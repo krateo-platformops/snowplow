@@ -67,6 +67,11 @@ func registerStoreSwapInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	byGVR, err := m.Int64ObservableCounter("snowplow_store_swaps_by_gvr_total",
+		metric.WithDescription("Store builds by GVR and outcome {installed, superseded, abort_clean, abort_refused, abort_teardown}: installed = the GVR was swapped (its new copy delivered M). The gvr label is GroupVersionResource.String(); no identity (#870, #928)."))
+	if err != nil {
+		return err
+	}
 	cache.SetStoreSwapCloseRecorder(func(kind, reason, close string, ms int64) {
 		set := metric.WithAttributes(attribute.String("reason", reason), attribute.String("close", close))
 		if kind == "detect" {
@@ -102,7 +107,11 @@ func registerStoreSwapInstruments(m metric.Meter) error {
 		for _, g := range s.LedgerOwed {
 			o.ObserveInt64(owed, int64(g.Value), metric.WithAttributes(attribute.String("reason", g.Reason)))
 		}
+		for _, c := range cache.StoreSwapsByGVRSnapshot() {
+			o.ObserveInt64(byGVR, int64(c.Value),
+				metric.WithAttributes(attribute.String("gvr", c.GVR), attribute.String("outcome", c.Outcome)))
+		}
 		return nil
-	}, keysTotal, buildsTotal, windowTotal, closesTotal, keysOpen, windowMax, owed)
+	}, keysTotal, buildsTotal, windowTotal, closesTotal, keysOpen, windowMax, owed, byGVR)
 	return err
 }

@@ -21,6 +21,37 @@ import (
 // refused, does not count.
 func storeRepairsRequestedForTest() int64 { return int64(storeRepairsFiredTotal.Load()) }
 
+// gvrOutcomes reads gvr's per-GVR build outcomes (snowplow_store_swaps_by_gvr)
+// by the published GroupVersionResource.String() spelling; nil when the GVR
+// has had no build.
+func gvrOutcomes(gvr schema.GroupVersionResource) map[string]uint64 {
+	m, _ := storeSwapsByGVRExpvar().(map[string]map[string]uint64)
+	return m[gvr.String()]
+}
+
+// wantGVROutcomes fails unless gvr's outcomes are exactly want (every other
+// outcome 0) and gvr is the only GVR with a build.
+func wantGVROutcomes(t *testing.T, arm string, gvr schema.GroupVersionResource, want map[string]uint64) {
+	t.Helper()
+	m, _ := storeSwapsByGVRExpvar().(map[string]map[string]uint64)
+	if len(m) != 1 || m[gvr.String()] == nil {
+		t.Fatalf("%s RED: snowplow_store_swaps_by_gvr has GVRs %v, want exactly %q", arm, keysOfGVRMap(m), gvr.String())
+	}
+	for _, o := range StoreSwapGVROutcomes {
+		if got := m[gvr.String()][o]; got != want[o] {
+			t.Fatalf("%s RED: snowplow_store_swaps_by_gvr[%q][%s] = %d, want %d", arm, gvr.String(), o, got, want[o])
+		}
+	}
+}
+
+func keysOfGVRMap(m map[string]map[string]uint64) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // noteDeliveredForTest records obj as delivered to the dep handler of gvr's
 // live instance — what the adapter does after a real delivery — for an arm
 // that writes the indexer directly and must model "the dep handler ran"

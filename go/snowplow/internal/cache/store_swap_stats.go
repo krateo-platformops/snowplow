@@ -19,6 +19,7 @@ package cache
 
 import (
 	"expvar"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -273,6 +274,81 @@ func storeSwapKnownStaleExpvar() any {
 	return m
 }
 
+// ── per-GVR build outcomes (#928 bench review) ───────────────────────────────
+
+// StoreSwapGVROutcomes is the closed set of per-GVR build outcomes; each build
+// ends in exactly one. installed: the swap delivered M (step 6) — the GVR was
+// swapped; superseded: a later install absorbed it before its step-3 check
+// (Q6) and delivered for both; abort_clean / abort_refused / abort_teardown:
+// the build ended without a swap.
+var StoreSwapGVROutcomes = []string{gvrOutcomeInstalled, gvrOutcomeSuperseded, outcomeAbortClean, outcomeAbortRefused, outcomeAbortTeardown}
+
+const (
+	gvrOutcomeInstalled  = "installed"
+	gvrOutcomeSuperseded = "superseded"
+)
+
+// gvrSwapCells is one GVR's outcome counters, in StoreSwapGVROutcomes order.
+type gvrSwapCells struct{ n [5]atomic.Uint64 }
+
+// storeSwapsByGVR: GroupVersionResource.String() → *gvrSwapCells. The label is
+// the GVR alone — bounded by the cluster's type set, never an identity.
+var storeSwapsByGVR sync.Map
+
+func noteSwapOutcome(gvr schema.GroupVersionResource, outcome string) {
+	for i, o := range StoreSwapGVROutcomes {
+		if o == outcome {
+			v, _ := storeSwapsByGVR.LoadOrStore(gvr.String(), &gvrSwapCells{})
+			v.(*gvrSwapCells).n[i].Add(1)
+			return
+		}
+	}
+}
+
+// StoreSwapByGVRCell is one (gvr, outcome) reading.
+type StoreSwapByGVRCell struct {
+	GVR, Outcome string
+	Value        uint64
+}
+
+// StoreSwapsByGVRSnapshot reads every GVR that has had a build, each with its
+// whole closed outcome set (a zero is a reading, not an absence), sorted by
+// GVR.
+func StoreSwapsByGVRSnapshot() []StoreSwapByGVRCell {
+	var gvrs []string
+	cells := map[string]*gvrSwapCells{}
+	storeSwapsByGVR.Range(func(k, v any) bool {
+		gvrs = append(gvrs, k.(string))
+		cells[k.(string)] = v.(*gvrSwapCells)
+		return true
+	})
+	sort.Strings(gvrs)
+	var out []StoreSwapByGVRCell
+	for _, g := range gvrs {
+		for i, o := range StoreSwapGVROutcomes {
+			out = append(out, StoreSwapByGVRCell{GVR: g, Outcome: o, Value: cells[g].n[i].Load()})
+		}
+	}
+	return out
+}
+
+func storeSwapsByGVRExpvar() any {
+	m := map[string]map[string]uint64{}
+	for _, c := range StoreSwapsByGVRSnapshot() {
+		if m[c.GVR] == nil {
+			m[c.GVR] = map[string]uint64{}
+		}
+		m[c.GVR][c.Outcome] = c.Value
+	}
+	return m
+}
+
+// NoteStoreSwapOutcomeForTest moves one GVR's outcome through the production
+// counter (the internal/metrics OTLP mirror arm). TEST-ONLY.
+func NoteStoreSwapOutcomeForTest(gvr schema.GroupVersionResource, outcome string) {
+	noteSwapOutcome(gvr, outcome)
+}
+
 var storeSwapExpvarOnce sync.Once
 
 // registerStoreSwapExpvar publishes the tagged family and the labelled
@@ -281,6 +357,7 @@ func registerStoreSwapExpvar() {
 	storeSwapExpvarOnce.Do(func() {
 		expvar.Publish("snowplow_store_swap", expvar.Func(func() any { return StoreSwapStatsByStat() }))
 		expvar.Publish("snowplow_store_swap_known_stale", expvar.Func(storeSwapKnownStaleExpvar))
+		expvar.Publish("snowplow_store_swaps_by_gvr", expvar.Func(storeSwapsByGVRExpvar))
 	})
 }
 
@@ -308,6 +385,10 @@ func resetStoreSwapStatsForTest() {
 	for _, c := range []*atomic.Uint64{&s.swaps, &s.superseded, &s.deliveries, &s.mKeys, &s.reused, &s.regressedKeys, &s.schemaUnowned} {
 		c.Store(0)
 	}
+	storeSwapsByGVR.Range(func(k, _ any) bool {
+		storeSwapsByGVR.Delete(k)
+		return true
+	})
 	resetSwapLedgerForTest()
 }
 

@@ -29,11 +29,11 @@
 //     previous copy joins the retiring set, and the lock is released. Then,
 //     with no lock held, every retiring copy is stopped and waited for; the new
 //     copy is unmuted IN EACH LISTENER'S ORDER (a swapUnmute notification
-//     through the new informer's own OnUpdate, waited for on every adapter);
-//     M — every key whose bytes differ between the new store and what each
-//     consumer last ACTED on — is computed; the push ledger is opened; and M
-//     is delivered, one swapDelivery per key through the same OnUpdate, so
-//     each handler receives it in its own order (store_instance.go).
+//     through the new informer's own OnUpdate); M — every key whose bytes
+//     differ between the new store and what each consumer last ACTED on — is
+//     computed; the push ledger is opened; and M is delivered, one
+//     swapDelivery per key through the same OnUpdate, so each handler
+//     receives it in its own order (store_instance.go).
 //  4. The servability epoch does NOT move at a swap (owner ruling 1) and the
 //     GVR keeps its confirmation. No whole-type mark, no unanchor: the only
 //     apiserver List per repair is the new copy's own.
@@ -534,7 +534,9 @@ func (rw *ResourceWatcher) noteCleanPass(gvr schema.GroupVersionResource, in *st
 	}
 	rw.mu.Unlock()
 	acc.endReason(reasonDivergence, outcomeAbortClean, windowNow())
-	_ = aborted
+	if aborted != nil {
+		noteSwapOutcome(gvr, outcomeAbortClean)
+	}
 }
 
 // ── the install ──────────────────────────────────────────────────────────────
@@ -574,6 +576,7 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 		acc.absorb(live.account)
 		live.account = nil
 		storeSwapStats.superseded.Add(1)
+		noteSwapOutcome(gvr, gvrOutcomeSuperseded)
 	}
 	c.account = acc
 	rw.retiring[gvr] = append(rw.retiring[gvr], live)
@@ -620,21 +623,26 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// byte-equal key with a new identity is re-pointed by the C6 rebind);
 	// then the comparator's record becomes the new copy's `seen`; then the
 	// handlers act — each from its own listener's position (#928 F2): a
-	// swapUnmute goes through the new informer's OnUpdate, and every adapter
-	// is waited for until it has passed it. A notification queued before it
-	// stays muted (seen only), so it can never reach a consumer that has
-	// already acted on a newer version. The wait ends early when this copy is
-	// stopped (a later install retired it, or a teardown): its listeners are
-	// gone, so the later install's M delivers for both (Q3), and this install
-	// still decides and counts its own accounting below (Q6).
+	// swapUnmute goes through the new informer's OnUpdate, so a notification
+	// queued before it stays muted (seen only) and can never reach a consumer
+	// that has already acted on a newer version.
 	markChangedPending(gvr, live, c)
 	setComparatorRecord(gvr, c)
 	swapStep(c, "before_unmute")
 	unmuteInListenerOrder(c)
 
-	// Step 5 — M, after every adapter has passed the unmute: a write the new
-	// copy took while muted cannot fall between the two (its notification was
-	// muted, so acted still differs from the store, so it is in M).
+	// Step 5 — M, once the unmute is ENQUEUED. Nothing waits for the adapters
+	// to pass it, and no consumer can tell (#928 F2b): acted changes only by a
+	// live delivery or a swap delivery, and on every listener both come after
+	// the unmute. So at any moment after the enqueue, a key whose store object
+	// differs from acted is in M and is delivered once (C1 skips it if a live
+	// delivery got there first, suppression drops a still-queued older one),
+	// and a key equal to acted has nothing older left to deliver live. What
+	// the moment of M changes is counters only — |M| and, for a schema build,
+	// its known-stale coordinates — within their contract (deliveries ≤ |M|).
+	// A write the new copy took while muted cannot fall between the two (its
+	// notification was muted, so acted still differs from the store, so it is
+	// in M).
 	m := computeM(c)
 	storeSwapStats.mKeys.Add(uint64(len(m)))
 	swapStep(c, "after_m")
@@ -647,6 +655,7 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// Step 6 — deliver M through the new informer's own OnUpdate: every
 	// listener gets one swapDelivery per key, in order with its real ones.
 	deliverM(c, m)
+	noteSwapOutcome(gvr, gvrOutcomeInstalled)
 	close(c.delivered)
 	slog.Info("cache.store.swap.installed",
 		slog.String("subsystem", "cache"),
@@ -659,42 +668,23 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 }
 
 // unmuteInListenerOrder unmutes c's adapters in each listener's own order: one
-// swapUnmute through the new informer's OnUpdate, then a wait until every
-// adapter has processed it, or until c is stopped (its listeners are then
-// gone). Every consumer listener of an instance is an adapter, and all are
-// attached before Run (wireInstanceLocked), so the count is the consumer
-// listener count. The instance's one other listener, its delivery log's
-// handler (#918), takes no part in muting and ignores the notification (it
-// has no object identity).
+// swapUnmute through the new informer's OnUpdate, which every listener takes
+// in order with its real notifications. The instance's one non-adapter
+// listener, its delivery log's handler (#918), takes no part in muting and
+// ignores the notification (it has no object identity).
 func unmuteInListenerOrder(c *storeInstance) {
-	adapters := c.adaptersSnapshot()
 	n, ok := c.gi.Informer().(swapNotifier)
 	if !ok {
 		// No OnUpdate to distribute through (deliverM logs the same
 		// condition): nothing can be ordered, so the adapters are unmuted
 		// where they stand.
-		for _, a := range adapters {
-			a.OnUpdate(swapUnmute{passed: func() {}}, swapUnmute{passed: func() {}})
+		for _, a := range c.adaptersSnapshot() {
+			a.OnUpdate(swapUnmute{}, swapUnmute{})
 		}
 		return
 	}
-	all := make(chan struct{})
-	var remaining atomic.Int64
-	remaining.Store(int64(len(adapters)))
-	if len(adapters) == 0 {
-		close(all)
-	}
-	u := swapUnmute{passed: func() {
-		if remaining.Add(-1) == 0 {
-			close(all)
-		}
-	}}
-	n.OnUpdate(u, u)
+	n.OnUpdate(swapUnmute{}, swapUnmute{})
 	swapStep(c, "unmute_sent")
-	select {
-	case <-all:
-	case <-c.stop:
-	}
 }
 
 // swapStepHookForTest, when non-nil, runs at named points of installBuild

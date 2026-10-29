@@ -257,6 +257,8 @@ func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 	if s := StoreSwapStatsSnapshot(); s.Superseded != 1 {
 		t.Fatalf("K11e: superseded = %d, want 1", s.Superseded)
 	}
+	// #928 bench — B1 superseded (absorbed by B2), B2 installed (G2).
+	wantGVROutcomes(t, "K11e (G2)", gvr, map[string]uint64{gvrOutcomeInstalled: 1, gvrOutcomeSuperseded: 1})
 	if got := storeSwapStats.keys.get(reasonDivergence, outcomeSwap); got != 2 {
 		t.Fatalf("K11e (Q6): keys_total{divergence,swap} = %d, want 2 — each coordinate counted once", got)
 	}

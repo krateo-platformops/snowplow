@@ -145,6 +145,8 @@ func TestStoreSwap_K2_ExactMarks(t *testing.T) {
 	if got := typeMarksAnyCause(d) - type0; got != 0 {
 		t.Fatalf("K2 RED (X2): the swap moved %d type-path dirty-mark(s); only the keys of M may be marked", got)
 	}
+	// #928 bench — the swapped GVR is named, by its String() spelling (G1).
+	wantGVROutcomes(t, "K2 (G1)", gvr, map[string]uint64{gvrOutcomeInstalled: 1})
 	ls := ListCellStatsSnapshot()
 	if got := ls.Unanchors["type_event"] - ls0.Unanchors["type_event"]; got != 0 {
 		t.Fatalf("K2 RED: %d type_event unanchor(s) at the swap", got)
@@ -379,6 +381,7 @@ func TestStoreSwap_K8_TeardownAbortsTheBuild(t *testing.T) {
 	if !f.rw.everyPerGVRMapClearForTest(gvr) {
 		t.Fatal("K8 RED (X13): per-GVR state survives the teardown")
 	}
+	wantGVROutcomes(t, "K8 (G4)", gvr, map[string]uint64{outcomeAbortTeardown: 1})
 }
 
 // ── K8b — owned only ─────────────────────────────────────────────────────────
@@ -448,6 +451,8 @@ func TestStoreSwap_K10_RefusedAbortsAndStallBlocksNothing(t *testing.T) {
 		if !f.rw.IsServable(gvr) {
 			t.Fatal("K10: the live copy stopped serving after its build was refused")
 		}
+		f.waitFor("the refused build's per-GVR outcome", func() bool { return gvrOutcomes(gvr)[outcomeAbortRefused] == 1 })
+		wantGVROutcomes(t, "K10 (G3)", gvr, map[string]uint64{outcomeAbortRefused: 1})
 	})
 	t.Run("stall_blocks_no_other_gvr", func(t *testing.T) {
 		gvrA := swapGVR(t)
@@ -625,6 +630,7 @@ func TestStoreSwap_K14b_SchemaSurvivesACleanPass(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("K14b: the aborted copy's Run never returned")
 	}
+	wantGVROutcomes(t, "K14b (G5)", gvr, map[string]uint64{gvrOutcomeInstalled: 1, outcomeAbortClean: 1})
 }
 
 // ── K15 — a copy that syncs behind ───────────────────────────────────────────

@@ -85,8 +85,7 @@ func (r *adapterRig) nSwap()               { r.a.OnUpdate(swapDelivery{key: "swa
 // live from here on (#928 F2 — the unmute is a notification in listener
 // order, never a flag flipped out of it).
 func (r *adapterRig) nUnmute() {
-	u := swapUnmute{passed: func() {}}
-	r.a.OnUpdate(u, u)
+	r.a.OnUpdate(swapUnmute{}, swapUnmute{})
 }
 
 func (r *adapterRig) seq() []string {

@@ -421,11 +421,9 @@ type swapDelivery struct{ key string }
 // swapUnmute is the notification the install enqueues, through the same
 // OnUpdate, to unmute the new copy IN EACH LISTENER'S ORDER (#928 F2): every
 // notification the listener received before it is muted (seen only), every
-// one after it is live. passed is called once by each adapter as it processes
-// it; the install computes M only after every adapter has passed it, so a
-// notification still queued at the unmute can never reach a consumer that
-// already acted on a newer version.
-type swapUnmute struct{ passed func() }
+// one after it is live, so a notification still queued at the unmute can
+// never reach a consumer that already acted on a newer version.
+type swapUnmute struct{}
 
 // handlerAdapter wraps one consumer handler on one instance.
 type handlerAdapter struct {
@@ -471,7 +469,6 @@ func (a *handlerAdapter) OnUpdate(oldObj, newObj any) {
 		a.mu.Lock()
 		a.muted = false
 		a.mu.Unlock()
-		n.passed()
 		return
 	}
 	a.deliver(newObj, oldObj, true, false, true)

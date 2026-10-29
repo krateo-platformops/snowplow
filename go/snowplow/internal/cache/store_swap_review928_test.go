@@ -116,9 +116,9 @@ func TestRev928_A_LaggingCandidateListenerAtUnmute(t *testing.T) {
 	})
 	close(proceed)
 	// (adopted with one change, #928 F2's fix) The install has sent its
-	// unmute while this listener is still held behind its muted backlog; the
-	// fix then WAITS for the listener at the unmute, so the listener is
-	// released here, not after the swap completes.
+	// unmute while this listener is still held behind its muted backlog: the
+	// listener is released here, so the arm observes the unmute's ORDER (the
+	// backlog stays muted), whatever the install does next.
 	<-unmuteSent
 	ext.mu.Unlock()
 	held = false

@@ -693,9 +693,10 @@ Two rules of the install (#928 review):
   recovered from is copied, and because that install is then an exit from servable, it moves the
   servability epoch (owner ruling 1). `cache.store.swap.installed` carries `servable`.
 - **The new copy is unmuted in each listener's own order.** A `swapUnmute` notification goes
-  through the new informer's handler path and the install waits until every handler adapter has
-  passed it; everything a listener received before it stays muted. A notification still queued at
-  the unmute therefore never reaches a consumer that already acted on a newer version.
+  through the new informer's handler path; everything a listener received before it stays muted.
+  A notification still queued at the unmute therefore never reaches a consumer that already acted
+  on a newer version. Nothing waits for the listeners to reach it: M is computed once it is
+  enqueued, which no consumer can tell apart (the reasoning is at step 5 in `store_swap.go`).
 
 **What this does and does not close.** Invisibility is closed for every loss class **except a stale
 apiserver watch cache** — see the scope limit above; that qualifier travels with every claim made
@@ -736,6 +737,7 @@ keys). Every instant reads the dirty-window clock (#930). No key, body or identi
 | `snowplow_store_swap_known_stale_keys_open` (gauge) | `reason` | known-stale coordinates in open windows |
 | `snowplow_store_swap_known_stale_window_open_seconds_max` (gauge) | `reason` | age of the oldest open window — a window that never ends is visible here |
 | `snowplow_store_swap_ledger_owed` (gauge) | `reason` | entries refreshed with no subscriber now — an expected outcome, not a detector |
+| `snowplow_store_swaps_by_gvr_total` (expvar `snowplow_store_swaps_by_gvr`: `{"<gvr>": {"<outcome>": n}}`) | `gvr`, `outcome` | **which GVR a build swapped**: builds by GVR and outcome `installed` (the GVR was swapped: its new copy delivered M), `superseded` (a later install absorbed it before its step 3 and delivered for both), `abort_clean`, `abort_refused`, `abort_teardown` (no swap). `gvr` is `GroupVersionResource.String()`, the spelling `snowplow_resolve_collection_lists` uses (#991); no identity. A GVR appears once it has had a build, with every outcome present |
 
 `outcome` ∈ `swap`, `abort_clean`, `abort_refused`, `abort_teardown`. The window and the ledger
 are defined in `store_swap_ledger.go`; #710's 10 s bar is exceeded by design for a real loss at
