@@ -829,9 +829,10 @@ func lookupRoleRefRules(snap *cache.RBACSnapshot, namespace string, ref rbacv1.R
 //
 // Ship B (0.30.138) — map lookups on the snapshot replace the
 // per-call GetTypedObject reads (pre-Ship-B: evaluate.go:254/:270). A
-// missed lookup (`!ok`) is recorded via cache.RecordRBACSnapshotMiss
-// (AC-B.10) and treated as a deny — same fail-closed posture as
-// today's GetTypedObject !ok.
+// missed lookup (`!ok`) is treated as a deny — same fail-closed posture as
+// today's GetTypedObject !ok. It is recorded via cache.RecordRBACSnapshotMiss
+// (AC-B.10) only when the snapshot is not Synced (#947); in a Synced snapshot
+// it is a dangling binding, reported by the snapshot writer, not here.
 //
 // v7 Step 2B — the resolve half is now lookupRoleRefRules (above); this
 // function is resolve + rulesPermit + miss-accounting. The miss bump stays
@@ -849,7 +850,16 @@ func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleR
 	if ok {
 		return rulesPermit(rules, opts), nil
 	}
-	// Resolve miss — record it with the exact pre-split labels/selectivity.
+	// #947 — in a Synced snapshot the role really is absent: the binding is
+	// dangling, a valid Kubernetes state that grants nothing. The snapshot
+	// writer reported it once, at the publish where it became dangling
+	// (cache/rbac_dangling_roleref.go). Deny without logging: a per-evaluation
+	// line here scaled with traffic (392M rows on one cluster).
+	if snap.Synced {
+		return false, nil
+	}
+	// Resolve miss in a snapshot built before every RBAC informer synced — a
+	// consistency fault. Record it with the exact pre-split labels/selectivity.
 	switch ref.Kind {
 	case "ClusterRole":
 		cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)

@@ -137,6 +137,11 @@ func ResetCacheProcessStateForTest() error {
 	// exempted — #471.
 	ResetRBACPublishHealthForTest()
 
+	// 5d⁗ — #947 the dangling-roleRef set of the last synced publish and its
+	// gauge. Process-global, so a test would otherwise see a sibling's
+	// bindings resolve, or its own reported as already known. Composed — #471.
+	ResetDanglingRoleRefsForTest()
+
 	// 5d″ — #681 the denial-only Put counter (process-global). Composed rather
 	// than exempted — #471.
 	ResetDenialOnlyPutForTest()
