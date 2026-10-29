@@ -35,7 +35,9 @@ __all__ = ["redact", "summarize_conditions", "pod_summary", "failing_pods",
            "installer_progress", "Kube", "collect", "wait_installer",
            "evaluate483", "verify483", "chart_inspector_errors",
            "platform_state", "platform_line", "parse_not_ready_children", "declared_components",
-           "core_features",
+           "core_features", "create_state", "definition_record", "definitions_snapshot",
+           "controller_logs", "controller_images", "platform_report", "wedge_window",
+           "component_windows", "PROVIDER_RUNTIME_RELEASES",
            "allow_list_from_env", "DEFAULT_ALLOW_NOT_READY", "REQUIRED_READY",
            "main"]
 
@@ -738,13 +740,348 @@ def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
     return written
 
 
+# ─── RestDefinitions / CompositionDefinitions: the create handshake ─────────
+#
+# A run lost a whole attempt to a wedged platform component, and the bundle
+# kept neither controller logs nor the managed objects' annotations: the
+# cause was unprovable afterwards. Recorded at the end of the platform step and
+# at every teardown, so the bench can say what it OBSERVED (it fixes nothing).
+
+CREATE_PENDING = "krateo.io/external-create-pending"
+CREATE_SUCCEEDED = "krateo.io/external-create-succeeded"
+CREATE_FAILED = "krateo.io/external-create-failed"
+# What a pending-without-terminal means depends on the provider-runtime the
+# controller CARRIES (read from its image, controller_images), per release
+# (krateo-platformops/provider-runtime, each tag's pkg/reconciler/reconciler.go,
+# read 2026-10-28):
+#   v1.4.0 .. v1.5.3 (897399b "give an unresolved create a bounded path back"):
+#     an unresolved create keeps its pending marker and is re-observed every
+#     defaultCreateRecoveryReobserveInterval (15 s, :40) until
+#     defaultCreateRecoveryGracePeriod (2 m, :38) has elapsed, then retried.
+#     The measured recovery (2m0.1s) lands on the first re-observe after the
+#     grace period: a wedge once older than grace + 2 x re-observe.
+#   v1.0.0 .. v1.3.1: no recovery path. v1.3.0 refuses an incomplete create
+#     for good (:766-773); v1.3.1 asks Observe, and one it cannot see is still
+#     never retried. Each reconcile runs under r.timeout + reconcileGracePeriod
+#     (1 m + 30 s, :29-30, applied at v1.3.0 :662): a pending marker older than
+#     that has no reconcile left that could finish it.
+#   any other version (newer, a pseudo-version, not read): UNKNOWN, never a
+#   default window.
+_RECOVERY = {"recovery": True, "grace_s": 120.0, "reobserve_s": 15.0,
+             "source": "pkg/reconciler/reconciler.go:38 defaultCreateRecoveryGracePeriod = 2 * time.Minute, "
+                       ":40 defaultCreateRecoveryReobserveInterval = 15 * time.Second"}
+_NO_RECOVERY = {"recovery": False, "reconcile_timeout_s": 60.0, "reconcile_grace_s": 30.0,
+                "source": "pkg/reconciler/reconciler.go:29 reconcileGracePeriod = 30 * time.Second, "
+                          ":30 reconcileTimeout = 1 * time.Minute (each reconcile's bound); an incomplete "
+                          "create is never retried"}
+PROVIDER_RUNTIME_RELEASES = {
+    **{v: dict(_NO_RECOVERY, commit=c) for v, c in (
+        ("v1.0.0", "5e5132d9"), ("v1.1.0", "c308f606"), ("v1.2.0", "b23717e5"), ("v1.2.1", "ac67ea6e"),
+        ("v1.2.2", "d9ca4ac0"), ("v1.3.0", "81781579"), ("v1.3.1", "e60fb883"))},
+    **{v: dict(_RECOVERY, commit=c) for v, c in (
+        ("v1.4.0", "897399ba"), ("v1.5.0", "34efb047"), ("v1.5.1", "7a8b8d46"), ("v1.5.2", "7f81abec"),
+        ("v1.5.3", "855ed1e2"))},
+}
+DEFINITION_KINDS = (("restdefinitions.ogen.krateo.io", "restdefinitions", "oasgen-provider"),
+                    ("compositiondefinitions.core.krateo.io", "compositiondefinitions", "core-provider"))
+# the two controllers, by app.kubernetes.io/name EXACTLY (not core-provider-chart-inspector,
+# not the agents)
+CONTROLLERS = ("oasgen-provider", "core-provider")
+# provider-runtime's module path, under both org spellings it has had
+PROVIDER_RUNTIME = ("github.com/krateo-platformops/provider-runtime",
+                    "github.com/krateoplatformops/provider-runtime")
+
+
+def wedge_window(version: str | None, why: str | None = None) -> dict:
+    """How long a pending-without-terminal may last under this provider-runtime
+    before it is WEDGED (see PROVIDER_RUNTIME_RELEASES). `wedge_after_s` None:
+    the version is unknown, and so is the window — never a default one."""
+    rel = PROVIDER_RUNTIME_RELEASES.get(version or "")
+    if rel is None:
+        return {"version": version, "wedge_after_s": None, "recovery": None,
+                "why": why or (f"provider-runtime {version} is not a release this bench has read the recovery "
+                               f"rules of" if version else "the provider-runtime version is unknown")}
+    bound = (rel["grace_s"] + 2 * rel["reobserve_s"] if rel["recovery"]
+             else rel["reconcile_timeout_s"] + rel["reconcile_grace_s"])
+    return {"version": version, "wedge_after_s": bound, "recovery": rel["recovery"],
+            "source": f"provider-runtime {version} ({rel['commit']}) {rel['source']}"}
+
+
+def _ts(v) -> float | None:
+    if not isinstance(v, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def create_state(annotations: dict | None, now: float, window: dict) -> dict:
+    """The create handshake as the object's own annotations tell it, at `now`,
+    judged by `window` (wedge_window of the controller's provider-runtime).
+
+    A pending marker newer than BOTH terminal markers (strictly, as
+    meta.ExternalCreateIncomplete: a marker at the same second resolved it) is
+    WEDGED once older than the window by its own timestamp, `pending` inside
+    it, and UNKNOWN when the window is (the runtime's version unknown). Under a
+    runtime with no recovery path a WEDGED one says so. cleared: superseded by
+    a later succeeded; create-failed: by a later failed; no-pending: no
+    pending marker; unreadable: a marker that is not a timestamp."""
+    a = annotations or {}
+    raw = {k: a.get(f"krateo.io/external-create-{k}") for k in ("pending", "succeeded", "failed")}
+    out = {"annotations": {k: v for k, v in raw.items() if v is not None}}
+    if raw["pending"] is None:
+        return {**out, "state": "no-pending"}
+    t = {k: _ts(v) for k, v in raw.items() if v is not None}
+    if any(v is None for v in t.values()):
+        return {**out, "state": "unreadable"}
+    pending = t["pending"]
+    terminal = {k: t[k] for k in ("succeeded", "failed") if k in t}
+    if all(pending > v for v in terminal.values()):
+        age = round(now - pending, 1)
+        bound = window.get("wedge_after_s")
+        if bound is None:
+            return {**out, "pending_age_s": age, "state": "UNKNOWN",
+                    "why": f"no window to judge it by: {window.get('why')}"}
+        if age <= bound:
+            return {**out, "pending_age_s": age, "state": "pending"}
+        return {**out, "pending_age_s": age, "state": "WEDGED",
+                **({} if window.get("recovery") else
+                   {"note": f"no recovery path in this runtime (provider-runtime {window.get('version')})"})}
+    last = max(terminal, key=lambda k: (terminal[k], k == "succeeded"))
+    return {**out, "state": "cleared" if last == "succeeded" else "create-failed"}
+
+
+def definition_record(obj: dict, resource: str, now: float, window: dict) -> dict:
+    """One RestDefinition / CompositionDefinition as the bench saw it."""
+    s = summarize_conditions(obj, resource)
+    st = obj.get("status") or {}
+    rec = {"id": s.get("id"), "kind": obj.get("kind"), "namespace": s.get("namespace"), "name": s.get("name"),
+           **create_state((obj.get("metadata") or {}).get("annotations"), now, window),
+           "ready": s.get("Ready"), "synced": s.get("Synced")}
+    managed = st.get("managed")
+    if isinstance(managed, dict):              # CompositionDefinition: status.managed{group,kind}, apiVersion
+        rec["managed"] = {"group": managed.get("group"), "kind": managed.get("kind")}
+    if isinstance(st.get("apiVersion"), str):
+        rec["apiVersion"] = st["apiVersion"]
+    if st.get("resource") is not None:         # RestDefinition: status.resource{apiVersion,kind}
+        rec["resource"] = st["resource"]
+    return rec
+
+
+STATES = ("WEDGED", "UNKNOWN", "pending", "cleared", "create-failed", "no-pending", "unreadable")
+
+
+def component_windows(images: list[dict]) -> dict[str, dict]:
+    """Per controller, the window of the provider-runtime its pods carry. Its
+    pods disagreeing, or none read, is UNKNOWN (with why)."""
+    out = {}
+    for comp in CONTROLLERS:
+        rows = [i for i in images if i.get("component") == comp]
+        versions = sorted({(i.get("provider_runtime") or {}).get("version") for i in rows} - {None})
+        whys = sorted({(i.get("provider_runtime") or {}).get("why") for i in rows} - {None})
+        if not rows:
+            out[comp] = wedge_window(None, f"no {comp} pod was found")
+        elif len(versions) == 1 and not whys:
+            out[comp] = wedge_window(versions[0])
+        elif len(versions) > 1:
+            out[comp] = wedge_window(None, f"its pods carry different provider-runtimes: {', '.join(versions)}")
+        else:
+            out[comp] = wedge_window(None, "; ".join(whys) or "no pod's provider-runtime was read")
+    return out
+
+
+def definitions_snapshot(k: "Kube", *, at: str, windows: dict[str, dict],
+                         now: Callable[[], float] = time.time) -> dict:
+    """Every RestDefinition and CompositionDefinition, each judged by the
+    window of the controller that reconciles it."""
+    t = now()
+    objects, unlisted = [], []
+    for kind, resource, comp in DEFINITION_KINDS:
+        rc, out, err = k.kubectl("get", kind, "-A", "-o", "json")
+        try:
+            items = json.loads(out).get("items", []) if rc == 0 else None
+        except ValueError:
+            items = None
+        if items is None:
+            unlisted.append({"kind": kind, "rc": rc, "error": _first_line(err)})
+            continue
+        w = windows.get(comp) or wedge_window(None, f"no window for {comp}")
+        objects += [{**definition_record(o, resource, t, w), "controller": comp} for o in items]
+    counts = {st: sum(1 for o in objects if o["state"] == st) for st in STATES}
+    return {"kind": "platform_definitions", "at": at, "t": t, "context": k.ctx, "windows": windows,
+            "counts": counts, "unlisted": unlisted, "objects": objects}
+
+
+def _first_line(text: str) -> str:
+    return next((ln for ln in (text or "").splitlines() if ln.strip()), "")[:300]
+
+
+def _redact_log(text: str, extra: tuple[str, ...] = ()) -> str:
+    """A log as every bench log is kept: credentials (redact) AND identities
+    (bench/identity.py: users, e-mails, Secret names, CNs). identity imports
+    nothing from bench, so this module stays free of bench's import-time
+    context guard."""
+    from bench import identity
+    return "\n".join(identity.redact_identity(ln) for ln in redact(text, extra).split("\n"))
+
+
+def _redact_obj(obj, extra: tuple[str, ...] = ()):
+    """Every string of a record through _redact_log (a condition message, an
+    error line can name a user): the record is written AND printed from this."""
+    if isinstance(obj, str):
+        return _redact_log(obj, extra)
+    if isinstance(obj, dict):
+        return {key: _redact_obj(v, extra) for key, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_obj(v, extra) for v in obj]
+    return obj
+
+
+def controller_pods(k: "Kube") -> list[dict]:
+    rc, out, _ = k.kubectl("get", "pods", "-A", "-l",
+                           f"app.kubernetes.io/name in ({','.join(CONTROLLERS)})", "-o", "json")
+    try:
+        return json.loads(out).get("items", []) if rc == 0 else []
+    except ValueError:
+        return []
+
+
+def controller_logs(k: "Kube", pods: list[dict], out_dir: str, *, extra: tuple[str, ...] = ()) -> list[dict]:
+    """Every container log of the controllers, IN FULL (no --tail: the line
+    after a failure is never cut), with timestamps; the previous container's
+    too when it restarted. Redacted like every bench log, current AND previous."""
+    os.makedirs(out_dir, exist_ok=True)
+    out = []
+    for p in pods:
+        md = p.get("metadata") or {}
+        restarts = {c.get("name"): c.get("restartCount") or 0
+                    for c in (p.get("status") or {}).get("containerStatuses") or []}
+        for c in (p.get("spec") or {}).get("containers") or []:
+            for prev in ((False, True) if restarts.get(c["name"]) else (False,)):
+                args = ["logs", "-n", md.get("namespace"), md.get("name"), "-c", c["name"], "--timestamps"]
+                rc, text, err = k.kubectl(*(args + (["--previous"] if prev else [])), timeout=120)
+                name = (f"{md.get('namespace')}__{md.get('name')}__{c['name']}__"
+                        f"{'previous' if prev else 'current'}.log")
+                path = os.path.join(out_dir, name)
+                body = _redact_log(text if rc == 0 else f"rc={rc} {_first_line(err)}", extra)
+                with open(path, "w") as fh:
+                    fh.write(body)
+                out.append({"component": (md.get("labels") or {}).get("app.kubernetes.io/name"),
+                            "pod": md.get("name"), "container": c["name"], "previous": prev, "rc": rc,
+                            "lines": len(text.splitlines()) if rc == 0 else 0, "file": path})
+    return out
+
+
+def controller_images(pods: list[dict], *, read=None, known: dict[str, dict] | None = None) -> list[dict]:
+    """Which provider-runtime each controller carries, read from the image
+    digest the pod runs (bench/imagemod.py), never assumed from a pin.
+    `known`: image digest -> a read already made this run (the platform_end
+    record), reused for the same digest."""
+    if read is None:
+        from bench import imagemod
+        read = imagemod.image_deps
+    out, cache = [], dict(known or {})
+    for p in pods:
+        md = p.get("metadata") or {}
+        spec = {c["name"]: c for c in (p.get("spec") or {}).get("containers") or []}
+        for cs in (p.get("status") or {}).get("containerStatuses") or []:
+            ref = (cs.get("imageID") or "").replace("docker-pullable://", "") or cs.get("image")
+            row = {"component": (md.get("labels") or {}).get("app.kubernetes.io/name"), "pod": md.get("name"),
+                   "container": cs.get("name"), "image": cs.get("image"), "image_id": ref}
+            if ref not in cache:
+                try:
+                    got = read(ref, PROVIDER_RUNTIME, command=(spec.get(cs.get("name")) or {}).get("command"))
+                    got = dict(got, version=(got.get("replaced_by") or {}).get("version") or got.get("version"))
+                except Exception as e:  # noqa: BLE001 — evidence: why it could not be read
+                    got = {"version": None, "why": f"{type(e).__name__}: {e}"[:300]}
+                cache[ref] = {k2: got.get(k2) for k2 in ("module", "version", "process_binary", "why")
+                              if got.get(k2) is not None}
+            row["provider_runtime"] = cache[ref]
+            out.append(row)
+    return out
+
+
+def definitions_line(rec: dict) -> str:
+    """The run log's summary, built from the REDACTED record (the CLI passes it)."""
+    c = rec["counts"]
+    line = (f"[platform] definitions at {rec['at']}: {len(rec['objects'])} object(s); WEDGED {c['WEDGED']} "
+            f"(expected 0); UNKNOWN {c['UNKNOWN']}; pending in the window {c['pending']}; cleared {c['cleared']}; "
+            f"create-failed {c['create-failed']}")
+    for comp, w in (rec.get("windows") or {}).items():
+        line += (f"\n[platform]   {comp}: provider-runtime {w.get('version') or 'UNKNOWN'}: "
+                 + (f"WEDGED after {w['wedge_after_s']:g} s"
+                    + ("" if w.get("recovery") else " (no recovery path in this runtime)")
+                    if w.get("wedge_after_s") is not None else f"NO WINDOW ({w.get('why')})"))
+    for o in rec["objects"]:
+        if o["state"] in ("WEDGED", "UNKNOWN"):
+            line += (f"\n[platform]   {o['state']} {o['id']}: pending {o['annotations'].get('pending')} "
+                     f"({o['pending_age_s']:g} s old), Ready={(o.get('ready') or {}).get('status')} "
+                     f"({(o.get('ready') or {}).get('reason')}), Synced={(o.get('synced') or {}).get('status')} "
+                     f"({(o.get('synced') or {}).get('reason')})"
+                     + (f"; {o['note']}" if o.get("note") else "") + (f"; {o['why']}" if o.get("why") else ""))
+    for u in rec["unlisted"]:
+        line += f"\n[platform]   could not list {u['kind']} (rc={u['rc']}): {u['error']}"
+    return line
+
+
+def platform_report(snaps: list[dict], caps: list[dict] = ()) -> dict:
+    """The verdict's platform section: per snapshot (platform_end, teardown)
+    the counts; for the cluster, WEDGED (expected 0), UNKNOWN, cleared, the
+    windows and provider-runtimes (with why when one was not read), and any
+    snapshot cut short by its cap."""
+    if not snaps:
+        return {"status": "absent", "cap_hits": list(caps),
+                "note": "no platform_definitions record (a run before the bench recorded them, or every "
+                        "snapshot was cut short)"}
+    snaps = sorted(snaps, key=lambda r: r.get("t") or 0)
+    last = snaps[-1]
+    images = next((r.get("controller_images") for r in snaps if r.get("controller_images")), None)
+    return {"status": "present", "context": last.get("context"),
+            "wedged": max(r["counts"]["WEDGED"] for r in snaps), "expected_wedged": 0,
+            "unknown": max(r["counts"]["UNKNOWN"] for r in snaps),
+            "cleared": last["counts"]["cleared"], "windows": last.get("windows") or {},
+            "cap_hits": list(caps),
+            "snapshots": [{"at": r["at"], "t": r["t"], "counts": r["counts"], "unlisted": r.get("unlisted") or [],
+                           "flagged": [{"id": o["id"], "state": o["state"], "pending": o["annotations"].get("pending"),
+                                        "pending_age_s": o.get("pending_age_s"),
+                                        **({"note": o["note"]} if o.get("note") else {}),
+                                        **({"why": o["why"]} if o.get("why") else {})}
+                                       for o in r["objects"] if o["state"] in ("WEDGED", "UNKNOWN")]}
+                          for r in snaps],
+            "provider_runtime": [{"component": i["component"], "image": i.get("image"),
+                                  "version": (i.get("provider_runtime") or {}).get("version"),
+                                  **({"why": i["provider_runtime"]["why"]}
+                                     if (i.get("provider_runtime") or {}).get("why") else {})}
+                                 for i in images or []]}
+
+
+def _known_images(path: str) -> dict[str, dict]:
+    """This run's earlier provider-runtime reads (platform-definitions.jsonl), by image digest."""
+    out: dict[str, dict] = {}
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                for i in r.get("controller_images") or []:
+                    if i.get("image_id") and (i.get("provider_runtime") or {}).get("version"):
+                        out[i["image_id"]] = i["provider_runtime"]
+    except OSError:
+        pass
+    return out
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m bench.diag606")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("wait-installer", "collect", "verify483"):
+    for name in ("wait-installer", "collect", "verify483", "definitions"):
         s = sub.add_parser(name)
         s.add_argument("--kubeconfig", required=True)
         s.add_argument("--context", required=True)
@@ -753,6 +1090,11 @@ def main(argv=None) -> int:
             s.add_argument("--interval-s", type=float, default=60)
         else:
             s.add_argument("--out", required=True)
+        if name == "definitions":
+            s.add_argument("--at", required=True, choices=("platform_end", "teardown"))
+            s.add_argument("--logs-dir", required=True)
+            s.add_argument("--redact", action="append", default=[])
+            continue
         if name == "collect":
             s.add_argument("--redact", action="append", default=[],
                            help="extra literal to redact (repeatable)")
@@ -763,6 +1105,20 @@ def main(argv=None) -> int:
         s.add_argument("--installer-chart", required=name != "collect",
                        help="the pulled installer chart, or the pull workdir holding it")
     a = p.parse_args(argv)
+    if a.cmd == "definitions":
+        k = Kube(a.kubeconfig, a.context)
+        pods = controller_pods(k)
+        # the provider-runtime each controller carries decides its objects' window; a digest already
+        # read this run (the platform_end record) is not read again
+        images = controller_images(pods, known=_known_images(a.out))
+        rec = definitions_snapshot(k, at=a.at, windows=component_windows(images))
+        rec["controller_images"] = images
+        rec["controller_logs"] = controller_logs(k, pods, a.logs_dir, extra=tuple(a.redact))
+        rec = _redact_obj(rec, tuple(a.redact))      # written AND printed redacted
+        with open(a.out, "a") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+        print(definitions_line(rec), flush=True)
+        return 0                                   # evidence, not a gate
     try:
         core = core_features(a.installer_chart) if a.installer_chart and (
             a.cmd != "collect" or os.path.isdir(a.installer_chart)) else ()

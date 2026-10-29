@@ -653,8 +653,10 @@ def test_evaluate_is_in_the_run_budget():
     """5: evaluate runs while the cluster is up (run 15: 809 s A, 828 s B)."""
     src = (BENCH_DIR / "run606.sh").read_text()
     assert 'EVALUATE_EST_S="${EVALUATE_EST_S:-828}"' in src and "809 s (A) and 828 s (B)" in src
-    assert "+ COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + DOWN_BUDGET_S ))" in src
+    assert "+ COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))" in src
     assert "+ evaluate ${EVALUATE_EST_S} +" in src
+    # #960: both platform-definitions calls are capped, and both caps are in the budget
+    assert "+ definitions 2x${DEFS_CAP_S} +" in src
 
 
 from tests.test_pair_ready_time import K0, P14, SHIFT, _arms, _failing, _shift  # noqa: E402

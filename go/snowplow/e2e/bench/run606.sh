@@ -200,6 +200,12 @@ DATA_TIMEOUT_S="${DATA_TIMEOUT_S:-2400}"      # data606 (run 8: 1041 s)
 ROLLOUT_TIMEOUT_S="${ROLLOUT_TIMEOUT_S:-2700}" # reboot: rollout status
 COLLECT_CAP_S="${COLLECT_CAP_S:-1800}"        # collect + evaluate, all reads together
 DIAG_CAP_S="${DIAG_CAP_S:-900}"               # diag606 snapshot on failure
+# diag606 definitions, once at the platform step's end and once at teardown:
+# two lists, the two controllers' logs (each read bounded at 120 s) and their
+# images' build info (two registry reads, reused at teardown). Its own cap, so
+# neither the platform step nor the teardown is held by it; a cap hit is said
+# and recorded (platform-definitions.jsonl, the verdict's platform section).
+DEFS_CAP_S="${DEFS_CAP_S:-300}"
 DOWN_BUDGET_S="${DOWN_BUDGET_S:-900}"         # gke-down
 # evaluate runs after collect while the cluster is still up: run 15 measured
 # it at 809 s (A) and 828 s (B) ("=== step evaluate ===" -> "verdict exit=" in
@@ -218,9 +224,9 @@ fi
 RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ENDPOINT_WAIT_S + PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
-                 + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + DOWN_BUDGET_S ))
+                 + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
-budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -305,14 +311,17 @@ bounded() {
 # wall-clock cap; stop early on the cap or when teardown was signalled.
 TD_SIGNALED=0
 CAPPED_PID=""
+CAPPED_HIT=0         # 1 when the last capped call was stopped (cap or signal)
 capped() {
   local secs="$1" label="$2"; shift 2
+  CAPPED_HIT=0
   ( set +e; "$@" ) &
   CAPPED_PID=$!
   local waited=0
   while kill -0 "$CAPPED_PID" 2>/dev/null; do
     if (( waited >= secs )) || [[ "$TD_SIGNALED" == "1" ]]; then
-      log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing to teardown"
+      CAPPED_HIT=1
+      log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing"
       pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
       kill -TERM "$CAPPED_PID" 2>/dev/null || true
       break
@@ -373,6 +382,11 @@ teardown() {
       else
         log "no kubeconfig yet; no diagnostics to collect"
       fi
+    fi
+    # every teardown, the run's outcome whatever it is: the definitions and the
+    # controller logs once more, before the cluster goes
+    if [[ "$TD_SIGNALED" != "1" ]] && { [[ "$DRY" == "1" ]] || [[ -s "$KCFG" ]]; }; then
+      capped_definitions teardown
     fi
     # Test hook (like BENCH_606_FAIL_AT): a command that fails inside teardown,
     # as one killed by a group signal would. It must not stop the delete.
@@ -482,14 +496,46 @@ s_verify483() {
   run python3 -m bench.diag606 verify483 --kubeconfig "$KCFG" --context "$KCTX" \
       --installer-chart "$OUT/installer-pulled" --out "$OUT/verify483.json"
 }
+# platform_definitions <platform_end|teardown>: every RestDefinition and
+# CompositionDefinition (its create markers, Ready/Synced, what it manages;
+# WEDGED = a pending create past provider-runtime's recovery window) and the
+# oasgen-provider / core-provider logs IN FULL, appended to
+# platform-definitions.jsonl (evaluate's platform section) and kept under
+# platform-logs/<at>/. Evidence: it never fails the run.
+platform_definitions() {
+  local at="$1"
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.diag606 definitions --at $at --out $OUT/platform-definitions.jsonl --logs-dir $OUT/platform-logs/$at (capped at ${DEFS_CAP_S}s)"
+    return 0
+  fi
+  python3 -m bench.diag606 definitions --kubeconfig "$KCFG" --context "$KCTX" --at "$at" \
+      --out "$OUT/platform-definitions.jsonl" --logs-dir "$OUT/platform-logs/$at" --redact "$PW" >&2 \
+    || log "platform definitions at ${at}: not recorded (exit $?)"
+}
+# capped_definitions <at>: platform_definitions under DEFS_CAP_S; a cap hit is
+# said loudly and recorded, so an incomplete record never reads as a whole one
+capped_definitions() {
+  local at="$1"
+  capped "$DEFS_CAP_S" "platform definitions at ${at}" platform_definitions "$at"
+  if [[ "$CAPPED_HIT" == "1" ]]; then
+    log "PLATFORM DEFINITIONS CAP HIT at ${at}: stopped after ${DEFS_CAP_S}s; its record and the controller logs may be incomplete or missing"
+    printf '{"kind": "platform_definitions_cap", "at": "%s", "cap_s": %s, "t": %s}\n' \
+        "$at" "$DEFS_CAP_S" "$(date +%s)" >> "$OUT/platform-definitions.jsonl"
+  fi
+}
 s_wait_platform() {
   # Polled, not a blind wait: prints which components are Ready (and why the
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
   # Installer CR declares is read with the chart's own feature rule.
+  local prc=0
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
-      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled"
+      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled" || prc=$?
+  # the platform step's end, READY or not: a platform that never got ready is
+  # the case the definitions and the controller logs explain
+  capped_definitions platform_end
+  (( prc == 0 )) || return "$prc"
   # NEVER wait on the umbrella Installer being Ready: on a credential-free
   # bench it never is (github-provider-kog stays 401, installer#484). Wait on
   # the specific components the bench uses: their Deployments Available and
@@ -1316,7 +1362,7 @@ s_evaluate() {
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
-               "$OUT"/api-outages*.jsonl)
+               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
