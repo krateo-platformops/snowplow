@@ -124,6 +124,7 @@ var storeRegistry = map[string]string{
 	"cache.ResolvedCacheStore.index":                  "class-keyed (identity-free classes re-gated: widgetContent→gateWidgetEnvelope, apistage→gateContentEnvelope)",
 	"cache.ResolvedCacheStore.tombstones":             "no-content",
 	"cache.listCellSet.delivered":                     "no-content (#854 per-key identity of the last informer delivery: object keys and slice identities, never a body)",
+	"cache.storeSwapsByGVR":                           "no-content (#870 / #928 per-GVR build outcome counters keyed by GroupVersionResource.String(); never a body, never an identity)",
 	"cache.listCellSet.cells":                         "free+regated (#854 incremental apistage LIST cells: the identity-free content substrate of the apistage entries they back, re-gated per requester at serve exactly as those entries are)",
 	"cache.impCapMemoT.entries":                       "no-content (#608 impersonate verdict per principal for snowplow's OWN credential; cleared per RBACGen)",
 	"cache.SeedResolveMemo.m":                         "class-keyed (R4)",
