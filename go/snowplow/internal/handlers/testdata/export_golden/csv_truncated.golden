@@ -1,0 +1,14 @@
+status: 200
+Content-Type: "text/csv; charset=utf-8"
+Content-Disposition: "attachment; filename=\"golden.csv\""
+X-Export-Truncated: "true"
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=2&resource=restactions
+call[1]: name=demo&page=2&perPage=2&resource=restactions
+body:
+id,name,nested.v
+0,row-0,0.5
+1,row-1,1.5
+2,row-2,2.5
+3,row-3,3.5
