@@ -66,7 +66,7 @@ authoritative machine-readable spec is
 |---|---|
 | `GET /call` | **The content endpoint.** Resolves the referenced `RESTAction` or `Widget` (`apiVersion`, `resource`, `name`, `namespace` query params; optional [`extras`](../go/snowplow/howto/extras.md)) — dispatched, RBAC-gated, cached. |
 | `POST/PUT/PATCH/DELETE /call` | Write passthrough to the apiserver under the caller's identity — never resolved, never cached. |
-| `GET /export` | Any `/call`-resolvable list as a CSV/JSON attachment; re-dispatches in-process with identical auth/RBAC ([export.md](../go/snowplow/howto/export.md)). |
+| `GET /export` | Any `/call`-resolvable list as a CSV, JSON or PDF attachment, with optional column labels; re-dispatches in-process with identical auth/RBAC ([export.md](../go/snowplow/howto/export.md)). |
 | `GET /list` | List resources by category in a namespace. |
 | `GET /api-info/names` | API names/plurals discovery helper. |
 | `GET /rbac` | Enumerates the (group, version, resource, verb) read-set a RESTAction *would* perform, without dispatching — for RBAC pre-generation. |

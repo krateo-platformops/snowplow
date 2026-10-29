@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,11 +19,12 @@ import (
 	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/support/pdftable"
 )
 
 // exportParams are the /export-specific query parameters, stripped from
 // the query before the request is re-dispatched through the /call lane.
-var exportParams = []string{"format", "path", "fields", "filename"}
+var exportParams = []string{"format", "path", "fields", "filename", "title", "header"}
 
 // Internal full-list pagination for an /export request that carries NO
 // page/perPage of its own (the scheduled-export shape). A single bare
@@ -46,6 +48,13 @@ var (
 // bound: the row set is a prefix of the full list, not the whole of it.
 const exportTruncatedHeader = "X-Export-Truncated"
 
+// exportBoundStatus answers a pdf export whose full list reaches the
+// exportPageSize*exportMaxPages bound. csv and json send such a list
+// truncated and flagged (exportTruncatedHeader); a pdf is a finished
+// report with no header a reader could check, so it is never sent
+// truncated: the request is refused with a JSON Status instead.
+const exportBoundStatus = http.StatusUnprocessableEntity
+
 // Export returns the GET /export handler: a GENERIC serializer layered on
 // top of the /call resolve lane. It re-dispatches the request through the
 // given /call handler chain in-process (same RBAC gate, same serve-time
@@ -56,13 +65,17 @@ const exportTruncatedHeader = "X-Export-Truncated"
 //
 // Query parameters (in addition to the /call ones):
 //
-//   - format:   "csv" (default) or "json"
+//   - format:   "csv" (default), "json" or "pdf"
 //   - path:     optional jq expression selecting the rows within the
 //     resolved envelope (e.g. ".status.items"); when omitted the
 //     rows are auto-detected (top-level array, then .items, then
 //     the first array under .status / .status.widgetData)
 //   - fields:   optional comma-separated list of dot-paths selecting and
-//     ordering the CSV columns (default: union of flattened keys)
+//     ordering the CSV/PDF columns (default: union of flattened keys)
+//   - header:   optional column label, repeated once per field in fields
+//     order (header=Name&header=Created%2C%20UTC); used as the CSV header
+//     row, the JSON keys and the PDF header row (see parseHeaderLabels)
+//   - title:    pdf only: the report title (default: the resource name)
 //   - filename: optional attachment filename (sanitized; extension added)
 //
 // Pagination semantics: a caller that supplies page/perPage exports
@@ -71,6 +84,8 @@ const exportTruncatedHeader = "X-Export-Truncated"
 // (perPage=exportPageSize) and concatenates the pages until exhaustion,
 // bounded at exportMaxPages pages (exportPageSize*exportMaxPages rows);
 // hitting the bound sets `X-Export-Truncated: true`. See collectAllPages.
+// A pdf export never ships truncated: reaching the bound is an
+// exportBoundStatus error (see servePDF).
 //
 // Every export emits an AuditEvent (action=export) so data egress is
 // correlated end-to-end like any other action.
@@ -87,24 +102,28 @@ type exportHandler struct {
 }
 
 // @Summary Export Endpoint
-// @Description Export any /call-resolvable list as CSV or JSON
+// @Description Export any /call-resolvable list as CSV, JSON or PDF
 // @ID export
 // @Param  apiVersion  query  string  true   "Resource API Group and Version"
 // @Param  resource    query  string  true   "Resource Plural"
 // @Param  name        query  string  true   "Resource name"
 // @Param  namespace   query  string  true   "Resource namespace"
-// @Param  format      query  string  false  "Export format: csv (default) or json"
+// @Param  format      query  string  false  "Export format: csv (default), json or pdf"
 // @Param  path        query  string  false  "JQ expression selecting the rows in the resolved envelope"
 // @Param  fields      query  string  false  "Comma separated list of column dot-paths"
+// @Param  header      query  []string  false  "Column label, one per field in fields order (repeat the parameter): the CSV header row, the JSON keys and the PDF header row"  collectionFormat(multi)
+// @Param  title       query  string  false  "PDF report title (default: the resource name)"
 // @Param  filename    query  string  false  "Attachment file name"
 // @Param  page        query  int     false  "Explicit /call page to export; omit (with perPage) to export the FULL list via internal pagination (capped, see X-Export-Truncated)"
 // @Param  perPage     query  int     false  "Explicit /call page size; omit (with page) to export the FULL list via internal pagination"
 // @Produce  text/csv
 // @Produce  json
+// @Produce  application/pdf
 // @Success 200 {string} string
 // @Failure 400 {object} response.Status
 // @Failure 401 {object} response.Status
 // @Failure 404 {object} response.Status
+// @Failure 422 {object} response.Status "pdf only: the full list reaches the 50,000-row export bound"
 // @Failure 500 {object} response.Status
 // @Router /export [get]
 func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
@@ -114,14 +133,19 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if format == "" {
 		format = "csv"
 	}
-	if format != "csv" && format != "json" {
+	if format != "csv" && format != "json" && format != "pdf" {
 		writeExportError(wri, http.StatusBadRequest,
-			fmt.Errorf("unsupported export format %q (want csv or json)", format))
+			fmt.Errorf("unsupported export format %q (want csv, json or pdf)", format))
 		return
 	}
 
 	rowsPath := req.URL.Query().Get("path")
 	fields := parseFields(req.URL.Query().Get("fields"))
+	labels, err := parseHeaderLabels(req.URL.Query()["header"], fields)
+	if err != nil {
+		writeExportError(wri, http.StatusBadRequest, err)
+		return
+	}
 
 	// Pagination (review fix — silent truncation): an /export carrying an
 	// explicit page/perPage exports exactly that /call window, unchanged.
@@ -168,43 +192,123 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	name := req.URL.Query().Get("name")
 	filename := attachmentName(req.URL.Query().Get("filename"), name, format)
+	auditExport := func(code int, err error) {
+		outcome := "success"
+		if err != nil {
+			outcome = "failure"
+		}
+		audit.Emit(req.Context(), audit.Event{
+			Action:    "export",
+			Verb:      http.MethodGet,
+			Resource:  req.URL.Query().Get("resource"),
+			Name:      name,
+			Namespace: req.URL.Query().Get("namespace"),
+			Outcome:   outcome,
+			Code:      code,
+			Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
+				format, len(rows), pages, truncated),
+		})
+	}
+
+	if format == "pdf" {
+		code, err := servePDF(wri, req, rows, fields, labels, truncated, filename)
+		if err != nil {
+			log.Error("unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
+		}
+		auditExport(code, err)
+		return
+	}
+
 	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	if truncated {
 		wri.Header().Set(exportTruncatedHeader, "true")
 	}
 
-	var err error
 	switch format {
 	case "json":
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
 		enc := json.NewEncoder(wri)
 		enc.SetIndent("", "  ")
-		err = enc.Encode(rows)
+		if labels != nil {
+			err = enc.Encode(labeledRows(rows, fields, labels))
+		} else {
+			err = enc.Encode(rows)
+		}
 	default:
 		wri.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		wri.WriteHeader(http.StatusOK)
-		err = writeCSV(wri, rows, fields)
+		err = writeCSV(wri, rows, fields, labels)
 	}
 	if err != nil {
 		log.Error("unable to serialize export", slog.Any("err", err))
 	}
+	auditExport(http.StatusOK, err)
+}
 
-	outcome := "success"
-	if err != nil {
-		outcome = "failure"
+// servePDF renders the rows as a PDF report and sends it. Nothing is
+// written to wri until the whole document has been built: a list that
+// reaches the bound, or a render failure, is answered with a JSON Status
+// and its code, never with a 200 and a partial or broken file. It returns
+// the status it answered with and, on failure, why.
+//
+// The report states the caller's username: the PDF body carries it on
+// purpose (who generated this report). It is never logged, and no error
+// returned here contains it.
+func servePDF(wri http.ResponseWriter, req *http.Request, rows []any, fields, labels []string, truncated bool, filename string) (int, error) {
+	if truncated {
+		err := fmt.Errorf("the list reaches the export bound of %d rows and a pdf export is never truncated: "+
+			"export it as csv or json (sent truncated and flagged %s), or a page at a time with page/perPage",
+			exportPageSize*exportMaxPages, exportTruncatedHeader)
+		writeExportError(wri, exportBoundStatus, err)
+		return exportBoundStatus, err
 	}
-	audit.Emit(req.Context(), audit.Event{
-		Action:    "export",
-		Verb:      http.MethodGet,
-		Resource:  req.URL.Query().Get("resource"),
-		Name:      name,
-		Namespace: req.URL.Query().Get("namespace"),
-		Outcome:   outcome,
-		Code:      http.StatusOK,
-		Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
-			format, len(rows), pages, truncated),
+	user, err := xcontext.UserInfo(req.Context())
+	if err != nil {
+		err = fmt.Errorf("the request carries no caller identity: %w", err)
+		writeExportError(wri, http.StatusInternalServerError, err)
+		return http.StatusInternalServerError, err
+	}
+
+	cols, cells := cellTable(rows, fields)
+	header := cols
+	if labels != nil {
+		header = labels
+	}
+	title := req.URL.Query().Get("title")
+	if title == "" {
+		title = req.URL.Query().Get("name")
+	}
+	now := time.Now().UTC()
+	doc, err := pdftable.Render(pdftable.Document{
+		Title:   title,
+		Created: now,
+		Meta: []string{
+			"Generated: " + now.Format(time.RFC3339),
+			"User: " + user.Username,
+			fmt.Sprintf("Rows: %d", len(rows)),
+		},
+		Header: header,
+		Rows:   cells,
 	})
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, pdftable.ErrHeaderTooTall) {
+			code = http.StatusBadRequest // the caller's labels or fields; shorter ones render
+		}
+		writeExportError(wri, code, err)
+		return code, err
+	}
+
+	wri.Header().Set("Content-Type", "application/pdf")
+	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	wri.Header().Set("Content-Length", strconv.Itoa(len(doc)))
+	wri.Header().Set("X-Content-Type-Options", "nosniff")
+	wri.WriteHeader(http.StatusOK)
+	if _, err := wri.Write(doc); err != nil {
+		return http.StatusOK, fmt.Errorf("send pdf: %w", err)
+	}
+	return http.StatusOK, nil
 }
 
 // dispatchCall re-dispatches the request through the /call lane
@@ -423,23 +527,23 @@ func normalizeRows(v any) []any {
 	}
 }
 
-// writeCSV flattens each row (nested maps become dot-path columns,
-// arrays are JSON-encoded) and writes an RFC 4180 CSV. Column set/order:
-// the explicit fields list when given, else the sorted union of the
-// flattened keys across all rows.
-func writeCSV(wri http.ResponseWriter, rows []any, fields []string) error {
-	flat := make([]map[string]string, 0, len(rows))
+// flattenRows flattens every row (flattenLeaves) and resolves the column
+// set/order: the explicit fields list when given, else the sorted union of
+// the flattened keys across all rows. csv, the labelled json and pdf all
+// select their columns through it.
+func flattenRows(rows []any, fields []string) (cols []string, flat []map[string]any) {
+	flat = make([]map[string]any, 0, len(rows))
 	colSet := map[string]struct{}{}
 	for _, row := range rows {
-		fr := map[string]string{}
-		flattenInto(fr, "", row)
+		fr := map[string]any{}
+		flattenLeaves(fr, "", row)
 		for k := range fr {
 			colSet[k] = struct{}{}
 		}
 		flat = append(flat, fr)
 	}
 
-	cols := fields
+	cols = fields
 	if len(cols) == 0 {
 		cols = make([]string, 0, len(colSet))
 		for k := range colSet {
@@ -447,15 +551,28 @@ func writeCSV(wri http.ResponseWriter, rows []any, fields []string) error {
 		}
 		sort.Strings(cols)
 	}
+	return cols, flat
+}
+
+// writeCSV flattens each row (nested maps become dot-path columns,
+// arrays are JSON-encoded) and writes an RFC 4180 CSV. Column set/order:
+// see flattenRows. The header row is labels when given, else the column
+// dot-paths.
+func writeCSV(wri http.ResponseWriter, rows []any, fields, labels []string) error {
+	cols, flat := flattenRows(rows, fields)
+	header := cols
+	if labels != nil {
+		header = labels
+	}
 
 	w := csv.NewWriter(wri)
-	if err := w.Write(cols); err != nil {
+	if err := w.Write(header); err != nil {
 		return err
 	}
 	rec := make([]string, len(cols))
 	for _, fr := range flat {
 		for i, c := range cols {
-			rec[i] = fr[c]
+			rec[i] = csvCell(fr[c])
 		}
 		if err := w.Write(rec); err != nil {
 			return err
@@ -465,46 +582,117 @@ func writeCSV(wri http.ResponseWriter, rows []any, fields []string) error {
 	return w.Error()
 }
 
-// flattenInto flattens nested maps to dot-path keys; scalars are
-// stringified and composite leaves (arrays, empty maps) JSON-encoded.
-func flattenInto(out map[string]string, prefix string, v any) {
-	switch t := v.(type) {
-	case map[string]any:
-		if len(t) == 0 {
-			out[keyOrRoot(prefix)] = "{}"
-			return
+// csvCell is a leaf's CSV text: cellText, plus CSV formula-injection
+// neutralization (OWASP) on strings — a cell whose FIRST char is a formula
+// trigger is prefixed with a single quote so a spreadsheet renders it as
+// literal text, not an executable formula. The string case is the
+// user-controlled-text vector (resource names/labels/status text flow
+// here); numeric/bool cells are snowplow-produced and not attacker-shaped.
+// CSV-only: JSON export is unaffected (its json.Encoder escapes), and a
+// PDF cell is drawn text, never evaluated. PR #116 arch blocker.
+func csvCell(leaf any) string {
+	if s, ok := leaf.(string); ok {
+		return neutralizeCSVCell(s)
+	}
+	return cellText(leaf)
+}
+
+// cellTable is the rows' cell text in column order (see flattenRows), for
+// the pdf table.
+func cellTable(rows []any, fields []string) (cols []string, cells [][]string) {
+	cols, flat := flattenRows(rows, fields)
+	cells = make([][]string, len(flat))
+	for r, fr := range flat {
+		cells[r] = make([]string, len(cols))
+		for i, c := range cols {
+			cells[r][i] = cellText(fr[c])
 		}
+	}
+	return cols, cells
+}
+
+// flattenLeaves flattens nested maps to dot-path keys holding the leaves
+// as decoded: scalars, null, arrays and empty maps.
+func flattenLeaves(out map[string]any, prefix string, v any) {
+	if t, ok := v.(map[string]any); ok && len(t) > 0 {
 		for k, cv := range t {
 			p := k
 			if prefix != "" {
 				p = prefix + "." + k
 			}
-			flattenInto(out, p, cv)
+			flattenLeaves(out, p, cv)
 		}
+		return
+	}
+	out[keyOrRoot(prefix)] = v
+}
+
+// cellText stringifies a leaf: strings as they are, bools and numbers in
+// their JSON spelling, null (and a missing column) as empty, composite
+// leaves (arrays, empty maps) JSON-encoded.
+func cellText(leaf any) string {
+	switch t := leaf.(type) {
 	case nil:
-		out[keyOrRoot(prefix)] = ""
+		return ""
 	case string:
-		// CSV formula-injection neutralization (OWASP): a cell whose FIRST
-		// char is a formula trigger is prefixed with a single quote so a
-		// spreadsheet renders it as literal text, not an executable formula.
-		// The string case is the user-controlled-text vector (resource
-		// names/labels/status text flow here); numeric/bool cells are
-		// snowplow-produced and not attacker-shaped. CSV-only path (flattenInto
-		// is called solely by writeCSV) — JSON export is unaffected (its
-		// json.Encoder escapes). PR #116 arch blocker.
-		out[keyOrRoot(prefix)] = neutralizeCSVCell(t)
+		return t
 	case bool:
-		out[keyOrRoot(prefix)] = fmt.Sprintf("%t", t)
+		return fmt.Sprintf("%t", t)
 	case float64:
-		out[keyOrRoot(prefix)] = strconv64(t)
+		return strconv64(t)
 	default:
 		dat, err := json.Marshal(t)
 		if err != nil {
-			out[keyOrRoot(prefix)] = fmt.Sprintf("%v", t)
-			return
+			return fmt.Sprintf("%v", t)
 		}
-		out[keyOrRoot(prefix)] = string(dat)
+		return string(dat)
 	}
+}
+
+// labeledRow is one row of a labelled json export: the label/value pairs
+// in column order (a Go map would sort the keys).
+type labeledRow struct {
+	labels []string
+	values []any
+}
+
+func (r labeledRow) MarshalJSON() ([]byte, error) {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i, l := range r.labels {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		k, err := json.Marshal(l)
+		if err != nil {
+			return nil, err
+		}
+		v, err := json.Marshal(r.values[i])
+		if err != nil {
+			return nil, err
+		}
+		b.Write(k)
+		b.WriteByte(':')
+		b.Write(v)
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
+}
+
+// labeledRows is the json body of a labelled export: one object per row
+// whose keys are the labels, in fields order, and whose values are the
+// selected leaves as decoded (a missing column is null).
+func labeledRows(rows []any, fields, labels []string) []labeledRow {
+	_, flat := flattenRows(rows, fields)
+	out := make([]labeledRow, len(flat))
+	for r, fr := range flat {
+		values := make([]any, len(fields))
+		for i, f := range fields {
+			values[i] = fr[f]
+		}
+		out[r] = labeledRow{labels: labels, values: values}
+	}
+	return out
 }
 
 func keyOrRoot(prefix string) string {
@@ -543,6 +731,34 @@ func strconv64(f float64) string {
 		return fmt.Sprintf("%d", int64(f))
 	}
 	return fmt.Sprintf("%g", f)
+}
+
+// parseHeaderLabels validates the optional column labels: one `header`
+// query parameter per selected field, in fields order. The encoding is a
+// repeated parameter, not a comma list, so a label may hold any character,
+// commas included (header=Created%2C%20UTC). Labels name columns by
+// position, so they need an explicit fields list of the same length, and
+// they must be unique because they become the JSON keys. A label is used
+// verbatim. No header parameter returns nil: the columns are headed by
+// their dot-paths, as before.
+func parseHeaderLabels(raw, fields []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if len(fields) == 0 {
+		return nil, errors.New("header labels need an explicit fields list: one header parameter per field, in the same order")
+	}
+	if len(raw) != len(fields) {
+		return nil, fmt.Errorf("got %d header labels for %d fields: give one header parameter per field, in the same order", len(raw), len(fields))
+	}
+	seen := make(map[string]struct{}, len(raw))
+	for i, l := range raw {
+		if _, dup := seen[l]; dup {
+			return nil, fmt.Errorf("header label %d repeats an earlier label: labels name the columns and the JSON keys, so they must be unique", i+1)
+		}
+		seen[l] = struct{}{}
+	}
+	return raw, nil
 }
 
 func parseFields(raw string) []string {

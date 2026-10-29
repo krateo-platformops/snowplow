@@ -1263,7 +1263,7 @@ func main() {
 	cache.RegisterScopedRoute("POST /call/read", cache.ScopeCallGeneric)
 
 	// GET /export — GENERIC export: any /call-resolvable list
-	// (RESTAction or list/table Widget) serialized as a CSV/JSON
+	// (RESTAction or list/table Widget) serialized as a CSV/JSON/PDF
 	// attachment. The handler re-dispatches IN-PROCESS through the same
 	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
 	// and serve-time user-aware filtering — export can never see more
