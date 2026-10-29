@@ -1,0 +1,759 @@
+{
+ "after": {
+  "snowplow_apiserver_fallthrough_cells": {},
+  "snowplow_apiserver_fallthrough_total": 0,
+  "snowplow_crd_discovery": {
+   "crd_discovery_noop": 0,
+   "delete_skipped_ng": 0,
+   "deletes_processed": 0,
+   "discovery_invoked": 0,
+   "discovery_skipped_ng": 0,
+   "events_dropped": 0,
+   "events_enqueued": 0,
+   "events_parked": 0,
+   "events_processed": 0,
+   "list_refused_checks_total": 0,
+   "list_refused_crd_unknown_total": 0,
+   "list_refused_dropped_total": 0,
+   "list_refused_still_served_total": 0,
+   "panics_recovered": 0,
+   "refused_version_pruned_total": 0,
+   "schema_relists_fired": 0,
+   "schema_unchanged": 0,
+   "stale_version_pruned_total": 0,
+   "unserved_version_registrations_refused_total": 0
+  },
+  "snowplow_deps_dirty_mark_attribution": {
+   "by_bucket": [
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_add",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "list_dep",
+     "count": 0
+    }
+   ],
+   "by_entry_class": {
+    "apistage": 0,
+    "raFullList": 0,
+    "restactions": 0,
+    "unknown": 0,
+    "unregistered": 0,
+    "widgetContent": 0,
+    "widgets": 0
+   },
+   "by_gvr": {},
+   "events_total": 0,
+   "submit_source": {
+    "reconcile": 0,
+    "store_swap": 0,
+    "watch": 0
+   },
+   "unattributed": 0
+  },
+  "snowplow_list_incremental": {
+   "anchor_settling_keys": 0,
+   "anchor_skipped": 0,
+   "anchors": 0,
+   "applied_keys": 0,
+   "decodes": 0,
+   "divergence_total": 0,
+   "divergences": {},
+   "gen_alloc_bytes_max": 0,
+   "gen_alloc_bytes_total": 0,
+   "gen_alloc_count": 0,
+   "generations": 0,
+   "items_built": 0,
+   "live": 0,
+   "passes": 0,
+   "pending_recorded": 0,
+   "rawjson_built": 0,
+   "reads": 0,
+   "rebinds": 0,
+   "refresh_skipped": 0,
+   "restamps": 0,
+   "suspects": 0,
+   "unanchors": {}
+  },
+  "snowplow_resolved_cache": {},
+  "snowplow_resolved_cache_denial_only_put_total": {
+   "call_ra": 0,
+   "call_widget": 0,
+   "ra_full_list": 0,
+   "refresher": 0,
+   "seed": 0
+  },
+  "snowplow_store_swap": {
+   "store_swap_deliveries_total": 2,
+   "store_swap_m_keys_total": 3,
+   "store_swap_regressed_keys": 0,
+   "store_swap_reused_objects_total": 4997,
+   "store_swap_schema_unowned_total": 0,
+   "store_swap_superseded_total": 0,
+   "store_swaps_total": 1
+  },
+  "snowplow_store_swap_known_stale": {
+   "store_swap_detect_to_push_ms": {
+    "divergence|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    }
+   },
+   "store_swap_install_to_push_ms": {
+    "divergence|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    }
+   },
+   "store_swap_known_stale_builds_total": {
+    "divergence|abort_clean": 1,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_known_stale_keys_open": {
+    "divergence": 0,
+    "schema": 0
+   },
+   "store_swap_known_stale_keys_total": {
+    "divergence|abort_clean": 2,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_known_stale_window_open_seconds_max": {
+    "divergence": 0,
+    "schema": 0
+   },
+   "store_swap_known_stale_window_seconds_total": {
+    "divergence|abort_clean": 3,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_ledger_closes_total": {
+    "divergence|evicted": 0,
+    "divergence|known_stale": 0,
+    "divergence|live_event": 0,
+    "divergence|pushed": 0,
+    "divergence|pushed_on_arm": 0,
+    "divergence|pushed_resync": 0,
+    "schema|evicted": 0,
+    "schema|known_stale": 0,
+    "schema|live_event": 0,
+    "schema|pushed": 0,
+    "schema|pushed_on_arm": 0,
+    "schema|pushed_resync": 0
+   },
+   "store_swap_ledger_owed": {
+    "divergence": 0,
+    "schema": 0
+   }
+  },
+  "snowplow_store_swaps_by_gvr": {
+   "composition.krateo.io/v1-2-2, Resource=compositions": {
+    "abort_clean": 1,
+    "abort_refused": 0,
+    "abort_teardown": 0,
+    "installed": 1,
+    "superseded": 0
+   }
+  },
+  "snowplow_store_verification": {
+   "store_divergence_candidates_total": 0,
+   "store_divergence_cleared_total": 0,
+   "store_divergence_pending_keys": 0,
+   "store_divergence_pending_oldest_age_seconds": 0,
+   "store_divergence_pending_resolved_lost_total": 0,
+   "store_divergence_pending_resolved_received_total": 0,
+   "store_divergence_pending_superseded_total": 0,
+   "store_divergence_received_total": 0,
+   "store_divergence_store_ahead_total": 0,
+   "store_divergence_undecided_total": 0,
+   "store_divergence_unrecorded_total": 0,
+   "store_divergent_lost_add_forced_total": 0,
+   "store_divergent_lost_add_snapshot_total": 0,
+   "store_divergent_lost_delete_forced_total": 0,
+   "store_divergent_lost_delete_snapshot_total": 0,
+   "store_divergent_lost_update_forced_total": 0,
+   "store_divergent_lost_update_snapshot_total": 0,
+   "store_divergent_uid_mismatch_forced_total": 0,
+   "store_divergent_uid_mismatch_snapshot_total": 0,
+   "store_gvrs_undecorated": 0,
+   "store_gvrs_unverifiable": 0,
+   "store_gvrs_unverified": 0,
+   "store_objects_verified_total": 0,
+   "store_position_unavailable": 0,
+   "store_repair_ineffective_total": 0,
+   "store_repair_suppressed_total": 0,
+   "store_repair_unsupported_total": 0,
+   "store_repairs_fired_total": 0,
+   "store_verification_forced_lists_total": 0,
+   "store_verification_invalidated_total": 0,
+   "store_verification_max_age_seconds": 0,
+   "store_verification_skipped_total": 0,
+   "store_verifications_total": 0
+  },
+  "snowplow_store_verification_pending_by_gvr": {},
+  "snowplow_store_verification_skipped_by_reason": {},
+  "snowplow_store_verification_unverifiable_by_reason": {}
+ },
+ "before": {
+  "snowplow_apiserver_fallthrough_cells": {},
+  "snowplow_apiserver_fallthrough_total": 0,
+  "snowplow_crd_discovery": {
+   "crd_discovery_noop": 0,
+   "delete_skipped_ng": 0,
+   "deletes_processed": 0,
+   "discovery_invoked": 0,
+   "discovery_skipped_ng": 0,
+   "events_dropped": 0,
+   "events_enqueued": 0,
+   "events_parked": 0,
+   "events_processed": 0,
+   "list_refused_checks_total": 0,
+   "list_refused_crd_unknown_total": 0,
+   "list_refused_dropped_total": 0,
+   "list_refused_still_served_total": 0,
+   "panics_recovered": 0,
+   "refused_version_pruned_total": 0,
+   "schema_relists_fired": 0,
+   "schema_unchanged": 0,
+   "stale_version_pruned_total": 0,
+   "unserved_version_registrations_refused_total": 0
+  },
+  "snowplow_deps_dirty_mark_attribution": {
+   "by_bucket": [
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "add_update",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "degraded",
+     "class": "self",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "object_event",
+     "cause": "delete",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_add",
+     "class": "list_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "exact_dep",
+     "count": 0
+    },
+    {
+     "path": "type_event",
+     "cause": "crd_delete",
+     "class": "list_dep",
+     "count": 0
+    }
+   ],
+   "by_entry_class": {
+    "apistage": 0,
+    "raFullList": 0,
+    "restactions": 0,
+    "unknown": 0,
+    "unregistered": 0,
+    "widgetContent": 0,
+    "widgets": 0
+   },
+   "by_gvr": {},
+   "events_total": 0,
+   "submit_source": {
+    "reconcile": 0,
+    "store_swap": 0,
+    "watch": 0
+   },
+   "unattributed": 0
+  },
+  "snowplow_list_incremental": {
+   "anchor_settling_keys": 0,
+   "anchor_skipped": 0,
+   "anchors": 0,
+   "applied_keys": 0,
+   "decodes": 0,
+   "divergence_total": 0,
+   "divergences": {},
+   "gen_alloc_bytes_max": 0,
+   "gen_alloc_bytes_total": 0,
+   "gen_alloc_count": 0,
+   "generations": 0,
+   "items_built": 0,
+   "live": 0,
+   "passes": 0,
+   "pending_recorded": 0,
+   "rawjson_built": 0,
+   "reads": 0,
+   "rebinds": 0,
+   "refresh_skipped": 0,
+   "restamps": 0,
+   "suspects": 0,
+   "unanchors": {}
+  },
+  "snowplow_resolved_cache": {},
+  "snowplow_resolved_cache_denial_only_put_total": {
+   "call_ra": 0,
+   "call_widget": 0,
+   "ra_full_list": 0,
+   "refresher": 0,
+   "seed": 0
+  },
+  "snowplow_store_swap": {
+   "store_swap_deliveries_total": 0,
+   "store_swap_m_keys_total": 0,
+   "store_swap_regressed_keys": 0,
+   "store_swap_reused_objects_total": 0,
+   "store_swap_schema_unowned_total": 0,
+   "store_swap_superseded_total": 0,
+   "store_swaps_total": 0
+  },
+  "snowplow_store_swap_known_stale": {
+   "store_swap_detect_to_push_ms": {
+    "divergence|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    }
+   },
+   "store_swap_install_to_push_ms": {
+    "divergence|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "divergence|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|evicted": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|known_stale": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|live_event": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_on_arm": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    },
+    "schema|pushed_resync": {
+     "count": 0,
+     "max_ms": 0,
+     "sum_ms": 0
+    }
+   },
+   "store_swap_known_stale_builds_total": {
+    "divergence|abort_clean": 0,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_known_stale_keys_open": {
+    "divergence": 0,
+    "schema": 0
+   },
+   "store_swap_known_stale_keys_total": {
+    "divergence|abort_clean": 0,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_known_stale_window_open_seconds_max": {
+    "divergence": 0,
+    "schema": 0
+   },
+   "store_swap_known_stale_window_seconds_total": {
+    "divergence|abort_clean": 0,
+    "divergence|abort_refused": 0,
+    "divergence|abort_teardown": 0,
+    "divergence|swap": 0,
+    "schema|abort_clean": 0,
+    "schema|abort_refused": 0,
+    "schema|abort_teardown": 0,
+    "schema|swap": 0
+   },
+   "store_swap_ledger_closes_total": {
+    "divergence|evicted": 0,
+    "divergence|known_stale": 0,
+    "divergence|live_event": 0,
+    "divergence|pushed": 0,
+    "divergence|pushed_on_arm": 0,
+    "divergence|pushed_resync": 0,
+    "schema|evicted": 0,
+    "schema|known_stale": 0,
+    "schema|live_event": 0,
+    "schema|pushed": 0,
+    "schema|pushed_on_arm": 0,
+    "schema|pushed_resync": 0
+   },
+   "store_swap_ledger_owed": {
+    "divergence": 0,
+    "schema": 0
+   }
+  },
+  "snowplow_store_swaps_by_gvr": {},
+  "snowplow_store_verification": {
+   "store_divergence_candidates_total": 0,
+   "store_divergence_cleared_total": 0,
+   "store_divergence_pending_keys": 0,
+   "store_divergence_pending_oldest_age_seconds": 0,
+   "store_divergence_pending_resolved_lost_total": 0,
+   "store_divergence_pending_resolved_received_total": 0,
+   "store_divergence_pending_superseded_total": 0,
+   "store_divergence_received_total": 0,
+   "store_divergence_store_ahead_total": 0,
+   "store_divergence_undecided_total": 0,
+   "store_divergence_unrecorded_total": 0,
+   "store_divergent_lost_add_forced_total": 0,
+   "store_divergent_lost_add_snapshot_total": 0,
+   "store_divergent_lost_delete_forced_total": 0,
+   "store_divergent_lost_delete_snapshot_total": 0,
+   "store_divergent_lost_update_forced_total": 0,
+   "store_divergent_lost_update_snapshot_total": 0,
+   "store_divergent_uid_mismatch_forced_total": 0,
+   "store_divergent_uid_mismatch_snapshot_total": 0,
+   "store_gvrs_undecorated": 0,
+   "store_gvrs_unverifiable": 0,
+   "store_gvrs_unverified": 0,
+   "store_objects_verified_total": 0,
+   "store_position_unavailable": 0,
+   "store_repair_ineffective_total": 0,
+   "store_repair_suppressed_total": 0,
+   "store_repair_unsupported_total": 0,
+   "store_repairs_fired_total": 0,
+   "store_verification_forced_lists_total": 0,
+   "store_verification_invalidated_total": 0,
+   "store_verification_max_age_seconds": 0,
+   "store_verification_skipped_total": 0,
+   "store_verifications_total": 0
+  },
+  "snowplow_store_verification_pending_by_gvr": {},
+  "snowplow_store_verification_skipped_by_reason": {},
+  "snowplow_store_verification_unverifiable_by_reason": {}
+ },
+ "source": "bench #969: rendered by #928 a2e5e055's own expvar funcs (internal/cache, -tags unit, CACHE_ENABLED=true); one divergence build accounted by RunStoreSwapAbortForTest (2 keys, 3 s, abort_clean) and its per-GVR abort_clean through the production noteSwapOutcome (NoteStoreSwapOutcomeForTest); then swaps+1 with that GVR's installed+1 (NoteStoreSwapOutcomeForTest), m_keys+3, deliveries+2, reused+4997 set directly"
+}

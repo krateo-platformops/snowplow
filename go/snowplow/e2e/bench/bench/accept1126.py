@@ -74,7 +74,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from bench import cluster
+from bench import cluster, store_rebuild
 from bench.phases import StageProof, _now_iso, load_state, save_state
 
 
@@ -113,6 +113,10 @@ K_DEPS = "snowplow_deps"
 K_RESOLVED = "snowplow_resolved_cache"
 K_BROADCAST = "snowplow_refresh_broadcaster"
 K_CRD = "snowplow_crd_discovery"
+#: #969 (#870, 1.12.60): build-and-swap replaces the relist, its re-fire and its bridge
+K_SWAP = store_rebuild.SWAP
+K_SWAP_KS = store_rebuild.SWAP_KS
+K_LIST_INCREMENTAL = store_rebuild.LIST_INCREMENTAL
 
 #: §16 defence-in-depth ceiling: the periodic reconcile ticker samples at most
 #: 512 entries every 30 s. A manual /debug/reconcile full walk blows past it.
@@ -478,13 +482,81 @@ def snapshot_counters(snapshot: dict) -> dict:
     return out
 
 
-def snapshot_crd_counters(snapshot: dict) -> dict:
-    """The §14.3 bridge counters, for the gated CRD-relist stage only."""
-    stats = ["schema_relists_fired", "schema_unchanged",
-             "relist_bridge_runs_total", "relist_bridge_enqueued_total",
-             "relist_bridge_timeout_total", "relist_bridge_aborted_total",
-             "relist_dirtymark_postsync_total", "relist_postsync_timeout_total"]
-    return {f"{K_CRD}.{s}": expvar_get(snapshot, K_CRD, s) for s in stats}
+def expvar_member(snapshot: dict, parent: str, stat: str, label: str, *, open_map: bool = False) -> int | float:
+    """`parent.stat[label]` from a counter map. A CLOSED map (#870's labelled
+    family: every label exists from the first scrape) must carry the label; an
+    OPEN map (created on its first count, e.g. snowplow_list_incremental's
+    unanchors) reads 0 for a label it has not counted yet, but only when the
+    map itself is published."""
+    if parent not in snapshot or not isinstance(snapshot[parent], dict) or stat not in snapshot[parent]:
+        raise AssertionsFailed(f"expvar {parent}.{stat} absent from /debug/vars: not a zero")
+    m = snapshot[parent][stat]
+    if not isinstance(m, dict):
+        raise AssertionsFailed(f"expvar {parent}.{stat} is not a map ({type(m).__name__})")
+    if label not in m:
+        if open_map:
+            return 0
+        raise AssertionsFailed(f"expvar {parent}.{stat}[{label!r}] absent (present: {sorted(m)[:12]})")
+    return m[label]
+
+
+# #969: the CRD stage reads the counters of the mechanism the build PUBLISHES
+# (store_rebuild.mechanism), never one chosen by version: (parent, stat, label,
+# open_map). Deltas are taken over these; END are read at the stage's end.
+CRD_COUNTERS = {
+    "relist": [(K_CRD, s, None, False) for s in (
+        "schema_relists_fired", "schema_unchanged",
+        "relist_bridge_runs_total", "relist_bridge_enqueued_total",
+        "relist_bridge_timeout_total", "relist_bridge_aborted_total",
+        "relist_dirtymark_postsync_total", "relist_postsync_timeout_total")],
+    "build_and_swap": (
+        [(K_CRD, s, None, False) for s in ("schema_relists_fired", "schema_unchanged")]
+        + [(K_SWAP, s, None, False) for s in ("store_swaps_total", "store_swap_m_keys_total",
+                                               "store_swap_deliveries_total", "store_swap_superseded_total",
+                                               "store_swap_regressed_keys", "store_swap_schema_unowned_total")]
+        + [(K_SWAP_KS, f"store_swap_known_stale_{q}_total", f"{r}|{o}", False)
+           for q in ("builds", "keys", "window_seconds") for r in store_rebuild.REASONS
+           for o in store_rebuild.OUTCOMES]
+        + [(K_SWAP_KS, "store_swap_ledger_closes_total", f"{r}|{c}", False)
+           for r in store_rebuild.REASONS for c in store_rebuild.CLOSES]
+        + [(K_LIST_INCREMENTAL, "unanchors", "type_event", True)]),
+}
+CRD_END = {
+    "relist": [],
+    "build_and_swap": (
+        [(K_SWAP_KS, g, r, False) for g in ("store_swap_known_stale_keys_open",
+                                             "store_swap_known_stale_window_open_seconds_max",
+                                             "store_swap_ledger_owed") for r in store_rebuild.REASONS]
+        + [(K_SWAP_KS, h, f"{r}|{c}", False) for h in ("store_swap_detect_to_push_ms",
+                                                        "store_swap_install_to_push_ms")
+           for r in store_rebuild.REASONS for c in store_rebuild.CLOSES]),
+}
+
+
+def _qkey(parent: str, stat: str, label: str | None) -> str:
+    return f"{parent}.{stat}" if label is None else f"{parent}.{stat}[{label}]"
+
+
+def crd_mechanism(snapshot: dict) -> str:
+    """The rebuild mechanism this snapshot publishes; neither or both refuses
+    the stage (no row is read against counters the build does not publish)."""
+    mech, why = store_rebuild.mechanism(snapshot)
+    if mech is None:
+        raise AssertionsFailed(f"the build's store-rebuild mechanism is not known: it {why}")
+    return mech
+
+
+def snapshot_crd_counters(snapshot: dict, mech: str) -> dict:
+    """The CRD stage's cumulative counters under `mech` (§14.3; #969)."""
+    return {_qkey(p, st, lb): (expvar_get(snapshot, p, st) if lb is None
+                               else expvar_member(snapshot, p, st, lb, open_map=om))
+            for p, st, lb, om in CRD_COUNTERS[mech]}
+
+
+def crd_end_readings(snapshot: dict, mech: str) -> dict:
+    """The gauges and histograms read once, at the stage's end."""
+    return {f"end:{_qkey(p, st, lb)}": expvar_member(snapshot, p, st, lb, open_map=om)
+            for p, st, lb, om in CRD_END[mech]}
 
 
 def delta(before: dict, after: dict) -> dict:
@@ -676,12 +748,15 @@ def wait_hook(run_dir: Path, name: str, run_id: str, not_before: str,
 
 @dataclass
 class Row:
-    """One assertion. `check` takes the delta dict and returns (ok, actual)."""
+    """One assertion. `check` takes the delta dict and returns (ok, actual).
+    `gates` False: reported with its result and `why`, never failing the stage."""
     rid: str
     what: str
     key: str | None
     expect: str
     check: Callable[[dict], tuple[bool, Any]]
+    gates: bool = True
+    why: str | None = None
 
 
 def _eq(key: str, want: int) -> Callable[[dict], tuple[bool, Any]]:
@@ -773,8 +848,26 @@ def burst_rows(n: int) -> list[Row]:
     ]
 
 
-def crd_rows() -> list[Row]:
-    """§14.3 / §15.4 — the gated relist stage's bridge counters."""
+def crd_rows(mech: str, changed: int = 0) -> list[Row]:
+    """§14.3 / §15.4 — the gated CRD stage, by the mechanism the build
+    publishes (#969). `changed`: the objects whose served bytes the widen
+    changes (widen_changed_objects, from the stage's fixture)."""
+    return CRD_ROWS[mech](changed)
+
+
+#: why the full widen's B3 is report only (#987 review F3): #928's deliveries
+#: and M leave out a key a LIVE event delivered first, and a CRD update ends the
+#: live watches, so the live informer may re-list and deliver the defaulted
+#: objects itself; #928 publishes no count of those. With changed == 0 (B1) a
+#: re-list delivers identical bytes and B3 stays exact.
+B3_LIVE_FIRST = ("a CRD update ends the live watches, so the live informer may re-list and deliver the "
+                 "changed objects before the swap; #928's deliveries and M leave those out and it publishes no "
+                 "count of them, so B3 cannot be exact against the changed objects until a cluster run "
+                 "shows the live copy does not re-list")
+
+
+def _crd_rows_relist(changed: int = 0) -> list[Row]:
+    """The relist, its 1.12.5 re-fire and its 1.12.6 bridge (to 1.12.59)."""
     C = K_CRD
     return [
         Row("B1", "a real structural schema change was detected",
@@ -800,6 +893,92 @@ def crd_rows() -> list[Row]:
     ]
 
 
+def _all(*checks: Callable[[dict], tuple[bool, Any]]) -> Callable[[dict], tuple[bool, Any]]:
+    """Every check holds; the actual is each one's."""
+    def f(d):
+        rs = [c(d) for c in checks]
+        return all(ok for ok, _ in rs), [a for _, a in rs]
+    return f
+
+
+def _sum_eq(keys: list[str], want: int) -> Callable[[dict], tuple[bool, Any]]:
+    """The keys' sum equals `want`; a key absent from the delta fails."""
+    def f(d):
+        if any(k not in d for k in keys):
+            return False, {k: d.get(k) for k in keys}
+        return sum(d[k] for k in keys) == want, sum(d[k] for k in keys)
+    return f
+
+
+def _crd_rows_swap(changed: int = 0) -> list[Row]:
+    """Build-and-swap (#870, from 1.12.60): the widen builds a replacement
+    beside the live informer and swaps it in (#969's table). B3 is EXACT: the
+    swap delivers, and M holds, exactly the objects whose served bytes the
+    widen changed (`changed`, from the stage's fixture: 0 for a widen with no
+    default). The counters are process-wide, so a divergence build in the same
+    window makes them unattributable: B3 then fails, saying so."""
+    C, S, KS, LI = K_CRD, K_SWAP, K_SWAP_KS, K_LIST_INCREMENTAL
+    div_builds = [f"{KS}.store_swap_known_stale_builds_total[divergence|{o}]" for o in store_rebuild.OUTCOMES]
+    deliv, mkeys = f"{S}.store_swap_deliveries_total", f"{S}.store_swap_m_keys_total"
+    open_keys = f"end:{KS}.store_swap_known_stale_keys_open[schema]"
+    open_max = f"end:{KS}.store_swap_known_stale_window_open_seconds_max[schema]"
+    return [
+        Row("B1", "a real structural schema change was detected",
+            f"{C}.schema_relists_fired", "+1", _eq(f"{C}.schema_relists_fired", 1)),
+        Row("B2", "the build was installed (swapped in)",
+            f"{S}.store_swaps_total", ">=1", _ge(f"{S}.store_swaps_total", 1)),
+        Row("B3", f"the swap delivered exactly the {changed} object(s) whose served bytes the widen changed",
+            deliv, f"== {changed}, {mkeys} == {changed}, and no divergence build in the window",
+            _all(_eq(deliv, changed), _eq(mkeys, changed), _sum_eq(div_builds, 0)),
+            gates=changed == 0, why=None if changed == 0 else B3_LIVE_FIRST),
+        Row("B4", "THE FALSIFIER: no whole-type mark at the swap, and the build's window ended",
+            f"{LI}.unanchors[type_event]", f"0, and {open_keys} = 0",
+            _all(_eq(f"{LI}.unanchors[type_event]", 0), _eq(open_keys, 0))),
+        Row("B5", "no CRD DELETE raced the build",
+            f"{KS}.store_swap_known_stale_builds_total[schema|abort_teardown]", "0",
+            _eq(f"{KS}.store_swap_known_stale_builds_total[schema|abort_teardown]", 0)),
+        Row("B6", "the forcing step did something (thrash guard NOT hit)",
+            f"{C}.schema_unchanged", "0", _eq(f"{C}.schema_unchanged", 0)),
+        Row("B7", "the new copy synced and was installed",
+            f"{KS}.store_swap_known_stale_builds_total[schema|abort_refused]", f"0, and {open_max} = 0",
+            _all(_eq(f"{KS}.store_swap_known_stale_builds_total[schema|abort_refused]", 0), _eq(open_max, 0))),
+    ]
+
+
+CRD_ROWS = {"relist": _crd_rows_relist, "build_and_swap": _crd_rows_swap}
+
+
+def crd_swap_report(d: dict, end: dict) -> dict:
+    """Report only (the #870 paired run reads it): the stage's known-stale
+    keys and window per reason|outcome, the ledger's closes, the per-entry
+    detect / install -> push histograms, owed entries, supersedes and
+    regressions."""
+    KS, S = K_SWAP_KS, K_SWAP
+
+    def by(stat, labels, src, pre=""):
+        return {lb: src.get(f"{pre}{KS}.{stat}[{lb}]") for lb in labels
+                if src.get(f"{pre}{KS}.{stat}[{lb}]")}
+    swaps = [f"{r}|swap" for r in store_rebuild.REASONS]
+    closes = [f"{r}|{c}" for r in store_rebuild.REASONS for c in store_rebuild.CLOSES]
+    hist = {h: {lb: {k: v for k, v in (end.get(f"end:{KS}.store_swap_{h}_to_push_ms[{lb}]") or {}).items()
+                     if k in ("count", "max_ms")}
+                for lb in closes if (end.get(f"end:{KS}.store_swap_{h}_to_push_ms[{lb}]") or {}).get("count")}
+            for h in ("detect", "install")}
+    return {"known_stale_keys": by("store_swap_known_stale_keys_total", swaps, d),
+            "known_stale_window_s": by("store_swap_known_stale_window_seconds_total", swaps, d),
+            "ledger_closes": by("store_swap_ledger_closes_total", closes, d),
+            "detect_to_push_ms": hist["detect"], "install_to_push_ms": hist["install"],
+            "ledger_owed": {r: end.get(f"end:{KS}.store_swap_ledger_owed[{r}]") for r in store_rebuild.REASONS},
+            "superseded": d.get(f"{S}.store_swap_superseded_total"),
+            "regressed_keys": d.get(f"{S}.store_swap_regressed_keys"),
+            # #928 F5: the widen landed on a factory-backed GVR (no copy built; B2 then fails)
+            "schema_unowned": d.get(f"{S}.store_swap_schema_unowned_total"),
+            "note": "report only; the histograms' count and max_ms are lifetime values at the stage's end"}
+
+
+CRD_REPORT = {"relist": None, "build_and_swap": crd_swap_report}
+
+
 def evaluate(rows: list[Row], d: dict) -> tuple[bool, list[dict]]:
     """Run every row. Returns (all_passed, results) — NEVER short-circuits.
 
@@ -812,10 +991,12 @@ def evaluate(rows: list[Row], d: dict) -> tuple[bool, list[dict]]:
             ok, actual = r.check(d)
         except Exception as e:                      # a malformed delta
             ok, actual = False, f"<error: {e}>"
-        ok_all = ok_all and ok
+        if r.gates:
+            ok_all = ok_all and ok
         results.append({
             "id": r.rid, "assertion": r.what, "key": r.key,
             "expected": r.expect, "actual": actual, "passed": bool(ok),
+            **({} if r.gates else {"report_only": True, "why": r.why}),
         })
     return ok_all, results
 
@@ -1397,7 +1578,9 @@ def stage_counters_after(ctx: dict) -> dict:
         "assertions": results,
         "crosscheck_evict_delete_total": a1a2,
         "crosscheck_evidence_channels": chan,
-        "failed_rows": [r["id"] for r in results if not r["passed"]],
+        "failed_rows": [r["id"] for r in results if not r["passed"] and not r.get("report_only")],
+        # a report-only row's failure never fails the stage: listed apart (#987 review G2)
+        "report_only_failed": [r["id"] for r in results if not r["passed"] and r.get("report_only")],
     }
 
 
@@ -1477,7 +1660,8 @@ def _kubectl_apply(manifest: str, what: str) -> None:
         raise RuntimeError(f"failed to apply {what}: {err}")
 
 
-def _crd_manifest(group: str, plural: str, kind: str, *, widened: bool) -> str:
+def _crd_manifest(group: str, plural: str, kind: str, *, widened: bool,
+                  default: str | None = None) -> str:
     """The disposable CRD, in its narrow and widened forms.
 
     The ONLY difference between the two is one extra OPTIONAL property under
@@ -1486,8 +1670,12 @@ def _crd_manifest(group: str, plural: str, kind: str, *, widened: bool) -> str:
     `crd_discovery_side_effect.go:593` — so this edit changes it and a metadata
     edit would not. Optional, so no existing CR becomes invalid.
     """
+    # `default` (the full-widen stage only, #969): the apiserver applies a
+    # default when it READS an object, so that widen changes every existing
+    # object's served bytes. B1's widen has none and changes no object's bytes.
     extra = ('                  widened:\n'
-             '                    type: string\n') if widened else ""
+             '                    type: string\n'
+             + (f'                    default: {default}\n' if default is not None else "")) if widened else ""
     return (
         "apiVersion: apiextensions.k8s.io/v1\n"
         "kind: CustomResourceDefinition\n"
@@ -1517,7 +1705,21 @@ def _crd_manifest(group: str, plural: str, kind: str, *, widened: bool) -> str:
     )
 
 
+#: the spec every stage CR is created with (`_cr_manifest`)
+CR_SPEC = {"note": "s6 relist probe"}
+
+
+def widen_changed_objects(specs: list[dict], default: str | None) -> int:
+    """How many of the stage's own objects the widen changes the served bytes
+    of, from the FIXTURE (never from the instrument under test): a defaulted
+    new property changes every object that does not set it; a property with
+    no default changes none (the stored and served bytes are the same)."""
+    return sum(1 for sp in specs if default is not None and "widened" not in sp)
+
+
 def _cr_manifest(group: str, kind: str, name: str) -> str:
+    """A stage CR, its spec rendered from CR_SPEC: widen_changed_objects counts
+    what the stage applies, never a restated literal."""
     return (
         f"apiVersion: {group}/v1alpha1\n"
         f"kind: {kind}\n"
@@ -1525,7 +1727,7 @@ def _cr_manifest(group: str, kind: str, name: str) -> str:
         f"  name: {name}\n"
         f"  namespace: {NS}\n"
         "spec:\n"
-        "  note: s6 relist probe\n"
+        + "".join(f"  {k}: {v}\n" for k, v in CR_SPEC.items())
     )
 
 
@@ -1566,16 +1768,70 @@ def stage_crd_relist(ctx: dict) -> dict:
             "Creating/deleting a CRD on 057 is heavier than a CR and is never "
             "implied by the default S6 path.")
 
+    return _crd_widen_stage(ctx, crd_name=ctx["crd_name"], crs=1, default=None)
+
+
+def stage_crd_full_widen(ctx: dict) -> dict:
+    """B2 — a widen that changes EVERY object (#969; reviewer-928's full-widen
+    run, for heap and GC): `--full-widen-crs` CRs, and the widened property
+    carries a default, which the apiserver applies on read. Gated like B1, by
+    its own flag (--enable-crd-full-widen) and approval
+    (S6_CRD_FULL_WIDEN_APPROVED=1). B1 stays as it was: a widen that changes no
+    object's bytes."""
+    if not ctx.get("enable_crd_full_widen"):
+        raise RuntimeError("stage_crd_full_widen called without --enable-crd-full-widen; "
+                           "this is a programming error, not a skip.")
+    if os.environ.get("S6_CRD_FULL_WIDEN_APPROVED") != "1":
+        raise PreflightFailed(
+            "the full-widen stage is approved-gated: set S6_CRD_FULL_WIDEN_APPROVED=1 only when "
+            "Diego has approved this run (a CRD and --full-widen-crs CRs on the cluster).")
+    n = int(ctx.get("full_widen_crs") or 0)
+    if n < 1:
+        raise PreflightFailed("the full-widen stage needs --full-widen-crs N (N >= 1): how many objects "
+                              "the widen changes is the stage's parameter, never a default")
+    return _crd_widen_stage(ctx, crd_name=ctx["full_widen_crd_name"], crs=n, default="widened")
+
+
+def _memstats(snap: dict) -> dict:
+    m = snap.get("memstats") or {}
+    return {"heap_inuse_mb": round(m["HeapInuse"] / 1048576, 1) if "HeapInuse" in m else None,
+            "num_gc": m.get("NumGC"), "pause_total_ms": (round(m["PauseTotalNs"] / 1e6, 3)
+                                                          if "PauseTotalNs" in m else None),
+            "gc_cpu_fraction": m.get("GCCPUFraction")}
+
+
+def memory_during(samples: list[dict]) -> dict:
+    """The heap and GC across the stage's settle (one /debug/vars read a
+    second): peak heap_inuse against the reading before the widen, GC cycles
+    and pause time in between. Report only."""
+    ms = [_memstats(x) for x in samples]
+    heap = [m["heap_inuse_mb"] for m in ms if m["heap_inuse_mb"] is not None]
+    first, last = ms[0], ms[-1]
+
+    def d(k):
+        return (last[k] - first[k]) if last[k] is not None and first[k] is not None else None
+    return {"samples": len(ms), "heap_inuse_mb_before": first["heap_inuse_mb"],
+            "heap_inuse_mb_peak": max(heap) if heap else None,
+            "heap_inuse_mb_after": last["heap_inuse_mb"],
+            "gc_cycles": d("num_gc"), "gc_pause_ms": round(d("pause_total_ms"), 3) if d("pause_total_ms") is not None
+            else None,
+            "gc_cpu_fraction_before": first["gc_cpu_fraction"], "gc_cpu_fraction_after": last["gc_cpu_fraction"],
+            "note": "report only; GCCPUFraction is a since-start fraction (its window needs the process start)"}
+
+
+def _crd_widen_stage(ctx: dict, *, crd_name: str, crs: int, default: str | None) -> dict:
     run_dir, portal = ctx["run_dir"], ctx["portal_base"]
     reqlog, rid = ctx["reqlog"], ctx["run_id"]
     began = _now_iso()
 
-    crd_name = ctx["crd_name"]                       # "<plural>.harness.krateo.io"
-    assert_owned("crd", crd_name)
+    assert_owned("crd", crd_name)                  # "<plural>.harness.krateo.io"
     plural, group = crd_name.split(".", 1)
     kind = plural[:-1].capitalize()
-    cr_name = f"{OWNED_PREFIX}{plural}"
-    assert_owned("cr", cr_name)
+    cr_names = [f"{OWNED_PREFIX}{plural}"] if crs == 1 else [f"{OWNED_PREFIX}{plural}-{i:04d}"
+                                                              for i in range(1, crs + 1)]
+    for cr_name in cr_names:
+        assert_owned("cr", cr_name)
+    changed = widen_changed_objects([dict(CR_SPEC) for _ in cr_names], default)
 
     created_objs: list[tuple[str, str]] = []
     try:
@@ -1586,14 +1842,15 @@ def stage_crd_relist(ctx: dict) -> dict:
                        f"CRD {crd_name}")
         created_objs.append(("crd", crd_name))
 
-        # (2) one CR of the new kind.
-        _kubectl_apply(_cr_manifest(group, kind, cr_name),
-                       f"{kind}/{cr_name}")
-        created_objs.append((plural, cr_name))
+        # (2) the CRs of the new kind (one for B1).
+        for cr_name in cr_names:
+            _kubectl_apply(_cr_manifest(group, kind, cr_name),
+                           f"{kind}/{cr_name}")
+            created_objs.append((plural, cr_name))
 
         announce(run_dir, "crd_created", rid, {
             "crd": crd_name, "group": group, "plural": plural,
-            "kind": kind, "namespace": NS, "cr": cr_name,
+            "kind": kind, "namespace": NS, "cr": cr_names[0], "crs": len(cr_names),
             "next": "render a widget over this CR, then signal crd_rendered",
         })
 
@@ -1605,29 +1862,47 @@ def stage_crd_relist(ctx: dict) -> dict:
         #     fail for the wrong reason.
         wait_hook(run_dir, "crd_rendered", rid, began)
 
-        before = snapshot_crd_counters(
-            read_debug_vars(portal, ctx["token"], reqlog))
+        snap = read_debug_vars(portal, ctx["token"], reqlog)
+        mech = crd_mechanism(snap)                  # #969: the build's own mechanism
+        before = snapshot_crd_counters(snap, mech)
 
-        # (4) the bump: one extra OPTIONAL property in the structural schema.
-        _kubectl_apply(_crd_manifest(group, plural, kind, widened=True),
+        # (4) the bump: one extra OPTIONAL property in the structural schema
+        #     (with a default in the full-widen stage only).
+        _kubectl_apply(_crd_manifest(group, plural, kind, widened=True, default=default),
                        f"CRD {crd_name} (widened)")
         announce(run_dir, "crd_bumped", rid, {"crd": crd_name})
-        time.sleep(SETTLE_SECONDS)
-
-        after = snapshot_crd_counters(
-            read_debug_vars(portal, ctx["token"], reqlog))
+        mem = [snap]
+        for _ in range(SETTLE_SECONDS):             # the settle, read once a second (heap / GC)
+            time.sleep(1)
+            mem.append(read_debug_vars(portal, ctx["token"], reqlog))
+        snap = mem[-1]
+        if crd_mechanism(snap) != mech:
+            raise AssertionsFailed(f"the build's rebuild mechanism changed during the stage "
+                                   f"({mech} -> {crd_mechanism(snap)}): the pod was replaced")
+        after = snapshot_crd_counters(snap, mech)
         d = delta(before, after)
-        ok, results = evaluate(crd_rows(), d)
+        end = crd_end_readings(snap, mech)
+        ok, results = evaluate(crd_rows(mech, changed), d | end)
+        rep_fn = CRD_REPORT[mech]
 
         return {
             "__passed__": ok,
-            "crd": crd_name, "cr": cr_name, "group": group, "kind": kind,
+            "crd": crd_name, "cr": cr_names[0], "crs": len(cr_names), "group": group, "kind": kind,
+            "widen_default": default, "objects_changed_by_the_widen": changed,
             "approved": True,
+            "mechanism": mech,
+            "memory_report_only": memory_during(mem),
+            "settle": (f"{SETTLE_SECONDS} /debug/vars reads, one a second (heap / GC); the apiserver workload is "
+                       f"B1's as before; a failed read during the settle ends the stage"),
             "counters_before": before,
             "counters_after": after,
             "delta": d,
+            "end_readings": end,
+            **({"report_only": rep_fn(d, end)} if rep_fn else {}),
             "assertions": results,
-            "failed_rows": [r["id"] for r in results if not r["passed"]],
+            "failed_rows": [r["id"] for r in results if not r["passed"] and not r.get("report_only")],
+            # a report-only row's failure never fails the stage: listed apart (#987 review G2)
+            "report_only_failed": [r["id"] for r in results if not r["passed"] and r.get("report_only")],
             "known_residue": (
                 "navDiscoveredGroups is APPEND-ONLY on DELETE by ratified "
                 "design, so the disposable group name stays in that in-memory "
@@ -1686,9 +1961,35 @@ STAGES: list[tuple[str, Callable[[dict], dict], str]] = [
 ]
 
 
+def stage_list(*, enable_crd_relist: bool = False, enable_crd_full_widen: bool = False) -> list:
+    """The stages one invocation runs: S6's, then each gated CRD stage only
+    behind its own flag."""
+    stages = list(STAGES)
+    if enable_crd_relist:
+        stages.append((
+            "B1_crd_relist", stage_crd_relist,
+            "Read by the mechanism the build publishes (#969). relist (to "
+            "1.12.59): relist_bridge_timeout_total > 0 on a healthy cluster "
+            "means the bridge does NOT cover the teardown window and the "
+            "1.12.5 post-sync re-fire must stay. build_and_swap (#870): a "
+            "schema change builds the replacement beside the live informer "
+            "and swaps it in; the falsifier is a whole-type mark at the swap "
+            "(unanchors.type_event > 0) or a build window that does not end."))
+    if enable_crd_full_widen:
+        stages.append((
+            "B2_crd_full_widen", stage_crd_full_widen,
+            "A widen that changes every object's served bytes (a defaulted "
+            "property, --full-widen-crs objects; #969, reviewer-928's "
+            "full-widen run): the rows as B1's, B3 report only (a live "
+            "re-list may deliver first: B3_LIVE_FIRST); heap and GC across "
+            "the settle, report only."))
+    return stages
+
+
 def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
         crd_name: str | None = None, from_stage: str | None = None,
-        expect_bundle: str | None = None) -> int:
+        expect_bundle: str | None = None, enable_crd_full_widen: bool = False,
+        full_widen_crs: int | None = None) -> int:
     """One invocation, every stage, per-stage proofs + state.json."""
     run_dir = Path(run_dir)
     (run_dir / "proofs").mkdir(parents=True, exist_ok=True)
@@ -1722,6 +2023,9 @@ def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
         "expect_bundle": expect_bundle or os.environ.get(
             "S6_EXPECT_BUNDLE", "").strip() or None,
         "crd_name": crd_name or f"s6run{int(time.time())}{OWNED_CRD_SUFFIX}",
+        "enable_crd_full_widen": enable_crd_full_widen,
+        "full_widen_crs": full_widen_crs,
+        "full_widen_crd_name": f"s6wide{int(time.time())}{OWNED_CRD_SUFFIX}",
     }
 
     try:
@@ -1729,14 +2033,7 @@ def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
     except Exception:
         state = {"schema_version": "1.0.0", "stages": {}}
 
-    stages = list(STAGES)
-    if enable_crd_relist:
-        stages.append((
-            "B1_crd_relist", stage_crd_relist,
-            "The relist bridge's only live falsifier: "
-            "relist_bridge_timeout_total > 0 on a healthy cluster means the "
-            "bridge does NOT cover the teardown window and the 1.12.5 "
-            "post-sync re-fire must stay."))
+    stages = stage_list(enable_crd_relist=enable_crd_relist, enable_crd_full_widen=enable_crd_full_widen)
 
     started_here = from_stage is None
     failed: list[str] = []
@@ -1852,6 +2149,12 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
         help="Run the gated CRD schema-relist stage. OFF by default; also "
              "requires S6_CRD_RELIST_APPROVED=1 (Diego's approval).")
     p.add_argument("--crd-name", default=None)
+    p.add_argument(
+        "--enable-crd-full-widen", action="store_true",
+        help="Run the gated full-widen stage (B2: a defaulted property, every object's bytes change). "
+             "OFF by default; also requires S6_CRD_FULL_WIDEN_APPROVED=1 and --full-widen-crs.")
+    p.add_argument("--full-widen-crs", type=int, default=None,
+                   help="how many CRs the full-widen stage creates and widens")
     p.set_defaults(func=cmd_accept1126)
 
     h = sub.add_parser(
@@ -1871,7 +2174,9 @@ def cmd_accept1126(args) -> int:
     return run(Path(args.run_dir), args.portal_base,
                enable_crd_relist=args.enable_crd_relist,
                crd_name=args.crd_name, from_stage=args.from_stage,
-               expect_bundle=args.expect_bundle)
+               expect_bundle=args.expect_bundle,
+               enable_crd_full_widen=args.enable_crd_full_widen,
+               full_widen_crs=args.full_widen_crs)
 
 
 def cmd_accept1126_hook(args) -> int:

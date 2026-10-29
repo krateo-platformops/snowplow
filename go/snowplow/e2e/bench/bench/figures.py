@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import re
 
-from bench import apf, flowcontrol, load606
+from bench import apf, flowcontrol, load606, store_rebuild
 
 COUNTERS = ("rejected", "wait_requests", "wait_mean_s", "wait_p95_s", "wait_p99_s")
 
@@ -356,6 +356,8 @@ def run_figures(report: dict, recs: list[dict], window, facts: dict,
            "reflector_establishments_after_ready": reflector_establishments(
                [r for r in recs if r.get("kind") == "mem"], facts.get("ready_at"), k6_calls or [],
                [r for r in recs if r.get("kind") == "top"]),
+           # #969: store rebuilds, the quantities both mechanisms report (same paths on both arms)
+           "store_rebuilds": store_rebuild.figures(report.get("store_rebuild_report_only")),
            # #935: phases from the run's own schedule (load606.run_phases), as every per-phase report
            "fresh_first_visits": fresh_first_visits(
                browser, load606.run_phases([r for r in recs if r.get("kind") in ("mem_start", "mem", "mem_end")],
