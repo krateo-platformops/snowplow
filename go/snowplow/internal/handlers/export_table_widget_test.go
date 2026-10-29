@@ -66,7 +66,7 @@ const (
 // fields, not from the cells.
 var (
 	tableValueKeys = []string{"name", "ns", "size", "owner"}
-	tableTitles    = []string{"Name", "Namespace, scope", "Size (MiB)", "Owner"}
+	tableTitles    = []string{"Name", "Namespace, scope", "Size (MiB)", "Name"} // two "Name" columns, told apart by position
 )
 
 func tableWidgetCR() string {
@@ -404,19 +404,28 @@ func TestExport970_TableWidgetThroughRealCallChain(t *testing.T) {
 				t.Errorf("csv rows: %d exported, want %d in order with no duplicates or gaps", len(got), len(want))
 			}
 
-			// json: one object per row, the titles as keys in valueKey order.
+			// json: the columns (field + title, valueKey order, the two
+			// "Name" titles both kept) and every row keyed by valueKey.
 			rec = serveAsEndpoint(t, export, eps[id.user], id.user, tableExportURL("json"))
 			exported["json"] = rec.Body.String()
-			var objs []json.RawMessage
-			if err := json.Unmarshal(rec.Body.Bytes(), &objs); err != nil || rec.Code != http.StatusOK {
+			var doc struct {
+				Columns []struct{ Field, Label string } `json:"columns"`
+				Rows    []json.RawMessage               `json:"rows"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil || rec.Code != http.StatusOK {
 				t.Fatalf("json: %d %v", rec.Code, err)
 			}
-			if len(objs) != len(want) {
-				t.Errorf("json rows = %d, want %d", len(objs), len(want))
+			for i := range tableValueKeys {
+				if i >= len(doc.Columns) || doc.Columns[i].Field != tableValueKeys[i] || doc.Columns[i].Label != tableTitles[i] {
+					t.Fatalf("json columns = %+v, want valueKeys %q titled %q, in order", doc.Columns, tableValueKeys, tableTitles)
+				}
 			}
-			first := regexp.MustCompile(`\s+`).ReplaceAllString(string(objs[0]), "")
-			if wantFirst := `{"Name":"cm-a-0000","Namespace,scope":"team-a","Size(MiB)":"0","Owner":"team-a"}`; first != wantFirst {
-				t.Errorf("json first row = %s, want %s", first, wantFirst)
+			if len(doc.Rows) != len(want) {
+				t.Errorf("json rows = %d, want %d", len(doc.Rows), len(want))
+			}
+			first := regexp.MustCompile(`\s+`).ReplaceAllString(string(doc.Rows[0]), "")
+			if wantFirst := `{"name":"cm-a-0000","ns":"team-a","size":"0","owner":"team-a"}`; first != wantFirst {
+				t.Errorf("json first row = %s, want %s (keyed by valueKey, in order)", first, wantFirst)
 			}
 
 			// pdf: the titles head every page; every row exactly once.

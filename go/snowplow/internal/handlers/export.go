@@ -73,9 +73,10 @@ const exportBoundStatus = http.StatusUnprocessableEntity
 //   - fields:   optional comma-separated list of dot-paths selecting and
 //     ordering the CSV/PDF columns (default: union of flattened keys)
 //   - header:   optional column label, repeated once per field in fields
-//     order (header=Name&header=Created%2C%20UTC); used as the CSV header
-//     row, the JSON keys and the PDF header row (see parseHeaderLabels)
-//   - title:    pdf only: the report title (default: the resource name)
+//     order (header=Name&header=Created%2C%20UTC); the CSV and PDF header
+//     row, and the json columns[].label (see parseHeaderLabels, labeledJSON)
+//   - title:    pdf only: the report title (default: the resource name);
+//     ignored by csv and json
 //   - filename: optional attachment filename (sanitized; extension added)
 //
 // Pagination semantics: a caller that supplies page/perPage exports
@@ -111,8 +112,8 @@ type exportHandler struct {
 // @Param  format      query  string  false  "Export format: csv (default), json or pdf"
 // @Param  path        query  string  false  "JQ expression selecting the rows in the resolved envelope"
 // @Param  fields      query  string  false  "Comma separated list of column dot-paths"
-// @Param  header      query  []string  false  "Column label, one per field in fields order (repeat the parameter): the CSV header row, the JSON keys and the PDF header row"  collectionFormat(multi)
-// @Param  title       query  string  false  "PDF report title (default: the resource name)"
+// @Param  header      query  []string  false  "Column label, one per field in fields order (repeat the parameter); may repeat. The CSV and PDF header row; json becomes {columns:[{field,label}],rows:[{<field>:value}]}"  collectionFormat(multi)
+// @Param  title       query  string  false  "PDF report title (default: the resource name); ignored by csv and json"
 // @Param  filename    query  string  false  "Attachment file name"
 // @Param  page        query  int     false  "Explicit /call page to export; omit (with perPage) to export the FULL list via internal pagination (capped, see X-Export-Truncated)"
 // @Param  perPage     query  int     false  "Explicit /call page size; omit (with page) to export the FULL list via internal pagination"
@@ -231,7 +232,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		enc := json.NewEncoder(wri)
 		enc.SetIndent("", "  ")
 		if labels != nil {
-			err = enc.Encode(labeledRows(rows, fields, labels))
+			err = enc.Encode(labeledBody(rows, fields, labels))
 		} else {
 			err = enc.Encode(rows)
 		}
@@ -649,21 +650,40 @@ func cellText(leaf any) string {
 	}
 }
 
-// labeledRow is one row of a labelled json export: the label/value pairs
-// in column order (a Go map would sort the keys).
-type labeledRow struct {
-	labels []string
+// labeledJSON is the json body of an export that carries header labels.
+// Labels are display text and may repeat (two "Name" columns told apart by
+// position); fields are the identifiers. So the labels never become keys:
+// columns lists every selected column in fields order as {field, label},
+// and each row is an object keyed by field, its keys written in fields
+// order, holding the selected (flattened) leaves as decoded (a missing
+// column is null). A consumer pairs a row's values with their labels
+// through columns, by field or by position. Without labels the json body
+// is the extracted rows, unchanged.
+type labeledJSON struct {
+	Columns []labeledColumn `json:"columns"`
+	Rows    []fieldRow      `json:"rows"`
+}
+
+type labeledColumn struct {
+	Field string `json:"field"`
+	Label string `json:"label"`
+}
+
+// fieldRow is one row keyed by field, written in fields order (a Go map
+// would sort the keys).
+type fieldRow struct {
+	fields []string
 	values []any
 }
 
-func (r labeledRow) MarshalJSON() ([]byte, error) {
+func (r fieldRow) MarshalJSON() ([]byte, error) {
 	var b bytes.Buffer
 	b.WriteByte('{')
-	for i, l := range r.labels {
+	for i, f := range r.fields {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		k, err := json.Marshal(l)
+		k, err := json.Marshal(f)
 		if err != nil {
 			return nil, err
 		}
@@ -679,18 +699,20 @@ func (r labeledRow) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// labeledRows is the json body of a labelled export: one object per row
-// whose keys are the labels, in fields order, and whose values are the
-// selected leaves as decoded (a missing column is null).
-func labeledRows(rows []any, fields, labels []string) []labeledRow {
+// labeledBody builds the json body of a labelled export (labeledJSON).
+func labeledBody(rows []any, fields, labels []string) labeledJSON {
+	out := labeledJSON{Columns: make([]labeledColumn, len(fields))}
+	for i, f := range fields {
+		out.Columns[i] = labeledColumn{Field: f, Label: labels[i]}
+	}
 	_, flat := flattenRows(rows, fields)
-	out := make([]labeledRow, len(flat))
+	out.Rows = make([]fieldRow, len(flat))
 	for r, fr := range flat {
 		values := make([]any, len(fields))
 		for i, f := range fields {
 			values[i] = fr[f]
 		}
-		out[r] = labeledRow{labels: labels, values: values}
+		out.Rows[r] = fieldRow{fields: fields, values: values}
 	}
 	return out
 }
@@ -736,11 +758,13 @@ func strconv64(f float64) string {
 // parseHeaderLabels validates the optional column labels: one `header`
 // query parameter per selected field, in fields order. The encoding is a
 // repeated parameter, not a comma list, so a label may hold any character,
-// commas included (header=Created%2C%20UTC). Labels name columns by
-// position, so they need an explicit fields list of the same length, and
-// they must be unique because they become the JSON keys. A label is used
-// verbatim. No header parameter returns nil: the columns are headed by
-// their dot-paths, as before.
+// commas included (header=Created%2C%20UTC). A label is display text, used
+// verbatim, and may repeat; the fields are the column identifiers. Labels
+// pair with fields by position, so they need an explicit fields list of the
+// same length, and that list must not name a field twice (a repeated
+// identifier is a caller bug, and the labelled json keys its rows by
+// field). No header parameter returns nil: the columns are headed by their
+// dot-paths, and fields are taken as before.
 func parseHeaderLabels(raw, fields []string) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -751,12 +775,12 @@ func parseHeaderLabels(raw, fields []string) ([]string, error) {
 	if len(raw) != len(fields) {
 		return nil, fmt.Errorf("got %d header labels for %d fields: give one header parameter per field, in the same order", len(raw), len(fields))
 	}
-	seen := make(map[string]struct{}, len(raw))
-	for i, l := range raw {
-		if _, dup := seen[l]; dup {
-			return nil, fmt.Errorf("header label %d repeats an earlier label: labels name the columns and the JSON keys, so they must be unique", i+1)
+	seen := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		if _, dup := seen[f]; dup {
+			return nil, fmt.Errorf("field %q is listed twice: fields identify the columns that header labels name, so each may appear once", f)
 		}
-		seen[l] = struct{}{}
+		seen[f] = struct{}{}
 	}
 	return raw, nil
 }

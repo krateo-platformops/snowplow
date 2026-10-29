@@ -41,7 +41,7 @@ re-dispatched through `/call`.
 | `path`     | auto    | Optional **jq expression** returning the row array from the resolved envelope, e.g. `.status.services` (see [What `path` must return](#what-path-must-return)). |
 | `fields`   | all     | Comma-separated list of column **dot-paths** selecting and ordering the CSV and PDF columns, e.g. `name,health,usage.cpu`. |
 | `header`   | dot-paths | Optional column **label**, one `header` parameter per field, repeated in `fields` order (below). |
-| `title`    | resource name | `pdf` only: the report title. |
+| `title`    | resource name | `pdf` only: the report title; csv and json ignore it. |
 | `filename` | derived | Attachment file name (sanitized; extension appended). |
 | `page` / `perPage` | full list | Export exactly that `/call` window. When **both** are omitted, the handler exports the **full list** (below). |
 
@@ -56,14 +56,36 @@ included (URL-encode it):
 fields=metadata.name,metadata.creationTimestamp&header=Name&header=Created%2C%20UTC
 ```
 
-The labels are used verbatim as the CSV header row, the JSON keys and the
-PDF header row. They require an explicit `fields` list of the same length
-and must be unique (they become JSON keys); otherwise the request is a
-`400` and nothing is dispatched. With labels, the JSON export is one object
-per row whose keys are the labels, in `fields` order, and whose values are
-the selected (flattened) values with their JSON types; a missing value is
-`null`. Without `header`, csv and json are exactly as before: the CSV header
-row is the dot-paths, and the JSON export is the extracted rows as resolved.
+**Labels are display text; `fields` are the identifiers.** A label is used
+verbatim and may repeat (a table with two `Name` columns told apart by
+position).
+
+- **CSV and PDF:** the labels are the header row, duplicates included.
+- **JSON:** labels are never keys. The body becomes an object with the
+  columns in `fields` order and the rows keyed by field:
+
+  ```json
+  {
+    "columns": [{"field": "metadata.name", "label": "Name"},
+                {"field": "metadata.creationTimestamp", "label": "Created, UTC"}],
+    "rows":    [{"metadata.name": "a", "metadata.creationTimestamp": "2026-10-29T10:00:00Z"}]
+  }
+  ```
+
+  Each row object writes its keys in `fields` order. Its values are the
+  selected (flattened) values with their JSON types; a missing value is
+  `null`. Pair values with labels through `columns`, by field or by
+  position.
+
+Labels pair with fields by position, so the request is a `400`, and nothing
+is dispatched, when `header` comes without an explicit `fields` list, when
+the counts differ, or when `fields` lists the same field twice. Without
+`header`, csv and json are exactly as before: the CSV header row is the
+dot-paths, and the JSON export is the extracted rows as resolved (a
+repeated field is two identical columns in the CSV, as before).
+
+`title` is used only by `pdf`. A csv or json export ignores it (no error,
+same bytes), so one request shape can serve all three formats.
 
 Labels are generic: snowplow has no widget-kind logic. To export a `Table`
 widget's typed cells, select and shape them with your own `path` jq, then

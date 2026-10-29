@@ -468,14 +468,17 @@ func TestExport970_BuildThenSend(t *testing.T) {
 }
 
 // TestExport970_HeaderLabels — rule 7: one repeated header= per field, in
-// fields order, labels the csv header row, the json keys and the pdf header
-// row; commas and any other character are allowed; csv cells and the json
-// values are otherwise unchanged. A label list that does not match the
-// fields is a 400 before anything is dispatched.
+// fields order. Labels are display text: any character (commas included),
+// used verbatim, and they may repeat (two "Name" columns). They head the
+// csv and pdf columns; csv cells are otherwise unchanged. The json body
+// becomes {columns:[{field,label}] in fields order, rows keyed by field} —
+// labels are never keys, so repeated labels cannot collide. A label list
+// that does not pair with the fields (no fields, a count mismatch, a field
+// listed twice) is a 400 before anything is dispatched.
 func TestExport970_HeaderLabels(t *testing.T) {
 	body := `{"items":[{"name":"alpha","meta":{"created":"2026-10-29","n":3}},{"name":"=beta","meta":{"n":4.5}}]}`
-	q := "fields=name,meta.created,meta.n&header=Name&header=" + url.QueryEscape("Created, UTC") + "&header=" + url.QueryEscape("Größe \"n\"")
-	labels := []string{"Name", "Created, UTC", `Größe "n"`}
+	q := "fields=name,meta.created,meta.n&header=Name&header=" + url.QueryEscape("Created, UTC") + "&header=Name"
+	labels := []string{"Name", "Created, UTC", "Name"}
 	var queries []url.Values
 
 	rec, _ := exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=csv&"+q)
@@ -488,21 +491,37 @@ func TestExport970_HeaderLabels(t *testing.T) {
 	}
 
 	rec, _ = exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=json&"+q)
-	wantJSON := `[
-  {
-    "Name": "alpha",
-    "Created, UTC": "2026-10-29",
-    "Größe \"n\"": 3
-  },
-  {
-    "Name": "=beta",
-    "Created, UTC": null,
-    "Größe \"n\"": 4.5
-  }
-]
+	wantJSON := `{
+  "columns": [
+    {
+      "field": "name",
+      "label": "Name"
+    },
+    {
+      "field": "meta.created",
+      "label": "Created, UTC"
+    },
+    {
+      "field": "meta.n",
+      "label": "Name"
+    }
+  ],
+  "rows": [
+    {
+      "name": "alpha",
+      "meta.created": "2026-10-29",
+      "meta.n": 3
+    },
+    {
+      "name": "=beta",
+      "meta.created": null,
+      "meta.n": 4.5
+    }
+  ]
+}
 `
 	if rec.Body.String() != wantJSON {
-		t.Errorf("json =\n%s\nwant (keys in fields order, typed values)\n%s", rec.Body.String(), wantJSON)
+		t.Errorf("json =\n%s\nwant (columns in fields order, rows keyed by field, typed values)\n%s", rec.Body.String(), wantJSON)
 	}
 
 	rec, _ = exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=pdf&"+q)
@@ -515,10 +534,10 @@ func TestExport970_HeaderLabels(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"header=Name",                          // no fields
-		"fields=name,meta.n&header=Name",       // fewer labels than fields
-		"fields=name&header=Name&header=More",  // more labels than fields
-		"fields=name,meta.n&header=X&header=X", // duplicate label
+		"header=Name",                         // no fields
+		"fields=name,meta.n&header=Name",      // fewer labels than fields
+		"fields=name&header=Name&header=More", // more labels than fields
+		"fields=name,name&header=A&header=B",  // a field listed twice
 	} {
 		queries = nil
 		rec, _ := exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=csv&"+bad)
@@ -588,6 +607,39 @@ func TestExport970_NeverLogsTheUsername(t *testing.T) {
 		if bytes.Contains(all.Bytes(), []byte(needle)) {
 			t.Errorf("a log line carries the caller identity (%q):\n%s", needle, all.String())
 		}
+	}
+}
+
+// TestExport970_TitleIgnoredByCSVAndJSON — the export button sends one
+// request shape for every format, title included: a csv or json export
+// ignores title (no 400, byte-identical to the same export without it),
+// and title never reaches the /call re-dispatch. Labelled and unlabelled
+// requests both.
+func TestExport970_TitleIgnoredByCSVAndJSON(t *testing.T) {
+	body := `{"items":[{"name":"alpha","n":1},{"name":"beta","n":2}]}`
+	for _, format := range []string{"csv", "json"} {
+		for _, extra := range []string{"", "&fields=name,n&header=Name&header=Name"} {
+			base := "/export?resource=restactions&name=demo&filename=f&format=" + format + extra
+			var q1, q2 []url.Values
+			without, _ := exportAs(t, recordingCall(body, &q1), base)
+			with, _ := exportAs(t, recordingCall(body, &q2), base+"&title="+url.QueryEscape("Report, Q3"))
+			if with.Code != http.StatusOK || without.Code != http.StatusOK {
+				t.Fatalf("%s%s: status %d with title, %d without", format, extra, with.Code, without.Code)
+			}
+			if !bytes.Equal(with.Body.Bytes(), without.Body.Bytes()) || !reflect.DeepEqual(with.Header(), without.Header()) {
+				t.Errorf("%s%s: title changed the export:\n%s\nvs\n%s", format, extra, with.Body.String(), without.Body.String())
+			}
+			if !reflect.DeepEqual(q1, q2) {
+				t.Errorf("%s%s: title reached the /call re-dispatch: %v", format, extra, q2)
+			}
+		}
+	}
+	// A field listed twice without labels is today's behaviour, unchanged:
+	// two columns of the same dot-path (labels are what make it ambiguous).
+	var q []url.Values
+	rec, _ := exportAs(t, recordingCall(body, &q), "/export?resource=restactions&name=demo&format=csv&fields=name,name")
+	if rec.Code != http.StatusOK || rec.Body.String() != "name,name\nalpha,alpha\nbeta,beta\n" {
+		t.Errorf("unlabelled repeated field: %d %q, want the unchanged two-column csv", rec.Code, rec.Body.String())
 	}
 }
 
