@@ -95,8 +95,8 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync/atomic"
-	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -141,6 +141,9 @@ type verifyingListerWatcher struct {
 	innerCtx clientcache.ListerWatcherWithContext
 	gvr      schema.GroupVersionResource
 	informer clientcache.SharedIndexInformer
+	// log is the GVR's delivery record (#918), nil when its transform could
+	// not be installed. Set once, before the informer runs.
+	log *deliveryLog
 }
 
 var _ clientcache.ListerWatcher = (*verifyingListerWatcher)(nil)
@@ -161,11 +164,26 @@ func newVerifyingListerWatcher(lw clientcache.ListerWatcher, gvr schema.GroupVer
 // race: the reflector that reads this field does not exist until Run.
 func (v *verifyingListerWatcher) bind(inf clientcache.SharedIndexInformer) { v.informer = inf }
 
+// setDeliveryLog attaches the GVR's delivery record. Called once, at
+// registration, before the informer runs.
+func (v *verifyingListerWatcher) setDeliveryLog(l *deliveryLog) { v.log = l }
+
+// mark is the delivery record's transform counter as a read begins: what the
+// transform hands on after it is the read itself, not something the store had
+// received before the read (judge.receivedMark).
+func (v *verifyingListerWatcher) mark() uint64 {
+	if v.log == nil {
+		return 0
+	}
+	return v.log.mark()
+}
+
 func (v *verifyingListerWatcher) List(options metav1.ListOptions) (runtime.Object, error) {
 	return v.ListWithContext(context.Background(), options)
 }
 
 func (v *verifyingListerWatcher) ListWithContext(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+	mark := v.mark()
 	list, err := v.innerCtx.ListWithContext(ctx, options)
 	if err != nil || list == nil {
 		return list, err
@@ -184,7 +202,11 @@ func (v *verifyingListerWatcher) ListWithContext(ctx context.Context, options me
 			upstream[key] = id
 		}
 	}
-	v.verify(upstream)
+	listRV := ""
+	if la, laErr := meta.ListAccessor(list); laErr == nil {
+		listRV = la.GetResourceVersion()
+	}
+	v.verify(upstream, listRV, mark)
 	return list, nil
 }
 
@@ -204,13 +226,14 @@ func (v *verifyingListerWatcher) WatchWithContext(ctx context.Context, options m
 	if options.SendInitialEvents == nil || !*options.SendInitialEvents {
 		return w, nil
 	}
-	return newInitialEventsVerifier(v, w), nil
+	return newInitialEventsVerifier(v, w, v.mark()), nil
 }
 
 // verify runs the comparison against the bound informer's indexer and reports.
-// site is always verifySiteSnapshot here; the forced pass calls compareStore
-// directly with verifySiteForced.
-func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity) {
+// site is always verifySiteSnapshot here; the forced pass judges its own
+// candidates (judgeForcedPass) with verifySiteForced. listRV is the
+// snapshot's resourceVersion; mark the transform counter when it began.
+func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity, listRV string, mark uint64) {
 	if v.informer == nil {
 		recordVerifySkipped(verifySkipTornDown)
 		return
@@ -231,7 +254,7 @@ func (v *verifyingListerWatcher) verify(upstream map[string]objIdentity) {
 		recordVerifySkipped(verifySkipTornDown)
 		return
 	}
-	report := compareStore(idx, upstream)
+	report := compareStore(idx, v.log, upstream, listRV, mark)
 	publishDivergence(v.gvr, verifySiteSnapshot, report)
 }
 
@@ -255,24 +278,61 @@ func identityOf(obj any) (string, objIdentity, bool) {
 	return key, objIdentity{rv: acc.GetResourceVersion(), uid: string(acc.GetUID())}, true
 }
 
-// compareStore is the whole of B's classification, and it is deliberately one
+// compareStore is the snapshot path's comparison: diffStore's candidates,
+// judged under the one lost-update rule (store_verify_judge.go). On this path
+// the reflector is blocked inside the read, and the read IS the store's next
+// state, so a store behind it is a divergence by definition (the position is
+// "always reached"); what the store had already received and not yet applied
+// before the read began (mark) still counts as received, which is what the
+// 250 ms drain wait used to approximate. log may be nil.
+func compareStore(idx clientcache.Indexer, log *deliveryLog, upstream map[string]objIdentity, listRV string, mark uint64) divergenceReport {
+	candidates := diffStore(idx, upstream)
+	if len(candidates) == 0 {
+		return reportOf(len(upstream), 0, nil)
+	}
+	pos := positionView{applied: idx.LastStoreSyncResourceVersion(), always: true}
+	// A tombstone's pass generation means nothing here (no pass took this
+	// read), so none counts as "after the read".
+	t := judge{idx: idx, log: log, pos: pos, receivedMark: mark}.sweep(upstream, listRV, math.MaxUint64, candidates, false)
+	return reportOf(len(upstream), len(candidates), t.lost)
+}
+
+// reportOf builds a report from the candidates that still diverge.
+func reportOf(objectsCompared, candidates int, confirmed []divergenceCandidate) divergenceReport {
+	rep := divergenceReport{objectsCompared: objectsCompared, candidates: candidates}
+	for _, c := range confirmed {
+		switch c.class {
+		case classLostAdd:
+			rep.lostAdd = append(rep.lostAdd, c.key)
+		case classLostUpdate:
+			rep.lostUpdate = append(rep.lostUpdate, c.key)
+		case classLostDelete:
+			rep.lostDelete = append(rep.lostDelete, c.key)
+		case classUIDMismatch:
+			rep.uidMismatch = append(rep.uidMismatch, c.key)
+		}
+	}
+	return rep
+}
+
+// diffStore is the whole of B's classification, and it is deliberately one
 // function shared by both detection sites so the two can never drift about what
-// a lost UPDATE is.
+// a lost UPDATE is. It returns every key on which the store and the read
+// disagree, by class; whether a candidate COUNTS is the rule's
+// (store_verify_judge.go).
 //
 // The UID class is the one that matters most and the one a key-set diff is
 // structurally blind to: ResolvedKeyInputs carries class/G/V/R/namespace/name/
 // BindingUID and NO object UID, so a delete-and-recreate under the same name
 // reuses the byte-identical L1 cell. The ten-day staleness in #237 is a UID
 // phantom, which is why that arm is load-bearing rather than defensive.
-func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) divergenceReport {
-	var rep divergenceReport
+func diffStore(idx clientcache.Indexer, upstream map[string]objIdentity) []divergenceCandidate {
 	stored := make(map[string]objIdentity, len(upstream))
 	for _, obj := range idx.List() {
 		if key, id, ok := identityOf(obj); ok {
 			stored[key] = id
 		}
 	}
-	rep.objectsCompared = len(upstream)
 
 	var candidates []divergenceCandidate
 	for key, up := range upstream {
@@ -294,25 +354,8 @@ func compareStore(idx clientcache.Indexer, upstream map[string]objIdentity) dive
 			candidates = append(candidates, divergenceCandidate{key, classLostDelete})
 		}
 	}
-	rep.candidates = len(candidates)
-	if rep.candidates == 0 {
-		return rep
-	}
-	storeDivergenceCandidates.Add(uint64(rep.candidates))
-
-	for _, c := range confirmDivergences(idx, upstream, candidates) {
-		switch c.class {
-		case classLostAdd:
-			rep.lostAdd = append(rep.lostAdd, c.key)
-		case classLostUpdate:
-			rep.lostUpdate = append(rep.lostUpdate, c.key)
-		case classLostDelete:
-			rep.lostDelete = append(rep.lostDelete, c.key)
-		case classUIDMismatch:
-			rep.uidMismatch = append(rep.uidMismatch, c.key)
-		}
-	}
-	return rep
+	storeDivergenceCandidates.Add(uint64(len(candidates)))
+	return candidates
 }
 
 // divergenceClass is which of the four classes a candidate falls in.
@@ -330,88 +373,6 @@ type divergenceCandidate struct {
 	class divergenceClass
 }
 
-// confirmDivergenceBudget bounds the re-read that separates a real divergence
-// from the DeltaFIFO drain race. Paid only on a divergence, which in a healthy
-// process is never.
-const confirmDivergenceBudget = 250 * time.Millisecond
-
-// confirmDivergenceTick is the re-read cadence inside the budget.
-const confirmDivergenceTick = 10 * time.Millisecond
-
-// confirmDivergences re-reads the candidate keys until they agree with upstream
-// or the budget expires, and returns those that still disagree.
-//
-// THE DRAIN RACE. The indexer lags the DeltaFIFO: a delta already queued but
-// not yet popped makes the store look older than upstream, and counting that as
-// a divergence would be a false positive on a perfectly healthy process.
-// Because the reflector is blocked inside our call we can afford to wait.
-//
-// THE BUDGET IS FOR THE WHOLE COMPARISON, NOT PER KEY. A correlated divergence
-// across thousands of keys must not be able to stall the watch stream for
-// keys x 250ms. Whatever still disagrees when the budget expires is counted as
-// confirmed, which is the safe direction: the alternative is discarding a real
-// divergence because the FIFO happened to be busy.
-//
-// The raw count is published as store_divergence_candidates_total alongside the
-// confirmed classes, rather than hidden, because a large
-// candidates-minus-confirmed gap is itself a signal — it says the FIFO is
-// backing up, which is a different problem from a stale store and deserves to
-// be readable as one.
-func confirmDivergences(idx clientcache.Indexer, upstream map[string]objIdentity, candidates []divergenceCandidate) []divergenceCandidate {
-	deadline := time.Now().Add(confirmDivergenceBudget)
-	pending := candidates
-	for {
-		still := pending[:0:0]
-		for _, c := range pending {
-			if stillDivergent(idx, upstream, c) {
-				still = append(still, c)
-			}
-		}
-		pending = still
-		if len(pending) == 0 || !time.Now().Before(deadline) {
-			return pending
-		}
-		time.Sleep(confirmDivergenceTick)
-	}
-}
-
-// stillDivergent re-reads ONE key from the indexer and re-applies the same
-// predicate the first pass used. It re-derives the class rather than trusting
-// the recorded one so a candidate that changed class while the FIFO drained
-// (a lost ADD that arrived, leaving only an rv difference) is not confirmed
-// under a class it no longer belongs to.
-func stillDivergent(idx clientcache.Indexer, upstream map[string]objIdentity, c divergenceCandidate) bool {
-	obj, exists, err := idx.GetByKey(c.key)
-	if err != nil {
-		return true
-	}
-	up, wanted := upstream[c.key]
-	if !exists || obj == nil {
-		// Absent from the store: a real lost ADD if upstream has it, and
-		// nothing at all if upstream does not (the lost DELETE drained).
-		return wanted && c.class == classLostAdd
-	}
-	_, st, ok := identityOf(obj)
-	if !ok {
-		return true
-	}
-	if !wanted {
-		return c.class == classLostDelete
-	}
-	switch c.class {
-	case classUIDMismatch:
-		return st.uid != "" && up.uid != "" && st.uid != up.uid
-	case classLostUpdate:
-		return st.rv != up.rv
-	case classLostAdd:
-		// The object arrived while we waited — the ADD was not lost.
-		return false
-	case classLostDelete:
-		return false
-	}
-	return false
-}
-
 // publishDivergence moves a report onto the counters and, when it is non-empty,
 // emits ONE warn-level line naming the classes and a bounded sample of the
 // coordinates.
@@ -426,7 +387,13 @@ func stillDivergent(idx clientcache.Indexer, upstream map[string]objIdentity, c 
 func publishDivergence(gvr schema.GroupVersionResource, site string, rep divergenceReport) {
 	storeVerificationsTotal.Add(1)
 	storeObjectsVerifiedTotal.Add(uint64(rep.objectsCompared))
+	recordDivergence(gvr, site, rep)
+}
 
+// recordDivergence moves a report's divergences onto the counters and logs
+// them. A pending key resolved after its pass (publishResolvedLoss) records
+// through here alone: it is not a verification of its own.
+func recordDivergence(gvr schema.GroupVersionResource, site string, rep divergenceReport) {
 	addN(storeDivergentLostUpdate[site], len(rep.lostUpdate))
 	addN(storeDivergentLostDelete[site], len(rep.lostDelete))
 	addN(storeDivergentLostAdd[site], len(rep.lostAdd))

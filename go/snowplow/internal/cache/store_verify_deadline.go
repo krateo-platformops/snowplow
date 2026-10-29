@@ -36,8 +36,9 @@
 //	                               as our store was when the pass opened — which
 //	                               removes the false positives a naive RV="0"
 //	                               read would invent. The store keeps moving
-//	                               after that; the keys it moves are recorded
-//	                               and re-read (store_verify_recheck.go, #872)
+//	                               after that; each candidate is ordered
+//	                               against the LIST's own revisions
+//	                               (store_verify_judge.go, #872, #918)
 //	Limit = 0                      REQUIRED. client-go's own rule: a LIST with a
 //	                               Limit and a non-zero resourceVersion is
 //	                               delegated to etcd and SKIPS the watch cache.
@@ -71,6 +72,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientfeatures "k8s.io/client-go/features"
 	"k8s.io/client-go/metadata"
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -88,8 +90,34 @@ func StartStoreVerification(ctx context.Context) {
 		slog.String("hint", "every servable GVR's full object set is compared against the apiserver "+
 			"within max_verification_age; snapshots do it for free, this walker is the backstop "+
 			"for GVRs whose watch only ever recycles"))
+	if positionUnavailable() == 1 {
+		// #923 review L2 / N1 — loud, once: with AtomicFIFO off the store's
+		// applied position is always empty, so no forced-pass candidate
+		// behind its read can ever be decided a loss. The forced pass then
+		// does not run, every GVR reads as unverifiable with reason
+		// position_unavailable, and store_position_unavailable is 1. A
+		// disabled detector, so ERROR, as repair_ineffective is. Nothing
+		// changes the gate here.
+		slog.Error("cache.store_verification.position_unavailable",
+			slog.String("subsystem", "cache"),
+			slog.String("hint", "client-go's AtomicFIFO feature is off (KUBE_FEATURE_AtomicFIFO=false?), so "+
+				"Store.LastStoreSyncResourceVersion is always empty and the forced store verification cannot "+
+				"decide a lost update: it does not run, and every GVR reads as unverifiable "+
+				"(store_gvrs_unverifiable, reason position_unavailable). Snapshot detection is unaffected. "+
+				"Re-enable AtomicFIFO to restore forced-pass detection."))
+	}
 	go runStoreVerificationWalker(ctx)
 	go runStoreRepairQueue(ctx)
+}
+
+// positionUnavailable is 1 when client-go's AtomicFIFO is off: the store then
+// reports no applied position (thread_safe_store.go LastStoreSyncResourceVersion
+// returns "" unless the gate is on).
+func positionUnavailable() int64 {
+	if clientfeatures.FeatureGates().Enabled(clientfeatures.AtomicFIFO) {
+		return 0
+	}
+	return 1
 }
 
 // runStoreVerificationWalker picks the most overdue eligible GVR, verifies it,
@@ -148,6 +176,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // waited behind it. With the attempt in the order it goes to the back after
 // each try and the others get their turn. Nothing is limited or skipped: every
 // overdue GVR is still attempted, in turn.
+//
+// #918 — A GVR holding PENDING keys is due now, deadline or not: on a GVR that
+// only receives bookmarks, its next pass is the only event that decides them
+// (store_verify_delivery.go). Flagged GVRs and overdue ones ALTERNATE (owner
+// ruling, 2026-10-27): after a pass on a flagged GVR the next turn goes to the
+// most overdue one, then to a flagged one again, and so on, so a GVR whose
+// watch keeps lagging can never starve the others, and an overdue GVR is
+// served within one turn whatever is flagged.
 func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 	rows := verificationRows()
 	if len(rows) == 0 {
@@ -156,9 +192,18 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 	deadline := maxVerificationAge()
 	now := time.Now()
 
-	var pick schema.GroupVersionResource
-	var oldest time.Time
-	governed, found := 0, false
+	type best struct {
+		gvr   schema.GroupVersionResource
+		turn  time.Time
+		found bool
+	}
+	var flagged, overdue best
+	consider := func(b *best, gvr schema.GroupVersionResource, turn time.Time) {
+		if !b.found || turn.Before(b.turn) {
+			*b = best{gvr: gvr, turn: turn, found: true}
+		}
+	}
+	governed := 0
 	for gvr, row := range rows {
 		if row.repairPending {
 			// A repair for this GVR is queued or running: its store is about
@@ -167,18 +212,31 @@ func nextOverdueGVR() (schema.GroupVersionResource, int, bool) {
 			continue
 		}
 		governed++
-		if now.Sub(row.epoch) <= deadline {
-			continue
-		}
 		turn := row.epoch
 		if row.lastAttempt.After(turn) {
 			turn = row.lastAttempt
 		}
-		if !found || turn.Before(oldest) {
-			pick, oldest, found = gvr, turn, true
+		switch {
+		case row.hasPending:
+			consider(&flagged, gvr, turn)
+		case now.Sub(row.epoch) > deadline:
+			consider(&overdue, gvr, turn)
 		}
 	}
-	return pick, governed, found
+	first, second := flagged, overdue
+	if lastTurnFlagged() {
+		first, second = overdue, flagged
+	}
+	if first.found {
+		return first.gvr, governed, true
+	}
+	return second.gvr, governed, second.found
+}
+
+func lastTurnFlagged() bool {
+	storeVerify.mu.Lock()
+	defer storeVerify.mu.Unlock()
+	return storeVerify.lastTurnFlagged
 }
 
 // forcedPassInputs gathers everything the forced pass needs, under rw.mu, and
@@ -244,6 +302,14 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		recordVerifySkipped(verifySkipTornDown)
 		return
 	}
+	if positionUnavailable() == 1 {
+		// #923 review N1 — no applied position, so nothing behind its read
+		// can be decided: a pass would hold keys pending forever and still
+		// mark the GVR verified, a zero that reads as health. It does not
+		// run; the GVR reads as unverifiable (storeVerificationGauges).
+		recordVerifySkipped(verifySkipPositionUnavailable)
+		return
+	}
 
 	if rv == "" {
 		// NO SYNC POSITION — SKIP, NEVER FALL BACK TO RV="0".
@@ -280,25 +346,29 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		recordVerifySkipped(verifySkipNoSyncPosition)
 		return
 	}
-	// #875 — open the pass BEFORE the LIST: from here every key the reflector
-	// delivers is recorded, and the LIST is no older than the position read
-	// at this instant (store_verify_delivery.go). That position, not the one
-	// the last confirm pass copied into lastSyncRV, is what the LIST carries:
-	// the record starts now, so the LIST's lower bound must be now too, or a
-	// delivery between the two would be neither recorded nor in the LIST.
+	// #918 — first, the keys the previous pass left pending are judged
+	// against their own reads (store_verify_delivery.go judgePending): the
+	// losses among them are published with this pass, or on their own if
+	// this pass cannot take its read. Then the pass opens: the LIST is no
+	// older than the reflector's position read now (beginPass).
 	//
-	// No delivery record (dl == nil): there is no window to open, and the LIST
-	// carries the confirm-time position as it did before #875.
+	// No delivery log (dl == nil): the LIST carries the confirm-time position
+	// as it did before #875.
 	listRV := rv
-	var win *deliveryWindow
+	var carried []divergenceCandidate
+	var gen uint64
 	if dl != nil {
-		win = dl.openPass(idx)
-		defer win.close()
-		if win.position == "" {
+		var release func()
+		carried, release = dl.judgePending()
+		// The carried losses stay counted as pending until this pass has
+		// published them, whichever way it ends (storePendingKeys' invariant).
+		defer release()
+		if listRV = dl.beginPass(); listRV == "" {
+			publishCarried(gvr, carried)
 			recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
 			return
 		}
-		listRV = win.position
+		gen = dl.passGen()
 	}
 	opts := metav1.ListOptions{
 		ResourceVersion:      listRV,
@@ -313,6 +383,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// this single List call — a metaClient.List spawns no nested establishment LIST.
 	list, err := cli.Resource(gvr).Namespace(metav1.NamespaceAll).List(withForcedVerifyTag(ctx), opts)
 	if err != nil {
+		publishCarried(gvr, carried)
 		recordVerifySkipped(verifySkipListError)
 		slog.Warn("cache.store.verification_list_failed",
 			slog.String("subsystem", "cache"),
@@ -330,43 +401,28 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 			upstream[key] = id
 		}
 	}
-	report := compareStore(idx, upstream)
-	// #872 — the store kept moving while the LIST was in flight, so a
-	// divergence the store may have moved past counts only if it still holds
-	// against the object's current state (store_verify_recheck.go). #875 —
-	// only a key delivered during the pass can have moved; every other
-	// candidate is counted as it stands. A failed re-check makes the pass
-	// inconclusive: nothing is published or repaired, and the GVR is not marked
-	// verified, so the deadline walker comes back to it.
-	if report.total() > 0 && win == nil {
-		// #875 — NO DELIVERY RECORD: count every candidate as it stands, with
-		// no GET — the pre-#872 behaviour, for this GVR only. Skipping instead
-		// would leave exactly the #237 class unverified: a re-registered
-		// shared-factory GVR gets its already-started informer back, the
-		// transform cannot be installed, and a skipped pass would also starve
-		// #244's factory-divergence age of its only input (noteVerified). The
-		// cost is that churn can be misread as a loss here, as it was before
-		// #872, and store_divergence_recheck_unavailable_total says so.
-		storeRecheckUnavailableTotal.Add(report.total())
-	} else if report.total() > 0 {
-		// Closed only now: compareStore's confirm loop reads the store until
-		// it returns, so a delivery landing during that loop must be in the
-		// record.
-		delivered := win.close()
-		mayHaveMoved := func(key string, class divergenceClass) bool { return win.delivered(delivered, key, class) }
-		rechecked, ok := recheckAgainstCurrent(ctx, cli, gvr, idx, report, mayHaveMoved)
-		if !ok {
-			recordVerifySkipped(verifySkipRecheckError)
-			slog.Warn("cache.store.verification_recheck_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.Int("candidates", int(report.total())),
-				slog.String("hint", "a quorum re-read of a divergence candidate failed, so this pass is "+
-					"inconclusive: nothing was published or repaired and the GVR stays due for "+
-					"verification. A real divergence is found by the next pass."))
-			return
-		}
-		report = rechecked
+	// The pass has its own read now: what is still pending is superseded by it.
+	if dl != nil {
+		dl.supersede()
+	}
+	candidates := withoutKeys(diffStore(idx, upstream), carried)
+	// #872 / #875 / #878 / #918 — the store kept moving while the LIST was in
+	// flight and keeps moving now, so each candidate is ordered against the
+	// LIST's own revisions under the lost-update rule (store_verify_judge.go):
+	// lost only if the store is behind the read and has applied everything up
+	// to it. A key the store has not caught up with yet is PENDING, re-judged
+	// by the GVR's next applied event or its next pass; a pair of
+	// resourceVersions the API does not let us order is UNDECIDED.
+	//
+	// #875 — a re-registered shared-factory GVR gets its already-started
+	// informer back and the transform cannot be installed; its log has the
+	// handler only. The pass still runs — skipping it would leave the #237
+	// class unverified and starve #244's factory-divergence age
+	// (noteVerified) — and store_divergence_unrecorded_total counts what it
+	// publishes.
+	report := reportOf(len(upstream), 0, carried)
+	if len(candidates) > 0 {
+		report = judgeForcedPass(gvr, idx, dl, upstream, list.ResourceVersion, gen, candidates, carried)
 	}
 	publishDivergence(gvr, verifySiteForced, report)
 
@@ -390,4 +446,31 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// AND re-enqueue in the same pass, which is the hammering the breaker
 	// exists to stop.
 	enqueueStoreRepair(gvr, "store_divergence")
+}
+
+// publishCarried publishes the losses judgePending decided when the pass that
+// decided them cannot take its own read: they do not depend on it.
+func publishCarried(gvr schema.GroupVersionResource, carried []divergenceCandidate) {
+	if len(carried) > 0 {
+		publishResolvedLoss(gvr, carried)
+	}
+}
+
+// withoutKeys drops the candidates already decided by judgePending: an older
+// read of theirs has already shown the loss.
+func withoutKeys(candidates, decided []divergenceCandidate) []divergenceCandidate {
+	if len(decided) == 0 {
+		return candidates
+	}
+	skip := make(map[string]bool, len(decided))
+	for _, d := range decided {
+		skip[d.key] = true
+	}
+	out := candidates[:0:0]
+	for _, c := range candidates {
+		if !skip[c.key] {
+			out = append(out, c)
+		}
+	}
+	return out
 }

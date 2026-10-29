@@ -128,6 +128,9 @@ func compositionStreamingListEnabled() bool {
 type streamingDynamicInformer struct {
 	informer clientcache.SharedIndexInformer
 	gvr      schema.GroupVersionResource
+	// verifier is the snapshot decorator, which judges against the GVR's
+	// delivery record once registration attaches it (#918).
+	verifier *verifyingListerWatcher
 }
 
 func (d *streamingDynamicInformer) Informer() clientcache.SharedIndexInformer {
@@ -257,7 +260,7 @@ func newStreamingDynamicInformer(
 	// reads it existed — and so it never needs rw.mu on the reflector's own
 	// goroutine, which is the deadlock hazard reflector_path.go documents.
 	verifier.bind(informer)
-	return &streamingDynamicInformer{informer: informer, gvr: gvr}, true
+	return &streamingDynamicInformer{informer: informer, gvr: gvr, verifier: verifier}, true
 }
 
 // streamingRESTClient builds a rest.RESTClient for raw apiserver GETs

@@ -69,6 +69,11 @@ type gvrVerification struct {
 	// lastAttempt is when the latest forced pass started, completed or not
 	// (#875). The walker's turn order only — never the age (noteVerifyAttempt).
 	lastAttempt time.Time
+	// hasPending (#918): the GVR's delivery log holds pending keys. Set and
+	// cleared with the pending set itself (setPendingFlag), so it never
+	// outlives the keys it stands for; the walker serves flagged GVRs and the
+	// most overdue ones in turn (nextOverdueGVR).
+	hasPending bool
 	// verified is true once a verification has completed since the current
 	// epoch was set. It drives the "never" reading on /debug/servable's row,
 	// which is a different question from the age the gauge reports.
@@ -140,6 +145,9 @@ type gvrVerification struct {
 var storeVerify = struct {
 	mu   sync.Mutex
 	gvrs map[schema.GroupVersionResource]*gvrVerification
+	// lastTurnFlagged is whether the walker's latest pass was on a GVR with
+	// pending keys: the next turn then goes to the most overdue GVR (#918).
+	lastTurnFlagged bool
 }{
 	gvrs: map[schema.GroupVersionResource]*gvrVerification{},
 }
@@ -221,6 +229,18 @@ func noteVerifyAttempt(gvr schema.GroupVersionResource) {
 	storeVerify.mu.Lock()
 	if st, ok := storeVerify.gvrs[gvr]; ok {
 		st.lastAttempt = time.Now()
+		storeVerify.lastTurnFlagged = st.hasPending
+	}
+	storeVerify.mu.Unlock()
+}
+
+// setPendingFlag records whether gvr's delivery log holds pending keys
+// (#918). Called by the log whenever its pending set becomes empty or
+// non-empty; never by anything else, so the flag and the keys move together.
+func setPendingFlag(gvr schema.GroupVersionResource, pending bool) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.hasPending = pending
 	}
 	storeVerify.mu.Unlock()
 }
@@ -326,6 +346,7 @@ func verificationDecorated(gvr schema.GroupVersionResource) (decorated, known bo
 type verificationRow struct {
 	epoch                  time.Time
 	lastAttempt            time.Time
+	hasPending             bool
 	verified               bool
 	decorated              bool
 	ownsInformer           bool
@@ -345,6 +366,7 @@ func verificationRows() map[schema.GroupVersionResource]verificationRow {
 		out[gvr] = verificationRow{
 			epoch:                  st.epoch,
 			lastAttempt:            st.lastAttempt,
+			hasPending:             st.hasPending,
 			verified:               st.verified,
 			decorated:              st.decorated,
 			ownsInformer:           st.ownsInformer,
@@ -369,6 +391,7 @@ func verificationRowFor(gvr schema.GroupVersionResource) (verificationRow, bool)
 	return verificationRow{
 		epoch:                  st.epoch,
 		lastAttempt:            st.lastAttempt,
+		hasPending:             st.hasPending,
 		verified:               st.verified,
 		decorated:              st.decorated,
 		ownsInformer:           st.ownsInformer,
@@ -404,5 +427,6 @@ func maxVerificationAge() time.Duration { return ResolvedCacheTTL() }
 func resetStoreVerificationStateForTest() {
 	storeVerify.mu.Lock()
 	storeVerify.gvrs = map[schema.GroupVersionResource]*gvrVerification{}
+	storeVerify.lastTurnFlagged = false
 	storeVerify.mu.Unlock()
 }
