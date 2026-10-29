@@ -44,4 +44,6 @@ The ~9 testdata `/call` occurrences are **external client→snowplow curl docs**
 
 **THE TRAP (hard guardrail):** `objects.ParseCallPathToObjectRef` (`internal/objects/callpath.go`) is a **shared parser** used by branch B AND mechanism-A callers (resourcesrefs/resolve.go, resourcesrefstemplate/resolve.go, widgets/resolve.go). C must delete ONLY the dispatch branch at api/resolve.go:625-700 (+ seam/flag/tests). It MUST NOT delete `ParseCallPathToObjectRef`, `ParseCallPathPagination`, or `buildPath`'s `/call?…` emission, nor any non-resolve caller — doing so breaks the SPA navigation + F2 walker catastrophically.
 
+> **Superseded 2026-10-29 for `ParseCallPathPagination` (#966 / #967):** the guardrail no longer holds for that one function. Since #966 the F2 walker reads a child's pagination through the request's own parser, `paginationFromQuery`, the one `paginationInfo` applies to the browser's `/call` (via `prewarmPaginationFor`). `util.ParseCallPathPagination` was left with no caller and was deleted in #967. `ParseCallPathToObjectRef` and `buildPath`'s `/call?…` emission are unaffected, so the rest of this guardrail stands.
+
 **Retirement-safety proof:** after deleting branch B + its 6 tests, the A-side suite (§4) must stay green — that is the empirical proof mechanism A ⊥ branch B. A named CI gate.
