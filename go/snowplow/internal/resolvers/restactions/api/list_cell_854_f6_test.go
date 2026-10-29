@@ -183,7 +183,7 @@ func TestListCell854_F6_PortalCorpusNeverMutatesSharedItems(t *testing.T) {
 		}
 	}
 	if !fill710WaitFor(10e9, func() bool {
-		raw, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
+		raw, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
 		p, ok := parseListEnvelope(r1FsaGVR, raw)
 		return ok && len(p.items) == objects
 	}) {

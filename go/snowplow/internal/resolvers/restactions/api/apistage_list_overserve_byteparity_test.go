@@ -98,7 +98,7 @@ func TestFalsifier58_ByteParity_NarrowTenant_OnlyGrantedNamespacesInBytes(t *tes
 		Path: "/apis/widgets.krateo.io/v1/widgets", Verb: ptr.To(http.MethodGet),
 	}}
 
-	v, served, ok, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	v, served, ok, _, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !ok || !served {
 		t.Fatalf("byte-parity: expected a served (gated) LIST; ok=%v served=%v", ok, served)
 	}

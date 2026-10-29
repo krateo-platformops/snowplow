@@ -161,7 +161,7 @@ func TestIssue618_Kind_InformerParityWithRealApiserver(t *testing.T) {
 					t.Fatalf("oracle %s: HTTP %d", pq, code)
 				}
 				for name, bctx := range branches {
-					raw, ok := dispatchViaInformer(bctx, buildCall(http.MethodGet, pq))
+					raw, ok, _ := dispatchViaInformer(bctx, buildCall(http.MethodGet, pq))
 					if !ok {
 						t.Fatalf("%s %s: not informer-served", name, pq)
 					}
@@ -182,7 +182,7 @@ func TestIssue618_Kind_InformerParityWithRealApiserver(t *testing.T) {
 			}
 			for _, pq := range fall {
 				for name, bctx := range branches {
-					if _, ok := dispatchViaInformer(bctx, buildCall(http.MethodGet, pq)); ok {
+					if _, ok, _ := dispatchViaInformer(bctx, buildCall(http.MethodGet, pq)); ok {
 						t.Fatalf("RED #618 %s %s: must fall through to the apiserver", name, pq)
 					}
 				}

@@ -116,7 +116,7 @@ func TestContentFill710_SF1_KnownStaleHerd_64Readers_OneFlight(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok, _ := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
+			v, served, ok, _, _ := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
 		}(i)
 	}
@@ -191,19 +191,19 @@ func TestContentFill710_SF2_ReaderWithNewerEpochDoesNotJoinOlderFlight(t *testin
 	var calls atomic.Int64
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if calls.Add(1) == 1 {
 			close(leaderRead)
 			<-gate
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 
 	serve := func() chan fill710Served {
 		ch := make(chan fill710Served, 1)
 		go func() {
-			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			ch <- fill710Served{v, served, ok}
 		}()
 		return ch
@@ -286,11 +286,11 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 	var arrived atomic.Int64
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		arrived.Add(1)
 		<-gate
 		if ctx.Err() != nil {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -312,7 +312,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
 		}(i)
 	}
@@ -320,7 +320,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 	quitterCtx, quit := context.WithCancel(r1Ctx())
 	quitter := make(chan fill710Served, 1)
 	go func() {
-		v, served, ok, _ := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
+		v, served, ok, _, _ := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
 		quitter <- fill710Served{v, served, ok}
 	}()
 	if !fill710WaitFor(10*time.Second, func() bool { return ContentFillStatsSnapshot().JoinWaiting == joiners+1 }) {

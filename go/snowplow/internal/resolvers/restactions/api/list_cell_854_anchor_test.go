@@ -34,8 +34,8 @@ func TestListCell854_F1r_EventBetweenFillAndAnchorIsTakenFromTheInformer(t *test
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	var once sync.Once
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		once.Do(func() {
 			// The fill has read the informer; a change lands before its anchor.
 			before := cache.DepGenEpochNow()
@@ -46,10 +46,10 @@ func TestListCell854_F1r_EventBetweenFillAndAnchorIsTakenFromTheInformer(t *test
 				t.Error("the racing update never reached the dep hook")
 			}
 		})
-		return raw, ok
+		return raw, ok, fctx
 	}
 	raced0 := cache.ListCellStatsSnapshot().Unanchors["anchor_raced"]
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatal("the fill was not served")
 	}
 	e, ok := store.GetNoTouch(fill710ListKey())
@@ -103,12 +103,12 @@ func TestListCell854_F1m_InformerObjectsCarryNoManagedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !fill710WaitFor(10*time.Second, func() bool {
-		raw, ok := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
+		raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
 		return ok && bytes.Contains(raw, []byte(`"mf"`))
 	}) {
 		t.Fatal("the object never reached the informer")
 	}
-	raw, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
+	raw, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
 	if bytes.Contains(raw, []byte("managedFields")) {
 		t.Fatal("F1m: the informer serves managedFields — the decoder's strip is load-bearing, and F1 must cover it")
 	}

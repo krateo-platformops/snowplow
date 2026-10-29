@@ -979,7 +979,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			gatedVal, served, ok, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
+			gatedVal, served, ok, fallCtx, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
 			if cerr != nil {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage
@@ -1077,7 +1077,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// ok=false — the content layer could not serve this
 			// call (not pivot-servable: write verb, external URL,
 			// metadata-only GVR, pre-sync). Fall through.
-		} else if raw, served := dispatchViaInformer(gctx, call); served {
+			//
+			// #988 — with the reason the content layer decided, so the
+			// apiserver LIST below is labelled with it on
+			// snowplow_resolve_collection_lists. gctx is this item's
+			// own (dispatchOneCall's local), never a peer's.
+			gctx = fallCtx
+		} else if raw, served, fallCtx := dispatchViaInformer(gctx, call); served {
 			// Informer-served bytes are in memory — feed direct
 			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy). For a
 			// resolve:true direct-path RA/widget GET, feedRawOrResolved
@@ -1100,6 +1106,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("dispatch", dispatch),
 			)
 			return nil
+		} else {
+			gctx = fallCtx // #988 — the pivot's fall-through reason (see above)
 		}
 	}
 

@@ -105,6 +105,10 @@ type contentFlightResult struct {
 	// cell (#882 F2) is the incremental cell the leader anchored and stored,
 	// nil if none: a joiner takes Snapshot(its own seq) from it.
 	cell *cache.ListCell
+	// fallReason (#988) is, on a not-servable flight, the reason the leader's
+	// dispatch fell through: a joiner falls through on the same decision and
+	// sends its apiserver call with it.
+	fallReason cache.FallthroughReason
 }
 
 // contentStampGate is a stamp-gated (#765) reader's state: on for a refresher

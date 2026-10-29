@@ -51,6 +51,12 @@
 // outside this package, such as plumbing's endpoints.FromSecret, inherits it),
 // and every client constructor applies it to its own copy (so a client built
 // here has no limiter whatever config it was handed).
+//
+// #988 — THE RESOLVE COLLECTION-LIST COUNTER. Because every config and client
+// that carries a snowplow-held credential leaves this package, this is also
+// where a resolve's collection LISTs are counted on the wire
+// (snowplow_resolve_collection_lists, resolve_lists.go): Harden and Client
+// install CountResolveCollectionLists wherever they install RefuseRedirectHops.
 package credhttp
 
 import (
@@ -112,11 +118,13 @@ func (t *refuseRedirectHops) RoundTrip(req *http.Request) (*http.Response, error
 // CloseIdleConnectionsFor).
 func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.next }
 
-// Harden installs RefuseRedirectHops on rc and removes its client-side rate
-// limit (#920), in place, and returns it. Every client later built from rc or
-// from a rest.CopyConfig of it inherits both. nil-safe.
+// Harden installs RefuseRedirectHops on rc, with the #988 resolve
+// collection-LIST counter inside it, and removes its client-side rate limit
+// (#920), in place, and returns it. Every client later built from rc or from a
+// rest.CopyConfig of it inherits all three. nil-safe.
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
+		rc.Wrap(CountResolveCollectionLists)
 		rc.Wrap(RefuseRedirectHops)
 		noClientRateLimit(rc)
 	}
@@ -137,10 +145,11 @@ func noClientRateLimit(rc *rest.Config) {
 	rc.RateLimiter = nil
 }
 
-// Client applies both layers to c (in place) and returns it.
+// Client applies both layers to c (in place), with the #988 resolve
+// collection-LIST counter inside the hop refusal, and returns it.
 func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
-	c.Transport = RefuseRedirectHops(c.Transport)
+	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(c.Transport))
 	return c
 }
 

@@ -77,37 +77,37 @@ import (
 	"expvar"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strings"
 	"sync"
 
+	"github.com/krateo-platformops/snowplow/internal/apicall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/transport"
 )
 
-// The five wire shapes, plus the two denominators' worth of context. Values are
-// the strings published in the per-GVR map, so they are part of the surface.
+// The five wire shapes. They are apicall's (internal/apicall wire_shape.go),
+// the one classifier this file and the #988 resolve collection-LIST counter
+// share; the names stay local because the per-GVR map publishes them.
 const (
 	// reflectorPathWatchList — watch=true & sendInitialEvents=true: the
 	// initial state is streamed from the apiserver watch cache.
-	reflectorPathWatchList = "watchlist"
+	reflectorPathWatchList = apicall.WireWatchList
 	// reflectorPathWatchPlain — watch=true with no sendInitialEvents: the
 	// ordinary re-watch after a clean timeout. Happens under BOTH regimes, so
 	// it is not a discriminator; it is the proof the instrument is wired.
-	reflectorPathWatchPlain = "watch_plain"
+	reflectorPathWatchPlain = apicall.WireWatchPlain
 	// reflectorPathListPage — a continue page. A continue token is an etcd
 	// read by definition and its page size is what bounds it, so this is
 	// correct traffic, not a bypass.
-	reflectorPathListPage = "list_page"
+	reflectorPathListPage = apicall.WireListPage
 	// reflectorPathListEtcdDelegated — limit + a resourceVersion that is
 	// neither empty nor "0", no continue. By client-go's own documented rule
 	// this LIST is delegated to etcd and SKIPS the watch cache. It is non-zero
 	// on today's binary by construction (listOptionsTweak sets Limit
 	// unconditionally) and must read 0 once C1 ships.
-	reflectorPathListEtcdDelegated = "list_etcd_delegated"
+	reflectorPathListEtcdDelegated = apicall.WireListEtcdDelegated
 	// reflectorPathListCacheEligible — every other LIST: RV ""/"0", or no
 	// limit. The cacher can serve these.
-	reflectorPathListCacheEligible = "list_cache_eligible"
+	reflectorPathListCacheEligible = apicall.WireListCacheEligible
 )
 
 // reflectorPathList is the second per-GVR path value: the classic
@@ -290,8 +290,8 @@ func isForcedVerifyRequest(req *http.Request) bool {
 //
 // COST ON THE HOT PATH, which matters because this wrapper sits on the SHARED
 // rest.Config and every fallthrough GET-by-name pays it: one atomic add, then
-// a NON-ALLOCATING scan of the URL path. parseResourcePath walks the path with
-// IndexByte and returns substrings that share the request's own backing array,
+// a NON-ALLOCATING scan of the URL path. apicall.ParseResourcePath walks the path
+// with IndexByte and returns substrings that share the request's own backing array,
 // so the overwhelmingly common miss — a named GET — allocates nothing and
 // never parses the query. Non-GET verbs exit one branch earlier still.
 func classifyReflectorRequest(req *http.Request) {
@@ -302,14 +302,14 @@ func classifyReflectorRequest(req *http.Request) {
 	if req.Method != http.MethodGet {
 		return
 	}
-	gvr, collection, ok := parseResourcePath(req.URL.Path)
+	gvr, collection, ok := apicall.ParseResourcePath(req.URL.Path)
 	if !ok || !collection {
 		return
 	}
 	reflectorCollectionRequestsTotal.Add(1)
 
 	q := req.URL.Query()
-	bucket := classifyCollectionQuery(q)
+	bucket := apicall.ClassifyCollectionQuery(q)
 	switch bucket {
 	case reflectorPathWatchList:
 		reflectorWatchListEstablishedTotal.Add(1)
@@ -334,117 +334,6 @@ func classifyReflectorRequest(req *http.Request) {
 		return
 	}
 	recordReflectorPath(gvr, bucket, q.Get("resourceVersion") != "")
-}
-
-// classifyCollectionQuery maps a collection GET's query to its bucket. Called
-// only for requests already known to be collection GETs.
-// The "1" spellings are defensive only: client-go's parameter codec always
-// emits "true", and the narrower strconv.ParseBool spellings (t/T/True/TRUE)
-// are deliberately not accepted, since a request carrying one did not come
-// from a client-go informer and should not be attributed to a reflector.
-func classifyCollectionQuery(q url.Values) string {
-	if w := q.Get("watch"); w == "true" || w == "1" {
-		if s := q.Get("sendInitialEvents"); s == "true" || s == "1" {
-			return reflectorPathWatchList
-		}
-		return reflectorPathWatchPlain
-	}
-	if q.Get("continue") != "" {
-		return reflectorPathListPage
-	}
-	rv := q.Get("resourceVersion")
-	if q.Get("limit") != "" && rv != "" && rv != "0" {
-		return reflectorPathListEtcdDelegated
-	}
-	return reflectorPathListCacheEligible
-}
-
-// parseResourcePath splits a Kubernetes API path into its GVR and reports
-// whether it addresses a COLLECTION (no name segment) rather than a single
-// object or a subresource.
-//
-//	/api/v1/configmaps                         → (v1 configmaps, collection)
-//	/api/v1/namespaces/krateo-system/configmaps→ (v1 configmaps, collection)
-//	/api/v1/namespaces/krateo-system/configmaps/cm-1 → (…, NOT a collection)
-//	/api/v1/namespaces                         → (v1 namespaces, collection)
-//	/api/v1/namespaces/krateo-system           → (v1 namespaces, NOT a collection)
-//	/apis/widgets…/v1beta1/pageheaders         → (…, collection)
-//	/version, /openapi/v2, /apis               → not a resource path at all
-//
-// ONE KNOWN CORNER, pre-existing and bounded: a namespace SUBRESOURCE path —
-// /api/v1/namespaces/<ns>/status, /finalize — parses as a collection LIST of a
-// resource literally named "status". It behaved identically under the previous
-// strings.Split implementation, so this is not a regression, and the effect
-// stops at a counter: GVR{v1, status} is never a registered informer, so the
-// registered gate keeps it out of the per-GVR map and out of the WARN. What
-// remains is one increment in list_cache_eligible, already covered by the
-// honest-scope note in the file header. Recorded so the next reader does not
-// rediscover it and take it for something new.
-//
-// It ALLOCATES NOTHING: cutSegment returns substrings that share p's backing
-// array, so the common case — a named GET falling through to the apiserver —
-// costs a handful of IndexByte scans and no garbage. That matters because the
-// wrapper is on the shared rest.Config and this runs on the serve path's own
-// goroutine.
-func parseResourcePath(p string) (schema.GroupVersionResource, bool, bool) {
-	var none schema.GroupVersionResource
-	p = strings.TrimPrefix(p, "/")
-	p = strings.TrimSuffix(p, "/")
-
-	root, rest, ok := cutSegment(p)
-	if !ok {
-		return none, false, false
-	}
-	var group, version string
-	switch root {
-	case "api":
-		if version, rest, ok = cutSegment(rest); !ok {
-			return none, false, false
-		}
-	case "apis":
-		if group, rest, ok = cutSegment(rest); !ok {
-			return none, false, false
-		}
-		if version, rest, ok = cutSegment(rest); !ok {
-			return none, false, false
-		}
-	default:
-		return none, false, false
-	}
-
-	resource, rest, ok := cutSegment(rest)
-	if !ok {
-		return none, false, false
-	}
-	// A namespace-scoped path interposes /namespaces/<ns>/ — unless it is
-	// addressing the namespaces resource itself (a collection when nothing
-	// follows, a named GET when one segment does).
-	if resource == "namespaces" {
-		if _, afterNS, nsOK := cutSegment(rest); nsOK {
-			if scoped, tail, scopedOK := cutSegment(afterNS); scopedOK {
-				resource, rest = scoped, tail
-			} else {
-				return schema.GroupVersionResource{Group: group, Version: version, Resource: resource}, false, true
-			}
-		}
-	}
-	if resource == "" {
-		return none, false, false
-	}
-	gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
-	return gvr, rest == "", true
-}
-
-// cutSegment splits off the first '/'-delimited segment of p. Both returned
-// strings share p's backing array — no allocation.
-func cutSegment(p string) (seg, rest string, ok bool) {
-	if p == "" {
-		return "", "", false
-	}
-	if i := strings.IndexByte(p, '/'); i >= 0 {
-		return p[:i], p[i+1:], true
-	}
-	return p, "", true
 }
 
 // recordReflectorPath updates the per-GVR path and emits the transition WARN.

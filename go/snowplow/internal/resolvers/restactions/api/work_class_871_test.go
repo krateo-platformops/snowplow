@@ -113,7 +113,7 @@ func TestWorkClass871_D2_DebtRefillAndReplaceAreFillBG(t *testing.T) {
 		replace  []string
 	)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		mu.Lock()
 		dispatch = append(dispatch, workclassprobe.GoroutineClass()+"/"+workclass.Of(ctx).String())
 		mu.Unlock()

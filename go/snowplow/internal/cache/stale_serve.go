@@ -564,7 +564,7 @@ func RunRefreshNow(ctx context.Context, l1Key string) error {
 	if fn == nil {
 		return ErrRefreshNowNoHandler
 	}
-	return fn(ctx, l1Key, *entry.Inputs)
+	return runRefreshFunc(ctx, fn, l1Key, *entry.Inputs)
 }
 
 // staleServeQuiesce stops and joins the D2 goroutines (debt refills, push

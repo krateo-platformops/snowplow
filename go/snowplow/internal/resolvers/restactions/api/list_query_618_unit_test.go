@@ -167,7 +167,7 @@ func TestIssue618_ContentKey_SelectorAndUnselectedNeverShare(t *testing.T) {
 	sel := q618ClusterPath + "?labelSelector=env%3Dprod"
 	selSpelt := q618ClusterPath + "?labelSelector=env=prod"
 	for _, p := range []string{q618ClusterPath, sel, selSpelt} {
-		if _, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok || !served {
+		if _, served, ok, _, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok || !served {
 			t.Fatalf("serve %s", p)
 		}
 	}

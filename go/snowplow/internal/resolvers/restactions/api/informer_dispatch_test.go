@@ -236,7 +236,7 @@ func TestDispatchViaInformer_VerbGate(t *testing.T) {
 	for _, verb := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
 		t.Run(verb, func(t *testing.T) {
 			call := buildCall(verb, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-			raw, served := dispatchViaInformer(dispatchCtx(), call)
+			raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 			if served {
 				t.Fatalf("verb=%s: expected served=false; got served=true with %d bytes", verb, len(raw))
 			}
@@ -254,7 +254,7 @@ func TestDispatchViaInformer_SubresourcePaths(t *testing.T) {
 	for _, sfx := range []string{"/status", "/scale", "/log", "/exec", "/binding", "/proxy"} {
 		t.Run(sfx, func(t *testing.T) {
 			call := buildCall(http.MethodGet, base+sfx)
-			raw, served := dispatchViaInformer(dispatchCtx(), call)
+			raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 			if served {
 				t.Fatalf("subresource %s: expected served=false; got served=true with %d bytes", sfx, len(raw))
 			}
@@ -280,7 +280,7 @@ func TestDispatchViaInformer_ExternalPaths(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			call := buildCall(http.MethodGet, tc.path)
-			raw, served := dispatchViaInformer(dispatchCtx(), call)
+			raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 			if served {
 				t.Fatalf("path=%s: expected served=false; got served=true with %d bytes", tc.path, len(raw))
 			}
@@ -311,7 +311,7 @@ func TestDispatchViaInformer_PassthroughMode(t *testing.T) {
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("passthrough: expected served=false; got served=true with %d bytes", len(raw))
 	}
@@ -343,7 +343,7 @@ func TestDispatchViaInformer_NotSyncedFallback(t *testing.T) {
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("not-synced: expected served=false; got served=true with %d bytes", len(raw))
 	}
@@ -407,7 +407,7 @@ func TestDispatchViaInformer_MetadataOnlyFallback(t *testing.T) {
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("metadata-only: expected served=false; got served=true with %d bytes", len(raw))
 	}
@@ -428,7 +428,7 @@ func TestDispatchViaInformer_ListServed(t *testing.T) {
 
 	// Namespaced LIST → 2 items.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if !served {
 		t.Fatalf("LIST: expected served=true; got served=false")
 	}
@@ -455,7 +455,7 @@ func TestDispatchViaInformer_ListServed(t *testing.T) {
 
 	// Cluster-wide LIST → 3 items.
 	call = buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
-	raw, served = dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ = dispatchViaInformer(dispatchCtx(), call)
 	if !served {
 		t.Fatalf("cluster-wide LIST: expected served=true; got served=false")
 	}
@@ -476,7 +476,7 @@ func TestDispatchViaInformer_GetByNameServed(t *testing.T) {
 	)
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions/alpha")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if !served {
 		t.Fatalf("GET-by-name: expected served=true; got served=false")
 	}
@@ -511,7 +511,7 @@ func TestDispatchViaInformer_GetByNameNotFound(t *testing.T) {
 	)
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions/missing")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("GET-by-name 404: expected served=false (apiserver-handled); got served=true with %d bytes", len(raw))
 	}
@@ -551,7 +551,7 @@ func TestIterParallelismRespected(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-				raw, ok := dispatchViaInformer(dispatchCtx(), call)
+				raw, ok, _ := dispatchViaInformer(dispatchCtx(), call)
 				if !ok {
 					t.Errorf("parallel call: expected served=true; got false")
 					return
@@ -913,7 +913,7 @@ func TestDispatchViaInformer_UnregisteredGVR_ListFallthrough(t *testing.T) {
 
 	// LIST /api/v1/namespaces — the exact shape that froze S4.
 	call := buildCall(http.MethodGet, "/api/v1/namespaces")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("unregistered-GVR LIST: expected served=false (apiserver fallthrough); got served=true with %d bytes", len(raw))
 	}
@@ -944,7 +944,7 @@ func TestDispatchViaInformer_UnregisteredGVR_GetFallthrough(t *testing.T) {
 	}
 
 	call := buildCall(http.MethodGet, "/api/v1/namespaces/kube-system")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if served {
 		t.Fatalf("unregistered-GVR GET: expected served=false (apiserver fallthrough); got served=true with %d bytes", len(raw))
 	}
@@ -977,7 +977,7 @@ func TestDispatchViaInformer_SyncedEmptyStillServes(t *testing.T) {
 	}
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
 	if !served {
 		t.Fatalf("synced + genuinely-empty: expected served=true (over-correction guard); got served=false")
 	}

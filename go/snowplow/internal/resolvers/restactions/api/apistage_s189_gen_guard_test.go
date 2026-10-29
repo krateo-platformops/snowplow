@@ -43,11 +43,11 @@ func TestApistageContentServe_S189_ResolveRacingDelete_RefusedNotResurrected(t *
 	// generation past the captured value.
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := dispatchViaInformer(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := dispatchViaInformer(ctx, call)
 		store.PutResolved(fixtureStoreVerdict, contentKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(contentKey)
-		return raw, ok
+		return raw, ok, fctx
 	}
 
 	ctx := xcontext.BuildContext(context.Background(),
@@ -58,7 +58,7 @@ func TestApistageContentServe_S189_ResolveRacingDelete_RefusedNotResurrected(t *
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, served, ok, _ := apistageContentServe(ctx, store, call, false)
+	_, served, ok, _, _ := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("#189 apistage A5: apistageContentServe ok=false; setup broken (served=%v)", served)
 	}

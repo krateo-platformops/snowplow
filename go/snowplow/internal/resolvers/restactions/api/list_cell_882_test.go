@@ -42,8 +42,8 @@ func list882CountDispatches(t *testing.T, onList func()) (lists, others *atomic.
 	listPath := fill710ListCall().Path
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if call.Path == listPath {
 			lists.Add(1)
 			if onList != nil {
@@ -52,7 +52,7 @@ func list882CountDispatches(t *testing.T, onList func()) (lists, others *atomic.
 		} else {
 			others.Add(1)
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 	return lists, others
 }
@@ -84,7 +84,7 @@ func TestListCell882_F1a_IncrementalCellIsNotExpiredByTTLOrMaxAge(t *testing.T) 
 	lists, gets := list882CountDispatches(t, nil)
 	call := fill710ListCall()
 
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, call, false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, call, false); !ok || !served {
 		t.Fatal("PRECONDITION: the first LIST read was not served")
 	}
 	e, ok := store.GetNoTouch(fill710ListKey())
@@ -92,7 +92,7 @@ func TestListCell882_F1a_IncrementalCellIsNotExpiredByTTLOrMaxAge(t *testing.T) 
 		t.Fatal("PRECONDITION: the LIST content cell is not an anchored incremental cell")
 	}
 	getName := fmt.Sprintf("fsa-%05d", n-1)
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, list882GetCall(getName), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, list882GetCall(getName), false); !ok || !served {
 		t.Fatal("PRECONDITION: the control GET-by-name read was not served")
 	}
 	if lists.Load() != 1 || gets.Load() != 1 {
@@ -119,7 +119,7 @@ func TestListCell882_F1a_IncrementalCellIsNotExpiredByTTLOrMaxAge(t *testing.T) 
 	}
 	store.ReapPastMaxEntryAgeForTest()
 
-	v, served, ok, _ := apistageContentServe(r1Ctx(), store, call, false)
+	v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, call, false)
 	if !ok || !served {
 		t.Fatal("F1a: the LIST read after 5 s was not served")
 	}
@@ -140,7 +140,7 @@ func TestListCell882_F1a_IncrementalCellIsNotExpiredByTTLOrMaxAge(t *testing.T) 
 	}
 
 	// Control: the bounds are live on this store — the plain GET cell expired.
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, list882GetCall(getName), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, list882GetCall(getName), false); !ok || !served {
 		t.Fatal("control: the GET-by-name read was not served")
 	}
 	if got := gets.Load(); got != 2 {
@@ -175,7 +175,7 @@ func TestListCell882_F2c_AnchorUnderChurnTakesEditedKeysAndNeverRaces(t *testing
 	})
 	raced0 := cache.ListCellStatsSnapshot().Unanchors["anchor_raced"]
 
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatal("the fill was not served")
 	}
 	if got := cache.ListCellStatsSnapshot().Unanchors["anchor_raced"] - raced0; got != 0 {
@@ -196,7 +196,7 @@ func TestListCell882_F2c_AnchorUnderChurnTakesEditedKeysAndNeverRaces(t *testing
 		t.Fatal("F2c: the cell never showed the edit left unsettled at the anchor")
 	}
 	inc854Same(t, "F2c", store, fill710ListCall())
-	v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+	v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 	if !ok || !served {
 		t.Fatal("F2c: the read after the anchor was not served")
 	}
@@ -234,13 +234,13 @@ func list882HoldFirstList(t *testing.T) (listed, release chan struct{}, lists *a
 	listPath := fill710ListCall().Path
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if call.Path == listPath && lists.Add(1) == 1 {
 			close(listed)
 			<-release
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 	return listed, release, lists
 }
@@ -333,7 +333,7 @@ func TestListCell882_F2r_AFlightLedOnARetryAdmitsMovedReaders(t *testing.T) {
 
 	leader := make(chan fill710Served, 1)
 	go func() {
-		v, served, ok, _ := apistageContentServeAttempt(r1Ctx(), store, fill710ListCall(), false, false) // a retry attempt
+		v, served, ok, _, _ := apistageContentServeAttempt(r1Ctx(), store, fill710ListCall(), false, false) // a retry attempt
 		leader <- fill710Served{v, served, ok}
 	}()
 	list882Wait(t, listed, "the retrying leader never listed the informer")

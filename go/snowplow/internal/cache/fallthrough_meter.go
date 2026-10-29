@@ -63,6 +63,8 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // FallthroughReason is the closed enum of `reason` label values for
@@ -445,9 +447,9 @@ const fallthroughWarnSampleEvery = 100
 //   - `cache.Disabled() == true` — cache=off baseline; the apiserver
 //     fall-through is expected and counted nowhere.
 //   - The ctx is not inside a `FallthroughScope` — i.e. the call is
-//     not on a `/call`-class read path (e.g. Phase 1 walker, watcher
-//     bootstrap, refresher). The middleware in fallthrough_ctx.go
-//     stamps the scope ONLY on the `/call`-class routes.
+//     not on a resolve path (e.g. watcher bootstrap). The scope is
+//     stamped by the `/call`-class route middleware, the boot prewarm
+//     walk and seed, and (#988) the refresher.
 //
 // Both checks are cheap (one boolean read + one ctx.Value lookup);
 // the no-op branch is taken on every non-`/call` apiserver
@@ -457,16 +459,41 @@ const fallthroughWarnSampleEvery = 100
 // target GVR (e.g. `endpoints.FromSecret` — the Secret being read is
 // fixed per user, not per resolver target). Use `""` to keep label
 // cardinality bounded; do NOT synthesize a placeholder string.
-func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, gvr string) {
+//
+// #988 — IT RETURNS ctx WITH THE REASON STAMPED (WithFallthroughReason).
+// The request a site lets fall through is sent with the returned ctx, so
+// the wire-level counter snowplow_resolve_collection_lists{gvr,reason}
+// (credhttp resolve_lists.go) labels the LIST with the reason decided
+// here. A site that hands the ctx back to its caller (dispatchViaInformer,
+// apistageContentServe) returns it; a site after which no request is sent
+// (a diagnostic hit) has nothing to send it with.
+func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, gvr string) context.Context {
 	// 1.12.4 (design §5.4) — the ONLY routing decision. Everything
 	// below recordCell is the pre-1.12.4 body verbatim; only the pair
 	// of destinations differs. Call sites are unchanged and cannot
 	// influence the choice.
 	if _, diag := diagnosticReasons[reason]; diag {
 		recordCell(ctx, reason, gvr, &diagnosticCounters, &diagnosticTotal)
-		return
+	} else {
+		recordCell(ctx, reason, gvr, &fallthroughCounters, &fallthroughTotal)
 	}
-	recordCell(ctx, reason, gvr, &fallthroughCounters, &fallthroughTotal)
+	return WithFallthroughReason(ctx, reason)
+}
+
+// WithFallthroughReason returns ctx carrying reason as its fall-through
+// reason, without counting anything: RecordApiserverFallthrough counts the
+// decision and stamps it; this alone is for a reader that falls through on a
+// decision another reader already counted (a content-fill flight's joiner
+// falls through on its leader's decision, apistage.go). A no-op on a ctx
+// that is not a resolve's (credhttp.WithResolveReason).
+func WithFallthroughReason(ctx context.Context, reason FallthroughReason) context.Context {
+	return credhttp.WithResolveReason(ctx, string(reason))
+}
+
+// FallthroughReasonOf returns the fall-through reason ctx carries, "" if
+// none.
+func FallthroughReasonOf(ctx context.Context) FallthroughReason {
+	return FallthroughReason(credhttp.ResolveReason(ctx))
 }
 
 // recordCell is the pre-1.12.4 body of RecordApiserverFallthrough,
