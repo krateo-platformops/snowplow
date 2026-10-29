@@ -81,6 +81,7 @@ type swapStats struct {
 	mKeys         atomic.Uint64
 	reused        atomic.Uint64
 	regressedKeys atomic.Uint64
+	schemaUnowned atomic.Uint64
 }
 
 var storeSwapStats = newSwapStats()
@@ -113,6 +114,7 @@ type StoreSwapStats struct {
 	MKeys         uint64 `stat:"store_swap_m_keys_total" desc:"Σ|M| over all swaps: the keys whose bytes differed between the new copy and what the consumers last acted on. A whole-type mark is gone; this is all a swap marks."`
 	Reused        uint64 `stat:"store_swap_reused_objects_total" desc:"Objects a new copy SHARED with the live copy because their bytes were equal (the reuse transform): the new copy costs only what changed."`
 	RegressedKeys uint64 `stat:"store_swap_regressed_keys" desc:"Swap deliveries that pushed a body OLDER than the consumer had (the new copy synced behind the live one, F8); each converges when the new copy's own watch delivers the newer version. Counted, not avoided (design v5 §5)."`
+	SchemaUnowned uint64 `stat:"store_swap_schema_unowned_total" desc:"CRD schema changes on a GVR whose informer comes from a shared factory: no copy can be listed under the new schema beside it, so objects listed under the old schema keep being served until that informer re-lists by itself (#928 F5; divergences on such a GVR count store_repair_unsupported_total). Healthy: 0 in production, where the streaming path owns nearly every GVR."`
 }
 
 // StoreSwapStatsSnapshot reads the scalar family.
@@ -125,6 +127,7 @@ func StoreSwapStatsSnapshot() StoreSwapStats {
 		MKeys:         s.mKeys.Load(),
 		Reused:        s.reused.Load(),
 		RegressedKeys: s.regressedKeys.Load(),
+		SchemaUnowned: s.schemaUnowned.Load(),
 	}
 }
 
@@ -302,7 +305,7 @@ func resetStoreSwapStatsForTest() {
 			h.maxMS.Store(0)
 		}
 	}
-	for _, c := range []*atomic.Uint64{&s.swaps, &s.superseded, &s.deliveries, &s.mKeys, &s.reused, &s.regressedKeys} {
+	for _, c := range []*atomic.Uint64{&s.swaps, &s.superseded, &s.deliveries, &s.mKeys, &s.reused, &s.regressedKeys, &s.schemaUnowned} {
 		c.Store(0)
 	}
 	resetSwapLedgerForTest()

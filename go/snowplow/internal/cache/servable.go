@@ -158,16 +158,25 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 // land between them.
 func (rw *ResourceWatcher) watchErrorHandlerForInstance(gvr schema.GroupVersionResource, in *storeInstance) func(*clientcache.Reflector, error) {
 	return func(_ *clientcache.Reflector, err error) {
+		// #928 F1 — the instance's position at this error, read before rw.mu
+		// (the reflector calls this handler with no lock of its own held).
+		var pos string
+		if in != nil {
+			pos = in.gi.Informer().LastSyncResourceVersion()
+		}
 		rw.mu.Lock()
 		if in != nil && rw.instances[gvr] != in {
 			// #870 — not the live copy. A candidate keeps its own watch state
 			// and its build aborts on a terminal LIST refusal (#796's
 			// classification: only a CRD version or an RBAC grant heals it). A
-			// retiring copy's error changes nothing.
+			// retiring copy's error changes nothing. The state is the LATEST
+			// error and the position at it; the install judges it by the live
+			// copy's recovery rule (storeInstance.watchStateNow).
 			refusedNow := apierrors.IsNotFound(err) || apierrors.IsForbidden(err)
 			var aborted *buildAccount
 			if b := rw.builds[gvr]; b != nil && b.inst == in {
 				in.broken = true
+				in.brokenAt = pos
 				in.refused = refusedNow
 				if refusedNow {
 					aborted = rw.abortBuildLocked(gvr)
@@ -495,7 +504,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	// watchBroken.
 	rv := gi.Informer().LastSyncResourceVersion()
 	prev := rw.lastSyncRV[gvr]
-	if rv != "" && rv != prev && gi.Informer().HasSynced() {
+	if watchHealed(rv, prev, gi.Informer().HasSynced()) {
 		delete(rw.listRefused, gvr) // #796 — a relist succeeded
 		if _, broken := rw.watchBroken[gvr]; broken {
 			delete(rw.watchBroken, gvr)
@@ -509,6 +518,16 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	if rv != "" {
 		rw.lastSyncRV[gvr] = rv
 	}
+}
+
+// watchHealed is THE recovery rule for a broken watch: the reflector has
+// listed successfully since its position was prev — its position rv advanced
+// past prev and the informer is synced. The live copy's conjunct-3 recovery
+// (prev = the position the last confirm pass observed) and a build
+// candidate's install (prev = its position at its latest error, #928 F1) both
+// apply it.
+func watchHealed(rv, prev string, synced bool) bool {
+	return rv != "" && rv != prev && synced
 }
 
 // ConfirmResourceType runs ONE conjunct-3/4 confirmation pass SCOPED to a

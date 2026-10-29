@@ -3,9 +3,20 @@
 
 // store_swap_kind_integration_test.go — #870 against a REAL apiserver (kind):
 // the production construction path (the H5 streaming informer with the
-// verifying ListerWatcher, watch-list on, client-go v0.36.5 default gates),
-// a real forced pass that detects a REAL lost update (a watch event swallowed
-// on its way to the live copy), and a repair under churn.
+// verifying ListerWatcher), a real forced pass that detects a REAL lost update
+// (a watch event swallowed on its way to the live copy), and a repair under
+// churn.
+//
+// WATCH-LIST. The package's TestMain turns client-go's WatchListClient gate
+// OFF for the whole test binary (featuregate_watchlist_test.go: the fake
+// ListerWatchers never send the initial-events bookmark). Production runs it
+// ON: it is the v0.36.5 default and nothing in snowplow opts out
+// (store_verify.go). This arm re-enables it for its own duration with
+// client-go's scoped test override (features/testing.SetFeatureDuringTest),
+// before any informer is built (the reflector reads the gate at
+// construction), so the transform running twice through the reflector's
+// temporary store — and the reuse it does there — is exercised against a real
+// apiserver (#928 F4).
 //
 // What it asserts (design v5 §8 K1, K3 and the acceptance shape, scaled to
 // kind — the 50K run is the bench's):
@@ -14,8 +25,10 @@
 //     (counted at the RoundTripper, initial pages only);
 //   - K3: every divergent key equals a quorum GET after the swap;
 //   - acceptance shape: 0 type_event unanchors, 0 type-path dirty-marks,
-//     swap deliveries ≤ |M| (C1), keys_total{divergence,swap} = the injected
-//     losses, and install_to_push / detect_to_push reported.
+//     keys_total{divergence,swap} = the injected losses, exactly; and, from
+//     the arm's OWN record of the keys it churned while the build ran (C, no
+//     slack constant): losses ≤ swap deliveries ≤ |M| ≤ losses + |C| (C1), and
+//     reused ≥ objects − losses − |C|.
 //
 // CLUSTER. Its own kind cluster, krateo-sptest-<pid> (#522, #742), created and
 // destroyed inside the test. CI runs it under the integration tag.
@@ -41,6 +54,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -58,8 +73,10 @@ const (
 	k870Lost    = 3  // real lost updates injected
 )
 
-// k870ListCounter counts the initial-page LISTs of the GVR's DATA (not the
-// forced pass's metadata LIST, not a continue page, not a WATCH).
+// k870ListCounter counts the INITIAL LISTINGS of the GVR's DATA a copy makes,
+// on either path: a watch-list start (a WATCH with sendInitialEvents=true, the
+// production path) or a classic LIST's first page (the fallback). Not the
+// forced pass's metadata LIST, not a continue page, not a plain WATCH.
 type k870ListCounter struct {
 	inner http.RoundTripper
 	path  string
@@ -68,9 +85,13 @@ type k870ListCounter struct {
 
 func (c *k870ListCounter) RoundTrip(r *http.Request) (*http.Response, error) {
 	q := r.URL.Query()
-	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, c.path) && q.Get("watch") != "true" &&
-		q.Get("continue") == "" && !strings.Contains(r.Header.Get("Accept"), "PartialObjectMetadata") {
-		c.n.Add(1)
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, c.path) &&
+		!strings.Contains(r.Header.Get("Accept"), "PartialObjectMetadata") {
+		watchList := q.Get("watch") == "true" && q.Get("sendInitialEvents") == "true"
+		firstPage := q.Get("watch") != "true" && q.Get("continue") == ""
+		if watchList || firstPage {
+			c.n.Add(1)
+		}
 	}
 	return c.inner.RoundTrip(r)
 }
@@ -135,6 +156,8 @@ func (r k870SwallowNS) Watch(ctx context.Context, opts metav1.ListOptions) (watc
 }
 
 func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
+	// Production's watch-list setting (the v0.36.5 default), for this arm only.
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, true)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	ctx := context.Background()
@@ -245,6 +268,11 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 	// update for real: the watch event is swallowed on its way to the store.
 	stop := make(chan struct{})
 	churnDone := make(chan struct{})
+	// churned: every key the churn patches while recording is on (from the
+	// forced pass to the swap's completion) — the arm's own count C.
+	var churnMu sync.Mutex
+	recording := false
+	churned := map[string]bool{}
 	go func() {
 		defer close(churnDone)
 		rnd := rand.New(rand.NewSource(870))
@@ -258,6 +286,11 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 			}
 			i := 100 + rnd.Intn(k870Objects-100)
 			p := fmt.Sprintf(`{"spec":{"v":"%d"}}`, time.Now().UnixNano())
+			churnMu.Lock()
+			if recording {
+				churned[nsName(i)+"/"+objName(i)] = true
+			}
+			churnMu.Unlock()
 			_, _ = admin.Resource(gvr).Namespace(nsName(i)).Patch(ctx, objName(i), types.MergePatchType, []byte(p), metav1.PatchOptions{})
 		}
 	}()
@@ -293,6 +326,9 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 	lists0 := counter.n.Load()
 
 	// The real forced pass detects the losses and requests the build.
+	churnMu.Lock()
+	recording = true
+	churnMu.Unlock()
 	rw.ConfirmResourceType(ctx, gvr)
 	forcedVerify(ctx, gvr)
 	if lu, _, _, _ := divergenceCounts(verifySiteForced); lu != k870Lost {
@@ -311,8 +347,18 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// The swap's own completion event (step 6 done), not the install count.
+	select {
+	case <-rw.liveInstance(gvr).delivered:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the swap was installed but never completed its delivery")
+	}
+	churnMu.Lock()
+	recording = false
+	nChurned := len(churned)
+	churnMu.Unlock()
 	if got := counter.n.Load() - lists0; got != 1 {
-		t.Fatalf("K1 RED: %d data LIST(s) of the GVR for one repair, want 1 (the new copy's own)", got)
+		t.Fatalf("K1 RED: %d initial listing(s) of the GVR's data for one repair, want 1 (the new copy's own)", got)
 	}
 	// K3: every divergent key equals a quorum GET.
 	for end := time.Now().Add(60 * time.Second); ; time.Sleep(100 * time.Millisecond) {
@@ -339,21 +385,29 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 
 	s := StoreSwapStatsSnapshot()
 	ls := ListCellStatsSnapshot()
-	t.Logf("#870 kind: |M|=%d deliveries=%d reused=%d regressed=%d keys_total{divergence,swap}=%d data LISTs=%d",
-		s.MKeys, s.Deliveries, s.Reused, s.RegressedKeys, storeSwapStats.keys.get(reasonDivergence, outcomeSwap), counter.n.Load()-lists0)
+	t.Logf("#870 kind (watch-list on): |M|=%d deliveries=%d reused=%d regressed=%d keys_total{divergence,swap}=%d data LISTs=%d churned during the build=%d",
+		s.MKeys, s.Deliveries, s.Reused, s.RegressedKeys, storeSwapStats.keys.get(reasonDivergence, outcomeSwap), counter.n.Load()-lists0, nChurned)
 	if n := typeMarksAnyCause(d) - type0; n != 0 {
 		t.Errorf("acceptance RED: %d type-path dirty-mark(s) during the repair", n)
 	}
 	if n := ls.Unanchors["type_event"] - ls0.Unanchors["type_event"]; n != 0 {
 		t.Errorf("acceptance RED: %d type_event unanchor(s)", n)
 	}
-	if s.Deliveries > s.MKeys || s.MKeys < k870Lost {
-		t.Errorf("acceptance RED: |M|=%d deliveries=%d — M must hold the %d losses and deliveries ≤ |M|", s.MKeys, s.Deliveries, k870Lost)
+	// M holds the losses and at most the keys the arm churned during the build
+	// (a k-fold M — the whole store — fails here); every loss is delivered
+	// (its consumer never acted on S), and no more than M (C1).
+	if s.MKeys < k870Lost || s.MKeys > uint64(k870Lost+nChurned) {
+		t.Errorf("acceptance RED: |M|=%d, want %d ≤ |M| ≤ %d (the losses + the %d keys churned during the build)", s.MKeys, k870Lost, k870Lost+nChurned, nChurned)
+	}
+	if s.Deliveries < k870Lost || s.Deliveries > s.MKeys {
+		t.Errorf("acceptance RED: deliveries=%d, want %d ≤ deliveries ≤ |M|=%d", s.Deliveries, k870Lost, s.MKeys)
 	}
 	if got := storeSwapStats.keys.get(reasonDivergence, outcomeSwap); got != k870Lost {
 		t.Errorf("acceptance RED: keys_total{divergence,swap} = %d, want the %d injected", got, k870Lost)
 	}
-	if s.Reused < uint64(k870Objects-200) {
-		t.Errorf("reuse: only %d of %d objects shared with the live copy", s.Reused, k870Objects)
+	// Every object neither lost nor churned during the build is byte-equal in
+	// both copies when the new copy lists it: shared.
+	if floor := uint64(k870Objects - k870Lost - nChurned); s.Reused < floor {
+		t.Errorf("reuse RED: %d objects shared with the live copy, want ≥ %d (objects − losses − churned)", s.Reused, floor)
 	}
 }

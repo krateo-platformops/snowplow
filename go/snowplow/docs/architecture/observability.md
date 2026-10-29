@@ -679,6 +679,17 @@ lines are `cache.store.divergent` at **WARN**, `cache.store.swap.requested` /
 `cache.store.swap.installed` / `cache.store.swap.build` at INFO (metadata only), and
 `cache.store.repair_ineffective` at **ERROR**.
 
+Two rules of the install (#928 review):
+- **The new copy's watch state is judged at the install by the live copy's own recovery rule.** A
+  reflector error the copy has since listed past (its position advanced and it is synced) is
+  healed and not copied: one retried LIST never leaves the GVR unservable. An error it has not
+  recovered from is copied, and because that install is then an exit from servable, it moves the
+  servability epoch (owner ruling 1). `cache.store.swap.installed` carries `servable`.
+- **The new copy is unmuted in each listener's own order.** A `swapUnmute` notification goes
+  through the new informer's handler path and the install waits until every handler adapter has
+  passed it; everything a listener received before it stays muted. A notification still queued at
+  the unmute therefore never reaches a consumer that already acted on a newer version.
+
 **What this does and does not close.** Invisibility is closed for every loss class **except a stale
 apiserver watch cache** — see the scope limit above; that qualifier travels with every claim made
 about this deliverable. Staleness is bounded by `maxVerificationAge` + one build (the new
@@ -705,6 +716,7 @@ keys). Every instant reads the dirty-window clock (#930). No key, body or identi
 | `store_swap_deliveries_total` | swap deliveries the dep handler acted on (≤ \|M\|: a key a live event delivered first is skipped, v5.1 C1) | ≤ `store_swap_m_keys_total` |
 | `store_swap_reused_objects_total` | objects a new copy shared with the live copy (equal bytes) | ≈ the store size per swap |
 | `store_swap_regressed_keys` | swap deliveries that pushed a body older than the consumer had (the new copy synced behind); each converges on the new copy's next watch event | 0; rare |
+| `store_swap_schema_unowned_total` | CRD schema changes on a GVR whose informer comes from a shared factory: no copy can be listed under the new schema beside it, so objects listed under the old schema keep being served until that informer re-lists by itself (log `cache.store.swap.schema_unowned`). A divergence there counts `store_repair_unsupported_total` instead | 0 in production, where the streaming path owns nearly every GVR |
 
 | OTLP instrument (expvar key under `snowplow_store_swap_known_stale`) | labels | meaning |
 |---|---|---|

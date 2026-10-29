@@ -133,7 +133,7 @@ func TestStoreSwap_K2_ExactMarks(t *testing.T) {
 	f.waitFor("both swap deliveries to reach the dep handler", func() bool {
 		return d.dirtyMarkSubmitSourceSnapshot()[dmSourceStoreSwap]-src0 >= 2
 	})
-	time.Sleep(50 * time.Millisecond) // room for any extra (wrong) delivery
+	f.fence() // every listener has delivered everything queued before it
 
 	s := StoreSwapStatsSnapshot()
 	if s.MKeys != 2 || s.Deliveries != 2 {
@@ -164,7 +164,7 @@ func TestStoreSwap_K2_ExactMarks(t *testing.T) {
 		t.Fatalf("K2 RED: %d new anchor(s) — a full fill happened", got)
 	}
 	// Exactly one consumer event per key of M, none for the others.
-	evs := f.rec.since(evs0)
+	evs := withoutFence(f.rec.since(evs0))
 	if len(evs) != 2 || keysOf(evs) != keysOf([]swapEvent{
 		{kind: "update", key: swapKey("o01"), rv: "2", v: "v2", oldRV: "1"},
 		{kind: "update", key: swapKey("o04"), rv: "2", v: "v2", oldRV: "1"},
@@ -360,7 +360,13 @@ func TestStoreSwap_K8_TeardownAbortsTheBuild(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("K8 RED: the aborted copy's Run never returned")
 	}
-	time.Sleep(50 * time.Millisecond)
+	// The copy's sync goroutine has decided (installed, or given up): the
+	// checks below are decided by that event, not by a sleep.
+	select {
+	case <-cand.syncDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("K8 RED: the aborted copy's sync goroutine never returned")
+	}
 	if f.rw.IsRegistered(gvr) {
 		t.Fatal("K8 RED (X12/X13): the GVR is registered again after its teardown — the aborted copy was installed")
 	}
@@ -636,7 +642,11 @@ func TestStoreSwap_K15_BehindCopyConvergesAndIsCounted(t *testing.T) {
 	f.waitFor("the live copy at v3", func() bool { o, _ := f.storeObj(swapKey("o00")); return rvOf(o) == "3" })
 	f.request(reasonSchema)
 	f.awaitSwaps(1)
-	// The new copy's watch delivers v3 (it came after its LIST).
+	// Every listener has processed the swap delivery (it pushed v2): only
+	// then does the new copy's watch deliver v3 (it came after its LIST). A v3
+	// written before the swap delivery is processed would be read as S
+	// itself (#928 F4: the arm decides its interleaving by an event).
+	f.fence()
 	f.watcher(1).Modify(swapObj(gvr, "o00", "3", "v3"))
 	f.waitFor("convergence on v3", func() bool {
 		e := f.rec.forKey(swapKey("o00"))
@@ -692,8 +702,8 @@ func r1Case(t *testing.T, lose func(f *swapFix, gvr schema.GroupVersionResource)
 	sort.Strings(keys)
 	f.request(reasonDivergence, keys...)
 	f.awaitSwaps(1)
+	f.fence() // every listener has delivered everything queued before it
 	f.waitFor("the dep worker to drain", func() bool { return DepWatchStatsSnapshot().DeleteQueueDepth == 0 })
-	time.Sleep(50 * time.Millisecond)
 	got := f.readCell(c)
 	if !c.Anchored() {
 		t.Fatalf("R1 RED (X3): the cell unanchored at the swap: %v", ListCellStatsSnapshot().Unanchors)

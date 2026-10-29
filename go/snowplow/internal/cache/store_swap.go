@@ -28,11 +28,12 @@
 //     over exactly the per-GVR map set a teardown purges (perGVRFields), the
 //     previous copy joins the retiring set, and the lock is released. Then,
 //     with no lock held, every retiring copy is stopped and waited for; the new
-//     copy is unmuted; M — every key whose bytes differ between the new store
-//     and what each consumer last ACTED on — is computed; the push ledger is
-//     opened; and M is delivered, one swapDelivery per key through the new
-//     informer's own OnUpdate, so each handler receives it in its own order
-//     (store_instance.go).
+//     copy is unmuted IN EACH LISTENER'S ORDER (a swapUnmute notification
+//     through the new informer's own OnUpdate, waited for on every adapter);
+//     M — every key whose bytes differ between the new store and what each
+//     consumer last ACTED on — is computed; the push ledger is opened; and M
+//     is delivered, one swapDelivery per key through the same OnUpdate, so
+//     each handler receives it in its own order (store_instance.go).
 //  4. The servability epoch does NOT move at a swap (owner ruling 1) and the
 //     GVR keeps its confirmation. No whole-type mark, no unanchor: the only
 //     apiserver List per repair is the new copy's own.
@@ -132,17 +133,22 @@ var perGVRFields = []perGVRField{
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.confirmed[g]; return ok },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) { delete(rw.confirmed, g) },
 		nil},
+	// The new copy's watch state, judged NOW by the live copy's recovery rule:
+	// an error its reflector has since listed past is healed and not copied
+	// (#928 F1).
 	{"watchBroken",
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.watchBroken[g]; return ok },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) { delete(rw.watchBroken, g) },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource, c *storeInstance) {
-			setMember(&rw.watchBroken, g, c.broken)
+			broken, _ := c.watchStateNow()
+			setMember(&rw.watchBroken, g, broken)
 		}},
 	{"listRefused",
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.listRefused[g]; return ok },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) { delete(rw.listRefused, g) },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource, c *storeInstance) {
-			setMember(&rw.listRefused, g, c.refused)
+			_, refused := c.watchStateNow()
+			setMember(&rw.listRefused, g, refused)
 		}},
 	{"informerStop",
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.informerStop[g]; return ok },
@@ -317,7 +323,7 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 	owned, known, suppressed := storeVerificationOwnership(gvr)
 	if !known || !owned || !live.shape.owned() {
 		rw.mu.Unlock()
-		refuseUnownedBuild(gvr, reason)
+		refuseUnownedBuild(gvr, reason, keys)
 		return false
 	}
 	if reason == reasonDivergence && suppressed {
@@ -373,14 +379,29 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 	return true
 }
 
-// refuseUnownedBuild counts and logs a refused build of a factory-built GVR
-// (store_repair_unsupported_total). Detection continues.
-func refuseUnownedBuild(gvr schema.GroupVersionResource, reason string) {
+// refuseUnownedBuild counts and logs a refused build of a factory-built GVR,
+// under its own reason (#928 F5): a divergence is a repair that cannot happen
+// (store_repair_unsupported_total, cache.store.repair_unsupported); a schema
+// change is a re-list under the new schema that cannot happen
+// (store_swap_schema_unowned_total, cache.store.swap.schema_unowned).
+// Detection continues.
+func refuseUnownedBuild(gvr schema.GroupVersionResource, reason string, keys []string) {
+	if reason == reasonSchema {
+		storeSwapStats.schemaUnowned.Add(1)
+		slog.Warn("cache.store.swap.schema_unowned",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("hint", "the CRD's schema changed, but this GVR's informer comes from a shared informer "+
+				"factory, which hands back the same cached informer: a copy listed under the new schema cannot "+
+				"be built beside it. Objects listed under the old schema keep being served until that informer "+
+				"re-lists by itself."))
+		return
+	}
 	storeRepairUnsupportedTotal.Add(1)
 	slog.Warn("cache.store.repair_unsupported",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
-		slog.String("reason", reason),
+		slog.Int("keys", len(keys)),
 		slog.String("hint", "this GVR's informer comes from a shared informer factory, which hands back "+
 			"the same cached informer: a replacement cannot be built beside it. The divergence is "+
 			"still reported; it is not repaired."))
@@ -396,7 +417,7 @@ func (rw *ResourceWatcher) constructCandidateLocked(gvr schema.GroupVersionResou
 		return nil
 	}
 	c := newStoreInstance(gvr, gi, live.shape, make(chan struct{}))
-	c.muted.Store(true)
+	c.startMuted.Store(true)
 	liveIdx := live.gi.Informer().GetIndexer()
 	c.reuse.Store(&liveIdx)
 	var tf clientcache.TransformFunc
@@ -420,6 +441,7 @@ func (rw *ResourceWatcher) constructCandidateLocked(gvr schema.GroupVersionResou
 	}()
 	go func() {
 		defer rw.goroutineWG.Done()
+		defer close(c.syncDone)
 		waitInformerSync(c.gi.Informer().HasSynced, c.syncCh, c.stop)
 		if c.stopped() || !c.gi.Informer().HasSynced() {
 			return
@@ -498,6 +520,7 @@ func (rw *ResourceWatcher) noteCleanPass(gvr schema.GroupVersionResource, in *st
 // Runs on the candidate's sync goroutine.
 func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	gvr := c.gvr
+	swapStep(c, "before_install")
 	// Step 1 — under rw.mu: re-check, write the state, retire the previous
 	// copy, unlock. The new copy serves reads from here, still muted.
 	rw.mu.Lock()
@@ -507,10 +530,18 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 		rw.mu.Unlock()
 		return
 	}
+	_, wasServable := rw.servableLocked(gvr)
 	for _, f := range perGVRFields {
 		if f.install != nil {
 			f.install(rw, gvr, c)
 		}
+	}
+	_, servable := rw.servableLocked(gvr)
+	if wasServable && !servable {
+		// #854, owner ruling 1 — the epoch moves on every exit from servable.
+		// An install that leaves the GVR unservable (a watch error its new
+		// copy has not recovered from) is one.
+		bumpServabilityEpoch(gvr)
 	}
 	c.reuse.Store(nil)
 	acc := b.account
@@ -564,14 +595,22 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// then never judges a key whose delivery is still on its way, and a
 	// byte-equal key with a new identity is re-pointed by the C6 rebind);
 	// then the comparator's record becomes the new copy's `seen`; then the
-	// handlers act.
+	// handlers act — each from its own listener's position (#928 F2): a
+	// swapUnmute goes through the new informer's OnUpdate, and every adapter
+	// is waited for until it has passed it. A notification queued before it
+	// stays muted (seen only), so it can never reach a consumer that has
+	// already acted on a newer version. The wait ends early when this copy is
+	// stopped (a later install retired it, or a teardown): its listeners are
+	// gone, so the later install's M delivers for both (Q3), and this install
+	// still decides and counts its own accounting below (Q6).
 	markChangedPending(gvr, live, c)
 	setComparatorRecord(gvr, c)
 	swapStep(c, "before_unmute")
-	c.muted.Store(false)
+	unmuteInListenerOrder(c)
 
-	// Step 5 — M, after the unmute: a write the new copy took while muted
-	// cannot fall between the two.
+	// Step 5 — M, after every adapter has passed the unmute: a write the new
+	// copy took while muted cannot fall between the two (its notification was
+	// muted, so acted still differs from the store, so it is in M).
 	m := computeM(c)
 	storeSwapStats.mKeys.Add(uint64(len(m)))
 	swapStep(c, "after_m")
@@ -584,18 +623,56 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// Step 6 — deliver M through the new informer's own OnUpdate: every
 	// listener gets one swapDelivery per key, in order with its real ones.
 	deliverM(c, m)
+	close(c.delivered)
 	slog.Info("cache.store.swap.installed",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
 		slog.String("reasons", strings.Join(acc.reasonList(), ",")),
 		slog.Int("m_keys", len(m)),
 		slog.Int("retired_copies", len(retiring)),
+		slog.Bool("servable", servable),
 	)
 }
 
+// unmuteInListenerOrder unmutes c's adapters in each listener's own order: one
+// swapUnmute through the new informer's OnUpdate, then a wait until every
+// adapter has processed it, or until c is stopped (its listeners are then
+// gone). Every listener of an instance is an adapter, and all are attached
+// before Run (wireInstanceLocked), so the count is the listener count.
+func unmuteInListenerOrder(c *storeInstance) {
+	adapters := c.adaptersSnapshot()
+	n, ok := c.gi.Informer().(swapNotifier)
+	if !ok {
+		// No OnUpdate to distribute through (deliverM logs the same
+		// condition): nothing can be ordered, so the adapters are unmuted
+		// where they stand.
+		for _, a := range adapters {
+			a.OnUpdate(swapUnmute{passed: func() {}}, swapUnmute{passed: func() {}})
+		}
+		return
+	}
+	all := make(chan struct{})
+	var remaining atomic.Int64
+	remaining.Store(int64(len(adapters)))
+	if len(adapters) == 0 {
+		close(all)
+	}
+	u := swapUnmute{passed: func() {
+		if remaining.Add(-1) == 0 {
+			close(all)
+		}
+	}}
+	n.OnUpdate(u, u)
+	swapStep(c, "unmute_sent")
+	select {
+	case <-all:
+	case <-c.stop:
+	}
+}
+
 // swapStepHookForTest, when non-nil, runs at named points of installBuild
-// ("installed", "before_close_retiring", "after_step3", "before_unmute",
-// "after_m"), never under a lock. TEST-ONLY: production pays one atomic load
+// ("before_install", "installed", "before_close_retiring", "after_step3",
+// "before_unmute", "unmute_sent", "after_m"), never under a lock. TEST-ONLY: production pays one atomic load
 // per point. The interleaving arms (K11d, K11e, K11f) use it to land a write
 // or another install at an exact step.
 var swapStepHookForTest atomic.Pointer[func(c *storeInstance, step string)]

@@ -50,7 +50,7 @@ func newAdapterRig(t *testing.T, acted *actedRecord, muted bool) *adapterRig {
 	gvr := schema.GroupVersionResource{Group: "adapter870.krateo.io", Version: "v1", Resource: "panels"}
 	idx := clientcache.NewIndexer(clientcache.MetaNamespaceKeyFunc, clientcache.Indexers{})
 	inst := newStoreInstance(gvr, stubGenericInformer{inf: stubSharedInformer{idx: idx}}, shapeStandaloneDynamic, make(chan struct{}))
-	inst.muted.Store(muted)
+	inst.startMuted.Store(muted)
 	rec := &swapRecorder{}
 	if acted == nil {
 		acted = newActedRecord()
@@ -80,6 +80,14 @@ func (r *adapterRig) nAdd(o any)           { r.a.OnAdd(o, false) }
 func (r *adapterRig) nUpdate(old, new any) { r.a.OnUpdate(old, new) }
 func (r *adapterRig) nDelete(o any)        { r.a.OnDelete(o) }
 func (r *adapterRig) nSwap()               { r.a.OnUpdate(swapDelivery{key: "swap/k"}, swapDelivery{key: "swap/k"}) }
+
+// nUnmute is the install's swapUnmute reaching this listener: the adapter is
+// live from here on (#928 F2 — the unmute is a notification in listener
+// order, never a flag flipped out of it).
+func (r *adapterRig) nUnmute() {
+	u := swapUnmute{passed: func() {}}
+	r.a.OnUpdate(u, u)
+}
 
 func (r *adapterRig) seq() []string {
 	var out []string
@@ -123,8 +131,8 @@ func TestStoreSwap_K11b_OrderIsNonDecreasing(t *testing.T) {
 	r := newAdapterRig(t, liveActedOn(t, v2), true)
 	v3 := r.obj("3", "v3")
 	r.write(v3)
-	r.nAdd(v3) // the new copy's initial list, muted: seen = v3
-	r.inst.muted.Store(false)
+	r.nAdd(v3)  // the new copy's initial list, muted: seen = v3
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	// M = {k} (acted v2 ≠ v3). Before the listener reaches the swapDelivery,
 	// two real writes land: v4 then v5, their notifications queued BEHIND it.
 	v4, v5 := r.obj("4", "v4"), r.obj("5", "v5")
@@ -157,8 +165,8 @@ func TestStoreSwap_K11c0_NoSuppressionWhenNothingPending(t *testing.T) {
 	r := newAdapterRig(t, liveActedOn(t, swapObj(gvr, "k", "2", "v2")), true)
 	s3 := r.obj("3", "v3")
 	r.write(s3)
-	r.nAdd(s3) // muted: seen = S
-	r.inst.muted.Store(false)
+	r.nAdd(s3)  // muted: seen = S
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	r.nSwap()
 	if n, _ := r.a.suppressingForTest(); n != 0 {
 		t.Fatalf("K11c-0 RED: %d key(s) suppressed although the listener already delivered S", n)
@@ -183,8 +191,8 @@ func TestStoreSwap_K11c6_SameVersionOlderBytesNeverFollowNewer(t *testing.T) {
 	r := newAdapterRig(t, liveActedOn(t, swapObj(gvr, "k", "6", "v6")), true)
 	s0 := r.obj("7", "z")
 	r.write(s0)
-	r.nAdd(s0) // muted: seen = S0 (rv 7)
-	r.inst.muted.Store(false)
+	r.nAdd(s0)  // muted: seen = S0 (rv 7)
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	s1, s2 := r.obj("7", "a"), r.obj("7", "b")
 	r.write(s1)
 	r.write(s2)
@@ -205,7 +213,7 @@ func TestStoreSwap_K11c2_DeleteAfterSIsRead(t *testing.T) {
 	v3 := r.obj("3", "v3")
 	r.write(v3)
 	r.nAdd(v3)
-	r.inst.muted.Store(false)
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	v5 := r.obj("5", "v5")
 	r.write(v5)
 	r.nSwap() // reads S = v5
@@ -225,7 +233,7 @@ func TestStoreSwap_K11c3_SuppressionDiesWithTheInstance(t *testing.T) {
 	v3 := r.obj("3", "v3")
 	r.write(v3)
 	r.nAdd(v3)
-	r.inst.muted.Store(false)
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	r.write(r.obj("5", "v5"))
 	r.nSwap()
 	if n, _ := r.a.suppressingForTest(); n != 1 {
@@ -251,8 +259,8 @@ func TestStoreSwap_K11c4_AbsentSConvergesThroughTheStatedTransient(t *testing.T)
 	v1 := swapObj(gvr, "k", "1", "v1")
 	r := newAdapterRig(t, liveActedOn(t, v1), true)
 	r.write(v1)
-	r.nAdd(v1) // seen = v1
-	r.inst.muted.Store(false)
+	r.nAdd(v1)  // seen = v1
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	r2 := r.obj("2", "r2")
 	r.del(v1)
 	r.write(r2)
@@ -282,7 +290,7 @@ func TestStoreSwap_K11d_CaughtUpListenerStillDelivers(t *testing.T) {
 	if len(r.rec.all()) != 0 {
 		t.Fatal("precondition: a muted delivery reached the consumer")
 	}
-	r.inst.muted.Store(false)
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	r.nSwap()
 	if got, want := r.seq(), []string{"update:3:v3"}; !eqSeq(got, want) {
 		t.Fatalf("K11d RED (X32): sequence %v, want %v — exactly one event per key of M", got, want)
@@ -302,7 +310,7 @@ func TestStoreSwap_K11f_WriteAfterUnmuteIsDeliveredOnce(t *testing.T) {
 	v1 := r.obj("1", "v1")
 	r.write(v1)
 	r.nAdd(v1)
-	r.inst.muted.Store(false)
+	r.nUnmute() // the listener reaches the install's swapUnmute
 	// Between the unmute and M: v6.
 	v6 := r.obj("6", "v6")
 	r.write(v6)

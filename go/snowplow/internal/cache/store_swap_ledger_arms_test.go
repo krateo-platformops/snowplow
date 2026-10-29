@@ -23,6 +23,7 @@ type ledgerRig struct {
 	decline map[string]bool          // refresh returns without a Put (a decline)
 	gate    map[string]chan struct{} // refresh of key waits here
 	after   map[string]chan struct{} // refresh of key waits here AFTER its publish
+	calls   map[string]int           // refreshes of key that have BEGUN (entered the refresh func)
 	refresh atomic.Int64
 
 	// clk is the dirty-window clock (#930): every instant the swap, the
@@ -45,7 +46,7 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 	resetRefresherForTest()
 	t.Cleanup(resetRefresherForTest)
 	r := &ledgerRig{swapFix: f, decline: map[string]bool{}, gate: map[string]chan struct{}{}, after: map[string]chan struct{}{},
-		clk: newC930Clock()}
+		calls: map[string]int{}, clk: newC930Clock()}
 	t.Cleanup(SetDirtyWindowClockForTest(r.clk.now))
 	r.store = ResolvedCache()
 	if r.store == nil {
@@ -54,6 +55,7 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 	Deps().SetStore(r.store)
 	RegisterRefreshFunc("widgets", func(ctx context.Context, key string, in ResolvedKeyInputs) error {
 		r.mu.Lock()
+		r.calls[key]++
 		g, decl := r.gate[key], r.decline[key]
 		r.mu.Unlock()
 		if g != nil {
@@ -125,6 +127,14 @@ func (r *ledgerRig) body(key string) string {
 	return string(e.RawJSON)
 }
 
+// began is how many refreshes of key have entered the refresh func (their
+// dequeue began before that).
+func (r *ledgerRig) began(key string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[key]
+}
+
 func (r *ledgerRig) holdRefresh(key string) func() {
 	ch := make(chan struct{})
 	r.mu.Lock()
@@ -139,11 +149,12 @@ func (r *ledgerRig) holdRefresh(key string) func() {
 // viewer is a simulated /refreshes stream: it reads the sink and, like the
 // handler, calls Wrote after each frame it "writes".
 type viewer struct {
-	st     RefreshStream
-	mu     sync.Mutex
-	frames map[string]int
-	at     map[string]time.Time
-	done   chan struct{}
+	st      RefreshStream
+	mu      sync.Mutex
+	frames  map[string]int
+	written map[string]int // frames whose Wrote has RETURNED (the ledger heard them)
+	at      map[string]time.Time
+	done    chan struct{}
 }
 
 // quiesce waits until nothing more can happen without a new event: the dep
@@ -162,7 +173,7 @@ func (r *ledgerRig) view(keys ...string) *viewer {
 	for _, k := range keys {
 		set[k] = struct{}{}
 	}
-	v := &viewer{st: SubscribeRefreshStream(set), frames: map[string]int{}, at: map[string]time.Time{}, done: make(chan struct{})}
+	v := &viewer{st: SubscribeRefreshStream(set), frames: map[string]int{}, written: map[string]int{}, at: map[string]time.Time{}, done: make(chan struct{})}
 	go func() {
 		for {
 			select {
@@ -177,6 +188,9 @@ func (r *ledgerRig) view(keys ...string) *viewer {
 				v.at[k] = windowNow()
 				v.mu.Unlock()
 				v.st.Wrote(k)
+				v.mu.Lock()
+				v.written[k]++
+				v.mu.Unlock()
 			}
 		}
 	}()
@@ -197,6 +211,13 @@ func (v *viewer) count(k string) int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.frames[k]
+}
+
+// wrote is how many frames for k the ledger has heard (Wrote returned).
+func (v *viewer) wrote(k string) int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.written[k]
 }
 
 func (v *viewer) when(k string) time.Time {
@@ -501,9 +522,9 @@ func TestStoreSwap_K16e_OfferIsNotAWrite(t *testing.T) {
 		r.request(reasonDivergence, swapKey("o00"))
 		r.awaitSwaps(1)
 		r.waitFor("dep refreshed", func() bool { return r.body(dep) == `{"v":"x"}` })
-		time.Sleep(50 * time.Millisecond)
-		st.Unsub() // disconnects before the drain: the backlog is discarded
-		time.Sleep(50 * time.Millisecond)
+		r.quiesce() // the refresh has published: its offer was deferred
+		st.Unsub()  // disconnects before the drain: the backlog is discarded
+		r.quiesce()
 		if closes(reasonDivergence, closePushed) != 0 {
 			t.Fatal("K16e (1) RED (X43): a deferred offer closed the entry as pushed")
 		}

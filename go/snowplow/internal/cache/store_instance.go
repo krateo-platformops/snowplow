@@ -85,10 +85,19 @@ type storeInstance struct {
 	syncCh chan struct{}
 	dl     *deliveryLog
 
-	// muted: a candidate's adapters record `seen` and do nothing else until
-	// the install unmutes it (design v5 §2.6 step 4). One atomic load per
-	// delivery.
-	muted atomic.Bool
+	// startMuted: the instance was constructed as a build candidate, so each
+	// adapter attached to it starts MUTED (records `seen`, does nothing else).
+	// An adapter is unmuted only by the swapUnmute notification, in its own
+	// listener's order (#928 F2) — never by flipping a flag the listener reads
+	// out of order. Set before any adapter attaches.
+	startMuted atomic.Bool
+
+	// delivered is closed when this instance's swap has delivered M (step 6
+	// done): the swap's completion event.
+	delivered chan struct{}
+	// syncDone is closed when a candidate's sync goroutine has returned: it
+	// installed the copy, or gave up (stopped first, or never synced).
+	syncDone chan struct{}
 
 	// reuse is the LIVE copy's indexer while this instance is a candidate: the
 	// transform hands back the live object when the bytes are equal, so a new
@@ -101,10 +110,15 @@ type storeInstance struct {
 	adapters []*handlerAdapter
 	depAdpt  *handlerAdapter // the dep handler's adapter: the comparator record
 
-	// Candidate-only watch state, guarded by rw.mu: written by the
-	// instance-aware watch-error handler while this instance is not the live
-	// one, and copied into rw.watchBroken / rw.listRefused at the install.
+	// Candidate-only watch state, guarded by rw.mu: the latest reflector error
+	// the instance-aware watch-error handler saw while this instance was not
+	// the live one, and the instance's position (LastSyncResourceVersion) at
+	// that error. At the install it is judged NOW by the live copy's own
+	// recovery rule (watchHealed): a position that advanced past brokenAt on a
+	// synced informer means the reflector has listed successfully since the
+	// error, which is healed (#928 F1).
 	broken, refused bool
+	brokenAt        string
 
 	// account is the known-stale accounting of the build that installed this
 	// instance, until its swap goroutine claims it at step 3 (or a later
@@ -115,13 +129,30 @@ type storeInstance struct {
 
 func newStoreInstance(gvr schema.GroupVersionResource, gi informers.GenericInformer, shape instanceShape, stop chan struct{}) *storeInstance {
 	return &storeInstance{
-		gvr:    gvr,
-		gi:     gi,
-		shape:  shape,
-		stop:   stop,
-		done:   make(chan struct{}),
-		syncCh: make(chan struct{}),
+		gvr:       gvr,
+		gi:        gi,
+		shape:     shape,
+		stop:      stop,
+		done:      make(chan struct{}),
+		syncCh:    make(chan struct{}),
+		delivered: make(chan struct{}),
+		syncDone:  make(chan struct{}),
 	}
+}
+
+// watchStateNow is the candidate's watch state judged at the install by the
+// live copy's conjunct-3 recovery rule (watchHealed): an error the reflector
+// has since recovered from (its position advanced past the one at the error
+// and it is synced) is not copied. Callers hold rw.mu.
+func (in *storeInstance) watchStateNow() (broken, refused bool) {
+	if !in.broken {
+		return false, false
+	}
+	inf := in.gi.Informer()
+	if watchHealed(inf.LastSyncResourceVersion(), in.brokenAt, inf.HasSynced()) {
+		return false, false
+	}
+	return true, in.refused
 }
 
 // closeStop closes the instance's stop channel exactly once, from any caller
@@ -201,6 +232,7 @@ func (in *storeInstance) adapt(name string, inner clientcache.ResourceEventHandl
 		name:     name,
 		inner:    inner,
 		acted:    acted,
+		muted:    in.startMuted.Load(),
 		seen:     map[string]any{},
 		suppress: map[string]suppressTarget{},
 	}
@@ -376,6 +408,15 @@ func (t suppressTarget) matches(obj any, present bool) bool {
 // treats it as a resync.
 type swapDelivery struct{ key string }
 
+// swapUnmute is the notification the install enqueues, through the same
+// OnUpdate, to unmute the new copy IN EACH LISTENER'S ORDER (#928 F2): every
+// notification the listener received before it is muted (seen only), every
+// one after it is live. passed is called once by each adapter as it processes
+// it; the install computes M only after every adapter has passed it, so a
+// notification still queued at the unmute can never reach a consumer that
+// already acted on a newer version.
+type swapUnmute struct{ passed func() }
+
 // handlerAdapter wraps one consumer handler on one instance.
 type handlerAdapter struct {
 	inst  *storeInstance
@@ -383,13 +424,21 @@ type handlerAdapter struct {
 	inner clientcache.ResourceEventHandler
 	acted *actedRecord // nil where no build can happen
 
-	mu       sync.Mutex
-	freed    bool
+	mu    sync.Mutex
+	freed bool
+	// muted: this adapter records `seen` and nothing else. Starts as the
+	// instance's startMuted; cleared only by the swapUnmute notification.
+	muted    bool
 	seen     map[string]any
 	suppress map[string]suppressTarget
-	// displaced[k] is the resourceVersion a swap delivery replaced for k. A
-	// later real delivery carrying exactly that version means the swap pushed
-	// an OLDER body than the consumer had (F8): store_swap_regressed_keys.
+	// displaced[k] is the resourceVersion a swap delivery replaced for k. It
+	// is recorded only when the swap replaced a DIFFERENT version (a version
+	// can come back only then: the new copy synced behind and its watch is
+	// still to deliver it), and it ends at k's next real delivery or with the
+	// instance. A real delivery carrying exactly that version means the swap
+	// pushed an OLDER body than the consumer had (F8):
+	// store_swap_regressed_keys. A schema widen replaces every key at the
+	// same version, so it records nothing (#928 F5).
 	displaced map[string]string
 }
 
@@ -404,8 +453,15 @@ func (a *handlerAdapter) OnAdd(obj any, isInInitialList bool) {
 }
 
 func (a *handlerAdapter) OnUpdate(oldObj, newObj any) {
-	if sd, ok := newObj.(swapDelivery); ok {
-		a.swapDeliver(sd.key)
+	switch n := newObj.(type) {
+	case swapDelivery:
+		a.swapDeliver(n.key)
+		return
+	case swapUnmute:
+		a.mu.Lock()
+		a.muted = false
+		a.mu.Unlock()
+		n.passed()
 		return
 	}
 	a.deliver(newObj, oldObj, true, false, true)
@@ -442,7 +498,7 @@ func (a *handlerAdapter) deliver(obj, old any, present, isInInitialList, update 
 		a.mu.Unlock()
 		return
 	}
-	if a.inst.muted.Load() {
+	if a.muted {
 		a.recordSeenLocked(key, obj, st.present)
 		a.mu.Unlock()
 		return
@@ -532,10 +588,12 @@ func (a *handlerAdapter) swapDeliver(key string) {
 		return
 	}
 	if hadActed && present {
-		if a.displaced == nil {
-			a.displaced = map[string]string{}
+		if prev := stateOf(acted, true).rv; prev != stateOf(s, true).rv {
+			if a.displaced == nil {
+				a.displaced = map[string]string{}
+			}
+			a.displaced[key] = prev
 		}
-		a.displaced[key] = stateOf(acted, true).rv
 	}
 	seenObj, seenOK := a.seen[key]
 	if seenOK != present || (present && seenObj != s) {

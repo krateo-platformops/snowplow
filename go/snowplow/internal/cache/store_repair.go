@@ -70,7 +70,7 @@ func requestStoreRepair(gvr schema.GroupVersionResource, keys []string) bool {
 	// Bound 6 first, from the RECORDED property alone: a factory-built GVR is
 	// refused, out loud, whatever state the watcher is in.
 	if owned, known, _ := storeVerificationOwnership(gvr); known && !owned {
-		refuseUnownedBuild(gvr, reasonDivergence)
+		refuseUnownedBuild(gvr, reasonDivergence, keys)
 		return false
 	}
 	rw := Global()

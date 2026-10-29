@@ -49,14 +49,23 @@ func TestStoreSwap_K7_InFlightResolveSelfRemarks(t *testing.T) {
 	ctx := WithL1KeyContext(context.Background(), key)
 	gen0 := c.CaptureGen(key) // the resolve reads the OLD copy here
 
-	src0 := Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceStoreSwap]
+	// The swap delivery's dep event has STAMPED its buckets (the #375 bump):
+	// decided by that event, not by a sleep (#928 F4).
+	stamped := make(chan struct{})
+	var stampOnce sync.Once
+	t.Cleanup(SetDepBumpHookForTest(func(stage string) {
+		if stage == "after_store" {
+			stampOnce.Do(func() { close(stamped) })
+		}
+	}))
 	f.clusterSet(swapObj(gvr, "o01", "2", "v2"))
 	f.request(reasonDivergence, swapKey("o01"))
 	f.awaitSwaps(1)
-	f.waitFor("the swap delivery to be processed", func() bool {
-		return Deps().dirtyMarkSubmitSourceSnapshot()[dmSourceStoreSwap] > src0 && DepWatchStatsSnapshot().DeleteQueueDepth == 0
-	})
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-stamped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("K7: the swap delivery's dep event never stamped its buckets")
+	}
 
 	Deps().Record(ctx, key, gvr, swapNS, "o01")
 	if !c.putIfGen(ctx, key, body375(`{}`), gen0) {
@@ -103,9 +112,12 @@ func TestStoreSwap_K11_CRDDeletedInTheGapReachesTriggerCRDDelete(t *testing.T) {
 	f.request(reasonDivergence, crd.GetName())
 	f.awaitSwaps(1)
 	f.waitFor("triggerCRDDelete", func() bool { return CRDDiscoveryStatsSnapshot().DeletesProcessed > before })
-	if e := f.rec.forKey(crd.GetName()); len(e) == 0 || e[len(e)-1].kind != "delete" {
-		t.Fatalf("K11 RED: the handler-level consumers did not receive the CRD's delete (%v)", e)
-	}
+	// The recording consumer is ANOTHER listener: its delivery is awaited on
+	// its own record, never inferred from the lifecycle handler's (#928 F4).
+	f.waitFor("the CRD's delete at the recording consumer", func() bool {
+		e := f.rec.forKey(crd.GetName())
+		return len(e) > 0 && e[len(e)-1].kind == "delete"
+	})
 }
 
 // ── K11d (variant) — a write while muted, just before the unmute ────────────
@@ -199,12 +211,14 @@ func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 	f.waitFor("o01 and o02 at the consumer", func() bool {
 		return len(f.rec.forKey(swapKey("o01"))) > 1 && len(f.rec.forKey(swapKey("o02"))) > 1
 	})
-	time.Sleep(50 * time.Millisecond)
+	f.fence() // every listener has delivered everything queued before it
 	// Exactly once each: B0's held write to o00 (delivered by B0 itself once
 	// released), and the two repaired keys (through B2). Nothing else.
 	counts := map[string]int{}
 	for _, e := range f.rec.since(evs0) {
-		counts[e.key]++
+		if e.key != fenceKey {
+			counts[e.key]++
+		}
 	}
 	for _, k := range []string{"o00", "o01", "o02"} {
 		if counts[swapKey(k)] != 1 {
@@ -273,7 +287,7 @@ func TestStoreSwap_K11e1_InstallBetweenStep3AndUnmute(t *testing.T) {
 	f.request(reasonDivergence, swapKey("o02"))
 	c2.Store(f.rw.storeBuildForTest(gvr))
 	f.waitFor("B2's install", func() bool { return StoreSwapStatsSnapshot().Swaps == 2 })
-	go func() { time.Sleep(20 * time.Millisecond); close(gate) }()
+	close(gate) // B1 resumes on a copy B2 has retired
 	f.awaitSwaps(2)
 	f.waitFor("every changed key at the consumer", func() bool {
 		a, b, c := f.rec.forKey(swapKey("o01")), f.rec.forKey(swapKey("o02")), f.rec.forKey(swapKey("o03"))
@@ -282,10 +296,13 @@ func TestStoreSwap_K11e1_InstallBetweenStep3AndUnmute(t *testing.T) {
 	})
 	// B1 passed its step-3 check, so it keeps its own coordinates (Q6) and
 	// counts them when it resumes; each coordinate is counted exactly once.
-	f.waitFor("both builds' coordinates counted", func() bool {
-		return storeSwapStats.keys.get(reasonDivergence, outcomeSwap) >= 2
-	})
-	time.Sleep(20 * time.Millisecond)
+	// B1's install has completed too (its own completion event): every count
+	// it makes is in.
+	select {
+	case <-c1.Load().delivered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("K11e-1: B1's install never completed")
+	}
 	if got := storeSwapStats.keys.get(reasonDivergence, outcomeSwap); got != 2 {
 		t.Fatalf("K11e-1 (Q6): keys_total{divergence,swap} = %d, want 2", got)
 	}

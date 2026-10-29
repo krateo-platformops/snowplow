@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -166,6 +167,7 @@ type swapFix struct {
 	hdyn     holdListDynamic                  // counts every LIST of the GVR as it is ISSUED
 	factory  bool                             // the GVR's informer comes from the shared factory (not owned)
 	watchErr atomic.Bool                      // every new WATCH of the GVR fails
+	fenceN   int                              // fences written so far
 }
 
 type swapFixOpt func(*swapFix)
@@ -416,20 +418,82 @@ func (f *swapFix) request(reason string, keys ...string) {
 	}
 }
 
-// awaitSwaps waits until n swaps have completed their delivery (step 6), read
-// as "the build slot is empty, the live instance has passed step 3 and every
-// key of M has been offered".
+// awaitSwaps waits until n swaps have been installed and the live copy's swap
+// has COMPLETED: its delivered channel is closed after step 6, so every key of
+// M is queued to every listener and the ledger is open (#928 F4 — the swap's
+// own completion event, not a state set at step 3). No build may be in
+// progress and no copy retiring.
 func (f *swapFix) awaitSwaps(n uint64) {
 	f.t.Helper()
-	f.waitFor(fmt.Sprintf("%d swap(s)", n), func() bool {
+	var in *storeInstance
+	f.waitFor(fmt.Sprintf("%d swap(s) installed", n), func() bool {
 		if StoreSwapStatsSnapshot().Swaps < n {
 			return false
 		}
 		f.rw.mu.RLock()
 		defer f.rw.mu.RUnlock()
-		in := f.rw.instances[f.gvr]
+		in = f.rw.instances[f.gvr]
 		return in != nil && in.passedSt3 && f.rw.builds[f.gvr] == nil && len(f.rw.retiring[f.gvr]) == 0
 	})
+	select {
+	case <-in.delivered:
+	case <-time.After(30 * time.Second):
+		f.t.Fatalf("swap %d was installed but never completed its delivery (step 6)", n)
+	}
+}
+
+// fenceNS / fenceKey: the fence object (fence) lives in its own namespace, so
+// it is in no arm's cell partition and no arm's key set.
+const fenceNS = "zzfence-ns"
+
+var fenceKey = fenceNS + "/zzfence"
+
+// fence writes the fence object through the LIVE copy's watch (the newest
+// one) and waits until EVERY adapter of the live instance has recorded it in
+// seen, which each does after its consumer returned. A listener is FIFO, so
+// every notification queued before the fence has been delivered once the
+// fence is seen: a negative check after the fence is decided by an event,
+// never by a sleep (#928 F4). Arms that count events skip fenceKey.
+func (f *swapFix) fence() {
+	f.t.Helper()
+	f.mu.Lock()
+	w := f.watchers[len(f.watchers)-1]
+	f.fenceN++
+	n := f.fenceN
+	f.mu.Unlock()
+	rv := strconv.Itoa(1000 + n)
+	o := swapObj(f.gvr, "zzfence", rv, "fence")
+	o.SetNamespace(fenceNS)
+	f.clusterSet(o)
+	if n == 1 {
+		w.Add(o.DeepCopy())
+	} else {
+		w.Modify(o.DeepCopy())
+	}
+	f.waitFor("the fence at every listener of the live copy", func() bool {
+		in := f.live()
+		if in == nil {
+			return false
+		}
+		for _, a := range in.adaptersSnapshot() {
+			v, ok, _ := a.seenObject(fenceKey)
+			if !ok || rvOf(v) != rv {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// withoutFence drops the fence object's own events.
+func withoutFence(evs []swapEvent) []swapEvent {
+	var out []swapEvent
+	for _, e := range evs {
+		if e.key != fenceKey {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // settle waits until the consumer has received n events in total.
