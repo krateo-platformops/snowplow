@@ -92,7 +92,7 @@ func TestIssue912_N1_SeedMemoHitStillDeclinesADeclaredWrite(t *testing.T) {
 		return out, nil
 	}
 	for _, w := range []*unstructured.Unstructured{w1, w2} {
-		e := navWidgetEntry{W: w, GVR: h1WidgetGVR, PerPage: -1, Page: -1, KeyPerPage: -1, KeyPage: -1}
+		e := navWidgetEntry{W: w, GVR: h1WidgetGVR, Pagination: unpaginatedPrewarm}
 		_ = seedOneWidget(cohort, e, psAuthnNS, seedModeBoot)
 	}
 	hits, misses := memo.Stats()

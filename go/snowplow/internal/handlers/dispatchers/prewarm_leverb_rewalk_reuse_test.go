@@ -58,7 +58,7 @@ func leverBHarvestN(n int) *navWidgetHarvester {
 		w.SetNamespace("krateo-system")
 		w.SetName(fmt.Sprintf("w%d", i))
 		w.SetGroupVersionKind(schema.GroupVersionKind{Group: gvr.Group, Version: gvr.Version, Kind: "W"})
-		h.harvestNavWidget(w, gvr, -1, 1, -1, -1)
+		h.harvestNavWidget(w, gvr, unpaginatedPrewarm)
 	}
 	return h
 }

@@ -207,8 +207,19 @@ func buildPath(gvr schema.GroupVersionResource, in *templatesv1.ResourceRef) str
 		q.Set("name", in.Name)
 	}
 
-	if slice := in.Slice; slice != nil {
-		q.Set("page", strconv.Itoa(slice.Page))
+	// The child's declared window, in its CANONICAL form (#966): the shape the
+	// dispatcher's paginationInfo normalizes a request to. A slice that declares
+	// only perPage means page 1 (normalizePagination's rule), so the path says
+	// page=1, not page=0: the browser requests exactly this URL, and the prewarm
+	// walk derives the pagination it resolves and keys the child with from it
+	// (dispatchers.prewarmPaginationFor), so the two must read the same window.
+	// A slice with no positive perPage windows nothing and emits no pagination.
+	if slice := in.Slice; slice != nil && slice.PerPage > 0 {
+		page := slice.Page
+		if page <= 0 {
+			page = 1
+		}
+		q.Set("page", strconv.Itoa(page))
 		q.Set("perPage", strconv.Itoa(slice.PerPage))
 	}
 

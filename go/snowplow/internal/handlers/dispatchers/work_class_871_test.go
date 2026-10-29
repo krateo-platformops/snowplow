@@ -247,7 +247,7 @@ func TestWorkClass871_D_DrainJobIsDrain(t *testing.T) {
 	got := workclassprobe.CPUClasses(t, func() {
 		drainApiRefPaginationJobs(context.Background(), []apiRefPaginationJob{{
 			In: newUnstructuredWidget(ns, name), GVR: drainPageCellGVR(), Page1Res: fakePage1Driven(),
-			Depth: 1, PerPage: 5, KeyPerPage: -1, KeyPage: -1, AuthnNS: ns,
+			Depth: 1, Pagination: newPrewarmPagination(5, 1), AuthnNS: ns,
 		}}, endpoints.Endpoint{}, nil)
 	})
 	workclassprobe.RequireAll(t, "drain page goroutine", p.Self(), "drain")

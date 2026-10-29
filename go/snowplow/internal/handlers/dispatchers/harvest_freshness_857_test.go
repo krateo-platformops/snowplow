@@ -68,7 +68,7 @@ func TestS857_KeepwarmResolvesTheEditedWidgetSpec(t *testing.T) {
 
 	// Boot: the widget as harvested at boot, apiRef → A.
 	navHarv := newNavWidgetHarvester()
-	navHarv.harvestNavWidget(s857Widget("1", "s857-ra-a"), h1WidgetGVR, -1, -1, -1, -1)
+	navHarv.harvestNavWidget(s857Widget("1", "s857-ra-a"), h1WidgetGVR, unpaginatedPrewarm)
 	if err := seedScopeYielding(context.Background(), nil, navHarv.snapshot(),
 		endpoints.Endpoint{}, nil, l262AuthnNS, seedModeBoot); err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestS857_KeepwarmResolvesTheEditedWidgetSpec(t *testing.T) {
 
 	// The edit (new resourceVersion, apiRef → B), seen by the keep-warm
 	// sweep's re-walk exactly as walk() harvests it.
-	navHarv.harvestNavWidget(s857Widget("2", "s857-ra-b"), h1WidgetGVR, -1, -1, -1, -1)
+	navHarv.harvestNavWidget(s857Widget("2", "s857-ra-b"), h1WidgetGVR, unpaginatedPrewarm)
 	time.Sleep(300 * time.Millisecond) // the cell is older than the age-skip threshold
 	mu.Lock()
 	resolvedApiRefs = nil
@@ -121,12 +121,12 @@ func TestS857_KeepwarmResolvesTheEditedWidgetSpec(t *testing.T) {
 // can reuse nothing else) does replace it.
 func TestS857_SameObjectVersionDoesNotChurnTheHarvest(t *testing.T) {
 	h := newNavWidgetHarvester()
-	h.harvestNavWidget(s857Widget("7", "s857-ra-a"), h1WidgetGVR, -1, -1, -1, -1)
-	h.harvestNavWidget(s857Widget("1", "s857-other"), h1WidgetGVR, -1, -1, 5, 1) // a second key: NavOrder 1
+	h.harvestNavWidget(s857Widget("7", "s857-ra-a"), h1WidgetGVR, unpaginatedPrewarm)
+	h.harvestNavWidget(s857Widget("1", "s857-other"), h1WidgetGVR, newPrewarmPagination(5, 1)) // a second key: NavOrder 1
 	byName := func() map[string]navWidgetEntry {
 		out := map[string]navWidgetEntry{}
 		for _, e := range h.snapshot() {
-			out[e.W.GetResourceVersion()+"/"+strconvItoa(e.KeyPage)] = e
+			out[e.W.GetResourceVersion()+"/"+strconvItoa(e.Pagination.Page)] = e
 		}
 		return out
 	}
@@ -134,7 +134,7 @@ func TestS857_SameObjectVersionDoesNotChurnTheHarvest(t *testing.T) {
 	refreshed := navWidgetHarvestRefreshedTotal.Load()
 
 	for i := 0; i < 3; i++ { // resyncs: same UID, same resourceVersion
-		h.harvestNavWidget(s857Widget("7", "s857-ra-a"), h1WidgetGVR, -1, -1, -1, -1)
+		h.harvestNavWidget(s857Widget("7", "s857-ra-a"), h1WidgetGVR, unpaginatedPrewarm)
 	}
 	after, ok := byName()["7/-1"]
 	if !ok || after.W != before.W {
@@ -152,7 +152,7 @@ func TestS857_SameObjectVersionDoesNotChurnTheHarvest(t *testing.T) {
 	// a different object, so the copy is replaced and the stamps stay.
 	recreated := s857Widget("7", "s857-ra-a")
 	recreated.SetUID("uid-s857-w-recreated")
-	h.harvestNavWidget(recreated, h1WidgetGVR, -1, -1, -1, -1)
+	h.harvestNavWidget(recreated, h1WidgetGVR, unpaginatedPrewarm)
 	got := byName()["7/-1"]
 	if got.W == before.W || got.W.GetUID() != "uid-s857-w-recreated" {
 		t.Fatalf("#857 RED: a new UID under the same name kept the old object's copy")

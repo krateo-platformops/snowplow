@@ -11,8 +11,9 @@
 //   - the SLICE fix: the walk extracts page/perPage from a child's
 //     `/call` Path (util.ParseCallPathPagination) and threads the
 //     declared slice — never the unbounded -1 — into widgets.Resolve;
-//   - the bounded PREWARM_PAGE_LIMIT default for a child whose Path
-//     carries no slice;
+//   - (#966) the unpaginated pagination for a child whose Path carries no
+//     slice — the bounded PREWARM_PAGE_LIMIT default it replaced stored a
+//     perPage=5 body under the unpaginated key;
 //   - the harvester collecting an apiRef (compositions-list) once the
 //     walk descends to the widget that declares it.
 //
@@ -50,7 +51,7 @@ const noSlicePath = "/call?resource=panels&apiVersion=widgets.templates.krateo.i
 func TestFAL127_SliceExtractedFromChildPath(t *testing.T) {
 	page, perPage, ok := util.ParseCallPathPagination(dashboardTablePath)
 	if !ok {
-		t.Fatalf("FAL-127: the Dashboard table's /call Path declares page=1&perPage=5 — "+
+		t.Fatalf("FAL-127: the Dashboard table's /call Path declares page=1&perPage=5 — " +
 			"ParseCallPathPagination must extract it, got ok=false")
 	}
 	if page != 1 || perPage != 5 {
@@ -59,41 +60,21 @@ func TestFAL127_SliceExtractedFromChildPath(t *testing.T) {
 	}
 }
 
-// TestFAL127_NoSliceFallsBackToBoundedDefault proves a child Path with no
-// declared slice yields ok=false — the walk then applies the bounded
-// PREWARM_PAGE_LIMIT default (prewarmPageLimit()), NEVER the unbounded
-// -1 that caused the storm.
-func TestFAL127_NoSliceFallsBackToBoundedDefault(t *testing.T) {
-	_, _, ok := util.ParseCallPathPagination(noSlicePath)
-	if ok {
-		t.Fatalf("FAL-127: a /call Path with no page/perPage must yield ok=false so "+
-			"the walk applies the bounded default")
-	}
-	// The fallback the walk uses MUST be bounded and positive — never -1.
-	if d := prewarmPageLimit(); d <= 0 {
-		t.Fatalf("FAL-127: prewarmPageLimit() = %d — the discovery-walk pagination "+
-			"fallback must be bounded and positive, NEVER the unbounded -1", d)
-	}
-}
-
-// TestFAL127_PrewarmPageLimitEnvOverride pins the PREWARM_PAGE_LIMIT env
-// knob: a positive value overrides the default; a non-positive / unset
-// value falls back to the bounded default (never -1).
-func TestFAL127_PrewarmPageLimitEnvOverride(t *testing.T) {
-	t.Setenv("PREWARM_PAGE_LIMIT", "")
-	if got := prewarmPageLimit(); got != defaultPrewarmPageLimit {
-		t.Fatalf("unset PREWARM_PAGE_LIMIT must use defaultPrewarmPageLimit (%d), got %d",
-			defaultPrewarmPageLimit, got)
-	}
+// TestPrewarmPagination966_NoSliceIsUnpaginated pins the #966 replacement of
+// the bounded PREWARM_PAGE_LIMIT default: a child Path with no declared slice
+// gives the walk the UNPAGINATED pagination — what paginationInfo derives for
+// the browser's request of that URL — and a PREWARM_PAGE_LIMIT left in the
+// environment changes nothing (it is a retired flag).
+func TestPrewarmPagination966_NoSliceIsUnpaginated(t *testing.T) {
 	t.Setenv("PREWARM_PAGE_LIMIT", "25")
-	if got := prewarmPageLimit(); got != 25 {
-		t.Fatalf("PREWARM_PAGE_LIMIT=25 override, got %d", got)
+	for _, path := range []string{noSlicePath, ""} {
+		if got := prewarmPaginationFor(path); got != unpaginatedPrewarm || got.paginated() {
+			t.Fatalf("#966: prewarmPaginationFor(%q) = %+v, want the unpaginated %+v — a URL with no "+
+				"page/perPage is requested unpaginated, so its cell must be resolved unpaginated", path, got, unpaginatedPrewarm)
+		}
 	}
-	// A negative / zero value must NOT yield an unbounded walk.
-	t.Setenv("PREWARM_PAGE_LIMIT", "-1")
-	if got := prewarmPageLimit(); got != defaultPrewarmPageLimit {
-		t.Fatalf("PREWARM_PAGE_LIMIT=-1 must fall back to the bounded default (%d), "+
-			"got %d — the walk must never go unbounded", defaultPrewarmPageLimit, got)
+	if got := prewarmPaginationFor(dashboardTablePath); got != (prewarmPagination{PerPage: 5, Page: 1}) || !got.paginated() {
+		t.Fatalf("#966: a declared slice must give exactly that pagination, got %+v", got)
 	}
 }
 

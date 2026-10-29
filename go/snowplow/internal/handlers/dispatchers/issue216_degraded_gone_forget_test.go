@@ -58,7 +58,7 @@ func i216HarvestFlex(nav *navWidgetHarvester, ns, name string) {
 	w.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: fixCWidgetGVR.Group, Version: fixCWidgetGVR.Version, Kind: i187Kind,
 	})
-	nav.harvestNavWidget(w, fixCWidgetGVR, -1, -1, -1, -1)
+	nav.harvestNavWidget(w, fixCWidgetGVR, unpaginatedPrewarm)
 }
 
 func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testing.T) {

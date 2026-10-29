@@ -28,10 +28,7 @@ func TestIssue214_SeedOneWidget_ResolveCtxIsPrewarmMarked(t *testing.T) {
 	entry := navWidgetEntry{
 		W:          h1WidgetUnstructured(map[string]any{"apiRef": map[string]any{"name": a1RAName2, "namespace": h1NS}}),
 		GVR:        h1WidgetGVR,
-		PerPage:    -1,
-		Page:       -1,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: unpaginatedPrewarm,
 	}
 
 	// A cohort representative that presents the GROUP the shared CRB grants, so

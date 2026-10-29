@@ -205,7 +205,7 @@ func TestIssue216_F6b_GoneVerdictStopsTheSeedReplayingAHarvestedCopy(t *testing.
 	w.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: fixCWidgetGVR.Group, Version: fixCWidgetGVR.Version, Kind: "Flex",
 	})
-	nav.harvestNavWidget(w, fixCWidgetGVR, -1, -1, -1, -1)
+	nav.harvestNavWidget(w, fixCWidgetGVR, unpaginatedPrewarm)
 	content := newContentPrewarmHarvester()
 
 	// THE PRODUCTION REGISTRAR. Not a closure this test wrote.
@@ -286,8 +286,8 @@ func TestIssue216_F6b_LiveCoordinateIsNeverForgotten(t *testing.T) {
 		w.SetGroupVersionKind(schema.GroupVersionKind{Group: gvr.Group, Version: gvr.Version, Kind: "Flex"})
 		// Two pagination tuples for the same widget: a forget must take both,
 		// and a forget for a different widget must take neither.
-		nav.harvestNavWidget(w, gvr, -1, -1, -1, -1)
-		nav.harvestNavWidget(w, gvr, 5, 1, 5, 1)
+		nav.harvestNavWidget(w, gvr, unpaginatedPrewarm)
+		nav.harvestNavWidget(w, gvr, newPrewarmPagination(5, 1))
 	}
 	content := newContentPrewarmHarvester()
 	registerHarvesterGoneForgetHook(rePrewarmDeps{navHarv: nav, harvester: content})
@@ -338,7 +338,7 @@ func TestIssue216_F6b_ExistsVerdictNeverForgets(t *testing.T) {
 	w.SetNamespace("krateo-system")
 	w.SetName("uncertain-flex")
 	w.SetGroupVersionKind(schema.GroupVersionKind{Group: gvr.Group, Version: gvr.Version, Kind: "Flex"})
-	nav.harvestNavWidget(w, gvr, -1, -1, -1, -1)
+	nav.harvestNavWidget(w, gvr, unpaginatedPrewarm)
 	registerHarvesterGoneForgetHook(rePrewarmDeps{navHarv: nav, harvester: newContentPrewarmHarvester()})
 
 	// The object EXISTS — an ADD/UPDATE verdict. Dirty-mark territory, never a

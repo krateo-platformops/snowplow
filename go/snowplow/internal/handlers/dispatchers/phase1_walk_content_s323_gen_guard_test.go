@@ -84,11 +84,9 @@ func TestPhase1WalkContent_S323_PostReadyz_ResolveRacingDelete_RefusedNotResurre
 		newPhase1Walker(nil, "krateo-system"),
 		newUnstructuredWidget(ns, name),
 		gvr,
-		fakePage1Driven(), // page1Res — apiRef+template + wants continue
-		1,                 // depth
-		5,                 // perPage (resolution default)
-		-1,                // keyPerPage (root tuple)
-		-1,                // keyPage (root tuple)
+		fakePage1Driven(),          // page1Res — apiRef+template + wants continue
+		1,                          // depth
+		newPrewarmPagination(5, 1), // #966: the first page's one pagination
 		"krateo-system",
 	)
 

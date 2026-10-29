@@ -79,13 +79,11 @@ func drainPageCellGVR() schema.GroupVersionResource {
 //     actually LANDS (a real datagrid page cell is RBAC-declined; here we
 //     isolate the KEY-MODEL — does the Put land where the install pointed?).
 //
-// The page-1 envelope is apiRef+template-driven (loop entry) with a ROOT KEY
-// tuple keyPerPage=-1, keyPage=-1; the RESOLUTION perPage=5. On drain page 2:
-//   - HEAD: install keys (keyPerPage=-1, page=2); Put keys (perPage=5, page=2)
-//     → the Put lands in a DIFFERENT cell than the install pointed at → the
-//     install-key cell is EMPTY → RED.
-//   - Fixed: both sites key (keyPerPage=-1, drainKeyPageFor(-1,2)=2) → the Put
-//     lands in the install-key cell → GREEN.
+// The page-1 envelope is apiRef+template-driven (loop entry). Pre-#318 the
+// install keyed (keyPerPage=-1, page=2) while the Put keyed (perPage=5, page=2)
+// → the Put landed in a DIFFERENT cell than the install pointed at → RED.
+// Since #966 the first page's ONE pagination is (perPage=5, page=1) and drain
+// page 2's is pg.pageAfter(1) = (5, 2) for the install, the resolve AND the Put.
 func TestDrainKeyModel_InstallKeyEqualsPutKey(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -129,11 +127,9 @@ func TestDrainKeyModel_InstallKeyEqualsPutKey(t *testing.T) {
 		newPhase1Walker(nil, "krateo-system"),
 		newUnstructuredWidget(ns, name),
 		gvr,
-		fakePage1Driven(), // page1Res — apiRef+template + wants continue
-		1,                 // depth
-		5,                 // perPage (resolution default)
-		-1,                // keyPerPage (root tuple)
-		-1,                // keyPage (root tuple)
+		fakePage1Driven(),          // page1Res — apiRef+template + wants continue
+		1,                          // depth
+		newPrewarmPagination(5, 1), // #966: the first page's one pagination
 		"krateo-system",
 	)
 
@@ -161,13 +157,13 @@ func TestDrainKeyModel_InstallKeyEqualsPutKey(t *testing.T) {
 // TestDrainKeyModel_ChildPutKeyMatchesServeTime (design §1b, §6 row 1).
 //
 // A leaf child reached via a ?page=2&perPage=M /call Path is the drain's only
-// serveable value (design §1d). Its Put key (derived via deriveSeedKeyTuple,
+// serveable value (design §1d). Its Put key (derived via prewarmPaginationFor,
 // the page-1-identical path) MUST equal the serve-time content lookup key the
 // dispatcher composes from paginationInfo for the SAME URL. This pins the
-// deriveSeedKeyTuple ↔ paginationInfo contract (phase1_pip_seed.go:273).
+// prewarmPaginationFor ↔ paginationInfo contract (prewarm_pagination.go).
 //
-// This GREENs on HEAD for the CHILD path (children already go through
-// deriveSeedKeyTuple); it is included as the positive control that the key
+// This GREENs on HEAD for the CHILD path (children go through
+// prewarmPaginationFor); it is included as the positive control that the key
 // model the fix adopts for the PAGE cell is the SAME one serve-time uses.
 func TestDrainKeyModel_ChildPutKeyMatchesServeTime(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
@@ -183,8 +179,9 @@ func TestDrainKeyModel_ChildPutKeyMatchesServeTime(t *testing.T) {
 		"&namespace=" + ns + "&name=" + name +
 		"&page=2&perPage=7"
 
-	// Prewarm side: the child Put key tuple comes from deriveSeedKeyTuple.
-	childKeyPerPage, childKeyPage := deriveSeedKeyTuple(childPath)
+	// Prewarm side: the child's one pagination comes from prewarmPaginationFor.
+	childPg := prewarmPaginationFor(childPath)
+	childKeyPerPage, childKeyPage := childPg.PerPage, childPg.Page
 	childPutKey, _ := widgetContentL1Key(gvr, ns, name, childKeyPerPage, childKeyPage)
 
 	// Serve side: the dispatcher composes the content key from paginationInfo's
@@ -282,10 +279,8 @@ func TestDrainSinkParity_PopulateDeclinesOnStageError(t *testing.T) {
 		newUnstructuredWidget(ns, name),
 		gvr,
 		page1,
-		1,  // depth
-		5,  // perPage (resolution)
-		-1, // keyPerPage (root tuple)
-		-1, // keyPage (root tuple)
+		1,                          // depth
+		newPrewarmPagination(5, 1), // #966: the first page's one pagination
 		"krateo-system",
 	)
 

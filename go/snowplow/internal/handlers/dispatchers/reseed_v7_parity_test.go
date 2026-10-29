@@ -39,7 +39,7 @@ func TestS258_V7_ReseededKeyEqualsRotatedCustomerKey(t *testing.T) {
 
 	navHarv := newNavWidgetHarvester()
 	e := reseedWidgetEntry()
-	navHarv.harvestNavWidget(e.W, e.GVR, e.PerPage, e.Page, e.KeyPerPage, e.KeyPage)
+	navHarv.harvestNavWidget(e.W, e.GVR, e.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	// The rotation: a real binding ADD for carol.

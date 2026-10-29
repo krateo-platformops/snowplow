@@ -515,7 +515,7 @@ func TestIssue431_SeedAndCustomerRAKeyParity(t *testing.T) {
 		}},
 	}}
 	cohort := withCohortSeedContext(context.Background(), seedTarget{Username: "", Groups: []string{psGroup}}, *saEP, saRC)
-	seedRAFullListForWidget(cohort, widget, psAuthnNS, h1NS, "w431")
+	seedRAFullListForWidget(cohort, widget, psAuthnNS, h1NS, "w431", newPrewarmPagination(5, 1))
 	sKey, sIn := i431RAKey(t, cohort, ra)
 	se, ok := cache.ResolvedCache().Get(sKey)
 	if !ok || se.Inputs == nil {

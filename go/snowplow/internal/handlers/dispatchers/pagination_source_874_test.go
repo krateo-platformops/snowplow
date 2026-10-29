@@ -104,7 +104,7 @@ func s874Drain(t *testing.T, maxPages int,
 		t.Fatalf("page 1: %v", err)
 	}
 	collectIDs(page1, &ids)
-	iterateApiRefPages(ctx, newPhase1Walker(nil, "ns"), in, s874GVR, page1, 1, 5, 5, 1, "ns")
+	iterateApiRefPages(ctx, newPhase1Walker(nil, "ns"), in, s874GVR, page1, 1, newPrewarmPagination(5, 1), "ns")
 	return calls, ids
 }
 
@@ -256,7 +256,7 @@ func TestS874_Drain_CursorPagesAreNotStoredUnderACursorlessKey(t *testing.T) {
 				"cursor-less cell key; a customer /call or refresh for that page would see bytes no cursor-less resolve produces", d)
 		}
 		for _, p := range []int{2, 3} {
-			key, _ := widgetContentL1Key(s874GVR, "krateo-system", "s874-menu", 5, drainKeyPageFor(1, p))
+			key, _ := widgetContentL1Key(s874GVR, "krateo-system", "s874-menu", 5, p)
 			if _, ok := cache.ResolvedCache().GetNoTouch(key); ok {
 				t.Fatalf("#874 RED: page %d's cursor-less cell holds a cursor page", p)
 			}

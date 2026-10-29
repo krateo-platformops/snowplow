@@ -282,7 +282,7 @@ func l262Setup(t *testing.T, o l262Opts) *l262Env {
 			"metadata":   map[string]any{"name": "l262-w" + itoaLine(i), "namespace": h1NS},
 			"spec":       map[string]any{"apiRef": map[string]any{"name": raName, "namespace": h1NS}},
 		}}
-		navHarv.harvestNavWidget(w, h1WidgetGVR, -1, -1, -1, -1)
+		navHarv.harvestNavWidget(w, h1WidgetGVR, unpaginatedPrewarm)
 		raHarv.harvestApiRef(w)
 	}
 	env.widgets = navHarv.snapshot()

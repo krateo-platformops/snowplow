@@ -16,13 +16,15 @@
 //   - widget reached via /call Path WITH declared page/perPage:
 //       seed-key tuple = (declared page, declared perPage)
 //       (matches paginationInfo when the frontend hits the same URL).
-// The resolution tuple stays = prewarmPageLimit() for no-slice widgets
-// (the 0.30.127 storm guard) and = declared (page,perPage) when present.
+// #966 then removed the remaining split: D2 kept RESOLVING a no-slice widget
+// at prewarmPageLimit()=5 while KEYING it (-1,-1), so the cell held a body no
+// unpaginated request computes. Since #966 the seed resolves and keys with
+// ONE pagination (prewarmPaginationFor), and these tests pin that derivation.
 //
-// THESE TESTS pin the seed-key derivation in isolation — they do not
-// require a live apiserver, do not require an informer, and run in <1ms.
-// A regression that reverts the decoupling (re-folds resolution into the
-// seed key) fails TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple.
+// THESE TESTS pin the derivation in isolation — they do not require a live
+// apiserver, do not require an informer, and run in <1ms. The writer-level
+// arms (stored body == a live request's resolve) are in
+// prewarm_pagination_966_test.go.
 
 package dispatchers
 
@@ -67,63 +69,55 @@ func TestPipCohortTimeout_RestoredToFixed120s(t *testing.T) {
 }
 
 // TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple is the D2
-// falsifier. It pins the contract that the walker's seed-key derivation
-// for a widget reached via a /call Path with NO page/perPage params
-// produces the SAME (perPage, page) tuple the dispatcher's
-// paginationInfo defaults to for a request with no URL slice params:
-// (-1, -1).
-//
-// The contract is enforced by the helper deriveSeedKeyTuple in
-// phase1_pip_seed.go (introduced this ship).
+// falsifier, restated for #966. A widget reached via a /call Path with NO
+// page/perPage params gets the pagination the dispatcher's paginationInfo
+// derives for that URL, (-1, -1) — and since #966 that ONE pagination is both
+// the seed cell's key and the seed's resolve, so the cell is unpaginated
+// through and through.
 func TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple(t *testing.T) {
-	// No-slice widget: the /call Path declares no page/perPage. The
-	// walker resolves under prewarmPageLimit() (the 0.30.127 storm
-	// guard) but the seed-key tuple MUST be (-1, -1) so a serve-time
-	// request with no URL slice params lands on the same cell.
-	keyPerPage, keyPage := deriveSeedKeyTuple(noSlicePath)
-	if keyPerPage != -1 || keyPage != -1 {
-		t.Fatalf("D2: no-slice widget seed-key tuple = (perPage=%d, page=%d), "+
+	pg := prewarmPaginationFor(noSlicePath)
+	if pg.PerPage != -1 || pg.Page != -1 {
+		t.Fatalf("D2: no-slice widget pagination = (perPage=%d, page=%d), "+
 			"want (-1, -1) — the dispatcher's paginationInfo defaults to "+
 			"(-1, -1) when the request URL carries no ?page/?perPage, so the "+
 			"seed Put must use the same tuple or it hashes to a different "+
 			"cell and the serve-time lookup misses (the 0.30.186 14/17 first-"+
 			"nav-hit defect)",
-			keyPerPage, keyPage)
+			pg.PerPage, pg.Page)
 	}
 }
 
 // TestPhase1PIPSeedKey_DeclaredSlicePreserved pins the symmetric
-// contract: a /call Path that carries explicit page/perPage must yield a
-// seed-key tuple equal to the declared slice. The frontend hits the same
-// URL at serve time, so paginationInfo returns the same (page, perPage),
-// so the seed-key tuple must equal the declared slice.
+// contract: a /call Path that carries explicit page/perPage yields exactly
+// the declared slice. The frontend hits the same URL at serve time, so
+// paginationInfo returns the same (page, perPage).
 func TestPhase1PIPSeedKey_DeclaredSlicePreserved(t *testing.T) {
 	// Dashboard table: declared slice page=1 perPage=5.
-	keyPerPage, keyPage := deriveSeedKeyTuple(dashboardTablePath)
-	if keyPerPage != 5 || keyPage != 1 {
-		t.Fatalf("D2: declared-slice widget seed-key tuple = (perPage=%d, page=%d), "+
+	pg := prewarmPaginationFor(dashboardTablePath)
+	if pg.PerPage != 5 || pg.Page != 1 {
+		t.Fatalf("D2: declared-slice widget pagination = (perPage=%d, page=%d), "+
 			"want (perPage=5, page=1) — paginationInfo at serve time returns "+
 			"the URL's declared page/perPage so the seed Put must use the "+
 			"same tuple",
-			keyPerPage, keyPage)
+			pg.PerPage, pg.Page)
 	}
 }
 
 // TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple pins the
 // root-navigation case. A root has no /call Path (it is fetched directly
 // via objects.Get from a listed ObjectReference), so the walker passes
-// an empty path string — deriveSeedKeyTuple must yield the dispatcher's
+// an empty path string — prewarmPaginationFor must yield the dispatcher's
 // no-slice default tuple. The frontend's first hit on a root navigation
 // widget URL carries no slice params, so paginationInfo returns
-// (-1, -1); the seed-key tuple must match.
+// (-1, -1); the root's pagination must match.
 func TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple(t *testing.T) {
-	keyPerPage, keyPage := deriveSeedKeyTuple("")
-	if keyPerPage != -1 || keyPage != -1 {
-		t.Fatalf("D2: root widget (empty path) seed-key tuple = "+
+	pg := prewarmPaginationFor("")
+	if pg.PerPage != -1 || pg.Page != -1 {
+		t.Fatalf("D2: root widget (empty path) pagination = "+
 			"(perPage=%d, page=%d), want (-1, -1) — a root widget has no "+
 			"/call Path and the dispatcher's first request for it carries "+
 			"no slice params, so paginationInfo returns (-1, -1)",
-			keyPerPage, keyPage)
+			pg.PerPage, pg.Page)
 	}
 }
 

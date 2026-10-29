@@ -31,7 +31,7 @@ func TestS258_ReseedTargetsOrderedByNavOrder(t *testing.T) {
 		e := reseedWidgetEntry()
 		w := e.W.DeepCopy()
 		w.SetName(name)
-		navHarv.harvestNavWidget(w, e.GVR, e.PerPage, e.Page, e.KeyPerPage, e.KeyPage)
+		navHarv.harvestNavWidget(w, e.GVR, e.Pagination)
 	}
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 

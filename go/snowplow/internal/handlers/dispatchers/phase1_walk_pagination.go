@@ -33,9 +33,8 @@
 //   1. Calls `widgets.Resolve` on a FRESH CR copy (the resolver mutates
 //      its input — we must NOT reuse the page-1 copy).
 //   2. Calls `populateWidgetContentL1` to Put the page's envelope under
-//      the matching identity-free key (KEY tuple decoupled from the
-//      RESOLUTION tuple per Ship 0.30.187 D2 — the seed must match the
-//      dispatcher's serve-time lookup).
+//      the identity-free key of the SAME pagination it was resolved with
+//      (#966), which is the dispatcher's serve-time key for that page.
 //   3. Walks each new child ref (`status.resourcesRefs.items[]`)
 //      discovered on this page, honouring the SAME `visited` set the
 //      page-1 walk uses so a shared subtree is resolved once.
@@ -115,7 +114,6 @@ import (
 	"github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -135,7 +133,9 @@ import (
 //
 // CEILING DERIVATION (#156 / 0.30.256 — Diego holds veto on this number):
 //
-//	perPage              = prewarmPageLimit() default = defaultPrewarmPageLimit = 5
+//	perPage              = 5 (the then PREWARM_PAGE_LIMIT default; since #966 the
+//	                          drain pages at the slice the ref declares, which is
+//	                          no smaller in any chart we know — 057 declares 50)
 //	max_realistic_items  = 50,000   (ratified production scope: 1000 users +
 //	                                  50,000 compositions — project_production_scale,
 //	                                  canonical 2026-05-14, supersedes the design
@@ -265,41 +265,6 @@ func resolverCursor(res *unstructured.Unstructured) string {
 	return c
 }
 
-// drainKeyPageFor derives the dispatcher-lookup KEY page for a drain page,
-// given page-1's KEY page (keyPage, captured at collect time via
-// deriveSeedKeyTuple) and the drain's RESOLUTION page (page = 2, 3, …).
-// Task #318 Step 1.
-//
-// The KEY page is decoupled from the RESOLUTION page (Ship 0.30.187 D2): the
-// resolution page advances the apiRef RA's slice; the KEY page must match what
-// the dispatcher's paginationInfo (helpers.go:53-79) returns at serve time for
-// the request that fetches the SAME deep page. Two cases, no widget/GVR
-// special-case (the discriminant is the captured KEY tuple, not the resource):
-//
-//   - keyPage <= 0 (page-1 reached with NO declared slice — the root datagrid
-//     keys at (-1, -1)): the frontend's deep-page request carries ?page=N, so
-//     paginationInfo returns page=N. The drain's resolution page IS that N, so
-//     the KEY page == the resolution page.
-//   - keyPage >= 1 (page-1 reached at a declared ?page=K&perPage=M slice): the
-//     drain advances from the declared start, so the KEY page advances from K
-//     in lockstep with the resolution page (which starts at 2 for the first
-//     EXTRA page after page-1): keyPage + (page - 1).
-//
-// BOTH the WithL1KeyContext install (:403) and the populateWidgetContentL1 Put
-// (:446) call this with the SAME (keyPage, page) so they hash to one cell —
-// closing the AC-G.5 detached-entry defect the pre-#318 split re-introduced.
-func drainKeyPageFor(keyPage, page int) int {
-	if keyPage <= 0 {
-		// No declared slice on page-1 (root). The serve-time KEY page for the
-		// deep page is the resolution page (the frontend sends ?page=<page>).
-		return page
-	}
-	// Declared slice starting at page keyPage. The drain's first EXTRA page
-	// (resolution page 2) is the page AFTER the declared start, so advance
-	// keyPage by (page-1).
-	return keyPage + (page - 1)
-}
-
 // iterateApiRefPages — Path 3.2.2 (0.30.220) — drives apiRef pagination
 // AFTER the existing page-1 walk has resolved + populated. Inputs:
 //
@@ -321,33 +286,26 @@ func drainKeyPageFor(keyPage, page int) int {
 //   - depth         — the walker depth; subsequent-page recursion
 //     continues from depth+1, the same as the page-1
 //     children loop.
-//   - perPage       — the RESOLUTION perPage (passed unchanged for
-//     pages 2..N — the apiRef RA is paginated by adv-
-//     ancing PAGE, not by changing perPage).
-//   - keyPerPage    — the KEY perPage tuple. Per Ship 0.30.187 D2,
-//     decoupled from `perPage`; passed straight through
-//     to `populateWidgetContentL1` so each page's seed
-//     cell matches the dispatcher's serve-time lookup
-//     for the SAME page.
-//   - keyPage       — page-1's KEY page tuple (Task #318 Step 1). The
-//     per-page KEY page is derived from this base via
-//     drainKeyPageFor(keyPage, page) so the page cell's
-//     two key sites (the WithL1KeyContext install and the
-//     populateWidgetContentL1 Put) hash to the SAME cell
-//     AND follow deriveSeedKeyTuple semantics — instead
-//     of the pre-#318 split where the install used the raw
-//     loop counter and the Put used the RESOLUTION perPage
-//     (the AC-G.5 detached-entry defect for the page cell).
+//   - pg            — the pagination the first page was resolved and keyed
+//     with (the walk's pg). #966: each deep page's ONE
+//     pagination is pg.pageAfter(n) — same perPage, page
+//     advanced by n — and the drain resolves that page with
+//     it AND keys its cell with it, so the cell holds what a
+//     /call with that ?page&perPage resolves. Before #966 the
+//     drain resolved at (perPage, n+1) while keying
+//     (keyPerPage, drainKeyPageFor(keyPage, n+1)): a no-slice
+//     widget's deep pages were stored under (-1, n+1), a
+//     pagination no request carries, and a declared start
+//     page K>1 resolved page n+1 under key K+n.
 //   - authnNS       — the authn namespace; threaded to widgets.Resolve.
 //
 // Returns no error: any pagination failure is logged and stops the
 // loop; the page-1 envelope (already Put) remains correct. The walker's
 // primary purpose (informer discovery) is unaffected.
 //
-// SAFETY: gated on isApiRefTemplateDriven(page1Res) AND
-// resolverWantsContinue(page1Res). If either is false, the function is
-// a no-op — page-1-only behaviour, byte-identical to the pre-3.2.2
-// posture.
+// SAFETY: gated on pg being paginated (an unwindowed resolve has no next
+// page), isApiRefTemplateDriven(page1Res) AND resolverWantsContinue(page1Res).
+// If any is false, the function is a no-op — page-1-only behaviour.
 func iterateApiRefPages(
 	ctx context.Context,
 	w *phase1Walker,
@@ -355,12 +313,13 @@ func iterateApiRefPages(
 	gvr schema.GroupVersionResource,
 	page1Res *unstructured.Unstructured,
 	depth int,
-	perPage int,
-	keyPerPage int,
-	keyPage int,
+	pg prewarmPagination,
 	authnNS string,
 ) {
 	if in == nil || page1Res == nil || w == nil {
+		return
+	}
+	if !pg.paginated() {
 		return
 	}
 	// Predicate: only widgets whose items list grows with apiRef pages.
@@ -402,13 +361,15 @@ func iterateApiRefPages(
 	// for every source that pages by offset/page or not at all.
 	cursor := resolverCursor(page1Res)
 
-	// The page-1 walk ran at PAGE=1. We start at PAGE=2 and increment.
-	// Each iteration: re-fetch a fresh CR copy (resolver mutates input),
-	// resolve at this page, populate, recurse children, decide whether
-	// to continue. The OPERATIVE terminator is the resolver's
+	// The walk ran the FIRST page at pg. `page` counts the drain's pages from
+	// 2 (the first page after pg) and pageN is that page's one pagination
+	// (#966). Each iteration: re-fetch a fresh CR copy (resolver mutates
+	// input), resolve at pageN, populate under pageN, recurse children, decide
+	// whether to continue. The OPERATIVE terminator is the resolver's
 	// `.slice.continue==false` (the blueprint's declared pagination); the
 	// loop bound `maxPages` is the liveness backstop only.
 	for page := 2; page <= maxPages; page++ {
+		pageN := pg.pageAfter(page - 1)
 		// P8 customer-priority yield (#156 / 0.30.256): raising the page
 		// backstop to cover the FULL declared list (10K+ pages at 50K) turns
 		// this drain into a long-running CPU consumer, so the loop MUST step
@@ -465,22 +426,10 @@ func iterateApiRefPages(
 		}
 
 		// Install the widgetContent L1 key on the resolveCtx (Ship G
-		// AC-G.5 — see phase1_walk.go:910-931 for the rationale). The
-		// page cell's KEY tuple is (keyPerPage, keyPageForThisPage) —
-		// decoupled from the RESOLUTION (perPage, page) per Ship
-		// 0.30.187 D2 and symmetric with the page-1 site
-		// (phase1_walk.go:1146). keyPageForThisPage advances page-1's
-		// KEY page (keyPage) in lockstep with the drain's resolution
-		// page so each deep page lands in its OWN cell while staying on
-		// the deriveSeedKeyTuple model.
-		//
-		// Task #318 Step 1: pre-#318 this site used the RESOLUTION-loop
-		// counter `page` as the KEY page and the Put at :446 used the
-		// RESOLUTION `perPage` — so the two key sites disagreed (the
-		// AC-G.5 detached-entry defect for the page cell). Both sites now
-		// compute keyPageForThisPage + keyPerPage identically.
-		keyPageForThisPage := drainKeyPageFor(keyPage, page)
-		wcKey, _ := widgetContentL1Key(gvr, ns, name, keyPerPage, keyPageForThisPage)
+		// AC-G.5 — see walk() for the rationale). #966: the install key,
+		// the resolve below and the populate Put all take pageN, this
+		// page's one pagination.
+		wcKey, _ := widgetContentL1Key(gvr, ns, name, pageN.PerPage, pageN.Page)
 		// #323 — capture the content cell's generation BEFORE the page resolve
 		// below (paginationResolvePageFn), so populateWidgetContentL1's post-readyz
 		// PutIfGen refuses (rather than resurrecting) if a DELETE lands during this
@@ -518,8 +467,8 @@ func iterateApiRefPages(
 			In:      got.Unstructured,
 			RC:      w.rc,
 			AuthnNS: authnNS,
-			PerPage: perPage,
-			Page:    page,
+			PerPage: pageN.PerPage,
+			Page:    pageN.Page,
 			Cursor:  cursor,
 		})
 		if err != nil {
@@ -561,14 +510,13 @@ func iterateApiRefPages(
 		// — for page N these are the same conditions, so behaviour is
 		// uniform.
 		//
-		// Task #318 Step 1: pass the KEY tuple (keyPerPage,
-		// keyPageForThisPage) — BYTE-IDENTICAL to the :403 install key
-		// above — NOT the RESOLUTION (perPage, page); and pass resolveCtx
+		// #966: keyed with pageN, the pagination res was resolved with and
+		// the install key above folds. Task #318 Step 1: pass resolveCtx
 		// (which carries the stage-error sink + the L1 key) NOT the bare
 		// ctx, so the Cache-A gate inside populateWidgetContentL1 sees this
-		// resolve's sink (parity with phase1_walk.go:1226).
+		// resolve's sink (parity with walk()).
 		if storePage {
-			populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res, wcGen0)
+			populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, pageN.PerPage, pageN.Page, res, wcGen0)
 		} else {
 			bumpPrewarmApiRefCursorPagesUnstored()
 		}
@@ -603,24 +551,15 @@ func iterateApiRefPages(
 			// reachable widget-CR count, not re-walks.
 			bumpPrewarmUnitsPlanned(1)
 
-			// Child pagination defaults — same posture as the page-1
-			// children loop in phase1_walk.go:1057-1083: honour the
-			// child's declared slice, else use page=1 + bounded
-			// perPage. Key tuple via the same deriveSeedKeyTuple
-			// helper the page-1 path uses (paginationInfo-symmetric).
-			childPage, childPerPage := 1, prewarmPageLimit()
-			if p, pp, hasPg := util.ParseCallPathPagination(child.Path); hasPg {
-				childPage, childPerPage = p, pp
-			}
-			childKeyPerPage, childKeyPage := deriveSeedKeyTuple(child.Path)
+			// #966 — the child's one pagination, the SAME derivation the
+			// page-1 children loop (descendChildren) uses.
+			childPg := prewarmPaginationFor(child.Path)
 
 			childGot := objects.Get(ctx, childRef)
 			if childGot.Err != nil || childGot.Unstructured == nil {
 				continue
 			}
-			_ = w.walk(ctx, childGot.Unstructured, childGot.GVR,
-				depth+1, childPage, childPerPage,
-				childKeyPerPage, childKeyPage)
+			_ = w.walk(ctx, childGot.Unstructured, childGot.GVR, depth+1, childPg)
 		}
 
 		// Decide whether to continue. The resolver's

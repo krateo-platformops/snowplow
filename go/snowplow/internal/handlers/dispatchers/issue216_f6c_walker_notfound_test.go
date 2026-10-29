@@ -65,7 +65,7 @@ func f6cWalker(t *testing.T) (*phase1Walker, *navWidgetHarvester) {
 	w.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: i187Group, Version: i187Version, Kind: i187Kind,
 	})
-	nav.harvestNavWidget(w, f6cGVR(), -1, -1, -1, -1)
+	nav.harvestNavWidget(w, f6cGVR(), unpaginatedPrewarm)
 	if !f6bHarvestedStillHolds(nav, f6cGVR(), i187NS, i187Name) {
 		t.Fatalf("premise: the child was not harvested")
 	}

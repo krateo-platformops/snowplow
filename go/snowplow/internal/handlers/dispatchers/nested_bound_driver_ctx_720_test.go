@@ -106,9 +106,7 @@ func captureDrainCtx720(t *testing.T) context.Context {
 		GVR:        drainPageCellGVR(),
 		Page1Res:   fakePage1Driven(),
 		Depth:      1,
-		PerPage:    5,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: newPrewarmPagination(5, 1),
 		AuthnNS:    ns,
 	}}, endpoints.Endpoint{}, nil)
 

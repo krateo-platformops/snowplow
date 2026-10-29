@@ -156,10 +156,7 @@ func seed2EWidgetEntry() navWidgetEntry {
 	return navWidgetEntry{
 		W:          h1WidgetUnstructured(map[string]any{"apiRef": map[string]any{"name": a1RAName2, "namespace": h1NS}}),
 		GVR:        h1WidgetGVR,
-		PerPage:    -1,
-		Page:       -1,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: unpaginatedPrewarm,
 	}
 }
 

@@ -399,7 +399,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		objs = append(objs, h643RA(raName, ep, stagePaths...))
 		w := h643Widget(wName, raName)
 		objs = append(objs, w)
-		navHarv.harvestNavWidget(w, h643WidgetGVR, -1, -1, -1, -1)
+		navHarv.harvestNavWidget(w, h643WidgetGVR, unpaginatedPrewarm)
 		env.external[h643NS+"/"+wName] = external
 	}
 	for _, x := range o.extra {
@@ -411,7 +411,7 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 		}})
 		w := h643Widget(x.widget, x.ra)
 		objs = append(objs, w)
-		navHarv.harvestNavWidget(w, h643WidgetGVR, -1, -1, -1, -1)
+		navHarv.harvestNavWidget(w, h643WidgetGVR, unpaginatedPrewarm)
 		env.external[h643NS+"/"+x.widget] = x.external
 	}
 	for _, obj := range o.objs {

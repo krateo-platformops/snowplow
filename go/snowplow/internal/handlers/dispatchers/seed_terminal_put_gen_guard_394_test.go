@@ -48,10 +48,7 @@ func s394WidgetEntry() navWidgetEntry {
 	return navWidgetEntry{
 		W:          h1WidgetUnstructured(map[string]any{}),
 		GVR:        h1WidgetGVR,
-		PerPage:    -1,
-		Page:       -1,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: unpaginatedPrewarm,
 	}
 }
 
