@@ -2420,6 +2420,15 @@ def _store_verify_counters(m: dict) -> dict | None:
     return out | _flat("skipped", extra.get(STORE_VERIFY_SKIPPED_KEY))
 
 
+STORE_REPAIR_NOTES = {
+    "relist": ("report only. repairs.repairs_fired counts relists the cache.store.repair log line announced "
+               "(a GVR torn down in between is logged, not counted)"),
+    "build_and_swap": ("report only. repairs.repairs_fired counts builds REQUESTED for a new divergence; "
+                       "snowplow_store_swap.store_swaps_total counts builds INSTALLED; the difference is the open "
+                       "or aborted builds, by outcome in store_swap_known_stale_builds_total (#870)"),
+}
+
+
 def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
     """#875, per phase: the forced pass's re-check GETs and the candidates
     they cleared; the candidates counted WITHOUT a re-check — nothing
@@ -2447,12 +2456,23 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
             "skipped_by_reason": _split(c, "skipped"),
             "repairs": {k[len("store_"):-len("_total")]: c.get(k) for k in _STORE_REPAIRS},
         }
-    sv = (last.get("extra") or {}).get(STORE_VERIFY_KEY) or {}
+    # #969: the open-repair gauge is the mechanism's own (relist: the repair
+    # queue; build_and_swap, #870: the known-stale divergence window), read by
+    # what the build publishes, never by its version (bench/store_rebuild.py)
+    from bench import store_rebuild
+    ex = last.get("extra") or {}
+    sv = ex.get(STORE_VERIFY_KEY) or {}
+    mech, why = store_rebuild.mechanism(ex)
+    gauges = {k: _num(sv.get(k)) for k in ("store_gvrs_unverified", "store_gvrs_unverifiable")}
+    if mech is not None:
+        gauges |= {k: v for k, v in store_rebuild.gauges(ex, mech).items()
+                   if not k.endswith(".schema")}
     return {"status": "present", "by_phase": out, "samples": r["samples"], "restarts": r["restarts"],
-            "gauges_last": {k: _num(sv.get(k)) for k in ("store_gvrs_unverified", "store_gvrs_unverifiable",
-                                                         "store_repairs_pending")},
-            "note": ("report only. repairs.repairs_fired counts relists the cache.store.repair "
-                     "log line announced (a GVR torn down in between is logged, not counted)")}
+            "mechanism": mech, "mechanism_identified_by": why,
+            "gauges_last": gauges,
+            "note": (STORE_REPAIR_NOTES.get(mech, f"the repair mechanism is not known ({why}): its gauges "
+                                                  f"are not read")
+                     + "; per-phase builds, windows and pushes: store_rebuild_report_only")}
 
 
 def profiling_report(mem: list[dict], navs: list[dict],
@@ -2567,6 +2587,11 @@ RUN8_VARS_PREFIXES = (
     # per-GVR count or time (#932 step 0 adds it).
     "snowplow_reflector_path",
     "snowplow_informer_watch",
+    # #969 (#870, 1.12.60): build-and-swap, the known-stale family, and the
+    # resolves' fall-throughs to the apiserver (by path|gvr|reason): every
+    # prefix bench/store_rebuild.py VARS_PREFIXES reads
+    "snowplow_store_swap",
+    "snowplow_apiserver_fallthrough_cells",
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3598,6 +3623,15 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["list_incremental_report_only"] = list_incremental_report(mem or [], phase_src)
     report["store_verification_report_only"] = store_verification_report(mem or [], phase_src)
+    # #969: store rebuilds (repairs and schema changes) under the build's own
+    # mechanism — relist (to 1.12.59) or build-and-swap (#870, 1.12.60) — with
+    # the same quantities on both, and the paired run's three watches
+    from bench import store_rebuild
+    report["store_rebuild_report_only"] = sr = store_rebuild.report(
+        mem or [], snowplow_pods or [], run_phases(mem or [], phase_src), _phase_of, _deltas)
+    if sr["status"] != "present":
+        report["report_warnings"].append(f"store rebuilds: {sr['status']}: {sr['note']}")
+    report["report_warnings"] += sr.get("claim_violations") or []
     for name, key, what in (("list_incremental_report_only", LIST_INCREMENTAL_KEY,
                              "the #865 incremental list cell report"),
                             ("store_verification_report_only", STORE_VERIFY_KEY,
@@ -4851,6 +4885,8 @@ def mem_sample(client: HttpClient, token: str | None,
         rec["gc_pause_total_ms"] = (round(m["PauseTotalNs"] / 1e6, 3)
                                     if m.get("PauseTotalNs") is not None else None)
         rec["gc_cpu_fraction"] = m.get("GCCPUFraction")
+        # #969: the fraction is as of the last GC; its time windows it (store_rebuild.gc_share)
+        rec["last_gc"] = m.get("LastGC")
         rec["sched_latencies"] = v.get(SCHED_LATENCY_KEY)
         rec["heap_objects"] = m.get("HeapObjects")
         rec["customer_resolve_inflight"] = v.get("snowplow_customer_resolve_inflight")

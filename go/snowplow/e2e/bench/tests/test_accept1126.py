@@ -261,7 +261,7 @@ def test_a17_tolerates_ordinary_refresh_traffic_in_the_burst_window():
 
 
 def test_crd_rows_pin_the_timeout_falsifier():
-    rows = {r.rid: r for r in a.crd_rows()}
+    rows = {r.rid: r for r in a.crd_rows("relist")}
     assert rows["B4"].key == f"{a.K_CRD}.relist_bridge_timeout_total"
     ok, _ = a.evaluate([rows["B4"]], {rows["B4"].key: 1})
     assert not ok, "relist_bridge_timeout_total > 0 must fail the stage"
@@ -270,7 +270,7 @@ def test_crd_rows_pin_the_timeout_falsifier():
 def test_crd_rows_catch_a_metadata_only_touch():
     """schema_unchanged moving means the forcing step edited metadata, not the
     structural schema — the cheap self-check from facts §4."""
-    rows = {r.rid: r for r in a.crd_rows()}
+    rows = {r.rid: r for r in a.crd_rows("relist")}
     ok, _ = a.evaluate([rows["B6"]], {rows["B6"].key: 1})
     assert not ok
 
