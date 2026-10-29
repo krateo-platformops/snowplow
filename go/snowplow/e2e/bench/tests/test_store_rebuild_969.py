@@ -447,7 +447,7 @@ def test_the_swapped_gvrs_lists_every_reason_during_or_after_break_the_claim(tmp
         w = _lw(v)
         assert w["value"] == 1 and w["judged_by_gvr_reason"] == {f"{G}|unattributed": 1}, at
         viol = v["report"]["store_rebuild_report_only"]["claim_violations"]
-        assert len(viol) == 1 and "the swapped GVRs" in viol[0] and f"{G}|unattributed 1" in viol[0]
+        assert len(viol) == 1 and "each swapped GVR" in viol[0] and f"{G}|unattributed 1" in viol[0]
         assert viol[0] in v["report"]["report_warnings"]
     v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists({f"{G}|unattributed": 7}, swaps={G: 5}))
     assert _lw(v)["value"] == 0
@@ -501,3 +501,65 @@ def test_the_refresher_s_fall_throughs_never_join_the_resolve_count(tmp_path):
     assert r["watch"]["resolve_fallthroughs_during_rebuilds"]["value"] == 0
     assert r["watch"]["resolve_collection_lists_during_rebuilds"]["refresher_fallthroughs_during_rebuilds"] == {
         "informer-fallthrough-not-synced": 5, "informer-fallthrough-not-servable": 0}
+
+
+# ─── #987 round 3: the per-GVR swap signal, judged per GVR and per window ──
+
+def _installed(gvr_from: dict, const: dict | None = None):
+    """snowplow_store_swaps_by_gvr: {gvr: first sample its installed is 1 at};
+    `const`: GVRs present with a constant installed (they swapped before the run)."""
+    def f(i):
+        m = {g: {"installed": 1 if i >= at else 0} for g, at in gvr_from.items()}
+        m |= {g: {"installed": n} for g, n in (const or {}).items()}
+        return {g: dict(v, superseded=0, abort_clean=0, abort_refused=0, abort_teardown=0) for g, v in m.items()}
+    return f
+
+
+def _with(lists_cells, swaps_fn):
+    def f(i):
+        return {LISTS: {c: (1 if i >= at else 0) for c, at in lists_cells.items()}, SWAPS: swaps_fn(i)}
+    return f
+
+
+def test_a_gvr_present_in_the_map_but_not_installed_in_the_window_is_never_judged(tmp_path):
+    """H1: CM swapped before the run (installed 4, constant); its LISTs during
+    G's swap are reported, never judged."""
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap",
+                     extra=_with({f"{CM}|unattributed": 4}, _installed({G: 5}, const={CM: 4})))
+    w = _lw(v)
+    assert w["swapped_gvrs"] == [G] and w["value"] == 0 and w["judged_by_gvr_reason"] == {}
+    assert w["by_gvr_reason"] == {f"{CM}|unattributed": 1}
+    assert v["report"]["store_rebuild_report_only"]["claim_violations"] == []
+
+
+# the reviewer's PB stream: two rebuilds, G installs in the first (s5), CM in the second (s12)
+SECOND = [(1, 20 + i, 900 + 100 * i, 0, 2000, 20 + i, 0.010, x) for i, x in enumerate(
+    [(1, 0, 20.5), (1, 0, 20.5), (1, 3, 20.5), (1, 3, 20.5), (2, 0, 41.0), (2, 0, 41.0), (2, 0, 41.0)])]
+
+
+def test_each_gvr_is_judged_only_over_its_own_window(tmp_path):
+    """H2 (probe PB): a LIST of G at s11, during CM's later rebuild, six pairs
+    after G's own swap, is reported, not judged; one in G's own window is."""
+    rows = list(SWAP) + SECOND
+    v, _ = _evaluate(tmp_path, rows, "build_and_swap",
+                     extra=_with({f"{G}|unattributed": 11}, _installed({G: 5, CM: 12})))
+    w = _lw(v)
+    assert w["swapped_gvrs"] == sorted([G, CM]) and w["value"] == 0 and w["judged_by_gvr_reason"] == {}
+    assert w["by_gvr_reason"] == {f"{G}|unattributed": 1}
+    assert v["report"]["store_rebuild_report_only"]["claim_violations"] == []
+    v, _ = _evaluate(tmp_path, rows, "build_and_swap",
+                     extra=_with({f"{G}|unattributed": 4, f"{CM}|unattributed": 11}, _installed({G: 5, CM: 12})))
+    w = _lw(v)
+    assert w["value"] == 2 and w["judged_by_gvr_reason"] == {f"{G}|unattributed": 1, f"{CM}|unattributed": 1}
+
+
+def test_with_the_signal_published_and_nothing_installed_nothing_is_judged(tmp_path):
+    """H3 (probe PA): a rebuild opens but no GVR installs (aborted or still
+    open): no value, "nothing judged", never a zero that reads as health."""
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap",
+                     extra=_with({f"{G}|informer-fallthrough-{NS}": 3}, _installed({})))
+    w = _lw(v)
+    assert w["swapped_gvrs"] == [] and w["value"] is None
+    assert w["missing"] == "no swap installed in the window: nothing judged"
+    assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
+        "resolve_collection_lists_during_rebuilds"] is None
