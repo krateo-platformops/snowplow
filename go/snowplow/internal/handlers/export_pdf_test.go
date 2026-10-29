@@ -472,9 +472,11 @@ func TestExport970_BuildThenSend(t *testing.T) {
 // used verbatim, and they may repeat (two "Name" columns). They head the
 // csv and pdf columns; csv cells are otherwise unchanged. The json body
 // becomes {columns:[{field,label}] in fields order, rows keyed by field} —
-// labels are never keys, so repeated labels cannot collide. A label list
-// that does not pair with the fields (no fields, a count mismatch, a field
-// listed twice) is a 400 before anything is dispatched.
+// labels are never keys, so repeated labels cannot collide. A field may be
+// selected twice (two views of one value): csv and pdf repeat the column,
+// json lists both columns and carries the field once per row. A label list
+// that does not pair with the fields (no fields, a count mismatch) is a 400
+// before anything is dispatched.
 func TestExport970_HeaderLabels(t *testing.T) {
 	body := `{"items":[{"name":"alpha","meta":{"created":"2026-10-29","n":3}},{"name":"=beta","meta":{"n":4.5}}]}`
 	q := "fields=name,meta.created,meta.n&header=Name&header=" + url.QueryEscape("Created, UTC") + "&header=Name"
@@ -537,12 +539,33 @@ func TestExport970_HeaderLabels(t *testing.T) {
 		"header=Name",                         // no fields
 		"fields=name,meta.n&header=Name",      // fewer labels than fields
 		"fields=name&header=Name&header=More", // more labels than fields
-		"fields=name,name&header=A&header=B",  // a field listed twice
 	} {
 		queries = nil
 		rec, _ := exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=csv&"+bad)
 		if rec.Code != http.StatusBadRequest || len(queries) != 0 {
 			t.Errorf("%s: status %d after %d dispatches, want 400 before any dispatch", bad, rec.Code, len(queries))
+		}
+	}
+
+	// One field selected twice, under two labels: exported in all three
+	// formats. csv and pdf repeat the column; json lists both columns and
+	// carries the field once per row.
+	dup := "fields=meta.n,name,meta.n&header=" + url.QueryEscape("Size") + "&header=Name&header=" + url.QueryEscape("Size, raw")
+	rec, _ = exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=csv&"+dup)
+	if want := "Size,Name,\"Size, raw\"\n3,alpha,3\n4.5,'=beta,4.5\n"; rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Errorf("csv with a repeated field: %d %q, want %q", rec.Code, rec.Body.String(), want)
+	}
+	rec, _ = exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=json&"+dup)
+	compact := regexp.MustCompile(`\s+`).ReplaceAllString(rec.Body.String(), "")
+	if want := `{"columns":[{"field":"meta.n","label":"Size"},{"field":"name","label":"Name"},{"field":"meta.n","label":"Size,raw"}],` +
+		`"rows":[{"meta.n":3,"name":"alpha"},{"meta.n":4.5,"name":"=beta"}]}`; rec.Code != http.StatusOK || compact != want {
+		t.Errorf("json with a repeated field: %d %s, want %s", rec.Code, compact, want)
+	}
+	rec, _ = exportAs(t, recordingCall(body, &queries), "/export?resource=restactions&name=demo&format=pdf&"+dup)
+	d = parsePDF(t, rec)
+	for _, want := range []string{"Size | Name | Size, raw", "3 | alpha | 3", "4.5 | =beta | 4.5"} {
+		if !hasLine(d.Pages[0], want) {
+			t.Errorf("pdf with a repeated field lacks the line %q:\n%s", want, d.Pages[0].Text())
 		}
 	}
 }

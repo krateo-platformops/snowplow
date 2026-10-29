@@ -65,8 +65,8 @@ const (
 // (name, owner, ns, size), so the export's column order provably comes from
 // fields, not from the cells.
 var (
-	tableValueKeys = []string{"name", "ns", "size", "owner"}
-	tableTitles    = []string{"Name", "Namespace, scope", "Size (MiB)", "Name"} // two "Name" columns, told apart by position
+	tableValueKeys = []string{"name", "ns", "size", "owner", "size"}                         // size twice: two views of one value
+	tableTitles    = []string{"Name", "Namespace, scope", "Size (MiB)", "Name", "Size, raw"} // two "Name" columns, told apart by position
 )
 
 func tableWidgetCR() string {
@@ -396,7 +396,7 @@ func TestExport970_TableWidgetThroughRealCallChain(t *testing.T) {
 				}
 				var n int
 				fmt.Sscanf(r[0][5:], "%d", &n)
-				if want := []string{r[0], ns, fmt.Sprint(n), ns}; strings.Join(r, "|") != strings.Join(want, "|") {
+				if want := []string{r[0], ns, fmt.Sprint(n), ns, fmt.Sprint(n)}; strings.Join(r, "|") != strings.Join(want, "|") {
 					t.Fatalf("csv row %d = %q, want %q (valueKey order)", i, r, want)
 				}
 			}
@@ -458,7 +458,7 @@ func TestExport970_TableWidgetThroughRealCallChain(t *testing.T) {
 					break
 				}
 			}
-			if line := strings.Join([]string{"cm-a-0007", "team-a", "7", "team-a"}, pdfcheck.Sep); !strings.Contains(d.String(), line) {
+			if line := strings.Join([]string{"cm-a-0007", "team-a", "7", "team-a", "7"}, pdfcheck.Sep); !strings.Contains(d.String(), line) {
 				t.Errorf("pdf lacks the row %q in valueKey order", line)
 			}
 

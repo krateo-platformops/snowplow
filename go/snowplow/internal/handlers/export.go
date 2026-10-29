@@ -653,12 +653,13 @@ func cellText(leaf any) string {
 // labeledJSON is the json body of an export that carries header labels.
 // Labels are display text and may repeat (two "Name" columns told apart by
 // position); fields are the identifiers. So the labels never become keys:
-// columns lists every selected column in fields order as {field, label},
-// and each row is an object keyed by field, its keys written in fields
-// order, holding the selected (flattened) leaves as decoded (a missing
-// column is null). A consumer pairs a row's values with their labels
-// through columns, by field or by position. Without labels the json body
-// is the extracted rows, unchanged.
+// columns lists every selected column in fields order as {field, label} —
+// a field selected twice (two views of one value) is listed twice — and
+// each row is an object keyed by field, every field once, its keys in
+// order of first selection, holding the selected (flattened) leaves as
+// decoded (a missing column is null). A consumer pairs columns with a
+// row's values by field. Without labels the json body is the extracted
+// rows, unchanged.
 type labeledJSON struct {
 	Columns []labeledColumn `json:"columns"`
 	Rows    []fieldRow      `json:"rows"`
@@ -705,14 +706,24 @@ func labeledBody(rows []any, fields, labels []string) labeledJSON {
 	for i, f := range fields {
 		out.Columns[i] = labeledColumn{Field: f, Label: labels[i]}
 	}
+	// Every field once, in order of first selection: two columns of one
+	// field read the same cell, so the row carries the value once.
+	keys := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		if _, dup := seen[f]; !dup {
+			seen[f] = struct{}{}
+			keys = append(keys, f)
+		}
+	}
 	_, flat := flattenRows(rows, fields)
 	out.Rows = make([]fieldRow, len(flat))
 	for r, fr := range flat {
-		values := make([]any, len(fields))
-		for i, f := range fields {
+		values := make([]any, len(keys))
+		for i, f := range keys {
 			values[i] = fr[f]
 		}
-		out.Rows[r] = fieldRow{fields: fields, values: values}
+		out.Rows[r] = fieldRow{fields: keys, values: values}
 	}
 	return out
 }
@@ -759,12 +770,11 @@ func strconv64(f float64) string {
 // query parameter per selected field, in fields order. The encoding is a
 // repeated parameter, not a comma list, so a label may hold any character,
 // commas included (header=Created%2C%20UTC). A label is display text, used
-// verbatim, and may repeat; the fields are the column identifiers. Labels
-// pair with fields by position, so they need an explicit fields list of the
-// same length, and that list must not name a field twice (a repeated
-// identifier is a caller bug, and the labelled json keys its rows by
-// field). No header parameter returns nil: the columns are headed by their
-// dot-paths, and fields are taken as before.
+// verbatim, and may repeat; the fields are the column identifiers, and a
+// field may be selected twice (two views of one value). Labels pair with
+// fields by position, so they need an explicit fields list of the same
+// length. No header parameter returns nil: the columns are headed by their
+// dot-paths, as before.
 func parseHeaderLabels(raw, fields []string) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -774,13 +784,6 @@ func parseHeaderLabels(raw, fields []string) ([]string, error) {
 	}
 	if len(raw) != len(fields) {
 		return nil, fmt.Errorf("got %d header labels for %d fields: give one header parameter per field, in the same order", len(raw), len(fields))
-	}
-	seen := make(map[string]struct{}, len(fields))
-	for _, f := range fields {
-		if _, dup := seen[f]; dup {
-			return nil, fmt.Errorf("field %q is listed twice: fields identify the columns that header labels name, so each may appear once", f)
-		}
-		seen[f] = struct{}{}
 	}
 	return raw, nil
 }

@@ -72,17 +72,22 @@ position).
   }
   ```
 
-  Each row object writes its keys in `fields` order. Its values are the
-  selected (flattened) values with their JSON types; a missing value is
-  `null`. Pair values with labels through `columns`, by field or by
-  position.
+  Each row object holds every selected field once, its keys in the order
+  of first selection. Its values are the selected (flattened) values with
+  their JSON types; a missing value is `null`. Pair a column with its value
+  through the column's `field`.
+
+A field may be selected twice, for example two columns showing one value
+raw and formatted (`fields=size,name,size&header=Size&header=Name&header=Size%2C%20raw`).
+CSV and PDF repeat the column. JSON lists both columns, each with its own
+label, and the row carries the field once, since both columns read the same
+value.
 
 Labels pair with fields by position, so the request is a `400`, and nothing
-is dispatched, when `header` comes without an explicit `fields` list, when
-the counts differ, or when `fields` lists the same field twice. Without
-`header`, csv and json are exactly as before: the CSV header row is the
-dot-paths, and the JSON export is the extracted rows as resolved (a
-repeated field is two identical columns in the CSV, as before).
+is dispatched, only when `header` comes without an explicit `fields` list or
+the counts differ. Without `header`, csv and json are exactly as before: the
+CSV header row is the dot-paths, and the JSON export is the extracted rows
+as resolved.
 
 `title` is used only by `pdf`. A csv or json export ignores it (no error,
 same bytes), so one request shape can serve all three formats.
