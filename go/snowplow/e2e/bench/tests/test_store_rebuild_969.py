@@ -215,7 +215,11 @@ def test_the_relist_arm(tmp_path):
         ("churn:list_dep@10", round(1000 / 15, 3), None)
     assert (x["next_pair"]["phase"], x["next_pair"]["watch_submits_per_s"], x["next_pair"]["over_quiet_median"]) == \
         ("steady", round(100 / 15, 3), 1.0)
-    assert a["max_over_quiet_median"] == 1.0
+    # #987 review G1: the end pair has no baseline in its phase, so the headline is withheld (never the
+    # maximum over the other pairs, which would read this 10x spike as 1.0), and a warning says so
+    assert a["max_over_quiet_median"] is None
+    assert a["pairs_without_baseline"] == [{"pair": "end_pair", "t1": T0 + 75, "phase": "churn:list_dep@10"}]
+    assert any("headline is withheld" in w for w in r["warnings"])
     h = w["heap_and_gc_during_rebuilds"]
     assert h["heap_inuse_mb_peak"] == 3100.0 and h["heap_inuse_mb_before_first"] == 2005.0
     assert h["gc_cpu_share_max"] is not None and h["gc_cpu_share_max"] > h["gc_cpu_share_quiet_p50"]
@@ -235,7 +239,7 @@ def test_the_build_and_swap_arm(tmp_path):
     # the install pair (s4->s5, +110, churn: no quiet pair there) and the next one (+90, steady)
     assert [(x["end_pair"]["watch_submits_per_s"], x["next_pair"]["watch_submits_per_s"])
             for x in a["after_each_rebuild"]] == [(round(110 / 15, 3), round(90 / 15, 3))]
-    assert a["max_over_quiet_median"] == 0.9
+    assert a["max_over_quiet_median"] is None and a["pairs_without_baseline"][0]["pair"] == "end_pair"
     p = r["by_phase"]["all"]
     assert (p["rebuilds_installed"], p["m_keys"], p["deliveries"]) == (1, 3, 2)
     assert p["known_stale_window_s"] == {"divergence|swap": 20.5}
@@ -245,7 +249,7 @@ def test_the_build_and_swap_arm(tmp_path):
     # the build the rendering accounted through the production path (abort_clean, 2 keys, 3 s)
     assert SWAP_DOC["after"]["snowplow_store_swap_known_stale"]["store_swap_known_stale_builds_total"][
         "divergence|abort_clean"] == 1
-    assert "store rebuilds" not in err
+    assert [ln for ln in err.splitlines() if "store rebuilds" in ln and "headline is withheld" not in ln] == []
 
 
 def test_one_fall_through_during_a_swap_already_breaks_its_claim(tmp_path):
@@ -372,20 +376,48 @@ def test_a_restart_pair_is_skipped_not_counted(mech, rows):
     assert r["rebuild_pairs"] == 2                                     # s2->s3 and s4->s5
 
 
+# ─── watch 2: each pair against its own phase's quiet median (#987 G1) ─────
+
+def test_each_watched_pair_is_compared_with_its_own_phase(tmp_path):
+    """Quiet pairs in two phases at different rates: the end pair (in churn)
+    is compared with churn's quiet median, the next pair (steady) with
+    steady's; an all-phase median would give other ratios."""
+    rows = []
+    watch = 0
+    for i in range(12):
+        # churn (t <= T0+105): quiet +300 per pair; a rebuild at s4..s6 ending in churn, +600 in its end pair;
+        # steady after: quiet +60 per pair, +120 in the next pair
+        watch += {5: 300, 6: 600, 7: 120}.get(i, 300 if i <= 7 else 60)
+        rows.append((1 if i >= 4 else 0, 10, watch, 0, 2000, 10 + i, 0.01, 1 if i in (4, 5) else 0))
+    mem = _mem(rows, "relist")
+    phases = [("churn:list_dep@10", T0 - 1, T0 + 100)]
+    r = store_rebuild.report(mem, [POD], phases, load606._phase_of, load606._deltas)
+    a = r["watch"]["watch_submits_after_rebuild"]
+    assert a["quiet_median_per_s_by_phase"] == {"churn:list_dep@10": 20.0, "steady": 4.0}
+    [x] = a["after_each_rebuild"]
+    assert (x["end_pair"]["phase"], x["end_pair"]["over_quiet_median"]) == ("churn:list_dep@10", 2.0)
+    assert (x["next_pair"]["phase"], x["next_pair"]["over_quiet_median"]) == ("steady", 2.0)
+    assert a["pairs_without_baseline"] == [] and a["max_over_quiet_median"] == 2.0
+
+
 # ─── #988 (PR #991): the resolves' collection LISTs on the wire ─────────────
 
 LISTS = "snowplow_resolve_collection_lists"
+SWAPS = "snowplow_store_swaps_by_gvr"
 CM = "/v1, Resource=configmaps"
+NS = "not-synced"
 
 
-def _lists(composition_at, other_at=None, refresher_from=None):
-    """A build with #991: the lists counter (G's LISTs from sample `composition_at`
-    on, a configmap LIST from `other_at` on) and the refresher's fall-through path."""
+def _lists(cells_at, swaps=None, refresher_from=None):
+    """A build with #991: `cells_at` = {"<gvr>|<reason>": first sample index
+    it counts 1 at}; `swaps` = {gvr: first sample index its installed is 1 at}
+    (#928's per-GVR swap signal; None = not published); and the refresher's
+    fall-through path."""
     def f(i):
-        cells = {f"{G}|informer-fallthrough-not-synced": 1 if composition_at is not None and i >= composition_at else 0}
-        if other_at is not None and i >= other_at:
-            cells[f"{CM}|unattributed"] = 1
-        out = {LISTS: cells}
+        out = {LISTS: {c: (1 if i >= at else 0) for c, at in cells_at.items()}}
+        if swaps is not None:
+            out[SWAPS] = {g: {"installed": 1 if i >= at else 0, "superseded": 0, "abort_clean": 0,
+                              "abort_refused": 0, "abort_teardown": 0} for g, at in swaps.items()}
         if refresher_from is not None:
             out["snowplow_apiserver_fallthrough_cells"] = {
                 f"refresher|{G}|informer-fallthrough-not-synced": 5 if i >= refresher_from else 0}
@@ -393,32 +425,62 @@ def _lists(composition_at, other_at=None, refresher_from=None):
     return f
 
 
+def _lw(v):
+    return v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]
+
+
 def test_the_lists_counter_is_captured_and_reads_zero_through_a_clean_swap(tmp_path):
-    v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None))
+    v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists({}, swaps={G: 5}))
     r = v["report"]["store_rebuild_report_only"]
-    w = r["watch"]["resolve_collection_lists_during_rebuilds"]
-    assert (w["value"], w["claim"], w["by_gvr"]) == (0, 0, {}) and r["claim_violations"] == []
-    assert "resolve_collection_lists" not in r["not_published"]
+    w = _lw(v)
+    assert (w["value"], w["claim"], w["swapped_gvrs"], w["judged_by_gvr_reason"]) == (0, 0, [G], {})
+    assert r["claim_violations"] == [] and "resolve_collection_lists" not in r["not_published"]
     assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
         "resolve_collection_lists_during_rebuilds"] == 0
 
 
-def test_a_list_during_or_right_after_a_swap_breaks_870s_claim(tmp_path):
-    """During (s3) and right after (s5->s6, the pair after the install): each
-    is a breach, named by GVR; a list long after (s7) is not counted."""
-    for at, want in ((3, {G: 1}), (6, {G: 1})):
-        v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(at))
-        w = v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]
-        assert w["value"] == 1 and w["by_gvr"] == want, at
+def test_the_swapped_gvrs_lists_every_reason_during_or_after_break_the_claim(tmp_path):
+    """Keyed on the GVR whose installed moved (G, at s5), every reason; during
+    (s3) and right after (s6) both count; a later one (s7) does not."""
+    for at in (3, 6):
+        v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists({f"{G}|unattributed": at}, swaps={G: 5}))
+        w = _lw(v)
+        assert w["value"] == 1 and w["judged_by_gvr_reason"] == {f"{G}|unattributed": 1}, at
         viol = v["report"]["store_rebuild_report_only"]["claim_violations"]
-        assert len(viol) == 1 and "1 resolve collection LIST(s)" in viol[0] and G in viol[0]
+        assert len(viol) == 1 and "the swapped GVRs" in viol[0] and f"{G}|unattributed 1" in viol[0]
         assert viol[0] in v["report"]["report_warnings"]
-    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(7))
-    assert v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]["value"] == 0
-    # every GVR is listed: the bench cannot single out the swapped one
-    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None, other_at=4))
-    w = v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]
-    assert w["by_gvr"] == {CM: 1} and v["report"]["store_rebuild_report_only"]["claim_violations"]
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists({f"{G}|unattributed": 7}, swaps={G: 5}))
+    assert _lw(v)["value"] == 0
+
+
+def test_another_gvrs_lists_are_reported_never_judged(tmp_path):
+    """#987 review G3: background LISTs of a GVR that did not swap are
+    reported under gvr|reason and never called a violation."""
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap",
+                     extra=_lists({f"{CM}|unattributed": 4, f"{CM}|informer-fallthrough-{NS}": 4}, swaps={G: 5}))
+    w = _lw(v)
+    assert w["value"] == 0 and w["judged_by_gvr_reason"] == {}
+    assert w["by_gvr_reason"] == {f"{CM}|unattributed": 1, f"{CM}|informer-fallthrough-{NS}": 1}
+    assert w["all_reasons_total"] == 2 and v["report"]["store_rebuild_report_only"]["claim_violations"] == []
+
+
+def test_without_the_per_gvr_swap_signal_only_the_window_reasons_are_judged(tmp_path):
+    """A build with #988's counter but not #928's per-GVR swap signal: the
+    swapped GVR cannot be singled out, so only the rebuild-window reasons are
+    judged (every GVR), and the rest is reported."""
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap",
+                     extra=_lists({f"{CM}|unattributed": 4, f"{G}|informer-fallthrough-{NS}": 4}))
+    w = _lw(v)
+    assert w["swapped_gvrs"] is None and "not published" in w["judged_on"]
+    assert w["value"] == 1 and w["judged_by_gvr_reason"] == {f"{G}|informer-fallthrough-{NS}": 1}
+    assert len(v["report"]["store_rebuild_report_only"]["claim_violations"]) == 1
+
+
+def test_the_counter_published_with_no_rebuild_is_untested_never_a_zero(tmp_path):
+    """#987 review G4: the counter is there, but nothing was watched."""
+    v, _ = _evaluate(tmp_path, [SWAP[0]] * 8, "build_and_swap", extra=_lists({}, swaps={}))
+    w = _lw(v)
+    assert w["value"] is None and w["missing"] == "no rebuild observed: the claim is untested"
 
 
 def test_a_build_without_the_counter_reads_not_published(tmp_path):
@@ -434,7 +496,7 @@ def test_a_build_without_the_counter_reads_not_published(tmp_path):
 def test_the_refresher_s_fall_throughs_never_join_the_resolve_count(tmp_path):
     """#991 counts the refresher's fall-throughs under path "refresher": kept
     apart, so resolve_fallthroughs means the same on 1.12.59 and 1.12.60."""
-    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None, refresher_from=4))
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists({}, refresher_from=4))
     r = v["report"]["store_rebuild_report_only"]
     assert r["watch"]["resolve_fallthroughs_during_rebuilds"]["value"] == 0
     assert r["watch"]["resolve_collection_lists_during_rebuilds"]["refresher_fallthroughs_during_rebuilds"] == {

@@ -243,3 +243,13 @@ def test_a_pod_replaced_by_another_mechanism_mid_stage_is_refused(monkeypatch, t
     with pytest.raises(a.AssertionsFailed, match="mechanism changed"):
         _stage(monkeypatch, tmp_path, [_relist_snapshot(), _swap_snapshot(swaps=1, relists=1)],
                a.stage_crd_relist, enable_crd_relist=True)
+
+
+def test_a_failing_report_only_row_is_listed_apart_from_the_failed_rows(monkeypatch, tmp_path):
+    """#987 review G2: the full widen's B3 failing leaves the stage passed,
+    out of failed_rows, and in report_only_failed."""
+    monkeypatch.setenv("S6_CRD_FULL_WIDEN_APPROVED", "1")
+    out = _stage(monkeypatch, tmp_path, [_swap_snapshot(), _swap_snapshot(swaps=1, m_keys=4, deliveries=4,
+                                                                          relists=1)],
+                 a.stage_crd_full_widen, enable_crd_full_widen=True, full_widen_crs=5)
+    assert out["__passed__"] and out["failed_rows"] == [] and out["report_only_failed"] == ["B3"]

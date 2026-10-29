@@ -1578,7 +1578,9 @@ def stage_counters_after(ctx: dict) -> dict:
         "assertions": results,
         "crosscheck_evict_delete_total": a1a2,
         "crosscheck_evidence_channels": chan,
-        "failed_rows": [r["id"] for r in results if not r["passed"]],
+        "failed_rows": [r["id"] for r in results if not r["passed"] and not r.get("report_only")],
+        # a report-only row's failure never fails the stage: listed apart (#987 review G2)
+        "report_only_failed": [r["id"] for r in results if not r["passed"] and r.get("report_only")],
     }
 
 
@@ -1898,7 +1900,9 @@ def _crd_widen_stage(ctx: dict, *, crd_name: str, crs: int, default: str | None)
             "end_readings": end,
             **({"report_only": rep_fn(d, end)} if rep_fn else {}),
             "assertions": results,
-            "failed_rows": [r["id"] for r in results if not r["passed"]],
+            "failed_rows": [r["id"] for r in results if not r["passed"] and not r.get("report_only")],
+            # a report-only row's failure never fails the stage: listed apart (#987 review G2)
+            "report_only_failed": [r["id"] for r in results if not r["passed"] and r.get("report_only")],
             "known_residue": (
                 "navDiscoveredGroups is APPEND-ONLY on DELETE by ratified "
                 "design, so the disposable group name stays in that in-memory "

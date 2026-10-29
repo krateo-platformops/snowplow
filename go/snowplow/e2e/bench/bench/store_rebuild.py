@@ -64,6 +64,12 @@ FALLTHROUGH = "snowplow_apiserver_fallthrough_cells"
 # "not published", never 0. With it, the refresher is a resolve origin too: its
 # fall-throughs land in FALLTHROUGH under path "refresher" (uncounted before).
 RESOLVE_LISTS = "snowplow_resolve_collection_lists"
+# The per-GVR swap signal #928 adds (names as planned, to be confirmed on its
+# head): {"<GroupVersionResource.String()>": {"installed": n, "superseded": n,
+# "abort_clean": n, "abort_refused": n, "abort_teardown": n}}. The LIST claim is
+# judged on exactly the GVRs whose `installed` moved in the window. Captured by
+# the SWAP prefix ("snowplow_store_swap...").
+SWAPS_BY_GVR = "snowplow_store_swaps_by_gvr"
 REFRESHER_PATH = "refresher"
 RESOLVED = "snowplow_resolved_cache"
 DIRTY = "snowplow_deps_dirty_mark_attribution"
@@ -218,13 +224,18 @@ def counters(x: dict, mech: str) -> dict | None:
                     continue
                 out[f"fallthrough/{parts[2]}"] += n
                 out[f"fallthrough_gvr/{parts[1]}|{parts[2]}"] = out.get(f"fallthrough_gvr/{parts[1]}|{parts[2]}", 0) + n
+    by_gvr = x.get(SWAPS_BY_GVR)
+    if isinstance(by_gvr, dict):
+        for gvr, m in by_gvr.items():
+            if isinstance(m, dict) and _num(m.get("installed")) is not None:
+                out[f"swaps_installed_gvr/{gvr}"] = m["installed"]
     if isinstance(lists, dict):
         out["resolve_lists"] = 0
         for cell, n in lists.items():
             gvr, _, reason = str(cell).rpartition("|")
             if _num(n) is not None:
                 out["resolve_lists"] += n
-                out[f"resolve_lists_gvr/{gvr}"] = out.get(f"resolve_lists_gvr/{gvr}", 0) + n
+                out[f"resolve_lists_cell/{gvr}|{reason}"] = out.get(f"resolve_lists_cell/{gvr}|{reason}", 0) + n
     return out
 
 
@@ -304,8 +315,10 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
         # a fall-through cell the earlier sample's meter had not counted yet read 0 there
         meter_a = isinstance(_extra(a).get(FALLTHROUGH), dict)
         lists_a = isinstance(_extra(a).get(RESOLVE_LISTS), dict)
+        swaps_a = isinstance(_extra(a).get(SWAPS_BY_GVR), dict)
         d, r = deltas(a, b, {k: ca.get(k, 0 if (meter_a and k.startswith("fallthrough_gvr/"))
-                                         or (lists_a and k.startswith("resolve_lists_gvr/")) else None)
+                                         or (lists_a and k.startswith("resolve_lists_cell/"))
+                                         or (swaps_a and k.startswith("swaps_installed_gvr/")) else None)
                              for k in cb}, cb)
         if r:
             restarts += 1
@@ -358,6 +371,8 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
     # the pair a rebuild ends in (build_and_swap: it holds the install and the
     # unmute) and the pair after it
     watch_after = [{"end_pair": rate_of(r), "next_pair": rate_of(f)} for r, f in after]
+    no_baseline = [{"pair": x, "t1": w[x]["t1"], "phase": w[x]["phase"]} for w in watch_after for x in w
+                   if w[x]["watch_submits_per_s"] is not None and w[x]["quiet_median_per_s"] is None]
 
     fall = {k: sum(r["d"].get(f"fallthrough/{k}") or 0 for r in intervals) for k in WINDOW_REASONS}
     # no rebuild pair: nothing was watched, so no number (all([]) is True: never a zero)
@@ -374,12 +389,30 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
     lists_published = bool(rows) and all(isinstance(_extra(m).get(RESOLVE_LISTS), dict) for m in rows)
     lists_known = lists_published and bool(intervals) and all(r["d"].get("resolve_lists") is not None
                                                                for r in lists_pairs)
-    lists_total = sum(r["d"].get("resolve_lists") or 0 for r in lists_pairs) if lists_known else None
-    lists_by_gvr: dict[str, float] = {}
+    # judged: the LISTs of the rebuild-window reasons (a GVR not servable or not synced during the
+    # build); every other reason is reported, never judged (background LISTs run with or without a
+    # swap). Until #928 publishes a per-GVR swap signal the swapped GVR cannot be singled out.
+    lists_total = None                              # the judged LISTs (below), when known
+    lists_all = sum(r["d"].get("resolve_lists") or 0 for r in lists_pairs) if lists_known else None
+    lists_cells: dict[str, float] = {}
     for r in lists_pairs if lists_known else []:
         for k, v in r["d"].items():
-            if k.startswith("resolve_lists_gvr/") and v:
-                lists_by_gvr[k.split("/", 1)[1]] = lists_by_gvr.get(k.split("/", 1)[1], 0) + v
+            if k.startswith("resolve_lists_cell/") and v:
+                lists_cells[k.split("/", 1)[1]] = lists_cells.get(k.split("/", 1)[1], 0) + v
+    # #928's per-GVR swap signal, when the build publishes it: the claim is keyed on exactly the GVRs whose
+    # `installed` moved in the window, every reason; without it, the rebuild-window reasons on every GVR
+    swaps_published = bool(rows) and all(isinstance(_extra(m).get(SWAPS_BY_GVR), dict) for m in rows)
+    swapped = sorted({k.split("/", 1)[1] for r in lists_pairs for k, v in r["d"].items()
+                      if k.startswith("swaps_installed_gvr/") and v}) if swaps_published else None
+    if swaps_published:
+        lists_judged = {c: n for c, n in lists_cells.items() if c.rpartition("|")[0] in swapped}
+        judged_on = "the swapped GVRs (snowplow_store_swaps_by_gvr installed moved), every reason"
+    else:
+        lists_judged = {c: n for c, n in lists_cells.items() if c.rpartition("|")[2] in WINDOW_REASONS}
+        judged_on = (f"the rebuild-window reasons on every GVR ({SWAPS_BY_GVR} not published: the swapped GVR "
+                     f"cannot be singled out)")
+    if lists_known:
+        lists_total = sum(lists_judged.values())
     refresher_fall = ({k: sum(r["d"].get(f"fallthrough_refresher/{k}") or 0 for r in intervals)
                        for k in WINDOW_REASONS} if lists_known else None)
     heap_in = [h for r in intervals for h in r["heap_inuse_mb"]]
@@ -403,19 +436,29 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
                                                    else f"{FALLTHROUGH} absent in a rebuild pair's samples")})},
         "resolve_collection_lists_during_rebuilds": {
             "value": lists_total,
-            "by_gvr": lists_by_gvr if lists_known else None,
+            "judged_on": judged_on if lists_known else None,
+            "swapped_gvrs": swapped if lists_known else None,
+            "judged_by_gvr_reason": lists_judged if lists_known else None,
+            "all_reasons_total": lists_all,
+            "by_gvr_reason": lists_cells if lists_known else None,
             "claim": CLAIMS[mech].get("resolve_collection_lists_during_rebuilds"),
             "refresher_fallthroughs_during_rebuilds": refresher_fall,
-            "how": (f"Δ {RESOLVE_LISTS} (#988: a resolve's collection LIST on the wire, every reason) over the "
-                    f"rebuild pairs and the pair after each; by GVR. #870 claims 0 for the SWAPPED GVR, which "
-                    f"the bench cannot single out (no per-GVR swap signal): every GVR is listed"),
+            "how": (f"Δ {RESOLVE_LISTS} (#988: a resolve's collection LIST on the wire, by gvr|reason) over "
+                    f"the rebuild pairs and the pair after each. #870 claims 0 for the SWAPPED GVR during and "
+                    f"after the swap: JUDGED on the GVRs whose {SWAPS_BY_GVR} `installed` moved in that window, "
+                    f"every reason; every other GVR is reported, never judged. A build without {SWAPS_BY_GVR} "
+                    f"is judged on the rebuild-window reasons ({' / '.join(WINDOW_REASONS)}) instead"),
             **({} if lists_known else {"missing": ("not published by this build" if not lists_published else
                                                    "no rebuild observed: the claim is untested")})},
         "watch_submits_after_rebuild": {
             "quiet_median_per_s_by_phase": {ph: round(v, 3) for ph, v in sorted(q_med_by_phase.items())},
             "after_each_rebuild": watch_after,
-            "max_over_quiet_median": max((w[x]["over_quiet_median"] for w in watch_after for x in w
-                                          if w[x]["over_quiet_median"] is not None), default=None),
+            # a watched pair with no baseline in its phase withholds the headline: a maximum over the
+            # other pairs would hide the very pair the watch is for
+            "pairs_without_baseline": no_baseline,
+            "max_over_quiet_median": (None if no_baseline else
+                                      max((w[x]["over_quiet_median"] for w in watch_after for x in w
+                                           if w[x]["over_quiet_median"] is not None), default=None)),
             "how": (f"{DIRTY}.submit_source.watch per second in the sample pair each rebuild ends in "
                     f"(build_and_swap: it holds the install, where the swap unmutes) and in the pair after it, "
                     f"against the median of the quiet pairs of the SAME phase (none there: no ratio); 15 s "
@@ -437,15 +480,20 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
     untested = ([f"store rebuilds ({mech}): no rebuild observed in {len(rows)} samples: the watches had nothing "
                  f"to watch" + (f"; the claim of {claim} resolve fall-throughs during rebuilds is untested"
                                 if claim is not None else "")] if not intervals else [])
+    if no_baseline:
+        untested.append(f"store rebuilds ({mech}): watch submits after a rebuild: {len(no_baseline)} watched "
+                        f"pair(s) have no quiet pair in their phase "
+                        f"({', '.join(sorted({n['phase'] for n in no_baseline}))}): no ratio for them, and the "
+                        f"headline is withheld")
     violations = ([f"store rebuilds ({mech}): {total_fall} resolve fall-through(s) to the apiserver during "
                    f"rebuilds ({', '.join(f'{k} {v}' for k, v in fall.items() if v)}); the mechanism claims "
                    f"{claim}"] if claim is not None and fall_known and total_fall > claim else [])
     lclaim = CLAIMS[mech].get("resolve_collection_lists_during_rebuilds")
     if lclaim is not None and lists_known and lists_total > lclaim:
         violations.append(f"store rebuilds ({mech}): {lists_total} resolve collection LIST(s) on the wire during "
-                          f"or right after rebuilds (by GVR: {', '.join(f'{g} {n}' for g, n in sorted(lists_by_gvr.items()))}); "
-                          f"#870 claims {lclaim} for the swapped GVR (the bench cannot single it out: every GVR "
-                          f"is listed)")
+                          f"or right after rebuilds, judged on {judged_on} "
+                          f"({', '.join(f'{c} {n}' for c, n in sorted(lists_judged.items()))}); #870 claims "
+                          f"{lclaim}")
 
     # every phase summed, as the other per-phase reports
     tot = {"seconds": 0.0, "pairs": 0, "rebuild_pairs": 0, "counters": {}}
