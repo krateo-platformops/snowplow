@@ -9,11 +9,14 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // fromSecretAsCallerFn reads a named endpointRef Secret with the caller's
-// credentials. A package var so a hermetic test can observe the identity used.
-var fromSecretAsCallerFn = endpoints.FromSecret
+// credentials, through credhttp.FromSecret (a hardened copy: no client-side
+// limiter, no redirect followed). A package var so a hermetic test can observe
+// the identity used.
+var fromSecretAsCallerFn = credhttp.FromSecret
 
 // resolveOneAsCaller resolves a NAMED endpointRef for a caller-supplied
 // (inline draft) spec. The Secret is read with the CALLER's own rest config,

@@ -56,7 +56,6 @@ import (
 	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/kubeutil"
@@ -240,11 +239,14 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					return
 				}
 
-				// Verbatim upstream call (`use.UserConfig` :50-52)
-				// with the EXACT same arguments. The cache-miss
-				// fallback's observable behaviour MUST be byte-identical
-				// to upstream — gated by TestUserConfig_ByteEquivalence_CacheMiss.
-				ep, ferr = endpoints.FromSecret(context.Background(), sarc, secretName, authnNS)
+				// Upstream call (`use.UserConfig` :50-52) with the EXACT
+				// same arguments, through credhttp.FromSecret: plumbing's
+				// endpoints.FromSecret over a hardened copy of sarc (#920:
+				// no client-side limiter; #723: no redirect followed). The
+				// cache-miss fallback's observable behaviour MUST be
+				// byte-identical to upstream — gated by
+				// TestUserConfig_ByteEquivalence_CacheMiss.
+				ep, ferr = credhttp.FromSecret(context.Background(), sarc, secretName, authnNS)
 				if ferr != nil {
 					// Upstream :54-59 — NotFound → 401, else → 500.
 					// PM load-bearing pin: the IsNotFound distinction

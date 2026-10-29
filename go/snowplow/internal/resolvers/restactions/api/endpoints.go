@@ -12,6 +12,7 @@ import (
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/client-go/rest"
 )
 
@@ -155,7 +156,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	// not per resolver target, and synthesizing a placeholder would
 	// inflate cardinality without diagnostic value.
 	cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
-	ep, err := endpoints.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
+	ep, err := credhttp.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
 		return ep, false, err
 	}

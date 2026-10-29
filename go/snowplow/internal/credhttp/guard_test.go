@@ -9,6 +9,22 @@ package credhttp
 //
 // Exemptions are listed in `allowed` with the reason. Each one must still
 // match something, so an exemption cannot outlive the code it excuses.
+//
+// #920 extends it to the client-side rate limit. Outside this package a
+// *rest.Config may only be copied from one credhttp returned (rest.CopyConfig,
+// *rc), never built from nothing. That is judged by TYPE in
+// ratelimit_920_typed_guard_test.go (no rest.Config by value in any type
+// expression or generic type argument, no &x of a *rest.Config, no reference
+// to a function outside this module that returns one), and here no code
+// writes to, or takes the address of, QPS, Burst or RateLimiter
+// (limiterWrites): those would bring client-go's limiter back. Nothing
+// outside this package imports unsafe or uses //go:linkname (F13): both reach
+// past every typed rule, e.g. writing a limiter into *rest.Request's
+// unexported field. Inside this
+// package, every function that builds a REST client or a *rest.Config must
+// apply noClientRateLimit (TestIssue920_EveryCredhttpBuilderAppliesNoClientRateLimit),
+// and the behavioural test must cover it
+// (TestIssue920_BehaviouralTestCoversEveryCredhttpBuilder).
 
 import (
 	"go/ast"
@@ -53,6 +69,10 @@ func forbidden(pkgPath, name string) bool {
 		return name == "HTTPClientForEndpoint" || name == "Do"
 	case "github.com/krateo-platformops/plumbing/kubeconfig":
 		return name == "NewClientConfig"
+	case "github.com/krateo-platformops/plumbing/endpoints":
+		// #920: FromSecret builds its own REST client from the config it is
+		// given; credhttp.FromSecret hands it a hardened copy.
+		return name == "FromSecret"
 	case "net/http":
 		switch name {
 		case "DefaultClient", "DefaultTransport", "Get", "Head", "Post", "PostForm":
@@ -68,17 +88,62 @@ func forbidden(pkgPath, name string) bool {
 var forConfigRe = regexp.MustCompile(`^New.*ForConfig`)
 
 // httpClientType reports whether e is the NON-pointer type net/http.Client or
-// net/http.Transport, and which.
+// net/http.Transport, and which, as "http.Client" or "http.Transport". (A
+// rest.Config by value is refused by the typed #920 gate, which also sees it
+// inside []T, [N]T, map[K]T, chan T and generic type arguments.)
 func httpClientType(e ast.Expr, imports map[string]string) (string, bool) {
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
 		return "", false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	if !ok || imports[id.Name] != "net/http" || (sel.Sel.Name != "Client" && sel.Sel.Name != "Transport") {
+	if !ok {
 		return "", false
 	}
-	return sel.Sel.Name, true
+	if imports[id.Name] == "net/http" && (sel.Sel.Name == "Client" || sel.Sel.Name == "Transport") {
+		return "http." + sel.Sel.Name, true
+	}
+	return "", false
+}
+
+// limiterField reports whether name is a rest.Config field that sets the
+// client-side rate limit (#920).
+func limiterField(name string) bool {
+	return name == "QPS" || name == "Burst" || name == "RateLimiter"
+}
+
+// limiterWrites is the one #920 predicate for "this code can change a
+// client-side rate limit": every field named QPS, Burst or RateLimiter that n
+// writes to or takes the address of. That is an assignment's left side (=,
+// :=, +=, ...), the operand of ++ or --, and the operand of & (an address
+// lets a later write through the pointer escape every other shape).
+// Parentheses are looked through.
+func limiterWrites(n ast.Node) []*ast.SelectorExpr {
+	var targets []ast.Expr
+	switch x := n.(type) {
+	case *ast.AssignStmt:
+		targets = x.Lhs
+	case *ast.IncDecStmt:
+		targets = []ast.Expr{x.X}
+	case *ast.UnaryExpr:
+		if x.Op == token.AND {
+			targets = []ast.Expr{x.X}
+		}
+	}
+	var out []*ast.SelectorExpr
+	for _, e := range targets {
+		for {
+			p, ok := e.(*ast.ParenExpr)
+			if !ok {
+				break
+			}
+			e = p.X
+		}
+		if sel, ok := e.(*ast.SelectorExpr); ok && limiterField(sel.Sel.Name) {
+			out = append(out, sel)
+		}
+	}
+	return out
 }
 
 // allowed: (module-relative file, enclosing func, reference) → reason.
@@ -94,6 +159,17 @@ type ref struct {
 	pos            token.Position
 }
 
+// explain is the failure text for r: a failure must say why it is one.
+func explain(r ref) string {
+	switch r.what {
+	case "import of unsafe":
+		return "imports unsafe outside internal/credhttp: unsafe can bypass the client-side-limiter and config rules (#920)"
+	case "//go:linkname":
+		return "uses //go:linkname outside internal/credhttp: a linkname can bypass the client-side-limiter and config rules (#920)"
+	}
+	return r.what + " (in " + r.fn + ") builds a client/transport/rest.Config outside internal/credhttp"
+}
+
 func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 	imports := map[string]string{} // local name → path
 	var out []ref
@@ -102,11 +178,26 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 		if im.Name != nil && im.Name.Name == "." && dotImportForbidden(p) {
 			out = append(out, ref{rel, "import", "dot import of " + p, fset.Position(im.Pos())})
 		}
+		// #920 F13: unsafe reaches past every typed rule (a limiter written
+		// into *rest.Request's unexported field through reflect.NewAt and
+		// unsafe.Pointer), so it is refused outright.
+		if p == "unsafe" {
+			out = append(out, ref{rel, "import", "import of unsafe", fset.Position(im.Pos())})
+		}
 		name := p[strings.LastIndex(p, "/")+1:]
 		if im.Name != nil {
 			name = im.Name.Name
 		}
 		imports[name] = p
+	}
+	// #920 F13: //go:linkname binds a local name to another package's
+	// unexported symbol, which reaches past every typed rule the same way.
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if strings.HasPrefix(c.Text, "//go:linkname") {
+				out = append(out, ref{rel, "directive", "//go:linkname", fset.Position(c.Pos())})
+			}
+		}
 	}
 	var fn string
 	var stack []ast.Node
@@ -129,30 +220,36 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 				fn = fd.Name.Name
 			}
 		}
+		// #920: writing to (or taking the address of) QPS, Burst or
+		// RateLimiter puts a client-side limiter back on a config credhttp
+		// cleared.
+		for _, sel := range limiterWrites(n) {
+			out = append(out, ref{rel, fn, "write ." + sel.Sel.Name, fset.Position(sel.Pos())})
+		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
 			// #729: new(http.Client) / new(http.Transport) is a zero-value client.
 			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "new" && len(x.Args) == 1 {
 				if name, ok := httpClientType(x.Args[0], imports); ok {
-					out = append(out, ref{rel, fn, "new(http." + name + ")", fset.Position(x.Pos())})
+					out = append(out, ref{rel, fn, "new(" + name + ")", fset.Position(x.Pos())})
 				}
 			}
 		case *ast.ValueSpec:
 			// #729: `var c http.Client` (no value) is a zero-value client.
 			if name, ok := httpClientType(x.Type, imports); ok && len(x.Values) == 0 {
-				out = append(out, ref{rel, fn, "var http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "var " + name, fset.Position(x.Pos())})
 			}
 		case *ast.Field:
 			// #729: a by-value http.Client/Transport field or parameter is a
 			// zero-value (or copied) client that never passed through credhttp.
 			if name, ok := httpClientType(x.Type, imports); ok {
-				out = append(out, ref{rel, fn, "field http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "field " + name, fset.Position(x.Pos())})
 			}
 		case *ast.TypeSpec:
 			// #729: `type C http.Client` / `type C = http.Client` renames the
 			// type, so new(C), `var c C` and C{} would escape every shape above.
 			if name, ok := httpClientType(x.Type, imports); ok {
-				out = append(out, ref{rel, fn, "type http." + name, fset.Position(x.Pos())})
+				out = append(out, ref{rel, fn, "type " + name, fset.Position(x.Pos())})
 			}
 		case *ast.SelectorExpr:
 			id, ok := x.X.(*ast.Ident)
@@ -164,12 +261,8 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 				out = append(out, ref{rel, fn, p[strings.LastIndex(p, "/")+1:] + "." + x.Sel.Name, fset.Position(x.Pos())})
 			}
 		case *ast.CompositeLit:
-			sel, ok := x.Type.(*ast.SelectorExpr)
+			name, ok := httpClientType(x.Type, imports)
 			if !ok {
-				return true
-			}
-			id, ok := sel.X.(*ast.Ident)
-			if !ok || imports[id.Name] != "net/http" || (sel.Sel.Name != "Client" && sel.Sel.Name != "Transport") {
 				return true
 			}
 			// An http.Client literal handed straight to credhttp.Client is hardened.
@@ -183,7 +276,7 @@ func scanFile(fset *token.FileSet, f *ast.File, rel string) []ref {
 					}
 				}
 			}
-			out = append(out, ref{rel, fn, "http." + sel.Sel.Name + "{}", fset.Position(x.Pos())})
+			out = append(out, ref{rel, fn, name + "{}", fset.Position(x.Pos())})
 		}
 		return true
 	})
@@ -239,7 +332,7 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 		if strings.HasPrefix(rel, "internal/credhttp/") {
 			return nil
 		}
-		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution|parser.ParseComments)
 		if perr != nil {
 			return perr
 		}
@@ -250,7 +343,7 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 				used[k] = true
 				continue
 			}
-			bad = append(bad, r.pos.String()+": "+r.what+" (in "+r.fn+") builds a client/transport/rest.Config outside internal/credhttp")
+			bad = append(bad, r.pos.String()+": "+explain(r))
 		}
 		return nil
 	})
@@ -274,40 +367,64 @@ func TestIssue723_724_NoCredentialedClientBypassesCredhttp(t *testing.T) {
 // The guard must bite on every shape it claims to catch.
 func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 	cases := map[string]string{
-		"dynamic":    `import "k8s.io/client-go/dynamic"; func f() { dynamic.NewForConfig(nil) }`,
-		"aliased":    `import k8sdynamic "k8s.io/client-go/dynamic"; func f() { k8sdynamic.NewForConfigAndClient(nil, nil) }`,
-		"kubernetes": `import "k8s.io/client-go/kubernetes"; func f() { kubernetes.NewForConfig(nil) }`,
-		"typed":      `import authv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"; func f() { authv1.NewForConfig(nil) }`,
-		"discovery":  `import "k8s.io/client-go/discovery"; func f() { discovery.NewDiscoveryClientForConfig(nil) }`,
-		"metadata":   `import "k8s.io/client-go/metadata"; func f() { metadata.NewForConfig(nil) }`,
-		"incluster":  `import "k8s.io/client-go/rest"; var x = rest.InClusterConfig`,
-		"restclient": `import "k8s.io/client-go/rest"; func f() { rest.RESTClientFor(nil) }`,
-		"httpclient": `import "k8s.io/client-go/rest"; func f() { rest.HTTPClientFor(nil) }`,
-		"transport":  `import "k8s.io/client-go/transport"; func f() { transport.New(nil) }`,
-		"plumbing":   `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.HTTPClientForEndpoint(nil, nil) }`,
-		"kubeconfig": `import "github.com/krateo-platformops/plumbing/kubeconfig"; func f() { kubeconfig.NewClientConfig(nil, x) }`,
-		"literal":    `import "net/http"; var c = &http.Client{}`,
-		"transportL": `import "net/http"; var c = &http.Transport{}`,
-		"default":    `import "net/http"; var c = http.DefaultClient`,
-		"defaultRT":  `import "net/http"; var rt = http.DefaultTransport`,
-		"newClient":  `import "net/http"; var c = new(http.Client)`,
-		"newRT":      `import "net/http"; var c = new(http.Transport)`,
-		"zeroVar":    `import "net/http"; func f() { var c http.Client; _ = c }`,
-		"zeroField":  `import "net/http"; type T struct{ c http.Client }`,
-		"aliasedNet": `import nh "net/http"; var c nh.Client`,
-		"zeroParam":  `import "net/http"; func f(c http.Client) {}`,
-		"embedded":   `import "net/http"; type T struct{ http.Client }`,
-		"typeDef":    `import "net/http"; type C http.Client`,
-		"typeAlias":  `import "net/http"; type C = http.Transport`,
-		"apiext":     `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
+		"dynamic":     `import "k8s.io/client-go/dynamic"; func f() { dynamic.NewForConfig(nil) }`,
+		"aliased":     `import k8sdynamic "k8s.io/client-go/dynamic"; func f() { k8sdynamic.NewForConfigAndClient(nil, nil) }`,
+		"kubernetes":  `import "k8s.io/client-go/kubernetes"; func f() { kubernetes.NewForConfig(nil) }`,
+		"typed":       `import authv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"; func f() { authv1.NewForConfig(nil) }`,
+		"discovery":   `import "k8s.io/client-go/discovery"; func f() { discovery.NewDiscoveryClientForConfig(nil) }`,
+		"metadata":    `import "k8s.io/client-go/metadata"; func f() { metadata.NewForConfig(nil) }`,
+		"incluster":   `import "k8s.io/client-go/rest"; var x = rest.InClusterConfig`,
+		"restclient":  `import "k8s.io/client-go/rest"; func f() { rest.RESTClientFor(nil) }`,
+		"httpclient":  `import "k8s.io/client-go/rest"; func f() { rest.HTTPClientFor(nil) }`,
+		"transport":   `import "k8s.io/client-go/transport"; func f() { transport.New(nil) }`,
+		"plumbing":    `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.HTTPClientForEndpoint(nil, nil) }`,
+		"kubeconfig":  `import "github.com/krateo-platformops/plumbing/kubeconfig"; func f() { kubeconfig.NewClientConfig(nil, x) }`,
+		"fromSecret":  `import "github.com/krateo-platformops/plumbing/endpoints"; func f() { endpoints.FromSecret(nil, nil, "s", "n") }`,
+		"fromSecretV": `import "github.com/krateo-platformops/plumbing/endpoints"; var f = endpoints.FromSecret`,
+		"literal":     `import "net/http"; var c = &http.Client{}`,
+		"transportL":  `import "net/http"; var c = &http.Transport{}`,
+		"default":     `import "net/http"; var c = http.DefaultClient`,
+		"defaultRT":   `import "net/http"; var rt = http.DefaultTransport`,
+		"newClient":   `import "net/http"; var c = new(http.Client)`,
+		"newRT":       `import "net/http"; var c = new(http.Transport)`,
+		"zeroVar":     `import "net/http"; func f() { var c http.Client; _ = c }`,
+		"zeroField":   `import "net/http"; type T struct{ c http.Client }`,
+		"aliasedNet":  `import nh "net/http"; var c nh.Client`,
+		"zeroParam":   `import "net/http"; func f(c http.Client) {}`,
+		"embedded":    `import "net/http"; type T struct{ http.Client }`,
+		"typeDef":     `import "net/http"; type C http.Client`,
+		"typeAlias":   `import "net/http"; type C = http.Transport`,
+		"apiext":      `import apiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"; func f() { apiext.NewForConfig(nil) }`,
 		// #735 — a dot import hides every selector; it is refused outright.
 		"dotHTTP":     `import . "net/http"; var c = &Client{}`,
 		"dotClientGo": `import . "k8s.io/client-go/dynamic"; func f() { NewForConfig(nil) }`,
 		"dotPlumbing": `import . "github.com/krateo-platformops/plumbing/http/request"; func f() { HTTPClientForEndpoint(nil, nil) }`,
+		// #920 — a limiter put back. (A rest.Config built from nothing is a
+		// typed case: typedShapeCases below.)
+		"qps":           `func f(rc *x) { rc.QPS = 50 }`,
+		"burst":         `func f(rc *x) { rc.Burst = 100 }`,
+		"rateLimiter":   `func f(rc *x) { rc.RateLimiter = nil }`,
+		"qpsMulti":      `func f(rc *x) { rc.Host, rc.QPS = "h", 50 }`,
+		"qpsCompound":   `func f(rc *x) { rc.QPS += 6 }`,
+		"incQPS":        `func f(rc *x) { rc.QPS++ }`,
+		"decBurst":      `func f(rc *x) { rc.Burst-- }`,
+		"addrOfQPS":     `func f(rc *x) { p := &rc.QPS; *p = 5 }`,
+		"addrOfLimiter": `func f(rc *x) { set(&rc.RateLimiter) }`,
+		"parenQPS":      `func f(rc *x) { (rc.QPS)++ }`,
+		// #920 F13 — U1: write a limiter into *rest.Request's unexported
+		// field; and a linkname to another package's unexported symbol.
+		"unsafeU1": `import ("reflect"; "unsafe"; "k8s.io/client-go/rest"; "k8s.io/client-go/util/flowcontrol")
+func u1(r *rest.Request) {
+	f := reflect.ValueOf(r).Elem().FieldByName("rateLimiter")
+	*(*flowcontrol.RateLimiter)(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Interface().(*flowcontrol.RateLimiter)) = flowcontrol.NewTokenBucketRateLimiter(5, 10)
+}`,
+		"unsafeAliased": `import u "unsafe"; var _ = u.Sizeof(0)`,
+		"linkname":      "import _ \"unsafe\"\n//go:linkname defaultQPS k8s.io/client-go/rest.DefaultQPS\nvar defaultQPS float32",
+		"linknameOnly":  "//go:linkname f runtime.nanotime\nfunc f() int64",
 	}
 	for name, body := range cases {
 		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution)
+		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -327,8 +444,9 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 			t.Errorf("package-level literal after a func: want fn \"\", got %+v", got)
 		}
 	}
-	// And it must NOT flag the hardened forms.
-	ok := `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{}); type T struct{ h *http.Client }; func g(h *http.Client) {}; var p *http.Client`
+	// And it must NOT flag the hardened forms, nor a copy of a config credhttp
+	// returned (#920: a copy keeps the no-limiter setting).
+	ok := `import ("net/http"; "k8s.io/client-go/rest"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{}); type T struct{ h *http.Client; rc *rest.Config }; func g(h *http.Client, rc *rest.Config) { cp := rest.CopyConfig(rc); v := *rc; cp.Host = v.Host }; var p *http.Client`
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", "package p\n"+ok+"\n", parser.SkipObjectResolution)
 	if err != nil {
@@ -337,4 +455,9 @@ func TestIssue723_724_GuardDetectsEveryShape(t *testing.T) {
 	if got := scanFile(fset, f, "x.go"); len(got) != 0 {
 		t.Errorf("hardened literal flagged: %v", got)
 	}
+	// #920 — a *rest.Config built from nothing is judged by TYPE
+	// (ratelimit_920_typed_guard_test.go): a rest.Config by value anywhere in
+	// a type expression or a generic type argument, &x of a *rest.Config, and
+	// any function outside the module that returns one.
+	typedShapeCases(t)
 }

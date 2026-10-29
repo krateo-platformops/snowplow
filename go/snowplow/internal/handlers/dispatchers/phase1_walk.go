@@ -353,25 +353,13 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return saErr
 	}
 
-	// #120: build the roots-read client from an UN-THROTTLED shallow copy of
-	// rc. The shared rc carries client-go's default client-side rate limiter
-	// (QPS 5 / Burst 10) — main.go's rest.InClusterConfig() sets neither QPS
-	// nor RateLimiter, so NewForConfig synthesises the 5/10 token bucket
-	// (client-go rest/config.go:373-382). On a slow-apiserver boot the very
-	// first roots read (the frontend-config ConfigMap Get in
-	// listNavigationRootsFromConfigMap) can lose its tryThrottle Wait to the
-	// startupProbe ctx deadline BEFORE the request is ever sent — no nav
-	// roots, no recursive walk, proactive informer registration starved.
-	// Disabling the limiter (QPS=-1/Burst=0) makes tryThrottleWithInfo return
-	// nil immediately (rest/request.go:667 nil-limiter short-circuit; -1 QPS
-	// leaves RateLimiter nil at config.go:380 `qps > 0`), so the boot-critical
-	// roots path can never deadline on the throttle. Server-side API Priority
-	// & Fairness remains authoritative. This mirrors the SA-client posture
-	// (internal/dynamic/sa_client.go:170-171). rootsReadRESTConfig copies rc
-	// (rest.CopyConfig) before tuning so the shared rc — which also backs the
-	// informer factory, metadata, discovery, config-vars-watch, secrets and
-	// controller-health clients — keeps its throttling untouched.
-	dynCli, dynErr := credhttp.Dynamic(rootsReadRESTConfig(rc))
+	// #120: the boot-critical roots read must never wait on a client-side
+	// rate limiter: on a slow-apiserver boot the frontend-config ConfigMap Get
+	// lost client-go's 5/s token-bucket Wait to the startupProbe deadline before
+	// the request was sent, so no roots were walked. #920: credhttp builds every
+	// client without that limiter, this one included, so server-side Priority &
+	// Fairness is authoritative here as everywhere else.
+	dynCli, dynErr := credhttp.Dynamic(rc)
 	if dynErr != nil {
 		log.Error("phase1.warmup.no_dyn_client",
 			slog.String("subsystem", "cache"),
@@ -1109,44 +1097,6 @@ func rootKey(root *unstructured.Unstructured) string {
 // pathological CR graph that the visited-set somehow fails to dedupe. It
 // is NOT a per-resource policy — it is a uniform recursion-safety bound.
 const phase1MaxWalkDepth = 32
-
-// rootsReadRESTConfig returns a shallow copy of rc with the client-side
-// rate limiter disabled (QPS=-1 / Burst=0), for the boot-critical
-// navigation-roots read only.
-//
-// #120: the shared rc (main.go's rest.InClusterConfig()) has no QPS /
-// RateLimiter set, so k8sdynamic.NewForConfig gives it client-go's default
-// 5-QPS / 10-burst token bucket. On a slow-apiserver boot the roots
-// ConfigMap Get can lose its tryThrottle Wait to the startupProbe ctx
-// deadline before the request is sent — starving the recursive walk and the
-// proactive informer registration it drives. QPS<=0 leaves the copy's
-// RateLimiter nil (client-go rest/config.go:373-382 only builds a bucket
-// when qps > 0), so tryThrottleWithInfo returns nil immediately
-// (rest/request.go:667). Server-side API Priority & Fairness stays
-// authoritative. Mirrors the SA-client posture (internal/dynamic/
-// sa_client.go:170-171).
-//
-// The COPY is load-bearing: the caller passes the SAME rc to the informer
-// factory, metadata / discovery, config-vars-watch, secrets and
-// controller-health clients; mutating rc in place would strip throttling
-// from all of them. rest.CopyConfig duplicates the config by value (QPS and
-// Burst are scalars), so tuning the copy leaves rc untouched.
-//
-// RateLimiter is cleared on the COPY: CopyConfig duplicates RateLimiter by
-// POINTER, and NewForConfig honours a non-nil RateLimiter verbatim — QPS<=0
-// only takes effect when RateLimiter is nil (client-go rest/config.go:370).
-// In production rc.RateLimiter is nil (rest.InClusterConfig leaves it unset,
-// as sa_client.go likewise assumes) so this is a no-op there; clearing it
-// makes the un-throttled posture hold unconditionally even if rc ever
-// carries a pre-built limiter, and keeps the shared rc's limiter untouched
-// (we clear the field on our private copy, not the shared limiter object).
-func rootsReadRESTConfig(rc *rest.Config) *rest.Config {
-	c := rest.CopyConfig(rc)
-	c.QPS = -1
-	c.Burst = 0
-	c.RateLimiter = nil
-	return c
-}
 
 // resolveNavigationRoot resolves one navigation-root CR through the
 // STANDARD widget resolver under the snowplow SA identity, then

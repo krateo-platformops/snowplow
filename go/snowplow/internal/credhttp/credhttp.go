@@ -38,6 +38,19 @@
 //
 // The structural guard (guard_test.go) fails CI when any non-test file in the
 // module builds a client, a transport or a *rest.Config by any other route.
+//
+// #920 — NO CLIENT-SIDE RATE LIMIT. client-go gives every client whose config
+// leaves QPS at 0 and RateLimiter nil its own token bucket of 5 requests/s,
+// burst 10 (rest.DefaultQPS / rest.DefaultBurst). Nobody chose that cap, and it
+// silently paced every long-lived client snowplow built (the metadata client's
+// store-verification re-check ran at exactly 5 reads/s in bench run 16). The
+// apiserver's own Priority & Fairness is the authority on how fast snowplow may
+// read, so every *rest.Config that leaves this package, and every client built
+// here, carries no client-side limiter: noClientRateLimit is the one place that
+// says so. Harden applies it to the configs (so a client built from one by code
+// outside this package, such as plumbing's endpoints.FromSecret, inherits it),
+// and every client constructor applies it to its own copy (so a client built
+// here has no limiter whatever config it was handed).
 package credhttp
 
 import (
@@ -99,14 +112,29 @@ func (t *refuseRedirectHops) RoundTrip(req *http.Request) (*http.Response, error
 // CloseIdleConnectionsFor).
 func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.next }
 
-// Harden installs RefuseRedirectHops on rc (in place) and returns it. Every
-// client later built from rc or from a rest.CopyConfig of it inherits the
-// layer. nil-safe.
+// Harden installs RefuseRedirectHops on rc and removes its client-side rate
+// limit (#920), in place, and returns it. Every client later built from rc or
+// from a rest.CopyConfig of it inherits both. nil-safe.
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
 		rc.Wrap(RefuseRedirectHops)
+		noClientRateLimit(rc)
 	}
 	return rc
+}
+
+// noClientRateLimit removes client-go's client-side rate limit from rc, in
+// place (#920). A negative QPS with a nil RateLimiter is client-go's own "no
+// limiter" setting (rest.Config.QPS: "Setting this to a negative value will
+// disable client-side ratelimiting"): rest.RESTClientForConfigAndClient builds
+// a token bucket only when RateLimiter is nil and QPS > 0, and a QPS of 0 means
+// rest.DefaultQPS (5/s). RateLimiter is cleared as well because a non-nil one
+// is used verbatim whatever QPS says. Burst is read only by a bucket, so it is
+// zeroed to say that no bucket exists. Idempotent.
+func noClientRateLimit(rc *rest.Config) {
+	rc.QPS = -1
+	rc.Burst = 0
+	rc.RateLimiter = nil
 }
 
 // Client applies both layers to c (in place) and returns it.
@@ -116,9 +144,14 @@ func Client(c *http.Client) *http.Client {
 	return c
 }
 
+// inClusterConfig is the source InClusterConfig hardens. rest.InClusterConfig
+// reads fixed service-account paths, so this package's own tests replace it to
+// build the in-cluster config against a test server.
+var inClusterConfig = rest.InClusterConfig
+
 // InClusterConfig is rest.InClusterConfig, hardened.
 func InClusterConfig() (*rest.Config, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := inClusterConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +168,19 @@ func NewClientConfig(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, 
 	return Harden(rc), nil
 }
 
+// FromSecret is plumbing's endpoints.FromSecret over a hardened copy of rc.
+// FromSecret builds its own REST client from the config it is given (one per
+// call), so this is where that client gets both #723's redirect refusal and
+// #920's absence of a client-side rate limit, whatever config the caller holds.
+// The caller's rc is not changed. Errors are plumbing's, unwrapped, so callers
+// keep telling a NotFound from any other failure.
+func FromSecret(ctx context.Context, rc *rest.Config, name, namespace string) (endpoints.Endpoint, error) {
+	if rc != nil {
+		rc = Harden(rest.CopyConfig(rc))
+	}
+	return endpoints.FromSecret(ctx, rc, name, namespace)
+}
+
 // HTTPClientFor is rest.HTTPClientFor with both layers applied.
 func HTTPClientFor(rc *rest.Config) (*http.Client, error) {
 	hc, err := rest.HTTPClientFor(rc)
@@ -144,9 +190,11 @@ func HTTPClientFor(rc *rest.Config) (*http.Client, error) {
 	return Client(hc), nil
 }
 
-// Dynamic is dynamic.NewForConfig through HTTPClientFor.
+// Dynamic is dynamic.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Dynamic(rc *rest.Config) (*dynamic.DynamicClient, error) {
 	cfg := dynamic.ConfigFor(rc)
+	noClientRateLimit(cfg)
 	hc, err := HTTPClientFor(cfg)
 	if err != nil {
 		return nil, err
@@ -154,9 +202,11 @@ func Dynamic(rc *rest.Config) (*dynamic.DynamicClient, error) {
 	return dynamic.NewForConfigAndClient(cfg, hc)
 }
 
-// Metadata is metadata.NewForConfig through HTTPClientFor.
+// Metadata is metadata.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Metadata(rc *rest.Config) (metadata.Interface, error) {
 	cfg := metadata.ConfigFor(rc)
+	noClientRateLimit(cfg)
 	hc, err := HTTPClientFor(cfg)
 	if err != nil {
 		return nil, err
@@ -164,9 +214,11 @@ func Metadata(rc *rest.Config) (metadata.Interface, error) {
 	return metadata.NewForConfigAndClient(cfg, hc)
 }
 
-// Kubernetes is kubernetes.NewForConfig through HTTPClientFor.
+// Kubernetes is kubernetes.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Kubernetes(rc *rest.Config) (*kubernetes.Clientset, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
@@ -178,9 +230,10 @@ func Kubernetes(rc *rest.Config) (*kubernetes.Clientset, error) {
 }
 
 // APIExtensions is the apiextensions clientset NewForConfig through
-// HTTPClientFor.
+// HTTPClientFor, with no client-side rate limit (#920).
 func APIExtensions(rc *rest.Config) (*apiextensionsclientset.Clientset, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
@@ -195,9 +248,11 @@ func APIExtensions(rc *rest.Config) (*apiextensionsclientset.Clientset, error) {
 // NewDiscoveryClientForConfig applies before building its http.Client.
 const discoveryDefaultTimeout = 32 * time.Second
 
-// Discovery is discovery.NewDiscoveryClientForConfig through HTTPClientFor.
+// Discovery is discovery.NewDiscoveryClientForConfig through HTTPClientFor,
+// with no client-side rate limit (#920).
 func Discovery(rc *rest.Config) (*discovery.DiscoveryClient, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.Timeout == 0 {
 		cfg.Timeout = discoveryDefaultTimeout
 	}
@@ -231,11 +286,14 @@ func HeldCredential(ctx context.Context) bool {
 	return v
 }
 
-// RESTClient is rest.RESTClientFor through HTTPClientFor.
+// RESTClient is rest.RESTClientFor through HTTPClientFor, with no client-side
+// rate limit (#920).
 func RESTClient(rc *rest.Config) (*rest.RESTClient, error) {
-	hc, err := HTTPClientFor(rc)
+	cfg := *rc
+	noClientRateLimit(&cfg)
+	hc, err := HTTPClientFor(&cfg)
 	if err != nil {
 		return nil, err
 	}
-	return rest.RESTClientForConfigAndClient(rc, hc)
+	return rest.RESTClientForConfigAndClient(&cfg, hc)
 }

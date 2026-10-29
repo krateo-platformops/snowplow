@@ -29,9 +29,12 @@
 package dynamic
 
 import (
+	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/client-go/rest"
 )
 
@@ -177,115 +180,26 @@ func TestServiceAccountRESTConfig_ConcurrentMemoisation(t *testing.T) {
 	}
 }
 
-// TestServiceAccountRESTConfig_DisablesRateLimit asserts the 0.30.168
-// contract: the returned *rest.Config MUST carry QPS<0 and Burst==0 so
-// that client-go's RESTClientFor (config.go:380) leaves rateLimiter nil
-// and request.go:667 short-circuits the throttle Wait. Falsifier for the
-// 2x parallelism ceiling re-diagnosis
-// (docs/parallelism-2x-ceiling-diagnosis-2026-05-22.md §6, §7 F1).
+// TestServiceAccountRESTConfig_DisablesRateLimit pins the 0.30.168 contract
+// (no client-side rate limit on the SA config, so server-side Priority &
+// Fairness is authoritative; docs/parallelism-2x-ceiling-diagnosis-2026-05-22.md
+// §6, §7 F1) at its #920 home. Before #920 this function set rc.QPS=-1 itself;
+// it now takes the posture from credhttp.InClusterConfig, which applies it to
+// every config snowplow builds, and credhttp's own tests prove that every client
+// built from that config has no limiter
+// (TestIssue920_EveryClientFromEveryConstructorHasNoClientRateLimit).
 //
-// PRIOR ART (TRACED file:line, verified against the vendored client-go
-// at /Users/diegobraga/go/pkg/mod/k8s.io/client-go@v0.33.0):
-//   - rest.InClusterConfig() returns a Config{} without QPS/Burst set
-//     (rest/config.go:543-577); zero-value QPS/Burst trigger the
-//     defaults below.
-//   - Const DefaultQPS=5.0, DefaultBurst=10 at rest/config.go:47-48.
-//   - QPS field doc at rest/config.go:117-122: "Setting this to a
-//     negative value will disable client-side ratelimiting unless
-//     `Ratelimiter` is also set." This is the documented contract the
-//     0.30.168 fix relies on.
-//   - RESTClientFor gate at rest/config.go:380 (`if qps > 0` — FALSE
-//     when qps==-1, so rateLimiter stays nil).
-//   - Request.tryThrottleWithInfo nil-short-circuit at
-//     rest/request.go:666-667 (`if r.rateLimiter == nil { return nil }`).
-//
-// PRE-FIX (un-modified sa_client.go:158-172): rest.InClusterConfig()
-// returns QPS=0 / Burst=0. The cached singleton therefore carries those
-// zero values verbatim; downstream client-go collapses them to
-// DefaultQPS=5.0 / DefaultBurst=10 and installs a shared
-// flowcontrol.tokenBucketPassiveRateLimiter at the memoised dynamic
-// client (internal_dispatch.go:115-127). Under 16-call dashboard load
-// this serialises the tail of /call dispatches at 200ms intervals —
-// the empirically observed 1.95x parallelism factor (anchor 4.3x).
-//
-// POST-FIX: ServiceAccountRESTConfig sets rc.QPS=-1 and rc.Burst=0 on
-// the freshly-built config before caching, so every consumer of the
-// singleton (Phase-1 walk, refresher, per-request /call dispatch) sees
-// the rate-limit-disabled config and the shared dynamic client's
-// RESTClient has rateLimiter==nil. This assertion is the load-bearing
-// pin against re-introducing the regression.
-//
-// TEST MECHANICS: rest.InClusterConfig reads HARDCODED paths
-// /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt}
-// (client-go rest/config.go:544-547) and is NOT pointable from unit
-// tests without a seam. The test injects via inClusterConfigFn — the
-// package-private indirection at sa_client.go (init expr to
-// rest.InClusterConfig). The test substitutes a synthetic builder that
-// returns the EXACT shape rest.InClusterConfig produces pre-fix
-// (Config{Host, BearerToken, BearerTokenFile, TLSClientConfig.CAFile}
-// with QPS=0/Burst=0), exercising the un-modified-code construction
-// site verbatim. The test then asserts the returned config carries
-// QPS<0/Burst==0 — which only holds if the 2 LOC fix at
-// sa_client.go:170-171 ran.
-//
-// PRE-FIX FAIL: without the 2 LOC, the synthetic config flows through
-// the function unchanged. rc.QPS==0 → assertion FAILS.
-//
-// POST-FIX PASS: the 2 LOC rewrite QPS=-1/Burst=0 on the freshly-built
-// config before caching. rc.QPS==-1 → assertion PASSES.
+// What remains to prove HERE is the wiring: the singleton is built by
+// credhttp.InClusterConfig and by nothing else. A seam pointed at another
+// builder (for example a raw rest.InClusterConfig, whose QPS of 0 means 5/s)
+// would bring the limit back, and this test goes RED.
 func TestServiceAccountRESTConfig_DisablesRateLimit(t *testing.T) {
-	resetSARestConfigForTest()
-	t.Cleanup(resetSARestConfigForTest)
-
-	// Swap the inClusterConfigFn seam to a synthetic builder that mimics
-	// rest.InClusterConfig's return shape exactly (per client-go
-	// rest/config.go:570-576): Host populated, BearerToken populated,
-	// QPS+Burst left at their zero values. This is the pre-fix shape
-	// the production path caches into saRestConfigInstance.
-	origFn := inClusterConfigFn
-	inClusterConfigFn = func() (*rest.Config, error) {
-		return &rest.Config{
-			Host:            "https://10.0.0.1:443",
-			BearerToken:     "synthetic-sa-token",
-			BearerTokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
-			// QPS and Burst intentionally zero — the pre-fix shape.
-		}, nil
-	}
-	t.Cleanup(func() { inClusterConfigFn = origFn })
-
-	rc, err := ServiceAccountRESTConfig()
-	if err != nil {
-		t.Fatalf("ServiceAccountRESTConfig with synthetic inClusterConfigFn failed: %v", err)
-	}
-	if rc == nil {
-		t.Fatalf("ServiceAccountRESTConfig returned nil *rest.Config on success — contract broken")
-	}
-
-	// THE LOAD-BEARING ASSERTION: QPS must be negative. Per
-	// rest/config.go:120 doc "Setting this to a negative value will
-	// disable client-side ratelimiting", and the gate at
-	// rest/config.go:380 (`if qps > 0`) leaves rateLimiter nil.
-	if rc.QPS >= 0 {
-		t.Fatalf("rc.QPS=%v: MUST be negative to disable client-side rate limiter "+
-			"(per client-go rest/config.go:117-122 contract). Pre-fix value is 0 "+
-			"which collapses to DefaultQPS=5.0 at rest/config.go:374, installing a "+
-			"shared 5-QPS / 10-burst token bucket on the memoised dynamic client and "+
-			"serialising the /call dispatch tail (the 1.95x parallelism regression "+
-			"documented in docs/parallelism-2x-ceiling-diagnosis-2026-05-22.md §6).",
-			rc.QPS)
-	}
-
-	// Burst should be 0 (architect §7 F1 spec). Burst is only consulted
-	// if qps>0 (rest/config.go:380-381), so this is a defence-in-depth
-	// assertion — if someone removes the QPS=-1 line, this still catches
-	// the regression because Burst=0 alone would collapse to DefaultBurst=10
-	// behind the qps>0 gate.
-	if rc.Burst != 0 {
-		t.Fatalf("rc.Burst=%d: MUST be 0 per architect §7 F1 spec "+
-			"(docs/parallelism-2x-ceiling-diagnosis-2026-05-22.md). Pre-fix value "+
-			"would collapse to DefaultBurst=10 at rest/config.go:378 if QPS were "+
-			"ever >0; setting Burst=0 alongside QPS=-1 keeps the contract uniform.",
-			rc.Burst)
+	got := reflect.ValueOf(inClusterConfigFn).Pointer()
+	want := reflect.ValueOf(credhttp.InClusterConfig).Pointer()
+	if got != want {
+		t.Fatalf("the SA singleton is not built by credhttp.InClusterConfig (seam points at %s); "+
+			"only that constructor removes client-go's 5/s client-side limit (#920)",
+			runtime.FuncForPC(got).Name())
 	}
 }
 
