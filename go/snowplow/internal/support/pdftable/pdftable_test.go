@@ -2,9 +2,11 @@ package pdftable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -372,14 +374,128 @@ func TestRenderLongLabelsAlwaysRender(t *testing.T) {
 						t.Fatalf("page %d column %d: label drawn as %q, want every character of %q", i+1, col, trim(got.String()), trim(c.header[col]))
 					}
 				}
-				if share := (top - bottom) / (bottomY - margin); share > headerShare {
-					t.Errorf("page %d: the header takes %.0f%% of the table area, more than %.0f%%", i+1, share*100, headerShare*100)
+				// The contract is half the table area: a literal, not the
+				// constant under test.
+				if share := (top - bottom) / (bottomY - margin); share > 0.5 {
+					t.Errorf("page %d: the header takes %.0f%% of the table area, more than half", i+1, share*100)
 				}
 				if i < len(d.Pages)-1 && len(rowsHere) < 15 {
 					t.Errorf("page %d holds %d rows: the header left too little room", i+1, len(rowsHere))
 				}
 			}
 		})
+	}
+}
+
+// bandLayout is a layout positioned for one band of columns of the given
+// widths, as run sets it up.
+func bandLayout(t *testing.T, widths []float64) *layout {
+	t.Helper()
+	reg, bold, err := loadFonts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &layout{reg: newFace(reg, "F1"), bold: newFace(bold, "F2")}
+	x := margin
+	l.colX = append(l.colX, x)
+	for _, w := range widths {
+		x += w
+		l.colX = append(l.colX, x)
+	}
+	return l
+}
+
+// TestHeaderSizeIsTheLargestThatFits: a header that does not fit at the
+// normal size is set at the LARGEST size whose wrapped height fits in half
+// the table area — not merely some size that fits.
+func TestHeaderSizeIsTheLargestThatFits(t *testing.T) {
+	half := (bottomY - margin) * 0.5 // the contract, literally
+	narrow := make([]float64, 32)
+	labels := make([]string, 32)
+	for c := range narrow {
+		narrow[c] = availW / 32
+		labels[c] = fmt.Sprintf("spec.c%02d.", c) + strings.Repeat("segment.", 14)[:110]
+	}
+	cases := []struct {
+		name   string
+		widths []float64
+		header []string
+	}{
+		{"32 narrow columns of 120-character paths", narrow, labels},
+		{"one 20000-character label", []float64{availW}, []string{strings.Repeat("Lorem ipsum dolor sit amet ", 741)[:20000]}},
+		{"20000 lines", []float64{availW}, []string{strings.Repeat("x\n", 20000) + "x"}},
+	}
+	for _, c := range cases {
+		l := bandLayout(t, c.widths)
+		s := l.headerSize(c.header)
+		if s <= 0 || s >= headSize {
+			t.Fatalf("%s: size %v, want a shrunk size in (0, %v)", c.name, s, headSize)
+		}
+		if h := l.headerHeightAt(c.header, s); h > half {
+			t.Errorf("%s: at %v pt the header is %.2f pt tall, more than half the table area (%.2f)", c.name, s, h, half)
+		}
+		// One step above the chosen size (well above the bisection's
+		// headSize/2^24 resolution) must no longer fit.
+		if up := s * 1.0001; l.headerHeightAt(c.header, up) <= half {
+			t.Errorf("%s: %v pt fits too, so %v pt is not the largest size that fits", c.name, up, s)
+		}
+	}
+}
+
+// TestBodyRowFailsWhenAFreshPageFitsNoRow: should the header ever leave a
+// fresh page no room for one row line (the header budget broken), the
+// layout returns an error instead of opening page after page forever.
+func TestBodyRowFailsWhenAFreshPageFitsNoRow(t *testing.T) {
+	l := bandLayout(t, []float64{availW})
+	l.hs = headSize
+	l.hlines = [][]string{make([]string, 1000)} // a header taller than the page
+	l.newPage()
+	l.tableStart("")
+	done := make(chan error, 1)
+	go func() { done <- l.bodyRow([]string{"a"}, "") }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errNoRoomForRows) {
+			t.Fatalf("bodyRow = %v, want errNoRoomForRows", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("bodyRow did not return: the layout pages forever")
+	}
+}
+
+// TestRenderTinyHeaderSizeIsWrittenPositive: a header shrunk far below
+// legibility (20,000 and 60,000 line breaks in one label) is still written
+// with a positive size — never "0 Tf" — and every label character is drawn.
+func TestRenderTinyHeaderSizeIsWrittenPositive(t *testing.T) {
+	sizeRe := regexp.MustCompile(`/F2 ([0-9.]+) Tf`)
+	for _, lines := range []int{20000, 60000} { // 60000 sets it below 0.005 pt
+		label := strings.Repeat("x\n", lines-1) + "x"
+		d := render(t, Document{Created: created, Header: []string{label}, Rows: [][]string{{"1"}}})
+		var sizes []float64
+		for _, st := range d.Streams {
+			if st.IsFontProgram() {
+				continue
+			}
+			for _, m := range sizeRe.FindAllSubmatch(st.Data, -1) {
+				v, err := strconv.ParseFloat(string(m[1]), 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sizes = append(sizes, v)
+			}
+		}
+		if len(sizes) == 0 {
+			t.Fatalf("%d lines: no header text drawn", lines)
+		}
+		for _, v := range sizes {
+			if v <= 0 {
+				t.Fatalf("%d lines: header written at %v pt; a positive size must never print as 0", lines, v)
+			}
+		}
+		if got := strings.Count(d.Pages[0].Text(), "x"); got != lines {
+			t.Errorf("%d lines: %d label characters drawn, want %d", lines, got, lines)
+		}
+		t.Logf("%d lines: header at %v pt", lines, sizes[0])
 	}
 }
 

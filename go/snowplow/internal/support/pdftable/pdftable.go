@@ -15,6 +15,7 @@ package pdftable
 import (
 	"bytes"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -67,6 +68,12 @@ const (
 	// to rows.
 	headerShare = 0.5
 )
+
+// errNoRoomForRows reports a broken layout invariant: a fresh page, its
+// header drawn, fits no row line. headerSize keeps the header within
+// headerShare of the table area, so this never happens; Render fails
+// rather than paging forever if it ever did.
+var errNoRoomForRows = errors.New("pdftable: layout invariant broken: a fresh page fits no row under the header")
 
 // Render lays the document out and returns the complete PDF.
 func Render(doc Document) (*PDF, error) {
@@ -384,6 +391,12 @@ func (l *layout) bodyRow(row []string, caption string) error {
 	lh := bodySize * leading
 	for done := 0; done < n; {
 		fit := int((bottomY - l.y - 2*padY) / lh)
+		if fit < 1 && l.rowsOn == 0 {
+			// A fresh page, its header drawn, fits no row line: a new page
+			// would be the same. The header budget (headerShare) rules
+			// this out; should it ever be broken, fail instead of looping.
+			return errNoRoomForRows
+		}
 		if fit < n-done && l.rowsOn > 0 || fit < 1 {
 			if err := l.finishPage(); err != nil {
 				return err
@@ -440,7 +453,8 @@ func (l *layout) textInBT(f *face, size, x, top float64, s string) {
 	l.cur.WriteByte('/')
 	l.cur.WriteString(f.res)
 	l.cur.WriteByte(' ')
-	l.num(size)
+	l.scratch = appendSize(l.scratch[:0], size)
+	l.cur.Write(l.scratch)
 	l.cur.WriteString(" Tf 1 0 0 1 ")
 	l.num(x)
 	l.cur.WriteByte(' ')
@@ -470,8 +484,22 @@ func (l *layout) num(v float64) {
 // num formats a coordinate with at most two decimals.
 func num(v float64) string { return string(appendNum(nil, v)) }
 
-func appendNum(b []byte, v float64) []byte {
-	b = strconv.AppendFloat(b, v, 'f', 2, 64)
+func appendNum(b []byte, v float64) []byte { return appendFixed(b, v, 2) }
+
+// appendSize formats a font size with four significant digits, so a
+// positive size (a header set very small to fit) never prints as 0.
+func appendSize(b []byte, size float64) []byte {
+	decimals := 2
+	if size > 0 {
+		decimals = max(decimals, 3-int(math.Floor(math.Log10(size))))
+	}
+	return appendFixed(b, size, decimals)
+}
+
+// appendFixed formats v with the given decimals, trailing zeros trimmed
+// (PDF numbers take no exponent).
+func appendFixed(b []byte, v float64, decimals int) []byte {
+	b = strconv.AppendFloat(b, v, 'f', decimals, 64)
 	for b[len(b)-1] == '0' {
 		b = b[:len(b)-1]
 	}

@@ -323,6 +323,10 @@ func TestExport970_SameRowsAsCSV(t *testing.T) {
 		{"jq path + fields", `{"status":{"svc":[{"n":"a","m":{"x":1}},{"n":"b","m":{"x":2.5}}]}}`, "path=.status.svc&fields=n,m.x"},
 		{"auto-detect widgetData", `{"status":{"widgetData":{"rows":[{"k":"v1","t":true},{"k":"v2","t":false}]}}}`, ""},
 		{"auto-detect items, nested", `{"items":[{"a":{"b":{"c":"deep"}},"arr":[1,2],"nul":null}]}`, ""},
+		// Ten sparse keys, none in every row and none in sorted order: an
+		// unsorted pdf column order cannot match csv's by chance.
+		{"auto-detect, 10 sparse keys", `{"items":[{"kj":"1","kb":"2","kh":"3","kd":"4","kf":"5"},` +
+			`{"ka":"6","ki":"7","kc":"8","kg":"9","ke":"10"},{"kj":"11","ka":"12","ke":"13"}]}`, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -708,8 +712,16 @@ func TestExport970_SendFailureIsReported(t *testing.T) {
 
 // TestExport970_LongColumnNamesRender — the header never refuses a table:
 // 32 columns whose auto-detected dot-paths are 120 characters long (no
-// labels) render as a 200 PDF with every column's name in the header.
+// labels), and one 20,000-character label, render as 200 PDFs.
 func TestExport970_LongColumnNamesRender(t *testing.T) {
+	t.Run("one 20000-character label", func(t *testing.T) {
+		var queries []url.Values
+		label := strings.Repeat("Lorem ipsum dolor sit amet ", 741)[:20000]
+		rec, _ := exportAs(t, recordingCall(itemsEnvelope(3), &queries), "/export?resource=restactions&name=demo&format=pdf&fields=id&header="+url.QueryEscape(label))
+		if !strings.Contains(parsePDF(t, rec).Pages[0].Text(), "row-00002") {
+			t.Errorf("the rows under a 20,000-character label are missing")
+		}
+	})
 	keys := make([]string, 32)
 	row := map[string]any{}
 	for c := range keys {

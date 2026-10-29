@@ -330,10 +330,10 @@ func servePDF(wri http.ResponseWriter, req *http.Request, table *pdfCells, label
 
 // pdfCells collects a pdf export's rows as cell text, page by page, so each
 // fetched page's decoded rows can be dropped once converted. The columns
-// are those of csv (flattenRows): the explicit fields when given, else the
-// sorted union of the flattened keys, which is known only after the last
-// page; until then each row keeps its (column, text) pairs, the column
-// names shared.
+// are those of csv and json (exportColumns): the explicit fields when
+// given, else the sorted union of the flattened keys, which is known only
+// after the last page; until then each row keeps its (column, text) pairs,
+// the column names shared.
 type pdfCells struct {
 	fields []string
 	cells  [][]string // with fields: one cell per field
@@ -383,11 +383,7 @@ func (t *pdfCells) table() (cols []string, cells [][]string) {
 		t.cells = nil
 		return cols, cells
 	}
-	cols = make([]string, 0, len(t.cols))
-	for k := range t.cols {
-		cols = append(cols, k)
-	}
-	sort.Strings(cols)
+	cols = exportColumns(nil, t.cols)
 	index := make(map[string]int, len(cols))
 	for i, c := range cols {
 		index[c] = i
@@ -639,15 +635,21 @@ func flattenRows(rows []any, fields []string) (cols []string, flat []map[string]
 		flat = append(flat, fr)
 	}
 
-	cols = fields
-	if len(cols) == 0 {
-		cols = make([]string, 0, len(colSet))
-		for k := range colSet {
-			cols = append(cols, k)
-		}
-		sort.Strings(cols)
+	return exportColumns(fields, colSet), flat
+}
+
+// exportColumns is the column set and order of every format: the explicit
+// fields when given, else the sorted union of the flattened keys.
+func exportColumns[V any](fields []string, keys map[string]V) []string {
+	if len(fields) > 0 {
+		return fields
 	}
-	return cols, flat
+	cols := make([]string, 0, len(keys))
+	for k := range keys {
+		cols = append(cols, k)
+	}
+	sort.Strings(cols)
+	return cols
 }
 
 // writeCSV flattens each row (nested maps become dot-path columns,

@@ -71,7 +71,7 @@ func (l *layout) assemble(doc Document) (*PDF, error) {
 		var c bytes.Buffer
 		label := fmt.Sprintf("Page %d of %d", i+1, n)
 		x := pageW - margin - l.reg.width(label, footSize)
-		fmt.Fprintf(&c, "BT /%s %s Tf 1 0 0 1 %s %s Tm ", l.reg.res, num(footSize), num(x), num(margin))
+		fmt.Fprintf(&c, "BT /%s %s Tf 1 0 0 1 %s %s Tm ", l.reg.res, appendSize(nil, footSize), num(x), num(margin))
 		l.reg.encode(&c, label)
 		c.WriteString(" Tj ET\n")
 		footers[i] = c.Bytes()
