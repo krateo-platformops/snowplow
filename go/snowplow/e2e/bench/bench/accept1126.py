@@ -748,12 +748,15 @@ def wait_hook(run_dir: Path, name: str, run_id: str, not_before: str,
 
 @dataclass
 class Row:
-    """One assertion. `check` takes the delta dict and returns (ok, actual)."""
+    """One assertion. `check` takes the delta dict and returns (ok, actual).
+    `gates` False: reported with its result and `why`, never failing the stage."""
     rid: str
     what: str
     key: str | None
     expect: str
     check: Callable[[dict], tuple[bool, Any]]
+    gates: bool = True
+    why: str | None = None
 
 
 def _eq(key: str, want: int) -> Callable[[dict], tuple[bool, Any]]:
@@ -852,6 +855,17 @@ def crd_rows(mech: str, changed: int = 0) -> list[Row]:
     return CRD_ROWS[mech](changed)
 
 
+#: why the full widen's B3 is report only (#987 review F3): #928's deliveries
+#: and M leave out a key a LIVE event delivered first, and a CRD update ends the
+#: live watches, so the live informer may re-list and deliver the defaulted
+#: objects itself; #928 publishes no count of those. With changed == 0 (B1) a
+#: re-list delivers identical bytes and B3 stays exact.
+B3_LIVE_FIRST = ("a CRD update ends the live watches, so the live informer may re-list and deliver the "
+                 "changed objects before the swap; #928's deliveries and M leave those out and it publishes no "
+                 "count of them, so B3 cannot be exact against the changed objects until a cluster run "
+                 "shows the live copy does not re-list")
+
+
 def _crd_rows_relist(changed: int = 0) -> list[Row]:
     """The relist, its 1.12.5 re-fire and its 1.12.6 bridge (to 1.12.59)."""
     C = K_CRD
@@ -915,7 +929,8 @@ def _crd_rows_swap(changed: int = 0) -> list[Row]:
             f"{S}.store_swaps_total", ">=1", _ge(f"{S}.store_swaps_total", 1)),
         Row("B3", f"the swap delivered exactly the {changed} object(s) whose served bytes the widen changed",
             deliv, f"== {changed}, {mkeys} == {changed}, and no divergence build in the window",
-            _all(_eq(deliv, changed), _eq(mkeys, changed), _sum_eq(div_builds, 0))),
+            _all(_eq(deliv, changed), _eq(mkeys, changed), _sum_eq(div_builds, 0)),
+            gates=changed == 0, why=None if changed == 0 else B3_LIVE_FIRST),
         Row("B4", "THE FALSIFIER: no whole-type mark at the swap, and the build's window ended",
             f"{LI}.unanchors[type_event]", f"0, and {open_keys} = 0",
             _all(_eq(f"{LI}.unanchors[type_event]", 0), _eq(open_keys, 0))),
@@ -976,10 +991,12 @@ def evaluate(rows: list[Row], d: dict) -> tuple[bool, list[dict]]:
             ok, actual = r.check(d)
         except Exception as e:                      # a malformed delta
             ok, actual = False, f"<error: {e}>"
-        ok_all = ok_all and ok
+        if r.gates:
+            ok_all = ok_all and ok
         results.append({
             "id": r.rid, "assertion": r.what, "key": r.key,
             "expected": r.expect, "actual": actual, "passed": bool(ok),
+            **({} if r.gates else {"report_only": True, "why": r.why}),
         })
     return ok_all, results
 
@@ -1699,6 +1716,8 @@ def widen_changed_objects(specs: list[dict], default: str | None) -> int:
 
 
 def _cr_manifest(group: str, kind: str, name: str) -> str:
+    """A stage CR, its spec rendered from CR_SPEC: widen_changed_objects counts
+    what the stage applies, never a restated literal."""
     return (
         f"apiVersion: {group}/v1alpha1\n"
         f"kind: {kind}\n"
@@ -1706,7 +1725,7 @@ def _cr_manifest(group: str, kind: str, name: str) -> str:
         f"  name: {name}\n"
         f"  namespace: {NS}\n"
         "spec:\n"
-        "  note: s6 relist probe\n"
+        + "".join(f"  {k}: {v}\n" for k, v in CR_SPEC.items())
     )
 
 
@@ -1871,6 +1890,8 @@ def _crd_widen_stage(ctx: dict, *, crd_name: str, crs: int, default: str | None)
             "approved": True,
             "mechanism": mech,
             "memory_report_only": memory_during(mem),
+            "settle": (f"{SETTLE_SECONDS} /debug/vars reads, one a second (heap / GC); the apiserver workload is "
+                       f"B1's as before; a failed read during the settle ends the stage"),
             "counters_before": before,
             "counters_after": after,
             "delta": d,
@@ -1936,6 +1957,31 @@ STAGES: list[tuple[str, Callable[[dict], dict], str]] = [
 ]
 
 
+def stage_list(*, enable_crd_relist: bool = False, enable_crd_full_widen: bool = False) -> list:
+    """The stages one invocation runs: S6's, then each gated CRD stage only
+    behind its own flag."""
+    stages = list(STAGES)
+    if enable_crd_relist:
+        stages.append((
+            "B1_crd_relist", stage_crd_relist,
+            "Read by the mechanism the build publishes (#969). relist (to "
+            "1.12.59): relist_bridge_timeout_total > 0 on a healthy cluster "
+            "means the bridge does NOT cover the teardown window and the "
+            "1.12.5 post-sync re-fire must stay. build_and_swap (#870): a "
+            "schema change builds the replacement beside the live informer "
+            "and swaps it in; the falsifier is a whole-type mark at the swap "
+            "(unanchors.type_event > 0) or a build window that does not end."))
+    if enable_crd_full_widen:
+        stages.append((
+            "B2_crd_full_widen", stage_crd_full_widen,
+            "A widen that changes every object's served bytes (a defaulted "
+            "property, --full-widen-crs objects; #969, reviewer-928's "
+            "full-widen run): the rows as B1's, B3 report only (a live "
+            "re-list may deliver first: B3_LIVE_FIRST); heap and GC across "
+            "the settle, report only."))
+    return stages
+
+
 def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
         crd_name: str | None = None, from_stage: str | None = None,
         expect_bundle: str | None = None, enable_crd_full_widen: bool = False,
@@ -1983,24 +2029,7 @@ def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
     except Exception:
         state = {"schema_version": "1.0.0", "stages": {}}
 
-    stages = list(STAGES)
-    if enable_crd_relist:
-        stages.append((
-            "B1_crd_relist", stage_crd_relist,
-            "Read by the mechanism the build publishes (#969). relist (to "
-            "1.12.59): relist_bridge_timeout_total > 0 on a healthy cluster "
-            "means the bridge does NOT cover the teardown window and the "
-            "1.12.5 post-sync re-fire must stay. build_and_swap (#870): a "
-            "schema change builds the replacement beside the live informer "
-            "and swaps it in; the falsifier is a whole-type mark at the swap "
-            "(unanchors.type_event > 0) or a build window that does not end."))
-    if enable_crd_full_widen:
-        stages.append((
-            "B2_crd_full_widen", stage_crd_full_widen,
-            "A widen that changes every object's served bytes (a defaulted "
-            "property, --full-widen-crs objects; #969, reviewer-928's "
-            "full-widen run): the rows as B1's, B3 exact at the object "
-            "count; heap and GC across the settle, report only."))
+    stages = stage_list(enable_crd_relist=enable_crd_relist, enable_crd_full_widen=enable_crd_full_widen)
 
     started_here = from_stage is None
     failed: list[str] = []

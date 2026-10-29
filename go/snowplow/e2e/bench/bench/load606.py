@@ -2592,6 +2592,7 @@ RUN8_VARS_PREFIXES = (
     # prefix bench/store_rebuild.py VARS_PREFIXES reads
     "snowplow_store_swap",
     "snowplow_apiserver_fallthrough_cells",
+    "snowplow_crd_discovery",             # schema relists / build requests, on both mechanisms
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3631,7 +3632,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         mem or [], snowplow_pods or [], run_phases(mem or [], phase_src), _phase_of, _deltas)
     if sr["status"] != "present":
         report["report_warnings"].append(f"store rebuilds: {sr['status']}: {sr['note']}")
-    report["report_warnings"] += sr.get("claim_violations") or []
+    report["report_warnings"] += (sr.get("claim_violations") or []) + (sr.get("warnings") or [])
     for name, key, what in (("list_incremental_report_only", LIST_INCREMENTAL_KEY,
                              "the #865 incremental list cell report"),
                             ("store_verification_report_only", STORE_VERIFY_KEY,

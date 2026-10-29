@@ -102,15 +102,24 @@ def test_b1s_widen_changes_no_object_and_its_swap_delivers_none():
     assert rep["known_stale_window_s"] == {"schema|swap": 2.5} and rep["known_stale_keys"] == {}
 
 
-def test_the_full_widen_delivers_every_object_exactly():
+def test_the_full_widen_reports_b3_exactly_but_does_not_gate_on_it():
+    """#987 review F3: a CRD update ends the live watches; the live informer
+    may re-list and deliver the changed objects first, which #928 leaves out
+    of M and of deliveries and does not count. The full widen's B3 is
+    therefore REPORTED (exact, with the reason) but gates nothing, until a
+    cluster run shows the live copy does not re-list. B1's (0 changed) gates."""
     n = a.widen_changed_objects([dict(a.CR_SPEC) for _ in range(7)], "widened")
     assert n == 7
     ok, rows, _, _ = _run(_swap_snapshot(), _swap_snapshot(swaps=1, m_keys=7, deliveries=7, relists=1), changed=n)
-    assert ok, [r for r in rows.values() if not r["passed"]]
+    assert ok and rows["B3"]["passed"] and rows["B3"]["report_only"] is True
+    assert "re-list" in rows["B3"]["why"]
     for m_keys, deliveries in ((7, 6), (6, 6), (50, 50)):           # one missed; M short; M = some other store
         ok, rows, _, _ = _run(_swap_snapshot(),
                               _swap_snapshot(swaps=1, m_keys=m_keys, deliveries=deliveries, relists=1), changed=n)
-        assert not ok and [r for r, x in rows.items() if not x["passed"]] == ["B3"]
+        assert ok and not rows["B3"]["passed"] and rows["B3"]["report_only"] is True
+    # B1 (nothing changed): B3 gates, exactly
+    ok, rows, _, _ = _run(_swap_snapshot(), _swap_snapshot(swaps=1, m_keys=1, deliveries=1, relists=1), changed=0)
+    assert not ok and not rows["B3"]["passed"] and "report_only" not in rows["B3"]
 
 
 @pytest.mark.parametrize("after,row", [
@@ -200,8 +209,33 @@ def test_the_full_widen_stage_is_gated_and_needs_its_count(monkeypatch, tmp_path
     monkeypatch.setenv("S6_CRD_FULL_WIDEN_APPROVED", "1")
     with pytest.raises(a.PreflightFailed, match="--full-widen-crs"):
         a.stage_crd_full_widen({"enable_crd_full_widen": True})
-    with pytest.raises(RuntimeError):
-        a.stage_crd_full_widen({})
+
+
+def test_each_layer_of_the_full_widen_gate_holds_on_its_own(monkeypatch):
+    """#987 review M23 / M24: the stage's own flag check, with the approval
+    and the count both given, refuses by itself (a plain RuntimeError, not the
+    PreflightFailed the other layers raise); and the stage list leaves B2 out
+    without the flag, whatever the approval says."""
+    monkeypatch.setenv("S6_CRD_FULL_WIDEN_APPROVED", "1")
+    with pytest.raises(RuntimeError) as e:
+        a.stage_crd_full_widen({"full_widen_crs": 5, "full_widen_crd_name": "s6wides.harness.krateo.io"})
+    assert type(e.value) is RuntimeError and "--enable-crd-full-widen" in str(e.value)
+    ids = [x[0] for x in a.stage_list(enable_crd_relist=True)]
+    assert "B2_crd_full_widen" not in ids and "B1_crd_relist" in ids
+    assert "B2_crd_full_widen" in [x[0] for x in a.stage_list(enable_crd_full_widen=True)]
+    assert "B1_crd_relist" not in [x[0] for x in a.stage_list(enable_crd_full_widen=True)]
+    import inspect
+    assert "stage_list(enable_crd_relist=enable_crd_relist, enable_crd_full_widen=enable_crd_full_widen)" in \
+        inspect.getsource(a.run)                                   # run() takes its stages from it
+
+
+def test_the_fixture_count_is_derived_from_the_manifest_the_stage_applies():
+    """#987 review M29: the CR the stage applies carries exactly CR_SPEC, so
+    widen_changed_objects counts what is applied, never a restated literal."""
+    import yaml
+    applied = yaml.safe_load(a._cr_manifest("harness.krateo.io", "S6run", "s6-probe-s6runs"))
+    assert applied["spec"] == a.CR_SPEC
+    assert a.widen_changed_objects([applied["spec"]], "widened") == 1
 
 
 def test_a_pod_replaced_by_another_mechanism_mid_stage_is_refused(monkeypatch, tmp_path):

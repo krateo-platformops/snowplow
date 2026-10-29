@@ -68,7 +68,7 @@ CLOSES = ("pushed", "pushed_on_arm", "pushed_resync", "known_stale", "evicted", 
 WINDOW_REASONS = ("informer-fallthrough-not-synced", "informer-fallthrough-not-servable")
 
 # The /debug/vars prefixes mem606 must capture for this report (load606.RUN8_VARS_PREFIXES).
-VARS_PREFIXES = (SWAP, FALLTHROUGH, VERIFY, RESOLVED, "snowplow_deps_dirty_mark_")
+VARS_PREFIXES = (SWAP, FALLTHROUGH, VERIFY, RESOLVED, CRD, "snowplow_deps_dirty_mark_")
 
 MECHANISMS = {
     "relist": {
@@ -121,12 +121,24 @@ LIFETIME_MAX = {"relist": (), "build_and_swap": tuple(
 # report-only gauges (not an "open" signal: ledger_owed is an expected outcome, not a detector)
 EXTRA_GAUGES = {"relist": (), "build_and_swap": tuple(
     (f"store_swap_ledger_owed.{r}", SWAP_KS, "store_swap_ledger_owed", r) for r in REASONS)}
-# what each mechanism does not publish (listed, never zero)
-NOT_PUBLISHED = {
-    "relist": ("rebuilds_installed", "known_stale_keys", "known_stale_window_s", "ledger_closes",
-               "detect_to_push_ms", "install_to_push_ms", "m_keys", "deliveries", "regressed_keys"),
-    "build_and_swap": ("store_repairs_pending", "store_repair_queue_age_seconds"),
-}
+def _quantities(mech: str) -> set[str]:
+    """Every name the report gives a quantity of `mech` under: its counters'
+    (scalars by name, labelled groups by their report name, histograms as
+    their means), its lifetime maxima and its gauges."""
+    out = set()
+    for name, *_ in COUNTERS[mech]:
+        group, _, label = name.partition("/")
+        out.add(name if not label else (f"{group}_to_push_mean_ms" if group in HISTOGRAMS[mech]
+                                        else RENAME.get(group, group)))
+    out |= {name for name, *_ in LIFETIME_MAX[mech]}
+    out |= {name for name, *_ in GAUGES[mech] + EXTRA_GAUGES[mech]}
+    return out
+
+
+# what each mechanism does not publish: every quantity another mechanism
+# reports and this one does not (listed, never zero) — derived, not a hand list
+NOT_PUBLISHED = {m: tuple(sorted(set().union(*(_quantities(o) for o in MECHANISMS if o != m)) - _quantities(m)))
+                 for m in MECHANISMS}
 # what a mechanism CLAIMS during a rebuild (the #870 design's K1): checked, report only
 CLAIMS = {
     "relist": {},
@@ -171,6 +183,8 @@ def counters(x: dict, mech: str) -> dict | None:
     build does not publish; a fall-through cell is 0 only when the meter is
     published and the cell has not counted yet)."""
     out = {"repairs_requested": read(x, VERIFY, "store_repairs_fired_total"),
+           # a CRD schema change: a relist (to 1.12.59) or a build request (#870); same name on both
+           "schema_changes": read(x, CRD, "schema_relists_fired"),
            "stale_served": read(x, RESOLVED, "stale_served_total"),
            "known_stale_served": read(x, RESOLVED, "known_stale_served_total"),
            "watch_submits": read(x, DIRTY, "submit_source", "watch")}
@@ -277,7 +291,7 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             if v is not None:
                 p["counters"][k] = p["counters"].get(k, 0) + v
         active = (is_open(_extra(a), mech) or is_open(_extra(b), mech)
-                  or (d.get("repairs_requested") or 0) > 0 or (d.get("rebuilds_installed") or 0) > 0)
+                  or any((d.get(k) or 0) > 0 for k in ("repairs_requested", "schema_changes", "rebuilds_installed")))
         row = {"t0": a["t"], "t1": b["t"], "phase": ph, "d": d,
                "heap_inuse_mb": [x for x in (a.get("heap_inuse_mb"), b.get("heap_inuse_mb")) if x is not None],
                "gc_share": gc_share(a, b, pods)}
@@ -300,19 +314,27 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             follow = next((q for q in quiet if q["t0"] == r["t1"]), None)
             if follow is not None:
                 after.append((r, follow))
-    q_rate = per_s(quiet, "watch_submits")
-    q_med = statistics.median(q_rate) if q_rate else None
+    # the quiet baseline of the SAME phase (storm, steady and each churn phase apart)
+    q_med_by_phase = {}
+    for ph in {q["phase"] for q in quiet}:
+        v = per_s([q for q in quiet if q["phase"] == ph], "watch_submits")
+        if v:
+            q_med_by_phase[ph] = statistics.median(v)
     def rate_of(pair):
         rate = per_s([pair], "watch_submits")
+        q_med = q_med_by_phase.get(pair["phase"])
         return {"t0": pair["t0"], "t1": pair["t1"], "phase": pair["phase"],
                 "watch_submits_per_s": round(rate[0], 3) if rate else None,
+                "quiet_median_per_s": round(q_med, 3) if q_med is not None else None,
                 "over_quiet_median": round(rate[0] / q_med, 3) if rate and q_med else None}
     # the pair a rebuild ends in (build_and_swap: it holds the install and the
     # unmute) and the pair after it
     watch_after = [{"end_pair": rate_of(r), "next_pair": rate_of(f)} for r, f in after]
 
     fall = {k: sum(r["d"].get(f"fallthrough/{k}") or 0 for r in intervals) for k in WINDOW_REASONS}
-    fall_known = all(r["d"].get(f"fallthrough/{k}") is not None for r in intervals for k in WINDOW_REASONS)
+    # no rebuild pair: nothing was watched, so no number (all([]) is True: never a zero)
+    fall_known = bool(intervals) and all(r["d"].get(f"fallthrough/{k}") is not None
+                                         for r in intervals for k in WINDOW_REASONS)
     by_gvr: dict[str, float] = {}
     for r in intervals:
         for k, v in r["d"].items():
@@ -334,16 +356,17 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             "how": (f"Δ {FALLTHROUGH} for {' / '.join(WINDOW_REASONS)} over the rebuild pairs: a resolve's "
                     f"call to the live apiserver (GET or LIST: the meter does not say which; no /debug/vars "
                     f"counter counts resolve-originated LISTs, #870's RoundTripper count is its kind arm's own)"),
-            **({} if fall_known else {"missing": f"{FALLTHROUGH} absent in a rebuild pair's samples"})},
+            **({} if fall_known else {"missing": ("no rebuild observed: the claim is untested" if not intervals
+                                                   else f"{FALLTHROUGH} absent in a rebuild pair's samples")})},
         "watch_submits_after_rebuild": {
-            "quiet_median_per_s": round(q_med, 3) if q_med is not None else None,
+            "quiet_median_per_s_by_phase": {ph: round(v, 3) for ph, v in sorted(q_med_by_phase.items())},
             "after_each_rebuild": watch_after,
             "max_over_quiet_median": max((w[x]["over_quiet_median"] for w in watch_after for x in w
                                           if w[x]["over_quiet_median"] is not None), default=None),
             "how": (f"{DIRTY}.submit_source.watch per second in the sample pair each rebuild ends in "
                     f"(build_and_swap: it holds the install, where the swap unmutes) and in the pair after it, "
-                    f"against the quiet pairs' median; 15 s pairs, so a spike in the seconds after the unmute "
-                    f"is diluted over its pair")},
+                    f"against the median of the quiet pairs of the SAME phase (none there: no ratio); 15 s "
+                    f"pairs, so a spike in the seconds after the unmute is diluted over its pair")},
         "heap_and_gc_during_rebuilds": {
             "heap_inuse_mb_peak": max(heap_in) if heap_in else None,
             "heap_inuse_mb_before_first": (before["heap_inuse_mb"][-1] if before and before["heap_inuse_mb"]
@@ -352,9 +375,15 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             "gc_cpu_share_max": max(gc_in) if gc_in else None,
             "gc_cpu_share_quiet_p50": statistics.median(gc_q) if gc_q else None,
             "how": ("heap_inuse over the rebuild pairs' samples; the GC's share of the available CPU per pair "
-                    "from GCCPUFraction and memstats LastGC (gc_share); quiet = the pairs with no rebuild")},
+                    "from GCCPUFraction and memstats LastGC (gc_share): over the interval between the two "
+                    "samples' last GCs (it can start before the pair), idle mark time left out (Go's "
+                    "definition), GOMAXPROCS assumed constant over the process life, the start the container's "
+                    "(1 s resolution); quiet = the pairs with no rebuild")},
     }
     claim = watch["resolve_fallthroughs_during_rebuilds"]["claim"]
+    untested = ([f"store rebuilds ({mech}): no rebuild observed in {len(rows)} samples: the watches had nothing "
+                 f"to watch" + (f"; the claim of {claim} resolve fall-throughs during rebuilds is untested"
+                                if claim is not None else "")] if not intervals else [])
     violations = ([f"store rebuilds ({mech}): {total_fall} resolve fall-through(s) to the apiserver during "
                    f"rebuilds ({', '.join(f'{k} {v}' for k, v in fall.items() if v)}); the mechanism claims "
                    f"{claim}"] if claim is not None and fall_known and total_fall > claim else [])
@@ -372,7 +401,7 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
     for ph, p in phase_tot.items():
         c = p["counters"]
         q = {"seconds": round(p["seconds"], 1), "pairs": p["pairs"], "rebuild_pairs": p["rebuild_pairs"],
-             "repairs_requested": c.get("repairs_requested"),
+             "repairs_requested": c.get("repairs_requested"), "schema_changes": c.get("schema_changes"),
              "stale_served": c.get("stale_served"), "known_stale_served": c.get("known_stale_served"),
              "resolve_fallthroughs": {k: c.get(f"fallthrough/{k}") for k in WINDOW_REASONS},
              "watch_submits": c.get("watch_submits")}
@@ -396,7 +425,7 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
                           "gc_cpu_share": r["gc_share"]} for r in intervals],
             "gauges_last": gauges(last, mech),
             **lifetime_max,
-            "watch": watch, "claim_violations": violations,
+            "watch": watch, "claim_violations": violations, "warnings": untested,
             "not_published": list(NOT_PUBLISHED[mech]),
             "note": ("report only. A rebuild pair is a mem606 sample pair in which a rebuild was requested, "
                      "installed or open: the window at the sampler's resolution, the same for both mechanisms. "

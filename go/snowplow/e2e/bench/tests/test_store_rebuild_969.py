@@ -202,12 +202,16 @@ def test_the_relist_arm(tmp_path):
     assert f["by_gvr_reason"] == {f"{G}|informer-fallthrough-not-synced": 80,
                                   f"{G}|informer-fallthrough-not-servable": 20}
     # the watch submits in the pair the rebuild ended in (s4->s5: +1000) and the next one (+100),
-    # against the quiet pairs' median (+100 per 15 s)
+    # each against the quiet median of ITS OWN phase: the end pair is in the churn phase, which has
+    # no quiet pair (no ratio); the next one is steady (+100 per 15 s)
     a = w["watch_submits_after_rebuild"]
-    assert a["quiet_median_per_s"] == round(100 / 15, 3)
-    assert [(x["end_pair"]["watch_submits_per_s"], x["next_pair"]["watch_submits_per_s"])
-            for x in a["after_each_rebuild"]] == [(round(1000 / 15, 3), round(100 / 15, 3))]
-    assert a["max_over_quiet_median"] == 10.0
+    assert a["quiet_median_per_s_by_phase"] == {"steady": round(100 / 15, 3)}
+    [x] = a["after_each_rebuild"]
+    assert (x["end_pair"]["phase"], x["end_pair"]["watch_submits_per_s"], x["end_pair"]["over_quiet_median"]) == \
+        ("churn:list_dep@10", round(1000 / 15, 3), None)
+    assert (x["next_pair"]["phase"], x["next_pair"]["watch_submits_per_s"], x["next_pair"]["over_quiet_median"]) == \
+        ("steady", round(100 / 15, 3), 1.0)
+    assert a["max_over_quiet_median"] == 1.0
     h = w["heap_and_gc_during_rebuilds"]
     assert h["heap_inuse_mb_peak"] == 3100.0 and h["heap_inuse_mb_before_first"] == 2005.0
     assert h["gc_cpu_share_max"] is not None and h["gc_cpu_share_max"] > h["gc_cpu_share_quiet_p50"]
@@ -224,10 +228,10 @@ def test_the_build_and_swap_arm(tmp_path):
     f = r["watch"]["resolve_fallthroughs_during_rebuilds"]
     assert f["value"] == 0 and f["claim"] == 0 and r["claim_violations"] == []
     a = r["watch"]["watch_submits_after_rebuild"]
-    # the install pair (s4->s5, +110) and the next one (+90)
+    # the install pair (s4->s5, +110, churn: no quiet pair there) and the next one (+90, steady)
     assert [(x["end_pair"]["watch_submits_per_s"], x["next_pair"]["watch_submits_per_s"])
             for x in a["after_each_rebuild"]] == [(round(110 / 15, 3), round(90 / 15, 3))]
-    assert a["max_over_quiet_median"] == 1.1
+    assert a["max_over_quiet_median"] == 0.9
     p = r["by_phase"]["all"]
     assert (p["rebuilds_installed"], p["m_keys"], p["deliveries"]) == (1, 3, 2)
     assert p["known_stale_window_s"] == {"divergence|swap": 20.5}
@@ -238,6 +242,58 @@ def test_the_build_and_swap_arm(tmp_path):
     assert SWAP_DOC["after"]["snowplow_store_swap_known_stale"]["store_swap_known_stale_builds_total"][
         "divergence|abort_clean"] == 1
     assert "store rebuilds" not in err
+
+
+def test_one_fall_through_during_a_swap_already_breaks_its_claim(tmp_path):
+    """The claim's boundary, exactly: a single fall-through is a breach."""
+    rows = [list(x) for x in SWAP]
+    for i in (3, 4, 5, 6, 7):
+        rows[i][3] = 1                                                 # 1 not-synced, 0 not-servable at s3
+    v, err = _evaluate(tmp_path, [tuple(x) for x in rows], "build_and_swap")
+    r = v["report"]["store_rebuild_report_only"]
+    assert r["watch"]["resolve_fallthroughs_during_rebuilds"]["value"] == 1
+    assert len(r["claim_violations"]) == 1 and "1 resolve fall-through(s)" in r["claim_violations"][0]
+
+
+def test_with_no_rebuild_the_claim_is_untested_never_a_zero(tmp_path):
+    """#987 review F1: a run with no rebuild watched nothing: no value, no
+    figure, and a warning that the claim is untested."""
+    quiet = [SWAP[0]] * 8
+    v, err = _evaluate(tmp_path, quiet, "build_and_swap")
+    r = v["report"]["store_rebuild_report_only"]
+    f = r["watch"]["resolve_fallthroughs_during_rebuilds"]
+    assert r["rebuild_pairs"] == 0
+    assert f["value"] is None and f["by_reason"] is None and "untested" in f["missing"]
+    assert r["claim_violations"] == [] and "untested" in r["warnings"][0]
+    assert r["warnings"][0] in v["report"]["report_warnings"]
+    assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
+        "resolve_fallthroughs_during_rebuilds"] is None
+
+
+def test_a_schema_relist_is_a_rebuild_on_the_relist_arm(tmp_path):
+    """#987 review F5: snowplow_crd_discovery is captured; a schema relist
+    with no repair is a rebuild pair (as a schema swap is on build_and_swap)."""
+    mem = _mem([r[:7] + (0,) for r in RELIST[:3]] * 1, "relist")
+    for i, m in enumerate(mem[1:]):
+        m["extra"]["snowplow_crd_discovery"]["schema_relists_fired"] = 1 if i >= 2 else 0
+        m["extra"]["snowplow_store_verification"]["store_repairs_fired_total"] = 0
+    r = store_rebuild.report(mem, [POD], [], load606._phase_of, load606._deltas)
+    assert r["rebuild_pairs"] == 1 and r["by_phase"]["all"]["schema_changes"] == 1
+
+
+def test_what_one_mechanism_reports_the_other_lists_as_not_published(tmp_path):
+    """#987 review F4: every quantity the swap arm reports is either reported
+    or listed as not published by the relist arm, and the reverse."""
+    reps = {m: store_rebuild.report(_mem(rows, m), [POD], [], load606._phase_of, load606._deltas)
+            for m, rows in (("relist", RELIST), ("build_and_swap", SWAP))}
+
+    def names(r):
+        return set(r["by_phase"]["all"]) | set(r["gauges_last"]) | {k for k in r if k.endswith("_to_push_max_ms")}
+    for m, o in (("relist", "build_and_swap"), ("build_and_swap", "relist")):
+        missing = names(reps[o]) - names(reps[m]) - set(reps[m]["not_published"])
+        assert not missing, (m, missing)
+    assert {"superseded", "reused_objects", "schema_unowned", "known_stale_builds", "detect_to_push_max_ms",
+            "install_to_push_max_ms", "store_swap_ledger_owed.divergence"} <= set(reps["relist"]["not_published"])
 
 
 def test_a_fall_through_during_a_swap_breaks_its_claim(tmp_path):
@@ -298,7 +354,15 @@ def test_store_verification_gauges_follow_the_mechanism():
 
 @pytest.mark.parametrize("mech,rows", [("relist", RELIST), ("build_and_swap", SWAP)])
 def test_a_restart_pair_is_skipped_not_counted(mech, rows):
+    """The restart pair (s3->s4) is left out: its absolute values are never
+    summed in as deltas (#987 review M13), so the totals are those of the
+    other pairs, exactly."""
     mem = _mem(rows, mech)
     mem[5]["num_gc"] = 1                                               # snowplow restarted before s4
     r = store_rebuild.report(mem, [POD], [], load606._phase_of, load606._deltas)
-    assert r["restarts_skipped"] >= 1
+    assert r["restarts_skipped"] == 1
+    a = r["by_phase"]["all"]
+    stale = (rows[3][1] - rows[0][1]) + (rows[7][1] - rows[4][1])        # s0..s3 and s4..s7
+    watch = (rows[3][2] - rows[0][2]) + (rows[7][2] - rows[4][2])
+    assert (a["repairs_requested"], a["stale_served"], a["watch_submits"], a["pairs"]) == (1, stale, watch, 6)
+    assert r["rebuild_pairs"] == 2                                     # s2->s3 and s4->s5
