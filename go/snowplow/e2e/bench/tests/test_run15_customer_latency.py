@@ -632,6 +632,10 @@ NA, NB = "snowplow-bench-r15a", "snowplow-bench-r15b"
 # the region's quota read (#895), as gcloud returns it; FAKE_SSD_USAGE steers it
 FAKE_QUOTA_GCLOUD = (
     "#!/usr/bin/env python3\nimport json, os, sys\n"
+    "if sys.argv[1:3] == ['auth', 'print-access-token']:\n"
+    "    print('fake-access-token'); sys.exit(0)\n"
+    "if sys.argv[1:4] == ['container', 'clusters', 'list']:\n"
+    "    print(os.environ.get('FAKE_CLUSTERS', '[]')); sys.exit(0)\n"
     "if sys.argv[1:4] == ['compute', 'regions', 'describe']:\n"
     "    print(json.dumps({'name': sys.argv[4], 'quotas': [{'metric': 'SSD_TOTAL_GB', 'limit': 500.0,\n"
     "                      'usage': float(os.environ.get('FAKE_SSD_USAGE', '333'))}]}))\n"
@@ -669,17 +673,22 @@ def pairbed(tmp_path):
     fbin.mkdir()
     (fbin / "gcloud").write_text(FAKE_QUOTA_GCLOUD)
     (fbin / "gcloud").chmod(0o755)
+    # #985: and GKE's per-location cluster limit (the Cloud Quotas fake; fake/cluster_limit moves it)
+    from tests import fake_cloudquotas
+    quotas_url, quotas_stop = fake_cloudquotas.serve(fake / "cluster_limit")
     today = datetime.now(UTC).strftime("%Y%m%d")
     env = {k: v for k, v in os.environ.items()
            if k not in ("RUN_NAME", "SNOWPLOW_TAG", "EXPECTED_IMAGE_DIGEST", "BENCH_606_GO", "OUT",
                         "DRIVE_S", "K6_SPAN", "LOAD_DRIVER", "BENCH_606_DRY_RUN")}
     env.update(PATH=f"{fbin}{os.pathsep}{env['PATH']}", FAKE_SSD_USAGE="333",
+               CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS=quotas_url,
                PYTHONPATH=str(BENCH), FAKE=str(fake), PAIR_OUT=str(tmp_path / "pair"),
                OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), PAIR_POLL_S="0.2",
                RUN_NAME_A=NA, RUN_NAME_B=NB, SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
                EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B,
                BENCH_606_GO_A=f"{today}-{NA}", BENCH_606_GO_B=f"{today}-{NB}")
-    return repo, fake, env, tmp_path
+    yield repo, fake, env, tmp_path
+    quotas_stop()
 
 
 def _launch(repo, env, bash="bash", **over):

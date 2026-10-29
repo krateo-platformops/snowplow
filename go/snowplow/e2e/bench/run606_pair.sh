@@ -101,6 +101,22 @@ for x in A B; do
   fi
   log "run $x: dry pass OK"
 done
+# What both clusters need, together (each gke-up alone would see room for
+# itself): reads only, nothing is created, so the DRY pass runs them too and
+# refuses a pair that cannot start (#985: run 18 was lost to GKE's
+# per-location cluster limit ~19 s into gke-up).
+# #895: both clusters' PVC disks must fit the region's SSD_TOTAL_GB;
+# #985: both clusters must fit GKE's per-location cluster limit
+# (ClustersPerRegion, read) beside every cluster already in the region.
+quota_args=()
+[[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
+[[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
+for check in gke-ssd-quota gke-cluster-quota; do
+  if ! quota_msg="$(python3 -m bench.gke "$check" ${quota_args[@]+"${quota_args[@]}"} --runs 2 2>&1)"; then
+    refuse "${quota_msg#refusing: }"
+  fi
+  log "$quota_msg"
+done
 eval_cmd=(python3 -m bench.custlat pair --a "$OUT_A/verdict.json" --b "$OUT_B/verdict.json"
           --a-dir "$OUT_A" --b-dir "$OUT_B"
           --replica "$REPLICA" --expect-a "$EXPECTED_IMAGE_DIGEST_A" --expect-b "$EXPECTED_IMAGE_DIGEST_B")
@@ -108,15 +124,6 @@ if [[ "$DRY" == "1" ]]; then
   log "DRY: both runs would start now; then ${eval_cmd[*]} > $PAIR_OUT/paired-verdict.json"
   exit 0
 fi
-# #895: both clusters' PVC disks must fit the region's SSD_TOTAL_GB together
-# (each gke-up alone would see room for itself); a read, nothing is created
-quota_args=()
-[[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
-[[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
-if ! quota_msg="$(python3 -m bench.gke gke-ssd-quota ${quota_args[@]+"${quota_args[@]}"} --runs 2 2>&1)"; then
-  refuse "${quota_msg#refusing: }"
-fi
-log "$quota_msg"
 
 python3 -c 'import json, sys, time
 keys = ("run_name", "tag", "digest", "out")

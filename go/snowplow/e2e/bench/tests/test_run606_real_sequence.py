@@ -68,8 +68,18 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
     record("gcloud", os.environ.get("KUBECONFIG"))
     def opt(name):
         return a[a.index(name) + 1] if name in a else None
+    if a[:3] == ["auth", "print-access-token"]:                 # #985: the Cloud Quotas read
+        print("fake-access-token"); sys.exit(0)
     if a[:3] == ["container", "clusters", "list"]:
-        print("[]"); sys.exit(0)
+        print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
+    # FAKE_CREATE_ERROR: the create refused with this stderr (run 18: the
+    # per-location limit); no cluster exists, so its describe answers NotFound
+    if a[:3] == ["container", "clusters", "create"] and os.environ.get("FAKE_CREATE_ERROR"):
+        sys.stderr.write(os.environ["FAKE_CREATE_ERROR"] + "\\n"); sys.exit(1)
+    if a[:3] == ["container", "clusters", "describe"] and os.environ.get("FAKE_CREATE_ERROR"):
+        sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
+                         "message=Not found: clusters/" + a[3] + ".\\n")
+        sys.exit(1)
     if a[:3] == ["container", "clusters", "get-credentials"]:
         name, p, z = a[3], opt("--project"), opt("--region")   # regional control plane
         ctx = f"gke_{p}_{z}_{name}"
@@ -954,6 +964,8 @@ def harness(tmp_path):
         "contexts": [{"name": AMBIENT_CTX, "context": {"cluster": AMBIENT_CTX}}],
         "clusters": [], "users": []}))
     srv = _fake_server(state)
+    from tests import fake_cloudquotas
+    quotas_url, quotas_stop = fake_cloudquotas.serve(state / "cluster_limit")
     env = dict(os.environ)
     for k in ("BENCH_ALLOW_NON_GKE", "BENCH_GKE_CONTEXT", "BENCH_606_DRY_RUN",
               "BENCH_606_FAIL_AT", "SNOWPLOW_URL", "AUTHN_URL", "FRONTEND_URL"):
@@ -975,12 +987,15 @@ def harness(tmp_path):
         "BENCH_NO_COLOR": "1", "FAKE_PW": SCALEUSER_PASSWORD,
         "FAKE_USER_CRD": str(CRD_CHARTS / "authn-crds" / "templates" / "basic.authn.krateo.io_users.yaml"),
         "FAKE_CRD_CHARTS": str(CRD_CHARTS),
+        # #985: GKE's per-location cluster limit, read from the Cloud Quotas fake
+        "CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS": quotas_url,
     })
     from datetime import datetime, timezone
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME
     (tmp_path / "home").mkdir()
     yield env, state, ambient, tmp_path
     srv.shutdown()
+    quotas_stop()
 
 
 def _calls(state: Path):

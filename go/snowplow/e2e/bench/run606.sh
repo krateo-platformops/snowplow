@@ -349,6 +349,7 @@ on_teardown_signal() {
 }
 
 CLUSTER_CREATED=0
+UP_OK=0   # #985: 1 once gke-up returned 0 (the cluster exists)
 IN_TEARDOWN=0
 teardown() {
   local rc=$?
@@ -400,7 +401,15 @@ teardown() {
     # shielded: a process-group Ctrl-C must not interrupt the delete itself
     down_rc=0
     ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" $YES ) || down_rc=$?
-    if [[ "$down_rc" == "4" ]]; then
+    if [[ "$down_rc" == "5" && "${UP_OK:-0}" != "1" ]]; then
+      # #985: gke-up did not complete and the exact-name describe finds no
+      # cluster: the create never made one
+      log "no cluster ${RUN_NAME} in ${REGION} (gke-down's exact-name describe: NotFound; gke-up did not complete): nothing to delete"
+    elif [[ "$down_rc" == "5" ]]; then
+      # gke-up made it, and its region no longer has it: not ours to explain away
+      log "TEARDOWN FAILED — the cluster gke-up made is not in ${REGION} (exact-name describe: NotFound); check by hand: gcloud container clusters list --project ${PROJECT}"
+      rc=$(( rc == 0 ? 1 : rc ))
+    elif [[ "$down_rc" == "4" ]]; then
       # #895: the cluster IS deleted, but its PVC disks could not be checked or deleted
       # #954: its disks are found by the cluster's ID label (cluster-id-gke-io), not its name
       # label (a disk provisioned late carries the id alone); gke-down's stderr names each disk
@@ -481,8 +490,16 @@ s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
   log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
+  # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
+  # by gke-up) goes through record_failure like every other step's; its
+  # progress is on stdout. Run 18 lost both arms with only the RUN line logged.
+  local up_rc=0
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
-      --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES
+      --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES \
+      2>"$KERR" || up_rc=$?
+  if [[ -s "$KERR" ]]; then cat "$KERR" >&2; fi
+  (( up_rc == 0 )) || { record_failure "up FAILED: gke-up exited ${up_rc}"; return 1; }
+  UP_OK=1             # gke-up made the cluster: a teardown that cannot find it is a failure
   run "${K[@]}" version
   # the run's record of the cluster's shape (runs 14-16: zonal control plane;
   # 17+: regional), READ BACK from GKE after create (#899 F1): where the control
