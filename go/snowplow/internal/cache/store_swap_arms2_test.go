@@ -24,6 +24,11 @@ func setSwapStepHook(t *testing.T, h func(c *storeInstance, step string)) {
 	t.Cleanup(func() { swapStepHookForTest.Store(nil) })
 }
 
+func setSwapWaitHook(t *testing.T, h func(c, r *storeInstance)) {
+	swapWaitHookForTest.Store(&h)
+	t.Cleanup(func() { swapWaitHookForTest.Store(nil) })
+}
+
 // ── K7 — #375 covers the swap ───────────────────────────────────────────────
 
 // TestStoreSwap_K7_InFlightResolveSelfRemarks: a resolve that read the OLD copy
@@ -191,6 +196,7 @@ func chainHoldB0(t *testing.T, f *swapFix, gvr schema.GroupVersionResource) (rel
 func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 	gvr := swapGVR(t)
 	f := newSwapFix(t, gvr, objs(gvr, 4))
+	b0 := f.live()
 	release := chainHoldB0(t, f, gvr)
 	t.Cleanup(release)
 	evs0 := len(f.rec.all())
@@ -200,11 +206,30 @@ func TestStoreSwap_K11e_ChainedSwaps(t *testing.T) {
 	f.waitFor("B1's install", func() bool { return StoreSwapStatsSnapshot().Swaps == 1 })
 	c1 := f.live()
 
+	// C3 — B2 must wait for EVERY retiring copy, B0 included. B0's listener is
+	// held, so B0's Run cannot return: the arm releases it on the event "B2
+	// waits for B0". If B2 instead completes its swap while B0 is still held,
+	// it never waited for B0 (X38). Both are events, never a timing guess.
+	waitsB0 := make(chan struct{})
+	var wOnce sync.Once
+	setSwapWaitHook(t, func(c, r *storeInstance) {
+		if c.gvr == gvr && c != c1 && r == b0 {
+			wOnce.Do(func() { close(waitsB0) })
+		}
+	})
 	f.clusterSet(swapObj(gvr, "o02", "2", "b2"))
 	f.request(reasonDivergence, swapKey("o02"))
 	f.waitFor("B2's install", func() bool { return StoreSwapStatsSnapshot().Swaps == 2 })
-	if f.live() == c1 {
+	c2 := f.live()
+	if c2 == c1 {
 		t.Fatal("precondition: B2 is not live")
+	}
+	select {
+	case <-waitsB0:
+	case <-c2.delivered:
+		t.Fatal("K11e RED (X38): B2 completed its swap while B0's listener was still delivering — B2 never waited for B0 (C3: every waiter waits for every retiring copy)")
+	case <-time.After(30 * time.Second):
+		t.Fatal("K11e: B2 neither waited for B0 nor completed")
 	}
 	release()
 	f.awaitSwaps(2)

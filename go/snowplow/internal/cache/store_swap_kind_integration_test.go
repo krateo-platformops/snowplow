@@ -20,9 +20,14 @@
 //
 // What it asserts (design v5 §8 K1, K3 and the acceptance shape, scaled to
 // kind — the 50K run is the bench's):
-//   - K1: during the build the GVR stays servable on every read, and the ONLY
-//     LIST of the GVR's data the process issues is the new copy's own
-//     (counted at the RoundTripper, initial pages only);
+//   - K1: during the build the GVR stays servable on every read, and the
+//     watcher's own REST config issues exactly ONE initial listing of the
+//     GVR's data for the repair: the new copy's (k870ListCounter, at that
+//     config's RoundTripper). That is REFLECTOR traffic only: a resolve's
+//     LISTs travel on per-user configs (credhttp.NewClientConfig) this counter
+//     never sees, and this arm drives no resolves, so it claims nothing about
+//     resolve-originated LISTs. That assertion is #988's (the production
+//     wire counter, and real resolves during the build);
 //   - K3: every divergent key equals a quorum GET after the swap;
 //   - acceptance shape: 0 type_event unanchors, 0 type-path dirty-marks,
 //     keys_total{divergence,swap} = the injected losses, exactly; and, from
@@ -358,7 +363,7 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 	nChurned := len(churned)
 	churnMu.Unlock()
 	if got := counter.n.Load() - lists0; got != 1 {
-		t.Fatalf("K1 RED: %d initial listing(s) of the GVR's data for one repair, want 1 (the new copy's own)", got)
+		t.Fatalf("K1 RED: the watcher's config issued %d initial listing(s) of the GVR's data for one repair, want 1 (the new copy's own; reflector traffic only)", got)
 	}
 	// K3: every divergent key equals a quorum GET.
 	for end := time.Now().Add(60 * time.Second); ; time.Sleep(100 * time.Millisecond) {

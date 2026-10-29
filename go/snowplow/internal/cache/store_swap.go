@@ -571,6 +571,7 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	}
 	for _, r := range retiring {
 		if r.ownRun {
+			swapWait(c, r)
 			<-r.done
 		}
 	}
@@ -680,6 +681,18 @@ var swapStepHookForTest atomic.Pointer[func(c *storeInstance, step string)]
 func swapStep(c *storeInstance, step string) {
 	if h := swapStepHookForTest.Load(); h != nil {
 		(*h)(c, step)
+	}
+}
+
+// swapWaitHookForTest, when non-nil, runs as installBuild is about to wait
+// for retiring copy r's Run to return (step 2), never under a lock. TEST-ONLY:
+// the chained-swap arm (K11e) releases a held copy on the EVENT "the later
+// install waits for it" instead of a timing guess.
+var swapWaitHookForTest atomic.Pointer[func(c, r *storeInstance)]
+
+func swapWait(c, r *storeInstance) {
+	if h := swapWaitHookForTest.Load(); h != nil {
+		(*h)(c, r)
 	}
 }
 
