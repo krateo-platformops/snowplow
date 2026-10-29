@@ -284,12 +284,7 @@ func Refreshes() http.HandlerFunc {
 			// so the stream must end now for the SPA to re-validate.
 			select {
 			case <-stream.Resync:
-				// #870 C2 — a WRITTEN resync closes the stream's refreshed
-				// push-ledger entries (the SPA re-reads every armed key); a
-				// failed write closes nothing.
-				if writeFrame(refreshResyncFrame) {
-					stream.WroteResync()
-				}
+				writeResyncFrame(writeFrame, stream)
 				return
 			default:
 			}
@@ -297,9 +292,7 @@ func Refreshes() http.HandlerFunc {
 			case <-req.Context().Done():
 				return // client gone
 			case <-stream.Resync:
-				if writeFrame(refreshResyncFrame) {
-					stream.WroteResync() // #870 C2 — see above
-				}
+				writeResyncFrame(writeFrame, stream)
 				return
 			case k, ok := <-stream.Keys:
 				if !ok {
@@ -307,12 +300,9 @@ func Refreshes() http.HandlerFunc {
 					// to idle; the client falls back to its throttle.
 					return
 				}
-				if !writeFrame("event: refresh\ndata: " + k + "\n\n") {
+				if !writeRefreshFrame(writeFrame, stream, k) {
 					return // client write failed or exceeded the deadline — disconnect
 				}
-				// #870 C2 — the frame for k was WRITTEN: the latest point the
-				// server can observe. Only now does a push-ledger entry close.
-				stream.Wrote(k)
 			case <-classMoved:
 				// #819: an RBAC publish or the #682 epoch may have moved this
 				// identity's class. Re-acquire first (coalesced: notes during the
@@ -541,4 +531,25 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 		slog.Int("skipped_other", skippedOther),
 	)
 	return armed, rotation, nil
+}
+
+// writeRefreshFrame writes k's refresh frame and, only when the write
+// SUCCEEDED, tells the store-swap push ledger (#870 C2): a written frame is the
+// latest point the server can observe; an offer, or a failed write, is not one.
+func writeRefreshFrame(writeFrame func(string) bool, stream cache.RefreshStream, k string) bool {
+	if !writeFrame("event: refresh\ndata: " + k + "\n\n") {
+		return false
+	}
+	stream.Wrote(k)
+	return true
+}
+
+// writeResyncFrame writes the resync frame and, only when the write
+// SUCCEEDED, tells the ledger: the SPA re-reads every armed key, so the
+// stream's refreshed entries close as pushed_resync. A failed write closes
+// nothing (#870 C2).
+func writeResyncFrame(writeFrame func(string) bool, stream cache.RefreshStream) {
+	if writeFrame(refreshResyncFrame) {
+		stream.WroteResync()
+	}
 }

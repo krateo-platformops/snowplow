@@ -21,12 +21,16 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -161,6 +165,7 @@ type swapFix struct {
 	meta     *metadatafake.FakeMetadataClient // the metadata-only variant's cluster
 	hdyn     holdListDynamic                  // counts every LIST of the GVR as it is ISSUED
 	factory  bool                             // the GVR's informer comes from the shared factory (not owned)
+	watchErr atomic.Bool                      // every new WATCH of the GVR fails
 }
 
 type swapFixOpt func(*swapFix)
@@ -238,6 +243,9 @@ func newSwapFix(t *testing.T, gvr schema.GroupVersionResource, objs []*unstructu
 		}
 	}
 	f.fake.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
+		if a.GetResource() == gvr && f.watchErr.Load() {
+			return true, nil, apierrors.NewInternalError(errors.New("watch refused"))
+		}
 		w := watch.NewFakeWithChanSize(256, false)
 		t.Cleanup(w.Stop)
 		if a.GetResource() == gvr {

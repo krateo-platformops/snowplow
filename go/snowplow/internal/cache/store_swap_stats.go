@@ -21,6 +21,9 @@ import (
 	"expvar"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // labelled is a fixed two-label counter family.
@@ -301,3 +304,14 @@ func resetStoreSwapStatsForTest() {
 
 // ResetStoreSwapForTest is the cross-package twin (internal/metrics arms).
 func ResetStoreSwapForTest() { resetStoreSwapStatsForTest() }
+
+// RunStoreSwapAbortForTest runs one build account through the PRODUCTION
+// accounting path — noted at detection, ended as abort_clean after held — so a
+// cross-package arm (internal/metrics' OTLP mirror) reads counters moved by the
+// real code, not constants. TEST-ONLY.
+func RunStoreSwapAbortForTest(gvr schema.GroupVersionResource, reason string, keys []string, held time.Duration) {
+	at := windowNow()
+	acc := newBuildAccount()
+	acc.note(gvr, reason, keys, at)
+	acc.endReason(reason, outcomeAbortClean, at.Add(held))
+}

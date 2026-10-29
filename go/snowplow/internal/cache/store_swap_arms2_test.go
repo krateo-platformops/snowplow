@@ -421,3 +421,23 @@ func TestStoreSwap_TransformChainIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// ── K9 — no barrier on the live copy's state ────────────────────────────────
+
+// TestStoreSwap_K9_LiveCopyInAFailingWatchDoesNotBlockTheSwap — F1. The live
+// copy's watch is torn and every re-establishment fails (a failing
+// watch-list/re-watch attempt) when the build is constructed; nothing in the
+// build waits on the live copy's reflector, so the swap completes on the new
+// copy's own sync.
+func TestStoreSwap_K9_LiveCopyInAFailingWatchDoesNotBlockTheSwap(t *testing.T) {
+	gvr := swapGVR(t)
+	f := newSwapFix(t, gvr, objs(gvr, 3))
+	f.watchErr.Store(true)
+	f.watcher(0).Stop() // the live copy's watch ends; every retry fails
+	f.clusterSet(swapObj(gvr, "o00", "2", "v2"))
+	f.request(reasonDivergence, swapKey("o00"))
+	f.awaitSwaps(1)
+	if o, _ := f.storeObj(swapKey("o00")); rvOf(o) != "2" {
+		t.Fatalf("K9: the swapped-in copy holds rv %q, want 2", rvOf(o))
+	}
+}
