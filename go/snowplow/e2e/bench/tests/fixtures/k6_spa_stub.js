@@ -19,6 +19,15 @@ export function pickRoute (routes, user, visit) {
   return routes[visit % routes.length]
 }
 
+export function sameMenu (routes, table) {
+  const key = (rs) => (rs || []).map((r) => `${r.path} ${r.endpoint}`).sort().join('\n')
+  return key(routes) === key(table)
+}
+
+export function userRoutes (fl, failed, classTable) {
+  return failed ? classTable : fl.routes
+}
+
 export function walkTree (endpoints, fetch) {
   const r = fetch(endpoints, 0)
   return { calls: r.length, errors: r.filter((x) => x.status !== 200).length, armed: [] }

@@ -332,11 +332,18 @@ def k6_checks(o: dict | None, th: dict | None = None) -> list[dict]:
                 "result": "PASS" if rate is not None and rate <= th["max_k6_error_rate"] else "FAIL",
                 **({} if rate is not None else {"why": "no data"})})
     mism = _metric(s, "route_table_mismatch", "count") or 0
+    per = Counter()
+    for val, t in o["points"].get("route_table_mismatch", []):
+        per[t.get("class") or "(no class tag)"] += int(val or 0)
+    by = ", ".join(f"{n} of menu class {c}" for c, n in sorted(per.items()))
     out.append({"check": "k6.route_table", "value": mism, "bar": "== 0",
                 "result": "PASS" if mism == 0 else "FAIL",
-                **({} if mism == 0 else {"why": f"{mism} users' own menus differ from the run's "
-                                                f"route table (preflight's): their route clicks "
-                                                f"would not be the SPA's"})})
+                **({} if mism == 0 else {"by_class": dict(per),
+                                         "why": f"{mism} users' own menus differ from their menu "
+                                                f"class's table (that class's preflight)"
+                                                + (f": {by}" if by else "")
+                                                + ": the portal did not show them the menu their "
+                                                  "RBAC gives the class"})})
     return out
 
 

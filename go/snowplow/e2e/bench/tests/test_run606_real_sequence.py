@@ -745,7 +745,19 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             init = os.environ.get("FAKE_INIT", "/call?resource=layouts&apiVersion="
                                   "widgets.templates.krateo.io/v1beta1&name=app-shell"
                                   "&namespace=krateo-system")
-            print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system"},
+            # the installer's path-mode URLs (one origin, 057's paths); FAKE_PORTAL=split:
+            # the localhost defaults a config keeps until the gateway has an address
+            if os.environ.get("FAKE_PORTAL") == "split":
+                urls = {"SNOWPLOW_API_BASE_URL": "http://localhost:8081",
+                        "AUTHN_API_BASE_URL": "http://localhost:8082",
+                        "EVENTS_API_BASE_URL": "http://localhost:8083",
+                        "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"}
+            else:
+                urls = {"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/content",
+                        "AUTHN_API_BASE_URL": "http://10.0.0.9/auth",
+                        "EVENTS_API_BASE_URL": "http://10.0.0.9/events",
+                        "EVENTS_PUSH_API_BASE_URL": "http://10.0.0.9/events"}
+            print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system", **urls},
                               "params": {"FRONTEND_NAMESPACE": "krateo-system"}}))
             sys.exit(0)
         if (what == "pods" and "app.kubernetes.io/name=snowplow" in a
@@ -1148,3 +1160,34 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
                      if c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"])
     assert idx_logs < idx_delete
     assert all(c["context"] in (KCTX, None) for c in calls if c["tool"] in ("kubectl", "helm"))
+
+
+def test_a_portal_on_several_origins_stops_the_run_at_the_platform_step(harness):
+    """Run 19: the browser must load the portal from ONE origin (057's
+    gateway). A config.json that keeps the installer's localhost defaults
+    (four origins: the gateway has no address yet, or path mode is off)
+    stops the run at the platform step, before data and load are paid for,
+    with what config.json said; the cluster is still torn down."""
+    env, state, ambient, tmp = harness
+    env["FAKE_PORTAL"] = "split"
+    env["DEPLOY_WAIT_S"] = "1"            # the gate's deadline: the platform's and deploy's budgets
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert "portal origin FAILED" in out and "3 origins" in out
+    assert "=== step preflight ===" not in out and "=== step data ===" not in out
+    fails = [json.loads(ln) for ln in (tmp / "out" / "command-failures.jsonl").read_text().splitlines()]
+    assert any(f["step"] == "platform" and "portal origin FAILED" in f["what"] for f in fails)
+    calls = _calls(state)
+    assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)
+
+
+def test_the_real_sequence_reads_the_portal_origin_from_config(harness):
+    env, state, ambient, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    assert "portal origin (config.json): http://10.0.0.9; snowplow at http://10.0.0.9/content" in p.stderr
+    vals = (tmp / "out" / "installer-values.yaml").read_text()
+    assert "type: Gateway" in vals and "gatewayMode: path" in vals and "agentGateway: true" in vals

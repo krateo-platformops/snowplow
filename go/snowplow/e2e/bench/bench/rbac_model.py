@@ -34,6 +34,9 @@ __all__ = [
     "namespace_rbac_yaml",
     "admin_rbac_yaml",
     "READER_RULES",
+    "team_namespace",
+    "grant_scope",
+    "menu_class",
 ]
 
 BASE_GROUP = "devs"
@@ -75,6 +78,38 @@ def bench_model(users: int, namespaces: int) -> "RbacModel":
 
 def team_group(ns_index: int) -> str:
     return f"bench-team-{ns_index:02d}"
+
+
+def team_namespace(ns_index: int) -> str:
+    """The bench data namespace team NN owns (its compositions, nothing of the portal's)."""
+    return f"bench-ns-{ns_index:02d}"
+
+
+def grant_scope(group: str, m: RbacModel) -> tuple[str, ...] | None:
+    """Where this model's bindings let `group` read: its team's namespace
+    (namespace_rbac_yaml), ("*",) for the admins' ClusterRoleBinding
+    (admin_rbac_yaml), None for a group the bench does not bind at all (the
+    portal's base group: its grants are the platform's own)."""
+    for n in range(1, m.namespaces + 1):
+        if group == team_group(n):
+            return (team_namespace(n),)
+    if m.admins and group == ADMIN_GROUP:
+        return ("*",)
+    return None
+
+
+def menu_class(groups, m: RbacModel) -> str:
+    """The identity class of a user's portal MENU (run 17 attempt 5: the
+    portal filters its sidebar by RBAC, so admins see pages devs do not).
+    Its groups, less every group whose grants this model confines to bench
+    data namespaces: those hold compositions, never a portal page, so they
+    cannot change which pages a menu offers. A group the bench does not bind
+    (the platform grants it) and a cluster-wide one are kept. The label is
+    the kept groups, sorted, '+'-joined."""
+    data = {team_namespace(n) for n in range(1, m.namespaces + 1)}
+    kept = sorted(g for g in groups
+                  if (s := grant_scope(g, m)) is None or not set(s) <= data)
+    return "+".join(kept)
 
 
 def _home_team(i: int, m: RbacModel) -> int:
@@ -134,7 +169,7 @@ def _rules_yaml(rules) -> str:
 
 def namespace_rbac_yaml(ns_index: int) -> str:
     """Role + RoleBinding giving team NN read access to bench-ns-NN."""
-    ns = f"bench-ns-{ns_index:02d}"
+    ns = team_namespace(ns_index)
     grp = team_group(ns_index)
     return f"""\
 apiVersion: rbac.authorization.k8s.io/v1

@@ -41,7 +41,7 @@ import exec from 'k6/execution'
 import { sleep } from 'k6'
 import { SharedArray } from 'k6/data'
 import { Counter, Trend } from 'k6/metrics'
-import { firstLoad, firstLoadFailed, pickRoute, walkTree } from './spa.js'
+import { firstLoad, firstLoadFailed, pickRoute, sameMenu, userRoutes, walkTree } from './spa.js'
 
 const CFG = JSON.parse(open(__ENV.K6_CONFIG || '/opt/k6/config.json'))
 // Bearer tokens obtained by the pod's login initContainer (never under /out).
@@ -165,14 +165,15 @@ function record (start, kind, route, visit, calls, errors) {
   if (errors) NAV_ERRORS.add(errors, tags)
 }
 
-// The user's routes must be the run's route table (preflight's): route clicks
-// pick from it. Any difference is counted (a validity check), never assumed.
-function checkRoutes (routes) {
-  const mine = routes.map((r) => `${r.path} ${r.endpoint}`).sort().join('\n')
-  const table = CFG.routes.map((r) => `${r.path} ${r.endpoint}`).sort().join('\n')
-  if (mine !== table) ROUTE_MISMATCH.add(1)
+// A user's own menu must be its menu class's table (that class's preflight,
+// config menuClasses / userClass): any difference is counted per class (a
+// validity check), never assumed. Route clicks pick from the user's OWN menu.
+function classTable (user) {
+  return CFG.menuClasses[CFG.userClass[String(user)]]
 }
 
+// The first load; returns the routes the user's clicks pick from and the
+// route it landed on.
 function doFirstLoad (user, deepLink) {
   const start = Date.now()
   const kind = deepLink ? 'composite_first_load' : 'first_load'
@@ -183,18 +184,21 @@ function doFirstLoad (user, deepLink) {
   record(start, kind, route, 'first', calls, errors)
   FIRST_LOADS.add(1)
   const failed = firstLoadFailed(fl)
+  const table = classTable(user)
   if (failed) FIRST_FAILED.add(1, { kind })
-  else checkRoutes(fl.routes)
+  else if (!sameMenu(fl.routes, table)) ROUTE_MISMATCH.add(1, { class: CFG.userClass[String(user)] })
   feed({ kind: 'nav', nav: navId(user, 0), user, route, t_end: Date.now() / 1000, ok: !failed,
          shell: fl.shell.armed, page: fl.content ? fl.content.armed : [] })
+  const routes = userRoutes(fl, failed, table)
+  return { routes, firstPath: fl.target ? fl.target.path : (deepLink || routes[0].path) }
 }
 
-function routeClick (user, visit, firstPath) {
+function routeClick (user, visit, firstPath, routes) {
   // Has this user visited the route before? Its earlier choices are a pure
   // function of (user, visit): the first-load route at visit 0, then pickRoute.
-  const route = pickRoute(CFG.routes, user, visit)
+  const route = pickRoute(routes, user, visit)
   let seen = route.path === firstPath
-  for (let v = 1; v < visit && !seen; v++) seen = pickRoute(CFG.routes, user, v).path === route.path
+  for (let v = 1; v < visit && !seen; v++) seen = pickRoute(routes, user, v).path === route.path
   const start = Date.now()
   const w = walkTree([route.endpoint], fetcher(user, { kind: 'route' }))
   record(start, 'route', route.path, seen ? 'warm' : 'first', w.calls, w.errors)
@@ -205,7 +209,7 @@ function routeClick (user, visit, firstPath) {
 // One user's tab: arrive at `slotMs` (epoch ms), first load, then a route
 // click THINK_S after each page completed, until the run's end. `endMs`:
 // no page starts after it.
-function session (user, slotMs, endMs, deepLink, firstPath) {
+function session (user, slotMs, endMs, deepLink) {
   const wait = slotMs - Date.now()
   if (wait > 0) sleep(wait / 1000)
   // against the wall-clock slot: a VU that started, or woke, late is late
@@ -213,7 +217,7 @@ function session (user, slotMs, endMs, deepLink, firstPath) {
   ARRIVALS.add(1)
   ARRIVAL_LAG.add(lag)
   if (lag > LATE_MS) ARRIVALS_LATE.add(1)
-  doFirstLoad(user, deepLink)
+  const { routes, firstPath } = doFirstLoad(user, deepLink)
   const thinkMs = CFG.thinkS * 1000
   const loaded = Date.now()
   // the open schedule's clicks (slot + v * THINK_S) that fell inside the
@@ -228,7 +232,7 @@ function session (user, slotMs, endMs, deepLink, firstPath) {
     CLICKS.add(1)
     CLICK_LAG.add(clickLag)
     if (clickLag > LATE_MS) CLICKS_LATE.add(1)
-    routeClick(user, visit, firstPath)
+    routeClick(user, visit, firstPath, routes)
     next = Date.now() + thinkMs
   }
 }
@@ -240,15 +244,14 @@ export function navigate (data) {
   // per-vu-iterations, 1 each: iterationInTest is 0..NAV-1, one per user;
   // the first loads arrive spread over the first THINK_S, as before
   const i = exec.scenario.iterationInTest
-  session(NAV[i], data.t0 + i * 1000 / navRate, data.t0 + CFG.durationS * 1000, null,
-          CFG.routes[0].path)
+  session(NAV[i], data.t0 + i * 1000 / navRate, data.t0 + CFG.durationS * 1000, null)
 }
 
 export function compositeBurst (data) {
   // all at BURST_AT_S, each deep-linking to a composite route
   const i = exec.scenario.iterationInTest
   const route = CFG.compositeRoutes[i % CFG.compositeRoutes.length]
-  session(BURST[i], data.t0 + CFG.burstAtS * 1000, data.t0 + CFG.durationS * 1000, route, route)
+  session(BURST[i], data.t0 + CFG.burstAtS * 1000, data.t0 + CFG.durationS * 1000, route)
 }
 
 export function setup () {

@@ -177,7 +177,8 @@ spec:
 
 def render_preflight(*, snowplow_url: str, authn_url: str, user: str,
                      password: str, init: str, frontend_ns: str,
-                     builders_ns: str, src: str | None = None) -> str:
+                     builders_ns: str, src: str | None = None,
+                     job_name: str = "preflight606") -> str:
     """Namespace + ConfigMap + the preflight606 Job: one user, seconds-scale
     (`load606 preflight --full-walk`). Exit 2 = refused (an unserved type or
     a 404 on INIT or a menu route, no sidebar route, a sidebar that changed
@@ -214,14 +215,14 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: preflight606
+  name: {job_name}
   namespace: bench-loadgen
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: preflight606
+        app: {job_name}
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -457,57 +458,92 @@ def preflight_routes(path: str) -> list[dict]:
             if r.get("endpoint") and r.get("status") == 200]
 
 
-# The frontend's config.json (installer default, values.schema.json:2552-2556 at
-# 0.3.430) points the SPA at localhost:8081 snowplow, :8082 authn and :8083
-# events. :8083 is the sse-proxy (the /notifications firehose behind live
-# widget refresh, ui/src/hooks/useLiveRefresh.ts:18-21): Service
-# krateo-sse-proxy (installer compositions.yaml:790,803 pin the release name to
-# the component name; chart krateo-sse-proxy 0.1.15 templates/service.yaml:4 +
-# _helpers.tpl:20-31 make it the Service name) on port 8080
-# (templates/service.yaml:14, values.yaml:36; exposure.port is unset, so
-# compositions.yaml:153 leaves it).
-K6_BROWSER_FORWARDS = ("8080=frontend.krateo-system.svc:8080",
-                       "8081=snowplow.krateo-system.svc:8081",
-                       "8082=authn.krateo-system.svc:8082",
-                       "8083=krateo-sse-proxy.krateo-system.svc:8080")
+# The browser loads the portal from its OWN origin (run 19, Diego's ruling:
+# same-origin like 057's gateway): the platform gateway the installer routes
+# the portal stack through (exposure.type=Gateway, gatewayMode=path: / the
+# SPA, /auth authn, /content snowplow, /events sse-proxy), read from the
+# frontend's live config.json (load606 portal-origin). A localhost forwarder
+# (--browser-forward) gave the SPA four origins, and a cross-origin
+# Bearer-header fetch is preflighted: sse-proxy 1.2.0 answers that preflight
+# 401, so no /notifications stream ever opened (run 17 attempt 5).
+
+
+def _k6_population(a):
+    """(model, burst users, browser sessions, menu class of user i): the users
+    k6 drives and their menu classes, the same for --class-reps and the
+    driver's render."""
+    from bench import k6_job, rbac_model
+    burst_users = min(a.burst_users, a.users - 1) if a.dry_run else a.burst_users
+    model = rbac_model.RbacModel(users=a.users, namespaces=a.namespaces)
+    sessions = k6_job.browser_sessions(model, a.browser_sessions,
+                                       last=max(0, a.users - burst_users - 1))
+
+    def class_of(i):
+        return rbac_model.menu_class(rbac_model.user_groups(i, model), model)
+    return model, burst_users, sessions, class_of
+
+
+def class_representatives(a) -> dict[str, str]:
+    """{menu class: the user its preflight signs in as} (run606 s_classes)."""
+    from bench import data_manifests, k6_job
+    _, burst_users, sessions, class_of = _k6_population(a)
+    reps = k6_job.menu_class_representatives(class_of, a.users, burst_users,
+                                             [s["index"] for s in sessions])
+    return {c: data_manifests.scaleuser_name(i) for c, i in reps.items()}
+
+
+def class_tables(specs: list[str]) -> dict[str, list[dict]]:
+    """--class-preflight LABEL=FILE → {menu class: its preflight's route table}."""
+    out = {}
+    for spec in specs:
+        label, sep, path = spec.partition("=")
+        if not sep or not label or not path:
+            raise ValueError(f"--class-preflight wants LABEL=FILE, got {spec!r}")
+        out[label] = preflight_routes(path)
+    return out
 
 
 def render_k6_driver(a) -> str:
     """#830: the k6 load Job and the real-Chrome Job, from the CLI args."""
     import os
 
-    from bench import k6_job, rbac_model
+    from bench import k6_job
     viewers = not a.no_viewers
-    k6_job.loadgen_fit(a.loadgen_machine_type, k6_job.k6_plan_requests(viewers=viewers))
+    forwards = list(a.browser_forward or [])
+    if not forwards and not (a.browser_origin and a.browser_snowplow_url):
+        raise ValueError("the browser needs the portal's origin and snowplow URL "
+                         "(--browser-origin, --browser-snowplow-url) or forwards")
+    k6_job.loadgen_fit(a.loadgen_machine_type,
+                       k6_job.k6_plan_requests(viewers=viewers, forwarder=bool(forwards)))
+    _, burst_users, sessions, class_of = _k6_population(a)
     if a.preflight_file and os.path.exists(a.preflight_file):
         routes = preflight_routes(a.preflight_file)
+        menu_classes = class_tables(a.class_preflight or [])
     elif a.dry_run:
         # BENCH_606_DRY_RUN prints the manifests and applies nothing; there is
-        # no preflight to read, so the route table is a visible placeholder.
+        # no preflight to read, so the route tables are visible placeholders.
         routes = [{"path": "/dry-run-no-preflight", "endpoint": a.init}]
+        menu_classes = {c: routes for c in class_representatives(a)}
     else:
         raise ValueError(f"no preflight route table at {a.preflight_file!r}")
     think_s = a.think_s if a.think_s > 0 or not a.dry_run else 1.0   # dry: printed, never run
-    burst_users = min(a.burst_users, a.users - 1) if a.dry_run else a.burst_users
-    model = rbac_model.RbacModel(users=a.users, namespaces=a.namespaces)
-    sessions = k6_job.browser_sessions(model, a.browser_sessions,
-                                       last=max(0, a.users - burst_users - 1))
     cfg = k6_job.k6_config(snowplow_url=a.snowplow_url, init=a.init, frontend_ns=a.frontend_ns,
                            builders_ns=a.builders_ns, routes=routes, users=a.users,
                            burst_users=burst_users, think_s=think_s,
                            duration_s=a.duration_s, burst_at_s=a.burst_at_s,
                            composite_routes=a.composite_route or (
                                [routes[0]["path"]] if a.dry_run else []),
+                           menu_classes=menu_classes, class_of=class_of,
                            browser_users=[s["index"] for s in sessions], viewers=viewers)
     fresh = None
     if a.fresh_classes:
         import json
         with open(a.fresh_classes) as fh:
             fresh = json.load(fh)
+    origin = dict(frontend_url=a.browser_origin, snowplow_url=a.browser_snowplow_url) if not forwards else {}
     bcfg = k6_job.browser_config(sessions=sessions, routes=[r["path"] for r in routes],
                                  password=a.password, think_s=a.browser_think_s,
-                                 duration_s=a.duration_s, fresh=fresh)
-    forwards = a.browser_forward or list(K6_BROWSER_FORWARDS)
+                                 duration_s=a.duration_s, fresh=fresh, **origin)
     return (k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password,
                              linger_s=a.linger_s)
             + k6_job.render_browser(config=bcfg, forwards=forwards, linger_s=a.linger_s))
@@ -533,6 +569,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--preflight-only", action="store_true",
                    help="render ONLY the preflight Job (+ namespace/configmap)")
     p.add_argument("--preflight-user", default="scaleuser-0000")
+    p.add_argument("--preflight-job-name", default="preflight606",
+                   help="--preflight-only: the Job's name (a menu class's preflight, run606 s_classes)")
+    p.add_argument("--class-reps", action="store_true",
+                   help="print each menu class k6 drives and the user its preflight signs in as "
+                        "(LABEL<TAB>USER lines), then exit")
+    p.add_argument("--class-preflight", action="append", default=None,
+                   help="k6: LABEL=FILE, a menu class's preflight.jsonl (repeatable): that class's table")
     # Optional in-cluster freshness Job (fresh606), same manifest.
     p.add_argument("--fresh-rates", nargs="*", default=None)
     p.add_argument("--fresh-user", default="scaleuser-0001")
@@ -565,13 +608,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fresh-classes", default=None,
                    help="#935: bench/fresh_classes plan JSON (each browser session's fresh identity classes)")
     p.add_argument("--browser-forward", action="append", default=None,
-                   help="k6: LOCALPORT=host:port forwarded inside the browser pod (repeatable)")
+                   help="k6: LOCALPORT=host:port forwarded inside the browser pod (repeatable); "
+                        "none: the browser loads the portal from --browser-origin")
+    p.add_argument("--browser-origin", default=None,
+                   help="k6: the portal's origin as the frontend config names it (load606 portal-origin)")
+    p.add_argument("--browser-snowplow-url", default=None,
+                   help="k6: snowplow as the browser reaches it (config SNOWPLOW_API_BASE_URL)")
     a = p.parse_args(argv)
+    if a.class_reps:
+        for label, user in sorted(class_representatives(a).items()):
+            print(f"{label}\t{user}")
+        return 0
     if a.preflight_only:
         sys.stdout.write(render_preflight(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
             user=a.preflight_user, password=a.password, init=a.init,
-            frontend_ns=a.frontend_ns, builders_ns=a.builders_ns))
+            frontend_ns=a.frontend_ns, builders_ns=a.builders_ns,
+            job_name=a.preflight_job_name))
         return 0
     if a.driver == "k6":
         sys.stdout.write(render_base() + render_k6_driver(a))

@@ -18,9 +18,10 @@
 // Live updates, the user's way (#830 re-gate): the SPA keeps two SSE streams,
 // each counted per session when it OPENS (an answered request): snowplow's
 // per-widget `/refreshes` (fetch POST, hooks/refreshSse.ts:572-578) and the
-// sse-proxy's `/notifications` firehose (EventSource, hooks/sseClient.ts:49,
-// subscribed at hooks/useLiveRefresh.ts:18-21; localhost:8083 is forwarded to
-// it). `browser_sse_opened{session, stream}`; the evaluator wants >= 1 of each.
+// sse-proxy's `/notifications` firehose (fetch + Bearer from frontend 1.8.11,
+// hooks/sseClient.ts; an EventSource before; under the portal's origin at
+// /events, as on 057). pageload.sseStreamOf tells them apart.
+// `browser_sse_opened{session, stream}`; the evaluator wants >= 1 of each.
 import { browser } from 'k6/browser'
 import exec from 'k6/execution'
 import http from 'k6/http'

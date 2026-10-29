@@ -107,10 +107,13 @@ BROWSER_SESSIONS="${BROWSER_SESSIONS:-5}"
 if [[ "$LOAD_DRIVER" == "k6" ]]; then LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-16}"
 else LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-8}"; fi
 BROWSER_THINK_S="${BROWSER_THINK_S:-15}"
-# Inside the browser pod, the frontend's localhost URLs (its config.json was
-# made for a port-forwarding operator) are forwarded to the cluster Services;
-# :8083 = the sse-proxy (live refresh): sources in bench/load606_job.py.
-BROWSER_FORWARDS="${BROWSER_FORWARDS:-8080=frontend.krateo-system.svc:8080 8081=snowplow.krateo-system.svc:8081 8082=authn.krateo-system.svc:8082 8083=krateo-sse-proxy.krateo-system.svc:8080}"
+# The browser loads the portal from ITS OWN origin, as krateo-057's users do
+# (run 19 ruling: same-origin like 057's gateway): the installer routes the
+# portal stack through the platform gateway (s_install: exposure.type=Gateway,
+# gatewayMode=path) and the frontend's live config.json names that origin
+# (wait_portal_origin). No localhost forwards: they gave the SPA four origins,
+# and sse-proxy 401s the preflight of a cross-origin Bearer fetch, so run 17
+# attempt 5 opened no /notifications stream.
 CHURN_RATES="${CHURN_RATES:-1 10 50}"
 FRESH_SAMPLES="${FRESH_SAMPLES:-60}"
 FRESH_GAP_S="${FRESH_GAP_S:-5}"
@@ -221,12 +224,20 @@ fi
 # step at its maximum, must fit inside the cluster's TTL minus a margin, or
 # the TTL reaper could delete the cluster mid-measure (or a hung step could
 # outlive it). Refused here, before any cloud call.
+# the menu classes k6 drives, each one more preflight (s_classes)
+CLASS_COUNT=0
+if [[ "$LOAD_DRIVER" == "k6" ]]; then
+  CLASS_COUNT="$(python3 -m bench.load606_job --class-reps --users "$USERS" --namespaces "$NAMESPACES" \
+      --browser-sessions "$BROWSER_SESSIONS" --burst-users "$COMPOSITE_BURST_USERS" --snowplow-url - \
+      --authn-url - --password - --init - --driver k6 | grep -c .)" \
+    || { echo "refusing: the menu classes k6 drives could not be listed (bench.load606_job --class-reps)" >&2; exit 2; }
+fi
 RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
-                 + ENDPOINT_WAIT_S + PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
+                 + ENDPOINT_WAIT_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
-budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -516,9 +527,21 @@ s_install() {
 bootstrap:
   coreProvider:
     enabled: true
+# The portal stack behind ONE origin, as krateo-057's installer-platform
+# release has it (helm get values, read-only 2026-10-29): exposure Gateway,
+# path mode (/ frontend, /auth authn, /content snowplow, /events sse-proxy,
+# each prefix rewritten to /), the two-gateway split, the agentgateway. 057
+# also sets tls (its own hostname and certificate): the bench has neither, so
+# its origin is http://<platform gateway ip>:<platformPort>.
 exposure:
-  type: LoadBalancer
+  type: Gateway
+  gatewayMode: path
+  gatewayRef:
+    name: krateo-agent-gateway
+  internalDataPlane: true
+  platformPort: 80
 features:
+  agentGateway: true
   coreAgents: false
   specialistAgents: false
 vertexAI:
@@ -579,7 +602,44 @@ capped_definitions() {
         "$at" "$DEFS_CAP_S" "$(date +%s)" >> "$OUT/platform-definitions.jsonl"
   fi
 }
+# wait_portal_origin <deadline epoch>: the frontend's live config.json must
+# name ONE origin for snowplow, authn and sse-proxy, at 057's paths (load606
+# portal-origin). The installer writes those URLs once the platform gateway
+# has an address ("the next reconcile fills it", compositions.yaml); until
+# then the SPA keeps its localhost defaults. Re-read every PLATFORM_POLL_S
+# until the platform step's own deadline (no budget of its own); a portal
+# that is never same-origin stops the run HERE, before data and load are paid
+# for, with what config.json said.
+wait_portal_origin() {
+  local deadline="$1" why=""
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: read $FRONTEND_CONFIGMAP config.json until load606 portal-origin passes -> $OUT/portal-origin.env"
+    printf 'export PORTAL_ORIGIN=http://dry-run-gateway PORTAL_SNOWPLOW_URL=http://dry-run-gateway/content\n' \
+        > "$OUT/portal-origin.env"
+    # shellcheck disable=SC1091
+    source "$OUT/portal-origin.env"
+    return 0
+  fi
+  while :; do
+    "${K[@]}" -n krateo-system get configmap "$FRONTEND_CONFIGMAP" \
+        -o 'jsonpath={.data.config\.json}' > "$OUT/frontend-config.json" 2>"$KERR" || true
+    if python3 -m bench.load606 portal-origin < "$OUT/frontend-config.json" \
+        > "$OUT/portal-origin.env" 2>"$OUT/.portal-origin.err"; then
+      # shellcheck disable=SC1091
+      source "$OUT/portal-origin.env"
+      log "portal origin (config.json): $PORTAL_ORIGIN; snowplow at $PORTAL_SNOWPLOW_URL"
+      return 0
+    fi
+    why="$(cut -c1-600 "$OUT/.portal-origin.err")"
+    (( $(date +%s) < deadline )) || break
+    log "portal not same-origin yet: $why"
+    sleep "$PLATFORM_POLL_S"
+  done
+  record_failure "portal origin FAILED: ${why:-config.json unreadable}" || true
+  return 1
+}
 s_wait_platform() {
+  PLATFORM_STARTED="$(date +%s)"
   # Polled, not a blind wait: prints which components are Ready (and why the
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
@@ -598,6 +658,7 @@ s_wait_platform() {
   # their Services present (checked by the env step).
   run "${K[@]}" -n krateo-system wait --for=condition=Available \
       $(printf 'deploy/%s ' $REQUIRED_DEPLOYMENTS) --timeout="${DEPLOY_WAIT_S}s"
+  wait_portal_origin "$(( PLATFORM_STARTED + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S ))" || return 1
   # Record WHERE snowplow runs: a pod outside the dedicated pool shares CPU.
   run "${K[@]}" -n krateo-system get pods -l app.kubernetes.io/name=snowplow \
       -o wide | tee -a "$OUT/snowplow-placement.txt" || true
@@ -656,6 +717,37 @@ flowcontrol_attribution() {
   fi
   log "flow control: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl")"
 }
+# run_preflight_job <job> <out.jsonl> <what>: wait (PREFLIGHT_TIMEOUT_S) for
+# an applied preflight Job, keep its record, and refuse the run when it
+# refused (naming what) or did not finish.
+run_preflight_job() {
+  local job="$1" out="$2" what="$3"
+  [[ "$job" == preflight606 ]] || kapply "${out%.jsonl}-job.yaml"
+  local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S )) ok="" failed=""
+  while (( $(date +%s) < deadline )); do
+    ok="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
+    failed="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
+    [[ -n "$ok" && "$ok" != "0" ]] && break
+    [[ -n "$failed" && "$failed" != "0" ]] && break
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  "${K[@]}" -n bench-loadgen logs "job/$job" > "$out" 2>&1 || true
+  local summary why
+  summary="$(python3 -m bench.load606 preflight-summary < "$out" 2>&1 || true)"
+  printf '%s\n' "$summary" >&2
+  if [[ -n "$failed" && "$failed" != "0" ]]; then
+    # name WHAT was refused (run 17: "(sidebar menu) -> None: the shell
+    # rendered no sidebar Menu with routes" was logged as an unserved type / 404)
+    why="$(printf '%s\n' "$summary" | sed -n 's/^\[preflight\] REFUSED //p' | awk 'NR<=3' | tr '\n' ';')"
+    log "PREFLIGHT REFUSED (${what}): ${why:-no refusal line (the preflight Job failed without a result)} — see $out"
+    return 1
+  fi
+  if [[ -z "$ok" || "$ok" == "0" ]]; then
+    log "PREFLIGHT (${what}) did not finish within ${PREFLIGHT_TIMEOUT_S}s"
+    return 1
+  fi
+  log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
+}
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
   # (run 6 discovered stale page roots 54 minutes in). The boot root is the
@@ -678,30 +770,7 @@ s_preflight() {
       --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \
       > "$OUT/preflight-job.yaml"
   kapply "$OUT/preflight-job.yaml"
-  local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S )) ok="" failed=""
-  while (( $(date +%s) < deadline )); do
-    ok="$("${K[@]}" -n bench-loadgen get job preflight606 -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
-    failed="$("${K[@]}" -n bench-loadgen get job preflight606 -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
-    [[ -n "$ok" && "$ok" != "0" ]] && break
-    [[ -n "$failed" && "$failed" != "0" ]] && break
-    sleep "$PREFLIGHT_POLL_S"
-  done
-  "${K[@]}" -n bench-loadgen logs job/preflight606 > "$OUT/preflight.jsonl" 2>&1 || true
-  local summary why
-  summary="$(python3 -m bench.load606 preflight-summary < "$OUT/preflight.jsonl" 2>&1 || true)"
-  printf '%s\n' "$summary" >&2
-  if [[ -n "$failed" && "$failed" != "0" ]]; then
-    # name WHAT was refused (run 17: "(sidebar menu) -> None: the shell
-    # rendered no sidebar Menu with routes" was logged as an unserved type / 404)
-    why="$(printf '%s\n' "$summary" | sed -n 's/^\[preflight\] REFUSED //p' | awk 'NR<=3' | tr '\n' ';')"
-    log "PREFLIGHT REFUSED: ${why:-no refusal line (the preflight Job failed without a result)} — see $OUT/preflight.jsonl"
-    return 1
-  fi
-  if [[ -z "$ok" || "$ok" == "0" ]]; then
-    log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s"
-    return 1
-  fi
-  log "preflight OK (product errors, if any, are recorded, not fatal)"
+  run_preflight_job preflight606 "$OUT/preflight.jsonl" "the run" || return 1
   local r
   while IFS= read -r r; do [[ -n "$r" ]] && COMPOSITE_ROUTES+=("$r"); done \
     < <(python3 -m bench.load606 preflight-composite < "$OUT/preflight.jsonl")
@@ -766,6 +835,37 @@ fresh_classes_cleanup() {
         >/dev/null 2>"$KERR" || log "fresh classes cleanup: $(kerr_line)"
   done < <(python3 -m bench.fresh_classes cleanup --plan "$OUT/fresh-classes.json")
   log "fresh classes cleaned up"
+}
+# s_classes (run 17 attempt 5): the portal filters its menu by RBAC, so each
+# menu class k6 drives (bench/rbac_model.menu_class: a user's groups less the
+# team groups, whose grants stay in bench data namespaces) gets its own route
+# table: the preflight606 walk, signed in as that class's lowest-index k6
+# user (load606_job --class-reps). After the data step (its users and RBAC
+# exist) and before the reboot (snowplow forgets what the walks warmed).
+# Each table is one --class-preflight LABEL=FILE of the measure step.
+CLASS_PREFLIGHTS=()
+s_classes() {
+  local label user k=0 f
+  while IFS=$'\t' read -r label user; do
+    [[ -n "$label" ]] || continue
+    k=$(( k + 1 ))
+    f="$OUT/class-preflight-${k}.jsonl"
+    log "menu class ${label}: preflight as its lowest-index k6 user"
+    if [[ "$DRY" == "1" ]]; then
+      log "DRY: preflight606-c${k} Job -> $f"
+      continue
+    fi
+    python3 -m bench.load606_job --preflight-only --preflight-job-name "preflight606-c${k}" \
+        --preflight-user "$user" --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
+        --password "$PW" --init "$PORTAL_INIT" --frontend-ns "$PORTAL_FRONTEND_NS" \
+        --builders-ns "$PORTAL_BUILDERS_NS" > "$OUT/class-preflight-${k}-job.yaml"
+    run_preflight_job "preflight606-c${k}" "$f" "menu class ${label}" || return 1
+    CLASS_PREFLIGHTS+=("${label}=${f}")
+  done < <(python3 -m bench.load606_job --class-reps --users "$USERS" --namespaces "$NAMESPACES" \
+             --browser-sessions "$BROWSER_SESSIONS" --burst-users "$COMPOSITE_BURST_USERS" \
+             --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
+             --init "$PORTAL_INIT" --driver k6 $([[ "$DRY" == "1" ]] && printf -- "--dry-run"))
+  (( k > 0 )) || { log "no menu class: k6 drives no user"; return 1; }
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
@@ -849,7 +949,8 @@ s_measure() {
       --browser-sessions "$BROWSER_SESSIONS" --browser-think-s "$BROWSER_THINK_S" \
       $([[ -f "$OUT/fresh-classes.json" ]] && printf -- "--fresh-classes %s" "$OUT/fresh-classes.json") \
       --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
-      $(for x in $BROWSER_FORWARDS; do printf -- '--browser-forward %s ' "$x"; done) \
+      ${CLASS_PREFLIGHTS[@]+$(printf -- '--class-preflight %q ' "${CLASS_PREFLIGHTS[@]}")} \
+      --browser-origin "$PORTAL_ORIGIN" --browser-snowplow-url "$PORTAL_SNOWPLOW_URL" \
       > "$OUT/loadgen-job.yaml"
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
@@ -1486,6 +1587,7 @@ if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi
 step env       s_env
 step preflight s_preflight
 step data      s_data
+if [[ "$LOAD_DRIVER" == "k6" ]]; then step classes s_classes; fi
 step reboot    s_reboot
 step digest    s_digest
 step measure   s_measure

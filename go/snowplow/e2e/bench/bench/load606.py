@@ -4175,6 +4175,54 @@ def portal_from_config_json(text: str) -> dict:
             "builders_ns": api.get("BUILDERS_NAMESPACE") or ""}
 
 
+# The portal stack behind ONE origin, as krateo-057 serves it (read-only,
+# 2026-10-29): Gateway krateo-agent-gateway-platform, one listener; HTTPRoutes
+# / -> frontend, /auth -> authn, /content -> snowplow, /events -> sse-proxy
+# (each prefix rewritten to /); frontend-config-vars config.json names them
+# https://portal.krateo.dev{/auth,/content,/events}. The installer writes the
+# same table for exposure.type=Gateway, gatewayMode=path (component-pins
+# gatewayPath). config.json key -> the path it must carry on that origin.
+PORTAL_PATHS = {"SNOWPLOW_API_BASE_URL": "/content", "AUTHN_API_BASE_URL": "/auth",
+                "EVENTS_API_BASE_URL": "/events", "EVENTS_PUSH_API_BASE_URL": "/events"}
+
+
+def portal_origin(text: str) -> dict:
+    """The frontend's config.json → {origin, snowplow_url, urls}, or
+    {origin: None, why}: the SPA's peers (snowplow, authn, sse-proxy) must
+    share ONE origin at 057's paths. Four origins make every Bearer-header
+    fetch cross-origin, and its preflight is the server's to answer (run 17
+    attempt 5: sse-proxy 401s it, so /notifications never opened)."""
+    from urllib.parse import urlsplit
+    api = (json.loads(text).get("api") or {})
+    urls = {k: api.get(k) or "" for k in PORTAL_PATHS}
+    origins, wrong = set(), []
+    for k, path in PORTAL_PATHS.items():
+        u = urlsplit(urls[k])
+        if not (u.scheme and u.netloc):
+            wrong.append(f"{k}={urls[k]!r} is not an absolute URL")
+            continue
+        origins.add(f"{u.scheme}://{u.netloc}")
+        if u.path.rstrip("/") != path:
+            wrong.append(f"{k}={urls[k]!r}: path {u.path or '/'!r}, not {path!r}")
+    if len(origins) > 1:
+        wrong.append(f"{len(origins)} origins: {sorted(origins)}")
+    if wrong:
+        return {"origin": None, "urls": urls, "why": "; ".join(wrong)}
+    origin = origins.pop()
+    return {"origin": origin, "urls": urls, "snowplow_url": urls["SNOWPLOW_API_BASE_URL"].rstrip("/")}
+
+
+def _cmd_portal_origin(a) -> int:
+    r = portal_origin(sys.stdin.read())
+    if r["origin"] is None:
+        print(f"portal not same-origin: {r['why']}", file=sys.stderr)
+        return 1
+    import shlex
+    print(f"export PORTAL_ORIGIN={shlex.quote(r['origin'])}")
+    print(f"export PORTAL_SNOWPLOW_URL={shlex.quote(r['snowplow_url'])}")
+    return 0
+
+
 def _cmd_portal_config(a) -> int:
     p = portal_from_config_json(sys.stdin.read())
     import shlex
@@ -5511,6 +5559,11 @@ def main(argv: list[str] | None = None) -> int:
     pc = sub.add_parser("portal-config",
                         help="config.json on stdin -> PORTAL_* shell exports")
     pc.set_defaults(func=_cmd_portal_config)
+    po = sub.add_parser("portal-origin",
+                        help="config.json on stdin -> PORTAL_ORIGIN / PORTAL_SNOWPLOW_URL exports; "
+                             "exit 1 (the reason on stderr) unless snowplow, authn and sse-proxy share "
+                             "one origin at 057's paths")
+    po.set_defaults(func=_cmd_portal_origin)
     ps = sub.add_parser("preflight-summary", help="preflight JSONL on stdin -> summary")
     ps.set_defaults(func=_cmd_preflight_summary)
     pcx = sub.add_parser("preflight-composite", help="preflight JSONL on stdin -> composite routes")

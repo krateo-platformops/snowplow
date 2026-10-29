@@ -55,14 +55,19 @@ export const OBSERVER = `(() => {
     b.armClick = false;
     b.navT0 = performance.now(); b.saw = false; b.goneAt = 0;
   }, true);
-  // live updates: each SSE stream counted when it OPENS (an answered request)
+  // live updates: each SSE stream counted when it OPENS (an answered request).
+  // The SPA reads both with fetch + Bearer (refreshSse.ts; sseClient.ts from
+  // frontend 1.8.11, 18df61d): a fetch whose response is ok opened its
+  // stream. An older SPA opens /notifications as an EventSource: counted at
+  // its 'open'.
   const sse = window.__benchSse = { refreshes: 0, notifications: 0 };
+  const sseStreamOf = ${sseStreamOf.toString()};
   const f = window.fetch;
   window.fetch = function (input, init) {
-    const url = String((input && input.url) || input);
+    const s = sseStreamOf(String((input && input.url) || input), window.location.href);
     const p = f.apply(this, arguments);
-    if (url.indexOf('/refreshes') >= 0) {
-      p.then((r) => { if (r.ok) sse.refreshes++ }, () => {});
+    if (s) {
+      p.then((r) => { if (r.ok) sse[s]++ }, () => {});
     }
     return p;
   };
@@ -70,8 +75,9 @@ export const OBSERVER = `(() => {
   if (ES) {
     window.EventSource = function (url, opts) {
       const es = new ES(url, opts);
-      if (String(url).indexOf('/notifications') >= 0) {
-        es.addEventListener('open', () => { sse.notifications++ });
+      const s = sseStreamOf(String(url), window.location.href);
+      if (s) {
+        es.addEventListener('open', () => { sse[s]++ });
       }
       return es;
     };
@@ -104,6 +110,19 @@ export const OBSERVER = `(() => {
 // a URL pattern with a fixed string and needs the `url` system tag, which
 // would put the extras into every point. Self-contained, like settledNow
 // (shipped into the page as source text).
+// The live-update stream a request opens: 'refreshes' (snowplow's
+// per-widget stream) or 'notifications' (sse-proxy's firehose), by the URL's
+// LAST path segment, wherever the portal mounts it (localhost:8083/
+// notifications, or /events/notifications behind a path-mode gateway);
+// anything else (a /call named "notifications-…" among it): null.
+// Self-contained, shipped into the page as source text.
+function sseStreamOf (url, base) {
+  let u
+  try { u = new URL(url, base) } catch (e) { return null }
+  const m = /\/(refreshes|notifications)\/?$/.exec(u.pathname)
+  return m ? m[1] : null
+}
+
 function callOf (url, base, duration, status) {
   let u
   try { u = new URL(url, base) } catch (e) { return null }
@@ -298,4 +317,4 @@ export function recordOps (r, tags, timeoutMs) {
   return ops
 }
 
-export { callOf, loadOf, settledNow }
+export { callOf, loadOf, settledNow, sseStreamOf }

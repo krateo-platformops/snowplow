@@ -42,6 +42,8 @@ export function firstLoad (portal, fetch, deepLink) {
            target: { path: deepLink || '/a' }, routes: globalThis.__routes, ok: true }
 }
 export function firstLoadFailed (fl) { return false }
+export function sameMenu (routes, table) { return true }
+export function userRoutes (fl, failed, table) { return failed ? table : fl.routes }
 export function pickRoute (routes, user, visit) { return routes[visit %% routes.length] }
 export function walkTree (endpoints, fetch) {
   globalThis.__clock += %d
@@ -63,7 +65,7 @@ def _session(tmp_path, *, fn="navigate", i=0, clock0=T0, oversleep=(), scenario_
         (BENCH_DIR / "k6" / "navigate.js").read_text().replace("'./spa.js'", "'./spa.mjs'"))
     (tmp_path / "spa.mjs").write_text(SPA)
     cfg = k6_job.k6_config(snowplow_url="http://s", init=INIT, frontend_ns=NS, builders_ns=NS,
-                           routes=ROUTES, users=6, burst_users=2, think_s=THINK_MS / 1000,
+                           routes=ROUTES, menu_classes={"devs": ROUTES}, class_of=lambda i: "devs", users=6, burst_users=2, think_s=THINK_MS / 1000,
                            duration_s=20, burst_at_s=8, composite_routes=["/b"], viewers=False)
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     (tmp_path / "tokens.json").write_text("[]")

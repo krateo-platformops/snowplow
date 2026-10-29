@@ -99,14 +99,15 @@ def loadgen_fit(machine: str, requests: list[tuple[str, str]]) -> dict:
 
 
 def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
-                     viewers: bool = True) -> list[tuple[str, str]]:
+                     viewers: bool = True, forwarder: bool = True) -> list[tuple[str, str]]:
     """Every container the k6 plan puts on the loadgen node: k6 (+ its viewer
     sidecar), the browser pod (Chrome + the forwarder sidecar), fresh606 and
     mem606."""
     return ([(k6_cpu or K6_CPU, K6_MEMORY)]
             + ([(VIEWER_CPU, VIEWER_MEMORY)] if viewers else [])
-            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FORWARD_CPU, FORWARD_MEMORY),
-               (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
+            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY)]
+            + ([(FORWARD_CPU, FORWARD_MEMORY)] if forwarder else [])
+            + [(FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
 
 
 def browser_sessions(m: rbac_model.RbacModel, n: int = 5,
@@ -156,13 +157,46 @@ def first_visit_label(sessions: list[dict]) -> str:
     return "first for this tab, not cold: k6 users share some sessions' identity classes"
 
 
+def k6_users(users: int, burst_users: int, browser_users=()) -> tuple[list[int], list[int]]:
+    """(navigating, burst) user indices k6 drives: the burst users are the
+    LAST `burst_users` of 1..users; the real-Chrome sessions' users are left
+    out, so each identity has exactly one client."""
+    if not 0 <= burst_users < users:
+        raise ValueError("burst users must be fewer than users")
+    burst_ids = list(range(users - burst_users + 1, users + 1))
+    excluded = set(browser_users)
+    if excluded & set(burst_ids) or not excluded <= set(range(1, users + 1)):
+        raise ValueError("browser users must be navigating users in 1..users, outside the burst")
+    nav_ids = [i for i in range(1, users - burst_users + 1) if i not in excluded]
+    if not nav_ids:
+        raise ValueError("no user left for k6 to drive")
+    return nav_ids, burst_ids
+
+
+def menu_class_representatives(class_of, users: int, burst_users: int, browser_users=()) -> dict[str, int]:
+    """{menu class: the lowest-index user of it k6 drives} — the user each
+    class's preflight signs in as (run606 s_classes), so its table is one
+    such user's real menu."""
+    nav_ids, burst_ids = k6_users(users, burst_users, browser_users)
+    reps: dict[str, int] = {}
+    for i in sorted(nav_ids + burst_ids):
+        reps.setdefault(class_of(i), i)
+    return reps
+
+
+def _table(routes) -> list[dict]:
+    return [{"path": r["path"], "endpoint": r["endpoint"]} for r in routes]
+
+
 def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: str,
               routes: list[dict], users: int, burst_users: int, think_s: float,
               duration_s: float, burst_at_s: float, composite_routes: list[str],
+              menu_classes: dict[str, list[dict]], class_of,
               browser_users: list[int] = (), viewers: bool = True) -> dict:
-    """k6's config. The burst users are the LAST `burst_users` of 1..users;
-    the real-Chrome sessions' users (`browser_users`) are left out of k6's
-    navigating users, so each identity has exactly one client."""
+    """k6's config. `routes`: the run's preflight table; `menu_classes`:
+    {menu class: that class's preflight table}; `class_of(i)`: user i's menu
+    class (rbac_model.menu_class). Each user clicks from its OWN menu and
+    navigate.js counts a user whose menu is not its class's table."""
     if not routes:
         raise ValueError("no route table: preflight found no navigable route")
     if burst_users and not composite_routes:
@@ -171,20 +205,23 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
     if unknown:
         # a deep link outside the menu would record failed first loads, not a burst
         raise ValueError(f"composite routes not in the route table: {sorted(unknown)}")
-    if not 0 <= burst_users < users:
-        raise ValueError("burst users must be fewer than users")
     if think_s <= 0:
         raise ValueError("the think time must be > 0: it sets k6's arrival rate")
-    burst_ids = list(range(users - burst_users + 1, users + 1))
-    excluded = set(browser_users)
-    if excluded & set(burst_ids) or not excluded <= set(range(1, users + 1)):
-        raise ValueError("browser users must be navigating users in 1..users, outside the burst")
-    nav_ids = [i for i in range(1, users - burst_users + 1) if i not in excluded]
-    if not nav_ids:
-        raise ValueError("no user left for k6 to drive")
+    nav_ids, burst_ids = k6_users(users, burst_users, browser_users)
+    user_class = {str(i): class_of(i) for i in nav_ids + burst_ids}
+    missing = sorted(set(user_class.values()) - {c for c, t in menu_classes.items() if t})
+    if missing:
+        raise ValueError(f"menu classes with no preflight route table: {missing}")
+    for i in burst_ids:
+        if unknown := set(composite_routes) - {r["path"] for r in menu_classes[user_class[str(i)]]}:
+            raise ValueError(f"composite routes not in menu class {user_class[str(i)]!r}'s table: "
+                             f"{sorted(unknown)}")
+    used = set(user_class.values())
     return {"snowplowUrl": snowplow_url.rstrip("/"), "init": init, "frontendNs": frontend_ns,
             "buildersNs": builders_ns,
-            "routes": [{"path": r["path"], "endpoint": r["endpoint"]} for r in routes],
+            "routes": _table(routes),
+            "menuClasses": {c: _table(t) for c, t in menu_classes.items() if c in used},
+            "userClass": user_class,
             "users": users, "burstUsers": burst_users, "thinkS": think_s,
             "navUserIds": nav_ids, "burstUserIds": burst_ids,
             "durationS": int(duration_s), "burstAtS": int(burst_at_s),
@@ -447,19 +484,19 @@ FORWARD_PROBE_PERIOD_S = 2
 FORWARD_ATTEMPT_S = 10
 
 
-def _forward_wait(ports: list[str], wait_s: int) -> str:
-    """POSIX sh (busybox): every 127.0.0.1:<port> answers HTTP (any status;
-    busybox wget prints `HTTP/` only when a server answered) within wait_s;
-    each attempt ends within FORWARD_ATTEMPT_S (+2 s to kill), so the wait
-    overruns wait_s by at most one attempt. Writes /out/browser-forward.json
-    either way."""
+def _forward_wait(urls: list[str], wait_s: int) -> str:
+    """POSIX sh (busybox): every URL (a forward's 127.0.0.1:<port>/, or the
+    portal's own origin) answers HTTP (any status; busybox wget prints
+    `HTTP/` only when a server answered) within wait_s; each attempt ends
+    within FORWARD_ATTEMPT_S (+2 s to kill), so the wait overruns wait_s by
+    at most one attempt. Writes /out/browser-forward.json either way."""
     return f"""wait_forwards() {{
   t0=$(date +%s); end=$((t0 + ${{FORWARD_WAIT_S:-{wait_s}}}))
-  for p in {" ".join(ports)}; do
-    until timeout -k 2 {FORWARD_ATTEMPT_S} wget -q -T 5 -S -O /dev/null "http://127.0.0.1:$p/" 2>&1 | grep -q 'HTTP/'; do
+  for u in {" ".join(urls)}; do
+    until timeout -k 2 {FORWARD_ATTEMPT_S} wget -q -T 5 -S -O /dev/null "$u" 2>&1 | grep -q 'HTTP/'; do
       if [ "$(date +%s)" -ge "$end" ]; then
-        echo "forward 127.0.0.1:$p did not answer within ${{FORWARD_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
-        printf '{{"kind": "forward_wait", "ok": false, "port": %s, "waited_s": %s}}\\n' "$p" "$(( $(date +%s) - t0 ))" > /out/browser-forward.json
+        echo "$u did not answer within ${{FORWARD_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
+        printf '{{"kind": "forward_wait", "ok": false, "url": "%s", "waited_s": %s}}\\n' "$u" "$(( $(date +%s) - t0 ))" > /out/browser-forward.json
         return 3
       fi
       sleep 1
@@ -470,42 +507,10 @@ def _forward_wait(ports: list[str], wait_s: int) -> str:
 """
 
 
-def render_browser(*, config: dict, forwards: list[str], linger_s: float,
-                   cpu: str = BROWSER_CPU, memory: str = BROWSER_MEMORY,
-                   forward_wait_s: int = FORWARD_WAIT_S) -> str:
-    """ConfigMap k6browser (script + config + forwarder) + the k6browser Job:
-    Chrome through k6 browser, behind the localhost forwarder (a native
-    sidecar Chrome waits for)."""
-    files = {"browser.js": (K6_DIR / "browser.js").read_text(),
-             "pageload.js": (K6_DIR / "pageload.js").read_text(),
-             "forward.py": (K6_DIR / "forward.py").read_text(),
-             "browser-config.json": json.dumps(config, indent=1)}
-    ports = [f.split("=", 1)[0] for f in forwards]
-    run = (_forward_wait(ports, forward_wait_s) + "wait_forwards && "
-           "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
+def _forwarder(forwards: list[str], forward_wait_s: int) -> str:
     fwd = ", ".join(json.dumps(f) for f in forwards)
     probes = math.ceil(forward_wait_s / FORWARD_PROBE_PERIOD_S)
-    return _configmap("k6browser", files) + f"""---
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: k6browser
-  namespace: bench-loadgen
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        app: k6browser
-      annotations:
-        # collect's `kubectl exec` / `cp` reach the browser's /out, never the
-        # forwarder sidecar's
-        kubectl.kubernetes.io/default-container: browser
-    spec:
-{_POOL}
-      securityContext:
-        fsGroup: {K6_UID}
-      initContainers:
+    return f"""      initContainers:
       # a native sidecar (restartPolicy Always): it starts first, the browser
       # container only once its startupProbe passed, and it never holds the
       # Job open
@@ -526,7 +531,49 @@ spec:
         volumeMounts:
         - name: k6
           mountPath: /opt/k6
-      containers:
+"""
+
+
+def render_browser(*, config: dict, forwards: list[str], linger_s: float,
+                   cpu: str = BROWSER_CPU, memory: str = BROWSER_MEMORY,
+                   forward_wait_s: int = FORWARD_WAIT_S) -> str:
+    """ConfigMap k6browser (script + config [+ forwarder]) + the k6browser
+    Job: Chrome through k6 browser. With `forwards`, behind the localhost
+    forwarder (a native sidecar Chrome waits for); without, Chrome loads the
+    portal from its own origin (config frontendUrl: the platform gateway, as
+    on 057) and waits for that origin to answer."""
+    files = {"browser.js": (K6_DIR / "browser.js").read_text(),
+             "pageload.js": (K6_DIR / "pageload.js").read_text(),
+             "browser-config.json": json.dumps(config, indent=1)}
+    if forwards:
+        files["forward.py"] = (K6_DIR / "forward.py").read_text()
+        urls = [f"http://127.0.0.1:{f.split('=', 1)[0]}/" for f in forwards]
+    else:
+        urls = [config["frontendUrl"].rstrip("/") + "/"]
+    run = (_forward_wait(urls, forward_wait_s) + "wait_forwards && "
+           "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
+    sidecar = _forwarder(forwards, forward_wait_s) if forwards else ""
+    return _configmap("k6browser", files) + f"""---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6browser
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6browser
+      annotations:
+        # collect's `kubectl exec` / `cp` reach the browser's /out, never the
+        # forwarder sidecar's
+        kubectl.kubernetes.io/default-container: browser
+    spec:
+{_POOL}
+      securityContext:
+        fsGroup: {K6_UID}
+{sidecar}      containers:
       - name: browser
         image: {K6_BROWSER_IMAGE}
         command: ["/bin/sh", "-c"]

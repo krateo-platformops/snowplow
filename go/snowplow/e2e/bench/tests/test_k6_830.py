@@ -672,7 +672,7 @@ def test_browser_sessions_are_singleton_classes_no_k6_user_shares():
     for x in s:
         assert classes[tuple(sorted(x["groups"]))] == [x["index"]] and x["cold"] is True
     cfg = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                           routes=_routes(), users=1000, burst_users=200, think_s=60,
+                           routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=1000, burst_users=200, think_s=60,
                            duration_s=1, burst_at_s=1, composite_routes=["/dashboard"],
                            browser_users=[x["index"] for x in s])
     k6_classes = {tuple(sorted(rbac_model.user_groups(i, m)))
@@ -703,7 +703,7 @@ def _routes():
 
 def test_k6_config_drives_every_identity_once():
     cfg = k6_job.k6_config(snowplow_url="http://snowplow:8081/", init=INIT, frontend_ns=NS,
-                           builders_ns=NS, routes=_routes(), users=1000, burst_users=200,
+                           builders_ns=NS, routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=1000, burst_users=200,
                            think_s=60, duration_s=1800, burst_at_s=900,
                            composite_routes=["/compositions"], browser_users=[1, 20, 11, 12, 13])
     nav, burst = cfg["navUserIds"], cfg["burstUserIds"]
@@ -715,19 +715,19 @@ def test_k6_config_drives_every_identity_once():
     assert "maxVUs" not in cfg and "preAllocatedVUs" not in cfg
     with pytest.raises(ValueError, match="outside the burst"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                         routes=_routes(), users=1000, burst_users=200, think_s=60,
+                         routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=1000, burst_users=200, think_s=60,
                          duration_s=1, burst_at_s=1, composite_routes=["/dashboard"], browser_users=[900])
     with pytest.raises(ValueError, match=r"not in the route table: \['/observability'\]"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                         routes=_routes(), users=1000, burst_users=200, think_s=60,
+                         routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=1000, burst_users=200, think_s=60,
                          duration_s=1, burst_at_s=1, composite_routes=["/observability"])
     with pytest.raises(ValueError, match="no route table"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                         routes=[], users=10, burst_users=0, think_s=1, duration_s=1,
+                         routes=[], menu_classes={}, class_of=_one_class, users=10, burst_users=0, think_s=1, duration_s=1,
                          burst_at_s=1, composite_routes=[])
     with pytest.raises(ValueError, match="think time"):
         k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                         routes=_routes(), users=10, burst_users=0, think_s=0, duration_s=1,
+                         routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=10, burst_users=0, think_s=0, duration_s=1,
                          burst_at_s=1, composite_routes=[])
 
 
@@ -1490,7 +1490,7 @@ def test_navigate_js_options_under_node(tmp_path):
         (tmp_path / n.replace(".js", ".mjs")).write_text(
             (BENCH_DIR / "k6" / n).read_text().replace("'./spa.js'", "'./spa.mjs'"))
     cfg = k6_job.k6_config(snowplow_url="u", init=INIT, frontend_ns=NS, builders_ns=NS,
-                           routes=_routes(), users=1000, burst_users=200, think_s=60,
+                           routes=_routes(), menu_classes={"devs": _routes()}, class_of=_one_class, users=1000, burst_users=200, think_s=60,
                            duration_s=1800, burst_at_s=900, composite_routes=["/dashboard"],
                            browser_users=[1, 20, 30, 40, 50])
     (tmp_path / "config.json").write_text(json.dumps(cfg))
@@ -1663,3 +1663,8 @@ def test_run606_k6_missing_browser_output_is_invalid(harness):
     v = json.loads((out / "verdict.json").read_text())
     assert v["verdict"] == "INVALID"
     assert any("no browser output was collected" in r for r in v["invalid_reasons"])
+
+
+def _one_class(i):
+    """Every user in one menu class (the tests' portal has one menu)."""
+    return "devs"
