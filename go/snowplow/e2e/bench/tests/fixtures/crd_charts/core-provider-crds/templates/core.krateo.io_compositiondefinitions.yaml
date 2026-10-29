@@ -1,0 +1,513 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: compositiondefinitions.core.krateo.io
+spec:
+  group: core.krateo.io
+  names:
+    categories:
+    - krateo
+    - defs
+    - core
+    kind: CompositionDefinition
+    listKind: CompositionDefinitionList
+    plural: compositiondefinitions
+    singular: compositiondefinition
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: READY
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Synced')].status
+      name: SYNCED
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: AGE
+      type: date
+    - jsonPath: .status.apiVersion
+      name: API VERSION
+      priority: 10
+      type: string
+    - jsonPath: .status.kind
+      name: KIND
+      priority: 10
+      type: string
+    - jsonPath: .status.packageUrl
+      name: PACKAGE URL
+      priority: 10
+      type: string
+    - jsonPath: .status.target.mode
+      name: TARGET
+      priority: 10
+      type: string
+    - jsonPath: .status.target.connectionStatus
+      name: CONNECTION
+      priority: 10
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: CompositionDefinition is a definition type with a spec and a
+          status.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              apiRef:
+                description: |-
+                  ApiRef references a RESTAction whose calls are resolved (via snowplow, under an
+                  authn-issued scoped service identity) each reconcile; results are keyed by call name
+                  under ".api" in the projection root. Shape copied from snowplow's spec.apiRef
+                  (name/namespace + inline extras).
+                properties:
+                  extras:
+                    description: |-
+                      Extras are author-declared STATIC values merged into the RESTAction's jq root
+                      (snowplow spec.apiRef.extras). Input-only — they never surface in status. The
+                      controller additionally injects per-instance context (compositionId, namespace, …)
+                      which merges over these (request-wins).
+                    x-kubernetes-preserve-unknown-fields: true
+                  name:
+                    description: Name of the referenced RESTAction.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace of the referenced RESTAction.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              chart:
+                description: rtv1.ManagedSpec `json:",inline"`
+                properties:
+                  credentials:
+                    description: 'Credentials: credentials for private repos'
+                    properties:
+                      passwordRef:
+                        description: 'PasswordRef: reference to secret containing
+                          password for private repo'
+                        properties:
+                          key:
+                            description: The key to select.
+                            type: string
+                          name:
+                            description: Name of the referenced object.
+                            type: string
+                          namespace:
+                            description: Namespace of the referenced object.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        - namespace
+                        type: object
+                      username:
+                        description: 'Username: username for private repo'
+                        type: string
+                    required:
+                    - passwordRef
+                    - username
+                    type: object
+                  insecureSkipVerifyTLS:
+                    description: 'InsecureSkipVerifyTLS: skip tls verification'
+                    type: boolean
+                  repo:
+                    description: |-
+                      Repo: Helm repo name
+                      Should be set only for helm repo urls
+                      If specified with OCI registries, it will be used as the repository name, instead the URL should contain the full path to the chart.
+                      This is ignored for tgz archives
+                    maxLength: 256
+                    type: string
+                  url:
+                    description: 'Url: oci or tgz full url'
+                    type: string
+                  version:
+                    description: 'Version: desired chart version, needed for oci charts
+                      and for helm repo urls'
+                    maxLength: 20
+                    type: string
+                required:
+                - url
+                type: object
+                x-kubernetes-validations:
+                - message: Version is required once set
+                  rule: '!has(oldSelf.version) || has(self.version)'
+                - message: Repo is required once set
+                  rule: '!has(oldSelf.repo) || has(self.repo)'
+              controller:
+                description: |-
+                  Controller tunes the composition-dynamic-controller (CDC) Deployment for THIS definition's
+                  Kind. It is the per-Kind escape hatch from the otherwise-uniform, cluster-wide CDC template:
+                  a Kind with many instances can raise reconcile concurrency and lengthen its resync without
+                  touching — or restarting — any other controller. Omitted fields fall back to the chart-global
+                  defaults, so existing definitions render byte-identically.
+                properties:
+                  resources:
+                    description: |-
+                      Resources sets the CDC container's compute resource requests/limits for this Kind. The shared
+                      template ships resources:{} (no requests), which is bad practice and makes the CDC
+                      unschedulable-aware and impossible to autoscale; set requests here for a Kind whose CDC needs
+                      a memory/CPU floor (e.g. one caching many instances). When unset, the chart-global default
+                      (cdc.resources) applies, so existing definitions render byte-identically.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  resyncInterval:
+                    description: |-
+                      ResyncInterval is how often the CDC re-lists and re-observes every instance of the Kind to
+                      correct drift (the CDC's -resync-interval flag). On a Kind with many instances a short resync
+                      makes the controller re-enqueue the whole population continuously; lengthening it lets steady
+                      state ride watch events instead of full sweeps. Defaults to the chart-global value (3m) when
+                      unset. A Go duration string (e.g. "30m", "1h"); it is passed verbatim to the CDC's
+                      -resync-interval flag. Typed as string (not metav1.Duration) deliberately: core-provider runs
+                      no admission webhook, so the CRD schema is the only gate, and a plain string always decodes —
+                      a bad value can never fail the typed informer's atomic list-decode and stall every
+                      CompositionDefinition. The Pattern + CEL rules then reject unit-less/garbage values and
+                      non-positive durations ("0s"/negative would crash the CDC's ticker) at admission.
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: resyncInterval must be a positive Go duration such
+                        as 30m or 1h
+                      rule: duration(self) > duration('0s')
+                  workers:
+                    description: |-
+                      Workers is the number of concurrent reconcile workers inside the CDC process (the CDC's
+                      -workers flag; one shared work queue feeds them). It is the primary lever for reconcile
+                      throughput on a Kind with many instances. Defaults to the chart-global value (1) when unset.
+                    format: int32
+                    maximum: 512
+                    minimum: 1
+                    type: integer
+                type: object
+              deploy:
+                description: |-
+                  Deploy: selects whether the composition-dynamic-controller (and the generated
+                  CRD and RBAC) are deployed locally in the management cluster (the default) or to
+                  a remote target cluster referenced by a KubernetesTarget. When omitted, deployment
+                  is local.
+                properties:
+                  targetRef:
+                    description: |-
+                      TargetRef references a KubernetesTarget (resolved in this object's own namespace)
+                      describing the remote cluster to deploy to. When omitted, deployment is local.
+                    properties:
+                      name:
+                        description: Name of the KubernetesTarget, resolved in the
+                          referencing object's own namespace.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
+              statusDataTemplate:
+                description: |-
+                  StatusDataTemplate declares extra fields projected onto the generated Composition
+                  CRD's status and populated by the controller each reconcile (snowplow
+                  widgetDataTemplate shape). Each entry's ${ jq } Expression is evaluated over the
+                  combined source root (built-in self/spec/status, helm, and api) and written under
+                  .status at ForPath.
+                items:
+                  description: StatusFieldMapping is one projected status field (snowplow
+                    widgetDataTemplate item).
+                  properties:
+                    expression:
+                      description: |-
+                        Expression is a ${ jq } program evaluated over the projection root; a bare path is
+                        the trivial copy. Plain literals (no ${ } wrapper) are written verbatim.
+                      minLength: 1
+                      type: string
+                    forPath:
+                      description: ForPath is the dotted path under .status to write,
+                        e.g. "endpoint" or "network.host".
+                      minLength: 1
+                      type: string
+                    preserveUnknownFields:
+                      description: |-
+                        PreserveUnknownFields generates the status node with
+                        x-kubernetes-preserve-unknown-fields: true, retaining an arbitrary structure without
+                        pruning. Mutually exclusive with Type/Schema.
+                      type: boolean
+                    schema:
+                      description: |-
+                        Schema optionally supplies the full JSON-schema for a complex output (object, array,
+                        array of objects). Mutually exclusive with PreserveUnknownFields.
+                      x-kubernetes-preserve-unknown-fields: true
+                    type:
+                      description: |-
+                        Type optionally pins the generated status property's scalar JSON-schema type. For
+                        complex (object/array) outputs use Schema or PreserveUnknownFields instead.
+                      enum:
+                      - string
+                      - integer
+                      - number
+                      - boolean
+                      - object
+                      - array
+                      type: string
+                  required:
+                  - expression
+                  - forPath
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - forPath
+                x-kubernetes-list-type: map
+              upgradePolicy:
+                default: Automatic
+                description: |-
+                  UpgradePolicy governs whether existing composition instances are migrated onto a newly
+                  served chart version:
+                    - Automatic (default): eagerly self-heal every owned instance onto the current version
+                      (retire the old version's controller once nothing references it). Backward-compatible
+                      with the pre-policy behavior.
+                    - Manual: keep existing instances on their current version (the new version is still served,
+                      so coexistence holds); migrate only when the krateo.io/upgrade-to-version annotation names
+                      the current served version.
+                    - Paused: never migrate; freeze existing instances on their version.
+                  Under Manual/Paused the old version's controller is kept so coexisting instances are not
+                  orphaned; served-version pruning still keeps any version an instance's label references.
+                enum:
+                - Automatic
+                - Manual
+                - Paused
+                type: string
+            type: object
+          status:
+            description: CompositionDefinitionStatus is the status of a CompositionDefinition.
+            properties:
+              apiVersion:
+                description: 'ApiVersion: the api version of the custom resource -
+                  Last applied apiVersion'
+                type: string
+              conditions:
+                description: Conditions of the resource.
+                items:
+                  description: A Condition that may apply to a resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        LastTransitionTime is the last time this condition transitioned from one
+                        status to another.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        A Message containing details about this condition's last transition from
+                        one status to another, if any.
+                      type: string
+                    reason:
+                      description: A Reason for this condition's last transition from
+                        one status to another.
+                      type: string
+                    status:
+                      description: Status of this condition; is it currently True,
+                        False, or Unknown?
+                      type: string
+                    type:
+                      description: |-
+                        Type of this condition. At most one of each condition type may apply to
+                        a resource at any point in time.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              digest:
+                description: 'Digest: the digest of the managed resources'
+                type: string
+              kind:
+                description: 'Kind: the kind of the custom resource - Last applied
+                  kind'
+                type: string
+              managed:
+                description: 'Managed: information about the managed resources'
+                properties:
+                  group:
+                    description: 'Group: the generated custom resource Group'
+                    type: string
+                  kind:
+                    description: 'Kind: the generated custom resource Kind'
+                    type: string
+                  versionInfo:
+                    description: 'VersionInfo: the version information of the chart'
+                    items:
+                      properties:
+                        chart:
+                          description: 'Chart: the chart information'
+                          properties:
+                            credentials:
+                              description: 'Credentials: credentials for private repos'
+                              properties:
+                                passwordRef:
+                                  description: 'PasswordRef: reference to secret containing
+                                    password for private repo'
+                                  properties:
+                                    key:
+                                      description: The key to select.
+                                      type: string
+                                    name:
+                                      description: Name of the referenced object.
+                                      type: string
+                                    namespace:
+                                      description: Namespace of the referenced object.
+                                      type: string
+                                  required:
+                                  - key
+                                  - name
+                                  - namespace
+                                  type: object
+                                username:
+                                  description: 'Username: username for private repo'
+                                  type: string
+                              required:
+                              - passwordRef
+                              - username
+                              type: object
+                            insecureSkipVerifyTLS:
+                              description: 'InsecureSkipVerifyTLS: skip tls verification'
+                              type: boolean
+                            repo:
+                              description: 'Repo: helm repo name (for helm repo urls
+                                only)'
+                              maxLength: 256
+                              type: string
+                            url:
+                              description: 'Url: oci or tgz full url'
+                              type: string
+                            version:
+                              description: 'Version: desired chart version, needed
+                                for oci charts and for helm repo urls'
+                              maxLength: 20
+                              type: string
+                          required:
+                          - url
+                          type: object
+                        served:
+                          description: 'Served: whether the version is served'
+                          type: boolean
+                        stored:
+                          description: 'Stored: whether the version is stored'
+                          type: boolean
+                        version:
+                          description: 'Version: the version of the chart that is
+                            served. It is the version of the CRD.'
+                          type: string
+                      type: object
+                    type: array
+                type: object
+              packageUrl:
+                description: 'PackageURL: .tgz or oci chart direct url'
+                type: string
+              resource:
+                description: 'Resource: the resource of the custom resource - Last
+                  applied resource'
+                type: string
+              target:
+                description: 'Target: information about the cluster the controller
+                  is deployed to.'
+                properties:
+                  connectionStatus:
+                    description: 'ConnectionStatus: Healthy when the target cluster
+                      is reachable, Down otherwise.'
+                    type: string
+                  kubeconfigSecretResourceVersion:
+                    description: |-
+                      KubeconfigSecretResourceVersion: the resourceVersion of the kubeconfig Secret last
+                      used to reach a remote target, for credential-rotation traceability.
+                    type: string
+                  mode:
+                    description: 'Mode: where the controller is deployed (Local or
+                      Remote).'
+                    type: string
+                  version:
+                    description: 'Version: the Kubernetes version reported by the
+                      target cluster.'
+                    type: string
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -260,6 +260,10 @@ unset BENCH_ALLOW_NON_GKE
 PW="$(python3 -c 'from bench.load606 import SCALEUSER_PASSWORD as p; print(p)')"
 
 mkdir -p "$OUT"
+# The record of every failing bench command (record_failure): present from
+# the start, so an empty file reads "none failed" and a missing one is a
+# missing record, never zero (evaluate reads it like every other stream).
+touch "$OUT/command-failures.jsonl"
 # Logs go to STDERR (and the run log) so a step's stdout stays pipeable.
 log() {
   local msg="$*"
@@ -289,6 +293,7 @@ redact_pw() {
 }
 step() {
   local name="$1"; shift
+  CUR_STEP="$name"
   log "=== step ${name} ==="
   if [[ "$FAIL_AT" == "$name" ]]; then log "injected failure at ${name}"; return 1; fi
   "$@"
@@ -421,22 +426,56 @@ on_signal() {
   if [[ "$IN_TEARDOWN" == "1" ]]; then on_teardown_signal; else exit 130; fi
 }
 trap on_signal INT TERM HUP
+# A PAIR STOP (SIGUSR1, run606_pair.sh when the partner run failed as tooling)
+# is not an operator's interrupt: the measurement stops, and the teardown —
+# collect, diagnostics, the platform definitions, gke-down and its disk
+# backstop — runs IN FULL. Received during the teardown it changes nothing
+# (run 17 attempt 4: the pair's stop reached B's teardown as a TERM).
+on_pair_stop() {
+  if [[ "$IN_TEARDOWN" == "1" ]]; then
+    log "pair stop received during teardown: ignored, the teardown finishes in full"
+    return 0
+  fi
+  log "pair stop: the partner run failed as tooling; this run's measurement stops here, its teardown runs in full"
+  exit 143
+}
+trap on_pair_stop USR1
 
 s_source() {
   # Registry preflight, BEFORE any cluster exists (read-only, ghcr only):
   # the chart must resolve at INSTALLER_VERSION and, with VERIFY483=1, its
   # pins must carry the #483 gate. Either failure refuses the run for free.
+  # It runs in the dry pass too: s_schema validates against what it pulls.
   local pins=(--no-pins)
   [[ "$VERIFY483" == "1" ]] && pins=()
-  if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.installer_src oci-preflight --chart $INSTALLER_CHART --version $INSTALLER_VERSION ${pins[*]:-}"
-    return 0
-  fi
   rm -rf "$OUT/installer-pulled"
   python3 -m bench.installer_src oci-preflight --chart "$INSTALLER_CHART" \
       --version "$INSTALLER_VERSION" --workdir "$OUT/installer-pulled" \
       --out "$OUT/installer-preflight.json" ${pins[@]+"${pins[@]}"}
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
+}
+# s_schema: every manifest the run applies, rendered offline and validated
+# against the CRDs of the components INSTALLER_VERSION pins (bench/crd_schema.py),
+# BEFORE any cluster exists, in the dry pass too. Run 17 attempt 4: all 670
+# fresh-class Users lacked spec.avatarURL, which authn-crds 0.27.3 requires;
+# two paid clusters ran ~40 min to learn it. Every line it prints is logged
+# (kinds, counts, field paths, chart versions: no identity); what it could not
+# validate faithfully it names.
+s_schema() {
+  local args=(--installer-pulled "$OUT/installer-pulled" --workdir "$OUT/crd-charts"
+              --out "$OUT/crd-check.json" --users "$USERS" --namespaces "$NAMESPACES"
+              --fresh-modes $FRESH_MODES --user-prefix "$BENCH_USER_PREFIX")
+  [[ "$LOAD_DRIVER" == "k6" ]] && args+=(--fresh-classes --sessions "$BROWSER_SESSIONS"
+                                         --browser-think-s "$BROWSER_THINK_S" --duration-s "$DRIVE_S")
+  local rc=0 ln
+  python3 -m bench.crd_schema check "${args[@]}" >/dev/null 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) && return 0
+  # the record keeps the refusals (every line when it failed otherwise, e.g. a traceback)
+  if grep -F "crd check FAILED" "$KERR" > "$KERR.refusals"; then mv "$KERR.refusals" "$KERR"; else rm -f "$KERR.refusals"; fi
+  record_failure "schema FAILED: the manifests of this run do not satisfy the CRDs installer ${INSTALLER_VERSION} pins (exit ${rc}, $OUT/crd-check.json)"
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 s_up() {
@@ -590,12 +629,12 @@ flowcontrol_attribution() {
     return 0
   fi
   "${fc[@]}" probe --out "$OUT/.flowcontrol-probe.json" -- "${K[@]}" 2>"$KERR" \
-    || { log "flow control FAILED: the API server's APF classification could not be read ($(kerr_line))"; return 1; }
+    || { record_failure "flow control FAILED: the API server's APF classification could not be read"; return 1; }
   "${fc[@]}" render --probe "$OUT/.flowcontrol-probe.json" > "$OUT/bench-flowschemas.yaml" 2>"$KERR" \
-    || { log "flow control FAILED: $(kerr_line)"; return 1; }
+    || { record_failure "flow control FAILED: rendering the bench FlowSchemas"; return 1; }
   kapply "$OUT/bench-flowschemas.yaml"
   if ! "${fc[@]}" verify --probe "$OUT/.flowcontrol-probe.json" -- "${K[@]}" > "$OUT/flowcontrol-config.jsonl" 2>"$KERR"; then
-    log "flow control FAILED: an identity does not land in its bench FlowSchema: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl") $(kerr_line)"
+    record_failure "flow control FAILED: an identity does not land in its bench FlowSchema: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl")" || true
     return 1
   fi
   log "flow control: $(cut -c1-600 "$OUT/flowcontrol-config.jsonl")"
@@ -691,14 +730,13 @@ fresh_classes_create() {
       --user-prefix "$BENCH_USER_PREFIX" --password-file "$pwf" --out "$OUT/fresh-classes.json" \
       --manifest "$OUT/fresh-classes.yaml" 2>"$KERR" || rc=$?
   rm -f "$pwf"
-  (( rc == 0 )) || { log "fresh classes FAILED: the plan could not be made: $(kerr_line)"; return 1; }
+  (( rc == 0 )) || { record_failure "fresh classes FAILED: the plan could not be made"; return 1; }
   log "$(kerr_line)"
   if [[ ! -s "$OUT/fresh-classes.yaml" ]]; then
     log "no fresh identity class: the browser's run is shorter than one class cycle"
     return 0
   fi
-  kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" \
-    || { log "fresh classes FAILED: $(kerr_line)"; return 1; }
+  kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"
 }
 # fresh_classes_cleanup (#935): every object fresh_classes_create made, and
 # each fresh user's clientconfig Secret authn wrote at its login; bounded,
@@ -827,13 +865,13 @@ s_measure() {
     read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get job/fresh606 -o name || rv=$?
     case "$rv" in
       0|4) api_seen ok
-           log "measure FAILED: waiting for fresh606 failed $(verdict_why "$rv"): $(kerr_line)"
+           record_failure "measure FAILED: waiting for fresh606 failed $(verdict_why "$rv")" || true
            return 1 ;;
       2) api_seen ok ;;
       *) api_seen down "wait job/fresh606" ;;
     esac
     if (( $(date +%s) >= deadline )); then
-      log "measure FAILED: fresh606 not seen Complete within ${MEASURE_WAIT_S}s (last error: $(kerr_line))"
+      record_failure "measure FAILED: fresh606 not seen Complete within ${MEASURE_WAIT_S}s (last error)" || true
       return 1
     fi
     sleep "$DRIVE_POLL_S"
@@ -861,14 +899,32 @@ KERR="$OUT/.kubectl-last-error"
 # system:serviceaccount:…), any e-mail address. A redactor that does not run
 # withholds the line: it is never logged unredacted.
 kerr_line() {
-  local line out
-  line="$(head -1 "$KERR" 2>/dev/null)" || true
-  [[ -n "$line" ]] || return 0
-  if out="$(printf '%s\n' "$line" | python3 "${HERE:-.}/bench/identity.py" 2>/dev/null)"; then
-    printf '%s\n' "${out:0:300}"
+  # EVERY line the command wrote, not the first: run606's own "RUN: ..." line shares
+  # the captured stderr and came first (run 17 attempt 4 logged only that, and lost
+  # its 670 identical errors); identical lines counted once
+  [[ -s "$KERR" ]] || return 0
+  local out
+  if out="$(python3 "${HERE:-.}/bench/identity.py" --summary < "$KERR" 2>/dev/null)"; then
+    printf '%s\n' "$out"
   else
     echo "<kubectl's error withheld: the identity redactor did not run>"
   fi
+}
+# record_failure <message>: a failing bench command's evidence, said in the
+# log ("<message>: <its stderr>") AND kept for the verdict
+# (command-failures.jsonl, evaluate's report.command_failures): the message,
+# the step, and the command's stderr summarized and redacted (kerr_line).
+# Returns 1, so `cmd || record_failure "x FAILED: ..."` fails the step.
+record_failure() {
+  local what="$1" parts
+  log "${what}: $(kerr_line)"
+  parts="$(python3 "${HERE:-.}/bench/identity.py" --summary-json < "$KERR" 2>/dev/null || echo '["<withheld: the identity redactor did not run>"]')"
+  python3 -c 'import json, sys, time
+print(json.dumps({"kind": "command_failure", "step": sys.argv[1], "what": sys.argv[2], "t": time.time(),
+                  "stderr": json.loads(sys.argv[3] or "[]")}))' "${CUR_STEP:-}" "$what" "$parts" \
+      >> "$OUT/command-failures.jsonl" \
+    || log "could not record this failure in $OUT/command-failures.jsonl: the verdict will not carry it"
+  return 1
 }
 # local_error: kubectl failed BEFORE reaching any API server — its own
 # client-side configuration: an unknown flag or command, a kubeconfig that
@@ -1011,7 +1067,7 @@ wait_drive_done() {
         read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$j" -o name || rv=$?
         case "$rv" in
           0|4) api_seen ok
-               log "measure FAILED: reading job/$j failed $(verdict_why "$rv"): $(kerr_line)"
+               record_failure "measure FAILED: reading job/$j failed $(verdict_why "$rv")" || true
                return 1 ;;
           2) api_seen ok ;;
           *) api_seen down "get job/$j" ;;
@@ -1036,7 +1092,7 @@ wait_drive_done() {
           read_verdict "${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o name || rv=$?
           case "$rv" in
             0|4) api_seen ok
-                 log "measure FAILED: listing the $k driver pods failed $(verdict_why "$rv"): $(kerr_line)"
+                 record_failure "measure FAILED: listing the $k driver pods failed $(verdict_why "$rv")" || true
                  return 1 ;;
             2) api_seen ok ;;
             *) api_seen down "get pods job-name=$k" ;;
@@ -1145,7 +1201,7 @@ apf_preflight() {
   fi
   rm -f "$m"
   if answered_error; then
-    log "APF preflight FAILED: the API server refused /metrics ($(kerr_line)): the run would have no flow-control evidence"
+    record_failure "APF preflight FAILED: the API server refused /metrics (the run would have no flow-control evidence)" || true
     return 1
   fi
   log "WARNING: APF preflight read no apiserver_flowcontrol_* series ($(err_kind): $(kerr_line)); the sampler records every sample"
@@ -1362,7 +1418,7 @@ s_evaluate() {
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
-               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl)
+               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
@@ -1404,6 +1460,7 @@ s_evaluate() {
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
+step schema    s_schema
 step reap      s_reap
 step up        s_up
 step install   s_install

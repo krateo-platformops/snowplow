@@ -73,6 +73,7 @@ from bench.cluster import (
 # so this does not introduce a cycle.
 
 from bench.cli import log, section  # noqa: E402
+from bench import data_manifests  # noqa: E402
 
 
 # ─── HTTP helpers used by lifecycle (login, snowplow probes) ─────────────────
@@ -1425,14 +1426,14 @@ def assert_clean(retry_with_cleanup=True, allow_destructive=False):
 
 # ─── Synthetic users (Phase 7) ───────────────────────────────────────────────
 
-PHASE7_AUTHN_NS = "krateo-system"
+PHASE7_AUTHN_NS = data_manifests.AUTHN_NS
 USER_COUNTS = [10, 50, 100, 500, 1000]
 
 AUTHN = os.environ.get("AUTHN_URL", "http://34.136.84.51:8082")
 
 
-def _scaleuser_name(i):
-    return f"scaleuser-{i:04d}"
+_scaleuser_name = data_manifests.scaleuser_name
+synthetic_user_docs = data_manifests.synthetic_user_docs
 
 
 def _scaleuser_password():
@@ -1467,39 +1468,8 @@ def create_synthetic_users(start, end, groups_for=None, login=True):
         batch_end = min(batch_start + batch_size - 1, end)
         docs = []
         for i in range(batch_start, batch_end + 1):
-            name = _scaleuser_name(i)
             groups = list(groups_for(i)) if groups_for else ["devs"]
-            groups_yaml = "\n".join(f"    - {g}" for g in groups)
-            docs.append(f"""\
-apiVersion: v1
-kind: Secret
-type: kubernetes.io/basic-auth
-metadata:
-  name: {name}-password
-  namespace: {PHASE7_AUTHN_NS}
-  labels:
-    app: scaletest
-stringData:
-  password: "{password}"
-""")
-            docs.append(f"""\
-apiVersion: basic.authn.krateo.io/v1alpha1
-kind: User
-metadata:
-  name: {name}
-  namespace: {PHASE7_AUTHN_NS}
-  labels:
-    app: scaletest
-spec:
-  displayName: "Scale User {i:04d}"
-  avatarURL: https://i.pravatar.cc/256?img={(i % 70) + 1}
-  groups:
-{groups_yaml}
-  passwordRef:
-    namespace: {PHASE7_AUTHN_NS}
-    name: {name}-password
-    key: password
-""")
+            docs += [json.dumps(d) + "\n" for d in synthetic_user_docs(i, groups, password)]
         batch_yaml = "---\n".join(docs)
         ok, _ = apply_with_retry(batch_yaml,
                                  f"user batch {batch_start}-{batch_end}",

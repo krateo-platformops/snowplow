@@ -71,8 +71,10 @@ def check(obj: dict, *, client_side: bool) -> list[str]:
 
 
 def _run606_dry(tmp_path: Path, **env) -> Path:
+    from tests.test_run606_real_sequence import fake_registry   # the dry pass reads the registry
     out = tmp_path / "out"
-    e = dict(os.environ, HOME=str(tmp_path), OUT=str(out), RUN_NAME="snowplow-bench-sizes",
+    e = dict(os.environ, **fake_registry(tmp_path))
+    e.update(HOME=str(tmp_path), OUT=str(out), RUN_NAME="snowplow-bench-sizes",
              INSTALLER_VERSION="0.3.422", SNOWPLOW_TAG="1.12.46", BENCH_606_DRY_RUN="1",
              EXPECTED_IMAGE_DIGEST=FAKE_DIGEST, PYTHONPATH=str(BENCH), **env)
     p = subprocess.run(["bash", str(BENCH / "run606.sh")], env=e, capture_output=True, text=True,
@@ -112,7 +114,8 @@ def test_run606_applies_everything_through_one_server_side_apply():
     # #924 M3: the bench's own FlowSchemas (env); the preflight Job; #935's
     # fresh identity classes (data; its output names users: discarded); the load
     assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/preflight-job.yaml"',
-                     'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" \\', 'kapply "$OUT/loadgen-job.yaml"']
+                     'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
+                     'kapply "$OUT/loadgen-job.yaml"']
     assert "--server-side" in _kapply()
 
 

@@ -45,6 +45,12 @@ _RULES = (
     (re.compile(r"\b(secrets?)/[^/\s?&,\"']+"), r"\1/<redacted>"),
     (re.compile(r'\b(secrets?) "[^"]*"'), r'\1 "<redacted>"'),
     (re.compile(r"\bCN=[^,/\s\"')]+"), "CN=<redacted>"),
+    # the bench's OWN users, wherever they are named: scaleuser-NNNN, a fresh class's
+    # scaleuser-fresh-S-NNN and every object named after one (its -password Secret,
+    # its -reader RoleBinding, its -clientconfig): BENCH_USER_PREFIX's default, the
+    # name logscrub denies too. An API error names the object it refused (run 17
+    # attempt 4: 670 x `User.basic.authn.krateo.io "scaleuser-fresh-1-001" is invalid`).
+    (re.compile(r"\bscaleuser-[\w.-]*"), "<redacted>"),
     # a user named in prose ("token for user carol expired"): the word after
     # "user" / "username" (the quoted form is the first rule's)
     (re.compile(r"(?i)\b(user(?:name)?)([:=]?\s+)(?![\"<])[^\s,;)\"]+"), r"\1\2<redacted>"),
@@ -58,6 +64,26 @@ def redact_identity(line: str) -> str:
     for rx, rep in _RULES:
         line = rx.sub(rep, line)
     return line
+
+
+# a line of run606's own log (`[hh:mm:ss] RUN: kubectl ...`): it shares the captured
+# stderr with the command it ran, but it is not the command's error
+_OWN_LOG = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] ")
+
+
+def summarize(text: str | None) -> list[str]:
+    """A failed command's stderr as evidence: every line that is not the
+    bench's own log line, redacted, identical lines counted once (`670 x
+    <line>`), in first-seen order. Run 17 attempt 4 lost its cause because
+    only the FIRST line was kept, and that was the bench's own RUN line."""
+    counts: dict[str, int] = {}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or _OWN_LOG.match(ln):
+            continue
+        r = redact_identity(ln)
+        counts[r] = counts.get(r, 0) + 1
+    return [f"{n} x {line}" if n > 1 else line for line, n in counts.items()]
 
 
 def error_summary(stderr: str | None) -> str:
@@ -74,7 +100,19 @@ def error_summary(stderr: str | None) -> str:
     return redact_identity(out)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """`identity.py` redacts each line of stdin; `identity.py --summary`
+    prints summarize(stdin) on ONE line, its parts joined by " | " (run606's
+    kerr_line), and `--summary-json` the same as a JSON list."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("--summary", "--summary-json"):
+        parts = summarize(sys.stdin.read())
+        if argv[0] == "--summary-json":
+            import json
+            print(json.dumps(parts))
+        elif parts:
+            print(" | ".join(parts))
+        return 0
     for line in sys.stdin:
         sys.stdout.write(redact_identity(line.rstrip("\n")) + "\n")
     return 0

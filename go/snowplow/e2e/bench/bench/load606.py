@@ -5330,6 +5330,8 @@ def _cmd_evaluate(a) -> int:
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
+    # every bench command that failed, with its redacted stderr (run606 record_failure)
+    result["report"]["command_failures"] = [r for r in recs if r.get("kind") == "command_failure"]
     # the platform's create handshakes (diag606 definitions): WEDGED expected 0, said when not
     from bench import diag606
     plat = diag606.platform_report([r for r in recs if r.get("kind") == "platform_definitions"],
