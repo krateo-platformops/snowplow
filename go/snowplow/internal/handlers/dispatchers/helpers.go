@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -66,9 +67,19 @@ func fetchObject(req *http.Request) (got objects.Result) {
 }
 
 func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
+	return paginationFromQuery(log, req.URL.Query())
+}
+
+// paginationFromQuery is THE derivation of a /call's pagination from its query
+// string: the raw perPage/page values, then normalizePagination. paginationInfo
+// applies it to a request; prewarmPaginationFor (#966) applies it to the /call
+// path the browser will request, so a prewarm cell and the request for the same
+// URL fold the same pagination for EVERY shape the URL can take — not only the
+// canonical one buildPath emits.
+func paginationFromQuery(log *slog.Logger, q url.Values) (perPage, page int) {
 	perPage, page = -1, -1
 
-	if val := req.URL.Query().Get("perPage"); val != "" {
+	if val := q.Get("perPage"); val != "" {
 		var err error
 		perPage, err = strconv.Atoi(val)
 		if err != nil {
@@ -77,7 +88,7 @@ func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
 		}
 	}
 
-	if val := req.URL.Query().Get("page"); val != "" {
+	if val := q.Get("page"); val != "" {
 		var err error
 		page, err = strconv.Atoi(val)
 		if err != nil {

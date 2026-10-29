@@ -463,10 +463,9 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 			withApiRefHarvester(deps.harvester),
 			withNavWidgetHarvester(deps.navHarv),
 		)
-		// Same walk() entrypoint + same root pagination as
-		// resolveNavigationRoot (#966: prewarmPaginationFor(""), the
-		// unpaginated (-1,-1) the frontend requests a root with).
-		if err := w.walk(rctx, root.Root, root.GVR, 0, prewarmPaginationFor("")); err != nil {
+		// The SAME root entry as resolveNavigationRoot (#966 review F2:
+		// walkRoot owns the root's pagination for both walks).
+		if err := w.walkRoot(rctx, root.Root, root.GVR); err != nil {
 			log.Warn("prewarm.engine.boot.root_rewalk_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", rootKey(root.Root)),

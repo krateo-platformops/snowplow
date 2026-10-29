@@ -551,15 +551,13 @@ func iterateApiRefPages(
 			// reachable widget-CR count, not re-walks.
 			bumpPrewarmUnitsPlanned(1)
 
-			// #966 — the child's one pagination, the SAME derivation the
-			// page-1 children loop (descendChildren) uses.
-			childPg := prewarmPaginationFor(child.Path)
-
 			childGot := objects.Get(ctx, childRef)
 			if childGot.Err != nil || childGot.Unstructured == nil {
 				continue
 			}
-			_ = w.walk(ctx, childGot.Unstructured, childGot.GVR, depth+1, childPg)
+			// #966 — the SAME child entry as the page-1 children loop
+			// (descendChildren): walkChild owns the child's pagination.
+			_ = w.walkChild(ctx, child, childGot, depth)
 		}
 
 		// Decide whether to continue. The resolver's

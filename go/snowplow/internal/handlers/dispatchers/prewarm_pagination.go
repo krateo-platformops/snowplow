@@ -1,7 +1,9 @@
 package dispatchers
 
 import (
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"log/slog"
+	"net/url"
+
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 )
 
@@ -49,9 +51,12 @@ func newPrewarmPagination(perPage, page int) prewarmPagination {
 // widget, or "" for a navigation root (the frontend requests a root with no
 // page/perPage).
 //
-//   - The path declares page and perPage → that pagination.
-//   - Otherwise → unpaginatedPrewarm, what paginationInfo returns for a URL
-//     with no pagination.
+// It is paginationFromQuery over callPath's query — the SAME function
+// paginationInfo applies to the browser's request of that URL — so prewarm and
+// the request agree on every shape the URL can take (perPage alone, page=0, a
+// non-numeric value, ...), not only on the canonical one buildPath emits (#966
+// review F1). A path that does not parse cannot be requested either, and is
+// unpaginated.
 //
 // No widget kind and no widget content is consulted, so there is nothing to
 // special-case. A widget-declared page size (portal#235) plugs in HERE, and
@@ -61,11 +66,12 @@ func prewarmPaginationFor(callPath string) prewarmPagination {
 	if callPath == "" {
 		return unpaginatedPrewarm
 	}
-	page, perPage, ok := util.ParseCallPathPagination(callPath)
-	if !ok {
+	u, err := url.Parse(callPath)
+	if err != nil {
 		return unpaginatedPrewarm
 	}
-	return newPrewarmPagination(perPage, page)
+	perPage, page := paginationFromQuery(slog.Default(), u.Query())
+	return prewarmPagination{PerPage: perPage, Page: page}
 }
 
 // paginated reports whether the pagination windows the resolve — the same

@@ -50,6 +50,7 @@ import (
 	"strings"
 	"testing"
 
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
@@ -131,10 +132,27 @@ type s966Fixture struct {
 	paths map[string]string // widget name → the /call URL the browser requests for it
 }
 
+// s966Driver is which REAL walk entry fills the cells before an arm reads them.
+type s966Driver int
+
+const (
+	// s966Phase1Walk: the phase-1 boot walk (resolveNavigationRoot).
+	s966Phase1Walk s966Driver = iota
+	// s966EngineReWalk: the prewarm engine's boot re-walk (a scopeKindBoot
+	// pass → rePrewarmBootScoped), the second root entry (#967 review F2/W4).
+	s966EngineReWalk
+	// s966NoWalk: nothing walks; the arm drives a writer itself.
+	s966NoWalk
+)
+
+func (d s966Driver) String() string {
+	return [...]string{"phase-1 walk", "engine boot re-walk", "no walk"}[d]
+}
+
 // s966Setup builds the tree, restores the REAL widgets.Resolve behind the seed
 // seam (the #643 harness replaces it with an apiRef-only stand-in that runs no
-// widget jq), and runs the REAL phase-1 root walk.
-func s966Setup(t *testing.T) *s966Fixture {
+// widget jq), and runs the REAL root walk `driver` names.
+func s966Setup(t *testing.T, driver s966Driver) *s966Fixture {
 	t.Helper()
 	b2StubSeeds(t) // the walk arms observe the walk's own cells; the seed arm calls seedOneWidget directly
 	tree := &b2Tree{objs: []*unstructured.Unstructured{
@@ -155,13 +173,21 @@ func s966Setup(t *testing.T) *s966Fixture {
 	widgetsResolveFn = widgets.Resolve
 	t.Cleanup(func() { widgetsResolveFn = prevW })
 
-	roots, err := env.deps.lister(context.Background())
-	if err != nil || len(roots) != 1 {
-		t.Fatalf("lister: %v (%d roots)", err, len(roots))
-	}
-	if err := resolveNavigationRoot(context.Background(), roots[0].Root, roots[0].GVR, env.deps.saEP, env.deps.saRC,
-		env.deps.authnNS, env.deps.harvester, env.deps.navHarv, nil); err != nil {
-		t.Fatalf("phase1 root walk: %v", err)
+	switch driver {
+	case s966Phase1Walk:
+		roots, err := env.deps.lister(context.Background())
+		if err != nil || len(roots) != 1 {
+			t.Fatalf("lister: %v (%d roots)", err, len(roots))
+		}
+		if err := resolveNavigationRoot(context.Background(), roots[0].Root, roots[0].GVR, env.deps.saEP, env.deps.saRC,
+			env.deps.authnNS, env.deps.harvester, env.deps.navHarv, nil); err != nil {
+			t.Fatalf("phase1 root walk: %v", err)
+		}
+	case s966EngineReWalk:
+		env.pass(prewarmScope{kind: scopeKindBoot})
+		if b2WalkObs(s966Root) == 0 {
+			t.Fatalf("SETUP: the engine boot pass did not walk the root")
+		}
 	}
 
 	// The browser's URLs: the root's from the frontend config (no pagination),
@@ -226,19 +252,15 @@ func s966Title(t *testing.T, raw []byte) string {
 	return s
 }
 
-// TestPrewarmPagination966_WalkCellsEqualTheLiveRequest covers the root walk,
-// the child walk and the walk's content populate.
-func TestPrewarmPagination966_WalkCellsEqualTheLiveRequest(t *testing.T) {
-	f := s966Setup(t)
+// assertContentCell: `name`'s identity-free content cell, looked up at the
+// pagination its browser request carries, exists, shows that pagination, and is
+// byte-equal to a live resolve at that pagination under the walk identity.
+func (f *s966Fixture) assertContentCell(t *testing.T, writer, name, wantTitle string) {
+	t.Helper()
+	tc := struct{ writer, name, wantTitle string }{writer, name, wantTitle}
 	saCtx := s966SACtx(f.env)
-	for _, tc := range []struct {
-		writer, name, wantTitle string
-	}{
-		{"root walk", s966Root, "0|unpaginated"},
-		{"child walk (ref declares no slice)", s966Plain, "0|unpaginated"},
-		{"child walk (ref declares only perPage)", s966PerPage, "0|1x3"},
-	} {
-		t.Run(tc.writer, func(t *testing.T) {
+	{
+		{
 			pp, p := f.requestPagination(t, tc.name)
 			key, _ := widgetContentL1Key(h643WidgetGVR, h643NS, tc.name, pp, p)
 			e, ok := cache.ResolvedCache().GetNoTouch(key)
@@ -258,14 +280,111 @@ func TestPrewarmPagination966_WalkCellsEqualTheLiveRequest(t *testing.T) {
 				t.Fatalf("#966 RED (%s): %s's stored body differs from a live request's resolve at (perPage=%d, page=%d)\n stored: %s\n live:   %s",
 					tc.writer, tc.name, pp, p, psTrunc(string(e.RawJSON), 600), psTrunc(string(want), 600))
 			}
+		}
+	}
+}
+
+// TestPrewarmPagination966_WalkCellsEqualTheLiveRequest covers the root walk,
+// the child walk and the walk's content populate, through BOTH root entries:
+// the phase-1 walk and the engine's boot re-walk (#967 review F2/W4).
+func TestPrewarmPagination966_WalkCellsEqualTheLiveRequest(t *testing.T) {
+	for _, driver := range []s966Driver{s966Phase1Walk, s966EngineReWalk} {
+		t.Run(driver.String(), func(t *testing.T) {
+			f := s966Setup(t, driver)
+			for _, tc := range []struct {
+				writer, name, wantTitle string
+			}{
+				{"root walk", s966Root, "0|unpaginated"},
+				{"child walk (ref declares no slice)", s966Plain, "0|unpaginated"},
+				{"child walk (ref declares only perPage)", s966PerPage, "0|1x3"},
+			} {
+				t.Run(tc.writer, func(t *testing.T) { f.assertContentCell(t, driver.String()+": "+tc.writer, tc.name, tc.wantTitle) })
+			}
 		})
+	}
+}
+
+// TestPrewarmPagination966_DrainChildCellsEqualTheLiveRequest covers the
+// deep-page drain's children loop (#967 review F2/W5): children a deep page
+// reveals are walked with the pagination of THEIR OWN /call path — the URL the
+// browser requests — exactly as the page-1 children loop walks them.
+func TestPrewarmPagination966_DrainChildCellsEqualTheLiveRequest(t *testing.T) {
+	f := s966Setup(t, s966NoWalk)
+	paginationTestMu.Lock()
+	defer paginationTestMu.Unlock()
+	oldCap := phase1MaxApiRefPagesForTest
+	phase1MaxApiRefPagesForTest = 2 // one deep page
+	t.Cleanup(func() { phase1MaxApiRefPagesForTest = oldCap })
+	prevFetch, prevResolve := paginationFetchPageFn, paginationResolvePageFn
+	t.Cleanup(func() { paginationFetchPageFn, paginationResolvePageFn = prevFetch, prevResolve })
+
+	root, err := f.env.dyn.Resource(h643WidgetGVR).Namespace(h643NS).Get(context.Background(), s966Root, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get root: %v", err)
+	}
+	paginationFetchPageFn = func(_ context.Context, _ templatesv1.ObjectReference) objects.Result {
+		return objects.Result{GVR: h643WidgetGVR, Unstructured: root.DeepCopy()}
+	}
+	// Deep page 2 of an apiRef+template list reveals two children, at the exact
+	// paths the root's resourcesRefs emit (one undeclared, one perPage-only).
+	paginationResolvePageFn = func(_ context.Context, _ widgets.ResolveOptions) (*unstructured.Unstructured, error) {
+		page2 := fakePageEnvelope(2, false)
+		page2.Object["status"].(map[string]any)["resourcesRefs"].(map[string]any)["items"] = []any{
+			map[string]any{"id": "c1", "path": f.paths[s966Plain], "verb": "GET", "allowed": true},
+			map[string]any{"id": "c2", "path": f.paths[s966PerPage], "verb": "GET", "allowed": true},
+		}
+		return page2, nil
+	}
+
+	iterateApiRefPages(s966SACtx(f.env), newPhase1Walker(f.env.deps.saRC, f.env.deps.authnNS), root.DeepCopy(), h643WidgetGVR,
+		fakePage1Driven(), 1, newPrewarmPagination(5, 1), f.env.deps.authnNS)
+
+	f.assertContentCell(t, "drain child walk (ref declares no slice)", s966Plain, "0|unpaginated")
+	f.assertContentCell(t, "drain child walk (ref declares only perPage)", s966PerPage, "0|1x3")
+}
+
+// TestPrewarmPagination966_RecollectResolvesTheCandidatesPagination covers the
+// drain's re-collection (#967 review F2/W1): it re-tries the FIRST page's
+// continuation decision, so it must re-resolve exactly the pagination that page
+// was resolved and keyed with — here a declared start page 2 of 3 rows, which
+// no default (page 1, or a bounded perPage) reproduces.
+func TestPrewarmPagination966_RecollectResolvesTheCandidatesPagination(t *testing.T) {
+	paginationTestMu.Lock()
+	defer paginationTestMu.Unlock()
+	t.Cleanup(recollectDelayForTest(0))
+	prevFetch, prevResolve := paginationFetchPageFn, paginationResolvePageFn
+	t.Cleanup(func() { paginationFetchPageFn, paginationResolvePageFn = prevFetch, prevResolve })
+
+	c := newApiRefPaginationCollector()
+	job := fakeApiRefPaginationJob("krateo-system", "s966-recollect")
+	job.Pagination = newPrewarmPagination(3, 2)
+	job.Page1Res.Object["status"].(map[string]any)["resourcesRefs"].(map[string]any)["slice"].(map[string]any)["continue"] = false
+	c.collect(job)
+	if c.pendingRecollectCount() != 1 {
+		t.Fatalf("SETUP: expected 1 pending re-collection candidate; got %d", c.pendingRecollectCount())
+	}
+	paginationFetchPageFn = func(_ context.Context, _ templatesv1.ObjectReference) objects.Result {
+		return fetchOKResult("krateo-system", "s966-recollect")
+	}
+	var got []prewarmPagination
+	paginationResolvePageFn = func(_ context.Context, opts widgets.ResolveOptions) (*unstructured.Unstructured, error) {
+		got = append(got, prewarmPagination{PerPage: opts.PerPage, Page: opts.Page})
+		return fakeContinuingPage1(), nil
+	}
+	recollectPendingApiRefPaginationJobs(context.Background(), c, nil)
+	if len(got) != 1 || got[0] != job.Pagination {
+		t.Fatalf("#966 RED (re-collection): re-resolved the first page at %+v, want exactly the candidate's own pagination %+v",
+			got, job.Pagination)
+	}
+	if c.count() != 1 {
+		t.Fatalf("PRE: the continuing re-resolve must hand the job back (count=%d)", c.count())
 	}
 }
 
 // TestPrewarmPagination966_SeedCellsEqualTheLiveRequest covers the PIP cohort
 // seed for apiRef widgets whose RESTAction filter AND widget jq read `.slice`.
 func TestPrewarmPagination966_SeedCellsEqualTheLiveRequest(t *testing.T) {
-	f := s966Setup(t)
+	f := s966Setup(t, s966Phase1Walk)
 	cohort := h643CohortCtx(f.env)
 	entries := map[string]navWidgetEntry{}
 	for _, e := range f.env.deps.navHarv.snapshot() {
@@ -315,7 +434,14 @@ func TestPrewarmPagination966_SeedCellsEqualTheLiveRequest(t *testing.T) {
 // the browser's request with), over every shape a declared ref slice can take.
 func TestPrewarmPagination966_CanonicalPathAgreesWithTheRequest(t *testing.T) {
 	base := "/call?resource=tables&apiVersion=widgets.templates.krateo.io/v1beta1&namespace=n&name=w"
-	for _, q := range []string{"", "&page=1&perPage=50", "&page=3&perPage=5"} {
+	for _, q := range []string{
+		// canonical: what buildPath emits
+		"", "&page=1&perPage=50", "&page=3&perPage=5",
+		// the six shapes #967 review F1 found disagreeing under the stricter parser
+		"&perPage=50", "&page=0&perPage=50", "&page=-2&perPage=50", "&page=x&perPage=50", "&page=2", "&page=2&perPage=0",
+		// and a few more a hand-written or portal#235 path could carry
+		"&perPage=x", "&page=1", "&page=0&perPage=0", "&perPage=-5&page=3",
+	} {
 		path := base + q
 		pp, p := paginationInfo(slog.Default(), httptest.NewRequest("GET", path, nil))
 		if got := prewarmPaginationFor(path); got != (prewarmPagination{PerPage: pp, Page: p}) {

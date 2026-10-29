@@ -1451,12 +1451,27 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	// cyberjoker requesting the same root via dispatcher will hit the
 	// SAME cell.
 	//
-	// #966 — the root has no /call Path of its own: the frontend requests it
-	// with no page/perPage, so prewarmPaginationFor("") is the unpaginated
-	// (-1,-1), and the walk both resolves the root and keys its cell with it.
-	// Each descended child takes its own pagination from its /call Path the
-	// same way (descendChildren).
-	return w.walk(rctx, root, gvr, 0, prewarmPaginationFor(""))
+	return w.walkRoot(rctx, root, gvr)
+}
+
+// walkRoot is the ONE entry of a walk into a navigation root, shared by the
+// phase-1 walk (resolveNavigationRoot) and the engine's boot re-walk
+// (rePrewarmBootScoped), so the two cannot choose different paginations (#966
+// review F2). The root has no /call Path of its own: the frontend requests it
+// with no page/perPage, so prewarmPaginationFor("") is the unpaginated
+// (-1,-1), and the walk both resolves the root and keys its cell with it.
+func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource) error {
+	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(""))
+}
+
+// walkChild is the ONE entry of a walk into a child widget reached through a
+// resourcesRefs item, shared by the page-1 children loop (descendChildren) and
+// the deep-page drain's children loop (iterateApiRefPages), so the two cannot
+// choose different paginations (#966 review F2). got is the child CR the
+// caller fetched; the child's pagination comes from child.Path — the URL the
+// browser requests for it — and the walk resolves AND keys with it.
+func (w *phase1Walker) walkChild(ctx context.Context, child navChildRef, got objects.Result, depth int) error {
+	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(child.Path))
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -1830,13 +1845,6 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 		}
 		w.visited[key] = struct{}{}
 
-		// #966 — the child's ONE pagination, derived from the /call Path its
-		// parent emitted: the URL the browser requests for it. The declared
-		// slice when the parent's ref declares one (resourcesrefs writes
-		// page/perPage onto the Path), otherwise unpaginated. The child walk
-		// resolves with it and keys every cell it writes with it.
-		childPg := prewarmPaginationFor(child.Path)
-
 		// Fetch the child widget CR under the SA-credentialed ctx. The
 		// resolver mutates the object in place, so a fresh fetch per
 		// child is required.
@@ -1877,13 +1885,14 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 		if got.Unstructured == nil {
 			continue
 		}
-		// Recurse into the child widget subtree with childPg (#966).
+		// Recurse into the child widget subtree (#966: walkChild takes the
+		// child's one pagination from child.Path).
 		//
 		// Ship G (0.30.16x): got.GVR is the child widget's GVR — threaded
 		// from objects.Get's return shape (internal/objects/get.go:22-26)
 		// so populateWidgetContentL1 down the recursion has the GVR the
 		// serve-time dispatcher will compose its key under.
-		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPg)
+		_ = w.walkChild(ctx, child, got, depth)
 	}
 	return nil
 }
