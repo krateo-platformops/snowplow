@@ -27,13 +27,23 @@ header — correlation rides W3C baggage.)
 ## Request
 
 ```
-GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&header=...]...[&title=...][&filename=...][&page=...&perPage=...]
+GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&header=...]...[&title=...][&filename=...][&extras=...][&page=...&perPage=...]
 ```
 
 The `apiVersion` / `resource` / `name` / `namespace` parameters are the
 standard `/call` ones. Authentication is the same JWT used for `/call`.
 The export parameters below are stripped before the request is
-re-dispatched through `/call`.
+re-dispatched through `/call`. Every other parameter is forwarded to it
+unchanged.
+
+**Extras:** pass a widget's or RESTAction's `extras` (for example the
+filters a table shows on screen) as the query parameter
+`extras=<URL-encoded JSON>`, exactly as on `GET /call`. `/export` is a
+`GET` only: it does not take extras from a request body the way
+`POST /call/read` does. The re-dispatch carries the same `extras`, so the
+file holds exactly the rows the `/call` with those extras returns, and each
+re-dispatched page is served from the same resolved-cache cell as a `/call`
+of that window (`page`/`perPage`) with those extras.
 
 | Parameter  | Default | Description |
 |------------|---------|-------------|
