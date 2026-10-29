@@ -99,14 +99,18 @@ func TestFalsifierF1_RBACMemoNameIndependence(t *testing.T) {
 	ctx := ctxWithUser(narrowUser)
 	rbac.ResetEvaluateRBACCallCount()
 
-	// A LIST of team-a: the scope evaluation (team-a) covers both items.
+	// A LIST of team-a: the scope evaluation of the request, then ONE per-item
+	// evaluation of team-a covering both items (verb:list is name-independent).
+	// #963 F1 — the per-item memo is NOT seeded from the scope verdict: step 2
+	// evaluates the request's own namespace too, so it backs up step 1.
 	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", items)
 	if gateErr != nil {
 		t.Fatalf("F1-name: filterListByRBAC = %v", gateErr)
 	}
-	if got := rbac.EvaluateRBACCallCount(); got != 1 {
-		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 1 "+
-			"(the scope evaluation of team-a covers its items: verb:list is name-independent)", got)
+	if got := rbac.EvaluateRBACCallCount(); got != 2 {
+		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 2 — the scope "+
+			"evaluation plus ONE per-item evaluation of team-a (name-independent; 1 means the per-item "+
+			"step trusted the scope verdict instead of re-checking, #963 F1)", got)
 	}
 	if len(kept) != 2 {
 		t.Fatalf("F1-name: name-independence broken — %d/2 items kept; the verdict must be "+

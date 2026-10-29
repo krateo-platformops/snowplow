@@ -107,6 +107,9 @@ func newListForbidden(gvr schema.GroupVersionResource, namespace string) error {
 //     covers every item a correct copy holds — a cluster grant covers every
 //     namespace, a namespace grant covers that namespace's partition — so this
 //     step only drops an item that does not belong to the request's scope.
+//     It evaluates EVERY item's namespace, the request's own included (#963
+//     F1), so it is a real backstop: a wrong allow in step 1 cannot serve an
+//     item step 2 would refuse.
 //     "What this requester may see across namespaces" is userAccessFilter's
 //     job, never a cluster-wide list's.
 //
@@ -180,11 +183,15 @@ func filterListByRBAC(
 	// invocation — never a struct field, never package-scoped. It is
 	// discarded at return: no persistence, no invalidation, no staleness.
 	// A subsequent LIST builds a fresh memo against the live RBAC store.
+	//
+	// #963 F1 — the memo starts EMPTY: it is never seeded from the scope
+	// verdict. Step 2 is the backstop of step 1, so an item of the request's
+	// own namespace is evaluated by step 2 like every other item. Seeded with
+	// the scope's allow, a wrong allow in step 1 (an evaluator error read as
+	// allowed) served every item of the request's namespace unchecked; the
+	// cost of not seeding is one EvaluateRBAC per request namespace present
+	// in the items.
 	rbacMemo := make(map[string]bool, len(items))
-	// The scope step already evaluated (user, list, gvr, namespace) and
-	// allowed it: an item of the request's own namespace needs no second
-	// evaluation (for a cluster-wide list that is the cluster-scoped items).
-	rbacMemo[namespace] = true
 
 	kept := make([]*unstructured.Unstructured, 0, len(items))
 	dropped := 0
