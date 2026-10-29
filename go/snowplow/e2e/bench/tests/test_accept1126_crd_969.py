@@ -3,7 +3,7 @@ PUBLISHES. On 1.12.60 (#870) the relist bridge, its re-fire and their counters
 are deleted: B2 asked for relist_bridge_runs_total >= 1 and could not pass.
 Now the rows follow the mechanism: relist (to 1.12.59, unchanged) or
 build-and-swap (#969's table). The 1.12.60 snapshot is RENDERED by #928's own
-expvar functions (tests/fixtures/store_swap_expvar_5a6bb60c.json)."""
+expvar functions (tests/fixtures/store_swap_expvar_a2e5e055.json)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import pytest
 from bench import accept1126 as a
 
 FIX = Path(__file__).resolve().parent / "fixtures"
-R = json.loads((FIX / "store_swap_expvar_5a6bb60c.json").read_text())
+R = json.loads((FIX / "store_swap_expvar_a2e5e055.json").read_text())
 KS = a.K_SWAP_KS
 
 

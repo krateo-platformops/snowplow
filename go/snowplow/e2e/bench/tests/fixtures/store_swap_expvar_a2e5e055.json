@@ -333,12 +333,27 @@
     "schema": 0
    }
   },
+  "snowplow_store_swaps_by_gvr": {
+   "composition.krateo.io/v1-2-2, Resource=compositions": {
+    "abort_clean": 1,
+    "abort_refused": 0,
+    "abort_teardown": 0,
+    "installed": 1,
+    "superseded": 0
+   }
+  },
   "snowplow_store_verification": {
    "store_divergence_candidates_total": 0,
-   "store_divergence_recheck_cleared_total": 0,
-   "store_divergence_recheck_gets_total": 0,
-   "store_divergence_recheck_unavailable_total": 0,
-   "store_divergence_recheck_undelivered_total": 0,
+   "store_divergence_cleared_total": 0,
+   "store_divergence_pending_keys": 0,
+   "store_divergence_pending_oldest_age_seconds": 0,
+   "store_divergence_pending_resolved_lost_total": 0,
+   "store_divergence_pending_resolved_received_total": 0,
+   "store_divergence_pending_superseded_total": 0,
+   "store_divergence_received_total": 0,
+   "store_divergence_store_ahead_total": 0,
+   "store_divergence_undecided_total": 0,
+   "store_divergence_unrecorded_total": 0,
    "store_divergent_lost_add_forced_total": 0,
    "store_divergent_lost_add_snapshot_total": 0,
    "store_divergent_lost_delete_forced_total": 0,
@@ -351,6 +366,7 @@
    "store_gvrs_unverifiable": 0,
    "store_gvrs_unverified": 0,
    "store_objects_verified_total": 0,
+   "store_position_unavailable": 0,
    "store_repair_ineffective_total": 0,
    "store_repair_suppressed_total": 0,
    "store_repair_unsupported_total": 0,
@@ -361,6 +377,7 @@
    "store_verification_skipped_total": 0,
    "store_verifications_total": 0
   },
+  "snowplow_store_verification_pending_by_gvr": {},
   "snowplow_store_verification_skipped_by_reason": {},
   "snowplow_store_verification_unverifiable_by_reason": {}
  },
@@ -698,12 +715,19 @@
     "schema": 0
    }
   },
+  "snowplow_store_swaps_by_gvr": {},
   "snowplow_store_verification": {
    "store_divergence_candidates_total": 0,
-   "store_divergence_recheck_cleared_total": 0,
-   "store_divergence_recheck_gets_total": 0,
-   "store_divergence_recheck_unavailable_total": 0,
-   "store_divergence_recheck_undelivered_total": 0,
+   "store_divergence_cleared_total": 0,
+   "store_divergence_pending_keys": 0,
+   "store_divergence_pending_oldest_age_seconds": 0,
+   "store_divergence_pending_resolved_lost_total": 0,
+   "store_divergence_pending_resolved_received_total": 0,
+   "store_divergence_pending_superseded_total": 0,
+   "store_divergence_received_total": 0,
+   "store_divergence_store_ahead_total": 0,
+   "store_divergence_undecided_total": 0,
+   "store_divergence_unrecorded_total": 0,
    "store_divergent_lost_add_forced_total": 0,
    "store_divergent_lost_add_snapshot_total": 0,
    "store_divergent_lost_delete_forced_total": 0,
@@ -716,6 +740,7 @@
    "store_gvrs_unverifiable": 0,
    "store_gvrs_unverified": 0,
    "store_objects_verified_total": 0,
+   "store_position_unavailable": 0,
    "store_repair_ineffective_total": 0,
    "store_repair_suppressed_total": 0,
    "store_repair_unsupported_total": 0,
@@ -726,8 +751,9 @@
    "store_verification_skipped_total": 0,
    "store_verifications_total": 0
   },
+  "snowplow_store_verification_pending_by_gvr": {},
   "snowplow_store_verification_skipped_by_reason": {},
   "snowplow_store_verification_unverifiable_by_reason": {}
  },
- "source": "bench #969: rendered by #928 5a6bb60c's own expvar funcs (internal/cache, -tags unit); one divergence build accounted by RunStoreSwapAbortForTest (2 keys, 3 s, abort_clean), then swaps+1, m_keys+3, deliveries+2, reused+4997 set directly"
+ "source": "bench #969: rendered by #928 a2e5e055's own expvar funcs (internal/cache, -tags unit, CACHE_ENABLED=true); one divergence build accounted by RunStoreSwapAbortForTest (2 keys, 3 s, abort_clean) and its per-GVR abort_clean through the production noteSwapOutcome (NoteStoreSwapOutcomeForTest); then swaps+1 with that GVR's installed+1 (NoteStoreSwapOutcomeForTest), m_keys+3, deliveries+2, reused+4997 set directly"
 }

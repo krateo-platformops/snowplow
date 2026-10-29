@@ -5,8 +5,8 @@ resolve fall-throughs to the apiserver; plus the paired run's three watches
 (fall-throughs during a rebuild, watch submits right after it, heap and GC
 CPU during it).
 
-The 1.12.60 documents are RENDERED by #928's own expvar functions (5a6bb60c,
-internal/cache -tags unit: tests/fixtures/store_swap_expvar_5a6bb60c.json);
+The 1.12.60 documents are RENDERED by #928's own expvar functions (a2e5e055,
+internal/cache -tags unit: tests/fixtures/store_swap_expvar_a2e5e055.json);
 the 1.12.5x ones are the recorded store-verification capture (#875,
 tests/fixtures/store_verification_expvar_0934e202.json). They go through
 mem606's real sampler (load606.mem_sample, default prefixes) and the report
@@ -27,7 +27,7 @@ from bench import figures, load606, store_rebuild
 from tests.test_run14_list_narrow import _Vars
 
 FIX = Path(__file__).resolve().parent / "fixtures"
-SWAP_DOC = json.loads((FIX / "store_swap_expvar_5a6bb60c.json").read_text())
+SWAP_DOC = json.loads((FIX / "store_swap_expvar_a2e5e055.json").read_text())
 SV = json.loads((FIX / "store_verification_expvar_0934e202.json").read_text())
 G = "composition.krateo.io/v1-2-2, Resource=githubscaffoldingwithcompositionpages"
 T0, START = 1_800_000_000.0, 1_799_999_000.0        # the first sample; snowplow's container start
@@ -96,12 +96,16 @@ def _doc(row, mech, t):
 
 
 def _mem(rows, mech, extra=None):
-    """mem606 samples of `rows`; extra(i) -> a dict merged into sample i's /debug/vars."""
+    """mem606 samples of `rows`; extra(i) -> a dict merged into sample i's
+    /debug/vars (a None value: that family is not published by this build)."""
     out = [{"kind": "mem_start", "t": T0 - 1}]
     for i, row in enumerate(rows):
         t = T0 + 15 * i
         doc = _doc(row, mech, t)
         for k, v in ((extra(i) if extra else None) or {}).items():
+            if v is None:
+                doc.pop(k, None)
+                continue
             doc[k] = {**doc.get(k, {}), **v} if isinstance(v, dict) and isinstance(doc.get(k), dict) else v
         rec = load606.mem_sample(_Vars(doc), "tok", tuple(load606.RUN8_VARS_PREFIXES))
         rec["t"] = t
@@ -415,6 +419,7 @@ def _lists(cells_at, swaps=None, refresher_from=None):
     fall-through path."""
     def f(i):
         out = {LISTS: {c: (1 if i >= at else 0) for c, at in cells_at.items()}}
+        out[SWAPS] = None                   # a build without #928's per-GVR swap signal
         if swaps is not None:
             out[SWAPS] = {g: {"installed": 1 if i >= at else 0, "superseded": 0, "abort_clean": 0,
                               "abort_refused": 0, "abort_teardown": 0} for g, at in swaps.items()}
@@ -563,3 +568,18 @@ def test_with_the_signal_published_and_nothing_installed_nothing_is_judged(tmp_p
     assert w["missing"] == "no swap installed in the window: nothing judged"
     assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
         "resolve_collection_lists_during_rebuilds"] is None
+
+
+def test_the_rendered_per_gvr_swap_family_is_read_by_its_installed_count():
+    """#928 a2e5e055 renders snowplow_store_swaps_by_gvr as {gvr: {installed,
+    superseded, abort_clean, abort_refused, abort_teardown}}; an empty map
+    before any build. The bench reads `installed` per GVR, and the build that
+    installed it moves it by one."""
+    b, a = SWAP_DOC["before"][SWAPS], SWAP_DOC["after"][SWAPS]
+    gvr = "composition.krateo.io/v1-2-2, Resource=compositions"
+    assert b == {} and set(a) == {gvr}
+    assert set(a[gvr]) == {"installed", "superseded", "abort_clean", "abort_refused", "abort_teardown"}
+    cb = store_rebuild.counters(SWAP_DOC["before"], "build_and_swap")
+    ca = store_rebuild.counters(SWAP_DOC["after"], "build_and_swap")
+    assert not any(k.startswith("swaps_installed_gvr/") for k in cb)
+    assert ca[f"swaps_installed_gvr/{gvr}"] == 1
