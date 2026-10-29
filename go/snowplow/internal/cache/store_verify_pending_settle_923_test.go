@@ -20,6 +20,14 @@ package cache
 //       the pass's LIST is in flight, before the pass supersedes anything.
 //   J2  the resolver meets an unknown (empty) applied position: the key stays
 //       pending, no loss is published (#923 review F4).
+//   RP5 the REVERSE order of RP3 (#923 review round 2, mutation S3): the next
+//       pass's judgePending takes its copy of the set and is parked while
+//       judging it; the resolver settles the key meanwhile; the pass resumes
+//       and must not settle it again.
+//   S6  a STALE verdict must not settle a key a newer pass re-held (#923 review
+//       round 2, mutation S6): the resolver is parked with a verdict against the
+//       key's old read; the next pass re-holds the key against its own, newer
+//       read; the resolver resumes and must leave the re-held key pending.
 //
 // No sleeps: the resolver's sweep counter moves once its judgement is complete
 // (settled, published and counted), and the arms wait on it.
@@ -30,6 +38,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	clientcache "k8s.io/client-go/tools/cache"
 )
 
 func TestPendingSettle923_RP1_CarriedLossOnAPassWhoseListFails(t *testing.T) {
@@ -94,6 +104,13 @@ func TestPendingSettle923_RP2_CarriedLossOnAPassWithNoPublishedPosition(t *testi
 // sweep count before the wake.
 func rp923ParkResolver(t *testing.T, rw *ResourceWatcher, dl *deliveryLog) (unpark func(), sweeps0 uint64) {
 	t.Helper()
+	return rp923ParkResolverAt(t, rw, dl, j9Object{jclock.name, "5100", jclock.uid})
+}
+
+// rp923ParkResolverAt is rp923ParkResolver with the waking event's clock
+// object given (its resourceVersion is the store's position once applied).
+func rp923ParkResolverAt(t *testing.T, rw *ResourceWatcher, dl *deliveryLog, wake j9Object) (unpark func(), sweeps0 uint64) {
+	t.Helper()
 	orig := dl.applied
 	var armed atomic.Bool
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -106,7 +123,7 @@ func rp923ParkResolver(t *testing.T, rw *ResourceWatcher, dl *deliveryLog) (unpa
 	}
 	armed.Store(true)
 	sweeps0 = dl.sweeps.Load()
-	j9Deliver(t, rw, repairGVR, jmod(j9Object{jclock.name, "5100", jclock.uid}))
+	j9Deliver(t, rw, repairGVR, jmod(wake))
 	select {
 	case <-entered:
 	case <-time.After(verifyBound):
@@ -209,5 +226,124 @@ func TestPendingSettle923_J2_AnUnknownAppliedPositionKeepsTheKeyPending(t *testi
 	}
 	if got := storePendingKeys.Load(); got != 1 {
 		t.Fatalf("J2 RED: %d pending keys, want the key still pending (1)", got)
+	}
+}
+
+// rp5ParkingIndexer parks the first GetByKey after it is armed: the judging
+// loop of whichever path reads it next, after that path's copy of the set.
+type rp5ParkingIndexer struct {
+	clientcache.Indexer
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *rp5ParkingIndexer) GetByKey(key string) (any, bool, error) {
+	if p.armed.CompareAndSwap(true, false) {
+		close(p.entered)
+		<-p.release
+	}
+	return p.Indexer.GetByKey(key)
+}
+
+// TestPendingSettle923_RP5_ThePassJudgesAKeyTheResolverSettlesMeanwhile —
+// reviewer-923's round-2 probe RP5, adopted: the reverse order of RP3.
+func TestPendingSettle923_RP5_ThePassJudgesAKeyTheResolverSettlesMeanwhile(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	cli.answer("5002", ja2, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	if got := storePendingKeys.Load(); got != 1 {
+		t.Fatalf("precondition: %d pending keys, want 1", got)
+	}
+	dl := j9Log(t, rw, repairGVR)
+	j9WaitFor(t, "the resolver's first judgement", func() bool { return dl.sweeps.Load() >= 1 })
+	// Both paths must decide "lost": the store's position is moved past the
+	// read by a bookmark, which gives no callback.
+	j9Bookmark(t, rw, repairGVR, "5100")
+
+	pi := &rp5ParkingIndexer{Indexer: dl.indexer, entered: make(chan struct{}), release: make(chan struct{})}
+	dl.indexer = pi
+	cli.mu.Lock()
+	cli.listErr = errors.New("unavailable")
+	cli.mu.Unlock()
+	pi.armed.Store(true)
+	var unparkOnce atomic.Bool
+	unpark := func() {
+		if unparkOnce.CompareAndSwap(false, true) {
+			close(pi.release)
+		}
+	}
+	t.Cleanup(unpark)
+	done := make(chan struct{})
+	go func() { defer close(done); forcedVerify(context.Background(), repairGVR) }()
+	select {
+	case <-pi.entered:
+	case <-time.After(verifyBound):
+		t.Fatalf("precondition: judgePending never reached its judgement")
+	}
+	// The pass is parked inside judgePending, after its copy of the set. An
+	// applied event wakes the resolver, which settles the key.
+	s0 := dl.sweeps.Load()
+	j9Deliver(t, rw, repairGVR, jmod(j9Object{jclock.name, "5200", jclock.uid}))
+	j9WaitFor(t, "the resolver settling the key", func() bool { return dl.sweeps.Load() > s0 })
+	if got := j9Class("update"); got != 1 {
+		t.Fatalf("SETUP: the resolver published %d lost updates, want 1", got)
+	}
+	unpark()
+	<-done
+	rp923AssertSettledOnce(t, "RP5")
+}
+
+// TestPendingSettle923_S6_AStaleVerdictDoesNotSettleAKeyANewerPassReHeld —
+// #923 review round 2, mutation S6 (the resolver's pass-generation check).
+//
+//  1. Pass 1 holds panel-a against its read at 5002 (the store is at 4001 and
+//     its position below 5002).
+//  2. The resolver is woken (position 5001) and parked after its copy of the
+//     set, at its position read.
+//  3. Pass 2 judges the key against the old read (position 5001 < 5002:
+//     still pending), lists at 5300, supersedes, and re-holds the key against
+//     its own, newer read at 5300.
+//  4. A bookmark moves the position to 5100: past the OLD read, short of the
+//     new one.
+//  5. The resolver resumes. Its copy holds the old read, so its verdict is
+//     "lost"; the key it would settle is the one pass 2 re-held. That verdict
+//     is stale: the key must stay pending, held to its newer read, and no loss
+//     is published.
+func TestPendingSettle923_S6_AStaleVerdictDoesNotSettleAKeyANewerPassReHeld(t *testing.T) {
+	rw, cli := j9Setup(t, repairGVR, true, ja1)
+	cli.answer("5002", ja2, jclock)
+	forcedVerify(context.Background(), repairGVR)
+	if got := storePendingKeys.Load(); got != 1 {
+		t.Fatalf("precondition: %d pending keys, want 1", got)
+	}
+	dl := j9Log(t, rw, repairGVR)
+	j9WaitFor(t, "the resolver's first judgement", func() bool { return dl.sweeps.Load() >= 1 })
+
+	clock := j9Object{jclock.name, "5001", jclock.uid}
+	unpark, sweeps0 := rp923ParkResolverAt(t, rw, dl, clock)
+	t.Cleanup(unpark)
+
+	cli.answer("5300", j9Object{ja1.name, "5300", ja1.uid}, clock)
+	forcedVerify(context.Background(), repairGVR)
+	if got := storePendingKeys.Load(); got != 1 {
+		t.Fatalf("SETUP: %d pending after pass 2, want panel-a re-held (1)", got)
+	}
+	if got := j9Class("update"); got != 0 {
+		t.Fatalf("SETUP: pass 2 published %d lost updates, want 0 (the key is behind both reads)", got)
+	}
+	j9Bookmark(t, rw, repairGVR, "5100")
+
+	unpark()
+	j9WaitFor(t, "the parked resolver completing its judgement", func() bool { return dl.sweeps.Load() > sweeps0 })
+	if got := j9Class("update"); got != 0 {
+		t.Errorf("S6 RED: a stale verdict (old read 5002, position 5100) published %d lost updates for a key "+
+			"pass 2 re-held against its newer read 5300, want 0", got)
+	}
+	if got := storePendingResolvedLostTotal.Load(); got != 0 {
+		t.Errorf("S6 RED: store_divergence_pending_resolved_lost_total = %d, want 0", got)
+	}
+	if got := storePendingKeys.Load(); got != 1 {
+		t.Errorf("S6 RED: %d pending, want the re-held key still pending (1)", got)
 	}
 }
