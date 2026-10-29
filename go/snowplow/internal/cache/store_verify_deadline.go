@@ -358,7 +358,11 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	var carried []divergenceCandidate
 	var gen uint64
 	if dl != nil {
-		carried = dl.judgePending()
+		var release func()
+		carried, release = dl.judgePending()
+		// The carried losses stay counted as pending until this pass has
+		// published them, whichever way it ends (storePendingKeys' invariant).
+		defer release()
 		if listRV = dl.beginPass(); listRV == "" {
 			publishCarried(gvr, carried)
 			recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"

@@ -122,7 +122,21 @@ import (
 
 // storePendingKeys is the store_divergence_pending_keys gauge: pending keys
 // across every GVR.
+//
+// THE INVARIANT (#923 / #959): a key leaves this gauge only after its outcome
+// is FULLY published. A key resolved to a loss is counted until its divergence
+// is recorded and its repair enqueued (the resolver: publishResolvedLoss; the
+// next forced pass: its report, through judgePending's release); a key
+// resolved otherwise until its outcome counter has moved. So a reader that
+// sees 0 sees every resolved outcome already published, never one in flight.
+// The per-GVR breakdown (pendingCount) counts the same keys: those still
+// judged (pending) plus those resolved and being published (publishing).
 var storePendingKeys atomic.Int64
+
+// resolvedLossPublishedHookForTest, when set, runs on the resolver right after
+// it has published a resolved loss and before the key leaves the gauge — the
+// one instant the invariant above speaks about. Nil in production.
+var resolvedLossPublishedHookForTest atomic.Pointer[func()]
 
 // received is one key's latest delivery handed on and not yet seen applied:
 // what it carried, and its number on the log's transform counter.
@@ -185,10 +199,14 @@ type deliveryLog struct {
 	pending map[string]pendingKey
 	pgen    uint64
 	carried map[string]time.Time
-	running bool
-	closed  bool
-	wake    chan struct{}
-	stop    chan struct{}
+	// publishing: keys removed from pending as resolved losses whose outcome
+	// is not yet published (see storePendingKeys' invariant). They are still
+	// counted as pending by the gauge and the per-GVR breakdown.
+	publishing int
+	running    bool
+	closed     bool
+	wake       chan struct{}
+	stop       chan struct{}
 	// sweeps counts the resolver's judgements of its pending set, so a test
 	// can tell "the resolver has looked" from "the resolver has not run yet".
 	sweeps atomic.Uint64
@@ -347,7 +365,11 @@ func (l *deliveryLog) passGen() uint64 {
 // up with is settled; any other stays pending — until the pass's own read
 // supersedes it (supersede), or, if the pass cannot take one, until a later
 // event or pass.
-func (l *deliveryLog) judgePending() []divergenceCandidate {
+//
+// The returned losses stay COUNTED as pending (storePendingKeys' invariant)
+// until the pass has published them: the pass calls release once its report is
+// recorded and its repair enqueued, on every way out. release is never nil.
+func (l *deliveryLog) judgePending() (lost []divergenceCandidate, release func()) {
 	pos := positionOf(l.appliedPosition()) // first (store_verify_judge.go)
 	l.mu.Lock()
 	gen := l.pgen
@@ -357,10 +379,9 @@ func (l *deliveryLog) judgePending() []divergenceCandidate {
 	}
 	l.mu.Unlock()
 	if len(keys) == 0 {
-		return nil
+		return nil, func() {}
 	}
 
-	var lost []divergenceCandidate
 	var settled []string
 	var resolvedReceived uint64
 	for key, p := range keys {
@@ -377,20 +398,37 @@ func (l *deliveryLog) judgePending() []divergenceCandidate {
 	l.mu.Lock()
 	if l.pgen != gen {
 		l.mu.Unlock()
-		return nil // closed meanwhile
+		return nil, func() {} // closed meanwhile
 	}
 	for _, k := range settled {
 		delete(l.pending, k)
 	}
+	l.publishing += len(lost)
 	empty := len(l.pending) == 0
 	l.mu.Unlock()
-	storePendingKeys.Add(-int64(len(settled)))
 	storePendingResolvedLostTotal.Add(uint64(len(lost)))
 	storePendingResolvedReceivedTotal.Add(resolvedReceived)
+	// The settled keys that are not losses are published (their counter has
+	// moved): they leave the gauge now. The losses leave it at release.
+	storePendingKeys.Add(-int64(len(settled) - len(lost)))
 	if empty {
 		setPendingFlag(l.gvr, false)
 	}
-	return lost
+	n := len(lost)
+	var once sync.Once
+	return lost, func() { once.Do(func() { l.lossesPublished(n) }) }
+}
+
+// lossesPublished removes n resolved losses from the pending counts once their
+// outcome is published (storePendingKeys' invariant).
+func (l *deliveryLog) lossesPublished(n int) {
+	if n == 0 {
+		return
+	}
+	l.mu.Lock()
+	l.publishing -= n
+	l.mu.Unlock()
+	storePendingKeys.Add(-int64(n))
 }
 
 // beginPass opens a forced pass: the pass generation advances, deletes older
@@ -515,11 +553,12 @@ func (l *deliveryLog) setPending(reads map[string]readState) {
 	l.signal()
 }
 
-// pendingCount is the number of keys pending on this GVR.
+// pendingCount is the number of keys pending on this GVR: those still judged
+// and those resolved to a loss whose outcome is not yet published.
 func (l *deliveryLog) pendingCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.pending)
+	return len(l.pending) + l.publishing
 }
 
 // oldestPending is when this GVR's oldest pending key first became pending
@@ -610,18 +649,26 @@ func (l *deliveryLog) resolve() {
 		for _, k := range settled {
 			delete(l.pending, k)
 		}
+		l.publishing += len(lost)
 		empty := len(l.pending) == 0
 		if empty {
 			l.running = false
 		}
 		l.mu.Unlock()
-		storePendingKeys.Add(-int64(len(settled)))
+		// PUBLISH FIRST, DECREMENT LAST (storePendingKeys' invariant): every
+		// outcome counter moves and every loss is recorded and its repair
+		// enqueued before the settled keys leave the gauge.
 		storePendingResolvedReceivedTotal.Add(resolvedReceived)
 		storeUndecidedTotal.Add(undecided)
 		if len(lost) > 0 {
 			storePendingResolvedLostTotal.Add(uint64(len(lost)))
 			publishResolvedLoss(l.gvr, lost)
+			if fn := resolvedLossPublishedHookForTest.Load(); fn != nil {
+				(*fn)()
+			}
 		}
+		storePendingKeys.Add(-int64(len(settled) - len(lost)))
+		l.lossesPublished(len(lost))
 		if empty {
 			setPendingFlag(l.gvr, false)
 			return
