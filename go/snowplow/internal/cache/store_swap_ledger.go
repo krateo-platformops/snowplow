@@ -426,7 +426,7 @@ func ledgerRefreshed(key string, began time.Time) {
 			continue
 		}
 		e.refreshed = true
-		e.refreshedAt = time.Now()
+		e.refreshedAt = windowNow()
 	}
 }
 
@@ -435,7 +435,7 @@ func ledgerKnownStale(key string, began time.Time) {
 	var recs []closeRecord
 	l := swapLedger
 	l.mu.Lock()
-	now := time.Now()
+	now := windowNow()
 	for e := range l.byKey[key] {
 		if e.refreshed || began.Before(e.ra.installed) {
 			continue
@@ -455,7 +455,7 @@ func ledgerEvicted(key string) {
 		return
 	}
 	var recs []closeRecord
-	now := time.Now()
+	now := windowNow()
 	for e := range l.byKey[key] {
 		recs = append(recs, l.closeLocked(e, closeEvicted, now))
 	}
@@ -463,12 +463,13 @@ func ledgerEvicted(key string) {
 	recordCloses(recs)
 }
 
-// ledgerFrameWritten: the /refreshes handler WROTE a refresh frame for key to
-// a stream subscribed at armedAt (C2: after writeFrame returned true). A
-// refreshed entry closes pushed, or pushed_on_arm when the stream armed the key
-// after the refresh. A still-stale entry stays open: the frame announced a body
-// that is not the corrected one yet.
-func ledgerFrameWritten(key string, armedAt time.Time) {
+// ledgerFrameWritten: the /refreshes handler WROTE a refresh frame for key
+// (C2: after writeFrame returned true). A refreshed entry closes pushed, or
+// pushed_on_arm when the stream armed the key AFTER the entry was refreshed
+// (onArm: the arm found it refreshed — decided by the order of the two events,
+// never by comparing instants). A still-stale entry stays open: the frame
+// announced a body that is not the corrected one yet.
+func ledgerFrameWritten(key string, onArm bool) {
 	l := swapLedger
 	l.mu.Lock()
 	if len(l.byKey[key]) == 0 {
@@ -476,13 +477,13 @@ func ledgerFrameWritten(key string, armedAt time.Time) {
 		return
 	}
 	var recs []closeRecord
-	now := time.Now()
+	now := windowNow()
 	for e := range l.byKey[key] {
 		if !e.refreshed {
 			continue
 		}
 		c := closePushed
-		if !armedAt.Before(e.refreshedAt) {
+		if onArm {
 			c = closePushedOnArm
 		}
 		recs = append(recs, l.closeLocked(e, c, now))
@@ -499,7 +500,7 @@ func ledgerResyncWritten(keys map[string]struct{}) {
 	l := swapLedger
 	l.mu.Lock()
 	var recs []closeRecord
-	now := time.Now()
+	now := windowNow()
 	for k := range keys {
 		for e := range l.byKey[k] {
 			if !e.refreshed {
@@ -558,7 +559,7 @@ func storeSwapGauges() (keysOpen map[string]int64, windowMaxSec map[string]float
 		keysOpen[r], windowMaxSec[r], owed[r] = 0, 0, 0
 	}
 	l := swapLedger
-	now := time.Now()
+	now := windowNow()
 	type refreshedKey struct{ key, reason string }
 	var refreshed []refreshedKey
 	l.mu.Lock()

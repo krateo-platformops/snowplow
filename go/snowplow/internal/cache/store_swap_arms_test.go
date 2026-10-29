@@ -452,13 +452,16 @@ func TestStoreSwap_K10_RefusedAbortsAndStallBlocksNothing(t *testing.T) {
 			}
 			return nil
 		}), withExtraGVR(gvrB))
+		clk := newC930Clock()
+		t.Cleanup(SetDirtyWindowClockForTest(clk.now))
 		fail.Store(true)
 		fa.clusterSet(swapObj(gvrA, "o00", "2", "v2"))
 		fa.request(reasonDivergence, swapKey("o00"))
-		time.Sleep(100 * time.Millisecond)
+		fa.waitFor("the stalled copy's failing LIST", func() bool { return fa.listCount() >= 2 })
+		clk.advance(7 * time.Second)
 		_, winMax, _ := storeSwapGauges()
-		if winMax[reasonDivergence] <= 0 {
-			t.Fatal("K10: the stalled build's window is not visible on window_open_seconds_max")
+		if winMax[reasonDivergence] != 7 {
+			t.Fatalf("K10: window_open_seconds_max = %v 7 s into the stalled build, want 7", winMax[reasonDivergence])
 		}
 		// A second GVR on the SAME watcher repairs while A is stalled.
 		fa.fake.Tracker().Create(gvrB, swapObj(gvrB, "b0", "1", "v1"), swapNS)
@@ -473,9 +476,10 @@ func TestStoreSwap_K10_RefusedAbortsAndStallBlocksNothing(t *testing.T) {
 		if fa.rw.storeBuildForTest(gvrA) == nil {
 			t.Fatal("K10: A's stalled build ended without an event")
 		}
+		clk.advance(3 * time.Second)
 		_, winMax2, _ := storeSwapGauges()
-		if winMax2[reasonDivergence] < winMax[reasonDivergence] {
-			t.Fatal("K10: A's open window gauge went backwards while it stalled")
+		if winMax2[reasonDivergence] != 10 {
+			t.Fatalf("K10: A's open window = %v after 10 s of stall, want 10 (rising while it stalls)", winMax2[reasonDivergence])
 		}
 		if st := fa.rw.ServabilityEpoch(gvrA); !fa.rw.IsServable(gvrA) {
 			t.Fatalf("K10: A left servable while its build stalled (epoch %d)", st)

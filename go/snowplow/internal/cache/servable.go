@@ -176,7 +176,7 @@ func (rw *ResourceWatcher) watchErrorHandlerForInstance(gvr schema.GroupVersionR
 			rw.mu.Unlock()
 			recordWatchError()
 			if aborted != nil {
-				aborted.endAll(outcomeAbortRefused, time.Now())
+				aborted.endAll(outcomeAbortRefused, windowNow())
 				slog.Warn("cache.store.swap.aborted_refused",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),

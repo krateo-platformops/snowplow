@@ -302,7 +302,7 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 	if rw == nil || rw.mode == modePassthrough {
 		return false
 	}
-	now := time.Now()
+	now := windowNow()
 	rw.mu.Lock()
 	live := rw.instances[gvr]
 	if live == nil {
@@ -488,7 +488,7 @@ func (rw *ResourceWatcher) noteCleanPass(gvr schema.GroupVersionResource, in *st
 		aborted = rw.abortBuildLocked(gvr)
 	}
 	rw.mu.Unlock()
-	acc.endReason(reasonDivergence, outcomeAbortClean, time.Now())
+	acc.endReason(reasonDivergence, outcomeAbortClean, windowNow())
 	_ = aborted
 }
 
@@ -525,7 +525,7 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	rw.retiring[gvr] = append(rw.retiring[gvr], live)
 	retiring := append([]*storeInstance(nil), rw.retiring[gvr]...)
 	resetVerificationAfterSwap(gvr, acc.has(reasonDivergence))
-	installed := time.Now()
+	installed := windowNow()
 	rw.mu.Unlock()
 	storeSwapStats.swaps.Add(1)
 	swapStep(c, "installed")

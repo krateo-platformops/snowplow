@@ -9,6 +9,8 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +26,11 @@ type ledgerRig struct {
 	gate    map[string]chan struct{} // refresh of key waits here
 	after   map[string]chan struct{} // refresh of key waits here AFTER its publish
 	refresh atomic.Int64
+
+	// clk is the dirty-window clock (#930): every instant the swap, the
+	// ledger and the refresher's windows read. The arms advance it at the
+	// points they state and assert EXACT window lengths, never a wall bound.
+	clk *c930Clock
 }
 
 func newLedgerRig(t *testing.T, n int) *ledgerRig {
@@ -39,7 +46,9 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 	t.Cleanup(ResetRefreshBroadcasterForTest)
 	resetRefresherForTest()
 	t.Cleanup(resetRefresherForTest)
-	r := &ledgerRig{swapFix: f, decline: map[string]bool{}, gate: map[string]chan struct{}{}, after: map[string]chan struct{}{}}
+	r := &ledgerRig{swapFix: f, decline: map[string]bool{}, gate: map[string]chan struct{}{}, after: map[string]chan struct{}{},
+		clk: newC930Clock()}
+	t.Cleanup(SetDirtyWindowClockForTest(r.clk.now))
 	r.store = ResolvedCache()
 	if r.store == nil {
 		t.Skip("resolved cache disabled")
@@ -56,11 +65,16 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 		if decl {
 			return nil // no Put: the dequeue ends known-stale (declined)
 		}
+		// As resolveAndPopulateL1 does: the resolve's own dep-gen sink (the
+		// L1-key context), its generation captured before the read, its dep
+		// recorded, then the gen-guarded replace.
+		rctx := WithL1KeyContext(ctx, key)
 		gen0 := r.store.CaptureGen(key)
 		obj, _ := f.storeObj(in.Namespace + "/" + in.Name)
+		Deps().Record(rctx, key, f.gvr, in.Namespace, in.Name)
 		e := &ResolvedEntry{RawJSON: cellBody(obj), Inputs: &in}
-		stored := r.store.ReplaceIfGenRefresh(ctx, key, e, gen0)
-		NoteRefreshWrite(ctx, key, stored)
+		stored := r.store.replaceIfGenRefresh(rctx, key, e, gen0)
+		NoteRefreshWrite(rctx, key, stored)
 		if stored {
 			PublishRefresh(key) // what resolveAndPopulateL1 does after an accepted re-Put
 		}
@@ -75,6 +89,12 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	StartRefresher(ctx)
+	// Runs FIRST at cleanup (LIFO): stop the informers and join the dep worker,
+	// so nothing marks into the refresher or the store while they are reset.
+	t.Cleanup(func() {
+		f.rw.Stop()
+		resetDepWatchForTest()
+	})
 	return r
 }
 
@@ -94,7 +114,7 @@ func (r *ledgerRig) cell(name, class string) string {
 		Resource: r.gvr.Resource, Namespace: swapNS, Name: name}
 	key := ComputeKey(*in)
 	obj, _ := r.storeObj(swapKey(name))
-	r.store.Put(key, &ResolvedEntry{RawJSON: cellBody(obj), Inputs: in})
+	r.store.put(key, &ResolvedEntry{RawJSON: cellBody(obj), Inputs: in})
 	Deps().Record(context.Background(), key, r.gvr, swapNS, name)
 	return key
 }
@@ -128,6 +148,20 @@ type viewer struct {
 	done   chan struct{}
 }
 
+// quiesce waits until nothing more can happen without a new event: the dep
+// worker's queue is drained and the refresher has no work outstanding (#930's
+// event-driven wait, never a sleep).
+func (r *ledgerRig) quiesce() {
+	r.t.Helper()
+	r.waitFor("the dep worker to drain", func() bool { return DepWatchStatsSnapshot().DeleteQueueDepth == 0 })
+	if _, err := WaitRefresherQuiescentForTest(RefresherWorkSnapshot(), 30*time.Second); err != nil {
+		buf := make([]byte, 1<<22)
+		n := runtime.Stack(buf, true)
+		_ = os.WriteFile("/private/tmp/claude-501/-Users-diegobraga-krateo-snowplow-cache-snowplow--claude-worktrees-gate-118cv2/35e88d50-8fa5-4a2a-9780-d3b7ef3f70cf/scratchpad/dev870/stacks.txt", buf[:n], 0o644)
+		r.t.Fatalf("refresher never quiescent: %v (work %+v, refreshes run %d)", err, RefresherWorkSnapshot(), r.refresh.Load())
+	}
+}
+
 func (r *ledgerRig) view(keys ...string) *viewer {
 	set := map[string]struct{}{}
 	for _, k := range keys {
@@ -145,7 +179,7 @@ func (r *ledgerRig) view(keys ...string) *viewer {
 				}
 				v.mu.Lock()
 				v.frames[k]++
-				v.at[k] = time.Now()
+				v.at[k] = windowNow()
 				v.mu.Unlock()
 				v.st.Wrote(k)
 			}
@@ -194,11 +228,13 @@ func closes(reason, c string) uint64 { return storeSwapStats.closes.get(reason, 
 
 // TestStoreSwap_K16_KnownStaleDivergence: (1) during the build a single-object
 // dependent of a confirmed key keeps serving the stale body while a churned
-// dependent stays fresh; (2) keys_open{divergence} = the confirmed count;
-// (3) after the window closes keys_total{divergence,swap} grew by exactly that
-// count and the window total lies between detection and the frame's receipt;
-// (4) the armed subscriber gets NO frame before the install and EXACTLY ONE
-// after it, with the corrected object. RED under X1, X23, X24 and X32.
+// dependent stays fresh; (2) keys_open{divergence} = the confirmed count and
+// the open window's age is read off the window clock; (3) after the window
+// closes keys_total{divergence,swap} grew by exactly that count and the window
+// total is EXACTLY detection → the frame's write; (4) the armed subscriber gets
+// NO frame before the install and EXACTLY ONE after it, with the corrected
+// object. All instants are the dirty-window clock's. RED under X1, X23, X24 and
+// X32.
 func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 	r := newLedgerRig(t, 4)
 	stale := r.cell("o00", "")
@@ -208,7 +244,7 @@ func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 	release := r.holdList(lists0 + 1)
 
 	r.clusterSet(swapObj(r.gvr, "o00", "2", "corrected"))
-	tDetect := time.Now()
+	t0 := r.clk.now() // detection
 	r.request(reasonDivergence, swapKey("o00"))
 
 	// (1) the live copy keeps delivering: the churned dependent refreshes.
@@ -219,19 +255,22 @@ func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 	if got := r.body(stale); got != `{"v":"v1"}` {
 		t.Fatalf("K16 (1): the known-stale dependent changed during the build: %s", got)
 	}
-	// (2) and (X24) the window is open and counted.
+	// (2) and (X24): 2 s into the build the window is open, counted and 2 s old.
+	r.clk.advance(2 * time.Second)
 	ko, wm, _ := gauges()
-	if ko[reasonDivergence] != 1 || wm[reasonDivergence] <= 0 {
-		t.Fatalf("K16 (2) RED (X24): keys_open=%v window_open_max=%v during the build, want 1 and >0", ko, wm)
+	if ko[reasonDivergence] != 1 || wm[reasonDivergence] != 2 {
+		t.Fatalf("K16 (2) RED (X24): keys_open=%v window_open_max=%v 2 s into the build, want 1 and 2", ko, wm)
 	}
 	if v.count(stale) != 0 {
 		t.Fatal("K16 (4): a frame for the stale dependent before the install")
 	}
 
+	relRefresh := r.holdRefresh(stale) // the dependent's refresh waits for the arm
 	release()
-	r.awaitSwaps(1)
+	r.awaitSwaps(1) // installed at t0 + 2 s
+	r.clk.advance(3 * time.Second)
+	relRefresh() // refreshed and written at t0 + 5 s
 	r.waitFor("the corrected frame", func() bool { return v.count(stale) >= 1 })
-	tFrame := v.when(stale)
 	if got := r.body(stale); got != `{"v":"corrected"}` {
 		t.Fatalf("K16 (4) RED (X1): the frame announced %s, want the corrected object", got)
 	}
@@ -239,9 +278,12 @@ func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 		ko, wm, _ := gauges()
 		return ko[reasonDivergence] == 0 && wm[reasonDivergence] == 0
 	})
-	time.Sleep(50 * time.Millisecond)
+	r.quiesce()
 	if n := v.count(stale); n != 1 {
 		t.Fatalf("K16 (4) RED (X32): %d frames after the install, want exactly 1", n)
+	}
+	if got := v.when(stale).Sub(t0); got != 5*time.Second {
+		t.Fatalf("K16: the frame was written at t0+%v, want t0+5s", got)
 	}
 	// (3)
 	if got := storeSwapStats.keys.get(reasonDivergence, outcomeSwap); got != 1 {
@@ -250,16 +292,17 @@ func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 	if got := storeSwapStats.builds.get(reasonDivergence, outcomeSwap); got != 1 {
 		t.Fatalf("K16 (3) RED (X23): builds_total{divergence,swap} = %d, want 1", got)
 	}
-	win := storeSwapWindowSeconds(reasonDivergence, outcomeSwap)
-	if max := time.Since(tDetect).Seconds(); win <= 0 || win > max || win < tFrame.Sub(tDetect).Seconds()-0.05 {
-		t.Fatalf("K16 (3) RED (X24): window = %.3fs, want within [frame-detect=%.3fs, now-detect=%.3fs]",
-			win, tFrame.Sub(tDetect).Seconds(), max)
+	if win := storeSwapWindowSeconds(reasonDivergence, outcomeSwap); win != 5 {
+		t.Fatalf("K16 (3) RED (X24): window_seconds_total{divergence,swap} = %vs, want exactly 5 (detection → the frame written)", win)
 	}
 	if closes(reasonDivergence, closePushed) != 1 {
 		t.Fatalf("K16: closes{pushed} = %d, want 1", closes(reasonDivergence, closePushed))
 	}
-	if c := storeSwapStats.detectHist[[2]string{reasonDivergence, closePushed}].count.Load(); c != 1 {
-		t.Fatalf("K16: detect_to_push_ms{divergence,pushed} has %d observations, want 1", c)
+	d := storeSwapStats.detectHist[[2]string{reasonDivergence, closePushed}]
+	i := storeSwapStats.installHist[[2]string{reasonDivergence, closePushed}]
+	if d.count.Load() != 1 || d.maxMS.Load() != 5000 || i.count.Load() != 1 || i.maxMS.Load() != 3000 {
+		t.Fatalf("K16: detect_to_push=%d obs/%dms, install_to_push=%d obs/%dms; want 1/5000 and 1/3000",
+			d.count.Load(), d.maxMS.Load(), i.count.Load(), i.maxMS.Load())
 	}
 }
 
@@ -296,8 +339,8 @@ func TestStoreSwap_K16_LiveEventClosesACoordinateNotInM(t *testing.T) {
 // ── K16b — reason schema ─────────────────────────────────────────────────────
 
 // TestStoreSwap_K16bSchemaWindow: a widen build serves the changed objects
-// pruned during it; keys_total{schema,swap} = |M|; the window spans the CRD
-// event to the last push; the armed single-object dependent gets exactly one
+// pruned during it; keys_total{schema,swap} = |M|; the window is EXACTLY the
+// CRD event → the push; the armed single-object dependent gets exactly one
 // frame after the install. RED under X30.
 func TestStoreSwap_K16bSchemaWindow(t *testing.T) {
 	r := newLedgerRig(t, 3)
@@ -307,12 +350,12 @@ func TestStoreSwap_K16bSchemaWindow(t *testing.T) {
 	release := r.holdList(lists0 + 1)
 	widened := swapObj(r.gvr, "o01", "1", "widened") // same resourceVersion: a widen
 	r.clusterSet(widened)
-	tEvent := time.Now()
-	r.request(reasonSchema)
-	time.Sleep(20 * time.Millisecond)
+	r.request(reasonSchema) // the CRD event, at t0
+	r.waitFor("the new copy's LIST", func() bool { return r.listCount() == lists0+1 })
 	if got := r.body(dep); got != `{"v":"v1"}` {
 		t.Fatalf("K16b: the dependent changed during the build: %s", got)
 	}
+	r.clk.advance(4 * time.Second)
 	release()
 	r.awaitSwaps(1)
 	r.waitFor("the frame", func() bool { return v.count(dep) == 1 })
@@ -320,15 +363,18 @@ func TestStoreSwap_K16bSchemaWindow(t *testing.T) {
 		_, wm, _ := gauges()
 		return wm[reasonSchema] == 0
 	})
+	r.quiesce()
+	if n := v.count(dep); n != 1 {
+		t.Fatalf("K16b: %d frames after the install, want exactly 1", n)
+	}
 	if got := storeSwapStats.keys.get(reasonSchema, outcomeSwap); got != 1 {
 		t.Fatalf("K16b RED (X30): keys_total{schema,swap} = %d, want |M| = 1", got)
 	}
 	if got := storeSwapStats.keys.get(reasonDivergence, outcomeSwap); got != 0 {
 		t.Fatalf("K16b RED (X30): a schema build was counted under reason divergence (%d)", got)
 	}
-	win := storeSwapWindowSeconds(reasonSchema, outcomeSwap)
-	if win < v.when(dep).Sub(tEvent).Seconds()-0.05 || win > time.Since(tEvent).Seconds() {
-		t.Fatalf("K16b: window %.3fs does not span the CRD event to the push (%.3fs)", win, v.when(dep).Sub(tEvent).Seconds())
+	if win := storeSwapWindowSeconds(reasonSchema, outcomeSwap); win != 4 {
+		t.Fatalf("K16b: window_seconds_total{schema,swap} = %vs, want exactly 4 (the CRD event → the push)", win)
 	}
 	if got := r.body(dep); got != `{"v":"widened"}` {
 		t.Fatalf("K16b: after the swap the dependent serves %s", got)
@@ -337,38 +383,39 @@ func TestStoreSwap_K16bSchemaWindow(t *testing.T) {
 
 // ── K16c — install to push ───────────────────────────────────────────────────
 
-// TestStoreSwap_K16c_InstallToPush: a refresh that takes time after the install
-// is recorded per entry on install_to_push_ms, and the window total is at least
-// (install − detection) + the largest install-to-push. RED under X31 (the
-// window ends at the install).
+// TestStoreSwap_K16c_InstallToPush: a push that lands after the install is
+// recorded per entry on install_to_push_ms, and the window total is
+// (install − detection) + install-to-push, exactly. RED under X31 (the window
+// ends at the install).
 func TestStoreSwap_K16c_InstallToPush(t *testing.T) {
 	r := newLedgerRig(t, 3)
 	dep := r.cell("o00", "")
 	v := r.view(dep)
+	lists0 := r.listCount()
+	releaseList := r.holdList(lists0 + 1)
 	rel := r.holdRefresh(dep) // the refresher is busy (the yield stand-in)
 	r.clusterSet(swapObj(r.gvr, "o00", "2", "c"))
-	tDetect := time.Now()
-	r.request(reasonDivergence, swapKey("o00"))
-	r.awaitSwaps(1)
-	tInstall := time.Now()
-	time.Sleep(150 * time.Millisecond)
-	ko, _, _ := gauges()
-	if ko[reasonDivergence] != 1 {
-		t.Fatalf("K16c RED (X31): keys_open = %v after the install with the push pending, want 1", ko)
+	r.request(reasonDivergence, swapKey("o00")) // t0
+	r.clk.advance(1 * time.Second)
+	releaseList()
+	r.awaitSwaps(1) // installed at t0 + 1 s
+	r.clk.advance(4 * time.Second)
+	ko, wm, _ := gauges()
+	if ko[reasonDivergence] != 1 || wm[reasonDivergence] != 5 {
+		t.Fatalf("K16c RED (X31): keys_open=%v window_open_max=%v with the push still pending, want 1 and 5", ko, wm)
 	}
-	rel()
+	rel() // pushed at t0 + 5 s
 	r.waitFor("the frame", func() bool { return v.count(dep) == 1 })
 	r.waitFor("the window to close", func() bool {
 		_, wm, _ := gauges()
 		return wm[reasonDivergence] == 0
 	})
 	h := storeSwapStats.installHist[[2]string{reasonDivergence, closePushed}]
-	if h.count.Load() != 1 || h.maxMS.Load() < 150 {
-		t.Fatalf("K16c: install_to_push_ms{divergence,pushed} count=%d max=%dms, want 1 and >= 150", h.count.Load(), h.maxMS.Load())
+	if h.count.Load() != 1 || h.maxMS.Load() != 4000 {
+		t.Fatalf("K16c: install_to_push_ms{divergence,pushed} count=%d max=%dms, want 1 and 4000", h.count.Load(), h.maxMS.Load())
 	}
-	floor := tInstall.Sub(tDetect).Seconds() + float64(h.maxMS.Load())/1000 - 0.05
-	if win := storeSwapWindowSeconds(reasonDivergence, outcomeSwap); win < floor {
-		t.Fatalf("K16c RED (X31): window %.3fs < install − detection + max install_to_push (%.3fs)", win, floor)
+	if win := storeSwapWindowSeconds(reasonDivergence, outcomeSwap); win != 5 {
+		t.Fatalf("K16c RED (X31): window_seconds_total = %vs, want exactly 5 = (install − detection) 1 + install_to_push 4", win)
 	}
 }
 

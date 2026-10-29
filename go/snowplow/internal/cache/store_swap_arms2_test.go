@@ -59,7 +59,7 @@ func TestStoreSwap_K7_InFlightResolveSelfRemarks(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	Deps().Record(ctx, key, gvr, swapNS, "o01")
-	if !c.PutIfGen(ctx, key, body375(`{}`), gen0) {
+	if !c.putIfGen(ctx, key, body375(`{}`), gen0) {
 		t.Fatal("K7: the Put was refused outright")
 	}
 	if got := remarks.Load(); got != 1 {

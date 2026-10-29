@@ -1893,7 +1893,7 @@ func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResour
 		f.del(rw, gvr)
 	}
 	for _, acc := range aborted {
-		acc.endAll(outcomeAbortTeardown, time.Now())
+		acc.endAll(outcomeAbortTeardown, windowNow())
 	}
 	// #237 A3 — the reflector-path attribution state is keyed by GVR too, so
 	// it is purged here like every other per-GVR map. It lives behind its own

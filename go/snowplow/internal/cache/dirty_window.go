@@ -225,7 +225,7 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq, began: time.Now()}) {
+		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq, began: windowNow()}) {
 			return s.t0, true
 		}
 	}

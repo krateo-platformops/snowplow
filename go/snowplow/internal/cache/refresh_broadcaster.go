@@ -873,7 +873,9 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	// has a subscriber now, and an entry already REFRESHED is owed a frame on
 	// this stream at once (it closes pushed_on_arm when the handler writes it).
 	// The ledger mutex is a leaf, taken with no hub lock held.
+	onArm := map[string]struct{}{}
 	for _, k := range ledgerArmed(armedKeys) {
+		onArm[k] = struct{}{}
 		h.mu.RLock()
 		s.offerRefresh(k)
 		h.mu.RUnlock()
@@ -907,13 +909,15 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 			// uses the same "producer never sends to a closed chan" discipline.)
 		})
 	}
-	armedAt := s.subscribedAt
 	armedCopy := make(map[string]struct{}, len(armedKeys))
 	for k := range armedKeys {
 		armedCopy[k] = struct{}{}
 	}
 	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated,
-		Wrote:       func(k string) { ledgerFrameWritten(k, armedAt) },
+		Wrote: func(k string) {
+			_, armed := onArm[k]
+			ledgerFrameWritten(k, armed)
+		},
 		WroteResync: func() { ledgerResyncWritten(armedCopy) },
 	}
 }
