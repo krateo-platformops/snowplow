@@ -108,7 +108,23 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 	if gi == nil {
 		return
 	}
-	handler := rw.watchErrorHandlerFor(gvr)
+	rw.setWatchErrorHandlerLocked(gvr, gi, rw.watchErrorHandlerFor(gvr), true)
+}
+
+// installWatchErrorHandlerFor is installWatchErrorHandler for one informer
+// INSTANCE (#870): the handler acts on the GVR's servability only while that
+// instance is the live one. A build's candidate records its own watch state
+// (copied in at the install) and aborts on a terminal LIST refusal; a retiring
+// copy's errors change nothing. Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) installWatchErrorHandlerFor(gvr schema.GroupVersionResource, in *storeInstance) {
+	if in == nil || in.gi == nil {
+		return
+	}
+	rw.setWatchErrorHandlerLocked(gvr, in.gi, rw.watchErrorHandlerForInstance(gvr, in), rw.instances[gvr] == in)
+}
+
+func (rw *ResourceWatcher) setWatchErrorHandlerLocked(gvr schema.GroupVersionResource, gi informers.GenericInformer,
+	handler func(*clientcache.Reflector, error), live bool) {
 	if err := gi.Informer().SetWatchErrorHandler(handler); err != nil {
 		// Reachable only if the informer already started — which the
 		// callers guarantee against (handler installed pre-Run). Log a
@@ -120,7 +136,9 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 		)
 		return
 	}
-	rw.markWatchHandlerInstalledLocked(gvr)
+	if live {
+		rw.markWatchHandlerInstalledLocked(gvr)
+	}
 }
 
 // watchErrorHandlerFor builds the per-GVR reflector error handler.
@@ -131,8 +149,51 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 // Hoisting it here is what lets the falsifier hold the installed closure rather
 // than re-implement its arithmetic.
 func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource) func(*clientcache.Reflector, error) {
+	return rw.watchErrorHandlerForInstance(gvr, nil)
+}
+
+// watchErrorHandlerForInstance is watchErrorHandlerFor bound to one informer
+// instance (nil = whatever instance is live: the test hooks). The live check
+// and the servability write happen under ONE rw.mu section, so a swap can never
+// land between them.
+func (rw *ResourceWatcher) watchErrorHandlerForInstance(gvr schema.GroupVersionResource, in *storeInstance) func(*clientcache.Reflector, error) {
 	return func(_ *clientcache.Reflector, err error) {
+		// #928 F1 — the instance's position at this error, read before rw.mu
+		// (the reflector calls this handler with no lock of its own held).
+		var pos string
+		if in != nil {
+			pos = in.gi.Informer().LastSyncResourceVersion()
+		}
 		rw.mu.Lock()
+		if in != nil && rw.instances[gvr] != in {
+			// #870 — not the live copy. A candidate keeps its own watch state
+			// and its build aborts on a terminal LIST refusal (#796's
+			// classification: only a CRD version or an RBAC grant heals it). A
+			// retiring copy's error changes nothing. The state is the LATEST
+			// error and the position at it; the install judges it by the live
+			// copy's recovery rule (storeInstance.watchStateNow).
+			refusedNow := apierrors.IsNotFound(err) || apierrors.IsForbidden(err)
+			var aborted *buildAccount
+			if b := rw.builds[gvr]; b != nil && b.inst == in {
+				in.broken = true
+				in.brokenAt = pos
+				in.refused = refusedNow
+				if refusedNow {
+					aborted = rw.abortBuildLocked(gvr)
+				}
+			}
+			rw.mu.Unlock()
+			recordWatchError()
+			if aborted != nil {
+				aborted.endAll(outcomeAbortRefused, windowNow())
+				slog.Warn("cache.store.swap.aborted_refused",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.String("hint", "the replacement store's LIST was refused (not found / forbidden), so the "+
+						"build was aborted; the live copy keeps serving and its known-stale keys stay counted"))
+			}
+			return
+		}
 		if rw.watchBroken == nil {
 			rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
 		}
@@ -443,7 +504,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	// watchBroken.
 	rv := gi.Informer().LastSyncResourceVersion()
 	prev := rw.lastSyncRV[gvr]
-	if rv != "" && rv != prev && gi.Informer().HasSynced() {
+	if watchHealed(rv, prev, gi.Informer().HasSynced()) {
 		delete(rw.listRefused, gvr) // #796 — a relist succeeded
 		if _, broken := rw.watchBroken[gvr]; broken {
 			delete(rw.watchBroken, gvr)
@@ -457,6 +518,16 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	if rv != "" {
 		rw.lastSyncRV[gvr] = rv
 	}
+}
+
+// watchHealed is THE recovery rule for a broken watch: the reflector has
+// listed successfully since its position was prev — its position rv advanced
+// past prev and the informer is synced. The live copy's conjunct-3 recovery
+// (prev = the position the last confirm pass observed) and a build
+// candidate's install (prev = its position at its latest error, #928 F1) both
+// apply it.
+func watchHealed(rv, prev string, synced bool) bool {
+	return rv != "" && rv != prev && synced
 }
 
 // ConfirmResourceType runs ONE conjunct-3/4 confirmation pass SCOPED to a

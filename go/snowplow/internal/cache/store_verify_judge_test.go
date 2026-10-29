@@ -184,6 +184,13 @@ func j9Setup(t *testing.T, gvr schema.GroupVersionResource, owned bool, store ..
 	t.Helper()
 	c3Setup(t)
 	resetVerificationForArm(t)
+	// #870 — a repair is a build beside the live copy, not a queue entry.
+	// This fixture's informer source and its verification LIST disagree on
+	// purpose, so a build would list the very state the arms judge and swap it
+	// in under them. Every arm here judges the live copy while the repair it
+	// requested stays open: the build's copy is never started.
+	holdBuildsForTest.Store(true)
+	t.Cleanup(func() { holdBuildsForTest.Store(false) })
 	objs := []*unstructured.Unstructured{jclock.obj(gvr)}
 	for _, o := range store {
 		objs = append(objs, o.obj(gvr))
@@ -333,7 +340,7 @@ func TestForcedPass918_ObjectsThatChangeAfterTheirRead_AreNotLosses(t *testing.T
 	if got := j9Published(); got != 0 {
 		t.Fatalf("#918 RED: %d of %d objects the store had moved past the read were published as lost updates", got, n)
 	}
-	if d := storeRepairQueueDepth(); d != 0 {
+	if d := storeRepairsRequestedForTest(); d != 0 {
 		t.Fatalf("#918 RED: %d repair(s) queued for a store that lost nothing (the #870 window)", d)
 	}
 	if got := storeAheadTotal.Load(); got != n {
@@ -381,7 +388,7 @@ func TestForcedPass918_StoreAheadOfTheList_PerClass(t *testing.T) {
 			if got := j9Published(); got != 0 {
 				t.Fatalf("#872 RED: a store that moved past the LIST published %d divergences (class %s)", got, c.name)
 			}
-			if d := storeRepairQueueDepth(); d != 0 {
+			if d := storeRepairsRequestedForTest(); d != 0 {
 				t.Fatalf("#872 RED: %d repair(s) queued for a store that lost nothing", d)
 			}
 			if got := storeAheadTotal.Load(); got != 1 {
@@ -419,8 +426,8 @@ func TestForcedPass918_RealLoss_PerClass(t *testing.T) {
 			if got := j9Published(); got != 1 {
 				t.Errorf("published %d divergences in total, want 1", got)
 			}
-			if d := storeRepairQueueDepth(); d != 1 {
-				t.Fatalf("store_repairs_pending = %d after a real loss, want 1", d)
+			if d := storeRepairsRequestedForTest(); d != 1 {
+				t.Fatalf("repairs requested = %d after a real loss, want 1", d)
 			}
 			if g := cli.gets.Load(); g != 0 {
 				t.Errorf("%d GETs, want 0", g)
@@ -445,8 +452,8 @@ func TestForcedPass918_RealLossAmongChurn(t *testing.T) {
 	if got := storeAheadTotal.Load(); got < 1 {
 		t.Errorf("store_divergence_store_ahead_total = %d, want panel-a cleared as ahead", got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Fatalf("store_repairs_pending = %d, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Fatalf("repairs requested = %d, want 1", d)
 	}
 }
 
@@ -476,8 +483,8 @@ func TestForcedPass918_WhollyDivergentStore_GoesStraightToRepair(t *testing.T) {
 			if g := cli.gets.Load(); g != 0 {
 				t.Errorf("%d GETs for a wholly divergent store, want 0", g)
 			}
-			if d := storeRepairQueueDepth(); d != 1 {
-				t.Errorf("store_repairs_pending = %d, want 1", d)
+			if d := storeRepairsRequestedForTest(); d != 1 {
+				t.Errorf("repairs requested = %d, want 1", d)
 			}
 		})
 	}
@@ -610,8 +617,8 @@ func TestForcedPass918_PendingKey_ResolvedLostByAnAppliedEventPastIt(t *testing.
 			// Owned GVRs queue the repair; a factory-built one is refused by
 			// the repair verb (#244) and self-heals passively.
 			if origin.owned {
-				if d := storeRepairQueueDepth(); d != 1 {
-					t.Errorf("store_repairs_pending = %d, want 1", d)
+				if d := storeRepairsRequestedForTest(); d != 1 {
+					t.Errorf("repairs requested = %d, want 1", d)
 				}
 			}
 		})
@@ -704,11 +711,12 @@ func TestForcedPass918_LostDeleteOnAQuietGVR_PublishedByTheNextPass(t *testing.T
 		case i > 1 && got < 1:
 			t.Fatalf("pass %d: the lost delete is no longer published", i+1)
 		}
-		// Later passes publish it again while the repair (queued, not run by
-		// this fixture) has not fixed the store: the divergence is still real.
+		// Later passes publish it again while the repair (requested; its build
+		// is held by this fixture) has not fixed the store: the divergence is
+		// still real.
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Errorf("store_repairs_pending = %d, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Errorf("repairs requested = %d, want 1", d)
 	}
 }
 

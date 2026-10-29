@@ -29,6 +29,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -164,21 +165,26 @@ func TestCRDSchemaWiden_RelistsRunningInformer(t *testing.T) {
 			s.SchemaRelistsFired, crdDiscoveryStatsString())
 	}
 
-	// The relisted GVR must still be registered (RemoveResourceType +
-	// EnsureResourceType re-created a fresh standalone informer — safe because
-	// triggerCRDDiscovery called AddNavigationDiscoveredGroup BEFORE the
-	// relist, so addResourceTypeLocked builds a re-creatable standalone, not a
-	// frozen shared-factory informer).
+	// #870 — the widen BUILDS the replacement beside the live informer and
+	// swaps it in; the GVR stays registered and servable throughout.
 	if !rw.IsRegistered(target) {
-		t.Fatalf("after relist the target GVR is no longer registered — remove+re-add must "+
-			"leave a fresh informer in place")
+		t.Fatalf("after the widen the target GVR is no longer registered — a schema build must " +
+			"never tear the live informer down")
+	}
+	// This fixture's REST client never connects, so the new copy cannot sync:
+	// the build stays OPEN (it ends on an event — its sync — never a timer),
+	// with the live informer still registered. The swap itself is pinned on a
+	// syncing fixture (TestStoreSwap_K5_SchemaWidenByContent, K16b).
+	if rw.storeBuildForTest(target) == nil {
+		t.Fatalf("the widen did not open a schema build for the registered GVR")
 	}
 
-	// The relist must dirty-mark dependent L1 so a cached widget resolve
-	// recomputes against the now-unpruned objects.
-	if !rec.marked("l1-widget-key") {
-		t.Fatalf("relist did not dirty-mark the dependent L1 entry — a stale (pruned) widget "+
-			"resolve would survive the relist")
+	// #870 — and it marks ONLY what changed: nothing is marked when the build
+	// is requested (a whole-type mark is gone, X2).
+	time.Sleep(100 * time.Millisecond)
+	if rec.marked("l1-widget-key") {
+		t.Fatalf("#870 RED: the widen dirty-marked a dependent whose object did not change — " +
+			"a whole-type mark is back")
 	}
 }
 

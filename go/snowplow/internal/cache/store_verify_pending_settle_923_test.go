@@ -64,8 +64,8 @@ func TestPendingSettle923_RP1_CarriedLossOnAPassWhoseListFails(t *testing.T) {
 	if got := j9Class("update"); got != 1 {
 		t.Fatalf("RP1 RED: the pass whose LIST failed published %d lost updates, want its carried 1", got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Errorf("RP1 RED: store_repairs_pending = %d, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Errorf("RP1 RED: repairs requested = %d, want 1", d)
 	}
 	if got := storePendingKeys.Load(); got != 0 {
 		t.Errorf("RP1 RED: %d pending after the pass, want 0", got)
@@ -87,8 +87,8 @@ func TestPendingSettle923_RP2_CarriedLossOnAPassWithNoPublishedPosition(t *testi
 	if got := j9Class("update"); got != 1 {
 		t.Fatalf("RP2 RED: the pass with no published position published %d lost updates, want its carried 1", got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Errorf("RP2 RED: store_repairs_pending = %d, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Errorf("RP2 RED: repairs requested = %d, want 1", d)
 	}
 	if got := storePendingKeys.Load(); got != 0 {
 		t.Errorf("RP2 RED: %d pending after the pass, want 0", got)
@@ -151,8 +151,8 @@ func rp923AssertSettledOnce(t *testing.T, arm string) {
 	if got := PendingByGVRSnapshot()[repairGVR.String()]; got != 0 {
 		t.Errorf("%s RED: per-GVR %d pending, want 0", arm, got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Errorf("%s: store_repairs_pending = %d, want 1", arm, d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Errorf("%s: repairs requested = %d, want 1", arm, d)
 	}
 }
 

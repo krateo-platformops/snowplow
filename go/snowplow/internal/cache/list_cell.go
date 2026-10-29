@@ -41,13 +41,15 @@
 //
 // WHEN THE CELL STOPS TRUSTING ITSELF (unanchor → the next read takes today's
 // full fill, which re-anchors):
-//   - the GVR's servability epoch moved (any exit from servable, any informer
-//     (re)creation — so an informer rebuild whose initial-list ADDs the dep hook
-//     drops, #688, is never missed), or the GVR is not servable now;
+//   - the GVR's servability epoch moved (#870 owner ruling 1: it moves on any
+//     EXIT FROM SERVABLE — a watch break, a confirmation retraction, a removal;
+//     a re-creation after a removal is covered by the removal's bump), or the
+//     GVR is not servable now. A store swap (store_swap.go) is NOT an exit: the
+//     GVR stays servable throughout, and the keys whose bytes changed reach
+//     the cell as ordinary per-key events (M), so the cell keeps its anchor;
 //   - any lost-event signal moved: a dep-worker panic, an ADD seen with a nil
 //     syncCh, a submit dropped onto a shut-down dep queue;
-//   - a type-level event on the GVR (CRD available / removed / schema relisted /
-//     store repaired);
+//   - a type-level event on the GVR (CRD available / removed);
 //   - the shadow comparator found a divergence;
 //   - the store dropped or replaced the entry (byte / entry-count pressure
 //     (LRU), DELETE, a later Put).
@@ -95,7 +97,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	clientcache "k8s.io/client-go/tools/cache"
 
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
@@ -232,13 +233,11 @@ type listCellSet struct {
 	// recorded in that cell's pending). Two cells of one content key — the
 	// published one and its replacement being filled — are both here.
 	cells map[*ListCell]struct{}
-	// delivered — the raw identity of the last informer delivery per key (the
-	// zero rawID for a delete), recorded while the GVR has a cell. The
-	// comparator's in-flight test: an indexer object whose identity is not the
-	// delivered one has not reached the dep handler yet (it sits in the
-	// client-go listener buffer); a key never delivered since recording began
-	// still holds its anchor-time object, which the cell matched at the anchor.
-	delivered map[listObjKey]rawID
+	// #870 F5 — the comparator's "delivered" record is no longer kept here: it
+	// is the live instance's dep-handler `seen` record (store_instance.go),
+	// exact for its listener's order from the instance's construction, muted
+	// deliveries included, so a swap leaves no key looking permanently in
+	// flight. deliveredMismatch reads it.
 }
 
 var (
@@ -274,9 +273,6 @@ func deregisterListCell(c *ListCell) {
 	s := listCellSetFor(c.gvr)
 	s.mu.Lock()
 	delete(s.cells, c)
-	if len(s.cells) == 0 {
-		s.delivered = nil // no cell left to compare: stop recording
-	}
 	s.mu.Unlock()
 }
 
@@ -291,79 +287,19 @@ func (s *listCellSet) cellsOf() []*ListCell {
 	return cells
 }
 
-// noteListCellDelivery records an informer delivery for the GVR's cells (see
-// listCellSet.delivered). One sync.Map load when the GVR has no cell.
-func noteListCellDelivery(gvr schema.GroupVersionResource, obj interface{}, deleted bool) {
-	v, ok := listCellsByGVR.Load(gvr)
-	if !ok {
-		return
-	}
-	s := v.(*listCellSet)
-	var key listObjKey
-	var id rawID
-	if t, isTomb := obj.(clientcache.DeletedFinalStateUnknown); isTomb {
-		ns, name, err := clientcache.SplitMetaNamespaceKey(t.Key)
-		if err != nil {
-			return
-		}
-		key, deleted = listObjKey{ns: ns, name: name}, true
-	} else {
-		ns, name, ok := indexerSlotKey(obj)
-		if !ok {
-			return
-		}
-		key = listObjKey{ns: ns, name: name}
-		if !deleted {
-			if b, ok := storeItemJSON(obj); ok {
-				id = idOf(b)
-			}
-		}
-	}
-	s.mu.Lock()
-	if len(s.cells) > 0 {
-		if s.delivered == nil {
-			s.delivered = map[listObjKey]rawID{}
-		}
-		s.delivered[key] = id
-	}
-	s.mu.Unlock()
-}
-
-// seedDelivered records the anchor listing as delivered for every key with no
-// delivery recorded yet: the pairing proved the cell equals those objects, and
-// a notification still buffered for one of them carries the same identity. A
-// key already recorded keeps its (newer or equal) delivery.
-func seedDelivered(gvr schema.GroupVersionResource, keyed []keyedRaw) {
-	s := listCellSetFor(gvr)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.delivered == nil {
-		s.delivered = make(map[listObjKey]rawID, len(keyed))
-	}
-	for _, kr := range keyed {
-		if _, seen := s.delivered[kr.key]; !seen {
-			s.delivered[kr.key] = idOf(kr.raw)
-		}
-	}
-}
-
 // deliveredMismatch reports whether the indexer's current object for k (idx, the
-// zero rawID when absent) is not the last one delivered to the dep handler.
+// zero rawID when absent) is not the last one delivered to the dep handler of
+// the GVR's live instance (#870 F5: its `seen` record, store_instance.go). A
+// key with no delivery and no indexer object is settled; one present in the
+// indexer and never delivered is an ADD still on its way — in flight. With no
+// record at all (the GVR has no live instance) nothing can be judged, and the
+// key reads as in flight.
 func deliveredMismatch(gvr schema.GroupVersionResource, k listObjKey, idx rawID) bool {
-	v, ok := listCellsByGVR.Load(gvr)
-	if !ok {
-		return false
-	}
-	s := v.(*listCellSet)
-	s.mu.Lock()
-	d, seen := s.delivered[k]
-	s.mu.Unlock()
-	if !seen {
-		// Neither seeded by an anchor nor delivered since: an object created
-		// after the anchor whose ADD has not reached the handler — in flight.
+	id, _, known := deliveredRaw(gvr, k)
+	if !known {
 		return true
 	}
-	return d != idx
+	return id != idx
 }
 
 // noteListCellsPending records (gvr, namespace, name) as changed in every live
@@ -582,7 +518,6 @@ func (f *ListCellFill) Anchor(envelope []byte, items []*unstructured.Unstructure
 		body.chunks = append(body.chunks, ch)
 	}
 	c.gen.Store(&listGen{asOf: s, body: body})
-	seedDelivered(c.gvr, keyed)
 	// #882 F2 — the edits recorded while the fill ran, applied before anyone
 	// can read the cell (an optimisation, see the doc above: Snapshot drains
 	// pending for every reader anyway).

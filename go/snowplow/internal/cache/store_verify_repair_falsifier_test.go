@@ -731,10 +731,9 @@ func TestStoreVerification_NoSyncPosition_SkipsRatherThanWeakensTheOracle(t *tes
 	if lu, ld, la, um := divergenceCounts(verifySiteForced); lu+ld+la+um != 0 {
 		t.Errorf("divergences reported from a pass that never ran: %d/%d/%d/%d", lu, ld, la, um)
 	}
-	if got := storeRepairQueueDepth(); got != 0 {
-		t.Errorf("store_repairs_pending = %d — a skipped pass must never enqueue a repair, which "+
-			"would open a real non-servable window on the strength of a comparison that did "+
-			"not happen", got)
+	if got := storeRepairsRequestedForTest(); got != 0 {
+		t.Errorf("%d repair build(s) started — a skipped pass must never request a repair on the "+
+			"strength of a comparison that did not happen", got)
 	}
 }
 
@@ -784,48 +783,28 @@ func TestForcedPass_RepairsTheStore_NotJustL1(t *testing.T) {
 			t.Errorf("snapshot-site counter moved (%d) with no snapshot taken — the site split is not holding", lu)
 		}
 
-		// 2. THE REPAIR FIRED, and it actually re-registered the informer.
-		if storeRepairQueueDepth() != 1 {
-			t.Fatalf("store_repairs_pending = %d after a confirmed divergence, want 1", storeRepairQueueDepth())
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		go runStoreRepairQueue(ctx)
-		waitForVerify(t, "the repair to fire", verifyBound, func() bool {
-			return storeRepairsFiredTotal.Load() == 1
+		// 2. THE REPAIR FIRED: a build was constructed beside the live copy and
+		// swapped in (#870). There is no queue and no worker: the request
+		// constructs the build, and its own sync installs it.
+		waitForVerify(t, "the repair build to swap in", verifyBound, func() bool {
+			return storeRepairsFiredTotal.Load() == 1 && StoreSwapStatsSnapshot().Swaps == 1
 		})
-		// The repair must NAME ITSELF in the event log rather than reusing the
-		// schema-relist label. #237 is an issue about instruments that named
-		// the wrong cause, so a store repair logged as SCHEMA_RELIST would be
-		// the same defect shipped inside its own fix.
-		//
-		// Asserted on the dep-tracker cause rather than on
-		// confirm_retracted_by_reason, because that counter only ticks for a
-		// GVR that was actually CONFIRMED — and with no discovery client
-		// wired, conjunct 4 is degraded-true and rw.confirmed is never
-		// populated. Counting a retraction that did not happen would be the
-		// very thing informer_watch_stats.go warns against, so the fixture
-		// cannot assert it and says so instead of asserting something weaker
-		// under the same name.
-		//
-		// #380: both assertions are SCOPED to repairGVR (the capture is
-		// process-global), and the negative one runs only after the post-sync
-		// re-fire has happened. Asserted any earlier it checks a fire that
-		// has not run yet, which is how a hardcoded SCHEMA_RELIST in that
-		// re-fire passed here most of the time. The wait is on the
-		// label-agnostic #239 type-path total of THIS test's tracker
-		// (pre-sync fire + re-fire, one dependent cell = 2).
+		// #870 — the repair marks ONLY what changed, through ordinary per-key
+		// events: no type-level mark of any cause (the STORE_REPAIR and
+		// SCHEMA_RELIST causes are deleted), and the dependent cell is reached
+		// by a swap delivery (submission source store_swap).
 		d := Deps()
-		waitForVerify(t, "the repair's post-sync dirty-mark re-fire", verifyBound, func() bool {
-			return typeMarksAnyCause(d) >= 2
+		waitForVerify(t, "the swap delivery to reach the dep handler", verifyBound, func() bool {
+			return d.dirtyMarkSubmitSourceSnapshot()[dmSourceStoreSwap] >= 1
 		})
-		if countEventTypeForGVR(logs, "STORE_REPAIR", repairGVR) == 0 {
-			t.Errorf("no cache_event.consumed for %s carried type=STORE_REPAIR; the repair's dirty-mark did "+
-				"not name its own cause. Records seen: %v", repairGVR, eventTypes(logs))
+		if n := typeMarksAnyCause(d); n != 0 {
+			t.Errorf("#870 RED: the repair dirty-marked %d dependent(s) through a TYPE-level event — "+
+				"a whole-type mark is back (X2)", n)
 		}
-		if n := countEventTypeForGVR(logs, "SCHEMA_RELIST", repairGVR); n != 0 {
-			t.Errorf("the store repair logged %d SCHEMA_RELIST record(s) for %s — an instrument naming the "+
-				"wrong cause, which is the defect class #237 is about", n, repairGVR)
+		for _, typ := range []string{"STORE_REPAIR", "SCHEMA_RELIST"} {
+			if n := countEventTypeForGVR(logs, typ, repairGVR); n != 0 {
+				t.Errorf("the repair logged %d %s record(s) for %s — a whole-type mark", n, typ, repairGVR)
+			}
 		}
 
 		// 3. THE STORE. This is the assertion B-1 was about.
@@ -834,50 +813,47 @@ func TestForcedPass_RepairsTheStore_NotJustL1(t *testing.T) {
 			return ok && rv == "2"
 		})
 
-		// 4. And the queue drained — the gauge counts the in-flight repair, so
-		// reaching 0 means the work finished, not that it started.
-		waitForVerify(t, "the repair queue to drain", verifyBound, func() bool {
-			return storeRepairQueueDepth() == 0
-		})
+		// 4. And the build slot is empty: the build ended at its swap.
+		if c := rw.storeBuildForTest(repairGVR); c != nil {
+			t.Errorf("a build is still open after its swap")
+		}
 	})
 
-	t.Run("worst_case_repair_disabled_store_stays_stale", func(t *testing.T) {
-		// THE DISCRIMINATING HALF. Same fixture, repair never run. Detection
+	t.Run("worst_case_repair_refused_store_stays_stale", func(t *testing.T) {
+		// THE DISCRIMINATING HALF. Same divergence, on a GVR whose informer
+		// is FACTORY-BUILT, so the repair is refused (bound 6). Detection
 		// alone produces a green-looking divergence counter OVER A WRONG
 		// STORE, and without this arm a future refactor could drop the repair
 		// while every other arm stayed green.
 		c3Setup(t)
 		resetVerificationForArm(t)
-		rw, dyn := silentWatchCluster(t, panelObj("demo", "panel-a", "1", "uid-a"))
+		factoryGVR := schema.GroupVersionResource{Group: "factory.repair.krateo.io", Version: "v1", Resource: "panels"}
+		rw, dyn := silentWatchClusterFor(t, factoryGVR, false, panelObj("demo", "panel-a", "1", "uid-a"))
 		Deps().SetRefreshHook(func(string, schema.GroupVersionResource) {})
 
-		if _, err := dyn.Resource(repairGVR).Namespace("demo").
+		if _, err := dyn.Resource(factoryGVR).Namespace("demo").
 			Update(context.Background(), panelObj("demo", "panel-a", "2", "uid-a"), metav1.UpdateOptions{}); err != nil {
 			t.Fatalf("updating the fake cluster: %v", err)
 		}
-		attachMetaClient(t, rw, partialMeta("demo", "panel-a", "2", "uid-a"))
+		attachMetaClient(t, rw, partialMetaFor(factoryGVR, "demo", "panel-a", "2", "uid-a"))
 
-		forcedVerify(context.Background(), repairGVR)
+		forcedVerify(context.Background(), factoryGVR)
 
 		if lu, _, _, _ := divergenceCounts(verifySiteForced); lu != 1 {
 			t.Fatalf("lost_update_forced = %d, want 1", lu)
 		}
 		if storeRepairsFiredTotal.Load() != 0 {
-			t.Fatalf("a repair fired with no queue worker running (%d)", storeRepairsFiredTotal.Load())
+			t.Fatalf("a repair build started for a factory-built GVR (%d)", storeRepairsFiredTotal.Load())
+		}
+		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
+			t.Errorf("store_repair_unsupported_total = %d, want 1 — the refusal must be visible", got)
 		}
 		// The whole point: the counter is green-looking and the store is WRONG.
 		time.Sleep(200 * time.Millisecond)
-		rv, ok := indexerRV(t, rw, "demo", "panel-a")
+		rv, ok := indexerRVFor(t, rw, factoryGVR, "demo", "panel-a")
 		if !ok || rv != "1" {
 			t.Fatalf("the store read rv=%q ok=%v without a repair; this arm must observe the STALE "+
 				"store, or it is not demonstrating that detection alone is insufficient", rv, ok)
-		}
-		// And the queue says so out loud, which is what makes the state readable.
-		if depth := storeRepairQueueDepth(); depth != 1 {
-			t.Errorf("store_repairs_pending = %d, want 1 — an outstanding repair must be visible", depth)
-		}
-		if age := storeRepairQueueAgeSeconds(); age <= 0 {
-			t.Errorf("store_repair_queue_age_seconds = %v, want >0 for a waiting repair", age)
 		}
 	})
 }
@@ -904,20 +880,13 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 			partialMeta("demo", "panel-phantom", "1", "uid-p"),
 		)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		go runStoreRepairQueue(ctx)
-
-		// Pass 1: divergence, repair enqueued and fired.
+		// Pass 1: divergence, a repair build constructed and swapped in.
 		forcedVerify(context.Background(), repairGVR)
 		if _, _, la, _ := divergenceCounts(verifySiteForced); la != 1 {
 			t.Fatalf("lost_add_forced = %d, want 1", la)
 		}
-		waitForVerify(t, "the first repair to fire", verifyBound, func() bool {
-			return storeRepairsFiredTotal.Load() == 1
-		})
-		waitForVerify(t, "the repair queue to drain", verifyBound, func() bool {
-			return storeRepairQueueDepth() == 0
+		waitForVerify(t, "the first repair to swap in", verifyBound, func() bool {
+			return storeRepairsFiredTotal.Load() == 1 && StoreSwapStatsSnapshot().Swaps == 1
 		})
 		rw.RefreshDiscovery(context.Background())
 
@@ -948,26 +917,9 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("pending_repairs_are_deduped_per_gvr", func(t *testing.T) {
-		// RG-2. Bound 1 forbids CONCURRENT relists of one GVR; it does not by
-		// itself forbid a second queue entry for one already waiting, and a
-		// GVR re-detected at the next deadline while still pending would
-		// otherwise be enqueued twice — doubling the gauge and the work.
-		c3Setup(t)
-		resetVerificationForArm(t)
-		rememberStoreVerification(repairGVR, true, true)
-
-		if !enqueueStoreRepair(repairGVR, "first") {
-			t.Fatal("the first enqueue was refused")
-		}
-		if enqueueStoreRepair(repairGVR, "second") {
-			t.Error("a second repair was queued for a GVR already pending — store_repairs_pending " +
-				"would double and the GVR would be relisted twice")
-		}
-		if got := storeRepairQueueDepth(); got != 1 {
-			t.Errorf("store_repairs_pending = %d after a duplicate enqueue, want 1", got)
-		}
-	})
+	// #870: "pending_repairs_are_deduped_per_gvr" is now K13's "a re-detection
+	// during the build joins it" (store_swap_arms_test.go): there is no queue
+	// to dedupe, and a second request JOINS the open build.
 
 	t.Run("repair_is_refused_on_ownership_not_on_group_name", func(t *testing.T) {
 		// THE DRIFT ARM (PM condition C-B1). The property bound 6 needs is
@@ -995,7 +947,7 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		// Factory-built: NOT owned, and not decorated either.
 		rememberStoreVerification(drifted, false, false)
 
-		if enqueueStoreRepair(drifted, "drift") {
+		if requestStoreRepair(drifted, []string{"ns/drift"}) {
 			t.Fatal("a repair was queued for a GVR that does NOT own its informer. The teardown would " +
 				"stop the factory's cached informer and the re-register would hand the STOPPED one " +
 				"back, killing the cache for this GVR while store_repairs_fired_total counted a success")
@@ -1004,8 +956,8 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 			t.Errorf("store_repair_unsupported_total = %d, want 1 — the refusal must be counted, or "+
 				"a GVR that is detected-but-never-repaired looks identical to one nobody acted on", got)
 		}
-		if got := storeRepairQueueDepth(); got != 0 {
-			t.Errorf("store_repairs_pending = %d after a refused repair, want 0", got)
+		if got := storeRepairsRequestedForTest(); got != 0 {
+			t.Errorf("%d repair build(s) started after a refused repair, want 0", got)
 		}
 
 		// The mirror image: OWNED but in a group that is NOT
@@ -1020,10 +972,10 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 			t.Fatal("precondition: this group must NOT be navigation-discovered")
 		}
 		rememberStoreVerification(owned, true, true)
-		if !enqueueStoreRepair(owned, "owned") {
-			t.Fatal("a repair was refused for a GVR that DOES own its informer — the predicate is " +
-				"still reading the group name, not the recorded ownership")
-		}
+		// #870: with no watcher here there is no live copy to build beside, so
+		// the request cannot be accepted; what must hold is that it is NOT
+		// refused as unsupported (the end-to-end acceptance is K8b).
+		_ = requestStoreRepair(owned, []string{"ns/owned"})
 		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
 			t.Errorf("store_repair_unsupported_total = %d after one refusal and one acceptance, want 1", got)
 		}
@@ -1087,48 +1039,10 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("queue_is_fifo_by_detection_and_counts_the_inflight_repair", func(t *testing.T) {
-		// FIFO BY DETECTION TIME, not by GVR size: a 50K GVR at the head must
-		// not starve everything behind it by being re-detected first each
-		// round.
-		c3Setup(t)
-		resetVerificationForArm(t)
-		gvrA := repairGVR
-		gvrB := schema.GroupVersionResource{Group: "widgets.krateo.io", Version: "v1beta1", Resource: "cards"}
-		rememberStoreVerification(gvrA, true, true)
-		rememberStoreVerification(gvrB, true, true)
-
-		if !enqueueStoreRepair(gvrA, "a") {
-			t.Fatal("enqueue A refused")
-		}
-		time.Sleep(5 * time.Millisecond)
-		if !enqueueStoreRepair(gvrB, "b") {
-			t.Fatal("enqueue B refused")
-		}
-		if got := storeRepairQueueDepth(); got != 2 {
-			t.Fatalf("store_repairs_pending = %d, want 2", got)
-		}
-
-		first, ok := dequeueStoreRepair()
-		if !ok || first.gvr != gvrA {
-			t.Fatalf("dequeued %v (ok=%v), want A first — the queue is not FIFO by detection time", first.gvr, ok)
-		}
-		// GLOBAL SERIALISATION, as the gauge sees it: A is in flight and B is
-		// still queued, so the gauge must read 2 and NOT 1. A gauge that drops
-		// as soon as work STARTS reads 0 for the whole rebuild window, which
-		// is precisely when an operator is looking at it.
-		if got := storeRepairQueueDepth(); got != 2 {
-			t.Errorf("store_repairs_pending = %d with one in flight and one queued, want 2", got)
-		}
-		second, ok := dequeueStoreRepair()
-		if !ok || second.gvr != gvrB {
-			t.Fatalf("dequeued %v (ok=%v), want B second", second.gvr, ok)
-		}
-		if !second.detected.After(first.detected) && !second.detected.Equal(first.detected) {
-			t.Errorf("B was detected before A (%v vs %v); the ordering key is not detection time",
-				second.detected, first.detected)
-		}
-	})
+	// #870: "queue_is_fifo_by_detection_and_counts_the_inflight_repair" is
+	// deleted with the queue (owner ruling 2). Builds of different GVRs run
+	// concurrently and each ends on its own event; K10 pins that a stalled
+	// build does not hold another GVR's repair back.
 }
 
 // --- the cause-label capture ----------------------------------------------

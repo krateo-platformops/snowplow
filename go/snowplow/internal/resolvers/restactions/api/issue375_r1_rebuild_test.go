@@ -1,12 +1,13 @@
 // issue375_r1_rebuild_test.go — #375 R1 for the TYPE-LEVEL bump sources (TL ask).
 //
-// The type-level bump (schema relist / store repair / CRD add) fires BEFORE the
+// The type-level bump (CRD add / delete) fires BEFORE the
 // replacement informer has synced. R1 still holds because of one invariant: while a GVR
 // is mid-rebuild (registered but not yet synced), a resolve FALLS THROUGH to the
 // apiserver and never serves from the informer. So a resolve with startSeq ≥ bump reads
 // live data, never the torn-down or partial store. This arm pins that invariant on the
 // real watcher. It performs a real teardown + re-register (RemoveResourceType +
-// EnsureResourceType, the relistGVRForRepair sequence) and holds the replacement
+// EnsureResourceType, the CRD delete→recreate sequence; #870 removed the repair and
+// schema-relist teardowns, which now build beside the live copy) and holds the replacement
 // informer's LIST so it cannot sync. While held, the informer dispatch and the content
 // serve must both decline. NEUTER: let Gate 6 (`!rw.IsSynced(gvr)` in
 // dispatchViaInformer) serve an unsynced GVR → RED. If the invariant ever regresses,
@@ -65,8 +66,8 @@ func TestIssue375_R1_MidRebuildGVR_FallsThroughNeverServesInformer(t *testing.T)
 	// else the shared factory hands back the old synced informer and nothing rebuilds.
 	cache.AddNavigationDiscoveredGroup(f1WidgetsGVR.Group)
 	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
-	rw.RemoveResourceType(f1WidgetsGVR)              // teardown (relistGVRForRepair :812)
-	_, syncCh := rw.EnsureResourceType(f1WidgetsGVR) // re-register, unsynced (:813)
+	rw.RemoveResourceType(f1WidgetsGVR)              // teardown (a CRD delete)
+	_, syncCh := rw.EnsureResourceType(f1WidgetsGVR) // re-register, unsynced (the CRD recreated)
 	// <- the type-level bump fires HERE in production (:814), before sync.
 
 	for i := 0; i < 20; i++ {

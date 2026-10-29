@@ -40,11 +40,13 @@ func TestIssue883_TypeLevelEventDropsWhatItMoves(t *testing.T) {
 		return d, m
 	}
 
-	t.Run("schema_relist_moves_every_dep_of_the_gvr", func(t *testing.T) {
+	// #870: the schema relist no longer marks the type; CRD_DELETE is the
+	// type-level event that moves every dep of the GVR.
+	t.Run("crd_delete_moves_every_dep_of_the_gvr", func(t *testing.T) {
 		d, m := store(t)
-		d.OnResourceTypeSchemaRelisted(gvr883Hot)
+		d.OnResourceTypeRemoved(gvr883Hot)
 		if got := fmt.Sprint(memoKeys883(m)); got != "[calm]" {
-			t.Fatalf("#883 RED (type-level): after a schema relist of the hot GVR the memo holds %s, want [calm]", got)
+			t.Fatalf("#883 RED (type-level): after a CRD delete of the hot GVR the memo holds %s, want [calm]", got)
 		}
 	})
 

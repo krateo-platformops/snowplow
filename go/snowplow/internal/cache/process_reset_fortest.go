@@ -160,6 +160,10 @@ func ResetCacheProcessStateForTest() error {
 	// #471.
 	ResetUnrenderableStoreItemsForTest()
 
+	// 5g — #870 the build-and-swap instruments and the push ledger
+	// (process-global: keyed by reason and by L1 key). Composed — #471.
+	resetStoreSwapStatsForTest()
+
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)
 	PublishRBACSnapshotForTest(nil)

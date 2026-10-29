@@ -209,12 +209,19 @@ func newStreamingDynamicInformer(
 		return nil, false
 	}
 
+	// #870 (design v5.1 C4) — the context-aware fields, so the informer's own
+	// context reaches the LIST and the WATCH: stopping a copy (an aborted or
+	// superseded build, a retired one) cancels its in-flight LIST and decode
+	// instead of leaving them running until the apiserver answers. client-go's
+	// own dynamic and metadata informers already set these
+	// (dynamicinformer/informer.go, metadatainformer/informer.go); with only
+	// the context-free fields set, ListWatch hands them context.TODO().
 	lw := &clientcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
 			if tweak != nil {
 				tweak(&options)
 			}
-			list, err := streamingList(context.TODO(), restClient, gvr, options)
+			list, err := streamingList(ctx, restClient, gvr, options)
 			if err != nil {
 				// Return an untyped nil on the error path — never a
 				// typed-nil *bytesObjectList wrapped in a non-nil
@@ -224,7 +231,7 @@ func newStreamingDynamicInformer(
 			}
 			return list, nil
 		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 			// Standard dynamic watch — unchanged from
 			// NewFilteredDynamicInformer. A WATCH stream is already
 			// incremental (one event at a time); only the initial LIST
@@ -232,7 +239,7 @@ func newStreamingDynamicInformer(
 			if tweak != nil {
 				tweak(&options)
 			}
-			return dyn.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(context.TODO(), options)
+			return dyn.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, options)
 		},
 	}
 

@@ -104,6 +104,11 @@ type dirtyStamp struct {
 	// it; one that began before it ends only the known-stale flag and leaves an
 	// ordinary open window (#884, endKnownStaleOnPut).
 	seq uint64
+	// began (#870) is when the in-flight dequeue began (set by beginWindow).
+	// The store-swap push ledger applies a refresher close only to a dequeue
+	// that began after the ledger opened (store_swap_ledger.go, Q3): one that
+	// began earlier may have read the pre-swap copy.
+	began time.Time
 }
 
 // unfreshReason indexes the closed set of unfresh outcomes.
@@ -198,7 +203,7 @@ func (r *refresher) markDirty(key string, now time.Time) {
 		s := cur.(*dirtyStamp)
 		// First mark wins t0; #547 — the LATEST mark's seq is kept, so a Put whose
 		// resolve predates a later mark never closes the window.
-		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq}
+		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq, began: s.began}
 		if s.inflight && s.next.IsZero() {
 			next.next = now
 		}
@@ -220,7 +225,7 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq}) {
+		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq, began: windowNow()}) {
 			return s.t0, true
 		}
 	}
@@ -290,8 +295,21 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keep windowKeep, stal
 
 // windowFresh closes the window with a sample of now − t0.
 func (r *refresher) windowFresh(key string, t0 time.Time) {
+	began := r.inflightBegan(key, t0)
 	r.settleWindow(key, t0, windowEnd, knownStaleNone)
 	r.sampleFresh(t0)
+	ledgerRefreshed(key, began) // #870 — the push ledger's refreshed state
+}
+
+// inflightBegan is when key's in-flight dequeue for the window t0 began (the
+// zero time when it is not this dequeue's stamp).
+func (r *refresher) inflightBegan(key string, t0 time.Time) time.Time {
+	if cur, ok := r.dirty.Load(key); ok {
+		if s := cur.(*dirtyStamp); s.inflight && s.t0.Equal(t0) {
+			return s.began
+		}
+	}
+	return time.Time{}
 }
 
 // sampleFresh records one dirty→fresh sample of now − t0.
@@ -327,10 +345,16 @@ func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason
 	if reason == unfreshRemarked {
 		keep = windowKeepAccepted // a remark follows an ACCEPTED re-Put (settleDequeue)
 	}
+	began := r.inflightBegan(key, t0)
 	if r.settleWindow(key, t0, keep, ks) {
 		reason = unfreshEvicted
 	}
 	r.dirtyStats.unfresh[reason].Add(1)
+	// #870 — the push ledger: a dequeue that ended known-stale closes its
+	// entries known_stale (an eviction closes them through evictDirtyWindow).
+	if reason != unfreshEvicted && reason != unfreshRemarked && ks != knownStaleNone {
+		ledgerKnownStale(key, began)
+	}
 }
 
 // windowContinue keeps the window open from t0 (a retried error: a FAILED
@@ -345,6 +369,7 @@ func (r *refresher) windowContinue(key string, t0 time.Time) {
 // only, no store re-entry). A window that is not in flight ends here as evicted;
 // an in-flight one is ended by its dequeue's outcome (the stamp is gone).
 func evictDirtyWindow(key string) {
+	ledgerEvicted(key) // #870 — the key left the store: its push-ledger entries close evicted
 	r := refresherPeek()
 	if r == nil {
 		return
@@ -460,9 +485,33 @@ func NoteRefreshWrite(ctx context.Context, key string, stored bool) {
 	}
 	if stored {
 		o.accepted.Store(true)
+		// #870 (design v5.3) — the store-swap push ledger's "refreshed" is the
+		// accepted re-Put, taken HERE, at the write: the publish that follows
+		// (PublishRefresh, after this call) can reach a subscriber and be
+		// WRITTEN before this dequeue returns to settle its window, and a
+		// frame written for an entry still marked stale would close nothing.
+		// A remark does not matter: a dequeue that began after the ledger
+		// opened read the installed copy, so its body already carries the
+		// corrected content (only that dequeue counts — ledgerRefreshed checks
+		// when it began).
+		ledgerRefreshed(key, refreshDequeueBegan(key))
 	} else {
 		o.refused.Store(true)
 	}
+}
+
+// refreshDequeueBegan is when key's in-flight dequeue began (zero when none).
+func refreshDequeueBegan(key string) time.Time {
+	r := refresherPeek()
+	if r == nil {
+		return time.Time{}
+	}
+	if cur, ok := r.dirty.Load(key); ok {
+		if s := cur.(*dirtyStamp); s.inflight {
+			return s.began
+		}
+	}
+	return time.Time{}
 }
 
 // noteRefreshRemark reports a #375 remark of key on the dequeue's ctx.

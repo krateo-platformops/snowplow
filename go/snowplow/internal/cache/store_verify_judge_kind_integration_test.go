@@ -263,7 +263,7 @@ func kChurnVerdict(t *testing.T, issue string, passes int, rate float64) {
 	kChurnReport(t, fmt.Sprintf("%s: %d passes at %.0f patches/s: candidates=%d cleared=%d (store ahead %d, received %d) undecided=%d pending resolved lost/received/superseded=%d/%d/%d published update/delete/add/uid=%d/%d/%d/%d repairs queued=%d refused=%d",
 		issue, passes, rate, candidates, storeClearedTotal.Load(), ahead, storeReceivedTotal.Load(), storeUndecidedTotal.Load(),
 		storePendingResolvedLostTotal.Load(), storePendingResolvedReceivedTotal.Load(), storePendingSupersededTotal.Load(),
-		lu, ld, la, um, storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load()))
+		lu, ld, la, um, storeRepairsRequestedForTest(), storeRepairUnsupportedTotal.Load()))
 	// The verdict first, so a mutant that publishes is reported as what it
 	// is; the non-vacuity preconditions follow.
 	if lu+ld+la+um != 0 {
@@ -276,7 +276,7 @@ func kChurnVerdict(t *testing.T, issue string, passes int, rate float64) {
 	// A repair ATTEMPT, whether queued or refused as unsupported: this GVR's
 	// informer may not be rebuildable here, and counting only the queue would
 	// make the assertion vacuous on exactly that path.
-	if d, u := storeRepairQueueDepth(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
+	if d, u := storeRepairsRequestedForTest(), storeRepairUnsupportedTotal.Load(); d+int64(u) != 0 {
 		t.Errorf("%s RED: %d repair attempt(s) under churn alone (queued %d, refused-unsupported %d)", issue, d+int64(u), d, u)
 	}
 	if n := VerifySkippedByReasonSnapshot()[verifySkipNoSyncPosition]; n != 0 {
