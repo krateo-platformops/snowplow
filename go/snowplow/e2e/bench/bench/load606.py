@@ -2592,6 +2592,7 @@ RUN8_VARS_PREFIXES = (
     # prefix bench/store_rebuild.py VARS_PREFIXES reads
     "snowplow_store_swap",
     "snowplow_apiserver_fallthrough_cells",
+    "snowplow_resolve_collection_lists",  # #988 (PR #991): a resolve's collection LISTs on the wire
     "snowplow_crd_discovery",             # schema relists / build requests, on both mechanisms
 )
 # The identity-class inputs whose movement rotates every identity-bound key

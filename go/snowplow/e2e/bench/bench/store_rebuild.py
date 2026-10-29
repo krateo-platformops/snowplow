@@ -30,12 +30,13 @@ the same quantities on both arms:
                         (informer-fallthrough-not-synced / -not-servable), by
                         GVR. The meter counts a resolve's call to the live
                         apiserver; whether it was a GET or a LIST is not in it.
-                        No /debug/vars counter counts resolve-ORIGINATED LISTs
-                        (checked at #928): snowplow_reflector_path counts every
-                        collection GET through the shared rest.Config,
-                        reflectors' and fall-throughs' alike, and #870's K1
-                        RoundTripper LIST count is the kind arm's own
-                        (store_swap_kind_integration_test.go), not published.
+                        The refresher's path (#991) is kept apart, so the
+                        figure means the same on a build that counts it.
+  resolve_collection_lists  snowplow_resolve_collection_lists (#988, PR #991):
+                        a resolve's collection LISTs ON THE WIRE, by GVR and
+                        reason, over the rebuild pairs and the pair after
+                        each; #870 claims 0 for the swapped GVR. A build that
+                        does not publish it (1.12.59) reads "not published".
   watch_submits         snowplow_deps_dirty_mark_attribution.submit_source.watch
   rebuild intervals     the mem606 sample pairs (15 s) a rebuild was requested,
                         installed or open in: the window both mechanisms can be
@@ -57,6 +58,13 @@ VERIFY = "snowplow_store_verification"
 CRD = "snowplow_crd_discovery"
 LIST_INCREMENTAL = "snowplow_list_incremental"
 FALLTHROUGH = "snowplow_apiserver_fallthrough_cells"
+# #988 (PR #991, for 1.12.60): the collection LISTs a resolve sent ON THE WIRE,
+# {"<gvr>|<reason>": n} (gvr = GroupVersionResource.String(), reason a
+# FallthroughReason or "unattributed"). A build without it does not publish it:
+# "not published", never 0. With it, the refresher is a resolve origin too: its
+# fall-throughs land in FALLTHROUGH under path "refresher" (uncounted before).
+RESOLVE_LISTS = "snowplow_resolve_collection_lists"
+REFRESHER_PATH = "refresher"
 RESOLVED = "snowplow_resolved_cache"
 DIRTY = "snowplow_deps_dirty_mark_attribution"
 
@@ -68,7 +76,7 @@ CLOSES = ("pushed", "pushed_on_arm", "pushed_resync", "known_stale", "evicted", 
 WINDOW_REASONS = ("informer-fallthrough-not-synced", "informer-fallthrough-not-servable")
 
 # The /debug/vars prefixes mem606 must capture for this report (load606.RUN8_VARS_PREFIXES).
-VARS_PREFIXES = (SWAP, FALLTHROUGH, VERIFY, RESOLVED, CRD, "snowplow_deps_dirty_mark_")
+VARS_PREFIXES = (SWAP, FALLTHROUGH, RESOLVE_LISTS, VERIFY, RESOLVED, CRD, "snowplow_deps_dirty_mark_")
 
 MECHANISMS = {
     "relist": {
@@ -142,7 +150,8 @@ NOT_PUBLISHED = {m: tuple(sorted(set().union(*(_quantities(o) for o in MECHANISM
 # what a mechanism CLAIMS during a rebuild (the #870 design's K1): checked, report only
 CLAIMS = {
     "relist": {},
-    "build_and_swap": {"resolve_fallthroughs_during_rebuilds": 0},
+    # #870's K1, read on #988's counter: the swapped GVR's resolve LISTs, all reasons, 0 during and after a swap
+    "build_and_swap": {"resolve_fallthroughs_during_rebuilds": 0, "resolve_collection_lists_during_rebuilds": 0},
 }
 
 
@@ -190,15 +199,32 @@ def counters(x: dict, mech: str) -> dict | None:
            "watch_submits": read(x, DIRTY, "submit_source", "watch")}
     for name, fam, stat, label in COUNTERS[mech]:
         out[name] = read(x, fam, stat, label)
+    lists = x.get(RESOLVE_LISTS)
     cells = x.get(FALLTHROUGH)
     if isinstance(cells, dict):
+        # the refresher's path exists only on a build that counts it (#991, with RESOLVE_LISTS):
+        # kept apart, so resolve_fallthroughs means the same on every build
+        refresher = isinstance(lists, dict)
         for reason in WINDOW_REASONS:
             out[f"fallthrough/{reason}"] = 0
+            if refresher:
+                out[f"fallthrough_refresher/{reason}"] = 0
         for cell, n in cells.items():
             parts = str(cell).split("|")
             if len(parts) == 3 and parts[2] in WINDOW_REASONS and _num(n) is not None:
+                if parts[0] == REFRESHER_PATH:
+                    if refresher:
+                        out[f"fallthrough_refresher/{parts[2]}"] += n
+                    continue
                 out[f"fallthrough/{parts[2]}"] += n
                 out[f"fallthrough_gvr/{parts[1]}|{parts[2]}"] = out.get(f"fallthrough_gvr/{parts[1]}|{parts[2]}", 0) + n
+    if isinstance(lists, dict):
+        out["resolve_lists"] = 0
+        for cell, n in lists.items():
+            gvr, _, reason = str(cell).rpartition("|")
+            if _num(n) is not None:
+                out["resolve_lists"] += n
+                out[f"resolve_lists_gvr/{gvr}"] = out.get(f"resolve_lists_gvr/{gvr}", 0) + n
     return out
 
 
@@ -277,7 +303,9 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
         ca, cb = counters(_extra(a), mech), counters(_extra(b), mech)
         # a fall-through cell the earlier sample's meter had not counted yet read 0 there
         meter_a = isinstance(_extra(a).get(FALLTHROUGH), dict)
-        d, r = deltas(a, b, {k: ca.get(k, 0 if meter_a and k.startswith("fallthrough_gvr/") else None)
+        lists_a = isinstance(_extra(a).get(RESOLVE_LISTS), dict)
+        d, r = deltas(a, b, {k: ca.get(k, 0 if (meter_a and k.startswith("fallthrough_gvr/"))
+                                         or (lists_a and k.startswith("resolve_lists_gvr/")) else None)
                              for k in cb}, cb)
         if r:
             restarts += 1
@@ -340,6 +368,20 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
         for k, v in r["d"].items():
             if k.startswith("fallthrough_gvr/") and v:
                 by_gvr[k.split("/", 1)[1]] = by_gvr.get(k.split("/", 1)[1], 0) + v
+    # #988: the resolves' collection LISTs on the wire, during the rebuilds AND in the pair after each
+    # (#870: 0 for the swapped GVR during and after a swap); not published by a build without it
+    lists_pairs = intervals + [f for _, f in after]
+    lists_published = bool(rows) and all(isinstance(_extra(m).get(RESOLVE_LISTS), dict) for m in rows)
+    lists_known = lists_published and bool(intervals) and all(r["d"].get("resolve_lists") is not None
+                                                               for r in lists_pairs)
+    lists_total = sum(r["d"].get("resolve_lists") or 0 for r in lists_pairs) if lists_known else None
+    lists_by_gvr: dict[str, float] = {}
+    for r in lists_pairs if lists_known else []:
+        for k, v in r["d"].items():
+            if k.startswith("resolve_lists_gvr/") and v:
+                lists_by_gvr[k.split("/", 1)[1]] = lists_by_gvr.get(k.split("/", 1)[1], 0) + v
+    refresher_fall = ({k: sum(r["d"].get(f"fallthrough_refresher/{k}") or 0 for r in intervals)
+                       for k in WINDOW_REASONS} if lists_known else None)
     heap_in = [h for r in intervals for h in r["heap_inuse_mb"]]
     heap_q = [h for r in quiet for h in r["heap_inuse_mb"]]
     gc_in = [r["gc_share"] for r in intervals if r["gc_share"] is not None]
@@ -354,10 +396,21 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             "by_gvr_reason": by_gvr,
             "claim": CLAIMS[mech].get("resolve_fallthroughs_during_rebuilds"),
             "how": (f"Δ {FALLTHROUGH} for {' / '.join(WINDOW_REASONS)} over the rebuild pairs: a resolve's "
-                    f"call to the live apiserver (GET or LIST: the meter does not say which; no /debug/vars "
-                    f"counter counts resolve-originated LISTs, #870's RoundTripper count is its kind arm's own)"),
+                    f"call to the live apiserver (GET or LIST: the meter does not say which; the LISTs on the "
+                    f"wire are resolve_collection_lists_during_rebuilds, #988); the refresher's path (#991) is "
+                    f"reported apart, under resolve_collection_lists_during_rebuilds"),
             **({} if fall_known else {"missing": ("no rebuild observed: the claim is untested" if not intervals
                                                    else f"{FALLTHROUGH} absent in a rebuild pair's samples")})},
+        "resolve_collection_lists_during_rebuilds": {
+            "value": lists_total,
+            "by_gvr": lists_by_gvr if lists_known else None,
+            "claim": CLAIMS[mech].get("resolve_collection_lists_during_rebuilds"),
+            "refresher_fallthroughs_during_rebuilds": refresher_fall,
+            "how": (f"Δ {RESOLVE_LISTS} (#988: a resolve's collection LIST on the wire, every reason) over the "
+                    f"rebuild pairs and the pair after each; by GVR. #870 claims 0 for the SWAPPED GVR, which "
+                    f"the bench cannot single out (no per-GVR swap signal): every GVR is listed"),
+            **({} if lists_known else {"missing": ("not published by this build" if not lists_published else
+                                                   "no rebuild observed: the claim is untested")})},
         "watch_submits_after_rebuild": {
             "quiet_median_per_s_by_phase": {ph: round(v, 3) for ph, v in sorted(q_med_by_phase.items())},
             "after_each_rebuild": watch_after,
@@ -387,6 +440,12 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
     violations = ([f"store rebuilds ({mech}): {total_fall} resolve fall-through(s) to the apiserver during "
                    f"rebuilds ({', '.join(f'{k} {v}' for k, v in fall.items() if v)}); the mechanism claims "
                    f"{claim}"] if claim is not None and fall_known and total_fall > claim else [])
+    lclaim = CLAIMS[mech].get("resolve_collection_lists_during_rebuilds")
+    if lclaim is not None and lists_known and lists_total > lclaim:
+        violations.append(f"store rebuilds ({mech}): {lists_total} resolve collection LIST(s) on the wire during "
+                          f"or right after rebuilds (by GVR: {', '.join(f'{g} {n}' for g, n in sorted(lists_by_gvr.items()))}); "
+                          f"#870 claims {lclaim} for the swapped GVR (the bench cannot single it out: every GVR "
+                          f"is listed)")
 
     # every phase summed, as the other per-phase reports
     tot = {"seconds": 0.0, "pairs": 0, "rebuild_pairs": 0, "counters": {}}
@@ -426,7 +485,8 @@ def report(mem: list[dict], pods: list[dict], phases: list, phase_of, deltas) ->
             "gauges_last": gauges(last, mech),
             **lifetime_max,
             "watch": watch, "claim_violations": violations, "warnings": untested,
-            "not_published": list(NOT_PUBLISHED[mech]),
+            "not_published": list(NOT_PUBLISHED[mech]) + ([] if lists_published else
+                                                          ["resolve_collection_lists", "refresher_fallthroughs"]),
             "note": ("report only. A rebuild pair is a mem606 sample pair in which a rebuild was requested, "
                      "installed or open: the window at the sampler's resolution, the same for both mechanisms. "
                      "*_to_push_max_ms are lifetime maxima (the last sample's)")}
@@ -462,6 +522,7 @@ def figures(rep: dict | None) -> dict:
     return {"rebuild_pairs": rep["rebuild_pairs"], "rebuild_s_bounded": rep["rebuild_s_bounded"],
             **tot,
             "resolve_fallthroughs_during_rebuilds": w["resolve_fallthroughs_during_rebuilds"]["value"],
+            "resolve_collection_lists_during_rebuilds": w["resolve_collection_lists_during_rebuilds"]["value"],
             "watch_submits_after_rebuild_max_over_quiet": w["watch_submits_after_rebuild"]["max_over_quiet_median"],
             "heap_inuse_mb_peak_during_rebuilds": w["heap_and_gc_during_rebuilds"]["heap_inuse_mb_peak"],
             "gc_cpu_share_max_during_rebuilds": w["heap_and_gc_during_rebuilds"]["gc_cpu_share_max"]}

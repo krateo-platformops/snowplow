@@ -95,11 +95,15 @@ def _doc(row, mech, t):
                                                                                 3 * swaps, 2 * swaps)
 
 
-def _mem(rows, mech):
+def _mem(rows, mech, extra=None):
+    """mem606 samples of `rows`; extra(i) -> a dict merged into sample i's /debug/vars."""
     out = [{"kind": "mem_start", "t": T0 - 1}]
     for i, row in enumerate(rows):
         t = T0 + 15 * i
-        rec = load606.mem_sample(_Vars(_doc(row, mech, t)), "tok", tuple(load606.RUN8_VARS_PREFIXES))
+        doc = _doc(row, mech, t)
+        for k, v in ((extra(i) if extra else None) or {}).items():
+            doc[k] = {**doc.get(k, {}), **v} if isinstance(v, dict) and isinstance(doc.get(k), dict) else v
+        rec = load606.mem_sample(_Vars(doc), "tok", tuple(load606.RUN8_VARS_PREFIXES))
         rec["t"] = t
         out.append(rec)
     return out
@@ -109,10 +113,10 @@ POD = {"kind": "snowplow_pod", "phase": "before", "pod": "snowplow-0", "restarts
        "started_at": START}
 
 
-def _evaluate(tmp_path, rows, mech, *, churn=True):
+def _evaluate(tmp_path, rows, mech, *, churn=True, extra=None):
     """The verdict of the evaluate CLI over one run's mem606 stream."""
     f = tmp_path / f"mem-mem606-{mech}.jsonl"
-    recs = _mem(rows, mech)
+    recs = _mem(rows, mech, extra)
     f.write_text("".join(json.dumps(m) + "\n" for m in recs))
     files = [str(f)]
     p2 = tmp_path / f"pod-{mech}.jsonl"
@@ -366,3 +370,72 @@ def test_a_restart_pair_is_skipped_not_counted(mech, rows):
     watch = (rows[3][2] - rows[0][2]) + (rows[7][2] - rows[4][2])
     assert (a["repairs_requested"], a["stale_served"], a["watch_submits"], a["pairs"]) == (1, stale, watch, 6)
     assert r["rebuild_pairs"] == 2                                     # s2->s3 and s4->s5
+
+
+# ─── #988 (PR #991): the resolves' collection LISTs on the wire ─────────────
+
+LISTS = "snowplow_resolve_collection_lists"
+CM = "/v1, Resource=configmaps"
+
+
+def _lists(composition_at, other_at=None, refresher_from=None):
+    """A build with #991: the lists counter (G's LISTs from sample `composition_at`
+    on, a configmap LIST from `other_at` on) and the refresher's fall-through path."""
+    def f(i):
+        cells = {f"{G}|informer-fallthrough-not-synced": 1 if composition_at is not None and i >= composition_at else 0}
+        if other_at is not None and i >= other_at:
+            cells[f"{CM}|unattributed"] = 1
+        out = {LISTS: cells}
+        if refresher_from is not None:
+            out["snowplow_apiserver_fallthrough_cells"] = {
+                f"refresher|{G}|informer-fallthrough-not-synced": 5 if i >= refresher_from else 0}
+        return out
+    return f
+
+
+def test_the_lists_counter_is_captured_and_reads_zero_through_a_clean_swap(tmp_path):
+    v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None))
+    r = v["report"]["store_rebuild_report_only"]
+    w = r["watch"]["resolve_collection_lists_during_rebuilds"]
+    assert (w["value"], w["claim"], w["by_gvr"]) == (0, 0, {}) and r["claim_violations"] == []
+    assert "resolve_collection_lists" not in r["not_published"]
+    assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
+        "resolve_collection_lists_during_rebuilds"] == 0
+
+
+def test_a_list_during_or_right_after_a_swap_breaks_870s_claim(tmp_path):
+    """During (s3) and right after (s5->s6, the pair after the install): each
+    is a breach, named by GVR; a list long after (s7) is not counted."""
+    for at, want in ((3, {G: 1}), (6, {G: 1})):
+        v, err = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(at))
+        w = v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]
+        assert w["value"] == 1 and w["by_gvr"] == want, at
+        viol = v["report"]["store_rebuild_report_only"]["claim_violations"]
+        assert len(viol) == 1 and "1 resolve collection LIST(s)" in viol[0] and G in viol[0]
+        assert viol[0] in v["report"]["report_warnings"]
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(7))
+    assert v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]["value"] == 0
+    # every GVR is listed: the bench cannot single out the swapped one
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None, other_at=4))
+    w = v["report"]["store_rebuild_report_only"]["watch"]["resolve_collection_lists_during_rebuilds"]
+    assert w["by_gvr"] == {CM: 1} and v["report"]["store_rebuild_report_only"]["claim_violations"]
+
+
+def test_a_build_without_the_counter_reads_not_published(tmp_path):
+    v, _ = _evaluate(tmp_path, RELIST, "relist")
+    r = v["report"]["store_rebuild_report_only"]
+    w = r["watch"]["resolve_collection_lists_during_rebuilds"]
+    assert w["value"] is None and w["missing"] == "not published by this build" and w["claim"] is None
+    assert {"resolve_collection_lists", "refresher_fallthroughs"} <= set(r["not_published"])
+    assert v["report"]["acceptance_figures_report_only"]["store_rebuilds"][
+        "resolve_collection_lists_during_rebuilds"] is None
+
+
+def test_the_refresher_s_fall_throughs_never_join_the_resolve_count(tmp_path):
+    """#991 counts the refresher's fall-throughs under path "refresher": kept
+    apart, so resolve_fallthroughs means the same on 1.12.59 and 1.12.60."""
+    v, _ = _evaluate(tmp_path, SWAP, "build_and_swap", extra=_lists(None, refresher_from=4))
+    r = v["report"]["store_rebuild_report_only"]
+    assert r["watch"]["resolve_fallthroughs_during_rebuilds"]["value"] == 0
+    assert r["watch"]["resolve_collection_lists_during_rebuilds"]["refresher_fallthroughs_during_rebuilds"] == {
+        "informer-fallthrough-not-synced": 5, "informer-fallthrough-not-servable": 0}
