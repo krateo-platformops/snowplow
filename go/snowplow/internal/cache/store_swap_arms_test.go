@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -502,14 +503,16 @@ func TestStoreSwap_K13_VerificationBindsToTheInstance(t *testing.T) {
 	lists0 := f.listCount()
 	release := f.holdList(lists0 + 1)
 	f.clusterSet(swapObj(gvr, "o00", "2", "v2"))
-	f.request(reasonDivergence, swapKey("o00"))
-	cand := f.rw.storeBuildForTest(gvr)
-	// The pass that found it marked the registry; the build must not wipe it.
+	// The pass that found the divergence marked the registry BEFORE it asked
+	// for the build; constructing the build must not wipe it (X19 wipes it at
+	// construction, so this state must exist before the request).
 	markRepairPending(gvr, true)
 	storeVerify.mu.Lock()
 	storeVerify.gvrs[gvr].suppressed = false
 	storeVerify.gvrs[gvr].factoryDivergentSince = time.Unix(1, 0)
 	storeVerify.mu.Unlock()
+	f.request(reasonDivergence, swapKey("o00"))
+	cand := f.rw.storeBuildForTest(gvr)
 
 	// Re-detection during the build: joins, constructs nothing.
 	f.request(reasonDivergence, swapKey("o00"), swapKey("o01"))
@@ -649,15 +652,45 @@ func TestStoreSwap_K15_BehindCopyConvergesAndIsCounted(t *testing.T) {
 // TestStoreSwap_R1_CellEqualsAFromScratchListing: a cell anchored before the
 // swap equals a from-scratch listing after it, with no unanchor. RED under X3
 // (bump the epoch) and X7 (drop one key from M).
+//
+// Two loss sets: several lost writes (update, update, delete, create) and a
+// single lost write. With several, the anchored cell re-renders from the new
+// copy as soon as ANY key of M dirties it, so a dropped key of M hides behind
+// the others at the cell; the per-key check below catches it at the consumer.
+// With one, the dropped key is the only one and the cell itself stays stale.
 func TestStoreSwap_R1_CellEqualsAFromScratchListing(t *testing.T) {
+	t.Run("several_losses", func(t *testing.T) {
+		r1Case(t, func(f *swapFix, gvr schema.GroupVersionResource) map[string]string {
+			f.clusterSet(swapObj(gvr, "o00", "2", "x"))
+			f.clusterSet(swapObj(gvr, "o03", "2", "y"))
+			f.clusterDelete("o05")
+			f.clusterSet(swapObj(gvr, "zz", "1", "new"))
+			return map[string]string{"o00": "x", "o03": "y", "o05": "", "zz": "new"}
+		})
+	})
+	t.Run("one_loss", func(t *testing.T) {
+		r1Case(t, func(f *swapFix, gvr schema.GroupVersionResource) map[string]string {
+			f.clusterSet(swapObj(gvr, "o02", "2", "only"))
+			return map[string]string{"o02": "only"}
+		})
+	})
+}
+
+// r1Case: lose the writes lose() makes (the live copy never sees them), repair,
+// and require (1) the anchored cell equals a from-scratch listing, and (2) the
+// consumer's last event for every lost key carries the cluster's state ("" =
+// deleted).
+func r1Case(t *testing.T, lose func(f *swapFix, gvr schema.GroupVersionResource) map[string]string) {
 	gvr := swapGVR(t)
 	f := newSwapFix(t, gvr, objs(gvr, 6))
 	c := f.anchorCell()
-	f.clusterSet(swapObj(gvr, "o00", "2", "x"))
-	f.clusterSet(swapObj(gvr, "o03", "2", "y"))
-	f.clusterDelete("o05")
-	f.clusterSet(swapObj(gvr, "zz", "1", "new"))
-	f.request(reasonDivergence, swapKey("o00"), swapKey("o03"), swapKey("o05"), swapKey("zz"))
+	lost := lose(f, gvr)
+	var keys []string
+	for k := range lost {
+		keys = append(keys, swapKey(k))
+	}
+	sort.Strings(keys)
+	f.request(reasonDivergence, keys...)
 	f.awaitSwaps(1)
 	f.waitFor("the dep worker to drain", func() bool { return DepWatchStatsSnapshot().DeleteQueueDepth == 0 })
 	time.Sleep(50 * time.Millisecond)
@@ -668,6 +701,16 @@ func TestStoreSwap_R1_CellEqualsAFromScratchListing(t *testing.T) {
 	want := f.fromScratch()
 	if got != want {
 		t.Fatalf("R1 RED (X7): the anchored cell differs from a from-scratch listing after the swap:\n cell: %s\n full: %s", got, want)
+	}
+	for name, v := range lost {
+		evs := f.rec.forKey(swapKey(name))
+		if len(evs) == 0 {
+			t.Fatalf("R1 RED (X7): lost key %s never reached the consumer", name)
+		}
+		last := evs[len(evs)-1]
+		if gone := v == ""; gone != (last.kind == "delete") || last.v != v {
+			t.Fatalf("R1 RED (X7): the consumer's last event for lost key %s is %v, want the cluster's state (v=%q)", name, last, v)
+		}
 	}
 }
 

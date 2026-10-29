@@ -34,7 +34,7 @@ import (
 
 // StatSpec describes one published stat derived from a tagged struct field.
 type StatSpec struct {
-	// Stat is the published key (the `stat` tag), e.g. "relist_bridge_timeout_total".
+	// Stat is the published key (the `stat` tag), e.g. "store_swaps_total".
 	Stat string
 	// Kind is "counter" (monotonic; the default) or "gauge" (a current value).
 	Kind string

@@ -425,16 +425,16 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	)
 
 	rw := &ResourceWatcher{
-		mode:                  modeInformer,
-		dyn:                   dyn,
-		factory:               factory,
-		informers:             map[schema.GroupVersionResource]informers.GenericInformer{},
-		syncCh:                map[schema.GroupVersionResource]chan struct{}{},
-		metadataOnly:          map[schema.GroupVersionResource]struct{}{},
-		watchBroken:           map[schema.GroupVersionResource]struct{}{},
-		confirmed:             map[schema.GroupVersionResource]struct{}{},
-		lastSyncRV:            map[schema.GroupVersionResource]string{},
-		watchHandlerInstalled: map[schema.GroupVersionResource]struct{}{},
+		mode:                   modeInformer,
+		dyn:                    dyn,
+		factory:                factory,
+		informers:              map[schema.GroupVersionResource]informers.GenericInformer{},
+		syncCh:                 map[schema.GroupVersionResource]chan struct{}{},
+		metadataOnly:           map[schema.GroupVersionResource]struct{}{},
+		watchBroken:            map[schema.GroupVersionResource]struct{}{},
+		confirmed:              map[schema.GroupVersionResource]struct{}{},
+		lastSyncRV:             map[schema.GroupVersionResource]string{},
+		watchHandlerInstalled:  map[schema.GroupVersionResource]struct{}{},
 		stopCh:                 make(chan struct{}),
 		rbacInitialPublishDone: make(chan struct{}),
 	}

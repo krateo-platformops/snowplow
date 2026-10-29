@@ -9,8 +9,6 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -155,9 +153,6 @@ func (r *ledgerRig) quiesce() {
 	r.t.Helper()
 	r.waitFor("the dep worker to drain", func() bool { return DepWatchStatsSnapshot().DeleteQueueDepth == 0 })
 	if _, err := WaitRefresherQuiescentForTest(RefresherWorkSnapshot(), 30*time.Second); err != nil {
-		buf := make([]byte, 1<<22)
-		n := runtime.Stack(buf, true)
-		_ = os.WriteFile("/private/tmp/claude-501/-Users-diegobraga-krateo-snowplow-cache-snowplow--claude-worktrees-gate-118cv2/35e88d50-8fa5-4a2a-9780-d3b7ef3f70cf/scratchpad/dev870/stacks.txt", buf[:n], 0o644)
 		r.t.Fatalf("refresher never quiescent: %v (work %+v, refreshes run %d)", err, RefresherWorkSnapshot(), r.refresh.Load())
 	}
 }
@@ -224,6 +219,22 @@ func gauges() (keysOpen, winMax, owed map[string]float64) {
 
 func closes(reason, c string) uint64 { return storeSwapStats.closes.get(reason, c) }
 
+// windowEnded: no open build window of reason remains. The ledger rig runs on
+// an injected window clock that moves only when an arm steps it, so
+// window_open_seconds_max reads 0 for a window that is still open whenever the
+// arm has not stepped the clock; it can never stand in for "the window ended".
+func windowEnded(reason string) bool {
+	l := swapLedger
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ra := range l.open {
+		if ra.reason == reason {
+			return false
+		}
+	}
+	return true
+}
+
 // ── K16 — ruling 3, reason divergence ────────────────────────────────────────
 
 // TestStoreSwap_K16_KnownStaleDivergence: (1) during the build a single-object
@@ -276,7 +287,7 @@ func TestStoreSwap_K16_KnownStaleDivergence(t *testing.T) {
 	}
 	r.waitFor("the window to close", func() bool {
 		ko, wm, _ := gauges()
-		return ko[reasonDivergence] == 0 && wm[reasonDivergence] == 0
+		return windowEnded(reasonDivergence) && ko[reasonDivergence] == 0 && wm[reasonDivergence] == 0
 	})
 	r.quiesce()
 	if n := v.count(stale); n != 1 {
@@ -324,10 +335,7 @@ func TestStoreSwap_K16_LiveEventClosesACoordinateNotInM(t *testing.T) {
 	r.waitFor("the live event's refresh", func() bool { return r.body(dep) == `{"v":"x"}` })
 	release()
 	r.awaitSwaps(1)
-	r.waitFor("the window to close", func() bool {
-		_, wm, _ := gauges()
-		return wm[reasonDivergence] == 0
-	})
+	r.waitFor("the window to close", func() bool { return windowEnded(reasonDivergence) })
 	if got := closes(reasonDivergence, closeLiveEvent); got != 1 {
 		t.Fatalf("K16 (Q3): closes{live_event} = %d, want 1", got)
 	}
@@ -359,10 +367,7 @@ func TestStoreSwap_K16bSchemaWindow(t *testing.T) {
 	release()
 	r.awaitSwaps(1)
 	r.waitFor("the frame", func() bool { return v.count(dep) == 1 })
-	r.waitFor("the window to close", func() bool {
-		_, wm, _ := gauges()
-		return wm[reasonSchema] == 0
-	})
+	r.waitFor("the window to close", func() bool { return windowEnded(reasonSchema) })
 	r.quiesce()
 	if n := v.count(dep); n != 1 {
 		t.Fatalf("K16b: %d frames after the install, want exactly 1", n)
@@ -406,10 +411,7 @@ func TestStoreSwap_K16c_InstallToPush(t *testing.T) {
 	}
 	rel() // pushed at t0 + 5 s
 	r.waitFor("the frame", func() bool { return v.count(dep) == 1 })
-	r.waitFor("the window to close", func() bool {
-		_, wm, _ := gauges()
-		return wm[reasonDivergence] == 0
-	})
+	r.waitFor("the window to close", func() bool { return windowEnded(reasonDivergence) })
 	h := storeSwapStats.installHist[[2]string{reasonDivergence, closePushed}]
 	if h.count.Load() != 1 || h.maxMS.Load() != 4000 {
 		t.Fatalf("K16c: install_to_push_ms{divergence,pushed} count=%d max=%dms, want 1 and 4000", h.count.Load(), h.maxMS.Load())
@@ -463,10 +465,7 @@ func TestStoreSwap_K16d_LedgerCloses(t *testing.T) {
 	r.waitFor("pushed_on_arm", func() bool { return closes(reasonDivergence, closePushedOnArm) == 1 })
 	// owedKey never had a subscriber: refreshed and owed, holding nothing.
 	r.waitFor("owedKey refreshed", func() bool { return r.body(owedKey) == `{"v":"new"}` })
-	r.waitFor("the window to close", func() bool {
-		_, wm, _ := gauges()
-		return wm[reasonDivergence] == 0
-	})
+	r.waitFor("the window to close", func() bool { return windowEnded(reasonDivergence) })
 	if _, _, ow := gauges(); ow[reasonDivergence] != 1 {
 		t.Fatalf("K16d: ledger_owed = %v, want 1 (owedKey)", ow)
 	}
@@ -565,10 +564,10 @@ func TestStoreSwap_K16f_WindowHolders(t *testing.T) {
 	r.clusterSet(swapObj(r.gvr, "o00", "2", "x"))
 	r.request(reasonDivergence, swapKey("o00"))
 	r.awaitSwaps(1)
-	r.waitFor("the window to close with the refresh still pending", func() bool {
-		_, wm, _ := gauges()
-		return wm[reasonDivergence] == 0
-	})
+	// Only the armable dependent has an entry, and it never had a subscriber,
+	// so nothing holds the window: it ends at the install although the
+	// dependent's refresh is still held (C5a). X45 makes it hold.
+	r.waitFor("the window to end with the refresh still pending", func() bool { return windowEnded(reasonDivergence) })
 	if e, _ := openLedgerForTest(); e != 1 {
 		t.Fatalf("K16f RED (X46): %d entries open, want 1 (the armable dependent only; the %s cell opens none)", e, content)
 	}
@@ -606,8 +605,7 @@ func TestStoreSwap_K16g_FrameWrittenBeforeTheDequeueSettles(t *testing.T) {
 	r.awaitSwaps(1)
 	r.waitFor("the frame", func() bool { return v.count(dep) == 1 })
 	r.waitFor("pushed while the dequeue is still held", func() bool {
-		_, wm, _ := gauges()
-		return closes(reasonDivergence, closePushed) == 1 && wm[reasonDivergence] == 0
+		return closes(reasonDivergence, closePushed) == 1 && windowEnded(reasonDivergence)
 	})
 	close(hold)
 }
