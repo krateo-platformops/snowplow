@@ -47,6 +47,12 @@ type adapterRig struct {
 }
 
 func newAdapterRig(t *testing.T, acted *actedRecord, muted bool) *adapterRig {
+	return newAdapterRigNamed(t, acted, muted, "ext/1")
+}
+
+// newAdapterRigNamed is newAdapterRig for a handler of the given record name
+// (depHandlerName: the dep handler, the one that counts swap statistics).
+func newAdapterRigNamed(t *testing.T, acted *actedRecord, muted bool, name string) *adapterRig {
 	gvr := schema.GroupVersionResource{Group: "adapter870.krateo.io", Version: "v1", Resource: "panels"}
 	idx := clientcache.NewIndexer(clientcache.MetaNamespaceKeyFunc, clientcache.Indexers{})
 	inst := newStoreInstance(gvr, stubGenericInformer{inf: stubSharedInformer{idx: idx}}, shapeStandaloneDynamic, make(chan struct{}))
@@ -55,7 +61,7 @@ func newAdapterRig(t *testing.T, acted *actedRecord, muted bool) *adapterRig {
 	if acted == nil {
 		acted = newActedRecord()
 	}
-	a := inst.adapt("ext/1", rec.handler(), acted)
+	a := inst.adapt(name, rec.handler(), acted)
 	return &adapterRig{t: t, gvr: gvr, idx: idx, inst: inst, a: a, rec: rec, acted: acted}
 }
 

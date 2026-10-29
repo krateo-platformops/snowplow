@@ -439,15 +439,22 @@ type handlerAdapter struct {
 	muted    bool
 	seen     map[string]any
 	suppress map[string]suppressTarget
-	// displaced[k] is the resourceVersion a swap delivery replaced for k. It
-	// is recorded only when the swap replaced a DIFFERENT version (a version
-	// can come back only then: the new copy synced behind and its watch is
-	// still to deliver it), and it ends at k's next real delivery or with the
-	// instance. A real delivery carrying exactly that version means the swap
-	// pushed an OLDER body than the consumer had (F8):
-	// store_swap_regressed_keys. A schema widen replaces every key at the
-	// same version, so it records nothing (#928 F5).
-	displaced map[string]string
+}
+
+// noteStepBack counts a delivery that steps the consumer BACK: it had acted on
+// a newer resourceVersion than the one delivered now. Only a swap can do that
+// (one informer delivers in order): the new copy synced behind the old one
+// (F8), and the older body came through its swap delivery or its lagging watch.
+// Counted once per step, at the dep handler (store_swap_regressed_keys).
+// Ordered with orderRV (#918); a pair the API does not let us order is not
+// counted. A same-version delivery (a schema widen) is not a step back.
+func (a *handlerAdapter) noteStepBack(acted, delivered any) {
+	if a.name != depHandlerName {
+		return
+	}
+	if c, err := orderRV(stateOf(delivered, true).rv, stateOf(acted, true).rv); err == nil && c < 0 {
+		storeSwapStats.regressedKeys.Add(1)
+	}
 }
 
 var _ clientcache.ResourceEventHandler = (*handlerAdapter)(nil)
@@ -510,17 +517,16 @@ func (a *handlerAdapter) deliver(obj, old any, present, isInInitialList, update 
 		a.mu.Unlock()
 		return
 	}
-	if rv, ok := a.displaced[key]; ok {
-		delete(a.displaced, key)
-		if st.present && rv != "" && st.rv == rv && a.name == depHandlerName {
-			storeSwapStats.regressedKeys.Add(1)
-		}
-	}
 	a.mu.Unlock()
 
 	if a.acted != nil {
-		if prev, had := a.acted.get(key); had && update {
-			old = prev
+		if prev, had := a.acted.get(key); had {
+			if update {
+				old = prev
+			}
+			if st.present {
+				a.noteStepBack(prev, obj)
+			}
 		}
 	}
 	a.callInner(obj, old, present, isInInitialList, update)
@@ -569,6 +575,9 @@ func (a *handlerAdapter) swapDeliver(key string) {
 	if a.name == depHandlerName {
 		storeSwapStats.deliveries.Add(1)
 	}
+	if hadActed && present {
+		a.noteStepBack(acted, s)
+	}
 	// A consumer that attributes its work by source is told this is a swap
 	// delivery (the dep handler: submission source store_swap).
 	sh, sourced := a.inner.(swapSourcedHandler)
@@ -593,14 +602,6 @@ func (a *handlerAdapter) swapDeliver(key string) {
 	defer a.mu.Unlock()
 	if a.freed {
 		return
-	}
-	if hadActed && present {
-		if prev := stateOf(acted, true).rv; prev != stateOf(s, true).rv {
-			if a.displaced == nil {
-				a.displaced = map[string]string{}
-			}
-			a.displaced[key] = prev
-		}
 	}
 	seenObj, seenOK := a.seen[key]
 	if seenOK != present || (present && seenObj != s) {
@@ -636,7 +637,6 @@ func (a *handlerAdapter) free() {
 	a.freed = true
 	a.seen = nil
 	a.suppress = nil
-	a.displaced = nil
 	a.mu.Unlock()
 }
 

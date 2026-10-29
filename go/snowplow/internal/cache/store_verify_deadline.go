@@ -365,7 +365,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 		// published them, whichever way it ends (storePendingKeys' invariant).
 		defer release()
 		if listRV = dl.beginPass(); listRV == "" {
-			publishCarried(gvr, carried)
+			publishCarried(dl, carried)
 			recordVerifySkipped(verifySkipNoSyncPosition) // same reason, same rule: never RV="0"
 			return
 		}
@@ -384,7 +384,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// this single List call — a metaClient.List spawns no nested establishment LIST.
 	list, err := cli.Resource(gvr).Namespace(metav1.NamespaceAll).List(withForcedVerifyTag(ctx), opts)
 	if err != nil {
-		publishCarried(gvr, carried)
+		publishCarried(dl, carried)
 		recordVerifySkipped(verifySkipListError)
 		slog.Warn("cache.store.verification_list_failed",
 			slog.String("subsystem", "cache"),
@@ -461,14 +461,14 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	// below is already refused (requestStoreBuild refuses a suppressed GVR).
 	// Reverse the two and an ineffective repair would latch AND rebuild in the
 	// same pass, which is the hammering the breaker exists to stop.
-	requestStoreRepair(gvr, report.confirmedKeys())
+	requestStoreRepair(gvr, report.confirmedKeys(), liveInstanceIs(gvr, inst))
 }
 
-// publishCarried publishes the losses judgePending decided when the pass that
-// decided them cannot take its own read: they do not depend on it.
-func publishCarried(gvr schema.GroupVersionResource, carried []divergenceCandidate) {
+// publishCarried publishes the losses dl's judgePending decided when the pass
+// that decided them cannot take its own read: they do not depend on it.
+func publishCarried(dl *deliveryLog, carried []divergenceCandidate) {
 	if len(carried) > 0 {
-		publishResolvedLoss(gvr, carried)
+		publishResolvedLoss(dl, carried)
 	}
 }
 

@@ -315,6 +315,14 @@ func (rw *ResourceWatcher) wireInstanceLocked(gvr schema.GroupVersionResource, i
 // reasonSchema. It constructs a build or joins the running one, and returns
 // without waiting. Returns false when the request was refused.
 func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, reason string, keys []string) bool {
+	return rw.requestStoreBuildBound(gvr, reason, keys, nil)
+}
+
+// requestStoreBuildBound is requestStoreBuild for a request that belongs to
+// one copy of the GVR: bound (nil: unbound) is evaluated under the same rw.mu
+// as the decision, and a request whose copy is no longer live is dropped
+// (requestStoreRepair).
+func (rw *ResourceWatcher) requestStoreBuildBound(gvr schema.GroupVersionResource, reason string, keys []string, bound func(rw *ResourceWatcher) bool) bool {
 	if rw == nil || rw.mode == modePassthrough {
 		return false
 	}
@@ -323,6 +331,11 @@ func (rw *ResourceWatcher) requestStoreBuild(gvr schema.GroupVersionResource, re
 	live := rw.instances[gvr]
 	if live == nil {
 		rw.mu.Unlock()
+		return false
+	}
+	if bound != nil && !bound(rw) {
+		rw.mu.Unlock()
+		recordVerifySkipped(verifySkipInstanceChanged)
 		return false
 	}
 	// BOUND 6 / #244 — ONLY OWNED INFORMERS CAN BE REBUILT, decided by the
@@ -636,10 +649,14 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	// live delivery or a swap delivery, and on every listener both come after
 	// the unmute. So at any moment after the enqueue, a key whose store object
 	// differs from acted is in M and is delivered once (C1 skips it if a live
-	// delivery got there first, suppression drops a still-queued older one),
-	// and a key equal to acted has nothing older left to deliver live. What
-	// the moment of M changes is counters only — |M| and, for a schema build,
-	// its known-stale coordinates — within their contract (deliveries ≤ |M|).
+	// delivery got there first; suppression drops a notification still queued
+	// BEHIND the swap delivery), and a key equal to acted has nothing older
+	// left to deliver live. What the moment of M changes is counters only — |M|
+	// and, for a schema build, its known-stale coordinates — within their
+	// contract (deliveries ≤ |M|). NOT covered, by any moment: a new copy whose
+	// watch lags the old one (F8) can still deliver an older version live after
+	// the unmute; the consumer steps back and converges as that watch catches
+	// up, and the step is counted (store_swap_regressed_keys, both paths).
 	// A write the new copy took while muted cannot fall between the two (its
 	// notification was muted, so acted still differs from the store, so it is
 	// in M).

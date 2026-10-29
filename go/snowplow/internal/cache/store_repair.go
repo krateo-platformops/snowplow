@@ -63,10 +63,15 @@ package cache
 import "k8s.io/apimachinery/pkg/runtime/schema"
 
 // requestStoreRepair asks for a build with reason divergence for gvr, carrying
-// the confirmed-divergent keys. Returns false when it was refused (not
-// registered, factory-built — counted on store_repair_unsupported_total — or
-// suppressed by the breaker).
-func requestStoreRepair(gvr schema.GroupVersionResource, keys []string) bool {
+// the confirmed-divergent keys of a loss judged against ONE copy. live (nil:
+// unbound) reports, under the same rw.mu as the build decision, whether that
+// copy is still the GVR's live one: a judgement of a copy a swap has replaced
+// is dropped (verification_skipped{instance_changed}) — the swap's own LIST
+// already corrected that store, and a request then would start a second,
+// redundant build (#870 F6; #928 delta). Returns false when it was refused
+// (not registered, factory-built — counted on store_repair_unsupported_total —
+// suppressed by the breaker) or dropped.
+func requestStoreRepair(gvr schema.GroupVersionResource, keys []string, live func(rw *ResourceWatcher) bool) bool {
 	// Bound 6 first, from the RECORDED property alone: a factory-built GVR is
 	// refused, out loud, whatever state the watcher is in.
 	if owned, known, _ := storeVerificationOwnership(gvr); known && !owned {
@@ -77,7 +82,19 @@ func requestStoreRepair(gvr schema.GroupVersionResource, keys []string) bool {
 	if rw == nil {
 		return false
 	}
-	return rw.requestStoreBuild(gvr, reasonDivergence, keys)
+	return rw.requestStoreBuildBound(gvr, reasonDivergence, keys, live)
+}
+
+// liveInstanceIs and liveDeliveryLogIs are the bindings a repair request
+// carries (requestStoreRepair): the copy a loss was judged against — the
+// instance a forced pass compared, or the delivery log whose pending key
+// resolved — is still the GVR's live one. Evaluated under rw.mu.
+func liveInstanceIs(gvr schema.GroupVersionResource, inst *storeInstance) func(rw *ResourceWatcher) bool {
+	return func(rw *ResourceWatcher) bool { return inst != nil && rw.instances[gvr] == inst }
+}
+
+func liveDeliveryLogIs(log *deliveryLog) func(rw *ResourceWatcher) bool {
+	return func(rw *ResourceWatcher) bool { return log != nil && rw.deliveries[log.gvr] == log }
 }
 
 // confirmedKeys is every key a report confirmed divergent, whatever its class:

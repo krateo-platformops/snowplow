@@ -625,7 +625,13 @@ func (l *deliveryLog) oldestPending() time.Time {
 }
 
 // close stops the resolver, drops what is pending and removes the handler:
-// the GVR's informer is being torn down (deletePerGVRStateLocked).
+// the GVR's informer is being torn down (deletePerGVRStateLocked), or a swap
+// replaced the copy this log records (#870). It clears exactly what it owned:
+// its pending keys and, when it held any, the GVR's walker flag they set — only
+// the GVR's live log is ever judged into pending (a pass reads
+// rw.deliveries[gvr]), and an install closes the replaced log before any pass
+// can judge the new one, so the flag never outlives the keys it stands for
+// (#928 delta G1).
 func (l *deliveryLog) close() {
 	l.mu.Lock()
 	if l.closed {
@@ -638,6 +644,9 @@ func (l *deliveryLog) close() {
 	l.pgen++
 	l.mu.Unlock()
 	storePendingKeys.Add(-int64(n))
+	if n > 0 {
+		setPendingFlag(l.gvr, false)
+	}
 	liveDeliveryLogs.Delete(l)
 	if l.inf != nil && l.reg != nil {
 		_ = l.inf.RemoveEventHandler(l.reg)
@@ -703,7 +712,7 @@ func (l *deliveryLog) resolve() {
 		storeUndecidedTotal.Add(st.undecided)
 		if len(st.lost) > 0 {
 			storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
-			publishResolvedLoss(l.gvr, st.lost)
+			publishResolvedLoss(l, st.lost)
 			if fn := resolvedLossPublishedHookForTest.Load(); fn != nil {
 				(*fn)()
 			}

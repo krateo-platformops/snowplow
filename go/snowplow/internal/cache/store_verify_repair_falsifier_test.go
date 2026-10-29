@@ -947,7 +947,7 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		// Factory-built: NOT owned, and not decorated either.
 		rememberStoreVerification(drifted, false, false)
 
-		if requestStoreRepair(drifted, []string{"ns/drift"}) {
+		if requestStoreRepair(drifted, []string{"ns/drift"}, nil) {
 			t.Fatal("a repair was queued for a GVR that does NOT own its informer. The teardown would " +
 				"stop the factory's cached informer and the re-register would hand the STOPPED one " +
 				"back, killing the cache for this GVR while store_repairs_fired_total counted a success")
@@ -975,7 +975,7 @@ func TestForcedPass_RepairBounds(t *testing.T) {
 		// #870: with no watcher here there is no live copy to build beside, so
 		// the request cannot be accepted; what must hold is that it is NOT
 		// refused as unsupported (the end-to-end acceptance is K8b).
-		_ = requestStoreRepair(owned, []string{"ns/owned"})
+		_ = requestStoreRepair(owned, []string{"ns/owned"}, nil)
 		if got := storeRepairUnsupportedTotal.Load(); got != 1 {
 			t.Errorf("store_repair_unsupported_total = %d after one refusal and one acceptance, want 1", got)
 		}

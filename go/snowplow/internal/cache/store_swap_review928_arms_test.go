@@ -213,7 +213,7 @@ func TestStoreSwap_K16i_ArmAfterTheSwapHoldsTheWindow(t *testing.T) {
 	}
 }
 
-// ── F5 — the schema refusal's own reason; the displaced record's bound ───────
+// ── F5 — the schema refusal's own reason; G2 — every step back is counted ───
 
 // TestStoreSwap_K8c_SchemaChangeOnAFactoryGVRIsNotARepair: a schema change on
 // a factory-built GVR is refused like any build there, but it is counted and
@@ -236,42 +236,50 @@ func TestStoreSwap_K8c_SchemaChangeOnAFactoryGVRIsNotARepair(t *testing.T) {
 	}
 }
 
-// TestStoreSwap_K15b_SameVersionSwapRecordsNoDisplacement: a swap delivery that
-// replaces the consumer's object at the SAME resourceVersion (a schema widen)
-// can never be followed by that version coming back, so it records nothing in
-// displaced — a 50K widen leaves no per-key residue for the instance's life. A
-// swap delivery that replaced a DIFFERENT version records it (K15 counts the
-// regression it may reveal). RED under F5b (record every replaced version).
-func TestStoreSwap_K15b_SameVersionSwapRecordsNoDisplacement(t *testing.T) {
+// TestStoreSwap_K15b_EveryStepBackIsCountedAndOnlyThat (#928 delta G2): a
+// delivery that steps the consumer BACK to an older resourceVersion than it
+// acted on is counted in store_swap_regressed_keys, on either path — the swap
+// delivery of a copy that synced behind, or that copy's lagging watch after
+// the unmute — and nothing else is: not a same-version swap delivery (a schema
+// widen), not a step forward. RED under G2a (the live path does not count), G2b
+// (the swap path does not count) and G2c (the order is inverted).
+func TestStoreSwap_K15b_EveryStepBackIsCountedAndOnlyThat(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "adapter870.krateo.io", Version: "v1", Resource: "panels"}
-	v2 := swapObj(gvr, "k", "2", "v2")
-	r := newAdapterRig(t, liveActedOn(t, v2), true)
-	w := r.obj("2", "widened") // same resourceVersion, different bytes
-	r.write(w)
-	r.nAdd(w) // muted initial list
-	r.nUnmute()
-	r.nSwap()
-	if got := r.seq(); !eqSeq(got, []string{"update:2:widened"}) {
-		t.Fatalf("setup: consumer sequence %v, want the widened object once", got)
+	obj := func(rv, v string) any { return swapObj(gvr, "k", rv, v) }
+	count := func(t *testing.T, what string, want uint64, run func()) {
+		t.Helper()
+		before := storeSwapStats.regressedKeys.Load()
+		run()
+		if got := storeSwapStats.regressedKeys.Load() - before; got != want {
+			t.Fatalf("K15b RED: %s moved store_swap_regressed_keys by %d, want %d", what, got, want)
+		}
 	}
-	r.a.mu.Lock()
-	n := len(r.a.displaced)
-	r.a.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("K15b RED (F5b): a same-version swap delivery recorded %d displaced version(s)", n)
+	// The swap delivery, the consumer having acted on rv 2 through an earlier copy.
+	swap := func(store any) func() {
+		return func() {
+			r := newAdapterRigNamed(t, liveActedOn(t, obj("2", "v2")), true, depHandlerName)
+			r.write(store)
+			r.nAdd(store) // muted initial list
+			r.nUnmute()
+			r.nSwap()
+		}
 	}
-
-	// A different version is recorded.
-	r2 := newAdapterRig(t, liveActedOn(t, v2), true)
-	v3 := r2.obj("3", "v3")
-	r2.write(v3)
-	r2.nAdd(v3)
-	r2.nUnmute()
-	r2.nSwap()
-	r2.a.mu.Lock()
-	got, ok := r2.a.displaced["swap/k"]
-	r2.a.mu.Unlock()
-	if !ok || got != "2" {
-		t.Fatalf("K15b: a swap delivery that replaced rv 2 by rv 3 recorded displaced=%q (present=%v), want \"2\"", got, ok)
-	}
+	count(t, "a same-version swap delivery (a schema widen)", 0, swap(obj("2", "widened")))
+	count(t, "a swap delivery of a newer version", 0, swap(obj("3", "v3")))
+	count(t, "a swap delivery of an OLDER version (the new copy synced behind)", 1, swap(obj("1", "v1")))
+	// The live path: the consumer acted on rv 4 through the old copy; the new
+	// copy's lagging watch delivers rv 3 after the unmute.
+	count(t, "a live delivery of an OLDER version after the unmute", 1, func() {
+		r := newAdapterRigNamed(t, liveActedOn(t, obj("4", "v4")), true, depHandlerName)
+		r.write(obj("2", "v2"))
+		r.nAdd(obj("2", "v2"))
+		r.nUnmute()
+		r.write(obj("3", "v3"))
+		r.nUpdate(obj("2", "v2"), obj("3", "v3"))
+	})
+	count(t, "a live delivery of a newer version", 0, func() {
+		r := newAdapterRigNamed(t, liveActedOn(t, obj("4", "v4")), false, depHandlerName)
+		r.write(obj("5", "v5"))
+		r.nUpdate(obj("4", "v4"), obj("5", "v5"))
+	})
 }

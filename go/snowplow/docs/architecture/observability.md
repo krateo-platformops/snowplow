@@ -723,7 +723,7 @@ keys). Every instant reads the dirty-window clock (#930). No key, body or identi
 | `store_swap_m_keys_total` | Σ\|M\|: keys whose bytes differed between the new copy and what the consumers last acted on | small: the changed keys only |
 | `store_swap_deliveries_total` | swap deliveries the dep handler acted on (≤ \|M\|: a key a live event delivered first is skipped, v5.1 C1) | ≤ `store_swap_m_keys_total` |
 | `store_swap_reused_objects_total` | objects a new copy shared with the live copy (equal bytes) | ≈ the store size per swap |
-| `store_swap_regressed_keys` | swap deliveries that pushed a body older than the consumer had (the new copy synced behind); each converges on the new copy's next watch event | 0; rare |
+| `store_swap_regressed_keys` | deliveries that stepped a consumer back to an older resourceVersion than it had acted on: the new copy synced behind the live one (F8), and the older body came through its swap delivery or through its lagging watch after the unmute. Each converges as that watch catches up. Ordered with the API's resourceVersion order (#918); a pair it does not let us order is not counted | 0; rare |
 | `store_swap_schema_unowned_total` | CRD schema changes on a GVR whose informer comes from a shared factory: no copy can be listed under the new schema beside it, so objects listed under the old schema keep being served until that informer re-lists by itself (log `cache.store.swap.schema_unowned`). A divergence there counts `store_repair_unsupported_total` instead | 0 in production, where the streaming path owns nearly every GVR |
 
 | OTLP instrument (expvar key under `snowplow_store_swap_known_stale`) | labels | meaning |

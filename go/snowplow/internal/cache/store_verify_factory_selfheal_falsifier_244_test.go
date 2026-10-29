@@ -64,7 +64,7 @@ func TestFactory244_RefusedAndAgeSignalDiscriminates(t *testing.T) {
 	// (1) REFUSAL — the active repair verb is UNAVAILABLE for the factory class,
 	// so the passive self-heal is the sole path.
 	before := storeRepairUnsupportedTotal.Load()
-	if requestStoreRepair(factory244GVR, []string{"ns/div"}) {
+	if requestStoreRepair(factory244GVR, []string{"ns/div"}, nil) {
 		t.Fatal("#244: a factory-built GVR must be REFUSED — a shared-factory teardown hands back " +
 			"the STOPPED informer and kills the cache; the active relist-repair is not available")
 	}
@@ -79,7 +79,7 @@ func TestFactory244_RefusedAndAgeSignalDiscriminates(t *testing.T) {
 	// a real watcher is arm K8b, TestStoreSwap_K8b_OwnedOnly.)
 	rememberStoreVerification(owned244GVR, true, true)
 	unsupBefore := storeRepairUnsupportedTotal.Load()
-	_ = requestStoreRepair(owned244GVR, []string{"ns/owned"})
+	_ = requestStoreRepair(owned244GVR, []string{"ns/owned"}, nil)
 	if got := storeRepairUnsupportedTotal.Load(); got != unsupBefore {
 		t.Fatalf("#244 positive control: an owned GVR's acceptance must NOT increment "+
 			"store_repair_unsupported_total; it moved %d→%d", unsupBefore, got)
