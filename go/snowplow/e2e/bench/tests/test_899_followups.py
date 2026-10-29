@@ -275,7 +275,10 @@ def test_without_legacy_zonal_the_zone_is_never_looked_at(fakegke, monkeypatch):
     with pytest.raises(RuntimeError, match="only by hand: gke-down --legacy-zonal"):
         gke.teardown(SPEC, dry_run=False, log=lambda _: None, budget_s=60)
     assert calls(fakegke) == [f"describe --region {REGION}"]
-    assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--yes"]) == 1
+    # #985: gke-down says "nothing to delete" (its own exit); run606 tells a create that
+    # never made the cluster (nothing to delete) from one gke-up made (TEARDOWN FAILED)
+    assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--yes"]) == \
+        gke.EXIT_NOTHING_TO_DELETE
     assert not any("--zone" in c or c.startswith("delete") for c in calls(fakegke))
 
 

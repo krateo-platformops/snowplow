@@ -320,6 +320,10 @@ FAKE = textwrap.dedent("""\
         sys.exit(rc)
     if a[:3] == ["compute", "regions", "describe"]:
         q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(q)); sys.exit(0)
+    if a[:3] == ["auth", "print-access-token"]:          # #985: the Cloud Quotas read
+        print("fake-access-token"); sys.exit(0)
+    if a[:3] == ["container", "clusters", "list"]:
+        print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
     sys.exit(0)
     """)
 
@@ -360,7 +364,12 @@ def fakes(tmp_path, monkeypatch):
     for k, v in (("FAKE_STATE", st), ("FAKE_PVS", tmp_path / "pvs.json"), ("FAKE_DISKS", tmp_path / "disks.json"),
                  ("FAKE_QUOTAS", tmp_path / "quotas.json"), ("FAKE_ID", ID_OURS)):
         monkeypatch.setenv(k, str(v))
-    return tmp_path
+    # #985: GKE's per-location cluster limit, from the Cloud Quotas fake (state/cluster_limit moves it)
+    from tests import fake_cloudquotas
+    url, stop = fake_cloudquotas.serve(st / "cluster_limit")
+    monkeypatch.setenv("CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS", url)
+    yield tmp_path
+    stop()
 
 
 def _calls(tmp):

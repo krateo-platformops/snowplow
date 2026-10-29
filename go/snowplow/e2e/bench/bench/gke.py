@@ -99,6 +99,11 @@ DEFAULT_CLUSTER_VERSION = "1.36"
 DEFAULT_TTL_HOURS = 8
 
 
+class ClusterNotFound(RuntimeError):
+    """The exact-name describe answered NotFound: there is no such cluster
+    (#985: a create that never made one must not read as a failed teardown)."""
+
+
 class NotDeletable(RuntimeError):
     """Raised when teardown is asked to delete a cluster it does not own."""
 
@@ -713,9 +718,9 @@ def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
         if not not_found:
             raise RuntimeError(f"describe {spec.name} in {location} failed (rc={rc})")
         if not legacy_zonal:
-            raise RuntimeError(f"describe {spec.name} failed (rc={rc}): not found in region {spec.region}; "
-                               f"it may already be gone (a zonal cluster made before run 17 is deleted "
-                               f"only by hand: gke-down --legacy-zonal)")
+            raise ClusterNotFound(f"no cluster {spec.name} in region {spec.region} (its exact-name describe "
+                                  f"answered NotFound): nothing to delete (a zonal cluster made before run 17 "
+                                  f"is deleted only by hand: gke-down --legacy-zonal)")
         if location == spec.zone:
             raise RuntimeError(f"describe {spec.name} failed (rc={rc}): not found in region "
                                f"{spec.region} nor in zone {spec.zone}; it may already be gone")
@@ -893,6 +898,102 @@ def ssd_quota_fit(region: dict, need_gb: float) -> tuple[bool, str]:
     msg = (f"{SSD_QUOTA_METRIC} in {region.get('name')}: {q['usage']:g} of {q['limit']:g} GB used, "
            f"{free:g} free; the run needs {need_gb:g} GB of PVC disk")
     return free >= need_gb, msg
+
+
+# ─── GKE's per-location cluster limit (#985) ────────────────────────────────
+#
+# Run 18 lost both arms ~19 s into gke-up: "Your project already has the
+# maximum number of clusters (3) in location europe-west4" — krateo-installer-
+# release and run 17's two clusters held the three. GKE's limit is a Cloud
+# Quotas quota: `ClustersPerRegion` (metric container.googleapis.com/
+# clusters_per_region, dimension region) for a regional cluster — every bench
+# cluster since run 17 — and `ClustersPerZone` for a zonal one; read
+# 2026-10-29 from the project (value 3 in every region). The limit is READ,
+# never a constant. gcloud has the Cloud Quotas API only as an `alpha`
+# component, so it is read over REST with gcloud's own access token (kept in
+# memory), at gcloud's endpoint-override name
+# (CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS, the root URL) when one is set.
+# Every cluster in the location counts, whatever its status or owner.
+
+CLOUD_QUOTAS_API = "https://cloudquotas.googleapis.com/"
+CLUSTER_QUOTA_ID = "ClustersPerRegion"
+
+
+def all_clusters_command(project: str) -> list[str]:
+    """Every cluster of the project, any location, owner or status."""
+    return ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
+
+
+def cluster_quota_url(project: str) -> str:
+    root = os.environ.get("CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS") or CLOUD_QUOTAS_API
+    return (f"{root.rstrip('/')}/v1/projects/{project}/locations/global/services/container.googleapis.com/"
+            f"quotaInfos/{CLUSTER_QUOTA_ID}")
+
+
+def read_cluster_quota(project: str, *, run=execute, fetch=None) -> tuple[dict | None, str]:
+    """(the ClustersPerRegion quotaInfo, "") or (None, why it was not read)."""
+    import urllib.error
+    import urllib.request
+    rc, tok = run(["gcloud", "auth", "print-access-token"], dry_run=False, log=lambda _m: None)
+    tok = (tok or "").strip()
+    if rc != 0 or not tok:
+        return None, f"no gcloud access token (rc={rc})"
+    url = cluster_quota_url(project)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}", "x-goog-user-project": project})
+    try:
+        if fetch is not None:
+            return fetch(req), ""
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r), ""
+    except urllib.error.HTTPError as e:
+        return None, f"the Cloud Quotas API answered HTTP {e.code} for {CLUSTER_QUOTA_ID}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, f"the Cloud Quotas API did not answer ({type(e).__name__})"
+
+
+def cluster_limit(info: dict | None, region: str) -> int | None:
+    """The ClustersPerRegion value that applies to `region`: the dimensions
+    entry naming the region itself, else the one whose applicableLocations
+    holds it. None when neither (the limit is not known)."""
+    rows = (info or {}).get("dimensionsInfos") or []
+    exact = [d for d in rows if ((d.get("dimensions") or {}).get("region")) == region]
+    cover = [d for d in rows if region in (d.get("applicableLocations") or [])]
+    for d in exact or cover:
+        v = ((d.get("details") or {}).get("value"))
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def cluster_count_fit(limit: int | None, clusters: list[dict] | None, region: str,
+                      need: int) -> tuple[bool, str]:
+    """Do `need` more regional clusters fit GKE's per-location limit in
+    `region`, beside every cluster already there (any status, any owner)?
+    -1 is GKE's "unlimited"; an unread limit or listing is "unknown": no fit."""
+    if limit is None:
+        return False, f"GKE's {CLUSTER_QUOTA_ID} limit for {region} could not be read: whether the run fits is unknown"
+    if clusters is None:
+        return False, f"the project's clusters could not be listed: whether the run fits in {region} is unknown"
+    there = sorted(f"{c.get('name')} ({c.get('status')})" for c in clusters if c.get("location") == region)
+    if limit < 0:
+        return True, f"GKE clusters in {region}: {len(there)} present, no limit; the run needs {need}"
+    free = limit - len(there)
+    return free >= need, (f"GKE clusters in {region}: {len(there)} of {limit} ({CLUSTER_QUOTA_ID}): "
+                          f"{', '.join(there) or 'none'}; {max(free, 0)} free, the run needs {need}")
+
+
+def cluster_quota_check(project: str, zone: str, need: int, *, run=execute, fetch=None) -> tuple[bool, str]:
+    """Read the limit and the clusters, then cluster_count_fit (a read: nothing is created)."""
+    region = region_of(zone)
+    info, why = read_cluster_quota(project, run=run, fetch=fetch)
+    if info is None:
+        return False, f"GKE's {CLUSTER_QUOTA_ID} limit could not be read ({why}): whether the run fits is unknown"
+    rc, out = run(all_clusters_command(project), dry_run=False, log=lambda _m: None)
+    clusters = _json(out) if rc == 0 else None
+    return cluster_count_fit(cluster_limit(info, region), clusters if isinstance(clusters, list) else None,
+                             region, need)
 
 
 def _kubectl(spec: ClusterSpec) -> list[str]:
@@ -1303,13 +1404,21 @@ def cmd_gke_up(a) -> int:
                              f"was created\n")
             return 2
         print(msg)
+        # #985: GKE's per-location cluster limit, read (run 18 hit it ~19 s in)
+        ok, msg = cluster_quota_check(spec.project, spec.zone, 1)
+        if not ok:
+            sys.stderr.write(f"refusing: {msg}; nothing was created\n")
+            return 2
+        print(msg)
     if not dry:
         os.makedirs(os.path.dirname(spec.kubeconfig), exist_ok=True)
     for argv in create_commands(spec):
-        rc, _ = execute(argv, dry_run=dry, env=env)
+        err: list[str] = []
+        rc, _ = execute(argv, dry_run=dry, env=env, stderr_out=err)
         if rc != 0:
-            sys.stderr.write(
-                f"create step failed (rc={rc}); tearing down what exists\n")
+            # #985: the reason, redacted (gcloud's text can name the operator's account)
+            sys.stderr.write(f"create step failed (rc={rc}): {gcloud_error_lines(err[-1] if err else '')}; "
+                             f"tearing down what exists\n")
             if not dry:
                 try:
                     teardown(spec, dry_run=False)
@@ -1359,16 +1468,38 @@ def cmd_gke_shape(a) -> int:
 # gke-down's exit when the cluster IS deleted but the disk backstop failed or
 # was skipped (run606 reports it: disks of the run may be left)
 EXIT_BACKSTOP_FAILED = 4
+# gke-down's exit when no such cluster exists (exact-name describe: NotFound):
+# nothing to delete (#985; run606 says so, never "TEARDOWN FAILED")
+EXIT_NOTHING_TO_DELETE = 5
 
 
 def cmd_gke_down(a) -> int:
     spec = default_spec(a.name, project=a.project, zone=a.zone)
     try:
         problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s, legacy_zonal=a.legacy_zonal)
+    except ClusterNotFound as e:
+        sys.stderr.write(f"gke-down: {e}\n")
+        return EXIT_NOTHING_TO_DELETE
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         return 1
     return EXIT_BACKSTOP_FAILED if problems else 0
+
+
+def gcloud_error_lines(stderr: str) -> str:
+    """gcloud's ERROR lines, each redacted (bench/identity.py), joined; the
+    code-only summary when it printed none."""
+    from bench.identity import redact_identity
+    lines = [redact_identity(ln.strip()) for ln in (stderr or "").splitlines() if ln.strip().startswith("ERROR")]
+    return " | ".join(lines) if lines else error_summary(stderr)
+
+
+def cmd_gke_cluster_quota(a) -> int:
+    """#985: run606_pair.sh, before two clusters start at once (each gke-up
+    alone would see room for itself)."""
+    ok, msg = cluster_quota_check(a.project, a.zone, a.runs)
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 2
 
 
 def cmd_gke_ssd_quota(a) -> int:
@@ -1501,6 +1632,14 @@ def add_parsers(sub) -> None:
     sq.add_argument("--zone", default=DEFAULT_ZONE)
     sq.add_argument("--runs", type=int, default=1)
     sq.set_defaults(func=cmd_gke_ssd_quota)
+
+    cq = sub.add_parser("gke-cluster-quota", help="#985: exit 2 unless RUNS more regional clusters fit GKE's "
+                                                   "per-location limit (ClustersPerRegion, read) beside every "
+                                                   "cluster already in the region (a read; nothing is created)")
+    cq.add_argument("--project", default=DEFAULT_PROJECT)
+    cq.add_argument("--zone", default=DEFAULT_ZONE)
+    cq.add_argument("--runs", type=int, default=1)
+    cq.set_defaults(func=cmd_gke_cluster_quota)
 
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")
