@@ -1,0 +1,14 @@
+apiVersion: v2
+description: Krateo PlatformOps AuthN Service CRDs
+home: https://krateo.io
+icon: https://github.com/krateoplatformops/krateo/blob/main/docs/media/logo.svg
+keywords:
+- krateo
+- platformops
+- authn
+- crd
+name: authn-crds
+sources:
+- https://github.com/krateo-platformops/authn
+type: application
+version: 0.27.3

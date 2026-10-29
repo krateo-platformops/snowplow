@@ -943,9 +943,11 @@ def _k8s_gvr_for(resource):
 # ─── Composition + bench constants (shared across modules) ───────────────────
 
 NS = "krateo-system"
-COMPDEF_NAME = "github-scaffolding-with-composition-page"
-COMP_GVR = "composition.krateo.io"
-COMP_RES = "githubscaffoldingwithcompositionpages"
+# the composition fixture's names and renderers: bench/data_manifests.py (no
+# import-time kubectl call there, so the schema step can render them before
+# any cluster exists)
+from bench.data_manifests import (  # noqa: E402
+    COMP_GVR, COMP_RES, COMPDEF_NAME, composition_yaml, compositiondefinition_yaml)
 COMP_CONTROLLER_DEPLOY = f"{COMP_RES}-v1-2-2-controller"
 
 # Task #348: page the heavy cluster-wide ground-truth count/name probes.
@@ -1199,87 +1201,12 @@ def list_composition_names():
 
 # ─── Composition deploy + YAML helpers ───────────────────────────────────────
 
-def composition_yaml(ns, name):
-    """Return the YAML body for a single bench composition."""
-    return f"""\
-apiVersion: composition.krateo.io/v1-2-2
-kind: GithubScaffoldingWithCompositionPage
-metadata:
-  name: {name}
-  namespace: {ns}
-spec:
-  argocd:
-    namespace: krateo-system
-    application:
-      project: default
-      source:
-        path: chart/
-      destination:
-        server: https://kubernetes.default.svc
-        namespace: {name}
-      syncEnabled: false
-      syncPolicy:
-        automated:
-          prune: true
-          selfHeal: true
-  app:
-    service:
-      type: NodePort
-      port: 31180
-  git:
-    unsupportedCapabilities: true
-    insecure: true
-    fromRepo:
-      scmUrl: https://github.com
-      org: krateoplatformops-blueprints
-      name: github-scaffolding-with-composition-page
-      branch: main
-      path: skeleton/
-      credentials:
-        authMethod: generic
-        secretRef:
-          namespace: krateo-system
-          name: github-repo-creds
-          key: token
-    toRepo:
-      scmUrl: https://github.com
-      org: krateoplatformops-test
-      name: {name}
-      branch: main
-      path: /
-      credentials:
-        authMethod: generic
-        secretRef:
-          namespace: krateo-system
-          name: github-repo-creds
-          key: token
-      private: false
-      initialize: true
-      deletionPolicy: Delete
-      verbose: false
-      configurationRef:
-        name: repo-config
-        namespace: demo-system"""
-
-
 def deploy_compositiondefinition(ns="bench-ns-01"):
     """Apply the bench CompositionDefinition into `ns` and wait for Ready.
 
     Returns True if the CD becomes Ready within 300s, False otherwise.
     """
-    yaml_str = f"""\
-apiVersion: core.krateo.io/v1alpha1
-kind: CompositionDefinition
-metadata:
-  name: {COMPDEF_NAME}
-  namespace: {ns}
-spec:
-  chart:
-    repo: {COMPDEF_NAME}
-    url: https://marketplace.krateo.io
-    version: 1.2.2
-"""
-    kubectl("apply", "--server-side", "-f", "-", input_data=yaml_str)
+    kubectl("apply", "--server-side", "-f", "-", input_data=compositiondefinition_yaml(ns))
     deadline = time.time() + 300
     while time.time() < deadline:
         rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io",

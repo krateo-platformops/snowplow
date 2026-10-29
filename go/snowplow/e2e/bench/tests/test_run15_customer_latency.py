@@ -618,6 +618,8 @@ teardown() { local rc=$?; trap - EXIT; [[ -n "$SLEEP_PID" ]] && kill "$SLEEP_PID
 trap teardown EXIT
 on_signal() { echo "$RUN_NAME signal" >> "$FAKE/calls"; exit 130; }
 trap on_signal INT TERM HUP
+on_pair_stop() { echo "$RUN_NAME pair-stop" >> "$FAKE/calls"; exit 143; }
+trap on_pair_stop USR1
 mkdir -p "$OUT"
 if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"; fi
 echo "=== step measure ===" >> "$OUT/run.log"
@@ -774,8 +776,9 @@ def test_a_run_that_failed_as_tooling_stops_its_partner_and_its_trap_runs(pairbe
     assert (datetime.now(UTC) - t0).total_seconds() < 30, "B ran on: the TERM never reached it"
     assert p.returncode == 3, p.stderr[-3000:]
     calls = _calls(fake)
-    # the TERM reached run606's own shell: its trap ran, then its teardown
-    assert f"{NB} signal" in calls and f"{NB} teardown rc=130" in calls
+    # the PAIR STOP (USR1, not a TERM) reached run606's own shell: its trap ran, then its teardown
+    assert f"{NB} pair-stop" in calls and f"{NB} teardown rc=143" in calls
+    assert f"{NB} signal" not in calls
     pid_b = next(c for c in calls if c.startswith(f"{NB} dry=0")).rsplit("pid=", 1)[1]
     log = (tmp / "pair" / "pair.log").read_text()
     assert f"run B pid {pid_b}" in log                       # $! is run606's shell, not a subshell

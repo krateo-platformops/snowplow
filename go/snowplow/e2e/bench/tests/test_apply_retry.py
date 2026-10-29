@@ -14,6 +14,9 @@ import pytest
 
 from bench import data606, lifecycle
 
+# scaleuser-0301's User CR, as the ONE authn user rendering writes it (bench/authn_user.py: JSON documents)
+MARK = '"kind": "User", "metadata": {"name": "scaleuser-0301",'
+
 TRANSIENT = ("Unable to connect to the server: http2: client connection lost")
 
 
@@ -49,29 +52,29 @@ def _no_login(monkeypatch):
 
 def test_user_batch_survives_one_transient_failure(monkeypatch, sleeps):
     # scaleuser-0301 opens batch 301-350, the batch run 9 attempt 3 lost.
-    k = FlakyKubectl(marker="name: scaleuser-0301\n", fail_times=1)
+    k = FlakyKubectl(marker=MARK, fail_times=1)
     monkeypatch.setattr(lifecycle, "kubectl", k)
     _no_login(monkeypatch)
     n, _ = lifecycle.create_synthetic_users(1, 400, login=False)
     assert n == 400
-    batch = [d for d in k.applies if "name: scaleuser-0301\n" in d]
+    batch = [d for d in k.applies if MARK in d]
     assert len(batch) == 2 and batch[0] == batch[1], "must re-apply the SAME YAML"
     assert sleeps == [5]
     assert len(k.applies) == 8 + 1  # 8 batches of 50, one retried
 
 
 def test_user_batch_failing_every_attempt_is_not_counted(monkeypatch, sleeps):
-    k = FlakyKubectl(marker="name: scaleuser-0301\n", fail_times=99)
+    k = FlakyKubectl(marker=MARK, fail_times=99)
     monkeypatch.setattr(lifecycle, "kubectl", k)
     _no_login(monkeypatch)
     n, _ = lifecycle.create_synthetic_users(1, 400, login=False)
     assert n == 350
     assert sleeps == [5, 10, 20]
-    assert sum("name: scaleuser-0301\n" in d for d in k.applies) == 4
+    assert sum(MARK in d for d in k.applies) == 4
 
 
 def test_user_batch_three_failures_then_success_is_counted(monkeypatch, sleeps):
-    k = FlakyKubectl(marker="name: scaleuser-0301\n", fail_times=3)
+    k = FlakyKubectl(marker=MARK, fail_times=3)
     monkeypatch.setattr(lifecycle, "kubectl", k)
     _no_login(monkeypatch)
     n, _ = lifecycle.create_synthetic_users(1, 400, login=False)

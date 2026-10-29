@@ -51,7 +51,7 @@ import json
 import math
 import sys
 
-from bench import rbac_model
+from bench import authn_user, rbac_model
 
 LABEL = "bench.krateo.io/fresh-class"
 AUTHN_NS = "krateo-system"          # bench/lifecycle.py PHASE7_AUTHN_NS: where authn's Users live
@@ -95,18 +95,17 @@ def manifest(p: dict, password: str) -> str:
     """The authn Users, their password Secrets, and the RoleBinding that
     names each user alone."""
     docs = []
+    labels = {LABEL: "true", "app": "scaletest"}
+    meta = {"labels": labels}
+    i = 0
     for s in p["sessions"]:
         for f in s["fresh"]:
             u = f["user"]
-            meta = {"labels": {LABEL: "true", "app": "scaletest"}}
-            docs.append({"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/basic-auth",
-                         "metadata": dict(meta, name=f"{u}-password", namespace=AUTHN_NS),
-                         "stringData": {"password": password}})
-            docs.append({"apiVersion": "basic.authn.krateo.io/v1alpha1", "kind": "User",
-                         "metadata": dict(meta, name=u, namespace=AUTHN_NS),
-                         "spec": {"displayName": "Fresh class", "groups": f["groups"],
-                                  "passwordRef": {"namespace": AUTHN_NS, "name": f"{u}-password",
-                                                  "key": "password"}}})
+            i += 1
+            # the ONE authn user rendering (bench/authn_user.py): the data step's users use it too
+            docs.append(authn_user.password_secret(u, AUTHN_NS, password, labels))
+            docs.append(authn_user.user(u, AUTHN_NS, display_name="Fresh class", groups=f["groups"],
+                                        avatar=authn_user.avatar_url(i), labels=labels))
             docs.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
                          "metadata": dict(meta, name=f"{u}-reader", namespace=f["namespace"]),
                          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": ROLE},

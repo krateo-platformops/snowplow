@@ -559,7 +559,9 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
 
 
 def _run606(tmp_path, **env):
-    base = dict(os.environ, HOME=str(tmp_path), OUT=str(tmp_path / "out"),
+    from tests.test_run606_real_sequence import fake_registry   # the dry pass reads the registry
+    base = dict(os.environ, **fake_registry(tmp_path))
+    base.update(HOME=str(tmp_path), OUT=str(tmp_path / "out"),
                 RUN_NAME="snowplow-bench-1014-1200", INSTALLER_VERSION="0.0.0",
                 SNOWPLOW_TAG="0.0.0", THINK_S="0", PYTHONPATH=str(BENCH_DIR),
                 EXPECTED_IMAGE_DIGEST="sha256:" + "ab" * 32)

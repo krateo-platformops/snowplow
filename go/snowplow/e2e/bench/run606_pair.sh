@@ -150,8 +150,10 @@ while [[ -z "$RC_A" || -z "$RC_B" ]]; do
       if [[ "${!rc}" != "0" && "${!done_x}" != "1" ]]; then
         other=$([[ "$x" == "A" ]] && echo B || echo A); opid="PID_$other"; orc="RC_$other"
         if [[ -z "${!orc}" ]]; then
-          log "run $x failed as tooling: stopping run $other (half a pair cannot be compared)"
-          kill -TERM "${!opid}" 2>/dev/null || true
+          # a PAIR STOP (USR1), not a TERM: its measurement stops and its teardown, diagnostics
+          # and disk backstop run in full (run 17 attempt 4: the TERM reached B's teardown)
+          log "run $x failed as tooling: stopping run $other (half a pair cannot be compared): its measurement stops, its teardown runs in full"
+          kill -USR1 "${!opid}" 2>/dev/null || true
         fi
       fi
     fi

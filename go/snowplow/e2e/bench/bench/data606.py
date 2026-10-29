@@ -42,7 +42,7 @@ __all__ = ["hold_composition_controller", "assert_no_external_children",
 PAUSED_ANNOTATION = "krateo.io/paused=true"
 # The served version of the bench composition kind (cluster.composition_yaml
 # stamps apiVersion composition.krateo.io/v1-2-2).
-COMP_VERSION = "v1-2-2"
+from bench.data_manifests import COMP_VERSION  # noqa: E402
 
 
 def hold_composition_controller(ns: str = "bench-ns-01") -> None:

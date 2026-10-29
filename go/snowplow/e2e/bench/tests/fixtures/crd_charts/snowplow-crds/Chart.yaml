@@ -1,0 +1,14 @@
+apiVersion: v2
+description: Krateo PlatformOps Snowplow CRDs
+home: https://krateo.io
+icon: https://github.com/krateoplatformops/krateo/blob/main/docs/media/logo.svg
+keywords:
+- krateo
+- platformops
+- snowplow
+- crd
+name: snowplow-crds
+sources:
+- https://github.com/krateo-platformops/snowplow
+type: application
+version: 1.12.56

@@ -147,6 +147,16 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             resolved = None
     record("kubectl", kc, resolved)
     port = os.environ["FAKE_PORT"]
+    if a[:1] == ["apply"] and "-f" in a:
+        # every object applied, by apiVersion and kind (tests/test_crd_schema.py: the
+        # schema step's check names every non-built-in kind the run applies)
+        import yaml
+        f = a[a.index("-f") + 1]
+        text = sys.stdin.read() if f == "-" else (open(f).read() if os.path.isfile(f) else "")
+        with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh:
+            for d in yaml.safe_load_all(text):
+                if isinstance(d, dict):
+                    fh.write(json.dumps([d.get("apiVersion"), d.get("kind")]) + "\\n")
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
     # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
     # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the
@@ -210,6 +220,24 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             "bench-snowplow-users": 9899, "bench-drivers": 8999}
     bench_fs = (os.path.exists(os.path.join(STATE, "bench_flowschemas"))
                 and os.environ.get("FAKE_BENCH_FS_IGNORED") != "1")
+    if a[:1] == ["apply"] and "-f" in a and os.environ.get("FAKE_USER_CRD"):
+        # the API server validates an applied User against authn's CRD (its spec.required),
+        # as the real one refused all 670 fresh Users of run 17 attempt 4
+        import yaml
+        crd = yaml.safe_load(open(os.environ["FAKE_USER_CRD"]))
+        need = list(crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"].get("required") or [])
+        need += [x for x in os.environ.get("FAKE_USER_REQUIRE", "").split(",") if x]
+        bad = []
+        f = a[a.index("-f") + 1]
+        for d in yaml.safe_load_all(open(f)) if os.path.isfile(f) else []:
+            if isinstance(d, dict) and d.get("kind") == "User":
+                for k in need:
+                    if k not in (d.get("spec") or {}):
+                        bad.append(f'Error from server (Invalid): User.basic.authn.krateo.io "{d["metadata"]["name"]}" '
+                                   f"is invalid: spec.{k}: Required value")
+        if bad:
+            sys.stderr.write("\\n".join(bad) + "\\n")
+            sys.exit(1)
     if a[:1] == ["apply"] and any(x.endswith("bench-flowschemas.yaml") for x in a):
         open(os.path.join(STATE, "bench_flowschemas"), "w").write(open(a[-1]).read())
         sys.exit(0)
@@ -804,11 +832,36 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         if os.environ.get("FAKE_CHART_MISSING") == "1":
             print("Error: not found", file=sys.stderr); sys.exit(1)
         print(f"apiVersion: v2\\nname: installer\\nversion: {ver}"); sys.exit(0)
+    CRD_CHARTS = os.environ["FAKE_CRD_CHARTS"]    # the pinned CRD charts, vendored (tests/fixtures/crd_charts)
+    def crd_chart(name, dest):
+        # a CRD chart as the registry serves it; FAKE_CRD_REQUIRE="Kind:field,..." serves a
+        # CRD whose spec requires one more field (what authn-crds did to the fresh classes)
+        import shutil, yaml
+        shutil.copytree(os.path.join(CRD_CHARTS, name), dest)
+        req = [x.split(":", 1) for x in os.environ.get("FAKE_CRD_REQUIRE", "").split(",") if x]
+        tdir = os.path.join(dest, "templates")
+        for f in sorted(os.listdir(tdir)) if req else []:
+            crd = yaml.safe_load(open(os.path.join(tdir, f)))
+            for kind, field in req:
+                if crd["spec"]["names"]["kind"] == kind:
+                    for v in crd["spec"]["versions"]:
+                        spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+                        spec["required"] = list(spec.get("required") or []) + [field]
+                        spec.setdefault("properties", {})[field] = {"type": "string"}
+            yaml.safe_dump(crd, open(os.path.join(tdir, f), "w"))
+    if a[:1] == ["pull"] and not a[1].endswith("/installer"):
+        chart = a[1].rsplit("/", 1)[-1]
+        if not os.path.isdir(os.path.join(CRD_CHARTS, chart)):
+            print(f"Error: {a[1]}:{ver}: not found", file=sys.stderr); sys.exit(1)
+        crd_chart(chart, os.path.join(a[a.index("-d") + 1], chart))
+        sys.exit(0)
     if a[:1] == ["pull"]:
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
         os.makedirs(os.path.join(d, "charts"), exist_ok=True)
         open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w").write("x")
+        crd_chart("core-provider-crds", os.path.join(d, "charts", "core-provider-crds"))
+        open(os.path.join(d, "values.yaml"), "w").write("ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10))
         os.makedirs(os.path.join(d, "templates"), exist_ok=True)
         core = os.environ.get("FAKE_CORE_FEATURES", "")
         if core == "dynamic":
@@ -817,10 +870,13 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
-            "dependencies": [{"name": "core-provider", "version": "2.13.24"}]}))
+            "dependencies": [{"name": "core-provider", "version": "2.13.24"},
+                             {"name": "core-provider-crds", "version": "2.13.40"}]}))
         good = os.environ.get("FAKE_PINS", "good") == "good"
         open(os.path.join(d, "files", "component-pins.yaml"), "w").write(json.dumps({
             "components": [
+                {"name": "authn-crd", "kind": "AuthnCrds", "chart": "authn-crds", "version": "0.27.3"},
+                {"name": "snowplow-crd", "kind": "SnowplowCrds", "chart": "snowplow-crds", "version": "1.12.56"},
                 {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
                 {"name": "alert-provider", "feature": "specialistAgents"},
                 {"name": "krateo-observability", "feature": "portal",
@@ -863,6 +919,21 @@ def _fake_server(state: Path):
     return srv
 
 
+CRD_CHARTS = Path(__file__).resolve().parent / "fixtures" / "crd_charts"
+
+
+def fake_registry(tmp_path: Path) -> dict:
+    """The env a DRY run606 needs: its registry reads (the installer chart and
+    the CRD charts it pins) answered by the harness's fake helm."""
+    fakebin = tmp_path / "registry-bin"
+    state = tmp_path / "registry-state"
+    fakebin.mkdir(exist_ok=True)
+    state.mkdir(exist_ok=True)
+    _write_exe(fakebin / "helm", FAKE_HELM)
+    return {"PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}", "FAKE_STATE": str(state),
+            "FAKE_CRD_CHARTS": str(CRD_CHARTS)}
+
+
 def _write_exe(path: Path, body: str):
     path.write_text(f"#!{sys.executable} -I\n" + body)
     path.chmod(0o755)
@@ -902,6 +973,8 @@ def harness(tmp_path):
         "FRESH_SAMPLES": "2", "FRESH_GAP_S": "0", "HOLD_PROBE_WAIT_S": "0",
         "PLATFORM_TIMEOUT_S": "1", "PLATFORM_POLL_S": "0.2",
         "BENCH_NO_COLOR": "1", "FAKE_PW": SCALEUSER_PASSWORD,
+        "FAKE_USER_CRD": str(CRD_CHARTS / "authn-crds" / "templates" / "basic.authn.krateo.io_users.yaml"),
+        "FAKE_CRD_CHARTS": str(CRD_CHARTS),
     })
     from datetime import datetime, timezone
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME
@@ -991,7 +1064,8 @@ def test_gke_entrypoint_never_imports_the_context_guard():
 
 
 def test_dry_run_log_redacts_password(tmp_path):
-    env = dict(os.environ, HOME=str(tmp_path), OUT=str(tmp_path / "out"),
+    env = dict(os.environ, **fake_registry(tmp_path))
+    env.update(HOME=str(tmp_path), OUT=str(tmp_path / "out"),
                RUN_NAME=RUN_NAME, INSTALLER_VERSION="0.3.422",
                SNOWPLOW_TAG="1.12.46", THINK_S="0", BENCH_606_DRY_RUN="1",
                EXPECTED_IMAGE_DIGEST=FAKE_DIGEST, PYTHONPATH=str(BENCH_DIR))
