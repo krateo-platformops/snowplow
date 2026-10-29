@@ -1162,12 +1162,13 @@ def test_mem606_captures_prewarm_and_learned_identity_counters():
 # ─── browser.js in real Chrome against a fixture SPA (docker) ──────────────
 
 
-def _docker_ok():
-    return shutil.which("docker") is not None and subprocess.run(
-        ["docker", "info"], capture_output=True).returncode == 0
-
-
-needs_docker = pytest.mark.skipif(not _docker_ok(), reason="docker is not available")
+def needs_docker(test):
+    """A test that runs containers. Marked `docker`: on the shared developer
+    host, where Docker (like kind) is not to be used, run the suite with
+    `-m "not docker"`; CI (bench-tests.yaml) runs them. Docker's availability
+    is checked at the test's setup (tests/conftest.py `_require_docker`), so a
+    deselected test never calls `docker`, not even `docker info` at import."""
+    return pytest.mark.docker(pytest.mark.usefixtures("_require_docker")(test))
 
 
 def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page_ms=250, fresh=(),

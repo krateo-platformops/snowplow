@@ -35,6 +35,21 @@ if str(_E2E_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_BENCH_DIR))
 
 
+@pytest.fixture
+def _require_docker():
+    """tests/test_k6_830.py needs_docker: skip unless a Docker daemon answers."""
+    import shutil
+    import subprocess
+    if shutil.which("docker") is None or subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        pytest.skip("docker is not available")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "docker: runs containers (k6 / Chrome); deselect on the shared host with "
+                   "-m 'not docker', CI runs them (tests/test_k6_830.py needs_docker)")
+
+
 @pytest.fixture(autouse=True)
 def _stub_k8s_client_preflight(monkeypatch):
     """#320: cmd_check gate 8 / the cmd_phase6 pre-check call
