@@ -2,9 +2,9 @@ package pdftable
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,11 +19,23 @@ import (
 
 func render(t *testing.T, doc Document) pdfcheck.Doc {
 	t.Helper()
-	b, err := Render(doc)
+	return pdfcheck.Parse(t, renderBytes(t, doc))
+}
+
+// renderBytes renders doc and returns the file as WriteTo writes it,
+// checking it is exactly Len bytes.
+func renderBytes(t testing.TB, doc Document) []byte {
+	t.Helper()
+	p, err := Render(doc)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	return pdfcheck.Parse(t, b)
+	var b bytes.Buffer
+	n, err := p.WriteTo(&b)
+	if err != nil || int(n) != p.Len() || b.Len() != p.Len() {
+		t.Fatalf("WriteTo wrote %d bytes (err %v), Len is %d", n, err, p.Len())
+	}
+	return b.Bytes()
 }
 
 func rowsOf(n, cols int) [][]string {
@@ -276,12 +288,98 @@ func TestRenderWideTablesSplitIntoColumnBands(t *testing.T) {
 	}
 }
 
-// TestRenderHeaderTooTall: a header that cannot repeat on every page is an
-// error, never a clipped or endless document.
-func TestRenderHeaderTooTall(t *testing.T) {
-	_, err := Render(Document{Title: "t", Created: created, Header: []string{strings.Repeat("label ", 3000)}, Rows: rowsOf(1, 1)})
-	if !errors.Is(err, ErrHeaderTooTall) {
-		t.Fatalf("err = %v, want ErrHeaderTooTall", err)
+// TestRenderLongLabelsAlwaysRender: labels that would wrap taller than
+// half a page are set in a smaller type until they fit, so the table always
+// renders, with every label character drawn, the header on every page, and
+// at least the other half of every page left to rows. Shapes: 32 columns
+// of 120-character dot-paths (a band of narrow columns), and one 20,000-
+// character label (a full-width column).
+func TestRenderLongLabelsAlwaysRender(t *testing.T) {
+	path120 := func(c int) string {
+		return fmt.Sprintf("spec.c%02d.", c) + strings.Repeat("segment.", 14)[:110]
+	}
+	wide := make([]string, 32)
+	for c := range wide {
+		wide[c] = path120(c)
+	}
+	cases := []struct {
+		name   string
+		header []string
+	}{
+		{"32 columns of 120-character paths", wide},
+		{"one 20000-character label", []string{strings.Repeat("Lorem ipsum dolor sit amet ", 741)[:20000]}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			const n = 200
+			// Body cells short enough not to wrap in a 24-point column: the
+			// row number, then x.
+			rows := make([][]string, n)
+			for r := range rows {
+				rows[r] = make([]string, len(c.header))
+				for col := range rows[r] {
+					rows[r][col] = "x"
+				}
+				rows[r][0] = fmt.Sprintf("%03d", r)
+			}
+			d := render(t, Document{Title: "t", Created: created, Header: c.header, Rows: rows})
+			body := regexp.MustCompile(`^(\d{3}|x)$`)
+			seen := countCells(d, regexp.MustCompile(`\b\d{3}\b`))
+			if len(seen) != n {
+				t.Fatalf("rows drawn = %d, want %d", len(seen), n)
+			}
+			for i, p := range d.Pages {
+				// Header runs: everything above the first body run on the page.
+				var headerRuns []pdfcheck.Run
+				rowsHere := map[float64]bool{}
+				firstBodyY := -1.0
+				for _, r := range p.Runs {
+					if body.MatchString(r.S) {
+						rowsHere[r.Y] = true
+						firstBodyY = max(firstBodyY, r.Y)
+					}
+				}
+				for _, r := range p.Runs {
+					if r.Y > firstBodyY && !strings.HasPrefix(r.S, "Page ") && r.S != "t" {
+						headerRuns = append(headerRuns, r)
+					}
+				}
+				if len(headerRuns) == 0 {
+					t.Fatalf("page %d has no header", i+1)
+				}
+				// Reassemble each label from its column's runs (same X, top
+				// to bottom) and compare with the label.
+				byX := map[float64][]pdfcheck.Run{}
+				var xs []float64
+				for _, r := range headerRuns {
+					if _, ok := byX[r.X]; !ok {
+						xs = append(xs, r.X)
+					}
+					byX[r.X] = append(byX[r.X], r)
+				}
+				slices.Sort(xs)
+				if len(xs) != len(c.header) {
+					t.Fatalf("page %d: header columns = %d, want %d", i+1, len(xs), len(c.header))
+				}
+				top, bottom := 0.0, 1e9
+				for col, x := range xs {
+					var got strings.Builder
+					for _, r := range byX[x] {
+						got.WriteString(r.S)
+						top, bottom = max(top, r.Y+r.Size), min(bottom, r.Y)
+					}
+					if want := strings.ReplaceAll(c.header[col], " ", ""); strings.ReplaceAll(got.String(), " ", "") != want {
+						t.Fatalf("page %d column %d: label drawn as %q, want every character of %q", i+1, col, trim(got.String()), trim(c.header[col]))
+					}
+				}
+				if share := (top - bottom) / (bottomY - margin); share > headerShare {
+					t.Errorf("page %d: the header takes %.0f%% of the table area, more than %.0f%%", i+1, share*100, headerShare*100)
+				}
+				if i < len(d.Pages)-1 && len(rowsHere) < 15 {
+					t.Errorf("page %d holds %d rows: the header left too little room", i+1, len(rowsHere))
+				}
+			}
+		})
 	}
 }
 
@@ -306,7 +404,7 @@ func TestRenderEmptyShapes(t *testing.T) {
 func TestRenderConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
-	outs := make([][]byte, 8)
+	outs := make([]*PDF, 8)
 	for i := range errs {
 		wg.Add(1)
 		go func() {
@@ -319,7 +417,11 @@ func TestRenderConcurrent(t *testing.T) {
 		if errs[i] != nil {
 			t.Fatalf("render %d: %v", i, errs[i])
 		}
-		d := pdfcheck.Parse(t, outs[i])
+		var b bytes.Buffer
+		if _, err := outs[i].WriteTo(&b); err != nil {
+			t.Fatal(err)
+		}
+		d := pdfcheck.Parse(t, b.Bytes())
 		if !hasLine(d.Pages[0], fmt.Sprint("doc ", i)) {
 			t.Errorf("render %d has the wrong title", i)
 		}
@@ -335,6 +437,6 @@ func BenchmarkRender50Kx10(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.ReportMetric(float64(len(out))/(1<<20), "MiB-pdf")
+		b.ReportMetric(float64(out.Len())/(1<<20), "MiB-pdf")
 	}
 }

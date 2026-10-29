@@ -157,30 +157,39 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	callerPaginated := req.URL.Query().Get("perPage") != "" ||
 		req.URL.Query().Get("page") != ""
 
+	// Each fetched page's rows go to the format's sink as the page arrives.
+	// csv and json keep the decoded rows (their serializers need them); pdf
+	// turns them into cell text at once and drops them, so a pdf export
+	// never holds every page's decoded rows next to its cells.
 	var (
 		rows      []any
+		table     *pdfCells
 		pages     int
 		truncated bool
 	)
+	consume := func(page []any) { rows = append(rows, page...) }
+	if format == "pdf" {
+		table = newPDFCells(fields)
+		consume = table.add
+	}
 	if callerPaginated {
 		rec := r.dispatchCall(req, 0, 0)
 		if rec.status != http.StatusOK {
 			passThroughCallFailure(wri, rec)
 			return
 		}
-		var code int
-		var err error
-		rows, code, err = extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
+		pageRows, code, err := extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
 		if err != nil {
 			writeExportError(wri, code, err)
 			return
 		}
+		consume(pageRows)
 		pages = 1
 	} else {
 		var failed *exportRecorder
 		var code int
 		var err error
-		rows, pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath)
+		pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath, consume)
 		if failed != nil {
 			passThroughCallFailure(wri, failed)
 			return
@@ -190,9 +199,15 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	rowCount := len(rows)
+	if table != nil {
+		rowCount = table.len()
+	}
 
 	name := req.URL.Query().Get("name")
 	filename := attachmentName(req.URL.Query().Get("filename"), name, format)
+	// The audit closure captures the row count, never the rows: it must not
+	// keep a pdf export's rows reachable through the render.
 	auditExport := func(code int, err error) {
 		outcome := "success"
 		if err != nil {
@@ -207,12 +222,12 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			Outcome:   outcome,
 			Code:      code,
 			Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
-				format, len(rows), pages, truncated),
+				format, rowCount, pages, truncated),
 		})
 	}
 
 	if format == "pdf" {
-		code, err := servePDF(wri, req, rows, fields, labels, truncated, filename)
+		code, err := servePDF(wri, req, table, labels, rowCount, truncated, filename)
 		if err != nil {
 			log.Error("unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
 		}
@@ -247,16 +262,21 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	auditExport(http.StatusOK, err)
 }
 
-// servePDF renders the rows as a PDF report and sends it. Nothing is
+// renderPDF builds the document. A variable so a test can make the render
+// fail and observe that nothing was sent (build then send).
+var renderPDF = pdftable.Render
+
+// servePDF renders the cells as a PDF report and sends it. Nothing is
 // written to wri until the whole document has been built: a list that
 // reaches the bound, or a render failure, is answered with a JSON Status
 // and its code, never with a 200 and a partial or broken file. It returns
-// the status it answered with and, on failure, why.
+// the status it answered with and, on failure, why (including a failure
+// to send the built document).
 //
 // The report states the caller's username: the PDF body carries it on
 // purpose (who generated this report). It is never logged, and no error
 // returned here contains it.
-func servePDF(wri http.ResponseWriter, req *http.Request, rows []any, fields, labels []string, truncated bool, filename string) (int, error) {
+func servePDF(wri http.ResponseWriter, req *http.Request, table *pdfCells, labels []string, rowCount int, truncated bool, filename string) (int, error) {
 	if truncated {
 		err := fmt.Errorf("the list reaches the export bound of %d rows and a pdf export is never truncated: "+
 			"export it as csv or json (sent truncated and flagged %s), or a page at a time with page/perPage",
@@ -271,7 +291,7 @@ func servePDF(wri http.ResponseWriter, req *http.Request, rows []any, fields, la
 		return http.StatusInternalServerError, err
 	}
 
-	cols, cells := cellTable(rows, fields)
+	cols, cells := table.table()
 	header := cols
 	if labels != nil {
 		header = labels
@@ -281,35 +301,108 @@ func servePDF(wri http.ResponseWriter, req *http.Request, rows []any, fields, la
 		title = req.URL.Query().Get("name")
 	}
 	now := time.Now().UTC()
-	doc, err := pdftable.Render(pdftable.Document{
+	doc, err := renderPDF(pdftable.Document{
 		Title:   title,
 		Created: now,
 		Meta: []string{
 			"Generated: " + now.Format(time.RFC3339),
 			"User: " + user.Username,
-			fmt.Sprintf("Rows: %d", len(rows)),
+			fmt.Sprintf("Rows: %d", rowCount),
 		},
 		Header: header,
 		Rows:   cells,
 	})
 	if err != nil {
-		code := http.StatusInternalServerError
-		if errors.Is(err, pdftable.ErrHeaderTooTall) {
-			code = http.StatusBadRequest // the caller's labels or fields; shorter ones render
-		}
-		writeExportError(wri, code, err)
-		return code, err
+		writeExportError(wri, http.StatusInternalServerError, err)
+		return http.StatusInternalServerError, err
 	}
 
 	wri.Header().Set("Content-Type", "application/pdf")
 	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-	wri.Header().Set("Content-Length", strconv.Itoa(len(doc)))
+	wri.Header().Set("Content-Length", strconv.Itoa(doc.Len()))
 	wri.Header().Set("X-Content-Type-Options", "nosniff")
 	wri.WriteHeader(http.StatusOK)
-	if _, err := wri.Write(doc); err != nil {
+	if _, err := doc.WriteTo(wri); err != nil {
 		return http.StatusOK, fmt.Errorf("send pdf: %w", err)
 	}
 	return http.StatusOK, nil
+}
+
+// pdfCells collects a pdf export's rows as cell text, page by page, so each
+// fetched page's decoded rows can be dropped once converted. The columns
+// are those of csv (flattenRows): the explicit fields when given, else the
+// sorted union of the flattened keys, which is known only after the last
+// page; until then each row keeps its (column, text) pairs, the column
+// names shared.
+type pdfCells struct {
+	fields []string
+	cells  [][]string // with fields: one cell per field
+	pairs  [][]colText
+	cols   map[string]string // interned column names, without fields
+}
+
+type colText struct{ col, text string }
+
+func newPDFCells(fields []string) *pdfCells {
+	return &pdfCells{fields: fields, cols: map[string]string{}}
+}
+
+func (t *pdfCells) len() int { return len(t.cells) + len(t.pairs) }
+
+// add converts one page of rows.
+func (t *pdfCells) add(rows []any) {
+	for _, row := range rows {
+		fr := map[string]any{}
+		flattenLeaves(fr, "", row)
+		if len(t.fields) > 0 {
+			c := make([]string, len(t.fields))
+			for i, f := range t.fields {
+				c[i] = cellText(fr[f])
+			}
+			t.cells = append(t.cells, c)
+			continue
+		}
+		p := make([]colText, 0, len(fr))
+		for k, v := range fr {
+			name, ok := t.cols[k]
+			if !ok {
+				name = k
+				t.cols[k] = k
+			}
+			p = append(p, colText{col: name, text: cellText(v)})
+		}
+		t.pairs = append(t.pairs, p)
+	}
+}
+
+// table returns the columns and every row's cells in column order, and
+// lets go of its own copy of them.
+func (t *pdfCells) table() (cols []string, cells [][]string) {
+	if len(t.fields) > 0 {
+		cols, cells = t.fields, t.cells
+		t.cells = nil
+		return cols, cells
+	}
+	cols = make([]string, 0, len(t.cols))
+	for k := range t.cols {
+		cols = append(cols, k)
+	}
+	sort.Strings(cols)
+	index := make(map[string]int, len(cols))
+	for i, c := range cols {
+		index[c] = i
+	}
+	cells = make([][]string, len(t.pairs))
+	for r, p := range t.pairs {
+		row := make([]string, len(cols))
+		for _, ct := range p {
+			row[index[ct.col]] = ct.text
+		}
+		cells[r] = row
+		t.pairs[r] = nil // converted: release the pairs as we go
+	}
+	t.pairs, t.cols = nil, nil
+	return cols, cells
 }
 
 // dispatchCall re-dispatches the request through the /call lane
@@ -353,19 +446,21 @@ func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int) *expo
 //     exportPageSize*exportMaxPages rows) — the export is truncated and
 //     flagged via exportTruncatedHeader.
 //
+// Each kept page's rows are handed to consume as the page arrives.
+//
 // A non-200 inner page aborts the export; the /call failure envelope is
 // returned via failed for pass-through. On extraction errors code is the
 // HTTP status to respond with.
-func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string) (rows []any, pages int, truncated bool, failed *exportRecorder, code int, err error) {
+func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string, consume func([]any)) (pages int, truncated bool, failed *exportRecorder, code int, err error) {
 	prevFP := ""
 	for page := 1; page <= exportMaxPages; page++ {
 		rec := r.dispatchCall(req, page, exportPageSize)
 		if rec.status != http.StatusOK {
-			return nil, 0, false, rec, 0, nil
+			return 0, false, rec, 0, nil
 		}
 		pageRows, pcode, perr := extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
 		if perr != nil {
-			return nil, 0, false, nil, pcode, perr
+			return 0, false, nil, pcode, perr
 		}
 		fp := rowsFingerprint(pageRows)
 		if page > 1 && fp == prevFP {
@@ -374,7 +469,7 @@ func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string) (row
 			break
 		}
 		prevFP = fp
-		rows = append(rows, pageRows...)
+		consume(pageRows)
 		pages = page
 		if len(pageRows) != exportPageSize {
 			break // last (short) page, or a slice-ignoring full set
@@ -383,7 +478,7 @@ func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string) (row
 			truncated = true // full last-allowed page: more may exist
 		}
 	}
-	return rows, pages, truncated, nil, 0, nil
+	return pages, truncated, nil, 0, nil
 }
 
 // extractFromEnvelope decodes a /call response body and extracts the row
@@ -596,20 +691,6 @@ func csvCell(leaf any) string {
 		return neutralizeCSVCell(s)
 	}
 	return cellText(leaf)
-}
-
-// cellTable is the rows' cell text in column order (see flattenRows), for
-// the pdf table.
-func cellTable(rows []any, fields []string) (cols []string, cells [][]string) {
-	cols, flat := flattenRows(rows, fields)
-	cells = make([][]string, len(flat))
-	for r, fr := range flat {
-		cells[r] = make([]string, len(cols))
-		for i, c := range cols {
-			cells[r][i] = cellText(fr[c])
-		}
-	}
-	return cols, cells
 }
 
 // flattenLeaves flattens nested maps to dot-path keys holding the leaves

@@ -185,7 +185,10 @@ table report (`internal/support/pdftable`):
   breaks, or between characters for a word wider than the column) and are
   never clipped; a row taller than a page continues on the next one;
   columns that do not all fit across the page at a minimum width are
-  printed as bands of adjacent columns, each with all the rows;
+  printed as bands of adjacent columns, each with all the rows; column
+  names or labels that would wrap taller than half the table area are set
+  in a smaller type until they fit, so any table renders (the header
+  repeats on every page and is never split or clipped);
 - the Go fonts (regular and bold, BSD-3-Clause) embedded, so text in
   Latin, Greek and Cyrillic scripts renders and extracts as Unicode; a
   character the font has no glyph for (for example CJK) is drawn as a
@@ -193,15 +196,19 @@ table report (`internal/support/pdftable`):
 - no links, annotations, actions, scripts, forms or external references.
 
 The document is built completely before any byte is sent: a failure is an
-error status with a JSON `Status` body (for example `400` for column labels
-too long to repeat on every page), never a `200` with a broken file. The
-response is `application/pdf` with
-`Content-Disposition: attachment; filename="<sanitized>.pdf"`.
+error status with a JSON `Status` body (`422` at the bound, `500` for a
+render failure), never a `200` with a broken file. The response is
+`application/pdf` with `Content-Disposition: attachment;
+filename="<sanitized>.pdf"` and `X-Content-Type-Options: nosniff`.
 
 The username is in the PDF on purpose (who generated the report); it is
-never written to snowplow's logs. Building a 50,000-row × 10-column PDF
-peaks at about 165 MiB of heap, against about 128 MiB for the same export
-as CSV (`BenchmarkExport970_50Kx10_*`, `export_pdf_bench_test.go`).
+never written to snowplow's logs.
+
+Memory: a pdf export holds its rows as cell text only. Each fetched page is
+converted and its decoded rows are dropped, and the finished document is
+held once. Its peak is about the cells plus the document; see
+`BenchmarkExport970_Peak` in `export_pdf_bench_test.go` for the measured
+peaks at 50,000 × 10 cells.
 
 ## Examples
 

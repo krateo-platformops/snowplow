@@ -4,10 +4,35 @@ import (
 	"bytes"
 	"compress/zlib"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 	"unicode/utf16"
 )
+
+// PDF is a finished document: the bytes of the file in order, as parts.
+// The page content streams are parts of their own, moved in from the
+// layout rather than copied, so a document is held once, not twice.
+type PDF struct {
+	parts [][]byte
+	size  int
+}
+
+// Len is the size of the file in bytes.
+func (p *PDF) Len() int { return p.size }
+
+// WriteTo writes the file to w.
+func (p *PDF) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	for _, part := range p.parts {
+		m, err := w.Write(part)
+		n += int64(m)
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
 
 // Object numbers. The fixed objects come first; page i (0-based) is
 // firstPageObj+3i, followed by its body and footer content streams.
@@ -22,7 +47,7 @@ const (
 )
 
 // assemble writes the finished pages, fonts and metadata as one PDF.
-func (l *layout) assemble(doc Document) ([]byte, error) {
+func (l *layout) assemble(doc Document) (*PDF, error) {
 	w := &pdfWriter{}
 	w.buf.WriteString("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
 
@@ -64,7 +89,8 @@ func (l *layout) assemble(doc Document) ([]byte, error) {
 		page := firstPageObj + 3*i
 		w.object(page, fmt.Sprintf("<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents [%d 0 R %d 0 R] >>",
 			pagesObj, num(pageW), num(pageH), resources, page+1, page+2))
-		w.stream(page+1, "/Filter /FlateDecode", l.pages[i])
+		w.streamPart(page+1, "/Filter /FlateDecode", l.pages[i])
+		l.pages[i] = nil // the PDF holds it now
 		w.stream(page+2, "", footers[i])
 	}
 	return w.finish(infoObj)
@@ -166,17 +192,32 @@ func deflate(p []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// pdfWriter writes numbered objects and the cross-reference table.
+// pdfWriter writes numbered objects and the cross-reference table. Small
+// objects are written into buf; a large stream given to streamPart becomes
+// a part of its own, so its bytes are never copied.
 type pdfWriter struct {
-	buf     bytes.Buffer
+	parts   [][]byte
+	done    int          // bytes in parts
+	buf     bytes.Buffer // the part being written
 	offsets map[int]int
+}
+
+func (w *pdfWriter) offset() int { return w.done + w.buf.Len() }
+
+// cut closes the part being written.
+func (w *pdfWriter) cut() {
+	if w.buf.Len() > 0 {
+		w.done += w.buf.Len()
+		w.parts = append(w.parts, w.buf.Bytes())
+		w.buf = bytes.Buffer{} // the part keeps the old buffer's bytes
+	}
 }
 
 func (w *pdfWriter) begin(n int) {
 	if w.offsets == nil {
 		w.offsets = map[int]int{}
 	}
-	w.offsets[n] = w.buf.Len()
+	w.offsets[n] = w.offset()
 	fmt.Fprintf(&w.buf, "%d 0 obj\n", n)
 }
 
@@ -193,11 +234,21 @@ func (w *pdfWriter) stream(n int, dict string, data []byte) {
 	w.buf.WriteString("\nendstream\nendobj\n")
 }
 
+// streamPart is stream with data kept as a part of its own, not copied.
+func (w *pdfWriter) streamPart(n int, dict string, data []byte) {
+	w.begin(n)
+	fmt.Fprintf(&w.buf, "<< /Length %d %s>>\nstream\n", len(data), dict+" ")
+	w.cut()
+	w.parts = append(w.parts, data)
+	w.done += len(data)
+	w.buf.WriteString("\nendstream\nendobj\n")
+}
+
 // finish writes the cross-reference table and trailer. Every object number
 // from 1 to the highest must have been written.
-func (w *pdfWriter) finish(info int) ([]byte, error) {
+func (w *pdfWriter) finish(info int) (*PDF, error) {
 	size := len(w.offsets) + 1
-	xref := w.buf.Len()
+	xref := w.offset()
 	fmt.Fprintf(&w.buf, "xref\n0 %d\n0000000000 65535 f \n", size)
 	for n := 1; n < size; n++ {
 		off, ok := w.offsets[n]
@@ -207,7 +258,8 @@ func (w *pdfWriter) finish(info int) ([]byte, error) {
 		fmt.Fprintf(&w.buf, "%010d 00000 n \n", off)
 	}
 	fmt.Fprintf(&w.buf, "trailer\n<< /Size %d /Root %d 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n", size, catalogObj, info, xref)
-	return w.buf.Bytes(), nil
+	w.cut()
+	return &PDF{parts: w.parts, size: w.done}, nil
 }
 
 // programCache holds a parsedFont's deflated font file, computed once.

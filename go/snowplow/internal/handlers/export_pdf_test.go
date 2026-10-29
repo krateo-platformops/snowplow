@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"github.com/krateo-platformops/snowplow/internal/support/pdftable"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/pdfcheck"
 	"go.opentelemetry.io/otel/log/logtest"
 	"golang.org/x/image/font"
@@ -273,6 +275,9 @@ func TestExport970_ResponseHeaders(t *testing.T) {
 	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
 		t.Errorf("Content-Length = %q, body is %d bytes", cl, rec.Body.Len())
 	}
+	if v := rec.Header().Get("X-Content-Type-Options"); v != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", v)
+	}
 
 	rec, _ = exportAs(t, recordingCall(itemsEnvelope(2), &queries), "/export?resource=restactions&name=demo&format=PDF")
 	parsePDF(t, rec)
@@ -356,15 +361,15 @@ func TestExport970_BoundIsAnErrorNeverATruncatedPDF(t *testing.T) {
 	for _, total := range []int{6, 100} {
 		var calls [][2]int
 		rec, _ := exportAs(t, pagedCall(t, total, &calls), "/export?resource=restactions&name=demo&format=pdf")
-		if rec.Code != exportBoundStatus {
-			t.Fatalf("%d rows: status = %d, want %d", total, rec.Code, exportBoundStatus)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("%d rows: status = %d, want 422", total, rec.Code)
 		}
 		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 			t.Errorf("%d rows: Content-Type = %q, want application/json", total, ct)
 		}
 		var st map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil || st["kind"] != "Status" || st["code"] != float64(exportBoundStatus) {
-			t.Errorf("%d rows: body is not a Status with code %d: %s", total, exportBoundStatus, rec.Body.String())
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil || st["kind"] != "Status" || st["code"] != float64(http.StatusUnprocessableEntity) {
+			t.Errorf("%d rows: body is not a Status with code 422: %s", total, rec.Body.String())
 		}
 		if !strings.Contains(fmt.Sprint(st["message"]), "6 rows") {
 			t.Errorf("%d rows: message does not name the bound: %v", total, st["message"])
@@ -399,6 +404,14 @@ func (w *writeOrder) WriteHeader(code int) {
 	w.ResponseRecorder.WriteHeader(code)
 }
 
+// failRender makes the pdf render fail for one test.
+func failRender(t *testing.T) {
+	t.Helper()
+	orig := renderPDF
+	renderPDF = func(pdftable.Document) (*pdftable.PDF, error) { return nil, errors.New("render failed") }
+	t.Cleanup(func() { renderPDF = orig })
+}
+
 // TestExport970_BuildThenSend — rule 4: a document that fails to render is
 // answered with an error status and a JSON Status — the handler wrote no
 // 200 and no PDF byte before the render failed — and the AuditEvent
@@ -408,19 +421,21 @@ func TestExport970_BuildThenSend(t *testing.T) {
 	audit.SetDefault(audit.New(recorder.Logger("test-970")))
 	t.Cleanup(func() { audit.SetDefault(nil) })
 
-	// A label so long that the header row (repeated on every page) cannot
-	// fit: the render fails after the rows were collected.
-	label := strings.Repeat("a very long column label ", 400)
+	// The render fails after the rows were collected and converted.
 	var queries []url.Values
-	req := httptest.NewRequest(http.MethodGet, "/export?resource=restactions&name=demo&namespace=ns&format=pdf&fields=id&header="+url.QueryEscape(label), nil)
+	req := httptest.NewRequest(http.MethodGet, "/export?resource=restactions&name=demo&namespace=ns&format=pdf&fields=id", nil)
 	req = req.WithContext(xcontext.BuildContext(req.Context(),
 		xcontext.WithLogger(slog.New(slog.DiscardHandler)),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: pdfUser})))
 	w := &writeOrder{ResponseRecorder: httptest.NewRecorder()}
-	Export(recordingCall(itemsEnvelope(3), &queries)).ServeHTTP(w, req)
+	func() {
+		failRender(t)
+		Export(recordingCall(itemsEnvelope(3), &queries)).ServeHTTP(w, req)
+	}()
+	renderPDF = pdftable.Render
 
-	if !reflect.DeepEqual(w.codes, []int{http.StatusBadRequest}) {
-		t.Errorf("statuses written = %v, want exactly [400]: nothing may be sent before the document is built", w.codes)
+	if !reflect.DeepEqual(w.codes, []int{http.StatusInternalServerError}) {
+		t.Errorf("statuses written = %v, want exactly [500]: nothing may be sent before the document is built", w.codes)
 	}
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" || bytes.Contains(w.Body.Bytes(), []byte("%PDF")) {
 		t.Errorf("Content-Type %q, body %q: want a JSON Status and no PDF bytes", ct, trim(w.Body.String()))
@@ -457,9 +472,9 @@ func TestExport970_BuildThenSend(t *testing.T) {
 		}
 	}
 	want := []ev{
-		{"failure", 400, "format=pdf rows=3 pages=1 truncated=false"},
+		{"failure", 500, "format=pdf rows=3 pages=1 truncated=false"},
 		{"success", 200, "format=pdf rows=3 pages=1 truncated=false"},
-		{"failure", int64(exportBoundStatus), "format=pdf rows=6 pages=2 truncated=true"},
+		{"failure", http.StatusUnprocessableEntity, "format=pdf rows=6 pages=2 truncated=true"},
 		{"success", 200, "format=csv rows=6 pages=2 truncated=true"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -616,7 +631,11 @@ func TestExport970_NeverLogsTheUsername(t *testing.T) {
 	var all bytes.Buffer
 	_, logs := exportAs(t, recordingCall(itemsEnvelope(3), &queries), "/export?resource=restactions&name=demo&format=pdf")
 	all.Write(logs.Bytes())
-	_, logs = exportAs(t, recordingCall(itemsEnvelope(3), &queries), "/export?resource=restactions&name=demo&format=pdf&fields=id&header="+url.QueryEscape(strings.Repeat("label ", 3000)))
+	func() {
+		failRender(t)
+		_, logs = exportAs(t, recordingCall(itemsEnvelope(3), &queries), "/export?resource=restactions&name=demo&format=pdf&fields=id")
+	}()
+	renderPDF = pdftable.Render
 	all.Write(logs.Bytes())
 	setExportPaging(t, 3, 2)
 	var calls [][2]int
@@ -629,6 +648,82 @@ func TestExport970_NeverLogsTheUsername(t *testing.T) {
 	for _, needle := range []string{pdfUser, "jürgen", "User: "} {
 		if bytes.Contains(all.Bytes(), []byte(needle)) {
 			t.Errorf("a log line carries the caller identity (%q):\n%s", needle, all.String())
+		}
+	}
+}
+
+// failingWriter accepts the status and headers and fails every body write,
+// as a connection the client dropped mid-download does.
+type failingWriter struct {
+	header http.Header
+	code   int
+	writes int
+}
+
+func (w *failingWriter) Header() http.Header  { return w.header }
+func (w *failingWriter) WriteHeader(code int) { w.code = code }
+func (w *failingWriter) Write([]byte) (int, error) {
+	w.writes++
+	return 0, errors.New("connection reset by peer")
+}
+
+// TestExport970_SendFailureIsReported — rule 4: when the built document
+// cannot be sent (the write fails mid-PDF), the error is not swallowed: it
+// is logged and the AuditEvent records outcome=failure (with the 200 that
+// was already sent).
+func TestExport970_SendFailureIsReported(t *testing.T) {
+	recorder := logtest.NewRecorder()
+	audit.SetDefault(audit.New(recorder.Logger("test-970")))
+	t.Cleanup(func() { audit.SetDefault(nil) })
+
+	var logs bytes.Buffer
+	var queries []url.Values
+	req := httptest.NewRequest(http.MethodGet, "/export?resource=restactions&name=demo&namespace=ns&format=pdf", nil)
+	req = req.WithContext(xcontext.BuildContext(req.Context(),
+		xcontext.WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: pdfUser})))
+	w := &failingWriter{header: http.Header{}}
+	Export(recordingCall(itemsEnvelope(3), &queries)).ServeHTTP(w, req)
+
+	if w.code != http.StatusOK || w.writes == 0 {
+		t.Fatalf("status %d after %d writes: the document should have been built and its send attempted", w.code, w.writes)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("unable to serve pdf export")) || !bytes.Contains(logs.Bytes(), []byte("send pdf: connection reset by peer")) {
+		t.Errorf("the send failure was not logged:\n%s", logs.String())
+	}
+	var outcomes []string
+	for _, recs := range recorder.Result() {
+		for _, r := range recs {
+			for _, kv := range r.Attributes {
+				if kv.Key == "outcome" {
+					outcomes = append(outcomes, kv.Value.AsString())
+				}
+			}
+		}
+	}
+	if !reflect.DeepEqual(outcomes, []string{"failure"}) {
+		t.Errorf("audit outcomes = %v, want [failure] for a document that never arrived", outcomes)
+	}
+}
+
+// TestExport970_LongColumnNamesRender — the header never refuses a table:
+// 32 columns whose auto-detected dot-paths are 120 characters long (no
+// labels) render as a 200 PDF with every column's name in the header.
+func TestExport970_LongColumnNamesRender(t *testing.T) {
+	keys := make([]string, 32)
+	row := map[string]any{}
+	for c := range keys {
+		keys[c] = fmt.Sprintf("k%02d_", c) + strings.Repeat("abcdefghij", 12)[:116]
+		row[keys[c]] = "v"
+	}
+	body, _ := json.Marshal(map[string]any{"items": []any{row, row}})
+	var queries []url.Values
+	rec, _ := exportAs(t, recordingCall(string(body), &queries), "/export?resource=restactions&name=demo&format=pdf")
+	d := parsePDF(t, rec)
+	text := strings.ReplaceAll(strings.ReplaceAll(d.Pages[0].Text(), "\n", ""), pdfcheck.Sep, "")
+	for _, k := range keys {
+		if !strings.Contains(text, k[:4]) {
+			t.Errorf("column %s is missing from the header", k[:4])
 		}
 	}
 }

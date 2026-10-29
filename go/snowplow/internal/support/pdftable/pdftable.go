@@ -8,13 +8,13 @@
 //
 // Render builds the whole document in memory and returns it, or an error.
 // It never returns a partial document, so a caller can send nothing until
-// Render has succeeded.
+// Render has succeeded. A table always renders: wrapping, column bands and
+// a smaller header type keep every cell and label on the page.
 package pdftable
 
 import (
 	"bytes"
 	"compress/zlib"
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -35,11 +35,6 @@ type Document struct {
 	// Rows holds the cell text of every row, one cell per column.
 	Rows [][]string
 }
-
-// ErrHeaderTooTall reports column labels whose wrapped height leaves less
-// than half of a page for rows. The header row is repeated on every page,
-// so it cannot be split across pages, and it is never clipped.
-var ErrHeaderTooTall = errors.New("pdftable: the column header row does not fit in half a page")
 
 // Page geometry, in PDF points (1/72 in). A4 landscape is 297 x 210 mm.
 const (
@@ -64,10 +59,17 @@ const (
 	// width, they are split into bands of adjacent columns, each band
 	// printed as its own run of pages with all the rows.
 	minColW = 24.0
+
+	// headerShare is the most of a page's table area the header row may
+	// take. The header repeats at the top of every page and is never split
+	// or clipped, so labels that would wrap taller than this are set in a
+	// smaller type until they fit, leaving at least the rest of every page
+	// to rows.
+	headerShare = 0.5
 )
 
 // Render lays the document out and returns the complete PDF.
-func Render(doc Document) ([]byte, error) {
+func Render(doc Document) (*PDF, error) {
 	reg, bold, err := loadFonts()
 	if err != nil {
 		return nil, err
@@ -93,6 +95,8 @@ func Render(doc Document) ([]byte, error) {
 // compressed content stream of every finished page.
 type layout struct {
 	reg, bold *face
+	hs        float64    // the current band's header type size, see headerSize
+	hlines    [][]string // the current band's labels wrapped at hs, per column
 
 	pages [][]byte     // finished pages' compressed content streams
 	cur   bytes.Buffer // content stream of the page being drawn
@@ -134,20 +138,19 @@ func (l *layout) run(doc Document) error {
 		if len(bands) > 1 {
 			caption = fmt.Sprintf("Columns %d–%d of %d", band[0]+1, band[1], ncols)
 		}
-		if l.headerHeight(header) > (bottomY-margin)/2 {
-			return ErrHeaderTooTall
-		}
+		l.hs = l.headerSize(header)
+		l.hlines = l.wrapLabels(header, l.hs)
 		// A band starts on a fresh page, and so does the first one when the
 		// title block leaves no room for the header and one row under it.
-		if bi > 0 || l.y+l.tableStartHeight(header, caption)+bodySize*leading+2*padY > bottomY {
+		if bi > 0 || l.y+l.tableStartHeight(caption)+bodySize*leading+2*padY > bottomY {
 			if err := l.finishPage(); err != nil {
 				return err
 			}
 			l.newPage()
 		}
-		l.tableStart(header, caption)
+		l.tableStart(caption)
 		for _, row := range doc.Rows {
-			if err := l.bodyRow(row[band[0]:band[1]], header, caption); err != nil {
+			if err := l.bodyRow(row[band[0]:band[1]], caption); err != nil {
 				return err
 			}
 		}
@@ -299,35 +302,71 @@ func (l *layout) titleBlock(doc Document) error {
 }
 
 // tableStartHeight is the height tableStart takes on a page.
-func (l *layout) tableStartHeight(header []string, caption string) float64 {
-	h := l.headerHeight(header)
+func (l *layout) tableStartHeight(caption string) float64 {
+	h := l.headerHeight()
 	if caption != "" {
 		h += metaSize*leading + 2
 	}
 	return h
 }
 
-func (l *layout) headerHeight(header []string) float64 {
-	n := 1
-	for c, h := range header {
-		n = max(n, len(l.bold.wrap(h, headSize, l.colX[c+1]-l.colX[c]-2*padX)))
+// headerSize is the type size for the band's labels: headSize when they
+// fit in headerShare of the table area, else the largest size that does
+// (found by bisection; a smaller size always fits, since the wrapped
+// height shrinks with the size and reaches zero).
+func (l *layout) headerSize(header []string) float64 {
+	budget := (bottomY - margin) * headerShare
+	if l.headerHeightAt(header, headSize) <= budget {
+		return headSize
 	}
-	return float64(n)*headSize*leading + 2*padY
+	lo, hi := 0.0, headSize
+	for range 24 { // headSize/2^24: far below any visible difference
+		mid := (lo + hi) / 2
+		if l.headerHeightAt(header, mid) <= budget {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// headerHeight is the height of the current band's header row.
+func (l *layout) headerHeight() float64 { return linesHeight(l.hlines, l.hs) }
+
+func (l *layout) headerHeightAt(header []string, size float64) float64 {
+	return linesHeight(l.wrapLabels(header, size), size)
+}
+
+func (l *layout) wrapLabels(header []string, size float64) [][]string {
+	lines := make([][]string, len(header))
+	for c, h := range header {
+		lines[c] = l.bold.wrap(h, size, l.colX[c+1]-l.colX[c]-2*padX)
+	}
+	return lines
+}
+
+func linesHeight(lines [][]string, size float64) float64 {
+	n := 1
+	for _, ls := range lines {
+		n = max(n, len(ls))
+	}
+	return float64(n)*size*leading + 2*padY
 }
 
 // tableStart prints the band caption and the header row at the current
 // position of a page.
-func (l *layout) tableStart(header []string, caption string) {
+func (l *layout) tableStart(caption string) {
 	if caption != "" {
 		l.text(l.reg, metaSize, margin, l.y, caption)
 		l.y += metaSize*leading + 2
 	}
 	l.tableTop = l.y
-	h := l.headerHeight(header)
+	h := l.headerHeight()
 	fmt.Fprintf(&l.cur, "0.9 g %s %s %s %s re f 0 g\n",
 		num(margin), num(pageH-l.y-h), num(l.colX[len(l.colX)-1]-margin), num(h))
 	l.line(margin, l.y, l.colX[len(l.colX)-1], l.y)
-	l.headerCells(header)
+	l.headerCells()
 	l.y += h
 	l.line(margin, l.y, l.colX[len(l.colX)-1], l.y)
 }
@@ -335,7 +374,7 @@ func (l *layout) tableStart(header []string, caption string) {
 // bodyRow prints one row. A row that does not fit under the rows already
 // on the page moves to a new page; a row taller than a whole page is split
 // across pages, line by line.
-func (l *layout) bodyRow(row, header []string, caption string) error {
+func (l *layout) bodyRow(row []string, caption string) error {
 	lines := make([][]string, len(row))
 	n := 1
 	for c, cell := range row {
@@ -350,7 +389,7 @@ func (l *layout) bodyRow(row, header []string, caption string) error {
 				return err
 			}
 			l.newPage()
-			l.tableStart(header, caption)
+			l.tableStart(caption)
 			continue
 		}
 		k := min(fit, n-done)
@@ -371,12 +410,12 @@ func (l *layout) bodyRow(row, header []string, caption string) error {
 }
 
 // headerCells prints every label's wrapped lines in its column.
-func (l *layout) headerCells(header []string) {
-	lh := headSize * leading
+func (l *layout) headerCells() {
+	lh := l.hs * leading
 	l.cur.WriteString("BT\n")
-	for c, label := range header {
-		for i, line := range l.bold.wrap(label, headSize, l.colX[c+1]-l.colX[c]-2*padX) {
-			l.textInBT(l.bold, headSize, l.colX[c]+padX, l.y+padY+float64(i)*lh, line)
+	for c, lines := range l.hlines {
+		for i, line := range lines {
+			l.textInBT(l.bold, l.hs, l.colX[c]+padX, l.y+padY+float64(i)*lh, line)
 		}
 	}
 	l.cur.WriteString("ET\n")
