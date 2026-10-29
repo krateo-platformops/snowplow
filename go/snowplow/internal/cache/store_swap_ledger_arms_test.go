@@ -589,8 +589,16 @@ func TestStoreSwap_K16f_WindowHolders(t *testing.T) {
 	// so nothing holds the window: it ends at the install although the
 	// dependent's refresh is still held (C5a). X45 makes it hold.
 	r.waitFor("the window to end with the refresh still pending", func() bool { return windowEnded(reasonDivergence) })
-	if e, _ := openLedgerForTest(); e != 1 {
-		t.Fatalf("K16f RED (X46): %d entries open, want 1 (the armable dependent only; the %s cell opens none)", e, content)
+	// Every entry the ledger EVER opened for the build: still open, or closed
+	// under any label. A non-armable entry X46 opens is closed as known_stale
+	// by its own dequeue soon after the swap, so counting the open ones alone
+	// would see it only by timing.
+	opened, _ := openLedgerForTest()
+	for _, c := range StoreSwapCloses {
+		opened += int(closes(reasonDivergence, c))
+	}
+	if opened != 1 {
+		t.Fatalf("K16f RED (X46): the ledger opened %d entries, want 1 (the armable dependent only; the %s cell opens none)", opened, content)
 	}
 	rel()
 	r.waitFor("refreshed", func() bool { return r.body(unviewed) == `{"v":"x"}` })
