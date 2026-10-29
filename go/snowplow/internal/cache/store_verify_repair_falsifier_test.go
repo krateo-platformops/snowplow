@@ -283,6 +283,12 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	// This cluster owns silentWatchLatest from here on: only ITS watches are
+	// recorded there, so a reflector of an earlier arm's cluster (stopped, or
+	// still winding down) can never hand an arm a watch it does not own.
+	owner := new(byte)
+	silentWatchOwner.Store(owner)
+	silentWatchLatest.Store(nil)
 	for _, o := range objs {
 		if _, err := dyn.Resource(gvr).Namespace(o.GetNamespace()).
 			Create(context.Background(), o, metav1.CreateOptions{}); err != nil {
@@ -316,7 +322,7 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 			w.Action(e.Type, e.Object)
 		}
 		t.Cleanup(w.Stop)
-		if a.GetResource() == gvr {
+		if a.GetResource() == gvr && silentWatchOwner.Load() == owner {
 			silentWatchLatest.Store(w)
 		}
 		return true, w, nil
@@ -395,6 +401,14 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 	if err := rw.WaitForCacheSync(context.Background(), verifyBound); err != nil {
 		t.Fatalf("precondition: the fixture's informers did not all sync: %v", err)
 	}
+	// The sync is the LIST; an arm that writes to the watch needs the WATCH
+	// this informer opened after it, not an earlier cluster's (#923 review F2:
+	// a send reached a previous arm's stopped watch, "send on closed channel").
+	for deadline := time.Now().Add(verifyBound); silentWatchLatest.Load() == nil; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("precondition: %s's informer never opened its watch", gvr)
+		}
+	}
 	// Populates lastSyncRV, which is the resourceVersion the forced LIST must
 	// carry. With no discovery client, conjunct 4 is degraded-true and the
 	// refresh is purely the conjunct-3 / lastSyncRV update.
@@ -412,6 +426,10 @@ func silentWatchClusterFor(t *testing.T, gvr schema.GroupVersionResource, owned 
 // while a forced pass's LIST is in flight, which is the only way the store can
 // move past the LIST.
 var silentWatchLatest atomic.Pointer[watch.FakeWatcher]
+
+// silentWatchOwner is the fake cluster that owns silentWatchLatest: the one the
+// running arm built. A watch opened by any other cluster is not recorded.
+var silentWatchOwner atomic.Pointer[byte]
 
 // clusterListRV is the collection resourceVersion the fake cluster reports on
 // every LIST. Fixed rather than incrementing: the arms assert that the forced

@@ -207,8 +207,9 @@ type deliveryLog struct {
 	closed     bool
 	wake       chan struct{}
 	stop       chan struct{}
-	// sweeps counts the resolver's judgements of its pending set, so a test
-	// can tell "the resolver has looked" from "the resolver has not run yet".
+	// sweeps counts the resolver's COMPLETED judgements of its pending set —
+	// settled, published and counted (or found superseded) — so a test can
+	// tell "the resolver has finished looking" from "it has not run yet".
 	sweeps atomic.Uint64
 }
 
@@ -382,16 +383,13 @@ func (l *deliveryLog) judgePending() (lost []divergenceCandidate, release func()
 		return nil, func() {}
 	}
 
-	var settled []string
-	var resolvedReceived uint64
+	verdicts := make([]settleVerdict, 0, len(keys))
 	for key, p := range keys {
 		switch v := judgeKey(l.indexer, l, pos, key, p.read); v.outcome {
 		case outcomeLost:
-			lost = append(lost, divergenceCandidate{key, v.class})
-			settled = append(settled, key)
+			verdicts = append(verdicts, settleVerdict{key: key, kind: settleLost, class: v.class})
 		case outcomeAgree, outcomeStoreAhead:
-			settled = append(settled, key)
-			resolvedReceived++
+			verdicts = append(verdicts, settleVerdict{key: key, kind: settleReceived})
 		}
 	}
 
@@ -400,23 +398,75 @@ func (l *deliveryLog) judgePending() (lost []divergenceCandidate, release func()
 		l.mu.Unlock()
 		return nil, func() {} // closed meanwhile
 	}
-	for _, k := range settled {
-		delete(l.pending, k)
-	}
-	l.publishing += len(lost)
+	st := l.settleLocked(verdicts)
 	empty := len(l.pending) == 0
 	l.mu.Unlock()
-	storePendingResolvedLostTotal.Add(uint64(len(lost)))
-	storePendingResolvedReceivedTotal.Add(resolvedReceived)
+	storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
+	storePendingResolvedReceivedTotal.Add(st.received)
 	// The settled keys that are not losses are published (their counter has
 	// moved): they leave the gauge now. The losses leave it at release.
-	storePendingKeys.Add(-int64(len(settled) - len(lost)))
+	storePendingKeys.Add(-int64(st.removed - len(st.lost)))
 	if empty {
 		setPendingFlag(l.gvr, false)
 	}
-	n := len(lost)
+	n := len(st.lost)
 	var once sync.Once
-	return lost, func() { once.Do(func() { l.lossesPublished(n) }) }
+	return st.lost, func() { once.Do(func() { l.lossesPublished(n) }) }
+}
+
+// settleKind is how a judged pending key settles.
+type settleKind uint8
+
+const (
+	settleLost      settleKind = iota // a loss: published, then repaired
+	settleReceived                    // the store has caught up with the read
+	settleUndecided                   // not comparable: no later event can order it
+)
+
+// settleVerdict is one pending key's verdict, decided OUTSIDE l.mu against a
+// copy of the pending set.
+type settleVerdict struct {
+	key   string
+	kind  settleKind
+	class divergenceClass
+}
+
+// settlement is what ONE settle removed from the pending set: only the keys this
+// caller removed, and their outcomes.
+type settlement struct {
+	lost      []divergenceCandidate
+	received  uint64
+	undecided uint64
+	removed   int
+}
+
+// settleLocked applies verdicts under l.mu by THE ONE RULE of the pending set:
+// a key is settled exactly once, by whichever path removes it from l.pending.
+// The resolver and the next pass's judgePending each judge their own copy of
+// the set outside the lock, so both can judge the same key; a key already gone
+// when the verdict is applied was settled by the other path (or dropped by
+// supersede or close, which also move pgen) and is skipped here: no count, no
+// publish, no gauge decrement. The losses removed here join publishing (see
+// storePendingKeys' invariant). Callers hold l.mu and have checked pgen.
+func (l *deliveryLog) settleLocked(verdicts []settleVerdict) settlement {
+	var st settlement
+	for _, v := range verdicts {
+		if _, still := l.pending[v.key]; !still {
+			continue // settled by the other path
+		}
+		delete(l.pending, v.key)
+		st.removed++
+		switch v.kind {
+		case settleLost:
+			st.lost = append(st.lost, divergenceCandidate{v.key, v.class})
+		case settleReceived:
+			st.received++
+		case settleUndecided:
+			st.undecided++
+		}
+	}
+	l.publishing += len(st.lost)
+	return st
 }
 
 // lossesPublished removes n resolved losses from the pending counts once their
@@ -617,39 +667,31 @@ func (l *deliveryLog) resolve() {
 		}
 		l.mu.Unlock()
 
-		var lost []divergenceCandidate
-		var settled []string
-		var resolvedReceived, undecided uint64
+		verdicts := make([]settleVerdict, 0, len(keys))
 		pos := positionOf(l.appliedPosition()) // first (store_verify_judge.go)
 		for key, p := range keys {
 			switch v := judgeKey(l.indexer, l, pos, key, p.read); v.outcome {
 			case outcomeLost:
-				lost = append(lost, divergenceCandidate{key, v.class})
-				settled = append(settled, key)
+				verdicts = append(verdicts, settleVerdict{key: key, kind: settleLost, class: v.class})
 			case outcomeAgree, outcomeStoreAhead:
-				settled = append(settled, key)
-				resolvedReceived++
+				verdicts = append(verdicts, settleVerdict{key: key, kind: settleReceived})
 			case outcomeUndecided:
 				if !v.reverify {
 					// Not comparable: no later event can order it.
-					settled = append(settled, key)
-					undecided++
+					verdicts = append(verdicts, settleVerdict{key: key, kind: settleUndecided})
 				}
 			}
 		}
 
-		l.sweeps.Add(1)
 		l.mu.Lock()
 		if l.pgen != gen {
 			// Superseded by a newer pass, or closed, while judging: its read
 			// is the one that counts now.
 			l.mu.Unlock()
+			l.sweeps.Add(1)
 			continue
 		}
-		for _, k := range settled {
-			delete(l.pending, k)
-		}
-		l.publishing += len(lost)
+		st := l.settleLocked(verdicts)
 		empty := len(l.pending) == 0
 		if empty {
 			l.running = false
@@ -658,17 +700,19 @@ func (l *deliveryLog) resolve() {
 		// PUBLISH FIRST, DECREMENT LAST (storePendingKeys' invariant): every
 		// outcome counter moves and every loss is recorded and its repair
 		// enqueued before the settled keys leave the gauge.
-		storePendingResolvedReceivedTotal.Add(resolvedReceived)
-		storeUndecidedTotal.Add(undecided)
-		if len(lost) > 0 {
-			storePendingResolvedLostTotal.Add(uint64(len(lost)))
-			publishResolvedLoss(l.gvr, lost)
+		storePendingResolvedReceivedTotal.Add(st.received)
+		storeUndecidedTotal.Add(st.undecided)
+		if len(st.lost) > 0 {
+			storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
+			publishResolvedLoss(l.gvr, st.lost)
 			if fn := resolvedLossPublishedHookForTest.Load(); fn != nil {
 				(*fn)()
 			}
 		}
-		storePendingKeys.Add(-int64(len(settled) - len(lost)))
-		l.lossesPublished(len(lost))
+		storePendingKeys.Add(-int64(st.removed - len(st.lost)))
+		l.lossesPublished(len(st.lost))
+		// The judgement is complete: settled, published and counted.
+		l.sweeps.Add(1)
 		if empty {
 			setPendingFlag(l.gvr, false)
 			return
