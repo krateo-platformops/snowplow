@@ -243,6 +243,9 @@ var cacheAllow443 = map[string]cacheClass443{
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
+	// #988 — pure ctx value read / stamp of the fall-through reason the wire
+	// counter labels a LIST with: no cache state is written.
+	"FallthroughReasonOf": readOnly443, "WithFallthroughReason": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
 	// #561 removed "WithInformerOnlyReads" from this table when it deleted

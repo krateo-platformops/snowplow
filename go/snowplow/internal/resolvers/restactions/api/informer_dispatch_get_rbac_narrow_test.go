@@ -188,7 +188,7 @@ func TestDispatchViaInformer_RBACNarrowing_GetDeniedNamespace(t *testing.T) {
 
 	// AUTHORIZED namespace — the narrow user has a `get` grant; the
 	// pivot serves the object. (Both pre- and post-fix.)
-	raw, served := dispatchViaInformer(ctx, buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
+	raw, served, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 	if !served {
 		t.Fatalf("authorized GET: expected served=true; got served=false")
 	}
@@ -197,7 +197,7 @@ func TestDispatchViaInformer_RBACNarrowing_GetDeniedNamespace(t *testing.T) {
 	}
 
 	// DENIED namespace — the narrow user has NO `get` grant.
-	raw, served = dispatchViaInformer(ctx, buildCall(http.MethodGet, getByNamePath("bench-ns-1", "bench-ns-1-x")))
+	raw, served, _ = dispatchViaInformer(ctx, buildCall(http.MethodGet, getByNamePath("bench-ns-1", "bench-ns-1-x")))
 
 	if rbacNarrowBaseline {
 		// NEGATIVE CONTROL (pre-fix behaviour). The pivot GET branch
@@ -234,7 +234,7 @@ func TestDispatchViaInformer_RBACFailClosed_GetNilIdentity(t *testing.T) {
 	// No UserInfo attached — context.Background() only. Use an object
 	// in an AUTHORIZED namespace so the ONLY thing preventing a serve
 	// is the missing identity.
-	raw, served := dispatchViaInformer(context.Background(),
+	raw, served, _ := dispatchViaInformer(context.Background(),
 		buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 
 	if rbacNarrowBaseline {
@@ -325,7 +325,7 @@ func TestDispatchViaInformer_RBACNarrowing_GetGroupGrant(t *testing.T) {
 	}
 
 	// User "alice" is in group "devs".
-	raw, served := dispatchViaInformer(ctxWithUser("alice", "devs"),
+	raw, served, _ := dispatchViaInformer(ctxWithUser("alice", "devs"),
 		buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 	if !served {
 		t.Fatalf("group-grant GET: expected served=true")

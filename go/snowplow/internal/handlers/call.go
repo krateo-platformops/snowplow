@@ -207,12 +207,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if opts.raw {
 		reason = cache.ReasonRawRead
 	}
-	cache.RecordApiserverFallthrough(req.Context(), reason, "")
+	// #988 — the dial is sent with the returned ctx, so a passthrough LIST is
+	// labelled with this reason on snowplow_resolve_collection_lists.
+	dctx := cache.RecordApiserverFallthrough(req.Context(), reason, "")
 	// #726 — the dial presents the CALLER's clientconfig credential, which
 	// snowplow holds on their behalf: credhttp.Do is request.Do with a client
 	// that never follows a redirect (a token-auth clientconfig's bearer is
 	// re-added on every hop), and a refused 3xx is surfaced with its own code.
-	rt := credhttp.Do(req.Context(), callOpts)
+	rt := credhttp.Do(dctx, callOpts)
 
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see

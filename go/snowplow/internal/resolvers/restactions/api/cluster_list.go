@@ -394,7 +394,9 @@ func populateClusterListCellSync(
 
 	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
-	rawEnvelope, dispatchedOK := dispatchViaInformerFn(
+	// informer-only: an unservable collapse falls back to the per-NS path and
+	// sends nothing to the apiserver from here.
+	rawEnvelope, dispatchedOK, _ := dispatchViaInformerFn(
 		cache.WithApistageContentResolve(ctx), clusterCall)
 	defensiveDispatchMs := time.Since(dispatchStart).Milliseconds()
 	if !dispatchedOK {

@@ -393,7 +393,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 
 	// Learn one envelope's size and the GVR's calibration, then size the ceiling for 2.5 fills.
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("PRECONDITION: list 0 not content-servable")
 	}
 	store.DeleteForTest(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), "")))
@@ -416,7 +416,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 		go func(n int) {
 			defer wg.Done()
 			<-start
-			if _, s, ok, _ := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(n), false); ok && s {
+			if _, s, ok, _, _ := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(n), false); ok && s {
 				served.Add(1)
 			}
 		}(n)
@@ -491,7 +491,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 
 	var dispatches atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		dispatches.Add(1)
 		return orig(ctx, call)
 	}
@@ -504,7 +504,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	results := make(chan out, 3)
 	for i := 0; i < 3; i++ {
 		go func() {
-			_, s, ok, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
+			_, s, ok, _, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
 			results <- out{ok, s, err}
 		}()
 	}
@@ -552,7 +552,7 @@ func TestContentFill710_D1_ACustomerNeverGetsTheAdmissionTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(r1Ctx(), 500*time.Millisecond)
 	defer cancel()
-	_, s, ok, err := apistageContentServe(ctx, store, fill710NSListCall(0), false)
+	_, s, ok, _, err := apistageContentServe(ctx, store, fill710NSListCall(0), false)
 	if err != nil {
 		t.Fatalf("D1 RED: a customer read got %v — users never queue, so no customer may receive the admission timeout", err)
 	}

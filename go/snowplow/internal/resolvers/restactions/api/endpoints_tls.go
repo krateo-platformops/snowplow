@@ -101,7 +101,14 @@ func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *http
 	if credhttp.HeldCredential(ctx) || cache.ServiceAccountDialFromContext(ctx) {
 		cli = credhttp.Client(cli)
 	}
-	return cli, nil
+	// #988 — whatever credential the stage dials with, its collection LISTs
+	// are a resolve's, so every endpoint client counts them
+	// (snowplow_resolve_collection_lists). Separate from the redirect policy
+	// above: a named endpointRef keeps its own redirect behaviour, but a LIST
+	// it sends to the apiserver — e.g. of a GVR whose store is being swapped
+	// (#870) — is counted like any other. On a held dial the counter is already
+	// in Client's chain and this adds none.
+	return credhttp.CountResolveListsOn(cli), nil
 }
 
 // buildEndpointClient builds the client for ep. It is the ONLY site in the

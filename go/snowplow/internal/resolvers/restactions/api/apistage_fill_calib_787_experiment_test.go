@@ -52,7 +52,7 @@ func TestContentFill787_Experiment_LearnedExpansionUnderGCPressure(t *testing.T)
 	cache.ResetAdmissionRuntimeSeamsForTest()
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
 	for n := 0; n < lists; n++ {
-		if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); !ok {
+		if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); !ok {
 			t.Fatalf("PRECONDITION: list %d not content-servable", n)
 		}
 	}
@@ -106,7 +106,7 @@ func TestContentFill787_Experiment_LearnedExpansionUnderGCPressure(t *testing.T)
 	runtime.GC()
 	h0, a0 := fill710HeapObjects(), fill710HeapAllocs()
 	contentFillAdmissionInflightWeightPeak.Store(0)
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("the cold fill was not served")
 	}
 	charged := contentFillAdmissionInflightWeightPeak.Load()

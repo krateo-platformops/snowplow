@@ -1273,6 +1273,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerStoreSwapInstruments(m); err != nil { // #870
 		return err
 	}
+	if err := registerResolveCollectionListsInstrument(m); err != nil { // #988
+		return err
+	}
 	return registerSecurityInstruments(m)
 }
 

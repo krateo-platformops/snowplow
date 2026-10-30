@@ -128,7 +128,7 @@ func TestIssue552_ApistageContentServe_TriggerlessBackgroundReadIsInternal(t *te
 			freshCell(t)
 			h0, m0 := store.Stats().HitTotal, store.Stats().MissTotal
 			s0 := store.Stats().StaleServedTotal
-			v, served, ok, _ := apistageContentServe(r.wrap(r1Ctx()), store, r1GetCall(), false)
+			v, served, ok, _, _ := apistageContentServe(r.wrap(r1Ctx()), store, r1GetCall(), false)
 			// ARM-RAN check: a read that never happened proves nothing.
 			if !ok || !served {
 				t.Fatalf("ARM DID NOT RUN: the content HIT was not served (ok=%v served=%v)", ok, served)
@@ -159,7 +159,7 @@ func TestIssue552_ApistageContentServe_TriggerlessBackgroundReadIsInternal(t *te
 	t.Run("customer_call_stamps", func(t *testing.T) {
 		freshCell(t)
 		h0 := store.Stats().HitTotal
-		v, served, ok, _ := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
+		v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
 		if !ok || !served {
 			t.Fatalf("customer content HIT must serve (ok=%v served=%v)", ok, served)
 		}
@@ -183,7 +183,7 @@ func TestIssue552_ApistageContentServe_TriggerlessBackgroundReadIsInternal(t *te
 	t.Run("matching_trigger_still_force_misses", func(t *testing.T) {
 		freshCell(t) // back to the stale snapshot the force-miss must discard
 		ctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
-		v, served, ok, _ := apistageContentServe(ctx, store, r1GetCall(), false)
+		v, served, ok, _, _ := apistageContentServe(ctx, store, r1GetCall(), false)
 		if !ok || !served {
 			t.Fatalf("the force-missed re-dispatch must serve (ok=%v served=%v)", ok, served)
 		}

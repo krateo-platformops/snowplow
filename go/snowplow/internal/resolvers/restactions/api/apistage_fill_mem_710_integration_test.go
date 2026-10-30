@@ -176,7 +176,7 @@ func fill710Burst(store *cache.ResolvedCacheStore, lists, readers int, ctxFn fun
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			if _, s, o, _ := apistageContentServe(ctxFn(), store, fill710NSListCall(i%lists), false); o && s {
+			if _, s, o, _, _ := apistageContentServe(ctxFn(), store, fill710NSListCall(i%lists), false); o && s {
 				ok.Add(1)
 			}
 		}(i)
@@ -234,7 +234,7 @@ func TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill(t *testing.T) {
 	store := cache.ResolvedCache()
 	fill710Admission(t)
 	fill710SpyDispatch(t, nil, nil, nil)
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("PRECONDITION: warm-up list not content-servable")
 	}
 	for n := 1; n <= probes; n++ {
@@ -243,7 +243,7 @@ func TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill(t *testing.T) {
 		restore := cache.SetAdmissionRuntimeSeamsForTest(func() int64 { return 1<<63 - 1 }, fill710HeapObjects)
 		runtime.GC()
 		a0 := fill710HeapAllocs()
-		_, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false)
+		_, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false)
 		alloc := fill710HeapAllocs() - a0
 		charged := contentFillAdmissionInflightWeightPeak.Load()
 		restore()
@@ -274,7 +274,7 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 
 	// Every list resident (the burst replaces them).
 	for n := 0; n < lists; n++ {
-		if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); !ok {
+		if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(n), false); !ok {
 			t.Fatalf("PRECONDITION: list %d not content-servable", n)
 		}
 	}
@@ -308,7 +308,7 @@ func TestContentFill710_FMEM_GateBoundsRealHeapOfAResidentListBurst(t *testing.T
 	var checkAdmitted atomic.Bool
 	var inDispatch, unadmittedPeak atomic.Int64
 	prevDispatch := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		n := inDispatch.Add(1)
 		defer inDispatch.Add(-1)
 		if checkAdmitted.Load() {
@@ -440,7 +440,7 @@ func TestContentFill710_FMEM_CustomerFirstLoadBurst_ReportOnly(t *testing.T) {
 	wg := fill710Goroutines(t)
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
 	// One cold fill to learn the envelope size, then every list cold again.
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("PRECONDITION: list 0 not content-servable")
 	}
 	store.DeleteForTest(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), "")))

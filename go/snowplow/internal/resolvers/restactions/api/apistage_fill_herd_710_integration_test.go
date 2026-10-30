@@ -77,7 +77,7 @@ func TestContentFill710_Integration_5KItems200Readers_KnownStaleBurst(t *testing
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+			if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 				notServed.Add(1)
 			}
 		}()
@@ -198,7 +198,7 @@ func TestContentFill882_Integration_5KItems32Readers_EditsFlowing(t *testing.T) 
 		names[w] = fmt.Sprintf("fsa-%05d", w*600+7)
 		getCall := fill710ListCall()
 		getCall.Path = listPath + "/" + names[w]
-		if _, served, ok, _ := apistageContentServe(r1Ctx(), store, getCall, false); !ok || !served {
+		if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, getCall, false); !ok || !served {
 			t.Fatalf("PRECONDITION: the GET-by-name read of writer %d's object was not served", w)
 		}
 	}
@@ -210,8 +210,8 @@ func TestContentFill882_Integration_5KItems32Readers_EditsFlowing(t *testing.T) 
 	release := make(chan struct{})
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if call.Path == listPath && listDispatches.Add(1) == 1 {
 			// The leader has LISTED the informer: everything acknowledged from
 			// here on is newer than the flight's own body.
@@ -219,7 +219,7 @@ func TestContentFill882_Integration_5KItems32Readers_EditsFlowing(t *testing.T) 
 			close(dispatchStarted)
 			<-release
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 	parseHook := func(gvr schema.GroupVersionResource) {
 		if gvr == r1FsaGVR {
@@ -297,7 +297,7 @@ func TestContentFill882_Integration_5KItems32Readers_EditsFlowing(t *testing.T) 
 	read := func(i int) {
 		defer wg.Done()
 		acks := snapshotAcks() // read BEFORE the reader enters: its entry seq is later
-		v, sv, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+		v, sv, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 		results[i] = served{ok: ok && sv, acks: acks, revs: herd882Revs(v, names)}
 	}
 	t0 := time.Now()

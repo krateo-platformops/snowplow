@@ -188,7 +188,7 @@ func TestA2_ServePathParity_RefusedCoordinateAndHealthyNeighbour(t *testing.T) {
 	rwBefore := newA2ParityWatcher(t, false, seed...)
 
 	// First dispatch drives the lazy register (the real spawn-site funnel).
-	_, _ = dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
+	_, _, _ = dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
 
 	if !rwBefore.IsRegistered(a2ParityUnwatchableGVR) {
 		t.Fatalf("PRE-A2 world invalid: with SKIP_UNSERVED_GROUP_INFORMERS=false the unwatchable "+
@@ -218,10 +218,10 @@ func TestA2_ServePathParity_RefusedCoordinateAndHealthyNeighbour(t *testing.T) {
 			"snap=%+v", snapBefore)
 	}
 
-	rawBefore, servedBefore := dispatchViaInformer(
+	rawBefore, servedBefore, _ := dispatchViaInformer(
 		dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
 
-	healthyBefore, healthyServedBefore := dispatchViaInformer(
+	healthyBefore, healthyServedBefore, _ := dispatchViaInformer(
 		dispatchCtx(), buildCall(http.MethodGet, a2ParityHealthyPath))
 	if !healthyServedBefore {
 		t.Fatalf("PRE-A2 world invalid: the HEALTHY control coordinate must serve from the "+
@@ -231,17 +231,17 @@ func TestA2_ServePathParity_RefusedCoordinateAndHealthyNeighbour(t *testing.T) {
 	// --- WORLD "AFTER" (A2 gate on): never registers. ---------------------
 	rwAfter := newA2ParityWatcher(t, true, seed...)
 
-	_, _ = dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
+	_, _, _ = dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
 
 	if rwAfter.IsRegistered(a2ParityUnwatchableGVR) {
 		t.Fatalf("A2 world invalid: the unwatchable GVR must NOT be registered with the gate on; "+
 			"snap=%+v", rwAfter.ServabilitySnapshotFor(a2ParityUnwatchableGVR))
 	}
 
-	rawAfter, servedAfter := dispatchViaInformer(
+	rawAfter, servedAfter, _ := dispatchViaInformer(
 		dispatchCtx(), buildCall(http.MethodGet, a2ParityUnwatchablePath))
 
-	healthyAfter, healthyServedAfter := dispatchViaInformer(
+	healthyAfter, healthyServedAfter, _ := dispatchViaInformer(
 		dispatchCtx(), buildCall(http.MethodGet, a2ParityHealthyPath))
 
 	// --- PART 1: the refused coordinate serves IDENTICALLY. ---------------

@@ -96,7 +96,7 @@ func inc854Obj(ns, name string, managed int, env string) *unstructured.Unstructu
 // inc854Full is what a full fill of the call's partition stores right now.
 func inc854Full(t *testing.T, call httpcall.RequestOptions) ([]byte, []*unstructured.Unstructured) {
 	t.Helper()
-	raw, ok := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), call)
+	raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), call)
 	if !ok {
 		t.Fatalf("the full dispatch of %s was not servable", call.Path)
 	}
@@ -118,7 +118,7 @@ func inc854Key(t *testing.T, call httpcall.RequestOptions) string {
 // inc854Anchor fills the cell with a customer read and returns its cell.
 func inc854Anchor(t *testing.T, store *cache.ResolvedCacheStore, call httpcall.RequestOptions) *cache.ListCell {
 	t.Helper()
-	_, _, _, _ = apistageContentServe(r1Ctx(), store, call, false)
+	_, _, _, _, _ = apistageContentServe(r1Ctx(), store, call, false)
 	e, ok := store.GetNoTouch(inc854Key(t, call))
 	if !ok {
 		t.Fatalf("PRECONDITION: no content cell stored for %s", call.Path)
@@ -341,7 +341,7 @@ func TestListCell854_F4_NoFillAndNoStoreWriteAcrossFiftyChanges(t *testing.T) {
 	for m := 1; m <= 50; m++ {
 		stamp765Change(t, dyn, 1+m%7)
 		_ = stamp765Recv(t, "refresher", stamp765Serve(stamp765RefreshCtx(), store))
-		if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+		if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 			t.Fatalf("customer read %d not served", m)
 		}
 	}

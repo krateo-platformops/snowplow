@@ -64,7 +64,9 @@ func List() http.HandlerFunc {
 		// client + Discover + per-GVR ListObjects; the cache-gate
 		// stub at dynamic/list.go:19-33 today falls through to
 		// apiserver. Record BEFORE client build (AC-D.3 ordering).
-		cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
+		// #988 — the per-GVR LISTs below are sent with the returned ctx, so
+		// they are labelled with this reason on snowplow_resolve_collection_lists.
+		lctx := cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
 		cli, err := dynamic.NewClient(rc)
 		if err != nil {
 			log.Error("cannot create dynamic client", slog.Any("err", err))
@@ -106,7 +108,7 @@ func List() http.HandlerFunc {
 				GVR:       gvr,
 			}
 
-			obj, err := dynamic.ListObjects(req.Context(), cli, opts)
+			obj, err := dynamic.ListObjects(lctx, cli, opts)
 			if err != nil {
 				log.Error("cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))

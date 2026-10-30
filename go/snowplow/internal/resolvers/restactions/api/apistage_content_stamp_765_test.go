@@ -74,7 +74,7 @@ func stamp765Change(t *testing.T, dyn dynamic.Interface, m int) {
 func stamp765Serve(ctx context.Context, store *cache.ResolvedCacheStore) chan fill710Served {
 	ch := make(chan fill710Served, 1)
 	go func() {
-		v, served, ok, _ := apistageContentServe(ctx, store, fill710ListCall(), false)
+		v, served, ok, _, _ := apistageContentServe(ctx, store, fill710ListCall(), false)
 		ch <- fill710Served{v, served, ok}
 	}()
 	return ch
@@ -97,7 +97,7 @@ func stamp765Recv(t *testing.T, name string, ch chan fill710Served) fill710Serve
 // stamp765Prime fills the LIST cell with a customer read (managed=r1StaleManaged).
 func stamp765Prime(t *testing.T, store *cache.ResolvedCacheStore) {
 	t.Helper()
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("PRECONDITION: the priming read was not served (ok=%v served=%v)", ok, served)
 	}
 	if _, ok := store.GetNoTouch(fill710ListKey()); !ok {
@@ -121,13 +121,13 @@ func stamp765HoldDispatches(t *testing.T, hold int) (calls *atomic.Int64, read [
 	}
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if n := int(calls.Add(1)); n <= hold {
 			close(read[n-1])
 			<-gates[n-1]
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 	return calls, read, release
 }
@@ -342,7 +342,7 @@ func TestContentStamp765_B4_RealRefresherDequeueRefillsAfterChange(t *testing.T)
 			return nil
 		}
 		rctx := xcontext.BuildContext(cache.WithBackgroundResolve(ctx), xcontext.WithUserInfo(jwtutil.UserInfo{Username: r1User}))
-		v, served, ok, _ := apistageContentServe(rctx, store, fill710ListCall(), false)
+		v, served, ok, _, _ := apistageContentServe(rctx, store, fill710ListCall(), false)
 		if ok && served {
 			m := stamp765ManagedOf(v)
 			mu.Lock()

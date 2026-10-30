@@ -202,12 +202,12 @@ func TestPaired854(t *testing.T) {
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/composition.krateo.io/v1/namespaces/" + r1Ns + "/fullstackapps", Verb: ptr.To(http.MethodGet)}}
 	// Prime: one customer read fills the cell (and anchors it on the branch).
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, call, false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, call, false); !ok || !served {
 		t.Fatal("prime read not served")
 	}
 	otherCall := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/composition.krateo.io/v1/namespaces/" + pairedOtherNs + "/fullstackapps", Verb: ptr.To(http.MethodGet)}}
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, otherCall, false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, otherCall, false); !ok || !served {
 		t.Fatal("prime read of the unrelated list not served")
 	}
 	runtime.GC()
@@ -265,7 +265,7 @@ func TestPaired854(t *testing.T) {
 				labels := pprof.Labels("dep", fmt.Sprintf("dep-%02d", d))
 				pprof.Do(context.Background(), labels, func(lctx context.Context) {
 					rctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
-					v, served, ok, _ := apistageContentServe(rctx, store, call, false)
+					v, served, ok, _, _ := apistageContentServe(rctx, store, call, false)
 					if !ok || !served {
 						jqErrs.Add(1)
 						return
@@ -328,7 +328,7 @@ func TestPaired854(t *testing.T) {
 			t0 := time.Now()
 			custInFlight.Add(1)
 			pprof.Do(context.Background(), pprof.Labels("cust", class), func(lctx context.Context) {
-				v, served, ok, _ := apistageContentServe(r1Ctx(), store, c, false)
+				v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, c, false)
 				if !ok || !served {
 					custErrs.Add(1)
 					return

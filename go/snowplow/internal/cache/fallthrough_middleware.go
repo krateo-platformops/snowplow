@@ -99,6 +99,15 @@ const (
 	// — lets the seed's paginated 4a serve through. NOT a route; diagnostic +
 	// gate-discriminator only.
 	ScopeBootPrewarmSeed = "boot-prewarm-seed"
+
+	// ScopeRefresher — #988. The refresher's scope, stamped on the context of
+	// every refresh it runs (runRefreshFunc: a dequeued key, and a
+	// RunRefreshNow replace). A refresh is a resolve origin like a /call, so
+	// its context carries the resolve marker for
+	// snowplow_resolve_collection_lists, and its genuine fall-throughs land in
+	// snowplow_apiserver_fallthrough_cells under path "refresher" instead of
+	// going uncounted. NOT a route; never registered with RegisterScopedRoute.
+	ScopeRefresher = "refresher"
 )
 
 // validScopeNames is the boot-time validation set used by
@@ -118,6 +127,7 @@ var validScopeNames = map[string]struct{}{
 	ScopeResolverInnerCall: {},
 	ScopeBootPrewarmWalk:   {},
 	ScopeBootPrewarmSeed:   {},
+	ScopeRefresher:         {},
 }
 
 // routeScopeRegistry records the routes whose middleware chain has

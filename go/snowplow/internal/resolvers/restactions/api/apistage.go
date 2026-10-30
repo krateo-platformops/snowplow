@@ -509,12 +509,12 @@ func apistageContentServe(
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
 	uafActive bool,
-) (value any, served bool, ok bool, err error) {
-	value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
+) (value any, served bool, ok bool, fallCtx context.Context, err error) {
+	value, served, ok, fallCtx, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
 	if errors.Is(err, errInheritedAdmissionTimeout) || errors.Is(err, errJoinedMovedFlight) {
-		value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
+		value, served, ok, fallCtx, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
 	}
-	return value, served, ok, err
+	return value, served, ok, fallCtx, err
 }
 
 // errInheritedAdmissionTimeout is a joiner's signal to retry (never returned
@@ -536,7 +536,7 @@ func apistageContentServeAttempt(
 	call httpcall.RequestOptions,
 	uafActive bool,
 	mayRetry bool,
-) (value any, served bool, ok bool, err error) {
+) (value any, served bool, ok bool, fallCtx context.Context, err error) {
 	log := xcontext.Logger(ctx)
 
 	// Ship 0.30.193 Checkpoint 3 — per-call apistageContentServe
@@ -564,11 +564,11 @@ func apistageContentServeAttempt(
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
 	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
-		return nil, false, false, nil
+		return nil, false, false, ctx, nil
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
-		return nil, false, false, nil
+		return nil, false, false, ctx, nil
 	}
 	isList := name == ""
 	// #618 — classify the query BEFORE any cell is read or written. A query
@@ -579,8 +579,7 @@ func apistageContentServeAttempt(
 	query := planListQuery(call.Path, isList, ns != "")
 	if !query.applicable {
 		recordListQuery(query)
-		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
-		return nil, false, false, nil
+		return nil, false, false, cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String()), nil
 	}
 	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, ns, name, query.canon))
 
@@ -888,14 +887,15 @@ func apistageContentServeAttempt(
 			// deadline, not this reader's: while this reader's own request is
 			// alive it tries once more (apistageContentServe); else it errors.
 			if mayRetry && ctx.Err() == nil {
-				return nil, false, false, errInheritedAdmissionTimeout
+				return nil, false, false, ctx, errInheritedAdmissionTimeout
 			}
-			return nil, false, true, res.err
+			return nil, false, true, ctx, res.err
 		}
 		if !ok {
 			// The flight was not servable (its leader fell through too), or this
-			// reader's own ctx ended while it waited.
-			return nil, false, false, nil
+			// reader's own ctx ended while it waited. #988 — it falls through on
+			// the leader's decision, which the leader counted: carry its reason.
+			return nil, false, false, cache.WithFallthroughReason(ctx, res.fallReason), nil
 		}
 		// #882 F2 — the flight's incremental cell, brought up to THIS reader's
 		// own seq (its content sink's entry seq, taken before it joined): every
@@ -922,9 +922,9 @@ func apistageContentServeAttempt(
 				// cell to bring up to this reader's seq: the flight's body may miss
 				// an edit this reader must see. One more attempt (epoch rule).
 				if mayRetry && ctx.Err() == nil {
-					return nil, false, false, errJoinedMovedFlight
+					return nil, false, false, ctx, errJoinedMovedFlight
 				}
-				return nil, false, false, nil
+				return nil, false, false, ctx, nil
 			}
 			envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
 		}
@@ -962,6 +962,7 @@ func apistageContentServeAttempt(
 		// propagate to the outer resolve's sink.
 		// Block-scoped shadow: the child sink covers exactly this MISS branch's read → Put
 		// → Record; the gate below keeps the caller's ctx.
+		callerCtx := ctx // #988: the ctx this reader falls through with
 		ctx := fillCtx
 		// #710 — count the fill and hold its envelope bytes in flight until
 		// this serve returns; the dispatch and the parse run under pprof
@@ -980,7 +981,7 @@ func apistageContentServeAttempt(
 			// D1 — never admitted before the deadline: this reader and every
 			// joiner error. Nothing is dispatched, stored or served stale.
 			flight.complete(contentFlightResult{err: aerr})
-			return nil, false, true, aerr
+			return nil, false, true, callerCtx, aerr
 		}
 		admitted := true
 		defer func() {
@@ -1000,14 +1001,22 @@ func apistageContentServeAttempt(
 		}
 		var dispatched []byte
 		var dispatchedOK bool
+		var dispatchCtx context.Context
 		pprof.Do(ctx, fillLabels, func(ctx context.Context) {
-			dispatched, dispatchedOK = dispatchViaInformerFn(
+			dispatched, dispatchedOK, dispatchCtx = dispatchViaInformerFn(
 				cache.WithApistageContentResolve(ctx), call)
 		})
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
 			fill.notServable()
-			return nil, false, false, nil
+			// #988 — the gate's reason (counted by dispatchViaInformer) goes
+			// with this reader's fall-through and its joiners'. Only the
+			// reason crosses: the fill ctx carries the un-gated content marker
+			// and a deadline cancelled on return, neither of which the
+			// apiserver dispatch may inherit.
+			reason := cache.FallthroughReasonOf(dispatchCtx)
+			flight.complete(contentFlightResult{fallReason: reason})
+			return nil, false, false, cache.WithFallthroughReason(callerCtx, reason), nil
 		}
 		fill.dispatched(dispatched)
 		// The exact size is known: the held weight becomes exact, in place.
@@ -1156,7 +1165,7 @@ func apistageContentServeAttempt(
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
-		return nil, false, true, nil
+		return nil, false, true, ctx, nil
 	}
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
@@ -1205,9 +1214,9 @@ func apistageContentServeAttempt(
 	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
-		return nil, false, true, nil
+		return nil, false, true, ctx, nil
 	}
-	return gated, true, true, nil
+	return gated, true, true, ctx, nil
 }
 
 // serveParsedListEnvelope returns the cell's pre-parsed list items as
@@ -1275,7 +1284,8 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	raw, served := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call)
+	// informer-only: a refresh of a content cell sends nothing to the apiserver.
+	raw, served, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call)
 	if !served {
 		// Not pivot-servable (pre-sync informer, metadata-only GVR, …).
 		// 1.12.6 C4 (§6.2 row 9): TYPED, not (nil, nil). The (nil, nil)

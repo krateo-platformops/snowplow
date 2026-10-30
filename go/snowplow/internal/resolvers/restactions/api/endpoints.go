@@ -155,8 +155,8 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	// gvr label is left empty: the Secret being read is fixed per user,
 	// not per resolver target, and synthesizing a placeholder would
 	// inflate cardinality without diagnostic value.
-	cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
-	ep, err := credhttp.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
+	sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
+	ep, err := credhttp.FromSecret(sctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
 		return ep, false, err
 	}

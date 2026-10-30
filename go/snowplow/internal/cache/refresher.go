@@ -198,6 +198,15 @@ func customerInFlightLocked() bool {
 // with exponential backoff; nil makes it Forget the key.
 type RefreshFunc func(ctx context.Context, key string, inputs ResolvedKeyInputs) error
 
+// runRefreshFunc runs one refresh: fn under the refresher's scope (#988). A
+// refresh is a resolve origin, so it is scoped like a /call and its context
+// carries the resolve marker; the scope is stamped here, where every refresh
+// starts — a dequeued key (processOne) and a stale dependent's replace
+// (RunRefreshNow) — so no refresh runs unscoped.
+func runRefreshFunc(ctx context.Context, fn RefreshFunc, key string, inputs ResolvedKeyInputs) error {
+	return fn(WithFallthroughScope(ctx, ScopeRefresher), key, inputs)
+}
+
 // refresher is the singleton worker pool. Constructed lazily by
 // StartRefresher; one per process.
 type refresher struct {
@@ -1467,7 +1476,7 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 	// rate-floor defer. Recorded for success AND failure: a failed re-resolve
 	// still did the resolve work whose cost #384/#365 are sizing.
 	resolveStart := time.Now()
-	err := fn(ctx, key, *entry.Inputs)
+	err := runRefreshFunc(ctx, fn, key, *entry.Inputs)
 	r.recordResolveLatency(time.Since(resolveStart))
 	if err != nil {
 		// #608 — a closed-set class and the failing stage, so a failure is

@@ -51,7 +51,7 @@ func TestContentFill710_R2_CustomerJoinDispatchesAQueuedBackgroundFlightAtOnce(t
 
 	var dispatched atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		dispatched.Add(1)
 		return orig(ctx, call)
 	}
@@ -65,7 +65,7 @@ func TestContentFill710_R2_CustomerJoinDispatchesAQueuedBackgroundFlightAtOnce(t
 	served := make(chan string, 2)
 	read := func(name string, ctx context.Context) {
 		go func() {
-			if _, s, ok, err := apistageContentServe(ctx, store, fill710NSListCall(0), false); ok && s && err == nil {
+			if _, s, ok, _, err := apistageContentServe(ctx, store, fill710NSListCall(0), false); ok && s && err == nil {
 				served <- name
 				return
 			}
@@ -122,7 +122,7 @@ func TestContentFill710_R3_NestedGateFullTheTreesFillStillCompletes(t *testing.T
 
 	done := make(chan error, 1)
 	go func() {
-		_, s, ok, err := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false)
+		_, s, ok, _, err := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false)
 		if err == nil && (!ok || !s) {
 			err = errors.New("not served")
 		}
@@ -220,7 +220,7 @@ func TestContentFill710_R5_JoinerWithItsOwnBudgetStartsANewFlight(t *testing.T) 
 	}
 	leader := make(chan out, 1)
 	go func() {
-		_, s, ok, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
+		_, s, ok, _, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
 		leader <- out{ok, s, err}
 	}()
 	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillAdmissionStatsSnapshot().Queued["background"] == 1 }) {
@@ -228,7 +228,7 @@ func TestContentFill710_R5_JoinerWithItsOwnBudgetStartsANewFlight(t *testing.T) 
 	}
 	joiner := make(chan out, 1)
 	go func() {
-		_, s, ok, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
+		_, s, ok, _, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
 		joiner <- out{ok, s, err}
 	}()
 	if !fill710WaitFor(5*time.Second, func() bool { return ContentFillStatsSnapshot().JoinWaiting == 1 }) {

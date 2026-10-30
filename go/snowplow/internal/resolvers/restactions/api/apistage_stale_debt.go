@@ -442,7 +442,7 @@ func staleDebtRefillOnce(d *staleDebt) (bool, cache.StaleRetryOutcome) {
 	if store == nil {
 		return false, cache.StaleRetryGenuine
 	}
-	_, _, _, err := apistageContentServe(ctx, store, d.call, false)
+	_, _, _, _, err := apistageContentServe(ctx, store, d.call, false)
 	out.mu.Lock()
 	defer out.mu.Unlock()
 	switch {

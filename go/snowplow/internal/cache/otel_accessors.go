@@ -14,6 +14,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // otlpCellSeriesCap bounds how many (path, gvr, reason) series ONE cell
@@ -78,6 +80,33 @@ func CacheDiagnosticCellsSnapshot() (cells []FallthroughCell, truncated int) {
 	return cappedCells(&diagnosticCounters, "cache_diagnostic")
 }
 
+// ResolveCollectionListCell is one snowplow_resolve_collection_lists series
+// (#988) for the OTLP mirror.
+type ResolveCollectionListCell struct {
+	GVR    string
+	Reason string
+	Count  uint64
+}
+
+// ResolveCollectionListCellsSnapshot returns the #988 wire-level resolve
+// collection-LIST cells (credhttp resolve_lists.go), capped exactly like the
+// two fall-through families: at most otlpCellSeriesCap series, the tail
+// folded into gvr=__other__ per reason and counted under family
+// "resolve_collection_lists". /debug/vars keeps the uncapped map.
+func ResolveCollectionListCellsSnapshot() (cells []ResolveCollectionListCell, truncated int) {
+	counts := credhttp.ResolveCollectionLists()
+	all := make([]FallthroughCell, 0, len(counts))
+	for k, n := range counts {
+		all = append(all, FallthroughCell{GVR: k.GVR, Reason: k.Reason, Count: n})
+	}
+	capped, truncated := capCells(all, "resolve_collection_lists")
+	cells = make([]ResolveCollectionListCell, 0, len(capped))
+	for _, c := range capped {
+		cells = append(cells, ResolveCollectionListCell{GVR: c.GVR, Reason: c.Reason, Count: c.Count})
+	}
+	return cells, truncated
+}
+
 // cappedCells is the shared body. Both families must truncate the same
 // way or the two dashboard panels stop being comparable.
 func cappedCells(m *sync.Map, family string) ([]FallthroughCell, int) {
@@ -92,6 +121,13 @@ func cappedCells(m *sync.Map, family string) ([]FallthroughCell, int) {
 		})
 		return true
 	})
+	return capCells(all, family)
+}
+
+// capCells caps one family's cells (see cappedCells). The #988 resolve
+// collection-LIST family has no path label: its cells carry Path "", so its
+// tail folds per reason.
+func capCells(all []FallthroughCell, family string) ([]FallthroughCell, int) {
 	if len(all) <= otlpCellSeriesCap {
 		return all, 0
 	}

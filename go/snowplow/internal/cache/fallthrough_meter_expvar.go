@@ -15,6 +15,8 @@
 //     grand-total for the six reasons that reach no apiserver.
 //   - snowplow_cache_diagnostic_cells       — its per-cell breakdown,
 //     same `"path|gvr|reason"` key shape.
+//   - snowplow_resolve_collection_lists     — #988: the collection LISTs
+//     resolves sent on the wire, key `"gvr|reason"`.
 //
 // The two families are published inside the SAME sync.Once, so a
 // process either has all four keys or none — an operator never sees a
@@ -37,6 +39,8 @@ import (
 	"expvar"
 	"sync"
 	"sync/atomic"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // fallthroughExpvarOnce guards registerFallthroughExpvar so the
@@ -100,7 +104,28 @@ func registerFallthroughExpvar() {
 		expvar.Publish("snowplow_cache_diagnostic_cells", expvar.Func(func() any {
 			return flatFallthroughCells(&diagnosticCounters)
 		}))
+		// #988 — the wire-level companion: the collection LISTs resolves
+		// actually sent, `"gvr|reason" -> count` (credhttp
+		// resolve_lists.go). Beside the decision-site family it is read
+		// against, in the same sync.Once, so wherever a fall-through cell is
+		// published the requests it let through are too. Uncapped, like the
+		// cells above; the OTLP mirror caps it.
+		expvar.Publish("snowplow_resolve_collection_lists", expvar.Func(func() any {
+			return flatResolveCollectionLists()
+		}))
 	})
+}
+
+// flatResolveCollectionLists flattens the #988 counter into the
+// `"gvr|reason" -> count` shape snowplow_resolve_collection_lists publishes.
+// Neither label contains a pipe: gvr is schema.GroupVersionResource.String(),
+// reason a closed enum.
+func flatResolveCollectionLists() map[string]uint64 {
+	out := map[string]uint64{}
+	for k, n := range credhttp.ResolveCollectionLists() {
+		out[k.GVR+"|"+k.Reason] = n
+	}
+	return out
 }
 
 // flatFallthroughCells flattens one cell map into the

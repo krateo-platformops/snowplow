@@ -107,7 +107,7 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 		}
 		if f.secondInput.Load() {
 			rctx := cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
-			if _, _, ok, err := apistageContentServe(rctx, f.store, d2SecondCall(), false); err != nil || !ok {
+			if _, _, ok, _, err := apistageContentServe(rctx, f.store, d2SecondCall(), false); err != nil || !ok {
 				return fmt.Errorf("second content input: ok=%v err=%v", ok, err)
 			}
 			f.secondFilled.Store(true)
@@ -127,7 +127,7 @@ func (f *d2Fixture) customer(t *testing.T, l1Key string) (any, *cache.StaleServe
 	t.Helper()
 	// As the dispatchers do: the L1 key is scoped first, then the sink on it.
 	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions")
-	v, s, ok, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
+	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("customer read not served: ok=%v served=%v err=%v", ok, s, err)
 	}
@@ -246,7 +246,7 @@ func TestStale710_D2_4_WithHeadroomAKnownStaleArmableHitIsServedStaleAndRefilled
 	f := newD2Fixture(t)
 	var dispatched atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		dispatched.Add(1)
 		return orig(ctx, call)
 	}
@@ -264,7 +264,7 @@ func TestStale710_D2_4_WithHeadroomAKnownStaleArmableHitIsServedStaleAndRefilled
 
 func TestStale710_D2_5b_NonArmableReadReadsThroughFreshWithNoDebt(t *testing.T) {
 	f := newD2Fixture(t)
-	v, s, ok, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false)
+	v, s, ok, _, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("read not served: ok=%v served=%v err=%v", ok, s, err)
 	}
@@ -284,7 +284,7 @@ func TestStale710_D2_18_ASubstrateFillUnderAnArmableResolveReadsThrough(t *testi
 	f := newD2Fixture(t)
 	ctx, _ := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-15"), "dep-15", "widgets")
 	ctx = cache.WithL1KeyContext(ctx, "ra-full-list-15")
-	v, s, ok, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
+	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("read not served: ok=%v served=%v err=%v", ok, s, err)
 	}
@@ -301,7 +301,7 @@ func TestStale710_D2_6_ATransientRefillFailureRetriesAtOnceAndTheDebtClears(t *t
 	var first atomic.Bool
 	var refills atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if contentDebtRefillFromContext(ctx) {
 			refills.Add(1)
 			if first.CompareAndSwap(false, true) {
@@ -353,7 +353,7 @@ func TestStale710_D2_7_ACommitDuringRegistrationStillPushesTheDependent(t *testi
 	release := sync.OnceFunc(func() { close(gate) })
 	t.Cleanup(release)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		<-gate
 		return orig(ctx, call)
 	}
@@ -379,7 +379,7 @@ func TestStale710_D2_8_TwoIdentitiesEachGetTheirOwnPush(t *testing.T) {
 	release := sync.OnceFunc(func() { close(gate) })
 	t.Cleanup(release)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		<-gate
 		return orig(ctx, call)
 	}
@@ -409,9 +409,9 @@ func TestStale710_D2_12_AnOverdueDebtIsCountedOnce(t *testing.T) {
 	var fail atomic.Bool
 	fail.Store(true)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if fail.Load() {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -544,7 +544,7 @@ func TestStale710_D2_16b_ALateArmAfterTheReplacementWasEvictedStillGetsTheRefres
 	defer unsub()
 	d2Push(t, ch, "dep-16b", time.Second)
 	// The refetch misses the evicted cell and fills: its content read is fresh.
-	v, s, ok, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false)
+	v, s, ok, _, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("refetch content read not served: ok=%v served=%v err=%v", ok, s, err)
 	}
@@ -642,9 +642,9 @@ func TestStale710_V8a_AGenuinelyFailingDebtNobodyViewsIsAbandoned(t *testing.T) 
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
 	var calls atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		calls.Add(1)
-		return nil, false // the upstream is down
+		return nil, false, ctx // the upstream is down
 	}
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	f.customer(t, "dep-v8a")
@@ -681,9 +681,9 @@ func TestStale710_V8b_AViewedFailingDebtRetriesOnTheBackoffAndHeals(t *testing.T
 	var fail atomic.Bool
 	fail.Store(true)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if fail.Load() {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -784,9 +784,9 @@ func TestStale710_V8c_AFailingDebtStopsWhenItsLastViewerLeaves(t *testing.T) {
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
 	var calls atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		calls.Add(1)
-		return nil, false // the upstream is down
+		return nil, false, ctx // the upstream is down
 	}
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	_, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-v8c": {}})
@@ -832,9 +832,9 @@ func d2Parked(t *testing.T, f *d2Fixture, dep string) (*cache.StaleRetryManualCl
 	var fail atomic.Bool
 	fail.Store(true)
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if fail.Load() {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -944,7 +944,7 @@ func TestStale710_D2_20_ARefresherFillRetiresAParkedDebt(t *testing.T) {
 	_, heal, _ := d2Parked(t, f, "dep-20")
 	heal()
 	rctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolveOrigin(r1Ctx(), cache.BackgroundOriginRefresher), r1FsaGVR)
-	if _, _, ok, err := apistageContentServe(rctx, f.store, fill710ListCall(), false); err != nil || !ok {
+	if _, _, ok, _, err := apistageContentServe(rctx, f.store, fill710ListCall(), false); err != nil || !ok {
 		t.Fatalf("PRECONDITION: the refresher fill failed: ok=%v err=%v", ok, err)
 	}
 	d2RequireRetired(t, f, "D2-20", "dep-20")
@@ -955,7 +955,7 @@ func TestStale710_D2_20b_AReadThroughRetiresAParkedDebt(t *testing.T) {
 	f := newD2Fixture(t)
 	_, heal, _ := d2Parked(t, f, "dep-20b")
 	heal()
-	if _, _, ok, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false); err != nil || !ok {
+	if _, _, ok, _, err := apistageContentServe(r1Ctx(), f.store, fill710ListCall(), false); err != nil || !ok {
 		t.Fatalf("PRECONDITION: the read-through failed: ok=%v err=%v", ok, err)
 	}
 	d2RequireRetired(t, f, "D2-20b", "dep-20b")
@@ -1063,10 +1063,10 @@ func d2ParkedPending(t *testing.T, f *d2Fixture, deps, pending []string) (heal f
 	fail.Store(true)
 	dispatches = &atomic.Int64{}
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		dispatches.Add(1)
 		if fail.Load() {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -1131,7 +1131,7 @@ func TestStale710_D2_20e_AParkedDebtsEvictedContentEvictsItsDependentsWithoutReR
 	d2Push(t, ch, "dep-20e-a", 10*time.Second) // the owed mark, at arm time
 	// The refetch under the viewer is an ordinary fill: fresh, no new debt.
 	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions")
-	if _, served, ok, err := apistageContentServe(ctx, f.store, fill710ListCall(), false); err != nil || !ok || !served {
+	if _, served, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false); err != nil || !ok || !served {
 		t.Fatalf("D2-20e: the refetch was not served: ok=%v served=%v err=%v", ok, served, err)
 	}
 	if sink.StaleDerived() {
@@ -1151,7 +1151,7 @@ func TestStale710_D2_20f_AnActiveDebtsEvictedContentStillReResolvesItsDependent(
 	cache.SetStaleRetryClockForTest(clock)
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) { return nil, false }
+	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) { return nil, false, ctx }
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-20f": {}})
 	defer unsub()
@@ -1365,7 +1365,7 @@ func TestStale710_V8d_ARefusedRefillNobodyViewsStopsAfterOneImmediateRetry(t *te
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
 	var refills atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if contentDebtRefillFromContext(ctx) {
 			refills.Add(1)
 			// Every refill's generation moves mid-fill and the cell stays

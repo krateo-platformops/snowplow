@@ -44,7 +44,7 @@ func TestListCell854_F3c_CustomerReadIsServedTheChange(t *testing.T) {
 	inc854Anchor(t, store, fill710ListCall())
 	for m := 2; m <= 5; m++ {
 		stamp765Change(t, dyn, m)
-		v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+		v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 		if !ok || !served {
 			t.Fatalf("customer read %d not served", m)
 		}
@@ -71,6 +71,6 @@ func TestListCell854_F5r_ReadsAloneScheduleComparatorPasses(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("F5r RED: 10s of reads scheduled no comparator pass — the comparator never runs on its own")
 		}
-		_, _, _, _ = apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+		_, _, _, _, _ = apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 	}
 }

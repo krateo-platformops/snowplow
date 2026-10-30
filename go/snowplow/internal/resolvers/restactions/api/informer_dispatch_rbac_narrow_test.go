@@ -225,7 +225,7 @@ func TestDispatchViaInformer_RBACNarrowing_ListIsUserScoped(t *testing.T) {
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
 	ctx := ctxWithUser(narrowUser)
 
-	raw, served := dispatchViaInformer(ctx, call)
+	raw, served, _ := dispatchViaInformer(ctx, call)
 	if !served {
 		t.Fatalf("cluster-wide LIST: expected served=true; got served=false")
 	}
@@ -269,7 +269,7 @@ func TestDispatchViaInformer_RBACNarrowing_NamespacedListScoped(t *testing.T) {
 
 	// Authorized namespace → 2 items.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/team-a/restactions")
-	raw, served := dispatchViaInformer(ctx, call)
+	raw, served, _ := dispatchViaInformer(ctx, call)
 	if !served {
 		t.Fatalf("authorized-namespace LIST: expected served=true")
 	}
@@ -279,7 +279,7 @@ func TestDispatchViaInformer_RBACNarrowing_NamespacedListScoped(t *testing.T) {
 
 	// Denied namespace → 0 items (filtered) when Tag-A is present.
 	call = buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/bench-ns-1/restactions")
-	raw, served = dispatchViaInformer(ctx, call)
+	raw, served, _ = dispatchViaInformer(ctx, call)
 	if !served {
 		t.Fatalf("denied-namespace LIST: expected served=true")
 	}
@@ -305,7 +305,7 @@ func TestDispatchViaInformer_RBACFailClosed_NilIdentity(t *testing.T) {
 
 	// No UserInfo attached — context.Background() only.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
-	raw, served := dispatchViaInformer(context.Background(), call)
+	raw, served, _ := dispatchViaInformer(context.Background(), call)
 
 	if rbacNarrowBaseline {
 		// Pre-Tag-A: the pivot never reads identity → leaks everything.
@@ -390,7 +390,7 @@ func TestDispatchViaInformer_RBACNarrowing_GroupGrant(t *testing.T) {
 
 	// User "alice" is in group "devs".
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")
-	raw, served := dispatchViaInformer(ctxWithUser("alice", "devs"), call)
+	raw, served, _ := dispatchViaInformer(ctxWithUser("alice", "devs"), call)
 	if !served {
 		t.Fatalf("group-grant LIST: expected served=true")
 	}
