@@ -157,6 +157,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             resolved = None
     record("kubectl", kc, resolved)
     port = os.environ["FAKE_PORT"]
+    if a[:3] == ["create", "secret", "generic"]:
+        # the ghcr pull Secret: its value comes on stdin (--from-file=token=/dev/stdin)
+        with open(os.path.join(STATE, "created-secret"), "w") as fh:
+            fh.write(json.dumps({"argv": a, "stdin": sys.stdin.read(), "ns": ns}))
+        print(f"secret/{a[3]} created"); sys.exit(0)
     if a[:1] == ["apply"] and "-f" in a:
         # every object applied, by apiVersion and kind (tests/test_crd_schema.py: the
         # schema step's check names every non-built-in kind the run applies)
@@ -917,7 +922,13 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
                 {"name": "alert-provider", "feature": "specialistAgents"},
                 {"name": "krateo-observability", "feature": "portal",
-                 "deps": ["clickhouse-operator"] + (["alert-provider-crd"] if good else [])}]}))
+                 "deps": ["clickhouse-operator"] + (["alert-provider-crd"] if good else [])},
+                # PRIVATE (krateo-agentiko), as at 0.3.468: the ghcr pull token resolves them
+                {"name": "agentgateway-controller", "version": os.environ.get("FAKE_AGW_VERSION", "0.2.0"),
+                 "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway"},
+                {"name": "agentgateway-policies", "version": "0.2.18",
+                 "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway",
+                 "deps": ["agentgateway-controller"]}]}))
         sys.exit(0)
     if "list" in a:
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
@@ -1164,10 +1175,13 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
     calls = _calls(state)
 
     def verb(c):
-        return [a for a in c["argv"]
-                if not a.startswith(("--kubeconfig=", "--context="))]
+        a = [x for x in c["argv"] if not x.startswith(("--kubeconfig=", "--context="))]
+        return a[2:] if a[:1] == ["-n"] else a
+    # no Secret is ever READ (the one write: the ghcr pull Secret, created at install from stdin)
     assert not any(a in ("secret", "secrets") for c in calls
-                   if c["tool"] == "kubectl" for a in verb(c)[:3])
+                   if c["tool"] == "kubectl" and verb(c)[:1] != ["create"] for a in verb(c)[:3])
+    assert [verb(c)[:4] for c in calls if c["tool"] == "kubectl" and verb(c)[:1] == ["create"]
+            and "secret" in verb(c)] == [["create", "secret", "generic", "krateo-agentiko-pull"]]
     # diagnostics were taken BEFORE the delete, and the delete still happened
     idx_logs = max(i for i, c in enumerate(calls)
                    if c["tool"] == "kubectl" and verb(c)[:1] == ["logs"])
