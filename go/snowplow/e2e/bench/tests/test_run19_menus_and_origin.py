@@ -71,6 +71,10 @@ def test_each_class_is_preflighted_as_a_dedicated_identity_no_k6_user_shares():
         assert rbac_model.menu_class(c["groups"], M) == c["class"]
         assert tuple(sorted(c["groups"])) not in driven and c["user"] not in names
     assert [c["user"] for c in p["classes"]] == ["scaleuser-menuclass-1", "scaleuser-menuclass-2"]
+    # #999 review N4: the classes come from the model data606 creates the users with
+    _, _, class_of = load606_job.k6_population(1000, 50, 5, 200, False)
+    assert [class_of(i) for i in (2, 10, 11)] == [ADMINS, ADMINS, "devs"]
+    assert rbac_model.bench_model(1000, 50).admins == 10
 
 
 def test_the_class_identities_manifest_and_cleanup():
@@ -95,6 +99,22 @@ def test_grant_scope_reads_the_rbac_the_data_step_applies():
             if d and d["kind"] == "ClusterRoleBinding":
                 assert rbac_model.grant_scope(d["subjects"][0]["name"], M) == ("*",)
     assert rbac_model.grant_scope("devs", M) is None
+
+
+def test_grant_scope_follows_the_rbac_not_the_names(monkeypatch):
+    """#999 review N3: bind a team in krateo-system (a portal namespace) and
+    its group's scope, and so the menu class, follow the RBAC."""
+    real = rbac_model.rbac_yaml
+    monkeypatch.setattr(rbac_model, "rbac_yaml",
+                        lambda n: [real(n)[0].replace("namespace: bench-ns-01", "namespace: krateo-system")]
+                        + real(n)[1:])
+    rbac_model.grant_scopes.cache_clear()
+    try:
+        assert rbac_model.grant_scope("bench-team-01", M) == ("krateo-system",)
+        assert rbac_model.menu_class(rbac_model.user_groups(1, M), M) == "bench-platform-admins+bench-team-01+devs"
+    finally:
+        monkeypatch.undo()
+        rbac_model.grant_scopes.cache_clear()
 
 
 def _args(**kw):

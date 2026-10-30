@@ -1588,9 +1588,11 @@ def test_run606_k6_end_to_end(harness):
         paths = [r["path"] for r in cfg["menuClasses"][c["class"]]]
         assert paths == ["/dashboard", "/observability", "/compositions", f"/only-c{k}"], (c["class"], paths)
     assert [r["path"] for r in cfg["routes"]] == ["/dashboard", "/observability", "/compositions"]
-    # the identities are deleted after their walks (and again at collect)
-    dels = [c["argv"] for c in calls if c["tool"] == "kubectl" and "delete" in c["argv"]]
-    assert any("bench.krateo.io/menu-class=true" in a for d in dels for a in d)
+    # the identities are deleted right after their walks, BEFORE the reboot (and again at collect)
+    kc = [c["argv"] for c in calls if c["tool"] == "kubectl"]
+    first_del = next(i for i, a in enumerate(kc) if "delete" in a and "bench.krateo.io/menu-class=true" in a)
+    reboot = next(i for i, a in enumerate(kc) if "rollout" in a and "restart" in a)
+    assert first_del < reboot
     assert v["report"]["navs"] == 60                       # the browsers' page loads
     jp = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}
