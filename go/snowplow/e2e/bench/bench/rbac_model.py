@@ -25,6 +25,7 @@ so the run proof can state the population shape it measured.
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 __all__ = [
     "RbacModel",
@@ -34,6 +35,9 @@ __all__ = [
     "namespace_rbac_yaml",
     "admin_rbac_yaml",
     "READER_RULES",
+    "team_namespace",
+    "grant_scope",
+    "menu_class",
 ]
 
 BASE_GROUP = "devs"
@@ -75,6 +79,56 @@ def bench_model(users: int, namespaces: int) -> "RbacModel":
 
 def team_group(ns_index: int) -> str:
     return f"bench-team-{ns_index:02d}"
+
+
+def team_namespace(ns_index: int) -> str:
+    """The bench data namespace team NN owns (its compositions, nothing of the portal's)."""
+    return f"bench-ns-{ns_index:02d}"
+
+
+def rbac_yaml(namespaces: int) -> list[str]:
+    """Every RBAC document the data step applies (data606), in its order:
+    each team's Role + RoleBinding, then the admins' ClusterRole + binding."""
+    return [namespace_rbac_yaml(n) for n in range(1, namespaces + 1)] + [admin_rbac_yaml()]
+
+
+@functools.lru_cache(maxsize=None)
+def grant_scopes(namespaces: int) -> dict[str, tuple[str, ...]]:
+    """{group: the namespaces the bench's RBAC binds it in ("*": a
+    ClusterRoleBinding)}, READ from the documents the data step applies
+    (rbac_yaml), never paired by name (#999 review N3)."""
+    import yaml
+    out: dict[str, set[str]] = {}
+    for text in rbac_yaml(namespaces):
+        for d in yaml.safe_load_all(text):
+            if not isinstance(d, dict) or d.get("kind") not in ("RoleBinding", "ClusterRoleBinding"):
+                continue
+            where = d["metadata"]["namespace"] if d["kind"] == "RoleBinding" else "*"
+            for sub in d.get("subjects") or []:
+                if sub.get("kind") == "Group":
+                    out.setdefault(sub["name"], set()).add(where)
+    return {g: tuple(sorted(ns)) for g, ns in out.items()}
+
+
+def grant_scope(group: str, m: RbacModel) -> tuple[str, ...] | None:
+    """Where the bench's RBAC lets `group` read (grant_scopes); None for a
+    group the bench does not bind at all (the portal's base group: its
+    grants are the platform's own)."""
+    return grant_scopes(m.namespaces).get(group)
+
+
+def menu_class(groups, m: RbacModel) -> str:
+    """The identity class of a user's portal MENU (run 17 attempt 5: the
+    portal filters its sidebar by RBAC, so admins see pages devs do not).
+    Its groups, less every group whose grants this model confines to bench
+    data namespaces: those hold compositions, never a portal page, so they
+    cannot change which pages a menu offers. A group the bench does not bind
+    (the platform grants it) and a cluster-wide one are kept. The label is
+    the kept groups, sorted, '+'-joined."""
+    data = {team_namespace(n) for n in range(1, m.namespaces + 1)}
+    kept = sorted(g for g in groups
+                  if (s := grant_scope(g, m)) is None or not set(s) <= data)
+    return "+".join(kept)
 
 
 def _home_team(i: int, m: RbacModel) -> int:
@@ -134,7 +188,7 @@ def _rules_yaml(rules) -> str:
 
 def namespace_rbac_yaml(ns_index: int) -> str:
     """Role + RoleBinding giving team NN read access to bench-ns-NN."""
-    ns = f"bench-ns-{ns_index:02d}"
+    ns = team_namespace(ns_index)
     grp = team_group(ns_index)
     return f"""\
 apiVersion: rbac.authorization.k8s.io/v1

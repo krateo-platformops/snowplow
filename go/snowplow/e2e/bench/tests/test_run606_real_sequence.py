@@ -163,10 +163,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         import yaml
         f = a[a.index("-f") + 1]
         text = sys.stdin.read() if f == "-" else (open(f).read() if os.path.isfile(f) else "")
-        with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh:
+        with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh, \\
+                open(os.path.join(STATE, "applied-jobs"), "a") as jobs:
             for d in yaml.safe_load_all(text):
                 if isinstance(d, dict):
                     fh.write(json.dumps([d.get("apiVersion"), d.get("kind")]) + "\\n")
+                    if d.get("kind") == "Job":
+                        jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
     # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
     # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the
@@ -745,7 +748,19 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             init = os.environ.get("FAKE_INIT", "/call?resource=layouts&apiVersion="
                                   "widgets.templates.krateo.io/v1beta1&name=app-shell"
                                   "&namespace=krateo-system")
-            print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system"},
+            # the installer's path-mode URLs (one origin, 057's paths); FAKE_PORTAL=split:
+            # the localhost defaults a config keeps until the gateway has an address
+            if os.environ.get("FAKE_PORTAL") == "split":
+                urls = {"SNOWPLOW_API_BASE_URL": "http://localhost:8081",
+                        "AUTHN_API_BASE_URL": "http://localhost:8082",
+                        "EVENTS_API_BASE_URL": "http://localhost:8083",
+                        "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"}
+            else:
+                urls = {"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/content",
+                        "AUTHN_API_BASE_URL": "http://10.0.0.9/auth",
+                        "EVENTS_API_BASE_URL": "http://10.0.0.9/events",
+                        "EVENTS_PUSH_API_BASE_URL": "http://10.0.0.9/events"}
+            print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system", **urls},
                               "params": {"FRONTEND_NAMESPACE": "krateo-system"}}))
             sys.exit(0)
         if (what == "pods" and "app.kubernetes.io/name=snowplow" in a
@@ -762,15 +777,27 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what == "job/load606":                       # ready/failed/completions
             print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
             sys.exit(0)
-        if what == "job" and "preflight606" in a:
-            refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
+        if what == "job" and any(x.startswith("preflight606") for x in a):   # + each menu class's
+            # a preflight Job answers only once the run APPLIED it (#999 review B2): else NotFound
+            job = next(x for x in a if x.startswith("preflight606"))
+            jf = os.path.join(STATE, "applied-jobs")
+            if job not in (open(jf).read().split() if os.path.exists(jf) else []):
+                print(f'Error from server (NotFound): jobs.batch "{job}" not found', file=sys.stderr)
+                sys.exit(1)
+            # FAKE_PREFLIGHT=refused: the run's preflight refuses; FAKE_PREFLIGHT_REFUSE_JOB: that Job alone
+            refused = (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
+                       or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("" if refused else "1"); sys.exit(0)
             if any(x.endswith("{.status.failed}") for x in a):
                 print("1" if refused else ""); sys.exit(0)
         sys.exit(0)
     if a[:1] == ["logs"] and any("preflight606" in x for x in a):
-        if os.environ.get("FAKE_PREFLIGHT", "ok") == "refused":
+        job = next(x for x in a if "preflight606" in x).split("/", 1)[-1]
+        # each Job its OWN table: a class's Job adds a route only it has (#999 review B2)
+        own = [] if job == "preflight606" else ["/only-" + job.rsplit("-", 1)[1]]
+        if (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
+                or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job):
             print(json.dumps({"kind": "preflight", "ok": False, "init_status": 200,
                               "routes": [], "refused": [{"path": "/dashboard", "status": 500,
                               "body": "no matches for widgets.templates.krateo.io/v1beta1, Resource=pages"}],
@@ -780,7 +807,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(json.dumps({"kind": "preflight", "ok": True, "init_status": 200,
                               "routes": [{"path": p, "status": 200, "endpoint":
                                           "/call?resource=flexes&name=page" + p.replace("/", "-")}
-                                         for p in ("/dashboard", "/observability", "/compositions")],
+                                         for p in ("/dashboard", "/observability", "/compositions", *own)],
                               "refused": [], "product_errors": [
                                   {"path": "/agents/new", "status": 500,
                                    "body": "unexpected end of JSON input"}],
@@ -1148,3 +1175,34 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
                      if c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"])
     assert idx_logs < idx_delete
     assert all(c["context"] in (KCTX, None) for c in calls if c["tool"] in ("kubectl", "helm"))
+
+
+def test_a_portal_on_several_origins_stops_the_run_at_the_platform_step(harness):
+    """Run 19: the browser must load the portal from ONE origin (057's
+    gateway). A config.json that keeps the installer's localhost defaults
+    (four origins: the gateway has no address yet, or path mode is off)
+    stops the run at the platform step, before data and load are paid for,
+    with what config.json said; the cluster is still torn down."""
+    env, state, ambient, tmp = harness
+    env["FAKE_PORTAL"] = "split"
+    env["DEPLOY_WAIT_S"] = "1"            # the gate's deadline: the platform's and deploy's budgets
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert "portal origin FAILED" in out and "3 origins" in out
+    assert "=== step preflight ===" not in out and "=== step data ===" not in out
+    fails = [json.loads(ln) for ln in (tmp / "out" / "command-failures.jsonl").read_text().splitlines()]
+    assert any(f["step"] == "platform" and "portal origin FAILED" in f["what"] for f in fails)
+    calls = _calls(state)
+    assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)
+
+
+def test_the_real_sequence_reads_the_portal_origin_from_config(harness):
+    env, state, ambient, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    assert "portal origin (config.json): http://10.0.0.9; snowplow at http://10.0.0.9/content" in p.stderr
+    vals = (tmp / "out" / "installer-values.yaml").read_text()
+    assert "type: Gateway" in vals and "gatewayMode: path" in vals and "agentGateway: true" in vals

@@ -1,7 +1,7 @@
 """#834 review nits, folded into run 12's PR:
 1. the browser wrapper's forward wait is bounded per attempt: a port that
    streams at / (headers, then keepalives forever) answered, and must not
-   hold the wait open past FORWARD_WAIT_S (it hung > 90 s on a 20 s budget);
+   hold the wait open past ORIGIN_WAIT_S (it hung > 90 s on a 20 s budget);
 2. run606's driver wait fails fast, with the reason, when a load or browser
    pod stays Pending / in Init (a forwarder whose startupProbe never passes)
    instead of only at MEASURE_WAIT_S."""
@@ -23,11 +23,11 @@ FIX = BENCH_DIR / "tests" / "fixtures"
 
 
 def _wait_fn() -> str:
-    """The rendered browser container's wait_forwards function."""
-    y = k6_job.render_browser(config={"sessions": []}, forwards=["8080=x:1"], linger_s=0)
+    """The rendered browser container's wait for the portal's origin."""
+    y = k6_job.render_browser(config={"sessions": [], "frontendUrl": "http://127.0.0.1:8080"}, linger_s=0)
     job = next(d for d in yaml.safe_load_all(y) if d and d["kind"] == "Job")
     args = job["spec"]["template"]["spec"]["containers"][0]["args"][0]
-    return args[args.index("wait_forwards() {"):args.index("wait_forwards && ")]
+    return args[args.index("wait_origin() {"):args.index("wait_origin && ")]
 
 
 def _run_wait(tmp_path, ports: str, budget_s: int):
@@ -35,8 +35,9 @@ def _run_wait(tmp_path, ports: str, budget_s: int):
     out = tmp_path / "out"
     out.mkdir(mode=0o777)
     out.chmod(0o777)
-    script = (_wait_fn().replace("for p in 8080; do", f"for p in {ports}; do")
-              + "wait_forwards; echo rc=$?\n")
+    urls = " ".join(f"http://127.0.0.1:{p}/" for p in ports.split())
+    script = (_wait_fn().replace("for u in http://127.0.0.1:8080/; do", f"for u in {urls}; do")
+              + "wait_origin; echo rc=$?\n")
     subprocess.run(["docker", "run", "-d", "--name", name, "-v", f"{FIX}:/f:ro",
                     "python:3.12-slim", "python3", "-u", "/f/k6_stream_fixture.py"],
                    capture_output=True, check=True)
@@ -50,7 +51,7 @@ def _run_wait(tmp_path, ports: str, budget_s: int):
                         "        time.sleep(0.05)\n"], capture_output=True, check=True)
         t0 = time.time()
         p = subprocess.run(["docker", "run", "--rm", "--network", f"container:{name}",
-                            "-v", f"{out}:/out", "-e", f"FORWARD_WAIT_S={budget_s}",
+                            "-v", f"{out}:/out", "-e", f"ORIGIN_WAIT_S={budget_s}",
                             "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE, "-c", script],
                            capture_output=True, text=True, timeout=120)
         took = time.time() - t0
@@ -64,20 +65,21 @@ def test_a_streaming_port_answers_and_does_not_hold_the_wait(tmp_path):
     p, took, fw = _run_wait(tmp_path, "8080", budget_s=20)
     assert "rc=0" in p.stdout, p.stdout + p.stderr
     assert fw["ok"] is True
-    # one attempt at most: FORWARD_ATTEMPT_S + 2 s kill grace (+ docker start)
-    assert took < k6_job.FORWARD_ATTEMPT_S + 2 + 8, took
+    # one attempt at most: ORIGIN_ATTEMPT_S + 2 s kill grace (+ docker start)
+    assert took < k6_job.ORIGIN_ATTEMPT_S + 2 + 8, took
 
 
 @needs_docker
 def test_a_silent_port_fails_the_wait_within_its_budget(tmp_path):
     p, took, fw = _run_wait(tmp_path, "8081", budget_s=6)
     assert "rc=3" in p.stdout and "did not answer within 6s" in p.stderr, p.stdout + p.stderr
-    assert fw["ok"] is False and fw["port"] == 8081
-    assert took < 6 + k6_job.FORWARD_ATTEMPT_S + 2 + 8, took
+    assert fw["ok"] is False and fw["url"] == "http://127.0.0.1:8081/"
+    assert took < 6 + k6_job.ORIGIN_ATTEMPT_S + 2 + 8, took
 
 
 def test_every_attempt_has_an_overall_time_limit():
-    assert f"timeout -k 2 {k6_job.FORWARD_ATTEMPT_S} wget " in _wait_fn()
+    assert f"timeout -k 2 {k6_job.ORIGIN_ATTEMPT_S} wget " in _wait_fn()
+    assert "for u in http://127.0.0.1:8080/; do" in _wait_fn()        # the docker arms rewrite this line
 
 
 # ─── 2. a driver pod that never starts fails the driver wait at once ───────

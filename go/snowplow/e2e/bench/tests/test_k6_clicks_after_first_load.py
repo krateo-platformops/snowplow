@@ -39,7 +39,7 @@ def _k6_navigate(tmp_path, *, users=6, burst=2, duration_s=12, burst_at_s=4):
     shutil.copy(BENCH_DIR / "k6" / "navigate.js", k6dir / "navigate.js")
     shutil.copy(FIX / "k6_spa_stub.js", k6dir / "spa.js")
     cfg = k6_job.k6_config(snowplow_url=f"http://{fx}:8081", init=INIT, frontend_ns=NS,
-                           builders_ns=NS, routes=ROUTES, users=users, burst_users=burst,
+                           builders_ns=NS, routes=ROUTES, menu_classes={"devs": ROUTES}, class_of=lambda i: "devs", users=users, burst_users=burst,
                            think_s=THINK_S, duration_s=duration_s, burst_at_s=burst_at_s,
                            composite_routes=["/b"] if burst else [], viewers=False)
     (k6dir / "config.json").write_text(json.dumps(cfg))

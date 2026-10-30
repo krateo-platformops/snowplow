@@ -215,3 +215,20 @@ export function fnv1a (s) {
 export function pickRoute (routes, user, visit) {
   return routes.length ? routes[fnv1a(`${user}#${visit}`) % routes.length] : null
 }
+
+// A user's own menu against the route table of its identity class (that
+// class's preflight, run606 s_classes): the same (path, endpoint) pairs, menu
+// order aside. The portal filters its menu by RBAC (a page in a namespace
+// the user cannot read is not in it), so there is one table per class,
+// never one for every user (run 17 attempt 5: the 9 admins' menus).
+export function sameMenu (routes, table) {
+  const key = (rs) => (rs || []).map((r) => `${r.path} ${r.endpoint}`).sort().join('\n')
+  return key(routes) === key(table)
+}
+
+// The routes a user's clicks pick from: its own menu, as the SPA's sidebar
+// offers them. A user whose first load failed has no menu of its own, so it
+// clicks from its class's table (the menu that load would have shown).
+export function userRoutes (fl, failed, classTable) {
+  return failed ? classTable : fl.routes
+}

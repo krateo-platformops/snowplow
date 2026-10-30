@@ -229,12 +229,13 @@ def test_a_plan_beyond_the_ttl_is_refused_before_any_cloud_call(tmp_path, env, n
 
 def test_a_plan_inside_the_margin_but_under_the_ttl_is_refused(tmp_path):
     """R11: the margin is part of the bar. The DEFAULT plan's budget is
-    37,098 s (the script's own budget line; 35,670 s + the 828 s evaluate
-    term, #898, + 2 x 300 s for the platform definitions, #960), against TTL
-    39,600 s − 1,800 s margin = 37,800 s: it fits. THIS test's plan adds
-    2,400 s of data budget (THINK_S=60, DATA_TIMEOUT_S=4800): 39,498 s, under
-    the raw TTL but inside the margin → refused."""
-    p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="4800")
+    37,698 s (the script's own budget line; 35,670 s + the 828 s evaluate
+    term, #898, + 2 x 300 s for the platform definitions, #960, + 2 x 300 s
+    for the two menu classes' preflights, run 19), against TTL 39,600 s −
+    1,800 s margin = 37,800 s: it fits. THIS test's plan adds 1,800 s of data
+    budget (THINK_S=60, DATA_TIMEOUT_S=4200): 39,498 s, under the raw TTL but
+    inside the margin → refused."""
+    p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="4200")
     assert p.returncode == 2 and "refusing: worst-case run 39498 s" in p.stderr
 
 
