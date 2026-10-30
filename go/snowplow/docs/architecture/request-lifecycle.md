@@ -145,7 +145,8 @@ bytes leave the pod (`widget_content.go`). The shell is never served verbatim.
 The mux is wrapped (inner → outer) by **gzip** (`gzhttp` via
 `middleware/compression.go` — Accept-Encoding-gated, SSE-excluded so
 `/refreshes` keeps per-event flush; non-gzip clients are byte-identical), then
-**otelhttp** (no-op spans unless tracing is enabled — see
+**otelhttp** via `tracing.NewServerHandler` (one `Server` span per request,
+named `<METHOD> <route>`; no-op spans unless tracing is enabled — see
 [observability.md](observability.md)), then the **audit middleware**
 (`internal/support/audit` — session correlation rides W3C `baggage`
 `session.id`), then **CORS** (`snowplowCORSOptions` in `main.go`: exposes the

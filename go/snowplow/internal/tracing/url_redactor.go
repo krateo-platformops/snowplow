@@ -5,6 +5,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/krateo-platformops/snowplow/internal/redact"
 )
@@ -15,12 +16,23 @@ import (
 // differently-versioned instrumentation cannot route around the redactor.
 //
 // Deliberately NOT in this list: `url.path`, `http.route`, `http.target` and
-// `server.address`, which carry no query. snowplow's own SERVER spans record
-// url.path only (main.go), so they are unaffected either way.
+// `server.address`, which carry no query. url.path is handled separately, on
+// Server spans only (serverPathKey below).
 var urlAttrKeys = [...]attribute.Key{"url.full", "http.url"}
 
+// serverPathKey is dropped from every SERVER span (#1013). otelhttp records the
+// raw request path as url.path, and a raw path can carry a name: snowplow's own
+// routes are all literal ("/call", "/call/read", …), so the only paths that
+// differ from their route are ones the client chose freely, e.g. an unmatched
+// "/call/<name>" that the mux 404s, or a "/swagger/<name>". The span already
+// carries the templated http.route (NewServerHandler), which is what the SLIs
+// and every view group on, so url.path adds nothing but that exposure. Client
+// spans keep it: their path is a RESTAction endpoint snowplow itself built.
+const serverPathKey attribute.Key = "url.path"
+
 // redactingExporter strips credentials out of URL-bearing span attributes on
-// the way out of the process (#489).
+// the way out of the process (#489), and the raw path out of Server spans
+// (#1013).
 //
 // WHY AT THE EXPORTER, and not at a SpanProcessor's OnStart: otelhttp records
 // url.full on the span AFTER trace.Start returns, so an OnStart rewrite is
@@ -65,28 +77,29 @@ func (e redactingExporter) ExportSpans(ctx context.Context, spans []sdktrace.Rea
 }
 
 // redactSpanURLs returns s with every URL attribute rendered through
-// redact.URL (userinfo dropped, query values replaced, keys kept), or s itself
-// when there was nothing to change.
+// redact.URL (userinfo dropped, query values replaced, keys kept) and, on a
+// Server span, url.path removed; or s itself when there was nothing to change.
 func redactSpanURLs(s sdktrace.ReadOnlySpan) sdktrace.ReadOnlySpan {
 	if s == nil {
 		return s
 	}
+	server := s.SpanKind() == trace.SpanKindServer
 	attrs := s.Attributes()
-	var out []attribute.KeyValue
+	var out []attribute.KeyValue // nil until the first change, then the rewritten list
 	for i, a := range attrs {
-		if a.Value.Type() != attribute.STRING || !isURLAttr(a.Key) {
-			continue
+		drop := server && a.Key == serverPathKey
+		changed := drop
+		if !drop && a.Value.Type() == attribute.STRING && isURLAttr(a.Key) {
+			if safe := redact.URL(a.Value.AsString()); safe != a.Value.AsString() {
+				a, changed = a.Key.String(safe), true
+			}
 		}
-		raw := a.Value.AsString()
-		safe := redact.URL(raw)
-		if safe == raw {
-			continue
+		if changed && out == nil {
+			out = append(make([]attribute.KeyValue, 0, len(attrs)), attrs[:i]...)
 		}
-		if out == nil {
-			out = make([]attribute.KeyValue, len(attrs))
-			copy(out, attrs)
+		if out != nil && !drop {
+			out = append(out, a)
 		}
-		out[i] = a.Key.String(safe)
 	}
 	if out == nil {
 		return s
@@ -104,9 +117,9 @@ func isURLAttr(k attribute.Key) bool {
 }
 
 // redactedSpan is the exported view of a span whose URL attributes have been
-// rewritten. Embedding the ReadOnlySpan interface promotes every other method
-// (including the SDK's unexported marker), so this stays a faithful view of
-// the original span with exactly one field substituted.
+// rewritten or dropped. Embedding the ReadOnlySpan interface promotes every
+// other method (including the SDK's unexported marker), so this stays a
+// faithful view of the original span with exactly one field substituted.
 type redactedSpan struct {
 	sdktrace.ReadOnlySpan
 	attrs []attribute.KeyValue

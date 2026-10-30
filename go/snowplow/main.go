@@ -46,8 +46,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
 
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/transport"
 )
@@ -117,6 +115,27 @@ func snowplowCORSOptions() cors.Options {
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
 	}
+}
+
+// newServerHandler is the http.Server's handler around the route table, from
+// the outside in:
+//
+//   - use.CORS is OUTERMOST, so it answers the OPTIONS preflight before the
+//     tracing layer runs (a preflight is CORS's, not a served API request).
+//   - tracing.NewServerHandler gives every served request exactly one Server
+//     span named "<METHOD> <route>" with the templated http.route, and
+//     extracts the inbound W3C traceparent/baggage (#1013). With tracing off
+//     the global TracerProvider is the no-op default and it records nothing;
+//     otelhttp's HTTP server metrics still flow when metrics are on.
+//   - middleware.Gzip is INNERMOST (Track 2): it compresses the handler's
+//     actual response bytes while the span still measures the whole request.
+//     text/event-stream (GET /refreshes) is excluded so the SSE stream keeps
+//     its per-event flush (T2-2); non-gzip clients are byte-identical.
+//
+// It is a function so the composition the pod serves is the one the tests
+// drive (main_server_spans_test.go).
+func newServerHandler(mux *http.ServeMux) http.Handler {
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(middleware.Gzip(mux), mux))
 }
 
 // mountCallWriteRoutes mounts the write-verb /call routes and their #443
@@ -1384,43 +1403,9 @@ func main() {
 	}...)
 	defer stop()
 
-	// Track 2 (transport gzip) — wrap the mux with Accept-Encoding-gated gzip
-	// compression BEFORE otelhttp so gzip is the INNERMOST wrapper (closest to
-	// the mux): it compresses the handler's actual response bytes, and the
-	// otelhttp span still measures the full request incl. the compressed
-	// write. text/event-stream (GET /refreshes) is excluded so the SSE stream
-	// keeps its per-event incremental flush (middleware.Gzip / T2-2). Non-gzip
-	// clients + curl diagnostics are byte-identical (gzhttp only compresses on
-	// Accept-Encoding: gzip). See middleware/compression.go.
-	var muxHandler http.Handler = middleware.Gzip(mux)
-
-	// OTel HTTP server instrumentation (default-OFF gated). otelhttp wraps
-	// the mux to create a server span per request and EXTRACT inbound W3C
-	// traceparent/baggage (the global propagator installed by
-	// tracing.Setup). When tracing is disabled the global TracerProvider is
-	// the no-op default, so otelhttp.NewHandler produces no spans and adds
-	// negligible overhead — the off-path stays effectively byte-identical.
-	//
-	// The wrap sits INSIDE use.CORS so CORS remains OUTERMOST and answers
-	// the OPTIONS preflight before otelhttp ever runs (otelhttp would
-	// otherwise span the preflight; CORS must own it). WithFilter skips
-	// span creation for the high-frequency health/readiness/debug probes.
-	var rootHandler http.Handler = otelhttp.NewHandler(muxHandler, serviceName,
-		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			return r.Method + " " + r.URL.Path
-		}),
-		otelhttp.WithFilter(func(r *http.Request) bool {
-			switch r.URL.Path {
-			case "/health", "/readyz":
-				return false
-			}
-			return !strings.HasPrefix(r.URL.Path, "/debug/")
-		}),
-	)
-
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
-		Handler:      use.CORS(snowplowCORSOptions())(rootHandler),
+		Handler:      newServerHandler(mux),
 		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
 		WriteTimeout: writeTimeout,     // 300s — clears cache-OFF heavy path (#351/C2)
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
