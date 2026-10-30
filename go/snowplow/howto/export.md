@@ -32,18 +32,29 @@ GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format
 
 The `apiVersion` / `resource` / `name` / `namespace` parameters are the
 standard `/call` ones. Authentication is the same JWT used for `/call`.
-The export parameters below are stripped before the request is
-re-dispatched through `/call`. Every other parameter is forwarded to it
-unchanged.
+The export's own parameters (`format`, `path`, `fields`, `header`, `title`,
+`filename`) are stripped before the request is re-dispatched through
+`/call`. Every other parameter, `extras` and `page`/`perPage` included, is
+forwarded to it.
 
 **Extras:** pass a widget's or RESTAction's `extras` (for example the
 filters a table shows on screen) as the query parameter
 `extras=<URL-encoded JSON>`, exactly as on `GET /call`. `/export` is a
 `GET` only: it does not take extras from a request body the way
-`POST /call/read` does. The re-dispatch carries the same `extras`, so the
-file holds exactly the rows the `/call` with those extras returns, and each
-re-dispatched page is served from the same resolved-cache cell as a `/call`
-of that window (`page`/`perPage`) with those extras.
+`POST /call/read` does.
+
+- **Same rows.** Every re-dispatched page carries the same `extras`, so the
+  file holds exactly the rows the `/call` with those extras returns.
+- **Invalid extras.** Extras that are not valid JSON are refused with the
+  same `400` as on `/call`, and nothing is exported.
+- **Cache cells.** Each page of a full-list export reads a 500-row window
+  (`page=N&perPage=500`). That window is its own resolved-cache cell,
+  shared only with a `/call` of the same window and extras. The pages a
+  screen shows at its own page size are different cells, so the first
+  export of a filter resolves its windows fresh.
+- **URL size.** Because `/export` is a `GET`, a filter too large for the
+  URL cannot be exported: the gateway answers `431` before snowplow sees
+  the request.
 
 | Parameter  | Default | Description |
 |------------|---------|-------------|
@@ -53,6 +64,7 @@ of that window (`page`/`perPage`) with those extras.
 | `header`   | dot-paths | Optional column **label**, one `header` parameter per field, repeated in `fields` order (below). |
 | `title`    | resource name | `pdf` only: the report title; csv and json ignore it. |
 | `filename` | derived | Attachment file name (sanitized; extension appended). |
+| `extras`   | none    | The widget's or RESTAction's extras as URL-encoded JSON, as on `GET /call`; forwarded to every re-dispatched page (above). |
 | `page` / `perPage` | full list | Export exactly that `/call` window. When **both** are omitted, the handler exports the **full list** (below). |
 
 ### Column header labels

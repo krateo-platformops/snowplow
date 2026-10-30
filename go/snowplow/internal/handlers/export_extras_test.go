@@ -54,8 +54,9 @@ var (
 
 const extrasNS970 = "krateo-system"
 
-// raFilter970 keeps the listed ConfigMaps whose team is the extras' team.
-const raFilter970 = `. as $x | {rows: ((.cms // []) | map(select(.team == $x.team)))}`
+// raFilter970 keeps the listed ConfigMaps whose team is the extras' team
+// and, on a paginated request, the window .slice asks for.
+const raFilter970 = `. as $x | {rows: ((.cms // []) | map(select(.team == $x.team)) | if $x.slice then .[$x.slice.offset:($x.slice.offset + $x.slice.perPage)] else . end)}`
 
 const cmFilter970 = `[.cms.items[] | {id: .metadata.name, team: .data.team}]`
 
@@ -292,6 +293,108 @@ func TestExport970_ExtrasReachTheCallAndItsCacheCell(t *testing.T) {
 	// reads are two cells — a reused key above is the extras' own cell.
 	if keys["green"] == keys["blue"] {
 		t.Errorf("green and blue reads share key %q: extras do not reach the key, so the reuse check proves nothing", keys["green"])
+	}
+}
+
+// TestExport970_ExtrasOnEveryPage — an export that walks several internal
+// pages carries the extras on EVERY re-dispatch, and each page lands on the
+// cell of a /call of that same window with those extras; the file is the
+// concatenation of those /call pages.
+func TestExport970_ExtrasOnEveryPage(t *testing.T) {
+	seedExtrasRESTAction(t)
+	dispatchers.RegisterL1LookupMetricsForTest()
+	setExportPaging(t, 2, 100) // 4 rows per team: pages 1 and 2 full, page 3 short
+
+	chain := Dispatcher(dispatchers.All())(Call())
+	type seen struct{ extras, page, perPage, key string }
+	var inner []seen
+	spy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chain.ServeHTTP(w, r)
+		q := r.URL.Query()
+		inner = append(inner, seen{q.Get("extras"), q.Get("page"), q.Get("perPage"), w.Header().Get("X-Snowplow-Refresh-Key")})
+	})
+	export := Export(spy)
+	coords := "apiVersion=templates.krateo.io/v1&resource=restactions&namespace=" + extrasNS970 + "&name=team-rows"
+	type row struct {
+		ID   string `json:"id"`
+		Team string `json:"team"`
+	}
+	for _, team := range []string{"green", "blue"} {
+		raw := `{"team":"` + team + `"}`
+		extras := url.QueryEscape(raw)
+		var want []row
+		keyByPage := map[string]string{}
+		for p := 1; p <= 3; p++ {
+			rec := serveAsDev(chain, "/call?"+coords+"&extras="+extras+"&page="+itoa(p)+"&perPage=2")
+			var ra struct {
+				Status struct {
+					Rows []row `json:"rows"`
+				} `json:"status"`
+			}
+			if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &ra) != nil {
+				t.Fatalf("%s: /call page %d: %d %s", team, p, rec.Code, rec.Body.String())
+			}
+			want = append(want, ra.Status.Rows...)
+			keyByPage[itoa(p)] = rec.Header().Get("X-Snowplow-Refresh-Key")
+		}
+		if len(want) != 4 {
+			t.Fatalf("%s: the paged /call gave %d rows, want 4 (the RESTAction must slice)", team, len(want))
+		}
+
+		inner = nil
+		hitsBefore := l1Hits(t)
+		storeBefore := cache.ResolvedCache().Len()
+		rec := serveAsDev(export, "/export?"+coords+"&extras="+extras+"&format=json&path=.status.rows")
+		var got []row
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
+			t.Fatalf("%s: /export: %d %s", team, rec.Code, rec.Body.String())
+		}
+		if len(inner) < 2 {
+			t.Fatalf("%s: the export walked %d page(s), want at least 2", team, len(inner))
+		}
+		for _, s := range inner {
+			if s.extras != raw {
+				t.Errorf("%s: page %s's re-dispatch carried extras %q, want %q", team, s.page, s.extras, raw)
+			}
+			if s.perPage != "2" || s.key == "" || s.key != keyByPage[s.page] {
+				t.Errorf("%s: page %s (perPage %s) used key %q, the /call of that window %q", team, s.page, s.perPage, s.key, keyByPage[s.page])
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: export rows %+v, want the /call pages %+v", team, got, want)
+		}
+		if hits := l1Hits(t) - hitsBefore; hits < float64(len(inner)) {
+			t.Errorf("%s: %v of %d re-dispatched pages were served from the /call cells", team, hits, len(inner))
+		}
+		if n := cache.ResolvedCache().Len(); n != storeBefore {
+			t.Errorf("%s: the export stored %d new cells; every page must reuse its window's", team, n-storeBefore)
+		}
+	}
+}
+
+// TestExport970_InvalidExtrasIs400LikeCall — extras that are not valid JSON
+// are refused by /export exactly as by /call (the same status and Status
+// body, passed through), for an explicit window and for the full list; the
+// export never goes ahead unfiltered.
+func TestExport970_InvalidExtrasIs400LikeCall(t *testing.T) {
+	seedExtrasRESTAction(t)
+	chain := Dispatcher(dispatchers.All())(Call())
+	export := Export(chain)
+	coords := "apiVersion=templates.krateo.io/v1&resource=restactions&namespace=" + extrasNS970 + "&name=team-rows"
+	bad := url.QueryEscape(`{"team":`)
+	for _, window := range []string{"&page=1&perPage=5", ""} {
+		callWindow := window
+		if callWindow == "" {
+			callWindow = "&page=1&perPage=" + itoa(exportPageSize) // what the full list's first page asks
+		}
+		call := serveAsDev(chain, "/call?"+coords+"&extras="+bad+callWindow)
+		exp := serveAsDev(export, "/export?"+coords+"&extras="+bad+"&format=json"+window)
+		if call.Code != http.StatusBadRequest {
+			t.Fatalf("window %q: /call answered %d to invalid extras, want 400", window, call.Code)
+		}
+		if exp.Code != call.Code || exp.Body.String() != call.Body.String() {
+			t.Errorf("window %q: /export answered %d %q, want /call's %d %q", window, exp.Code, exp.Body.String(), call.Code, call.Body.String())
+		}
 	}
 }
 
