@@ -119,6 +119,13 @@ FRESH_SAMPLES="${FRESH_SAMPLES:-60}"
 FRESH_GAP_S="${FRESH_GAP_S:-5}"
 HOLD_PROBE_WAIT_S="${HOLD_PROBE_WAIT_S:-60}"
 ENDPOINT_MODE="${ENDPOINT_MODE:-incluster}"
+# external = the per-component LoadBalancer IPs; the portal now rides ONE
+# gateway origin (s_install: exposure Gateway, path mode), whose Services are
+# ClusterIP: no such IP ever exists. Refused here, before any cloud call.
+if [[ "$ENDPOINT_MODE" != "incluster" ]]; then
+  echo "refusing: ENDPOINT_MODE=${ENDPOINT_MODE}: the portal is exposed through one gateway origin (path mode, as on 057); its components have no LoadBalancer IP of their own. Use ENDPOINT_MODE=incluster" >&2
+  exit 2
+fi
 ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
 ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
 REQUIRED_DEPLOYMENTS="${REQUIRED_DEPLOYMENTS:-snowplow frontend authn}"

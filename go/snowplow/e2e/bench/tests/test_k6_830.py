@@ -740,6 +740,13 @@ def _preflight(tmp_path):
     return f
 
 
+# the portal's one origin (run 19: the browser loads it as 057's users do)
+ORIGIN = ("--browser-origin", "http://10.0.0.9", "--browser-snowplow-url", "http://10.0.0.9/content")
+# the localhost forwarder, kept for a portal that names localhost peers
+FORWARDS = ["8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
+            "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
+
+
 def _render(tmp_path, *extra):
     import contextlib
     import io
@@ -749,14 +756,18 @@ def _render(tmp_path, *extra):
             "--authn-url", "http://authn.krateo-system.svc:8082", "--password", "pw-" + "bench",
             "--init", INIT, "--think-s", "60", "--duration-s", "1800",
             "--burst-users", "200", "--burst-at-s", "900", "--composite-route", "/compositions",
-            "--fresh-rates", "1", "--mem-duration-s", "60", *extra]
+            "--fresh-rates", "1", "--mem-duration-s", "60",
+            # each menu class's table (run606 s_classes): here the one portal menu
+            "--class-preflight", f"devs={tmp_path / 'preflight.jsonl'}",
+            "--class-preflight", f"bench-platform-admins+devs={tmp_path / 'preflight.jsonl'}",
+            *(extra or ORIGIN)]
     with contextlib.redirect_stdout(buf):
         assert load606_job.main(argv) == 0
     return list(yaml.safe_load_all(buf.getvalue()))
 
 
 def test_render_k6_driver(tmp_path):
-    docs = _render(tmp_path)
+    docs = _render(tmp_path, *[x for f in FORWARDS for x in ("--browser-forward", f)])
     by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
     # fresh606 and mem606 are unchanged beside the k6 Jobs; no load606 driver
     assert {("Job", "k6load"), ("Job", "k6browser"), ("Job", "fresh606"), ("Job", "mem606"),
@@ -805,15 +816,15 @@ def test_render_k6_driver(tmp_path):
     # the browser back until every local port accepts
     fw = b["spec"]["initContainers"]
     assert [x["name"] for x in fw] == ["forward"] and fw[0]["restartPolicy"] == "Always"
-    specs = ["8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
-             "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
+    specs = FORWARDS
     assert fw[0]["command"][-4:] == specs
     sp = fw[0]["startupProbe"]
     assert sp["exec"]["command"] == ["python3", "/opt/k6/forward.py", "--probe", *specs]
     assert sp["periodSeconds"] * sp["failureThreshold"] >= k6_job.FORWARD_WAIT_S
     # and the browser itself waits for an HTTP answer on every port first
     args = b["spec"]["containers"][0]["args"][0]
-    assert "for p in 8080 8081 8082 8083; do" in args
+    assert ("for u in http://127.0.0.1:8080/ http://127.0.0.1:8081/ http://127.0.0.1:8082/ "
+            "http://127.0.0.1:8083/; do") in args
     assert args.index("wait_forwards && ") < args.index("k6 run --quiet")
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
@@ -830,7 +841,7 @@ def test_render_k6_driver(tmp_path):
 
 
 def test_render_k6_without_viewers(tmp_path):
-    docs = _render(tmp_path, "--no-viewers")
+    docs = _render(tmp_path, "--no-viewers", *ORIGIN)
     by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
     k6 = by[("Job", "k6load")]["spec"]["template"]["spec"]
     assert [x["name"] for x in k6["containers"]] == ["k6"]
@@ -840,7 +851,7 @@ def test_render_k6_without_viewers(tmp_path):
 
 def test_render_k6_refuses_the_small_node_and_a_missing_route_table(tmp_path):
     with pytest.raises(ValueError, match="over budget"):
-        _render(tmp_path, "--loadgen-machine-type", "n2-standard-8")
+        _render(tmp_path, "--loadgen-machine-type", "n2-standard-8", *ORIGIN)
     import contextlib
     import io
     with pytest.raises(ValueError, match="no preflight route table"), \
@@ -1334,7 +1345,7 @@ def test_forwarder_never_listens_the_browser_does_not_start(tmp_path):
     p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=0, forward=False, forward_wait_s=5)
     assert p.returncode == 3 and "did not answer within 5s: not starting the browser" in p.stderr
     fw = json.loads((out / "browser-forward.json").read_text())
-    assert fw == {"kind": "forward_wait", "ok": False, "port": 8080, "waited_s": fw["waited_s"]}
+    assert fw == {"kind": "forward_wait", "ok": False, "url": "http://127.0.0.1:8080/", "waited_s": fw["waited_s"]}
     c = k6eval.browser_checks(k6eval.read_k6_out(str(out), "browser"), 3)[0]
     assert c["check"] == "browser.stream_complete" and c["result"] == "FAIL" and "rc=3" in c["why"]
 
@@ -1609,11 +1620,17 @@ def test_run606_k6_end_to_end(harness):
         assert val[n] == "PASS", (n, v["validity"])
     assert all(r == "PASS" for c, r in val.items() if c.startswith(("k6.", "browser.", "viewer.")))
     assert v["report"]["viewer_report_only"]["arms"] == 3
-    # the browser pod forwards the sse-proxy (:8083) like the other localhost URLs
-    fwd = next(d for d in yaml.safe_load_all((out / "loadgen-job.yaml").read_text())
-               if d and d["kind"] == "Job" and d["metadata"]["name"] == "k6browser")
-    assert "8083=krateo-sse-proxy.krateo-system.svc:8080" in \
-        fwd["spec"]["template"]["spec"]["initContainers"][0]["command"]
+    # run 19: the browser loads the portal from the one origin config.json names; no forwarder
+    docs = [d for d in yaml.safe_load_all((out / "loadgen-job.yaml").read_text()) if d]
+    fwd = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "k6browser")
+    assert "initContainers" not in fwd["spec"]["template"]["spec"]
+    bcm = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "k6browser")
+    assert json.loads(bcm["data"]["browser-config.json"])["frontendUrl"] == "http://10.0.0.9"
+    # each menu class k6 drives got its own preflight (run606 s_classes)
+    assert "menu class bench-platform-admins+devs: preflight as its lowest-index k6 user" in log
+    cfg = json.loads(next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "k6")
+                     ["data"]["config.json"])
+    assert set(cfg["menuClasses"]) == {"bench-platform-admins+devs", "devs"}
     assert v["report"]["navs"] == 60                       # the browsers' page loads
     jp = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}

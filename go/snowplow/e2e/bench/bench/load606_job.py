@@ -510,9 +510,6 @@ def render_k6_driver(a) -> str:
     from bench import k6_job
     viewers = not a.no_viewers
     forwards = list(a.browser_forward or [])
-    if not forwards and not (a.browser_origin and a.browser_snowplow_url):
-        raise ValueError("the browser needs the portal's origin and snowplow URL "
-                         "(--browser-origin, --browser-snowplow-url) or forwards")
     k6_job.loadgen_fit(a.loadgen_machine_type,
                        k6_job.k6_plan_requests(viewers=viewers, forwarder=bool(forwards)))
     _, burst_users, sessions, class_of = _k6_population(a)
@@ -526,6 +523,9 @@ def render_k6_driver(a) -> str:
         menu_classes = {c: routes for c in class_representatives(a)}
     else:
         raise ValueError(f"no preflight route table at {a.preflight_file!r}")
+    if not forwards and not (a.browser_origin and a.browser_snowplow_url):
+        raise ValueError("the browser needs the portal's origin and snowplow URL "
+                         "(--browser-origin, --browser-snowplow-url) or forwards")
     think_s = a.think_s if a.think_s > 0 or not a.dry_run else 1.0   # dry: printed, never run
     cfg = k6_job.k6_config(snowplow_url=a.snowplow_url, init=a.init, frontend_ns=a.frontend_ns,
                            builders_ns=a.builders_ns, routes=routes, users=a.users,

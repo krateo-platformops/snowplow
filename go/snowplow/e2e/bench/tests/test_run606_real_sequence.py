@@ -774,7 +774,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what == "job/load606":                       # ready/failed/completions
             print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
             sys.exit(0)
-        if what == "job" and "preflight606" in a:
+        if what == "job" and any(x.startswith("preflight606") for x in a):   # + each menu class's
             refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("" if refused else "1"); sys.exit(0)

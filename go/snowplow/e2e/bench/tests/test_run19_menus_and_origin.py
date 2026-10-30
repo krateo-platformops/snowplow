@@ -90,6 +90,13 @@ def test_a_class_preflight_job_has_its_own_name():
     job = [d for d in yaml.safe_load_all(y) if d and d["kind"] == "Job"][0]
     assert job["metadata"]["name"] == "preflight606-c2"
     assert job["spec"]["template"]["metadata"]["labels"]["app"] == "preflight606-c2"
+    # the CLI run606's classes step calls
+    p = subprocess.run([sys.executable, "-m", "bench.load606_job", "--preflight-only", "--preflight-job-name",
+                        "preflight606-c1", "--preflight-user", "u", "--snowplow-url", "s", "--authn-url", "a",
+                        "--password", "p", "--init", INIT], capture_output=True, text=True, cwd=BENCH_DIR, timeout=60)
+    assert p.returncode == 0, p.stderr
+    job = [d for d in yaml.safe_load_all(p.stdout) if d and d["kind"] == "Job"][0]
+    assert job["metadata"]["name"] == "preflight606-c1"
 
 
 # ─── k6's config: each user's class, each class's table ─────────────────────

@@ -3,8 +3,8 @@ IN_USE_ADDRESSES quota, 14 global) and gke-env died at once. The fix:
 
 - every step that talks HTTP to snowplow/authn runs IN-CLUSTER (load606 and
   fresh606 Jobs) against Service DNS — no external IP needed;
-- ENDPOINT_MODE=external keeps a bounded, reporting wait for LB IPs and fails
-  at once (clearly) when a Service is not type LoadBalancer;
+- ENDPOINT_MODE=external (LB IPs) is refused since run 19: the portal rides
+  one gateway origin and its Services are ClusterIP;
 - no step waits on the umbrella Installer Ready (never true on a
   credential-free bench: github-provider-kog 401, installer#484) — only the
   snowplow/frontend/authn Deployments.
@@ -110,36 +110,19 @@ def test_clusterip_only_services_still_reach_data_and_measure(harness):
     assert "installer Ready=False" in out
 
 
-def test_external_mode_pending_lb_waits_then_fails_clearly(harness):
+def test_external_mode_is_refused_before_any_cloud_call(harness):
+    """Run 19: the portal rides ONE gateway origin (exposure Gateway, path
+    mode, as on 057), whose component Services are ClusterIP, so the
+    per-component LoadBalancer IPs external mode read never exist. Refused
+    at once, before any cloud call, never a run that waits and fails."""
     env, state, ambient, tmp = harness
     env = _env483(env)
-    env.update(FAKE_SVC="pending", FAKE_483="pass", ENDPOINT_MODE="external",
-               ENDPOINT_WAIT_S="1", ENDPOINT_POLL_S="0.2")
+    env.update(ENDPOINT_MODE="external")
     p = _run(env)
-    out = p.stdout + p.stderr
-    assert p.returncode != 0
-    assert "endpoint mode: external" in out
-    assert "[env] waiting for LoadBalancer IPs:" in out          # it waited, with progress
-    assert "no LoadBalancer IP after 1s" in out
-    assert "IN_USE_ADDRESSES" in out                             # names the reason
-    assert "=== step data ===" not in p.stderr
-    gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
-    assert ["container", "clusters", "delete"] in gcl
-    svcs = json.loads((tmp / "out" / "diagnostics" / "services.json").read_text())
-    snow = next(s for s in svcs if s["name"] == "snowplow")
-    assert snow["type"] == "LoadBalancer" and not snow["lb_ingress"]
-
-
-def test_external_mode_clusterip_fails_at_once(harness):
-    env, state, ambient, tmp = harness
-    env = _env483(env)
-    env.update(FAKE_SVC="clusterip", FAKE_483="pass", ENDPOINT_MODE="external",
-               ENDPOINT_WAIT_S="600", ENDPOINT_POLL_S="5")
-    p = _run(env)
-    out = p.stdout + p.stderr
-    assert p.returncode != 0
-    assert "is type ClusterIP; it will never get an external IP" in out
-    assert "[env] waiting for LoadBalancer IPs" not in out       # no pointless wait
+    assert p.returncode == 2
+    assert "refusing: ENDPOINT_MODE=external" in p.stderr and "ENDPOINT_MODE=incluster" in p.stderr
+    assert "=== step" not in p.stderr
+    assert not [c for c in _calls(state) if c["tool"] in ("gcloud", "kubectl", "helm")]
 
 
 def test_no_bench_step_waits_on_the_umbrella_installer():
