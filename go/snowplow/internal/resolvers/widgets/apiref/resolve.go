@@ -60,9 +60,9 @@ type ResolveOptions struct {
 // The nav-STRUCTURE harvest needs ONLY the widget's bounded page-1
 // resourcesRefs.items[] (child nav endpoints), NOT composition DATA, and has no
 // use for a serve-time page-independent slice cache. Excluding it here falls
-// straight through to the bounded page-keyed resolveRA(ctx, PerPage, Page) in
-// Resolve (perPage=prewarmPageLimit()=5, page=1) — the composition GVR is LISTed
-// bounded/informer-served (the #121 1a branch), never a 60K materialization.
+// straight through to the page-keyed resolveRA(ctx, PerPage, Page) in Resolve,
+// at the walk's own pagination for that widget (#966: the slice its ref
+// declares — the walk resolves and keys each cell with the same pagination).
 //
 // SCOPE-PRECISE, NOT a resource/scale special-case (feedback_no_special_cases):
 // the exclusion reads the EXISTING generic discovery-walk scope marker, so ANY

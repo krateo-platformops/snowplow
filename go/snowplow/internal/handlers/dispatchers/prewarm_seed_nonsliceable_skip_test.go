@@ -286,7 +286,7 @@ func TestFixB_SeedSkipsKnownNonSliceable(t *testing.T) {
 	widgetKnown := fixBWidget("panel-known", "agg-known")
 	// FIX-B is the identity-free SHAPE-negative skip; FIX-G's per-key path finds
 	// no per-key verdict here, so this arm isolates FIX-B.
-	seedRAFullListForWidget(ctx, widgetKnown, "authn-ns", "krateo-system", "panel-known")
+	seedRAFullListForWidget(ctx, widgetKnown, "authn-ns", "krateo-system", "panel-known", newPrewarmPagination(5, 1))
 	if !bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-B GREEN: expected the skip_nonsliceable log for a known-non-sliceable widget "+
 			"(pre-check must consult the SAME shape the serve path recorded); logs:\n%s", buf.String())
@@ -297,7 +297,7 @@ func TestFixB_SeedSkipsKnownNonSliceable(t *testing.T) {
 	// verdict, not unconditional. ---
 	buf.Reset()
 	widgetUnknown := fixBWidget("panel-unknown", "agg-unknown")
-	seedRAFullListForWidget(ctx, widgetUnknown, "authn-ns", "krateo-system", "panel-unknown")
+	seedRAFullListForWidget(ctx, widgetUnknown, "authn-ns", "krateo-system", "panel-unknown", newPrewarmPagination(5, 1))
 	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-B CONTROL: an UNKNOWN-shape widget must NOT skip (no shape-negative recorded for agg-unknown); logs:\n%s", buf.String())
 	}
@@ -385,7 +385,7 @@ func TestFixG_SeedSkipsPerKeyNonPermanentNegative(t *testing.T) {
 	// skip fires attributed to the PER-KEY negative. Under the DIVERGENT fixture
 	// a widget-coordinate derivation (eg1) would key off binding-W and MISS. ---
 	buf.Reset()
-	seedRAFullListForWidget(ctx, widget, "authn-ns", "krateo-system", "panel-perkey")
+	seedRAFullListForWidget(ctx, widget, "authn-ns", "krateo-system", "panel-perkey", newPrewarmPagination(5, 1))
 	if !bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-G G2-B GREEN: expected the per-key skip under the RA-CR derivation on the DIVERGENT-binding "+
 			"fixture (eg2). A miss here is the eg1 defect (pre-check keyed off the widget binding); logs:\n%s", buf.String())
@@ -398,7 +398,7 @@ func TestFixG_SeedSkipsPerKeyNonPermanentNegative(t *testing.T) {
 	// recorded verdict → does NOT skip (proves the skip is gated on a present
 	// per-key verdict, not unconditional). ---
 	buf.Reset()
-	seedRAFullListForWidget(ctx, fixBWidget("panel-unrec", "perkey-unrec"), "authn-ns", "krateo-system", "panel-unrec")
+	seedRAFullListForWidget(ctx, fixBWidget("panel-unrec", "perkey-unrec"), "authn-ns", "krateo-system", "panel-unrec", newPrewarmPagination(5, 1))
 	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-G CONSULT: an identity with NO recorded per-key verdict must NOT skip; logs:\n%s", buf.String())
 	}

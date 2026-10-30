@@ -130,7 +130,7 @@ func (r *covRig) harvest(names []string) {
 		u.SetGroupVersionKind(schema.GroupVersionKind{
 			Group: covGVR().Group, Version: covGVR().Version, Kind: "Flex",
 		})
-		r.nav.harvestNavWidget(u, covGVR(), -1, -1, -1, -1)
+		r.nav.harvestNavWidget(u, covGVR(), unpaginatedPrewarm)
 	}
 }
 
@@ -756,7 +756,7 @@ func TestIssue220_CoverageSets_ConcurrentAccessIsRaceFree(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for i := 0; i < iterations; i++ {
-				nav.harvestNavWidget(widget("flex-"+strconv.Itoa(g)+"-"+strconv.Itoa(i)), gvr, -1, -1, -1, -1)
+				nav.harvestNavWidget(widget("flex-"+strconv.Itoa(g)+"-"+strconv.Itoa(i)), gvr, unpaginatedPrewarm)
 			}
 		}(g)
 	}

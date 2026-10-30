@@ -90,7 +90,6 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -156,32 +155,24 @@ func PrewarmPIPEnabled() bool {
 }
 
 // navWidgetEntry is one navigation widget CR captured during the
-// Phase-1 walk together with the GVR + pagination tuple it resolved
+// Phase-1 walk together with the GVR + the pagination it was reached
 // under. The seed loop re-resolves the SAME CR per cohort under per-
 // cohort identity and Puts the per-user widgets L1 entry.
-//
-// Ship 0.30.187 D2: the RESOLUTION tuple (PerPage, Page — passed to
-// widgets.Resolve) is DECOUPLED from the dispatcher-lookup KEY tuple
-// (KeyPerPage, KeyPage — passed to dispatchCacheLookupKey). Pre-0.30.187
-// both used the walker's prewarmPageLimit() default for no-slice
-// widgets, but the dispatcher's serve-time paginationInfo defaults to
-// (-1, -1) when the request URL carries no ?page/?perPage params —
-// seed→serve cells thus missed on every no-slice widget. The seed-key
-// tuple is now derived via deriveSeedKeyTuple from the /call Path the
-// walker reached the widget through; the resolution tuple stays
-// bounded by prewarmPageLimit() as the 0.30.127 storm guard.
 type navWidgetEntry struct {
-	W       *unstructured.Unstructured
-	GVR     schema.GroupVersionResource
-	PerPage int // resolution tuple — passed to widgets.Resolve
-	Page    int // resolution tuple — passed to widgets.Resolve
+	W   *unstructured.Unstructured
+	GVR schema.GroupVersionResource
 
-	// Ship 0.30.187 D2 — dispatcher-lookup KEY tuple. Set to (-1, -1)
-	// for widgets reached via a /call Path with no slice declared (the
-	// dispatcher's paginationInfo default), or to the declared (page,
-	// perPage) when the Path carries them. See deriveSeedKeyTuple.
-	KeyPerPage int
-	KeyPage    int
+	// Pagination is THE pagination of this widget's seed cell (#966): the
+	// seed resolves the widget with it AND keys the cell with it. It is the
+	// walk's pg (prewarmPaginationFor of the /call Path the walk reached the
+	// widget through), so the cell matches the dispatcher's serve-time
+	// paginationInfo for that URL and holds the body that request resolves.
+	//
+	// Before #966 the entry carried two tuples — a resolve tuple bounded at
+	// perPage=5 (0.30.127) and a key tuple of (-1,-1) for the same no-slice
+	// widget (0.30.187 D2) — so the cell held a perPage=5 body under the
+	// unpaginated key.
+	Pagination prewarmPagination
 
 	// #42 FIX-E — FIRST-NAV WALK ORDER. A monotonic sequence number
 	// assigned at harvest time. The Phase-1 walk visits nav roots in
@@ -432,30 +423,22 @@ func (h *navWidgetHarvester) BeginRoot() {
 	h.mu.Unlock()
 }
 
-// harvestNavWidget records a navigation widget CR plus the GVR +
-// pagination tuples it was reached under. Nil-safe: a nil harvester /
-// nil widget is a no-op (flag-off Phase 1 passes no harvester).
+// harvestNavWidget records a navigation widget CR plus the GVR + the
+// pagination it was reached under. Nil-safe: a nil harvester / nil widget
+// is a no-op (flag-off Phase 1 passes no harvester).
 //
-// Ship 0.30.187 D2: TWO pagination tuples are now passed.
-//   - resolvePerPage/resolvePage: what the walker passes to
-//     widgets.Resolve (bounded by prewarmPageLimit() for no-slice
-//     widgets — the 0.30.127 storm guard).
-//   - keyPerPage/keyPage: what the per-cohort seed loop passes to
-//     dispatchCacheLookupKey — derived from the /call Path the walker
-//     reached the widget through so the cell matches the dispatcher's
-//     serve-time lookup. See deriveSeedKeyTuple.
+// pg is the walk's one pagination for this widget (#966): the per-cohort
+// seed resolves the widget with it and keys the cell with it.
 //
-// Dedupe is over (gvr, ns, name, keyPerPage, keyPage) — the dispatcher-
-// key tuple — because that is the cell the seed populates. Two
-// different roots reaching the same widget via the same key tuple yield
+// Dedupe is over (gvr, ns, name, pg) — the cell the seed populates. Two
+// different roots reaching the same widget via the same pagination yield
 // one Put (idempotent — the resolver output is per-cohort identical for
-// a given key tuple).
-func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource,
-	resolvePerPage, resolvePage, keyPerPage, keyPage int) {
+// a given pagination).
+func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource, pg prewarmPagination) {
 	if h == nil || w == nil {
 		return
 	}
-	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), keyPerPage, keyPage)
+	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), pg.PerPage, pg.Page)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// ── 1.12.7 / #220 — RECORD THE REACH, ABOVE THE DEDUPE RETURN BELOW.
@@ -510,45 +493,10 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	h.entries[key] = navWidgetEntry{
 		W:          w.DeepCopy(),
 		GVR:        gvr,
-		PerPage:    resolvePerPage,
-		Page:       resolvePage,
-		KeyPerPage: keyPerPage,
-		KeyPage:    keyPage,
+		Pagination: pg,
 		NavOrder:   seq,
 		RootIndex:  rootIdx,
 	}
-}
-
-// deriveSeedKeyTuple computes the dispatcher-lookup key tuple
-// (perPage, page) the per-cohort seed Put MUST use for a widget the
-// walker reached via the given /call Path. Ship 0.30.187 D2.
-//
-// CONTRACT: the returned tuple MUST equal what the dispatcher's
-// paginationInfo (helpers.go:50-76) returns at serve time for a request
-// with that Path's query parameters.
-//
-//   - Empty path (root navigation widget — fetched directly via
-//     objects.Get, no /call Path) → the frontend's first request
-//     URL carries no slice params → paginationInfo returns (-1, -1) →
-//     seed-key tuple = (-1, -1).
-//   - Path with no page/perPage params → ParseCallPathPagination
-//     returns ok=false → paginationInfo returns (-1, -1) →
-//     seed-key tuple = (-1, -1).
-//   - Path with explicit ?page=N&perPage=M → ParseCallPathPagination
-//     returns the declared values → paginationInfo at serve time
-//     returns the same → seed-key tuple = (perPage=M, page=N).
-//
-// The returned order is (perPage, page) — matches the seedOneWidget
-// argument order to dispatchCacheLookupKey.
-func deriveSeedKeyTuple(callPath string) (perPage, page int) {
-	if callPath == "" {
-		return -1, -1
-	}
-	p, pp, ok := util.ParseCallPathPagination(callPath)
-	if !ok {
-		return -1, -1
-	}
-	return pp, p
 }
 
 // navWidgetHarvestKey is the canonical dedup key for harvested
@@ -1398,21 +1346,11 @@ func seedRestactionResolveAndPutProd(
 // dispatcher's canonical key. STRUCTURALLY MATCHES widgets.go:148-231:
 //
 //   - dispatchCacheLookupKey("widgets", group, version, resource, ns,
-//     name, KeyPerPage, KeyPage, nil) with the DISPATCHER-LOOKUP key
-//     tuple (Ship 0.30.187 D2 decoupling) so cohort A's first /call with
-//     no URL slice params hits the SAME cell as the seed Put. Pre-D2
-//     this used the RESOLUTION tuple (prewarmPageLimit()) which never
-//     matched the dispatcher's paginationInfo default of (-1, -1) and
-//     caused the 0.30.186 14/17 first-nav-hit defect.
+//     name, pg.PerPage, pg.Page, extras) and widgets.Resolve with the SAME
+//     pg = e.Pagination (#966), so the cell holds what a /call of the URL
+//     the walk reached the widget through resolves, and that /call hits it.
 //   - cache.WithL1KeyContext(ctx, key) before Resolve so the inner-call
 //     dep tracker records edges.
-//   - widgets.Resolve at widgets.go:187-193 (same entrypoint). The
-//     RESOLUTION tuple (e.PerPage, e.Page) stays bounded by
-//     prewarmPageLimit() — the 0.30.127 storm guard. For no-slice
-//     navigation widgets the resolved output is structurally invariant
-//     under pagination (no row fan-out at the top widget level — row
-//     data flows from declared-slice child resourcesRefs which carry
-//     their own URL-matching pagination).
 //   - encodeResolvedJSON + cacheHandle.Put + recordWidgetDeps —
 //     matches widgets.go:215-231 (recordWidgetDeps calls
 //     ensureWatcherInformerForGVR for the widget GVR + apiRef GVR +
@@ -1447,16 +1385,15 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// will fold the same identity a live request folds.
 	seedKeyExtras := effectiveKeyExtras(ctx, e.W.Object, nil)
 
-	// Ship 0.30.187 D2: the dispatcher-lookup key uses the KEY tuple
-	// (KeyPerPage, KeyPage) — derived from the /call Path the walker
-	// reached this widget through so the cell matches the dispatcher's
-	// serve-time paginationInfo. The resolution tuple (e.PerPage,
-	// e.Page) is still used for widgets.Resolve below (the 0.30.127
-	// storm guard).
+	// #966 — ONE pagination for this unit: the key below folds pg and the
+	// widgets.Resolve further down resolves with pg. It is the walk's
+	// pagination for the /call Path that reached the widget, so the cell
+	// matches the dispatcher's serve-time paginationInfo for that URL.
+	pg := e.Pagination
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, seedKeyExtras)
+		pg.PerPage, pg.Page, seedKeyExtras)
 	// Ship 0.30.188 — diagnostic slog: emit the widget seed Put cache
 	// key + components so it can be diff'd against the dispatcher_get
 	// and per_user_fallback_put log lines at widgets.go.
@@ -1464,7 +1401,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		key, inputs, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, seedKeyExtras)
+		pg.PerPage, pg.Page, seedKeyExtras)
 	if handle == nil || key == "" {
 		// L1 disabled or no identity — same defensive skip as
 		// seedOneRestaction.
@@ -1671,8 +1608,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// cache.GVRFor → discoverPluralInfo (the four-revert root cause).
 		RC:      rcFromCtx(resCtx),
 		AuthnNS: authnNS,
-		PerPage: e.PerPage,
-		Page:    e.Page,
+		// #966 — the pagination `key` above folds.
+		PerPage: pg.PerPage,
+		Page:    pg.Page,
 	})
 	if err != nil {
 		return fmt.Errorf("resolve widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), err)
@@ -1778,35 +1716,37 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// bindingUID, which key-diverged from the RA-CR verdict → G inert).
 	//
 	// #130 F4 Option 2 — SKIP the 4a full-list pin when THIS widget resolves
-	// UNPAGINATED (apiref.IsPaginatedResolve(e.PerPage, e.Page) false). The 4a
+	// UNPAGINATED (pg.paginated() false — apiref.IsPaginatedResolve). The 4a
 	// pin exists to warm a sliceable full-list for a subsequent PAGINATED /call
 	// (shouldServeRAFullList engages only when perPage>0 && page>0). An
 	// unpaginated-consuming widget (a Statistic/Tag widget counting `list:`
-	// wholesale) resolves at (0,0)/(−1,−1), so its own /call never engages the
+	// wholesale) resolves at (−1,−1), so its own /call never engages the
 	// slice serve — the pin's second full ~18s benchapps materialization is pure
 	// waste. Reuses the EXACT serve-gate pagination predicate (one derivation
 	// site, no drift) and is DATA-DERIVED (reads the resolve tuple, never
 	// widget-kind — feedback_no_special_cases / C-F4-7). A paginated widget is
 	// byte-unchanged (still pins). Emits a greppable skip line for the falsifier.
-	if !apiref.IsPaginatedResolve(e.PerPage, e.Page) {
+	if !pg.paginated() {
 		slog.Default().Info("phase1.seed.rafulllist.skip_unpaginated",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-			slog.Int("perpage", e.PerPage),
-			slog.Int("page", e.Page),
+			slog.Int("perpage", pg.PerPage),
+			slog.Int("page", pg.Page),
 			slog.String("effect", "F4 Option 2 — widget consumes the list unpaginated; the 4a full-list "+
 				"pin would never be slice-served on its own /call, so the redundant unpaginated re-resolve is skipped"),
 		)
 		return nil
 	}
-	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
+	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName(), pg)
 	return nil
 }
 
 // seedRAFullListForWidget prewarms + pins the page-independent RAFullList
 // cell for a widget's underlying RESTAction, under the cohort ctx — Ship 4a
-// (0.30.198). It resolves the widget's apiRef at a PAGINATED tuple
-// (prewarmPageLimit, page 1) so apiref.Resolve engages raFullListServe,
+// (0.30.198). It resolves the widget's apiRef at the widget's own PAGINATED
+// pagination pg (#966: the one its seed cell is keyed and resolved with —
+// the caller only reaches here when pg is paginated) so apiref.Resolve
+// engages raFullListServe,
 // which: resolves the RA UNPAGINATED, byte-verifies sliceability for the
 // apiRef shape, Puts the full cell (pinned when the cost predicate fires —
 // envelope bytes ≥ threshold), and records the verdict. Reusing the serve
@@ -1819,7 +1759,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 // is a harmless extra read (only reached when ResolvedCacheEnabled, see the
 // guard below). The whole block is gated under cache.ResolvedCacheEnabled()
 // so a cache-off process never runs the extra resolve.
-func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, authnNS, ns, name string) {
+func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, authnNS, ns, name string, pg prewarmPagination) {
 	if !cache.ResolvedCacheEnabled() {
 		return
 	}
@@ -1891,15 +1831,14 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 			}
 		}
 	}
-	// Resolve at a paginated tuple so raFullListServe engages (it requires
-	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
+	// Resolve at the widget's own paginated pg so raFullListServe engages (it
+	// requires perPage>0 && page>0) exactly as that widget's /call does. The
 	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single
 	// prewarm populates+verifies+pins the cell for EVERY subsequent (page,
 	// perPage) /call by this cohort. The result is discarded (we only want
 	// the cell-populating side-effect).
-	pp := prewarmPageLimit()
-	if pp <= 0 {
-		pp = 1
+	if !pg.paginated() {
+		return // raFullListServe would not engage; the caller already skips this
 	}
 	if _, rerr := apiref.Resolve(ctx, apiref.ResolveOptions{
 		ApiRef: apiRef,
@@ -1912,8 +1851,8 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		// of the construction-site fixes.
 		RC:      rcFromCtx(ctx),
 		AuthnNS: authnNS,
-		PerPage: pp,
-		Page:    1,
+		PerPage: pg.PerPage,
+		Page:    pg.Page,
 		// inline-extras P §5 — fold the apiRef-inline map so the RAFullList
 		// key matches the dispatcher's apiRef-effective key (seed has no
 		// request extras). NOT the union — rrt-inline must not key this cell.

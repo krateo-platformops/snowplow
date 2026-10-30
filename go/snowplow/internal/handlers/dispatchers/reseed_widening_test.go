@@ -212,7 +212,7 @@ func TestS258_WideningSubjectAppearsInReseedSet(t *testing.T) {
 	// reached it). No restaction units.
 	navHarv := newNavWidgetHarvester()
 	e := reseedWidgetEntry()
-	navHarv.harvestNavWidget(e.W, e.GVR, e.PerPage, e.Page, e.KeyPerPage, e.KeyPage)
+	navHarv.harvestNavWidget(e.W, e.GVR, e.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	// RED control (pre-grant): a rotated set naming carol (driven through the

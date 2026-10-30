@@ -150,7 +150,7 @@ func eHarvestWidget(h *navWidgetHarvester, name string, gvr schema.GroupVersionR
 	w.SetNamespace("krateo-system")
 	w.SetName(name)
 	w.SetGroupVersionKind(schema.GroupVersionKind{Group: gvr.Group, Version: gvr.Version, Kind: "W"})
-	h.harvestNavWidget(w, gvr, -1, 1, -1, -1)
+	h.harvestNavWidget(w, gvr, unpaginatedPrewarm)
 }
 
 func eRA(name string) templatesv1.ObjectReference {

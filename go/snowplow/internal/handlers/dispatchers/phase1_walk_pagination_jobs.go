@@ -116,28 +116,11 @@ type apiRefPaginationJob struct {
 	// as the page-1 children loop.
 	Depth int
 
-	// PerPage is the RESOLUTION perPage — passed unchanged to
-	// widgets.Resolve for pages 2..N.
-	PerPage int
-
-	// KeyPerPage is the dispatcher-lookup KEY perPage tuple (Ship
-	// 0.30.187 D2). Decoupled from PerPage; passed to
-	// populateWidgetContentL1 so each page's seed cell matches the
-	// dispatcher's serve-time lookup.
-	KeyPerPage int
-
-	// KeyPage is page-1's dispatcher-lookup KEY page tuple (Ship
-	// 0.30.187 D2; Task #318 Step 1). Decoupled from the RESOLUTION
-	// page the drain advances. Captured at collect time from the SAME
-	// deriveSeedKeyTuple the page-1 walk used (phase1_walk.go's
-	// keyPage), so the drain can reconstruct page-1's KEY tuple instead
-	// of substituting the raw loop counter. The per-page KEY page for a
-	// drain page is derived from this base via drainKeyPageFor — see
-	// phase1_walk_pagination.go. Pre-#318 the job carried only
-	// KeyPerPage, so the drain's :403 install and :446 Put disagreed on
-	// the key tuple (the AC-G.5 detached-entry defect re-introduced for
-	// the page cell).
-	KeyPage int
+	// Pagination is the pagination the first page was resolved AND keyed
+	// with (the walk's pg, #966). The drain resolves and keys each next page
+	// with Pagination.pageAfter(n); the re-collection re-resolves the first
+	// page with Pagination itself.
+	Pagination prewarmPagination
 
 	// AuthnNS is the authn namespace — threaded to widgets.Resolve.
 	AuthnNS string
@@ -204,6 +187,12 @@ func newApiRefPaginationCollector() *apiRefPaginationCollector {
 // fast no-op; matches the byte-identical-when-flag-off posture.
 func (c *apiRefPaginationCollector) collect(j apiRefPaginationJob) {
 	if c == nil || j.In == nil || j.Page1Res == nil {
+		return
+	}
+	// #966 — a first page resolved (and keyed) unpaginated has no next page:
+	// its body is the whole list, exactly as an unpaginated /call's. Nothing
+	// to drain, nothing to re-collect.
+	if !j.Pagination.paginated() {
 		return
 	}
 	if !isApiRefTemplateDriven(j.Page1Res.Object) {
@@ -457,9 +446,7 @@ func drainOneApiRefPaginationJob(ctx context.Context, j apiRefPaginationJob, saR
 		j.GVR,
 		j.Page1Res,
 		j.Depth,
-		j.PerPage,
-		j.KeyPerPage,
-		j.KeyPage,
+		j.Pagination,
 		j.AuthnNS,
 	)
 }
@@ -588,14 +575,15 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 			)
 			continue
 		}
-		// Re-resolve PAGE 1 (we are re-trying the page-1 continuation decision,
-		// not advancing to page 2). Use the candidate's RESOLUTION perPage.
+		// Re-resolve the FIRST page (we are re-trying the first page's
+		// continuation decision, not advancing). #966: with the candidate's own
+		// pagination — the one its first page was resolved and keyed with.
 		res, err := paginationResolvePageFn(ctx, widgets.ResolveOptions{
 			In:      got.Unstructured,
 			RC:      saRC, // SA rest.Config — see the function doc (nil-rc 500 class).
 			AuthnNS: cand.AuthnNS,
-			PerPage: cand.PerPage,
-			Page:    1,
+			PerPage: cand.Pagination.PerPage,
+			Page:    cand.Pagination.Page,
 		})
 		if err != nil || res == nil {
 			log.Warn("phase1.pagination_recollect.resolve_failed",

@@ -260,8 +260,8 @@ const navRootOffsetWindowExpression = `${
 // (overshoot returns children, contradicting the live byte-proof that it
 // returns zero) and PASSES with the fix.
 func TestNavRootWindow_Page1_Yields_Children_Overshoot_Yields_Zero(t *testing.T) {
-	// prewarmPageLimit() default — kept in sync with
-	// dispatchers/phase1_content_prewarm.go defaultPrewarmPageLimit (=5).
+	// the then prewarmPageLimit() default (retired by #966: prewarm now
+	// resolves with the pagination its cell is keyed with) — historical (=5).
 	// The walk uses this as the page SIZE (perPage) at both root and
 	// no-declared-slice child sites.
 	const perPage = 5

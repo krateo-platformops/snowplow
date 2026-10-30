@@ -86,29 +86,16 @@ const (
 	// real headline data source while still tripping on a pathological
 	// over-large one.
 	defaultPrewarmContentMaxBytes = 32 * 1024 * 1024
-
-	// envPrewarmPageLimit (Ship 0.30.127) is the bounded per-widget
-	// pagination DEFAULT the Phase-1 discovery walk resolves a widget
-	// under WHEN that widget's `/call` Path carries no explicit
-	// page/perPage `slice`. A widget that DOES declare a slice overrides
-	// it. It is never -1 — -1 is the unbounded value that, with the
-	// iterator cap removed, drives the 49K-row resolution storm.
-	envPrewarmPageLimit = "PREWARM_PAGE_LIMIT"
-
-	// defaultPrewarmPageLimit — a small bounded default. The discovery
-	// walk only needs to traverse navigation STRUCTURE + discover
-	// informers (GVR-scoped); a handful of resolved rows per widget
-	// exercises the apiRef chain as well as the full LIST would.
-	defaultPrewarmPageLimit = 5
 )
 
 // PrewarmContentEnabled reports whether the F2 Step-7.5 content pass runs.
 // FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md): the
 // standalone PREWARM_CONTENT_ENABLED env read is RETIRED (registered in
 // cache.retiredFlags). It is now IMPLICIT-ON-CACHE — the content pass runs
-// whenever prewarm runs, mirroring #57. (The sizing knobs PREWARM_CONTENT_MAX_BYTES
-// / PREWARM_PAGE_LIMIT are NOT folded — they are observability/pagination
-// params, not on/off gates.)
+// whenever prewarm runs, mirroring #57. (The sizing knob PREWARM_CONTENT_MAX_BYTES
+// is NOT folded — it is an observability param, not an on/off gate. The
+// pagination knob PREWARM_PAGE_LIMIT is RETIRED by #966: prewarm resolves each
+// widget with the pagination its cell is keyed with — see prewarmPagination.)
 func PrewarmContentEnabled() bool {
 	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PREWARM_CONTENT_ENABLED"=="true"
 }
@@ -117,18 +104,6 @@ func PrewarmContentEnabled() bool {
 // observability threshold, defaulting to defaultPrewarmContentMaxBytes.
 func prewarmContentMaxBytes() int {
 	return env.Int(envPrewarmContentMaxBytes, defaultPrewarmContentMaxBytes)
-}
-
-// prewarmPageLimit returns the bounded per-widget pagination default the
-// Phase-1 discovery walk uses for a widget whose `/call` Path declares no
-// explicit page/perPage slice (Ship 0.30.127). A non-positive env value
-// falls back to defaultPrewarmPageLimit — the walk is NEVER unbounded.
-func prewarmPageLimit() int {
-	n := env.Int(envPrewarmPageLimit, defaultPrewarmPageLimit)
-	if n <= 0 {
-		return defaultPrewarmPageLimit
-	}
-	return n
 }
 
 // contentPrewarmHarvester accumulates the deduplicated data-source

@@ -35,7 +35,7 @@ func TestProbe416_MidRunFlushNotLost(t *testing.T) {
 
 	navHarv := newNavWidgetHarvester()
 	w := reseedWidgetEntry()
-	navHarv.harvestNavWidget(w.W, w.GVR, w.PerPage, w.Page, w.KeyPerPage, w.KeyPage)
+	navHarv.harvestNavWidget(w.W, w.GVR, w.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	orig := seedOneWidgetFn
@@ -92,7 +92,7 @@ func TestProbe416_EnumerationCutDoesNotDropRotation(t *testing.T) {
 	})
 	navHarv := newNavWidgetHarvester()
 	w := reseedWidgetEntry()
-	navHarv.harvestNavWidget(w.W, w.GVR, w.PerPage, w.Page, w.KeyPerPage, w.KeyPage)
+	navHarv.harvestNavWidget(w.W, w.GVR, w.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	cache.ResetRBACShiftHooksForTest()

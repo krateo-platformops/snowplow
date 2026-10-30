@@ -107,6 +107,20 @@ var retiredFlags = []retiredFlag{
 	// "0" (off) and never enabled on a deployment; a NON-zero value is the
 	// silent change — the operator asked for a bounded-stale partial cache and
 	// now gets a bare decline — so that is the Warn trigger, not "false".
+	// RETIRED #966: the Phase-1 walk and the per-cohort seed resolved a widget
+	// whose ref declares no slice at page=1, perPage=PREWARM_PAGE_LIMIT (default
+	// 5) and stored it under the UNPAGINATED key — a body no unpaginated request
+	// computes. Prewarm now resolves each widget with exactly the pagination its
+	// cell is keyed with (the ref's declared slice, else unpaginated), so there
+	// is no prewarm page size left to set. Any value is the silent change: the
+	// operator asked for a bounded prewarm window and no longer gets one.
+	{
+		name:     "PREWARM_PAGE_LIMIT",
+		behavior: "prewarm resolves each widget with the pagination its cell is keyed with (the ref's declared slice, else unpaginated); a list's bound is the slice its chart declares (no replacement knob)",
+		warnWhen: func(val string) bool {
+			return strings.TrimSpace(val) != ""
+		},
+	},
 	{
 		name:     "PARTIAL_RESULT_TTL_SECONDS",
 		behavior: "the bounded partial-result cache layer was removed; a stage-error resolve is served and never cached (no replacement knob)",
