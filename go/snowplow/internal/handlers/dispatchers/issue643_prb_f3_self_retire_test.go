@@ -77,13 +77,14 @@ func TestIssue643_F3a_RAEditedToInternal_NextBackgroundPassPuts(t *testing.T) {
 	env := h643Setup(t, h643Opts{cohorts: h643K, external: h643M, internal: h643N, things: 2})
 	h643BootAndMark(t, env, "ext-w0")
 
-	// Edit ext-ra0 so its stages hit an apiserver path (internal dispatch).
+	// Edit ext-ra0 so its stage reads this cluster: an apiserver path with no
+	// endpointRef (#1017: a named endpointRef is always sent to its endpoint).
 	u, err := env.dyn.Resource(h643RAGVR).Namespace(h643NS).Get(context.Background(), "ext-ra0", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get ext-ra0: %v", err)
 	}
 	internalPath := "/apis/" + h643ThingsGVR.Group + "/" + h643ThingsGVR.Version + "/namespaces/" + h643NS + "/" + h643ThingsGVR.Resource
-	_ = unstructured.SetNestedSlice(u.Object, []any{h643ExtStage("s0", internalPath)}, "spec", "api")
+	_ = unstructured.SetNestedSlice(u.Object, []any{h643OwnStage("s0", internalPath)}, "spec", "api")
 	u.SetResourceVersion("2")
 	if _, err := env.dyn.Resource(h643RAGVR).Namespace(h643NS).Update(context.Background(), u, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update ext-ra0: %v", err)
