@@ -176,6 +176,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	setCallEchoHeaders(wri.Header(), uri, opts)
 
 	dict := map[string]any{}
+	// answer is the apiserver's 2xx response body, kept for the audit record
+	// (#957): a write records the identity of the object the apiserver
+	// returned, never of the object the caller sent.
+	var answer []byte
 	callOpts := request.RequestOptions{
 		RequestInfo: request.RequestInfo{
 			Path: uri,
@@ -185,7 +189,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			},
 		},
 		Endpoint:        &ep,
-		ResponseHandler: callResponseHandler(dict),
+		ResponseHandler: callResponseHandler(dict, &answer),
 	}
 	if opts.dat != nil && has([]string{http.MethodPost, http.MethodPut, http.MethodPatch}, opts.verb) {
 		callOpts.Headers = append(callOpts.Headers,
@@ -228,12 +232,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = "failure", rt.Code, rt.Message
 		}
-		action := "call"
-		if opts.dryRun {
-			action = "call.dryRun"
-		}
-		audit.Emit(req.Context(), audit.Event{
-			Action:      action,
+		// A dry run (#443, /call/dry-run: the apiserver is always sent
+		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
+		// as krateo.action=call.dryRun and with no written object (#957).
+		ev := audit.Event{
+			Action:      "call",
+			DryRun:      opts.dryRun,
 			Verb:        strings.ToUpper(opts.verb),
 			Group:       opts.gvr.Group,
 			Version:     opts.gvr.Version,
@@ -244,7 +248,11 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			Outcome:     outcome,
 			Code:        code,
 			Message:     msg,
-		})
+		}
+		// #957 — the written object's uid/generation/resourceVersion, from the
+		// apiserver's answer (none on a failure or a dry run).
+		ev.RecordWrittenObject(answer)
+		audit.Emit(req.Context(), ev)
 	}
 
 	if rt.Status == response.StatusFailure {
@@ -686,12 +694,15 @@ func has(s []string, e string) bool {
 	return false
 }
 
-func callResponseHandler(out map[string]any) func(io.ReadCloser) error {
+// callResponseHandler decodes the apiserver's 2xx answer into out and keeps
+// its bytes in body, for the audit record of a write (#957).
+func callResponseHandler(out map[string]any, body *[]byte) func(io.ReadCloser) error {
 	return func(in io.ReadCloser) error {
 		dat, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
+		*body = dat
 
 		x := bytes.TrimSpace(dat)
 		isArray := len(x) > 0 && x[0] == '['

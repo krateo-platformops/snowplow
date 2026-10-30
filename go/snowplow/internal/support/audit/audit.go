@@ -52,6 +52,10 @@ const (
 	// (event.name="audit") — the constant every audit row is filtered on.
 	EventName = "audit"
 
+	// DryRunSuffix is appended to krateo.action for a dry-run write
+	// (Event.DryRun): "call.dryRun", "restaction.dryRun".
+	DryRunSuffix = ".dryRun"
+
 	// maxIDLen bounds an inbound session id; anything longer (or with
 	// characters outside idPattern) is rejected and replaced, so a hostile
 	// caller cannot inject baggage/pipeline control characters.
@@ -131,8 +135,14 @@ func Middleware() func(http.Handler) http.Handler {
 // optional; unset fields are omitted from the record. Field names map to the
 // semconv attribute keys in D19a §1.
 type Event struct {
-	// Action is the logical operation -> krateo.action ("call", "export").
+	// Action is the logical operation -> krateo.action ("call", "export",
+	// "restaction").
 	Action string
+	// DryRun marks a write the apiserver was asked to validate and not
+	// persist (dryRun=All). krateo.action then carries the suffix DryRunSuffix
+	// ("call.dryRun", "restaction.dryRun"), and RecordWrittenObject records no
+	// object identity: nothing was written (#957).
+	DryRun bool
 	// Verb is the HTTP verb -> http.request.method.
 	Verb string
 	// Group/Version/Resource/Name/Namespace identify the object acted on ->
@@ -169,11 +179,40 @@ type Event struct {
 	RESTActionNamespace string
 	RESTActionName      string
 	Stage               string
+
+	// ObjectUID/ObjectGeneration/ObjectResourceVersion are the identity of the
+	// object a successful Kubernetes write wrote, as the apiserver RETURNED it
+	// (#957, krateo-acmp#59 Option B) -> k8s.object.{uid,generation,
+	// resource_version}. They are the join key to the audit record of the
+	// controller that later reconciles that object: it records the same uid and
+	// the generation it acted on. The attribute keys are those of the shared
+	// emitter, github.com/krateo-platformops/audit, so the join cannot drift.
+	// Optional: set only by RecordWrittenObject (written_object.go), so a failed
+	// write, a read, a dry run or a write to a non-Kubernetes endpoint carries
+	// none of them. A zero generation is omitted.
+	ObjectUID             string
+	ObjectGeneration      int64
+	ObjectResourceVersion string
+}
+
+// actionOf is the krateo.action value of ev: its Action, marked DryRunSuffix
+// when the write was a dry run. An absent action stays absent (and is counted
+// missing).
+func actionOf(ev Event) string {
+	if ev.DryRun && ev.Action != "" {
+		return ev.Action + DryRunSuffix
+	}
+	return ev.Action
 }
 
 // missingFields returns, in a fixed order, the fields other than the actor
 // that ev lacks to answer "what was done to which target": action, method,
 // target (a Kubernetes resource or a server address). Empty when complete.
+//
+// The written object's identity (ObjectUID, ObjectGeneration,
+// ObjectResourceVersion) is OPTIONAL and never listed here: only a successful
+// Kubernetes write has a returned object, so its absence on a failure, a read,
+// a dry run or an external endpoint is the correct record, not a gap.
 func missingFields(ev Event) []string {
 	var out []string
 	if ev.Action == "" {
@@ -267,7 +306,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		rec.SetSeverityText("ERROR")
 	}
 
-	attrs := make([]attribute.KeyValue, 0, 22)
+	attrs := make([]attribute.KeyValue, 0, 25)
 	add := func(k, v string) {
 		if v != "" {
 			attrs = append(attrs, attribute.String(k, v))
@@ -286,7 +325,9 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	add("k8s.resource.resource", ev.Resource)
 	add("k8s.resource.subresource", ev.Subresource)
 	add("k8s.resource.name", ev.Name)
-	add("krateo.action", ev.Action)
+	add("k8s.object.uid", ev.ObjectUID)
+	add("k8s.object.resource_version", ev.ObjectResourceVersion)
+	add("krateo.action", actionOf(ev))
 	add("http.request.method", ev.Verb)
 	add("outcome", ev.Outcome)
 	add("server.address", ev.ServerAddress)
@@ -299,6 +340,9 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		// v0.21.0: the log API adopted the shared attribute value types, so the
 		// hand-rolled []log.Value is now just a typed string slice.
 		attrs = append(attrs, attribute.StringSlice("user.roles", groups))
+	}
+	if ev.ObjectGeneration != 0 {
+		attrs = append(attrs, attribute.Int64("k8s.object.generation", ev.ObjectGeneration))
 	}
 	if ev.Code != 0 {
 		attrs = append(attrs, attribute.Int("http.response.status_code", ev.Code))
