@@ -1340,8 +1340,8 @@ func TestNextOverdueGVR918_FlaggedAndOverdueAlternate(t *testing.T) {
 	storeVerify.gvrs[f2] = &gvrVerification{epoch: now}
 	storeVerify.gvrs[over] = &gvrVerification{epoch: now.Add(-3 * maxVerificationAge())}
 	storeVerify.mu.Unlock()
-	setPendingFlag(f1, true)
-	setPendingFlag(f2, true)
+	setPendingFlag(newDeliveryLog(f1), true)
+	setPendingFlag(newDeliveryLog(f2), true)
 
 	var turns []schema.GroupVersionResource
 	for i := 0; i < 4; i++ {
@@ -1380,11 +1380,12 @@ func TestNextOverdueGVR918_FlagGoesWithTheKeys(t *testing.T) {
 	storeVerify.gvrs[gvr] = &gvrVerification{epoch: time.Now()}
 	storeVerify.gvrs[over] = &gvrVerification{epoch: time.Now().Add(-3 * maxVerificationAge())}
 	storeVerify.mu.Unlock()
-	setPendingFlag(gvr, true)
+	flagger := newDeliveryLog(gvr)
+	setPendingFlag(flagger, true)
 	if g, _, _ := nextOverdueGVR(); g != gvr {
 		t.Fatalf("precondition: picked %v, want the flagged %v", g, gvr)
 	}
-	setPendingFlag(gvr, false)
+	setPendingFlag(flagger, false)
 	if g, _, _ := nextOverdueGVR(); g != over {
 		t.Errorf("an unflagged GVR inside its deadline was picked (%v)", g)
 	}

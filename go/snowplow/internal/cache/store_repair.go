@@ -66,9 +66,15 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 // the confirmed-divergent keys of a loss judged against ONE copy. live (nil:
 // unbound) reports, under the same rw.mu as the build decision, whether that
 // copy is still the GVR's live one: a judgement of a copy a swap has replaced
-// is dropped (verification_skipped{instance_changed}) — the swap's own LIST
-// already corrected that store, and a request then would start a second,
-// redundant build (#870 F6; #928 delta). Returns false when it was refused
+// is dropped (verification_skipped{instance_changed}). The loss is evidence
+// about the replaced copy only; the new copy was built from its own LIST and
+// is judged by its own next pass (#870 F6; #928 delta). When that LIST is at
+// least as new as the loss's read, the new copy already holds the read's
+// state, and a request would start a second, redundant build. When it is
+// older (an apiserver-wide event drop every watcher missed), the new copy
+// diverges too, and its own pass detects and repairs it within one
+// verification window: the delay F6 already accepts for a pass open across a
+// swap (#928 delta review, residual). Returns false when it was refused
 // (not registered, factory-built — counted on store_repair_unsupported_total —
 // suppressed by the breaker) or dropped.
 func requestStoreRepair(gvr schema.GroupVersionResource, keys []string, live func(rw *ResourceWatcher) bool) bool {

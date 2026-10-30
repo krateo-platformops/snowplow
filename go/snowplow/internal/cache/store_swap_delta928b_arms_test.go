@@ -12,9 +12,9 @@ import (
 
 // TestStoreSwap_K20_ALossJudgedOnAReplacedCopyRequestsNoBuild: once a swap has
 // replaced the copy a loss was judged against, the loss's repair request is
-// dropped under the same rw.mu as the build decision — the swap's own LIST
-// already corrected that store, and a request would start a second, redundant
-// 50K build. Both bindings: the delivery log whose pending key resolved (the
+// dropped under the same rw.mu as the build decision: the new copy is judged
+// by its own pass (requestStoreRepair), and a request on the old copy's
+// evidence would start a second 50K build. Both bindings: the delivery log whose pending key resolved (the
 // resolver, publishResolvedLoss) and the instance a forced pass compared. The
 // live copy's judgement still requests one. RED under B1 (the request ignores
 // its binding), B2 (the log binding always holds) and B3 (the instance

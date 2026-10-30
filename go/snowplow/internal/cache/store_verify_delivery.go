@@ -398,16 +398,15 @@ func (l *deliveryLog) judgePending() (lost []divergenceCandidate, release func()
 		return nil, func() {} // closed meanwhile
 	}
 	st := l.settleLocked(verdicts)
-	empty := len(l.pending) == 0
+	if len(l.pending) == 0 {
+		setPendingFlag(l, false)
+	}
 	l.mu.Unlock()
 	storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
 	storePendingResolvedReceivedTotal.Add(st.received)
 	// The settled keys that are not losses are published (their counter has
 	// moved): they leave the gauge now. The losses leave it at release.
 	storePendingKeys.Add(-int64(st.removed - len(st.lost)))
-	if empty {
-		setPendingFlag(l.gvr, false)
-	}
 	n := len(st.lost)
 	var once sync.Once
 	return st.lost, func() { once.Do(func() { l.lossesPublished(n) }) }
@@ -559,11 +558,11 @@ func (l *deliveryLog) supersede() {
 	l.pending = nil
 	l.pgen++
 	l.carried = carried
+	setPendingFlag(l, false)
 	l.mu.Unlock()
 	if n > 0 {
 		storePendingKeys.Add(-int64(n))
 		storePendingSupersededTotal.Add(uint64(n))
-		setPendingFlag(l.gvr, false)
 	}
 }
 
@@ -593,9 +592,9 @@ func (l *deliveryLog) setPending(reads map[string]readState) {
 	l.pgen++
 	start := !l.running
 	l.running = true
+	setPendingFlag(l, true)
 	l.mu.Unlock()
 	storePendingKeys.Add(int64(len(reads)))
-	setPendingFlag(l.gvr, true)
 	if start {
 		go l.resolve()
 	}
@@ -627,11 +626,10 @@ func (l *deliveryLog) oldestPending() time.Time {
 // close stops the resolver, drops what is pending and removes the handler:
 // the GVR's informer is being torn down (deletePerGVRStateLocked), or a swap
 // replaced the copy this log records (#870). It clears exactly what it owned:
-// its pending keys and, when it held any, the GVR's walker flag they set — only
-// the GVR's live log is ever judged into pending (a pass reads
-// rw.deliveries[gvr]), and an install closes the replaced log before any pass
-// can judge the new one, so the flag never outlives the keys it stands for
-// (#928 delta G1).
+// its pending keys and, if this log set it, the GVR's walker flag (#928 delta
+// G1, H1). Both under l.mu, so a setPending racing it either holds its keys
+// first and has them cleared here, or finds the log closed and holds nothing;
+// and a flag the live log set is not this log's to clear (setPendingFlag).
 func (l *deliveryLog) close() {
 	l.mu.Lock()
 	if l.closed {
@@ -642,11 +640,9 @@ func (l *deliveryLog) close() {
 	n := len(l.pending)
 	l.pending = nil
 	l.pgen++
+	setPendingFlag(l, false)
 	l.mu.Unlock()
 	storePendingKeys.Add(-int64(n))
-	if n > 0 {
-		setPendingFlag(l.gvr, false)
-	}
 	liveDeliveryLogs.Delete(l)
 	if l.inf != nil && l.reg != nil {
 		_ = l.inf.RemoveEventHandler(l.reg)
@@ -703,6 +699,7 @@ func (l *deliveryLog) resolve() {
 		empty := len(l.pending) == 0
 		if empty {
 			l.running = false
+			setPendingFlag(l, false)
 		}
 		l.mu.Unlock()
 		// PUBLISH FIRST, DECREMENT LAST (storePendingKeys' invariant): every
@@ -722,7 +719,6 @@ func (l *deliveryLog) resolve() {
 		// The judgement is complete: settled, published and counted.
 		l.sweeps.Add(1)
 		if empty {
-			setPendingFlag(l.gvr, false)
 			return
 		}
 	}
