@@ -194,6 +194,14 @@ func attemptClusterListCollapse(
 		return nil, false, 9
 	}
 
+	// #1017 — the cell holds THIS cluster's objects: a stage whose endpoint
+	// names another one (targetsOwnCluster) never collapses into it. Its own
+	// deny gate, 10, right after the verb (the one order every site uses:
+	// verb first, then own cluster).
+	if !targetsOwnCluster(ctx) {
+		return nil, false, 10
+	}
+
 	// Gate 2: cache-off + Servable. AC-D5.13.
 	if cache.Disabled() {
 		return nil, false, 2

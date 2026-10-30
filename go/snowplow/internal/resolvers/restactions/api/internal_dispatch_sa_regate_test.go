@@ -225,7 +225,7 @@ func TestSARegate_ARM1_DeniedPerUserGet_Forbidden(t *testing.T) {
 	rc := newFakeRestActionAPIServer(t, []fakeRAItem{{"bench-ns-1", "bench-ns-1-x"}})
 	ctx := cache.WithInternalRESTConfig(ctxWithUser(narrowUser), rc)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, getByNamePath("bench-ns-1", "bench-ns-1-x")))
 
 	t.Logf("ARM-1 served=%v err=%v sha256=%s", served, err, sha256Hex(raw))
@@ -254,7 +254,7 @@ func TestSARegate_ARM2_AllowedPerUserGet_ByteParity(t *testing.T) {
 
 	// Authorized per-user serve.
 	ctxUser := cache.WithInternalRESTConfig(ctxWithUser(narrowUser), rc)
-	rawUser, servedUser, errUser := dispatchViaInternalRESTConfig(ctxUser,
+	rawUser, servedUser, errUser := dispatchViaInternalRESTConfig(ownClusterCtx(ctxUser),
 		buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 	if errUser != nil || !servedUser {
 		t.Fatalf("authorized GET must serve; got served=%v err=%v", servedUser, errUser)
@@ -264,7 +264,7 @@ func TestSARegate_ARM2_AllowedPerUserGet_ByteParity(t *testing.T) {
 	resetInternalClientCacheForTest()
 	ctxSA := cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc)
 	ctxSA = cache.WithInternalEndpoint(ctxSA, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
-	rawSA, servedSA, errSA := dispatchViaInternalRESTConfig(ctxSA,
+	rawSA, servedSA, errSA := dispatchViaInternalRESTConfig(ownClusterCtx(ctxSA),
 		buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 	if errSA != nil || !servedSA {
 		t.Fatalf("SA-exempt reference GET must serve; got served=%v err=%v", servedSA, errSA)
@@ -299,13 +299,13 @@ func TestSARegate_ARM3_DeniedPerUserList_Narrowed(t *testing.T) {
 
 	// #961 (match Kubernetes): the narrow user holds namespace grants only, so
 	// its cluster-wide LIST is the typed re-gate Forbidden — nothing served.
-	if raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	if raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")); served || raw != nil || !isRegateDenied(err) {
 		t.Fatalf("cluster-wide LIST by a namespace-only user: served=%v bytes=%d err=%v, want the re-gate Forbidden",
 			served, len(raw), err)
 	}
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/team-a/restactions"))
 	if err != nil || !served {
 		t.Fatalf("authorized-namespace LIST must serve; got served=%v err=%v", served, err)
@@ -360,7 +360,7 @@ func TestSARegate_ARM4_Phase1SAWalk_Unnarrowed(t *testing.T) {
 		cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc), rw)
 	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
 
-	raw, served, derr := dispatchViaInternalRESTConfig(ctx,
+	raw, served, derr := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions"))
 	if derr != nil || !served {
 		t.Fatalf("Phase-1 SA-walk LIST must serve; got served=%v err=%v", served, derr)
@@ -405,7 +405,7 @@ func TestSARegate_ARM5_CacheOff_DeniedGet_Forbidden(t *testing.T) {
 		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: "https://sar.test"}))
 	ctx = cache.WithInternalRESTConfig(ctx, rc)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, getByNamePath("bench-ns-1", "bench-ns-1-x")))
 
 	t.Logf("ARM-5 served=%v err=%v sha256=%s", served, err, sha256Hex(raw))
@@ -432,7 +432,7 @@ func TestSARegate_ARM6_GroupOnlyUser_Narrowed(t *testing.T) {
 		// Username deliberately empty; identity is group-only.
 		ctx := cache.WithInternalRESTConfig(ctxWithUser("", "devs"), rc)
 
-		raw, served, err := dispatchViaInternalRESTConfig(ctx,
+		raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 			buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 		t.Logf("ARM-6/denied served=%v err=%v sha256=%s", served, err, sha256Hex(raw))
 		if served {
@@ -452,7 +452,7 @@ func TestSARegate_ARM6_GroupOnlyUser_Narrowed(t *testing.T) {
 		rc := newFakeRestActionAPIServer(t, []fakeRAItem{{"team-a", "team-a-x"}})
 		ctx := cache.WithInternalRESTConfig(ctxWithUser("", "devs"), rc)
 
-		raw, served, err := dispatchViaInternalRESTConfig(ctx,
+		raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 			buildCall(http.MethodGet, getByNamePath("team-a", "team-a-x")))
 		t.Logf("ARM-6/granted served=%v err=%v sha256=%s", served, err, sha256Hex(raw))
 		if err != nil || !served {
@@ -533,7 +533,7 @@ func TestSARegate_ARM7_RefresherIdentityFree_Unnarrowed(t *testing.T) {
 	ctx := cache.WithInternalRESTConfig(ctxWithUser(saRegateIdentity), rc)
 	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host, Token: saRegateSAToken()})
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions"))
 	if err != nil || !served {
 		t.Fatalf("refresher SA LIST must serve; got served=%v err=%v", served, err)
@@ -570,7 +570,7 @@ func TestSARegate_ARM8_RC1Guard_UnpublishedSnapshot_FallsThrough(t *testing.T) {
 	rc := newFakeRestActionAPIServer(t, []fakeRAItem{{"bench-ns-1", "bench-ns-1-x"}})
 	ctx := cache.WithInternalRESTConfig(ctxWithUser(narrowUser), rc)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx,
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx),
 		buildCall(http.MethodGet, getByNamePath("bench-ns-1", "bench-ns-1-x")))
 
 	t.Logf("ARM-8 served=%v err=%v sha256=%s", served, err, sha256Hex(raw))

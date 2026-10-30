@@ -256,7 +256,7 @@ func TestIssue677_P1_PreDialEqualsPostFetch_AndDenyNeverDials(t *testing.T) {
 			}
 
 			d0 := f.dials.Load()
-			raw, served, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tg.path))
+			raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tg.path))
 			dials := f.dials.Load() - d0
 			if pre {
 				allow++
@@ -317,7 +317,7 @@ func runP3(t *testing.T) (served bool, err error) {
 	// answers the team-a GET with an object that claims team-b.
 	f.respNS.Store("team-b")
 	ctx := cache.WithInternalRESTConfig(ctxWithUser("u677"), rc)
-	_, served, err = dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, "/api/v1/namespaces/team-a/configmaps/other"))
+	_, served, err = dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, "/api/v1/namespaces/team-a/configmaps/other"))
 	return served, err
 }
 
@@ -347,12 +347,12 @@ func TestIssue677_P4_DeniedNonexistentIs403Not404(t *testing.T) {
 	f, rc := newFakeAPI677(t)
 	f.missing["ghost"] = true
 	ctx := cache.WithInternalRESTConfig(ctxWithUser("u677"), rc)
-	_, _, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, "/api/v1/namespaces/team-b/configmaps/ghost"))
+	_, _, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, "/api/v1/namespaces/team-b/configmaps/ghost"))
 	if !apierrors.IsForbidden(err) || f.dials.Load() != 0 {
 		t.Fatalf("denied nonexistent object: err=%v dials=%d, want a 403 with no dial", err, f.dials.Load())
 	}
 	// Allowed nonexistent stays a 404 from the apiserver.
-	_, _, err = dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, "/api/v1/namespaces/team-a/configmaps/ghost"))
+	_, _, err = dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, "/api/v1/namespaces/team-a/configmaps/ghost"))
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("allowed nonexistent object: err=%v, want 404", err)
 	}
@@ -367,7 +367,7 @@ func TestIssue677_P5_RC1_UnpublishedSnapshotFallsThroughWithoutDial(t *testing.T
 	t.Cleanup(resetInternalClientCacheForTest)
 	f, rc := newFakeAPI677(t)
 	ctx := cache.WithInternalRESTConfig(ctxWithUser("u677"), rc)
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, "/api/v1/namespaces/team-b/configmaps/catalog"))
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, "/api/v1/namespaces/team-b/configmaps/catalog"))
 	if served || err != nil || raw != nil {
 		t.Fatalf("RC1: want fall-through (nil,false,nil); got served=%v err=%v", served, err)
 	}

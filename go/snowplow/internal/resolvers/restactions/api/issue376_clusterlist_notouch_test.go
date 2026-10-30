@@ -61,7 +61,7 @@ func TestIssue376_ClusterListCollapse_DecisionProbeIsNoTouch(t *testing.T) {
 
 	h0, m0 := store.Stats().HitTotal, store.Stats().MissTotal
 	_, useCluster, gate := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall, map[string]any{},
+		ownClusterCtx(ctx), clusterListLogger(t), apiCall, map[string]any{},
 		endpoints.Endpoint{}, store, true)
 	if !useCluster {
 		t.Fatalf("warm cell must be RECOGNIZED by the collapse probe (useCluster=true); gate=%d", gate)

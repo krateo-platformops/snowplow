@@ -684,7 +684,7 @@ func TestAttemptClusterListCollapse_FlagOnCacheOffDenies(t *testing.T) {
 		DependsOn: &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
 	}
 	tmp, ok, gate := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
+		ownClusterCtx(context.Background()), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
 		t.Fatalf("cache-off must deny; got ok=%v tmp=%v", ok, tmp)
@@ -711,7 +711,7 @@ func TestAttemptClusterListCollapse_InertGateDeniesUnderTestOverride(t *testing.
 		DependsOn: &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
 	}
 	tmp, ok, gate := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
+		ownClusterCtx(context.Background()), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
 		t.Fatalf("inert collapse must deny; got ok=%v tmp=%v", ok, tmp)
@@ -731,7 +731,7 @@ func TestAttemptClusterListCollapse_NoIterator(t *testing.T) {
 		DependsOn: nil, // no iterator
 	}
 	tmp, ok, _ := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
+		ownClusterCtx(context.Background()), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
 		t.Fatalf("no iterator must short-circuit; got ok=%v tmp=%v", ok, tmp)
@@ -745,7 +745,7 @@ func TestAttemptClusterListCollapse_EmptyIterator(t *testing.T) {
 		DependsOn: &templates.Dependency{Iterator: ptr.To("")},
 	}
 	tmp, ok, _ := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
+		ownClusterCtx(context.Background()), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
 		t.Fatalf("empty iterator must short-circuit; got ok=%v tmp=%v", ok, tmp)
@@ -759,7 +759,7 @@ func TestAttemptClusterListCollapse_ApistageStoreNil(t *testing.T) {
 		DependsOn: &templates.Dependency{Iterator: ptr.To(`[{"ns":"a"}]`)},
 	}
 	tmp, ok, _ := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
+		ownClusterCtx(context.Background()), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, false /* apistage disabled */)
 	if ok || tmp != nil {
 		t.Fatalf("apistage disabled must short-circuit; got ok=%v tmp=%v", ok, tmp)

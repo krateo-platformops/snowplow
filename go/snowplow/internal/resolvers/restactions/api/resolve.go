@@ -587,7 +587,7 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // informer register. st is the per-stage timing struct (a loop-local value,
 // passed by pointer) — its ClusterList* fields are written here exactly as
 // before. Returns tmp (possibly empty for C-3).
-func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
+func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
 	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
@@ -676,7 +676,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 	// gate-attempt signal is gone with the field.
 	st.ClusterListAttempted = true
 	if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
-		r.ctx, r.log, apiCall, r.dict, ep, r.apistageStore, r.apistageEnabled); useClusterList {
+		provCtx, r.log, apiCall, r.dict, ep, r.apistageStore, r.apistageEnabled); useClusterList {
 		tmp = newTmp
 		st.ClusterListUsed = true
 		st.ClusterListDenyGate = denyGate // 0 on success
@@ -708,7 +708,13 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 	// Timing instrumentation: if EnsureResourceType ever blocks
 	// longer than lazyRegisterSlowThreshold we emit a WARN so the
 	// 0.30.92 first-read-latency follow-up has a falsifier.
-	lazyRegisterInnerCallPaths(r.ctx, r.log, tmp)
+	//
+	// #1017 — only for a stage that targets this cluster: a named endpointRef's
+	// paths name another endpoint's resources, so registering (and discovering,
+	// with the ServiceAccount) them on THIS cluster is neither needed nor sound.
+	if targetsOwnCluster(provCtx) {
+		lazyRegisterInnerCallPaths(r.ctx, r.log, tmp)
+	}
 	return tmp
 }
 
@@ -1004,7 +1010,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// step 2 — no cross-user leak, the hit path is gated too.
 	// Flag-off (apistageEnabled false) this is byte-identical
 	// to the 0.30.118 pivot path.
-	if resolverUseInformer() {
+	//
+	// #1017 — only for a stage that targets this cluster (targetsOwnCluster):
+	// the cells and informers hold THIS cluster's objects, and a named
+	// endpointRef may name another one.
+	if resolverUseInformer() && targetsOwnCluster(gctx) {
 		if r.apistageEnabled {
 			// #443 part 2 — a caller-supplied UAF stage is dispatched as the
 			// caller (non-UAF gating: the requester's own RBAC narrows the
@@ -1740,6 +1750,15 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		recordStageTiming()
 		return true
 	}
+	// #723/#724 — the stage dials a credential snowplow holds (SA or the
+	// per-user clientconfig): the dial site's client never follows a redirect.
+	// #1017 — the same provenance is what targetsOwnCluster reads: marked once
+	// here, before the plan, so the collapse and the lazy register see it as
+	// the dispatch does (gctx derives from provCtx below).
+	provCtx := r.ctx
+	if heldCred {
+		provCtx = credhttp.WithHeldCredential(provCtx)
+	}
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active
 	// the SA endpoint carries the SA token (no user-bearer override needed);
@@ -1858,7 +1877,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// stageTiming.ClusterList* fields are written inside). An empty
 	// tmp is C-3 (the "empty request options" Warn fired inside) —
 	// the orchestrator owns the recordStageTiming()+continue.
-	tmp := r.collapseOrFanoutPlan(id, apiCall, ep, &stageTiming)
+	tmp := r.collapseOrFanoutPlan(provCtx, id, apiCall, ep, &stageTiming)
 	if len(tmp) == 0 {
 		recordStageTiming()
 		return false
@@ -1886,7 +1905,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// concurrent jsonHandler writes. On the common (Info) path
 	// neither the walk nor the lock runs.
 	var dictMu sync.Mutex
-	g, gctx := errgroup.WithContext(r.ctx)
+	g, gctx := errgroup.WithContext(provCtx)
 	// #267/#268/#269 — PROVENANCE marker for the dial site. When this stage's
 	// endpoint is snowplow's own SA endpoint (isSA, from resolveStageEndpoint:
 	// the ctx-carried internal endpoint or the UAF SA endpoint), mark the per-stage
@@ -1896,11 +1915,6 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// ctx value — g's Done channel (errgroup cancellation) is preserved.
 	if isSA {
 		gctx = cache.WithServiceAccountDial(gctx)
-	}
-	// #723/#724 — the stage dials a credential snowplow holds (SA or the
-	// per-user clientconfig): the dial site's client never follows a redirect.
-	if heldCred {
-		gctx = credhttp.WithHeldCredential(gctx)
 	}
 	// #710 — the owning RESTAction and stage name a content fill (pprof labels,
 	// by_ra). Once per stage, not per call: a content HIT pays nothing for it.
