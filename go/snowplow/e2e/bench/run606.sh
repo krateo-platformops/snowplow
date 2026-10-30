@@ -746,11 +746,11 @@ run_preflight_job() {
     # name WHAT was refused (run 17: "(sidebar menu) -> None: the shell
     # rendered no sidebar Menu with routes" was logged as an unserved type / 404)
     why="$(printf '%s\n' "$summary" | sed -n 's/^\[preflight\] REFUSED //p' | awk 'NR<=3' | tr '\n' ';')"
-    log "PREFLIGHT REFUSED (${what}): ${why:-no refusal line (the preflight Job failed without a result)} — see $out"
+    log "PREFLIGHT REFUSED: ${why:-no refusal line (the preflight Job failed without a result)} (${what}) — see $out"
     return 1
   fi
   if [[ -z "$ok" || "$ok" == "0" ]]; then
-    log "PREFLIGHT (${what}) did not finish within ${PREFLIGHT_TIMEOUT_S}s"
+    log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s (${what})"
     return 1
   fi
   log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
