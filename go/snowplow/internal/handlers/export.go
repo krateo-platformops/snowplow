@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -473,9 +474,8 @@ func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int, stage
 // was refused or failed — an export's refused write stage included — is
 // reported, never silent.
 type stageOutcomeSet struct {
-	seen    map[string]bool
-	entries []json.RawMessage
-	other   string // a value that is not a list (a truncated summary)
+	entries []string // distinct outcome objects, as JSON
+	other   string   // a value that is not a list (a truncated summary)
 	any     bool
 }
 
@@ -491,13 +491,9 @@ func (s *stageOutcomeSet) add(v string) {
 		}
 		return
 	}
-	if s.seen == nil {
-		s.seen = map[string]bool{}
-	}
 	for _, e := range list {
-		if !s.seen[string(e)] {
-			s.seen[string(e)] = true
-			s.entries = append(s.entries, e)
+		if !slices.Contains(s.entries, string(e)) { // a handful of stages at most
+			s.entries = append(s.entries, string(e))
 		}
 	}
 }
@@ -512,12 +508,7 @@ func (s *stageOutcomeSet) set(h http.Header) {
 		h.Set(util.HeaderStageOutcomes, s.other)
 		return
 	}
-	entries := s.entries
-	if entries == nil {
-		entries = []json.RawMessage{}
-	}
-	b, _ := json.Marshal(entries) // RawMessages decoded from JSON: cannot fail
-	h.Set(util.HeaderStageOutcomes, string(b))
+	h.Set(util.HeaderStageOutcomes, "["+strings.Join(s.entries, ",")+"]")
 }
 
 // collectAllPages is the paginate-and-concat lane for an unpaginated
