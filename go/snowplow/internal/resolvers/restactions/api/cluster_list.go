@@ -184,22 +184,23 @@ func attemptClusterListCollapse(
 		return nil, false, 1
 	}
 
+	// #1017 — the cell holds THIS cluster's objects: a stage whose endpoint
+	// names another one (targetsOwnCluster) never collapses into it. Its own
+	// deny gate, 10. The one order every serve site uses: own cluster first
+	// (where the stage's calls go), then the verb (whether a cache may answer
+	// them).
+	if !targetsOwnCluster(ctx) {
+		return nil, false, 10
+	}
+
 	// #1011 — the verb. The collapse stands in for the stage's per-item calls
 	// with ONE cluster-scope GET LIST, so only a stage whose calls ARE a plain
 	// GET may enter it (isPlainGet, write_verb.go). Without this gate a write
 	// iterator was rewritten into that GET once the cell was warm: its writes
 	// were never sent and the stage reported success. Its own deny gate, 9,
-	// before any other work.
+	// before any other work on an own-cluster stage.
 	if !isPlainGet(apiCall.Verb) {
 		return nil, false, 9
-	}
-
-	// #1017 — the cell holds THIS cluster's objects: a stage whose endpoint
-	// names another one (targetsOwnCluster) never collapses into it. Its own
-	// deny gate, 10, right after the verb (the one order every site uses:
-	// verb first, then own cluster).
-	if !targetsOwnCluster(ctx) {
-		return nil, false, 10
 	}
 
 	// Gate 2: cache-off + Servable. AC-D5.13.
