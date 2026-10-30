@@ -615,6 +615,20 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                       "helm install failed: token=" + os.environ.get("FAKE_TOKVAL", ""))])
         if what.startswith("snowplows."):
             items([cr("Snowplow", "snowplow", ready)])
+        if what.startswith("frontends.") and "-A" not in a:
+            # what the installer RENDERED into the Frontend composition: FAKE_RENDERED = same (default)
+            # | split | absent | unread
+            mode = os.environ.get("FAKE_RENDERED", "same")
+            if mode == "unread":
+                print("Error from server (Forbidden): frontends is forbidden", file=sys.stderr); sys.exit(1)
+            host = "http://10.0.0.9" if mode == "same" else "http://localhost:808"
+            cfg = ({"SNOWPLOW_API_BASE_URL": host + "/content", "AUTHN_API_BASE_URL": host + "/auth",
+                    "EVENTS_API_BASE_URL": host + "/events", "EVENTS_PUSH_API_BASE_URL": host + "/events"}
+                   if mode == "same" else
+                   {"SNOWPLOW_API_BASE_URL": "http://localhost:8081", "AUTHN_API_BASE_URL": "http://localhost:8082",
+                    "EVENTS_API_BASE_URL": "http://localhost:8083", "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"})
+            print(json.dumps({"items": [] if mode == "absent" else [{"spec": {"config": cfg}}]}))
+            sys.exit(0)
         if what.startswith("frontends."):
             items([cr("Frontend", "frontend", True)])
         if what.startswith("portals."):
@@ -745,8 +759,24 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("\\n".join(f"bench-ns-01 bench-app-01-0{i} 1m" for i in range(1, 5)))
             sys.exit(0)
         if what == "svc" and "krateo-agent-gateway-platform" in a:
-            # the platform gateway's address (#1005): FAKE_GATEWAY=none: GCP still provisioning
-            print("" if os.environ.get("FAKE_GATEWAY") == "none" else "10.0.0.9", end="")
+            # the platform gateway (#1005): FAKE_GATEWAY = address (default) | none (GCP still
+            # provisioning) | absent (NotFound) | unread (an API error) | flap (address, then none on
+            # every 2nd read)
+            mode = os.environ.get("FAKE_GATEWAY", "address")
+            if mode == "flap":
+                cnt = os.path.join(STATE, "gateway_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                mode = "address" if n % 2 == 0 else "none"
+            if mode == "absent":
+                print('Error from server (NotFound): services "krateo-agent-gateway-platform" not found',
+                      file=sys.stderr); sys.exit(1)
+            if mode == "unread":
+                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+                sys.exit(1)
+            ing = [{"ip": "10.0.0.9"}] if mode == "address" else []
+            print(json.dumps({"metadata": {"name": "krateo-agent-gateway-platform"},
+                              "status": {"loadBalancer": {"ingress": ing}}}))
             sys.exit(0)
         if what in ("deploy", "deployments") and "json" in a and len([x for x in a[2:] if not x.startswith("-")
                                                                      and x != "json"]) == 0:
@@ -757,9 +787,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                          + ([f"-resync-interval={iv}"] if src == "args" else []),
                  "env": [{"name": "COMPOSITION_CONTROLLER_RESYNC_INTERVAL", "value": iv}] if src == "env" else [],
                  "envFrom": [{"configMapRef": {"name": "installers-v0-3-422-configmap"}}]}
+            avail = os.environ.get("FAKE_CDC_AVAILABLE", "True")
             d = {"metadata": {"name": "installers-v0-3-422-controller"},
-                 "spec": {"template": {"spec": {"containers": [c]}}}}
-            print(json.dumps({"items": [] if src == "none" else [d]}))
+                 "spec": {"template": {"spec": {"containers": [c]}}},
+                 "status": {"conditions": [{"type": "Available", "status": avail}]}}
+            items = [] if src == "none" else [d]
+            if os.environ.get("FAKE_CDC_COUNT") == "2":
+                items.append(dict(d, metadata={"name": "installers-v0-3-421-controller"}))
+            print(json.dumps({"items": items}))
             sys.exit(0)
         if what in ("configmap", "configmaps") and "json" in a and "frontend-config-vars" not in a:
             src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
@@ -999,18 +1034,6 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         if merged:
             with open(os.path.join(STATE, "helm-registry-auth.json"), "w") as fh:
                 json.dump(merged, fh)
-    if "history" in a and "installer-platform" in a:
-        # FAKE_HELM_REVISION: advance (default: each read one more) | frozen | unanswered
-        mode = os.environ.get("FAKE_HELM_REVISION", "advance")
-        if mode == "unanswered":
-            print("Error: release: not found", file=sys.stderr); sys.exit(1)
-        p = os.path.join(STATE, "helm_revision")
-        n = int(open(p).read()) if os.path.exists(p) else 40
-        if mode == "advance":
-            n += 1
-            open(p, "w").write(str(n))
-        print(json.dumps([{"revision": n, "status": "deployed", "chart": "installer-0.3.422"}]))
-        sys.exit(0)
     if "list" in a:
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
@@ -1283,6 +1306,7 @@ def test_a_portal_on_several_origins_stops_the_run_at_the_platform_step(harness)
     env, state, ambient, tmp = harness
     env["FAKE_PORTAL"] = "split"
     env["FAKE_CDC_RESYNC"] = "args:1s"    # the gate's window: 2 x the cdc's resync (#1005)
+    env["FAKE_RENDERED"] = "split"        # the installer renders the localhost defaults: its defect
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=300)
     out = p.stdout + p.stderr

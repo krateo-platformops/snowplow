@@ -272,6 +272,9 @@ else
   TTL_HOW="set by hand"
 fi
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
+# what the TTL holds past the plan's worst case and the margin: the room a
+# portal-origin window longer than its budget term may take (#1006 F8)
+TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
@@ -720,21 +723,21 @@ capped_definitions() {
 }
 # wait_portal_origin (#1005): the frontend's live config.json must name ONE
 # origin for snowplow, authn and sse-proxy, at 057's paths (load606
-# portal-origin). The installer writes those URLs from a lookup of the
-# platform gateway Service's LoadBalancer address, re-rendered on every resync
-# of its composition-dynamic-controller, so they appear within ~2 resyncs of
-# the gateway having an address. The gate's OWN window (bench/origin_gate.py),
-# never what the platform's earlier waits left: up to ENDPOINT_WAIT_S for the
-# gateway's address, then 2 x the cdc's EFFECTIVE resync interval (read from
-# the cluster: its -resync-interval arg, else its env / envFrom ConfigMap,
-# else the compiled default) + one poll, from the first reading that has the
-# address. Interval, source and window are logged and recorded. Every poll
-# also records two read-only readings (the gateway's ingress; installer-
-# platform's helm revision), so a gate that runs out says which failure it
-# is: waiting on GCP, nothing reconciling, or an installer defect.
+# portal-origin). Two hops: the installer's cdc renders the Frontend
+# composition's spec.config from a lookup of the platform gateway's address
+# on every resync, then the frontend's cdc renders frontend-config-vars. The
+# gate's OWN window (bench/origin_gate.py), never what the platform's earlier
+# waits left: up to ENDPOINT_WAIT_S for the gateway's address, then 2 x the
+# installer cdc's EFFECTIVE resync (read from the cluster by the cdc's own
+# semantics) + one poll, from the latest reading with the address. A resync
+# that cannot be honoured (an ambiguous cdc, one that cannot start, or a
+# window past what the TTL holds) stops it at once. Every poll records three
+# read-only readings (the gateway's address, what the installer RENDERED into
+# the Frontend composition, the cdc's availability), and a gate that runs out
+# names its failure from the last one.
 PORTAL_GATEWAY_SVC="krateo-agent-gateway-platform"   # internalDataPlane: <gatewayRef>-platform carries the portal (installer compositions.yaml)
 wait_portal_origin() {
-  local why="" t0 now t_addr="" end resync_s resync_src ing hist v
+  local why="" t0 now t_addr="" end resync_s resync_src refuse v rc_d rc_c rc_g rc_f g="$OUT/.gate"
   if [[ "$DRY" == "1" ]]; then
     log "DRY: read the installer cdc's resync interval; read $FRONTEND_CONFIGMAP config.json until load606 portal-origin passes (gateway $PORTAL_GATEWAY_SVC address, then 2 x resync) -> $OUT/portal-origin.env"
     printf 'export PORTAL_ORIGIN=http://dry-run-gateway PORTAL_SNOWPLOW_URL=http://dry-run-gateway/content\n' \
@@ -743,17 +746,32 @@ wait_portal_origin() {
     source "$OUT/portal-origin.env"
     return 0
   fi
-  t0="$(python3 -c 'import time; print(f"{time.time():.3f}")')"
-  "${K[@]}" -n krateo-system get deploy -o json > "$OUT/.cdc-deployments.json" 2>"$KERR" || true
-  "${K[@]}" -n krateo-system get configmap -o json > "$OUT/.cdc-configmaps.json" 2>"$KERR" || true
-  python3 -m bench.origin_gate resync --deployments "$OUT/.cdc-deployments.json" \
-      --configmaps "$OUT/.cdc-configmaps.json" > "$OUT/portal-origin-resync.json"
-  rm -f "$OUT/.cdc-deployments.json" "$OUT/.cdc-configmaps.json"
+  mkdir -p "$g"; rm -f "$g/clock"
+  t0="$(python3 -m bench.origin_gate now --state "$g/clock")"
+  rc_d=0; rc_c=0
+  "${K[@]}" -n krateo-system get deploy -o json > "$g/deploy.json" 2>"$g/err" || rc_d=$?
+  "${K[@]}" -n krateo-system get configmap -o json > "$g/cm.json" 2>>"$g/err" || rc_c=$?
+  python3 -m bench.origin_gate resync --deployments "$g/deploy.json" --deployments-rc "$rc_d" \
+      --configmaps "$g/cm.json" --configmaps-rc "$rc_c" --errors "$g/err" > "$OUT/portal-origin-resync.json"
+  rm -f "$g/cm.json"
+  refuse="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["refuse"] or "")' "$OUT/portal-origin-resync.json")"
+  if [[ -n "$refuse" ]]; then
+    record_failure "portal origin FAILED: the installer cdc's resync cannot be honoured: $refuse" || true
+    return 1
+  fi
   resync_s="$(python3 -c 'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["seconds"]))' "$OUT/portal-origin-resync.json")"
   resync_src="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["source"])' "$OUT/portal-origin-resync.json")"
   log "portal origin gate: the installer cdc resyncs every ${resync_s}s (${resync_src}); window: up to ${ENDPOINT_WAIT_S}s for the gateway's address, then 2 x ${resync_s}s + one ${PLATFORM_POLL_S}s poll"
+  # #1006 F8: a resync past the budget's term widens the window into the TTL's
+  # slack (the derived TTL cannot know it: it is read after the cluster
+  # exists). Within the slack: said; past it: the reaper could take the
+  # cluster mid-run, so the run stops here.
   if (( resync_s > ORIGIN_RESYNC_BUDGET_S )); then
-    log "WARNING: the cdc's resync (${resync_s}s) exceeds the run budget's ${ORIGIN_RESYNC_BUDGET_S}s: the gate's window is the cluster's, past the budget term"
+    if (( 2 * (resync_s - ORIGIN_RESYNC_BUDGET_S) > TTL_SLACK_S )); then
+      record_failure "portal origin FAILED: the installer cdc resyncs every ${resync_s}s: its window exceeds the run budget's ${ORIGIN_RESYNC_BUDGET_S}s term by more than the TTL's ${TTL_SLACK_S}s slack" || true
+      return 1
+    fi
+    log "WARNING: the cdc's resync (${resync_s}s) exceeds the run budget's ${ORIGIN_RESYNC_BUDGET_S}s: the gate's window runs into the TTL's ${TTL_SLACK_S}s slack"
   fi
   : > "$OUT/portal-origin-wait.jsonl"
   while :; do
@@ -764,15 +782,25 @@ wait_portal_origin() {
       # shellcheck disable=SC1091
       source "$OUT/portal-origin.env"
       log "portal origin (config.json): $PORTAL_ORIGIN; snowplow at $PORTAL_SNOWPLOW_URL"
+      rm -rf "$g"
       return 0
     fi
     why="$(cut -c1-600 "$OUT/.portal-origin.err")"
-    ing="$("${K[@]}" -n krateo-system get svc "$PORTAL_GATEWAY_SVC" \
-        -o 'jsonpath={.status.loadBalancer.ingress[*].ip}{.status.loadBalancer.ingress[*].hostname}' 2>/dev/null || true)"
-    hist="$("${H[@]}" history installer-platform -n krateo-system --max 1 -o json 2>/dev/null || true)"
-    now="$(python3 -c 'import time; print(f"{time.time():.3f}")')"
-    python3 -m bench.origin_gate reading --t "$now" --ingress "$ing" --history "$hist" >> "$OUT/portal-origin-wait.jsonl"
-    if [[ -n "$ing" && -z "$t_addr" ]]; then t_addr="$now"; fi
+    rc_g=0; rc_f=0; rc_d=0
+    "${K[@]}" -n krateo-system get svc "$PORTAL_GATEWAY_SVC" -o json > "$g/svc.json" 2>"$g/svc.err" || rc_g=$?
+    "${K[@]}" -n krateo-system get frontends.composition.krateo.io -o json > "$g/fe.json" 2>"$g/fe.err" || rc_f=$?
+    "${K[@]}" -n krateo-system get deploy -o json > "$g/deploy.json" 2>/dev/null || rc_d=$?
+    (( rc_d == 0 )) || : > "$g/deploy.json"
+    now="$(python3 -m bench.origin_gate now --state "$g/clock")"
+    python3 -m bench.origin_gate reading --t "$now" --gateway-json "$g/svc.json" --gateway-rc "$rc_g" \
+        --gateway-err "$g/svc.err" --frontends-json "$g/fe.json" --frontends-rc "$rc_f" --frontends-err "$g/fe.err" \
+        --deployments-json "$g/deploy.json" >> "$OUT/portal-origin-wait.jsonl"
+    # the window counts from the latest reading with the address: one that disappears restarts it
+    if python3 -c 'import json, sys; r = json.loads(open(sys.argv[1]).read().splitlines()[-1]); sys.exit(0 if r["gateway"] == "address" else 1)' "$OUT/portal-origin-wait.jsonl"; then
+      [[ -n "$t_addr" ]] || t_addr="$now"
+    else
+      t_addr=""
+    fi
     end="$(python3 -m bench.origin_gate deadline --t0 "$t0" --t-addr "$t_addr" --resync "$resync_s" \
         --poll "$PLATFORM_POLL_S" --lb-wait "$ENDPOINT_WAIT_S")"
     python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$now" "$end" || break
@@ -781,6 +809,7 @@ wait_portal_origin() {
   done
   v="$(python3 -m bench.origin_gate verdict --readings "$OUT/portal-origin-wait.jsonl" \
       --resync "$OUT/portal-origin-resync.json" --why "${why:-config.json unreadable}")"
+  rm -rf "$g"
   record_failure "portal origin FAILED: $(python3 -c 'import json, sys; v = json.loads(sys.argv[1]); print(v["kind"] + ": " + v["message"])' "$v")" || true
   return 1
 }
