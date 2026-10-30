@@ -617,20 +617,69 @@ def _cd_summaries(k: Kube) -> list[dict]:
             for o in k.items("compositiondefinitions.core.krateo.io", "-A")]
 
 
+#: a container's waiting reasons that mean its image cannot be pulled
+IMAGE_PULL_REASONS = ("ErrImagePull", "ImagePullBackOff")
+
+
+def image_pull_failures(k: Kube) -> list[dict]:
+    """Every container (init containers included) waiting on an image it
+    cannot pull: its pod, image, waiting reason and message, the image-pull
+    Secrets the pod references, and what the kubelet said about retrieving
+    them (FailedToRetrieveImagePullSecret: the Secret is missing). Read from
+    pods and events only: Secrets are never read."""
+    missing = {}
+    for ev in k.items("events", "-A", "--field-selector", "reason=FailedToRetrieveImagePullSecret"):
+        io = ev.get("involvedObject") or {}
+        if ev.get("reason") == "FailedToRetrieveImagePullSecret" and io.get("kind") == "Pod":
+            missing[(io.get("namespace"), io.get("name"))] = ev.get("message") or ""
+    out = []
+    for pod in k.items("pods", "-A"):
+        md, spec, st = pod.get("metadata") or {}, pod.get("spec") or {}, pod.get("status") or {}
+        images = {c.get("name"): c.get("image") for c in (spec.get("initContainers") or []) + (spec.get("containers") or [])}
+        for cs in (st.get("initContainerStatuses") or []) + (st.get("containerStatuses") or []):
+            w = (cs.get("state") or {}).get("waiting") or {}
+            if w.get("reason") not in IMAGE_PULL_REASONS:
+                continue
+            key = (md.get("namespace"), md.get("name"))
+            out.append({"pod": f"{key[0]}/{key[1]}", "container": cs.get("name"),
+                        "image": cs.get("image") or images.get(cs.get("name")),
+                        "reason": w.get("reason"), "message": redact(w.get("message") or ""),
+                        "pull_secrets": [x.get("name") for x in spec.get("imagePullSecrets") or []],
+                        "pull_secret_missing": redact(missing[key]) if key in missing else None})
+    return out
+
+
+def image_pull_line(f: dict) -> str:
+    secrets = ", ".join(f["pull_secrets"]) or "none"
+    tail = f"; kubelet: {f['pull_secret_missing']}" if f["pull_secret_missing"] else ""
+    return (f"{f['pod']} [{f['container']}] {f['image']}: {f['reason']} "
+            f"(image-pull Secrets referenced: {secrets}{tail})")
+
+
 def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
                    allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (),
                    log: Callable[[str], None] = print,
-                   clock=time.monotonic, sleep=time.sleep) -> bool:
+                   clock=time.monotonic, sleep=time.sleep, reason: list | None = None) -> bool:
     """Poll until every child (CDs + CRs) is Ready except the allow-listed
-    known-unrelated ones, and every `required` component is Ready."""
+    known-unrelated ones, and every `required` component is Ready. Every
+    poll also reads the pods whose image cannot be pulled and names each at
+    the poll it appears; on a timeout `reason` gets the failure's NAME: those
+    image pulls first (with their image and the pull Secrets they reference),
+    then what was not Ready."""
     allow = allow_list_from_env() if allow is None else allow
     log("[platform] allow-list (known, unrelated): "
         + (", ".join(f"{i}[{r}]" for i, r in allow) or "(empty)"))
     deadline = clock() + timeout_s
+    seen: set = set()
     while True:
         inst, leaves = _leaf_summaries(k, core=core)
         st = platform_state(inst, leaves, _cd_summaries(k), allow, required)
         log(f"[platform] {platform_line(st)}")
+        pulls = image_pull_failures(k)
+        for f in pulls:
+            if (f["pod"], f["container"], f["reason"]) not in seen:
+                seen.add((f["pod"], f["container"], f["reason"]))
+                log(f"[platform] IMAGE PULL FAILING: {image_pull_line(f)}")
         if st["ok"]:
             log("[platform] verdict READY"
                 + (" (with allow-listed known-unrelated: "
@@ -639,6 +688,11 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
             return True
         if clock() >= deadline:
             log(f"[platform] TIMEOUT after {timeout_s:.0f}s")
+            why = (f"image pull: {'; '.join(image_pull_line(f) for f in pulls)}; then " if pulls else "")
+            why += f"not Ready after {timeout_s:.0f}s: {platform_line(st)}"
+            log(f"[platform] FAILED: {why}")
+            if reason is not None:
+                reason.append(why)
             return False
         sleep(interval_s)
 
@@ -1122,6 +1176,7 @@ def main(argv=None) -> int:
         if name == "wait-installer":
             s.add_argument("--timeout-s", type=float, default=2700)
             s.add_argument("--interval-s", type=float, default=60)
+            s.add_argument("--reason-out", help="file the failure's named reason is written to")
         else:
             s.add_argument("--out", required=True)
         if name == "definitions":
@@ -1188,9 +1243,13 @@ def main(argv=None) -> int:
     if a.cmd == "wait-installer":
         print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",
               flush=True)
-        return 0 if wait_installer(k, timeout_s=a.timeout_s,
-                                   interval_s=a.interval_s, core=core,
-                                   log=lambda m: print(m, flush=True)) else 1
+        why: list = []
+        ok = wait_installer(k, timeout_s=a.timeout_s, interval_s=a.interval_s, core=core,
+                            log=lambda m: print(m, flush=True), reason=why)
+        if not ok and a.reason_out:
+            with open(a.reason_out, "w") as fh:
+                fh.write((why[0] if why else "wait-installer failed") + "\n")
+        return 0 if ok else 1
     collect(k, a.out, extra_secrets=tuple(a.redact), core=core,
             log=lambda m: print(m, file=sys.stderr, flush=True))
     return 0

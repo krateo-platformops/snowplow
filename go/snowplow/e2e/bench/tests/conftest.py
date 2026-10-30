@@ -50,12 +50,31 @@ if str(_E2E_BENCH_DIR) not in sys.path:
 #   "scope401/403"    under-scoped: the exchange succeeds, the private
 #                     (krateo-agentiko) manifests answer 401 / 403;
 #   "redirect"        the exchange answers a redirect to another host;
+#   "imgscope403"     reads the charts, but the private (krateo-agentiko)
+#                     IMAGES answer 403;
 #   anything else     the exchange answers 401.
-# Every chart is published at every version except FAKE_GHCR_UNPUBLISHED (a
-# 404): the suite's fake pins and the real installer charts some tests pull
-# (their real pins) both resolve, and an arm names the missing version.
+# Every chart and image is published at every version except
+# FAKE_GHCR_UNPUBLISHED (a 404): the suite's fake pins and the real installer
+# charts some tests pull (their real pins) both resolve, and an arm names the
+# missing version. A chart's content (GET manifest, then its helm layer) is
+# built from FAKE_CHART_VALUES, appVersion = the version asked for; its blob
+# is served, as ghcr does, through a redirect to a blob store that REFUSES
+# any Authorization header (a client must not forward the registry's bearer).
+# Two chart versions misbehave on purpose: FAKE_CHART_BAD_DIGEST (its blob
+# does not match the manifest's digest) and FAKE_CHART_HTTP_BLOB (its blob
+# redirect points at plain http).
 FAKE_GHCR_USER, FAKE_GHCR_TOKEN = "fake-ghcr-user", "fake-ghcr-token-" + "f00d" * 4
 FAKE_GHCR_UNPUBLISHED = "9.9.9"
+FAKE_CHART_BAD_DIGEST, FAKE_CHART_HTTP_BLOB = "6.6.6", "5.5.5"
+FAKE_CHART_VALUES = {
+    "agentgateway-policies": {   # the two private hops, as 0.3.468's schema shapes them; one public image
+        "uiTokenHop": {"enabled": True, "image": {"repository": "ghcr.io/krateo-agentiko/ui-token-hop", "tag": ""}},
+        "certReplayHop": {"enabled": True,
+                          "image": {"repository": "ghcr.io/krateo-agentiko/cert-replay-hop", "tag": ""}},
+        "proxy": {"image": {"registry": "cr.agentgateway.dev", "repository": "agentgateway", "tag": "v0.7.0"}}},
+    "agentgateway-controller": {"image": {"registry": "cr.agentgateway.dev", "repository": "controller",
+                                          "tag": "v0.7.0"}},
+}
 
 
 def fake_bearer(token: str) -> str:
@@ -77,8 +96,30 @@ def _fake_ghcr():
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
                     "-days", "2", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
                    check=True, capture_output=True)
-    known = {FAKE_GHCR_TOKEN, "scope401", "scope403", "redirect"}
+    known = {FAKE_GHCR_TOKEN, "scope401", "scope403", "redirect", "imgscope403"}
     bearers = {fake_bearer(t): t for t in known}
+    blobs, http_blobs = {}, set()
+
+    def chart_tgz(name, version):
+        import io
+        import tarfile
+        import yaml
+        chart = name.rsplit("/", 1)[1]
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            files = [("Chart.yaml", {"apiVersion": "v2", "name": chart, "version": version, "appVersion": version}),
+                     ("values.yaml", FAKE_CHART_VALUES.get(chart, {}))]
+            if chart == "agentgateway-policies":     # a subchart: its own values, its own appVersion
+                files += [("charts/hop-sidecar/Chart.yaml", {"apiVersion": "v2", "name": "hop-sidecar",
+                                                             "version": "9.0.1", "appVersion": "9.0.1"}),
+                          ("charts/hop-sidecar/values.yaml",
+                           {"image": {"repository": "ghcr.io/krateo-agentiko/hop-sidecar", "tag": ""}})]
+            for fn, doc in files:
+                data = yaml.safe_dump(doc).encode()
+                ti = tarfile.TarInfo(f"{chart}/{fn}")
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+        return buf.getvalue()
 
     class H(http.server.BaseHTTPRequestHandler):
         def _answer(self, code, body=b"", headers=()):
@@ -102,16 +143,40 @@ def _fake_ghcr():
                 if token == "redirect":
                     return self._answer(307, headers=[("Location", "https://elsewhere.invalid/token")])
                 return self._answer(200, json.dumps({"token": fake_bearer(token)}).encode())
+            if self.path.startswith("/blobstore/"):
+                if self.headers.get("Authorization"):
+                    return self._answer(400, b"an Authorization header reached the blob store")
+                data = blobs.get(self.path[len("/blobstore/"):])
+                return self._answer(200, data) if data is not None else self._answer(404)
             return self.do_HEAD()
 
         def do_HEAD(self):
+            import hashlib
             token = bearers.get((self.headers.get("Authorization") or "")[len("Bearer "):])
             if token is None:
                 return self._answer(401)
+            if "/blobs/" in self.path:
+                digest = self.path.rsplit("/blobs/", 1)[1]
+                scheme = "http" if digest in http_blobs else "https"
+                return self._answer(307, headers=[("Location", f"{scheme}://127.0.0.1:{self.server.server_address[1]}"
+                                                               f"/blobstore/{digest}")])
             name, _, tag = self.path[len("/v2/"):].partition("/manifests/")
             if token in ("scope401", "scope403") and name.startswith("krateo-agentiko/"):
                 return self._answer(int(token[-3:]))
-            return self._answer(404 if tag == FAKE_GHCR_UNPUBLISHED else 200)
+            if token == "imgscope403" and name.startswith("krateo-agentiko/") and "/charts/" not in f"/{name}":
+                return self._answer(403)
+            if tag == FAKE_GHCR_UNPUBLISHED:
+                return self._answer(404)
+            if self.command == "GET" and "/charts/" in f"/{name}":
+                data = chart_tgz(name, tag)
+                digest = "sha256:" + hashlib.sha256(data).hexdigest()
+                blobs[digest] = data + (b"tampered" if tag == FAKE_CHART_BAD_DIGEST else b"")
+                if tag == FAKE_CHART_HTTP_BLOB:
+                    http_blobs.add(digest)
+                return self._answer(200, json.dumps({"schemaVersion": 2, "layers": [
+                    {"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip", "digest": digest,
+                     "size": len(data)}]}).encode())
+            return self._answer(200)
 
         def log_message(self, *a):
             pass

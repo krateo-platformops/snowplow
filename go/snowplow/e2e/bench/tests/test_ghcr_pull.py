@@ -7,6 +7,15 @@ the run is refused before any cloud call. A token that does not resolve the
 private charts at their pinned versions is refused before any cluster exists.
 The token never reaches argv, a log, the run dir or a diagnostic.
 
+Run 19 attempt 2 died at the platform step too: installer 0.3.468 renders its
+derived image-pull Secret only with coreAgents or specialistAgents on, yet
+injects its name into agentgateway-policies' private hop pods (ImagePullBackOff
+for 43 min). The bench now creates its own dockerconfigjson Secret
+(bench-ghcr-image-pull) from the same file and names it in
+registryAuth.imagePullSecretName (the installer's documented opt-out); the
+preflight also resolves every ghcr.io image the pinned charts' values name;
+and the platform step names an image that cannot be pulled.
+
 The suite never reads the operator's file nor reaches ghcr.io: conftest gives
 every run606 a fake file and a fake registry (FAKE_GHCR_*)."""
 
@@ -21,7 +30,8 @@ import pytest
 import yaml
 
 from bench import ghcr_pull
-from tests.conftest import FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer
+from tests.conftest import (FAKE_CHART_BAD_DIGEST, FAKE_CHART_HTTP_BLOB, FAKE_GHCR_TOKEN, FAKE_GHCR_USER,
+                            fake_bearer)
 from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401
 
 
@@ -68,10 +78,12 @@ def _leaks():
     username, base64(user:token) (the Basic header), base64(token), and the
     bearer the registry exchanged the token for."""
     import base64
+    dcj = ghcr_pull.dockerconfigjson(FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
     return {"token": FAKE_GHCR_TOKEN, "username": FAKE_GHCR_USER,
             "basic": base64.b64encode(f"{FAKE_GHCR_USER}:{FAKE_GHCR_TOKEN}".encode()).decode(),
             "b64token": base64.b64encode(FAKE_GHCR_TOKEN.encode()).decode(),
-            "bearer": fake_bearer(FAKE_GHCR_TOKEN)}
+            "bearer": fake_bearer(FAKE_GHCR_TOKEN),
+            "dockerconfigjson": dcj, "b64dockerconfigjson": base64.b64encode(dcj.encode()).decode()}
 
 
 @pytest.mark.parametrize("case,why", [
@@ -83,6 +95,7 @@ def _leaks():
     ("http", "is not https: the token is never sent in clear text"),                 # F6
     ("redirect", "redirect to https://elsewhere.invalid/token refused"),
     ("core_feature", "krateo-agentiko/charts/incident-agent:9.9.9: HTTP 404"),        # F5: an always-on feature
+    ("image_scope", "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18: HTTP 403"),          # run 19b: the images
 ])
 def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, case, why):  # noqa: F811
     env, state, ambient, tmp = harness
@@ -98,6 +111,7 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "http": lambda: {"GHCR_API_URL": env["GHCR_API_URL"].replace("https://", "http://")},
         "redirect": lambda: {"GHCR_PULL_ENV_FILE": token_file("redirect")},
         "core_feature": lambda: {"FAKE_CORE_FEATURES": "specialistAgents"},
+        "image_scope": lambda: {"GHCR_PULL_ENV_FILE": token_file("imgscope403")},
     }[case]())
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=300)
@@ -108,7 +122,7 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
                    for c in _calls(state))
     for what, v in _leaks().items():
         assert v not in out or what == "username", what
-    assert "revoked" not in out and "scope40" not in out
+    assert "revoked" not in out and "scope40" not in out and "imgscope" not in out
 
 
 # ─── the install: 057's registryAuth, the Secret from stdin, nothing kept ───
@@ -125,20 +139,40 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
     assert sorted((c["chart"].rsplit("/", 1)[1], c["version"], c["error"]) for c in pf["charts"]) == [
         ("agentgateway-controller", "0.2.0", None), ("agentgateway-policies", "0.2.18", None),
         ("github-provider-kog", "0.6.0", None), ("krateo-marketplace-catalog", "0.1.2", None)]
-    # registryAuth: 057's fields (installer-platform values, read-only), the username not in the record
+    # the images: read from the pinned chart's own values (an empty tag = its appVersion), each
+    # ghcr.io one resolved with the token; another registry's named, not this token's to resolve
+    assert pf["images"] == [
+        {"image": "ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None},
+        {"image": "ghcr.io/krateo-agentiko/hop-sidecar:9.0.1", "charts": ["agentgateway-policies"], "error": None},
+        {"image": "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None}]
+    assert pf["images_elsewhere"] == [
+        {"image": "cr.agentgateway.dev/agentgateway:v0.7.0", "charts": ["agentgateway-policies"]},
+        {"image": "cr.agentgateway.dev/controller:v0.7.0", "charts": ["agentgateway-controller"]}]
+    # registryAuth: 057's fields (installer-platform values, read-only), the username not in the
+    # record; the image-pull Secret is the bench's own (the installer's documented opt-out)
     vals = yaml.safe_load((tmp / "out" / "installer-values.yaml").read_text())
-    assert vals["registryAuth"] == {"enabled": True, "imagePullSecretName": "", "insecureSkipVerifyTLS": False,
-                                    "registries": [], "passwordRef": {"name": "krateo-agentiko-pull",
-                                                                       "namespace": "krateo-system", "key": "token"}}
-    # the Secret: created from stdin, before the install, with exactly the token
-    sec = json.loads((state / "created-secret").read_text())
-    assert sec["stdin"] == FAKE_GHCR_TOKEN and sec["ns"] == "krateo-system"
-    assert sec["argv"][:4] == ["create", "secret", "generic", "krateo-agentiko-pull"]
-    assert "--from-file=token=/dev/stdin" in sec["argv"]
+    assert vals["registryAuth"] == {"enabled": True, "imagePullSecretName": "bench-ghcr-image-pull",
+                                    "insecureSkipVerifyTLS": False, "registries": [],
+                                    "passwordRef": {"name": "krateo-agentiko-pull",
+                                                    "namespace": "krateo-system", "key": "token"}}
+    # the two Secrets: created from stdin, before the install, in krateo-system
+    secs = [json.loads(ln) for ln in (state / "created-secrets.jsonl").read_text().splitlines()]
+    assert [x["argv"][3] for x in secs] == ["krateo-agentiko-pull", "bench-ghcr-image-pull"]
+    tok, dcj = secs
+    assert tok["stdin"] == FAKE_GHCR_TOKEN and tok["ns"] == "krateo-system"
+    assert "--from-file=token=/dev/stdin" in tok["argv"]
+    # the dockerconfigjson: the shape the installer's imagepull-secret.yaml renders, for ghcr.io
+    import base64
+    assert json.loads(dcj["stdin"]) == {"auths": {"ghcr.io": {
+        "username": FAKE_GHCR_USER, "password": FAKE_GHCR_TOKEN,
+        "auth": base64.b64encode(f"{FAKE_GHCR_USER}:{FAKE_GHCR_TOKEN}".encode()).decode()}}}
+    assert dcj["ns"] == "krateo-system"
+    assert "--type=kubernetes.io/dockerconfigjson" in dcj["argv"]
+    assert "--from-file=.dockerconfigjson=/dev/stdin" in dcj["argv"]
     calls = _calls(state)
-    i_secret = next(i for i, c in enumerate(calls) if c["tool"] == "kubectl" and "secret" in c["argv"])
+    i_secrets = [i for i, c in enumerate(calls) if c["tool"] == "kubectl" and "secret" in c["argv"]]
     i_install = next(i for i, c in enumerate(calls) if c["tool"] == "helm" and "install" in c["argv"])
-    assert i_secret < i_install
+    assert len(i_secrets) == 2 and max(i_secrets) < i_install
     # the username: piped into helm's `-f -` (#1007 F2), no file: helm received it
     helm = calls[i_install]["argv"]
     assert [helm[i + 1] for i, x in enumerate(helm) if x == "-f"][1] == "-"
@@ -257,6 +291,95 @@ def test_the_pins_are_every_repo_override_the_installer_turns_on(tmp_path):
     v.write_text(yaml.safe_dump({"features": {"agentGateway": True}}))
     assert [p["name"] for p in ghcr_pull.private_pins(str(tmp_path), str(v))] == [
         "agentgateway-controller", "github-provider-kog", "codegen"]
+
+
+def test_the_images_are_what_the_chart_values_name():
+    """As the charts template them: a dict under `image` with a repository (a
+    registry before it), its tag, else its digest, else the chart's
+    appVersion; a string under `image`."""
+    v = {"uiTokenHop": {"image": {"repository": "ghcr.io/krateo-agentiko/ui-token-hop", "tag": ""}},
+         "proxy": {"image": {"registry": "cr.agentgateway.dev", "repository": "agentgateway", "tag": "v1"}},
+         "sidecars": [{"image": {"repository": "ghcr.io/x/pinned", "digest": "sha256:" + "a" * 64}}],
+         "job": {"image": "ghcr.io/x/job"}, "notAnImage": {"repository": "ghcr.io/x/ignored"},
+         "image": {"pullPolicy": "IfNotPresent"}}
+    assert ghcr_pull.images_in_values(v, "0.2.18") == [
+        "cr.agentgateway.dev/agentgateway:v1", "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18",
+        "ghcr.io/x/job:latest", "ghcr.io/x/pinned@sha256:" + "a" * 64]
+    assert ghcr_pull.split_image("ghcr.io/krateo-agentiko/ui-token-hop:0.2.18") == (
+        "ghcr.io", "krateo-agentiko/ui-token-hop", "0.2.18")
+
+
+def test_a_chart_is_read_through_the_blob_redirect_without_the_registry_bearer():
+    """ghcr serves a blob through a redirect to its storage; the fake store
+    refuses any Authorization header, so reading the chart proves the bearer
+    is not forwarded; the content is digest-verified."""
+    imgs, err = ghcr_pull.chart_images("oci://ghcr.io/krateo-agentiko/charts", "agentgateway-policies", "0.2.18",
+                                       FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
+    assert err is None
+    assert "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18" in imgs
+    assert "ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18" in imgs
+    assert "ghcr.io/krateo-agentiko/hop-sidecar:9.0.1" in imgs          # a subchart: its own appVersion
+
+
+@pytest.mark.parametrize("version,why", [(FAKE_CHART_BAD_DIGEST, "does not match its digest"),
+                                         (FAKE_CHART_HTTP_BLOB, "redirected off https")])
+def test_a_chart_blob_that_is_not_what_the_manifest_names_is_refused(version, why):
+    imgs, err = ghcr_pull.chart_images("oci://ghcr.io/krateo-agentiko/charts", "agentgateway-policies", version,
+                                       FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
+    assert imgs == [] and err.startswith("its images unreadable: ") and why in err
+
+
+def test_an_init_container_that_cannot_pull_is_named_too():
+    import subprocess as sp
+    from bench import diag606
+    pod = {"metadata": {"name": "p", "namespace": "ns"},
+           "spec": {"initContainers": [{"name": "init", "image": "ghcr.io/x/init:1"}],
+                    "containers": [{"name": "app", "image": "ghcr.io/x/app:1"}]},
+           "status": {"initContainerStatuses": [{"name": "init", "state": {"waiting": {"reason": "ErrImagePull",
+                                                                                       "message": "401"}}}],
+                      "containerStatuses": [{"name": "app", "state": {"waiting": {"reason": "PodInitializing"}}}]}}
+
+    def run(argv, **kw):
+        if " get pods" in " ".join(argv):
+            return sp.CompletedProcess(argv, 0, json.dumps({"items": [pod]}), "")
+        return sp.CompletedProcess(argv, 0, json.dumps({"items": []}), "")
+    f = diag606.image_pull_failures(diag606.Kube("kc", "gke_p_z_snowplow-bench-x", run=run))
+    assert [(x["pod"], x["container"], x["image"], x["reason"], x["pull_secrets"]) for x in f] == [
+        ("ns/p", "init", "ghcr.io/x/init:1", "ErrImagePull", [])]
+
+
+@pytest.mark.parametrize("mode,kubelet", [("backoff", None), ("missing_secret", "Unable to retrieve some image pull "
+                                                                              "secrets (krateo-registry-image-pull)")])
+def test_an_image_that_cannot_be_pulled_is_the_platform_failures_name(harness, mode, kubelet):  # noqa: F811
+    """Run 19 attempt 2: the hop pods sat in ImagePullBackOff for 43 min and
+    the step said only "timeout". The pod, its image and the pull Secret it
+    references are named at the poll it appears and ARE the failure's
+    reason; a Secret the kubelet cannot retrieve is said so (read from the
+    events: Secrets are never read)."""
+    env, state, ambient, tmp = harness
+    env = dict(env, FAKE_IMAGE_PULL=mode, FAKE_INSTALLER_READY="0", PLATFORM_TIMEOUT_S="1",
+               PLATFORM_POLL_S="0.2")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
+                       timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode != 0
+    line = ("krateo-system/agentgateway-policies-ui-token-hop-7d9f-x2 [hop] "
+            "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18: ImagePullBackOff "
+            "(image-pull Secrets referenced: krateo-registry-image-pull")
+    assert f"[platform] IMAGE PULL FAILING: {line}" in out
+    assert f"platform FAILED: image pull: {line}" in out, out[-3000:]
+    assert (f"; kubelet: {kubelet}" in out) if kubelet else ("kubelet:" not in out)
+    rec = [json.loads(ln) for ln in (tmp / "out" / "command-failures.jsonl").read_text().splitlines()]
+    assert any(r["step"] == "platform" and r["what"].startswith("platform FAILED: image pull: ") for r in rec)
+
+
+def test_without_an_image_pull_failure_the_platform_failure_names_what_is_not_ready(harness):  # noqa: F811
+    env, state, ambient, tmp = harness
+    env = dict(env, FAKE_INSTALLER_READY="0", PLATFORM_TIMEOUT_S="1", PLATFORM_POLL_S="0.2")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
+                       timeout=300)
+    out = p.stdout + p.stderr
+    assert "platform FAILED: not Ready after 1s: " in out and "IMAGE PULL" not in out
 
 
 def test_check_never_names_the_token(tmp_path):

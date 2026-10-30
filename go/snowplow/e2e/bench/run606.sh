@@ -543,10 +543,16 @@ s_up() {
 # preflight reads their features; s_install applies them). registryAuth is
 # 057's (installer-platform values, read-only 2026-10-30): enabled, global
 # credentials (registries: []), passwordRef krateo-agentiko-pull/token in
-# krateo-system, the derived image-pull Secret (imagePullSecretName ""), TLS
-# verified. Its username comes from the pull-token file at install time,
-# piped into helm: no identity is kept in the run's record (and diag606
-# redacts it from the Installer CR the installer copies it into).
+# krateo-system, TLS verified. Its username comes from the pull-token file
+# at install time, piped into helm: no identity is kept in the run's record
+# (and diag606 redacts it from the Installer CR the installer copies it into).
+# The IMAGE-pull Secret is the bench's own (imagePullSecretName
+# bench-ghcr-image-pull), the installer's documented opt-out: 0.3.468
+# renders its derived Secret only when coreAgents or specialistAgents is on,
+# yet injects its name into agentgateway-policies' private hop pods (run 19
+# attempt 2: ImagePullBackOff for 43 min). Fixed in the installer's PR 599;
+# once that ships the derived path ("") works too, and going back is a later
+# decision.
 write_installer_values() {
   cat > "$OUT/installer-values.yaml" <<EOF
 bootstrap:
@@ -603,16 +609,17 @@ registryAuth:
     name: krateo-agentiko-pull
     namespace: krateo-system
     key: token
-  imagePullSecretName: ""
+  imagePullSecretName: bench-ghcr-image-pull
   insecureSkipVerifyTLS: false
   registries: []
 EOF
 }
 # s_registry: BEFORE any cluster exists, the pull token must resolve every
-# private chart this install pulls (the repo-override pins of the features
-# the values enable) at the pinned version: a bad or under-scoped token costs
-# nothing (bench/ghcr_pull.py preflight; $OUT/ghcr-pull-preflight.json names
-# charts and versions, never the token).
+# repo-override chart the installer turns on, at its pinned version, AND every
+# ghcr.io image those charts' own values name (read from the chart itself):
+# a bad or under-scoped token costs nothing (bench/ghcr_pull.py preflight;
+# $OUT/ghcr-pull-preflight.json names charts, images and versions, never the
+# token).
 s_registry() {
   write_installer_values
   local rc=0 ln
@@ -621,15 +628,17 @@ s_registry() {
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
-  (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts"; return 1; }
+  (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1; }
 }
 s_install() {
   [[ -s "$OUT/installer-values.yaml" ]] || write_installer_values
-  # registryAuth's Secret, created BEFORE the install renders (the installer
-  # derives its image-pull Secret from it). The token goes through a pipe into
-  # kubectl's stdin: never argv, a variable, a log or the run dir.
+  # registryAuth's Secret and the image-pull Secret, both created BEFORE the
+  # install renders. The token (and the dockerconfigjson, built in-process)
+  # goes through a pipe into kubectl's stdin: never argv, a variable, a log, a
+  # file or the run dir.
   if [[ "$DRY" == "1" ]]; then
     log "DRY: kubectl create namespace krateo-system; bench.ghcr_pull token | kubectl -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin"
+    log "DRY: bench.ghcr_pull dockerconfigjson | kubectl -n krateo-system create secret generic bench-ghcr-image-pull --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=/dev/stdin"
   else
     run "${K[@]}" create namespace krateo-system
     log "RUN: bench.ghcr_pull token | kubectl -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin"
@@ -637,6 +646,12 @@ s_install() {
       | "${K[@]}" -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin \
           >/dev/null 2>"$KERR" \
       || { record_failure "install FAILED: creating the ghcr pull Secret"; return 1; }
+    log "RUN: bench.ghcr_pull dockerconfigjson | kubectl -n krateo-system create secret generic bench-ghcr-image-pull --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=/dev/stdin"
+    python3 -m bench.ghcr_pull dockerconfigjson --env-file "$GHCR_PULL_ENV_FILE" \
+      | "${K[@]}" -n krateo-system create secret generic bench-ghcr-image-pull \
+          --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=/dev/stdin \
+          >/dev/null 2>"$KERR" \
+      || { record_failure "install FAILED: creating the image-pull Secret"; return 1; }
   fi
   # registryAuth.username through a pipe into helm's `-f -` (helm reads that
   # values document from stdin): no file holds it, so no exit path can leave
@@ -727,14 +742,22 @@ s_wait_platform() {
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
   # Installer CR declares is read with the chart's own feature rule.
+  # Its failure is NAMED (platform-reason.txt): a pod whose image cannot be
+  # pulled is reported with its image and the pull Secrets it references at
+  # the poll it appears, and is the failure's reason, not "timeout".
   local prc=0
+  rm -f "$OUT/platform-reason.txt"
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
-      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled" || prc=$?
+      --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled" \
+      --reason-out "$OUT/platform-reason.txt" || prc=$?
   # the platform step's end, READY or not: a platform that never got ready is
   # the case the definitions and the controller logs explain
   capped_definitions platform_end
-  (( prc == 0 )) || return "$prc"
+  if (( prc != 0 )); then
+    record_failure "platform FAILED: $(cat "$OUT/platform-reason.txt" 2>/dev/null || echo "wait-installer exited $prc with no reason")" || true
+    return "$prc"
+  fi
   # NEVER wait on the umbrella Installer being Ready: on a credential-free
   # bench it never is (github-provider-kog stays 401, installer#484). Wait on
   # the specific components the bench uses: their Deployments Available and
