@@ -80,8 +80,8 @@ a filter too large for a URL (many facet chips, long lists). It mirrors
 - **The body** is `/call/read`'s envelope, decoded by the same code:
   `{"extras":{...}}` (an inline `object`, as `/call/read` accepts it, is
   validated the same way). The body is bounded at 1 MiB. An invalid body,
-  or one over the bound, gets the same `400` as `/call/read`, and nothing
-  is exported.
+  or one over the bound, gets the same `400` as `/call/read` (its message
+  names `POST /export`), and nothing is exported.
 - **The query** carries everything else: the addressing (`apiVersion`,
   `resource`, `name`, `namespace`), `page`/`perPage` and the export's own
   parameters (`format`, `path`, `fields`, `header`, `title`, `filename`).
@@ -104,14 +104,24 @@ curl -fsS -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -o
 ### An export never writes
 
 An export is a read. A RESTAction that declares a write stage (any verb but
-`GET`) is exported without sending that write, by `GET` and `POST /export`
-alike:
+`GET`, `HEAD`, `OPTIONS`, `TRACE`) is exported without sending that write,
+by `GET` and `POST /export` alike, on every page of the export, for every
+item of an iterator stage, and whatever the stage's `continueOnError`:
 - the write stage is refused the way background work refuses one (origin
-  `export`), and the rows of the other stages still export;
+  `export`), and the rows of the other stages still export. Its `errorKey`
+  records `an export never sends writes: stage "<name>" verb <VERB> was not
+  sent (export, #970)`; a RESTAction filter that exports the `errorKey`
+  exports that text;
 - the refusal is reported, not silent: the export response carries
   `X-Snowplow-Stage-Outcomes`, the stages of its re-dispatched pages that
   did not succeed (as `/call` reports them), and the refused write stage
-  is listed there.
+  is listed there. The merged value keeps the header's 4 KiB bound: above
+  it, or when a page already sent the summary, it is
+  `{"truncated":true,"failed":N}`, with `N` the number of distinct
+  outcomes the pages listed (or a summarised page's own `N`, when larger);
+- nothing is cached for a customer read to be served from: a RESTAction
+  that declares a write stage is never stored, so a `GET /call` after an
+  export resolves again and sends its write.
 
 **Behaviour change:** before #970, `GET /export` of such a RESTAction sent
 its write stage, like `GET /call` does. It no longer does. `GET /call` and

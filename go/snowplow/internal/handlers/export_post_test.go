@@ -157,8 +157,9 @@ func TestExport970_PostExportMatchesCallRead(t *testing.T) {
 
 // TestExport970_PostExportBodyRefusedLikeCallRead — a body that is not the
 // /call/read envelope (invalid JSON), and a body over /call/read's 1 MiB
-// bound, get exactly /call/read's refusal: the same 400 and body, for an
-// explicit window and for the full list, before any page is dispatched.
+// bound, get /call/read's refusal: the same 400 and body, naming the route
+// it was sent to (POST /export where /call/read's says POST /call/read), for
+// an explicit window and for the full list, before any page is dispatched.
 func TestExport970_PostExportBodyRefusedLikeCallRead(t *testing.T) {
 	seedExtrasRESTAction(t)
 	var pages []pageSeen
@@ -176,8 +177,12 @@ func TestExport970_PostExportBodyRefusedLikeCallRead(t *testing.T) {
 			if want.Code != http.StatusBadRequest {
 				t.Fatalf("%s: POST /call/read answered %d, want 400", c.name, want.Code)
 			}
-			if got.Code != want.Code || got.Body.String() != want.Body.String() {
-				t.Errorf("%s window %q: POST /export answered %d %q, want /call/read's %d %q", c.name, window, got.Code, got.Body.String(), want.Code, want.Body.String())
+			if !strings.Contains(want.Body.String(), "invalid POST /call/read body") {
+				t.Errorf("%s: POST /call/read's 400 %q does not name its route", c.name, want.Body.String())
+			}
+			wantBody := strings.Replace(want.Body.String(), "POST /call/read", "POST /export", 1)
+			if got.Code != want.Code || got.Body.String() != wantBody {
+				t.Errorf("%s window %q: POST /export answered %d %q, want %d %q", c.name, window, got.Code, got.Body.String(), want.Code, wantBody)
 			}
 			if len(pages) != 0 {
 				t.Errorf("%s window %q: %d page(s) dispatched after a refused body", c.name, window, len(pages))

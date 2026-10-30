@@ -67,6 +67,20 @@ func seedExtrasRESTAction(t *testing.T) { seedExtrasHarness(t, "https://127.0.0.
 // read result survives a refused or failed write).
 const writeRAName970 = "team-rows-notify"
 
+// The round-6 write shapes (seedExtrasHarness): the same read and the same
+// POST, with continueOnError off, as an iterator over the read stage's rows,
+// both, and with the errorKey exported as the one row.
+const (
+	writeNoCoeRAName970     = "team-rows-notify-nocoe"
+	writeIterRAName970      = "team-rows-notify-iter"
+	writeIterNoCoeRAName970 = "team-rows-notify-iter-nocoe"
+	writeErrorKeyRAName970  = "notify-error-row"
+)
+
+// errorKeyFilter970 exports the write stage's errorKey as a row, as a
+// RESTAction that surfaces a stage error to its widget does.
+const errorKeyFilter970 = `{rows: [{id: "notify", team: (.notifyError | tostring)}]}`
+
 // seedExtrasHarness is seedExtrasRESTAction with the caller's clientconfig
 // pointing at serverURL, where a dialed stage (the write stage) lands.
 func seedExtrasHarness(t *testing.T, serverURL string) {
@@ -126,6 +140,39 @@ func seedExtrasHarness(t *testing.T, serverURL string) {
 				"filter": raFilter970,
 			},
 		}},
+	}
+	// The other write shapes an export must not send (#970 round 6): a write
+	// stage with continueOnError off, an iterator write stage (one write per
+	// row of the read stage), both together, and one whose RESTAction filter
+	// exports the write stage's errorKey as a row.
+	for _, x := range []struct {
+		name     string
+		coe      bool
+		iterator bool
+		filter   string
+	}{
+		{writeNoCoeRAName970, false, false, raFilter970},
+		{writeIterRAName970, true, true, raFilter970},
+		{writeIterNoCoeRAName970, false, true, raFilter970},
+		{writeErrorKeyRAName970, true, false, errorKeyFilter970},
+	} {
+		w := map[string]any{
+			"name": "notify", "verb": "POST", "path": "/api/v1/namespaces/team-a/configmaps",
+			"payload":         `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"exported"}}`,
+			"continueOnError": x.coe, "errorKey": "notifyError",
+		}
+		if x.iterator {
+			w["dependsOn"] = map[string]any{"name": "cms", "iterator": ".cms"}
+		}
+		seed = append(seed, &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "templates.krateo.io/v1",
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": x.name, "namespace": extrasNS970, "uid": "uid-" + x.name},
+			"spec": map[string]any{
+				"api":    []any{map[string]any{"name": "cms", "path": "/api/v1/namespaces/team-a/configmaps", "filter": cmFilter970}, w},
+				"filter": x.filter,
+			},
+		}})
 	}
 	for i := range 12 {
 		seed = append(seed, &unstructured.Unstructured{Object: map[string]any{

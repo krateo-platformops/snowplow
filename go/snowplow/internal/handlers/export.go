@@ -22,6 +22,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"github.com/krateo-platformops/snowplow/internal/support/pdftable"
@@ -473,10 +474,18 @@ func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int, stage
 // once, in first-seen order. The export answers with it, so a stage that
 // was refused or failed — an export's refused write stage included — is
 // reported, never silent.
+//
+// The merge keeps the header's contract: a value over
+// api.StageOutcomesMaxHeaderBytes is the {"truncated":true,"failed":N}
+// summary. So is the merge when any page was already a summary: that page's
+// stages are unknown, and a list without them would read as success. N is
+// the number of distinct outcomes the pages listed, or a summarised page's
+// own N when larger; a summarised page never drops the other pages' count.
 type stageOutcomeSet struct {
-	entries []string // distinct outcome objects, as JSON
-	other   string   // a value that is not a list (a truncated summary)
-	any     bool
+	entries          []string // distinct outcome objects, as JSON
+	summarised       bool     // some page sent the truncated summary
+	summarisedFailed int      // the largest N among those pages
+	any              bool
 }
 
 func (s *stageOutcomeSet) add(v string) {
@@ -486,13 +495,16 @@ func (s *stageOutcomeSet) add(v string) {
 	s.any = true
 	var list []json.RawMessage
 	if err := json.Unmarshal([]byte(v), &list); err != nil {
-		if s.other == "" {
-			s.other = v
+		var sum struct {
+			Failed int `json:"failed"`
 		}
+		_ = json.Unmarshal([]byte(v), &sum) // a value that is not the summary counts 0
+		s.summarised = true
+		s.summarisedFailed = max(s.summarisedFailed, sum.Failed)
 		return
 	}
 	for _, e := range list {
-		if !slices.Contains(s.entries, string(e)) { // a handful of stages at most
+		if !slices.Contains(s.entries, string(e)) { // distinct stage × reason: a handful
 			s.entries = append(s.entries, string(e))
 		}
 	}
@@ -504,11 +516,13 @@ func (s *stageOutcomeSet) set(h http.Header) {
 	if !s.any {
 		return
 	}
-	if s.other != "" {
-		h.Set(util.HeaderStageOutcomes, s.other)
-		return
+	if !s.summarised {
+		if v := "[" + strings.Join(s.entries, ",") + "]"; len(v) <= api.StageOutcomesMaxHeaderBytes {
+			h.Set(util.HeaderStageOutcomes, v)
+			return
+		}
 	}
-	h.Set(util.HeaderStageOutcomes, "["+strings.Join(s.entries, ",")+"]")
+	h.Set(util.HeaderStageOutcomes, api.TruncatedStageOutcomes(max(len(s.entries), s.summarisedFailed)))
 }
 
 // collectAllPages is the paginate-and-concat lane for an unpaginated
