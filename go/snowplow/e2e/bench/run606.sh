@@ -46,14 +46,13 @@ fi
 # The control plane is REGIONAL (3 replicas; run 16 attempt 2 lost B's zonal
 # one for 5+ minutes): gcloud and the kube context name the region.
 REGION="${ZONE%-*}"
-# The cluster's TTL (the self-destruct CronJob and gke-reap read it). The
-# whole run's worst case must fit inside it, or the run is refused before any
-# cloud call (see the budget below). 12 h holds run 9's default plan (two
-# churn modes x 3 rates x 60 samples) with every bounded wait at its maximum,
-# since run 19's two menu-class preflights and the portal-origin gate's own
-# window (#1005: 2 x the cdc's resync after the gateway's address) took the
-# 11 h plan past its margin.
-TTL_HOURS="${TTL_HOURS:-12}"
+# The cluster's TTL (the self-destruct CronJob and gke-reap read it), in
+# hours. Unset (the default): DERIVED from the plan itself, its worst case +
+# the margin rounded up to the hour (see the budget below), so the bound
+# follows the plan's terms with no number to re-tune. Set by hand: it must fit
+# that same plan, or the run is refused before any cloud call, with the
+# numbers; a hand-set TTL is never raised.
+TTL_HOURS="${TTL_HOURS:-}"
 INSTALLER_CHART="${INSTALLER_CHART:-oci://ghcr.io/krateo-platformops/charts/installer}"
 # Installer source: ONLY the published OCI chart (INSTALLER_VERSION).
 # Local-chart mode cannot work for this installer (run 4): its self-CD pulls
@@ -265,12 +264,19 @@ RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_W
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
+TTL_NEEDED_H=$(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 ))
+if [[ -z "$TTL_HOURS" ]]; then
+  TTL_HOURS="$TTL_NEEDED_H"
+  TTL_HOW="derived: the plan's ${RUN_BUDGET_S} s + margin ${TTL_MARGIN_S} s, rounded up to the hour"
+else
+  TTL_HOW="set by hand"
+fi
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
-  echo "  needs TTL_HOURS >= $(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 )), or fewer FRESH_SAMPLES / CHURN_RATES / FRESH_MODES" >&2
+  echo "  needs TTL_HOURS >= ${TTL_NEEDED_H} (or leave it unset: it is derived from the plan), or fewer FRESH_SAMPLES / CHURN_RATES / FRESH_MODES" >&2
   exit 2
 fi
 COMPOSITE_ROUTES=()
@@ -1750,7 +1756,7 @@ s_evaluate() {
   return 0
 }
 
-log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus ${TTL_MARGIN_S} s"
+log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s; ${TTL_HOW}) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
 step schema    s_schema
