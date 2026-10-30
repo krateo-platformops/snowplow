@@ -126,6 +126,16 @@ if [[ "$ENDPOINT_MODE" != "incluster" ]]; then
   echo "refusing: ENDPOINT_MODE=${ENDPOINT_MODE}: the portal is exposed through one gateway origin (path mode, as on 057); its components have no LoadBalancer IP of their own. Use ENDPOINT_MODE=incluster" >&2
   exit 2
 fi
+# The read-only ghcr pull token (bench/ghcr_pull.py): the agentgateway charts
+# the portal's gateway needs are PRIVATE (krateo-agentiko/*; run 19 died on
+# their 401 at the platform step). The bench installs with registryAuth
+# exactly as 057 does, from this operator-written file (mode 0600,
+# GHCR_PULL_USERNAME + GHCR_PULL_TOKEN). Without it: refused here, before any
+# cloud call; never a run without it.
+# exported: bench.diag606 reads the same file (never argv) to redact the pull
+# account from every bundle, whether the path is the default or an override
+export GHCR_PULL_ENV_FILE="${GHCR_PULL_ENV_FILE:-$HOME/.config/snowplow-bench/ghcr-pull.env}"
+python3 -m bench.ghcr_pull check --env-file "$GHCR_PULL_ENV_FILE" || exit 2
 ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
 ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
 REQUIRED_DEPLOYMENTS="${REQUIRED_DEPLOYMENTS:-snowplow frontend authn}"
@@ -529,7 +539,15 @@ s_up() {
       --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES 2>&1 >"$OUT/cluster-shape.jsonl")"
   log "$shape_msg"
 }
-s_install() {
+# write_installer_values: the installer's values for this run (the registry
+# preflight reads their features; s_install applies them). registryAuth is
+# 057's (installer-platform values, read-only 2026-10-30): enabled, global
+# credentials (registries: []), passwordRef krateo-agentiko-pull/token in
+# krateo-system, the derived image-pull Secret (imagePullSecretName ""), TLS
+# verified. Its username comes from the pull-token file at install time,
+# piped into helm: no identity is kept in the run's record (and diag606
+# redacts it from the Installer CR the installer copies it into).
+write_installer_values() {
   cat > "$OUT/installer-values.yaml" <<EOF
 bootstrap:
   coreProvider:
@@ -578,10 +596,61 @@ componentValues:
       operator: Equal
       value: snowplow
       effect: NoSchedule
+registryAuth:
+  enabled: true
+  # username: set at install from the pull-token file, piped into helm's -f - (not kept)
+  passwordRef:
+    name: krateo-agentiko-pull
+    namespace: krateo-system
+    key: token
+  imagePullSecretName: ""
+  insecureSkipVerifyTLS: false
+  registries: []
 EOF
-  run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
-      -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" \
-      --wait --timeout "${INSTALL_TIMEOUT_S}s"
+}
+# s_registry: BEFORE any cluster exists, the pull token must resolve every
+# private chart this install pulls (the repo-override pins of the features
+# the values enable) at the pinned version: a bad or under-scoped token costs
+# nothing (bench/ghcr_pull.py preflight; $OUT/ghcr-pull-preflight.json names
+# charts and versions, never the token).
+s_registry() {
+  write_installer_values
+  local rc=0 ln
+  python3 -m bench.ghcr_pull preflight --env-file "$GHCR_PULL_ENV_FILE" --installer-pulled "$OUT/installer-pulled" \
+      --values "$OUT/installer-values.yaml" --out "$OUT/ghcr-pull-preflight.json" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts"; return 1; }
+}
+s_install() {
+  [[ -s "$OUT/installer-values.yaml" ]] || write_installer_values
+  # registryAuth's Secret, created BEFORE the install renders (the installer
+  # derives its image-pull Secret from it). The token goes through a pipe into
+  # kubectl's stdin: never argv, a variable, a log or the run dir.
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: kubectl create namespace krateo-system; bench.ghcr_pull token | kubectl -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin"
+  else
+    run "${K[@]}" create namespace krateo-system
+    log "RUN: bench.ghcr_pull token | kubectl -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin"
+    python3 -m bench.ghcr_pull token --env-file "$GHCR_PULL_ENV_FILE" \
+      | "${K[@]}" -n krateo-system create secret generic krateo-agentiko-pull --from-file=token=/dev/stdin \
+          >/dev/null 2>"$KERR" \
+      || { record_failure "install FAILED: creating the ghcr pull Secret"; return 1; }
+  fi
+  # registryAuth.username through a pipe into helm's `-f -` (helm reads that
+  # values document from stdin): no file holds it, so no exit path can leave
+  # one behind (#1007 review F2)
+  if [[ "$DRY" == "1" ]]; then
+    run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+        -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
+        --wait --timeout "${INSTALL_TIMEOUT_S}s"
+    return 0
+  fi
+  python3 -m bench.ghcr_pull username --env-file "$GHCR_PULL_ENV_FILE" \
+    | run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+        -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
+        --wait --timeout "${INSTALL_TIMEOUT_S}s"
 }
 s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
@@ -1621,6 +1690,7 @@ log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus 
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
 step schema    s_schema
+step registry  s_registry
 step reap      s_reap
 step up        s_up
 step install   s_install

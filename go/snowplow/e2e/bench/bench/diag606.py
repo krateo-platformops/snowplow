@@ -67,6 +67,38 @@ def _kv_sub(m: re.Match) -> str:
     return f'{m.group("key")}<redacted>'
 
 
+#: the keys under which an object carries a REGISTRY credential: the installer
+#: copies its registryAuth (username included) into the Installer CR's spec
+#: (installer 0.3.468 self-bootstrap.yaml:191, `pick .Values ... "registryAuth"`),
+#: and stamps every CompositionDefinition's spec.chart.credentials from it
+#: (_helpers.tpl inst.chartExtras). Its `username` is the pull account's
+#: identity: redacted by KEY wherever such an object is written (#1007 review F1).
+CREDENTIAL_PARENTS = ("registryAuth", "credentials")
+
+
+def redact_credentials(obj, under: bool = False):
+    """`obj` with every `username` under a registryAuth / credentials key (at
+    any depth: registryAuth.registries[].username too) replaced."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if under and k == "username" and v else
+                     redact_credentials(v, under or k in CREDENTIAL_PARENTS)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_credentials(v, under) for v in obj]
+    return obj
+
+
+def _pull_account() -> tuple[str, ...]:
+    """The ghcr pull account's username and token (bench/ghcr_pull.py), read
+    from the operator's file, never from argv: literals every bundle and log
+    this module writes redacts, wherever they appear (a controller log line
+    naming the account included). () when there is no usable file."""
+    from bench import ghcr_pull
+    path = os.environ.get("GHCR_PULL_ENV_FILE") or ghcr_pull.DEFAULT_ENV_FILE
+    if ghcr_pull.check(path):
+        return ()
+    return tuple(x for x in ghcr_pull.creds(path) if x)
+
+
 def redact(text: str, extra: tuple[str, ...] = ()) -> str:
     for rx, rep in _REDACTIONS:
         text = rx.sub(rep, text)
@@ -614,12 +646,14 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
 def collect(k: Kube, out_dir: str, *, extra_secrets: tuple[str, ...] = (),
             core: tuple[str, ...] = (), log: Callable[[str], None] = print) -> dict:
     """Write the diagnostics bundle. Never raises: a probe that fails records
-    its error, so one broken call cannot cost the rest of the bundle."""
+    its error, so one broken call cannot cost the rest of the bundle. The
+    pull account's literals are redacted whoever the caller is."""
+    extra_secrets = tuple(extra_secrets) + _pull_account()
     os.makedirs(out_dir, exist_ok=True)
     written: dict[str, str] = {}
 
     def w(name: str, data):
-        txt = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
+        txt = data if isinstance(data, str) else json.dumps(redact_credentials(data), indent=2, default=str)
         path = os.path.join(out_dir, name)
         with open(path, "w") as fh:
             fh.write(redact(txt, extra_secrets))
@@ -933,7 +967,7 @@ def _redact_obj(obj, extra: tuple[str, ...] = ()):
     if isinstance(obj, str):
         return _redact_log(obj, extra)
     if isinstance(obj, dict):
-        return {key: _redact_obj(v, extra) for key, v in obj.items()}
+        return {key: _redact_obj(v, extra) for key, v in redact_credentials(obj).items()}
     if isinstance(obj, list):
         return [_redact_obj(v, extra) for v in obj]
     return obj
@@ -1113,8 +1147,9 @@ def main(argv=None) -> int:
         images = controller_images(pods, known=_known_images(a.out))
         rec = definitions_snapshot(k, at=a.at, windows=component_windows(images))
         rec["controller_images"] = images
-        rec["controller_logs"] = controller_logs(k, pods, a.logs_dir, extra=tuple(a.redact))
-        rec = _redact_obj(rec, tuple(a.redact))      # written AND printed redacted
+        extra = tuple(a.redact) + _pull_account()
+        rec["controller_logs"] = controller_logs(k, pods, a.logs_dir, extra=extra)
+        rec = _redact_obj(rec, extra)      # written AND printed redacted
         with open(a.out, "a") as fh:
             fh.write(json.dumps(rec, default=str) + "\n")
         print(definitions_line(rec), flush=True)
@@ -1131,7 +1166,7 @@ def main(argv=None) -> int:
     if a.cmd == "verify483":
         res = verify483(k, core=core)
         with open(a.out, "w") as fh:
-            fh.write(redact(json.dumps(res, indent=2, default=str)))
+            fh.write(redact(json.dumps(redact_credentials(res), indent=2, default=str), _pull_account()))
         h = res["headline"]
         print(f"[verify483] HEADLINE (4) {h['result']} {h['check']}", flush=True)
         for c in res["checks"]:

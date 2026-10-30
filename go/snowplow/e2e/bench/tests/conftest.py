@@ -35,6 +35,101 @@ if str(_E2E_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_BENCH_DIR))
 
 
+# ─── The ghcr pull token (bench/ghcr_pull.py) ────────────────────────────────
+# run606 refuses without the operator's read-only pull-token file and resolves
+# the repo-override charts with it before any cluster exists. The suite must
+# never read the operator's real file nor reach ghcr.io: every run606 it
+# starts (any HOME) inherits a FAKE file (mode 0600) and a fake registry, over
+# TLS (the module sends the token over https only), whose self-signed
+# certificate is trusted through SSL_CERT_FILE.
+#
+# The fake registry knows these tokens (`fake_bearer(token)` is the bearer
+# its exchange hands out, derived from the token so a leaked bearer is
+# visible to a scan):
+#   FAKE_GHCR_TOKEN   reads every chart below;
+#   "scope401/403"    under-scoped: the exchange succeeds, the private
+#                     (krateo-agentiko) manifests answer 401 / 403;
+#   "redirect"        the exchange answers a redirect to another host;
+#   anything else     the exchange answers 401.
+# Every chart is published at every version except FAKE_GHCR_UNPUBLISHED (a
+# 404): the suite's fake pins and the real installer charts some tests pull
+# (their real pins) both resolve, and an arm names the missing version.
+FAKE_GHCR_USER, FAKE_GHCR_TOKEN = "fake-ghcr-user", "fake-ghcr-token-" + "f00d" * 4
+FAKE_GHCR_UNPUBLISHED = "9.9.9"
+
+
+def fake_bearer(token: str) -> str:
+    import hashlib
+    return "fake-bearer-" + hashlib.sha256(token.encode()).hexdigest()[:24]
+
+
+def _fake_ghcr():
+    import base64
+    import http.server
+    import json
+    import ssl
+    import subprocess
+    import tempfile
+    import threading
+
+    d = tempfile.mkdtemp(prefix="bench-ghcr-")
+    cert, key = os.path.join(d, "cert.pem"), os.path.join(d, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                    "-days", "2", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+                   check=True, capture_output=True)
+    known = {FAKE_GHCR_TOKEN, "scope401", "scope403", "redirect"}
+    bearers = {fake_bearer(t): t for t in known}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _answer(self, code, body=b"", headers=()):
+            self.send_response(code)
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/token"):
+                auth = self.headers.get("Authorization") or ""
+                try:
+                    user, _, token = base64.b64decode(auth[len("Basic "):]).decode().partition(":")
+                except ValueError:
+                    return self._answer(401)
+                if user != FAKE_GHCR_USER or token not in known:
+                    return self._answer(401)
+                if token == "redirect":
+                    return self._answer(307, headers=[("Location", "https://elsewhere.invalid/token")])
+                return self._answer(200, json.dumps({"token": fake_bearer(token)}).encode())
+            return self.do_HEAD()
+
+        def do_HEAD(self):
+            token = bearers.get((self.headers.get("Authorization") or "")[len("Bearer "):])
+            if token is None:
+                return self._answer(401)
+            name, _, tag = self.path[len("/v2/"):].partition("/manifests/")
+            if token in ("scope401", "scope403") and name.startswith("krateo-agentiko/"):
+                return self._answer(int(token[-3:]))
+            return self._answer(404 if tag == FAKE_GHCR_UNPUBLISHED else 200)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    f = os.path.join(d, "ghcr-pull.env")
+    with open(os.open(f, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
+        fh.write(f"GHCR_PULL_USERNAME={FAKE_GHCR_USER}\nGHCR_PULL_TOKEN={FAKE_GHCR_TOKEN}\n")
+    return f"https://127.0.0.1:{srv.server_address[1]}", f, cert
+
+
+os.environ["GHCR_API_URL"], os.environ["GHCR_PULL_ENV_FILE"], os.environ["SSL_CERT_FILE"] = _fake_ghcr()
+
+
 @pytest.fixture
 def _require_docker():
     """tests/test_k6_830.py needs_docker: skip unless a Docker daemon answers."""

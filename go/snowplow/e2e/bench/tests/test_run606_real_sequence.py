@@ -157,6 +157,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             resolved = None
     record("kubectl", kc, resolved)
     port = os.environ["FAKE_PORT"]
+    if a[:3] == ["create", "secret", "generic"]:
+        # the ghcr pull Secret: its value comes on stdin (--from-file=token=/dev/stdin)
+        with open(os.path.join(STATE, "created-secret"), "w") as fh:
+            fh.write(json.dumps({"argv": a, "stdin": sys.stdin.read(), "ns": ns}))
+        print(f"secret/{a[3]} created"); sys.exit(0)
     if a[:1] == ["apply"] and "-f" in a:
         # every object applied, by apiVersion and kind (tests/test_crd_schema.py: the
         # schema step's check names every non-built-in kind the run applies)
@@ -597,10 +602,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 decl.append(("github-provider-kog", "GithubProviderKog", None))
             if os.environ.get("FAKE_DECLARED_LATER") == "1":   # run 17: deps on portal, not created yet
                 decl.append(("dashboard-page", "DashboardPage", None))
+            ra = os.path.join(STATE, "helm-registry-auth.json")
             inst["spec"] = {"features": {"portal": True, "agentGateway": False},
                             "components": [{"name": n, "kind": k, "feature": f or "portal",
                                             **({"deps": ["portal"]} if n == "dashboard-page" else {})}
                                            for n, k, f in decl]}
+            if os.path.exists(ra):
+                inst["spec"]["registryAuth"] = json.load(open(ra))
             items([inst])
         if what.startswith("authns."):
             items([cr("Authn", "authn", ready, "ReconcileError",
@@ -898,7 +906,9 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         os.makedirs(os.path.join(d, "charts"), exist_ok=True)
         open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w").write("x")
         crd_chart("core-provider-crds", os.path.join(d, "charts", "core-provider-crds"))
-        open(os.path.join(d, "values.yaml"), "w").write("ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10))
+        open(os.path.join(d, "values.yaml"), "w").write(
+            "ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10)
+            + "features: {portal: true, agentGateway: false, specialistAgents: false}" + chr(10))
         os.makedirs(os.path.join(d, "templates"), exist_ok=True)
         core = os.environ.get("FAKE_CORE_FEATURES", "")
         if core == "dynamic":
@@ -917,8 +927,33 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
                 {"name": "alert-provider", "feature": "specialistAgents"},
                 {"name": "krateo-observability", "feature": "portal",
-                 "deps": ["clickhouse-operator"] + (["alert-provider-crd"] if good else [])}]}))
+                 "deps": ["clickhouse-operator"] + (["alert-provider-crd"] if good else [])},
+                # PRIVATE (krateo-agentiko), as at 0.3.468: the ghcr pull token resolves them
+                {"name": "agentgateway-controller", "version": os.environ.get("FAKE_AGW_VERSION", "0.2.0"),
+                 "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway"},
+                {"name": "agentgateway-policies", "version": "0.2.18",
+                 "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway",
+                 "deps": ["agentgateway-controller"]},
+                # public repo overrides, as at 0.3.468 (one featureless: always on)
+                {"name": "krateo-marketplace-catalog", "version": "0.1.2",
+                 "repo": "oci://ghcr.io/krateo-blueprints/charts", "feature": "portal"},
+                {"name": "github-provider-kog", "version": "0.6.0", "repo": "oci://ghcr.io/krateo-blueprints/charts"},
+                # a private pin of a feature that is off unless the chart makes it a core feature,
+                # at a version the fake registry has not published: preflighted only when on
+                {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
+                 "feature": "specialistAgents"}]}))
         sys.exit(0)
+    if "install" in a:
+        import yaml
+        merged = {}
+        for i, x in enumerate(a):
+            if x == "-f" and i + 1 < len(a):
+                f = a[i + 1]
+                doc = yaml.safe_load(sys.stdin.read() if f == "-" else open(f).read()) or {}
+                merged.update(doc.get("registryAuth") or {})
+        if merged:
+            with open(os.path.join(STATE, "helm-registry-auth.json"), "w") as fh:
+                json.dump(merged, fh)
     if "list" in a:
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
@@ -1164,10 +1199,13 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
     calls = _calls(state)
 
     def verb(c):
-        return [a for a in c["argv"]
-                if not a.startswith(("--kubeconfig=", "--context="))]
+        a = [x for x in c["argv"] if not x.startswith(("--kubeconfig=", "--context="))]
+        return a[2:] if a[:1] == ["-n"] else a
+    # no Secret is ever READ (the one write: the ghcr pull Secret, created at install from stdin)
     assert not any(a in ("secret", "secrets") for c in calls
-                   if c["tool"] == "kubectl" for a in verb(c)[:3])
+                   if c["tool"] == "kubectl" and verb(c)[:1] != ["create"] for a in verb(c)[:3])
+    assert [verb(c)[:4] for c in calls if c["tool"] == "kubectl" and verb(c)[:1] == ["create"]
+            and "secret" in verb(c)] == [["create", "secret", "generic", "krateo-agentiko-pull"]]
     # diagnostics were taken BEFORE the delete, and the delete still happened
     idx_logs = max(i for i, c in enumerate(calls)
                    if c["tool"] == "kubectl" and verb(c)[:1] == ["logs"])
