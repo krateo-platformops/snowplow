@@ -81,7 +81,7 @@ func TestDispatchCounters_GetServed(t *testing.T) {
 	newDispatchWatcher(t, newTestRestActionRuntimeObject("default", "alpha", "m"))
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions/alpha")
-	if _, served, _ := dispatchViaInformer(dispatchCtx(), call); !served {
+	if _, served, _, _ := dispatchViaInformer(dispatchCtx(), call); !served {
 		t.Fatalf("GET: expected served=true")
 	}
 	s := DispatchInformerStatsSnapshot()
@@ -103,7 +103,7 @@ func TestDispatchCounters_ListServed(t *testing.T) {
 	)
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	if _, served, _ := dispatchViaInformer(dispatchCtx(), call); !served {
+	if _, served, _, _ := dispatchViaInformer(dispatchCtx(), call); !served {
 		t.Fatalf("LIST: expected served=true")
 	}
 	s := DispatchInformerStatsSnapshot()
@@ -124,17 +124,17 @@ func TestDispatchCounters_Fallthrough(t *testing.T) {
 
 	// Write verb → Gate 1 fallthrough.
 	call := buildCall(http.MethodPost, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
-	if _, served, _ := dispatchViaInformer(dispatchCtx(), call); served {
+	if _, served, _, _ := dispatchViaInformer(dispatchCtx(), call); served {
 		t.Fatalf("POST: expected served=false (fallthrough)")
 	}
 	// Subresource path → Gate 2 fallthrough.
 	call = buildCall(http.MethodGet, "/apis/apps/v1/namespaces/default/deployments/foo/status")
-	if _, served, _ := dispatchViaInformer(dispatchCtx(), call); served {
+	if _, served, _, _ := dispatchViaInformer(dispatchCtx(), call); served {
 		t.Fatalf("subresource: expected served=false (fallthrough)")
 	}
 	// GET-miss → Gate-after-sync fallthrough.
 	call = buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions/missing")
-	if _, served, _ := dispatchViaInformer(dispatchCtx(), call); served {
+	if _, served, _, _ := dispatchViaInformer(dispatchCtx(), call); served {
 		t.Fatalf("GET-miss: expected served=false (fallthrough)")
 	}
 
@@ -163,7 +163,7 @@ func TestDispatchCounters_MixedTotals(t *testing.T) {
 		"/apis/templates.krateo.io/v1/namespaces/default/restactions/b", // GET
 	}
 	for _, p := range served {
-		if _, ok, _ := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); !ok {
+		if _, ok, _, _ := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); !ok {
 			t.Fatalf("expected served=true for %s", p)
 		}
 	}
@@ -172,7 +172,7 @@ func TestDispatchCounters_MixedTotals(t *testing.T) {
 		"https://external.invalid/x",                                       // external
 	}
 	for _, p := range fallthroughs {
-		if _, ok, _ := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); ok {
+		if _, ok, _, _ := dispatchViaInformer(dispatchCtx(), buildCall(http.MethodGet, p)); ok {
 			t.Fatalf("expected served=false for %s", p)
 		}
 	}

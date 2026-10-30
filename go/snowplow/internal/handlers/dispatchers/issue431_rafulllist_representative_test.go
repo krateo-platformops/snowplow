@@ -10,8 +10,9 @@
 //
 // REAL BOUNDARY: the cell is minted by the real apiref.Resolve (customer) or the
 // real seedRAFullListForWidget (seed) over a real ResourceWatcher + published
-// RBAC snapshot; the RESTAction LISTs configmaps cluster-wide and the informer
-// pivot narrows each item per requester (filterListByRBAC). The dep change is a
+// RBAC snapshot; the RESTAction LISTs configmaps cluster-wide through a
+// userAccessFilter and the refilter narrows each item per requester (#961: a
+// cluster-wide LIST made as a namespace-only caller is the apiserver's 403). The dep change is a
 // real informer UPDATE; the refresh is the real refresher loop
 // (cache.StartRefresher → resolveAndPopulateL1 → resolveOnceProd). No customer
 // request runs between the mint and the assertion.
@@ -63,6 +64,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -103,7 +105,14 @@ func i431RACR(name string) *unstructured.Unstructured {
 		"metadata":   map[string]any{"name": name, "namespace": h1NS},
 		"spec": map[string]any{
 			"api": []any{
-				map[string]any{"name": "cms", "path": "/api/v1/configmaps", "continueOnError": true},
+				// #961: a cluster-wide LIST as a namespace-only caller is the
+				// apiserver's 403. The per-class cross-namespace view this
+				// fixture needs is a userAccessFilter's: the SA lists, the
+				// refilter keeps the items the caller may list in their own
+				// namespace.
+				map[string]any{"name": "cms", "path": "/api/v1/configmaps", "continueOnError": true,
+					"userAccessFilter": map[string]any{"verb": "list", "group": "", "resource": "configmaps",
+						"namespaceFrom": ".metadata.namespace"}},
 			},
 			"filter": i431SliceJQ,
 		},
@@ -156,6 +165,10 @@ func i431Fixture(t *testing.T, raName string) (*dynamicfake.FakeDynamicClient, *
 	}
 	srv := psFakeAPIServer(t, a, k423Counters())
 	psSeedClientconfigs(t, srv.URL)
+	// The userAccessFilter stage dials snowplow's ServiceAccount endpoint.
+	t.Cleanup(api.SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
+		return &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, nil
+	}))
 	return dyn, &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, &rest.Config{Host: srv.URL}
 }
 

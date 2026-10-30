@@ -43,7 +43,7 @@ func TestIssue375_R1_MidRebuildGVR_FallsThroughNeverServesInformer(t *testing.T)
 		Verb: ptr.To(http.MethodGet),
 	}}
 	ctx := xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: u375}))
-	if _, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call); !ok {
+	if _, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call); !ok {
 		t.Fatalf("setup: a synced GVR must be informer-served")
 	}
 
@@ -74,7 +74,7 @@ func TestIssue375_R1_MidRebuildGVR_FallsThroughNeverServesInformer(t *testing.T)
 		if rw.IsServable(f1WidgetsGVR) {
 			t.Fatalf("setup: the GVR became servable while its LIST is held")
 		}
-		if raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call); ok {
+		if raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call); ok {
 			t.Fatalf("#375 R1 RED: a mid-rebuild (registered, NOT synced) GVR was SERVED from the informer "+
 				"(%d bytes) — the type-level bump fires before sync, so R1 needs every such read to fall "+
 				"through to the apiserver", len(raw))

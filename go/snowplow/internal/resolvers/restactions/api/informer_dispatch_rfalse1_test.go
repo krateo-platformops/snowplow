@@ -12,7 +12,7 @@
 // resolve.go consumer gate is now:
 //
 //	if resolverUseInformer() {   // == !cache.Disabled()
-//	    if raw, served, _ := dispatchViaInformer(gctx, call); served { ... }
+//	    if raw, served, _, _ := dispatchViaInformer(gctx, call); served { ... }
 //	}
 //
 // So "pivot inactive" is now exactly "cache subsystem OFF". Cache-OFF is
@@ -94,7 +94,7 @@ func TestF4_CacheOff_DispatchDoesNotReachServableGate(t *testing.T) {
 			// closed this branch is dead — dispatchViaInformer (and the
 			// servable gate it alone reaches) is never entered.
 			if gateReachesPivot() {
-				_, _, _ = dispatchViaInformer(dispatchCtx(), call)
+				_, _, _, _ = dispatchViaInformer(dispatchCtx(), call)
 			}
 
 			after := DispatchInformerStatsSnapshot()
@@ -125,7 +125,7 @@ func TestF4_PivotCounterIsAFaithfulWitness(t *testing.T) {
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
 
 	before := DispatchInformerStatsSnapshot()
-	raw, served, _ := dispatchViaInformer(dispatchCtx(), call)
+	raw, served, _, _ := dispatchViaInformer(dispatchCtx(), call)
 	after := DispatchInformerStatsSnapshot()
 
 	if !served {

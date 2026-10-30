@@ -96,7 +96,7 @@ func inc854Obj(ns, name string, managed int, env string) *unstructured.Unstructu
 // inc854Full is what a full fill of the call's partition stores right now.
 func inc854Full(t *testing.T, call httpcall.RequestOptions) ([]byte, []*unstructured.Unstructured) {
 	t.Helper()
-	raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), call)
+	raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), call)
 	if !ok {
 		t.Fatalf("the full dispatch of %s was not servable", call.Path)
 	}

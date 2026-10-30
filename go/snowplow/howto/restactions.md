@@ -213,6 +213,36 @@ recorded under its `errorKey` (default `error`): the upstream's `Status`
 non-2xx answer always keeps its HTTP code, even with an empty body or a body
 that is not a `Status`.
 
+### A list the caller may not make is `Forbidden`, whichever path answers it
+
+A read stage without `endpointRef` runs as the caller. Snowplow answers it
+either from its own copy of the data (the cache) or by asking the Kubernetes
+API server, depending on what it holds at that moment. A `GET` of a list gets
+the same answer either way:
+
+Snowplow authorizes the list the way Kubernetes does:
+
+- A **namespaced** list (`.../namespaces/team-a/...`) needs a `list` grant in
+  that namespace: a `ClusterRoleBinding`, or a `RoleBinding` in `team-a`.
+- A **cluster-wide** list needs a `ClusterRoleBinding`. `RoleBinding`s in some
+  (or all) namespaces do not authorize it, whatever the resource.
+
+If the caller may not make the list, the stage fails with `Forbidden`:
+`errorKey` holds the `Status` `{"reason":"Forbidden","code":403}`, and the
+stage-outcome header lists the stage as `Forbidden`. The message names the
+resource and the scope ("at the cluster scope", or "in the namespace
+"team-a""), never the caller. A `RESTAction` that branches on a 403 sees it on
+every path, not only when the cache is cold.
+
+If the caller may make the list, the stage gets `200` with the items. An empty
+collection is `200` with `items: []`, not a 403.
+
+The decision comes from the caller's RBAC rules, never from how many items
+happen to be visible. To show a caller "everything I may see across
+namespaces", list as snowplow's ServiceAccount with a
+[`userAccessFilter`](#specapiuseraccessfilter). A cluster-wide list made as
+the caller is refused when the caller holds only namespace grants.
+
 ### A write stage waits for the stage it depends on
 
 A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) whose

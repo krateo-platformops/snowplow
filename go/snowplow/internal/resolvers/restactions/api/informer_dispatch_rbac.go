@@ -63,6 +63,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -72,30 +73,64 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// filterListByRBAC returns the subset of items the context's user is
-// authorized to `list`, evaluated per-item against the in-process
-// typed-RBAC indexer.
+// errGateFallthrough is the per-user gate's "not decided here" answer: it
+// cannot vouch for the read (no identity on the context, an evaluator error, a
+// denied GET-by-name). The caller does not
+// serve the read and falls through to the apiserver, whose answer for the
+// requester's own credential is authoritative. It never reaches a result.
+var errGateFallthrough = errors.New("rbac gate: not decided in process, fall through to the apiserver")
+
+// newListForbidden is the deny of a LIST the requester may not make (#961): the
+// typed re-gate Forbidden (internal_dispatch_predial.go), so resolve.go records
+// it exactly as it records the apiserver's own 403 on the requester's dial
+// (#681). Its text IS the canonical identity-free message
+// classifyOwnDialForbidden derives for the same LIST path.
+func newListForbidden(gvr schema.GroupVersionResource, namespace string) error {
+	return newRegateForbiddenVerb(gvr, namespace, "", "list")
+}
+
+// filterListByRBAC is the per-user gate of a LIST served from snowplow's own
+// copy of the data (the informer, the api-stage content cell, branch C's SA
+// read). namespace is the REQUEST's namespace ("" = a cluster-wide list).
+//
+// It answers in two steps, both from the requester's RBAC rules through the
+// in-process evaluator, never from the items:
+//
+//  1. Scope (#961, listScopeAllowed): may the requester `list` at the scope
+//     of the request, exactly as the apiserver authorizes it? If not, the
+//     apiserver refuses the request with 403, and so does this gate: it
+//     returns newListForbidden, whatever the items. An allowed request whose
+//     collection is empty is served empty.
+//  2. Items (defence in depth): of an allowed request, the items the
+//     requester may `list` in each item's own namespace (cluster-scoped items,
+//     namespace "", against the cluster scope). An allowed scope already
+//     covers every item a correct copy holds — a cluster grant covers every
+//     namespace, a namespace grant covers that namespace's partition — so this
+//     step only drops an item that does not belong to the request's scope.
+//     It evaluates EVERY item's namespace, the request's own included (#963
+//     F1), so it is a real backstop: a wrong allow in step 1 cannot serve an
+//     item step 2 would refuse.
+//     "What this requester may see across namespaces" is userAccessFilter's
+//     job, never a cluster-wide list's.
 //
 // Return contract:
-//   - (subset, true)  — identity present; subset is the RBAC-permitted
-//     items (possibly empty). Caller serves the subset.
-//   - (nil, false)    — NO identity on the context. Caller MUST NOT
-//     serve; fall through to the apiserver (whose per-user token gate
-//     narrows correctly). This is the fail-closed path: an absent
-//     identity is never permitted to yield an unfiltered partition.
+//   - (subset, nil) — serve the subset (possibly empty).
+//   - (nil, a *regateDeniedError) — the requester may not make this LIST:
+//     record it as a per-identity Forbidden, the same answer the apiserver gives.
+//   - (nil, errGateFallthrough) — not decided here (no identity, an evaluator
+//     error): do not serve, fall through to the
+//     apiserver. An absent identity never yields an unfiltered partition.
 //
 // gvr supplies the API group + resource for the EvaluateRBAC tuple. The
 // verb is fixed "list" — this is the served-LIST branch.
 //
-// Per-item EvaluateRBAC errors fail closed (item dropped) — see file
-// header. namespace for each item is the item's own metadata.namespace
-// (cluster-scoped items, namespace=="", evaluate against cluster-wide
-// RBAC, which is the correct apiserver-equivalent semantics).
+// Per-item EvaluateRBAC errors fail closed (item dropped) — see file header.
 func filterListByRBAC(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,
+	namespace string,
 	items []*unstructured.Unstructured,
-) ([]*unstructured.Unstructured, bool) {
+) ([]*unstructured.Unstructured, error) {
 	log := xcontext.Logger(ctx)
 
 	user, err := xcontext.UserInfo(ctx)
@@ -111,7 +146,22 @@ func filterListByRBAC(
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
-		return nil, false
+		return nil, errGateFallthrough
+	}
+
+	// Step 1 — scope (#961).
+	allowed, decided := listScopeAllowed(ctx, user.Username, user.Groups, gvr, namespace)
+	if !decided {
+		return nil, errGateFallthrough
+	}
+	if !allowed {
+		log.Debug("informer_dispatch.rbac_filter.list_denied",
+			slog.String("subsystem", "cache"),
+			slog.String("user", redact.User(user.Username)),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", namespace),
+		)
+		return nil, newListForbidden(gvr, namespace)
 	}
 
 	// 0.30.111 Part 3 — namespace-keyed EvaluateRBAC memo. The verb is
@@ -133,6 +183,14 @@ func filterListByRBAC(
 	// invocation — never a struct field, never package-scoped. It is
 	// discarded at return: no persistence, no invalidation, no staleness.
 	// A subsequent LIST builds a fresh memo against the live RBAC store.
+	//
+	// #963 F1 — the memo starts EMPTY: it is never seeded from the scope
+	// verdict. Step 2 is the backstop of step 1, so an item of the request's
+	// own namespace is evaluated by step 2 like every other item. Seeded with
+	// the scope's allow, a wrong allow in step 1 (an evaluator error read as
+	// allowed) served every item of the request's namespace unchecked; the
+	// cost of not seeding is one EvaluateRBAC per request namespace present
+	// in the items.
 	rbacMemo := make(map[string]bool, len(items))
 
 	kept := make([]*unstructured.Unstructured, 0, len(items))
@@ -201,7 +259,44 @@ func filterListByRBAC(
 		slog.Int("kept", len(kept)),
 		slog.Int("dropped", dropped),
 	)
-	return kept, true
+	return kept, nil
+}
+
+// listScopeAllowed reports whether the requester may `list` gvr at the scope
+// of a LIST of namespace (#961), exactly as the apiserver authorizes the same
+// request — one EvaluateRBAC at the request's own scope:
+//
+//   - a namespaced LIST (namespace != ""): a ClusterRoleBinding, or a
+//     RoleBinding in that namespace;
+//   - a cluster-wide LIST (namespace == ""): a ClusterRoleBinding, full stop.
+//     A RoleBinding grants nothing at the cluster scope, whatever the resource;
+//     a requester holding only namespace grants gets the apiserver's 403, and a
+//     view across the namespaces it may read is what userAccessFilter is for.
+//
+// decided is false when the evaluator errors: the gate then falls through to
+// the apiserver rather than guess.
+func listScopeAllowed(ctx context.Context, username string, groups []string, gvr schema.GroupVersionResource, namespace string) (allowed, decided bool) {
+	ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:       username,
+		Groups:         groups,
+		Verb:           "list",
+		Group:          gvr.Group,
+		Resource:       gvr.Resource,
+		Namespace:      namespace,
+		SkipBindingUID: true,
+	})
+	if err != nil {
+		xcontext.Logger(ctx).Warn("informer_dispatch.rbac_filter.scope_undecided",
+			slog.String("subsystem", "cache"),
+			slog.String("user", redact.User(username)),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", namespace),
+			slog.Any("err", err),
+			slog.String("action", "fallthrough_to_apiserver"),
+		)
+		return false, false
+	}
+	return ok, true
 }
 
 // filterGetByRBAC reports whether the context's user is authorized to

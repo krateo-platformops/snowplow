@@ -62,7 +62,7 @@ func TestClusterListCellSync_S323_ResolveRacingDelete_RefusedNotResurrected(t *t
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	dispatchViaInformerFn = func(dctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
-		raw, ok, fctx := dispatchViaInformer(dctx, call)
+		raw, ok, fctx, _ := dispatchViaInformer(dctx, call)
 		store.PutResolved(fixtureStoreVerdict, contentKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(contentKey)
 		return raw, ok, fctx

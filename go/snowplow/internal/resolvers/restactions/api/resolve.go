@@ -388,6 +388,38 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	}
 }
 
+// recordRBACDeny records a per-identity deny snowplow decided from RBAC (a
+// *regateDeniedError: branch C's re-gate, or a LIST served from snowplow's own
+// copy that the requester may not make, #961) exactly as the apiserver's own
+// 403 on the requester's dial is recorded (#681 F2, resolve.go's branch E): the
+// ONE identity-free canonical body under errorKey (so the stage outcome reads
+// Forbidden and continueOnError behaves the same), the same item error, and a
+// bump of the per-identity forbidden sink at the same site, for the same item,
+// as the stage-error bump. external is false: nothing was dialed.
+func (r *resolveRun) recordRBACDeny(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, deny error) {
+	msg := deny.Error()
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, deny)
+	}
+	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
+// recordServedListDeny is recordRBACDeny for a LIST served from the informer or
+// the api-stage content cell (dispatch names which), with the failure line an
+// expected per-identity deny logs (#711: WARN once per cell generation, DEBUG
+// after).
+func (r *resolveRun) recordServedListDeny(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, deny error, dispatch string) {
+	r.log.Log(r.ctx, expectedDenyLevel(r.ctx, call.Path), "api call response failure", slog.String("name", id),
+		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+		slog.String("restaction_name", r.opts.RESTActionName),
+		slog.String("path", call.Path),
+		slog.String("dispatch", dispatch),
+		slog.String("error", deny.Error()))
+	r.recordRBACDeny(dictMu, itemErrs, id, i, call, deny)
+}
+
 // stageAction encodes what the per-stage endpoint resolution tells the
 // orchestrator to do next. The helper that resolves the endpoint is pure-ish
 // (it logs + writes its own C-2 empty result) and returns one of these; the
@@ -980,6 +1012,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
 			gatedVal, served, ok, fallCtx, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
+			if isRegateDenied(cerr) {
+				// #961 — the requester may not make this LIST: the same answer,
+				// through the same recording, as the apiserver's 403.
+				r.recordServedListDeny(dictMu, itemErrs, id, i, call, cerr, "apistage-content")
+				return nil
+			}
 			if cerr != nil {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage
@@ -1083,7 +1121,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// snowplow_resolve_collection_lists. gctx is this item's
 			// own (dispatchOneCall's local), never a peer's.
 			gctx = fallCtx
-		} else if raw, served, fallCtx := dispatchViaInformer(gctx, call); served {
+		} else if raw, served, fallCtx, denied := dispatchViaInformer(gctx, call); denied != nil {
+			// #961 — the requester may not make this LIST: the same answer,
+			// through the same recording, as the apiserver's 403.
+			r.recordServedListDeny(dictMu, itemErrs, id, i, call, denied, "informer")
+			return nil
+		} else if served {
 			// Informer-served bytes are in memory — feed direct
 			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy). For a
 			// resolve:true direct-path RA/widget GET, feedRawOrResolved
@@ -1181,19 +1224,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// the real error behind a second x509 failure) — the
 			// success-log line + return below covers both the error
 			// and the fed-bytes case.
-			var itemErr error
-			if !call.ContinueOnError {
-				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
-			}
 			if isRegateDenied(ierr) {
-				// #681 F1 — a per-identity re-gate deny. Recorded as the ONE
-				// identity-free canonical body (per_identity_forbidden.go) and
-				// counted on the per-identity forbidden sink at the same site,
-				// for the same item, as the stage-error bump.
-				msg := ierr.Error()
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
-				notePerIdentityForbidden(r.ctx, false)
+				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
+				// canonical body (per_identity_forbidden.go).
+				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
 			} else {
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
+				}
 				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
 			}
 			dispatch = "internal-rest-config-error"

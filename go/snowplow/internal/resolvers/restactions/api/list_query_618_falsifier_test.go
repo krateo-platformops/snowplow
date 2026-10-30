@@ -309,7 +309,7 @@ func TestIssue618_DispatchViaInformer_ServedQueriesMatchApiserverSemantics(t *te
 	} {
 		for _, tc := range q618Served {
 			t.Run(branch.name+"/"+tc.name, func(t *testing.T) {
-				raw, served, _ := dispatchViaInformer(branch.ctx(), buildCall(http.MethodGet, tc.path))
+				raw, served, _, _ := dispatchViaInformer(branch.ctx(), buildCall(http.MethodGet, tc.path))
 				if !served {
 					t.Fatalf("%s: a query the informer can reproduce exactly must be served; got served=false", tc.path)
 				}
@@ -330,7 +330,7 @@ func TestIssue618_DispatchViaInformer_UnsupportedQueriesFallThrough(t *testing.T
 				if ctxName == "raw" {
 					ctx = cache.WithApistageContentResolve(ctx)
 				}
-				if raw, served, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, tc.path)); served {
+				if raw, served, _, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, tc.path)); served {
 					t.Fatalf("RED #618 %s: must fall through to the apiserver with its query intact; the informer "+
 						"served %d bytes (items %v) — the param was silently dropped", tc.path, len(raw), namesInEnvelopeBytes(t, raw))
 				}

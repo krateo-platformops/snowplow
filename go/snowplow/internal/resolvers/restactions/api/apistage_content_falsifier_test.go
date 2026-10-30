@@ -122,9 +122,24 @@ func f1RoleBinding(ns, user string) *rbacv1.RoleBinding {
 	}
 }
 
+// f1ClusterRoleBinding binds `user` to the widget-lister ClusterRole
+// cluster-wide.
+func f1ClusterRoleBinding(user string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: "f1-cluster-binding-" + user},
+		Subjects: []rbacv1.Subject{
+			{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: user},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "f1-widget-lister",
+		},
+	}
+}
+
 // newF1Watcher builds a synced cache=on watcher seeded with one widget
 // per namespace in f1AllNamespaces, a widget-lister ClusterRole, and
-// RoleBindings granting f1BroadUser EVERY namespace + f1NarrowUser only
+// a ClusterRoleBinding granting f1BroadUser every namespace + RoleBindings granting f1NarrowUser only
 // f1NarrowNamespaces. The content-keyed api-stage path is live because it
 // is folded under CACHE_ENABLED+RESOLVED_CACHE_ENABLED (#57 — the standalone
 // RESOLVED_CACHE_APISTAGE_ENABLED flag was retired); the informer pivot is
@@ -145,9 +160,10 @@ func newF1Watcher(t *testing.T) *cache.ResourceWatcher {
 		seed = append(seed, f1WidgetObject(ns, "widget-"+ns))
 	}
 	seed = append(seed, f1WidgetListerClusterRole())
-	for _, ns := range f1AllNamespaces {
-		seed = append(seed, f1RoleBinding(ns, f1BroadUser))
-	}
+	// #961: f1BroadUser's "every namespace" is a CLUSTER grant — a cluster-wide
+	// LIST needs one, as on the apiserver (RoleBindings in every namespace do
+	// not authorize it).
+	seed = append(seed, f1ClusterRoleBinding(f1BroadUser))
 	for _, ns := range f1NarrowNamespaces {
 		seed = append(seed, f1RoleBinding(ns, f1NarrowUser))
 	}

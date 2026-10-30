@@ -34,7 +34,7 @@ joins a shared context that later calls and JQ expressions can reference.
 | `filter` | JQ expression applied to the response ([custom modules](./configuration.md) available). |
 | `continueOnError`, `errorKey` | Keep going on failure; where the error lands in `status`. |
 | `exportJwt` | Export a JWT obtained by this stage for later stages. |
-| `resolve` | When `path` points at a `RESTAction`/`Widget` CR, resolve it in-process (default `true`). |
+| `resolve` | When `path` points at a `RESTAction`/`Widget` CR, resolve it in-process. Opt-in: omitted means `false`, and the raw stored CR is returned. |
 | `userAccessFilter` | Dispatch the read via snowplow's ServiceAccount, then RBAC-refilter the result per item against the requesting user. CEL rules on the CRD enforce read-verb-only, no `exportJwt`, and the `resource`/`resourcesFrom` XOR. |
 
 A top-level `spec.filter` shapes the overall output.

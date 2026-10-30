@@ -102,13 +102,16 @@ func contentKeyInputsQ(gvr schema.GroupVersionResource, namespace, name, query s
 // gating the stored raw envelope yields byte-identical narrowing to a
 // fresh inline-gated dispatch (AC-F1.2).
 //
-// Returns (gatedEnvelope, served):
-//   - served==false — fail-closed: no identity on ctx, or a GET denied.
-//     The caller treats this exactly as dispatchViaInformer's
-//     served=false — fall through to the apiserver branch, whose
-//     per-user token narrows correctly.
-//   - served==true  — gatedEnvelope is the RBAC-narrowed bytes to feed
-//     the stage's ResponseHandler.
+// Returns (gatedEnvelope, err):
+//   - err == nil — gatedEnvelope is the RBAC-narrowed envelope to feed the
+//     stage's ResponseHandler.
+//   - err is a *regateDeniedError — a LIST the requester may not make
+//     (#961): the caller records it as a per-identity Forbidden, the answer
+//     the apiserver gives the same request.
+//   - err == errGateFallthrough — fail-closed: no identity on ctx, a GET
+//     denied, an evaluator error. The caller treats this exactly
+//     as dispatchViaInformer's served=false — fall through to the apiserver
+//     branch, whose per-user token narrows correctly.
 func gateContentEnvelope(
 	ctx context.Context,
 	call interface {
@@ -117,8 +120,8 @@ func gateContentEnvelope(
 	},
 	raw []byte,
 	uafActive bool,
-) (any, bool) {
-	gvr, _, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
+) (any, error) {
+	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
 	if !parseOK {
 		// Not an apiserver GVR path — the content layer never produced
 		// this; pass the bytes through un-gated (defensive — the caller
@@ -127,9 +130,9 @@ func gateContentEnvelope(
 		// P-CORE-2).
 		var v any
 		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, false
+			return nil, errGateFallthrough
 		}
-		return v, true
+		return v, nil
 	}
 	// SECURITY (#58, UAF-AWARE — symmetric with the pre-parsed-LIST branch):
 	// a UAF step is served UN-narrowed here; the per-user narrowing is the
@@ -141,16 +144,20 @@ func gateContentEnvelope(
 	if uafActive {
 		var v any
 		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, false
+			return nil, errGateFallthrough
 		}
-		return v, true
+		return v, nil
 	}
 	if name == "" {
 		// LIST envelope: {apiVersion, kind, items:[...]}.
-		return gateListEnvelope(ctx, gvr, raw)
+		return gateListEnvelope(ctx, gvr, ns, raw)
 	}
 	// GET-by-name: raw is a single object.
-	return gateGetEnvelope(ctx, gvr, raw)
+	v, ok := gateGetEnvelope(ctx, gvr, raw)
+	if !ok {
+		return nil, errGateFallthrough
+	}
+	return v, nil
 }
 
 // parsedListEnvelope is the Ship 0.30.121 R3 pre-parsed form of a LIST
@@ -278,14 +285,17 @@ func stripManagedFields(obj map[string]any) {
 // envelope map is built exactly as marshalAsList builds it
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
-func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) (any, bool) {
-	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
-	if !identityOK {
-		// FAIL-CLOSED: no identity — same contract as the inline gate's
-		// served=false (caller falls through to the apiserver).
-		return nil, false
+//
+// namespace is the LIST's own namespace ("" = cluster-wide). A non-nil error
+// is filterListByRBAC's: a *regateDeniedError (the requester may not make this
+// LIST, #961) or errGateFallthrough (not decided here — the caller falls
+// through to the apiserver).
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace string, parsed parsedListEnvelope) (any, error) {
+	kept, err := filterListByRBAC(ctx, gvr, namespace, parsed.items)
+	if err != nil {
+		return nil, err
 	}
-	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), true
+	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), nil
 }
 
 // listEnvelopeValue assembles the apiserver-shaped LIST envelope as a
@@ -341,13 +351,13 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 // envelope, or a refresh path that stored RawJSON only). The hot path
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace string, raw []byte) (any, error) {
 	parsed, ok := parseListEnvelope(gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
-		return nil, false
+		return nil, errGateFallthrough
 	}
-	return gateListItems(ctx, gvr, parsed)
+	return gateListItems(ctx, gvr, namespace, parsed)
 }
 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
@@ -494,11 +504,16 @@ func (c callPathVerb) GetVerb() string {
 // namespace-source differ), so applying raw RBAC to a UAF step would wrongly
 // strip the UAF-intended scope (the Diego/arch UAF verdict).
 //
-// #710 PR-2a — err is non-nil only when the call's content fill could not be
+// #710 PR-2a — err is non-nil when the call's content fill could not be
 // admitted under the memory ceiling before its deadline
 // (ErrContentFillAdmissionTimeout, D1): the caller records a stage error. It
 // must NOT fall through to another dispatch branch, which would rebuild the
 // whole list the gate refused.
+//
+// #961 — err is also non-nil (a *regateDeniedError, isRegateDenied) when the
+// serve-time gate finds the requester may not make this LIST at all: the caller
+// records it as the per-identity Forbidden the apiserver answers the same
+// request with, exactly as it records the apiserver's own 403.
 //
 // A JOINER of a flight that was never admitted, whose own ctx is still alive,
 // does not inherit that failure — someone else's deadline produced it. It makes
@@ -1202,17 +1217,26 @@ func apistageContentServeAttempt(
 	//     DIVERGENT UAF) is the proof this branch is required.
 	_ = entryRef
 	var gated any
-	var gateOK bool
+	var gateErr error
 	if haveParsed {
 		if uafActive {
-			gated, gateOK = serveParsedListEnvelope(parsed)
+			var ok bool
+			if gated, ok = serveParsedListEnvelope(parsed); !ok {
+				gateErr = errGateFallthrough
+			}
 		} else {
-			gated, gateOK = gateListItems(ctx, gvr, parsed)
+			gated, gateErr = gateListItems(ctx, gvr, ns, parsed)
 		}
 	} else {
-		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)
+		gated, gateErr = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)
 	}
-	if !gateOK {
+	if isRegateDenied(gateErr) {
+		// #961 — the requester may not make this LIST: the per-identity
+		// Forbidden the apiserver would answer, recorded by the caller. Not a
+		// fall-through: the apiserver would only say the same.
+		return nil, false, true, ctx, gateErr
+	}
+	if gateErr != nil {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
 		return nil, false, true, ctx, nil
 	}
@@ -1285,7 +1309,7 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 		},
 	}
 	// informer-only: a refresh of a content cell sends nothing to the apiserver.
-	raw, served, _ := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call)
+	raw, served, _ := dispatchContentViaInformer(ctx, call)
 	if !served {
 		// Not pivot-servable (pre-sync informer, metadata-only GVR, …).
 		// 1.12.6 C4 (§6.2 row 9): TYPED, not (nil, nil). The (nil, nil)

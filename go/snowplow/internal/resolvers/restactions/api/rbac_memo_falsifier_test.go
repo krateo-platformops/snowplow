@@ -13,8 +13,10 @@
 //        (passing Name: it.GetName()), so the count is N_items, not N.
 //
 // Plus the AC-6 name-independence leg: two items in the SAME namespace
-// with DIFFERENT names yield ONE EvaluateRBAC call and an identical
-// verdict.
+// with DIFFERENT names yield ONE per-item EvaluateRBAC call and an
+// identical verdict. With #961's scope step and #963 F1 (the per-item memo
+// is never seeded from the scope verdict), a LIST of that namespace makes
+// TWO calls in all: the scope evaluation plus that one per-item evaluation.
 
 package api
 
@@ -46,16 +48,18 @@ func memoItem(ns, name string) *unstructured.Unstructured {
 }
 
 // TestFalsifierF1_RBACMemoIsNamespaceKeyed asserts a filterListByRBAC
-// pass over N distinct namespaces × M items each makes exactly N
-// EvaluateRBAC calls.
+// pass over N distinct namespaces × M items each makes exactly N per-item
+// EvaluateRBAC calls — N+1 with #961's scope evaluation of the request.
 //
 // FAILS on the unfixed code: per-item evaluation → N*M calls.
 func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
-	_, _ = newRBACNarrowWatcher(t) // wires a cache=on watcher + RBAC store
+	newDispatchWatcher(t) // cache=on watcher; dispatchAdminUser holds a cluster-wide grant
 
 	const itemsPerNS = 3
 	namespaces := []string{"team-a", "team-b", "bench-ns-1", "bench-ns-2", "kube-system"}
-	wantCalls := uint64(len(namespaces)) // one EvaluateRBAC per namespace
+	// One EvaluateRBAC per namespace, plus the ONE scope evaluation of the
+	// request itself (#961: may the requester list at the cluster scope?).
+	wantCalls := uint64(len(namespaces)) + 1
 
 	var items []*unstructured.Unstructured
 	for _, ns := range namespaces {
@@ -64,18 +68,19 @@ func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
 		}
 	}
 
-	ctx := ctxWithUser(narrowUser)
+	ctx := dispatchCtx() // #961: a cluster-wide list needs a cluster grant
 	rbac.ResetEvaluateRBACCallCount()
 
-	_, served := filterListByRBAC(ctx, dispatchTestGVR, items)
-	if !served {
-		t.Fatalf("F1: filterListByRBAC served=false (expected an identity-present pass)")
+	// A cluster-wide LIST (namespace "") by a cluster-granted identity.
+	_, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "", items)
+	if gateErr != nil {
+		t.Fatalf("F1: filterListByRBAC = %v (expected an identity-present pass)", gateErr)
 	}
 
 	got := rbac.EvaluateRBACCallCount()
 	if got != wantCalls {
 		t.Fatalf("F1: filterListByRBAC over %d namespaces × %d items made %d EvaluateRBAC calls; "+
-			"want exactly %d (one per namespace) — the per-item evaluation is not namespace-memoized",
+			"want exactly %d (one per namespace + the scope) — the per-item evaluation is not namespace-memoized",
 			len(namespaces), itemsPerNS, got, wantCalls)
 	}
 }
@@ -96,13 +101,18 @@ func TestFalsifierF1_RBACMemoNameIndependence(t *testing.T) {
 	ctx := ctxWithUser(narrowUser)
 	rbac.ResetEvaluateRBACCallCount()
 
-	kept, served := filterListByRBAC(ctx, dispatchTestGVR, items)
-	if !served {
-		t.Fatalf("F1-name: filterListByRBAC served=false")
+	// A LIST of team-a: the scope evaluation of the request, then ONE per-item
+	// evaluation of team-a covering both items (verb:list is name-independent).
+	// #963 F1 — the per-item memo is NOT seeded from the scope verdict: step 2
+	// evaluates the request's own namespace too, so it backs up step 1.
+	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", items)
+	if gateErr != nil {
+		t.Fatalf("F1-name: filterListByRBAC = %v", gateErr)
 	}
-	if got := rbac.EvaluateRBACCallCount(); got != 1 {
-		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 1 "+
-			"(verb:list is name-independent — one namespace, one evaluation)", got)
+	if got := rbac.EvaluateRBACCallCount(); got != 2 {
+		t.Fatalf("F1-name: two same-namespace items made %d EvaluateRBAC calls; want 2 — the scope "+
+			"evaluation plus ONE per-item evaluation of team-a (name-independent; 1 means the per-item "+
+			"step trusted the scope verdict instead of re-checking, #963 F1)", got)
 	}
 	if len(kept) != 2 {
 		t.Fatalf("F1-name: name-independence broken — %d/2 items kept; the verdict must be "+

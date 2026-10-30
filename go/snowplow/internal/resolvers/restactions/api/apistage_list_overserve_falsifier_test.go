@@ -267,15 +267,11 @@ func TestFalsifier58_NoUAF_NarrowTenantGetsOnlyOwnNamespaces(t *testing.T) {
 	_ = newF1Watcher(t)
 	seedOverserveCell(t)
 
-	narrowNss, served := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1NarrowUser})
-	if !served {
-		t.Fatalf("narrow tenant: expected a served (gated) LIST")
-	}
-	want := append([]string{}, f1NarrowNamespaces...)
-	sort.Strings(want)
-	if !equalStrs(narrowNss, want) {
-		t.Fatalf("#58 SECURITY (no-UAF): narrow tenant received %v, want ONLY %v — over-serve "+
-			"(serveParsedListEnvelope skipped serve-time filterListByRBAC).", narrowNss, want)
+	// #961 (match Kubernetes): the narrow tenant holds namespace grants only, so
+	// its CLUSTER-WIDE LIST is refused — nothing of the SA-maximal cell is served.
+	if narrowNss, served := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1NarrowUser}); served {
+		t.Fatalf("#58 SECURITY (no-UAF): a namespace-only tenant was served %v on a cluster-wide LIST — "+
+			"over-serve (want the per-identity Forbidden)", narrowNss)
 	}
 
 	broadNss, servedB := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1BroadUser})

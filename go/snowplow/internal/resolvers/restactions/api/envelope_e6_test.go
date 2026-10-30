@@ -120,7 +120,7 @@ func e6Table(t *testing.T) []e6Row {
 	av, lk := apiVersionForGVR(f1WidgetsGVR), listKindForResource(f1WidgetsGVR.Resource)
 	stored := e6StoredEnvelope(t, items)
 	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1BroadUser})) // #961: the gated rows LIST cluster-wide, which needs a cluster grant
 	decode := func(t *testing.T, b []byte, err error) any {
 		t.Helper()
 		if err != nil {
@@ -186,16 +186,16 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"content hit, gated: gateListItems(parseListEnvelope(stored with metadata))",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListItems(ctx, f1WidgetsGVR, parsed(t))
-				if !ok {
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", parsed(t))
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v
 			}},
 		{"rebuild: gateListEnvelope(stored with metadata)",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListEnvelope(ctx, f1WidgetsGVR, stored)
-				if !ok {
+				v, gerr := gateListEnvelope(ctx, f1WidgetsGVR, "", stored)
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v
@@ -210,8 +210,8 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"cluster-list collapse, gated (stored with metadata)",
 			[]string{"api.validateClusterListShape", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListItems(ctx, f1WidgetsGVR, cluster(t))
-				if !ok {
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", cluster(t))
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v

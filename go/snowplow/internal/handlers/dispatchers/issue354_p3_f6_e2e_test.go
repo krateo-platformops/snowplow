@@ -117,6 +117,11 @@ func p3E2EFixture(t *testing.T) *p3E2EEnv {
 	}
 	srv := psFakeAPIServer(t, a, k423Counters())
 	psSeedClientconfigs(t, srv.URL)
+	// i431RACR's stage is a userAccessFilter read (#961): it dials snowplow's
+	// ServiceAccount endpoint.
+	t.Cleanup(restapi.SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
+		return &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, nil
+	}))
 	return &p3E2EEnv{dyn: dyn, saEP: &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"},
 		saRC: &rest.Config{Host: srv.URL}, carol: i431Ctx(psCarol)}
 }

@@ -103,12 +103,12 @@ func TestListCell854_F1m_InformerObjectsCarryNoManagedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !fill710WaitFor(10*time.Second, func() bool {
-		raw, ok, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
+		raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
 		return ok && bytes.Contains(raw, []byte(`"mf"`))
 	}) {
 		t.Fatal("the object never reached the informer")
 	}
-	raw, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
+	raw, _, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())
 	if bytes.Contains(raw, []byte("managedFields")) {
 		t.Fatal("F1m: the informer serves managedFields — the decoder's strip is load-bearing, and F1 must cover it")
 	}

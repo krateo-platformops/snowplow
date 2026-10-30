@@ -19,7 +19,7 @@
 // identity-free operation (internalDispatchServesUnnarrowed), the fetched
 // bytes are re-gated with the SAME per-user helpers branch B uses
 // (filterGetByRBAC / filterListByRBAC). A denied GET → apierrors.Forbidden;
-// a LIST → the ctx identity's authorized subset (served-empty on full deny).
+// a LIST → the ctx identity's authorized subset (a LIST the identity may not make at all is the typed re-gate Forbidden, #961).
 //
 // RIGGING: each arm drives the REAL dispatchViaInternalRESTConfig against a
 // hermetic in-process fake apiserver (httptest) reachable through a
@@ -31,7 +31,7 @@
 // ── ARMS ──────────────────────────────────────────────────────────────
 //   ARM-1  denied per-user GET (cyberjoker repro) → served==false, Forbidden.
 //   ARM-2  allowed per-user GET control          → served==true, sha256 parity.
-//   ARM-3  denied per-user LIST narrowing         → namespaces=={authorized}.
+//   ARM-3  per-user LIST: cluster-wide refused (#961), namespaced == {authorized}.
 //   ARM-4  Phase-1 SA-walk (ServeWatcher present) → full un-narrowed set.
 //   ARM-5  cache-off parity (SAR deny)            → identical Forbidden to ARM-1.
 //   ARM-6  group-only user (Username=="")         → narrowed (denied) / group grant served.
@@ -281,9 +281,9 @@ func TestSARegate_ARM2_AllowedPerUserGet_ByteParity(t *testing.T) {
 }
 
 // ── ARM-3 ──────────────────────────────────────────────────────────────
-// A denied per-user LIST is narrowed to the user's authorized namespaces.
-// The SA LIST spans an authorized ns + two denied ns; post-fix the served
-// items are exactly the authorized-namespace subset (len>0).
+// A per-user LIST never serves an item outside the grant. The SA data spans an
+// authorized ns + two denied ns: the cluster-wide LIST is refused (#961), the
+// authorized namespace LIST serves exactly that namespace (len>0).
 func TestSARegate_ARM3_DeniedPerUserList_Narrowed(t *testing.T) {
 	resetInternalClientCacheForTest()
 	t.Cleanup(resetInternalClientCacheForTest)
@@ -297,10 +297,18 @@ func TestSARegate_ARM3_DeniedPerUserList_Narrowed(t *testing.T) {
 	})
 	ctx := cache.WithInternalRESTConfig(ctxWithUser(narrowUser), rc)
 
+	// #961 (match Kubernetes): the narrow user holds namespace grants only, so
+	// its cluster-wide LIST is the typed re-gate Forbidden — nothing served.
+	if raw, served, err := dispatchViaInternalRESTConfig(ctx,
+		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions")); served || raw != nil || !isRegateDenied(err) {
+		t.Fatalf("cluster-wide LIST by a namespace-only user: served=%v bytes=%d err=%v, want the re-gate Forbidden",
+			served, len(raw), err)
+	}
+
 	raw, served, err := dispatchViaInternalRESTConfig(ctx,
-		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/restactions"))
+		buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/team-a/restactions"))
 	if err != nil || !served {
-		t.Fatalf("cluster-wide LIST must serve; got served=%v err=%v", served, err)
+		t.Fatalf("authorized-namespace LIST must serve; got served=%v err=%v", served, err)
 	}
 
 	nss := servedItemNamespaces(t, raw)
