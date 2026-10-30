@@ -22,6 +22,13 @@
 //     every egress to snowplow itself (never to another host), and the ingest
 //     (dispatchers.reseedBackgroundFromHeaders) re-installs the hop marker.
 //
+// AN EXPORT IS A READ (#970). GET and POST /export re-dispatch a customer's
+// request through the /call lane to serialize rows; an export never sends a
+// write stage. Each re-dispatch carries WithExportRead, and
+// NonCustomerWriteOrigin answers NonCustomerExport for it: the same refusal
+// (and the same not-succeeded stage outcome) as background work. The marker
+// is set in-process by the export handler only — no header carries it in.
+//
 // THE HOP MARKER ONLY RESTRICTS. It is read by the write refusal and by the
 // egress that propagates it, nothing else: it does not change RefDenialOrigin,
 // the memory gates, the cache key or any log level. So, like #443's
@@ -41,6 +48,9 @@ const (
 	NonCustomerDemandRevalidation = "demand-revalidation"
 	// NonCustomerBackgroundHop — an HTTP self-loopback of a background resolve.
 	NonCustomerBackgroundHop = "background-hop"
+	// NonCustomerExport — a re-dispatch of GET or POST /export: a customer's
+	// read, which never writes.
+	NonCustomerExport = "export"
 )
 
 // NonCustomerWriteOrigins is the CLOSED set NonCustomerWriteOrigin can return
@@ -53,6 +63,27 @@ var NonCustomerWriteOrigins = []string{
 	RefDenialOriginBackgroundUnattributed,
 	NonCustomerDemandRevalidation,
 	NonCustomerBackgroundHop,
+	NonCustomerExport,
+}
+
+type exportReadCtxKey struct{}
+
+// WithExportRead marks ctx as a re-dispatch of an export: a read that never
+// sends a write stage.
+func WithExportRead(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, exportReadCtxKey{}, true)
+}
+
+// ExportRead reports WithExportRead.
+func ExportRead(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(exportReadCtxKey{}).(bool)
+	return v
 }
 
 type backgroundHopCtxKey struct{}
@@ -87,6 +118,9 @@ func NonCustomerWriteOrigin(ctx context.Context) string {
 	}
 	if BackgroundHop(ctx) {
 		return NonCustomerBackgroundHop
+	}
+	if ExportRead(ctx) {
+		return NonCustomerExport
 	}
 	return ""
 }

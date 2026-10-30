@@ -1,7 +1,7 @@
 ---
 type: Usage
 title: Generic export (GET /export)
-description: Export any /call-resolvable list (RESTAction or Widget) as a CSV, JSON or PDF attachment — parameters, column header labels, row auto-detection, full-list pagination and the truncation cap, CSV shaping, the PDF report, and the audit trail.
+description: Export any /call-resolvable list (RESTAction or Widget) as a CSV, JSON or PDF attachment — parameters, column header labels, row auto-detection, full-list pagination and the truncation cap, CSV shaping, the PDF report, POST /export for large filters, and the audit trail.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
 tags: [portal, export, csv, pdf, audit]
 timestamp: 2026-10-29T00:00:00Z
@@ -27,8 +27,12 @@ header — correlation rides W3C baggage.)
 ## Request
 
 ```
-GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&header=...]...[&title=...][&filename=...][&extras=...][&page=...&perPage=...]
+GET  /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&header=...]...[&title=...][&filename=...][&extras=...][&page=...&perPage=...]
+POST /export?<the same parameters, without extras>      body: {"extras":{...}}
 ```
+
+Use `POST /export` when the filter (`extras`) is large; see
+[Large filters: POST /export](#large-filters-post-export).
 
 The `apiVersion` / `resource` / `name` / `namespace` parameters are the
 standard `/call` ones. Authentication is the same JWT used for `/call`.
@@ -38,10 +42,10 @@ The export's own parameters (`format`, `path`, `fields`, `header`, `title`,
 forwarded to it.
 
 **Extras:** pass a widget's or RESTAction's `extras` (for example the
-filters a table shows on screen) as the query parameter
-`extras=<URL-encoded JSON>`, exactly as on `GET /call`. `/export` is a
-`GET` only: it does not take extras from a request body the way
-`POST /call/read` does.
+filters a table shows on screen). `GET /export` takes them as the query
+parameter `extras=<URL-encoded JSON>`, exactly as on `GET /call`.
+`POST /export` takes them in the request body, exactly as `POST /call/read`
+does (below).
 
 - **Same rows.** Every re-dispatched page carries the same `extras`, so the
   file holds exactly the rows the `/call` with those extras returns.
@@ -52,9 +56,9 @@ filters a table shows on screen) as the query parameter
   shared only with a `/call` of the same window and extras. The pages a
   screen shows at its own page size are different cells, so the first
   export of a filter resolves its windows fresh.
-- **URL size.** Because `/export` is a `GET`, a filter too large for the
-  URL cannot be exported: the gateway answers `431` before snowplow sees
-  the request.
+- **URL size.** On `GET /export`, a filter too large for the URL cannot be
+  exported: the gateway answers `431` before snowplow sees the request.
+  Send it with `POST /export` instead.
 
 | Parameter  | Default | Description |
 |------------|---------|-------------|
@@ -64,8 +68,54 @@ filters a table shows on screen) as the query parameter
 | `header`   | dot-paths | Optional column **label**, one `header` parameter per field, repeated in `fields` order (below). |
 | `title`    | resource name | `pdf` only: the report title; csv and json ignore it. |
 | `filename` | derived | Attachment file name (sanitized; extension appended). |
-| `extras`   | none    | The widget's or RESTAction's extras as URL-encoded JSON, as on `GET /call`; forwarded to every re-dispatched page (above). |
+| `extras`   | none    | `GET /export`: the widget's or RESTAction's extras as URL-encoded JSON, as on `GET /call`, forwarded to every re-dispatched page (above). `POST /export`: in the body, never the query. |
 | `page` / `perPage` | full list | Export exactly that `/call` window. When **both** are omitted, the handler exports the **full list** (below). |
+
+### Large filters: POST /export
+
+`POST /export` is the same export with the extras in the request body, for
+a filter too large for a URL (many facet chips, long lists). It mirrors
+`POST /call/read` exactly:
+
+- **The body** is `/call/read`'s envelope, decoded by the same code:
+  `{"extras":{...}}` (an inline `object`, as `/call/read` accepts it, is
+  validated the same way). The body is bounded at 1 MiB. An invalid body,
+  or one over the bound, gets the same `400` as `/call/read`, and nothing
+  is exported.
+- **The query** carries everything else: the addressing (`apiVersion`,
+  `resource`, `name`, `namespace`), `page`/`perPage` and the export's own
+  parameters (`format`, `path`, `fields`, `header`, `title`, `filename`).
+  That is where `/call/read` keeps every parameter that is not extras.
+- **A `?extras=` on a POST is ignored**, as on `/call/read`: the body is
+  the only source of extras.
+- **Every re-dispatched page** goes through the `/call/read` read lane:
+  the same resolve handlers, and the read-only passthrough (verb forced to
+  `GET`) for a resource they don't serve. A page uses the same
+  resolved-cache cell and refresh key as a `POST /call/read` of that window
+  with that body.
+- **Auth and RBAC** are identical to `GET /export`.
+
+```sh
+curl -fsS -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -o table.csv \
+  -X POST "$SNOWPLOW/export?apiVersion=widgets.templates.krateo.io/v1beta1&resource=tables&name=marketplace&namespace=demo&format=csv" \
+  -d '{"extras":{"facets":["a","b","c"]}}'
+```
+
+### An export never writes
+
+An export is a read. A RESTAction that declares a write stage (any verb but
+`GET`) is exported without sending that write, by `GET` and `POST /export`
+alike:
+- the write stage is refused the way background work refuses one (origin
+  `export`), and the rows of the other stages still export;
+- the refusal is reported, not silent: the export response carries
+  `X-Snowplow-Stage-Outcomes`, the stages of its re-dispatched pages that
+  did not succeed (as `/call` reports them), and the refused write stage
+  is listed there.
+
+**Behaviour change:** before #970, `GET /export` of such a RESTAction sent
+its write stage, like `GET /call` does. It no longer does. `GET /call` and
+`POST /call/read` are unchanged.
 
 ### Column header labels
 

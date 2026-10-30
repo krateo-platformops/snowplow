@@ -17,6 +17,10 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jqutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"github.com/krateo-platformops/snowplow/internal/support/pdftable"
@@ -89,9 +93,35 @@ const exportBoundStatus = http.StatusUnprocessableEntity
 // exportBoundStatus error (see servePDF).
 //
 // Every export emits an AuditEvent (action=export) so data egress is
-// correlated end-to-end like any other action.
+// correlated end-to-end like any other action. An export is a read: no
+// re-dispatch ever sends a RESTAction write stage (dispatchCall).
 func Export(call http.Handler) http.Handler {
 	return &exportHandler{call: call}
+}
+
+// ExportGET is the GET /export handler: the export over the GET /call lane
+// (the GET dispatcher into the resolve handlers, handlers.Call behind it).
+func ExportGET() http.Handler {
+	return Export(Dispatcher(dispatchers.All())(Call()))
+}
+
+// ExportPOST is the POST /export handler (#970): the export with its extras
+// in the request body, over exactly the POST /call/read lane —
+// middleware.BodyExtrasDecode (the {"extras":{...}} envelope, its 1 MiB
+// bound and 400s; a stray ?extras= is ignored), then each page through the
+// POST dispatcher into the resolve handlers with the read-only CallRead
+// (verb forced GET) behind it. A page therefore lands on the cell of a POST
+// /call/read of that window and body, and no page can be a write.
+func ExportPOST() http.Handler { return exportPOST(nil) }
+
+// exportPOST is ExportPOST with an optional wrapper around the read lane
+// each page is re-dispatched to (tests observe the pages through it).
+func exportPOST(wrap func(http.Handler) http.Handler) http.Handler {
+	lane := ReadDispatcher(dispatchers.All())(CallRead())
+	if wrap != nil {
+		lane = wrap(lane)
+	}
+	return middleware.BodyExtrasDecode(Export(lane))
 }
 
 var _ http.Handler = (*exportHandler)(nil)
@@ -103,7 +133,7 @@ type exportHandler struct {
 }
 
 // @Summary Export Endpoint
-// @Description Export any /call-resolvable list as CSV, JSON or PDF
+// @Description Export any /call-resolvable list as CSV, JSON or PDF. POST carries the extras in the body, as POST /call/read; an export never sends a RESTAction write stage.
 // @ID export
 // @Param  apiVersion  query  string  true   "Resource API Group and Version"
 // @Param  resource    query  string  true   "Resource Plural"
@@ -115,6 +145,8 @@ type exportHandler struct {
 // @Param  header      query  []string  false  "Column label, one per field in fields order (repeat the parameter); may repeat. The CSV and PDF header row; json becomes {columns:[{field,label}],rows:[{<field>:value}]}"  collectionFormat(multi)
 // @Param  title       query  string  false  "PDF report title (default: the resource name); ignored by csv and json"
 // @Param  filename    query  string  false  "Attachment file name"
+// @Param  extras      query  string  false  "GET only: the extras as URL-encoded JSON (POST takes them in the body)"
+// @Param  body        body   object  false  "POST only: the POST /call/read envelope {\"extras\":{...}}"
 // @Param  page        query  int     false  "Explicit /call page to export; omit (with perPage) to export the FULL list via internal pagination (capped, see X-Export-Truncated)"
 // @Param  perPage     query  int     false  "Explicit /call page size; omit (with page) to export the FULL list via internal pagination"
 // @Produce  text/csv
@@ -126,7 +158,9 @@ type exportHandler struct {
 // @Failure 404 {object} response.Status
 // @Failure 422 {object} response.Status "pdf only: the full list reaches the 50,000-row export bound"
 // @Failure 500 {object} response.Status
+// @Accept   json
 // @Router /export [get]
+// @Router /export [post]
 func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	log := xcontext.Logger(req.Context())
 
@@ -168,12 +202,13 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		truncated bool
 	)
 	consume := func(page []any) { rows = append(rows, page...) }
+	stages := &stageOutcomeSet{}
 	if format == "pdf" {
 		table = newPDFCells(fields)
 		consume = table.add
 	}
 	if callerPaginated {
-		rec := r.dispatchCall(req, 0, 0)
+		rec := r.dispatchCall(req, 0, 0, stages)
 		if rec.status != http.StatusOK {
 			passThroughCallFailure(wri, rec)
 			return
@@ -189,7 +224,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		var failed *exportRecorder
 		var code int
 		var err error
-		pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath, consume)
+		pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath, consume, stages)
 		if failed != nil {
 			passThroughCallFailure(wri, failed)
 			return
@@ -227,7 +262,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	if format == "pdf" {
-		code, err := servePDF(wri, req, table, labels, rowCount, truncated, filename)
+		code, err := servePDF(wri, req, table, labels, rowCount, truncated, filename, stages)
 		if err != nil {
 			log.Error("unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
 		}
@@ -236,6 +271,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	stages.set(wri.Header())
 	if truncated {
 		wri.Header().Set(exportTruncatedHeader, "true")
 	}
@@ -276,7 +312,7 @@ var renderPDF = pdftable.Render
 // The report states the caller's username: the PDF body carries it on
 // purpose (who generated this report). It is never logged, and no error
 // returned here contains it.
-func servePDF(wri http.ResponseWriter, req *http.Request, table *pdfCells, labels []string, rowCount int, truncated bool, filename string) (int, error) {
+func servePDF(wri http.ResponseWriter, req *http.Request, table *pdfCells, labels []string, rowCount int, truncated bool, filename string, stages *stageOutcomeSet) (int, error) {
 	if truncated {
 		err := fmt.Errorf("the list reaches the export bound of %d rows and a pdf export is never truncated: "+
 			"export it as csv or json (sent truncated and flagged %s), or a page at a time with page/perPage",
@@ -319,6 +355,7 @@ func servePDF(wri http.ResponseWriter, req *http.Request, table *pdfCells, label
 
 	wri.Header().Set("Content-Type", "application/pdf")
 	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	stages.set(wri.Header())
 	wri.Header().Set("Content-Length", strconv.Itoa(doc.Len()))
 	wri.Header().Set("X-Content-Type-Options", "nosniff")
 	wri.WriteHeader(http.StatusOK)
@@ -408,8 +445,12 @@ func (t *pdfCells) table() (cols []string, cells [][]string) {
 // pagination with the given (page, perPage) window (the
 // paginate-and-concat loop), otherwise the caller's own pagination
 // params pass through untouched.
-func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int) *exportRecorder {
-	inner := req.Clone(req.Context())
+//
+// An export is a read: the re-dispatch carries cache.WithExportRead, so a
+// RESTAction write stage is refused (#903's refusal, origin "export"),
+// never sent. The page's stage outcomes are added to stages.
+func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int, stages *stageOutcomeSet) *exportRecorder {
+	inner := req.Clone(cache.WithExportRead(req.Context()))
 	q := inner.URL.Query()
 	for _, p := range exportParams {
 		q.Del(p)
@@ -422,7 +463,61 @@ func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int) *expo
 
 	rec := newExportRecorder()
 	r.call.ServeHTTP(rec, inner)
+	stages.add(rec.header.Get(util.HeaderStageOutcomes))
 	return rec
+}
+
+// stageOutcomeSet merges the X-Snowplow-Stage-Outcomes of an export's
+// re-dispatches (#904): every stage that did not succeed on some page,
+// once, in first-seen order. The export answers with it, so a stage that
+// was refused or failed — an export's refused write stage included — is
+// reported, never silent.
+type stageOutcomeSet struct {
+	seen    map[string]bool
+	entries []json.RawMessage
+	other   string // a value that is not a list (a truncated summary)
+	any     bool
+}
+
+func (s *stageOutcomeSet) add(v string) {
+	if v == "" {
+		return
+	}
+	s.any = true
+	var list []json.RawMessage
+	if err := json.Unmarshal([]byte(v), &list); err != nil {
+		if s.other == "" {
+			s.other = v
+		}
+		return
+	}
+	if s.seen == nil {
+		s.seen = map[string]bool{}
+	}
+	for _, e := range list {
+		if !s.seen[string(e)] {
+			s.seen[string(e)] = true
+			s.entries = append(s.entries, e)
+		}
+	}
+}
+
+// set writes the merged outcomes on the export response, when a
+// re-dispatch reported any (a RESTAction /call always does; others don't).
+func (s *stageOutcomeSet) set(h http.Header) {
+	if !s.any {
+		return
+	}
+	if s.other != "" {
+		h.Set(util.HeaderStageOutcomes, s.other)
+		return
+	}
+	entries := s.entries
+	if entries == nil {
+		entries = []json.RawMessage{}
+	}
+	b, _ := json.Marshal(entries) // RawMessages decoded from JSON: cannot fail
+	h.Set(util.HeaderStageOutcomes, string(b))
 }
 
 // collectAllPages is the paginate-and-concat lane for an unpaginated
@@ -447,10 +542,10 @@ func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int) *expo
 // A non-200 inner page aborts the export; the /call failure envelope is
 // returned via failed for pass-through. On extraction errors code is the
 // HTTP status to respond with.
-func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string, consume func([]any)) (pages int, truncated bool, failed *exportRecorder, code int, err error) {
+func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string, consume func([]any), stages *stageOutcomeSet) (pages int, truncated bool, failed *exportRecorder, code int, err error) {
 	prevFP := ""
 	for page := 1; page <= exportMaxPages; page++ {
-		rec := r.dispatchCall(req, page, exportPageSize)
+		rec := r.dispatchCall(req, page, exportPageSize, stages)
 		if rec.status != http.StatusOK {
 			return 0, false, rec, 0, nil
 		}

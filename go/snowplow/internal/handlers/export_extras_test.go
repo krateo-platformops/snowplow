@@ -60,7 +60,16 @@ const raFilter970 = `. as $x | {rows: ((.cms // []) | map(select(.team == $x.tea
 
 const cmFilter970 = `[.cms.items[] | {id: .metadata.name, team: .data.team}]`
 
-func seedExtrasRESTAction(t *testing.T) {
+func seedExtrasRESTAction(t *testing.T) { seedExtrasHarness(t, "https://127.0.0.1:1") }
+
+// writeRAName970 is a RESTAction that, besides the team-rows read, declares
+// a write stage: a POST to the caller's apiserver (continueOnError, so the
+// read result survives a refused or failed write).
+const writeRAName970 = "team-rows-notify"
+
+// seedExtrasHarness is seedExtrasRESTAction with the caller's clientconfig
+// pointing at serverURL, where a dialed stage (the write stage) lands.
+func seedExtrasHarness(t *testing.T, serverURL string) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -101,6 +110,22 @@ func seedExtrasRESTAction(t *testing.T) {
 				"filter": raFilter970,
 			},
 		}},
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "templates.krateo.io/v1",
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": writeRAName970, "namespace": extrasNS970, "uid": "uid-team-rows-notify"},
+			"spec": map[string]any{
+				"api": []any{
+					map[string]any{"name": "cms", "path": "/api/v1/namespaces/team-a/configmaps", "filter": cmFilter970},
+					map[string]any{
+						"name": "notify", "verb": "POST", "path": "/api/v1/namespaces/team-a/configmaps",
+						"payload":         `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"exported"}}`,
+						"continueOnError": true, "errorKey": "notifyError",
+					},
+				},
+				"filter": raFilter970,
+			},
+		}},
 	}
 	for i := range 12 {
 		seed = append(seed, &unstructured.Unstructured{Object: map[string]any{
@@ -123,7 +148,7 @@ func seedExtrasRESTAction(t *testing.T) {
 	})
 	t.Cleanup(cache.SetSecretsClientForTest(k8sfake.NewSimpleClientset(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "usera-clientconfig", Namespace: extrasNS970},
-		Data:       map[string][]byte{"server-url": []byte("https://127.0.0.1:1"), "token": []byte("token-userA")},
+		Data:       map[string][]byte{"server-url": []byte(serverURL), "token": []byte("token-userA")},
 	})))
 	sctx, scancel := context.WithCancel(context.Background())
 	t.Cleanup(scancel)

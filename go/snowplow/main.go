@@ -1274,9 +1274,25 @@ func main() {
 	mux.Handle("GET /export", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
-		Then(handlers.Export(
-			handlers.Dispatcher(dispatchers.All())(handlers.Call()))))
+		Then(handlers.ExportGET()))
 	cache.RegisterScopedRoute("GET /export", cache.ScopeCallGeneric)
+
+	// POST /export (#970) — the same export with the extras in the request
+	// BODY, for a filter too large for the URL (the gateway 431s a long
+	// ?extras=). It mirrors POST /call/read exactly: the same middleware
+	// (BodyExtrasDecode: the {"extras":{...}} envelope, its 1 MiB bound and
+	// its 400s, a stray ?extras= ignored), and every page re-dispatched
+	// through the same read lane — ReadDispatcher into the resolve handlers,
+	// the read-only CallRead (verb forced GET) as the fallthrough — so a page
+	// lands on the cell of a POST /call/read of that window and body. The
+	// export's own parameters stay in the query, as /call/read keeps every
+	// non-extras parameter there. Registered like GET /export. The body
+	// decode and the read lane are composed in handlers.ExportPOST.
+	mux.Handle("POST /export", chain.Append(
+		middleware.UserConfig(jwtKeys, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
+		Then(handlers.ExportPOST()))
+	cache.RegisterScopedRoute("POST /export", cache.ScopeCallGeneric)
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
