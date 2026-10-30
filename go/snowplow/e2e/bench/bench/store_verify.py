@@ -14,20 +14,22 @@ Two mechanisms exist:
                     the read, or left undecided (store_divergence_cleared /
                     store_ahead / received / undecided / pending_*).
 
-A snapshot's mechanism is the one whose identifying counter it publishes,
-never one chosen by version; neither or both is no answer, and an absent
-counter is never a zero.
+A snapshot's mechanism is the one whose OWN keys it publishes (any of
+them), never one chosen by version; neither or both is no answer, and an
+absent counter is never a zero.
 
-The quantities both mechanisms publish an equivalent of are reported under
-one name:
+Only quantities that ARE the same on both builds share a name (#996 review,
+read in the Go at 64c1c0e3 and 102ed658):
   candidates          store_divergence_candidates_total (the same key on both)
-  candidates_cleared  recheck: re-check GETs that found the store already
-                      past the LIST (forced pass only); lost_update_rule:
-                      candidates the rule cleared (store agreed, ahead, or
-                      had received the state; either site)
-  no_delivery_record  recheck: candidates counted without a re-check because
-                      the GVR has no delivery record; lost_update_rule:
-                      divergences published for a GVR with no delivery record
+  no_delivery_record  divergences the forced pass published for a GVR with no
+                      delivery record (recheck: ..._recheck_unavailable_total;
+                      the rule: ..._unrecorded_total)
+The cleared candidates are NOT the same quantity, so each keeps its own name:
+  recheck_cleared  forced-pass candidates (delivered while the pass was open,
+                   still divergent after the confirm loop) the re-check found
+                   the store already past; never the snapshot site
+  rule_cleared     every raw candidate the lost-update rule cleared, at both
+                   sites (agreed, ahead, or received at the snapshot)
 Everything else is the mechanism's own, and `not_published` for the other.
 
 STDLIB ONLY.
@@ -39,24 +41,22 @@ VERIFY = "snowplow_store_verification"
 PENDING_BY_GVR = "snowplow_store_verification_pending_by_gvr"
 
 MECHANISMS = {
-    "recheck": {"identified_by": ("store_divergence_recheck_gets_total",),
-                "how": "a candidate is re-checked with a quorum GET (#872/#875, to 1.12.58)"},
-    "lost_update_rule": {"identified_by": ("store_divergence_pending_keys", "store_divergence_cleared_total"),
-                         "how": ("a candidate is lost only if the store is behind the LIST's revision and has "
+    "recheck": {"how": "a candidate is re-checked with a quorum GET (#872/#875, to 1.12.58)"},
+    "lost_update_rule": {"how": ("a candidate is lost only if the store is behind the LIST's revision and has "
                                  "applied everything up to it (#918, #923, from 1.12.59)")},
 }
 
 # (report name, stat): the cumulative counters per mechanism
 COMMON = {
-    "recheck": (("candidates_cleared", "store_divergence_recheck_cleared_total"),
-                ("no_delivery_record", "store_divergence_recheck_unavailable_total")),
-    "lost_update_rule": (("candidates_cleared", "store_divergence_cleared_total"),
-                         ("no_delivery_record", "store_divergence_unrecorded_total")),
+    "recheck": (("no_delivery_record", "store_divergence_recheck_unavailable_total"),),
+    "lost_update_rule": (("no_delivery_record", "store_divergence_unrecorded_total"),),
 }
 OWN = {
     "recheck": (("recheck_gets", "store_divergence_recheck_gets_total"),
+                ("recheck_cleared", "store_divergence_recheck_cleared_total"),
                 ("recheck_undelivered", "store_divergence_recheck_undelivered_total")),
-    "lost_update_rule": (("store_ahead", "store_divergence_store_ahead_total"),
+    "lost_update_rule": (("rule_cleared", "store_divergence_cleared_total"),
+                         ("store_ahead", "store_divergence_store_ahead_total"),
                          ("received", "store_divergence_received_total"),
                          ("undecided", "store_divergence_undecided_total"),
                          ("pending_resolved_lost", "store_divergence_pending_resolved_lost_total"),
@@ -81,13 +81,22 @@ def _names(m: str) -> set[str]:
 NOT_PUBLISHED = {m: tuple(sorted(set().union(*(_names(o) for o in MECHANISMS if o != m)) - _names(m)))
                  for m in MECHANISMS}
 NOTES = {
-    "recheck": ("candidates_cleared: forced-pass candidates the re-check GET cleared; no_delivery_record: "
-                "candidates counted without a re-check (the GVR has no delivery record)"),
-    "lost_update_rule": ("candidates_cleared: candidates the lost-update rule cleared, at either site (store "
-                         "agreed, ahead, or had received the state); no_delivery_record: divergences published "
-                         "for a GVR with no delivery record; pending_*: keys held until the store's applied "
-                         "position reaches their read"),
+    "recheck": ("recheck_cleared: forced-pass candidates (delivered while the pass was open, still divergent "
+                "after the confirm loop) the re-check found the store already past, never the snapshot site; "
+                "no_delivery_record: forced-pass divergences published for a GVR with no delivery record"),
+    "lost_update_rule": ("rule_cleared: raw candidates the lost-update rule cleared at either site (agreed, "
+                         "ahead, or received at the snapshot): not recheck_cleared's quantity; "
+                         "no_delivery_record: forced-pass divergences published for a GVR with no delivery "
+                         "record (losses the resolver or a carried pass publishes later are not in it); "
+                         "pending_*: keys held until the store's applied position reaches their read"),
 }
+
+
+def identifying(m: str) -> tuple[str, ...]:
+    """Every stat only mechanism `m` publishes: a snapshot carrying any of
+    them publishes `m` (#996 review F7: not one key, which a partial family
+    would slip past)."""
+    return tuple(stat for _, stat in COMMON[m] + OWN[m] + GAUGES[m])
 
 
 def _num(v):
@@ -99,13 +108,12 @@ def mechanism(x: dict) -> tuple[str | None, str]:
     v = x.get(VERIFY)
     if not isinstance(v, dict):
         return None, f"publishes no {VERIFY}"
-    hits = {m: [s for s in d["identified_by"] if s in v] for m, d in MECHANISMS.items()}
+    hits = {m: [s for s in identifying(m) if s in v] for m in MECHANISMS}
     found = [m for m, k in hits.items() if k]
     if len(found) == 1:
-        return found[0], f"publishes {', '.join(f'{VERIFY}.{s}' for s in hits[found[0]])}"
+        return found[0], f"publishes {len(hits[found[0]])} of its {VERIFY} keys ({hits[found[0]][0]}, ...)"
     if not found:
-        return None, ("publishes neither " + " nor ".join("/".join(d["identified_by"])
-                                                           for d in MECHANISMS.values()))
+        return None, "publishes neither mechanism's keys: " + " nor ".join(f"{m}'s" for m in MECHANISMS)
     return None, "publishes both: " + "; ".join(f"{m}: {', '.join(k)}" for m, k in hits.items() if k)
 
 
@@ -125,5 +133,5 @@ def gauges(x: dict, mech: str | None) -> dict:
     out = {name: _num(v.get(stat)) for name, stat in GAUGES[mech]}
     for name, fam in MAPS[mech]:
         m = x.get(fam)
-        out[name] = dict(m) if isinstance(m, dict) else None
+        out[name] = {k: _num(n) for k, n in m.items()} if isinstance(m, dict) else None
     return out

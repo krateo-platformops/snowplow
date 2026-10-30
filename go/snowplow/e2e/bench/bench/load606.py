@@ -2444,11 +2444,15 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
     the recheck (#875, to 1.12.58: re-check GETs, cleared, undelivered,
     unavailable) or the lost-update rule (#918/#923, from 1.12.59: cleared,
     store-ahead, received, undecided, pending), the shared quantities under one
-    name (candidates_cleared, no_delivery_record), the rest `not_published`
+    name (no_delivery_record; each its own cleared count), the rest `not_published`
     for the other."""
     from bench import store_verify
-    mechs = {store_verify.mechanism(m.get("extra") or {})[0] for m in mem
-             if m.get("kind") == "mem" and isinstance((m.get("extra") or {}).get(STORE_VERIFY_KEY), dict)}
+    # every sample's (mechanism, why): one mechanism on every sample is the
+    # run's; a sample that publishes neither or both, or a mid-run change,
+    # makes the run read none (#996 review F3/F6)
+    seen = {store_verify.mechanism(m.get("extra") or {}) for m in mem
+            if m.get("kind") == "mem" and isinstance((m.get("extra") or {}).get(STORE_VERIFY_KEY), dict)}
+    mechs = {mm for mm, _ in seen}
     judging = next(iter(mechs)) if len(mechs) == 1 else None
     r = _phase_counter_report(mem, fresh, STORE_VERIFY_KEY, lambda m: _store_verify_counters(m, judging))
     if r["status"] == REPORT_ABSENT:
@@ -2484,8 +2488,9 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
     return {"status": "present", "by_phase": out, "samples": r["samples"], "restarts": r["restarts"],
             "mechanism": mech, "mechanism_identified_by": why,
             # how the build judges a forced pass's candidates (#995); several in one run: none is read
-            "judging": judging, "judging_identified_by": (jwhy if judging else
-                                                          f"the samples publish {sorted(map(str, mechs))}"),
+            "judging": judging, "judging_identified_by": (
+                jwhy if judging else "the samples do not publish one mechanism: "
+                + "; ".join(sorted({f"{mm or 'none'} ({w})" for mm, w in seen}))),
             "judging_how": store_verify.MECHANISMS[judging]["how"] if judging else None,
             "judging_note": store_verify.NOTES.get(judging),
             "not_published": list(store_verify.NOT_PUBLISHED[judging]) if judging else None,
@@ -3645,7 +3650,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         if report["list_narrow_shadow_report_only"]["status"] == LIST_NARROW_ABSENT else [])
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["list_incremental_report_only"] = list_incremental_report(mem or [], phase_src)
-    report["store_verification_report_only"] = store_verification_report(mem or [], phase_src)
+    report["store_verification_report_only"] = sv = store_verification_report(mem or [], phase_src)
+    if sv["status"] == "present" and sv.get("judging") is None:
+        report["report_warnings"].append(
+            f"store verification: how the build judges a forced pass's candidates is not read: "
+            f"{sv['judging_identified_by']}")
     # #969: store rebuilds (repairs and schema changes) under the build's own
     # mechanism — relist (to 1.12.59) or build-and-swap (#870, 1.12.60) — with
     # the same quantities on both, and the paired run's three watches

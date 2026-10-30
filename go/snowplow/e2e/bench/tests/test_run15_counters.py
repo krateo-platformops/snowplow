@@ -122,18 +122,18 @@ def test_store_verification_report_per_phase():
     st = p["storm"]
     # the recorded forced pass: a true lost update nothing was delivered for —
     # counted undelivered, without a re-check GET; 1 forced lost update, 1 candidate
-    assert (st["recheck_gets"], st["candidates_cleared"], st["divergence_candidates"]) == (0, 0, 1)
+    assert (st["recheck_gets"], st["recheck_cleared"], st["divergence_candidates"]) == (0, 0, 1)
     assert (st["recheck_undelivered"], st["no_delivery_record"]) == (1, 0)
     assert st["findings"]["lost_update_forced"] == 1 and st["repairs"]["repairs_fired"] == 0
     b = p["burst"]
-    assert (b["recheck_gets"], b["candidates_cleared"], b["recheck_undelivered"]) == (12, 4, 2)
+    assert (b["recheck_gets"], b["recheck_cleared"], b["recheck_undelivered"]) == (12, 4, 2)
     assert b["skipped_by_reason"] == {"recheck_error": 1}
     c1 = p["churn:list_dep@1"]
     assert c1["repairs"]["repairs_fired"] == 1 and c1["findings"]["lost_update_forced"] == 1
     assert (c1["recheck_undelivered"], c1["no_delivery_record"]) == (2, 2)
     c10 = p["churn:list_dep@10"]
-    assert (c10["candidates_cleared"], c10["recheck_undelivered"], c10["no_delivery_record"]) == (46, 4, 0)
-    assert p["all"]["recheck_gets"] == 80 and p["all"]["candidates_cleared"] == 60
+    assert (c10["recheck_cleared"], c10["recheck_undelivered"], c10["no_delivery_record"]) == (46, 4, 0)
+    assert p["all"]["recheck_gets"] == 80 and p["all"]["recheck_cleared"] == 60
     assert (p["all"]["recheck_undelivered"], p["all"]["no_delivery_record"]) == (9, 2)
     assert r["gauges_last"]["store_repairs_pending"] == 1                       # recorded
 
