@@ -504,7 +504,7 @@ func TestIssue961_BranchC_NoGrantList_IsTheCanonicalForbidden(t *testing.T) {
 		{u961NS, p961TeamA, "team-a", false, []string{"team-a"}},
 		{u961Cluster, p961Cluster, "", false, []string{"team-a", "team-b", "team-r"}},
 	} {
-		raw, served, err := dispatchViaInternalRESTConfig(cache.WithInternalRESTConfig(ctxWithUser(c.user), rc),
+		raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(cache.WithInternalRESTConfig(ctxWithUser(c.user), rc)),
 			buildCall(http.MethodGet, c.path))
 		if c.denied {
 			if served || !isRegateDenied(err) {
