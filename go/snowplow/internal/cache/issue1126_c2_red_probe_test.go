@@ -1,11 +1,11 @@
-// issue1126_c2_red_probe_test.go — the E1 arm WITHOUT the C2 symbols, so it
-// compiles against main (with issue1126_c2_harness_test.go) and yields a
-// BEHAVIOURAL RED there: with the refresher off, a delete the informer missed
-// leaves its self entry resident across a schema relist, because no DELETE is
-// ever generated for it and nothing bridges the delta. On the C2 tree the
-// same probe is GREEN. Kept in the tree as the plain-English statement of the
-// gap; the full arm with the bridge counters is in
-// issue1126_c2_relist_bridge_test.go.
+// issue1126_c2_red_probe_test.go — the E1 probe: with the refresher off, a
+// delete the informer MISSED must not leave its self entry resident across a
+// schema change. 1.12.6 C2 closed it with the relist delta bridge; #870 deleted
+// the bridge with the teardown window it bridged. The schema change now builds
+// the replacement beside the live informer and swaps it in, and the missed
+// delete is a key of M (the consumer acted on the object, the new copy does
+// not hold it), delivered as OnDelete — so the probe stays GREEN through the
+// swap's own delivery, with no bridge.
 
 package cache
 
@@ -37,6 +37,9 @@ func TestIssue1126_E1_RedProbe_MissedDeleteSurvivesRelistWithoutTheBridge(t *tes
 	Deps().SetRefreshHook(func(string, schema.GroupVersionResource) {}) // dirty-marks go nowhere
 
 	gvr := b5GVR()
+	// #870 — only an OWNED informer can have a replacement built beside it
+	// (bound 6); production gets that from the streaming constructor.
+	AddNavigationDiscoveredGroup(gvr.Group)
 	rw, dyn, faults := c2Watcher(t, gvr)
 	createObj(t, rw, dyn, gvr, b5NS, "button-x", "x")
 	key := "L1_button-x"
@@ -55,7 +58,7 @@ func TestIssue1126_E1_RedProbe_MissedDeleteSurvivesRelistWithoutTheBridge(t *tes
 	b5DriveRelist(t, rw)
 
 	if !c2WaitGone(store, key, 10*time.Second) {
-		t.Fatalf("RED: L1_button-x still resident after the relist — no DELETE is generated for an object " +
-			"absent from the fresh LIST and nothing bridged the delta")
+		t.Fatalf("RED: L1_button-x still resident after the schema swap — the missed delete is a key of M " +
+			"and the swap must deliver it")
 	}
 }

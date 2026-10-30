@@ -132,9 +132,10 @@ func TestIssue239_A_TypePathAttribution(t *testing.T) {
 		cause string
 		call  func(*DepTracker)
 	}{
+		// #870 deleted the schema_relist and store_repair causes: a schema
+		// widen and a store repair swap the store in and mark only what
+		// changed, through ordinary object events.
 		{"crd_delete", dmCauseCRDDelete, func(d *DepTracker) { d.OnResourceTypeRemoved(gvr) }},
-		{"schema_relist", dmCauseSchemaRelist, func(d *DepTracker) { d.OnResourceTypeSchemaRelisted(gvr) }},
-		{"store_repair", dmCauseStoreRepair, func(d *DepTracker) { d.OnResourceTypeStoreRepaired(gvr) }},
 	} {
 		t.Run(tc.name+" marks both list and exact", func(t *testing.T) {
 			d := newTypeDeps(t)
@@ -154,11 +155,11 @@ func TestIssue239_A_SubmitSourceAttribution(t *testing.T) {
 	// Each source lands in its OWN bucket (pre-dedup submit axis).
 	d.recordSubmitSource(dmSourceWatch)
 	d.recordSubmitSource(dmSourceWatch)
-	d.recordSubmitSource(dmSourceRelistBridge)
+	d.recordSubmitSource(dmSourceStoreSwap)
 	d.recordSubmitSource(dmSourceReconcile)
 	src := d.dirtyMarkSubmitSourceSnapshot()
-	if src[dmSourceWatch] != 2 || src[dmSourceRelistBridge] != 1 || src[dmSourceReconcile] != 1 {
-		t.Fatalf("submit-source snapshot=%v, want watch=2 relist_bridge=1 reconcile=1", src)
+	if src[dmSourceWatch] != 2 || src[dmSourceStoreSwap] != 1 || src[dmSourceReconcile] != 1 {
+		t.Fatalf("submit-source snapshot=%v, want watch=2 store_swap=1 reconcile=1", src)
 	}
 }
 
@@ -181,7 +182,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 		t.Fatalf("benign delete marked a self entry (%d) — fixture wrong", got)
 	}
 	if got := dmCount(amp, dmPathObject, dmCauseDegraded, dmClassSelf); got == 0 {
-		t.Fatalf("the amplified (degraded) scenario did NOT mark the self entry — the instrument cannot "+
+		t.Fatalf("the amplified (degraded) scenario did NOT mark the self entry — the instrument cannot " +
 			"show a degrade storm re-marking entries a delete would evict, so it does not discriminate")
 	}
 	// The distributions DIFFER at the self class — the amplifier signature.
@@ -247,8 +248,8 @@ func TestIssue239_C_SumInvariant(t *testing.T) {
 	// Exercise both emit paths and several causes/classes.
 	d.OnObjectEvent(gvr, ns, name, objExists)          // object add_update
 	d.OnObjectEvent(gvr, ns, name, objUnknownDegraded) // object degraded
-	d.OnResourceTypeRemoved(gvr)                        // type crd_delete
-	d.OnResourceTypeSchemaRelisted(gvr)                // type schema_relist
+	d.OnResourceTypeRemoved(gvr)                       // type crd_delete
+	d.OnResourceTypeAvailable(gvr)                     // type crd_add
 	d.OnObjectEvent(gvr, ns, name, objAbsent)          // object delete (self evicted)
 
 	total := d.dirtyMarkTotal.Load()

@@ -1,13 +1,16 @@
 // list_cell_watcher.go — #854: what the incremental list cell needs from the
 // ResourceWatcher and the dep bridge.
 //
-//   - ServabilityEpoch: a per-GVR counter bumped on every transition OUT of
-//     servable (watch broken, type confirmation retracted, informer removed). A
-//     cell captures it at anchor and re-checks it on every read, so an outage or
-//     a rebuild — even one that recovered before the read, with no event the dep
-//     tracker sees — drops the cell back to a full fill. An informer is only
-//     created where none exists (first registration, or after a removal), so
-//     the removal's bump also covers every re-creation.
+//   - ServabilityEpoch: a per-GVR counter bumped on every EXIT FROM SERVABLE
+//     (watch broken, type confirmation retracted, informer removed) — #870 owner
+//     ruling 1, and nothing else. A cell captures it at anchor and re-checks it
+//     on every read, so an outage — even one that recovered before the read,
+//     with no event the dep tracker sees — drops the cell back to a full fill.
+//     An informer is only created from nothing where none exists (first
+//     registration, or after a removal), so the removal's bump also covers
+//     every re-creation. A store SWAP (store_swap.go) is not an exit from
+//     servable and does not bump it: the GVR stays servable throughout, and the
+//     keys whose bytes changed reach the cells as ordinary per-key events (M).
 //   - listRawKeyedServable / rawByKey: the same per-object bytes ListRawServable
 //     serves, with their keys, and one object by key.
 //   - depWatchLostEventSignal / depWatchInFlight: the dep bridge's lost-event

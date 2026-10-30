@@ -199,7 +199,8 @@ var closedAttributeKeys = map[string]struct{}{
 	"state": {}, "stat": {}, "check": {}, "version": {}, "health": {},
 	"policy": {}, "family": {},
 	// #239 dirty-mark attribution — both bounded enums: cause is the ~7
-	// object/type causes, source is {watch, relist_bridge, reconcile}.
+	// object/type causes, source is {watch, store_swap, reconcile} (#870
+	// replaced relist_bridge with store_swap).
 	"cause": {}, "source": {},
 	// #408 moved-remark carrier — a 2-value enum {boot, guarded}.
 	"carrier": {},
@@ -222,6 +223,13 @@ var closedAttributeKeys = map[string]struct{}{
 	// cache.KnownStaleRevalidationSlots set {background, demand}, pinned by
 	// issue740_known_stale_rerun_otlp_test.go.
 	"slot": {},
+	// #870 — close on the push-ledger instruments
+	// (snowplow_store_swap_ledger_closes_total, _detect_to_push_ms,
+	// _install_to_push_ms): the closed cache.StoreSwapCloses set {pushed,
+	// pushed_on_arm, pushed_resync, known_stale, evicted, live_event}, pinned
+	// with reason/outcome by store_swap_otlp_870_test.go
+	// (TestStoreSwap870_LabelValuesAreClosedSets).
+	"close": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

@@ -121,6 +121,11 @@ type divergenceReport struct {
 	lostAdd         []string
 	uidMismatch     []string
 	candidates      int
+	// unsettled: candidates this pass could not decide — held pending (the
+	// store has not reached the read yet) or undecided (#918). A pass with
+	// unsettled keys verified less than its whole store, so it is NOT a clean
+	// pass for #870's build accounting (noteCleanPass).
+	unsettled int
 }
 
 func (r divergenceReport) total() uint64 {

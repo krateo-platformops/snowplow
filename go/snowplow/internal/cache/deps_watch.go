@@ -586,29 +586,37 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // gates. A plain-func caller (depEventHandlers) carries no flag and keeps
 // the syncCh gate, including O14's nil-syncCh fail-safe drop.
 type depEventHandler struct {
-	gvr   schema.GroupVersionResource
-	funcs clientcache.ResourceEventHandlerFuncs
-	add   func(obj interface{}, isInInitialList, fromInformer bool)
+	gvr    schema.GroupVersionResource
+	funcs  clientcache.ResourceEventHandlerFuncs
+	add    func(obj interface{}, isInInitialList, fromInformer bool, source string)
+	update func(oldObj, newObj interface{}, source string)
+	del    func(obj interface{}, source string)
 }
 
-// #854 — every informer delivery is recorded for the incremental list cells of
-// its GVR (noteListCellDelivery) AFTER the handler has submitted it, so the
-// comparator sees each key either undelivered (its indexer write is still in
-// the client-go listener buffer, or this handler is still running), queued /
-// processing in the dep worker, or pending in the cell — in flight in all three
-// — and only otherwise as settled.
+// #854 / #870 — the incremental list cells' comparator reads each key's last
+// delivery from the live instance's dep-handler `seen` record, which the
+// adapter (store_instance.go) updates AFTER this handler has submitted the
+// event. So the comparator sees each key either undelivered (its indexer write
+// is still in the client-go listener buffer, or this handler is still
+// running), queued / processing in the dep worker, or pending in the cell — in
+// flight in all three — and only otherwise as settled.
 func (h depEventHandler) OnAdd(obj interface{}, isInInitialList bool) {
-	h.add(obj, isInInitialList, true)
-	noteListCellDelivery(h.gvr, obj, false)
+	h.add(obj, isInInitialList, true, dmSourceWatch)
 }
 func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) {
-	h.funcs.OnUpdate(oldObj, newObj)
-	noteListCellDelivery(h.gvr, newObj, false)
+	h.update(oldObj, newObj, dmSourceWatch)
 }
 func (h depEventHandler) OnDelete(obj interface{}) {
-	h.funcs.OnDelete(obj)
-	noteListCellDelivery(h.gvr, obj, true)
+	h.del(obj, dmSourceWatch)
 }
+
+// #870 — a swap delivery (design v5 §2.7) is an ordinary live event for the
+// dep handler, attributed to submission source store_swap.
+func (h depEventHandler) onSwapAdd(obj any) { h.add(obj, false, true, dmSourceStoreSwap) }
+func (h depEventHandler) onSwapUpdate(oldObj, newObj any) {
+	h.update(oldObj, newObj, dmSourceStoreSwap)
+}
+func (h depEventHandler) onSwapDelete(obj any) { h.del(obj, dmSourceStoreSwap) }
 
 func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depEventHandler {
 	w := depWatchSingleton()
@@ -616,7 +624,7 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once per
 	// handler-set construction, NOT per-event.
 	crdSideEffect := IsCRDGVR(gvr)
-	add := func(obj interface{}, isInInitialList, fromInformer bool) {
+	add := func(obj interface{}, isInInitialList, fromInformer bool, source string) {
 		if h := depAddDeliveryHookForTest.Load(); h != nil {
 			defer (*h)(gvr)()
 		}
@@ -650,45 +658,47 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 		w.counters.addPropagated.Add(1)
 		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
 		// #603 PR-2 — an ADD is a membership change.
-		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch, narrowMembershipMask(gvr))
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source, narrowMembershipMask(gvr))
 		// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
 		// processor goroutine. See crd_discovery_side_effect.go.
 		if crdSideEffect {
 			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
 		}
 	}
-	return depEventHandler{gvr: gvr, add: add, funcs: clientcache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) { add(obj, false, false) },
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			ns, name := metaNSName(newObj)
-			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			// #603 PR-2 SHADOW — the ONLY place the pre-image exists: compare it
-			// with the new object on every live interest of the GVR, per
-			// transition, before the queue coalesces it (read-only on both).
-			w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch,
-				narrowUpdateMask(gvr, oldObj, newObj))
-			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
-			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			// DeletedFinalStateUnknown wraps the last-known object when the
-			// watcher missed the explicit DELETE. Unwrap so we still get the
-			// (ns, name) tuple AND the underlying CRD spec for the CRD-DELETE
-			// teardown branch below.
-			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
-				obj = tomb.Obj
-			}
-			ns, name := metaNSName(obj)
-			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			// #603 PR-2 — a DELETE (or a tombstone) is a membership change.
-			w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch, narrowMembershipMask(gvr))
-			// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
-			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
-			}
-		},
+	update := func(oldObj, newObj interface{}, source string) {
+		ns, name := metaNSName(newObj)
+		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
+		// #603 PR-2 SHADOW — the ONLY place the pre-image exists: compare it
+		// with the new object on every live interest of the GVR, per
+		// transition, before the queue coalesces it (read-only on both).
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source,
+			narrowUpdateMask(gvr, oldObj, newObj))
+		// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
+		if crdSideEffect {
+			crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
+		}
+	}
+	del := func(obj interface{}, source string) {
+		// DeletedFinalStateUnknown wraps the last-known object when the
+		// watcher missed the explicit DELETE. Unwrap so we still get the
+		// (ns, name) tuple AND the underlying CRD spec for the CRD-DELETE
+		// teardown branch below.
+		if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
+			obj = tomb.Obj
+		}
+		ns, name := metaNSName(obj)
+		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
+		// #603 PR-2 — a DELETE (or a tombstone) is a membership change.
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source, narrowMembershipMask(gvr))
+		// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
+		if crdSideEffect {
+			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
+		}
+	}
+	return depEventHandler{gvr: gvr, add: add, update: update, del: del, funcs: clientcache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { add(obj, false, false, dmSourceWatch) },
+		UpdateFunc: func(oldObj, newObj interface{}) { update(oldObj, newObj, dmSourceWatch) },
+		DeleteFunc: func(obj interface{}) { del(obj, dmSourceWatch) },
 	}}
 }
 

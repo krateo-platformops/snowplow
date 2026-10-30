@@ -1,47 +1,27 @@
-// issue187_relist_window_test.go — #187 arm B5: the CRD schema-relist
-// teardown window strands self entries, and the post-sync dirty-mark re-fire
-// is their only trigger.
+// issue187_relist_window_test.go — #187 arm B5, re-pointed by #870.
 //
-// THE MECHANISM (trace addendum 4 §1). triggerCRDSchemaRelist tears the
-// per-GVR informer down and builds a fresh one:
+// #187 was a TEARDOWN window: a CRD schema relist removed the informer and
+// built a fresh one, so a delete landing inside the window was dropped with no
+// handler run and the fresh informer synthesised no Deleted delta. 1.12.5 / 1.12.6
+// covered it with a post-sync dirty-mark re-fire and a relist delta bridge.
 //
-//   - RemoveResourceType closes the old informer's per-GVR stop channel and
-//     purges its state, so anything still in its DeltaFIFO or in flight on its
-//     watch is dropped with NO handler run;
-//   - the replacement informer is freshly constructed, so its knownObjects
-//     indexer is EMPTY. DeltaFIFO.Replace() synthesises Deleted deltas only
-//     for keys present in knownObjects and absent from the new list, so for a
-//     fresh informer there is nothing to diff: an object that vanished before
-//     the new LIST simply never appears, and NO DELETE IS EVER GENERATED.
+// #870 removed the window itself: a schema change BUILDS the replacement beside
+// the live informer and swaps it in (store_swap.go). The live copy keeps
+// watching for the whole build, so a delete during the build is delivered by it
+// like any other event, and the swap delivers only the keys whose bytes changed
+// (M). These arms drive the real CRD lifecycle handlers and the real
+// triggerCRDSchemaRelist against a real ResourceWatcher whose informers really
+// sync over a fake dynamic client; the assertion is on the SERVED ENTRY.
 //
-// OnResourceTypeSchemaRelisted does dirty-mark from the forward dep index
-// (not the indexer), so it covers entries whose objects are already gone. But
-// it ran ONCE, at the START of the window. An entry dirty-marked at that
-// instant re-resolves SUCCESSFULLY while its object still exists, survives,
-// and is then stranded when the delete lands a moment later. That is the #187
-// burst shape exactly: relist ~09:21, deletes 09:21-09:24.
-//
-// WHAT THIS ARM DRIVES. The real triggerCRDSchemaRelist, via the real CRD
-// lifecycle handlers, against a real ResourceWatcher whose informers really
-// sync over a fake dynamic client. The relist's RemoveResourceType /
-// EnsureResourceType / dirty-mark sequence is production code; nothing about
-// the window is simulated. The object's deletion is modelled by the resolve
-// handler's view flipping between the two dirty-marks, which is what a delete
-// landing inside the window looks like from the refresher's side.
-//
-// The assertion is on the SERVED ENTRY — store.Get must MISS — never on a
-// counter.
-//
-// RED on main: no second dirty-mark exists, so nothing ever re-resolves the
-// stranded entry and it survives to TTL.
-// GREEN with the post-sync re-fire + the drop-point self-404 eviction. The
-// re-fire is worthless without the eviction, and vice versa for this window.
+//   - B5:  an object deleted WHILE the replacement is being built (its LIST held
+//          open) is evicted through the live copy's own DELETE.
+//   - B5b: the over-eviction guard. A live, unchanged object survives the swap
+//          and is NOT re-resolved: a widen that changes no bytes marks nothing.
 
 package cache
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,8 +30,11 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
-	k8stesting "k8s.io/client-go/testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 const (
@@ -83,11 +66,18 @@ func b5Watcher(t *testing.T, holdRelistUntil <-chan struct{}) *ResourceWatcher {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		b5GVR(): "ButtonList",
 	}
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	fake := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	var dyn dynamic.Interface = fake
 	if holdRelistUntil != nil {
-		// Installed BEFORE any informer runs: the fake's reactor chain is
-		// not safe to modify while a reflector lists through it.
-		b5HoldRelistList(dyn, holdRelistUntil)
+		// #870 — the replacement's LIST (the second LIST of the GVR) is held
+		// OUTSIDE the fake's reactor lock, so the live copy's watch and the
+		// arm's writes keep flowing while the build is open.
+		dyn = newHoldListDynamic(fake, b5GVR(), func(n int64) <-chan struct{} {
+			if n > 1 {
+				return holdRelistUntil
+			}
+			return nil
+		})
 	}
 
 	rw, err := NewResourceWatcher(context.Background(), dyn)
@@ -99,7 +89,10 @@ func b5Watcher(t *testing.T, holdRelistUntil <-chan struct{}) *ResourceWatcher {
 	}
 	t.Cleanup(rw.Stop)
 
-	// Register the "running" informer — the one the relist will tear down.
+	// Register the "running" informer. #870: it must be OWNED (production gets
+	// that from the streaming constructor; with no *rest.Config here the
+	// standalone path provides it), or the schema build is refused (bound 6).
+	AddNavigationDiscoveredGroup(b5Group)
 	_, syncCh := rw.EnsureResourceType(b5GVR())
 	select {
 	case <-syncCh:
@@ -125,30 +118,6 @@ func b5Watcher(t *testing.T, holdRelistUntil <-chan struct{}) *ResourceWatcher {
 	SetGlobal(rw)
 	t.Cleanup(func() { SetGlobal(nil) })
 	return rw
-}
-
-// b5HoldRelistList makes the relisted informer's LIST wait until release is
-// closed (#664). The arm models a delete landing INSIDE the teardown window:
-// the pre-sync dirty-mark re-resolves while the object still exists, the
-// delete lands, and only then does the fresh informer LIST (without it) and
-// sync. Under CPU contention a starved refresher worker could dequeue the
-// entry only AFTER the fresh informer had synced and the post-sync mark had
-// coalesced onto the same queued key. Then the arm's ONE re-resolve played
-// the "object still here" step after the fresh LIST, a sequence that cannot
-// happen in production (the object is gone from that LIST). Holding the LIST
-// until that step completes pins the modelled order. The first LIST (the
-// running informer's, already synced by b5Watcher) is not held.
-func b5HoldRelistList(dyn *dynamicfake.FakeDynamicClient, release <-chan struct{}) {
-	var lists atomic.Int64
-	dyn.PrependReactor("list", b5Plural, func(k8stesting.Action) (bool, k8sruntime.Object, error) {
-		if lists.Add(1) > 1 {
-			select {
-			case <-release:
-			case <-time.After(time.Minute): // never deadlock the arm; the assertions below report it
-			}
-		}
-		return false, nil, nil // fall through to the tracker
-	})
 }
 
 // b5DriveRelist fires the real CRD lifecycle handlers: first an ADD at the
@@ -206,6 +175,18 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 
 	firstResolved := make(chan struct{})
 	rw := b5Watcher(t, firstResolved)
+	// The object exists on the cluster, and the live informer holds it.
+	if err := createB5Object(rw, b5Object); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if rw.StoreObjectState(b5GVR(), b5NS, b5Object).Found {
+			break
+		}
+	}
+	if !rw.StoreObjectState(b5GVR(), b5NS, b5Object).Found {
+		t.Fatalf("precondition: the live informer never received the object")
+	}
 
 	inputs := &ResolvedKeyInputs{
 		CacheEntryClass: "widgets",
@@ -219,28 +200,11 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"pre-delete"}`), Inputs: inputs})
 	Deps().Record(context.Background(), key, b5GVR(), b5NS, b5Object) // the self dep edge
 
-	// objectGone models the delete landing INSIDE the teardown window: the
-	// first re-resolve (the relist's pre-sync dirty-mark) still finds the
-	// object and succeeds; every later one does not. That is precisely the
-	// stranding condition — and no DELETE is delivered for it, because a fresh
-	// informer synthesises none.
-	var objectGone atomic.Bool
+	// The refresher is wired so a wrong whole-type mark would be visible as a
+	// re-resolve; the eviction itself comes from the live DELETE.
 	var attempts atomic.Int64
-	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, in ResolvedKeyInputs) error {
-		n := attempts.Add(1)
-		if n == 1 {
-			// Pre-sync mark: object still live, re-resolve succeeds, entry
-			// survives with a fresh body. THE DELETE LANDS NOW.
-			store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"still-here"}`), Inputs: inputs})
-			objectGone.Store(true)
-			close(firstResolved) // the fresh informer may LIST now (b5HoldRelistList)
-			return nil
-		}
-		if objectGone.Load() {
-			return fmt.Errorf("resolveAndPopulateL1 %s/%s: re-fetch %s/%s: %s.%s %q not found: %w",
-				in.CacheEntryClass, in.Name, in.Resource, in.Name, in.Resource, in.Group, in.Name,
-				ErrSelfObjectGone)
-		}
+	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
+		attempts.Add(1)
 		return nil
 	})
 
@@ -249,45 +213,55 @@ func TestIssue187_B5_RelistTeardownWindowStrandsSelfEntry(t *testing.T) {
 	StartRefresher(ctx)
 
 	beforeEvictDelete := Deps().Stats().EvictDeleteTotal
+	swapsBefore := StoreSwapStatsSnapshot().Swaps
 
 	b5DriveRelist(t, rw)
 
-	// The whole point: no DELETE is ever delivered for the object, so the
-	// post-sync dirty-mark is the only trigger that can reach this entry.
-	// Event-driven: returns as soon as the entry is gone (ms when idle); the
-	// deadline is a backstop for a starved refresher, not a timing budget
-	// (#664).
+	// The replacement's LIST is held (b5HoldRelistList): the build is open and
+	// the GVR is still servable from the live copy, which keeps watching.
+	if !rw.IsServable(b5GVR()) {
+		t.Fatalf("#870 RED: the GVR left servable during a schema build — the build must happen beside the live copy")
+	}
+	// The delete lands DURING the build. The fake client's watch delivers it to
+	// the LIVE informer.
+	if err := deleteB5Object(rw, b5Object); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		if _, alive := store.Get(key); !alive {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-
 	if _, alive := store.Get(key); alive {
-		s := CRDDiscoveryStatsSnapshot()
-		t.Fatalf("#187 B5 RED: an object deleted INSIDE the relist teardown window left its "+
-			"self entry RESIDENT after %d refresh attempts. The old informer was torn down "+
-			"(its in-flight deltas dropped), the fresh informer synthesises no Deleted delta "+
-			"for an object it never saw, and the single pre-sync dirty-mark re-resolved while "+
-			"the object still existed — so nothing else will ever touch this entry before its "+
-			"TTL. postsync_refires=%d postsync_timeouts=%d",
-			attempts.Load(), s.RelistDirtyMarkPostSync, s.RelistPostSyncTimeout)
+		t.Fatalf("#187 B5 RED: an object deleted DURING the schema build left its self entry resident "+
+			"(%d refresh attempts) — the live copy must keep delivering while its replacement is built", attempts.Load())
 	}
-	if got := CRDDiscoveryStatsSnapshot().RelistDirtyMarkPostSync; got != 1 {
-		t.Fatalf("#187 B5: relist_dirtymark_postsync_total = %d, want 1 — the eviction must "+
-			"have come from the post-sync re-fire, not from some other trigger", got)
+	if got := Deps().Stats().EvictDeleteTotal; got == beforeEvictDelete {
+		t.Fatalf("#187 B5: the entry went away without an informer DELETE — the live copy's watch is not what removed it")
 	}
-	// No informer DELETE was involved: the H1 counter must not have moved.
-	if got := Deps().Stats().EvictDeleteTotal; got != beforeEvictDelete {
-		t.Fatalf("#187 B5: evict_delete_total moved (%d -> %d) — a DELETE event WAS delivered, "+
-			"so the arm is not exercising the stranding window it claims to",
-			beforeEvictDelete, got)
+	close(firstResolved) // release the replacement's LIST: the build completes
+	for time.Now().Before(deadline) && StoreSwapStatsSnapshot().Swaps == swapsBefore {
+		time.Sleep(20 * time.Millisecond)
 	}
-	if got := Deps().Stats().EvictSelfGoneTotal; got == 0 {
-		t.Fatalf("#187 B5: the entry went away without a self-gone eviction — unexpected route")
+	if StoreSwapStatsSnapshot().Swaps == swapsBefore {
+		t.Fatalf("#870: the schema build never swapped in after its LIST was released")
 	}
+}
+
+func createB5Object(rw *ResourceWatcher, name string) error {
+	o := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": b5Group + "/" + b5Version,
+		"kind":       "Button",
+		"metadata":   map[string]any{"name": name, "namespace": b5NS},
+	}}
+	_, err := rw.dyn.Resource(b5GVR()).Namespace(b5NS).Create(context.Background(), o, metav1.CreateOptions{})
+	return err
+}
+
+func deleteB5Object(rw *ResourceWatcher, name string) error {
+	return rw.dyn.Resource(b5GVR()).Namespace(b5NS).Delete(context.Background(), name, metav1.DeleteOptions{})
 }
 
 // --- B5b — the over-eviction guard: a LIVE object must survive the relist ----
@@ -338,30 +312,30 @@ func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
 	defer cancel()
 	StartRefresher(ctx)
 
+	swapsBefore := StoreSwapStatsSnapshot().Swaps
 	b5DriveRelist(t, rw)
 
-	// Wait for the post-sync re-fire to have happened, then give the refresher
-	// room to do whatever it is going to do. Event-driven; the deadline is a
-	// backstop for a starved bridge (#664).
+	// Wait for the swap: event-driven, the deadline is a backstop.
 	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
-		if CRDDiscoveryStatsSnapshot().RelistDirtyMarkPostSync >= 1 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	for time.Now().Before(deadline) && StoreSwapStatsSnapshot().Swaps == swapsBefore {
+		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(500 * time.Millisecond)
+	if StoreSwapStatsSnapshot().Swaps == swapsBefore {
+		t.Fatalf("#870: the schema build never swapped in")
+	}
+	time.Sleep(300 * time.Millisecond) // room for any (wrong) mark to be refreshed
 
 	e, alive := store.Get(key)
 	if !alive {
 		t.Fatalf("#187 B5b RED: the relist EVICTED an entry whose object is still live, after "+
-			"%d refresh attempts. The post-sync dirty-mark must re-RESOLVE, never evict by "+
-			"itself — evicting a whole GVR on every CRD schema change would be a cold-cache "+
-			"storm dressed up as a fix.", attempts.Load())
+			"%d refresh attempts — evicting a whole GVR on every CRD schema change would be a "+
+			"cold-cache storm.", attempts.Load())
 	}
-	if got := string(e.RawJSON); got != `{"v":"fresh"}` {
-		t.Fatalf("#187 B5b: entry survived but was never re-resolved (%s) — the post-sync "+
-			"dirty-mark did not reach it", got)
+	// #870 — the widen changed no bytes (the fake apiserver prunes nothing), so
+	// M is empty and nothing is re-resolved: only what changed is marked.
+	if got := string(e.RawJSON); got != `{"v":"old"}` || attempts.Load() != 0 {
+		t.Fatalf("#870 RED (B5b): a swap that changed no bytes re-resolved the entry (%d attempts, body %s) — "+
+			"a whole-type mark is back", attempts.Load(), got)
 	}
 	if got := Deps().Stats().EvictSelfGoneTotal; got != 0 {
 		t.Fatalf("#187 B5b: evict_self_gone_total = %d, want 0 for a live object", got)

@@ -357,15 +357,20 @@ func judgeForcedPass(gvr schema.GroupVersionResource, idx clientcache.Indexer, l
 	if log == nil || !log.recording {
 		storeUnrecordedTotal.Add(uint64(len(lost)))
 	}
-	return reportOf(len(upstream), len(candidates)+len(carried), lost)
+	rep := reportOf(len(upstream), len(candidates)+len(carried), lost)
+	rep.unsettled = len(t.pending) + int(t.und)
+	return rep
 }
 
-// publishResolvedLoss publishes losses a pending key resolved to after its
-// pass ended, and queues the repair.
-func publishResolvedLoss(gvr schema.GroupVersionResource, lost []divergenceCandidate) {
+// publishResolvedLoss publishes losses log's pending keys resolved to after
+// their pass ended, and requests the repair: a build with reason divergence
+// carrying the confirmed keys (#870, the same request path as the pass's own),
+// bound to log — dropped if a swap replaced the copy it records (#928 delta).
+// The loss itself is published either way: it was real for that copy.
+func publishResolvedLoss(log *deliveryLog, lost []divergenceCandidate) {
 	rep := reportOf(0, len(lost), lost)
-	recordDivergence(gvr, verifySiteForced, rep)
-	enqueueStoreRepair(gvr, "store_divergence")
+	recordDivergence(log.gvr, verifySiteForced, rep)
+	requestStoreRepair(log.gvr, rep.confirmedKeys(), liveDeliveryLogIs(log))
 }
 
 var (

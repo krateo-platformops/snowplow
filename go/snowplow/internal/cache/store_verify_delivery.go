@@ -116,7 +116,6 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/informers"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
@@ -399,16 +398,15 @@ func (l *deliveryLog) judgePending() (lost []divergenceCandidate, release func()
 		return nil, func() {} // closed meanwhile
 	}
 	st := l.settleLocked(verdicts)
-	empty := len(l.pending) == 0
+	if len(l.pending) == 0 {
+		setPendingFlag(l, false)
+	}
 	l.mu.Unlock()
 	storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
 	storePendingResolvedReceivedTotal.Add(st.received)
 	// The settled keys that are not losses are published (their counter has
 	// moved): they leave the gauge now. The losses leave it at release.
 	storePendingKeys.Add(-int64(st.removed - len(st.lost)))
-	if empty {
-		setPendingFlag(l.gvr, false)
-	}
 	n := len(st.lost)
 	var once sync.Once
 	return st.lost, func() { once.Do(func() { l.lossesPublished(n) }) }
@@ -560,11 +558,11 @@ func (l *deliveryLog) supersede() {
 	l.pending = nil
 	l.pgen++
 	l.carried = carried
+	setPendingFlag(l, false)
 	l.mu.Unlock()
 	if n > 0 {
 		storePendingKeys.Add(-int64(n))
 		storePendingSupersededTotal.Add(uint64(n))
-		setPendingFlag(l.gvr, false)
 	}
 }
 
@@ -594,9 +592,9 @@ func (l *deliveryLog) setPending(reads map[string]readState) {
 	l.pgen++
 	start := !l.running
 	l.running = true
+	setPendingFlag(l, true)
 	l.mu.Unlock()
 	storePendingKeys.Add(int64(len(reads)))
-	setPendingFlag(l.gvr, true)
 	if start {
 		go l.resolve()
 	}
@@ -626,7 +624,12 @@ func (l *deliveryLog) oldestPending() time.Time {
 }
 
 // close stops the resolver, drops what is pending and removes the handler:
-// the GVR's informer is being torn down (deletePerGVRStateLocked).
+// the GVR's informer is being torn down (deletePerGVRStateLocked), or a swap
+// replaced the copy this log records (#870). It clears exactly what it owned:
+// its pending keys and, if this log set it, the GVR's walker flag (#928 delta
+// G1, H1). Both under l.mu, so a setPending racing it either holds its keys
+// first and has them cleared here, or finds the log closed and holds nothing;
+// and a flag the live log set is not this log's to clear (setPendingFlag).
 func (l *deliveryLog) close() {
 	l.mu.Lock()
 	if l.closed {
@@ -637,6 +640,7 @@ func (l *deliveryLog) close() {
 	n := len(l.pending)
 	l.pending = nil
 	l.pgen++
+	setPendingFlag(l, false)
 	l.mu.Unlock()
 	storePendingKeys.Add(-int64(n))
 	liveDeliveryLogs.Delete(l)
@@ -695,6 +699,7 @@ func (l *deliveryLog) resolve() {
 		empty := len(l.pending) == 0
 		if empty {
 			l.running = false
+			setPendingFlag(l, false)
 		}
 		l.mu.Unlock()
 		// PUBLISH FIRST, DECREMENT LAST (storePendingKeys' invariant): every
@@ -704,7 +709,7 @@ func (l *deliveryLog) resolve() {
 		storeUndecidedTotal.Add(st.undecided)
 		if len(st.lost) > 0 {
 			storePendingResolvedLostTotal.Add(uint64(len(st.lost)))
-			publishResolvedLoss(l.gvr, st.lost)
+			publishResolvedLoss(l, st.lost)
 			if fn := resolvedLossPublishedHookForTest.Load(); fn != nil {
 				(*fn)()
 			}
@@ -714,7 +719,6 @@ func (l *deliveryLog) resolve() {
 		// The judgement is complete: settled, published and counted.
 		l.sweeps.Add(1)
 		if empty {
-			setPendingFlag(l.gvr, false)
 			return
 		}
 	}
@@ -760,16 +764,21 @@ func pendingGVRsSorted() []string {
 	return out
 }
 
-// installDeliveryLogLocked installs gvr's delivery log on gi: the transform
-// (next, the strip, runs first; nil for none) and the handler. Callers MUST
-// hold rw.mu.Lock(). The returned error is the transform's: the informer
-// already runs (a re-registered shared-factory GVR gets its started informer
-// back), and the log is installed without its RECEIVED record. Only when the
-// handler cannot be added either does the GVR get no log at all.
-func (rw *ResourceWatcher) installDeliveryLogLocked(gvr schema.GroupVersionResource, gi informers.GenericInformer, next clientcache.TransformFunc) error {
+// installDeliveryLogLocked installs a delivery log on instance in of gvr: the
+// transform (next, the strip, runs first; nil for none; then the record; then
+// #870's reuse step, a no-op on a live instance) and the handler. The log is
+// the instance's (in.dl). It becomes the GVR's (rw.deliveries) now when in is
+// the live instance, and at its install when in is a build's copy
+// (perGVRFields "deliveries", store_swap.go). Callers MUST hold rw.mu.Lock().
+// The returned error is the transform's: the informer already runs (a
+// re-registered shared-factory GVR gets its started informer back), and the
+// log is installed without its RECEIVED record. Only when the handler cannot
+// be added either does the instance get no log at all.
+func (rw *ResourceWatcher) installDeliveryLogLocked(gvr schema.GroupVersionResource, in *storeInstance, next clientcache.TransformFunc) error {
+	gi := in.gi
 	dl := newDeliveryLog(gvr)
 	inf := gi.Informer()
-	transformErr := inf.SetTransform(dl.transform(next))
+	transformErr := inf.SetTransform(in.reuseTransform(dl.transform(next)))
 	dl.recording = transformErr == nil
 	reg, err := inf.AddEventHandler(dl.handler())
 	if err != nil {
@@ -783,6 +792,9 @@ func (rw *ResourceWatcher) installDeliveryLogLocked(gvr schema.GroupVersionResou
 	if s, ok := gi.(*streamingDynamicInformer); ok && s.verifier != nil {
 		s.verifier.setDeliveryLog(dl)
 	}
-	rw.rememberDeliveryLogLocked(gvr, dl)
+	in.dl = dl
+	if rw.instances[gvr] == in {
+		rw.rememberDeliveryLogLocked(gvr, dl)
+	}
 	return transformErr
 }

@@ -69,11 +69,13 @@ type gvrVerification struct {
 	// lastAttempt is when the latest forced pass started, completed or not
 	// (#875). The walker's turn order only — never the age (noteVerifyAttempt).
 	lastAttempt time.Time
-	// hasPending (#918): the GVR's delivery log holds pending keys. Set and
-	// cleared with the pending set itself (setPendingFlag), so it never
-	// outlives the keys it stands for; the walker serves flagged GVRs and the
-	// most overdue ones in turn (nextOverdueGVR).
-	hasPending bool
+	// pendingLog (#918; #928 delta H1): the delivery log whose pending keys
+	// flag this GVR for the walker, nil when none does. The walker serves
+	// flagged GVRs and the most overdue ones in turn (nextOverdueGVR). Only
+	// setPendingFlag writes it, from the log and under the log's own mutex,
+	// so the flag moves exactly with the pending set it stands for; and only
+	// the log that set it can clear it.
+	pendingLog *deliveryLog
 	// verified is true once a verification has completed since the current
 	// epoch was set. It drives the "never" reading on /debug/servable's row,
 	// which is a different question from the age the gauge reports.
@@ -229,18 +231,40 @@ func noteVerifyAttempt(gvr schema.GroupVersionResource) {
 	storeVerify.mu.Lock()
 	if st, ok := storeVerify.gvrs[gvr]; ok {
 		st.lastAttempt = time.Now()
-		storeVerify.lastTurnFlagged = st.hasPending
+		storeVerify.lastTurnFlagged = st.pendingLog != nil
 	}
 	storeVerify.mu.Unlock()
 }
 
-// setPendingFlag records whether gvr's delivery log holds pending keys
-// (#918). Called by the log whenever its pending set becomes empty or
-// non-empty; never by anything else, so the flag and the keys move together.
-func setPendingFlag(gvr schema.GroupVersionResource, pending bool) {
+// setPendingFlag records whether log l holds pending keys (#918). The log
+// calls it whenever its pending set becomes non-empty or empty, and nothing
+// else does, so the flag and the keys move together.
+//
+// EXACT (#928 delta H1), by two properties:
+//
+//   - the caller holds l.mu, so the write is ordered with the pending-set
+//     change it records: a close() that drops the keys a setPending just held
+//     clears the flag after that setPending set it, never before;
+//   - the flag names the log that set it, and a clear by any other log is a
+//     no-op. After a swap two logs exist for one GVR and the replaced one's
+//     resolver may still be finishing; its "empty" is about its own keys, not
+//     the live log's.
+//
+// Every clear is made with the caller's set empty (close and supersede drop
+// all of it), so no caller needs a "did I hold any" guard: a log that held
+// none does not own the flag, and its clear changes nothing.
+//
+// Lock order: rw.mu → l.mu → storeVerify.mu. No storeVerify.mu section takes
+// l.mu or rw.mu, and no l.mu section takes rw.mu.
+func setPendingFlag(l *deliveryLog, pending bool) {
 	storeVerify.mu.Lock()
-	if st, ok := storeVerify.gvrs[gvr]; ok {
-		st.hasPending = pending
+	if st, ok := storeVerify.gvrs[l.gvr]; ok {
+		switch {
+		case pending:
+			st.pendingLog = l
+		case st.pendingLog == l:
+			st.pendingLog = nil
+		}
 	}
 	storeVerify.mu.Unlock()
 }
@@ -268,7 +292,7 @@ func noteVerified(gvr schema.GroupVersionResource, objects int, divergences uint
 	st.divergentSinceBoot += divergences
 
 	// #244 — age an unrepaired factory-built divergence. A factory (!ownsInformer)
-	// GVR's divergence is refused by enqueueStoreRepair (a relist cannot repair a
+	// GVR's divergence is refused by requestStoreRepair (a relist cannot repair a
 	// shared-factory informer) and clears only on the reflector's next watch
 	// re-establishment; timing it from first-detection makes that bounded passive
 	// self-heal observable, and stuck-detectable if it ever exceeds the cluster's
@@ -366,7 +390,7 @@ func verificationRows() map[schema.GroupVersionResource]verificationRow {
 		out[gvr] = verificationRow{
 			epoch:                  st.epoch,
 			lastAttempt:            st.lastAttempt,
-			hasPending:             st.hasPending,
+			hasPending:             st.pendingLog != nil,
 			verified:               st.verified,
 			decorated:              st.decorated,
 			ownsInformer:           st.ownsInformer,
@@ -391,7 +415,7 @@ func verificationRowFor(gvr schema.GroupVersionResource) (verificationRow, bool)
 	return verificationRow{
 		epoch:                  st.epoch,
 		lastAttempt:            st.lastAttempt,
-		hasPending:             st.hasPending,
+		hasPending:             st.pendingLog != nil,
 		verified:               st.verified,
 		decorated:              st.decorated,
 		ownsInformer:           st.ownsInformer,
@@ -428,5 +452,50 @@ func resetStoreVerificationStateForTest() {
 	storeVerify.mu.Lock()
 	storeVerify.gvrs = map[schema.GroupVersionResource]*gvrVerification{}
 	storeVerify.lastTurnFlagged = false
+	storeVerify.mu.Unlock()
+}
+
+// #870 — the build path's reads and writes of this registry. Each takes only
+// storeVerify.mu and may run under rw.mu (the documented order).
+
+// storeVerificationOwnership reports gvr's RECORDED ownsInformer (set by the
+// constructing branch at registration), whether gvr is known, and whether the
+// breaker has suppressed its repairs.
+func storeVerificationOwnership(gvr schema.GroupVersionResource) (owned, known, suppressed bool) {
+	storeVerify.mu.Lock()
+	defer storeVerify.mu.Unlock()
+	st, ok := storeVerify.gvrs[gvr]
+	if !ok {
+		return false, false, false
+	}
+	return st.ownsInformer, true, st.suppressed
+}
+
+// markRepairPending sets the /debug row's "a build with reason divergence is
+// open". Nothing schedules on it: the walker's deadline alone decides when the
+// live copy is verified (architect Q2).
+func markRepairPending(gvr schema.GroupVersionResource, on bool) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.repairPending = on
+	}
+	storeVerify.mu.Unlock()
+}
+
+// resetVerificationAfterSwap is the install's write (design v5 §2.6 step 1):
+// the new copy has not been verified, so its deadline restarts now; and when
+// the build repaired a divergence, the next verification judges the repair
+// (the breaker's input, bound 3). No verification registry state is wiped:
+// suppression and the factory-divergence age survive the swap.
+func resetVerificationAfterSwap(gvr schema.GroupVersionResource, repaired bool) {
+	storeVerify.mu.Lock()
+	if st, ok := storeVerify.gvrs[gvr]; ok {
+		st.epoch = time.Now()
+		st.verified = false
+		st.repairPending = false
+		if repaired {
+			st.repairedAwaitingVerify = true
+		}
+	}
 	storeVerify.mu.Unlock()
 }

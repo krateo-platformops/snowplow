@@ -845,7 +845,7 @@ type DepTracker struct {
 	gvrLastBump sync.Map
 
 	// gvrLastTypeBump — #765: the depEventSeq of the LAST type-level event on the GVR
-	// (bumpResourceTypeGen: available / removed / schema relisted / store repaired),
+	// (bumpResourceTypeGen: available / removed),
 	// gvr -> *atomic.Uint64. A listOnly type event stamps only the GVR's LIST buckets,
 	// so a GET content cell's own bucket cannot show it; ContentStampCovers checks this
 	// too, so a type event since a content cell's read always re-fills it. Bounded by the
@@ -1487,11 +1487,11 @@ func fireDepBumpHook(stage string) {
 	}
 }
 
-// bumpResourceTypeGen is bumpCoordinateGen's TYPE-LEVEL twin (#375, TL ruling): the four
-// GVR-lifecycle dirty-mark sources (OnResourceTypeAvailable / Removed / SchemaRelisted /
-// StoreRepaired) mark every dependent of a whole GVR without an OnObjectEvent, so they
-// must advance the generation too, or a resolve in flight across a CRD add / delete /
-// schema relist / store repair could have its type-level mark consumed while it is
+// bumpResourceTypeGen is bumpCoordinateGen's TYPE-LEVEL twin (#375, TL ruling): the two
+// GVR-lifecycle dirty-mark sources (OnResourceTypeAvailable / Removed; #870 deleted the
+// schema-relist and store-repair ones) mark every dependent of a whole GVR without an OnObjectEvent, so they
+// must advance the generation too, or a resolve in flight across a CRD add / delete
+// could have its type-level mark consumed while it is
 // non-resident and its Put-check see no move. It advances depEventSeq ONCE, raises the
 // GVR floor (cold buckets), and stamps every bucket of the GVR the matching
 // collectTypeMatches scan would fan out to (LIST buckets only when listOnly). Called by
@@ -1501,8 +1501,7 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 	if d == nil {
 		return
 	}
-	// #854 — a type-level event (CRD available / removed / schema relisted /
-	// store repaired) is not a per-object delta: the incremental list cells of
+	// #854 — a type-level event (CRD available / removed) is not a per-object delta: the incremental list cells of
 	// the GVR drop back to a full fill.
 	unanchorListCellsForGVR(gvr, "type_event")
 	s := depEventSeq.Add(1)
@@ -2331,52 +2330,12 @@ func (d *DepTracker) OnResourceTypeRemoved(gvr schema.GroupVersionResource) int 
 	return d.dirtyMarkResourceType("CRD_DELETE", gvr, matched)
 }
 
-// OnResourceTypeSchemaRelisted is invoked by the CRD schema-widen relist
-// (triggerCRDSchemaRelist, crd_discovery_side_effect.go) when a CRD's
-// structural schema CHANGED at runtime and its data informer was relisted.
-// The GVR is NOT being removed — its informer is re-LISTing under the now-
-// wider schema — but every L1 entry that LIST- or GET-depends on the GVR was
-// resolved against the PRE-widen (pruned) objects and is now stale, so it
-// must dirty-mark the same dependent-bucket set OnResourceTypeRemoved does.
-//
-// Mechanically identical to OnResourceTypeRemoved (same collectTypeMatches
-// scan, same dirty-mark-only, NEVER-evict contract) — it differs ONLY in the
-// telemetry label: it logs cache_event.consumed type=SCHEMA_RELIST, not
-// type=CRD_DELETE, so the relist's dirty-mark does not masquerade as a CRD
-// deletion in logs/metrics. dirtyMarkResourceType already parameterises the
-// event type, so this is a label-only divergence.
-//
-// Returns the number of dependent L1 keys dirty-marked. A no-op (and
-// idempotent) when no dep matches gvr.
-func (d *DepTracker) OnResourceTypeSchemaRelisted(gvr schema.GroupVersionResource) int {
-	if d == nil {
-		return 0
-	}
-	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
-	matched := d.collectTypeMatches(gvr, false /* listOnly */)
-	return d.dirtyMarkResourceType("SCHEMA_RELIST", gvr, matched)
-}
-
-// OnResourceTypeStoreRepaired is the #237 deliverable B sibling of
-// OnResourceTypeSchemaRelisted: the same dirty-mark-only, never-evict body,
-// reached when a relist was fired because the informer STORE was found to
-// disagree with the apiserver — not because a CRD's schema changed.
-//
-// It exists for one reason: the event label. The relist machinery is shared
-// (relistGVRForRepair, crd_discovery_side_effect.go), so a store repair that
-// reused OnResourceTypeSchemaRelisted would log cache_event.consumed
-// type=SCHEMA_RELIST and the event log would attribute a store divergence to a
-// CRD schema widen. That is the same misattribution this whole issue is about:
-// #237 spent two sessions on a defect whose instruments named the wrong cause.
-// One label, one caller each, so a non-zero bucket names the code path.
-func (d *DepTracker) OnResourceTypeStoreRepaired(gvr schema.GroupVersionResource) int {
-	if d == nil {
-		return 0
-	}
-	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
-	matched := d.collectTypeMatches(gvr, false /* listOnly */)
-	return d.dirtyMarkResourceType("STORE_REPAIR", gvr, matched)
-}
+// #870 — OnResourceTypeSchemaRelisted and OnResourceTypeStoreRepaired are
+// deleted. A schema widen and a store repair no longer tear the informer down:
+// the replacement is built beside the live copy and swapped in, and only the
+// keys whose bytes changed (M) reach the consumers, as ordinary per-object
+// events (store_swap.go). A whole-type mark of either kind is the mutation X2
+// that K2 turns RED.
 
 // dirtyMarkResourceType dirty-marks every L1 key in matched via the
 // refreshHook — the shared body of OnResourceTypeAvailable +

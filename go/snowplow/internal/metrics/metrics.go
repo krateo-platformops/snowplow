@@ -733,7 +733,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	}
 	dirtyMarkSubmits, err := m.Int64ObservableCounter(
 		"snowplow_deps_dirty_mark_submits_total",
-		metric.WithDescription("Dep-event submissions by source (watch/relist_bridge/reconcile), counted PRE-dedup — which mechanism drives the queue."))
+		metric.WithDescription("Dep-event submissions by source (watch/store_swap/reconcile), counted PRE-dedup — which mechanism drives the queue. store_swap = a store swap's per-key deliveries (#870)."))
 	if err != nil {
 		return err
 	}
@@ -1268,6 +1268,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 	if err := registerInformerServeMissInstruments(m); err != nil {
+		return err
+	}
+	if err := registerStoreSwapInstruments(m); err != nil { // #870
 		return err
 	}
 	return registerSecurityInstruments(m)

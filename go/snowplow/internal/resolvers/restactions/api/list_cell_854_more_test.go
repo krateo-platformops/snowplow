@@ -1,8 +1,8 @@
 // list_cell_854_more_test.go — #854: the remaining unanchor triggers and the
 // reader paths.
 //
-//	F2t  every type-level event on the GVR (available / removed / schema
-//	     relisted / store repaired) unanchors the cell.
+//	F2t  every type-level event on the GVR (available / removed; #870 deleted
+//	     the schema-relisted and store-repaired ones) unanchors the cell.
 //	F3c  C5: a CUSTOMER read after a change is served the change (a customer
 //	     read drains pending with the current seq as its need).
 //	F5r  the comparator is read-driven: reads alone schedule passes (no timer),
@@ -21,8 +21,6 @@ func TestListCell854_F2t_TypeLevelEventsUnanchor(t *testing.T) {
 	events := map[string]func(){
 		"available":       func() { cache.Deps().OnResourceTypeAvailable(r1FsaGVR) },
 		"removed":         func() { cache.Deps().OnResourceTypeRemoved(r1FsaGVR) },
-		"schema_relisted": func() { cache.Deps().OnResourceTypeSchemaRelisted(r1FsaGVR) },
-		"store_repaired":  func() { cache.Deps().OnResourceTypeStoreRepaired(r1FsaGVR) },
 	}
 	for name, fire := range events {
 		t.Run(name, func(t *testing.T) {

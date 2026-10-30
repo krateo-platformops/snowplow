@@ -50,7 +50,7 @@ func TestPendingOrder923_O1_TheResolverPublishesBeforeTheKeyLeavesTheGauge(t *te
 			at := make(chan seen, 1)
 			hook := func() {
 				s := seen{pending: storePendingKeys.Load(), perGVR: PendingByGVRSnapshot()[gvr.String()],
-					lostUpdates: j9Class("update"), repairs: storeRepairQueueDepth()}
+					lostUpdates: j9Class("update"), repairs: storeRepairsRequestedForTest()}
 				select {
 				case at <- s:
 				default:
@@ -122,8 +122,8 @@ func TestPendingOrder923_O2_TheNextPassPublishesBeforeTheCarriedKeyLeavesTheGaug
 	if got := j9Class("update"); got != 1 {
 		t.Fatalf("the deciding pass published %d lost updates, want 1", got)
 	}
-	if d := storeRepairQueueDepth(); d != 1 {
-		t.Fatalf("store_repairs_pending = %d after the deciding pass, want 1", d)
+	if d := storeRepairsRequestedForTest(); d != 1 {
+		t.Fatalf("repairs requested = %d after the deciding pass, want 1", d)
 	}
 	if got := storePendingKeys.Load(); got != 0 {
 		t.Fatalf("%d keys still pending after the deciding pass published its loss", got)

@@ -413,12 +413,6 @@ env:
   #
   # Set to "0" to disable (UAF cells then use the standard TTL).
   UAF_RESOLVED_TTL_SECONDS: "300"
-  # 1.12.6 C2 — relist delta bridge: how long the bridge waits for a
-  # schema-relisted informer to sync before giving up (it then enqueues
-  # nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync
-  # re-fire keeps covering the window). Matches the re-fire's own 2-minute
-  # wait. String (installer plumbing is string-only); unset/unparseable → 120.
-  DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS: "120"
   # 1.12.6 C3 — the sampled reconcile audit (deps_reconcile.go): every
   # DEPS_RECONCILE_PERIOD_SECONDS, sample DEPS_RECONCILE_SAMPLE resident L1
   # entries, probe each entry's own object against the informer indexer and
