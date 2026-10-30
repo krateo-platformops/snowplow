@@ -70,11 +70,9 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"sync"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
@@ -167,7 +165,7 @@ func resetDiscoveryClientCacheForTest() {
 func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, error) {
 	// Gate 1: verb. Discovery is read-only; a non-GET to a
 	// discovery-shaped path is not a discovery probe (F5).
-	if verb := ptr.Deref(call.Verb, http.MethodGet); verb != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, nil
 	}
 
