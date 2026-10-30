@@ -429,8 +429,17 @@ func TestStoreSwap_K10_RefusedAbortsAndStallBlocksNothing(t *testing.T) {
 	t.Run("forbidden_aborts", func(t *testing.T) {
 		gvr := swapGVR(t)
 		var refuse atomic.Bool
+		// The refusal is answered only once the test holds the candidate: the
+		// abort follows the refused LIST, so the build cannot end before it is
+		// read (#928 round 3, F-LOW: read after the request, a fast abort left
+		// it nil and <-cand.done panicked the package binary).
+		captured := make(chan struct{})
+		var release sync.Once
+		releaseRefusal := func() { release.Do(func() { close(captured) }) }
+		t.Cleanup(releaseRefusal)
 		f := newSwapFix(t, gvr, objs(gvr, 2), withListErr(func(int64) error {
 			if refuse.Load() {
+				<-captured
 				return apierrors.NewForbidden(gvr.GroupResource(), "", errors.New("rbac"))
 			}
 			return nil
@@ -439,6 +448,10 @@ func TestStoreSwap_K10_RefusedAbortsAndStallBlocksNothing(t *testing.T) {
 		f.clusterSet(swapObj(gvr, "o00", "2", "v2"))
 		f.request(reasonDivergence, swapKey("o00"))
 		cand := f.rw.storeBuildForTest(gvr)
+		releaseRefusal()
+		if cand == nil {
+			t.Fatal("setup: the request opened no build")
+		}
 		f.waitFor("abort_refused", func() bool { return storeSwapStats.keys.get(reasonDivergence, outcomeAbortRefused) == 1 })
 		if f.rw.storeBuildForTest(gvr) != nil {
 			t.Fatal("K10 RED (X14): the build is still open after a terminal refusal")
