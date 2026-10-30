@@ -110,8 +110,7 @@ def generate(*, scale: int = 50000, namespaces: int = 50, users: int = 1000,
     proof["hold_final"] = assert_no_external_children()
 
     model = rbac_model.bench_model(users, namespaces)
-    docs = [rbac_model.namespace_rbac_yaml(n) for n in range(1, namespaces + 1)]
-    docs.append(rbac_model.admin_rbac_yaml())
+    docs = rbac_model.rbac_yaml(namespaces)        # the documents menu_class reads its grants from
     ok, err = lifecycle.apply_with_retry("---\n".join(docs), "RBAC",
                                          timeout_secs=300)
     if not ok:

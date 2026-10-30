@@ -163,10 +163,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         import yaml
         f = a[a.index("-f") + 1]
         text = sys.stdin.read() if f == "-" else (open(f).read() if os.path.isfile(f) else "")
-        with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh:
+        with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh, \\
+                open(os.path.join(STATE, "applied-jobs"), "a") as jobs:
             for d in yaml.safe_load_all(text):
                 if isinstance(d, dict):
                     fh.write(json.dumps([d.get("apiVersion"), d.get("kind")]) + "\\n")
+                    if d.get("kind") == "Job":
+                        jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
     # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
     # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the
@@ -775,14 +778,26 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
             sys.exit(0)
         if what == "job" and any(x.startswith("preflight606") for x in a):   # + each menu class's
-            refused = os.environ.get("FAKE_PREFLIGHT", "ok") == "refused"
+            # a preflight Job answers only once the run APPLIED it (#999 review B2): else NotFound
+            job = next(x for x in a if x.startswith("preflight606"))
+            jf = os.path.join(STATE, "applied-jobs")
+            if job not in (open(jf).read().split() if os.path.exists(jf) else []):
+                print(f'Error from server (NotFound): jobs.batch "{job}" not found', file=sys.stderr)
+                sys.exit(1)
+            # FAKE_PREFLIGHT=refused: the run's preflight refuses; FAKE_PREFLIGHT_REFUSE_JOB: that Job alone
+            refused = (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
+                       or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("" if refused else "1"); sys.exit(0)
             if any(x.endswith("{.status.failed}") for x in a):
                 print("1" if refused else ""); sys.exit(0)
         sys.exit(0)
     if a[:1] == ["logs"] and any("preflight606" in x for x in a):
-        if os.environ.get("FAKE_PREFLIGHT", "ok") == "refused":
+        job = next(x for x in a if "preflight606" in x).split("/", 1)[-1]
+        # each Job its OWN table: a class's Job adds a route only it has (#999 review B2)
+        own = [] if job == "preflight606" else ["/only-" + job.rsplit("-", 1)[1]]
+        if (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
+                or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job):
             print(json.dumps({"kind": "preflight", "ok": False, "init_status": 200,
                               "routes": [], "refused": [{"path": "/dashboard", "status": 500,
                               "body": "no matches for widgets.templates.krateo.io/v1beta1, Resource=pages"}],
@@ -792,7 +807,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(json.dumps({"kind": "preflight", "ok": True, "init_status": 200,
                               "routes": [{"path": p, "status": 200, "endpoint":
                                           "/call?resource=flexes&name=page" + p.replace("/", "-")}
-                                         for p in ("/dashboard", "/observability", "/compositions")],
+                                         for p in ("/dashboard", "/observability", "/compositions", *own)],
                               "refused": [], "product_errors": [
                                   {"path": "/agents/new", "status": 500,
                                    "body": "unexpected end of JSON input"}],

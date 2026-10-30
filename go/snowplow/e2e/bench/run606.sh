@@ -234,10 +234,10 @@ fi
 # the menu classes k6 drives, each one more preflight (s_classes)
 CLASS_COUNT=0
 if [[ "$LOAD_DRIVER" == "k6" ]]; then
-  CLASS_COUNT="$(python3 -m bench.load606_job --class-reps --users "$USERS" --namespaces "$NAMESPACES" \
+  CLASS_COUNT="$(python3 -m bench.load606_job --menu-classes --users "$USERS" --namespaces "$NAMESPACES" \
       --browser-sessions "$BROWSER_SESSIONS" --burst-users "$COMPOSITE_BURST_USERS" --snowplow-url - \
       --authn-url - --password - --init - --driver k6 | grep -c .)" \
-    || { echo "refusing: the menu classes k6 drives could not be listed (bench.load606_job --class-reps)" >&2; exit 2; }
+    || { echo "refusing: the menu classes k6 drives could not be listed (bench.load606_job --menu-classes)" >&2; exit 2; }
 fi
 RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ENDPOINT_WAIT_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
@@ -539,7 +539,14 @@ bootstrap:
 # path mode (/ frontend, /auth authn, /content snowplow, /events sse-proxy,
 # each prefix rewritten to /), the two-gateway split, the agentgateway. 057
 # also sets tls (its own hostname and certificate): the bench has neither, so
-# its origin is http://<platform gateway ip>:<platformPort>.
+# its origin is http://<platform gateway ip>:<platformPort>. 057's
+# exposure.port: 80 is left out: inert in Gateway mode (installer 0.3.468
+# values.schema.json: "Ignored when type=Gateway"; compositions.yaml reads it
+# only for LoadBalancer/NodePort and outside the path-mode branch).
+# Comparability: from run 19 on, the browser reaches the portal through the
+# agentgateway (runs <= 17 went direct, through a localhost forwarder), so
+# browser figures are not comparable across that line; A/B inside one run is
+# unaffected, and k6's users still reach snowplow by its Service DNS.
 exposure:
   type: Gateway
   gatewayMode: path
@@ -844,20 +851,37 @@ fresh_classes_cleanup() {
   log "fresh classes cleaned up"
 }
 # s_classes (run 17 attempt 5): the portal filters its menu by RBAC, so each
-# menu class k6 drives (bench/rbac_model.menu_class: a user's groups less the
-# team groups, whose grants stay in bench data namespaces) gets its own route
-# table: the preflight606 walk, signed in as that class's lowest-index k6
-# user (load606_job --class-reps). After the data step (its users and RBAC
-# exist) and before the reboot (snowplow forgets what the walks warmed).
-# Each table is one --class-preflight LABEL=FILE of the measure step.
+# menu class k6 drives (bench/rbac_model.menu_class: a user's groups less
+# those whose grants the bench's RBAC confines to its data namespaces) gets
+# its own route table: the preflight606 walk, signed in as a DEDICATED
+# identity per class (bench/menu_classes: exactly the class's kept groups;
+# no k6 user shares its identity class, so the walk teaches snowplow no
+# class the run measures; #999 review N2). After the data step (its RBAC
+# exists); the identities are deleted once their walks are done, and again
+# at collect (the cluster's deletion is the backstop). Each table is one
+# --class-preflight LABEL=FILE of the measure step.
 CLASS_PREFLIGHTS=()
 s_classes() {
-  local label user k=0 f
+  local label user k=0 f pwf="$OUT/.bench-password" rc=0
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.menu_classes plan -> $OUT/menu-classes.json; kapply $OUT/menu-classes.yaml; a preflight606-cN Job per class"
+  fi
+  (umask 077; printf '%s' "$PW" > "$pwf")
+  python3 -m bench.menu_classes plan --users "$USERS" --namespaces "$NAMESPACES" \
+      --browser-sessions "$BROWSER_SESSIONS" --burst-users "$COMPOSITE_BURST_USERS" \
+      $([[ "$DRY" == "1" ]] && printf -- "--dry-run") --user-prefix "$BENCH_USER_PREFIX" \
+      --password-file "$pwf" --out "$OUT/menu-classes.json" --manifest "$OUT/menu-classes.yaml" 2>"$KERR" || rc=$?
+  rm -f "$pwf"
+  (( rc == 0 )) || { record_failure "menu classes FAILED: the plan could not be made"; return 1; }
+  if [[ "$DRY" != "1" ]]; then
+    kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \
+      || { record_failure "menu classes FAILED: applying their identities"; return 1; }
+  fi
   while IFS=$'\t' read -r label user; do
     [[ -n "$label" ]] || continue
     k=$(( k + 1 ))
     f="$OUT/class-preflight-${k}.jsonl"
-    log "menu class ${label}: preflight as its lowest-index k6 user"
+    log "menu class ${label}: preflight as its own identity"
     if [[ "$DRY" == "1" ]]; then
       log "DRY: preflight606-c${k} Job -> $f"
       continue
@@ -866,13 +890,22 @@ s_classes() {
         --preflight-user "$user" --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
         --password "$PW" --init "$PORTAL_INIT" --frontend-ns "$PORTAL_FRONTEND_NS" \
         --builders-ns "$PORTAL_BUILDERS_NS" > "$OUT/class-preflight-${k}-job.yaml"
-    run_preflight_job "preflight606-c${k}" "$f" "menu class ${label}" || return 1
+    run_preflight_job "preflight606-c${k}" "$f" "menu class ${label}" || { menu_classes_cleanup; return 1; }
     CLASS_PREFLIGHTS+=("${label}=${f}")
-  done < <(python3 -m bench.load606_job --class-reps --users "$USERS" --namespaces "$NAMESPACES" \
-             --browser-sessions "$BROWSER_SESSIONS" --burst-users "$COMPOSITE_BURST_USERS" \
-             --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
-             --init "$PORTAL_INIT" --driver k6 $([[ "$DRY" == "1" ]] && printf -- "--dry-run"))
+  done < <(python3 -m bench.menu_classes list --plan "$OUT/menu-classes.json")
+  menu_classes_cleanup
   (( k > 0 )) || { log "no menu class: k6 drives no user"; return 1; }
+}
+# menu_classes_cleanup: the class identities s_classes made, and each one's
+# clientconfig Secret authn wrote at its login; bounded, best effort,
+# output discarded (it names the users).
+menu_classes_cleanup() {
+  [[ "$DRY" != "1" && -f "$OUT/menu-classes.json" ]] || return 0
+  local args
+  while read -r -a args; do
+    bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" "${args[@]}" \
+        >/dev/null 2>"$KERR" || log "menu classes cleanup: $(kerr_line)"
+  done < <(python3 -m bench.menu_classes cleanup --plan "$OUT/menu-classes.json")
 }
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
@@ -1171,8 +1204,8 @@ driver_jobs() { if [[ "$LOAD_DRIVER" == "k6" ]]; then echo "k6load k6browser"; e
 # wait_drive_done <deadline>: every driver Job's pods are Ready (readinessProbe
 # on /out/done), so the Jobs are NOT Complete here. A failed driver pod fails
 # the step at once, not at the deadline; so does one that never starts (#834
-# review: a forwarder whose startupProbe never passes holds the browser pod in
-# Init), checked on EVERY driver Job at each poll (the browser pod's would
+# review: a pod held in Init, e.g. by an init container that keeps failing),
+# checked on EVERY driver Job at each poll (the browser pod's would
 # otherwise wait behind k6load's whole run).
 wait_drive_done() {
   local deadline="$1" st ready failed want j k stuck pods src rv
@@ -1507,8 +1540,10 @@ s_collect() {
     | scrub --kubelet-timestamps > "$OUT/snowplow-previous.log"
   [[ -s "$OUT/snowplow-previous.log" ]] || rm -f "$OUT/snowplow-previous.log"
   "${KR[@]}" top nodes > "$OUT/top-nodes.txt" || true
-  # #935: the fresh identity classes, once the browser is done with them
+  # #935: the fresh identity classes, once the browser is done with them;
+  # the menu classes' identities again (s_classes deleted them already)
   fresh_classes_cleanup
+  menu_classes_cleanup
   COLLECTED=1
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }

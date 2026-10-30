@@ -627,10 +627,10 @@ def test_k6_plan_needs_the_larger_loadgen_node():
     with pytest.raises(ValueError, match="over budget on n2-standard-8"):
         k6_job.loadgen_fit("n2-standard-8", k6_job.k6_plan_requests())
     fit = k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())
-    # k6 4 + viewer sidecar 1 + Chrome 3 + forwarder 0.1 + fresh606 1 + mem606 0.25
-    assert fit["cpu_m"] == 9350 and fit["cpu_m"] <= fit["budget_cpu_m"]
+    # k6 4 + viewer sidecar 1 + Chrome 3 + fresh606 1 + mem606 0.25
+    assert fit["cpu_m"] == 9250 and fit["cpu_m"] <= fit["budget_cpu_m"]
     assert k6_job.loadgen_fit("n2-standard-16",
-                              k6_job.k6_plan_requests(viewers=False))["cpu_m"] == 8350
+                              k6_job.k6_plan_requests(viewers=False))["cpu_m"] == 8250
     with pytest.raises(ValueError, match="unknown loadgen machine type"):
         k6_job.loadgen_fit("e2-small", k6_job.k6_plan_requests())
 
@@ -742,9 +742,6 @@ def _preflight(tmp_path):
 
 # the portal's one origin (run 19: the browser loads it as 057's users do)
 ORIGIN = ("--browser-origin", "http://10.0.0.9", "--browser-snowplow-url", "http://10.0.0.9/content")
-# the localhost forwarder, kept for a portal that names localhost peers
-FORWARDS = ["8080=frontend.krateo-system.svc:8080", "8081=snowplow.krateo-system.svc:8081",
-            "8082=authn.krateo-system.svc:8082", "8083=krateo-sse-proxy.krateo-system.svc:8080"]
 
 
 def _render(tmp_path, *extra):
@@ -767,7 +764,7 @@ def _render(tmp_path, *extra):
 
 
 def test_render_k6_driver(tmp_path):
-    docs = _render(tmp_path, *[x for f in FORWARDS for x in ("--browser-forward", f)])
+    docs = _render(tmp_path)
     by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
     # fresh606 and mem606 are unchanged beside the k6 Jobs; no load606 driver
     assert {("Job", "k6load"), ("Job", "k6browser"), ("Job", "fresh606"), ("Job", "mem606"),
@@ -812,21 +809,14 @@ def test_render_k6_driver(tmp_path):
     assert b["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] == "browser"
     assert [x["name"] for x in b["spec"]["containers"]] == ["browser"]
     assert b["spec"]["containers"][0]["image"] == k6_job.K6_BROWSER_IMAGE
-    # run 11's race: the forwarder is a NATIVE sidecar whose startupProbe holds
-    # the browser back until every local port accepts
-    fw = b["spec"]["initContainers"]
-    assert [x["name"] for x in fw] == ["forward"] and fw[0]["restartPolicy"] == "Always"
-    specs = FORWARDS
-    assert fw[0]["command"][-4:] == specs
-    sp = fw[0]["startupProbe"]
-    assert sp["exec"]["command"] == ["python3", "/opt/k6/forward.py", "--probe", *specs]
-    assert sp["periodSeconds"] * sp["failureThreshold"] >= k6_job.FORWARD_WAIT_S
-    # and the browser itself waits for an HTTP answer on every port first
+    # run 19: no sidecar; run 11's race is covered by the browser waiting for
+    # an HTTP answer from the portal's ORIGIN before it starts
+    assert "initContainers" not in b["spec"]
     args = b["spec"]["containers"][0]["args"][0]
-    assert ("for u in http://127.0.0.1:8080/ http://127.0.0.1:8081/ http://127.0.0.1:8082/ "
-            "http://127.0.0.1:8083/; do") in args
-    assert args.index("wait_forwards && ") < args.index("k6 run --quiet")
+    assert "for u in http://10.0.0.9/; do" in args
+    assert args.index("wait_origin && ") < args.index("k6 run --quiet")
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
+    assert bcfg["frontendUrl"] == "http://10.0.0.9" and bcfg["snowplowUrl"] == "http://10.0.0.9/content"
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
     assert len(bcfg["sessions"]) == 5 and not browser_users & set(cfg["navUserIds"])
     # singleton identity classes: no k6 user shares their group set (#831 gate)
@@ -1247,53 +1237,47 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     assert (out / "probe-exit.json").exists() and (out / "done").read_text().strip() == "0"
 
 
-def _browser_pod_in_docker(tmp_path, *, forward_delay_s, wrapper=True, login_tries=6,
-                           forward_wait_s=60, forward=True):
-    """The k6browser pod, emulated: a `forward` container owns the network
-    namespace and starts its forwarder `forward_delay_s` late (run 11: the
-    sidecar was not listening yet when Chrome navigated); the browser container
-    joins that namespace and runs the RENDERED browser args (with `wrapper`)
-    or a bare `k6 run` (without: run 11's container). 3 sessions against the
-    fixture SPA."""
-    net = f"k6race-{os.getpid()}-{forward_delay_s}-{int(wrapper)}-{login_tries}"
-    spa, fwd = f"{net}-spa", f"{net}-fwd"
+def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_tries=6,
+                           origin_wait_s=60, origin=True):
+    """The k6browser pod, emulated: the fixture SPA (the portal's origin)
+    starts `origin_delay_s` late (run 11: Chrome navigated before what it
+    loads the portal through answered); the browser container runs the
+    RENDERED browser args (with `wrapper`) or a bare `k6 run` (without: run
+    11's container). 3 sessions against the fixture SPA at its own origin."""
+    net = f"k6race-{os.getpid()}-{origin_delay_s}-{int(wrapper)}-{login_tries}"
+    spa = f"{net}-spa"
     out, k6dir = tmp_path / "out", tmp_path / "k6"
     out.mkdir(mode=0o777)
     out.chmod(0o777)
     k6dir.mkdir()
-    for n in ("browser.js", "pageload.js", "forward.py"):
+    for n in ("browser.js", "pageload.js"):
         shutil.copy(BENCH_DIR / "k6" / n, k6dir / n)
     sessions = [{"name": f"s{i}", "user": f"fixture-{i}", "offset": i} for i in (1, 2, 3)]
     cfg = k6_job.browser_config(sessions=[dict(s, cold=True) for s in sessions],
                                 routes=["/dashboard", "/compositions"], password="x",
-                                think_s=0.3, duration_s=6, page_timeout_ms=5000)
-    cfg.update(frontendUrl="http://localhost:8080", loginTries=login_tries, loginRetryMs=2000,
-               signinTimeoutMs=10000)
+                                think_s=0.3, duration_s=6, page_timeout_ms=5000,
+                                frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080")
+    cfg.update(loginTries=login_tries, loginRetryMs=2000, signinTimeoutMs=10000)
     (k6dir / "browser-config.json").write_text(json.dumps(cfg))
-    yaml_text = k6_job.render_browser(config=cfg, forwards=[f"8080={spa}:8080"], linger_s=0,
-                                      forward_wait_s=forward_wait_s)
+    yaml_text = k6_job.render_browser(config=cfg, linger_s=0, origin_wait_s=origin_wait_s)
     job = next(d for d in yaml.safe_load_all(yaml_text) if d and d["kind"] == "Job")
     browser = job["spec"]["template"]["spec"]["containers"][0]
     script = (browser["args"][0] if wrapper
               else "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
     env = [x for e in browser["env"] for x in ("-e", f"{e['name']}={e['value']}")]
-    fwd_cmd = (f"sleep {forward_delay_s}; exec python3 -u /opt/k6/forward.py 8080={spa}:8080"
-               if forward else "sleep 600")
+    spa_cmd = (f"sleep {origin_delay_s}; exec python3 -u /f/k6_browser_fixture.py 8080 300 50 100"
+               if origin else "sleep 600")
     subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)
     try:
         subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
                         "-v", f"{BENCH_DIR / 'tests' / 'fixtures'}:/f:ro", "python:3.12-slim",
-                        "python3", "-u", "/f/k6_browser_fixture.py", "8080", "300", "50", "100"],
-                       capture_output=True, check=True)
-        subprocess.run(["docker", "run", "-d", "--name", fwd, "--network", net,
-                        "-v", f"{k6dir}:/opt/k6:ro", "python:3.12-slim", "sh", "-c", fwd_cmd],
-                       capture_output=True, check=True)
-        p = subprocess.run(["docker", "run", "--rm", "--network", f"container:{fwd}",
+                        "sh", "-c", spa_cmd], capture_output=True, check=True)
+        p = subprocess.run(["docker", "run", "--rm", "--network", net,
                             "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out", *env,
                             "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE, "-c", script],
                            capture_output=True, text=True, timeout=300)
     finally:
-        subprocess.run(["docker", "rm", "-f", spa, fwd], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", spa], capture_output=True)
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
     if not (out / "browser-exit.json").exists():                # the bare k6 run has no wrapper
         (out / "browser-exit.json").write_text(json.dumps({"kind": "browser_exit",
@@ -1303,21 +1287,21 @@ def _browser_pod_in_docker(tmp_path, *, forward_delay_s, wrapper=True, login_tri
 
 @needs_docker
 def test_run11_race_reproduced_without_the_gate(tmp_path):
-    """Run 11, reproduced: Chrome navigates while the forwarder is not
-    listening yet, no wait, no retry -> net::ERR_CONNECTION_REFUSED, sessions
-    lost, and browser.sessions keeps such a run INVALID."""
-    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6, wrapper=False, login_tries=1)
-    assert "ERR_CONNECTION_REFUSED" in p.stdout + p.stderr
+    """Run 11, reproduced: Chrome navigates while the portal's origin does
+    not answer yet, no wait, no retry -> sessions lost, and browser.sessions
+    keeps such a run INVALID."""
+    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=6, wrapper=False, login_tries=1)
+    assert "ERR_" in p.stdout + p.stderr
     o = k6eval.read_k6_out(str(out), "browser")
     c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
     assert c["result"] == "FAIL" and c["value"] == 0
 
 
 @needs_docker
-def test_forwarder_late_at_session_start_the_browser_waits(tmp_path):
+def test_origin_late_at_session_start_the_browser_waits(tmp_path):
     """The same race with the rendered browser container: its wrapper waits
-    for the forwarded port to answer, then all 3 sessions sign in."""
-    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6)
+    for the portal's origin to answer, then all 3 sessions sign in."""
+    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=6)
     assert p.returncode == 0, p.stderr[-2000:]
     fw = json.loads((out / "browser-forward.json").read_text())
     assert fw["ok"] is True and fw["waited_s"] >= 4
@@ -1325,71 +1309,28 @@ def test_forwarder_late_at_session_start_the_browser_waits(tmp_path):
     c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
     assert c["result"] == "PASS" and c["value"] == 3
     assert k6eval.browser_report(o)["forward_wait"]["ok"] is True
-    assert "ERR_CONNECTION_REFUSED" not in p.stdout + p.stderr
 
 
 @needs_docker
-def test_forwarder_late_the_login_retry_alone_recovers(tmp_path):
+def test_origin_late_the_login_retry_alone_recovers(tmp_path):
     """Without the wrapper's wait, browser.js's bounded login retry alone
-    carries the sessions over a forwarder that listens 6 s late."""
-    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=6, wrapper=False, login_tries=6)
+    carries the sessions over an origin that answers 6 s late."""
+    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=6, wrapper=False, login_tries=6)
     assert "retrying in 2000 ms" in p.stdout + p.stderr
     o = k6eval.read_k6_out(str(out), "browser")
     assert _check(k6eval.browser_checks(o, 3), "browser.sessions")["value"] == 3
 
 
 @needs_docker
-def test_forwarder_never_listens_the_browser_does_not_start(tmp_path):
-    """Bounded: no forward within FORWARD_WAIT_S -> no browser run, rc 3,
-    and the run is INVALID with the reason."""
-    p, out = _browser_pod_in_docker(tmp_path, forward_delay_s=0, forward=False, forward_wait_s=5)
+def test_origin_never_answers_the_browser_does_not_start(tmp_path):
+    """Bounded: no answer within ORIGIN_WAIT_S -> no browser run, rc 3, and
+    the run is INVALID with the reason."""
+    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=0, origin=False, origin_wait_s=5)
     assert p.returncode == 3 and "did not answer within 5s: not starting the browser" in p.stderr
     fw = json.loads((out / "browser-forward.json").read_text())
-    assert fw == {"kind": "forward_wait", "ok": False, "url": "http://127.0.0.1:8080/", "waited_s": fw["waited_s"]}
+    assert fw["kind"] == "forward_wait" and fw["ok"] is False and fw["url"].endswith(":8080/")
     c = k6eval.browser_checks(k6eval.read_k6_out(str(out), "browser"), 3)[0]
     assert c["check"] == "browser.stream_complete" and c["result"] == "FAIL" and "rc=3" in c["why"]
-
-
-def test_forward_probe_passes_only_once_every_local_port_listens(tmp_path):
-    """forward.py --probe (the sidecar's startupProbe) fails while any local
-    port is not listening yet (run 11's race) and passes once the forwarder
-    listens on all of them. The targets are the wrapper's bounded wait's job:
-    a probe on them could hold the pod in Init unbounded."""
-    import socket as so
-
-    def free_port():
-        s = so.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
-        return port
-
-    target = so.socket()
-    target.bind(("127.0.0.1", 0))
-    target.listen()
-    tport, l1, l2 = target.getsockname()[1], free_port(), free_port()
-    specs = [f"{l1}=127.0.0.1:{tport}", f"{l2}=127.0.0.1:{tport}"]
-    fwd = [sys.executable, str(BENCH_DIR / "k6" / "forward.py")]
-    probe = subprocess.run(fwd + ["--probe", *specs], capture_output=True, text=True)
-    assert probe.returncode == 1 and f"127.0.0.1:{l1} not accepting" in probe.stderr
-    p = subprocess.Popen(fwd + specs[:1], stdout=subprocess.PIPE, text=True)
-    try:
-        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l1}")
-        # one of two ports listening is not ready
-        probe = subprocess.run(fwd + ["--probe", *specs], capture_output=True, text=True)
-        assert probe.returncode == 1 and f"127.0.0.1:{l2} not accepting" in probe.stderr
-    finally:
-        p.kill()
-        p.wait()
-    p = subprocess.Popen(fwd + specs, stdout=subprocess.PIPE, text=True)
-    try:
-        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l1}")
-        assert p.stdout.readline().startswith(f"forward 127.0.0.1:{l2}")
-        assert subprocess.run(fwd + ["--probe", *specs]).returncode == 0
-    finally:
-        p.kill()
-        p.wait()
-        target.close()
 
 
 @needs_docker
@@ -1586,8 +1527,9 @@ def test_navigate_js_reads_no_url_tags_and_keeps_tokens_out_of_out():
 
 def _run606_k6(harness, **env):
     e, state, _, tmp = harness
+    # PREFLIGHT_TIMEOUT_S: a preflight Job that never answers fails in seconds, not 300
     e = dict(e, LOAD_DRIVER="k6", USERS="20", THINK_S="1", COMPOSITE_BURST_USERS="5",
-             BROWSER_SESSIONS="3", **env)
+             BROWSER_SESSIONS="3", PREFLIGHT_TIMEOUT_S="10", PREFLIGHT_POLL_S="0.5", **env)
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=e,
                        capture_output=True, text=True, timeout=300)
     return p, _calls(state), tmp / "out"
@@ -1627,10 +1569,28 @@ def test_run606_k6_end_to_end(harness):
     bcm = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "k6browser")
     assert json.loads(bcm["data"]["browser-config.json"])["frontendUrl"] == "http://10.0.0.9"
     # each menu class k6 drives got its own preflight (run606 s_classes)
-    assert "menu class bench-platform-admins+devs: preflight as its lowest-index k6 user" in log
+    # each menu class's walk, as its OWN identity (#999 review N2): its Job applied, its own table
+    plan = json.loads((out / "menu-classes.json").read_text())["classes"]
+    assert [c["class"] for c in plan] == ["bench-platform-admins+devs", "devs"]
+    for k, c in enumerate(plan, 1):
+        assert f"menu class {c['class']}: preflight as its own identity" in log
+        job = next(d for d in yaml.safe_load_all((out / f"class-preflight-{k}-job.yaml").read_text())
+                   if d and d["kind"] == "Job")
+        assert job["metadata"]["name"] == f"preflight606-c{k}"
+        assert f'--user "{c["user"]}"' in job["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    applied = (state_dir(harness) / "applied-jobs").read_text().split()
+    assert {"preflight606", "preflight606-c1", "preflight606-c2"} <= set(applied)
     cfg = json.loads(next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "k6")
                      ["data"]["config.json"])
     assert set(cfg["menuClasses"]) == {"bench-platform-admins+devs", "devs"}
+    # each class's table is ITS Job's walk (the fake gives each Job a route of its own), never the run's
+    for k, c in enumerate(plan, 1):
+        paths = [r["path"] for r in cfg["menuClasses"][c["class"]]]
+        assert paths == ["/dashboard", "/observability", "/compositions", f"/only-c{k}"], (c["class"], paths)
+    assert [r["path"] for r in cfg["routes"]] == ["/dashboard", "/observability", "/compositions"]
+    # the identities are deleted after their walks (and again at collect)
+    dels = [c["argv"] for c in calls if c["tool"] == "kubectl" and "delete" in c["argv"]]
+    assert any("bench.krateo.io/menu-class=true" in a for d in dels for a in d)
     assert v["report"]["navs"] == 60                       # the browsers' page loads
     jp = [json.loads(x) for x in (out / "job-pods.jsonl").read_text().splitlines()]
     assert {r["job"] for r in jp} >= {"k6load", "k6browser", "fresh606", "mem606"}
@@ -1685,3 +1645,21 @@ def test_run606_k6_missing_browser_output_is_invalid(harness):
 def _one_class(i):
     """Every user in one menu class (the tests' portal has one menu)."""
     return "devs"
+
+
+
+def state_dir(harness):
+    """The fake tools' state dir (the harness's second member)."""
+    return harness[1]
+
+
+def test_run606_k6_a_refused_menu_class_preflight_stops_the_run(harness):
+    """#999 review B2 (M25): the admins' class preflight alone refuses: the
+    run stops at the classes step, naming the class, before the reboot and
+    the load; the run's own preflight passed."""
+    p, calls, out = _run606_k6(harness, FAKE_PREFLIGHT_REFUSE_JOB="preflight606-c1")
+    log = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert "preflight OK (the run;" in log
+    assert "PREFLIGHT REFUSED: /dashboard -> 500" in log and "(menu class bench-platform-admins+devs)" in log
+    assert "=== step reboot ===" not in log and "=== step measure ===" not in log

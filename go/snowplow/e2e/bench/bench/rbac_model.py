@@ -25,6 +25,7 @@ so the run proof can state the population shape it measured.
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 __all__ = [
     "RbacModel",
@@ -85,17 +86,35 @@ def team_namespace(ns_index: int) -> str:
     return f"bench-ns-{ns_index:02d}"
 
 
+def rbac_yaml(namespaces: int) -> list[str]:
+    """Every RBAC document the data step applies (data606), in its order:
+    each team's Role + RoleBinding, then the admins' ClusterRole + binding."""
+    return [namespace_rbac_yaml(n) for n in range(1, namespaces + 1)] + [admin_rbac_yaml()]
+
+
+@functools.lru_cache(maxsize=None)
+def grant_scopes(namespaces: int) -> dict[str, tuple[str, ...]]:
+    """{group: the namespaces the bench's RBAC binds it in ("*": a
+    ClusterRoleBinding)}, READ from the documents the data step applies
+    (rbac_yaml), never paired by name (#999 review N3)."""
+    import yaml
+    out: dict[str, set[str]] = {}
+    for text in rbac_yaml(namespaces):
+        for d in yaml.safe_load_all(text):
+            if not isinstance(d, dict) or d.get("kind") not in ("RoleBinding", "ClusterRoleBinding"):
+                continue
+            where = d["metadata"]["namespace"] if d["kind"] == "RoleBinding" else "*"
+            for sub in d.get("subjects") or []:
+                if sub.get("kind") == "Group":
+                    out.setdefault(sub["name"], set()).add(where)
+    return {g: tuple(sorted(ns)) for g, ns in out.items()}
+
+
 def grant_scope(group: str, m: RbacModel) -> tuple[str, ...] | None:
-    """Where this model's bindings let `group` read: its team's namespace
-    (namespace_rbac_yaml), ("*",) for the admins' ClusterRoleBinding
-    (admin_rbac_yaml), None for a group the bench does not bind at all (the
-    portal's base group: its grants are the platform's own)."""
-    for n in range(1, m.namespaces + 1):
-        if group == team_group(n):
-            return (team_namespace(n),)
-    if m.admins and group == ADMIN_GROUP:
-        return ("*",)
-    return None
+    """Where the bench's RBAC lets `group` read (grant_scopes); None for a
+    group the bench does not bind at all (the portal's base group: its
+    grants are the platform's own)."""
+    return grant_scopes(m.namespaces).get(group)
 
 
 def menu_class(groups, m: RbacModel) -> str:

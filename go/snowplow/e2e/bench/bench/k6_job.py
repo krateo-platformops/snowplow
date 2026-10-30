@@ -48,7 +48,6 @@ K6_UID = 12345                      # the k6 images' user
 
 K6_CPU, K6_MEMORY = "4", "4Gi"
 BROWSER_CPU, BROWSER_MEMORY = "3", "4Gi"
-FORWARD_CPU, FORWARD_MEMORY = "100m", "64Mi"
 # 1,000 idle SSE reader threads + push refetches (run 10's driver carried them
 # inside its 3 CPU / 4Gi beside the navigation)
 VIEWER_CPU, VIEWER_MEMORY = "1", "2Gi"
@@ -99,15 +98,12 @@ def loadgen_fit(machine: str, requests: list[tuple[str, str]]) -> dict:
 
 
 def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
-                     viewers: bool = True, forwarder: bool = True) -> list[tuple[str, str]]:
+                     viewers: bool = True) -> list[tuple[str, str]]:
     """Every container the k6 plan puts on the loadgen node: k6 (+ its viewer
-    sidecar), the browser pod (Chrome + the forwarder sidecar), fresh606 and
-    mem606."""
+    sidecar), the browser (Chrome), fresh606 and mem606."""
     return ([(k6_cpu or K6_CPU, K6_MEMORY)]
             + ([(VIEWER_CPU, VIEWER_MEMORY)] if viewers else [])
-            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY)]
-            + ([(FORWARD_CPU, FORWARD_MEMORY)] if forwarder else [])
-            + [(FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
+            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
 
 
 def browser_sessions(m: rbac_model.RbacModel, n: int = 5,
@@ -173,17 +169,6 @@ def k6_users(users: int, burst_users: int, browser_users=()) -> tuple[list[int],
     return nav_ids, burst_ids
 
 
-def menu_class_representatives(class_of, users: int, burst_users: int, browser_users=()) -> dict[str, int]:
-    """{menu class: the lowest-index user of it k6 drives} — the user each
-    class's preflight signs in as (run606 s_classes), so its table is one
-    such user's real menu."""
-    nav_ids, burst_ids = k6_users(users, burst_users, browser_users)
-    reps: dict[str, int] = {}
-    for i in sorted(nav_ids + burst_ids):
-        reps.setdefault(class_of(i), i)
-    return reps
-
-
 def _table(routes) -> list[dict]:
     return [{"path": r["path"], "endpoint": r["endpoint"]} for r in routes]
 
@@ -232,12 +217,11 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
 def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
                    page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
-                   frontend_url: str = "http://localhost:8080",
-                   snowplow_url: str = "http://localhost:8081",
+                   frontend_url: str, snowplow_url: str,
                    fresh: dict | None = None) -> dict:
     """`fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
-    in order; `snowplow_url`: snowplow as the browser pod reaches it (its
-    forward), where a session reads the learned-class counters."""
+    in order; `frontend_url`: the portal's origin; `snowplow_url`: snowplow as the browser reaches it (config
+    SNOWPLOW_API_BASE_URL), where a session reads the learned-class counters."""
     by_session = {x["session"]: [f["user"] for f in x["fresh"]] for x in (fresh or {}).get("sessions", [])}
     return {"sessions": [dict({k: s[k] for k in ("name", "user", "offset")}, fresh=by_session.get(s["name"], []))
                          for s in sessions],
@@ -468,34 +452,31 @@ spec:
 """
 
 
-# Run 11 (#831 follow-up): 4 of 5 sessions met net::ERR_CONNECTION_REFUSED on
-# localhost:8080 — Chrome was up before the forward sidecar listened (plain
-# containers start together). Three layers, each bounded: the forwarder is a
-# NATIVE sidecar (initContainers, restartPolicy Always) whose startupProbe
-# (forward.py --probe) holds the browser container back until every local
-# port accepts; the browser wrapper then waits for an HTTP answer through
-# every forward, i.e. from its target too (FORWARD_WAIT_S, else rc 3: INVALID
-# with the reason); browser.js retries its first navigation.
-FORWARD_WAIT_S = 180
-FORWARD_PROBE_PERIOD_S = 2
+# Run 11 (#831 follow-up): 4 of 5 sessions met net::ERR_CONNECTION_REFUSED —
+# Chrome navigated before what it loads the portal through answered. The
+# browser wrapper waits for an HTTP answer from the portal's ORIGIN first
+# (ORIGIN_WAIT_S, else rc 3: INVALID with the reason); browser.js retries its
+# first navigation. (Runs 11-17 loaded it through a localhost forwarder
+# sidecar; run 19 loads it from the platform gateway's origin, as on 057. The
+# wait's record keeps its name, browser-forward.json, which evaluate reads.)
+ORIGIN_WAIT_S = 180
 # one attempt's whole time (#834 review): `wget -T` is a read-IDLE timeout,
-# so a port that streams at / kept one attempt open forever. A stream that
+# so a URL that streams at / kept one attempt open forever. A stream that
 # sent its headers has answered; busybox `timeout` ends the attempt.
-FORWARD_ATTEMPT_S = 10
+ORIGIN_ATTEMPT_S = 10
 
 
-def _forward_wait(urls: list[str], wait_s: int) -> str:
-    """POSIX sh (busybox): every URL (a forward's 127.0.0.1:<port>/, or the
-    portal's own origin) answers HTTP (any status; busybox wget prints
-    `HTTP/` only when a server answered) within wait_s; each attempt ends
-    within FORWARD_ATTEMPT_S (+2 s to kill), so the wait overruns wait_s by
-    at most one attempt. Writes /out/browser-forward.json either way."""
-    return f"""wait_forwards() {{
-  t0=$(date +%s); end=$((t0 + ${{FORWARD_WAIT_S:-{wait_s}}}))
+def _origin_wait(urls: list[str], wait_s: int) -> str:
+    """POSIX sh (busybox): every URL answers HTTP (any status; busybox wget
+    prints `HTTP/` only when a server answered) within wait_s; each attempt
+    ends within ORIGIN_ATTEMPT_S (+2 s to kill), so the wait overruns wait_s
+    by at most one attempt. Writes /out/browser-forward.json either way."""
+    return f"""wait_origin() {{
+  t0=$(date +%s); end=$((t0 + ${{ORIGIN_WAIT_S:-{wait_s}}}))
   for u in {" ".join(urls)}; do
-    until timeout -k 2 {FORWARD_ATTEMPT_S} wget -q -T 5 -S -O /dev/null "$u" 2>&1 | grep -q 'HTTP/'; do
+    until timeout -k 2 {ORIGIN_ATTEMPT_S} wget -q -T 5 -S -O /dev/null "$u" 2>&1 | grep -q 'HTTP/'; do
       if [ "$(date +%s)" -ge "$end" ]; then
-        echo "$u did not answer within ${{FORWARD_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
+        echo "$u did not answer within ${{ORIGIN_WAIT_S:-{wait_s}}}s: not starting the browser" >&2
         printf '{{"kind": "forward_wait", "ok": false, "url": "%s", "waited_s": %s}}\\n' "$u" "$(( $(date +%s) - t0 ))" > /out/browser-forward.json
         return 3
       fi
@@ -507,52 +488,17 @@ def _forward_wait(urls: list[str], wait_s: int) -> str:
 """
 
 
-def _forwarder(forwards: list[str], forward_wait_s: int) -> str:
-    fwd = ", ".join(json.dumps(f) for f in forwards)
-    probes = math.ceil(forward_wait_s / FORWARD_PROBE_PERIOD_S)
-    return f"""      initContainers:
-      # a native sidecar (restartPolicy Always): it starts first, the browser
-      # container only once its startupProbe passed, and it never holds the
-      # Job open
-      - name: forward
-        image: {PY_IMAGE}
-        restartPolicy: Always
-        command: ["python3", "-u", "/opt/k6/forward.py", {fwd}]
-        startupProbe:
-          exec:
-            command: ["python3", "/opt/k6/forward.py", "--probe", {fwd}]
-          periodSeconds: {FORWARD_PROBE_PERIOD_S}
-          timeoutSeconds: 10
-          failureThreshold: {probes}
-        resources:
-          requests:
-            cpu: {json.dumps(FORWARD_CPU)}
-            memory: {FORWARD_MEMORY}
-        volumeMounts:
-        - name: k6
-          mountPath: /opt/k6
-"""
-
-
-def render_browser(*, config: dict, forwards: list[str], linger_s: float,
+def render_browser(*, config: dict, linger_s: float,
                    cpu: str = BROWSER_CPU, memory: str = BROWSER_MEMORY,
-                   forward_wait_s: int = FORWARD_WAIT_S) -> str:
-    """ConfigMap k6browser (script + config [+ forwarder]) + the k6browser
-    Job: Chrome through k6 browser. With `forwards`, behind the localhost
-    forwarder (a native sidecar Chrome waits for); without, Chrome loads the
-    portal from its own origin (config frontendUrl: the platform gateway, as
-    on 057) and waits for that origin to answer."""
+                   origin_wait_s: int = ORIGIN_WAIT_S) -> str:
+    """ConfigMap k6browser (script + config) + the k6browser Job: Chrome
+    through k6 browser, loading the portal from its own origin (config
+    frontendUrl: the platform gateway, as on 057) once that origin answers."""
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
              "pageload.js": (K6_DIR / "pageload.js").read_text(),
              "browser-config.json": json.dumps(config, indent=1)}
-    if forwards:
-        files["forward.py"] = (K6_DIR / "forward.py").read_text()
-        urls = [f"http://127.0.0.1:{f.split('=', 1)[0]}/" for f in forwards]
-    else:
-        urls = [config["frontendUrl"].rstrip("/") + "/"]
-    run = (_forward_wait(urls, forward_wait_s) + "wait_forwards && "
+    run = (_origin_wait([config["frontendUrl"].rstrip("/") + "/"], origin_wait_s) + "wait_origin && "
            "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
-    sidecar = _forwarder(forwards, forward_wait_s) if forwards else ""
     return _configmap("k6browser", files) + f"""---
 apiVersion: batch/v1
 kind: Job
@@ -566,14 +512,13 @@ spec:
       labels:
         app: k6browser
       annotations:
-        # collect's `kubectl exec` / `cp` reach the browser's /out, never the
-        # forwarder sidecar's
+        # collect's `kubectl exec` / `cp` reach the browser's /out
         kubectl.kubernetes.io/default-container: browser
     spec:
 {_POOL}
       securityContext:
         fsGroup: {K6_UID}
-{sidecar}      containers:
+      containers:
       - name: browser
         image: {K6_BROWSER_IMAGE}
         command: ["/bin/sh", "-c"]

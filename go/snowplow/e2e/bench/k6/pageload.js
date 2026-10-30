@@ -57,9 +57,12 @@ export const OBSERVER = `(() => {
   }, true);
   // live updates: each SSE stream counted when it OPENS (an answered request).
   // The SPA reads both with fetch + Bearer (refreshSse.ts; sseClient.ts from
-  // frontend 1.8.11, 18df61d): a fetch whose response is ok opened its
-  // stream. An older SPA opens /notifications as an EventSource: counted at
-  // its 'open'.
+  // frontend 1.8.11, 18df61d): a fetch opened its stream when the response
+  // is ok AND an event stream. An ok response of another type is not one:
+  // behind a path-mode gateway a path no route claims falls to the SPA,
+  // whose nginx answers 200 text/html (try_files ... /index.html; #999
+  // review B1). An older SPA opens /notifications as an EventSource: counted
+  // at its 'open' (the browser opens one only on text/event-stream).
   const sse = window.__benchSse = { refreshes: 0, notifications: 0 };
   const sseStreamOf = ${sseStreamOf.toString()};
   const f = window.fetch;
@@ -67,7 +70,10 @@ export const OBSERVER = `(() => {
     const s = sseStreamOf(String((input && input.url) || input), window.location.href);
     const p = f.apply(this, arguments);
     if (s) {
-      p.then((r) => { if (r.ok) sse[s]++ }, () => {});
+      p.then((r) => {
+        const type = (r.headers && r.headers.get && r.headers.get('content-type')) || '';
+        if (r.ok && type.toLowerCase().indexOf('text/event-stream') === 0) sse[s]++
+      }, () => {});
     }
     return p;
   };

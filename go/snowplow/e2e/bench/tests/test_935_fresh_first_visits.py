@@ -84,10 +84,11 @@ def test_the_browser_config_carries_each_sessions_fresh_users():
     sessions = k6_job.browser_sessions(m, 2)
     p = fresh_classes.plan(sessions=2, routes=2, think_s=10, duration_s=120, namespaces=2, user_prefix="scaleuser-")
     cfg = k6_job.browser_config(sessions=sessions, routes=["/a", "/b"], password="pw", think_s=10,
-                                duration_s=120, fresh=p)
+                                duration_s=120, fresh=p, frontend_url="http://10.0.0.9",
+                                snowplow_url="http://10.0.0.9/content")
     # 2 routes x 10 s: a 40 s class cycle; 120 s: 3 classes, the initial user and 2 fresh
     assert cfg["sessions"][1]["fresh"] == ["scaleuser-fresh-2-001", "scaleuser-fresh-2-002"]
-    assert cfg["snowplowUrl"] == "http://localhost:8081"
+    assert cfg["snowplowUrl"] == "http://10.0.0.9/content" and cfg["frontendUrl"] == "http://10.0.0.9"
 
 
 # ─── browser.js's pure parts (node) ──────────────────────────────────────────
@@ -315,7 +316,8 @@ def test_run606_creates_hands_on_and_cleans_up_the_fresh_classes(harness):  # no
     assert [s["fresh"] for s in bcfg["sessions"]] == [[f["user"] for f in s["fresh"]] for s in plan["sessions"]]
     # cleaned up at collect: by label, and every user's clientconfig Secret by name
     deletes = [c["argv"] for c in calls if c["tool"] == "kubectl" and "delete" in c["argv"]
-               and ("bench.krateo.io/fresh-class=true" in c["argv"] or any(x.endswith("-clientconfig") for x in c["argv"]))]
+               and ("bench.krateo.io/fresh-class=true" in c["argv"]
+                    or any(x.endswith("-clientconfig") and "fresh-" in x for x in c["argv"]))]   # not the menu classes
     assert len(deletes) == 4 and all(f"{u}-clientconfig" in deletes[-1] for u in users)
     assert "fresh classes cleaned up" in log
     # no fresh user's name in what run606 prints

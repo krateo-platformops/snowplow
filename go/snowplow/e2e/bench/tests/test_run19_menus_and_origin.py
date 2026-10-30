@@ -27,11 +27,11 @@ import sys
 import pytest
 import yaml
 
-from bench import k6_job, k6eval, load606, load606_job, rbac_model
+from bench import k6_job, k6eval, load606, load606_job, menu_classes, rbac_model
 from tests.test_k6_830 import INIT, NODE, NS, needs_node
 from tests.test_run606_real_sequence import BENCH_DIR
 
-M = rbac_model.RbacModel(users=1000, namespaces=50)
+M = rbac_model.bench_model(1000, 50)
 ADMINS = "bench-platform-admins+devs"
 
 
@@ -55,16 +55,46 @@ def test_a_users_menu_class_is_its_groups_less_those_confined_to_bench_data():
     assert rbac_model.menu_class(["devs", rbac_model.ADMIN_GROUP], none) == f"{rbac_model.ADMIN_GROUP}+devs"
 
 
-def test_each_class_is_preflighted_as_its_lowest_index_k6_user():
+def test_each_class_is_preflighted_as_a_dedicated_identity_no_k6_user_shares():
+    """#999 review N2: the walk signs in as an identity whose groups are
+    exactly the class's kept groups. It is in the class by menu_class's own
+    definition, and no k6 user has its group set (every one carries a team
+    group), so it teaches snowplow no identity class the run measures."""
+    labels = load606_job.menu_classes_driven(1000, 50, 5, 200, False)
+    assert labels == sorted([ADMINS, "devs"])
+    p = menu_classes.plan(labels, "scaleuser-")
     sessions = k6_job.browser_sessions(M, 5, last=799)
-    browser = [s["index"] for s in sessions]
-    reps = k6_job.menu_class_representatives(_class, 1000, 200, browser)
-    nav, burst = k6_job.k6_users(1000, 200, browser)
-    assert set(reps) == {ADMINS, "devs"}
-    for c, i in reps.items():
-        assert i in nav + burst and i not in browser and _class(i) == c
-        assert all(_class(j) != c for j in nav + burst if j < i)
-    assert reps[ADMINS] == min(i for i in nav if i <= 10)       # user 1 is a browser session
+    nav, burst = k6_job.k6_users(1000, 200, [x["index"] for x in sessions])
+    driven = {tuple(sorted(rbac_model.user_groups(i, M))) for i in nav + burst}
+    names = {f"scaleuser-{i:04d}" for i in range(0, 1001)}
+    for c in p["classes"]:
+        assert rbac_model.menu_class(c["groups"], M) == c["class"]
+        assert tuple(sorted(c["groups"])) not in driven and c["user"] not in names
+    assert [c["user"] for c in p["classes"]] == ["scaleuser-menuclass-1", "scaleuser-menuclass-2"]
+
+
+def test_the_class_identities_manifest_and_cleanup():
+    p = menu_classes.plan([ADMINS, "devs"], "scaleuser-")
+    docs = [json.loads(d) for d in menu_classes.manifest(p, "pw").split("\n---\n")]
+    users = [d for d in docs if d["kind"] == "User"]
+    assert sorted(sorted(u["spec"]["groups"]) for u in users) == [["bench-platform-admins", "devs"], ["devs"]]
+    assert all(d["metadata"]["labels"][menu_classes.LABEL] == "true" for d in docs)
+    assert not any(d["kind"] in ("RoleBinding", "ClusterRoleBinding") for d in docs)   # its groups' grants only
+    cl = menu_classes.cleanup_targets(p)
+    assert ["scaleuser-menuclass-1-clientconfig", "scaleuser-menuclass-2-clientconfig"] == cl[-1][-2:]
+
+
+def test_grant_scope_reads_the_rbac_the_data_step_applies():
+    """#999 review N3: each group's namespaces come from the RoleBindings and
+    ClusterRoleBindings rbac_yaml renders (what data606 applies), not from a
+    pairing of names."""
+    for text in rbac_model.rbac_yaml(M.namespaces):
+        for d in yaml.safe_load_all(text):
+            if d and d["kind"] == "RoleBinding":
+                assert rbac_model.grant_scope(d["subjects"][0]["name"], M) == (d["metadata"]["namespace"],)
+            if d and d["kind"] == "ClusterRoleBinding":
+                assert rbac_model.grant_scope(d["subjects"][0]["name"], M) == ("*",)
+    assert rbac_model.grant_scope("devs", M) is None
 
 
 def _args(**kw):
@@ -77,11 +107,9 @@ def _args(**kw):
     return base
 
 
-def test_class_reps_prints_each_class_and_its_user(capsys):
-    assert load606_job.main(_args(class_reps=True)) == 0
-    lines = [ln.split("\t") for ln in capsys.readouterr().out.splitlines()]
-    assert [c for c, _ in lines] == sorted([ADMINS, "devs"])
-    assert all(u.startswith("scaleuser-") for _, u in lines)
+def test_menu_classes_prints_each_class_k6_drives(capsys):
+    assert load606_job.main(_args(menu_classes=True)) == 0
+    assert capsys.readouterr().out.splitlines() == sorted([ADMINS, "devs"])
 
 
 def test_a_class_preflight_job_has_its_own_name():
@@ -163,16 +191,16 @@ def test_the_browser_loads_the_portal_from_its_origin_with_no_forwarder(tmp_path
     assert cfg["menuClasses"] == {ADMINS: ADMIN, "devs": DEVS} and cfg["userClass"]["2"] == ADMINS
 
 
-def test_without_an_origin_or_a_forward_the_render_refuses(tmp_path):
+def test_without_the_portals_origin_the_render_refuses_and_there_is_no_forwarder(tmp_path):
+    """#999 review N1: the four-origin localhost forwarder is gone, not
+    parked behind a flag: no --browser-forward, no forward.py, no sidecar."""
     p = _render(tmp_path)
     assert p.returncode != 0 and "--browser-origin" in p.stderr
-    assert _render(tmp_path, browser_forward="8080=frontend.krateo-system.svc:8080").returncode == 0
-
-
-def test_the_plan_counts_the_forwarder_only_when_there_is_one():
-    with_f = k6_job.k6_plan_requests(viewers=True)
-    without = k6_job.k6_plan_requests(viewers=True, forwarder=False)
-    assert len(with_f) == len(without) + 1 and (k6_job.FORWARD_CPU, k6_job.FORWARD_MEMORY) not in without
+    p = _render(tmp_path, browser_origin="http://10.0.0.9", browser_snowplow_url="http://10.0.0.9/content",
+                browser_forward="8080=frontend.krateo-system.svc:8080")
+    assert p.returncode == 2 and "unrecognized arguments: --browser-forward" in p.stderr
+    assert not (BENCH_DIR / "k6" / "forward.py").exists()
+    assert "forward" not in str(k6_job.k6_plan_requests()) and not hasattr(k6_job, "FORWARD_CPU")
 
 
 # ─── the portal's origin, as 057 serves it ──────────────────────────────────
@@ -344,7 +372,11 @@ class FakeES {
 }
 globalThis.window = {
   location: { href: 'http://10.0.0.9/dashboard', pathname: '/dashboard' },
-  fetch: (u) => Promise.resolve({ ok: cases.ok[String(u)] !== false }),
+  fetch: (u) => {
+    const type = (cases.types || {})[String(u)] ?? 'text/event-stream; charset=utf-8'
+    return Promise.resolve({ ok: cases.ok[String(u)] !== false,
+                             headers: { get: (h) => (h.toLowerCase() === 'content-type' ? type : null) } })
+  },
   EventSource: FakeES, addEventListener () {}, PerformanceObserver: undefined,
 }
 globalThis.document = { querySelectorAll: () => [], addEventListener () {} }
@@ -384,3 +416,19 @@ def test_a_notifications_fetch_that_answered_ok_is_an_opened_stream(tmp_path):
     assert out["streamOf"] == ["notifications", "notifications", "notifications", "refreshes", None, None, None, None]
     # two ok /notifications fetches + the EventSource 'open'; the 401 one is not a stream
     assert out["sse"] == {"refreshes": 1, "notifications": 3}
+
+
+@needs_node
+def test_an_ok_response_that_is_not_an_event_stream_is_no_stream(tmp_path):
+    """#999 review B1: behind a path-mode gateway, a path no route claims
+    falls to the SPA, whose nginx answers 200 text/html (try_files ...
+    /index.html). The installer writes /events into config.json even when it
+    emits no /events route, so the origin gate cannot see it. That fallback
+    page is not an opened stream: only an ok text/event-stream response is."""
+    html = "http://10.0.0.9/events/notifications"
+    out = _probe(tmp_path, {
+        "urls": [], "fetched": [html, "http://10.0.0.9/content/refreshes", "http://10.0.0.9/x/notifications"],
+        "ok": {}, "sources": [],
+        "types": {html: "text/html; charset=utf-8", "http://10.0.0.9/content/refreshes": "text/html",
+                  "http://10.0.0.9/x/notifications": ""}})
+    assert out["sse"] == {"refreshes": 0, "notifications": 0}
