@@ -205,6 +205,20 @@ func writesOnEveryCall1011(t *testing.T, named bool) {
 	if n := u.sent(http.MethodPost); n != 3 {
 		t.Fatalf("cold call: %d POSTs reached the upstream, want 3 (one per item)", n)
 	}
+	// The verb gate comes first (#1012 review M12): a write's cold call does
+	// not take the cold-cell path at all — no cold fallback, no async
+	// cluster-scope populate scheduled for it — and the deny gate is 9.
+	if _, cold := cache.ClusterListCellCounters(); cold != 0 {
+		<-populated1011 // let the populate it scheduled end before failing
+		t.Fatalf("#1011 W RED (M12): a write's cold call took the cold-cell path (cold fallbacks %d) and scheduled a cluster-scope populate", cold)
+	}
+	if n := len(populated1011); n != 0 {
+		t.Fatalf("#1011 W RED (M12): a write's cold call scheduled %d cluster-scope populate(s)", n)
+	}
+	if _, used, gate := attemptClusterListCollapse(ctx, clusterListLogger(t), stage, map[string]any{},
+		endpoints.Endpoint{}, cache.ResolvedCache(), true); used || gate != 9 {
+		t.Fatalf("#1011 W RED (M12): a write stage's collapse decision is used=%v deny gate %d, want false and 9", used, gate)
+	}
 	warmCell1011(t, ctx)
 	raw := resolve1011(t, ctx, u, stage)
 	if n := u.sent(http.MethodPost) - 3; n != 3 {
