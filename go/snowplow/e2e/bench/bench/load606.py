@@ -2271,8 +2271,14 @@ def content_fill_report(mem: list[dict], bucket_s: float = CONTENT_FILL_BUCKET_S
 #   snowplow_store_verification (#875 @ 0934e202, re-checked from 01d32632:
 #     two stats added, none renamed; cache/store_verify_stats.go, statsByTag:
 #     the map's keys are the stat tags):
+#     how the forced pass judges its candidates, read by the mechanism the
+#     build publishes (#995, bench/store_verify.py): to 1.12.58 the recheck
 #     store_divergence_recheck_gets_total / _cleared_total /
-#     _undelivered_total / _unavailable_total, the
+#     _undelivered_total / _unavailable_total; from 1.12.59 (#923 @ 102ed658)
+#     the lost-update rule's store_divergence_{cleared,store_ahead,received,
+#     undecided,unrecorded}_total, store_divergence_pending_{resolved_lost,
+#     resolved_received,superseded}_total, the pending gauges and
+#     snowplow_store_verification_pending_by_gvr {gvr}; on both the
 #     store_divergent_{lost_update,lost_delete,lost_add,uid_mismatch}_
 #     {snapshot,forced}_total findings, store_divergence_candidates_total,
 #     store_repairs_fired_total (one per relist the cache.store.repair line
@@ -2406,17 +2412,18 @@ def list_incremental_report(mem: list[dict], fresh: list[dict] | None = None) ->
                      "whose single content fill is the biggest (max_bytes, last sample)")}
 
 
-def _store_verify_counters(m: dict) -> dict | None:
+def _store_verify_counters(m: dict, judging: str | None = None) -> dict | None:
+    """One sample's store-verification counters: the families every build
+    publishes, and the candidate-judging mechanism's own (#995,
+    bench/store_verify.py: `judging`, read once for the whole run)."""
+    from bench import store_verify
     extra = m.get("extra") or {}
     v = extra.get(STORE_VERIFY_KEY)
     if not isinstance(v, dict):
         return None
-    out = {k: _num(v.get(k)) for k in ("store_divergence_recheck_gets_total",
-                                        "store_divergence_recheck_cleared_total",
-                                        "store_divergence_recheck_undelivered_total",
-                                        "store_divergence_recheck_unavailable_total",
-                                        "store_divergence_candidates_total", "store_verifications_total",
+    out = {k: _num(v.get(k)) for k in ("store_divergence_candidates_total", "store_verifications_total",
                                         *_STORE_FINDINGS, *_STORE_REPAIRS)}
+    out |= {f"judge/{k}": n for k, n in store_verify.counters(v, judging).items()}
     return out | _flat("skipped", extra.get(STORE_VERIFY_SKIPPED_KEY))
 
 
@@ -2430,13 +2437,24 @@ STORE_REPAIR_NOTES = {
 
 
 def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) -> dict:
-    """#875, per phase: the forced pass's re-check GETs and the candidates
-    they cleared; the candidates counted WITHOUT a re-check — nothing
-    delivered for the key during the pass (undelivered), or the GVR has no
-    delivery record (unavailable: verified the pre-#872 way); the verification findings (divergences by class and site,
-    raw candidates), the verifications skipped by reason, and the repairs
-    (fired, and ineffective / unsupported / suppressed)."""
-    r = _phase_counter_report(mem, fresh, STORE_VERIFY_KEY, _store_verify_counters)
+    """Per phase: the verification findings (divergences by class and site,
+    raw candidates), the verifications skipped by reason, the repairs (fired,
+    and ineffective / unsupported / suppressed), and how the build judged the
+    candidates — read by the mechanism it PUBLISHES (#995, bench/store_verify.py):
+    the recheck (#875, to 1.12.58: re-check GETs, cleared, undelivered,
+    unavailable) or the lost-update rule (#918/#923, from 1.12.59: cleared,
+    store-ahead, received, undecided, pending), the shared quantities under one
+    name (no_delivery_record; each its own cleared count), the rest `not_published`
+    for the other."""
+    from bench import store_verify
+    # every sample's (mechanism, why): one mechanism on every sample is the
+    # run's; a sample that publishes neither or both, or a mid-run change,
+    # makes the run read none (#996 review F3/F6)
+    seen = {store_verify.mechanism(m.get("extra") or {}) for m in mem
+            if m.get("kind") == "mem" and isinstance((m.get("extra") or {}).get(STORE_VERIFY_KEY), dict)}
+    mechs = {mm for mm, _ in seen}
+    judging = next(iter(mechs)) if len(mechs) == 1 else None
+    r = _phase_counter_report(mem, fresh, STORE_VERIFY_KEY, lambda m: _store_verify_counters(m, judging))
     if r["status"] == REPORT_ABSENT:
         return r
     last = r.pop("last")
@@ -2446,10 +2464,9 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
         c = p["counters"]
         out[name] = {
             "seconds": p["seconds"], "pairs": p["pairs"],
-            "recheck_gets": c.get("store_divergence_recheck_gets_total"),
-            "recheck_cleared": c.get("store_divergence_recheck_cleared_total"),
-            "recheck_undelivered": c.get("store_divergence_recheck_undelivered_total"),
-            "recheck_unavailable": c.get("store_divergence_recheck_unavailable_total"),
+            **({k.split("/", 1)[1]: c.get(k) for k in
+                [f"judge/{n}" for n, _ in store_verify.COMMON[judging] + store_verify.OWN[judging]]}
+               if judging else {}),
             "verifications": c.get("store_verifications_total"),
             "findings": {k[len("store_divergent_"):-len("_total")]: c.get(k) for k in _STORE_FINDINGS},
             "divergence_candidates": c.get("store_divergence_candidates_total"),
@@ -2467,8 +2484,17 @@ def store_verification_report(mem: list[dict], fresh: list[dict] | None = None) 
     if mech is not None:
         gauges |= {k: v for k, v in store_rebuild.gauges(ex, mech).items()
                    if not k.endswith(".schema")}
+    jwhy = store_verify.mechanism(ex)[1]
     return {"status": "present", "by_phase": out, "samples": r["samples"], "restarts": r["restarts"],
             "mechanism": mech, "mechanism_identified_by": why,
+            # how the build judges a forced pass's candidates (#995); several in one run: none is read
+            "judging": judging, "judging_identified_by": (
+                jwhy if judging else "the samples do not publish one mechanism: "
+                + "; ".join(sorted({f"{mm or 'none'} ({w})" for mm, w in seen}))),
+            "judging_how": store_verify.MECHANISMS[judging]["how"] if judging else None,
+            "judging_note": store_verify.NOTES.get(judging),
+            "not_published": list(store_verify.NOT_PUBLISHED[judging]) if judging else None,
+            "judging_gauges_last": store_verify.gauges(ex, judging),
             "gauges_last": gauges,
             "note": (STORE_REPAIR_NOTES.get(mech, f"the repair mechanism is not known ({why}): its gauges "
                                                   f"are not read")
@@ -3624,7 +3650,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         if report["list_narrow_shadow_report_only"]["status"] == LIST_NARROW_ABSENT else [])
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["list_incremental_report_only"] = list_incremental_report(mem or [], phase_src)
-    report["store_verification_report_only"] = store_verification_report(mem or [], phase_src)
+    report["store_verification_report_only"] = sv = store_verification_report(mem or [], phase_src)
+    if sv["status"] == "present" and sv.get("judging") is None:
+        report["report_warnings"].append(
+            f"store verification: how the build judges a forced pass's candidates is not read: "
+            f"{sv['judging_identified_by']}")
     # #969: store rebuilds (repairs and schema changes) under the build's own
     # mechanism — relist (to 1.12.59) or build-and-swap (#870, 1.12.60) — with
     # the same quantities on both, and the paired run's three watches
