@@ -48,9 +48,12 @@ fi
 REGION="${ZONE%-*}"
 # The cluster's TTL (the self-destruct CronJob and gke-reap read it). The
 # whole run's worst case must fit inside it, or the run is refused before any
-# cloud call (see the budget below). 11 h holds run 9's default plan (two
-# churn modes x 3 rates x 60 samples) with every bounded wait at its maximum.
-TTL_HOURS="${TTL_HOURS:-11}"
+# cloud call (see the budget below). 12 h holds run 9's default plan (two
+# churn modes x 3 rates x 60 samples) with every bounded wait at its maximum,
+# since run 19's two menu-class preflights and the portal-origin gate's own
+# window (#1005: 2 x the cdc's resync after the gateway's address) took the
+# 11 h plan past its margin.
+TTL_HOURS="${TTL_HOURS:-12}"
 INSTALLER_CHART="${INSTALLER_CHART:-oci://ghcr.io/krateo-platformops/charts/installer}"
 # Installer source: ONLY the published OCI chart (INSTALLER_VERSION).
 # Local-chart mode cannot work for this installer (run 4): its self-CD pulls
@@ -249,12 +252,21 @@ if [[ "$LOAD_DRIVER" == "k6" ]]; then
       --authn-url - --password - --init - --driver k6 | grep -c .)" \
     || { echo "refusing: the menu classes k6 drives could not be listed (bench.load606_job --menu-classes)" >&2; exit 2; }
 fi
+# the portal-origin gate's own window (#1005): ENDPOINT_WAIT_S for the platform
+# gateway's address (the one LoadBalancer the bench waits for; in-cluster
+# endpoints need none), then 2 x the installer cdc's resync + one poll. The
+# resync is read from the cluster at the gate; the budget takes the cdc's
+# compiled default (bench/origin_gate.py), and the gate logs a read interval
+# that exceeds it.
+ORIGIN_RESYNC_BUDGET_S="$(python3 -c 'import math; from bench import origin_gate; print(math.ceil(origin_gate.COMPILED_DEFAULT_S))')"
+ORIGIN_GATE_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1]) + 2 * float(sys.argv[2]) + float(sys.argv[3])))' \
+    "$ENDPOINT_WAIT_S" "$ORIGIN_RESYNC_BUDGET_S" "${PLATFORM_POLL_S:-60}")"
 RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
-                 + ENDPOINT_WAIT_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
+                 + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
 TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
-budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + env ${ENDPOINT_WAIT_S} + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -700,24 +712,44 @@ capped_definitions() {
         "$at" "$DEFS_CAP_S" "$(date +%s)" >> "$OUT/platform-definitions.jsonl"
   fi
 }
-# wait_portal_origin <deadline epoch>: the frontend's live config.json must
-# name ONE origin for snowplow, authn and sse-proxy, at 057's paths (load606
-# portal-origin). The installer writes those URLs once the platform gateway
-# has an address ("the next reconcile fills it", compositions.yaml); until
-# then the SPA keeps its localhost defaults. Re-read every PLATFORM_POLL_S
-# until the platform step's own deadline (no budget of its own); a portal
-# that is never same-origin stops the run HERE, before data and load are paid
-# for, with what config.json said.
+# wait_portal_origin (#1005): the frontend's live config.json must name ONE
+# origin for snowplow, authn and sse-proxy, at 057's paths (load606
+# portal-origin). The installer writes those URLs from a lookup of the
+# platform gateway Service's LoadBalancer address, re-rendered on every resync
+# of its composition-dynamic-controller, so they appear within ~2 resyncs of
+# the gateway having an address. The gate's OWN window (bench/origin_gate.py),
+# never what the platform's earlier waits left: up to ENDPOINT_WAIT_S for the
+# gateway's address, then 2 x the cdc's EFFECTIVE resync interval (read from
+# the cluster: its -resync-interval arg, else its env / envFrom ConfigMap,
+# else the compiled default) + one poll, from the first reading that has the
+# address. Interval, source and window are logged and recorded. Every poll
+# also records two read-only readings (the gateway's ingress; installer-
+# platform's helm revision), so a gate that runs out says which failure it
+# is: waiting on GCP, nothing reconciling, or an installer defect.
+PORTAL_GATEWAY_SVC="krateo-agent-gateway-platform"   # internalDataPlane: <gatewayRef>-platform carries the portal (installer compositions.yaml)
 wait_portal_origin() {
-  local deadline="$1" why=""
+  local why="" t0 now t_addr="" end resync_s resync_src ing hist v
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: read $FRONTEND_CONFIGMAP config.json until load606 portal-origin passes -> $OUT/portal-origin.env"
+    log "DRY: read the installer cdc's resync interval; read $FRONTEND_CONFIGMAP config.json until load606 portal-origin passes (gateway $PORTAL_GATEWAY_SVC address, then 2 x resync) -> $OUT/portal-origin.env"
     printf 'export PORTAL_ORIGIN=http://dry-run-gateway PORTAL_SNOWPLOW_URL=http://dry-run-gateway/content\n' \
         > "$OUT/portal-origin.env"
     # shellcheck disable=SC1091
     source "$OUT/portal-origin.env"
     return 0
   fi
+  t0="$(python3 -c 'import time; print(f"{time.time():.3f}")')"
+  "${K[@]}" -n krateo-system get deploy -o json > "$OUT/.cdc-deployments.json" 2>"$KERR" || true
+  "${K[@]}" -n krateo-system get configmap -o json > "$OUT/.cdc-configmaps.json" 2>"$KERR" || true
+  python3 -m bench.origin_gate resync --deployments "$OUT/.cdc-deployments.json" \
+      --configmaps "$OUT/.cdc-configmaps.json" > "$OUT/portal-origin-resync.json"
+  rm -f "$OUT/.cdc-deployments.json" "$OUT/.cdc-configmaps.json"
+  resync_s="$(python3 -c 'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["seconds"]))' "$OUT/portal-origin-resync.json")"
+  resync_src="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["source"])' "$OUT/portal-origin-resync.json")"
+  log "portal origin gate: the installer cdc resyncs every ${resync_s}s (${resync_src}); window: up to ${ENDPOINT_WAIT_S}s for the gateway's address, then 2 x ${resync_s}s + one ${PLATFORM_POLL_S}s poll"
+  if (( resync_s > ORIGIN_RESYNC_BUDGET_S )); then
+    log "WARNING: the cdc's resync (${resync_s}s) exceeds the run budget's ${ORIGIN_RESYNC_BUDGET_S}s: the gate's window is the cluster's, past the budget term"
+  fi
+  : > "$OUT/portal-origin-wait.jsonl"
   while :; do
     "${K[@]}" -n krateo-system get configmap "$FRONTEND_CONFIGMAP" \
         -o 'jsonpath={.data.config\.json}' > "$OUT/frontend-config.json" 2>"$KERR" || true
@@ -729,15 +761,24 @@ wait_portal_origin() {
       return 0
     fi
     why="$(cut -c1-600 "$OUT/.portal-origin.err")"
-    (( $(date +%s) < deadline )) || break
+    ing="$("${K[@]}" -n krateo-system get svc "$PORTAL_GATEWAY_SVC" \
+        -o 'jsonpath={.status.loadBalancer.ingress[*].ip}{.status.loadBalancer.ingress[*].hostname}' 2>/dev/null || true)"
+    hist="$("${H[@]}" history installer-platform -n krateo-system --max 1 -o json 2>/dev/null || true)"
+    now="$(python3 -c 'import time; print(f"{time.time():.3f}")')"
+    python3 -m bench.origin_gate reading --t "$now" --ingress "$ing" --history "$hist" >> "$OUT/portal-origin-wait.jsonl"
+    if [[ -n "$ing" && -z "$t_addr" ]]; then t_addr="$now"; fi
+    end="$(python3 -m bench.origin_gate deadline --t0 "$t0" --t-addr "$t_addr" --resync "$resync_s" \
+        --poll "$PLATFORM_POLL_S" --lb-wait "$ENDPOINT_WAIT_S")"
+    python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$now" "$end" || break
     log "portal not same-origin yet: $why"
     sleep "$PLATFORM_POLL_S"
   done
-  record_failure "portal origin FAILED: ${why:-config.json unreadable}" || true
+  v="$(python3 -m bench.origin_gate verdict --readings "$OUT/portal-origin-wait.jsonl" \
+      --resync "$OUT/portal-origin-resync.json" --why "${why:-config.json unreadable}")"
+  record_failure "portal origin FAILED: $(python3 -c 'import json, sys; v = json.loads(sys.argv[1]); print(v["kind"] + ": " + v["message"])' "$v")" || true
   return 1
 }
 s_wait_platform() {
-  PLATFORM_STARTED="$(date +%s)"
   # Polled, not a blind wait: prints which components are Ready (and why the
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
@@ -764,7 +805,7 @@ s_wait_platform() {
   # their Services present (checked by the env step).
   run "${K[@]}" -n krateo-system wait --for=condition=Available \
       $(printf 'deploy/%s ' $REQUIRED_DEPLOYMENTS) --timeout="${DEPLOY_WAIT_S}s"
-  wait_portal_origin "$(( PLATFORM_STARTED + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S ))" || return 1
+  wait_portal_origin || return 1
   # Record WHERE snowplow runs: a pod outside the dedicated pool shares CPU.
   run "${K[@]}" -n krateo-system get pods -l app.kubernetes.io/name=snowplow \
       -o wide | tee -a "$OUT/snowplow-placement.txt" || true

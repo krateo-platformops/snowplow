@@ -744,6 +744,28 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what.startswith("githubscaffoldingwithcompositionpages"):
             print("\\n".join(f"bench-ns-01 bench-app-01-0{i} 1m" for i in range(1, 5)))
             sys.exit(0)
+        if what == "svc" and "krateo-agent-gateway-platform" in a:
+            # the platform gateway's address (#1005): FAKE_GATEWAY=none: GCP still provisioning
+            print("" if os.environ.get("FAKE_GATEWAY") == "none" else "10.0.0.9", end="")
+            sys.exit(0)
+        if what in ("deploy", "deployments") and "json" in a and len([x for x in a[2:] if not x.startswith("-")
+                                                                     and x != "json"]) == 0:
+            # the installer cdc, by FAKE_CDC_RESYNC=<source>:<interval>: args | env | configmap | none
+            src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
+            c = {"name": "installers-v0-3-422-controller",
+                 "args": ["-group=composition.krateo.io", "-resource=installers"]
+                         + ([f"-resync-interval={iv}"] if src == "args" else []),
+                 "env": [{"name": "COMPOSITION_CONTROLLER_RESYNC_INTERVAL", "value": iv}] if src == "env" else [],
+                 "envFrom": [{"configMapRef": {"name": "installers-v0-3-422-configmap"}}]}
+            d = {"metadata": {"name": "installers-v0-3-422-controller"},
+                 "spec": {"template": {"spec": {"containers": [c]}}}}
+            print(json.dumps({"items": [] if src == "none" else [d]}))
+            sys.exit(0)
+        if what in ("configmap", "configmaps") and "json" in a and "frontend-config-vars" not in a:
+            src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
+            data = {"COMPOSITION_CONTROLLER_RESYNC_INTERVAL": iv} if src == "configmap" else {"OTHER": "x"}
+            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data}]}))
+            sys.exit(0)
         if what == "svc":
             mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending
             ports = {"snowplow": 8081, "authn": 8082, "frontend": 8080}
@@ -773,8 +795,15 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                   "widgets.templates.krateo.io/v1beta1&name=app-shell"
                                   "&namespace=krateo-system")
             # the installer's path-mode URLs (one origin, 057's paths); FAKE_PORTAL=split:
-            # the localhost defaults a config keeps until the gateway has an address
-            if os.environ.get("FAKE_PORTAL") == "split":
+            # the localhost defaults a config keeps until the gateway has an address;
+            # FAKE_PORTAL=after:N: split for the first N reads, then same-origin (#1005)
+            portal = os.environ.get("FAKE_PORTAL", "")
+            if portal.startswith("after:"):
+                cnt = os.path.join(STATE, "portal_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                portal = "split" if n < int(portal.split(":")[1]) else ""
+            if portal == "split":
                 urls = {"SNOWPLOW_API_BASE_URL": "http://localhost:8081",
                         "AUTHN_API_BASE_URL": "http://localhost:8082",
                         "EVENTS_API_BASE_URL": "http://localhost:8083",
@@ -970,6 +999,18 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         if merged:
             with open(os.path.join(STATE, "helm-registry-auth.json"), "w") as fh:
                 json.dump(merged, fh)
+    if "history" in a and "installer-platform" in a:
+        # FAKE_HELM_REVISION: advance (default: each read one more) | frozen | unanswered
+        mode = os.environ.get("FAKE_HELM_REVISION", "advance")
+        if mode == "unanswered":
+            print("Error: release: not found", file=sys.stderr); sys.exit(1)
+        p = os.path.join(STATE, "helm_revision")
+        n = int(open(p).read()) if os.path.exists(p) else 40
+        if mode == "advance":
+            n += 1
+            open(p, "w").write(str(n))
+        print(json.dumps([{"revision": n, "status": "deployed", "chart": "installer-0.3.422"}]))
+        sys.exit(0)
     if "list" in a:
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
@@ -1241,12 +1282,12 @@ def test_a_portal_on_several_origins_stops_the_run_at_the_platform_step(harness)
     with what config.json said; the cluster is still torn down."""
     env, state, ambient, tmp = harness
     env["FAKE_PORTAL"] = "split"
-    env["DEPLOY_WAIT_S"] = "1"            # the gate's deadline: the platform's and deploy's budgets
+    env["FAKE_CDC_RESYNC"] = "args:1s"    # the gate's window: 2 x the cdc's resync (#1005)
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=300)
     out = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "portal origin FAILED" in out and "3 origins" in out
+    assert "portal origin FAILED" in out and "3 origins" in out and "INSTALLER DEFECT" in out
     assert "=== step preflight ===" not in out and "=== step data ===" not in out
     fails = [json.loads(ln) for ln in (tmp / "out" / "command-failures.jsonl").read_text().splitlines()]
     assert any(f["step"] == "platform" and "portal origin FAILED" in f["what"] for f in fails)
