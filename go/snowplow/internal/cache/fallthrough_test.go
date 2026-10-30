@@ -236,15 +236,16 @@ func TestAssertReadPathsScoped_LogsAndCountsInProd_OnMissingMiddleware(t *testin
 	missing := AssertReadPathsScoped()
 	after := AssertionViolationsTotal()
 
-	// 11 required routes minus the one registered = 10 missing
+	// 12 required routes minus the one registered = 11 missing
 	// (GET /api-info/names, GET /list, POST /call, PUT /call,
 	// PATCH /call, DELETE /call, POST /call/read — the #186 body-read path —
-	// and the three #443 POST|PUT|PATCH /call/dry-run twins).
-	if missing != 10 {
-		t.Errorf("missing count = %d; want 10", missing)
+	// the three #443 POST|PUT|PATCH /call/dry-run twins, and the #1015
+	// POST /telemetry/v1/traces ingest).
+	if missing != 11 {
+		t.Errorf("missing count = %d; want 11", missing)
 	}
-	if delta := after - before; delta != 10 {
-		t.Errorf("assertionViolationsTotal delta = %d; want 10", delta)
+	if delta := after - before; delta != 11 {
+		t.Errorf("assertionViolationsTotal delta = %d; want 11", delta)
 	}
 }
 
@@ -260,6 +261,7 @@ func TestAssertReadPathsScoped_AllPresentReturnsZero(t *testing.T) {
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 	registerDryRun443(t)
+	registerTelemetry1015(t)
 
 	if missing := AssertReadPathsScoped(); missing != 0 {
 		t.Errorf("missing count = %d; want 0 (all required routes present)", missing)
@@ -285,6 +287,7 @@ func TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
 	registerDryRun443(t)
+	registerTelemetry1015(t)
 	if missing := AssertReadPathsScoped(); missing != 0 {
 		t.Fatalf("#186 all-present: missing=%d; want 0 — POST /call/read must be a recognised required route", missing)
 	}
@@ -302,6 +305,7 @@ func TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	registerDryRun443(t)
+	registerTelemetry1015(t)
 	// POST /call/read deliberately NOT registered.
 	if missing := AssertReadPathsScoped(); missing != 1 {
 		t.Fatalf("#186 half-wired: missing=%d; want exactly 1 (POST /call/read required but unregistered)", missing)
@@ -329,6 +333,7 @@ func TestAssertReadPathsScoped_RBACEndpointUnregisteredStillPasses(t *testing.T)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 	registerDryRun443(t)
+	registerTelemetry1015(t)
 	// GET /rbac deliberately NOT registered (mirrors /refreshes).
 
 	if missing := AssertReadPathsScoped(); missing != 0 {
@@ -726,6 +731,7 @@ func TestS443_DryRunRoutesRequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
+	registerTelemetry1015(t)
 	if missing := AssertReadPathsScoped(); missing != 3 {
 		t.Fatalf("#443 half-wired: missing=%d; want exactly 3 (POST|PUT|PATCH /call/dry-run required but unregistered)", missing)
 	}
@@ -733,4 +739,11 @@ func TestS443_DryRunRoutesRequiredAndRegistered(t *testing.T) {
 	if missing := AssertReadPathsScoped(); missing != 0 {
 		t.Fatalf("#443 all-present: missing=%d; want 0", missing)
 	}
+}
+
+// registerTelemetry1015 registers the #1015 browser RUM ingest route, required
+// since #1015 (requiredScopedRoutes), so the all-present arms stay all-present.
+func registerTelemetry1015(t *testing.T) {
+	t.Helper()
+	RegisterScopedRoute("POST /telemetry/v1/traces", ScopeTelemetry)
 }

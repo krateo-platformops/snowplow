@@ -58,6 +58,10 @@ var requiredScopedRoutes = []string{
 	"POST /call/dry-run",
 	"PUT /call/dry-run",
 	"PATCH /call/dry-run",
+	// #1015 — the browser RUM ingest. Zero apiserver reads, unlike the routes
+	// above; it is registered (scope telemetry) by the issue's requirement so
+	// that any read it ever issues is attributed instead of unscoped.
+	"POST /telemetry/v1/traces",
 }
 
 // assertionViolationsTotal is the production-mode counter bumped by
