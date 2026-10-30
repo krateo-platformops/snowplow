@@ -132,7 +132,9 @@ fi
 # exactly as 057 does, from this operator-written file (mode 0600,
 # GHCR_PULL_USERNAME + GHCR_PULL_TOKEN). Without it: refused here, before any
 # cloud call; never a run without it.
-GHCR_PULL_ENV_FILE="${GHCR_PULL_ENV_FILE:-$HOME/.config/snowplow-bench/ghcr-pull.env}"
+# exported: bench.diag606 reads the same file (never argv) to redact the pull
+# account from every bundle, whether the path is the default or an override
+export GHCR_PULL_ENV_FILE="${GHCR_PULL_ENV_FILE:-$HOME/.config/snowplow-bench/ghcr-pull.env}"
 python3 -m bench.ghcr_pull check --env-file "$GHCR_PULL_ENV_FILE" || exit 2
 ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
 ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
@@ -542,9 +544,9 @@ s_up() {
 # 057's (installer-platform values, read-only 2026-10-30): enabled, global
 # credentials (registries: []), passwordRef krateo-agentiko-pull/token in
 # krateo-system, the derived image-pull Secret (imagePullSecretName ""), TLS
-# verified. Its username comes from the pull-token file at install time
-# through a private values file outside the run dir: no identity is kept in
-# the run's record.
+# verified. Its username comes from the pull-token file at install time,
+# piped into helm: no identity is kept in the run's record (and diag606
+# redacts it from the Installer CR the installer copies it into).
 write_installer_values() {
   cat > "$OUT/installer-values.yaml" <<EOF
 bootstrap:
@@ -596,7 +598,7 @@ componentValues:
       effect: NoSchedule
 registryAuth:
   enabled: true
-  # username: set at install from the pull-token file (a private values file, not kept)
+  # username: set at install from the pull-token file, piped into helm's -f - (not kept)
   passwordRef:
     name: krateo-agentiko-pull
     namespace: krateo-system
@@ -636,14 +638,19 @@ s_install() {
           >/dev/null 2>"$KERR" \
       || { record_failure "install FAILED: creating the ghcr pull Secret"; return 1; }
   fi
-  local priv rc=0
-  priv="$(mktemp -d)"
-  (umask 077; python3 -m bench.ghcr_pull username --env-file "$GHCR_PULL_ENV_FILE" > "$priv/registry-auth.yaml")
-  run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
-      -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f "$priv/registry-auth.yaml" \
-      --wait --timeout "${INSTALL_TIMEOUT_S}s" || rc=$?
-  rm -rf "$priv"
-  return "$rc"
+  # registryAuth.username through a pipe into helm's `-f -` (helm reads that
+  # values document from stdin): no file holds it, so no exit path can leave
+  # one behind (#1007 review F2)
+  if [[ "$DRY" == "1" ]]; then
+    run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+        -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
+        --wait --timeout "${INSTALL_TIMEOUT_S}s"
+    return 0
+  fi
+  python3 -m bench.ghcr_pull username --env-file "$GHCR_PULL_ENV_FILE" \
+    | run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+        -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
+        --wait --timeout "${INSTALL_TIMEOUT_S}s"
 }
 s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
