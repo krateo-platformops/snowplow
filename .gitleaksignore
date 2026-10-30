@@ -24,3 +24,11 @@
 # test constant in dd3b8b1c. Not a credential; renamed to a low-entropy canary in
 # 555c610a. Exactly this one finding; no path or rule allowlist.
 dd3b8b1c73acc2f6ee3e9d85121ae9cd24113dc1:go/snowplow/internal/resolvers/restactions/api/stage_audit_410_test.go:generic-api-key:56
+
+# Synthetic JWT fixture (#1015, 2026-10-30): TestS1015_ForwardedPayloadIsAllowlistOnly
+# in go/snowplow/main_telemetry_1015_test.go posts a JWT-shaped value to the RUM ingest
+# to prove a token-shaped value is never forwarded. It decodes to header
+# {"alg":"RS256","typ":"JWT"}, payload {"sub":"synthetic-test"}, signature the bytes
+# "synthetic-signature"; no key ever issued it. Not a credential; no real credential
+# is present. Exactly this one finding; no path or rule allowlist.
+337b1d8ff0a109a1ef167d00debeafef6e1e95c4:go/snowplow/main_telemetry_1015_test.go:jwt:331
