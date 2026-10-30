@@ -189,6 +189,35 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 	}
 }
 
+// mountExportRoutes mounts GET and POST /export (#970) on mux behind the
+// /call middleware prefix — the caller's identity (userConfig), then the
+// call-generic fallthrough scope — and registers each as a scoped route, so
+// the boot-assert (requiredScopedRoutes) catches a lost registration.
+//
+//   - GET /export: handlers.ExportGET, the export over the GET /call lane.
+//   - POST /export: handlers.ExportPOST, the export with its extras in the
+//     body, over exactly the POST /call/read lane (its body decode, the read
+//     dispatcher, the read-only CallRead). The export's own parameters stay
+//     in the query, as /call/read keeps every non-extras parameter there.
+//
+// It is a function (not inline in main) so the route table is testable with a
+// test identity middleware, as mountCallWriteRoutes is.
+func mountExportRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+	for _, r := range []struct {
+		pattern string
+		handler http.Handler
+	}{
+		{"GET /export", handlers.ExportGET()},
+		{"POST /export", handlers.ExportPOST()},
+	} {
+		mux.Handle(r.pattern, chain.Append(
+			userConfig,
+			cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
+			Then(r.handler))
+		cache.RegisterScopedRoute(r.pattern, cache.ScopeCallGeneric)
+	}
+}
+
 // @title SnowPlow API
 // @version 0.1.0
 // @description This the total new Krateo backend.
@@ -1271,28 +1300,13 @@ func main() {
 	// The route shares the /call middleware chain, so the scope
 	// classification and the read-path invariant hold; a scheduled
 	// export is just a CronJob curling this route (see howto/export.md).
-	mux.Handle("GET /export", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
-		Then(handlers.ExportGET()))
-	cache.RegisterScopedRoute("GET /export", cache.ScopeCallGeneric)
-
-	// POST /export (#970) — the same export with the extras in the request
+	//
+	// POST /export (#970) is the same export with the extras in the request
 	// BODY, for a filter too large for the URL (the gateway 431s a long
-	// ?extras=). It mirrors POST /call/read exactly: the same middleware
-	// (BodyExtrasDecode: the {"extras":{...}} envelope, its 1 MiB bound and
-	// its 400s, a stray ?extras= ignored), and every page re-dispatched
-	// through the same read lane — ReadDispatcher into the resolve handlers,
-	// the read-only CallRead (verb forced GET) as the fallthrough — so a page
-	// lands on the cell of a POST /call/read of that window and body. The
-	// export's own parameters stay in the query, as /call/read keeps every
-	// non-extras parameter there. Registered like GET /export. The body
-	// decode and the read lane are composed in handlers.ExportPOST.
-	mux.Handle("POST /export", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
-		Then(handlers.ExportPOST()))
-	cache.RegisterScopedRoute("POST /export", cache.ScopeCallGeneric)
+	// ?extras=); it mirrors POST /call/read exactly. Both export routes are
+	// mounted by mountExportRoutes (so the route table is testable) and are
+	// required scoped routes (requiredScopedRoutes).
+	mountExportRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
