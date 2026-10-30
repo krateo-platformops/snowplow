@@ -21,6 +21,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -248,6 +249,11 @@ func seedExtrasHarness(t *testing.T, serverURL string) {
 	if store := cache.ResolvedCache(); store != nil {
 		cache.Deps().SetStore(store)
 	}
+	// An iterator stage's first resolve misses the cluster-list cell and
+	// starts a populate that detaches from the request and outlives the
+	// test. Registered last, so it runs first: every populate is done before
+	// the cleanups above stop the watcher and reset the globals it reads.
+	t.Cleanup(api.WaitClusterListAsyncIdleForTest)
 }
 
 // serveAsDev serves target on h as userA (group devs).
