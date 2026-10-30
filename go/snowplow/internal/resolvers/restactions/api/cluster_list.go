@@ -146,9 +146,12 @@ var clusterListCollapseEnabled = true
 // VERBATIM for S.2, just unreachable until S.2 flips the var true
 // after landing refresher-decoupling.
 //
-// When enabled, the helper performs FOUR structural gates in order,
+// When enabled, the helper performs FIVE structural gates in order,
 // short-circuiting on the first failure (no wasted work):
 //
+//  9. Verb (#1011): the stage's verb is a plain GET (isPlainGet). The
+//     collapse replaces the stage's calls with one GET LIST, so a write
+//     (or a HEAD) must never enter it. Checked first.
 //  2. Cache-off + snapshot gate (AC-D5.13): !cache.Disabled() AND the
 //     Ship B typed-RBAC snapshot is published.
 //  3. Iterator present: apiCall.DependsOn.Iterator is non-empty (a
@@ -179,6 +182,16 @@ func attemptClusterListCollapse(
 	// disabled, S.2-pending".
 	if !clusterListCollapseEnabled {
 		return nil, false, 1
+	}
+
+	// #1011 — the verb. The collapse stands in for the stage's per-item calls
+	// with ONE cluster-scope GET LIST, so only a stage whose calls ARE a plain
+	// GET may enter it (isPlainGet, write_verb.go). Without this gate a write
+	// iterator was rewritten into that GET once the cell was warm: its writes
+	// were never sent and the stage reported success. Its own deny gate, 9,
+	// before any other work.
+	if !isPlainGet(apiCall.Verb) {
+		return nil, false, 9
 	}
 
 	// Gate 2: cache-off + Servable. AC-D5.13.
@@ -840,9 +853,13 @@ func clusterListElementTarget(pathTmpl string, element any) (schema.GroupVersion
 //
 // The Path is /apis/<group>/<version>/<resource> for a named group OR
 // /api/<version>/<resource> for the core group (group==""). Verb is
-// forced GET (the cluster-list collapse is a read-only mechanism;
-// non-GET iterator stages never reach this site — the worker would
-// reject them anyway).
+// GET, and it may be: the cluster-list collapse is a read optimisation, and
+// only a stage whose own calls are a plain GET reaches this site (#1011).
+// Its two production callers each admit only such a stage, by the one
+// predicate isPlainGet: attemptClusterListCollapse (deny gate 9, before any
+// other work) and the boot prewarm roster (extractClusterListGVRFromStagePath).
+// TestIssue1011_B_OnlyThePlainGetGatedCallersBuildTheCollapsedCall pins
+// that these are its only callers and that both are gated.
 func buildClusterListCall(
 	apiCall *templates.API,
 	ep endpoints.Endpoint,

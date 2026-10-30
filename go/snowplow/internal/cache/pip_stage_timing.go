@@ -70,7 +70,7 @@ type PIPStageTiming struct {
 	// ClusterListDenyGate.
 	ClusterListUsed bool `json:"cl_used"`
 
-	// ClusterListDenyGate is the gate number (1-7) that triggered the
+	// ClusterListDenyGate is the gate number (1-9) that triggered the
 	// false return from attemptClusterListCollapse — see cluster_list.go.
 	// 0 means no deny (gate passed, ClusterListUsed=true) OR the helper
 	// was not attempted. Values:
@@ -81,6 +81,9 @@ type PIPStageTiming struct {
 	//   5 — RBAC permission deny
 	//   6 — dispatch returned non-servable (rare — pre-sync informer)
 	//   7 — shape check failed (cluster-list multi-element check)
+	//   8 — the cell is cold: per-item fallback, async populate scheduled
+	//   9 — the stage's verb is not a plain GET: a collapse would replace its
+	//       calls with a GET they are not (#1011)
 	ClusterListDenyGate int `json:"cl_deny_gate"`
 
 	// IteratorCalls is the number of inner-call elements the bounded

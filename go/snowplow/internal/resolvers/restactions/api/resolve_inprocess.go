@@ -35,10 +35,8 @@ package api
 
 import (
 	"context"
-	"net/http"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
@@ -113,7 +111,7 @@ func (r *resolveRun) maybeResolveInProcess(
 
 	// Gate 3 — only a GET can be resolve-substituted (a write verb is not a
 	// cacheable single-CR fetch).
-	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, nil
 	}
 

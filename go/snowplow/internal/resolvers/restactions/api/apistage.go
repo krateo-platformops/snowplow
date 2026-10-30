@@ -578,7 +578,7 @@ func apistageContentServeAttempt(
 	// Content-keyed entries describe apiserver GET/LIST calls only — the
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
-	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, false, ctx, nil
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)

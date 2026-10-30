@@ -117,14 +117,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
@@ -371,7 +369,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	}
 
 	// Gate 2: verb. client-go dynamic Get/List is read-only.
-	if verb := ptr.Deref(call.Verb, http.MethodGet); verb != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, nil
 	}
 

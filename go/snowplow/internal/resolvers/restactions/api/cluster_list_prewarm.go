@@ -164,8 +164,10 @@ func EnumerateClusterListCells(
 // Rules (all conservative — false-negatives are acceptable, false-
 // positives are not):
 //
-//   1. Non-GET stages are skipped. The cluster_list cell models a LIST
-//      response; write verbs must never seed it.
+//   1. A stage whose verb is not a plain GET is skipped (isPlainGet, the
+//      collapse's own verb gate, #1011). The cluster_list cell models a
+//      LIST response that stands in for the stage's calls; a write, a
+//      HEAD, an empty or lower-case verb must never seed it.
 //   2. Inter-RA `/call?...` paths are skipped — not apiserver paths.
 //   3. Paths with unresolved `${...}` JQ template fragments are skipped
 //      — we can't know the target GVR without running the iterator's
@@ -206,14 +208,12 @@ func extractClusterListGVRFromStagePath(apiCall *templates.API) (schema.GroupVer
 	if apiCall == nil {
 		return schema.GroupVersionResource{}, false
 	}
-	// Only GET stages seed cluster-list cells. apiCall.Verb is *string
-	// with empty/nil meaning GET per the templates schema (`Verb is the
-	// request method (GET if omitempty)`).
-	if apiCall.Verb != nil {
-		v := strings.ToUpper(strings.TrimSpace(*apiCall.Verb))
-		if v != "" && v != "GET" && v != "HEAD" {
-			return schema.GroupVersionResource{}, false
-		}
+	// Only a stage the collapse admits seeds a cluster-list cell: the same
+	// predicate as attemptClusterListCollapse's verb gate (isPlainGet,
+	// #1011). A seeded cell is what makes a later customer call collapse, so
+	// the two must never disagree.
+	if !isPlainGet(apiCall.Verb) {
+		return schema.GroupVersionResource{}, false
 	}
 	path := strings.TrimSpace(apiCall.Path)
 	if path == "" {

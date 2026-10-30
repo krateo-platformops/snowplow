@@ -44,14 +44,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -478,7 +476,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// Gate 1: verb. Informer cache is read-only — POST/PUT/PATCH/
 	// DELETE all require the apiserver. The default verb is GET when
 	// call.Verb is nil (httpcall convention).
-	if v := ptr.Deref(call.Verb, http.MethodGet); v != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		dispatchInformerFallthrough.Add(1)
 		// Ship D — F-2 sub-reason: write verb on the inner-call path.
 		return nil, false, cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerWriteVerb, ""), nil
