@@ -113,12 +113,15 @@ def test_the_address_name_is_gkes_default_load_balancer_name():
         assert gke.lb_address_name(UID_GW[:-1] + last) == ADDR_GW
     assert len(gke.lb_address_name(UID_FE)) == 32 and gke.lb_address_name(UID_FE).startswith("a0c2f7a10")
     svcs = gke.lb_services({"items": LB_SVCS + [
-        _svc("x", "rbs", "22222222-2222-4222-8222-222222222222"),
+        dict(_svc("x", "rbs", "22222222-2222-4222-8222-222222222222"),
+             metadata={"namespace": "x", "name": "rbs", "uid": "22222222-2222-4222-8222-222222222222",
+                       "annotations": {"cloud.google.com/l4-rbs": "enabled"}}),
         _svc("x", "classed", "33333333-3333-4333-8333-333333333333", loadBalancerClass="example.com/lb")]})
     by = {s["service"]: s["address"] for s in svcs}
     assert by["krateo-system/krateo-agent-gateway-platform"] == ADDR_GW
     assert "krateo-system/snowplow" not in by                       # ClusterIP: no address
     assert by["x/classed"] is None                                  # another controller names it
+    assert by["x/rbs"] is None                                      # the RBS NetLB names it k8s2-...
 
 
 # ─── 1. ORDER ───────────────────────────────────────────────────────────────
@@ -430,3 +433,141 @@ def test_the_dry_run_teardown_names_the_release_and_the_sweep(monkeypatch, capsy
     out = capsys.readouterr().out
     assert out.index("delete svc") < out.index("DRY-RUN: gcloud container clusters delete") < out.index(
         "DRY-RUN: gcloud compute addresses list")
+
+
+# ─── #1037 review: the rules the PR states, each with its own arm ──────────
+
+def test_the_record_never_says_deleted_for_an_address_still_listed(lbfakes, monkeypatch):
+    """F1 (R3): `deleted` comes from the list AFTER the delete, never from the
+    delete call: a delete that leaves the address, or a verifying list that
+    fails, both record deleted=False (the run log prints it as is)."""
+    monkeypatch.setenv("FAKE_LB_GUARD_IGNORED", "1")
+    monkeypatch.setenv("FAKE_ADDR_DELETE_NOOP", "1")                # rc 0, the address stays
+    rec = {}
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None, record=rec)
+    assert _deleted_addresses(_calls(lbfakes)) == [ADDR_FE]          # asked, rc 0 — and still listed
+    assert {a["name"]: a["deleted"] for a in rec["leaked_addresses"]}[ADDR_FE] is False
+    assert any("left them there" in p for p in rec["address_problems"])
+
+
+def test_the_record_never_says_deleted_when_the_verifying_list_fails(lbfakes, monkeypatch):
+    monkeypatch.setenv("FAKE_LB_GUARD_IGNORED", "1")
+    monkeypatch.setenv("FAKE_ADDR_RELIST_RC", "1")                  # the delete went, the re-list failed
+    rec = {}
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=60, clock=_ticks(),
+                 sleep=lambda s: None, record=rec)
+    assert _deleted_addresses(_calls(lbfakes)) == [ADDR_FE]
+    assert {a["name"]: a["deleted"] for a in rec["leaked_addresses"]}[ADDR_FE] is False
+    assert any("whether they are gone is unknown" in p for p in rec["address_problems"])
+
+
+class _Clock:
+    """A clock that moves `step` per read; `at` = the reading when each argv ran."""
+    def __init__(self, step):
+        self.t, self.step, self.at = 0.0, step, []
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+def test_the_load_balancer_release_stops_at_a_quarter_of_the_budget(lbfakes, monkeypatch):
+    """F2 (R10): the Services never go; the release gives up at start + B/4,
+    so the PVC release starts by then and the cluster delete by B/2 — the
+    gone-poll and both backstops keep the rest."""
+    monkeypatch.setenv("FAKE_SVC_STUCK", "1")
+    clock, B = _Clock(5), 400.0
+    real = gke.execute
+
+    def spy(argv, **kw):
+        clock.at.append((argv, clock.t))
+        return real(argv, **kw)
+    monkeypatch.setattr(gke, "execute", spy)
+    rec = {}
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=B, clock=clock,
+                 sleep=lambda s: None, record=rec)
+    t_pv = next(t for argv, t in clock.at if argv[-4:] == ["get", "pv", "-o", "json"])
+    t_del = next(t for argv, t in clock.at if argv[:4] == ["gcloud", "container", "clusters", "delete"])
+    poll = 4 * clock.step                       # one release poll reads the clock at most a few times
+    assert rec["lb_release"].startswith("not released")
+    assert t_pv <= B / 4 + poll, (t_pv, B / 4)
+    assert t_del <= B / 2 + poll, (t_del, B / 2)
+
+
+def test_a_gce_list_that_does_not_answer_is_never_released(lbfakes, monkeypatch):
+    """F3 (R4): the Services are gone but the forwarding-rule list fails:
+    unknown is not "released" — the release keeps polling until its deadline
+    and says so."""
+    (lbfakes / "addresses.json").write_text("[]")
+    monkeypatch.setenv("FAKE_FWD_LIST_RC", "1")
+    rec = {}
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=400, clock=_ticks(1),
+                 sleep=lambda s: None, record=rec)
+    c = _calls(lbfakes)
+    i_cluster = _first(c, ["gcloud", "container", "clusters", "delete"])
+    fwd = [i for i, x in enumerate(c) if x[:4] == ["gcloud", "compute", "forwarding-rules", "list"]]
+    assert rec["lb_release"] == "not released: GCE unlisted"
+    assert len(fwd) > 1 and fwd[-1] < i_cluster                     # it kept asking, before the delete
+
+
+def test_the_address_sweep_waits_for_the_cluster_to_be_gone(lbfakes, monkeypatch):
+    """F4 (R9): a cluster still being deleted when the budget ends: no address
+    is deleted (its controller may still own them); the record says it was
+    skipped and how to list them once the cluster is gone."""
+    monkeypatch.setenv("FAKE_LB_GUARD_IGNORED", "1")
+    monkeypatch.setenv("FAKE_NEVER_GONE", "1")
+    rec = {}
+    problems = gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=60,
+                            clock=_ticks(), sleep=lambda s: None, record=rec)
+    c = _calls(lbfakes)
+    assert not any(x[:4] == ["gcloud", "compute", "addresses", "delete"] for x in c)
+    assert not any(x[:4] == ["gcloud", "compute", "addresses", "list"] for x in c)
+    want = (f"once it is gone list them with gcloud compute addresses list --project {gke.DEFAULT_PROJECT} "
+            f"--regions {R} --filter name=({ADDR_FE} {ADDR_GW})")
+    assert any(p.startswith("skipped:") and want in p for p in rec["address_problems"]), rec["address_problems"]
+    assert rec["leaked_addresses"] is None and problems
+
+
+def test_a_hung_gcloud_call_is_bounded(lbfakes, monkeypatch):
+    """N1: every gcloud call this teardown adds carries a timeout (what is
+    left until its deadline, at least GCLOUD_CALL_MIN_S); a hung list is a
+    failed list, never an empty one."""
+    monkeypatch.setenv("FAKE_LB_GUARD_IGNORED", "1")
+    monkeypatch.setenv("FAKE_GCE_LIST_SLEEP", "20")
+    monkeypatch.setattr(gke, "GCLOUD_CALL_MIN_S", 0.5)
+    import time as _t
+    t0 = _t.monotonic()
+    rec = {}
+    gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=1, sleep=lambda s: None,
+                 record=rec)
+    assert _t.monotonic() - t0 < 15
+    assert any(f"failed (rc={gke.GCLOUD_TIMED_OUT})" in p for p in rec["address_problems"]), rec
+
+
+def test_the_exposure_type_defaults_to_the_installers_load_balancer(tmp_path):
+    """R16: no exposure.type in the chart's values nor the run's: the
+    installer's default (values.yaml: LoadBalancer) applies, so every exposed
+    component counts."""
+    fix = json.loads(json.dumps(RUN19))
+    fix["chart_values"]["exposure"] = {}
+    v = json.loads(json.dumps(RUN19["run_values"]))
+    v.pop("exposure")
+    v["features"]["agentGateway"] = False
+    vf = tmp_path / "v.yaml"
+    vf.write_text(yaml.safe_dump(v))
+    rows = lb_need.planned(str(_chart(tmp_path, fix)), str(vf))
+    assert [r["service"] for r in rows] == ["authn", "snowplow", "frontend", "sse-proxy"]
+
+
+def test_gke_down_keeps_the_record_when_the_teardown_raises(lbfakes, monkeypatch):
+    """R19: what the teardown learnt before it failed (here: the LoadBalancer
+    Services and their address names) is in the record, with the failure."""
+    def boom(*a, **kw):
+        raise RuntimeError("the PVC release fell over")
+    monkeypatch.setattr(gke, "release_pvc_disks", boom)
+    out = lbfakes / "teardown.json"
+    assert gke.main(["gke-down", "--name", NAME, "--budget-s", "1", "--yes", "--record", str(out)]) == 1
+    rec = json.loads(out.read_text())
+    assert rec["outcome"] == "failed: RuntimeError"
+    assert sorted(s["address"] for s in rec["lb_services"]) == [ADDR_FE, ADDR_GW]

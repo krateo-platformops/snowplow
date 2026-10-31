@@ -360,6 +360,14 @@ FAKE = textwrap.dedent("""\
         import re
         if os.environ.get("FAKE_ADDR_LIST_RC") and a[1] == "addresses":
             sys.exit(int(os.environ["FAKE_ADDR_LIST_RC"]))
+        if os.environ.get("FAKE_FWD_LIST_RC") and a[1] == "forwarding-rules":
+            sys.exit(int(os.environ["FAKE_FWD_LIST_RC"]))
+        # FAKE_ADDR_RELIST_RC: the address list after a delete fails (the verifying list)
+        if os.environ.get("FAKE_ADDR_RELIST_RC") and a[1] == "addresses" and has("addr_delete_called"):
+            sys.exit(int(os.environ["FAKE_ADDR_RELIST_RC"]))
+        if os.environ.get("FAKE_GCE_LIST_SLEEP"):                # a hung gcloud list
+            import time
+            time.sleep(float(os.environ["FAKE_GCE_LIST_SLEEP"]))
         m = re.fullmatch(r"name=\\((.+)\\)", a[a.index("--filter") + 1])
         if not m or "--regions" not in a:
             sys.stderr.write("ERROR: unexpected filter\\n"); sys.exit(2)
@@ -382,6 +390,7 @@ FAKE = textwrap.dedent("""\
                           (loose or (r["name"] in want and r["region"].rsplit("/", 1)[-1] == reg))]))
         sys.exit(0)
     if a[:3] == ["compute", "addresses", "delete"]:
+        open(os.path.join(st, "addr_delete_called"), "w").write("1")
         if not os.environ.get("FAKE_ADDR_DELETE_NOOP"):
             with open(os.path.join(st, "deleted_addresses"), "a") as fh:
                 fh.write(" ".join(a[3:a.index("--region")]) + " ")

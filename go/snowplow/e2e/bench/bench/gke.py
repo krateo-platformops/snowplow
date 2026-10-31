@@ -850,7 +850,8 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
                 # the cluster IS deleted; a disk possibly left over is said loudly, not as a failed delete
                 disk_problems.append(str(e))
             if gone:
-                rec["leaked_addresses"], address_problems = address_backstop(spec, services=lb["services"], log=log)
+                rec["leaked_addresses"], address_problems = address_backstop(
+                    spec, services=lb["services"], log=log, deadline=deadline, clock=clock)
             elif lb["services"] != []:          # no LoadBalancer Service at all: nothing to check
                 names = [s["address"] for s in lb["services"] or [] if s["address"]]
                 address_problems.append(
@@ -1531,12 +1532,34 @@ def own_addresses(found: Iterable[dict], *, names: Iterable[str], region: str) -
                   key=lambda a: a["name"])
 
 
-def _gce_lb_left(spec: ClusterSpec, names: list[str], *, log: Callable[[str], None]) -> list[str] | None:
+# A gcloud call of the release or the address backstop is bounded per call too (gcloud has no
+# --request-timeout): by what is left until its deadline, never less than this, so one hung
+# call overruns its deadline by at most GCLOUD_CALL_MIN_S (#1037 review N1)
+GCLOUD_CALL_MIN_S = 60.0
+GCLOUD_TIMED_OUT = 124          # the rc a timed-out call reads as (timeout(1)'s)
+
+
+def _gcloud_bounded(argv: list[str], *, deadline: float, clock: Callable[[], float],
+                    log: Callable[[str], None]) -> tuple[int, str]:
+    """execute() with timeout = max(GCLOUD_CALL_MIN_S, deadline - now); a
+    call that times out answers GCLOUD_TIMED_OUT (a failed call, never an
+    empty answer)."""
+    limit = max(GCLOUD_CALL_MIN_S, deadline - clock())
+    try:
+        return execute(argv, dry_run=False, log=log, timeout=limit)
+    except subprocess.TimeoutExpired:
+        log(f"  timed out after {limit:g} s: {' '.join(argv[:4])}")
+        return GCLOUD_TIMED_OUT, ""
+
+
+def _gce_lb_left(spec: ClusterSpec, names: list[str], *, log: Callable[[str], None], deadline: float,
+                 clock: Callable[[], float]) -> list[str] | None:
     """The forwarding rules and addresses GCE still lists under `names`, or
     None when a list did not answer (unknown is never "released")."""
     left = []
     for kind in ("forwarding-rules", "addresses"):
-        rc, out = execute(_gce_list_command(kind, spec, names), dry_run=False, log=lambda _: None)
+        rc, out = _gcloud_bounded(_gce_list_command(kind, spec, names), deadline=deadline, clock=clock,
+                                  log=lambda _: None)
         found = _json(out) if rc == 0 else None
         if not isinstance(found, list):
             log(f"LB release: listing {kind} by name failed (rc={rc})")
@@ -1600,7 +1623,8 @@ def release_lb_services(spec: ClusterSpec, describe: dict, *, log: Callable[[str
         left = sorted(f"{(x.get('metadata') or {}).get('namespace')}/{(x.get('metadata') or {}).get('name')}"
                       for x in (cur.get("items") or []) if (x.get("metadata") or {}).get("uid") in uids) \
             if isinstance(cur, dict) else ["<unlisted>"]
-        gce = (_gce_lb_left(spec, names, log=log) if names else []) if not left else None
+        gce = (_gce_lb_left(spec, names, log=log, deadline=deadline, clock=clock) if names else []) \
+            if not left else None
         if gce == []:
             log(f"LB release: the {len(svcs)} LoadBalancer Service(s) are gone and GCE lists none of their "
                 f"forwarding rules or addresses")
@@ -1612,14 +1636,16 @@ def release_lb_services(spec: ClusterSpec, describe: dict, *, log: Callable[[str
         sleep(_POLL_S)
 
 
-def address_backstop(spec: ClusterSpec, *, services: list[dict] | None,
-                     log: Callable[[str], None]) -> tuple[list[dict], list[str]]:
+def address_backstop(spec: ClusterSpec, *, services: list[dict] | None, log: Callable[[str], None],
+                     deadline: float = 0.0, clock: Callable[[], float] = time.monotonic
+                     ) -> tuple[list[dict], list[str]]:
     """After the cluster is gone: list the region's addresses by the names
     recorded from this cluster's LoadBalancer Services, delete those with no
     users by exact name, and list again. Returns (leaked, problems): every
     recorded address that was still there, each with `deleted`; problems is
     empty only when none is left (a leak never reads as success). An address
-    with users is never deleted."""
+    with users is never deleted. Each gcloud call is bounded (_gcloud_bounded:
+    what is left until `deadline`, at least GCLOUD_CALL_MIN_S)."""
     if services is None:
         return [], [f"{spec.name}'s LoadBalancer Services were never read, so their address names are unknown: "
                     f"whether one is left RESERVED is unknown (list the region's addresses with no users)"]
@@ -1630,7 +1656,7 @@ def address_backstop(spec: ClusterSpec, *, services: list[dict] | None,
         log(f"address backstop: no recorded LoadBalancer address of {spec.name} to look for")
         return [], problems
     argv = _gce_list_command("addresses", spec, by_name)
-    rc, out = execute(argv, dry_run=False, log=log)
+    rc, out = _gcloud_bounded(argv, deadline=deadline, clock=clock, log=log)
     found = _json(out) if rc == 0 else None
     if not isinstance(found, list):
         return [], problems + [f"listing {spec.name}'s addresses failed (rc={rc}): whether any is left is "
@@ -1642,9 +1668,9 @@ def address_backstop(spec: ClusterSpec, *, services: list[dict] | None,
     if free:
         log(f"address backstop: deleting {len(free)} leftover address(es) of {spec.name}, by name: "
             + ", ".join(f"{n} ({by_name[n]})" for n in free))
-        drc, _ = execute(["gcloud", "compute", "addresses", "delete", *free, "--region", spec.region,
-                          "--project", spec.project, "--quiet"], dry_run=False, log=log)
-        rc, out = execute(argv, dry_run=False, log=log)          # verified, never assumed
+        drc, _ = _gcloud_bounded(["gcloud", "compute", "addresses", "delete", *free, "--region", spec.region,
+                                  "--project", spec.project, "--quiet"], deadline=deadline, clock=clock, log=log)
+        rc, out = _gcloud_bounded(argv, deadline=deadline, clock=clock, log=log)   # verified, never assumed
         again = _json(out) if rc == 0 else None
         still = ({a["name"] for a in own_addresses(again, names=by_name, region=spec.region)}
                  if isinstance(again, list) else None)
