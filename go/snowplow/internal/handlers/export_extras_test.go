@@ -86,6 +86,14 @@ const errorKeyFilter970 = `{rows: [{id: "notify", team: (.notifyError | tostring
 // pointing at serverURL, where a dialed stage (the write stage) lands.
 func seedExtrasHarness(t *testing.T, serverURL string) {
 	t.Helper()
+	seedExtrasHarnessWithSecrets(t, serverURL)
+}
+
+// seedExtrasHarnessWithSecrets is seedExtrasHarness with more Secrets in
+// AUTHN_NAMESPACE: another cluster's endpointRef Secret, the caller's
+// step-up credential.
+func seedExtrasHarnessWithSecrets(t *testing.T, serverURL string, extra ...*corev1.Secret) {
+	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("REFRESH_SSE_ENABLED", "")
@@ -175,6 +183,36 @@ func seedExtrasHarness(t *testing.T, serverURL string) {
 			},
 		}})
 	}
+	// The credential arms (#1019, #1024 through an export): the team-rows read
+	// sent to another cluster through a named endpointRef, and the team-rows
+	// read plus a GET no informer serves, dialed with the caller's own
+	// credential.
+	seed = append(seed,
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "templates.krateo.io/v1",
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": remoteRAName970, "namespace": extrasNS970, "uid": "uid-" + remoteRAName970},
+			"spec": map[string]any{
+				"api": []any{map[string]any{
+					"name": "cms", "path": "/api/v1/namespaces/team-a/configmaps", "filter": cmFilter970,
+					"endpointRef": map[string]any{"name": remoteSecret970, "namespace": extrasNS970},
+				}},
+				"filter": raFilter970,
+			},
+		}},
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "templates.krateo.io/v1",
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": dialRAName970, "namespace": extrasNS970, "uid": "uid-" + dialRAName970},
+			"spec": map[string]any{
+				"api": []any{
+					map[string]any{"name": "cms", "path": "/api/v1/namespaces/team-a/configmaps", "filter": cmFilter970},
+					map[string]any{"name": "probe", "path": dialPath970, "continueOnError": true, "errorKey": "probeError"},
+				},
+				"filter": raFilter970,
+			},
+		}},
+	)
 	for i := range 12 {
 		seed = append(seed, &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "v1", "kind": "ConfigMap",
@@ -194,10 +232,14 @@ func seedExtrasHarness(t *testing.T, serverURL string) {
 		cache.ResetSecretsInformerForTest()
 		cache.ResetSecretsSnapshotForTest()
 	})
-	t.Cleanup(cache.SetSecretsClientForTest(k8sfake.NewSimpleClientset(&corev1.Secret{
+	secrets := []runtime.Object{&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "usera-clientconfig", Namespace: extrasNS970},
 		Data:       map[string][]byte{"server-url": []byte(serverURL), "token": []byte("token-userA")},
-	})))
+	}}
+	for _, sec := range extra {
+		secrets = append(secrets, sec)
+	}
+	t.Cleanup(cache.SetSecretsClientForTest(k8sfake.NewSimpleClientset(secrets...)))
 	sctx, scancel := context.WithCancel(context.Background())
 	t.Cleanup(scancel)
 	if err := cache.StartSecretsInformer(sctx, nil, extrasNS970); err != nil {
