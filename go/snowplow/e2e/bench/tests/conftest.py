@@ -60,21 +60,125 @@ if str(_E2E_BENCH_DIR) not in sys.path:
 # built from FAKE_CHART_VALUES, appVersion = the version asked for; its blob
 # is served, as ghcr does, through a redirect to a blob store that REFUSES
 # any Authorization header (a client must not forward the registry's bearer).
-# Two chart versions misbehave on purpose: FAKE_CHART_BAD_DIGEST (its blob
-# does not match the manifest's digest) and FAKE_CHART_HTTP_BLOB (its blob
-# redirect points at plain http).
+# Chart versions that misbehave on purpose: FAKE_CHART_BAD_DIGEST (its blob
+# does not match the manifest's digest), FAKE_CHART_HTTP_BLOB (its blob
+# redirect points at plain http), FAKE_CHART_BIG_MANIFEST (a manifest past
+# the distribution spec's 4 MiB), FAKE_CHART_BLOB_OVER_SIZE (a blob larger
+# than the size its manifest declares), FAKE_CHART_DRIP (a manifest dripped
+# a byte at a time, for ever).
 FAKE_GHCR_USER, FAKE_GHCR_TOKEN = "fake-ghcr-user", "fake-ghcr-token-" + "f00d" * 4
 FAKE_GHCR_UNPUBLISHED = "9.9.9"
 FAKE_CHART_BAD_DIGEST, FAKE_CHART_HTTP_BLOB = "6.6.6", "5.5.5"
+FAKE_CHART_BIG_MANIFEST, FAKE_CHART_BLOB_OVER_SIZE, FAKE_CHART_DRIP = "4.4.4", "3.3.3", "7.7.7"
+# FAKE_CHART_HEADER_DRIP: the registry answers its status line, then drips a header line every
+# 0.3 s, for ever (#1041 review F2: a bound must hold over the headers too)
+FAKE_CHART_HEADER_DRIP = "8.8.8"
+# FAKE_CHART_HOP_UNRENDERED: an agentgateway-policies whose ui-token-hop renders on a key the
+# installer never sets: the pull secret injected at uiTokenHop.image.pullSecrets reaches no pod
+# (#1041 review F4)
+FAKE_CHART_HOP_UNRENDERED = "1.1.1"
 FAKE_CHART_VALUES = {
-    "agentgateway-policies": {   # the two private hops, as 0.3.468's schema shapes them; one public image
-        "uiTokenHop": {"enabled": True, "image": {"repository": "ghcr.io/krateo-agentiko/ui-token-hop", "tag": ""}},
+    # the two private hops, as run 19's dry pass found them: certReplayHop's image is in the values;
+    # uiTokenHop is OFF in the chart's own values and names no image there: the installer turns it on
+    # through componentValues, and its image is in a template only (#1023 A)
+    "agentgateway-policies": {       # as the real 0.2.18 values.yaml: both hops name their image
+        "uiTokenHop": {"enabled": False, "image": {"repository": "ghcr.io/krateo-agentiko/ui-token-hop", "tag": ""}},
         "certReplayHop": {"enabled": True,
                           "image": {"repository": "ghcr.io/krateo-agentiko/cert-replay-hop", "tag": ""}},
         "proxy": {"image": {"registry": "cr.agentgateway.dev", "repository": "agentgateway", "tag": "v0.7.0"}}},
     "agentgateway-controller": {"image": {"registry": "cr.agentgateway.dev", "repository": "controller",
                                           "tag": "v0.7.0"}},
+    # a private-image component with no repo of its own (the installer's ociRepo), on through portal:
+    # as alert-provider at 0.3.468 (#1041 review F1); its pull secret at the top-level imagePullSecrets
+    "alert-dispatcher": {"imagePullSecrets": [],
+                         "image": {"repository": "ghcr.io/krateo-platformops/alert-dispatcher", "tag": ""}},
 }
+#: each chart's templates, real Helm templates (rendered by the real helm)
+FAKE_CHART_TEMPLATES = {
+    "agentgateway-policies": {
+        "templates/cert-replay-hop.yaml": "{{- if .Values.certReplayHop.enabled }}\n" + """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-replay-hop
+spec:
+  template:
+    spec:
+      {{- with .Values.certReplayHop.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: hop
+        image: "{{ .Values.certReplayHop.image.repository }}:{{ .Values.certReplayHop.image.tag | default .Chart.AppVersion }}"
+""" + "{{- end }}\n",
+        # the dashboard's hop: OFF in the chart's values, its image named only here
+        "templates/ui-token-hop.yaml": "{{- if .Values.uiTokenHop.enabled }}\n" + """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui-token-hop
+spec:
+  template:
+    spec:
+      {{- with .Values.uiTokenHop.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: hop
+        image: "{{ .Values.uiTokenHop.image.repository }}:{{ .Values.uiTokenHop.image.tag | default .Chart.AppVersion }}"
+""" + "{{- end }}\n"},
+    "alert-dispatcher": {"templates/dispatcher.yaml": """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-dispatcher
+spec:
+  template:
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: d
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+"""},
+    # an init image hard-coded in a template, named by no values.yaml
+    "agentgateway-controller": {"templates/controller.yaml": """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: init
+        image: "ghcr.io/krateo-agentiko/agw-init:{{ .Chart.AppVersion }}"
+      containers:
+      - name: c
+        image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+"""},
+}
+
+
+#: the `helm template` the suite renders with: the REAL helm (found before any fake is on PATH),
+#: except FAKE_HELM_TEMPLATE_FAIL / _EMPTY = a chart name (the release name the preflight passes):
+#: that chart's render fails / renders nothing
+FAKE_HELM_TEMPLATE = """import os
+import sys
+REAL = %r
+a = sys.argv[1:]
+name = a[1] if len(a) > 1 else ""
+if os.environ.get("FAKE_HELM_TEMPLATE_FAIL") == name:
+    print(f"Error: execution error at ({name}/templates/hop.yaml:3:4): a required value is missing", file=sys.stderr)
+    sys.exit(1)
+if os.environ.get("FAKE_HELM_TEMPLATE_EMPTY") == name:
+    sys.stdin.read()
+    sys.exit(0)
+if not REAL:
+    print("Error: helm is not installed: the suite renders charts with the real helm", file=sys.stderr)
+    sys.exit(1)
+os.execv(REAL, [REAL, *a])
+"""
 
 
 def fake_bearer(token: str) -> str:
@@ -84,6 +188,7 @@ def fake_bearer(token: str) -> str:
 
 def _fake_ghcr():
     import base64
+    import shutil
     import http.server
     import json
     import ssl
@@ -109,13 +214,18 @@ def _fake_ghcr():
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             files = [("Chart.yaml", {"apiVersion": "v2", "name": chart, "version": version, "appVersion": version}),
                      ("values.yaml", FAKE_CHART_VALUES.get(chart, {}))]
+            tpls = dict(FAKE_CHART_TEMPLATES.get(chart) or {})
+            if chart == "agentgateway-policies" and version == FAKE_CHART_HOP_UNRENDERED:
+                tpls["templates/ui-token-hop.yaml"] = tpls["templates/ui-token-hop.yaml"].replace(
+                    ".Values.uiTokenHop.enabled }}", ".Values.uiTokenHop.neverOn }}", 1)
+            files += sorted(tpls.items())
             if chart == "agentgateway-policies":     # a subchart: its own values, its own appVersion
                 files += [("charts/hop-sidecar/Chart.yaml", {"apiVersion": "v2", "name": "hop-sidecar",
                                                              "version": "9.0.1", "appVersion": "9.0.1"}),
                           ("charts/hop-sidecar/values.yaml",
                            {"image": {"repository": "ghcr.io/krateo-agentiko/hop-sidecar", "tag": ""}})]
             for fn, doc in files:
-                data = yaml.safe_dump(doc).encode()
+                data = (doc if isinstance(doc, str) else yaml.safe_dump(doc)).encode()
                 ti = tarfile.TarInfo(f"{chart}/{fn}")
                 ti.size = len(data)
                 tf.addfile(ti, io.BytesIO(data))
@@ -152,6 +262,17 @@ def _fake_ghcr():
 
         def do_HEAD(self):
             import hashlib
+            if self.path.endswith("/manifests/" + FAKE_CHART_HEADER_DRIP):
+                import time
+                self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                for i in range(200):
+                    try:
+                        self.wfile.write(b"X-Drip-%d: x\r\n" % i)
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.3)
+                return
             token = bearers.get((self.headers.get("Authorization") or "")[len("Bearer "):])
             if token is None:
                 return self._answer(401)
@@ -167,15 +288,32 @@ def _fake_ghcr():
                 return self._answer(403)
             if tag == FAKE_GHCR_UNPUBLISHED:
                 return self._answer(404)
+            if self.command == "GET" and "/charts/" in f"/{name}" and tag == FAKE_CHART_DRIP:
+                import time
+                self.send_response(200)
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                for _ in range(600):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.2)
+                return
+            if self.command == "GET" and "/charts/" in f"/{name}" and tag == FAKE_CHART_BIG_MANIFEST:
+                return self._answer(200, b"{" + b" " * (4 * 1024 * 1024 + 10) + b"}")
             if self.command == "GET" and "/charts/" in f"/{name}":
                 data = chart_tgz(name, tag)
                 digest = "sha256:" + hashlib.sha256(data).hexdigest()
-                blobs[digest] = data + (b"tampered" if tag == FAKE_CHART_BAD_DIGEST else b"")
+                # tampered IN PLACE (same size): the digest check, not the size bound, must catch it
+                blobs[digest] = data[:-1] + bytes([data[-1] ^ 1]) if tag == FAKE_CHART_BAD_DIGEST else data
                 if tag == FAKE_CHART_HTTP_BLOB:
                     http_blobs.add(digest)
+                size = len(data) - (1 if tag == FAKE_CHART_BLOB_OVER_SIZE else 0)
                 return self._answer(200, json.dumps({"schemaVersion": 2, "layers": [
                     {"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip", "digest": digest,
-                     "size": len(data)}]}).encode())
+                     "size": size}]}).encode())
             return self._answer(200)
 
         def log_message(self, *a):
@@ -189,6 +327,11 @@ def _fake_ghcr():
     f = os.path.join(d, "ghcr-pull.env")
     with open(os.open(f, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
         fh.write(f"GHCR_PULL_USERNAME={FAKE_GHCR_USER}\nGHCR_PULL_TOKEN={FAKE_GHCR_TOKEN}\n")
+    tpl = os.path.join(d, "fake_helm_template.py")
+    with open(tpl, "w") as fh:
+        fh.write("#!/usr/bin/env python3" + chr(10) + FAKE_HELM_TEMPLATE % shutil.which("helm"))
+    os.chmod(tpl, 0o755)
+    os.environ["FAKE_HELM_TEMPLATE_BIN"] = tpl
     return f"https://127.0.0.1:{srv.server_address[1]}", f, cert
 
 

@@ -679,8 +679,11 @@ registryAuth:
 EOF
 }
 # s_registry: BEFORE any cluster exists, the pull token must resolve every
-# repo-override chart the installer turns on, at its pinned version, AND every
-# ghcr.io image those charts' own values name (read from the chart itself):
+# repo-override chart the installer turns on, and every private-image
+# component it turns on (inst.privateImageComponents, whatever its repo), at
+# its pinned version, AND every ghcr.io image those charts RUN: rendered with
+# helm template and the installer's componentValues, each pull-secret path
+# tied to the pod that uses it, plus what their values name:
 # a bad or under-scoped token costs nothing (bench/ghcr_pull.py preflight;
 # $OUT/ghcr-pull-preflight.json names charts, images and versions, never the
 # token).

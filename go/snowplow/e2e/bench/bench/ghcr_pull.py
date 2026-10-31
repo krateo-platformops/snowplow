@@ -49,12 +49,28 @@ written only to that pipe.
 
 The preflight resolves, before any cluster exists:
   - every repo-override chart the installer turns on (see private_pins);
-  - every ghcr.io IMAGE those charts' own values name (chart_images): the
-    chart is fetched in-process from the registry with the token (manifest,
-    then its helm layer, digest-verified), and every `image` its values.yaml
-    (subcharts included) names is resolved, an empty tag being the chart's
-    appVersion, as the charts template it. An image the token cannot read is
-    refused here, never as an ImagePullBackOff on a paid cluster.
+  - every ghcr.io IMAGE those charts run (chart_images). The chart is fetched
+    in-process from the registry with the token (manifest, then its helm
+    layer, digest-verified) and RENDERED with `helm template`, with the
+    values the installer gives that component (its componentValues: the
+    installer's own, overridden by the bench's): every `image` the rendered
+    manifests name, a template-only one included (#1023 A; run 19's dry pass
+    found ui-token-hop missing from the values-only list, because the
+    installer turns it on through componentValues). The images the chart's
+    values.yaml files name count too (a component the installer could still
+    turn on). An image the token cannot read is refused here, never as an
+    ImagePullBackOff on a paid cluster.
+  - the installer's own list of private-image components
+    (inst.privateImageComponents): each one this install enables must render,
+    and must render at least one ghcr.io image, or the derivation is not to
+    be trusted and the run is refused. A render failure of any other chart is
+    recorded, not refused.
+
+Every registry read is bounded: in size (a blob at its declared size, a
+manifest or a token answer at the distribution spec's 4 MiB) and in time (each
+call's whole answer within its own bound, not only each socket read); the
+render is bounded too. The step's bound is the sum of its calls' bounds and is
+recorded with the preflight.
 """
 
 from __future__ import annotations
@@ -65,9 +81,14 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tarfile
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -84,6 +105,28 @@ MANIFEST_TYPES = ", ".join(("application/vnd.oci.image.index.v1+json", "applicat
                             "application/vnd.docker.distribution.manifest.list.v2+json",
                             "application/vnd.docker.distribution.manifest.v2+json"))
 HELM_CHART_LAYER = "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+#: the OCI distribution spec's manifest bound (registries SHOULD accept manifests up to 4 MiB): a
+#: manifest, or a token answer, larger than that is not one
+MANIFEST_MAX = 4 * 1024 * 1024
+#: each call's WHOLE bound (seconds), connect, status line, headers and body together (_call): a
+#: registry call, a blob, a helm render (run, its output read, and parsed)
+HTTP_BOUND_S, BLOB_BOUND_S, RENDER_BOUND_S = 30.0, 60.0, 120.0
+#: Size caps, from what real charts need plus a stated margin (#1041 review F3). Measured 2026-10-31
+#: on the public charts this install pulls (installer 0.3.468, github-provider-kog 0.6.0,
+#: krateo-marketplace-catalog 0.1.2, alert-provider 0.2.55): the largest blob 363,138 B, the
+#: largest single file 833,982 B, the largest chart inflated 1,622,254 B, the largest `helm
+#: template` output 390,039 B. The margin: 16 x the largest measured, for growth.
+SIZE_MARGIN = 16
+REAL_LARGEST = {"blob": 363_138, "file": 833_982, "inflated": 1_622_254, "render": 390_039}
+BLOB_MAX = SIZE_MARGIN * REAL_LARGEST["blob"]                 # a chart blob's ceiling, whatever it declares
+CHART_INFLATED_MAX = SIZE_MARGIN * REAL_LARGEST["inflated"]   # every member of the chart, inflated
+#: one file inflated: helm's own loader limit (MaxDecompressedFileSize, 5 MiB): a chart with a
+#: larger file is one helm itself refuses to load
+CHART_FILE_MAX = 5 * 1024 * 1024
+RENDER_OUT_MAX = SIZE_MARGIN * REAL_LARGEST["render"]         # `helm template`'s stdout, read streamed
+CAPS = {"margin": SIZE_MARGIN, "real_largest": REAL_LARGEST, "blob_max": BLOB_MAX,
+        "chart_inflated_max": CHART_INFLATED_MAX, "chart_file_max": CHART_FILE_MAX,
+        "render_out_max": RENDER_OUT_MAX}
 #: the registry API. GHCR_API_URL may point it elsewhere (the suite's fake
 #: registry), over https only: the token is never sent in clear text.
 API = os.environ.get("GHCR_API_URL", "https://ghcr.io")
@@ -138,7 +181,7 @@ def creds(path: str) -> tuple[str, str]:
     return kv["GHCR_PULL_USERNAME"], kv["GHCR_PULL_TOKEN"]
 
 
-def private_pins(installer_pulled: str, values: str) -> list[dict]:
+def private_pins(installer_pulled: str, values: str, include: set[str] | frozenset = frozenset()) -> list[dict]:
     """Every pinned chart this install pulls from a repo of its OWN (the
     repo-override pins: krateo-agentiko/*, krateo-blueprints/*, ...), whose
     component the installer enables, by its own rule (inst.featureEnabled):
@@ -146,7 +189,25 @@ def private_pins(installer_pulled: str, values: str) -> list[dict]:
     always on; else the install's features (the installer's defaults,
     overridden by the bench's values). The token must resolve each one: a
     public chart resolves with any valid token, a private one only with
-    access."""
+    access.
+
+    `include`: components preflighted WHATEVER their repo (the installer's
+    private-image components, #1041 review F1): a pin with no repo of its own
+    comes from the installer's ociRepo (`default $top.Values.ociRepo $c.repo`,
+    inst.imagePullAuths' rule), the bench's ociRepo overriding the
+    installer's.
+
+    `values` per pin: what the installer gives the component, as far as it
+    can be known offline: its componentValues (the installer's values.yaml,
+    overridden by the bench's), merged as helm merges values files (a null
+    deletes the key). Known differences from the installer's real spec
+    (compositions.yaml at 0.3.468, #1041 review F5), none of which names an
+    image in the charts pulled today: the spec the installer COMPUTES wins
+    over componentValues (`merge $spec (deepCopy $custom)`), and its
+    fill-if-absent and forced writes come after (cors.enabled,
+    gateway.internalDataPlane, platformRoutes, subAgents, mcpBackendHash; the
+    image pull secrets, mirrored by with_markers). The release name is the
+    component's own name, as the installer's."""
     import yaml
 
     from bench import diag606
@@ -160,20 +221,122 @@ def private_pins(installer_pulled: str, values: str) -> list[dict]:
     except OSError:
         features = {}
     with open(values) as fh:
-        features.update((yaml.safe_load(fh) or {}).get("features") or {})
+        bench = yaml.safe_load(fh) or {}
+    features.update(bench.get("features") or {})
+    try:
+        with open(os.path.join(root, "values.yaml")) as fh:
+            inst_values = yaml.safe_load(fh) or {}
+    except OSError:
+        inst_values = {}
+    cv = dict(inst_values.get("componentValues") or {})
+    oci = bench.get("ociRepo") or inst_values.get("ociRepo")
     out = []
     for c in pins.get("components") or []:
-        if not (isinstance(c, dict) and c.get("repo")):
+        if not (isinstance(c, dict) and (c.get("repo") or c.get("name") in include)):
             continue
         f = c.get("feature") or ""
         if not f or f in core or features.get(f, False):
-            out.append({"name": c["name"], "chart": c.get("chart") or c["name"], "repo": c["repo"],
-                        "version": str(c.get("version"))})
+            repo = c.get("repo") or oci
+            if not repo:
+                raise ValueError(f"{c['name']}: no repo of its own and the installer has no ociRepo")
+            out.append({"name": c["name"], "chart": c.get("chart") or c["name"], "repo": repo,
+                        "version": str(c.get("version")),
+                        # what the installer renders this component with: its own componentValues,
+                        # overridden by the bench's
+                        "values": _merge(cv.get(c["name"]) or {}, (bench.get("componentValues") or {}).get(c["name"]) or {})})
+    return out
+
+
+def _merge(base: dict, over: dict) -> dict:
+    """helm's values merge: maps merge key by key, anything else is replaced,
+    and a null deletes the key."""
+    out = dict(base)
+    for k, v in over.items():
+        if v is None:
+            out.pop(k, None)
+        else:
+            out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+_PRIVATE_IMAGE_RX = re.compile(
+    r'\{\{-?\s*define\s+"inst\.privateImageComponents"\s*-?\}\}(.*?)\{\{-?\s*end\s*-?\}\}', re.S)
+
+
+def private_image_components(installer_pulled: str) -> set[str] | None:
+    """The names in private_image_paths()."""
+    paths = private_image_paths(installer_pulled)
+    return None if paths is None else set(paths)
+
+
+def private_image_paths(installer_pulled: str) -> dict[str, list[list[str]]] | None:
+    """The installer's own list of components with PRIVATE images (its
+    inst.privateImageComponents define: the components it injects image-pull
+    Secrets into, and at which values paths), by component. None when this
+    installer has no such define; raises ValueError when the define is not a
+    static list (it is then not the installer's rule this mirrors)."""
+    import yaml
+    tdir = os.path.join(installer_pulled, "installer", "templates")
+    bodies = []
+    for n in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+        if n.endswith((".tpl", ".yaml")):
+            with open(os.path.join(tdir, n)) as fh:
+                bodies += _PRIVATE_IMAGE_RX.findall(fh.read())
+    if not bodies:
+        return None
+    if len(bodies) != 1 or "{{" in bodies[0]:
+        raise ValueError("inst.privateImageComponents is not one static list: its rule cannot be read")
+    doc = yaml.safe_load(bodies[0]) or {}
+    out: dict[str, list[list[str]]] = {}
+    for c in doc.get("components") or []:
+        if isinstance(c, dict) and c.get("name"):
+            out.setdefault(c["name"], []).append([str(x) for x in c.get("path") or []])
     return out
 
 
 class _Refused(Exception):
     """Why a reference does not resolve (never carries a credential)."""
+
+
+def _call(fn, bound_s: float, on_timeout=None):
+    """fn() within `bound_s` of wall clock, WHOLE: the caller is answered at
+    the bound whatever fn is doing (a registry dripping its headers, a parse
+    that runs long). fn runs in a daemon thread; its socket reads wait at most
+    the bound each, so it ends too; `on_timeout` stops what it started (a
+    helm process). fn's own exception is raised here."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:          # noqa: BLE001 - re-raised in the caller
+            box["e"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(bound_s)
+    if t.is_alive():
+        if on_timeout:
+            on_timeout()
+        raise _Refused(f"no whole answer within its {bound_s:g} s bound")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
+def _read(req, cap: int, bound_s: float) -> bytes:
+    """The answer to `req`, at most `cap` bytes, the whole call (connect,
+    status, headers, body) within `bound_s` (_call)."""
+    def call():
+        with _OPEN(req, timeout=bound_s) as r:
+            out = bytearray()
+            while True:
+                chunk = r.read1(min(65536, cap + 1 - len(out)))
+                if not chunk:
+                    return bytes(out)
+                out += chunk
+                if len(out) > cap:
+                    raise _Refused(f"an answer larger than its {cap} byte bound")
+    return _call(call, bound_s)
 
 
 def _exchange(host: str, name: str, user: str, token: str) -> str:
@@ -183,11 +346,10 @@ def _exchange(host: str, name: str, user: str, token: str) -> str:
     basic = base64.b64encode(f"{user}:{token}".encode()).decode()
     req = urllib.request.Request(f"{API}/token?scope=repository:{name}:pull&service={host}",
                                  headers={"Authorization": f"Basic {basic}"})
-    with _OPEN(req, timeout=30) as r:
-        try:
-            bearer = json.loads(r.read() or b"{}").get("token")
-        except ValueError:
-            raise _Refused(f"{host} answered the token exchange for {name} with no JSON") from None
+    try:
+        bearer = json.loads(_read(req, MANIFEST_MAX, HTTP_BOUND_S) or b"{}").get("token")
+    except ValueError:
+        raise _Refused(f"{host} answered the token exchange for {name} with no JSON") from None
     if not bearer:
         raise _Refused(f"{host} gave no token for {name}")
     return bearer
@@ -209,8 +371,8 @@ def _head_manifest(host: str, name: str, tag: str, user: str, token: str) -> Non
     bearer = _exchange(host, name, user, token)
     req = urllib.request.Request(f"{API}/v2/{name}/manifests/{tag}", method="HEAD",
                                  headers={"Authorization": f"Bearer {bearer}", "Accept": MANIFEST_TYPES})
-    with _OPEN(req, timeout=30):
-        return None
+    _read(req, 0, HTTP_BOUND_S)
+    return None
 
 
 def _split_repo(repo: str, chart: str) -> tuple[str, str]:
@@ -243,22 +405,27 @@ def resolve_image(ref: str, user: str, token: str) -> str | None:
     return _ref_error(ref, lambda: _head_manifest(host, name, tag, user, token))
 
 
-def _blob(host: str, name: str, digest: str, bearer: str) -> bytes:
-    """A blob, digest-verified. The registry answers with a redirect to its
-    blob storage: followed over https only and WITHOUT the Authorization
-    header (the signed URL is the credential), like every registry client."""
+def _blob(host: str, name: str, digest: str, size: int, bearer: str) -> bytes:
+    """A blob of its DECLARED size, digest-verified. The registry answers with
+    a redirect to its blob storage: followed over https only and WITHOUT the
+    Authorization header (the signed URL is the credential), like every
+    registry client."""
+    if not isinstance(size, int) or size < 0:
+        raise _Refused(f"blob {digest[:19]} declares no size")
+    if size > BLOB_MAX:
+        raise _Refused(f"blob {digest[:19]} declares {size} bytes, over the {BLOB_MAX} byte ceiling of a chart")
+    def get(r):                          # the one read of a blob, from the registry or its storage
+        return _read(r, size, BLOB_BOUND_S)
     req = urllib.request.Request(f"{API}/v2/{name}/blobs/{digest}", headers={"Authorization": f"Bearer {bearer}"})
     try:
-        with _OPEN(req, timeout=60) as r:
-            data = r.read()
+        data = get(req)
     except urllib.error.HTTPError as e:
         loc = e.headers.get("Location") if e.code in (301, 302, 303, 307, 308) and e.headers else None
         if not loc:
             raise
         if not loc.startswith("https://"):
             raise _Refused(f"blob {digest[:19]} redirected off https") from None
-        with _OPEN(urllib.request.Request(loc), timeout=60) as r:
-            data = r.read()
+        data = get(urllib.request.Request(loc))
     algo, _, want = digest.partition(":")
     if algo != "sha256" or hashlib.sha256(data).hexdigest() != want:
         raise _Refused(f"blob {digest[:19]} does not match its digest")
@@ -270,9 +437,15 @@ def images_in_values(values, app_version: str) -> list[str]:
     under an `image` key with a `repository` (an optional `registry` before
     it; its `tag`, else its `digest`, else the chart's appVersion), or a
     string under an `image` key. Sorted, unique."""
-    out = set()
+    out, seen = set(), set()
 
     def walk(o, key):
+        if isinstance(o, (dict, list)):
+            # a YAML alias is the SAME object again: each one is walked once (an alias chain
+            # would otherwise double the walk at every level)
+            if (id(o), key) in seen:
+                return
+            seen.add((id(o), key))
         if isinstance(o, dict):
             if key == "image" and isinstance(o.get("repository"), str) and o["repository"]:
                 repo = o["repository"]
@@ -295,43 +468,233 @@ def images_in_values(values, app_version: str) -> list[str]:
     return sorted(out)
 
 
-def chart_images(repo: str, chart: str, version: str, user: str, token: str) -> tuple[list[str], str | None]:
-    """(the images oci://<repo>/<chart>:<version> names, None) or ([], why
-    not): the chart is fetched in-process (manifest, its helm layer) and read
-    in memory, never written anywhere; every values.yaml in it counts (a
-    subchart's own appVersion for its empty tags)."""
+def images_in_manifests(docs) -> list[str]:
+    """Every image the rendered manifests run: each string under an `image`
+    key, at any depth (containers, init containers, CRs that carry one).
+    Sorted, unique; YAML aliases walked once."""
+    out, seen = set(), set()
+
+    def walk(o, key):
+        if isinstance(o, (dict, list)):
+            if id(o) in seen:
+                return
+            seen.add(id(o))
+        if isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, k)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, key)
+        elif key == "image" and isinstance(o, str) and o.strip():
+            out.add(o.strip())
+    walk(docs, None)
+    return sorted(out)
+
+
+def render(data: bytes, name: str, values: dict, helm: str = "helm") -> list:
+    """`helm template` of the chart `data` with `values`: its manifests. The
+    WHOLE of it within RENDER_BOUND_S (_call): helm run, its stdout read
+    streamed and capped at RENDER_OUT_MAX, then parsed; past the bound helm
+    is killed. Raises _Refused with helm's own reason when it cannot render.
+    The chart (never a credential) is written to a private temporary
+    directory removed at once; the values go on stdin, stderr to a file."""
     import yaml
+    procs: list = []
+
+    def kill():
+        for pr in procs:
+            if pr.poll() is None:
+                pr.kill()
+
+    def run():
+        with tempfile.TemporaryDirectory(prefix="bench-render-") as d:
+            path, err = os.path.join(d, "chart.tgz"), os.path.join(d, "stderr")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            with open(err, "w+") as ef:
+                try:
+                    pr = subprocess.Popen([helm, "template", name, path, "--namespace", SECRET_NS, "-f", "-"],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=ef)
+                except OSError as e:
+                    raise _Refused(f"helm template could not run: {e}") from None
+                procs.append(pr)
+                pr.stdin.write(yaml.safe_dump(values or {}).encode())
+                pr.stdin.close()
+                out = bytearray()
+                while True:
+                    chunk = pr.stdout.read1(65536)
+                    if not chunk:
+                        break
+                    out += chunk
+                    if len(out) > RENDER_OUT_MAX:
+                        kill()
+                        raise _Refused(f"helm template rendered more than its {RENDER_OUT_MAX} byte cap")
+                rc = pr.wait()
+                ef.seek(0)
+                why = (ef.read().strip().splitlines() or [f"exit {rc}"])[-1]
+        if rc != 0:
+            raise _Refused(f"helm template failed: {why[:300]}")
+        try:
+            return [x for x in yaml.safe_load_all(out.decode()) if x is not None]
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            raise _Refused(f"helm template rendered no YAML: {str(e).splitlines()[0][:200]}") from None
+    try:
+        return _call(run, RENDER_BOUND_S, on_timeout=kill)
+    except _Refused as e:
+        if str(e).startswith("no whole answer"):
+            raise _Refused(f"helm template did not finish within its {RENDER_BOUND_S:g} s bound") from None
+        raise
+
+
+def render_images(data: bytes, name: str, values: dict, helm: str = "helm") -> list[str]:
+    """The images the chart's manifests run, rendered with `values`."""
+    return images_in_manifests(render(data, name, values, helm))
+
+
+def pods(docs) -> list[dict]:
+    """Every pod spec in the manifests (a map with a `containers` list, at
+    any depth: a Deployment's template, a Job's, a CR that embeds one):
+    {pull_secrets, images}. YAML aliases walked once."""
+    out, seen = [], set()
+
+    def walk(o):
+        if isinstance(o, (dict, list)):
+            if id(o) in seen:
+                return
+            seen.add(id(o))
+        if isinstance(o, dict):
+            if isinstance(o.get("containers"), list):
+                cs = [c for c in (o.get("initContainers") or []) + o["containers"] if isinstance(c, dict)]
+                out.append({"pull_secrets": sorted({x.get("name") for x in o.get("imagePullSecrets") or []
+                                                    if isinstance(x, dict) and x.get("name")}),
+                            "images": sorted({c["image"] for c in cs if isinstance(c.get("image"), str)})})
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(docs)
+    return out
+
+
+def marker(i: int) -> str:
+    """The pull-secret name the preflight injects at a component's i-th path."""
+    return f"bench-preflight-path-{i}"
+
+
+def with_markers(values: dict, paths: list[list[str]]) -> dict:
+    """`values` with each path's leaf set to its own marker pull secret, in
+    the shape the installer injects (`list (dict "name" ...)`,
+    compositions.yaml): which pod carries which path's secret is then read
+    from the render. The leaf is set whatever it held: the image a path
+    serves does not depend on the secret's name."""
+    import copy
+    out = copy.deepcopy(values or {})
+    for i, path in enumerate(paths):
+        cur = out
+        for seg in path[:-1]:
+            nxt = cur.get(seg)
+            if not isinstance(nxt, dict):
+                nxt = cur[seg] = {}
+            cur = nxt
+        cur[path[-1]] = [{"name": marker(i)}]
+    return out
+
+
+def path_results(docs, paths: list[list[str]], effective: dict) -> list[dict]:
+    """Per pull-secret path of a private-image component: the rendered pods
+    that carry its marker and their ghcr.io images. `ok` when such a pod runs
+    a ghcr.io image; `off` when the path's own sub-component is turned off in
+    the values the chart rendered with (an ancestor map with `enabled: false`,
+    helm's convention: nothing behind it runs); else `missing`, refused: the
+    installer injects a secret there for an image the preflight never saw."""
+    ps = pods(docs)
+    out = []
+    for i, path in enumerate(paths):
+        imgs = sorted({im for pd in ps if marker(i) in pd["pull_secrets"] for im in pd["images"]})
+        ghcr = [im for im in imgs if im.startswith(REGISTRY_HOST + "/")]
+        off, cur = None, effective
+        for k, seg in enumerate(path[:-1]):
+            cur = cur.get(seg) if isinstance(cur, dict) else None
+            if isinstance(cur, dict) and cur.get("enabled") is False:
+                off = ".".join(path[:k + 1]) + ".enabled: false"
+                break
+        res = "ok" if ghcr else ("off" if off else "missing")
+        out.append({"path": ".".join(path), "result": res, "images": imgs,
+                    **({"why": off} if res == "off" else {})})
+    return out
+
+
+def chart_images(repo: str, chart: str, version: str, user: str, token: str, values: dict | None = None,
+                 helm: str = "helm", name: str | None = None, paths: list[list[str]] | None = None) -> dict:
+    """What oci://<repo>/<chart>:<version> runs: {images, rendered,
+    render_error, error}. The chart is fetched in-process (manifest, its helm
+    layer); `rendered` is what `helm template` with `values` (the installer's
+    componentValues for it) runs, None with `render_error` when it cannot
+    render; `images` adds what every values.yaml in it names (a subchart's own
+    appVersion for its empty tags). `error` when the chart itself cannot be
+    read: then nothing is known about its images.
+
+    `name` is the release name (the installer renders a component under its
+    own name, $c.name). `paths`: the component's pull-secret paths when it is
+    a private-image component; then `paths` gets each one's pods (see
+    path_results)."""
+    import yaml
+    release = name or chart
     host, name = _split_repo(repo, chart)
     ref = f"oci://{host}/{name}:{version}"
+    out = {"images": [], "rendered": None, "render_error": None, "error": None, "paths": None}
 
     def fetch():
         bearer = _exchange(host, name, user, token)
         req = urllib.request.Request(f"{API}/v2/{name}/manifests/{version}",
                                      headers={"Authorization": f"Bearer {bearer}",
                                               "Accept": "application/vnd.oci.image.manifest.v1+json"})
-        with _OPEN(req, timeout=30) as r:
-            manifest = json.loads(r.read() or b"{}")
+        try:
+            manifest = json.loads(_read(req, MANIFEST_MAX, HTTP_BOUND_S) or b"{}")
+        except ValueError:
+            raise _Refused("its manifest is not JSON") from None
         layers = [x for x in manifest.get("layers") or [] if x.get("mediaType") == HELM_CHART_LAYER]
         if len(layers) != 1:
             raise _Refused(f"{len(layers)} helm chart layers in its manifest")
-        data = _blob(host, name, layers[0]["digest"], bearer)
-        charts, values = {}, {}
+        data = _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer)
+        charts, vals, inflated = {}, {}, 0
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-            for m in tf.getmembers():
+            for m in tf:                         # streamed: stops at the first cap passed
+                inflated += max(0, m.size)
+                if inflated > CHART_INFLATED_MAX:
+                    raise _Refused(f"its chart inflates past {CHART_INFLATED_MAX} bytes")
                 d, _, base = m.name.rpartition("/")
                 if m.isfile() and base in ("Chart.yaml", "values.yaml"):
-                    doc = yaml.safe_load(tf.extractfile(m).read()) or {}
-                    (charts if base == "Chart.yaml" else values)[d] = doc
+                    if m.size > CHART_FILE_MAX:
+                        raise _Refused(f"{m.name} inflates to {m.size} bytes, past helm's own "
+                                       f"{CHART_FILE_MAX} byte file limit")
+                    doc = yaml.safe_load(tf.extractfile(m).read(CHART_FILE_MAX + 1)) or {}
+                    (charts if base == "Chart.yaml" else vals)[d] = doc
         if not charts:
             raise _Refused("no Chart.yaml in its chart layer")
         imgs = set()
-        for d, v in values.items():
+        for d, v in vals.items():
             c = charts.get(d) or {}
             imgs.update(images_in_values(v, str(c.get("appVersion") or c.get("version") or version)))
+        try:
+            given = with_markers(values or {}, paths) if paths else (values or {})
+            docs = render(data, release, given, helm)
+            out["rendered"] = images_in_manifests(docs)
+            imgs.update(out["rendered"])
+            if paths:
+                top = min(vals, key=len) if vals else None
+                out["paths"] = path_results(docs, paths, _merge(vals.get(top) or {}, given))
+        except _Refused as e:
+            out["render_error"] = str(e)
         return sorted(imgs)
 
     res = _ref_error(ref, fetch)
-    return (res, None) if isinstance(res, list) else ([], f"its images unreadable: {res}")
+    if isinstance(res, list):
+        out["images"] = res
+    else:
+        out["error"] = f"{ref}: its images unreadable: " + (res[len(ref) + 2:] if res.startswith(f"{ref}: ") else res)
+    return out
 
 
 def dockerconfigjson(user: str, token: str) -> str:
@@ -351,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--installer-pulled", required=True)
     pf.add_argument("--values", required=True)
     pf.add_argument("--out", required=True)
+    pf.add_argument("--helm", default="helm", help="the helm that renders each chart (helm template)")
     a = ap.parse_args(argv)
     why = check(a.env_file)
     if why:
@@ -369,24 +733,56 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(dockerconfigjson(user, token))
         return 0
     try:
-        pins = private_pins(a.installer_pulled, a.values)
+        paths = private_image_paths(a.installer_pulled)
+        private = None if paths is None else set(paths)
+        pins = private_pins(a.installer_pulled, a.values, include=private or frozenset())
     except ValueError as e:              # the installer's enable rule unreadable: nothing to resolve against
         print(f"refusing: {e}", file=sys.stderr)
         return 2
     res, images, other = [], {}, {}
     for p in pins:
-        err = resolve(p["repo"], p["chart"], p["version"], user, token)
+        ref = f"{p['repo']}/{p['chart']}"
+        err, render, ci = resolve(p["repo"], p["chart"], p["version"], user, token), None, None
         if not err:
-            imgs, err = chart_images(p["repo"], p["chart"], p["version"], user, token)
-            for i in imgs:
+            ci = chart_images(p["repo"], p["chart"], p["version"], user, token, p["values"], a.helm,
+                              name=p["name"], paths=(paths or {}).get(p["name"]))
+            err = ci["error"]
+            render = (None if ci["error"] else ("failed: " + ci["render_error"]) if ci["render_error"]
+                      else f"ok ({len(ci['rendered'])} images)")
+            if not err and private is not None and p["name"] in private:
+                # the installer injects image-pull Secrets into this one: its images MUST be known
+                missing = [r["path"] for r in ci["paths"] or [] if r["result"] == "missing"]
+                if ci["render_error"]:
+                    err = (f"{ref}:{p['version']}: the installer lists it as a private-image component "
+                           f"(inst.privateImageComponents) and it cannot be rendered: {ci['render_error']}")
+                elif missing:
+                    err = (f"{ref}:{p['version']}: the installer lists it as a private-image component "
+                           f"(inst.privateImageComponents), yet no rendered pod running a {REGISTRY_HOST} "
+                           f"image carries the pull secret it injects at {', '.join(missing)} (the image "
+                           f"behind it was never seen)")
+            for i in ci["images"]:
                 (images if i.startswith(REGISTRY_HOST + "/") else other).setdefault(i, []).append(p["name"])
-        res.append({"chart": f"{p['repo']}/{p['chart']}", "version": p["version"], "error": err})
+        res.append({"chart": ref, "version": p["version"], "render": render,
+                    "private_image_component": bool(private and p["name"] in private),
+                    "paths": ci["paths"] if ci else None, "error": err})
     img_res = [{"image": i, "charts": c, "error": resolve_image(i, user, token)} for i, c in sorted(images.items())]
+    # the step's bound: every call it made at its own WHOLE bound (_call; a resolve = 2 calls; a chart
+    # read = 2 calls and its blob; an image = 2 calls) and each render at its own
+    bound = len(pins) * (4 * HTTP_BOUND_S + BLOB_BOUND_S + RENDER_BOUND_S) + len(img_res) * 2 * HTTP_BOUND_S
+    how = (f"{len(pins)} charts x (4 x {HTTP_BOUND_S:g} + {BLOB_BOUND_S:g} + {RENDER_BOUND_S:g} s) + "
+           f"{len(img_res)} images x (2 x {HTTP_BOUND_S:g} s)")
     with open(a.out, "w") as fh:
-        json.dump({"kind": "ghcr_pull_preflight", "charts": res, "images": img_res,
+        json.dump({"kind": "ghcr_pull_preflight", "bound_s": bound, "bound": how, "caps": CAPS,
+                   "private_image_components": sorted(private) if private is not None else None,
+                   "charts": res, "images": img_res,
                    "images_elsewhere": [{"image": i, "charts": c} for i, c in sorted(other.items())]}, fh, indent=1)
+    print(f"[ghcr] the step's bound: {bound:g} s ({how})", file=sys.stderr)
+    if private is None:
+        print("[ghcr] this installer declares no inst.privateImageComponents: no private-image self-check",
+              file=sys.stderr)
     for r in res:
-        print(f"[ghcr] {r['chart']} {r['version']}: {'OK' if not r['error'] else r['error']}", file=sys.stderr)
+        print(f"[ghcr] {r['chart']} {r['version']}: {'OK' if not r['error'] else r['error']}"
+              + (f" (render {r['render']})" if r["render"] else ""), file=sys.stderr)
     for r in img_res:
         print(f"[ghcr] image {r['image']} ({', '.join(r['charts'])}): {'OK' if not r['error'] else r['error']}",
               file=sys.stderr)
