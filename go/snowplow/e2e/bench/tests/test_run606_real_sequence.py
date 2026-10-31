@@ -158,9 +158,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     record("kubectl", kc, resolved)
     port = os.environ["FAKE_PORT"]
     if a[:3] == ["create", "secret", "generic"]:
-        # the ghcr pull Secret: its value comes on stdin (--from-file=token=/dev/stdin)
-        with open(os.path.join(STATE, "created-secret"), "w") as fh:
-            fh.write(json.dumps({"argv": a, "stdin": sys.stdin.read(), "ns": ns}))
+        # the ghcr pull Secret and the image-pull Secret: their values come on stdin
+        with open(os.path.join(STATE, "created-secrets.jsonl"), "a") as fh:
+            fh.write(json.dumps({"argv": a, "stdin": sys.stdin.read(), "ns": ns}) + chr(10))
         print(f"secret/{a[3]} created"); sys.exit(0)
     if a[:1] == ["apply"] and "-f" in a:
         # every object applied, by apiVersion and kind (tests/test_crd_schema.py: the
@@ -681,7 +681,16 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                    for n, c, r in (("oasgen-provider-0", "oasgen-provider", 0),
                                    ("installer-core-provider-0", "core-provider", 1))])
         if what == "pods":
-            items([{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
+            pull = []
+            if os.environ.get("FAKE_IMAGE_PULL"):
+                pull = [{"metadata": {"name": "agentgateway-policies-ui-token-hop-7d9f-x2", "namespace": "krateo-system"},
+                         "spec": {"nodeName": "n1", "imagePullSecrets": [{"name": "krateo-registry-image-pull"}],
+                                  "containers": [{"name": "hop", "image": "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18"}]},
+                         "status": {"phase": "Pending", "containerStatuses": [{"name": "hop", "ready": False,
+                             "restartCount": 0, "image": "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18",
+                             "state": {"waiting": {"reason": "ImagePullBackOff",
+                                 "message": 'Back-off pulling image "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18"'}}}]}}]
+            items(pull + [{"metadata": {"name": "ok-0", "namespace": "krateo-system"},
                     "spec": {"nodeName": "n1"}, "status": {"phase": "Running",
                     "containerStatuses": [{"name": "c", "ready": True, "restartCount": 0, "state": {"running": {}}}]}},
                    {"metadata": {"name": "crash-0", "namespace": "krateo-system"},
@@ -689,6 +698,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                     "containerStatuses": [{"name": "app", "ready": False, "restartCount": 3,
                         "state": {"waiting": {"reason": "CrashLoopBackOff"}},
                         "lastState": {"terminated": {"reason": "Error", "exitCode": 1}}}]}}])
+        if what == "events" and "reason=FailedToRetrieveImagePullSecret" in a:
+            items([{"reason": "FailedToRetrieveImagePullSecret", "type": "Warning",
+                    "involvedObject": {"kind": "Pod", "namespace": "krateo-system",
+                                       "name": "agentgateway-policies-ui-token-hop-7d9f-x2"},
+                    "message": "Unable to retrieve some image pull secrets (krateo-registry-image-pull); "
+                               "attempting to pull the image without them"}]
+                  if os.environ.get("FAKE_IMAGE_PULL") == "missing_secret" else [])
         if what == "events":
             ev = [{"lastTimestamp": "2026-10-14T08:10:00Z", "type": "Warning",
                    "reason": "BackOff", "involvedObject": {"kind": "Pod", "namespace": "krateo-system", "name": "crash-0"},
@@ -1201,11 +1217,13 @@ def test_failure_path_writes_redacted_diagnostics_before_teardown(harness):
     def verb(c):
         a = [x for x in c["argv"] if not x.startswith(("--kubeconfig=", "--context="))]
         return a[2:] if a[:1] == ["-n"] else a
-    # no Secret is ever READ (the one write: the ghcr pull Secret, created at install from stdin)
+    # no Secret is ever READ (the two writes: the ghcr pull Secret and the image-pull Secret,
+    # created at install from stdin)
     assert not any(a in ("secret", "secrets") for c in calls
                    if c["tool"] == "kubectl" and verb(c)[:1] != ["create"] for a in verb(c)[:3])
     assert [verb(c)[:4] for c in calls if c["tool"] == "kubectl" and verb(c)[:1] == ["create"]
-            and "secret" in verb(c)] == [["create", "secret", "generic", "krateo-agentiko-pull"]]
+            and "secret" in verb(c)] == [["create", "secret", "generic", "krateo-agentiko-pull"],
+                                         ["create", "secret", "generic", "bench-ghcr-image-pull"]]
     # diagnostics were taken BEFORE the delete, and the delete still happened
     idx_logs = max(i for i, c in enumerate(calls)
                    if c["tool"] == "kubectl" and verb(c)[:1] == ["logs"])
