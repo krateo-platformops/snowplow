@@ -107,6 +107,13 @@ func su994Informer(t *testing.T, secrets ...*corev1.Secret) {
 // Secret name it was asked for.
 func su994APIServer(t *testing.T, have ...*corev1.Secret) func() []string {
 	t.Helper()
+	return su994APIServerFailing(t, nil, have...)
+}
+
+// su994APIServerFailing is su994APIServer that answers the given HTTP status
+// (an apiserver Status body) for each name in fail, whether or not it holds it.
+func su994APIServerFailing(t *testing.T, fail map[string]int, have ...*corev1.Secret) func() []string {
+	t.Helper()
 	byName := map[string]*corev1.Secret{}
 	for _, s := range have {
 		byName[s.Name] = s
@@ -124,6 +131,18 @@ func su994APIServer(t *testing.T, have ...*corev1.Secret) func() []string {
 		mu.Lock()
 		asked = append(asked, name)
 		mu.Unlock()
+		if code, failing := fail[name]; failing {
+			reason := "InternalError"
+			if code == http.StatusForbidden {
+				reason = "Forbidden"
+			}
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": reason, "code": code,
+				"message": "secrets is " + strings.ToLower(reason), "details": map[string]any{"name": name, "kind": "secrets"},
+			})
+			return
+		}
 		s, ok := byName[name]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -243,5 +262,33 @@ func TestUserConfig994_MissingStepUpSecretIs401NoFallback(t *testing.T) {
 	got := asked()
 	if len(got) != 1 || got[0] != credsecret.StepUpName(su994User) {
 		t.Fatalf("the apiserver re-read must ask for the step-up Secret only (no session fallback), got %v", got)
+	}
+}
+
+// A step-up re-read that FAILS (403 or 5xx, not NotFound) answers an error —
+// upstream's non-NotFound branch, 500 — and never falls back to the session
+// Secret, which is present in the informer and readable on the apiserver.
+func TestUserConfig994_StepUpReReadErrorIsAnErrorNoFallback(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			session := su994Secret(credsecret.SessionName(su994User), su994Session)
+			su994Informer(t, session)
+			asked := su994APIServerFailing(t, map[string]int{credsecret.StepUpName(su994User): code}, session)
+
+			res := su994Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
+			if res.reached || res.code != http.StatusInternalServerError {
+				t.Fatalf("NO-FALLBACK VIOLATED: a step-up re-read answering %d must answer 500 without reaching the handler; "+
+					"code=%d reached=%v endpoint=%q (session endpoint %q)", code, res.code, res.reached, res.ep.ServerURL, su994Session)
+			}
+			got := asked()
+			if len(got) == 0 {
+				t.Fatal("PRE: the informer miss must re-read the step-up Secret from the apiserver")
+			}
+			for _, name := range got {
+				if name != credsecret.StepUpName(su994User) {
+					t.Fatalf("the apiserver re-read asked for %q; only the step-up Secret may be read (reads=%v)", name, got)
+				}
+			}
+		})
 	}
 }
