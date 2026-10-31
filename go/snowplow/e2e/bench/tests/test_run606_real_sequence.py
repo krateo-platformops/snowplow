@@ -586,7 +586,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             if extra:
                 kids.append("compositiondefinitions/krateo-system/oasgen-provider")
             msg = (f"{len(kids)} of 41 managed children are not ready: " + ", ".join(kids)) if kids else ""
-            inst = cr("Installer", "installer", not kids, "Creating" if kids else "Available", msg)
+            # FAKE_INSTALLER_SMSG: the Installer's Synced message (#1006 R3-2: it may name the pull account)
+            inst = cr("Installer", "installer", not kids, "Creating" if kids else "Available", msg,
+                      smsg=os.environ.get("FAKE_INSTALLER_SMSG", ""))
             # spec.components as the 0.3.459 Installer CR carries it: what it WILL
             # create (a feature-off entry is not created; github-provider-kog is
             # declared, its CR never appears while its definition 401s)
@@ -615,6 +617,20 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                       "helm install failed: token=" + os.environ.get("FAKE_TOKVAL", ""))])
         if what.startswith("snowplows."):
             items([cr("Snowplow", "snowplow", ready)])
+        if what.startswith("frontends.") and "-A" not in a:
+            # what the installer RENDERED into the Frontend composition: FAKE_RENDERED = same (default)
+            # | split | absent | unread
+            mode = os.environ.get("FAKE_RENDERED", "same")
+            if mode == "unread":
+                print("Error from server (Forbidden): frontends is forbidden", file=sys.stderr); sys.exit(1)
+            host = "http://10.0.0.9" if mode == "same" else "http://localhost:808"
+            cfg = ({"SNOWPLOW_API_BASE_URL": host + "/content", "AUTHN_API_BASE_URL": host + "/auth",
+                    "EVENTS_API_BASE_URL": host + "/events", "EVENTS_PUSH_API_BASE_URL": host + "/events"}
+                   if mode == "same" else
+                   {"SNOWPLOW_API_BASE_URL": "http://localhost:8081", "AUTHN_API_BASE_URL": "http://localhost:8082",
+                    "EVENTS_API_BASE_URL": "http://localhost:8083", "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"})
+            print(json.dumps({"items": [] if mode == "absent" else [{"spec": {"config": cfg}}]}))
+            sys.exit(0)
         if what.startswith("frontends."):
             items([cr("Frontend", "frontend", True)])
         if what.startswith("portals."):
@@ -744,6 +760,54 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what.startswith("githubscaffoldingwithcompositionpages"):
             print("\\n".join(f"bench-ns-01 bench-app-01-0{i} 1m" for i in range(1, 5)))
             sys.exit(0)
+        if what == "svc" and "krateo-agent-gateway-platform" in a:
+            # the platform gateway (#1005): FAKE_GATEWAY = address (default) | none (GCP still
+            # provisioning) | absent (NotFound) | unread (an API error) | flap (address, then none on
+            # every 2nd read) | blip (address; read 2 is one API error; address again: #1006 R2-1)
+            mode = os.environ.get("FAKE_GATEWAY", "address")
+            if mode == "blip":
+                cnt = os.path.join(STATE, "gateway_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                mode = "unread" if n == 1 else "address"
+            if mode == "flap":
+                cnt = os.path.join(STATE, "gateway_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                mode = "address" if n % 2 == 0 else "none"
+            if mode == "absent":
+                print('Error from server (NotFound): services "krateo-agent-gateway-platform" not found',
+                      file=sys.stderr); sys.exit(1)
+            if mode == "unread":
+                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr)
+                sys.exit(1)
+            ing = [{"ip": "10.0.0.9"}] if mode == "address" else []
+            print(json.dumps({"metadata": {"name": "krateo-agent-gateway-platform"},
+                              "status": {"loadBalancer": {"ingress": ing}}}))
+            sys.exit(0)
+        if what in ("deploy", "deployments") and "json" in a and len([x for x in a[2:] if not x.startswith("-")
+                                                                     and x != "json"]) == 0:
+            # the installer cdc, by FAKE_CDC_RESYNC=<source>:<interval>: args | env | configmap | none
+            src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
+            c = {"name": "installers-v0-3-422-controller",
+                 "args": ["-group=composition.krateo.io", "-resource=installers"]
+                         + ([f"-resync-interval={iv}"] if src == "args" else []),
+                 "env": [{"name": "COMPOSITION_CONTROLLER_RESYNC_INTERVAL", "value": iv}] if src == "env" else [],
+                 "envFrom": [{"configMapRef": {"name": "installers-v0-3-422-configmap"}}]}
+            avail = os.environ.get("FAKE_CDC_AVAILABLE", "True")
+            d = {"metadata": {"name": "installers-v0-3-422-controller"},
+                 "spec": {"template": {"spec": {"containers": [c]}}},
+                 "status": {"conditions": [{"type": "Available", "status": avail}]}}
+            items = [] if src == "none" else [d]
+            if os.environ.get("FAKE_CDC_COUNT") == "2":
+                items.append(dict(d, metadata={"name": "installers-v0-3-421-controller"}))
+            print(json.dumps({"items": items}))
+            sys.exit(0)
+        if what in ("configmap", "configmaps") and "json" in a and "frontend-config-vars" not in a:
+            src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
+            data = {"COMPOSITION_CONTROLLER_RESYNC_INTERVAL": iv} if src == "configmap" else {"OTHER": "x"}
+            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data}]}))
+            sys.exit(0)
         if what == "svc":
             mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending
             ports = {"snowplow": 8081, "authn": 8082, "frontend": 8080}
@@ -773,8 +837,15 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                   "widgets.templates.krateo.io/v1beta1&name=app-shell"
                                   "&namespace=krateo-system")
             # the installer's path-mode URLs (one origin, 057's paths); FAKE_PORTAL=split:
-            # the localhost defaults a config keeps until the gateway has an address
-            if os.environ.get("FAKE_PORTAL") == "split":
+            # the localhost defaults a config keeps until the gateway has an address;
+            # FAKE_PORTAL=after:N: split for the first N reads, then same-origin (#1005)
+            portal = os.environ.get("FAKE_PORTAL", "")
+            if portal.startswith("after:"):
+                cnt = os.path.join(STATE, "portal_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                portal = "split" if n < int(portal.split(":")[1]) else ""
+            if portal == "split":
                 urls = {"SNOWPLOW_API_BASE_URL": "http://localhost:8081",
                         "AUTHN_API_BASE_URL": "http://localhost:8082",
                         "EVENTS_API_BASE_URL": "http://localhost:8083",
@@ -1241,12 +1312,13 @@ def test_a_portal_on_several_origins_stops_the_run_at_the_platform_step(harness)
     with what config.json said; the cluster is still torn down."""
     env, state, ambient, tmp = harness
     env["FAKE_PORTAL"] = "split"
-    env["DEPLOY_WAIT_S"] = "1"            # the gate's deadline: the platform's and deploy's budgets
+    env["FAKE_CDC_RESYNC"] = "args:1s"    # the gate's window: 2 x the cdc's resync (#1005)
+    env["FAKE_RENDERED"] = "split"        # the installer renders the localhost defaults: its defect
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
                        capture_output=True, text=True, timeout=300)
     out = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "portal origin FAILED" in out and "3 origins" in out
+    assert "portal origin FAILED" in out and "3 origins" in out and "INSTALLER DEFECT" in out
     assert "=== step preflight ===" not in out and "=== step data ===" not in out
     fails = [json.loads(ln) for ln in (tmp / "out" / "command-failures.jsonl").read_text().splitlines()]
     assert any(f["step"] == "platform" and "portal origin FAILED" in f["what"] for f in fails)

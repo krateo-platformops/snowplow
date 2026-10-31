@@ -211,15 +211,23 @@ def test_every_collect_read_is_bounded_twice(harness):
 # ─── (d) TTL budget ────────────────────────────────────────────────────────
 
 
-def test_default_plan_fits_the_default_ttl(tmp_path):
+def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
+    """#1006: no hand-set default. The DEFAULT plan's budget is 38,118 s (the
+    script's own budget line: 35,670 s + the 828 s evaluate term, #898, + 2 x
+    300 s platform definitions, #960, + 2 x 300 s menu-class preflights, run
+    19, + the portal-origin gate's own 600 + 2 x 180 + 60 s in place of the
+    env step's 600 s, #1005); + the 1,800 s margin = 39,918 s -> 12 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "run budget:" in p.stderr and "fits TTL_HOURS=11" in p.stderr
+    assert "= 38118 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 38118 s" in p.stderr
+    # a longer plan derives a longer TTL; it is not refused
+    p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
+    assert p.returncode == 0 and "fits TTL_HOURS=13 (46800 s; derived" in p.stderr
 
 
-@pytest.mark.parametrize("env,needs", [({"FRESH_SAMPLES": "100"}, None),
-                                       ({"TTL_HOURS": "8"}, None)])
-def test_a_plan_beyond_the_ttl_is_refused_before_any_cloud_call(tmp_path, env, needs):
+@pytest.mark.parametrize("env", [{"TTL_HOURS": "8"}, {"TTL_HOURS": "11"},
+                                 {"FRESH_SAMPLES": "100", "TTL_HOURS": "12"}])
+def test_a_hand_set_ttl_the_plan_does_not_fit_is_refused_before_any_cloud_call(tmp_path, env):
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", **env)
     assert p.returncode == 2
     assert "refusing: worst-case run" in p.stderr and "needs TTL_HOURS >=" in p.stderr
@@ -227,16 +235,14 @@ def test_a_plan_beyond_the_ttl_is_refused_before_any_cloud_call(tmp_path, env, n
     assert "=== step" not in p.stderr                                # nothing ran
 
 
-def test_a_plan_inside_the_margin_but_under_the_ttl_is_refused(tmp_path):
-    """R11: the margin is part of the bar. The DEFAULT plan's budget is
-    37,698 s (the script's own budget line; 35,670 s + the 828 s evaluate
-    term, #898, + 2 x 300 s for the platform definitions, #960, + 2 x 300 s
-    for the two menu classes' preflights, run 19), against TTL 39,600 s −
-    1,800 s margin = 37,800 s: it fits. THIS test's plan adds 1,800 s of data
-    budget (THINK_S=60, DATA_TIMEOUT_S=4200): 39,498 s, under the raw TTL but
-    inside the margin → refused."""
-    p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="4200")
-    assert p.returncode == 2 and "refusing: worst-case run 39498 s" in p.stderr
+def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path):
+    """R11: the margin is part of the bar. THIS plan adds 3,400 s of data
+    budget to the default 38,118 s (DATA_TIMEOUT_S=5800): 41,518 s, under a
+    hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with
+    the hours it needs."""
+    p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
+    assert p.returncode == 2 and "refusing: worst-case run 41518 s" in p.stderr
+    assert "needs TTL_HOURS >= 13" in p.stderr
 
 
 def test_fresh606_phases_are_bounded_and_truncation_is_recorded():
