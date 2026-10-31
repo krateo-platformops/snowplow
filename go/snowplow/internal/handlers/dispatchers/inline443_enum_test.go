@@ -381,6 +381,7 @@ var goAllow443 = map[string]bool{
 	"apistage_stale_debt.go:serveStaleWithDebt":         true,  // #710 PR-2b: starts a debt's refill only past its cache.Inert check
 	"apistage_stale_debt.go:goReplaceStaleDependent":    false, // #710 PR-2b: a committed dependent's replace + push; only past serveStaleWithDebt's Inert check
 	"apistage_stale_debt.go:ensureStaleOverdueScanner":  false, // #710 PR-2b: once-per-process overdue ticker (counters + one WARN)
+	"apistage_stale_debt.go:joinStaleDebts":             false, // #1033 review: test joins only; waits staleDebtWG and closes a channel, no cache access
 	"informer_dispatch_metrics.go:startDispatchSummary": false, // once-per-process summary log ticker
 	"informer_serve.go:startObjectsGetSummary":          false, // once-per-process summary log ticker
 }
