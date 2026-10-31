@@ -7,12 +7,28 @@
 # (ResolveOptions rc/SArc, ResolvedEntry Put-site scope-completeness, BindingUID single-source,
 # identity-key completeness, and the unchecked *unstructured assert guard) are NOT covered by the reusable, so they are kept as a
 # local `lint-gates` job that runs from the go/snowplow module dir (fold-safe).
+#
+# The same jobs also run on every push to main (#1035). Each PR is tested against the main it was
+# branched from, so two PRs that each pass alone can still break main when combined, and nothing
+# else tests main before a release tag. Running this workflow on the merged commit tests exactly
+# what the next tag will ship, with the same jobs, the same flags and the same check names.
 name: release-pullrequest
 
 on:
   pull_request:
     branches:
       - main
+  push:
+    branches:
+      - main
+
+# On main, a newer merge supersedes the run for the commit before it: that newer commit contains
+# the older one, so only its result matters and the older run is cancelled. Each pull_request run
+# gets a group of its own (the run id), so PR runs behave exactly as they did before: nothing is
+# queued or cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   build:
