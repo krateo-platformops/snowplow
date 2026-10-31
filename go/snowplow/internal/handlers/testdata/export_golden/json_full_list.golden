@@ -1,0 +1,32 @@
+status: 200
+Content-Type: "application/json"
+Content-Disposition: "attachment; filename=\"golden.json\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=2&resource=restactions
+call[1]: name=demo&page=2&perPage=2&resource=restactions
+body:
+[
+  {
+    "id": 0,
+    "name": "row-0",
+    "nested": {
+      "v": 0.5
+    }
+  },
+  {
+    "id": 1,
+    "name": "row-1",
+    "nested": {
+      "v": 1.5
+    }
+  },
+  {
+    "id": 2,
+    "name": "row-2",
+    "nested": {
+      "v": 2.5
+    }
+  }
+]

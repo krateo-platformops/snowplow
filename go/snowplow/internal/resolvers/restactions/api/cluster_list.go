@@ -690,6 +690,26 @@ var clusterListInflightCells sync.Map
 // path.
 const clusterListAsyncPopulateTimeout = 30 * time.Second
 
+// WaitClusterListAsyncIdleForTest blocks until no populateClusterListCellAsync
+// goroutine is running. A populate takes its semaphore slot before its
+// goroutine starts and gives it back when the populate is done, so holding
+// every slot at once means none is running. Test-only — production code MUST
+// NOT call this. A harness registers it as the cleanup that runs BEFORE it
+// resets the globals a populate reads (the dependency tracker, the resolved
+// cache): the populate detaches from the request and outlives it. Do not mix
+// it with ResetClusterListAsyncStateForTest while a populate runs: that drain
+// takes back a running populate's slot, and the populate's own release would
+// then consume one of these.
+func WaitClusterListAsyncIdleForTest() {
+	n := cap(clusterListAsyncSemaphore)
+	for range n {
+		clusterListAsyncSemaphore <- struct{}{}
+	}
+	for range n {
+		<-clusterListAsyncSemaphore
+	}
+}
+
 // ResetClusterListAsyncStateForTest clears the inflight-cells dedup map
 // + drains the bounded-concurrency semaphore. Test-only — production
 // code MUST NOT call this. Used by tests to prevent state leakage

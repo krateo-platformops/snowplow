@@ -243,10 +243,18 @@ func (s *StageOutcomes) HeaderValue() string {
 	s.mu.Unlock()
 	b, err := json.Marshal(out)
 	if err != nil || len(b) > StageOutcomesMaxHeaderBytes {
-		t, _ := json.Marshal(map[string]any{"truncated": true, "failed": failed})
-		return string(t)
+		return TruncatedStageOutcomes(failed)
 	}
 	return string(b)
+}
+
+// TruncatedStageOutcomes is the header value that replaces a per-stage list
+// longer than StageOutcomesMaxHeaderBytes: {"truncated":true,"failed":N}.
+// Both writers of the header, a resolve and an export's merge of its pages,
+// render the summary here, so it has one shape.
+func TruncatedStageOutcomes(failed int) string {
+	t, _ := json.Marshal(map[string]any{"truncated": true, "failed": failed})
+	return string(t)
 }
 
 // stageReasonOf maps an accumulated per-item error value to a reason code.

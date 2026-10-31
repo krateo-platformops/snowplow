@@ -1,0 +1,47 @@
+status: 200
+Content-Type: "application/json"
+Content-Disposition: "attachment; filename=\"golden.json\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=500&resource=restactions
+body:
+[
+  {
+    "health": "OK",
+    "labels": {
+      "app.kubernetes.io/name": "web"
+    },
+    "meta": {},
+    "name": "alpha",
+    "note": null,
+    "ready": true,
+    "tags": [
+      "a",
+      "b"
+    ],
+    "usage": {
+      "cpu": 2,
+      "mem": 1.5
+    }
+  },
+  {
+    "health": "Critical, degraded",
+    "multi": "line one\nline \"two\"",
+    "name": "=1+1",
+    "ready": false,
+    "tags": [],
+    "text": "Grüße — Ελληνικά — Кириллица — 東京",
+    "usage": {
+      "cpu": 7
+    }
+  },
+  {
+    "health": "-x",
+    "name": "@SUM(A1)",
+    "ready": true,
+    "usage": {
+      "cpu": 0.25
+    }
+  }
+]
