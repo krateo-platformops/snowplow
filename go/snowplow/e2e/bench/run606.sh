@@ -260,7 +260,10 @@ fi
 ORIGIN_RESYNC_BUDGET_S="$(python3 -c 'import math; from bench import origin_gate; print(math.ceil(origin_gate.COMPILED_DEFAULT_S))')"
 ORIGIN_GATE_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1]) + 2 * float(sys.argv[2]) + float(sys.argv[3])))' \
     "$ENDPOINT_WAIT_S" "$ORIGIN_RESYNC_BUDGET_S" "${PLATFORM_POLL_S:-60}")"
-RUN_BUDGET_S=$(( UP_BUDGET_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
+# the pre-drive PSI check (#1042): one more preflight Job, on the k6 driver only (its browser)
+PSI_JOBS=0
+[[ "$LOAD_DRIVER" == "k6" ]] && PSI_JOBS=1
+RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
@@ -275,7 +278,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 # what the TTL holds past the plan's worst case and the margin: the room a
 # portal-origin window longer than its budget term may take (#1006 F8)
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
-budget_line="up ${UP_BUDGET_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -971,6 +974,38 @@ run_preflight_job() {
     return 1
   fi
   log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
+}
+# s_psi (#1042): right after the loadgen node exists, before any install or
+# drive time: the browser's starvation evidence needs the kernel's PSI. A
+# container on the loadgen pool (the browser's pin) reads its cgroup's
+# cpu.pressure and the node's /proc/pressure/cpu; either unreadable refuses
+# the run here, with the reason, and teardown runs as for any failed step.
+s_psi() {
+  if [[ "$LOAD_DRIVER" != "k6" ]]; then
+    log "psi: not checked (LOAD_DRIVER=${LOAD_DRIVER}: no browser, no starvation gate)"
+    return 0
+  fi
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: psi606 Job on the loadgen pool reads cpu.pressure and /proc/pressure/cpu -> $OUT/psi.jsonl"
+    return 0
+  fi
+  python3 -m bench.k6_job psi-job > "$OUT/psi-job.yaml"
+  kapply "$OUT/psi-job.yaml"
+  local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S )) ok="" failed="" why rc=0
+  while (( $(date +%s) < deadline )); do
+    ok="$("${K[@]}" -n bench-loadgen get job psi606 -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
+    failed="$("${K[@]}" -n bench-loadgen get job psi606 -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
+    [[ -n "$ok" && "$ok" != "0" ]] && break
+    [[ -n "$failed" && "$failed" != "0" ]] && break
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  "${K[@]}" -n bench-loadgen logs job/psi606 > "$OUT/psi.jsonl" 2>&1 || true
+  why="$(python3 -m bench.k6_job psi-check < "$OUT/psi.jsonl")" || rc=$?
+  if (( rc != 0 )); then
+    record_failure "psi FAILED: the loadgen node's kernel does not give the browser's starvation evidence (${why}): every judged page load would be UNMEASURED; refused before any drive time" || true
+    return 1
+  fi
+  log "psi: readable on the loadgen node (${why})"
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
@@ -1834,6 +1869,7 @@ step schema    s_schema
 step registry  s_registry
 step reap      s_reap
 step up        s_up
+step psi       s_psi
 step install   s_install
 step platform  s_wait_platform
 if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi

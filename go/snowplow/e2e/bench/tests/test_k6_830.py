@@ -230,17 +230,34 @@ def _point(metric, value, **tags):
             "data": {"time": "2026-10-21T10:00:00Z", "value": value, "tags": tags}}
 
 
-def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit_m=None):
+#: the points' time (_point) as an epoch, and the CPU windows' anchor: the windows start 15 s
+#: before it, so they cover the page loads that end at it
+T_POINTS = 1792576800.0
+
+
+def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit_m=None,
+              stall=None, idle=None, pressure=True, node=True, anchored=True):
     """<container>-cpu.jsonl as k6_job._cpu_sampler writes it: cumulative
-    usage every 5 s, one window per `cores` value."""
+    usage every 5 s, one window per `cores` value; per window its cgroup
+    pressure stall (`stall`, seconds; default none) and the node's idle ticks
+    (`idle`; default 400 of 1000, 0 = saturated)."""
     recs = [{"kind": "cpu_start", "container": container, "request_m": request_m,
-             "limit_m": limit_m, "interval_s": 5}]
-    used = 0.0
-    recs.append({"kind": "cpu", "t": 1000.0, "usage_usec": 0, "throttled_usec": 0})
+             "limit_m": limit_m, "interval_s": 5, "node_cpus": 16,
+             **({"epoch": T_POINTS - 15, "uptime": 1000.0} if anchored else {})}]
+    used = some = busy = idl = 0.0
+
+    def rec(t):
+        return {"kind": "cpu", "t": t, "usage_usec": int(used * 1e6), "throttled_usec": 0,
+                "pressure_some_usec": int(some * 1e6) if pressure else None,
+                "pressure_full_usec": 0 if pressure else None,
+                "node_busy_ticks": int(busy) if node else None, "node_idle_ticks": int(idl) if node else None}
+    recs.append(rec(1000.0))
     for i, c in enumerate(cores):
         used += c * 5
-        recs.append({"kind": "cpu", "t": 1000.0 + 5 * (i + 1), "usage_usec": int(used * 1e6),
-                     "throttled_usec": 0})
+        some += (stall[i] if stall else 0)
+        busy += 1000
+        idl += (idle[i] if idle else 400)
+        recs.append(rec(1000.0 + 5 * (i + 1)))
     recs.append({"kind": "cpu_end"})
     (d / f"{container}-cpu.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
 
@@ -395,6 +412,160 @@ def test_cpu_stats_and_the_browser_headroom_check(tmp_path):
                             "browser")["result"] == "FAIL"
 
 
+# ─── browser starvation: measured, judged against the verdict's own bars ─────
+
+def test_the_starvation_windows_and_a_page_loads_possible_delay(tmp_path):
+    """Per window: the cgroup's pressure stall, and whether the node had no
+    idle tick; a page load's possible delay is, per window it overlaps
+    (widened by the anchor's 1 s), at most the stall and never more than the
+    overlap; the whole overlap where the node was saturated."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6, stall=[0, 0, 0.4, 3.0, 0, 0], idle=[400, 400, 400, 400, 0, 400])
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    assert (st["pressure"], st["node"], st["anchored"], st["node_cpus"]) == (True, True, True, 16)
+    assert [w["stall_s"] for w in st["windows"]] == [0, 0, 0.4, 3.0, 0, 0]
+    assert [w["saturated"] for w in st["windows"]] == [False] * 4 + [True, False]
+    assert st["stall_share"] == round(3.4 / 30, 4) and st["saturated_windows"] == 1
+    t0 = T_POINTS - 15
+    # a 200 ms load inside window 3 (stall 3.0 s): its whole time may be the stall
+    assert k6eval.possible_delay_ms(t0 + 16.0, 200, st) == 200
+    # a 2 s load across windows 0-1 (no stall), more than 1 s from window 2: none
+    assert k6eval.possible_delay_ms(t0 + 1.0, 2000, st) == 0
+    # inside window 2 (stall 0.4 s): at most the stall
+    assert k6eval.possible_delay_ms(t0 + 12.0, 1000, st) == pytest.approx(400)
+    # inside the saturated window 4: the whole overlap
+    assert k6eval.possible_delay_ms(t0 + 21.0, 1500, st) == 1500
+
+
+def test_the_possible_delay_is_capped_by_the_overlap_and_the_anchor_widens_each_window():
+    """Where a load runs past the sampled windows, a window's stall counts only
+    up to the load's overlap with it; and each window is widened by the
+    anchor's 1 s (a load just before a stalled window may have met it)."""
+    st = {"windows": [{"t0": 0.0, "t1": 5.0, "stall_s": 4.0}]}
+    # from 4.0 s for 5 s: overlaps [-1, 6] for 2 s: 2 s, never the window's 4 s
+    assert k6eval.possible_delay_ms(4.0, 5000, st) == pytest.approx(2000)
+    st = {"windows": [{"t0": 10.0, "t1": 15.0, "stall_s": 0.4}, {"t0": 15.0, "t1": 20.0, "stall_s": 3.0}]}
+    # 14.0 to 14.5 s: window 2 (0.4 s) and, within the anchor's 1 s, window 3: the whole 500 ms
+    assert k6eval.possible_delay_ms(14.0, 500, st) == pytest.approx(500)
+
+
+def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_path):
+    """The rendered sampler, run by sh against a fake cgroup and /proc (the
+    docker arm runs it in the real images): cpu.pressure's some/full totals,
+    /proc/stat's busy (user nice system irq softirq steal) and idle (idle +
+    iowait) ticks, the node's CPU count and the epoch / uptime anchor."""
+    cg, proc, out = tmp_path / "cg", tmp_path / "proc", tmp_path / "out"
+    for d in (cg, proc, out):
+        d.mkdir()
+    (cg / "cpu.stat").write_text("usage_usec 5000000\nuser_usec 4000000\nthrottled_usec 7\n")
+    (cg / "cpu.max").write_text("max 100000\n")
+    (cg / "cpu.pressure").write_text("some avg10=0.10 avg60=0.05 avg300=0.01 total=123456\n"
+                                     "full avg10=0.00 avg60=0.00 avg300=0.00 total=789\n")
+    (proc / "stat").write_text("cpu  100 2 30 400 5 6 7 8 0 0\ncpu0 50 1 15 200 2 3 3 4 0 0\n"
+                               "cpu1 50 1 15 200 3 3 4 4 0 0\nintr 1 2 3\n")
+    (proc / "uptime").write_text("4321.50 8000.00\n")
+    script = k6_job._wrapper("sleep 1", "probe", 0, done=str(out / "done"), cpu=("2", None))
+    script = (script.replace("/sys/fs/cgroup/", f"{cg}/").replace("/proc/", f"{proc}/")
+              .replace("/out/", f"{out}/"))
+    p = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    recs = [json.loads(x) for x in (out / "probe-cpu.jsonl").read_text().splitlines()]
+    start, cpu = recs[0], [r for r in recs if r["kind"] == "cpu"]
+    assert (start["node_cpus"], start["uptime"]) == (2, 4321.5) and start["epoch"] > 1_700_000_000
+    assert cpu and all(r["pressure_some_usec"] == 123456 and r["pressure_full_usec"] == 789 for r in cpu)
+    assert all(r["node_busy_ticks"] == 100 + 2 + 30 + 6 + 7 + 8 and r["node_idle_ticks"] == 400 + 5 for r in cpu)
+    assert all(r["usage_usec"] == 5000000 and r["throttled_usec"] == 7 for r in cpu)
+    # no cpu.pressure: recorded as missing (null), never absent
+    (cg / "cpu.pressure").unlink()
+    (out / "probe-cpu.jsonl").unlink()
+    subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60, check=True)
+    cpu = [json.loads(x) for x in (out / "probe-cpu.jsonl").read_text().splitlines() if '"cpu"' in x]
+    assert cpu and all(r["pressure_some_usec"] is None and r["pressure_full_usec"] is None for r in cpu)
+
+
+def _starve_case(tmp_path, *, base_ms=600.0, stall=None, idle=None, cores=None, **cpu):
+    k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
+    _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
+    _write_viewer(k6dir)
+    _write_out(bdir, "browser", _browser_points(base_ms=base_ms), _browser_summary(63), 0)
+    _cpu_file(bdir, "browser", 3000, cores or [1.0] * 6, stall=stall, idle=idle, **cpu)
+    return _evaluate_cli(tmp_path, k6dir, bdir)
+
+
+def test_a_stall_that_explains_a_failed_bar_is_invalid(tmp_path):
+    """Starved by pressure: warm loads at 600 ms FAIL the 500 ms bar, and the
+    browser's cgroup stalled the whole window they ran in: without the stall
+    they pass. The load generator may have decided the FAIL: INVALID."""
+    rc, v = _starve_case(tmp_path, stall=[0, 0, 5.0, 5.0, 5.0, 0])
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and v["verdict"] == "INVALID", c
+    assert any(r.startswith("browser.cpu_starvation: ") for r in v["invalid_reasons"])
+    assert "could have decided warm_nav_p95_ms" in c["why"] and "FAIL as measured, PASS without the stall" in c["why"]
+
+
+def test_a_saturated_node_that_explains_a_failed_bar_is_invalid(tmp_path):
+    """Starved by node saturation: no cgroup stall, but the node had not one
+    idle tick in the windows the loads ran in."""
+    rc, v = _starve_case(tmp_path, idle=[400, 400, 0, 0, 0, 400])
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and v["verdict"] == "INVALID" and "no idle CPU in 3 window(s)" in c["why"], c
+
+
+def test_high_usage_with_no_stall_is_valid(tmp_path):
+    """Run 19's shape: Chrome far over its request (2.9 of 3 cores at p95),
+    no stall, an idle node: the run is judged on its pages. The 80 % line is
+    reported, never validity."""
+    rc, v = _starve_case(tmp_path, base_ms=200.0, cores=[2.9] * 6)
+    assert _check(v["validity"], "browser.cpu_starvation")["result"] == "PASS"
+    assert not any("cpu_" in r for r in v["invalid_reasons"])           # (the fixture's own reasons aside)
+    assert v["report"]["browser_cpu_headroom"]["result"] == "REPORT"
+    assert "CPU-starved" in v["report"]["browser_cpu_headroom"]["why"]     # the report still says it
+
+
+def test_a_stall_that_decides_nothing_is_valid(tmp_path):
+    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[5.0] * 6)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "PASS" and c["value"]["stall_share"] == 1.0
+
+
+@pytest.mark.parametrize("missing", [{"pressure": False}, {"node": False}, {"anchored": False}])
+def test_unmeasured_starvation_is_never_a_pass(tmp_path, missing):
+    """Pressure (or the node's CPU, or the anchor) unreadable: UNMEASURED,
+    and the page-load bars cannot be called PASS or FAIL: INCONCLUSIVE."""
+    rc, v = _starve_case(tmp_path, base_ms=200.0, **missing)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "UNMEASURED" and "unmeasured, not 'not starved'" in c["why"]
+    for n in ("warm_nav_p95_ms", "cold_nav_p95_ms", "zero_cold_navs.first_nav_p95_ms",
+              "zero_cold_navs.navs_over_cold_bar"):
+        assert _check(v["checks"], n)["result"] == "INCONCLUSIVE", n
+    assert v["verdict"] != "PASS"
+
+
+def test_a_page_load_without_a_start_is_unmeasured(tmp_path):
+    """Every other evidence measured, but one judged page load cannot be
+    placed against the windows: UNMEASURED, never judged as if it were."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6)
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    assert (st["pressure"], st["node"], st["anchored"]) == (True, True, True)
+    from bench import load606
+    navs = [{"wall_ms": 300.0, "visit": 2, "start": T_POINTS - 1}, {"wall_ms": 300.0, "visit": 2}]
+    c = load606.starvation_check(navs, st, load606.THRESHOLDS)
+    assert c["result"] == "UNMEASURED" and "the start of 1 page load(s)" in c["why"]
+    assert load606.starvation_check(navs[:1], st, load606.THRESHOLDS)["result"] == "PASS"
+
+
+def test_run_19s_samples_read_unmeasured(tmp_path):
+    """Run 19 sampled no pressure, no node CPU, no anchor: the new rule never
+    invents validity for it."""
+    recs = [{"kind": "cpu_start", "container": "browser", "request_m": 3000, "limit_m": None}]
+    recs += [{"kind": "cpu", "t": 100.0 + 5 * i, "usage_usec": int(2.8e6 * 5 * i), "throttled_usec": 0}
+             for i in range(6)]
+    st = k6eval.starvation({"cpu": {"browser": recs}})
+    assert (st["pressure"], st["node"], st["anchored"]) == (False, False, False)
+    from bench import load606
+    navs = [{"wall_ms": 300.0, "visit": 2, "start": 1.0}]
+    assert load606.starvation_check(navs, st, load606.THRESHOLDS)["result"] == "UNMEASURED"
+
+
 def test_widget_error_states_are_gated(tmp_path):
     # 1 error state over 63 loads = 1.6 % > 1 %; forbidden/notfound never count
     _write_out(tmp_path, "browser", _browser_points(error_states=1), _browser_summary(63), 0)
@@ -419,7 +590,7 @@ def test_k6_error_rate_and_route_table(tmp_path):
 
 
 def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
-                    sse=("refreshes", "notifications"), error_states=0):
+                    sse=("refreshes", "notifications"), error_states=0, base_ms=200.0):
     pts = []
     for s in sessions:
         pts.append(_point("browser_logins", 1, session=s))
@@ -430,7 +601,7 @@ def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
         for i in range(loads):
             tags = {"session": s, "route": f"/r{i % 4}", "visit": "first" if i < 4 else "warm",
                     "method": "login" if i == 0 else "click"}
-            pts += [_point("browser_page_load_ms", 200.0 + i, **tags),
+            pts += [_point("browser_page_load_ms", base_ms + i, **tags),
                     _point("browser_page_loads", 1, **tags)]
     for _ in range(timeouts):                    # pageload.recordOps: a timeout is a load too
         t = {"session": sessions[0], "route": "/r0", "visit": "warm", "method": "click",
@@ -577,8 +748,10 @@ def test_evaluate_judges_browser_page_loads_and_k6_validity(tmp_path):
     assert not any(c.startswith("driver.") for c in names)
     assert _check(v["checks"], "browser.page_timeouts")["result"] == "PASS"
     assert _check(v["checks"], "browser.widget_errors")["result"] == "PASS"
-    assert _check(v["validity"], "browser.cpu_headroom")["result"] == "PASS"
+    assert _check(v["validity"], "browser.cpu_starvation")["result"] == "PASS"
+    assert "browser.cpu_headroom" not in names                 # reported, never validity
     rep = v["report"]
+    assert rep["browser_cpu_headroom"]["result"] == "REPORT"
     assert rep["navs"] == 63                       # the north-star bars judge these
     assert rep["page_loads_are"].startswith("real Chrome")
     assert rep["browser"]["page_load_by_session"]["s1"]["n"] == 21
@@ -1226,11 +1399,21 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     assert p.returncode == 0, p.stderr
     recs = k6eval.read_cpu(str(out), "probe")
     # --cpus 2: the kernel's limit, read from cpu.max, is 2000m
-    assert recs[0] == {"kind": "cpu_start", "container": "probe", "request_m": 2000,
-                       "limit_m": 2000, "cgroup_limit_m": 2000, "interval_s": 5}
+    start = recs[0]
+    assert {k: start[k] for k in ("kind", "container", "request_m", "limit_m", "cgroup_limit_m", "interval_s")} == {
+        "kind": "cpu_start", "container": "probe", "request_m": 2000, "limit_m": 2000, "cgroup_limit_m": 2000,
+        "interval_s": 5}
+    # the starvation evidence's anchor and the node's CPU count, read in the image's own shell
+    assert isinstance(start["epoch"], int) and start["epoch"] > 1_700_000_000 and start["uptime"] > 0
+    assert isinstance(start["node_cpus"], int) and start["node_cpus"] >= 1
     assert recs[-1] == {"kind": "cpu_end"}
     pts = [r for r in recs if r["kind"] == "cpu"]
     assert len(pts) >= 2 and pts[-1]["usage_usec"] > pts[0]["usage_usec"] > 0
+    # the node's ticks always (/proc/stat); the cgroup's pressure where the kernel has PSI: a
+    # number, or null (recorded as missing), never absent
+    assert all(p["node_busy_ticks"] >= 0 and p["node_idle_ticks"] >= 0 for p in pts)
+    assert all("pressure_some_usec" in p and "pressure_full_usec" in p for p in pts)
+    assert pts[-1]["node_busy_ticks"] > pts[0]["node_busy_ticks"]
     assert all(b["t"] > a["t"] for a, b in itertools.pairwise(pts))
     st = k6eval.cpu_stats(recs)
     assert st["windows"] >= 1 and st["p95_cores"] > 0
@@ -1490,7 +1673,10 @@ def test_kind_proof_outputs_pass_every_k6_browser_and_viewer_check(tmp_path):
         (k6dir / "viewer.jsonl").write_text(fi.read())
     _, v = _evaluate_cli(tmp_path, k6dir, bdir)
     val = [c for c in v["validity"] if c["check"].startswith(("k6.", "browser.", "viewer."))]
-    assert len(val) == 17 and all(c["result"] == "PASS" for c in val), val
+    # recorded before the sampler read cpu.pressure and /proc/stat: its starvation is UNMEASURED,
+    # never "not starved" (and the page-load bars it would judge read INCONCLUSIVE)
+    assert len(val) == 17 and all(c["result"] == "PASS" for c in val if c["check"] != "browser.cpu_starvation"), val
+    assert _check(v["validity"], "browser.cpu_starvation")["result"] == "UNMEASURED"
     # only the fake portal's missing snowplow pod records make it INVALID
     assert v["invalid_reasons"] == [
         "snowplow.restarts_during_measure: restart state unknown (missing before/after pod record)"]
@@ -1556,7 +1742,7 @@ def test_run606_k6_end_to_end(harness):
     val = {c["check"]: c["result"] for c in v["validity"]}
     for n in ("k6.stream_complete", "k6.dropped_iterations[navigate]",
               "k6.composite_burst_complete", "k6.error_rate", "k6.route_table",
-              "browser.cpu_headroom",
+              "browser.cpu_starvation",
               "browser.stream_complete", "browser.sessions", "browser.live_refresh[s1]",
               "viewer.stream_complete", "viewer.armed_users"):
         assert val[n] == "PASS", (n, v["validity"])
@@ -1612,7 +1798,8 @@ def test_run606_k6_dropped_burst_is_invalid(harness):
 
 
 @pytest.mark.parametrize("mode,reason", [
-    ("starved", "browser.cpu_headroom"),
+    ("starved", "browser.cpu_starvation"),
+    ("saturated", "browser.cpu_starvation"),
     ("viewercut", "the viewers stopped on: k6 exited without feed_end"),
     ("nosse", "no live-update stream opened: /refreshes, /notifications"),
 ])
@@ -1622,6 +1809,67 @@ def test_run606_k6_viewers_and_live_updates_are_validity(harness, mode, reason):
     v = json.loads((out / "verdict.json").read_text())
     assert v["verdict"] == "INVALID"
     assert any(reason in r for r in v["invalid_reasons"]), v["invalid_reasons"]
+
+
+@pytest.mark.parametrize("mode,result,bars", [
+    ("busy", "PASS", "PASS"),                  # high usage, no stall: valid, judged on its pages
+    ("nopressure", "UNMEASURED", "INCONCLUSIVE"),   # missing evidence is never a pass
+])
+def test_run606_k6_browser_starvation_is_measured(harness, mode, result, bars):
+    """Through run606 (the fake's own data voids its verdict elsewhere: only
+    the starvation line, its reasons and the page-load bars are read)."""
+    p, _, out = _run606_k6(harness, FAKE_K6_OUT=mode)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-4000:]
+    v = json.loads((out / "verdict.json").read_text())
+    assert _check(v["validity"], "browser.cpu_starvation")["result"] == result
+    assert not any(r.startswith("browser.cpu_") for r in v["invalid_reasons"]), v["invalid_reasons"]
+    assert _check(v["checks"], "warm_nav_p95_ms")["result"] == bars
+    assert v["report"]["browser_cpu_headroom"]["result"] == "REPORT"
+
+
+def test_run606_k6_psi_readable_lets_the_run_proceed(harness):
+    """#1042: the pre-drive check reads PSI on the loadgen node, then the run
+    goes on (install, platform, ..., the drive)."""
+    p, _, out = _run606_k6(harness)
+    log = p.stdout + p.stderr
+    assert p.returncode == 0, log[-4000:]
+    assert "=== step psi ===" in log and "psi: readable on the loadgen node" in log
+    assert log.index("=== step up ===") < log.index("=== step psi ===") < log.index("=== step install ===")
+    assert "=== step measure ===" in log
+    job = next(d for d in yaml.safe_load_all((out / "psi-job.yaml").read_text()) if d and d["kind"] == "Job")
+    assert job["spec"]["template"]["spec"]["nodeSelector"] == {"bench.krateo.io/pool": "loadgen"}
+
+
+@pytest.mark.parametrize("mode,unreadable", [("nocgroup", "/sys/fs/cgroup/cpu.pressure: unreadable"),
+                                             ("nonode", "/proc/pressure/cpu: unreadable")])
+def test_run606_k6_psi_unreadable_refuses_before_the_drive(harness, mode, unreadable):
+    """#1042: a kernel without PSI would make every judged page load
+    UNMEASURED: refused right after the loadgen node exists, before install
+    and any drive time, with the reason; teardown still runs."""
+    p, _, out = _run606_k6(harness, FAKE_PSI=mode)
+    out_all = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert "psi FAILED: the loadgen node's kernel does not give the browser's starvation evidence" in out_all
+    assert unreadable in out_all and "refused before any drive time" in out_all
+    for later in ("=== step install ===", "=== step measure ==="):
+        assert later not in out_all
+    calls = _calls(state_dir(harness))
+    assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)
+    rec = [json.loads(x) for x in (out / "command-failures.jsonl").read_text().splitlines()]
+    assert any(r["step"] == "psi" and r["what"].startswith("psi FAILED: ") for r in rec)
+
+
+def test_the_psi_check_reads_both_files():
+    ok_line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=5"
+
+    def lines(cg, node):
+        return [json.dumps({"kind": "psi_file", "which": "cgroup", "file": "c", "some": cg}),
+                json.dumps({"kind": "psi_file", "which": "node", "file": "n", "some": node})]
+    assert k6_job.psi_check(lines(ok_line, ok_line))[0]
+    assert not k6_job.psi_check(lines(None, ok_line))[0]
+    assert not k6_job.psi_check(lines(ok_line, None))[0]
+    assert not k6_job.psi_check(lines(ok_line, "some avg10=0.00"))[0]           # no total: not PSI
+    assert not k6_job.psi_check([])[0]                                          # no answer at all
 
 
 def test_run606_k6_without_viewers(harness):

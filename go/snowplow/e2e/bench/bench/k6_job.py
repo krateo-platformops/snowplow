@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 from bench import rbac_model
@@ -244,12 +245,24 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
     """The container's own CPU (#831 gate M1), from its cgroup: cpu.stat
     usage_usec / throttled_usec (v2; cpuacct.usage on v1), every CPU_SAMPLE_S,
     timed by /proc/uptime (sub-second), into /out/<prefix>-cpu.jsonl, framed
-    by cpu_start (request, limit) and cpu_end. POSIX sh: the k6 images are
-    Alpine (busybox), the python image Debian (dash)."""
+    by cpu_start (request, limit) and cpu_end.
+
+    And its STARVATION evidence (browser-starvation issue): the cgroup's
+    cpu.pressure "some" / "full" totals (v2 PSI: microseconds during which at
+    least one / every runnable task of the container waited for a CPU), and
+    the NODE's CPU from /proc/stat (not namespaced: the node's own busy and
+    idle ticks, sampled at the same instants). null where a file is
+    unreadable: a missing measure is recorded as missing. cpu_start carries
+    the node's CPU count and an epoch / uptime anchor (date +%s and
+    /proc/uptime read together, 1 s resolution) that places the windows
+    against the page loads' wall-clock times.
+
+    POSIX sh: the k6 images are Alpine (busybox), the python image Debian
+    (dash)."""
     f = f"/out/{prefix}-cpu.jsonl"
     lim = _mcpu(limit) if limit else "null"
     return f"""cpu_sample() {{
-  u=; th=null
+  u=; th=null; ps=null; pf=null; nb=null; ni=null
   if [ -r /sys/fs/cgroup/cpu.stat ]; then
     while read -r k v; do
       case "$k" in usage_usec) u=$v ;; throttled_usec) th=$v ;; esac
@@ -257,8 +270,19 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
   elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
     read -r n < /sys/fs/cgroup/cpuacct/cpuacct.usage; u=$((n / 1000))
   fi
+  # "some avg10=.. avg60=.. avg300=.. total=<usec>" / "full ..."
+  if [ -r /sys/fs/cgroup/cpu.pressure ]; then
+    while read -r k _ _ _ tot; do
+      case "$k" in some) ps=${{tot#total=}} ;; full) pf=${{tot#total=}} ;; esac
+    done < /sys/fs/cgroup/cpu.pressure
+  fi
+  # "cpu user nice system idle iowait irq softirq steal ...": busy and idle ticks, node-wide
+  if [ -r /proc/stat ]; then
+    read -r _ c1 c2 c3 c4 c5 c6 c7 c8 _ < /proc/stat
+    nb=$((c1 + c2 + c3 + c6 + c7 + c8)); ni=$((c4 + c5))
+  fi
   read -r up _ < /proc/uptime
-  [ -n "$u" ] && printf '{{"kind": "cpu", "t": %s, "usage_usec": %s, "throttled_usec": %s}}\\n' "$up" "$u" "$th" >> {f}
+  [ -n "$u" ] && printf '{{"kind": "cpu", "t": %s, "usage_usec": %s, "throttled_usec": %s, "pressure_some_usec": %s, "pressure_full_usec": %s, "node_busy_ticks": %s, "node_idle_ticks": %s}}\\n' "$up" "$u" "$th" "$ps" "$pf" "$nb" "$ni" >> {f}
 }}
 # the limit the kernel enforces (cgroup v2 cpu.max "<quota> <period>" or "max")
 cg=null
@@ -266,7 +290,10 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
   read -r q per < /sys/fs/cgroup/cpu.max
   [ "$q" != max ] && cg=$((q * 1000 / per))
 fi
-printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}}}\\n' "$cg" > {f}
+nc=null
+[ -r /proc/stat ] && nc=$(grep -c '^cpu[0-9]' /proc/stat)
+read -r up0 _ < /proc/uptime; ep0=$(date +%s)
+printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s}}\\n' "$cg" "$nc" "$ep0" "$up0" > {f}
 ( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
 sampler=$!
 """
@@ -554,3 +581,89 @@ spec:
       - name: out
         emptyDir: {{}}
 """
+
+
+# ─── the pre-drive PSI check (#1042) ────────────────────────────────────────
+#: the files the starvation evidence reads: the container cgroup's PSI (what the
+#: browser's sampler reads, in a container of the same pool) and the node's
+PSI_FILES = (("cgroup", "/sys/fs/cgroup/cpu.pressure"), ("node", "/proc/pressure/cpu"))
+
+
+def render_psi_check() -> str:
+    """Namespace bench-loadgen + the psi606 Job: one container on the LOADGEN
+    pool (the browser's node, the same pin) reports whether its cgroup's
+    cpu.pressure and the node's /proc/pressure/cpu can be read. Run before
+    any drive time is spent (run606 s_psi): a kernel without PSI would make
+    every judged page load's starvation UNMEASURED."""
+    probe = "; ".join(
+        f'if [ -r {f} ] && l=$(grep "^some " {f}); then '
+        f'printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": "%s"}}\\n\' "$l"; '
+        f'else printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": null}}\\n\'; fi'
+        for w, f in PSI_FILES)
+    return f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench-loadgen
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: psi606
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+{_POOL}
+      containers:
+      - name: psi
+        image: {K6_IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          {probe}
+        resources:
+          requests: {{cpu: 50m, memory: 32Mi}}
+          limits: {{cpu: 50m, memory: 32Mi}}
+"""
+
+
+def psi_check(lines: list[str]) -> tuple[bool, str]:
+    """(readable, what was read): both PSI_FILES answered a "some ... total=N"
+    line. Anything else (a file missing, unreadable, no total, no answer at
+    all) is not readable, with the reason."""
+    import re
+    import json as _json
+    got = {}
+    for ln in lines:
+        try:
+            r = _json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("kind") == "psi_file":
+            got[r.get("which")] = r.get("some")
+    why = []
+    for w, f in PSI_FILES:
+        v = got.get(w, "<no answer>")
+        if not (isinstance(v, str) and re.search(r"\btotal=\d+", v)):
+            why.append(f"{f}: {'unreadable' if v is None else v}")
+    return (not why, "; ".join(why) if why else "; ".join(f"{f}: {got[w]}" for w, f in PSI_FILES))
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="bench.k6_job")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("psi-job", help="the psi606 Job (YAML, stdout)")
+    sub.add_parser("psi-check", help="read psi606's log on stdin: exit 0 if PSI is readable, 3 if not")
+    a = ap.parse_args(argv)
+    if a.cmd == "psi-job":
+        sys.stdout.write(render_psi_check())
+        return 0
+    ok, why = psi_check(sys.stdin.read().splitlines())
+    print(why)
+    return 0 if ok else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -212,14 +212,15 @@ def test_every_collect_read_is_bounded_twice(harness):
 
 
 def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
-    """#1006: no hand-set default. The DEFAULT plan's budget is 38,118 s (the
+    """#1006: no hand-set default. The DEFAULT plan's budget is 38,418 s (the
     script's own budget line: 35,670 s + the 828 s evaluate term, #898, + 2 x
     300 s platform definitions, #960, + 2 x 300 s menu-class preflights, run
     19, + the portal-origin gate's own 600 + 2 x 180 + 60 s in place of the
-    env step's 600 s, #1005); + the 1,800 s margin = 39,918 s -> 12 h."""
+    env step's 600 s, #1005, + the 300 s pre-drive PSI Job, #1042); + the
+    1,800 s margin = 40,218 s -> 12 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "= 38118 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 38118 s" in p.stderr
+    assert "= 38418 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 38418 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
     assert p.returncode == 0 and "fits TTL_HOURS=13 (46800 s; derived" in p.stderr
@@ -237,11 +238,11 @@ def test_a_hand_set_ttl_the_plan_does_not_fit_is_refused_before_any_cloud_call(t
 
 def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path):
     """R11: the margin is part of the bar. THIS plan adds 3,400 s of data
-    budget to the default 38,118 s (DATA_TIMEOUT_S=5800): 41,518 s, under a
+    budget to the default 38,418 s (DATA_TIMEOUT_S=5800): 41,818 s, under a
     hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 41518 s" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 41818 s" in p.stderr
     assert "needs TTL_HOURS >= 13" in p.stderr
 
 
