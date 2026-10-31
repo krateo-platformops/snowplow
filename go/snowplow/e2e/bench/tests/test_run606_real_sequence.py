@@ -1043,6 +1043,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                     "- name: core-provider-agent", "  path: [mcpServers, chartGate, imagePullSecrets]",
                     "- name: agentgateway-policies", "  path: [certReplayHop, image, pullSecrets]",
                     "- name: agentgateway-policies", "  path: [uiTokenHop, image, pullSecrets]",
+                    "- name: alert-provider", "  path: [imagePullSecrets]",
+                    "- name: alert-dispatcher", "  path: [imagePullSecrets]",
                     "{{- end -}}"]))
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
             '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10))
@@ -1062,13 +1064,16 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 # PRIVATE (krateo-agentiko), as at 0.3.468: the ghcr pull token resolves them
                 {"name": "agentgateway-controller", "version": os.environ.get("FAKE_AGW_VERSION", "0.2.0"),
                  "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway"},
-                {"name": "agentgateway-policies", "version": "0.2.18",
+                {"name": "agentgateway-policies", "version": os.environ.get("FAKE_POLICIES_VERSION", "0.2.18"),
                  "repo": "oci://ghcr.io/krateo-agentiko/charts", "feature": "agentGateway",
                  "deps": ["agentgateway-controller"]},
                 # public repo overrides, as at 0.3.468 (one featureless: always on)
                 {"name": "krateo-marketplace-catalog", "version": "0.1.2",
                  "repo": "oci://ghcr.io/krateo-blueprints/charts", "feature": "portal"},
                 {"name": "github-provider-kog", "version": "0.6.0", "repo": "oci://ghcr.io/krateo-blueprints/charts"},
+                # a private-image component with NO repo of its own (the installer's ociRepo), on through
+                # portal, as alert-provider is at 0.3.468 (#1041 review F1)
+                {"name": "alert-dispatcher", "version": "0.4.0", "feature": "portal"},
                 # a private pin of a feature that is off unless the chart makes it a core feature,
                 # at a version the fake registry has not published: preflighted only when on
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
