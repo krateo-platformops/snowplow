@@ -30,8 +30,11 @@ import pytest
 import yaml
 
 from bench import ghcr_pull
-from tests.conftest import (FAKE_CHART_BAD_DIGEST, FAKE_CHART_HTTP_BLOB, FAKE_GHCR_TOKEN, FAKE_GHCR_USER,
-                            fake_bearer)
+from tests.conftest import (FAKE_CHART_BAD_DIGEST, FAKE_CHART_BIG_MANIFEST, FAKE_CHART_BLOB_OVER_SIZE,
+                            FAKE_CHART_DRIP, FAKE_CHART_HTTP_BLOB, FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer)
+
+HELM = os.environ["FAKE_HELM_TEMPLATE_BIN"]
+AGW = "oci://ghcr.io/krateo-agentiko/charts"
 from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401
 
 
@@ -96,6 +99,15 @@ def _leaks():
     ("redirect", "redirect to https://elsewhere.invalid/token refused"),
     ("core_feature", "krateo-agentiko/charts/incident-agent:9.9.9: HTTP 404"),        # F5: an always-on feature
     ("image_scope", "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18: HTTP 403"),          # run 19b: the images
+    # #1023 B: a chart whose images cannot be read is refused, never passed with none checked
+    ("bad_digest", f"agentgateway-controller:{FAKE_CHART_BAD_DIGEST}: its images unreadable: "),
+    ("http_blob", f"agentgateway-controller:{FAKE_CHART_HTTP_BLOB}: its images unreadable: "),
+    # #1023 A: a private-image component (inst.privateImageComponents) must render, and render a ghcr image
+    ("private_unrendered", "agentgateway-policies:0.2.18: the installer lists it as a private-image component "
+                           "(inst.privateImageComponents) and it cannot be rendered: helm template failed: "),
+    ("private_no_image", "agentgateway-policies:0.2.18: the installer lists it as a private-image component "
+                         "(inst.privateImageComponents), yet it renders no ghcr.io image"),
+    ("private_rule_dynamic", "inst.privateImageComponents is not one static list"),
 ])
 def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, case, why):  # noqa: F811
     env, state, ambient, tmp = harness
@@ -112,11 +124,16 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "redirect": lambda: {"GHCR_PULL_ENV_FILE": token_file("redirect")},
         "core_feature": lambda: {"FAKE_CORE_FEATURES": "specialistAgents"},
         "image_scope": lambda: {"GHCR_PULL_ENV_FILE": token_file("imgscope403")},
+        "bad_digest": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_BAD_DIGEST},
+        "http_blob": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_HTTP_BLOB},
+        "private_unrendered": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "agentgateway-policies"},
+        "private_no_image": lambda: {"FAKE_HELM_TEMPLATE_EMPTY": "agentgateway-policies"},
+        "private_rule_dynamic": lambda: {"FAKE_PRIVATE_IMAGES": "dynamic"},
     }[case]())
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=300)
     out = p.stdout + p.stderr
-    assert p.returncode != 0 and "registry FAILED" in out and why in out, out[-2000:]
+    assert p.returncode != 0 and ("registry FAILED" in out or "refusing: " in out) and why in out, out[-2000:]
     assert "=== step registry ===" in out and "=== step up ===" not in out
     assert not any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "create"]
                    for c in _calls(state))
@@ -141,10 +158,20 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
         ("github-provider-kog", "0.6.0", None), ("krateo-marketplace-catalog", "0.1.2", None)]
     # the images: read from the pinned chart's own values (an empty tag = its appVersion), each
     # ghcr.io one resolved with the token; another registry's named, not this token's to resolve
+    # #1023 A: RENDERED with the installer's componentValues: ui-token-hop (on only through them, named
+    # by no values.yaml) and agw-init (hard-coded in a template) are preflighted
     assert pf["images"] == [
+        {"image": "ghcr.io/krateo-agentiko/agw-init:0.2.0", "charts": ["agentgateway-controller"], "error": None},
         {"image": "ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None},
         {"image": "ghcr.io/krateo-agentiko/hop-sidecar:9.0.1", "charts": ["agentgateway-policies"], "error": None},
         {"image": "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None}]
+    assert {c["chart"].rsplit("/", 1)[1]: (c["render"].split(" ")[0], c["private_image_component"])
+            for c in pf["charts"]} == {"agentgateway-controller": ("ok", False), "agentgateway-policies": ("ok", True),
+                                       "github-provider-kog": ("ok", False), "krateo-marketplace-catalog": ("ok", False)}
+    assert pf["private_image_components"] == ["agentgateway-policies", "core-provider-agent"]
+    assert pf["bound_s"] == 4 * (2 * (4 * 30 + 60) + 120) + 4 * 2 * (2 * 30)
+    assert "4 charts x (2 x (4 x 30 + 60) + 120 s) + 4 images x 2 x (2 x 30 s)" == pf["bound"]
+    assert f"[ghcr] the step's bound: {pf['bound_s']:g} s" in out
     assert pf["images_elsewhere"] == [
         {"image": "cr.agentgateway.dev/agentgateway:v0.7.0", "charts": ["agentgateway-policies"]},
         {"image": "cr.agentgateway.dev/controller:v0.7.0", "charts": ["agentgateway-controller"]}]
@@ -313,20 +340,125 @@ def test_a_chart_is_read_through_the_blob_redirect_without_the_registry_bearer()
     """ghcr serves a blob through a redirect to its storage; the fake store
     refuses any Authorization header, so reading the chart proves the bearer
     is not forwarded; the content is digest-verified."""
-    imgs, err = ghcr_pull.chart_images("oci://ghcr.io/krateo-agentiko/charts", "agentgateway-policies", "0.2.18",
-                                       FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
-    assert err is None
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN,
+                               {"uiTokenHop": {"enabled": True}}, HELM)
+    assert r["error"] is None and r["render_error"] is None
+    imgs = r["images"]
     assert "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18" in imgs
     assert "ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18" in imgs
     assert "ghcr.io/krateo-agentiko/hop-sidecar:9.0.1" in imgs          # a subchart: its own appVersion
 
 
 @pytest.mark.parametrize("version,why", [(FAKE_CHART_BAD_DIGEST, "does not match its digest"),
-                                         (FAKE_CHART_HTTP_BLOB, "redirected off https")])
+                                         (FAKE_CHART_HTTP_BLOB, "redirected off https"),
+                                         # #1023: every read bounded in size
+                                         (FAKE_CHART_BIG_MANIFEST, f"an answer larger than its {4 * 1024 * 1024} byte bound"),
+                                         (FAKE_CHART_BLOB_OVER_SIZE, "an answer larger than its ")])
 def test_a_chart_blob_that_is_not_what_the_manifest_names_is_refused(version, why):
-    imgs, err = ghcr_pull.chart_images("oci://ghcr.io/krateo-agentiko/charts", "agentgateway-policies", version,
-                                       FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
-    assert imgs == [] and err.startswith("its images unreadable: ") and why in err
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", version, FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["images"] == [] and r["error"].startswith(f"{AGW}/agentgateway-policies:{version}: its images unreadable: ")
+    assert why in r["error"]
+
+
+def test_the_render_uses_the_installers_values_for_the_component():
+    """#1023 A, run 19's dry pass: values-only found cert-replay-hop, not
+    ui-token-hop, which the installer turns on through componentValues and
+    which only a template names. The chart's own defaults render it off."""
+    on = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN,
+                                {"uiTokenHop": {"enabled": True}}, HELM)
+    off = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18" in on["rendered"]
+    assert "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18" not in off["images"]
+
+
+def test_the_pins_carry_the_installers_component_values_overridden_by_the_benchs(tmp_path):
+    root = tmp_path / "installer"
+    (root / "files").mkdir(parents=True)
+    (root / "templates").mkdir()
+    (root / "Chart.yaml").write_text("apiVersion: v2\nname: installer\nversion: 0.3.468\n")
+    (root / "templates" / "_helpers.tpl").write_text('{{- define "inst.coreFeatures" -}}{{- end -}}\n')
+    (root / "files" / "component-pins.yaml").write_text(yaml.safe_dump({"components": [
+        {"name": "agentgateway-policies", "version": "0.2.18", "repo": AGW}]}))
+    (root / "values.yaml").write_text(yaml.safe_dump({"componentValues": {"agentgateway-policies": {
+        "uiTokenHop": {"enabled": True}, "networkPolicy": {"ui": {"enabled": False}, "egress": {"enabled": True}}}}}))
+    v = tmp_path / "v.yaml"
+    v.write_text(yaml.safe_dump({"componentValues": {"agentgateway-policies": {"networkPolicy": {"ui": {"enabled": True}},
+                                                                               "certReplayHop": {"replicas": 2}}}}))
+    assert ghcr_pull.private_pins(str(tmp_path), str(v))[0]["values"] == {      # merged map by map, as helm does
+        "uiTokenHop": {"enabled": True}, "networkPolicy": {"ui": {"enabled": True}, "egress": {"enabled": True}},
+        "certReplayHop": {"replicas": 2}}
+
+
+def test_a_render_that_does_not_finish_is_bounded(monkeypatch, tmp_path):
+    slow = tmp_path / "helm"
+    slow.write_text("#!/bin/sh\nsleep 30\n")
+    slow.chmod(0o755)
+    monkeypatch.setattr(ghcr_pull, "RENDER_BOUND_S", 1.0)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, str(slow))
+    assert r["render_error"] == "helm template did not finish within its 1 s bound"
+
+
+def test_a_registry_that_drips_its_answer_is_bounded(monkeypatch):
+    """Each call's WHOLE answer within its bound, not each socket read."""
+    import time
+    monkeypatch.setattr(ghcr_pull, "HTTP_BOUND_S", 2.0)
+    t0 = time.monotonic()
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", FAKE_CHART_DRIP, FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert "no whole answer within its 2 s bound" in r["error"] and time.monotonic() - t0 < 10
+
+
+def test_yaml_aliases_are_walked_once():
+    """A chain of aliases, each doubling the one before: 40 levels would be
+    2^40 visits without a visited set."""
+    import signal
+    doc = "l0: &l0 {image: {repository: ghcr.io/x/y, tag: '1'}}\n" + "".join(
+        f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]\n" for i in range(1, 41))
+    values = yaml.safe_load(doc)
+
+    def boom(*_):
+        raise TimeoutError("the walk did not finish: aliases are walked more than once")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(20)
+    try:
+        assert ghcr_pull.images_in_values(values, "0") == ["ghcr.io/x/y:1"]
+        assert ghcr_pull.images_in_manifests([{"spec": values}]) == []
+        assert ghcr_pull.images_in_manifests(yaml.safe_load(doc.replace("{image: {repository: ghcr.io/x/y, tag: '1'}}",
+                                                                         "{image: ghcr.io/x/y:1}"))) == ["ghcr.io/x/y:1"]
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_the_image_pull_failure_redacts_the_pull_account():
+    import subprocess as sp
+    from bench import diag606
+    pod = {"metadata": {"name": "p", "namespace": "ns"}, "spec": {"containers": [{"name": "c", "image": "ghcr.io/x/c:1"}]},
+           "status": {"containerStatuses": [{"name": "c", "state": {"waiting": {
+               "reason": "ErrImagePull", "message": f"pulling as {FAKE_GHCR_USER}: 401"}}}]}}
+
+    def run(argv, **kw):
+        out = {"items": [pod]} if " get pods" in " ".join(argv) else {"items": []}
+        return sp.CompletedProcess(argv, 0, json.dumps(out), "")
+    f = diag606.image_pull_failures(diag606.Kube("kc", "gke_p_z_snowplow-bench-x", run=run))
+    assert FAKE_GHCR_USER not in f[0]["message"] and "<redacted>" in f[0]["message"]
+
+
+@pytest.mark.parametrize("env,render", [({"FAKE_HELM_TEMPLATE_FAIL": "agentgateway-controller"}, "failed: helm template failed: "),
+                                        ({"FAKE_PRIVATE_IMAGES": "none"}, "ok")])
+def test_what_is_not_a_private_image_component_is_recorded_not_refused(harness, env, render):  # noqa: F811
+    """A chart the installer injects no pull Secret into may fail to render:
+    recorded (its values' images still preflighted), the run goes on. An
+    installer with no inst.privateImageComponents says so."""
+    env0, state, ambient, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env0, **env), capture_output=True,
+                       text=True, timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-3000:]
+    pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
+    ctl = next(c for c in pf["charts"] if c["chart"].endswith("/agentgateway-controller"))
+    assert ctl["render"].startswith(render) and ctl["error"] is None
+    if "FAKE_PRIVATE_IMAGES" in env:
+        assert pf["private_image_components"] is None and "declares no inst.privateImageComponents" in out
 
 
 def test_an_init_container_that_cannot_pull_is_named_too():

@@ -987,6 +987,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             print(f"Error: {a[1]}:{ver}: not found", file=sys.stderr); sys.exit(1)
         crd_chart(chart, os.path.join(a[a.index("-d") + 1], chart))
         sys.exit(0)
+    if a[:1] == ["template"]:
+        os.execv(sys.executable, [sys.executable, os.environ["FAKE_HELM_TEMPLATE_BIN"], *a])
     if a[:1] == ["pull"]:
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
@@ -995,13 +997,24 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         crd_chart("core-provider-crds", os.path.join(d, "charts", "core-provider-crds"))
         open(os.path.join(d, "values.yaml"), "w").write(
             "ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10)
-            + "features: {portal: true, agentGateway: false, specialistAgents: false}" + chr(10))
+            + "features: {portal: true, agentGateway: false, specialistAgents: false}" + chr(10)
+            # as 0.3.468: the installer turns the dashboard's ui-token-hop on through componentValues
+            + "componentValues: {agentgateway-policies: {uiTokenHop: {enabled: true}}}" + chr(10))
         os.makedirs(os.path.join(d, "templates"), exist_ok=True)
         core = os.environ.get("FAKE_CORE_FEATURES", "")
         if core == "dynamic":
             core = "{{ .Values.coreFeatures }}"
+        # inst.privateImageComponents as at 0.3.468 (FAKE_PRIVATE_IMAGES: none = no such define;
+        # dynamic = not a static list)
+        priv = {"none": "", "dynamic": '{{- define "inst.privateImageComponents" -}}{{ toYaml .Values.x }}{{- end -}}'
+                }.get(os.environ.get("FAKE_PRIVATE_IMAGES", ""), chr(10).join([
+                    '{{- define "inst.privateImageComponents" -}}', "components:",
+                    "- name: core-provider-agent", "  path: [mcpServers, chartGate, imagePullSecrets]",
+                    "- name: agentgateway-policies", "  path: [certReplayHop, image, pullSecrets]",
+                    "- name: agentgateway-policies", "  path: [uiTokenHop, image, pullSecrets]",
+                    "{{- end -}}"]))
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
-            '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10))
+            '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
             "dependencies": [{"name": "core-provider", "version": "2.13.24"},
