@@ -27,7 +27,8 @@ credential Secret from AUTHN_NAMESPACE before the handler runs:
 
 - `GET /call` and `POST /call/read`;
 - the `/call` write routes;
-- `GET /list` and `GET /export`;
+- `GET /list`;
+- `GET /export` and `POST /export`;
 - `GET /rbac`;
 - `POST /jq`.
 
