@@ -512,15 +512,21 @@ def test_each_path_is_tied_to_the_pod_that_uses_it():
         {"name": ghcr_pull.marker(0)}]
 
 
-def test_helms_merge_deletes_a_null_and_the_release_is_the_components_name(monkeypatch):
+def test_helms_merge_deletes_a_null_and_the_release_is_the_components_name(tmp_path):
     """#1041 review F5: what can change an image is mirrored: a null deletes
     the key, and the release is named after the component, as the
-    installer's $c.name."""
+    installer's $c.name (a recording helm writes the argv it was given)."""
     assert ghcr_pull._merge({"a": {"b": 1, "c": 2}}, {"a": {"c": None}}) == {"a": {"b": 1}}
-    monkeypatch.setenv("FAKE_HELM_TEMPLATE_FAIL", "the-component")
-    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM,
+    argv = tmp_path / "argv.json"
+    rec = tmp_path / "helm"
+    rec.write_text("#!/usr/bin/env python3\nimport json, sys\nsys.stdin.read()\n"
+                   f"open({str(argv)!r}, 'w').write(json.dumps(sys.argv[1:]))\n")
+    rec.chmod(0o755)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, str(rec),
                                name="the-component")
-    assert r["render_error"] and "the-component" in r["render_error"]
+    assert r["error"] is None and r["render_error"] is None, r
+    got = json.loads(argv.read_text())
+    assert got[:2] == ["template", "the-component"], got
 
 
 def test_every_enabled_private_component_is_a_pin_whatever_its_repo(tmp_path):
