@@ -210,7 +210,9 @@ def resync_interval(deployments: dict | None, configmaps: dict | None, read_erro
                     "source": f"UNREAD ({name}: {e}{'; ConfigMaps: ' + read_error if read_error else ''}); "
                               f"sized for the cdc's compiled default"}
         if v is not None:
-            sec = parse_duration(v)
+            # plumbing env.Duration parses strings.TrimSpace(val) (plumbing v1.17.1 env/env.go:81);
+            # the flag is parsed as given
+            sec = parse_duration(v.strip())
             if sec is None:
                 return {"seconds": COMPILED_DEFAULT_S, "deployment": name, "refuse": None,
                         "source": f"{name} {where} {ENV}={v!r} is unparseable: the cdc's compiled default "
@@ -262,16 +264,23 @@ def _json(path: str):
 
 
 def installer_conditions(installers_json: str) -> list[dict] | None:
-    """The Installer composition's Ready / Synced conditions (type, status,
-    reason, message), None when it was not read or there is not exactly one."""
+    """EVERY Installer composition in krateo-system, by name, with its Ready /
+    Synced conditions (type, status, reason, message): one installers cdc
+    reconciles each Installer CR it finds, so with more than one, each one's
+    own word is reported, never the first one's alone (#1006 R3-3). None when
+    they were not read or there is none. Messages pass through diag606's run
+    redaction: the pull account's name never reaches the run's record (R3-2)."""
     d = _json(installers_json) if installers_json else None
     items = d.get("items") if isinstance(d, dict) else None
-    if not isinstance(items, list) or len(items) != 1:
+    if not isinstance(items, list) or not items:
         return None
     from bench import diag606
-    return [{"type": c.get("type"), "status": c.get("status"), "reason": c.get("reason"),
-             "message": diag606.redact(str(c.get("message") or ""))[:400]}
-            for c in ((items[0].get("status") or {}).get("conditions") or []) if c.get("type") in ("Ready", "Synced")]
+    return [{"name": (i.get("metadata") or {}).get("name"),
+             "conditions": [{"type": c.get("type"), "status": c.get("status"), "reason": c.get("reason"),
+                             "message": diag606.redact_run_text(str(c.get("message") or ""))[:400]}
+                            for c in ((i.get("status") or {}).get("conditions") or [])
+                            if c.get("type") in ("Ready", "Synced")]}
+            for i in items]
 
 
 def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, frontends_rc: int,
@@ -341,13 +350,16 @@ def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
     if last["cdc_available"] is False:
         return "installer_cdc_down", (f"the gateway has an address, but the installer cdc is not Available: "
                                       f"nothing renders installer-platform (Frontend composition {r}); {tail}")
-    conds = last.get("installer")
-    says = ("; ".join(f"{c['type']}={c['status']} ({c.get('reason') or '-'}): {c.get('message') or '-'}" for c in conds)
-            if conds else "its conditions could not be read")
+    insts = last.get("installer")
+
+    def word(i):
+        return f"{i['name']}: " + ("; ".join(f"{c['type']}={c['status']} ({c.get('reason') or '-'}): "
+                                             f"{c.get('message') or '-'}" for c in i["conditions"]) or "no conditions")
+    says = (" | ".join(word(i) for i in insts) if insts else "its conditions could not be read")
     return "installer_defect", (f"INSTALLER DEFECT: the installer cdc is Available and the gateway has had its "
                                 f"address for {since:.0f}s (2 x its resync), yet the Frontend composition it "
                                 f"renders is {r} (not one origin at /content, /auth, /events); the Installer "
-                                f"composition says: {says}; {tail}")
+                                f"composition{'s say' if insts and len(insts) > 1 else ' says'}: {says}; {tail}")
 
 
 def main(argv: list[str] | None = None) -> int:

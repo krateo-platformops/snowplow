@@ -129,6 +129,21 @@ def test_an_envfrom_secret_that_may_carry_the_key_is_unread_never_skipped():
     assert _r(_deploy(prefixed), _cms(**{CM: {ENV: "60s"}}))["seconds"] == 60     # its prefix cannot make the key
 
 
+@pytest.mark.parametrize("where", ["env", "envFrom"])
+def test_an_env_value_is_trimmed_as_the_cdcs_env_duration_trims_it(where):
+    """#1006 R3-1: plumbing env.Duration parses strings.TrimSpace(val); the
+    flag is parsed as given (a flag " 60s" is malformed)."""
+    if where == "env":
+        r = _r(_deploy(_c(env=[{"name": ENV, "value": " 60s "}])), _cms())
+    else:
+        r = _r(_deploy(_c()), _cms(**{CM: {ENV: " 60s "}}))
+    assert r["seconds"] == 60 and r["refuse"] is None
+    neg = _r(_deploy(_c(env=[{"name": ENV, "value": " -1m"}])), _cms())
+    assert neg["refuse"] and "is not positive" in neg["refuse"]
+    assert _r(_deploy(_c(args=["-resync-interval= 60s"])), _cms())["refuse"].endswith(
+        "the cdc exits at flag parsing, nothing renders installer-platform")
+
+
 def test_else_the_compiled_default():
     r = _r(_deploy(_c()), _cms(**{CM: {}}))
     assert r["seconds"] == 180 and "sets no -resync-interval" in r["source"]
@@ -252,14 +267,49 @@ def test_only_a_reading_of_no_address_restarts_the_window(gws, since):
 def test_the_installer_defect_carries_the_installer_compositions_own_conditions():
     """#1006 R2-6: Available says the pod is up, not that its reconcile
     succeeds: the Installer composition's Ready/Synced say why."""
-    last = dict(_p(9), installer=[{"type": "Ready", "status": "False", "reason": "ReconcileError",
-                                   "message": "lookup krateo-agent-gateway-platform: forbidden"},
-                                  {"type": "Synced", "status": "True", "reason": "ReconcileSuccess", "message": ""}])
+    last = dict(_p(9), installer=[{"name": "installer", "conditions": [
+        {"type": "Ready", "status": "False", "reason": "ReconcileError",
+         "message": "lookup krateo-agent-gateway-platform: forbidden"},
+        {"type": "Synced", "status": "True", "reason": "ReconcileSuccess", "message": ""}]}])
     k, m = origin_gate.verdict([_p(0), last], R, "w")
     assert k == "installer_defect"
-    assert ("the Installer composition says: Ready=False (ReconcileError): lookup krateo-agent-gateway-platform: "
-            "forbidden; Synced=True (ReconcileSuccess): -") in m
+    assert ("the Installer composition says: installer: Ready=False (ReconcileError): lookup "
+            "krateo-agent-gateway-platform: forbidden; Synced=True (ReconcileSuccess): -") in m
     assert "its conditions could not be read" in origin_gate.verdict([_p(0), _p(9)], R, "w")[1]
+
+
+def _installers(tmp_path, *items):
+    f = tmp_path / "inst.json"
+    f.write_text(json.dumps({"items": [
+        {"metadata": {"name": n}, "status": {"conditions": [
+            {"type": "Ready", "status": r, "reason": "x", "message": m},
+            {"type": "Synced", "status": "True", "reason": "ReconcileSuccess", "message": ""},
+            {"type": "Other", "status": "True", "reason": "ignored", "message": "ignored"}]}}
+        for n, r, m in items]}))
+    return str(f)
+
+
+def test_every_installer_speaks_never_the_first_alone(tmp_path):
+    """#1006 R3-3: one installers cdc reconciles each Installer CR it finds;
+    with two, each one's own conditions are reported, by name."""
+    got = origin_gate.installer_conditions(_installers(tmp_path, ("installer-platform", "False", "lookup failed"),
+                                                       ("installer-extra", "True", "")))
+    assert [i["name"] for i in got] == ["installer-platform", "installer-extra"]
+    assert [[c["type"] for c in i["conditions"]] for i in got] == [["Ready", "Synced"], ["Ready", "Synced"]]
+    k, m = origin_gate.verdict([_p(0), dict(_p(9), installer=got)], R, "w")
+    assert ("the Installer compositions say: installer-platform: Ready=False (x): lookup failed; Synced=True "
+            "(ReconcileSuccess): - | installer-extra: Ready=True (x): -; ") in m
+    assert origin_gate.installer_conditions(_installers(tmp_path)) is None
+
+
+def test_an_installer_message_never_carries_the_pull_account(tmp_path):
+    """#1006 R3-2: the same redaction as every diag606 bundle: token shapes
+    AND the ghcr pull account's literals (conftest's fake pull file)."""
+    from tests.conftest import FAKE_GHCR_TOKEN, FAKE_GHCR_USER
+    got = origin_gate.installer_conditions(_installers(tmp_path, (
+        "installer", "False", f"pulling as {FAKE_GHCR_USER} with token={FAKE_GHCR_TOKEN}: 401")))
+    msg = got[0]["conditions"][0]["message"]
+    assert FAKE_GHCR_USER not in msg and FAKE_GHCR_TOKEN not in msg and "<redacted>" in msg
 
 
 def test_a_reading_is_built_from_what_kubectl_answered(tmp_path):
@@ -351,9 +401,25 @@ def test_the_installer_defect_through_the_real_sequence_names_the_installers_con
     p, out, d = _run(harness, FAKE_PORTAL="split", FAKE_RENDERED="split", FAKE_CDC_RESYNC="args:20s",
                      BENCH_GATE_CLOCK_STEP_S="10", PLATFORM_POLL_S="0")
     assert p.returncode != 0 and "portal origin FAILED: installer_defect: INSTALLER DEFECT" in out
-    assert "the Installer composition says: Ready=True (Available)" in out, out[-3000:]
+    assert "the Installer composition says: installer: Ready=True (Available)" in out, out[-3000:]
     last = json.loads((d / "portal-origin-wait.jsonl").read_text().splitlines()[-1])
-    assert [c["type"] for c in last["installer"]] == ["Ready", "Synced"]
+    assert [c["type"] for c in last["installer"][0]["conditions"]] == ["Ready", "Synced"]
+
+
+def test_the_pull_account_in_an_installer_message_never_reaches_the_runs_record(harness):  # noqa: F811
+    """#1006 R3-2 through run606: the defect text goes to run.log and
+    command-failures.jsonl; the account named in the Installer's message
+    reaches neither, nor the output, nor the gate's readings."""
+    from tests.conftest import FAKE_GHCR_USER
+    p, out, d = _run(harness, FAKE_PORTAL="split", FAKE_RENDERED="split", FAKE_CDC_RESYNC="args:20s",
+                     BENCH_GATE_CLOCK_STEP_S="10", PLATFORM_POLL_S="0",
+                     FAKE_INSTALLER_SMSG=f"helm pull as {FAKE_GHCR_USER}: 401 unauthorized")
+    assert p.returncode != 0 and "portal origin FAILED: installer_defect" in out
+    assert "Synced=True (ReconcileSuccess): helm pull as <redacted>: 401 unauthorized" in out
+    for f in ("run.log", "command-failures.jsonl", "portal-origin-wait.jsonl"):
+        text = (d / f).read_text()
+        assert FAKE_GHCR_USER not in text, f
+    assert FAKE_GHCR_USER not in out
 
 
 def test_an_address_that_flaps_restarts_the_window(harness):  # noqa: F811

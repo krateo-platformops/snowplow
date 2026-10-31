@@ -586,7 +586,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             if extra:
                 kids.append("compositiondefinitions/krateo-system/oasgen-provider")
             msg = (f"{len(kids)} of 41 managed children are not ready: " + ", ".join(kids)) if kids else ""
-            inst = cr("Installer", "installer", not kids, "Creating" if kids else "Available", msg)
+            # FAKE_INSTALLER_SMSG: the Installer's Synced message (#1006 R3-2: it may name the pull account)
+            inst = cr("Installer", "installer", not kids, "Creating" if kids else "Available", msg,
+                      smsg=os.environ.get("FAKE_INSTALLER_SMSG", ""))
             # spec.components as the 0.3.459 Installer CR carries it: what it WILL
             # create (a feature-off entry is not created; github-provider-kog is
             # declared, its CR never appears while its definition 401s)

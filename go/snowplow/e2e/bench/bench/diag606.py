@@ -99,6 +99,13 @@ def _pull_account() -> tuple[str, ...]:
     return tuple(x for x in ghcr_pull.creds(path) if x)
 
 
+def redact_run_text(text: str) -> str:
+    """THE redaction for cluster text that reaches run.log,
+    command-failures.jsonl or a bundle: redact()'s token shapes plus the ghcr
+    pull account's literals (#1006 R3-2). One helper, every caller."""
+    return redact(text, _pull_account())
+
+
 def redact(text: str, extra: tuple[str, ...] = ()) -> str:
     for rx, rep in _REDACTIONS:
         text = rx.sub(rep, text)
