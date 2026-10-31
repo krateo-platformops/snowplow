@@ -153,7 +153,9 @@ Content-Type: application/json
     stage still reports `StageNotExecuted`, never `Skipped`.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
-  error), and a `-clientconfig` endpointRef is refused. A `userAccessFilter`
+  error). An endpointRef naming a per-user credential Secret
+  (`<user>-clientconfig` or `<user>-clientconfig-stepup`) is refused, as it
+  is in a stored RESTAction (#1025). A `userAccessFilter`
   stage reads with the caller's own RBAC, never through snowplow's
   ServiceAccount: rows the caller cannot read are not returned, and a path the
   caller cannot list that is not served from snowplow's informers is the

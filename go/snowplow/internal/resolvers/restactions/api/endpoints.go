@@ -30,53 +30,38 @@ type endpointReferenceMapper struct {
 // The per-user credential Secret names come from credsecret (#994): For picks
 // the one a validated identity reads (`<user>-clientconfig`, or
 // `<user>-clientconfig-stepup` when its groups carry krateo:loa:2), and
-// IsPerUserName is the reserved set #113 guardrail (b) and the #443
-// caller-supplied refusal key on. Single source, so the guardrail and the
-// synthesis can never drift onto different strings
+// IsPerUserName is the reserved set the #1025 rule keys on. Single source, so
+// the rule and the synthesis can never drift onto different strings
 // (feedback_consultation_mutation_is_not_key_correctness). It is a general
 // boundary on the reserved names, NOT a per-resource carve-out
 // (feedback_no_special_cases).
 
-// resolveOne resolves a named/nil endpoint Reference to an Endpoint. templated
-// reports whether ref was produced by REQUEST-DRIVEN jq templating of
-// endpointRef.name (#113): the eval site in resolveStageEndpoint passes true so
-// this choke point can apply guardrail (b) — the defense-in-depth reserved-suffix
-// refusal — WITHOUT refusing resolveOne's OWN internal nil-ref synthesis (which
-// legitimately produces a `<user>-clientconfig` name and MUST still resolve).
-// Every non-templated caller (internal nil-ref, static author-literal refs)
-// passes false and is byte-identical to pre-#113.
+// resolveOne resolves a named/nil endpoint Reference to an Endpoint.
+//
+// #1025 — the single choke point every named ref passes: a named ref that
+// names a per-user credential Secret is refused here, for every provenance
+// (stored or caller-supplied) and whether its name was literal or templated
+// (per_user_ref.go). The check runs BEFORE the nil-ref synthesis below, which
+// legitimately builds the caller's OWN per-user name and must still resolve.
+//
 // resolveOne additionally reports isSAEndpoint: true ONLY on the
 // InternalEndpointFromContext branch, which always carries snowplow's own SA
 // endpoint (every WithInternalEndpoint attach passes saEP). This is the PROVENANCE
 // signal the dial site uses to thread the SA token FILE (#267) — the SA endpoint is
 // shape-identical to a token-auth per-user clientconfig, so it can only be
 // distinguished by where it came from, never by field shape (arch-268 ruling). All
-// other returns (guardrail-b, wrong-type fall-through, clientconfig cache-hit,
-// FromSecret, errors) report false.
-func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference, templated bool) (endpoints.Endpoint, bool, error) {
+// other returns (the #1025 refusal, wrong-type fall-through, clientconfig
+// cache-hit, FromSecret, errors) report false.
+func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
 	isInternal := false
-	// #113 guardrail (b) — defense-in-depth. A REQUEST-TEMPLATED ref may never
-	// resolve to the reserved `<user>-clientconfig` internal-identity class. This
-	// is the SECOND layer (the eval site refuses first); it lives here because
-	// resolveOne is the single choke point EVERY ref lookup passes AND where the
-	// internal `-clientconfig` name is itself constructed — so a FUTURE templating
-	// call site that forgets the eval-site check still cannot dial a per-user
-	// credential Secret. Gated on templated so the internal nil-ref synthesis
-	// below (which DOES build a `-clientconfig` name) is never refused.
-	// #994: the reserved set holds the step-up `<user>-clientconfig-stepup`
-	// too — a templated ref resolving to another user's step-up name would
-	// otherwise dial that user's ELEVATED credential.
-	if templated && ref != nil && credsecret.IsPerUserName(ref.Name) {
-		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"templated endpointRef resolved to the reserved per-user credential name %q (suffix %q or %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
-			ref.Name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
+	if ref != nil && credsecret.IsPerUserName(ref.Name) {
+		recordPerUserRefRefused(m.provenance)
+		return endpoints.Endpoint{}, false, ErrPerUserCredentialRef
 	}
 	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
 	// CALLER, never through the ServiceAccount or the SA-backed Secrets
 	// snapshot, so a draft can only use credentials its author can already
-	// read. A literal `-clientconfig` ref is refused too (the #113 guardrail
-	// applied to literal refs, defense in depth): a draft must never select
-	// another user's clientconfig even if the caller could read it.
+	// read.
 	if ref != nil && m.provenance == ProvenanceCallerSupplied {
 		return m.resolveOneAsCaller(ctx, ref)
 	}

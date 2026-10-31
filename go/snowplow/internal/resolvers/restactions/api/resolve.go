@@ -32,7 +32,6 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
-	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -461,7 +460,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
 		// the SA-dial mark never fires. The refilter still runs unchanged. A
 		// path the caller cannot list is then the apiserver's 403 stage error.
-		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil, false)
+		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil)
 		if err != nil {
 			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
@@ -502,19 +501,22 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
 	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
 	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
-	// stays literal, never templated). Returns templated=true so resolveOne applies
-	// the guardrail (b) defense-in-depth layer.
-	ref, templated, guardErr := r.evalEndpointRef(apiCall.EndpointRef)
-	if guardErr != nil {
-		// Guardrail (b) refusal at the eval site (fail-fast, before any Secret
-		// lookup): a templated name resolved to the reserved `-clientconfig`
-		// internal-identity class. Same truncating posture as any endpoint-resolve
-		// failure (R-2 stageReturn) — the Secret is never dialed.
-		r.log.Error("templated endpoint reference refused",
-			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
+	// stays literal, never templated).
+	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
+	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
+	if errors.Is(err, ErrPerUserCredentialRef) {
+		// #1025 — the named ref names a per-user credential Secret: refused
+		// for every provenance, literal or templated. Same truncating posture
+		// as any endpoint-resolve failure (R-2 stageReturn); nothing was read
+		// or dialed. The Secret name embeds a username: a redact label only.
+		r.log.Error("endpointRef refused: it names a per-user credential Secret",
+			slog.String("name", id),
+			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
+			slog.Bool("templated", templated),
+			slog.String("namespace", ref.Namespace),
+			slog.String("secret_name", redact.Prefixed("secret", ref.Name)))
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
-	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref, templated)
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
@@ -531,22 +533,23 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 // refs are untouched). For a MaybeQuery-shaped name it evaluates the name through
 // evalJQ against r.dict (the SAME per-stage dict path/payload/headers see, so
 // `.name` resolves identically), RFC1123-sanitizes the result, applies guardrail
-// (a) (namespace stays the author-literal — NEVER templated) and guardrail (b)
-// (a resolved `-clientconfig` name is REFUSED here, fail-fast, so the Secret
-// lookup never fires), and returns templated=true so resolveOne applies its
-// defense-in-depth reserved-suffix refusal too. A jq error keeps the §1.2
-// honest-error posture — the error string is still sanitized to a name that
-// resolves to a Secret miss downstream, byte-identical to pre-#341 — but #341
-// now also SURFACES it (a DEBUG line + snowplow_nondial_jq_error_total) instead
-// of swallowing it silently; not a new error class.
-func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool, error) {
+// (a) (namespace stays the author-literal — NEVER templated) and returns
+// templated=true. Guardrail (b) — a name that resolves to a per-user credential
+// Secret — is not applied here: since #1025 resolveOne refuses such a name for
+// every ref, templated or literal, on the normalised name this returns. A jq
+// error keeps the §1.2 honest-error posture — the error string is still
+// sanitized to a name that resolves to a Secret miss downstream, byte-identical
+// to pre-#341 — but #341 now also SURFACES it (a DEBUG line +
+// snowplow_nondial_jq_error_total) instead of swallowing it silently; not a new
+// error class.
+func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool) {
 	if ref == nil {
-		return ref, false, nil
+		return ref, false
 	}
 	if _, isTemplate := jqutil.MaybeQuery(ref.Name); !isTemplate {
-		// Static/literal name (incl a literal `-clientconfig` internal ref, which
-		// is the author's own business): pass through, NOT templated, NOT gated.
-		return ref, false, nil
+		// Static/literal name: passed through, NOT templated. resolveOne
+		// still applies the #1025 per-user credential rule to it.
+		return ref, false
 	}
 	// #341 — NON-dial evalJQ-swallow cleanup (#302 sibling). Render through
 	// evalJQE and SURFACE a jq error (a DEBUG line + the per-site
@@ -564,22 +567,14 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		)
 		rendered = jqErr.Error() // byte-identical to evalJQ's pre-#341 swallow value
 	}
+	// Normalised BEFORE resolveOne sees it, so the #1025 rule checks the
+	// name that is looked up.
 	name := kubeutil.MakeDNS1123Compatible(rendered)
-	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
-	// resolve to a reserved per-user credential name — the session
-	// `<user>-clientconfig` or, since #994, the step-up
-	// `<user>-clientconfig-stepup` (credsecret.IsPerUserName holds both).
-	if credsecret.IsPerUserName(name) {
-		return nil, true, fmt.Errorf(
-			"templated endpointRef.name %q resolved to %q, which is a reserved per-user credential Secret name (suffix %q or %q); refusing at the template-eval site (#113 guardrail b) — user query-extras may not select a per-user credential Secret",
-			ref.Name, name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
-	}
 	// Guardrail (a): namespace is NEVER templated in V1 — it stays the
 	// author-authored literal, so a templated name can only ever select WITHIN
 	// the namespace the RA author already chose (the credential-store trust
-	// boundary). templated=true so resolveOne applies guardrail (b) again (§2
-	// two-layer defense).
-	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true, nil
+	// boundary).
+	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true
 }
 
 // collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call

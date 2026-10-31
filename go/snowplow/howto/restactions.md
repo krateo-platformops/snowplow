@@ -354,9 +354,24 @@ A stage's `path`, `payload` and each `headers` entry may embed a **jq template**
 delimited by `${ ... }`. The template is evaluated against the shared resolve
 dict (previous stage outputs + `extras`) before the request is issued; a plain
 string without the delimiter is passed through verbatim. (`endpointRef.name`
-supports the same templating, with a guardrail: a request-templated name may
-never resolve to a reserved per-user credential Secret: `<user>-clientconfig`
-or the step-up `<user>-clientconfig-stepup`.)
+supports the same templating. Whether literal or templated, it may never
+name a per-user credential Secret; see below.)
+
+### `endpointRef` never names a per-user credential
+
+A stage's `endpointRef` may never name a per-user credential Secret: the
+session `<user>-clientconfig` or the step-up `<user>-clientconfig-stepup`.
+This holds for every RESTAction, stored or sent inline as a draft, and for
+both literal and templated names (a templated name is checked after it is
+rendered and normalised). Snowplow refuses such a stage before it reads the
+Secret: the stage fails, the resolve stops there, and the refusal is logged
+as `endpointRef refused: it names a per-user credential Secret` (the Secret
+name appears only as a redacted label) and counted in
+`snowplow_endpointref_per_user_refused_total{provenance}` at `/debug/vars`.
+
+To call the Kubernetes API as the requesting user, omit `endpointRef`.
+Snowplow then uses the caller's own credential: the step-up one when the
+caller has stepped up, the session one otherwise.
 
 ## Example
 

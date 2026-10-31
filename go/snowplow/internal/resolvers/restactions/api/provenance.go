@@ -9,7 +9,6 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
-	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 // fromSecretAsCallerFn reads a named endpointRef Secret with the caller's
@@ -23,15 +22,9 @@ var fromSecretAsCallerFn = credhttp.FromSecret
 // built from the caller's clientconfig endpoint on the request ctx, so the
 // apiserver decides whether the caller may read it (a 403 or 404 becomes the
 // stage's error). It never consults the SA-backed Secrets snapshot or the
-// ServiceAccount rest config, and refuses a `-clientconfig` name outright.
+// ServiceAccount rest config. A per-user credential name never reaches it:
+// resolveOne refuses one for every provenance first (#1025).
 func (m *endpointReferenceMapper) resolveOneAsCaller(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
-	// A session `<user>-clientconfig` or step-up `<user>-clientconfig-stepup`
-	// name (#994): one reserved set, credsecret.IsPerUserName.
-	if credsecret.IsPerUserName(ref.Name) {
-		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"endpointRef %q names a reserved per-user credential Secret (suffix %q or %q); a caller-supplied RESTAction may not select one",
-			ref.Name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
-	}
 	// An inline request never carries an internal (ServiceAccount) rest
 	// config: only seeds and the refresher set one. Refuse rather than let
 	// ClientConfigFor hand back the SA's config.
@@ -74,9 +67,8 @@ const (
 	//   - a userAccessFilter stage dials the caller's clientconfig instead of
 	//     the ServiceAccount (the refilter still runs);
 	//   - a named endpointRef Secret is read with the caller's credentials,
-	//     never through the ServiceAccount or the informer snapshot, and a
-	//     literal per-user credential ref (session or step-up, #994) is
-	//     refused, so a draft can never dial
-	//     as another user.
+	//     never through the ServiceAccount or the informer snapshot.
+	// A named per-user credential ref (session or step-up) is refused for
+	// EVERY provenance, this one included (#1025, per_user_ref.go).
 	ProvenanceCallerSupplied
 )
