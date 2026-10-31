@@ -45,10 +45,13 @@ If that Secret is not in snowplow's informer, snowplow re-reads it from the
 apiserver. If the apiserver answers **NotFound**, the credential is missing and
 the request answers **401** with a cause (section 2).
 
-- **Step-up case.** The step-up credential lives about 15 minutes, so the
-  usual reason is that it expired and authn removed it. The step-up JWT itself
-  expires no later than the credential, so an expired step-up JWT is still a
-  plain 401 from token validation (section 4).
+- **Step-up case.** Two facts here come from authn, and snowplow cannot verify
+  them:
+  - Per authn, the step-up credential lives about 15 minutes, so the usual
+    reason is that it expired and authn removed it.
+  - Per authn, the step-up JWT expires no later than the credential (its `exp`
+    is clamped to the certificate's NotAfter). So an expired step-up JWT is
+    normally a plain 401 from token validation (section 4), not this cause.
 - **Session case.** The session Secret was deleted, for example by an admin or
   by a logout on another device.
 
@@ -104,6 +107,12 @@ There is no `WWW-Authenticate` header in this case.
   Portal behaviour must never depend on the header. Most 401s reach
   `useCatchError`, which has no headers. Only `useWidgetQuery.ts` and
   `sseClient.ts` hold the `Response`.
+- **The header is readable same-origin only.** `WWW-Authenticate` is
+  deliberately not in snowplow's CORS `ExposedHeaders` (`snowplowCORSOptions`
+  in `main.go`). The portal is served same-origin through the gateway, where
+  the header is readable. A cross-origin caller gets `null` from
+  `res.headers.get('WWW-Authenticate')`, which is fine because nothing may
+  depend on the header; the body carries the cause either way.
 
 ## 3. The three portal outcomes
 
@@ -134,6 +143,14 @@ from snowplow; they are listed only so that one parser covers both components.
   credential is missing, so it invents no cause. Treat it as today's 500.
 - **A 503** means the JWT signing key could not be resolved (authn's JWKS
   unreachable). It is unchanged and retryable.
+- **A Secret deleted after the middleware read it.** The middleware reads the
+  credential once, before the handler runs. If the Secret disappears while the
+  request is already being resolved (for example, the step-up credential
+  expires mid-request), a stage that dials the caller's own credential fails
+  later as a stage error inside the response, not as this 401. A RESTAction
+  reports it in its stage outcomes; a widget reports it as a failed dependency
+  (`docs/howto-frontend-widget-dependency-status.md`). The next request then
+  gets this 401 with its cause.
 - **An unknown `causes[0].reason`** (a future value): fall back to the plain
   401 handling. Never prompt for step-up on an unknown reason.
 - **A burst of concurrent 401s** from one expired step-up credential: every
@@ -206,7 +223,8 @@ for this to type-check. `data.message` keeps its meaning.
 
 At the two sites that hold the `Response` (`useWidgetQuery.ts`,
 `sseClient.ts`), you may additionally log
-`res.headers.get('WWW-Authenticate')` for diagnostics. Do not branch on it.
+`res.headers.get('WWW-Authenticate')` for diagnostics (same-origin only; see
+section 2c). Do not branch on it.
 
 ## 6. How to see it
 

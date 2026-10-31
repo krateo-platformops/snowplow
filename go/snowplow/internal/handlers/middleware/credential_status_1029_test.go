@@ -14,6 +14,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -182,6 +183,161 @@ func TestCredentialStatus1029_ReReadErrorIs500WithNoCause(t *testing.T) {
 			_ = response.InternalError(plumbing, errors.New(b.Message))
 			if rec.Body.String() != plumbing.Body.String() {
 				t.Fatalf("the 500 must stay plumbing's, byte for byte:\n got  %s\n want %s", rec.Body.String(), plumbing.Body.String())
+			}
+		})
+	}
+}
+
+// ── Reviewer arms (#1031 security review: R-DOC, R-NM, R-ID, R-INF) ──────────
+// They pin three properties the arms above did not hold: the cause follows
+// credsecret.For's EXACT group match (R1), the cause message carries no
+// identity (R2/R2b), and the informer paths never produce the cause shape (R6).
+// R-DOC also keeps the integration doc's section 2 examples byte-equal to the
+// wire.
+
+// c1029DocBlocks returns the bodies and header lines of the doc's ```http
+// examples (sections 2a and 2b), in order.
+func c1029DocBlocks(t *testing.T) (bodies []string, headers [][]string) {
+	t.Helper()
+	b, err := os.ReadFile("../../../docs/howto-frontend-credential-401-causes.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, blk := range strings.Split(string(b), "```http\n")[1:] {
+		blk = blk[:strings.Index(blk, "```")]
+		var hs []string
+		for _, ln := range strings.Split(blk, "\n") {
+			if strings.HasPrefix(ln, "{") {
+				bodies = append(bodies, ln)
+			} else if strings.Contains(ln, ": ") {
+				hs = append(hs, ln)
+			}
+		}
+		headers = append(headers, hs)
+	}
+	return
+}
+
+// R-DOC — the doc's examples are the wire, byte for byte, once the doc's
+// example user is substituted.
+func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
+	bodies, headers := c1029DocBlocks(t)
+	if len(bodies) != 2 || len(headers) != 2 {
+		t.Fatalf("expected 2 doc examples, got %d bodies %d header sets", len(bodies), len(headers))
+	}
+	sub := func(s string) string { return strings.ReplaceAll(s, "alice", su994User) }
+
+	t.Run("2a", func(t *testing.T) {
+		session := su994Secret(credsecret.SessionName(su994User), su994Session)
+		su994Informer(t, session)
+		su994APIServer(t, session)
+		rec, _ := c1029Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
+		if got, want := rec.Body.String(), sub(bodies[0])+"\n"; got != want {
+			t.Fatalf("2a body differs from doc:\n got  %q\n want %q", got, want)
+		}
+		if len(headers[0]) != 2 {
+			t.Fatalf("2a doc headers: %q", headers[0])
+		}
+		for _, h := range headers[0] {
+			k, v, _ := strings.Cut(h, ": ")
+			if rec.Header().Get(k) != v {
+				t.Fatalf("2a header %q: doc %q wire %q", k, v, rec.Header().Get(k))
+			}
+		}
+		if rec.Code != http.StatusUnauthorized || len(rec.Header()) != 2 {
+			t.Fatalf("2a code=%d headers=%v", rec.Code, rec.Header())
+		}
+	})
+	t.Run("2b", func(t *testing.T) {
+		stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+		su994Informer(t, stepUp)
+		su994APIServer(t, stepUp)
+		rec, _ := c1029Serve(t, su994Token(t, su994Group))
+		if got, want := rec.Body.String(), sub(bodies[1])+"\n"; got != want {
+			t.Fatalf("2b body differs from doc:\n got  %q\n want %q", got, want)
+		}
+		if len(headers[1]) != 1 {
+			t.Fatalf("2b doc headers: %q", headers[1])
+		}
+		if rec.Code != http.StatusUnauthorized || len(rec.Header()) != 1 || rec.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("2b code=%d headers=%v", rec.Code, rec.Header())
+		}
+	})
+}
+
+// R-NM — a token whose groups only resemble the marker reads the session Secret
+// (credsecret.For) and gets the session cause, never StepUpRequired.
+func TestCredentialStatus1029_NearMissGroupIsSessionCause(t *testing.T) {
+	for _, g := range []string{"x-krateo:loa:2", "krateo:loa:2 ", "KRATEO:LOA:2", "krateo:loa:20"} {
+		t.Run(g, func(t *testing.T) {
+			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			su994Informer(t, stepUp)
+			su994APIServer(t, stepUp)
+			rec, _ := c1029Serve(t, su994Token(t, su994Group, g))
+			if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"reason":"SessionCredentialMissing"`) ||
+				rec.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("group %q: want the session cause; code=%d hdr=%q body=%s",
+					g, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String())
+			}
+		})
+	}
+}
+
+// R-ID — neither cause message carries identity.
+func TestCredentialStatus1029_CauseMessageCarriesNoIdentity(t *testing.T) {
+	for _, stepup := range []bool{true, false} {
+		t.Run(map[bool]string{true: "stepup", false: "session"}[stepup], func(t *testing.T) {
+			groups := []string{su994Group}
+			have := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			if stepup {
+				groups = append(groups, credsecret.StepUpGroup)
+				have = su994Secret(credsecret.SessionName(su994User), su994Session)
+			}
+			su994Informer(t, have)
+			su994APIServer(t, have)
+			rec, _ := c1029Serve(t, su994Token(t, groups...))
+			b := c1029Decode(t, rec)
+			if b.Details == nil || len(b.Details.Causes) != 1 {
+				t.Fatalf("no cause: %s", rec.Body.String())
+			}
+			if m := b.Details.Causes[0].Message; strings.Contains(m, su994User) || strings.Contains(m, "clientconfig") {
+				t.Fatalf("cause message carries identity: %q", m)
+			}
+		})
+	}
+}
+
+// R-INF — the informer paths never produce the cause shape: a hit reaches the
+// handler; a malformed Secret in the snapshot is plumbing's 500, with no cause
+// and no challenge.
+func TestCredentialStatus1029_InformerPathsNeverCarryACause(t *testing.T) {
+	for _, stepup := range []bool{true, false} {
+		groups := []string{su994Group}
+		name := credsecret.SessionName(su994User)
+		if stepup {
+			groups = append(groups, credsecret.StepUpGroup)
+			name = credsecret.StepUpName(su994User)
+		}
+		kind := map[bool]string{true: "stepup", false: "session"}[stepup]
+		t.Run(kind+"/hit", func(t *testing.T) {
+			s := su994Secret(name, su994Session)
+			su994Informer(t, s)
+			su994APIServer(t)
+			rec, reached := c1029Serve(t, su994Token(t, groups...))
+			if !reached || rec.Code != http.StatusOK || rec.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("cache hit: reached=%v code=%d body=%s", reached, rec.Code, rec.Body.String())
+			}
+		})
+		t.Run(kind+"/malformed", func(t *testing.T) {
+			s := su994Secret(name, su994Session)
+			delete(s.Data, "server-url")
+			su994Informer(t, s)
+			su994APIServer(t, s)
+			rec, reached := c1029Serve(t, su994Token(t, groups...))
+			if reached || rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "causes") ||
+				rec.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("malformed: reached=%v code=%d hdr=%q body=%s",
+					reached, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String())
 			}
 		})
 	}
