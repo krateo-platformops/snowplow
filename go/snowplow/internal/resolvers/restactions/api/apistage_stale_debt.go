@@ -64,6 +64,7 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -311,6 +312,7 @@ func contentRefillCall(call httpcall.RequestOptions) httpcall.RequestOptions {
 // retry chain (#740).
 func runStaleDebt(d *staleDebt) {
 	defer staleDebtWG.Done()
+	defer trackStaleDebt("refill", d.contentKey, d.gvr)()
 	// #871 — measurement only: started by a customer's stale serve, inherited
 	// its label; detached work no user waits on is fill_bg.
 	_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
@@ -564,6 +566,7 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	staleDebtWG.Add(1)
 	go func() {
 		defer staleDebtWG.Done()
+		defer trackStaleDebt("replace", sink.L1Key(), "")()
 		// #871 — measurement only: see runStaleDebt.
 		_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
 		defer endWork()
@@ -790,6 +793,17 @@ var (
 
 	// staleDebtWG joins every debt goroutine (tests wait it out).
 	staleDebtWG sync.WaitGroup
+	// staleDebtInflight names every debt goroutine still running (trackStaleDebt),
+	// so a test join that does not end can say which one it waits on.
+	staleDebtInflightMu sync.Mutex
+	staleDebtInflight   = map[*staleDebtGoroutine]struct{}{}
+	// staleDebtWedged is the first debt goroutine a test join found past its
+	// bound (joinStaleDebts). It never returns, so the process can no longer
+	// quiesce: every later join reports it at once. Never set in production
+	// (only test joins run joinStaleDebts).
+	staleDebtWedged atomic.Pointer[string]
+	// staleDebtTracked wakes a test join when a debt goroutine names itself.
+	staleDebtTracked = make(chan struct{}, 1)
 
 	// staleDebtStop is closed only by quiesceStaleDebts (a test reset of the
 	// singletons the debt goroutines read); every debt wait selects on it.
@@ -812,6 +826,16 @@ func init() {
 // never resets them). A running refill attempt or re-resolve finishes first;
 // both are bounded by DemandRevalidationDeadline.
 func quiesceStaleDebts() {
+	// #1033 review — a debt goroutine that outlives its own deadline (a wedged
+	// refill or re-resolve) would hang every later test of the binary without
+	// a word: name it and stop. A wedged goroutine never returns, so once any
+	// join found one, every later quiesce reports it AT ONCE and touches
+	// nothing (the testing package runs the remaining cleanups after a
+	// cleanup's panic; each must fail fast, never re-close the stop channel or
+	// join again).
+	if w := staleDebtWedged.Load(); w != nil {
+		panic("quiesceStaleDebts: " + *w)
+	}
 	staleDebtStopMu.Lock()
 	close(staleDebtStop)
 	staleDebtStopMu.Unlock()
@@ -819,7 +843,12 @@ func quiesceStaleDebts() {
 	// engine, not on staleDebtWG: join it first, so it cannot start a D2
 	// goroutine after the join below.
 	cache.WaitStaleRetryForTest()
-	staleDebtWG.Wait()
+	if err := joinStaleDebts(); err != nil {
+		staleDebtStopMu.Lock()
+		staleDebtStop = make(chan struct{})
+		staleDebtStopMu.Unlock()
+		panic("quiesceStaleDebts: " + err.Error())
+	}
 	staleDebtsMu.Lock()
 	staleDebts = map[string]*staleDebt{}
 	staleReplacing = map[*cache.StaleServeSink]*staleReplace{}
@@ -951,9 +980,116 @@ func RegisterStaleExpvarForTest() { registerStaleExpvar() }
 
 // WaitStaleDebtsForTest blocks until every debt goroutine (refill and push
 // delivery) has returned — a cross-package fixture calls it before tearing down
-// the refresher, the store or the broadcaster those goroutines use. Production
-// MUST NOT use it.
-func WaitStaleDebtsForTest() { staleDebtWG.Wait() }
+// the refresher, the store or the broadcaster those goroutines use. It returns
+// an error naming the goroutine that outlived its own bound (joinStaleDebts)
+// instead of blocking forever. Production MUST NOT use it.
+func WaitStaleDebtsForTest() error { return joinStaleDebts() }
+
+// staleDebtGoroutine is one debt goroutine in flight: what it does (a content
+// "refill" or a dependent "replace"), the L1 key it works on (an opaque cache
+// key digest, as the store's own logs print it), the content GVR of a refill,
+// when it started, and the deadline its one unit of work runs under.
+type staleDebtGoroutine struct {
+	what, key, gvr string
+	started        time.Time
+	deadline       time.Duration
+}
+
+// trackStaleDebt names the calling debt goroutine in staleDebtInflight until
+// the returned func runs (deferred first thing on the goroutine). Every debt
+// goroutine does ONE unit of work (a refill attempt, or a dependent
+// re-resolve) under a context bounded by cache.DemandRevalidationDeadline,
+// read here, on the goroutine, as its own bound (the refill is launched under
+// staleDebtsMu; the deadline takes the store's lock, so it is never read there).
+func trackStaleDebt(what, key, gvr string) (untrack func()) {
+	g := &staleDebtGoroutine{what: what, key: key, gvr: gvr, started: time.Now(), deadline: cache.DemandRevalidationDeadline()}
+	staleDebtInflightMu.Lock()
+	staleDebtInflight[g] = struct{}{}
+	staleDebtInflightMu.Unlock()
+	select { // wake a join waiting on a goroutine it could not name yet
+	case staleDebtTracked <- struct{}{}:
+	default:
+	}
+	return func() {
+		staleDebtInflightMu.Lock()
+		delete(staleDebtInflight, g)
+		staleDebtInflightMu.Unlock()
+	}
+}
+
+// joinStaleDebts waits for every debt goroutine, but never past a goroutine's
+// own bound: its deadline, plus that deadline again as the margin for
+// scheduling, counted from when the join began (or from the goroutine's start,
+// if it started later: a refill that clears starts its dependents' replaces).
+// The bound comes from the product's own deadline, so it adapts to whatever
+// write deadline the store runs under. Past it, the goroutine is wedged (it
+// ignores its context): the error names it instead of hanging the caller.
+// Test joins only.
+func joinStaleDebts() error {
+	if w := staleDebtWedged.Load(); w != nil {
+		return errors.New(*w)
+	}
+	joined := make(chan struct{})
+	go func() {
+		staleDebtWG.Wait()
+		close(joined)
+	}()
+	begin := time.Now()
+	for {
+		wait, stuck, tracked := staleDebtOverdue(begin, time.Now())
+		if stuck != nil {
+			msg := fmt.Sprintf("debt %s goroutine for L1 key %s (gvr %q) still running %s after the join began, past its bound of 2× its %s deadline: it ignores its context",
+				stuck.what, stuck.key, stuck.gvr, time.Since(begin).Round(time.Millisecond), stuck.deadline)
+			staleDebtWedged.CompareAndSwap(nil, &msg)
+			return errors.New(*staleDebtWedged.Load())
+		}
+		// Nothing named yet (launched, not started): wait for the join or for a
+		// goroutine to name itself. Never a store read here: ResolvedCache()
+		// builds the singleton, and the test resets run this join.
+		var t *time.Timer
+		var expire <-chan time.Time
+		if tracked {
+			t = time.NewTimer(wait)
+			expire = t.C
+		}
+		done := false
+		select {
+		case <-joined:
+			done = true
+		case <-expire:
+		case <-staleDebtTracked:
+		}
+		if t != nil {
+			t.Stop()
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// staleDebtOverdue returns the first in-flight goroutine past its bound at now,
+// or how long until the earliest one reaches it; tracked is false when no
+// goroutine is named.
+func staleDebtOverdue(begin, now time.Time) (next time.Duration, stuck *staleDebtGoroutine, tracked bool) {
+	staleDebtInflightMu.Lock()
+	defer staleDebtInflightMu.Unlock()
+	for g := range staleDebtInflight {
+		from := begin
+		if g.started.After(from) {
+			from = g.started
+		}
+		left := from.Add(2 * g.deadline).Sub(now)
+		if left <= 0 {
+			return 0, g, true
+		}
+		if !tracked || left < next {
+			next = left
+		}
+		tracked = true
+	}
+	return next, nil, tracked
+}
 
 // staleRefillHoldForTest, when set, parks every debt refill attempt until the
 // channel closes (HoldStaleDebtRefillsForTest). Nil in production.
