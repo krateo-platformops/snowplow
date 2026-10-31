@@ -48,6 +48,7 @@ func TestExport970_Routes(t *testing.T) {
 	// then every required route must be present — the export routes
 	// included, registered by mountExportRoutes alone.
 	mountCallWriteRoutes(http.NewServeMux(), use.NewChain(), testUserConfig443(ep))
+	mountTelemetryRoute(http.NewServeMux(), use.NewChain(), debugAuthTestKeys, nil) // #1015's required route, as main mounts it
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
 	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)

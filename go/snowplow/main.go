@@ -43,6 +43,7 @@ import (
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/telemetry/rum"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
 
@@ -136,6 +137,55 @@ func snowplowCORSOptions() cors.Options {
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
 	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(middleware.Gzip(mux), mux))
+}
+
+// newRUMIngest returns #1015's ingest, with its forwarder's worker running
+// until ctx is done, when rum.CollectorURL enables it: tracing on
+// (OTEL_TRACING_ENABLED, defaulting to OTEL_ENABLED) AND a collector endpoint
+// set (Diego, 2026-10-30: on whenever tracing is on, no switch of its own).
+// Otherwise it returns a nil http.Handler, which mountTelemetryRoute mounts as
+// a 404. It is a function so the default-off contract is tested through the
+// code main runs (TestS1015_DefaultOffContract).
+//
+// mux is snowplow's own routing table: a krateo.widget.fetch http.route must
+// be one of its routes (rum.RegisteredRoutes, #1020 F3). The set is looked up
+// on the live mux at request time, so routes registered after this call count.
+func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
+	url, ok := rum.CollectorURL()
+	if !ok {
+		return nil // an untyped nil: a typed (*rum.Ingest)(nil) would mount as "enabled"
+	}
+	fwd := rum.NewForwarder(url)
+	fwd.Start(ctx)
+	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
+}
+
+// mountTelemetryRoute mounts #1015's browser RUM ingest, POST
+// /telemetry/v1/traces, and registers it as a scoped route (scope telemetry,
+// listed in requiredScopedRoutes).
+//
+// Enabled (ingest non-nil), the chain is: the auth-failure counter, then
+// middleware.RefreshAuth, then the telemetry fall-through scope, then the
+// ingest. The contract with frontend is the same `Authorization: Bearer` JWT
+// as /call. RefreshAuth validates it exactly as UserConfig does (the same
+// jwtutil.ValidateWithKeySource), without UserConfig's per-request
+// clientconfig Secret lookup, which this route has no use for: it issues no
+// apiserver read. RefreshAuth also accepts the session cookie, a superset the
+// contract does not rely on. Disabled, the route answers 404 to everyone, so it exposes
+// nothing, not even a 401 that would reveal it.
+//
+// It is a function so the route the pod serves is the one the tests drive
+// (main_telemetry_1015_test.go).
+func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
+	var h http.Handler = http.NotFoundHandler()
+	if ingest != nil {
+		h = rum.CountAuthFailures(chain.Append(
+			middleware.RefreshAuth(keys),
+			cache.FallthroughScopeMiddleware(cache.ScopeTelemetry)).
+			Then(ingest))
+	}
+	mux.Handle(rum.Pattern, h)
+	cache.RegisterScopedRoute(rum.Pattern, cache.ScopeTelemetry)
 }
 
 // mountCallWriteRoutes mounts the write-verb /call routes and their #443
@@ -1354,6 +1404,15 @@ func main() {
 	mux.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
 	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+
+	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
+	// On only under the OTel trace contract with a collector endpoint
+	// (rum.CollectorURL); off, the route answers 404. The forwarder's worker
+	// runs until main returns.
+	rumCtx, rumStop := context.WithCancel(context.Background())
+	defer rumStop()
+	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx, mux))
+	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register
 	// snowplow_rbac_publish_seq (RBAC snapshot publish-sequence counter)
