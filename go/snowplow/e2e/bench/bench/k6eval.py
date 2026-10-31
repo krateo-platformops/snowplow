@@ -52,12 +52,11 @@ K6_THRESHOLDS = {
     "min_armed_user_share": 0.9,
     # per browser session: the SPA's live-update streams that opened
     "min_sse_opened_per_stream": 1,
-    # Chrome's CPU: the p95 of its 5 s windows stays under this share of its
-    # request. The request is what the scheduler guarantees Chrome against
-    # k6/the viewer (both now limited); a p95 under 80 % of it means Chrome
-    # never needed more than its guaranteed share, so the load generator
-    # could not have slowed a judged page (#831 gate M1). The 20 % margin
-    # covers the 5 s window averaging away sub-window bursts.
+    # Chrome's CPU p95 against this share of its request: REPORTED only, it
+    # never voids a run (Diego, browser-starvation ruling). The request is a
+    # scheduling reservation (guarded by k6_job.loadgen_fit); Chrome has no
+    # limit, so using more than it is not starvation. Starvation is MEASURED:
+    # see starvation() and load606.starvation_check.
     "max_browser_cpu_p95_share_of_request": 0.8,
     "min_cpu_windows": 3,
     # page loads that ended with a widget-error / widget-timeout state
@@ -194,9 +193,71 @@ def cpu_stats(recs: list[dict] | None) -> dict | None:
             "throttled_s_per_s_max": round(max(thr), 3) if thr else None}
 
 
+#: the epoch / uptime anchor's resolution (date +%s): a window is placed against the page loads'
+#: wall-clock times to within this, so each window is widened by it on both sides (conservative)
+ANCHOR_SLACK_S = 1.0
+
+
+def starvation(o: dict | None, container: str = "browser") -> dict:
+    """The container's measured starvation evidence, per sample window:
+    `stall_s` (cgroup cpu.pressure "some": seconds during which at least one
+    of its runnable tasks waited for a CPU) and `saturated` (the NODE had not
+    one idle tick in the window: /proc/stat's idle + iowait did not move, to
+    its 10 ms tick, on any CPU). Windows are on the epoch (cpu_start's
+    anchor). `pressure` / `node` / `anchored` say whether each was MEASURED:
+    a series that lacks it is unmeasured, never "not starved"."""
+    recs = ((o or {}).get("cpu") or {}).get(container) or []
+    start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
+    pressure = bool(pts) and all(p.get("pressure_some_usec") is not None for p in pts)
+    node = bool(pts) and all(p.get("node_idle_ticks") is not None and p.get("node_busy_ticks") is not None
+                             for p in pts)
+    anchored = start.get("epoch") is not None and start.get("uptime") is not None
+    off = float(start["epoch"]) - float(start["uptime"]) if anchored else 0.0
+    wins = []
+    for a, b in pairwise(pts):
+        dt = float(b["t"]) - float(a["t"])
+        if dt <= 0:
+            continue
+        w = {"t0": float(a["t"]) + off, "t1": float(b["t"]) + off}
+        if pressure:
+            w["stall_s"] = max(0, b["pressure_some_usec"] - a["pressure_some_usec"]) / 1e6
+            w["full_s"] = (max(0, b["pressure_full_usec"] - a["pressure_full_usec"]) / 1e6
+                           if a.get("pressure_full_usec") is not None and b.get("pressure_full_usec") is not None
+                           else None)
+        if node:
+            di = b["node_idle_ticks"] - a["node_idle_ticks"]
+            db = b["node_busy_ticks"] - a["node_busy_ticks"]
+            w["saturated"] = di <= 0 and db > 0
+            w["node_busy_share"] = round(db / (db + di), 4) if db + di > 0 else None
+        wins.append(w)
+    span = sum(w["t1"] - w["t0"] for w in wins)
+    return {"container": container, "pressure": pressure, "node": node, "anchored": anchored,
+            "node_cpus": start.get("node_cpus"), "windows": wins,
+            "stall_share": (round(sum(w["stall_s"] for w in wins) / span, 4) if pressure and span else None),
+            "saturated_windows": (sum(1 for w in wins if w["saturated"]) if node else None)}
+
+
+def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:
+    """At most how much of a page load (from epoch `start`, `wall_ms` long)
+    can have been the load generator waiting for a CPU: in each window it
+    overlaps (widened by the anchor's resolution), at most the window's
+    stall, never more than the overlap itself; the WHOLE overlap where the
+    node had no idle tick. Capped at the load's own time."""
+    s0, s1 = start, start + wall_ms / 1000
+    total = 0.0
+    for w in st["windows"]:
+        overlap = min(s1, w["t1"] + ANCHOR_SLACK_S) - max(s0, w["t0"] - ANCHOR_SLACK_S)
+        if overlap <= 0:
+            continue
+        total += overlap if w.get("saturated") else min(w.get("stall_s") or 0.0, overlap)
+    return min(wall_ms, total * 1000)
+
+
 def cpu_check(o: dict | None, container: str, th: dict | None = None) -> dict:
-    """The browser container kept CPU headroom (K6_THRESHOLDS
-    max_browser_cpu_p95_share_of_request)."""
+    """The browser container's CPU p95 against K6_THRESHOLDS
+    max_browser_cpu_p95_share_of_request: a REPORT line (the run's report,
+    never its validity): usage above a reservation is not starvation."""
     th = dict(K6_THRESHOLDS, **(th or {}))
     st = cpu_stats(((o or {}).get("cpu") or {}).get(container))
     name = f"{container}.cpu_headroom"

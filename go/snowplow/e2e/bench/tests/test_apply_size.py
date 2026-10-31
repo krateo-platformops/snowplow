@@ -111,11 +111,12 @@ def test_run606_applies_everything_through_one_server_side_apply():
                if re.search(r"\bapply\b", ln) and not ln.lstrip().startswith("#")]
     assert applies == [ln for ln in applies if ln.startswith("kapply()")], applies
     sites = [ln.strip() for ln in src.splitlines() if ln.strip().startswith('kapply "')]
-    # #924 M3: the bench's own FlowSchemas (env); the preflight Job; #935's
+    # #924 M3: the bench's own FlowSchemas (env); #1042's pre-drive PSI Job; the preflight Job; #935's
     # fresh identity classes (data; its output names users: discarded); run 19's
     # menu-class identities (classes; the same); the load. Each class's preflight
     # Job goes through kapply inside run_preflight_job.
-    assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/preflight-job.yaml"',
+    assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
+                     'kapply "$OUT/preflight-job.yaml"',
                      'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
                      'kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \\',
                      'kapply "$OUT/loadgen-job.yaml"']

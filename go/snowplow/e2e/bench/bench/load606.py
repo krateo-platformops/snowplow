@@ -3442,6 +3442,81 @@ def _check(name, value, op, bar, checks):
                    "result": "PASS" if ok else "FAIL"})
 
 
+#: the checks judged on the page loads' wall time: the ones a load generator's CPU stall can move
+NAV_CHECKS = ("warm_nav_p95_ms", "cold_nav_p95_ms", "zero_cold_navs.first_nav_p95_ms",
+              "zero_cold_navs.navs_over_cold_bar")
+
+
+def nav_checks(navs: list[dict], th: dict) -> list[dict]:
+    """The north-star bars on the page loads' wall time (NAV_CHECKS)."""
+    out: list[dict] = []
+    first = [n["wall_ms"] for n in navs if n.get("visit") == 1]
+    warm = [n["wall_ms"] for n in navs if (n.get("visit") or 0) > 1]
+    _check("warm_nav_p95_ms", pct(warm, 95), "<=", th["warm_nav_p95_ms"], out)
+    _check("cold_nav_p95_ms", pct(first, 95), "<=", th["cold_nav_p95_ms"], out)
+    _check("zero_cold_navs.first_nav_p95_ms", pct(first, 95), "<=",
+           th["first_nav_p95_ms_for_zero_cold"], out)
+    over = sum(1 for n in navs if n["wall_ms"] > th["max_nav_ms_for_zero_cold"])
+    _check("zero_cold_navs.navs_over_cold_bar", over if navs else None, "<=", 0, out)
+    return out
+
+
+def starvation_check(navs: list[dict], st: dict, th: dict) -> dict:
+    """browser.cpu_starvation (Diego's ruling, the browser-starvation issue):
+    could the load generator's OWN waiting for a CPU have decided a judged
+    page-load outcome?
+
+    The measure: per judged page load, at most how much of its wall time can
+    have been Chrome waiting for a CPU (k6eval.possible_delay_ms: its cgroup's
+    pressure stall, or the whole overlap where the node had no idle tick).
+
+    The threshold, from what the measure means: a stall only ADDS time, so
+    the page loads with their possible delay removed are the fastest the
+    browser can have seen snowplow. The NAV_CHECKS are re-judged on them,
+    against the verdict's OWN bars; an outcome that differs (a FAIL that the
+    stall alone can explain) means the load generator, not snowplow, may have
+    decided it: INVALID. No other number: high usage with no stall changes
+    nothing (valid); a stall that decides nothing changes nothing.
+
+    UNMEASURED when the pressure, the node's CPU, the windows' wall-clock
+    anchor, or a page load's start is missing: the NAV_CHECKS can then not be
+    told the browser's from snowplow's, and evaluate() makes them
+    INCONCLUSIVE: missing evidence is never a pass."""
+    from bench import k6eval             # operator side only (this file also runs alone in Job pods)
+    name = "browser.cpu_starvation"
+    missing = [w for w, ok in (("its cgroup CPU pressure (cpu.pressure)", st["pressure"]),
+                               ("the loadgen node's CPU (/proc/stat)", st["node"]),
+                               ("the samples' wall-clock anchor", st["anchored"])) if not ok]
+    unplaced = sum(1 for n in navs if n.get("start") is None)
+    if unplaced:
+        missing.append(f"the start of {unplaced} page load(s)")
+    value = {"stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
+             "windows": len(st["windows"]), "node_cpus": st["node_cpus"]}
+    if missing or not st["windows"]:
+        return {"check": name, "value": value, "bar": "measured: no judged outcome decided by the stall",
+                "result": "UNMEASURED",
+                "why": "UNMEASURED: " + ("; ".join(missing) if missing else "no sample windows")
+                       + " was not sampled: whether the load generator slowed a judged page is unknown "
+                         "(unmeasured, not 'not starved')"}
+    delays = [k6eval.possible_delay_ms(n["start"], n["wall_ms"], st) for n in navs]
+    fastest = [dict(n, wall_ms=n["wall_ms"] - d) for n, d in zip(navs, delays)]
+    shares = sorted(d / n["wall_ms"] for n, d in zip(navs, delays) if n["wall_ms"])
+    value.update({"page_delay_ms_max": round(max(delays), 1) if delays else None,
+                  "page_delay_share_p95": round(pct(shares, 95), 4) if shares else None})
+    as_seen = {c["check"]: c["result"] for c in nav_checks(navs, th)}
+    without = {c["check"]: c["result"] for c in nav_checks(fastest, th)}
+    decided = [c for c in NAV_CHECKS if as_seen.get(c) != without.get(c)]
+    if decided:
+        return {"check": name, "value": value, "bar": "no judged outcome decided by the stall",
+                "result": "FAIL",
+                "why": (f"the load generator's CPU stall could have decided {', '.join(decided)} "
+                        f"({', '.join(f'{as_seen[c]} as measured, {without[c]} without the stall' for c in decided)}): "
+                        f"Chrome stalled {value['stall_share']:.2%} of the drive, the node had no idle CPU in "
+                        f"{value['saturated_windows']} window(s); up to {value['page_delay_ms_max']} ms of a page load "
+                        f"may be the load generator's")}
+    return {"check": name, "value": value, "bar": "no judged outcome decided by the stall", "result": "PASS"}
+
+
 def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              *, thresholds: dict | None = None,
              login_curves: list[dict] | None = None,
@@ -3490,13 +3565,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     calls = sum(int(n.get("calls", 0)) for n in navs)
     errors = sum(int(n.get("errors", 0)) for n in navs)
 
-    _check("warm_nav_p95_ms", pct(warm, 95), "<=", th["warm_nav_p95_ms"], checks)
-    _check("cold_nav_p95_ms", pct(first, 95), "<=", th["cold_nav_p95_ms"], checks)
-    _check("zero_cold_navs.first_nav_p95_ms", pct(first, 95), "<=",
-           th["first_nav_p95_ms_for_zero_cold"], checks)
-    over = sum(1 for n in navs if n["wall_ms"] > th["max_nav_ms_for_zero_cold"])
-    _check("zero_cold_navs.navs_over_cold_bar", over if navs else None, "<=", 0,
-           checks)
+    checks.extend(nav_checks(navs, th))
+    starved = None
+    if k6 is not None:
+        starved = starvation_check(navs, k6eval.starvation(k6.get("browser"), "browser"), th)
+        validity.append(starved)
 
     # Ruling 2026-10-14: freshness GATES at the 10 events/s churn step; the
     # other rates (1, 50) are REPORTED as the curve. Labels are
@@ -3550,7 +3623,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         validity.extend(k6eval.k6_checks(k6.get("k6"), k6.get("thresholds")))
         validity.extend(k6eval.browser_checks(k6.get("browser"), k6.get("sessions"),
                                               k6.get("thresholds")))
-        validity.append(k6eval.cpu_check(k6.get("browser"), "browser", k6.get("thresholds")))
+        # report only (Diego's ruling): usage above a reservation is not starvation
+        report_cpu = k6eval.cpu_check(k6.get("browser"), "browser", k6.get("thresholds"))
         if k6.get("viewers", True):
             validity.extend(k6eval.viewer_checks(k6.get("viewer"), k6.get("k6"),
                                                  k6.get("thresholds")))
@@ -3697,6 +3771,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     if k6 is not None:
         report["page_loads_are"] = "real Chrome sessions (k6 browser), first visit vs warm per session"
         report["browser"] = k6eval.browser_report(k6.get("browser"))
+        # Diego's ruling: the 80 %-of-request line is reported, never validity
+        report["browser_cpu_headroom"] = dict(report_cpu, result="REPORT", judged_by="browser.cpu_starvation")
+        report["browser_starvation"] = starved["value"] if starved else None
         report["k6_report_only"] = k6eval.k6_report(k6.get("k6"))
         report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
         report["load_generator_cpu_report_only"] = {
@@ -3718,6 +3795,12 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["run8"] = r8
         checks.extend(r8_checks)
 
+    if starved is not None and starved["result"] == "UNMEASURED":
+        for c in checks:
+            if c["check"] in NAV_CHECKS and c["result"] in ("PASS", "FAIL"):
+                c["why"] = (f"{c['result']} as measured, but " + starved["why"]
+                            + (f" ({c['why']})" if c.get("why") else ""))
+                c["result"] = "INCONCLUSIVE"
     if any(c["result"] == "FAIL" for c in validity):
         verdict = "INVALID"
     elif any(c["result"] == "FAIL" for c in checks):

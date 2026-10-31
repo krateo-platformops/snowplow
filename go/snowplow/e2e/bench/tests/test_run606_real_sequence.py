@@ -514,7 +514,12 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         def pt(m, v, **tags):
-            return json.dumps({"metric": m, "type": "Point", "data": {"value": v, "tags": tags}})
+            # the browser's points carry their time (2026-10-21T10:00:00Z): its page loads are placed
+            # against the CPU windows (the starvation check); k6's stay untimed
+            data = {"value": v, "tags": tags}
+            if name == "browser":
+                data["time"] = "2026-10-21T10:00:00Z"
+            return json.dumps({"metric": m, "type": "Point", "data": data})
         lines = [pt("bench_frame", 1, frame="start")]
         if name == "k6":
             for i in range(7):
@@ -550,7 +555,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 for i in range(20):
                     t = {"session": s, "route": "/r%d" % (i % 4),
                          "visit": "first" if i < 4 else "warm", "method": "click"}
-                    lines += [pt("browser_page_load_ms", 300 + i, **t),
+                    # starved / saturated: loads over the warm bar that the stall alone can explain
+                    ms = (600 if mode in ("starved", "saturated") else 300) + i
+                    lines += [pt("browser_page_load_ms", ms, **t),
                               pt("browser_page_loads", 1, **t)]
             m = {"metrics": {"browser_page_loads": {"count": 60}}}
         lines.append(pt("bench_frame", 1, frame="end"))
@@ -558,13 +565,21 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             fh.write("\\n".join(lines) + "\\n")
         with open(os.path.join(dest, name + "-summary.json"), "w") as fh:
             json.dump(m, fh)
-        # the wrappers' CPU samples (k6_job._cpu_sampler); "starved": Chrome at
-        # its request the whole run
+        # the wrappers' CPU samples (k6_job._cpu_sampler), anchored so the windows cover the
+        # browser's page loads (2026-10-21T10:00:00Z = 1792576800). "starved": Chrome's cgroup
+        # stalled every whole window; "saturated": the node had no idle tick; "busy": Chrome far
+        # over its request with no stall; "nopressure": no cpu.pressure to read
         for c, req in ((("k6", 4000), ("viewer", 1000)) if name == "k6" else (("browser", 3000),)):
-            cores = 2.9 if (c == "browser" and mode == "starved") else 1.0
-            recs = [{"kind": "cpu_start", "container": c, "request_m": req, "limit_m": None}]
+            cores = 2.9 if (c == "browser" and mode in ("starved", "busy")) else 1.0
+            stall = 5e6 if (c == "browser" and mode == "starved") else 0
+            idle = 0 if (c == "browser" and mode == "saturated") else 400
+            recs = [{"kind": "cpu_start", "container": c, "request_m": req, "limit_m": None,
+                     "node_cpus": 16, "epoch": 1792576800 - 15, "uptime": 100.0}]
             recs += [{"kind": "cpu", "t": 100.0 + 5 * i, "usage_usec": int(cores * 5e6 * i),
-                      "throttled_usec": 0} for i in range(6)]
+                      "throttled_usec": 0,
+                      "pressure_some_usec": None if mode == "nopressure" else int(stall * i),
+                      "pressure_full_usec": None if mode == "nopressure" else 0,
+                      "node_busy_ticks": 1000 * i, "node_idle_ticks": idle * i} for i in range(6)]
             with open(os.path.join(dest, c + "-cpu.jsonl"), "w") as fh:
                 fh.write("".join(json.dumps(r) + "\\n" for r in recs))
         with open(os.path.join(dest, name + "-exit.json"), "w") as fh:
@@ -903,6 +918,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what == "job/load606":                       # ready/failed/completions
             print("/1/1" if os.environ.get("FAKE_DRIVER_FAILED") == "1" else "1//1")
             sys.exit(0)
+        if what == "job" and "psi606" in a:
+            # #1042's pre-drive PSI check: answers once applied (else NotFound), and completes
+            jf = os.path.join(STATE, "applied-jobs")
+            if "psi606" not in (open(jf).read().split() if os.path.exists(jf) else []):
+                print('Error from server (NotFound): jobs.batch "psi606" not found', file=sys.stderr)
+                sys.exit(1)
+            print("1" if any(x.endswith("{.status.succeeded}") for x in a) else ""); sys.exit(0)
         if what == "job" and any(x.startswith("preflight606") for x in a):   # + each menu class's
             # a preflight Job answers only once the run APPLIED it (#999 review B2): else NotFound
             job = next(x for x in a if x.startswith("preflight606"))
@@ -917,6 +939,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 print("" if refused else "1"); sys.exit(0)
             if any(x.endswith("{.status.failed}") for x in a):
                 print("1" if refused else ""); sys.exit(0)
+        sys.exit(0)
+    if a[:1] == ["logs"] and "job/psi606" in a:
+        # FAKE_PSI: ok (both readable) | nocgroup (no cpu.pressure) | nonode (no /proc/pressure/cpu)
+        mode = os.environ.get("FAKE_PSI", "ok")
+        line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=1234"
+        for which, f in (("cgroup", "/sys/fs/cgroup/cpu.pressure"), ("node", "/proc/pressure/cpu")):
+            gone = (mode == "nocgroup" and which == "cgroup") or (mode == "nonode" and which == "node")
+            print(json.dumps({"kind": "psi_file", "which": which, "file": f, "some": None if gone else line}))
         sys.exit(0)
     if a[:1] == ["logs"] and any("preflight606" in x for x in a):
         job = next(x for x in a if "preflight606" in x).split("/", 1)[-1]
