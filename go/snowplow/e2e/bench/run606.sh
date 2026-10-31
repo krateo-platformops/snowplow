@@ -976,17 +976,19 @@ run_preflight_job() {
   log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
 }
 # s_psi (#1042): right after the loadgen node exists, before any install or
-# drive time: the browser's starvation evidence needs the kernel's PSI. A
+# drive time: the browser's starvation evidence needs what the gate reads. A
 # container on the loadgen pool (the browser's pin) reads its cgroup's
-# cpu.pressure and the node's /proc/pressure/cpu; either unreadable refuses
-# the run here, with the reason, and teardown runs as for any failed step.
+# cpu.pressure, the node's /proc/stat, and /proc/self/cgroup (`0::/`: its
+# cgroup is its own); any of them missing refuses the run here, with the
+# reason, and teardown runs as for any failed step. The Job is deleted once
+# read.
 s_psi() {
   if [[ "$LOAD_DRIVER" != "k6" ]]; then
     log "psi: not checked (LOAD_DRIVER=${LOAD_DRIVER}: no browser, no starvation gate)"
     return 0
   fi
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: psi606 Job on the loadgen pool reads cpu.pressure and /proc/pressure/cpu -> $OUT/psi.jsonl"
+    log "DRY: psi606 Job on the loadgen pool reads cpu.pressure, /proc/stat and /proc/self/cgroup -> $OUT/psi.jsonl"
     return 0
   fi
   python3 -m bench.k6_job psi-job > "$OUT/psi-job.yaml"
@@ -999,7 +1001,13 @@ s_psi() {
     [[ -n "$failed" && "$failed" != "0" ]] && break
     sleep "$PREFLIGHT_POLL_S"
   done
+  if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
+    "${K[@]}" -n bench-loadgen delete job psi606 --wait=false >/dev/null 2>&1 || true
+    record_failure "psi FAILED: the psi606 Job did not finish within ${PREFLIGHT_TIMEOUT_S}s: the browser's starvation evidence could not be checked; refused before any drive time" || true
+    return 1
+  fi
   "${K[@]}" -n bench-loadgen logs job/psi606 > "$OUT/psi.jsonl" 2>&1 || true
+  "${K[@]}" -n bench-loadgen delete job psi606 --wait=false >/dev/null 2>&1 || true
   why="$(python3 -m bench.k6_job psi-check < "$OUT/psi.jsonl")" || rc=$?
   if (( rc != 0 )); then
     record_failure "psi FAILED: the loadgen node's kernel does not give the browser's starvation evidence (${why}): every judged page load would be UNMEASURED; refused before any drive time" || true

@@ -253,9 +253,12 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
     the NODE's CPU from /proc/stat (not namespaced: the node's own busy and
     idle ticks, sampled at the same instants). null where a file is
     unreadable: a missing measure is recorded as missing. cpu_start carries
-    the node's CPU count and an epoch / uptime anchor (date +%s and
-    /proc/uptime read together, 1 s resolution) that places the windows
-    against the page loads' wall-clock times.
+    the node's CPU count and an epoch / uptime anchor that places the windows
+    against the page loads' wall-clock times: it waits for `date +%s` to tick
+    and brackets the tick between two /proc/uptime reads (`uptime_lo` before
+    the last `date` that still read the old second, `uptime` after the one
+    that read the new): the anchor's error is that bracket, measured per run
+    (#1043 review B1), not a second.
 
     POSIX sh: the k6 images are Alpine (busybox), the python image Debian
     (dash)."""
@@ -292,8 +295,10 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
 fi
 nc=null
 [ -r /proc/stat ] && nc=$(grep -c '^cpu[0-9]' /proc/stat)
-read -r up0 _ < /proc/uptime; ep0=$(date +%s)
-printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s}}\\n' "$cg" "$nc" "$ep0" "$up0" > {f}
+read -r lo _ < /proc/uptime; e0=$(date +%s)
+while :; do read -r ua _ < /proc/uptime; ep0=$(date +%s); [ "$ep0" != "$e0" ] && break; lo=$ua; done
+read -r up0 _ < /proc/uptime
+printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$ep0" "$up0" "$lo" > {f}
 ( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
 sampler=$!
 """
@@ -584,22 +589,27 @@ spec:
 
 
 # ─── the pre-drive PSI check (#1042) ────────────────────────────────────────
-#: the files the starvation evidence reads: the container cgroup's PSI (what the
-#: browser's sampler reads, in a container of the same pool) and the node's
-PSI_FILES = (("cgroup", "/sys/fs/cgroup/cpu.pressure"), ("node", "/proc/pressure/cpu"))
+#: what the starvation gate READS (#1043 review nits), as the browser's sampler reads it in a
+#: container of the same pool: the container cgroup's PSI (`some ... total=N`), the node's
+#: /proc/stat (`cpu ...` ticks), and /proc/self/cgroup reading `0::/` (cgroup v2 with a private
+#: cgroup namespace: cpu.pressure is the container's own, not a parent's)
+PSI_FILES = (("cgroup", "/sys/fs/cgroup/cpu.pressure", "^some "), ("node", "/proc/stat", "^cpu "),
+             ("cgroupns", "/proc/self/cgroup", ""))
+PSI_WANT = {"cgroup": r"^some .*\btotal=\d+", "node": r"^cpu( +\d+){7,}", "cgroupns": r"^0::/$"}
 
 
 def render_psi_check() -> str:
     """Namespace bench-loadgen + the psi606 Job: one container on the LOADGEN
-    pool (the browser's node, the same pin) reports whether its cgroup's
-    cpu.pressure and the node's /proc/pressure/cpu can be read. Run before
-    any drive time is spent (run606 s_psi): a kernel without PSI would make
-    every judged page load's starvation UNMEASURED."""
+    pool (the browser's node, the same pin) reports what the starvation gate
+    reads: its cgroup's cpu.pressure, the node's /proc/stat ticks, and
+    /proc/self/cgroup (0::/ = a private cgroup namespace, so cpu.pressure is
+    the container's own). Run before any drive time is spent (run606 s_psi):
+    without them every judged page load's starvation would be UNMEASURED."""
     probe = "; ".join(
-        f'if [ -r {f} ] && l=$(grep "^some " {f}); then '
+        f'if [ -r {f} ] && l=$({"grep " + repr(rx) if rx else "head -n 1"} {f} | head -n 1) && [ -n "$l" ]; then '
         f'printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": "%s"}}\\n\' "$l"; '
         f'else printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": null}}\\n\'; fi'
-        for w, f in PSI_FILES)
+        for w, f, rx in PSI_FILES)
     return f"""apiVersion: v1
 kind: Namespace
 metadata:
@@ -643,11 +653,11 @@ def psi_check(lines: list[str]) -> tuple[bool, str]:
         if isinstance(r, dict) and r.get("kind") == "psi_file":
             got[r.get("which")] = r.get("some")
     why = []
-    for w, f in PSI_FILES:
+    for w, f, _ in PSI_FILES:
         v = got.get(w, "<no answer>")
-        if not (isinstance(v, str) and re.search(r"\btotal=\d+", v)):
+        if not (isinstance(v, str) and re.search(PSI_WANT[w], v.strip())):
             why.append(f"{f}: {'unreadable' if v is None else v}")
-    return (not why, "; ".join(why) if why else "; ".join(f"{f}: {got[w]}" for w, f in PSI_FILES))
+    return (not why, "; ".join(why) if why else "; ".join(f"{f}: {got[w]}" for w, f, _ in PSI_FILES))
 
 
 def main(argv: list[str] | None = None) -> int:

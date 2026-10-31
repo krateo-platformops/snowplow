@@ -371,19 +371,28 @@ def test_the_report_marks_profiled_windows_and_compares_latency():
 
 
 def test_k6_point_times_become_page_load_starts(tmp_path):
+    """A browser load starts at its own t0 tag (the page's timeOrigin +
+    navT0, #1043 review B1), never at its point's time minus its wall time
+    (a QUIET_MS and more late). A load without one (an older run's data) has
+    no start: the profile report leaves it out, the starvation gate calls it
+    UNMEASURED. k6's own page loads keep their point time minus their value."""
     import gzip
     lines = [
         {"metric": "browser_page_load_ms", "type": "Point",
          "data": {"time": "2026-10-22T09:45:39.422766631Z", "value": 2000.0,
-                  "tags": {"session": "s1", "visit": "first", "route": "/d"}}},
+                  "tags": {"session": "s1", "visit": "first", "route": "/d", "t0": "1792662336100"}}},
+        {"metric": "browser_page_load_ms", "type": "Point",
+         "data": {"time": "2026-10-22T09:45:40Z", "value": 900.0,
+                  "tags": {"session": "s1", "visit": "warm", "route": "/e"}}},
         {"metric": "page_load_ms", "type": "Point",
          "data": {"time": "2026-10-22T11:45:41+02:00", "value": 500.0,
                   "tags": {"kind": "nav", "visit": "warm"}}}]
     with gzip.open(tmp_path / "browser.json.gz", "wt") as fh:
         fh.write("\n".join(json.dumps(x) for x in lines) + "\n")
     o = k6eval.read_k6_out(str(tmp_path), "browser")
-    (nav,) = k6eval.browser_navs(o)
-    assert nav["start"] == pytest.approx(1792662339.422766631 - 2.0, abs=1e-3)
+    placed, unplaced = k6eval.browser_navs(o)
+    assert placed["start"] == pytest.approx(1792662336.1, abs=1e-6)
+    assert "start" not in unplaced
     ((t, ms, tags),) = k6eval.k6_page_loads(o)
     assert t == pytest.approx(1792662341.0 - 0.5, abs=1e-3) and ms == 500.0
     assert k6eval.epoch("not a time") is None

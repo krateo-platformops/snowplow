@@ -557,6 +557,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                          "visit": "first" if i < 4 else "warm", "method": "click"}
                     # starved / saturated: loads over the warm bar that the stall alone can explain
                     ms = (600 if mode in ("starved", "saturated") else 300) + i
+                    # each load's own start (pageload.recordOps' t0), inside the sampled windows
+                    t["t0"] = str(1792576800000 - 3000 + 40 * (20 * int(s[1:] or 0) + i))
                     lines += [pt("browser_page_load_ms", ms, **t),
                               pt("browser_page_loads", 1, **t)]
             m = {"metrics": {"browser_page_loads": {"count": 60}}}
@@ -574,7 +576,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             stall = 5e6 if (c == "browser" and mode == "starved") else 0
             idle = 0 if (c == "browser" and mode == "saturated") else 400
             recs = [{"kind": "cpu_start", "container": c, "request_m": req, "limit_m": None,
-                     "node_cpus": 16, "epoch": 1792576800 - 15, "uptime": 100.0}]
+                     "node_cpus": 16, "epoch": 1792576800 - 15, "uptime": 100.0, "uptime_lo": 99.98}]
             recs += [{"kind": "cpu", "t": 100.0 + 5 * i, "usage_usec": int(cores * 5e6 * i),
                       "throttled_usec": 0,
                       "pressure_some_usec": None if mode == "nopressure" else int(stall * i),
@@ -924,7 +926,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             if "psi606" not in (open(jf).read().split() if os.path.exists(jf) else []):
                 print('Error from server (NotFound): jobs.batch "psi606" not found', file=sys.stderr)
                 sys.exit(1)
-            print("1" if any(x.endswith("{.status.succeeded}") for x in a) else ""); sys.exit(0)
+            # FAKE_PSI=pending: the Job never finishes (the step's deadline must hold)
+            done = os.environ.get("FAKE_PSI") != "pending"
+            print("1" if done and any(x.endswith("{.status.succeeded}") for x in a) else ""); sys.exit(0)
         if what == "job" and any(x.startswith("preflight606") for x in a):   # + each menu class's
             # a preflight Job answers only once the run APPLIED it (#999 review B2): else NotFound
             job = next(x for x in a if x.startswith("preflight606"))
@@ -941,10 +945,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 print("1" if refused else ""); sys.exit(0)
         sys.exit(0)
     if a[:1] == ["logs"] and "job/psi606" in a:
-        # FAKE_PSI: ok (both readable) | nocgroup (no cpu.pressure) | nonode (no /proc/pressure/cpu)
+        # FAKE_PSI: ok | nocgroup (no cpu.pressure) | nonode (no /proc/stat) | sharedns (/proc/self/cgroup
+        # names a path: not a private cgroup namespace)
         mode = os.environ.get("FAKE_PSI", "ok")
-        line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=1234"
-        for which, f in (("cgroup", "/sys/fs/cgroup/cpu.pressure"), ("node", "/proc/pressure/cpu")):
+        for which, f, line in (("cgroup", "/sys/fs/cgroup/cpu.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=1234"),
+                               ("node", "/proc/stat", "cpu  100 2 30 400 5 6 7 8 0 0"),
+                               ("cgroupns", "/proc/self/cgroup",
+                                "0::/kubepods/burstable/pod1/c1" if mode == "sharedns" else "0::/")):
             gone = (mode == "nocgroup" and which == "cgroup") or (mode == "nonode" and which == "node")
             print(json.dumps({"kind": "psi_file", "which": which, "file": f, "some": None if gone else line}))
         sys.exit(0)

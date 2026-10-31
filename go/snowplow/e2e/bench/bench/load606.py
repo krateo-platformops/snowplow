@@ -3445,6 +3445,9 @@ def _check(name, value, op, bar, checks):
 #: the checks judged on the page loads' wall time: the ones a load generator's CPU stall can move
 NAV_CHECKS = ("warm_nav_p95_ms", "cold_nav_p95_ms", "zero_cold_navs.first_nav_p95_ms",
               "zero_cold_navs.navs_over_cold_bar")
+#: every wall-time outcome a stall can decide (Diego's ruling, applied without special cases, #1043
+#: review): the four bars, a page that timed out, a widget that timed out
+WALL_TIME_CHECKS = NAV_CHECKS + ("browser.page_timeouts", "browser.widget_errors")
 
 
 def nav_checks(navs: list[dict], th: dict) -> list[dict]:
@@ -3461,7 +3464,8 @@ def nav_checks(navs: list[dict], th: dict) -> list[dict]:
     return out
 
 
-def starvation_check(navs: list[dict], st: dict, th: dict) -> dict:
+def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None = None,
+                     k6th: dict | None = None) -> dict:
     """browser.cpu_starvation (Diego's ruling, the browser-starvation issue):
     could the load generator's OWN waiting for a CPU have decided a judged
     page-load outcome?
@@ -3472,16 +3476,21 @@ def starvation_check(navs: list[dict], st: dict, th: dict) -> dict:
 
     The threshold, from what the measure means: a stall only ADDS time, so
     the page loads with their possible delay removed are the fastest the
-    browser can have seen snowplow. The NAV_CHECKS are re-judged on them,
-    against the verdict's OWN bars; an outcome that differs (a FAIL that the
-    stall alone can explain) means the load generator, not snowplow, may have
-    decided it: INVALID. No other number: high usage with no stall changes
-    nothing (valid); a stall that decides nothing changes nothing.
+    browser can have seen snowplow. Every WALL_TIME_CHECKS outcome is
+    re-judged on them, against the verdict's OWN bars: the four page-load
+    bars on the loads' times; browser.page_timeouts without the timeouts a
+    stall overlapped (such a load may have finished in time); and
+    browser.widget_errors without the widget-timeout states of loads a stall
+    overlapped. An outcome that differs (a FAIL the stall alone can explain)
+    means the load generator, not snowplow, may have decided it: INVALID. No
+    other number: high usage with no stall changes nothing (valid); a stall
+    that decides nothing changes nothing.
 
     UNMEASURED when the pressure, the node's CPU, the windows' wall-clock
-    anchor, or a page load's start is missing: the NAV_CHECKS can then not be
-    told the browser's from snowplow's, and evaluate() makes them
-    INCONCLUSIVE: missing evidence is never a pass."""
+    anchor, a judged load's start, or its place inside the sampled span
+    (#1043 review B2) is missing: those outcomes can then not be told the
+    browser's from snowplow's, and evaluate() makes them INCONCLUSIVE:
+    missing evidence is never a pass."""
     from bench import k6eval             # operator side only (this file also runs alone in Job pods)
     name = "browser.cpu_starvation"
     missing = [w for w, ok in (("its cgroup CPU pressure (cpu.pressure)", st["pressure"]),
@@ -3490,6 +3499,12 @@ def starvation_check(navs: list[dict], st: dict, th: dict) -> dict:
     unplaced = sum(1 for n in navs if n.get("start") is None)
     if unplaced:
         missing.append(f"the start of {unplaced} page load(s)")
+    wt, wt_unplaced = k6eval.widget_timeouts_by_load(browser)
+    if wt_unplaced:
+        missing.append(f"the load of {wt_unplaced} widget-timeout state(s)")
+    uncovered = sum(1 for n in navs if n.get("start") is not None and not k6eval.covered(n["start"], n["wall_ms"], st))
+    if uncovered and st["windows"]:
+        missing.append(f"the stall of {uncovered} page load(s) outside the sampled windows")
     value = {"stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
              "windows": len(st["windows"]), "node_cpus": st["node_cpus"]}
     if missing or not st["windows"]:
@@ -3502,10 +3517,24 @@ def starvation_check(navs: list[dict], st: dict, th: dict) -> dict:
     fastest = [dict(n, wall_ms=n["wall_ms"] - d) for n, d in zip(navs, delays)]
     shares = sorted(d / n["wall_ms"] for n, d in zip(navs, delays) if n["wall_ms"])
     value.update({"page_delay_ms_max": round(max(delays), 1) if delays else None,
-                  "page_delay_share_p95": round(pct(shares, 95), 4) if shares else None})
+                  "page_delay_share_p95": round(pct(shares, 95), 4) if shares else None,
+                  "slack_s": st.get("slack_s")})
     as_seen = {c["check"]: c["result"] for c in nav_checks(navs, th)}
     without = {c["check"]: c["result"] for c in nav_checks(fastest, th)}
-    decided = [c for c in NAV_CHECKS if as_seen.get(c) != without.get(c)]
+    # a page that timed out: without the stall it may have finished in time
+    as_seen["browser.page_timeouts"] = "FAIL" if any(n.get("timeout") for n in navs) else "PASS"
+    without["browser.page_timeouts"] = "FAIL" if any(n.get("timeout") and not d for n, d in zip(navs, delays)) else "PASS"
+    # a widget that timed out, in a load a stall overlapped: the same
+    if browser is not None:
+        wc = k6eval.widget_error_check(browser, k6th)
+        as_seen["browser.widget_errors"] = wc["result"]
+        stalled = {(n.get("session"), n.get("t0")) for n, d in zip(navs, delays) if d}
+        dropped = sum(c for k, c in wt.items() if k in stalled)
+        v = wc["value"]
+        share = (v["loads_with_error_state"] - dropped) / v["loads"] if v["loads"] else None
+        cap = dict(k6eval.K6_THRESHOLDS, **(k6th or {}))["max_widget_error_share"]
+        without["browser.widget_errors"] = "PASS" if share is not None and share <= cap else "FAIL"
+    decided = [c for c in WALL_TIME_CHECKS if c in as_seen and as_seen.get(c) != without.get(c)]
     if decided:
         return {"check": name, "value": value, "bar": "no judged outcome decided by the stall",
                 "result": "FAIL",
@@ -3568,7 +3597,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     checks.extend(nav_checks(navs, th))
     starved = None
     if k6 is not None:
-        starved = starvation_check(navs, k6eval.starvation(k6.get("browser"), "browser"), th)
+        starved = starvation_check(navs, k6eval.starvation(k6.get("browser"), "browser"), th,
+                                   k6.get("browser"), k6.get("thresholds"))
         validity.append(starved)
 
     # Ruling 2026-10-14: freshness GATES at the 10 events/s churn step; the
@@ -3797,7 +3827,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
 
     if starved is not None and starved["result"] == "UNMEASURED":
         for c in checks:
-            if c["check"] in NAV_CHECKS and c["result"] in ("PASS", "FAIL"):
+            if c["check"] in WALL_TIME_CHECKS and c["result"] in ("PASS", "FAIL"):
                 c["why"] = (f"{c['result']} as measured, but " + starved["why"]
                             + (f" ({c['why']})" if c.get("why") else ""))
                 c["result"] = "INCONCLUSIVE"

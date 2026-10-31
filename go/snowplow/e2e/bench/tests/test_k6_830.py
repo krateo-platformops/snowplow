@@ -240,10 +240,14 @@ def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit
     """<container>-cpu.jsonl as k6_job._cpu_sampler writes it: cumulative
     usage every 5 s, one window per `cores` value; per window its cgroup
     pressure stall (`stall`, seconds; default none) and the node's idle ticks
-    (`idle`; default 400 of 1000, 0 = saturated)."""
+    (`idle`; default 400 of 1000, 0 = saturated). `anchored`: True, False
+    (no anchor), or the one anchor field to leave out (an older sampler's
+    anchor: 67cc483d wrote epoch + uptime, no uptime_lo)."""
+    anchor = {"epoch": T_POINTS - 15, "uptime": 1000.0, "uptime_lo": 999.98} if anchored else {}
+    if isinstance(anchored, str):
+        anchor.pop(anchored)
     recs = [{"kind": "cpu_start", "container": container, "request_m": request_m,
-             "limit_m": limit_m, "interval_s": 5, "node_cpus": 16,
-             **({"epoch": T_POINTS - 15, "uptime": 1000.0} if anchored else {})}]
+             "limit_m": limit_m, "interval_s": 5, "node_cpus": 16, **anchor}]
     used = some = busy = idl = 0.0
 
     def rec(t):
@@ -267,7 +271,7 @@ def _write_out(d: Path, name: str, points: list[dict], summary: dict | None, rc:
     d.mkdir(parents=True, exist_ok=True)
     if cpu:
         for c in (("k6", "viewer") if name == "k6" else (name,)):
-            _cpu_file(d, c, {"k6": 4000, "viewer": 1000, "browser": 3000}[c], [1.0] * 6,
+            _cpu_file(d, c, {"k6": 4000, "viewer": 1000, "browser": 3000}[c], [1.0] * 20,
                       limit_m=None if c == "browser" else 1000)
     lines = [json.dumps({"metric": "bench_frame", "type": "Metric", "data": {}})]
     if "start" in frames:
@@ -440,12 +444,15 @@ def test_the_possible_delay_is_capped_by_the_overlap_and_the_anchor_widens_each_
     """Where a load runs past the sampled windows, a window's stall counts only
     up to the load's overlap with it; and each window is widened by the
     anchor's 1 s (a load just before a stalled window may have met it)."""
-    st = {"windows": [{"t0": 0.0, "t1": 5.0, "stall_s": 4.0}]}
+    st = {"windows": [{"t0": 0.0, "t1": 5.0, "stall_s": 4.0}], "slack_s": 1.0}
     # from 4.0 s for 5 s: overlaps [-1, 6] for 2 s: 2 s, never the window's 4 s
     assert k6eval.possible_delay_ms(4.0, 5000, st) == pytest.approx(2000)
-    st = {"windows": [{"t0": 10.0, "t1": 15.0, "stall_s": 0.4}, {"t0": 15.0, "t1": 20.0, "stall_s": 3.0}]}
-    # 14.0 to 14.5 s: window 2 (0.4 s) and, within the anchor's 1 s, window 3: the whole 500 ms
+    st = {"windows": [{"t0": 10.0, "t1": 15.0, "stall_s": 0.4}, {"t0": 15.0, "t1": 20.0, "stall_s": 3.0}],
+          "slack_s": 1.0}
+    # 14.0 to 14.5 s: window 2 (0.4 s) and, within an anchor error of 1 s, window 3: the whole 500 ms
     assert k6eval.possible_delay_ms(14.0, 500, st) == pytest.approx(500)
+    # the slack is the run's own anchor bracket: with none, window 3 is not reached
+    assert k6eval.possible_delay_ms(14.0, 500, dict(st, slack_s=0.0)) == pytest.approx(400)
 
 
 def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_path):
@@ -471,6 +478,8 @@ def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_pat
     recs = [json.loads(x) for x in (out / "probe-cpu.jsonl").read_text().splitlines()]
     start, cpu = recs[0], [r for r in recs if r["kind"] == "cpu"]
     assert (start["node_cpus"], start["uptime"]) == (2, 4321.5) and start["epoch"] > 1_700_000_000
+    # the anchor's bracket: the uptime read just before the epoch ticked (a fixed file: the same value)
+    assert start["uptime_lo"] == 4321.5
     assert cpu and all(r["pressure_some_usec"] == 123456 and r["pressure_full_usec"] == 789 for r in cpu)
     assert all(r["node_busy_ticks"] == 100 + 2 + 30 + 6 + 7 + 8 and r["node_idle_ticks"] == 400 + 5 for r in cpu)
     assert all(r["usage_usec"] == 5000000 and r["throttled_usec"] == 7 for r in cpu)
@@ -482,12 +491,21 @@ def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_pat
     assert cpu and all(r["pressure_some_usec"] is None and r["pressure_full_usec"] is None for r in cpu)
 
 
-def _starve_case(tmp_path, *, base_ms=600.0, stall=None, idle=None, cores=None, **cpu):
+_BROWSER_KW = ("first_ms", "timeouts", "widget_timeouts", "t0_ms")
+
+
+def _starve_case(tmp_path, *, base_ms=600.0, stall=None, idle=None, cores=None, **kw):
+    """`stall` / `idle` / `cores` per 5 s window (20 windows: 15 s before the
+    points' time to 85 s after, so a 60 s timeout load lies inside)."""
+    bkw = {k: kw.pop(k) for k in list(kw) if k in _BROWSER_KW}
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
     _write_viewer(k6dir)
-    _write_out(bdir, "browser", _browser_points(base_ms=base_ms), _browser_summary(63), 0)
-    _cpu_file(bdir, "browser", 3000, cores or [1.0] * 6, stall=stall, idle=idle, **cpu)
+    _write_out(bdir, "browser", _browser_points(base_ms=base_ms, **bkw), _browser_summary(63), 0)
+    n = 20
+    pad = (lambda xs, fill: (list(xs) + [fill] * n)[:n])
+    _cpu_file(bdir, "browser", 3000, pad(cores or [], 1.0), stall=pad(stall or [], 0),
+              idle=pad(idle or [], 400), **kw)
     return _evaluate_cli(tmp_path, k6dir, bdir)
 
 
@@ -514,7 +532,7 @@ def test_high_usage_with_no_stall_is_valid(tmp_path):
     """Run 19's shape: Chrome far over its request (2.9 of 3 cores at p95),
     no stall, an idle node: the run is judged on its pages. The 80 % line is
     reported, never validity."""
-    rc, v = _starve_case(tmp_path, base_ms=200.0, cores=[2.9] * 6)
+    rc, v = _starve_case(tmp_path, base_ms=200.0, cores=[2.9] * 20)
     assert _check(v["validity"], "browser.cpu_starvation")["result"] == "PASS"
     assert not any("cpu_" in r for r in v["invalid_reasons"])           # (the fixture's own reasons aside)
     assert v["report"]["browser_cpu_headroom"]["result"] == "REPORT"
@@ -522,12 +540,13 @@ def test_high_usage_with_no_stall_is_valid(tmp_path):
 
 
 def test_a_stall_that_decides_nothing_is_valid(tmp_path):
-    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[5.0] * 6)
+    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[5.0] * 20)
     c = _check(v["validity"], "browser.cpu_starvation")
     assert c["result"] == "PASS" and c["value"]["stall_share"] == 1.0
 
 
-@pytest.mark.parametrize("missing", [{"pressure": False}, {"node": False}, {"anchored": False}])
+@pytest.mark.parametrize("missing", [{"pressure": False}, {"node": False}, {"anchored": False},
+                                     {"anchored": "uptime_lo"}, {"anchored": "uptime"}])
 def test_unmeasured_starvation_is_never_a_pass(tmp_path, missing):
     """Pressure (or the node's CPU, or the anchor) unreadable: UNMEASURED,
     and the page-load bars cannot be called PASS or FAIL: INCONCLUSIVE."""
@@ -538,6 +557,120 @@ def test_unmeasured_starvation_is_never_a_pass(tmp_path, missing):
               "zero_cold_navs.navs_over_cold_bar"):
         assert _check(v["checks"], n)["result"] == "INCONCLUSIVE", n
     assert v["verdict"] != "PASS"
+
+
+def test_a_load_is_placed_by_its_own_start_not_by_its_points_time(tmp_path):
+    """#1043 review B1 (probe P1): k6 writes a load's point after settled()'s
+    QUIET_MS and more; placed by point time minus wall time, 30 loads that ran
+    inside a fully stalled window would read 0 ms of stall. Placed by their
+    own start (t0) they are what the stall can explain: INVALID."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6, stall=[0, 0, 5.0, 0, 0, 0])      # window 2: [T-5, T]
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    assert st["slack_s"] == pytest.approx(0.02)                                   # the anchor's bracket
+    pts = []
+    for i in range(30):          # 700 ms loads in the window's last 0.7 s, written 1.1 s after they ended
+        t0 = int((T_POINTS - 0.7) * 1000) + i
+        p = _point("browser_page_load_ms", 700.0, session="s1", route="/r1", visit="warm", method="click",
+                   t0=str(t0))
+        p["data"]["time"] = "2026-10-21T10:00:01.100Z"
+        pts.append(p)
+    _write_out(tmp_path, "browser", pts, None, 0, cpu=False)
+    navs = k6eval.browser_navs(k6eval.read_k6_out(str(tmp_path), "browser"))
+    assert navs[0]["start"] == pytest.approx(T_POINTS - 0.7)
+    c = load606.starvation_check(navs, st, load606.THRESHOLDS)
+    assert c["result"] == "FAIL" and "warm_nav_p95_ms" in c["why"], c
+
+
+def test_a_load_outside_the_sampled_windows_is_unmeasured(tmp_path):
+    """#1043 review B2 (probe P2): a judged load the windows do not cover is
+    UNMEASURED, never "measured, 0 ms"."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6)
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    navs = [{"wall_ms": 700.0, "visit": 2, "start": T_POINTS - 3}, {"wall_ms": 700.0, "visit": 2, "start": T_POINTS + 600}]
+    c = load606.starvation_check(navs, st, load606.THRESHOLDS)
+    assert c["result"] == "UNMEASURED" and "the stall of 1 page load(s) outside the sampled windows" in c["why"]
+    assert load606.starvation_check(navs[:1], st, load606.THRESHOLDS)["result"] == "PASS"
+
+
+@pytest.mark.parametrize("field", ["pressure_some_usec", "node_idle_ticks"])
+def test_one_null_sample_in_the_middle_is_unmeasured(tmp_path, field):
+    """#1043 review R1 / R2: one unreadable sample in the middle of a series
+    leaves its windows unmeasured: the whole series is, never a crash."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6, stall=[0, 0, 5.0, 0, 0, 0])
+    f = tmp_path / "browser-cpu.jsonl"
+    recs = [json.loads(x) for x in f.read_text().splitlines()]
+    recs[3][field] = None
+    f.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    navs = [{"wall_ms": 700.0, "visit": 2, "start": T_POINTS - 3}]
+    assert load606.starvation_check(navs, st, load606.THRESHOLDS)["result"] == "UNMEASURED"
+
+
+@pytest.mark.parametrize("kw,decided", [
+    ({"base_ms": 510.0, "first_ms": 200.0}, "warm_nav_p95_ms"),                     # warm loads over 500 only
+    ({"base_ms": 200.0, "first_ms": 1100.0}, "cold_nav_p95_ms"),                    # first visits over 1000
+    ({"base_ms": 200.0, "first_ms": 700.0}, "zero_cold_navs.first_nav_p95_ms"),     # first visits over 500
+    ({"base_ms": 1100.0}, "zero_cold_navs.navs_over_cold_bar"),                      # every load over 1000
+])
+def test_every_wall_time_bar_is_rejudged(tmp_path, kw, decided):
+    """#1043 review R18: all four page-load bars are judged again, not two."""
+    rc, v = _starve_case(tmp_path, stall=[0, 0, 5.0, 5.0, 5.0, 0], **kw)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and decided in c["why"], c
+
+
+def test_a_timeout_or_a_widget_timeout_a_stall_overlapped_is_rejudged_too(tmp_path):
+    """Diego's ruling, without special cases: a page that timed out, or a
+    widget that timed out, inside a stalled window may have been the load
+    generator's: re-judged as the bars are."""
+    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], timeouts=1)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and "browser.page_timeouts" in c["why"], c
+    rc, v = _starve_case(tmp_path / "w", base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], widget_timeouts=2)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and "browser.widget_errors" in c["why"], c
+    # unmeasured: those outcomes are INCONCLUSIVE too
+    rc, v = _starve_case(tmp_path / "u", base_ms=200.0, timeouts=1, pressure=False)
+    assert _check(v["checks"], "browser.page_timeouts")["result"] == "INCONCLUSIVE"
+    assert _check(v["checks"], "browser.widget_errors")["result"] == "INCONCLUSIVE"
+
+
+def test_the_psi606_probe_reads_what_the_gate_reads_in_a_posix_shell(tmp_path):
+    """#1043 review R21 / R22: the probe itself, run by sh against fake
+    cgroup and /proc trees; each missing piece refuses, with its reason."""
+    import yaml
+    cg, proc = tmp_path / "cg", tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    cg.mkdir()
+    job = next(d for d in yaml.safe_load_all(k6_job.render_psi_check()) if d and d["kind"] == "Job")
+    script = job["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    script = script.replace("/sys/fs/cgroup/", f"{cg}/").replace("/proc/", f"{proc}/")
+
+    def run():
+        p = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, p.stderr
+        for ln in p.stdout.splitlines():
+            json.loads(ln)                               # every line is JSON
+        return k6_job.psi_check(p.stdout.splitlines())
+    (cg / "cpu.pressure").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=12\nfull avg10=0 total=3\n")
+    (proc / "stat").write_text("cpu  100 2 30 400 5 6 7 8 0 0\ncpu0 50 1 15 200 2 3 3 4 0 0\n")
+    (proc / "self" / "cgroup").write_text("0::/\n")
+    ok, why = run()
+    assert ok, why
+    (proc / "self" / "cgroup").write_text("0::/kubepods/pod1/c1\n")       # not a private cgroup namespace
+    ok, why = run()
+    assert not ok and "/proc/self/cgroup: 0::/kubepods/pod1/c1" in why
+    (proc / "self" / "cgroup").write_text("0::/\n")
+    (cg / "cpu.pressure").unlink()
+    ok, why = run()
+    assert not ok and "/sys/fs/cgroup/cpu.pressure: unreadable" in why
+    (cg / "cpu.pressure").write_text("some avg10=0.00\n")                  # no total: not PSI
+    ok, why = run()
+    assert not ok
+    (cg / "cpu.pressure").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=12\n")
+    (proc / "stat").unlink()
+    ok, why = run()
+    assert not ok and "/proc/stat: unreadable" in why
 
 
 def test_a_page_load_without_a_start_is_unmeasured(tmp_path):
@@ -590,8 +723,14 @@ def test_k6_error_rate_and_route_table(tmp_path):
 
 
 def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
-                    sse=("refreshes", "notifications"), error_states=0, base_ms=200.0):
+                    sse=("refreshes", "notifications"), error_states=0, base_ms=200.0,
+                    t0_ms=None, first_ms=None, widget_timeouts=0):
+    """Each load carries its own start (`t0`, epoch ms, as pageload.recordOps
+    writes it): from `t0_ms` (default 3 s before the points' time) 40 ms
+    apart. `first_ms`: first-visit loads at that time instead."""
     pts = []
+    t0 = int((T_POINTS - 3) * 1000) if t0_ms is None else int(t0_ms)
+    k = 0
     for s in sessions:
         pts.append(_point("browser_logins", 1, session=s))
         pts.append(_point("browser_signin_ms", 3100.0, session=s))
@@ -600,13 +739,18 @@ def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
                               session=s, stream=stream))
         for i in range(loads):
             tags = {"session": s, "route": f"/r{i % 4}", "visit": "first" if i < 4 else "warm",
-                    "method": "login" if i == 0 else "click"}
-            pts += [_point("browser_page_load_ms", base_ms + i, **tags),
+                    "method": "login" if i == 0 else "click", "t0": str(t0 + 40 * k)}
+            k += 1
+            ms = first_ms if (first_ms is not None and i < 4) else base_ms + i
+            pts += [_point("browser_page_load_ms", ms, **tags),
                     _point("browser_page_loads", 1, **tags)]
+            if i < widget_timeouts:
+                pts.append(_point("browser_widget_states", 1, **dict(tags, state="timeout")))
     for _ in range(timeouts):                    # pageload.recordOps: a timeout is a load too
         t = {"session": sessions[0], "route": "/r0", "visit": "warm", "method": "click",
-             "skeleton": "timeout", "timeout": "yes"}
-        pts += [_point("browser_page_timeouts", 1, session=sessions[0], route="/r0"),
+             "skeleton": "timeout", "timeout": "yes", "t0": str(t0 + 40 * k)}
+        k += 1
+        pts += [_point("browser_page_timeouts", 1, session=sessions[0], route="/r0", t0=t["t0"]),
                 _point("browser_page_load_ms", 60000.0, **t), _point("browser_page_loads", 1, **t)]
     pts += [_point("browser_widget_states", 1, session=sessions[0], route="/r1", state="error")
             ] * error_states
@@ -1221,8 +1365,9 @@ const cases = JSON.parse(readFileSync(process.argv[2], 'utf8'))
 const out = {
   settled: cases.settled.map((c) => pl.settledNow(c.b, c.here, c.now, c.arg)),
   loads: cases.loads.map((c) => pl.loadOf(c.b, c.here, c.ids)),
-  ops: cases.ops.map((c) => pl.recordOps(c.r, c.tags, c.timeout)),
+  ops: cases.ops.map((c) => pl.recordOps(c.r, c.tags, c.timeout, c.at)),
   quiet: pl.QUIET_MS,
+  origin: performance.timeOrigin,
   // shipped into the page as source text: must not carry `export`
   sources: [pl.settledNow.toString(), pl.loadOf.toString()],
 }
@@ -1272,6 +1417,9 @@ def test_pageload_load_time_and_widget_states(tmp_path):
          "ids": ["widget-error", "widget-forbidden", "widget-forbidden", "widget-other"]},
         {"b": _b(saw=False, navT0=100, goneAt=0), "here": "/x", "ids": []},     # app cache: 0 ms
     ]})
+    # #1043 review B1: the load's own start, on the wall clock, from the clock its time is measured on
+    t0 = out["loads"][0].pop("t0")
+    assert t0 == pytest.approx(out["origin"] + 100)
     assert out["loads"][0] == {"ms": 403, "saw": True, "path": "/err",
                                "states": {"error": 1, "timeout": 0, "forbidden": 2, "notfound": 0}}
     assert out["loads"][1]["ms"] == 0 and out["loads"][1]["saw"] is False
@@ -1281,9 +1429,9 @@ def test_pageload_load_time_and_widget_states(tmp_path):
 def test_pageload_a_timeout_counts_as_a_load_and_a_timeout(tmp_path):
     tags = {"session": "s1", "route": "/r", "visit": "warm", "method": "click"}
     out = _pageload(tmp_path, {"settled": [], "loads": [], "ops": [
-        {"r": None, "tags": tags, "timeout": 60000},
-        {"r": {"ms": 403, "saw": True, "path": "/r", "states": {"error": 1, "timeout": 0}},
-         "tags": tags, "timeout": 60000},
+        {"r": None, "tags": tags, "timeout": 60000, "at": 1792576800123},
+        {"r": {"ms": 403, "saw": True, "path": "/r", "states": {"error": 1, "timeout": 0}, "t0": 1792576801456.7},
+         "tags": tags, "timeout": 60000, "at": 1792576800999},
     ]})
     timeout_ops, ok_ops = out["ops"]
     assert [o[0] for o in timeout_ops] == ["browser_page_timeouts", "browser_page_load_ms",
@@ -1292,6 +1440,10 @@ def test_pageload_a_timeout_counts_as_a_load_and_a_timeout(tmp_path):
     assert [(o[0], o[1]) for o in ok_ops] == [("browser_page_load_ms", 403), ("browser_page_loads", 1),
                                               ("browser_widget_states", 1)]
     assert ok_ops[2][2]["state"] == "error" and ok_ops[0][2]["skeleton"] == "yes"
+    # every point of a load carries its start: the page's own when it settled, else the driver's
+    # clock just before the action (#1043 review B1)
+    assert {o[2]["t0"] for o in timeout_ops} == {"1792576800123"}
+    assert {o[2]["t0"] for o in ok_ops} == {"1792576801457"}
 
 
 def test_a_slow_sign_in_with_fast_pages_passes(tmp_path):
@@ -1405,6 +1557,7 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
         "interval_s": 5}
     # the starvation evidence's anchor and the node's CPU count, read in the image's own shell
     assert isinstance(start["epoch"], int) and start["epoch"] > 1_700_000_000 and start["uptime"] > 0
+    assert 0 < start["uptime_lo"] <= start["uptime"]                            # the tick is bracketed
     assert isinstance(start["node_cpus"], int) and start["node_cpus"] >= 1
     assert recs[-1] == {"kind": "cpu_end"}
     pts = [r for r in recs if r["kind"] == "cpu"]
@@ -1838,10 +1991,15 @@ def test_run606_k6_psi_readable_lets_the_run_proceed(harness):
     assert "=== step measure ===" in log
     job = next(d for d in yaml.safe_load_all((out / "psi-job.yaml").read_text()) if d and d["kind"] == "Job")
     assert job["spec"]["template"]["spec"]["nodeSelector"] == {"bench.krateo.io/pool": "loadgen"}
+    # read, then deleted (#1043 review nit)
+    assert any(c["tool"] == "kubectl" and "delete" in c["argv"] and "psi606" in c["argv"]
+               for c in _calls(state_dir(harness)))
 
 
 @pytest.mark.parametrize("mode,unreadable", [("nocgroup", "/sys/fs/cgroup/cpu.pressure: unreadable"),
-                                             ("nonode", "/proc/pressure/cpu: unreadable")])
+                                             ("nonode", "/proc/stat: unreadable"),
+                                             ("sharedns", "/proc/self/cgroup: 0::/kubepods/burstable/pod1/c1"),
+                                             ("pending", "the psi606 Job did not finish within 10s")])
 def test_run606_k6_psi_unreadable_refuses_before_the_drive(harness, mode, unreadable):
     """#1042: a kernel without PSI would make every judged page load
     UNMEASURED: refused right after the loadgen node exists, before install
@@ -1849,26 +2007,30 @@ def test_run606_k6_psi_unreadable_refuses_before_the_drive(harness, mode, unread
     p, _, out = _run606_k6(harness, FAKE_PSI=mode)
     out_all = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "psi FAILED: the loadgen node's kernel does not give the browser's starvation evidence" in out_all
-    assert unreadable in out_all and "refused before any drive time" in out_all
+    assert "psi FAILED: " in out_all and unreadable in out_all and "refused before any drive time" in out_all
     for later in ("=== step install ===", "=== step measure ==="):
         assert later not in out_all
     calls = _calls(state_dir(harness))
     assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)
+    # the Job is deleted whatever its outcome (#1043 review nit)
+    assert any(c["tool"] == "kubectl" and "delete" in c["argv"] and "psi606" in c["argv"] for c in calls)
     rec = [json.loads(x) for x in (out / "command-failures.jsonl").read_text().splitlines()]
     assert any(r["step"] == "psi" and r["what"].startswith("psi FAILED: ") for r in rec)
 
 
-def test_the_psi_check_reads_both_files():
-    ok_line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=5"
+def test_the_psi_check_reads_what_the_gate_reads():
+    """The cgroup's PSI, the node's /proc/stat ticks, and a private cgroup
+    namespace (/proc/self/cgroup = 0::/)."""
+    ok = {"cgroup": "some avg10=0.00 avg60=0.00 avg300=0.00 total=5", "node": "cpu  100 2 30 400 5 6 7 8 0 0",
+          "cgroupns": "0::/"}
 
-    def lines(cg, node):
-        return [json.dumps({"kind": "psi_file", "which": "cgroup", "file": "c", "some": cg}),
-                json.dumps({"kind": "psi_file", "which": "node", "file": "n", "some": node})]
-    assert k6_job.psi_check(lines(ok_line, ok_line))[0]
-    assert not k6_job.psi_check(lines(None, ok_line))[0]
-    assert not k6_job.psi_check(lines(ok_line, None))[0]
-    assert not k6_job.psi_check(lines(ok_line, "some avg10=0.00"))[0]           # no total: not PSI
+    def lines(**over):
+        v = dict(ok, **over)
+        return [json.dumps({"kind": "psi_file", "which": w, "file": w, "some": v[w]}) for w in ok]
+    assert k6_job.psi_check(lines())[0]
+    for bad in ({"cgroup": None}, {"node": None}, {"cgroupns": None}, {"cgroup": "some avg10=0.00"},
+                {"node": "cpu 1 2"}, {"cgroupns": "0::/kubepods/pod1"}):
+        assert not k6_job.psi_check(lines(**bad))[0], bad
     assert not k6_job.psi_check([])[0]                                          # no answer at all
 
 
