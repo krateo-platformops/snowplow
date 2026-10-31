@@ -116,6 +116,11 @@ var nonCacheInitPublishers = map[string][]string{
 	// Disabled() for that reason (gating would hide the counter cache-off exactly
 	// when a mis-authored RA is erroring).
 	"internal/resolvers/restactions/api/nondial_jq_error_metrics.go": {"snowplow_nondial_jq_error_total"},
+	// #1025 per-user endpointRef refusal: same RESOLVER-path family — resolveOne
+	// refuses a named ref to a per-user credential Secret on every RESTAction
+	// resolve, cache on or off, so the refusal must stay observable with the
+	// cache off.
+	"internal/resolvers/restactions/api/per_user_ref.go": {"snowplow_endpointref_per_user_refused_total"},
 	// #367 shadow-parity toggle STATE: enabled/source is a CONFIG fact (not a cache
 	// measurement) a latency-acceptance window must assert regardless of
 	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS

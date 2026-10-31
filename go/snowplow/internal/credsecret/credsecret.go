@@ -70,8 +70,9 @@ func For(username string, groups []string) string {
 }
 
 // IsPerUserName reports whether name is a per-user credential Secret name of
-// either kind. It is the reserved set: a request-driven or caller-supplied
-// endpointRef may never resolve to one (#113 guardrail b, #443).
+// either kind. It is the reserved set: no named endpointRef may resolve to one,
+// whoever vouches for the RESTAction and whether the name is literal or
+// templated (#1025, which generalised #113 guardrail b and #443).
 func IsPerUserName(name string) bool {
 	return IsSessionName(name) || IsStepUpName(name)
 }

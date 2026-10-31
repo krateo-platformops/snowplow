@@ -200,6 +200,20 @@ func seedExtrasHarnessWithSecrets(t *testing.T, serverURL string, extra ...*core
 				"filter": raFilter970,
 			},
 		}},
+		// #1025: the team-rows read through a literal endpointRef naming
+		// ANOTHER user's per-user credential Secret (export_per_user_ref_1025_test.go).
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "templates.krateo.io/v1",
+			"kind":       "RESTAction",
+			"metadata":   map[string]any{"name": victimRAName1025, "namespace": extrasNS970, "uid": "uid-" + victimRAName1025},
+			"spec": map[string]any{
+				"api": []any{map[string]any{
+					"name": "cms", "path": "/api/v1/namespaces/team-a/configmaps", "filter": cmFilter970,
+					"endpointRef": map[string]any{"name": victimSecret1025, "namespace": extrasNS970},
+				}},
+				"filter": raFilter970,
+			},
+		}},
 		&unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "templates.krateo.io/v1",
 			"kind":       "RESTAction",
