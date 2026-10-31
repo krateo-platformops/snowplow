@@ -449,7 +449,24 @@ teardown() {
     log "=== teardown ${RUN_NAME} (exit ${rc}) ==="
     # shielded: a process-group Ctrl-C must not interrupt the delete itself
     down_rc=0
-    ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" $YES ) || down_rc=$?
+    # #1026: the teardown record ($OUT/teardown.json): the LoadBalancer Services and
+    # their release, deleted_disks, leaked_addresses, each backstop's problems
+    ( trap "" INT TERM HUP; exec python3 -m bench.gke gke-down --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" --budget-s "$DOWN_BUDGET_S" --record "$OUT/teardown.json" ${LB_NEED:+--lb-need "$LB_NEED"} $YES ) || down_rc=$?
+    # what the record says about the run's own addresses and disks, in the log
+    while IFS= read -r ln; do
+      if [[ -n "$ln" ]]; then log "$ln"; fi
+    done < <(python3 -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+if r.get("lb_need_check"):
+    print("LoadBalancer Services against the preflight: " + r["lb_need_check"])
+if r.get("dry_run") or not str(r.get("outcome", "")).startswith("deleted"):
+    sys.exit(0)      # said only once gke-down deleted the cluster
+svcs, la = r.get("lb_services"), r.get("leaked_addresses")
+print("teardown record: LoadBalancer Services %s (release: %s); leaked_addresses %s; deleted_disks %s" % (
+    "unknown" if svcs is None else len(svcs), r.get("lb_release"),
+    "unknown" if la is None else (", ".join("%s (%s, %s)" % (a["name"], a["service"],
+        "deleted" if a["deleted"] else "NOT deleted") for a in la) or "none"),
+    "unknown" if r.get("deleted_disks") is None else len(r["deleted_disks"])))' "$OUT/teardown.json" 2>/dev/null || true)
     if [[ "$down_rc" == "5" && "${UP_OK:-0}" != "1" ]]; then
       # #985: gke-up did not complete and the exact-name describe finds no
       # cluster: the create never made one
@@ -463,7 +480,15 @@ teardown() {
       # #954: its disks are found by the cluster's ID label (cluster-id-gke-io), not its name
       # label (a disk provisioned late carries the id alone); gke-down's stderr names each disk
       # left and the exact list command
-      log "cluster ${RUN_NAME} deleted, but DISK BACKSTOP FAILED (gke-down's stderr says why and names the disks left, with the gcloud command that lists them by the cluster's id): its disks may be left"
+      # #1026: or its addresses (the record says which backstop failed)
+      if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("disk_problems") == [] else 1)' \
+           "$OUT/teardown.json" 2>/dev/null; then :; else
+        log "cluster ${RUN_NAME} deleted, but DISK BACKSTOP FAILED (gke-down's stderr says why and names the disks left, with the gcloud command that lists them by the cluster's id): its disks may be left"
+      fi
+      if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("address_problems") == [] else 1)' \
+           "$OUT/teardown.json" 2>/dev/null; then :; else
+        log "cluster ${RUN_NAME} deleted, but ADDRESS BACKSTOP FAILED (gke-down's stderr and $OUT/teardown.json say why and name the addresses left): a static address of its LoadBalancer Services may be left RESERVED"
+      fi
       rc=$(( rc == 0 ? 1 : rc ))
     elif [[ "$down_rc" != "0" ]]; then
       log "TEARDOWN FAILED — delete by hand: gcloud container clusters delete ${RUN_NAME} --project ${PROJECT} --region ${REGION} --quiet"
@@ -536,16 +561,34 @@ s_schema() {
   record_failure "schema FAILED: the manifests of this run do not satisfy the CRDs installer ${INSTALLER_VERSION} pins (exit ${rc}, $OUT/crd-check.json)"
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
+LB_NEED=""   # #1026: the LoadBalancer Services this install creates (s_up), for gke-down's record
 s_up() {
   log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
+  # #1026: each LoadBalancer Service the install creates needs a regional static
+  # address (STATIC_ADDRESSES; run 19 attempt 3 waited 45 min for one). How many,
+  # derived from what this run installs (the pulled chart, its values), offline,
+  # in the dry pass too ($OUT/lb-need.json: the pair sums both runs'); gke-up
+  # refuses a run that does not fit, before anything is created.
+  local ln lb_rc=0
+  rm -f "$OUT/lb-need.json"
+  LB_NEED="$(python3 -m bench.lb_need --installer-pulled "$OUT/installer-pulled" \
+      --values "$OUT/installer-values.yaml" --out "$OUT/lb-need.json" 2>"$KERR")" || lb_rc=$?
+  if (( lb_rc != 0 )); then
+    LB_NEED=""
+    record_failure "up FAILED: the LoadBalancer Services this install creates could not be derived"
+    return 1
+  fi
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
   # by gke-up) goes through record_failure like every other step's; its
   # progress is on stdout. Run 18 lost both arms with only the RUN line logged.
   local up_rc=0
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
-      --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES \
-      2>"$KERR" || up_rc=$?
+      --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
+      --address-need "$LB_NEED" $YES 2>"$KERR" || up_rc=$?
   if [[ -s "$KERR" ]]; then cat "$KERR" >&2; fi
   (( up_rc == 0 )) || { record_failure "up FAILED: gke-up exited ${up_rc}"; return 1; }
   UP_OK=1             # gke-up made the cluster: a teardown that cannot find it is a failure

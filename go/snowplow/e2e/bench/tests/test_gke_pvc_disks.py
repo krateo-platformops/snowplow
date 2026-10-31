@@ -231,10 +231,44 @@ FAKE = textwrap.dedent("""\
                 pvs = pvs + [json.loads(os.environ["FAKE_STS_CLAIM"])]
             print(json.dumps({"items": pvs})); sys.exit(0)
         guard = has("guard_applied") and not os.environ.get("FAKE_GUARD_IGNORED")
+        lb_guard = has("lb_guard_applied") and not os.environ.get("FAKE_LB_GUARD_IGNORED")
         if a[:2] == ["apply", "--server-side"] and "bench-teardown" in " ".join(a):
+            text = sys.stdin.read()
+            if "bench-teardown-no-new-loadbalancers" in text:          # #1026: the LB guard
+                if os.environ.get("FAKE_LB_GUARD_APPLY_RC"):
+                    sys.exit(int(os.environ["FAKE_LB_GUARD_APPLY_RC"]))
+                open(os.path.join(st, "lb_guard_applied"), "w").write(text); sys.exit(0)
             if os.environ.get("FAKE_GUARD_APPLY_RC"):
                 sys.exit(int(os.environ["FAKE_GUARD_APPLY_RC"]))
-            open(os.path.join(st, "guard_applied"), "w").write(sys.stdin.read()); sys.exit(0)
+            open(os.path.join(st, "guard_applied"), "w").write(text); sys.exit(0)
+        probe = sys.stdin.read() if a[:2] == ["create", "--dry-run=server"] else ""
+        if a[:2] == ["create", "--dry-run=server"] and "kind: Service" in probe:
+            if lb_guard:   # #1026: the API server's answer to a LoadBalancer Service the policy refuses
+                sys.stderr.write("The services \\"bench-teardown-probe\\" is invalid: : ValidatingAdmissionPolicy "
+                                 "'bench-teardown-no-new-loadbalancers' with binding "
+                                 "'bench-teardown-no-new-loadbalancers' denied request: bench teardown (#1026)\\n")
+                sys.exit(1)
+            sys.exit(0)
+        if a[:3] == ["get", "svc", "--all-namespaces"]:              # #1026: the cluster's Services
+            if os.environ.get("FAKE_SVC_LIST_RC"):
+                sys.exit(int(os.environ["FAKE_SVC_LIST_RC"]))
+            dl = os.path.join(st, "svcs_deleted")
+            gone = set(open(dl).read().split()) if has("svcs_deleted") and not os.environ.get(
+                "FAKE_SVC_STUCK") else set()
+            svcs = [x for x in json.loads(os.environ.get("FAKE_LB_SVCS", "[]"))
+                    if x["metadata"]["name"] not in gone]
+            if has("svcs_recreated"):
+                svcs += json.loads(open(os.path.join(st, "svcs_recreated")).read())
+            print(json.dumps({"items": svcs})); sys.exit(0)
+        if a[:2] == ["delete", "svc"]:
+            with open(os.path.join(st, "svcs_deleted"), "a") as fh:
+                fh.write(a[4] + " ")
+            if os.environ.get("FAKE_LB_RECREATE") and not lb_guard and a[4] == "krateo-agent-gateway-platform":
+                # the agentgateway controller: its Gateway's Service is gone, so it makes a NEW one
+                # (a new UID: a new address name) unless the API server refuses it
+                new = json.loads(os.environ["FAKE_LB_RECREATE"])
+                open(os.path.join(st, "svcs_recreated"), "w").write(json.dumps([new]))
+            sys.exit(0)
         if a[:2] == ["create", "--dry-run=server"]:
             if os.environ.get("FAKE_PROBE_REFUSAL"):     # refused, but NOT by our policy
                 sys.stderr.write(os.environ["FAKE_PROBE_REFUSAL"] + "\\n"); sys.exit(1)
@@ -320,6 +354,47 @@ FAKE = textwrap.dedent("""\
         sys.exit(rc)
     if a[:3] == ["compute", "regions", "describe"]:
         q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(q)); sys.exit(0)
+    if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]) and a[2] == "list":
+        # #1026: GCE by the filter the bench writes (name=(a b)) in --regions; the leftovers
+        # (FAKE_ADDRESSES) are there once the cluster was deleted under its Services
+        import re
+        if os.environ.get("FAKE_ADDR_LIST_RC") and a[1] == "addresses":
+            sys.exit(int(os.environ["FAKE_ADDR_LIST_RC"]))
+        if os.environ.get("FAKE_FWD_LIST_RC") and a[1] == "forwarding-rules":
+            sys.exit(int(os.environ["FAKE_FWD_LIST_RC"]))
+        # FAKE_ADDR_RELIST_RC: the address list after a delete fails (the verifying list)
+        if os.environ.get("FAKE_ADDR_RELIST_RC") and a[1] == "addresses" and has("addr_delete_called"):
+            sys.exit(int(os.environ["FAKE_ADDR_RELIST_RC"]))
+        if os.environ.get("FAKE_GCE_LIST_SLEEP"):                # a hung gcloud list
+            import time
+            time.sleep(float(os.environ["FAKE_GCE_LIST_SLEEP"]))
+        m = re.fullmatch(r"name=\\((.+)\\)", a[a.index("--filter") + 1])
+        if not m or "--regions" not in a:
+            sys.stderr.write("ERROR: unexpected filter\\n"); sys.exit(2)
+        want, reg = set(m.group(1).split()), a[a.index("--regions") + 1]
+        src = os.environ.get("FAKE_ADDRESSES") if a[1] == "addresses" else os.environ.get("FAKE_FWD_RULES")
+        rows = json.load(open(src)) if src else []
+        if a[1] == "addresses" and not has("deleted"):
+            rows = []
+        if a[1] == "forwarding-rules":
+            # FAKE_FWD_GONE_AFTER=n: the controller releases the forwarding rules n lists later
+            with open(os.path.join(st, "fwd_lists"), "a") as fh:
+                fh.write("x")
+            if len(open(os.path.join(st, "fwd_lists")).read()) > int(os.environ.get("FAKE_FWD_GONE_AFTER", "0")):
+                rows = []
+        gone = set(open(os.path.join(st, "deleted_addresses")).read().split()) if has("deleted_addresses") else set()
+        # gcloud's filter as the server applies it: the bench re-checks name and region itself, so a
+        # fake that returns MORE (FAKE_LOOSE_FILTER: the whole region) must not change what is deleted
+        loose = bool(os.environ.get("FAKE_LOOSE_FILTER"))
+        print(json.dumps([r for r in rows if r["name"] not in gone and
+                          (loose or (r["name"] in want and r["region"].rsplit("/", 1)[-1] == reg))]))
+        sys.exit(0)
+    if a[:3] == ["compute", "addresses", "delete"]:
+        open(os.path.join(st, "addr_delete_called"), "w").write("1")
+        if not os.environ.get("FAKE_ADDR_DELETE_NOOP"):
+            with open(os.path.join(st, "deleted_addresses"), "a") as fh:
+                fh.write(" ".join(a[3:a.index("--region")]) + " ")
+        sys.exit(int(os.environ.get("FAKE_ADDR_DELETE_RC", "0")))
     if a[:3] == ["auth", "print-access-token"]:          # #985: the Cloud Quotas read
         print("fake-access-token"); sys.exit(0)
     if a[:3] == ["container", "clusters", "list"]:
@@ -377,8 +452,13 @@ def _calls(tmp):
     return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
 
-def _first(calls, prefix):
-    return next(i for i, c in enumerate(calls) if c[:len(prefix)] == prefix)
+def _first(calls, prefix, start=0):
+    return next(i for i, c in enumerate(calls) if i >= start and c[:len(prefix)] == prefix)
+
+
+def _pvc_release(calls):
+    """Where the PVC release starts (#1026: the LoadBalancer release, with its own guard, runs first)."""
+    return _first(calls, ["kubectl", "get", "pv"])
 
 
 def _mutating(calls):
@@ -397,8 +477,8 @@ def test_teardown_releases_the_pvcs_before_the_cluster_then_backstops_exactly(fa
     c = _calls(fakes)
     i_view = _first(c, ["kubectl", "config", "view"])
     i_patch = _first(c, ["kubectl", "patch", "pv", "pvc-ours-recorded-unlabelled"])   # Retain -> Delete
-    i_guard = _first(c, ["kubectl", "apply", "--server-side"])
-    i_probe = _first(c, ["kubectl", "create", "--dry-run=server"])
+    i_guard = _first(c, ["kubectl", "apply", "--server-side"], _pvc_release(c))
+    i_probe = _first(c, ["kubectl", "create", "--dry-run=server"], _pvc_release(c))
     i_pvc = _first(c, ["kubectl", "delete", "pvc", "--all", "--all-namespaces"])
     assert i_patch < i_guard < i_probe < i_pvc
     i_pod = _first(c, ["kubectl", "delete", "pod", "-n", "krateo-system", "mongodb-0"])
@@ -578,7 +658,8 @@ def test_the_release_refuses_new_claims_before_it_deletes_any(fakes, monkeypatch
     assert gke.teardown(gke.default_spec(NAME), dry_run=False, log=log.append, budget_s=60,
                         sleep=lambda s: None) == []
     c = _calls(fakes)
-    assert _first(c, ["kubectl", "apply", "--server-side"]) < _first(c, ["kubectl", "create", "--dry-run=server"]) \
+    r = _pvc_release(c)
+    assert _first(c, ["kubectl", "apply", "--server-side"], r) < _first(c, ["kubectl", "create", "--dry-run=server"], r) \
         < _first(c, ["kubectl", "delete", "pvc"]) < _first(c, ["kubectl", "delete", "pod"])
     assert not (fakes / "state" / "sts_recreated").exists()
     assert not any("provisioned DURING" in m for m in log)
@@ -682,14 +763,14 @@ def test_gke_up_refuses_a_run_that_does_not_fit_and_creates_nothing(fakes, capsy
     q = json.loads((fakes / "quotas.json").read_text())
     next(x for x in q["quotas"] if x["metric"] == "SSD_TOTAL_GB")["usage"] = 480.0
     (fakes / "quotas.json").write_text(json.dumps(q))
-    assert gke.main(["gke-up", "--name", NAME, "--yes"]) == 2
+    assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--yes"]) == 2
     err = capsys.readouterr().err
     assert "refusing: SSD_TOTAL_GB in europe-west4: 480 of 500 GB used, 20 free; the run needs 32 GB" in err
     assert not any(x[:3] == ["gcloud", "container", "clusters"] for x in _calls(fakes))
 
 
 def test_gke_up_that_fits_creates_the_labelled_cluster_and_touches_no_storageclass(fakes, capsys):
-    assert gke.main(["gke-up", "--name", NAME, "--yes"]) == 0
+    assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--yes"]) == 0
     c = _calls(fakes)
     assert _first(c, ["gcloud", "compute", "regions", "describe", "europe-west4"]) < _first(
         c, ["gcloud", "container", "clusters", "create"])

@@ -621,7 +621,12 @@ trap on_signal INT TERM HUP
 on_pair_stop() { echo "$RUN_NAME pair-stop" >> "$FAKE/calls"; exit 143; }
 trap on_pair_stop USR1
 mkdir -p "$OUT"
-if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"; fi
+if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then
+  # #1026: run606's dry pass derives its LoadBalancer Services (FAKE/<RUN_NAME>.lbneed; "none": not derived)
+  lbn="$(cat "$FAKE/$RUN_NAME.lbneed" 2>/dev/null || echo 1)"
+  [[ "$lbn" == "none" ]] || echo "{\"need\": $lbn, \"services\": []}" > "$OUT/lb-need.json"
+  exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"
+fi
 echo "=== step measure ===" >> "$OUT/run.log"
 if [[ -f "$FAKE/$RUN_NAME.sleep" ]]; then sleep "$(cat "$FAKE/$RUN_NAME.sleep")" & SLEEP_PID=$!; wait "$SLEEP_PID"; SLEEP_PID=""; fi
 [[ -f "$FAKE/$RUN_NAME.verdict.json" ]] && cp "$FAKE/$RUN_NAME.verdict.json" "$OUT/verdict.json"
@@ -638,7 +643,9 @@ FAKE_QUOTA_GCLOUD = (
     "    print(os.environ.get('FAKE_CLUSTERS', '[]')); sys.exit(0)\n"
     "if sys.argv[1:4] == ['compute', 'regions', 'describe']:\n"
     "    print(json.dumps({'name': sys.argv[4], 'quotas': [{'metric': 'SSD_TOTAL_GB', 'limit': 500.0,\n"
-    "                      'usage': float(os.environ.get('FAKE_SSD_USAGE', '333'))}]}))\n"
+    "                      'usage': float(os.environ.get('FAKE_SSD_USAGE', '333'))},\n"
+    "                      {'metric': 'STATIC_ADDRESSES', 'limit': 8.0,\n"
+    "                       'usage': float(os.environ.get('FAKE_STATIC_USAGE', '3'))}]}))\n"
     "    sys.exit(0)\n"
     "sys.exit(9)\n")
 # the bash the script claims to support (macOS /bin/bash 3.2) and a current one

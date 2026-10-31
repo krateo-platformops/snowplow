@@ -93,7 +93,15 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
     if a[:3] == ["compute", "regions", "describe"]:            # #895: the SSD quota read
         print(json.dumps({"name": a[3], "quotas": [
             {"metric": "SSD_TOTAL_GB", "limit": 500.0,
-             "usage": float(os.environ.get("FAKE_SSD_USAGE", "333"))}]}))
+             "usage": float(os.environ.get("FAKE_SSD_USAGE", "333"))},
+            # #1026: one static address per LoadBalancer Service the run creates
+            {"metric": "STATIC_ADDRESSES", "limit": 8.0,
+             "usage": float(os.environ.get("FAKE_STATIC_USAGE", "3"))}]}))
+        sys.exit(0)
+    if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]):
+        # #1026: the region's addresses / forwarding rules (FAKE_ADDRESSES: the addresses GCE lists)
+        if a[2] == "list":
+            print(os.environ.get("FAKE_ADDRESSES", "[]") if a[1] == "addresses" else "[]")
         sys.exit(0)
     if a[:3] == ["compute", "disks", "list"]:                  # #895: the disk backstop
         if os.environ.get("FAKE_DISKS_FAIL") == "1":
@@ -118,6 +126,7 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                   "ttl-expires": str(int(time.time()) + 3600)}
         # what GKE reports for the regional cluster gke-up made (#899 F1 records it)
         print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
+                          "endpoint": "127.0.0.1",    # the server get-credentials writes below
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
                           "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
                                          "locations": ["europe-west4-a"]}
@@ -173,6 +182,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             for d in yaml.safe_load_all(text):
                 if isinstance(d, dict):
                     fh.write(json.dumps([d.get("apiVersion"), d.get("kind")]) + "\\n")
+                    if d.get("kind") == "ValidatingAdmissionPolicy":      # the teardown's guards
+                        open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
@@ -402,6 +413,26 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                            "message": smsg}]}}
     def items(xs):
         print(json.dumps({"items": xs})); sys.exit(0)
+    if a[:2] == ["config", "view"]:                            # the teardown's endpoint check
+        print(json.load(open(kc))["clusters"][0]["cluster"]["server"], end=""); sys.exit(0)
+    if a[:2] == ["create", "--dry-run=server"]:                # the teardown guards' probes
+        import yaml
+        d = yaml.safe_load(sys.stdin.read()) or {}
+        for kind, pol in (("Service", "bench-teardown-no-new-loadbalancers"),
+                          ("PersistentVolumeClaim", "bench-teardown-no-new-claims")):
+            if d.get("kind") == kind and os.path.exists(os.path.join(STATE, "vap-" + pol)):
+                print(f"ValidatingAdmissionPolicy '{pol}' with binding '{pol}' denied request", file=sys.stderr)
+                sys.exit(1)
+        sys.exit(0)
+    if a[:2] == ["get", "svc"] and "--all-namespaces" in a:    # #1026: the LB release at teardown
+        dl = os.path.join(STATE, "svcs_deleted")
+        gone = set(open(dl).read().split()) if os.path.exists(dl) else set()
+        lbs = json.loads(os.environ.get("FAKE_LB_SVCS", "[]"))
+        print(json.dumps({"items": [x for x in lbs if x["metadata"]["name"] not in gone]})); sys.exit(0)
+    if a[:2] == ["delete", "svc"]:
+        with open(os.path.join(STATE, "svcs_deleted"), "a") as fh:
+            fh.write(a[2] + " ")
+        sys.exit(0)
     if a[:2] == ["get", "pv"]:                                 # #895: the PV release at teardown
         gone = os.path.exists(os.path.join(STATE, "pvcs_deleted"))
         items([] if gone else json.loads(os.environ.get("FAKE_PVS", "[]")))
