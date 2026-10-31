@@ -31,6 +31,11 @@ func registerRUMIngestInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	routes, err := m.Int64ObservableCounter("snowplow_rum_ingest_widget_routes_unregistered_total",
+		metric.WithDescription("krateo.widget.fetch http.route values (#1020 F3) dropped because they are not one of snowplow's own registered routes; a subset of snowplow_rum_ingest_attributes_dropped_total. Non-zero means the frontend sends a path or a route snowplow does not serve."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		s := rum.Read()
 		for outcome, n := range s.Requests {
@@ -40,7 +45,8 @@ func registerRUMIngestInstruments(m metric.Meter) error {
 			o.ObserveInt64(spans, int64(n), metric.WithAttributes(attribute.String("outcome", outcome)))
 		}
 		o.ObserveInt64(attrs, int64(s.Attributes))
+		o.ObserveInt64(routes, int64(s.UnregisteredWidgetRoutes))
 		return nil
-	}, requests, spans, attrs)
+	}, requests, spans, attrs, routes)
 	return err
 }

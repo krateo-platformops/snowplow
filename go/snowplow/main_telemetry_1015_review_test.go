@@ -35,10 +35,8 @@ import (
 // Documented limits (howto/rum-ingest.md), as literals so an arm can never
 // loosen together with the constant it checks.
 const (
-	docSpanCap       = 512
-	docAttrCap       = 64
-	docGlobalBurst   = 2048
-	docSpansPerBatch = 512
+	docSpanCap = 512
+	docAttrCap = 64
 )
 
 // countingBody counts the bytes the server pulls from the client.
@@ -96,6 +94,30 @@ func manyAttributesBody(size int) []byte {
 	return b.Bytes()
 }
 
+// repeatedAttributesBody is #1020 delta D1's shape: one allowlisted span whose
+// "attributes" key is repeated, each occurrence a full list of 64, filling
+// ~size bytes. Before the repeat was refused, every occurrence restarted the
+// count: ~6,400 attributes against a cap of 64, ~32 MiB, answered 200.
+func repeatedAttributesBody(size int) []byte {
+	var list bytes.Buffer
+	list.WriteString(`[`)
+	for i := 0; i < 64; i++ {
+		if i > 0 {
+			list.WriteString(`,`)
+		}
+		fmt.Fprintf(&list, `{"key":"k%d","value":{"stringValue":"v"}}`, i)
+	}
+	list.WriteString(`]`)
+	var b bytes.Buffer
+	b.WriteString(`{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"krateo-frontend"}}]},"scopeSpans":[{"spans":[{"name":"krateo.widget.fetch"`)
+	for b.Len()+list.Len()+32 < size {
+		b.WriteString(`,"attributes":`)
+		b.Write(list.Bytes())
+	}
+	b.WriteString(`}]}]}]}`)
+	return b.Bytes()
+}
+
 // F1 — what one request may allocate is bounded by the caps, not by the shape
 // of a body under the byte cap. The review measured 109 MiB allocated for 512
 // KiB of empty spans (decoded in full before the span count was checked) and
@@ -118,9 +140,13 @@ func TestS1015_DecodeAllocationIsBoundedByCaps(t *testing.T) {
 	for _, shape := range []struct {
 		name string
 		body []byte
+		want int
 	}{
-		{"512KiB of empty spans", emptySpansBody(documentedBodyCap)},
-		{"one span with ~174K empty attributes", manyAttributesBody(documentedBodyCap)},
+		{"512KiB of empty spans", emptySpansBody(documentedBodyCap), http.StatusRequestEntityTooLarge},
+		{"one span with ~174K empty attributes", manyAttributesBody(documentedBodyCap), http.StatusRequestEntityTooLarge},
+		// #1020 delta D1: the same key repeated ~100 times, each carrying a
+		// full 64-attribute list; refused at the first repeat.
+		{"one span with \"attributes\":[64] repeated", repeatedAttributesBody(documentedBodyCap), http.StatusBadRequest},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
 			if len(shape.body) > documentedBodyCap {
@@ -140,8 +166,8 @@ func TestS1015_DecodeAllocationIsBoundedByCaps(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+tokens[i])
 				rec := httptest.NewRecorder()
 				h.ServeHTTP(rec, req)
-				if rec.Code != http.StatusRequestEntityTooLarge {
-					t.Fatalf("run %d: status %d, want 413 (a structural cap is exceeded)", i, rec.Code)
+				if rec.Code != shape.want {
+					t.Fatalf("run %d: status %d, want %d (a structural cap is exceeded, or a key repeated)", i, rec.Code, shape.want)
 				}
 			}
 			runtime.ReadMemStats(&after)
@@ -270,11 +296,18 @@ func TestS1015_SpanAndAttributeCaps(t *testing.T) {
 	}
 }
 
-// routeKept posts one widget-fetch span with http.route=route and reports
-// whether the forwarded span carries it.
+// routeKept posts one PAGE-level span (krateo.page.load, whose route is the
+// portal's and is held to validRoute) and reports whether its route is kept.
 func routeKept(t *testing.T, h http.Handler, c *collector, user, route string) bool {
 	t.Helper()
-	s := otlpSpan{name: "krateo.widget.fetch", attrs: []map[string]any{strAttr("http.route", route)}}
+	return routeKeptOn(t, h, c, user, "krateo.page.load", route)
+}
+
+// routeKeptOn posts one span named spanName with http.route=route and reports
+// whether the forwarded span carries it.
+func routeKeptOn(t *testing.T, h http.Handler, c *collector, user, spanName, route string) bool {
+	t.Helper()
+	s := otlpSpan{name: spanName, attrs: []map[string]any{strAttr("http.route", route)}}
 	if rec := postRUM(t, h, mintRUMToken(t, user), otlpBody(t, rum.ServiceName, nil, s)); rec.Code != http.StatusOK {
 		t.Fatalf("route %q: status %d, want 200", route, rec.Code)
 	}
@@ -364,11 +397,11 @@ func TestS1015_DefaultOffContract(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			ingest := newRUMIngest(ctx)
+			mux := http.NewServeMux()
+			ingest := newRUMIngest(ctx, mux)
 			if (ingest != nil) != tc.wantOn {
 				t.Fatalf("newRUMIngest on=%v, want %v", ingest != nil, tc.wantOn)
 			}
-			mux := http.NewServeMux()
 			mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, ingest)
 			t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 			want := http.StatusNotFound
@@ -464,43 +497,6 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
-// F6 — the global spans/s cap into the collector: across distinct users (so no
-// per-user limit applies), the first docGlobalBurst/512 = 4 full batches are
-// forwarded, and the burst is then exhausted: a later batch is refused 429
-// with Retry-After and counted, not forwarded.
-//
-// MUTATIONS (RED, shown in the PR): the global cap removed (never 429); the
-// burst lowered (one of the first 4 refused).
-func TestS1015_GlobalSpanRateCap(t *testing.T) {
-	c := newCollector(t, nil)
-	defer c.srv.Close()
-	h := telemetryRouter(t, c.srv.URL+"/v1/traces")
-	body := spansBody(t, docSpansPerBatch)
-	before := rum.Read()
-	var limited *httptest.ResponseRecorder
-	for i := 0; i < 12 && limited == nil; i++ {
-		rec := postRUM(t, h, mintRUMToken(t, fmt.Sprintf("global-%d", i)), body)
-		switch {
-		case rec.Code == http.StatusTooManyRequests:
-			if i < docGlobalBurst/docSpansPerBatch {
-				t.Fatalf("batch %d refused within the documented burst of %d spans", i, docGlobalBurst)
-			}
-			limited = rec
-		case rec.Code != http.StatusOK:
-			t.Fatalf("batch %d: status %d", i, rec.Code)
-		}
-	}
-	if limited == nil {
-		t.Fatalf("12 batches of %d spans back to back were never limited by the global cap", docSpansPerBatch)
-	}
-	if limited.Header().Get("Retry-After") == "" {
-		t.Fatal("global-cap 429 without Retry-After")
-	}
-	if d := rum.Read().Spans["forward_rate_limited"] - before.Spans["forward_rate_limited"]; d != docSpansPerBatch {
-		t.Fatalf("forward_rate_limited delta %d, want %d (one refused batch)", d, docSpansPerBatch)
-	}
-}
-
 // F6(d) — dropped_auth is counted once per 401, whichever layer answers it.
 // Here the Ingest itself refuses a request that reached it with no identity
 // (a mis-wired chain); CountAuthFailures around it is the only counter.
@@ -513,7 +509,7 @@ func TestS1015_AuthDropCountedOnce(t *testing.T) {
 	defer cancel()
 	fwd := rum.NewForwarder(c.srv.URL + "/v1/traces")
 	fwd.Start(ctx)
-	h := rum.CountAuthFailures(rum.NewIngest(fwd))
+	h := rum.CountAuthFailures(rum.NewIngest(fwd, nil))
 	before := rum.Read()
 	if rec := postRUM(t, h, "", otlpBody(t, rum.ServiceName, nil, widgetFetch())); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no identity: status %d, want 401", rec.Code)

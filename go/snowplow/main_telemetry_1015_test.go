@@ -61,7 +61,11 @@ func newCollector(t *testing.T, block <-chan struct{}) *collector {
 	return c
 }
 
-// telemetryRouter mounts the route exactly as main does, forwarding to url.
+// telemetryRouter mounts the route exactly as main does, forwarding to url,
+// on a mux that also carries snowplow's /call routes: GET /call with main's
+// pattern, and the write verbs and /call/dry-run from the production
+// registrar mountCallWriteRoutes. The ingest's RouteSet is derived from this
+// mux (rum.RegisteredRoutes), as newRUMIngest derives it from main's.
 func telemetryRouter(t *testing.T, url string) http.Handler {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -69,7 +73,10 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	fwd := rum.NewForwarder(url)
 	fwd.Start(ctx)
 	mux := http.NewServeMux()
-	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd))
+	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.Handle("GET /call", stub)
+	mountCallWriteRoutes(mux, use.NewChain(), func(http.Handler) http.Handler { return stub })
+	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	return mux
 }

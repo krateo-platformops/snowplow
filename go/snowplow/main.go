@@ -146,14 +146,18 @@ func newServerHandler(mux *http.ServeMux) http.Handler {
 // Otherwise it returns a nil http.Handler, which mountTelemetryRoute mounts as
 // a 404. It is a function so the default-off contract is tested through the
 // code main runs (TestS1015_DefaultOffContract).
-func newRUMIngest(ctx context.Context) http.Handler {
+//
+// mux is snowplow's own routing table: a krateo.widget.fetch http.route must
+// be one of its routes (rum.RegisteredRoutes, #1020 F3). The set is looked up
+// on the live mux at request time, so routes registered after this call count.
+func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
 	url, ok := rum.CollectorURL()
 	if !ok {
 		return nil // an untyped nil: a typed (*rum.Ingest)(nil) would mount as "enabled"
 	}
 	fwd := rum.NewForwarder(url)
 	fwd.Start(ctx)
-	return rum.NewIngest(fwd)
+	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
 }
 
 // mountTelemetryRoute mounts #1015's browser RUM ingest, POST
@@ -1377,7 +1381,7 @@ func main() {
 	// runs until main returns.
 	rumCtx, rumStop := context.WithCancel(context.Background())
 	defer rumStop()
-	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx))
+	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx, mux))
 	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register

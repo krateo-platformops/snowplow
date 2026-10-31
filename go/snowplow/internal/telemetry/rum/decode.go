@@ -118,12 +118,17 @@ func (d *walker) open(want json.Delim) (present bool, err error) {
 }
 
 // object walks an object, calling field for each key; field must consume the
-// value.
+// value. A key repeated within one object is refused (errMalformed, 400):
+// #1020 delta D1 showed that a repeated "attributes" restarted the element
+// count, so 100 × "attributes":[64 entries] slipped 6,400 attributes past a
+// cap of 64. Refusing the repeat removes the bypass, and with it any question
+// of whether the first, the last or every occurrence counts.
 func (d *walker) object(field func(key string) error) error {
 	present, err := d.open('{')
 	if err != nil || !present {
 		return err
 	}
+	seen := make(map[string]struct{}, 4)
 	for d.dec.More() {
 		tok, err := d.dec.Token()
 		if err != nil {
@@ -133,6 +138,10 @@ func (d *walker) object(field func(key string) error) error {
 		if !ok {
 			return errMalformed
 		}
+		if _, dup := seen[key]; dup {
+			return errMalformed
+		}
+		seen[key] = struct{}{}
 		if err := field(key); err != nil {
 			return err
 		}
@@ -174,8 +183,8 @@ func (d *walker) resourceSpan() (decodedResource, error) {
 				}
 				n := 0
 				return d.array(MaxResourceAttributes, &n, "resource attributes", func() error {
-					var kv keyValue
-					if err := d.value(&kv); err != nil {
+					kv, err := d.keyValue()
+					if err != nil {
 						return err
 					}
 					res.attributes = append(res.attributes, kv)
@@ -232,8 +241,8 @@ func (d *walker) span() (span, error) {
 		case "attributes":
 			n := 0
 			return d.array(MaxAttributesPerSpan, &n, "span attributes", func() error {
-				var kv keyValue
-				if err := d.value(&kv); err != nil {
+				kv, err := d.keyValue()
+				if err != nil {
 					return err
 				}
 				sp.Attributes = append(sp.Attributes, kv)
@@ -244,4 +253,42 @@ func (d *walker) span() (span, error) {
 		}
 	})
 	return sp, err
+}
+
+// keyValue walks one OTLP/JSON KeyValue, and its AnyValue, with the same
+// repeated-key refusal as every other object. Only stringValue and intValue
+// are kept (the allowlist never needs another type); any other AnyValue member
+// (arrayValue, kvlistValue, bytesValue, …) is scanned past without being built.
+func (d *walker) keyValue() (keyValue, error) {
+	var kv keyValue
+	err := d.object(func(key string) error {
+		switch key {
+		case "key":
+			return d.value(&kv.Key)
+		case "value":
+			return d.object(func(key string) error {
+				switch key {
+				case "stringValue":
+					var s string
+					if err := d.value(&s); err != nil {
+						return err
+					}
+					kv.Value.StringValue = &s
+					return nil
+				case "intValue":
+					var n jsonInt64
+					if err := d.value(&n); err != nil {
+						return err
+					}
+					kv.Value.IntValue = &n
+					return nil
+				default:
+					return d.skip()
+				}
+			})
+		default:
+			return d.skip()
+		}
+	})
+	return kv, err
 }

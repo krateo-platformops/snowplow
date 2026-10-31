@@ -54,7 +54,10 @@ const (
 
 // Ingest serves POST /telemetry/v1/traces behind the auth middleware.
 type Ingest struct {
-	fwd     *Forwarder
+	fwd *Forwarder
+	// routes is snowplow's own routing table (RegisteredRoutes over the mux):
+	// a krateo.widget.fetch http.route must be one of them.
+	routes  RouteSet
 	limiter *userLimiter
 	// decodes bounds the requests reading and decoding a body at once, across
 	// all users (F1): with the structural caps this bounds the memory the
@@ -64,17 +67,42 @@ type Ingest struct {
 	global     *rate.Limiter
 	refusalLog *rate.Limiter
 	now        func() time.Time
+
+	// inFlight holds the users with a request inside the ingest (#1020 delta
+	// D2): one at a time per user, so a single user's slow bodies cannot hold
+	// every decode slot. An entry lives exactly as long as its request.
+	mu       sync.Mutex
+	inFlight map[string]struct{}
+}
+
+// enter admits user's request unless that user already has one in flight.
+func (in *Ingest) enter(user string) bool {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if _, busy := in.inFlight[user]; busy {
+		return false
+	}
+	in.inFlight[user] = struct{}{}
+	return true
+}
+
+func (in *Ingest) leave(user string) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	delete(in.inFlight, user)
 }
 
 // NewIngest returns the ingest handler forwarding through fwd.
-func NewIngest(fwd *Forwarder) *Ingest {
+func NewIngest(fwd *Forwarder, routes RouteSet) *Ingest {
 	return &Ingest{
 		fwd:        fwd,
+		routes:     routes,
 		limiter:    newUserLimiter(PerUserRate, PerUserBurst, maxTracked),
 		decodes:    make(chan struct{}, runtime.GOMAXPROCS(0)),
 		global:     rate.NewLimiter(GlobalSpansPerSecond, GlobalSpanBurst),
 		refusalLog: rate.NewLimiter(refusalLogsPerSecond, refusalLogBurst),
 		now:        time.Now,
+		inFlight:   map[string]struct{}{},
 	}
 }
 
@@ -103,6 +131,14 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in.refuse(w, user, http.StatusRequestEntityTooLarge, "size", "body too large", 0)
 		return
 	}
+	// One request in flight per user (D2), checked BEFORE a decode slot is
+	// taken: a user still sending one body cannot take a second slot.
+	if !in.enter(user) {
+		requestsDroppedBusy.Add(1)
+		in.refuse(w, user, http.StatusTooManyRequests, "busy_user", "a request from this user is already in flight", time.Second)
+		return
+	}
+	defer in.leave(user)
 	select {
 	case in.decodes <- struct{}{}:
 	default:
@@ -127,11 +163,12 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestsAccepted.Add(1)
-	f := filter(req)
+	f := filter(req, in.routes)
 	spansDroppedService.Add(uint64(f.droppedService))
 	spansDroppedName.Add(uint64(f.droppedName))
 	spansDroppedInvalid.Add(uint64(f.droppedInvalid))
 	attributesDropped.Add(uint64(f.droppedAttrs))
+	widgetRoutesUnregistered.Add(uint64(f.unregisteredRoutes))
 	spansAccepted.Add(uint64(len(f.spans)))
 
 	rejected := f.rejected()
@@ -164,7 +201,7 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // nothing from the request body. The counters (by reason) are the unsampled
 // totals; the line says who.
 func (in *Ingest) refuse(w http.ResponseWriter, user string, status int, reason, msg string, retryAfter time.Duration) {
-	if in.refusalLog.Allow() {
+	if in.refusalLog.AllowN(in.now(), 1) {
 		slog.Warn("rum.ingest.refused",
 			slog.String("subsystem", "rum"),
 			slog.String("user", redact.User(user)),
