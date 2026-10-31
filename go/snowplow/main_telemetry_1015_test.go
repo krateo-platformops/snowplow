@@ -75,6 +75,7 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	mux := http.NewServeMux()
 	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.Handle("GET /call", stub)
+	mux.Handle("GET /swagger/", stub) // main registers this subtree pattern too
 	mountCallWriteRoutes(mux, use.NewChain(), func(http.Handler) http.Handler { return stub })
 	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)

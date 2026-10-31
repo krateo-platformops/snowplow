@@ -74,7 +74,10 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   `<METHOD>` for a request no route serves), `http.route` = the templated mux
   pattern (never the raw path; `url.path` is dropped from Server spans at
   export), `http.request.method`, `http.response.status_code`, status `Error`
-  only for 5xx. `/health`, `/readyz` and `/debug/*` get no span. Sampled at
+  only for 5xx. `/health`, `/readyz`, `/debug/*` and the browser RUM upload
+  `POST /telemetry/v1/traces` (#1020 D6: telemetry about the portal, not
+  platform API; read its health from the `snowplow_rum_ingest_*` counters,
+  see `howto/rum-ingest.md`) get no span. Sampled at
   100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
   `docs/configuration.md`). The CORS options in `main.go` allow the browser
   to send `traceparent`/`tracestate`/`baggage`.

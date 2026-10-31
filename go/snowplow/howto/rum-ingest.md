@@ -99,7 +99,13 @@ Forwarding is asynchronous and bounded (a 64-batch queue, one worker, 5 s per po
 
 ## Metrics
 
-On `/debug/vars` as `snowplow_rum_ingest`, and over OTLP:
+**Uploads get no Server span.** `POST /telemetry/v1/traces` is excluded from snowplow's own Server spans exactly like the health probes (Diego, 2026-10-30, #1020 D6). It is telemetry about the portal, not platform API, so it is never in the API SLIs.
+
+Read upload health from these counters instead:
+- `requests_total{outcome=accepted}` against the `dropped_*` outcomes: refused, busy, rate;
+- `spans_total{outcome=forwarded}` against `forward_rate_limited`, `forward_overflow` and `forward_failed`.
+
+They are on `/debug/vars` as `snowplow_rum_ingest`, and over OTLP:
 
 | metric | `outcome` values |
 |---|---|

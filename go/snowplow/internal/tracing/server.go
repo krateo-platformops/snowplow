@@ -89,14 +89,23 @@ func route(pattern string) string {
 	return ""
 }
 
-// unspannedRoutes are the kubelet probe routes. They serve no client: the
-// liveness probe hits /health every 10 s and the readiness probe hits /readyz
-// every 5 s (helm/snowplow/values.yaml), 25,920 requests a day per pod, which
-// is more than all of 057's client traffic (6,962 requests over the 24 h to
-// 2026-10-30 11:00Z). Spanning them would make probes most of the volume and
-// would push availability and p95 toward the probes' trivially fast 200s
-// unless every SLI query remembered to filter them out.
-var unspannedRoutes = map[string]bool{"/health": true, "/readyz": true}
+// unspannedRoutes are the routes that get no Server span.
+//
+//   - /health and /readyz, the kubelet probes. They serve no client: the
+//     liveness probe hits /health every 10 s and the readiness probe hits
+//     /readyz every 5 s (helm/snowplow/values.yaml), 25,920 requests a day per
+//     pod, which is more than all of 057's client traffic (6,962 requests over
+//     the 24 h to 2026-10-30 11:00Z). Spanning them would make probes most of
+//     the volume and would push availability and p95 toward the probes'
+//     trivially fast 200s unless every SLI query remembered to filter them out.
+//   - /telemetry/v1/traces, the browser RUM upload (#1015; Diego, 2026-10-30,
+//     #1020 D6: no Server span for RUM uploads, treated exactly like the
+//     probes). It is telemetry about the portal, not platform API; its health
+//     is read from the snowplow_rum_ingest_* counters (accepted, refused, busy,
+//     forward_rate_limited). The path is spelled here, not imported, because
+//     internal/telemetry/rum imports this package; the main-package arm
+//     TestS1020_RUMUploadGetsNoServerSpan pins it to rum.Path.
+var unspannedRoutes = map[string]bool{"/health": true, "/readyz": true, "/telemetry/v1/traces": true}
 
 // spanned reports whether a request served under rt gets a Server span.
 //

@@ -17,15 +17,20 @@ import (
 // of snowplow's own registered routes, derived from the mux; anything else,
 // even a well-formed template, is dropped and counted.
 //
+// The harness mux carries main's SUBTREE pattern GET /swagger/ as well: the
+// mux serves "/swagger/<anything>" with it, so only an exact comparison with
+// the pattern's path ("/swagger/") keeps a concrete name under it out.
+//
 // MUTATIONS (RED, shown in the PR): the widget-fetch branch falling back to
 // the page-level checks (a portal template is forwarded); RegisteredRoutes
-// matching by prefix instead of exactly (an unregistered path is forwarded).
+// matching by prefix instead of exactly, with or without an empty-pattern
+// guard (a concrete path under /swagger/ is forwarded).
 func TestS1020_WidgetFetchRouteMustBeSnowplowRoute(t *testing.T) {
 	c := newCollector(t, nil)
 	defer c.srv.Close()
 	h := telemetryRouter(t, c.srv.URL+"/v1/traces")
 
-	for i, route := range []string{"/call", "/call/dry-run"} {
+	for i, route := range []string{"/call", "/call/dry-run", "/swagger/"} {
 		if !routeKeptOn(t, h, c, fmt.Sprintf("wf-ok-%d", i), rum.SpanWidgetFetch, route) {
 			t.Errorf("widget-fetch route %q is a registered snowplow route and was dropped", route)
 		}
@@ -37,6 +42,8 @@ func TestS1020_WidgetFetchRouteMustBeSnowplowRoute(t *testing.T) {
 		"/call/",                         // trailing slash: not the registered pattern
 		"/calls",                         // a near miss
 		"/",                              // root
+		"/swagger/zq1020-alice-name",     // a concrete name under a SUBTREE pattern the mux would serve
+		"/swagger",                       // the subtree without its slash: the mux would redirect
 	}
 	before := rum.Read()
 	for i, route := range notSnowplow {
