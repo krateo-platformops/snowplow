@@ -296,7 +296,15 @@ type heldCredentialKey struct{}
 // present. PROVENANCE, never endpoint shape: a token-auth endpointRef is
 // shape-identical to the SA endpoint.
 func WithHeldCredential(ctx context.Context) context.Context {
-	return context.WithValue(ctx, heldCredentialKey{}, true)
+	return WithHeldCredentialValue(ctx, true)
+}
+
+// WithHeldCredentialValue sets the mark to held, true OR false. The mark is
+// per stage: a stage sets it to its own provenance every time, so a ctx a
+// nested resolve inherits from an outer held stage never makes a nested
+// named-ref stage read as held (#1019 review F1).
+func WithHeldCredentialValue(ctx context.Context, held bool) context.Context {
+	return context.WithValue(ctx, heldCredentialKey{}, held)
 }
 
 // HeldCredential reports whether ctx carries the WithHeldCredential mark.

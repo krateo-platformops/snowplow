@@ -215,9 +215,16 @@ func writesOnEveryCall1011(t *testing.T, named bool) {
 	if n := len(populated1011); n != 0 {
 		t.Fatalf("#1011 W RED (M12): a write's cold call scheduled %d cluster-scope populate(s)", n)
 	}
-	if _, used, gate := attemptClusterListCollapse(ctx, clusterListLogger(t), stage, map[string]any{},
-		endpoints.Endpoint{}, cache.ResolvedCache(), true); used || gate != 9 {
-		t.Fatalf("#1011 W RED (M12): a write stage's collapse decision is used=%v deny gate %d, want false and 9", used, gate)
+	// The decision as runStage makes it: a stage with no endpointRef carries
+	// the own-cluster mark (#1017), so the verb gate (9) is what denies it; a
+	// named endpointRef is denied first as not this cluster (10).
+	decCtx, wantGate := ownClusterCtx(ctx), 9
+	if named {
+		decCtx, wantGate = ctx, 10
+	}
+	if _, used, gate := attemptClusterListCollapse(decCtx, clusterListLogger(t), stage, map[string]any{},
+		endpoints.Endpoint{}, cache.ResolvedCache(), true); used || gate != wantGate {
+		t.Fatalf("#1011 W RED (M12): a write stage's collapse decision is used=%v deny gate %d, want false and %d", used, gate, wantGate)
 	}
 	warmCell1011(t, ctx)
 	raw := resolve1011(t, ctx, u, stage)

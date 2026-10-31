@@ -84,6 +84,8 @@ type PIPStageTiming struct {
 	//   8 — the cell is cold: per-item fallback, async populate scheduled
 	//   9 — the stage's verb is not a plain GET: a collapse would replace its
 	//       calls with a GET they are not (#1011)
+	//   10 — the stage's endpoint is not snowplow's own cluster (#1017);
+	//       checked before 9 (own cluster first, then the verb)
 	ClusterListDenyGate int `json:"cl_deny_gate"`
 
 	// IteratorCalls is the number of inner-call elements the bounded

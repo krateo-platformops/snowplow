@@ -163,6 +163,13 @@ func resetDiscoveryClientCacheForTest() {
 // so the downstream JQ pipeline is invariant
 // (feedback_cache_must_not_constrain_jq.md).
 func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, error) {
+	// Gate 0 (#1017): the discovery client reads THIS cluster with the
+	// ServiceAccount; a stage whose endpoint names another cluster
+	// (targetsOwnCluster) is answered by that endpoint.
+	if !targetsOwnCluster(ctx) {
+		return nil, false, nil
+	}
+
 	// Gate 1: verb. Discovery is read-only; a non-GET to a
 	// discovery-shaped path is not a discovery probe (F5).
 	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate

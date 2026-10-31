@@ -368,6 +368,14 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, nil
 	}
 
+	// Gate 1b (#1017): the internal rest config is THIS cluster's
+	// ServiceAccount. A stage whose endpoint names another cluster
+	// (targetsOwnCluster) is never answered with it: it falls through to the
+	// dispatch on its own endpoint.
+	if !targetsOwnCluster(ctx) {
+		return nil, false, nil
+	}
+
 	// Gate 2: verb. client-go dynamic Get/List is read-only.
 	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, nil

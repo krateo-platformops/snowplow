@@ -206,7 +206,7 @@ func TestClusterListCollapsePut_RecordsDepEdges(t *testing.T) {
 	// Phase 2 — the cell is now warm. attemptClusterListCollapse must
 	// return useCluster=true + gate=0 via the cell-warm fast-path.
 	newTmp, useCluster, gate := attemptClusterListCollapse(
-		ctx, log, apiCall,
+		ownClusterCtx(ctx), log, apiCall,
 		map[string]any{}, endpoints.Endpoint{}, store, true,
 	)
 	if !useCluster {

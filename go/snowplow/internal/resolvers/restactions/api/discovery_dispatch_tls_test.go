@@ -170,7 +170,7 @@ func TestDiscoveryDispatch_TrustsClusterCA(t *testing.T) {
 	}
 	withDiscoverySARESTConfig(t, rc)
 
-	raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+	raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: fixtureDiscoveryPath},
 	})
 	if err != nil {
@@ -229,7 +229,7 @@ func TestDiscoveryDispatch_CoreGroupShape(t *testing.T) {
 	rc := &rest.Config{Host: srv.URL, BearerToken: "fake-sa-jwt", TLSClientConfig: rest.TLSClientConfig{CAData: caPEM}}
 	withDiscoverySARESTConfig(t, rc)
 
-	raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+	raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: "/api/v1"},
 	})
 	if err != nil {
@@ -268,7 +268,7 @@ func TestDiscoveryDispatch_BareRootServed(t *testing.T) {
 			rc := &rest.Config{Host: srv.URL, BearerToken: "fake-sa-jwt", TLSClientConfig: rest.TLSClientConfig{CAData: caPEM}}
 			withDiscoverySARESTConfig(t, rc)
 
-			raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+			raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 				RequestInfo: httpcall.RequestInfo{Path: root},
 			})
 			if err != nil {
@@ -300,7 +300,7 @@ func TestDiscoveryDispatch_BareRootLeakGuard(t *testing.T) {
 		"/apis/apps/v1/deployments",         // group LIST
 		"/apis/apps/v1/namespaces/x/pods/p", // group namespaced GET
 	} {
-		raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+		raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 			RequestInfo: httpcall.RequestInfo{Path: p},
 		})
 		if err != nil {
@@ -324,7 +324,7 @@ func TestDiscoveryDispatch_NonAPIServerPathFallsThrough(t *testing.T) {
 	// leaked, the dispatch would try to build a client and we'd notice.
 	withDiscoverySARESTConfig(t, &rest.Config{Host: "https://kubernetes.default.svc"})
 
-	raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+	raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: "https://example.com/external"},
 	})
 	if err != nil {
@@ -375,7 +375,7 @@ func TestDiscoveryDispatch_ResourcePathNotRouted(t *testing.T) {
 				"discovery, else the SA-serve branch would leak it cross-user", p, gv)
 		}
 		// Dispatch-level: the branch must not serve it.
-		raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+		raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 			RequestInfo: httpcall.RequestInfo{Path: p},
 		})
 		if err != nil {
@@ -405,7 +405,7 @@ func TestDiscoveryDispatch_ResourcePathNotRouted(t *testing.T) {
 func TestDiscoveryDispatch_NonGETNotServed(t *testing.T) {
 	withDiscoverySARESTConfig(t, &rest.Config{Host: "https://kubernetes.default.svc"})
 
-	raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+	raw, served, err := dispatchViaDiscovery(ownClusterCtx(context.Background()), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{
 			Path: fixtureDiscoveryPath,
 			Verb: ptr.To(http.MethodPost),

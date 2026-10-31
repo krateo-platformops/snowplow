@@ -189,7 +189,7 @@ func TestNullCollapseWARN_EndToEnd(t *testing.T) {
 		logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		ctx := withSlogLogger(cache.WithInternalRESTConfig(context.Background(), rc), logger)
 
-		raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+		raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 			RequestInfo: httpcall.RequestInfo{Path: path},
 		})
 		if err != nil {

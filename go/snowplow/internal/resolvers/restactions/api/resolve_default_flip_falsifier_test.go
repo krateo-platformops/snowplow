@@ -73,7 +73,7 @@ func TestResolveDefaultFlip_Omit_NilPointer_NotResolved(t *testing.T) {
 	stub.install(t)
 
 	r := inProcessRun(t)
-	_, did, err := r.maybeResolveInProcess(r.ctx, directRACall(), resolve)
+	_, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), directRACall(), resolve)
 	if err != nil {
 		t.Fatalf("OMIT: unexpected error: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestResolveDefaultFlip_ExplicitTrue_StillResolves(t *testing.T) {
 	stub.install(t)
 
 	r := inProcessRun(t)
-	got, did, err := r.maybeResolveInProcess(r.ctx, directRACall(), explicitTrue)
+	got, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), directRACall(), explicitTrue)
 	if err != nil || !did {
 		t.Fatalf("EXPLICIT-TRUE: did=%v err=%v — opt-in resolve:true must still substitute", did, err)
 	}

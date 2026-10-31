@@ -234,7 +234,7 @@ func TestInternalRESTConfigDispatch_TrustsClusterCA(t *testing.T) {
 	}
 	ctx := cache.WithInternalRESTConfig(context.Background(), rc)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: "/api/v1/namespaces"},
 	})
 	if err != nil {
@@ -292,7 +292,7 @@ func TestInternalRESTConfigDispatch_TrustsClusterCA(t *testing.T) {
 // context (every ordinary per-user request), dispatchViaInternalRESTConfig
 // returns served=false so the call takes the unchanged httpcall.Do path.
 func TestInternalRESTConfigDispatch_NoConfigFallsThrough(t *testing.T) {
-	raw, served, err := dispatchViaInternalRESTConfig(context.Background(),
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(context.Background()),
 		httpcall.RequestOptions{
 			RequestInfo: httpcall.RequestInfo{Path: "/api/v1/namespaces"},
 		})
@@ -317,7 +317,7 @@ func TestInternalRESTConfigDispatch_NonAPIServerPathFallsThrough(t *testing.T) {
 	rc := &rest.Config{Host: "https://kubernetes.default.svc"}
 	ctx := cache.WithInternalRESTConfig(context.Background(), rc)
 
-	_, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	_, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: "https://example.com/external"},
 	})
 	if err != nil {

@@ -660,7 +660,7 @@ func TestIssue618_InternalDispatch_HandsSelectorsToTheLiveList(t *testing.T) {
 			mu.Lock()
 			seen = nil
 			mu.Unlock()
-			_, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			_, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			if err != nil || !ok {
 				t.Fatalf("%s: served=%v err=%v", tc.path, ok, err)
 			}
@@ -682,7 +682,7 @@ func TestIssue618_InternalDispatch_HandsSelectorsToTheLiveList(t *testing.T) {
 			mu.Lock()
 			seen = nil
 			mu.Unlock()
-			_, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			_, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			mu.Lock()
 			defer mu.Unlock()
 			if ok || err != nil || len(seen) != 0 {
@@ -719,7 +719,7 @@ func TestIssue618_InternalDispatch_InformerBranchFiltersSelectors(t *testing.T) 
 			mu.Lock()
 			live = 0
 			mu.Unlock()
-			raw, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			raw, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			if err != nil || !ok {
 				t.Fatalf("%s: served=%v err=%v", tc.path, ok, err)
 			}
