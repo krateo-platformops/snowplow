@@ -96,6 +96,29 @@ func p3ContentCells() []string {
 	return out
 }
 
+// p3ServedBody is the body a customer read of content cell k is served: an
+// incremental list cell (#854) keeps no RawJSON, its body is the generation a
+// customer reader takes (Snapshot at the current dep-event seq, #854 C5).
+func p3ServedBody(t *testing.T, k string) string {
+	t.Helper()
+	e, ok := cache.ResolvedCache().GetNoTouch(k)
+	if !ok || e == nil {
+		return "<absent>"
+	}
+	if lc := e.ListCell(); lc != nil {
+		v, ok := lc.Snapshot(cache.DepGenEpochNow())
+		if !ok {
+			return "<unanchored>"
+		}
+		return string(v.Raw())
+	}
+	return string(e.RawJSON)
+}
+
+// p3F6WriteDeadline is F6's fixture write deadline: the arm's longest phase
+// bound ("every cell converged").
+const p3F6WriteDeadline = 20 * time.Second
+
 func p3Extras(i int) map[string]any { return map[string]any{"k": fmt.Sprintf("v%d", i)} }
 
 func p3ExtrasQuery(i int) string { return url.QueryEscape(fmt.Sprintf(`{"k":"v%d"}`, i)) }
@@ -209,6 +232,14 @@ func (e *p3E2EEnv) serveFL(t *testing.T, i int) string {
 
 func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	e := p3E2EFixture(t)
+	// The fixture server's write deadline (production: main.go writeTimeout →
+	// SetTombstoneTTL), the one source of DemandRevalidationDeadline. Sized to
+	// the arm's longest phase bound (p3F6WriteDeadline), so a debt refill or
+	// re-resolve that wedges is reported by the bounded debt join within twice
+	// that (#1033 review), never by the go-test timeout.
+	prevDeadline := cache.DemandRevalidationDeadline()
+	cache.ResolvedCache().SetTombstoneTTL(p3F6WriteDeadline)
+	t.Cleanup(func() { cache.ResolvedCache().SetTombstoneTTL(prevDeadline) })
 
 	// Mint the 12 cells (cold fills), and their keys.
 	var keys []string
@@ -251,9 +282,12 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 
 	// The backing content cells the configmap change also marks (#1033): one
 	// window each, alongside the 12 cells'.
+	// Exactly the fixture's two content calls: the by-name RA's configmap GET
+	// and the FL RAs' configmaps LIST (pinned, so the window count is the
+	// fixture's, never whatever happens to be resident).
 	substrate := p3ContentCells()
-	if len(substrate) == 0 {
-		t.Fatal("PRE: no backing content cell is resident — the arm's window count would be the 12 cells' only")
+	if len(substrate) != 2 {
+		t.Fatalf("PRE: %d backing content cells resident, want the fixture's 2 (configmap GET by name, configmaps LIST)", len(substrate))
 	}
 
 	// The refresher, gated so every window is open at once.
@@ -411,7 +445,9 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	work1 := cache.RefresherWorkSnapshot()
 	e.serveRA(t, p3M+1)
 	e.serveFL(t, p3M+1)
-	restapi.WaitStaleDebtsForTest()
+	if err := restapi.WaitStaleDebtsForTest(); err != nil {
+		t.Fatalf("F6: the final read's stale-debt work never ended: %v", err)
+	}
 	p3Settle(t, work1)
 	for _, k := range append(append([]string{}, keys...), substrate...) {
 		if cache.InputsMovedSincePut(k) {
@@ -421,6 +457,14 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	if d := p3RefStat("dirty_to_fresh_samples") - s0; d != windows {
 		t.Fatalf("F6: dirty_to_fresh_samples Δ=%d once every window has ended, want exactly %d (one per window: %d cells + %d backing); unfresh=%v",
 			d, windows, len(keys), len(substrate), p3Unfresh())
+	}
+	// A closed window is a FRESH cell: every backing cell SERVES the change,
+	// not only its window instrument. Last, because a list cell's read can
+	// queue its own due pass.
+	for n, k := range substrate {
+		if !strings.Contains(p3ServedBody(t, k), p3NewValue) {
+			t.Fatalf("F6: backing content cell %d's window closed but the body it serves does not carry the new value", n)
+		}
 	}
 	if p3RefStat("dirty_to_fresh_ms_p95") <= 0 {
 		t.Fatalf("F6: dirty_to_fresh_ms_p95 must be > 0 after %d samples", len(keys))
