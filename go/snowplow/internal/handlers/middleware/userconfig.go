@@ -262,8 +262,16 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// PM load-bearing pin: the IsNotFound distinction
 					// MUST be preserved here (cache-miss errors must
 					// route 401 vs 500 identically to upstream).
+					//
+					// #1029 — the NotFound 401 carries a machine-readable
+					// cause chosen from the same validated groups that chose
+					// the Secret (StepUpRequired + the RFC 9470 challenge for
+					// a krateo:loa:2 token, SessionCredentialMissing
+					// otherwise). Its kind/apiVersion/status/message/reason/
+					// code are byte-identical to upstream's. Any other
+					// re-read error stays upstream's 500, with no cause.
 					if apierrors.IsNotFound(ferr) {
-						response.Unauthorized(wri, ferr)
+						credentialMissing(wri, userInfo.Groups, ferr)
 						return
 					}
 					response.InternalError(wri, ferr)

@@ -108,6 +108,13 @@ const (
 	// snowplow_apiserver_fallthrough_cells under path "refresher" instead of
 	// going uncounted. NOT a route; never registered with RegisterScopedRoute.
 	ScopeRefresher = "refresher"
+
+	// ScopeTelemetry — #1015, the browser RUM ingest POST /telemetry/v1/traces.
+	// The route issues ZERO apiserver reads (JWT validation and a forward to the
+	// collector), so a fall-through landing under this scope is a defect by
+	// definition. The issue makes it a registered scoped route so that such a
+	// read is attributed and visible rather than unscoped.
+	ScopeTelemetry = "telemetry"
 )
 
 // validScopeNames is the boot-time validation set used by
@@ -128,6 +135,7 @@ var validScopeNames = map[string]struct{}{
 	ScopeBootPrewarmWalk:   {},
 	ScopeBootPrewarmSeed:   {},
 	ScopeRefresher:         {},
+	ScopeTelemetry:         {},
 }
 
 // routeScopeRegistry records the routes whose middleware chain has
