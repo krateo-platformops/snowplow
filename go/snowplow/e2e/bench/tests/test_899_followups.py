@@ -363,8 +363,10 @@ def test_the_zone_fallback_keeps_every_safety_check(fakegke, monkeypatch, zone_m
 def test_gke_down_cli_deletes_a_zonal_cluster(fakegke, monkeypatch):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
+    # #1026: deleted (exit 4, not 1): the cluster's API server never answered, so its LoadBalancer
+    # Services (and their address names) are unknown, said as such
     assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--legacy-zonal",
-                     "--yes"]) == 0
+                     "--yes"]) == gke.EXIT_BACKSTOP_FAILED
     assert f"delete --zone {ZONE}" in calls(fakegke) and not any(c.startswith("delete --region") for c in calls(fakegke))
 
 

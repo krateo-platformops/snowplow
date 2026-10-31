@@ -106,8 +106,11 @@ def test_release_never_mutates_without_the_bench_context(realkubectl, shape):
     assert lines, "kubectl was never called"
     rl = realkubectl / "state" / "resolved.log"
     assert not rl.exists(), "a non-bench context was resolved: " + rl.read_text()
-    # the only kubectl call is the PV read, which fails; nothing mutating is ever issued
-    assert all(l.split()[3:5] == ["get", "pv"] for l in lines), lines
+    # the only kubectl calls are reads, which fail: the LoadBalancer release's endpoint check
+    # (#1026: `config view`, before any Service is read or changed) and the PV read; nothing
+    # mutating is ever issued
+    assert all(l.split()[3:5] in (["get", "pv"], ["config", "view"]) for l in lines), lines
+    assert any(l.split()[3:5] == ["get", "pv"] for l in lines), lines
     assert not muts, muts
     assert any("could not list" in m for m in log), log
     # the backstop still deletes only this cluster's disks, by its id label (#954)

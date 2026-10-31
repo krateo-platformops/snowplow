@@ -34,7 +34,8 @@
 # Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
 # OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
 # verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
-# anything was created (#895: the SSD quota read refuses too). A restart of B
+# anything was created (#895: the SSD quota read refuses too; #1026: and the
+# STATIC_ADDRESSES read, for both runs' LoadBalancer Services). A restart of B
 # FAILs the pair; a restart of A is recorded and
 # its not-Ready time is removed from both runs (bench/custlat.py's module doc):
 # the pair reads each run's k6 stream from its OUT for that.
@@ -94,6 +95,7 @@ runenv() {
 log "pair: A=${RUN_NAME_A} (${SNOWPLOW_TAG_A}) B=${RUN_NAME_B} (${SNOWPLOW_TAG_B}), bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
 for x in A B; do
   runenv "$x"
+  rm -f "$PAIR_OUT/dry-$x/lb-need.json"     # #1026: only THIS dry pass's derivation counts
   if ! env "${RUNENV[@]}" BENCH_606_DRY_RUN=1 OUT="$PAIR_OUT/dry-$x" "$BASH" "$RUN606" \
        > "$PAIR_OUT/dry-$x.console" 2>&1; then
     tail -5 "$PAIR_OUT/dry-$x.console" >&2
@@ -117,6 +119,21 @@ for check in gke-ssd-quota gke-cluster-quota; do
   fi
   log "$quota_msg"
 done
+# #1026: both runs' LoadBalancer Services must fit the region's STATIC_ADDRESSES
+# (one regional static address each while GKE builds its load balancer; run 19
+# attempt 3 waited 45 min for one). Each run's dry pass derived its own from
+# what it installs ($OUT/lb-need.json, bench/lb_need.py); the pair needs both.
+lb_need=0
+for x in A B; do
+  n="$(python3 -c 'import json, sys; n = json.load(open(sys.argv[1]))["need"]; assert isinstance(n, int) and n >= 0; print(n)' \
+       "$PAIR_OUT/dry-$x/lb-need.json" 2>/dev/null)" \
+    || refuse "run $x's dry pass did not derive its LoadBalancer Services ($PAIR_OUT/dry-$x/lb-need.json): whether the pair fits STATIC_ADDRESSES is unknown; nothing was created"
+  lb_need=$(( lb_need + n ))
+done
+if ! quota_msg="$(python3 -m bench.gke gke-address-quota ${quota_args[@]+"${quota_args[@]}"} --need "$lb_need" 2>&1)"; then
+  refuse "${quota_msg#refusing: }"
+fi
+log "$quota_msg"
 eval_cmd=(python3 -m bench.custlat pair --a "$OUT_A/verdict.json" --b "$OUT_B/verdict.json"
           --a-dir "$OUT_A" --b-dir "$OUT_B"
           --replica "$REPLICA" --expect-a "$EXPECTED_IMAGE_DIGEST_A" --expect-b "$EXPECTED_IMAGE_DIGEST_B")

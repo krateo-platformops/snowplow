@@ -29,6 +29,12 @@ This module owns that lifecycle and nothing else:
     deletes its disk) before the cluster, then deletes what is left of THIS
     cluster by exact name (`backstop_disks`). GKE itself labels each PVC disk
     with the cluster's resource labels, name and id.
+  - LoadBalancer Services (#1026): gke-up refuses a run whose LoadBalancer
+    Services (bench/lb_need.py) do not fit the region's STATIC_ADDRESSES;
+    teardown deletes every LoadBalancer Service and waits for GCE to release
+    its forwarding rule and address before the cluster goes, then deletes
+    what is left of the address names it recorded from THIS cluster's
+    Services (`address_backstop`), unused ones only.
 
 Every command is built as an argv list and only EXECUTED by `execute()`,
 which honours dry-run. The unit tests drive the builders and never shell out.
@@ -735,6 +741,7 @@ def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
 # including gke-up's own teardown after a failed create.
 DEFAULT_DOWN_BUDGET_S = 900.0
 BACKSTOP_FAILED = "DISK BACKSTOP FAILED"
+ADDRESS_BACKSTOP_FAILED = "ADDRESS BACKSTOP FAILED"
 
 
 def teardown(spec: ClusterSpec, *, dry_run: bool,
@@ -742,13 +749,23 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
              budget_s: float | None = None,
              clock: Callable[[], float] = time.monotonic,
              sleep: Callable[[float], None] = time.sleep,
-             legacy_zonal: bool = False) -> list[str]:
-    """Describe → assert_deletable → release the PVC disks → delete → wait
-    for the cluster to be gone → delete this cluster's leftover disks by exact
-    name. Raises when not deletable or the delete call fails, so
-    run_with_teardown reports it. Returns the disk backstop's problems (each
-    also written to stderr as DISK BACKSTOP FAILED): the cluster is deleted,
-    but disks of it may be left.
+             legacy_zonal: bool = False,
+             record: dict | None = None,
+             lb_need: int | None = None) -> list[str]:
+    """Describe → assert_deletable → release the LoadBalancer Services →
+    release the PVC disks → delete → wait for the cluster to be gone → delete
+    this cluster's leftover disks and addresses by exact name. Raises when
+    not deletable or the delete call fails, so run_with_teardown reports it.
+    Returns the backstops' problems (each also written to stderr as DISK
+    BACKSTOP FAILED / ADDRESS BACKSTOP FAILED): the cluster is deleted, but
+    disks or addresses of it may be left.
+
+    #1026: the LoadBalancer Services go first (release_lb_services, within a
+    quarter of the budget), their address names recorded; after the delete
+    address_backstop deletes what is left of THOSE names, unused. `record`
+    (a dict) receives the teardown record: lb_services, lb_release,
+    deleted_disks, disk_problems, leaked_addresses, address_problems, and with
+    `lb_need` (what the preflight derived) lb_need_check.
 
     #895: PVC disks survive `clusters delete`. First every PVC goes and the CSI
     driver deletes its disk (release_pvc_disks, within half of the budget);
@@ -766,8 +783,19 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     manual cleanup: gke-down --legacy-zonal; run606 never passes it), on
     NotFound there it is looked up in its node zone (a zonal cluster made
     before run 17) and deleted where it was found (#899 F3)."""
+    rec = record if record is not None else {}
+    rec.update({"cluster": spec.name, "region": spec.region, "lb_need": lb_need})
     if dry_run:
         execute(describe_command(spec), dry_run=True, log=log)
+        execute(_kubectl(spec) + ["apply", "--server-side", "--field-manager=bench-teardown", "-f", "-"],
+                dry_run=True, log=log)
+        log(f"DRY-RUN: (stdin: ValidatingAdmissionPolicy {NO_NEW_LBS}, then a server-side dry-run LoadBalancer "
+            f"Service that must be denied)")
+        execute(_kubectl(spec) + ["get", "svc", "--all-namespaces", "-o", "json"], dry_run=True, log=log)
+        execute(_kubectl(spec) + ["delete", "svc", "-n", "<ns>", "<each LoadBalancer Service>", "--wait=false"],
+                dry_run=True, log=log)
+        execute(_gce_list_command("forwarding-rules", spec, ["<each recorded address name>"]), dry_run=True,
+                log=log)
         execute(_kubectl(spec) + ["apply", "--server-side", "--field-manager=bench-teardown", "-f", "-"],
                 dry_run=True, log=log)
         log(f"DRY-RUN: (stdin: ValidatingAdmissionPolicy {NO_NEW_CLAIMS}, then a server-side dry-run claim "
@@ -777,6 +805,7 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         execute(delete_command(spec), dry_run=True, log=log)
         execute(disks_list_command(spec, cluster_id="<the cluster's id, base32>",
                                    names=["<each recorded PV's disk>"]), dry_run=True, log=log)
+        execute(_gce_list_command("addresses", spec, ["<each recorded address name>"]), dry_run=True, log=log)
         return []
     location, describe = find_cluster(spec, log=log, legacy_zonal=legacy_zonal)
     assert_deletable(describe)
@@ -784,7 +813,18 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     budget = DEFAULT_DOWN_BUDGET_S if budget_s is None else budget_s
     start = clock()
     deadline = start + budget
-    # half the budget releases the PVs; the rest deletes the cluster and runs the backstop
+    # #1026: a quarter of the budget releases the LoadBalancer Services, up to half the PVs;
+    # the rest deletes the cluster and runs the backstops
+    lb = release_lb_services(spec, describe, log=log, clock=clock, sleep=sleep, deadline=start + budget / 4)
+    rec.update({"lb_services": lb["services"], "lb_release": lb["state"]})
+    if lb_need is not None and lb["services"] is not None:
+        n = len(lb["services"])
+        rec["lb_need_check"] = (f"OK: {n} LoadBalancer Service(s), the preflight derived {lb_need}" if n <= lb_need
+                                else f"UNDER-COUNTED: {n} LoadBalancer Service(s), the preflight derived only "
+                                     f"{lb_need} (bench/lb_need.py does not see what made the others)")
+        if n > lb_need:
+            log(rec["lb_need_check"])
+            sys.stderr.write(f"{rec['lb_need_check']}\n")
     recorded = release_pvc_disks(spec, describe, log=log, clock=clock, sleep=sleep,
                                  deadline=start + budget / 2)
     while True:
@@ -792,12 +832,15 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
         rc, _ = execute(delete_argv, dry_run=False, log=log, stderr_out=err)
         if rc == 0:
             problems = []
+            disk_problems: list[str] = []
+            address_problems: list[str] = []
+            rec.update({"deleted_disks": None, "leaked_addresses": None})
+            cid = cluster_id_b32(describe)
+            gone = wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep, location=location)
             try:
-                cid = cluster_id_b32(describe)
-                if wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep,
-                                     location=location):
-                    disk_backstop(spec, cluster_id=cid, recorded=recorded, log=log,
-                                  deadline=deadline, clock=clock, sleep=sleep)
+                if gone:
+                    rec["deleted_disks"] = disk_backstop(spec, cluster_id=cid, recorded=recorded, log=log,
+                                                         deadline=deadline, clock=clock, sleep=sleep)
                 else:
                     raise RuntimeError(
                         f"skipped: {spec.name} still being deleted when the {budget:g} s budget ran out, so "
@@ -805,9 +848,25 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
                         f"{' '.join(disks_list_command(spec, cluster_id=cid, names=[d['disk'] for d in recorded]))}")
             except RuntimeError as e:
                 # the cluster IS deleted; a disk possibly left over is said loudly, not as a failed delete
-                problems.append(str(e))
-                log(f"{BACKSTOP_FAILED}: {e}")
-                sys.stderr.write(f"{BACKSTOP_FAILED} for {spec.name}: {e}\n")
+                disk_problems.append(str(e))
+            if gone:
+                rec["leaked_addresses"], address_problems = address_backstop(
+                    spec, services=lb["services"], log=log, deadline=deadline, clock=clock)
+            elif lb["services"] != []:          # no LoadBalancer Service at all: nothing to check
+                names = [s["address"] for s in lb["services"] or [] if s["address"]]
+                address_problems.append(
+                    f"skipped: {spec.name} still being deleted when the {budget:g} s budget ran out, so its "
+                    f"addresses were never checked"
+                    + (f"; once it is gone list them with {' '.join(_gce_list_command('addresses', spec, names))}"
+                       if names else ""))
+            else:
+                rec["leaked_addresses"] = []
+            for tag, ps in ((BACKSTOP_FAILED, disk_problems), (ADDRESS_BACKSTOP_FAILED, address_problems)):
+                for p in ps:
+                    problems.append(p)
+                    log(f"{tag}: {p}")
+                    sys.stderr.write(f"{tag} for {spec.name}: {p}\n")
+            rec.update({"disk_problems": disk_problems, "address_problems": address_problems})
             return problems
         m = _INCOMPATIBLE_OP.search(err[-1] if err else "")
         left = deadline - clock()
@@ -1154,24 +1213,43 @@ spec:
 """
 
 
-def block_new_claims(k: list[str], *, log: Callable[[str], None], deadline: float,
-                     clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
-    """Apply NO_NEW_CLAIMS and wait — on the real condition, bounded by
-    `deadline` — until the API server refuses a new claim (a server-side
-    dry-run create is denied by this policy). True once it is in force."""
+def _kubeconfig_server(k: list[str], describe: dict, *, log: Callable[[str], None]) -> tuple[str | None,
+                                                                                               str | None]:
+    """(the bench kubeconfig's server host, the cluster's endpoint): nothing
+    in the cluster is read for the record or changed unless they are equal."""
+    rc, out = execute(k + ["config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
+                      dry_run=False, log=log)
+    return (_host(out) if rc == 0 else None), describe.get("endpoint")
+
+
+def _block_new(k: list[str], *, manifest: str, probe: str, policy: str, log: Callable[[str], None],
+               deadline: float, clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
+    """Apply `manifest` (a ValidatingAdmissionPolicy named `policy` and its
+    binding) and wait — on the real condition, bounded by `deadline` — until
+    the API server refuses `probe` (a server-side dry-run create) BY THAT
+    POLICY. True once it is in force."""
     rc, _ = execute(k + ["apply", "--server-side", "--field-manager=bench-teardown", "-f", "-"], dry_run=False,
-                    log=log, input_data=NO_NEW_CLAIMS_MANIFEST)
+                    log=log, input_data=manifest)
     if rc != 0:
         return False
     while True:
         err: list[str] = []
         rc, _ = execute(k + ["create", "--dry-run=server", "-f", "-"], dry_run=False, log=lambda _: None,
-                        input_data=NO_NEW_CLAIMS_PROBE, stderr_out=err)
-        if rc != 0 and NO_NEW_CLAIMS in (err[-1] if err else ""):
+                        input_data=probe, stderr_out=err)
+        if rc != 0 and policy in (err[-1] if err else ""):
             return True
         if clock() >= deadline:
             return False
         sleep(_POLL_S)
+
+
+def block_new_claims(k: list[str], *, log: Callable[[str], None], deadline: float,
+                     clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
+    """Apply NO_NEW_CLAIMS and wait — on the real condition, bounded by
+    `deadline` — until the API server refuses a new claim (a server-side
+    dry-run create is denied by this policy). True once it is in force."""
+    return _block_new(k, manifest=NO_NEW_CLAIMS_MANIFEST, probe=NO_NEW_CLAIMS_PROBE, policy=NO_NEW_CLAIMS,
+                      log=log, deadline=deadline, clock=clock, sleep=sleep)
 
 
 def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str], None],
@@ -1195,9 +1273,7 @@ def release_pvc_disks(spec: ClusterSpec, describe: dict, *, log: Callable[[str],
     if not isinstance(pvs, dict):
         log(f"PVC release: could not list {spec.name}'s PVs (rc={rc}); the disk backstop runs after the delete")
         return []
-    rc, out = execute(k + ["config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
-                      dry_run=False, log=log)
-    server, endpoint = _host(out) if rc == 0 else None, describe.get("endpoint")
+    server, endpoint = _kubeconfig_server(k, describe, log=log)
     if not server or not endpoint or server != endpoint:
         log(f"PVC release: refusing — the bench kubeconfig's server ({server}) is not {spec.name}'s endpoint "
             f"({endpoint}); nothing changed, the disk backstop runs after the delete")
@@ -1344,6 +1420,292 @@ def disk_backstop(spec: ClusterSpec, *, cluster_id: str | None, recorded: list[d
         sleep(_POLL_S)
 
 
+# ─── LoadBalancer Services: release before the delete, exact address backstop (#1026) ─
+#
+# Run 19 attempt 3 waited 45 min at the portal origin gate: the gateway's
+# LoadBalancer Service never got an address, "Quota 'STATIC_ADDRESSES'
+# exceeded. Limit: 8.0 in region europe-west4". All 8 were RESERVED, with no
+# users, by LoadBalancer Services of bench clusters deleted before their
+# Services. GKE's service controller (cloud-provider-gcp, the target-pool
+# NetLB; gce_loadbalancer_external.go) reserves a regional static address for
+# a LoadBalancer Service while it builds the load balancer, named like the
+# forwarding rule: cloudprovider.DefaultLoadBalancerName = "a" + the Service
+# UID without dashes, cut to 32 characters (k8s.io/cloud-provider cloud.go;
+# run 19 attempt 2's SyncLoadBalancerFailed event names
+# a7497f861f97649d0b468ac1a4bc6f2d for krateo-system/krateo-agent-gateway-
+# platform; the region's live forwarding rules carry the same shape). A
+# cluster deleted under the Service leaves it RESERVED for good.
+#
+# So, as GKE documents: every LoadBalancer Service is deleted while the
+# cluster lives — nothing may create a new one meanwhile (the agentgateway
+# controller re-creates its Gateway's Service) — and the teardown waits,
+# bounded, until the Services are gone (their load-balancer-cleanup finalizer
+# goes only once the controller released the GCE side) AND GCE lists neither
+# a forwarding rule nor an address of theirs. The address names are recorded
+# from the Services themselves first; once the cluster is gone, an address on
+# that list with no users is deleted by its exact name. Never by description
+# or pattern: another cluster's address is never named on this cluster's list.
+
+STATIC_QUOTA_METRIC = "STATIC_ADDRESSES"
+# a Service another controller balances names its GCE objects otherwise (RBS NetLB: k8s2-...)
+_LB_RBS_ANNOTATION = "cloud.google.com/l4-rbs"
+NO_NEW_LBS = "bench-teardown-no-new-loadbalancers"
+NO_NEW_LBS_MANIFEST = f"""\
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {NO_NEW_LBS}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["services"]
+  validations:
+  - expression: "!has(object.spec.type) || object.spec.type != 'LoadBalancer' || (request.operation == 'UPDATE' && has(oldObject.spec.type) && oldObject.spec.type == 'LoadBalancer')"
+    message: "bench teardown (#1026): no new LoadBalancer Service while the cluster's load balancers are released"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {NO_NEW_LBS}
+spec:
+  policyName: {NO_NEW_LBS}
+  validationActions: [Deny]
+"""
+# an existing LoadBalancer Service stays updatable (its controller removes the cleanup
+# finalizer by an UPDATE); a new one, or one turned into a LoadBalancer, is refused
+NO_NEW_LBS_PROBE = """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-teardown-probe
+  namespace: default
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+"""
+
+
+def lb_address_name(uid: str) -> str:
+    """GKE's name for a LoadBalancer Service's forwarding rule and the static
+    address it reserves: "a" + the Service UID without dashes, at most 32
+    characters (cloudprovider.DefaultLoadBalancerName)."""
+    return ("a" + uid).replace("-", "")[:32]
+
+
+def lb_services(svc_list: dict) -> list[dict]:
+    """Every LoadBalancer Service in a `kubectl get svc -A -o json`, with the
+    address name GKE gives it (None when its name is not GKE's
+    DefaultLoadBalancerName: another loadBalancerClass, or the RBS NetLB)."""
+    out = []
+    for s in svc_list.get("items") or []:
+        sp, md = s.get("spec") or {}, s.get("metadata") or {}
+        if sp.get("type") != "LoadBalancer":
+            continue
+        uid = str(md.get("uid") or "")
+        other = sp.get("loadBalancerClass") or (md.get("annotations") or {}).get(_LB_RBS_ANNOTATION) == "enabled"
+        out.append({"service": f"{md.get('namespace')}/{md.get('name')}", "uid": uid,
+                    "address": lb_address_name(uid) if uid and not other else None})
+    return sorted(out, key=lambda s: s["service"])
+
+
+def _gce_list_command(kind: str, spec: ClusterSpec, names: Iterable[str]) -> list[str]:
+    """ONE list of `kind` (forwarding-rules | addresses) in the cluster's
+    region by the exact recorded names; the caller keeps exact matches only."""
+    return ["gcloud", "compute", kind, "list", "--project", spec.project, "--regions", spec.region,
+            "--filter", f"name=({' '.join(sorted(set(names)))})", "--format", "json"]
+
+
+def _region_of_url(url) -> str:
+    return str(url or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def own_addresses(found: Iterable[dict], *, names: Iterable[str], region: str) -> list[dict]:
+    """The listed addresses that ARE on this cluster's recorded list: exact
+    name, this region. Nothing else (no description, no pattern)."""
+    want = set(names)
+    return sorted((a for a in found if a.get("name") in want and _region_of_url(a.get("region")) == region),
+                  key=lambda a: a["name"])
+
+
+# A gcloud call of the release or the address backstop is bounded per call too (gcloud has no
+# --request-timeout): by what is left until its deadline, never less than this, so one hung
+# call overruns its deadline by at most GCLOUD_CALL_MIN_S (#1037 review N1)
+GCLOUD_CALL_MIN_S = 60.0
+GCLOUD_TIMED_OUT = 124          # the rc a timed-out call reads as (timeout(1)'s)
+
+
+def _gcloud_bounded(argv: list[str], *, deadline: float, clock: Callable[[], float],
+                    log: Callable[[str], None]) -> tuple[int, str]:
+    """execute() with timeout = max(GCLOUD_CALL_MIN_S, deadline - now); a
+    call that times out answers GCLOUD_TIMED_OUT (a failed call, never an
+    empty answer)."""
+    limit = max(GCLOUD_CALL_MIN_S, deadline - clock())
+    try:
+        return execute(argv, dry_run=False, log=log, timeout=limit)
+    except subprocess.TimeoutExpired:
+        log(f"  timed out after {limit:g} s: {' '.join(argv[:4])}")
+        return GCLOUD_TIMED_OUT, ""
+
+
+def _gce_lb_left(spec: ClusterSpec, names: list[str], *, log: Callable[[str], None], deadline: float,
+                 clock: Callable[[], float]) -> list[str] | None:
+    """The forwarding rules and addresses GCE still lists under `names`, or
+    None when a list did not answer (unknown is never "released")."""
+    left = []
+    for kind in ("forwarding-rules", "addresses"):
+        rc, out = _gcloud_bounded(_gce_list_command(kind, spec, names), deadline=deadline, clock=clock,
+                                  log=lambda _: None)
+        found = _json(out) if rc == 0 else None
+        if not isinstance(found, list):
+            log(f"LB release: listing {kind} by name failed (rc={rc})")
+            return None
+        left += [f"{kind[:-1]} {a['name']}" for a in own_addresses(found, names=names, region=spec.region)]
+    return left
+
+
+def release_lb_services(spec: ClusterSpec, describe: dict, *, log: Callable[[str], None],
+                        deadline: float, clock: Callable[[], float],
+                        sleep: Callable[[float], None]) -> dict:
+    """Before the cluster goes: refuse every new LoadBalancer Service
+    (NO_NEW_LBS, verified by a denied dry-run), record every LoadBalancer
+    Service with its address name, delete them, and wait — bounded by
+    `deadline` — until they are gone and GCE lists none of their forwarding
+    rules or addresses. Nothing is read or changed unless the bench
+    kubeconfig's server IS this cluster's endpoint.
+
+    Returns {"services": [...] | None (unknown: the address backstop cannot
+    run), "state": what happened}. Best effort, like the PVC release: what is
+    left is the address backstop's, after the delete."""
+    k = _kubectl(spec)
+    server, endpoint = _kubeconfig_server(k, describe, log=log)
+    if not server or not endpoint or server != endpoint:
+        why = (f"the bench kubeconfig's server ({server}) is not {spec.name}'s endpoint ({endpoint}): "
+               f"its LoadBalancer Services were not read")
+        log(f"LB release: refusing — {why}")
+        return {"services": None, "state": f"not read: {why}"}
+    # first nothing may create one (a controller re-creating a deleted Service makes a new
+    # address under a new name), then the record: it holds every Service there can be
+    guard = _block_new(k, manifest=NO_NEW_LBS_MANIFEST, probe=NO_NEW_LBS_PROBE, policy=NO_NEW_LBS,
+                       log=log, deadline=deadline, clock=clock, sleep=sleep)
+    rc, out = execute(k + ["get", "svc", "--all-namespaces", "-o", "json"], dry_run=False, log=log)
+    lst = _json(out) if rc == 0 else None
+    if not isinstance(lst, dict):
+        why = f"could not list {spec.name}'s Services (rc={rc})"
+        log(f"LB release: {why}")
+        return {"services": None, "state": f"not read: {why}"}
+    svcs = lb_services(lst)
+    log(f"LB release: {len(svcs)} LoadBalancer Service(s): "
+        + (", ".join(f"{s['service']}={s['address'] or '<not a GKE DefaultLoadBalancerName>'}" for s in svcs)
+           or "none"))
+    if not svcs:
+        return {"services": [], "state": "none"}
+    if not guard:
+        msg = (f"LB release REFUSED: the API server of {spec.name} does not yet refuse new LoadBalancer "
+               f"Services ({NO_NEW_LBS}); deleting them now would let their controllers re-create them, each "
+               f"with a NEW address. None deleted; the address backstop runs after the delete")
+        log(msg)
+        sys.stderr.write(msg + "\n")
+        return {"services": svcs, "state": "refused: new LoadBalancer Services not refused"}
+    for s in svcs:
+        ns, name = s["service"].split("/", 1)
+        execute(k + ["delete", "svc", "-n", ns, name, "--wait=false"], dry_run=False, log=log)
+    uids = {s["uid"] for s in svcs}
+    names = [s["address"] for s in svcs if s["address"]]
+    while True:
+        rc, out = execute(k + ["get", "svc", "--all-namespaces", "-o", "json"], dry_run=False,
+                          log=lambda _: None)
+        cur = _json(out) if rc == 0 else None
+        left = sorted(f"{(x.get('metadata') or {}).get('namespace')}/{(x.get('metadata') or {}).get('name')}"
+                      for x in (cur.get("items") or []) if (x.get("metadata") or {}).get("uid") in uids) \
+            if isinstance(cur, dict) else ["<unlisted>"]
+        gce = (_gce_lb_left(spec, names, log=log, deadline=deadline, clock=clock) if names else []) \
+            if not left else None
+        if gce == []:
+            log(f"LB release: the {len(svcs)} LoadBalancer Service(s) are gone and GCE lists none of their "
+                f"forwarding rules or addresses")
+            return {"services": svcs, "state": "released"}
+        if clock() >= deadline:
+            what = ", ".join(left) if left else ("GCE " + ", ".join(gce) if gce else "GCE unlisted")
+            log(f"LB release: still there at the budget's end ({what}); the address backstop runs after the delete")
+            return {"services": svcs, "state": f"not released: {what}"}
+        sleep(_POLL_S)
+
+
+def address_backstop(spec: ClusterSpec, *, services: list[dict] | None, log: Callable[[str], None],
+                     deadline: float = 0.0, clock: Callable[[], float] = time.monotonic
+                     ) -> tuple[list[dict], list[str]]:
+    """After the cluster is gone: list the region's addresses by the names
+    recorded from this cluster's LoadBalancer Services, delete those with no
+    users by exact name, and list again. Returns (leaked, problems): every
+    recorded address that was still there, each with `deleted`; problems is
+    empty only when none is left (a leak never reads as success). An address
+    with users is never deleted. Each gcloud call is bounded (_gcloud_bounded:
+    what is left until `deadline`, at least GCLOUD_CALL_MIN_S)."""
+    if services is None:
+        return [], [f"{spec.name}'s LoadBalancer Services were never read, so their address names are unknown: "
+                    f"whether one is left RESERVED is unknown (list the region's addresses with no users)"]
+    problems = [f"{s['service']}: its address is not named by GKE's DefaultLoadBalancerName, so it was not "
+                f"swept" for s in services if not s["address"]]
+    by_name = {s["address"]: s["service"] for s in services if s["address"]}
+    if not by_name:
+        log(f"address backstop: no recorded LoadBalancer address of {spec.name} to look for")
+        return [], problems
+    argv = _gce_list_command("addresses", spec, by_name)
+    rc, out = _gcloud_bounded(argv, deadline=deadline, clock=clock, log=log)
+    found = _json(out) if rc == 0 else None
+    if not isinstance(found, list):
+        return [], problems + [f"listing {spec.name}'s addresses failed (rc={rc}): whether any is left is "
+                               f"unknown; run {' '.join(argv)}"]
+    mine = own_addresses(found, names=by_name, region=spec.region)
+    leaked = [{"name": a["name"], "service": by_name[a["name"]], "status": a.get("status"),
+               "users": list(a.get("users") or []), "deleted": False} for a in mine]
+    free = [x["name"] for x in leaked if not x["users"]]
+    if free:
+        log(f"address backstop: deleting {len(free)} leftover address(es) of {spec.name}, by name: "
+            + ", ".join(f"{n} ({by_name[n]})" for n in free))
+        drc, _ = _gcloud_bounded(["gcloud", "compute", "addresses", "delete", *free, "--region", spec.region,
+                                  "--project", spec.project, "--quiet"], deadline=deadline, clock=clock, log=log)
+        rc, out = _gcloud_bounded(argv, deadline=deadline, clock=clock, log=log)   # verified, never assumed
+        again = _json(out) if rc == 0 else None
+        still = ({a["name"] for a in own_addresses(again, names=by_name, region=spec.region)}
+                 if isinstance(again, list) else None)
+        for x in leaked:
+            x["deleted"] = still is not None and x["name"] in free and x["name"] not in still
+        if still is None:
+            problems.append(f"the list after deleting {', '.join(free)} failed (rc={rc}): whether they are gone "
+                            f"is unknown; run {' '.join(argv)}")
+        elif still & set(free):
+            problems.append(f"deleting {', '.join(sorted(still & set(free)))} (rc={drc}) left them there: "
+                            f"delete them by hand (gcloud compute addresses delete ... --region {spec.region})")
+    for x in leaked:
+        if x["users"]:
+            problems.append(f"{x['name']} ({x['service']}) is still used by {', '.join(x['users'])}: not deleted")
+    if not leaked:
+        log(f"address backstop: verified, none of the {len(by_name)} recorded address(es) of {spec.name} is left")
+    return leaked, problems
+
+
+def address_quota_fit(region: dict, need: int) -> tuple[bool, str]:
+    """Do `need` LoadBalancer Services' static addresses fit the region's
+    STATIC_ADDRESSES (limit - usage)?"""
+    q = next((x for x in region.get("quotas") or [] if x.get("metric") == STATIC_QUOTA_METRIC), None)
+    if q is None or q.get("limit") is None or q.get("usage") is None:
+        return False, f"{STATIC_QUOTA_METRIC} not in the region's quotas: whether the run fits is unknown"
+    free = float(q["limit"]) - float(q["usage"])
+    msg = (f"{STATIC_QUOTA_METRIC} in {region.get('name')}: {q['usage']:g} of {q['limit']:g} used, {free:g} free; "
+           f"the run creates {need} LoadBalancer Service(s), each needs one while GKE builds its load balancer")
+    return free >= need, msg
+
+
+ADDRESS_REFUSAL_HINT = ("Free STATIC_ADDRESSES first (leaked addresses are RESERVED with no users: gcloud compute "
+                        "addresses list --filter='status=RESERVED'; delete only those whose Service is gone)")
+
+
 def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float,
                       clock: Callable[[], float], sleep: Callable[[float], None],
                       location: str | None = None) -> bool:
@@ -1402,6 +1764,20 @@ def cmd_gke_up(a) -> int:
             sys.stderr.write(f"refusing: {msg}. Free SSD_TOTAL_GB first (leaked PVC disks: "
                              f"gcloud compute disks list --filter='labels.created-by=bench-gke'), nothing "
                              f"was created\n")
+            return 2
+        print(msg)
+        # #1026: one regional static address per LoadBalancer Service the run's install creates
+        # (run 19 attempt 3 waited 45 min for one): the number is derived from the install
+        # (bench/lb_need.py), never assumed
+        need_lb = getattr(a, "address_need", None)
+        if need_lb is None:
+            ok, msg = False, ("the number of LoadBalancer Services this run creates was not given "
+                              "(--address-need, from bench.lb_need): whether the run fits "
+                              f"{STATIC_QUOTA_METRIC} is unknown")
+        else:
+            ok, msg = address_quota_fit(region if isinstance(region, dict) else {}, need_lb)
+        if not ok:
+            sys.stderr.write(f"refusing: {msg}. {ADDRESS_REFUSAL_HINT}; nothing was created\n")
             return 2
         print(msg)
         # #985: GKE's per-location cluster limit, read (run 18 hit it ~19 s in)
@@ -1473,16 +1849,33 @@ EXIT_BACKSTOP_FAILED = 4
 EXIT_NOTHING_TO_DELETE = 5
 
 
+def _write_record(path: str | None, rec: dict) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "w") as fh:
+            json.dump(rec, fh, indent=1)
+    except OSError as e:
+        sys.stderr.write(f"gke-down: the teardown record could not be written to {path} ({e.strerror})\n")
+
+
 def cmd_gke_down(a) -> int:
     spec = default_spec(a.name, project=a.project, zone=a.zone)
+    rec: dict = {"dry_run": not a.yes}
     try:
-        problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s, legacy_zonal=a.legacy_zonal)
+        problems = teardown(spec, dry_run=not a.yes, budget_s=a.budget_s, legacy_zonal=a.legacy_zonal,
+                            record=rec, lb_need=getattr(a, "lb_need", None))
     except ClusterNotFound as e:
         sys.stderr.write(f"gke-down: {e}\n")
+        _write_record(getattr(a, "record", None), dict(rec, outcome="nothing to delete"))
         return EXIT_NOTHING_TO_DELETE
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
+        _write_record(getattr(a, "record", None), dict(rec, outcome=f"failed: {type(e).__name__}"))
         return 1
+    _write_record(getattr(a, "record", None),
+                  dict(rec, outcome="dry run" if not a.yes else ("deleted, backstop failed" if problems
+                                                                 else "deleted")))
     return EXIT_BACKSTOP_FAILED if problems else 0
 
 
@@ -1514,6 +1907,20 @@ def cmd_gke_ssd_quota(a) -> int:
     # no "refusing:" prefix: the caller (run606_pair.sh) says it once
     print(msg + f" ({a.runs} bench cluster(s) x {BENCH_PVC_FOOTPRINT_GB} GB)",
           file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 2
+
+
+def cmd_gke_address_quota(a) -> int:
+    """#1026: run606_pair.sh, before two clusters start at once: both runs'
+    LoadBalancer Services (each run's dry pass derived its own) must fit the
+    region's STATIC_ADDRESSES."""
+    rc, out = execute(ssd_quota_command(a.project, a.zone), dry_run=False, log=lambda _: None)
+    region = _json(out) if rc == 0 else None
+    ok, msg = address_quota_fit(region if isinstance(region, dict) else {}, a.need)
+    if rc != 0:
+        ok, msg = False, f"could not read the region's quotas (rc={rc}): whether the runs fit is unknown"
+    # no "refusing:" prefix: the caller (run606_pair.sh) says it once
+    print(msg if ok else f"{msg}. {ADDRESS_REFUSAL_HINT}", file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 2
 
 
@@ -1618,6 +2025,9 @@ def add_parsers(sub) -> None:
     up.add_argument("--ssd-need-gb", type=float, default=BENCH_PVC_FOOTPRINT_GB,
                     help=f"#895: PVC disk the run needs free in SSD_TOTAL_GB (one bench cluster: "
                          f"{BENCH_PVC_FOOTPRINT_GB})")
+    up.add_argument("--address-need", type=int, default=None,
+                    help="#1026: the LoadBalancer Services the run's install creates (bench.lb_need), each needs "
+                         "a regional static address (STATIC_ADDRESSES); required with --yes")
     up.set_defaults(func=cmd_gke_up)
 
     shape = sub.add_parser("gke-shape", help="the cluster-shape record of a run: read back from GKE "
@@ -1641,6 +2051,15 @@ def add_parsers(sub) -> None:
     cq.add_argument("--runs", type=int, default=1)
     cq.set_defaults(func=cmd_gke_cluster_quota)
 
+    aq = sub.add_parser("gke-address-quota", help="#1026: exit 2 unless NEED LoadBalancer Services' static "
+                                                   "addresses fit the region's STATIC_ADDRESSES (a read; "
+                                                   "nothing is created)")
+    aq.add_argument("--project", default=DEFAULT_PROJECT)
+    aq.add_argument("--zone", default=DEFAULT_ZONE)
+    aq.add_argument("--need", type=int, required=True,
+                    help="the LoadBalancer Services the runs create, together (bench.lb_need per run)")
+    aq.set_defaults(func=cmd_gke_address_quota)
+
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")
     common(down)
@@ -1651,6 +2070,12 @@ def add_parsers(sub) -> None:
     down.add_argument("--legacy-zonal", action="store_true",
                       help="manual cleanup only (run606 never passes it): when the region answers NotFound, "
                            "look for a zonal bench cluster made before run 17 in --zone and delete it there")
+    down.add_argument("--record", default=None,
+                      help="#1026: write the teardown record (JSON) here: the LoadBalancer Services and their "
+                           "release, deleted_disks, leaked_addresses, the backstops' problems")
+    down.add_argument("--lb-need", type=int, default=None,
+                      help="#1026: the LoadBalancer Services the preflight derived (bench.lb_need); the record "
+                           "says UNDER-COUNTED when the cluster had more")
     down.set_defaults(func=cmd_gke_down)
 
     reap = sub.add_parser("gke-reap", help="#606: delete bench clusters past "

@@ -143,7 +143,11 @@ def test_an_operation_still_blocking_when_the_budget_is_spent_fails(fakegke, mon
 
 def test_gke_down_passes_the_budget(fakegke, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
-    assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "60", "--yes"]) == 0
+    # #1026: deleted (exit 4, not 1); this fake cluster has no endpoint to match the bench
+    # kubeconfig, so its LoadBalancer Services were never read: whether an address is left is unknown
+    assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "60", "--yes"]) == gke.EXIT_BACKSTOP_FAILED
+    err = capsys.readouterr().err
+    assert f"{gke.ADDRESS_BACKSTOP_FAILED} for {SPEC.name}" in err and gke.BACKSTOP_FAILED not in err
     assert f"wait {OP1} {SPEC.project} {SPEC.region}" in _calls(fakegke)
     # and honours it: an operation that outlasts --budget-s fails gke-down, fast
     (fakegke / "calls").unlink()
