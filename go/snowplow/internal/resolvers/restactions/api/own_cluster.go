@@ -26,9 +26,18 @@ import (
 // such a stage is never answered from this cluster's cells, informers or
 // ServiceAccount: it is sent to the endpoint it names.
 //
+// Precedence follows where the stage's calls actually go: a userAccessFilter
+// stage always dials the ServiceAccount endpoint (resolveStageEndpoint checks
+// it before the endpointRef), so it targets this cluster even when it names an
+// endpointRef.
+//
 // PROVENANCE, never endpoint shape: a named ref whose Secret happens to point
 // at this cluster's apiserver is not recognised as this cluster. That costs it
 // the cache, never a correct answer.
+//
+// The mark is per stage and set to the stage's own value, true or false
+// (credhttp.WithHeldCredentialValue): a nested resolve (resolve: true) runs on
+// a ctx derived from the outer stage's, and must not inherit it (#1019 review).
 func targetsOwnCluster(ctx context.Context) bool {
 	return credhttp.HeldCredential(ctx)
 }

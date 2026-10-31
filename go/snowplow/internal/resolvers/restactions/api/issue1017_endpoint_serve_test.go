@@ -83,7 +83,11 @@ func newSrv1017(t *testing.T, cluster string) *srv1017 {
 	s := &srv1017{}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
-		s.reqs = append(s.reqs, r.Method+" "+r.URL.Path+" auth="+r.Header.Get("Authorization"))
+		req := r.Method + " " + r.URL.Path + " auth=" + r.Header.Get("Authorization")
+		if acting := r.Header.Get("Impersonate-User"); acting != "" {
+			req += " acting=" + acting
+		}
+		s.reqs = append(s.reqs, req)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if name, ok := strings.CutPrefix(r.URL.Path, "/api/v1/namespaces/"+ns1017+"/secrets/"); ok {
@@ -540,5 +544,69 @@ func TestIssue1017_R5_AnOwnClusterStageStillLazyRegisters(t *testing.T) {
 	defer mu.Unlock()
 	if len(hops) != 1 || hops[0] != "widgets.krateo.io" {
 		t.Fatalf("#1017 R5 RED: an own-cluster stage did not run the lazy-register discovery hop for its group (hops %v)", hops)
+	}
+}
+
+// --- #1019 review F1/F2: the per-stage marks are set, never inherited -------
+
+// TestR1019_N1_NestedRemoteStageInheritsNoOwnClusterMark (reviewer's arm N1,
+// adopted): an own-cluster resolve:true stage hands its ctx to the nested
+// resolve; a nested stage whose endpointRef names another cluster must still
+// be answered by that cluster. RED when runStage only ADDS the own-cluster
+// mark (the inherited true survives the nested named-ref stage).
+func TestR1019_N1_NestedRemoteStageInheritsNoOwnClusterMark(t *testing.T) {
+	ctx, local, remote := setup1017(t)
+	var inner string
+	prev := nestedCallResolver
+	nestedCallResolver = func(nctx context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
+		// what ResolveNestedCall does: resolve the inner RA under a ctx derived from nctx
+		inner = resolve1017(t, nctx, local.srv.URL, remoteStage1017("innerRemote", path1017))
+		b, _ := json.Marshal(map[string]any{"kind": "RESTAction", "status": map[string]any{"inner": json.RawMessage(inner)}})
+		return b, nil
+	}
+	t.Cleanup(func() { nestedCallResolver = prev })
+	r0 := remote.n()
+	_ = resolve1017(t, ctx, local.srv.URL, &templates.API{Name: "outer", Path: path1017 + "/widget-team-a",
+		Resolve: ptr.To(true), ContinueOnError: ptr.To(true), ErrorKey: ptr.To("outerErr")})
+	if inner == "" {
+		t.Fatal("setup: the outer own-cluster stage did not resolve in process")
+	}
+	wantRemote1017(t, "N1 (nested resolve inherits the outer own-cluster mark)", inner, remote, r0)
+}
+
+// TestR1019_N1c_TopLevelRemoteStageControl (reviewer's control N1c, adopted):
+// the same inner stage at the top level is answered by the remote.
+func TestR1019_N1c_TopLevelRemoteStageControl(t *testing.T) {
+	ctx, local, remote := setup1017(t)
+	r0 := remote.n()
+	got := resolve1017(t, ctx, local.srv.URL, remoteStage1017("innerRemote", path1017))
+	wantRemote1017(t, "N1c", got, remote, r0)
+}
+
+// TestR1019_N2_NestedRemoteStageInheritsNoServiceAccountDialMark: an outer
+// stage that dials snowplow's ServiceAccount (a background driver's
+// no-endpointRef stage) marks its dispatch ctx as an SA dial, and a
+// resolve:true nested resolve runs its stages on a ctx derived from it. The
+// arm hands a stage exactly that inherited mark: a stage with its own named
+// endpointRef must still dial its endpoint with ITS credential, so the remote
+// receives one request carrying the remote endpoint's own token. RED when
+// runStage only ADDS the SA-dial mark (the inherited true survives: the
+// stage's credential is replaced by the ServiceAccount's file token path and
+// its own Authorization dropped).
+func TestR1019_N2_NestedRemoteStageInheritsNoServiceAccountDialMark(t *testing.T) {
+	ctx, local, remote := setup1017(t)
+	inherited := cache.WithServiceAccountDial(ctx) // what an outer SA stage's gctx carries
+	// The remote API expects a header the stage declares; on an SA dial
+	// snowplow drops a stage's Impersonate-* and Authorization headers
+	// (#615/#725), so it survives only if the stage is NOT read as an SA dial.
+	stage := remoteStage1017("innerRemote", path1017)
+	stage.Headers = []string{"Impersonate-User: remote-operator"}
+	r0 := remote.n()
+	got := resolve1017(t, inherited, local.srv.URL, stage)
+	remote.mu.Lock()
+	reqs := append([]string(nil), remote.reqs[r0:]...)
+	remote.mu.Unlock()
+	if len(reqs) != 1 || !strings.HasSuffix(reqs[0], "auth=Bearer remote-tok acting=remote-operator") {
+		t.Fatalf("#1019 N2 RED: a stage on a ctx carrying an inherited SA-dial mark was dialled as the SA (its own declared headers dropped): remote requests %v (result %s)", reqs, got)
 	}
 }

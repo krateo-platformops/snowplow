@@ -1755,10 +1755,11 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #1017 — the same provenance is what targetsOwnCluster reads: marked once
 	// here, before the plan, so the collapse and the lazy register see it as
 	// the dispatch does (gctx derives from provCtx below).
-	provCtx := r.ctx
-	if heldCred {
-		provCtx = credhttp.WithHeldCredential(provCtx)
-	}
+	// #1019 review F1 — set to THIS stage's provenance, true or false, never
+	// inherited: a nested resolve (resolve: true) runs its stages on a ctx
+	// derived from the outer stage's, and a nested named-ref stage must not
+	// read as held because its outer stage was.
+	provCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active
 	// the SA endpoint carries the SA token (no user-bearer override needed);
@@ -1910,12 +1911,13 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// endpoint is snowplow's own SA endpoint (isSA, from resolveStageEndpoint:
 	// the ctx-carried internal endpoint or the UAF SA endpoint), mark the per-stage
 	// dispatch ctx so httpClientForEndpoint threads the SA token FILE (self-reloading,
-	// #267) rather than a read-once static token. Per-stage granularity: a non-SA
-	// (per-user clientconfig / named-ref) stage's gctx is never marked. Only ADDS a
-	// ctx value — g's Done channel (errgroup cancellation) is preserved.
-	if isSA {
-		gctx = cache.WithServiceAccountDial(gctx)
-	}
+	// #267) rather than a read-once static token. Per-stage granularity: the mark
+	// is SET to this stage's isSA, true or false, never inherited (#1019 review
+	// F2): a nested resolve's stages run on a ctx derived from the outer stage's,
+	// and a nested stage with its own endpoint must not dial as the SA (its own
+	// Authorization dropped, then refused at branch E). Only a ctx value — g's
+	// Done channel (errgroup cancellation) is preserved.
+	gctx = cache.WithServiceAccountDialValue(gctx, isSA)
 	// #710 — the owning RESTAction and stage name a content fill (pprof labels,
 	// by_ra). Once per stage, not per call: a content HIT pays nothing for it.
 	gctx = withContentFillOwner(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, id)
