@@ -669,12 +669,12 @@
         },
         "OTEL_TRACES_SAMPLER": {
           "type": "string",
-          "description": "OTel SDK sampler family. Ship \"traceidratio\" (snowplow's own root decision). NOT \"parentbased_traceidratio\": the agent gateway samples 100% and propagates sampled=1, so a parent-based sampler would span 100% of customer /call.",
+          "description": "OTel SDK sampler (#1013). Ships \"parentbased_always_on\": the platform API SLIs are counts over snowplow's Server spans, so every request's span is kept. Root spans are always sampled; a span with a traceparent follows the parent's sampled flag, so once the gateway samples at its edge (installer#402) a request it drops gets no snowplow span.",
           "title": "OTEL Traces Sampler"
         },
         "OTEL_TRACES_SAMPLER_ARG": {
           "type": "string",
-          "description": "Sampling ratio for OTEL_TRACES_SAMPLER (\"0.05\" = 5% of root traces). The SDK default with no sampler is 100% \u2014 always set together with OTEL_ENABLED.",
+          "description": "Sampling ratio, read only by the ratio samplers (traceidratio, parentbased_traceidratio; \"0.05\" = 5%). Unset by default: parentbased_always_on takes no argument.",
           "title": "OTEL Traces Sampler Arg"
         },
         "OTEL_LOGS_ENABLED": {

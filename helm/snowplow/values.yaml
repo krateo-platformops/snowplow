@@ -311,16 +311,18 @@ env:
   # http://otel-collector-daemonset-opentelemetry-collector.<ns>.svc.cluster.local:4318
   # and $(HOST_IP) simply goes unused.
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://$(HOST_IP):4318"
-  # SAMPLER FAMILY — read before changing. "traceidratio" makes snowplow's
-  # OWN root decision. NOT "parentbased_traceidratio": snowplow sits behind
-  # the agent gateway whose tracing policy samples 100% and propagates
-  # sampled=1, so a parent-based sampler would span 100% of customer
-  # /call — exactly the traffic the ratio is meant to bound. Trade: 5%
-  # complete end-to-end traces + 95% gateway-only traces, partial BY
-  # DESIGN. The SDK default with no sampler is 100%, so these two ship
-  # together with OTEL_ENABLED — never flip one without the other.
-  OTEL_TRACES_SAMPLER: "traceidratio"
-  OTEL_TRACES_SAMPLER_ARG: "0.05"
+  # SAMPLER — read before changing (#1013, Diego's ruling 2026-10-30). The
+  # platform API SLIs (availability, p95) are computed over snowplow's
+  # Server spans and are COUNTS, so every request's span must be kept:
+  # "parentbased_always_on" samples every root span (no traceparent) and
+  # follows the parent's sampled flag otherwise. Behind the agent gateway
+  # (randomSampling "100", propagates sampled=1) that is 100% of requests.
+  # Once the gateway samples at its edge (installer#402) a dropped request
+  # arrives with sampled=0 and gets NO snowplow span; see
+  # internal/tracing/tracing.go SAMPLING for the three remedies. No
+  # OTEL_TRACES_SAMPLER_ARG: parentbased_always_on takes none. Installer
+  # override: componentValues.snowplow.env.OTEL_TRACES_SAMPLER.
+  OTEL_TRACES_SAMPLER: "parentbased_always_on"
   # Explicit override DOWN from the master: the collector agent's logs
   # pipeline accepts filelog only (no OTLP logs receiver), so an OTLP log
   # export has no consumer. Logs stay stdout → filelog as for every other

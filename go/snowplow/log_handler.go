@@ -73,8 +73,8 @@ func buildLogHandler(prettyLog bool, level slog.Level, w io.Writer) slog.Handler
 // SpanContextFromContext returns an invalid context, nothing is appended,
 // and the record is byte-identical to the pre-1.12.4 emission. The F6
 // byte-identity arm pins that. Note that a span context is VALID (and
-// the ids are stamped) even when the sampler dropped the span: at
-// traceidratio 0.05, 100% of request records still carry the request's
+// the ids are stamped) even when the sampler dropped the span: under
+// any sampler, ratio or parent-based, 100% of request records carry the request's
 // trace_id — which is what lets an operator group one request's log
 // lines together whether or not its trace was exported.
 //

@@ -66,9 +66,18 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
 
 - **Traces** (`internal/tracing/tracing.go` `Setup`): registers a global
   TracerProvider + the W3C trace-context/baggage propagators; the whole mux is
-  wrapped in `otelhttp.NewHandler` (no-op spans when disabled). The CORS
-  options in `main.go` allow the browser to send
-  `traceparent`/`tracestate`/`baggage`.
+  wrapped in `tracing.NewServerHandler` (`internal/tracing/server.go`, over
+  `otelhttp`; no-op spans when disabled). **#1013 server-span contract** (the
+  platform API SLIs read it): exactly one span per served request with
+  `SpanKind='Server'`, `ServiceName='snowplow'`, name `<METHOD> <route>`
+  (`GET /call`, `POST /call/read`, `GET /export`, `GET /refreshes`, …; just
+  `<METHOD>` for a request no route serves), `http.route` = the templated mux
+  pattern (never the raw path; `url.path` is dropped from Server spans at
+  export), `http.request.method`, `http.response.status_code`, status `Error`
+  only for 5xx. `/health`, `/readyz` and `/debug/*` get no span. Sampled at
+  100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
+  `docs/configuration.md`). The CORS options in `main.go` allow the browser
+  to send `traceparent`/`tracestate`/`baggage`.
 - **Metrics** (`internal/metrics/metrics.go` `Setup`): an **OTLP mirror of the
   expvar surface** — observable instruments read the same live counter
   snapshots the expvar closures read (families: fallthrough, dispatch L1,
