@@ -16,22 +16,24 @@ var (
 	requestsDroppedRate   atomic.Uint64 // 429: the user's limit
 	requestsDroppedType   atomic.Uint64 // 415: not application/json
 	requestsDroppedFormat atomic.Uint64 // 400: not OTLP/JSON
+	requestsDroppedBusy   atomic.Uint64 // 429: every decode slot (all users) in use
 
-	spansAccepted        atomic.Uint64 // passed the allowlist
-	spansDroppedService  atomic.Uint64
-	spansDroppedName     atomic.Uint64
-	spansDroppedInvalid  atomic.Uint64
-	attributesDropped    atomic.Uint64
-	spansForwarded       atomic.Uint64 // the collector answered 2xx
-	spansForwardFailed   atomic.Uint64 // the collector failed or answered non-2xx
-	spansForwardOverflow atomic.Uint64 // the forward queue was full: dropped without blocking
+	spansAccepted           atomic.Uint64 // passed the allowlist
+	spansDroppedService     atomic.Uint64
+	spansDroppedName        atomic.Uint64
+	spansDroppedInvalid     atomic.Uint64
+	attributesDropped       atomic.Uint64
+	spansForwarded          atomic.Uint64 // the collector answered 2xx
+	spansForwardFailed      atomic.Uint64 // the collector failed or answered non-2xx
+	spansForwardOverflow    atomic.Uint64 // the forward queue was full: dropped without blocking
+	spansForwardRateLimited atomic.Uint64 // over the global spans/s cap: not forwarded, 429
 )
 
 // Snapshot is a point-in-time read of every counter, keyed by the outcome
 // label the OTLP mirror publishes.
 type Snapshot struct {
-	Requests   map[string]uint64 // accepted, dropped_auth, dropped_size, dropped_rate, dropped_content_type, dropped_malformed
-	Spans      map[string]uint64 // accepted, dropped_service, dropped_name, dropped_invalid, forwarded, forward_failed, forward_overflow
+	Requests   map[string]uint64 // accepted, dropped_auth, dropped_size, dropped_rate, dropped_content_type, dropped_malformed, dropped_busy
+	Spans      map[string]uint64 // accepted, dropped_service, dropped_name, dropped_invalid, forwarded, forward_failed, forward_overflow, forward_rate_limited
 	Attributes uint64            // span attributes dropped by the allowlist
 }
 
@@ -45,15 +47,17 @@ func Read() Snapshot {
 			"dropped_rate":         requestsDroppedRate.Load(),
 			"dropped_content_type": requestsDroppedType.Load(),
 			"dropped_malformed":    requestsDroppedFormat.Load(),
+			"dropped_busy":         requestsDroppedBusy.Load(),
 		},
 		Spans: map[string]uint64{
-			"accepted":         spansAccepted.Load(),
-			"dropped_service":  spansDroppedService.Load(),
-			"dropped_name":     spansDroppedName.Load(),
-			"dropped_invalid":  spansDroppedInvalid.Load(),
-			"forwarded":        spansForwarded.Load(),
-			"forward_failed":   spansForwardFailed.Load(),
-			"forward_overflow": spansForwardOverflow.Load(),
+			"accepted":             spansAccepted.Load(),
+			"dropped_service":      spansDroppedService.Load(),
+			"dropped_name":         spansDroppedName.Load(),
+			"dropped_invalid":      spansDroppedInvalid.Load(),
+			"forwarded":            spansForwarded.Load(),
+			"forward_failed":       spansForwardFailed.Load(),
+			"forward_overflow":     spansForwardOverflow.Load(),
+			"forward_rate_limited": spansForwardRateLimited.Load(),
 		},
 		Attributes: attributesDropped.Load(),
 	}

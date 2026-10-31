@@ -22,25 +22,23 @@ func (f filtered) rejected() int { return f.droppedService + f.droppedName + f.d
 // a NEW tracepb.Span populated field by field from the allowlisted inputs.
 func filter(req *exportRequest) filtered {
 	var f filtered
-	for _, rs := range req.ResourceSpans {
-		service := resourceServiceName(rs.Resource.Attributes)
-		for _, ss := range rs.ScopeSpans {
-			for i := range ss.Spans {
-				in := &ss.Spans[i]
-				switch {
-				case service != ServiceName:
-					f.droppedService++
-				case !SpanNames[in.Name]:
-					f.droppedName++
-				default:
-					out, dropped, ok := buildSpan(in)
-					if !ok {
-						f.droppedInvalid++
-						continue
-					}
-					f.droppedAttrs += dropped
-					f.spans = append(f.spans, out)
+	for _, rs := range req.resources {
+		service := resourceServiceName(rs.attributes)
+		for i := range rs.spans {
+			in := &rs.spans[i]
+			switch {
+			case service != ServiceName:
+				f.droppedService++
+			case !SpanNames[in.Name]:
+				f.droppedName++
+			default:
+				out, dropped, ok := buildSpan(in)
+				if !ok {
+					f.droppedInvalid++
+					continue
 				}
+				f.droppedAttrs += dropped
+				f.spans = append(f.spans, out)
 			}
 		}
 	}
@@ -72,7 +70,7 @@ func buildSpan(in *span) (out *tracepb.Span, dropped int, ok bool) {
 	if _, known := tracepb.Span_SpanKind_name[in.Kind]; !known {
 		return nil, 0, false
 	}
-	if _, known := tracepb.Status_StatusCode_name[in.Status.Code]; !known {
+	if _, known := tracepb.Status_StatusCode_name[in.StatusCode]; !known {
 		return nil, 0, false
 	}
 
@@ -96,7 +94,7 @@ func buildSpan(in *span) (out *tracepb.Span, dropped int, ok bool) {
 		StartTimeUnixNano: start,
 		EndTimeUnixNano:   end,
 		Attributes:        attrs,
-		Status:            &tracepb.Status{Code: tracepb.Status_StatusCode(in.Status.Code)},
+		Status:            &tracepb.Status{Code: tracepb.Status_StatusCode(in.StatusCode)},
 	}, dropped, true
 }
 

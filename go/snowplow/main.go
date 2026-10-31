@@ -139,6 +139,23 @@ func newServerHandler(mux *http.ServeMux) http.Handler {
 	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(middleware.Gzip(mux), mux))
 }
 
+// newRUMIngest returns #1015's ingest, with its forwarder's worker running
+// until ctx is done, when rum.CollectorURL enables it: tracing on
+// (OTEL_TRACING_ENABLED, defaulting to OTEL_ENABLED) AND a collector endpoint
+// set (Diego, 2026-10-30: on whenever tracing is on, no switch of its own).
+// Otherwise it returns a nil http.Handler, which mountTelemetryRoute mounts as
+// a 404. It is a function so the default-off contract is tested through the
+// code main runs (TestS1015_DefaultOffContract).
+func newRUMIngest(ctx context.Context) http.Handler {
+	url, ok := rum.CollectorURL()
+	if !ok {
+		return nil // an untyped nil: a typed (*rum.Ingest)(nil) would mount as "enabled"
+	}
+	fwd := rum.NewForwarder(url)
+	fwd.Start(ctx)
+	return rum.NewIngest(fwd)
+}
+
 // mountTelemetryRoute mounts #1015's browser RUM ingest, POST
 // /telemetry/v1/traces, and registers it as a scoped route (scope telemetry,
 // listed in requiredScopedRoutes).
@@ -1358,15 +1375,9 @@ func main() {
 	// On only under the OTel trace contract with a collector endpoint
 	// (rum.CollectorURL); off, the route answers 404. The forwarder's worker
 	// runs until main returns.
-	var rumIngest http.Handler
-	if url, ok := rum.CollectorURL(); ok {
-		rumCtx, rumStop := context.WithCancel(context.Background())
-		defer rumStop()
-		fwd := rum.NewForwarder(url)
-		fwd.Start(rumCtx)
-		rumIngest = rum.NewIngest(fwd)
-	}
-	mountTelemetryRoute(mux, chain, jwtKeys, rumIngest)
+	rumCtx, rumStop := context.WithCancel(context.Background())
+	defer rumStop()
+	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx))
 	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register

@@ -19,7 +19,6 @@ package rum
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"strconv"
 	"strings"
 )
@@ -106,31 +105,29 @@ func tokenShaped(seg string) bool {
 }
 
 // --- OTLP/JSON decoding: only the fields above have a Go field to land in. ---
+// decode.go walks the body; these are what it fills.
 
-// exportRequest is the subset of OTLP/JSON ExportTraceServiceRequest read.
+// exportRequest is what decodeCapped keeps of an OTLP/JSON
+// ExportTraceServiceRequest: per resource, its attributes and its spans.
 type exportRequest struct {
-	ResourceSpans []struct {
-		Resource struct {
-			Attributes []keyValue `json:"attributes"`
-		} `json:"resource"`
-		ScopeSpans []struct {
-			Spans []span `json:"spans"`
-		} `json:"scopeSpans"`
-	} `json:"resourceSpans"`
+	resources []decodedResource
+}
+
+type decodedResource struct {
+	attributes []keyValue
+	spans      []span
 }
 
 type span struct {
-	TraceID           string     `json:"traceId"`
-	SpanID            string     `json:"spanId"`
-	ParentSpanID      string     `json:"parentSpanId"`
-	Name              string     `json:"name"`
-	Kind              int32      `json:"kind"`
-	StartTimeUnixNano jsonUint64 `json:"startTimeUnixNano"`
-	EndTimeUnixNano   jsonUint64 `json:"endTimeUnixNano"`
-	Attributes        []keyValue `json:"attributes"`
-	Status            struct {
-		Code int32 `json:"code"`
-	} `json:"status"`
+	TraceID           string
+	SpanID            string
+	ParentSpanID      string
+	Name              string
+	Kind              int32
+	StartTimeUnixNano jsonUint64
+	EndTimeUnixNano   jsonUint64
+	Attributes        []keyValue
+	StatusCode        int32
 }
 
 type keyValue struct {
@@ -157,14 +154,6 @@ func (i *jsonInt64) UnmarshalJSON(b []byte) error {
 	n, err := strconv.ParseInt(strings.Trim(string(b), `"`), 10, 64)
 	*i = jsonInt64(n)
 	return err
-}
-
-func decode(body []byte) (*exportRequest, error) {
-	var req exportRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
 }
 
 // resourceServiceName returns the resource's service.name string value.

@@ -108,7 +108,7 @@ func otlpBody(t *testing.T, service string, extraResource []map[string]any, span
 	for i, s := range spans {
 		js = append(js, map[string]any{
 			"traceId":           "4bf92f3577b34da6a3ce929d0e0e4736",
-			"spanId":            fmt.Sprintf("00f067aa0ba902%02x", i+1),
+			"spanId":            fmt.Sprintf("00f067aa0ba9%04x", i+1),
 			"parentSpanId":      "00f067aa0ba90200",
 			"name":              s.name,
 			"kind":              3,

@@ -31,11 +31,18 @@ new OTLPTraceExporter({
 
 | limit | value | answer |
 |---|---|---|
-| body | 512 KiB | `413` |
+| body | 512 KiB, with or without `Content-Length` | `413` |
 | spans per request | 512 | `413` |
+| attributes per span | 64 (only 3 are forwarded; the rest are dropped) | `413` |
+| resource attributes | 64 | `413` |
+| resource spans / scope spans per request | 16 / 64 | `413` |
 | requests per user | 1/s sustained, bursts of 10 | `429` with `Retry-After` (seconds) |
+| decodes in flight, all users | GOMAXPROCS of the pod | `429` with `Retry-After: 1` |
+| spans into the collector, all users | 2000/s, bursts of 2048 | `429` with `Retry-After` |
 
-The limit is per authenticated user, not global: one user hitting it does not affect another. The browser exporter's default 5 s batching uses about 0.2 requests/s per tab.
+- **Structural limits:** the span, attribute and container caps are enforced *while* the body is decoded. The decoder stops at cap+1, so what a request allocates is set by the caps, not by the shape of the body.
+- **Per-user limit:** one user hitting it does not affect another. The browser exporter's default 5 s batching uses about 0.2 requests/s per tab.
+- **Attribution:** every refusal (400, 413, 415, 429) writes a sampled WARN line `rum.ingest.refused` with the caller's `redact.User` label (never the username in clear), the status and the reason.
 
 ## Allowlist
 
@@ -60,6 +67,10 @@ Everything not listed here is dropped. Nothing is forwarded as sent: the payload
 
 Every other attribute is dropped and counted, as is an allowlisted key whose value fails its check. That includes `enduser.id`, `url.full` and any header.
 
+**`http.route` must be the router's template, never the URL.**
+- **The frontend's job:** send the pattern your router matched (`/compositions/:namespace/:name`), not the concrete path (`/compositions/team-a/prod-db`).
+- **Residual (#1020 review F3; owner decision pending):** snowplow's check rejects query strings, escapes, and token-shaped or over-long segments. It cannot tell a word-shaped identifier from a static route word: `/users/alice/profile` and `/users/settings/profile` are syntactically identical. So a concrete path made of short words passes it.
+
 **Spans carry no identity.** snowplow uses the authenticated user only for the rate limit and never adds it to a span.
 
 ## Response
@@ -76,8 +87,8 @@ On `/debug/vars` as `snowplow_rum_ingest`, and over OTLP:
 
 | metric | `outcome` values |
 |---|---|
-| `snowplow_rum_ingest_requests_total` | `accepted`, `dropped_auth`, `dropped_size`, `dropped_rate`, `dropped_content_type`, `dropped_malformed` |
-| `snowplow_rum_ingest_spans_total` | `accepted`, `dropped_service`, `dropped_name`, `dropped_invalid`, `forwarded`, `forward_failed`, `forward_overflow` |
+| `snowplow_rum_ingest_requests_total` | `accepted`, `dropped_auth`, `dropped_size`, `dropped_rate`, `dropped_content_type`, `dropped_malformed`, `dropped_busy` |
+| `snowplow_rum_ingest_spans_total` | `accepted`, `dropped_service`, `dropped_name`, `dropped_invalid`, `forwarded`, `forward_failed`, `forward_overflow`, `forward_rate_limited` |
 | `snowplow_rum_ingest_attributes_dropped_total` | (none) |
 
 No audit event is written: this is telemetry, not a mutation.

@@ -17,12 +17,12 @@ import (
 // the cache.
 func registerRUMIngestInstruments(m metric.Meter) error {
 	requests, err := m.Int64ObservableCounter("snowplow_rum_ingest_requests_total",
-		metric.WithDescription("POST /telemetry/v1/traces requests (#1015) by outcome: accepted (decoded and filtered), dropped_auth (401), dropped_size (413), dropped_rate (429, per user), dropped_content_type (415), dropped_malformed (400)."))
+		metric.WithDescription("POST /telemetry/v1/traces requests (#1015) by outcome: accepted (decoded and filtered), dropped_auth (401), dropped_size (413), dropped_rate (429, per user), dropped_content_type (415), dropped_malformed (400), dropped_busy (429: every decode slot, across all users, in use)."))
 	if err != nil {
 		return err
 	}
 	spans, err := m.Int64ObservableCounter("snowplow_rum_ingest_spans_total",
-		metric.WithDescription("Browser RUM spans (#1015) by outcome: accepted (passed the allowlist), dropped_service (resource service.name not krateo-frontend), dropped_name (span name not allowlisted), dropped_invalid (bad ids, times, kind or status), forwarded (collector 2xx), forward_failed (collector error or non-2xx), forward_overflow (forward queue full, dropped without blocking)."))
+		metric.WithDescription("Browser RUM spans (#1015) by outcome: accepted (passed the allowlist), dropped_service (resource service.name not krateo-frontend), dropped_name (span name not allowlisted), dropped_invalid (bad ids, times, kind or status), forwarded (collector 2xx), forward_failed (collector error or non-2xx), forward_overflow (forward queue full, dropped without blocking), forward_rate_limited (over the global spans/s cap into the collector; the request got 429)."))
 	if err != nil {
 		return err
 	}
