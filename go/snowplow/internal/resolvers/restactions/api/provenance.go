@@ -3,13 +3,13 @@ package api
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 // fromSecretAsCallerFn reads a named endpointRef Secret with the caller's
@@ -25,10 +25,12 @@ var fromSecretAsCallerFn = credhttp.FromSecret
 // stage's error). It never consults the SA-backed Secrets snapshot or the
 // ServiceAccount rest config, and refuses a `-clientconfig` name outright.
 func (m *endpointReferenceMapper) resolveOneAsCaller(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
-	if strings.HasSuffix(ref.Name, clientConfigSuffix) {
+	// A session `<user>-clientconfig` or step-up `<user>-clientconfig-stepup`
+	// name (#994): one reserved set, credsecret.IsPerUserName.
+	if credsecret.IsPerUserName(ref.Name) {
 		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"endpointRef %q names a reserved per-user credential Secret (suffix %q); a caller-supplied RESTAction may not select one",
-			ref.Name, clientConfigSuffix)
+			"endpointRef %q names a reserved per-user credential Secret (suffix %q or %q); a caller-supplied RESTAction may not select one",
+			ref.Name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
 	}
 	// An inline request never carries an internal (ServiceAccount) rest
 	// config: only seeds and the refresher set one. Refuse rather than let
@@ -73,7 +75,8 @@ const (
 	//     the ServiceAccount (the refilter still runs);
 	//   - a named endpointRef Secret is read with the caller's credentials,
 	//     never through the ServiceAccount or the informer snapshot, and a
-	//     literal "-clientconfig" ref is refused, so a draft can never dial
+	//     literal per-user credential ref (session or step-up, #994) is
+	//     refused, so a draft can never dial
 	//     as another user.
 	ProvenanceCallerSupplied
 )

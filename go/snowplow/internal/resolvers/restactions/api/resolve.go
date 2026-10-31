@@ -16,7 +16,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
@@ -271,6 +271,7 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	mapper := endpointReferenceMapper{
 		authnNS:    opts.AuthnNS,
 		username:   user.Username,
+		groups:     user.Groups,
 		rc:         opts.RC,
 		provenance: opts.Provenance,
 	}
@@ -565,11 +566,13 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 	}
 	name := kubeutil.MakeDNS1123Compatible(rendered)
 	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
-	// resolve to the reserved `<user>-clientconfig` internal-identity class.
-	if strings.HasSuffix(name, clientConfigSuffix) {
+	// resolve to a reserved per-user credential name — the session
+	// `<user>-clientconfig` or, since #994, the step-up
+	// `<user>-clientconfig-stepup` (credsecret.IsPerUserName holds both).
+	if credsecret.IsPerUserName(name) {
 		return nil, true, fmt.Errorf(
-			"templated endpointRef.name %q resolved to %q, which carries the reserved internal-identity suffix %q; refusing at the template-eval site (#113 guardrail b) — user query-extras may not select a per-user credential Secret",
-			ref.Name, name, clientConfigSuffix)
+			"templated endpointRef.name %q resolved to %q, which is a reserved per-user credential Secret name (suffix %q or %q); refusing at the template-eval site (#113 guardrail b) — user query-extras may not select a per-user credential Secret",
+			ref.Name, name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
 	}
 	// Guardrail (a): namespace is NEVER templated in V1 — it stays the
 	// author-authored literal, so a templated name can only ever select WITHIN

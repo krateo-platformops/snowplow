@@ -45,18 +45,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	corev1 "k8s.io/api/core/v1"
 )
 
-// clientconfigSecretSuffix / clientCertificateDataKey are authn's storage
-// contract (authn internal/helpers/kube/config/storage/storage.go:
-// "%s-clientconfig" and ClientCertLabel). The NAME selects a login artifact; a
-// clientconfig Secret without a readable certificate is counted unparseable.
-const (
-	clientconfigSecretSuffix = "-clientconfig"
-	clientCertificateDataKey = "client-certificate-data"
-)
+// clientCertificateDataKey is authn's storage contract (authn
+// internal/helpers/kube/config/storage/storage.go: ClientCertLabel). The NAME
+// selects a login artifact (credsecret.IsSessionName, authn's
+// ClientConfigSecretName); a clientconfig Secret without a readable
+// certificate is counted unparseable.
+const clientCertificateDataKey = "client-certificate-data"
 
 // LearnedIdentity is one learned class, as the seed engine consumes it.
 // Groups is a sorted copy (the FULL set the certificate / JWT carried).
@@ -303,8 +302,18 @@ func parseClientconfigCertificate(sec *corev1.Secret) (username string, groups [
 // format (no client-certificate-data) must count as UNPARSEABLE, not be skipped,
 // or the format-drift alarm (from_secrets == 0 while clientconfig Secrets
 // exist) reads 0/0 — a zero that looks like health.
+//
+// #994 — ONLY the session Secret `<user>-clientconfig` is a login artifact. A
+// step-up Secret `<user>-clientconfig-stepup` (authn#49) is excluded ON
+// PURPOSE: its credential lives about 15 minutes, so prewarming its class
+// (the session's groups plus krateo:loa:2) is seed work for an identity that
+// is about to disappear, and it is not a login, so it must not count in the
+// format-drift alarm's denominator. credsecret.IsSessionName excludes it: the
+// suffixes are disjoint by authn's contract (TestLearned994_* pins it). A
+// step-up session still reaches the registry through S2 (live /call traffic),
+// which expires with its JWT — no later than its credential.
 func isClientconfigSecret(sec *corev1.Secret) bool {
-	return sec != nil && strings.HasSuffix(sec.Name, clientconfigSecretSuffix)
+	return sec != nil && credsecret.IsSessionName(sec.Name)
 }
 
 // detachSecretLocked removes the Secret source from its class, dropping the
