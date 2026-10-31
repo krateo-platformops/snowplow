@@ -361,9 +361,10 @@ name a per-user credential Secret; see below.)
 
 A stage's `endpointRef` may never name a per-user credential Secret: the
 session `<user>-clientconfig` or the step-up `<user>-clientconfig-stepup`.
-This holds for every RESTAction, stored or sent inline as a draft, and for
-both literal and templated names (a templated name is checked after it is
-rendered and normalised). Snowplow refuses such a stage before it reads the
+This holds for every RESTAction, stored or sent inline as a draft, for both
+literal and templated names (a templated name is checked after it is
+rendered and normalised), and for every stage, including a
+`userAccessFilter` stage, which does not use its `endpointRef` at all. Snowplow refuses such a stage before it reads the
 Secret: the stage fails, the resolve stops there, and the refusal is logged
 as `endpointRef refused: it names a per-user credential Secret` (the Secret
 name appears only as a redacted label) and counted in

@@ -64,31 +64,28 @@ func seedForgeableAdminClientconfig(t *testing.T, authnNS string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// C-113-1 — resolveOne, the choke point every ref lookup passes, refuses a ref
-// to `admin-clientconfig` BEFORE the snapshot lookup: the sentinel admin
-// ServerURL is never returned. #1025: the refusal no longer depends on how the
-// ref was produced, so there is no "ungated" path left to show as RED.
-func TestT1_ClientconfigForgery_RefusedInResolveOne_NeverDials(t *testing.T) {
+// C-113-1 — the #1025 rule (refusePerUserRef, applied to every stage before
+// resolveOne) refuses a ref to `admin-clientconfig`, so the snapshot lookup
+// that would return the sentinel admin ServerURL never runs. The refusal no
+// longer depends on how the ref was produced. The resolve-level proof that
+// nothing is dialed is issue1025_per_user_ref_test.go.
+func TestT1_ClientconfigForgery_RefusedBeforeLookup(t *testing.T) {
 	authnNS := "krateo-system"
 	seedForgeableAdminClientconfig(t, authnNS)
 
 	m := &endpointReferenceMapper{authnNS: authnNS, username: "victim", rc: nil}
 	forged := &templates.Reference{Name: "admin-clientconfig", Namespace: authnNS}
 
-	ep, _, err := m.resolveOne(context.Background(), forged)
-	if !errors.Is(err, ErrPerUserCredentialRef) {
-		t.Fatalf("C-113-1 VIOLATED: resolveOne did not refuse a ref to admin-clientconfig; got err=%v", err)
-	}
-	if ep.ServerURL == forgedAdminServerURL {
-		t.Fatalf("C-113-1 ESCALATION: resolveOne DIALED the admin credential (returned the sentinel ServerURL %q)", forgedAdminServerURL)
+	if err := m.refusePerUserRef(forged); !errors.Is(err, ErrPerUserCredentialRef) {
+		t.Fatalf("C-113-1 VIOLATED: a ref to admin-clientconfig was not refused; got err=%v", err)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // C-113-1 — the eval site (resolveStageEndpoint→evalEndpointRef) renders a
 // template that folds a request extra into `admin-clientconfig`; the name it
-// hands on is refused by resolveOne, so the Secret lookup never fires.
-func TestT1_ClientconfigForgery_TemplatedNameRefusedAtResolveOne(t *testing.T) {
+// hands on is refused by the #1025 rule, so the Secret lookup never fires.
+func TestT1_ClientconfigForgery_TemplatedNameRefused(t *testing.T) {
 	authnNS := "krateo-system"
 	seedForgeableAdminClientconfig(t, authnNS)
 
@@ -104,9 +101,8 @@ func TestT1_ClientconfigForgery_TemplatedNameRefusedAtResolveOne(t *testing.T) {
 		t.Fatalf("C-113-1: the eval site must render the template to admin-clientconfig (templated); got %+v templated=%v", ref, templated)
 	}
 	m := &endpointReferenceMapper{authnNS: authnNS, username: "victim"}
-	ep, _, err := m.resolveOne(context.Background(), ref)
-	if !errors.Is(err, ErrPerUserCredentialRef) || ep.ServerURL == forgedAdminServerURL {
-		t.Fatalf("C-113-1 VIOLATED: a templated name resolving to admin-clientconfig was resolved (ep=%q err=%v)", ep.ServerURL, err)
+	if err := m.refusePerUserRef(ref); !errors.Is(err, ErrPerUserCredentialRef) {
+		t.Fatalf("C-113-1 VIOLATED: a templated name resolving to admin-clientconfig was not refused; got err=%v", err)
 	}
 
 	// Discriminating: the SAME derivation without the `-clientconfig` fold
@@ -184,12 +180,12 @@ func TestC113_2_InternalSynthesisResolves_NamedPerUserRefRefused(t *testing.T) {
 		t.Fatalf("C-113-2 provenance: the internal-endpoint branch must return the SA endpoint verbatim; got %+v", saResolved)
 	}
 
-	// (ii) a NAMED ref to the very name the nil-ref path synthesizes is refused:
-	// the check runs before the synthesis, on named refs only. Even the caller's
+	// (ii) a NAMED ref to the very name the nil-ref path synthesizes is refused
+	// by the #1025 rule, which judges named refs only. Even the caller's
 	// own name is refused when named: the boundary is the reserved suffix, not
 	// cross-user (#1025).
 	forged := &templates.Reference{Name: "victim-clientconfig", Namespace: authnNS}
-	if _, _, terr := m.resolveOne(context.Background(), forged); !errors.Is(terr, ErrPerUserCredentialRef) {
+	if terr := m.refusePerUserRef(forged); !errors.Is(terr, ErrPerUserCredentialRef) {
 		t.Fatalf("C-113-2 (ii) VIOLATED: a named `-clientconfig` ref was NOT refused; got %v", terr)
 	}
 }
@@ -222,10 +218,10 @@ func TestC113_5_NamespaceNeverTemplated(t *testing.T) {
 // C-113-6 — a STATIC (non-template) endpointRef.name is byte-identical to
 // pre-#113 at the eval site: the MaybeQuery gate skips evaluation,
 // templated=false, same pointer. #1025 CHANGED the literal `-clientconfig`
-// case: it passes the eval site unchanged, but resolveOne refuses it (before
+// case: it passes the eval site unchanged, but the #1025 rule refuses it (before
 // #1025 a literal per-user ref in a stored RESTAction was "the author's own
 // business" and resolved through the ServiceAccount-backed snapshot).
-func TestC113_6_StaticRefUnchanged_LiteralClientconfigRefusedAtResolveOne(t *testing.T) {
+func TestC113_6_StaticRefUnchanged_LiteralClientconfigRefused(t *testing.T) {
 	r := &resolveRun{dict: map[string]any{"want": "spoke-a"}}
 
 	// A plain literal name: passes through unchanged, NOT templated.
@@ -241,10 +237,10 @@ func TestC113_6_StaticRefUnchanged_LiteralClientconfigRefusedAtResolveOne(t *tes
 	if templatedCC || outCC != litCC {
 		t.Fatalf("C-113-6: a literal `-clientconfig` ref must pass the eval site unchanged (templated=false); got out=%+v templated=%v", outCC, templatedCC)
 	}
-	// … and is refused at resolveOne (#1025).
+	// … and is refused by the #1025 rule.
 	m := &endpointReferenceMapper{authnNS: "krateo-system", username: "victim"}
-	if _, _, err := m.resolveOne(context.Background(), outCC); !errors.Is(err, ErrPerUserCredentialRef) {
-		t.Fatalf("#1025 VIOLATED: a LITERAL `-clientconfig` ref was not refused at resolveOne; got %v", err)
+	if err := m.refusePerUserRef(outCC); !errors.Is(err, ErrPerUserCredentialRef) {
+		t.Fatalf("#1025 VIOLATED: a LITERAL `-clientconfig` ref was not refused; got %v", err)
 	}
 
 	// And a nil ref (internal path) is a clean pass-through, not templated.

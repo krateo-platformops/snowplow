@@ -10,7 +10,7 @@ package api
 //      guard). A missing step-up Secret fails the stage; the session credential
 //      is never dialed in its place.
 //   G  a request-TEMPLATED endpointRef resolving to `x-clientconfig-stepup` is
-//      refused in resolveOne, so a caller can never dial another user's
+//      refused by the #1025 rule, so a caller can never dial another user's
 //      ELEVATED credential. Since #1025 the same rule refuses a LITERAL one in
 //      a stored RESTAction too (issue1025_per_user_ref_test.go).
 //   C  #443: a caller-supplied (inline draft) literal `x-clientconfig-stepup`
@@ -189,9 +189,8 @@ func su994SeedForgeable(t *testing.T) {
 }
 
 // G — the eval site renders and normalises a templated name; it does not
-// judge it. resolveOne refuses the per-user name it produces (#1025: one rule,
-// at the choke point).
-func TestStepUp994_G_TemplatedStepUpRefRefusedAtResolveOne(t *testing.T) {
+// judge it. The #1025 rule refuses the per-user name it produces.
+func TestStepUp994_G_TemplatedStepUpRefRefused(t *testing.T) {
 	su994SeedForgeable(t)
 	r := &resolveRun{dict: map[string]any{"want": "victim"}}
 	ref, templated := r.evalEndpointRef(&templates.Reference{Name: `${ .want + "-clientconfig-stepup" }`, Namespace: su994NS})
@@ -199,10 +198,9 @@ func TestStepUp994_G_TemplatedStepUpRefRefusedAtResolveOne(t *testing.T) {
 		t.Fatalf("the eval site must render the templated name; got ref=%+v templated=%v", ref, templated)
 	}
 	m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker"}
-	ep, _, err := m.resolveOne(context.Background(), ref)
-	if !errors.Is(err, ErrPerUserCredentialRef) || ep.ServerURL == su994Forged {
-		t.Fatalf("a templated ref to another user's step-up Secret was resolved (ep=%q err=%v) — "+
-			"the caller dials that user's ELEVATED credential", ep.ServerURL, err)
+	if err := m.refusePerUserRef(ref); !errors.Is(err, ErrPerUserCredentialRef) {
+		t.Fatalf("a templated ref to another user's step-up Secret was not refused (err=%v) — "+
+			"the caller dials that user's ELEVATED credential", err)
 	}
 	// Control: the same template to a non-credential name renders and is not refused.
 	ok, _ := r.evalEndpointRef(&templates.Reference{Name: `${ .want + "-stepup-endpoint" }`, Namespace: su994NS})
@@ -230,12 +228,8 @@ func TestStepUp994_C_CallerSuppliedLiteralStepUpRefRefused(t *testing.T) {
 	m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker", provenance: ProvenanceCallerSupplied}
 
 	for _, name := range []string{"x-clientconfig-stepup", credsecret.StepUpName("victim"), "x-clientconfig"} {
-		ep, _, err := m.resolveOne(ctx, &templates.Reference{Name: name, Namespace: su994NS})
-		if err == nil || ep.ServerURL == su994Forged {
-			t.Fatalf("#443 VIOLATED: a caller-supplied literal ref %q was resolved (ep=%q err=%v)", name, ep.ServerURL, err)
-		}
-		if !errors.Is(err, ErrPerUserCredentialRef) {
-			t.Fatalf("want the per-user credential refusal for %q; got %v", name, err)
+		if err := m.refusePerUserRef(&templates.Reference{Name: name, Namespace: su994NS}); !errors.Is(err, ErrPerUserCredentialRef) {
+			t.Fatalf("#443 VIOLATED: a caller-supplied literal ref %q was not refused; got %v", name, err)
 		}
 	}
 	mu.Lock()

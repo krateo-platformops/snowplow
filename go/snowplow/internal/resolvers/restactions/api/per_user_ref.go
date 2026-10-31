@@ -14,10 +14,14 @@
 // produced. A literal ref in a stored RESTAction resolved through snowplow's
 // ServiceAccount-backed Secrets snapshot, so a RESTAction author could dial as
 // any user, including with that user's elevated step-up credential. Now ONE
-// check in resolveOne, the choke point every named ref passes, keys on the
-// name alone. It runs on the name that is looked up: a templated name is
-// already DNS-1123 normalised by evalEndpointRef, and a literal name is looked
-// up exactly as written.
+// check, refusePerUserRef, keys on the name alone. It is called once, at the
+// top of resolveStageEndpoint, which every stage passes BEFORE it branches on
+// userAccessFilter: a UAF stage ignores its endpointRef (it dials the
+// ServiceAccount, or the caller's own credential for an inline draft), yet a
+// per-user ref there is refused, logged and counted like any other. It runs on
+// the name that would be looked up: a templated name is already DNS-1123
+// normalised by evalEndpointRef, and a literal name is looked up exactly as
+// written.
 //
 // THE REFUSAL is an endpoint-resolve failure, the same posture the #113 and
 // #443 refusals had: the stage fails (stage outcome Error), the resolve
@@ -36,10 +40,24 @@ import (
 	"expvar"
 	"sync"
 	"sync/atomic"
+
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
-// ErrPerUserCredentialRef is resolveOne's refusal of a named endpointRef that
-// names a per-user credential Secret (#1025). Its text carries no name.
+// refusePerUserRef is THE #1025 rule: a named ref (nil is the caller's own
+// credential, never refused) whose name is a per-user credential name is
+// refused and counted under the resolve's provenance.
+func (m *endpointReferenceMapper) refusePerUserRef(ref *templates.Reference) error {
+	if ref != nil && credsecret.IsPerUserName(ref.Name) {
+		recordPerUserRefRefused(m.provenance)
+		return ErrPerUserCredentialRef
+	}
+	return nil
+}
+
+// ErrPerUserCredentialRef is refusePerUserRef's refusal of a named endpointRef
+// that names a per-user credential Secret (#1025). Its text carries no name.
 var ErrPerUserCredentialRef = errors.New(
 	"endpointRef names a per-user credential Secret; per-user credentials are chosen only from the caller's own identity (omit endpointRef)")
 

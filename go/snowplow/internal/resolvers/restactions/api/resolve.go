@@ -455,6 +455,30 @@ const (
 // dispatch ctx with credhttp.WithHeldCredential on it, and the dial site then
 // builds a client that never follows a redirect. Provenance, never shape.
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, bool, stageAction) {
+	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
+	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
+	// exact ds createRequestOptions is handed at :405), so `.name` resolves
+	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
+	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
+	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
+	// stays literal, never templated).
+	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
+	// #1025 — every stage passes here before it branches on userAccessFilter,
+	// so the one rule covers every stage: a named ref to a per-user credential
+	// Secret is refused for every provenance, literal or templated, UAF or
+	// not (a UAF stage ignores its endpointRef, but naming one is still
+	// refused). Same truncating posture as any endpoint-resolve failure (R-2
+	// stageReturn); nothing was read or dialed. The Secret name embeds a
+	// username: a redact label only.
+	if err := r.mapper.refusePerUserRef(ref); err != nil {
+		r.log.Error("endpointRef refused: it names a per-user credential Secret",
+			slog.String("name", id),
+			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
+			slog.Bool("templated", templated),
+			slog.String("namespace", ref.Namespace),
+			slog.String("secret_name", redact.Prefixed("secret", ref.Name)))
+		return endpoints.Endpoint{}, false, false, stageReturn
+	}
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
 		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
 		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
@@ -495,28 +519,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// dial site threads the SA token FILE (#267).
 		return *saEP, true, true, stageProceed
 	}
-	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
-	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
-	// exact ds createRequestOptions is handed at :405), so `.name` resolves
-	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
-	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
-	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
-	// stays literal, never templated).
-	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
-	if errors.Is(err, ErrPerUserCredentialRef) {
-		// #1025 — the named ref names a per-user credential Secret: refused
-		// for every provenance, literal or templated. Same truncating posture
-		// as any endpoint-resolve failure (R-2 stageReturn); nothing was read
-		// or dialed. The Secret name embeds a username: a redact label only.
-		r.log.Error("endpointRef refused: it names a per-user credential Secret",
-			slog.String("name", id),
-			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
-			slog.Bool("templated", templated),
-			slog.String("namespace", ref.Namespace),
-			slog.String("secret_name", redact.Prefixed("secret", ref.Name)))
-		return endpoints.Endpoint{}, false, false, stageReturn
-	}
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))

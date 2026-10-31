@@ -30,7 +30,7 @@ type endpointReferenceMapper struct {
 // The per-user credential Secret names come from credsecret (#994): For picks
 // the one a validated identity reads (`<user>-clientconfig`, or
 // `<user>-clientconfig-stepup` when its groups carry krateo:loa:2), and
-// IsPerUserName is the reserved set the #1025 rule keys on. Single source, so
+// IsPerUserName is the reserved set the #1025 rule (refusePerUserRef) keys on. Single source, so
 // the rule and the synthesis can never drift onto different strings
 // (feedback_consultation_mutation_is_not_key_correctness). It is a general
 // boundary on the reserved names, NOT a per-resource carve-out
@@ -38,11 +38,10 @@ type endpointReferenceMapper struct {
 
 // resolveOne resolves a named/nil endpoint Reference to an Endpoint.
 //
-// #1025 — the single choke point every named ref passes: a named ref that
-// names a per-user credential Secret is refused here, for every provenance
-// (stored or caller-supplied) and whether its name was literal or templated
-// (per_user_ref.go). The check runs BEFORE the nil-ref synthesis below, which
-// legitimately builds the caller's OWN per-user name and must still resolve.
+// #1025 — its only caller, resolveStageEndpoint, has already passed the named
+// ref through refusePerUserRef (per_user_ref.go), for every stage, UAF or
+// not, so a per-user credential name never reaches the lookup below. The
+// nil-ref synthesis legitimately builds the caller's OWN per-user name.
 //
 // resolveOne additionally reports isSAEndpoint: true ONLY on the
 // InternalEndpointFromContext branch, which always carries snowplow's own SA
@@ -50,14 +49,10 @@ type endpointReferenceMapper struct {
 // signal the dial site uses to thread the SA token FILE (#267) — the SA endpoint is
 // shape-identical to a token-auth per-user clientconfig, so it can only be
 // distinguished by where it came from, never by field shape (arch-268 ruling). All
-// other returns (the #1025 refusal, wrong-type fall-through, clientconfig
-// cache-hit, FromSecret, errors) report false.
+// other returns (wrong-type fall-through, clientconfig cache-hit, FromSecret,
+// errors) report false.
 func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
 	isInternal := false
-	if ref != nil && credsecret.IsPerUserName(ref.Name) {
-		recordPerUserRefRefused(m.provenance)
-		return endpoints.Endpoint{}, false, ErrPerUserCredentialRef
-	}
 	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
 	// CALLER, never through the ServiceAccount or the SA-backed Secrets
 	// snapshot, so a draft can only use credentials its author can already

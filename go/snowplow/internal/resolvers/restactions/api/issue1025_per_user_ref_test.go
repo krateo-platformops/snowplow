@@ -18,9 +18,15 @@ package api
 //   A5  a normal endpoint Secret, literal or templated     → dials it
 //   A6  nil ref → the caller's OWN credential: step-up for a krateo:loa:2
 //       identity, session otherwise (#994, #1024)
+//   A8  a userAccessFilter stage naming `victim-clientconfig-stepup`, stored
+//       and inline → refused and counted. A UAF stage ignores its endpointRef
+//       (it dials the ServiceAccount, or the caller's own credential for an
+//       inline draft), so without the rule it would silently succeed.
 //
-// A1–A4 assert the SAME refusal: the one error, the one log line and the one
-// counter, labelled by provenance. There is one rule, not one per provenance.
+// A1–A4 and A8 assert the SAME refusal: the one error, the one log line and
+// the one counter, labelled by provenance. There is one rule, at one call site
+// every stage passes, not one per provenance or per stage kind.
+// (A7 is the export arm, internal/handlers/export_per_user_ref_1025_test.go.)
 
 import (
 	"bytes"
@@ -37,10 +43,8 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
-	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/redact"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
 )
 
@@ -90,9 +94,23 @@ func i1025Setup(t *testing.T) (string, func() []su994Dial) {
 	return api.URL, dials
 }
 
-// i1025Run resolves one GET stage with the given endpointRef as the caller and
-// returns the stage-outcomes header and the log the resolve wrote.
+// i1025Stage is the one GET stage every arm resolves, named "read".
+func i1025Stage(ref *templates.Reference) *templates.API {
+	return &templates.API{
+		Name: "read", Path: i1025Path, Verb: ptr.To(http.MethodGet),
+		EndpointRef: ref, ContinueOnError: ptr.To(true), ErrorKey: ptr.To("readErr"),
+	}
+}
+
+// i1025Run resolves i1025Stage(ref) as the caller and returns the
+// stage-outcomes header and the log the resolve wrote.
 func i1025Run(t *testing.T, apiURL string, ref *templates.Reference, prov Provenance, extras map[string]any, groups ...string) (string, string) {
+	t.Helper()
+	return i1025RunStage(t, apiURL, i1025Stage(ref), prov, extras, groups...)
+}
+
+// i1025RunStage resolves one given stage as the caller.
+func i1025RunStage(t *testing.T, apiURL string, stage *templates.API, prov Provenance, extras map[string]any, groups ...string) (string, string) {
 	t.Helper()
 	logs := &i1025Log{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -104,10 +122,7 @@ func i1025Run(t *testing.T, apiURL string, ref *templates.Reference, prov Proven
 	ctx, outcomes := WithStageOutcomes(ctx)
 	Resolve(ctx, ResolveOptions{RC: &rest.Config{Host: apiURL}, AuthnNS: su994NS,
 		RESTActionNamespace: su994NS, RESTActionName: "ra1025", Provenance: prov, Extras: extras,
-		Items: []*templates.API{{
-			Name: "read", Path: i1025Path, Verb: ptr.To(http.MethodGet),
-			EndpointRef: ref, ContinueOnError: ptr.To(true), ErrorKey: ptr.To("readErr"),
-		}}})
+		Items: []*templates.API{stage}})
 	return outcomes.HeaderValue(), logs.String()
 }
 
@@ -273,33 +288,60 @@ func TestIssue1025_A6_NilRefUsesTheCallersOwnCredential(t *testing.T) {
 	}
 }
 
-// The choke point itself: resolveOne returns the one sentinel for every
-// provenance, and its text names no Secret.
-func TestIssue1025_ResolveOneRefusesEveryProvenance(t *testing.T) {
-	// Both of the victim's Secrets are in the snapshot with a SENTINEL
-	// server-url: a lookup that is not refused returns it.
-	names := []string{credsecret.SessionName("victim"), credsecret.StepUpName("victim")}
-	t.Setenv("CACHE_ENABLED", "true")
-	cache.ResetSecretsInformerForTest()
-	cache.ResetSecretsSnapshotForTest()
-	snap := map[string]*corev1.Secret{}
-	for _, n := range names {
-		snap[n] = mkSecret(su994NS, n, map[string]string{"server-url": su994Forged})
-	}
-	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: snap})
-	cache.ForceSecretsCacheReadyForTest(su994NS)
-	t.Cleanup(func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() })
+// A8 — a userAccessFilter stage naming another user's step-up Secret is
+// refused and counted, stored and inline. The ServiceAccount endpoint a stored
+// UAF stage would dial is the same fake apiserver with its own bearer, so a
+// stage that is not refused is SEEN dialing (and would succeed silently).
+func TestIssue1025_A8_UAFStagePerUserRefRefused(t *testing.T) {
+	const tokSA = "TOK-SA-1025"
+	for _, tc := range []struct {
+		name string
+		prov Provenance
+		want string
+	}{
+		{"stored", ProvenanceStored, perUserRefProvenanceStored},
+		{"caller-supplied", ProvenanceCallerSupplied, perUserRefProvenanceCallerSupplied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apiURL, dials := i1025Setup(t)
+			prev := serviceAccountEndpointFn
+			serviceAccountEndpointFn = func() (*endpoints.Endpoint, error) {
+				return &endpoints.Endpoint{ServerURL: apiURL, Token: tokSA}, nil
+			}
+			t.Cleanup(func() { serviceAccountEndpointFn = prev })
 
+			name := credsecret.StepUpName(i1025Victim)
+			stage := i1025Stage(&templates.Reference{Name: name, Namespace: su994NS})
+			stage.UserAccessFilter = &templates.UserAccessFilterSpec{Verb: "get", Group: "composition.krateo.io", Resource: "fireworksapps"}
+			before := PerUserRefRefusedSnapshot()
+			header, logs := i1025RunStage(t, apiURL, stage, tc.prov, nil)
+			i1025AssertRefused(t, dials(), header, logs, name, tc.want, false, before, PerUserRefRefusedSnapshot())
+		})
+	}
+}
+
+// The rule itself: one sentinel for every provenance, counted under it; a nil
+// ref (the caller's own credential) and an ordinary name pass; the text names
+// no Secret.
+func TestIssue1025_RuleRefusesEveryProvenance(t *testing.T) {
 	for _, prov := range []Provenance{ProvenanceStored, ProvenanceCallerSupplied} {
 		m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker", provenance: prov}
-		for _, name := range names {
-			ep, _, err := m.resolveOne(context.Background(), &templates.Reference{Name: name, Namespace: su994NS})
-			if !errors.Is(err, ErrPerUserCredentialRef) || ep.ServerURL == su994Forged {
-				t.Fatalf("provenance %s, ref %q: want ErrPerUserCredentialRef and no endpoint; got ep=%q err=%v",
-					provenanceLabel(prov), name, ep.ServerURL, err)
+		for _, name := range []string{credsecret.SessionName("victim"), credsecret.StepUpName("victim")} {
+			before := PerUserRefRefusedSnapshot()
+			err := m.refusePerUserRef(&templates.Reference{Name: name, Namespace: su994NS})
+			if !errors.Is(err, ErrPerUserCredentialRef) {
+				t.Fatalf("provenance %s, ref %q: want ErrPerUserCredentialRef; got %v", provenanceLabel(prov), name, err)
 			}
 			if strings.Contains(err.Error(), "victim") {
 				t.Fatalf("the refusal text must not name the Secret: %v", err)
+			}
+			if after := PerUserRefRefusedSnapshot(); after[provenanceLabel(prov)] != before[provenanceLabel(prov)]+1 {
+				t.Fatalf("provenance %s: the refusal was not counted: %v → %v", provenanceLabel(prov), before, after)
+			}
+		}
+		for _, ok := range []*templates.Reference{nil, {Name: i1025Endpoint, Namespace: su994NS}} {
+			if err := m.refusePerUserRef(ok); err != nil {
+				t.Fatalf("provenance %s: %+v must pass the rule; got %v", provenanceLabel(prov), ok, err)
 			}
 		}
 	}
