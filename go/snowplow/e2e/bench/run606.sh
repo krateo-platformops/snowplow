@@ -791,16 +791,15 @@ wait_portal_origin() {
     "${K[@]}" -n krateo-system get frontends.composition.krateo.io -o json > "$g/fe.json" 2>"$g/fe.err" || rc_f=$?
     "${K[@]}" -n krateo-system get deploy -o json > "$g/deploy.json" 2>/dev/null || rc_d=$?
     (( rc_d == 0 )) || : > "$g/deploy.json"
+    "${K[@]}" -n krateo-system get installers.composition.krateo.io -o json > "$g/installers.json" 2>/dev/null \
+      || : > "$g/installers.json"
     now="$(python3 -m bench.origin_gate now --state "$g/clock")"
     python3 -m bench.origin_gate reading --t "$now" --gateway-json "$g/svc.json" --gateway-rc "$rc_g" \
         --gateway-err "$g/svc.err" --frontends-json "$g/fe.json" --frontends-rc "$rc_f" --frontends-err "$g/fe.err" \
-        --deployments-json "$g/deploy.json" >> "$OUT/portal-origin-wait.jsonl"
-    # the window counts from the latest reading with the address: one that disappears restarts it
-    if python3 -c 'import json, sys; r = json.loads(open(sys.argv[1]).read().splitlines()[-1]); sys.exit(0 if r["gateway"] == "address" else 1)' "$OUT/portal-origin-wait.jsonl"; then
-      [[ -n "$t_addr" ]] || t_addr="$now"
-    else
-      t_addr=""
-    fi
+        --deployments-json "$g/deploy.json" --installers-json "$g/installers.json" >> "$OUT/portal-origin-wait.jsonl"
+    # the window counts from when the current address was first read: a reading of NO address
+    # restarts it; one that could not be taken (a transient API error) does not (#1006 R2-1)
+    t_addr="$(python3 -m bench.origin_gate address-since --readings "$OUT/portal-origin-wait.jsonl")"
     end="$(python3 -m bench.origin_gate deadline --t0 "$t0" --t-addr "$t_addr" --resync "$resync_s" \
         --poll "$PLATFORM_POLL_S" --lb-wait "$ENDPOINT_WAIT_S")"
     python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$now" "$end" || break

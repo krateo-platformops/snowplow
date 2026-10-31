@@ -63,22 +63,54 @@ COMPILED_DEFAULT_S = 180.0
 CDC_RESOURCE = "installers"
 ENV = "COMPOSITION_CONTROLLER_RESYNC_INTERVAL"
 FLAG = "resync-interval"
-_DUR = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)")
-_UNIT = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9}
+#: what the cdc does with a resync it parsed but is not positive: its runtime refuses to build the
+#: controller (unstructured-runtime v1.7.0 pkg/controller/controller.go:164), so it never starts
+NOT_POSITIVE = ("is not positive: the cdc's runtime refuses it (\"resync interval must be greater than 0\") "
+                "and the cdc does not start; nothing renders installer-platform")
+#: Go's time unitMap: µ is U+00B5 (micro sign) and μ U+03BC (Greek mu), both accepted
+_UNIT = {"ns": 1e-9, "us": 1e-6, "\u00b5s": 1e-6, "\u03bcs": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
 
 
 def parse_duration(s) -> float | None:
-    """A Go duration ("60s", "3m", "1m30s") in seconds; None if it is not one."""
-    s = str(s if s is not None else "").strip()
+    """A duration in seconds, accepted EXACTLY as Go's time.ParseDuration
+    accepts it (the cdc parses its flag and env with it): an optional sign;
+    "0"; else one or more <number><unit>, a number being digits with an
+    optional fraction (".5", "1." and "1.5" all count; "." alone does not),
+    a unit one of ns us µs μs ms s m h. No surrounding space. None if Go
+    would reject it."""
+    s = str(s) if s is not None else ""
+    neg = False
+    if s[:1] in ("-", "+"):
+        neg, s = s[0] == "-", s[1:]
+    if s == "0":
+        return 0.0
     if not s:
         return None
-    pos, total = 0, 0.0
-    for m in _DUR.finditer(s):
-        if m.start() != pos:
+    total, i, n = 0.0, 0, len(s)
+    while i < n:
+        j = i
+        while j < n and "0" <= s[j] <= "9":
+            j += 1
+        pre, num = j > i, s[i:j]
+        if j < n and s[j] == ".":
+            k = j + 1
+            while k < n and "0" <= s[k] <= "9":
+                k += 1
+            post, num = k > j + 1, num + "." + s[j + 1:k]
+            j = k
+        else:
+            post = False
+        if not pre and not post:
             return None
-        total += float(m.group(1)) * _UNIT[m.group(2)]
-        pos = m.end()
-    return total if pos == len(s) and total > 0 else None
+        u = j
+        while u < n and s[u] != "." and not ("0" <= s[u] <= "9"):
+            u += 1
+        unit = s[j:u]
+        if unit not in _UNIT:
+            return None
+        total += float(num if num not in ("", ".") else 0) * _UNIT[unit]
+        i = u
+    return -total if neg else total
 
 
 def _flag_value(args: list) -> tuple[bool, str | None]:
@@ -115,11 +147,15 @@ def _container_env(c: dict, configmaps: dict) -> tuple[str | None, str]:
             return str(data.get(ref.get("key"), "")), f"env valueFrom ConfigMap {ref.get('name')}"
         raise LookupError(f"env {ENV} comes from a source the gate does not read ({sorted(e.get('valueFrom') or {})})")
     for ef in reversed(c.get("envFrom") or []):
-        name = (ef.get("configMapRef") or {}).get("name")
-        if not name:
-            continue
         prefix = ef.get("prefix") or ""
         if not ENV.startswith(prefix):
+            continue
+        if ef.get("secretRef"):
+            # a later source wins, and the gate never reads Secrets: this one may carry the key
+            raise LookupError(f"envFrom Secret {(ef['secretRef'] or {}).get('name')} may set "
+                              f"{ENV[len(prefix):]}, and the gate does not read Secrets")
+        name = (ef.get("configMapRef") or {}).get("name")
+        if not name:
             continue
         data = configmaps.get(name)
         if data is None:
@@ -162,6 +198,9 @@ def resync_interval(deployments: dict | None, configmaps: dict | None, read_erro
                 return {"seconds": None, "deployment": name, "source": f"{name} arg -{FLAG}={v}",
                         "refuse": f"{name}: -{FLAG}={v!r} is not a duration: the cdc exits at flag parsing, "
                                   f"nothing renders installer-platform"}
+            if sec <= 0:
+                return {"seconds": sec, "deployment": name, "source": f"{name} arg -{FLAG}={v}",
+                        "refuse": f"{name}: -{FLAG}={v} {NOT_POSITIVE}"}
             return {"seconds": sec, "deployment": name, "refuse": None, "source": f"{name} arg -{FLAG}={v}"}
     for c in containers:
         try:
@@ -176,6 +215,9 @@ def resync_interval(deployments: dict | None, configmaps: dict | None, read_erro
                 return {"seconds": COMPILED_DEFAULT_S, "deployment": name, "refuse": None,
                         "source": f"{name} {where} {ENV}={v!r} is unparseable: the cdc's compiled default "
                                   f"(plumbing env.Duration)"}
+            if sec <= 0:
+                return {"seconds": sec, "deployment": name, "source": f"{name} {where} {ENV}={v}",
+                        "refuse": f"{name}: {where} {ENV}={v} {NOT_POSITIVE}"}
             return {"seconds": sec, "deployment": name, "refuse": None, "source": f"{name} {where} {ENV}={v}"}
     return {"seconds": COMPILED_DEFAULT_S, "deployment": name, "refuse": None,
             "source": f"the cdc's compiled default ({name} sets no -{FLAG} and no {ENV})"}
@@ -184,6 +226,22 @@ def resync_interval(deployments: dict | None, configmaps: dict | None, read_erro
 class _Unread(dict):
     def get(self, k, default=None):
         return None
+
+
+def address_since(readings: list[dict]) -> float | None:
+    """When the gateway's current address was first read: the first reading
+    with it since the last one that READ no address (no_address) or no
+    Service (absent). A reading that could not be taken (unread: a transient
+    API error) says nothing about the address and never restarts the window
+    (#1006 R2-1). None when no address is held."""
+    t = None
+    for r in readings:
+        g = r.get("gateway")
+        if g == "address":
+            t = r["t"] if t is None else t
+        elif g in ("no_address", "absent"):
+            t = None
+    return t
 
 
 def deadline(t0: float, t_addr: float | None, resync_s: float, poll_s: float, lb_wait_s: float) -> float:
@@ -203,8 +261,21 @@ def _json(path: str):
         return None
 
 
+def installer_conditions(installers_json: str) -> list[dict] | None:
+    """The Installer composition's Ready / Synced conditions (type, status,
+    reason, message), None when it was not read or there is not exactly one."""
+    d = _json(installers_json) if installers_json else None
+    items = d.get("items") if isinstance(d, dict) else None
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    from bench import diag606
+    return [{"type": c.get("type"), "status": c.get("status"), "reason": c.get("reason"),
+             "message": diag606.redact(str(c.get("message") or ""))[:400]}
+            for c in ((items[0].get("status") or {}).get("conditions") or []) if c.get("type") in ("Ready", "Synced")]
+
+
 def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, frontends_rc: int,
-            deployments_json: str, err: dict | None = None) -> dict:
+            deployments_json: str, err: dict | None = None, installers_json: str = "") -> dict:
     """One poll's readings, each one READ or saying it was not (#1006 F3)."""
     from bench import load606
     err = err or {}
@@ -234,6 +305,7 @@ def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, f
             conds = (cdcs[0].get("status") or {}).get("conditions") or []
             cdc = any(c.get("type") == "Available" and c.get("status") == "True" for c in conds)
     return {"t": t, "gateway": gw, "rendered": rendered, "cdc_available": cdc,
+            "installer": installer_conditions(installers_json),
             "errors": {k: v[:300] for k, v in err.items() if v}}
 
 
@@ -252,12 +324,9 @@ def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
     if gw == "no_address":
         span = last["t"] - readings[0]["t"]
         return "lb_pending", f"waiting on GCP: the platform gateway Service has no LoadBalancer address after {span:.0f}s; {tail}"
-    # how long the address has held: since the first reading of the trailing run of readings with
-    # it (an address that disappeared and came back restarts the count, #1006 F7)
-    first = len(readings) - 1
-    while first > 0 and readings[first - 1]["gateway"] == "address":
-        first -= 1
-    since = last["t"] - readings[first]["t"]
+    # how long the address has held (an address that disappeared and came back restarts the count,
+    # #1006 F7; a reading that could not be taken does not, R2-1)
+    since = last["t"] - (address_since(readings) or last["t"])
     r = last["rendered"]
     if r == "unread":
         return "rendered_unread", (f"the gateway has an address; the Frontend composition could not be read "
@@ -272,9 +341,13 @@ def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
     if last["cdc_available"] is False:
         return "installer_cdc_down", (f"the gateway has an address, but the installer cdc is not Available: "
                                       f"nothing renders installer-platform (Frontend composition {r}); {tail}")
+    conds = last.get("installer")
+    says = ("; ".join(f"{c['type']}={c['status']} ({c.get('reason') or '-'}): {c.get('message') or '-'}" for c in conds)
+            if conds else "its conditions could not be read")
     return "installer_defect", (f"INSTALLER DEFECT: the installer cdc is Available and the gateway has had its "
                                 f"address for {since:.0f}s (2 x its resync), yet the Frontend composition it "
-                                f"renders is {r} (not one origin at /content, /auth, /events); {tail}")
+                                f"renders is {r} (not one origin at /content, /auth, /events); the Installer "
+                                f"composition says: {says}; {tail}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -298,6 +371,9 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--frontends-rc", type=int, required=True)
     rd.add_argument("--gateway-err", default="")
     rd.add_argument("--frontends-err", default="")
+    rd.add_argument("--installers-json", default="", help="kubectl get installers -o json (krateo-system)")
+    ad = sub.add_parser("address-since", help="when the gateway's current address was first read (empty: none)")
+    ad.add_argument("--readings", required=True)
     v = sub.add_parser("verdict")
     v.add_argument("--readings", required=True)
     v.add_argument("--resync", required=True)
@@ -330,7 +406,12 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "reading":
         print(json.dumps(reading(a.t, a.gateway_json, a.gateway_rc, a.frontends_json, a.frontends_rc,
                                  a.deployments_json, {"gateway": text(a.gateway_err),
-                                                      "frontends": text(a.frontends_err)})))
+                                                      "frontends": text(a.frontends_err)}, a.installers_json)))
+        return 0
+    if a.cmd == "address-since":
+        rows = [json.loads(x) for x in text(a.readings).splitlines() if x.strip()]
+        t = address_since(rows)
+        print("" if t is None else f"{t:.3f}")
         return 0
     if a.cmd == "resync":
         errors = text(a.errors)

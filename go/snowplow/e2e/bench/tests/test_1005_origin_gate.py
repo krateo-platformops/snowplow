@@ -25,6 +25,7 @@ only when a child changes (#1006 review F1).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 import pytest
@@ -112,6 +113,22 @@ def test_the_last_envfrom_source_wins_and_a_prefix_applies():
     assert r["seconds"] == 75 and "prefix COMPOSITION_" in r["source"]
 
 
+def test_an_envfrom_secret_that_may_carry_the_key_is_unread_never_skipped():
+    """#1006 R2-4: Kubernetes takes the LAST envFrom source that has the key;
+    the gate never reads Secrets, so a Secret after the ConfigMap is UNREAD.
+    One before it loses to the ConfigMap's value."""
+    after = {"args": [], "env": [], "envFrom": [{"configMapRef": {"name": CM}}, {"secretRef": {"name": "s"}}]}
+    r = _r(_deploy(after), _cms(**{CM: {ENV: "60s"}}))
+    assert r["source"].startswith("UNREAD (") and "envFrom Secret s may set" in r["source"]
+    assert r["seconds"] == origin_gate.COMPILED_DEFAULT_S
+    before = {"args": [], "env": [], "envFrom": [{"secretRef": {"name": "s"}}, {"configMapRef": {"name": CM}}]}
+    r = _r(_deploy(before), _cms(**{CM: {ENV: "60s"}}))
+    assert r["seconds"] == 60 and "envFrom ConfigMap" in r["source"]
+    prefixed = {"args": [], "env": [], "envFrom": [{"configMapRef": {"name": CM}},
+                                                   {"secretRef": {"name": "s"}, "prefix": "OTHER_"}]}
+    assert _r(_deploy(prefixed), _cms(**{CM: {ENV: "60s"}}))["seconds"] == 60     # its prefix cannot make the key
+
+
 def test_else_the_compiled_default():
     r = _r(_deploy(_c()), _cms(**{CM: {}}))
     assert r["seconds"] == 180 and "sets no -resync-interval" in r["source"]
@@ -131,9 +148,44 @@ def test_more_than_one_installer_cdc_is_refused():
     assert r["seconds"] is None and r["refuse"].startswith("ambiguous: 2")
 
 
-def test_parse_duration():
-    assert [origin_gate.parse_duration(x) for x in ("60s", "3m", "1m30s", "1h", "500ms", "", "3", "x", "-1s", None)] == \
-        [60, 180, 90, 3600, 0.5, None, None, None, None, None]
+#: Go's time.ParseDuration, by its own test table (src/time/time_test.go): every form it accepts is
+#: accepted with its value, every form it rejects is rejected (#1006 R2-3)
+GO_ACCEPTS = [
+    ("0", 0), ("5s", 5), ("30s", 30), ("1478s", 1478), ("-5s", -5), ("+5s", 5), ("-0", 0), ("+0", 0),
+    ("5.0s", 5), ("5.6s", 5.6), ("5.s", 5), (".5s", 0.5), ("1.0s", 1), ("1.00s", 1), ("1.004s", 1.004),
+    ("1.0040s", 1.004), ("100.00100s", 100.001), ("10ns", 10e-9), ("11us", 11e-6), ("12\u00b5s", 12e-6),
+    ("12\u03bcs", 12e-6), ("13ms", 13e-3), ("14s", 14), ("15m", 900), ("16h", 57600), ("3h30m", 12600),
+    ("10.5s4m", 250.5), ("-2m3.4s", -123.4), ("1h2m3s4ms5us6ns", 3723.004005006), ("39h9m14.425s", 39 * 3600 + 9 * 60 + 14.425),
+    ("52763797000ns", 52.763797), ("0.3333333333333333333h", 1200), (".5m", 30), ("1.m", 60), ("+60s", 60),
+]
+GO_REJECTS = ["", "3", "-", "s", ".", "-.", ".s", "+.s", "1d", "\x85\x85", "\xffff", "hello \xffff world",
+              " 60s", "60s ", "1.5", "60S"]
+
+
+@pytest.mark.parametrize("text,secs", GO_ACCEPTS)
+def test_parse_duration_accepts_what_go_accepts(text, secs):
+    assert origin_gate.parse_duration(text) == pytest.approx(secs, rel=1e-9, abs=1e-12)
+
+
+@pytest.mark.parametrize("text", GO_REJECTS)
+def test_parse_duration_rejects_what_go_rejects(text):
+    assert origin_gate.parse_duration(text) is None
+
+
+@pytest.mark.parametrize("flag", [".5m", "1.m", "+60s", "60s", "1m0s"])
+def test_a_valid_go_flag_is_never_refused(flag):
+    r = _r(_deploy(_c(args=[f"-resync-interval={flag}"])), _cms())
+    assert r["refuse"] is None and r["seconds"] == origin_gate.parse_duration(flag)
+
+
+@pytest.mark.parametrize("where", ["arg", "env"])
+@pytest.mark.parametrize("v", ["0", "-0", "-5s"])
+def test_a_resync_that_is_not_positive_is_refused_the_cdc_does_not_start(where, v):
+    """unstructured-runtime v1.7.0 controller.go:164 refuses a resync <= 0:
+    the cdc parses it (Go accepts it), then does not start."""
+    c = _c(args=[f"-resync-interval={v}"]) if where == "arg" else _c(env=[{"name": ENV, "value": v}])
+    r = _r(_deploy(c), _cms())
+    assert r["refuse"] and "is not positive" in r["refuse"] and "does not start" in r["refuse"]
 
 
 # ─── the window ─────────────────────────────────────────────────────────────
@@ -181,6 +233,33 @@ def test_the_last_reading_decides_and_an_address_that_came_back_restarts_the_cou
     assert k == "lb_pending"
     k, m = origin_gate.verdict([_p(0), _p(60, gw="no_address"), _p(100), _p(130)], R, "w")
     assert k == "installer_defect" and "for 30s" in m
+
+
+@pytest.mark.parametrize("gws,since", [
+    (["address", "unread", "address"], 0),                        # a reading not taken keeps the window
+    (["address", "unread", "unread", "address"], 0),
+    (["address", "no_address", "address"], 2),                    # a reading of NO address restarts it
+    (["address", "absent", "unread", "address"], 3),
+    (["unread", "address"], 1),
+    (["address", "no_address"], None),
+    (["address", "unread"], 0),
+])
+def test_only_a_reading_of_no_address_restarts_the_window(gws, since):
+    """#1006 R2-1: one transient API error must not end a paid run's window."""
+    assert origin_gate.address_since([_p(i, gw=g) for i, g in enumerate(gws)]) == since
+
+
+def test_the_installer_defect_carries_the_installer_compositions_own_conditions():
+    """#1006 R2-6: Available says the pod is up, not that its reconcile
+    succeeds: the Installer composition's Ready/Synced say why."""
+    last = dict(_p(9), installer=[{"type": "Ready", "status": "False", "reason": "ReconcileError",
+                                   "message": "lookup krateo-agent-gateway-platform: forbidden"},
+                                  {"type": "Synced", "status": "True", "reason": "ReconcileSuccess", "message": ""}])
+    k, m = origin_gate.verdict([_p(0), last], R, "w")
+    assert k == "installer_defect"
+    assert ("the Installer composition says: Ready=False (ReconcileError): lookup krateo-agent-gateway-platform: "
+            "forbidden; Synced=True (ReconcileSuccess): -") in m
+    assert "its conditions could not be read" in origin_gate.verdict([_p(0), _p(9)], R, "w")[1]
 
 
 def test_a_reading_is_built_from_what_kubectl_answered(tmp_path):
@@ -267,6 +346,16 @@ def test_a_gate_that_runs_out_names_its_failure(harness, env, kind):  # noqa: F8
     assert readings and all(r["t"] > 1_800_000_000 for r in readings)
 
 
+def test_the_installer_defect_through_the_real_sequence_names_the_installers_conditions(harness):  # noqa: F811
+    """#1006 R2-6: read from the Installer composition the cdc renders (read-only)."""
+    p, out, d = _run(harness, FAKE_PORTAL="split", FAKE_RENDERED="split", FAKE_CDC_RESYNC="args:20s",
+                     BENCH_GATE_CLOCK_STEP_S="10", PLATFORM_POLL_S="0")
+    assert p.returncode != 0 and "portal origin FAILED: installer_defect: INSTALLER DEFECT" in out
+    assert "the Installer composition says: Ready=True (Available)" in out, out[-3000:]
+    last = json.loads((d / "portal-origin-wait.jsonl").read_text().splitlines()[-1])
+    assert [c["type"] for c in last["installer"]] == ["Ready", "Synced"]
+
+
 def test_an_address_that_flaps_restarts_the_window(harness):  # noqa: F811
     """F7: address, gone, address, gone ...: the window restarts at every
     return, so the gate stops on the LB bound, saying no address."""
@@ -275,6 +364,43 @@ def test_an_address_that_flaps_restarts_the_window(harness):  # noqa: F811
     assert p.returncode != 0 and "portal origin FAILED: lb_pending" in out
     gws = [json.loads(x)["gateway"] for x in (d / "portal-origin-wait.jsonl").read_text().splitlines()]
     assert gws[:4] == ["address", "no_address", "address", "no_address"] and len(gws) >= 8
+
+
+def test_one_unreadable_gateway_read_keeps_the_window(harness):  # noqa: F811
+    """#1006 R2-1: the address on read 1, ONE TLS handshake timeout on read 2,
+    the URLs on read 5, the LB budget already spent: the window from read 1
+    holds (2 x 20 s, 10 s per read) and the run goes on."""
+    p, out, d = _run(harness, FAKE_PORTAL="after:4", FAKE_GATEWAY="blip", FAKE_CDC_RESYNC="args:20s",
+                     BENCH_GATE_CLOCK_STEP_S="10", PLATFORM_POLL_S="0", ENDPOINT_WAIT_S="10")
+    assert p.returncode == 0, out[-3000:]
+    gws = [json.loads(x)["gateway"] for x in (d / "portal-origin-wait.jsonl").read_text().splitlines()]
+    assert gws[:3] == ["address", "unread", "address"] and "portal origin (config.json)" in out
+
+
+@pytest.mark.parametrize("side", ["one_past_the_slack", "at_the_slack"])
+def test_the_ttl_refusal_sits_exactly_at_the_slack(harness, side):  # noqa: F811
+    """#1006 R2-2: the refusal is 2 x (resync - budget term) > TTL slack, the
+    slack being TTL - margin - run budget. One second past it is refused (a
+    1 x excess, or a slack that kept the margin, would only warn); exactly at
+    it warns. The slack is read from this plan's own budget line."""
+    import shutil
+    env, state, ambient, tmp = harness
+    # the probe stops at `up` and tears down: on a COPY of the fake cloud's state, never the run's
+    shutil.copytree(state, tmp / "probe-state")
+    probe = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], capture_output=True, text=True, timeout=300,
+                           env=dict(env, FAIL_AT="up", OUT=str(tmp / "probe"), FAKE_STATE=str(tmp / "probe-state")))
+    m = re.search(r"= (\d+) s; fits TTL_HOURS=\d+ \((\d+) s; [^)]*\) minus (\d+) s", probe.stdout + probe.stderr)
+    budget, ttl, margin = map(int, m.groups())
+    slack = ttl - margin - budget
+    assert slack > 2 and margin > 2                      # a band (slack, slack + margin] exists
+    resync = 180 + slack // 2 + (1 if side == "one_past_the_slack" else 0)
+    p, out, d = _run(harness, FAKE_CDC_RESYNC=f"args:{resync}s")
+    if side == "one_past_the_slack":
+        assert p.returncode != 0 and f"by more than the TTL's {slack}s slack" in out
+        assert "=== step env ===" not in out
+    else:
+        assert p.returncode == 0, out[-3000:]
+        assert f"WARNING: the cdc's resync ({resync}s) exceeds the run budget's 180s" in out
 
 
 def test_a_squeezed_platform_budget_still_leaves_the_gate_its_window(harness):  # noqa: F811

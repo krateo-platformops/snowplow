@@ -761,8 +761,13 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what == "svc" and "krateo-agent-gateway-platform" in a:
             # the platform gateway (#1005): FAKE_GATEWAY = address (default) | none (GCP still
             # provisioning) | absent (NotFound) | unread (an API error) | flap (address, then none on
-            # every 2nd read)
+            # every 2nd read) | blip (address; read 2 is one API error; address again: #1006 R2-1)
             mode = os.environ.get("FAKE_GATEWAY", "address")
+            if mode == "blip":
+                cnt = os.path.join(STATE, "gateway_reads")
+                n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+                open(cnt, "w").write(str(n + 1))
+                mode = "unread" if n == 1 else "address"
             if mode == "flap":
                 cnt = os.path.join(STATE, "gateway_reads")
                 n = int(open(cnt).read()) if os.path.exists(cnt) else 0
