@@ -1,0 +1,14 @@
+status: 200
+Content-Type: "application/json"
+Content-Disposition: "attachment; filename=\"golden.json\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=500&resource=restactions
+body:
+[
+  {
+    "cpu": 2,
+    "mem": 1.5
+  }
+]

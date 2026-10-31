@@ -1,0 +1,12 @@
+status: 200
+Content-Type: "text/csv; charset=utf-8"
+Content-Disposition: "attachment; filename=\"golden.csv\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=500&resource=restactions
+body:
+health,multi,name,ready,tags,text,usage.cpu
+"Critical, degraded","line one
+line ""two""",'=1+1,false,[],Grüße — Ελληνικά — Кириллица — 東京,7
+'-x,,'@SUM(A1),true,,,0.25

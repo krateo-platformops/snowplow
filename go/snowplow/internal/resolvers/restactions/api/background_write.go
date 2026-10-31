@@ -153,14 +153,14 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 		return false
 	}
 	verb := ptr.Deref(call.Verb, http.MethodGet)
-	msg := fmt.Sprintf("background work never writes: stage %q verb %s is sent only on a customer request (%s, #903)", sc.id, verb, origin)
+	msg := writeRefusalMessage(origin, sc.id, verb)
 	var itemErr error
 	if !call.ContinueOnError {
 		itemErr = fmt.Errorf("api %s item %d failed: %s", sc.id, i, msg)
 	}
 	r.recordItemError(sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
 	recordBackgroundWriteRefused(origin)
-	r.log.Debug("write stage refused: not a customer request",
+	r.log.Debug("write stage refused",
 		slog.String("name", sc.id),
 		slog.String("verb", verb),
 		slog.String("origin", origin),
@@ -168,4 +168,15 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 		slog.String("restaction_name", r.opts.RESTActionName))
 	return true
+}
+
+// writeRefusalMessage is the text a refused write item records under its
+// errorKey. It can reach the resolved output (and an export's rows), so it
+// names what the request is: an export is a customer's own read (#970), not
+// background work, and is told so.
+func writeRefusalMessage(origin, stage, verb string) string {
+	if origin == cache.NonCustomerExport {
+		return fmt.Sprintf("an export never sends writes: stage %q verb %s was not sent (export, #970)", stage, verb)
+	}
+	return fmt.Sprintf("background work never writes: stage %q verb %s is sent only on a customer request (%s, #903)", stage, verb, origin)
 }

@@ -1,0 +1,9 @@
+status: 403
+Content-Type: "application/json"
+Content-Disposition: ""
+X-Export-Truncated: ""
+X-Content-Type-Options: "nosniff"
+X-From-Call: "yes"
+call[0]: fail=1&name=demo&page=1&perPage=500&resource=restactions
+body:
+{"kind":"Status","status":"Failure","code":403,"message":"forbidden"}
