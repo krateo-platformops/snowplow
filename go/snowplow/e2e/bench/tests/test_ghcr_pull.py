@@ -114,7 +114,7 @@ def _leaks():
                                 "(inst.privateImageComponents), yet no rendered pod running a ghcr.io image carries "
                                 "the pull secret it injects at uiTokenHop.image.pullSecrets"),
     # #1041 review F1: a private-image component with no repo of its own is checked too
-    ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-dispatcher:0.4.0: the installer lists it as a "
+    ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-provider:0.2.53: the installer lists it as a "
                          "private-image component (inst.privateImageComponents) and it cannot be rendered"),
     ("private_rule_dynamic", "inst.privateImageComponents is not one static list"),
 ])
@@ -138,7 +138,7 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "private_unrendered": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "agentgateway-policies"},
         "private_no_image": lambda: {"FAKE_HELM_TEMPLATE_EMPTY": "agentgateway-policies"},
         "private_path_unrendered": lambda: {"FAKE_POLICIES_VERSION": FAKE_CHART_HOP_UNRENDERED},
-        "private_repoless": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "alert-dispatcher"},
+        "private_repoless": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "alert-provider"},
         "private_rule_dynamic": lambda: {"FAKE_PRIVATE_IMAGES": "dynamic"},
     }[case]())
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
@@ -166,18 +166,22 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
     pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
     assert sorted((c["chart"].rsplit("/", 1)[1], c["version"], c["error"]) for c in pf["charts"]) == [
         ("agentgateway-controller", "0.2.0", None), ("agentgateway-policies", "0.2.18", None),
-        ("alert-dispatcher", "0.4.0", None),
+        ("alert-provider", "0.2.53", None),
         ("github-provider-kog", "0.6.0", None), ("krateo-marketplace-catalog", "0.1.2", None)]
     # #1041 review F1: the repo-less private-image component, from the installer's ociRepo
-    disp = next(c for c in pf["charts"] if c["chart"].endswith("/alert-dispatcher"))
-    assert disp["chart"] == "oci://ghcr.io/krateo-platformops/charts/alert-dispatcher"
+    disp = next(c for c in pf["charts"] if c["chart"].endswith("/alert-provider"))
+    assert disp["chart"] == "oci://ghcr.io/krateo-platformops/charts/alert-provider"
     # F4: each pull-secret path tied to the pod that uses it
     pol = next(c for c in pf["charts"] if c["chart"].endswith("/agentgateway-policies"))
     assert [(x["path"], x["result"], x["images"]) for x in pol["paths"]] == [
         ("certReplayHop.image.pullSecrets", "ok", ["ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18"]),
         ("uiTokenHop.image.pullSecrets", "ok", ["ghcr.io/krateo-agentiko/ui-token-hop:0.2.18"])]
-    assert [(x["path"], x["result"]) for x in disp["paths"]] == [("imagePullSecrets", "ok")]
-    assert pf["caps"]["blob_max"] == 16 * 363_138 and pf["caps"]["chart_file_max"] == 5 * 1024 * 1024
+    # N1: its secret is on its ServiceAccount, which its Deployment and Job name: ok, as on a cluster
+    assert [(x["path"], x["result"], x["images"]) for x in disp["paths"]] == [
+        ("imagePullSecrets", "ok", ["ghcr.io/krateo-platformops/alert-provider:0.2.53"])]
+    assert pf["caps"]["chart_inflated_max"] == pf["caps"]["blob_max"] == 100 * 1024 * 1024
+    assert pf["caps"]["chart_file_max"] == 5 * 1024 * 1024
+    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "render"} for c in pf["charts"])
     # the images: read from the pinned chart's own values (an empty tag = its appVersion), each
     # ghcr.io one resolved with the token; another registry's named, not this token's to resolve
     # #1023 A: RENDERED with the installer's componentValues: ui-token-hop (on only through them, named
@@ -187,13 +191,12 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
         {"image": "ghcr.io/krateo-agentiko/cert-replay-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None},
         {"image": "ghcr.io/krateo-agentiko/hop-sidecar:9.0.1", "charts": ["agentgateway-policies"], "error": None},
         {"image": "ghcr.io/krateo-agentiko/ui-token-hop:0.2.18", "charts": ["agentgateway-policies"], "error": None},
-        {"image": "ghcr.io/krateo-platformops/alert-dispatcher:0.4.0", "charts": ["alert-dispatcher"], "error": None}]
+        {"image": "ghcr.io/krateo-platformops/alert-provider:0.2.53", "charts": ["alert-provider"], "error": None}]
     assert {c["chart"].rsplit("/", 1)[1]: (c["render"].split(" ")[0], c["private_image_component"])
             for c in pf["charts"]} == {"agentgateway-controller": ("ok", False), "agentgateway-policies": ("ok", True),
-                                       "alert-dispatcher": ("ok", True),
+                                       "alert-provider": ("ok", True),
                                        "github-provider-kog": ("ok", False), "krateo-marketplace-catalog": ("ok", False)}
-    assert pf["private_image_components"] == ["agentgateway-policies", "alert-dispatcher", "alert-provider",
-                                              "core-provider-agent"]
+    assert pf["private_image_components"] == ["agentgateway-policies", "alert-provider", "core-provider-agent"]
     # F2: every call at its own WHOLE bound
     assert pf["bound_s"] == 5 * (4 * 30 + 60 + 120) + 5 * 2 * 30
     assert "5 charts x (4 x 30 + 60 + 120 s) + 5 images x (2 x 30 s)" == pf["bound"]
@@ -486,12 +489,99 @@ def test_a_render_over_its_output_cap_is_refused(monkeypatch):
     assert r["render_error"] == "helm template rendered more than its 10 byte cap"
 
 
-def test_the_caps_come_from_real_charts_and_a_stated_margin():
+def test_the_caps_are_helms_own_limits_and_the_render_a_measured_margin():
+    """The chart's files: helm's own loader limits (100 MiB a chart, 5 MiB a
+    file); the blob: a gzip stream inflates to about its own size at least,
+    so the same 100 MiB; the render (helm has no limit): 16 x the largest
+    measured. Every real chart run 20 pulls sits far inside each."""
     c = ghcr_pull.CAPS
-    assert c["blob_max"] == c["margin"] * c["real_largest"]["blob"]
-    assert c["chart_inflated_max"] == c["margin"] * c["real_largest"]["inflated"]
-    assert c["render_out_max"] == c["margin"] * c["real_largest"]["render"]
-    assert c["chart_file_max"] == 5 * 1024 * 1024 > c["real_largest"]["file"]     # helm's own file limit
+    assert (c["chart_inflated_max"], c["chart_file_max"]) == (100 * 1024 * 1024, 5 * 1024 * 1024)
+    assert c["blob_max"] == c["chart_inflated_max"]
+    assert c["render_out_max"] == c["render_margin"] * c["real_largest"]["render"]
+    assert all(c["real_largest"][k] < cap for k, cap in (("blob", c["blob_max"]), ("file", c["chart_file_max"]),
+                                                         ("inflated", c["chart_inflated_max"]),
+                                                         ("render", c["render_out_max"])))
+
+
+def _many_member_chart(n):
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, body in (("c/Chart.yaml", b"name: c\nversion: 1.0.0\n"), ("c/values.yaml", b"a: 1\n")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(body)
+            tf.addfile(ti, io.BytesIO(body))
+        for i in range(n):
+            tf.addfile(tarfile.TarInfo(f"c/templates/e{i}.yaml"), io.BytesIO(b""))
+    return buf.getvalue()
+
+
+def _walk_peak(data):
+    import tracemalloc
+    tracemalloc.start()
+    out = ghcr_pull.read_chart_files(data)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    return out, peak
+
+
+def test_a_chart_of_many_members_is_walked_in_constant_memory():
+    """#1041 review (round 2, info): the walk's memory does not grow with the
+    member count. 90 000 more members, kept as headers, would add tens of MB
+    (about 420 B each); walked one at a time they add nearly nothing. A
+    difference, not an absolute bound, so other threads' allocations do not
+    count."""
+    (charts, vals, _, _), small = _walk_peak(_many_member_chart(10_000))
+    _, large = _walk_peak(_many_member_chart(100_000))
+    assert charts["c"]["name"] == "c" and vals["c"] == {"a": 1}
+    assert large - small < 90_000 * 420 // 4, (small, large)
+
+
+def test_only_the_tail_of_helms_stderr_is_read(tmp_path):
+    """#1041 review N3: the reason is helm's last line; the rest of a huge
+    stderr is never read."""
+    f = tmp_path / "stderr"
+    f.write_bytes(b"x" * 1_000_000 + b"\nError: the reason\n")
+    with open(f, "rb") as fh:
+        t = ghcr_pull._tail(fh)
+    assert len(t) <= ghcr_pull.STDERR_TAIL and t.strip().splitlines()[-1] == "Error: the reason"
+
+
+def _pod(image, secrets=(), sa=None, kind="Deployment"):
+    spec = {"containers": [{"name": "c", "image": image}]}
+    if secrets:
+        spec["imagePullSecrets"] = [{"name": s} for s in secrets]
+    if sa:
+        spec["serviceAccountName"] = sa
+    return {"kind": kind, "spec": {"template": {"spec": spec}}}
+
+
+@pytest.mark.parametrize("case,docs,effective,want", [
+    # A: the hop is enabled: false, but its template ignores it and runs the image with no secret
+    ("A", [_pod("ghcr.io/o/hop:1.0.0")], {"hop": {"enabled": False}}, "missing"),
+    # B: an UNRELATED ancestor is off; the chartGate pod renders, reading its secret from another key
+    ("B", [_pod("ghcr.io/o/chart-gate:1.0.0", ["other-secret"])], {"mcpServers": {"enabled": False}}, "missing"),
+    # C: the control: B with the ancestor on
+    ("C", [_pod("ghcr.io/o/chart-gate:1.0.0", ["other-secret"])], {"mcpServers": {"enabled": True}}, "missing"),
+    # D: the secret on the pod's ServiceAccount, which the pod names (alert-provider 0.2.53's shape)
+    ("D", [{"kind": "ServiceAccount", "metadata": {"name": "ctl-sa"},
+            "imagePullSecrets": [{"name": ghcr_pull.marker(0)}]}, _pod("ghcr.io/o/ctl:1.0.0", sa="ctl-sa")],
+     {}, "ok"),
+    # a pod naming no ServiceAccount runs as `default`
+    ("D-default", [{"kind": "ServiceAccount", "metadata": {"name": "default"},
+                    "imagePullSecrets": [{"name": ghcr_pull.marker(0)}]}, _pod("ghcr.io/o/ctl:1.0.0")], {}, "ok"),
+    # legitimately off: the hop disabled and nothing of it rendered
+    ("off", [], {"hop": {"enabled": False}}, "off"),
+])
+def test_off_means_nothing_runs_behind_it(case, docs, effective, want):
+    """#1041 review N2 (A, B, D): a path is off only when its sub-component is
+    disabled AND no rendered ghcr pod runs without the component's markers;
+    a pod's secrets include its ServiceAccount's (N1)."""
+    path = {"A": ["hop", "image", "pullSecrets"], "off": ["hop", "image", "pullSecrets"]}.get(
+        case, ["mcpServers", "chartGate", "imagePullSecrets"] if case in ("B", "C") else ["imagePullSecrets"])
+    got = ghcr_pull.path_results(docs, [path], effective)
+    assert got[0]["result"] == want, (case, got)
 
 
 def test_each_path_is_tied_to_the_pod_that_uses_it():

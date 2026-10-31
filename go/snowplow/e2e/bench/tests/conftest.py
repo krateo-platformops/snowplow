@@ -88,10 +88,11 @@ FAKE_CHART_VALUES = {
         "proxy": {"image": {"registry": "cr.agentgateway.dev", "repository": "agentgateway", "tag": "v0.7.0"}}},
     "agentgateway-controller": {"image": {"registry": "cr.agentgateway.dev", "repository": "controller",
                                           "tag": "v0.7.0"}},
-    # a private-image component with no repo of its own (the installer's ociRepo), on through portal:
-    # as alert-provider at 0.3.468 (#1041 review F1); its pull secret at the top-level imagePullSecrets
-    "alert-dispatcher": {"imagePullSecrets": [],
-                         "image": {"repository": "ghcr.io/krateo-platformops/alert-dispatcher", "tag": ""}},
+    # alert-provider in the REAL 0.2.53 shape (#1041 review N1): a private-image component with no
+    # repo of its own (the installer's ociRepo), on through portal; its pull secrets go on its
+    # ServiceAccount, and its Deployment and Job only name that ServiceAccount
+    "alert-provider": {"imagePullSecrets": [],
+                       "image": {"repository": "ghcr.io/krateo-platformops/alert-provider", "tag": ""}},
 }
 #: each chart's templates, real Helm templates (rendered by the real helm)
 FAKE_CHART_TEMPLATES = {
@@ -127,19 +128,39 @@ spec:
       - name: hop
         image: "{{ .Values.uiTokenHop.image.repository }}:{{ .Values.uiTokenHop.image.tag | default .Chart.AppVersion }}"
 """ + "{{- end }}\n"},
-    "alert-dispatcher": {"templates/dispatcher.yaml": """apiVersion: apps/v1
+    "alert-provider": {
+        "templates/serviceaccount.yaml": """apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krateo-alert-provider
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+""",
+        "templates/deployment.yaml": """apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: alert-dispatcher
+  name: krateo-alert-provider
 spec:
   template:
     spec:
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      serviceAccountName: krateo-alert-provider
       containers:
-      - name: d
+      - name: provider
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+""",
+        "templates/job.yaml": """apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hyperdx-key-bootstrap
+spec:
+  template:
+    spec:
+      serviceAccountName: krateo-alert-provider
+      restartPolicy: Never
+      containers:
+      - name: bootstrap
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
 """},
     # an init image hard-coded in a template, named by no values.yaml
