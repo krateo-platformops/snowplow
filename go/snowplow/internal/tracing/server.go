@@ -5,6 +5,9 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // NewServerHandler is snowplow's HTTP server instrumentation: it gives every
@@ -41,7 +44,7 @@ import (
 // PROBE AND DEBUG ROUTES GET NO SPAN (see spanned). That is the original
 // main.go filter, now decided on the route instead of the raw path.
 func NewServerHandler(next http.Handler, routes *http.ServeMux) http.Handler {
-	h := otelhttp.NewHandler(next, serviceName,
+	h := otelhttp.NewHandler(markPanics(next), serviceName,
 		otelhttp.WithFilter(func(r *http.Request) bool { return spanned(route(r.Pattern)) }),
 	)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +52,30 @@ func NewServerHandler(next http.Handler, routes *http.ServeMux) http.Handler {
 		// one step earlier changes nothing the mux sees.
 		_, r.Pattern = routes.Handler(r)
 		h.ServeHTTP(w, r)
+	})
+}
+
+// markPanics makes a panicking request count as unavailable (#1018 review).
+// otelhttp sets the span status and http.response.status_code only after the
+// handler RETURNS. A panic unwinds past that code, so the span used to export
+// Unset with no status code, an available request in the SLIs, while net/http
+// recovered the panic by closing the connection and the client (the gateway)
+// saw a 5xx. Here, inside otelhttp's span, a panic sets status Error and
+// http.response.status_code=500 on the span and is then RE-PANICKED unchanged,
+// so net/http's own recovery (log, close the connection) is exactly as before;
+// otelhttp's deferred span.End still exports the span. http.ErrAbortHandler
+// (a deliberate abort) is marked too: the client gets no response either way.
+func markPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				span := trace.SpanFromContext(r.Context())
+				span.SetAttributes(attribute.Int("http.response.status_code", http.StatusInternalServerError))
+				span.SetStatus(codes.Error, "handler panic")
+				panic(v)
+			}
+		}()
+		next.ServeHTTP(w, r)
 	})
 }
 

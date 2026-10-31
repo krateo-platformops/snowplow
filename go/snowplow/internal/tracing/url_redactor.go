@@ -17,18 +17,28 @@ import (
 //
 // Deliberately NOT in this list: `url.path`, `http.route`, `http.target` and
 // `server.address`, which carry no query. url.path is handled separately, on
-// Server spans only (serverPathKey below).
+// Server spans only (serverDroppedKeys below).
 var urlAttrKeys = [...]attribute.Key{"url.full", "http.url"}
 
-// serverPathKey is dropped from every SERVER span (#1013). otelhttp records the
-// raw request path as url.path, and a raw path can carry a name: snowplow's own
-// routes are all literal ("/call", "/call/read", …), so the only paths that
-// differ from their route are ones the client chose freely, e.g. an unmatched
-// "/call/<name>" that the mux 404s, or a "/swagger/<name>". The span already
-// carries the templated http.route (NewServerHandler), which is what the SLIs
-// and every view group on, so url.path adds nothing but that exposure. Client
-// spans keep it: their path is a RESTAction endpoint snowplow itself built.
-const serverPathKey attribute.Key = "url.path"
+// serverDroppedKeys are dropped from every SERVER span: client-chosen strings
+// the SLIs never read, which can carry a name.
+//
+//   - url.path (#1013): otelhttp records the raw request path, and a raw path
+//     can carry a name. snowplow's own routes are all literal ("/call",
+//     "/call/read", …), so the only paths that differ from their route are ones
+//     the client chose freely, e.g. an unmatched "/call/<name>" that the mux
+//     404s, or a "/swagger/<name>". The span already carries the templated
+//     http.route (NewServerHandler), which is what the SLIs and every view
+//     group on. Client spans keep url.path: their path is a RESTAction
+//     endpoint snowplow itself built.
+//   - http.request.method_original (#1018 review): otelhttp records the
+//     client's verbatim method when it is not a standard one ("PURGE",
+//     "get"), next to http.request.method="_OTHER"/"GET". The method is any
+//     token the client sends; the SLIs read http.request.method only.
+var serverDroppedKeys = map[attribute.Key]bool{
+	"url.path":                     true,
+	"http.request.method_original": true,
+}
 
 // redactingExporter strips credentials out of URL-bearing span attributes on
 // the way out of the process (#489), and the raw path out of Server spans
@@ -78,7 +88,8 @@ func (e redactingExporter) ExportSpans(ctx context.Context, spans []sdktrace.Rea
 
 // redactSpanURLs returns s with every URL attribute rendered through
 // redact.URL (userinfo dropped, query values replaced, keys kept) and, on a
-// Server span, url.path removed; or s itself when there was nothing to change.
+// Server span, every serverDroppedKeys attribute removed; or s itself when
+// there was nothing to change.
 func redactSpanURLs(s sdktrace.ReadOnlySpan) sdktrace.ReadOnlySpan {
 	if s == nil {
 		return s
@@ -87,7 +98,7 @@ func redactSpanURLs(s sdktrace.ReadOnlySpan) sdktrace.ReadOnlySpan {
 	attrs := s.Attributes()
 	var out []attribute.KeyValue // nil until the first change, then the rewritten list
 	for i, a := range attrs {
-		drop := server && a.Key == serverPathKey
+		drop := server && serverDroppedKeys[a.Key]
 		changed := drop
 		if !drop && a.Value.Type() == attribute.STRING && isURLAttr(a.Key) {
 			if safe := redact.URL(a.Value.AsString()); safe != a.Value.AsString() {

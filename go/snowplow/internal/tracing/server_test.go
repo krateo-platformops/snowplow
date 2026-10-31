@@ -203,3 +203,83 @@ func TestS1013_ProbesAndDebugGetNoSpan(t *testing.T) {
 		t.Fatalf("exported spans [%s], want [%s]: probes and /debug/ get none, /call and the unmatched /healthz one each", got, want)
 	}
 }
+
+// TestS1018_PanicCountsAsUnavailable — a handler that panics exports ONE
+// Server span with status Error and http.response.status_code=500 (it is
+// unavailable: the client sees the connection closed, the gateway a 5xx),
+// and the panic still reaches net/http unchanged (same value), so the
+// server's own recovery is as before.
+//
+// MUTATIONS (RED, shown in the PR): markPanics not wrapped around the handler
+// (span exported Unset with no status code); markPanics swallowing the panic
+// instead of re-panicking.
+func TestS1018_PanicCountsAsUnavailable(t *testing.T) {
+	type sentinel struct{ msg string }
+	boom := &sentinel{"zq1018-boom"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /call", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(boom) }))
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := newTracerProvider(exp)
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prev)
+		_ = tp.Shutdown(context.Background())
+	})
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		NewServerHandler(mux, mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/call", nil))
+	}()
+	if recovered != boom {
+		t.Fatalf("recovered %v from the handler chain, want the handler's own panic value: net/http must see the panic unchanged", recovered)
+	}
+	if err := tp.ForceFlush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported %d spans for one panicking request, want 1", len(spans))
+	}
+	s := spans[0]
+	if s.Status.Code != codes.Error {
+		t.Errorf("panicking request: span status %v, want Error (it counted as available)", s.Status.Code)
+	}
+	if got, _ := attr(s, "http.response.status_code"); got != "500" {
+		t.Errorf("panicking request: http.response.status_code=%q, want 500", got)
+	}
+	if s.Name != "GET /call" {
+		t.Errorf("span name %q, want GET /call", s.Name)
+	}
+}
+
+// TestS1018_MethodOriginalDropped — a non-standard method is recorded by
+// otelhttp as http.request.method="_OTHER" plus the verbatim
+// http.request.method_original. The verbatim value is any token the client
+// sends, so it is dropped from Server spans at export with url.path; the
+// normalised http.request.method stays.
+//
+// MUTATION (RED, shown in the PR): http.request.method_original removed from
+// serverDroppedKeys.
+func TestS1018_MethodOriginalDropped(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /call", status(http.StatusOK))
+	spans := serverSpans(t, mux, httptest.NewRequest("ZQ1018NAME", "/call", nil))
+	if len(spans) != 1 {
+		t.Fatalf("exported %d spans, want 1", len(spans))
+	}
+	s := spans[0]
+	if v, ok := attr(s, "http.request.method_original"); ok {
+		t.Errorf("Server span exports http.request.method_original=%q; it is dropped at export", v)
+	}
+	if v, _ := attr(s, "http.request.method"); v != "_OTHER" {
+		t.Errorf("http.request.method=%q, want the normalised _OTHER", v)
+	}
+	for _, a := range s.Attributes {
+		if strings.Contains(a.Value.Emit(), "ZQ1018NAME") {
+			t.Errorf("attribute %s carries the client's verbatim method", a.Key)
+		}
+	}
+}
