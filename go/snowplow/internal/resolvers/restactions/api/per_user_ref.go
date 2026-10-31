@@ -18,7 +18,9 @@
 // top of resolveStageEndpoint, which every stage passes BEFORE it branches on
 // userAccessFilter: a UAF stage ignores its endpointRef (it dials the
 // ServiceAccount, or the caller's own credential for an inline draft), yet a
-// per-user ref there is refused, logged and counted like any other. It runs on
+// per-user ref there is refused, logged and counted like any other.
+// resolveOne does not re-check; TestRev1032_ResolveOneOnlyBehindRefusePerUserRef
+// fails on any other caller of resolveOne and on a rule moved below it. It runs on
 // the name that would be looked up: a templated name is already DNS-1123
 // normalised by evalEndpointRef, and a literal name is looked up exactly as
 // written.

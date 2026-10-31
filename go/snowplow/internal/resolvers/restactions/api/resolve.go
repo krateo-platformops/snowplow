@@ -538,8 +538,9 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 // `.name` resolves identically), RFC1123-sanitizes the result, applies guardrail
 // (a) (namespace stays the author-literal — NEVER templated) and returns
 // templated=true. Guardrail (b) — a name that resolves to a per-user credential
-// Secret — is not applied here: since #1025 resolveOne refuses such a name for
-// every ref, templated or literal, on the normalised name this returns. A jq
+// Secret — is not applied here: since #1025 resolveStageEndpoint applies the
+// one rule (refusePerUserRef) to every ref, templated or literal, on the
+// normalised name this returns, before any lookup. A jq
 // error keeps the §1.2 honest-error posture — the error string is still
 // sanitized to a name that resolves to a Secret miss downstream, byte-identical
 // to pre-#341 — but #341 now also SURFACES it (a DEBUG line +
@@ -550,8 +551,9 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		return ref, false
 	}
 	if _, isTemplate := jqutil.MaybeQuery(ref.Name); !isTemplate {
-		// Static/literal name: passed through, NOT templated. resolveOne
-		// still applies the #1025 per-user credential rule to it.
+		// Static/literal name: passed through, NOT templated. The caller
+		// (resolveStageEndpoint) still applies the #1025 per-user credential
+		// rule to it.
 		return ref, false
 	}
 	// #341 — NON-dial evalJQ-swallow cleanup (#302 sibling). Render through
@@ -570,8 +572,8 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		)
 		rendered = jqErr.Error() // byte-identical to evalJQ's pre-#341 swallow value
 	}
-	// Normalised BEFORE resolveOne sees it, so the #1025 rule checks the
-	// name that is looked up.
+	// Normalised BEFORE the caller applies the #1025 rule, so the rule
+	// checks the name that is looked up.
 	name := kubeutil.MakeDNS1123Compatible(rendered)
 	// Guardrail (a): namespace is NEVER templated in V1 — it stays the
 	// author-authored literal, so a templated name can only ever select WITHIN

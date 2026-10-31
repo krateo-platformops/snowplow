@@ -40,8 +40,11 @@ type endpointReferenceMapper struct {
 //
 // #1025 — its only caller, resolveStageEndpoint, has already passed the named
 // ref through refusePerUserRef (per_user_ref.go), for every stage, UAF or
-// not, so a per-user credential name never reaches the lookup below. The
-// nil-ref synthesis legitimately builds the caller's OWN per-user name.
+// not, so a per-user credential name never reaches the lookup below.
+// TestRev1032_ResolveOneOnlyBehindRefusePerUserRef keeps it that way: it
+// fails on any other caller of resolveOne, and on a rule that no longer
+// precedes every resolveOne call there. The nil-ref synthesis legitimately
+// builds the caller's OWN per-user name.
 //
 // resolveOne additionally reports isSAEndpoint: true ONLY on the
 // InternalEndpointFromContext branch, which always carries snowplow's own SA

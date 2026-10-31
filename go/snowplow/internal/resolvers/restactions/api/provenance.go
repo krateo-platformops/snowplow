@@ -23,7 +23,8 @@ var fromSecretAsCallerFn = credhttp.FromSecret
 // apiserver decides whether the caller may read it (a 403 or 404 becomes the
 // stage's error). It never consults the SA-backed Secrets snapshot or the
 // ServiceAccount rest config. A per-user credential name never reaches it:
-// resolveOne refuses one for every provenance first (#1025).
+// resolveStageEndpoint applies the #1025 rule (refusePerUserRef) to every
+// stage's ref, for every provenance, before it calls resolveOne.
 func (m *endpointReferenceMapper) resolveOneAsCaller(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
 	// An inline request never carries an internal (ServiceAccount) rest
 	// config: only seeds and the refresher set one. Refuse rather than let

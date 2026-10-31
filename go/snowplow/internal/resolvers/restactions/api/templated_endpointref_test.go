@@ -9,9 +9,10 @@
 // guardrails:
 //   (a) V1 templates the NAME only; namespace stays the author-literal.
 //   (b) a templated ref may never resolve to a per-user credential name. Since
-//       #1025 this is not a templating rule any more: resolveOne refuses a
-//       per-user name for EVERY named ref, literal or templated, stored or
-//       caller-supplied (per_user_ref.go, issue1025_per_user_ref_test.go).
+//       #1025 this is not a templating rule any more: refusePerUserRef,
+//       applied to every stage before resolveOne, refuses a per-user name for
+//       EVERY named ref, literal or templated, stored or caller-supplied
+//       (per_user_ref.go, issue1025_per_user_ref_test.go).
 //
 // This file is the GATE-BLOCKING security proof (C-113-1) plus the request-
 // templated-marker default (C-113-2), namespace-literal (C-113-5), and static-ref
