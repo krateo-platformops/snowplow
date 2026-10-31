@@ -32,7 +32,10 @@
 // snapshot (`api.FromInformerSecret`). On any cache miss the
 // VERBATIM upstream call is then issued with the IDENTICAL arguments;
 // error handling on the fallback path is byte-identical to upstream
-// (NotFound → 401, anything else → 500). Cache hits bypass the
+// (NotFound → 401, anything else → 500). A SECOND intentional change (#994):
+// a token whose groups carry krateo:loa:2 reads the step-up Secret
+// `<user>-clientconfig-stepup` instead of `<user>-clientconfig`
+// (credsecret.For); every other token's Secret name is upstream's. Cache hits bypass the
 // apiserver GET entirely and are byte-equivalent to what
 // `endpoints.FromSecret` would have returned (gated by Ship D.2's
 // TestFromInformerSecret_UpstreamFieldParity).
@@ -58,11 +61,11 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	"github.com/krateo-platformops/plumbing/kubeutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
@@ -97,7 +100,9 @@ const PinnedPlumbingVersion = "v1.15.1"
 //      branches.)
 //
 //   5.  CACHE-FIRST LOOKUP — Ship D.3 change.
-//       `api.FromInformerSecret(ctx, authnNS, "<user>-clientconfig")`.
+//       `api.FromInformerSecret(ctx, authnNS, credsecret.For(user, groups))`:
+//       `<user>-clientconfig`, or `<user>-clientconfig-stepup` for a token
+//       whose groups carry krateo:loa:2 (#994).
 //
 //       a. served=true, ferr=nil  → cache HIT. Skip the upstream
 //          apiserver GET entirely; the cache's `Endpoint` value is
@@ -193,13 +198,18 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				return
 			}
 
-			// Ship D.3 — cache-first lookup. The `<user>-clientconfig`
-			// Secret name is computed IDENTICALLY to upstream
-			// `userconfig.go:51-52`: kubeutil.MakeDNS1123Compatible of
-			// the validated JWT username, with the `-clientconfig`
-			// suffix.
-			secretName := fmt.Sprintf("%s-clientconfig",
-				kubeutil.MakeDNS1123Compatible(userInfo.Username))
+			// Ship D.3 — cache-first lookup. #994 — the Secret is chosen
+			// from the VALIDATED token alone: a token whose groups carry
+			// krateo:loa:2 (a step-up login, authn#49) reads
+			// `<DNS1123(username)>-clientconfig-stepup`; every other token
+			// reads `<DNS1123(username)>-clientconfig`, computed
+			// IDENTICALLY to upstream `userconfig.go:51-52`. The name is
+			// built from the token's own username, never from a claim or
+			// the request. There is NO fallback between the two: a step-up
+			// Secret that is neither in the informer nor on the apiserver
+			// re-read below is a NotFound, which answers 401 like any
+			// missing credential.
+			secretName := credsecret.For(userInfo.Username, userInfo.Groups)
 
 			ep, served, ferr := api.FromInformerSecret(req.Context(), authnNS, secretName)
 			if !served {

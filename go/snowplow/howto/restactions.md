@@ -355,7 +355,8 @@ delimited by `${ ... }`. The template is evaluated against the shared resolve
 dict (previous stage outputs + `extras`) before the request is issued; a plain
 string without the delimiter is passed through verbatim. (`endpointRef.name`
 supports the same templating, with a guardrail: a request-templated name may
-never resolve to a reserved `<user>-clientconfig` credential Secret.)
+never resolve to a reserved per-user credential Secret: `<user>-clientconfig`
+or the step-up `<user>-clientconfig-stepup`.)
 
 ## Example
 

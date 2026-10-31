@@ -4,38 +4,38 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
-	"github.com/krateo-platformops/plumbing/kubeutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"k8s.io/client-go/rest"
 )
 
 type endpointReferenceMapper struct {
 	authnNS  string
 	username string
-	rc       *rest.Config
+	// groups are the requester's groups. With username they choose the
+	// caller's own credential Secret (credsecret.For, #994).
+	groups []string
+	rc     *rest.Config
 	// provenance (#443 part 2) — under ProvenanceCallerSupplied a named
 	// endpointRef Secret is read with the caller's own credentials.
 	provenance Provenance
 }
 
-// clientConfigSuffix is snowplow's OWN reserved internal-identity suffix: the
-// per-user credential Secret name resolveOne synthesizes for the nil-ref
-// internal path (`<user>-clientconfig`, endpoints.go). #113 guardrail (b) keys
-// on THIS single literal — a request-templated endpointRef may never resolve to
-// a name ending in it (that would let user query-extras select another user's
-// apiserver credentials — the credential-selection escalation). Single source so
-// the guardrail and the synthesis can never drift onto different strings
+// The per-user credential Secret names come from credsecret (#994): For picks
+// the one a validated identity reads (`<user>-clientconfig`, or
+// `<user>-clientconfig-stepup` when its groups carry krateo:loa:2), and
+// IsPerUserName is the reserved set #113 guardrail (b) and the #443
+// caller-supplied refusal key on. Single source, so the guardrail and the
+// synthesis can never drift onto different strings
 // (feedback_consultation_mutation_is_not_key_correctness). It is a general
-// boundary on the reserved suffix, NOT a per-resource carve-out
+// boundary on the reserved names, NOT a per-resource carve-out
 // (feedback_no_special_cases).
-const clientConfigSuffix = "-clientconfig"
 
 // resolveOne resolves a named/nil endpoint Reference to an Endpoint. templated
 // reports whether ref was produced by REQUEST-DRIVEN jq templating of
@@ -63,10 +63,13 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	// call site that forgets the eval-site check still cannot dial a per-user
 	// credential Secret. Gated on templated so the internal nil-ref synthesis
 	// below (which DOES build a `-clientconfig` name) is never refused.
-	if templated && ref != nil && strings.HasSuffix(ref.Name, clientConfigSuffix) {
+	// #994: the reserved set holds the step-up `<user>-clientconfig-stepup`
+	// too — a templated ref resolving to another user's step-up name would
+	// otherwise dial that user's ELEVATED credential.
+	if templated && ref != nil && credsecret.IsPerUserName(ref.Name) {
 		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"templated endpointRef resolved to the reserved internal-identity name %q (suffix %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
-			ref.Name, clientConfigSuffix)
+			"templated endpointRef resolved to the reserved per-user credential name %q (suffix %q or %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
+			ref.Name, credsecret.SessionSuffix, credsecret.StepUpSuffix)
 	}
 	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
 	// CALLER, never through the ServiceAccount or the SA-backed Secrets
@@ -110,9 +113,14 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 				slog.String("hint", "an internal driver (e.g. Phase 1) must pass *endpoints.Endpoint to cache.WithInternalEndpoint"),
 			)
 		}
+		// #994 — the caller's OWN credential, chosen exactly as the auth
+		// middleware chose it: the step-up Secret for an identity whose
+		// groups carry krateo:loa:2, else the session Secret. No fallback: a
+		// step-up identity whose Secret is gone fails this stage rather than
+		// dialing the session credential.
 		ref = &templates.Reference{
 			Namespace: m.authnNS,
-			Name:      kubeutil.MakeDNS1123Compatible(m.username) + clientConfigSuffix,
+			Name:      credsecret.For(m.username, m.groups),
 		}
 		isInternal = true
 	}

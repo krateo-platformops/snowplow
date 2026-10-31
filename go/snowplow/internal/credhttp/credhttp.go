@@ -158,6 +158,16 @@ func Client(c *http.Client) *http.Client {
 // build the in-cluster config against a test server.
 var inClusterConfig = rest.InClusterConfig
 
+// SetInClusterConfigForTest replaces the in-cluster config source and returns
+// the restore func. TEST-ONLY: it lets another package's test drive a caller
+// of InClusterConfig (the auth middleware's apiserver re-read, #994) against a
+// test server. Not safe for concurrent use with InClusterConfig.
+func SetInClusterConfigForTest(fn func() (*rest.Config, error)) (restore func()) {
+	prev := inClusterConfig
+	inClusterConfig = fn
+	return func() { inClusterConfig = prev }
+}
+
 // InClusterConfig is rest.InClusterConfig, hardened.
 func InClusterConfig() (*rest.Config, error) {
 	rc, err := inClusterConfig()

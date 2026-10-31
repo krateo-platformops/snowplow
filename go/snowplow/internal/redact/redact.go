@@ -1,7 +1,7 @@
 // Package redact is the single source of every identity label that may reach
 // a log line, a debug surface or an expvar (#453).
 //
-// THE RULE: no username, certificate CN, `<user>-clientconfig` Secret name or
+// THE RULE: no username, certificate CN, `<user>-clientconfig[-stepup]` Secret name or
 // group string is ever logged in clear. A site that wants to say WHICH identity
 // it acted for renders it through this package. The label is
 //
@@ -114,11 +114,15 @@ func Prefixed(prefix, s string) string {
 
 // apiserverUser matches the requester the apiserver names in a Forbidden
 // message (`pods is forbidden: User "alice" cannot list ...`); clientconfig
-// matches an authn `<user>-clientconfig` Secret name quoted in a NotFound
-// (`secrets "alice-clientconfig" not found`).
+// matches an authn per-user credential Secret name quoted in a NotFound: the
+// session `<user>-clientconfig` (`secrets "alice-clientconfig" not found`) and,
+// #994, the step-up `<user>-clientconfig-stepup`. It matches any quoted name
+// carrying `-clientconfig` rather than the two suffixes, because this package
+// stays a stdlib-only leaf and cannot import credsecret (which owns the
+// suffixes); a scrubber that over-matches costs only a label.
 var (
 	apiserverUser = regexp.MustCompile(`\b(User|user) "[^"]*"`)
-	clientconfig  = regexp.MustCompile(`"[^"]*-clientconfig"`)
+	clientconfig  = regexp.MustCompile(`"[^"]*-clientconfig[^"]*"`)
 )
 
 // ErrorText scrubs the identity an apiserver or authn error string carries

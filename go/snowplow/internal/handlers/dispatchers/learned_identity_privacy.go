@@ -25,14 +25,16 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // learnedRedactionTokens returns the strings a learned class's logs must never
-// carry: the username, its clientconfig Secret name (the DNS-1123 form authn
-// writes) and every group except system:authenticated (a constant every
-// identity carries, not an identity fact). Longest first, so a token that
-// contains another is replaced whole.
+// carry: the username, both of its credential Secret names (the DNS-1123 forms
+// authn writes: the session `-clientconfig` and, #994, the step-up
+// `-clientconfig-stepup`) and every group except system:authenticated (a
+// constant every identity carries, not an identity fact). Longest first, so a
+// token that contains another is replaced whole.
 func learnedRedactionTokens(username string, groups []string) []string {
 	seen := map[string]struct{}{}
 	var out []string
@@ -48,7 +50,8 @@ func learnedRedactionTokens(username string, groups []string) []string {
 	}
 	add(username)
 	if username != "" {
-		add(kubeutil.MakeDNS1123Compatible(username) + "-clientconfig")
+		add(credsecret.StepUpName(username))
+		add(credsecret.SessionName(username))
 		add(kubeutil.MakeDNS1123Compatible(username))
 	}
 	for _, g := range groups {
