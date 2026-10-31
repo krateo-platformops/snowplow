@@ -334,7 +334,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"PerIdentityForbiddenSinkFromContext": readOnly443,
 	"WithContentDepGenSink":               readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
-	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDial": readOnly443,
+	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDialValue": readOnly443,
 	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.
 	"IsSensitiveResource": readOnly443, "SensitiveTouchedSink.Bump": readOnly443,
 	"SensitiveTouchedSink.Count": readOnly443, "SensitiveTouchedSinkFromContext": readOnly443,

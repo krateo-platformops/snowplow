@@ -187,6 +187,17 @@ func h643Thing(name string) *unstructured.Unstructured {
 }
 
 // h643ExtStage is an api[] stage dispatched through the external endpointRef.
+// h643OwnStage is a stage with no endpointRef: it targets this cluster (#1017).
+func h643OwnStage(name, path string) map[string]any {
+	return map[string]any{"name": name, "path": path, "verb": "GET"}
+}
+
+// h643Iterate gives stage s an iterator expression.
+func h643Iterate(s map[string]any, iterator string) map[string]any {
+	s["dependsOn"] = map[string]any{"iterator": iterator}
+	return s
+}
+
 func h643ExtStage(name, path string) map[string]any {
 	return map[string]any{
 		"name": name, "path": path, "verb": "GET",

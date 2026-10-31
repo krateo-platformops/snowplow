@@ -236,16 +236,17 @@ func TestAssertReadPathsScoped_LogsAndCountsInProd_OnMissingMiddleware(t *testin
 	missing := AssertReadPathsScoped()
 	after := AssertionViolationsTotal()
 
-	// 12 required routes minus the one registered = 11 missing
+	// 14 required routes minus the one registered = 13 missing
 	// (GET /api-info/names, GET /list, POST /call, PUT /call,
 	// PATCH /call, DELETE /call, POST /call/read — the #186 body-read path —
-	// the three #443 POST|PUT|PATCH /call/dry-run twins, and the #1015
-	// POST /telemetry/v1/traces ingest).
-	if missing != 11 {
-		t.Errorf("missing count = %d; want 11", missing)
+	// the three #443 POST|PUT|PATCH /call/dry-run twins, the two #970
+	// export routes GET|POST /export, and the #1015 POST /telemetry/v1/traces
+	// ingest).
+	if missing != 13 {
+		t.Errorf("missing count = %d; want 13", missing)
 	}
-	if delta := after - before; delta != 11 {
-		t.Errorf("assertionViolationsTotal delta = %d; want 11", delta)
+	if delta := after - before; delta != 13 {
+		t.Errorf("assertionViolationsTotal delta = %d; want 13", delta)
 	}
 }
 
@@ -261,6 +262,7 @@ func TestAssertReadPathsScoped_AllPresentReturnsZero(t *testing.T) {
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 	registerDryRun443(t)
+	registerExport970(t)
 	registerTelemetry1015(t)
 
 	if missing := AssertReadPathsScoped(); missing != 0 {
@@ -287,6 +289,7 @@ func TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
 	registerDryRun443(t)
+	registerExport970(t)
 	registerTelemetry1015(t)
 	if missing := AssertReadPathsScoped(); missing != 0 {
 		t.Fatalf("#186 all-present: missing=%d; want 0 — POST /call/read must be a recognised required route", missing)
@@ -305,6 +308,7 @@ func TestAssertReadPathsScoped_CallRead186_RequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	registerDryRun443(t)
+	registerExport970(t)
 	registerTelemetry1015(t)
 	// POST /call/read deliberately NOT registered.
 	if missing := AssertReadPathsScoped(); missing != 1 {
@@ -333,6 +337,7 @@ func TestAssertReadPathsScoped_RBACEndpointUnregisteredStillPasses(t *testing.T)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric) // #186
 	registerDryRun443(t)
+	registerExport970(t)
 	registerTelemetry1015(t)
 	// GET /rbac deliberately NOT registered (mirrors /refreshes).
 
@@ -709,6 +714,47 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 // registerDryRun443 registers the three #443 /call/dry-run routes under the
 // write scope of the verb each one dry-runs, exactly as main.go's
 // mountCallWriteRoutes does.
+// registerExport970 registers the #970 export routes (GET and POST /export).
+func registerExport970(t *testing.T) {
+	t.Helper()
+	RegisterScopedRoute("GET /export", ScopeCallGeneric)
+	RegisterScopedRoute("POST /export", ScopeCallGeneric)
+}
+
+// TestAssertReadPathsScoped_Export970_RequiredAndRegistered — #970 boot-assert
+// arm: GET and POST /export are required scoped routes. With every required
+// route registered the assert passes; with either export route's
+// registration lost it reports exactly that route missing.
+func TestAssertReadPathsScoped_Export970_RequiredAndRegistered(t *testing.T) {
+	env.SetTestMode(false)
+	t.Cleanup(func() { env.SetTestMode(false) })
+	base := func() {
+		ResetRouteScopeRegistryForTest()
+		RegisterScopedRoute("GET /api-info/names", ScopePlurals)
+		RegisterScopedRoute("GET /list", ScopeList)
+		RegisterScopedRoute("GET /call", ScopeCallGeneric)
+		RegisterScopedRoute("POST /call", ScopeCallWritePost)
+		RegisterScopedRoute("PUT /call", ScopeCallWritePut)
+		RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
+		RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+		RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
+		registerDryRun443(t)
+		registerTelemetry1015(t)
+	}
+	base()
+	registerExport970(t)
+	if missing := AssertReadPathsScoped(); missing != 0 {
+		t.Fatalf("#970 all-present: missing=%d; want 0", missing)
+	}
+	for _, kept := range []string{"GET /export", "POST /export"} {
+		base()
+		RegisterScopedRoute(kept, ScopeCallGeneric) // the other export route's registration lost
+		if missing := AssertReadPathsScoped(); missing != 1 {
+			t.Errorf("#970 only %s registered: missing=%d; want exactly 1 (the other export route)", kept, missing)
+		}
+	}
+}
+
 func registerDryRun443(t *testing.T) {
 	t.Helper()
 	RegisterScopedRoute("POST /call/dry-run", ScopeCallWritePost)
@@ -731,6 +777,7 @@ func TestS443_DryRunRoutesRequiredAndRegistered(t *testing.T) {
 	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
 	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
 	RegisterScopedRoute("POST /call/read", ScopeCallGeneric)
+	registerExport970(t)
 	registerTelemetry1015(t)
 	if missing := AssertReadPathsScoped(); missing != 3 {
 		t.Fatalf("#443 half-wired: missing=%d; want exactly 3 (POST|PUT|PATCH /call/dry-run required but unregistered)", missing)

@@ -1,16 +1,16 @@
 ---
 type: Usage
 title: Generic export (GET /export)
-description: Export any /call-resolvable list (RESTAction or Widget) as a CSV or JSON attachment — parameters, row auto-detection, full-list pagination and the truncation cap, CSV shaping, and the audit trail.
+description: Export any /call-resolvable list (RESTAction or Widget) as a CSV, JSON or PDF attachment — parameters, column header labels, row auto-detection, full-list pagination and the truncation cap, CSV shaping, the PDF report, POST /export for large filters, and the audit trail.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
-tags: [portal, export, csv, audit]
-timestamp: 2026-08-06T00:00:00Z
+tags: [portal, export, csv, pdf, audit]
+timestamp: 2026-10-29T00:00:00Z
 ---
 
 # Generic export (`GET /export`)
 
 `/export` turns **any `/call`-resolvable list** — a `RESTAction` or a
-list/table `Widget` — into a downloadable **CSV** or **JSON** attachment.
+list/table `Widget` — into a downloadable **CSV**, **JSON** or **PDF** attachment.
 It is a pure serializer layered on the `/call` resolve lane
 (`internal/handlers/export.go`): the request is re-dispatched **in-process**
 through the same dispatcher chain the `GET /call` route uses, so
@@ -27,19 +27,186 @@ header — correlation rides W3C baggage.)
 ## Request
 
 ```
-GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&filename=...][&page=...&perPage=...]
+GET  /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&header=...]...[&title=...][&filename=...][&extras=...][&page=...&perPage=...]
+POST /export?<the same parameters, without extras>      body: {"extras":{...}}
 ```
+
+Use `POST /export` when the filter (`extras`) is large; see
+[Large filters: POST /export](#large-filters-post-export).
 
 The `apiVersion` / `resource` / `name` / `namespace` parameters are the
 standard `/call` ones. Authentication is the same JWT used for `/call`.
+The export's own parameters (`format`, `path`, `fields`, `header`, `title`,
+`filename`) are stripped before the request is re-dispatched through
+`/call`. Every other parameter, `extras` and `page`/`perPage` included, is
+forwarded to it.
+
+**Extras:** pass a widget's or RESTAction's `extras` (for example the
+filters a table shows on screen). `GET /export` takes them as the query
+parameter `extras=<URL-encoded JSON>`, exactly as on `GET /call`.
+`POST /export` takes them in the request body, exactly as `POST /call/read`
+does (below).
+
+- **Same rows.** Every re-dispatched page carries the same `extras`, so the
+  file holds exactly the rows the `/call` with those extras returns.
+- **Invalid extras.** Extras that are not valid JSON are refused with the
+  same `400` as on `/call`, and nothing is exported.
+- **Cache cells.** Each page of a full-list export reads a 500-row window
+  (`page=N&perPage=500`). That window is its own resolved-cache cell,
+  shared only with a `/call` of the same window and extras. The pages a
+  screen shows at its own page size are different cells, so the first
+  export of a filter resolves its windows fresh.
+- **URL size.** On `GET /export`, a filter too large for the URL cannot be
+  exported: the gateway answers `431` before snowplow sees the request.
+  Send it with `POST /export` instead.
 
 | Parameter  | Default | Description |
 |------------|---------|-------------|
-| `format`   | `csv`   | `csv` or `json`. |
-| `path`     | auto    | Optional **jq expression** selecting the row array inside the resolved envelope, e.g. `.status.services`. |
-| `fields`   | all     | Comma-separated list of column **dot-paths** selecting and ordering the CSV columns, e.g. `name,health,usage.cpu`. |
+| `format`   | `csv`   | `csv`, `json` or `pdf`. |
+| `path`     | auto    | Optional **jq expression** returning the row array from the resolved envelope, e.g. `.status.services` (see [What `path` must return](#what-path-must-return)). |
+| `fields`   | all     | Comma-separated list of column **dot-paths** selecting and ordering the CSV and PDF columns, e.g. `name,health,usage.cpu`. |
+| `header`   | dot-paths | Optional column **label**, one `header` parameter per field, repeated in `fields` order (below). |
+| `title`    | resource name | `pdf` only: the report title; csv and json ignore it. |
 | `filename` | derived | Attachment file name (sanitized; extension appended). |
+| `extras`   | none    | `GET /export`: the widget's or RESTAction's extras as URL-encoded JSON, as on `GET /call`, forwarded to every re-dispatched page (above). `POST /export`: in the body, never the query. |
 | `page` / `perPage` | full list | Export exactly that `/call` window. When **both** are omitted, the handler exports the **full list** (below). |
+
+### Large filters: POST /export
+
+`POST /export` is the same export with the extras in the request body, for
+a filter too large for a URL (many facet chips, long lists). It mirrors
+`POST /call/read` exactly:
+
+- **The body** is `/call/read`'s envelope, decoded by the same code:
+  `{"extras":{...}}` (an inline `object`, as `/call/read` accepts it, is
+  validated the same way). The body is bounded at 1 MiB. An invalid body,
+  or one over the bound, gets the same `400` as `/call/read` (its message
+  names `POST /export`), and nothing is exported.
+- **The query** carries everything else: the addressing (`apiVersion`,
+  `resource`, `name`, `namespace`), `page`/`perPage` and the export's own
+  parameters (`format`, `path`, `fields`, `header`, `title`, `filename`).
+  That is where `/call/read` keeps every parameter that is not extras.
+- **A `?extras=` on a POST is ignored**, as on `/call/read`: the body is
+  the only source of extras.
+- **Every re-dispatched page** goes through the `/call/read` read lane:
+  the same resolve handlers, and the read-only passthrough (verb forced to
+  `GET`) for a resource they don't serve. A page uses the same
+  resolved-cache cell and refresh key as a `POST /call/read` of that window
+  with that body.
+- **Auth and RBAC** are identical to `GET /export`.
+
+```sh
+curl -fsS -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -o table.csv \
+  -X POST "$SNOWPLOW/export?apiVersion=widgets.templates.krateo.io/v1beta1&resource=tables&name=marketplace&namespace=demo&format=csv" \
+  -d '{"extras":{"facets":["a","b","c"]}}'
+```
+
+### An export never writes
+
+An export is a read. A RESTAction that declares a write stage (any verb but
+`GET`, `HEAD`, `OPTIONS`, `TRACE`) is exported without sending that write,
+by `GET` and `POST /export` alike, on every page of the export, for every
+item of an iterator stage, and whatever the stage's `continueOnError`:
+- the write stage is refused the way background work refuses one (origin
+  `export`), and the rows of the other stages still export. Its `errorKey`
+  records `an export never sends writes: stage "<name>" verb <VERB> was not
+  sent (export, #970)`; a RESTAction filter that exports the `errorKey`
+  exports that text;
+- the refusal is reported, not silent: the export response carries
+  `X-Snowplow-Stage-Outcomes`, the stages of its re-dispatched pages that
+  did not succeed (as `/call` reports them), and the refused write stage
+  is listed there. The merged value keeps the header's 4 KiB bound: above
+  it, or when a page already sent the summary, it is
+  `{"truncated":true,"failed":N}`, with `N` the number of distinct
+  outcomes the pages listed (or a summarised page's own `N`, when larger);
+- nothing is cached for a customer read to be served from: a RESTAction
+  that declares a write stage is never stored, so a `GET /call` after an
+  export resolves again and sends its write.
+
+**Behaviour change:** before #970, `GET /export` of such a RESTAction sent
+its write stage, like `GET /call` does. It no longer does. `GET /call` and
+`POST /call/read` are unchanged.
+
+### Column header labels
+
+`header` gives the selected columns human-readable labels. It is a
+**repeated parameter, one per field, in the same order as `fields`** — not a
+comma-separated list — so a label may contain any character, commas
+included (URL-encode it):
+
+```
+fields=metadata.name,metadata.creationTimestamp&header=Name&header=Created%2C%20UTC
+```
+
+**Labels are display text; `fields` are the identifiers.** A label is used
+verbatim and may repeat (a table with two `Name` columns told apart by
+position).
+
+- **CSV and PDF:** the labels are the header row, duplicates included.
+- **JSON:** labels are never keys. The body becomes an object with the
+  columns in `fields` order and the rows keyed by field:
+
+  ```json
+  {
+    "columns": [{"field": "metadata.name", "label": "Name"},
+                {"field": "metadata.creationTimestamp", "label": "Created, UTC"}],
+    "rows":    [{"metadata.name": "a", "metadata.creationTimestamp": "2026-10-29T10:00:00Z"}]
+  }
+  ```
+
+  Each row object holds every selected field once, its keys in the order
+  of first selection. Its values are the selected (flattened) values with
+  their JSON types; a missing value is `null`. Pair a column with its value
+  through the column's `field`.
+
+A field may be selected twice, for example two columns showing one value
+raw and formatted (`fields=size,name,size&header=Size&header=Name&header=Size%2C%20raw`).
+CSV and PDF repeat the column. JSON lists both columns, each with its own
+label, and the row carries the field once, since both columns read the same
+value.
+
+Labels pair with fields by position, so the request is a `400`, and nothing
+is dispatched, only when `header` comes without an explicit `fields` list or
+the counts differ. Without `header`, csv and json are exactly as before: the
+CSV header row is the dot-paths, and the JSON export is the extracted rows
+as resolved.
+
+`title` is used only by `pdf`. A csv or json export ignores it (no error,
+same bytes), so one request shape can serve all three formats.
+
+Labels are generic: snowplow has no widget-kind logic. To export a `Table`
+widget's typed cells, select and shape them with your own `path` jq, then
+name the columns with `fields` (the columns' `valueKey`s, in display order)
+and `header` (their `title`s). For example, a `path` that turns each
+`dataSource` row into one object keyed by `valueKey`:
+
+```
+[ .status.widgetData.dataSource[]? | map({ (.valueKey): (.stringValue // .decimalValue
+  // (.numberValue | select(. != null) | tostring)
+  // (.booleanValue | select(. != null) | tostring)
+  // ((.arrayValue // []) | join(", "))) }) | add ]
+```
+
+(`null | tostring` is the string `"null"`, which ends a `//` chain: guard
+each typed value with `select(. != null)` or boolean, array and empty cells
+all export as `null`.)
+
+### What `path` must return
+
+`path` is evaluated once over the resolved envelope, and its result is the
+row set:
+
+- one **array**: each element is a row (the shape to use);
+- one object or scalar: a single row; `null`: no rows.
+
+A `path` that produces a **jq stream** — several outputs rather than one
+array, such as `.items[]` — is **not** collected into rows today. The
+outputs are concatenated as JSON text with no separator, and that text is
+exported as **one row** with a single `value` column: `.items[]` over two
+objects exports the one cell `{"a":1}{"a":2}`, a stream of the numbers `1`
+and `2` exports the single number `12`, and a stream of no outputs
+(`empty`) exports one empty row. Wrap a stream in `[...]` (`[.items[]]`) to
+export its outputs as rows.
 
 ### Full-list pagination and the truncation cap
 
@@ -52,6 +219,16 @@ extracted rows page by page until a short page signals exhaustion, bounded at
 carries **`X-Export-Truncated: true`**, so a consumer can tell a complete
 export from a capped one. A target that ignores the injected pagination is
 detected by page fingerprinting and exported once, never duplicated.
+
+**A PDF is never truncated.** A `format=pdf` full-list export that reaches
+the bound is refused with **`422`** and a JSON `Status` body, and no PDF is
+sent: a report has no header a reader could check for truncation. Export
+such a list as csv or json, or a page at a time with `page`/`perPage`.
+
+Because every internal page carries an explicit `page` **and** `perPage`, an
+unpaginated export of a widget whose parent declares a smaller slice (for
+example `perPage: 50` in its `resourcesRefs`) still exports the full list:
+the explicit values override the declared slice.
 
 ### Row auto-detection
 
@@ -75,6 +252,46 @@ String cells beginning with a spreadsheet formula trigger (`=`, `+`, `-`,
 them as literal text, not an executable formula (`neutralizeCSVCell` —
 OWASP CSV-injection guard; the JSON format is unaffected).
 
+### PDF report
+
+`format=pdf` renders the same rows — the same RBAC-filtered `/call`
+re-dispatch, the same `path`/auto-detection and the same `fields`
+flattening, so a PDF never shows more than the caller's `/call` — as a
+table report (`internal/support/pdftable`):
+
+- the first page states the title (`title`, default the resource name),
+  the generation time in UTC, the caller's username and the row count;
+- the selected columns, in order, with the header row repeated at the top
+  of every page, and a page number on every page;
+- landscape A4; long cells wrap inside their column (at spaces, at line
+  breaks, or between characters for a word wider than the column) and are
+  never clipped; a row taller than a page continues on the next one;
+  columns that do not all fit across the page at a minimum width are
+  printed as bands of adjacent columns, each with all the rows; column
+  names or labels that would wrap taller than half the table area are set
+  in a smaller type until they fit, so any table renders (the header
+  repeats on every page and is never split or clipped);
+- the Go fonts (regular and bold, BSD-3-Clause) embedded, so text in
+  Latin, Greek and Cyrillic scripts renders and extracts as Unicode; a
+  character the font has no glyph for (for example CJK) is drawn as a
+  placeholder box and extracts as U+FFFD;
+- no links, annotations, actions, scripts, forms or external references.
+
+The document is built completely before any byte is sent: a failure is an
+error status with a JSON `Status` body (`422` at the bound, `500` for a
+render failure), never a `200` with a broken file. The response is
+`application/pdf` with `Content-Disposition: attachment;
+filename="<sanitized>.pdf"` and `X-Content-Type-Options: nosniff`.
+
+The username is in the PDF on purpose (who generated the report); it is
+never written to snowplow's logs.
+
+Memory: a pdf export holds its rows as cell text only. Each fetched page is
+converted and its decoded rows are dropped, and the finished document is
+held once. Its peak is about the cells plus the document; see
+`BenchmarkExport970_Peak` in `export_pdf_bench_test.go` for the measured
+peaks at 50,000 × 10 cells.
+
 ## Examples
 
 ```sh
@@ -89,7 +306,16 @@ curl -H "Authorization: Bearer $JWT" \
 # jq-selected rows out of a custom envelope
 curl -H "Authorization: Bearer $JWT" \
   "$SNOWPLOW/export?apiVersion=templates.krateo.io/v1&resource=restactions&name=usage&namespace=demo&path=.status.records&format=json"
+
+# PDF report with a title and labelled columns (a label may contain commas)
+curl -fsS -H "Authorization: Bearer $JWT" -o services.pdf \
+  "$SNOWPLOW/export?apiVersion=templates.krateo.io/v1&resource=restactions&name=service-list&namespace=demo&format=pdf&title=Services%20by%20health&fields=name,health,usage.pct&header=Service&header=Health&header=Usage%2C%20%25"
 ```
+
+Each export's `AuditEvent` carries the real outcome and status code and a
+message of the form `format=<csv|json|pdf> rows=<n> pages=<n>
+truncated=<bool>`; a refused or failed pdf export is recorded with
+`outcome=failure` and its error code.
 
 ## Scheduled / recurring exports
 

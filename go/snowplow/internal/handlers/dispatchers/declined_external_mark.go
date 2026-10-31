@@ -11,8 +11,10 @@
 // fall-through), in BOTH decline branches: a fetch abandoned at the
 // boot-readiness bound bumps the stage-error sink as well, and those abandoned
 // fetches are the bulk of the load. A stage error with NO external touch never
-// marks. apiref.DeclaresExternalEndpoint is never the criterion (I-5): an
-// endpointRef can point at the apiserver and dispatch internally.
+// marks. apiref.DeclaresExternalEndpoint is never the criterion (I-5): a
+// declared external stage need not be dialled (an iterator over no items, a
+// stage skipped after a failed dependency). Since #1017 a named endpointRef is
+// always sent to its endpoint, never answered from this cluster.
 //
 // THE RE-CHECK (I-1, zero cold navigation). Before a mark suppresses a resolve
 // every recorded fact is re-read; any change, and any failed read, retires the

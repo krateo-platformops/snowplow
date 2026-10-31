@@ -236,3 +236,16 @@ func SetServiceAccountTokenPathForTest(path string) func() {
 		resetSAEndpointForTest()
 	}
 }
+
+// SetServiceAccountRESTConfigForTest makes ServiceAccountRESTConfig return rc,
+// so a cross-package test can stand a hermetic apiserver in for the in-cluster
+// one (rest.InClusterConfig reads fixed /var/run/secrets paths a test cannot
+// plant). Returns a restore that clears the singleton again. Exported
+// test-support ONLY, like SetServiceAccountTokenPathForTest; production never
+// calls it.
+func SetServiceAccountRESTConfigForTest(rc *rest.Config) func() {
+	saRestConfigMu.Lock()
+	saRestConfigInstance = rc
+	saRestConfigMu.Unlock()
+	return resetSARestConfigForTest
+}

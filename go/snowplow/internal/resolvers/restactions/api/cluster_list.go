@@ -184,12 +184,21 @@ func attemptClusterListCollapse(
 		return nil, false, 1
 	}
 
+	// #1017 — the cell holds THIS cluster's objects: a stage whose endpoint
+	// names another one (targetsOwnCluster) never collapses into it. Its own
+	// deny gate, 10. The one order every serve site uses: own cluster first
+	// (where the stage's calls go), then the verb (whether a cache may answer
+	// them).
+	if !targetsOwnCluster(ctx) {
+		return nil, false, 10
+	}
+
 	// #1011 — the verb. The collapse stands in for the stage's per-item calls
 	// with ONE cluster-scope GET LIST, so only a stage whose calls ARE a plain
 	// GET may enter it (isPlainGet, write_verb.go). Without this gate a write
 	// iterator was rewritten into that GET once the cell was warm: its writes
 	// were never sent and the stage reported success. Its own deny gate, 9,
-	// before any other work.
+	// before any other work on an own-cluster stage.
 	if !isPlainGet(apiCall.Verb) {
 		return nil, false, 9
 	}
@@ -680,6 +689,26 @@ var clusterListInflightCells sync.Map
 // and the cell stays cold; next customer retries via the same cold-miss
 // path.
 const clusterListAsyncPopulateTimeout = 30 * time.Second
+
+// WaitClusterListAsyncIdleForTest blocks until no populateClusterListCellAsync
+// goroutine is running. A populate takes its semaphore slot before its
+// goroutine starts and gives it back when the populate is done, so holding
+// every slot at once means none is running. Test-only — production code MUST
+// NOT call this. A harness registers it as the cleanup that runs BEFORE it
+// resets the globals a populate reads (the dependency tracker, the resolved
+// cache): the populate detaches from the request and outlives it. Do not mix
+// it with ResetClusterListAsyncStateForTest while a populate runs: that drain
+// takes back a running populate's slot, and the populate's own release would
+// then consume one of these.
+func WaitClusterListAsyncIdleForTest() {
+	n := cap(clusterListAsyncSemaphore)
+	for range n {
+		clusterListAsyncSemaphore <- struct{}{}
+	}
+	for range n {
+		<-clusterListAsyncSemaphore
+	}
+}
 
 // ResetClusterListAsyncStateForTest clears the inflight-cells dedup map
 // + drains the bounded-concurrency semaphore. Test-only — production
