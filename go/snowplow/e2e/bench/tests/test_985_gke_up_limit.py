@@ -79,7 +79,7 @@ def test_gke_cluster_quota_reads_the_api_and_refuses_when_full(fakes, monkeypatc
 
 def test_gke_up_refuses_when_the_region_is_full_and_creates_nothing(fakes, monkeypatch, capsys):  # noqa: F811
     monkeypatch.setenv("FAKE_CLUSTERS", THREE)
-    assert gke.main(["gke-up", "--name", NAME, "--yes"]) == 2
+    assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--yes"]) == 2
     err = capsys.readouterr().err
     assert "refusing: GKE clusters in europe-west4: 3 of 3 (ClustersPerRegion)" in err and "nothing was created" in err
     assert not any(x[:3] == ["gcloud", "container", "clusters"] and x[3:4] == ["create"] for x in _calls(fakes))

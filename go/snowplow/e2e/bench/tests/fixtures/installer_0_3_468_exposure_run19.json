@@ -1,0 +1,365 @@
+{
+ "read": "2026-10-31, read-only: installer 0.3.468 as run 19 attempt 3 pulled it (installer-pulled/installer: files/component-pins.yaml, values.yaml features+exposure, templates/_helpers.tpl inst.coreFeatures), the values it installed with (installer-values.yaml), and the LoadBalancer rows of run 19 attempt 2's diagnostics/services.json (same chart, same values)",
+ "chart_version": "0.3.468",
+ "core_features_define": "{{- define \"inst.coreFeatures\" -}}{{- end -}}",
+ "pins": [
+  {
+   "name": "authn-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "oasgen-provider-crd",
+   "feature": "oasgenProvider"
+  },
+  {
+   "name": "frontend-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "snowplow-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "authn",
+   "feature": "portal",
+   "expose": true,
+   "svcMatch": "authn"
+  },
+  {
+   "name": "snowplow",
+   "feature": "portal",
+   "expose": true,
+   "svcMatch": "snowplow"
+  },
+  {
+   "name": "frontend",
+   "feature": "portal",
+   "expose": true,
+   "svcMatch": "frontend"
+  },
+  {
+   "name": "krateo-marketplace-catalog",
+   "feature": "portal"
+  },
+  {
+   "name": "git-provider-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "git-provider",
+   "feature": "portal"
+  },
+  {
+   "name": "github-provider-kog",
+   "feature": "portal"
+  },
+  {
+   "name": "portal",
+   "feature": "portal"
+  },
+  {
+   "name": "portal-agents",
+   "feature": "portal"
+  },
+  {
+   "name": "marketplace-page",
+   "feature": "portal"
+  },
+  {
+   "name": "incidents-page",
+   "feature": "portal"
+  },
+  {
+   "name": "alerts-page",
+   "feature": "portal"
+  },
+  {
+   "name": "dashboard-page",
+   "feature": "portal"
+  },
+  {
+   "name": "compositions-page",
+   "feature": "portal"
+  },
+  {
+   "name": "blueprints-page",
+   "feature": "portal"
+  },
+  {
+   "name": "resources-page",
+   "feature": "portal"
+  },
+  {
+   "name": "search-page",
+   "feature": "portal"
+  },
+  {
+   "name": "builders-page",
+   "feature": "portal"
+  },
+  {
+   "name": "clusters-page",
+   "feature": "portal"
+  },
+  {
+   "name": "reviews-page",
+   "feature": "portal"
+  },
+  {
+   "name": "settings-page",
+   "feature": "portal"
+  },
+  {
+   "name": "observability-page",
+   "feature": "portal"
+  },
+  {
+   "name": "blueprint-render-service",
+   "feature": "portal"
+  },
+  {
+   "name": "controller-render-service",
+   "feature": "portal"
+  },
+  {
+   "name": "oasgen-provider",
+   "feature": "oasgenProvider"
+  },
+  {
+   "name": "clickhouse-operator",
+   "feature": "portal"
+  },
+  {
+   "name": "mongodb-operator",
+   "feature": "portal"
+  },
+  {
+   "name": "krateo-observability",
+   "feature": "portal",
+   "svcMatch": "krateo-clickstack"
+  },
+  {
+   "name": "otel-collector-deployment",
+   "feature": "portal"
+  },
+  {
+   "name": "otel-collector-daemonset",
+   "feature": "portal"
+  },
+  {
+   "name": "krateo-audit-worm",
+   "feature": "auditWorm"
+  },
+  {
+   "name": "krateo-sse-proxy",
+   "feature": "portal",
+   "expose": true,
+   "svcMatch": "sse-proxy"
+  },
+  {
+   "name": "gateway-api-crds",
+   "feature": "ingress"
+  },
+  {
+   "name": "agentgateway",
+   "feature": "ingress"
+  },
+  {
+   "name": "cert-manager",
+   "feature": "ingress"
+  },
+  {
+   "name": "cert-manager-issuers",
+   "feature": "ingress"
+  },
+  {
+   "name": "external-dns",
+   "feature": "externalDns"
+  },
+  {
+   "name": "kagent-crds",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "kagent",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "model-configs",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "installer-agent",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "repo-mcp-server",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "structure-graph-mcp-server",
+   "feature": "structureGraph"
+  },
+  {
+   "name": "config-refs-mcp-server",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "krateo-autopilot",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "incident-agent",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "clickhouse-mcp-server",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "authn-agent",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "snowplow-agent",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "frontend-agent",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "clickstack-agent",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "core-provider-agent",
+   "feature": "coreAgents"
+  },
+  {
+   "name": "incident-controller-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "incident-controller",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "alert-provider-crd",
+   "feature": "portal"
+  },
+  {
+   "name": "alert-provider",
+   "feature": "portal"
+  },
+  {
+   "name": "nightly-review-crd",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "nightly-review",
+   "feature": "specialistAgents"
+  },
+  {
+   "name": "agentgateway-controller",
+   "feature": "agentGateway"
+  },
+  {
+   "name": "agentgateway-policies",
+   "feature": "agentGateway",
+   "expose": true,
+   "svcMatch": "krateo-agent-gateway"
+  },
+  {
+   "name": "gcp-configconnector-crd",
+   "feature": "configConnector"
+  },
+  {
+   "name": "gcp-configconnector",
+   "feature": "configConnector"
+  }
+ ],
+ "chart_values": {
+  "features": {
+   "coreProvider": true,
+   "coreAgents": false,
+   "specialistAgents": false,
+   "codegenAgents": false,
+   "structureGraph": false,
+   "repoGraph": false,
+   "oasgenProvider": true,
+   "portal": true,
+   "ingress": false,
+   "externalDns": false,
+   "agentGateway": false,
+   "configConnector": false,
+   "auditWorm": false
+  },
+  "exposure": {
+   "type": "LoadBalancer"
+  }
+ },
+ "run_values": {
+  "bootstrap": {
+   "coreProvider": {
+    "enabled": true
+   }
+  },
+  "exposure": {
+   "type": "Gateway",
+   "gatewayMode": "path",
+   "gatewayRef": {
+    "name": "krateo-agent-gateway"
+   },
+   "internalDataPlane": true,
+   "platformPort": 80
+  },
+  "features": {
+   "agentGateway": true,
+   "coreAgents": false,
+   "specialistAgents": false
+  },
+  "vertexAI": {
+   "enabled": false
+  },
+  "core-provider": {
+   "resources": {
+    "limits": {
+     "memory": "4Gi"
+    }
+   }
+  },
+  "componentValues": {
+   "snowplow": {
+    "image": {
+     "tag": "1.12.59"
+    },
+    "nodeSelector": {
+     "bench.krateo.io/pool": "snowplow"
+    },
+    "tolerations": [
+     {
+      "key": "dedicated",
+      "operator": "Equal",
+      "value": "snowplow",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "registryAuth": {
+   "enabled": true,
+   "passwordRef": {
+    "name": "krateo-agentiko-pull",
+    "namespace": "krateo-system",
+    "key": "token"
+   },
+   "imagePullSecretName": "bench-ghcr-image-pull",
+   "insecureSkipVerifyTLS": false,
+   "registries": []
+  }
+ },
+ "observed_lb_services": [
+  "krateo-system/krateo-agent-gateway-platform"
+ ]
+}
