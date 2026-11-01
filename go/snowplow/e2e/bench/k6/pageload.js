@@ -302,20 +302,27 @@ function loadOf (b, here, testids) {
     const k = String(id).replace(/^widget-/, '')
     if (k in states) states[k]++
   }
-  return { ms: end - b.navT0, saw: b.saw, path: here, states }
+  // t0: the load's own start on the wall clock (epoch ms), from the same clock its time is
+  // measured on: where its interval sits against the CPU windows (#1042, #1043 review B1)
+  return { ms: end - b.navT0, saw: b.saw, path: here, states, t0: performance.timeOrigin + b.navT0 }
 }
 
 // The metric points one load writes. A page that did not settle within its
 // timeout is a TIMEOUT and still a load, at its timeout value, so it counts in
 // the p95 as well as in the timeout check (#831 gate). skeleton=no: painted
 // from the app's own React Query cache (App.tsx:25-30), no request.
-export function recordOps (r, tags, timeoutMs) {
+// Every point of a load carries its start, t0 (epoch ms, integer): the page's
+// own (loadOf), or for a load that never settled, `actionAt`, the driver's
+// clock just before the action (the same system clock) (#1043 review B1).
+export function recordOps (r, tags, timeoutMs, actionAt) {
+  const t0 = r === null ? actionAt : r.t0
+  const at = Number.isFinite(t0) ? { t0: String(Math.round(t0)) } : {}
   if (r === null) {
-    const t = Object.assign({}, tags, { skeleton: 'timeout', timeout: 'yes' })
-    return [['browser_page_timeouts', 1, tags], ['browser_page_load_ms', timeoutMs, t],
+    const t = Object.assign({}, tags, at, { skeleton: 'timeout', timeout: 'yes' })
+    return [['browser_page_timeouts', 1, Object.assign({}, tags, at)], ['browser_page_load_ms', timeoutMs, t],
       ['browser_page_loads', 1, t]]
   }
-  const t = Object.assign({}, tags, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' })
+  const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' })
   const ops = [['browser_page_load_ms', r.ms, t], ['browser_page_loads', 1, t]]
   for (const k of Object.keys(r.states || {})) {
     if (r.states[k]) ops.push(['browser_widget_states', r.states[k], Object.assign({}, t, { state: k })])
