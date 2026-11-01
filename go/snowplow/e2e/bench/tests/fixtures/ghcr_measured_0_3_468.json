@@ -1,0 +1,76 @@
+{
+ "what": "the real charts run 20 pulls, measured by bench.ghcr_pull preflight's own `measured` record (installer 0.3.468, the bench's values, 2026-11-01); REAL_LARGEST is the largest of each",
+ "charts": [
+  {
+   "chart": "oci://ghcr.io/krateo-blueprints/charts/krateo-marketplace-catalog",
+   "version": "0.1.2",
+   "measured": {
+    "blob": 42296,
+    "largest_file": 284927,
+    "inflated": 363923,
+    "parsed": 681,
+    "members": 6,
+    "render": 390039
+   }
+  },
+  {
+   "chart": "oci://ghcr.io/krateo-blueprints/charts/github-provider-kog",
+   "version": "0.6.0",
+   "measured": {
+    "blob": 88778,
+    "largest_file": 15708,
+    "inflated": 386177,
+    "parsed": 1644,
+    "members": 125,
+    "render": 361843
+   }
+  },
+  {
+   "chart": "oci://ghcr.io/krateo-platformops/charts/alert-provider",
+   "version": "0.2.53",
+   "measured": {
+    "blob": 9429,
+    "largest_file": 10094,
+    "inflated": 31001,
+    "parsed": 7451,
+    "members": 8,
+    "render": 15495
+   }
+  },
+  {
+   "chart": "oci://ghcr.io/krateo-agentiko/charts/agentgateway-controller",
+   "version": "0.2.0",
+   "measured": {
+    "blob": 298188,
+    "largest_file": 1041093,
+    "inflated": 2753178,
+    "parsed": 17621,
+    "members": 30,
+    "render": 2665855
+   }
+  },
+  {
+   "chart": "oci://ghcr.io/krateo-agentiko/charts/agentgateway-policies",
+   "version": "0.2.18",
+   "measured": {
+    "blob": 152818,
+    "largest_file": 141400,
+    "inflated": 593530,
+    "parsed": 141293,
+    "members": 41,
+    "render": 99113
+   }
+  },
+  {
+   "chart": "oci://ghcr.io/krateo-platformops/charts/installer",
+   "version": "0.3.468",
+   "measured": {
+    "blob": 363138,
+    "largest_file": 833982,
+    "inflated": 1622254,
+    "render": 32104
+   },
+   "source": "measured once, outside the preflight (the installer is pulled by run606, not fetched here)"
+  }
+ ]
+}

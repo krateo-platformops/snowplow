@@ -650,9 +650,9 @@ def image_pull_failures(k: Kube) -> list[dict]:
             key = (md.get("namespace"), md.get("name"))
             out.append({"pod": f"{key[0]}/{key[1]}", "container": cs.get("name"),
                         "image": cs.get("image") or images.get(cs.get("name")),
-                        "reason": w.get("reason"), "message": redact(w.get("message") or ""),
+                        "reason": w.get("reason"), "message": redact_run_text(w.get("message") or ""),
                         "pull_secrets": [x.get("name") for x in spec.get("imagePullSecrets") or []],
-                        "pull_secret_missing": redact(missing[key]) if key in missing else None})
+                        "pull_secret_missing": redact_run_text(missing[key]) if key in missing else None})
     return out
 
 
