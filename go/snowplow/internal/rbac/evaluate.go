@@ -904,14 +904,20 @@ func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	return false
 }
 
-// nameSpecificVerbs is the set of RBAC verbs that act on a single named
-// object — the only verbs for which a resourceNames-scoped rule can
-// grant access. Mirrors the Kubernetes RBAC authorizer: the collection
-// verbs ("list", "watch", "create", "deletecollection") have no single
-// named object, so a rule with a non-empty ResourceNames must never
-// match them. (rbac/v1's authorizer scopes resourceNames to exactly
-// these verbs; "get"/"update"/"patch"/"delete" — and the "*" wildcard,
-// handled separately — are name-specific.)
+// nameSpecificVerbs is snowplow's map of which request verbs address an
+// ITEM URL — and so carry the object's name — for the plain item and
+// collection URLs snowplow builds: get / update / patch / delete name the
+// object; list / watch / create / deletecollection address the collection
+// URL and name none.
+//
+// It is NOT the upstream rule. Kubernetes' ResourceNameMatches ignores the
+// verb and compares the rule's resourceNames with the request's Name, which
+// RequestInfo takes from the URL (and also from a list/watch
+// `fieldSelector=metadata.name=`, or a named subresource). For a plain URL
+// a collection request has Name "", so a resourceNames rule never matches it
+// — which is exactly what gating on this table reproduces. A request shape
+// this table does not model (a fieldSelector list/watch, a create on a named
+// subresource, a non-HTTP verb) is over-denied here, never over-granted.
 var nameSpecificVerbs = map[string]struct{}{
 	"get":    {},
 	"update": {},
@@ -934,20 +940,16 @@ func IsNameSpecificVerb(verb string) bool {
 	return ok
 }
 
-// resourceNameMatches implements Kubernetes `ResourceNameMatches`
-// semantics for a single PolicyRule (0.30.109, G1):
+// resourceNameMatches is Kubernetes `ResourceNameMatches` for a single
+// PolicyRule (0.30.109, G1), over the request shapes snowplow evaluates:
 //
 //   - rule.ResourceNames empty  → matches all objects (unchanged
 //     behaviour for unscoped rules).
-//   - rule.ResourceNames non-empty → the rule is scoped to specific
-//     named objects:
-//   - It can only ever match a name-specific verb
-//     ("get"/"update"/"patch"/"delete", or the verb wildcard "*").
-//     For a collection verb ("list"/"watch"/"create"/
-//     "deletecollection") it does NOT match — a resourceNames-scoped
-//     rule never grants `list`.
-//   - The request's object name (opts.Name) must appear in
-//     rule.ResourceNames.
+//   - rule.ResourceNames non-empty → the request's object name
+//     (opts.Name) must appear in rule.ResourceNames. Upstream compares the
+//     NAME only; the verb gate below is snowplow's stand-in for "this request
+//     URL names no object" (nameSpecificVerbs): a collection verb's plain URL
+//     has Name "" upstream, so the rule cannot match it there either.
 //
 // opts.Verb is already known to satisfy the rule's Verbs list by the
 // time this is called (rulesPermit checks Verbs first). We re-derive

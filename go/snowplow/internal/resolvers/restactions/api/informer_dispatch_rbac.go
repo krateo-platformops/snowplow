@@ -165,11 +165,15 @@ func filterListByRBAC(
 	}
 
 	// 0.30.111 Part 3 — namespace-keyed EvaluateRBAC memo. The verb is
-	// fixed "list"; a `list` decision is NAMESPACE-scoped and
-	// NAME-INDEPENDENT (Kubernetes ResourceNameMatches consults
-	// rule.ResourceNames only for name-specific verbs — never for a
-	// collection verb such as `list`). So every item in the same
-	// namespace yields the identical permit/deny verdict. The memo turns
+	// fixed "list"; for the plain collection URL this filter serves, a
+	// `list` decision is NAMESPACE-scoped and NAME-INDEPENDENT: Kubernetes'
+	// ResourceNameMatches ignores the verb and compares rule.ResourceNames
+	// with the request's Name, and a plain collection URL names no object
+	// (Name ""), so no resourceNames rule can grant it. (A list with
+	// `fieldSelector=metadata.name=` DOES carry a Name upstream; that shape
+	// is not modelled here and is over-denied, tracked separately.) So
+	// every item in the same namespace yields the identical permit/deny
+	// verdict. The memo turns
 	// an N-item LIST spanning K distinct namespaces into K EvaluateRBAC
 	// calls instead of N.
 	//

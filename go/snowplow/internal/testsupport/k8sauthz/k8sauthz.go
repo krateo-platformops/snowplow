@@ -65,9 +65,16 @@ func New(objs ...runtime.Object) *Authorizer {
 }
 
 // RequestName is the object name the apiserver's request carries for an
-// operation of verb on the object called name: an item URL (get, update,
-// patch, delete) names it; a collection URL (list, watch, create,
-// deletecollection) does not.
+// operation of verb on the object called name, for a PLAIN item or collection
+// URL: an item URL (get, update, patch, delete) names it; a collection URL
+// (list, watch, create, deletecollection) does not.
+//
+// NOT INDEPENDENT of snowplow: it is the same verb → URL-shape table as
+// rbac.IsNameSpecificVerb, so a matrix built on it cannot detect a request
+// shape that table misses — a list/watch with `fieldSelector=metadata.name=`
+// (RequestInfo sets Name), a create on a named subresource, a non-HTTP verb.
+// Allowed's rule matching is independent; this helper is the shared
+// assumption.
 func RequestName(verb, name string) string {
 	switch verb {
 	case "get", "update", "patch", "delete":

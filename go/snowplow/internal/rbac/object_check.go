@@ -14,16 +14,26 @@
 // the name, but the SelfSubjectAccessReview it fell back to dropped it.
 //
 // THE RULE. A decision about one object is built from that object's
-// coordinates by ObjectCheck, and nowhere else. ObjectCheck carries the name
-// exactly as the apiserver's own request would: a request that names a single
-// object (get / update / patch / delete) carries it; a collection request
-// (list / watch / create / deletecollection) has no object name, so none is
-// carried. That is the Kubernetes request shape, not a carve-out, and it is the
-// same predicate the evaluator scopes `resourceNames` by (IsNameSpecificVerb).
-// Carrying the name on a collection verb would be inert in-process but NOT in
-// a SelfSubjectAccessReview — the apiserver would match a `create
-// resourceNames: [x]` rule that the real POST (which has no name) never
-// matches — so the drop is what keeps the cache=on and cache=off answers equal.
+// coordinates by ObjectCheck, and nowhere else.
+//
+// WHAT UPSTREAM DOES. Kubernetes' ResourceNameMatches does NOT look at the
+// verb: a rule with resourceNames matches iff the request's Name is listed. The
+// Name comes from the request URL (RequestInfo): it is the object segment of
+// an item URL, and "" for a collection URL. (RequestInfo also takes it from a
+// `fieldSelector=metadata.name=` on a list/watch, from a named subresource, and
+// a non-HTTP verb — impersonate, bind, escalate, use, a custom verb — carries
+// whatever name its check names. snowplow builds none of those shapes here.)
+//
+// WHAT SNOWPLOW MAPS. The requests snowplow decides about are plain item and
+// collection URLs: get / update / patch / delete address an item URL, which
+// names the object; list / watch / create / deletecollection address the
+// collection URL, which names none. IsNameSpecificVerb is that mapping, and
+// for those URL shapes it gives exactly the Name the apiserver would see. So
+// ObjectCheck carries the name for the item verbs and drops it for the
+// collection verbs. The drop matters in a SelfSubjectAccessReview: a review
+// carrying x would match a `create resourceNames: [x]` rule that the real POST
+// (whose URL names no object) never matches — dropping it keeps the cache=on
+// and cache=off answers equal to the apiserver's.
 //
 // A collection check (a LIST scope gate, a per-namespace list filter) is not a
 // decision about one object and keeps its own Name-less literal.

@@ -2,8 +2,10 @@
 // the decision Kubernetes makes, with the cache on and with it off.
 //
 // THE MATRIX. Grants {namespace-wide, name-scoped on x (Role), name-scoped on x
-// (ClusterRole via a ClusterRoleBinding), none} × verbs {get, update, patch,
-// delete, list, create} × objects {x, y}. For every cell four answers must
+// (ClusterRole via a ClusterRoleBinding), ONE Role holding a name-scoped rule on
+// x followed by an unscoped `get` (a name mismatch on the first rule must not
+// end the rule walk: `get y` is allowed by the second), none} × verbs {get,
+// update, patch, delete, list, create} × objects {x, y}. For every cell four answers must
 // equal the ground truth:
 //
 //   - cache on,  EvaluateRBAC(rbac.ObjectCheck(...))  (the dispatch gate, the
@@ -56,7 +58,7 @@ const (
 var i1046GVR = schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
 
 // i1046Users: one requester per grant shape.
-var i1046Users = []string{"u-nswide", "u-name-x", "u-cluster-name-x", "u-none"}
+var i1046Users = []string{"u-nswide", "u-name-x", "u-cluster-name-x", "u-mixed", "u-none"}
 
 var i1046Verbs = []string{"get", "update", "patch", "delete", "list", "create"}
 
@@ -71,6 +73,9 @@ func i1046Seed() []runtime.Object {
 		roleBinding(i1046NS, "rb-name-x", "Role", "ra-x", userSubject("u-name-x")),
 		clusterRole("cr-ra-x", scoped),
 		clusterRoleBinding("crb-name-x", "cr-ra-x", userSubject("u-cluster-name-x")),
+		// u-mixed: ONE Role, the name-scoped rule FIRST, then an unscoped get.
+		role(i1046NS, "ra-mixed", scoped, rule([]string{i1046GVR.Group}, []string{i1046GVR.Resource}, []string{"get"})),
+		roleBinding(i1046NS, "rb-mixed", "Role", "ra-mixed", userSubject("u-mixed")),
 		// u-none holds an unrelated grant, so "none" is not "no binding at all".
 		role(i1046NS, "pods", rule([]string{""}, []string{"pods"}, []string{"get"})),
 		roleBinding(i1046NS, "rb-none", "Role", "pods", userSubject("u-none")),
@@ -141,6 +146,12 @@ func TestIssue1046_ObjectCheck_ParityWithKubernetes(t *testing.T) {
 	if !oracle.Allowed(k8sauthz.Attributes{User: "u-name-x", Verb: "get", Group: i1046GVR.Group, Resource: i1046GVR.Resource, Namespace: i1046NS, Name: i1046X}) ||
 		oracle.Allowed(k8sauthz.Attributes{User: "u-name-x", Verb: "get", Group: i1046GVR.Group, Resource: i1046GVR.Resource, Namespace: i1046NS, Name: i1046Y}) {
 		t.Fatalf("PRE: the oracle must allow u-name-x `get x` and deny `get y`")
+	}
+	// The merged shape must discriminate too: `get y` allowed only by the
+	// SECOND rule of the Role, `update y` by neither.
+	if !oracle.Allowed(k8sauthz.Attributes{User: "u-mixed", Verb: "get", Group: i1046GVR.Group, Resource: i1046GVR.Resource, Namespace: i1046NS, Name: i1046Y}) ||
+		oracle.Allowed(k8sauthz.Attributes{User: "u-mixed", Verb: "update", Group: i1046GVR.Group, Resource: i1046GVR.Resource, Namespace: i1046NS, Name: i1046Y}) {
+		t.Fatalf("PRE: the oracle must allow u-mixed `get y` and deny `update y`")
 	}
 
 	mismatches := 0

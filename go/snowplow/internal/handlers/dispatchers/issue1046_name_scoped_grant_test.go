@@ -152,7 +152,10 @@ func n46RBAC() []runtime.Object {
 	}
 	scoped := func(ra, w string) []rbacv1.PolicyRule {
 		return []rbacv1.PolicyRule{
-			{Verbs: []string{"get"}, APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}, ResourceNames: []string{ra}},
+			// get / update / delete name-scoped (patch deliberately NOT granted),
+			// and a name-scoped create, which can never match a POST: the
+			// collection URL names no object (the R12 action-ref arm).
+			{Verbs: []string{"get", "update", "delete", "create"}, APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}, ResourceNames: []string{ra}},
 			{Verbs: []string{"get"}, APIGroups: []string{h1WidgetGVR.Group}, Resources: []string{h1WidgetGVR.Resource}, ResourceNames: []string{w}},
 		}
 	}
@@ -167,7 +170,7 @@ func n46RBAC() []runtime.Object {
 			RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "n46-parents"},
 		},
 		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: n46NS, Name: "n46-all"}, Rules: []rbacv1.PolicyRule{
-			{Verbs: []string{"get", "list"}, APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}},
+			{Verbs: []string{"get", "list", "update", "patch", "delete", "create"}, APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}},
 			{Verbs: []string{"get", "list"}, APIGroups: []string{h1WidgetGVR.Group}, Resources: []string{h1WidgetGVR.Resource}},
 		}},
 		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: n46NS, Name: "n46-nswide", UID: types.UID("uid-rb-nswide")},
@@ -777,35 +780,46 @@ func TestIssue1046_UserAccessFilter_NameScoped(t *testing.T) {
 // off — both where it is computed (resourcesrefs.Resolve, the cold widget
 // resolve) and where it is re-derived per requester on the identity-free widget
 // cell (gateWidgetEnvelope → recomputeAllowedFromRefItem).
+//
+// Every action verb a ref carries, not only GET: a name-scoped DELETE / PUT
+// button on x is allowed, on y denied; PATCH is not granted at all; a POST
+// stays denied under `create resourceNames: [x]` (the collection URL names no
+// object), and allowed under the namespace-wide create.
 func TestIssue1046_ResourcesRefs_AllowedFlag(t *testing.T) {
-	item := func(name string) map[string]any {
+	methods := map[string]string{http.MethodGet: "get", http.MethodPut: "update", http.MethodPatch: "patch",
+		http.MethodDelete: "delete", http.MethodPost: "create"}
+	item := func(name, method string) map[string]any {
 		q := url.Values{}
 		q.Set("apiVersion", h1RAGVR.Group+"/"+h1RAGVR.Version)
 		q.Set("resource", h1RAGVR.Resource)
 		q.Set("namespace", n46NS)
 		q.Set("name", name)
-		return map[string]any{"path": "/call?" + q.Encode(), "verb": http.MethodGet}
+		return map[string]any{"path": "/call?" + q.Encode(), "verb": method}
 	}
 	run := func(t *testing.T, e *n46Env) map[string]bool {
 		got := map[string]bool{}
 		for _, u := range n46Users {
 			for _, target := range []string{n46RAX, n46RAY} {
-				want := e.k8sAllowsGet(u, h1RAGVR, target)
-				regated := recomputeAllowedFromRefItem(e.ctx(u), item(target))
-				if regated != want {
-					t.Errorf("%s: %s serve-time resourcesRef GET %s: allowed=%v, Kubernetes says %v", e.mode(), u, target, regated, want)
+				for method, verb := range methods {
+					want := e.api.oracle.Allowed(k8sauthz.Attributes{User: u, Groups: n46Groups(), Verb: verb,
+						Group: h1RAGVR.Group, Resource: h1RAGVR.Resource, Namespace: n46NS,
+						Name: k8sauthz.RequestName(verb, target)})
+					regated := recomputeAllowedFromRefItem(e.ctx(u), item(target, method))
+					if regated != want {
+						t.Errorf("%s: %s serve-time resourcesRef %s %s: allowed=%v, Kubernetes says %v", e.mode(), u, method, target, regated, want)
+					}
+					res, err := resourcesrefs.Resolve(e.ctx(u), []templates.ResourceRef{{
+						ID: "ref-" + target, Name: target, Namespace: n46NS, Resource: h1RAGVR.Resource,
+						APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Verb: method,
+					}})
+					if err != nil || len(res) != 1 {
+						t.Fatalf("%s: %s resourcesrefs.Resolve(%s %s): %d results, err=%v", e.mode(), u, method, target, len(res), err)
+					}
+					if res[0].Allowed != want {
+						t.Errorf("%s: %s cold resourcesRef %s %s: allowed=%v, Kubernetes says %v", e.mode(), u, method, target, res[0].Allowed, want)
+					}
+					got[u+"|"+method+"|"+target] = regated && res[0].Allowed
 				}
-				res, err := resourcesrefs.Resolve(e.ctx(u), []templates.ResourceRef{{
-					ID: "ref-" + target, Name: target, Namespace: n46NS, Resource: h1RAGVR.Resource,
-					APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Verb: http.MethodGet,
-				}})
-				if err != nil || len(res) != 1 {
-					t.Fatalf("%s: %s resourcesrefs.Resolve(%s): %d results, err=%v", e.mode(), u, target, len(res), err)
-				}
-				if res[0].Allowed != want {
-					t.Errorf("%s: %s cold resourcesRef GET %s: allowed=%v, Kubernetes says %v", e.mode(), u, target, res[0].Allowed, want)
-				}
-				got[u+"|"+target] = regated && res[0].Allowed
 			}
 		}
 		return got
@@ -814,6 +828,17 @@ func TestIssue1046_ResourcesRefs_AllowedFlag(t *testing.T) {
 	t.Run("cache-on", func(t *testing.T) { on = run(t, n46Setup(t, true)) })
 	t.Run("cache-off", func(t *testing.T) { off = run(t, n46Setup(t, false)) })
 	n46AssertModesAgree(t, on, off)
+	// The action shapes must discriminate, or a constant answer passes.
+	for k, want := range map[string]bool{
+		n46NameX + "|DELETE|" + n46RAX: true, n46NameX + "|DELETE|" + n46RAY: false,
+		n46NameX + "|PUT|" + n46RAX: true, n46NameX + "|PUT|" + n46RAY: false,
+		n46NameX + "|PATCH|" + n46RAX: false, n46NameX + "|POST|" + n46RAX: false,
+		n46NSWide + "|POST|" + n46RAX: true,
+	} {
+		if on[k] != want {
+			t.Errorf("action ref %s: allowed=%v, want %v", k, on[k], want)
+		}
+	}
 }
 
 // TestIssue1046_KeyNeverServesAnotherGrantsCell — the cache-key implication.
