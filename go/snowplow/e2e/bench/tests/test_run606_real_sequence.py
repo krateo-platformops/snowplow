@@ -582,6 +582,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                       "pressure_some_usec": None if mode == "nopressure" else int(stall * i),
                       "pressure_full_usec": None if mode == "nopressure" else 0,
                       "node_busy_ticks": 1000 * i, "node_idle_ticks": idle * i} for i in range(6)]
+            recs.append({"kind": "cpu_end", "epoch": 1792576800 - 15 + 26, "uptime": 126.0, "uptime_lo": 125.98})
             with open(os.path.join(dest, c + "-cpu.jsonl"), "w") as fh:
                 fh.write("".join(json.dumps(r) + "\\n" for r in recs))
         with open(os.path.join(dest, name + "-exit.json"), "w") as fh:

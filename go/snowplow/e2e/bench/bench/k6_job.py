@@ -258,7 +258,9 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
     and brackets the tick between two /proc/uptime reads (`uptime_lo` before
     the last `date` that still read the old second, `uptime` after the one
     that read the new): the anchor's error is that bracket, measured per run
-    (#1043 review B1), not a second.
+    (#1043 review B1), not a second. cpu_end carries a second such anchor, so
+    a step of the realtime clock during the drive is seen (round 2); a `date`
+    that is missing or never ticks ends the wait, loudly, with null anchors.
 
     POSIX sh: the k6 images are Alpine (busybox), the python image Debian
     (dash)."""
@@ -295,10 +297,26 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
 fi
 nc=null
 [ -r /proc/stat ] && nc=$(grep -c '^cpu[0-9]' /proc/stat)
-read -r lo _ < /proc/uptime; e0=$(date +%s)
-while :; do read -r ua _ < /proc/uptime; ep0=$(date +%s); [ "$ep0" != "$e0" ] && break; lo=$ua; done
-read -r up0 _ < /proc/uptime
-printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$ep0" "$up0" "$lo" > {f}
+# the wall-clock anchor: wait for `date +%s` to tick, bracketed by two /proc/uptime reads; sets
+# an_ep an_up an_lo, or null with a loud line when no tick is seen (no `date`, or a clock that
+# does not move) by uptime's whole second + 3: at least 2 s, twice the tick's 1 s period
+anchor() {{
+  an_ep=null; an_up=null; an_lo=null
+  read -r lo _ < /proc/uptime; e0=$(date +%s 2>/dev/null) || e0=
+  if [ -z "$e0" ]; then echo "cpu sampler: no date +%s: the samples have no wall-clock anchor" >&2; return 0; fi
+  lim=$(( ${{lo%.*}} + 3 ))
+  while :; do
+    read -r ua _ < /proc/uptime; ep0=$(date +%s 2>/dev/null) || ep0=
+    [ -n "$ep0" ] && [ "$ep0" != "$e0" ] && break
+    if [ "${{ua%.*}}" -ge "$lim" ]; then
+      echo "cpu sampler: date +%s did not tick within 2 s: the samples have no wall-clock anchor" >&2; return 0
+    fi
+    lo=$ua
+  done
+  read -r an_up _ < /proc/uptime; an_ep=$ep0; an_lo=$lo
+}}
+anchor
+printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$an_ep" "$an_up" "$an_lo" > {f}
 ( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
 sampler=$!
 """
@@ -310,9 +328,12 @@ def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done",
     mark `done` (Ready = results final), linger for kubectl cp. `cpu` =
     (request, limit): sample the container's CPU while `cmd` runs."""
     head = _cpu_sampler(prefix, *cpu) if cpu else ""
+    # cpu_end carries the same anchor again: a realtime step during the drive shows as the two
+    # anchors' offsets disagreeing past their brackets (#1043 review, round 2)
     tail = (f"""kill "$sampler" 2>/dev/null
 cpu_sample
-printf '{{"kind": "cpu_end"}}\\n' >> /out/{prefix}-cpu.jsonl
+anchor
+printf '{{"kind": "cpu_end", "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$an_ep" "$an_up" "$an_lo" >> /out/{prefix}-cpu.jsonl
 """ if cpu else "")
     return f"""set -u
 {head}rc=0

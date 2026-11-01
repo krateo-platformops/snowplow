@@ -236,13 +236,15 @@ T_POINTS = 1792576800.0
 
 
 def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit_m=None,
-              stall=None, idle=None, pressure=True, node=True, anchored=True):
+              stall=None, idle=None, pressure=True, node=True, anchored=True, end_step=0.0):
     """<container>-cpu.jsonl as k6_job._cpu_sampler writes it: cumulative
     usage every 5 s, one window per `cores` value; per window its cgroup
     pressure stall (`stall`, seconds; default none) and the node's idle ticks
     (`idle`; default 400 of 1000, 0 = saturated). `anchored`: True, False
     (no anchor), or the one anchor field to leave out (an older sampler's
-    anchor: 67cc483d wrote epoch + uptime, no uptime_lo)."""
+    anchor: 67cc483d wrote epoch + uptime, no uptime_lo). cpu_end carries the
+    same offset again (a steady clock), or one `end_step` seconds later
+    (realtime stepped), or none (`end_step=None`)."""
     anchor = {"epoch": T_POINTS - 15, "uptime": 1000.0, "uptime_lo": 999.98} if anchored else {}
     if isinstance(anchored, str):
         anchor.pop(anchored)
@@ -262,7 +264,10 @@ def _cpu_file(d: Path, container: str, request_m: int, cores: list[float], limit
         busy += 1000
         idl += (idle[i] if idle else 400)
         recs.append(rec(1000.0 + 5 * (i + 1)))
-    recs.append({"kind": "cpu_end"})
+    up_end = 1000.0 + 5 * len(cores) + 1.0
+    end = ({"epoch": int(T_POINTS - 15 + (up_end - 1000.0) + end_step), "uptime": up_end, "uptime_lo": up_end - 0.02}
+           if anchored is True and end_step is not None else {})
+    recs.append({"kind": "cpu_end", **end})
     (d / f"{container}-cpu.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
 
 
@@ -480,6 +485,10 @@ def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_pat
     assert (start["node_cpus"], start["uptime"]) == (2, 4321.5) and start["epoch"] > 1_700_000_000
     # the anchor's bracket: the uptime read just before the epoch ticked (a fixed file: the same value)
     assert start["uptime_lo"] == 4321.5
+    # cpu_end carries the same anchor again (a realtime step during the drive shows, round 2)
+    end = recs[-1]
+    assert end["kind"] == "cpu_end" and (end["uptime"], end["uptime_lo"]) == (4321.5, 4321.5)
+    assert end["epoch"] >= start["epoch"] + 1
     assert cpu and all(r["pressure_some_usec"] == 123456 and r["pressure_full_usec"] == 789 for r in cpu)
     assert all(r["node_busy_ticks"] == 100 + 2 + 30 + 6 + 7 + 8 and r["node_idle_ticks"] == 400 + 5 for r in cpu)
     assert all(r["usage_usec"] == 5000000 and r["throttled_usec"] == 7 for r in cpu)
@@ -566,7 +575,9 @@ def test_a_load_is_placed_by_its_own_start_not_by_its_points_time(tmp_path):
     own start (t0) they are what the stall can explain: INVALID."""
     _cpu_file(tmp_path, "browser", 3000, [1.0] * 6, stall=[0, 0, 5.0, 0, 0, 0])      # window 2: [T-5, T]
     st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
-    assert st["slack_s"] == pytest.approx(0.02)                                   # the anchor's bracket
+    # the anchor's bracket (0.02 s) + /proc/uptime's 10 ms resolution (round 2 nit)
+    assert st["slack_s"] == pytest.approx(0.03)
+    assert (st["end_anchored"], st["clock_step_s"]) == (True, 0.0)               # a steady clock
     pts = []
     for i in range(30):          # 700 ms loads in the window's last 0.7 s, written 1.1 s after they ended
         t0 = int((T_POINTS - 0.7) * 1000) + i
@@ -1562,7 +1573,8 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     assert isinstance(start["epoch"], int) and start["epoch"] > 1_700_000_000 and start["uptime"] > 0
     assert 0 < start["uptime_lo"] <= start["uptime"]                            # the tick is bracketed
     assert isinstance(start["node_cpus"], int) and start["node_cpus"] >= 1
-    assert recs[-1] == {"kind": "cpu_end"}
+    end = recs[-1]
+    assert end["kind"] == "cpu_end" and end["epoch"] > start["epoch"] and 0 < end["uptime_lo"] <= end["uptime"]
     pts = [r for r in recs if r["kind"] == "cpu"]
     assert len(pts) >= 2 and pts[-1]["usage_usec"] > pts[0]["usage_usec"] > 0
     # the node's ticks always (/proc/stat); the cgroup's pressure where the kernel has PSI: a
@@ -1572,7 +1584,7 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     assert pts[-1]["node_busy_ticks"] > pts[0]["node_busy_ticks"]
     assert all(b["t"] > a["t"] for a, b in itertools.pairwise(pts))
     st = k6eval.cpu_stats(recs)
-    assert st["windows"] >= 1 and st["p95_cores"] > 0
+    assert st["windows"] >= 1 and st["p95_cores"] > 0, (st, recs)            # the records, to tell a cause
     assert (out / "probe-exit.json").exists() and (out / "done").read_text().strip() == "0"
 
 
@@ -2078,3 +2090,136 @@ def test_run606_k6_a_refused_menu_class_preflight_stops_the_run(harness):
     assert "preflight OK (the run;" in log
     assert "PREFLIGHT REFUSED: /dashboard -> 500" in log and "(menu class bench-platform-admins+devs)" in log
     assert "=== step reboot ===" not in log and "=== step measure ===" not in log
+
+
+
+# ── #1043 review round 2 ──────────────────────────────────────────────────
+
+def _clock_tree(tmp_path, step_s=0.003, realtime=None):
+    """A fake cgroup / proc / out and a fake `date` FIRST on PATH sharing one
+    simulated clock (the review's probe): each `date` call advances it by
+    `step_s` and rewrites /proc/uptime (truncated to 10 ms, as the kernel
+    prints it) for the next read, with realtime -
+    uptime = 900.000 s exactly; `realtime` fixed = a clock that never ticks."""
+    for d in ("cg", "proc", "out", "bin"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "cg" / "cpu.stat").write_text("usage_usec 5000000\nthrottled_usec 0\n")
+    (tmp_path / "cg" / "cpu.pressure").write_text("some avg10=0 avg60=0 avg300=0 total=1\n"
+                                                  "full avg10=0 avg60=0 avg300=0 total=0\n")
+    (tmp_path / "proc" / "stat").write_text("cpu  1 2 3 4 5 6 7 8 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n")
+    (tmp_path / "n").write_text("0")
+    (tmp_path / "proc" / "uptime").write_text("100.60 0.00\n")
+    rt = "int(1000 + t)" if realtime is None else str(int(realtime))
+    (tmp_path / "bin" / "date").write_text(f"""#!/bin/sh
+n=$(cat {tmp_path}/n); n=$((n + 1)); echo $n > {tmp_path}/n
+LC_ALL=C awk -v n=$n 'BEGIN {{ t = 0.6 + {step_s} * n; printf "%.2f 0.00\\n", int((100 + t) * 100 + 1e-6) / 100 > "{tmp_path}/proc/uptime"; printf "%d\\n", {rt} }}'
+""")
+    (tmp_path / "bin" / "date").chmod(0o755)
+    script = k6_job._wrapper("true", "probe", 0, done=str(tmp_path / "out" / "done"), cpu=("2", None))
+    return (script.replace("/sys/fs/cgroup/", f"{tmp_path}/cg/").replace("/proc/", f"{tmp_path}/proc/")
+            .replace("/out/", f"{tmp_path}/out/"))
+
+
+def test_the_anchor_brackets_the_tick_under_a_moving_clock(tmp_path):
+    """#1043 review R29: the REAL sampler start-up, by sh, against a simulated
+    clock (realtime - uptime = 900.000 s). Without the wait for the tick the
+    anchor is +0.61 s off while reporting 0.01 s of slack; with it the tick
+    (realtime 1001 = uptime 101.00) lies inside (uptime_lo, uptime] and the
+    true offset inside the anchor's interval."""
+    script = _clock_tree(tmp_path)
+    p = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120,
+                       env=dict(os.environ, PATH=f"{tmp_path}/bin:" + os.environ["PATH"]))
+    assert p.returncode == 0, p.stderr
+    recs = [json.loads(x) for x in (tmp_path / "out" / "probe-cpu.jsonl").read_text().splitlines()]
+    start, end = recs[0], recs[-1]
+    assert start["epoch"] == 1001                                    # the second right after the tick
+    assert start["uptime_lo"] < 101.0 <= start["uptime"]
+    lo, hi = k6eval._anchor(start)
+    assert lo <= 900.0 <= hi and hi - lo <= 0.03
+    st = k6eval.starvation({"cpu": {"probe": recs}}, "probe")
+    assert st["anchored"] and st["end_anchored"] and st["clock_step_s"] == 0.0
+    assert end["kind"] == "cpu_end" and end["epoch"] > start["epoch"]
+
+
+def test_a_date_that_is_missing_or_never_ticks_ends_the_wait_loudly(tmp_path):
+    """#1043 review (nit): with no `date`, or one that never ticks, the anchor
+    wait ends (bounded by uptime: at least 2 s) and says so; the samples have
+    no anchor, so the evaluator reads them UNMEASURED, never a hang."""
+    script = _clock_tree(tmp_path, step_s=0.01, realtime=1000)
+    p = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, PATH=f"{tmp_path}/bin:" + os.environ["PATH"]))
+    assert "date +%s did not tick within 2 s: the samples have no wall-clock anchor" in p.stderr
+    start = json.loads((tmp_path / "out" / "probe-cpu.jsonl").read_text().splitlines()[0])
+    assert (start["epoch"], start["uptime"], start["uptime_lo"]) == (None, None, None)
+    # no date at all: an empty answer, refused at once
+    (tmp_path / "bin" / "date").write_text("#!/bin/sh\nexit 127\n")
+    (tmp_path / "out" / "probe-cpu.jsonl").unlink()
+    p = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, PATH=f"{tmp_path}/bin:" + os.environ["PATH"]))
+    assert "no date +%s: the samples have no wall-clock anchor" in p.stderr
+    start = json.loads((tmp_path / "out" / "probe-cpu.jsonl").read_text().splitlines()[0])
+    assert start["epoch"] is None
+
+
+def test_the_windows_sit_on_the_epoch_to_the_millisecond(tmp_path):
+    """#1043 review R25 (probe P9): 30 warm 700 ms loads in the FIRST 0.7 s
+    of a fully stalled window are what the stall explains: INVALID. With the
+    windows 1 s late the stall is missed and the FAIL is blamed on snowplow:
+    so the windows' placement is pinned, to the millisecond."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6, stall=[0, 0, 0, 5.0, 0, 0])      # window 3: [T, T+5]
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    # cpu_start: epoch T-15 at uptime 1000.0; the first sample at uptime 1000.0
+    assert st["windows"][0]["t0"] == pytest.approx(T_POINTS - 15, abs=1e-3)
+    assert st["windows"][3]["t0"] == pytest.approx(T_POINTS, abs=1e-3)
+    navs = [{"wall_ms": 700.0, "visit": 2, "start": T_POINTS + 0.015 + 0.001 * i} for i in range(30)]
+    navs.append({"wall_ms": 100.0, "visit": 1, "start": T_POINTS - 10})
+    c = load606.starvation_check(navs, st, load606.THRESHOLDS)
+    assert c["result"] == "FAIL" and "warm_nav_p95_ms" in c["why"], c
+
+
+def test_a_widget_timeout_with_no_start_is_unmeasured(tmp_path):
+    """#1043 review R32: a widget-timeout state that names no load (no t0)
+    cannot be placed against the stall: UNMEASURED, never dropped."""
+    _cpu_file(tmp_path, "browser", 3000, [1.0] * 6)
+    st = k6eval.starvation({"cpu": {"browser": k6eval.read_cpu(str(tmp_path), "browser")}})
+    navs = [{"wall_ms": 700.0, "visit": 2, "start": T_POINTS - 3, "session": "s1", "t0": str(int((T_POINTS - 3) * 1000))}]
+    browser = {"points": {"browser_widget_states": [(1, {"session": "s1", "state": "timeout"})],
+                          "browser_page_loads": [], "browser_page_load_ms": []}}
+    c = load606.starvation_check(navs, st, load606.THRESHOLDS, browser=browser)
+    assert c["result"] == "UNMEASURED" and "the load of 1 widget-timeout state(s)" in c["why"], c
+    placed = {"points": dict(browser["points"], browser_widget_states=[
+        (1, {"session": "s1", "state": "timeout", "t0": navs[0]["t0"]})])}
+    assert load606.starvation_check(navs, st, load606.THRESHOLDS, browser=placed)["result"] != "UNMEASURED"
+
+
+@pytest.mark.parametrize("end_step,want", [(0.0, None), (2.0, "realtime stepped at least"),
+                                           (-2.0, "realtime stepped at least"),
+                                           (None, "the samples' closing wall-clock anchor (cpu_end)")])
+def test_a_realtime_step_during_the_drive_is_unmeasured(tmp_path, end_step, want):
+    """#1043 review round 2: cpu_end re-anchors. A realtime step between the
+    two anchors (past both brackets) moves the loads (realtime) against the
+    windows (boottime): the page bars are UNMEASURED; so are they with no
+    closing anchor. A steady clock judges as before."""
+    rc, v = _starve_case(tmp_path, base_ms=200.0, end_step=end_step)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    if want is None:
+        assert c["result"] == "PASS", c
+    else:
+        assert c["result"] == "UNMEASURED" and want in c["why"], c
+        assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "INCONCLUSIVE"
+
+
+def test_the_step_is_how_far_the_anchors_disagree_past_their_brackets():
+    """The two anchors' offset intervals, [epoch - uptime - 0.01,
+    epoch - uptime_lo]: overlapping = a steady clock (0), apart = a step of
+    at least the gap. A disagreement inside the brackets is not a step."""
+    def st(end):
+        recs = [{"kind": "cpu_start", "epoch": 1000, "uptime": 100.00, "uptime_lo": 99.90},
+                {"kind": "cpu", "t": 100.0, "usage_usec": 0}, {"kind": "cpu", "t": 105.0, "usage_usec": 1},
+                dict({"kind": "cpu_end"}, **end)]
+        return k6eval.starvation({"cpu": {"browser": recs}})
+    # start: offset in [899.99, 900.10]
+    assert st({"epoch": 1010, "uptime": 109.95, "uptime_lo": 109.90})["clock_step_s"] == 0.0   # [900.04, 900.10]
+    assert st({"epoch": 1010, "uptime": 109.70, "uptime_lo": 109.65})["clock_step_s"] == pytest.approx(0.19)
+    assert st({"epoch": 1010, "uptime": 110.20, "uptime_lo": 110.15})["clock_step_s"] == pytest.approx(0.14)  # [899.79, 899.85]
+    assert st({})["clock_step_s"] is None and st({})["end_anchored"] is False

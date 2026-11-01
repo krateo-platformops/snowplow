@@ -195,6 +195,22 @@ def cpu_stats(recs: list[dict] | None) -> dict | None:
 
 
 
+#: /proc/uptime prints centiseconds, truncated: a read can be up to 10 ms behind the instant
+UPTIME_RES_S = 0.01
+
+
+def _anchor(r: dict) -> tuple[float, float] | None:
+    """The interval the true realtime - boottime offset lies in, from one
+    tick-bracketed anchor (k6_job._cpu_sampler's `anchor`): realtime crossed
+    `epoch` between the uptime reads `uptime_lo` and `uptime`, each up to
+    UPTIME_RES_S behind its instant, so the offset is in
+    [epoch - uptime - UPTIME_RES_S, epoch - uptime_lo]. None if not recorded."""
+    if not all(r.get(k) is not None for k in ("epoch", "uptime", "uptime_lo")):
+        return None
+    e, u, lo = float(r["epoch"]), float(r["uptime"]), float(r["uptime_lo"])
+    return e - u - UPTIME_RES_S, e - min(lo, u)
+
+
 def starvation(o: dict | None, container: str = "browser") -> dict:
     """The container's measured starvation evidence, per sample window:
     `stall_s` (cgroup cpu.pressure "some": seconds during which at least one
@@ -202,19 +218,27 @@ def starvation(o: dict | None, container: str = "browser") -> dict:
     one idle tick in the window: /proc/stat's idle + iowait did not move, to
     its 10 ms tick, on any CPU). Windows are on the epoch (cpu_start's
     anchor: the tick of `date +%s`, bracketed by two /proc/uptime reads).
-    `slack_s` is that bracket, the anchor's whole error, measured per run
-    (#1043 review B1): each window is widened by it. `pressure` / `node` /
-    `anchored` say whether each was MEASURED: a series that lacks it (one
-    null sample included) is unmeasured, never "not starved"."""
+    `slack_s` is that bracket plus /proc/uptime's 10 ms resolution, the
+    anchor's whole error, measured per run (#1043 review B1, round 2): each
+    window is widened by it. cpu_end carries a second anchor: `clock_step_s`
+    is how far the two disagree past their brackets (a realtime step during
+    the drive; NTP slewing moves realtime and boottime alike, so a steady
+    clock reads 0). `pressure` / `node` / `anchored` / `end_anchored` say
+    whether each was MEASURED: a series that lacks it (one null sample
+    included) is unmeasured, never "not starved"."""
     recs = ((o or {}).get("cpu") or {}).get(container) or []
     start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    end = next((r for r in recs if r.get("kind") == "cpu_end"), {})
     pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
     pressure = bool(pts) and all(p.get("pressure_some_usec") is not None for p in pts)
     node = bool(pts) and all(p.get("node_idle_ticks") is not None and p.get("node_busy_ticks") is not None
                              for p in pts)
-    anchored = all(start.get(k) is not None for k in ("epoch", "uptime", "uptime_lo"))
+    a0, a1 = _anchor(start), _anchor(end)
+    anchored = a0 is not None
     off = float(start["epoch"]) - float(start["uptime"]) if anchored else 0.0
-    slack = max(0.0, float(start["uptime"]) - float(start["uptime_lo"])) if anchored else None
+    slack = max(0.0, float(start["uptime"]) - float(start["uptime_lo"])) + UPTIME_RES_S if anchored else None
+    # the two anchors' offset intervals: apart = the clock stepped by at least the gap
+    step = round(max(0.0, a1[0] - a0[1], a0[0] - a1[1]), 3) if anchored and a1 is not None else None
     wins = []
     for a, b in pairwise(pts):
         dt = float(b["t"]) - float(a["t"])
@@ -234,6 +258,7 @@ def starvation(o: dict | None, container: str = "browser") -> dict:
         wins.append(w)
     span = sum(w["t1"] - w["t0"] for w in wins)
     return {"container": container, "pressure": pressure, "node": node, "anchored": anchored,
+            "end_anchored": a1 is not None, "clock_step_s": step,
             "slack_s": slack, "node_cpus": start.get("node_cpus"), "windows": wins,
             "stall_share": (round(sum(w["stall_s"] for w in wins) / span, 4) if pressure and span else None),
             "saturated_windows": (sum(1 for w in wins if w["saturated"]) if node else None)}

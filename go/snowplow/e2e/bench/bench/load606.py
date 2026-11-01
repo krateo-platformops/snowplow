@@ -3495,7 +3495,14 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     name = "browser.cpu_starvation"
     missing = [w for w, ok in (("its cgroup CPU pressure (cpu.pressure)", st["pressure"]),
                                ("the loadgen node's CPU (/proc/stat)", st["node"]),
-                               ("the samples' wall-clock anchor", st["anchored"])) if not ok]
+                               ("the samples' wall-clock anchor", st["anchored"]),
+                               ("the samples' closing wall-clock anchor (cpu_end)",
+                                not st["anchored"] or st.get("end_anchored"))) if not ok]
+    if st.get("clock_step_s"):
+        # the realtime clock stepped during the drive: the windows (boottime) and the loads (realtime)
+        # no longer share one offset, so no load can be placed against them
+        missing.append(f"one wall clock for the drive (realtime stepped at least {st['clock_step_s']:g} s "
+                       f"against boottime between the samples' two anchors)")
     unplaced = sum(1 for n in navs if n.get("start") is None)
     if unplaced:
         missing.append(f"the start of {unplaced} page load(s)")
