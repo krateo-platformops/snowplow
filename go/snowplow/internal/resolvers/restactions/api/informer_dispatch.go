@@ -52,6 +52,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -464,6 +465,7 @@ func dispatchContentViaInformer(ctx context.Context, call httpcall.RequestOption
 // RecordApiserverFallthrough, so the apiserver LIST that follows is labelled
 // with it on snowplow_resolve_collection_lists. On a served call it is ctx.
 func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context, error) {
+	defer slowcall.Start(ctx, slowcall.PhaseInformerDispatch).End() // #1054
 	log := xcontext.Logger(ctx)
 
 	// 0.30.96: lazy-start the informer_dispatch.summary goroutine the
@@ -617,15 +619,19 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		servedAfterWait := false
 		if budget := syncWaitBudget(); budget > 0 && syncCh != nil {
 			timer := time.NewTimer(budget)
+			wait := slowcall.StartWait(ctx, slowcall.PhaseInformerSyncWait, "informer_sync", "", gvr.String()) // #1054
 			select {
 			case <-syncCh:
 				// Initial WaitForCacheSync completed within the budget.
 				timer.Stop()
+				wait.End()
 			case <-ctx.Done():
 				// Request cancelled — abandon the wait, fall through.
 				timer.Stop()
+				wait.EndRelease(slowcall.CauseOf(ctx.Err()))
 			case <-timer.C:
 				// Budget exhausted — informer still not synced.
+				wait.EndRelease(slowcall.ReleaseTimeout)
 			}
 			// Re-check servability ONCE after the bounded wait. A now-
 			// servable GVR proceeds to the served path below (no second

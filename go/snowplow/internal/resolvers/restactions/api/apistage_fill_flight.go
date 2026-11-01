@@ -84,6 +84,7 @@ import (
 	"sync"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -124,6 +125,9 @@ type contentStampGate struct {
 // contentFlight is one in-flight fill of one content key.
 type contentFlight struct {
 	key string
+	// gvr (#1054) is the flight's resource type, as a waiter's slow-call
+	// record names it. Immutable.
+	gvr string
 	// startSeq is the flight's read epoch. A PENDING flight (#765) sets it only
 	// when it starts, under contentFlightsMu; it is read under the same lock, or
 	// after done is closed.
@@ -179,7 +183,9 @@ func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersion
 		// The prior flight is bounded by its own detached write deadline, so this
 		// wait is too; it is not cut by this reader's ctx, because the pending
 		// flight's joiners are waiting on THIS leader.
+		w := slowcall.StartWait(ctx, slowcall.PhaseFlightWait, "content_flight_pending", key, flight.gvr) // #1054
 		<-flight.prior.done
+		w.End()
 		fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 		startSeq, _ = cache.DepGenStartSeqFromContext(fillCtx)
 		startPendingContentFlight(flight, startSeq)
@@ -244,12 +250,12 @@ func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionR
 			return p, false, false
 		}
 		if cur != nil {
-			p := &contentFlight{key: key, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
+			p := &contentFlight{key: key, gvr: gvr.String(), prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
 			contentPendingFlights[key] = p
 			return p, true, false
 		}
 	}
-	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
+	f := &contentFlight{key: key, gvr: gvr.String(), startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
 	contentFlights[key] = f
 	return f, true, false
 }
@@ -277,10 +283,20 @@ func (f *contentFlight) complete(res contentFlightResult) {
 func (f *contentFlight) wait(ctx context.Context) (contentFlightResult, bool) {
 	contentFillJoinWaiting.Add(1)
 	defer contentFillJoinWaiting.Add(-1)
+	// #1054 — the joiner's wait on another reader's fill: the flight wait of
+	// its slow-call record, named by the content key's digest and released by
+	// the flight (with or without a servable result) or by its own ctx.
+	w := slowcall.StartWait(ctx, slowcall.PhaseFlightWait, "content_flight", f.key, f.gvr)
 	select {
 	case <-f.done:
+		if f.res.ok {
+			w.End()
+		} else {
+			w.EndRelease(slowcall.ReleaseLeaderFailed)
+		}
 		return f.res, f.res.ok
 	case <-ctx.Done():
+		w.EndRelease(slowcall.CauseOf(ctx.Err()))
 		return contentFlightResult{}, false
 	}
 }

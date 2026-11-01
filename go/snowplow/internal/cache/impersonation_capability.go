@@ -59,6 +59,7 @@ import (
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"golang.org/x/sync/singleflight"
 
 	authzv1 "k8s.io/api/authorization/v1"
@@ -269,6 +270,11 @@ func review(ctx context.Context, p impPrincipal) (bool, error) {
 		return false, errNoImpersonationReviewer
 	}
 	key := strconv.FormatUint(gen, 10) + "\x00" + p.resource + "\x00" + p.namespace + "\x00" + p.name
+	// #1054 — a single-flight: a request that joins waits on the first
+	// caller's review (the span covers the leader's own review too). The key
+	// names a principal: the record carries only its redact digest.
+	wait := slowcall.StartWait(ctx, slowcall.PhaseFlightWait, "impersonation_review", key, "")
+	defer func() { wait.EndRelease(slowcall.CauseOf(ctx.Err())) }()
 	v, err, _ := impCapFlight.Do(key, func() (any, error) {
 		// A flight that finished between our lookup and this Do already stored
 		// the answer; do not ask the apiserver twice.

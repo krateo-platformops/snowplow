@@ -76,6 +76,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 )
@@ -209,7 +210,9 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 	// pipeline is invariant (feedback_cache_must_not_constrain_jq). This is
 	// the #18/#19 mechanism extended to the discovery root.
 	if rootOK {
+		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054
 		raw, dErr := cli.RESTClient().Get().AbsPath(root).DoRaw(ctx)
+		dial.End()
 		if dErr != nil {
 			return nil, false, dErr
 		}
@@ -218,7 +221,9 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 
 	// Single-GroupVersion discovery (/apis/<g>/<v> or /api/<v>) — the #18/#19
 	// path, unchanged.
+	dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054
 	list, dErr := cli.ServerResourcesForGroupVersion(gv)
+	dial.End()
 	if dErr != nil {
 		return nil, false, dErr
 	}

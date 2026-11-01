@@ -42,6 +42,7 @@ import (
 	"log/slog"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -395,7 +396,11 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	// Per-group singleflight — serialize concurrent discovery hops
 	// for the same group across goroutines.
 	lock := discoverGroupLock(group)
+	// #1054 — a request blocked here waits on another goroutine's discovery
+	// hop for the same group: the lock wait of its slow-call record.
+	held := slowcall.StartWait(ctx, slowcall.PhaseLockWait, "discovery_group", group, "")
 	lock.Lock()
+	held.End()
 	defer lock.Unlock()
 
 	if ctx.Err() != nil {

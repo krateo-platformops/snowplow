@@ -127,6 +127,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -467,7 +468,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 				recordPreDial(preDialScopeFallback)
 			}
 		}
+		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054: one apiserver round-trip
 		obj, getErr := nri.Get(ctx, name, metav1.GetOptions{})
+		dial.End()
 		if getErr != nil {
 			return nil, false, getErr
 		}
@@ -617,7 +620,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// the common boot case), then the SAME four-conjunct IsServable gate
 		// ListObjectsServable enforces. Both must hold to serve from cache.
 		waitStart := time.Now()
+		syncWait := slowcall.StartWait(ctx, slowcall.PhaseInformerSyncWait, "informer_sync", "", gvr.String()) // #1054
 		synced := rw.WaitForGVRSync(ctx, gvr, internalDispatchServeSyncWait)
+		syncWait.EndRelease(syncWaitRelease(ctx, synced))
 		recordServeSyncWait(time.Since(waitStart)) // #796
 		if synced && rw.IsServable(gvr) {
 			if served, ok := rw.ListServableEnvelopeJSONWhere(gvr, namespace, keep); ok {
@@ -668,7 +673,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			return nil, false, ctx.Err()
 		default:
 		}
+		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054: one LIST page round-trip
 		page, pageErr := nri.List(ctx, opts)
+		dial.End()
 		if pageErr != nil {
 			return nil, false, pageErr
 		}
@@ -872,4 +879,17 @@ func pathHasNullPathSegment(path string) bool {
 	// (typically the namespace) folded to empty. TrimPrefix the leading '/'
 	// so the mandatory leading separator is not mistaken for an empty segment.
 	return strings.Contains(strings.TrimPrefix(path, "/"), "//")
+}
+
+// syncWaitRelease is why a bounded informer sync wait ended (#1054): the
+// informer synced (completed), the caller's ctx ended, or the bound ran out
+// first (timeout).
+func syncWaitRelease(ctx context.Context, synced bool) slowcall.Release {
+	if synced {
+		return slowcall.ReleaseCompleted
+	}
+	if err := ctx.Err(); err != nil {
+		return slowcall.CauseOf(err)
+	}
+	return slowcall.ReleaseTimeout
 }

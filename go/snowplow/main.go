@@ -41,6 +41,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"github.com/krateo-platformops/snowplow/internal/telemetry/rum"
@@ -128,6 +129,10 @@ func snowplowCORSOptions() cors.Options {
 //     extracts the inbound W3C traceparent/baggage (#1013). With tracing off
 //     the global TracerProvider is the no-op default and it records nothing;
 //     otelhttp's HTTP server metrics still flow when metrics are on.
+//   - slowcall.Middleware (#1054) runs inside the span, where r.Pattern
+//     already names the route: it gives each API request its phase record
+//     and logs one WARN line for a request slower than the page goal's bound
+//     (slowcall.Bound), with the log line correlated to the span.
 //   - middleware.Gzip is INNERMOST (Track 2): it compresses the handler's
 //     actual response bytes while the span still measures the whole request.
 //     text/event-stream (GET /refreshes) is excluded so the SSE stream keeps
@@ -136,7 +141,7 @@ func snowplowCORSOptions() cors.Options {
 // It is a function so the composition the pod serves is the one the tests
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
-	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(middleware.Gzip(mux), mux))
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(mux)), mux))
 }
 
 // newRUMIngest returns #1015's ingest, with its forwarder's worker running

@@ -47,6 +47,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -711,6 +712,9 @@ func apistageContentServeAttempt(
 		return true
 	}
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
+		// #1054 — the request's content_read phase: the store lock, an
+		// incremental cell's snapshot drain, the stale-debt registry.
+		defer slowcall.Start(ctx, slowcall.PhaseContentRead).End()
 		// #710 PR-2b (D2, owner ruling "show then replace") — an ARMABLE customer
 		// read of a KNOWN-STALE cell is served the cell at once and opens (or
 		// joins) its debt: an immediate refill at top priority, then a push to
@@ -921,7 +925,10 @@ func apistageContentServeAttempt(
 		fromCell := false
 		if res.cell != nil && isList {
 			need, _ := cache.DepGenStartSeqFromContext(fillCtx)
-			if v, vok := res.cell.Snapshot(need); vok {
+			snap := slowcall.Start(ctx, slowcall.PhaseContentRead) // #1054: the cell's drain to need
+			v, vok := res.cell.Snapshot(need)
+			snap.End()
+			if vok {
 				if items := v.Items(); len(items) > 0 {
 					parsed = parsedListEnvelope{items: items, apiVersion: v.APIVersion(), kind: v.Kind()}
 					haveParsed = true
@@ -992,7 +999,10 @@ func apistageContentServeAttempt(
 		// item, …), bounded by the detached fill ctx (the write deadline), while
 		// the fills in flight would exceed the shared ceiling. Joiners pay nothing.
 		gate := theContentFillGate()
-		if aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList)); aerr != nil {
+		adm := slowcall.Start(ctx, slowcall.PhaseFillAdmission) // #1054
+		aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList))
+		adm.End()
+		if aerr != nil {
 			// D1 — never admitted before the deadline: this reader and every
 			// joiner error. Nothing is dispatched, stored or served stale.
 			flight.complete(contentFlightResult{err: aerr})

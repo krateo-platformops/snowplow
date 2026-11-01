@@ -48,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -846,6 +847,8 @@ func (r *refresher) yieldToCustomer(ctx context.Context) {
 	if !customerInFlightLocked() {
 		return
 	}
+	// #1054 — parked: the process-wide count every slow-call snapshot reports.
+	defer slowcall.BeginYield(ctx).End()
 	t := time.NewTicker(refresherYieldPoll)
 	defer t.Stop()
 	cap := time.NewTimer(refresherYieldMaxParked)

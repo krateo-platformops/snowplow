@@ -35,6 +35,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -1523,7 +1524,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := withDialAnswer(fctx)
+	dial := slowcall.Start(fctx, slowcall.PhaseStageDial) // #1054: the endpoint round-trip
 	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
+	dial.End()
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
 		// (the boot-readiness bound, a cut scope, a client that left). Counted,
