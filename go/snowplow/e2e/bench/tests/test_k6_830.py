@@ -1543,7 +1543,10 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
     out = tmp_path / "out"
     out.mkdir()
     out.chmod(0o777)
-    burn = "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; sleep 6"
+    # the burn is sized in WALL time (2-3 s busy), not in iterations: p95_cores is rounded to 0.1
+    # and an iteration count's CPU depends on the shell and the machine (dash ran 400 000 of them
+    # too fast to show in a 5 s window on CI, busybox did not)
+    burn = 'end=$(( $(date +%s) + 3 )); while [ "$(date +%s)" -lt "$end" ]; do :; done; sleep 6'
     script = k6_job._wrapper(burn, "probe", 0, cpu=("2", "2"))
     p = subprocess.run(["docker", "run", "--rm", "--cpus", "2", "--user", "12345",
                         "-v", f"{out}:/out", "--entrypoint", "/bin/sh", image, "-c", script],
