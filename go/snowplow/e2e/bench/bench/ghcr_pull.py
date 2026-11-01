@@ -109,36 +109,60 @@ HELM_CHART_LAYER = "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
 #: manifest, or a token answer, larger than that is not one
 MANIFEST_MAX = 4 * 1024 * 1024
 #: each call's WHOLE bound (seconds), connect, status line, headers and body together (_call): a
-#: registry call, a blob, a helm render (run, its output read, and parsed)
+#: registry call, a blob, a helm render (run, its output read, and parsed), the chart's own files
+#: read (its tar walked, its Chart.yaml / values.yaml parsed in-process: read_chart_files). The parse
+#: has the render's bound: both are an in-process YAML parse of at most RENDER_MARGIN x a measured
+#: real size (below).
 HTTP_BOUND_S, BLOB_BOUND_S, RENDER_BOUND_S = 30.0, 60.0, 120.0
+PARSE_BOUND_S = RENDER_BOUND_S
 #: Size caps (#1041 review F3, round 2).
 #: - A chart's files: helm's OWN loader limits (helm v3 pkg/chart/loader: MaxDecompressedChartSize
 #:   100 MiB, MaxDecompressedFileSize 5 MiB): a chart past them is one helm itself refuses to load.
 #: - A blob's ceiling: the same 100 MiB. A gzip stream inflates to at least about its own size, so a
 #:   larger blob cannot hold a chart helm loads. Held in memory whole; the tar headers are read one
-#:   at a time and never accumulate (chart_images), so memory is the blob plus one file.
+#:   at a time and never accumulate (read_chart_files), so the WALK's memory is the blob plus one
+#:   file; what is parsed is capped below (`parsed`).
 #: - helm template's stdout: helm sets no limit. 16 x the largest render measured (2,665,855 B,
 #:   agentgateway-controller 0.2.0): 16 = four doublings of growth before a real chart is refused.
 #:   The YAML parse costs about 8 bytes of memory per byte of output (the round-1 review: 52 MB ->
-#:   +415 MiB), so at the cap the parse peaks near 340 MiB, inside the operator machine's.
+#:   +415 MiB), so at the cap the parse peaks near 340 MiB, inside the operator machine's. Near that
+#:   cap the TIME bound refuses first (a 42 MB render parses for about 150 s, past RENDER_BOUND_S):
+#:   the size cap bounds the memory, the bound the wait.
+#: - The chart's own Chart.yaml + values.yaml, parsed in-process for the images its values name: all
+#:   of them together, 16 x the largest such total measured (`parsed`), the same rule (#1041 review
+#:   round 3, M1: within helm's own 5 MiB / 100 MiB, two 5 MiB values.yaml took 941 s and +496 MiB).
+#:   Counted before any of it is parsed, so a chart past it is refused without the parse. Probe
+#:   (2026-11-01, the review's shape `kN: {a: 1, b: [x, y]}`): the review's two 5 MiB values.yaml
+#:   are refused in 0.01 s, +1.7 MiB; just under the cap (2,260,389 B) parses in 2.9 s, +203 MiB
+#:   with libyaml, 10.3 s, +273 MiB without: inside PARSE_BOUND_S either way.
 #: Measured 2026-10-31 by this preflight's own `measured` record over the charts run 20 pulls, on the
 #: real installer 0.3.468 with the bench's values (largest blob / largest file / inflated / render,
 #: bytes): agentgateway-controller 0.2.0 298,188 / 1,041,093 / 2,753,178 / 2,665,855;
-#: agentgateway-policies 0.2.18 152,818 / 141,400 / 593,530 / 99,129; the pinned alert-provider
+#: agentgateway-policies 0.2.18 152,818 / 141,400 / 593,530 / 99,113; the pinned alert-provider
 #: 0.2.53 9,429 / 10,094 / 31,001 / 15,495; github-provider-kog 0.6.0 88,778 / 15,708 / 386,177 /
 #: 361,843; krateo-marketplace-catalog 0.1.2 42,296 / 284,927 / 363,923 / 390,039; and the installer
-#: 0.3.468 itself 363,138 / 833,982 / 1,622,254 / 32,104. Every run records its own under
-#: `measured`.
+#: 0.3.468 itself 363,138 / 833,982 / 1,622,254 / 32,104. Parsed in-process (Chart.yaml +
+#: values.yaml, all of a chart's, bytes; 2026-11-01): agentgateway-policies 0.2.18 141,293;
+#: agentgateway-controller 0.2.0 17,621; alert-provider 0.2.53 7,451; github-provider-kog 0.6.0 1,644;
+#: krateo-marketplace-catalog 0.1.2 681. tests/fixtures/ghcr_measured_0_3_468.json
+#: holds that record, and a test pins REAL_LARGEST to it. Every run records its own under
+#: `measured`, and the preflight says so when one exceeds REAL_LARGEST (a stale input, #1041 R31).
 HELM_MAX_CHART, HELM_MAX_FILE = 100 * 1024 * 1024, 5 * 1024 * 1024
-REAL_LARGEST = {"blob": 363_138, "file": 1_041_093, "inflated": 2_753_178, "render": 2_665_855}
+REAL_LARGEST = {"blob": 363_138, "file": 1_041_093, "inflated": 2_753_178, "render": 2_665_855,
+                "parsed": 141_293}
 RENDER_MARGIN = 16
 CHART_INFLATED_MAX = HELM_MAX_CHART
 CHART_FILE_MAX = HELM_MAX_FILE
 BLOB_MAX = HELM_MAX_CHART
 RENDER_OUT_MAX = RENDER_MARGIN * REAL_LARGEST["render"]
+CHART_PARSED_MAX = RENDER_MARGIN * REAL_LARGEST["parsed"]
 CAPS = {"helm_max_chart": HELM_MAX_CHART, "helm_max_file": HELM_MAX_FILE, "render_margin": RENDER_MARGIN,
         "real_largest": REAL_LARGEST, "blob_max": BLOB_MAX, "chart_inflated_max": CHART_INFLATED_MAX,
-        "chart_file_max": CHART_FILE_MAX, "render_out_max": RENDER_OUT_MAX}
+        "chart_file_max": CHART_FILE_MAX, "render_out_max": RENDER_OUT_MAX,
+        "chart_parsed_max": CHART_PARSED_MAX}
+#: a `measured` key -> the REAL_LARGEST input it is compared with
+MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated", "render": "render",
+                  "parsed": "parsed"}
 #: the registry API. GHCR_API_URL may point it elsewhere (the suite's fake
 #: registry), over https only: the token is never sent in clear text.
 API = os.environ.get("GHCR_API_URL", "https://ghcr.io")
@@ -542,8 +566,12 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                 except OSError as e:
                     raise _Refused(f"helm template could not run: {e}") from None
                 procs.append(pr)
-                pr.stdin.write(yaml.safe_dump(values or {}).encode())
-                pr.stdin.close()
+                unread = False
+                try:
+                    pr.stdin.write(yaml.safe_dump(values or {}).encode())
+                    pr.stdin.close()
+                except OSError:             # helm exited before reading its values: its own reason follows
+                    unread = True
                 out = bytearray()
                 while True:
                     chunk = pr.stdout.read1(65536)
@@ -559,6 +587,8 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                     meta["render"] = len(out)
         if rc != 0:
             raise _Refused(f"helm template failed: {why[:300]}")
+        if unread:
+            raise _Refused("helm template exited without reading its values")
         try:
             return [x for x in yaml.safe_load_all(out.decode()) if x is not None]
         except (yaml.YAMLError, UnicodeDecodeError) as e:
@@ -587,14 +617,20 @@ def pods(docs) -> list[dict]:
     them, its own imagePullSecrets PLUS those of the ServiceAccount it runs
     as (serviceAccountName, else `default`) among the rendered manifests
     (#1041 review N1: alert-provider 0.2.53 puts its secret on its
-    ServiceAccount). YAML aliases walked once."""
+    ServiceAccount), in the pod's OWN namespace (round 3, F): a manifest's
+    metadata.namespace, else the release's (helm template --namespace).
+    YAML aliases walked once."""
+    docs = docs if isinstance(docs, list) else [docs]
+
+    def ns_of(d):
+        return ((d.get("metadata") or {}).get("namespace") if isinstance(d, dict) else None) or SECRET_NS
     accounts = {}
-    for d in docs if isinstance(docs, list) else [docs]:
+    for d in docs:
         if isinstance(d, dict) and d.get("kind") == "ServiceAccount":
-            accounts[(d.get("metadata") or {}).get("name")] = _secret_names(d.get("imagePullSecrets"))
+            accounts[(ns_of(d), (d.get("metadata") or {}).get("name"))] = _secret_names(d.get("imagePullSecrets"))
     out, seen = [], set()
 
-    def walk(o):
+    def walk(o, ns):
         if isinstance(o, (dict, list)):
             if id(o) in seen:
                 return
@@ -603,15 +639,17 @@ def pods(docs) -> list[dict]:
             if isinstance(o.get("containers"), list):
                 cs = [c for c in (o.get("initContainers") or []) + o["containers"] if isinstance(c, dict)]
                 sa = o.get("serviceAccountName") or o.get("serviceAccount") or "default"
-                out.append({"pull_secrets": sorted(_secret_names(o.get("imagePullSecrets")) | accounts.get(sa, set())),
-                            "service_account": sa,
+                out.append({"pull_secrets": sorted(_secret_names(o.get("imagePullSecrets"))
+                                                   | accounts.get((ns, sa), set())),
+                            "service_account": sa, "namespace": ns,
                             "images": sorted({c["image"] for c in cs if isinstance(c.get("image"), str)})})
             for v in o.values():
-                walk(v)
+                walk(v, ns)
         elif isinstance(o, list):
             for v in o:
-                walk(v)
-    walk(docs)
+                walk(v, ns)
+    for d in docs:
+        walk(d, ns_of(d))
     return out
 
 
@@ -703,10 +741,15 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
         if len(layers) != 1:
             raise _Refused(f"{len(layers)} helm chart layers in its manifest")
         data = _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer)
-        charts, vals, inflated, largest = read_chart_files(data)
+        try:
+            charts, vals, inflated, largest, parsed = _call(lambda: read_chart_files(data), PARSE_BOUND_S)
+        except _Refused as e:
+            if str(e).startswith("no whole answer"):
+                raise _Refused(f"its chart files were not read within their {PARSE_BOUND_S:g} s bound") from None
+            raise
         if not charts:
             raise _Refused("no Chart.yaml in its chart layer")
-        out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated}
+        out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed}
         imgs = set()
         for d, v in vals.items():
             c = charts.get(d) or {}
@@ -731,13 +774,28 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
     return out
 
 
-def read_chart_files(data: bytes) -> tuple[dict, dict, int, int]:
-    """(Chart.yaml by dir, values.yaml by dir, bytes inflated, largest file)
-    of a chart blob: walked header by header, streamed, stopping at the first
-    cap passed. The headers never accumulate (tarfile would keep every one):
-    memory is the blob plus one file, whatever the member count."""
+def _yaml_loader():
+    """libyaml's safe loader when PyYAML has it (about 4x faster), else the
+    pure-Python one: the same documents either way. Speed only: the bound is
+    CHART_PARSED_MAX and PARSE_BOUND_S."""
     import yaml
-    charts, vals, inflated, largest = {}, {}, 0, 0
+    return getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def read_chart_files(data: bytes) -> tuple[dict, dict, int, int, int]:
+    """(Chart.yaml by dir, values.yaml by dir, bytes inflated, largest file,
+    bytes parsed) of a chart blob. The tar is walked header by header,
+    streamed, stopping at the first cap passed; the headers never accumulate
+    (tarfile would keep every one). The Chart.yaml / values.yaml bytes are
+    kept raw while walking and counted against CHART_PARSED_MAX, then
+    parsed: a chart past it is refused before any parse. Memory: the blob,
+    those raw bytes (at most CHART_PARSED_MAX) and their parsed documents
+    (structured YAML costs about 100 bytes per byte parsed: +203 MiB at the
+    cap, the probe in the caps comment). The caller runs this under
+    PARSE_BOUND_S (chart_images)."""
+    import yaml
+    charts, vals, inflated, largest, parsed = {}, {}, 0, 0, 0
+    raw = []
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         while True:
             m = tf.next()
@@ -753,9 +811,41 @@ def read_chart_files(data: bytes) -> tuple[dict, dict, int, int]:
                 if m.size > CHART_FILE_MAX:
                     raise _Refused(f"{m.name} inflates to {m.size} bytes, past helm's own "
                                    f"{CHART_FILE_MAX} byte file limit")
-                doc = yaml.safe_load(tf.extractfile(m).read(CHART_FILE_MAX + 1)) or {}
-                (charts if base == "Chart.yaml" else vals)[d] = doc
-    return charts, vals, inflated, largest
+                parsed += max(0, m.size)
+                if parsed > CHART_PARSED_MAX:
+                    raise _Refused(f"its Chart.yaml and values.yaml files come to more than its "
+                                   f"{CHART_PARSED_MAX} byte parse cap ({RENDER_MARGIN} x the largest real total)")
+                raw.append((d, base, tf.extractfile(m).read(CHART_FILE_MAX + 1)))
+    loader = _yaml_loader()
+    for d, base, body in raw:
+        try:
+            doc = yaml.load(body, Loader=loader) or {}      # noqa: S506 - a safe loader (_yaml_loader)
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            raise _Refused(f"{d + '/' if d else ''}{base} is not YAML: {str(e).splitlines()[0][:200]}") from None
+        (charts if base == "Chart.yaml" else vals)[d] = doc
+    return charts, vals, inflated, largest, parsed
+
+
+def stale_inputs(charts: list[dict]) -> list[dict]:
+    """Every measured size of this run that exceeds the REAL_LARGEST input
+    the caps derive from (#1041 review R31): that input is hand-copied from
+    an earlier run, so it shows itself stale here, long before a real chart
+    reaches RENDER_MARGIN x it. A report, not a refusal."""
+    out = []
+    for c in charts:
+        for k, v in sorted((c.get("measured") or {}).items()):
+            key = MEASURED_INPUT.get(k)
+            if key and isinstance(v, int) and v > REAL_LARGEST[key]:
+                out.append({"chart": c["chart"], "version": c["version"], "measured": k, "value": v,
+                            "input": key, "real_largest": REAL_LARGEST[key]})
+    return out
+
+
+def stale_notes(stale: list[dict]) -> list[str]:
+    """The preflight's report line per stale input (stale_inputs)."""
+    return [f"[ghcr] NOTE: {x['chart']} {x['version']} measured {x['measured']} = {x['value']} B, over the caps' "
+            f"measured input REAL_LARGEST[{x['input']!r}] = {x['real_largest']} B: re-measure it (the "
+            f"{RENDER_MARGIN} x margin is over a stale input; reported, not refused)" for x in stale]
 
 
 def dockerconfigjson(user: str, token: str) -> str:
@@ -829,12 +919,15 @@ def main(argv: list[str] | None = None) -> int:
                     "error": err})
     img_res = [{"image": i, "charts": c, "error": resolve_image(i, user, token)} for i, c in sorted(images.items())]
     # the step's bound: every call it made at its own WHOLE bound (_call; a resolve = 2 calls; a chart
-    # read = 2 calls and its blob; an image = 2 calls) and each render at its own
-    bound = len(pins) * (4 * HTTP_BOUND_S + BLOB_BOUND_S + RENDER_BOUND_S) + len(img_res) * 2 * HTTP_BOUND_S
-    how = (f"{len(pins)} charts x (4 x {HTTP_BOUND_S:g} + {BLOB_BOUND_S:g} + {RENDER_BOUND_S:g} s) + "
-           f"{len(img_res)} images x (2 x {HTTP_BOUND_S:g} s)")
+    # read = 2 calls, its blob and its files' parse; an image = 2 calls) and each render at its own
+    bound = (len(pins) * (4 * HTTP_BOUND_S + BLOB_BOUND_S + PARSE_BOUND_S + RENDER_BOUND_S)
+             + len(img_res) * 2 * HTTP_BOUND_S)
+    how = (f"{len(pins)} charts x (4 x {HTTP_BOUND_S:g} + {BLOB_BOUND_S:g} + {PARSE_BOUND_S:g} + "
+           f"{RENDER_BOUND_S:g} s) + {len(img_res)} images x (2 x {HTTP_BOUND_S:g} s)")
+    stale = stale_inputs(res)
     with open(a.out, "w") as fh:
         json.dump({"kind": "ghcr_pull_preflight", "bound_s": bound, "bound": how, "caps": CAPS,
+                   "stale_inputs": stale,
                    "private_image_components": sorted(private) if private is not None else None,
                    "charts": res, "images": img_res,
                    "images_elsewhere": [{"image": i, "charts": c} for i, c in sorted(other.items())]}, fh, indent=1)
@@ -851,6 +944,8 @@ def main(argv: list[str] | None = None) -> int:
     if other:
         print(f"[ghcr] {len(other)} image(s) on other registries (not this token's): " + ", ".join(sorted(other)),
               file=sys.stderr)
+    for line in stale_notes(stale):
+        print(line, file=sys.stderr)
     bad = [r["error"] for r in res + img_res if r["error"]]
     if bad:
         print("refusing: the ghcr pull token does not resolve every chart and image this install pulls: "

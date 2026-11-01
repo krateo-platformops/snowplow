@@ -181,7 +181,9 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
         ("imagePullSecrets", "ok", ["ghcr.io/krateo-platformops/alert-provider:0.2.53"])]
     assert pf["caps"]["chart_inflated_max"] == pf["caps"]["blob_max"] == 100 * 1024 * 1024
     assert pf["caps"]["chart_file_max"] == 5 * 1024 * 1024
-    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "render"} for c in pf["charts"])
+    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "parsed", "render"} for c in pf["charts"])
+    assert pf["caps"]["chart_parsed_max"] == 16 * ghcr_pull.REAL_LARGEST["parsed"]
+    assert pf["stale_inputs"] == []                    # the fakes are far inside every real measurement
     # the images: read from the pinned chart's own values (an empty tag = its appVersion), each
     # ghcr.io one resolved with the token; another registry's named, not this token's to resolve
     # #1023 A: RENDERED with the installer's componentValues: ui-token-hop (on only through them, named
@@ -198,8 +200,8 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
                                        "github-provider-kog": ("ok", False), "krateo-marketplace-catalog": ("ok", False)}
     assert pf["private_image_components"] == ["agentgateway-policies", "alert-provider", "core-provider-agent"]
     # F2: every call at its own WHOLE bound
-    assert pf["bound_s"] == 5 * (4 * 30 + 60 + 120) + 5 * 2 * 30
-    assert "5 charts x (4 x 30 + 60 + 120 s) + 5 images x (2 x 30 s)" == pf["bound"]
+    assert pf["bound_s"] == 5 * (4 * 30 + 60 + 120 + 120) + 5 * 2 * 30           # round 3 M1: + the parse
+    assert "5 charts x (4 x 30 + 60 + 120 + 120 s) + 5 images x (2 x 30 s)" == pf["bound"]
     assert f"[ghcr] the step's bound: {pf['bound_s']:g} s" in out
     assert pf["images_elsewhere"] == [
         {"image": "cr.agentgateway.dev/agentgateway:v0.7.0", "charts": ["agentgateway-policies"]},
@@ -532,7 +534,7 @@ def test_a_chart_of_many_members_is_walked_in_constant_memory():
     (about 420 B each); walked one at a time they add nearly nothing. A
     difference, not an absolute bound, so other threads' allocations do not
     count."""
-    (charts, vals, _, _), small = _walk_peak(_many_member_chart(10_000))
+    (charts, vals, _, _, _), small = _walk_peak(_many_member_chart(10_000))
     _, large = _walk_peak(_many_member_chart(100_000))
     assert charts["c"]["name"] == "c" and vals["c"] == {"a": 1}
     assert large - small < 90_000 * 420 // 4, (small, large)
@@ -548,13 +550,18 @@ def test_only_the_tail_of_helms_stderr_is_read(tmp_path):
     assert len(t) <= ghcr_pull.STDERR_TAIL and t.strip().splitlines()[-1] == "Error: the reason"
 
 
-def _pod(image, secrets=(), sa=None, kind="Deployment"):
+def _pod(image, secrets=(), sa=None, kind="Deployment", ns=None):
     spec = {"containers": [{"name": "c", "image": image}]}
     if secrets:
         spec["imagePullSecrets"] = [{"name": s} for s in secrets]
     if sa:
         spec["serviceAccountName"] = sa
-    return {"kind": kind, "spec": {"template": {"spec": spec}}}
+    return {"kind": kind, **({"metadata": {"namespace": ns}} if ns else {}), "spec": {"template": {"spec": spec}}}
+
+
+def _sa(name, ns=None):
+    return {"kind": "ServiceAccount", "metadata": {"name": name, **({"namespace": ns} if ns else {})},
+            "imagePullSecrets": [{"name": ghcr_pull.marker(0)}]}
 
 
 @pytest.mark.parametrize("case,docs,effective,want", [
@@ -573,6 +580,12 @@ def _pod(image, secrets=(), sa=None, kind="Deployment"):
                     "imagePullSecrets": [{"name": ghcr_pull.marker(0)}]}, _pod("ghcr.io/o/ctl:1.0.0")], {}, "ok"),
     # legitimately off: the hop disabled and nothing of it rendered
     ("off", [], {"hop": {"enabled": False}}, "off"),
+    # F (round 3): the marker's ServiceAccount is in ANOTHER namespace than the pod: not the pod's
+    ("F", [_sa("sa", ns="ns-b"), _pod("ghcr.io/o/ctl:1.0.0", sa="sa", ns="ns-a")], {}, "missing"),
+    # its control: the same namespace, named on both
+    ("F-same", [_sa("sa", ns="ns-a"), _pod("ghcr.io/o/ctl:1.0.0", sa="sa", ns="ns-a")], {}, "ok"),
+    # a manifest with no namespace is in the release's (helm template --namespace): the same as one naming it
+    ("F-release", [_sa("sa"), _pod("ghcr.io/o/ctl:1.0.0", sa="sa", ns=ghcr_pull.SECRET_NS)], {}, "ok"),
 ])
 def test_off_means_nothing_runs_behind_it(case, docs, effective, want):
     """#1041 review N2 (A, B, D): a path is off only when its sub-component is
@@ -755,3 +768,137 @@ def test_check_never_names_the_token(tmp_path):
     assert ghcr_pull.creds(str(f)) == (FAKE_GHCR_USER, FAKE_GHCR_TOKEN)
     f.chmod(0o640)
     assert FAKE_GHCR_TOKEN not in ghcr_pull.check(str(f))
+
+
+# ── #1041 review round 3 ──────────────────────────────────────────────────
+
+def _yaml_heavy_chart(sub_bytes, nsub=2):
+    """The review's M1 probe shape: a small chart whose subcharts each carry
+    a values.yaml of ordinary structured YAML (`kN: {a: 1, b: [x, y]}`)."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        def add(name, body):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(body)
+            tf.addfile(ti, io.BytesIO(body))
+        add("c/Chart.yaml", b"apiVersion: v2\nname: c\nversion: 1.0.0\n")
+        add("c/values.yaml", b"a: 1\n")
+        line = "k{}: {{a: 1, b: [x, y]}}\n"
+        for j in range(nsub):
+            body, k = [], 0
+            size = 0
+            while size + len(line.format(k)) <= sub_bytes:
+                body.append(line.format(k))
+                size += len(body[-1])
+                k += 1
+            add(f"c/charts/s{j}/Chart.yaml", f"apiVersion: v2\nname: s{j}\nversion: 1.0.0\n".encode())
+            add(f"c/charts/s{j}/values.yaml", "".join(body).encode())
+    return buf.getvalue()
+
+
+def test_the_reviews_yaml_heavy_chart_is_refused_before_any_parse(monkeypatch):
+    """Round 3, M1: two 5 MiB values.yaml (within helm's own limits) took
+    941 s and +496 MiB to parse. All of a chart's Chart.yaml + values.yaml
+    together are capped at 16 x the largest real total, counted before any
+    is parsed: refused at once, the parse never run."""
+    import time
+    data = _yaml_heavy_chart(5 * 1024 * 1024 - 64)
+    parsed = []
+    real = ghcr_pull._yaml_loader
+    monkeypatch.setattr(ghcr_pull, "_yaml_loader", lambda: parsed.append(1) or real())
+    t0 = time.monotonic()
+    with pytest.raises(ghcr_pull._Refused, match=r"more than its 2260688 byte parse cap \(16 x the largest real total\)"):
+        ghcr_pull.read_chart_files(data)
+    assert time.monotonic() - t0 < 5 and not parsed
+    assert ghcr_pull.CHART_PARSED_MAX == 16 * 141_293
+    # just under the cap, the same shape is read whole
+    under = ghcr_pull.read_chart_files(_yaml_heavy_chart((ghcr_pull.CHART_PARSED_MAX - 400) // 2))
+    assert under[4] <= ghcr_pull.CHART_PARSED_MAX and len(under[1]["c/charts/s0"]) == 43_894
+
+
+def test_a_chart_over_its_parse_cap_is_refused_through_chart_images(monkeypatch):
+    monkeypatch.setattr(ghcr_pull, "CHART_PARSED_MAX", 10)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["error"] and "byte parse cap" in r["error"], r
+
+
+def test_the_chart_files_are_read_within_their_own_bound(monkeypatch):
+    """Round 3, M1: the tar walk and the parse run WHOLE under PARSE_BOUND_S
+    (_call), and that bound is counted in the step's."""
+    import time
+    real = ghcr_pull.read_chart_files
+
+    def slow(data):
+        time.sleep(3)
+        return real(data)
+    monkeypatch.setattr(ghcr_pull, "read_chart_files", slow)
+    monkeypatch.setattr(ghcr_pull, "PARSE_BOUND_S", 0.5)
+    t0 = time.monotonic()
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["error"] and "its chart files were not read within their 0.5 s bound" in r["error"], r
+    assert time.monotonic() - t0 < 2.5
+
+
+def test_the_render_reads_only_the_tail_of_helms_stderr(tmp_path):
+    """Round 3, R28: render() itself (not only _tail) reads helm's reason
+    from the end of its stderr: a 32 MiB stderr costs nearly nothing."""
+    import tracemalloc
+    helm = tmp_path / "helm"
+    helm.write_text("#!/bin/sh\ncat > /dev/null\nhead -c 33554432 /dev/zero | tr '\\0' x >&2\n"
+                    "printf '\\nError: the real reason\\n' >&2\nexit 1\n")
+    helm.chmod(0o755)
+    tracemalloc.start()
+    with pytest.raises(ghcr_pull._Refused, match="^helm template failed: Error: the real reason$"):
+        ghcr_pull.render(b"chart", "rel", {}, str(helm))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024 // 8, peak
+
+
+def test_a_helm_that_exits_before_reading_its_values_is_a_render_failure(tmp_path):
+    """Round 3 (info): a helm that never reads -f - breaks the values pipe;
+    that is helm failing (its own reason), never an unreadable chart."""
+    helm = tmp_path / "helm"
+    helm.write_text("#!/bin/sh\necho 'Error: no such chart' >&2\nexit 1\n")
+    helm.chmod(0o755)
+    big = {"k": "v" * (1 << 20)}                         # past any pipe buffer: the write must break
+    with pytest.raises(ghcr_pull._Refused, match="^helm template failed: Error: no such chart$"):
+        ghcr_pull.render(b"chart", "rel", big, str(helm))
+    ok = tmp_path / "helm0"                              # exits 0 without reading: no render from it
+    ok.write_text("#!/bin/sh\nexit 0\n")
+    ok.chmod(0o755)
+    with pytest.raises(ghcr_pull._Refused, match="exited without reading its values"):
+        ghcr_pull.render(b"chart", "rel", big, str(ok))
+
+
+def test_the_caps_input_is_the_largest_real_measurement():
+    """Round 3, R31: REAL_LARGEST is not a hand-copied number on its own: it
+    is the largest of each measurement in the committed record of the real
+    charts (tests/fixtures/ghcr_measured_0_3_468.json, the preflight's own
+    `measured` over installer 0.3.468)."""
+    rec = json.load(open(os.path.join(os.path.dirname(__file__), "fixtures", "ghcr_measured_0_3_468.json")))
+    largest = {}
+    for c in rec["charts"]:
+        for k, v in c["measured"].items():
+            key = ghcr_pull.MEASURED_INPUT[k]
+            largest[key] = max(largest.get(key, 0), v)
+    assert largest == ghcr_pull.REAL_LARGEST
+
+
+def test_a_measurement_over_its_input_is_reported_not_refused():
+    """Round 3, R31: a run whose chart measures over REAL_LARGEST says so (the
+    16 x margin is over a stale input), in the record and as a report line."""
+    big = ghcr_pull.REAL_LARGEST["render"] + 1
+    charts = [{"chart": "oci://ghcr.io/o/c", "version": "1.0.0",
+               "measured": {"blob": 1, "largest_file": 1, "inflated": 1, "parsed": 1, "render": big}},
+              {"chart": "oci://ghcr.io/o/d", "version": "2.0.0", "measured": None}]
+    st = ghcr_pull.stale_inputs(charts)
+    assert st == [{"chart": "oci://ghcr.io/o/c", "version": "1.0.0", "measured": "render", "value": big,
+                   "input": "render", "real_largest": ghcr_pull.REAL_LARGEST["render"]}]
+    (line,) = ghcr_pull.stale_notes(st)
+    assert line.startswith("[ghcr] NOTE: oci://ghcr.io/o/c 1.0.0 measured render") and "reported, not refused" in line
+    at = [dict(charts[0], measured={k: ghcr_pull.REAL_LARGEST[ghcr_pull.MEASURED_INPUT[k]]
+                                    for k in ghcr_pull.MEASURED_INPUT})]
+    assert ghcr_pull.stale_inputs(at) == []                # AT the input is not over it
