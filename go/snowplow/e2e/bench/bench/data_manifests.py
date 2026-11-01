@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from bench import authn_user, rbac_model
 
-__all__ = ["COMPDEF_NAME", "COMP_GVR", "COMP_RES", "COMP_VERSION", "AUTHN_NS", "composition_yaml",
+__all__ = ["COMPDEF_NAME", "COMP_GVR", "COMP_RES", "COMP_VERSION", "AUTHN_NS", "COMPOSITION_APPLY_BATCH",
+           "COMPOSITION_APPLY_WORKERS", "APPLY_RETRY_BACKOFFS_S", "composition_yaml",
            "compositiondefinition_yaml", "scaleuser_name", "synthetic_user_docs", "documents"]
 
 COMPDEF_NAME = "github-scaffolding-with-composition-page"
@@ -20,6 +21,15 @@ COMP_GVR = "composition.krateo.io"
 COMP_RES = "githubscaffoldingwithcompositionpages"
 COMP_VERSION = "v1-2-2"
 AUTHN_NS = "krateo-system"          # where authn's Users live
+# How the data step installs its compositions (lifecycle.deploy_compositions_parallel),
+# here so the full-widen stage (#1004, bench/full_widen.py) installs its objects the
+# same way without importing lifecycle (a kubectl context check at import):
+# at most COMPOSITION_APPLY_BATCH objects of one namespace per server-side apply,
+# COMPOSITION_APPLY_WORKERS applies at a time, each batch re-applied after
+# APPLY_RETRY_BACKOFFS_S (SSA is idempotent).
+COMPOSITION_APPLY_BATCH = 200
+COMPOSITION_APPLY_WORKERS = 32
+APPLY_RETRY_BACKOFFS_S = (5, 10, 20)
 
 
 def composition_yaml(ns, name):

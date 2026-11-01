@@ -479,7 +479,7 @@ FINALIZER_RESOURCES = [
 # here: the same YAML is re-applied (SSA is idempotent, so objects that
 # landed on a failed attempt are fine), and only a batch that fails EVERY
 # attempt is reported as failed. 4 attempts: sleeps 5s, 10s, 20s between.
-APPLY_RETRY_BACKOFFS_S = (5, 10, 20)
+APPLY_RETRY_BACKOFFS_S = data_manifests.APPLY_RETRY_BACKOFFS_S
 
 
 def apply_with_retry(yaml_text, what, timeout_secs=60,
@@ -1052,7 +1052,8 @@ def restaction_count_snapshot():
 
 # ─── Composition deploy ──────────────────────────────────────────────────────
 
-def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, workers=32,
+def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns,
+                                workers=data_manifests.COMPOSITION_APPLY_WORKERS,
                                 backoffs=APPLY_RETRY_BACKOFFS_S):
     """Deploy compositions in parallel using a thread pool.
 
@@ -1067,7 +1068,7 @@ def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, workers=32,
     failed = []
     deployed_count = [0]
 
-    max_per_apply = 200
+    max_per_apply = data_manifests.COMPOSITION_APPLY_BATCH
 
     def deploy_ns_batch(ns_i):
         ns = f"bench-ns-{ns_i:02d}"

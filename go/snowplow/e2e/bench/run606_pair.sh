@@ -9,6 +9,9 @@
 # Per run (required):  RUN_NAME_A / _B, SNOWPLOW_TAG_A / _B,
 #                      EXPECTED_IMAGE_DIGEST_A / _B, BENCH_606_GO_A / _B
 #                      (Diego's go PER RUN, as run606.sh: <YYYYMMDD>-<RUN_NAME>)
+# #1004's full-widen stage (after each run's evaluate step): BENCH_1004_GO_A
+# and _B, Diego's go for it PER RUN in the same form; both or neither (half a
+# stage cannot be compared), and its one switch.
 # Everything else in the environment is shared by both runs, so the two
 # schedules are the same by construction (and custlat pair checks it from the
 # data). The per-run names themselves (RUN_NAME, SNOWPLOW_TAG, ...) and K6_SPAN
@@ -50,7 +53,7 @@ refuse() { echo "refusing: $*" >&2; exit 2; }
 for v in RUN_NAME_A RUN_NAME_B SNOWPLOW_TAG_A SNOWPLOW_TAG_B EXPECTED_IMAGE_DIGEST_A EXPECTED_IMAGE_DIGEST_B; do
   [[ -n "${!v:-}" ]] || refuse "$v is required (one per run of the pair)"
 done
-for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO OUT; do
+for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT; do
   [[ -z "${!v:-}" ]] || refuse "$v is per run (set ${v}_A / ${v}_B): unset it"
 done
 [[ -z "${DRIVE_S:-}" ]] || refuse "DRIVE_S is derived by K6_SPAN=churn: unset it"
@@ -58,10 +61,18 @@ done
 [[ "${LOAD_DRIVER:-k6}" == "k6" ]] || refuse "a pair compares k6's customers: LOAD_DRIVER=k6"
 [[ "$RUN_NAME_A" != "$RUN_NAME_B" ]] || refuse "RUN_NAME_A and RUN_NAME_B are the same: two clusters need two names"
 [[ "$EXPECTED_IMAGE_DIGEST_A" != "$EXPECTED_IMAGE_DIGEST_B" ]] || refuse "the two digests are the same image: nothing to compare"
+# #1004: the full-widen stage runs on both arms or on neither
+if [[ -n "${BENCH_1004_GO_A:-}" && -z "${BENCH_1004_GO_B:-}" ]] || [[ -z "${BENCH_1004_GO_A:-}" && -n "${BENCH_1004_GO_B:-}" ]]; then
+  refuse "BENCH_1004_GO_A and BENCH_1004_GO_B: set both (the full-widen stage on both arms) or neither"
+fi
 if [[ "$DRY" != "1" ]]; then
   today="$(date -u +%Y%m%d)"
   [[ "${BENCH_606_GO_A:-}" == "${today}-${RUN_NAME_A}" ]] || refuse "BENCH_606_GO_A must be '${today}-${RUN_NAME_A}' (Diego's go for run A)"
   [[ "${BENCH_606_GO_B:-}" == "${today}-${RUN_NAME_B}" ]] || refuse "BENCH_606_GO_B must be '${today}-${RUN_NAME_B}' (Diego's go for run B)"
+  if [[ -n "${BENCH_1004_GO_A:-}" ]]; then
+    [[ "$BENCH_1004_GO_A" == "${today}-${RUN_NAME_A}" ]] || refuse "BENCH_1004_GO_A must be '${today}-${RUN_NAME_A}' (Diego's go for the full-widen stage on run A)"
+    [[ "$BENCH_1004_GO_B" == "${today}-${RUN_NAME_B}" ]] || refuse "BENCH_1004_GO_B must be '${today}-${RUN_NAME_B}' (Diego's go for the full-widen stage on run B)"
+  fi
 fi
 # one commit, nothing uncommitted under the bench: both runs execute it
 BENCH_SHA="$(git -C "$HERE" rev-parse HEAD)" || refuse "the bench is not a git checkout"
@@ -87,9 +98,9 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$PAIR_OUT/pair.
 # runenv <A|B>: RUNENV = that run's per-run variables, for `env`
 runenv() {
   local name="RUN_NAME_$1" tag="SNOWPLOW_TAG_$1" dig="EXPECTED_IMAGE_DIGEST_$1" go="BENCH_606_GO_$1"
-  local out="OUT_$1"
+  local out="OUT_$1" fw="BENCH_1004_GO_$1"
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
-          BENCH_606_GO="${!go:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}")
+          BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}")
 }
 
 log "pair: A=${RUN_NAME_A} (${SNOWPLOW_TAG_A}) B=${RUN_NAME_B} (${SNOWPLOW_TAG_B}), bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"

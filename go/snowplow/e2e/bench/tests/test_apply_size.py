@@ -114,12 +114,19 @@ def test_run606_applies_everything_through_one_server_side_apply():
     # #924 M3: the bench's own FlowSchemas (env); #1042's pre-drive PSI Job; the preflight Job; #935's
     # fresh identity classes (data; its output names users: discarded); run 19's
     # menu-class identities (classes; the same); the load. Each class's preflight
-    # Job goes through kapply inside run_preflight_job.
+    # Job goes through kapply inside run_preflight_job. #1004's full-widen stage
+    # (after evaluate): each batch of its objects (fw_one, output discarded: 50K
+    # lines), its CRD, its read + identity, its Job, and the widened CRD.
     assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
                      'kapply "$OUT/preflight-job.yaml"',
                      'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
                      'kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \\',
-                     'kapply "$OUT/loadgen-job.yaml"']
+                     'kapply "$OUT/loadgen-job.yaml"',
+                     'kapply "$f" >/dev/null 2>"$f.err" && { rm -f "$f.err"; return 0; }',
+                     'kapply "$FW_DIR/crd.yaml" || { fw_fail "creating the CRD ${FW_CRD}"; return 1; }',
+                     'kapply "$FW_DIR/probe.yaml" >/dev/null 2>"$KERR" || { fw_fail "the stage\'s read and identity"; return 1; }',
+                     'kapply "$FW_DIR/job.yaml" || { fw_fail "the fullwiden606 Job"; return 1; }',
+                     'kapply "$FW_DIR/crd-widened.yaml" || { fw_fail "widening the CRD"; return 1; }']
     assert '[[ "$job" == preflight606 ]] || kapply "${out%.jsonl}-job.yaml"' in src
     assert "--server-side" in _kapply()
 

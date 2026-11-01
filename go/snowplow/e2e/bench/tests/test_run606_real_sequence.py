@@ -186,6 +186,48 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+    # #1004: the full-widen stage's objects, its Job's /out and the CRD's deletion.
+    # FAKE_FW_JOB: ok (default: arms once applied, exits once the widened CRD is
+    # applied) | ends_unarmed (exits without arming) | never (never arms);
+    # FAKE_FW_SHORT=k: k objects fewer than applied exist; FAKE_FW_WAIT_HANG=s:
+    # the CRD's Established wait hangs; FAKE_FW_STREAM: the stream /out holds.
+    fw_crd = "fullwidens.fullwiden.bench.krateo.io"
+    def fw_note(what):
+        with open(os.path.join(STATE, "fw-events"), "a") as fh:
+            fh.write(json.dumps([time.time(), what]) + "\\n")
+    if a[:1] == ["apply"] and "-f" in a and "/full-widen/" in a[a.index("-f") + 1]:
+        fw_note("apply " + os.path.basename(a[a.index("-f") + 1]))
+    if a[:1] == ["wait"] and f"crd/{fw_crd}" in a:
+        time.sleep(float(os.environ.get("FAKE_FW_WAIT_HANG", "0")))
+        sys.exit(0)
+    if a[:2] == ["get", fw_crd]:
+        kinds = open(os.path.join(STATE, "applied-kinds.jsonl")).read().splitlines()
+        n = sum(1 for k in kinds if json.loads(k) == ["fullwiden.bench.krateo.io/v1alpha1", "FullWiden"])
+        print("\\n".join(f"bench-ns-01 o{i} 1s" for i in range(max(0, n - int(os.environ.get("FAKE_FW_SHORT", "0"))))))
+        sys.exit(0)
+    if a[:3] == ["get", "deploy", "snowplow"]:
+        env = json.loads(os.environ.get("FAKE_FW_DEPLOY_ENV", "[]"))
+        print(json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "snowplow", "env": env}]}}}}))
+        sys.exit(0)
+    fw_events = (open(os.path.join(STATE, "fw-events")).read() if os.path.exists(os.path.join(STATE, "fw-events"))
+                 else "")
+    if a[:2] == ["get", "pods"] and "job-name=fullwiden606" in a:
+        print("fullwiden606-0" if "apply job.yaml" in fw_events else ""); sys.exit(0)
+    if a[:1] == ["exec"] and "fullwiden606-0" in a:
+        mode = os.environ.get("FAKE_FW_JOB", "ok")
+        armed = mode == "ok" and "apply job.yaml" in fw_events
+        exited = (mode == "ok" and "apply crd-widened.yaml" in fw_events) or mode == "ends_unarmed"
+        fw_note("exec " + a[-1] + " " + ("yes" if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else "no"))
+        sys.exit(0 if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else 1)
+    if a[:1] == ["cp"] and any(x.startswith("fullwiden606-0:") for x in a):
+        os.makedirs(a[-1], exist_ok=True)
+        src = os.environ.get("FAKE_FW_STREAM")
+        open(os.path.join(a[-1], "widen.jsonl"), "w").write(open(src).read() if src else "")
+        fw_note("cp"); sys.exit(0)
+    if a[:2] == ["delete", "crd"] and fw_crd in a:
+        fw_note("delete crd"); sys.exit(0)
+    if a[:1] == ["delete"] and any(x.startswith("bench.krateo.io/full-widen") for x in a):
+        fw_note("delete " + " ".join(x for x in a if "," in x or x.endswith(".io"))); sys.exit(0)
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
     # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
     # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the

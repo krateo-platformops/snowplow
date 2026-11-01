@@ -18,7 +18,8 @@ requires. The dry pass could not see it. Now it can:
    would need the installer's values to render.
 2. DOCUMENTS: what the run applies of a kind that is not built in, rendered by
    the renderers the run applies them from (data_manifests.documents,
-   fresh_classes.manifest).
+   fresh_classes.manifest, and with --full-widen #1004's stage,
+   full_widen.documents, its objects checked against the stage's own CRD).
 3. VALIDATION against the served version's openAPIV3Schema, as the API
    server does for a CREATE with kubectl's default `--validate=strict`:
    nulls in non-nullable fields pruned, defaults applied, then `type`,
@@ -456,6 +457,10 @@ def run_documents(a) -> list[tuple[str, dict]]:
                                duration_s=a.duration_s, namespaces=a.namespaces, user_prefix=a.user_prefix)
         text = fresh_classes.manifest(p, SCALEUSER_PASSWORD)
         docs += [("the fresh identity classes", json.loads(x)) for x in text.split("\n---\n") if x.strip()]
+    if getattr(a, "full_widen", False):
+        # #1004: the stage's objects (validated against its own CRD, crd_source), its read, its User
+        from bench import full_widen
+        docs += full_widen.documents(a.namespaces, a.user_prefix)
     return docs
 
 
@@ -481,6 +486,7 @@ def main(argv=None) -> int:
     c.add_argument("--browser-think-s", type=float, default=0)
     c.add_argument("--duration-s", type=float, default=0)
     c.add_argument("--user-prefix", default="scaleuser-")
+    c.add_argument("--full-widen", action="store_true", help="the #1004 stage runs (BENCH_1004_GO)")
     a = ap.parse_args(argv)
     docs = run_documents(a)
     srcs = crd_sources(_installer_dir(a.installer_pulled))
@@ -488,6 +494,9 @@ def main(argv=None) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         srcs = list(ex.map(lambda s: pull(s, a.workdir) if s["from"] == "pin" else s, srcs))
     srcs = [read_crds(s) for s in srcs]
+    if a.full_widen:
+        from bench import full_widen
+        srcs.append(full_widen.crd_source())      # the stage's own CRD governs its objects
     res = check(docs, srcs)
     with open(a.out, "w") as fh:
         json.dump(res, fh, indent=2)
