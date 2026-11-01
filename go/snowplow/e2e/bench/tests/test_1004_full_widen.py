@@ -24,8 +24,9 @@ Rules, each with an arm (and a logic-only mutation shown RED, see the PR):
       its cleanup deletes the CRD; the bodies, the password file and the
       password in its manifests never outlive the run (signal, failure).
   R8  the pair: BENCH_1004_GO_A and _B, both or neither, each a go for its run.
-  R9  attribution (Q2): every schema relist between armed and the end is the
-      stage CRD's (snowplow's log), else the result is refused.
+  R9  attribution (Q2, #1050 F7): from the cluster, never snowplow's log (it
+      runs at LOG_LEVEL warn): the stage's CRD is the only one whose
+      generation moved in the window, and it moved once; else refused.
   R10 the record's baseline is the armed sample: register-phase counters and
       heap never reach the rows or the memory report; detection is the first
       sample whose relists moved.
@@ -44,7 +45,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bench import data_manifests, full_widen as fw, logscrub
+from bench import data_manifests, full_widen as fw
 from bench.load606 import SCALEUSER_PASSWORD
 from tests.test_run606_real_sequence import BENCH_DIR, RUN_NAME, fake_registry, harness  # noqa: F401
 from tests.test_run15_customer_latency import NA, NB, _launch, _calls, _verdicts, pairbed, va  # noqa: F401
@@ -228,18 +229,22 @@ class FakeSnowplow:
         return 200, b"{}"
 
     def raw_log(self, kubelet=False) -> list[str]:
-        """snowplow's schema_relist lines, as it writes them (kubelet: with
-        `kubectl logs --timestamps`' prefix)."""
+        """snowplow's log over the stage, as the chart runs it (LOG_LEVEL warn,
+        #1050 F7): WARN lines only, no schema_relist (an INFO line) (kubelet:
+        with `kubectl logs --timestamps`' prefix)."""
         out = []
-        for t, crd in self.events:
-            ln = json.dumps({"time": _iso(t), "level": "INFO", "msg": fw.SCHEMA_RELIST_MSG, "subsystem": "cache",
-                             "crd": crd, "gvrs_relisted": 1})
+        for t, _ in self.events:
+            ln = json.dumps({"time": _iso(t), "level": "WARN", "msg": "cache.refresher.decline", "subsystem": "cache"})
             out.append((_iso(t) + " " + ln) if kubelet else ln)
         return out
 
-    def scrubbed_log(self) -> list[str]:
-        s = logscrub.Scrubber()
-        return [s.line(x) for x in self.raw_log()]
+    def crds(self, end: bool) -> dict:
+        """Every CRD's uid and generation at the window's start / end: the widen
+        bumps the stage's; `other_crd_relist_at` bumps another's."""
+        other = 1 + (1 if end and self.other_crd_relist_at is not None else 0)
+        return {"otherkinds.example.io": {"uid": "u-o", "generation": other},
+                "users.basic.authn.krateo.io": {"uid": "u-u", "generation": 4},
+                fw.CRD_NAME: {"uid": "u-fw", "generation": 1 + (1 if end else 0)}}
 
 
 def B(swap=60.0, relist=121.0, register=60.0):
@@ -431,7 +436,8 @@ def test_detection_is_the_first_sample_whose_relists_moved():
     det = first(recs, "detected")["t"]
     settle = [r for r in recs if r["kind"] == "sample" and r["phase"] == "settle"]
     assert det == settle[2]["t"]
-    rec = fw.evaluate(recs, plan_=PLAN, pods_before=PODS, pods_after=PODS, log_lines=sp.scrubbed_log())
+    rec = fw.evaluate(recs, plan_=PLAN, pods_before=PODS, pods_after=PODS, crds_before=sp.crds(False),
+                      crds_after=sp.crds(True))
     assert rec["timeline_s"]["widened_to_detected"] >= 2.0
 
 
@@ -444,7 +450,8 @@ PODS = {"snowplow-abc": 0}
 
 def _eval(sp, recs, **kw):
     return fw.evaluate(recs, plan_=PLAN, pods_before=kw.get("before", PODS), pods_after=kw.get("after", PODS),
-                       log_lines=kw["log"] if "log" in kw else sp.scrubbed_log())
+                       crds_before=kw["crds_before"] if "crds_before" in kw else sp.crds(False),
+                       crds_after=kw["crds_after"] if "crds_after" in kw else sp.crds(True))
 
 
 @pytest.mark.parametrize("mech", ["build_and_swap", "relist"])
@@ -458,7 +465,7 @@ def test_a_build_that_ended_passes_with_its_rows_and_the_heap_peak(mech):
     m = rec["memory"]
     assert m["heap_inuse_mb_armed"] == 2000.0 and m["heap_inuse_mb_peak"] == 2800.0
     assert m["heap_inuse_mb_peak_over_armed"] == 800.0 and m["gc_cycles"] == 4
-    assert rec["attribution"]["ours"] == 1 and rec["attribution"]["other_crds"] == {}
+    assert rec["attribution"]["stage_crd_generation_delta"] == 1 and rec["attribution"]["other_crds_changed"] == {}
     if mech == "relist":
         assert rec["relist_bridge_timeout_total"] == 0
     else:
@@ -516,31 +523,56 @@ def test_a_failing_row_fails_the_stage():
 
 
 @pytest.mark.parametrize("mech", ["build_and_swap", "relist"])
-def test_another_crds_relist_in_the_window_refuses_the_result(mech):
+def test_another_crds_schema_change_in_the_window_refuses_the_result(mech):
     sp = FakeSnowplow(mech, other_crd_relist_at=2, build_samples=4)
     rc, recs, _ = watch(sp)
     rec = _eval(sp, recs)
     assert not rec["passed"]
-    assert any(r.startswith("another CRD's schema relist landed between armed and the end") for r in rec["fail_reasons"])
-    assert rec["attribution"]["other_crds"] == {logscrub._h("otherkinds.example.io"): 1}
+    assert any(r.startswith("another CRD's spec changed in the window") for r in rec["fail_reasons"])
+    assert rec["attribution"]["other_crds_changed"] == {"otherkinds.example.io": 1}
 
 
-def test_an_unread_log_or_a_relist_the_log_does_not_name_refuses_the_result():
+def test_crds_unread_at_either_end_refuse_the_result():
     sp = FakeSnowplow("relist")
     rc, recs, _ = watch(sp)
-    rec = _eval(sp, recs, log=None)
-    assert not rec["passed"] and any("snowplow's log was not read" in r for r in rec["fail_reasons"])
-    rec = _eval(sp, recs, log=[])
-    assert not rec["passed"] and any("names the stage's CRD 0 time(s)" in r for r in rec["fail_reasons"])
+    for kw in ({"crds_before": None}, {"crds_after": None}):
+        rec = _eval(sp, recs, **kw)
+        assert not rec["passed"] and any("the CRDs were not read at both ends" in r for r in rec["fail_reasons"])
 
 
-def test_a_relist_outside_the_window_is_not_attributed():
-    sp = FakeSnowplow("relist")
+@pytest.mark.parametrize("gen_after,ok", [(1, False), (2, True), (3, False)])
+def test_the_stage_crd_changes_exactly_once_the_widen(gen_after, ok):
+    sp = FakeSnowplow("build_and_swap")
     rc, recs, _ = watch(sp)
-    late = logscrub.Scrubber().line(json.dumps({"time": _iso(end_of(recs)["t"] + 60), "msg": fw.SCHEMA_RELIST_MSG,
-                                                "crd": "otherkinds.example.io"}))
-    rec = _eval(sp, recs, log=sp.scrubbed_log() + [late])
+    after = sp.crds(True) | {fw.CRD_NAME: {"uid": "u-fw", "generation": gen_after}}
+    rec = _eval(sp, recs, crds_after=after)
+    assert rec["passed"] is ok, rec["fail_reasons"]
+
+
+def test_a_crd_created_deleted_or_recreated_in_the_window_is_reported_not_refused():
+    """A CRD's first observation and its deletion relist nothing: reported. A
+    recreated CRD (a new uid, its generation back to 1) is not a spec change."""
+    sp = FakeSnowplow("build_and_swap")
+    rc, recs, _ = watch(sp)
+    before = sp.crds(False) | {"gone.example.io": {"uid": "u-g", "generation": 2},
+                               "again.example.io": {"uid": "u-a1", "generation": 7}}
+    after = sp.crds(True) | {"new.example.io": {"uid": "u-n", "generation": 1},
+                             "again.example.io": {"uid": "u-a2", "generation": 1}}
+    rec = _eval(sp, recs, crds_before=before, crds_after=after)
     assert rec["passed"], rec["fail_reasons"]
+    att = rec["attribution"]
+    assert att["created"] == ["again.example.io", "new.example.io"] and att["deleted"] == ["again.example.io",
+                                                                                         "gone.example.io"]
+    assert att["other_crds_changed"] == {}
+
+
+def test_a_warn_level_log_does_not_decide_attribution():
+    """(the #1050 re-check's b5, unit) snowplow runs at LOG_LEVEL warn: no
+    schema_relist line exists; the stage still PASSes, attributed from the CRDs."""
+    sp = FakeSnowplow("relist")
+    rc, recs, _ = watch(sp)
+    assert all('"level": "WARN"' in ln for ln in sp.raw_log())
+    assert _eval(sp, recs)["passed"]
 
 
 # ─── R5: the bounds ──────────────────────────────────────────────────────────
@@ -707,10 +739,10 @@ def test_every_bounded_wait_of_the_stage_is_a_budget_term(tmp_path):
     deletes = len(fw.cleanup_targets("x"))
     widen_wait = 300 + 300 + 60                      # the operator's armed poll, its widened apply, one exec
     job = 300 + 2700 + widen_wait + 2700             # start + register + widen wait + settle
-    want = 3 * 300 + 300 + 2400 + job + 7 * 300 + deletes * 300 + 2400
-    assert b_on - b_off == want == 16260
+    want = 3 * 300 + 300 + 2400 + job + 9 * 300 + deletes * 300 + 2400
+    assert b_on - b_off == want == 16860
     assert (f"full widen {want} (applies 3x300 + ready 300 + objects 2400 + job {job} (preflight 300 + register "
-            f"2700 + widen wait {widen_wait} + settle 2700) + reads 7x300 + deletes {deletes}x300 + CRD delete 2400)"
+            f"2700 + widen wait {widen_wait} + settle 2700) + reads 9x300 + deletes {deletes}x300 + CRD delete 2400)"
             ) in line_on
     assert "full widen" not in line_off
 
@@ -723,7 +755,7 @@ def test_the_stage_reads_and_deletes_are_counted_where_they_run():
     body = src[src.index("s_full_widen() {"):src.index('log "run budget: ${budget_line}')]
     reads = body.count("fw_read ") + body.count(" cp \"${FW_POD}") + body.count(" logs deploy/snowplow") \
         + body.count('get "$FW_CRD" -A')
-    assert reads == 7 and "FW_READS=7" in src
+    assert reads == 9 and "FW_READS=9" in src
     singles = [ln for ln in body.splitlines() if ln.strip().startswith('bounded "$COLLECT_TIMEOUT_S" kapply')]
     assert len(singles) == 4 and "FW_APPLIES=3" in src          # the widened one is inside the job's widen wait
     assert 'FW_DELETES="$(python3 -m bench.full_widen cleanup-count)"' in src
@@ -794,7 +826,8 @@ def test_the_stage_runs_after_run_complete_widens_only_once_served_and_cleans_up
     assert len(fw_applies) == 6 and all("--request-timeout=300s" in a for a in fw_applies), fw_applies
     rec = json.loads((tmp / "out" / "full-widen.json").read_text())
     assert rec["passed"] and rec["plan"]["n"] == 4 and rec["outcome"] == "ended", rec.get("fail_reasons")
-    assert rec["attribution"]["ours"] == 1                     # read from the stage's scrubbed log
+    att = rec["attribution"]                                   # from the cluster's CRDs (F7)
+    assert att["stage_crd_generation_delta"] == 1 and att["other_crds_changed"] == {}
     assert "full widen: PASS" in log and "full widen: CRD fullwidens.fullwiden.bench.krateo.io and its objects deleted" in log
     assert "envFrom ConfigMap snowplow" in log                 # the bound's source: the chart's way
     assert not list((tmp / "out" / "full-widen").glob("objects-*.yaml"))
@@ -815,6 +848,26 @@ def test_the_live_configmap_value_sets_the_relist_bound_and_its_refusal(harness)
     assert "a bound exceeds the run budget's 200s term" in log and '"s": 301.0' in log
     assert "DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS=300 (envFrom ConfigMap snowplow)" in log
     assert not [x for x in ev if x.startswith("apply ")]
+
+
+def test_a_warn_level_snowplow_log_still_passes(harness):  # noqa: F811
+    """(the #1050 re-check's b5) the real sequence, a build that ended, and the
+    log a LOG_LEVEL=warn snowplow writes: no INFO line. The stage PASSes: its
+    attribution is the CRDs' generations."""
+    p, ev, state, tmp = _real(harness)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    log_lines = (tmp / "out" / "full-widen" / "snowplow.log").read_text().splitlines()
+    assert log_lines and not any('"INFO"' in ln for ln in log_lines)
+    rec = json.loads((tmp / "out" / "full-widen.json").read_text())
+    assert rec["passed"], rec["fail_reasons"]
+
+
+def test_another_crds_change_in_the_window_fails_the_real_stage(harness):  # noqa: F811
+    p, ev, state, tmp = _real(harness, FAKE_FW_OTHER_CRD_BUMP="1")
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    rec = json.loads((tmp / "out" / "full-widen.json").read_text())
+    assert not rec["passed"] and rec["attribution"]["other_crds_changed"] == {"installers.composition.krateo.io": 1}
+    assert "full widen FAILED: another CRD's spec changed in the window" in (tmp / "out" / "run.log").read_text()
 
 
 def test_missing_objects_fail_the_stage_before_any_widen_and_leave_no_password(harness):  # noqa: F811

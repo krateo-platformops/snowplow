@@ -88,13 +88,18 @@ store_swap.go): ROLLOUT_TIMEOUT_S, the bench's bound for snowplow listing and
 syncing everything it serves at boot; the stage's copy is one GVR of the
 run's composition count.
 
-ATTRIBUTION (Q2). snowplow_crd_discovery's counters are process-wide: the rows
-are the stage's only when every schema relist between armed and the end was
-the stage's CRD's. Both tags log cache.crd_discovery.schema_relist with the
-CRD's name; the stage's scrubbed snowplow log (logscrub hashes the name) is
-read for it, and the result is refused (FAIL, never PASS) when another CRD's
-relist landed in the window, when the log names fewer of the stage's own than
-Δschema_relists_fired, or when the log was not read.
+ATTRIBUTION (Q2; #1050 re-check F7). snowplow_crd_discovery's counters are
+process-wide: the rows are the stage's only when the stage's CRD is the only
+one whose schema changed in the window. That is read from the CLUSTER, never
+from snowplow's log: the schema_relist lines are INFO, and the chart runs
+snowplow at LOG_LEVEL warn (run 20's logs hold no INFO line; the level is read
+at startup, so raising it would mean a restart). Every CRD's uid and
+metadata.generation (a spec change, the schema's included, bumps it) is read
+before the Job is applied and after it exited, a window holding [armed, end]:
+the result is refused (FAIL, never PASS) when another CRD's generation moved,
+when the stage's CRD's did not move exactly once (the widen), or when either
+read is missing. CRDs created or deleted in the window are reported (a CRD's
+first observation and its deletion relist nothing).
 
 STDLIB ONLY at import: the Job imports this module with load606.py and
 store_rebuild.py beside it (bench/ in its ConfigMap). The renderers that need
@@ -769,15 +774,10 @@ HOW = ("A CRD of the stage's own and N objects the size of the run's composition
        "'serves again' relies on #547's known-stale read-through) until a read serves; then the CRD widened with "
        "a defaulted property, so every object's served bytes change. In-cluster, one read and two /debug/vars "
        "reads a sample: the heap and GC from memstats; the rebuild's counters by the mechanism the build "
-       "publishes, read with accept1126's B1-B7 rows over armed -> end, attributed to the stage's CRD by the "
-       "schema_relist lines of snowplow's log; the end and its bound (its clock from the widen) per the #1004 "
+       "publishes, read with accept1126's B1-B7 rows over armed -> end, attributed to the stage's CRD by every "
+       "CRD's generation read before the Job and after it (snowplow's own schema_relist lines are INFO, and it runs "
+       "at LOG_LEVEL warn); the end and its bound (its clock from the widen) per the #1004 "
        "rulings. After the run's evaluate step: nothing of it reaches the paired verdict.")
-
-SCHEMA_RELIST_MSG = "cache.crd_discovery.schema_relist"
-# what names the GVR a rebuild ran for, per tag (both hash the GVR: its String() carries "=")
-GVR_LINES = ("cache.crd_discovery.relist_postsync.dirty_marked", "cache.crd_discovery.relist_postsync.timeout",
-             "cache.store.swap.build")
-
 
 def parse(lines) -> list[dict]:
     out = []
@@ -792,58 +792,40 @@ def parse(lines) -> list[dict]:
     return out
 
 
-def _epoch(ts) -> float | None:
-    """An RFC3339(Nano) time as epoch seconds (snowplow's slog `time`, the
-    kubelet's `kts`)."""
-    import calendar
-    import re
-    m = re.match(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$", str(ts or ""))
-    if not m:
-        return None
-    y, mo, d, h, mi, se = (int(x) for x in m.groups()[:6])
-    t = calendar.timegm((y, mo, d, h, mi, se)) + (float(m.group(7)) if m.group(7) else 0.0)
-    z = m.group(8)
-    if z != "Z":
-        sign = 1 if z[0] == "+" else -1
-        t -= sign * (int(z[1:3]) * 3600 + int(z[4:6]) * 60)
-    return t
+def crd_generations(crds: dict) -> dict:
+    """{name: {uid, generation}} of every CRD (kubectl get crd -o json)."""
+    return {(m.get("metadata") or {}).get("name"): {"uid": (m.get("metadata") or {}).get("uid"),
+                                                    "generation": (m.get("metadata") or {}).get("generation")}
+            for m in crds.get("items") or []}
 
 
-def relist_attribution(log_lines: list[str] | None, t0: float, t1: float, slack: float = SAMPLE_S) -> dict | None:
-    """Which CRDs' schema relists (and which GVRs' rebuilds) the scrubbed
-    snowplow log shows in [t0 - slack, t1 + slack]; None when the log was not
-    read. The scrub hashes the CRD's name and the GVR (logscrub._h), so the
-    stage's are recognised by their hash and every other one is named by it."""
-    if log_lines is None:
+def crd_attribution(before: dict | None, after: dict | None) -> dict | None:
+    """What changed among the CRDs between the window's two reads: the stage
+    CRD's generation delta (the same uid), every other CRD whose generation
+    moved (the same uid: a spec change, a schema change included), and the
+    CRDs created or deleted (a uid that appears or goes). None when a read is
+    missing."""
+    if before is None or after is None:
         return None
-    from bench import logscrub
-    k_crd = "k:" + logscrub._h("crd")[2:]
-    ours_crd, ours_gvr = logscrub._h(CRD_NAME), logscrub._h(GVR)
-    out = {"window": [round(t0 - slack, 3), round(t1 + slack, 3)], "ours": 0, "other_crds": {},
-           "rebuilds": {"ours": 0, "other_gvrs": {}}}
-    for ln in log_lines:
-        try:
-            rec = json.loads(ln)
-        except ValueError:
+    ours_b, ours_a = before.get(CRD_NAME), after.get(CRD_NAME)
+    ours = (ours_a["generation"] - ours_b["generation"]
+            if ours_b and ours_a and ours_a.get("uid") == ours_b.get("uid")
+            and isinstance(ours_a.get("generation"), int) and isinstance(ours_b.get("generation"), int) else None)
+    moved, created, deleted = {}, [], []
+    for name, a in after.items():
+        if name == CRD_NAME:
             continue
-        if not isinstance(rec, dict) or rec.get("msg") not in (SCHEMA_RELIST_MSG,) + GVR_LINES:
-            continue
-        t = _epoch(rec.get("time")) or _epoch(rec.get("kts"))
-        if t is None or not (t0 - slack <= t <= t1 + slack):
-            continue
-        if rec["msg"] == SCHEMA_RELIST_MSG:
-            c = rec.get(k_crd)
-            if c == ours_crd:
-                out["ours"] += 1
-            else:
-                out["other_crds"][str(c)] = out["other_crds"].get(str(c), 0) + 1
-        else:
-            g = rec.get("gvr")
-            if g == ours_gvr:
-                out["rebuilds"]["ours"] += 1
-            else:
-                out["rebuilds"]["other_gvrs"][str(g)] = out["rebuilds"]["other_gvrs"].get(str(g), 0) + 1
-    return out
+        b = before.get(name)
+        if b is None or b.get("uid") != a.get("uid"):
+            created.append(name)
+            if b is not None:
+                deleted.append(name)
+        elif a.get("generation") != b.get("generation"):
+            moved[name] = (a.get("generation") or 0) - (b.get("generation") or 0)
+    deleted += [n for n in before if n not in after and n != CRD_NAME]
+    return {"stage_crd_generation_delta": ours, "other_crds_changed": moved,
+            "created": sorted(created), "deleted": sorted(deleted),
+            "window": "every CRD read before the Job was applied and after it exited (it holds armed -> end)"}
 
 
 def memory_report(samples: list[dict], t_detected: float | None) -> dict:
@@ -893,11 +875,12 @@ def _other_builds(armed: dict, end: dict) -> dict:
 
 
 def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after: dict,
-             log_lines: list[str] | None) -> dict:
+             crds_before: dict | None, crds_after: dict | None) -> dict:
     """The stage's record: outcome, rows, attribution, memory, how; `passed`
-    only when the build ENDED inside its bound, every gating row passed, every
-    schema relist in the window was the stage's CRD's, and snowplow was
-    neither restarted nor replaced."""
+    only when the build ENDED inside its bound, every gating row passed, the
+    stage's CRD was the only one whose spec changed in the window (crd_*:
+    crd_generations of the window's two reads), and snowplow was neither
+    restarted nor replaced."""
     from bench import accept1126
     reasons = []
     kinds = [r.get("kind") for r in records]
@@ -926,8 +909,8 @@ def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after:
         if armed_i is not None else None
     if armed_s is not None and settle and out["mechanism"] in MECHANISMS:
         mech = out["mechanism"]
-        t_armed, t_end = records[armed_i]["t"], (end or settle[-1])["t"]
-        att = relist_attribution(log_lines, t_armed, t_end)
+        t_armed = records[armed_i]["t"]
+        att = crd_attribution(crds_before, crds_after)
         out["attribution"] = att
         d = None
         try:
@@ -948,17 +931,16 @@ def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after:
                 reasons.append(f"rows failed: {', '.join(out['failed_rows'])}")
         except accept1126.AssertionsFailed as e:
             reasons.append(f"the rows could not be read: {e}")
-        fired = (d or {}).get(f"{CRD_F}.schema_relists_fired")
         if att is None:
-            reasons.append("snowplow's log was not read: whether another CRD's schema relist landed in the "
-                           "window is unknown, so the rows are unattributable")
+            reasons.append("the CRDs were not read at both ends of the window: whether another CRD's schema "
+                           "changed in it is unknown, so the process-wide rows are unattributable")
         else:
-            if att["other_crds"]:
-                reasons.append(f"another CRD's schema relist landed between armed and the end "
-                               f"({att['other_crds']}): the process-wide rows are unattributable")
-            if fired is not None and att["ours"] < fired:
-                reasons.append(f"Δschema_relists_fired {fired} but snowplow's log names the stage's CRD "
-                               f"{att['ours']} time(s): unattributed relist(s)")
+            if att["other_crds_changed"]:
+                reasons.append(f"another CRD's spec changed in the window ({att['other_crds_changed']}): a schema "
+                               f"change there relists too, so the process-wide rows are unattributable")
+            if att["stage_crd_generation_delta"] != 1:
+                reasons.append(f"the stage's CRD changed {att['stage_crd_generation_delta']} time(s) in the "
+                               f"window, not once (the widen)")
         out["other_gvr_builds"] = _other_builds(armed_s["vars"], settle[-1]["vars"])
         fts = {}
         for s in settle:
@@ -995,7 +977,7 @@ def report_lines(rec: dict) -> list[str]:
     if rec.get("timeline_s"):
         out.append(f"full widen: timeline {rec['timeline_s']}")
     if "attribution" in rec:
-        out.append(f"full widen: schema relists in the window: {rec['attribution']}")
+        out.append(f"full widen: CRDs changed in the window: {rec['attribution']}")
     for r in rec.get("assertions") or []:
         out.append(f"full widen: {r['id']} {'ok' if r['passed'] else 'FAILED'}"
                    f"{' (report only)' if r.get('report_only') else ''}: {r['assertion']}: {r['actual']}")
@@ -1026,8 +1008,9 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("cleanup", help="kubectl argument lists, one per line")
     cl.add_argument("--user-prefix", required=True)
     sub.add_parser("restarts", help="kubectl get pods -o json on stdin -> {pod: restarts}")
+    sub.add_parser("crds", help="kubectl get crd -o json on stdin -> {name: {uid, generation}}")
     ev = sub.add_parser("evaluate")
-    for f in ("--stream", "--plan", "--pods-before", "--pods-after", "--out", "--log"):
+    for f in ("--stream", "--plan", "--pods-before", "--pods-after", "--out", "--crds-before", "--crds-after"):
         ev.add_argument(f, required=True)
     w = sub.add_parser("watch", help="in-cluster: the register, armed and settle phases")
     for f in ("--snowplow-url", "--authn-url", "--user", "--password", "--bounds"):
@@ -1081,6 +1064,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "restarts":
         print(json.dumps(restarts(json.load(sys.stdin)), sort_keys=True))
         return 0
+    if a.cmd == "crds":
+        print(json.dumps(crd_generations(json.load(sys.stdin)), sort_keys=True))
+        return 0
     if a.cmd == "evaluate":
         with open(a.stream) as fh:
             recs = parse(fh)
@@ -1090,12 +1076,14 @@ def main(argv: list[str] | None = None) -> int:
             pb = json.load(fh)
         with open(a.pods_after) as fh:
             pa = json.load(fh)
-        try:
-            with open(a.log) as fh:
-                log_lines = fh.read().splitlines()
-        except OSError:
-            log_lines = None
-        rec = evaluate(recs, plan_=p, pods_before=pb, pods_after=pa, log_lines=log_lines)
+        crds = []
+        for f in (a.crds_before, a.crds_after):
+            try:
+                with open(f) as fh:
+                    crds.append(json.load(fh))
+            except (OSError, ValueError):
+                crds.append(None)
+        rec = evaluate(recs, plan_=p, pods_before=pb, pods_after=pa, crds_before=crds[0], crds_after=crds[1])
         with open(a.out, "w") as fh:
             json.dump(rec, fh, indent=1)
         for ln in report_lines(rec):

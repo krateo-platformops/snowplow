@@ -281,7 +281,8 @@ PSI_JOBS=0
 #            build's bound is derived from the live Deployment at the stage and
 #            must fit it;
 #   reads    its reads (the Deployment, the ConfigMaps, the count, snowplow's
-#            pods before and after, the Job's /out, snowplow's log), each
+#            pods before and after, every CRD before and after (Q2's
+#            attribution), the Job's /out, snowplow's log), each
 #            COLLECT_TIMEOUT_S;
 #   deletes  each cleanup delete (COLLECT_TIMEOUT_S), then the CRD's: the data
 #            step's bound again, its deletion removes N objects.
@@ -289,7 +290,7 @@ FULL_WIDEN_GO="${BENCH_1004_GO:-}"
 FW_S=0
 FW_EXEC_S=60               # one kubectl exec's bound, as mem_stop's
 FW_APPLIES=3
-FW_READS=7
+FW_READS=9
 FW_DELETES="$(python3 -m bench.full_widen cleanup-count)"
 FW_BOUND_S="$ROLLOUT_TIMEOUT_S"
 FW_CREATE_S="$DATA_TIMEOUT_S"
@@ -2021,7 +2022,8 @@ fw_local_cleanup() {
   local f
   rm -f "$OUT/.bench-password"
   [[ -d "$FW_DIR" ]] || return 0
-  rm -f "$FW_DIR"/objects-*.yaml "$FW_DIR"/objects-*.yaml.err "$FW_DIR/snowplow-deploy.json" "$FW_DIR/configmaps.json"
+  rm -f "$FW_DIR"/objects-*.yaml "$FW_DIR"/objects-*.yaml.err "$FW_DIR/snowplow-deploy.json" "$FW_DIR/configmaps.json" \
+      "$FW_DIR/crds-raw.json" "$FW_DIR/pods-raw.json"
   for f in "$FW_DIR/job.yaml" "$FW_DIR/probe.yaml"; do
     if [[ -f "$f" ]]; then redact_pw "$f"; fi
   done
@@ -2107,6 +2109,10 @@ s_full_widen() {
   fw_read "$FW_DIR/pods-raw.json" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
     || { fw_fail "reading snowplow's pods before the stage"; return 1; }
   python3 -m bench.full_widen restarts < "$FW_DIR/pods-raw.json" > "$FW_DIR/pods-before.json"
+  # Q2 (#1050 F7): every CRD's uid and generation at the window's start (before the Job, so before armed)
+  fw_read "$FW_DIR/crds-raw.json" get crd -o json || { fw_fail "reading the CRDs before the stage"; return 1; }
+  python3 -m bench.full_widen crds < "$FW_DIR/crds-raw.json" > "$FW_DIR/crds-before.json"
+  rm -f "$FW_DIR/crds-raw.json"
   bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/job.yaml" || { fw_fail "the fullwiden606 Job"; return 1; }
   t_job=$(date +%s)
   rc=0
@@ -2127,6 +2133,14 @@ s_full_widen() {
     rc=0
   fi
   (( rc == 0 )) || { fw_fail "the fullwiden606 Job did not finish within its ${FW_JOB_S}s"; return 1; }
+  # and at its end (the Job has exited, so after its end); a failed read leaves the
+  # file out: evaluate refuses the result (unattributable), the stage goes on
+  if fw_read "$FW_DIR/crds-raw.json" get crd -o json; then
+    python3 -m bench.full_widen crds < "$FW_DIR/crds-raw.json" > "$FW_DIR/crds-after.json"
+  else
+    log "full widen: the CRDs could not be read after the stage: its rows are unattributed (the stage FAILs)"
+  fi
+  rm -f "$FW_DIR/crds-raw.json"
   fw_pod "$(( $(date +%s) + COLLECT_TIMEOUT_S ))" || true
   bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
       cp "${FW_POD}:/out" "$FW_DIR/out" >/dev/null 2>&1 \
@@ -2139,11 +2153,12 @@ s_full_widen() {
   bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system logs deploy/snowplow \
       --since-time="$since" --timestamps 2>/dev/null | scrub --kubelet-timestamps > "$FW_DIR/snowplow.log.part" \
     && mv "$FW_DIR/snowplow.log.part" "$FW_DIR/snowplow.log" \
-    || log "full widen: could not read snowplow's log since ${since}: its schema relists are unattributed (the stage FAILs)"
+    || log "full widen: could not read snowplow's log since ${since} (diagnostics only)"
   rm -f "$FW_DIR/snowplow.log.part"
   python3 -m bench.full_widen evaluate --stream "$FW_DIR/out/widen.jsonl" --plan "$FW_DIR/plan.json" \
       --pods-before "$FW_DIR/pods-before.json" --pods-after "$FW_DIR/pods-after.json" \
-      --log "$FW_DIR/snowplow.log" --out "$OUT/full-widen.json" 2>"$FW_DIR/report.txt" \
+      --crds-before "$FW_DIR/crds-before.json" --crds-after "$FW_DIR/crds-after.json" \
+      --out "$OUT/full-widen.json" 2>"$FW_DIR/report.txt" \
     || { fw_fail "evaluating the stage's stream: $(tail -3 "$FW_DIR/report.txt")"; return 1; }
   while IFS= read -r ln; do if [[ -n "$ln" ]]; then log "$ln"; fi; done < "$FW_DIR/report.txt"
   fw_cleanup

@@ -218,6 +218,20 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         sys.exit(0)
     fw_events = (open(os.path.join(STATE, "fw-events")).read() if os.path.exists(os.path.join(STATE, "fw-events"))
                  else "")
+    if a[:2] == ["get", "crd"] and "json" in a and "apply crd.yaml" in fw_events:
+        # #1004 F7: every CRD's name, uid and generation, read at the window's two ends.
+        # The widen bumps the stage CRD's generation; FAKE_FW_OTHER_CRD_BUMP=1: another
+        # CRD's spec changes in the window too; FAKE_FW_CRDS_FAIL=1: the read fails
+        if os.environ.get("FAKE_FW_CRDS_FAIL") == "1":
+            print("Error from server (Forbidden): customresourcedefinitions is forbidden", file=sys.stderr)
+            sys.exit(1)
+        widened = "apply crd-widened.yaml" in fw_events
+        bump = os.environ.get("FAKE_FW_OTHER_CRD_BUMP") == "1" and widened
+        print(json.dumps({"items": [
+            {"metadata": {"name": "installers.composition.krateo.io", "uid": "u-inst", "generation": 3 + bump}},
+            {"metadata": {"name": "users.basic.authn.krateo.io", "uid": "u-users", "generation": 1}},
+            {"metadata": {"name": fw_crd, "uid": "u-fw", "generation": 1 + widened}}]}))
+        sys.exit(0)
     if a[:2] == ["get", "pods"] and "job-name=fullwiden606" in a:
         print("fullwiden606-0" if "apply job.yaml" in fw_events else ""); sys.exit(0)
     if a[:1] == ["exec"] and "fullwiden606-0" in a and a[-2:] == ["touch", "/out/widened"]:
