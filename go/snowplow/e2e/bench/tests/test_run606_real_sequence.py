@@ -165,6 +165,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         except Exception:
             resolved = None
     record("kubectl", kc, resolved)
+    # #1051: FAKE_VERDICT_SNAPSHOT=<file>: the first call after verdict.json exists copies it
+    _snap = os.environ.get("FAKE_VERDICT_SNAPSHOT")
+    _vj = os.path.join(os.environ.get("OUT", ""), "verdict.json")
+    if _snap and not os.path.exists(_snap) and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
+        open(_snap, "wb").write(open(_vj, "rb").read())
     port = os.environ["FAKE_PORT"]
     if a[:3] == ["create", "secret", "generic"]:
         # the ghcr pull Secret and the image-pull Secret: their values come on stdin
