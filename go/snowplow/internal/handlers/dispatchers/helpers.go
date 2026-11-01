@@ -143,7 +143,14 @@ var evaluateRBACFn = rbac.EvaluateRBAC
 
 // checkDispatchRBAC is the cache=on permission gate (Revision 2
 // binding, Tag 0.30.4). Returns true iff the user identified by ctx is
-// permitted to GET the dispatched CR in namespace.
+// permitted to GET the dispatched CR obj.
+//
+// #1046 — the check is about obj ITSELF: its namespace AND its name are read
+// from the object (rbac.TargetOfObject) and the options are built by
+// rbac.ObjectCheck, so a resourceNames-scoped grant (`get restactions
+// resourceNames: [x]`) is honoured exactly as the apiserver honours the
+// cache=off GET of x. Taking the object rather than loose coordinates is what
+// keeps a caller from passing the namespace and forgetting the name.
 //
 // The check runs against the *dispatch target* (RestAction or Widget
 // CR) — the same object the cache=off fetchObject branch hits the
@@ -153,7 +160,7 @@ var evaluateRBACFn = rbac.EvaluateRBAC
 // Callers MUST only invoke this in cache=on mode (`!cache.Disabled()`).
 // In cache=off mode the gate is implicit in fetchObject's per-user
 // apiserver call.
-func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, namespace string) bool {
+func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj rbac.ObjectNamer) bool {
 	log := xcontext.Logger(ctx)
 
 	ui, err := xcontext.UserInfo(ctx)
@@ -168,22 +175,18 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 	// (allowed, matchedBindingUID, err). This per-item caller ignores
 	// matchedBindingUID; cache-key callers consume it (helpers.go:202 +
 	// :306 via the per-request memo, Phase 2b).
-	allowed, _, evalErr := evaluateRBACFn(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	target := rbac.TargetOfObject(gvr, obj)
+	opts := rbac.ObjectCheck(ui.Username, ui.Groups, "get", target)
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, evalErr := evaluateRBACFn(ctx, opts)
 	if evalErr != nil {
 		log.Error("checkDispatchRBAC: EvaluateRBAC error",
 			slog.String("user", redact.User(ui.Username)),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", namespace),
+			slog.String("namespace", target.Namespace),
+			slog.String("name", target.Name),
 			slog.Any("err", evalErr),
 		)
 		return false
@@ -293,16 +296,10 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	// out-param; EvaluateRBAC's public (bool,string,error) signature is
 	// unchanged. On deny/err the out-param is left at its default (regular).
 	var winClass rbac.WinningSubjectClass
-	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:               ui.Username,
-		Groups:                 ui.Groups,
-		Verb:                   "get",
-		Group:                  group,
-		Resource:               resource,
-		Namespace:              namespace,
-		Name:                   name,
-		WinningSubjectClassOut: &winClass,
-	})
+	keyCheck := rbac.ObjectCheck(ui.Username, ui.Groups, "get",
+		rbac.ObjectTarget{Group: group, Resource: resource, Namespace: namespace, Name: name})
+	keyCheck.WinningSubjectClassOut = &winClass
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, keyCheck)
 	// Assemble the mint-time at-risk MARK. Only meaningful for a real permit (a
 	// non-empty first-match BindingUID); a "" BindingUID serves as a MISS
 	// (serveFromCacheEligible) so it can never reach the hit-site bump. Case-2
@@ -843,15 +840,8 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// its two consumers gate on: behaviour is unchanged wherever a
 		// consumer actually runs (kind/bench INFO, or the diag env), and
 		// the cost is dropped exactly when the value would be discarded.
-		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-			Username:  username,
-			Groups:    groups,
-			Verb:      "get",
-			Group:     group,
-			Resource:  resource,
-			Namespace: namespace,
-			Name:      name,
-		})
+		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.ObjectCheck(username, groups, "get",
+			rbac.ObjectTarget{Group: group, Resource: resource, Namespace: namespace, Name: name}))
 	}
 	log.Info("dispatch.cache_key.computed",
 		slog.String("subsystem", "cache"),

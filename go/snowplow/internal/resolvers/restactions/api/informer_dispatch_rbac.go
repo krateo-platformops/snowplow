@@ -165,11 +165,15 @@ func filterListByRBAC(
 	}
 
 	// 0.30.111 Part 3 — namespace-keyed EvaluateRBAC memo. The verb is
-	// fixed "list"; a `list` decision is NAMESPACE-scoped and
-	// NAME-INDEPENDENT (Kubernetes ResourceNameMatches consults
-	// rule.ResourceNames only for name-specific verbs — never for a
-	// collection verb such as `list`). So every item in the same
-	// namespace yields the identical permit/deny verdict. The memo turns
+	// fixed "list"; for the plain collection URL this filter serves, a
+	// `list` decision is NAMESPACE-scoped and NAME-INDEPENDENT: Kubernetes'
+	// ResourceNameMatches ignores the verb and compares rule.ResourceNames
+	// with the request's Name, and a plain collection URL names no object
+	// (Name ""), so no resourceNames rule can grant it. (A list with
+	// `fieldSelector=metadata.name=` DOES carry a Name upstream; that shape
+	// is not modelled here and is over-denied, tracked separately.) So
+	// every item in the same namespace yields the identical permit/deny
+	// verdict. The memo turns
 	// an N-item LIST spanning K distinct namespaces into K EvaluateRBAC
 	// calls instead of N.
 	//
@@ -374,18 +378,12 @@ func authorizeGetByRBAC(
 	//
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
 	// matchedBindingUID.
-	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		Name:      name,
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	// #1046 — built by rbac.ObjectCheck, the one per-object construction.
+	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOf(gvr, namespace, name))
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("informer_dispatch.rbac_get_filter.evaluate_error",

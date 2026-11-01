@@ -324,19 +324,18 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		return false
 	}
 
+	// #1046 — the check is about obj itself: rbac.ObjectCheck over the
+	// object's own namespace AND name, so a resourceNames-scoped `get` grant
+	// is served from the informer instead of falling through to the
+	// apiserver (and, on the SA re-gate in getFromAPIServer, instead of
+	// failing closed).
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
 	// matchedBindingUID.
-	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: obj.GetNamespace(),
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOfObject(gvr, obj))
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("objects.Get.rbac_get_filter.evaluate_error",

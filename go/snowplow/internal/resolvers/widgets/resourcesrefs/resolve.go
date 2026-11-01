@@ -113,10 +113,14 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			Inline: in.Inline,
 		}
 
+		// #1046 — the ref is about the object it names: a resourceNames-scoped
+		// grant on in.Name is honoured for a name-specific verb (UserCan builds
+		// the check through rbac.ObjectCheck, cache on and off alike).
 		el.Allowed = rbac.UserCan(ctx, rbac.UserCanOptions{
 			Verb:          verb,
 			GroupResource: gvr.GroupResource(),
 			Namespace:     in.Namespace,
+			Name:          in.Name,
 		})
 		if !el.Allowed {
 			// #214: a resourceRef RBAC denial is EXPECTED on the prewarm walk

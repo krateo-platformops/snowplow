@@ -117,7 +117,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// dispatch by EvaluateRBAC. Cache=off skips the gate — fetchObject
 	// already ran per-user against apiserver.
 	if !cache.Disabled() {
-		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
 			log.Warn("widget dispatch denied by EvaluateRBAC",
 				slog.String("gvr", got.GVR.String()),
 			)

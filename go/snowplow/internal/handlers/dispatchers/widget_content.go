@@ -752,10 +752,14 @@ func recomputeAllowedFromRefItem(ctx context.Context, item map[string]any) bool 
 	if !ok {
 		return false
 	}
+	// #1046 — the same (verb, resource, namespace, NAME) tuple the cold
+	// resolve checks (resourcesrefs/resolve.go): the item's path names its
+	// object, so a resourceNames-scoped grant re-derives the same flag here.
 	return rbac.UserCan(ctx, rbac.UserCanOptions{
 		Verb:          kubeVerb,
 		GroupResource: gvr.GroupResource(),
 		Namespace:     ref.Namespace,
+		Name:          ref.Name,
 	})
 }
 

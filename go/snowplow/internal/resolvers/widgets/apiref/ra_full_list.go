@@ -158,15 +158,8 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	if err != nil {
 		return cache.ResolvedKeyInputs{}, "", false
 	}
-	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		Name:      name,
-	})
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.ObjectCheck(ui.Username, ui.Groups, "get",
+		rbac.TargetOf(gvr, namespace, name)))
 	if bindingUID == "" {
 		return cache.ResolvedKeyInputs{}, "", false
 	}

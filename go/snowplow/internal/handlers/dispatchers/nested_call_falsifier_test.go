@@ -442,7 +442,7 @@ func TestF5_RealCheckDispatchRBAC_DeniesUnauthorized(t *testing.T) {
 	deniedCtx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "denied-user"}),
 	)
-	if checkDispatchRBAC(deniedCtx, nestedCallInnerGVR, ns) {
+	if checkDispatchRBAC(deniedCtx, nestedCallInnerGVR, &metav1.ObjectMeta{Namespace: ns, Name: name}) {
 		t.Fatalf("F5: checkDispatchRBAC ALLOWED an identity with no `get` grant — " +
 			"the in-process nested /call RBAC gate is the single load-bearing " +
 			"correctness line and must deny")
@@ -450,7 +450,7 @@ func TestF5_RealCheckDispatchRBAC_DeniesUnauthorized(t *testing.T) {
 	authedCtx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "authorized-user"}),
 	)
-	if !checkDispatchRBAC(authedCtx, nestedCallInnerGVR, ns) {
+	if !checkDispatchRBAC(authedCtx, nestedCallInnerGVR, &metav1.ObjectMeta{Namespace: ns, Name: name}) {
 		t.Fatalf("F5: checkDispatchRBAC DENIED an identity that holds the `get` grant")
 	}
 }

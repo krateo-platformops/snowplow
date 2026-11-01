@@ -18,6 +18,17 @@ type UserCanOptions struct {
 	Verb          string
 	GroupResource schema.GroupResource
 	Namespace     string
+	// Name is the object the check is about (#1046): a resourceNames-scoped
+	// grant only matches a request that names its object. "" when the check
+	// is about no single object. Both paths apply it through ObjectCheck, so
+	// it is carried exactly when the verb names a single object.
+	Name string
+}
+
+// target is the object these options are about.
+func (o UserCanOptions) target() ObjectTarget {
+	return ObjectTarget{Group: o.GroupResource.Group, Resource: o.GroupResource.Resource,
+		Namespace: o.Namespace, Name: o.Name}
 }
 
 // UserCan reports whether the user identified by ctx is permitted to
@@ -42,14 +53,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		// Ship 0.30.242 H.c-layered Phase 2 step 2a — EvaluateRBAC returns
 		// (allowed, matchedBindingUID, err). UserCan is a per-item caller;
 		// matchedBindingUID is ignored.
-		allowed, _, evalErr := EvaluateRBAC(ctx, EvaluateOptions{
-			Username:  ui.Username,
-			Groups:    ui.Groups,
-			Verb:      opts.Verb,
-			Group:     opts.GroupResource.Group,
-			Resource:  opts.GroupResource.Resource,
-			Namespace: opts.Namespace,
-		})
+		allowed, _, evalErr := EvaluateRBAC(ctx, ObjectCheck(ui.Username, ui.Groups, opts.Verb, opts.target()))
 		if evalErr != nil {
 			log.Error("rbac.UserCan: EvaluateRBAC failed", slog.Any("err", evalErr))
 			return false
@@ -93,13 +97,19 @@ func userCanViaSAR(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return false
 	}
 
+	// #1046 — the review asks about the request the apiserver would see, built
+	// by the same ObjectCheck as the in-process path: the object's name rides
+	// along iff the verb names a single object, so a resourceNames-scoped
+	// grant is answered here exactly as it is with the cache on.
+	check := ObjectCheck("", nil, opts.Verb, opts.target())
 	selfCheck := authv1.SelfSubjectAccessReview{
 		Spec: authv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authv1.ResourceAttributes{
-				Group:     opts.GroupResource.Group,
-				Resource:  opts.GroupResource.Resource,
-				Namespace: opts.Namespace,
-				Verb:      opts.Verb,
+				Group:     check.Group,
+				Resource:  check.Resource,
+				Namespace: check.Namespace,
+				Verb:      check.Verb,
+				Name:      check.Name,
 			},
 		},
 	}
