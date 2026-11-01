@@ -947,9 +947,12 @@ def test_run606_evaluate_step_succeeds_whatever_the_verdict(tmp_path, verdict, w
     (bin_ / "python3").chmod(0o755)
     script = ("set -Eeuo pipefail\nlog() { echo \"$*\" >> \"$OUT/run.log\"; }\n"
               "DRY=0 RUN8_REPORT=1 LOAD_DRIVER=k6 VIEWERS=1 BROWSER_SESSIONS=5 EXPECTED_IMAGE_DIGEST=x\n"
+              # #1051: run606.sh defines the mark beside OUT; s_evaluate writes it
+              "VERDICT_MARK=\"$OUT/.verdict-final\"\n"
               + _s_evaluate_body() + "\ns_evaluate\necho step-ok\n")
     p = subprocess.run(["bash", "-c", script], env=dict(os.environ, OUT=str(out),
                        PATH=f"{bin_}{os.pathsep}{os.environ['PATH']}"),
                        capture_output=True, text=True, timeout=60, check=False)
     assert p.returncode == 0 and "step-ok" in p.stdout, p.stderr[-2000:]
     assert f"verdict exit={rc}" in (out / "run.log").read_text()
+    assert (out / ".verdict-final").exists()          # #1051: the verdict is final, whatever it is
