@@ -563,23 +563,19 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		}
 		// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 		// ignores matchedBindingUID return.
-		allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-			Username:  username,
-			Groups:    groups,
-			Verb:      uaf.Verb,
-			Group:     uaf.Group,
-			Resource:  resource,
-			Namespace: namespace,
-			// #123 — thread the per-object name so a resourceNames-scoped
-			// grant (name-specific verb only) matches the named object.
-			// Empty for collection verbs is harmless: the evaluator scopes
-			// resourceNames to name-specific verbs, so a plain list grant is
-			// evaluated identically whether or not Name is set (INERTNESS).
-			Name: name,
-			// Ship L1 (0.30.252): per-item caller discards
-			// matchedBindingUID — skip the CRB/RB stable-sort.
-			SkipBindingUID: true,
+		// #123 / #1046 — the check is about this one object: rbac.ObjectCheck
+		// carries its name for a name-specific verb, so a resourceNames-scoped
+		// grant matches the named object, and drops it for a collection verb
+		// (where name is "" anyway, see above). The cache=off fallback
+		// (EvaluateRBAC → UserCan → SelfSubjectAccessReview) carries the same
+		// name, so both modes keep the same items.
+		opts := rbac.ObjectCheck(username, groups, uaf.Verb, rbac.ObjectTarget{
+			Group: uaf.Group, Resource: resource, Namespace: namespace, Name: name,
 		})
+		// Ship L1 (0.30.252): per-item caller discards matchedBindingUID —
+		// skip the CRB/RB stable-sort.
+		opts.SkipBindingUID = true
+		allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 		if err != nil {
 			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
 				slog.String("user", redact.User(username)),

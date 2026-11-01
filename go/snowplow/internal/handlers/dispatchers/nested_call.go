@@ -138,7 +138,7 @@ func ResolveNestedCall(
 	// the RESTAction and widget arms are gated identically. A denied identity
 	// gets a 403-class error — never empty content.
 	if !cache.Disabled() {
-		if !checkDispatchRBAC(ctx, got.GVR, got.Unstructured.GetNamespace()) {
+		if !checkDispatchRBAC(ctx, got.GVR, got.Unstructured) {
 			log.Warn("nested resolve dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),

@@ -374,18 +374,12 @@ func authorizeGetByRBAC(
 	//
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
 	// matchedBindingUID.
-	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		Name:      name,
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	// #1046 — built by rbac.ObjectCheck, the one per-object construction.
+	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOf(gvr, namespace, name))
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("informer_dispatch.rbac_get_filter.evaluate_error",

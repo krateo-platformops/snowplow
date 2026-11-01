@@ -13,7 +13,9 @@
 //
 // AND it MUST call EvaluateRBAC with Verb=="get" + SkipBindingUID==true (the
 // per-item posture — it discards matchedBindingUID, so skipping the stable-sort
-// is both correct and the 50K-scale CPU win, Ship L1).
+// is both correct and the 50K-scale CPU win, Ship L1), about the dispatched
+// object ITSELF: its namespace and its NAME (#1046 — without the name a
+// resourceNames-scoped grant can never match).
 //
 // RED arm (fail-OPEN): if checkDispatchRBAC returned true on a missing UserInfo
 // or an evaluator error, an unauthenticated / evaluator-degraded request would
@@ -31,6 +33,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -43,6 +46,9 @@ func setEvaluateRBACForTest(fn func(ctx context.Context, opts rbac.EvaluateOptio
 }
 
 var m5GVR = schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
+
+// m5Obj is the dispatched CR the gate is asked about.
+var m5Obj = &metav1.ObjectMeta{Namespace: "krateo-system", Name: "m5-ra"}
 
 func m5CtxWithUser() context.Context {
 	return xcontext.BuildContext(context.Background(),
@@ -85,7 +91,7 @@ func TestM5_CheckDispatchRBAC_Table(t *testing.T) {
 				ctx = m5CtxWithUser()
 			}
 
-			got := checkDispatchRBAC(ctx, m5GVR, "krateo-system")
+			got := checkDispatchRBAC(ctx, m5GVR, m5Obj)
 			if got != tc.wantResult {
 				t.Fatalf("checkDispatchRBAC = %v, want %v", got, tc.wantResult)
 			}
@@ -106,6 +112,11 @@ func TestM5_CheckDispatchRBAC_Table(t *testing.T) {
 				}
 				if gotOpts.Namespace != "krateo-system" {
 					t.Fatalf("EvaluateOptions.Namespace = %q, want krateo-system", gotOpts.Namespace)
+				}
+				// #1046 — the gate is about the dispatched object: its name
+				// rides along, or a resourceNames-scoped grant never matches.
+				if gotOpts.Name != m5Obj.Name {
+					t.Fatalf("EvaluateOptions.Name = %q, want %q (the dispatched CR's own name, #1046)", gotOpts.Name, m5Obj.Name)
 				}
 				if gotOpts.Username != "alice" {
 					t.Fatalf("EvaluateOptions.Username = %q, want alice (the ctx identity)", gotOpts.Username)
@@ -145,7 +156,7 @@ func TestM5_FailClosed_RED_ShadowFailOpen(t *testing.T) {
 	defer restore()
 
 	noUserCtx := context.Background()
-	if real := checkDispatchRBAC(noUserCtx, m5GVR, "krateo-system"); real != false {
+	if real := checkDispatchRBAC(noUserCtx, m5GVR, m5Obj); real != false {
 		t.Fatalf("real gate must DENY a no-UserInfo request; got %v", real)
 	}
 	if shadow := shadowFailOpen(noUserCtx, m5GVR, "krateo-system"); shadow != true {
@@ -159,7 +170,7 @@ func TestM5_FailClosed_RED_ShadowFailOpen(t *testing.T) {
 	defer restore2()
 
 	userCtx := m5CtxWithUser()
-	if real := checkDispatchRBAC(userCtx, m5GVR, "krateo-system"); real != false {
+	if real := checkDispatchRBAC(userCtx, m5GVR, m5Obj); real != false {
 		t.Fatalf("real gate must DENY on an evaluator error; got %v", real)
 	}
 	if shadow := shadowFailOpen(userCtx, m5GVR, "krateo-system"); shadow != true {

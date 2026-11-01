@@ -258,6 +258,10 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 				Group: opts.Group, Resource: opts.Resource,
 			},
 			Namespace: opts.Namespace,
+			// #1046 — the review carries the object's name, or a
+			// resourceNames-scoped grant the in-process path honours is
+			// denied here (the userAccessFilter cache=off divergence).
+			Name: opts.Name,
 		})
 		return ok, "", nil
 	}

@@ -165,7 +165,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Cache=off skips this gate — fetchObject already runs per-user
 	// against apiserver, which enforces RBAC inline.
 	if !cache.Disabled() {
-		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
 			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
