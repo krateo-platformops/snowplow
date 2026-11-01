@@ -52,12 +52,11 @@ K6_THRESHOLDS = {
     "min_armed_user_share": 0.9,
     # per browser session: the SPA's live-update streams that opened
     "min_sse_opened_per_stream": 1,
-    # Chrome's CPU: the p95 of its 5 s windows stays under this share of its
-    # request. The request is what the scheduler guarantees Chrome against
-    # k6/the viewer (both now limited); a p95 under 80 % of it means Chrome
-    # never needed more than its guaranteed share, so the load generator
-    # could not have slowed a judged page (#831 gate M1). The 20 % margin
-    # covers the 5 s window averaging away sub-window bursts.
+    # Chrome's CPU p95 against this share of its request: REPORTED only, it
+    # never voids a run (Diego, browser-starvation ruling). The request is a
+    # scheduling reservation (guarded by k6_job.loadgen_fit); Chrome has no
+    # limit, so using more than it is not starvation. Starvation is MEASURED:
+    # see starvation() and load606.starvation_check.
     "max_browser_cpu_p95_share_of_request": 0.8,
     "min_cpu_windows": 3,
     # page loads that ended with a widget-error / widget-timeout state
@@ -194,9 +193,108 @@ def cpu_stats(recs: list[dict] | None) -> dict | None:
             "throttled_s_per_s_max": round(max(thr), 3) if thr else None}
 
 
+
+
+#: /proc/uptime prints centiseconds, truncated: a read can be up to 10 ms behind the instant
+UPTIME_RES_S = 0.01
+
+
+def _anchor(r: dict) -> tuple[float, float] | None:
+    """The interval the true realtime - boottime offset lies in, from one
+    tick-bracketed anchor (k6_job._cpu_sampler's `anchor`): realtime crossed
+    `epoch` between the uptime reads `uptime_lo` and `uptime`, each up to
+    UPTIME_RES_S behind its instant, so the offset is in
+    [epoch - uptime - UPTIME_RES_S, epoch - uptime_lo]. None if not recorded."""
+    if not all(r.get(k) is not None for k in ("epoch", "uptime", "uptime_lo")):
+        return None
+    e, u, lo = float(r["epoch"]), float(r["uptime"]), float(r["uptime_lo"])
+    return e - u - UPTIME_RES_S, e - min(lo, u)
+
+
+def starvation(o: dict | None, container: str = "browser") -> dict:
+    """The container's measured starvation evidence, per sample window:
+    `stall_s` (cgroup cpu.pressure "some": seconds during which at least one
+    of its runnable tasks waited for a CPU) and `saturated` (the NODE had not
+    one idle tick in the window: /proc/stat's idle + iowait did not move, to
+    its 10 ms tick, on any CPU). Windows are on the epoch (cpu_start's
+    anchor: the tick of `date +%s`, bracketed by two /proc/uptime reads).
+    `slack_s` is that bracket plus /proc/uptime's 10 ms resolution, the
+    anchor's whole error, measured per run (#1043 review B1, round 2): each
+    window is widened by it. cpu_end carries a second anchor: `clock_step_s`
+    is how far the two disagree past their brackets (a realtime step during
+    the drive; NTP slewing moves realtime and boottime alike, so a steady
+    clock reads 0). `pressure` / `node` / `anchored` / `end_anchored` say
+    whether each was MEASURED: a series that lacks it (one null sample
+    included) is unmeasured, never "not starved"."""
+    recs = ((o or {}).get("cpu") or {}).get(container) or []
+    start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    end = next((r for r in recs if r.get("kind") == "cpu_end"), {})
+    pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
+    pressure = bool(pts) and all(p.get("pressure_some_usec") is not None for p in pts)
+    node = bool(pts) and all(p.get("node_idle_ticks") is not None and p.get("node_busy_ticks") is not None
+                             for p in pts)
+    a0, a1 = _anchor(start), _anchor(end)
+    anchored = a0 is not None
+    off = float(start["epoch"]) - float(start["uptime"]) if anchored else 0.0
+    slack = max(0.0, float(start["uptime"]) - float(start["uptime_lo"])) + UPTIME_RES_S if anchored else None
+    # the two anchors' offset intervals: apart = the clock stepped by at least the gap
+    step = round(max(0.0, a1[0] - a0[1], a0[0] - a1[1]), 3) if anchored and a1 is not None else None
+    wins = []
+    for a, b in pairwise(pts):
+        dt = float(b["t"]) - float(a["t"])
+        if dt <= 0:
+            continue
+        w = {"t0": float(a["t"]) + off, "t1": float(b["t"]) + off}
+        if pressure:
+            w["stall_s"] = max(0, b["pressure_some_usec"] - a["pressure_some_usec"]) / 1e6
+            w["full_s"] = (max(0, b["pressure_full_usec"] - a["pressure_full_usec"]) / 1e6
+                           if a.get("pressure_full_usec") is not None and b.get("pressure_full_usec") is not None
+                           else None)
+        if node:
+            di = b["node_idle_ticks"] - a["node_idle_ticks"]
+            db = b["node_busy_ticks"] - a["node_busy_ticks"]
+            w["saturated"] = di <= 0 and db > 0
+            w["node_busy_share"] = round(db / (db + di), 4) if db + di > 0 else None
+        wins.append(w)
+    span = sum(w["t1"] - w["t0"] for w in wins)
+    return {"container": container, "pressure": pressure, "node": node, "anchored": anchored,
+            "end_anchored": a1 is not None, "clock_step_s": step,
+            "slack_s": slack, "node_cpus": start.get("node_cpus"), "windows": wins,
+            "stall_share": (round(sum(w["stall_s"] for w in wins) / span, 4) if pressure and span else None),
+            "saturated_windows": (sum(1 for w in wins if w["saturated"]) if node else None)}
+
+
+def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:
+    """At most how much of a page load (from epoch `start`, `wall_ms` long)
+    can have been the load generator waiting for a CPU: in each window it
+    overlaps (widened by the anchor's measured error, st["slack_s"]), at
+    most the window's stall, never more than the overlap itself; the WHOLE
+    overlap where the node had no idle tick. Capped at the load's own time."""
+    s0, s1 = start, start + wall_ms / 1000
+    slack = st.get("slack_s") or 0.0
+    total = 0.0
+    for w in st["windows"]:
+        overlap = min(s1, w["t1"] + slack) - max(s0, w["t0"] - slack)
+        if overlap <= 0:
+            continue
+        total += overlap if w.get("saturated") else min(w.get("stall_s") or 0.0, overlap)
+    return min(wall_ms, total * 1000)
+
+
+def covered(start: float, wall_ms: float, st: dict) -> bool:
+    """The load lies within the sampled span (its first window's start to
+    its last window's end, widened by the anchor's error): only there is its
+    stall measured (#1043 review B2)."""
+    if not st["windows"]:
+        return False
+    slack = st.get("slack_s") or 0.0
+    return st["windows"][0]["t0"] - slack <= start and start + wall_ms / 1000 <= st["windows"][-1]["t1"] + slack
+
+
 def cpu_check(o: dict | None, container: str, th: dict | None = None) -> dict:
-    """The browser container kept CPU headroom (K6_THRESHOLDS
-    max_browser_cpu_p95_share_of_request)."""
+    """The browser container's CPU p95 against K6_THRESHOLDS
+    max_browser_cpu_p95_share_of_request: a REPORT line (the run's report,
+    never its validity): usage above a reservation is not starvation."""
     th = dict(K6_THRESHOLDS, **(th or {}))
     st = cpu_stats(((o or {}).get("cpu") or {}).get(container))
     name = f"{container}.cpu_headroom"
@@ -478,13 +576,30 @@ def browser_navs(o: dict | None) -> list[dict]:
     (visit 1 = this session's first load of the route, 2 = warm)."""
     if o is None:
         return []
-    times = (o.get("times") or {}).get("browser_page_load_ms") or []
+    # each load's start is its own t0 tag (epoch ms: the page's performance.timeOrigin + navT0, or
+    # the driver's clock just before the action for a load that never settled): never the point's
+    # time minus its wall time, which lands a QUIET_MS and more after the load (#1043 review B1)
     return [{"kind": "nav", "nav": t.get("method"), "page": t.get("route"),
              "session": t.get("session"), "wall_ms": round(v, 1),
              "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0,
-             # the point is written when the load ends
-             **({"start": times[i] - v / 1000} if i < len(times) and times[i] else {})}
-            for i, (v, t) in enumerate(o["points"].get("browser_page_load_ms", []))]
+             "timeout": t.get("timeout") == "yes", "t0": t.get("t0"),
+             **({"start": int(t["t0"]) / 1000} if str(t.get("t0") or "").isdigit() else {})}
+            for v, t in o["points"].get("browser_page_load_ms", [])]
+
+
+def widget_timeouts_by_load(o: dict | None) -> tuple[dict, int]:
+    """({(session, t0): widget-timeout states}, how many such states carry no
+    t0): which load each widget-timeout state belongs to."""
+    out, unplaced = {}, 0
+    for v, t in ((o or {}).get("points") or {}).get("browser_widget_states", []):
+        if t.get("state") != "timeout":
+            continue
+        if not str(t.get("t0") or "").isdigit():
+            unplaced += 1
+            continue
+        k = (t.get("session"), t["t0"])
+        out[k] = out.get(k, 0) + 1
+    return out, unplaced
 
 
 def k6_page_loads(o: dict | None) -> list[tuple[float, float, dict]]:

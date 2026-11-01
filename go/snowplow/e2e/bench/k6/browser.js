@@ -114,8 +114,10 @@ async function settled (page, path) {
   return await page.evaluate(() => window.__benchLoad)
 }
 
-function record (r, tags) {
-  for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs)) METRICS[metric].add(value, t)
+// `actionAt`: the driver's clock (epoch ms) just before the action, the start of a load that never
+// settled (a settled load carries the page's own start)
+function record (r, tags, actionAt) {
+  for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
 }
 
 // #919: the /calls the page made since the last drain (pageload.callOf), as
@@ -218,6 +220,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const b = window.__bench
       b.armLogin = true; b.submitAt = performance.now(); b.signinMs = null
     })
+    const loginAt = Date.now()
     await page.locator('#basic_password').press('Enter')
     const first = await settled(page, null)
     const landed = first === null ? '(none)' : first.path
@@ -226,7 +229,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
-    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base))
+    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt)
     await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base))
     token = (await tokenOf(page)) || prevToken
     if (k > 0) {
@@ -242,6 +245,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const item = page.locator(`li.ant-menu-item[data-menu-id$="-${route}"]`)
       let method = 'click'
       await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
+      const actionAt = Date.now()
       await markStart(page)
       if (await item.isVisible()) {
         await item.click()
@@ -257,7 +261,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       }
       const r = await settled(page, route)
       const visit = visits[route] ? 'warm' : 'first'
-      record(r, Object.assign({ route, visit, method }, base))
+      record(r, Object.assign({ route, visit, method }, base), actionAt)
       await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base))
       visits[route] = (visits[route] || 0) + 1
       shown = route

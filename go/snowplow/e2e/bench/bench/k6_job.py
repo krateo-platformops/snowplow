@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 from bench import rbac_model
@@ -244,12 +245,29 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
     """The container's own CPU (#831 gate M1), from its cgroup: cpu.stat
     usage_usec / throttled_usec (v2; cpuacct.usage on v1), every CPU_SAMPLE_S,
     timed by /proc/uptime (sub-second), into /out/<prefix>-cpu.jsonl, framed
-    by cpu_start (request, limit) and cpu_end. POSIX sh: the k6 images are
-    Alpine (busybox), the python image Debian (dash)."""
+    by cpu_start (request, limit) and cpu_end.
+
+    And its STARVATION evidence (browser-starvation issue): the cgroup's
+    cpu.pressure "some" / "full" totals (v2 PSI: microseconds during which at
+    least one / every runnable task of the container waited for a CPU), and
+    the NODE's CPU from /proc/stat (not namespaced: the node's own busy and
+    idle ticks, sampled at the same instants). null where a file is
+    unreadable: a missing measure is recorded as missing. cpu_start carries
+    the node's CPU count and an epoch / uptime anchor that places the windows
+    against the page loads' wall-clock times: it waits for `date +%s` to tick
+    and brackets the tick between two /proc/uptime reads (`uptime_lo` before
+    the last `date` that still read the old second, `uptime` after the one
+    that read the new): the anchor's error is that bracket, measured per run
+    (#1043 review B1), not a second. cpu_end carries a second such anchor, so
+    a step of the realtime clock during the drive is seen (round 2); a `date`
+    that is missing or never ticks ends the wait, loudly, with null anchors.
+
+    POSIX sh: the k6 images are Alpine (busybox), the python image Debian
+    (dash)."""
     f = f"/out/{prefix}-cpu.jsonl"
     lim = _mcpu(limit) if limit else "null"
     return f"""cpu_sample() {{
-  u=; th=null
+  u=; th=null; ps=null; pf=null; nb=null; ni=null
   if [ -r /sys/fs/cgroup/cpu.stat ]; then
     while read -r k v; do
       case "$k" in usage_usec) u=$v ;; throttled_usec) th=$v ;; esac
@@ -257,8 +275,19 @@ def _cpu_sampler(prefix: str, request: str, limit: str | None) -> str:
   elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
     read -r n < /sys/fs/cgroup/cpuacct/cpuacct.usage; u=$((n / 1000))
   fi
+  # "some avg10=.. avg60=.. avg300=.. total=<usec>" / "full ..."
+  if [ -r /sys/fs/cgroup/cpu.pressure ]; then
+    while read -r k _ _ _ tot; do
+      case "$k" in some) ps=${{tot#total=}} ;; full) pf=${{tot#total=}} ;; esac
+    done < /sys/fs/cgroup/cpu.pressure
+  fi
+  # "cpu user nice system idle iowait irq softirq steal ...": busy and idle ticks, node-wide
+  if [ -r /proc/stat ]; then
+    read -r _ c1 c2 c3 c4 c5 c6 c7 c8 _ < /proc/stat
+    nb=$((c1 + c2 + c3 + c6 + c7 + c8)); ni=$((c4 + c5))
+  fi
   read -r up _ < /proc/uptime
-  [ -n "$u" ] && printf '{{"kind": "cpu", "t": %s, "usage_usec": %s, "throttled_usec": %s}}\\n' "$up" "$u" "$th" >> {f}
+  [ -n "$u" ] && printf '{{"kind": "cpu", "t": %s, "usage_usec": %s, "throttled_usec": %s, "pressure_some_usec": %s, "pressure_full_usec": %s, "node_busy_ticks": %s, "node_idle_ticks": %s}}\\n' "$up" "$u" "$th" "$ps" "$pf" "$nb" "$ni" >> {f}
 }}
 # the limit the kernel enforces (cgroup v2 cpu.max "<quota> <period>" or "max")
 cg=null
@@ -266,7 +295,28 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
   read -r q per < /sys/fs/cgroup/cpu.max
   [ "$q" != max ] && cg=$((q * 1000 / per))
 fi
-printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}}}\\n' "$cg" > {f}
+nc=null
+[ -r /proc/stat ] && nc=$(grep -c '^cpu[0-9]' /proc/stat)
+# the wall-clock anchor: wait for `date +%s` to tick, bracketed by two /proc/uptime reads; sets
+# an_ep an_up an_lo, or null with a loud line when no tick is seen (no `date`, or a clock that
+# does not move) by uptime's whole second + 3: at least 2 s, twice the tick's 1 s period
+anchor() {{
+  an_ep=null; an_up=null; an_lo=null
+  read -r lo _ < /proc/uptime; e0=$(date +%s 2>/dev/null) || e0=
+  if [ -z "$e0" ]; then echo "cpu sampler: no date +%s: the samples have no wall-clock anchor" >&2; return 0; fi
+  lim=$(( ${{lo%.*}} + 3 ))
+  while :; do
+    read -r ua _ < /proc/uptime; ep0=$(date +%s 2>/dev/null) || ep0=
+    [ -n "$ep0" ] && [ "$ep0" != "$e0" ] && break
+    if [ "${{ua%.*}}" -ge "$lim" ]; then
+      echo "cpu sampler: date +%s did not tick within 2 s: the samples have no wall-clock anchor" >&2; return 0
+    fi
+    lo=$ua
+  done
+  read -r an_up _ < /proc/uptime; an_ep=$ep0; an_lo=$lo
+}}
+anchor
+printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$an_ep" "$an_up" "$an_lo" > {f}
 ( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
 sampler=$!
 """
@@ -278,9 +328,12 @@ def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done",
     mark `done` (Ready = results final), linger for kubectl cp. `cpu` =
     (request, limit): sample the container's CPU while `cmd` runs."""
     head = _cpu_sampler(prefix, *cpu) if cpu else ""
+    # cpu_end carries the same anchor again: a realtime step during the drive shows as the two
+    # anchors' offsets disagreeing past their brackets (#1043 review, round 2)
     tail = (f"""kill "$sampler" 2>/dev/null
 cpu_sample
-printf '{{"kind": "cpu_end"}}\\n' >> /out/{prefix}-cpu.jsonl
+anchor
+printf '{{"kind": "cpu_end", "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$an_ep" "$an_up" "$an_lo" >> /out/{prefix}-cpu.jsonl
 """ if cpu else "")
     return f"""set -u
 {head}rc=0
@@ -554,3 +607,94 @@ spec:
       - name: out
         emptyDir: {{}}
 """
+
+
+# ─── the pre-drive PSI check (#1042) ────────────────────────────────────────
+#: what the starvation gate READS (#1043 review nits), as the browser's sampler reads it in a
+#: container of the same pool: the container cgroup's PSI (`some ... total=N`), the node's
+#: /proc/stat (`cpu ...` ticks), and /proc/self/cgroup reading `0::/` (cgroup v2 with a private
+#: cgroup namespace: cpu.pressure is the container's own, not a parent's)
+PSI_FILES = (("cgroup", "/sys/fs/cgroup/cpu.pressure", "^some "), ("node", "/proc/stat", "^cpu "),
+             ("cgroupns", "/proc/self/cgroup", ""))
+PSI_WANT = {"cgroup": r"^some .*\btotal=\d+", "node": r"^cpu( +\d+){7,}", "cgroupns": r"^0::/$"}
+
+
+def render_psi_check() -> str:
+    """Namespace bench-loadgen + the psi606 Job: one container on the LOADGEN
+    pool (the browser's node, the same pin) reports what the starvation gate
+    reads: its cgroup's cpu.pressure, the node's /proc/stat ticks, and
+    /proc/self/cgroup (0::/ = a private cgroup namespace, so cpu.pressure is
+    the container's own). Run before any drive time is spent (run606 s_psi):
+    without them every judged page load's starvation would be UNMEASURED."""
+    probe = "; ".join(
+        f'if [ -r {f} ] && l=$({"grep " + repr(rx) if rx else "head -n 1"} {f} | head -n 1) && [ -n "$l" ]; then '
+        f'printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": "%s"}}\\n\' "$l"; '
+        f'else printf \'{{"kind": "psi_file", "which": "{w}", "file": "{f}", "some": null}}\\n\'; fi'
+        for w, f, rx in PSI_FILES)
+    return f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench-loadgen
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: psi606
+  namespace: bench-loadgen
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+{_POOL}
+      containers:
+      - name: psi
+        image: {K6_IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          {probe}
+        resources:
+          requests: {{cpu: 50m, memory: 32Mi}}
+          limits: {{cpu: 50m, memory: 32Mi}}
+"""
+
+
+def psi_check(lines: list[str]) -> tuple[bool, str]:
+    """(readable, what was read): both PSI_FILES answered a "some ... total=N"
+    line. Anything else (a file missing, unreadable, no total, no answer at
+    all) is not readable, with the reason."""
+    import re
+    import json as _json
+    got = {}
+    for ln in lines:
+        try:
+            r = _json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("kind") == "psi_file":
+            got[r.get("which")] = r.get("some")
+    why = []
+    for w, f, _ in PSI_FILES:
+        v = got.get(w, "<no answer>")
+        if not (isinstance(v, str) and re.search(PSI_WANT[w], v.strip())):
+            why.append(f"{f}: {'unreadable' if v is None else v}")
+    return (not why, "; ".join(why) if why else "; ".join(f"{f}: {got[w]}" for w, f, _ in PSI_FILES))
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="bench.k6_job")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("psi-job", help="the psi606 Job (YAML, stdout)")
+    sub.add_parser("psi-check", help="read psi606's log on stdin: exit 0 if PSI is readable, 3 if not")
+    a = ap.parse_args(argv)
+    if a.cmd == "psi-job":
+        sys.stdout.write(render_psi_check())
+        return 0
+    ok, why = psi_check(sys.stdin.read().splitlines())
+    print(why)
+    return 0 if ok else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
