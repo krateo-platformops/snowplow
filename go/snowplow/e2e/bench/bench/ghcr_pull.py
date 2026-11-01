@@ -80,6 +80,7 @@ import base64
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import re
 import stat
@@ -131,7 +132,11 @@ PARSE_BOUND_S = RENDER_BOUND_S
 #: - The chart's own Chart.yaml + values.yaml, parsed in-process for the images its values name: all
 #:   of them together, 16 x the largest such total measured (`parsed`), the same rule (#1041 review
 #:   round 3, M1: within helm's own 5 MiB / 100 MiB, two 5 MiB values.yaml took 941 s and +496 MiB).
-#:   Counted before any of it is parsed, so a chart past it is refused without the parse. Probe
+#:   Counted before any of it is parsed, so a chart past it is refused without the parse.
+#: - The chart's tar MEMBERS (files and directories): each costs the walk a header and each
+#:   Chart.yaml / values.yaml a parse and a kept document, whatever its size (#1041 review round 4,
+#:   M1b: 2,000,000 empty values.yaml in a 9.4 MB blob took 69 s, +619 MiB): 16 x the largest real
+#:   chart's member count (`members`), the same rule, counted header by header. Probe
 #:   (2026-11-01, the review's shape `kN: {a: 1, b: [x, y]}`): the review's two 5 MiB values.yaml
 #:   are refused in 0.01 s, +1.7 MiB; just under the cap (2,260,389 B) parses in 2.9 s, +203 MiB
 #:   with libyaml, 10.3 s, +273 MiB without: inside PARSE_BOUND_S either way.
@@ -144,25 +149,28 @@ PARSE_BOUND_S = RENDER_BOUND_S
 #: 0.3.468 itself 363,138 / 833,982 / 1,622,254 / 32,104. Parsed in-process (Chart.yaml +
 #: values.yaml, all of a chart's, bytes; 2026-11-01): agentgateway-policies 0.2.18 141,293;
 #: agentgateway-controller 0.2.0 17,621; alert-provider 0.2.53 7,451; github-provider-kog 0.6.0 1,644;
-#: krateo-marketplace-catalog 0.1.2 681. tests/fixtures/ghcr_measured_0_3_468.json
+#: krateo-marketplace-catalog 0.1.2 681. Tar members (2026-11-01): github-provider-kog 0.6.0 125;
+#: agentgateway-policies 0.2.18 41; agentgateway-controller 0.2.0 30; alert-provider 0.2.53 8;
+#: krateo-marketplace-catalog 0.1.2 6. tests/fixtures/ghcr_measured_0_3_468.json
 #: holds that record, and a test pins REAL_LARGEST to it. Every run records its own under
 #: `measured`, and the preflight says so when one exceeds REAL_LARGEST (a stale input, #1041 R31).
 HELM_MAX_CHART, HELM_MAX_FILE = 100 * 1024 * 1024, 5 * 1024 * 1024
 REAL_LARGEST = {"blob": 363_138, "file": 1_041_093, "inflated": 2_753_178, "render": 2_665_855,
-                "parsed": 141_293}
+                "parsed": 141_293, "members": 125}
 RENDER_MARGIN = 16
 CHART_INFLATED_MAX = HELM_MAX_CHART
 CHART_FILE_MAX = HELM_MAX_FILE
 BLOB_MAX = HELM_MAX_CHART
 RENDER_OUT_MAX = RENDER_MARGIN * REAL_LARGEST["render"]
 CHART_PARSED_MAX = RENDER_MARGIN * REAL_LARGEST["parsed"]
+CHART_MEMBERS_MAX = RENDER_MARGIN * REAL_LARGEST["members"]
 CAPS = {"helm_max_chart": HELM_MAX_CHART, "helm_max_file": HELM_MAX_FILE, "render_margin": RENDER_MARGIN,
         "real_largest": REAL_LARGEST, "blob_max": BLOB_MAX, "chart_inflated_max": CHART_INFLATED_MAX,
         "chart_file_max": CHART_FILE_MAX, "render_out_max": RENDER_OUT_MAX,
-        "chart_parsed_max": CHART_PARSED_MAX}
+        "chart_parsed_max": CHART_PARSED_MAX, "chart_members_max": CHART_MEMBERS_MAX}
 #: a `measured` key -> the REAL_LARGEST input it is compared with
 MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated", "render": "render",
-                  "parsed": "parsed"}
+                  "parsed": "parsed", "members": "members"}
 #: the registry API. GHCR_API_URL may point it elsewhere (the suite's fake
 #: registry), over https only: the token is never sent in clear text.
 API = os.environ.get("GHCR_API_URL", "https://ghcr.io")
@@ -336,10 +344,16 @@ class _Refused(Exception):
 
 def _call(fn, bound_s: float, on_timeout=None):
     """fn() within `bound_s` of wall clock, WHOLE: the caller is answered at
-    the bound whatever fn is doing (a registry dripping its headers, a parse
-    that runs long). fn runs in a daemon thread; its socket reads wait at most
-    the bound each, so it ends too; `on_timeout` stops what it started (a
-    helm process). fn's own exception is raised here."""
+    the bound whatever fn is doing. A thread cannot be killed, so this bounds
+    the WAIT, not the work (#1041 review round 4): it is used only where the
+    work left after the bound is itself capped. A registry read (_read,
+    _blob): the thread only waits on its socket, each read at most the bound,
+    the total at most the call's byte cap (MANIFEST_MAX / BLOB_MAX, and
+    http.client's own header limits), CPU only per byte received; a daemon,
+    gone with the preflight. helm template: `on_timeout` kills helm and the
+    reading ends at its EOF. Work that is not capped that way (a YAML parse)
+    runs in a killed child instead (_in_child). fn's own exception is raised
+    here."""
     box: dict = {}
 
     def run():
@@ -527,6 +541,54 @@ def images_in_manifests(docs) -> list[str]:
     return sorted(out)
 
 
+#: a refusal for input nested past Python's recursion limit (a values.yaml 1,000 deep), named
+DEEP = "it nests deeper than Python's recursion limit"
+
+
+def _child_main(conn, fn_name: str, args: tuple) -> None:
+    """_in_child's other end: fn(*args), its answer (or its refusal) sent back."""
+    try:
+        conn.send(("ok", globals()[fn_name](*args)))
+    except _Refused as e:
+        conn.send(("refused", str(e)))
+    except RecursionError:
+        conn.send(("refused", DEEP))
+    except Exception as e:                  # noqa: BLE001 - reported to the caller, never lost
+        conn.send(("error", f"{type(e).__name__}: {str(e)[:300]}"))
+    finally:
+        conn.close()
+
+
+def _in_child(fn_name: str, args: tuple, bound_s: float, late: str):
+    """fn(*args) in a CHILD process (spawned), killed at `bound_s`: unlike a
+    thread (_call), the work itself ends at the bound, with its memory
+    (#1041 review round 4, M1b: an abandoned parse ran on for 57 s). The
+    answer comes back pickled; a child that dies without one is a refusal.
+    `late` is the refusal at the bound."""
+    ctx = multiprocessing.get_context("spawn")
+    rd, wr = ctx.Pipe(duplex=False)
+    pr = ctx.Process(target=_child_main, args=(wr, fn_name, args), daemon=True)
+    pr.start()
+    wr.close()
+    try:
+        if not rd.poll(bound_s):
+            raise _Refused(late)
+        try:
+            kind, v = rd.recv()
+        except (EOFError, OSError):
+            raise _Refused(f"its reader ended with no answer (exit {pr.exitcode})") from None
+        except RecursionError:
+            raise _Refused(DEEP) from None
+    finally:
+        if pr.is_alive():
+            pr.kill()
+        pr.join()
+        rd.close()
+    if kind != "ok":
+        raise _Refused(v)
+    return v
+
+
 #: how much of helm's stderr is read: its last line is the reason
 STDERR_TAIL = 4096
 
@@ -541,9 +603,10 @@ def _tail(fh, n: int = STDERR_TAIL) -> str:
 
 def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict | None = None) -> list:
     """`helm template` of the chart `data` with `values`: its manifests. The
-    WHOLE of it within RENDER_BOUND_S (_call): helm run, its stdout read
-    streamed and capped at RENDER_OUT_MAX, then parsed; past the bound helm
-    is killed. Raises _Refused with helm's own reason when it cannot render.
+    WHOLE of it within RENDER_BOUND_S: helm run and its stdout read streamed
+    and capped at RENDER_OUT_MAX (_call; past the bound helm is killed, and
+    the reading ends with it), then parsed in a child process killed at what
+    is left of the bound (_in_child: the parse stops, not only the wait). Raises _Refused with helm's own reason when it cannot render.
     The chart (never a credential) is written to a private temporary
     directory removed at once; the values go on stdin, stderr to a file."""
     import yaml
@@ -589,16 +652,25 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
             raise _Refused(f"helm template failed: {why[:300]}")
         if unread:
             raise _Refused("helm template exited without reading its values")
-        try:
-            return [x for x in yaml.safe_load_all(out.decode()) if x is not None]
-        except (yaml.YAMLError, UnicodeDecodeError) as e:
-            raise _Refused(f"helm template rendered no YAML: {str(e).splitlines()[0][:200]}") from None
+        return bytes(out)
+    late = f"helm template did not finish within its {RENDER_BOUND_S:g} s bound"
+    t0 = time.monotonic()
     try:
-        return _call(run, RENDER_BOUND_S, on_timeout=kill)
+        out = _call(run, RENDER_BOUND_S, on_timeout=kill)
     except _Refused as e:
         if str(e).startswith("no whole answer"):
-            raise _Refused(f"helm template did not finish within its {RENDER_BOUND_S:g} s bound") from None
+            raise _Refused(late) from None
         raise
+    return _in_child("_parse_manifests", (out,), max(0.0, RENDER_BOUND_S - (time.monotonic() - t0)), late)
+
+
+def _parse_manifests(out: bytes) -> list:
+    """helm template's output as documents (run in a child: render)."""
+    import yaml
+    try:
+        return [x for x in yaml.load_all(out.decode(), Loader=_yaml_loader()) if x is not None]  # noqa: S506
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise _Refused(f"helm template rendered no YAML: {str(e).splitlines()[0][:200]}") from None
 
 
 def render_images(data: bytes, name: str, values: dict, helm: str = "helm") -> list[str]:
@@ -741,15 +813,19 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
         if len(layers) != 1:
             raise _Refused(f"{len(layers)} helm chart layers in its manifest")
         data = _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer)
-        try:
-            charts, vals, inflated, largest, parsed = _call(lambda: read_chart_files(data), PARSE_BOUND_S)
-        except _Refused as e:
-            if str(e).startswith("no whole answer"):
-                raise _Refused(f"its chart files were not read within their {PARSE_BOUND_S:g} s bound") from None
-            raise
+        charts, vals, inflated, largest, parsed, members = _in_child(
+            "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
+            f"its chart files were not read within their {PARSE_BOUND_S:g} s bound")
         if not charts:
             raise _Refused("no Chart.yaml in its chart layer")
-        out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed}
+        out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
+                           "members": members}
+        try:
+            return walk(charts, vals, data)
+        except RecursionError:
+            raise _Refused(DEEP) from None
+
+    def walk(charts, vals, data):
         imgs = set()
         for d, v in vals.items():
             c = charts.get(d) or {}
@@ -782,7 +858,13 @@ def _yaml_loader():
     return getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
-def read_chart_files(data: bytes) -> tuple[dict, dict, int, int, int]:
+def chart_caps() -> dict:
+    """The caps read_chart_files applies, as this process holds them (passed to its child)."""
+    return {"inflated": CHART_INFLATED_MAX, "file": CHART_FILE_MAX, "parsed": CHART_PARSED_MAX,
+            "members": CHART_MEMBERS_MAX}
+
+
+def read_chart_files(data: bytes, caps: dict | None = None) -> tuple[dict, dict, int, int, int, int]:
     """(Chart.yaml by dir, values.yaml by dir, bytes inflated, largest file,
     bytes parsed) of a chart blob. The tar is walked header by header,
     streamed, stopping at the first cap passed; the headers never accumulate
@@ -791,10 +873,13 @@ def read_chart_files(data: bytes) -> tuple[dict, dict, int, int, int]:
     parsed: a chart past it is refused before any parse. Memory: the blob,
     those raw bytes (at most CHART_PARSED_MAX) and their parsed documents
     (structured YAML costs about 100 bytes per byte parsed: +203 MiB at the
-    cap, the probe in the caps comment). The caller runs this under
-    PARSE_BOUND_S (chart_images)."""
+    cap, the probe in the caps comment), and every member counts against
+    CHART_MEMBERS_MAX as its header is read: an empty file costs a walk and
+    a parse too (round 4, M1b). The caller runs this in a child process
+    killed at PARSE_BOUND_S (chart_images, _in_child). `caps`: chart_caps()."""
     import yaml
-    charts, vals, inflated, largest, parsed = {}, {}, 0, 0, 0
+    cap = caps or chart_caps()
+    charts, vals, inflated, largest, parsed, members = {}, {}, 0, 0, 0, 0
     raw = []
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         while True:
@@ -802,28 +887,34 @@ def read_chart_files(data: bytes) -> tuple[dict, dict, int, int, int]:
             if m is None:
                 break
             tf.members = []
+            members += 1
+            if members > cap["members"]:
+                raise _Refused(f"its chart has more than its {cap['members']} member cap "
+                               f"({RENDER_MARGIN} x the largest real chart's)")
             inflated += max(0, m.size)
             largest = max(largest, m.size if m.isfile() else 0)
-            if inflated > CHART_INFLATED_MAX:
-                raise _Refused(f"its chart inflates past {CHART_INFLATED_MAX} bytes")
+            if inflated > cap["inflated"]:
+                raise _Refused(f"its chart inflates past {cap['inflated']} bytes")
             d, _, base = m.name.rpartition("/")
             if m.isfile() and base in ("Chart.yaml", "values.yaml"):
-                if m.size > CHART_FILE_MAX:
+                if m.size > cap["file"]:
                     raise _Refused(f"{m.name} inflates to {m.size} bytes, past helm's own "
-                                   f"{CHART_FILE_MAX} byte file limit")
+                                   f"{cap['file']} byte file limit")
                 parsed += max(0, m.size)
-                if parsed > CHART_PARSED_MAX:
+                if parsed > cap["parsed"]:
                     raise _Refused(f"its Chart.yaml and values.yaml files come to more than its "
-                                   f"{CHART_PARSED_MAX} byte parse cap ({RENDER_MARGIN} x the largest real total)")
-                raw.append((d, base, tf.extractfile(m).read(CHART_FILE_MAX + 1)))
+                                   f"{cap['parsed']} byte parse cap ({RENDER_MARGIN} x the largest real total)")
+                raw.append((d, base, tf.extractfile(m).read(cap["file"] + 1)))
     loader = _yaml_loader()
     for d, base, body in raw:
         try:
             doc = yaml.load(body, Loader=loader) or {}      # noqa: S506 - a safe loader (_yaml_loader)
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise _Refused(f"{d + '/' if d else ''}{base} is not YAML: {str(e).splitlines()[0][:200]}") from None
+        except RecursionError:
+            raise _Refused(f"{d + '/' if d else ''}{base}: {DEEP}") from None
         (charts if base == "Chart.yaml" else vals)[d] = doc
-    return charts, vals, inflated, largest, parsed
+    return charts, vals, inflated, largest, parsed, members
 
 
 def stale_inputs(charts: list[dict]) -> list[dict]:

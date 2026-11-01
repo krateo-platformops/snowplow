@@ -32,7 +32,7 @@ import yaml
 from bench import ghcr_pull
 from tests.conftest import (FAKE_CHART_BAD_DIGEST, FAKE_CHART_BIG_MANIFEST, FAKE_CHART_BLOB_OVER_SIZE,
                             FAKE_CHART_DRIP, FAKE_CHART_HEADER_DRIP, FAKE_CHART_HOP_UNRENDERED, FAKE_CHART_HTTP_BLOB,
-                            FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer)
+                            FAKE_CHART_DEEP, FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer)
 
 HELM = os.environ["FAKE_HELM_TEMPLATE_BIN"]
 AGW = "oci://ghcr.io/krateo-agentiko/charts"
@@ -181,7 +181,9 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
         ("imagePullSecrets", "ok", ["ghcr.io/krateo-platformops/alert-provider:0.2.53"])]
     assert pf["caps"]["chart_inflated_max"] == pf["caps"]["blob_max"] == 100 * 1024 * 1024
     assert pf["caps"]["chart_file_max"] == 5 * 1024 * 1024
-    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "parsed", "render"} for c in pf["charts"])
+    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "parsed", "members", "render"}
+               for c in pf["charts"])
+    assert pf["caps"]["chart_members_max"] == 16 * ghcr_pull.REAL_LARGEST["members"] == 2000
     assert pf["caps"]["chart_parsed_max"] == 16 * ghcr_pull.REAL_LARGEST["parsed"]
     assert pf["stale_inputs"] == []                    # the fakes are far inside every real measurement
     # the images: read from the pinned chart's own values (an empty tag = its appVersion), each
@@ -430,8 +432,10 @@ def test_a_render_that_does_not_finish_is_bounded(monkeypatch, tmp_path):
     slow.write_text(f"#!/bin/sh\necho $$ > {pid}\nexec sleep 30\n")
     slow.chmod(0o755)
     monkeypatch.setattr(ghcr_pull, "RENDER_BOUND_S", 1.0)
+    t0 = time.monotonic()
     r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, str(slow))
     assert r["render_error"] == "helm template did not finish within its 1 s bound"
+    assert time.monotonic() - t0 < 10                    # answered at the bound, not after helm's 30 s
     time.sleep(0.5)
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid.read_text()), 0)
@@ -522,7 +526,7 @@ def _many_member_chart(n):
 def _walk_peak(data):
     import tracemalloc
     tracemalloc.start()
-    out = ghcr_pull.read_chart_files(data)
+    out = ghcr_pull.read_chart_files(data, dict(ghcr_pull.chart_caps(), members=10 ** 9))
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     return out, peak
@@ -534,7 +538,7 @@ def test_a_chart_of_many_members_is_walked_in_constant_memory():
     (about 420 B each); walked one at a time they add nearly nothing. A
     difference, not an absolute bound, so other threads' allocations do not
     count."""
-    (charts, vals, _, _, _), small = _walk_peak(_many_member_chart(10_000))
+    (charts, vals, _, _, _, _), small = _walk_peak(_many_member_chart(10_000))
     _, large = _walk_peak(_many_member_chart(100_000))
     assert charts["c"]["name"] == "c" and vals["c"] == {"a": 1}
     assert large - small < 90_000 * 420 // 4, (small, large)
@@ -825,20 +829,15 @@ def test_a_chart_over_its_parse_cap_is_refused_through_chart_images(monkeypatch)
 
 
 def test_the_chart_files_are_read_within_their_own_bound(monkeypatch):
-    """Round 3, M1: the tar walk and the parse run WHOLE under PARSE_BOUND_S
-    (_call), and that bound is counted in the step's."""
+    """Rounds 3-4, M1/M1b: the tar walk and the parse run WHOLE in a child
+    killed at PARSE_BOUND_S (counted in the step's bound): a bound no child
+    can answer within is the refusal, at once."""
     import time
-    real = ghcr_pull.read_chart_files
-
-    def slow(data):
-        time.sleep(3)
-        return real(data)
-    monkeypatch.setattr(ghcr_pull, "read_chart_files", slow)
-    monkeypatch.setattr(ghcr_pull, "PARSE_BOUND_S", 0.5)
+    monkeypatch.setattr(ghcr_pull, "PARSE_BOUND_S", 0.001)
     t0 = time.monotonic()
     r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
-    assert r["error"] and "its chart files were not read within their 0.5 s bound" in r["error"], r
-    assert time.monotonic() - t0 < 2.5
+    assert r["error"] and "its chart files were not read within their 0.001 s bound" in r["error"], r
+    assert time.monotonic() - t0 < 5
 
 
 def test_the_render_reads_only_the_tail_of_helms_stderr(tmp_path):
@@ -902,3 +901,76 @@ def test_a_measurement_over_its_input_is_reported_not_refused():
     at = [dict(charts[0], measured={k: ghcr_pull.REAL_LARGEST[ghcr_pull.MEASURED_INPUT[k]]
                                     for k in ghcr_pull.MEASURED_INPUT})]
     assert ghcr_pull.stale_inputs(at) == []                # AT the input is not over it
+
+
+
+# ── #1041 review round 4 ──────────────────────────────────────────────────
+
+def _empty_values_chart(n):
+    """The review's M1b shape: n EMPTY charts/sN/values.yaml (no byte to count)."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        ti = tarfile.TarInfo("c/Chart.yaml")
+        body = b"apiVersion: v2\nname: c\nversion: 1.0.0\n"
+        ti.size = len(body)
+        tf.addfile(ti, io.BytesIO(body))
+        for i in range(n):
+            tf.addfile(tarfile.TarInfo(f"c/charts/s{i}/values.yaml"), io.BytesIO(b""))
+    return buf.getvalue()
+
+
+def test_zero_byte_files_are_counted_by_the_member_cap():
+    """Round 4, M1b: 2,000,000 empty values.yaml (parsed = 38 B) took 69 s
+    and +619 MiB. Every member counts against 16 x the largest real chart's
+    member count (125, github-provider-kog 0.6.0), header by header: refused
+    as soon as the cap is passed, not after the walk."""
+    import time
+    data = _empty_values_chart(200_000)
+    t0 = time.monotonic()
+    with pytest.raises(ghcr_pull._Refused, match=r"more than its 2000 member cap \(16 x the largest real chart's\)"):
+        ghcr_pull.read_chart_files(data)
+    assert time.monotonic() - t0 < 2
+    assert ghcr_pull.CHART_MEMBERS_MAX == 16 * 125
+    # at the cap it is read: the cap is the rule, not the shape
+    charts, vals, _, _, parsed, members = ghcr_pull.read_chart_files(_empty_values_chart(1999))
+    assert (members, parsed, len(vals)) == (2000, 38, 1999)
+
+
+def test_the_member_cap_reaches_the_reader_through_chart_images(monkeypatch):
+    monkeypatch.setattr(ghcr_pull, "CHART_MEMBERS_MAX", 3)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["error"] and "more than its 3 member cap" in r["error"], r
+
+
+def test_a_parse_past_its_bound_leaves_no_work_running():
+    """Round 4, M1b: the bound stops the WORK, not only the wait. A parse
+    that needs seconds (just under the parse cap) given 0.5 s: the answer
+    comes at the bound, and its child is gone with it: no process, no CPU
+    left running (a thread under _call ran on for 57 s)."""
+    import multiprocessing
+    import time
+    data = _yaml_heavy_chart((ghcr_pull.CHART_PARSED_MAX - 400) // 2)
+    t0 = time.monotonic()
+    with pytest.raises(ghcr_pull._Refused, match="^late$"):
+        ghcr_pull._in_child("read_chart_files", (data, ghcr_pull.chart_caps()), 0.5, "late")
+    assert time.monotonic() - t0 < 2
+    assert multiprocessing.active_children() == []
+    # given its time, the same child answers whole
+    out = ghcr_pull._in_child("read_chart_files", (data, ghcr_pull.chart_caps()), 120, "late")
+    assert out[4] <= ghcr_pull.CHART_PARSED_MAX and multiprocessing.active_children() == []
+
+
+def test_a_values_file_nested_past_the_recursion_limit_is_a_named_refusal():
+    """Round 4 (info): a values.yaml nested 1,000 deep made RecursionError
+    escape chart_images (a traceback). It is a named refusal."""
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", FAKE_CHART_DEEP, FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["error"] and ghcr_pull.DEEP in r["error"], r
+
+
+def test_a_child_that_dies_or_fails_is_a_refusal_never_a_hang():
+    with pytest.raises(ghcr_pull._Refused, match="^helm template rendered no YAML: "):
+        ghcr_pull._in_child("_parse_manifests", (b"\xff\xfe",), 60, "late")
+    with pytest.raises(ghcr_pull._Refused, match="^KeyError"):
+        ghcr_pull._in_child("_no_such_reader", (), 60, "late")

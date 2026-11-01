@@ -9,6 +9,7 @@
     "largest_file": 284927,
     "inflated": 363923,
     "parsed": 681,
+    "members": 6,
     "render": 390039
    }
   },
@@ -20,6 +21,7 @@
     "largest_file": 15708,
     "inflated": 386177,
     "parsed": 1644,
+    "members": 125,
     "render": 361843
    }
   },
@@ -31,6 +33,7 @@
     "largest_file": 10094,
     "inflated": 31001,
     "parsed": 7451,
+    "members": 8,
     "render": 15495
    }
   },
@@ -42,6 +45,7 @@
     "largest_file": 1041093,
     "inflated": 2753178,
     "parsed": 17621,
+    "members": 30,
     "render": 2665855
    }
   },
@@ -53,6 +57,7 @@
     "largest_file": 141400,
     "inflated": 593530,
     "parsed": 141293,
+    "members": 41,
     "render": 99113
    }
   },

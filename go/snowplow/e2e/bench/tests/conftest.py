@@ -77,6 +77,9 @@ FAKE_CHART_HEADER_DRIP = "8.8.8"
 # installer never sets: the pull secret injected at uiTokenHop.image.pullSecrets reaches no pod
 # (#1041 review F4)
 FAKE_CHART_HOP_UNRENDERED = "1.1.1"
+# FAKE_CHART_DEEP: a chart whose values.yaml nests 1,000 deep (2 KB; #1041 review round 4): past
+# Python's recursion limit for the preflight's walks, a named refusal, never a traceback
+FAKE_CHART_DEEP = "2.2.2"
 FAKE_CHART_VALUES = {
     # the two private hops, as run 19's dry pass found them: certReplayHop's image is in the values;
     # uiTokenHop is OFF in the chart's own values and names no image there: the installer turns it on
@@ -234,7 +237,8 @@ def _fake_ghcr():
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             files = [("Chart.yaml", {"apiVersion": "v2", "name": chart, "version": version, "appVersion": version}),
-                     ("values.yaml", FAKE_CHART_VALUES.get(chart, {}))]
+                     ("values.yaml", FAKE_CHART_VALUES.get(chart, {}) if version != FAKE_CHART_DEEP
+                      else "a: " + "{a: " * 1000 + "1" + "}" * 1000 + "\n")]
             tpls = dict(FAKE_CHART_TEMPLATES.get(chart) or {})
             if chart == "agentgateway-policies" and version == FAKE_CHART_HOP_UNRENDERED:
                 tpls["templates/ui-token-hop.yaml"] = tpls["templates/ui-token-hop.yaml"].replace(
