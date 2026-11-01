@@ -89,7 +89,6 @@ DRIVER_PENDING_S="${DRIVER_PENDING_S:-$(python3 -c 'from bench import load606; p
 LOG_STREAM_RETRY_S="${LOG_STREAM_RETRY_S:-5}"   # snowplow log stream: reconnect pause
 MEM_STOP_WAIT_S="${MEM_STOP_WAIT_S:-180}"       # collect: mem606 writes its final stream
 MEASURE_STARTED=0
-COLLECTED=0
 SCALE="${SCALE:-50000}"
 USERS="${USERS:-1000}"
 NAMESPACES="${NAMESPACES:-50}"
@@ -312,6 +311,13 @@ unset BENCH_ALLOW_NON_GKE
 PW="$(python3 -c 'from bench.load606 import SCALEUSER_PASSWORD as p; print(p)')"
 
 mkdir -p "$OUT"
+# #1051: what collect and evaluate COMPLETED, as files: collect runs under
+# `capped`, a subshell, so a shell variable set there never reached the
+# teardown (a failure after "run complete" re-collected from the cluster as
+# it was then and overwrote verdict.json). A previous run's marks never count.
+COLLECTED_MARK="$OUT/.collected"
+VERDICT_MARK="$OUT/.verdict-final"
+rm -f "$COLLECTED_MARK" "$VERDICT_MARK"
 # The record of every failing bench command (record_failure): present from
 # the start, so an empty file reads "none failed" and a missing one is a
 # missing record, never zero (evaluate reads it like every other stream).
@@ -424,7 +430,16 @@ teardown() {
       # after-record, snowplow logs) and computes a verdict over whatever was
       # collected. Run 8 lost the driver log, the heap profiles and the
       # snowplow logs this way.
-      if [[ "${MEASURE_STARTED:-0}" == "1" && "${COLLECTED:-0}" != "1" ]]; then
+      # #1051: once the run has its verdict, teardown never re-collects nor
+      # re-evaluates: the failure is its own outcome beside the intact verdict.
+      # Collected but not evaluated: the verdict is computed from what was
+      # collected, nothing is read again.
+      if [[ "${MEASURE_STARTED:-0}" == "1" && -f "$VERDICT_MARK" ]]; then
+        log "failed after the verdict (exit ${rc}): $OUT/verdict.json stands; nothing is re-collected or re-evaluated"
+      elif [[ "${MEASURE_STARTED:-0}" == "1" && -f "$COLLECTED_MARK" ]]; then
+        log "failed after collect (exit ${rc}): computing the verdict from what was collected before teardown"
+        capped "$COLLECT_CAP_S" "evaluate" s_evaluate
+      elif [[ "${MEASURE_STARTED:-0}" == "1" ]]; then
         log "measure FAILED or interrupted (exit ${rc}): collecting partial results before teardown"
         capped "$COLLECT_CAP_S" "partial collect" collect_and_evaluate
       fi
@@ -1800,7 +1815,7 @@ s_collect() {
   # the menu classes' identities again (s_classes deleted them already)
   fresh_classes_cleanup
   menu_classes_cleanup
-  COLLECTED=1
+  : > "$COLLECTED_MARK"      # #1051: survives capped's subshell
   log "collected: $(cd "$OUT" && ls nav-*.jsonl fresh-*.jsonl mem-*.jsonl pod-after.jsonl snowplow.log 2>/dev/null | tr '\n' ' ')heap=$(ls "$OUT/heap" 2>/dev/null | wc -l | tr -d ' ')"
 }
 # mem_stop <pod>: ask mem606 for its final stream and wait until its wrapper
@@ -1854,6 +1869,7 @@ s_evaluate() {
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
       ${k6args[@]+"${k6args[@]}"} "${apfargs[@]}" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
+  : > "$VERDICT_MARK"        # #1051: the verdict is final; teardown never recomputes it
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
   # 9's zero navigations surfaced only as `warm_navs 0`).
   local r
@@ -1894,3 +1910,6 @@ step measure   s_measure
 step collect   capped "$COLLECT_CAP_S" "collect" s_collect
 step evaluate  s_evaluate
 log "run complete: $OUT"
+# test hook (#1051), like BENCH_606_FAIL_AT=<step>: a failure after the verdict,
+# as any step after evaluate would fail
+if [[ "$FAIL_AT" == "complete" ]]; then log "injected failure after run complete"; exit 1; fi
