@@ -130,12 +130,14 @@ def _flag_value(args: list) -> tuple[bool, str | None]:
     return present, value
 
 
-def _container_env(c: dict, configmaps: dict) -> tuple[str | None, str]:
-    """(value, where) of ENV as the container sees it: env (last wins,
-    valueFrom configMapKeyRef resolved) shadows envFrom (last source wins,
-    prefix applied). (None, ...) when it is not set."""
+def _container_env(c: dict, configmaps: dict, name: str = ENV) -> tuple[str | None, str]:
+    """(value, where) of the variable `name` (the cdc's ENV unless named; #1004
+    reads snowplow's DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS with it) as the
+    container sees it: env (last wins, valueFrom configMapKeyRef resolved)
+    shadows envFrom (last source wins, prefix applied). (None, ...) when it is
+    not set."""
     for e in reversed(c.get("env") or []):
-        if e.get("name") != ENV:
+        if e.get("name") != name:
             continue
         if "value" in e:
             return str(e.get("value") or ""), "env"
@@ -143,26 +145,26 @@ def _container_env(c: dict, configmaps: dict) -> tuple[str | None, str]:
         if ref:
             data = configmaps.get(ref.get("name"))
             if data is None:
-                raise LookupError(f"env {ENV} valueFrom ConfigMap {ref.get('name')} was not read")
+                raise LookupError(f"env {name} valueFrom ConfigMap {ref.get('name')} was not read")
             return str(data.get(ref.get("key"), "")), f"env valueFrom ConfigMap {ref.get('name')}"
-        raise LookupError(f"env {ENV} comes from a source the gate does not read ({sorted(e.get('valueFrom') or {})})")
+        raise LookupError(f"env {name} comes from a source the gate does not read ({sorted(e.get('valueFrom') or {})})")
     for ef in reversed(c.get("envFrom") or []):
         prefix = ef.get("prefix") or ""
-        if not ENV.startswith(prefix):
+        if not name.startswith(prefix):
             continue
         if ef.get("secretRef"):
             # a later source wins, and the gate never reads Secrets: this one may carry the key
             raise LookupError(f"envFrom Secret {(ef['secretRef'] or {}).get('name')} may set "
-                              f"{ENV[len(prefix):]}, and the gate does not read Secrets")
-        name = (ef.get("configMapRef") or {}).get("name")
-        if not name:
+                              f"{name[len(prefix):]}, and the gate does not read Secrets")
+        cm = (ef.get("configMapRef") or {}).get("name")
+        if not cm:
             continue
-        data = configmaps.get(name)
+        data = configmaps.get(cm)
         if data is None:
-            raise LookupError(f"envFrom ConfigMap {name} was not read")
-        key = ENV[len(prefix):]
+            raise LookupError(f"envFrom ConfigMap {cm} was not read")
+        key = name[len(prefix):]
         if key in data:
-            return str(data[key]), f"envFrom ConfigMap {name}" + (f" (prefix {prefix})" if prefix else "")
+            return str(data[key]), f"envFrom ConfigMap {cm}" + (f" (prefix {prefix})" if prefix else "")
     return None, ""
 
 

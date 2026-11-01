@@ -36,7 +36,7 @@ WHAT IT CREATES (all removed by `cleanup`, the cluster's deletion the backstop):
     COMPOSITION_APPLY_WORKERS at a time, as the data step applies them;
   - RESTAction bench-fullwiden-probe (bench-ns-01): one stage, a GET of ONE
     stage object (the stage's read: it makes snowplow register the GVR through
-    the informer dispatch, objects are small, and every read is one dispatch);
+    the informer dispatch, and its objects are small);
   - its own identity (authn User + password Secret, group bench-fullwiden)
     and a ClusterRole + binding: get/list/watch on the stage's objects, get on
     the probe RESTAction; nothing else;
@@ -44,19 +44,30 @@ WHAT IT CREATES (all removed by `cleanup`, the cluster's deletion the backstop):
     (this file, load606.py, store_rebuild.py).
 
 THE READ. GET /call on the probe RESTAction with extras {"bench1004_read": n},
-n new on every read: the extras fold into the L1 key (cache.ComputeKey), so
-no read is an L1 hit and each one dispatches the stage's GET. A read "moved"
-a fall-through cell when snowplow_apiserver_fallthrough_cells for the stage's
-GVR changed between the /debug/vars read just before it and the one just after.
+n new on every read: the extras fold into the RESTAction's L1 key
+(cache.ComputeKey), so no read is an RA-level hit. The api stage's CONTENT cell
+is keyed by (gvr, namespace, name) and is shared across reads, so a read does
+NOT always dispatch the stage's GET: once the cell is filled (only after an
+informer serve) a read can be served from it. During a relist the cell is
+dirty-marked, not evicted, and served until the refresher's failed refill makes
+it known-stale, from where reads fall through (#547's known-stale
+read-through): the relist end's "serves again" relies on that read-through.
+A read "moved" a fall-through cell when snowplow_apiserver_fallthrough_cells
+for the stage's GVR changed between the /debug/vars read just before it and
+the one just after.
 
-THE PHASES (in the Job, `watch`), each bounded by the mechanism's bound:
+THE PHASES (in the Job, `watch`), each bounded:
   register  read until the GVR is registered (snowplow_plurals_registered_gvrs)
             and one read returned 200 and moved NONE of the GVR's fall-through
             cells: the live copy serves (registration alone could be a copy
-            still listing; #1004 ruling Q4). Then the snapshot the deltas start
-            from, and /out/armed.
-  settle    the operator applies the widened CRD; one read + /debug/vars a
-            SAMPLE_S until the build's END (rulings Q1/Q2):
+            still listing; #1004 ruling Q4). A cold LIST of N objects: bounded
+            by ROLLOUT_TIMEOUT_S (the register bound). Then the snapshot the
+            deltas start from, and /out/armed.
+  armed     the operator applies the widened CRD, then writes /out/widened;
+            bounded by the widen wait (the operator's poll, its apply, its exec).
+  settle    from the moment /out/widened is seen (the bound's clock starts at
+            the widen, so a post-sync timeout is named as itself), one read +
+            /debug/vars a SAMPLE_S until the build's END (rulings Q1/Q2):
               build_and_swap  the stage GVR's own outcome in
                               snowplow_store_swaps_by_gvr moved by >= 1 since
                               armed, and known_stale_keys_open[schema] and
@@ -68,12 +79,22 @@ THE PHASES (in the Job, `watch`), each bounded by the mechanism's bound:
                               (servable again, as a customer sees it).
             Bound reached first: recorded as the outcome, never a pass (Q3).
 THE BOUNDS (Q3, `bounds`): relist = max(relistPostSyncWait, the live snowplow
-Deployment's DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS, else its default) + one
-sample: snowplow's own give-ups, past which its end cannot come.
+Deployment's DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS as its container sees it (env,
+valueFrom or envFrom: the chart sets it through envFrom configMapRef; read
+with origin_gate._container_env), else its default) + one sample: snowplow's
+own give-ups, past which its end cannot come.
 build_and_swap has no snowplow bound (every build ends on an event,
 store_swap.go): ROLLOUT_TIMEOUT_S, the bench's bound for snowplow listing and
 syncing everything it serves at boot; the stage's copy is one GVR of the
 run's composition count.
+
+ATTRIBUTION (Q2). snowplow_crd_discovery's counters are process-wide: the rows
+are the stage's only when every schema relist between armed and the end was
+the stage's CRD's. Both tags log cache.crd_discovery.schema_relist with the
+CRD's name; the stage's scrubbed snowplow log (logscrub hashes the name) is
+read for it, and the result is refused (FAIL, never PASS) when another CRD's
+relist landed in the window, when the log names fewer of the stage's own than
+Δschema_relists_fired, or when the log was not read.
 
 STDLIB ONLY at import: the Job imports this module with load606.py and
 store_rebuild.py beside it (bench/ in its ConfigMap). The renderers that need
@@ -116,6 +137,7 @@ SRC_DIR = "/opt/fullwiden"
 STREAM = "/out/widen.jsonl"
 ARMED = "/out/armed"
 EXITED = "/out/exited"
+WIDENED = "/out/widened"     # written by the operator after the widened CRD is applied
 # The Job's read cadence: accept1126's settle (one /debug/vars a second). #918
 # measured a 20-35 s rebuild window at 50K: 15 s (mem606's) would see one or two
 # samples of it and could miss the heap peak.
@@ -237,7 +259,7 @@ def identity_docs(user: str, password: str) -> list[dict]:
 
 
 def job_yaml(*, snowplow_url: str, authn_url: str, user: str, password: str, bounds: dict,
-             linger_s: float, sample_s: float = SAMPLE_S) -> str:
+             linger_s: float, widen_wait_s: float, sample_s: float = SAMPLE_S) -> str:
     """The fullwiden606 Job and its ConfigMap (this file, load606.py and
     store_rebuild.py under bench/, so `python3 -m bench.full_widen` imports
     them as on the host). Framed like mem606: the wrapper appends its exit
@@ -255,7 +277,8 @@ cd {SRC_DIR}
 python3 -u -m bench.full_widen watch \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --user {json.dumps(user)} --password {json.dumps(password)} \\
-  --bounds {json.dumps(json.dumps(bounds, sort_keys=True))} --sample-s {sample_s:g} || rc=$?
+  --bounds {json.dumps(json.dumps(bounds, sort_keys=True))} --sample-s {sample_s:g} \\
+  --widen-wait-s {widen_wait_s:g} || rc=$?
 printf '{{"kind": "exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {STREAM}
 echo "$rc" > {EXITED}
 sleep {linger_s:g}
@@ -344,7 +367,7 @@ def identity_user(user_prefix: str) -> str:
 
 
 def plan(*, n: int, scale: int, namespaces: int, out_dir: str, user_prefix: str, password: str,
-         snowplow_url: str, authn_url: str, bounds: dict, linger_s: float) -> dict:
+         snowplow_url: str, authn_url: str, bounds: dict, linger_s: float, widen_wait_s: float) -> dict:
     """Write every manifest of the stage into out_dir and return its plan.
     N is the data step's proven count, and must be the SCALE the run budgeted."""
     from bench import data_manifests
@@ -371,7 +394,7 @@ def plan(*, n: int, scale: int, namespaces: int, out_dir: str, user_prefix: str,
     write("probe.yaml", "\n---\n".join(json.dumps(d) for d in [probe_ra(first)] + identity_docs(user, password))
           + "\n")
     write("job.yaml", job_yaml(snowplow_url=snowplow_url, authn_url=authn_url, user=user, password=password,
-                               bounds=bounds, linger_s=linger_s))
+                               bounds=bounds, linger_s=linger_s, widen_wait_s=widen_wait_s))
     p = {"kind": "full_widen_plan", "n": n, "namespaces": namespaces, "per_namespace": n // namespaces,
          "batches": len(bs), "batch": data_manifests.COMPOSITION_APPLY_BATCH,
          "workers": data_manifests.COMPOSITION_APPLY_WORKERS,
@@ -413,29 +436,51 @@ def _env_seconds(raw) -> int | None:
     return v if v > 0 else None
 
 
-def bounds(deployment: dict, rollout_timeout_s: float, sample_s: float = SAMPLE_S) -> dict:
-    """Each mechanism's bound on the register and settle phases, and where it
-    comes from. `deployment`: the live snowplow Deployment (kubectl -o json)."""
-    env = {}
-    for c in ((deployment.get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []:
-        for e in c.get("env") or []:
-            if e.get("name") == RELIST_BRIDGE_ENV and "value" in e:
-                env[c.get("name")] = e["value"]
-    raw = next(iter(env.values()), None)
+def snowplow_container(deployment: dict) -> dict:
+    """The snowplow container of the snowplow Deployment: the one named as the
+    Deployment (the chart names it `snowplow.fullname`, as the Deployment).
+    Refused (ValueError) when there is none."""
+    name = (deployment.get("metadata") or {}).get("name")
+    cs = ((deployment.get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
+    hit = [c for c in cs if c.get("name") == name]
+    if len(hit) != 1:
+        raise ValueError(f"the snowplow Deployment {name!r} has {len(hit)} container(s) named {name!r} "
+                         f"(containers: {[c.get('name') for c in cs]}): whose env is snowplow's is not known")
+    return hit[0]
+
+
+def bounds(deployment: dict, configmaps: dict, rollout_timeout_s: float, sample_s: float = SAMPLE_S) -> dict:
+    """Each phase's bound and where it comes from. `deployment`: the live
+    snowplow Deployment; `configmaps`: its namespace's ConfigMaps (both
+    kubectl -o json). The bridge's timeout is read as the snowplow container
+    sees it (origin_gate._container_env: env, valueFrom, envFrom). Refused
+    (ValueError) when it cannot be read: never a default in its place."""
+    from bench import origin_gate
+    c = snowplow_container(deployment)
+    cms = {(m.get("metadata") or {}).get("name"): m.get("data") or {} for m in configmaps.get("items") or []}
+    try:
+        raw, where = origin_gate._container_env(c, cms, RELIST_BRIDGE_ENV)
+    except LookupError as e:
+        raise ValueError(f"{RELIST_BRIDGE_ENV} of the snowplow container cannot be read: {e}") from None
     bridge = _env_seconds(raw)
-    bridge_src = (f"{RELIST_BRIDGE_ENV}={raw} on the live snowplow Deployment" if bridge is not None
-                  else (f"{RELIST_BRIDGE_ENV}={raw!r} unparseable or <= 0 on the live Deployment: its default "
-                        f"{RELIST_BRIDGE_DEFAULT_S} s" if raw is not None
-                        else f"{RELIST_BRIDGE_ENV} unset on the live Deployment: its default {RELIST_BRIDGE_DEFAULT_S} s"))
+    if raw is None:
+        bridge_src = f"{RELIST_BRIDGE_ENV} not set for the snowplow container: its default {RELIST_BRIDGE_DEFAULT_S} s"
+    elif bridge is None:
+        bridge_src = (f"{RELIST_BRIDGE_ENV}={raw!r} ({where}) unparseable or <= 0: its default "
+                      f"{RELIST_BRIDGE_DEFAULT_S} s (intFromEnv)")
+    else:
+        bridge_src = f"{RELIST_BRIDGE_ENV}={raw} ({where})"
     bridge = bridge if bridge is not None else RELIST_BRIDGE_DEFAULT_S
     relist = max(RELIST_POSTSYNC_WAIT_S, bridge) + sample_s
+    rollout = (f"ROLLOUT_TIMEOUT_S {rollout_timeout_s:g} s, the bench's bound for snowplow listing and syncing "
+               f"everything it serves at boot")
     return {"relist": {"s": relist, "source": (f"max(relistPostSyncWait {RELIST_POSTSYNC_WAIT_S} s, the bridge's "
                                                f"{bridge} s: {bridge_src}) + one {sample_s:g} s sample: "
                                                f"snowplow's own give-ups")},
             "build_and_swap": {"s": float(rollout_timeout_s),
-                               "source": (f"ROLLOUT_TIMEOUT_S {rollout_timeout_s:g} s: snowplow publishes no bound "
-                                          f"(every build ends on an event); the bench's bound for snowplow "
-                                          f"listing and syncing everything it serves at boot")}}
+                               "source": f"{rollout}: snowplow publishes no bound (every build ends on an event)"},
+            "register": {"s": float(rollout_timeout_s), "source": f"{rollout}: the register read waits for a cold "
+                                                                  f"LIST of the stage's objects"}}
 
 
 # ─── the end rules (rulings Q1, Q2, Q4) ──────────────────────────────────────
@@ -503,19 +548,20 @@ def serves(probe: dict, v: dict) -> tuple[bool, str]:
     return True, "registered, and a read answered 200 with no fall-through"
 
 
-def swap_outcomes(v: dict) -> int | None:
-    """Every outcome the stage GVR's builds ended in (installed, superseded,
-    abort_*), summed; 0 for a GVR with no build yet; None when unpublished."""
+def swap_outcomes(v: dict, gvr: str = GVR) -> int | None:
+    """Every outcome a GVR's builds ended in (installed, superseded, abort_*),
+    summed; 0 for a GVR with no build yet; None when unpublished."""
     by = v.get(SWAPS_BY_GVR_F)
     if not isinstance(by, dict):
         return None
-    m = by.get(GVR) or {}
+    m = by.get(gvr) or {}
     return sum(n for n in m.values() if isinstance(n, (int, float))) if isinstance(m, dict) else None
 
 
 def build_ended(mech: str, armed: dict, now: dict, probe: dict) -> tuple[bool, str]:
     """Whether the stage's build has ended, by the mechanism's end signal
-    (rulings Q1 / Q2): (ended, why)."""
+    (rulings Q1 / Q2): (ended, why). `armed`: the snapshot taken before the
+    widen (the deltas' baseline)."""
     if mech == "build_and_swap":
         a, b = swap_outcomes(armed), swap_outcomes(now)
         ko = _fam(now, SWAP_KS_F, "store_swap_known_stale_keys_open", "schema")
@@ -555,13 +601,15 @@ def build_ended(mech: str, armed: dict, now: dict, probe: dict) -> tuple[bool, s
 def trim(v: dict, prev_num_gc: int | None) -> dict:
     """One /debug/vars read, kept: memstats' heap and GC fields (and the GC
     pauses since the previous read, load606.gc_pauses), the rebuild families
-    whole, and of the per-GVR maps only the stage GVR's entry (whether the
-    family is published is kept: absent is never zero). METADATA ONLY."""
+    whole, every GVR's build outcomes (bounded by the cluster's type set: the
+    report names other GVRs' builds), and of the per-GVR fall-through and
+    registration maps only the stage GVR's entry (whether a family is
+    published is kept: absent is never zero). METADATA ONLY."""
     from bench import load606
     m = v.get("memstats") or {}
     out = {k: v[k] for k in KEPT_FAMILIES if k in v}
     if isinstance(v.get(SWAPS_BY_GVR_F), dict):
-        out[SWAPS_BY_GVR_F] = {GVR: v[SWAPS_BY_GVR_F][GVR]} if GVR in v[SWAPS_BY_GVR_F] else {}
+        out[SWAPS_BY_GVR_F] = v[SWAPS_BY_GVR_F]
     if isinstance(v.get(FALLTHROUGH_F), dict):
         out[FALLTHROUGH_F] = {c: n for c, n in v[FALLTHROUGH_F].items() if str(c).split("|")[1:2] == [GVR]}
     if isinstance(v.get(REGISTERED_F), dict):
@@ -572,7 +620,7 @@ def trim(v: dict, prev_num_gc: int | None) -> dict:
 
 
 def read_path(seq: int) -> str:
-    """The stage's read, its extras new on every read (no L1 hit)."""
+    """The stage's read, its extras new on every read (a new RA-level L1 key)."""
     extras = urllib.parse.quote(json.dumps({"bench1004_read": seq}, separators=(",", ":")))
     return (f"/call?apiVersion={urllib.parse.quote(RA_API, safe='')}&resource=restactions"
             f"&name={RA_NAME}&namespace={RA_NS}&extras={extras}")
@@ -580,15 +628,18 @@ def read_path(seq: int) -> str:
 
 class Watch:
     """The Job's loop. `get(path, token) -> (status, body bytes)`, `login() ->
-    token`, `emit(record)`, `clock()`, `sleep(s)`, `armed()` injected (tests
-    drive it with a fake snowplow)."""
+    token`, `emit(record)`, `arm()` (writes /out/armed), `widened() -> bool`
+    (the operator wrote /out/widened), `clock()`, `sleep(s)` injected (tests
+    drive it with a fake snowplow). `bounds`: {"register", "relist",
+    "build_and_swap": {"s", "source"}}; `widen_wait_s`: how long armed may wait
+    for the operator's widen."""
 
-    def __init__(self, *, get: Callable, login: Callable, emit: Callable, arm: Callable,
-                 bounds: dict, sample_s: float = SAMPLE_S, clock: Callable = time.time,
+    def __init__(self, *, get: Callable, login: Callable, emit: Callable, arm: Callable, widened: Callable,
+                 bounds: dict, widen_wait_s: float, sample_s: float = SAMPLE_S, clock: Callable = time.time,
                  sleep: Callable = time.sleep, mechanism: Callable | None = None):
-        self.get, self.login, self.emit, self.arm = get, login, emit, arm
-        self.bounds, self.sample_s, self.clock, self.sleep = bounds, sample_s, clock, sleep
-        self.mechanism = mechanism
+        self.get, self.login, self.emit, self.arm, self.widened = get, login, emit, arm, widened
+        self.bounds, self.widen_wait_s, self.sample_s = bounds, widen_wait_s, sample_s
+        self.clock, self.sleep, self.mechanism = clock, sleep, mechanism
         self.token, self.seq, self.prev_gc = None, 0, None
 
     def _vars(self) -> dict | None:
@@ -629,61 +680,63 @@ class Watch:
         self.emit(rec)
         return rec
 
+    def _end(self, outcome: str, rc: int, **kw) -> int:
+        self.emit({"kind": "end", "t": self.clock(), "outcome": outcome, **kw})
+        return rc
+
     def run(self) -> int:
         from bench import store_rebuild
         mech_of = self.mechanism or store_rebuild.mechanism
         t0 = self.clock()
-        self.emit({"kind": "start", "t": t0, "gvr": GVR, "bounds": self.bounds, "sample_s": self.sample_s})
-        mech, deadline, rec = None, None, None
+        self.emit({"kind": "start", "t": t0, "gvr": GVR, "bounds": self.bounds, "sample_s": self.sample_s,
+                   "widen_wait_s": self.widen_wait_s})
+        mech, rec = None, None
+        reg_deadline = t0 + self.bounds["register"]["s"]
         while True:                                   # register (ruling Q4)
             rec = self.tick("register")
             if rec is not None and mech is None:
                 mech, why = mech_of(rec["vars"])
                 if mech is None:
-                    self.emit({"kind": "end", "t": self.clock(), "outcome": "mechanism_unknown", "why": why})
-                    return 3
-                deadline = t0 + self.bounds[mech]["s"]
+                    return self._end("mechanism_unknown", 3, why=why)
                 self.emit({"kind": "mechanism", "t": self.clock(), "mechanism": mech, "why": why,
                            "bound_s": self.bounds[mech]["s"], "bound_source": self.bounds[mech]["source"]})
             if rec is not None and serves(rec["probe"], rec["vars"])[0]:
                 break
-            if deadline is not None and self.clock() >= deadline:
-                self.emit({"kind": "end", "t": self.clock(), "outcome": "not_serving_within_bound",
-                           "why": serves(rec["probe"], rec["vars"])[1] if rec else "no sample in the last read"})
-                return 3
-            if deadline is None and self.clock() >= t0 + max(b["s"] for b in self.bounds.values()):
-                self.emit({"kind": "end", "t": self.clock(), "outcome": "no_sample_within_bound"})
-                return 3
+            if self.clock() >= reg_deadline:
+                return self._end("not_serving_within_bound", 3, bound_s=self.bounds["register"]["s"],
+                                 why=serves(rec["probe"], rec["vars"])[1] if rec else "the last read failed")
             self.sleep(self.sample_s)
         armed_vars, t_armed = rec["vars"], self.clock()
         self.emit({"kind": "armed", "t": t_armed, "mechanism": mech, "why": serves(rec["probe"], rec["vars"])[1]})
         self.arm()
-        deadline = t_armed + self.bounds[mech]["s"]
+        while not self.widened():                     # armed: the operator's widen
+            if self.clock() >= t_armed + self.widen_wait_s:
+                return self._end("never_widened", 3, waited_s=round(self.clock() - t_armed, 1))
+            self.sleep(self.sample_s)
+            self.tick("armed")
+        t_widened = self.clock()
+        self.emit({"kind": "widened", "t": t_widened})
+        deadline = t_widened + self.bounds[mech]["s"]
         detected = None
-        while True:                                   # settle (rulings Q1 / Q2)
+        armed_fired = _fam(armed_vars, CRD_F, "schema_relists_fired")
+        while True:                                   # settle (rulings Q1 / Q2), the clock from the widen
             self.sleep(self.sample_s)
             rec = self.tick("settle")
             if rec is not None:
                 if mech_of(rec["vars"])[0] != mech:
-                    self.emit({"kind": "end", "t": self.clock(), "outcome": "mechanism_changed",
-                               "why": "the build's rebuild mechanism changed: the pod was replaced"})
-                    return 3
+                    return self._end("mechanism_changed", 3,
+                                     why="the build's rebuild mechanism changed: the pod was replaced")
                 fired = _fam(rec["vars"], CRD_F, "schema_relists_fired")
-                if detected is None and fired is not None and fired > (_fam(armed_vars, CRD_F,
-                                                                             "schema_relists_fired") or 0):
+                if detected is None and fired is not None and armed_fired is not None and fired > armed_fired:
                     detected = rec["t"]
                     self.emit({"kind": "detected", "t": detected})
                 ok, why = build_ended(mech, armed_vars, rec["vars"], rec["probe"])
                 if ok:
-                    self.emit({"kind": "end", "t": self.clock(), "outcome": "ended", "signal": why,
-                               "detected": detected})
-                    return 0
+                    return self._end("ended", 0, signal=why, detected=detected)
             if self.clock() >= deadline:
-                self.emit({"kind": "end", "t": self.clock(), "outcome": "bound_reached",
-                           "detected": detected, "bound_s": self.bounds[mech]["s"],
-                           "why": build_ended(mech, armed_vars, rec["vars"], rec["probe"])[1] if rec
-                           else "the last read failed"})
-                return 0
+                return self._end("bound_reached", 0, detected=detected, bound_s=self.bounds[mech]["s"],
+                                 why=build_ended(mech, armed_vars, rec["vars"], rec["probe"])[1] if rec
+                                 else "the last read failed")
 
 
 def _cmd_watch(a) -> int:
@@ -704,18 +757,26 @@ def _cmd_watch(a) -> int:
         with open(ARMED, "w") as f:
             f.write(str(time.time()))
     return Watch(get=get, login=lambda: load606.login(a.authn_url, a.user, a.password), emit=emit, arm=arm,
-                 bounds=json.loads(a.bounds), sample_s=a.sample_s).run()
+                 widened=lambda: os.path.exists(WIDENED), bounds=json.loads(a.bounds),
+                 widen_wait_s=a.widen_wait_s, sample_s=a.sample_s).run()
 
 
 # ─── the evaluation (operator side) ──────────────────────────────────────────
 
 HOW = ("A CRD of the stage's own and N objects the size of the run's compositions, created in batches like the "
        "data step's; the GVR registered by the stage's own read (a RESTAction GET of one object, its extras new "
-       "on every read so none is an L1 hit) until it serves; then the CRD widened with a defaulted property, so "
-       "every object's served bytes change. In-cluster, one read and two /debug/vars reads a sample: the heap "
-       "and GC from memstats; the rebuild's counters by the mechanism the build publishes, read with "
-       "accept1126's B1-B7 rows over the settle (armed -> end); the end and its bound per the #1004 rulings. "
-       "After the run's evaluate step: nothing of it reaches the paired verdict.")
+       "on every read so no read is an RA-level L1 hit; the api stage's content cell is shared, and the relist's "
+       "'serves again' relies on #547's known-stale read-through) until a read serves; then the CRD widened with "
+       "a defaulted property, so every object's served bytes change. In-cluster, one read and two /debug/vars "
+       "reads a sample: the heap and GC from memstats; the rebuild's counters by the mechanism the build "
+       "publishes, read with accept1126's B1-B7 rows over armed -> end, attributed to the stage's CRD by the "
+       "schema_relist lines of snowplow's log; the end and its bound (its clock from the widen) per the #1004 "
+       "rulings. After the run's evaluate step: nothing of it reaches the paired verdict.")
+
+SCHEMA_RELIST_MSG = "cache.crd_discovery.schema_relist"
+# what names the GVR a rebuild ran for, per tag (both hash the GVR: its String() carries "=")
+GVR_LINES = ("cache.crd_discovery.relist_postsync.dirty_marked", "cache.crd_discovery.relist_postsync.timeout",
+             "cache.store.swap.build")
 
 
 def parse(lines) -> list[dict]:
@@ -728,6 +789,60 @@ def parse(lines) -> list[dict]:
             out.append(json.loads(ln))
         except ValueError:
             out.append({"kind": "unparseable"})
+    return out
+
+
+def _epoch(ts) -> float | None:
+    """An RFC3339(Nano) time as epoch seconds (snowplow's slog `time`, the
+    kubelet's `kts`)."""
+    import calendar
+    import re
+    m = re.match(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$", str(ts or ""))
+    if not m:
+        return None
+    y, mo, d, h, mi, se = (int(x) for x in m.groups()[:6])
+    t = calendar.timegm((y, mo, d, h, mi, se)) + (float(m.group(7)) if m.group(7) else 0.0)
+    z = m.group(8)
+    if z != "Z":
+        sign = 1 if z[0] == "+" else -1
+        t -= sign * (int(z[1:3]) * 3600 + int(z[4:6]) * 60)
+    return t
+
+
+def relist_attribution(log_lines: list[str] | None, t0: float, t1: float, slack: float = SAMPLE_S) -> dict | None:
+    """Which CRDs' schema relists (and which GVRs' rebuilds) the scrubbed
+    snowplow log shows in [t0 - slack, t1 + slack]; None when the log was not
+    read. The scrub hashes the CRD's name and the GVR (logscrub._h), so the
+    stage's are recognised by their hash and every other one is named by it."""
+    if log_lines is None:
+        return None
+    from bench import logscrub
+    k_crd = "k:" + logscrub._h("crd")[2:]
+    ours_crd, ours_gvr = logscrub._h(CRD_NAME), logscrub._h(GVR)
+    out = {"window": [round(t0 - slack, 3), round(t1 + slack, 3)], "ours": 0, "other_crds": {},
+           "rebuilds": {"ours": 0, "other_gvrs": {}}}
+    for ln in log_lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("msg") not in (SCHEMA_RELIST_MSG,) + GVR_LINES:
+            continue
+        t = _epoch(rec.get("time")) or _epoch(rec.get("kts"))
+        if t is None or not (t0 - slack <= t <= t1 + slack):
+            continue
+        if rec["msg"] == SCHEMA_RELIST_MSG:
+            c = rec.get(k_crd)
+            if c == ours_crd:
+                out["ours"] += 1
+            else:
+                out["other_crds"][str(c)] = out["other_crds"].get(str(c), 0) + 1
+        else:
+            g = rec.get("gvr")
+            if g == ours_gvr:
+                out["rebuilds"]["ours"] += 1
+            else:
+                out["rebuilds"]["other_gvrs"][str(g)] = out["rebuilds"]["other_gvrs"].get(str(g), 0) + 1
     return out
 
 
@@ -768,21 +883,34 @@ def restarts(pods: dict) -> dict:
             for p in pods.get("items") or []}
 
 
-def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after: dict) -> dict:
-    """The stage's record: outcome, rows, memory, how; `passed` only when the
-    build ENDED inside its bound, every gating row passed, and snowplow was
+def _other_builds(armed: dict, end: dict) -> dict:
+    """Other GVRs whose build outcomes moved between two samples (report)."""
+    a, b = armed.get(SWAPS_BY_GVR_F), end.get(SWAPS_BY_GVR_F)
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return {}
+    return {g: swap_outcomes(end, g) - (swap_outcomes(armed, g) or 0) for g in b
+            if g != GVR and (swap_outcomes(end, g) or 0) - (swap_outcomes(armed, g) or 0)}
+
+
+def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after: dict,
+             log_lines: list[str] | None) -> dict:
+    """The stage's record: outcome, rows, attribution, memory, how; `passed`
+    only when the build ENDED inside its bound, every gating row passed, every
+    schema relist in the window was the stage's CRD's, and snowplow was
     neither restarted nor replaced."""
     from bench import accept1126
     reasons = []
     kinds = [r.get("kind") for r in records]
     end = next((r for r in records if r.get("kind") == "end"), None)
     mech_rec = next((r for r in records if r.get("kind") == "mechanism"), None)
+    widened = next((r for r in records if r.get("kind") == "widened"), None)
     armed_i = kinds.index("armed") if "armed" in kinds else None
     out = {"kind": "full_widen", "how": HOW, "plan": {k: plan_.get(k) for k in (
         "n", "namespaces", "per_namespace", "batches", "batch", "workers", "object_bytes", "composition_bytes",
         "crd", "gvr", "derived_from")},
         "mechanism": mech_rec and mech_rec.get("mechanism"),
-        "bound": mech_rec and {"s": mech_rec.get("bound_s"), "source": mech_rec.get("bound_source")},
+        "bound": mech_rec and {"s": mech_rec.get("bound_s"), "source": mech_rec.get("bound_source"),
+                               "clock": "from the widen (/out/widened seen)"},
         "outcome": end.get("outcome") if end else "no_end_record", "end": end,
         "exit": next((r for r in records if r.get("kind") == "exit"), None),
         "sample_failures": kinds.count("sample_failed"), "login_failures": kinds.count("login_failed"),
@@ -798,6 +926,10 @@ def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after:
         if armed_i is not None else None
     if armed_s is not None and settle and out["mechanism"] in MECHANISMS:
         mech = out["mechanism"]
+        t_armed, t_end = records[armed_i]["t"], (end or settle[-1])["t"]
+        att = relist_attribution(log_lines, t_armed, t_end)
+        out["attribution"] = att
+        d = None
         try:
             before = accept1126.snapshot_crd_counters(armed_s["vars"], mech)
             after = accept1126.snapshot_crd_counters(settle[-1]["vars"], mech)
@@ -816,6 +948,18 @@ def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after:
                 reasons.append(f"rows failed: {', '.join(out['failed_rows'])}")
         except accept1126.AssertionsFailed as e:
             reasons.append(f"the rows could not be read: {e}")
+        fired = (d or {}).get(f"{CRD_F}.schema_relists_fired")
+        if att is None:
+            reasons.append("snowplow's log was not read: whether another CRD's schema relist landed in the "
+                           "window is unknown, so the rows are unattributable")
+        else:
+            if att["other_crds"]:
+                reasons.append(f"another CRD's schema relist landed between armed and the end "
+                               f"({att['other_crds']}): the process-wide rows are unattributable")
+            if fired is not None and att["ours"] < fired:
+                reasons.append(f"Δschema_relists_fired {fired} but snowplow's log names the stage's CRD "
+                               f"{att['ours']} time(s): unattributed relist(s)")
+        out["other_gvr_builds"] = _other_builds(armed_s["vars"], settle[-1]["vars"])
         fts = {}
         for s in settle:
             for k, n in (s["probe"].get("moved_window") or {}).items():
@@ -823,11 +967,11 @@ def evaluate(records: list[dict], *, plan_: dict, pods_before: dict, pods_after:
         out["window_fallthroughs_during_settle"] = {"by_path_reason": fts, "reads": len(settle),
                                                     "note": "report only (#870 K1 claims 0 on build_and_swap)"}
         out["memory"] = memory_report([armed_s] + settle, (end or {}).get("detected"))
-        out["timeline_s"] = {"armed_to_detected": (round(end["detected"] - records[armed_i]["t"], 1)
-                                                   if end and end.get("detected") else None),
-                             "armed_to_end": round(end["t"] - records[armed_i]["t"], 1) if end else None,
-                             "detected_to_end": (round(end["t"] - end["detected"], 1)
-                                                 if end and end.get("detected") else None)}
+        det = (end or {}).get("detected")
+        out["timeline_s"] = {"armed_to_widened": round(widened["t"] - t_armed, 1) if widened else None,
+                             "widened_to_detected": (round(det - widened["t"], 1) if det and widened else None),
+                             "widened_to_end": round(end["t"] - widened["t"], 1) if end and widened else None,
+                             "detected_to_end": round(end["t"] - det, 1) if end and det else None}
     elif not reasons:
         reasons.append("no settle samples: nothing was measured")
     out["passed"] = not reasons
@@ -841,7 +985,7 @@ def report_lines(rec: dict) -> list[str]:
            f"{rec.get('mechanism')}; N {rec['plan'].get('n')} objects of {rec['plan'].get('object_bytes')} B "
            f"(composition {rec['plan'].get('composition_bytes')} B)"]
     if rec.get("bound"):
-        out.append(f"full widen: bound {rec['bound']['s']} s ({rec['bound']['source']})")
+        out.append(f"full widen: bound {rec['bound']['s']} s from the widen ({rec['bound']['source']})")
     if rec.get("end") and rec["end"].get("signal"):
         out.append(f"full widen: ended on {rec['end']['signal']}")
     if m:
@@ -850,6 +994,8 @@ def report_lines(rec: dict) -> list[str]:
                    f"cycles, max pause {m['gc_pause_max_ms']} ms, total {m['gc_pause_total_ms']} ms")
     if rec.get("timeline_s"):
         out.append(f"full widen: timeline {rec['timeline_s']}")
+    if "attribution" in rec:
+        out.append(f"full widen: schema relists in the window: {rec['attribution']}")
     for r in rec.get("assertions") or []:
         out.append(f"full widen: {r['id']} {'ok' if r['passed'] else 'FAILED'}"
                    f"{' (report only)' if r.get('report_only') else ''}: {r['assertion']}: {r['actual']}")
@@ -864,7 +1010,9 @@ def report_lines(rec: dict) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.full_widen")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("bounds", help="the live snowplow Deployment (-o json) on stdin -> each mechanism's bound")
+    b = sub.add_parser("bounds", help="the live snowplow Deployment and its namespace's ConfigMaps -> each bound")
+    b.add_argument("--deployment", required=True)
+    b.add_argument("--configmaps", required=True)
     b.add_argument("--rollout-timeout-s", type=float, required=True)
     pl = sub.add_parser("plan", help="write the stage's manifests and plan.json")
     for f in ("--n", "--scale", "--namespaces"):
@@ -872,22 +1020,33 @@ def main(argv: list[str] | None = None) -> int:
     for f in ("--out-dir", "--user-prefix", "--password-file", "--snowplow-url", "--authn-url", "--bounds"):
         pl.add_argument(f, required=True)
     pl.add_argument("--linger-s", type=float, required=True)
+    pl.add_argument("--widen-wait-s", type=float, required=True)
     sub.add_parser("proof-count", help="data-proof.json on stdin -> its composition count")
+    sub.add_parser("cleanup-count", help="how many cleanup deletes there are (the run budget counts each)")
     cl = sub.add_parser("cleanup", help="kubectl argument lists, one per line")
     cl.add_argument("--user-prefix", required=True)
     sub.add_parser("restarts", help="kubectl get pods -o json on stdin -> {pod: restarts}")
     ev = sub.add_parser("evaluate")
-    for f in ("--stream", "--plan", "--pods-before", "--pods-after", "--out"):
+    for f in ("--stream", "--plan", "--pods-before", "--pods-after", "--out", "--log"):
         ev.add_argument(f, required=True)
-    w = sub.add_parser("watch", help="in-cluster: the register and settle phases")
+    w = sub.add_parser("watch", help="in-cluster: the register, armed and settle phases")
     for f in ("--snowplow-url", "--authn-url", "--user", "--password", "--bounds"):
         w.add_argument(f, required=True)
     w.add_argument("--sample-s", type=float, default=SAMPLE_S)
+    w.add_argument("--widen-wait-s", type=float, required=True)
     a = ap.parse_args(argv)
     if a.cmd == "watch":
         return _cmd_watch(a)
     if a.cmd == "bounds":
-        print(json.dumps(bounds(json.load(sys.stdin), a.rollout_timeout_s)))
+        with open(a.deployment) as fh:
+            dep = json.load(fh)
+        with open(a.configmaps) as fh:
+            cms = json.load(fh)
+        try:
+            print(json.dumps(bounds(dep, cms, a.rollout_timeout_s)))
+        except ValueError as e:
+            print(f"refusing: {e}", file=sys.stderr)
+            return 2
         return 0
     if a.cmd == "proof-count":
         n = json.load(sys.stdin).get("compositions")
@@ -896,13 +1055,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(n)
         return 0
+    if a.cmd == "cleanup-count":
+        print(len(cleanup_targets("x")))
+        return 0
     if a.cmd == "plan":
         with open(a.password_file) as fh:
             pw = fh.read()
         try:
             p = plan(n=a.n, scale=a.scale, namespaces=a.namespaces, out_dir=a.out_dir, user_prefix=a.user_prefix,
                      password=pw, snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-                     bounds=json.loads(a.bounds), linger_s=a.linger_s)
+                     bounds=json.loads(a.bounds), linger_s=a.linger_s, widen_wait_s=a.widen_wait_s)
         except ValueError as e:
             print(f"refusing: {e}", file=sys.stderr)
             return 2
@@ -928,7 +1090,12 @@ def main(argv: list[str] | None = None) -> int:
             pb = json.load(fh)
         with open(a.pods_after) as fh:
             pa = json.load(fh)
-        rec = evaluate(recs, plan_=p, pods_before=pb, pods_after=pa)
+        try:
+            with open(a.log) as fh:
+                log_lines = fh.read().splitlines()
+        except OSError:
+            log_lines = None
+        rec = evaluate(recs, plan_=p, pods_before=pb, pods_after=pa, log_lines=log_lines)
         with open(a.out, "w") as fh:
             json.dump(rec, fh, indent=1)
         for ln in report_lines(rec):

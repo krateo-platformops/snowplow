@@ -211,17 +211,21 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print("\\n".join(f"bench-ns-01 o{i} 1s" for i in range(max(0, n - int(os.environ.get("FAKE_FW_SHORT", "0"))))))
         sys.exit(0)
     if a[:3] == ["get", "deploy", "snowplow"]:
+        # as the chart renders it: the env through envFrom its ConfigMap (FAKE_FW_DEPLOY_ENV: an env list too)
         env = json.loads(os.environ.get("FAKE_FW_DEPLOY_ENV", "[]"))
-        print(json.dumps({"spec": {"template": {"spec": {"containers": [{"name": "snowplow", "env": env}]}}}}))
+        print(json.dumps({"metadata": {"name": "snowplow"}, "spec": {"template": {"spec": {"containers": [
+            {"name": "snowplow", "envFrom": [{"configMapRef": {"name": "snowplow"}}], "env": env}]}}}}))
         sys.exit(0)
     fw_events = (open(os.path.join(STATE, "fw-events")).read() if os.path.exists(os.path.join(STATE, "fw-events"))
                  else "")
     if a[:2] == ["get", "pods"] and "job-name=fullwiden606" in a:
         print("fullwiden606-0" if "apply job.yaml" in fw_events else ""); sys.exit(0)
+    if a[:1] == ["exec"] and "fullwiden606-0" in a and a[-2:] == ["touch", "/out/widened"]:
+        fw_note("exec touch /out/widened"); sys.exit(0)
     if a[:1] == ["exec"] and "fullwiden606-0" in a:
         mode = os.environ.get("FAKE_FW_JOB", "ok")
         armed = mode == "ok" and "apply job.yaml" in fw_events
-        exited = (mode == "ok" and "apply crd-widened.yaml" in fw_events) or mode == "ends_unarmed"
+        exited = (mode == "ok" and "exec touch /out/widened" in fw_events) or mode == "ends_unarmed"
         fw_note("exec " + a[-1] + " " + ("yes" if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else "no"))
         sys.exit(0 if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else 1)
     if a[:1] == ["cp"] and any(x.startswith("fullwiden606-0:") for x in a):
@@ -902,7 +906,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what in ("configmap", "configmaps") and "json" in a and "frontend-config-vars" not in a:
             src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
             data = {"COMPOSITION_CONTROLLER_RESYNC_INTERVAL": iv} if src == "configmap" else {"OTHER": "x"}
-            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data}]}))
+            # #1004: snowplow's own ConfigMap, its env through envFrom (FAKE_FW_CM: its data)
+            fw_cm = json.loads(os.environ.get("FAKE_FW_CM", '{"DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS": "120"}'))
+            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data},
+                                        {"metadata": {"name": "snowplow"}, "data": fw_cm}]}))
             sys.exit(0)
         if what == "svc":
             mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending
@@ -1043,6 +1050,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
         sys.exit(1)
     snow = next((x for x in a if x == "deploy/snowplow" or x.startswith("pod/snowplow")), None)
+    if a[:1] == ["logs"] and snow and any(x.startswith("--since-time=") for x in a) and os.environ.get("FAKE_FW_LOG"):
+        # #1004: the stage's read of snowplow's log since its start (FAKE_FW_LOG: its lines)
+        for ln in open(os.environ["FAKE_FW_LOG"]).read().splitlines():
+            print(ln, flush=True)
+        sys.exit(0)
     if a[:1] == ["logs"] and snow and "--previous" not in a:
         ts = "2026-10-21T06:00:00.5Z " if "--timestamps" in a else ""
         if "-f" not in a and snow.startswith("pod/") and os.environ.get("FAKE_SNOWPLOW_PODS"):

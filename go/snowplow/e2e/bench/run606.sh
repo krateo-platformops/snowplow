@@ -265,24 +265,39 @@ PSI_JOBS=0
 # #1004: the full-widen stage (s_full_widen), after the evaluate step, ONLY with
 # Diego's go for it on this run: BENCH_1004_GO=<YYYYMMDD>-<RUN_NAME> is its one
 # switch (no go, no stage; a go for another day or run is refused below). Its
-# terms, each enforced where it runs:
+# terms: EVERY bounded wait it makes, each enforced where it runs:
+#   applies  its single applies outside the Job's window (the CRD, the read +
+#            identity, the Job), each under COLLECT_TIMEOUT_S, every request
+#            of it bounded too (KAPPLY_REQUEST_TIMEOUT_S);
+#   ready    the CRD's Established wait (PREFLIGHT_TIMEOUT_S);
 #   objects  the data step's bound: it installs the same count (N = the data
 #            step's proven compositions, = SCALE) of the same body, batched the
 #            same way (bench/full_widen.py);
-#   job      one preflight's window (the Job starts, signs in) + two phases
-#            bounded by FW_BOUND_S: the register read until it serves, the
-#            settle until the build's end. FW_BOUND_S = ROLLOUT_TIMEOUT_S, the
-#            build_and_swap bound (#1004 ruling Q3); a relist build's bound is
-#            derived from the live Deployment at the stage and must fit it;
-#   collect  one bounded read of the Job's /out, the logs and the pods;
-#   delete   the data step's bound again: the CRD's deletion removes N objects.
+#   job      one preflight's window (the Job starts, signs in) + the register
+#            read until it serves (FW_BOUND_S) + the widen wait (the
+#            operator's armed poll, its widened apply, its exec) + the settle
+#            from the widen (FW_BOUND_S). FW_BOUND_S = ROLLOUT_TIMEOUT_S: the
+#            build_and_swap and register bound (#1004 ruling Q3); a relist
+#            build's bound is derived from the live Deployment at the stage and
+#            must fit it;
+#   reads    its reads (the Deployment, the ConfigMaps, the count, snowplow's
+#            pods before and after, the Job's /out, snowplow's log), each
+#            COLLECT_TIMEOUT_S;
+#   deletes  each cleanup delete (COLLECT_TIMEOUT_S), then the CRD's: the data
+#            step's bound again, its deletion removes N objects.
 FULL_WIDEN_GO="${BENCH_1004_GO:-}"
 FW_S=0
+FW_EXEC_S=60               # one kubectl exec's bound, as mem_stop's
+FW_APPLIES=3
+FW_READS=7
+FW_DELETES="$(python3 -m bench.full_widen cleanup-count)"
 FW_BOUND_S="$ROLLOUT_TIMEOUT_S"
 FW_CREATE_S="$DATA_TIMEOUT_S"
 FW_DELETE_S="$DATA_TIMEOUT_S"
-FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + 2 * FW_BOUND_S ))
-[[ -n "$FULL_WIDEN_GO" ]] && FW_S=$(( FW_CREATE_S + FW_JOB_S + COLLECT_TIMEOUT_S + FW_DELETE_S ))
+FW_WIDEN_WAIT_S=$(( PREFLIGHT_TIMEOUT_S + COLLECT_TIMEOUT_S + FW_EXEC_S ))
+FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
+[[ -n "$FULL_WIDEN_GO" ]] && FW_S=$(( FW_APPLIES * COLLECT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + FW_CREATE_S + FW_JOB_S
+                                     + FW_READS * COLLECT_TIMEOUT_S + FW_DELETES * COLLECT_TIMEOUT_S + FW_DELETE_S ))
 RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
@@ -299,7 +314,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 # portal-origin window longer than its budget term may take (#1006 F8)
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
-(( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + 2x${FW_BOUND_S}) + collect ${COLLECT_TIMEOUT_S} + delete ${FW_DELETE_S})"
+(( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
 budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
@@ -366,12 +381,14 @@ run() {
 # the bench code (~250 KB), so run 15's preflight apply was refused ("The
 # ConfigMap \"load606\" is invalid: metadata.annotations: Too long"). Server-
 # side apply records field ownership in managedFields instead, no copy.
+# KAPPLY_REQUEST_TIMEOUT_S, when a step sets it (#1004's stage), bounds each
+# request of the apply.
 # (tests/test_apply_size.py: every object this script applies fits the API.)
 # Once applied (or refused), the manifest keeps no password on disk: the
 # Jobs' command lines, the browser config and #935's user Secrets carry the
 # bench users' password, and the run directory outlives the cluster (#939
 # review); redact_pw replaces it in place, success or not.
-kapply() { local rc=0; run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 -f "$1" || rc=$?; redact_pw "$1"; return "$rc"; }
+kapply() { local rc=0; run "${K[@]}" apply --server-side --force-conflicts --field-manager=bench606 ${KAPPLY_REQUEST_TIMEOUT_S:+--request-timeout="${KAPPLY_REQUEST_TIMEOUT_S}s"} -f "$1" || rc=$?; redact_pw "$1"; return "$rc"; }
 redact_pw() {
   python3 -c 'import sys; p, s = sys.argv[1], sys.argv[2]; t = open(p).read(); open(p, "w").write(t.replace(s, "<redacted>"))' \
       "$1" "$PW"
@@ -448,6 +465,9 @@ teardown() {
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   declare -F stop_sampler >/dev/null && stop_sampler top_boot
   declare -F stop_log_stream >/dev/null && stop_log_stream
+  # #1004: the full-widen stage's bodies and its password-bearing manifests
+  # never outlive the run, whatever stopped it (no cluster call)
+  declare -F fw_local_cleanup >/dev/null && fw_local_cleanup
   if [[ "$CLUSTER_CREATED" == "1" ]]; then
     # On ANY failure, snapshot the cluster BEFORE it is deleted (shakedown #2
     # tore down with nothing captured). Best effort: it never blocks teardown.
@@ -1922,21 +1942,35 @@ s_evaluate() {
 # verdict is final before it starts and nothing of it reaches a measured cell;
 # before teardown. A result is recorded whatever it is ($OUT/full-widen.json,
 # its lines in the run log); only tooling fails the step, after its cleanup.
+# Every wait is bounded and each bound is a term of FW_S (the budget above).
 FW_DIR="$OUT/full-widen"
 FW_POD=""
+# fw_left <deadline> <cap>: the seconds left to the deadline, at most cap (>= 1)
+fw_left() {
+  local l=$(( $1 - $(date +%s) ))
+  (( l > $2 )) && l=$2
+  (( l < 1 )) && l=1
+  echo "$l"
+}
 fw_pod() {
-  FW_POD="$("${K[@]}" --request-timeout=30s -n bench-loadgen get pods -l job-name=fullwiden606 \
+  local l
+  l="$(fw_left "$1" 30)"
+  FW_POD="$(bounded "$l" "${K[@]}" --request-timeout="${l}s" -n bench-loadgen get pods -l job-name=fullwiden606 \
       -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true)"
   [[ -n "$FW_POD" ]]
 }
-# fw_wait <file in the pod> <deadline>: 0 it exists, 3 the Job exited first, 1 the deadline
+# fw_wait <file in the pod> <deadline>: 0 it exists, 3 the Job exited first, 1
+# the deadline; every read in it bounded by what is left of the deadline
 fw_wait() {
-  local want="$1" deadline="$2"
+  local want="$1" deadline="$2" l
   while :; do
-    if fw_pod; then
-      bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$FW_POD" -- test -f "$want" \
+    (( $(date +%s) < deadline )) || return 1
+    if fw_pod "$deadline"; then
+      l="$(fw_left "$deadline" "$FW_EXEC_S")"
+      bounded "$l" "${K[@]}" --request-timeout="${l}s" -n bench-loadgen exec "$FW_POD" -- test -f "$want" \
         >/dev/null 2>&1 && return 0
-      if [[ "$want" != /out/exited ]] && bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen \
+      l="$(fw_left "$deadline" "$FW_EXEC_S")"
+      if [[ "$want" != /out/exited ]] && bounded "$l" "${K[@]}" --request-timeout="${l}s" -n bench-loadgen \
            exec "$FW_POD" -- test -f /out/exited >/dev/null 2>&1; then
         return 3
       fi
@@ -1971,12 +2005,27 @@ fw_objects() {
     (( bad == 0 )) || return 1
   done
 }
-# fw_cleanup: everything the stage made, each read bounded; the CRD last, its
-# deletion (the N objects with it) waited for within FW_DELETE_S
+# fw_local_cleanup: what the stage left on THIS disk, on every exit (the
+# teardown calls it too: a signal, a pair stop or an errexit mid-stage): the N
+# bodies (~70 MB at 50K), the reads' copies, and the bench password, which
+# job.yaml and probe.yaml carry until kapply redacts them (#939: the run
+# directory keeps no password). No cluster call.
+fw_local_cleanup() {
+  local f
+  rm -f "$OUT/.bench-password"
+  [[ -d "$FW_DIR" ]] || return 0
+  rm -f "$FW_DIR"/objects-*.yaml "$FW_DIR"/objects-*.yaml.err "$FW_DIR/snowplow-deploy.json" "$FW_DIR/configmaps.json"
+  for f in "$FW_DIR/job.yaml" "$FW_DIR/probe.yaml"; do
+    if [[ -f "$f" ]]; then redact_pw "$f"; fi
+  done
+}
+# fw_cleanup: the local part, then everything the stage made in the cluster,
+# each delete bounded; the CRD last, its deletion (the N objects with it)
+# waited for within FW_DELETE_S
 fw_cleanup() {
   local args t0
+  fw_local_cleanup
   [[ -f "$FW_DIR/plan.json" ]] || return 0
-  rm -f "$FW_DIR"/objects-*.yaml "$FW_DIR"/objects-*.yaml.err   # N bodies on disk (~70 MB at 50K)
   while read -r -a args; do
     bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" "${args[@]}" \
         >/dev/null 2>"$KERR" || log "full widen cleanup: $(kerr_line)"
@@ -1990,39 +2039,51 @@ fw_cleanup() {
   fi
 }
 fw_fail() { record_failure "full widen FAILED: $*" || true; fw_cleanup; return 1; }
+# fw_read <out file> <kubectl args...>: one bounded read (a FW_READS term)
+fw_read() {
+  local out="$1"
+  shift
+  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" "$@" > "$out" 2>"$KERR"
+}
 s_full_widen() {
-  local n bounds rc=0 since t_job f files=() pwf="$OUT/.bench-password" ln
+  local n bounds rc=0 since t_job f files=() pwf="$OUT/.bench-password" ln have
+  # every kapply of the stage: each request bounded (kapply reads it)
+  local KAPPLY_REQUEST_TIMEOUT_S="$COLLECT_TIMEOUT_S"
   FW_CRD="$(python3 -c 'from bench import full_widen as f; print(f.CRD_NAME)')"
   FW_WORKERS="$(python3 -c 'from bench import data_manifests as d; print(d.COMPOSITION_APPLY_WORKERS)')"
   FW_BACKOFFS="$(python3 -c 'from bench import data_manifests as d; print(*d.APPLY_RETRY_BACKOFFS_S)')"
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: full widen (#1004): after the evaluate step (the verdict is final), outside every measured window: N = $OUT/data-proof.json compositions; python3 -m bench.full_widen plan -> $FW_DIR; kapply crd.yaml; kapply the objects, ${FW_WORKERS} batches at a time (bound ${FW_CREATE_S}s); kapply probe.yaml + job.yaml; the Job's register read until it serves (bound ${FW_BOUND_S}s); kapply crd-widened.yaml; its settle until the build's end (bound ${FW_BOUND_S}s; job ${FW_JOB_S}s in all); copy /out; python3 -m bench.full_widen evaluate -> $OUT/full-widen.json; delete ${FW_CRD} (bound ${FW_DELETE_S}s)"
+    log "DRY: full widen (#1004): after the evaluate step (the verdict is final), outside every measured window: N = $OUT/data-proof.json compositions; python3 -m bench.full_widen plan -> $FW_DIR; kapply crd.yaml; kapply the objects, ${FW_WORKERS} batches at a time (bound ${FW_CREATE_S}s); kapply probe.yaml + job.yaml; the Job's register read until it serves (bound ${FW_BOUND_S}s); kapply crd-widened.yaml, then /out/widened (the settle's clock); its settle until the build's end (bound ${FW_BOUND_S}s; job ${FW_JOB_S}s in all); copy /out; python3 -m bench.full_widen evaluate -> $OUT/full-widen.json; delete ${FW_CRD} (bound ${FW_DELETE_S}s)"
     return 0
   fi
   mkdir -p "$FW_DIR"
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   n="$(python3 -m bench.full_widen proof-count < "$OUT/data-proof.json" 2>"$KERR")" \
-    || { record_failure "full widen FAILED: the data step's proof" || true; return 1; }
-  "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get deploy snowplow -o json > "$FW_DIR/snowplow-deploy.json" 2>"$KERR" \
-    || { record_failure "full widen FAILED: reading the snowplow Deployment (its relist bound)" || true; return 1; }
-  bounds="$(python3 -m bench.full_widen bounds --rollout-timeout-s "$FW_BOUND_S" < "$FW_DIR/snowplow-deploy.json")"
-  rm -f "$FW_DIR/snowplow-deploy.json"
+    || { fw_fail "the data step's proof"; return 1; }
+  fw_read "$FW_DIR/snowplow-deploy.json" -n krateo-system get deploy snowplow -o json \
+    || { fw_fail "reading the snowplow Deployment (its relist bound)"; return 1; }
+  fw_read "$FW_DIR/configmaps.json" -n krateo-system get configmap -o json \
+    || { fw_fail "reading the ConfigMaps its env comes from (its relist bound)"; return 1; }
+  bounds="$(python3 -m bench.full_widen bounds --deployment "$FW_DIR/snowplow-deploy.json" \
+      --configmaps "$FW_DIR/configmaps.json" --rollout-timeout-s "$FW_BOUND_S" 2>"$KERR")" \
+    || { fw_fail "the bounds"; return 1; }
+  rm -f "$FW_DIR/snowplow-deploy.json" "$FW_DIR/configmaps.json"
   if ! python3 -c 'import json, sys; b = json.loads(sys.argv[1]); sys.exit(0 if all(x["s"] <= float(sys.argv[2]) for x in b.values()) else 1)' \
        "$bounds" "$FW_BOUND_S"; then
-    record_failure "full widen FAILED: a mechanism's bound exceeds the run budget's ${FW_BOUND_S}s term: ${bounds}" || true
+    fw_fail "a bound exceeds the run budget's ${FW_BOUND_S}s term: ${bounds}"
     return 1
   fi
   log "full widen: bounds ${bounds}"
   (umask 077; printf '%s' "$PW" > "$pwf")
   python3 -m bench.full_widen plan --n "$n" --scale "$SCALE" --namespaces "$NAMESPACES" --out-dir "$FW_DIR" \
       --user-prefix "$BENCH_USER_PREFIX" --password-file "$pwf" --snowplow-url "$SNOWPLOW_URL" \
-      --authn-url "$AUTHN_URL" --bounds "$bounds" --linger-s "$(( FW_JOB_S + COLLECT_TIMEOUT_S ))" \
-      > "$FW_DIR/objects.list" 2>"$KERR" || rc=$?
+      --authn-url "$AUTHN_URL" --bounds "$bounds" --linger-s "$(( FW_JOB_S + FW_READS * COLLECT_TIMEOUT_S ))" \
+      --widen-wait-s "$FW_WIDEN_WAIT_S" > "$FW_DIR/objects.list" 2>"$KERR" || rc=$?
   rm -f "$pwf"
-  (( rc == 0 )) || { record_failure "full widen FAILED: the plan" || true; return 1; }
+  (( rc == 0 )) || { fw_fail "the plan"; return 1; }
   log "$(kerr_line)"
   while IFS= read -r f; do if [[ -n "$f" ]]; then files+=("$f"); fi; done < "$FW_DIR/objects.list"
-  kapply "$FW_DIR/crd.yaml" || { fw_fail "creating the CRD ${FW_CRD}"; return 1; }
+  bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/crd.yaml" || { fw_fail "creating the CRD ${FW_CRD}"; return 1; }
   bounded "$PREFLIGHT_TIMEOUT_S" "${K[@]}" wait --for=condition=Established "crd/${FW_CRD}" \
       --timeout="${PREFLIGHT_TIMEOUT_S}s" >/dev/null 2>"$KERR" \
     || { fw_fail "the CRD ${FW_CRD} not Established within ${PREFLIGHT_TIMEOUT_S}s"; return 1; }
@@ -2030,22 +2091,28 @@ s_full_widen() {
   capped "$FW_CREATE_S" "full widen objects" fw_objects "$(( t_job + FW_CREATE_S ))" "${files[@]}"
   (( CAPPED_HIT == 0 )) || { fw_fail "the objects were not created within ${FW_CREATE_S}s"; return 1; }
   rc=0
-  local have
   have="$(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" get "$FW_CRD" -A \
       --no-headers --chunk-size=500 2>"$KERR" | wc -l | tr -d ' ')" || rc=$?
   [[ "$have" == "$n" ]] || { fw_fail "${have:-?} of ${n} objects exist after the batches"; return 1; }
   log "full widen: ${n} objects created in $(( $(date +%s) - t_job ))s"
-  kapply "$FW_DIR/probe.yaml" >/dev/null 2>"$KERR" || { fw_fail "the stage's read and identity"; return 1; }
-  "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
-    | python3 -m bench.full_widen restarts > "$FW_DIR/pods-before.json" \
+  rm -f "$FW_DIR"/objects-*.yaml                  # the N bodies: applied and counted
+  bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/probe.yaml" >/dev/null 2>"$KERR" || { fw_fail "the stage's read and identity"; return 1; }
+  fw_read "$FW_DIR/pods-raw.json" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
     || { fw_fail "reading snowplow's pods before the stage"; return 1; }
-  kapply "$FW_DIR/job.yaml" || { fw_fail "the fullwiden606 Job"; return 1; }
+  python3 -m bench.full_widen restarts < "$FW_DIR/pods-raw.json" > "$FW_DIR/pods-before.json"
+  bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/job.yaml" || { fw_fail "the fullwiden606 Job"; return 1; }
   t_job=$(date +%s)
   rc=0
   fw_wait /out/armed "$(( t_job + PREFLIGHT_TIMEOUT_S + FW_BOUND_S ))" || rc=$?
   if (( rc == 0 )); then
     log "full widen: the GVR serves; widening ${FW_CRD}"
-    kapply "$FW_DIR/crd-widened.yaml" || { fw_fail "widening the CRD"; return 1; }
+    bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/crd-widened.yaml" || { fw_fail "widening the CRD"; return 1; }
+    # the settle's clock starts here: the Job sees /out/widened (its widen wait
+    # bounds this, FW_WIDEN_WAIT_S)
+    if fw_pod "$(( $(date +%s) + FW_EXEC_S ))"; then
+      bounded "$FW_EXEC_S" "${K[@]}" --request-timeout="${FW_EXEC_S}s" -n bench-loadgen exec "$FW_POD" -- \
+          touch /out/widened >/dev/null 2>&1 || log "full widen: could not tell the Job the widen was applied: it ends never_widened"
+    fi
     rc=0
     fw_wait /out/exited "$(( t_job + FW_JOB_S ))" || rc=$?
   elif (( rc == 3 )); then
@@ -2053,19 +2120,23 @@ s_full_widen() {
     rc=0
   fi
   (( rc == 0 )) || { fw_fail "the fullwiden606 Job did not finish within its ${FW_JOB_S}s"; return 1; }
-  fw_pod || true
+  fw_pod "$(( $(date +%s) + COLLECT_TIMEOUT_S ))" || true
   bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
       cp "${FW_POD}:/out" "$FW_DIR/out" >/dev/null 2>&1 \
     || { fw_fail "copying the Job's stream from ${FW_POD:-no pod}"; return 1; }
-  "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
-    | python3 -m bench.full_widen restarts > "$FW_DIR/pods-after.json" \
+  fw_read "$FW_DIR/pods-raw.json" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
     || { fw_fail "reading snowplow's pods after the stage"; return 1; }
+  python3 -m bench.full_widen restarts < "$FW_DIR/pods-raw.json" > "$FW_DIR/pods-after.json"
+  rm -f "$FW_DIR/pods-raw.json"
+  rm -f "$FW_DIR/snowplow.log"
   bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system logs deploy/snowplow \
-      --since-time="$since" --timestamps 2>/dev/null | scrub --kubelet-timestamps > "$FW_DIR/snowplow.log" \
-    || log "full widen: could not read snowplow's log since ${since}"
+      --since-time="$since" --timestamps 2>/dev/null | scrub --kubelet-timestamps > "$FW_DIR/snowplow.log.part" \
+    && mv "$FW_DIR/snowplow.log.part" "$FW_DIR/snowplow.log" \
+    || log "full widen: could not read snowplow's log since ${since}: its schema relists are unattributed (the stage FAILs)"
+  rm -f "$FW_DIR/snowplow.log.part"
   python3 -m bench.full_widen evaluate --stream "$FW_DIR/out/widen.jsonl" --plan "$FW_DIR/plan.json" \
       --pods-before "$FW_DIR/pods-before.json" --pods-after "$FW_DIR/pods-after.json" \
-      --out "$OUT/full-widen.json" 2>"$FW_DIR/report.txt" \
+      --log "$FW_DIR/snowplow.log" --out "$OUT/full-widen.json" 2>"$FW_DIR/report.txt" \
     || { fw_fail "evaluating the stage's stream: $(tail -3 "$FW_DIR/report.txt")"; return 1; }
   while IFS= read -r ln; do if [[ -n "$ln" ]]; then log "$ln"; fi; done < "$FW_DIR/report.txt"
   fw_cleanup
