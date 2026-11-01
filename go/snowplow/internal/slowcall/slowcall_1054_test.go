@@ -278,9 +278,10 @@ func TestS1054_SnapshotIsRateLimitedToOnePerWindow(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 
-	a := time.Now()
 	blockedRequest(t, m, "key-a", release)
-	t0 := a.Add(2 * bound)
+	// After the request has started (its start is recorded), so the check
+	// time is past the bound whatever the scheduler did.
+	t0 := time.Now().Add(2 * bound)
 	if !m.check(t0) {
 		t.Fatalf("SNAPSHOT RED: no snapshot for a request in flight past the bound")
 	}
