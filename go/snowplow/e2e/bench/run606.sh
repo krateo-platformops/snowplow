@@ -1912,6 +1912,13 @@ s_evaluate() {
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
   local vrc=0
+  # test hook (#1051), like BENCH_606_FAIL_AT=<step>: BENCH_606_HOLD_IN=evaluate
+  # holds the step's own run here (a real evaluate takes ~810-830 s) so a signal
+  # can land mid-evaluate; the teardown's evaluate is never held
+  if [[ "${BENCH_606_HOLD_IN:-}" == "evaluate" && "${IN_TEARDOWN:-0}" != "1" ]]; then
+    log "test hold inside evaluate"
+    sleep 60 & wait "$!" || true
+  fi
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
