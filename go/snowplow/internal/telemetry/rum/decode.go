@@ -17,8 +17,12 @@ import (
 const (
 	// MaxSpansPerRequest: the browser exporter's default maxExportBatchSize.
 	MaxSpansPerRequest = 512
-	// MaxAttributesPerSpan: a krateo.* span carries 3 allowlisted attributes;
-	// the browser fetch instrumentation adds about ten more, all dropped.
+	// MaxAttributesPerSpan bounds what the browser SENDS, not what is
+	// forwarded: a krateo.* span carries at most 4 allowlisted attributes
+	// (its row of spanAllowlist: the 3 http.* keys, plus
+	// krateo.interaction.abandoned on an interaction span), and the browser
+	// fetch instrumentation adds about ten more, all dropped. 64 leaves room
+	// for both.
 	MaxAttributesPerSpan = 64
 	// MaxResourceAttributes: the browser SDK resource carries about ten.
 	MaxResourceAttributes = 64
@@ -256,9 +260,11 @@ func (d *walker) span() (span, error) {
 }
 
 // keyValue walks one OTLP/JSON KeyValue, and its AnyValue, with the same
-// repeated-key refusal as every other object. Only stringValue and intValue
-// are kept (the allowlist never needs another type); any other AnyValue member
-// (arrayValue, kvlistValue, bytesValue, …) is scanned past without being built.
+// repeated-key refusal as every other object. Only stringValue, intValue and
+// boolValue are kept (the allowlist never needs another type); any other
+// AnyValue member (doubleValue, arrayValue, kvlistValue, bytesValue, …) is
+// scanned past without being built. A kept member whose JSON is not its type
+// (a boolValue of "true") is not OTLP/JSON: the request is refused 400.
 func (d *walker) keyValue() (keyValue, error) {
 	var kv keyValue
 	err := d.object(func(key string) error {
@@ -281,6 +287,13 @@ func (d *walker) keyValue() (keyValue, error) {
 						return err
 					}
 					kv.Value.IntValue = &n
+					return nil
+				case "boolValue":
+					var b bool
+					if err := d.value(&b); err != nil {
+						return err
+					}
+					kv.Value.BoolValue = &b
 					return nil
 				default:
 					return d.skip()
