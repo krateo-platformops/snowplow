@@ -280,8 +280,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// reaches the page-keyed resolve of the requested page.
 			Cursor: opts.Cursor,
 		}
-		if _, rerr := restactions.Resolve(rctx, raopts); rerr != nil {
+		_, tree, exact, rerr := restactions.ResolveStatusTree(rctx, raopts)
+		if rerr != nil {
 			return nil, nil, rerr
+		}
+		// #1079 — the RESTAction's filter output is already a Go tree; the
+		// bytes in Status.Raw were encoded from it a moment ago. When the tree
+		// is exactly what decoding those bytes yields, take it instead of
+		// re-parsing them (on run 20's refresher that decode was ~12% of all
+		// CPU). Otherwise decode, as always.
+		if exact {
+			return tree, local.Status.Raw, nil
 		}
 		return rawExtensionToMapEncoded(local.Status)
 	}
