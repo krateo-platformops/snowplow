@@ -150,7 +150,8 @@ func gateContentEnvelope(
 	}
 	if name == "" {
 		// LIST envelope: {apiVersion, kind, items:[...]}.
-		return gateListEnvelope(ctx, gvr, ns, raw)
+		_, rawQuery, _ := splitPathQuery(call.GetPath())
+		return gateListEnvelope(ctx, gvr, ns, rawQuery, raw)
 	}
 	// GET-by-name: raw is a single object.
 	v, ok := gateGetEnvelope(ctx, gvr, raw)
@@ -286,12 +287,13 @@ func stripManagedFields(obj map[string]any) {
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
 //
-// namespace is the LIST's own namespace ("" = cluster-wide). A non-nil error
-// is filterListByRBAC's: a *regateDeniedError (the requester may not make this
-// LIST, #961) or errGateFallthrough (not decided here — the caller falls
-// through to the apiserver).
-func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace string, parsed parsedListEnvelope) (any, error) {
-	kept, err := filterListByRBAC(ctx, gvr, namespace, parsed.items)
+// namespace is the LIST's own namespace ("" = cluster-wide) and rawQuery its
+// own query string (#1049: a metadata.name field selector carries a Name). A
+// non-nil error is filterListByRBAC's: a *regateDeniedError (the requester may
+// not make this LIST, #961) or errGateFallthrough (not decided here — the
+// caller falls through to the apiserver).
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, parsed parsedListEnvelope) (any, error) {
+	kept, err := filterListByRBAC(ctx, gvr, namespace, rawQuery, parsed.items)
 	if err != nil {
 		return nil, err
 	}
@@ -351,13 +353,13 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 // envelope, or a refresh path that stored RawJSON only). The hot path
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace string, raw []byte) (any, error) {
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, raw []byte) (any, error) {
 	parsed, ok := parseListEnvelope(gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
 		return nil, errGateFallthrough
 	}
-	return gateListItems(ctx, gvr, namespace, parsed)
+	return gateListItems(ctx, gvr, namespace, rawQuery, parsed)
 }
 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
@@ -1225,7 +1227,8 @@ func apistageContentServeAttempt(
 				gateErr = errGateFallthrough
 			}
 		} else {
-			gated, gateErr = gateListItems(ctx, gvr, ns, parsed)
+			_, rawQuery, _ := splitPathQuery(call.Path)
+			gated, gateErr = gateListItems(ctx, gvr, ns, rawQuery, parsed)
 		}
 	} else {
 		gated, gateErr = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)

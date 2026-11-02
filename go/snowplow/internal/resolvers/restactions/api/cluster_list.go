@@ -258,17 +258,14 @@ func attemptClusterListCollapse(
 		// per-user token / SA-dispatch downstream narrows correctly.
 		return nil, false, 5
 	}
-	permitOpts := rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "list",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: "", // cluster-scope check — evaluate.go:213-235
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	}
+	// #1049 — the check of the collapsed call itself: the cluster scope
+	// (Namespace "", evaluate.go:213-235) and the canonical query the call
+	// carries (buildClusterListCallQ), so a metadata.name selector carries its
+	// Name here exactly as at the serve gate (filterListByRBAC).
+	permitOpts := rbac.CollectionCheck(user.Username, user.Groups, gvr, "", query)
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	permitOpts.SkipBindingUID = true
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 	// ignores matchedBindingUID.
 	permit, _, evalErr := rbac.EvaluateRBAC(ctx, permitOpts)

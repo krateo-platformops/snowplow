@@ -787,7 +787,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		for i := range resultList.Items {
 			items[i] = &resultList.Items[i]
 		}
-		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, items)
+		// #1049: the requester's own request, query included.
+		_, rawQuery, _ := splitPathQuery(call.Path)
+		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, rawQuery, items)
 		if isRegateDenied(gateErr) {
 			return nil, false, gateErr
 		}

@@ -26,7 +26,6 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // evaluateRBACCallCount is a process-scoped counter of EvaluateRBAC
@@ -102,20 +101,14 @@ type EvaluateOptions struct {
 	Resource string
 	// Namespace is the request namespace. Empty string = cluster-wide.
 	Namespace string
-	// Name is the request object's name. For name-specific verbs
-	// ("get"/"update"/"patch"/"delete" and similar) it is the name of
-	// the single object the request targets — e.g. for a per-item check
-	// on a served LIST it is that item's metadata.name. Empty string
-	// means "no single named object" (the request is a collection-verb
-	// such as "list"/"watch"/"create"/"deletecollection", or the caller
-	// did not thread a name).
-	//
-	// Name is consumed by Kubernetes `resourceNames` semantics
-	// (ResourceNameMatches): a PolicyRule with a non-empty
-	// rule.ResourceNames only matches a request whose Name is in that
-	// list — and only for name-specific verbs. A resourceNames-scoped
-	// rule NEVER grants a collection verb. See rulesPermit /
-	// resourceNameMatches below.
+	// Name is the request's Name, as the apiserver's RequestInfo derives
+	// it: the object segment of an item URL (get / update / patch /
+	// delete), the value of a `fieldSelector=metadata.name=` on a list or
+	// watch (#1049), and "" for any other collection request. Build it
+	// with ObjectCheck or CollectionCheck, never by hand: the evaluator
+	// compares it with a rule's resourceNames whatever the verb
+	// (Kubernetes' ResourceNameMatches), so a Name the real request would
+	// not carry would match a rule the apiserver never matches.
 	Name string
 
 	// SkipBindingUID, when true, lets the evaluator SKIP the
@@ -249,21 +242,15 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	}()
 
 	if cache.Disabled() {
-		// Cache=off correctness baseline. UserCan reads the user's
-		// endpoint from ctx and issues a SelfSubjectAccessReview. No
-		// BindingUID is available (no snapshot).
-		ok := UserCan(ctx, UserCanOptions{
-			Verb: opts.Verb,
-			GroupResource: schema.GroupResource{
-				Group: opts.Group, Resource: opts.Resource,
-			},
-			Namespace: opts.Namespace,
-			// #1046 — the review carries the object's name, or a
-			// resourceNames-scoped grant the in-process path honours is
-			// denied here (the userAccessFilter cache=off divergence).
-			Name: opts.Name,
-		})
-		return ok, "", nil
+		// Cache=off correctness baseline: a SelfSubjectAccessReview with
+		// the user's endpoint from ctx. No BindingUID is available (no
+		// snapshot). The review asks about exactly the check the caller
+		// built (ObjectCheck or CollectionCheck): #1046 — it carries the
+		// object's name, or a resourceNames-scoped grant the in-process
+		// path honours is denied here; #1049 — it carries a list's
+		// field-selector Name, which re-deriving it from the verb would
+		// drop.
+		return selfSubjectAccessReview(ctx, opts), "", nil
 	}
 
 	rw := cache.Global()
@@ -904,20 +891,15 @@ func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	return false
 }
 
-// nameSpecificVerbs is snowplow's map of which request verbs address an
-// ITEM URL — and so carry the object's name — for the plain item and
-// collection URLs snowplow builds: get / update / patch / delete name the
-// object; list / watch / create / deletecollection address the collection
-// URL and name none.
+// nameSpecificVerbs are the verbs whose PLAIN request URL is an item URL —
+// get / update / patch / delete — and so names the object. list / watch /
+// create / deletecollection address the collection URL, which names none.
 //
-// It is NOT the upstream rule. Kubernetes' ResourceNameMatches ignores the
-// verb and compares the rule's resourceNames with the request's Name, which
-// RequestInfo takes from the URL (and also from a list/watch
-// `fieldSelector=metadata.name=`, or a named subresource). For a plain URL
-// a collection request has Name "", so a resourceNames rule never matches it
-// — which is exactly what gating on this table reproduces. A request shape
-// this table does not model (a fieldSelector list/watch, a create on a named
-// subresource, a non-HTTP verb) is over-denied here, never over-granted.
+// It is a fact about URL shapes, consulted where a check is BUILT
+// (ObjectCheck), never where one is evaluated: resourceNameMatches is the
+// upstream rule and does not look at the verb (#1049). A list or watch can
+// still carry a Name — from a `fieldSelector=metadata.name=` — and
+// CollectionCheck derives that Name exactly as the apiserver does.
 var nameSpecificVerbs = map[string]struct{}{
 	"get":    {},
 	"update": {},
@@ -925,46 +907,35 @@ var nameSpecificVerbs = map[string]struct{}{
 	"delete": {},
 }
 
-// IsNameSpecificVerb reports whether verb acts on a single named object —
-// i.e. whether a resourceNames-scoped rule (and therefore the request's
-// object Name) can EVER matter for this verb. It is the exact predicate
-// resourceNameMatches uses internally, exported so callers that derive a
-// per-object Name (e.g. the userAccessFilter refilter's NameFrom, #123) can
-// skip that derivation for collection verbs — where the Name is never
-// consulted — rather than fail-closed on a Name-derivation error that would
-// be irrelevant to the grant. The "*" verb wildcard on a request is not a
-// real request verb (requests carry a concrete verb), so it is not listed;
-// resourceNameMatches handles the rule-side wildcard separately.
+// IsNameSpecificVerb reports whether verb's plain request URL is an item URL,
+// so a check about one object with this verb carries the object's name
+// (ObjectCheck). Callers that derive a per-object Name (e.g. the
+// userAccessFilter refilter's NameFrom, #123) use it to skip that derivation
+// for collection verbs, whose per-object checks carry no name. The "*" verb
+// wildcard on a request is not a real request verb (requests carry a
+// concrete verb), so it is not listed.
 func IsNameSpecificVerb(verb string) bool {
 	_, ok := nameSpecificVerbs[verb]
 	return ok
 }
 
-// resourceNameMatches is Kubernetes `ResourceNameMatches` for a single
-// PolicyRule (0.30.109, G1), over the request shapes snowplow evaluates:
+// resourceNameMatches is Kubernetes' ResourceNameMatches for a single
+// PolicyRule (pkg/apis/rbac/v1 evaluation_helpers.go), exactly:
 //
-//   - rule.ResourceNames empty  → matches all objects (unchanged
-//     behaviour for unscoped rules).
-//   - rule.ResourceNames non-empty → the request's object name
-//     (opts.Name) must appear in rule.ResourceNames. Upstream compares the
-//     NAME only; the verb gate below is snowplow's stand-in for "this request
-//     URL names no object" (nameSpecificVerbs): a collection verb's plain URL
-//     has Name "" upstream, so the rule cannot match it there either.
+//   - rule.ResourceNames empty → matches every request;
+//   - otherwise the request's Name (opts.Name) must be listed.
 //
-// opts.Verb is already known to satisfy the rule's Verbs list by the
-// time this is called (rulesPermit checks Verbs first). We re-derive
-// the name-specific predicate from opts.Verb itself rather than the
-// rule's Verbs so that a wildcard-verb rule with resourceNames is still
-// correctly denied for a collection-verb request.
+// It does not look at the verb (#1049). Which requests carry a Name is the
+// request's shape, decided where the check is built — ObjectCheck for an
+// item URL, CollectionCheck for a list or watch, whose Name comes from a
+// `fieldSelector=metadata.name=` — so a collection request without a name
+// selector carries Name "" and a resourceNames rule cannot match it, as
+// upstream. Before #1049 a verb gate here refused every list and watch, so a
+// `list resourceNames: [x]` grant was denied a list the apiserver allows.
 func resourceNameMatches(rule rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	if len(rule.ResourceNames) == 0 {
 		return true
 	}
-	// Non-empty ResourceNames: only name-specific verbs can match.
-	if _, nameSpecific := nameSpecificVerbs[opts.Verb]; !nameSpecific {
-		return false
-	}
-	// The targeted object's name must be in the list.
 	for _, n := range rule.ResourceNames {
 		if n == opts.Name {
 			return true
