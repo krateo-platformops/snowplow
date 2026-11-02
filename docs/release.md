@@ -34,9 +34,9 @@ One tag ships everything. This monorepo has a single version line: the app image
      `ghcr.io/krateo-platformops/snowplow:X.Y.Z`.
    - [`release-oci.yaml`](../.github/workflows/release-oci.yaml) (the canonical,
      byte-identical org workflow) discovers every first-class chart under `helm/`,
-     substitutes the `Chart.yaml` placeholders (`CHART_VERSION` → the tag;
-     `APP_VERSION` → the latest app semver tag, which in this monorepo is the same
-     tag), packages, and pushes →
+     substitutes the `Chart.yaml` placeholders (`CHART_VERSION` and `APP_VERSION`
+     → the tag being released, passed explicitly so that pushing several tags at
+     once cannot give an older chart a newer `appVersion`), packages, and pushes →
      `oci://ghcr.io/krateo-platformops/charts/snowplow:X.Y.Z` and
      `oci://ghcr.io/krateo-platformops/charts/snowplow-crds:X.Y.Z`.
 

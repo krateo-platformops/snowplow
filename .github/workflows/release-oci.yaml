@@ -14,10 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       chart_version:
-        description: "Chart version (CHART_VERSION). Default: the git tag."
+        description: "Chart version (CHART_VERSION). Default: the tag this runs on."
         required: false
       app_version:
-        description: "App image version (APP_VERSION). Default: latest tag of the app repo."
+        description: "App image version (APP_VERSION). Default: the tag this runs on (run from a branch: the latest tag of the app repo)."
         required: false
 
 jobs:
@@ -26,6 +26,18 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Both versions are the tag being released (#1057). Snowplow's chart and image are released
+    # together from the same tag, so the chart for X.Y.Z must say appVersion X.Y.Z; the deployment's
+    # image tag defaults to .Chart.AppVersion.
+    #
+    # Left empty, the shared workflow sets APP_VERSION to the newest tag in the repo, read at the
+    # moment each of its jobs runs. That is only right when one tag is pushed at a time. Pushing
+    # 1.12.61-1.12.64 together published 1.12.61, 1.12.62 and 1.12.63 all with appVersion 1.12.64.
+    # The image check also looked the version up separately, so for 1.12.61 it checked the 1.12.61
+    # image while the published chart pointed at 1.12.64.
+    #
+    # A manual run's inputs still override. A manual run from a branch, which has no tag, keeps the
+    # shared workflow's default.
     with:
-      chart_version: ${{ github.event.inputs.chart_version || '' }}
-      app_version: ${{ github.event.inputs.app_version || '' }}
+      chart_version: ${{ github.event.inputs.chart_version || (github.ref_type == 'tag' && github.ref_name || '') }}
+      app_version: ${{ github.event.inputs.app_version || (github.ref_type == 'tag' && github.ref_name || '') }}
