@@ -476,8 +476,13 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	// silently.
 	AssertRBACTypedOverridesRegistered()
 
-	rw.factory.Start(rw.stopCh)
+	// #1016 — factory.Start is where the watcher escapes to other goroutines:
+	// its informers' handlers run from here on and can bind it to the
+	// dep-watch bridge through a submit. So the constructor's last write to
+	// the watcher comes first; everything after Start only reads it or
+	// spawns goroutines.
 	rw.started = true
+	rw.factory.Start(rw.stopCh)
 
 	// 0.30.9 Sub-scope B: now that the factory has started the
 	// constructor-registered informers (the four RBAC GVRs),
@@ -528,6 +533,15 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		slog.String("rbac.evaluate_path", "in-process"),
 		slog.String("subject_access_review_calls_in_cache_on_path", "banned"),
 	)
+
+	// #1016 — bind the watcher to the dep-watch bridge only now that it is
+	// fully built. Its dep handlers (registered above) feed the bridge, so it
+	// is the watcher the dep worker probes and the one the test reset stops
+	// (stopBoundDepWatcherForTest), from before its first event. The bind
+	// used to happen inside depEventHandler, i.e. at the first registration
+	// in the loop above: the worker could then read rw.informers while this
+	// constructor was still writing it.
+	depWatchSingleton().watcher.Store(rw)
 
 	return rw, nil
 }
