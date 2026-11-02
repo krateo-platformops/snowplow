@@ -272,11 +272,25 @@ type refresher struct {
 	priorityGetMu sync.Mutex
 	// #799 fix 2 — viewedActive: workers in viewed-tier work now (guarded by
 	// priorityGetMu); lastViewed: the last priority dequeue was viewed (p=1
-	// alternation; cleared by any normal-tier dequeue, the wake key included).
+	// alternation; cleared by any cluster_list or normal-tier dequeue — not by
+	// the wake key, which is not a turn, #1069).
 	viewedActive int
 	lastViewed   atomic.Bool
-	inFlightMu   sync.Mutex
-	inFlightKeys map[string]bool
+	// #1069 — the mirror reservation (refresher_viewed.go nextDequeue):
+	// unviewedActive counts workers holding a NON-viewed slot (normal or
+	// cluster_list work, or blocked in the normal tier's Get), at most
+	// parallelism−1, so one worker is always free for viewed work.
+	// reserveWaiting counts workers parked on reserveCond (L = priorityGetMu)
+	// for viewed work and not yet signalled; both guarded by priorityGetMu.
+	unviewedActive int
+	// normalGetBlocked: workers inside the normal tier's Get (#1069): the only
+	// ones a wake key can reach.
+	normalGetBlocked int
+	reserveWaiting   int
+	reserveStopped   bool
+	reserveCond      sync.Cond
+	inFlightMu       sync.Mutex
+	inFlightKeys     map[string]bool
 
 	// work (#930) counts the keys queued or in a worker's hands across every
 	// tier (refresher_quiescence.go).
@@ -381,6 +395,11 @@ type refresher struct {
 	// "both tiers progress in proportion".
 	clusterListEnqueueTotal   atomic.Uint64
 	clusterListCompletedTotal atomic.Uint64
+	// normalCompletedTotal (#1069) ticks every successful drain of the normal
+	// tier: with the viewed (viewed.completed) and cluster_list counts it splits
+	// completed by tier, so a paired run can see the normal tier progress in
+	// every interval under the viewed reservation.
+	normalCompletedTotal atomic.Uint64
 
 	startedOnce sync.Once
 	stopOnce    sync.Once
@@ -459,13 +478,17 @@ func refresherSingleton() *refresher {
 		r := &refresher{
 			parallelism:      parallelism,
 			work:             work,
-			queue:            newRefresherTierQueue("refresher_normal", rl, work, nil),
 			clusterListQueue: newRefresherTierQueue("refresher_cluster_list", clRL, work, nil),
 			inFlightKeys:     map[string]bool{},
 			handlers:         map[string]RefreshFunc{},
 			resolveLatency:   newP2Quantile(0.95),
 			dirtyStats:       newDirtyWindowStats(),
 		}
+		r.reserveCond.L = &r.priorityGetMu // #1069 — the reserved worker's park
+		// #1069 — the normal tier's shutdown also releases a parked reserved worker.
+		r.queue = newRefresherTierQueue("refresher_normal", rl, work, func(q workqueue.TypedInterface[string]) workqueue.TypedInterface[string] {
+			return &shutdownNotifyingQueue{TypedInterface: q, onShutDown: r.wakeReservedOnShutdown}
+		})
 		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work)
 		refresherInstance.Store(r)
 	})
@@ -923,52 +946,43 @@ func (r *refresher) yieldToCustomer(ctx context.Context) {
 // in expectation (every cluster_list arrival wakes at least one worker
 // that will Get it on its next loop iteration).
 func (r *refresher) processNext(ctx context.Context) bool {
-	// Path 3.2 — high-priority drain probe. If the cluster_list tier
-	// has work pending, pick it up first. Len() is cheap (atomic read
-	// inside the workqueue); a non-zero value guarantees the next
-	// Get() either returns an item promptly OR returns shutdown=true
-	// (queue ShutDown). On shutdown of clusterListQueue we fall back
-	// to the normal tier (which may still be live during a partial
-	// shutdown window — production shuts both together via the
-	// ctx.Done goroutine, but tests may shutdown only one).
-	var (
-		key      string
-		shutdown bool
-		fromCL   bool
-		tier     = tierNormal
-	)
-	// #765 — the VIEWED tier first (refresher_viewed.go): cells open on a page.
-	// #799 B1 — the probe and its Get are ONE step (tryPriorityGet): two workers
-	// that both saw Len()==1 must not both reach the blocking Get, or the loser
-	// parks there and the normal tier runs a worker short.
-	if k, ok := r.tryPriorityGet(r.viewedQueue, tierViewed); ok {
-		key, tier = k, tierViewed
-	} else if k, ok := r.tryPriorityGet(r.clusterListQueue, tierClusterList); ok {
-		key, tier, fromCL = k, tierClusterList, true
-		r.lastViewed.Store(false) // #799 N4: a cluster_list turn counts too
-	}
-	if tier == tierNormal {
-		// Normal tier blocking Get. This is the steady-state path
-		// (cluster_list events are infrequent — boot pre-warm
-		// populates ~10-15 cells then refreshes only on informer
-		// events on the underlying GVRs).
+	// Source selection (refresher_viewed.go nextDequeue): the VIEWED tier first
+	// (#765: cells open on a page), then cluster_list (Path 3.2), then the
+	// blocking normal Get. #799 B1 — a priority tier's probe and its Get are ONE
+	// step. #1069 — unviewed work never holds the last worker: a worker that may
+	// take neither side's slot parks until viewed work arrives.
+	key, tier, pick := r.nextDequeue()
+	fromCL := tier == tierClusterList
+	switch pick {
+	case pickShutdown:
+		return false
+	case pickNormal:
+		// Normal tier blocking Get, holding an unviewed slot. This is the
+		// steady-state path (cluster_list events are infrequent — boot pre-warm
+		// populates ~10-15 cells then refreshes only on informer events on the
+		// underlying GVRs).
+		var shutdown bool
 		key, shutdown = r.queue.Get()
 		if shutdown {
+			r.leftNormalGet(true)
 			return false
 		}
-		r.lastViewed.Store(false) // #799 fix 2: p=1 alternation
 		if key == viewedWakeKey {
 			// #765 idle wake: back to the viewed probe; wake the next idle worker
 			// while more viewed keys wait — but only when the reservation has a
 			// slot for it (#799 B3: re-adding with every slot full made the
 			// reserved worker busy-spin on the wake key). A slot release wakes
-			// again (endViewed).
+			// again (endViewed). #1069 — the wake key is not a turn: lastViewed
+			// stays as it was, so p=1 alternation counts only real dequeues.
+			r.leftNormalGet(true)
 			r.queue.Done(key)
 			if r.viewedQueue != nil && r.viewedQueue.Len() > 1 {
 				r.wakeViewed()
 			}
 			return true
 		}
+		r.leftNormalGet(false)    // the slot is held until this key's Done
+		r.lastViewed.Store(false) // #799 fix 2: p=1 alternation
 	}
 	switch tier {
 	case tierViewed:
@@ -986,9 +1000,15 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		}()
 		r.viewed.dequeued.Add(1)
 	case tierClusterList:
-		defer r.clusterListQueue.Done(key)
+		defer func() {
+			r.clusterListQueue.Done(key)
+			r.endUnviewed() // #1069
+		}()
 	default:
-		defer r.queue.Done(key)
+		defer func() {
+			r.queue.Done(key)
+			r.endUnviewed() // #1069
+		}()
 	}
 	// #765 — exactly once: a key whose triggers another tier's dequeue already
 	// consumed has nothing left to do (refresher_viewed.go). Before the yield: a
@@ -1202,6 +1222,10 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// part of the measured time. The stamp stays in the map (in flight) so a
 	// customer hit during the re-resolve still counts as a stale serve.
 	t0, windowOpen := r.beginWindow(key)
+	if windowOpen {
+		// #1069 — how old the change this dequeue is about to refresh is, by side.
+		r.dirtyStats.observeDequeueAge(tier == tierViewed, windowNow().Sub(t0))
+	}
 	// #603 PR-2 SHADOW audit — take the key's {avoided, tainted} pair with its
 	// trigger set; the terminal write reports the bytes against it.
 	rctx, auditTok := r.narrowAuditDequeue(rctx, key)
@@ -1405,8 +1429,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// dirty-mark of the same key starts from a clean backoff.
 	q.Forget(key)
 	r.completedTotal.Add(1)
-	if fromCL {
+	switch tier { // #1069 — per-tier completions
+	case tierClusterList:
 		r.clusterListCompletedTotal.Add(1)
+	case tierViewed:
+		r.viewed.completed.Add(1)
+	default:
+		r.normalCompletedTotal.Add(1)
 	}
 	if windowOpen {
 		r.settleDequeue(key, t0, ok && entry != nil, outcome)
@@ -1550,6 +1579,17 @@ type refresherStats struct {
 	viewedUnsubscribed    uint64 `stat:"viewed_unsubscribed"`
 	deferredInFlight      uint64 `stat:"deferred_in_flight"` // #799 B2
 	viewedQueueDepth      int64  `stat:"viewed_queue_depth" kind:"gauge" desc:"Live depth of the refresher's viewed tier (#765): dirty cells open on a page, drained before every other tier."`
+
+	// #1069 — the reservation of one worker for viewed work
+	// (refresher_viewed.go nextDequeue): completions by tier, the reserved
+	// worker's parks, and the age of the change a dequeue runs, by side.
+	normalCompleted    uint64 `stat:"normal_completed"`
+	viewedCompleted    uint64 `stat:"viewed_completed"`
+	viewedReserveParks uint64 `stat:"viewed_reserve_parks"`
+	viewedAgeP95MS     int64  `stat:"viewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a viewed-tier dequeue is about to refresh (its dirty mark to the dequeue that runs it), over roughly the last OTLP export interval (#1069)."`
+	viewedAgeMaxMS     int64  `stat:"viewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a viewed-tier dequeue is about to refresh, over roughly the last OTLP export interval (#1069)."`
+	unviewedAgeP95MS   int64  `stat:"unviewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a normal or cluster_list dequeue is about to refresh (its dirty mark to the dequeue that runs it), over roughly the last OTLP export interval (#1069)."`
+	unviewedAgeMaxMS   int64  `stat:"unviewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a normal or cluster_list dequeue is about to refresh, over roughly the last OTLP export interval (#1069)."`
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -1560,7 +1600,17 @@ func refresherStatsSnapshot() refresherStats {
 		return refresherStats{}
 	}
 	p95, mx := r.dirtyStats.d2f.read()
+	vP95, vMax := r.dirtyStats.dequeueAge[ageViewed].read()
+	uP95, uMax := r.dirtyStats.dequeueAge[ageUnviewed].read()
 	return refresherStats{
+		normalCompleted:    r.normalCompletedTotal.Load(),
+		viewedCompleted:    r.viewed.completed.Load(),
+		viewedReserveParks: r.viewed.reserveParks.Load(),
+		viewedAgeP95MS:     int64(vP95),
+		viewedAgeMaxMS:     int64(vMax),
+		unviewedAgeP95MS:   int64(uP95),
+		unviewedAgeMaxMS:   int64(uMax),
+
 		parkedMS:             r.parkedNanos.Load() / uint64(time.Millisecond),
 		dirtyToFreshSamples:  r.dirtyStats.samples.Load(),
 		unfreshRemarked:      r.dirtyStats.unfresh[unfreshRemarked].Load(),
@@ -1679,6 +1729,12 @@ func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
 		r.viewed.unsubscribed.Add(n)
 	case "deferred_in_flight":
 		r.viewed.deferredInFlight.Add(n)
+	case "normal_completed":
+		r.normalCompletedTotal.Add(n)
+	case "viewed_completed":
+		r.viewed.completed.Add(n)
+	case "viewed_reserve_parks":
+		r.viewed.reserveParks.Add(n)
 	case "parked_ms":
 		r.parkedNanos.Add(n * uint64(time.Millisecond))
 	case "dirty_to_fresh_samples":

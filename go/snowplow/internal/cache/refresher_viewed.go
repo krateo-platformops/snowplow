@@ -45,6 +45,18 @@
 //     is still queued (the reservation gives the normal tier turns, so it could
 //     otherwise run first, as background).
 //
+// #1069 (run 20: a viewer waited 2.4–3.2 s p95 for a change, against 1 s):
+//   - RESERVE A WORKER FOR VIEWED WORK, the mirror of fix 2. All N workers
+//     could be in ~0.9 s unviewed re-resolves at once, and the viewed tier was
+//     probed only when one ended. Now normal + cluster_list work holds at most
+//     parallelism−1 workers (unviewedSlotFree; a worker blocked in the normal
+//     Get holds its slot), so one worker is always free or already in viewed
+//     work. A worker that may take neither side parks on reserveCond and is
+//     woken by wakeViewed — the same wake every viewed add already makes — never
+//     by a poll. No new constant: both bounds are parallelism−1.
+//   - PARALLELISM 1: nothing can be reserved; the tiers alternate, and the wake
+//     key is not a turn (viewedSlotFree).
+//
 // UNCHANGED: yieldToCustomer before every tier, the per-key rate floor (applied
 // after the dequeue, so it covers the viewed tier and defers onto it), the
 // suppression, known-stale and poison-pill paths.
@@ -136,6 +148,12 @@ type viewedTierStats struct {
 	// deferredInFlight (#799 B2): dequeues not run because another tier's
 	// worker was re-resolving the same key; the key was re-added when it ended.
 	deferredInFlight atomic.Uint64
+	// #1069 — completed: successful viewed-tier dequeues (the viewed share of
+	// the pool's completed); reserveParks: parks of a worker that could take
+	// neither side's slot (the reserved worker waiting for viewed work). A park
+	// is one Wait, so its rate is bounded by the work, never by elapsed time.
+	completed    atomic.Uint64
+	reserveParks atomic.Uint64
 }
 
 // enqueueViewed adds l1Key to the viewed tier and wakes an idle worker.
@@ -254,32 +272,82 @@ func (r *refresher) routeDirty(l1Key string) {
 // tier's Len()>0 probe and its Get, so an arm can hold a worker exactly there.
 var tierProbeHook atomic.Pointer[func(refreshTier)]
 
-// tryPriorityGet takes one key from a priority tier (viewed, cluster_list) when
-// it has one, WITHOUT ever blocking: the probe and the Get run under one mutex
-// (#799 B1), and processNext is the tiers' only consumer, so a Len()>0 seen
-// under the lock is a key the Get returns at once. Before, two workers could
-// both see Len()==1; the loser parked in the blocking Get until the tier's next
-// add, a worker lost to the normal tier.
-func (r *refresher) tryPriorityGet(q workqueue.TypedRateLimitingInterface[string], t refreshTier) (string, bool) {
-	if q == nil {
-		return "", false
-	}
+// dequeuePick is what nextDequeue hands the worker.
+type dequeuePick uint8
+
+const (
+	// pickPriority: a key from the viewed or the cluster_list tier.
+	pickPriority dequeuePick = iota
+	// pickNormal: the worker holds an unviewed slot and blocks in the normal
+	// tier's Get (which may hand it the wake key).
+	pickNormal
+	// pickShutdown: the normal tier is shutting down and nothing is left for
+	// this worker.
+	pickShutdown
+)
+
+// nextDequeue picks the worker's next unit of work, under priorityGetMu.
+//
+// #799 B1 — a priority tier's Len()>0 probe and its Get are ONE step: processNext
+// is the tiers' only consumer, so a Len()>0 seen under the lock is a key the Get
+// returns at once. Before, two workers could both see Len()==1 and the loser
+// parked in the blocking Get until the tier's next add.
+//
+// #1069 — TWO RESERVATIONS, one per side, both derived from the pool size:
+//   - viewedSlotFree (#799 fix 2): viewed work holds at most parallelism−1
+//     workers, so the normal and cluster_list tiers always keep one;
+//   - unviewedSlotFree: normal + cluster_list work holds at most parallelism−1,
+//     so the viewed tier always keeps one. A worker blocked in the normal tier's
+//     Get HOLDS its unviewed slot while it blocks, so at most parallelism−1
+//     workers can ever come back from that Get with a key.
+//
+// A worker that may take neither parks on reserveCond: it is the RESERVED worker.
+// It wakes when wakeViewed announces a viewed key (every viewed add, delayed adds
+// included, and a viewed slot release) and on shutdown. It never polls: a park
+// is one Wait. A worker parks only while the unviewed side is full, which leaves
+// no viewed worker beside it, so every viewed arrival finds it; if a worker
+// leaving an unviewed job takes that key first, the woken one finds the slot
+// that worker left and takes it. Before #1069 every worker could be in a 0.9 s
+// unviewed job at once, and a viewed key waited for the first of them to end
+// (run 20: 2.4–3.2 s p95 for a viewer).
+func (r *refresher) nextDequeue() (key string, tier refreshTier, pick dequeuePick) {
 	r.priorityGetMu.Lock()
 	defer r.priorityGetMu.Unlock()
-	if q.Len() == 0 {
-		return "", false
+	for {
+		if r.viewedQueue != nil && r.viewedQueue.Len() > 0 && r.viewedSlotFree() {
+			if k, ok := r.priorityGetLocked(r.viewedQueue, tierViewed); ok {
+				r.viewedActive++ // released by endViewed
+				r.lastViewed.Store(true)
+				return k, tierViewed, pickPriority
+			}
+		}
+		if r.unviewedSlotFree() {
+			r.unviewedActive++ // released by endUnviewed
+			if r.clusterListQueue != nil && r.clusterListQueue.Len() > 0 {
+				if k, ok := r.priorityGetLocked(r.clusterListQueue, tierClusterList); ok {
+					r.lastViewed.Store(false) // #799 N4: a cluster_list turn counts too
+					return k, tierClusterList, pickPriority
+				}
+			}
+			r.normalGetBlocked++ // ended by leftNormalGet
+			return "", tierNormal, pickNormal
+		}
+		if r.reserveStopped || r.queue.ShuttingDown() {
+			return "", tierNormal, pickShutdown
+		}
+		r.viewed.reserveParks.Add(1)
+		r.reserveWaiting++ // decremented by whoever signals this park
+		r.reserveCond.Wait()
 	}
-	if t == tierViewed && !r.viewedSlotFree() {
-		return "", false
-	}
+}
+
+// priorityGetLocked is the Get of a priority tier whose Len()>0 the caller saw
+// under priorityGetMu (#799 B1), with the test seam between the two.
+func (r *refresher) priorityGetLocked(q workqueue.TypedRateLimitingInterface[string], t refreshTier) (string, bool) {
 	if fn := tierProbeHook.Load(); fn != nil {
 		(*fn)(t)
 	}
 	key, shutdown := q.Get()
-	if !shutdown && t == tierViewed {
-		r.viewedActive++ // under priorityGetMu; released by endViewed
-		r.lastViewed.Store(true)
-	}
 	return key, !shutdown
 }
 
@@ -287,9 +355,14 @@ func (r *refresher) tryPriorityGet(q workqueue.TypedRateLimitingInterface[string
 // viewed tier may hold at most parallelism−1 workers at once, so the normal and
 // cluster_list tiers always keep one — under constant churn on viewed cells the
 // viewed tier never empties, and strict priority starved every other cell (RUN,
-// dev-765h: zero normal-tier completions). Structural, not a knob. With one
-// worker the tiers ALTERNATE: after a viewed dequeue, the next dequeue goes to
-// the normal tier when it has work.
+// dev-765h: zero normal-tier completions). Structural, not a knob.
+//
+// PARALLELISM 1 (#1069, defined): one worker cannot be reserved for either side
+// without starving the other, so there is no reservation and the tiers ALTERNATE.
+// After a viewed dequeue the next dequeue goes to the cluster_list or normal tier
+// when either has work; after any other dequeue the viewed tier goes first. The
+// wake key is not a turn (processNext leaves lastViewed as it was), so a viewed
+// key waits for at most the job in hand plus one other-tier job.
 func (r *refresher) viewedSlotFree() bool {
 	if r.parallelism <= 1 {
 		return !r.lastViewed.Load() || (r.queue.Len() == 0 && (r.clusterListQueue == nil || r.clusterListQueue.Len() == 0))
@@ -297,17 +370,48 @@ func (r *refresher) viewedSlotFree() bool {
 	return r.viewedActive < r.parallelism-1
 }
 
-// wakeViewed adds the wake key to the normal queue — waking a worker blocked in
-// its Get — only when the reservation has a slot a woken worker could take
-// (#799 B3). With every slot full, a wake would only bring a worker back to a
-// refused viewed probe, the normal Get would hand it the next wake, and so on:
-// a busy spin (architect-623, RUN: ~85% of a core idle). A full reservation is
-// re-woken by the slot release instead (endViewed's caller).
+// unviewedSlotFree is the #1069 mirror of viewedSlotFree, read under
+// priorityGetMu: normal + cluster_list work may hold at most parallelism−1
+// workers, so one worker is always free to start a viewed key the moment it is
+// queued. With one worker there is nothing to reserve (see viewedSlotFree).
+func (r *refresher) unviewedSlotFree() bool {
+	if r.parallelism <= 1 {
+		return true
+	}
+	return r.unviewedActive < r.parallelism-1
+}
+
+// signalReserveLocked wakes one parked reserved worker. Under priorityGetMu.
+// The signaller takes the park off reserveWaiting, so a second wake that comes
+// before the woken worker runs counts it as gone and goes to the wake key.
+func (r *refresher) signalReserveLocked() {
+	r.reserveWaiting--
+	r.reserveCond.Signal()
+}
+
+// wakeViewed announces viewed work. When the reservation has a slot a woken
+// worker could take (#799 B3), it wakes the parked reserved worker (#1069), or,
+// with none parked, adds the wake key to the normal queue when a worker is
+// blocked in its Get. With every viewed slot full it does nothing: a wake would
+// only bring a worker back to a refused viewed probe, the normal Get would hand
+// it the next wake, and so on — a busy spin (architect-623, RUN: ~85% of a core
+// idle). A full reservation is re-woken by the slot release instead.
+//
+// #1069 — no wake key when no worker is blocked in the normal Get: every other
+// worker is in a job or about to probe, and re-probes the viewed tier itself. A
+// wake key nobody waits for sits in the normal FIFO and reads as normal work to
+// the p=1 alternation; under churn on a viewed cell that starved the viewed tier
+// once the wake key stopped counting as a turn.
 func (r *refresher) wakeViewed() {
 	r.priorityGetMu.Lock()
 	free := r.viewedSlotFree()
+	reserved := free && r.reserveWaiting > 0
+	if reserved {
+		r.signalReserveLocked()
+	}
+	blocked := free && !reserved && r.normalGetBlocked > 0
 	r.priorityGetMu.Unlock()
-	if free {
+	if blocked {
 		r.queue.Add(viewedWakeKey)
 	}
 }
@@ -317,6 +421,56 @@ func (r *refresher) endViewed() {
 	r.priorityGetMu.Lock()
 	r.viewedActive--
 	r.priorityGetMu.Unlock()
+}
+
+// leftNormalGet ends a worker's normal-tier Get (#1069); release also gives back
+// its unviewed slot (it came back with the wake key, or the tier shut down).
+func (r *refresher) leftNormalGet(release bool) {
+	r.priorityGetMu.Lock()
+	r.normalGetBlocked--
+	if release {
+		r.unviewedActive--
+	}
+	r.priorityGetMu.Unlock()
+}
+
+// endUnviewed releases an unviewed worker slot (#1069). No wake: the releasing
+// worker goes straight back to nextDequeue and takes the slot again, unless it
+// takes a viewed key — one whose wake already woke the parked worker, which then
+// takes this slot (see nextDequeue).
+func (r *refresher) endUnviewed() {
+	r.priorityGetMu.Lock()
+	r.unviewedActive--
+	r.priorityGetMu.Unlock()
+}
+
+// wakeReservedOnShutdown releases every parked reserved worker when the normal
+// tier shuts down: a worker blocked in a queue's Get learns that from the Get, a
+// parked one only from this.
+func (r *refresher) wakeReservedOnShutdown() {
+	r.priorityGetMu.Lock()
+	r.reserveStopped = true
+	r.reserveWaiting = 0
+	r.reserveCond.Broadcast()
+	r.priorityGetMu.Unlock()
+}
+
+// shutdownNotifyingQueue is the normal tier's underlying queue: its ShutDown —
+// direct, or the delaying queue's, which shuts down through it — also releases
+// the parked reserved workers (#1069), whoever shuts the queue down.
+type shutdownNotifyingQueue struct {
+	workqueue.TypedInterface[string]
+	onShutDown func()
+}
+
+func (q *shutdownNotifyingQueue) ShutDown() {
+	q.TypedInterface.ShutDown()
+	q.onShutDown()
+}
+
+func (q *shutdownNotifyingQueue) ShutDownWithDrain() {
+	q.onShutDown()
+	q.TypedInterface.ShutDownWithDrain()
 }
 
 // claimInFlight marks key as being re-resolved by this worker (#799 B2). false:
