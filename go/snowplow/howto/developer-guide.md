@@ -108,7 +108,8 @@ kubectl apply -f ./crds/templates.krateo.io_restactions.yaml
 * a `Deployment` running the `kind.local/snowplow:latest` image you just built,
   with the dev flags:
   `--debug=false --blizzard=false --port=8081 --authn-namespace=demo-system`
-  `--jwt-sign-key=AbbraCadabbra --pretty-log=false --jq-modules-path=/jq-modules`
+  `--url-authn=http://authn.demo-system.svc.cluster.local:8082`
+  `--pretty-log=false --jq-modules-path=/jq-modules`
 * a narrow read-only `ClusterRole`/`ClusterRoleBinding` for the snowplow
   ServiceAccount, plus a sample `devs`-group role
 
@@ -127,9 +128,12 @@ Notes on how this dev deployment differs from the production Helm chart
   run with a narrow read-only role, while the chart's ClusterRole grants
   cluster-wide `get`/`list`/`watch` + `SubjectAccessReview` create for the
   informer/RBAC-snapshot machinery.
-* **The JWT signing key is a hard-coded dev literal** (`AbbraCadabbra`) passed
-  as a flag; the chart consumes it from the `jwt-sign-key` Secret via
-  `envFrom`.
+* **No JWT key material, here or in the chart.** snowplow verifies RS256 tokens
+  against a JWKS it fetches on the first authenticated request. With no
+  `--jwks-url`, the URL is derived from `--url-authn`:
+  `http://authn.demo-system.svc.cluster.local:8082/.well-known/jwks.json`.
+  [install.md](install.md) §3 serves a quickstart JWKS at exactly that address;
+  until something answers there, authenticated requests get `503`.
 * No prewarm-seed / `authn` loopback artifacts are deployed — the chart's
   `seedAuthn` machinery needs the `authn` operator and its CRDs.
 
@@ -156,16 +160,17 @@ curl http://127.0.0.1:30081/health
 
 `/call` authenticates with **two** artifacts, both keyed to the same username:
 
-1. an **access token** — a plain HS256 JWT signed with the `--jwt-sign-key`
-   value (`AbbraCadabbra` here), carrying `username` and `groups` claims;
+1. an **access token**: an RS256 JWT, carrying `username` and `groups` claims,
+   signed with a private key whose public half is in the JWKS snowplow fetches;
 2. a **`<user>-clientconfig` Secret** in the `--authn-namespace`
    (`demo-system` here) holding the user's own Kubernetes credentials in the
    [`Endpoint`](endpoints.md) format. Without it every `/call` returns `401`.
 
-Follow steps **4 and 5 of [install.md](install.md)** — the inline Python JWT
-mint and the CSR-signed client-certificate `clientconfig` Secret work
-identically here (use `JWT_SECRET=AbbraCadabbra` to match the dev flag). The
-created user belongs to the `devs` group.
+Follow steps **3, 4 and 5 of [install.md](install.md)** with
+`NAMESPACE=demo-system`. They generate the signing keypair, serve its JWKS as
+the `authn` Service on port `8082` (the address `--url-authn` above points at),
+mint the token, and create the CSR-signed client-certificate `clientconfig`
+Secret. The created user belongs to the `devs` group.
 
 ## 9. RBAC for the Krateo PlatformOps user
 
