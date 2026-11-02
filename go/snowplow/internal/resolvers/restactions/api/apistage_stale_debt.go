@@ -81,20 +81,25 @@ import (
 // (owner bar: max ≤ 10 s). A design constant, never an env knob.
 const staleMaxMS = 10_000
 
-// StaleToPushBoundsMS are stale_to_push_ms's bucket bounds: they include
-// exactly 1000 (the target), 3000 (the p95 bar) and 10000 (the max bar), so
-// the bench can decide the bar from /debug/vars.
-var StaleToPushBoundsMS = []int64{100, 250, 500, 1000, 2000, 3000, 5000, 10000, 30000}
+// StaleToPushBoundsMS are the stale_to_push / stale_serve_age bucket bounds,
+// the ledger's (cache.StaleToPushBoundsMS, #1062): exactly 1000 (the target),
+// 3000 (the p95 bar) and 10000 (the max bar), so the bench decides the bar from
+// /debug/vars.
+var StaleToPushBoundsMS = cache.StaleToPushBoundsMS
 
 // staleClock is the debt clock (seamed in tests; read by debt goroutines, so
 // atomic).
 var staleClock atomic.Pointer[func() time.Time]
 
+// staleNow reads the debt clock. Unseamed it IS the stale-push ledger's clock
+// (#1062): a stale serve's servedAt is stamped here and its push is read there,
+// so a stale_to_push sample is two readings of one clock. A debt-only seam
+// (setStaleClockForTest) overrides it for the debt's own overdue arms.
 func staleNow() time.Time {
 	if f := staleClock.Load(); f != nil {
 		return (*f)()
 	}
-	return time.Now()
+	return cache.StalePushNow()
 }
 
 // setStaleClockForTest installs a fake debt clock; restore with nil. Test-only.
@@ -180,10 +185,9 @@ type staleDebt struct {
 	// parked (#740): its refill chain was abandoned because nobody views a
 	// dependent. The cell is kept and served, the record stays, and the overdue
 	// clock stops; an arm of a dependent or a new stale serve joining it resumes
-	// it. resumedAt is the latest resume: a resumed debt's stale_to_push is
-	// measured from it.
-	parked    bool
-	resumedAt time.Time
+	// it; the resume restarts its dependents' stale_to_push clocks (#1062:
+	// cache.RestartStaleServeClock — a resumed debt is measured from it).
+	parked bool
 }
 
 // staleReplace is one committed dependent whose replace is in flight (it may
@@ -382,13 +386,22 @@ func debtRetrySpec(d *staleDebt) cache.StaleRetrySpec {
 		},
 		Resume: func() {
 			staleDebtsMu.Lock()
-			defer staleDebtsMu.Unlock()
+			var keys []string
+			now := staleNow()
 			if staleDebts[d.contentKey] == d && d.parked {
-				now := staleNow()
 				d.parked = false
-				d.opened, d.overdue, d.resumedAt = now, false, now // a new viewed episode
+				d.opened, d.overdue = now, false // a new viewed episode
 				staleDebtParked.Add(-1)
 				staleDebtOpen.Add(1)
+				for sink := range d.dependents {
+					keys = append(keys, sink.L1Key())
+				}
+			}
+			staleDebtsMu.Unlock()
+			// #740 architect ruling: a resumed debt's stale_to_push is measured
+			// from the resume (#1062: on the ledger, every layer's one clock).
+			for _, k := range keys {
+				cache.RestartStaleServeClock(k, cache.StaleLayerAPIStage, now)
 			}
 		},
 	}
@@ -485,7 +498,6 @@ func retireStaleDebt(d *staleDebt, contentEvicted bool) {
 		staleDebtOpen.Add(-1)
 	}
 	evict := contentEvicted && d.parked
-	resumedAt := d.resumedAt
 	sinks := make([]*cache.StaleServeSink, 0, len(d.dependents))
 	for sink := range d.dependents {
 		sinks = append(sinks, sink)
@@ -496,10 +508,10 @@ func retireStaleDebt(d *staleDebt, contentEvicted bool) {
 			continue
 		}
 		if evict {
-			evictStaleDependent(sink, resumedAt)
+			evictStaleDependent(sink)
 			continue
 		}
-		goReplaceStaleDependent(sink, resumedAt)
+		goReplaceStaleDependent(sink)
 	}
 }
 
@@ -511,7 +523,7 @@ var staleParkedEvictHookForTest func(l1Key string)
 // stale-derived body (#755), then publishes, exactly as D2-3b's evict does: a
 // tab that armed while the cell was still stale-derived found no owed push to
 // emit, so this publish is its refresh (an unarmed key keeps its owed mark).
-func evictStaleDependent(sink *cache.StaleServeSink, from time.Time) {
+func evictStaleDependent(sink *cache.StaleServeSink) {
 	store := cache.ResolvedCache()
 	if store == nil {
 		return
@@ -535,7 +547,7 @@ func evictStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 	}
 	// Evicted now, or already gone (an LRU eviction publishes nothing, and a
 	// tab may have armed while the cell was still stale-derived).
-	finishStaleReplace(sink, from)
+	finishStaleReplace(sink)
 }
 
 // CommitStaleServe is the dispatcher's write-point outcome for a stale-derived
@@ -544,7 +556,7 @@ func evictStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 // cleared, replaces the cell now. Call it before writing the body.
 func CommitStaleServe(sink *cache.StaleServeSink) {
 	if sink.Commit() {
-		goReplaceStaleDependent(sink, time.Time{})
+		goReplaceStaleDependent(sink)
 	}
 }
 
@@ -559,10 +571,8 @@ func WithdrawStaleServe(sink *cache.StaleServeSink) {
 	}
 }
 
-// goReplaceStaleDependent replaces sink's cell on its own goroutine. from, when
-// later than the serve, is the resume a parked debt cleared after: its
-// stale_to_push is measured from there (architect ruling, #740).
-func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
+// goReplaceStaleDependent replaces sink's cell on its own goroutine.
+func goReplaceStaleDependent(sink *cache.StaleServeSink) {
 	staleDebtWG.Add(1)
 	go func() {
 		defer staleDebtWG.Done()
@@ -570,7 +580,7 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 		// #871 — measurement only: see runStaleDebt.
 		_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
 		defer endWork()
-		replaceStaleDependent(sink, from)
+		replaceStaleDependent(sink)
 	}()
 }
 
@@ -591,7 +601,7 @@ func goReplaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 //
 // A tab that arms after this publish is served by the owed-push mark at arm
 // time (cache.SubscribeRefreshStream).
-func replaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
+func replaceStaleDependent(sink *cache.StaleServeSink) {
 	l1Key := sink.L1Key()
 	staleDebtsMu.Lock()
 	staleReplacing[sink] = &staleReplace{key: l1Key, servedAt: sink.ServedAt()}
@@ -602,16 +612,16 @@ func replaceStaleDependent(sink *cache.StaleServeSink, from time.Time) {
 		// cell's viewer-gated retry chain; it stays in staleReplacing (overdue
 		// scan) until the chain lets go of it.
 		staleReplaceRetries.Add(1)
-		cache.StaleRetryFailed(l1Key, cache.StaleRetryGenuine, time.Since(start), replaceRetrySpec(sink, from))
+		cache.StaleRetryFailed(l1Key, cache.StaleRetryGenuine, time.Since(start), replaceRetrySpec(sink))
 		return
 	}
-	finishStaleReplace(sink, from)
+	finishStaleReplace(sink)
 }
 
 // replaceRetrySpec is a failed dependent replace's chain: each attempt is one
 // re-resolve (publishing on success); its viewer is the dependent cell's own
 // armed key; letting go of it ends the overdue tracking.
-func replaceRetrySpec(sink *cache.StaleServeSink, from time.Time) cache.StaleRetrySpec {
+func replaceRetrySpec(sink *cache.StaleServeSink) cache.StaleRetrySpec {
 	l1Key := sink.L1Key()
 	return cache.StaleRetrySpec{
 		Source: cache.StaleRetryDebt,
@@ -620,7 +630,7 @@ func replaceRetrySpec(sink *cache.StaleServeSink, from time.Time) cache.StaleRet
 				staleReplaceRetries.Add(1)
 				return cache.StaleRetryGenuine
 			}
-			finishStaleReplace(sink, from)
+			finishStaleReplace(sink)
 			return cache.StaleRetryFresh
 		},
 		Dependents: func() []string { return []string{l1Key} },
@@ -677,18 +687,16 @@ func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
 }
 
 // finishStaleReplace publishes a done replace's /refreshes signal and stops its
-// overdue tracking.
-func finishStaleReplace(sink *cache.StaleServeSink, from time.Time) {
+// overdue tracking. Its stale_to_push is recorded when the frame this publish
+// offers is WRITTEN to a stream (#1062, cache/stale_push.go), the same end for
+// every layer: an offer is not a push.
+func finishStaleReplace(sink *cache.StaleServeSink) {
 	l1Key := sink.L1Key()
 	staleDebtsMu.Lock()
 	delete(staleReplacing, sink)
 	staleDebtsMu.Unlock()
-	if from.Before(sink.ServedAt()) {
-		from = sink.ServedAt()
-	}
 	if cache.HasRefreshSubscriber(l1Key) {
 		stalePushTotal.Add(1)
-		staleToPushHist.record(staleNow().Sub(from).Milliseconds())
 	} else {
 		// Not armed yet: the owed-push mark announces it when the tab arms.
 		stalePushUnarmed.Add(1)
@@ -789,7 +797,6 @@ var (
 	// "unarmable"}: a stale serve whose Put was declined, re-run fresh.
 	staleServeWithdrawnUnarmable atomic.Uint64
 	staleServeAgeHist            = newMSHistogramBounds(StaleToPushBoundsMS)
-	staleToPushHist              = newMSHistogramBounds(StaleToPushBoundsMS)
 
 	// staleDebtWG joins every debt goroutine (tests wait it out).
 	staleDebtWG sync.WaitGroup
@@ -813,11 +820,6 @@ var (
 
 func init() {
 	cache.RegisterStaleServeQuiesce(quiesceStaleDebts)
-	// #710 F2 — an owed push delivered at ARM time is a correction too: record
-	// its stale_to_push, so late-arming tabs are not dropped from p95/max.
-	cache.SetStaleOwedArmRecorder(func(servedAt time.Time) {
-		staleToPushHist.record(staleNow().Sub(servedAt).Milliseconds())
-	})
 }
 
 // quiesceStaleDebts stops every debt goroutine at its next wait, joins them,
@@ -884,7 +886,9 @@ type StaleServeStats struct {
 	// 0), pushes emitted at arm time, marks cleared by a delivered publish.
 	Owed     cache.StaleOwedStats
 	ServeAge ContentFillDurationStats
-	ToPush   ContentFillDurationStats
+	// ToPush is the stale-push ledger's apistage histogram (#1062: one
+	// mechanism for every layer, cache.StaleToPushSnapshot).
+	ToPush ContentFillDurationStats
 }
 
 // StaleServeStatsSnapshot returns the family's state.
@@ -903,13 +907,20 @@ func StaleServeStatsSnapshot() StaleServeStats {
 		ReplaceRetries:      staleReplaceRetries.Load(),
 		Owed:                cache.StaleOwedStatsSnapshot(),
 		ServeAge:            staleServeAgeHist.snapshot(),
-		ToPush:              staleToPushHist.snapshot(),
+		ToPush:              apistageToPush(),
 	}
 }
 
-// SetStaleToPushRecorder / SetStaleServeAgeRecorder install the OTLP
-// histogram hooks (this package cannot import metrics).
-func SetStaleToPushRecorder(fn func(ms int64))   { staleToPushHist.setRecorder(fn) }
+// apistageToPush is the ledger's apistage stale_to_push histogram in this
+// family's shape.
+func apistageToPush() ContentFillDurationStats {
+	h := cache.StaleToPushSnapshot(cache.StaleLayerAPIStage)
+	return ContentFillDurationStats{Buckets: h.Buckets, Count: h.Count, SumMS: h.SumMS, MaxMS: h.MaxMS}
+}
+
+// SetStaleServeAgeRecorder installs the OTLP histogram hook (this package
+// cannot import metrics). stale_to_push's hook is the ledger's
+// (cache.SetStaleToPushRecorder, #1062).
 func SetStaleServeAgeRecorder(fn func(ms int64)) { staleServeAgeHist.setRecorder(fn) }
 
 var staleExpvarOnce sync.Once
@@ -929,8 +940,10 @@ func registerStaleExpvar() {
 		expvar.Publish("snowplow_apistage_stale_serve_age_ms", expvar.Func(func() any {
 			return staleServeAgeHist.expvarValue()
 		}))
+		// #1062 — kept for the bench: the SAME samples as the ledger's
+		// snowplow_stale_to_push_ms{layer="apistage"}, never a second measurement.
 		expvar.Publish("snowplow_apistage_stale_to_push_ms", expvar.Func(func() any {
-			return staleToPushHist.expvarValue()
+			return cache.StaleToPushSnapshot(cache.StaleLayerAPIStage).ExpvarValue()
 		}))
 		expvar.Publish("snowplow_apistage_stale_debt_open", expvar.Func(func() any {
 			return staleDebtOpen.Load()
@@ -1111,13 +1124,13 @@ func HoldStaleDebtRefillsForTest() (release func()) {
 }
 
 // AddStaleServeForTest moves the stale-serve and overdue counters and records
-// one stale_to_push sample through their production paths, so a cross-package
-// arm can prove the OTLP mirror reads the LIVE values. Production MUST NOT use
-// it.
+// one apistage stale_to_push sample through their production paths (the
+// ledger's record path, #1062), so a cross-package arm can prove the OTLP
+// mirror reads the LIVE values. Production MUST NOT use it.
 func AddStaleServeForTest(serves, overdue uint64, toPushMS int64) {
 	staleServeTotal.Add(serves)
 	staleOverdueTotal.Add(overdue)
-	staleToPushHist.record(toPushMS)
+	cache.AddStaleToPushForTest(cache.StaleLayerAPIStage, toPushMS)
 }
 
 // ResetStaleServeForTest stops and joins every debt goroutine and zeroes the
@@ -1137,5 +1150,5 @@ func ResetStaleServeForTest() {
 	stalePushUnarmed.Store(0)
 	staleDependentUnresolved.Store(0)
 	staleServeAgeHist.reset()
-	staleToPushHist.reset()
+	cache.ResetStalePushForTest()
 }

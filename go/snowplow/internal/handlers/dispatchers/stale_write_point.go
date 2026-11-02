@@ -20,7 +20,6 @@ package dispatchers
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
@@ -60,10 +59,16 @@ func isStaleRerun(req *http.Request) bool {
 
 // staleHitWritePoint keeps the invariant on a HIT of a stale-derived cell (a
 // co-bound request before the replace lands): the hit is armed, so it only
-// needs the key's owed-push mark.
-func staleHitWritePoint(key string, entry *cache.ResolvedEntry) {
+// needs the key's owed-push mark. #1062: an ARMED hit whose bytes are stale —
+// stale-derived (apistage) or on a dirty-stamped cell (l1) — is a stale serve
+// timed until its replacing frame is written (cache.NoteStaleHit). armed is
+// whether this hit stamped the refresh-key header.
+func staleHitWritePoint(key string, entry *cache.ResolvedEntry, armed bool) {
 	if entry != nil && entry.StaleDerived {
-		cache.MarkStaleOwed(key, time.Now())
+		cache.MarkStaleOwed(key)
+	}
+	if armed {
+		cache.NoteStaleHit(key, entry)
 	}
 }
 

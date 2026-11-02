@@ -809,7 +809,9 @@ type RefreshStream struct {
 	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
 	// ledger that a frame was WRITTEN to this stream — called by the handler
 	// after its writeFrame returned true, with no lock held. An offer is not a
-	// write: only these close a ledger entry as pushed.
+	// write: only these close a ledger entry as pushed. #1062: they also close
+	// the replaced stale serves of the key (stale_push.go), the end of
+	// stale_to_push_ms for every layer.
 	Wrote       func(key string)
 	WroteResync func()
 }
@@ -917,8 +919,12 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
+			stalePushFrameWritten(k) // #1062 — the replacing frame reached this stream
 		},
-		WroteResync: func() { ledgerResyncWritten(armedCopy) },
+		WroteResync: func() {
+			ledgerResyncWritten(armedCopy)
+			stalePushResyncWritten(armedCopy) // #1062
+		},
 	}
 }
 
