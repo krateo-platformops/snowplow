@@ -17,7 +17,7 @@ import (
 
 func registerSlowCallInstruments(m metric.Meter) error {
 	slow, err := m.Int64ObservableCounter("snowplow_slow_requests_total",
-		metric.WithDescription("API requests whose server time exceeded the page goal's bound (slowcall.Bound, the 3 s p95 goal), by route (the ServeMux pattern). Each one logged a slowcall.request WARN line naming where its time went (#1054)."))
+		metric.WithDescription("API requests whose server time exceeded the page goal's bound (slowcall.Bound, the 3 s p95 goal), by route (the ServeMux pattern) and work class (customer, or a background self-loopback's class). Each one logged a slowcall.request WARN line naming where its time went (#1054)."))
 	if err != nil {
 		return err
 	}
@@ -42,8 +42,8 @@ func registerSlowCallInstruments(m metric.Meter) error {
 		phase.Record(context.Background(), ms, metric.WithAttributes(attribute.String("phase", p)))
 	})
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		for route, n := range slowcall.SlowRequestsByRoute() {
-			o.ObserveInt64(slow, int64(n), metric.WithAttributes(attribute.String("route", route)))
+		for k, n := range slowcall.SlowRequests() {
+			o.ObserveInt64(slow, int64(n), metric.WithAttributes(attribute.String("route", k.Route), attribute.String("class", k.Class)))
 		}
 		taken, sup := slowcall.SnapshotCounts()
 		o.ObserveInt64(snaps, int64(taken))

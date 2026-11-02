@@ -3,32 +3,42 @@ package slowcall
 // slowcall_1054_test.go — #1054: the slow-call record and the goroutine
 // snapshot, through the production middleware and phase API.
 //
-//   - FAST: a request under the bound emits nothing (no line, no count, no
-//     ring entry), however many phases it entered.
-//   - SLOW: a request over the bound emits exactly one record, naming every
-//     phase it entered with its time and count, the longest wait (phase, kind,
-//     digest, release) and its own release cause.
-//   - UNTRACKED: the SSE stream, probes and /debug are never recorded.
-//   - SNAPSHOT: taken once while a request is in flight past the bound,
-//     rate-limited to one per window (a slow request first seen inside it is
-//     counted suppressed, once) and size-capped.
-//   - REDACTION: an identity carried by the request (a pprof label, a wait
-//     key, a blocked goroutine's argument) reaches no record, snapshot or
-//     ring; the raw profile DOES carry it (the filter is load-bearing).
+//   - FAST: a request under the bound emits nothing, however many phases it
+//     entered; a request AT the bound is not slow (the comparison is strict).
+//   - SLOW: one record per slow request, naming its phases, the LONGEST wait
+//     (not the last), its class and release cause.
+//   - DIALS: every HTTP attempt is recorded on its dial (attempts, status,
+//     429s, retry sleep, server time); a dial is a wait candidate.
+//   - RESPONSE PATH: the network write and gzip are separate phases.
+//   - CPU: the cgroup throttling and process CPU over the request's lifetime.
+//   - CLASS: a background request is counted under its class and never takes
+//     a snapshot.
+//   - SNAPSHOT: taken once while a customer request is in flight past the
+//     bound, for EVERY such request however many there are; rate-limited per
+//     process (a later one is suppressed once) and size-capped.
+//   - REDACTION: an identity carried by the request reaches no record,
+//     snapshot or ring; the raw profile DOES carry it.
+//
+// The arms named TestReview_* are the #1059 reviewer's, adopted as written.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"runtime/pprof"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/gzhttp"
+	"github.com/krateo-platformops/plumbing/http/util"
 
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
@@ -99,6 +109,16 @@ func num(t *testing.T, rec map[string]any, k string) int64 {
 	return int64(v)
 }
 
+func (m *monitor) inflightForTest() int {
+	n := 0
+	for i := range m.shards {
+		m.shards[i].mu.Lock()
+		n += m.shards[i].n
+		m.shards[i].mu.Unlock()
+	}
+	return n
+}
+
 func TestS1054_FastRequestEmitsNothing(t *testing.T) {
 	m, buf := testMonitor(t, 200*time.Millisecond)
 	for i := 0; i < 5; i++ {
@@ -108,19 +128,45 @@ func TestS1054_FastRequestEmitsNothing(t *testing.T) {
 			}
 			wait := StartWait(r.Context(), PhaseFlightWait, "content_flight", "k", "g/v/r")
 			wait.End()
+			_, _ = w.Write([]byte("{}"))
 		})
 	}
 	if s := buf.String(); s != "" {
 		t.Fatalf("FAST RED: a request under the bound logged: %s", s)
 	}
-	if got := m.stats.routes(); len(got) != 0 {
+	if got := m.stats.counts(); len(got) != 0 {
 		t.Fatalf("FAST RED: a request under the bound was counted: %v", got)
 	}
 	if got := m.stats.ring(&m.stats.recent); len(got) != 0 {
 		t.Fatalf("FAST RED: a request under the bound entered the ring: %v", got)
 	}
-	if m.n != 0 || m.head != nil {
-		t.Fatalf("finished requests left the in-flight list: n=%d", m.n)
+	if n := m.inflightForTest(); n != 0 {
+		t.Fatalf("finished requests left the in-flight list: n=%d", n)
+	}
+}
+
+// TestS1054_RequestAtTheBoundIsNotSlow pins the comparison: wall == bound is
+// not slow, bound + 1 ns is (the reviewer's MA2).
+func TestS1054_RequestAtTheBoundIsNotSlow(t *testing.T) {
+	const bound = 100 * time.Millisecond
+	for _, c := range []struct {
+		wall time.Duration
+		slow bool
+	}{{bound, false}, {bound + time.Nanosecond, true}} {
+		m, buf := testMonitor(t, bound)
+		t0 := time.Now()
+		calls := 0
+		m.now = func() time.Time {
+			calls++
+			if calls == 1 {
+				return t0
+			}
+			return t0.Add(c.wall)
+		}
+		serve(m, "GET /call", func(http.ResponseWriter, *http.Request) {})
+		if got := len(buf.records(t, "slowcall.request")) == 1; got != c.slow {
+			t.Errorf("BOUNDARY RED: wall=%v slow=%v, want %v", c.wall, got, c.slow)
+		}
 	}
 }
 
@@ -129,14 +175,14 @@ func TestS1054_SlowRequestEmitsOneRecordNamingItsPhases(t *testing.T) {
 	m, buf := testMonitor(t, bound)
 	serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		NoteClass(ctx, "customer")
+		NoteClass(ctx, workclass.Customer)
 		Start(ctx, PhaseAuth).End()
 		for i := 0; i < 3; i++ {
-			Start(ctx, PhaseStageDial).End()
+			Start(ctx, PhaseJQ).End()
 		}
 		short := StartWait(ctx, PhaseLockWait, "discovery_group", "short-key", "")
 		short.End()
-		long := StartWait(ctx, PhaseFlightWait, "content_flight", "the-long-key", "composition.krateo.io/v1, Resource=fsas")
+		long := StartLedWait(ctx, PhaseFlightWait, "content_flight", "the-long-key", "composition.krateo.io/v1, Resource=fsas", "background", "refresh")
 		time.Sleep(2 * bound)
 		long.EndRelease(ReleaseLeaderFailed)
 	})
@@ -148,8 +194,9 @@ func TestS1054_SlowRequestEmitsOneRecordNamingItsPhases(t *testing.T) {
 	want := map[string]string{
 		"level": "WARN", "subsystem": "slowcall", "route": "GET /call", "method": "GET",
 		"outcome": "completed", "class": "customer", "phase": "flight_wait",
-		"wait_phase": "flight_wait", "kind": "content_flight", "wait_outcome": "leader_failed",
-		"wait_key": waitKeyLabel("the-long-key"), "gvr": "composition.krateo.io/v1, Resource=fsas",
+		"wait_phase": "flight_wait", "wait_kind": "content_flight", "wait_outcome": "leader_failed",
+		"wait_key": waitKeyLabel("the-long-key"), "wait_gvr": "composition.krateo.io/v1, Resource=fsas",
+		"wait_leader_class": "background", "wait_leader_work": "refresh",
 	}
 	for k, v := range want {
 		if r[k] != v {
@@ -165,7 +212,7 @@ func TestS1054_SlowRequestEmitsOneRecordNamingItsPhases(t *testing.T) {
 	if got := num(t, r, "wait_ms"); got < 2*bound.Milliseconds() {
 		t.Errorf("wait_ms = %d, want ≥ %d", got, 2*bound.Milliseconds())
 	}
-	for k, n := range map[string]int64{"stage_dial_n": 3, "auth_n": 1, "flight_wait_n": 1, "lock_wait_n": 1} {
+	for k, n := range map[string]int64{"jq_n": 3, "auth_n": 1, "flight_wait_n": 1, "lock_wait_n": 1} {
 		if got := num(t, r, k); got != n {
 			t.Errorf("%s = %d, want %d", k, got, n)
 		}
@@ -176,14 +223,48 @@ func TestS1054_SlowRequestEmitsOneRecordNamingItsPhases(t *testing.T) {
 	if strings.Contains(buf.String(), "the-long-key") || strings.Contains(buf.String(), "short-key") {
 		t.Errorf("a raw wait key reached the log: %s", buf.String())
 	}
-	if got := m.stats.routes()["GET /call"]; got != 1 {
-		t.Errorf("snowplow_slow_requests_total{GET /call} = %d, want 1", got)
+	if got := m.stats.counts()[RouteClass{"GET /call", "customer"}]; got != 1 {
+		t.Errorf("snowplow_slow_requests_total{GET /call, customer} = %d, want 1", got)
 	}
 	if got := m.stats.hist[PhaseFlightWait].count; got != 1 {
 		t.Errorf("phase histogram flight_wait count = %d, want 1", got)
 	}
 	if ring := m.stats.ring(&m.stats.recent); len(ring) != 1 || ring[0]["wait_key"] != waitKeyLabel("the-long-key") {
 		t.Errorf("recent ring = %v, want the one record", ring)
+	}
+}
+
+// TestReview_RecordNamesLongestNotLastWait (reviewer, MB): with a long wait
+// then a short one, the record names the LONGEST.
+func TestReview_RecordNamesLongestNotLastWait(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	m, buf := testMonitor(t, bound)
+	serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+		a := StartWait(r.Context(), PhaseFlightWait, "content_flight", "long", "g/v1, Resource=long")
+		time.Sleep(3 * bound)
+		a.End()
+		b := StartWait(r.Context(), PhaseLockWait, "discovery_group", "short", "")
+		time.Sleep(bound / 4)
+		b.End()
+	})
+	recs := buf.records(t, "slowcall.request")
+	if len(recs) != 1 {
+		t.Fatalf("PRECONDITION: %d records", len(recs))
+	}
+	if recs[0]["wait_kind"] != "content_flight" || recs[0]["wait_key"] != waitKeyLabel("long") {
+		t.Fatalf("LONGEST RED: record names %v / %v, want the long content_flight", recs[0]["wait_kind"], recs[0]["wait_key"])
+	}
+}
+
+// TestReview_BoundIsTheGoal (reviewer, MA1/MA3/MM): the bound is the goal,
+// exactly 3 s, and the watchdog checks every quarter bound.
+func TestReview_BoundIsTheGoal(t *testing.T) {
+	if Bound != 3*time.Second {
+		t.Fatalf("BOUND RED: Bound=%v, want 3s", Bound)
+	}
+	m := newMonitor(Bound, newStats())
+	if m.tick != 750*time.Millisecond {
+		t.Fatalf("tick=%v, want 750ms", m.tick)
 	}
 }
 
@@ -232,20 +313,259 @@ func TestS1054_DetachedContextCarriesNoRecord(t *testing.T) {
 		if fromContext(d) != nil {
 			t.Fatalf("Detach left the request's record on the context")
 		}
+		if rc, _ := d.Value(recordCtxKey{}).(*recordCtx); rc != nil {
+			t.Fatalf("Detach left the request's writers on the context")
+		}
 		if s := Start(d, PhaseStageDial); s.r != nil {
 			t.Fatalf("a span on a detached context was recorded")
 		}
 	})
 }
 
+func TestS1054_HistogramBucketBoundaryIsInclusive(t *testing.T) {
+	var h phaseHist
+	h.buckets = make([]uint64, len(PhaseBoundsMS)+1)
+	h.record(3000) // exactly the bound: in le_3000
+	h.record(3001) // over it: in le_5000
+	idx := func(b int64) int {
+		for i, v := range PhaseBoundsMS {
+			if v == b {
+				return i
+			}
+		}
+		t.Fatalf("no bound %d", b)
+		return -1
+	}
+	if h.buckets[idx(3000)] != 1 || h.buckets[idx(5000)] != 1 {
+		t.Fatalf("BUCKET RED: buckets=%v, want 3000 → le_3000 and 3001 → le_5000", h.buckets)
+	}
+}
+
+// --- dials -----------------------------------------------------------------
+
+// TestS1054_DialRecordsEveryAttemptAndIsTheLongestWait drives plumbing's
+// retry client (the per-user and external endpoint dial) through Transport
+// against a server that answers one 429 without Retry-After: the retry client
+// sleeps its 2 s default and retries. The record's dial says so (attempts 2,
+// one 429, ~2 s of retry wait, status 200) and, being the longest wait, is
+// the reported wait.
+func TestS1054_DialRecordsEveryAttemptAndIsTheLongestWait(t *testing.T) {
+	const bound = 200 * time.Millisecond
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		time.Sleep(50 * time.Millisecond) // server time
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	m, buf := testMonitor(t, bound)
+	serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+		short := StartWait(r.Context(), PhaseFlightWait, "content_flight", "k", "")
+		time.Sleep(bound / 2)
+		short.End()
+		ctx, dial := StartDial(r.Context(), "external", "GET", "")
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/x?token=secret", nil)
+		cli := util.NewRetryClient(&http.Client{Transport: Transport(http.DefaultTransport)})
+		resp, err := cli.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		dial.EndErr(r.Context(), err)
+	})
+	recs := buf.records(t, "slowcall.request")
+	if len(recs) != 1 {
+		t.Fatalf("PRECONDITION: %d records", len(recs))
+	}
+	r := recs[0]
+	for k, v := range map[string]string{"wait_kind": "external", "wait_phase": "stage_dial", "wait_verb": "GET", "dial_kind": "external"} {
+		if r[k] != v {
+			t.Errorf("DIAL RED: %s = %v, want %q", k, r[k], v)
+		}
+	}
+	for k, v := range map[string]int64{"wait_attempts": 2, "wait_http_429": 1, "wait_status": 200, "http_attempts": 2, "http_429": 1, "dial_attempts": 2} {
+		if got := num(t, r, k); got != v {
+			t.Errorf("DIAL RED: %s = %d, want %d", k, got, v)
+		}
+	}
+	if got := num(t, r, "wait_retry_wait_ms"); got < 1900 {
+		t.Errorf("DIAL RED: wait_retry_wait_ms = %d, want ≈ 2000 (the retry client's 429 default)", got)
+	}
+	if got := num(t, r, "wait_server_ms"); got < 40 {
+		t.Errorf("DIAL RED: wait_server_ms = %d, want ≥ 40 (the server's own time)", got)
+	}
+	if s := buf.String(); strings.Contains(s, "token=secret") || strings.Contains(s, "127.0.0.1") {
+		t.Errorf("a dial's path, query or host reached the log: %s", s)
+	}
+}
+
+func TestS1054_AttemptOutsideAnyDialIsCountedUnscoped(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer srv.Close()
+	m, buf := testMonitor(t, bound)
+	serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, srv.URL, nil)
+		if resp, err := (&http.Client{Transport: Transport(http.DefaultTransport)}).Do(req); err == nil {
+			resp.Body.Close()
+		}
+		time.Sleep(2 * bound)
+	})
+	r := buf.records(t, "slowcall.request")[0]
+	if num(t, r, "unscoped_http_n") != 1 || num(t, r, "http_attempts") != 0 {
+		t.Fatalf("an attempt outside any dial: unscoped_http_n=%v http_attempts=%v, want 1 and 0", r["unscoped_http_n"], r["http_attempts"])
+	}
+}
+
+// --- the response path -----------------------------------------------------
+
+// TestS1054_ResponseWriteAndCompressionAreSeparatePhases serves a slow,
+// compressible response through the production order (Middleware → gzip →
+// Body) to a gzip client: the record has a write phase AND a compress phase.
+func TestS1054_ResponseWriteAndCompressionAreSeparatePhases(t *testing.T) {
+	const bound = 30 * time.Millisecond
+	m, buf := testMonitor(t, bound)
+	body := bytes.Repeat([]byte(`{"name":"item","status":"ready","spec":{"replicas":3}},`), 20000)
+	h := m.middleware(gzhttp.GzipHandler(Body(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * bound)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Pattern = "GET /call"
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/call", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := (&http.Transport{DisableCompression: true}).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("PRECONDITION: the response was not compressed")
+	}
+	recs := buf.records(t, "slowcall.request")
+	if len(recs) != 1 {
+		t.Fatalf("PRECONDITION: %d records", len(recs))
+	}
+	r := recs[0]
+	if num(t, r, "write_n") < 1 || num(t, r, "compress_n") < 1 {
+		t.Fatalf("RESPONSE RED: write_n=%v compress_n=%v, want both ≥ 1", r["write_n"], r["compress_n"])
+	}
+}
+
+// --- CPU starvation ----------------------------------------------------------
+
+func TestS1054_RecordAndSnapshotCarryCPUStarvation(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	m, buf := testMonitor(t, bound)
+	m.capture = func() []byte { return syntheticProfile(1, 2) }
+	var reads atomic.Int64
+	base := time.Now().Add(-time.Second)
+	m.cpu.read = func() cpuSample {
+		if reads.Add(1) == 1 {
+			return cpuSample{at: base, procOK: true, procNS: 10e9, cgOK: true, usageNS: 11e9, periods: 100, thrPer: 10, thrNS: 1e9}
+		}
+		return cpuSample{at: time.Now(), procOK: true, procNS: 16e9, cgOK: true, usageNS: 17e9, periods: 112, thrPer: 22, thrNS: 3500e6}
+	}
+	m.cpu.sample() // the sampler's reading before the request starts
+	release := make(chan struct{})
+	done := blockedRequest(t, m, "k", release)
+	if !m.check(time.Now().Add(2 * bound)) {
+		t.Fatalf("PRECONDITION: no snapshot")
+	}
+	time.Sleep(2 * bound)
+	close(release)
+	<-done
+	for _, msg := range []string{"slowcall.request", "slowcall.goroutines"} {
+		recs := buf.records(t, msg)
+		if len(recs) != 1 {
+			t.Fatalf("PRECONDITION: %d %s lines", len(recs), msg)
+		}
+		r := recs[0]
+		for k, v := range map[string]int64{"cfs_throttled_periods": 12, "cfs_periods": 12, "cfs_throttled_ms": 2500, "process_cpu_ms": 6000, "cgroup_cpu_ms": 6000} {
+			if got := num(t, r, k); got != v {
+				t.Errorf("CPU RED: %s %s = %d, want %d", msg, k, got, v)
+			}
+		}
+	}
+}
+
+func TestS1054_ParseCPUStatV1AndV2(t *testing.T) {
+	u, p, tp, tn, ok := parseCPUStat([]byte("usage_usec 5000\nuser_usec 1\nsystem_usec 2\nnr_periods 40\nnr_throttled 7\nthrottled_usec 9000\n"))
+	if !ok || u != 5e6 || p != 40 || tp != 7 || tn != 9e6 {
+		t.Fatalf("v2: %d %d %d %d %v", u, p, tp, tn, ok)
+	}
+	_, p, tp, tn, ok = parseCPUStat([]byte("nr_periods 3\nnr_throttled 2\nthrottled_time 123456\n"))
+	if !ok || p != 3 || tp != 2 || tn != 123456 {
+		t.Fatalf("v1: %d %d %d %v", p, tp, tn, ok)
+	}
+}
+
+// --- class -------------------------------------------------------------------
+
+func TestS1054_BackgroundRequestIsCountedUnderItsClassAndTakesNoSnapshot(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	m, buf := testMonitor(t, bound)
+	m.capture = func() []byte { return syntheticProfile(1, 2) }
+	release := make(chan struct{})
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+			NoteClass(r.Context(), workclass.Refresh)
+			close(started)
+			<-release
+		})
+	}()
+	<-started
+	if m.check(time.Now().Add(2 * bound)) {
+		t.Fatalf("CLASS RED: a background request took the snapshot")
+	}
+	if got := m.stats.suppressed.Load(); got != 0 {
+		t.Fatalf("CLASS RED: a background request was counted suppressed")
+	}
+	// A customer request then does, and the background one is listed.
+	cust := blockedRequest(t, m, "k", release)
+	if !m.check(time.Now().Add(2 * bound)) {
+		t.Fatalf("no snapshot for the customer request")
+	}
+	time.Sleep(2 * bound)
+	close(release)
+	<-done
+	<-cust
+	snap := buf.records(t, "slowcall.goroutines")[0]
+	if reqs, _ := snap["requests"].(string); !strings.Contains(reqs, "class:refresh") || !strings.Contains(reqs, "class:customer") {
+		t.Fatalf("the snapshot does not list both requests with their class: %q", reqs)
+	}
+	got := m.stats.counts()
+	if got[RouteClass{"GET /call", "refresh"}] != 1 || got[RouteClass{"GET /call", "customer"}] != 1 {
+		t.Fatalf("CLASS RED: snowplow_slow_requests_total = %v, want one refresh and one customer", got)
+	}
+}
+
+// --- the snapshot ------------------------------------------------------------
+
 // blockedRequest starts one tracked request that opens a flight wait and
 // blocks until release is closed. It returns once the request is in flight.
 func blockedRequest(t *testing.T, m *monitor, key string, release <-chan struct{}) <-chan struct{} {
 	t.Helper()
+	return blockedRequestOn(t, m, "GET /call", key, release)
+}
+
+func blockedRequestOn(t *testing.T, m *monitor, route, key string, release <-chan struct{}) <-chan struct{} {
+	t.Helper()
 	started, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
-		serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+		serve(m, route, func(w http.ResponseWriter, r *http.Request) {
 			wait := StartWait(r.Context(), PhaseFlightWait, "content_flight", key, "")
 			close(started)
 			<-release
@@ -271,7 +591,7 @@ func syntheticProfile(n, frames int) []byte {
 	return []byte(b.String())
 }
 
-func TestS1054_SnapshotIsRateLimitedToOnePerWindow(t *testing.T) {
+func TestS1054_SnapshotIsRateLimitedToOnePerProcessWindow(t *testing.T) {
 	const bound = 20 * time.Millisecond
 	m, buf := testMonitor(t, bound)
 	m.capture = func() []byte { return syntheticProfile(3, 4) }
@@ -288,7 +608,9 @@ func TestS1054_SnapshotIsRateLimitedToOnePerWindow(t *testing.T) {
 	if m.check(t0.Add(time.Second)) {
 		t.Fatalf("RATE RED: a second snapshot for the same request")
 	}
-	blockedRequest(t, m, "key-b", release)
+	// A slow request on ANOTHER route inside the window: the window is the
+	// process's, not the route's.
+	blockedRequestOn(t, m, "POST /call/read", "key-b", release)
 	if m.check(t0.Add(10 * time.Second)) {
 		t.Fatalf("RATE RED: a second snapshot inside the %v window", m.snapEvery)
 	}
@@ -307,6 +629,35 @@ func TestS1054_SnapshotIsRateLimitedToOnePerWindow(t *testing.T) {
 	}
 	if got := len(m.stats.ring(&m.stats.snaps)); got != recentSnapshots {
 		t.Fatalf("snapshot ring holds %d, want %d", got, recentSnapshots)
+	}
+}
+
+// TestReview_SuppressedCountsEveryUncoveredSlowRequest (reviewer, F3): with
+// more slow requests in flight than a snapshot renders, a later one is still
+// counted suppressed inside the window and snapshotted after it.
+func TestReview_SuppressedCountsEveryUncoveredSlowRequest(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	m, _ := testMonitor(t, bound)
+	m.capture = func() []byte { return syntheticProfile(1, 2) }
+	release := make(chan struct{})
+	defer close(release)
+	for i := 0; i < maxSnapshotRequests; i++ {
+		blockedRequest(t, m, fmt.Sprintf("old-%d", i), release)
+	}
+	t0 := time.Now().Add(2 * bound)
+	if !m.check(t0) {
+		t.Fatalf("PRECONDITION: no first snapshot")
+	}
+	// A ninth request starts after the snapshot and crosses the bound inside
+	// the window: no snapshot covers it.
+	blockedRequest(t, m, "late", release)
+	m.check(time.Now().Add(2 * bound))
+	if got := m.stats.suppressed.Load(); got != 1 {
+		t.Errorf("SUPPRESSED RED: suppressed=%d, want 1 (the ninth slow request, uncovered)", got)
+	}
+	// After the window, the ninth request is still uncovered and still slow.
+	if !m.check(t0.Add(m.snapEvery + time.Second)) {
+		t.Errorf("STARVATION RED: no snapshot after the window for an uncovered slow request (8 older covered requests hide it)")
 	}
 }
 
@@ -339,10 +690,12 @@ func TestS1054_SnapshotIsSizeCapped(t *testing.T) {
 	if got := num(t, r, "stacks_kept"); got == 0 || got > maxStacksPerClass*2 {
 		t.Fatalf("stacks_kept = %d, want 1..%d", got, maxStacksPerClass*2)
 	}
-	if got := num(t, r, "slow_inflight"); got != maxSnapshotRequests {
-		t.Fatalf("slow_inflight = %d, want the cap %d", got, maxSnapshotRequests)
+	if got := num(t, r, "slow_inflight"); got != maxSnapshotRequests+3 {
+		t.Fatalf("slow_inflight = %d, want every slow request (%d)", got, maxSnapshotRequests+3)
 	}
-	// Frames per stack: a stack is a count line then its frames, indented.
+	if got := num(t, r, "requests_omitted"); got != 3 {
+		t.Fatalf("requests_omitted = %d, want 3", got)
+	}
 	frames := 0
 	for _, line := range strings.Split(stacks, "\n") {
 		switch {
@@ -360,6 +713,23 @@ func TestS1054_SnapshotIsSizeCapped(t *testing.T) {
 	}
 	if strings.Count(reqs, "\n") != maxSnapshotRequests {
 		t.Fatalf("requests section lists %d requests, want %d", strings.Count(reqs, "\n"), maxSnapshotRequests)
+	}
+	if _, ok := r["capture_ms"].(float64); !ok {
+		t.Fatalf("the snapshot does not report its own cost (capture_ms)")
+	}
+}
+
+// TestS1054_SummaryCapsStacksPerClassAndClassifiesDeepStacks: small stacks
+// (so the byte cap cannot hide it) are capped per class (the reviewer's MN),
+// and a request stack deeper than the kept frames is still a request stack
+// (the reviewer's ME: conn.serve is outermost).
+func TestS1054_SummaryCapsStacksPerClassAndClassifiesDeepStacks(t *testing.T) {
+	s := summarizeGoroutines(syntheticProfile(maxStacksPerClass+5, maxFramesPerStack+10), 1<<30)
+	if s.kept != maxStacksPerClass || s.omitted != 5 {
+		t.Fatalf("CAP RED: kept=%d omitted=%d, want %d and 5", s.kept, s.omitted, maxStacksPerClass)
+	}
+	if s.requestGoroutines != (maxStacksPerClass+5)*3 || s.backgroundGoroutines != 0 {
+		t.Fatalf("CLASSIFY RED: request=%d background=%d: a deep request stack was not classified by its outermost frame", s.requestGoroutines, s.backgroundGoroutines)
 	}
 }
 
@@ -409,7 +779,7 @@ func TestS1054_SnapshotFromTheRealProfileNamesTheBlockedRequest(t *testing.T) {
 	if !strings.Contains(reqs, "wait{flight_wait content_flight "+waitKeyLabel("real-key")) {
 		t.Fatalf("the snapshot does not name the open wait: %q", reqs)
 	}
-	if r["kind"] != "content_flight" || r["wait_outcome"] != "open" || r["wait_key"] != waitKeyLabel("real-key") {
+	if r["wait_kind"] != "content_flight" || r["wait_outcome"] != "open" || r["wait_key"] != waitKeyLabel("real-key") {
 		t.Fatalf("the snapshot's oldest wait = %v", r)
 	}
 	if got := num(t, r, "request_goroutines"); got < 1 {
@@ -423,7 +793,6 @@ func TestS1054_NoIdentityReachesAnyRecordSnapshotOrRing(t *testing.T) {
 	m, buf := testMonitor(t, bound)
 	release := make(chan struct{})
 	started := make(chan struct{})
-	var raw []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Pattern = "GET /call"
 		m.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -432,7 +801,6 @@ func TestS1054_NoIdentityReachesAnyRecordSnapshotOrRing(t *testing.T) {
 			// impersonation review's key shape), and blocks with it as an
 			// argument.
 			pprof.Do(r.Context(), pprof.Labels(workclass.Key, "customer", "user", user), func(ctx context.Context) {
-				NoteClass(ctx, "customer")
 				wait := StartWait(ctx, PhaseFlightWait, "impersonation_review", "7\x00users\x00\x00"+user, "")
 				close(started)
 				s1054ParkedFor(user, release)
@@ -449,7 +817,7 @@ func TestS1054_NoIdentityReachesAnyRecordSnapshotOrRing(t *testing.T) {
 		}
 	}()
 	<-started
-	raw = goroutineProfile()
+	raw := goroutineProfile()
 	took := m.check(time.Now().Add(2 * bound))
 	time.Sleep(2 * bound) // the request itself crosses the bound
 	close(release)
@@ -539,6 +907,29 @@ func BenchmarkS1054_FastPath(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				c.h.ServeHTTP(w, req)
 			}
+		})
+	}
+}
+
+// BenchmarkS1054_ParallelRecord is the record under parallel requests (the
+// reviewer's: the registry lock was the one contention point).
+func BenchmarkS1054_ParallelRecord(b *testing.B) {
+	empty := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	m := newMonitor(Bound, newStats())
+	for _, c := range []struct {
+		name string
+		h    http.Handler
+	}{{"baseline", empty}, {"record", m.middleware(empty)}} {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				req := httptest.NewRequest(http.MethodGet, "/call", nil)
+				req.Pattern = "GET /call"
+				w := httptest.NewRecorder()
+				for pb.Next() {
+					c.h.ServeHTTP(w, req)
+				}
+			})
 		})
 	}
 }

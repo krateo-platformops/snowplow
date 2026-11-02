@@ -5,9 +5,10 @@ package main
 // route is already known: every API route's handler sees a record on its
 // context; the SSE stream, the probes and /debug do not. Over a real listener.
 //
-// MUTATION (RED, shown in the PR): slowcall.Middleware moved OUTSIDE
+// MUTATIONS (RED, shown in the PR): slowcall.Middleware moved OUTSIDE
 // tracing.NewServerHandler → r.Pattern is not set yet, every route is
-// untracked and no request is recorded.
+// untracked and no request is recorded; slowcall.Body dropped from inside the
+// compressor → an API handler's writes are not timed.
 
 import (
 	"net/http"
@@ -21,12 +22,13 @@ import (
 
 func TestS1054_ServedCompositionRecordsAPIRoutesOnly(t *testing.T) {
 	var mu sync.Mutex
-	seen := map[string]bool{}
+	seen, timed := map[string]bool{}, map[string]bool{}
 	mux := http.NewServeMux()
 	for _, p := range []string{"GET /call", "POST /call/read", "GET /list", "GET /export", "GET /refreshes", "GET /health", "GET /readyz", "GET /debug/vars"} {
 		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			seen[p] = slowcall.RecordingForTest(r.Context())
+			timed[p] = slowcall.BodyTimedForTest(w)
 			mu.Unlock()
 			ok200(w, r)
 		})
@@ -55,6 +57,9 @@ func TestS1054_ServedCompositionRecordsAPIRoutesOnly(t *testing.T) {
 		}
 		if got != w {
 			t.Errorf("S1054 RED: %s recorded=%v, want %v", p, got, w)
+		}
+		if timed[p] != w {
+			t.Errorf("S1054 RED: %s body writes timed=%v, want %v", p, timed[p], w)
 		}
 	}
 }

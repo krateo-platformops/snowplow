@@ -15,11 +15,11 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
-// startWatchdog starts the monitor's watchdog once. It runs for the process
-// lifetime (the middleware is built once, in main).
+// startWatchdog starts the monitor's watchdog and its CPU sampler once. Both
+// run for the process lifetime (the middleware is built once, in main).
 func (m *monitor) startWatchdog() {
 	m.watchOnce.Do(func() {
-		m.stop = make(chan struct{})
+		m.cpu.start()
 		go m.watch()
 	})
 }
@@ -30,114 +30,114 @@ func (m *monitor) watch() {
 	workclass.ClearGoroutine()
 	t := time.NewTicker(m.tick)
 	defer t.Stop()
-	for {
-		select {
-		case <-m.stop:
-			return
-		case now := <-t.C:
-			m.check(now)
-		}
+	for now := range t.C {
+		m.check(now)
 	}
 }
 
-// check takes a goroutine snapshot when a tracked request has been in flight
-// longer than the bound and no snapshot has covered it yet, at most one per
-// snapEvery. A slow request first seen inside the rate window is counted as
-// suppressed, once. It returns whether it took a snapshot.
-func (m *monitor) check(now time.Time) bool {
-	m.mu.Lock()
-	var slow []*Record
-	fresh := false
-	// The list is in arrival order, so the slow requests are a prefix of it.
-	for r := m.head; r != nil && len(slow) < maxSnapshotRequests; r = r.next {
-		if now.Sub(r.start) <= m.bound {
-			break
+// inflightSlow returns every request in flight longer than the bound at now,
+// oldest first, and the number in flight.
+func (m *monitor) inflightSlow(now time.Time) (slow []*Record, inflight int) {
+	for i := range m.shards {
+		s := &m.shards[i]
+		s.mu.Lock()
+		inflight += s.n
+		for r := s.head; r != nil; r = r.next {
+			if now.Sub(r.start) > m.bound {
+				slow = append(slow, r)
+			}
 		}
-		slow = append(slow, r)
+		s.mu.Unlock()
+	}
+	sort.Slice(slow, func(i, j int) bool { return slow[i].start.Before(slow[j].start) })
+	return slow, inflight
+}
+
+// check takes a goroutine snapshot when a CUSTOMER request has been in flight
+// longer than the bound and no snapshot has covered it yet, at most one per
+// snapEvery. EVERY such request is considered, however many are in flight: a
+// snapshot covers all of them, and one first seen inside the rate window is
+// counted as suppressed, once. A background request (a self-loopback of the
+// refresher or prewarm) never triggers or uses the snapshot; it is still
+// listed when one is taken. It returns whether it took a snapshot.
+func (m *monitor) check(now time.Time) bool {
+	slow, inflight := m.inflightSlow(now)
+	m.watchMu.Lock()
+	var customers []*Record
+	fresh := false
+	for _, r := range slow {
+		if r.workClass().Background() {
+			continue
+		}
+		customers = append(customers, r)
 		if !r.snapped {
 			fresh = true
 		}
 	}
 	if !fresh {
-		m.mu.Unlock()
+		m.watchMu.Unlock()
 		return false
 	}
-	inflight := m.n
 	if !m.lastSnap.IsZero() && now.Sub(m.lastSnap) < m.snapEvery {
-		for _, r := range slow {
+		for _, r := range customers {
 			if !r.snapped && !r.suppressed {
 				r.suppressed = true
 				m.stats.suppressed.Add(1)
 			}
 		}
-		m.mu.Unlock()
+		m.watchMu.Unlock()
 		return false
 	}
 	m.lastSnap = now
-	for _, r := range slow {
+	for _, r := range customers {
 		r.snapped = true
 	}
-	m.mu.Unlock()
+	m.watchMu.Unlock()
 
-	attrs := m.snapshotAttrs(now, slow, inflight)
+	attrs := m.snapshotAttrs(now, customers, slow, inflight)
 	m.stats.noteSnapshot(attrMap(attrs, now))
 	m.logger().LogAttrs(context.Background(), slog.LevelWarn, "slowcall.goroutines", attrs...)
 	return true
 }
 
 // snapshotAttrs is one snapshot's log record: the in-flight slow requests
-// (route, age, open phases, open waits) and the goroutine summary. FLAT, like
-// the request record; the two text blocks are capped together at
-// maxSnapshotBytes.
-func (m *monitor) snapshotAttrs(now time.Time, slow []*Record, inflight int) []slog.Attr {
-	var reqs strings.Builder
-	oldest := slow[0]
+// (customers first, each with its class, age, open phases and open waits),
+// the CPU starvation since the oldest customer one began, and the goroutine
+// summary. FLAT, like the request record; the two text blocks are capped
+// together at maxSnapshotBytes and the request list at maxSnapshotRequests.
+func (m *monitor) snapshotAttrs(now time.Time, customers, slow []*Record, inflight int) []slog.Attr {
+	listed := append([]*Record(nil), customers...)
 	for _, r := range slow {
-		reqs.WriteString(r.route)
-		reqs.WriteString(" age_ms=")
-		reqs.WriteString(strconv.FormatInt(now.Sub(r.start).Milliseconds(), 10))
-		for _, v := range r.phases() {
-			if v.o > 0 {
-				reqs.WriteString(" open:")
-				reqs.WriteString(v.p.String())
-				reqs.WriteString("=")
-				reqs.WriteString(strconv.FormatInt(v.o, 10))
-			}
+		if r.workClass().Background() {
+			listed = append(listed, r)
 		}
-		r.mu.Lock()
-		for _, o := range r.open {
-			if !o.set {
-				continue
-			}
-			reqs.WriteString(" wait{")
-			reqs.WriteString(o.phase.String())
-			reqs.WriteString(" ")
-			reqs.WriteString(o.kind)
-			if o.key != "" {
-				reqs.WriteString(" ")
-				reqs.WriteString(waitKeyLabel(o.key))
-			}
-			if o.gvr != "" {
-				reqs.WriteString(" ")
-				reqs.WriteString(o.gvr)
-			}
-			reqs.WriteString(" age_ms=")
-			reqs.WriteString(strconv.FormatInt(now.Sub(o.since).Milliseconds(), 10))
-			reqs.WriteString("}")
-		}
-		r.mu.Unlock()
-		reqs.WriteString("\n")
 	}
-	budget := maxSnapshotBytes - reqs.Len()
-	sum := summarizeGoroutines(m.capture(), budget)
+	omitted := 0
+	if len(listed) > maxSnapshotRequests {
+		omitted = len(listed) - maxSnapshotRequests
+		listed = listed[:maxSnapshotRequests]
+	}
+	var reqs strings.Builder
+	for _, r := range listed {
+		writeRequestLine(&reqs, r, now)
+	}
+	oldest := customers[0]
+
+	t0 := time.Now()
+	profile := m.capture()
+	sum := summarizeGoroutines(profile, maxSnapshotBytes-reqs.Len())
+	captureMS := time.Since(t0).Milliseconds()
 
 	attrs := []slog.Attr{
 		slog.String("subsystem", "slowcall"),
 		slog.Int("inflight", inflight),
 		slog.Int("slow_inflight", len(slow)),
+		slog.Int("slow_customers", len(customers)),
+		slog.Int("requests_omitted", omitted),
 		slog.Int64("oldest_age_ms", now.Sub(oldest.start).Milliseconds()),
 		slog.String("route", oldest.route),
 		slog.Int64("yield_parked", yieldParked.Load()),
+		slog.Int64("capture_ms", captureMS),
 		slog.Int("goroutines", sum.total),
 		slog.Int("request_goroutines", sum.requestGoroutines),
 		slog.Int("background_goroutines", sum.backgroundGoroutines),
@@ -146,12 +146,73 @@ func (m *monitor) snapshotAttrs(now time.Time, slow []*Record, inflight int) []s
 		slog.Int("stacks_omitted", sum.omitted),
 		slog.Bool("truncated", sum.truncated),
 	}
-	if w := oldest.reportedWait(now); w.set {
-		attrs = append(attrs, waitAttrs(w)...)
-	}
+	wait, dial, _, _ := oldest.reported(now)
+	attrs = append(attrs, infoAttrs("wait_", wait, true)...)
+	attrs = append(attrs, infoAttrs("dial_", dial, false)...)
+	attrs = append(attrs, m.cpu.windowAttrs(oldest.start)...)
 	return append(attrs,
 		slog.String("requests", reqs.String()),
 		slog.String("stacks", sum.text))
+}
+
+func writeRequestLine(b *strings.Builder, r *Record, now time.Time) {
+	b.WriteString(r.route)
+	b.WriteString(" class:")
+	b.WriteString(r.workClass().String())
+	b.WriteString(" age_ms:")
+	b.WriteString(strconv.FormatInt(now.Sub(r.start).Milliseconds(), 10))
+	for _, v := range r.phases() {
+		if v.o > 0 {
+			b.WriteString(" open:")
+			b.WriteString(v.p.String())
+			b.WriteString(":")
+			b.WriteString(strconv.FormatInt(v.o, 10))
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	write := func(tag string, o waitInfo) {
+		b.WriteString(" ")
+		b.WriteString(tag)
+		b.WriteString("{")
+		b.WriteString(o.phase.String())
+		b.WriteString(" ")
+		b.WriteString(o.kind)
+		if o.key != "" {
+			b.WriteString(" ")
+			b.WriteString(waitKeyLabel(o.key))
+		}
+		if o.gvr != "" {
+			b.WriteString(" ")
+			b.WriteString(o.gvr)
+		}
+		if o.verb != "" {
+			b.WriteString(" ")
+			b.WriteString(o.verb)
+		}
+		if o.leaderWork != "" {
+			b.WriteString(" leader:")
+			b.WriteString(o.leaderWork)
+		}
+		if o.dial != nil {
+			b.WriteString(" attempts:")
+			b.WriteString(strconv.FormatInt(o.dial.attempts.Load(), 10))
+			b.WriteString(" status:")
+			b.WriteString(strconv.FormatInt(o.dial.lastStatus.Load(), 10))
+		}
+		b.WriteString(" age_ms:")
+		b.WriteString(strconv.FormatInt(now.Sub(o.since).Milliseconds(), 10))
+		b.WriteString("}")
+	}
+	for _, o := range r.open {
+		if o.set {
+			write("wait", o)
+		}
+	}
+	if r.openLd.set {
+		write("lead", r.openLd)
+	}
+	b.WriteString("\n")
 }
 
 // goroutineSummary is a goroutine profile reduced to the stacks that can name

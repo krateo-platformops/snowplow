@@ -12,7 +12,7 @@ import (
 // stats are one monitor's counters, phase histogram and rings.
 type stats struct {
 	mu      sync.Mutex
-	byRoute map[string]uint64
+	byRoute map[RouteClass]uint64
 	hist    [numPhases]phaseHist
 	recent  []map[string]any // oldest first, ≤ recentRecords
 	snaps   []map[string]any // oldest first, ≤ recentSnapshots
@@ -32,7 +32,7 @@ type phaseHist struct {
 }
 
 func newStats() *stats {
-	s := &stats{byRoute: map[string]uint64{}}
+	s := &stats{byRoute: map[RouteClass]uint64{}}
 	for i := range s.hist {
 		s.hist[i].buckets = make([]uint64, len(PhaseBoundsMS)+1)
 	}
@@ -41,13 +41,19 @@ func newStats() *stats {
 
 var defaultStats = newStats()
 
-// observe counts one slow request: its route, every phase it entered into
-// the phase histogram, and its record into the recent ring.
+// RouteClass is one series of snowplow_slow_requests_total: the route (a
+// ServeMux pattern) and the request's work class, so a background
+// self-loopback is never counted as a customer's slow call.
+type RouteClass struct{ Route, Class string }
+
+// observe counts one slow request: its route and class, every phase it
+// entered into the phase histogram, and its record into the recent ring.
 func (s *stats) observe(r *Record, attrs []slog.Attr, at time.Time) {
 	views := r.phases()
 	rec := s.recorder.Load()
+	rc := RouteClass{Route: r.route, Class: r.workClass().String()}
 	s.mu.Lock()
-	s.byRoute[r.route]++
+	s.byRoute[rc]++
 	for _, v := range views {
 		if v.n == 0 {
 			continue
@@ -91,12 +97,24 @@ func (s *stats) noteSnapshot(e map[string]any) {
 	s.mu.Unlock()
 }
 
-func (s *stats) routes() map[string]uint64 {
+func (s *stats) counts() map[RouteClass]uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[string]uint64, len(s.byRoute))
+	out := make(map[RouteClass]uint64, len(s.byRoute))
 	for k, v := range s.byRoute {
 		out[k] = v
+	}
+	return out
+}
+
+// routes renders the counter for /debug/vars: route → class → count.
+func (s *stats) routes() map[string]map[string]uint64 {
+	out := map[string]map[string]uint64{}
+	for k, v := range s.counts() {
+		if out[k.Route] == nil {
+			out[k.Route] = map[string]uint64{}
+		}
+		out[k.Route][k.Class] = v
 	}
 	return out
 }
@@ -131,18 +149,15 @@ func (s *stats) ring(which *[]map[string]any) []map[string]any {
 	return append([]map[string]any(nil), (*which)...)
 }
 
-// SlowRequestsByRoute is snowplow_slow_requests_total by route (the ServeMux
-// pattern), for the OTLP mirror.
-func SlowRequestsByRoute() map[string]uint64 { return defaultStats.routes() }
+// SlowRequests is snowplow_slow_requests_total by route and class, for the
+// OTLP mirror.
+func SlowRequests() map[RouteClass]uint64 { return defaultStats.counts() }
 
 // SnapshotCounts are the goroutine snapshots taken, and those a rate window
 // suppressed (one per slow request that crossed the bound inside it).
 func SnapshotCounts() (taken, suppressed uint64) {
 	return defaultStats.snapshots.Load(), defaultStats.suppressed.Load()
 }
-
-// YieldParked is the number of workers parked in a customer yield now.
-func YieldParked() int64 { return yieldParked.Load() }
 
 // SetPhaseRecorder installs the phase histogram's OTLP hook (this package
 // cannot import metrics); nil uninstalls it.
@@ -153,9 +168,6 @@ func SetPhaseRecorder(fn func(ms int64, phase string)) {
 	}
 	defaultStats.recorder.Store(&fn)
 }
-
-// PhaseNames is the closed phase set, in order.
-func PhaseNames() []string { return append([]string(nil), phaseNames[:]...) }
 
 func init() {
 	expvar.Publish("snowplow_slow_requests_total", expvar.Func(func() any { return defaultStats.routes() }))

@@ -183,6 +183,13 @@ var parseListEnvelopeHookForTest atomic.Pointer[func(schema.GroupVersionResource
 // the stored items and skips re-unmarshalling on every hit. Returns ok=false
 // on a malformed envelope (the caller stores RawJSON only — the gate then
 // falls back to the unmarshal path, byte-identical to pre-0.30.121).
+// parseListEnvelopeTimed is parseListEnvelope timed as the request's parse
+// phase (#1054).
+func parseListEnvelopeTimed(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
+	defer slowcall.Start(ctx, slowcall.PhaseParse).End()
+	return parseListEnvelope(gvr, raw)
+}
+
 func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
 	if h := parseListEnvelopeHookForTest.Load(); h != nil {
 		(*h)(gvr) // TEST-ONLY: the #882 herd arm's own parse seam
@@ -353,7 +360,7 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
 func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace string, raw []byte) (any, error) {
-	parsed, ok := parseListEnvelope(gvr, raw)
+	parsed, ok := parseListEnvelopeTimed(ctx, gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
 		return nil, errGateFallthrough
@@ -820,7 +827,7 @@ func apistageContentServeAttempt(
 			}
 		} else if isList {
 			if items, av, k, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
-				p, pOK := parseListEnvelope(gvr, raw)
+				p, pOK := parseListEnvelopeTimed(ctx, gvr, raw)
 				return p.items, p.apiVersion, p.kind, pOK
 			}); ok && len(items) > 0 {
 				parsed = parsedListEnvelope{
@@ -966,6 +973,10 @@ func apistageContentServeAttempt(
 		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
 		// zero result = not servable); the success path publishes the result right
 		// after the Put, before this reader's own gate.
+		// #1054 — the lead marker: this request's record names the flight it
+		// leads by the same key digest a joiner's wait names, so the records join.
+		lead := slowcall.StartLead(ctx, "content_flight", contentKey, gvr.String())
+		defer lead.End()
 		defer flight.complete(contentFlightResult{})
 		// #710 PR-1 — the fill runs DETACHED from this reader's cancellation, bounded
 		// by the server write deadline: a leader whose request goes away cannot fail
@@ -1084,7 +1095,7 @@ func apistageContentServeAttempt(
 			var p parsedListEnvelope
 			var parseOK bool
 			pprof.Do(ctx, fillLabels, func(context.Context) {
-				p, parseOK = parseListEnvelope(gvr, dispatched)
+				p, parseOK = parseListEnvelopeTimed(ctx, gvr, dispatched)
 			})
 			if parseOK {
 				fill.parsed(len(p.items))

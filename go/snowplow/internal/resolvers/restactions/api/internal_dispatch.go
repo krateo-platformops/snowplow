@@ -468,9 +468,11 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 				recordPreDial(preDialScopeFallback)
 			}
 		}
-		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054: one apiserver round-trip
-		obj, getErr := nri.Get(ctx, name, metav1.GetOptions{})
-		dial.End()
+		// #1054 — one apiserver GET: its attempts (client-go retries a 429),
+		// statuses and retry sleeps ride dctx to slowcall.Transport.
+		dctx, dial := slowcall.StartDial(ctx, "apiserver", "get", gvr.String())
+		obj, getErr := nri.Get(dctx, name, metav1.GetOptions{})
+		dial.EndErr(ctx, getErr)
 		if getErr != nil {
 			return nil, false, getErr
 		}
@@ -673,9 +675,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			return nil, false, ctx.Err()
 		default:
 		}
-		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054: one LIST page round-trip
-		page, pageErr := nri.List(ctx, opts)
-		dial.End()
+		dctx, dial := slowcall.StartDial(ctx, "apiserver", "list", gvr.String()) // #1054: one LIST page
+		page, pageErr := nri.List(dctx, opts)
+		dial.EndErr(ctx, pageErr)
 		if pageErr != nil {
 			return nil, false, pageErr
 		}

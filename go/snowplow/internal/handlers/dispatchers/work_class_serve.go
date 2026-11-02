@@ -42,11 +42,11 @@ func beginServeWorkClass(req *http.Request) (*http.Request, func()) {
 	}
 	if c := loopbackWorkClass(req); c.Background() {
 		ctx, end := workclass.Continue(req.Context(), c)
-		slowcall.NoteClass(ctx, c.String()) // #1054: a slow hop says whose work it was
+		slowcall.NoteClass(ctx, c) // #1054: a slow hop says whose work it was
 		return req.WithContext(ctx), end
 	}
 	ctx, end := workclass.Begin(req.Context(), workclass.Customer)
-	slowcall.NoteClass(ctx, workclass.Customer.String())
+	slowcall.NoteClass(ctx, workclass.Customer)
 	return req.WithContext(ctx), end
 }
 

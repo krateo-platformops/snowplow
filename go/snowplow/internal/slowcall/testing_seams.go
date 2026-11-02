@@ -25,10 +25,17 @@ func NewMonitorForTest(bound time.Duration, log *slog.Logger) *MonitorForTest {
 func (t *MonitorForTest) Middleware(next http.Handler) http.Handler { return t.m.middleware(next) }
 
 // SlowRequestsForTest is this monitor's snowplow_slow_requests_total.
-func (t *MonitorForTest) SlowRequestsForTest() map[string]uint64 { return t.m.stats.routes() }
+func (t *MonitorForTest) SlowRequestsForTest() map[RouteClass]uint64 { return t.m.stats.counts() }
 
 // RecordingForTest reports whether ctx carries a request's slow-call record.
 func RecordingForTest(ctx context.Context) bool { return fromContext(ctx) != nil }
+
+// BodyTimedForTest reports whether w is the writer Body installs (the
+// handler's writes into the compressor are timed).
+func BodyTimedForTest(w http.ResponseWriter) bool {
+	_, ok := w.(*bodyWriter)
+	return ok
+}
 
 // WaitKeyLabelForTest is the label a record reports for a waited-on key.
 func WaitKeyLabelForTest(key string) string { return waitKeyLabel(key) }
@@ -58,7 +65,7 @@ func ResetDefaultStatsForTest() {
 	s := defaultStats
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byRoute = map[string]uint64{}
+	s.byRoute = map[RouteClass]uint64{}
 	for i := range s.hist {
 		s.hist[i] = phaseHist{buckets: make([]uint64, len(PhaseBoundsMS)+1)}
 	}

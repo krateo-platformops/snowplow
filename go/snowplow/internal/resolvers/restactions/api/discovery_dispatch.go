@@ -210,9 +210,9 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 	// pipeline is invariant (feedback_cache_must_not_constrain_jq). This is
 	// the #18/#19 mechanism extended to the discovery root.
 	if rootOK {
-		dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054
-		raw, dErr := cli.RESTClient().Get().AbsPath(root).DoRaw(ctx)
-		dial.End()
+		dctx, dial := slowcall.StartDial(ctx, "discovery", "get", "") // #1054
+		raw, dErr := cli.RESTClient().Get().AbsPath(root).DoRaw(dctx)
+		dial.EndErr(ctx, dErr)
 		if dErr != nil {
 			return nil, false, dErr
 		}
@@ -221,9 +221,11 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 
 	// Single-GroupVersion discovery (/apis/<g>/<v> or /api/<v>) — the #18/#19
 	// path, unchanged.
-	dial := slowcall.Start(ctx, slowcall.PhaseStageDial) // #1054
+	// #1054 — the discovery client takes no context, so this dial's time is
+	// recorded but its attempts are not (they never reach the request's ctx).
+	_, dial := slowcall.StartDial(ctx, "discovery", "get", gv)
 	list, dErr := cli.ServerResourcesForGroupVersion(gv)
-	dial.End()
+	dial.EndErr(ctx, dErr)
 	if dErr != nil {
 		return nil, false, dErr
 	}

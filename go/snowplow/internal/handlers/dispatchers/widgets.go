@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/rest"
 )
 
@@ -445,7 +446,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		)
 	}
 
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
 		log.Error("unable to encode widget response", slog.Any("err", err))
 		response.InternalError(wri, err)

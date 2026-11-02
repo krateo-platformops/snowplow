@@ -270,25 +270,41 @@ func review(ctx context.Context, p impPrincipal) (bool, error) {
 		return false, errNoImpersonationReviewer
 	}
 	key := strconv.FormatUint(gen, 10) + "\x00" + p.resource + "\x00" + p.namespace + "\x00" + p.name
-	// #1054 — a single-flight: a request that joins waits on the first
-	// caller's review (the span covers the leader's own review too). The key
-	// names a principal: the record carries only its redact digest.
+	// #1054 — a single-flight. The caller that LEADS sends the review itself:
+	// that is a dial (an access review round-trip), and its flight-wait span is
+	// discarded. A caller that JOINS waits on the leader's review: that is its
+	// flight wait, released completed, by its own ctx, or leader_failed when
+	// the review errored. The key names a principal: a record carries only its
+	// redact digest.
 	wait := slowcall.StartWait(ctx, slowcall.PhaseFlightWait, "impersonation_review", key, "")
-	defer func() { wait.EndRelease(slowcall.CauseOf(ctx.Err())) }()
+	led := false
 	v, err, _ := impCapFlight.Do(key, func() (any, error) {
+		led = true
 		// A flight that finished between our lookup and this Do already stored
 		// the answer; do not ask the apiserver twice.
 		if a, ok, _ := impCapMemo.lookup(p); ok {
 			return a, nil
 		}
 		impReviews.Add(1)
-		a, err := (*fnp)(ctx, p.resource, p.namespace, p.name)
+		dctx, dial := slowcall.StartDial(ctx, "access_review", "create", "authorization.k8s.io/v1, Resource=subjectaccessreviews")
+		a, err := (*fnp)(dctx, p.resource, p.namespace, p.name)
+		dial.EndErr(ctx, err)
 		if err != nil {
 			return false, err
 		}
 		impCapMemo.store(p, a, gen)
 		return a, nil
 	})
+	switch {
+	case led:
+		wait.Discard()
+	case err == nil:
+		wait.End()
+	case ctx.Err() != nil:
+		wait.EndRelease(slowcall.CauseOf(ctx.Err()))
+	default:
+		wait.EndRelease(slowcall.ReleaseLeaderFailed)
+	}
 	if err != nil {
 		return false, err
 	}

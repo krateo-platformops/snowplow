@@ -38,8 +38,8 @@ func TestS1054_SlowCallsAreMirroredOnOTLP(t *testing.T) {
 	all := flatten(rm)
 	got := map[string]int64{}
 	for _, p := range pointsFor(all, "snowplow_slow_requests_total") {
-		if len(p.attrs) != 1 {
-			t.Fatalf("snowplow_slow_requests_total attributes %v, want exactly route", p.attrs)
+		if len(p.attrs) != 2 || p.attrs["class"] != "customer" {
+			t.Fatalf("snowplow_slow_requests_total attributes %v, want exactly route and class=customer", p.attrs)
 		}
 		got[p.attrs["route"]] = p.value
 	}
@@ -47,11 +47,11 @@ func TestS1054_SlowCallsAreMirroredOnOTLP(t *testing.T) {
 		t.Fatalf("snowplow_slow_requests_total = %v, want {GET /call: 2, POST /call/read: 1}", got)
 	}
 	// The expvar mirror reads the same accessor.
-	var ev map[string]uint64
+	var ev map[string]map[string]uint64
 	if err := json.Unmarshal([]byte(expvar.Get("snowplow_slow_requests_total").String()), &ev); err != nil {
 		t.Fatalf("expvar: %v", err)
 	}
-	if ev["GET /call"] != 2 || ev["POST /call/read"] != 1 {
+	if ev["GET /call"]["customer"] != 2 || ev["POST /call/read"]["customer"] != 1 {
 		t.Fatalf("expvar snowplow_slow_requests_total = %v", ev)
 	}
 	for _, name := range []string{"snowplow_slow_request_snapshots_total", "snowplow_slow_request_snapshots_suppressed_total"} {

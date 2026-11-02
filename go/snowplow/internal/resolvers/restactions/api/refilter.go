@@ -43,6 +43,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
@@ -330,6 +331,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 // error denies the item; an EvaluateRBAC error denies the item; a
 // scalar the user has no grant for is dropped by EvaluateRBAC.
 func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, items []any) ([]any, int, int) {
+	defer slowcall.Start(ctx, slowcall.PhaseRefilter).End() // #1054
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
