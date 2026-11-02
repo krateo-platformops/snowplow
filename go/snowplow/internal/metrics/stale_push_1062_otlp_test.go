@@ -34,6 +34,15 @@ func expvarJSON(t *testing.T, name string) map[string]any {
 	return out
 }
 
+func inSet(set []string, v string) bool {
+	for _, s := range set {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
 func histPoints(rm metricdata.ResourceMetrics, name string) []metricdata.HistogramDataPoint[int64] {
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -93,8 +102,8 @@ func TestIssue1062_StalePushOTLPEqualsExpvarForEveryLayer(t *testing.T) {
 	byLayer := func(name string) map[string]int64 {
 		out := map[string]int64{}
 		for _, p := range pointsFor(all, name) {
-			if len(p.attrs) != 1 {
-				t.Fatalf("%s: attrs %v, want only layer", name, p.attrs)
+			if len(p.attrs) != 1 || !inSet(cache.StaleLayers, p.attrs["layer"]) {
+				t.Fatalf("%s: attrs %v, want only layer, from the closed set %v", name, p.attrs, cache.StaleLayers)
 			}
 			out[p.attrs["layer"]] = p.value
 		}
@@ -119,6 +128,9 @@ func TestIssue1062_StalePushOTLPEqualsExpvarForEveryLayer(t *testing.T) {
 	}
 	closesEV := expvarJSON(t, "snowplow_stale_serve_closes_total")
 	for _, p := range pointsFor(all, "snowplow_stale_serve_closes_total") {
+		if len(p.attrs) != 2 || !inSet(cache.StaleLayers, p.attrs["layer"]) || !inSet(cache.StalePushCloses, p.attrs["close"]) {
+			t.Fatalf("closes: attrs %v outside the closed sets %v × %v", p.attrs, cache.StaleLayers, cache.StalePushCloses)
+		}
 		m, _ := closesEV[p.attrs["layer"]].(map[string]any)
 		if e, _ := m[p.attrs["close"]].(float64); int64(e) != p.value {
 			t.Fatalf("closes %v: expvar %v != OTLP %d", p.attrs, m[p.attrs["close"]], p.value)
