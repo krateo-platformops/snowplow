@@ -134,11 +134,12 @@ func statusCode(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
 	return nil, false
 }
 
-// boolTrue: exactly the bool true, and no other member of the value. false
-// is never sent by contract, and a string "true", an int or any other type is
-// not a bool: each is dropped, never coerced.
+// boolTrue: exactly the bool true, and no other member of the value (members
+// counts every member the decoder saw, skipped ones included). false is never
+// sent by contract, and a string "true", an int or any other type is not a
+// bool: each is dropped, never coerced.
 func boolTrue(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
-	if b := v.BoolValue; b != nil && *b && v.StringValue == nil && v.IntValue == nil {
+	if b := v.BoolValue; b != nil && *b && v.members == 1 {
 		return &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}, true
 	}
 	return nil, false
@@ -227,11 +228,14 @@ type keyValue struct {
 }
 
 // anyValue keeps the AnyValue members some check reads; decode.go scans past
-// every other member without building it.
+// every other member without building it, but counts it in members. An OTLP
+// AnyValue is a oneof, so a conforming value has exactly one member; a check
+// that must see one and only one value (boolTrue) reads members.
 type anyValue struct {
 	StringValue *string
 	IntValue    *jsonInt64
 	BoolValue   *bool
+	members     int // every member of the value object, kept or skipped
 }
 
 // jsonUint64 / jsonInt64 accept the two encodings OTLP/JSON allows for 64-bit

@@ -148,12 +148,13 @@ func TestS1060_AbandonedDroppedOnNonInteractionSpans(t *testing.T) {
 }
 
 // Only bool true is the key's value. false, a string "true", an int, a double,
-// an array holding true, and a value carrying a string beside the bool are
-// each dropped and counted, never coerced; the span is still forwarded with
-// its other attributes.
+// an array holding true, and a bool true carrying any other member beside it
+// are each dropped and counted, never coerced; the span is still forwarded
+// with its other attributes.
 //
 // MUTATIONS (RED, shown in the PR): boolTrue accepting false; boolTrue
-// accepting a stringValue "true".
+// accepting a stringValue "true"; boolTrue without the one-member check; the
+// decoder not counting the members it skips.
 func TestS1060_AbandonedNonTrueValuesDropped(t *testing.T) {
 	values := []struct {
 		name  string
@@ -164,7 +165,15 @@ func TestS1060_AbandonedNonTrueValuesDropped(t *testing.T) {
 		{"int 1", map[string]any{"intValue": "1"}},
 		{"double 1", map[string]any{"doubleValue": 1.0}},
 		{"array [true]", map[string]any{"arrayValue": map[string]any{"values": []map[string]any{{"boolValue": true}}}}},
+		// An AnyValue is a oneof: bool true beside ANY other member is not
+		// exactly bool true (#1060 review F1), whichever member it is and
+		// whether the decoder keeps it or skips it.
 		{`bool true beside string "x"`, map[string]any{"boolValue": true, "stringValue": "x"}},
+		{"bool true beside int 1", map[string]any{"boolValue": true, "intValue": "1"}},
+		{"bool true beside double 1", map[string]any{"boolValue": true, "doubleValue": 1.0}},
+		{"bool true beside array", map[string]any{"boolValue": true, "arrayValue": map[string]any{"values": []map[string]any{}}}},
+		{"bool true beside kvlist", map[string]any{"boolValue": true, "kvlistValue": map[string]any{"values": []map[string]any{}}}},
+		{"bool true beside bytes", map[string]any{"boolValue": true, "bytesValue": "dHJ1ZQ=="}},
 	}
 	var spans []otlpSpan
 	for i, v := range values {

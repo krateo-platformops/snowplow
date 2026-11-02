@@ -89,7 +89,7 @@ What snowplow does with it:
 |---|---|
 | `{"boolValue": true}` on one of the three interaction spans | forwarded as the bool `true` |
 | absent | nothing added; the span is forwarded as before |
-| `{"boolValue": false}`, `{"stringValue": "true"}`, an `intValue`, a `doubleValue`, an `arrayValue`, or a value carrying another member beside the bool | dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| `{"boolValue": false}`, `{"stringValue": "true"}`, an `intValue`, a `doubleValue`, an `arrayValue`, or a `true` with any other member beside it (`stringValue`, `intValue`, `doubleValue`, `arrayValue`, `kvlistValue`, `bytesValue`: an OTLP `AnyValue` holds exactly one) | dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
 | on `krateo.widget.fetch` or `krateo.page.load` | dropped and counted; the span is still forwarded |
 | `{"boolValue": "true"}` (a JSON string where OTLP/JSON requires a bool) | the body is not OTLP/JSON: the request is refused `400` |
 

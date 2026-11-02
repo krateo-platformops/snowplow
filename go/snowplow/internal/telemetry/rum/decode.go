@@ -263,8 +263,9 @@ func (d *walker) span() (span, error) {
 // repeated-key refusal as every other object. Only stringValue, intValue and
 // boolValue are kept (the allowlist never needs another type); any other
 // AnyValue member (doubleValue, arrayValue, kvlistValue, bytesValue, …) is
-// scanned past without being built. A kept member whose JSON is not its type
-// (a boolValue of "true") is not OTLP/JSON: the request is refused 400.
+// scanned past without being built, but every member, kept or skipped, is
+// counted in anyValue.members. A kept member whose JSON is not its type (a
+// boolValue of "true") is not OTLP/JSON: the request is refused 400.
 func (d *walker) keyValue() (keyValue, error) {
 	var kv keyValue
 	err := d.object(func(key string) error {
@@ -273,6 +274,7 @@ func (d *walker) keyValue() (keyValue, error) {
 			return d.value(&kv.Key)
 		case "value":
 			return d.object(func(key string) error {
+				kv.Value.members++
 				switch key {
 				case "stringValue":
 					var s string

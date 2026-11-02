@@ -283,9 +283,11 @@ func TestS1015_PerUserRateLimit(t *testing.T) {
 }
 
 // A wrong service.name, or an unknown span name, is dropped and counted, and
-// only the allowlisted span is forwarded.
+// only the allowlisted span is forwarded. A span name matches EXACTLY: a case
+// variant or a name with surrounding whitespace is unknown (#1060 review F2).
 //
-// MUTATIONS (RED): the service.name check skipped; the span-name check skipped.
+// MUTATIONS (RED): the service.name check skipped; the span-name check skipped;
+// the span-name lookup ignoring case; the span-name lookup trimming space.
 func TestS1015_WrongServiceAndUnknownNameDropped(t *testing.T) {
 	c := newCollector(t, nil)
 	defer c.srv.Close()
@@ -296,17 +298,26 @@ func TestS1015_WrongServiceAndUnknownNameDropped(t *testing.T) {
 	if rec := postRUM(t, h, tok, otlpBody(t, "evil-service", nil, widgetFetch())); rec.Code != http.StatusOK {
 		t.Fatalf("wrong service: status %d, want 200 with a partial success", rec.Code)
 	}
-	mixed := otlpBody(t, rum.ServiceName, nil, otlpSpan{name: "document.load"}, widgetFetch())
+	unknown := []string{
+		"document.load",
+		"Krateo.Composition.Open", "KRATEO.FORM.SUBMIT", "krateo.widget.Fetch", // case variants
+		"krateo.page.publish ", " krateo.page.load", "krateo.form.submit\t", // whitespace
+	}
+	var mixedSpans []otlpSpan
+	for _, n := range unknown {
+		mixedSpans = append(mixedSpans, otlpSpan{name: n})
+	}
+	mixed := otlpBody(t, rum.ServiceName, nil, append(mixedSpans, widgetFetch())...)
 	rec := postRUM(t, h, tok, mixed)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"rejectedSpans":"1"`) {
-		t.Fatalf("mixed batch: status %d body %s, want 200 with rejectedSpans 1", rec.Code, rec.Body)
+	if want := fmt.Sprintf(`"rejectedSpans":"%d"`, len(unknown)); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("mixed batch: status %d body %s, want 200 with %s", rec.Code, rec.Body, want)
 	}
 	after := rum.Read()
 	if d := after.Spans["dropped_service"] - before.Spans["dropped_service"]; d != 1 {
 		t.Fatalf("dropped_service delta %d, want 1", d)
 	}
-	if d := after.Spans["dropped_name"] - before.Spans["dropped_name"]; d != 1 {
-		t.Fatalf("dropped_name delta %d, want 1", d)
+	if d := after.Spans["dropped_name"] - before.Spans["dropped_name"]; d != uint64(len(unknown)) {
+		t.Fatalf("dropped_name delta %d, want %d (%q)", d, len(unknown), unknown)
 	}
 	got := awaitExport(t, c)
 	spans := got.GetResourceSpans()[0].GetScopeSpans()[0].GetSpans()
