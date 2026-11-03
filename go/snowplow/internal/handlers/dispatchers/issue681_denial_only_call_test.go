@@ -120,8 +120,11 @@ func c681Seed() []runtime.Object {
 	return []runtime.Object{
 		cr("ra-reader681", rbacv1.PolicyRule{APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}, Verbs: []string{"get", "list"}}),
 		crb("ra-reader681", "ra-reader681", c681Group(c681All)),
-		// all681 may read configmaps in pub; readers681 in x.
-		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "pub", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM}},
+		// all681 may read configmaps in pub; readers681 in x. (#1080 C8: and
+		// the CRD-backed c1080Gizmos in pub — a rule, not a binding, so no
+		// binding set and no key moves.)
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "pub", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM,
+			{APIGroups: []string{c1080Gizmos.Group}, Resources: []string{c1080Gizmos.Resource}, Verbs: []string{"get", "list"}}}},
 		rb("pub", "all-cm", "cm", c681Group(c681All)),
 		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "x", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM}},
 		rb("x", "readers-cm", "cm", c681Group(c681Readers)),
@@ -170,6 +173,7 @@ func c681Setup(t *testing.T) *c681Env {
 		h1RAGVR: "RESTActionList", h1WidgetGVR: "PanelList",
 		c681CRBGVR: "ClusterRoleBindingList", c681CRGVR: "ClusterRoleList",
 		c681RBGVR: "RoleBindingList", c681RGVR: "RoleList", c681CMs: "ConfigMapList",
+		c1080Gizmos: "GizmoList", // #1080 C8 — a CRD-backed (removable) GVR
 	}
 	objs := append(c681Seed(), c681CMObj("pub", "p", "PUBDATA-681"), c681CMObj("x", "y", c681SecretY))
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
