@@ -230,6 +230,14 @@ var closedAttributeKeys = map[string]struct{}{
 	// with reason/outcome by store_swap_otlp_870_test.go
 	// (TestStoreSwap870_LabelValuesAreClosedSets).
 	"close": {},
+	// #1070 — tier and content on the refresh-cycle instruments
+	// (snowplow_refresh_cycle_put_total, _wait_ms, _duration_ms,
+	// snowplow_refresh_broadcaster_put_to_frame_ms): tier is the closed
+	// cache.RefreshCycleTiers set {viewed, normal, cluster_list, direct},
+	// content the closed cache.RefreshPutContents set {identical, changed};
+	// pinned by refresh_cycle_otlp_1070_test.go
+	// (TestRefreshCycle1070_LabelValuesAreClosedSets).
+	"tier": {}, "content": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

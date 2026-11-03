@@ -213,3 +213,32 @@ func TestRefreshCycle1070_OTLPAndExpvarAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestRefreshCycle1070_LabelValuesAreClosedSets — every put_total series the
+// real callback emits carries a class, tier and content from the closed sets,
+// and every cell of the closed product is emitted (a zero is a reading).
+func TestRefreshCycle1070_LabelValuesAreClosedSets(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	in := func(set []string) map[string]bool {
+		m := map[string]bool{}
+		for _, s := range set {
+			m[s] = true
+		}
+		return m
+	}
+	classes, tiers, contents := in(cache.RefreshCycleClasses), in(cache.RefreshCycleTiers), in(cache.RefreshPutContents)
+	seen := map[[3]string]bool{}
+	for _, p := range flatten(collectViaRealCallback(t, "test")) {
+		if p.metric != "snowplow_refresh_cycle_put_total" {
+			continue
+		}
+		c, tr, k := p.attrs["class"], p.attrs["tier"], p.attrs["content"]
+		if !classes[c] || !tiers[tr] || !contents[k] || len(p.attrs) != 3 {
+			t.Fatalf("put_total series %v is outside the closed sets", p.attrs)
+		}
+		seen[[3]string{c, tr, k}] = true
+	}
+	if want := len(classes) * len(tiers) * len(contents); len(seen) != want {
+		t.Fatalf("put_total emitted %d series, want the closed product of %d", len(seen), want)
+	}
+}
