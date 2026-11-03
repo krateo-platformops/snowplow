@@ -97,6 +97,42 @@ def quantile(q: float, buckets: dict[float, float]) -> float | None:
     return prev_le
 
 
+class PhaseClock:
+    """Which phase a time is in, for samples differenced pairwise (#919;
+    shared with bench/netpath.py, #1089). `phases` / `phase_of`:
+    load606.run_phases and its _phase_of; `measure_t0`: when the measure began
+    (before it is BEFORE, not the storm whose window opens at -inf); `boot`:
+    snowplow's boot window, its own phase (#922 F3)."""
+
+    def __init__(self, phases: list[tuple[str, float, float]], phase_of, measure_t0: float | None,
+                 boot: tuple[float, float] | None = None):
+        self.phases, self.phase_of, self.measure_t0, self.boot = phases, phase_of, measure_t0, boot
+        # every phase edge: where the phase a time falls in can change
+        self.edges = sorted({e for _, a0, a1 in phases for e in (a0, a1) if e not in (float("inf"), float("-inf"))}
+                            | ({measure_t0} if measure_t0 is not None else set()) | (set(boot) if boot else set()))
+
+    def phase(self, t: float) -> str:
+        if self.boot is not None and self.boot[0] <= t < self.boot[1]:
+            return BOOT
+        return BEFORE if self.measure_t0 is not None and t < self.measure_t0 else self.phase_of(t, self.phases)
+
+    def crossed(self, t0: float, t1: float) -> list[str]:
+        """The phases from t0 to t1, in order (each edge in (t0, t1] may
+        change it): one name when no phase boundary lies between."""
+        seq = [self.phase(t0)]
+        for e in self.edges:
+            if t0 < e <= t1 and self.phase(e) != seq[-1]:
+                seq.append(self.phase(e))
+        if self.phase(t1) != seq[-1]:
+            seq.append(self.phase(t1))
+        return seq
+
+    def order(self, present) -> list[str]:
+        """The phase names in `present`, in run order (then steady)."""
+        return ([n for n in (BEFORE, BOOT) if n in present] + [n for n, _, _ in self.phases if n in present]
+                + (["steady"] if "steady" in present else []))
+
+
 class _Phase:
     def __init__(self):
         self.scrapes = 0
@@ -204,24 +240,8 @@ def report(recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_o
     -inf); `boot`: snowplow's boot window (its restart to its new pod's
     Ready), its own phase (#922 F3).
     """
-    def phase(t):
-        if boot is not None and boot[0] <= t < boot[1]:
-            return BOOT
-        return BEFORE if measure_t0 is not None and t < measure_t0 else phase_of(t, phases)
-    # every phase edge: where the phase a time falls in can change
-    edges = sorted({e for _, a0, a1 in phases for e in (a0, a1) if e not in (float("inf"), float("-inf"))}
-                   | ({measure_t0} if measure_t0 is not None else set()) | (set(boot) if boot else set()))
-
-    def crossed(t0, t1):
-        """The phases from t0 to t1, in order (each edge in (t0, t1] may
-        change it): one name when no phase boundary lies between."""
-        seq = [phase(t0)]
-        for e in edges:
-            if t0 < e <= t1 and phase(e) != seq[-1]:
-                seq.append(phase(e))
-        if phase(t1) != seq[-1]:
-            seq.append(phase(t1))
-        return seq
+    clock = PhaseClock(phases, phase_of, measure_t0, boot)
+    phase, crossed = clock.phase, clock.crossed
     acc: dict[str, _Phase] = defaultdict(_Phase)
     spanning: dict[str, _Phase] = defaultdict(_Phase)
     last: dict = {}                       # replica -> (t, its reported series)

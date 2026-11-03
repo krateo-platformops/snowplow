@@ -1734,8 +1734,25 @@ def test_in_chrome_a_refused_call_and_the_open_streams_are_points(tmp_path):
     assert not o["points"].get("browser_request_failed_start_unseen")    # every start was seen
     calls = [t for _, t in o["points"]["browser_call_ms"]]
     assert any(t["call_resource"] == "tables" and t["call_status"] == "200" for t in calls), calls
+    # #1089 (#1104 review): the join's inputs on REAL k6 2.3.0 output — the answered /call's
+    # Resource Timing as call_timing metadata with its load's id, that id on the load's own
+    # page-load point, its protocol tag, and Chrome's Fetch samples stamped with the VU
+    from bench import calltiming
+    tables = [(t, calltiming.timing_of(md)) for (_, t), md in
+              zip(o["points"]["browser_call_ms"], o["metadata"]["browser_call_ms"]) if t["call_resource"] == "tables"]
+    t, m = tables[0]
+    assert m is not None and {"fetch", "request_start", "response_start", "response_end"} <= set(m), tables
+    assert t["call_protocol"] == "http/1.1"                                 # the fixture's plain-http origin
+    assert t["during"] == "load" and m.get("load_id") and isinstance(m.get("from_load_ms"), (int, float)), tables
+    load_ids = {md.get("load_id") for md in o["metadata"]["browser_page_load_ms"]}
+    assert m["load_id"] in load_ids, (m, load_ids)
+    fetch_vus = {md.get("vu") for (_, ft), md in zip(o["points"]["browser_http_req_duration"],
+                                                     o["metadata"]["browser_http_req_duration"])
+                 if ft.get("resource_type") == "Fetch"}
+    assert m["load_id"].split(":")[0] in fetch_vus, fetch_vus
     with gzip.open(tmp_path / "out" / "browser.json.gz", "rt") as fh:
-        assert "FIXTURE-SECRET" not in fh.read()
+        raw = fh.read()
+    assert "FIXTURE-SECRET" not in raw and '"call_timing"' in raw
 
 
 @needs_docker

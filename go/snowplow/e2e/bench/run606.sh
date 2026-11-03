@@ -980,7 +980,24 @@ s_env() {
   start_log_stream
   apf_preflight || return 1
   start_apf_loop
+  start_netns_sampler
   flowcontrol_attribution || return 1
+}
+# start_netns_sampler (#1089): the TCP path under snowplow, from here (the boot
+# included) to collect — every TOP_POLL_S, ONE pod on the snowplow node
+# (hostPID + hostNetwork, CAP_SYS_PTRACE only, reading /proc: the snowplow image has
+# no shell) records each pod network namespace's SYN retransmits / retransmitted
+# segments and the node's conntrack failures into its /out/netns.jsonl
+# (bench/netns606.py). Report only: a sampler that cannot start never stops the
+# run, and its figures read UNMEASURED.
+start_netns_sampler() {
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: netns606 Job on the snowplow pool (hostPID, hostNetwork; /proc only, every ${TOP_POLL_S}s) -> /out/netns.jsonl"
+    return 0
+  fi
+  python3 -m bench.netns606 render --every-s "$TOP_POLL_S" > "$OUT/netns-job.yaml"
+  kapply "$OUT/netns-job.yaml" \
+    || log "WARNING: the netns606 sampler could not be applied: the TCP path under snowplow will read UNMEASURED"
 }
 # flowcontrol_attribution (#922 F3, #924 review M2/M3): which APF flow schema
 # serves snowplow's ServiceAccount, the requests it sends as a bench user, and
@@ -1796,6 +1813,12 @@ s_collect() {
       || log "could not read the fresh606 log from ${p#pod/}"
   done
   snowplow_pod_record after
+  # #1089: the netns606 samples (the TCP path under snowplow), report only;
+  # flushed per line, so a copy at any moment holds whole samples
+  for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=netns606 -o name); do
+    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out/netns.jsonl" "$OUT/netns.jsonl" >/dev/null 2>&1 \
+      || log "could not copy the netns606 samples from ${p#pod/}: the TCP path under snowplow will read UNMEASURED"
+  done
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
@@ -1898,7 +1921,8 @@ s_evaluate() {
                "$OUT"/pod-*.jsonl "$OUT"/mem-*.jsonl "$OUT"/top.jsonl
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
-               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl)
+               "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
+               "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")

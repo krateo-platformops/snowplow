@@ -85,6 +85,13 @@ _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req
           "arrivals", "browser_http_req_duration", "browser_http_req_failed", "browser_call_ms",
           "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
           "browser_fresh_class")
+# the points whose sample metadata is kept too (out["metadata"], index-aligned
+# with out["points"]; {} when a point has none): #1089's per-call Resource
+# Timing rides as browser_call_ms' call_timing metadata (never a tag), a page
+# load's id as its own points' load_id, and the VU as every browser sample's
+# `vu` (bench/calltiming.py joins Chrome's request samples to a load by it)
+_WITH_METADATA = ("browser_call_ms", "browser_page_load_ms", "browser_http_req_duration")
+_NO_METADATA: dict = {}          # shared, never written: most points carry none
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 
 
@@ -116,7 +123,7 @@ def read_k6_out(d: str, name: str) -> dict | None:
     if not any(os.path.exists(p) for p in (stream, summary, exitf)):
         return None
     out = {"name": name, "stream": os.path.exists(stream), "points": defaultdict(list),
-           "times": defaultdict(list),
+           "times": defaultdict(list), "metadata": defaultdict(list),
            "frames": Counter(), "truncated": False, "summary": None, "exit": None}
     # one shared dict per distinct tag set: a paired run's customers stay on
     # for hours (K6_SPAN=churn, millions of calls with a few dozen tag sets)
@@ -146,6 +153,8 @@ def read_k6_out(d: str, name: str) -> dict | None:
                         out["points"][r["metric"]].append((data.get("value"), tags))
                         if r["metric"] in _TIMED:
                             out["times"][r["metric"]].append(epoch(data.get("time")))
+                        if r["metric"] in _WITH_METADATA:
+                            out["metadata"][r["metric"]].append(data.get("metadata") or _NO_METADATA)
         except (OSError, EOFError):
             out["truncated"] = True                      # a cut gzip member
     for key, path in (("summary", summary), ("exit", exitf)):
@@ -669,6 +678,7 @@ def k6_report(o: dict | None) -> dict | None:
 def browser_report(o: dict | None) -> dict | None:
     if o is None:
         return None
+    from bench import calltiming
     p = o["points"]
     states = defaultdict(int)
     for v, t in p.get("browser_widget_states", []):
@@ -688,6 +698,8 @@ def browser_report(o: dict | None) -> dict | None:
             "timeouts": sum(v for v, _ in p.get("browser_page_timeouts", [])),
             "widget_states": dict(states),
             "calls_report_only": calls_report(p.get("browser_call_ms", [])),
+            # #1089: each /call's protocol, connection queueing and waterfall
+            "call_timing_report_only": calltiming.report(o),
             "incomplete_requests_report_only": incomplete_report(p.get("browser_request_incomplete_ms", []),
                                                                  p.get("browser_request_failed_start_unseen", [])),
             "cpu": cpu_stats((o.get("cpu") or {}).get("browser"))}

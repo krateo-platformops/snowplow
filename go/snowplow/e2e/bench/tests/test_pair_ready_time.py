@@ -694,6 +694,12 @@ def _num(bar):
     return float(bar.split()[1])
 
 
+# a measured between-run ratio of 1 for steady (#1053: a cell with no replica
+# ratio has no FAIL bar at all; these probes test the exclusion arithmetic,
+# so they give the cell a between-run term that adds nothing)
+ONE = {"phases": {"steady": dict.fromkeys(custlat.METRICS, 1.0)}}
+
+
 def test_review_probe1_a_shorter_sample_never_makes_pass_easier():
     """The reviewer's probe 1: B = k x A at every call; the calm 80 % of A is
     cut, the volatile 20 % kept. On the full phase k FAILs; after the cut the
@@ -706,14 +712,14 @@ def test_review_probe1_a_shorter_sample_never_makes_pass_easier():
     a_cs = _blocks_calls(40, lambda k, j: vol[(k, j)] if k >= 32 else calm[(k, j)])
     excl = [(1000.0, 1320.0)]
     for m in ("p95_ms", "p99_ms"):
-        full_c = _probe_cell("steady", m, a_cs, a_cs, [], [])
-        cut_c = _probe_cell("steady", m, a_cs, a_cs, [], excl)
+        full_c = _probe_cell("steady", m, a_cs, a_cs, [], [], replica=ONE)
+        cut_c = _probe_cell("steady", m, a_cs, a_cs, [], excl, replica=ONE)
         assert _num(cut_c["bar"]) <= _num(full_c["bar"]), (m, cut_c["bar"], full_c["bar"])
         assert _num(cut_c["bar"]) < _num(cut_c["fail_bar"])
         k = 1.46
         b_cs = [(t, v * k) for t, v in a_cs]
-        assert _probe_cell("steady", m, a_cs, b_cs, [], []) ["result"] == "FAIL"
-        cut = _probe_cell("steady", m, a_cs, b_cs, [], excl)["result"]
+        assert _probe_cell("steady", m, a_cs, b_cs, [], [], replica=ONE)["result"] == "FAIL"
+        cut = _probe_cell("steady", m, a_cs, b_cs, [], excl, replica=ONE)["result"]
         # p99 (the probe's flip): undecidable on the volatile fifth; p95: past even its FAIL bar
         assert cut == {"p95_ms": "FAIL", "p99_ms": "INCONCLUSIVE"}[m], (m, cut)
 
@@ -731,8 +737,8 @@ def test_review_the_cap_keeps_a_shorter_sample_from_loosening_pass():
     a_cs = _blocks_calls(40, lambda k, j: vol[(k, j)] if k >= 30 else calm[(k, j)])
     excl = [(1000.0, 1120.0)]
     b_cs = [(t, v * 1.2) for t, v in a_cs]
-    full = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], [])
-    cut = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], excl)
+    full = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], [], replica=ONE)
+    cut = _probe_cell("steady", "p99_ms", a_cs, b_cs, [], excl, replica=ONE)
     assert full["result"] == "FAIL" and _num(full["bar"]) < 1.2
     assert _num(cut["bar"]) <= _num(full["bar"]) and cut["pass_bar_from"] == "A's whole-phase sd"
     assert cut["result"] != "PASS", cut["line"]
@@ -770,13 +776,16 @@ def test_review_probe2_the_replica_floor_keeps_the_band():
 def test_review_nothing_excluded_is_the_bar_of_before():
     rnd = random.Random(3)
     a_cs = _blocks_calls(40, lambda k, j: rnd.lognormvariate(4, 0.3))
-    for rp in (None, {"phases": {"steady": {"p95_ms": 1.3, "p99_ms": 1.01, "req_s": 1.2}}}):
+    for rp in (None, ONE, {"phases": {"steady": {"p95_ms": 1.3, "p99_ms": 1.01, "req_s": 1.2}}}):
         for m in custlat.METRICS:
             c = _probe_cell("steady", m, a_cs, a_cs, [], [], replica=rp)
             sd = c["a_half_sd"]
             tol = max(math.exp(Z9 * math.sqrt(2) * sd), (custlat._replica(rp, "steady", m) or 1.0))
             want = round(1 / tol, 4) if m == "req_s" else round(tol, 4)
-            assert _num(c["bar"]) == _num(c["fail_bar"]) == want and c["extra_spread"] == 1.0
+            assert _num(c["bar"]) == want and c["extra_spread"] == 1.0
+            # no replica ratio: no FAIL bar (#1053); with one, the one bar of before
+            assert (c["fail_bar"] == "n/a (no between-run replica)" if rp is None
+                    else _num(c["fail_bar"]) == want)
 
 
 def test_review_property_a_pass_after_exclusion_is_a_pass_on_full_data():

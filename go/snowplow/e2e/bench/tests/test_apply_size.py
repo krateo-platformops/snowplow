@@ -115,11 +115,12 @@ def test_run606_applies_everything_through_one_server_side_apply():
     # #924 M3: the bench's own FlowSchemas (env); #1042's pre-drive PSI Job; the preflight Job; #935's
     # fresh identity classes (data; its output names users: discarded); run 19's
     # menu-class identities (classes; the same); the load. Each class's preflight
-    # Job goes through kapply inside run_preflight_job. #1004's full-widen stage
-    # (after evaluate): each batch of its objects (fw_one, output discarded: 50K
-    # lines), its CRD, its read + identity, its Job, and the widened CRD; its
+    # Job goes through kapply inside run_preflight_job. #1089: the node-side netns606 sampler (env).
+    # #1004's full-widen stage (after evaluate): each batch of its objects (fw_one, output
+    # discarded: 50K lines), its CRD, its read + identity, its Job, and the widened CRD; its
     # single applies each under a wall-clock bound (a term of its budget).
-    assert sites == ['kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
+    assert sites == ['kapply "$OUT/netns-job.yaml" \\',
+                     'kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
                      'kapply "$OUT/preflight-job.yaml"',
                      'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
                      'kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \\',
@@ -138,6 +139,14 @@ def test_the_fresh_classes_fit_the_api():
     p = fresh_classes.plan(sessions=5, routes=8, think_s=15, duration_s=9000, namespaces=50, user_prefix="scaleuser-")
     objs = _objects(fresh_classes.manifest(p, "pw"))
     assert len(objs) == 3 * 5 * (p["classes_per_session"] - 1)
+    assert all(check(o, client_side=False) == [] for o in objs)
+
+
+def test_the_netns_sampler_fits_the_api():
+    """#1089: the ConfigMap carries bench/netns606.py verbatim."""
+    from bench import netns606
+    objs = _objects(netns606.render())
+    assert [o["kind"] for o in objs] == ["Namespace", "ConfigMap", "Job"]
     assert all(check(o, client_side=False) == [] for o in objs)
 
 

@@ -1593,6 +1593,8 @@ def pod_record(pod_list: dict, phase: str) -> dict:
     cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
     return {"kind": "snowplow_pod", "phase": phase,
             "pod": (p.get("metadata") or {}).get("name"),
+            # #1089: which network namespace on the node is snowplow's (bench/netpath.py)
+            "uid": (p.get("metadata") or {}).get("uid"),
             "restarts": cs.get("restartCount", 0),
             "ready": cs.get("ready"),
             "last_state": cs.get("lastState") or {},
@@ -3439,6 +3441,49 @@ def push_refetch_report(rows: list[dict]) -> dict | None:
             "start_lag_p95_ms": pct([r.get("start_lag_ms") for r in rows], 95)}
 
 
+def _unmeasured(why: str) -> dict:
+    return {"status": "UNMEASURED", "why": why}
+
+
+def refresher_gauges_report(vars_series: list[dict], mem: list[dict], k6_driver: bool) -> dict:
+    """The server's refresher queue depth and windowed dirty-to-fresh p95, from
+    the driver's own /debug/vars samples: the load606 driver's `vars` records,
+    or (the k6 driver, which has no such sampler: run 20 read null) mem606's
+    samples. A field whose gauge is in no sample is UNMEASURED with why, never
+    null. #1066."""
+    if k6_driver:
+        src = "mem606's /debug/vars samples"
+        rows = sorted((m for m in mem if m.get("kind") == "mem" and m.get("vars_status") == 200),
+                      key=lambda m: m.get("t") or 0)
+        rows = [{"refresher_queue_depth": m.get("refresher_queue_depth"),
+                 "dirty_to_fresh_p95_ms": (m.get("extra") or {}).get(RUN8_KEYS["dirty_to_fresh_p95"])}
+                for m in rows]
+    else:
+        src, rows = "the load606 driver's /debug/vars samples", vars_series
+
+    def series(field, key):
+        vals = [v for v in (_num(r.get(field)) for r in rows) if v is not None]
+        why = None if vals else (f"{key} is in none of the {len(rows)} {src}" if rows
+                                 else f"{src}: none recorded")
+        return vals, why
+
+    q, q_why = series("refresher_queue_depth", "snowplow_refresher_queue_depth")
+    p, p_why = series("dirty_to_fresh_p95_ms", RUN8_KEYS["dirty_to_fresh_p95"])
+    return {"refresher_queue_depth_max": max(q) if q else _unmeasured(q_why),
+            "refresher_queue_depth_last": q[-1] if q else _unmeasured(q_why),
+            "server_dirty_to_fresh_p95_ms_max_window": max(p) if p else _unmeasured(p_why),
+            "server_dirty_to_fresh_p95_ms_median_window": pct(p, 50) if p else _unmeasured(p_why),
+            "refresher_gauges_source": f"{src} ({len(rows)})"}
+
+
+def push_refetch_field(rows: list[dict], src: str) -> dict:
+    """push_refetch_report over the driver's viewers' records, or UNMEASURED
+    with why (#1066): none recorded is not none happened."""
+    r = push_refetch_report(rows)
+    return ({"status": "present", "source": src, **r} if r is not None
+            else _unmeasured(f"no push_refetch record in {src}"))
+
+
 def _check(name, value, op, bar, checks):
     if value is None:
         checks.append({"check": name, "value": None, "bar": bar,
@@ -3708,26 +3753,30 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     econ = None
     if len(vars_series) >= 2:
         econ = economics(vars_series[0], vars_series[-1], calls)
-    q = [v.get("refresher_queue_depth") for v in vars_series
-         if v.get("refresher_queue_depth") is not None]
-    p95s = [v.get("dirty_to_fresh_p95_ms") for v in vars_series
-            if v.get("dirty_to_fresh_p95_ms") is not None]
+    # #1066: the k6 driver's open tabs are the viewer sidecar's (k6/viewer.jsonl):
+    # their refetches feed this report and run 8's delivery alike
+    refetches, refetch_src = push_refetches or [], "the load606 driver's viewer records"
+    viewer_recs: list[dict] = []
+    if k6 is not None:
+        vo = k6.get("viewer")
+        viewer_recs = (vo or {}).get("records") or []
+        refetches = [r for r in viewer_recs if r.get("kind") == "push_refetch"]
+        refetch_src = ("k6/viewer.jsonl: the run drove no viewers" if not k6.get("viewers", True)
+                       else "k6/viewer.jsonl: not collected" if vo is None
+                       else f"k6/viewer.jsonl ({len(viewer_recs)} records)")
     report = {
         "navs": len(navs), "first_navs": len(first), "warm_navs": len(warm),
         "calls": calls, "errors": errors,
         "warm_p50_ms": pct(warm, 50), "warm_p95_ms": pct(warm, 95),
         "first_p50_ms": pct(first, 50), "first_p95_ms": pct(first, 95),
         "max_nav_ms": max((n["wall_ms"] for n in navs), default=None),
-        "refresher_queue_depth_max": max(q) if q else None,
-        "refresher_queue_depth_last": q[-1] if q else None,
-        "server_dirty_to_fresh_p95_ms_max_window": max(p95s) if p95s else None,
-        "server_dirty_to_fresh_p95_ms_median_window": pct(p95s, 50),
+        **refresher_gauges_report(vars_series, mem or [], k6 is not None),
         "fresh_curve_report_only": curve,
         # churn modes present ("list_dep" = annotation, "list_dep_status" =
         # status condition); each gates at its own @10 label
         "fresh_modes": modes,
         "fresh_push_report_only": push_report(fresh),
-        "push_refetch_report_only": push_refetch_report(push_refetches or []),
+        "push_refetch_report_only": push_refetch_field(refetches, refetch_src),
         # #817: the probe's viewer, incl. every time its cell's key rotated
         # under it (it re-arms, like the SPA; run 9 armed once and lost it).
         "fresh_viewer": fresh_viewer_report(fresh_viewers or []),
@@ -3840,14 +3889,12 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         # own page loads, tagged by kind (navs are Chrome's, by method: run 20's
         # bursts ran and read as "not recorded"); its open tabs are the viewer
         # sidecar's (run 20: 264,239 streams read as 0)
-        burst_navs, r8_viewers, r8_refetches = navs, viewer_stats, push_refetches
+        burst_navs, r8_viewers = navs, viewer_stats
         if k6 is not None:
             burst_navs = k6eval.k6_burst_navs(k6.get("k6"))
-            vr = (k6.get("viewer") or {}).get("records") or []
-            r8_viewers = [r for r in vr if r.get("kind") == "viewer_stats"][-1:]   # cumulative: the last
-            r8_refetches = [r for r in vr if r.get("kind") == "push_refetch"]
+            r8_viewers = [r for r in viewer_recs if r.get("kind") == "viewer_stats"][-1:]   # cumulative: the last
         r8, r8_checks = run8_report(burst_navs, mem or [], tops or [], snowplow_pods,
-                                    fresh=fresh, push_refetches=r8_refetches,
+                                    fresh=fresh, push_refetches=refetches,
                                     viewer_stats=r8_viewers)
         r8["burst_and_delivery_source"] = (
             "k6's page loads by kind; the viewer sidecar's viewer_stats / push_refetch" if k6 is not None
@@ -5514,7 +5561,16 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
     if apf_path is not None and not have:
         rep["note"] += f"; {apf_path} does not exist"
     report["apiserver_flowcontrol_report_only"] = rep
+    # #1089: the TCP path under snowplow (its pod's SYN retransmits, its node's
+    # conntrack, the API server's codes), per phase; the APF stream read again
+    from bench import netpath
+    report["tcp_path_report_only"] = netpath.report(
+        recs, iter_jsonl(apf_path) if have else [], run_phases(mem, fresh + churns), _phase_of,
+        min(before) if before else None, boot=window)
     warnings = report.setdefault("report_warnings", [])
+    for k, sec in report["tcp_path_report_only"].items():
+        if isinstance(sec, dict) and sec.get("status") == netpath.UNMEASURED:
+            warnings.append(f"tcp_path {k}: UNMEASURED ({sec.get('why')})")
     if rep["status"] == apf.REPORT_ABSENT:
         warnings.append(f"apiserver_flowcontrol report: {rep['note']}")
     elif not rep["samples"]["answered"]:
