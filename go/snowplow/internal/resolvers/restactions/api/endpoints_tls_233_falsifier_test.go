@@ -86,7 +86,7 @@ func TestIssue233_UnparseableCA_WarnsOnceAndCountsRate(t *testing.T) {
 
 	// Precondition: this endpoint IS the owned-CA shape → the CAPABILITY site,
 	// not the POLICY site. (Pinned in both directions, per the #229 lesson.)
-	if !endpointNeedsOwnedCAClient(unparseableCAEndpoint(srv, badCA)) {
+	if !endpointOwnedShape(unparseableCAEndpoint(srv, badCA)) {
 		t.Fatal("precondition: the unparseable-CA endpoint must be owned-predicate=true (capability site)")
 	}
 
@@ -128,9 +128,11 @@ func TestIssue233_PolicyDelegation_StaysSilent(t *testing.T) {
 	rec := install233Capture(t)
 
 	const srv = "https://apiserver.example:6443"
-	ep := &endpoints.Endpoint{ServerURL: srv, Token: saTestToken} // no CA → policy site
-	if endpointNeedsOwnedCAClient(ep) {
-		t.Fatal("precondition: a no-CA endpoint must be owned-predicate=false (policy site)")
+	ep := &endpoints.Endpoint{ServerURL: srv, Token: saTestToken} // no CA → nothing to parse
+	// #1088: a no-CA endpoint is owned (system roots, as plumbing) and has no CA
+	// for the capability site to read, so it never reaches the #233 WARN.
+	if _, ok := endpointTLSConfig(ep); !ok {
+		t.Fatal("precondition: a no-CA endpoint must have readable TLS material (nothing to parse)")
 	}
 
 	drive233(t, ep)

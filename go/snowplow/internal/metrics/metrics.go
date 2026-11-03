@@ -63,6 +63,7 @@ import (
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
@@ -1240,6 +1241,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerExternalFetchCacheInstruments(m); err != nil {
 		return err
 	}
+	if err := registerEndpointDialInstruments(m); err != nil { // #1088
+		return err
+	}
 	if err := registerUAFNullSkipInstruments(m); err != nil {
 		return err
 	}
@@ -1526,7 +1530,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return err
 	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
-		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted, so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
+		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted here (they are in snowplow_endpoint_retries_total, #1088), so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
 		return err
 	}
@@ -1630,6 +1634,46 @@ func registerListQueryInstrument(m metric.Meter) error {
 		}
 		return nil
 	}, listQuery)
+	return err
+}
+
+// registerEndpointDialInstruments hand-wires #1088's endpoint-dial surfaces
+// onto OTLP (no expvar->OTLP bridge), from the accessors their expvar closures
+// read: every retry by site and cause, and the stage fetch's per-identity
+// client cache. site and cause are closed, code-defined sets. Registered only
+// when the cache is on (CFG-1), like their expvar keys.
+func registerEndpointDialInstruments(m metric.Meter) error {
+	retries, err := m.Int64ObservableCounter("snowplow_endpoint_retries_total",
+		metric.WithDescription("HTTP attempts re-sent by an endpoint dial's retry loop (plumbing RetryClient), one per retry, by site {stage = RESTAction branch-E fetch, call = /call passthrough} and cause, the outcome of the attempt it replaces {dns, dial (TCP connect failed), tls_handshake, connection (any other error with no response), status_429, status_5xx, other}. A write is never re-sent, so it never counts here. Each retry also logs one WARN with the failed attempt's duration. #1088."))
+	if err != nil {
+		return err
+	}
+	clients, err := m.Int64ObservableGauge("snowplow_stage_endpoint_clients",
+		metric.WithDescription("HTTP clients the RESTAction stage fetch keeps, one per endpoint identity (every endpoint field + provenance), each owning its kept-alive connections; an entry unused for one idle-connection timeout is dropped. #1088."))
+	if err != nil {
+		return err
+	}
+	builds, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_builds_total",
+		metric.WithDescription("Stage endpoint clients built: one per cache miss, and one per fetch for a shape that is not kept (AWS SigV4, Debug, basic auth without a username, unreadable TLS material). Far below snowplow_external_fetch_total means fetches reuse their identity's connection. #1088."))
+	if err != nil {
+		return err
+	}
+	evictions, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_evictions_total",
+		metric.WithDescription("Stage endpoint clients dropped by the idle sweep (unused for one idle-connection timeout). #1088."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range credhttp.EndpointRetriesSnapshot() {
+			o.ObserveInt64(retries, int64(c.Count), metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("cause", c.Cause)))
+		}
+		n, b, e := restactionsapi.StageEndpointClientsStats()
+		o.ObserveInt64(clients, int64(n))
+		o.ObserveInt64(builds, int64(b))
+		o.ObserveInt64(evictions, int64(e))
+		return nil
+	}, retries, clients, builds, evictions)
 	return err
 }
 

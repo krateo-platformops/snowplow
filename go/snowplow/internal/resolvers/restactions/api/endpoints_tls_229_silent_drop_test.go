@@ -93,7 +93,7 @@ func TestIssue229_Arm11_PasswordOnlyBasicAuthIsNotSilentlyDropped(t *testing.T) 
 	}
 
 	// (1) ROUTING: this shape must NOT be owned.
-	if endpointNeedsOwnedCAClient(ep) {
+	if endpointOwnedShape(ep) {
 		t.Fatalf("ARM11 FAIL: a password-set/username-EMPTY endpoint with a CA must be DELEGATED "+
 			"to plumbing, not handled by the owned builder. client-go keys basic auth off "+
 			"Username, so the owned path would install neither a basic nor a bearer wrapper and "+

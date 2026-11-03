@@ -45,6 +45,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 )
 
@@ -208,7 +209,7 @@ func TestLeak267_ArmF_GUARD_TokenAuthClientconfig_UnmarkedCtx_KeepsOwnToken(t *t
 		certPEM, _ := saDialSelfSignedPEM(t) // stands in for the cluster CA
 		url, lastAuth := saDialServer(t)
 		ep := &endpoints.Endpoint{ServerURL: url, Token: userToken, CertificateAuthorityData: certPEM}
-		if !endpointNeedsOwnedCAClient(ep) {
+		if !endpointOwnedShape(ep) {
 			t.Fatalf("precondition: token-auth + CA must reach the owned-CA branch")
 		}
 		cli, err := httpClientForEndpoint(context.Background() /*UNMARKED*/, ep, &httpcall.RequestInfo{})
@@ -246,7 +247,7 @@ func TestLeak267_ArmF_GUARD_TokenAuthClientconfig_UnmarkedCtx_KeepsOwnToken(t *t
 		privateCA, _ := saDialSelfSignedPEM(t) // a customer's private CA
 		url, lastAuth := saDialServer(t)       // stands in for the customer webhook host
 		ep := &endpoints.Endpoint{ServerURL: url, Token: webhookToken, CertificateAuthorityData: privateCA}
-		if !endpointNeedsOwnedCAClient(ep) {
+		if !endpointOwnedShape(ep) {
 			t.Fatalf("precondition: token-auth + CA must reach the owned-CA branch")
 		}
 		cli, err := httpClientForEndpoint(context.Background() /*UNMARKED*/, ep, &httpcall.RequestInfo{})
@@ -271,21 +272,37 @@ func TestLeak267_ArmF_GUARD_TokenAuthClientconfig_UnmarkedCtx_KeepsOwnToken(t *t
 	})
 }
 
-// TestLeak267_ArmF_NONREG_CertAuthClientconfig_DelegatesToPlumbing — non-reg
-// (cannot fail): a cert-auth clientconfig never reaches the owned-CA branch (where
-// the SA-token-file wiring lives), so it can never be given the SA token file — it
-// dials with its client cert via plumbing. Structural assertion (no live dial: the
-// cert material is base64-encoded for plumbing, orthogonal here).
-func TestLeak267_ArmF_NONREG_CertAuthClientconfig_DelegatesToPlumbing(t *testing.T) {
-	certPEM, keyPEM := saDialSelfSignedPEM(t)
-	certAuthEP := &endpoints.Endpoint{
-		ServerURL:                "https://kubernetes.default.svc",
-		CertificateAuthorityData: certPEM,
-		ClientCertificateData:    certPEM,
-		ClientKeyData:            keyPEM,
+// TestLeak267_ArmF_NONREG_CertAuthClientconfig_NeverGetsSATokenFile — #1088 moved
+// the cert-auth clientconfig onto the owned client-go branch, where the
+// SA-token-file wiring lives. The wiring is keyed on PROVENANCE (the SA-dial
+// mark), never on shape, so an unmarked cert-auth clientconfig still dials with
+// its client cert alone: the wire carries no Authorization header, and never the
+// SA token file's token.
+func TestLeak267_ArmF_NONREG_CertAuthClientconfig_NeverGetsSATokenFile(t *testing.T) {
+	const saFileToken = "SA-FILE-TOKEN-NEVER-ON-A-USER-DIAL"
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(saFileToken), 0o600); err != nil {
+		t.Fatalf("write SA token: %v", err)
 	}
-	if endpointNeedsOwnedCAClient(certAuthEP) {
-		t.Fatalf("NON-REG: a cert-auth clientconfig must NOT enter the owned-CA branch (endpointNeedsOwnedCAClient must exclude HasCertAuth); it dials with its client cert via plumbing.")
+	restore := dynamic.SetServiceAccountTokenPathForTest(tokenFile)
+	defer restore()
+
+	p := newPKI1088(t)
+	cs := newConnServer1088(t, p, true)
+	ep := certEndpoint1088(t, p, cs.srv.URL, "user-a")
+	if !endpointOwnedShape(ep) {
+		t.Fatal("precondition: the cert-auth clientconfig takes the owned branch (#1088)")
 	}
-	t.Logf("NON-REG GREEN: a cert-auth clientconfig delegates to plumbing (client-cert dial) — never reaches the SA-token-file branch.")
+	if err := fetch1088(t, credhttp.WithHeldCredential(context.Background()), ep, http.MethodGet); err != nil {
+		t.Fatalf("cert-auth dial: %v", err)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for _, ids := range cs.ids {
+		for id := range ids {
+			if id != "cn:user-a" {
+				t.Fatalf("NON-REG: the cert-auth dial carried identity %q, want only its client cert", id)
+			}
+		}
+	}
 }

@@ -48,7 +48,7 @@ func TestIssue723_HeldClientconfigOwnedCABranchNeverFollowsRedirect(t *testing.T
 		rig := newRedirectRig(t, code, true) // only rig.other is used
 		api := newTLSRedirector(t, code, rig.other.URL+"/stolen")
 		ep := &endpoints.Endpoint{ServerURL: api.URL, Token: "user-token-held", CertificateAuthorityData: caOf(api)}
-		if !endpointNeedsOwnedCAClient(ep) {
+		if !endpointOwnedShape(ep) {
 			t.Fatal("fixture must take the owned-CA branch")
 		}
 		ctx := credhttp.WithHeldCredential(context.Background())

@@ -9,7 +9,7 @@ package credhttp
 // (re-added by plumbing's bearerAuthRoundTripper on EVERY hop) would follow a
 // 3xx to whatever host the upstream named, and the redirected body would be
 // returned as the answer. Do is request.Do transcribed (plumbing v1.15.1
-// http/request/request.go) with exactly two differences:
+// http/request/request.go) with exactly three differences:
 //
 //  1. the client is the endpoint client through Client(): it never follows a
 //     redirect (CheckRedirect) and no redirect hop reaches the network
@@ -18,8 +18,11 @@ package credhttp
 //     redirect's own status code and the fixed RedirectRefusedError text —
 //     never the redirect's body, which can carry the target URL.
 //
-// Everything else (headers, the AWS-signature branch, the payload, the retry
-// client, the non-2xx envelope, the JSON content-type check, the
+//  3. (#1088) it sends through Send (send.go): a write is sent once, where
+//     request.Do's RetryClient re-sent a PUT or a DELETE.
+//
+// Everything else (headers, the AWS-signature branch, the payload, a read's
+// retry client, the non-2xx envelope, the JSON content-type check, the
 // ResponseHandler contract) is unchanged, so a caller swapping request.Do for
 // Do sees the same envelopes on every non-redirect path.
 
@@ -36,7 +39,6 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
 )
 
@@ -96,7 +98,11 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
 	}
 
-	respo, err := util.NewRetryClient(Client(cli)).Do(call)
+	// #1088 — the endpoint send policy (send.go): a write is sent once, never
+	// re-sent once its bytes may have reached the apiserver (plumbing's
+	// RetryClient re-sent a PUT or DELETE); a read keeps the RetryClient, with
+	// every retry counted and logged with its cause.
+	respo, err := Send(SendSiteCall, Client(cli), call)
 	if err != nil {
 		return response.New(http.StatusInternalServerError, err)
 	}
@@ -117,11 +123,7 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		if err != nil {
 			return response.New(http.StatusInternalServerError, err)
 		}
-		res := &response.Status{}
-		if err := json.Unmarshal(dat, res); err != nil {
-			return response.New(respo.StatusCode, fmt.Errorf("%s", string(dat)))
-		}
-		return res
+		return nonOKEnvelope(respo.StatusCode, dat)
 	}
 
 	if ct := respo.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
@@ -136,4 +138,33 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	}
 
 	return response.New(http.StatusNoContent, nil)
+}
+
+// nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
+// answer is ALWAYS a Failure carrying the status line's code (#1088). Before
+// #1088 two shapes read as a success: a JSON body that is not a Status (an
+// object, which decodes into a Status with no "Failure" and no code) and a code
+// plumbing's response.New does not list (502, 504, ...). They hid behind the
+// RetryClient for PUT and DELETE, which turned a 5xx into a transport error;
+// with a write now sent once (send.go), every write meets this shaping, and an
+// audited write that the apiserver refused must never be recorded as a success.
+// A Status body keeps its message and reason, as before.
+func nonOKEnvelope(code int, dat []byte) *response.Status {
+	res := &response.Status{}
+	if err := json.Unmarshal(dat, res); err != nil {
+		res = response.New(code, fmt.Errorf("%s", string(dat)))
+	}
+	res.Code = code
+	res.Status = response.StatusFailure
+	if res.Kind == "" {
+		res.Kind, res.APIVersion = "Status", "v1"
+	}
+	if res.Message == "" {
+		if len(dat) > 0 {
+			res.Message = string(dat)
+		} else {
+			res.Message = fmt.Sprintf("upstream answered %d %s with an empty body", code, http.StatusText(code))
+		}
+	}
+	return res
 }
