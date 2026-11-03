@@ -317,14 +317,28 @@ to `reauthenticate`.
 The one change left for the portal is the three token reasons. Today they
 fall to that default, which is the right action for a session token.
 
-They need a rule of their own, not three more `BY_REASON` rows. A token
-reason describes **the token the request carried**, and an expired
-**step-up** JWT now answers `TokenExpired`: it is rejected at token
-validation, before any Secret is chosen. The `authFailureCauseOf` comment
-still expects that case to arrive with no reason at all. `authFailureCauseOf`
-lets a recognised reason win over `tokenKind`. So a `BY_REASON` row
-`TokenExpired → reauthenticate` would show a full sign-in for a session that
-is still valid. Let `tokenKind` decide instead:
+They need a rule of their own, not three more `BY_REASON` rows, because they
+are a different kind of cause. **The classification rule:**
+
+- **An absolute cause** names a fault that is the same whoever asked:
+  `StepUpRequired`, `SessionCredentialMissing`, and authn's `StepUpNotEnabled`
+  and `InsufficientAssurance`. The reason alone is the answer, so a table
+  keyed on the reason (`BY_REASON`) is right for it.
+- **A relative cause** says only that the credential **this request
+  presented** was absent, invalid or expired: `TokenMissing`, `TokenInvalid`,
+  `TokenExpired`. The right action depends on which credential that was. A
+  table keyed on the reason alone is wrong for it; the client must combine
+  the reason with the token kind it sent.
+
+The concrete case is an expired **step-up** JWT. It now answers
+`TokenExpired`, because it is rejected at token validation, before any
+Secret is chosen. (The `authFailureCauseOf` comment still expects it to
+arrive with no reason at all.) `authFailureCauseOf` lets a recognised reason
+win over `tokenKind`. So a `BY_REASON` row `TokenExpired → reauthenticate`
+would show a full sign-in for a session that is still valid, when the right
+action is to step up again.
+
+So let `tokenKind` decide every relative cause:
 
 ```ts
 // ui/src/utils/authFailureCause.ts
@@ -339,18 +353,35 @@ export const AUTH_FAILURE_REASONS = {
   tokenExpired: 'TokenExpired',
 } as const
 
-/** Reasons about the token the request carried: the caller's tokenKind decides the action. */
-const TOKEN_REASONS: ReadonlySet<string> = new Set([
+/**
+ * RELATIVE causes: about the token the request presented, not about the
+ * caller. The reason alone does not decide the action; tokenKind does.
+ * Every other reason is ABSOLUTE and stays in BY_REASON.
+ */
+const TOKEN_STATE_REASONS: ReadonlySet<string> = new Set([
   AUTH_FAILURE_REASONS.tokenMissing,
   AUTH_FAILURE_REASONS.tokenInvalid,
   AUTH_FAILURE_REASONS.tokenExpired,
 ])
 
 // in authFailureCauseOf, right after `reason` is computed:
-if (reason !== null && TOKEN_REASONS.has(reason)) {
+if (reason !== null && TOKEN_STATE_REASONS.has(reason)) {
   return { action: tokenKind === 'step-up' ? 'step-up' : 'reauthenticate', reason }
 }
 ```
+
+**Not reachable yet.** Today's portal sends no step-up token. According to
+the frontend owner, no caller on frontend main `9441551` passes
+`tokenKind: 'step-up'`, so every request carries the session token. Two
+things follow:
+
+- `StepUpRequired` cannot reach the portal yet: snowplow emits it only for a
+  token carrying `krateo:loa:2`;
+- the `step-up` branch above is dormant: every relative cause resolves to
+  `reauthenticate`.
+
+Both become live once the portal sends step-up tokens. Adopting the rule now
+means that change needs no second edit here.
 
 ### 6b. Automatic replay: oasgen's RDC, or any client that retries
 
