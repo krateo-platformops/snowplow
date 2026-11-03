@@ -116,8 +116,16 @@ async function settled (page, path) {
 
 // `actionAt`: the driver's clock (epoch ms) just before the action, the start of a load that never
 // settled (a settled load carries the page's own start)
-function record (r, tags, actionAt) {
-  for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
+// #1089: the load's id rides on its own points' metadata (load_id), set for
+// these synchronous adds only
+function record (r, tags, actionAt, loadId) {
+  const md = exec.vu.metrics.metadata
+  md.load_id = loadId
+  try {
+    for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
+  } finally {
+    delete md.load_id
+  }
 }
 
 // #919: the /calls the page made since the last drain (pageload.callOf), as
@@ -128,7 +136,7 @@ function record (r, tags, actionAt) {
 // sample's call_timing METADATA, set on the VU for that one synchronous add
 // and removed at once (per-call numbers as tags would each be a time series);
 // `loadT0` / `loadId`: the load these calls belong to (pageload.loadStart;
-// beginLoad), for a load's own calls only.
+// nextLoadId), for a load's own calls only.
 async function drainCalls (page, tags, loadT0, loadId) {
   let calls
   try {
@@ -151,19 +159,21 @@ async function drainCalls (page, tags, loadT0, loadId) {
   }
 }
 
-// #1089: one page load's id on the VU's METADATA from its action to its calls'
-// drain: k6 browser stamps each request with the VU's tags and metadata when
-// Chrome sends it, so Chrome's own request samples of the load
-// (browser_http_req_duration) carry the id its /calls' call_timing carries —
-// the join of Chrome's network events with Resource Timing, per load, never
-// by URL. Unique in the test: the VU's id and its own count.
+// #1089: the join of Chrome's own request samples (browser_http_req_duration)
+// with a load's /calls, never by URL. k6 v2.3.0 stamps a browser request
+// sample with the VU's tags and metadata when its RESPONSE is emitted
+// (network_manager.go emitResponseMetrics: state.Tags.GetCurrentValues();
+// capturing them when Chrome SENDS the request needs the experimental
+// AsyncMetricContext feature flag, which the bench does not turn on). A
+// per-load id on the VU would therefore be the load open when the response
+// came: a late fetch of the previous load booked to this one. So only the VU
+// is stamped, for the whole session (metadata `vu`, never changing), and
+// bench/calltiming.py places each Chrome request in a load of that VU by its
+// own start (the sample's time minus its duration) inside the load's window
+// (its t0 and wall time). A load's id (`<vu>:<n>`, unique in the test) rides
+// on its own page-load points (record) and its calls' call_timing.
 let LOADS = 0
-function beginLoad () {
-  const id = `${exec.vu.idInTest}:${++LOADS}`
-  exec.vu.metrics.metadata.load_id = id
-  return id
-}
-function endLoad () { delete exec.vu.metrics.metadata.load_id }
+function nextLoadId () { return `${exec.vu.idInTest}:${++LOADS}` }
 
 // The first navigation, retried (run 11: a refused localhost port killed 4
 // of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
@@ -208,6 +218,7 @@ async function tokenOf (page) {
 }
 
 export default async function () {
+  exec.vu.metrics.metadata.vu = String(exec.vu.idInTest)      // #1089: see nextLoadId
   const s = CFG.sessions[exec.vu.idInTest - 1]
   const deadline = Date.now() + CFG.durationS * 1000
   // #935: the session's identity classes, its initial user first, then each
@@ -252,7 +263,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       b.armLogin = true; b.submitAt = performance.now(); b.signinMs = null
     })
     const loginAt = Date.now()
-    const firstId = beginLoad()
+    const firstId = nextLoadId()
     await page.locator('#basic_password').press('Enter')
     const first = await settled(page, null)
     const landed = first === null ? '(none)' : first.path
@@ -261,10 +272,9 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
-    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt)
+    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt, firstId)
     await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base),
       loadStart(first, loginAt), firstId)
-    endLoad()
     token = (await tokenOf(page)) || prevToken
     if (k > 0) {
       const after = learnedCounts(token)
@@ -280,7 +290,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       let method = 'click'
       await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
       const actionAt = Date.now()
-      const loadId = beginLoad()
+      const loadId = nextLoadId()
       await markStart(page)
       if (await item.isVisible()) {
         await item.click()
@@ -296,14 +306,12 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       }
       const r = await settled(page, route)
       const visit = visits[route] ? 'warm' : 'first'
-      record(r, Object.assign({ route, visit, method }, base), actionAt)
+      record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)
       await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base), loadStart(r, actionAt), loadId)
-      endLoad()
       visits[route] = (visits[route] || 0) + 1
       shown = route
     }
   } finally {
-    endLoad()
     await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
     for (const [, value, t] of ledger.unfinished(Date.now())) {
       INCOMPLETE.add(value, Object.assign({ session: s.name, route: shown }, t))

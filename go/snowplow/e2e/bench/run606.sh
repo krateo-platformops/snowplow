@@ -936,7 +936,7 @@ s_env() {
 }
 # start_netns_sampler (#1089): the TCP path under snowplow, from here (the boot
 # included) to collect — every TOP_POLL_S, ONE pod on the snowplow node
-# (hostPID + hostNetwork, privileged, reading /proc only: the snowplow image has
+# (hostPID + hostNetwork, CAP_SYS_PTRACE only, reading /proc: the snowplow image has
 # no shell) records each pod network namespace's SYN retransmits / retransmitted
 # segments and the node's conntrack failures into its /out/netns.jsonl
 # (bench/netns606.py). Report only: a sampler that cannot start never stops the

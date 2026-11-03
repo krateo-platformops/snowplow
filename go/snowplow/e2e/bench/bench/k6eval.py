@@ -87,9 +87,9 @@ _TIMED = ("page_load_ms", "browser_page_load_ms", "http_req_duration", "http_req
           "browser_fresh_class")
 # the points whose sample metadata is kept too (out["metadata"], index-aligned
 # with out["points"]; {} when a point has none): #1089's per-call Resource
-# Timing rides as browser_call_ms' call_timing metadata (never a tag), and the
-# load each point belongs to as load_id (browser.js beginLoad): on the page
-# load's own points and on Chrome's request samples made during it
+# Timing rides as browser_call_ms' call_timing metadata (never a tag), a page
+# load's id as its own points' load_id, and the VU as every browser sample's
+# `vu` (bench/calltiming.py joins Chrome's request samples to a load by it)
 _WITH_METADATA = ("browser_call_ms", "browser_page_load_ms", "browser_http_req_duration")
 _NO_METADATA: dict = {}          # shared, never written: most points carry none
 _RFC3339 = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")

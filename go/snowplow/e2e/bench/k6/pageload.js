@@ -183,8 +183,8 @@ export function loadStart (r, actionAt) {
 // One key, call_timing, a JSON string: the Resource Timing offsets (ms from
 // the call's startTime); for a load's own calls also from_load_ms (the call's
 // start minus its load's start: the waterfall) and load_id (which load: the
-// same id browser.js puts on the VU's metadata for the load, so Chrome's own
-// request samples of that load — browser_http_req_duration — carry it too).
+// same id browser.js puts on the load's own page-load points; Chrome's request
+// samples are placed in a load by time instead, see browser.js nextLoadId).
 // null: no timing recorded (a browser.js before #1089).
 export function callTiming (c, loadT0, loadId) {
   if (!c || !('fetch' in c)) return null

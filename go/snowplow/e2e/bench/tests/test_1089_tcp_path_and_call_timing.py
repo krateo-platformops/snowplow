@@ -238,7 +238,15 @@ def test_the_manifest_is_node_side_pinned_to_snowplow_and_ships_the_sampler(tmp_
     assert spec["nodeSelector"] == {"bench.krateo.io/pool": "snowplow"}
     assert {"key": "dedicated", "operator": "Equal", "value": "snowplow", "effect": "NoSchedule"} in spec["tolerations"]
     c = spec["containers"][0]
-    assert c["securityContext"] == {"privileged": True}
+    # #1104 review B1: minimal and enforced — never privileged; one capability
+    assert c["securityContext"] == {
+        "capabilities": {"drop": ["ALL"], "add": ["SYS_PTRACE"]},
+        "allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+        "seccompProfile": {"type": "RuntimeDefault"}, "appArmorProfile": {"type": "Unconfined"}}
+    assert spec["automountServiceAccountToken"] is False and "securityContext" not in spec
+    mounts = {m["name"]: m for m in c["volumeMounts"]}
+    assert mounts["src"]["readOnly"] is True and not mounts["out"].get("readOnly")
+    assert [v["name"] for v in spec["volumes"] if "emptyDir" in v] == ["out"]     # its only writable place
     assert c["command"][:3] == ["python3", "/opt/netns606/netns606.py", "loop"] and "15" in c["command"]
     # sidecar-free: nothing of it lands in the snowplow pod or its namespace
     assert job["metadata"]["namespace"] == "bench-loadgen"
@@ -490,20 +498,30 @@ def test_each_call_keeps_its_protocol_and_offsets_from_its_start_never_its_url(t
     assert not out["source"].lstrip().startswith("export")                       # shipped into the page
 
 
-def test_browser_js_puts_timing_and_the_load_id_in_metadata_never_tags():
+
+def test_browser_js_puts_timing_the_load_and_the_vu_in_metadata_never_tags():
     src = (BENCH_DIR / "k6" / "browser.js").read_text()
     drain = src[src.index("async function drainCalls"):]
     drain = drain[:drain.index("\n}\n")]
     assert "md.call_timing = timing" in drain and "delete md.call_timing" in drain
     assert drain.index("md.call_timing = timing") < drain.rindex("CALL.add(value, t)") < \
         drain.index("delete md.call_timing")
+    # the load's id only around its own synchronous adds (#1104 review B2: k6 2.3.0 stamps a
+    # Chrome request's sample at its RESPONSE, so a load id held on the VU would mis-book them)
+    rec = src[src.index("function record (r, tags, actionAt, loadId)"):]
+    rec = rec[:rec.index("\n}\n")]
+    assert rec.index("md.load_id = loadId") < rec.index(".add(value, t)") < rec.index("delete md.load_id")
+    assert src.count("load_id =") == 1
+    # the VU, for the whole session, first thing
+    body = src[src.index("export default async function () {"):]
+    assert body.splitlines()[1].strip().startswith("exec.vu.metrics.metadata.vu = String(exec.vu.idInTest)")
     loop = src[src.index("while (Date.now() < deadline && !switchDue("):]
     loop = loop[:loop.index("  } finally {")]
-    assert loop.index("const loadId = beginLoad()") < loop.index("await item.click()")
-    assert loop.index("loadStart(r, actionAt), loadId)") < loop.index("endLoad()")
+    assert loop.index("const loadId = nextLoadId()") < loop.index("await item.click()")
+    assert "record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)" in loop
+    assert "loadStart(r, actionAt), loadId)" in loop
     login = src[src.index("const loginAt = Date.now()"):src.index("while (Date.now() < deadline")]
-    assert login.index("beginLoad()") < login.index("press('Enter')") < login.index("endLoad()")
-    assert "exec.vu.metrics.metadata.load_id = id" in src
+    assert login.index("nextLoadId()") < login.index("press('Enter')") < login.index("loginAt, firstId)")
     # no url / name system tag still: the extras (the user) never reach a point
     import re
     assert re.search(r"systemTags: \[([^\]]*)\]", src).group(1).count("'url'") == 0
@@ -511,18 +529,47 @@ def test_browser_js_puts_timing_and_the_load_id_in_metadata_never_tags():
 
 # ─── B2. the per-route report, through evaluate, run-20-shaped ──────────────
 
-def _dashboard_first_loads(n_loads=3, calls=57, conns=4, service=20.0, chrome_extra=None, proto="http/1.1"):
+T0 = 1793517678000.0                      # the first load's start (epoch ms)
+LOAD_EVERY_MS = 10_000.0
+
+
+def _iso(epoch_ms: float) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
+
+
+def _at(p, epoch_ms, md=None):
+    p["data"]["time"] = _iso(epoch_ms)
+    if md is not None:
+        p["data"]["metadata"] = md
+    return p
+
+
+def _dashboard_first_loads(n_loads=3, calls=57, conns=4, service=20.0, chrome_extra=None, proto="http/1.1",
+                           noise=False):
     """Run 20b's /dashboard first visit: 57 /calls a load, all issued together
     on HTTP/1.1 with `conns` free connections: call i waits (i // conns) x
-    `service` ms for one. Chrome's samples of the load: one Fetch per call,
-    its CDP time `chrome_extra` ms past Resource Timing's responseStart."""
-    pts, meta = [], []
+    `service` ms for one. Chrome's samples: one Fetch per call, started where
+    the call started, its CDP time `chrome_extra` ms past Resource Timing's
+    responseStart, stamped with the VU only (as k6 2.3.0 does).
+    `noise`: what real k6 output also holds, which must change nothing —
+    Fetch samples with no metadata (outside any session) between the others,
+    a Script of the load's VU inside its window, another VU's Fetch inside it,
+    a Fetch of the previous load
+    whose response lands inside this one, the VU's between-load calls, and a
+    call whose connection the browser did not expose."""
+    pts = []
     for L in range(n_loads):
-        lid = f"1:{L + 1}"
+        lid, t0 = f"1:{L + 1}", T0 + L * LOAD_EVERY_MS
+        wall = 1302.0 + L
         tags = dict(session="s1", **{"class": "0"}, route="/dashboard", visit="first", during="load")
-        pts.append(_point("browser_page_load_ms", 1302.0 + L, session="s1", route="/dashboard", visit="first",
-                          method="click", skeleton="yes", timeout="no", t0=str(int(ORIGIN) + L)))
-        meta.append(("browser_page_load_ms", {"load_id": lid}))
+        pts.append(_at(_point("browser_page_load_ms", wall, session="s1", route="/dashboard", visit="first",
+                              method="click", skeleton="yes", timeout="no", t0=str(int(t0))),
+                       t0 + wall, {"load_id": lid, "vu": "1"}))
+        if noise and L > 0:
+            # a fetch the previous load started 50 ms before this one, answered inside it
+            pts.append(_at(_point("browser_http_req_duration", 400.0, resource_type="Fetch", status="200"),
+                           t0 + 350.0, {"vu": "1"}))
         for i in range(calls):
             q = (i // conns) * service
             m = {"fetch": 0.1, "connect_start": 0.1, "connect_end": 0.1, "request_start": 0.1 + q,
@@ -530,15 +577,33 @@ def _dashboard_first_loads(n_loads=3, calls=57, conns=4, service=20.0, chrome_ex
                  "from_load_ms": 5.0 + i * 0.5, "load_id": lid}
             if L == 0 and i < conns:               # the first load opens its connections
                 m["connect_start"], m["connect_end"] = 0.2, 1.2
-            pts.append(_point("browser_call_ms", m["response_end"], **tags, call_resource=f"w{i % 15}",
-                              call_name=f"n{i}", call_namespace="ns", call_status="200", call_protocol=proto))
-            meta.append(("browser_call_ms", {"call_timing": json.dumps(m)}))
+            start = t0 + m["from_load_ms"]
+            pts.append(_at(_point("browser_call_ms", m["response_end"], **tags, call_resource=f"w{i % 15}",
+                                  call_name=f"n{i}", call_namespace="ns", call_status="200", call_protocol=proto),
+                           start + m["response_end"], {"call_timing": json.dumps(m), "vu": "1"}))
+            if noise and i % 10 == 0:              # no metadata at all: k6 output outside any session
+                pts.append(_at(_point("browser_http_req_duration", 99999.0, resource_type="Fetch", status="200"),
+                               start + 5.0))
             if chrome_extra is not None:
-                pts.append(_point("browser_http_req_duration", m["response_start"] + chrome_extra,
-                                  resource_type="Fetch", status="200", method="GET"))
-                meta.append(("browser_http_req_duration", {"load_id": lid}))
-    for p, (_, md) in zip(pts, meta):
-        p["data"]["metadata"] = md
+                d = m["response_start"] + chrome_extra
+                pts.append(_at(_point("browser_http_req_duration", d, resource_type="Fetch", status="200",
+                                      method="GET"), start + d, {"vu": "1"}))
+        if noise:
+            pts.append(_at(_point("browser_http_req_duration", 777.0, resource_type="Script", status="200"),
+                           t0 + 800.0, {"vu": "1"}))
+            # another session's (VU 2) fetch at the same moment: never this VU's load
+            pts.append(_at(_point("browser_http_req_duration", 555.0, resource_type="Fetch", status="200"),
+                           t0 + 600.0, {"vu": "2"}))
+            u = {"fetch": 0.1, "connect_start": None, "connect_end": None, "request_start": 500.0,
+                 "response_start": 510.0, "response_end": 511.0, "from_load_ms": 6.0, "load_id": lid}
+            pts.append(_at(_point("browser_call_ms", 511.0, **tags, call_resource="xo", call_name="x",
+                                  call_namespace="ns", call_status="200", call_protocol=""),
+                           t0 + 600.0, {"call_timing": json.dumps(u), "vu": "1"}))
+            b = {"fetch": 0.1, "connect_start": 0.1, "connect_end": 0.1, "request_start": 900.0,
+                 "response_start": 910.0, "response_end": 911.0}
+            pts.append(_at(_point("browser_call_ms", 911.0, **dict(tags, during="between", visit=None),
+                                  call_resource="w0", call_name="n0", call_namespace="ns", call_status="200",
+                                  call_protocol=proto), t0 + 5000.0, {"call_timing": json.dumps(b), "vu": "1"}))
     return pts
 
 
@@ -548,23 +613,51 @@ def _browser_eval(tmp_path, pts):
                      "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1")
 
 
+QUEUE_PER_LOAD = 20 * (4 * sum(range(14)) + 14)          # 7,560 ms: call i waits (i // 4) x 20 ms
+
+
 def test_dashboard_first_visit_queueing_on_http11_through_evaluate(tmp_path):
     v = _browser_eval(tmp_path, _dashboard_first_loads(chrome_extra=50.0))
     r = v["report"]["browser"]["call_timing_report_only"]
     assert r["status"] == "present" and r["protocols"] == {"http/1.1": 171}
     d = r["by_route_visit"]["/dashboard first"]
     assert d["calls"] == 171 and d["reused_connection"] == 171 - 4 and d["new_connection"] == 4
-    # per load: 20 x (4 x (0 + ... + 13) + 14) = 7,560 ms of waiting; the first load's 4 connects excluded
-    assert d["queue_ms"]["sum_ms"] == pytest.approx(7560 * 3, abs=0.5)
-    assert d["queue_ms"]["max_ms"] == 280.0
-    g = d["chrome_gap"]
-    assert g["loads"] == 3 and g["gap_ms"] == pytest.approx(3 * 57 * 50.0, abs=1)
-    assert g["queue_share"] == pytest.approx(7560 * 3 / (3 * 57 * 50.0), abs=0.001)
+    # the first load's 4 connects are not queueing
+    assert d["queue_ms"]["sum_ms"] == pytest.approx(QUEUE_PER_LOAD * 3, abs=0.5)
+    assert d["queue_ms"]["max_ms"] == 280.0 and d["queue_ms"]["p50_ms"] == 140.0
+    # a call's waiting against its own time to headers, which contains it: never above 1
+    assert d["queue_share_of_call"]["max_share"] == pytest.approx(280.0 / 295.1, abs=0.001)
+    pl = d["queue_per_load"]
+    assert pl["loads"] == 3 and pl["queue_max_ms"]["max_ms"] == 280.0
+    assert pl["queue_sum_ms"]["max_ms"] == pytest.approx(QUEUE_PER_LOAD, abs=0.5)
+    assert pl["queue_max_over_wall"]["max_share"] == pytest.approx(280.0 / 1302.0, abs=0.001)
+    assert pl["queue_sum_over_wall"]["n"] == 3           # summed over overlapping calls: can exceed 1
+    res = d["chrome_vs_resource_timing"]
+    assert res["loads"] == 3 and res["residual_ms"] == pytest.approx(3 * 57 * 50.0, abs=1)
+    assert res["chrome_fetches"] == res["rt_calls"] == 171 and res["is_queueing"] is False
+    assert '"queue_share"' not in json.dumps(r)          # #1104 review B2: no share of a gap that excludes it
     w = d["waterfall"]
     assert w["loads"] == 3 and w["first_call_start_ms"]["p50_ms"] == 5.0
     assert w["load_wall_ms"]["n"] == 3 and w["last_call_end_ms"]["max_ms"] == pytest.approx(5 + 56 * 0.5 + 300.1, abs=0.2)
     assert [c["call"] for c in w["calls"]][:2] == ["w0/ns/n0", "w1/ns/n1"]      # start order
     assert "alice" not in json.dumps(r)
+
+
+def test_what_real_output_also_holds_changes_nothing(tmp_path):
+    """#1104 review N4-N7: metadata-less points between the others keep the
+    metadata index-aligned (N4); a Script and a previous load's late fetch are
+    not this load's Chrome time (N5 + the response-time stamping); a call
+    whose connection was not exposed is not queueing (N6); between-load calls
+    stay out of the per-route report (N7)."""
+    clean = _browser_eval(tmp_path / "a", _dashboard_first_loads(chrome_extra=50.0))
+    noisy = _browser_eval(tmp_path / "b", _dashboard_first_loads(chrome_extra=50.0, noise=True))
+    c = clean["report"]["browser"]["call_timing_report_only"]["by_route_visit"]["/dashboard first"]
+    n = noisy["report"]["browser"]["call_timing_report_only"]["by_route_visit"]["/dashboard first"]
+    assert n["chrome_vs_resource_timing"]["chrome_ms"] == c["chrome_vs_resource_timing"]["chrome_ms"]
+    assert n["chrome_vs_resource_timing"]["chrome_fetches"] == 171
+    assert n["queue_ms"] == c["queue_ms"] and n["queue_per_load"]["queue_sum_ms"] == c["queue_per_load"]["queue_sum_ms"]
+    assert n["calls"] == c["calls"] + 3 and n["connection_not_exposed"] == 3 and n["reused_connection"] == 167
+    assert list(noisy["report"]["browser"]["call_timing_report_only"]["by_route_visit"]) == ["/dashboard first"]
 
 
 def test_queueing_vanishes_with_enough_connections(tmp_path):
@@ -575,10 +668,20 @@ def test_queueing_vanishes_with_enough_connections(tmp_path):
     assert d["queue_ms"]["max_ms"] == 0.0 and d["protocols"] == {"h2": 171}
 
 
-def test_a_gap_with_no_chrome_samples_is_unmeasured(tmp_path):
+def test_a_residual_with_no_chrome_samples_is_unmeasured(tmp_path):
     v = _browser_eval(tmp_path, _dashboard_first_loads(chrome_extra=None))
-    g = v["report"]["browser"]["call_timing_report_only"]["by_route_visit"]["/dashboard first"]["chrome_gap"]
-    assert g["status"] == "UNMEASURED"
+    d = v["report"]["browser"]["call_timing_report_only"]["by_route_visit"]["/dashboard first"]
+    assert d["chrome_vs_resource_timing"]["status"] == "UNMEASURED"
+    assert d["queue_per_load"]["loads"] == 3                     # queueing needs no Chrome sample
+
+
+def test_queueing_is_reported_even_when_chrome_equals_resource_timing(tmp_path):
+    """The review's case: Chrome == Resource Timing. 22.7 s of waiting over 3
+    loads; the old share read UNMEASURED. Queueing stands on its own."""
+    v = _browser_eval(tmp_path, _dashboard_first_loads(chrome_extra=0.0))
+    d = v["report"]["browser"]["call_timing_report_only"]["by_route_visit"]["/dashboard first"]
+    assert d["queue_ms"]["sum_ms"] == pytest.approx(QUEUE_PER_LOAD * 3, abs=0.5)
+    assert d["chrome_vs_resource_timing"]["residual_ms"] == 0.0
 
 
 def test_run20_shaped_calls_without_timing_read_unmeasured(tmp_path):
@@ -590,7 +693,51 @@ def test_run20_shaped_calls_without_timing_read_unmeasured(tmp_path):
     assert r["status"] == "UNMEASURED" and "before #1089" in r["why"]
 
 
-def test_a_gap_that_is_not_positive_has_no_share():
-    loads = {"1:1": [({"response_start": 30.0}, {}, 10.0)]}
-    g = calltiming._gap(loads, {"1:1": [20.0]})
-    assert g["gap_ms"] == -10.0 and str(g["queue_share"]).startswith("UNMEASURED")
+# ─── A4. evaluator guards the run-21 path takes (#1104 review N1, N9) ───────
+
+def test_a_field_missing_from_the_earlier_sample_is_not_differenced():
+    """N9: netstat unreadable in one sample, readable in the next: that pair
+    must not book the namespace's lifetime TCPSynRetrans as one phase's delta."""
+    clock = netpath.PhaseClock([], load606._phase_of, None)
+    rows = [(0, "ns", {"RetransSegs": 5}, {}), (15, "ns", {"TCPSynRetrans": 900, "RetransSegs": 6}, {}),
+            (30, "ns", {"TCPSynRetrans": 901, "RetransSegs": 7}, {})]
+    r = netpath.by_phase(rows, clock, ("TCPSynRetrans", "RetransSegs"))
+    assert r["by_phase"]["steady"]["counters"] == {"TCPSynRetrans": 1, "RetransSegs": 2}
+
+
+def test_a_field_missing_from_the_earlier_sample_through_evaluate(tmp_path):
+    files = run20b_records()
+    recs = [netns_rec(t) for t in grid(t1=T_RESTART + 600)]
+    for r in recs[:20]:                       # the new pod's netstat unreadable for its first samples
+        for ns in r["namespaces"]:
+            if NEW_UID in ns["pod_uids"]:
+                ns["tcp"].pop("TCPSynRetrans")
+                ns["errors"] = {"netstat": "PermissionError: denied"}
+    for r in recs[20:]:                       # then readable: a lifetime counter of 10,000
+        for ns in r["namespaces"]:
+            if NEW_UID in ns["pod_uids"]:
+                ns["tcp"]["TCPSynRetrans"] += 10_000
+    files["netns.jsonl"] = recs
+    v = _evaluate(tmp_path, files)
+    tcp = v["report"]["tcp_path_report_only"]["snowplow_pod_tcp"]
+    assert tcp["by_phase"]["all"]["counters"]["TCPSynRetrans"] < 10_000
+    assert tcp["read_errors"] == {"netstat: PermissionError: denied": sum(
+        1 for r in recs[:20] if any(NEW_UID in ns["pod_uids"] for ns in r["namespaces"]))}
+
+
+def test_the_snowplow_uid_in_the_host_namespace_is_not_its_pod():
+    """N1: a UID the host namespace names (a hostNetwork process) is never
+    read as the pod's own namespace."""
+    clock = netpath.PhaseClock([], load606._phase_of, None)
+    recs = [netns_rec(t) for t in (0.0, 15.0)]
+    for r in recs:
+        r["namespaces"] = [{"netns": "1", "host": True, "pod_uids": [NEW_UID], "tcp": {"TCPSynRetrans": 5}}]
+    assert netpath.pod_tcp(recs, [NEW_UID], clock)["status"] == "UNMEASURED"
+
+
+def test_the_sampler_health_says_what_it_could_read():
+    recs = [netns_rec(0.0), netns_rec(15.0), netns_rec(30.0, failed=True)]
+    recs[1]["processes_unreadable"] = 3
+    h = netpath.sampler_health(recs)
+    assert h == {"samples": 3, "failed": 1, "processes_max": 300, "processes_unreadable_max": 3,
+                 "host_namespace_seen": True}

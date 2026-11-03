@@ -16,8 +16,13 @@ could say. This sampler records what would:
     there Service NAT uses Cilium's BPF conntrack, which nf_conntrack does not see)
 
 HOW (the snowplow image is distroless: no shell, nothing to exec): ONE pod on
-the snowplow node, hostPID + hostNetwork, privileged (readlink of another
-user's /proc/<pid>/ns/net needs CAP_SYS_PTRACE), reading /proc only. Every
+the snowplow node, hostPID + hostNetwork, NOT privileged: every capability
+dropped but CAP_SYS_PTRACE (readlink of another user's /proc/<pid>/ns/net is
+a ptrace-read check), no privilege escalation, a read-only root filesystem,
+seccomp RuntimeDefault, AppArmor Unconfined (containerd's default profile
+refuses ptrace-read of processes outside it: PID 1, the host's daemons), no
+ServiceAccount token, the source mounted read-only; it reads /proc and
+writes only /out. Every
 process's network namespace is /proc/<pid>/ns/net; /proc/<pid>/net/{netstat,
 snmp} are that namespace's counters, whoever reads them; the pod a process
 belongs to is in its /proc/<pid>/cgroup (kubepods ... pod<UID>). No sidecar,
@@ -226,7 +231,8 @@ def _indent(text: str, n: int) -> str:
 def render(src: str | None = None, every_s: float = EVERY_S) -> str:
     """Namespace + the netns606 ConfigMap (this file verbatim) + its Job,
     pinned to the snowplow pool (its taint tolerated), hostPID + hostNetwork,
-    privileged, reading /proc only. Small requests: it shares snowplow's node."""
+    with CAP_SYS_PTRACE only (see the module doc for the rest of its
+    securityContext). Small requests: it shares snowplow's node."""
     src = _read(__file__) if src is None else src
     return f"""apiVersion: v1
 kind: Namespace
@@ -252,6 +258,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      automountServiceAccountToken: false
       hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -268,13 +275,25 @@ spec:
         command: ["python3", "/opt/netns606/netns606.py", "loop", "--every-s", "{every_s:g}",
                   "--out", "{OUT}", "--stop-file", "{STOP}"]
         securityContext:
-          privileged: true
+          # one capability: readlink of another user's /proc/<pid>/ns/net is a
+          # ptrace-read access check (CAP_SYS_PTRACE); every file it reads is
+          # 0444 / 0644, its one write is the /out emptyDir
+          capabilities: {{drop: [ALL], add: [SYS_PTRACE]}}
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          seccompProfile: {{type: RuntimeDefault}}
+          # containerd's default AppArmor profile lets ptrace-read reach only
+          # peers under the same profile: without this, readlink of PID 1 and
+          # of the host's daemons fails (the host namespace and the
+          # kube-proxy / cilium-agent detection are lost). Kubernetes >= 1.30.
+          appArmorProfile: {{type: Unconfined}}
         resources:
           requests: {{cpu: 20m, memory: 32Mi}}
           limits: {{cpu: 200m, memory: 128Mi}}
         volumeMounts:
         - name: src
           mountPath: /opt/netns606
+          readOnly: true
         - name: out
           mountPath: /out
       volumes:

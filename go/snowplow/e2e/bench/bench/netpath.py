@@ -228,6 +228,25 @@ def apiserver_codes(apf_recs: Iterable[dict], clock: PhaseClock) -> dict:
             "scrapes": scrapes, "scrapes_without_codes": without, **rep}
 
 
+def sampler_health(netns: list[dict]) -> dict:
+    """What the unprivileged sampler could read (#1104 review B1): processes
+    whose network namespace it could not resolve (about 0 expected: its
+    CAP_SYS_PTRACE + AppArmor Unconfined reach every process), whether it saw
+    the host's namespace, and the samples that failed whole."""
+    ok = [r for r in netns if not r.get("failed")]
+    if not netns:
+        return _absent("no netns606 sample")
+    un = [r["processes_unreadable"] for r in ok if _isnum(r.get("processes_unreadable"))]
+    return {"samples": len(netns), "failed": len(netns) - len(ok),
+            "processes_max": max((r.get("processes") or 0 for r in ok), default=None),
+            "processes_unreadable_max": max(un) if un else UNMEASURED,
+            "host_namespace_seen": any(ns.get("host") for r in ok for ns in r.get("namespaces") or [])}
+
+
+def _isnum(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def report(recs: list[dict], apf_recs: Iterable[dict], phases: list[tuple[str, float, float]], phase_of,
            measure_t0: float | None, boot: tuple[float, float] | None = None) -> dict:
     """verdict.json's tcp_path_report_only. `recs`: evaluate's records (the
@@ -236,6 +255,7 @@ def report(recs: list[dict], apf_recs: Iterable[dict], phases: list[tuple[str, f
     clock = PhaseClock(phases, phase_of, measure_t0, boot)
     netns = sorted((r for r in recs if r.get("kind") == "netns" and r.get("t") is not None), key=lambda r: r["t"])
     return {"note": NOTE,
+            "sampler": sampler_health(netns),
             "snowplow_pod_tcp": pod_tcp(netns, snowplow_uids(recs), clock),
             "node_conntrack": node_conntrack(netns, clock),
             "apiserver_request_codes": apiserver_codes(apf_recs, clock)}
