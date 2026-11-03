@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/util/workqueue"
 )
 
 type cycleClock struct{ ns atomic.Int64 }
@@ -388,7 +390,7 @@ func TestRefreshCycle1070_C7_ADirectRefreshIsTimedFromItsStart(t *testing.T) {
 func TestRefreshCycle1070_C6_ExpvarPublishesTheFamily(t *testing.T) {
 	cycleEnv(t)
 	RegisterRefreshCycleExpvarForTest()
-	if !RunRefreshCycleForTest("c6", RefreshTierNormal, true, 1500*time.Millisecond, 2500*time.Millisecond, 1200*time.Millisecond) {
+	if !runRefreshCycle("c6", tierNormal, true, 1500*time.Millisecond, 2500*time.Millisecond, 1200*time.Millisecond) {
 		t.Fatal("PRE: the driven cycle did not complete")
 	}
 	var puts map[string]uint64
@@ -418,6 +420,47 @@ func TestRefreshCycle1070_C6_ExpvarPublishesTheFamily(t *testing.T) {
 		if n.Count != 1 || n.SumMS != want || n.Buckets["le_inf"] != 1 || n.Buckets["le_1000"] != 0 || n.Buckets["le_3000"] != 1 {
 			t.Fatalf("C6 RED: %s normal = %+v, want one sample of %d ms (le_1000=0, le_3000=1, le_inf=1)", key, n, want)
 		}
+	}
+}
+
+// runRefreshCycle drives one refresh cycle of a widgets cell through the
+// production recording path, on a private store and the dirty-window clock at
+// exact instants: inserted, started wait later, Put duration after that with
+// identical or changed bytes, published, and its frame written toFrame after
+// the Put on an open stream.
+func runRefreshCycle(name string, tier refreshTier, identical bool, wait, duration, toFrame time.Duration) bool {
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC).UnixNano())
+	restore := SetDirtyWindowClockForTest(func() time.Time { return time.Unix(0, clock.Load()) })
+	defer restore()
+
+	c := newResolvedCache(16, 1<<20, time.Hour)
+	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "refresh-cycle-1070", Name: name}
+	key := ComputeKey(in)
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in})
+	st := SubscribeRefreshStream(map[string]struct{}{key: {}})
+	defer st.Unsub()
+
+	stamps := &enqueueStamps{}
+	(&stampingQueue{TypedInterface: workqueue.NewTyped[string](), stamps: stamps}).Add(key)
+	clock.Add(int64(wait))
+	ctx := startRefreshCycle(WithL1KeyContext(context.Background(), key), key, tier, stamps.take(key))
+	clock.Add(int64(duration))
+	body := `{"v":"new"}`
+	if identical {
+		body = `{"v":"old"}`
+	}
+	if !c.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)) {
+		return false
+	}
+	PublishRefreshed(ctx, key)
+	select {
+	case k := <-st.Keys:
+		clock.Add(int64(toFrame))
+		st.Wrote(k)
+		return k == key
+	case <-time.After(10 * time.Second):
+		return false
 	}
 }
 
