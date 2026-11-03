@@ -19,6 +19,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -108,7 +109,11 @@ func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction
 	var raw []byte
 	if opts.In.Spec.Filter != nil {
 		q := ptr.Deref(opts.In.Spec.Filter, "")
+		// #1054 — the RESTAction filter's JQ, timed on the request (the eval
+		// keeps its context.TODO).
+		jq := slowcall.Start(ctx, slowcall.PhaseJQ)
 		vals, s, err := evalFilter(context.TODO(), q, dict)
+		jq.End()
 		if err != nil {
 			// #709 — when a stage without continueOnError failed, the filter
 			// error is its consequence (it read the stage that has no

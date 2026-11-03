@@ -18,6 +18,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -239,6 +240,9 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	// byte-identical. The existing shortid X-Krateo-TraceId header set
 	// above is UNTOUCHED — both correlation ids ride the same request.
 	cli.Transport = tracing.WrapTransport(cli.Transport)
+	// #1054 — every attempt the retry client below makes (a 429's 2 s sleep, a
+	// 5xx backoff) is recorded on the request's dial.
+	cli.Transport = slowcall.Transport(cli.Transport)
 	// #615 — a non-UAF SA-endpoint dial under the impersonated-dial marker reads
 	// as the cohort (branche_impersonation.go). No-op for every other dial.
 	cli.Transport = impersonateEndpointTransport(ctx, cli.Transport)

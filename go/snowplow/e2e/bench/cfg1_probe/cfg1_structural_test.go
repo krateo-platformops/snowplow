@@ -148,6 +148,12 @@ var nonCacheInitPublishers = map[string][]string{
 	// target must stay observable with the cache off. Gating it would hide the
 	// refusals in a configuration where writes still happen.
 	"internal/support/audit/incomplete_metrics.go": {"snowplow_audit_incomplete_total"},
+	// #1054 slow-call record: a measurement of request latency, not a cache
+	// surface. Every API request is recorded in either cache mode (cache-off
+	// serves every /call from the apiserver, where slow calls are likeliest),
+	// so its counters, histogram and rings must stay observable with the
+	// cache off; gating them would blind the instrument exactly there.
+	"internal/slowcall/stats.go": {"snowplow_slow_request_bound_ms", "snowplow_slow_request_phase_ms", "snowplow_slow_request_snapshots_recent", "snowplow_slow_request_snapshots_suppressed_total", "snowplow_slow_request_snapshots_total", "snowplow_slow_requests_recent", "snowplow_slow_requests_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

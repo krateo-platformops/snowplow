@@ -1228,6 +1228,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerRUMIngestInstruments(m); err != nil { // #1015
 		return err
 	}
+	// #1054: slow calls are recorded whatever the cache mode (the expvar keys
+	// are published unconditionally), so their OTLP series are too.
+	if err := registerSlowCallInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).

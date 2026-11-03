@@ -67,6 +67,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 )
 
 // PinnedPlumbingVersion is the upstream `plumbing` module version this
@@ -155,6 +156,17 @@ const PinnedPlumbingVersion = "v1.15.1"
 func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// #1054 — the auth phase of the request's slow-call record: JWT
+			// validation plus the clientconfig lookup (and its apiserver
+			// re-read on a miss). It ends before the next handler runs.
+			auth := slowcall.Start(req.Context(), slowcall.PhaseAuth)
+			authOpen := true
+			defer func() {
+				if authOpen {
+					auth.End()
+				}
+			}()
+
 			// Upstream — a missing key source is a wiring bug, surfaced on every
 			// request as an InternalError, before the auth-header check.
 			if keys == nil {
@@ -287,6 +299,9 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
 			)
+
+			authOpen = false
+			auth.End()
 
 			// Upstream :68 — chain to next handler.
 			next.ServeHTTP(wri, req.WithContext(ctx))

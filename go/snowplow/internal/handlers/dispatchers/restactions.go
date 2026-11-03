@@ -17,6 +17,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -255,7 +256,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -507,7 +508,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// bytes for the next lookup. Sharing the same []byte between the
 	// http.ResponseWriter write path and the cache entry is safe
 	// because the cache treats RawJSON as immutable once put.
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
 		log.Error("unable to encode rest action response",
 			slog.String("name", cr.Name),
