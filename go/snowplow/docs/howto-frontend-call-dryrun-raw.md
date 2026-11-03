@@ -139,10 +139,14 @@ Content-Type: application/json
   - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
     `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
     item of its iterator, is listed with one of:
-    - `InvalidPath`: a stage that dials this cluster's apiserver (no
-      `endpointRef`) rendered a path that is not a valid Kubernetes object
-      path (a collapsed or non-DNS-1123 name or namespace). A named
-      `endpointRef` is never judged this way: its path is sent as rendered.
+    - `InvalidPath`: the rendered path lost a segment its template meant to
+      fill: an empty namespace (`/namespaces//`), or an empty last segment on
+      a `PUT`/`PATCH`/`DELETE` (a trailing `/`, which would turn a by-name
+      delete into a collection delete). This holds for every stage, named
+      `endpointRef` included. On a stage with no `endpointRef` (this
+      cluster's apiserver), a name or namespace that is not a valid
+      Kubernetes name is refused too. A named `endpointRef`'s ids are never
+      judged as Kubernetes names (`/api/v2/tickets/Ab_12` is sent).
     - `TemplateError`: the stage's `path`, `payload` or a header did not
       render (a jq error, e.g. `tonumber` on a non-number; or an unrendered
       `${…}`).
@@ -168,7 +172,9 @@ Content-Type: application/json
     fails with `502` naming the redirect (`upstream answered 302 Found, a
     redirect snowplow does not follow`); its row reads `Error`. A redirect
     within the endpoint's own origin is still followed (a stage with no
-    `endpointRef` follows none, #723).
+    `endpointRef` follows none, #723). **Behaviour change:** an endpoint that
+    used to answer through a redirect to another host (a CDN, a moved host)
+    now fails with that 502; the endpoint Secret must be given its final URL.
     The header never carries an error message, a path, an identity or
     response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}` (N stages
