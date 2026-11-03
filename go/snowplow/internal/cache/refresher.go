@@ -283,6 +283,10 @@ type refresher struct {
 	// tier (refresher_quiescence.go).
 	work *refresherWorkCount
 
+	// #1070 — per tier, when each queued key was inserted: the start of its
+	// wait for a worker (refresh_cycle.go). Measurement only.
+	normalStamps, clusterListStamps, viewedStamps *enqueueStamps
+
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
@@ -457,17 +461,22 @@ func refresherSingleton() *refresher {
 		// #930 — every tier counts its outstanding work into one total
 		// (refresher_quiescence.go).
 		work := newRefresherWorkCount()
+		// #1070 — each tier stamps its inserts (the wait for a worker).
+		normalStamps, clStamps, vStamps := &enqueueStamps{}, &enqueueStamps{}, &enqueueStamps{}
 		r := &refresher{
-			parallelism:      parallelism,
-			work:             work,
-			queue:            newRefresherTierQueue("refresher_normal", rl, work, nil),
-			clusterListQueue: newRefresherTierQueue("refresher_cluster_list", clRL, work, nil),
-			inFlightKeys:     map[string]bool{},
-			handlers:         map[string]RefreshFunc{},
-			resolveLatency:   newP2Quantile(0.95),
-			dirtyStats:       newDirtyWindowStats(),
+			parallelism:       parallelism,
+			work:              work,
+			normalStamps:      normalStamps,
+			clusterListStamps: clStamps,
+			viewedStamps:      vStamps,
+			queue:             newRefresherTierQueue("refresher_normal", rl, work, normalStamps, nil),
+			clusterListQueue:  newRefresherTierQueue("refresher_cluster_list", clRL, work, clStamps, nil),
+			inFlightKeys:      map[string]bool{},
+			handlers:          map[string]RefreshFunc{},
+			resolveLatency:    newP2Quantile(0.95),
+			dirtyStats:        newDirtyWindowStats(),
 		}
-		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work)
+		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work, vStamps)
 		refresherInstance.Store(r)
 	})
 	return refresherInstance.Load()
@@ -966,6 +975,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// slot for it (#799 B3: re-adding with every slot full made the
 			// reserved worker busy-spin on the wake key). A slot release wakes
 			// again (endViewed).
+			r.normalStamps.take(key) // #1070: the wake key is no refresh; drop its stamp
 			r.queue.Done(key)
 			if r.viewedQueue != nil && r.viewedQueue.Len() > 1 {
 				r.wakeViewed()
@@ -973,6 +983,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			return true
 		}
 	}
+	// #1070 — measurement only: the key's insert into this tier, taken at its
+	// dequeue, so a re-add while it is processing stamps the next dequeue anew.
+	enqueuedAt := r.tierStamps(tier).take(key)
 	switch tier {
 	case tierViewed:
 		defer func() {
@@ -1199,6 +1212,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// between the two would be consumed with a seq the need does not cover.
 	if len(consumedTriggers) > 0 {
 		rctx = withRefreshTriggerAsOf(rctx, depEventSeq.Load())
+	}
+	// #1070 — measurement only: past the yield, the suppression and the rate
+	// floor, the worker starts this refresh. The wait for a worker ends here and
+	// rctx times the rest of the cycle (refresh_cycle.go). A missing entry is no
+	// refresh (skipped_no_entry).
+	if ok && entry != nil {
+		rctx = startRefreshCycle(rctx, key, tier, enqueuedAt)
 	}
 	// #354 P3 — the window is consumed here, beside the trigger GVR, NOT in the
 	// floored branch above: a floored key keeps its window open, so the floor is

@@ -44,7 +44,6 @@ package api
 
 import (
 	"encoding/json"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -85,13 +84,12 @@ type listQuery struct {
 // empty reports whether there is nothing to apply in process.
 func (q listQuery) empty() bool { return q.applicable && q.canon == "" }
 
-// splitPathQuery returns the path and the raw query of an apiserver call path.
-// hasQuery is true when a `?` is present, even with an empty query after it.
+// splitPathQuery returns the path and the raw query of an apiserver call path,
+// exactly as the apiserver receives them: a `#` fragment is dropped first
+// (apicall.SplitURI, #1073 F1). hasQuery is true when a `?` is present, even
+// with an empty query after it.
 func splitPathQuery(p string) (path, rawQuery string, hasQuery bool) {
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		return p[:i], p[i+1:], true
-	}
-	return p, "", false
+	return apicall.SplitURI(p)
 }
 
 // planListQuery classifies the query string of call path p.

@@ -116,9 +116,7 @@ var subresourceSuffixes = []string{
 // resource names that contain the suffix string (e.g. a Deployment
 // literally named "status") are not false-positive-rejected.
 func hasSubresourceSuffix(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	path = strings.TrimRight(path, "/")
 	for _, sfx := range subresourceSuffixes {
 		if strings.HasSuffix(path, sfx) {
@@ -801,7 +799,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// this one are recorded identically by the caller.
 		if !cache.ApistageContentResolveFromContext(ctx) {
 			var gateErr error
-			items, gateErr = filterListByRBAC(ctx, gvr, namespace, items)
+			// #1049: the gate authorizes the request as written, query
+			// included — a metadata.name field selector carries a Name.
+			_, rawQuery, _ := splitPathQuery(call.Path)
+			items, gateErr = filterListByRBAC(ctx, gvr, namespace, rawQuery, items)
 			if isRegateDenied(gateErr) {
 				return nil, false, ctx, gateErr
 			}

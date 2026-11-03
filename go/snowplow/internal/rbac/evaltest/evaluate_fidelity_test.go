@@ -6,8 +6,9 @@
 // Coverage:
 //   - G1 (cross-user leak, P0): rule.ResourceNames is honoured.
 //     A resourceNames:["foo"] rule grants `get foo`, denies `get bar`,
-//     and — per Kubernetes ResourceNameMatches — NEVER grants `list`
-//     (a collection verb has no single named object).
+//     and — per Kubernetes ResourceNameMatches — never grants an
+//     unselected `list` (a plain collection URL names no object); since
+//     #1049 it grants `list ?fieldSelector=metadata.name=foo`, as upstream.
 //   - G3/G6 (under-allow, P1): a Group subject of
 //     system:serviceaccounts:<ns> grants a ServiceAccount in <ns> and
 //     not one in a different namespace; system:serviceaccounts grants
@@ -21,6 +22,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ruleNamed builds a PolicyRule that is scoped to specific named
@@ -84,15 +86,20 @@ func TestEvaluateRBAC_ResourceNamesScopesGet(t *testing.T) {
 }
 
 // TestEvaluateRBAC_ResourceNamesDoesNotGrantList pins the CRITICAL
-// Kubernetes ResourceNameMatches semantics: a rule with a non-empty
-// resourceNames NEVER grants a collection verb ("list"/"watch"/
-// "create"/"deletecollection"). A collection verb has no single named
-// object, so a resourceNames-scoped rule cannot match it.
+// Kubernetes ResourceNameMatches semantics as snowplow builds its checks: a
+// rule with a non-empty resourceNames grants a list ONLY when the request
+// itself carries a listed Name. A plain collection URL names no object, so
+// the rule cannot match it; since #1049 a `fieldSelector=metadata.name=foo`
+// list carries Name foo and the rule matches, exactly as upstream.
 //
-// This is the load-bearing G1 case for filterListByRBAC: the served
-// LIST branch evaluates Verb "list", so a resourceNames-scoped binding
-// must contribute NOTHING to a list result. Before 0.30.109 it granted
-// the entire list — a cross-user leak.
+// This is the load-bearing G1 case for filterListByRBAC: the served LIST
+// branch must not let a resourceNames-scoped binding grant an unselected
+// list. Before 0.30.109 it granted the entire list — a cross-user leak. The
+// guard is the check's construction: CollectionCheck (no selector) and
+// ObjectCheck (a collection verb) both carry no Name, whatever the items are
+// called. (A hand-built `list` check WITH Name foo is allowed, as a
+// SubjectAccessReview with that name is upstream — the evaluator no longer
+// second-guesses the Name by verb.)
 func TestEvaluateRBAC_ResourceNamesDoesNotGrantList(t *testing.T) {
 	newTestWatcher(t,
 		clusterRole("named-reader",
@@ -104,21 +111,34 @@ func TestEvaluateRBAC_ResourceNamesDoesNotGrantList(t *testing.T) {
 		),
 	)
 
-	// list — even though "list" is in the rule's Verbs, a non-empty
-	// resourceNames means the rule cannot grant the collection verb.
-	// Name is "foo" (the per-item name filterListByRBAC threads) — it
-	// must STILL deny, because the verb itself is collection-scoped.
-	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
-		Username: "alice", Verb: "list",
-		Group: "templates.krateo.io", Resource: "restactions",
-		Namespace: "default", Name: "foo",
-	})
-	if err != nil {
-		t.Fatalf("EvaluateRBAC(list): %v", err)
+	// list — even though "list" is in the rule's Verbs, an unselected list
+	// names no object, so the rule cannot grant it — neither the request's
+	// own check nor a per-item check about the item named "foo".
+	gvr := schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
+	for what, opts := range map[string]rbac.EvaluateOptions{
+		"CollectionCheck(no selector)":   rbac.CollectionCheck("alice", nil, gvr, "default", ""),
+		"ObjectCheck(list, item foo)":    rbac.ObjectCheck("alice", nil, "list", rbac.TargetOf(gvr, "default", "foo")),
+		"CollectionCheck(name!=bar)":     rbac.CollectionCheck("alice", nil, gvr, "default", "fieldSelector=metadata.name%21%3Dbar"),
+		"CollectionCheck(label app=foo)": rbac.CollectionCheck("alice", nil, gvr, "default", "labelSelector=app%3Dfoo"),
+	} {
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("EvaluateRBAC(%s): %v", what, err)
+		}
+		if ok {
+			t.Fatalf("G1 LEAK: a resourceNames-scoped rule MUST NOT grant an unselected `list` (%s)", what)
+		}
 	}
-	if ok {
-		t.Fatalf("G1 LEAK: a resourceNames-scoped rule MUST NOT grant `list` " +
-			"(even with verb 'list' in the rule and a matching item name)")
+
+	// #1049 — a list whose field selector requires metadata.name=foo carries
+	// Name foo, and Kubernetes allows it.
+	ok, _, err := rbac.EvaluateRBAC(context.Background(),
+		rbac.CollectionCheck("alice", nil, gvr, "default", "fieldSelector=metadata.name%3Dfoo"))
+	if err != nil {
+		t.Fatalf("EvaluateRBAC(list name=foo): %v", err)
+	}
+	if !ok {
+		t.Fatalf("#1049: `list ?fieldSelector=metadata.name=foo` must be granted by resourceNames:[foo], as upstream")
 	}
 
 	// Sanity: the same rule still grants `get foo` — the resourceNames
@@ -176,16 +196,23 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 		t.Fatalf("verb-wildcard + resourceNames:[foo] should grant `delete foo`")
 	}
 
-	// list — collection verb, must deny even with verb wildcard.
-	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
-		Username: "alice", Verb: "list", Group: "", Resource: "secrets",
-		Namespace: "default", Name: "foo",
-	})
+	// list — an unselected collection read, built as snowplow builds it
+	// (no Name), must deny even with the verb wildcard.
+	secrets := schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.CollectionCheck("alice", nil, secrets, "default", ""))
 	if err != nil {
 		t.Fatalf("EvaluateRBAC(list): %v", err)
 	}
 	if ok {
-		t.Fatalf("G1 LEAK: verb-wildcard + resourceNames MUST still deny the collection verb `list`")
+		t.Fatalf("G1 LEAK: verb-wildcard + resourceNames MUST still deny an unselected `list`")
+	}
+	// A per-item collection-verb check about foo carries no Name either.
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.ObjectCheck("alice", nil, "list", rbac.TargetOf(secrets, "default", "foo")))
+	if err != nil {
+		t.Fatalf("EvaluateRBAC(ObjectCheck list foo): %v", err)
+	}
+	if ok {
+		t.Fatalf("G1 LEAK: ObjectCheck(list, foo) must carry no Name and deny")
 	}
 
 	// get bar — name not in list → deny.
@@ -198,6 +225,21 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("G1 LEAK: resourceNames:[foo] MUST deny `get bar`")
+	}
+
+	// #1073 F2 — names compare exactly: neither a name that extends a granted
+	// one, nor its prefix, nor a case variant is the granted object.
+	for _, n := range []string{"foobar", "fo", "Foo", "foo "} {
+		ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "alice", Verb: "get", Group: "", Resource: "secrets",
+			Namespace: "default", Name: n,
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC(get %q): %v", n, err)
+		}
+		if ok {
+			t.Fatalf("G1 LEAK: resourceNames:[foo] MUST deny `get %q` (names compare exactly)", n)
+		}
 	}
 }
 
