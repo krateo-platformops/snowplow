@@ -357,6 +357,61 @@ string without the delimiter is passed through verbatim. (`endpointRef.name`
 supports the same templating. Whether literal or templated, it may never
 name a per-user credential Secret; see below.)
 
+### A value in a `path` is one segment (#1123)
+
+The `path` template is a **template**: its string literals are what you wrote,
+and every value it splices in (`+ .x`, `"\(.x)"`, or a whole `${ .path }`) is
+**exactly one path segment** — or, after the template's `?`, **exactly one query
+value**. Values come from the caller (`extras`), from earlier stages and from
+iterator elements, and the request goes out with the stage's credential, so a
+value must never decide what that credential is used for.
+
+| A value spliced into… | is rendered as | and refused (not dialed) when |
+|---|---|---|
+| the path (before the template's `?`) | one segment, escaped like `url.PathEscape` (`?` → `%3F`, `#` → `%23`, `%` → `%25`, space → `%20`) | it contains `/`, or the segment it lands in is `.` or `..` |
+| the query (after the template's `?`) | one query value: `&`, `=`, `+`, `;`, `#`, `%`, space and non-query characters are escaped | never |
+
+A clean value (a name, a namespace, a number, a UUID, `system:admin`) renders as
+itself. For an apiserver path (`/api/…`, `/apis/…`) a value that needed an
+escape is refused too: the apiserver decodes the path before it reads the
+namespace, resource and name, and no valid one contains `%`.
+
+What counts as **your text** rather than a value: a string literal, an
+interpolated string, `+` of those, parentheses, an `if` whose branches are
+those, the right side of `|` or of `E as $x | …`, and a variable bound to one of
+those (`(if .range == "1h" then "1%20HOUR" else "6%20HOUR" end) as $iv` keeps
+`$iv` your text), or a literal key of an object of them (`$w.bk`). Anything
+else — `.x`, `.x // "default"`, `(.x | f)`, a function call, a variable bound to
+a value — is a value.
+
+**A value that holds several segments must be declared.** Either split it into
+single values (the right form for an `apiVersion`, which is `group/version`):
+
+```yaml
+path: ${ (.apiVersion | split("/")) as [$g, $v] | "/apis/" + $g + "/" + $v + "/" + .resource }
+```
+
+or declare it with `segments(E)`, which keeps `/` between pieces and still
+escapes each piece and refuses a `.` or `..` piece:
+
+```yaml
+path: ${ segments(.path) }      # the iterator yields a whole path
+```
+
+`segments()` lets the value choose **how many** segments it is. Never use it on
+caller input for a stage whose credential the caller does not hold (an
+`endpointRef`, or a `userAccessFilter` stage, which dials with the
+ServiceAccount): split the known shape instead. `segments()` is valid only
+spliced into the path, never in the query.
+
+**A query parameter is declared in the template:**
+`"/events?limit=200&composition_id=" + .uid` encodes `.uid` as one value. A
+whole path that carries its own query (`${ .path }` with `?…` inside) is
+refused; move the query into the template and pass only the values.
+
+A refused stage makes no call and is counted in `/debug/vars`
+`snowplow_malformed_dial_skipped_total.path_value_refused`.
+
 ### `endpointRef` never names a per-user credential
 
 A stage's `endpointRef` may never name a per-user credential Secret: the

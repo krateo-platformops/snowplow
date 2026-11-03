@@ -45,6 +45,10 @@ var genericBuiltins = map[string]bool{
 	"fdim": true, "hypot": true, "jn": true, "nextafter": true, "nexttoward": true,
 	"remainder": true, "scalb": true, "scalbln": true, "yn": true, "fma": true,
 	"finites": true, "normals": true,
+	// #1123 — a stage path's declared multi-segment value (pathtemplate
+	// SegmentsFunc): it yields its argument's string, split and escaped. A
+	// deterministic function of its argument, so the generic rule is sound.
+	"segments/1": true,
 }
 
 // unprovable are builtins whose output is not a function of the program's

@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -73,9 +74,12 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		it = ptr.Deref(in.DependsOn.Iterator, "")
 	}
 
+	// #1123 — the path is compiled once per stage and rendered per call.
+	pt := pathtemplate.Compile(in.Path)
+
 	if len(it) == 0 {
 		all = make([]httpcall.RequestOptions, 0, 1)
-		el, ok, sr := createRequestOption(in, dict)
+		el, ok, sr := createRequestOptionWith(in, pt, dict)
 		if ok {
 			all = append(all, el)
 		} else {
@@ -116,7 +120,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 	}
 
 	for _, sa := range elems {
-		el, ok, sr := createRequestOption(in, sa)
+		el, ok, sr := createRequestOptionWith(in, pt, sa)
 		if !ok {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 			skips = append(skips, skippedOption{path: el.Path, reason: sr})
@@ -157,10 +161,21 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 // well-formed paths AND for out-of-scope paths (external URLs, LIST paths) —
 // byte-identical to pre-#288 behaviour.
 func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions, valid bool, sr skipReason) {
+	return createRequestOptionWith(in, pathtemplate.Compile(in.Path), ds)
+}
+
+// createRequestOptionWith is createRequestOption with the stage path already
+// compiled (pt = pathtemplate.Compile(in.Path)), so an iterator stage compiles
+// it once rather than once per element.
+func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds any) (out httpcall.RequestOptions, valid bool, sr skipReason) {
 	out.ContinueOnError = ptr.Deref(in.ContinueOnError, false)
 	out.ErrorKey = ptr.Deref(in.ErrorKey, "error")
 
-	path, pathErr := evalJQE(in.Path, ds)
+	// #1123 — the path is a TEMPLATE: the author's literals as written, every
+	// value spliced into it escaped as one segment (or one query value), and a
+	// value that cannot be one refused (pathtemplate). Payload and headers are
+	// not URIs and keep the plain render below.
+	path, pathErr := pt.Render(context.TODO(), ds)
 	out.Path = path
 	out.Verb = ptr.To(ptr.Deref(in.Verb, http.MethodGet))
 
@@ -188,6 +203,12 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 		}
 	}
 
+	if pathErr != nil && pathtemplate.IsRefused(pathErr) {
+		// #1123 — a value tried to be more than one segment, or a '.'/'..'
+		// segment. Never dialed. The refusal names the rule, never the value.
+		out.Path = pathErr.Error()
+		return out, false, skipReason{class: reasonPathValueRefused, detail: pathErr.Error()}
+	}
 	if pathErr != nil {
 		// #293 sub-case 2: the path jq expression ERRORED. evalJQE surfaces the
 		// error (evalJQ would have masqueraded it as the path string and dialed it
@@ -268,6 +289,18 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 	// below depend on the "//" and trailing "/" the parser would erase.
 	p, _, _ := splitPathQuery(path) // fragment and query dropped (#1073 F1)
 
+	// #1123 — no percent-escape in an apiserver path. The apiserver decodes the
+	// path before it reads namespace, resource and name; snowplow's parsers
+	// (this guard, the cache key, the dependency edge, the in-process RBAC
+	// decision) read it as sent (#1118). No valid apiserver path needs an
+	// escape — no group, version, resource, namespace or name may contain '%' —
+	// so a path that carries one is refused, and the path snowplow checks is
+	// the path the apiserver serves. An escaped value lands here: a value with
+	// '?' or '#' escapes into the segment it was spliced into.
+	if strings.Contains(p, "%") {
+		return false, skipReason{class: reasonPathValueRefused, detail: "percent-escape in an apiserver path (#1123)"}
+	}
+
 	// Collapsed NAMESPACE — the empty segment "/namespaces//" (blocker fix).
 	if strings.Contains(p, "/namespaces//") {
 		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)"}
@@ -302,9 +335,10 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 }
 
 // evalJQE evaluates a jq template and SURFACES the Eval error instead of
-// swallowing it into the output string. The api-call PATH render uses it so a
-// failed jq expression is NOT dialed as a garbage apiserver path (#293
-// sub-case 2). A non-template string (MaybeQuery !ok) returns unchanged with a
+// swallowing it into the output string, so a failed jq expression is never
+// dialed (#293 sub-case 2, #302). The api-call payload and headers render
+// through it; the PATH renders through pathtemplate.Render (#1123), which
+// surfaces errors the same way. A non-template string (MaybeQuery !ok) returns unchanged with a
 // nil error.
 func evalJQE(q string, ds any) (string, error) {
 	q, ok := jqutil.MaybeQuery(q)
