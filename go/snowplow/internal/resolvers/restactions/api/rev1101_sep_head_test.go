@@ -19,17 +19,18 @@ import (
 
 // A held dial and a named-ref dial of a field-identical endpoint never share a
 // client: the held one refuses a redirect, the named ref follows it, in either
-// order.
+// order. The redirect stays on the endpoint's own origin: since #1106 a named
+// ref follows no redirect to another origin either (credhttp.Send).
 func TestRev1101_HeldAndNamedRefNeverShareAClient(t *testing.T) {
 	for _, order := range []string{"named-first", "held-first"} {
 		t.Run(order, func(t *testing.T) {
-			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"kind":"X","id":"followed"}`))
-			}))
-			defer target.Close()
 			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, target.URL+"/y", http.StatusFound)
+				if r.URL.Path == "/y" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"kind":"X","id":"followed"}`))
+					return
+				}
+				http.Redirect(w, r, "/y", http.StatusFound)
 			}))
 			defer origin.Close()
 			ep := endpoints.Endpoint{ServerURL: origin.URL, Token: "same-token-" + order}
