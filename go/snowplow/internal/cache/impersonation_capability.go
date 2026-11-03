@@ -286,7 +286,7 @@ func review(ctx context.Context, p impPrincipal) (bool, error) {
 			return a, nil
 		}
 		impReviews.Add(1)
-		dctx, dial := slowcall.StartDial(ctx, "access_review", "create", "authorization.k8s.io/v1, Resource=subjectaccessreviews")
+		dctx, dial := slowcall.StartDial(ctx, slowcall.BranchAccessReview, "create", "authorization.k8s.io/v1, Resource=subjectaccessreviews")
 		a, err := (*fnp)(dctx, p.resource, p.namespace, p.name)
 		dial.EndErr(ctx, err)
 		if err != nil {

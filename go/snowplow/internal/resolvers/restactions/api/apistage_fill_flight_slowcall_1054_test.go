@@ -350,8 +350,8 @@ func TestS1054_ApiserverListRetriedAfter429IsOneDialWithTwoAttempts(t *testing.T
 		t.Fatalf("PRECONDITION: %d records", len(recs))
 	}
 	r := recs[0]
-	for k, v := range map[string]any{"wait_kind": "apiserver", "wait_phase": "stage_dial", "wait_verb": "list",
-		"wait_gvr": r1FsaGVR.String(), "dial_kind": "apiserver", "phase": "stage_dial"} {
+	for k, v := range map[string]any{"wait_kind": "dial", "wait_branch": "internal_rest_config", "wait_phase": "stage_dial", "wait_verb": "list",
+		"wait_gvr": r1FsaGVR.String(), "wait_outcome": "completed", "dial_branch": "internal_rest_config", "phase": "stage_dial"} {
 		if r[k] != v {
 			t.Errorf("DIAL RED: %s = %v, want %v", k, r[k], v)
 		}
@@ -406,7 +406,7 @@ func TestS1054_ExternalStageRetriedAfter5xxIsOneDialWithTwoAttempts(t *testing.T
 		t.Fatalf("PRECONDITION: %d records", len(recs))
 	}
 	r := recs[0]
-	for k, v := range map[string]any{"wait_kind": "external", "wait_phase": "stage_dial", "wait_verb": "GET",
+	for k, v := range map[string]any{"wait_kind": "dial", "wait_branch": "external_fetch", "wait_phase": "stage_dial", "wait_verb": "GET", "wait_last_cause": "ok",
 		"wait_attempts": float64(2), "wait_http_5xx": float64(1), "wait_status": float64(200), "stage_dial_n": float64(1)} {
 		if r[k] != v {
 			t.Errorf("DIAL RED: %s = %v, want %v", k, r[k], v)

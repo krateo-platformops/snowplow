@@ -470,7 +470,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		}
 		// #1054 — one apiserver GET: its attempts (client-go retries a 429),
 		// statuses and retry sleeps ride dctx to slowcall.Transport.
-		dctx, dial := slowcall.StartDial(ctx, "apiserver", "get", gvr.String())
+		dctx, dial := slowcall.StartDial(ctx, slowcall.BranchInternalRESTConfig, "get", gvr.String())
 		obj, getErr := nri.Get(dctx, name, metav1.GetOptions{})
 		dial.EndErr(ctx, getErr)
 		if getErr != nil {
@@ -675,7 +675,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			return nil, false, ctx.Err()
 		default:
 		}
-		dctx, dial := slowcall.StartDial(ctx, "apiserver", "list", gvr.String()) // #1054: one LIST page
+		dctx, dial := slowcall.StartDial(ctx, slowcall.BranchInternalRESTConfig, "list", gvr.String()) // #1054: one LIST page
 		page, pageErr := nri.List(dctx, opts)
 		dial.EndErr(ctx, pageErr)
 		if pageErr != nil {

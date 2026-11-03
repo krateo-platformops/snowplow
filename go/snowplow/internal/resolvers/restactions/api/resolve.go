@@ -1526,7 +1526,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	fctx, answer := withDialAnswer(fctx)
 	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
 	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
-	fctx, dial := slowcall.StartDial(fctx, "external", ptr.Deref(call.Verb, http.MethodGet), "")
+	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")
 	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
 	dial.EndErr(fctx, fetchErr)
 	if fetchErr != nil && fctx.Err() != nil {

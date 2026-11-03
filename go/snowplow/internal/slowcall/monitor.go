@@ -225,16 +225,29 @@ func infoAttrs(prefix string, w waitInfo, withPhase bool) []slog.Attr {
 	if w.leaderWork != "" {
 		out = append(out, slog.String(prefix+"leader_work", w.leaderWork))
 	}
+	if w.branch != "" {
+		out = append(out, slog.String(prefix+"branch", w.branch))
+	}
 	if d := w.dial; d != nil {
+		detail, host, class := d.attemptDetail()
 		out = append(out,
 			slog.Int64(prefix+"attempts", d.attempts.Load()),
 			slog.Int64(prefix+"status", d.lastStatus.Load()),
+			slog.String(prefix+"last_cause", class),
 			slog.Int64(prefix+"retry_wait_ms", ms(d.retryWait.Load())),
 			slog.Int64(prefix+"conn_wait_ms", ms(d.connWait.Load())),
-			slog.Int64(prefix+"server_ms", ms(d.server.Load())),
+			slog.Int64(prefix+"dns_ms", ms(d.dns.Load())),
+			slog.Int64(prefix+"connect_ms", ms(d.connect.Load())),
+			slog.Int64(prefix+"tls_ms", ms(d.tls.Load())),
+			slog.Int64(prefix+"ttfb_ms", ms(d.ttfb.Load())),
+			slog.Int64(prefix+"reused", d.reused.Load()),
 			slog.Int64(prefix+"http_429", d.n429.Load()),
 			slog.Int64(prefix+"http_5xx", d.n5xx.Load()),
-			slog.Int64(prefix+"http_errors", d.errs.Load()))
+			slog.Int64(prefix+"http_network_errors", d.nNet.Load()),
+			slog.String(prefix+"attempt_detail", detail))
+		if host != "" {
+			out = append(out, slog.String(prefix+"host", host))
+		}
 	}
 	return out
 }
@@ -287,10 +300,12 @@ func recordAttrs(r *Record, wall time.Duration, end time.Time, cause Release, bo
 			slog.Int64("http_attempts", t.attempts.Load()),
 			slog.Int64("http_429", t.n429.Load()),
 			slog.Int64("http_5xx", t.n5xx.Load()),
-			slog.Int64("http_errors", t.errs.Load()),
+			slog.Int64("http_network_errors", t.nNet.Load()),
+			slog.Int64("http_reused", t.reused.Load()),
 			slog.Int64("retry_wait_ms", ms(t.retryWait.Load())),
 			slog.Int64("conn_wait_ms", ms(t.connWait.Load())),
-			slog.Int64("server_ms", ms(t.server.Load())),
+			slog.Int64("connect_ms", ms(t.connect.Load())),
+			slog.Int64("ttfb_ms", ms(t.ttfb.Load())),
 			slog.Int64("unscoped_http_n", t.unscopedN.Load()),
 			slog.Int64("unscoped_http_ms", ms(t.unscopedNS.Load())))
 	}

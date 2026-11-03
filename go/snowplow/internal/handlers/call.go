@@ -28,6 +28,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -218,7 +219,15 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// snowplow holds on their behalf: credhttp.Do is request.Do with a client
 	// that never follows a redirect (a token-auth clientconfig's bearer is
 	// re-added on every hop), and a refused 3xx is surfaced with its own code.
+	// #1054 — the passthrough fetch is one dial: its attempts (the retry
+	// client's network-error, 5xx and 429 retries) are recorded on it.
+	dctx, dial := slowcall.StartDial(dctx, slowcall.BranchPassthrough, strings.ToUpper(opts.verb), opts.gvr.String())
 	rt := credhttp.Do(dctx, callOpts)
+	if rt != nil && rt.Status == response.StatusFailure {
+		dial.EndRelease(slowcall.ReleaseFailed)
+	} else {
+		dial.End()
+	}
 
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see

@@ -186,6 +186,10 @@ func writeRequestLine(b *strings.Builder, r *Record, now time.Time) {
 			b.WriteString(" ")
 			b.WriteString(o.gvr)
 		}
+		if o.branch != "" {
+			b.WriteString(" ")
+			b.WriteString(o.branch)
+		}
 		if o.verb != "" {
 			b.WriteString(" ")
 			b.WriteString(o.verb)

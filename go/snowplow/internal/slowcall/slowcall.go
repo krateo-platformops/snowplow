@@ -210,9 +210,11 @@ type waitInfo struct {
 	key   string // raw: rendered only through redact, only when reported
 	gvr   string
 	verb  string
-	since time.Time
-	ns    int64
-	cause Release
+	// branch is a dial's dispatch branch (Branch*).
+	branch string
+	since  time.Time
+	ns     int64
+	cause  Release
 	// leaderClass / leaderWork: a content flight's leader (its admission
 	// class and its work class), so a wait names WHOSE work it waited on.
 	leaderClass, leaderWork string
@@ -316,20 +318,21 @@ func (r *Record) workClass() workclass.Class {
 // Span is one timed phase of one request. The zero Span (no Record on the
 // context) is a no-op.
 type Span struct {
-	r     *Record
-	t0    time.Time
-	kind  string
-	key   string
-	gvr   string
-	verb  string
-	lc    string
-	lw    string
-	dial  *dialState
-	p     Phase
-	slot  int8
-	wait  bool
-	yield bool
-	lead  bool
+	r      *Record
+	t0     time.Time
+	kind   string
+	key    string
+	gvr    string
+	verb   string
+	branch string
+	lc     string
+	lw     string
+	dial   *dialState
+	p      Phase
+	slot   int8
+	wait   bool
+	yield  bool
+	lead   bool
 }
 
 // Start opens a phase on ctx's request. End it exactly once.
@@ -436,7 +439,7 @@ func BeginYield(ctx context.Context) Span {
 }
 
 func (s *Span) info(d int64, cause Release) waitInfo {
-	return waitInfo{set: true, phase: s.p, kind: s.kind, key: s.key, gvr: s.gvr, verb: s.verb,
+	return waitInfo{set: true, phase: s.p, kind: s.kind, key: s.key, gvr: s.gvr, verb: s.verb, branch: s.branch,
 		since: s.t0, ns: d, cause: cause, leaderClass: s.lc, leaderWork: s.lw, dial: s.dial}
 }
 

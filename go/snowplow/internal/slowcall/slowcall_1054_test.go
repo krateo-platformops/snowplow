@@ -366,7 +366,7 @@ func TestS1054_DialRecordsEveryAttemptAndIsTheLongestWait(t *testing.T) {
 		short := StartWait(r.Context(), PhaseFlightWait, "content_flight", "k", "")
 		time.Sleep(bound / 2)
 		short.End()
-		ctx, dial := StartDial(r.Context(), "external", "GET", "")
+		ctx, dial := StartDial(r.Context(), BranchExternalFetch, "GET", "")
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/x?token=secret", nil)
 		cli := util.NewRetryClient(&http.Client{Transport: Transport(http.DefaultTransport)})
 		resp, err := cli.Do(req)
@@ -381,7 +381,8 @@ func TestS1054_DialRecordsEveryAttemptAndIsTheLongestWait(t *testing.T) {
 		t.Fatalf("PRECONDITION: %d records", len(recs))
 	}
 	r := recs[0]
-	for k, v := range map[string]string{"wait_kind": "external", "wait_phase": "stage_dial", "wait_verb": "GET", "dial_kind": "external"} {
+	for k, v := range map[string]string{"wait_kind": "dial", "wait_branch": "external_fetch", "wait_phase": "stage_dial", "wait_verb": "GET",
+		"wait_outcome": "completed", "wait_last_cause": "ok", "dial_branch": "external_fetch", "wait_host": hostDigest(strings.TrimPrefix(srv.URL, "http://"))} {
 		if r[k] != v {
 			t.Errorf("DIAL RED: %s = %v, want %q", k, r[k], v)
 		}
@@ -394,8 +395,11 @@ func TestS1054_DialRecordsEveryAttemptAndIsTheLongestWait(t *testing.T) {
 	if got := num(t, r, "wait_retry_wait_ms"); got < 1900 {
 		t.Errorf("DIAL RED: wait_retry_wait_ms = %d, want ≈ 2000 (the retry client's 429 default)", got)
 	}
-	if got := num(t, r, "wait_server_ms"); got < 40 {
-		t.Errorf("DIAL RED: wait_server_ms = %d, want ≥ 40 (the server's own time)", got)
+	if got := num(t, r, "wait_ttfb_ms"); got < 40 {
+		t.Errorf("DIAL RED: wait_ttfb_ms = %d, want ≥ 40 (the server's own time to first byte)", got)
+	}
+	if d, _ := r["wait_attempt_detail"].(string); !strings.HasPrefix(d, "1 429 reused:false") || !strings.Contains(d, "; 2 200 ") {
+		t.Errorf("DIAL RED: wait_attempt_detail = %q, want a fresh-connection 429 then a 200", d)
 	}
 	if s := buf.String(); strings.Contains(s, "token=secret") || strings.Contains(s, "127.0.0.1") {
 		t.Errorf("a dial's path, query or host reached the log: %s", s)
@@ -417,6 +421,82 @@ func TestS1054_AttemptOutsideAnyDialIsCountedUnscoped(t *testing.T) {
 	r := buf.records(t, "slowcall.request")[0]
 	if num(t, r, "unscoped_http_n") != 1 || num(t, r, "http_attempts") != 0 {
 		t.Fatalf("an attempt outside any dial: unscoped_http_n=%v http_attempts=%v, want 1 and 0", r["unscoped_http_n"], r["http_attempts"])
+	}
+}
+
+// TestS1054_NetworkErrorAttemptIsClassifiedAndRetried: the first connection
+// is dropped before any response (the shape of a connect timeout or a reset):
+// plumbing's retry client retries it. The dial's first attempt is class
+// network, the second a 200, and the dial counts one network error.
+func TestS1054_NetworkErrorAttemptIsClassifiedAndRetried(t *testing.T) {
+	t.Setenv("CLIENT_MAX_RETRIES", "1")
+	t.Setenv("CLIENT_BASE_BACKOFF", "50ms")
+	t.Setenv("CLIENT_MAX_BACKOFF", "50ms")
+	const bound = 20 * time.Millisecond
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close() // no response at all
+			}
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	m, buf := testMonitor(t, bound)
+	serve(m, "GET /call", func(w http.ResponseWriter, r *http.Request) {
+		ctx, dial := StartDial(r.Context(), BranchExternalFetch, "GET", "")
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		resp, err := util.NewRetryClient(&http.Client{Transport: Transport(&http.Transport{})}).Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		dial.EndErr(r.Context(), err)
+		time.Sleep(2 * bound)
+	})
+	r := buf.records(t, "slowcall.request")[0]
+	if num(t, r, "dial_http_network_errors") != 1 || num(t, r, "dial_attempts") != 2 {
+		t.Fatalf("NETWORK RED: dial_http_network_errors=%v dial_attempts=%v, want 1 and 2", r["dial_http_network_errors"], r["dial_attempts"])
+	}
+	if d, _ := r["dial_attempt_detail"].(string); !strings.HasPrefix(d, "1 connection ") || !strings.Contains(d, "; 2 200 ") {
+		t.Fatalf("NETWORK RED: dial_attempt_detail = %q, want a connection-cause attempt then a 200", d)
+	}
+}
+
+// TestS1054_AttemptCauseVocabulary pins the cause of an attempt (shared with
+// the endpoint retry counter, #1088): which httptrace step failed when there
+// is no response, else the status class.
+func TestS1054_AttemptCauseVocabulary(t *testing.T) {
+	boom := fmt.Errorf("boom")
+	for _, c := range []struct {
+		name                  string
+		dnsErr, conn, connErr bool
+		tlsErr                bool
+		status                int64
+		err                   error
+		want                  string
+	}{
+		{"dns", true, false, false, false, 0, boom, "dns"},
+		{"dial", false, true, true, false, 0, boom, "dial"},
+		{"tls", false, true, false, true, 0, boom, "tls_handshake"},
+		{"connection", false, true, false, false, 0, boom, "connection"},
+		{"429", false, true, false, false, 429, nil, "status_429"},
+		{"503", false, true, false, false, 503, nil, "status_5xx"},
+		{"404", false, true, false, false, 404, nil, "status_4xx"},
+		{"200", false, true, false, false, 200, nil, "ok"},
+	} {
+		var tr attemptTrace
+		tr.dnsErr.Store(c.dnsErr)
+		tr.connErr.Store(c.connErr)
+		tr.tlsErr.Store(c.tlsErr)
+		if c.conn {
+			tr.connStart.Store(1)
+		}
+		if got := tr.errorClass(c.status, c.err); got != c.want {
+			t.Errorf("CAUSE RED: %s = %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

@@ -105,10 +105,10 @@ func TestS1054_ImpersonationReviewLeaderDialsAndJoinerWaits(t *testing.T) {
 	if joiner["wait_phase"] != "flight_wait" || joiner["wait_outcome"] != "completed" {
 		t.Fatalf("REVIEW RED: joiner wait = %v / %v, want flight_wait / completed", joiner["wait_phase"], joiner["wait_outcome"])
 	}
-	if _, ok := joiner["dial_kind"]; ok {
+	if _, ok := joiner["dial_branch"]; ok {
 		t.Fatalf("REVIEW RED: the joiner records a dial it never sent: %v", joiner)
 	}
-	if leader["dial_kind"] != "access_review" || leader["dial_verb"] != "create" || leader["wait_kind"] != "access_review" {
+	if leader["dial_branch"] != "access_review" || leader["dial_verb"] != "create" || leader["wait_kind"] != "dial" {
 		t.Fatalf("REVIEW RED: the leader's own review is not its dial: %v", leader)
 	}
 	if _, ok := leader["flight_wait_n"]; ok {
