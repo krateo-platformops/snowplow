@@ -121,6 +121,10 @@ var nonCacheInitPublishers = map[string][]string{
 	// resolve, cache on or off, so the refusal must stay observable with the
 	// cache off.
 	"internal/resolvers/restactions/api/per_user_ref.go": {"snowplow_endpointref_per_user_refused_total"},
+	// #1116 reserved-extras refusal: same RESOLVER-path family — every
+	// RESTAction resolve, cache on or off, refuses extras that name a key the
+	// resolver writes, so the refusal must stay observable with the cache off.
+	"internal/resolvers/restactions/api/reserved_extras.go": {"snowplow_extras_reserved_key_refused_total"},
 	// #367 shadow-parity toggle STATE: enabled/source is a CONFIG fact (not a cache
 	// measurement) a latency-acceptance window must assert regardless of
 	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS

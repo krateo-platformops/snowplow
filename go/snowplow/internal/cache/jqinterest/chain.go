@@ -164,26 +164,32 @@ func (s *state) chain(c Chain) {
 	// - when dict[stage] is unset, the call stores its value;
 	// - when dict[stage] is set, the value is appended, and a filter-produced
 	//   array is spliced in.
-	// dict[stage] can already be set for two reasons:
+	// dict[stage] can already be set when this call lands, for two reasons:
 	// - an iterator fan-out's earlier calls (other edges: constant here);
-	// - the request extras, or the slice. resolve.go newResolveRun seeds the
-	//   dict with the extras at TOP level, and the extras keys are chosen by
-	//   the client, so ANY stage name can collide. The seed is already in the
-	//   cell key, so it is a constant.
-	// Because of the second reason, the accumulated shape is always possible.
-	seed := constOf(ccExtras, "extras-seed")
+	// - for a stage named "slice", the pagination block resolve.go
+	//   newResolveRun writes before any stage runs (a constant of the
+	//   request, already in the cell key).
+	// The request extras cannot set it: since #1116 a resolve whose extras
+	// name a stage, an errorKey or slice is refused before any stage runs
+	// (restactions/api reserved_extras.go), so no client-chosen key pre-seeds
+	// dict[stage]. Without either reason the stage's value is exactly its
+	// output.
+	var seed *abs
+	if tracked.Name == "slice" && !mutated(mutNoSliceSeed) {
+		seed = constOf(ccExtras, "slice")
+	}
 	if tracked.DependsOn != "" {
 		seed = union(seed, constOf(ccOther, "other-calls"))
 	}
-	acc := &abs{k: aArr, elem: union(seed, out)}
-	if tracked.Filter != nil {
-		sp := s.iterate(out, true)
-		acc.elem = union(acc.elem, stripCU(sp))
-		acc.elemCU = acc.elemCU || anyCU(sp) || out.k == aArr && out.elemCU
-	}
-	dictS := union(out, acc)
-	if mutated(mutNoExtrasSeed) && tracked.DependsOn == "" {
-		dictS = out
+	dictS := out
+	if seed != nil {
+		acc := &abs{k: aArr, elem: union(seed, out)}
+		if tracked.Filter != nil {
+			sp := s.iterate(out, true)
+			acc.elem = union(acc.elem, stripCU(sp))
+			acc.elemCU = acc.elemCU || anyCU(sp) || out.k == aArr && out.elemCU
+		}
+		dictS = union(out, acc)
 	}
 	// The resolver dict (resolve.go newResolveRun): request extras + slice +
 	// every stage's output under its name.

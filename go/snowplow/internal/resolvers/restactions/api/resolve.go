@@ -2089,6 +2089,16 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		return map[string]any{}, nil
 	}
 
+	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
+	// and the resolver writes its own keys into it. Extras that name one of
+	// them (a stage name, an errorKey, slice) would stand in for the
+	// resolver's value, so the resolve does not start: nothing is read or
+	// dialled (reserved_extras.go). restactions.Resolve applies the same rule
+	// first and returns the refusal to its caller as a 400.
+	if RefuseReservedExtras(ctx, opts.Items, opts.Extras, opts.RESTActionNamespace, opts.RESTActionName) != nil {
+		return map[string]any{}, nil
+	}
+
 	// #903 (team-lead ruling, the generic form of "never store a resolve that
 	// stopped before its write") — a RESTAction that DECLARES a write stage is
 	// never stored, whether or not this resolve dialed the write (a zero-item
