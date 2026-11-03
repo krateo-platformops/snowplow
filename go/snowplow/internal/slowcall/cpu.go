@@ -40,7 +40,7 @@ type cpuSample struct {
 	at      time.Time
 	procNS  int64 // process user+system CPU
 	cgOK    bool
-	usageNS int64 // cgroup CPU used
+	usageNS int64 // cgroup CPU used; -1 when cpu.stat carries none (v1: it is in cpuacct)
 	periods int64 // cgroup CFS periods elapsed
 	thrPer  int64 // periods in which the cgroup was throttled
 	thrNS   int64 // time the cgroup was throttled
@@ -126,8 +126,12 @@ func (c *cpuSampler) windowAttrs(start time.Time) []slog.Attr {
 		}
 	}
 	if from.cgOK && to.cgOK {
+		// Usage only when both reads carried it: a v1 cpu.stat has none, and
+		// the delta of two missing values is UNMEASURED, never 0.
+		if from.usageNS >= 0 && to.usageNS >= 0 {
+			out = append(out, slog.Int64("cgroup_cpu_ms", (to.usageNS-from.usageNS)/int64(time.Millisecond)))
+		}
 		out = append(out,
-			slog.Int64("cgroup_cpu_ms", (to.usageNS-from.usageNS)/int64(time.Millisecond)),
 			slog.Int64("cfs_periods", to.periods-from.periods),
 			slog.Int64("cfs_throttled_periods", to.thrPer-from.thrPer),
 			slog.Int64("cfs_throttled_ms", (to.thrNS-from.thrNS)/int64(time.Millisecond)))
@@ -154,7 +158,10 @@ func readCPU() cpuSample {
 // parseCPUStat reads a cgroup v2 cpu.stat (usage_usec, nr_periods,
 // nr_throttled, throttled_usec) or a v1 one (nr_periods, nr_throttled,
 // throttled_time in ns; usage lives in cpuacct, not here).
+//
+// usageNS is -1 when the file carries no usage_usec.
 func parseCPUStat(b []byte) (usageNS, periods, thrPer, thrNS int64, ok bool) {
+	usageNS = -1
 	sc := bufio.NewScanner(bytes.NewReader(b))
 	for sc.Scan() {
 		f := bytes.Fields(sc.Bytes())

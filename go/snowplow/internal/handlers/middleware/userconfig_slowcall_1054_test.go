@@ -33,7 +33,11 @@ type s1054Buf struct {
 	b  bytes.Buffer
 }
 
-func (l *s1054Buf) Write(p []byte) (int, error) { l.mu.Lock(); defer l.mu.Unlock(); return l.b.Write(p) }
+func (l *s1054Buf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
 
 func TestS1054_UserConfigTimeIsTheAuthPhase(t *testing.T) {
 	const bound = 60 * time.Millisecond

@@ -150,6 +150,11 @@ type attemptTrace struct {
 	connWait, dns, connect, tls, first            atomic.Int64
 	reused                                        atomic.Bool
 	dnsErr, connErr, tlsErr                       atomic.Bool
+	// dnsDone, connDone, tlsDone: the step's Done hook (or settle) claimed
+	// it, so its time is added once.
+	dnsDone, connDone, tlsDone atomic.Bool
+	// cut is the step an attempt was abandoned in (settle), "" if none.
+	cut string
 }
 
 func since(mark *atomic.Int64) int64 {
@@ -170,6 +175,9 @@ func (tr *attemptTrace) hooks() *httptrace.ClientTrace {
 		},
 		DNSStart: func(httptrace.DNSStartInfo) { stamp(&tr.dnsStart) },
 		DNSDone: func(i httptrace.DNSDoneInfo) {
+			if !tr.dnsDone.CompareAndSwap(false, true) {
+				return
+			}
 			tr.dns.Add(since(&tr.dnsStart))
 			if i.Err != nil {
 				tr.dnsErr.Store(true)
@@ -177,6 +185,9 @@ func (tr *attemptTrace) hooks() *httptrace.ClientTrace {
 		},
 		ConnectStart: func(string, string) { stamp(&tr.connStart) },
 		ConnectDone: func(_, _ string, err error) {
+			if !tr.connDone.CompareAndSwap(false, true) {
+				return
+			}
 			tr.connect.Add(since(&tr.connStart))
 			if err != nil {
 				tr.connErr.Store(true)
@@ -184,6 +195,9 @@ func (tr *attemptTrace) hooks() *httptrace.ClientTrace {
 		},
 		TLSHandshakeStart: func() { stamp(&tr.tlsStart) },
 		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if !tr.tlsDone.CompareAndSwap(false, true) {
+				return
+			}
 			tr.tls.Add(since(&tr.tlsStart))
 			if err != nil {
 				tr.tlsErr.Store(true)
@@ -191,6 +205,32 @@ func (tr *attemptTrace) hooks() *httptrace.ClientTrace {
 		},
 		WroteRequest:         func(httptrace.WroteRequestInfo) { stamp(&tr.wrote) },
 		GotFirstResponseByte: func() { tr.first.Store(since(&tr.wrote)) },
+	}
+}
+
+// settle freezes an attempt when RoundTrip returns. A step whose Done hook
+// has not fired was still in progress when the attempt was abandoned: net/http
+// dials on a context without the request's cancellation, so when the
+// request's context ends mid-connect (a page budget, a cut scope, a client
+// that left) RoundTrip returns before ConnectDone. That step is the
+// attempt's cause and its time runs to now (#1059 re-review A). The latest
+// step started is the one in progress: TLS, then connect, then DNS.
+func (tr *attemptTrace) settle() {
+	for _, s := range []struct {
+		start *atomic.Int64
+		done  *atomic.Bool
+		acc   *atomic.Int64
+		cause string
+	}{
+		{&tr.tlsStart, &tr.tlsDone, &tr.tls, "tls_handshake"},
+		{&tr.connStart, &tr.connDone, &tr.connect, "dial"},
+		{&tr.dnsStart, &tr.dnsDone, &tr.dns, "dns"},
+	} {
+		if s.start.Load() != 0 && s.done.CompareAndSwap(false, true) {
+			s.acc.Add(since(s.start))
+			tr.cut = s.cause
+			return
+		}
 	}
 }
 
@@ -202,6 +242,8 @@ func (tr *attemptTrace) errorClass(status int64, err error) string {
 	switch {
 	case err != nil || status == 0:
 		switch {
+		case tr.cut != "":
+			return tr.cut
 		case tr.dnsErr.Load() && tr.connStart.Load() == 0:
 			return "dns"
 		case tr.connErr.Load():
@@ -239,6 +281,9 @@ func (a attemptRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	resp, err := a.next.RoundTrip(req.WithContext(context.WithValue(httptrace.WithClientTrace(ctx, tr.hooks()), attemptMark{}, true)))
 	end := time.Now()
+	if err != nil || resp == nil {
+		tr.settle()
+	}
 
 	status := int64(0)
 	if resp != nil {

@@ -577,6 +577,26 @@ func TestS1054_RecordAndSnapshotCarryCPUStarvation(t *testing.T) {
 	}
 }
 
+// TestS1054_WatchdogStartsTheCPUSampler (re-review C, MC4): the process
+// monitor's start is what starts the sampler; without it every record would
+// silently lose its CPU fields.
+func TestS1054_WatchdogStartsTheCPUSampler(t *testing.T) {
+	m, _ := testMonitor(t, time.Hour) // the watchdog's tick is a quarter hour: it never checks here
+	var reads atomic.Int64
+	m.cpu.read = func() cpuSample { reads.Add(1); return cpuSample{at: time.Now()} }
+	m.startWatchdog()
+	deadline := time.Now().Add(5 * time.Second)
+	for reads.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if reads.Load() == 0 {
+		t.Fatalf("SAMPLER RED: startWatchdog did not start the CPU sampler")
+	}
+	if _, _, ok := m.cpu.before(time.Now()); !ok {
+		t.Fatalf("SAMPLER RED: the sampler holds no sample")
+	}
+}
+
 func TestS1054_ParseCPUStatV1AndV2(t *testing.T) {
 	u, p, tp, tn, ok := parseCPUStat([]byte("usage_usec 5000\nuser_usec 1\nsystem_usec 2\nnr_periods 40\nnr_throttled 7\nthrottled_usec 9000\n"))
 	if !ok || u != 5e6 || p != 40 || tp != 7 || tn != 9e6 {
