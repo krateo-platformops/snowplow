@@ -196,6 +196,48 @@ func TestS1060_AbandonedNonTrueValuesDropped(t *testing.T) {
 	}
 }
 
+// An attribute key matches EXACTLY (#1061 review round 2, N-F1). A case or
+// whitespace variant of a listed key is an unlisted key, even when its value
+// would pass the key's check. It is dropped and counted, and never forwarded
+// under the sender's spelling: the SLI queries filter on the exact key, so a
+// variant that reached the collector would silently miss them.
+//
+// MUTATIONS (RED, shown in the PR): the key lookup in buildSpan ignoring case;
+// the key lookup trimming whitespace.
+func TestS1060_AttributeKeysMatchExactly(t *testing.T) {
+	variants := []map[string]any{
+		strAttr("HTTP.ROUTE", "/compositions"),
+		strAttr(" http.route", "/compositions"),
+		strAttr("http.route ", "/compositions"),
+		strAttr("http.request.method\t", "GET"),
+		boolAttr("Krateo.Interaction.Abandoned", true),
+		boolAttr("krateo.interaction.abandoned ", true),
+	}
+	var spans []otlpSpan
+	for _, name := range interactionSpans {
+		spans = append(spans, otlpSpan{name: name, attrs: append([]map[string]any{
+			intAttr("http.response.status_code", 200), // the one exact key: the span keeps it
+		}, variants...)})
+	}
+	out, dropped := postAndExport(t, "attr-key-variants", spans...)
+	if want := uint64(len(variants) * len(interactionSpans)); dropped != want {
+		t.Errorf("attributes_dropped delta %d, want %d (every key variant on every span)", dropped, want)
+	}
+	exact := map[string]bool{
+		"http.route": true, "http.request.method": true, "http.response.status_code": true, abandonedKey: true,
+	}
+	for _, s := range out {
+		for _, a := range s.GetAttributes() {
+			if !exact[a.GetKey()] {
+				t.Errorf("%s forwards key %q, which is not a listed spelling", s.GetName(), a.GetKey())
+			}
+		}
+		if got, want := attrKeys(s), "http.response.status_code"; got != want {
+			t.Errorf("%s forwards [%s], want [%s]", s.GetName(), got, want)
+		}
+	}
+}
+
 // Absent means not abandoned: an interaction span without the key is
 // forwarded exactly as before, with nothing added and nothing counted.
 func TestS1060_AbandonedAbsentIsUnchanged(t *testing.T) {
