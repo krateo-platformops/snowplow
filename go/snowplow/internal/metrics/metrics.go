@@ -67,6 +67,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -1660,6 +1661,27 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 	}
 	evictions, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_evictions_total",
 		metric.WithDescription("Stage endpoint clients dropped by the idle sweep (unused for one idle-connection timeout). #1088."))
+	if err != nil {
+		return err
+	}
+	budgetExchanges, err := m.Int64ObservableCounter("snowplow_page_budget_exchanges_total",
+		metric.WithDescription("Network exchanges of customer requests, by what the request's page budget (arrival + the 10 s page goal) did to them {within = it never acted, retried = a connection attempt failed or was abandoned and the one retry inside the budget answered, not_sent = the budget was spent before the exchange started, exhausted_connect = it ran out before a connection was obtained, exhausted_answer = it ran out waiting for the answer}. Background exchanges carry no budget and are not counted. #1115."))
+	if err != nil {
+		return err
+	}
+	budgetReserve, err := m.Int64ObservableGauge("snowplow_page_budget_retry_reserve_ms",
+		metric.WithDescription("The page budget's retry reserve: the 99th percentile of the recent attempts that opened a new connection, from asking for it to the first response byte; the page p95 goal (3 s) before any was measured. A customer connect still pending at deadline − reserve is abandoned and retried once. #1115."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range pagebudget.ExchangesSnapshot() {
+			o.ObserveInt64(budgetExchanges, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Result.String())))
+		}
+		reserve, _ := credhttp.RetryReserve()
+		o.ObserveInt64(budgetReserve, reserve.Milliseconds())
+		return nil
+	}, budgetExchanges, budgetReserve)
 	if err != nil {
 		return err
 	}

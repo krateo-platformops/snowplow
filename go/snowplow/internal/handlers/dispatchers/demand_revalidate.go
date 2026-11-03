@@ -54,6 +54,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -197,7 +198,7 @@ type demandTemplate struct {
 var demandTemplates sync.Map // L1 key → *demandTemplate
 
 func setDemandTemplate(key string, req *http.Request) *demandTemplate {
-	clone := req.Clone(context.WithoutCancel(req.Context()))
+	clone := req.Clone(pagebudget.Detach(req.Context())) // #1115: no customer budget
 	v, _ := demandTemplates.LoadOrStore(key, &demandTemplate{})
 	t := v.(*demandTemplate)
 	t.mu.Lock()
@@ -234,7 +235,7 @@ func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time
 	// content and nested fills bypass like a debt's (top priority, never queued
 	// behind background work), ahead of any origin rule. #740 — stamped on EVERY
 	// attempt, the absorbed-read reruns included.
-	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.WithoutCancel(req.Context())), cache.DemandRevalidationDeadline())
+	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(pagebudget.Detach(req.Context())), cache.DemandRevalidationDeadline())
 	defer cancel()
 	// #871 — measurement only: the template is a customer request and carries
 	// its label; the attempt is fill_bg. The re-entered ServeHTTP labels its

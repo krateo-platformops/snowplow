@@ -155,6 +155,13 @@ const PinnedPlumbingVersion = "v1.15.1"
 func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// #1115 — a customer request's network exchanges share the page's
+			// 10 s goal budget, from its arrival (pagebudget). Set once, here,
+			// where every customer request/response route enters, before the
+			// clientconfig read below. A background self-loopback (#903's
+			// marker) is not a customer request and carries none.
+			req = withCustomerPageBudget(req)
+
 			// Upstream — a missing key source is a wiring bug, surfaced on every
 			// request as an InternalError, before the auth-header check.
 			if keys == nil {

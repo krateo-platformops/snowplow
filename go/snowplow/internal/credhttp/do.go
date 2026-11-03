@@ -29,6 +29,7 @@ package credhttp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,6 +41,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -104,6 +106,9 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	// every retry counted and logged with its cause.
 	respo, err := Send(SendSiteCall, Client(cli), call)
 	if err != nil {
+		if st, ok := BudgetStatus(err); ok {
+			return st // #1115 — 504 Timeout
+		}
 		return response.New(http.StatusInternalServerError, err)
 	}
 	defer respo.Body.Close()
@@ -138,6 +143,26 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	}
 
 	return response.New(http.StatusNoContent, nil)
+}
+
+// BudgetStatusReason is the reason of the envelope a page-budget exhaustion is
+// reported with: the apiserver's own reason for 504 (metav1.StatusReasonTimeout).
+const BudgetStatusReason = "Timeout"
+
+// BudgetStatus shapes an exchange its page budget ended (#1115) into the
+// envelope a stage or a /call passthrough reports: 504 Gateway Timeout, a
+// Failure, reason Timeout, the identity-free ExhaustedError text. ok=false for
+// any other error. (plumbing's response.New(504, …) would read as a Success:
+// 504 is not in its list.)
+func BudgetStatus(err error) (*response.Status, bool) {
+	var e *pagebudget.ExhaustedError
+	if !errors.As(err, &e) {
+		return nil, false
+	}
+	st := response.New(http.StatusGatewayTimeout, e)
+	st.Status = response.StatusFailure
+	st.Reason = response.StatusReason(BudgetStatusReason)
+	return st, true
 }
 
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx

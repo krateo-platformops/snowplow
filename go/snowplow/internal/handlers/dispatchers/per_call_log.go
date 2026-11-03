@@ -6,6 +6,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
@@ -62,6 +63,10 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 			slog.String("l1_hit", st.l1Hit),
 			slog.String("gvr", st.gvr),
 			slog.Int64("total_ms", time.Since(st.start).Milliseconds()),
+			// #1115 — what the request's page budget did to its network
+			// exchanges (none / within / retried / not_sent /
+			// exhausted_connect / exhausted_answer).
+			slog.String("budget", pagebudget.Outcome(ctx).String()),
 		}
 		// OTel log-correlation: since 1.12.4 the trace_id/span_id pair is
 		// attached to EVERY *Context record by the trace-correlation

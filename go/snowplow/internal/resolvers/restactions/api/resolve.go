@@ -33,6 +33,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"golang.org/x/sync/errgroup"
@@ -1614,6 +1615,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
+			// #1115 — the page budget ended the fetch: the item error carries
+			// the *pagebudget.ExhaustedError (same text), so the resolve's
+			// StageFailure reports the budget, not an upstream answer.
+			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
+				itemErr = &budgetItemError{text: itemErr.Error(), cause: be}
+			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
 		if isOwnDenied {

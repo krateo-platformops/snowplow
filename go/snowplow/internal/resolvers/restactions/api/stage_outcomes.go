@@ -56,6 +56,9 @@ const (
 	// identity or no client config. Every declared stage is then NotRun, so
 	// the header can never read "all succeeded" ([]) for it.
 	StageReasonAborted = "Aborted"
+	// StageReasonTimeout (#1115) — the stage's exchange was ended by the
+	// request's page budget (a 504 Timeout): the page's 10 s goal ran out.
+	StageReasonTimeout = "Timeout"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -66,10 +69,11 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	StageReasonNotExecuted:  5,
-	StageReasonForbidden:    4,
-	StageReasonUnauthorized: 3,
-	StageReasonNotFound:     2,
+	StageReasonNotExecuted:  6,
+	StageReasonForbidden:    5,
+	StageReasonUnauthorized: 4,
+	StageReasonNotFound:     3,
+	StageReasonTimeout:      2,
 	StageReasonError:        1,
 }
 
@@ -279,6 +283,8 @@ func stageReasonOf(v any) string {
 		return StageReasonForbidden
 	case 404:
 		return StageReasonNotFound
+	case 504:
+		return StageReasonTimeout
 	}
 	return StageReasonError
 }

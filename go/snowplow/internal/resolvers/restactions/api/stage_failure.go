@@ -59,6 +59,8 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -73,6 +75,10 @@ type StageFailure struct {
 
 	// redirect is the upstream's 3xx when Code was mapped to 502 (#729).
 	redirect int
+	// budget (#1115) is the page-budget exhaustion that ended the stage's
+	// exchange: snowplow cut it, so the message says so, never "upstream
+	// answered".
+	budget *pagebudget.ExhaustedError
 }
 
 // StatusError renders the failure as a typed apiserver status, so every
@@ -104,6 +110,17 @@ type stageItemFailure struct {
 func (e *stageItemFailure) Error() string { return e.err.Error() }
 func (e *stageItemFailure) Unwrap() error { return e.err }
 
+// budgetItemError (#1115) is a branch-E item error whose fetch the page budget
+// ended: the worker's text, unchanged, with the *pagebudget.ExhaustedError as
+// its cause, so newStageItemFailure can report the budget.
+type budgetItemError struct {
+	text  string
+	cause *pagebudget.ExhaustedError
+}
+
+func (e *budgetItemError) Error() string { return e.text }
+func (e *budgetItemError) Unwrap() error { return e.cause }
+
 // newStageItemFailure derives the stage's code and reason from what
 // recordItemError recorded (accumVal) and the worker's item error.
 func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFailure {
@@ -119,6 +136,16 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 		if errors.As(itemErr, &se) {
 			f.Code = int(se.ErrStatus.Code)
 			f.Reason = string(se.ErrStatus.Reason)
+		}
+	}
+	// #1115 — an exchange the request's page budget ended (a client-go read
+	// records a plain string, so the chain is what carries it): 504 Timeout.
+	var be *pagebudget.ExhaustedError
+	if errors.As(itemErr, &be) {
+		f.budget = be
+		if f.Code == 0 {
+			f.Code = http.StatusGatewayTimeout
+			f.Reason = credhttp.BudgetStatusReason
 		}
 	}
 	if f.Code == 0 {
@@ -221,9 +248,14 @@ func firstStageFailure(itemErrs []error, calls []httpcall.RequestOptions) *Stage
 			if i < len(calls) {
 				call = calls[i]
 			}
-			if f.redirect != 0 {
+			switch {
+			case f.budget != nil:
+				// #1115 — the ExhaustedError's text is identity-free by
+				// construction (phase, cause, attempts; no host).
+				f.Message = stageMessage(f.Code, f.budget.Error(), call)
+			case f.redirect != 0:
 				f.Message = canonicalRedirectMessage(f.redirect, call)
-			} else {
+			default:
 				f.Message = canonicalStageMessage(f.Code, call)
 			}
 			return &f
