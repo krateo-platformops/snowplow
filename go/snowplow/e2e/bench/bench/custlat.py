@@ -49,12 +49,14 @@ replica` of two runs of one image on this schedule). A's within-run spread
 cannot stand in for the between-run term, at any block length: a cluster's
 constant offset (its node CPU platform, its control plane) adds nothing to
 the spread inside a run, so that spread is a lower bound on the between-run
-one, never an estimate of it — #1053: A's steady p95 bar, from its
-half-sample sd at 10, 60, 300 or 600 s blocks, is at most 1.047 (run 20 A)
-and 1.043 (run 19 A), yet the three pairs' steady p95 B/A were 0.937 (a
-1.068 ratio the other way), 1.060 and 0.981. B's own spread (or B / A per
-segment) is the instrument under test: a noisier candidate would loosen its
-own bar.
+one, never an estimate of it. The data is consistent with that, no more
+(#1053): run 19's steady p95 B/A, 1.060, is past its A's bar at every block
+length (10, 60, 300 or 600 s: at most 1.043), but that pair compares two
+images, so it cannot tell code from a cluster offset; run 17's 0.937 (1.068
+the other way) is inside its own A's bar at 3 of those 4 block lengths. The
+rule rests on the offset argument, not on these numbers. B's own spread (or
+B / A per segment) is the instrument under test: a noisier candidate would
+loosen its own bar.
 
 Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
 2026-10-24):

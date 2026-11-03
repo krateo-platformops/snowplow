@@ -5,11 +5,13 @@ churn, never steady (those runs had no steady phase), so the cell's
 tolerance was A's within-run sampling spread alone.
 
 No data gives steady a between-run term today: the three pairs with a
-steady phase on this schedule (17a5/17b5, 19a3/19b3, 20a/20b) all compare
-two different images; the only same-image runs (1.12.56 in 17a5 and 20a,
-1.12.57 in 17b5 and 19a3) run a different workload (steady p99 ~40 ms
-against ~250 ms). A's within-run spread cannot stand in at any block
-length (custlat's module doc). So a cell with no replica ratio PASSes
+steady phase (17a5/17b5, 19a3/19b3, 20a/20b) all compare two different
+images, and the only same-image runs (1.12.56 in 17a5 and 20a, 1.12.57 in
+17b5 and 19a3) cross the workload change of bench d249d7d2 (#999; steady
+p99 ~40 ms against ~250 ms). A's within-run spread cannot stand in at any
+block length: a cluster's constant offset adds nothing to it (custlat's
+module doc; the measured swings are consistent with that, they do not
+show it). So a cell with no replica ratio PASSes
 inside the within-run bar (the between-run term could only widen it) and
 has no FAIL bar: past it, INCONCLUSIVE with the reason.
 
@@ -155,8 +157,8 @@ def test_planted_x15_steady_p99_fails_once_steady_has_a_replica(rp):
     """With a measured steady term (an A/A pair's), a 1.5x steady p99
     FAILs for every between-run ratio below 1.5: the tolerance is
     max(within, replica), the larger of two ratios, never a sum or a
-    product of slacks (runs 19/20's segment bars 1.031-1.039 and the
-    largest steady swing seen between pairs, p95 1.0603, all included)."""
+    product of slacks (runs 19/20's segment bars 1.031-1.039 and run 19's
+    steady p95 B/A, 1.0603, all included)."""
     p = _pair(b=_planted(1.5), replica=_with_steady({"p95_ms": rp, "p99_ms": rp, "req_s": rp}))
     c = _checks(p)[P99]
     assert c["result"] == "FAIL" and p["verdict"] == "FAIL", c
