@@ -329,6 +329,46 @@ func TestEndpointClients1088_ReuseCopyAndIdleSweep(t *testing.T) {
 	}
 }
 
+// R-d: the key fails closed. A field kind the fold cannot read exactly (a
+// pointer, an int, an unexported field) makes the type inexact, and an inexact
+// key keeps nothing: every Get builds.
+func TestEndpointKey1101_FailsClosedOnAnUnfoldableField(t *testing.T) {
+	if !foldsExactly(reflect.TypeOf(endpoints.Endpoint{})) || !endpointKeyExact {
+		t.Fatal("plumbing's Endpoint is exported strings and bools today: the fold must be exact")
+	}
+	type withPtr struct {
+		A string
+		P *string
+	}
+	type withInt struct {
+		A string
+		N int
+	}
+	type withUnexported struct {
+		A string
+		b string
+	}
+	for name, typ := range map[string]reflect.Type{"pointer": reflect.TypeOf(withPtr{}), "int": reflect.TypeOf(withInt{}), "unexported": reflect.TypeOf(withUnexported{})} {
+		if foldsExactly(typ) {
+			t.Fatalf("a struct with a %s field reads as exactly foldable", name)
+		}
+	}
+	prev := endpointKeyExact
+	endpointKeyExact = false
+	defer func() { endpointKeyExact = prev }()
+	c := NewEndpointClientsForTest(time.Hour, time.Now)
+	k := EndpointKeyOf(&endpoints.Endpoint{Token: "a"})
+	builds := 0
+	for i := 0; i < 3; i++ {
+		if _, err := c.Get(k, func() (*http.Client, bool, error) { builds++; return &http.Client{}, true, nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if builds != 3 || c.Len() != 0 {
+		t.Fatalf("an inexact key kept a client: builds = %d, entries = %d; want 3, 0", builds, c.Len())
+	}
+}
+
 // The idle bound is the transports' own idle timeout, never a number chosen
 // here: net/http's DefaultTransport value, which client-go installs.
 func TestEndpointClients1088_IdleIsTheTransportIdleTimeout(t *testing.T) {
@@ -368,6 +408,12 @@ func TestDo1088_NonOKAnswerIsAlwaysAFailure(t *testing.T) {
 		}
 		if tc.code == http.StatusForbidden && (st.Message != "forbidden: cm x" || st.Reason != "Forbidden") {
 			t.Fatalf("a Status body lost its message or reason: %+v", st)
+		}
+		// A body that names no reason gets plumbing's reason for the code; a
+		// code plumbing does not map keeps none (never an invented one).
+		wantReason := map[int]string{http.StatusInternalServerError: "InternalError", http.StatusBadGateway: "", http.StatusGatewayTimeout: "", http.StatusForbidden: "Forbidden"}[tc.code]
+		if string(st.Reason) != wantReason {
+			t.Fatalf("%d: reason %q, want %q (derived from the code)", tc.code, st.Reason, wantReason)
 		}
 	}
 }
