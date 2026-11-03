@@ -1705,6 +1705,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen (no sink on a plain Put: a no-op)
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
+	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
 }
 
@@ -1839,6 +1840,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	ksEnd := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
+	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
 	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
 	// any ctx without one, and for any key but the revalidated one). BEFORE the
@@ -1893,6 +1895,7 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
+	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -1960,7 +1963,11 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(entry)
-	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
+	// #1070 — ONE byte compare of the refresh Put against the resident prior,
+	// OFF c.mu: it counts the Put identical or changed, and it is #406's compare
+	// for an RAFullList body (raLayerEqualOf), so no body is compared twice.
+	same := c.sameBytesPrior(key, entry)
+	equalPrior := c.raLayerEqualOf(entry, same) // #406
 
 	c.mu.Lock()
 	el, live := c.index[key]
@@ -1971,6 +1978,10 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		c.mu.Unlock()
 		return false
 	}
+	// #1070 — identical only if the prior that compared equal is the one replaced
+	// here; any other resident entry (a write landed after the compare) counts the
+	// Put as changed, as #406 voids its compare.
+	identical := same != nil && el.Value.(*lruItem).entry == same
 	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
 	if freshMint {
@@ -1992,6 +2003,14 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	ksEnd := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
+	// #1070 — measurement only: the accepted refresh Put, timed on the
+	// dirty-window clock with the rest of the refresh cycle (refresh_cycle.go).
+	class := ""
+	if entry.Inputs != nil {
+		class = entry.Inputs.CacheEntryClass
+	}
+	noteRefreshPut(ctx, key, class, identical, windowNow())
+	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -4250,6 +4269,8 @@ func stopResolvedCacheSummaryForTest() {
 // Production code MUST NOT call it.
 func ResetResolvedCacheForTest() {
 	resetResolvedCacheForTest()
+	// #1062 — the stale-push ledger is keyed by L1 keys of the store being dropped.
+	ResetStalePushForTest()
 	// #643 — the engine-wide declined-external set is process-lived and keyed
 	// by L1 keys: a fresh store must not inherit marks for keys it never held.
 	ResetEngineDeclinedExternalSetForTest()

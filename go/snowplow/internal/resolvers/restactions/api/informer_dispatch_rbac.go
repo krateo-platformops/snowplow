@@ -91,25 +91,32 @@ func newListForbidden(gvr schema.GroupVersionResource, namespace string) error {
 
 // filterListByRBAC is the per-user gate of a LIST served from snowplow's own
 // copy of the data (the informer, the api-stage content cell, branch C's SA
-// read). namespace is the REQUEST's namespace ("" = a cluster-wide list).
+// read). namespace is the REQUEST's namespace ("" = a cluster-wide list) and
+// rawQuery the request's own query string (#1049): with namespace and gvr it
+// is the request the apiserver would authorize.
 //
 // It answers in two steps, both from the requester's RBAC rules through the
 // in-process evaluator, never from the items:
 //
-//  1. Scope (#961, listScopeAllowed): may the requester `list` at the scope
-//     of the request, exactly as the apiserver authorizes it? If not, the
-//     apiserver refuses the request with 403, and so does this gate: it
-//     returns newListForbidden, whatever the items. An allowed request whose
-//     collection is empty is served empty.
+//  1. Scope (#961, listScopeAllowed): may the requester make this request,
+//     exactly as the apiserver authorizes it? The check is
+//     rbac.CollectionCheck's — verb list, and the Name a
+//     `fieldSelector=metadata.name=<x>` carries (#1049), so a
+//     `list resourceNames: [x]` grant allows a list selecting x and nothing
+//     else. If not, the apiserver refuses the request with 403, and so does
+//     this gate: it returns newListForbidden, whatever the items. An allowed
+//     request whose collection is empty is served empty.
 //  2. Items (defence in depth): of an allowed request, the items the
-//     requester may `list` in each item's own namespace (cluster-scoped items,
-//     namespace "", against the cluster scope). An allowed scope already
-//     covers every item a correct copy holds — a cluster grant covers every
-//     namespace, a namespace grant covers that namespace's partition — so this
-//     step only drops an item that does not belong to the request's scope.
-//     It evaluates EVERY item's namespace, the request's own included (#963
-//     F1), so it is a real backstop: a wrong allow in step 1 cannot serve an
-//     item step 2 would refuse.
+//     requester may read through this same request moved to each item's own
+//     coordinates — its namespace (cluster-scoped items, namespace "", against
+//     the cluster scope) and, when the request names an object, its name. An
+//     allowed scope already covers every item a correct copy holds — a cluster
+//     grant covers every namespace, a namespace grant covers that namespace's
+//     partition, and a name-selected list holds only that name — so this step
+//     only drops an item that does not belong to the request's scope. It
+//     evaluates EVERY item, the request's own namespace included (#963 F1),
+//     so it is a real backstop: a wrong allow in step 1 cannot serve an item
+//     step 2 would refuse.
 //     "What this requester may see across namespaces" is userAccessFilter's
 //     job, never a cluster-wide list's.
 //
@@ -121,14 +128,15 @@ func newListForbidden(gvr schema.GroupVersionResource, namespace string) error {
 //     error): do not serve, fall through to the
 //     apiserver. An absent identity never yields an unfiltered partition.
 //
-// gvr supplies the API group + resource for the EvaluateRBAC tuple. The
-// verb is fixed "list" — this is the served-LIST branch.
+// gvr supplies the API group + resource for the EvaluateRBAC tuple. The verb
+// is the request's (rbac.CollectionRead): list, since a watch query is never
+// served here (it falls through to the apiserver, list_query.go).
 //
 // Per-item EvaluateRBAC errors fail closed (item dropped) — see file header.
 func filterListByRBAC(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,
-	namespace string,
+	namespace, rawQuery string,
 	items []*unstructured.Unstructured,
 ) ([]*unstructured.Unstructured, error) {
 	log := xcontext.Logger(ctx)
@@ -149,8 +157,12 @@ func filterListByRBAC(
 		return nil, errGateFallthrough
 	}
 
-	// Step 1 — scope (#961).
-	allowed, decided := listScopeAllowed(ctx, user.Username, user.Groups, gvr, namespace)
+	// Step 1 — scope (#961), on the request's own check (#1049).
+	scope := rbac.CollectionCheck(user.Username, user.Groups, gvr, namespace, rawQuery)
+	// Ship L1 (0.30.252): the gate discards matchedBindingUID — skip the
+	// CRB/RB stable-sort.
+	scope.SkipBindingUID = true
+	allowed, decided := listScopeAllowed(ctx, scope)
 	if !decided {
 		return nil, errGateFallthrough
 	}
@@ -164,24 +176,20 @@ func filterListByRBAC(
 		return nil, newListForbidden(gvr, namespace)
 	}
 
-	// 0.30.111 Part 3 — namespace-keyed EvaluateRBAC memo. The verb is
-	// fixed "list"; for the plain collection URL this filter serves, a
-	// `list` decision is NAMESPACE-scoped and NAME-INDEPENDENT: Kubernetes'
-	// ResourceNameMatches ignores the verb and compares rule.ResourceNames
-	// with the request's Name, and a plain collection URL names no object
-	// (Name ""), so no resourceNames rule can grant it. (A list with
-	// `fieldSelector=metadata.name=` DOES carry a Name upstream; that shape
-	// is not modelled here and is over-denied, tracked separately.) So
-	// every item in the same namespace yields the identical permit/deny
-	// verdict. The memo turns
-	// an N-item LIST spanning K distinct namespaces into K EvaluateRBAC
-	// calls instead of N.
+	// 0.30.111 Part 3 — coordinate-keyed EvaluateRBAC memo. Each item is
+	// evaluated on the scope check moved to the item's coordinates
+	// (itemCheck): its namespace, and its name only when the request carries
+	// a Name. A request without a name selector carries Name "" (Kubernetes'
+	// ResourceNameMatches compares rule.ResourceNames with the request's Name,
+	// and a plain collection URL names no object), so its decision is
+	// NAMESPACE-scoped and every item of a namespace shares one verdict; a
+	// name-selected request holds only items of that name (#1049), so it is
+	// one verdict per namespace too. The memo turns an N-item LIST spanning K
+	// distinct namespaces into K EvaluateRBAC calls instead of N.
 	//
-	// AC-6 (PM gate #113): the memoized call DROPS Name. For verb:"list"
-	// Name is inert at the evaluator (a resourceNames rule cannot grant a
-	// list), and omitting it makes the namespace-keyed memo correct BY
-	// CONSTRUCTION — two same-namespace items with different names cannot
-	// diverge because Name never enters the evaluated tuple.
+	// AC-6 (PM gate #113): the memo key IS the evaluated tuple's variable
+	// part (namespace, name), so it is correct BY CONSTRUCTION — two items
+	// share an entry only if they share the evaluated check.
 	//
 	// rbacMemo is a LOCAL variable scoped to this single filterListByRBAC
 	// invocation — never a struct field, never package-scoped. It is
@@ -195,7 +203,7 @@ func filterListByRBAC(
 	// allowed) served every item of the request's namespace unchecked; the
 	// cost of not seeding is one EvaluateRBAC per request namespace present
 	// in the items.
-	rbacMemo := make(map[string]bool, len(items))
+	rbacMemo := make(map[itemCoord]bool, len(items))
 
 	kept := make([]*unstructured.Unstructured, 0, len(items))
 	dropped := 0
@@ -207,25 +215,14 @@ func filterListByRBAC(
 			dropped++
 			continue
 		}
-		ns := it.GetNamespace()
-		allowed, memoized := rbacMemo[ns]
+		check := itemCheck(scope, it)
+		coord := itemCoord{namespace: check.Namespace, name: check.Name}
+		ns := check.Namespace
+		allowed, memoized := rbacMemo[coord]
 		if !memoized {
-			// Verb is "list" — Name is deliberately omitted (AC-6): it is
-			// inert for a collection verb and dropping it keeps the
-			// namespace-keyed memo sound.
 			// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
-			// ignores matchedBindingUID.
-			ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-				Username:  user.Username,
-				Groups:    user.Groups,
-				Verb:      "list",
-				Group:     gvr.Group,
-				Resource:  gvr.Resource,
-				Namespace: ns,
-				// Ship L1 (0.30.252): per-item caller discards
-				// matchedBindingUID — skip the CRB/RB stable-sort.
-				SkipBindingUID: true,
-			})
+			// ignores matchedBindingUID (SkipBindingUID, set on scope).
+			ok, _, err := rbac.EvaluateRBAC(ctx, check)
 			if err != nil {
 				// FAIL-CLOSED: an evaluator hiccup never permits a leak.
 				// The error is NOT memoized — a transient evaluator
@@ -243,7 +240,7 @@ func filterListByRBAC(
 				continue
 			}
 			allowed = ok
-			rbacMemo[ns] = ok
+			rbacMemo[coord] = ok
 		}
 		if allowed {
 			kept = append(kept, it)
@@ -266,9 +263,10 @@ func filterListByRBAC(
 	return kept, nil
 }
 
-// listScopeAllowed reports whether the requester may `list` gvr at the scope
-// of a LIST of namespace (#961), exactly as the apiserver authorizes the same
-// request — one EvaluateRBAC at the request's own scope:
+// listScopeAllowed reports whether the requester may make the LIST whose check
+// is scope (#961) — rbac.CollectionCheck of the request's gvr, namespace and
+// query — exactly as the apiserver authorizes the same request: one
+// EvaluateRBAC at the request's own scope:
 //
 //   - a namespaced LIST (namespace != ""): a ClusterRoleBinding, or a
 //     RoleBinding in that namespace;
@@ -277,30 +275,45 @@ func filterListByRBAC(
 //     a requester holding only namespace grants gets the apiserver's 403, and a
 //     view across the namespaces it may read is what userAccessFilter is for.
 //
+// A rule with resourceNames grants the request only when the request carries
+// one of those names, i.e. its `fieldSelector` requires `metadata.name=` one
+// of them (#1049).
+//
 // decided is false when the evaluator errors: the gate then falls through to
 // the apiserver rather than guess.
-func listScopeAllowed(ctx context.Context, username string, groups []string, gvr schema.GroupVersionResource, namespace string) (allowed, decided bool) {
-	ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:       username,
-		Groups:         groups,
-		Verb:           "list",
-		Group:          gvr.Group,
-		Resource:       gvr.Resource,
-		Namespace:      namespace,
-		SkipBindingUID: true,
-	})
+func listScopeAllowed(ctx context.Context, scope rbac.EvaluateOptions) (allowed, decided bool) {
+	ok, _, err := rbac.EvaluateRBAC(ctx, scope)
 	if err != nil {
 		xcontext.Logger(ctx).Warn("informer_dispatch.rbac_filter.scope_undecided",
 			slog.String("subsystem", "cache"),
-			slog.String("user", redact.User(username)),
-			slog.String("gvr", gvr.String()),
-			slog.String("namespace", namespace),
+			slog.String("user", redact.User(scope.Username)),
+			slog.String("gvr", scope.Group+"/"+scope.Resource),
+			slog.String("namespace", scope.Namespace),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
 		return false, false
 	}
 	return ok, true
+}
+
+// itemCoord is the part of a per-item check that varies across a LIST's
+// items: the memo key of filterListByRBAC's step 2.
+type itemCoord struct{ namespace, name string }
+
+// itemCheck is the request's scope check moved to one item's coordinates
+// (filterListByRBAC step 2): the item's own namespace and — only when the
+// request carries a Name (a `fieldSelector=metadata.name=`, #1049) — the
+// item's own name. A request without a Name names no object, so its item
+// checks carry none either: a resourceNames rule must not grant through the
+// backstop a list the apiserver would refuse.
+func itemCheck(scope rbac.EvaluateOptions, it *unstructured.Unstructured) rbac.EvaluateOptions {
+	check := scope
+	check.Namespace = it.GetNamespace()
+	if scope.Name != "" {
+		check.Name = it.GetName()
+	}
+	return check
 }
 
 // filterGetByRBAC reports whether the context's user is authorized to

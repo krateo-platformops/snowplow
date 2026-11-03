@@ -1228,6 +1228,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerRUMIngestInstruments(m); err != nil { // #1015
 		return err
 	}
+	// #1054: slow calls are recorded whatever the cache mode (the expvar keys
+	// are published unconditionally), so their OTLP series are too.
+	if err := registerSlowCallInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).
@@ -1277,6 +1282,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 	if err := registerResolveCollectionListsInstrument(m); err != nil { // #988
+		return err
+	}
+	if err := registerRefreshCycleInstruments(m); err != nil { // #1070
 		return err
 	}
 	return registerSecurityInstruments(m)
@@ -1991,14 +1999,19 @@ func registerStaleServeInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	// #1062 — the apistage series of the every-layer stale-push ledger
+	// (registerStalePushInstruments records into it), kept under its #710 name
+	// for the bench: the same samples as snowplow_stale_to_push_ms{layer="apistage"}.
 	toPush, err := m.Int64Histogram("snowplow_apistage_stale_to_push_ms",
-		metric.WithDescription("Stale serve → the /refreshes push of the dependent customer cell (ms). The owner bar: p95 ≤ 3000, max ≤ 10000, target 1000. #710 PR-2b."),
+		metric.WithDescription("Stale serve → the replacing /refreshes frame WRITTEN to a stream armed for the customer cell (ms), apistage only: the same samples as snowplow_stale_to_push_ms{layer=\"apistage\"} (#1062). The owner bar: p95 ≤ 3000, max ≤ 10000, target 1000. #710 PR-2b."),
 		metric.WithUnit("ms"),
-		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.StaleToPushBoundsMS)...))
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(cache.StaleToPushBoundsMS)...))
 	if err != nil {
 		return err
 	}
-	restactionsapi.SetStaleToPushRecorder(func(ms int64) { toPush.Record(context.Background(), ms) })
+	if err := registerStalePushInstruments(m, toPush); err != nil {
+		return err
+	}
 	serveAge, err := m.Int64Histogram("snowplow_apistage_stale_serve_age_ms",
 		metric.WithDescription("Age of the content body a stale serve delivered: since the content cell's known-stale window opened (ms). #710 PR-2b."),
 		metric.WithUnit("ms"),

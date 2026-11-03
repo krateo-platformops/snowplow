@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -175,7 +176,10 @@ func jsonHandlerBytesApply(ctx context.Context, opts jsonHandlerOptions, dat []b
 	if len(bytes.TrimSpace(dat)) == 0 {
 		return jsonHandlerCore(ctx, opts, nil)
 	}
-	if err := json.Unmarshal(dat, &tmp); err != nil {
+	dec := slowcall.Start(ctx, slowcall.PhaseParse) // #1054: the stage body's decode
+	err := json.Unmarshal(dat, &tmp)
+	dec.End()
+	if err != nil {
 		return safeDecodeError(err)
 	}
 	return jsonHandlerCore(ctx, opts, tmp)
@@ -265,7 +269,11 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		// directly — no jqutil encode-to-string + json.Unmarshal-back
 		// round-trip (design §3.4.2). Behaviour byte-identical per the
 		// §3.4.2 truth table.
+		// #1054 — the stage filter's JQ, timed on the request (the eval keeps
+		// its context.TODO: timing it changes nothing it does).
+		jq := slowcall.Start(ctx, slowcall.PhaseJQ)
 		v, ok, err := EvalValue(context.TODO(), q, pig, jqsupport.ModuleLoader())
+		jq.End()
 		switch {
 		case errors.Is(err, ErrMultiYield):
 			// Current: multi-yield -> invalid concatenated JSON ->

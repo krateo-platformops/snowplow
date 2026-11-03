@@ -246,6 +246,11 @@ type refreshSub struct {
 
 	// subscribedAt feeds stream_seconds_total at unsub (C12).
 	subscribedAt time.Time
+	// subject (#1062) is the connection's authenticated user as the stale-push
+	// ledger keys a client (StaleSubject): a frame written here closes only
+	// that user's stale serves. In memory only; never logged. "" for the
+	// in-process falsifiers' streams (SubscribeRefreshStream).
+	subject string
 
 	// C10 eviction pacing, all guarded by pmu (lock order: hub.mu -> pmu).
 	pmu     sync.Mutex
@@ -273,6 +278,12 @@ type refreshSub struct {
 	// on reconnect).
 	resynced bool
 	resync   chan struct{}
+
+	// owed (#1070, measurement only; guarded by pmu): per key, the earliest
+	// refresh Put an offer announced that no frame written on this stream has
+	// answered yet. The next written frame for the key records put_to_frame
+	// (frameWritten). Subset of keys; nil after close or resync.
+	owed map[string]refreshOwed
 
 	// per-connection attribution (C12), read by RefreshSubSnapshotForTest.
 	delivered     atomic.Uint64
@@ -311,6 +322,9 @@ type refreshBroadcaster struct {
 type coalesceWindow struct {
 	timer      *time.Timer
 	suppressed bool
+	// owed (#1070, measurement only) is the earliest refresh Put a suppressed
+	// signal announced: the trailing emit is timed from it (put_to_frame).
+	owed refreshOwed
 }
 
 var (
@@ -380,7 +394,7 @@ func (h *refreshBroadcaster) disarmLocked(s *refreshSub, l1Key string) {
 // disables coalescing entirely (always false), and a key nobody is armed for
 // gets no window (there is no fan-out to bound and nobody to owe a trailing
 // emit to), so live windows <= armed keys. Design §2.3.
-func (h *refreshBroadcaster) coalesced(l1Key string) bool {
+func (h *refreshBroadcaster) coalesced(l1Key string, owed refreshOwed) bool {
 	win := refreshCoalesceWindowFn()
 	if win <= 0 {
 		return false
@@ -398,6 +412,9 @@ func (h *refreshBroadcaster) coalesced(l1Key string) bool {
 	}
 	if w := h.windows[l1Key]; w != nil {
 		w.suppressed = true
+		if owed.earlier(w.owed) {
+			w.owed = owed // #1070
+		}
 		return true
 	}
 	w := &coalesceWindow{}
@@ -424,6 +441,8 @@ func (h *refreshBroadcaster) windowEnd(l1Key string, w *coalesceWindow) {
 		return
 	}
 	w.suppressed = false
+	owed := w.owed // #1070: the trailing emit announces the earliest suppressed Put
+	w.owed = refreshOwed{}
 	if win := refreshCoalesceWindowFn(); win > 0 {
 		w.timer = time.AfterFunc(win, func() { h.windowEnd(l1Key, w) })
 	} else {
@@ -431,7 +450,7 @@ func (h *refreshBroadcaster) windowEnd(l1Key string, w *coalesceWindow) {
 	}
 	h.cmu.Unlock()
 	refreshTrailingEmittedTotal.Add(1)
-	h.fanoutRefresh(l1Key) // no cmu held: lock order h.mu -> cmu
+	h.fanoutRefresh(l1Key, owed) // no cmu held: lock order h.mu -> cmu
 }
 
 // stopWindow tears l1Key's coalesce window down (timer stopped; a fire
@@ -458,16 +477,21 @@ func (h *refreshBroadcaster) stopWindow(l1Key string) {
 // publishIfSubscribed. NOT paced: a refresher-driven refetch is an L1 HIT
 // (feedback_customer_priority_over_refresher — pacing the eviction path must
 // never slow this one).
-func PublishRefresh(l1Key string) {
+func PublishRefresh(l1Key string) { publishRefresh(l1Key, refreshOwed{}) }
+
+// publishRefresh is PublishRefresh carrying the refresh Put the signal
+// announces (zero: none), for put_to_frame (#1070, measurement only; the
+// signal itself is the same either way).
+func publishRefresh(l1Key string, owed refreshOwed) {
 	h := refreshHub()
 	if h == nil {
 		return // disabled / cache-off — transparent no-op
 	}
-	if h.coalesced(l1Key) {
+	if h.coalesced(l1Key, owed) {
 		refreshCoalescedTotal.Add(1)
 		return
 	}
-	h.fanoutRefresh(l1Key)
+	h.fanoutRefresh(l1Key, owed)
 }
 
 // fanoutRefresh offers l1Key to every subscriber armed for it. C11: visit
@@ -476,12 +500,12 @@ func PublishRefresh(l1Key string) {
 // absolute count of subscribers examined, which an O(|subs|) loop cannot keep
 // small. Holds only the RLock (+ each sub's pmu, briefly); no I/O and no
 // blocking send.
-func (h *refreshBroadcaster) fanoutRefresh(l1Key string) {
+func (h *refreshBroadcaster) fanoutRefresh(l1Key string, owed refreshOwed) {
 	h.mu.RLock()
 	offered := 0
 	for _, s := range h.keySubs[l1Key] {
 		fanoutVisitsForTest.Add(1)
-		s.offerRefresh(l1Key)
+		s.offerRefresh(l1Key, owed)
 		offered++
 	}
 	h.mu.RUnlock()
@@ -497,17 +521,21 @@ func (h *refreshBroadcaster) fanoutRefresh(l1Key string) {
 // frame per key per backlog. Caller holds h.mu (read); takes s.pmu (lock
 // order h.mu -> s.pmu). The send is non-blocking, so pmu is never held
 // across a blocking operation.
-func (s *refreshSub) offerRefresh(l1Key string) {
+func (s *refreshSub) offerRefresh(l1Key string, owed refreshOwed) {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	s.offerRefreshLocked(l1Key)
+	s.offerRefreshLocked(l1Key, owed)
 }
 
-// offerRefreshLocked is offerRefresh's body. Caller holds s.pmu.
-func (s *refreshSub) offerRefreshLocked(l1Key string) {
+// offerRefreshLocked is offerRefresh's body. Caller holds s.pmu. owed is the
+// refresh Put this offer announces (zero: none); the stream's next frame for
+// the key is timed from the earliest one (#1070, measurement only), whichever
+// path below carries the frame.
+func (s *refreshSub) offerRefreshLocked(l1Key string, owed refreshOwed) {
 	if s.closed || s.resynced {
 		return
 	}
+	s.noteOwedLocked(l1Key, owed)
 	_, rdup := s.rpending[l1Key]
 	_, edup := s.pending[l1Key]
 	if rdup || edup {
@@ -613,6 +641,7 @@ func (s *refreshSub) forceResyncLocked() {
 	s.rorder = nil
 	s.pending = nil
 	s.order = nil
+	s.owed = nil // #1070: a resync frame is no refresh frame; nothing is timed
 	close(s.resync)
 	refreshPendingOverflowResyncTotal.Add(1)
 }
@@ -809,14 +838,16 @@ type RefreshStream struct {
 	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
 	// ledger that a frame was WRITTEN to this stream — called by the handler
 	// after its writeFrame returned true, with no lock held. An offer is not a
-	// write: only these close a ledger entry as pushed.
+	// write: only these close a ledger entry as pushed. #1062: they also close
+	// the replaced stale serves of the key (stale_push.go), the end of
+	// stale_to_push_ms for every layer.
 	Wrote       func(key string)
 	WroteResync func()
 }
 
 // SubscribeRefresh is SubscribeRefreshStream without the resync channel —
 // the shape the in-process falsifiers read. The /refreshes handler uses
-// SubscribeRefreshStream.
+// SubscribeRefreshStreamAs.
 func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 	st := SubscribeRefreshStream(armedKeys)
 	return st.Keys, st.Unsub
@@ -829,7 +860,17 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 // When the layer is disabled it returns a closed Keys channel, a nil Resync
 // (never fires) and a no-op unsub, so the handler degrades to a clean idle
 // stream (transparent fallback).
+//
+// It is SubscribeRefreshStreamAs with no subject: the in-process falsifiers'
+// stream. The /refreshes handler subscribes AS its authenticated user.
 func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
+	return SubscribeRefreshStreamAs("", armedKeys)
+}
+
+// SubscribeRefreshStreamAs is SubscribeRefreshStream for the connection of
+// subject (StaleSubject of the authenticated username, #1062): the stale-push
+// ledger pairs a frame written on this stream only with that user's serves.
+func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) RefreshStream {
 	h := refreshHub()
 	if h == nil {
 		ch := make(chan string)
@@ -843,6 +884,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		keys:         make(map[string]struct{}, len(armedKeys)),
 		ch:           make(chan string, refreshSubChanCap),
 		subscribedAt: time.Now(),
+		subject:      subject,
 		limiter:      rate.NewLimiter(limit, burst),
 		pending:      map[string]struct{}{},
 		rpending:     map[string]struct{}{},
@@ -865,7 +907,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 			continue
 		}
 		h.mu.RLock()
-		s.offerRefresh(k)
+		s.offerRefresh(k, refreshOwed{})
 		h.mu.RUnlock()
 		noteStaleOwedArmEmit(k)
 	}
@@ -877,7 +919,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 	for _, k := range ledgerArmed(armedKeys) {
 		onArm[k] = struct{}{}
 		h.mu.RLock()
-		s.offerRefresh(k)
+		s.offerRefresh(k, refreshOwed{})
 		h.mu.RUnlock()
 	}
 	// #740 — an arm of a dependent resumes an abandoned stale-retry chain with an
@@ -917,8 +959,13 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
+			s.frameWritten(k)                 // #1070: put_to_frame, on the same write point
+			stalePushFrameWritten(k, subject) // #1062 — the replacing frame reached this client's stream
 		},
-		WroteResync: func() { ledgerResyncWritten(armedCopy) },
+		WroteResync: func() {
+			ledgerResyncWritten(armedCopy)
+			stalePushResyncWritten(armedCopy, subject) // #1062
+		},
 	}
 }
 
@@ -952,7 +999,7 @@ func (s *refreshSub) offerRotated(keys []string) {
 		}
 		s.pmu.Lock()
 		delete(s.pending, k) // drainEvictions / trySendDeferred skip a key no longer pending
-		s.offerRefreshLocked(k)
+		s.offerRefreshLocked(k, refreshOwed{})
 		s.pmu.Unlock()
 		refreshRotationAnnouncedTotal.Add(1)
 	}
@@ -972,6 +1019,7 @@ func (s *refreshSub) close() {
 	s.order = nil
 	s.rpending = nil
 	s.rorder = nil
+	s.owed = nil // #1070
 	close(s.done)
 	s.pmu.Unlock()
 	refreshStreamNanosTotal.Add(time.Since(s.subscribedAt).Nanoseconds())
@@ -1024,6 +1072,24 @@ func HasRefreshSubscriber(l1Key string) bool {
 	n := len(h.keySubs[l1Key])
 	h.mu.RUnlock()
 	return n > 0
+}
+
+// HasRefreshSubscriberAs reports whether >=1 connection of subject is armed
+// for l1Key (#1062: the stale-push overdue scan asks it per client). O(armed
+// connections for the key) under RLock. Nil-safe: no hub -> false.
+func HasRefreshSubscriberAs(l1Key, subject string) bool {
+	h := refreshHub()
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, s := range h.keySubs[l1Key] {
+		if s.subject == subject {
+			return true
+		}
+	}
+	return false
 }
 
 // RefreshSubscriberCount returns the current number of live /refreshes

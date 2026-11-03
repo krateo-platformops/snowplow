@@ -95,6 +95,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 )
 
 // contentFillReason is why a reader entered the content fill.
@@ -418,11 +419,17 @@ func beginContentFill(ctx context.Context, key, gvr, namespace string, isList bo
 // closed-enum reason and a RESTAction namespace/name — no identity.
 func (f *contentFill) pprofLabels() pprof.LabelSet {
 	return pprof.Labels(
-		"apistage_fill_gvr", f.gvr,
-		"apistage_fill_reason", f.reason.String(),
+		fillLabelGVR, f.gvr,
+		fillLabelReason, f.reason.String(),
 		"apistage_fill_ra", f.owner.ra,
 	)
 }
+
+// The fill label keys a slow-call goroutine snapshot keeps (#1054).
+const (
+	fillLabelGVR    = "apistage_fill_gvr"
+	fillLabelReason = "apistage_fill_reason"
+)
 
 // dispatched records the raw envelope the fill's dispatch produced.
 func (f *contentFill) dispatched(raw []byte) {
@@ -807,6 +814,10 @@ func RecordContentFillDurationForTest(ms int64) { recordContentFillDuration(ms) 
 var contentFillExpvarOnce sync.Once
 
 func init() {
+	// #1054 — a slow call's goroutine snapshot keeps a fill's GVR and reason
+	// labels (identity-free, see pprofLabels) so a stack names the fill it
+	// serves; the RESTAction label stays out.
+	slowcall.AllowStackLabels(fillLabelGVR, fillLabelReason)
 	if cache.Disabled() {
 		return
 	}

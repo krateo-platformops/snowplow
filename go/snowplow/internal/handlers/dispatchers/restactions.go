@@ -17,6 +17,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -255,7 +256,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -305,7 +306,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			setStoredStageOutcomesHeader(wri, entry) // #904
-			staleHitWritePoint(cacheKey, entry)      // #710 PR-2b
+			// #710 PR-2b; #1062 — armed (the header above), for this requester.
+			staleHitWritePoint(cacheKey, entry, true, staleSubjectOf(req.Context()))
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -380,7 +382,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// resolve may be served a KNOWN-STALE content cell at once (D2, "show then
 		// replace"); the sink carries the fact to the Put below (StaleDerived) and
 		// the content layer's debt pushes this key once the fresh value lands.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
 	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
@@ -507,7 +509,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// bytes for the next lookup. Sharing the same []byte between the
 	// http.ResponseWriter write path and the cache entry is safe
 	// because the cache treats RawJSON as immutable once put.
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
 		log.Error("unable to encode rest action response",
 			slog.String("name", cr.Name),
