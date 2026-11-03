@@ -14,7 +14,7 @@ import (
 
 func TestPreDispatch401_1076_TheCauseSetIsClosed(t *testing.T) {
 	want := map[string]string{
-		"TokenMissing":             `Bearer error="invalid_token"`,
+		"TokenMissing":             `Bearer`,
 		"TokenInvalid":             `Bearer error="invalid_token"`,
 		"TokenExpired":             `Bearer error="invalid_token"`,
 		"SessionCredentialMissing": `Bearer error="invalid_token"`,
@@ -38,8 +38,8 @@ func TestPreDispatch401_1076_TheCauseSetIsClosed(t *testing.T) {
 		rec := httptest.NewRecorder()
 		_ = preDispatchUnauthorized(rec, k, errors.New("m"))
 		if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"details":{"causes":[{"reason":"`+k+`",`) ||
-			rec.Header().Get("WWW-Authenticate") != want[k] {
-			t.Fatalf("%s: code=%d hdr=%q body=%s", k, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String())
+			rec.Result().Header.Get("WWW-Authenticate") != want[k] {
+			t.Fatalf("%s: code=%d hdr=%q body=%s", k, rec.Code, rec.Result().Header.Get("WWW-Authenticate"), rec.Body.String())
 		}
 	}
 }

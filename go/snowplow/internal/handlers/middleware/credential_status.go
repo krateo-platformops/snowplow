@@ -22,14 +22,17 @@
 //     NOTHING was dispatched — no apiserver call, no RESTAction stage, no
 //     write;
 //   - a 401 snowplow RELAYS (a raw /call passthrough's apiserver answer, a
-//     RESTAction stage's upstream status) is written through plumbing's
+//     RESTAction stage's or a widget dependency's upstream status, an export's
+//     inner /call failure) is written through plumbing's
 //     response.Status, which has no Details field, so it never carries a
 //     cause, whatever the upstream body said;
 //   - the challenge header: StepUpRequired sends the RFC 9470 challenge
 //     `Bearer error="insufficient_user_authentication"` (no acr_values:
-//     krateo:loa:2 is authn's group, not an IdP ACR value); every other cause
-//     sends the RFC 6750 `Bearer error="invalid_token"`. The header is an
-//     optional signal; the body is the contract.
+//     krateo:loa:2 is authn's group, not an IdP ACR value); TokenMissing sends
+//     a bare `Bearer` (RFC 6750 §3.1: a request with no authentication
+//     information gets no error code); every other cause sends the RFC 6750
+//     `Bearer error="invalid_token"`. The header is an optional signal; the
+//     body is the contract.
 //
 // Each cause is chosen from what the middleware itself established — whether a
 // token was presented, jwtutil's typed validation error, the validated
@@ -59,8 +62,8 @@ import (
 // here.
 const (
 	// CauseTokenMissing — no bearer token was presented: no Authorization
-	// header, or one whose scheme is not Bearer (and, on RefreshAuth's routes,
-	// no session cookie either).
+	// header, one whose scheme is not Bearer, or `Bearer ` with an empty token
+	// (and, on RefreshAuth's routes, no session cookie either).
 	CauseTokenMissing = "TokenMissing"
 	// CauseTokenInvalid — the bearer token failed validation: malformed, bad
 	// signature, wrong algorithm (jwtutil.ErrTokenInvalid).
@@ -80,9 +83,15 @@ const (
 // max_age (both optional in RFC 9470).
 const stepUpChallenge = `Bearer error="insufficient_user_authentication"`
 
-// invalidTokenChallenge is the RFC 6750 §3.1 challenge: the access token
-// presented (or missing) cannot be used; obtain a new one.
+// invalidTokenChallenge is the RFC 6750 §3.1 challenge for a token that was
+// presented and cannot be used: obtain a new one.
 const invalidTokenChallenge = `Bearer error="invalid_token"`
+
+// bareBearerChallenge is the RFC 6750 §3.1 challenge for a request that
+// carried no bearer token at all: the scheme, with no error code ("the
+// resource server SHOULD NOT include an error code or other error
+// information").
+const bareBearerChallenge = `Bearer`
 
 // preDispatchCause is one entry of the closed set: its fixed human sentence
 // (no identity in it) and the challenge it sends.
@@ -94,7 +103,7 @@ type preDispatchCause struct {
 // preDispatchCauses IS the closed set. preDispatchUnauthorized refuses any
 // cause that is not a key here.
 var preDispatchCauses = map[string]preDispatchCause{
-	CauseTokenMissing:             {"no bearer token was presented; log in", invalidTokenChallenge},
+	CauseTokenMissing:             {"no bearer token was presented; log in", bareBearerChallenge},
 	CauseTokenInvalid:             {"the bearer token is not valid; log in again", invalidTokenChallenge},
 	CauseTokenExpired:             {"the bearer token has expired; log in again", invalidTokenChallenge},
 	CauseSessionCredentialMissing: {"the session credential is missing; log in again", invalidTokenChallenge},

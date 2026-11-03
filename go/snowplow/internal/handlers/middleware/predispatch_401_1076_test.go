@@ -34,7 +34,14 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
-const p1076InvalidToken = `Bearer error="invalid_token"`
+// p1076Challenge is the challenge each token cause sends, as literals: a bare
+// `Bearer` when no token was presented (RFC 6750 §3.1: no error code), the
+// invalid_token challenge for a token that was presented and refused.
+var p1076Challenge = map[string]string{
+	"TokenMissing": `Bearer`,
+	"TokenInvalid": `Bearer error="invalid_token"`,
+	"TokenExpired": `Bearer error="invalid_token"`,
+}
 
 // p1076Sentence is the fixed human sentence each token cause carries, as
 // literals.
@@ -64,9 +71,11 @@ func p1076Serve(mw func(http.Handler) http.Handler, req *http.Request) (*httptes
 }
 
 // p1076AssertCause: a 401 that did not reach the handler, carrying exactly the
-// cause, the invalid_token challenge, plumbing's Content-Type and no other
-// header, and a body that a plumbing response.Status reader decodes to the
-// same six fields.
+// cause, its challenge, plumbing's Content-Type and no other header, and a
+// body that a plumbing response.Status reader decodes to the same six fields.
+// Headers are read from rec.Result(), i.e. what was WRITTEN with the status
+// line: a header set after WriteHeader never reaches a real client, and the
+// recorder's live Header() map would still show it.
 func p1076AssertCause(t *testing.T, rec *httptest.ResponseRecorder, reached bool, plumbingBody, reason string) {
 	t.Helper()
 	if reached || rec.Code != http.StatusUnauthorized {
@@ -75,11 +84,11 @@ func p1076AssertCause(t *testing.T, rec *httptest.ResponseRecorder, reached bool
 	if got, want := rec.Body.String(), p1076Want(plumbingBody, reason); got != want {
 		t.Fatalf("body:\n got  %q\n want %q", got, want)
 	}
-	if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != p1076InvalidToken {
-		t.Fatalf("WWW-Authenticate = %q, want exactly [%q]", got, p1076InvalidToken)
+	if got := rec.Result().Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != p1076Challenge[reason] {
+		t.Fatalf("WWW-Authenticate (as written) = %q, want exactly [%q]", got, p1076Challenge[reason])
 	}
-	if rec.Header().Get("Content-Type") != "application/json" || len(rec.Header()) != 2 {
-		t.Fatalf("headers = %v, want Content-Type + WWW-Authenticate only", rec.Header())
+	if rec.Result().Header.Get("Content-Type") != "application/json" || len(rec.Result().Header) != 2 {
+		t.Fatalf("headers = %v, want Content-Type + WWW-Authenticate only", rec.Result().Header)
 	}
 	var asPlumbing, plumbing response.Status
 	if err := json.Unmarshal(rec.Body.Bytes(), &asPlumbing); err != nil {
@@ -132,7 +141,10 @@ func TestPreDispatch401_1076_UserConfigTokenCauses(t *testing.T) {
 		{"Basic scheme", withAuthz("Basic dXNlcjpwYXNz"), "TokenMissing"},
 		{"no space", withAuthz("BearerToken123"), "TokenMissing"},
 		{"garbage bearer", withAuthz("Bearer not.a.real.jwt"), "TokenInvalid"},
-		{"empty bearer", withAuthz("Bearer "), "TokenInvalid"},
+		// An empty bearer presents no token: TokenMissing, as on RefreshAuth
+		// (the message stays upstream's, which the comparison pins).
+		{"empty bearer", withAuthz("Bearer "), "TokenMissing"},
+		{"whitespace bearer", withAuthz("Bearer  "), "TokenInvalid"},
 		{"wrong signing key", func(t *testing.T) *http.Request {
 			return withAuthz("Bearer " + p1076OtherKeyToken(t, testKeyID, time.Hour))(t)
 		}, "TokenInvalid"},
@@ -186,6 +198,7 @@ func TestPreDispatch401_1076_RefreshAuthTokenCauses(t *testing.T) {
 	}{
 		{"no header, no cookie", req("", ""), "missing credentials: no bearer header or session cookie", "TokenMissing"},
 		{"Basic header, no cookie", req("Basic dXNlcjpwYXNz", ""), "missing credentials: no bearer header or session cookie", "TokenMissing"},
+		{"empty bearer, no cookie", req("Bearer ", ""), "missing credentials: no bearer header or session cookie", "TokenMissing"},
 		{"garbage bearer", req("Bearer not.a.real.jwt", ""), "token is invalid", "TokenInvalid"},
 		{"garbage cookie", req("", "not.a.real.jwt"), "token is invalid", "TokenInvalid"},
 		{"wrong signing key", func(t *testing.T) *http.Request {

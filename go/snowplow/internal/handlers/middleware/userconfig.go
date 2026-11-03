@@ -189,6 +189,15 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				return
 			}
 
+			// #1076 — `Bearer ` with an empty token presents no token either:
+			// TokenMissing, as RefreshAuth treats an empty bearer. Upstream
+			// hands "" to the validator, which answers ErrTokenInvalid; the
+			// message (one of the six plumbing fields) stays upstream's.
+			if parts[1] == "" {
+				tokenMissing(wri, jwtutil.ErrTokenInvalid)
+				return
+			}
+
 			// Upstream :34-42 — jwtutil.ValidateWithKeySource. Upstream answers
 			// the expired and the generic-invalid branch alike with a plain
 			// Unauthorized. #1076 — snowplow keeps that 401, its six Status

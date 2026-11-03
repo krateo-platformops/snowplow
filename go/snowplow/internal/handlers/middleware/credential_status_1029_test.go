@@ -81,7 +81,7 @@ func c1029AssertPlumbingCompatible(t *testing.T, rec *httptest.ResponseRecorder,
 	if !strings.HasPrefix(rec.Body.String(), prefix+`,"details":{"causes":[`) {
 		t.Fatalf("the plumbing fields are not byte-compatible:\n got  %s\n want %s,\"details\":...", rec.Body.String(), prefix)
 	}
-	if got := rec.Header().Get("Content-Type"); got != want.Header().Get("Content-Type") {
+	if got := rec.Result().Header.Get("Content-Type"); got != want.Header().Get("Content-Type") {
 		t.Fatalf("Content-Type = %q, want plumbing's %q", got, want.Header().Get("Content-Type"))
 	}
 	var asPlumbing response.Status
@@ -108,10 +108,10 @@ func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
 	if b.Details == nil || len(b.Details.Causes) != 1 || b.Details.Causes[0].Reason != "StepUpRequired" {
 		t.Fatalf("want details.causes[0].reason=StepUpRequired; body=%s", rec.Body.String())
 	}
-	if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != c1029Challenge {
+	if got := rec.Result().Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != c1029Challenge {
 		t.Fatalf("WWW-Authenticate = %q, want exactly [%q]", got, c1029Challenge)
 	}
-	if strings.Contains(rec.Header().Get("WWW-Authenticate"), "acr_values") {
+	if strings.Contains(rec.Result().Header.Get("WWW-Authenticate"), "acr_values") {
 		t.Fatal("the challenge must not carry acr_values (krateo:loa:2 is not an IdP ACR value)")
 	}
 	if !strings.Contains(b.Message, "not found") {
@@ -137,7 +137,7 @@ func TestCredentialStatus1029_SessionMissingIsSessionCredentialMissing(t *testin
 	if b.Details == nil || len(b.Details.Causes) != 1 || b.Details.Causes[0].Reason != "SessionCredentialMissing" {
 		t.Fatalf("want details.causes[0].reason=SessionCredentialMissing; body=%s", rec.Body.String())
 	}
-	if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != `Bearer error="invalid_token"` {
+	if got := rec.Result().Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != `Bearer error="invalid_token"` {
 		t.Fatalf("the session case must send exactly the invalid_token challenge (#1076); got %q", got)
 	}
 	if strings.Contains(rec.Body.String(), "StepUpRequired") {
@@ -296,12 +296,12 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			if got, want := rec.Body.String(), sub(ex.body)+"\n"; got != want {
 				t.Fatalf("body differs from doc:\n got  %q\n want %q", got, want)
 			}
-			if len(ex.headers) != len(rec.Header()) {
-				t.Fatalf("doc headers %q, wire headers %v", ex.headers, rec.Header())
+			if len(ex.headers) != len(rec.Result().Header) {
+				t.Fatalf("doc headers %q, wire headers %v", ex.headers, rec.Result().Header)
 			}
 			for _, h := range ex.headers {
 				k, v, _ := strings.Cut(h, ": ")
-				if got := rec.Header().Values(k); len(got) != 1 || got[0] != v {
+				if got := rec.Result().Header.Values(k); len(got) != 1 || got[0] != v {
 					t.Fatalf("header %q: doc %q wire %q", k, v, got)
 				}
 			}
@@ -319,9 +319,9 @@ func TestCredentialStatus1029_NearMissGroupIsSessionCause(t *testing.T) {
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, g))
 			if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"reason":"SessionCredentialMissing"`) ||
-				rec.Header().Get("WWW-Authenticate") != `Bearer error="invalid_token"` {
+				rec.Result().Header.Get("WWW-Authenticate") != `Bearer error="invalid_token"` {
 				t.Fatalf("group %q: want the session cause; code=%d hdr=%q body=%s",
-					g, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String())
+					g, rec.Code, rec.Result().Header.Get("WWW-Authenticate"), rec.Body.String())
 			}
 		})
 	}

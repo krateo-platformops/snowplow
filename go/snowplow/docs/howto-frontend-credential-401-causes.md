@@ -10,12 +10,13 @@ This guide is for a frontend session, and for any other client of snowplow
 
 The rule is short:
 
-- **A 401 with `details.causes[0].reason`** is a snowplow refusal **before
-  dispatch**. Nothing was sent upstream: no apiserver call, no RESTAction
-  stage, no write. The reason comes from a closed set of five (section 2).
-- **A 401 without `details`** was **relayed from upstream**. The request may
-  have been dispatched, and a write may already have happened. Do **not** drop
-  the token and replay the request on this 401 alone.
+- **A 401 whose `details.causes[0].reason` is one of the five in section 2**
+  is a snowplow refusal **before dispatch**. Nothing was sent upstream: no
+  apiserver call, no RESTAction stage, no write.
+- **Any other 401** (no `details`, or a reason outside the five) is one
+  snowplow does **not** vouch for. It may have been relayed from upstream
+  after the request was dispatched, and a write may already have happened. Do
+  **not** drop the token and replay the request on it.
 
 Everything below comes from the handler code:
 
@@ -34,8 +35,9 @@ The #1029 contract was agreed on that issue: authn emits its causes in
 body is the contract and the header is optional. #1076 extends the same shape
 to every pre-dispatch 401.
 
-The SPA references are to `frontend-draganddrop/frontend`,
-`ui/src/hooks/useCatchError.tsx`, as it is on the main checkout.
+The SPA references are to `frontend-draganddrop/frontend` main as of
+`9441551`, which includes frontend #562: `ui/src/utils/authFailureCause.ts`
+and `ui/src/hooks/useCatchError.tsx`.
 
 ## 1. Where the pre-dispatch 401s come from
 
@@ -92,7 +94,7 @@ Snowplow emits exactly these five reasons, and every one of them means
 
 | reason | emitted when | middleware | `WWW-Authenticate` | portal outcome |
 |---|---|---|---|---|
-| `TokenMissing` | no bearer token: no `Authorization` header, or one whose scheme is not `Bearer` (and, on `RefreshAuth` routes, no session cookie either) | both | `Bearer error="invalid_token"` | **log in** |
+| `TokenMissing` | no bearer token: no `Authorization` header, one whose scheme is not `Bearer`, or `Bearer ` with an empty token (and, on `RefreshAuth` routes, no session cookie either) | both | `Bearer` (no error code) | **log in** |
 | `TokenInvalid` | the token failed validation: malformed, bad signature, wrong algorithm | both | `Bearer error="invalid_token"` | **log in again** |
 | `TokenExpired` | the token is correctly signed but expired | both | `Bearer error="invalid_token"` | **log in again** (the session-resume flow) |
 | `SessionCredentialMissing` | a valid token without `krateo:loa:2`; its session credential Secret is missing | `UserConfig` | `Bearer error="invalid_token"` | **log in again** |
@@ -109,14 +111,21 @@ it). `alice` stands for the caller's username.
 ```http
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
-WWW-Authenticate: Bearer error="invalid_token"
+WWW-Authenticate: Bearer
 
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"missing authorization header","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"TokenMissing","message":"no bearer token was presented; log in"}]}}
 ```
 
-A non-Bearer header on `UserConfig` has the message `invalid authorization
-header format`. On `RefreshAuth` both cases have the message `missing
-credentials: no bearer header or session cookie`.
+The challenge is a bare `Bearer`: RFC 6750 §3.1 says a request that carried
+no authentication information gets no error code.
+
+The `message` field differs by case, and is not a contract:
+
+| case | `UserConfig` routes | `RefreshAuth` routes |
+|---|---|---|
+| no header | `missing authorization header` | `missing credentials: no bearer header or session cookie` |
+| a non-Bearer scheme | `invalid authorization header format` | `missing credentials: no bearer header or session cookie` |
+| `Bearer ` with an empty token | `token is invalid` (unchanged from before) | `missing credentials: no bearer header or session cookie` |
 
 ### 2b. TokenInvalid
 
@@ -182,8 +191,9 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 - **`message` is unchanged.** For the credential causes it still names the
   caller's own Secret (as before, and only ever sent to that caller). Do not
   parse it.
-- **The header is optional.** `Bearer error="invalid_token"` is the RFC 6750
-  challenge. `Bearer error="insufficient_user_authentication"` is the RFC 9470
+- **The header is optional.** A bare `Bearer` (no token presented) and
+  `Bearer error="invalid_token"` (a token presented and refused) are the RFC
+  6750 §3.1 challenges. `Bearer error="insufficient_user_authentication"` is the RFC 9470
   step-up challenge, with **no `acr_values`**: `krateo:loa:2` is authn's group,
   not an IdP ACR value. Portal behaviour must never depend on the header. Most
   401s reach `useCatchError`, which has no headers. Only `useWidgetQuery.ts`
@@ -195,30 +205,40 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
   `res.headers.get('WWW-Authenticate')`. That is fine, because nothing may
   depend on the header; the body carries the cause either way.
 
-## 3. A 401 without a cause: relayed from upstream
+## 3. A 401 without a snowplow cause: snowplow does not vouch that nothing was dispatched
 
-Snowplow relays an upstream 401 in two places. Both write plumbing's Status,
-which has no `details` field. So a relayed 401 **never** carries a cause or a
-`WWW-Authenticate` header, even when the upstream body or headers carry one
-(a snowplow test sends a forged cause and challenge from upstream and checks
-that both are dropped):
+A 401 with no `details`, or with a reason outside the five, is one snowplow
+does not vouch for. It may be an upstream 401 snowplow relayed, a route
+mounted without its auth middleware (no route is, today), or a hop in front
+of snowplow.
 
-- **A raw `/call` passthrough.** The apiserver answered 401 to the call
-  snowplow sent with the caller's credential. On a write, the call was sent
-  and audited before the 401 came back.
-- **A RESTAction stage.** A stage without `continueOnError` got a 401 from
-  upstream, and the filter needs that stage's value. The stage's 401 then
-  becomes the `/call`'s own 401 (#709). Earlier stages **have already run**,
-  including any write stage (a `POST` stage before it, for example).
+Snowplow relays an upstream 401 in four places. Each one writes plumbing's
+Status, which has no `details` field. So a relayed 401 **never** carries a
+cause or a `WWW-Authenticate` header, even when the upstream body or headers
+carry one. Snowplow tests send a forged cause and challenge from upstream on
+the first two paths and check that both are dropped. The relays are:
 
-A widget whose dependency answered 401 is answered the same way
-(`docs/howto-frontend-widget-dependency-status.md`): the dependency's 401,
-with no cause.
+- **A raw `/call` passthrough** (`internal/handlers/call.go`). The apiserver
+  answered 401 to the call snowplow sent with the caller's credential. On a
+  write, the call was sent and audited before the 401 came back.
+- **A RESTAction stage** (`internal/handlers/dispatchers/restactions.go`,
+  #709). A stage without `continueOnError` got a 401 from upstream, and the
+  filter needs that stage's value. The stage's 401 then becomes the `/call`'s
+  own 401. Earlier stages **have already run**, including any write stage (a
+  `POST` stage before it, for example).
+- **A widget dependency**
+  (`internal/handlers/dispatchers/widgets_resolve_error.go`;
+  `docs/howto-frontend-widget-dependency-status.md`). It answers with the
+  dependency's 401 and no cause.
+- **An export** (`passThroughCallFailure` in `internal/handlers/export.go`).
+  It passes through the inner `/call` lane's failure, and that lane runs
+  without the auth middleware, so its 401 can only be one of the relays
+  above.
 
 What this means for a client:
 
 - **Do not drop the token and replay** the request because of a 401 without a
-  cause. On a write, a replay can send the write twice.
+  snowplow cause. On a write, a replay can send the write twice.
 - The portal may keep its current handling of such a 401 (the session-resume
   flow). That flow re-authenticates; it must not re-send the failed write by
   itself.
@@ -248,9 +268,11 @@ What this means for a client:
     earlier stages have already run.
 
   The next request gets the pre-dispatch 401 with its cause.
-- **An unknown `causes[0].reason`** (a future value): treat it as a
-  pre-dispatch refusal with the plain 401 handling (log in again). Never
-  prompt for step-up on an unknown reason.
+- **An unknown `causes[0].reason`** (a future value, `""`, `null`, or a
+  reason from something other than snowplow): the portal gives it the plain
+  401 handling (sign in again). It is **never** a reason to replay a request
+  automatically: snowplow does not vouch that nothing was dispatched (section
+  3). Never prompt for step-up on an unknown reason.
 - **A burst of concurrent 401s** from one expired credential: every in-flight
   request gets the same cause. Raise one prompt, the same way
   `raiseSessionExpired` already de-duplicates.
@@ -272,16 +294,72 @@ components. Keep them distinct; never collapse them into one.
 | `StaleAuthentication` | **authn** (`POST /oidc/stepup`) | 403 | **re-authenticate** |
 | `StepUpNotEnabled` | **authn** | 403 | **configuration fault**: tell the admin; never prompt |
 | `StepUpMisconfigured` | **authn** | 500 | configuration fault: tell the admin; never prompt |
+| `IssuanceFailed` | **authn** (its login endpoints) | 500 | **server fault**: the caller authenticated, but authn could not issue the credential or sign the token; retrying may work |
 
 ## 6. Code example (TypeScript)
 
-Extend the error shape that `useCatchError` already receives. The body is
-already in `error.data`.
+### 6a. The portal: `ui/src/utils/authFailureCause.ts`
+
+Frontend main already classifies a 401 by `details.causes[0].reason`
+(frontend #562):
+
+- `CatchError.data.details.causes` carries the body's cause into
+  `useCatchError`;
+- `authFailureCauseOf(body, { origin, tokenKind })` maps the reason to an
+  `AuthFailureAction` (`reauthenticate`, `step-up`, `configuration-fault`,
+  `server-fault`) through `BY_REASON`;
+- `useCatchError` calls `raiseSessionExpired(cause)`.
+
+It already knows `SessionCredentialMissing`, `StepUpRequired` and authn's
+reasons, including `IssuanceFailed`. An unknown or absent reason falls back
+to `reauthenticate`.
+
+The one change left for the portal is the three token reasons. Today they
+fall to that default, which is the right action for a session token.
+
+They need a rule of their own, not three more `BY_REASON` rows. A token
+reason describes **the token the request carried**, and an expired
+**step-up** JWT now answers `TokenExpired`: it is rejected at token
+validation, before any Secret is chosen. The `authFailureCauseOf` comment
+still expects that case to arrive with no reason at all. `authFailureCauseOf`
+lets a recognised reason win over `tokenKind`. So a `BY_REASON` row
+`TokenExpired → reauthenticate` would show a full sign-in for a session that
+is still valid. Let `tokenKind` decide instead:
 
 ```ts
-// ui/src/utils/credentialCause.ts
+// ui/src/utils/authFailureCause.ts
 
-// The snowplow pre-dispatch causes (#1029, #1076): nothing was dispatched.
+export const AUTH_FAILURE_REASONS = {
+  // ...the existing entries, unchanged...
+  /** snowplow: no bearer token was presented (#1076). */
+  tokenMissing: 'TokenMissing',
+  /** snowplow: the bearer token failed validation (#1076). */
+  tokenInvalid: 'TokenInvalid',
+  /** snowplow: the bearer token is correctly signed but expired (#1076). */
+  tokenExpired: 'TokenExpired',
+} as const
+
+/** Reasons about the token the request carried: the caller's tokenKind decides the action. */
+const TOKEN_REASONS: ReadonlySet<string> = new Set([
+  AUTH_FAILURE_REASONS.tokenMissing,
+  AUTH_FAILURE_REASONS.tokenInvalid,
+  AUTH_FAILURE_REASONS.tokenExpired,
+])
+
+// in authFailureCauseOf, right after `reason` is computed:
+if (reason !== null && TOKEN_REASONS.has(reason)) {
+  return { action: tokenKind === 'step-up' ? 'step-up' : 'reauthenticate', reason }
+}
+```
+
+### 6b. Automatic replay: oasgen's RDC, or any client that retries
+
+A client that re-sends a request by itself must gate the replay on
+**membership** in the closed set, never on "a cause is present". Only the
+four reasons a fresh login fixes may trigger "drop the token, log in, replay":
+
+```ts
+// The five snowplow pre-dispatch causes (#1029, #1076): nothing was dispatched.
 export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'TokenMissing',
   'TokenInvalid',
@@ -290,79 +368,48 @@ export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'StepUpRequired',
 ] as const
 
-export interface StatusBody {
-  kind?: string
-  message?: string
-  reason?: string
-  code?: number
-  details?: { causes?: Array<{ reason?: string; message?: string }> }
+// The four a fresh login fixes. StepUpRequired is NOT one of them: a login does
+// not restore a step-up credential, so re-login-and-replay would loop, or would
+// re-send the request under the session credential instead.
+export const LOGIN_REPLAY_CAUSES = [
+  'TokenMissing',
+  'TokenInvalid',
+  'TokenExpired',
+  'SessionCredentialMissing',
+] as const
+
+const has = (set: readonly string[], c: string | null): c is string => c !== null && set.includes(c)
+
+/** The cause as a non-empty string, or null (absent, "", null, not a string). */
+export function causeOf(body: unknown): string | null {
+  const causes = (body as { details?: { causes?: { reason?: unknown }[] } } | null | undefined)?.details?.causes
+  const r = Array.isArray(causes) ? causes[0]?.reason : undefined
+  return typeof r === 'string' && r.length > 0 ? r : null
 }
 
-export type CredentialOutcome = 'step-up' | 'reauthenticate' | 'login' | 'config-fault' | 'none'
-
-export function causeOf(body?: StatusBody): string | undefined {
-  return body?.details?.causes?.[0]?.reason
+/** True only for a 401 whose cause is one of snowplow's five: nothing was dispatched. */
+export function refusedBeforeDispatch(status: number, body: unknown): boolean {
+  return status === 401 && has(SNOWPLOW_PRE_DISPATCH_CAUSES, causeOf(body))
 }
 
-// True only for a snowplow 401 that carries a cause: snowplow refused before
-// dispatch, so the request can be retried after a new login. Any other 401
-// (no cause) was relayed from upstream and may have been dispatched.
-export function refusedBeforeDispatch(status: number, body?: StatusBody): boolean {
-  return status === 401 && causeOf(body) !== undefined
-}
-
-export function credentialOutcome(body?: StatusBody): CredentialOutcome {
-  switch (causeOf(body)) {
-    case 'StepUpRequired':
-    case 'InsufficientAssurance':
-      return 'step-up'
-    case 'StaleAuthentication':
-      return 'reauthenticate'
-    case 'StepUpNotEnabled':
-    case 'StepUpMisconfigured':
-      return 'config-fault'
-    case 'TokenMissing':
-    case 'TokenInvalid':
-    case 'TokenExpired':
-    case 'SessionCredentialMissing':
-      return 'login'
-    default:
-      return 'none' // no cause, or one this build does not know: today's handling
-  }
+/** True only when a fresh login fixes it AND nothing was dispatched. */
+export function replayAfterLogin(status: number, body: unknown): boolean {
+  return status === 401 && has(LOGIN_REPLAY_CAUSES, causeOf(body))
 }
 ```
-
-```tsx
-// ui/src/hooks/useCatchError.tsx — inside the 401 branch
-import { credentialOutcome, type StatusBody } from '../utils/credentialCause'
-
-if (error?.status === 401 || error?.code === 401) {
-  const outcome = credentialOutcome(error?.data as StatusBody | undefined)
-  if (outcome === 'step-up') {
-    void raiseStepUpRequired() // one prompt, de-duplicated like raiseSessionExpired
-    if (type === 'notification') return
-  } else {
-    // 'login', 'none' (no cause): today's behaviour, unchanged
-    description = error?.data?.message || 'Your session has expired.'
-    void raiseSessionExpired()
-    if (type === 'notification') return
-  }
-}
-```
-
-A client that retries automatically after re-authenticating (for example
-oasgen's RDC) must gate the retry on `refusedBeforeDispatch`:
 
 ```ts
-if (res.status === 401 && refusedBeforeDispatch(res.status, body)) {
+// the client's 401 handling
+if (replayAfterLogin(res.status, body)) {
   await dropTokenAndLogin()
-  return retry() // safe: snowplow sent nothing upstream
+  return retryOnce() // safe: snowplow sent nothing upstream; a second 401 is surfaced, not replayed
 }
-// 401 without a cause: surface it; never replay a write on it
+if (res.status === 401 && causeOf(body) === 'StepUpRequired') {
+  return startStepUp() // the step-up flow owns what happens next; never re-login-and-replay
+}
+// Anything else (no cause, an unknown cause, "", null): surface it. Never replay:
+// snowplow does not vouch that nothing was dispatched, and a write may have happened.
 ```
-
-`CatchError.data` must be widened from `{ message?: string }` to `StatusBody`
-for this to type-check. `data.message` keeps its meaning.
 
 At the two sites that hold the `Response` (`useWidgetQuery.ts`,
 `sseClient.ts`), you may additionally log
@@ -378,10 +425,11 @@ curl -si "$SNOWPLOW/call?apiVersion=templates.krateo.io/v1&resource=restactions&
   | sed -n '1p;/^WWW-Authenticate/p;$p'
 ```
 
-The output is `HTTP/1.1 401`, `WWW-Authenticate: Bearer
-error="invalid_token"`, and a body whose `details.causes[0].reason` is
-`TokenMissing`. Send `-H "Authorization: Bearer not.a.jwt"` for
-`TokenInvalid`, or an expired JWT for `TokenExpired`.
+The output is `HTTP/1.1 401`, a bare `WWW-Authenticate: Bearer`, and a body
+whose `details.causes[0].reason` is `TokenMissing`. Send
+`-H "Authorization: Bearer not.a.jwt"` for `TokenInvalid` (with
+`WWW-Authenticate: Bearer error="invalid_token"`), or an expired JWT for
+`TokenExpired`.
 
 Credential causes: against a test user, with a valid step-up JWT, delete the
 user's `<user>-clientconfig-stepup` Secret in AUTHN_NAMESPACE and call any
