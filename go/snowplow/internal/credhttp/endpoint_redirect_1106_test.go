@@ -120,10 +120,14 @@ func TestIssue1112_D4_DumpHeadersRedactsEveryCredentialValue(t *testing.T) {
 			t.Errorf("RED: %s… is in the dumped headers:\n%s", c, got)
 		}
 	}
-	for _, want := range []string{"Authorization: [REDACTED]", "X-Api-Key: [REDACTED]", "Content-Type: application/json"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("want %q in:\n%s", want, got)
-		}
+	// Presence only: the named headers by the dump's own constant, the rest
+	// counted (X-Api-Key), and never a value, not even a descriptive one.
+	want := "Authorization\nContent-Type\nCookie\nImpersonate-User\nLocation\nProxy-Authorization\nSet-Cookie\n+1 other"
+	if got != want {
+		t.Errorf("dumped headers:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "application/json") {
+		t.Error("RED: a header value is in the dump")
 	}
 }
 

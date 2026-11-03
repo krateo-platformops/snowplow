@@ -17,10 +17,12 @@ package credhttp
 // and an endpoint that asks for the dump gets WireDump instead, outermost on its
 // client. WireDump logs metadata only:
 //   - the method and the URL through redact.URL (no userinfo, no query values);
-//   - every header NAME, with its value only for the few headers that describe
-//     the message (wireDumpClearHeaders); every other value — Authorization,
-//     Cookie, Set-Cookie, Impersonate-*, an API-key header — is "[REDACTED]".
-//     A Location goes through redact.URL;
+//   - which headers are present, never a header VALUE: each header of
+//     wireDumpNamedHeaders that is set is named (Authorization, Cookie,
+//     Content-Type, Location, ...), and every other header is counted. No value
+//     is logged, not even a descriptive one: the dump reads only presence, so
+//     no value can flow into it whatever its name (an API-key header with an
+//     innocuous name, a Location carrying a pre-signed query);
 //   - the request body as its length and its keyed digest (redact.Digest: a
 //     plain sha256 of a short body could be guessed), never its bytes; the response
 //     body as its declared length only (it is never read here, so a large body
@@ -33,7 +35,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -41,19 +42,15 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
-// wireDumpRedacted replaces a header value the dump does not show.
-const wireDumpRedacted = "[REDACTED]"
-
-// wireDumpClearHeaders are the headers whose value describes the message and
-// never carries a credential or identity: shown in clear.
-var wireDumpClearHeaders = map[string]bool{
-	"Accept":            true,
-	"Accept-Encoding":   true,
-	"Content-Encoding":  true,
-	"Content-Length":    true,
-	"Content-Type":      true,
-	"Retry-After":       true,
-	"Transfer-Encoding": true,
+// wireDumpNamedHeaders are the headers the dump names when present (by this
+// constant, never by the request's own key): the ones that say what kind of
+// message it is and which credential or identity it carries. Any other header
+// is counted, unnamed.
+var wireDumpNamedHeaders = []string{
+	"Accept", "Authorization", "Content-Encoding", "Content-Length", "Content-Type",
+	"Cookie", "Impersonate-Group", "Impersonate-Uid", "Impersonate-User", "Location",
+	"Proxy-Authorization", "Retry-After", "Set-Cookie", "Transfer-Encoding",
+	"Www-Authenticate",
 }
 
 // WithoutPlumbingWireDump returns ep for a plumbing builder: ep itself when it
@@ -102,25 +99,19 @@ func (t *wireDump) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// dumpHeaders is h as the dump shows it: every name, in order, with its value
-// in clear only for wireDumpClearHeaders.
+// dumpHeaders is h as the dump shows it: the wireDumpNamedHeaders that are
+// present, then "+N other" for the rest. It reads presence only, never a value.
 func dumpHeaders(h http.Header) []string {
-	names := make([]string, 0, len(h))
-	for k := range h {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	out := make([]string, 0, len(names))
-	for _, k := range names {
-		ck := http.CanonicalHeaderKey(k)
-		v := wireDumpRedacted
-		switch {
-		case wireDumpClearHeaders[ck]:
-			v = h.Get(k)
-		case ck == "Location":
-			v = redact.URL(h.Get(k))
+	out := make([]string, 0, len(wireDumpNamedHeaders)+1)
+	named := 0
+	for _, name := range wireDumpNamedHeaders {
+		if _, ok := h[name]; ok {
+			out = append(out, name)
+			named++
 		}
-		out = append(out, ck+": "+v)
+	}
+	if other := len(h) - named; other > 0 {
+		out = append(out, "+"+strconv.Itoa(other)+" other")
 	}
 	return out
 }
