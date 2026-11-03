@@ -126,7 +126,7 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 func (f *d2Fixture) customer(t *testing.T, l1Key string) (any, *cache.StaleServeSink) {
 	t.Helper()
 	// As the dispatchers do: the L1 key is scoped first, then the sink on it.
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions", "")
 	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("customer read not served: ok=%v served=%v err=%v", ok, s, err)
@@ -310,7 +310,7 @@ func TestStale710_D2_5b_NonArmableReadReadsThroughFreshWithNoDebt(t *testing.T) 
 // debt's own dependent re-resolve would read back as fresh.
 func TestStale710_D2_18_ASubstrateFillUnderAnArmableResolveReadsThrough(t *testing.T) {
 	f := newD2Fixture(t)
-	ctx, _ := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-15"), "dep-15", "widgets")
+	ctx, _ := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-15"), "dep-15", "widgets", "")
 	ctx = cache.WithL1KeyContext(ctx, "ra-full-list-15")
 	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
@@ -1191,7 +1191,7 @@ func TestStale710_D2_20e_AParkedDebtsEvictedContentEvictsItsDependentsWithoutReR
 	defer unsub()
 	d2Push(t, ch, "dep-20e-a", 10*time.Second) // the owed mark, at arm time
 	// The refetch under the viewer is an ordinary fill: fresh, no new debt.
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions", "")
 	if _, served, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false); err != nil || !ok || !served {
 		t.Fatalf("D2-20e: the refetch was not served: ok=%v served=%v err=%v", ok, served, err)
 	}

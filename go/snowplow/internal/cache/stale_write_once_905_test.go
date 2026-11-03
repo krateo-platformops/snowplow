@@ -77,7 +77,7 @@ func TestIssue905_A2_ParallelReadsAndWritesNeverBoth(t *testing.T) {
 
 func TestIssue905_A3_NestedWriteReachesTheRequestSink(t *testing.T) {
 	ctx := WithL1KeyContext(context.Background(), "outer")
-	ctx, s := WithStaleServeSink(ctx, "outer", "restactions")
+	ctx, s := WithStaleServeSink(ctx, "outer", "restactions", "")
 	if s == nil {
 		t.Fatal("PRE: no sink")
 	}

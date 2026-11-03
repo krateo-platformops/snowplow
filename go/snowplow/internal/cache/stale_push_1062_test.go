@@ -57,13 +57,26 @@ func (e *k1062Env) mark() {
 }
 
 // hit is the dispatcher's armed hit write point on the resident cell.
-func (e *k1062Env) hit(t *testing.T) {
+func (e *k1062Env) hit(t *testing.T) { t.Helper(); e.hitAs(t, "") }
+
+// hitAs is the armed hit write point for the requester subject.
+func (e *k1062Env) hitAs(t *testing.T, subject string) {
 	t.Helper()
 	entry, ok := e.c.GetNoTouch(e.key)
 	if !ok {
 		t.Fatalf("PRECONDITION: the cell is not resident")
 	}
-	NoteStaleHit(e.key, entry)
+	NoteStaleHit(e.key, subject, entry)
+}
+
+func noFrameWithin(t *testing.T, st RefreshStream, d time.Duration) bool {
+	t.Helper()
+	select {
+	case <-st.Keys:
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 // put is an accepted gen-guarded Put of a fresh body under rctx.
@@ -258,7 +271,7 @@ func TestIssue1062_EVI_RSY_AnEvictionReplacesAndAResyncPushes(t *testing.T) {
 func TestIssue1062_RST_TheResumeMovesTheApistageClockForwardOnly(t *testing.T) {
 	e := newK1062(t)
 	t0 := StalePushNow()
-	noteStaleServe(e.key, layerAPIStage, t0)
+	noteStaleServeNow(e.key, "", layerAPIStage, t0)
 	RestartStaleServeClock(e.key, StaleLayerAPIStage, t0.Add(3*time.Second)) // the resume
 	RestartStaleServeClock(e.key, StaleLayerAPIStage, t0.Add(time.Second))   // an older resume: never backwards
 	RestartStaleServeClock(e.key, StaleLayerL1, t0.Add(5*time.Second))       // another layer: untouched
@@ -279,5 +292,149 @@ func TestIssue1062_CLN_AHitOnACleanCellIsNoStaleServe(t *testing.T) {
 		if s.Serves != 0 || s.Open != 0 {
 			t.Fatalf("CLN RED: a clean hit opened a %s stale serve", s.Layer)
 		}
+	}
+}
+
+// RX1 (reviewer arm, adopted) — #1081 made visible: an L1 serve whose cell is
+// replaced and published BEFORE the tab's stream arms is offered no frame on
+// the stream that arms afterwards; the overdue scan counts it once at 10 s.
+func TestIssue1062_RX1_AServeReplacedBeforeItsStreamArmsIsCountedUnreplaced(t *testing.T) {
+	e := newK1062(t)
+	const subj = "user:rx1"
+	e.mark()
+	e.hitAs(t, subj) // the tab's /call: a stale L1 hit, armed header
+	e.advance(100 * time.Millisecond)
+	e.put(t, WithL1KeyContext(context.Background(), e.key), false) // the refresh lands
+	PublishRefresh(e.key)                                          // nobody armed yet
+	e.advance(200 * time.Millisecond)                              // the SPA's arm debounce
+	st := SubscribeRefreshStreamAs(subj, map[string]struct{}{e.key: {}})
+	defer st.Unsub()
+	if !noFrameWithin(t, st, 500*time.Millisecond) {
+		t.Fatalf("RX1: a frame was offered on arm — #1081's no-replay premise no longer holds; revisit this arm")
+	}
+	e.advance(10 * time.Second)
+	scanStalePushOverdue()
+	if s := k1062Layer(t, StaleLayerL1); s.Unreplaced != 1 || s.Open != 1 || s.ToPush.Count != 0 {
+		t.Fatalf("RX1 RED: unreplaced=%d open=%d samples=%d, want 1/1/0 — the strand must be visible", s.Unreplaced, s.Open, s.ToPush.Count)
+	}
+}
+
+// RX2 (reviewer arm, adopted for per-client keying) — two users are served the
+// same stale cell under ONE key (an RBAC class, or the identity-free
+// widgetContent shell). Only A's stream exists when the replacement's frame is
+// written; B's stream arms afterwards and is offered nothing. A's frame must
+// close A's serve ONLY: one push (A), one stranded serve (B), counted
+// unreplaced at 10 s.
+// Mutation → RED: a frame closes every subject's serves of the key.
+func TestIssue1062_RX2_AnotherClientsFrameNeverClosesAStrandedServe(t *testing.T) {
+	e := newK1062(t)
+	const a, b = "user:rx2-a", "user:rx2-b"
+	stA := SubscribeRefreshStreamAs(a, map[string]struct{}{e.key: {}})
+	defer stA.Unsub()
+	e.mark()
+	e.hitAs(t, a)
+	e.hitAs(t, b) // the same key: one RBAC class, or a shared shell
+	e.advance(time.Second)
+	e.put(t, WithL1KeyContext(context.Background(), e.key), false)
+	PublishRefresh(e.key)
+	select {
+	case k := <-stA.Keys:
+		stA.Wrote(k)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("PRECONDITION: A's stream got no frame")
+	}
+	stB := SubscribeRefreshStreamAs(b, map[string]struct{}{e.key: {}})
+	defer stB.Unsub()
+	if !noFrameWithin(t, stB, 500*time.Millisecond) {
+		t.Fatalf("PRECONDITION: B's late stream was offered a frame")
+	}
+	e.advance(10 * time.Second)
+	scanStalePushOverdue()
+	s := k1062Layer(t, StaleLayerL1)
+	if s.ToPush.Count != 1 || s.ToPush.MaxMS != 1000 || s.Unreplaced != 1 || s.Open != 1 || s.Closes["pushed"] != 1 {
+		t.Fatalf("RX2 RED: samples=%d max=%d unreplaced=%d open=%d pushed=%d, want 1/1000/1/1/1 — A's frame closed B's serve",
+			s.ToPush.Count, s.ToPush.MaxMS, s.Unreplaced, s.Open, s.Closes["pushed"])
+	}
+}
+
+// NSX — "no stream" means no stream OF THE SERVE'S CLIENT: B is served stale on
+// a key only A's stream is armed for. Past 10 s, B's serve is not counted
+// unreplaced (nothing can push to B); once B's own stream arms, it is.
+// Mutation → RED: the overdue scan asks for any stream on the key.
+func TestIssue1062_NSX_AnotherClientsStreamDoesNotMakeAServeViewed(t *testing.T) {
+	e := newK1062(t)
+	const a, b = "user:nsx-a", "user:nsx-b"
+	stA := SubscribeRefreshStreamAs(a, map[string]struct{}{e.key: {}})
+	defer stA.Unsub()
+	e.mark()
+	e.hitAs(t, b)
+	e.advance(11 * time.Second)
+	scanStalePushOverdue()
+	if s := k1062Layer(t, StaleLayerL1); s.Unreplaced != 0 || s.Open != 1 {
+		t.Fatalf("NSX RED: unreplaced=%d open=%d — A's stream made B's serve count as viewed", s.Unreplaced, s.Open)
+	}
+	stB := SubscribeRefreshStreamAs(b, map[string]struct{}{e.key: {}})
+	defer stB.Unsub()
+	scanStalePushOverdue()
+	if s := k1062Layer(t, StaleLayerL1); s.Unreplaced != 1 {
+		t.Fatalf("NSX: unreplaced=%d once B's own stream armed, want 1", s.Unreplaced)
+	}
+}
+
+// N2 — the overdue count is once PER SERVE: two serves of one client on one
+// key, 5 s apart, an armed stream, no push. At 10 s one is counted; at 15 s the
+// second, never the first again.
+// Mutation → RED: the second-pass once-guard is dropped.
+func TestIssue1062_N2_OverdueIsCountedOncePerServe(t *testing.T) {
+	e := newK1062(t)
+	const subj = "user:n2"
+	st := SubscribeRefreshStreamAs(subj, map[string]struct{}{e.key: {}})
+	defer st.Unsub()
+	e.mark()
+	e.hitAs(t, subj)
+	e.advance(5 * time.Second)
+	e.hitAs(t, subj) // the tab refetched, still stale
+	e.advance(5 * time.Second)
+	scanStalePushOverdue()
+	if s := k1062Layer(t, StaleLayerL1); s.Unreplaced != 1 {
+		t.Fatalf("N2: unreplaced=%d at 10 s, want 1 (the first serve only)", s.Unreplaced)
+	}
+	e.advance(5 * time.Second)
+	scanStalePushOverdue()
+	scanStalePushOverdue()
+	if s := k1062Layer(t, StaleLayerL1); s.Unreplaced != 2 || s.Open != 2 {
+		t.Fatalf("N2 RED: unreplaced=%d open=%d at 15 s, want 2/2 — each serve once, the first never again", s.Unreplaced, s.Open)
+	}
+}
+
+// N3 — the memory bound is real: with the L1 store's entry budget at 2, a third
+// open serve drops the OLDEST (close=dropped), and a later push reaches only
+// the two kept.
+// Mutation → RED: the capacity loop never drops.
+func TestIssue1062_N3_TheCapacityBoundDropsTheOldestServe(t *testing.T) {
+	t.Setenv(envResolvedCacheMaxEntries, "2")
+	resetResolvedCacheForTest()
+	t.Cleanup(resetResolvedCacheForTest)
+	e := newK1062(t)
+	if got := stalePushCapacity(); got != 2 {
+		t.Fatalf("PRECONDITION: the ledger's capacity is %d, want the store's budget 2", got)
+	}
+	subjects := []string{"user:n3-0", "user:n3-1", "user:n3-2"}
+	for _, s := range subjects {
+		noteStaleServeNow(e.key, s, layerAPIStage, StalePushNow())
+		e.advance(time.Second)
+	}
+	s := k1062Layer(t, StaleLayerAPIStage)
+	if s.Open != 2 || s.Closes["dropped"] != 1 || s.Serves != 3 {
+		t.Fatalf("N3 RED: open=%d dropped=%d serves=%d, want 2/1/3 — the bound must drop", s.Open, s.Closes["dropped"], s.Serves)
+	}
+	e.c.DeleteForTest(e.key)
+	for _, subj := range subjects {
+		st := SubscribeRefreshStreamAs(subj, map[string]struct{}{e.key: {}})
+		st.Wrote(e.key)
+		st.Unsub()
+	}
+	if s := k1062Layer(t, StaleLayerAPIStage); s.Closes["pushed"] != 2 || s.ToPush.MaxMS != 2000 || s.Open != 0 {
+		t.Fatalf("N3: pushed=%d max=%d open=%d, want 2/2000/0 — the OLDEST serve was the one dropped", s.Closes["pushed"], s.ToPush.MaxMS, s.Open)
 	}
 }

@@ -42,7 +42,10 @@ import (
 type StaleServeSink struct {
 	l1Key string
 	class string
-	mu    sync.Mutex
+	// subject (#1062) is the requester (StaleSubject): the stale-push ledger
+	// pairs this response's serve with that user's /refreshes stream only.
+	subject string
+	mu      sync.Mutex
 	// served is the content cells this resolve was served stale. Their reads
 	// were metric-neutral; Commit counts them as the request's hits.
 	served []staleServedRef
@@ -130,12 +133,13 @@ func StaleServeDisabled(ctx context.Context) bool {
 // of class (restactions, widgets) — eligible for the D2 stale serve — and
 // returns the sink its content reads note stale serves on. Install it ONLY on
 // a customer dispatch path whose stored cell is armed for /refreshes; never on
-// a background, inert or identity-free resolve.
-func WithStaleServeSink(ctx context.Context, l1Key, class string) (context.Context, *StaleServeSink) {
+// a background, inert or identity-free resolve. subject is the requester
+// (StaleSubject of the authenticated username, #1062).
+func WithStaleServeSink(ctx context.Context, l1Key, class, subject string) (context.Context, *StaleServeSink) {
 	if ctx == nil || l1Key == "" || StaleServeDisabled(ctx) {
 		return ctx, nil
 	}
-	s := &StaleServeSink{l1Key: l1Key, class: class}
+	s := &StaleServeSink{l1Key: l1Key, class: class, subject: subject}
 	return context.WithValue(ctx, ctxKeyStaleServeSink, s), s
 }
 
@@ -322,7 +326,7 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 	// #1062 — the stale-derived body is about to be written under its armed
 	// key: one apistage stale serve, timed from the D2 serve until the frame
 	// that follows its replacement is written to a stream (stale_push.go).
-	noteStaleServe(s.l1Key, layerAPIStage, servedAt)
+	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, servedAt)
 	// The stale bodies are now written: count their reads as this request's
 	// hits, exactly once (a withdrawn pass never reaches here), through the one
 	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547

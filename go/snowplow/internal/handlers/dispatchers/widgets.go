@@ -228,7 +228,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					// #1062 — an armed hit on a dirty shared shell is an l1 stale
 					// serve, timed until its replacing frame is written.
-					cache.NoteStaleHit(contentKey, entry)
+					cache.NoteStaleHit(contentKey, staleSubjectOf(req.Context()), entry)
 					writeResolvedJSON(wri, gated)
 					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
 					// instantly (counted in the Get funnel) and revalidated in the
@@ -293,7 +293,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// never fire. entry.ExternalTTL is false for every normal entry →
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
-			staleHitWritePoint(cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
+			staleHitWritePoint(cacheKey, entry, !entry.ExternalTTL, staleSubjectOf(req.Context())) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -343,7 +343,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		defer cache.Deps().ReleaseUnstored(ctx, cacheKey) // #890/#893 — see restactions.go
 		// #710 PR-2b — armable response: its resolve may be served a known-stale
 		// content cell at once (D2); see restactions.go.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level widget as an ancestor of the
 	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).

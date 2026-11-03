@@ -1,5 +1,5 @@
 // stale_push.go — #1062: stale serve → the replacing frame pushed, for EVERY
-// layer that answers with stale bytes.
+// layer that answers with stale bytes, per CLIENT.
 //
 // THE GOAL (#710 ruling): users never queue; under pressure they get a
 // temporary stale page, then it is replaced, p95 ≤ 3 s and max ≤ 10 s. Before
@@ -26,7 +26,21 @@
 //     before its replace landed.
 //
 // A response that is not armed (an external-TTL widget, a declined Put) is not
-// a stale serve here: nothing could ever push to it, by design.
+// a stale serve here: nothing could ever push to it, by design. The unit is a
+// SERVE, not a viewing episode: a tab that refetches stale twice before the
+// replacement yields two samples, the second shorter.
+//
+// # WHO THE CLIENT IS (the requester, never the key)
+//
+// An L1 key is NOT a client: it folds the RBAC class (every user whose verdicts
+// are equal shares it), and a widgetContent key is identity-free (one cell for
+// every user). Each serve therefore carries its REQUESTER's subject digest
+// (StaleSubject: the process-keyed redact digest of the username, held in
+// memory, never logged), and each /refreshes stream carries its own
+// authenticated user's (SubscribeRefreshStreamAs). A frame written on a stream
+// closes only the serves of the SAME (key, subject): one user's frame never
+// closes another user's stale serve, so a client left stranded (#1081) is
+// visible as unreplaced, not hidden as someone else's push.
 //
 // # WHEN IT IS REPLACED (one rule for every layer)
 //
@@ -36,40 +50,44 @@
 //     serve saw a dirty stamp, whose resolve began at or after that stamp's
 //     latest mark (its #375 startSeq ≥ the mark's seq — the rule that ends the
 //     known-stale state, endKnownStaleOnPut). A Put that began before the mark
-//     carries the pre-change state and replaces nothing; or
+//     carries the pre-change state and replaces nothing. A Put whose ctx carries
+//     no #375 dep-gen sink (the plain putPlain carriers: boot seed, external
+//     TTL) proves nothing and replaces such a serve not at all; or
 //   - the key LEAVES the store: a refetch is then a fresh fill.
+//
+// Replacement is a property of the CELL, so it applies to every subject's
+// serves of the key.
 //
 // # WHEN IT IS PUSHED
 //
 // When the /refreshes handler WROTE a frame for the key (RefreshStream.Wrote,
-// after writeFrame returned true — a write, not an offer) after the serve was
-// replaced, or wrote a resync frame to a stream armed for it (the SPA then
-// re-reads every armed key). That closes the serve: stale_to_push_ms{layer}
-// records now − servedAt. A frame written before the replacement closes
-// nothing: the refetch it triggers reads the same stale cell.
-//
-// The client is identified by the key it was served under (the key folds every
-// identity input), as the #870 push ledger and the D2 owed marks do: a frame
-// written for the key on any stream closes every replaced serve of the key.
+// after writeFrame returned true — a write, not an offer) on a stream of the
+// serve's subject after the serve was replaced, or wrote a resync frame to such
+// a stream armed for it (the SPA then re-reads every armed key). That closes the
+// serve: stale_to_push_ms{layer} records now − servedAt. A frame written before
+// the replacement closes nothing: the refetch it triggers reads the same stale
+// cell.
 //
 // # UNREPLACED (the 10 s goal max)
 //
 // stale_unreplaced_total{layer} counts, ONCE per serve, a serve whose
 // stale-to-push exceeded the 10 s max: recorded above it at its push, or — so a
 // push that never comes is visible, not silent — still unpushed 10 s after its
-// serve while a /refreshes stream is armed for its key (the overdue scanner).
+// serve while a /refreshes stream OF ITS SUBJECT is armed for its key (the
+// overdue scanner).
 //
 // # A CLIENT WITHOUT A STREAM (decided here)
 //
-// A serve whose key no stream has armed cannot be pushed: there is no stream.
-// It is NOT counted unreplaced while no stream is armed (the #740 ruling: with
-// nobody viewing, nothing is an alert; a k6 or API client would otherwise make
-// the detector fire on every stale read). It stays OPEN, so a stream that arms
-// later and is written a frame records the full delay since the serve (the #710
-// F2 ruling: the late tab showed the stale body all that time) and, past 10 s,
-// counts unreplaced. A serve no stream ever pushes leaves the ledger only
-// through its capacity bound (close=dropped): the L1 store's entry budget, the
-// bound the D2 owed marks use. stale_serves_open{layer} shows what is waiting.
+// A serve whose subject has no stream armed for its key cannot be pushed: there
+// is no stream. It is NOT counted unreplaced while that holds (the #740 ruling:
+// with nobody viewing, nothing is an alert; a k6 or API client would otherwise
+// make the detector fire on every stale read). It stays OPEN, so a stream of
+// that subject that arms later and is written a frame records the full delay
+// since the serve (the #710 F2 ruling: the late tab showed the stale body all
+// that time) and, past 10 s, counts unreplaced. A serve no stream ever pushes
+// leaves the ledger only through its capacity bound (close=dropped): the L1
+// store's entry budget, the bound the D2 owed marks use. stale_serves_open
+// {layer} shows what is waiting.
 //
 // # THE #740 RESUME
 //
@@ -79,11 +97,13 @@
 //
 // # COST AND LOCKS
 //
-// stalePush.mu is a LEAF: nothing is called under it but map/list operations.
-// Put and eviction hooks run first through one atomic load (no open serve → no
-// lock); eviction runs under the store's c.mu (evictDirtyWindow), which is why
-// the ledger never takes c.mu or the hub lock. The overdue scanner reads the
-// hub (HasRefreshSubscriber) with the ledger lock released.
+// The ledger is indexed key → subject → serves, so a frame touches only one
+// client's serves of one key. stalePush.mu is a LEAF: nothing is called under it
+// but map/list operations. Put and eviction hooks run first through one atomic
+// load (no open serve → no lock); eviction runs under the store's c.mu
+// (evictDirtyWindow), which is why the ledger never takes c.mu or the hub lock.
+// The overdue scanner reads the hub (HasRefreshSubscriberAs) with the ledger
+// lock released.
 //
 // # KNOWN BIAS
 //
@@ -91,7 +111,7 @@
 // landing in those microseconds hides the serve (under-count by that race).
 //
 // Metadata only: no key leaves this file except the opaque L1 key digest in a
-// WARN line, as the store's own logs print it.
+// WARN line, as the store's own logs print it; a subject never does.
 package cache
 
 import (
@@ -104,6 +124,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -161,10 +182,17 @@ func layerIndex(layer string) (int, bool) {
 	return 0, false
 }
 
+// StaleSubject is the client identity the ledger pairs a serve with its stream
+// by: the process-keyed digest of the authenticated username (redact.User).
+// The hit sites, the D2 sink and the /refreshes handler all derive it here, so
+// the two sides cannot drift. It stays in memory; nothing logs it.
+func StaleSubject(username string) string { return redact.User(username) }
+
 // staleServe is one open stale serve.
 type staleServe struct {
-	key   string
-	layer int
+	key     string
+	subject string
+	layer   int
 	// servedAt is when snowplow answered with the stale bytes (moved forward by
 	// a #740 resume, RestartStaleServeClock).
 	servedAt time.Time
@@ -179,12 +207,13 @@ type staleServe struct {
 }
 
 type stalePushLedger struct {
-	mu    sync.Mutex
-	byKey map[string][]*staleServe
+	mu sync.Mutex
+	// byKey: L1 key → subject → that client's open serves of the key.
+	byKey map[string]map[string][]*staleServe
 	order *list.List // every open serve, oldest first (the capacity bound)
 }
 
-var stalePush = &stalePushLedger{byKey: map[string][]*staleServe{}, order: list.New()}
+var stalePush = &stalePushLedger{byKey: map[string]map[string][]*staleServe{}, order: list.New()}
 
 // stalePushOpenTotal is the number of open serves: the Put / eviction / frame
 // hooks' lock-free fast path.
@@ -237,79 +266,116 @@ func SetStalePushClockForTest(now func() time.Time) (restore func()) {
 	return func() { stalePushClock.Store(prev) }
 }
 
+// stalePushCapacity is the ledger's bound: the L1 store's own entry budget.
+func stalePushCapacity() int {
+	if c := ResolvedCache(); c != nil && c.maxEntries > 0 {
+		return c.maxEntries
+	}
+	return defaultResolvedCacheMaxEntries
+}
+
 // ── serves ───────────────────────────────────────────────────────────────────
 
-// NoteStaleHit records the stale serve of an ARMED customer L1 hit on key, if
-// entry's bytes are stale: a stale-derived body (apistage), else a cell with a
-// dirty stamp (l1). Call it at the hit's write point, only when the refresh
-// key header was stamped. Nil-safe.
-func NoteStaleHit(key string, entry *ResolvedEntry) {
+// NoteStaleHit records the stale serve of an ARMED customer L1 hit on key for
+// the requester subject (StaleSubject), if entry's bytes are stale: a
+// stale-derived body (apistage), else a cell with a dirty stamp (l1). Call it
+// at the hit's write point, only when the refresh key header was stamped.
+// Nil-safe.
+func NoteStaleHit(key, subject string, entry *ResolvedEntry) {
 	if key == "" || entry == nil {
 		return
 	}
-	if entry.StaleDerived {
-		noteStaleServe(key, layerAPIStage, StalePushNow())
-		return
-	}
-	if _, dirty := dirtyStampFor(key); dirty {
-		noteStaleServe(key, layerL1, StalePushNow())
+	st, dirty := dirtyStampFor(key)
+	switch {
+	case entry.StaleDerived:
+		noteStaleServe(key, subject, layerAPIStage, StalePushNow(), st)
+	case dirty:
+		noteStaleServe(key, subject, layerL1, StalePushNow(), st)
 	}
 }
 
-// noteStaleServe opens one serve of key at servedAt. It reads key's dirty stamp
-// (the mark a replacing Put must have read past) before taking the leaf lock.
-func noteStaleServe(key string, layer int, servedAt time.Time) {
+// noteStaleServeNow is a serve whose dirty stamp has not been read yet (the D2
+// commit): it reads it once, here.
+func noteStaleServeNow(key, subject string, layer int, servedAt time.Time) {
+	st, _ := dirtyStampFor(key)
+	noteStaleServe(key, subject, layer, servedAt, st)
+}
+
+// noteStaleServe opens one serve of key for subject at servedAt. st is key's
+// dirty stamp as the serve read it (nil: none) — the mark a replacing Put must
+// have read past — read ONCE by the caller, before the leaf lock.
+func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirtyStamp) {
 	if key == "" {
 		return
 	}
 	if servedAt.IsZero() {
 		servedAt = StalePushNow()
 	}
-	s := &staleServe{key: key, layer: layer, servedAt: servedAt}
-	if st, ok := dirtyStampFor(key); ok && st != nil {
+	s := &staleServe{key: key, subject: subject, layer: layer, servedAt: servedAt}
+	if st != nil {
 		s.needSeq, s.seq = true, st.seq
 	}
-	limit := defaultResolvedCacheMaxEntries
-	if c := ResolvedCache(); c != nil && c.maxEntries > 0 {
-		limit = c.maxEntries
-	}
+	limit := stalePushCapacity()
 	stalePushStats.serves[layer].Add(1)
 	l := stalePush
 	l.mu.Lock()
 	s.el = l.order.PushBack(s)
-	l.byKey[key] = append(l.byKey[key], s)
+	subs := l.byKey[key]
+	if subs == nil {
+		subs = map[string][]*staleServe{}
+		l.byKey[key] = subs
+	}
+	subs[subject] = append(subs[subject], s)
 	stalePushStats.open[layer].Add(1)
 	stalePushOpenTotal.Add(1)
 	for l.order.Len() > limit {
-		l.closeLocked(l.order.Front().Value.(*staleServe), closeDroppedIdx)
+		l.dropOldestLocked()
 	}
 	l.mu.Unlock()
 	ensureStalePushScanner()
 }
 
-// closeLocked removes s from the ledger and counts its close. Caller holds mu.
-func (l *stalePushLedger) closeLocked(s *staleServe, closeIdx int) {
-	l.order.Remove(s.el)
-	serves := l.byKey[s.key]
+// dropOldestLocked closes the oldest open serve as dropped (the capacity
+// bound). Caller holds mu.
+func (l *stalePushLedger) dropOldestLocked() {
+	s := l.order.Front().Value.(*staleServe)
+	serves := l.byKey[s.key][s.subject]
 	for i, o := range serves {
 		if o == s {
 			serves = append(serves[:i], serves[i+1:]...)
 			break
 		}
 	}
-	if len(serves) == 0 {
-		delete(l.byKey, s.key)
-	} else {
-		l.byKey[s.key] = serves
+	l.setServesLocked(s.key, s.subject, serves)
+	l.countCloseLocked(s, closeDroppedIdx)
+}
+
+// setServesLocked stores (key, subject)'s remaining serves, pruning empty
+// levels. Caller holds mu.
+func (l *stalePushLedger) setServesLocked(key, subject string, serves []*staleServe) {
+	subs := l.byKey[key]
+	if len(serves) > 0 {
+		subs[subject] = serves
+		return
 	}
+	delete(subs, subject)
+	if len(subs) == 0 {
+		delete(l.byKey, key)
+	}
+}
+
+// countCloseLocked unlinks s from the age order and counts its close. The
+// caller has already removed it from byKey. Caller holds mu.
+func (l *stalePushLedger) countCloseLocked(s *staleServe, closeIdx int) {
+	l.order.Remove(s.el)
 	stalePushStats.open[s.layer].Add(-1)
 	stalePushOpenTotal.Add(-1)
 	stalePushStats.closes[s.layer][closeIdx].Add(1)
 }
 
 // RestartStaleServeClock moves the clock of key's open serves of layer to at
-// (never backwards): the #740 resume of a parked debt measures its dependents'
-// stale-to-push from the resume.
+// (never backwards), for every subject: the #740 resume of a parked debt
+// measures its dependents' stale-to-push from the resume.
 func RestartStaleServeClock(key, layer string, at time.Time) {
 	li, ok := layerIndex(layer)
 	if !ok || stalePushOpenTotal.Load() == 0 {
@@ -317,9 +383,11 @@ func RestartStaleServeClock(key, layer string, at time.Time) {
 	}
 	l := stalePush
 	l.mu.Lock()
-	for _, s := range l.byKey[key] {
-		if s.layer == li && s.servedAt.Before(at) {
-			s.servedAt = at
+	for _, serves := range l.byKey[key] {
+		for _, s := range serves {
+			if s.layer == li && s.servedAt.Before(at) {
+				s.servedAt = at
+			}
 		}
 	}
 	l.mu.Unlock()
@@ -329,7 +397,7 @@ func RestartStaleServeClock(key, layer string, at time.Time) {
 
 // noteStalePushPut is every ACCEPTED store Put of key (the four Put methods,
 // after c.mu is released, before the caller publishes): it replaces key's open
-// serves the Put corrects (see the file comment).
+// serves the Put corrects, for every subject (see the file comment).
 func noteStalePushPut(ctx context.Context, key string, entry *ResolvedEntry) {
 	if stalePushOpenTotal.Load() == 0 || entry == nil || entry.StaleDerived {
 		return
@@ -337,11 +405,13 @@ func noteStalePushPut(ctx context.Context, key string, entry *ResolvedEntry) {
 	start, hasStart := DepGenStartSeqFromContext(ctx)
 	l := stalePush
 	l.mu.Lock()
-	for _, s := range l.byKey[key] {
-		if s.replaced || (s.needSeq && (!hasStart || start < s.seq)) {
-			continue
+	for _, serves := range l.byKey[key] {
+		for _, s := range serves {
+			if s.replaced || (s.needSeq && (!hasStart || start < s.seq)) {
+				continue
+			}
+			s.replaced = true
 		}
-		s.replaced = true
 	}
 	l.mu.Unlock()
 }
@@ -354,8 +424,10 @@ func noteStalePushEvicted(key string) {
 	}
 	l := stalePush
 	l.mu.Lock()
-	for _, s := range l.byKey[key] {
-		s.replaced = true
+	for _, serves := range l.byKey[key] {
+		for _, s := range serves {
+			s.replaced = true
+		}
 	}
 	l.mu.Unlock()
 }
@@ -368,24 +440,24 @@ type stalePushSample struct {
 	ms    int64
 }
 
-// stalePushFrameWritten: the /refreshes handler WROTE a refresh frame for key.
-// Every replaced serve of key closes pushed.
-func stalePushFrameWritten(key string) {
+// stalePushFrameWritten: the /refreshes handler WROTE a refresh frame for key
+// on a stream of subject. Every replaced serve of (key, subject) closes pushed.
+func stalePushFrameWritten(key, subject string) {
 	if stalePushOpenTotal.Load() == 0 {
 		return
 	}
 	l := stalePush
 	now := StalePushNow()
 	l.mu.Lock()
-	samples := l.pushLocked(key, now, nil)
+	samples := l.pushLocked(key, subject, now, nil)
 	l.mu.Unlock()
 	recordStalePushSamples(samples)
 }
 
-// stalePushResyncWritten: a resync frame was WRITTEN to a stream armed for
-// keys (the SPA re-reads every armed key): every replaced serve of them closes
-// pushed.
-func stalePushResyncWritten(keys map[string]struct{}) {
+// stalePushResyncWritten: a resync frame was WRITTEN to a stream of subject
+// armed for keys (the SPA re-reads every armed key): every replaced serve of
+// them for subject closes pushed.
+func stalePushResyncWritten(keys map[string]struct{}, subject string) {
 	if stalePushOpenTotal.Load() == 0 {
 		return
 	}
@@ -394,33 +466,37 @@ func stalePushResyncWritten(keys map[string]struct{}) {
 	var samples []stalePushSample
 	l.mu.Lock()
 	for k := range keys {
-		samples = l.pushLocked(k, now, samples)
+		samples = l.pushLocked(k, subject, now, samples)
 	}
 	l.mu.Unlock()
 	recordStalePushSamples(samples)
 }
 
-// pushLocked closes key's replaced serves at now. Caller holds mu.
-func (l *stalePushLedger) pushLocked(key string, now time.Time, out []stalePushSample) []stalePushSample {
-	serves := l.byKey[key]
+// pushLocked closes (key, subject)'s replaced serves at now in one pass.
+// Caller holds mu.
+func (l *stalePushLedger) pushLocked(key, subject string, now time.Time, out []stalePushSample) []stalePushSample {
+	serves := l.byKey[key][subject]
 	if len(serves) == 0 {
 		return out
 	}
-	var done []*staleServe
+	keep := serves[:0]
 	for _, s := range serves {
-		if s.replaced {
-			done = append(done, s)
+		if !s.replaced {
+			keep = append(keep, s)
+			continue
 		}
-	}
-	for _, s := range done {
 		ms := max(0, now.Sub(s.servedAt).Milliseconds())
 		if ms > StaleToPushMaxMS && !s.overdue {
 			s.overdue = true
 			stalePushStats.unreplaced[s.layer].Add(1)
 		}
-		l.closeLocked(s, closePushedIdx)
+		l.countCloseLocked(s, closePushedIdx)
 		out = append(out, stalePushSample{layer: s.layer, ms: ms})
 	}
+	for i := len(keep); i < len(serves); i++ {
+		serves[i] = nil // release the closed serves' tail slots
+	}
+	l.setServesLocked(key, subject, keep)
 	return out
 }
 
@@ -452,9 +528,13 @@ func ensureStalePushScanner() {
 	})
 }
 
+// stalePushClient is one (key, subject) pair the overdue scan checks.
+type stalePushClient struct{ key, subject string }
+
 // scanStalePushOverdue counts, once each, the open serves past the 10 s max
-// whose key a /refreshes stream is armed for. The hub is read with the ledger
-// lock released; a serve closed in between is simply gone at the re-check.
+// whose subject has a /refreshes stream armed for the key. The hub is read with
+// the ledger lock released; a serve closed in between is simply gone at the
+// re-check.
 func scanStalePushOverdue() {
 	if stalePushOpenTotal.Load() == 0 {
 		return
@@ -462,20 +542,22 @@ func scanStalePushOverdue() {
 	now := StalePushNow()
 	l := stalePush
 	l.mu.Lock()
-	var keys []string
-	for k, serves := range l.byKey {
-		for _, s := range serves {
-			if !s.overdue && now.Sub(s.servedAt).Milliseconds() >= StaleToPushMaxMS {
-				keys = append(keys, k)
-				break
+	var clients []stalePushClient
+	for k, subs := range l.byKey {
+		for sub, serves := range subs {
+			for _, s := range serves {
+				if !s.overdue && now.Sub(s.servedAt).Milliseconds() >= StaleToPushMaxMS {
+					clients = append(clients, stalePushClient{k, sub})
+					break
+				}
 			}
 		}
 	}
 	l.mu.Unlock()
-	viewed := keys[:0]
-	for _, k := range keys {
-		if HasRefreshSubscriber(k) {
-			viewed = append(viewed, k)
+	viewed := clients[:0]
+	for _, c := range clients {
+		if HasRefreshSubscriberAs(c.key, c.subject) {
+			viewed = append(viewed, c)
 		}
 	}
 	if len(viewed) == 0 {
@@ -485,8 +567,8 @@ func scanStalePushOverdue() {
 	var sample [stalePushLayers]string
 	var oldest [stalePushLayers]int64
 	l.mu.Lock()
-	for _, k := range viewed {
-		for _, s := range l.byKey[k] {
+	for _, c := range viewed {
+		for _, s := range l.byKey[c.key][c.subject] {
 			age := now.Sub(s.servedAt).Milliseconds()
 			if s.overdue || age < StaleToPushMaxMS {
 				continue
@@ -495,7 +577,7 @@ func scanStalePushOverdue() {
 			stalePushStats.unreplaced[s.layer].Add(1)
 			newly[s.layer]++
 			if age > oldest[s.layer] {
-				oldest[s.layer], sample[s.layer] = age, k
+				oldest[s.layer], sample[s.layer] = age, c.key
 			}
 		}
 	}
@@ -504,14 +586,15 @@ func scanStalePushOverdue() {
 		if n == 0 {
 			continue
 		}
-		// One line per layer per scan (metadata only): a failure, never per-serve volume.
+		// One line per layer per scan (metadata only, never the subject): a
+		// failure, never per-serve volume.
 		slog.Warn("cache.stale_push_unreplaced",
 			slog.String("subsystem", "cache"),
 			slog.String("layer", StaleLayers[li]),
 			slog.Int("serves", n),
 			slog.Int64("oldest_age_ms", oldest[li]),
 			slog.String("key_hash", sample[li]),
-			slog.String("effect", "a stale-served customer response has not been replaced on its armed /refreshes stream within the 10 s goal max; the tab keeps showing stale data until a frame is written"),
+			slog.String("effect", "a stale-served customer response has not been replaced on its client's armed /refreshes stream within the 10 s goal max; the tab keeps showing stale data until a frame is written"),
 		)
 	}
 }
@@ -689,7 +772,7 @@ func AddStaleToPushForTest(layer string, ms int64) bool {
 func ResetStalePushForTest() {
 	l := stalePush
 	l.mu.Lock()
-	l.byKey = map[string][]*staleServe{}
+	l.byKey = map[string]map[string][]*staleServe{}
 	l.order = list.New()
 	stalePushOpenTotal.Store(0)
 	l.mu.Unlock()

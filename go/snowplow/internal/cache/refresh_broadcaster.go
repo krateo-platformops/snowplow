@@ -246,6 +246,11 @@ type refreshSub struct {
 
 	// subscribedAt feeds stream_seconds_total at unsub (C12).
 	subscribedAt time.Time
+	// subject (#1062) is the connection's authenticated user as the stale-push
+	// ledger keys a client (StaleSubject): a frame written here closes only
+	// that user's stale serves. In memory only; never logged. "" for the
+	// in-process falsifiers' streams (SubscribeRefreshStream).
+	subject string
 
 	// C10 eviction pacing, all guarded by pmu (lock order: hub.mu -> pmu).
 	pmu     sync.Mutex
@@ -842,7 +847,7 @@ type RefreshStream struct {
 
 // SubscribeRefresh is SubscribeRefreshStream without the resync channel —
 // the shape the in-process falsifiers read. The /refreshes handler uses
-// SubscribeRefreshStream.
+// SubscribeRefreshStreamAs.
 func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 	st := SubscribeRefreshStream(armedKeys)
 	return st.Keys, st.Unsub
@@ -855,7 +860,17 @@ func SubscribeRefresh(armedKeys map[string]struct{}) (<-chan string, func()) {
 // When the layer is disabled it returns a closed Keys channel, a nil Resync
 // (never fires) and a no-op unsub, so the handler degrades to a clean idle
 // stream (transparent fallback).
+//
+// It is SubscribeRefreshStreamAs with no subject: the in-process falsifiers'
+// stream. The /refreshes handler subscribes AS its authenticated user.
 func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
+	return SubscribeRefreshStreamAs("", armedKeys)
+}
+
+// SubscribeRefreshStreamAs is SubscribeRefreshStream for the connection of
+// subject (StaleSubject of the authenticated username, #1062): the stale-push
+// ledger pairs a frame written on this stream only with that user's serves.
+func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) RefreshStream {
 	h := refreshHub()
 	if h == nil {
 		ch := make(chan string)
@@ -869,6 +884,7 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		keys:         make(map[string]struct{}, len(armedKeys)),
 		ch:           make(chan string, refreshSubChanCap),
 		subscribedAt: time.Now(),
+		subject:      subject,
 		limiter:      rate.NewLimiter(limit, burst),
 		pending:      map[string]struct{}{},
 		rpending:     map[string]struct{}{},
@@ -943,12 +959,12 @@ func SubscribeRefreshStream(armedKeys map[string]struct{}) RefreshStream {
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
-			s.frameWritten(k)        // #1070: put_to_frame, on the same write point
-			stalePushFrameWritten(k) // #1062 — the replacing frame reached this stream
+			s.frameWritten(k)                 // #1070: put_to_frame, on the same write point
+			stalePushFrameWritten(k, subject) // #1062 — the replacing frame reached this client's stream
 		},
 		WroteResync: func() {
 			ledgerResyncWritten(armedCopy)
-			stalePushResyncWritten(armedCopy) // #1062
+			stalePushResyncWritten(armedCopy, subject) // #1062
 		},
 	}
 }
@@ -1056,6 +1072,24 @@ func HasRefreshSubscriber(l1Key string) bool {
 	n := len(h.keySubs[l1Key])
 	h.mu.RUnlock()
 	return n > 0
+}
+
+// HasRefreshSubscriberAs reports whether >=1 connection of subject is armed
+// for l1Key (#1062: the stale-push overdue scan asks it per client). O(armed
+// connections for the key) under RLock. Nil-safe: no hub -> false.
+func HasRefreshSubscriberAs(l1Key, subject string) bool {
+	h := refreshHub()
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, s := range h.keySubs[l1Key] {
+		if s.subject == subject {
+			return true
+		}
+	}
+	return false
 }
 
 // RefreshSubscriberCount returns the current number of live /refreshes
