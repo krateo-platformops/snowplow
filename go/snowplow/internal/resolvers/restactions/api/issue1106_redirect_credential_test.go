@@ -10,9 +10,13 @@ package api
 //      308) the full body.
 //   C  every credential kind: bearer, basic (client-go and plumbing branches),
 //      client certificate, AWS signature — 0 requests at the other host.
-//   D  an endpoint with no credential keeps net/http's behaviour (a public
-//      redirect is followed), unless the hop itself carries a credential header.
-//   E  the transport backstop refuses the hop when CheckRedirect is replaced.
+//   D  a credential in a stage header (X-Api-Key, X-Auth-Token, PRIVATE-TOKEN)
+//      on an endpoint with no credential of its own: 0 requests elsewhere,
+//      another host or another port of the same hostname.
+//   F  the refusal holds with the wire dump on (debug Secret on both builder
+//      branches, the verbose wire dump).
+// The transport backstop and the 10-hop bound are pinned in internal/credhttp
+// (endpoint_redirect_1106_test.go).
 
 import (
 	"context"
@@ -24,7 +28,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +40,6 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
-	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 var x1106RedirectCodes = []int{
@@ -189,9 +191,6 @@ func TestIssue1106_C_EveryCredentialKindStaysOnItsHost(t *testing.T) {
 				other := x1106TLSRequestingClientCert(t, x1106OK)
 				api := newTLSRedirector(t, code, x1106OtherURL(other.srv)+"/stolen")
 				ep := tc.ep(api.URL, caOf(api))
-				if !credhttp.EndpointPresentsCredential(ep) {
-					t.Fatal("PRE: the fixture must present a credential")
-				}
 				res, body, _, _ := httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
 					RequestInfo: httpcall.RequestInfo{Path: "/zd/tickets/42", Verb: ptr.To(http.MethodPut), Payload: ptr.To(x1106Body)},
 					Endpoint:    ep,
@@ -208,50 +207,41 @@ func TestIssue1106_C_EveryCredentialKindStaysOnItsHost(t *testing.T) {
 	}
 }
 
-func TestIssue1106_D_UncredentialedHopKeepsDefaultBehaviour(t *testing.T) {
-	t.Run("public_redirect_followed", func(t *testing.T) {
-		other := newX1106Srv(t, false, x1106OK)
-		api := newX1106Srv(t, false, func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, x1106OtherURL(other.srv)+"/index.yaml", http.StatusFound)
-		})
-		res, body, _, _ := httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
-			RequestInfo: httpcall.RequestInfo{Path: "/charts/index.yaml", Verb: ptr.To(http.MethodGet)},
-			Endpoint:    &endpoints.Endpoint{ServerURL: api.srv.URL},
-		})
-		if len(other.all()) != 1 || res == nil || res.Status == response.StatusFailure || body == nil {
-			t.Fatalf("an endpoint with no credential keeps following a redirect: hits=%d res=%+v", len(other.all()), res)
+// D — a credential snowplow cannot see: an endpoint Secret with no credential,
+// and a stage header carrying one under a name net/http does not strip on a
+// cross-host redirect. The hop is refused whatever the headers.
+func TestIssue1106_D_StageHeaderCredentialNeverLeavesTheOrigin(t *testing.T) {
+	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "PRIVATE-TOKEN"} {
+		for _, target := range []string{"other_host", "same_hostname_other_port"} {
+			t.Run(h+"_"+target, func(t *testing.T) {
+				other := newX1106Srv(t, false, x1106OK)
+				to := x1106OtherURL(other.srv)
+				if target == "same_hostname_other_port" {
+					to = other.srv.URL
+				}
+				ep := newX1106Srv(t, false, func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, to+"/stolen", http.StatusFound)
+				})
+				x1106Env(t, "", map[string]map[string]string{x1106Ref: {"server-url": ep.srv.URL}})
+				s := x1106Stage("r", http.MethodGet, "/zd/tickets/42")
+				s.Headers = []string{h + ": " + x1106Token}
+				o := x1106Resolve(t, x1106Extras, s)
+				if hits := ep.all(); len(hits) != 1 {
+					t.Fatalf("PRE: the endpoint gets the one request, got %d", len(hits))
+				}
+				if hits := other.all(); len(hits) != 0 {
+					t.Fatalf("RED: the %s header followed the redirect to %s (%d request(s))", h, target, len(hits))
+				}
+				x1106WantReason(t, o.outcomes, "r", StageReasonError)
+			})
 		}
-	})
-	t.Run("credential_header_refused", func(t *testing.T) {
-		other := newX1106Srv(t, false, x1106OK)
-		// Same hostname, another port: another service, and net/http keeps a
-		// Cookie or an Authorization header on it (shouldCopyHeaderOnRedirect
-		// compares hostnames only, and accepts a subdomain). A hop that carries
-		// one is credentialed whatever the endpoint is.
-		api := newX1106Srv(t, false, func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, other.srv.URL+"/stolen", http.StatusFound)
-		})
-		cli, err := httpClientForEndpoint(context.Background(), &endpoints.Endpoint{ServerURL: api.srv.URL}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req, _ := http.NewRequest(http.MethodGet, api.srv.URL+"/x", nil)
-		req.Header.Set("Cookie", "session="+x1106Token)
-		resp, err := cli.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		if len(other.all()) != 0 || resp.StatusCode != http.StatusFound {
-			t.Fatalf("RED: a hop carrying a credential header followed a cross-host redirect (hits=%d, status=%d)", len(other.all()), resp.StatusCode)
-		}
-	})
+	}
 }
 
 // F — the wire dump never displaces the redirect policy (the oasgen #379
 // trap: a debug wrapper assigned back onto the client bypassed its checks).
-// The dump is installed INSIDE the policy, in the one place the stack is
-// composed (wrapEndpointClient), on both builder branches.
+// The refusal is applied by credhttp.Send, outermost on whatever client the
+// builders and wrapEndpointClient composed, the dump included.
 func TestIssue1106_F_DebugAndVerboseKeepTheRefusal(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -285,26 +275,5 @@ func TestIssue1106_F_DebugAndVerboseKeepTheRefusal(t *testing.T) {
 				x1106WantReason(t, o.outcomes, "w", StageReasonError)
 			})
 		}
-	}
-}
-
-func TestIssue1106_E_TransportBackstopRefusesTheHop(t *testing.T) {
-	other := newX1106Srv(t, false, x1106OK)
-	api := newX1106Srv(t, false, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, x1106OtherURL(other.srv)+"/stolen", http.StatusTemporaryRedirect)
-	})
-	cli, err := httpClientForEndpoint(context.Background(), &endpoints.Endpoint{ServerURL: api.srv.URL, Token: x1106Token}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cp := *cli
-	cp.CheckRedirect = nil // a later copy that dropped the policy: net/http's default follows
-	_, err = cp.Get(api.srv.URL + "/x")
-	var refused *credhttp.RedirectRefusedError
-	if !errors.As(err, &refused) || refused.StatusCode != http.StatusTemporaryRedirect {
-		t.Fatalf("want the hop refused with the 307 named, got %v", err)
-	}
-	if len(other.all()) != 0 {
-		t.Fatalf("RED: the backstop let %d request(s) reach the other host", len(other.all()))
 	}
 }

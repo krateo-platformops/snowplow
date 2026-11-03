@@ -161,14 +161,14 @@ Content-Type: application/json
     it (`Skipped`, #904). An iterator write whose iterator yields **zero**
     items has nothing to send and still succeeds; a dry run still reports
     `StageNotExecuted`.
-  - **A credentialed redirect to another host is a failure (#1106).** A stage
-    whose endpoint answers a redirect to another origin (scheme, host, port)
-    is not followed when the hop would carry a credential (the endpoint's
-    token, basic auth, client certificate or AWS signature, or an
-    `Authorization`/`Cookie` header on the request). The stage fails with
-    `502` naming the redirect (`upstream answered 302 Found, a redirect
-    snowplow does not follow`); its row reads `Error`. A redirect within the
-    endpoint's own origin is still followed.
+  - **A redirect to another host is a failure (#1106).** A stage whose
+    endpoint answers a redirect to another origin (scheme, host, port) is
+    never followed, whatever the endpoint's credential or the stage's
+    headers: any header may carry a credential (`X-Api-Key`, …). The stage
+    fails with `502` naming the redirect (`upstream answered 302 Found, a
+    redirect snowplow does not follow`); its row reads `Error`. A redirect
+    within the endpoint's own origin is still followed (a stage with no
+    `endpointRef` follows none, #723).
     The header never carries an error message, a path, an identity or
     response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}` (N stages

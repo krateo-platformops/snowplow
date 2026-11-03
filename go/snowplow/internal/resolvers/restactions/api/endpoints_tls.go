@@ -165,19 +165,13 @@ func wrapEndpointClient(cli *http.Client, ep *endpoints.Endpoint, held, saDial b
 	// the object. credhttp.Client refuses at CheckRedirect (the caller sees the
 	// 3xx with its own code) and at the transport (no hop reaches the network).
 	//
-	// #1106 — a named endpointRef carries the third party's OWN credential, and
-	// the same RoundTripper argument holds for it: its bearer or basic auth is
-	// re-added on every hop and its client certificate is presented to whatever
-	// host a hop dials. So its client never sends a credential to another
-	// origin: a redirect within the endpoint's own origin is followed, one to
-	// another origin is refused whenever the hop would carry a credential (the
-	// endpoint's, or a credential header on the request), with the same two
-	// layers (credhttp/endpoint_redirect.go). The caller sees the 3xx, reported
-	// as #729's 502 naming the redirect.
+	// #1106 — a named endpointRef's dial never leaves its origin either: a
+	// redirect elsewhere is refused by credhttp.Send, the one place every
+	// endpoint request leaves, outermost on this client, so nothing installed
+	// here (the wire dump above, a plumbing-built chain) can displace it
+	// (credhttp/endpoint_redirect.go).
 	if held || saDial {
 		cli = credhttp.Client(cli)
-	} else {
-		cli = credhttp.EndpointClient(cli, ep)
 	}
 	// #988 — whatever credential the stage dials with, its collection LISTs
 	// are a resolve's, so every endpoint client counts them

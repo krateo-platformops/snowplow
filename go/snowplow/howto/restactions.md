@@ -373,16 +373,16 @@ succeeds.
 
 ## Redirects and credentials
 
-A stage's credential never goes to another host (#1106). When an endpoint
+A stage's request never goes to another host (#1106). When an endpoint
 answers a redirect to another origin (scheme, host and port), snowplow does
-not follow it if the redirected request would carry a credential: the
-endpoint's token, basic auth, client certificate or AWS signature, or an
-`Authorization` or `Cookie` header on the request (a stage with `exportJwt`
-included). The stage fails with `502`, naming the redirect. A redirect within
-the endpoint's own origin is followed. A request that carries no credential
-at all keeps the default behaviour. A stage with no `endpointRef` (this
-cluster's apiserver, a snowplow-held credential) follows no redirect at all
-(#723).
+not follow it, whatever the endpoint's credential (token, basic auth, client
+certificate, AWS signature) and whatever the stage's `headers`: any header
+can carry a credential (`X-Api-Key`, `PRIVATE-TOKEN`, an `exportJwt` bearer),
+and the HTTP client would forward it. The stage fails with `502`, naming the
+redirect. A redirect within the endpoint's own origin is followed. A stage
+with no `endpointRef` (this cluster's apiserver, a snowplow-held credential)
+follows no redirect at all (#723). An endpoint that legitimately redirects
+elsewhere (a CDN, a moved host) must be given its final URL.
 
 ## jq templating of `path`, `payload` and `headers`
 

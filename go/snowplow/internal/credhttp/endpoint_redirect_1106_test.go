@@ -7,6 +7,7 @@ package credhttp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -50,57 +51,79 @@ func TestIssue1106_Origin(t *testing.T) {
 	}
 }
 
-func TestIssue1106_EndpointPresentsCredential(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		ep   *endpoints.Endpoint
-		want bool
-	}{
-		{"none", &endpoints.Endpoint{ServerURL: "https://h"}, false},
-		{"bearer", &endpoints.Endpoint{ServerURL: "https://h", Token: "t"}, true},
-		{"basic_username", &endpoints.Endpoint{ServerURL: "https://h", Username: "u"}, true},
-		{"basic_password", &endpoints.Endpoint{ServerURL: "https://h", Password: "p"}, true},
-		{"client_cert", &endpoints.Endpoint{ServerURL: "https://h", ClientCertificateData: "c", ClientKeyData: "k"}, true},
-		{"aws", &endpoints.Endpoint{ServerURL: "https://h", AwsAccessKey: "a", AwsSecretKey: "s", AwsRegion: "r"}, true},
-		{"userinfo", &endpoints.Endpoint{ServerURL: "https://u:p@h"}, true},
-		{"nil", nil, false},
-	} {
-		if got := EndpointPresentsCredential(tc.ep); got != tc.want {
-			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
-func TestIssue1106_PolicyRefusesOnlyACredentialedHopToAnotherOrigin(t *testing.T) {
+func TestIssue1106_RefusesEveryHopToAnotherOrigin(t *testing.T) {
 	own := "https://api.example.com:443"
-	other := mustURL(t, "https://evil.example.net/x")
-	same := mustURL(t, "https://api.example.com/moved")
-	cookie := http.Header{"Cookie": []string{"sid=1"}}
 	for _, tc := range []struct {
-		name string
-		p    endpointRedirectPolicy
-		u    *url.URL
-		h    http.Header
+		u    string
 		want bool
 	}{
-		{"credentialed_other", endpointRedirectPolicy{own: own, credentialed: true}, other, nil, true},
-		{"credentialed_same", endpointRedirectPolicy{own: own, credentialed: true}, same, nil, false},
-		{"header_other", endpointRedirectPolicy{own: own}, other, cookie, true},
-		{"header_same", endpointRedirectPolicy{own: own}, same, cookie, false},
-		{"bare_other", endpointRedirectPolicy{own: own}, other, http.Header{}, false},
-		{"credentialed_no_origin", endpointRedirectPolicy{credentialed: true}, same, nil, true},
+		{"https://api.example.com/moved", false},
+		{"https://API.example.com:443/moved?x=1", false},
+		{"https://evil.example.net/x", true},
+		{"https://evil.api.example.com/x", true}, // net/http keeps credential headers on a subdomain
+		{"https://api.example.com:8443/x", true}, // ... and on another port of the same hostname
+		{"http://api.example.com/x", true},       // a downgrade
 	} {
-		if got := tc.p.refuses(tc.u, tc.h); got != tc.want {
-			t.Errorf("%s: refuses=%v, want %v", tc.name, got, tc.want)
+		if got := refusesHop(own, mustURL(t, tc.u)); got != tc.want {
+			t.Errorf("%s: refused=%v, want %v", tc.u, got, tc.want)
+		}
+	}
+	if !refusesHop("", mustURL(t, "https://api.example.com/x")) {
+		t.Error("an unknown origin refuses every hop")
+	}
+}
+
+// The hop is refused WHATEVER its headers: a stage may carry a credential in
+// any header (X-Api-Key, X-Auth-Token, PRIVATE-TOKEN), which net/http keeps on
+// a cross-host redirect.
+func TestIssue1106_SendRefusesACrossOriginHopCarryingAnyHeader(t *testing.T) {
+	var otherHits []http.Header
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		otherHits = append(otherHits, r.Header.Clone())
+	}))
+	t.Cleanup(other.Close)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, strings.Replace(other.URL, "127.0.0.1", "localhost", 1)+"/stolen", http.StatusFound)
+	}))
+	t.Cleanup(api.Close)
+	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "Private-Token"} {
+		req, _ := http.NewRequest(http.MethodGet, api.URL+"/x", nil)
+		req.Header.Set(h, "KEY-canary")
+		resp, err := Send(SendSiteStage, &http.Client{}, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusFound || len(otherHits) != 0 {
+			t.Fatalf("%s: RED — a cross-host hop was sent (status %d, %d request(s) at the other host)", h, resp.StatusCode, len(otherHits))
 		}
 	}
 }
 
-func TestIssue1106_CheckRedirectKeepsTheTenHopBound(t *testing.T) {
-	c := EndpointClient(&http.Client{}, &endpoints.Endpoint{ServerURL: "https://api.example.com"})
+func TestIssue1106_SameOriginOnly_BoundBackstopAndInnerPolicy(t *testing.T) {
+	own := "https://api.example.com:443"
+	c := SameOriginOnly(&http.Client{}, own)
 	via := make([]*http.Request, 10)
-	if err := c.CheckRedirect(&http.Request{URL: mustURL(t, "https://api.example.com/x"), Header: http.Header{}}, via); err == nil {
+	if err := c.CheckRedirect(&http.Request{URL: mustURL(t, "https://api.example.com/x")}, via); err == nil {
 		t.Fatal("setting CheckRedirect replaces net/http's 10-redirect bound: it must be kept")
+	}
+	// A held client's refuse-all policy is still asked for a same-origin hop.
+	held := SameOriginOnly(Client(&http.Client{}), own)
+	if err := held.CheckRedirect(&http.Request{URL: mustURL(t, "https://api.example.com/x")}, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("a held client still refuses a same-origin redirect (#723), got %v", err)
+	}
+	// The backstop refuses the hop when CheckRedirect is dropped from a copy.
+	rt := c.Transport.(*refuseCrossOriginHops)
+	_, err := rt.RoundTrip(&http.Request{Method: http.MethodGet, URL: mustURL(t, "https://evil.example.net/x"),
+		Header: http.Header{}, Response: &http.Response{StatusCode: http.StatusTemporaryRedirect}})
+	var refused *RedirectRefusedError
+	if !errors.As(err, &refused) || refused.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("want the hop refused with the 307 named, got %v", err)
+	}
+	orig := &http.Client{}
+	_ = SameOriginOnly(orig, own)
+	if orig.CheckRedirect != nil || orig.Transport != nil {
+		t.Fatal("SameOriginOnly must not modify the client it is handed")
 	}
 }
 
