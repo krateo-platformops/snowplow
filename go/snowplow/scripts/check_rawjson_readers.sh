@@ -14,7 +14,6 @@
 #   - internal/cache/list_cell.go                      2  Raw / RawLen themselves (plain branch)
 #   - internal/cache/resolved.go                       2  entryBytes, plain branch (incremental handled first)
 #   - internal/cache/resolved_entry_items.go           2  EnsureItems parse fallback (incremental handled first)
-#   - internal/cache/ra_full_list_layers.go            1  raFullList class (never incremental)
 #   - internal/resolvers/restactions/api/apistage.go   1  content HIT: plain entry (incremental view handled next)
 #   - internal/resolvers/widgets/apiref/ra_full_list.go 1 raFullList class
 #   - internal/handlers/dispatchers/restactions.go     2  restactions class (never incremental)
@@ -32,7 +31,6 @@ declare -A allow=(
   [internal/cache/list_cell.go]=2
   [internal/cache/resolved.go]=2
   [internal/cache/resolved_entry_items.go]=2
-  [internal/cache/ra_full_list_layers.go]=1
   [internal/resolvers/restactions/api/apistage.go]=1
   [internal/resolvers/widgets/apiref/ra_full_list.go]=1
   [internal/handlers/dispatchers/restactions.go]=2

@@ -13,6 +13,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jqutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/utils/ptr"
 )
@@ -123,6 +124,7 @@ func evalJQE(ctx context.Context, q string, ds any) (string, error) {
 		return q, nil
 	}
 
+	defer slowcall.Start(ctx, slowcall.PhaseJQ).End() // #1054
 	out, err := jqutil.Eval(ctx,
 		jqutil.EvalOptions{
 			Query:        q,

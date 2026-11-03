@@ -47,6 +47,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -150,7 +151,8 @@ func gateContentEnvelope(
 	}
 	if name == "" {
 		// LIST envelope: {apiVersion, kind, items:[...]}.
-		return gateListEnvelope(ctx, gvr, ns, raw)
+		_, rawQuery, _ := splitPathQuery(call.GetPath())
+		return gateListEnvelope(ctx, gvr, ns, rawQuery, raw)
 	}
 	// GET-by-name: raw is a single object.
 	v, ok := gateGetEnvelope(ctx, gvr, raw)
@@ -182,6 +184,13 @@ var parseListEnvelopeHookForTest atomic.Pointer[func(schema.GroupVersionResource
 // the stored items and skips re-unmarshalling on every hit. Returns ok=false
 // on a malformed envelope (the caller stores RawJSON only — the gate then
 // falls back to the unmarshal path, byte-identical to pre-0.30.121).
+// parseListEnvelopeTimed is parseListEnvelope timed as the request's parse
+// phase (#1054).
+func parseListEnvelopeTimed(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
+	defer slowcall.Start(ctx, slowcall.PhaseParse).End()
+	return parseListEnvelope(gvr, raw)
+}
+
 func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
 	if h := parseListEnvelopeHookForTest.Load(); h != nil {
 		(*h)(gvr) // TEST-ONLY: the #882 herd arm's own parse seam
@@ -286,12 +295,13 @@ func stripManagedFields(obj map[string]any) {
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
 //
-// namespace is the LIST's own namespace ("" = cluster-wide). A non-nil error
-// is filterListByRBAC's: a *regateDeniedError (the requester may not make this
-// LIST, #961) or errGateFallthrough (not decided here — the caller falls
-// through to the apiserver).
-func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace string, parsed parsedListEnvelope) (any, error) {
-	kept, err := filterListByRBAC(ctx, gvr, namespace, parsed.items)
+// namespace is the LIST's own namespace ("" = cluster-wide) and rawQuery its
+// own query string (#1049: a metadata.name field selector carries a Name). A
+// non-nil error is filterListByRBAC's: a *regateDeniedError (the requester may
+// not make this LIST, #961) or errGateFallthrough (not decided here — the
+// caller falls through to the apiserver).
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, parsed parsedListEnvelope) (any, error) {
+	kept, err := filterListByRBAC(ctx, gvr, namespace, rawQuery, parsed.items)
 	if err != nil {
 		return nil, err
 	}
@@ -351,13 +361,13 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 // envelope, or a refresh path that stored RawJSON only). The hot path
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace string, raw []byte) (any, error) {
-	parsed, ok := parseListEnvelope(gvr, raw)
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, raw []byte) (any, error) {
+	parsed, ok := parseListEnvelopeTimed(ctx, gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
 		return nil, errGateFallthrough
 	}
-	return gateListItems(ctx, gvr, namespace, parsed)
+	return gateListItems(ctx, gvr, namespace, rawQuery, parsed)
 }
 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
@@ -711,6 +721,9 @@ func apistageContentServeAttempt(
 		return true
 	}
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
+		// #1054 — the request's content_read phase: the store lock, an
+		// incremental cell's snapshot drain, the stale-debt registry.
+		defer slowcall.Start(ctx, slowcall.PhaseContentRead).End()
 		// #710 PR-2b (D2, owner ruling "show then replace") — an ARMABLE customer
 		// read of a KNOWN-STALE cell is served the cell at once and opens (or
 		// joins) its debt: an immediate refill at top priority, then a push to
@@ -816,7 +829,7 @@ func apistageContentServeAttempt(
 			}
 		} else if isList {
 			if items, av, k, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
-				p, pOK := parseListEnvelope(gvr, raw)
+				p, pOK := parseListEnvelopeTimed(ctx, gvr, raw)
 				return p.items, p.apiVersion, p.kind, pOK
 			}); ok && len(items) > 0 {
 				parsed = parsedListEnvelope{
@@ -921,7 +934,10 @@ func apistageContentServeAttempt(
 		fromCell := false
 		if res.cell != nil && isList {
 			need, _ := cache.DepGenStartSeqFromContext(fillCtx)
-			if v, vok := res.cell.Snapshot(need); vok {
+			snap := slowcall.Start(ctx, slowcall.PhaseContentRead) // #1054: the cell's drain to need
+			v, vok := res.cell.Snapshot(need)
+			snap.End()
+			if vok {
 				if items := v.Items(); len(items) > 0 {
 					parsed = parsedListEnvelope{items: items, apiVersion: v.APIVersion(), kind: v.Kind()}
 					haveParsed = true
@@ -959,6 +975,10 @@ func apistageContentServeAttempt(
 		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
 		// zero result = not servable); the success path publishes the result right
 		// after the Put, before this reader's own gate.
+		// #1054 — the lead marker: this request's record names the flight it
+		// leads by the same key digest a joiner's wait names, so the records join.
+		lead := slowcall.StartLead(ctx, "content_flight", contentKey, gvr.String())
+		defer lead.End()
 		defer flight.complete(contentFlightResult{})
 		// #710 PR-1 — the fill runs DETACHED from this reader's cancellation, bounded
 		// by the server write deadline: a leader whose request goes away cannot fail
@@ -992,7 +1012,10 @@ func apistageContentServeAttempt(
 		// item, …), bounded by the detached fill ctx (the write deadline), while
 		// the fills in flight would exceed the shared ceiling. Joiners pay nothing.
 		gate := theContentFillGate()
-		if aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList)); aerr != nil {
+		adm := slowcall.Start(ctx, slowcall.PhaseFillAdmission) // #1054
+		aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList))
+		adm.End()
+		if aerr != nil {
 			// D1 — never admitted before the deadline: this reader and every
 			// joiner error. Nothing is dispatched, stored or served stale.
 			flight.complete(contentFlightResult{err: aerr})
@@ -1074,7 +1097,7 @@ func apistageContentServeAttempt(
 			var p parsedListEnvelope
 			var parseOK bool
 			pprof.Do(ctx, fillLabels, func(context.Context) {
-				p, parseOK = parseListEnvelope(gvr, dispatched)
+				p, parseOK = parseListEnvelopeTimed(ctx, gvr, dispatched)
 			})
 			if parseOK {
 				fill.parsed(len(p.items))
@@ -1225,7 +1248,8 @@ func apistageContentServeAttempt(
 				gateErr = errGateFallthrough
 			}
 		} else {
-			gated, gateErr = gateListItems(ctx, gvr, ns, parsed)
+			_, rawQuery, _ := splitPathQuery(call.Path)
+			gated, gateErr = gateListItems(ctx, gvr, ns, rawQuery, parsed)
 		}
 	} else {
 		gated, gateErr = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)

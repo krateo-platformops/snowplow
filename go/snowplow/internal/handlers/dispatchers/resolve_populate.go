@@ -731,7 +731,9 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// (dispatchers.go:86), never from cold dispatch or the prewarm walker, so
 	// this announces dep-change-driven re-resolves only. PublishRefresh is
 	// nil-safe and a no-op when the SSE layer is disabled or cache is off.
-	cache.PublishRefresh(key)
+	// #1070 — PublishRefreshed is PublishRefresh carrying this refresh's Put time
+	// (on rctx) so the frame it causes is timed from it (measurement only).
+	cache.PublishRefreshed(rctx, key)
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),

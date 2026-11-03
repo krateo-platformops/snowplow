@@ -288,13 +288,12 @@ func collapsedPath(path, verb string) (bool, skipReason) {
 	return true, skipReason{}
 }
 
-// rawPath is path without its query: the parser's own query strip, but NOT its
-// trailing-slash trim, which would erase the collapse discriminators.
+// rawPath is path without its query and fragment (#1073 F1: splitPathQuery,
+// the parser's own split), but NOT trailing-slash-trimmed, which would erase
+// the collapse discriminators.
 func rawPath(path string) string {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		return path[:i]
-	}
-	return path
+	p, _, _ := splitPathQuery(path)
+	return p
 }
 
 // validInterpolatedPath reports whether a rendered api-call path is safe to dial

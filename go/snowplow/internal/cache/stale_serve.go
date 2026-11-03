@@ -42,7 +42,10 @@ import (
 type StaleServeSink struct {
 	l1Key string
 	class string
-	mu    sync.Mutex
+	// subject (#1062) is the requester (StaleSubject): the stale-push ledger
+	// pairs this response's serve with that user's /refreshes stream only.
+	subject string
+	mu      sync.Mutex
 	// served is the content cells this resolve was served stale. Their reads
 	// were metric-neutral; Commit counts them as the request's hits.
 	served []staleServedRef
@@ -130,12 +133,13 @@ func StaleServeDisabled(ctx context.Context) bool {
 // of class (restactions, widgets) — eligible for the D2 stale serve — and
 // returns the sink its content reads note stale serves on. Install it ONLY on
 // a customer dispatch path whose stored cell is armed for /refreshes; never on
-// a background, inert or identity-free resolve.
-func WithStaleServeSink(ctx context.Context, l1Key, class string) (context.Context, *StaleServeSink) {
+// a background, inert or identity-free resolve. subject is the requester
+// (StaleSubject of the authenticated username, #1062).
+func WithStaleServeSink(ctx context.Context, l1Key, class, subject string) (context.Context, *StaleServeSink) {
 	if ctx == nil || l1Key == "" || StaleServeDisabled(ctx) {
 		return ctx, nil
 	}
-	s := &StaleServeSink{l1Key: l1Key, class: class}
+	s := &StaleServeSink{l1Key: l1Key, class: class, subject: subject}
 	return context.WithValue(ctx, ctxKeyStaleServeSink, s), s
 }
 
@@ -318,7 +322,11 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 	served := append([]staleServedRef(nil), s.served...)
 	servedAt := s.servedAt
 	s.mu.Unlock()
-	MarkStaleOwed(s.l1Key, servedAt)
+	MarkStaleOwed(s.l1Key)
+	// #1062 — the stale-derived body is about to be written under its armed
+	// key: one apistage stale serve, timed from the D2 serve until the frame
+	// that follows its replacement is written to a stream (stale_push.go).
+	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, servedAt)
 	// The stale bodies are now written: count their reads as this request's
 	// hits, exactly once (a withdrawn pass never reaches here), through the one
 	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547
@@ -378,34 +386,21 @@ var (
 	staleOwed      = map[string]*list.Element{} // value: *staleOwedMark
 	staleOwedOrder = list.New()
 
-	// staleOwedArmRecorder records stale_to_push for an owed push delivered at
-	// arm time (the tab armed after the replacement was published): the
-	// histogram lives with the D2 family (restactions/api), which installs it.
-	staleOwedArmRecorder atomic.Pointer[func(servedAt time.Time)]
-
 	staleOwedDropped   atomic.Uint64
 	staleOwedArmEmits  atomic.Uint64
 	staleOwedDelivered atomic.Uint64
 )
 
-// staleOwedMark is one owed push: its key and the EARLIEST stale serve still
-// owed (the stale_to_push origin for an arm-time delivery).
+// staleOwedMark is one owed push. Its timing lives in the stale-push ledger
+// (stale_push.go, #1062): the mark only carries the push to a late arm.
 type staleOwedMark struct {
-	key      string
-	servedAt time.Time
+	key string
 }
 
-// SetStaleOwedArmRecorder installs the arm-time stale_to_push recorder.
-func SetStaleOwedArmRecorder(f func(servedAt time.Time)) { staleOwedArmRecorder.Store(&f) }
-
-// MarkStaleOwed sets key's owed-push mark, keeping the earliest servedAt still
-// owed (a zero servedAt means "now").
-func MarkStaleOwed(key string, servedAt time.Time) {
+// MarkStaleOwed sets key's owed-push mark.
+func MarkStaleOwed(key string) {
 	if key == "" {
 		return
-	}
-	if servedAt.IsZero() {
-		servedAt = time.Now()
 	}
 	limit := defaultResolvedCacheMaxEntries
 	if c := ResolvedCache(); c != nil && c.maxEntries > 0 {
@@ -414,13 +409,10 @@ func MarkStaleOwed(key string, servedAt time.Time) {
 	staleOwedMu.Lock()
 	defer staleOwedMu.Unlock()
 	if e, ok := staleOwed[key]; ok {
-		if m := e.Value.(*staleOwedMark); servedAt.Before(m.servedAt) {
-			m.servedAt = servedAt
-		}
 		staleOwedOrder.MoveToBack(e)
 		return
 	}
-	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key, servedAt: servedAt})
+	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key})
 	for staleOwedOrder.Len() > limit {
 		front := staleOwedOrder.Front()
 		staleOwedOrder.Remove(front)
@@ -453,36 +445,26 @@ func staleOwedReady(key string) bool {
 	return true
 }
 
+// clearStaleOwed clears key's mark; false when it had none.
 func clearStaleOwed(key string) bool {
-	_, ok := takeStaleOwed(key)
-	return ok
-}
-
-// takeStaleOwed clears key's mark and returns its earliest owed servedAt.
-func takeStaleOwed(key string) (time.Time, bool) {
 	staleOwedMu.Lock()
 	defer staleOwedMu.Unlock()
 	e, ok := staleOwed[key]
 	if !ok {
-		return time.Time{}, false
+		return false
 	}
 	staleOwedOrder.Remove(e)
 	delete(staleOwed, key)
-	return e.Value.(*staleOwedMark).servedAt, true
+	return true
 }
 
 // noteStaleOwedArmEmit is the arm-time delivery of an owed push: it clears
-// the mark, counts the emit, and records stale_to_push = now − servedAt (the
-// tab showed the stale body all that time — the slowest corrections, which a
-// publish-time-only record would drop).
+// the mark and counts the emit. Its stale_to_push (now − the serve: the tab
+// showed the stale body all that time, #710 F2) is recorded when the handler
+// WRITES the frame offered here (stale_push.go, #1062), like every push.
 func noteStaleOwedArmEmit(key string) {
-	servedAt, ok := takeStaleOwed(key)
-	if !ok {
-		return
-	}
-	staleOwedArmEmits.Add(1)
-	if f := staleOwedArmRecorder.Load(); f != nil {
-		(*f)(servedAt)
+	if clearStaleOwed(key) {
+		staleOwedArmEmits.Add(1)
 	}
 }
 
@@ -564,6 +546,9 @@ func RunRefreshNow(ctx context.Context, l1Key string) error {
 	if fn == nil {
 		return ErrRefreshNowNoHandler
 	}
+	// #1070 — measurement only: a direct refresh is timed from here to its Put
+	// (no queue, so no wait).
+	ctx = withRefreshCycle(ctx, l1Key, RefreshTierDirect, windowNow())
 	return runRefreshFunc(ctx, fn, l1Key, *entry.Inputs)
 }
 
