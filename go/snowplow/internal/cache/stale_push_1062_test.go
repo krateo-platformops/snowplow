@@ -66,7 +66,7 @@ func (e *k1062Env) hitAs(t *testing.T, subject string) {
 	if !ok {
 		t.Fatalf("PRECONDITION: the cell is not resident")
 	}
-	NoteStaleHit(e.key, subject, entry)
+	NoteStaleHit(context.Background(), e.key, entry, func(context.Context) string { return subject })
 }
 
 func noFrameWithin(t *testing.T, st RefreshStream, d time.Duration) bool {
@@ -354,6 +354,73 @@ func TestIssue1062_RX2_AnotherClientsFrameNeverClosesAStrandedServe(t *testing.T
 	if s.ToPush.Count != 1 || s.ToPush.MaxMS != 1000 || s.Unreplaced != 1 || s.Open != 1 || s.Closes["pushed"] != 1 {
 		t.Fatalf("RX2 RED: samples=%d max=%d unreplaced=%d open=%d pushed=%d, want 1/1000/1/1/1 — A's frame closed B's serve",
 			s.ToPush.Count, s.ToPush.MaxMS, s.Unreplaced, s.Open, s.Closes["pushed"])
+	}
+}
+
+// LAZY — the requester digest is derived only when a stale serve OPENS: a
+// fresh armed hit (nearly every hit) never calls subjectOf; a stale one calls
+// it exactly once.
+// Mutation → RED: NoteStaleHit derives the subject before the stale check.
+func TestIssue1062_LAZY_TheRequesterDigestIsDerivedOnlyForAStaleServe(t *testing.T) {
+	e := newK1062(t)
+	calls := 0
+	subjectOf := func(context.Context) string { calls++; return "user:lazy" }
+	entry, _ := e.c.GetNoTouch(e.key)
+	NoteStaleHit(context.Background(), e.key, entry, subjectOf) // clean cell
+	if calls != 0 {
+		t.Fatalf("LAZY RED: a fresh hit derived the requester digest %d time(s), want 0", calls)
+	}
+	e.mark()
+	NoteStaleHit(context.Background(), e.key, entry, subjectOf) // dirty cell
+	if calls != 1 || k1062Layer(t, StaleLayerL1).Open != 1 {
+		t.Fatalf("LAZY: a stale hit derived the digest %d time(s) (want 1), open=%d", calls, k1062Layer(t, StaleLayerL1).Open)
+	}
+}
+
+// RV-ALL (reviewer arm, adopted) — replacement is a property of the CELL: four
+// users are served stale on one key 100 ms apart, then ONE accepted Put. Each
+// of three users' own frames closes exactly that user's serve (3 samples:
+// 1300 + 1200 + 1100 ms); the fourth user's late frame closes the fourth serve
+// too — the one Put replaced it as well.
+// Mutation → RED: a Put replaces only one subject's serves.
+func TestIssue1062_RVALL_OnePutReplacesEveryUsersServe(t *testing.T) {
+	e := newK1062(t)
+	subs := []string{"user:all-a", "user:all-b", "user:all-c", "user:all-d"}
+	var streams []RefreshStream
+	for _, s := range subs[:3] {
+		st := SubscribeRefreshStreamAs(s, map[string]struct{}{e.key: {}})
+		defer st.Unsub()
+		streams = append(streams, st)
+	}
+	e.mark()
+	for i, s := range subs {
+		e.hitAs(t, s)
+		if i < 3 {
+			e.advance(100 * time.Millisecond)
+		}
+	}
+	e.advance(time.Second)
+	e.put(t, WithL1KeyContext(context.Background(), e.key), false) // ONE Put
+	PublishRefresh(e.key)
+	for i, st := range streams {
+		select {
+		case k := <-st.Keys:
+			st.Wrote(k)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("PRECONDITION: user %d's stream got no frame", i)
+		}
+	}
+	s := k1062Layer(t, StaleLayerL1)
+	if s.ToPush.Count != 3 || s.ToPush.SumMS != 3600 || s.ToPush.MaxMS != 1300 || s.Open != 1 {
+		t.Fatalf("RV-ALL RED: samples=%d sum=%d max=%d open=%d, want 3/3600/1300/1 — each user's frame closes exactly its own serve",
+			s.ToPush.Count, s.ToPush.SumMS, s.ToPush.MaxMS, s.Open)
+	}
+	late := SubscribeRefreshStreamAs(subs[3], map[string]struct{}{e.key: {}})
+	defer late.Unsub()
+	late.Wrote(e.key)
+	if s := k1062Layer(t, StaleLayerL1); s.ToPush.Count != 4 || s.Open != 0 {
+		t.Fatalf("RV-ALL RED: the fourth user's late frame left samples=%d open=%d, want 4/0 — the one Put did not replace that user's serve",
+			s.ToPush.Count, s.Open)
 	}
 }
 

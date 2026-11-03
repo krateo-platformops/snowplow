@@ -34,6 +34,8 @@ func expvarJSON(t *testing.T, name string) map[string]any {
 	return out
 }
 
+func noSubject(context.Context) string { return "" }
+
 func inSet(set []string, v string) bool {
 	for _, s := range set {
 		if s == v {
@@ -86,9 +88,9 @@ func TestIssue1062_StalePushOTLPEqualsExpvarForEveryLayer(t *testing.T) {
 	now.Store(base.UnixNano())
 	t.Cleanup(cache.SetStalePushClockForTest(func() time.Time { return time.Unix(0, now.Load()) }))
 	derived := &cache.ResolvedEntry{RawJSON: []byte(`{}`), StaleDerived: true}
-	cache.NoteStaleHit("k1062-viewed", "", derived)
-	cache.NoteStaleHit("k1062-unviewed", "", derived)
-	cache.NoteStaleHit("k1062-unviewed", "", derived)
+	cache.NoteStaleHit(context.Background(), "k1062-viewed", derived, noSubject)
+	cache.NoteStaleHit(context.Background(), "k1062-unviewed", derived, noSubject)
+	cache.NoteStaleHit(context.Background(), "k1062-unviewed", derived, noSubject)
 	st := cache.SubscribeRefreshStream(map[string]struct{}{"k1062-viewed": {}})
 	defer st.Unsub()
 	now.Store(base.Add(11 * time.Second).UnixNano())
