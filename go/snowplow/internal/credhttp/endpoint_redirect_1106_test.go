@@ -60,16 +60,29 @@ func TestIssue1106_RefusesEveryHopToAnotherOrigin(t *testing.T) {
 		{"https://api.example.com/moved", false},
 		{"https://API.example.com:443/moved?x=1", false},
 		{"https://evil.example.net/x", true},
-		{"https://evil.api.example.com/x", true}, // net/http keeps credential headers on a subdomain
-		{"https://api.example.com:8443/x", true}, // ... and on another port of the same hostname
-		{"http://api.example.com/x", true},       // a downgrade
+		{"https://evil.api.example.com/x", true}, // net/http keeps credential headers on a subdomain (oasgen A1)
+		{"https://api.example.com:8443/x", true}, // ... and on another port of the same hostname (oasgen 7, 9)
+		{"http://api.example.com/x", true},       // a downgrade (oasgen 10, 12)
+		// The rows of oasgen's host-policy conformance list that apply to an
+		// origin-equality rule:
+		{"https://api.example.com.attacker.net/x", true},     // A2: no suffix or substring match
+		{"https://api.example.com@evil.example.net/x", true}, // 20: userinfo cannot stand in for the host
+		{"https://collaborators/x", true},                    // 23: a single-label name (a search-domain Service)
+		{"https://api.example.com:443/moved", false},         // 23: a spelled-out default port is the same origin
+		{"https://api.example.com./moved", false},            // 17: a trailing dot is the same name to DNS
+		{"https://API.EXAMPLE.COM/moved", false},             // 18: case
+		{"http://api.example.com:443/x", true},               // scheme participates even on the same port
 	} {
 		if got := refusesHop(own, mustURL(t, tc.u)); got != tc.want {
 			t.Errorf("%s: refused=%v, want %v", tc.u, got, tc.want)
 		}
 	}
-	if !refusesHop("", mustURL(t, "https://api.example.com/x")) {
-		t.Error("an unknown origin refuses every hop")
+	// oasgen 3/4: the zero value refuses. An origin snowplow could not read
+	// (no scheme, no host, a bare trailing dot) refuses every hop.
+	for _, own := range []string{"", Origin(mustURL(t, "/relative")), Origin(mustURL(t, "https://./x"))} {
+		if !refusesHop(own, mustURL(t, "https://api.example.com/x")) {
+			t.Errorf("own=%q: an unknown origin refuses every hop", own)
+		}
 	}
 }
 

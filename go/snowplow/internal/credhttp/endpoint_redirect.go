@@ -66,9 +66,14 @@ const maxRedirects = 10
 var errTooManyRedirects = errors.New("stopped after 10 redirects")
 
 // Origin is the (scheme, host, port) a URL addresses, lower-cased, with the
-// scheme's default port made explicit; "" when u has no scheme or host.
+// scheme's default port made explicit and one trailing dot of the hostname
+// dropped (the same name to DNS); "" when u has no scheme or host. The host is
+// url.Hostname(), so userinfo can never stand in for it
+// (`https://api.example.com@evil.example.net` is evil.example.net), and the
+// comparison is equality, never a suffix or a substring
+// (`api.example.com.attacker.net` is another origin).
 func Origin(u *url.URL) string {
-	if u == nil || u.Scheme == "" || u.Hostname() == "" {
+	if u == nil || u.Scheme == "" || strings.TrimSuffix(u.Hostname(), ".") == "" {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -81,7 +86,7 @@ func Origin(u *url.URL) string {
 			port = "80"
 		}
 	}
-	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")), port)
 }
 
 // refusesHop reports whether a redirect hop to u leaves own, the origin of the
