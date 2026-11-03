@@ -2572,6 +2572,12 @@ RUN8_KEYS = {
 # Members of the snowplow_resolved_cache map the Q2 report reads.
 RUN8_RESOLVED_CACHE_STATS = ("hit_total", "stale_served_total", "stale_served_age_ms_max",
                              "known_stale_served_total")
+# #1054 (snowplow PR #1059): the slow-call record. A request past slowcall.Bound
+# (the page p95 goal, 3 s) is counted by route and phase, and its record and
+# up to 2 goroutine snapshots are kept in /debug/vars rings: the snapshot
+# reaches the bench ONLY this way (logscrub hashes its stacks whole in the log).
+# Covers snowplow_slow_requests_* and snowplow_slow_request_* (bench/slowcall.py).
+SLOW_REQUEST_PREFIX = "snowplow_slow_request"
 # The /debug/vars prefixes memwatch must capture so every key above is seen.
 # run606's MEM_VARS_PREFIXES default IS this tuple (printed by `prefixes`), and
 # `check-prefixes` refuses a run-8 run whose prefixes miss any RUN8_KEYS value.
@@ -2620,6 +2626,7 @@ RUN8_VARS_PREFIXES = (
     "snowplow_apiserver_fallthrough_cells",
     "snowplow_resolve_collection_lists",  # #988 (PR #991): a resolve's collection LISTs on the wire
     "snowplow_crd_discovery",             # schema relists / build requests, on both mechanisms
+    SLOW_REQUEST_PREFIX,                  # #1054: the slow-call record, phase histogram and snapshots
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3786,6 +3793,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["profiling"] = profiling_report(
         mem or [], navs,
         k6eval.k6_page_loads(k6.get("k6")) if k6 is not None else None)
+    # #1054: the slow-call record per run (report only; UNMEASURED on a build without it)
+    from bench import slowcall
+    report["slow_requests"] = slowcall.report(mem or [], SLOW_REQUEST_PREFIX)
     # #871 — the work-class label: CPU per class from the profiles, units per
     # class from the expvar. Report only; local import (load606.py alone runs
     # in the cluster).
@@ -3826,9 +3836,22 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["fresh_invalid_samples"] = len(fv)
 
     if run8:
-        r8, r8_checks = run8_report(navs, mem or [], tops or [], snowplow_pods,
-                                    fresh=fresh, push_refetches=push_refetches,
-                                    viewer_stats=viewer_stats)
+        # The k6 driver (#830): its first loads and composite deep links are k6's
+        # own page loads, tagged by kind (navs are Chrome's, by method: run 20's
+        # bursts ran and read as "not recorded"); its open tabs are the viewer
+        # sidecar's (run 20: 264,239 streams read as 0)
+        burst_navs, r8_viewers, r8_refetches = navs, viewer_stats, push_refetches
+        if k6 is not None:
+            burst_navs = k6eval.k6_burst_navs(k6.get("k6"))
+            vr = (k6.get("viewer") or {}).get("records") or []
+            r8_viewers = [r for r in vr if r.get("kind") == "viewer_stats"][-1:]   # cumulative: the last
+            r8_refetches = [r for r in vr if r.get("kind") == "push_refetch"]
+        r8, r8_checks = run8_report(burst_navs, mem or [], tops or [], snowplow_pods,
+                                    fresh=fresh, push_refetches=r8_refetches,
+                                    viewer_stats=r8_viewers)
+        r8["burst_and_delivery_source"] = (
+            "k6's page loads by kind; the viewer sidecar's viewer_stats / push_refetch" if k6 is not None
+            else "the load606 driver's navigations and viewer records")
         report["run8"] = r8
         checks.extend(r8_checks)
 
