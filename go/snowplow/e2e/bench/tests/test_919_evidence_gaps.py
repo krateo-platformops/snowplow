@@ -365,7 +365,9 @@ def test_each_call_carries_its_resource_name_and_namespace_never_the_extras(tmp_
                     {"name": "http://localhost:8081/call?resource=restactions&name=ra&namespace=ns",
                      "duration": 40}],
         "urls": [CALL_URL, "/call?resource=flexes&name=f", "http://h/callx?resource=r", "::bad"]})
-    assert out["calls"] == [
+    # (#1089 adds each entry's protocol and Resource Timing offsets beside these: test_1089)
+    keep = ("resource", "name", "namespace", "ms", "status")
+    assert [{k: c[k] for k in keep} for c in out["calls"]] == [
         {"resource": "tables", "name": "compositions-list", "namespace": "krateo-system", "ms": 812.4,
          "status": 200},
         {"resource": "restactions", "name": "ra", "namespace": "ns", "ms": 40, "status": 0}]
@@ -375,7 +377,7 @@ def test_each_call_carries_its_resource_name_and_namespace_never_the_extras(tmp_
     assert op[0] == "browser_call_ms" and op[1] == 812.4
     assert op[2] == {"session": "s1", "route": "/dashboard", "visit": "warm", "during": "load",
                      "call_resource": "tables", "call_name": "compositions-list",
-                     "call_namespace": "krateo-system", "call_status": "200"}
+                     "call_namespace": "krateo-system", "call_status": "200", "call_protocol": ""}
     assert "alice" not in json.dumps(out["calls"]) + json.dumps(out["ops"])
     assert not out["source"].lstrip().startswith("export")      # shipped into the page as text
 

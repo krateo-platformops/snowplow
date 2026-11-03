@@ -19,7 +19,9 @@ Kinds (what an answered sample keeps):
        `apiserver_flowcontrol_*` series of the API server's /metrics. A
        regional control plane has several replicas behind one endpoint; each
        scrape lands on one of them, and process_start_time_seconds says
-       which (bench/apf.py differences counters only within one replica).
+       which (bench/apf.py differences counters only within one replica);
+       and {"requests_by_code": {code: n}}: apiserver_request_total summed
+       by code (#1089, bench/netpath.py), from the same scrape.
 
 `t` is when the sample ended (as the shell loop wrote it before), `t_start`
 when it began. SIGTERM stops the loop: the sample in flight is killed and not
@@ -32,6 +34,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -42,6 +45,10 @@ from bench import identity
 
 APF_PREFIX = "apiserver_flowcontrol_"
 REPLICA_SERIES = "process_start_time_seconds"
+# #1089: every request the API server answered, by code (retried 5xx / 429
+# under snowplow's dials); bench/netpath.py differences it per phase
+REQUESTS_TOTAL = "apiserver_request_total"
+_CODE = re.compile(r'[{,]code="([^"]*)"')
 
 
 class _Stopping(Exception):
@@ -101,11 +108,27 @@ def parse_top(text: str) -> dict:
 
 def parse_apf(text: str) -> dict:
     """The API server's flow-control series (Prometheus text format), each
-    `name{labels}` -> value, and the replica that answered."""
+    `name{labels}` -> value, the replica that answered, and (#1089)
+    apiserver_request_total summed by its `code` label ({code: total}; the
+    family's other labels — verb, resource, scope, ... — are thousands of
+    series: only the code is kept). No apiserver_request_total line at all:
+    requests_by_code is None (not read), never {}."""
     series: dict[str, float] = {}
     replica = None
+    codes: dict[str, float] | None = None
     for line in text.splitlines():
         if not line or line.startswith("#"):
+            continue
+        if line.startswith(REQUESTS_TOTAL + "{"):
+            cut = line.rfind("}")
+            m = _CODE.search(line[:cut + 1])
+            try:
+                value = float(line[cut + 1:].split()[0])
+            except (IndexError, ValueError):
+                continue
+            codes = {} if codes is None else codes
+            code = m.group(1) if m else ""
+            codes[code] = codes.get(code, 0.0) + value
             continue
         if not (line.startswith(APF_PREFIX) or line.startswith(REPLICA_SERIES)):
             continue
@@ -121,7 +144,7 @@ def parse_apf(text: str) -> dict:
             replica = value
         elif head.startswith(APF_PREFIX):
             series[head] = value
-    return {"replica": replica, "series": series}
+    return {"replica": replica, "series": series, "requests_by_code": codes}
 
 
 # top_boot: kubectl top through snowplow's restart (#922 F3: boot is its own
