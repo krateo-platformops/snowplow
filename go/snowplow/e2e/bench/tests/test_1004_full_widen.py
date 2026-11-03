@@ -549,6 +549,18 @@ def test_the_stage_crd_changes_exactly_once_the_widen(gen_after, ok):
     assert rec["passed"] is ok, rec["fail_reasons"]
 
 
+def test_a_recreated_stage_crd_is_not_its_widen():
+    """(the #1050 re-check's G3) the stage's CRD read with another uid at the
+    end, its generation one more: that is a deleted and recreated CRD, not the
+    widen; its delta is unknown, so the result is refused."""
+    sp = FakeSnowplow("build_and_swap")
+    rc, recs, _ = watch(sp)
+    after = sp.crds(True) | {fw.CRD_NAME: {"uid": "u-fw-recreated", "generation": 2}}
+    rec = _eval(sp, recs, crds_after=after)
+    assert not rec["passed"] and rec["attribution"]["stage_crd_generation_delta"] is None
+    assert any("the stage's CRD changed None time(s)" in r for r in rec["fail_reasons"])
+
+
 def test_a_crd_created_deleted_or_recreated_in_the_window_is_reported_not_refused():
     """A CRD's first observation and its deletion relist nothing: reported. A
     recreated CRD (a new uid, its generation back to 1) is not a spec change."""
