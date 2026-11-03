@@ -596,6 +596,18 @@ def browser_navs(o: dict | None) -> list[dict]:
             for v, t in o["points"].get("browser_page_load_ms", [])]
 
 
+BURST_KINDS = ("first_load", "composite_first_load")
+
+
+def k6_burst_navs(o: dict | None) -> list[dict]:
+    """k6's first loads and composite deep links (navigate.js tags each
+    page_load_ms with its kind) as the nav records run8_report's burst
+    windows read: {"nav": kind, "start", "wall_ms"}. The browser's navs carry
+    the load's method instead, never these kinds."""
+    return [{"kind": "nav", "nav": t.get("kind"), "start": s, "wall_ms": ms, "page": t.get("route")}
+            for s, ms, t in k6_page_loads(o) if t.get("kind") in BURST_KINDS]
+
+
 def widget_timeouts_by_load(o: dict | None) -> tuple[dict, int]:
     """({(session, t0): widget-timeout states}, how many such states carry no
     t0): which load each widget-timeout state belongs to."""

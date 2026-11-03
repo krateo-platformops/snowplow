@@ -40,6 +40,24 @@ Latency PASSes when B / A <= tolerance; req/s (k6 is closed-loop: a click
 THINK_S after the page completed, so a slower snowplow shows as fewer req/s
 on the same schedule) when B / A >= 1 / tolerance.
 
+A judged cell the replica has no ratio for (#1053: steady — runs 12/13 had
+no steady phase) has no between-run term. Its PASS bar is the within-run
+one (any between-run term would only widen it, so PASSing inside it needs
+none), and it has NO FAIL bar: past the PASS bar it is INCONCLUSIVE, with
+that reason, until a replica for the cell exists (an A/A pair: `custlat
+replica` of two runs of one image on this schedule). A's within-run spread
+cannot stand in for the between-run term, at any block length: a cluster's
+constant offset (its node CPU platform, its control plane) adds nothing to
+the spread inside a run, so that spread is a lower bound on the between-run
+one, never an estimate of it. The data is consistent with that, no more
+(#1053): run 19's steady p95 B/A, 1.060, is past its A's bar at every block
+length (10, 60, 300 or 600 s: at most 1.043), but that pair compares two
+images, so it cannot tell code from a cluster offset; run 17's 0.937 (1.068
+the other way) is inside its own A's bar at 3 of those 4 block lengths. The
+rule rests on the offset argument, not on these numbers. B's own spread (or
+B / A per segment) is the instrument under test: a noisier candidate would
+loosen its own bar.
+
 Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
 2026-10-24):
   - any snowplow restart (or pod replacement) in B, the candidate, FAILs the
@@ -850,7 +868,45 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
             "k6_errors": k6_errors(k6o),
             "clicks_vs_open_schedule": clicks_vs_schedule(k6o, wins),
             "refresher_completions": refresher_per_phase(mem, wins, span),
-            "snowplow_cpu": cpu_per_phase(tops, wins, span)}
+            "snowplow_cpu": cpu_per_phase(tops, wins, span),
+            "page_loads_by_phase": page_loads_by_phase(browser, k6o, pooled(wins))}
+
+
+# the page goal (#710 ruling, the north-star): p95 <= 3 s, max <= 10 s, the
+# login storm included
+PAGE_P95_GOAL_MS, PAGE_MAX_GOAL_MS = 3000.0, 10000.0
+
+
+def _page_stats(rows: list[tuple[float, float]], wins) -> dict:
+    """Per phase (the gate's pooled windows, by each load's START): n, p50,
+    p95, max and the goal's two marks; a phase no load started in is
+    UNMEASURED, never a pass."""
+    out = {}
+    for name in _names(wins):
+        ms = [m for t, m in rows if _phase(t, wins) == name]
+        if not ms:
+            out[name] = {"n": 0, "result": "UNMEASURED"}
+            continue
+        p95, mx = _pct(ms, 95), max(ms)
+        out[name] = {"n": len(ms), "p50_ms": round(_pct(ms, 50), 1), "p95_ms": round(p95, 1), "max_ms": round(mx, 1),
+                     "p95_within_goal": p95 <= PAGE_P95_GOAL_MS, "max_within_goal": mx <= PAGE_MAX_GOAL_MS}
+    return out
+
+
+def page_loads_by_phase(browser: dict | None, k6o: dict | None, wins) -> dict:
+    """REPORT ONLY (run 20: page loads were split only inside/outside a CPU
+    profile): page-load time by phase, against the page goal. `browser`: the
+    real Chrome loads (the north-star's); `k6`: k6's protocol-level page loads
+    by kind (first_load in the login storm, composite_first_load in the
+    burst, route clicks)."""
+    navs = [n for n in k6eval.browser_navs(browser) if n.get("start") is not None]
+    k6l = k6eval.k6_page_loads(k6o)
+    kinds = sorted({t.get("kind") or "?" for _, _, t in k6l})
+    return {"goal": {"p95_ms": PAGE_P95_GOAL_MS, "max_ms": PAGE_MAX_GOAL_MS},
+            "browser": _page_stats([(n["start"], n["wall_ms"]) for n in navs], wins) if browser else None,
+            "k6": ({k: _page_stats([(s, ms) for s, ms, t in k6l if (t.get("kind") or "?") == k], wins) for k in kinds}
+                   if k6o else None),
+            "note": "report only; a load is in the phase its start falls in (customer_latency's pooled windows)"}
 
 
 def _validity(name, ok, value, bar, why):
@@ -1084,7 +1140,9 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
            "method": {"block_s": BLOCK_S, "half_samples": HALF_SAMPLES, "half_seed": HALF_SEED,
                       "family_alpha": FAMILY_ALPHA,
                       "tolerance": "max(exp(z * sqrt(2) * A's half-sample sd), replica ratio); "
-                                   "latency: B / A <= tolerance; req_s: B / A >= 1 / tolerance",
+                                   "latency: B / A <= tolerance; req_s: B / A >= 1 / tolerance; a cell "
+                                   "with no replica ratio PASSes inside the within-run bar and has no "
+                                   "FAIL bar: past it INCONCLUSIVE (no between-run term measured)",
                       "ready_time": "cells over the time both runs' snowplow was Ready (each run's "
                                     "not-Ready stretches removed from both, by phase-relative time); "
                                     "PASS iff B / A * (within_kept / within) <= max(within, replica) with "
@@ -1332,7 +1390,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
         cells = [(p, m) for p in judged for m in METRICS]
         z = NormalDist().inv_cdf(1 - FAMILY_ALPHA / len(cells)) if cells else None
         out["method"].update(cells=len(cells), z=round(z, 4) if z else None, judged=judged,
-                             shown=list(SHOWN) + ["each churn step"])
+                             shown=list(SHOWN) + ["each churn step"],
+                             no_replica=[f"{p}.{m}" for p, m in cells if _replica(replica, p, m) is None])
         wa, wb = pooled(_wins(ra)), pooled(_wins(rb))
         for p in judged:
             if not (gb.get(p) or {}).get("n"):
@@ -1497,7 +1556,12 @@ def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, full_sd=None, exclud
     (and strictly harder whenever the kept spread is > 0), FAIL keeps the
     kept sample's own false-FAIL control, and with nothing excluded both bars
     are the one bar of before. A kept sample with no calls, or no spread
-    left, is INCONCLUSIVE."""
+    left, is INCONCLUSIVE.
+
+    No replica for the cell (#1053; steady: runs 12/13 had no steady phase):
+    the PASS bar is the within-run one (the replica credits nothing), and
+    there is no FAIL bar — past the PASS bar is INCONCLUSIVE with that
+    reason, whatever the ratio, until a replica for the cell exists."""
     e = excluded or {"a_s": 0.0, "b_s": 0.0, "why": []}
     sa, sb = sa or {}, sb or {}
     sd, a, b, rp = (sa.get("half_sd") or {}).get(m), sa.get(m), sb.get(m), _replica(replica, p, m)
@@ -1541,29 +1605,44 @@ def _cell(p, m, sa, sb, z, replica, *, judged, full_s=None, full_sd=None, exclud
     # the kept sample's extra spread is charged against the WHOLE tolerance,
     # replica included: with less data PASS only gets harder (1 with nothing cut)
     extra = within_kept / within
-    tol, tol_fail = max(within, rp or 1.0) / extra, max(within_kept, rp or 1.0)
+    # PASS: the between-run term only ever widens the tolerance, so a ratio
+    # inside the within-run bar passes whatever that term is — a missing
+    # replica credits nothing (1.0). FAIL: past the tolerance INCLUDING the
+    # between-run term; with no replica for the cell that term is unmeasured
+    # (#1053: A's within-run spread, at any block length, cannot see a
+    # cluster's constant offset), so no FAIL bar exists: past the PASS bar
+    # is INCONCLUSIVE, never FAIL, never PASS
+    tol = max(within, rp or 1.0) / extra
+    tol_fail = None if rp is None else max(within_kept, rp)
     lower = m in LOWER_IS_WORSE
     bar = round(1 / tol, 4) if lower else round(tol, 4)
-    fail_bar = round(1 / tol_fail, 4) if lower else round(tol_fail, 4)
+    fail_bar = None if tol_fail is None else round(1 / tol_fail, 4) if lower else round(tol_fail, 4)
     ratio = round(b / a, 4)
-    if lower:
-        res = "PASS" if ratio >= bar else "FAIL" if ratio < fail_bar else INCONCLUSIVE
-    else:
-        res = "PASS" if ratio <= bar else "FAIL" if ratio > fail_bar else INCONCLUSIVE
+    past_pass = ratio < bar if lower else ratio > bar
+    past_fail = fail_bar is not None and (ratio < fail_bar if lower else ratio > fail_bar)
+    res = "PASS" if not past_pass else "FAIL" if past_fail else INCONCLUSIVE
     result = res if judged else "INFO"
     op = ">=" if lower else "<="
     by = "replica" if rp and rp >= within else ("A's whole-phase sd" if capped else "A's sd scaled to full length")
-    by_fail = "replica" if rp and rp >= within_kept else "the kept sample's sd"
+    by_fail = ("no between-run replica: no FAIL bar" if rp is None else
+               "replica" if rp >= within_kept else "the kept sample's sd")
     short = (f"; on {kept} of {full_s} s jointly Ready: PASS {op} {bar} = {by} bar "
              f"{round(max(within, rp or 1.0), 4)} less the kept sample's extra spread x{round(extra, 4)}, "
              f"FAIL past {fail_bar} ({by_fail}; t {round(q, 3)} on {df} df)" if shrunk else "")
     why = (f"{p} {m}: B is {ratio}x A, beyond the spread ({op} {fail_bar})" if res == "FAIL" else
+           f"{p} {m}: B is {ratio}x A, past the within-run bar {op} {bar}, and there is no between-run "
+           f"replica for {p} {m}: A's within-run spread is only sampling noise, so code cannot be told from "
+           f"the cluster-to-cluster spread; not judged until an A/A calibration measures that spread "
+           f"(`custlat replica` of two runs of one image on this schedule)"
+           if res == INCONCLUSIVE and rp is None else
            f"{p} {m}: B is {ratio}x A, between the PASS bar {bar} and the FAIL bar {fail_bar}: "
            f"the shortened jointly-Ready time decides it" if res == INCONCLUSIVE else None)
-    return {**base, "ratio": ratio, "bar": f"{op} {bar}", "fail_bar": f"{op} {fail_bar}",
+    return {**base, "ratio": ratio, "bar": f"{op} {bar}",
+            "fail_bar": f"{op} {fail_bar}" if fail_bar is not None else "n/a (no between-run replica)",
             "within": round(within, 4), "within_kept": round(within_kept, 4), "extra_spread": round(extra, 4),
             "kept_quantile": {"t": round(q, 4), "df": df} if shrunk else {"z": round(q, 4)},
             "pass_bar_from": by if shrunk else ("replica" if rp and rp >= within else "A's sd"),
+            "fail_bar_from": by_fail if shrunk or rp is None else ("replica" if rp >= within else "A's sd"),
             "result": result, "why": why,
             "line": f"{result} {p} {m}: B/A = {ratio} ({op} {bar}"
                     f"{'' if judged else ', not judged'}; a {a}, b {b}; within {round(within, 4)}, "
