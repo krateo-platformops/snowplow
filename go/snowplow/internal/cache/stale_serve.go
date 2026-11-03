@@ -542,6 +542,9 @@ func RunRefreshNow(ctx context.Context, l1Key string) error {
 	if fn == nil {
 		return ErrRefreshNowNoHandler
 	}
+	// #1070 — measurement only: a direct refresh is timed from here to its Put
+	// (no queue, so no wait).
+	ctx = withRefreshCycle(ctx, l1Key, RefreshTierDirect, windowNow())
 	return runRefreshFunc(ctx, fn, l1Key, *entry.Inputs)
 }
 

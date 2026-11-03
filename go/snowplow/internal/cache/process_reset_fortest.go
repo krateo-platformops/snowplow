@@ -125,6 +125,12 @@ func ResetCacheProcessStateForTest() error {
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
 
+	// 5d‴ — #1070 the refresh-cycle family (put_total, wait / duration /
+	// put_to_frame histograms). Process-global (the store, the refresher and the
+	// broadcaster all record into it), so a test asserting on a sample count
+	// would read a sibling's refreshes. Composed — #471.
+	ResetRefreshCycleForTest()
+
 	// 5d″ — #841 the seed-origin counters (cells seeded / hit per seed class)
 	// and the kept / unmatched representative counts. Process-global, so a test
 	// asserting on a class's hits would read a sibling's. Composed — #471.
