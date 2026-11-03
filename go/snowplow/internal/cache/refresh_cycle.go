@@ -273,12 +273,16 @@ func refreshCycleFor(ctx context.Context, key string) *refreshCycle {
 // under c.mu (a pointer read) and compares outside it, like raLayerEqualPrior
 // (#406), whose compare it replaces on the refresh Put so a body is compared
 // once. The caller confirms under c.mu that the same prior is the one it
-// replaces. Entries are never mutated once stored.
+// replaces. Entries are never mutated once stored. Raw(), not RawJSON: an
+// incremental list cell (#854) stores no RawJSON. Its refresh normally ends at
+// its snapshot with no Put; one that unanchored falls through to this Put, and
+// its prior's body is built here once, as #604's classifyRebuild already does.
+// Every other entry's Raw() is its RawJSON.
 func (c *ResolvedCacheStore) sameBytesPrior(key string, entry *ResolvedEntry) *ResolvedEntry {
 	c.mu.Lock()
 	prior := c.raLayerResidentEntryLocked(key)
 	c.mu.Unlock()
-	if prior != nil && bytes.Equal(prior.RawJSON, entry.RawJSON) {
+	if prior != nil && bytes.Equal(prior.Raw(), entry.Raw()) {
 		return prior
 	}
 	return nil
