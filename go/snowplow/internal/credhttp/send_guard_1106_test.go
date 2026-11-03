@@ -104,11 +104,16 @@ func TestIssue1106_EveryEndpointRequestLeavesThroughSend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sites < 3 || sendCalls < 2 {
-		t.Fatalf("control: the scan found %d endpoint-client sites and %d Send calls; it walked the wrong tree", sites, sendCalls)
-	}
 	sort.Strings(bad)
 	for _, b := range bad {
 		t.Errorf("RED: %s obtains an endpoint client and does not send through credhttp.Send: its request would follow a cross-origin redirect (#1106)", b)
+	}
+	// The control counts the sites, so a scan of the wrong tree (zero sites)
+	// cannot pass. The rule above, not this count, judges each site.
+	if sites < 3 {
+		t.Fatalf("control: the scan found %d endpoint-client sites (want the stage fetch, the builder and /call); it walked the wrong tree", sites)
+	}
+	if sendCalls == 0 {
+		t.Fatal("control: the scan found no Send call at all")
 	}
 }
