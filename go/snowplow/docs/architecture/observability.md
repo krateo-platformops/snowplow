@@ -276,7 +276,7 @@ Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullL
 | expvar | meaning | healthy range |
 |---|---|---|
 | `snowplow_apistage_stale_serve_total` | map `reason` (`known_stale`) → customer reads served a known-stale content cell at once | the stale-serve share of hits, reported by the bench |
-| `snowplow_apistage_stale_to_push_ms` | histogram (cumulative `le_*`, with buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the correction reaching the tab: the replacement's publish to an armed tab, **or** (a tab that armed later) the owed-push emit at arm time, measured from the earliest stale serve still owed. Late arms are the slowest corrections and are included | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
+| `snowplow_apistage_stale_to_push_ms` | the apistage series of the every-layer `snowplow_stale_to_push_ms` (below, #1062): the **same samples** as `{layer="apistage"}`, kept under its #710 name for the bench. Since #1062 a sample ends when the replacing frame is **written** to a stream (not at the publish), including the owed-push frame of a tab that armed later | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
 | `snowplow_apistage_stale_serve_age_ms` | histogram: the age of the body served stale (since its known-stale window opened) | diagnostic |
 | `snowplow_apistage_stale_debt_open` / `_debt_oldest_age_ms` | gauges: ACTIVE debts and the age of the oldest, from its current viewed episode (parked debts excluded, #740) | **0** at rest; back to 0 within 10 s after a burst |
 | `snowplow_apistage_stale_debt_parked` | gauge: debts PARKED because their refill failed and nobody views a dependent (the cell is kept and served; not retried, not overdue). An arm of a dependent or a new stale serve resumes one and restarts its overdue clock; any accepted fill of the content at or after its mark retires it (#740) | informational, **not** an alert |
@@ -290,6 +290,28 @@ Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullL
 | `snowplow_apistage_stale_owed_arm_emits_total` | refresh events emitted at `/refreshes` arm time for a key whose replacement was published before the tab armed | tracks `stale_push_unarmed_total` |
 | `snowplow_apistage_stale_owed_dropped_total` | owed marks dropped by the L1-capacity bound before reaching a tab: **a guarantee failure** | **0**. A bench gate |
 | `snowplow_apistage_stale_dependent_unresolved_total` | debt-lane re-resolves that completed but whose Put was declined; the stale-derived cell is evicted and the push still goes out | low |
+
+### Stale serve → push, for every layer (#1062)
+Defined in `internal/cache/stale_push.go`. The #710 goal times **every** stale page a customer is given, whichever layer served it, with one mechanism:
+- **A stale serve** is an armed customer response (it stamped `X-Snowplow-Refresh-Key`) written with bytes snowplow knows may be stale. It is labelled with `layer`:
+  - `l1`: an L1 hit on a cell with an open invalidation→fresh window or a known-stale stamp (the restactions, widgets and widgetContent hit sites);
+  - `apistage`: a stale-derived body, either the D2 cold serve that committed, or a hit on such a cell before its replace landed.
+  An unarmed response (external-TTL widget) is not counted: nothing can push to it. A nested cell read inside a resolve is not a response. `resolved_cache.stale_served_total` therefore counts more: every Get hit on a dirty cell.
+- **Replaced**: the key's cell stops holding the stale bytes. Either an accepted Put of a non-stale-derived body whose resolve began at or after the serve's latest dirty mark (a Put that began earlier carries the pre-change state), or the key leaves the store.
+- **Pushed**: the `/refreshes` handler **wrote** a frame for the key (a write, not an offer) after the replacement, or wrote a resync frame to a stream armed for it. The sample is `stale_to_push_ms{layer}` = push − serve.
+- **The client is the requester, not the key.** An L1 key is shared by a whole RBAC class, and a widgetContent key by every user. So each serve carries its requester's subject digest (`cache.StaleSubject`: the process-keyed digest of the username, in memory only, never logged), and each `/refreshes` stream carries its authenticated user's. A frame written on a stream closes only that user's serves of the key. One user's frame never closes another user's stale serve, so a stranded client (#1081) shows as unreplaced. The unit is a serve, not a viewing episode: a tab that refetches stale twice before the replacement yields two samples.
+- **A client without a stream** cannot be pushed. Its serve is **not** counted unreplaced while no stream **of its user** is armed for its key (nobody is viewing a live page, #740). It stays open: a stream that arms later and is written a frame records the full delay (#710 F2). Serves never pushed leave only through the L1-capacity bound (`close="dropped"`). `stale_serves_open` shows them.
+- **#740 resume**: a parked D2 debt that resumes restarts its dependents' apistage clocks at the resume.
+
+| expvar (map by `layer`) | meaning | healthy range |
+|---|---|---|
+| `snowplow_stale_to_push_ms` | histogram per layer (cumulative `le_*`, buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the replacing frame written | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
+| `snowplow_stale_unreplaced_total` | stale serves not replaced within the 10 s max, counted **once** each: pushed after > 10 s, or still unpushed 10 s after the serve while a stream of the serve's user is armed for the key (one WARN `cache.stale_push_unreplaced` per layer per scan, metadata only) | **0**. Alert on rate > 0 |
+| `snowplow_stale_serves_total` | stale serves timed | the stale share of armed responses |
+| `snowplow_stale_serve_closes_total` | map `layer` → `close` (`pushed`, `dropped`) | `dropped` is serves no stream ever pushed |
+| `snowplow_stale_serves_open` | gauge: serves waiting for their replacing frame, including those no stream has armed | small; drains as frames are written |
+
+On OTLP the same five series carry the attribute `layer` (and `close`), read from the same snapshot.
 
 **Viewer-gated retry (#740).** After a known-stale cell's refresh fails, it keeps being served (#547). It is retried **only while a `/refreshes` tab views it**: an armed key in its dependent set, which is the cell itself for the #547 slots and the dependents' keys for a D2 debt. There is one chain per cell. A refused Put (the generation moved) is *transient* and retried at once, then on #690's 10 ms → 5 s backoff. Every other failure is *genuine* and backs off from max(1 s, the failed attempt's own duration), doubling to a 60 s cap. A suppressed key opens no chain. When nobody views the cell, the chain is abandoned; an arm resumes it with an immediate attempt. Every series below is on expvar and on OTLP; the labels are closed sets.
 

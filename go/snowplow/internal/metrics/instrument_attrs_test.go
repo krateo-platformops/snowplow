@@ -238,6 +238,12 @@ var closedAttributeKeys = map[string]struct{}{
 	// pinned by refresh_cycle_otlp_1070_test.go
 	// (TestRefreshCycle1070_LabelValuesAreClosedSets).
 	"tier": {}, "content": {},
+	// #1062 — layer on the stale-push instruments (snowplow_stale_to_push_ms,
+	// _stale_unreplaced_total, _stale_serves_total, _stale_serves_open,
+	// _stale_serve_closes_total): the closed cache.StaleLayers set {apistage,
+	// l1}, with close from cache.StalePushCloses {pushed, dropped}; pinned by
+	// stale_push_1062_otlp_test.go.
+	"layer": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry
