@@ -218,7 +218,7 @@ var resolveEntryClass720 = map[string]string{
 	// --- the resolver chain: one in-progress resolve calling the next layer ---
 	"internal/resolvers/widgets/resolve.go:resolveApiRef":   "chain",
 	"internal/resolvers/widgets/apiref/resolve.go:Resolve":  "chain",
-	"internal/resolvers/restactions/restactions.go:Resolve": "chain",
+	"internal/resolvers/restactions/restactions.go:resolve": "chain", // Resolve and ResolveStatusTree (#1079) share it
 	// --- customer /call handlers: bypass the gate by owner ruling ---
 	"restactions.go:restActionHandler.ServeHTTP": "customer",
 	"widgets.go:widgetsHandler.ServeHTTP":        "customer",
@@ -262,7 +262,7 @@ var resolveEntryIdents720 = map[string]bool{
 // resolverEntries728 are the exported resolver entries, recognised by the
 // callee's IMPORT PATH so an import alias cannot hide a call (#728).
 var resolverEntries728 = map[string]map[string]bool{
-	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions":     {"Resolve": true},
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions":     {"Resolve": true, "ResolveStatusTree": true},
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets":         {"Resolve": true},
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref":  {"Resolve": true},
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api": {"Resolve": true, "ResolveWithFailure": true},
