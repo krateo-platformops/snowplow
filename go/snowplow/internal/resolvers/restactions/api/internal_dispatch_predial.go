@@ -107,6 +107,24 @@ func isRegateDenied(err error) bool {
 	return errors.As(err, &e)
 }
 
+// authorizedNotFoundError marks a branch C NotFound on a GET-by-name whose
+// per-identity pre-dial authorization ALLOWED the read (#1080 N2): the
+// identity may `get` the object and it does not exist. It unwraps to the
+// apiserver's error, so apierrors.IsNotFound and the error text are unchanged.
+type authorizedNotFoundError struct{ err error }
+
+func (e *authorizedNotFoundError) Error() string { return e.err.Error() }
+func (e *authorizedNotFoundError) Unwrap() error { return e.err }
+
+func newAuthorizedNotFound(err error) error { return &authorizedNotFoundError{err: err} }
+
+// isAuthorizedNotFound reports whether err is a branch C NotFound returned
+// after the per-identity pre-dial authorization allowed the read.
+func isAuthorizedNotFound(err error) bool {
+	var e *authorizedNotFoundError
+	return errors.As(err, &e)
+}
+
 // --- snowplow_internal_dispatch_predial_total{outcome} -----------------------
 
 const (
