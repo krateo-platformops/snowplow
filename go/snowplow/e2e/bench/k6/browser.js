@@ -27,7 +27,7 @@ import exec from 'k6/execution'
 import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
 import {
-  OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, recordOps, requestLedger, settledNow, switchDue,
+  OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, settledNow, switchDue,
 } from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
@@ -116,23 +116,64 @@ async function settled (page, path) {
 
 // `actionAt`: the driver's clock (epoch ms) just before the action, the start of a load that never
 // settled (a settled load carries the page's own start)
-function record (r, tags, actionAt) {
-  for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
+// #1089: the load's id rides on its own points' metadata (load_id), set for
+// these synchronous adds only
+function record (r, tags, actionAt, loadId) {
+  const md = exec.vu.metrics.metadata
+  md.load_id = loadId
+  try {
+    for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
+  } finally {
+    delete md.load_id
+  }
 }
 
 // #919: the /calls the page made since the last drain (pageload.callOf), as
 // browser_call_ms points with the page's tags: during=load right after a
 // load settled (the load's own calls), during=between before the next click
 // (live refreshes while the user thinks). A page that is gone: none drained.
-async function drainCalls (page, tags) {
+// #1089: each call's Resource Timing (pageload.callTiming) rides as the
+// sample's call_timing METADATA, set on the VU for that one synchronous add
+// and removed at once (per-call numbers as tags would each be a time series);
+// `loadT0` / `loadId`: the load these calls belong to (pageload.loadStart;
+// nextLoadId), for a load's own calls only.
+async function drainCalls (page, tags, loadT0, loadId) {
   let calls
   try {
     calls = await page.evaluate(() => (window.__benchCalls || []).splice(0))
   } catch (e) {
     return
   }
-  for (const [, value, t] of callOps(calls, tags)) CALL.add(value, t)
+  const md = exec.vu.metrics.metadata
+  for (const [, value, t, timing] of callOps(calls, tags, loadT0, loadId)) {
+    if (timing === null) {
+      CALL.add(value, t)
+      continue
+    }
+    md.call_timing = timing
+    try {
+      CALL.add(value, t)
+    } finally {
+      delete md.call_timing
+    }
+  }
 }
+
+// #1089: the join of Chrome's own request samples (browser_http_req_duration)
+// with a load's /calls, never by URL. k6 v2.3.0 stamps a browser request
+// sample with the VU's tags and metadata when its RESPONSE is emitted
+// (network_manager.go emitResponseMetrics: state.Tags.GetCurrentValues();
+// capturing them when Chrome SENDS the request needs the experimental
+// AsyncMetricContext feature flag, which the bench does not turn on). A
+// per-load id on the VU would therefore be the load open when the response
+// came: a late fetch of the previous load booked to this one. So only the VU
+// is stamped, for the whole session (metadata `vu`, never changing), and
+// bench/calltiming.py places each Chrome request in a load of that VU by its
+// own start (the sample's time minus its duration) inside the load's window
+// (its t0 and wall time). A load's id (`<vu>:<n>`, unique in the test) rides
+// on its own page-load points (record) and its calls' call_timing.
+let LOADS = 0
+function nextLoadId () { return `${exec.vu.idInTest}:${++LOADS}` }
 
 // The first navigation, retried (run 11: a refused localhost port killed 4
 // of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
@@ -177,6 +218,7 @@ async function tokenOf (page) {
 }
 
 export default async function () {
+  exec.vu.metrics.metadata.vu = String(exec.vu.idInTest)      // #1089: see nextLoadId
   const s = CFG.sessions[exec.vu.idInTest - 1]
   const deadline = Date.now() + CFG.durationS * 1000
   // #935: the session's identity classes, its initial user first, then each
@@ -221,6 +263,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       b.armLogin = true; b.submitAt = performance.now(); b.signinMs = null
     })
     const loginAt = Date.now()
+    const firstId = nextLoadId()
     await page.locator('#basic_password').press('Enter')
     const first = await settled(page, null)
     const landed = first === null ? '(none)' : first.path
@@ -229,8 +272,9 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
-    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt)
-    await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base))
+    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt, firstId)
+    await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base),
+      loadStart(first, loginAt), firstId)
     token = (await tokenOf(page)) || prevToken
     if (k > 0) {
       const after = learnedCounts(token)
@@ -246,6 +290,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       let method = 'click'
       await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
       const actionAt = Date.now()
+      const loadId = nextLoadId()
       await markStart(page)
       if (await item.isVisible()) {
         await item.click()
@@ -261,8 +306,8 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       }
       const r = await settled(page, route)
       const visit = visits[route] ? 'warm' : 'first'
-      record(r, Object.assign({ route, visit, method }, base), actionAt)
-      await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base))
+      record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)
+      await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base), loadStart(r, actionAt), loadId)
       visits[route] = (visits[route] || 0) + 1
       shown = route
     }

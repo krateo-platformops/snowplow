@@ -1593,6 +1593,8 @@ def pod_record(pod_list: dict, phase: str) -> dict:
     cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
     return {"kind": "snowplow_pod", "phase": phase,
             "pod": (p.get("metadata") or {}).get("name"),
+            # #1089: which network namespace on the node is snowplow's (bench/netpath.py)
+            "uid": (p.get("metadata") or {}).get("uid"),
             "restarts": cs.get("restartCount", 0),
             "ready": cs.get("ready"),
             "last_state": cs.get("lastState") or {},
@@ -5559,7 +5561,16 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
     if apf_path is not None and not have:
         rep["note"] += f"; {apf_path} does not exist"
     report["apiserver_flowcontrol_report_only"] = rep
+    # #1089: the TCP path under snowplow (its pod's SYN retransmits, its node's
+    # conntrack, the API server's codes), per phase; the APF stream read again
+    from bench import netpath
+    report["tcp_path_report_only"] = netpath.report(
+        recs, iter_jsonl(apf_path) if have else [], run_phases(mem, fresh + churns), _phase_of,
+        min(before) if before else None, boot=window)
     warnings = report.setdefault("report_warnings", [])
+    for k, sec in report["tcp_path_report_only"].items():
+        if isinstance(sec, dict) and sec.get("status") == netpath.UNMEASURED:
+            warnings.append(f"tcp_path {k}: UNMEASURED ({sec.get('why')})")
     if rep["status"] == apf.REPORT_ABSENT:
         warnings.append(f"apiserver_flowcontrol report: {rep['note']}")
     elif not rep["samples"]["answered"]:
