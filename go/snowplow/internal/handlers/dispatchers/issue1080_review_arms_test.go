@@ -5,11 +5,12 @@ package dispatchers
 // c681 customer harness as issue1080_definite_notfound_test.go.
 //
 //	C6  the object is created DURING the fill, after the apiserver answered
-//	    404 and before the Put. Either the resolve declines (the watcher
-//	    already holds the object), or the 404 is stored AND a dirty mark
-//	    reaches the cell after it is stored (the #375 put-then-remark). A
-//	    mark that only lands before the Put is not enough: a refresher acting
-//	    on it would be overwritten by the stale 404.
+//	    404 and before the Put, placed deterministically on either side of
+//	    the absence check: before it, the resolve declines; after it, the
+//	    404 is stored AND a dirty mark reaches the cell after it is stored
+//	    (the #375 put-then-remark). A mark that only lands before the Put is
+//	    not enough: a refresher acting on it would be overwritten by the
+//	    stale 404.
 //	C8  the resource type goes away and comes back together with the
 //	    object (a CRD deleted, then restored with its objects): the object
 //	    arrives in the new informer's INITIAL list, whose ADD the pre-sync
@@ -22,7 +23,6 @@ package dispatchers
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -33,76 +33,107 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
+// TestIssue1080_C6_CreateDuringFill_StoredCellIsRemarked places the object's
+// creation on one side of the absence check, deterministically, through the
+// #1080 check seam (api.SetDefiniteNotFoundCheckHookForTest). In both
+// subtests the apiserver has already answered 404. The hook creates the
+// object and returns only once the dep worker has handed its dirty mark for
+// the cell to the refresher hook. That means the informer's indexer holds the
+// object (handlers run after the indexer update), and the worker's own mark
+// has landed while the cell is not stored yet. So no mark that lands after
+// the Put can come from the worker.
+//
+//   - before_watch_check: the watcher sees the object, so the resolve declines.
+//   - after_watch_check: the 404 is already classified, so it is stored, and
+//     the only thing that can mark the stored cell is the #375 put-then-remark
+//     the Put runs. Mutation A6 (put-then-remark off) makes this RED.
 func TestIssue1080_C6_CreateDuringFill_StoredCellIsRemarked(t *testing.T) {
-	e := c681Setup(t)
-	orig := e.user.Config.Handler
-	var target atomic.Value
-	target.Store("")
-	e.user.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		orig.ServeHTTP(w, r)
-		if tp := target.Load().(string); tp != "" && r.URL.Path == "/api/v1/namespaces/pub/configmaps/"+tp {
-			target.Store("")
-			// The object appears after the apiserver answered 404 and before
-			// the resolver classifies and Puts (informer delivery is async).
-			_, _ = e.dyn.Resource(c681CMs).Namespace("pub").Create(context.Background(),
-				n1080CM("pub", tp, "RACE"), metav1.CreateOptions{})
-		}
-	})
-	t.Cleanup(func() { cache.Deps().SetRefreshHook(nil) })
-	// The window is a race; iterate until the store side has been seen a few
-	// times (each iteration is a fresh object name, so a fresh window).
-	const wantStored, maxIter = 3, 400
-	var declined, stored int
-	for i := 0; i < maxIter && stored < wantStored; i++ {
-		cache.ResetResolvedCacheForTest()
-		name := fmt.Sprintf("race-%d", i)
-		e.ra = c681RAObj("/api/v1/namespaces/pub/configmaps/" + name)
-		key := e.key(t, c681A)
-		var mu sync.Mutex
-		var pre, post int
-		cache.Deps().SetRefreshHook(func(k string, _ schema.GroupVersionResource) {
-			if k != key {
+	for _, tc := range []struct {
+		stage  string
+		name   string // a DNS-1123 object name
+		stored bool
+	}{
+		{api.DefiniteNotFoundBeforeWatchCheck, "race-before", false},
+		{api.DefiniteNotFoundAfterWatchCheck, "race-after", true},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			e := c681Setup(t)
+			name := tc.name
+			e.ra = c681RAObj("/api/v1/namespaces/pub/configmaps/" + name)
+			key := e.key(t, c681A)
+
+			var mu sync.Mutex
+			var pre, post int
+			marked := make(chan struct{}, 1)
+			cache.Deps().SetRefreshHook(func(k string, _ schema.GroupVersionResource) {
+				if k != key {
+					return
+				}
+				_, present := cache.ResolvedCache().GetNoTouch(k)
+				mu.Lock()
+				if present {
+					post++
+				} else {
+					pre++
+				}
+				mu.Unlock()
+				select {
+				case marked <- struct{}{}:
+				default:
+				}
+			})
+			t.Cleanup(func() { cache.Deps().SetRefreshHook(nil) })
+
+			var fired atomic.Bool
+			restore := api.SetDefiniteNotFoundCheckHookForTest(func(stage string) {
+				if stage != tc.stage || !fired.CompareAndSwap(false, true) {
+					return
+				}
+				if _, err := e.dyn.Resource(c681CMs).Namespace("pub").Create(context.Background(),
+					n1080CM("pub", name, "RACE"), metav1.CreateOptions{}); err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				select {
+				case <-marked:
+				case <-time.After(10 * time.Second):
+					t.Errorf("C6 (%s): the dep worker never marked the cell after the create", tc.stage)
+				}
+			})
+			t.Cleanup(restore)
+
+			body, dials := e.call(t, c681A)
+			if !fired.Load() || dials != 1 {
+				t.Fatalf("PRE: the 404 dial must happen and the hook must fire at %s (fired=%v dials=%d)", tc.stage, fired.Load(), dials)
+			}
+			mu.Lock()
+			p, q := post, pre
+			mu.Unlock()
+			if q == 0 {
+				t.Fatal("PRE: the worker's mark must land before the Put")
+			}
+			_, stored := e.cell(c681A, t)
+			if stored != tc.stored {
+				t.Fatalf("C6 RED (%s): stored=%v, want %v: %s", tc.stage, stored, tc.stored, s425Trunc(body))
+			}
+			if !tc.stored {
 				return
 			}
-			_, present := cache.ResolvedCache().GetNoTouch(k)
-			mu.Lock()
-			if present {
-				post++
-			} else {
-				pre++
+			if !bytes.Contains(body, []byte("not found")) {
+				t.Fatalf("C6 (%s): the stored body is not the 404: %s", tc.stage, s425Trunc(body))
 			}
-			mu.Unlock()
+			if p == 0 {
+				t.Fatalf("C6 RED (%s): the 404 was stored after the object was created during its fill and no dirty mark reached the STORED cell (pre-Put marks=%d). A refresher acting on the pre-Put mark would be overwritten by the stale 404", tc.stage, q)
+			}
+			t.Logf("RUN C6 (%s): stored, post-Put marks=%d, pre-Put marks=%d", tc.stage, p, q)
 		})
-		target.Store(name)
-		body, _ := e.call(t, c681A)
-		if _, ok := e.cell(c681A, t); !ok {
-			declined++
-			continue
-		}
-		stored++
-		if !bytes.Contains(body, []byte("not found")) {
-			t.Fatalf("iteration %d: the stored body is not the 404: %s", i, s425Trunc(body))
-		}
-		i1126WaitFor(t, 5*time.Second, fmt.Sprintf(
-			"C6 RED (iteration %d): the 404 was stored after the object was created during its fill and no dirty mark reached the STORED cell — a refresher that acted on a pre-Put mark is overwritten by the stale 404", i),
-			func() bool {
-				mu.Lock()
-				defer mu.Unlock()
-				return post > 0
-			})
-		mu.Lock()
-		t.Logf("iteration %d stored: post-Put marks=%d pre-Put marks=%d", i, post, pre)
-		mu.Unlock()
-	}
-	t.Logf("RUN C6: declined=%d stored(all re-marked after the Put)=%d", declined, stored)
-	if stored == 0 {
-		t.Fatalf("C6: no iteration stored the 404 in %d tries — the arm never exercised the put-then-remark window", maxIter)
 	}
 }
 

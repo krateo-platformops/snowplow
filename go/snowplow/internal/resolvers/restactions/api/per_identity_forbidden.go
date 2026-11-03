@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -117,10 +118,42 @@ func definiteNotFoundMessage(call httpcall.RequestOptions) (string, bool) {
 	if !ok || name == "" {
 		return "", false
 	}
+	noteDefiniteNotFoundCheck(DefiniteNotFoundBeforeWatchCheck)
 	if !cache.WatchedAbsent(gvr, ns, name) {
 		return "", false
 	}
+	noteDefiniteNotFoundCheck(DefiniteNotFoundAfterWatchCheck)
 	return apierrors.NewNotFound(gvr.GroupResource(), name).Error(), true
+}
+
+// The two #1080 check windows SetDefiniteNotFoundCheckHookForTest opens: right
+// before the watcher's absence check, and right after it said absent (the
+// classification is decided; the result has not been stored yet).
+const (
+	DefiniteNotFoundBeforeWatchCheck = "before_watch_check"
+	DefiniteNotFoundAfterWatchCheck  = "after_watch_check"
+)
+
+// definiteNotFoundCheckHook is a TEST seam (nil in production): it lets an arm
+// place an object's creation exactly on one side of the absence check — the
+// #375 put-then-remark window (#1080 C6) — instead of racing for it.
+var definiteNotFoundCheckHook atomic.Pointer[func(stage string)]
+
+func noteDefiniteNotFoundCheck(stage string) {
+	if h := definiteNotFoundCheckHook.Load(); h != nil {
+		(*h)(stage)
+	}
+}
+
+// SetDefiniteNotFoundCheckHookForTest installs fn at the two #1080 check
+// windows. Production code MUST NOT call it. Returns a restore func.
+func SetDefiniteNotFoundCheckHookForTest(fn func(stage string)) (restore func()) {
+	var p *func(string)
+	if fn != nil {
+		p = &fn
+	}
+	prev := definiteNotFoundCheckHook.Swap(p)
+	return func() { definiteNotFoundCheckHook.Store(prev) }
 }
 
 // classifyOwnDialNotFound reports whether an external-fall-through failure is
