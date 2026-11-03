@@ -156,6 +156,15 @@ func nonOKEnvelope(code int, dat []byte) *response.Status {
 	}
 	res.Code = code
 	res.Status = response.StatusFailure
+	// A body that names no reason gets the one plumbing derives from the code
+	// (response.New), as every other non-2xx envelope here does: an object-
+	// bodied 500 reads InternalError. A code plumbing does not map (502, 504,
+	// 429) keeps no reason: before #1088 those read InternalError only because
+	// the RetryClient's give-up error was re-wrapped as a 500, which also hid
+	// the real code. Inventing one would claim what the upstream never said.
+	if res.Reason == "" {
+		res.Reason = response.New(code, nil).Reason
+	}
 	if res.Kind == "" {
 		res.Kind, res.APIVersion = "Status", "v1"
 	}

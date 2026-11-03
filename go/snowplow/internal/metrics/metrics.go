@@ -1654,7 +1654,7 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 		return err
 	}
 	builds, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_builds_total",
-		metric.WithDescription("Stage endpoint clients built: one per cache miss, and one per fetch for a shape that is not kept (AWS SigV4, Debug, basic auth without a username, unreadable TLS material). Far below snowplow_external_fetch_total means fetches reuse their identity's connection. #1088."))
+		metric.WithDescription("Stage endpoint clients built through the per-identity cache: one per cache miss, plus one per fetch for an owned shape whose TLS material cannot be read exactly (built, then not kept). Shapes that never enter the cache (AWS SigV4, Debug, basic auth without a username, cert-auth without a CA or with Insecure) are not counted. Far below snowplow_external_fetch_total means fetches reuse their identity's connection. #1088."))
 	if err != nil {
 		return err
 	}

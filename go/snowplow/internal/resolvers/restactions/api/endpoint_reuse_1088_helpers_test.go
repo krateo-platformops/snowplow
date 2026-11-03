@@ -77,7 +77,9 @@ func (p *pki1088) issue(t *testing.T, cn string, server bool) (certPEM, keyPEM [
 }
 
 // connServer1088 is an HTTP/2 TLS server that records, per connection, every
-// client identity (client-cert CN, else the Authorization header) it carried.
+// client identity it carried: the Authorization header AND the client-cert CN,
+// recorded independently ("auth=<header>;cn=<cn>"), so a cert dial that also
+// carries a bearer is seen as both (#1101 review B1).
 type connServer1088 struct {
 	srv   *httptest.Server
 	mu    sync.Mutex
@@ -95,10 +97,11 @@ func newConnServer1088(t *testing.T, p *pki1088, requireClientCert bool) *connSe
 		if r.ProtoMajor == 2 {
 			cs.h2.Add(1)
 		}
-		id := r.Header.Get("Authorization")
+		cn := ""
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-			id = "cn:" + r.TLS.PeerCertificates[0].Subject.CommonName
+			cn = r.TLS.PeerCertificates[0].Subject.CommonName
 		}
+		id := "auth=" + r.Header.Get("Authorization") + ";cn=" + cn
 		cs.mu.Lock()
 		if cs.ids[r.RemoteAddr] == nil {
 			cs.ids[r.RemoteAddr] = map[string]bool{}

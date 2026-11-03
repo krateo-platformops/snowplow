@@ -300,8 +300,8 @@ func TestLeak267_ArmF_NONREG_CertAuthClientconfig_NeverGetsSATokenFile(t *testin
 	defer cs.mu.Unlock()
 	for _, ids := range cs.ids {
 		for id := range ids {
-			if id != "cn:user-a" {
-				t.Fatalf("NON-REG: the cert-auth dial carried identity %q, want only its client cert", id)
+			if id != "auth=;cn=user-a" {
+				t.Fatalf("NON-REG: the cert-auth dial carried %q, want its client cert and NO Authorization header", id)
 			}
 		}
 	}
