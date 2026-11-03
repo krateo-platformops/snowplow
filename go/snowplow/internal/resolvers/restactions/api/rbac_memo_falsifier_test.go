@@ -72,7 +72,7 @@ func TestFalsifierF1_RBACMemoIsNamespaceKeyed(t *testing.T) {
 	rbac.ResetEvaluateRBACCallCount()
 
 	// A cluster-wide LIST (namespace "") by a cluster-granted identity.
-	_, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "", items)
+	_, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "", "", items)
 	if gateErr != nil {
 		t.Fatalf("F1: filterListByRBAC = %v (expected an identity-present pass)", gateErr)
 	}
@@ -105,7 +105,7 @@ func TestFalsifierF1_RBACMemoNameIndependence(t *testing.T) {
 	// evaluation of team-a covering both items (verb:list is name-independent).
 	// #963 F1 — the per-item memo is NOT seeded from the scope verdict: step 2
 	// evaluates the request's own namespace too, so it backs up step 1.
-	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", items)
+	kept, gateErr := filterListByRBAC(ctx, dispatchTestGVR, "team-a", "", items)
 	if gateErr != nil {
 		t.Fatalf("F1-name: filterListByRBAC = %v", gateErr)
 	}

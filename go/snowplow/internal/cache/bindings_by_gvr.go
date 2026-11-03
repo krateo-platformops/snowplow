@@ -276,10 +276,13 @@ func rbacWildcardMatches(allowed []string, want string) bool {
 
 // rulesGrantGetList reports whether any rule in `rules` grants get OR list
 // on the given {group,resource} — mirroring rulesPermit's wildcard
-// semantics (evaluate.go:446-463). resourceNames-scoped rules never grant
-// the collection verb `list` and we have no object name for `get`, so they
-// do NOT enrol a binding for nav LIST (faithful to resourceNameMatches for
-// the collection verb). The `*/*` case is handled by rulesGrantWildcard.
+// semantics (evaluate.go:446-463). A resourceNames-scoped rule grants a
+// `list` only when the request names one of its objects (a
+// `fieldSelector=metadata.name=` list, #1049) and a `get` only of a named
+// object; a navigation LIST names none, so such a rule does NOT enrol a
+// binding for nav LIST (faithful to resourceNameMatches for an unnamed
+// request). This index decides warmth (prewarm / navigation enrolment),
+// never an authorization. The `*/*` case is handled by rulesGrantWildcard.
 func rulesGrantGetList(rules []rbacv1.PolicyRule, gr groupResource) bool {
 	for _, rule := range rules {
 		if len(rule.ResourceNames) > 0 {

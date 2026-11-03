@@ -787,7 +787,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		for i := range resultList.Items {
 			items[i] = &resultList.Items[i]
 		}
-		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, items)
+		// #1049: the requester's own request, query included.
+		_, rawQuery, _ := splitPathQuery(call.Path)
+		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, rawQuery, items)
 		if isRegateDenied(gateErr) {
 			return nil, false, gateErr
 		}
@@ -858,9 +860,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 // branch; here it is only consulted on the LIST branch, so it fires precisely
 // on the null→cluster-LIST case task #118 targets.
 func pathHasNullPathSegment(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	if path == "" {
 		return false
 	}
