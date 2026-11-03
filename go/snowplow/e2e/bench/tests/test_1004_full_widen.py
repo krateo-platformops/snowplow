@@ -931,14 +931,20 @@ def test_a_job_that_ends_unarmed_is_recorded_and_nothing_is_widened(harness):  #
 
 
 def test_a_job_that_never_arms_is_waited_for_only_to_its_deadline(harness):  # noqa: F811
-    t0 = time.monotonic()
+    """The armed wait ends at its deadline (PREFLIGHT_TIMEOUT_S + FW_BOUND_S
+    after the Job's apply), measured between the stage's own events (the fake
+    kubectl stamps each), not over the whole run: a loaded host slows the run
+    around it, never the deadline."""
     p, ev, state, tmp = _real(harness, FAKE_FW_JOB="never", PREFLIGHT_TIMEOUT_S="2", ROLLOUT_TIMEOUT_S="121")
-    took = time.monotonic() - t0
     assert p.returncode != 0
     log = (tmp / "out" / "run.log").read_text()
     assert "full widen FAILED: the fullwiden606 Job did not finish" in log
     assert "apply crd-widened.yaml" not in ev and ev[-1] == "delete crd"
-    assert took < 2 + 121 + 120, took                    # the armed deadline, plus the run around it
+    stamps = [json.loads(x) for x in (state / "fw-events").read_text().splitlines()]
+    t_job = next(t for t, what in stamps if what == "apply job.yaml")
+    last_poll = max(t for t, what in stamps if what.startswith("exec /out/"))
+    # the last poll falls before the deadline (2 + 121 s), give or take one poll's own bounded reads
+    assert 2 + 121 - 30 <= last_poll - t_job <= 2 + 121 + 2 * 60, last_poll - t_job
 
 
 def test_the_crds_established_wait_is_bounded(harness):  # noqa: F811
