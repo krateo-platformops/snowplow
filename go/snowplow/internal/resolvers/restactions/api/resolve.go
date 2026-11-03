@@ -593,11 +593,11 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // before. Returns tmp (possibly empty for C-3).
 func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
 	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
-	// this cluster's apiserver (the provenance runStage marked on provCtx); a
-	// write item any guard refuses is a stage failure with its reason, never a
-	// silent success (undialled_write.go).
+	// this cluster's apiserver (the provenance runStage marked on provCtx); an
+	// item any guard refuses, write (#1112 D2) or read (#1116), is a stage
+	// failure with its reason, never a silent success (undialled_write.go).
 	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
-	r.failUndialledWrites(id, apiCall, skips)
+	r.failRefusedItems(id, apiCall, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the

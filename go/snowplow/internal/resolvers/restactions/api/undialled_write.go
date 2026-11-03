@@ -4,8 +4,10 @@
 // THE DEFECT. Three guards decide, before any egress, that a rendered call must
 // not be dialled, and each only logged it at DEBUG: the #288 malformed-path
 // guard, the #302 jq-error skip (path, payload or header), and the #293
-// unrendered-template skip. For a read that is right (there is nothing sensible
-// to read, and the page renders what it can). For a WRITE it told the user
+// unrendered-template skip. Not dialling is right; staying silent was not. For
+// a READ it left the stage's key unset with no outcome and no errorKey, so
+// whatever stood there looked like the stage's output (#1116: a caller-seeded
+// extras key did, until #1116 refused those). For a WRITE it told the user
 // "done" with nothing sent: a Zendesk comment PUT to `/api/v2/tickets/<id>` with
 // a non-numeric id parsed as a core apiserver path, failed the DNS-1123 name
 // check, and the stage answered 0 requests, outcomes `[]`, no error.
@@ -21,6 +23,12 @@
 //     (#302) or an unrendered ${...} (#293);
 //   - NotSent       — the catch-all: the stage's items were planned but at least
 //     one was neither sent nor failed with a reason of its own.
+//
+// #1116 — the same rule holds for a READ stage's refused item (InvalidPath,
+// TemplateError; the NotSent catch-all stays write-only): a body built around
+// a read that was never made is not the stage's answer, so it fails the stage
+// and is never stored, as any per-item stage error is. Each refused read is
+// also counted by resolve work class (refused_read_metrics.go).
 //
 // Each refused item is one failure (an iterator write with one refused item of
 // three sends the other two and FAILS), recorded the way every stage failure is:
@@ -80,13 +88,18 @@ func undialledWriteCode(reason string) int {
 	return http.StatusInternalServerError
 }
 
-// failUndialledWrites records one failure per refused item of a write stage
-// (the plan's skips). A read stage's skips stay silent, as before. Runs on the
-// stage-loop goroutine before any worker exists, so dict needs no lock.
-func (r *resolveRun) failUndialledWrites(id string, apiCall *templates.API, skips []skippedOption) {
-	if !isWriteVerb(apiCall.Verb) {
-		return
-	}
+// failRefusedItems records one failure per refused item of a stage (the plan's
+// skips), write or read. #1116: a READ item a guard refused used to stay
+// silent (no outcome, no errorKey), so nothing told the caller the stage's
+// value was missing; before #1116 a caller-supplied extras key could even
+// stand in for it unseen. Now it is the same failure a refused write is: the
+// reason (InvalidPath / TemplateError), the errorKey record, the stage-error
+// sink (no Put stores a body built around the missing read, as for every
+// per-item stage error), and the StageFailure without continueOnError. Each
+// refused read is also counted by resolve class
+// (snowplow_refused_read_total{class}). Runs on the stage-loop goroutine
+// before any worker exists, so dict needs no lock.
+func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips []skippedOption) {
 	for _, sk := range skips {
 		reason, why := undialledWriteCause(sk.reason)
 		r.failUndialledWrite(id, apiCall, reason, why)
@@ -104,11 +117,18 @@ func (r *resolveRun) failUnsentWrites(sc *stageCtx) {
 	r.failUndialledWrite(sc.id, sc.apiCall, StageReasonNotSent, "it was not sent and recorded no other failure")
 }
 
-// failUndialledWrite records the failure of one write item that was not sent.
+// failUndialledWrite records the failure of one item, of a write or a read
+// stage, that was not sent. The message names the stage's class ("write
+// stage" / "read stage"), the stage, the verb and the cause only.
 func (r *resolveRun) failUndialledWrite(id string, apiCall *templates.API, reason, why string) {
 	verb := ptr.Deref(apiCall.Verb, http.MethodGet)
 	code := undialledWriteCode(reason)
-	msg := fmt.Sprintf("write stage %q verb %s was not sent: %s", id, verb, why)
+	class := "write"
+	if !isWriteVerb(apiCall.Verb) {
+		class = "read"
+		recordRefusedRead(r.ctx)
+	}
+	msg := fmt.Sprintf("%s stage %q verb %s was not sent: %s", class, id, verb, why)
 	accumulateErrorKey(r.dict, ptr.Deref(apiCall.ErrorKey, "error"), map[string]any{
 		"kind": "Status", "apiVersion": "v1", "status": "Failure",
 		"code": code, "reason": reason, "message": msg,
@@ -120,7 +140,7 @@ func (r *resolveRun) failUndialledWrite(id string, apiCall *templates.API, reaso
 		r.failure = &StageFailure{Stage: id, Code: code,
 			Reason: string(response.New(code, nil).Reason), Message: msg}
 	}
-	r.log.Warn("write stage not sent",
+	r.log.Warn(class+" stage not sent",
 		slog.String("name", id),
 		slog.String("verb", verb),
 		slog.String("reason", reason),
