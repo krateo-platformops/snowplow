@@ -134,7 +134,41 @@ Content-Type: application/json
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
-    `NotRun`), `Error` (anything else).
+    `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
+    snowplow refused to send, below), `Error` (anything else).
+  - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
+    `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
+    item of its iterator, is listed with one of:
+    - `InvalidPath`: a stage that dials this cluster's apiserver (no
+      `endpointRef`) rendered a path that is not a valid Kubernetes object
+      path (a collapsed or non-DNS-1123 name or namespace). A named
+      `endpointRef` is never judged this way: its path is sent as rendered.
+    - `TemplateError`: the stage's `path`, `payload` or a header did not
+      render (a jq error, e.g. `tonumber` on a non-number; or an unrendered
+      `${…}`).
+    - `NotSent`: any other write that was planned and not sent without a
+      reason of its own.
+
+    Before #1112 these answered `[]` with nothing sent: a UI that showed
+    "saved" on `[]` showed it for a write that never left snowplow. Under the
+    stage's `errorKey` the stage records
+    `{"kind":"Status","status":"Failure","code":400|500,"reason":"<code>","message":"write stage \"<id>\" verb <V> was not sent: <cause>"}`
+    (400 for `InvalidPath` and `TemplateError`, 500 for `NotSent`). The
+    message names the stage, the verb and the cause only, never the rendered
+    path or the caller's input. A stage without `continueOnError` is also the
+    resolve's failure: when the RESTAction's `filter` cannot produce a value,
+    `/call` answers that code. A failed write blocks the writes that depend on
+    it (`Skipped`, #904). An iterator write whose iterator yields **zero**
+    items has nothing to send and still succeeds; a dry run still reports
+    `StageNotExecuted`.
+  - **A credentialed redirect to another host is a failure (#1106).** A stage
+    whose endpoint answers a redirect to another origin (scheme, host, port)
+    is not followed when the hop would carry a credential (the endpoint's
+    token, basic auth, client certificate or AWS signature, or an
+    `Authorization`/`Cookie` header on the request). The stage fails with
+    `502` naming the redirect (`upstream answered 302 Found, a redirect
+    snowplow does not follow`); its row reads `Error`. A redirect within the
+    endpoint's own origin is still followed.
     The header never carries an error message, a path, an identity or
     response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}` (N stages

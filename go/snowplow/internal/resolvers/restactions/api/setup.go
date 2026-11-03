@@ -40,34 +40,45 @@ type skippedOption struct {
 	reason skipReason
 }
 
-// createRequestOptions is the DISPATCH entry point and its behaviour is
-// unchanged: it returns the valid options and drops the refused ones into
-// recordMalformedDialSkip. Byte-identical to pre-#504 for every RA, dict, verb
-// and iterator shape — it now delegates to the sibling below and discards the
-// skips, which is exactly what it did inline before.
+// createRequestOptions returns the valid options of a stage that dials this
+// cluster's apiserver (the #288 shape guard applies) and drops the refused ones
+// into recordMalformedDialSkip. Tests use it; the resolve stage loop calls
+// createRequestOptionsWithSkips with the stage's own target, and the inspect
+// pass (#504) with apiserver=true.
 func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions) {
-	all, _, _ = createRequestOptionsWithSkips(ctx, log, in, dict)
+	all, _, _ = createRequestOptionsWithSkips(ctx, log, in, dict, true)
 	return all
 }
 
 // createRequestOptionsChecked is createRequestOptions plus the iterator's
-// compile/eval error (#638). The resolve stage loop calls it: a non-benign
-// iterator error is a STAGE error (stage-error sink bumped so no L1 Put
-// accepts the partial/empty plan, outcome Error, dict[errorKey] written),
-// never a log line the stage silently continues past.
+// compile/eval error (#638): a non-benign iterator error is a STAGE error
+// (stage-error sink bumped so no L1 Put accepts the partial/empty plan, outcome
+// Error, dict[errorKey] written), never a log line the stage silently continues
+// past.
 func createRequestOptionsChecked(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) ([]httpcall.RequestOptions, error) {
-	all, _, iterErr := createRequestOptionsWithSkips(ctx, log, in, dict)
+	all, _, iterErr := createRequestOptionsWithSkips(ctx, log, in, dict, true)
 	return all, iterErr
 }
 
 // createRequestOptionsWithSkips is createRequestOptions plus the refused
-// options and their verdicts. Only the inspect pass calls it (#504). The
-// metrics/log side effect (recordMalformedDialSkip) still happens here, exactly
-// once per skip, so the #288/#293 counters read the same from either caller.
+// options and their verdicts, and the stage's target. The resolve stage loop
+// reads the skips of a write stage (#1112 D2: each is a stage failure with its
+// reason, never a silent success), and the inspect pass classifies them (#504).
+// The metrics/log side effect (recordMalformedDialSkip) happens here, exactly
+// once per skip, so the #288/#293 counters read the same from every caller.
+//
+// apiserver (#1112 D2) is true when the stage dials this cluster's apiserver
+// (targetsOwnCluster: the ServiceAccount or the requester's own clientconfig):
+// only then does the #288 SHAPE guard judge the rendered path, because only
+// then is it known to be a Kubernetes object path. A named endpointRef names
+// another endpoint, whose paths may parse as apiserver paths without being one
+// (`/api/v2/tickets/<id>` on a ticketing API, with ids that are not DNS-1123
+// names). The template checks (an unrendered ${...}, a jq error in the path,
+// payload or header) apply to every stage, whatever it dials.
 //
 // iterErr (#638) is the iterator's compile/eval error: nil for a non-iterator
 // stage and for a benign nil-upstream iteration (IsBenignNilIteration).
-func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions, skips []skippedOption, iterErr error) {
+func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any, apiserver bool) (all []httpcall.RequestOptions, skips []skippedOption, iterErr error) {
 	it := ""
 	if in.DependsOn != nil {
 		it = ptr.Deref(in.DependsOn.Iterator, "")
@@ -75,7 +86,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 
 	if len(it) == 0 {
 		all = make([]httpcall.RequestOptions, 0, 1)
-		el, ok, sr := createRequestOption(in, dict)
+		el, ok, sr := createRequestOption(in, dict, apiserver)
 		if ok {
 			all = append(all, el)
 		} else {
@@ -116,7 +127,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 	}
 
 	for _, sa := range elems {
-		el, ok, sr := createRequestOption(in, sa)
+		el, ok, sr := createRequestOption(in, sa, apiserver)
 		if !ok {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 			skips = append(skips, skippedOption{path: el.Path, reason: sr})
@@ -150,13 +161,15 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 }
 
 // createRequestOption renders one api-call RequestOptions from the stage `in`
-// and the per-call data `ds`. The second return is the #288 VALIDITY verdict:
-// false means the rendered path is a malformed single-object apiserver path (an
-// interpolated name/namespace segment collapsed to empty, or is DNS-1123-invalid
-// — e.g. a trailing '-'), so the caller must NOT append/dial it. valid=true for
-// well-formed paths AND for out-of-scope paths (external URLs, LIST paths) —
-// byte-identical to pre-#288 behaviour.
-func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions, valid bool, sr skipReason) {
+// and the per-call data `ds`. The second return is the VALIDITY verdict: false
+// means the call must NOT be appended or dialled — a template failed (#293
+// unrendered ${...}, #302 a jq error in the path, payload or header), or, on an
+// apiserver stage (apiserver=true), the rendered path is a malformed
+// single-object apiserver path (#288: an interpolated name/namespace segment
+// collapsed to empty, or is DNS-1123-invalid — e.g. a trailing '-').
+// valid=true for well-formed paths AND for out-of-scope paths (external URLs,
+// LIST paths).
+func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcall.RequestOptions, valid bool, sr skipReason) {
 	out.ContinueOnError = ptr.Deref(in.ContinueOnError, false)
 	out.ErrorKey = ptr.Deref(in.ErrorKey, "error")
 
@@ -208,9 +221,25 @@ func createRequestOption(in *templates.API, ds any) (out httpcall.RequestOptions
 	if headerErr != nil {
 		return out, false, skipReason{class: reasonJQHeaderError, detail: "header jq expression errored: " + headerErr.Error()}
 	}
+	if !apiserver {
+		// #1112 D2 — not an apiserver dial: only the template check applies.
+		if unrenderedTemplate(out.Path) {
+			return out, false, unrenderedTemplateSkip
+		}
+		return out, true, skipReason{}
+	}
 	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
 	return
 }
+
+// unrenderedTemplate reports whether a rendered path still carries a "${"
+// template (#293 sub-case 1: jqutil.MaybeQuery leaves it literal on unbalanced
+// braces). Never a dialable path, whatever the endpoint: a genuine URL never
+// carries "${".
+func unrenderedTemplate(path string) bool { return strings.Contains(path, "${") }
+
+// unrenderedTemplateSkip is the verdict on an unrendered template.
+var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail: "unrendered ${...} template (#293)"}
 
 // validInterpolatedPath reports whether a rendered api-call path is safe to dial
 // (#288). It guards ONLY single-object apiserver paths: it parses the rendered
@@ -253,8 +282,8 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 	// before the parseOK=false early-return below (which would otherwise pass it
 	// through as a legit external path). A genuine external URL never carries
 	// "${", so external-dial behaviour is unchanged.
-	if strings.Contains(path, "${") {
-		return false, skipReason{class: reasonUnrenderedTemplate, detail: "unrendered ${...} template (#293)"}
+	if unrenderedTemplate(path) {
+		return false, unrenderedTemplateSkip
 	}
 	_, ns, name, ok := cache.ParseAPIServerPathToDep(path)
 	if !ok {

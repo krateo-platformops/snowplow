@@ -26,7 +26,9 @@ import (
 //   - succeeded: it ran and every item it dialed succeeded. An iterator stage
 //     that yields zero items succeeded (it had nothing to do);
 //   - failed: at least one item failed, or the stage could not be built (its
-//     iterator errored, its endpoint could not be resolved). Reason: a code;
+//     iterator errored, its endpoint could not be resolved), or (#1112 D2) it
+//     is a write and snowplow refused to send at least one of its items
+//     (InvalidPath, TemplateError, NotSent: undialled_write.go). Reason: a code;
 //   - skipped: a write stage that was not dialed because the stage it depends
 //     on failed or was skipped (reason Skipped).
 //
@@ -56,6 +58,12 @@ const (
 	// identity or no client config. Every declared stage is then NotRun, so
 	// the header can never read "all succeeded" ([]) for it.
 	StageReasonAborted = "Aborted"
+	// #1112 D2 — a write stage, or one item of it, that snowplow refused to
+	// send (undialled_write.go). Recorded only by snowplow, never read from an
+	// upstream answer.
+	StageReasonInvalidPath   = "InvalidPath"   // the #288 guard refused the rendered apiserver path
+	StageReasonTemplateError = "TemplateError" // the path, payload or a header did not render (#302, #293)
+	StageReasonNotSent       = "NotSent"       // planned, not sent, and no other failure recorded
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -66,11 +74,14 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	StageReasonNotExecuted:  5,
-	StageReasonForbidden:    4,
-	StageReasonUnauthorized: 3,
-	StageReasonNotFound:     2,
-	StageReasonError:        1,
+	StageReasonNotExecuted:   8,
+	StageReasonForbidden:     7,
+	StageReasonUnauthorized:  6,
+	StageReasonNotFound:      5,
+	StageReasonInvalidPath:   4,
+	StageReasonTemplateError: 3,
+	StageReasonNotSent:       2,
+	StageReasonError:         1,
 }
 
 type stageOutcome struct {
@@ -158,6 +169,18 @@ func (s *StageOutcomes) fail(name, reason string) {
 	if reasonRank[reason] > reasonRank[o.reason] {
 		o.reason = reason
 	}
+}
+
+// failed reports whether stage name recorded a failure (any reason). Read by
+// the #1112 D2 catch-all after the stage's workers finished.
+func (s *StageOutcomes) failed(name string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.by[name]
+	return o != nil && o.reason != ""
 }
 
 // abortedResolve (#904 review F3) is ResolveWithFailure's answer when it stops

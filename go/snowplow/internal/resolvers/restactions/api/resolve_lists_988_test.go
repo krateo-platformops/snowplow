@@ -103,12 +103,22 @@ func TestIssue988_OFF_AnUnscopedResolveIsNotCounted(t *testing.T) {
 
 // --- #991 review findings ------------------------------------------------
 
+// req0 is a first request to base, for a CheckRedirect via list.
+func req0(t *testing.T, base string) *http.Request {
+	t.Helper()
+	r, err := http.NewRequest(http.MethodGet, base+"/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 // TestIssue988_EP_ANamedEndpointRefListIsCounted is the reviewer's case
 // (finding 1): a stage whose endpointRef carries a third party's own credential
 // (no held mark, no SA dial) and points at the apiserver sends a marked LIST.
 // It is a resolve's LIST and must be counted, once. A held dial, whose chain
 // already counts through credhttp.Client, must not count twice. The named
-// endpoint keeps net/http's redirect behaviour (no credhttp.Client).
+// endpoint keeps its own redirect policy (#1106), never credhttp.Client's.
 func TestIssue988_EP_ANamedEndpointRefListIsCounted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -132,8 +142,14 @@ func TestIssue988_EP_ANamedEndpointRefListIsCounted(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.named && cli.CheckRedirect != nil {
-				t.Fatal("a named endpointRef must keep net/http's redirect behaviour; the counter is not a redirect policy")
+			// #1106: a named endpointRef has its own redirect policy
+			// (credhttp.EndpointClient: same-origin hops followed), never the
+			// held refuse-all one; the counter is not a redirect policy.
+			if tc.named {
+				same, _ := http.NewRequest(http.MethodGet, srv.URL+"/moved", nil)
+				if cli.CheckRedirect == nil || cli.CheckRedirect(same, []*http.Request{req0(t, srv.URL)}) != nil {
+					t.Fatal("a named endpointRef follows a same-origin redirect (#1106 policy), not the held refuse-all one")
+				}
 			}
 			req, _ := http.NewRequestWithContext(tc.ctx, http.MethodGet, srv.URL+"/api/v1/namespaces/n/configmaps", nil)
 			resp, err := cli.Do(req)

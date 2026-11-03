@@ -291,7 +291,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
 
 - `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
-  `StageNotExecuted` (a dry run). `dependsOn` is set on a `Skipped` row.
+  `StageNotExecuted` (a dry run), and for a write stage snowplow refused to
+  send (#1112) `InvalidPath`, `TemplateError` or `NotSent` (see "A write
+  that is not sent fails" below). `dependsOn` is set on a `Skipped` row.
 - A resolve that runs no stage at all (its `dependsOn` graph names a stage
   that does not exist or has a cycle) answers a resolve-level row
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
@@ -347,6 +349,40 @@ stored or served.
   carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
   Snowplow sends the header only to itself and strips it from every other
   request.
+
+## A write that is not sent fails
+
+A write stage that snowplow refuses to send never reads as a success
+(#1112). Before any request leaves, snowplow refuses a call whose `path`,
+`payload` or a header did not render (a jq error, e.g. `tonumber` on a
+non-number, or an unrendered `${…}`), and — only on a stage with no
+`endpointRef`, which dials this cluster's apiserver — a rendered path that is
+not a valid Kubernetes object path (a collapsed or non-DNS-1123 name or
+namespace, #288). A stage with a named `endpointRef` is sent the path as
+rendered: an external API's ids (`/api/v2/tickets/Ab_12`) are not judged as
+Kubernetes names. Constrain caller input in the template itself.
+
+For a **read** the refused call is skipped and the page renders what it can,
+as before. For a **write** each refused call (one item of an iterator
+included) fails the stage with reason `InvalidPath`, `TemplateError` or
+`NotSent` in `X-Snowplow-Stage-Outcomes`, an error under its `errorKey`
+(code 400, or 500 for `NotSent`), and, without `continueOnError`, the
+resolve's status (see "The HTTP status"). A write stage that depends on it is
+`Skipped`. An iterator write with **zero** items has nothing to send and
+succeeds.
+
+## Redirects and credentials
+
+A stage's credential never goes to another host (#1106). When an endpoint
+answers a redirect to another origin (scheme, host and port), snowplow does
+not follow it if the redirected request would carry a credential: the
+endpoint's token, basic auth, client certificate or AWS signature, or an
+`Authorization` or `Cookie` header on the request (a stage with `exportJwt`
+included). The stage fails with `502`, naming the redirect. A redirect within
+the endpoint's own origin is followed. A request that carries no credential
+at all keeps the default behaviour. A stage with no `endpointRef` (this
+cluster's apiserver, a snowplow-held credential) follows no redirect at all
+(#723).
 
 ## jq templating of `path`, `payload` and `headers`
 

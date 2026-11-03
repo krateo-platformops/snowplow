@@ -112,7 +112,7 @@ func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *http
 		if err != nil {
 			return cli, err
 		}
-		return wrapEndpointClient(cli, held, saDial), nil
+		return wrapEndpointClient(cli, ep, held, saDial), nil
 	}
 	// The provenance inputs are everything besides the endpoint that changes
 	// the chain buildEndpointClient and wrapEndpointClient build: a held
@@ -130,7 +130,7 @@ func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *http
 		if err != nil {
 			return cli, false, err
 		}
-		return wrapEndpointClient(cli, held, saDial), keep, nil
+		return wrapEndpointClient(cli, ep, held, saDial), keep, nil
 	})
 }
 
@@ -143,9 +143,19 @@ func StageEndpointClientsStats() (entries int, builds, evictions uint64) {
 	return stageEndpointClients.Len(), stageEndpointClients.Builds(), stageEndpointClients.Evictions()
 }
 
-// wrapEndpointClient applies the provenance policy to a freshly built client,
-// in place.
-func wrapEndpointClient(cli *http.Client, held, saDial bool) *http.Client {
+// wrapEndpointClient applies the provenance policy to a freshly built client
+// of ep, in place. Everything it installs is a function of ep and the two
+// provenance marks, all three folded into the #1088 cache key, so a kept client
+// carries exactly the policy a fresh build would.
+func wrapEndpointClient(cli *http.Client, ep *endpoints.Endpoint, held, saDial bool) *http.Client {
+	// #1112 D4 — an endpoint that asks for a wire dump gets snowplow's, which
+	// logs metadata only: no credential, cookie or body (credhttp/wiredump.go).
+	// Plumbing's own dump is never installed (buildEndpointClient hands it a
+	// copy with Debug cleared). Inside the redirect policy below, so a refused
+	// hop is not dumped either: it never leaves.
+	if ep != nil && ep.Debug {
+		cli.Transport = credhttp.WireDump(cli.Transport)
+	}
 	// #723/#724 — a dial that presents a credential snowplow holds (the SA
 	// endpoint, marked by cache.WithServiceAccountDial, or any held credential,
 	// marked by credhttp.WithHeldCredential: the per-user clientconfig) NEVER
@@ -154,15 +164,25 @@ func wrapEndpointClient(cli *http.Client, held, saDial bool) *http.Client {
 	// never protects them; and a followed redirect's body would be accepted as
 	// the object. credhttp.Client refuses at CheckRedirect (the caller sees the
 	// 3xx with its own code) and at the transport (no hop reaches the network).
-	// A named endpointRef carries the third party's OWN credential and keeps
-	// net/http's default redirect behaviour.
+	//
+	// #1106 — a named endpointRef carries the third party's OWN credential, and
+	// the same RoundTripper argument holds for it: its bearer or basic auth is
+	// re-added on every hop and its client certificate is presented to whatever
+	// host a hop dials. So its client never sends a credential to another
+	// origin: a redirect within the endpoint's own origin is followed, one to
+	// another origin is refused whenever the hop would carry a credential (the
+	// endpoint's, or a credential header on the request), with the same two
+	// layers (credhttp/endpoint_redirect.go). The caller sees the 3xx, reported
+	// as #729's 502 naming the redirect.
 	if held || saDial {
 		cli = credhttp.Client(cli)
+	} else {
+		cli = credhttp.EndpointClient(cli, ep)
 	}
 	// #988 — whatever credential the stage dials with, its collection LISTs
 	// are a resolve's, so every endpoint client counts them
 	// (snowplow_resolve_collection_lists). Separate from the redirect policy
-	// above: a named endpointRef keeps its own redirect behaviour, but a LIST
+	// above: a named endpointRef has its own redirect policy, but a LIST
 	// it sends to the apiserver — e.g. of a GVR whose store is being swapped
 	// (#870) — is counted like any other. On a held dial the counter is already
 	// in Client's chain and this adds none.
@@ -173,16 +193,18 @@ func wrapEndpointClient(cli *http.Client, held, saDial bool) *http.Client {
 // kept across fetches (only a client-go-built one, see httpClientForEndpoint).
 // It is the ONLY site in the module allowed to build an endpoint client without
 // credhttp (the structural guard in internal/credhttp names it), because its
-// single caller, httpClientForEndpoint, applies credhttp.Client by provenance.
+// single caller, httpClientForEndpoint, applies credhttp.Client by provenance
+// (credhttp.EndpointClient otherwise, #1106). Plumbing is always handed a copy
+// of ep without Debug, so it never installs its wire dump (#1112 D4).
 func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, bool, error) {
 	if !endpointOwnedShape(ep) {
-		cli, err := httpcall.HTTPClientForEndpoint(ep, ri)
+		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
 		return cli, false, err
 	}
 
 	tlsCfg, ok := endpointTLSConfig(ep)
 	if !ok {
-		cli, err := httpcall.HTTPClientForEndpoint(ep, ri)
+		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
 		return cli, false, err
 	}
 
@@ -284,11 +306,10 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// client is built. An AWS-auth endpoint never reaches this branch
 	// anyway (see endpointOwnedShape).
 	//
-	// KNOWN DIVERGENCE, diagnostic-only: plumbing also wraps the client in a
-	// debuggingRoundTripper when ep.Debug is set (client.go:19-23), dumping
-	// each request via httputil.DumpRequestOut. A Debug:true token-auth
-	// endpoint with a CA loses that dump on this branch. Named here rather
-	// than left to be rediscovered as a bug; it affects no request semantics.
+	// THE WIRE DUMP (#1112 D4): plumbing wraps its client in a
+	// debuggingRoundTripper when ep.Debug is set, logging the Authorization
+	// header and both bodies. No builder installs it any more; a Debug endpoint
+	// on either branch gets credhttp.WireDump from wrapEndpointClient instead.
 	//
 	// CONNECTION REUSE (#1088): this client is kept per endpoint identity by
 	// httpClientForEndpoint, and its transport is its own (Proxy above), so one
@@ -319,9 +340,6 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 //     Config would send NO Authorization header at
 //     all. A silent credential drop is worse than any
 //     loud failure, so it is delegated, as AWS is.
-//   - Debug                     → plumbing's debuggingRoundTripper dumps each
-//     request and response; client-go has no such
-//     wrapper. A diagnostic mode, kept as it is.
 //   - HasCertAuth() && Insecure → plumbing IGNORES Insecure on a cert-auth
 //     endpoint (its cert branch replaces the
 //     skip-verify tls.Config with one that verifies
@@ -334,9 +352,12 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 // per-user population), the token-auth SA endpoint and any token-auth endpoint
 // with a CA (#229: plumbing drops that CA), CA-less endpoints (system roots, as
 // plumbing), Insecure endpoints (skip-verify, as plumbing, which ignores the CA
-// then), bearer, basic-with-username and a proxy.
+// then), bearer, basic-with-username and a proxy. A Debug endpoint is owned
+// like any other since #1112 D4: its wire dump is snowplow's own wrapper
+// (credhttp.WireDump), installed on either branch, so it no longer needs
+// plumbing's.
 func endpointOwnedShape(ep *endpoints.Endpoint) bool {
-	if ep == nil || ep.HasAwsAuth() || ep.Debug || (ep.HasBasicAuth() && ep.Username == "") {
+	if ep == nil || ep.HasAwsAuth() || (ep.HasBasicAuth() && ep.Username == "") {
 		return false
 	}
 	if ep.HasCertAuth() && (ep.Insecure || !ep.HasCA()) {
