@@ -850,7 +850,45 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
             "k6_errors": k6_errors(k6o),
             "clicks_vs_open_schedule": clicks_vs_schedule(k6o, wins),
             "refresher_completions": refresher_per_phase(mem, wins, span),
-            "snowplow_cpu": cpu_per_phase(tops, wins, span)}
+            "snowplow_cpu": cpu_per_phase(tops, wins, span),
+            "page_loads_by_phase": page_loads_by_phase(browser, k6o, pooled(wins))}
+
+
+# the page goal (#710 ruling, the north-star): p95 <= 3 s, max <= 10 s, the
+# login storm included
+PAGE_P95_GOAL_MS, PAGE_MAX_GOAL_MS = 3000.0, 10000.0
+
+
+def _page_stats(rows: list[tuple[float, float]], wins) -> dict:
+    """Per phase (the gate's pooled windows, by each load's START): n, p50,
+    p95, max and the goal's two marks; a phase no load started in is
+    UNMEASURED, never a pass."""
+    out = {}
+    for name in _names(wins):
+        ms = [m for t, m in rows if _phase(t, wins) == name]
+        if not ms:
+            out[name] = {"n": 0, "result": "UNMEASURED"}
+            continue
+        p95, mx = _pct(ms, 95), max(ms)
+        out[name] = {"n": len(ms), "p50_ms": round(_pct(ms, 50), 1), "p95_ms": round(p95, 1), "max_ms": round(mx, 1),
+                     "p95_within_goal": p95 <= PAGE_P95_GOAL_MS, "max_within_goal": mx <= PAGE_MAX_GOAL_MS}
+    return out
+
+
+def page_loads_by_phase(browser: dict | None, k6o: dict | None, wins) -> dict:
+    """REPORT ONLY (run 20: page loads were split only inside/outside a CPU
+    profile): page-load time by phase, against the page goal. `browser`: the
+    real Chrome loads (the north-star's); `k6`: k6's protocol-level page loads
+    by kind (first_load in the login storm, composite_first_load in the
+    burst, route clicks)."""
+    navs = [n for n in k6eval.browser_navs(browser) if n.get("start") is not None]
+    k6l = k6eval.k6_page_loads(k6o)
+    kinds = sorted({t.get("kind") or "?" for _, _, t in k6l})
+    return {"goal": {"p95_ms": PAGE_P95_GOAL_MS, "max_ms": PAGE_MAX_GOAL_MS},
+            "browser": _page_stats([(n["start"], n["wall_ms"]) for n in navs], wins) if browser else None,
+            "k6": ({k: _page_stats([(s, ms) for s, ms, t in k6l if (t.get("kind") or "?") == k], wins) for k in kinds}
+                   if k6o else None),
+            "note": "report only; a load is in the phase its start falls in (customer_latency's pooled windows)"}
 
 
 def _validity(name, ok, value, bar, why):
