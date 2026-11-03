@@ -226,6 +226,21 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	if ok {
 		t.Fatalf("G1 LEAK: resourceNames:[foo] MUST deny `get bar`")
 	}
+
+	// #1073 F2 — names compare exactly: neither a name that extends a granted
+	// one, nor its prefix, nor a case variant is the granted object.
+	for _, n := range []string{"foobar", "fo", "Foo", "foo "} {
+		ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "alice", Verb: "get", Group: "", Resource: "secrets",
+			Namespace: "default", Name: n,
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC(get %q): %v", n, err)
+		}
+		if ok {
+			t.Fatalf("G1 LEAK: resourceNames:[foo] MUST deny `get %q` (names compare exactly)", n)
+		}
+	}
 }
 
 // TestEvaluateRBAC_EmptyResourceNamesUnchanged is the no-regression

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/apicall"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/k8sauthz"
 
@@ -82,6 +83,34 @@ var i1049Queries = []struct{ name, raw string }{
 	{"undecodable watch with name=x", "watch=bogus&fieldSelector=metadata.name%3Dx"},
 	{"watch=true + undecodable limit", "watch=true&limit=abc&fieldSelector=metadata.name%3Dx"},
 	{"malformed pair skipped", "%zz&fieldSelector=metadata.name%3Dx"},
+	// #1073 F2/F3: a name that extends a granted one, and a case variant —
+	// names compare exactly, never by prefix or case-folded.
+	{"name=xx (extends x)", "fieldSelector=metadata.name%3Dxx"},
+	{"name=X (case variant)", "fieldSelector=metadata.name%3DX"},
+	// #1073 F1: a literal '#' in the rendered path starts a fragment the
+	// apiserver never receives. These rows are RAW rendered strings: the
+	// snowplow side splits the raw URL itself (apicall.SplitURI), exactly as
+	// the serve sites do, never a query net/url already cleaned.
+	{"fragment after y hides name=x (#1073 F1)", "fieldSelector=metadata.name%3Dy#,metadata.name=x"},
+	{"fragment after x (#1073 F1)", "fieldSelector=metadata.name%3Dx#frag"},
+	{"fragment holds the whole selector", "#fieldSelector=metadata.name%3Dx"},
+	{"fragment holding a second '?'", "fieldSelector=metadata.name%3Dx#a?fieldSelector=metadata.name%3Dy"},
+}
+
+// i1049RawSuffixes are rendered suffixes appended to the collection path as
+// they are, with no '?' added — a fragment BEFORE any '?' leaves no query.
+var i1049RawSuffixes = []string{
+	"#frag?fieldSelector=metadata.name%3Dx",
+	"?fieldSelector=metadata.name%3Dx#",
+	"#",
+	"?#",
+}
+
+// i1049Snowplow is what snowplow derives from the raw rendered URL: the
+// split every serve site uses, then CollectionRead.
+func i1049Snowplow(rawURL string) (verb, name string) {
+	_, rq, _ := apicall.SplitURI(rawURL)
+	return rbac.CollectionRead(rq)
 }
 
 // i1049URL is the collection URL of restactions in ns ("" = cluster-wide).
@@ -122,14 +151,20 @@ func i1049Upstream(t *testing.T, rawURL string) *request.RequestInfo {
 func TestIssue1049_CollectionRead_ParityWithRequestInfo(t *testing.T) {
 	named, unnamed, watches := 0, 0, 0
 	for _, ns := range []string{i1049NS, ""} {
+		rows := make([]struct{ name, url string }, 0, len(i1049Queries)+len(i1049RawSuffixes))
 		for _, q := range i1049Queries {
-			u := i1049URL(ns, q.raw)
+			rows = append(rows, struct{ name, url string }{q.name, i1049URL(ns, q.raw)})
+		}
+		for _, s := range i1049RawSuffixes {
+			rows = append(rows, struct{ name, url string }{"raw suffix " + s, i1049URL(ns, "") + s})
+		}
+		for _, q := range rows {
+			u := q.url
 			info := i1049Upstream(t, u)
-			req, _ := http.NewRequest(http.MethodGet, u, nil)
-			verb, name := rbac.CollectionRead(req.URL.RawQuery)
+			verb, name := i1049Snowplow(u)
 			if verb != info.Verb || name != info.Name {
-				t.Errorf("%s [ns=%q]: CollectionRead = (%s, %q), RequestInfo = (%s, %q)",
-					q.name, ns, verb, name, info.Verb, info.Name)
+				t.Errorf("%s [ns=%q] %s: snowplow = (%s, %q), RequestInfo = (%s, %q)",
+					q.name, ns, u, verb, name, info.Verb, info.Name)
 			}
 			if info.Namespace != ns {
 				t.Fatalf("%s: RequestInfo namespace %q, want %q", q.name, info.Namespace, ns)
@@ -189,7 +224,9 @@ func i1049Truth(t *testing.T, oracle *k8sauthz.Authorizer, user, ns, raw string)
 
 func i1049Evaluate(t *testing.T, user, ns, raw string) bool {
 	t.Helper()
-	ok, _, err := rbac.EvaluateRBAC(i1046Ctx(user), rbac.CollectionCheck(user, nil, i1046GVR, ns, raw))
+	// The raw rendered URL, split as every serve site splits it (#1073 F1).
+	_, rq, _ := apicall.SplitURI(i1049URL(ns, raw))
+	ok, _, err := rbac.EvaluateRBAC(i1046Ctx(user), rbac.CollectionCheck(user, nil, i1046GVR, ns, rq))
 	if err != nil {
 		t.Fatalf("EvaluateRBAC(%s, ns=%q, %q): %v", user, ns, raw, err)
 	}
@@ -267,6 +304,12 @@ func TestIssue1049_NameScopedListGrant_Arms(t *testing.T) {
 		{"list name=y,name=x, grant on x (terms sorted: x)", "u-list-x", i1049NS, q("metadata.name=y,metadata.name=x"), true},
 		{"list name=z,name=y, grant on x (terms sorted: y)", "u-list-x", i1049NS, q("metadata.name=z,metadata.name=y"), false},
 		{"list name=x + undecodable limit, grant on x", "u-list-x", i1049NS, "limit=abc&" + q("metadata.name=x"), false},
+		// #1073 F2/F3 — exact name comparison.
+		{"list name=xx, grant on x (no prefix match)", "u-list-x", i1049NS, q("metadata.name=xx"), false},
+		{"list name=X, grant on x (no case folding)", "u-list-x", i1049NS, q("metadata.name=X"), false},
+		// #1073 F1 — the reviewer's two '#' cases: the apiserver never sees the fragment.
+		{"list name=y#,name=x, grant on x: Kubernetes authorizes y", "u-list-x", i1049NS, "fieldSelector=metadata.name%3Dy#,metadata.name=x", false},
+		{"list name=x#frag, grant on x: Kubernetes authorizes x", "u-list-x", i1049NS, "fieldSelector=metadata.name%3Dx#frag", true},
 		{"list, no selector, namespace-wide grant", "u-nswide", i1049NS, "", true},
 		{"list name=x, unrelated grant", "u-none", i1049NS, q("metadata.name=x"), false},
 	}

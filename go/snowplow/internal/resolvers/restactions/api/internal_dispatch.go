@@ -860,9 +860,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 // branch; here it is only consulted on the LIST branch, so it fires precisely
 // on the null→cluster-LIST case task #118 targets.
 func pathHasNullPathSegment(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	if path == "" {
 		return false
 	}

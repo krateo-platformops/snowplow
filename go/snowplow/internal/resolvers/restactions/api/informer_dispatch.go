@@ -115,9 +115,7 @@ var subresourceSuffixes = []string{
 // resource names that contain the suffix string (e.g. a Deployment
 // literally named "status") are not false-positive-rejected.
 func hasSubresourceSuffix(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	path = strings.TrimRight(path, "/")
 	for _, sfx := range subresourceSuffixes {
 		if strings.HasSuffix(path, sfx) {

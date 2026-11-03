@@ -161,6 +161,14 @@ var i1049Arms = []struct {
 	// request carries x, so it is allowed, and it selects nothing.
 	{"ns list name=y,name=x (carries x, selects nothing)", i1049NSUser, q618NSPath("team-a") + i1049Sel("metadata.name=y,metadata.name=x"), []string{}},
 	{"ns list name=z,name=y (carries y)", i1049NSUser, q618NSPath("team-a") + i1049Sel("metadata.name=z,metadata.name=y"), nil},
+	// #1073 F2/F3: names compare exactly.
+	{"ns list name=xx (no prefix match)", i1049NSUser, q618NSPath("team-a") + i1049Sel("metadata.name=xx"), nil},
+	{"ns list name=X (no case folding)", i1049NSUser, q618NSPath("team-a") + i1049Sel("metadata.name=X"), nil},
+	// #1073 F1: a literal '#' in the rendered path — the apiserver never
+	// receives the fragment, so it authorizes y here (403 for a grant on x)…
+	{"ns list name=y#,name=x (Kubernetes: y)", i1049NSUser, q618NSPath("team-a") + "?fieldSelector=metadata.name%3Dy#,metadata.name=x", nil},
+	// …and x here (200 with x).
+	{"ns list name=x#frag (Kubernetes: x)", i1049NSUser, q618NSPath("team-a") + "?fieldSelector=metadata.name%3Dx#frag", []string{"team-a/x"}},
 	{"ns list name=x in team-b, Role only in team-a", i1049NSUser, q618NSPath("team-b") + i1049Sel("metadata.name=x"), nil},
 	{"cluster list name=x, Role only", i1049NSUser, q618ClusterPath + i1049Sel("metadata.name=x"), nil},
 	{"cluster list name=x, ClusterRole", i1049ClusterUser, q618ClusterPath + i1049Sel("metadata.name=x"), []string{"team-a/x", "team-b/x"}},
