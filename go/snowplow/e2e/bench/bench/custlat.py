@@ -896,14 +896,22 @@ def _page_stats(rows: list[tuple[float, float]], wins) -> dict:
 def page_loads_by_phase(browser: dict | None, k6o: dict | None, wins) -> dict:
     """REPORT ONLY (run 20: page loads were split only inside/outside a CPU
     profile): page-load time by phase, against the page goal. `browser`: the
-    real Chrome loads (the north-star's); `k6`: k6's protocol-level page loads
-    by kind (first_load in the login storm, composite_first_load in the
-    burst, route clicks)."""
+    real Chrome loads (the north-star's); `browser_by_skeleton`: the same split
+    by pageload.js's `skeleton` tag (no: painted from the SPA's own React Query
+    cache, no request, ~0 ms; yes: a load that waited on the server; timeout:
+    did not settle), so a phase's p95 is also read on the server-dependent
+    loads alone (#1064 review: 53.5 % of run 20b's loads were cache paints);
+    `k6`: k6's protocol-level page loads by kind (first_load in the login
+    storm, composite_first_load in the burst, route clicks)."""
     navs = [n for n in k6eval.browser_navs(browser) if n.get("start") is not None]
     k6l = k6eval.k6_page_loads(k6o)
     kinds = sorted({t.get("kind") or "?" for _, _, t in k6l})
     return {"goal": {"p95_ms": PAGE_P95_GOAL_MS, "max_ms": PAGE_MAX_GOAL_MS},
             "browser": _page_stats([(n["start"], n["wall_ms"]) for n in navs], wins) if browser else None,
+            "browser_by_skeleton": ({sk: _page_stats([(n["start"], n["wall_ms"]) for n in navs
+                                                      if (n.get("skeleton") or "unknown") == sk], wins)
+                                     for sk in sorted({n.get("skeleton") or "unknown" for n in navs})}
+                                    if browser else None),
             "k6": ({k: _page_stats([(s, ms) for s, ms, t in k6l if (t.get("kind") or "?") == k], wins) for k in kinds}
                    if k6o else None),
             "note": "report only; a load is in the phase its start falls in (customer_latency's pooled windows)"}

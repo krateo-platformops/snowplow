@@ -2578,6 +2578,14 @@ RUN8_RESOLVED_CACHE_STATS = ("hit_total", "stale_served_total", "stale_served_ag
 # reaches the bench ONLY this way (logscrub hashes its stacks whole in the log).
 # Covers snowplow_slow_requests_* and snowplow_slow_request_* (bench/slowcall.py).
 SLOW_REQUEST_PREFIX = "snowplow_slow_request"
+# #1099 (merged on main): the refresh cycle stage by stage, identical vs
+# changed Puts per class|tier, the worker wait and the refresh duration per
+# tier (bench/cycle_stale.py); outside snowplow_refresher_, which C7 reserves
+REFRESH_CYCLE_PREFIX = "snowplow_refresh_cycle_"
+# #1082: stale serve -> the replacing frame written, per serving layer
+# (apistage, l1), with the serves left unreplaced past 10 s; its retry family
+# (snowplow_stale_retry_) is inside it too
+STALE_PREFIX = "snowplow_stale_"
 # The /debug/vars prefixes memwatch must capture so every key above is seen.
 # run606's MEM_VARS_PREFIXES default IS this tuple (printed by `prefixes`), and
 # `check-prefixes` refuses a run-8 run whose prefixes miss any RUN8_KEYS value.
@@ -2627,6 +2635,8 @@ RUN8_VARS_PREFIXES = (
     "snowplow_resolve_collection_lists",  # #988 (PR #991): a resolve's collection LISTs on the wire
     "snowplow_crd_discovery",             # schema relists / build requests, on both mechanisms
     SLOW_REQUEST_PREFIX,                  # #1054: the slow-call record, phase histogram and snapshots
+    REFRESH_CYCLE_PREFIX,                 # #1099: refresh-cycle Puts, wait and duration per tier
+    STALE_PREFIX,                         # #1082: stale-to-push per layer, unreplaced serves
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -3843,6 +3853,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     # #1054: the slow-call record per run (report only; UNMEASURED on a build without it)
     from bench import slowcall
     report["slow_requests"] = slowcall.report(mem or [], SLOW_REQUEST_PREFIX)
+    # #1099 / #1082 (report only; UNMEASURED on a build without them)
+    from bench import cycle_stale
+    report["refresh_cycle"] = cycle_stale.refresh_cycle(mem or [])
+    report["stale_push_by_layer"] = cycle_stale.stale_push_by_layer(mem or [])
     # #871 — the work-class label: CPU per class from the profiles, units per
     # class from the expvar. Report only; local import (load606.py alone runs
     # in the cluster).

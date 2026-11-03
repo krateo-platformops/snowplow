@@ -79,7 +79,7 @@ def _evaluate(tmp_path, *, extras=None, viewer_kw=None, two_stats=False):
     _write_viewer(k6dir, **(viewer_kw or {}))
     if two_stats:   # a cumulative viewer_stats written twice: the last one counts, never their sum
         with open(k6dir / "viewer.jsonl", "a") as fh:
-            fh.write(json.dumps({"kind": "viewer_stats", "t": 7, "streams_opened": 5, "frames": 1}) + "\n")
+            fh.write(json.dumps({"kind": "viewer_stats", "t": 7, "streams_opened": 9, "frames": 2}) + "\n")
     _write_out(bdir, "browser", _browser_points(), _browser_summary(63), 0)
     fresh = tmp_path / "fresh.jsonl"
     fresh.write_text(json.dumps({"kind": "fresh", "label": "list_dep@1", "converged": True, "latency_ms": 100,
@@ -143,7 +143,8 @@ def test_the_sidecars_tabs_are_the_delivery_and_a_missing_stale_serve_is_named(t
 
 def test_a_cumulative_viewer_stats_counts_once(tmp_path):
     ex = _evaluate(tmp_path, two_stats=True)["report"]["run8"]["exercised_710_740"]
-    assert ex["streams_opened"] == 5
+    # the sidecar's viewer_stats is cumulative: 5 at t=5, 9 at t=7; the run's is the last (#1064 review V1)
+    assert ex["streams_opened"] == 9 and ex["frames"] == 2
 
 
 # ─── P: page loads by phase, against the goal ────────────────────────────────
@@ -157,8 +158,9 @@ def test_page_loads_by_phase_report_every_phase_and_an_empty_one_as_unmeasured()
     # (99.5 s, 1.5 s): it starts in the storm and ends after it: a storm load
     loads = [(50.0, 900.0), (60.0, 2500.0), (70.0, 12000.0), (99.5, 1500.0), (450.0, 400.0), (900.0, 300.0)]
     browser = _o({"browser_page_load_ms": [(ms, {"t0": str(int(t * 1000)), "method": "click"}) for t, ms in loads]})
-    k6o = _o({"page_load_ms": [(1000.0, {"kind": "first_load"}), (500.0, {"kind": "route"})]},
-             {"page_load_ms": [51.0, 901.0]})
+    k6o = _o({"page_load_ms": [(1000.0, {"kind": "first_load"}), (500.0, {"kind": "route"}),
+                               (300.0, {"kind": "route"})]},
+             {"page_load_ms": [51.0, 901.0, 61.0]})
     r = custlat.page_loads_by_phase(browser, k6o, wins)
     b = r["browser"]
     assert b["storm"]["n"] == 4 and b["storm"]["max_ms"] == 12000.0
@@ -166,12 +168,32 @@ def test_page_loads_by_phase_report_every_phase_and_an_empty_one_as_unmeasured()
     assert b["burst"] == {"n": 0, "result": "UNMEASURED"}
     assert b["steady"]["n"] == 1
     assert r["k6"]["first_load"]["storm"]["n"] == 1 and r["k6"]["route"]["steady"]["n"] == 1
+    # a route load and a first load in the storm: each under its own kind only (#1064 review P5)
+    assert r["k6"]["route"]["storm"]["n"] == 1 and r["k6"]["route"]["storm"]["max_ms"] == 300.0
+    assert r["k6"]["first_load"]["storm"]["max_ms"] == 1000.0
     assert r["goal"] == {"p95_ms": 3000.0, "max_ms": 10000.0}
+
+
+def test_page_loads_by_phase_split_by_skeleton():
+    """(#1064 review) cache paints (skeleton=no, ~0 ms) apart from the loads
+    that waited on the server (yes) and the timeouts, per phase."""
+    wins = [("storm", float("-inf"), 100.0)]
+    loads = [(10.0, 0.0, "no"), (11.0, 0.0, "no"), (12.0, 0.0, "no"), (13.0, 2400.0, "yes"), (14.0, 2900.0, "yes"),
+             (15.0, 60000.0, "timeout"), (500.0, 1200.0, "yes")]
+    browser = _o({"browser_page_load_ms": [(ms, {"t0": str(int(t * 1000)), "skeleton": sk}) for t, ms, sk in loads]})
+    r = custlat.page_loads_by_phase(browser, None, wins)
+    sk = r["browser_by_skeleton"]
+    assert set(sk) == {"no", "yes", "timeout"}
+    assert sk["no"]["storm"]["n"] == 3 and sk["no"]["storm"]["p95_ms"] == 0.0
+    assert sk["yes"]["storm"]["n"] == 2 and sk["yes"]["storm"]["p95_ms"] == 2875.0 and sk["yes"]["steady"]["n"] == 1
+    assert sk["timeout"]["storm"]["max_within_goal"] is False and sk["timeout"]["steady"]["result"] == "UNMEASURED"
+    assert r["browser"]["storm"]["n"] == 6                     # the whole, as before
 
 
 def test_page_loads_by_phase_reach_the_verdict(tmp_path):
     pl = _evaluate(tmp_path)["report"]["customer_latency"]["page_loads_by_phase"]
     assert sum(x.get("n", 0) for x in pl["browser"].values()) == 63
+    assert sum(x.get("n", 0) for sk in pl["browser_by_skeleton"].values() for x in sk.values()) == 63
     assert set(pl["k6"]) == {"first_load", "composite_first_load", "route"}
 
 
