@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/server/use"
@@ -80,7 +81,7 @@ func c1029AssertPlumbingCompatible(t *testing.T, rec *httptest.ResponseRecorder,
 	if !strings.HasPrefix(rec.Body.String(), prefix+`,"details":{"causes":[`) {
 		t.Fatalf("the plumbing fields are not byte-compatible:\n got  %s\n want %s,\"details\":...", rec.Body.String(), prefix)
 	}
-	if got := rec.Header().Get("Content-Type"); got != want.Header().Get("Content-Type") {
+	if got := rec.Result().Header.Get("Content-Type"); got != want.Header().Get("Content-Type") {
 		t.Fatalf("Content-Type = %q, want plumbing's %q", got, want.Header().Get("Content-Type"))
 	}
 	var asPlumbing response.Status
@@ -107,10 +108,10 @@ func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
 	if b.Details == nil || len(b.Details.Causes) != 1 || b.Details.Causes[0].Reason != "StepUpRequired" {
 		t.Fatalf("want details.causes[0].reason=StepUpRequired; body=%s", rec.Body.String())
 	}
-	if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != c1029Challenge {
+	if got := rec.Result().Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != c1029Challenge {
 		t.Fatalf("WWW-Authenticate = %q, want exactly [%q]", got, c1029Challenge)
 	}
-	if strings.Contains(rec.Header().Get("WWW-Authenticate"), "acr_values") {
+	if strings.Contains(rec.Result().Header.Get("WWW-Authenticate"), "acr_values") {
 		t.Fatal("the challenge must not carry acr_values (krateo:loa:2 is not an IdP ACR value)")
 	}
 	if !strings.Contains(b.Message, "not found") {
@@ -120,8 +121,9 @@ func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
 }
 
 // Any other token whose session Secret is missing: 401, cause
-// SessionCredentialMissing, never StepUpRequired, and no challenge — even with
-// a step-up Secret for the same user sitting in the informer.
+// SessionCredentialMissing, never StepUpRequired, and the RFC 6750
+// invalid_token challenge (#1076), never the step-up one — even with a step-up
+// Secret for the same user sitting in the informer.
 func TestCredentialStatus1029_SessionMissingIsSessionCredentialMissing(t *testing.T) {
 	stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
 	su994Informer(t, stepUp)
@@ -135,8 +137,8 @@ func TestCredentialStatus1029_SessionMissingIsSessionCredentialMissing(t *testin
 	if b.Details == nil || len(b.Details.Causes) != 1 || b.Details.Causes[0].Reason != "SessionCredentialMissing" {
 		t.Fatalf("want details.causes[0].reason=SessionCredentialMissing; body=%s", rec.Body.String())
 	}
-	if got := rec.Header().Values("WWW-Authenticate"); len(got) != 0 {
-		t.Fatalf("the session case must send no WWW-Authenticate challenge; got %q", got)
+	if got := rec.Result().Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != `Bearer error="invalid_token"` {
+		t.Fatalf("the session case must send exactly the invalid_token challenge (#1076); got %q", got)
 	}
 	if strings.Contains(rec.Body.String(), "StepUpRequired") {
 		t.Fatalf("the session case must never name StepUpRequired: %s", rec.Body.String())
@@ -195,74 +197,116 @@ func TestCredentialStatus1029_ReReadErrorIs500WithNoCause(t *testing.T) {
 // R-DOC also keeps the integration doc's section 2 examples byte-equal to the
 // wire.
 
-// c1029DocBlocks returns the bodies and header lines of the doc's ```http
-// examples (sections 2a and 2b), in order.
-func c1029DocBlocks(t *testing.T) (bodies []string, headers [][]string) {
+// c1029DocExample is one of the doc's ```http examples: its status line, its
+// header lines and its body.
+type c1029DocExample struct {
+	statusLine string
+	headers    []string
+	body       string
+}
+
+// c1029DocBlocks returns the doc's ```http examples (section 2), keyed by the
+// details.causes[0].reason of their body (#1076: one example per cause).
+func c1029DocBlocks(t *testing.T) map[string]c1029DocExample {
 	t.Helper()
 	b, err := os.ReadFile("../../../docs/howto-frontend-credential-401-causes.md")
 	if err != nil {
 		t.Fatal(err)
 	}
+	out := map[string]c1029DocExample{}
 	for _, blk := range strings.Split(string(b), "```http\n")[1:] {
 		blk = blk[:strings.Index(blk, "```")]
-		var hs []string
+		var ex c1029DocExample
 		for _, ln := range strings.Split(blk, "\n") {
-			if strings.HasPrefix(ln, "{") {
-				bodies = append(bodies, ln)
-			} else if strings.Contains(ln, ": ") {
-				hs = append(hs, ln)
+			switch {
+			case strings.HasPrefix(ln, "HTTP/"):
+				ex.statusLine = ln
+			case strings.HasPrefix(ln, "{"):
+				ex.body = ln
+			case strings.Contains(ln, ": "):
+				ex.headers = append(ex.headers, ln)
 			}
 		}
-		headers = append(headers, hs)
+		var st c1029Body
+		if err := json.Unmarshal([]byte(ex.body), &st); err != nil || st.Details == nil || len(st.Details.Causes) != 1 {
+			t.Fatalf("doc example has no single cause: %q", ex.body)
+		}
+		if _, dup := out[st.Details.Causes[0].Reason]; dup {
+			t.Fatalf("two doc examples for %s", st.Details.Causes[0].Reason)
+		}
+		out[st.Details.Causes[0].Reason] = ex
 	}
-	return
+	return out
 }
 
-// R-DOC — the doc's examples are the wire, byte for byte, once the doc's
-// example user is substituted.
+// R-DOC — the doc's examples are the wire, byte for byte (status line, every
+// header, body), once the doc's example user is substituted: one example for
+// each cause of the #1076 closed set, and no other.
 func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
-	bodies, headers := c1029DocBlocks(t)
-	if len(bodies) != 2 || len(headers) != 2 {
-		t.Fatalf("expected 2 doc examples, got %d bodies %d header sets", len(bodies), len(headers))
-	}
+	examples := c1029DocBlocks(t)
 	sub := func(s string) string { return strings.ReplaceAll(s, "alice", su994User) }
-
-	t.Run("2a", func(t *testing.T) {
-		session := su994Secret(credsecret.SessionName(su994User), su994Session)
-		su994Informer(t, session)
-		su994APIServer(t, session)
-		rec, _ := c1029Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
-		if got, want := rec.Body.String(), sub(bodies[0])+"\n"; got != want {
-			t.Fatalf("2a body differs from doc:\n got  %q\n want %q", got, want)
+	bearer := func(v string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/call?x=1", nil)
+		if v != "" {
+			r.Header.Set("Authorization", v)
 		}
-		if len(headers[0]) != 2 {
-			t.Fatalf("2a doc headers: %q", headers[0])
+		return r
+	}
+	tokenServe := func(r *http.Request) func(*testing.T) *httptest.ResponseRecorder {
+		return func(t *testing.T) *httptest.ResponseRecorder {
+			t.Setenv("CACHE_ENABLED", "false")
+			rec, _ := p1076Serve(middleware.UserConfig(testKeys, testAuthnNS), r)
+			return rec
 		}
-		for _, h := range headers[0] {
-			k, v, _ := strings.Cut(h, ": ")
-			if rec.Header().Get(k) != v {
-				t.Fatalf("2a header %q: doc %q wire %q", k, v, rec.Header().Get(k))
+	}
+	cases := map[string]func(*testing.T) *httptest.ResponseRecorder{
+		"TokenMissing": tokenServe(bearer("")),
+		"TokenInvalid": tokenServe(bearer("Bearer not.a.real.jwt")),
+		"TokenExpired": func(t *testing.T) *httptest.ResponseRecorder {
+			return tokenServe(bearer("Bearer " + helperMakeToken(t, testUsername, -time.Hour)))(t)
+		},
+		"StepUpRequired": func(t *testing.T) *httptest.ResponseRecorder {
+			session := su994Secret(credsecret.SessionName(su994User), su994Session)
+			su994Informer(t, session)
+			su994APIServer(t, session)
+			rec, _ := c1029Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
+			return rec
+		},
+		"SessionCredentialMissing": func(t *testing.T) *httptest.ResponseRecorder {
+			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			su994Informer(t, stepUp)
+			su994APIServer(t, stepUp)
+			rec, _ := c1029Serve(t, su994Token(t, su994Group))
+			return rec
+		},
+	}
+	if len(examples) != len(cases) {
+		t.Fatalf("the doc has %d examples, want one per cause (%d)", len(examples), len(cases))
+	}
+	for reason, serve := range cases {
+		t.Run(reason, func(t *testing.T) {
+			ex, ok := examples[reason]
+			if !ok {
+				t.Fatalf("the doc has no example for %s", reason)
 			}
-		}
-		if rec.Code != http.StatusUnauthorized || len(rec.Header()) != 2 {
-			t.Fatalf("2a code=%d headers=%v", rec.Code, rec.Header())
-		}
-	})
-	t.Run("2b", func(t *testing.T) {
-		stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
-		su994Informer(t, stepUp)
-		su994APIServer(t, stepUp)
-		rec, _ := c1029Serve(t, su994Token(t, su994Group))
-		if got, want := rec.Body.String(), sub(bodies[1])+"\n"; got != want {
-			t.Fatalf("2b body differs from doc:\n got  %q\n want %q", got, want)
-		}
-		if len(headers[1]) != 1 {
-			t.Fatalf("2b doc headers: %q", headers[1])
-		}
-		if rec.Code != http.StatusUnauthorized || len(rec.Header()) != 1 || rec.Header().Get("Content-Type") != "application/json" {
-			t.Fatalf("2b code=%d headers=%v", rec.Code, rec.Header())
-		}
-	})
+			rec := serve(t)
+			if ex.statusLine != "HTTP/1.1 401 Unauthorized" || rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status: doc %q wire %d", ex.statusLine, rec.Code)
+			}
+			if got, want := rec.Body.String(), sub(ex.body)+"\n"; got != want {
+				t.Fatalf("body differs from doc:\n got  %q\n want %q", got, want)
+			}
+			if len(ex.headers) != len(rec.Result().Header) {
+				t.Fatalf("doc headers %q, wire headers %v", ex.headers, rec.Result().Header)
+			}
+			for _, h := range ex.headers {
+				k, v, _ := strings.Cut(h, ": ")
+				if got := rec.Result().Header.Values(k); len(got) != 1 || got[0] != v {
+					t.Fatalf("header %q: doc %q wire %q", k, v, got)
+				}
+			}
+		})
+	}
 }
 
 // R-NM — a token whose groups only resemble the marker reads the session Secret
@@ -275,9 +319,9 @@ func TestCredentialStatus1029_NearMissGroupIsSessionCause(t *testing.T) {
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, g))
 			if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"reason":"SessionCredentialMissing"`) ||
-				rec.Header().Get("WWW-Authenticate") != "" {
+				rec.Result().Header.Get("WWW-Authenticate") != `Bearer error="invalid_token"` {
 				t.Fatalf("group %q: want the session cause; code=%d hdr=%q body=%s",
-					g, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String())
+					g, rec.Code, rec.Result().Header.Get("WWW-Authenticate"), rec.Body.String())
 			}
 		})
 	}

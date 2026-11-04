@@ -120,8 +120,11 @@ func c681Seed() []runtime.Object {
 	return []runtime.Object{
 		cr("ra-reader681", rbacv1.PolicyRule{APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource}, Verbs: []string{"get", "list"}}),
 		crb("ra-reader681", "ra-reader681", c681Group(c681All)),
-		// all681 may read configmaps in pub; readers681 in x.
-		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "pub", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM}},
+		// all681 may read configmaps in pub; readers681 in x. (#1080 C8: and
+		// the CRD-backed c1080Gizmos in pub — a rule, not a binding, so no
+		// binding set and no key moves.)
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "pub", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM,
+			{APIGroups: []string{c1080Gizmos.Group}, Resources: []string{c1080Gizmos.Resource}, Verbs: []string{"get", "list"}}}},
 		rb("pub", "all-cm", "cm", c681Group(c681All)),
 		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: "x", Name: "cm"}, Rules: []rbacv1.PolicyRule{getCM}},
 		rb("x", "readers-cm", "cm", c681Group(c681Readers)),
@@ -170,6 +173,7 @@ func c681Setup(t *testing.T) *c681Env {
 		h1RAGVR: "RESTActionList", h1WidgetGVR: "PanelList",
 		c681CRBGVR: "ClusterRoleBindingList", c681CRGVR: "ClusterRoleList",
 		c681RBGVR: "RoleBindingList", c681RGVR: "RoleList", c681CMs: "ConfigMapList",
+		c1080Gizmos: "GizmoList", // #1080 C8 — a CRD-backed (removable) GVR
 	}
 	objs := append(c681Seed(), c681CMObj("pub", "p", "PUBDATA-681"), c681CMObj("x", "y", c681SecretY))
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objs...)
@@ -241,6 +245,12 @@ func c681Setup(t *testing.T) *c681Env {
 			_, _ = fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,`+
 				`"message":"configmaps \"%s\" is forbidden: User \"%s\" cannot get resource \"configmaps\" in the namespace \"%s\" (groups %s)"}`,
 				name, id.user, ns, strings.ReplaceAll(string(gb), `"`, `'`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/boom") {
+			// A transient apiserver failure (#1080: never a definite answer).
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500}`)
 			return
 		}
 		body, found := c681Objects(r.URL.Path)
@@ -413,12 +423,15 @@ func TestIssue681_H5_H5b_CrossIdentityIsolation_AndNoIdentityText(t *testing.T) 
 	}
 }
 
+// H2 — the other error is a 5xx. (Before #1080 it was a 404 of pub/ghost; a
+// watched named object's NotFound under continueOnError is now a definite
+// answer itself, so it no longer plays "another error" — issue1080's arms.)
 func TestIssue681_H2_MixedDenialAndOtherError_NotCached(t *testing.T) {
 	e := c681Setup(t)
-	e.ra = c681RAObj("/api/v1/namespaces/x/configmaps/y", "/api/v1/namespaces/pub/configmaps/ghost")
+	e.ra = c681RAObj("/api/v1/namespaces/x/configmaps/y", "/api/v1/namespaces/pub/configmaps/boom")
 	e.call(t, c681A)
 	if _, ok := e.cell(c681A, t); ok {
-		t.Fatal("H2 RED: a denial + 404 result was cached")
+		t.Fatal("H2 RED: a denial + 5xx result was cached")
 	}
 	if _, d := e.call(t, c681A); d == 0 {
 		t.Fatal("H2: the second /call was served from a cell")

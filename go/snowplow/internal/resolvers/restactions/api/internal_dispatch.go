@@ -128,6 +128,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -453,6 +454,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// own authorize-before-lookup order.
 		//
 		// The LIST shape below is unchanged (its narrowing is per item).
+		preDialAuthorized := false
 		if !serveUnnarrowed {
 			if preNS, ok := preDialAuthzNamespace(gvr, namespace); ok {
 				if !authorizeGetByRBAC(ctx, gvr, preNS, name) {
@@ -464,6 +466,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 					return nil, false, newRegateForbidden(gvr, namespace, name)
 				}
 				recordPreDial(preDialAllowed)
+				preDialAuthorized = true
 			} else {
 				recordPreDial(preDialScopeFallback)
 			}
@@ -474,6 +477,14 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		obj, getErr := nri.Get(dctx, name, metav1.GetOptions{})
 		dial.EndErr(ctx, getErr)
 		if getErr != nil {
+			// #1080 N2 — a NotFound AFTER this identity's `get` was authorized
+			// is this identity's answer (the apiserver's own authorize-before-
+			// lookup order). Without the pre-dial step (an un-narrowed serve, a
+			// scope fallback) the SA's NotFound says nothing about the identity:
+			// it stays a plain error.
+			if preDialAuthorized && apierrors.IsNotFound(getErr) {
+				return nil, false, newAuthorizedNotFound(getErr)
+			}
 			return nil, false, getErr
 		}
 		// Per-user RBAC re-gate on the GET-by-name (defensive authorization).

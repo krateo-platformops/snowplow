@@ -203,7 +203,10 @@ func TestIssue709_A3_ContinueOnError_RecordsTheStageErrorAndContinues(t *testing
 	}
 
 	// A filter that yields no value under continueOnError is not a failure:
-	// status null, 200.
+	// status null, 200. (#1080: the CRD is watched and absent, so the result
+	// above is a definite NotFound and was cached under this RESTAction's key;
+	// the arm wants a fresh resolve of the edited filter.)
+	cache.ResetResolvedCacheForTest()
 	rec = serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", i709Filter, i709CRDStage(true), targetStage()))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":null`) {
 		t.Fatalf("zero-yield filter after a continueOnError failure: want 200 status null, got %d %s", rec.Code, rec.Body.String())
@@ -234,9 +237,12 @@ func TestIssue709_A5_NonOKWithoutAStatusBody_KeepsTheCode(t *testing.T) {
 		}
 		rec := serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", i709Filter, i709CRDStage(false)))
 		i709AssertNotFound(t, rec)
-		// What the stage recorded under errorKey says what the upstream did.
+		// What the stage recorded under errorKey keeps the code. (#1080: the CRD
+		// is watched and absent, and the 404 came from the requester's own
+		// apiserver dial, so under continueOnError it is a definite NotFound,
+		// recorded with the canonical identity-free NotFound text.)
 		rec = serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", `{e: .crdError}`, i709CRDStage(true)))
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "upstream answered 404 Not Found with an empty body") ||
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `\"agents.kagent.dev\" not found`) ||
 			!strings.Contains(rec.Body.String(), `"code":404`) {
 			t.Fatalf("empty-body 404 errorKey: got %d %s", rec.Code, rec.Body.String())
 		}

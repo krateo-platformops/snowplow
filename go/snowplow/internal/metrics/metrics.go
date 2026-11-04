@@ -1444,7 +1444,7 @@ func registerListNarrowInstruments(m metric.Meter) error {
 // described can never be set.
 func registerDenialOnlyInstruments(m metric.Meter) error {
 	denialOnly, err := m.Int64ObservableCounter("snowplow_resolved_cache_denial_only_put_total",
-		metric.WithDescription("Resolved RESTAction / widget results Put although they carried stage errors, because EVERY stage error was a per-identity forbidden (snowplow's re-gate deny, or the apiserver's 403 on the requester's own dial), by site: call_ra, call_widget, refresher, seed (#681). The cell is keyed per identity class exactly like any other; its error bodies are identity-free."))
+		metric.WithDescription("Resolved RESTAction / widget results Put although they carried stage errors, because EVERY stage error was a per-identity definite answer (snowplow's re-gate deny, the apiserver's 403 on the requester's own dial, or a watched named object's NotFound under continueOnError, #1080), by site: call_ra, call_widget, refresher, seed (#681). The cell is keyed per identity class exactly like any other; its error bodies are identity-free."))
 	if err != nil {
 		return err
 	}

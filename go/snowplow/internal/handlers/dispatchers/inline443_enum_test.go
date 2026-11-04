@@ -337,7 +337,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// Same classification as StageErrorSink.Bump.
 	"PerIdentityForbiddenSink.BumpStage": readOnly443, "PerIdentityForbiddenSink.BumpExternal": readOnly443,
 	"PerIdentityForbiddenSinkFromContext": readOnly443,
-	"WithContentDepGenSink":               readOnly443, "WithInternalEndpoint": readOnly443,
+	// #1080: the dep worker's objAbsent probe of the process watcher — an
+	// indexer read under the watcher's read lock; it never registers a GVR.
+	"WatchedAbsent":         readOnly443,
+	"WithContentDepGenSink": readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
 	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDialValue": readOnly443,
 	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.

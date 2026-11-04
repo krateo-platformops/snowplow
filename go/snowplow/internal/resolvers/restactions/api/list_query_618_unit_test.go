@@ -267,6 +267,7 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 		"collapsedPath":                      "#288/#1112 collapse refusal (every dial): path-shape check, serves nothing",
 		"extractClusterListGVRFromStagePath": "GVR shape half of extractClusterListTargetFromStage, which classifies",
 		"classifyOwnDialForbidden":           "#681: classifies an apiserver 403 and builds its identity-free error text from (gvr, ns, name); serves and keys nothing",
+		"definiteNotFoundMessage":            "#1080: classifies a named GET's NotFound (a LIST never qualifies) and builds its identity-free error text from (gvr, name); serves and keys nothing",
 		"stageMessage":                       "#709 (+#729 redirect variant): formats a failed stage's error text from (code, gvr, ns, name) only — never a key, never a served data body; TestIssue709_CanonicalStageMessage_CarriesNoQuery pins that no query reaches it",
 		"noteNarrowServed":                   "#603 PR-2 shadow: maps a served call back to the list edge the edge-3 record keyed on (gvr, ns) — the same query-free key runStage records; serves and keys nothing",
 		"stageAuditEvent":                    "AUDIT-4 (installer#410): labels the audit record of a write-verb stage with the (gvr, ns, name) it addressed, after the dial; the query is stripped first and no path is recorded; serves and keys nothing",
