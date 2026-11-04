@@ -210,17 +210,20 @@ func TestIssue1112_D2_E_ContinueOnErrorKeepsTheFailureInTheOutcomes(t *testing.T
 	}
 }
 
-func TestIssue1112_D2_F_ReadSkipSilent_EmptyIteratorWriteSucceeds(t *testing.T) {
+func TestIssue1112_D2_F_ReadSkipFails_EmptyIteratorWriteSucceeds(t *testing.T) {
 	ep := newX1106Srv(t, false, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
 	})
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
+	// #1116: a read's template skip is no longer silent: nothing is sent, and
+	// the stage fails with its reason (refused_read_1116_test.go).
 	read := x1106Stage("r", http.MethodGet, `${ "/zd/tickets/" + (.ticketId|tonumber|tostring) }`)
 	o := x1106Resolve(t, map[string]any{"ticketId": "abc"}, read)
-	if o.outcomes != "[]" || len(ep.all()) != 0 {
-		t.Fatalf("a read's template skip is unchanged (silent, nothing sent): header %s sent %d", o.outcomes, len(ep.all()))
+	if len(ep.all()) != 0 {
+		t.Fatalf("a read's template skip sent %d request(s)", len(ep.all()))
 	}
+	x1106WantReason(t, o.outcomes, "r", StageReasonTemplateError)
 	list := x1106Stage("list", http.MethodGet, "/zd/items")
 	del := x1106Write("del", http.MethodDelete, `${ "/zd/items/" + .id }`)
 	del.DependsOn = &templates.Dependency{Name: "list", Iterator: ptr.To(`.list`)}

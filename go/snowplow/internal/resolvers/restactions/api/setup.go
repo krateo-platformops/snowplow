@@ -277,12 +277,12 @@ func collapsedPath(path, verb string) (bool, skipReason) {
 	}
 	p := rawPath(path)
 	if strings.Contains(p, "/namespaces//") {
-		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)"}
+		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)", collapsed: true}
 	}
 	switch verb {
 	case http.MethodPut, http.MethodPatch, http.MethodDelete:
 		if _, _, name, ok := cache.ParseAPIServerPathToDep(path); ok && name == "" && strings.HasSuffix(p, "/") {
-			return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (empty last segment, trailing slash) (#288)"}
+			return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (empty last segment, trailing slash) (#288)", collapsed: true}
 		}
 	}
 	return true, skipReason{}

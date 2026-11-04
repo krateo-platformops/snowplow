@@ -613,7 +613,7 @@ func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, ap
 	// write item any guard refuses is a stage failure with its reason, never a
 	// silent success (undialled_write.go).
 	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
-	r.failUndialledWrites(id, apiCall, skips)
+	r.failRefusedItems(id, apiCall, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the

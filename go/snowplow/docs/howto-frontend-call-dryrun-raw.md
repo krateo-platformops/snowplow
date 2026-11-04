@@ -165,6 +165,24 @@ Content-Type: application/json
     it (`Skipped`, #904). An iterator write whose iterator yields **zero**
     items has nothing to send and still succeeds; a dry run still reports
     `StageNotExecuted`.
+  - **A read that was not sent is a failure too (#1116).** A `GET` stage, or
+    one item of its iterator, that snowplow refuses to send for the same two
+    causes is listed with `InvalidPath` or `TemplateError`. Under its
+    `errorKey` it records the same Status, with the message `read stage
+    "<id>" verb GET was not sent: <cause>`.
+    - For `InvalidPath`, the cause says which check refused the path: `a path
+      segment rendered empty` (any stage, a named endpoint's included) or `its
+      rendered path is not a valid Kubernetes object path` (a stage that dials
+      this cluster).
+    - Before #1116 it answered `[]` and left the stage's key unset, so a
+      filter read nothing there and could not tell "no data" from "never
+      read".
+    - Without `continueOnError` it is the resolve's failure, as for a write:
+      when the `filter` cannot produce a value, `/call` answers 400.
+    - With `continueOnError` the body is served with the failure in the
+      outcomes. It is not stored, so the next `/call` resolves again.
+    - The remaining valid items of an iterator read are still sent.
+    - `NotSent` stays write-only.
   - **A redirect to another host is a failure (#1106).** A stage whose
     endpoint answers a redirect to another origin (scheme, host, port) is
     never followed, whatever the endpoint's credential or the stage's
