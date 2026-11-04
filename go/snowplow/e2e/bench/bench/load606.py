@@ -5662,6 +5662,16 @@ def _cmd_evaluate(a) -> int:
     # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
     # runs 14-16 have no record (their control plane was zonal)
     result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
+    # installer#614: what the bench installed on the cluster BEFORE the installer
+    # (cert-manager, mirroring krateo-057's hand install; bench/cert_manager.py),
+    # as helm read it back. Shown with the verdict, never judged; none recorded
+    # is said, never read as "nothing was installed"
+    prereq = [r for r in recs if r.get("kind") == "cluster_prerequisite"]
+    result["report"]["cluster_prerequisites"] = prereq
+    if not prereq:
+        result["report"].setdefault("report_warnings", []).append(
+            "cluster prerequisites: no cert-manager record (installer#614): what ran before the installer "
+            "is unrecorded, not absent")
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]

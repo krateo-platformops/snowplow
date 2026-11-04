@@ -1123,6 +1123,14 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                         spec["required"] = list(spec.get("required") or []) + [field]
                         spec.setdefault("properties", {})[field] = {"type": "string"}
             yaml.safe_dump(crd, open(os.path.join(tdir, f), "w"))
+    # installer#614: the jetstack cert-manager chart, the REAL archive (tests/fixtures), so its
+    # pinned sha256 verifies; FAKE_CERT_MANAGER_TAMPER=1 serves it with one byte flipped
+    if a[:1] == ["pull"] and a[1] == "oci://quay.io/jetstack/charts/cert-manager":
+        data = open(os.environ["FAKE_CERT_MANAGER_TGZ"], "rb").read()
+        if os.environ.get("FAKE_CERT_MANAGER_TAMPER") == "1":
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        open(os.path.join(a[a.index("-d") + 1], f"cert-manager-{ver}.tgz"), "wb").write(data)
+        sys.exit(0)
     if a[:1] == ["pull"] and not a[1].endswith("/installer"):
         chart = a[1].rsplit("/", 1)[-1]
         if not os.path.isdir(os.path.join(CRD_CHARTS, chart)):
@@ -1188,6 +1196,20 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
                  "feature": "specialistAgents"}]}))
         sys.exit(0)
+    # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
+    sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")
+          and (i == 0 or a[i - 1] not in ("--kubeconfig", "--kube-context"))]
+    if sa[:2] == ["install", "cert-manager"]:
+        open(os.path.join(STATE, "cert-manager-installed"), "w").write(json.dumps(sa))
+    if sa[:1] == ["list"] and "cert-manager" in sa:
+        # the release as helm reads it back (FAKE_CERT_MANAGER_CHART: another chart was installed)
+        inst = os.path.exists(os.path.join(STATE, "cert-manager-installed"))
+        print(json.dumps([{"name": "cert-manager", "namespace": "cert-manager", "status": "deployed",
+                           "chart": os.environ.get("FAKE_CERT_MANAGER_CHART", "cert-manager-v1.21.1"),
+                           "app_version": "v1.21.1"}] if inst else []))
+        sys.exit(0)
+    if sa[:3] == ["get", "values", "cert-manager"]:
+        print(json.dumps({"crds": {"enabled": True}})); sys.exit(0)
     if "install" in a:
         import yaml
         merged = {}
@@ -1237,6 +1259,8 @@ def _fake_server(state: Path):
 
 
 CRD_CHARTS = Path(__file__).resolve().parent / "fixtures" / "crd_charts"
+# installer#614: the real jetstack cert-manager v1.21.1 archive (helm pull, 2026-11-04)
+CERT_MANAGER_TGZ = Path(__file__).resolve().parent / "fixtures" / "cert-manager-v1.21.1.tgz"
 
 
 def fake_registry(tmp_path: Path) -> dict:
@@ -1248,7 +1272,7 @@ def fake_registry(tmp_path: Path) -> dict:
     state.mkdir(exist_ok=True)
     _write_exe(fakebin / "helm", FAKE_HELM)
     return {"PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}", "FAKE_STATE": str(state),
-            "FAKE_CRD_CHARTS": str(CRD_CHARTS)}
+            "FAKE_CRD_CHARTS": str(CRD_CHARTS), "FAKE_CERT_MANAGER_TGZ": str(CERT_MANAGER_TGZ)}
 
 
 def _write_exe(path: Path, body: str):
@@ -1293,7 +1317,7 @@ def harness(tmp_path):
         "PLATFORM_TIMEOUT_S": "1", "PLATFORM_POLL_S": "0.2",
         "BENCH_NO_COLOR": "1", "FAKE_PW": SCALEUSER_PASSWORD,
         "FAKE_USER_CRD": str(CRD_CHARTS / "authn-crds" / "templates" / "basic.authn.krateo.io_users.yaml"),
-        "FAKE_CRD_CHARTS": str(CRD_CHARTS),
+        "FAKE_CRD_CHARTS": str(CRD_CHARTS), "FAKE_CERT_MANAGER_TGZ": str(CERT_MANAGER_TGZ),
         # #985: GKE's per-location cluster limit, read from the Cloud Quotas fake
         "CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS": quotas_url,
     })
