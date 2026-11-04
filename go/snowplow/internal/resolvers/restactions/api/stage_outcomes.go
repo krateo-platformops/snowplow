@@ -183,6 +183,22 @@ func (s *StageOutcomes) failed(name string) bool {
 	return o != nil && o.reason != ""
 }
 
+// reasonOf is the reason stage name's outcome reports (the highest-ranked
+// one it recorded, reasonRank), "" when it recorded none. #1139: a log line
+// that names a stage's cause reads it here, so it names the cause the header
+// does.
+func (s *StageOutcomes) reasonOf(name string) string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.by[name]; o != nil {
+		return o.reason
+	}
+	return ""
+}
+
 // abortedResolve (#904 review F3) is ResolveWithFailure's answer when it stops
 // before running any stage: an empty dict, and — on the collector this resolve
 // claims — a resolve-level Aborted row plus every declared stage as NotRun, so
