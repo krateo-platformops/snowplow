@@ -77,13 +77,35 @@ import (
 )
 
 // RedirectRefusedError is what a refused redirect hop returns. It carries the
-// status code of the redirect that was refused and nothing else: never a URL
-// (a Location can carry credentials), a token or an identity.
+// status code of the redirect that was refused and which credential the hop
+// carried, and nothing else: never a URL (a Location can carry credentials), a
+// token or an identity.
 type RedirectRefusedError struct {
 	StatusCode int
+	// Carried is the credential the refused hop carried, so the text names the
+	// rule that refused it (#1138): a held credential never follows any
+	// redirect, a named endpoint's never leaves its origin. The zero value is
+	// CarriedHeld.
+	Carried RedirectCredential
 }
 
+// RedirectCredential is the credential a refused redirect hop carried.
+type RedirectCredential int
+
+const (
+	// CarriedHeld: a credential snowplow holds and attaches itself (the
+	// ServiceAccount endpoint, a per-user clientconfig; WithHeldCredential).
+	// Such a client never follows a redirect (#723/#724).
+	CarriedHeld RedirectCredential = iota
+	// CarriedEndpoint: a named endpointRef's own credential, and any header
+	// its stage set. Such a dial never sends a hop to another origin (#1106).
+	CarriedEndpoint
+)
+
 func (e *RedirectRefusedError) Error() string {
+	if e.Carried == CarriedEndpoint {
+		return fmt.Sprintf("refused to follow a %d redirect to another origin: a named endpoint's own credential, and any header its stage set, never leave the origin the request was sent to (#1106)", e.StatusCode)
+	}
 	return fmt.Sprintf("refused to follow a %d redirect: a client carrying snowplow-held credentials never follows a redirect (#723/#724)", e.StatusCode)
 }
 
