@@ -196,11 +196,15 @@ func (o i24Obj) object() map[string]any {
 }
 
 // i24Watcher is the cache=on informer layer: RBAC from i24RBAC plus every
-// fixture object.
-func i24Watcher(t *testing.T) *cache.ResourceWatcher {
+// fixture object. extra lists more resources the fake client may be asked to
+// LIST (it panics on an unregistered one): a harness limit, not snowplow's.
+func i24Watcher(t *testing.T, extra ...schema.GroupVersionResource) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	kinds := dispatchTestListKinds()
+	for _, g := range extra {
+		kinds[g] = "List"
+	}
 	seed := i24RBAC()
 	for _, o := range i24Objects() {
 		kinds[o.gvr] = o.kind + "List"
@@ -275,9 +279,9 @@ type i24Env struct {
 	sa *httptest.Server
 }
 
-func newI24Env(t *testing.T) *i24Env {
+func newI24Env(t *testing.T, extra ...schema.GroupVersionResource) *i24Env {
 	t.Helper()
-	e := &i24Env{t: t, rw: i24Watcher(t), sa: i24SAServer(t)}
+	e := &i24Env{t: t, rw: i24Watcher(t, extra...), sa: i24SAServer(t)}
 	t.Cleanup(SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
 		return &endpoints.Endpoint{ServerURL: e.sa.URL, Token: "SA-EP-TOKEN"}, nil
 	}))

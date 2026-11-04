@@ -78,6 +78,8 @@ func undialledWriteCause(sr skipReason) (reason, why string) {
 		return StageReasonTemplateError, "its payload template failed to evaluate (#302)"
 	case reasonJQHeaderError:
 		return StageReasonTemplateError, "a header template failed to evaluate (#302)"
+	case reasonPathNotAsServed:
+		return StageReasonInvalidPath, "the apiserver would read its rendered path as a different path (#1137)"
 	}
 	return StageReasonNotSent, "it was refused before it was sent"
 }

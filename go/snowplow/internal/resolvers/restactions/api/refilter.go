@@ -620,9 +620,19 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 // item of that response IS an object of served. A LIST answers with members of
 // the listed collection and a GET with the named object, and Kubernetes
 // authorizes reading such an object on its own resource, in its own namespace,
-// with the caller's verb. The request is what names that resource on every
-// dispatch path: a typed list from the live apiserver carries no apiVersion or
-// kind on its items, and when an item does carry them they name served.
+// with the caller's verb. The request is the source that names that resource:
+// a typed list from the live apiserver carries no apiVersion or kind on its
+// items, and when an item does carry them they name served.
+//
+// served is parsed from the path as written, and that is the resource the
+// apiserver serves only because the plan holds no path the apiserver reads
+// differently (#1137, servedAsWritten in setup.go). A userAccessFilter stage
+// always dials this cluster's apiserver, so every one of its calls passes that
+// check. Without it, two path shapes were served as one resource and parsed as
+// another or as none: `apis/g/v/p2s` (no leading "/"; the dial adds it) and
+// `/apis/g/v/namespaces%2Fns-a%2Fp2s` (the apiserver decodes the escapes into
+// separators). servedOK was false or served was no member, so objects of a
+// checked resource were checked on the whole set.
 //
 //   - served is a member of the checked set (served.Group == uaf.Group and
 //     served.Resource is in resources): the items are objects of a checked

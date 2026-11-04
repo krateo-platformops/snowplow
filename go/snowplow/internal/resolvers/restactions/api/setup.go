@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
@@ -13,6 +14,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -300,6 +302,9 @@ func rawPath(path string) string {
 // on THIS cluster's apiserver (#288): collapsedPath, plus the checks that hold
 // only for a Kubernetes object path, so only for an own-cluster dial (#1112 D2:
 // on a named endpoint they refused another API's ids, `/api/v2/tickets/Ab_12`):
+//   - a path the apiserver would read as a different path (#1137,
+//     servedAsWritten): every reader of a planned call reads its path as
+//     written, so the plan holds only a path the apiserver serves as written;
 //   - a name/namespace segment that is present but DNS-1123-invalid (e.g. a
 //     trailing '-'), via IsDNS1123Subdomain / IsDNS1123Label (VALIDATE, not
 //     sanitize — sanitizing would dial a wrong-but-valid name and defeat #288);
@@ -313,6 +318,9 @@ func rawPath(path string) string {
 func validInterpolatedPath(path, verb string) (bool, skipReason) {
 	if ok, sr := collapsedPath(path, verb); !ok {
 		return false, sr
+	}
+	if !servedAsWritten(path) {
+		return false, skipReason{class: reasonPathNotAsServed, detail: "the apiserver would read this path as a different path (#1137)"}
 	}
 	_, ns, name, ok := cache.ParseAPIServerPathToDep(path)
 	if !ok {
@@ -330,6 +338,40 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (#288)"}
 	}
 	return true, skipReason{}
+}
+
+// servedAsWritten reports whether this cluster's apiserver reads path exactly
+// as it is written (#1137).
+//
+// Every reader of a planned call reads its path as written:
+// ParseAPIServerPathToDep for the userAccessFilter's own resource (#1124), the
+// cache key and the dependency edge, the informer and content-cell dispatch,
+// the sensitive-resource mark (#398), and this guard's own namespace and name
+// checks. The apiserver reads the path it RECEIVES, decoded: the dial sends
+// credhttp.RequestURL(server, path), which puts a "/" before a path written
+// without one, and the apiserver percent-decodes the request path before it
+// reads namespace, resource and name (k8s.io/apiserver: the handler director
+// and RequestInfoFactory both read req.URL.Path). Where the two differ, every
+// one of those readers decides about a request that is not the one served:
+// `apis/g/v/p2s` parses as nothing and is served as p2s; `/apis/g/v/
+// namespaces%2Fns-a%2Fp2s` parses as one resource named with escapes and is
+// served as p2s in ns-a. A userAccessFilter then checked such objects on its
+// whole set, not on their own resource.
+//
+// So the plan holds only a path the apiserver serves as written: the path
+// the server decodes from the URL the dial builds equals the written path
+// (before its query and fragment, which the apiserver does not read as
+// coordinates; splitPathQuery is the parsers' own split). One rule, not a list
+// of shapes: no own-cluster path needs a missing leading "/" or a percent-escape
+// (no group, version, resource, namespace or name contains '%' or '/'), and
+// whatever else the client and the server normalise is compared the same way.
+// The query is not judged: a selector value may be escaped.
+func servedAsWritten(path string) bool {
+	p, _, _ := splitPathQuery(path)
+	// The base carries no path of its own, so u.Path is the request path the
+	// server receives, decoded exactly as net/http decodes it for the apiserver.
+	u, err := url.Parse(credhttp.RequestURL("http://apiserver.invalid", path))
+	return err == nil && u.Path == p
 }
 
 // evalJQE evaluates a jq template and SURFACES the Eval error instead of

@@ -51,12 +51,7 @@ const maxUnstructuredResponseTextBytes = 2048
 
 // Do is request.Do with a client that never follows a redirect (see do.go).
 func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
-	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
-	if len(opts.Path) > 0 {
-		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(opts.Path, "/"))
-	}
-
-	u, err := url.Parse(uri)
+	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
 		return response.New(http.StatusInternalServerError, err)
 	}
@@ -147,6 +142,25 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	}
 
 	return response.New(http.StatusNoContent, nil)
+}
+
+// RequestURL is the URL a call to path on the endpoint at serverURL is sent to,
+// as request.Do builds it (plumbing v1.15.1 http/request/request.go): the
+// server URL without its trailing "/", then exactly one "/", then path without
+// its leading "/". Both dials build their URL here, this one and the
+// resolver's own fetch (restactions/api httpFetchConverting), and so does the
+// plan's check of what the apiserver will read (#1137): the path a stage is
+// checked by and the path it is sent to cannot be built two ways.
+//
+// A path that does not start with "/" is sent as if it did, and the server
+// percent-decodes what it receives: the request a server reads is the decoded
+// path of url.Parse(RequestURL(...)).
+func RequestURL(serverURL, path string) string {
+	uri := strings.TrimSuffix(serverURL, "/")
+	if len(path) > 0 {
+		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(path, "/"))
+	}
+	return uri
 }
 
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
