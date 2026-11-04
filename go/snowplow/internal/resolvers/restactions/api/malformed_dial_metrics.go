@@ -50,6 +50,13 @@ const (
 type skipReason struct {
 	class  string
 	detail string
+	// collapsed marks a #288 refusal of a path segment that rendered EMPTY
+	// (collapsedPath), as opposed to one that rendered to a non-DNS-1123
+	// value. Both are reasonEmptyInterp (one metric class); the refused
+	// item's errorKey message words them apart (undialledWriteCause), because
+	// the collapse check also judges a named endpoint's path, which need not
+	// be a Kubernetes object path at all.
+	collapsed bool
 }
 
 // malformedDialSkipped counts api-call plan entries dropped by the guard, broken
