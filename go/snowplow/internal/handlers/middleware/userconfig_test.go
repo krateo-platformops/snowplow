@@ -161,13 +161,17 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 		// expectedStatus is the upstream status code; we cross-check
 		// that snowplow returns the same.
 		expectedStatus int
+		// cause is the #1076 pre-dispatch cause snowplow appends after
+		// upstream's six Status fields (TokenMissing / TokenInvalid /
+		// TokenExpired).
+		cause string
 	}{
 		{
 			name: "missing_authorization_header",
 			mkReq: func(t *testing.T) *http.Request {
 				return httptest.NewRequest(http.MethodGet, "/call?x=1", nil)
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenMissing",
 		},
 		{
 			name: "invalid_authorization_format_no_bearer",
@@ -176,7 +180,7 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 				r.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
 				return r
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenMissing",
 		},
 		{
 			name: "invalid_authorization_format_no_space",
@@ -185,7 +189,7 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 				r.Header.Set("Authorization", "BearerToken123")
 				return r
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenMissing",
 		},
 		{
 			name: "jwt_validate_garbage_token",
@@ -194,7 +198,7 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 				r.Header.Set("Authorization", "Bearer not.a.real.jwt.token")
 				return r
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenInvalid",
 		},
 		{
 			name: "jwt_validate_wrong_signing_key",
@@ -218,7 +222,7 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 				r.Header.Set("Authorization", "Bearer "+wrongTok)
 				return r
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenInvalid",
 		},
 		{
 			name: "jwt_validate_expired",
@@ -230,7 +234,7 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 				r.Header.Set("Authorization", "Bearer "+expiredTok)
 				return r
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusUnauthorized, cause: "TokenExpired",
 		},
 	}
 
@@ -246,9 +250,11 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 			if snStatus != upStatus {
 				t.Errorf("status divergence: snowplow=%d upstream=%d", snStatus, upStatus)
 			}
-			if !bytes.Equal(snBody, upBody) {
-				t.Errorf("body divergence:\n  snowplow=%q\n  upstream=%q",
-					string(snBody), string(upBody))
+			// #1076 — snowplow's body is upstream's, byte for byte, with
+			// `details.causes[0]` appended after the six Status fields.
+			if want := p1076Want(string(upBody), tc.cause); string(snBody) != want {
+				t.Errorf("body divergence:\n  snowplow=%q\n  want    =%q (upstream + #1076 cause)",
+					string(snBody), want)
 			}
 		})
 	}
