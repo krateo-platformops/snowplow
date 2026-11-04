@@ -40,6 +40,12 @@ const PageMaxGoal = 10 * time.Second
 // measured (credhttp's reserve).
 const PageP95Goal = 3 * time.Second
 
+// PageGoalQuantile is the share of pages the typical-case bound covers: the
+// "95" of PageP95Goal. The goal tolerates the remaining 5 % above it, so a
+// bound derived from a distribution of calls (credhttp's retry reserve) takes
+// the same quantile.
+const PageGoalQuantile = 0.95
+
 // ErrExhausted is the cause of an exchange cut by its request's budget. Every
 // *ExhaustedError matches it with errors.Is.
 var ErrExhausted = errors.New("page budget exhausted")
@@ -112,6 +118,12 @@ type ctxKey struct{}
 func WithCustomer(ctx context.Context, start time.Time) context.Context {
 	b := &Budget{deadline: start.Add(PageMaxGoal)}
 	b.result.Store(uint32(Within))
+	return context.WithValue(ctx, ctxKey{}, b)
+}
+
+// With returns ctx carrying b (a budget already set by WithCustomer, handed to
+// a call that lost the request's context; credhttp.BindRequestBudget).
+func With(ctx context.Context, b *Budget) context.Context {
 	return context.WithValue(ctx, ctxKey{}, b)
 }
 

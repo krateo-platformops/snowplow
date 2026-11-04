@@ -165,6 +165,18 @@ func BudgetStatus(err error) (*response.Status, bool) {
 	return st, true
 }
 
+// WriteBudgetError writes the 504 Timeout envelope (BudgetStatus) for an
+// exchange the request's page budget ended and reports true; false (nothing
+// written) for any other error. For handlers that answer an error directly.
+func WriteBudgetError(w http.ResponseWriter, err error) bool {
+	st, ok := BudgetStatus(err)
+	if !ok {
+		return false
+	}
+	_ = response.Encode(w, st)
+	return true
+}
+
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
 // answer is ALWAYS a Failure carrying the status line's code (#1088). Before
 // #1088 two shapes read as a success: a JSON body that is not a Status (an

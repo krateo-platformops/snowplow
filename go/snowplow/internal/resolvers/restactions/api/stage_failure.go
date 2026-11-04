@@ -110,6 +110,20 @@ type stageItemFailure struct {
 func (e *stageItemFailure) Error() string { return e.err.Error() }
 func (e *stageItemFailure) Unwrap() error { return e.err }
 
+// itemErrorValue (#1115) is the errorKey value of a stage item that failed
+// with err on a branch that records the error's text (in-process resolve,
+// content serve, internal rest config, discovery): the page budget's 504
+// Timeout Status when the budget ended it — the value branch E records, so
+// every branch's stage outcome reads Timeout — else err's text, as before.
+func itemErrorValue(err error) any {
+	if st, ok := credhttp.BudgetStatus(err); ok {
+		if m, merr := response.AsMap(st); merr == nil {
+			return m
+		}
+	}
+	return err.Error()
+}
+
 // budgetItemError (#1115) is a branch-E item error whose fetch the page budget
 // ended: the worker's text, unchanged, with the *pagebudget.ExhaustedError as
 // its cause, so newStageItemFailure can report the budget.

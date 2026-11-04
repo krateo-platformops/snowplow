@@ -1678,7 +1678,7 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 		return err
 	}
 	budgetReserve, err := m.Int64ObservableGauge("snowplow_page_budget_retry_reserve_ms",
-		metric.WithDescription("The page budget's retry reserve: the 99th percentile of the recent attempts that opened a new connection, from asking for it to the first response byte; the page p95 goal (3 s) before any was measured. A customer connect still pending at deadline − reserve is abandoned and retried once. #1115."))
+		metric.WithDescription("The page budget's retry reserve: the goal quantile (p95, the goal's own) of the last 20 attempts that opened a new connection, from asking for it to the first response byte; the page p95 goal (3 s) before any was measured. A customer connect still pending at deadline − reserve is abandoned and retried once. #1115."))
 	if err != nil {
 		return err
 	}

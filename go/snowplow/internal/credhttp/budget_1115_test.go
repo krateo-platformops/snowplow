@@ -339,15 +339,16 @@ func TestBudget1115_A2e_ColdReserveIsTheP95Goal(t *testing.T) {
 	freshAnswers.resetForTest()
 }
 
-// The reserve is data: the 99th percentile of the recent fresh attempts.
-func TestBudget1115_ReserveIsTheP99OfRecentFreshAttempts(t *testing.T) {
+// The reserve is data: the goal quantile (p95) of the recent fresh attempts, over
+// the window derived from it (20).
+func TestBudget1115_ReserveIsTheGoalQuantileOfRecentFreshAttempts(t *testing.T) {
 	freshAnswers.resetForTest()
 	t.Cleanup(freshAnswers.resetForTest)
 	for i := range reserveWindow {
 		freshAnswers.record(time.Duration(i+1) * time.Millisecond)
 	}
-	if r, ok := RetryReserve(); !ok || r != 127*time.Millisecond {
-		t.Fatalf("reserve %v (measured %v), want 127ms = p99 of 1..128ms", r, ok)
+	if r, ok := RetryReserve(); !ok || r != time.Duration(reserveWindow-1)*time.Millisecond || reserveWindow != 20 {
+		t.Fatalf("reserve %v (measured %v), want 19ms = p95 of 1..20ms (window %d)", r, ok, reserveWindow)
 	}
 	// The observer feeds it: a fresh connection's answer is a sample, a reused
 	// one is not.

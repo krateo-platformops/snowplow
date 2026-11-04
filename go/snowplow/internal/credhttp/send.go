@@ -247,6 +247,12 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 	return 0, false
 }
 
+// retryPolicyTranscribedFrom is the plumbing version firstBackoff and
+// retryAfter transcribe (http/util/retry.go: backoff, parseRetryAfter, both
+// unexported). TestBudget1115_RetryPolicyPinnedToPlumbing fails when the module
+// builds against another one, so a plumbing bump re-audits them.
+const retryPolicyTranscribedFrom = "v1.15.1"
+
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.15.1 http/util/retry.go backoff(0, base, max)): base capped at max,
 // jittered into [d/2, d).

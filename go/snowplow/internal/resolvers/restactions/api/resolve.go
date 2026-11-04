@@ -970,7 +970,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			return dispatch + "-resolve-error"
 		}
 		bytesToFeed := raw
@@ -1060,7 +1060,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, cerr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, cerr.Error(), cerr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(cerr), cerr.Error(), itemErr)
 				return nil
 			}
 			if ok {
@@ -1100,7 +1100,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						if !call.ContinueOnError {
 							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 						}
-						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 						dispatch = "apistage-content-resolve-error"
 					} else {
 						var ferr error
@@ -1267,7 +1267,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(ierr), ierr.Error(), itemErr)
 			}
 			dispatch = "internal-rest-config-error"
 		} else {
@@ -1351,7 +1351,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, derr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, derr.Error(), derr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
 			r.log.Error("discovery response handler failed",
@@ -1420,7 +1420,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
 			r.log.Error("in-process resolve response handler failed (cache-off path)",

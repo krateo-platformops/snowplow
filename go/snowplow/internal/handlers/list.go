@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -67,7 +66,9 @@ func List() http.HandlerFunc {
 		// #988 — the per-GVR LISTs below are sent with the returned ctx, so
 		// they are labelled with this reason on snowplow_resolve_collection_lists.
 		lctx := cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
-		cli, err := dynamic.NewClient(rc)
+		// #1115 — this request's client: its discovery runs on client-go's own
+		// context.TODO(), so the page budget is bound to the client.
+		cli, err := dynamic.NewClient(credhttp.BindRequestBudget(req.Context(), rc))
 		if err != nil {
 			log.Error("cannot create dynamic client", slog.Any("err", err))
 			response.InternalError(wri, err)
@@ -75,8 +76,13 @@ func List() http.HandlerFunc {
 		}
 
 		log.Debug("performing discovery", slog.String("category", cat))
-		res, err := cli.Discover(context.Background(), cat)
+		// #1115 — the request's ctx: the discovery reads carry its page budget.
+		res, err := cli.Discover(req.Context(), cat)
 		if err != nil {
+			if credhttp.WriteBudgetError(wri, err) {
+				log.Warn("discovery ended by the page budget", slog.String("category", cat))
+				return
+			}
 			// #517 — A PARTIAL DISCOVERY IS DEGRADED, NOT FATAL. One stale
 			// aggregated APIService must not break /list for every category:
 			// Discover hands back the healthy groups' resources next to a
@@ -112,6 +118,11 @@ func List() http.HandlerFunc {
 			if err != nil {
 				log.Error("cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))
+				// #1115 — the page budget ran out: a clear 504, never a list
+				// silently missing the GVRs it could not read.
+				if credhttp.WriteBudgetError(wri, err) {
+					return
+				}
 				if apierrors.IsForbidden(err) {
 					response.Forbidden(wri, err)
 					return

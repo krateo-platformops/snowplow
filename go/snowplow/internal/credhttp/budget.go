@@ -23,6 +23,7 @@ package credhttp
 import (
 	"context"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 )
 
@@ -82,8 +84,59 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		x.end()
 		return nil, err
 	}
+	withholdUnaffordableRetryAfter(resp, b)
 	resp.Body = x.bodyEnding(resp.Body)
 	return resp, nil
+}
+
+// withholdUnaffordableRetryAfter (#1115 review R1) removes the Retry-After of
+// an answer client-go would retry (a 429 or a 5xx that carries one: its
+// rest.Request retries only then, after sleeping Retry-After on the request's
+// context, which has no deadline) when the sleep plus the retry reserve does
+// not fit the remaining budget. client-go then returns the answer at once
+// instead of sleeping past the deadline for an attempt that could only be
+// not_sent. A Retry-After that fits is left alone: the retry is taken.
+func withholdUnaffordableRetryAfter(resp *http.Response, b *pagebudget.Budget) {
+	if resp.Header.Get("Retry-After") == "" || (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500) {
+		return
+	}
+	reserve, _ := freshAnswers.reserve()
+	if b.Deadline().Sub(budgetNow()) < retryAfter(resp)+reserve {
+		resp.Header.Del("Retry-After")
+	}
+}
+
+// BindRequestBudget returns rc for clients built for ONE customer request:
+// when ctx carries a page budget, every round trip of a client built from the
+// returned copy runs under that budget, including those client-go sends on a
+// context of its own (discovery and the RESTMapper behind a dynamic client use
+// context.TODO(), so the request's ctx can never reach them). A round trip
+// whose ctx already carries a budget keeps it. Without a budget rc is returned
+// unchanged.
+func BindRequestBudget(ctx context.Context, rc *rest.Config) *rest.Config {
+	b, ok := pagebudget.From(ctx)
+	if !ok || rc == nil {
+		return rc
+	}
+	cp := rest.CopyConfig(rc)
+	// The bound wrapper enforces too (BudgetTransport under it), so the copy is
+	// bounded even if rc was not hardened; a hardened one does not apply it twice.
+	cp.Wrap(func(rt http.RoundTripper) http.RoundTripper { return &boundBudget{next: BudgetTransport(rt), b: b} })
+	return cp
+}
+
+type boundBudget struct {
+	next http.RoundTripper
+	b    *pagebudget.Budget
+}
+
+func (t *boundBudget) WrappedRoundTripper() http.RoundTripper { return t.next }
+
+func (t *boundBudget) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, ok := pagebudget.From(req.Context()); !ok {
+		req = req.WithContext(pagebudget.With(req.Context(), t.b))
+	}
+	return t.next.RoundTrip(req)
 }
 
 // budgetedAttempt is one attempt of a budgeted exchange: its context (the
@@ -243,14 +296,17 @@ func endpointDial(ctx context.Context, network, addr string) (net.Conn, error) {
 
 // --- the retry reserve -----------------------------------------------------------
 
-// reserveWindow is how many recent fresh-connection attempts the reserve is
-// computed over: enough that its 99th percentile is set by more than one
-// sample, few enough to follow a network change.
-const reserveWindow = 128
+// reserveQuantile is the goal's own quantile (pagebudget.PageGoalQuantile):
+// the reserve is the time within which that share of recent fresh attempts
+// answered, as the goal bounds that share of pages by its typical bound.
+const reserveQuantile = pagebudget.PageGoalQuantile
 
-// reserveQuantile: the reserve is the time 99 % of recent fresh attempts
-// answered within; robust to one slow outlier.
-const reserveQuantile = 0.99
+// reserveWindow is derived from the quantile: the fewest recent samples in
+// which the quantile is not the window's maximum, i.e. one slow outlier does
+// not set the reserve: 1 / (1 − q) = 20 for q = 0.95. The smallest window
+// with that property is also the one that follows a network change fastest.
+// (Exact: untyped constant arithmetic.)
+const reserveWindow = int(1 / (1 - reserveQuantile))
 
 type reserveRing struct {
 	mu      sync.Mutex
@@ -278,7 +334,7 @@ func (r *reserveRing) record(d time.Duration) {
 	r.total.Add(1)
 }
 
-// reserve is the retry reserve: the p99 of the recent fresh attempts, or — with
+// reserve is the retry reserve: the goal-quantile (p95) of the recent fresh attempts, or — with
 // none measured yet — PageP95Goal, the time the goal allows a healthy call to
 // answer in. measured reports which.
 func (r *reserveRing) reserve() (d time.Duration, measured bool) {
@@ -290,9 +346,10 @@ func (r *reserveRing) reserve() (d time.Duration, measured bool) {
 		return pagebudget.PageP95Goal, false
 	}
 	slices.Sort(s)
-	i := int(float64(n)*reserveQuantile+0.999999) - 1
-	i = min(max(i, 0), n-1)
-	return s[i], true
+	// The quantile's sample: skip the share above it (rounded down, so a
+	// partial window reads its maximum).
+	above := int(math.Floor(float64(n)*(1-reserveQuantile) + 1e-9))
+	return s[n-1-above], true
 }
 
 func (r *reserveRing) resetForTest() {
