@@ -89,6 +89,10 @@ func (r Result) String() string {
 type Budget struct {
 	deadline time.Time
 	result   atomic.Uint32
+	// parent (#1115 B2) is the budget of the request a resolve with its own
+	// budget runs inside (ForResolve): its results are raised there too, so
+	// the request's records read what its resolves' budgets did.
+	parent *Budget
 }
 
 // Deadline is when the request's network budget runs out.
@@ -100,15 +104,47 @@ func (b *Budget) Note(r Result) {
 		return
 	}
 	exchanges[r].Add(1)
-	if b == nil {
-		return
+	for x := b; x != nil; x = x.parent {
+		x.raise(r)
 	}
+}
+
+// raise lifts b's result to r if r is more severe.
+func (b *Budget) raise(r Result) {
 	for {
 		cur := b.result.Load()
 		if uint32(r) <= cur || b.result.CompareAndSwap(cur, uint32(r)) {
 			return
 		}
 	}
+}
+
+// resolveNow is the clock a resolve's own budget starts on (seamed in tests).
+var resolveNow = time.Now
+
+// SetResolveClockForTest replaces the clock ForResolve starts budgets on;
+// restore with the returned func. Production MUST NOT use it.
+func SetResolveClockForTest(now func() time.Time) (restore func()) {
+	prev := resolveNow
+	resolveNow = now
+	return func() { resolveNow = prev }
+}
+
+// ForResolve (#1115 B2, owner ruling: "10 s per page") gives one resolve that
+// a customer request runs in-process — a page a handler re-dispatches, like
+// each page of an /export — its own budget: its start + PageMaxGoal, exactly
+// what a /call of that page would get at arrival. The budget belongs to a
+// resolve, not to the HTTP request that happens to carry several. Its results
+// are also raised on the request's budget (the request's records stay true).
+// Without a customer budget (background work) ctx is returned unchanged.
+func ForResolve(ctx context.Context) context.Context {
+	parent, ok := From(ctx)
+	if !ok {
+		return ctx
+	}
+	b := &Budget{deadline: resolveNow().Add(PageMaxGoal), parent: parent}
+	b.result.Store(uint32(Within))
+	return context.WithValue(ctx, ctxKey{}, b)
 }
 
 type ctxKey struct{}
