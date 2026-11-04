@@ -124,13 +124,18 @@ func From(ctx context.Context) (*Budget, bool) {
 	return b, b != nil
 }
 
-// Outcome is ctx's request result: None without a budget.
-func Outcome(ctx context.Context) Result {
-	b, ok := From(ctx)
-	if !ok {
+// Result is the request's result so far; None for a nil budget.
+func (b *Budget) Result() Result {
+	if b == nil {
 		return None
 	}
 	return Result(b.result.Load())
+}
+
+// Outcome is ctx's request result: None without a budget.
+func Outcome(ctx context.Context) Result {
+	b, _ := From(ctx)
+	return b.Result()
 }
 
 // Detach is context.WithoutCancel minus the budget: every other value, none of

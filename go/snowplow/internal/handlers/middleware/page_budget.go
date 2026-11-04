@@ -8,6 +8,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 )
 
 // withCustomerPageBudget gives a customer request its page budget: arrival +
@@ -20,5 +21,9 @@ func withCustomerPageBudget(req *http.Request) *http.Request {
 	if req.Header.Get(cache.BackgroundHeader) == "1" {
 		return req
 	}
-	return req.WithContext(pagebudget.WithCustomer(req.Context(), time.Now()))
+	ctx := pagebudget.WithCustomer(req.Context(), time.Now())
+	// The slow-call record (#1054) is opened upstream, before this ctx exists:
+	// hand it the budget so its "budget" field reads what the budget did.
+	slowcall.AttachBudget(ctx)
+	return req.WithContext(ctx)
 }
