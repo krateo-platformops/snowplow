@@ -407,6 +407,21 @@ func (r *resolveRun) recordRBACDeny(dictMu *sync.Mutex, itemErrs []error, id str
 	notePerIdentityForbidden(r.ctx, false)
 }
 
+// recordDefiniteNotFound records a #1080 definite NotFound decided at branch C
+// (N2): the canonical identity-free NotFound body under errorKey, the item
+// error a stage without continueOnError would carry (never, by the classifier),
+// and a bump of the per-identity definite-answer sink at the same site, for the
+// same item, as the stage-error bump. Not external: branch C's SA dial is not an
+// external touch.
+func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, msg string) {
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+	}
+	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
 // recordServedListDeny is recordRBACDeny for a LIST served from the informer or
 // the api-stage content cell (dispatch names which), with the failure line an
 // expected per-identity deny logs (#711: WARN once per cell generation, DEBUG
@@ -1242,6 +1257,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
 				// canonical body (per_identity_forbidden.go).
 				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
+			} else if nf, ok := classifyAuthorizedNotFound(call, ierr); ok {
+				// #1080 N2 — an authorized GET of a named object that does not
+				// exist: a definite answer, with its canonical body.
+				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, nf)
 			} else {
 				var itemErr error
 				if !call.ContinueOnError {
@@ -1616,12 +1635,21 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if isOwnDenied {
 			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
 		}
+		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
+		// dial of a named object, in a continueOnError stage, that the watcher
+		// confirms absent: a definite answer for this identity (the apiserver
+		// authorized the `get` first), recorded with the canonical NotFound body
+		// and counted on the same sink (external: this dial bumped the sink).
+		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
+		if isOwnNotFound {
+			accumVal, bumpMsg = canonicalNotFoundBody(ownNotFound), ownNotFound
+		}
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
-		if isOwnDenied {
+		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}
 		// Fall through to the success-log line (preserves
