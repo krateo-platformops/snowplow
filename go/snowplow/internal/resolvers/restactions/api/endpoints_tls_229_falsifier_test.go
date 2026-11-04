@@ -341,7 +341,9 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 		{"cert-auth with a CA (live population, #1088)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k"}, true},
 		{"cert-auth with NO CA (plumbing verifies against an empty pool)", &endpoints.Endpoint{ServerURL: "https://x", ClientCertificateData: "c", ClientKeyData: "k"}, false},
 		{"cert-auth + insecure (plumbing ignores Insecure on cert auth)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k", Insecure: true}, false},
-		{"Debug (plumbing's wire dump)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", Debug: true}, false},
+		// #1112 D4: owned like any other; its wire dump is credhttp.WireDump,
+		// installed on either branch, never plumbing's.
+		{"Debug (snowplow's metadata-only wire dump)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", Debug: true}, true},
 		{"insecure explicitly requested (skip-verify, as plumbing)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca, Insecure: true}, true},
 		{"basic-auth with a CA", &endpoints.Endpoint{ServerURL: "https://x", Username: "u", Password: "p", CertificateAuthorityData: ca}, true},
 		// The EMPTY-USERNAME exclusion. plumbing calls this basic auth (it keys

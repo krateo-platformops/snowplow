@@ -264,6 +264,7 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 		"maybeResolveInProcess":              "GET-by-name of a RESTAction/Widget only; a query on a GET falls through earlier (query_on_get)",
 		"inspectInClusterStage":              "inspect/RBAC preflight: derives the RBAC verb from the path shape, serves nothing",
 		"validInterpolatedPath":              "#293 malformed-dial guard: path-shape check, serves nothing",
+		"collapsedPath":                      "#288/#1112 collapse refusal (every dial): path-shape check, serves nothing",
 		"extractClusterListGVRFromStagePath": "GVR shape half of extractClusterListTargetFromStage, which classifies",
 		"classifyOwnDialForbidden":           "#681: classifies an apiserver 403 and builds its identity-free error text from (gvr, ns, name); serves and keys nothing",
 		"definiteNotFoundMessage":            "#1080: classifies a named GET's NotFound (a LIST never qualifies) and builds its identity-free error text from (gvr, name); serves and keys nothing",

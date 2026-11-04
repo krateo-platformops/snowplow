@@ -310,7 +310,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 	// The iterator error (#638) is not consumed here: inspect is a
 	// dispatch-free read-set enumeration, unchanged — an errored iterator
 	// enumerates what it enumerated, exactly as before.
-	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
+	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict, true) // an in-cluster stage
 	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}

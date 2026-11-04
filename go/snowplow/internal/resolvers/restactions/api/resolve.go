@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -607,7 +608,12 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // passed by pointer) — its ClusterList* fields are written here exactly as
 // before. Returns tmp (possibly empty for C-3).
 func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
+	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
+	// this cluster's apiserver (the provenance runStage marked on provCtx); a
+	// write item any guard refuses is a stage failure with its reason, never a
+	// silent success (undialled_write.go).
+	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
+	r.failUndialledWrites(id, apiCall, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -758,6 +764,10 @@ type stageCtx struct {
 	wireVerbose bool
 	ep          endpoints.Endpoint
 	calls       []httpcall.RequestOptions
+	// sent counts the items that reached the send (branch E, the one place a
+	// write leaves snowplow). #1112 D2: a write stage that sent fewer than it
+	// planned and recorded no failure fails with NotSent (failUnsentWrites).
+	sent atomic.Int64
 }
 
 // dispatchOneCall is one iterator item's worker — the body the stage loop
@@ -1520,6 +1530,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if r.refuseWriteFromStalePass(gctx, sc, i) {
 		return nil
 	}
+	sc.sent.Add(1)
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
@@ -2085,6 +2096,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if r.failure == nil {
 		r.failure = firstStageFailure(itemErrs, sc.calls)
 	}
+	// #1112 D2 — the catch-all: a write stage none of whose refusals reported
+	// itself did not do what it declared (undialled_write.go).
+	r.failUnsentWrites(sc)
 
 	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
