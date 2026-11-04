@@ -16,6 +16,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -247,14 +248,19 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// client build so a panicking construction still increments the
 	// counter (AC-D.3 ordering).
 	cache.RecordApiserverFallthrough(ctx, cache.ReasonClientBuild, res.GVR.String())
-	cli, err := dynamic.NewClient(rc)
+	// #1115 — the client is this request's: its RESTMapper discovery runs on
+	// client-go's own context.TODO(), so the budget is bound to the client.
+	cli, err := dynamic.NewClient(credhttp.BindRequestBudget(ctx, rc))
 	if err != nil {
 		log.Error("unable to create kubernetes dynamic client", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
 		return
 	}
 
-	uns, err := cli.Get(context.Background(), ref.Name, dynamic.Options{
+	// #1115 — the request's own ctx, so a customer read carries its page
+	// budget to the round trip (credhttp.BudgetTransport); background work has
+	// none and is unchanged by it.
+	uns, err := cli.Get(ctx, ref.Name, dynamic.Options{
 		Namespace: ref.Namespace,
 		GVR:       res.GVR,
 	})
@@ -264,7 +270,9 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			slog.String("gvr", res.GVR.String()), slog.Any("err", err))
 
 		res.Err = response.New(http.StatusInternalServerError, err)
-		if apierrors.IsForbidden(err) {
+		if st, ok := credhttp.BudgetStatus(err); ok {
+			res.Err = st // #1115 — 504 Timeout
+		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
 		} else if apierrors.IsNotFound(err) {
 			res.Err = response.New(http.StatusNotFound, err)

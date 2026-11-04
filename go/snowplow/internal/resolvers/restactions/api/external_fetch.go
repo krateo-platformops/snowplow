@@ -266,6 +266,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		// the "https://svc@host/base?token=…" shape still renders its token in
 		// clear. redact.URL removes both.
 		redErr := redact.ErrorURL(err)
+		// #1115 — the request's page budget ended the exchange: 504 Timeout,
+		// with the ExhaustedError's identity-free text (no URL in it).
+		if st, ok := credhttp.BudgetStatus(err); ok {
+			return st, nil, "", redErr
+		}
 		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()

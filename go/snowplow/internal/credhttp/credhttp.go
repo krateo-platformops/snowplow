@@ -123,11 +123,17 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 // collection-LIST counter inside it, and removes its client-side rate limit
 // (#920), in place, and returns it. Every client later built from rc or from a
 // rest.CopyConfig of it inherits all three. nil-safe.
+//
+// #1115 — and the customer page budget (BudgetTransport, budget.go): a round
+// trip of a request that carries one runs under its deadline.
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
 		// #1054 — innermost: every attempt (a client-go 429 retry included)
 		// is recorded on the slow-call record of the request that sent it.
 		rc.Wrap(slowcall.Transport)
+		// #1115 — the customer page budget: a round trip of a request that
+		// carries one runs under its deadline.
+		rc.Wrap(BudgetTransport)
 		rc.Wrap(CountResolveCollectionLists)
 		rc.Wrap(RefuseRedirectHops)
 		noClientRateLimit(rc)
@@ -150,14 +156,15 @@ func noClientRateLimit(rc *rest.Config) {
 }
 
 // Client applies both layers to c (in place), with the #988 resolve
-// collection-LIST counter inside the hop refusal, and returns it.
+// collection-LIST counter inside the hop refusal, and returns it. #1115 — the
+// customer page budget (BudgetTransport) is innermost.
 func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
 	base := c.Transport
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(slowcall.Transport(base))) // #1054: innermost
+	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c
 }
 

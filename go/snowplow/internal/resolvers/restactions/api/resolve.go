@@ -34,6 +34,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
@@ -540,6 +541,12 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
+		// #1115 — the endpointRef Secret read is a network exchange of this
+		// request: if the page budget ended it, the stage outcome reads
+		// Timeout (the truncating exit's Error ranks below it).
+		if be := (*pagebudget.ExhaustedError)(nil); errors.As(err, &be) {
+			r.outcomes.fail(id, StageReasonTimeout)
+		}
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user
@@ -984,7 +991,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			return dispatch + "-resolve-error"
 		}
 		bytesToFeed := raw
@@ -1074,7 +1081,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, cerr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, cerr.Error(), cerr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(cerr), cerr.Error(), itemErr)
 				return nil
 			}
 			if ok {
@@ -1114,7 +1121,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						if !call.ContinueOnError {
 							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 						}
-						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 						dispatch = "apistage-content-resolve-error"
 					} else {
 						var ferr error
@@ -1281,7 +1288,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(ierr), ierr.Error(), itemErr)
 			}
 			dispatch = "internal-rest-config-error"
 		} else {
@@ -1365,7 +1372,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, derr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, derr.Error(), derr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
 			r.log.Error("discovery response handler failed",
@@ -1434,7 +1441,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
 			r.log.Error("in-process resolve response handler failed (cache-off path)",
@@ -1663,6 +1670,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
+			// #1115 — the page budget ended the fetch: the item error carries
+			// the *pagebudget.ExhaustedError (same text), so the resolve's
+			// StageFailure reports the budget, not an upstream answer.
+			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
+				itemErr = &budgetItemError{text: itemErr.Error(), cause: be}
+			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
 		if isOwnDenied || isOwnNotFound {

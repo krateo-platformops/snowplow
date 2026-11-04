@@ -212,6 +212,12 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	cfg := &transport.Config{
 		TLS:   tlsCfg,
 		Proxy: http.ProxyFromEnvironment,
+		// #1115 — snowplow's dialer, not client-go's 30 s one: every connect
+		// gives up the page goal (10 s) after it starts, whoever started it
+		// (credhttp/budget.go). One holder for all, so cacheability is as
+		// before; the explicit Proxy still keeps each identity's transport its
+		// own.
+		DialHolder: credhttp.EndpointDialHolder,
 	}
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
 	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by
