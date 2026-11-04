@@ -70,6 +70,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
@@ -77,6 +78,8 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 )
@@ -220,11 +223,11 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 	}
 
 	// Single-GroupVersion discovery (/apis/<g>/<v> or /api/<v>) — the #18/#19
-	// path, unchanged.
-	// #1054 — the discovery client takes no context, so this dial's time is
-	// recorded but its attempts are not (they never reach the request's ctx).
-	_, dial := slowcall.StartDial(ctx, slowcall.BranchDiscovery, "get", gv)
-	list, dErr := cli.ServerResourcesForGroupVersion(gv)
+	// path. #1115 N1 — sent on the request's ctx (the root branch above does
+	// the same), so the page budget bounds it and the dial's attempts are on
+	// the slow-call record.
+	dctx, dial := slowcall.StartDial(ctx, slowcall.BranchDiscovery, "get", gv)
+	list, dErr := serverResourcesForGroupVersion(dctx, cli, gv)
 	dial.EndErr(ctx, dErr)
 	if dErr != nil {
 		return nil, false, dErr
@@ -235,4 +238,66 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 		return nil, false, mErr
 	}
 	return raw, true, nil
+}
+
+// serverResourcesForGroupVersion is client-go's
+// DiscoveryClient.ServerResourcesForGroupVersion (client-go v0.36.5
+// discovery/discovery_client.go) sent on ctx: the same GET of the same path
+// through the client's own RESTClient, decoded the same way, with the same
+// tolerated core/v1 404. client-go's sends on context.TODO(), which no page
+// budget can reach (#1115 N1); this one carries the request's.
+func serverResourcesForGroupVersion(ctx context.Context, cli discovery.DiscoveryInterface, gv string) (*metav1.APIResourceList, error) {
+	if gv == "" {
+		return nil, fmt.Errorf("groupVersion shouldn't be empty")
+	}
+	path := "/apis/" + gv
+	if gv == "v1" {
+		path = "/api/v1"
+	}
+	out := &metav1.APIResourceList{GroupVersion: gv}
+	if err := cli.RESTClient().Get().AbsPath(path).Do(ctx).Into(out); err != nil {
+		if gv == "v1" && apierrors.IsNotFound(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// servedVersionsOfGroup is the versions group serves ("" = the core group),
+// read on ctx from the same documents client-go's ServerGroups reads (it sends
+// on context.TODO(), out of the page budget's reach, #1115 N1): /api's
+// APIVersions for the core group, /apis' APIGroupList for any other. Like
+// ServerGroups, a 404 or 403 on either document reads as "nothing served"
+// rather than an error. A group not listed: (nil, nil).
+func servedVersionsOfGroup(ctx context.Context, cli discovery.DiscoveryInterface, group string) ([]string, error) {
+	tolerated := func(err error) bool { return apierrors.IsNotFound(err) || apierrors.IsForbidden(err) }
+	if group == "" {
+		v := &metav1.APIVersions{}
+		if err := cli.RESTClient().Get().AbsPath("/api").Do(ctx).Into(v); err != nil {
+			if tolerated(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return v.Versions, nil
+	}
+	list := &metav1.APIGroupList{}
+	if err := cli.RESTClient().Get().AbsPath("/apis").Do(ctx).Into(list); err != nil {
+		if tolerated(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, g := range list.Groups {
+		if g.Name != group {
+			continue
+		}
+		out := make([]string, 0, len(g.Versions))
+		for _, v := range g.Versions {
+			out = append(out, v.Version)
+		}
+		return out, nil
+	}
+	return nil, nil
 }

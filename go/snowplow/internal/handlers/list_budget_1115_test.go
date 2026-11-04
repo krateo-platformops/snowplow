@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,5 +58,47 @@ func TestList1115_DiscoveryAndListsRunInsideTheBudget(t *testing.T) {
 	}
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("spent budget: /list answered %d, want 504: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// R41 (#1122 re-review) — the budget runs out DURING the per-GVR LISTs
+// (discovery answered in time, a LIST stalls past the deadline): /list answers
+// 504, never 200 with a list silently missing the GVRs it could not read.
+func TestList1115_R41_CutDuringTheListsIs504NotAShorterList(t *testing.T) {
+	prev := xenv.TestMode()
+	xenv.SetTestMode(true)
+	f := &fakeAPI517{}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/namespaces/") { // a per-GVR LIST, not discovery
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		f.handler(w, r)
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+		xenv.SetTestMode(prev)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/list?category="+cat517+"&ns="+ns517, nil)
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithAccessToken("test-token-1115"),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}}),
+		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: srv.URL}),
+	)
+	rec := httptest.NewRecorder()
+	handlers.List().ServeHTTP(rec, req.WithContext(pagebudget.WithCustomer(ctx, time.Now().Add(600*time.Millisecond-pagebudget.PageMaxGoal))))
+	f.mu.Lock()
+	discovered := len(f.hits)
+	f.mu.Unlock()
+	if discovered == 0 {
+		t.Fatal("PRE: discovery never reached the server; the cut must land in the LIST loop")
+	}
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("a /list cut during its per-GVR LISTs answered %d, want 504: %s", rec.Code, rec.Body.String())
 	}
 }

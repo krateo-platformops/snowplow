@@ -232,7 +232,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 				})
 				continue
 			}
-			rows, sErr := inspectUAFStage(rc, uaf, resources)
+			rows, sErr := inspectUAFStage(ctx, rc, uaf, resources)
 			if sErr != nil {
 				unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
 				continue
@@ -251,7 +251,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 
 		// (3) In-cluster GET stage. Evaluate the path against the empty dict
 		// WITHOUT dispatching, then classify the concrete URI.
-		rows, sErr := inspectInClusterStage(rc, stage, dict, log)
+		rows, sErr := inspectInClusterStage(ctx, rc, stage, dict, log)
 		if sErr != nil {
 			unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
 			continue
@@ -306,7 +306,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 // template whose RESOURCE collapsed (/apis/apps/v1/ from
 // `${ "/apis/apps/v1/" + .kind }`) comes back looking like a legitimate bare
 // discovery path. Same reason the two in-tree skeleton analysers exist.
-func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
+func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
 	// The iterator error (#638) is not consumed here: inspect is a
 	// dispatch-free read-set enumeration, unchanged — an errored iterator
 	// enumerates what it enumerated, exactly as before.
@@ -340,7 +340,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 		if !co.OK {
 			return nil, fmt.Errorf("stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
 		}
-		if err := validateGVR(rc, co.GVR); err != nil {
+		if err := validateGVR(ctx, rc, co.GVR); err != nil {
 			return nil, fmt.Errorf("discovery validation failed for %s: %w", co.GVR.String(), err)
 		}
 		// #504 ruling 2 — the verb comes from the three-state NAME, not from the
@@ -368,7 +368,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 
 		// Resource path → GVR (the dominant case).
 		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
-			if err := validateGVR(rc, gvr); err != nil {
+			if err := validateGVR(ctx, rc, gvr); err != nil {
 				return nil, fmt.Errorf("discovery validation failed for %s: %w", gvr.String(), err)
 			}
 			// The RBAC verb is determined by the path SHAPE, not a constant:
@@ -445,12 +445,12 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 // discovery-VALIDATED for EXISTENCE (does the group serve it under ANY served
 // version?); a bogus plural the apiserver serves nowhere → error → the stage
 // is UNRESOLVABLE/fail-loud, never silently emitted.
-func inspectUAFStage(rc *rest.Config, uaf *templates.UserAccessFilterSpec, resources []string) ([]Resource, error) {
+func inspectUAFStage(ctx context.Context, rc *rest.Config, uaf *templates.UserAccessFilterSpec, resources []string) ([]Resource, error) {
 	for _, plural := range resources {
 		if plural == "" {
 			continue // resolveUAFResources already skips these; defensive.
 		}
-		exists, err := pluralExistsInGroup(rc, uaf.Group, plural)
+		exists, err := pluralExistsInGroup(ctx, rc, uaf.Group, plural)
 		if err != nil {
 			return nil, fmt.Errorf("userAccessFilter resource %q (group %q): %w", plural, uaf.Group, err)
 		}
@@ -480,13 +480,13 @@ func inspectUAFStage(rc *rest.Config, uaf *templates.UserAccessFilterSpec, resou
 // gvr.Version via discovery. A discovery miss (group/version not served, or the
 // plural absent from the GroupVersion's resource list) is an error — the stage
 // would 404 at /call, so emitting it as a granted resource would be wrong.
-func validateGVR(rc *rest.Config, gvr schema.GroupVersionResource) error {
+func validateGVR(ctx context.Context, rc *rest.Config, gvr schema.GroupVersionResource) error {
 	cli, err := discoveryClientFor(rc)
 	if err != nil {
 		return err
 	}
 	gv := schema.GroupVersion{Group: gvr.Group, Version: gvr.Version}.String()
-	list, err := cli.ServerResourcesForGroupVersion(gv)
+	list, err := serverResourcesForGroupVersion(ctx, cli, gv) // #1115 N1: on the request ctx
 	if err != nil {
 		return fmt.Errorf("discovery for %s: %w", gv, err)
 	}
@@ -502,26 +502,17 @@ func validateGVR(rc *rest.Config, gvr schema.GroupVersionResource) error {
 // a bogus UAF plural without attaching a non-deterministic version to the row
 // (Q1 ruling). A group the apiserver does not serve at all → (false, nil),
 // which the caller turns into UNRESOLVABLE.
-func pluralExistsInGroup(rc *rest.Config, group, plural string) (bool, error) {
+func pluralExistsInGroup(ctx context.Context, rc *rest.Config, group, plural string) (bool, error) {
 	cli, err := discoveryClientFor(rc)
 	if err != nil {
 		return false, err
 	}
 
-	groups, err := cli.ServerGroups()
+	// #1115 N1 — the group's versions on the request's ctx (client-go's
+	// ServerGroups sends on context.TODO(), out of the page budget's reach).
+	versions, err := servedVersionsOfGroup(ctx, cli, group)
 	if err != nil {
-		return false, fmt.Errorf("discovery ServerGroups: %w", err)
-	}
-
-	var versions []string
-	for _, g := range groups.Groups {
-		if g.Name != group {
-			continue
-		}
-		for _, v := range g.Versions {
-			versions = append(versions, v.Version)
-		}
-		break
+		return false, fmt.Errorf("discovery of group %q: %w", group, err)
 	}
 	if len(versions) == 0 {
 		return false, nil // group not served — caller fails loud.
@@ -529,7 +520,7 @@ func pluralExistsInGroup(rc *rest.Config, group, plural string) (bool, error) {
 
 	for _, v := range versions {
 		gv := schema.GroupVersion{Group: group, Version: v}.String()
-		list, lerr := cli.ServerResourcesForGroupVersion(gv)
+		list, lerr := serverResourcesForGroupVersion(ctx, cli, gv) // #1115 N1
 		if lerr != nil {
 			continue
 		}
