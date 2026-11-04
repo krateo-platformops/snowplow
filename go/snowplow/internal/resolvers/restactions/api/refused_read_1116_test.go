@@ -152,3 +152,55 @@ func TestRefusedRead1116_CountedByWorkClass(t *testing.T) {
 		t.Errorf("every class cell must be present (a 0 is a reading): %v", after)
 	}
 }
+
+// A named-endpoint read whose namespace rendered empty (#1120 split the #288
+// guard: the collapse check judges every stage, the Kubernetes name check only
+// own-cluster ones) is a refused read: nothing is sent, the stage fails with
+// InvalidPath worded as an empty segment, and it is counted. A named-endpoint
+// read whose id is not a DNS-1123 name is still sent and succeeds. Adopted
+// from the #1132 review (TestReviewer1132_NamedRefCollapsedReadFailsTheStage).
+func TestRefusedRead1116_NamedRefCollapsedReadFailsTheStage(t *testing.T) {
+	spoke := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(spoke.srv.URL)})
+	before := RefusedReadSnapshot()
+	s := x1106Stage("s", http.MethodGet, `${ "/apis/composition.krateo.io/v1alpha1/namespaces/" + .ns + "/fireworksapps" }`)
+	o := x1106Resolve(t, map[string]any{"ns": ""}, s)
+	if n := len(spoke.all()); n != 0 {
+		t.Fatalf("the collapsed named-endpoint read was dialled %d time(s)", n)
+	}
+	x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+	if o.failure == nil || o.failure.Code != http.StatusBadRequest ||
+		!strings.Contains(o.failure.Message, `read stage "s" verb GET was not sent: a path segment rendered empty`) {
+		t.Fatalf("want the 400 StageFailure naming an empty segment, got %+v", o.failure)
+	}
+	if d := RefusedReadSnapshot()[refusedReadNone] - before[refusedReadNone]; d != 1 {
+		t.Fatalf("refused reads counted %d, want 1", d)
+	}
+
+	ep := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
+	o = x1106Resolve(t, map[string]any{"id": "Ab_12"}, x1106Stage("r", http.MethodGet, `${ "/api/v2/tickets/" + .id }`))
+	if len(ep.all()) != 1 || o.outcomes != "[]" || o.failure != nil {
+		t.Fatalf("named-endpoint read Ab_12: sent %d header %s failure %+v", len(ep.all()), o.outcomes, o.failure)
+	}
+}
+
+// A read stage's refusals are logged at WARN once per stage, with the number
+// of refused items; each refused item is still counted and recorded.
+func TestRefusedRead1116_OneWarnPerStage(t *testing.T) {
+	api := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, api.srv.URL, map[string]map[string]string{})
+	it := &templates.API{Name: "each", Verb: ptr.To(http.MethodGet), ErrorKey: ptr.To("eachErr"), ContinueOnError: ptr.To(true),
+		DependsOn: &templates.Dependency{Name: "", Iterator: ptr.To(`[ .nss[] | {ns: .} ]`)},
+		Path:      `${ "/api/v1/namespaces/" + .ns + "/configmaps/cm" }`}
+	o := x1106Resolve(t, map[string]any{"nss": []any{"", "", "", "team-a"}}, it)
+	if n := strings.Count(o.logs, `stage not sent"`); n != 1 || !strings.Contains(o.logs, `"msg":"read stage not sent"`) {
+		t.Errorf("a refused read stage logged %d 'stage not sent' line(s), want exactly one 'read stage not sent':\n%s", n, o.logs)
+	}
+	if !strings.Contains(o.logs, `"refused_items":3`) {
+		t.Errorf("the WARN must carry the refused item count (3):\n%s", o.logs)
+	}
+	if errs, _ := o.dict["eachErr"].([]any); len(errs) != 3 {
+		t.Errorf("every refused item is recorded under the errorKey: got %d", len(errs))
+	}
+}

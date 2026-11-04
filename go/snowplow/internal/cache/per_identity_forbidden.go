@@ -20,8 +20,36 @@
 //	    parseable apiserver resource path. An endpointRef host's 403 (a rate
 //	    limit, say) never counts.
 //
-// Everything else (timeouts, 5xx, 404, decode / jq, iterator, the branch-E SA
-// refusal, a genuine external touch) keeps declining exactly as before.
+// #1080 — A NAMED OBJECT'S NOTFOUND IS ALSO A DEFINITE ANSWER. The same sink
+// counts it, so the same predicate (DenialOnly) admits it; it is not a
+// parallel mechanism. A stage error is a definite NotFound iff it is one of:
+//
+//	N1  the apiserver's typed 404 NotFound on the requester's OWN dial (the F2
+//	    conditions: no endpointRef, not an SA dial, a GET, a parseable
+//	    apiserver path) of a NAMED object;
+//	N2  branch C's NotFound on the SA dial of a named object, AFTER #677's
+//	    per-identity pre-dial authorization allowed this identity's `get`;
+//
+// and, for both, the stage declares continueOnError (the RESTAction says a
+// failure of this stage is an expected outcome) and WatchedAbsent holds: the
+// process watcher is authoritative for the GVR and does not hold the object,
+// so its creation reaches the dep worker as an ADD and dirty-marks the cell
+// through the exact-object edge (gvr, namespace, name) the resolver records
+// for every named GET. A 404 on a LIST, a 404 for a GVR nobody watches (an
+// unserved type included) and a 404 in a stage without continueOnError keep
+// declining.
+//
+// 404 vs 403 (identity). The apiserver authorizes `get` on (resource,
+// namespace, name) BEFORE it looks the object up, and snowplow's branch C
+// pre-dial step does the same, so a 404 is only ever the answer to an identity
+// that may read the object; one that may not gets the 403 (F1/F2) whether or
+// not the object exists. Every member of the cell's binding-set class has the
+// same `get` verdict, so the same answer; the recorded body is one canonical,
+// identity-free NotFound Status built from the coordinates.
+//
+// Everything else (timeouts, 5xx, any other 404, decode / jq, iterator, the
+// branch-E SA refusal, a genuine external touch) keeps declining exactly as
+// before.
 //
 // HOW IT IS COUNTED. The resolver bumps this sink at the SAME site, for the SAME
 // item, as the StageErrorSink bump (stage). An F2 dial also bumped the
@@ -36,7 +64,7 @@
 // external count for those gates AND for every declined-external (DES) mark site
 // (#656 seed / engine, #680 walk).
 //
-// NO NEW KEY DIMENSION. A denial-only cell is keyed exactly like every other
+// NO NEW KEY DIMENSION. A denial-only cell (a definite NotFound included) is keyed exactly like every other
 // per-identity cell (BindingUID + SubjectBindingSet + RBACSubGen): requesters
 // that share the binding SET get identical verdicts for every step, so they get
 // an identical denial-only body (with the identity-free canonical error text the
@@ -52,15 +80,18 @@ import (
 	"expvar"
 	"sync"
 	"sync/atomic"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 type ctxKeyPerIdentityForbiddenSinkType struct{}
 
 var ctxKeyPerIdentityForbiddenSink = ctxKeyPerIdentityForbiddenSinkType{}
 
-// PerIdentityForbiddenSink counts a resolve's per-identity forbidden stage
-// errors (stage) and, of those, the ones whose dial also bumped the
-// ExternalTouchedSink (external — F2). nil-receiver-safe throughout.
+// PerIdentityForbiddenSink counts a resolve's per-identity definite stage
+// errors — forbidden (F1, F2) and, since #1080, a named object's NotFound (N1,
+// N2) — (stage) and, of those, the ones whose dial also bumped the
+// ExternalTouchedSink (external — F2, N1). nil-receiver-safe throughout.
 type PerIdentityForbiddenSink struct {
 	stage    atomic.Int64
 	external atomic.Int64
@@ -69,15 +100,15 @@ type PerIdentityForbiddenSink struct {
 	parent *PerIdentityForbiddenSink
 }
 
-// BumpStage records one per-identity forbidden stage error (F1 or F2).
+// BumpStage records one per-identity definite stage error (F1, F2, N1, N2).
 func (s *PerIdentityForbiddenSink) BumpStage() {
 	for cur := s; cur != nil; cur = cur.parent {
 		cur.stage.Add(1)
 	}
 }
 
-// BumpExternal records that a per-identity forbidden (F2) dial was the one that
-// bumped the ExternalTouchedSink.
+// BumpExternal records that a per-identity definite answer's own dial (F2, N1)
+// was the one that bumped the ExternalTouchedSink.
 func (s *PerIdentityForbiddenSink) BumpExternal() {
 	for cur := s; cur != nil; cur = cur.parent {
 		cur.external.Add(1)
@@ -165,12 +196,28 @@ func GenuineExternal(ext *ExternalTouchedSink, f *PerIdentityForbiddenSink) int6
 }
 
 // DenialOnly reports whether a resolve whose stage-error sink is non-empty may
-// still be Put: every stage error was a per-identity forbidden, no genuine
+// still be Put: every stage error was a per-identity definite answer (a
+// forbidden, or #1080 a named object's NotFound), no genuine
 // external endpoint was touched, and the cell's class is identity-bound (a
 // shared identity-free shell must never hold one requester's denial).
 func DenialOnly(stage *StageErrorSink, f *PerIdentityForbiddenSink, ext *ExternalTouchedSink, class string) bool {
 	n := stage.Count()
 	return n > 0 && n == f.Stage() && GenuineExternal(ext, f) == 0 && !IsIdentityFreeClass(class)
+}
+
+// WatchedAbsent reports whether the process watcher is authoritative for gvr
+// right now (registered AND synced AND watch not broken AND type confirmed) and
+// its indexer does not hold (namespace, name): the dep worker's own objAbsent
+// state (probeObjectState). It is the #1080 condition under which a named
+// object's NotFound may be cached: the object's creation arrives as a
+// post-sync ADD and dirty-marks the cell's exact-object edge. A nil watcher,
+// passthrough mode or an unservable GVR answer false. No side effect: it never
+// registers a GVR.
+func WatchedAbsent(gvr schema.GroupVersionResource, namespace, name string) bool {
+	if name == "" {
+		return false
+	}
+	return Global().probeObjectState(gvr, namespace, name) == objAbsent
 }
 
 // --- snowplow_resolved_cache_denial_only_put_total{site} --------------------

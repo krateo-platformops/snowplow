@@ -355,12 +355,15 @@ stored or served.
 A write stage that snowplow refuses to send never reads as a success
 (#1112). Before any request leaves, snowplow refuses a call whose `path`,
 `payload` or a header did not render (a jq error, e.g. `tonumber` on a
-non-number, or an unrendered `${…}`), and — only on a stage with no
-`endpointRef`, which dials this cluster's apiserver — a rendered path that is
-not a valid Kubernetes object path (a collapsed or non-DNS-1123 name or
-namespace, #288). A stage with a named `endpointRef` is sent the path as
-rendered: an external API's ids (`/api/v2/tickets/Ab_12`) are not judged as
-Kubernetes names. Constrain caller input in the template itself.
+non-number, or an unrendered `${…}`), and a rendered path that lost a segment
+its template meant to fill (#288): an empty namespace (`/namespaces//`), or
+an empty last segment on a `PUT`/`PATCH`/`DELETE` (a trailing `/`, which would
+turn a by-name delete into a collection delete). That holds for every stage,
+a named `endpointRef` to another cluster's apiserver included. Only on a
+stage with no `endpointRef` (this cluster's apiserver) is a name or namespace
+that is not a valid Kubernetes name refused as well: an external API's ids
+(`/api/v2/tickets/Ab_12`) are not judged as Kubernetes names. Constrain caller
+input in the template itself.
 
 For a **read** the refused call is skipped and the page renders what it can,
 as before. For a **write** each refused call (one item of an iterator

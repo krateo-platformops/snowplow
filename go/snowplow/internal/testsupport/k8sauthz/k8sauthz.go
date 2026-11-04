@@ -71,10 +71,12 @@ func New(objs ...runtime.Object) *Authorizer {
 //
 // NOT INDEPENDENT of snowplow: it is the same verb → URL-shape table as
 // rbac.IsNameSpecificVerb, so a matrix built on it cannot detect a request
-// shape that table misses — a list/watch with `fieldSelector=metadata.name=`
-// (RequestInfo sets Name), a create on a named subresource, a non-HTTP verb.
+// shape that table misses — a create on a named subresource, a non-HTTP verb.
 // Allowed's rule matching is independent; this helper is the shared
-// assumption.
+// assumption. A list/watch with `fieldSelector=metadata.name=` (RequestInfo
+// sets Name) is NOT modelled here: #1049's matrix takes the verb and Name of
+// such a read from the vendored RequestInfo resolver itself
+// (internal/rbac/evaltest/issue1049_collection_check_parity_test.go).
 func RequestName(verb, name string) string {
 	switch verb {
 	case "get", "update", "patch", "delete":

@@ -255,7 +255,10 @@ func Refreshes() http.HandlerFunc {
 		}
 
 		// (5) Subscribe + stream until the client disconnects.
-		stream := cache.SubscribeRefreshStream(armed)
+		// #1062 — the stream is this user's: the stale-push ledger pairs a frame
+		// written here only with this user's stale serves (cache.StaleSubject,
+		// the same derivation the dispatchers' hit sites use).
+		stream := cache.SubscribeRefreshStreamAs(cache.StaleSubject(ui.Username), armed)
 		defer stream.Unsub()
 
 		// #560 — the open-stream GAUGE, paired with its decrement so a

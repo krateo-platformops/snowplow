@@ -28,6 +28,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -218,7 +219,15 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// snowplow holds on their behalf: credhttp.Do is request.Do with a client
 	// that never follows a redirect (a token-auth clientconfig's bearer is
 	// re-added on every hop), and a refused 3xx is surfaced with its own code.
+	// #1054 — the passthrough fetch is one dial: its attempts (the retry
+	// client's network-error, 5xx and 429 retries) are recorded on it.
+	dctx, dial := slowcall.StartDial(dctx, slowcall.BranchPassthrough, strings.ToUpper(opts.verb), opts.gvr.String())
 	rt := credhttp.Do(dctx, callOpts)
+	if rt != nil && rt.Status == response.StatusFailure {
+		dial.EndRelease(slowcall.ReleaseFailed)
+	} else {
+		dial.End()
+	}
 
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see
@@ -235,20 +244,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// A dry run (#443, /call/dry-run: the apiserver is always sent
 		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
 		// as krateo.action=call.dryRun and with no written object (#957).
-		ev := audit.Event{
-			Action:      "call",
-			DryRun:      opts.dryRun,
-			Verb:        strings.ToUpper(opts.verb),
-			Group:       opts.gvr.Group,
-			Version:     opts.gvr.Version,
-			Resource:    opts.gvr.Resource,
-			Subresource: opts.subresource,
-			Name:        opts.nsn.Name,
-			Namespace:   opts.nsn.Namespace,
-			Outcome:     outcome,
-			Code:        code,
-			Message:     msg,
-		}
+		ev := requestAuditEvent("call", opts.verb,
+			auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}, outcome, code)
+		ev.DryRun = opts.dryRun
+		ev.Message = msg
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		ev.RecordWrittenObject(answer)

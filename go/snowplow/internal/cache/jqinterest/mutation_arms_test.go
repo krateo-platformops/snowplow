@@ -90,8 +90,12 @@ func soundnessArms() []arm {
 			Chain{RA: RESTAction{Stages: []Stage{{Name: "extras", Filter: strp(`[.extras.items[] | .spec.secret]`)}}}, Tracked: "extras"}},
 		{"A5: a stage named slice sees its response when the request is not paginated", mutPigConstWins,
 			Chain{RA: RESTAction{Stages: []Stage{{Name: "slice", Filter: strp(`[.slice.items[] | .spec.secret]`)}}}, Tracked: "slice"}},
-		{"A6: an extras key equal to the stage name pre-seeds dict[stage]: [seed, response]", mutNoExtrasSeed,
-			oneStage("", `.s | if type == "array" then .[1].items[0].spec.secret else "n" end`)},
+		// #1116: extras can no longer pre-seed dict[stage] (a resolve whose
+		// extras name a stage is refused), so the one pre-seed left is the
+		// pagination block under "slice", for a stage named slice.
+		{"A6: a paginated request pre-seeds dict[slice] of a stage named slice: [slice, response]", mutNoSliceSeed,
+			Chain{RA: RESTAction{Stages: []Stage{{Name: "slice"}},
+				Filter: strp(`.slice | if type == "array" then .[1].items[0].spec.secret else "n" end`)}, Tracked: "slice"}},
 		{"M4: two selects are two disjuncts, not one AND", mutKeyFlatAND,
 			oneStage(`[.s.items[] | select(.metadata.name == "a")] + [.s.items[] | select(.metadata.namespace == "ns2")]`, "")},
 		{"R2: the key field of a select guard is read", mutKeyNotRead,

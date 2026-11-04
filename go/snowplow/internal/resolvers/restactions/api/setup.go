@@ -222,11 +222,13 @@ func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcal
 		return out, false, skipReason{class: reasonJQHeaderError, detail: "header jq expression errored: " + headerErr.Error()}
 	}
 	if !apiserver {
-		// #1112 D2 — not an apiserver dial: only the template check applies.
-		if unrenderedTemplate(out.Path) {
-			return out, false, unrenderedTemplateSkip
-		}
-		return out, true, skipReason{}
+		// #1112 D2 — a named endpoint: the collapse refusal applies (a missing
+		// segment is malformed for any REST endpoint, and on a spoke apiserver
+		// reached through a named ref an empty namespace would widen the read),
+		// but not the Kubernetes name-validity check (another API's ids are not
+		// DNS-1123 names).
+		valid, sr = collapsedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
+		return
 	}
 	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
 	return
@@ -241,49 +243,76 @@ func unrenderedTemplate(path string) bool { return strings.Contains(path, "${") 
 // unrenderedTemplateSkip is the verdict on an unrendered template.
 var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail: "unrendered ${...} template (#293)"}
 
-// validInterpolatedPath reports whether a rendered api-call path is safe to dial
-// (#288). It guards ONLY single-object apiserver paths: it parses the rendered
-// path and rejects the empty-interpolation shapes seen on 057 —
+// collapsedPath reports whether a rendered api-call path still has every
+// segment its template meant to fill: the refusal that applies to EVERY dial,
+// this cluster's apiserver and a named endpoint alike (#288, split by #1112 D2).
+// A missing segment is malformed for any REST endpoint, and the shapes refused
+// here are the ones whose dial would silently mean something wider:
+//   - an UNRENDERED "${" template (#293 sub-case 1; a genuine URL never carries
+//     "${");
 //   - a COLLAPSED empty namespace segment (`/api/v1/namespaces//configmaps/...`),
 //     keyed on the literal "/namespaces//" (the DOUBLE slash), NOT merely ns==""
 //     (which is ALSO true for a legit cluster-scoped namespace-by-name GET like
 //     /api/v1/namespaces/kube-system) and NOT the general "//" (which would
-//     false-reject a proxy subresource URL, e.g. /pods/p/proxy/http://host);
+//     false-reject a proxy subresource URL, e.g. /pods/p/proxy/http://host). On a
+//     spoke apiserver reached through a named ref (cluster-compositions'
+//     `<name>-endpoint`) it would otherwise read every namespace;
+//   - a collapsed trailing NAME on a mutating verb: an apiserver-shaped path
+//     whose last segment rendered empty, leaving a trailing "/"
+//     (`DELETE .../rolebindings/` from `".../rolebindings/" + .name`): dialled,
+//     a by-name DELETE becomes a COLLECTION delete (blast radius). The check
+//     reads the RAW rendered path (query-stripped) BEFORE ParseAPIServerPathToDep's
+//     internal TrimRight erases the slash.
+//
+// Two residuals, both fail SAFE (reject rather than over-dial):
+//   - a collection write deliberately written WITH a trailing slash
+//     (`.../configmaps/`, no interpolation) is false-rejected; RAs write the
+//     collection path without the trailing slash, so this is rare;
+//   - a name that collapses BEFORE a subresource (`.../resource//subresource`, a
+//     mid-path "//") is NOT caught — the targeted "/namespaces//" key deliberately
+//     avoids the general "//" (proxy-URL edge above).
+func collapsedPath(path, verb string) (bool, skipReason) {
+	if unrenderedTemplate(path) {
+		return false, unrenderedTemplateSkip
+	}
+	p := rawPath(path)
+	if strings.Contains(p, "/namespaces//") {
+		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)", collapsed: true}
+	}
+	switch verb {
+	case http.MethodPut, http.MethodPatch, http.MethodDelete:
+		if _, _, name, ok := cache.ParseAPIServerPathToDep(path); ok && name == "" && strings.HasSuffix(p, "/") {
+			return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (empty last segment, trailing slash) (#288)", collapsed: true}
+		}
+	}
+	return true, skipReason{}
+}
+
+// rawPath is path without its query and fragment (#1073 F1: splitPathQuery,
+// the parser's own split), but NOT trailing-slash-trimmed, which would erase
+// the collapse discriminators.
+func rawPath(path string) string {
+	p, _, _ := splitPathQuery(path)
+	return p
+}
+
+// validInterpolatedPath reports whether a rendered api-call path is safe to dial
+// on THIS cluster's apiserver (#288): collapsedPath, plus the checks that hold
+// only for a Kubernetes object path, so only for an own-cluster dial (#1112 D2:
+// on a named endpoint they refused another API's ids, `/api/v2/tickets/Ab_12`):
 //   - a name/namespace segment that is present but DNS-1123-invalid (e.g. a
 //     trailing '-'), via IsDNS1123Subdomain / IsDNS1123Label (VALIDATE, not
 //     sanitize — sanitizing would dial a wrong-but-valid name and defeat #288);
-//   - a collapsed trailing NAME on a MUTATING verb: PUT/PATCH with name=="" is
-//     always a collapse (the apiserver 405s a nameless collection PUT/PATCH), and
-//     a DELETE with name=="" that left a trailing "/" on the rendered path is a
-//     collapsed by-name DELETE (vs a genuine collection DELETE written WITHOUT a
-//     trailing slash) — without this a `DELETE .../rolebindings/${name}` with an
-//     empty name would dial a COLLECTION delete (blast radius). The trailing-slash
-//     check reads the RAW rendered path (query-stripped) BEFORE ParseAPIServerPath
-//     ToDep's internal TrimRight erases it.
+//   - PUT/PATCH with name=="" even without a trailing slash: the apiserver has
+//     no nameless update (it 405s a collection PUT/PATCH), so an empty name is
+//     always a collapse.
 //
-// Untouched (byte-identical to pre-#288): non-apiserver paths (external URLs,
-// parseOK=false), nameless LIST (GET, name=="") and nameless create (POST,
-// name==""), and every well-formed single-object path.
-//
-// Two residuals, both fail SAFE (reject rather than over-dial), documented per
-// arch-1217 review:
-//   - a collection DELETE deliberately written WITH a trailing slash
-//     (`.../configmaps/`, no interpolation) is false-rejected; RAs write the
-//     collection path without the trailing slash, so this is rare.
-//   - a name that collapses BEFORE a subresource (`.../resource//subresource`, a
-//     mid-path "//") is NOT caught — the targeted "/namespaces//" key deliberately
-//     avoids the general "//" (proxy-URL edge above). Exotic; follow-up if seen.
-//
-// (Out of scope, filed #293: an UNRENDERED `${...}` / garbage path from an evalJQ
-// error — parseOK=false, left to pre-#288 dial behaviour.)
+// Untouched: non-apiserver paths (parseOK=false), nameless LIST (GET,
+// name=="") and nameless create (POST, name==""), and every well-formed
+// single-object path.
 func validInterpolatedPath(path, verb string) (bool, skipReason) {
-	// #293 sub-case 1: an UNRENDERED "${" template (jqutil.MaybeQuery leaves it
-	// literal on unbalanced braces) is never a dialable apiserver path. Reject it
-	// before the parseOK=false early-return below (which would otherwise pass it
-	// through as a legit external path). A genuine external URL never carries
-	// "${", so external-dial behaviour is unchanged.
-	if unrenderedTemplate(path) {
-		return false, unrenderedTemplateSkip
+	if ok, sr := collapsedPath(path, verb); !ok {
+		return false, sr
 	}
 	_, ns, name, ok := cache.ParseAPIServerPathToDep(path)
 	if !ok {
@@ -291,45 +320,15 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 		// unresolved template, or a shape ParseAPIServerPathToDep rejects).
 		return true, skipReason{}
 	}
-
-	// Inspect the RAW rendered path, query-stripped (mirror the parser's own
-	// query strip) but NOT trailing-slash-trimmed — the collapse discriminators
-	// below depend on the "//" and trailing "/" the parser would erase.
-	p := path
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		p = p[:i]
-	}
-
-	// Collapsed NAMESPACE — the empty segment "/namespaces//" (blocker fix).
-	if strings.Contains(p, "/namespaces//") {
-		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty namespace segment (#288)"}
-	}
-	// Present-but-invalid namespace / name segments.
 	if ns != "" && len(validation.IsDNS1123Label(ns)) > 0 {
 		return false, skipReason{class: reasonEmptyInterp, detail: "DNS-1123-invalid namespace segment (#288)"}
 	}
 	if name != "" && len(validation.IsDNS1123Subdomain(name)) > 0 {
 		return false, skipReason{class: reasonEmptyInterp, detail: "DNS-1123-invalid name segment (#288)"}
 	}
-
-	// Collapsed trailing NAME on a mutating verb (safety-gap b). name=="" is a
-	// legitimate nameless op ONLY for GET (list) and POST (collection create).
-	if name == "" {
-		switch verb {
-		case http.MethodPut, http.MethodPatch:
-			// No nameless update exists (apiserver 405s a collection PUT/PATCH),
-			// so an empty name here is always a collapse.
-			return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (#288)"}
-		case http.MethodDelete:
-			// A collapsed by-name DELETE leaves a trailing "/" (`.../configmaps/`
-			// from `".../configmaps/"+(.name)` with name==""); a genuine
-			// collection DELETE is written `.../configmaps` (no trailing slash).
-			if strings.HasSuffix(p, "/") {
-				return false, skipReason{class: reasonEmptyInterp, detail: "collapsed by-name DELETE (empty name, trailing slash) (#288)"}
-			}
-		}
+	if name == "" && (verb == http.MethodPut || verb == http.MethodPatch) {
+		return false, skipReason{class: reasonEmptyInterp, detail: "collapsed empty name on a mutating verb (#288)"}
 	}
-
 	return true, skipReason{}
 }
 

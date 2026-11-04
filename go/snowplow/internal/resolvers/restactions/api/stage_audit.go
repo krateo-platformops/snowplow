@@ -120,7 +120,7 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 	// may be any HTTP API: nothing of its path is recorded.
 	apiServerObject := false
 	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
-		path, query, _ := strings.Cut(call.Path, "?")
+		path, query, _ := splitPathQuery(call.Path) // as the apiserver receives it (#1073 F1)
 		// #957 — a stage may ask the apiserver for a dry run in its path
 		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
 		// persisted: the record says so and names no written object.

@@ -36,7 +36,6 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -130,13 +129,20 @@ func (c *ResolvedCacheStore) raLayerEqualPrior(key string, entry *ResolvedEntry)
 	if !isRAFullListEntry(entry) {
 		return nil
 	}
-	c.mu.Lock()
-	prior := c.raLayerResidentEntryLocked(key)
-	c.mu.Unlock()
+	return c.raLayerEqualOf(entry, c.sameBytesPrior(key, entry))
+}
+
+// raLayerEqualOf is raLayerEqualPrior given the byte compare's result: same is
+// the resident prior whose bytes equal entry's, or nil (sameBytesPrior). The
+// refresher terminal Put (#1070) compares once for its put_total count and
+// hands the result here.
+func (c *ResolvedCacheStore) raLayerEqualOf(entry, same *ResolvedEntry) *ResolvedEntry {
+	if !isRAFullListEntry(entry) {
+		return nil
+	}
 	var eq *ResolvedEntry
-	if prior != nil && isRAFullListEntry(prior) && prior.contentVersion != 0 &&
-		bytes.Equal(prior.RawJSON, entry.RawJSON) {
-		eq = prior
+	if same != nil && isRAFullListEntry(same) && same.contentVersion != 0 {
+		eq = same
 	}
 	if fn := raLayerAfterCompareHook.Load(); fn != nil {
 		(*fn)()

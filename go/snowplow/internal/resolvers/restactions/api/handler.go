@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -64,6 +65,12 @@ type jsonHandlerOptions struct {
 	// and stageEnvelopeCheck checks what the stage receives.
 	k8sList bool
 	listGVR schema.GroupVersionResource
+	// served/servedOK: the Kubernetes resource this call's path names, a
+	// LIST or a GET by name (servedOK false for a path that names none). The
+	// response's items are objects of it, and the userAccessFilter refilter
+	// checks an object of a checked resource on that resource alone (#1124).
+	served   schema.GroupResource
+	servedOK bool
 	// stageFailed records a failure of this stage that is still SERVED (#651:
 	// a userAccessFilter whose resource set did not resolve keeps its
 	// fail-closed empty answer): the stage-error sink bump every L1 Put gate
@@ -175,7 +182,10 @@ func jsonHandlerBytesApply(ctx context.Context, opts jsonHandlerOptions, dat []b
 	if len(bytes.TrimSpace(dat)) == 0 {
 		return jsonHandlerCore(ctx, opts, nil)
 	}
-	if err := json.Unmarshal(dat, &tmp); err != nil {
+	dec := slowcall.Start(ctx, slowcall.PhaseParse) // #1054: the stage body's decode
+	err := json.Unmarshal(dat, &tmp)
+	dec.End()
+	if err != nil {
 		return safeDecodeError(err)
 	}
 	return jsonHandlerCore(ctx, opts, tmp)
@@ -237,7 +247,7 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	// scope. Fixes the 0-count compositions-list regression preserved
 	// from 0.30.235.
 	if opts.uaf != nil {
-		rf := applyUserAccessFilterOnPig(ctx, pig, opts.dict, opts.key, opts.uaf)
+		rf := applyUserAccessFilterOnPig(ctx, pig, opts.dict, opts.key, opts.uaf, opts.served, opts.servedOK)
 		emitRefilterFalsifierFromHandler(ctx, log, opts.apiCallName, opts.uaf, rf)
 		// #759 (SECURITY) — the refilter REPLACES pig[key] on its fail-closed
 		// branches (the empty list; {} for a denied single object) and for a
@@ -265,7 +275,11 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		// directly — no jqutil encode-to-string + json.Unmarshal-back
 		// round-trip (design §3.4.2). Behaviour byte-identical per the
 		// §3.4.2 truth table.
+		// #1054 — the stage filter's JQ, timed on the request (the eval keeps
+		// its context.TODO: timing it changes nothing it does).
+		jq := slowcall.Start(ctx, slowcall.PhaseJQ)
 		v, ok, err := EvalValue(context.TODO(), q, pig, jqsupport.ModuleLoader())
+		jq.End()
 		switch {
 		case errors.Is(err, ErrMultiYield):
 			// Current: multi-yield -> invalid concatenated JSON ->

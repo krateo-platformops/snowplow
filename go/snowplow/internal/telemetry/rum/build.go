@@ -11,7 +11,7 @@ import (
 type filtered struct {
 	spans          []*tracepb.Span
 	droppedService int // spans under a resource whose service.name is not ServiceName
-	droppedName    int // spans whose name is not in SpanNames
+	droppedName    int // spans whose name is not a key of spanAllowlist
 	droppedInvalid int // spans whose ids, times, kind or status are not valid OTLP
 	droppedAttrs   int // span attributes not allowlisted, or with a value the key does not allow
 	// unregisteredRoutes is the subset of droppedAttrs that were a
@@ -46,10 +46,10 @@ func filter(req *exportRequest, snowplowRoutes RouteSet) filtered {
 			switch {
 			case service != ServiceName:
 				f.droppedService++
-			case !SpanNames[in.Name]:
+			case spanAllowlist[in.Name] == nil:
 				f.droppedName++
 			default:
-				out, dropped, unregistered, ok := buildSpan(in, snowplowRoutes)
+				out, dropped, unregistered, ok := buildSpan(in, spanAllowlist[in.Name], snowplowRoutes)
 				if !ok {
 					f.droppedInvalid++
 					continue
@@ -63,11 +63,13 @@ func filter(req *exportRequest, snowplowRoutes RouteSet) filtered {
 	return f
 }
 
-// buildSpan copies the allowlisted fields of in into a new span. ok is false
-// when an id, the times, the kind or the status code is not valid; dropped is
-// the number of span attributes left out, unregistered how many of those were
-// a krateo.widget.fetch http.route that is not one of snowplowRoutes.
-func buildSpan(in *span, snowplowRoutes RouteSet) (out *tracepb.Span, dropped, unregistered int, ok bool) {
+// buildSpan copies the allowlisted fields of in into a new span, keeping only
+// the attributes in allowed (in's row of spanAllowlist) whose value passes the
+// key's check. ok is false when an id, the times, the kind or the status code
+// is not valid; dropped is the number of span attributes left out,
+// unregistered how many of those were a krateo.widget.fetch http.route that
+// is not one of snowplowRoutes.
+func buildSpan(in *span, allowed map[string]valueCheck, snowplowRoutes RouteSet) (out *tracepb.Span, dropped, unregistered int, ok bool) {
 	traceID, ok := hexID(in.TraceID, 16)
 	if !ok {
 		return nil, 0, 0, false
@@ -96,7 +98,11 @@ func buildSpan(in *span, snowplowRoutes RouteSet) (out *tracepb.Span, dropped, u
 	var attrs []*commonpb.KeyValue
 	seen := map[string]bool{}
 	for _, kv := range in.Attributes {
-		v, keep := allowedValue(kv, in.Name, snowplowRoutes)
+		var v *commonpb.AnyValue
+		keep := false
+		if check, listed := allowed[kv.Key]; listed {
+			v, keep = check(kv.Value, snowplowRoutes)
+		}
 		if !keep || seen[kv.Key] {
 			dropped++
 			if !keep && kv.Key == AttrRoute && in.Name == SpanWidgetFetch {
@@ -118,44 +124,6 @@ func buildSpan(in *span, snowplowRoutes RouteSet) (out *tracepb.Span, dropped, u
 		Attributes:        attrs,
 		Status:            &tracepb.Status{Code: tracepb.Status_StatusCode(in.StatusCode)},
 	}, dropped, unregistered, true
-}
-
-// allowedValue returns the value to forward for an allowlisted key, or false
-// when the key is not allowlisted or its value is not one the key allows.
-//
-// http.route (Diego, 2026-10-30, #1020 F3: "exact where possible, trust the
-// rest"):
-//   - on krateo.widget.fetch the route names a snowplow route, so it must be
-//     EXACTLY one of snowplowRoutes (the live mux), else it is dropped;
-//   - on the page-level spans it is the portal router's pattern, which
-//     snowplow cannot know: it is accepted when validRoute passes (no query
-//     string, escape or space; no token- or JWT-shaped segment).
-func allowedValue(kv keyValue, spanName string, snowplowRoutes RouteSet) (*commonpb.AnyValue, bool) {
-	switch kv.Key {
-	case AttrRoute:
-		s := kv.Value.StringValue
-		if s == nil {
-			return nil, false
-		}
-		if spanName == SpanWidgetFetch {
-			if snowplowRoutes != nil && snowplowRoutes(*s) {
-				return strValue(*s), true
-			}
-			return nil, false
-		}
-		if validRoute(*s) {
-			return strValue(*s), true
-		}
-	case AttrMethod:
-		if s := kv.Value.StringValue; s != nil && methods[*s] {
-			return strValue(*s), true
-		}
-	case AttrStatus:
-		if n := kv.Value.IntValue; n != nil && *n >= 100 && *n <= 599 {
-			return &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: int64(*n)}}, true
-		}
-	}
-	return nil, false
 }
 
 func strValue(s string) *commonpb.AnyValue {

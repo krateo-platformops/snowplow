@@ -68,6 +68,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/workqueue"
@@ -859,6 +860,8 @@ func (e *prewarmEngine) yieldToCustomer(ctx context.Context) {
 	if !customerInFlight() {
 		return
 	}
+	// #1054 — parked: the process-wide count every slow-call snapshot reports.
+	defer slowcall.BeginYield(ctx).End()
 	t := time.NewTicker(e.yieldPoll)
 	defer t.Stop()
 	for customerInFlight() {

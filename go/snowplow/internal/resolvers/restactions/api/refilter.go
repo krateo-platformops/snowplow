@@ -43,7 +43,9 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // uafReadVerbs is the set of Kubernetes RBAC verbs that unambiguously express
@@ -250,6 +252,10 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 — the items are objects of the resource the path names; an object
+	// of a checked resource is checked on its own resource alone.
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(apiCall.Path)
+	resources = uafItemResources(uaf, resources, servedGVR.GroupResource(), servedOK)
 
 	raw, ok := dict[apiCall.Name]
 	if !ok || raw == nil {
@@ -330,6 +336,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 // error denies the item; an EvaluateRBAC error denies the item; a
 // scalar the user has no grant for is dropped by EvaluateRBAC.
 func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, items []any) ([]any, int, int) {
+	defer slowcall.Start(ctx, slowcall.PhaseRefilter).End() // #1054
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
@@ -450,9 +457,12 @@ type uafRBACMemoKey struct {
 // Ship 0.30.129 OR semantics: a namespace is kept iff the user can
 // perform Verb on ANY of the resolved resource plurals there.
 //
-// `resources` is the resolved plural set (resolveUAFResources): a single
-// element [uaf.Resource] when ResourcesFrom is unset (pre-0.30.129
-// behaviour, byte-identical), or the jq-derived set when it is set.
+// `resources` is the set the caller decided for these items: the resolved
+// plural set (resolveUAFResources: [uaf.Resource] when ResourcesFrom is
+// unset, the jq-derived set when it is set), narrowed by uafItemResources
+// (#1124). For objects of a checked resource it is that one resource, so the
+// OR has one term and the check is Kubernetes' own per-object decision; for
+// scope items (namespaces, names) it is the whole set.
 //
 // item is any (0.30.111 Part 1): a K8s object (map[string]any) OR a
 // bare scalar (string — the namespaces-stage name-array shape). jq
@@ -600,6 +610,45 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		}
 	}
 	return false
+}
+
+// uafItemResources is the resource set the refilter checks each item of one
+// response against, decided by what the items are (#1124, SECURITY).
+//
+// served is the Kubernetes resource the stage's request names: the group and
+// plural of the dialled path (servedOK false when the path names none). Every
+// item of that response IS an object of served. A LIST answers with members of
+// the listed collection and a GET with the named object, and Kubernetes
+// authorizes reading such an object on its own resource, in its own namespace,
+// with the caller's verb. The request is what names that resource on every
+// dispatch path: a typed list from the live apiserver carries no apiVersion or
+// kind on its items, and when an item does carry them they name served.
+//
+//   - served is a member of the checked set (served.Group == uaf.Group and
+//     served.Resource is in resources): the items are objects of a checked
+//     resource, and the set narrows to served.Resource alone. Keeping such an
+//     object because the caller may act on ANOTHER plural of the set reads it
+//     without its own grant: one p1s grant in a namespace plus the visibility
+//     of p2's definition read every p2 object there.
+//   - otherwise the items are not objects of a checked resource (namespaces
+//     checked with namespaceFrom .metadata.name, or another resource the
+//     author gates by the set), and the check asks about a scope: may the
+//     caller act on ANY of these plurals there. The OR across the set is that
+//     question, unchanged.
+//
+// A static resource is a set of one, so it checks exactly what it checked
+// before on both branches. Nothing here names a RESTAction, a stage or a
+// resource: the rule reads only the request and the stage's own stanza.
+func uafItemResources(uaf *templates.UserAccessFilterSpec, resources []string, served schema.GroupResource, servedOK bool) []string {
+	if !servedOK || served.Group != uaf.Group {
+		return resources
+	}
+	for _, r := range resources {
+		if r == served.Resource {
+			return []string{r}
+		}
+	}
+	return resources
 }
 
 // compileNamespaceFrom resolves the effective NamespaceFrom expression for a
@@ -873,7 +922,11 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 // shape for an unresolvable ResourcesFrom — identical to pre-Ship-K
 // behaviour for that case. Per-item refilter still uses `pig` items —
 // that scope is correct for items.
-func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
+//
+// #1124 — served/servedOK is the Kubernetes resource the stage's request
+// names (jsonHandlerOptions.served): the items are objects of it, and
+// uafItemResources narrows the checked set to it when it is a member.
+func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec, served schema.GroupResource, servedOK bool) refilterResult {
 	log := xcontext.Logger(ctx)
 	res := refilterResult{}
 
@@ -935,6 +988,9 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 (SECURITY) — an object of a checked resource is checked on its own
+	// resource alone; a scope item (a namespace, a name) keeps the set's OR.
+	resources = uafItemResources(uaf, resources, served, servedOK)
 
 	raw, ok := pig[stageName]
 	if !ok || raw == nil {

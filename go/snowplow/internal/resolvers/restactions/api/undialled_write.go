@@ -15,10 +15,11 @@
 // THE RULE. A write stage (any method but GET, HEAD, OPTIONS, TRACE) with real
 // coordinates that snowplow refuses to send FAILS, with a reason from the
 // closed outcome set (stage_outcomes.go):
-//   - InvalidPath   — the #288 guard refused the rendered path. Since #1112 the
-//     guard judges only a stage that dials this cluster's apiserver
-//     (createRequestOptionsWithSkips), so it never refuses an external
-//     endpoint's path;
+//   - InvalidPath   — the #288 guard refused the rendered path. Its collapse
+//     check (a path segment that rendered empty) judges every stage, a named
+//     endpoint's included; its Kubernetes name-validity check judges only a
+//     stage that dials this cluster's apiserver (createRequestOption). The
+//     errorKey message says which (undialledWriteCause);
 //   - TemplateError — the path, payload or a header did not render: a jq error
 //     (#302) or an unrendered ${...} (#293);
 //   - NotSent       — the catch-all: the stage's items were planned but at least
@@ -28,7 +29,8 @@
 // TemplateError; the NotSent catch-all stays write-only): a body built around
 // a read that was never made is not the stage's answer, so it fails the stage
 // and is never stored, as any per-item stage error is. Each refused read is
-// also counted by resolve work class (refused_read_metrics.go).
+// counted by resolve work class (refused_read_metrics.go) and a read stage's
+// refusals are logged at WARN once per stage (failRefusedItems).
 //
 // Each refused item is one failure (an iterator write with one refused item of
 // three sends the other two and FAILS), recorded the way every stage failure is:
@@ -64,6 +66,9 @@ import (
 func undialledWriteCause(sr skipReason) (reason, why string) {
 	switch sr.class {
 	case reasonEmptyInterp:
+		if sr.collapsed {
+			return StageReasonInvalidPath, "a path segment rendered empty (#288)"
+		}
 		return StageReasonInvalidPath, "its rendered path is not a valid Kubernetes object path (#288)"
 	case reasonUnrenderedTemplate:
 		return StageReasonTemplateError, "its path holds an unrendered ${...} template (#293)"
@@ -95,14 +100,35 @@ func undialledWriteCode(reason string) int {
 // stand in for it unseen. Now it is the same failure a refused write is: the
 // reason (InvalidPath / TemplateError), the errorKey record, the stage-error
 // sink (no Put stores a body built around the missing read, as for every
-// per-item stage error), and the StageFailure without continueOnError. Each
-// refused read is also counted by resolve class
-// (snowplow_refused_read_total{class}). Runs on the stage-loop goroutine
-// before any worker exists, so dict needs no lock.
+// per-item stage error), and the StageFailure without continueOnError.
+//
+// LOG VOLUME. A refused write is a WARN per item, as #1112 ruled: each is an
+// action that did not happen. A refused read is counted per item
+// (snowplow_refused_read_total{class}) and logged at WARN ONCE per stage, with
+// the number of refused items: an iterator read that refuses many items, or a
+// background resolve that refuses reads routinely, shows in the counter, not
+// as one WARN line per item. Runs on the stage-loop goroutine before any
+// worker exists, so dict needs no lock.
 func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips []skippedOption) {
+	if len(skips) == 0 {
+		return
+	}
+	var firstReason string
 	for _, sk := range skips {
 		reason, why := undialledWriteCause(sk.reason)
+		if firstReason == "" {
+			firstReason = reason
+		}
 		r.failUndialledWrite(id, apiCall, reason, why)
+	}
+	if !isWriteVerb(apiCall.Verb) {
+		r.log.Warn("read stage not sent",
+			slog.String("name", id),
+			slog.String("verb", ptr.Deref(apiCall.Verb, http.MethodGet)),
+			slog.String("reason", firstReason),
+			slog.Int("refused_items", len(skips)),
+			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+			slog.String("restaction_name", r.opts.RESTActionName))
 	}
 }
 
@@ -119,7 +145,8 @@ func (r *resolveRun) failUnsentWrites(sc *stageCtx) {
 
 // failUndialledWrite records the failure of one item, of a write or a read
 // stage, that was not sent. The message names the stage's class ("write
-// stage" / "read stage"), the stage, the verb and the cause only.
+// stage" / "read stage"), the stage, the verb and the cause only. A write item
+// is logged here; a read stage's refusals are logged once by failRefusedItems.
 func (r *resolveRun) failUndialledWrite(id string, apiCall *templates.API, reason, why string) {
 	verb := ptr.Deref(apiCall.Verb, http.MethodGet)
 	code := undialledWriteCode(reason)
@@ -140,7 +167,10 @@ func (r *resolveRun) failUndialledWrite(id string, apiCall *templates.API, reaso
 		r.failure = &StageFailure{Stage: id, Code: code,
 			Reason: string(response.New(code, nil).Reason), Message: msg}
 	}
-	r.log.Warn(class+" stage not sent",
+	if class == "read" {
+		return // logged once per stage by failRefusedItems
+	}
+	r.log.Warn("write stage not sent",
 		slog.String("name", id),
 		slog.String("verb", verb),
 		slog.String("reason", reason),

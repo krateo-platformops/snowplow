@@ -35,7 +35,11 @@
 // (NotFound → 401, anything else → 500). A SECOND intentional change (#994):
 // a token whose groups carry krateo:loa:2 reads the step-up Secret
 // `<user>-clientconfig-stepup` instead of `<user>-clientconfig`
-// (credsecret.For); every other token's Secret name is upstream's. Cache hits bypass the
+// (credsecret.For); every other token's Secret name is upstream's. A THIRD
+// (#1029, #1076): every 401 this middleware writes keeps upstream's six Status
+// fields and message and appends `details.causes[0].reason` from a closed set
+// plus a WWW-Authenticate challenge (credential_status.go), so a client can
+// tell a pre-dispatch rejection from a relayed upstream 401. Cache hits bypass the
 // apiserver GET entirely and are byte-equivalent to what
 // `endpoints.FromSecret` would have returned (gated by Ship D.2's
 // TestFromInformerSecret_UpstreamFieldParity).
@@ -67,6 +71,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 )
 
 // PinnedPlumbingVersion is the upstream `plumbing` module version this
@@ -92,6 +97,11 @@ const PinnedPlumbingVersion = "v1.15.1"
 //   2.  `Bearer ` prefix validation — Unauthorized on mismatch.
 //   3.  `jwtutil.ValidateWithKeySource(keys, token)` — Unauthorized on a bad or
 //       expired token, ServiceUnavailable when the key itself is unresolvable.
+//
+//      (#1076 — each Unauthorized in steps 1-3, and the NotFound in step 5,
+//      keeps upstream's six Status fields and message and adds a pre-dispatch
+//      cause plus a WWW-Authenticate challenge: credential_status.go.)
+//
 //   4.  `rest.InClusterConfig()` — InternalError on error.
 //
 //      (Steps 1-4 are byte-identical to upstream; the early `return`s
@@ -155,6 +165,17 @@ const PinnedPlumbingVersion = "v1.15.1"
 func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// #1054 — the auth phase of the request's slow-call record: JWT
+			// validation plus the clientconfig lookup (and its apiserver
+			// re-read on a miss). It ends before the next handler runs.
+			auth := slowcall.Start(req.Context(), slowcall.PhaseAuth)
+			authOpen := true
+			defer func() {
+				if authOpen {
+					auth.End()
+				}
+			}()
+
 			// Upstream — a missing key source is a wiring bug, surfaced on every
 			// request as an InternalError, before the auth-header check.
 			if keys == nil {
@@ -162,39 +183,51 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				return
 			}
 
-			// Upstream :22-26 — Authorization header presence.
+			// Upstream :22-26 — Authorization header presence. #1076 — the
+			// 401 keeps upstream's six Status fields and message, and adds
+			// the pre-dispatch cause TokenMissing (credential_status.go).
 			authHeader := req.Header.Get("Authorization")
 			if authHeader == "" {
-				response.Unauthorized(wri, fmt.Errorf("missing authorization header"))
+				tokenMissing(wri, fmt.Errorf("missing authorization header"))
 				return
 			}
 
-			// Upstream :28-32 — Bearer prefix.
+			// Upstream :28-32 — Bearer prefix. #1076 — a header whose scheme
+			// is not Bearer presents no bearer token: TokenMissing, the cause
+			// RefreshAuth gives a non-Bearer header with no session cookie.
 			parts := strings.SplitN(authHeader, " ", 2)
 			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-				response.Unauthorized(wri, fmt.Errorf("invalid authorization header format"))
+				tokenMissing(wri, fmt.Errorf("invalid authorization header format"))
 				return
 			}
 
-			// Upstream :34-42 — jwtutil.ValidateWithKeySource. Both expired +
-			// generic-invalid branches go to Unauthorized; we preserve the
-			// if/else shape verbatim so a future divergence in upstream is loud
-			// at audit time even if the observable behaviour is identical today.
+			// #1076 — `Bearer ` with an empty token presents no token either:
+			// TokenMissing, as RefreshAuth treats an empty bearer. Upstream
+			// hands "" to the validator, which answers ErrTokenInvalid; the
+			// message (one of the six plumbing fields) stays upstream's.
+			if parts[1] == "" {
+				tokenMissing(wri, jwtutil.ErrTokenInvalid)
+				return
+			}
+
+			// Upstream :34-42 — jwtutil.ValidateWithKeySource. Upstream answers
+			// the expired and the generic-invalid branch alike with a plain
+			// Unauthorized. #1076 — snowplow keeps that 401, its six Status
+			// fields and its message, and adds the cause jwtutil's typed error
+			// names: ErrTokenExpired → TokenExpired, anything else →
+			// TokenInvalid (tokenRejected).
 			userInfo, err := jwtutil.ValidateWithKeySource(keys, parts[1])
 			if err != nil {
 				// Upstream — an unresolvable key (JWKS unreachable, unknown
 				// kid) is OUR failure, not a bad credential: 503 so the client
 				// retries instead of re-authenticating against an authn that is
-				// merely down.
+				// merely down. It carries no cause (#1076: an unknown kid can
+				// be told apart only once krateo-platformops/plumbing#63 lands).
 				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				if errors.Is(err, jwtutil.ErrTokenExpired) {
-					response.Unauthorized(wri, err)
-				} else {
-					response.Unauthorized(wri, err)
-				}
+				tokenRejected(wri, err)
 				return
 			}
 
@@ -266,10 +299,11 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// #1029 — the NotFound 401 carries a machine-readable
 					// cause chosen from the same validated groups that chose
 					// the Secret (StepUpRequired + the RFC 9470 challenge for
-					// a krateo:loa:2 token, SessionCredentialMissing
-					// otherwise). Its kind/apiVersion/status/message/reason/
-					// code are byte-identical to upstream's. Any other
-					// re-read error stays upstream's 500, with no cause.
+					// a krateo:loa:2 token, SessionCredentialMissing + the
+					// RFC 6750 invalid_token challenge otherwise, #1076). Its
+					// kind/apiVersion/status/message/reason/code are
+					// byte-identical to upstream's. Any other re-read error
+					// stays upstream's 500, with no cause.
 					if apierrors.IsNotFound(ferr) {
 						credentialMissing(wri, userInfo.Groups, ferr)
 						return
@@ -287,6 +321,9 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
 			)
+
+			authOpen = false
+			auth.End()
 
 			// Upstream :68 — chain to next handler.
 			next.ServeHTTP(wri, req.WithContext(ctx))

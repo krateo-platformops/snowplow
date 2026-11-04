@@ -54,6 +54,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -197,7 +198,9 @@ type demandTemplate struct {
 var demandTemplates sync.Map // L1 key → *demandTemplate
 
 func setDemandTemplate(key string, req *http.Request) *demandTemplate {
-	clone := req.Clone(context.WithoutCancel(req.Context()))
+	// #1054 — the clone outlives the request it copies: its attempts' time is
+	// not that request's slow-call record.
+	clone := req.Clone(slowcall.Detach(context.WithoutCancel(req.Context())))
 	v, _ := demandTemplates.LoadOrStore(key, &demandTemplate{})
 	t := v.(*demandTemplate)
 	t.mu.Lock()

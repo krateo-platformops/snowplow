@@ -59,6 +59,49 @@ func TestIssue1112_D2_A_ExternalPathIsNotJudgedByTheApiserverShapeGuard(t *testi
 	}
 }
 
+// A2 — the collapse refusal applies to EVERY dial: a named ref to a spoke
+// apiserver (cluster-compositions' `<name>-endpoint`) with an empty namespace
+// would read every namespace, and an empty last segment on a DELETE would be a
+// collection delete. Only the Kubernetes name-validity check is own-cluster
+// only (A above: `Ab_12` is sent).
+func TestIssue1112_D2_A2_NamedRefCollapsedPathIsRefused(t *testing.T) {
+	const base = "/apis/composition.krateo.io/v1alpha1/namespaces/"
+	for _, tc := range []struct {
+		name, verb, path string
+		write            bool
+	}{
+		{"write_empty_namespace", http.MethodPut, `${ "` + base + `" + .ns + "/fireworksapps/demo" }`, true},
+		{"delete_empty_name_trailing_slash", http.MethodDelete, `${ "` + base + `team-a/fireworksapps/" + .ns }`, true},
+		{"read_empty_namespace", http.MethodGet, `${ "` + base + `" + .ns + "/fireworksapps" }`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spoke := newX1106Srv(t, false, x1106OK)
+			x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(spoke.srv.URL)})
+			s := x1106Write("s", tc.verb, tc.path)
+			if !tc.write {
+				s = x1106Stage("s", tc.verb, tc.path)
+			}
+			o := x1106Resolve(t, map[string]any{"ns": "", "text": x1106Body}, s)
+			if hits := spoke.all(); len(hits) != 0 {
+				t.Fatalf("RED: the collapsed path was dialled on the named endpoint: %s %s", hits[0].Method, hits[0].Path)
+			}
+			if tc.write {
+				x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+			}
+		})
+	}
+	// Control: the same named endpoint with a rendered namespace and a
+	// Zendesk-shaped id is sent.
+	spoke := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(spoke.srv.URL)})
+	o := x1106Resolve(t, map[string]any{"ns": "team-a", "id": "Ab_12", "text": x1106Body},
+		x1106Write("s", http.MethodPut, `${ "/api/v2/tickets/" + .id }`),
+		x1106Write("t", http.MethodPut, `${ "`+base+`" + .ns + "/fireworksapps/demo" }`))
+	if n := len(spoke.all()); n != 2 || o.outcomes != "[]" {
+		t.Fatalf("control: both well-formed writes are sent (%d sent, header %s)", n, o.outcomes)
+	}
+}
+
 func TestIssue1112_D2_B_OwnClusterGuardRefusalFailsTheWrite(t *testing.T) {
 	api := newX1106Srv(t, false, x1106OK)
 	x1106Env(t, api.srv.URL, map[string]map[string]string{})
@@ -174,7 +217,7 @@ func TestIssue1112_D2_F_ReadSkipFails_EmptyIteratorWriteSucceeds(t *testing.T) {
 	})
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
 	// #1116: a read's template skip is no longer silent: nothing is sent, and
-	// the stage fails with its reason (reserved_extras_1116 read-skip arms).
+	// the stage fails with its reason (refused_read_1116_test.go).
 	read := x1106Stage("r", http.MethodGet, `${ "/zd/tickets/" + (.ticketId|tonumber|tostring) }`)
 	o := x1106Resolve(t, map[string]any{"ticketId": "abc"}, read)
 	if len(ep.all()) != 0 {

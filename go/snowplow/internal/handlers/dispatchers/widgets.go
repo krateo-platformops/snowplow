@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/rest"
 )
 
@@ -226,6 +227,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 						contentKey, true, entry.SeededAtBoot, len(gated))
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
+					// #1062 — an armed hit on a dirty shared shell is an l1 stale
+					// serve, timed until its replacing frame is written.
+					cache.NoteStaleHit(req.Context(), contentKey, entry, staleSubjectOf)
 					writeResolvedJSON(wri, gated)
 					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
 					// instantly (counted in the Get funnel) and revalidated in the
@@ -274,7 +278,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -290,7 +294,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// never fire. entry.ExternalTTL is false for every normal entry →
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
-			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			staleHitWritePoint(req.Context(), cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -340,7 +344,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		defer cache.Deps().ReleaseUnstored(ctx, cacheKey) // #890/#893 — see restactions.go
 		// #710 PR-2b — armable response: its resolve may be served a known-stale
 		// content cell at once (D2); see restactions.go.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level widget as an ancestor of the
 	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).
@@ -409,6 +413,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Extras:  extras,
 	})
 	if err != nil {
+		// #1116 — the request's extras name a key the widget's apiRef
+		// RESTAction writes itself: the same 400 a RESTAction /call answers,
+		// naming the keys. Rendered before the ERROR line below: the refusal
+		// is a client error, already logged once at WARN where it was decided
+		// (api.RefuseReservedExtras), and nothing was read or dialled, so
+		// there is no stale-derived pass to withdraw.
+		if WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh
 		// (twin of restactions.go).
 		if staleWritePoint(r, wri, req, staleSink, false) {
@@ -445,7 +458,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		)
 	}
 
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
 		log.Error("unable to encode widget response", slog.Any("err", err))
 		response.InternalError(wri, err)
