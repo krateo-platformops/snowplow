@@ -119,6 +119,7 @@ func BindRequestBudget(ctx context.Context, rc *rest.Config) *rest.Config {
 		return rc
 	}
 	cp := rest.CopyConfig(rc)
+	noClientRateLimit(cp) // #920: a config credhttp returns never carries a client-side limiter
 	// The bound wrapper enforces too (BudgetTransport under it), so the copy is
 	// bounded even if rc was not hardened; a hardened one does not apply it twice.
 	cp.Wrap(func(rt http.RoundTripper) http.RoundTripper { return &boundBudget{next: BudgetTransport(rt), b: b} })
