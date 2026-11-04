@@ -413,6 +413,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Extras:  extras,
 	})
 	if err != nil {
+		// #1116 — the request's extras name a key the widget's apiRef
+		// RESTAction writes itself: the same 400 a RESTAction /call answers,
+		// naming the keys. Rendered before the ERROR line below: the refusal
+		// is a client error, already logged once at WARN where it was decided
+		// (api.RefuseReservedExtras), and nothing was read or dialled, so
+		// there is no stale-derived pass to withdraw.
+		if WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh
 		// (twin of restactions.go).
 		if staleWritePoint(r, wri, req, staleSink, false) {
