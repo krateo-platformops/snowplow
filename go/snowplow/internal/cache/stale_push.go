@@ -40,7 +40,10 @@
 // authenticated user's (SubscribeRefreshStreamAs). A frame written on a stream
 // closes only the serves of the SAME (key, subject): one user's frame never
 // closes another user's stale serve, so a client left stranded (#1081) is
-// visible as unreplaced, not hidden as someone else's push.
+// visible as unreplaced, not hidden as someone else's push. The grain is the
+// USER, not the tab: two tabs of one user are one client, so a strand on the
+// second tab is hidden while the first is pushed (the server cannot tell tabs
+// apart without a client-supplied tab id, i.e. client coordination).
 //
 // # WHEN IT IS REPLACED (one rule for every layer)
 //
@@ -276,21 +279,22 @@ func stalePushCapacity() int {
 
 // ── serves ───────────────────────────────────────────────────────────────────
 
-// NoteStaleHit records the stale serve of an ARMED customer L1 hit on key for
-// the requester subject (StaleSubject), if entry's bytes are stale: a
-// stale-derived body (apistage), else a cell with a dirty stamp (l1). Call it
-// at the hit's write point, only when the refresh key header was stamped.
-// Nil-safe.
-func NoteStaleHit(key, subject string, entry *ResolvedEntry) {
-	if key == "" || entry == nil {
+// NoteStaleHit records the stale serve of an ARMED customer L1 hit on key, if
+// entry's bytes are stale: a stale-derived body (apistage), else a cell with a
+// dirty stamp (l1). Call it at the hit's write point, only when the refresh key
+// header was stamped. subjectOf derives the requester's subject (StaleSubject)
+// from ctx; it is called ONLY when a serve opens, so a fresh hit — nearly every
+// hit — pays one sync.Map load and no digest. Nil-safe.
+func NoteStaleHit(ctx context.Context, key string, entry *ResolvedEntry, subjectOf func(context.Context) string) {
+	if key == "" || entry == nil || subjectOf == nil {
 		return
 	}
 	st, dirty := dirtyStampFor(key)
 	switch {
 	case entry.StaleDerived:
-		noteStaleServe(key, subject, layerAPIStage, StalePushNow(), st)
+		noteStaleServe(key, subjectOf(ctx), layerAPIStage, StalePushNow(), st)
 	case dirty:
-		noteStaleServe(key, subject, layerL1, StalePushNow(), st)
+		noteStaleServe(key, subjectOf(ctx), layerL1, StalePushNow(), st)
 	}
 }
 

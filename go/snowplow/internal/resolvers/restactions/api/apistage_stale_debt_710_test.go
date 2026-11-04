@@ -125,8 +125,15 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 // customer reads the list as a customer of an ARMABLE resolve producing l1Key.
 func (f *d2Fixture) customer(t *testing.T, l1Key string) (any, *cache.StaleServeSink) {
 	t.Helper()
+	return f.customerAs(t, l1Key, "")
+}
+
+// customerAs is customer for the requester subject (#1062: the D2 sink carries
+// it to the stale-push ledger, which pairs the serve with that user's stream).
+func (f *d2Fixture) customerAs(t *testing.T, l1Key, subject string) (any, *cache.StaleServeSink) {
+	t.Helper()
 	// As the dispatchers do: the L1 key is scoped first, then the sink on it.
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions", "")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions", subject)
 	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("customer read not served: ok=%v served=%v err=%v", ok, s, err)
@@ -152,7 +159,13 @@ func (f *d2Fixture) putDependent(l1Key string) {
 // at the write, not at the offer.
 func d2WrittenStream(t *testing.T, l1Key string) <-chan string {
 	t.Helper()
-	st := cache.SubscribeRefreshStream(map[string]struct{}{l1Key: {}})
+	return d2WrittenStreamAs(t, "", l1Key)
+}
+
+// d2WrittenStreamAs is d2WrittenStream for the stream of subject.
+func d2WrittenStreamAs(t *testing.T, subject, l1Key string) <-chan string {
+	t.Helper()
+	st := cache.SubscribeRefreshStreamAs(subject, map[string]struct{}{l1Key: {}})
 	out := make(chan string, 64)
 	done := make(chan struct{})
 	go func() {
@@ -555,6 +568,37 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 			t.Fatalf("D2-16 (#1062): apistage unreplaced=%d pushed=%d open=%d, want 1/1/0 (a 12 s push is past the 10 s max)",
 				l.Unreplaced, l.Closes["pushed"], l.Open)
 		}
+	}
+}
+
+// D2-16s — #1062 (re-review P9): the D2 sink carries its REQUESTER to the
+// stale-push ledger. A committed apistage serve of user X, with X's own stream
+// armed: the replacement's frame written on X's stream closes X's serve (one
+// sample, nothing open). Cross-user isolation itself is pinned by the cache
+// arms (RX2, NSX); this arm pins the propagation from the sink. (A stream of
+// another user cannot be shown not to close it here: any arm or delivery of the
+// key consumes the per-KEY D2 owed mark — the per-client owed push is #1081.)
+// Mutation → RED: the sink's Commit opens the serve without the subject.
+func TestStale710_D2_16s_TheCommittedServeIsPairedWithItsRequestersStream(t *testing.T) {
+	f := newD2Fixture(t)
+	const x = "user:d2-16s"
+	mine := d2WrittenStreamAs(t, x, "dep-16s")
+	f.customerAs(t, "dep-16s", x)
+	f.storeAndCommit("dep-16s")
+	d2Push(t, mine, "dep-16s", 10*time.Second)
+	apistage := func() cache.StalePushLayerStats {
+		for _, l := range cache.StalePushStatsSnapshot() {
+			if l.Layer == cache.StaleLayerAPIStage {
+				return l
+			}
+		}
+		return cache.StalePushLayerStats{}
+	}
+	if !fill710WaitFor(10*time.Second, func() bool { return apistage().Closes["pushed"] == 1 }) {
+		t.Fatalf("D2-16s RED: X's own frame did not close X's committed serve (%+v) — the sink lost its requester", apistage())
+	}
+	if l := apistage(); l.Serves != 1 || l.Open != 0 || l.ToPush.Count != 1 {
+		t.Fatalf("D2-16s: serves=%d open=%d samples=%d, want 1/0/1", l.Serves, l.Open, l.ToPush.Count)
 	}
 }
 

@@ -307,7 +307,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			setStoredStageOutcomesHeader(wri, entry) // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
-			staleHitWritePoint(cacheKey, entry, true, staleSubjectOf(req.Context()))
+			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,

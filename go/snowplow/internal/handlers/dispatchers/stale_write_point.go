@@ -65,14 +65,14 @@ func isStaleRerun(req *http.Request) bool {
 // needs the key's owed-push mark. #1062: an ARMED hit whose bytes are stale —
 // stale-derived (apistage) or on a dirty-stamped cell (l1) — is a stale serve
 // timed until its replacing frame is written to the REQUESTER's stream
-// (cache.NoteStaleHit). armed is whether this hit stamped the refresh-key
-// header; subject is the requester (staleSubjectOf).
-func staleHitWritePoint(key string, entry *cache.ResolvedEntry, armed bool, subject string) {
+// (cache.NoteStaleHit; the requester's digest is derived from ctx only when a
+// serve opens). armed is whether this hit stamped the refresh-key header.
+func staleHitWritePoint(ctx context.Context, key string, entry *cache.ResolvedEntry, armed bool) {
 	if entry != nil && entry.StaleDerived {
 		cache.MarkStaleOwed(key)
 	}
 	if armed {
-		cache.NoteStaleHit(key, subject, entry)
+		cache.NoteStaleHit(ctx, key, entry, staleSubjectOf)
 	}
 }
 
