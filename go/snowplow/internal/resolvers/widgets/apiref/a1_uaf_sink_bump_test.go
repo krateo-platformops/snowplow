@@ -21,8 +21,12 @@
 //   - THIS one is DECLARATION-based and fires whenever an apiRef'd RA declares a
 //     UAF stage, including when the refilter then narrows nothing (an empty
 //     result is still requester-dependent);
-//   - THAT one is EXECUTION-based and fires wherever a refilter actually runs,
-//     including RA→RA chains that never pass through apiref.
+//   - THAT one is EXECUTION-based and marks the ctx the refilter runs under,
+//     which includes an in-process RA→RA chain (a direct apiserver path with
+//     `resolve: true`) that never passes through apiref. An HTTP self-loopback
+//     child (a named snowplow endpoint calling /call, the shape of TestM1's
+//     fixture below) is its own request and marks only its own sink; there
+//     the outer Put is declined by the external-touched gate instead.
 // Double-bumping is harmless — every gate reads Count()>0, never an exact count.
 
 package apiref

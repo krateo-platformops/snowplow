@@ -203,11 +203,18 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution, and
-	// this bump is what covers the chain: a nested child's refilter runs under
-	// the outer resolve's ctx, so it marks the outer sink whatever the parent
-	// declares. Pinned by TestA4_RefilterBumpsUAFTouchedSink; the declaration
-	// limb's blindness by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed
@@ -947,11 +954,18 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution, and
-	// this bump is what covers the chain: a nested child's refilter runs under
-	// the outer resolve's ctx, so it marks the outer sink whatever the parent
-	// declares. Pinned by TestA4_RefilterBumpsUAFTouchedSink; the declaration
-	// limb's blindness by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed

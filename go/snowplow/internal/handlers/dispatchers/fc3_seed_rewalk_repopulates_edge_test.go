@@ -11,9 +11,9 @@
 // #279 is fixed (closed 2026-09-30): that branch now records the LIST edge from
 // the path skeleton (cache.ParseAPIServerListDepSkeleton), pinned by
 // TestFC3_IteratorEmpty_RecordsFannedListEdge (restactions/api). The residual
-// is a path whose version or resource is templated: the skeleton parser returns
-// ok=false, no edge is recorded, and the seed re-walk below is still what
-// re-populates it.
+// is a path whose version or resource is templated, or a namespaced resource
+// whose namespace is templated: the skeleton parser returns ok=false, no edge
+// is recorded, and the seed re-walk below is still what re-populates it.
 //
 // WHAT THIS GUARD PINS (not a fix — a regression fence). The mitigation for
 // that residual is the seed RE-WALK: the GVR-discovered re-prewarm (prewarm_engine_boot.go's

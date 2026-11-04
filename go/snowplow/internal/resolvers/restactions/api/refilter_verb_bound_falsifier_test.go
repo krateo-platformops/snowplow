@@ -396,9 +396,15 @@ func ptrToString(s string) *string { return &s }
 // UAFTouchedSink.Count()>0. The apiref chokepoint bump
 // (internal/resolvers/widgets/apiref) is DECLARATION-based and therefore blind
 // to a chain — a parent RA declaring no UAF whose inner step consumes a UAF
-// child. Only the bump at the refilter itself observes execution, so this arm
-// is what pins the chain's coverage: without the bump, nothing in the code
-// would mark a nested child's narrowed rows.
+// child. Only the bump at the refilter itself observes execution.
+//
+// SCOPE: this arm pins that a refilter run marks THE CTX IT RUNS UNDER, nothing
+// more. It does not drive a nested resolve. For an in-process nested child
+// (a direct apiserver path with `resolve: true`) that ctx is the outer
+// resolve's, so the bump reaches the outer sink — but no arm drives that case
+// against a sink. For an HTTP self-loopback child (a named snowplow endpoint
+// calling /call) the ctx is the child request's own, and the outer Put is
+// declined by the external-touched gate instead.
 //
 // RED without the bump: the sink reads 0 while the refilter demonstrably ran and
 // narrowed the body, so a downstream Put site would cache requester-specific

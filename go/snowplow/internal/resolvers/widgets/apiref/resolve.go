@@ -229,20 +229,31 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	//
 	// THE DECLARATION LIMB, ONE OF TWO. The refilter has its own,
 	// execution-based bump (cache.BumpUAFTouched at the top of
-	// applyUserAccessFilterOnPig, internal/resolvers/restactions/api/refilter.go,
-	// pinned by TestA4_RefilterBumpsUAFTouchedSink). Both shipped in 1.12.3
-	// (PR #173). The nested-chain case — a parent RA that declares nothing but
-	// consumes a UAF child — is invisible to THIS bump (pinned by
-	// TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package) and is
-	// covered by the refilter's bump, which fires under the outer resolve's ctx.
-	// The two bumps are COMPLEMENTARY, not duplicates, and both are wanted:
+	// applyUserAccessFilterOnPig, internal/resolvers/restactions/api/refilter.go;
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under). Both shipped
+	// in 1.12.3 (PR #173). The nested-chain case — a parent RA that declares
+	// nothing but consumes a UAF child — is invisible to THIS bump (pinned by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package). What
+	// covers it depends on the shape:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under the outer resolve's ctx, so the refilter's bump
+	//     marks the outer sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call — TestM1's
+	//     fixture shape): the child is a separate request and the refilter's
+	//     bump marks only that request's sink. The outer Put is declined by the
+	//     external-touched gate instead (the dial bumps the ExternalTouchedSink),
+	//     except for a widget that opts into
+	//     krateo.io/external-cache-ttl-seconds, whose verdict turns an
+	//     external-only decline into a store.
+	// The two UAF bumps are COMPLEMENTARY, not duplicates, and both are wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
 	//     empty result set still means the body is requester-dependent), and even
 	//     if a future short-circuit skips the refilter for some input.
 	//   - THE REFILTER'S bump is execution-based and fires wherever a refilter
-	//     actually runs, including chains this frame never sees (a nested RA→RA
-	//     hop that does not pass through apiref).
+	//     actually runs under this ctx, including an in-process nested RA→RA
+	//     hop that does not pass through apiref.
 	// Double-bumping is harmless: the gate reads Count()>0, never an exact count.
 	//
 	// No-op when no sink is installed on ctx (BumpUAFTouched is nil-safe), so

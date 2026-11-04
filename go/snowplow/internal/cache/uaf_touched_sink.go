@@ -16,14 +16,28 @@
 // A subtler case has the same shape: a NON-UAF RESTAction that NESTS a UAF one.
 // Its own spec declares no userAccessFilter, but its resolved body still
 // contains per-requester-narrowed rows. The declaration bump inspects the
-// PARENT, which declares nothing, so it cannot see this case. The
-// execution-based bump in the refilter itself (limb 2 below) does: the nested
-// resolve runs in-process under the outer resolve's ctx (resolve_inprocess.go),
-// so the child's refilter bumps the outer sink. The declaration limb's
-// blindness is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild
-// (apiref package); that a refilter run marks the resolve is asserted by
-// TestA4_RefilterBumpsUAFTouchedSink (internal/resolvers/restactions/api),
-// which drives the real refilter.
+// PARENT, which declares nothing, so it cannot see this case
+// (TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package). What does
+// depends on HOW the parent reaches the child — there are two shapes:
+//   - IN-PROCESS nesting: a step whose path is the child CR's direct apiserver
+//     path, with `resolve: true` (resolve_inprocess.go). The child resolves
+//     under the outer resolve's ctx (dispatchers.ResolveNestedCall installs no
+//     sink of its own), so the child's refilter bumps THIS sink — the
+//     execution-based limb (2) below.
+//   - HTTP SELF-LOOPBACK: a step that calls snowplow's own /call through a
+//     named snowplow endpoint (the composition-resources shape, and TestM1's
+//     fixture). The child is a separate request with its own sinks; its
+//     refilter bumps only those, never this one. The outer Put is declined
+//     instead by the EXTERNAL-touched gate: the dial is a branch-E send, which
+//     bumps the ExternalTouchedSink (restactions/api resolve.go) and
+//     PutGateVerdict declines a genuine external touch. EXCEPTION: a widget
+//     that opts into krateo.io/external-cache-ttl-seconds turns an
+//     external-only decline into a store (PutVerdict.WithExternalTTL, under the
+//     per-binding widgets key for at most 120 s), so for that widget nothing in
+//     this file declines the loopback chain.
+// That a refilter run marks the ctx it runs under is asserted by
+// TestA4_RefilterBumpsUAFTouchedSink (internal/resolvers/restactions/api). No
+// arm drives a nested in-process resolve against a sink.
 //
 // THE MECHANISM (mirrors StageErrorSink / ExternalTouchedSink exactly — the
 // established idiom for "something happened DOWN the resolve that the Put site
@@ -54,16 +68,20 @@
 //     entry point (applyUserAccessFilterOnPig,
 //     internal/resolvers/restactions/api/refilter.go), and symmetrically in its
 //     dead twin applyUserAccessFilter. It fires before any item is evaluated, so
-//     a refilter that keeps nothing still marks the resolve. Pinned by
+//     a refilter that keeps nothing still marks the resolve. That a refilter
+//     run marks the ctx it runs under is pinned by
 //     TestA4_RefilterBumpsUAFTouchedSink.
 //
 // WHY BOTH, AND WHY (2) IS NOT OPTIONAL. (1) inspects the RA the apiRef names.
 // It is therefore BLIND to a chain: a parent RA that declares nothing but whose
 // inner step consumes a UAF child (TestM1_DeclarationLimbIsBlindToNestedUAFChild
-// pins that blindness). The chain is covered by (2): the child's refilter runs
-// under the outer resolve's ctx and bumps its sink, whatever the parent
-// declares. The coverage comes from the code, not from what the live RAs happen
-// to look like.
+// pins that blindness). (2) covers the chain only when the child resolves
+// IN-PROCESS (a direct apiserver path with `resolve: true`): its refilter runs
+// under the outer resolve's ctx and bumps this sink, whatever the parent
+// declares. An HTTP self-loopback child (a named snowplow endpoint calling
+// /call) runs as its own request and bumps only its own sink; the outer Put is
+// declined by the external-touched gate instead, except for a widget that opts
+// into the external-TTL cache (see "A subtler case" above).
 //
 // NO SINGLE HERMETIC ARM SPANS THE WHOLE CHAIN, and an earlier attempt to write
 // one was wrong (it seamed away the resolver and asserted on its own simulation,

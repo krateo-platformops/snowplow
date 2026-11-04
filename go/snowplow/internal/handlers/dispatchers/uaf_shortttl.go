@@ -348,13 +348,22 @@ const (
 	//   - a widget whose apiRef'd RA declares the UAF several resolver frames
 	//     down (the R-1 hot carrier) — covered by apiref.Resolve's declaration
 	//     bump, and by the refilter's own bump when that RA's refilter runs;
-	//   - a non-UAF RA that NESTS a UAF one — covered by the refilter's
-	//     execution-based bump (applyUserAccessFilterOnPig, present since
-	//     1.12.3), which fires under the outer resolve's ctx when the child's
-	//     refilter runs. The declaration bump cannot see this case, because it
-	//     inspects the RA the apiRef names and that one declares nothing
-	//     (asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref
-	//     package). The refilter bump's arm is TestA4_RefilterBumpsUAFTouchedSink.
+	//   - a non-UAF RA that NESTS a UAF one IN-PROCESS (a direct apiserver path
+	//     with `resolve: true`) — covered by the refilter's execution-based
+	//     bump (applyUserAccessFilterOnPig, present since 1.12.3), which fires
+	//     under the outer resolve's ctx when the child's refilter runs. The
+	//     declaration bump cannot see this case, because it inspects the RA the
+	//     apiRef names and that one declares nothing (asserted by
+	//     TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package).
+	//     TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the
+	//     ctx it runs under; no arm drives the nested in-process case.
+	// NOT reached: a non-UAF RA that reaches a UAF child through an HTTP
+	// SELF-LOOPBACK (a named snowplow endpoint calling /call). The child is a
+	// separate request and bumps only its own sink, so this reason never fires
+	// for the outer cell. That Put is declined by the external-touched verdict
+	// (cache.PutGateVerdict) instead — except for a widget that opts into
+	// krateo.io/external-cache-ttl-seconds, whose WithExternalTTL turns the
+	// external-only decline into a store.
 	// Read this constant as "something marked the resolve", never as "every
 	// narrowed shape is marked".
 	uafDeclineObserved = "observed_refilter"
