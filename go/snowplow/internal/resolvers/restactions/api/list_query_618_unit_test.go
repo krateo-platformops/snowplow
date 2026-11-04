@@ -258,7 +258,8 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 	notServing := map[string]string{
 		"callWantsWireDump":                  "wire-dump verbosity decision only",
 		"k8sListGVR":                         "E6 normalisation flag only (#674): is the response a list envelope, of which GVR; serves and keys nothing",
-		"dispatchOneCall":                    "sensitive-resource check only (cache.IsSensitiveResource); no serve",
+		"dispatchOneCall":                    "sensitive-resource check (cache.IsSensitiveResource), and #1124: the resource the stage's items are objects of, for the userAccessFilter refilter's per-object check; no serve",
+		"applyUserAccessFilter":              "#1124: the resource the stage's items are objects of, for the userAccessFilter refilter's per-object check; serves and keys nothing",
 		"runStage":                           "dep-edge record — a selector LIST depends on the same (gvr, ns) list edge (over-approximation is safe)",
 		"gateContentEnvelope":                "gates an envelope apistageContentServe already classified and keyed",
 		"maybeResolveInProcess":              "GET-by-name of a RESTAction/Widget only; a query on a GET falls through earlier (query_on_get)",
