@@ -227,23 +227,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// declaration is visible at all. Bumping here makes the sink non-empty for the
 	// whole enclosing widget resolve, so the widget's Put declines.
 	//
-	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
-	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
-	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
-	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
-	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
-	// the ONLY one, which leaves the nested-chain case open — the blindness is
-	// asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package,
-	// and the refilter's own marking by TestA4_RefilterBumpsUAFTouchedSink in
-	// internal/resolvers/restactions/api. The two bumps are COMPLEMENTARY, not
-	// duplicates, and both are wanted:
+	// THE DECLARATION LIMB, ONE OF TWO. The refilter has its own,
+	// execution-based bump (cache.BumpUAFTouched at the top of
+	// applyUserAccessFilterOnPig, internal/resolvers/restactions/api/refilter.go,
+	// pinned by TestA4_RefilterBumpsUAFTouchedSink). Both shipped in 1.12.3
+	// (PR #173). The nested-chain case — a parent RA that declares nothing but
+	// consumes a UAF child — is invisible to THIS bump (pinned by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package) and is
+	// covered by the refilter's bump, which fires under the outer resolve's ctx.
+	// The two bumps are COMPLEMENTARY, not duplicates, and both are wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
 	//     empty result set still means the body is requester-dependent), and even
 	//     if a future short-circuit skips the refilter for some input.
-	//   - THEIR bump is execution-based and fires wherever a refilter actually
-	//     runs, including chains this frame never sees (a nested RA→RA hop that
-	//     does not pass through apiref).
+	//   - THE REFILTER'S bump is execution-based and fires wherever a refilter
+	//     actually runs, including chains this frame never sees (a nested RA→RA
+	//     hop that does not pass through apiref).
 	// Double-bumping is harmless: the gate reads Count()>0, never an exact count.
 	//
 	// No-op when no sink is installed on ctx (BumpUAFTouched is nil-safe), so

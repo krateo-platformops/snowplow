@@ -13,11 +13,11 @@
 // (feedback_falsifier_must_actually_run_under_gate_tag_env — a gate that is
 // never driven does not guard anything, and a green suite would not say so).
 //
-// SCOPE NOTE. A second, complementary bump belongs at the top of the live
-// refilter entry point (applyUserAccessFilterOnPig,
-// internal/resolvers/restactions/api/refilter.go), is owned by another dev, and
-// IS NOT ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening and is a hard
-// tag condition. The two are not duplicates:
+// SCOPE NOTE. A second, complementary bump sits at the top of the live refilter
+// entry point (applyUserAccessFilterOnPig,
+// internal/resolvers/restactions/api/refilter.go); its arm is
+// TestA4_RefilterBumpsUAFTouchedSink in that package. Both shipped in 1.12.3
+// (PR #173). The two are not duplicates:
 //   - THIS one is DECLARATION-based and fires whenever an apiRef'd RA declares a
 //     UAF stage, including when the refilter then narrows nothing (an empty
 //     result is still requester-dependent);
@@ -41,9 +41,9 @@ import (
 // TestA1_ApirefBumpsUAFSink_ForDeclaringRAOnly drives the REAL predicate-to-bump
 // wiring apiref.Resolve calls, against a REAL sink on ctx.
 //
-// RED on origin/main: bumpUAFSinkIfDeclared does not exist there, and nothing at
-// the apiRef chokepoint marks the resolve — so the widgets Put-gate never fires
-// and R-1 stays open.
+// RED before 1.12.3 (PR #173): bumpUAFSinkIfDeclared did not exist, and nothing
+// at the apiRef chokepoint marked the resolve — so the widgets Put-gate never
+// fired and R-1 was open.
 func TestA1_ApirefBumpsUAFSink_ForDeclaringRAOnly(t *testing.T) {
 	uafRA := &templatesv1.RESTAction{Spec: templatesv1.RESTActionSpec{
 		Filter: ptr.To(raSliceJQ),

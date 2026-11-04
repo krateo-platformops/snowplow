@@ -13,16 +13,17 @@
 // and that widgets cell served 298,064 hits against 365 misses over 5d7h. It is
 // THE hot carrier; gating only the RA was gating the cold path.
 //
-// A subtler case has the same shape and is NOT yet closed on this branch: a
-// NON-UAF RESTAction that NESTS a UAF one. Its own spec declares no
-// userAccessFilter, but its resolved body still contains per-requester-narrowed
-// rows. The sink is the right MECHANISM for it — but only once something bumps
-// it on that path, and the declaration bump present here inspects the PARENT,
-// which declares nothing. That case is closed by the refilter bump described
-// below. The blindness itself is asserted by
-// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref package); that the
-// refilter DOES mark a resolve is asserted by TestA4_RefilterBumpsUAFTouchedSink
-// (internal/resolvers/restactions/api), which drives the real refilter.
+// A subtler case has the same shape: a NON-UAF RESTAction that NESTS a UAF one.
+// Its own spec declares no userAccessFilter, but its resolved body still
+// contains per-requester-narrowed rows. The declaration bump inspects the
+// PARENT, which declares nothing, so it cannot see this case. The
+// execution-based bump in the refilter itself (limb 2 below) does: the nested
+// resolve runs in-process under the outer resolve's ctx (resolve_inprocess.go),
+// so the child's refilter bumps the outer sink. The declaration limb's
+// blindness is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild
+// (apiref package); that a refilter run marks the resolve is asserted by
+// TestA4_RefilterBumpsUAFTouchedSink (internal/resolvers/restactions/api),
+// which drives the real refilter.
 //
 // THE MECHANISM (mirrors StageErrorSink / ExternalTouchedSink exactly — the
 // established idiom for "something happened DOWN the resolve that the Put site
@@ -41,27 +42,28 @@
 // So the seed keeps its pre-resolve declaration skip and every Put site consults
 // both. Either one firing declines.
 //
-// THE TWO BUMP SITES, and their status as of this commit:
+// THE TWO BUMP SITES. Both exist; both shipped in 1.12.3 (PR #173).
 //
-//  1. DECLARATION-BASED, PRESENT on this branch — apiref.Resolve
+//  1. DECLARATION-BASED — apiref.Resolve
 //     (internal/resolvers/widgets/apiref/resolve.go, bumpUAFSinkIfDeclared) fires
 //     when the apiRef'd RESTAction DECLARES a userAccessFilter. This is the
 //     apiRef chokepoint every widget→RESTAction read funnels through, and the
 //     first frame holding the typed RA. It closes the R-1 widgets carrier.
 //
-//  2. EXECUTION-BASED, NOT YET PRESENT HERE — cache.BumpUAFTouched at the top of
-//     the live refilter entry point (applyUserAccessFilterOnPig,
-//     internal/resolvers/restactions/api/refilter.go). That file is owned by
-//     another dev and the bump lands on the sibling branch
-//     fix/1.12.3-authz-hardening. IT IS A HARD TAG CONDITION for 1.12.3.
+//  2. EXECUTION-BASED — cache.BumpUAFTouched at the top of the live refilter
+//     entry point (applyUserAccessFilterOnPig,
+//     internal/resolvers/restactions/api/refilter.go), and symmetrically in its
+//     dead twin applyUserAccessFilter. It fires before any item is evaluated, so
+//     a refilter that keeps nothing still marks the resolve. Pinned by
+//     TestA4_RefilterBumpsUAFTouchedSink.
 //
 // WHY BOTH, AND WHY (2) IS NOT OPTIONAL. (1) inspects the RA the apiRef names.
 // It is therefore BLIND to a chain: a parent RA that declares nothing but whose
-// inner step consumes a UAF child. Only a bump at the refilter itself sees that.
-// Today no live RA forms such a chain (0 of 49 consume the restactions endpoint),
-// so on this branch alone the chain is closed by CORPUS ACCIDENT rather than by
-// the code — one customer CR away from being false, with no admission rule
-// preventing it.
+// inner step consumes a UAF child (TestM1_DeclarationLimbIsBlindToNestedUAFChild
+// pins that blindness). The chain is covered by (2): the child's refilter runs
+// under the outer resolve's ctx and bumps its sink, whatever the parent
+// declares. The coverage comes from the code, not from what the live RAs happen
+// to look like.
 //
 // NO SINGLE HERMETIC ARM SPANS THE WHOLE CHAIN, and an earlier attempt to write
 // one was wrong (it seamed away the resolver and asserted on its own simulation,
@@ -156,12 +158,11 @@ func UAFTouchedSinkFromContext(ctx context.Context) *UAFTouchedSink {
 // BumpUAFTouched records that the resolve under ctx produced a
 // userAccessFilter-narrowed body, against whatever sink ctx carries.
 //
-// THIS IS THE ONE LINE EACH BUMP SITE CALLS. Two call it (see the header):
-// apiref.Resolve's declaration bump, present on this branch; and the refilter's
-// own execution bump at the top of applyUserAccessFilterOnPig
-// (internal/resolvers/restactions/api/refilter.go), which lands on the sibling
-// authz branch and is a hard tag condition. Keeping it a one-liner is what lets
-// either site adopt it without any sink plumbing of its own.
+// THIS IS THE ONE LINE EACH BUMP SITE CALLS. Two sites call it (see the
+// header): apiref.Resolve's declaration bump (bumpUAFSinkIfDeclared), and the
+// refilter's own execution bump at the top of applyUserAccessFilterOnPig
+// (internal/resolvers/restactions/api/refilter.go). Keeping it a one-liner is
+// what lets each site use it without any sink plumbing of its own.
 //
 // No-op when no sink is installed, so it is safe on every path — including tests
 // and refilter.go's dead twin applyUserAccessFilter.

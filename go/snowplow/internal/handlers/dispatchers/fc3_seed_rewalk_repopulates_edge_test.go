@@ -1,16 +1,22 @@
 // fc3_seed_rewalk_repopulates_edge_test.go — #279 F-C3 NO-REGRESSION guard.
 //
-// WHAT C3 IS (the DEFERRED defect, #279 stays OPEN). The iterator-empty
-// short-circuit in the resolver (restactions/api resolve.go — the `len(tmp)==0`
-// / crds.items[]-empty continue): when a stage's iterator evaluates to zero
-// items on a cold first pass (e.g. before a CompositionDefinition's CRD is
-// registered), the stage records NO LIST dep edge. The cell can be warm yet
-// carry no (gvr, ns, "*") edge, so a later CR ADD against that GVR dirty-marks
-// NOTHING → a stale-negative. The close-now fix stays DEFERRED (a narrow,
-// TTL-bounded residual); #279 remains OPEN.
+// WHAT C3 IS. The iterator-empty short-circuit in the resolver
+// (restactions/api resolve.go — the `len(tmp)==0` / crds.items[]-empty
+// continue): when a stage's iterator evaluates to zero items on a cold first
+// pass (e.g. before a CompositionDefinition's CRD is registered), the per-item
+// recorder never runs. Before #279 the stage then recorded NO LIST dep edge, so
+// a warm cell carried no (gvr, ns, "*") edge and a later CR ADD against that
+// GVR dirty-marked NOTHING → a stale-negative.
 //
-// WHAT THIS GUARD PINS (not a fix — a regression fence). The EXISTING mitigation
-// is the seed RE-WALK: the GVR-discovered re-prewarm (prewarm_engine_boot.go's
+// #279 is fixed (closed 2026-09-30): that branch now records the LIST edge from
+// the path skeleton (cache.ParseAPIServerListDepSkeleton), pinned by
+// TestFC3_IteratorEmpty_RecordsFannedListEdge (restactions/api). The residual
+// is a path whose version or resource is templated: the skeleton parser returns
+// ok=false, no edge is recorded, and the seed re-walk below is still what
+// re-populates it.
+//
+// WHAT THIS GUARD PINS (not a fix — a regression fence). The mitigation for
+// that residual is the seed RE-WALK: the GVR-discovered re-prewarm (prewarm_engine_boot.go's
 // "Ship 2 Stage 2" note) re-resolves already-warm cells with NO skip, so the
 // resolve re-runs over the now-populated iterator and re-records the LIST edge.
 // The PM required a no-regression guard so the edge-3 fix (#277/#281) — and the

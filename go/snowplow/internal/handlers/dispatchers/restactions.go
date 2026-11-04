@@ -444,14 +444,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// above. Whatever bumps it, wherever that happens and however many resolver
 	// frames down, the Put-gate below reads Count()>0 and declines.
 	//
-	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
-	// one — its own spec declares no userAccessFilter, so the declaration limb is
-	// blind to it, while its resolved body still carries per-requester-narrowed
-	// rows. That case is NOT closed on this branch: the only bump today is
-	// declaration-based (apiref.Resolve) and inspects the parent — the blindness
-	// is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref). It
-	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
-	// is TestA4_RefilterBumpsUAFTouchedSink.
+	// It is also the mechanism that covers a NON-UAF RESTAction that NESTS a UAF
+	// one — its own spec declares no userAccessFilter, so the declaration limb
+	// (apiref.Resolve) is blind to it (asserted by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref), while its resolved
+	// body still carries per-requester-narrowed rows. The refilter's own
+	// execution-based bump (applyUserAccessFilterOnPig, present since 1.12.3)
+	// fires under this ctx when the nested child's refilter runs, so this sink
+	// is marked. Its arm is TestA4_RefilterBumpsUAFTouchedSink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	// v7 Step 2D — DARK shadow-parity. Install the read-only shadow context (the
 	// cell's identity-free access domain D + this requester's identity + the

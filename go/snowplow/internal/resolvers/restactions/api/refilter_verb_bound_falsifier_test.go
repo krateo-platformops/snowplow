@@ -389,16 +389,16 @@ func TestA4_SameResourceIsTheRealInversion(t *testing.T) {
 // ptrToString is a local helper (the package's ptr import is not in scope here).
 func ptrToString(s string) *string { return &s }
 
-// TestA4_RefilterBumpsUAFTouchedSink — the A-1 hard tag condition, asserted from
-// the file that owns the bump site.
+// TestA4_RefilterBumpsUAFTouchedSink — the A-1 execution-based bump (present
+// since 1.12.3, PR #173), asserted from the file that owns the bump site.
 //
 // The L1 Put-gate declines to cache a userAccessFilter-narrowed body by reading
 // UAFTouchedSink.Count()>0. The apiref chokepoint bump
 // (internal/resolvers/widgets/apiref) is DECLARATION-based and therefore blind
 // to a chain — a parent RA declaring no UAF whose inner step consumes a UAF
-// child. Only the bump at the refilter itself observes execution. Without it the
-// chain is closed by corpus accident (0 of 49 live RAs form one), which is one
-// customer CR away from being false.
+// child. Only the bump at the refilter itself observes execution, so this arm
+// is what pins the chain's coverage: without the bump, nothing in the code
+// would mark a nested child's narrowed rows.
 //
 // RED without the bump: the sink reads 0 while the refilter demonstrably ran and
 // narrowed the body, so a downstream Put site would cache requester-specific

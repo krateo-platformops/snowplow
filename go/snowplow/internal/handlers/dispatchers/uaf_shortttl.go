@@ -344,17 +344,17 @@ const (
 	// TRANSITIVE and declaration-blind, so it reaches shapes the declaration
 	// cannot see from the Put site's own frame.
 	//
-	// WHAT IT ACTUALLY REACHES depends on where the bumps are, and that differs
-	// between this branch and the assembled tree:
+	// WHAT IT REACHES depends on where the bumps are. There are two:
 	//   - a widget whose apiRef'd RA declares the UAF several resolver frames
-	//     down (the R-1 hot carrier) — COVERED HERE, by apiref.Resolve's
-	//     declaration bump;
-	//   - a non-UAF RA that NESTS a UAF one — NOT covered here. No bump fires on
-	//     that path, because the only bump inspects the RA the apiRef names and
-	//     that one declares nothing (asserted by
-	//     TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package). It
-	//     closes with the refilter bump on fix/1.12.3-authz-hardening, whose arm
-	//     is TestA4_RefilterBumpsUAFTouchedSink.
+	//     down (the R-1 hot carrier) — covered by apiref.Resolve's declaration
+	//     bump, and by the refilter's own bump when that RA's refilter runs;
+	//   - a non-UAF RA that NESTS a UAF one — covered by the refilter's
+	//     execution-based bump (applyUserAccessFilterOnPig, present since
+	//     1.12.3), which fires under the outer resolve's ctx when the child's
+	//     refilter runs. The declaration bump cannot see this case, because it
+	//     inspects the RA the apiRef names and that one declares nothing
+	//     (asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref
+	//     package). The refilter bump's arm is TestA4_RefilterBumpsUAFTouchedSink.
 	// Read this constant as "something marked the resolve", never as "every
 	// narrowed shape is marked".
 	uafDeclineObserved = "observed_refilter"
