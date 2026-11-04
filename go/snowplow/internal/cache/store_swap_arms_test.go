@@ -885,6 +885,7 @@ func TestStoreSwap_PerGVRFieldsCoverEveryMap(t *testing.T) {
 		"eagerSet":            "the set of GVRs eager registration covered; not per-informer state",
 		"unservedVersions":    "#807: deliberately OUTLIVES the informer",
 		"retainUnknownWarned": "#217 one-shot WARN episode per GVR; discovery state, not per-informer",
+		"factoryIssued":       "#1146: describes the shared factory's cache, which OUTLIVES every registration",
 	}
 	listed := map[string]bool{}
 	for _, f := range perGVRFields {
