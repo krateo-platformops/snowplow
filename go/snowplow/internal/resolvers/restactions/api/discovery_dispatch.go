@@ -78,8 +78,11 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
+	apidiscoveryv2beta1 "k8s.io/api/apidiscovery/v2beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 )
@@ -264,40 +267,102 @@ func serverResourcesForGroupVersion(ctx context.Context, cli discovery.Discovery
 	return out, nil
 }
 
-// servedVersionsOfGroup is the versions group serves ("" = the core group),
-// read on ctx from the same documents client-go's ServerGroups reads (it sends
-// on context.TODO(), out of the page budget's reach, #1115 N1): /api's
-// APIVersions for the core group, /apis' APIGroupList for any other. Like
-// ServerGroups, a 404 or 403 on either document reads as "nothing served"
-// rather than an error. A group not listed: (nil, nil).
-func servedVersionsOfGroup(ctx context.Context, cli discovery.DiscoveryInterface, group string) ([]string, error) {
-	tolerated := func(err error) bool { return apierrors.IsNotFound(err) || apierrors.IsForbidden(err) }
-	if group == "" {
-		v := &metav1.APIVersions{}
-		if err := cli.RESTClient().Get().AbsPath("/api").Do(ctx).Into(v); err != nil {
-			if tolerated(err) {
-				return nil, nil
+// serverGroups is client-go's DiscoveryClient.ServerGroups (client-go v0.36.5
+// discovery/discovery_client.go: GroupsAndMaybeResources → downloadLegacy +
+// downloadAPIs) transcribed exactly, but sent on ctx (client-go sends on
+// context.TODO(), out of the page budget's reach, #1115 N1):
+//   - the same Accept header (selectDiscoveryAcceptHeader: aggregated v2,
+//     v2beta1, then v1, or v1 alone / the nopeer profile per the client's
+//     flags);
+//   - both documents always read, /api first; ONLY a 404 on /api is tolerated
+//     (an empty legacy group list), any error on /apis is returned;
+//   - an aggregated answer parsed with client-go's own SplitGroupsAndResources
+//     / SplitGroupsAndResourcesV2Beta1 (stale versions are dropped exactly as
+//     there), an unaggregated one as APIVersions / APIGroupList;
+//   - the legacy group ordered first.
+func serverGroups(ctx context.Context, cli discovery.DiscoveryInterface) (*metav1.APIGroupList, error) {
+	useLegacy, noPeer := false, false
+	if dc, ok := cli.(*discovery.DiscoveryClient); ok {
+		useLegacy, noPeer = dc.UseLegacyDiscovery, dc.NoPeerDiscovery
+	}
+	accept := discovery.AcceptV2 + "," + discovery.AcceptV2Beta1 + "," + discovery.AcceptV1
+	switch {
+	case useLegacy:
+		accept = discovery.AcceptV1
+	case noPeer:
+		accept = discovery.AcceptV2NoPeer + "," + accept
+	}
+	download := func(path string) (*metav1.APIGroupList, bool, error) {
+		var contentType string
+		body, err := cli.RESTClient().Get().AbsPath(path).SetHeader("Accept", accept).Do(ctx).ContentType(&contentType).Raw()
+		if err != nil {
+			return nil, false, err
+		}
+		if isGVK, _ := discovery.ContentTypeIsGVK(contentType, discoveryV2GVK); isGVK {
+			var agg apidiscoveryv2.APIGroupDiscoveryList
+			if err := json.Unmarshal(body, &agg); err != nil {
+				return nil, false, err
 			}
+			groups, _, _ := discovery.SplitGroupsAndResources(agg)
+			return groups, true, nil
+		}
+		if isGVK, _ := discovery.ContentTypeIsGVK(contentType, discoveryV2Beta1GVK); isGVK {
+			var agg apidiscoveryv2beta1.APIGroupDiscoveryList
+			if err := json.Unmarshal(body, &agg); err != nil {
+				return nil, false, err
+			}
+			groups, _, _ := discovery.SplitGroupsAndResourcesV2Beta1(agg)
+			return groups, true, nil
+		}
+		if path == "/api" {
+			var v metav1.APIVersions
+			if err := json.Unmarshal(body, &v); err != nil {
+				return nil, false, err
+			}
+			apiGroup := metav1.APIGroup{}
+			if len(v.Versions) != 0 {
+				apiGroup = apiVersionsToAPIGroup(&v)
+			}
+			return &metav1.APIGroupList{Groups: []metav1.APIGroup{apiGroup}}, false, nil
+		}
+		list := &metav1.APIGroupList{}
+		if err := json.Unmarshal(body, list); err != nil {
+			return nil, false, err
+		}
+		return list, false, nil
+	}
+
+	groups, _, err := download("/api")
+	if err != nil {
+		// downloadLegacy: tolerate 404, since aggregated api servers can return it.
+		if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
-		return v.Versions, nil
+		groups = &metav1.APIGroupList{}
 	}
-	list := &metav1.APIGroupList{}
-	if err := cli.RESTClient().Get().AbsPath("/apis").Do(ctx).Into(list); err != nil {
-		if tolerated(err) {
-			return nil, nil
-		}
-		return nil, err
+	apiGroups, _, aerr := download("/apis")
+	if aerr != nil {
+		return nil, aerr
 	}
-	for _, g := range list.Groups {
-		if g.Name != group {
-			continue
-		}
-		out := make([]string, 0, len(g.Versions))
-		for _, v := range g.Versions {
-			out = append(out, v.Version)
-		}
-		return out, nil
-	}
-	return nil, nil
+	groups.Groups = append(groups.Groups, apiGroups.Groups...)
+	return groups, nil
 }
+
+// apiVersionsToAPIGroup is client-go's (unexported) helper of the same name.
+func apiVersionsToAPIGroup(apiVersions *metav1.APIVersions) (apiGroup metav1.APIGroup) {
+	groupVersions := []metav1.GroupVersionForDiscovery{}
+	for _, version := range apiVersions.Versions {
+		groupVersions = append(groupVersions, metav1.GroupVersionForDiscovery{GroupVersion: version, Version: version})
+	}
+	apiGroup.Versions = groupVersions
+	// There should be only one groupVersion returned at /api
+	apiGroup.PreferredVersion = groupVersions[0]
+	return
+}
+
+// The aggregated-discovery kinds client-go compares the answer's content type
+// with (its unexported v2GVK / v2Beta1GVK).
+var (
+	discoveryV2GVK      = schema.GroupVersionKind{Group: "apidiscovery.k8s.io", Version: "v2", Kind: "APIGroupDiscoveryList"}
+	discoveryV2Beta1GVK = schema.GroupVersionKind{Group: "apidiscovery.k8s.io", Version: "v2beta1", Kind: "APIGroupDiscoveryList"}
+)

@@ -508,11 +508,22 @@ func pluralExistsInGroup(ctx context.Context, rc *rest.Config, group, plural str
 		return false, err
 	}
 
-	// #1115 N1 — the group's versions on the request's ctx (client-go's
-	// ServerGroups sends on context.TODO(), out of the page budget's reach).
-	versions, err := servedVersionsOfGroup(ctx, cli, group)
+	// #1115 N1 — client-go's ServerGroups, transcribed exactly but sent on the
+	// request's ctx (serverGroups; client-go's own sends on context.TODO()).
+	groups, err := serverGroups(ctx, cli)
 	if err != nil {
-		return false, fmt.Errorf("discovery of group %q: %w", group, err)
+		return false, fmt.Errorf("discovery ServerGroups: %w", err)
+	}
+
+	var versions []string
+	for _, g := range groups.Groups {
+		if g.Name != group {
+			continue
+		}
+		for _, v := range g.Versions {
+			versions = append(versions, v.Version)
+		}
+		break
 	}
 	if len(versions) == 0 {
 		return false, nil // group not served — caller fails loud.
