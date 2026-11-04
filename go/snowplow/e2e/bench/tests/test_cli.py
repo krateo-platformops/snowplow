@@ -276,14 +276,14 @@ def test_cmd_phase6_exits_2_on_incompatible_state_schema(tmp_path, monkeypatch):
 # ─── phase6 run-lock prevents concurrent invocations ───────────────────────
 
 
-def test_cmd_phase6_returns_5_when_lock_already_held(tmp_path, monkeypatch, capsys):
-    """When another phase6 holds /tmp/snowplow-bench.lock, cmd_phase6 exits 5
+def test_cmd_phase6_returns_5_when_lock_already_held(tmp_path, run_lock, capsys):
+    """When another phase6 holds the run lock (/tmp/snowplow-bench.lock on a
+    real host; the test's own file here, conftest `run_lock`), cmd_phase6 exits 5
     and names the holding PID in stderr. Prevents the cluster-contamination
     failure mode observed 2026-06-09 (two concurrent bench instances stomped
     each other's S5/S6)."""
     import fcntl
-    lock_path = tmp_path / "snowplow-bench.lock"
-    monkeypatch.setattr(cli_mod, "_RUN_LOCK_PATH", str(lock_path))
+    lock_path = run_lock
     # Hold the lock from a separate fd to simulate the prior bench instance.
     holder = open(lock_path, "a+")
     fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -305,6 +305,20 @@ def test_cmd_phase6_returns_5_when_lock_already_held(tmp_path, monkeypatch, caps
     finally:
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()
+
+
+def test_the_run_lock_is_the_hosts_file_unless_bench_run_lock_names_another(monkeypatch, run_lock):
+    """#1166: a real host's phase6 locks /tmp/snowplow-bench.lock (two runs on one host must
+    refuse each other); BENCH_RUN_LOCK names another file, and the suite's conftest names one
+    under each test's tmp_path, so no test takes (or is refused by) the host's lock."""
+    assert cli_mod._run_lock_path() == str(run_lock) and str(run_lock) != "/tmp/snowplow-bench.lock"
+    fh = cli_mod._acquire_run_lock()
+    try:
+        assert run_lock.read_text() == str(os.getpid())
+    finally:
+        fh.close()
+    monkeypatch.delenv("BENCH_RUN_LOCK")
+    assert cli_mod._run_lock_path() == "/tmp/snowplow-bench.lock"
 
 
 # ─── cmd_measure refuses lifecycle stages ──────────────────────────────────

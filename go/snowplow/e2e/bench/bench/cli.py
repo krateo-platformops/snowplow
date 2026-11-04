@@ -617,7 +617,13 @@ def _default_run_dir(args) -> Path:
     return Path("/tmp/snowplow-runs") / tag / f"run-{ts}"
 
 
-_RUN_LOCK_PATH = "/tmp/snowplow-bench.lock"
+#: the host-wide phase6 run lock; BENCH_RUN_LOCK names another file (the test suite gives
+#: every test its own, under its tmp_path, so no test ever takes the host's lock: #1166)
+_RUN_LOCK_DEFAULT = "/tmp/snowplow-bench.lock"
+
+
+def _run_lock_path() -> str:
+    return os.environ.get("BENCH_RUN_LOCK") or _RUN_LOCK_DEFAULT
 
 
 def _acquire_run_lock():
@@ -628,7 +634,8 @@ def _acquire_run_lock():
     contention, prints the PID stored in the lockfile and raises RuntimeError.
     """
     import fcntl
-    fh = open(_RUN_LOCK_PATH, "a+")
+    path = _run_lock_path()
+    fh = open(path, "a+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -636,7 +643,7 @@ def _acquire_run_lock():
         existing = fh.read().strip() or "unknown"
         fh.close()
         raise RuntimeError(
-            f"another bench phase6 is already running (lock={_RUN_LOCK_PATH}, "
+            f"another bench phase6 is already running (lock={path}, "
             f"pid={existing})"
         )
     fh.seek(0)
@@ -696,7 +703,7 @@ def cmd_phase6(args) -> int:
 
     section(f"phase6 — {tag} scale={scale} from={from_stage} to={to_stage}")
     log(f"run_dir={run_dir}")
-    log(f"run_lock pid={os.getpid()} path={_RUN_LOCK_PATH}")
+    log(f"run_lock pid={os.getpid()} path={_run_lock_path()}")
     try:
         phases.run_phase6(
             tag, scale,

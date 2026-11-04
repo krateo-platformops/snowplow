@@ -56,5 +56,15 @@ jobs:
               subprocess.run(["docker", "pull", image], check=True)
           PY
 
-      - name: Bench suite (Docker k6 / Chrome tests included)
-        run: python -m pytest -q -rfs --tb=short tests/
+      # #1166: one pytest-xdist worker per CPU. Every worker is its own process and every test
+      # its own tmp_path, run lock and processes (tests/conftest.py, tests/procreap.py), so the
+      # result does not depend on which worker ran what; the parallel pass/fail set was proven
+      # equal to the serial one, three runs in a row, before this switched over.
+      - name: Bench suite, in parallel (the Docker tests apart)
+        run: python -m pytest -n auto -m "not docker" -q -rfs --tb=short tests/
+
+      # The k6 / Chrome tests run containers whose own timing windows (a sampler's CPU burn,
+      # a browser's sign-in and quiet period) assume the runner is not also running the rest
+      # of the suite: they keep running on their own, one at a time, as before.
+      - name: Bench Docker tests (k6 / Chrome), one at a time
+        run: python -m pytest -m docker -q -rfs --tb=short tests/

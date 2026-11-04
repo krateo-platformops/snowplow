@@ -7,6 +7,19 @@ NOT exit during test collection.
 
 Risk Register R1.1 mitigation: `reset_k8s_state` fixture (opt-in) nulls
 the cluster.py module-level globals so tests don't share state.
+
+Running the suite (#1166): in parallel, one pytest-xdist worker per CPU, from
+`go/snowplow/e2e/bench`:
+
+    python3 -m pytest -n auto -m "not docker" -q -p no:cacheprovider
+
+CI (.github/workflows/bench-tests.yaml) runs the same parallel pass, then the
+`docker` tests on their own, one at a time. Each worker is a process of its
+own, so environment variables, the working directory and module globals are
+per worker. What workers could still share is the host: a test writes under
+its own tmp_path, its servers bind port 0, its phase6 run lock is its own
+(`run_lock`), and every process it starts is killed when it ends
+(tests/procreap.py, #1170).
 """
 
 from __future__ import annotations
@@ -375,7 +388,7 @@ def _require_docker():
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "docker: runs containers (k6 / Chrome); deselect on the shared host with "
-                   "-m 'not docker', CI runs them (tests/test_k6_830.py needs_docker)")
+                   "-m 'not docker', CI runs them, one at a time (tests/test_k6_830.py needs_docker)")
 
 
 @pytest.fixture(autouse=True)
@@ -480,6 +493,19 @@ def _stub_cache_list_transport(monkeypatch):
     import bench.browser as browser_mod
     monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
                         lambda token: None)
+
+
+@pytest.fixture(autouse=True)
+def run_lock(tmp_path, monkeypatch):
+    """The phase6 run lock, under the test's tmp_path (#1166). bench.cli takes a HOST-wide
+    flock, /tmp/snowplow-bench.lock, so two real bench runs on one host refuse each other;
+    BENCH_RUN_LOCK names another file. No test may take the host's lock: two parallel
+    workers, or another session's suite on the same host, would refuse each other (exit 5).
+    Autouse, so every test that reaches cmd_phase6 (directly, or through a `python -m bench`
+    it starts) locks its own file; the lock's own arms take the path from here."""
+    path = tmp_path / "snowplow-bench.lock"
+    monkeypatch.setenv("BENCH_RUN_LOCK", str(path))
+    return path
 
 
 @pytest.fixture
