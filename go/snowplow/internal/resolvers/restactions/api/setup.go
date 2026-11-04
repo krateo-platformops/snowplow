@@ -341,37 +341,69 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 }
 
 // servedAsWritten reports whether this cluster's apiserver reads path exactly
-// as it is written (#1137).
+// as it is written (#1137), on every branch that can dial it.
 //
 // Every reader of a planned call reads its path as written:
 // ParseAPIServerPathToDep for the userAccessFilter's own resource (#1124), the
 // cache key and the dependency edge, the informer and content-cell dispatch,
 // the sensitive-resource mark (#398), and this guard's own namespace and name
-// checks. The apiserver reads the path it RECEIVES, decoded: the dial sends
-// credhttp.RequestURL(server, path), which puts a "/" before a path written
-// without one, and the apiserver percent-decodes the request path before it
-// reads namespace, resource and name (k8s.io/apiserver: the handler director
-// and RequestInfoFactory both read req.URL.Path). Where the two differ, every
-// one of those readers decides about a request that is not the one served:
-// `apis/g/v/p2s` parses as nothing and is served as p2s; `/apis/g/v/
-// namespaces%2Fns-a%2Fp2s` parses as one resource named with escapes and is
-// served as p2s in ns-a. A userAccessFilter then checked such objects on its
-// whole set, not on their own resource.
+// checks. The request the apiserver serves is built two ways, and each one
+// normalises the path:
+//   - the HTTP dials (credhttp.Do, the resolver's fetch) send
+//     credhttp.RequestURL(server, path), which puts a "/" before a path written
+//     without one, and the apiserver percent-decodes the request path before it
+//     reads namespace, resource and name (k8s.io/apiserver: the handler
+//     director and RequestInfoFactory both read req.URL.Path);
+//   - the internal-rest-config branch (the refresher's dial) asks client-go for
+//     the parsed coordinates, and client-go joins them with path.Join, which
+//     drops an empty or "." segment and resolves "..".
 //
-// So the plan holds only a path the apiserver serves as written: the path
-// the server decodes from the URL the dial builds equals the written path
-// (before its query and fragment, which the apiserver does not read as
-// coordinates; splitPathQuery is the parsers' own split). One rule, not a list
-// of shapes: no own-cluster path needs a missing leading "/" or a percent-escape
-// (no group, version, resource, namespace or name contains '%' or '/'), and
-// whatever else the client and the server normalise is compared the same way.
-// The query is not judged: a selector value may be escaped.
+// Where the written path and the served one differ, every reader decides about
+// a request that is not the one served: `apis/g/v/p2s` parses as nothing and
+// is served as p2s; `/apis/g/v/namespaces%2Fns-a%2Fp2s` parses as one resource
+// named with escapes and is served as p2s in ns-a; `/apis/g/v/namespaces/ns-a/
+// ./p2s` parses as resource "." and the refresher LISTs p2s in ns-a;
+// `//api/v1/namespaces/ns-a/secrets` parses as nothing, so #398 does not mark
+// it, while the apiserver authorizes it as secrets.
+//
+// So the plan holds only a path that neither normalisation changes:
+//   - decoding: the path the server decodes from the URL the dial builds
+//     equals the written path, before its query and fragment (which the
+//     apiserver does not read as coordinates; splitPathQuery is the parsers'
+//     own split). The query is not judged: a selector value may be escaped.
+//   - cleaning: no segment is empty, "." or "..". Trailing "/"s are not
+//     segments: every reader, path cleaning and the apiserver read the path
+//     without them (a mutating verb's trailing "/" is collapsedPath's refusal).
+//
+// One rule, not a list of shapes: no own-cluster path needs a missing leading
+// "/", a percent-escape, an empty segment or a dot segment (no group, version,
+// resource, namespace or name is empty, "." or "..", or contains '%' or '/').
 func servedAsWritten(path string) bool {
 	p, _, _ := splitPathQuery(path)
 	// The base carries no path of its own, so u.Path is the request path the
 	// server receives, decoded exactly as net/http decodes it for the apiserver.
 	u, err := url.Parse(credhttp.RequestURL("http://apiserver.invalid", path))
-	return err == nil && u.Path == p
+	if err != nil || u.Path != p {
+		return false
+	}
+	return cleanAsWritten(p)
+}
+
+// cleanAsWritten reports whether path cleaning leaves p's segments as they
+// are: every segment between the leading "/" and any trailing "/"s is
+// non-empty and neither "." nor "..". The server root ("", sent as the server
+// URL itself, or "/") has no segment to clean.
+func cleanAsWritten(p string) bool {
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return true
+	}
+	for _, seg := range strings.Split(strings.TrimPrefix(p, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // evalJQE evaluates a jq template and SURFACES the Eval error instead of

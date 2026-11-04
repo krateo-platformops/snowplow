@@ -3,27 +3,36 @@ package api
 // issue1137_path_served_as_written_test.go — #1137 (SECURITY, the #1136 residual).
 //
 // THE DEFECT. #1124 checks an object of a checked resource on that resource
-// alone, and reads the resource from the stage's rendered path. Two path shapes
+// alone, and reads the resource from the stage's rendered path. Path shapes
 // were served as one resource and parsed as another, or as none:
 //   - no leading "/": `apis/g/v/p2s` parses as nothing (servedOK false), but
 //     the dial puts the "/" back and the apiserver serves p2s;
 //   - "%2F" for "/": `/apis/g/v/namespaces%2Fns-a%2Fp2s` parses as one
 //     resource named with escapes, but the apiserver decodes the path and
-//     serves p2s in ns-a.
+//     serves p2s in ns-a;
+//   - an empty or "." segment: `/apis/g/v/namespaces/ns-a/./p2s` parses as
+//     resource ".", but the refresher's internal-rest-config dial asks
+//     client-go for it, and client-go's path.Join cleans it into a LIST of p2s;
+//   - a leading "//": `//api/v1/namespaces/ns-a/secrets` parses as nothing (so
+//     #398 does not mark it), while the apiserver's RequestInfo reads secrets.
 // Narrowing was skipped, the check fell back to OR across the set, and a
 // caller who may list p1s in ns-a read p2 objects there. Cache on and off.
 //
 // THE RULE (servedAsWritten, in the #288 dial guard). An own-cluster path is
-// planned only when the apiserver reads it exactly as it is written: the
-// decoded path of the URL the dial builds (credhttp.RequestURL) equals the
-// written path. Every reader of a planned call reads its path as written, so
-// that is the only way all of them decide about the request served.
+// planned only when neither dial's normalisation changes it: the decoded path
+// of the URL the HTTP dial builds (credhttp.RequestURL) equals the written
+// path, and path cleaning leaves it as it is (no empty, "." or ".." segment;
+// one trailing "/" allowed). Every reader of a planned call reads its path as
+// written, so that is the only way all of them decide about the request served.
 //
 // THE APISERVER. i37APIServer reads every request with k8s.io/apiserver's own
 // RequestInfoFactory (configured as kube-apiserver configures it), on the
 // request Go's net/http server decoded, and answers with the fixture objects of
-// the resource THAT names. So "what the apiserver serves" is the apiserver's
-// code, not snowplow's parser. The RBAC oracle is #1124's i24Allows.
+// the resource THAT names. It routes as kube-apiserver v0.36.5 routes (the
+// handler director and PathRecorderMux match the decoded path against "/api/"
+// and "/apis/"): any other path is answered 404, though it is still read and
+// logged. So "what the apiserver serves" is the apiserver's code, not
+// snowplow's parser. The RBAC oracle is #1124's i24Allows.
 
 import (
 	"context"
@@ -43,6 +52,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/request"
@@ -70,6 +80,12 @@ func i37Read(r *http.Request) i37Coord {
 	return i37Coord{info.APIGroup, info.APIVersion, info.Resource, info.Namespace, info.Name, true}
 }
 
+// i37Routed is kube-apiserver's routing of a decoded request path: only the
+// "/api/" and "/apis/" prefixes reach a resource handler.
+func i37Routed(p string) bool {
+	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/apis/")
+}
+
 // i37Parse is snowplow's reading of a path as written.
 func i37Parse(path string) i37Coord {
 	gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path)
@@ -88,28 +104,16 @@ func (l *i37Log) add(c i37Coord) { l.mu.Lock(); l.seen = append(l.seen, c); l.mu
 
 func (l *i37Log) reset() { l.mu.Lock(); l.seen = nil; l.mu.Unlock() }
 
-// compositions counts the requests the apiserver read as a composition.krateo.io
-// resource: the ones that could serve the objects the arms check.
-func (l *i37Log) compositions() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	n := 0
-	for _, c := range l.seen {
-		if c.ok && c.group == i24Comp {
-			n++
-		}
-	}
-	return n
-}
+func (l *i37Log) count() int { l.mu.Lock(); defer l.mu.Unlock(); return len(l.seen) }
 
 // i37APIServer serves the i24 fixture by the apiserver's own reading of each
-// request: a LIST (cluster-wide or in the namespace) or a GET by name.
+// routed request: a LIST (cluster-wide or in the namespace) or a GET by name.
 func i37APIServer(t *testing.T, log *i37Log) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c := i37Read(r)
 		log.add(c)
-		if !c.ok {
+		if !c.ok || !i37Routed(r.URL.Path) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -144,10 +148,23 @@ func i37APIServer(t *testing.T, log *i37Log) *httptest.Server {
 	return srv
 }
 
-// i37Shape is a path the apiserver serves as served while snowplow, reading it
-// as written, does not.
+// i37Via is a dial an own-cluster call can take.
+type i37Via string
+
+const (
+	// i37HTTP is the resolver's own fetch (httpFetchConverting), the dial of
+	// a live own-cluster stage.
+	i37HTTP i37Via = "http fetch"
+	// i37ClientGo is the internal-rest-config branch (the refresher's dial):
+	// client-go on the parsed coordinates.
+	i37ClientGo i37Via = "internal rest config"
+)
+
+// i37Shape is a path the apiserver reads, on the dial via, as served, while
+// snowplow, reading it as written, does not.
 type i37Shape struct {
 	name, path string
+	via        i37Via
 	served     i37Coord // what the apiserver reads (asserted, not assumed)
 	canonical  string   // the same request written as the apiserver reads it
 }
@@ -156,63 +173,88 @@ var (
 	i37P2      = i37Coord{i24Comp, i24Ver, "p2s", "", "", true}
 	i37P2InA   = i37Coord{i24Comp, i24Ver, "p2s", "ns-a", "", true}
 	i37P2Named = i37Coord{i24Comp, i24Ver, "p2s", "ns-a", "b-p2-in-ns-a", true}
+	i37Secrets = i37Coord{"", "v1", "secrets", "ns-a", "", true}
+)
+
+const (
+	i37LP2    = "/apis/composition.krateo.io/v1-0-0/p2s"
+	i37LP2InA = "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"
+	i37GP2    = "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a"
 )
 
 var i37Shapes = []i37Shape{
-	{"no leading slash, LIST", "apis/composition.krateo.io/v1-0-0/p2s", i37P2,
-		"/apis/composition.krateo.io/v1-0-0/p2s"},
-	{"no leading slash, namespaced LIST", "apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s", i37P2InA,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"},
-	{"no leading slash, GET by name", "apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a", i37P2Named,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a"},
-	{"%2F for the separators", "/apis/composition.krateo.io/v1-0-0/namespaces%2Fns-a%2Fp2s", i37P2InA,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"},
-	{"%2f, lower case", "/apis/composition.krateo.io/v1-0-0/namespaces%2fns-a%2fp2s", i37P2InA,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"},
-	{"%2F before the name", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s%2Fb-p2-in-ns-a", i37P2Named,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a"},
-	{"an escaped letter", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p%32s", i37P2InA,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"},
-	{"no leading slash and %2F", "apis/composition.krateo.io/v1-0-0/namespaces%2Fns-a%2Fp2s", i37P2InA,
-		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s"},
+	{"no leading slash, LIST", "apis/composition.krateo.io/v1-0-0/p2s", i37HTTP, i37P2, i37LP2},
+	{"no leading slash, namespaced LIST", "apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s", i37HTTP, i37P2InA, i37LP2InA},
+	{"no leading slash, GET by name", "apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a", i37HTTP, i37P2Named, i37GP2},
+	{"%2F for the separators", "/apis/composition.krateo.io/v1-0-0/namespaces%2Fns-a%2Fp2s", i37HTTP, i37P2InA, i37LP2InA},
+	{"%2f, lower case", "/apis/composition.krateo.io/v1-0-0/namespaces%2fns-a%2fp2s", i37HTTP, i37P2InA, i37LP2InA},
+	{"%2F before the name", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s%2Fb-p2-in-ns-a", i37HTTP, i37P2Named, i37GP2},
+	{"an escaped letter", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p%32s", i37HTTP, i37P2InA, i37LP2InA},
+	{"no leading slash and %2F", "apis/composition.krateo.io/v1-0-0/namespaces%2Fns-a%2Fp2s", i37HTTP, i37P2InA, i37LP2InA},
+	{"a leading //, LIST", "//apis/composition.krateo.io/v1-0-0/p2s", i37HTTP, i37P2, i37LP2},
+	{"a leading //, Secrets", "//api/v1/namespaces/ns-a/secrets", i37HTTP, i37Secrets, "/api/v1/namespaces/ns-a/secrets"},
+	{"a . segment, namespaced LIST", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/./p2s", i37ClientGo, i37P2InA, i37LP2InA},
+	{"an empty segment, namespaced LIST", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a//p2s", i37ClientGo, i37P2InA, i37LP2InA},
+	{"a . segment, LIST", "/apis/composition.krateo.io/v1-0-0/./p2s", i37ClientGo, i37P2, i37LP2},
+	{"an empty segment, LIST", "/apis/composition.krateo.io/v1-0-0//p2s", i37ClientGo, i37P2, i37LP2},
+	{"a . segment before a name", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/./p2s/b-p2-in-ns-a", i37ClientGo, i37P2InA, i37LP2InA},
 }
 
-// i37Dial sends path through the resolver's own fetch (the dial an
-// own-cluster stage uses) and returns what the apiserver read.
-func i37Dial(t *testing.T, srv *httptest.Server, log *i37Log, path string) i37Coord {
+// i37Dial sends path through the dial via and returns what the apiserver read;
+// sent=false when that dial sent nothing (the internal-rest-config branch
+// answers only a path it parses).
+func i37Dial(t *testing.T, srv *httptest.Server, log *i37Log, via i37Via, path string) (read i37Coord, sent bool) {
 	t.Helper()
 	log.reset()
 	opts := httpcall.RequestOptions{Endpoint: &endpoints.Endpoint{ServerURL: srv.URL, Token: "SA"}}
 	opts.Path = path
 	opts.Verb = ptr.To(http.MethodGet)
-	_, _, _, _ = httpFetchAllowingNonJSON(context.Background(), opts)
+	switch via {
+	case i37HTTP:
+		_, _, _, _ = httpFetchAllowingNonJSON(context.Background(), opts)
+	case i37ClientGo:
+		resetInternalClientCacheForTest()
+		// The refresher's ctx: this cluster's ServiceAccount rest config on a
+		// held-credential (own-cluster) stage, identity-free so the branch
+		// serves without a re-gate.
+		ctx := cache.WithInternalRESTConfig(credhttp.WithHeldCredentialValue(context.Background(), true),
+			&rest.Config{Host: srv.URL, BearerToken: "SA"})
+		_, _, _ = dispatchViaInternalRESTConfig(ctx, opts)
+	}
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	if len(log.seen) != 1 {
-		t.Fatalf("dial %q: the apiserver saw %d requests, want 1", path, len(log.seen))
+	switch len(log.seen) {
+	case 0:
+		return i37Coord{}, false
+	case 1:
+		return log.seen[0], true
 	}
-	return log.seen[0]
+	t.Fatalf("%s %q: the apiserver saw %d requests, want at most 1", via, path, len(log.seen))
+	return i37Coord{}, false
 }
 
 // TestIssue1137_TheApiserverReadsEachShapeAsAnotherPath measures the premise:
-// dialled through snowplow's own fetch, the apiserver's RequestInfoFactory
-// reads each shape as the composition resource it serves, while snowplow's
-// parser reads it as something else or nothing. The canonical form of each is
-// read the same way by both.
+// on the dial each shape names, the apiserver's RequestInfoFactory reads it as
+// the resource it serves, while snowplow's parser reads it as something else or
+// nothing. The canonical form of each is read the same way by both, on both
+// dials.
 func TestIssue1137_TheApiserverReadsEachShapeAsAnotherPath(t *testing.T) {
+	t.Cleanup(resetInternalClientCacheForTest)
 	log := &i37Log{}
 	srv := i37APIServer(t, log)
 	for _, sh := range i37Shapes {
 		t.Run(sh.name, func(t *testing.T) {
-			got := i37Dial(t, srv, log, sh.path)
-			if got != sh.served {
-				t.Fatalf("the apiserver read %q as %+v, want %+v", sh.path, got, sh.served)
+			got, sent := i37Dial(t, srv, log, sh.via, sh.path)
+			if !sent || got != sh.served {
+				t.Fatalf("%s: the apiserver read %q as %+v (sent=%v), want %+v", sh.via, sh.path, got, sent, sh.served)
 			}
 			if p := i37Parse(sh.path); p == got {
 				t.Fatalf("snowplow's parser reads %q as the apiserver does (%+v): not a divergent shape", sh.path, p)
 			}
-			if c := i37Dial(t, srv, log, sh.canonical); c != sh.served || i37Parse(sh.canonical) != c {
-				t.Fatalf("canonical %q: apiserver %+v, parser %+v, want both %+v", sh.canonical, c, i37Parse(sh.canonical), sh.served)
+			for _, via := range []i37Via{i37HTTP, i37ClientGo} {
+				if c, sent := i37Dial(t, srv, log, via, sh.canonical); !sent || c != sh.served || i37Parse(sh.canonical) != c {
+					t.Fatalf("canonical %q via %s: apiserver %+v (sent=%v), parser %+v, want both %+v", sh.canonical, via, c, sent, i37Parse(sh.canonical), sh.served)
+				}
 			}
 		})
 	}
@@ -220,11 +262,16 @@ func TestIssue1137_TheApiserverReadsEachShapeAsAnotherPath(t *testing.T) {
 
 // i37Paths is the differential corpus: the shapes, their canonical forms, and
 // the shapes the guard must keep (a query value may be escaped; a fragment is
-// never sent; a trailing slash, a subresource).
+// never sent; a trailing slash, a subresource). It holds only paths whose
+// coordinates snowplow's parser and the apiserver agree on when the path is
+// served as written: a few such paths read differently for reasons that have
+// nothing to do with how the path is written (`/api/v1/namespaces/ns-a/status`,
+// `/apis/<g>/<v>/namespaces/ns-a`), a parser divergence #1118 owns.
 func i37Paths() []string {
 	out := []string{
 		"/apis/composition.krateo.io/v1-0-0/p2s?limit=500",
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s?labelSelector=a%3Db%2Cc",
+		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s?labelSelector=x/../y",
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s#frag",
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/",
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a/status",
@@ -234,6 +281,7 @@ func i37Paths() []string {
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s/b-p2-in-ns-a%2Fstatus",
 		"api/v1/namespaces/ns-a/secrets/s",
 		"/api/v1/namespaces/ns-a/secret%73/s",
+		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s//",
 	}
 	for _, sh := range i37Shapes {
 		out = append(out, sh.path, sh.canonical)
@@ -242,35 +290,46 @@ func i37Paths() []string {
 }
 
 // TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten — the
-// guard against the apiserver's own reading, both directions: every path the
-// guard keeps is read by the apiserver with the coordinates snowplow's parser
-// reads from it, and every path it refuses is read by the apiserver as
-// different coordinates.
+// guard against the apiserver's own reading over the corpus, both dials, both
+// directions: every path the guard keeps is read by the apiserver with the
+// coordinates snowplow's parser reads from it, on each dial that sends it; and
+// every path it refuses is read differently on at least one dial.
 func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *testing.T) {
+	t.Cleanup(resetInternalClientCacheForTest)
 	log := &i37Log{}
 	srv := i37APIServer(t, log)
 	kept, refused := 0, 0
 	for _, p := range i37Paths() {
-		read := i37Dial(t, srv, log, p)
 		parsed := i37Parse(p)
+		same := true
+		for _, via := range []i37Via{i37HTTP, i37ClientGo} {
+			if read, sent := i37Dial(t, srv, log, via, p); sent && read != parsed {
+				same = false
+				if servedAsWritten(p) {
+					t.Errorf("kept %q: via %s the apiserver reads %+v, snowplow %+v", p, via, read, parsed)
+				}
+			}
+		}
 		if servedAsWritten(p) {
 			kept++
-			if read != parsed {
-				t.Errorf("kept %q: the apiserver reads %+v, snowplow %+v", p, read, parsed)
-			}
 			continue
 		}
 		refused++
-		if read == parsed {
-			t.Errorf("refused %q, yet the apiserver reads it as snowplow does (%+v)", p, read)
+		if same {
+			t.Errorf("refused %q, yet the apiserver reads it as snowplow does on every dial (%+v)", p, parsed)
 		}
 	}
 	if kept == 0 || refused == 0 {
 		t.Fatalf("the corpus must hold both kept and refused paths: kept=%d refused=%d", kept, refused)
 	}
-	// The rule's own edges: an empty path is sent as the server URL itself, a
-	// leading "//" is sent as written, an invalid escape cannot be sent.
-	for p, want := range map[string]bool{"": true, "/": true, "//apis/x": true, "/apis/x%zz": false, "https://elsewhere/apis/x": false} {
+	// The rule's own edges: an empty path is sent as the server URL itself;
+	// trailing "/"s are read without them; an invalid escape cannot be sent; a
+	// ".." segment is resolved by path cleaning (and is never a valid name).
+	for p, want := range map[string]bool{
+		"": true, "/": true, "/apis/x/": true, "/apis/x//": true,
+		"//apis/x": false, "///apis/x": false, "/apis//x": false, "/apis/./x": false, "/apis/x/../y": false, "/apis/x/y/..": false,
+		"/apis/x%zz": false, "https://elsewhere/apis/x": false,
+	} {
 		if got := servedAsWritten(p); got != want {
 			t.Errorf("servedAsWritten(%q) = %v, want %v", p, got, want)
 		}
@@ -283,15 +342,33 @@ type i37Out struct {
 	outcomes string
 }
 
-func i37Resolve(e *i24Env, arm i24Arm, user string, ra *templates.RESTAction, extras map[string]any, stages ...*templates.API) i37Out {
+// i37Mode is how a resolve runs: the cache arm, and whether it is the
+// refresher's (the internal rest config on the ctx, under the caller's
+// identity) or a live request's.
+type i37Mode struct {
+	arm       i24Arm
+	refresher bool
+}
+
+func (m i37Mode) String() string {
+	if m.refresher {
+		return string(m.arm) + "/refresher"
+	}
+	return string(m.arm) + "/live"
+}
+
+var i37Modes = []i37Mode{{i24Content, false}, {i24Off, false}, {i24Content, true}, {i24Off, true}}
+
+func i37Resolve(e *i24Env, m i37Mode, user string, ra *templates.RESTAction, extras map[string]any, stages ...*templates.API) i37Out {
 	t := e.t
 	t.Helper()
 	t.Setenv("CLIENT_MAX_RETRIES", "0")
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
+	resetInternalClientCacheForTest()
 	cache.SetGlobal(e.rw)
-	if arm == i24Off {
+	if m.arm == i24Off {
 		t.Setenv("CACHE_ENABLED", "false")
 		cache.SetGlobal(nil)
 	}
@@ -301,6 +378,10 @@ func i37Resolve(e *i24Env, arm i24Arm, user string, ra *templates.RESTAction, ex
 	defer env.SetTestMode(prevTM)
 	ctx := xcontext.BuildContext(ctxWithUser(user, "g-1124"),
 		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: e.sa.URL, Token: "tok:" + user}))
+	if m.refresher {
+		ctx = cache.WithInternalRESTConfig(ctx, &rest.Config{Host: e.sa.URL, BearerToken: "SA-IC-TOKEN"})
+		ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: e.sa.URL})
+	}
 	ctx, _ = withSinks681(ctx)
 	ctx, oc := WithStageOutcomes(ctx)
 	cp := make([]*templates.API, len(stages))
@@ -333,7 +414,7 @@ func i37UAFStage(path string) *templates.API {
 func i37Want(user string, c i37Coord) []string {
 	rows := []string{}
 	for _, o := range i24Compositions() {
-		if o.gvr.Resource != c.resource || (c.ns != "" && o.ns != c.ns) || (c.name != "" && o.name != c.name) {
+		if o.gvr.Group != c.group || o.gvr.Resource != c.resource || (c.ns != "" && o.ns != c.ns) || (c.name != "" && o.name != c.name) {
 			continue
 		}
 		if i24Allows(user, "list", o.gvr.Group, o.gvr.Resource, o.ns) {
@@ -350,20 +431,24 @@ func i37Norm(e *i24Env, dict map[string]any) string {
 }
 
 // TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet — for each shape,
-// every caller, cache on and off: the call is refused when it is planned (no
+// every caller, cache on and off, live and on the refresher's
+// internal-rest-config branch: the call is refused when it is planned (no
 // request reaches the apiserver, the stage fails InvalidPath, one
 // path_not_as_served count per resolve), no composition object is returned,
-// and cache on and off answer the same. The canonical form of the same request
-// is narrowed: every caller's rows equal Kubernetes' answer, so A2 (p1s in
-// ns-a) reads no p2 object, which the OR across the set would have kept.
+// and every mode answers the same. The canonical form of the same request is
+// narrowed in every mode: every caller's rows equal Kubernetes' answer, so A2
+// (p1s in ns-a) reads no p2 object, which the OR across the set would have kept.
 func TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet(t *testing.T) {
+	t.Cleanup(resetInternalClientCacheForTest)
 	// Were a shape dialled (the rule absent: the mutation arms), the cache-on
 	// path would register an informer for the resource it parses; the fake
 	// client panics on an unregistered LIST, so register each one.
 	var extra []schema.GroupVersionResource
 	for _, sh := range i37Shapes {
-		if g, _, _, ok := cache.ParseAPIServerPathToDep(sh.path); ok {
-			extra = append(extra, g)
+		for _, p := range []string{sh.path, sh.canonical} {
+			if g, _, _, ok := cache.ParseAPIServerPathToDep(p); ok {
+				extra = append(extra, g)
+			}
 		}
 	}
 	e := newI24Env(t, extra...)
@@ -372,39 +457,67 @@ func TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet(t *testing.T) {
 	for _, sh := range i37Shapes {
 		t.Run(sh.name, func(t *testing.T) {
 			for _, u := range i24Users {
-				outs := map[i24Arm]string{}
-				for _, arm := range i24Arms {
+				outs := map[i37Mode]string{}
+				for _, m := range i37Modes {
 					log.reset()
 					before := MalformedDialSkippedByReason(reasonPathNotAsServed)
-					o := i37Resolve(e, arm, u, i37RA, nil, i37UAFStage(sh.path))
-					if n := log.compositions(); n != 0 {
-						t.Errorf("%s %s: %d composition requests reached the apiserver, want 0 (refused when planned)", arm, u, n)
+					o := i37Resolve(e, m, u, i37RA, nil, i37UAFStage(sh.path))
+					if n := log.count(); n != 0 {
+						t.Errorf("%s %s: %d requests reached the apiserver, want 0 (refused when planned)", m, u, n)
 					}
 					if d := MalformedDialSkippedByReason(reasonPathNotAsServed) - before; d != 1 {
-						t.Errorf("%s %s: path_not_as_served moved by %d, want 1", arm, u, d)
+						t.Errorf("%s %s: path_not_as_served moved by %d, want 1", m, u, d)
 					}
 					if !strings.Contains(o.outcomes, `"name":"st"`) || !strings.Contains(o.outcomes, `"reason":"`+StageReasonInvalidPath+`"`) {
-						t.Errorf("%s %s: stage outcomes %s, want st InvalidPath", arm, u, o.outcomes)
+						t.Errorf("%s %s: stage outcomes %s, want st InvalidPath", m, u, o.outcomes)
 					}
 					if rows := i24Rows(i37Norm(e, o.dict)); len(rows) != 0 {
-						t.Errorf("%s %s: returned %v from a refused call", arm, u, rows)
+						t.Errorf("%s %s: returned %v from a refused call", m, u, rows)
 					}
-					outs[arm] = i37Norm(e, o.dict)
+					outs[m] = i37Norm(e, o.dict)
 				}
-				if outs[i24Content] != outs[i24Off] {
-					t.Errorf("%s: cache on and off disagree:\n on  %s\n off %s", u, outs[i24Content], outs[i24Off])
+				for _, m := range i37Modes[1:] {
+					if outs[m] != outs[i37Modes[0]] {
+						t.Errorf("%s: %s and %s disagree:\n %s\n %s", u, i37Modes[0], m, outs[i37Modes[0]], outs[m])
+					}
 				}
 
-				// The same request, written as the apiserver reads it.
+				// The same request, written as the apiserver reads it. Not in the
+				// cache-off refresher mode, which production never runs (the
+				// refresher needs the cache): there the internal-rest-config
+				// branch re-gates a cluster-scope LIST at collection scope and
+				// answers Forbidden to a caller with namespaced grants only, a
+				// property of that branch, not of this rule.
 				want := i37Want(u, sh.served)
-				for _, arm := range i24Arms {
-					o := i37Resolve(e, arm, u, i37RA, nil, i37UAFStage(sh.canonical))
+				for _, m := range i37Modes {
+					if m.refresher && m.arm == i24Off {
+						continue
+					}
+					o := i37Resolve(e, m, u, i37RA, nil, i37UAFStage(sh.canonical))
 					if rows := i24Rows(i37Norm(e, o.dict)); strings.Join(rows, ",") != strings.Join(want, ",") {
-						t.Errorf("%s %s canonical %q: rows %v, want %v (Kubernetes' answer)", arm, u, sh.canonical, rows, want)
+						t.Errorf("%s %s canonical %q: rows %v, want %v (Kubernetes' answer)", m, u, sh.canonical, rows, want)
 					}
 				}
 			}
 		})
+	}
+}
+
+// TestIssue1137_NamedEndpointPathsAreStillSent — the rule is this cluster's
+// apiserver's (#1112 D2 split): a named endpoint is another API, which may need
+// an escaped separator in an id, and its paths are sent as before.
+func TestIssue1137_NamedEndpointPathsAreStillSent(t *testing.T) {
+	ep := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
+	for _, p := range []string{"/api/v2/items/a%2Fb", "api/v2/items/a", "/api/v2/items//a", "/api/v2/items/./a"} {
+		before := len(ep.all())
+		o := x1106Resolve(t, nil, x1106Stage("items", http.MethodGet, p))
+		if n := len(ep.all()) - before; n != 1 {
+			t.Errorf("named endpoint %q: %d requests sent, want 1", p, n)
+		}
+		if strings.Contains(o.outcomes, StageReasonInvalidPath) {
+			t.Errorf("named endpoint %q: refused: %s", p, o.outcomes)
+		}
 	}
 }
 
@@ -444,16 +557,16 @@ func TestIssue1137_PortalRESTActionsPlanNoRefusal(t *testing.T) {
 
 	resolves := 0
 	for _, r := range runs {
-		for _, arm := range i24Arms {
+		for _, m := range i37Modes {
 			for _, u := range i24Users {
 				before := MalformedDialSkippedByReason(reasonPathNotAsServed)
-				o := i37Resolve(e, arm, u, r.ra, r.extras, r.stages...)
+				o := i37Resolve(e, m, u, r.ra, r.extras, r.stages...)
 				resolves++
 				if d := MalformedDialSkippedByReason(reasonPathNotAsServed) - before; d != 0 {
-					t.Errorf("%s %s %s extras=%v: the rule refused %d planned calls of a portal RESTAction", r.ra.Name, arm, u, r.extras, d)
+					t.Errorf("%s %s %s extras=%v: the rule refused %d planned calls of a portal RESTAction", r.ra.Name, m, u, r.extras, d)
 				}
 				if strings.Contains(o.outcomes, StageReasonInvalidPath) {
-					t.Errorf("%s %s %s extras=%v: a stage reported InvalidPath: %s", r.ra.Name, arm, u, r.extras, o.outcomes)
+					t.Errorf("%s %s %s extras=%v: a stage reported InvalidPath: %s", r.ra.Name, m, u, r.extras, o.outcomes)
 				}
 			}
 		}

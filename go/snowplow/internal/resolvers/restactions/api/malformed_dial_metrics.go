@@ -35,7 +35,8 @@ import (
 //   - jq_header_error     (#302) a header jq expression errored — a jq fault that
 //     must never be dialed as a garbage header value (e.g. Authorization);
 //   - path_not_as_served  (#1137) an own-cluster path the apiserver would read
-//     as a different path (no leading "/", a percent-escape): an RA-authoring
+//     as a different path (no leading "/", a percent-escape, an empty or dot
+//     segment a dial would clean away): an RA-authoring
 //     or upstream-data fault that every path reader would have misread.
 const (
 	reasonEmptyInterp        = "empty_interp"
