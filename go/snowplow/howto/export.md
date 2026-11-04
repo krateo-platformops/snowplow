@@ -230,6 +230,25 @@ unpaginated export of a widget whose parent declares a smaller slice (for
 example `perPage: 50` in its `resourcesRefs`) still exports the full list:
 the explicit values override the declared slice.
 
+### Time budget: 10 s per page
+
+A customer `/call` has a network budget of 10 s from its arrival, the page
+goal (#1115). An export gets that budget **per page**, not per export: every
+page the handler re-dispatches is its own resolve and gets 10 s of its own,
+exactly as a `/call` of that page would.
+
+- **A long export is not cut by the total.** 40 pages that take 1 s each
+  finish in about 40 s.
+- **A stalled page fails after its own 10 s.** The export then answers as it
+  does for any failed page: the page's failure (a `504` `Timeout` envelope)
+  is passed through as the export's answer.
+- **The export's records read the worst page.** A page budget's outcome is
+  also raised on the export request's own record (`budget=` on the per-call
+  and slow-call records).
+
+A single-window export (`page`/`perPage` given) is one re-dispatch, with one
+budget of its own.
+
 ### Row auto-detection
 
 When `path` is omitted the rows are located by convention, in order

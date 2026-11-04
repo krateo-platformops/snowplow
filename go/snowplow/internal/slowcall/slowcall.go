@@ -55,14 +55,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // The page-latency goal (#1054, #710's bar): a page loads in p95 ≤ 3 s and
 // never over 10 s.
+// #1115: one source for the goal, pagebudget (a leaf).
 const (
-	PageP95Goal = 3 * time.Second
-	PageMaxGoal = 10 * time.Second
+	PageP95Goal = pagebudget.PageP95Goal
+	PageMaxGoal = pagebudget.PageMaxGoal
 )
 
 // Bound is the server time past which one request is a SLOW CALL.
@@ -230,6 +232,9 @@ type Record struct {
 	ph     [numPhases]phaseAcc
 	closed atomic.Bool
 	dials  dialTotals
+	// budget (#1115) is the request's page budget, attached where it is set
+	// (AttachBudget); nil for a request without one.
+	budget atomic.Pointer[pagebudget.Budget]
 
 	mu      sync.Mutex
 	class   workclass.Class
@@ -281,6 +286,20 @@ func fromContext(ctx context.Context) *Record {
 	}
 	r, _ := ctx.Value(recordKey{}).(*Record)
 	return r
+}
+
+// AttachBudget (#1115) links ctx's page budget to its request's record, so the
+// record's "budget" field names what the budget did to the request's network
+// exchanges (pagebudget.Result). The budget is set downstream of Middleware
+// (middleware.UserConfig), on a derived context, so the record cannot read it
+// from the context it was opened with. A no-op without a record or a budget.
+func AttachBudget(ctx context.Context) {
+	r := fromContext(ctx)
+	b, ok := pagebudget.From(ctx)
+	if r == nil || !ok {
+		return
+	}
+	r.budget.Store(b)
 }
 
 // Detach returns ctx without its request's Record, for work that outlives the

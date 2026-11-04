@@ -56,6 +56,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // External-fetch origins (closed set).
@@ -253,6 +254,21 @@ func init() {
 				out[c.Site][c.Cause] = c.Count
 			}
 			return out
+		}))
+		// #1115 — every budgeted (customer) exchange by what the page budget
+		// did to it, and the retry reserve it uses.
+		expvar.Publish("snowplow_page_budget", expvar.Func(func() any {
+			byResult := map[string]uint64{}
+			for _, c := range pagebudget.ExchangesSnapshot() {
+				byResult[c.Result.String()] = c.Count
+			}
+			reserve, measured := credhttp.RetryReserve()
+			return map[string]any{
+				"exchanges_total":        byResult,
+				"retry_reserve_ms":       reserve.Milliseconds(),
+				"retry_reserve_measured": measured,
+				"reserve_samples_total":  credhttp.RetryReserveSamples(),
+			}
 		}))
 		expvar.Publish("snowplow_stage_endpoint_clients", expvar.Func(func() any {
 			n, builds, evictions := StageEndpointClientsStats()

@@ -22,6 +22,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
@@ -448,7 +449,9 @@ func (t *pdfCells) table() (cols []string, cells [][]string) {
 // RESTAction write stage is refused (#903's refusal, origin "export"),
 // never sent. The page's stage outcomes are added to stages.
 func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int, stages *stageOutcomeSet) *exportRecorder {
-	inner := req.Clone(cache.WithExportRead(req.Context()))
+	// #1115 B2 (owner ruling: "10 s per page") — each re-dispatched page is
+	// its own resolve, with its own page budget, as a /call of it would be.
+	inner := req.Clone(pagebudget.ForResolve(cache.WithExportRead(req.Context())))
 	q := inner.URL.Query()
 	for _, p := range exportParams {
 		q.Del(p)
