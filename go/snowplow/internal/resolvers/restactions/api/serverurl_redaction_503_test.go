@@ -193,7 +193,7 @@ func TestS503_UnparseableCAWarnNeverCarriesAServerURLPassword(t *testing.T) {
 		Token:                    saTestToken,
 		CertificateAuthorityData: "!!! not pem and not base64 !!!",
 	}
-	if !endpointNeedsOwnedCAClient(ep) {
+	if !endpointOwnedShape(ep) {
 		t.Fatal("SETUP: the endpoint must take the owned-CA (capability) branch, else the WARN never fires")
 	}
 	drive233(t, ep)

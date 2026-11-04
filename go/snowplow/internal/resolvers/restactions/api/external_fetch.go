@@ -14,9 +14,9 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
@@ -53,7 +53,7 @@ const maxUnstructuredResponseTextBytes = 2048
 //
 // The TLS/CA/client-cert/proxy/timeout/auth apparatus
 // (HTTPClientForEndpoint, the bearer/basic/AWS roundtrippers,
-// util.NewRetryClient, ComputeAwsHeaders) is REUSED verbatim from
+// ComputeAwsHeaders) is REUSED verbatim from
 // plumbing — the only hand-written part is the request assembly and the
 // 2xx body conversion (AC7; falsifier (k) asserts the auth header on the
 // wire).
@@ -254,10 +254,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		cli.Transport = pinSADialHost(u, cli.Transport)
 	}
 
-	// REUSED verbatim: retry wrapper.
-	retryCli := util.NewRetryClient(cli)
-
-	respo, err := retryCli.Do(call)
+	// #1088 — the endpoint send policy: a write (any method but GET, HEAD,
+	// OPTIONS, TRACE) is sent once and never re-sent once its bytes may have
+	// reached the server; a safe request keeps plumbing's RetryClient, with every
+	// retry counted and logged with its cause (credhttp/send.go).
+	respo, err := credhttp.Send(credhttp.SendSiteStage, cli, call)
 	if err != nil {
 		// #523: net/http already wraps a transport failure in a *url.Error whose
 		// URL went through its own stripPassword — which replaces the PASSWORD
