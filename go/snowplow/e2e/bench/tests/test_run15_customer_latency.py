@@ -612,7 +612,7 @@ def test_k6_span_refusals(tmp_path, env, why):
 # last line after its evaluate step), then exits .rc.
 FAKE_RUN606 = r"""#!/usr/bin/env bash
 set -Eeuo pipefail
-echo "$RUN_NAME dry=${BENCH_606_DRY_RUN:-0} span=$K6_SPAN driver=$LOAD_DRIVER go=${BENCH_606_GO:-} tag=$SNOWPLOW_TAG digest=$EXPECTED_IMAGE_DIGEST pid=$$" >> "$FAKE/calls"
+echo "$RUN_NAME dry=${BENCH_606_DRY_RUN:-0} span=$K6_SPAN driver=$LOAD_DRIVER go=${BENCH_606_GO:-} tag=$SNOWPLOW_TAG digest=$EXPECTED_IMAGE_DIGEST fw=${BENCH_1004_GO:-} pid=$$" >> "$FAKE/calls"
 SLEEP_PID=""
 teardown() { local rc=$?; trap - EXIT; [[ -n "$SLEEP_PID" ]] && kill "$SLEEP_PID" 2>/dev/null; echo "$RUN_NAME teardown rc=$rc" >> "$FAKE/calls"; exit "$rc"; }
 trap teardown EXIT

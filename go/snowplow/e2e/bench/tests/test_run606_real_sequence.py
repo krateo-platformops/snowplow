@@ -191,6 +191,66 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+    # #1004: the full-widen stage's objects, its Job's /out and the CRD's deletion.
+    # FAKE_FW_JOB: ok (default: arms once applied, exits once the widened CRD is
+    # applied) | ends_unarmed (exits without arming) | never (never arms);
+    # FAKE_FW_SHORT=k: k objects fewer than applied exist; FAKE_FW_WAIT_HANG=s:
+    # the CRD's Established wait hangs; FAKE_FW_STREAM: the stream /out holds.
+    fw_crd = "fullwidens.fullwiden.bench.krateo.io"
+    def fw_note(what):
+        with open(os.path.join(STATE, "fw-events"), "a") as fh:
+            fh.write(json.dumps([time.time(), what]) + "\\n")
+    if a[:1] == ["apply"] and "-f" in a and "/full-widen/" in a[a.index("-f") + 1]:
+        fw_note("apply " + os.path.basename(a[a.index("-f") + 1]))
+    if a[:1] == ["wait"] and f"crd/{fw_crd}" in a:
+        time.sleep(float(os.environ.get("FAKE_FW_WAIT_HANG", "0")))
+        sys.exit(0)
+    if a[:2] == ["get", fw_crd]:
+        kinds = open(os.path.join(STATE, "applied-kinds.jsonl")).read().splitlines()
+        n = sum(1 for k in kinds if json.loads(k) == ["fullwiden.bench.krateo.io/v1alpha1", "FullWiden"])
+        print("\\n".join(f"bench-ns-01 o{i} 1s" for i in range(max(0, n - int(os.environ.get("FAKE_FW_SHORT", "0"))))))
+        sys.exit(0)
+    if a[:3] == ["get", "deploy", "snowplow"]:
+        # as the chart renders it: the env through envFrom its ConfigMap (FAKE_FW_DEPLOY_ENV: an env list too)
+        env = json.loads(os.environ.get("FAKE_FW_DEPLOY_ENV", "[]"))
+        print(json.dumps({"metadata": {"name": "snowplow"}, "spec": {"template": {"spec": {"containers": [
+            {"name": "snowplow", "envFrom": [{"configMapRef": {"name": "snowplow"}}], "env": env}]}}}}))
+        sys.exit(0)
+    fw_events = (open(os.path.join(STATE, "fw-events")).read() if os.path.exists(os.path.join(STATE, "fw-events"))
+                 else "")
+    if a[:2] == ["get", "crd"] and "json" in a and "apply crd.yaml" in fw_events:
+        # #1004 F7: every CRD's name, uid and generation, read at the window's two ends.
+        # The widen bumps the stage CRD's generation; FAKE_FW_OTHER_CRD_BUMP=1: another
+        # CRD's spec changes in the window too; FAKE_FW_CRDS_FAIL=1: the read fails
+        if os.environ.get("FAKE_FW_CRDS_FAIL") == "1":
+            print("Error from server (Forbidden): customresourcedefinitions is forbidden", file=sys.stderr)
+            sys.exit(1)
+        widened = "apply crd-widened.yaml" in fw_events
+        bump = os.environ.get("FAKE_FW_OTHER_CRD_BUMP") == "1" and widened
+        print(json.dumps({"items": [
+            {"metadata": {"name": "installers.composition.krateo.io", "uid": "u-inst", "generation": 3 + bump}},
+            {"metadata": {"name": "users.basic.authn.krateo.io", "uid": "u-users", "generation": 1}},
+            {"metadata": {"name": fw_crd, "uid": "u-fw", "generation": 1 + widened}}]}))
+        sys.exit(0)
+    if a[:2] == ["get", "pods"] and "job-name=fullwiden606" in a:
+        print("fullwiden606-0" if "apply job.yaml" in fw_events else ""); sys.exit(0)
+    if a[:1] == ["exec"] and "fullwiden606-0" in a and a[-2:] == ["touch", "/out/widened"]:
+        fw_note("exec touch /out/widened"); sys.exit(0)
+    if a[:1] == ["exec"] and "fullwiden606-0" in a:
+        mode = os.environ.get("FAKE_FW_JOB", "ok")
+        armed = mode == "ok" and "apply job.yaml" in fw_events
+        exited = (mode == "ok" and "exec touch /out/widened" in fw_events) or mode == "ends_unarmed"
+        fw_note("exec " + a[-1] + " " + ("yes" if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else "no"))
+        sys.exit(0 if {"/out/armed": armed, "/out/exited": exited}[a[-1]] else 1)
+    if a[:1] == ["cp"] and any(x.startswith("fullwiden606-0:") for x in a):
+        os.makedirs(a[-1], exist_ok=True)
+        src = os.environ.get("FAKE_FW_STREAM")
+        open(os.path.join(a[-1], "widen.jsonl"), "w").write(open(src).read() if src else "")
+        fw_note("cp"); sys.exit(0)
+    if a[:2] == ["delete", "crd"] and fw_crd in a:
+        fw_note("delete crd"); sys.exit(0)
+    if a[:1] == ["delete"] and any(x.startswith("bench.krateo.io/full-widen") for x in a):
+        fw_note("delete " + " ".join(x for x in a if "," in x or x.endswith(".io"))); sys.exit(0)
     # run 16 attempt 2: the API server stops answering for a while mid-measure.
     # FAKE_API_DOWN_POLLS=N: the first N driver-wait reads (the job status and
     # the driver pods) fail as kubectl does then; FAKE_API_DOWN_WAITS=N: the
@@ -860,7 +920,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         if what in ("configmap", "configmaps") and "json" in a and "frontend-config-vars" not in a:
             src, _, iv = os.environ.get("FAKE_CDC_RESYNC", "configmap:60s").partition(":")
             data = {"COMPOSITION_CONTROLLER_RESYNC_INTERVAL": iv} if src == "configmap" else {"OTHER": "x"}
-            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data}]}))
+            # #1004: snowplow's own ConfigMap, its env through envFrom (FAKE_FW_CM: its data)
+            fw_cm = json.loads(os.environ.get("FAKE_FW_CM", '{"DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS": "120"}'))
+            print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data},
+                                        {"metadata": {"name": "snowplow"}, "data": fw_cm}]}))
             sys.exit(0)
         if what == "svc":
             mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending
@@ -1001,6 +1064,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         print("error: timed out waiting for the condition on jobs/fresh606", file=sys.stderr)
         sys.exit(1)
     snow = next((x for x in a if x == "deploy/snowplow" or x.startswith("pod/snowplow")), None)
+    if a[:1] == ["logs"] and snow and any(x.startswith("--since-time=") for x in a) and os.environ.get("FAKE_FW_LOG"):
+        # #1004: the stage's read of snowplow's log since its start (FAKE_FW_LOG: its lines)
+        for ln in open(os.environ["FAKE_FW_LOG"]).read().splitlines():
+            print(ln, flush=True)
+        sys.exit(0)
     if a[:1] == ["logs"] and snow and "--previous" not in a:
         ts = "2026-10-21T06:00:00.5Z " if "--timestamps" in a else ""
         if "-f" not in a and snow.startswith("pod/") and os.environ.get("FAKE_SNOWPLOW_PODS"):
