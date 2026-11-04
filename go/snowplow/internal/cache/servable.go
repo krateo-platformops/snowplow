@@ -178,11 +178,12 @@ func (rw *ResourceWatcher) watchErrorHandlerForInstance(gvr schema.GroupVersionR
 				in.broken = true
 				in.brokenAt = pos
 				in.refused = refusedNow
+				in.watchErrs.Add(1) // #1146 — the install's off-lock position read is judged against it
 				if refusedNow {
 					aborted = rw.abortBuildLocked(gvr)
 				}
 			}
-			rw.mu.Unlock()
+			rw.unlockAndDetach() // #1146 — an abort retires the copy's delivery log
 			recordWatchError()
 			if aborted != nil {
 				aborted.endAll(outcomeAbortRefused, windowNow())
@@ -363,6 +364,14 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 		}
 	}
 
+	// #1146 — each informer's position is read here, with no lock held:
+	// LastSyncResourceVersion takes the informer's startedLock, which is never
+	// waited on under rw.mu.
+	rvs := make([]string, len(gis))
+	for i, gi := range gis {
+		rvs[i] = gi.Informer().LastSyncResourceVersion()
+	}
+
 	// Write confirmed + clear watchBroken on advanced RV, under the lock.
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -372,7 +381,7 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 		// result ({false,false,""}), exactly as the pre-#483 zero-value map read
 		// did; applyConfirmLocked ignores it under haveDisco==false either way.
 		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
-		rw.applyConfirmLocked(gvr, gis[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
+		rw.applyConfirmLocked(gvr, gis[i], rvs[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
 	}
 }
 
@@ -426,6 +435,12 @@ func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionR
 // confirm logic" constraint). Callers MUST hold rw.mu.Lock() and MUST have
 // called ensureConfirmMapsLocked.
 //
+//   - rv: gi's LastSyncResourceVersion, read by the caller with NO lock held
+//     (#1146: it takes the informer's startedLock, which a RemoveEventHandler
+//     can hold while it waits on a listener that waits on rw.mu). "" when the
+//     caller has no reading of THIS informer (it was replaced between the read
+//     and the lock): the recovery is then left to the next pass.
+//
 //   - haveDisco: a discovery client is wired (disco != nil). With no
 //     discovery client, conjunct 4 is degraded-true (resourceTypeConfirmedLocked
 //     returns true) so rw.confirmed is left untouched — identical to the
@@ -443,6 +458,7 @@ func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionR
 func (rw *ResourceWatcher) applyConfirmLocked(
 	gvr schema.GroupVersionResource,
 	gi informers.GenericInformer,
+	rv string,
 	haveDisco bool,
 	served bool,
 	known bool,
@@ -503,7 +519,6 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	// LastSyncResourceVersion. If it advanced since the last refresh AND
 	// the informer is currently synced, the WATCH is healthy again — clear
 	// watchBroken.
-	rv := gi.Informer().LastSyncResourceVersion()
 	prev := rw.lastSyncRV[gvr]
 	if watchHealed(rv, prev, gi.Informer().HasSynced()) {
 		delete(rw.listRefused, gvr) // #796 — a relist succeeded
@@ -622,6 +637,10 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		}
 	}
 
+	// #1146 — the informer's position, read with no lock held; it counts
+	// below only if that informer is still the registered one.
+	readGI, readRV := rw.informerPositionOf(gvr)
+
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	// Re-check registration under the write lock: a concurrent
@@ -641,7 +660,7 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		return
 	}
 	rw.ensureConfirmMapsLocked()
-	rw.applyConfirmLocked(gvr, curGI, disco != nil, res.served, res.known, res.reason, confirmRetractScopedConfirm)
+	rw.applyConfirmLocked(gvr, curGI, positionIfCurrent(curGI, readGI, readRV), disco != nil, res.served, res.known, res.reason, confirmRetractScopedConfirm)
 }
 
 // ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
@@ -711,6 +730,18 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		}
 	}
 
+	// #1146 — each informer's position, read with no lock held; a reading
+	// counts below only if its informer is still the registered one.
+	type readPosition struct {
+		gi informers.GenericInformer
+		rv string
+	}
+	reads := make(map[schema.GroupVersionResource]readPosition, len(gvrs))
+	for _, gvr := range gvrs {
+		gi, rv := rw.informerPositionOf(gvr)
+		reads[gvr] = readPosition{gi, rv}
+	}
+
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
@@ -724,8 +755,32 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 			continue
 		}
 		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
-		rw.applyConfirmLocked(gvr, curGI, disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
+		read := reads[gvr]
+		rw.applyConfirmLocked(gvr, curGI, positionIfCurrent(curGI, read.gi, read.rv), disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
 	}
+}
+
+// informerPositionOf returns gvr's registered informer and its
+// LastSyncResourceVersion, read with rw.mu NOT held (#1146). Callers MUST NOT
+// hold rw.mu.
+func (rw *ResourceWatcher) informerPositionOf(gvr schema.GroupVersionResource) (informers.GenericInformer, string) {
+	rw.mu.RLock()
+	gi := rw.informers[gvr]
+	rw.mu.RUnlock()
+	if gi == nil {
+		return nil, ""
+	}
+	return gi, gi.Informer().LastSyncResourceVersion()
+}
+
+// positionIfCurrent keeps a position read off the lock (informerPositionOf)
+// only if the informer it was read from is cur, the one registered now (N2:
+// the recovery is bound to the CURRENT informer); "" otherwise.
+func positionIfCurrent(cur, read informers.GenericInformer, rv string) string {
+	if cur == nil || cur != read {
+		return ""
+	}
+	return rv
 }
 
 // ServableGVRStatus is a read-only per-GVR servability snapshot row,

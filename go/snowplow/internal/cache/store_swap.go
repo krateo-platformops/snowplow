@@ -54,6 +54,13 @@
 //	  one send per listener (distribute :1094-1117)
 //	hub.mu → (released) → ledger mutex (leaf); /refreshes handler → ledger mutex
 //	rw.mu → storeVerify.mu; rw.mu → ledger mutex (leaf)
+//	rw.mu → NO informer lock (#1146): a stopping processor holds listenersLock
+//	  until its listeners return, a listener takes rw.mu.RLock, and
+//	  RemoveEventHandler holds startedLock while it waits for listenersLock.
+//	  So RemoveEventHandler runs after rw.mu is released (unlockAndDetach),
+//	  LastSyncResourceVersion is read before it is taken (installBuild, the
+//	  confirm passes), and the only informer calls left under rw.mu wire an
+//	  informer before it runs (TestIssue1146_NoInformerLockCallUnderRWMu).
 //
 // THE TRANSFORM CHAIN IS IDEMPOTENT. Under watch-list each object is
 // transformed twice (the reflector's temporary store, then
@@ -163,7 +170,10 @@ var perGVRFields = []perGVRField{
 			setMember(&rw.metadataOnly, g, c.shape.metadataOnly())
 		}},
 	// lastSyncRV is the conjunct-3 recovery baseline: the position the
-	// confirm pass last observed. The new copy's own position.
+	// confirm pass last observed. The new copy's own position, read before
+	// rw.mu (installBuild, #1146) — or, when the copy recorded a watch error
+	// after that read, the position at that error: the baseline the recovery
+	// rule must see advance.
 	{"lastSyncRV",
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.lastSyncRV[g]; return ok },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) { delete(rw.lastSyncRV, g) },
@@ -171,25 +181,25 @@ var perGVRFields = []perGVRField{
 			if rw.lastSyncRV == nil {
 				rw.lastSyncRV = map[schema.GroupVersionResource]string{}
 			}
-			if rv := c.gi.Informer().LastSyncResourceVersion(); rv != "" {
+			if rv := c.installBaseline(); rv != "" {
 				rw.lastSyncRV[g] = rv
 			} else {
 				delete(rw.lastSyncRV, g)
 			}
 		}},
 	// #918 — a log's pending keys and resolver go with its informer: the
-	// teardown closes the GVR's, and an install closes the replaced copy's.
+	// teardown retires the GVR's, and an install retires the replaced copy's.
+	// #1146 — retired here, under rw.mu; the handler is removed after the
+	// lock is released (unlockAndDetach).
 	{"deliveries",
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) bool { _, ok := rw.deliveries[g]; return ok },
 		func(rw *ResourceWatcher, g schema.GroupVersionResource) {
-			if dl := rw.deliveries[g]; dl != nil {
-				dl.close()
-			}
+			rw.retireDeliveryLogLocked(rw.deliveries[g])
 			delete(rw.deliveries, g)
 		},
 		func(rw *ResourceWatcher, g schema.GroupVersionResource, c *storeInstance) {
-			if old := rw.deliveries[g]; old != nil && old != c.dl {
-				old.close()
+			if old := rw.deliveries[g]; old != c.dl {
+				rw.retireDeliveryLogLocked(old)
 			}
 			if c.dl != nil {
 				rw.rememberDeliveryLogLocked(g, c.dl)
@@ -377,7 +387,7 @@ func (rw *ResourceWatcher) requestStoreBuildBound(gvr schema.GroupVersionResourc
 			return false
 		}
 		b.inst.closeStop()
-		b.inst.closeDeliveryLog()
+		rw.retireDeliveryLogLocked(b.inst.dl)
 		b.inst = c
 		superseded = true
 	}
@@ -389,7 +399,7 @@ func (rw *ResourceWatcher) requestStoreBuildBound(gvr schema.GroupVersionResourc
 			storeRepairsFiredTotal.Add(1)
 		}
 	}
-	rw.mu.Unlock()
+	rw.unlockAndDetach() // #1146 — a superseded copy's delivery log was retired
 	slog.Info("cache.store.swap.requested",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
@@ -520,7 +530,7 @@ func (rw *ResourceWatcher) abortBuildLocked(gvr schema.GroupVersionResource) *bu
 	}
 	delete(rw.builds, gvr)
 	b.inst.closeStop()
-	b.inst.closeDeliveryLog()
+	rw.retireDeliveryLogLocked(b.inst.dl)
 	markRepairPending(gvr, false)
 	return b.account
 }
@@ -545,7 +555,7 @@ func (rw *ResourceWatcher) noteCleanPass(gvr schema.GroupVersionResource, in *st
 	if len(acc.reasonList()) == 1 {
 		aborted = rw.abortBuildLocked(gvr)
 	}
-	rw.mu.Unlock()
+	rw.unlockAndDetach() // #1146 — the abort retired the copy's delivery log
 	acc.endReason(reasonDivergence, outcomeAbortClean, windowNow())
 	if aborted != nil {
 		noteSwapOutcome(gvr, outcomeAbortClean)
@@ -559,6 +569,14 @@ func (rw *ResourceWatcher) noteCleanPass(gvr schema.GroupVersionResource, in *st
 func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	gvr := c.gvr
 	swapStep(c, "before_install")
+	// #1146 — the new copy's position is read BEFORE rw.mu:
+	// LastSyncResourceVersion takes the informer's startedLock, which a
+	// RemoveEventHandler can hold while it waits on a listener that waits on
+	// rw.mu. The count of recorded watch errors is read first, so an error
+	// the copy records after this read is known to be newer than the position
+	// (watchStateNow, perGVRFields "lastSyncRV").
+	c.installAt = instancePosition{errs: c.watchErrs.Load()}
+	c.installAt.rv = c.gi.Informer().LastSyncResourceVersion()
 	// Step 1 — under rw.mu: re-check, write the state, retire the previous
 	// copy, unlock. The new copy serves reads from here, still muted.
 	rw.mu.Lock()
@@ -596,7 +614,9 @@ func (rw *ResourceWatcher) installBuild(c *storeInstance) {
 	retiring := append([]*storeInstance(nil), rw.retiring[gvr]...)
 	resetVerificationAfterSwap(gvr, acc.has(reasonDivergence))
 	installed := windowNow()
-	rw.mu.Unlock()
+	// #1146 — the replaced copy's delivery log was retired by the install
+	// ("deliveries"); its handler is removed here, before step 2 stops it.
+	rw.unlockAndDetach()
 	storeSwapStats.swaps.Add(1)
 	swapStep(c, "installed")
 

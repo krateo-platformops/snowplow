@@ -189,6 +189,14 @@ type ResourceWatcher struct {
 	// (store_divergence_unrecorded_total). Guarded by rw.mu.
 	deliveries map[schema.GroupVersionResource]*deliveryLog
 
+	// detachQueue (#1146) holds the delivery logs a critical section retired
+	// whose handlers are still attached: removing a handler takes the
+	// informer's locks, which may wait on a listener waiting on rw.mu, so it
+	// happens after the lock is released (retireDeliveryLogLocked,
+	// unlockAndDetach). Not per-GVR state: it is empty whenever rw.mu is free.
+	// Guarded by rw.mu.
+	detachQueue []*deliveryLog
+
 	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown
 	// EPISODE — a contiguous run of discovery-UNKNOWN conjunct-4 re-evals during
 	// which a granted confirmation is being held open. It rate-limits the WARN to
@@ -1839,7 +1847,9 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 		return
 	}
 	rw.mu.Lock()
-	defer rw.mu.Unlock()
+	// #1146 — the teardown retires the GVR's delivery log (and any build
+	// copy's) under the lock; their handlers are removed after it is released.
+	defer rw.unlockAndDetach()
 
 	// 1.12.7 — a teardown takes the GVR's confirmation with it. Count it only
 	// when one was actually held: deletePerGVRStateLocked deletes
@@ -1861,6 +1871,7 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 	// Close the per-GVR stop channel — exits the informer's Run
 	// goroutine and its sync-watcher.
 	rw.closePerGVRStopLocked(gvr)
+	teardownStep(gvr, "stop_closed")
 	// Purge every per-GVR map entry so no state outlives the informer.
 	rw.deletePerGVRStateLocked(gvr)
 
@@ -1869,6 +1880,20 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 		slog.String("gvr", gvr.String()),
 		slog.String("note", "per-GVR informer torn down — Run goroutine + sync-watcher reaped, per-GVR state purged"),
 	)
+}
+
+// teardownStepHookForTest, when non-nil, runs at named points of
+// removeResourceTypeWithReason ("stop_closed": the informer's stop channel is
+// closed, the per-GVR state not yet purged). It runs UNDER rw.mu, so it must
+// not take it. TEST-ONLY: production pays one atomic load per teardown. The
+// #1146 arm uses it to hold the teardown until the informer's processor is
+// waiting on a listener, the interleaving the deadlock needs.
+var teardownStepHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource, step string)]
+
+func teardownStep(gvr schema.GroupVersionResource, step string) {
+	if h := teardownStepHookForTest.Load(); h != nil {
+		(*h)(gvr, step)
+	}
 }
 
 // deletePerGVRStateLocked removes gvr from every per-GVR map. Callers
