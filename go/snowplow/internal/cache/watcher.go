@@ -197,6 +197,18 @@ type ResourceWatcher struct {
 	// Guarded by rw.mu.
 	detachQueue []*deliveryLog
 
+	// factoryIssued (#1146) records, per GVR, which shared factory (dynamic,
+	// metadata) has issued an informer for it. A factory caches one informer
+	// per GVR and has no eviction API, so after a teardown it would hand the
+	// SAME informer back: stopped and frozen (R6), and — while the teardown's
+	// handler removal still waits on its draining processor — holding the
+	// startedLock the re-registration's wiring takes under rw.mu (the #1146
+	// cycle, one hop longer). So a factory issues a GVR's informer once; a
+	// later registration of that GVR takes a standalone informer, as a
+	// removable GVR does. It describes the factory's cache, which outlives
+	// every registration: a teardown does not purge it. Guarded by rw.mu.
+	factoryIssued map[schema.GroupVersionResource]factoryIssue
+
 	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown
 	// EPISODE — a contiguous run of discovery-UNKNOWN conjunct-4 re-evals during
 	// which a granted confirmation is being held open. It rate-limits the WARN to
@@ -1029,7 +1041,9 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// so a build constructs its copy through the same one.
 	ownsInformer := false
 	shape := shapeFactoryMetadata
-	standalone := IsNavigationDiscoveredGroup(gvr.Group)
+	// #1146 — and so does a GVR the metadata factory already issued an
+	// informer for (factoryIssued).
+	standalone := IsNavigationDiscoveredGroup(gvr.Group) || rw.factoryIssued[gvr].metadata
 	if standalone {
 		ownsInformer = true // standalone: this GVR owns it outright
 		shape = shapeStandaloneMetadata
@@ -1054,6 +1068,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 			)
 		}
 		// Shared factory: NOT owned — ownsInformer stays false.
+		rw.noteFactoryIssuedLocked(gvr, factoryIssue{metadata: true})
 		gi = rw.metaFactory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
@@ -1536,7 +1551,10 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// identical — same navigation-derived predicate, same removable-iff-
 	// walker-discovered contract.
 	if gi == nil {
-		standalone := IsNavigationDiscoveredGroup(gvr.Group)
+		// #1146 — a GVR the factory already issued an informer for (it was
+		// registered and torn down) takes a standalone informer too: see
+		// factoryIssued.
+		standalone := IsNavigationDiscoveredGroup(gvr.Group) || rw.factoryIssued[gvr].dynamic
 		if standalone {
 			ownsInformer = true // standalone: this GVR owns it outright
 			shape = shapeStandaloneDynamic
@@ -1550,6 +1568,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			)
 		} else {
 			// Shared factory: NOT owned — ownsInformer stays false.
+			rw.noteFactoryIssuedLocked(gvr, factoryIssue{dynamic: true})
 			gi = rw.factory.ForResource(gvr)
 		}
 	}
@@ -1880,6 +1899,21 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 		slog.String("gvr", gvr.String()),
 		slog.String("note", "per-GVR informer torn down — Run goroutine + sync-watcher reaped, per-GVR state purged"),
 	)
+}
+
+// factoryIssue is which shared factories have issued a GVR's informer.
+type factoryIssue struct{ dynamic, metadata bool }
+
+// noteFactoryIssuedLocked records that a factory issued gvr's informer.
+// Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) noteFactoryIssuedLocked(gvr schema.GroupVersionResource, f factoryIssue) {
+	if rw.factoryIssued == nil {
+		rw.factoryIssued = map[schema.GroupVersionResource]factoryIssue{}
+	}
+	cur := rw.factoryIssued[gvr]
+	cur.dynamic = cur.dynamic || f.dynamic
+	cur.metadata = cur.metadata || f.metadata
+	rw.factoryIssued[gvr] = cur
 }
 
 // teardownStepHookForTest, when non-nil, runs at named points of

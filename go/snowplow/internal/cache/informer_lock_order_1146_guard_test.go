@@ -81,16 +81,19 @@ var informerLockCalls1146 = map[string]bool{
 
 // preRunWiring1146 — the listed calls that DO run under rw.mu, and why that
 // cannot close the cycle: each wires an informer BEFORE this watcher runs it,
-// in the critical section that registers it. An informer built in that section
-// (the streaming, standalone dynamic and standalone metadata branches, and
-// every build candidate) is reachable from no other goroutine: it has no
+// in the critical section that registers it, and that informer is one no other
+// goroutine has ever seen: built in that section (the streaming, standalone
+// dynamic and standalone metadata branches, and every build candidate), or
+// issued by a shared factory for the FIRST time — a factory issues a GVR's
+// informer once, and a GVR registered again after a teardown takes a
+// standalone one (factoryIssued, #1146 review N1). Such an informer has no
 // listener, no processor and no handler removal in flight, so its locks are
-// free. A shared-factory informer (factory.ForResource) is registered only for
-// a GVR R6 never tears down on its own (removable GVRs take a standalone
-// informer, watcher.go addResourceTypeLocked), and after this PR the only
-// holder of an informer lock that waits on a listener is a handler removal
-// (deliveryLog.detach), which runs on a torn-down GVR's informer with no lock
-// held.
+// free. (The informers a handler removal — deliveryLog.detach, the only holder
+// of an informer lock that waits on a listener — runs on are torn down, and
+// are never handed out again.)
+//
+// Known blind spots of the walk (closure values, local method values, a
+// retiring helper not named *Locked, detach-before-unlock): #1153.
 //
 // Key: the function that makes the call → the call. Value: the only functions
 // allowed to call that function (pinned: a new caller is a new path to review).

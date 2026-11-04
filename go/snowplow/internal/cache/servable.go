@@ -381,7 +381,16 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 		// result ({false,false,""}), exactly as the pre-#483 zero-value map read
 		// did; applyConfirmLocked ignores it under haveDisco==false either way.
 		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
-		rw.applyConfirmLocked(gvr, gis[i], rvs[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
+		// N2 (#1146 review) — re-read the informer under the write lock, as
+		// the scoped passes do: a GVR torn down since the snapshot is skipped
+		// (its confirmation and baseline must not be written back), and a
+		// position read from an informer since replaced does not count for
+		// its successor.
+		cur, stillRegistered := rw.informers[gvr]
+		if !stillRegistered {
+			continue
+		}
+		rw.applyConfirmLocked(gvr, cur, positionIfCurrent(cur, gis[i], rvs[i]), disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
 	}
 }
 

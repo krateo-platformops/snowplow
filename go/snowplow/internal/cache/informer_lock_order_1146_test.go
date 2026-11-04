@@ -21,18 +21,12 @@ package cache
 // break: that is reported as the deadlock.
 
 import (
-	"context"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
@@ -113,47 +107,14 @@ func cycle1146(stacks map[string]string, g1, g3 string, before map[string]bool) 
 }
 
 func TestIssue1146_TeardownDuringADeliveryWaitingOnRWMuCompletes(t *testing.T) {
-	t.Setenv("CACHE_ENABLED", "true")
-	kinds := rbacListKinds()
-	kinds[c854GVR] = "ThingList"
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(rbacScheme(t), kinds, []kruntime.Object{}...)
-	rw, err := NewResourceWatcher(context.Background(), dyn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// rw.Stop runs only when the teardown completed: after a deadlock it would
-	// wait on rw.mu forever and hang the package.
-	wedged := false
-	defer func() {
-		if !wedged {
-			rw.Stop()
-		}
-	}()
-	_, syncCh := rw.EnsureResourceType(c854GVR)
-	select {
-	case <-syncCh:
-	case <-time.After(verifyBound):
-		t.Fatal("PRECONDITION: the informer did not sync")
-	}
+	// A deadlocked watcher is never stopped (Stop would wait on its rw.mu) and
+	// is unbound from every process-wide singleton (newWatcher1146), so the
+	// rest of the package never reaches it: a RED stays a fast RED.
+	rw, dyn, wedged := newWatcher1146(t)
 
-	// G3 — the dep handler's ADD of the object created below parks here, on
-	// its listener goroutine, before it reaches rw.mu.
-	parked := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	var g3 string
-	depHook := func(gvr schema.GroupVersionResource) func() {
-		if gvr == c854GVR {
-			once.Do(func() {
-				g3 = currentGoroutineID1146()
-				close(parked)
-				<-release
-			})
-		}
-		return func() {}
-	}
-	depAddDeliveryHookForTest.Store(&depHook)
-	defer depAddDeliveryHookForTest.Store(nil)
+	// G3 — the dep handler's ADD of the object created below parks on its
+	// listener goroutine, before it reaches rw.mu.
+	g3, release := parkDepAdd1146(t, dyn, "t-1146")
 
 	// G1 — held after it closed the stop channel, under rw.mu, until G2 is
 	// waiting for its listeners; then G3 is let go towards rw.mu.
@@ -163,41 +124,15 @@ func TestIssue1146_TeardownDuringADeliveryWaitingOnRWMuCompletes(t *testing.T) {
 		if gvr != c854GVR || step != "stop_closed" {
 			return
 		}
-		ok := false
-		for end := time.Now().Add(verifyBound); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
-			if newDrainingProcessor1146(goroutineStacks1146(), before) {
-				ok = true
-				break
-			}
-		}
-		drained <- ok
+		drained <- waitFor1146(func(st map[string]string) bool { return newDrainingProcessor1146(st, before) })
 		close(release)
 	}
 	teardownStepHookForTest.Store(&tdHook)
 	defer teardownStepHookForTest.Store(nil)
 
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "c854.krateo.io/v1", "kind": "Thing",
-		"metadata": map[string]any{"namespace": "c854", "name": "t-1146"},
-	}}
-	if _, err := dyn.Resource(c854GVR).Namespace("c854").Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-parked:
-	case <-time.After(verifyBound):
-		t.Fatal("PRECONDITION: the ADD never reached the dep handler")
-	}
-
 	before = drainingProcessors1146(goroutineStacks1146())
-	done := make(chan struct{})
-	g1c := make(chan string, 1)
-	go func() {
-		defer close(done)
-		g1c <- currentGoroutineID1146()
-		rw.RemoveResourceType(c854GVR)
-	}()
-	g1 := <-g1c
+	*wedged = true // until the teardown has returned
+	g1, done := goTracked1146(func() { rw.RemoveResourceType(c854GVR) })
 	select {
 	case ok := <-drained:
 		if !ok {
@@ -210,27 +145,16 @@ func TestIssue1146_TeardownDuringADeliveryWaitingOnRWMuCompletes(t *testing.T) {
 	// Either the teardown returns, or the cycle forms. Each is decided by
 	// what the goroutines are doing, not by how long they take; the bound
 	// only stops a run where neither ever shows.
-	seen := 0
-	for end := time.Now().Add(2 * verifyBound); time.Now().Before(end); {
-		select {
-		case <-done:
-			return
-		case <-time.After(20 * time.Millisecond):
-		}
-		if cycle1146(goroutineStacks1146(), g1, g3, before) {
-			seen++
-		} else {
-			seen = 0
-		}
-		if seen >= 3 {
-			wedged = true
-			t.Fatalf("#1146 RED: DEADLOCK — the teardown holds rw.mu inside RemoveEventHandler (deletePerGVRStateLocked), " +
-				"the informer's processor holds listenersLock waiting for its listeners, and the dep listener waits for " +
-				"rw.mu.RLock (syncChState). Every cache read now waits on rw.mu forever.")
-		}
+	switch awaitOrCycle1146(func(st map[string]string) bool { return cycle1146(st, g1, g3(), before) }, done) {
+	case "":
+		*wedged = false
+	case "DEADLOCK":
+		t.Fatalf("#1146 RED: DEADLOCK — the teardown holds rw.mu inside RemoveEventHandler (deletePerGVRStateLocked), " +
+			"the informer's processor holds listenersLock waiting for its listeners, and the dep listener waits for " +
+			"rw.mu.RLock (syncChState). Every cache read now waits on rw.mu forever.")
+	default:
+		t.Fatal("the teardown neither completed nor formed the #1146 cycle")
 	}
-	wedged = true
-	t.Fatal("the teardown neither completed nor formed the #1146 cycle")
 }
 
 // fakeRemoval1146 is an informer whose RemoveEventHandler records the call and
