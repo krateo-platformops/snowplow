@@ -39,4 +39,5 @@ func RegisterExpvarForTest() {
 	registerReflectorPathExpvar()
 	registerStoreVerificationExpvar()
 	registerStoreSwapExpvar()
+	registerRefreshCycleExpvar() // #1070
 }

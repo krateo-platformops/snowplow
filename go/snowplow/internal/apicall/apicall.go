@@ -29,6 +29,23 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 )
 
+// SplitURI splits a rendered request URI into its path and raw query the way
+// net/url does — and so the way the apiserver sees it, because the HTTP
+// request is built with url.Parse and a fragment is never sent (#1073 F1).
+// The fragment is cut FIRST, at the first '#'; the query is then what follows
+// the first '?' of the rest. So `...?a=1#b=2` has query "a=1", and
+// `.../widgets#x?a=1` has no query at all. hasQuery is true when a '?' is
+// present (before any '#'), even with an empty query after it.
+//
+// Every site that reads the path or the query of a RENDERED call path —
+// to parse its coordinates, plan its selectors or authorize it — reads them
+// through this one function, so snowplow decides about the request the
+// apiserver receives.
+func SplitURI(p string) (path, rawQuery string, hasQuery bool) {
+	p, _, _ = strings.Cut(p, "#")
+	return strings.Cut(p, "?")
+}
+
 // ParsePath extracts (gvr, namespace, name) from a fully-resolved apiserver
 // path. It returns name="" for a LIST form and ok=false for a non-apiserver
 // path, an unresolved JQ fragment or a malformed shape.
@@ -47,10 +64,9 @@ import (
 // Subresource suffixes (e.g. ".../status", ".../scale") are accepted and
 // attributed to the parent resource.
 func ParsePath(path string) (gvr schema.GroupVersionResource, namespace, name string, ok bool) {
-	// Strip query string.
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	// Strip the fragment and the query string, as the apiserver never sees
+	// them in the path (SplitURI).
+	path, _, _ = SplitURI(path)
 	// Strip trailing slash.
 	path = strings.TrimRight(path, "/")
 
@@ -215,10 +231,7 @@ type Query struct {
 // repeated param, an unparseable selector, any query on a GET-by-name, and
 // any param not listed here.
 func PlanQuery(p string, isList, namespaced bool) Query {
-	raw := ""
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		raw = p[i+1:]
-	}
+	_, raw, _ := SplitURI(p)
 	if raw == "" {
 		return Query{Applicable: true}
 	}

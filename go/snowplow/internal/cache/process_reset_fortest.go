@@ -109,6 +109,10 @@ func ResetCacheProcessStateForTest() error {
 	// a sibling's marks or counters. Composed — #471.
 	ResetStaleOwedForTest()
 
+	// 5b3 — #1062 the stale-push ledger: process-global, keyed by L1 keys served
+	// stale, with its counters and histograms. Composed — #471.
+	ResetStalePushForTest()
+
 	// 5c — #560 live-refresh arming counters. Process-global (the stamp site is
 	// in dispatchers and the arrival site in handlers, so neither owns them), so
 	// a test asserting on the quartet would otherwise read a sibling's
@@ -120,6 +124,12 @@ func ResetCacheProcessStateForTest() error {
 	// asserting on a class count would read a sibling's failures. Composed
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
+
+	// 5d‴ — #1070 the refresh-cycle family (put_total, wait / duration /
+	// put_to_frame histograms). Process-global (the store, the refresher and the
+	// broadcaster all record into it), so a test asserting on a sample count
+	// would read a sibling's refreshes. Composed — #471.
+	ResetRefreshCycleForTest()
 
 	// 5d″ — #841 the seed-origin counters (cells seeded / hit per seed class)
 	// and the kept / unmatched representative counts. Process-global, so a test

@@ -67,6 +67,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -127,6 +128,11 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 // trip of a request that carries one runs under its deadline.
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
+		// #1054 — innermost: every attempt (a client-go 429 retry included)
+		// is recorded on the slow-call record of the request that sent it.
+		rc.Wrap(slowcall.Transport)
+		// #1115 — the customer page budget: a round trip of a request that
+		// carries one runs under its deadline.
 		rc.Wrap(BudgetTransport)
 		rc.Wrap(CountResolveCollectionLists)
 		rc.Wrap(RefuseRedirectHops)
@@ -154,7 +160,11 @@ func noClientRateLimit(rc *rest.Config) {
 // customer page budget (BudgetTransport) is innermost.
 func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
-	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(c.Transport)))
+	base := c.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c
 }
 

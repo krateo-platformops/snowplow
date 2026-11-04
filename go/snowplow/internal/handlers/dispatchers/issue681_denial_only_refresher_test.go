@@ -17,7 +17,7 @@ package dispatchers
 //       object is never SA-dialled (#677 (1)).
 //   R2  (H4) GRANT: a Role RULE edit grants the ConfigMap; the next dirty mark
 //       re-resolves and Puts the fuller body.
-//   R5  (H2/H8) mixed: a denial plus a 404 is NOT Put and the window ends
+//   R5  (H2/H8) mixed: a denial plus a 5xx is NOT Put and the window ends
 //       KNOWN-STALE(declined), exactly as before #681.
 //   H10 census: every dispatchers Put gate that reads a StageErrorSink count
 //       goes through cache.DenialOnly (no gate site can be missed).
@@ -157,6 +157,7 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		"/api/v1/namespaces/team-b/configmaps/catalog",
 		"/api/v1/namespaces/team-a/configmaps/other",
 		"/api/v1/namespaces/team-a/configmaps/ghost",
+		"/api/v1/namespaces/team-a/configmaps/boom",
 	} {
 		e.byPath[p] = &atomic.Int64{}
 	}
@@ -168,6 +169,12 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		seg := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if strings.HasSuffix(r.URL.Path, "/boom") {
+			// A transient apiserver failure (#1080: never a definite answer).
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500,"message":"boom"}`)
+			return
+		}
 		if len(seg) == 6 && seg[0] == "api" && seg[4] == "configmaps" && !e.missing[seg[5]] {
 			_, _ = fmt.Fprintf(w, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":%q,"name":%q},"data":{"k":"v"}}`, seg[3], seg[5])
 			return
@@ -263,6 +270,7 @@ const (
 	i677Denied  = "/api/v1/namespaces/team-b/configmaps/catalog"
 	i677Allowed = "/api/v1/namespaces/team-a/configmaps/other"
 	i677Ghost   = "/api/v1/namespaces/team-a/configmaps/ghost"
+	i677Boom    = "/api/v1/namespaces/team-a/configmaps/boom"
 )
 
 func i677DefaultRA() *unstructured.Unstructured {
@@ -341,14 +349,17 @@ func TestIssue681_R2_GrantRotates_NextRefreshPutsFuller(t *testing.T) {
 	}
 }
 
+// R5 — the other error is a 5xx. (Before #1080 it was a 404 of team-a/ghost;
+// the configmaps informer this resolve registers makes that a watched named
+// object's NotFound, a definite answer itself — issue1080's arms.)
 func TestIssue681_R5_MixedDenialAndOtherError_Declined_KnownStale(t *testing.T) {
-	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("ghost", i677Ghost)))
+	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("boom", i677Boom)))
 	e.cycle(t)
-	if e.pathDials(i677Ghost) != 1 {
-		t.Fatalf("precondition: the 404 stage dialled %d", e.pathDials(i677Ghost))
+	if e.pathDials(i677Boom) != 1 {
+		t.Fatalf("precondition: the 5xx stage dialled %d", e.pathDials(i677Boom))
 	}
 	if e.body(t) != `{"prior":true}` {
-		t.Fatalf("R5 RED: a denial + 404 refresh was Put: %s", e.body(t))
+		t.Fatalf("R5 RED: a denial + 5xx refresh was Put: %s", e.body(t))
 	}
 	if _, reason, ok := cache.KnownStale(e.key); !ok || reason != "declined" {
 		t.Fatalf("R5 (H8): the declined refresh must end KNOWN-STALE(declined); got ok=%v reason=%q", ok, reason)

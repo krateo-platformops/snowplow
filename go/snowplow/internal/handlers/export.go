@@ -250,17 +250,13 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			outcome = "failure"
 		}
-		audit.Emit(req.Context(), audit.Event{
-			Action:    "export",
-			Verb:      http.MethodGet,
-			Resource:  req.URL.Query().Get("resource"),
-			Name:      name,
-			Namespace: req.URL.Query().Get("namespace"),
-			Outcome:   outcome,
-			Code:      code,
-			Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
-				format, rowCount, pages, truncated),
-		})
+		// #1055 — the record names the method the export was sent with (GET
+		// or POST) and the target it resolved, through the helper every
+		// audited request builds its record with.
+		ev := requestAuditEvent("export", req.Method, exportAuditTarget(req.URL.Query()), outcome, code)
+		ev.Message = fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
+			format, rowCount, pages, truncated)
+		audit.Emit(req.Context(), ev)
 	}
 
 	if format == "pdf" {

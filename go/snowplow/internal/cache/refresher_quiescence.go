@@ -85,12 +85,13 @@ func (w *refresherWorkCount) NewRetriesMetric(string) workqueue.CounterMetric { 
 
 // newRefresherTierQueue builds one tier's rate-limiting queue over base (nil:
 // the default queue) counting into w. name only enables client-go's metrics
-// hooks; it is never published.
-func newRefresherTierQueue(name string, rl workqueue.TypedRateLimiter[string], w *refresherWorkCount, base func(workqueue.TypedInterface[string]) workqueue.TypedInterface[string]) workqueue.TypedRateLimitingInterface[string] {
+// hooks; it is never published. #1070 — every insert stamps the key into
+// stamps (refresh_cycle.go stampingQueue), the start of its wait for a worker.
+func newRefresherTierQueue(name string, rl workqueue.TypedRateLimiter[string], w *refresherWorkCount, stamps *enqueueStamps, base func(workqueue.TypedInterface[string]) workqueue.TypedInterface[string]) workqueue.TypedRateLimitingInterface[string] {
 	q := workqueue.NewTypedWithConfig(workqueue.TypedQueueConfig[string]{Name: name, MetricsProvider: w})
-	var inner workqueue.TypedInterface[string] = q
+	var inner workqueue.TypedInterface[string] = &stampingQueue{TypedInterface: q, stamps: stamps}
 	if base != nil {
-		inner = base(q)
+		inner = base(inner)
 	}
 	return workqueue.NewTypedRateLimitingQueueWithConfig(rl, workqueue.TypedRateLimitingQueueConfig[string]{
 		DelayingQueue: workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Queue: inner}),

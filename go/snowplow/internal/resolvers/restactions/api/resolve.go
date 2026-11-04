@@ -36,6 +36,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -404,6 +405,21 @@ func (r *resolveRun) recordRBACDeny(dictMu *sync.Mutex, itemErrs []error, id str
 		itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, deny)
 	}
 	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
+// recordDefiniteNotFound records a #1080 definite NotFound decided at branch C
+// (N2): the canonical identity-free NotFound body under errorKey, the item
+// error a stage without continueOnError would carry (never, by the classifier),
+// and a bump of the per-identity definite-answer sink at the same site, for the
+// same item, as the stage-error bump. Not external: branch C's SA dial is not an
+// external touch.
+func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, msg string) {
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+	}
+	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
 	notePerIdentityForbidden(r.ctx, false)
 }
 
@@ -1242,6 +1258,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
 				// canonical body (per_identity_forbidden.go).
 				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
+			} else if nf, ok := classifyAuthorizedNotFound(call, ierr); ok {
+				// #1080 N2 — an authorized GET of a named object that does not
+				// exist: a definite answer, with its canonical body.
+				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, nf)
 			} else {
 				var itemErr error
 				if !call.ContinueOnError {
@@ -1524,7 +1544,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := withDialAnswer(fctx)
+	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
+	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
+	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")
 	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
+	dial.EndErr(fctx, fetchErr)
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
 		// (the boot-readiness bound, a cut scope, a client that left). Counted,
@@ -1612,6 +1636,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if isOwnDenied {
 			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
 		}
+		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
+		// dial of a named object, in a continueOnError stage, that the watcher
+		// confirms absent: a definite answer for this identity (the apiserver
+		// authorized the `get` first), recorded with the canonical NotFound body
+		// and counted on the same sink (external: this dial bumped the sink).
+		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
+		if isOwnNotFound {
+			accumVal, bumpMsg = canonicalNotFoundBody(ownNotFound), ownNotFound
+		}
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
@@ -1623,7 +1656,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
-		if isOwnDenied {
+		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}
 		// Fall through to the success-log line (preserves

@@ -266,10 +266,7 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 	// Inspect the RAW rendered path, query-stripped (mirror the parser's own
 	// query strip) but NOT trailing-slash-trimmed — the collapse discriminators
 	// below depend on the "//" and trailing "/" the parser would erase.
-	p := path
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		p = p[:i]
-	}
+	p, _, _ := splitPathQuery(path) // fragment and query dropped (#1073 F1)
 
 	// Collapsed NAMESPACE — the empty segment "/namespaces//" (blocker fix).
 	if strings.Contains(p, "/namespaces//") {

@@ -21,6 +21,8 @@ import (
 	"encoding/hex"
 	"strconv"
 	"strings"
+
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
 // ServiceName is the only resource service.name accepted. A ResourceSpans
@@ -32,26 +34,116 @@ const ServiceName = "krateo-frontend"
 // directly (otel_traces.ScopeName).
 const ScopeName = "snowplow/rum-ingest"
 
-// SpanNames are the only span names forwarded (#1015).
-var SpanNames = map[string]bool{
-	"krateo.page.load":        true,
-	"krateo.composition.open": true,
-	"krateo.form.submit":      true,
-	"krateo.page.publish":     true,
-	"krateo.widget.fetch":     true,
-}
+// Span names forwarded (#1015). SpanWidgetFetch is in routes.go.
+const (
+	SpanPageLoad        = "krateo.page.load"
+	SpanCompositionOpen = "krateo.composition.open"
+	SpanFormSubmit      = "krateo.form.submit"
+	SpanPagePublish     = "krateo.page.publish"
+)
 
-// Attribute keys forwarded, each with the only values it may carry. Every
-// other span attribute is dropped and counted. The rest of the #1015
-// allowlist is span FIELDS rather than attributes: traceId, spanId and
-// parentSpanId (the traceparent ids, which link krateo.widget.fetch to
-// snowplow's Server span), kind, start and end time (the duration) and the
-// status code (never its message).
+// Attribute keys a forwarded span may carry; spanAllowlist says on which span
+// names and with which values. The rest of the #1015 allowlist is span FIELDS
+// rather than attributes: traceId, spanId and parentSpanId (the traceparent
+// ids, which link krateo.widget.fetch to snowplow's Server span), kind, start
+// and end time (the duration) and the status code (never its message).
 const (
 	AttrRoute  = "http.route"
 	AttrMethod = "http.request.method"
 	AttrStatus = "http.response.status_code"
+	// AttrInteractionAbandoned marks an interaction the user left before it
+	// finished (frontend contract, 2026-11-01): it is excluded from the
+	// latency SLI but NOT dropped, so it still counts for throughput and
+	// error rate. That is why it is a bool attribute and never a span status
+	// (ERROR would move it into the error-rate SLI). The frontend only ever
+	// sends true; absent means not abandoned.
+	AttrInteractionAbandoned = "krateo.interaction.abandoned"
 )
+
+// valueCheck returns the value to forward for one attribute, rebuilt from the
+// decoded input, or false when the value is not one the key allows. routes is
+// snowplow's live routing table (nil when the ingest has none).
+type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
+
+// spanAllowlist is the whole #1015 attribute allowlist: per forwarded span
+// name, the attribute keys that span may carry and each key's value check. A
+// span whose name is not a key here is dropped (dropped_name); an attribute
+// whose key is not in its span's set, or whose value fails the key's check,
+// is dropped and counted (attributes_dropped).
+//
+//   - The http.* keys are allowed on every span. http.route has two checks
+//     (Diego, 2026-10-30, #1020 F3: "exact where possible, trust the rest"):
+//     on krateo.widget.fetch it names a snowplow route, so it must be EXACTLY
+//     one of the live mux's routes (registeredRoute); on the page-level spans
+//     it is the portal router's pattern, which snowplow cannot know, so it
+//     passes the template check (routeTemplate).
+//   - krateo.interaction.abandoned is allowed only on the three interaction
+//     spans, and only as bool true (frontend contract, 2026-11-01). On
+//     krateo.widget.fetch (a child span) and krateo.page.load it is dropped.
+var spanAllowlist = map[string]map[string]valueCheck{
+	SpanWidgetFetch: {
+		AttrRoute: registeredRoute, AttrMethod: methodToken, AttrStatus: statusCode,
+	},
+	SpanPageLoad: {
+		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
+	},
+	SpanCompositionOpen: {
+		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
+		AttrInteractionAbandoned: boolTrue,
+	},
+	SpanFormSubmit: {
+		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
+		AttrInteractionAbandoned: boolTrue,
+	},
+	SpanPagePublish: {
+		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
+		AttrInteractionAbandoned: boolTrue,
+	},
+}
+
+// registeredRoute: a string that is exactly one of snowplow's own routes.
+func registeredRoute(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && routes != nil && routes(*s) {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// routeTemplate: a string that passes validRoute (no query string, escape or
+// space; no token- or JWT-shaped segment).
+func routeTemplate(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && validRoute(*s) {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// methodToken: a string that is an upper-case HTTP method token.
+func methodToken(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && methods[*s] {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// statusCode: an integer from 100 to 599.
+func statusCode(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if n := v.IntValue; n != nil && *n >= 100 && *n <= 599 {
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: int64(*n)}}, true
+	}
+	return nil, false
+}
+
+// boolTrue: exactly the bool true, and no other member of the value (members
+// counts every member the decoder saw, skipped ones included). false is never
+// sent by contract, and a string "true", an int or any other type is not a
+// bool: each is dropped, never coerced.
+func boolTrue(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if b := v.BoolValue; b != nil && *b && v.members == 1 {
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}, true
+	}
+	return nil, false
+}
 
 var methods = map[string]bool{
 	"GET": true, "HEAD": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "OPTIONS": true,
@@ -131,11 +223,19 @@ type span struct {
 }
 
 type keyValue struct {
-	Key   string `json:"key"`
-	Value struct {
-		StringValue *string    `json:"stringValue"`
-		IntValue    *jsonInt64 `json:"intValue"`
-	} `json:"value"`
+	Key   string
+	Value anyValue
+}
+
+// anyValue keeps the AnyValue members some check reads; decode.go scans past
+// every other member without building it, but counts it in members. An OTLP
+// AnyValue is a oneof, so a conforming value has exactly one member; a check
+// that must see one and only one value (boolTrue) reads members.
+type anyValue struct {
+	StringValue *string
+	IntValue    *jsonInt64
+	BoolValue   *bool
+	members     int // every member of the value object, kept or skipped
 }
 
 // jsonUint64 / jsonInt64 accept the two encodings OTLP/JSON allows for 64-bit
