@@ -26,8 +26,12 @@
 //	    an attempt that succeeds → rerun unchanged, the slot released, no second
 //	    attempt (architect-ch's gate: the still-known-stale check had no arm).
 //
-// K5 (the rerun bypasses the admission cap) lands with PR-2b's customer-
-// triggered marker, which is not on main yet (ruling: "whichever lands second").
+// K5 (the rerun bypasses the admission cap) is not in this file. The
+// customer-triggered marker it needed is on main: the refresher marks a
+// dequeue whose known-stale background slot is held — an absorbed read's rerun
+// included — as customer-triggered (refresher.go, "#740 K5"). Its arm is
+// TestIssue740_K5_TheBackgroundSlotDequeueIsCustomerTriggeredAtBothGates in
+// issue740_viewer_retry_test.go.
 package dispatchers
 
 import (

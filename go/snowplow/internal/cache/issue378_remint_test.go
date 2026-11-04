@@ -43,8 +43,10 @@ import (
 	"time"
 )
 
-// r378RefreshPutter is the #378 refresher-terminal carrier, reached through an
-// interface so this file compiles where it does not exist yet.
+// r378RefreshPutter is the #378 refresher-terminal carrier
+// (ResolvedCacheStore.replaceIfGenRefresh, resolved.go). It is reached through
+// an interface so the arm was RED, not a compile failure, on a tree without
+// the method; it exists now, and losing it reads as the #378 RED below.
 type r378RefreshPutter interface {
 	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
 }
