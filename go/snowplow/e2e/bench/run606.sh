@@ -216,6 +216,10 @@ MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S 
 # Every other bounded step (seconds). Each one is ENFORCED where it runs.
 UP_BUDGET_S="${UP_BUDGET_S:-1800}"            # reap + gke-up (+ node pools)
 INSTALL_TIMEOUT_S="${INSTALL_TIMEOUT_S:-900}"  # helm install --wait --timeout
+# installer#614 (s_cert_manager): cert-manager's install and its waits share ONE
+# bound, helm's own default --timeout (5m0s), the one cert-manager's documented
+# `helm install` runs under. Not a knob: it goes away with the step.
+CERT_MANAGER_TIMEOUT_S=300
 DEPLOY_WAIT_S="${DEPLOY_WAIT_S:-1800}"        # snowplow/frontend/authn Available
 DATA_TIMEOUT_S="${DATA_TIMEOUT_S:-2400}"      # data606 (run 8: 1041 s)
 ROLLOUT_TIMEOUT_S="${ROLLOUT_TIMEOUT_S:-2700}" # reboot: rollout status
@@ -299,7 +303,7 @@ FW_WIDEN_WAIT_S=$(( PREFLIGHT_TIMEOUT_S + COLLECT_TIMEOUT_S + FW_EXEC_S ))
 FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
 [[ -n "$FULL_WIDEN_GO" ]] && FW_S=$(( FW_APPLIES * COLLECT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + FW_CREATE_S + FW_JOB_S
                                      + FW_READS * COLLECT_TIMEOUT_S + FW_DELETES * COLLECT_TIMEOUT_S + FW_DELETE_S ))
-RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
+RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
@@ -316,7 +320,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -763,6 +767,73 @@ s_registry() {
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
   (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1; }
+}
+# installer#614: cert-manager BEFORE the installer, exactly as krateo-057 has it
+# (bench/cert_manager.py says what and why). Installer 0.3.506 ships it only
+# under features.ingress, which the bench leaves off; the ClickHouse and
+# MongoDB operators need cert-manager.io, so without it they and their 5
+# dependents are never created (run 21: 33 of 40 declared components). 057
+# has it only because it was installed there by hand, outside the installer.
+# Both steps go away once the installer ships cert-manager itself.
+# The readiness rules are untouched: the declared-vs-created count found this.
+#
+# s_cert_manager_source: BEFORE any cluster exists, in the dry pass too (a
+# registry read, like s_source): the pinned chart is pulled, its archive's
+# sha256 verified, and the Deployments and CRDs to wait for derived from it.
+s_cert_manager_source() {
+  local rc=0 ln
+  python3 -m bench.cert_manager preflight --workdir "$OUT/cert-manager" \
+      --out "$OUT/cert-manager-preflight.json" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) || { record_failure "cert-manager source FAILED: the pinned chart did not verify ($OUT/cert-manager-preflight.json)"; return 1; }
+}
+# cm_field <field>: one field of the preflight's record (a list, space-joined)
+cm_field() {
+  python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))[sys.argv[2]]; print(" ".join(v) if isinstance(v, list) else v)' \
+      "$OUT/cert-manager-preflight.json" "$1"
+}
+# s_cert_manager: the verified archive installed (never a second pull), then
+# its Deployments Available and its CRDs Established, all under one bound
+# (CERT_MANAGER_TIMEOUT_S); then the run's record, as helm reads it back,
+# compared with 057's reading ($OUT/cert-manager.jsonl, the verdict's report).
+s_cert_manager() {
+  local t0=$SECONDS left chart values d c deps=() crds=()
+  chart="$(cm_field chart_file)" && values="$(cm_field values_file)" \
+    || { record_failure "cert-manager FAILED: its preflight record is unreadable"; return 1; }
+  for d in $(cm_field deployments); do deps+=("deployment/$d"); done
+  for c in $(cm_field crds); do crds+=("crd/$c"); done
+  (( ${#deps[@]} > 0 && ${#crds[@]} > 0 )) \
+    || { record_failure "cert-manager FAILED: its preflight record names no Deployment or no CRD to wait for"; return 1; }
+  run "${H[@]}" install cert-manager "$chart" -n cert-manager --create-namespace -f "$values" \
+      --wait --timeout "${CERT_MANAGER_TIMEOUT_S}s" 2>"$KERR" \
+    || { record_failure "cert-manager FAILED: helm install"; return 1; }
+  left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
+  run "${K[@]}" -n cert-manager wait --for=condition=Available --timeout="${left}s" "${deps[@]}" >/dev/null 2>"$KERR" \
+    || { record_failure "cert-manager FAILED: its Deployments not Available within ${CERT_MANAGER_TIMEOUT_S}s"; return 1; }
+  left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
+  run "${K[@]}" wait --for=condition=Established --timeout="${left}s" "${crds[@]}" >/dev/null 2>"$KERR" \
+    || { record_failure "cert-manager FAILED: its CRDs not Established within ${CERT_MANAGER_TIMEOUT_S}s"; return 1; }
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: helm list / get values -n cert-manager -> python3 -m bench.cert_manager record -> $OUT/cert-manager.jsonl"
+    return 0
+  fi
+  # the readback, under what is left of the step's one bound
+  left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
+  bounded "$left" "${H[@]}" list -n cert-manager -o json > "$OUT/cert-manager-helm-list.json" 2>"$KERR" \
+    || { record_failure "cert-manager FAILED: helm list (within ${CERT_MANAGER_TIMEOUT_S}s)"; return 1; }
+  left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
+  bounded "$left" "${H[@]}" get values cert-manager -n cert-manager -o json > "$OUT/cert-manager-helm-values.json" 2>"$KERR" \
+    || { record_failure "cert-manager FAILED: helm get values (within ${CERT_MANAGER_TIMEOUT_S}s)"; return 1; }
+  local rc=0 ln
+  python3 -m bench.cert_manager record --preflight "$OUT/cert-manager-preflight.json" \
+      --helm-list "$OUT/cert-manager-helm-list.json" --helm-values "$OUT/cert-manager-helm-values.json" \
+      --out "$OUT/cert-manager.jsonl" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) || { record_failure "cert-manager FAILED: the installed release does not mirror krateo-057's"; return 1; }
 }
 s_install() {
   [[ -s "$OUT/installer-values.yaml" ]] || write_installer_values
@@ -1922,6 +1993,7 @@ s_evaluate() {
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
+               "$OUT"/cert-manager*.jsonl
                "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
@@ -2192,11 +2264,13 @@ s_full_widen() {
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s; ${TTL_HOW}) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
+step cert-manager-source s_cert_manager_source
 step schema    s_schema
 step registry  s_registry
 step reap      s_reap
 step up        s_up
 step psi       s_psi
+step cert-manager s_cert_manager
 step install   s_install
 step platform  s_wait_platform
 if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi

@@ -231,7 +231,9 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
     assert "--from-file=.dockerconfigjson=/dev/stdin" in dcj["argv"]
     calls = _calls(state)
     i_secrets = [i for i, c in enumerate(calls) if c["tool"] == "kubectl" and "secret" in c["argv"]]
-    i_install = next(i for i, c in enumerate(calls) if c["tool"] == "helm" and "install" in c["argv"])
+    # the installer's own install (installer#614: cert-manager's comes before it)
+    i_install = next(i for i, c in enumerate(calls) if c["tool"] == "helm" and "install" in c["argv"]
+                     and "installer" in c["argv"])
     assert len(i_secrets) == 2 and max(i_secrets) < i_install
     # the username: piped into helm's `-f -` (#1007 F2), no file: helm received it
     helm = calls[i_install]["argv"]

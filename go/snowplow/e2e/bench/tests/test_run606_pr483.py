@@ -169,7 +169,7 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert "=== step data ===" in p.stderr and "=== step measure ===" in p.stderr
     helm = [c["argv"] for c in _calls(state) if c["tool"] == "helm"]
     assert helm[0][:2] == ["show", "chart"] and "0.3.425" in helm[0]
-    install = [a for a in helm if "install" in a]
+    install = [a for a in helm if "install" in a and "installer" in a]   # installer#614: not cert-manager's
     assert len(install) == 1
     assert "oci://ghcr.io/krateo-platformops/charts/installer" in install[0]
     assert install[0][install[0].index("--version") + 1] == "0.3.425"

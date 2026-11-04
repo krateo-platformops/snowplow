@@ -352,12 +352,34 @@ def test_the_gate_reads_and_records_the_cdcs_resync_from_each_source(harness, cd
     assert "WARNING: the cdc's resync" not in out
 
 
+# The harness plan's numbers (its run-budget line, installer#614): budget 19,160 s
+# (18,860 s + the 300 s cert-manager term), TTL derived 6 h = 21,600 s, margin
+# 1,800 s -> slack 640 s (940 s before installer#614). The TTL is whole hours, so
+# the slack is its round-up remainder: both sides of the property are pinned here
+# by hand, never derived from the code under test, so a budget change shows which
+# side moved. A resync's excess = 2 x (resync - the 180 s budget term).
+HARNESS_TTL_SLACK_S = 640
+
+
 def test_a_resync_past_the_budget_term_warns_within_the_ttl_slack(harness):  # noqa: F811
-    """#1006 F5 (M22) / F8: 10m reads past the budget's 180s term; the derived
-    TTL's slack holds its window: said, and the run goes on."""
-    p, out, d = _run(harness, FAKE_CDC_RESYNC="args:10m")
+    """#1006 F5 (M22) / F8: 8m reads past the budget's 180s term; its excess,
+    2 x (480 - 180) = 600 s, is under the harness plan's 640 s slack: said, and
+    the run goes on."""
+    p, out, d = _run(harness, FAKE_CDC_RESYNC="args:8m")
     assert p.returncode == 0, out[-3000:]
-    assert "WARNING: the cdc's resync (600s) exceeds the run budget's 180s" in out
+    assert "WARNING: the cdc's resync (480s) exceeds the run budget's 180s" in out
+    assert f"the TTL's {HARNESS_TTL_SLACK_S}s slack" in out
+
+
+def test_a_resync_whose_excess_is_past_the_slack_is_refused(harness):  # noqa: F811
+    """The twin: 10m's excess, 2 x (600 - 180) = 840 s, is past the harness
+    plan's 640 s slack: refused at the gate, before data. (It fitted the 940 s
+    slack before installer#614's term only by the whole-hour TTL's rounding.)"""
+    p, out, d = _run(harness, FAKE_CDC_RESYNC="args:10m")
+    assert p.returncode != 0
+    assert ("the installer cdc resyncs every 600s: its window exceeds the run budget's 180s term by "
+            f"more than the TTL's {HARNESS_TTL_SLACK_S}s slack") in out
+    assert "=== step env ===" not in out
 
 
 def test_a_resync_past_what_the_ttl_holds_stops_the_run(harness):  # noqa: F811
