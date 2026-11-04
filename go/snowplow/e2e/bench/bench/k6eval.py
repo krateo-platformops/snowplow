@@ -591,7 +591,7 @@ def browser_navs(o: dict | None) -> list[dict]:
     return [{"kind": "nav", "nav": t.get("method"), "page": t.get("route"),
              "session": t.get("session"), "wall_ms": round(v, 1),
              "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0,
-             "timeout": t.get("timeout") == "yes", "t0": t.get("t0"),
+             "timeout": t.get("timeout") == "yes", "t0": t.get("t0"), "skeleton": t.get("skeleton"),
              **({"start": int(t["t0"]) / 1000} if str(t.get("t0") or "").isdigit() else {})}
             for v, t in o["points"].get("browser_page_load_ms", [])]
 
