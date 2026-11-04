@@ -483,7 +483,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// #1116 — extras that name a key the resolver writes: a 400 naming
 		// the keys. Nothing was read or dialled, so there is no stale-derived
 		// pass to withdraw.
-		if writeReservedExtrasRefusal(wri, err) {
+		if WriteReservedExtrasRefusal(wri, err) {
 			return
 		}
 		// #905 (c) — an error from a stale-derived pass is withdrawn and the

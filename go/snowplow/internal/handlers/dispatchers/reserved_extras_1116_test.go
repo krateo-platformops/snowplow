@@ -10,9 +10,11 @@ package dispatchers
 // points at a recording server).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +23,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -199,10 +202,18 @@ func TestReservedExtras1116_WidgetAnswers400(t *testing.T) {
 		})()
 	rec := httptest.NewRecorder()
 	ej := url.QueryEscape(`{"crds":[]}`)
-	req := httptest.NewRequest("GET", "/call?extras="+ej, nil).WithContext(h1ReqCtx(h1User))
+	var logs bytes.Buffer
+	ctx := xcontext.BuildContext(h1ReqCtx(h1User),
+		xcontext.WithLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	req := httptest.NewRequest("GET", "/call?extras="+ej, nil).WithContext(ctx)
 	Widgets().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"field":"extras.crds"`) {
 		t.Fatalf("widget: code %d body %s, want 400 naming extras.crds", rec.Code, rec.Body.String())
+	}
+	// #1127 review finding 4: any caller can send a reserved key, so the
+	// refusal is logged once at WARN where it is decided, never at ERROR.
+	if strings.Contains(logs.String(), `"level":"ERROR"`) {
+		t.Errorf("a refused widget /call wrote an ERROR line:\n%s", logs.String())
 	}
 }
 

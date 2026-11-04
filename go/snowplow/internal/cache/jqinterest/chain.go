@@ -174,6 +174,16 @@ func (s *state) chain(c Chain) {
 	// (restactions/api reserved_extras.go), so no client-chosen key pre-seeds
 	// dict[stage]. Without either reason the stage's value is exactly its
 	// output.
+	//
+	// KNOWN GAP (#1127 review finding 2, shadow only): a third reason exists
+	// that this model does not see. When some stage's effective errorKey
+	// equals the tracked stage's name (its own errorKey included), that
+	// stage's error records land in dict[stage] before the output and the
+	// output is appended: [err…, output]. The model's Stage carries no
+	// ErrorKey, so neither A6 nor the fuzz can express it. narrow.go is a
+	// shadow consumer (nothing served depends on it); the follow-up is to
+	// keep the accumulated union when the tracked name is any stage's
+	// effective errorKey.
 	var seed *abs
 	if tracked.Name == "slice" && !mutated(mutNoSliceSeed) {
 		seed = constOf(ccExtras, "slice")

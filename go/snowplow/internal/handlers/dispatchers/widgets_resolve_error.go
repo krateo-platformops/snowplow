@@ -49,11 +49,6 @@ const reasonFailedDependency response.StatusReason = "FailedDependency"
 // One rule for every widget kind and every dependency; it changes the answer
 // only. Nothing on this path is cached: the handler returns before any Put.
 func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err error) {
-	// #1116 — the request's extras name a key the widget's apiRef RESTAction
-	// writes itself: the same 400 a RESTAction /call answers, naming the keys.
-	if writeReservedExtrasRefusal(wri, err) {
-		return
-	}
 	var statusErr *apierrors.StatusError
 	if !errors.As(err, &statusErr) {
 		response.InternalError(wri, err)

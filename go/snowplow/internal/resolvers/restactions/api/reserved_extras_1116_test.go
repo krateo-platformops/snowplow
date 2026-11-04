@@ -155,6 +155,14 @@ func TestReservedExtras1116_ReservedDictKeys(t *testing.T) {
 	if err := CheckReservedExtras(items, map[string]any{"namespace": "x", "extras": 1, "aerr": 1}); err != nil {
 		t.Errorf("non-reserved extras refused: %v", err)
 	}
+	// The match is exact (#1127 review R7): a key that differs by whitespace,
+	// case or a prefix shadows nothing in the dict (jq .k is an exact lookup),
+	// so it is accepted.
+	for _, k := range []string{" a", "a ", "A", "aa", "aErr ", " slice", "Slice", "error\t"} {
+		if err := CheckReservedExtras(items, map[string]any{k: 1}); err != nil {
+			t.Errorf("key %q is not a reserved key, but was refused: %v", k, err)
+		}
+	}
 	// "error" is reserved only when a stage writes it.
 	if err := CheckReservedExtras(items[:1], map[string]any{"error": 1}); err != nil {
 		t.Errorf("\"error\" refused although every stage declares its errorKey: %v", err)

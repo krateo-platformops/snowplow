@@ -54,6 +54,10 @@ dialled:
 - `GET /call` and `POST /call/read` of a **widget**: its apiRef RESTAction
   receives the request extras;
 - `GET /export` and `POST /export`, which relay the `/call` envelope unchanged;
+- `GET /rbac?apiRefName=…&apiRefNamespace=…&extras=…`. Its read-set is
+  enumerated from the same dict, so it answers the same 400 instead of a
+  read-set computed from a forged stage output. It sends no
+  `X-Snowplow-Stage-Outcomes`.
 - a nested `resolve: true` stage, and the background refresher. These never
   reach the browser; a refused `/call` stores no cell for the refresher to
   re-resolve.

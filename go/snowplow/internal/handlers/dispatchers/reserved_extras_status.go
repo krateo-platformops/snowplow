@@ -1,7 +1,7 @@
 // reserved_extras_status.go — #1116: the 400 a /call answers when its extras
 // name a key the RESTAction resolver writes itself.
 //
-// THE CONTRACT (docs/frontend-integration/reserved-extras-keys-1116.md):
+// THE CONTRACT (docs/howto-frontend-reserved-extras-keys.md):
 //   - the body is a Status whose first six fields — kind, apiVersion, status,
 //     message, reason:"BadRequest", code:400 — are byte-identical to
 //     plumbing's response.New(400, err), in the same order, so every reader
@@ -12,10 +12,12 @@
 //     sending. reason is the one constant below.
 //
 // Every route that resolves a RESTAction renders it: GET /call and POST
-// /call/read of a RESTAction or of a widget (its apiRef), and /export, which
-// relays the /call envelope unchanged. The refusal happens before anything is
-// read or dialled, so the response carries the X-Snowplow-Stage-Outcomes of
-// an aborted resolve (a resolve-level Aborted row, every stage NotRun).
+// /call/read of a RESTAction or of a widget (its apiRef), /export, which
+// relays the /call envelope unchanged, and GET /rbac, whose read-set
+// enumeration seeds the same dict from the same extras (api.InspectReadSet).
+// The refusal happens before anything is read or dialled, so a RESTAction
+// /call carries the X-Snowplow-Stage-Outcomes of an aborted resolve (a
+// resolve-level Aborted row, every stage NotRun).
 //
 // plumbing's Status is not snowplow's to change, so the type is snowplow-owned
 // (the #1029 credential_status.go precedent).
@@ -54,9 +56,9 @@ type reservedExtrasStatus struct {
 	Details    reservedExtrasDetails `json:"details"`
 }
 
-// writeReservedExtrasRefusal answers the 400 when err is (or wraps) a #1116
+// WriteReservedExtrasRefusal answers the 400 when err is (or wraps) a #1116
 // refusal and reports whether it did. Any other error is left to the caller.
-func writeReservedExtrasRefusal(w http.ResponseWriter, err error) bool {
+func WriteReservedExtrasRefusal(w http.ResponseWriter, err error) bool {
 	re, ok := api.AsReservedExtrasError(err)
 	if !ok {
 		return false
