@@ -135,7 +135,7 @@ func (t *boundBudget) WrappedRoundTripper() http.RoundTripper { return t.next }
 
 func (t *boundBudget) RoundTrip(req *http.Request) (*http.Response, error) {
 	if _, ok := pagebudget.From(req.Context()); !ok {
-		req = req.WithContext(pagebudget.With(req.Context(), t.b))
+		req = req.WithContext(pagebudget.Rebind(req.Context(), t.b))
 	}
 	return t.next.RoundTrip(req)
 }

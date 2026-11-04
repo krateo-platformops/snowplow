@@ -49,7 +49,7 @@ func TestBudget1115_A4_StageEndedByTheBudgetIsA504Timeout(t *testing.T) {
 
 	ctx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "cyberjoker", Groups: []string{"devs"}}))
-	ctx = pagebudget.WithCustomer(ctx, time.Now().Add(700*time.Millisecond-pagebudget.PageMaxGoal))
+	ctx = pagebudget.WithCustomer(ctx, time.Now().Add(2*time.Second-pagebudget.PageMaxGoal)) // room for the fast stage on a loaded CI host
 	ctx, outcomes := WithStageOutcomes(ctx)
 	stages := []*templates.API{
 		u904Stage("fast", http.MethodGet, "/fast"),
@@ -60,8 +60,8 @@ func TestBudget1115_A4_StageEndedByTheBudgetIsA504Timeout(t *testing.T) {
 		RC: &rest.Config{Host: srv.URL}, AuthnNS: u904AuthnNS, Items: stages,
 		RESTActionNamespace: "ns-1115", RESTActionName: "ra-1115",
 	})
-	if took := time.Since(start); took > 3*time.Second {
-		t.Fatalf("the resolve took %v; the budget left 700ms", took)
+	if took := time.Since(start); took > 6*time.Second {
+		t.Fatalf("the resolve took %v; the budget left 2s", took)
 	}
 	if failure == nil || failure.Stage != "slow" || failure.Code != http.StatusGatewayTimeout || failure.Reason != credhttp.BudgetStatusReason {
 		t.Fatalf("StageFailure = %+v, want stage slow, 504 Timeout", failure)

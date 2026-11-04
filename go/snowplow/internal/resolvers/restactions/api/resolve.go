@@ -540,6 +540,12 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
+		// #1115 — the endpointRef Secret read is a network exchange of this
+		// request: if the page budget ended it, the stage outcome reads
+		// Timeout (the truncating exit's Error ranks below it).
+		if be := (*pagebudget.ExhaustedError)(nil); errors.As(err, &be) {
+			r.outcomes.fail(id, StageReasonTimeout)
+		}
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user

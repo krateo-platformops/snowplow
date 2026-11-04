@@ -121,9 +121,9 @@ func WithCustomer(ctx context.Context, start time.Time) context.Context {
 	return context.WithValue(ctx, ctxKey{}, b)
 }
 
-// With returns ctx carrying b (a budget already set by WithCustomer, handed to
+// Rebind returns ctx carrying b (a budget already set by WithCustomer, handed to
 // a call that lost the request's context; credhttp.BindRequestBudget).
-func With(ctx context.Context, b *Budget) context.Context {
+func Rebind(ctx context.Context, b *Budget) context.Context {
 	return context.WithValue(ctx, ctxKey{}, b)
 }
 
