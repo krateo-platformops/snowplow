@@ -255,10 +255,14 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 //   - a COLLAPSED empty namespace segment (`/api/v1/namespaces//configmaps/...`),
 //     keyed on the literal "/namespaces//" (the DOUBLE slash), NOT merely ns==""
 //     (which is ALSO true for a legit cluster-scoped namespace-by-name GET like
-//     /api/v1/namespaces/kube-system) and NOT the general "//" (which would
-//     false-reject a proxy subresource URL, e.g. /pods/p/proxy/http://host). On a
-//     spoke apiserver reached through a named ref (cluster-compositions'
-//     `<name>-endpoint`) it would otherwise read every namespace;
+//     /api/v1/namespaces/kube-system) and NOT the general "//": this check also
+//     judges a named endpoint's path, which is another API's and may hold a
+//     "//" it needs. On a spoke apiserver reached through a named ref
+//     (cluster-compositions' `<name>-endpoint`) it would otherwise read every
+//     namespace. On THIS cluster's apiserver every empty segment is refused
+//     anyway, by servedAsWritten (#1137): validInterpolatedPath runs both. That
+//     includes a proxy subresource carrying a URL
+//     (`.../services/svc/proxy/http://h/x`), which is refused there;
 //   - a collapsed trailing NAME on a mutating verb: an apiserver-shaped path
 //     whose last segment rendered empty, leaving a trailing "/"
 //     (`DELETE .../rolebindings/` from `".../rolebindings/" + .name`): dialled,
@@ -271,8 +275,9 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 //     (`.../configmaps/`, no interpolation) is false-rejected; RAs write the
 //     collection path without the trailing slash, so this is rare;
 //   - a name that collapses BEFORE a subresource (`.../resource//subresource`, a
-//     mid-path "//") is NOT caught — the targeted "/namespaces//" key deliberately
-//     avoids the general "//" (proxy-URL edge above).
+//     mid-path "//") is NOT caught HERE: the targeted "/namespaces//" key avoids
+//     the general "//" for a named endpoint's sake (above). On this cluster's
+//     apiserver, servedAsWritten (#1137) refuses it as an empty segment.
 func collapsedPath(path, verb string) (bool, skipReason) {
 	if unrenderedTemplate(path) {
 		return false, unrenderedTemplateSkip
