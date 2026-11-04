@@ -867,6 +867,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// resourcesFrom returned [] → 0-count regression on the
 	// multi-stage compositions-list RA.
 	listGVR, listOK := k8sListGVR(call.Path)
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(call.Path)
 	hOpts := jsonHandlerOptions{
 		key:         id,
 		out:         dict,
@@ -886,6 +887,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// SubjectAccessReview) answers with an object, not a list envelope.
 		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
 		listGVR: listGVR,
+		// #1124 — the resource the response's items are objects of: the
+		// userAccessFilter refilter checks such an object on its own resource.
+		served:   servedGVR.GroupResource(),
+		servedOK: servedOK,
 		// #651 — a served-but-failed stage (an unresolved userAccessFilter
 		// resource set) takes the same sink bump + Error outcome as every other
 		// stage failure (recordItemError), against THIS resolve's own stage:

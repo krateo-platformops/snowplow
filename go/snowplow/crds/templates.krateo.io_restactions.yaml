@@ -260,10 +260,14 @@ spec:
                             per object): ResourcesFrom lets the checked resource set itself
                             be RUNTIME-DISCOVERED rather than a static literal.
 
-                            When set, the refilter keeps a namespace iff the user can perform
-                            Verb on ANY plural in the set (OR semantics) in that namespace.
-                            Group stays static (a single API group). When unset, behaviour is
-                            byte-identical to pre-0.30.129 — the static Resource is checked.
+                            When set, an item that is an object of a resource in the set (the
+                            stage's request names Group and one of the plurals) is kept iff the
+                            user can perform Verb on THAT plural in the item's namespace, the
+                            decision Kubernetes makes for the object. Any other item (a namespace,
+                            a name) is kept iff the user can perform Verb on ANY plural in the set
+                            in that namespace (OR semantics). Group stays static (a single API
+                            group). When unset, behaviour is byte-identical to pre-0.30.129 — the
+                            static Resource is checked.
 
                             Use case: compositions-get-ns-and-crd discovers the composition
                             CRD plurals at runtime in dict["crds"]; resourcesFrom evaluates
