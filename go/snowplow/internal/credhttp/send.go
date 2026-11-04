@@ -88,13 +88,19 @@ func SafeMethod(method string) bool {
 }
 
 // Send sends req on cli under the endpoint send policy (see the file comment):
-// a write is sent once; a safe request goes through plumbing's RetryClient with
-// every retry counted and logged with its cause. cli is not modified.
+// no redirect hop leaves req's origin (#1106); a write is sent once; a safe
+// request goes through plumbing's RetryClient with every retry counted and
+// logged with its cause. cli is not modified.
 //
 // #1115 — a request that carries a customer page budget (pagebudget) is sent
 // inside it instead: sendBudgeted (safe methods) or sendOnceBudgeted (writes).
-// A request without one (background work) keeps the path above, unchanged.
+// A request without one (background work) keeps the path below, unchanged.
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	// #1106 — no redirect hop leaves the origin this request is sent to,
+	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
+	// cli (a wire dump, a plumbing-built chain) can displace it; the budgeted
+	// paths below send on the same wrapped client.
+	cli = SameOriginOnly(cli, Origin(req.URL))
 	if b, ok := pagebudget.From(req.Context()); ok {
 		if !SafeMethod(req.Method) {
 			return sendOnceBudgeted(cli, req, b)

@@ -122,6 +122,16 @@ type Unresolved struct {
 // synthetic CA.
 var saRESTConfigForInspectFn = dynamic.ServiceAccountRESTConfig
 
+// SetServiceAccountRESTConfigForInspectForTest swaps saRESTConfigForInspectFn
+// and returns a restore func, so a handler-level test can drive the REAL
+// InspectReadSet (e.g. GET /rbac's #1116 arm). TEST-ONLY: production code
+// MUST NOT call it.
+func SetServiceAccountRESTConfigForInspectForTest(fn func() (*rest.Config, error)) func() {
+	prev := saRESTConfigForInspectFn
+	saRESTConfigForInspectFn = fn
+	return func() { saRESTConfigForInspectFn = prev }
+}
+
 // InspectReadSet walks `in.Spec.API` in topologicalSort order and returns the
 // in-cluster (group, version, resource, verb) read-set that resolving `in`
 // would touch, plus any stages that could not be enumerated from the
@@ -141,6 +151,15 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 	}
 
 	stages := in.Spec.API
+	// #1116 — the same rule the resolver holds (reserved_extras.go): extras
+	// that name a stage, an errorKey or slice would stand in for the stage's
+	// output here exactly as they would in ResolveWithFailure, and the read-set
+	// would be enumerated from a forged value for a /call that is always
+	// refused. The refusal is returned as the *ReservedExtrasError; GET /rbac
+	// answers the same 400 /call does.
+	if err := RefuseReservedExtras(ctx, stages, extras, in.GetNamespace(), in.GetName()); err != nil {
+		return nil, nil, err
+	}
 	// The inspect dict holds ONLY extras — the seed the dispatcher would
 	// start the first stage with. Upstream stage outputs are deliberately
 	// absent: a stage that needs them is UNRESOLVABLE (reported, not guessed).
@@ -291,7 +310,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 	// The iterator error (#638) is not consumed here: inspect is a
 	// dispatch-free read-set enumeration, unchanged — an errored iterator
 	// enumerates what it enumerated, exactly as before.
-	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
+	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict, true) // an in-cluster stage
 	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}

@@ -21,6 +21,9 @@ package credhttp
 //  3. (#1088) it sends through Send (send.go): a write is sent once, where
 //     request.Do's RetryClient re-sent a PUT or a DELETE.
 //
+//  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
+//     never plumbing's, which logs the Authorization header and the bodies.
+//
 // Everything else (headers, the AWS-signature branch, the payload, a read's
 // retry client, the non-2xx envelope, the JSON content-type check, the
 // ResponseHandler contract) is unchanged, so a caller swapping request.Do for
@@ -94,10 +97,16 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		call.Header.Set(el[:idx], strings.TrimSpace(el[idx+1:]))
 	}
 
-	cli, err := request.HTTPClientForEndpoint(opts.Endpoint, &opts.RequestInfo)
+	// #1112 D4 — plumbing never installs its wire dump (it logs the
+	// Authorization header and the bodies); a Debug endpoint gets WireDump,
+	// which logs metadata only (wiredump.go).
+	cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
 	if err != nil {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
+	}
+	if opts.Endpoint != nil && opts.Endpoint.Debug {
+		cli.Transport = WireDump(cli.Transport)
 	}
 
 	// #1088 — the endpoint send policy (send.go): a write is sent once, never

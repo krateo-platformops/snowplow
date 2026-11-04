@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -614,7 +615,12 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // passed by pointer) — its ClusterList* fields are written here exactly as
 // before. Returns tmp (possibly empty for C-3).
 func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
+	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
+	// this cluster's apiserver (the provenance runStage marked on provCtx); a
+	// write item any guard refuses is a stage failure with its reason, never a
+	// silent success (undialled_write.go).
+	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
+	r.failUndialledWrites(id, apiCall, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -765,6 +771,10 @@ type stageCtx struct {
 	wireVerbose bool
 	ep          endpoints.Endpoint
 	calls       []httpcall.RequestOptions
+	// sent counts the items that reached the send (branch E, the one place a
+	// write leaves snowplow). #1112 D2: a write stage that sent fewer than it
+	// planned and recorded no failure fails with NotSent (failUnsentWrites).
+	sent atomic.Int64
 }
 
 // dispatchOneCall is one iterator item's worker — the body the stage loop
@@ -864,6 +874,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// resourcesFrom returned [] → 0-count regression on the
 	// multi-stage compositions-list RA.
 	listGVR, listOK := k8sListGVR(call.Path)
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(call.Path)
 	hOpts := jsonHandlerOptions{
 		key:         id,
 		out:         dict,
@@ -883,6 +894,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// SubjectAccessReview) answers with an object, not a list envelope.
 		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
 		listGVR: listGVR,
+		// #1124 — the resource the response's items are objects of: the
+		// userAccessFilter refilter checks such an object on its own resource.
+		served:   servedGVR.GroupResource(),
+		servedOK: servedOK,
 		// #651 — a served-but-failed stage (an unresolved userAccessFilter
 		// resource set) takes the same sink bump + Error outcome as every other
 		// stage failure (recordItemError), against THIS resolve's own stage:
@@ -1527,6 +1542,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if r.refuseWriteFromStalePass(gctx, sc, i) {
 		return nil
 	}
+	sc.sent.Add(1)
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
@@ -2098,6 +2114,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if r.failure == nil {
 		r.failure = firstStageFailure(itemErrs, sc.calls)
 	}
+	// #1112 D2 — the catch-all: a write stage none of whose refusals reported
+	// itself did not do what it declared (undialled_write.go).
+	r.failUnsentWrites(sc)
 
 	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
@@ -2132,6 +2151,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 // output cannot be produced; restactions.Resolve is that caller.
 func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]any, *StageFailure) {
 	if len(opts.Items) == 0 {
+		return map[string]any{}, nil
+	}
+
+	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
+	// and the resolver writes its own keys into it. Extras that name one of
+	// them (a stage name, an errorKey, slice) would stand in for the
+	// resolver's value, so the resolve does not start: nothing is read or
+	// dialled (reserved_extras.go). restactions.Resolve applies the same rule
+	// first and returns the refusal to its caller as a 400.
+	if RefuseReservedExtras(ctx, opts.Items, opts.Extras, opts.RESTActionNamespace, opts.RESTActionName) != nil {
 		return map[string]any{}, nil
 	}
 

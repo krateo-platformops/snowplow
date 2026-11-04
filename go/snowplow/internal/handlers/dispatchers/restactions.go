@@ -307,7 +307,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			setStoredStageOutcomesHeader(wri, entry) // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
-			staleHitWritePoint(cacheKey, entry, true, staleSubjectOf(req.Context()))
+			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -482,6 +482,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	})
 	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
+		// #1116 — extras that name a key the resolver writes: a 400 naming
+		// the keys. Nothing was read or dialled, so there is no stale-derived
+		// pass to withdraw.
+		if WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		// #905 (c) — an error from a stale-derived pass is withdrawn and the
 		// request re-run with D2 disabled, exactly like a declined body: a write
 		// held in that pass (rule a) makes a filter that needs its output fail,
