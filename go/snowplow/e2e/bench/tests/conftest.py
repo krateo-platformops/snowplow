@@ -8,12 +8,14 @@ NOT exit during test collection.
 Risk Register R1.1 mitigation: `reset_k8s_state` fixture (opt-in) nulls
 the cluster.py module-level globals so tests don't share state.
 
-Running the suite (#1166): in parallel, one pytest-xdist worker per CPU, from
-`go/snowplow/e2e/bench`:
+Running the suite (#1166), from `go/snowplow/e2e/bench`, in two passes: in
+parallel, one pytest-xdist worker per CPU; then, on their own, the tests that
+bound real elapsed time (marked `serial` from their source, tests/wallclock.py):
 
-    python3 -m pytest -n auto -m "not docker" -q -p no:cacheprovider
+    python3 -m pytest -n auto -m "not docker and not serial" -q -p no:cacheprovider
+    python3 -m pytest -m "serial and not docker" -q -p no:cacheprovider
 
-CI (.github/workflows/bench-tests.yaml) runs the same parallel pass, then the
+CI (.github/workflows/bench-tests.yaml) runs the same two passes, then the
 `docker` tests on their own, one at a time. Each worker is a process of its
 own, so environment variables, the working directory and module globals are
 per worker. What workers could still share is the host: a test writes under
