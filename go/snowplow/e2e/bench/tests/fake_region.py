@@ -16,7 +16,8 @@ the live API rather than on an outcome:
     FAKE_REGION_FORWARDING_RULES, FAKE_REGION_ADDRESSES (JSON lists shaped as
     gcloud prints them; vm(), forwarding_rule() and address() below make rows);
   - `compute project-info describe`: the project's global quotas,
-    FAKE_PROJECT_QUOTAS (a JSON list; none by default).
+    FAKE_PROJECT_QUOTAS (a JSON list; none by default);
+  - FAKE_FAIL_READ: those reads fail as gcloud fails them (#1172 B2).
 
 A fake gcloud is its own process (the run606 harness runs it with `python -I`,
 no PYTHONPATH), so it loads this file by path: LOADER is the source to put in
@@ -85,6 +86,22 @@ def project_quotas(env=None) -> dict:
     return {"name": PROJECT, "quotas": json.loads(_env(env).get("FAKE_PROJECT_QUOTAS") or "[]")}
 
 
+# FAKE_FAIL_READ: the pre-check reads that fail as gcloud fails them (comma-separated:
+# instances, forwarding-rules, addresses, project-info): exit 1, an ERROR line, no JSON
+READS = ("instances", "forwarding-rules", "addresses", "project-info")
+_PERMISSION = {"instances": "compute.instances.list", "forwarding-rules": "compute.forwardingRules.list",
+               "addresses": "compute.addresses.list", "project-info": "compute.projects.get"}
+
+
+def read_failure(what: str, env=None) -> str | None:
+    """gcloud's stderr for a failed `what` read, or None when it answers."""
+    if what not in [x.strip() for x in (_env(env).get("FAKE_FAIL_READ") or "").split(",")]:
+        return None
+    verb = "describe" if what == "project-info" else "list"
+    return (f"ERROR: (gcloud.compute.{what}.{verb}) Some requests did not succeed:\n"
+            f" - Required '{_PERMISSION[what]}' permission for 'projects/{PROJECT}'\n")
+
+
 # ─── rows, shaped as gcloud prints them ─────────────────────────────────────
 
 def vm(name: str, zone: str = "europe-west4-a", external_ips: int = 1) -> dict:
@@ -126,4 +143,10 @@ LOADER = (
     "    return _frm.region_list(kind)\n"
     "def project_quotas():\n"
     "    return _frm.project_quotas()\n"
+    "def answer_read(what, rows):\n"
+    "    import json as _j, sys as _s\n"
+    "    err = _frm.read_failure(what)\n"
+    "    if err:\n"
+    "        _s.stderr.write(err); _s.exit(1)\n"
+    "    print(_j.dumps(rows)); _s.exit(0)\n"
 )

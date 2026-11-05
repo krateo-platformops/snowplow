@@ -651,10 +651,10 @@ FAKE_QUOTA_GCLOUD = (
     "if sys.argv[1:4] == ['compute', 'regions', 'describe']:\n"
     "    print(json.dumps(region_quotas(sys.argv[4]))); sys.exit(0)\n"
     "if sys.argv[1:4] == ['compute', 'project-info', 'describe']:\n"
-    "    print(json.dumps(project_quotas())); sys.exit(0)\n"
+    "    answer_read('project-info', project_quotas())\n"
     "if sys.argv[1:2] == ['compute'] and sys.argv[2:4] in (['instances', 'list'], ['forwarding-rules', 'list'],\n"
     "                                                       ['addresses', 'list']) and '--filter' not in sys.argv:\n"
-    "    print(json.dumps(region_list(sys.argv[2]))); sys.exit(0)\n"
+    "    answer_read(sys.argv[2], region_list(sys.argv[2]))\n"
     "sys.exit(9)\n")
 # the bash the script claims to support (macOS /bin/bash 3.2) and a current one
 BASHES = [b for b in dict.fromkeys(["/bin/bash", shutil.which("bash")]) if b and os.path.exists(b)]

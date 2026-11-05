@@ -278,8 +278,46 @@ def test_used_is_the_larger_of_the_listed_and_the_reported():
 def test_a_list_that_cannot_be_read_is_unknown():
     _, refusals = gke.region_fit({"region": fake_region.quotas({}), "project": fake_region.project_quotas({})},
                                  _pair(), {"instances": [], "forwarding-rules": None, "addresses": []})
-    assert ("IN_USE_ADDRESSES: the region's instances, forwarding-rules, addresses could not be listed: whether the "
-            "run fits is unknown") in refusals
+    assert ("IN_USE_ADDRESSES: the region's forwarding-rules were not listed: what is used cannot be counted, "
+            "whether the run fits is unknown") in refusals
+
+
+# #1172 B2: every read fails closed, through the code that makes the read: a gcloud that
+# fails (a missing permission, a transient error) is a refusal naming that read, never an
+# empty region (the forwarding-rule term at 0 is revision 1's numbers, run 21 again)
+READ_REFUSALS = {
+    "instances": "IN_USE_ADDRESSES: gcloud compute instances list failed (rc=1): what is used cannot be counted, "
+                 "whether the run fits is unknown",
+    "forwarding-rules": "IN_USE_ADDRESSES: gcloud compute forwarding-rules list failed (rc=1): what is used cannot be "
+                        "counted, whether the run fits is unknown",
+    "addresses": "IN_USE_ADDRESSES: gcloud compute addresses list failed (rc=1): what is used cannot be counted, "
+                 "whether the run fits is unknown",
+    "project-info": "could not read the project's quotas (gcloud compute project-info describe failed, rc=1): "
+                    "whether the run fits is unknown",
+}
+
+
+@pytest.mark.parametrize("read", fake_region.READS)
+def test_gke_up_refuses_when_a_read_fails(fakes, monkeypatch, capsys, read):  # noqa: F811
+    for k, v in region_env(vms=0).items():                     # an empty region: every quota fits, but the read
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("FAKE_FAIL_READ", read)
+    assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert f"refusing: {READ_REFUSALS[read]}; nothing was created" in err, err
+    c = _calls(fakes)
+    assert any(x[:4] == (["gcloud", "compute", "project-info", "describe"] if read == "project-info"
+                         else ["gcloud", "compute", read, "list"]) for x in c)   # the read was made, and failed
+    assert not any(x[:4] == ["gcloud", "container", "clusters", "create"] for x in c)
+
+
+@pytest.mark.parametrize("read", fake_region.READS)
+def test_the_pair_refuses_when_a_read_fails(pairbed, read):  # noqa: F811
+    repo, fake, env, tmp = pairbed
+    p = _launch(repo, env, FAKE_FAIL_READ=read, **region_env(vms=0))
+    assert p.returncode == 2, p.stderr[-1500:]
+    assert f"refusing: {READ_REFUSALS[read]}" in p.stderr, p.stderr[-1500:]
+    assert not [c for c in _pair_calls(fake) if " dry=0 " in c]          # neither run started
 
 
 def test_the_fake_never_takes_an_in_use_number():

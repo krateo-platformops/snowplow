@@ -372,10 +372,10 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
         # #1173: IN_USE_ADDRESSES as the live API reports it (tests/fake_region.py)
         q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(region_reported(q))); sys.exit(0)
     if a[:3] == ["compute", "project-info", "describe"]:       # #1171: the project's global quotas
-        print(json.dumps(project_quotas())); sys.exit(0)
+        answer_read("project-info", project_quotas())
     if a[:2] in (["compute", "instances"], ["compute", "forwarding-rules"], ["compute", "addresses"]) \\
             and a[2] == "list" and "--filter" not in a:          # #1173: what holds the region's addresses
-        print(json.dumps(region_list(a[1]))); sys.exit(0)
+        answer_read(a[1], region_list(a[1]))
     if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]) and a[2] == "list":
         # #1026: GCE by the filter the bench writes (name=(a b)) in --regions; the leftovers
         # (FAKE_ADDRESSES) are there once the cluster was deleted under its Services

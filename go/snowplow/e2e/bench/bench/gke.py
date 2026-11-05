@@ -1987,12 +1987,15 @@ def quota_fit(quotas: dict, metric: str, need: float, what: str, unit: str = "",
                           f"{free:g} free; {what}")
 
 
-def region_fit(quotas: dict[str, dict], fp: Footprint,
-               listed: dict[str, list[dict]] | None = None) -> tuple[list[str], list[str]]:
+def region_fit(quotas: dict[str, dict], fp: Footprint, listed: dict[str, list[dict] | None] | None = None,
+               unread: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
     """(the fits, the refusals) of every "region" and "project" row of
     RUN_QUOTAS. `quotas`: {"region": regions describe, "project": project-info
-    describe}; `listed`: the resources the rows' `reads` name. A refusal
-    carries its row's hint."""
+    describe}; `listed`: the resources the rows' `reads` name, None for a read
+    that failed (`unread`: why). A row whose read failed is unknown: refused,
+    never counted as an empty region (#1172 B2). A refusal carries its row's
+    hint."""
+    listed, unread = listed or {}, unread or {}
     fits, refusals = [], []
     for row in RUN_QUOTAS:
         if row.source not in ("region", "project"):
@@ -2005,9 +2008,11 @@ def region_fit(quotas: dict[str, dict], fp: Footprint,
                 continue
             counted = None
             if row.used is not None:
-                if listed is None or any(listed.get(k) is None for k in row.reads):
-                    refusals.append(f"{metric}: the region's {', '.join(row.reads)} could not be listed: whether the "
-                                    f"run fits is unknown")
+                failed = [k for k in row.reads if listed.get(k) is None]
+                if failed:
+                    refusals.append(f"{metric}: " + "; ".join(unread.get(k) or f"the region's {k} were not listed"
+                                                             for k in failed)
+                                    + ": what is used cannot be counted, whether the run fits is unknown")
                     continue
                 counted = row.used(listed, src.get("name"))
             ok, msg = quota_fit(src, metric, need, what, row.unit, counted)
@@ -2036,19 +2041,29 @@ def quota_check(project: str, zone: str, fp: Footprint, *, run=execute, fetch=No
     then GKE's cluster limit (#985) once they fit. (the fits, the refusals);
     no refusal = the run fits."""
     quiet = lambda _m: None  # noqa: E731
+    # every read fails closed (#1172 B2): a gcloud that exits non-zero, or answers
+    # something else than the JSON it lists, is a read that did not happen, never an
+    # empty region or a project without quotas
     quotas = {}
     for src, argv in (("region", region_quotas_command(project, zone)), ("project", project_quotas_command(project))):
         rc, out = run(argv, dry_run=False, log=quiet)
         got = _json(out) if rc == 0 else None
         if not isinstance(got, dict):
-            return [], [f"could not read the {src}'s quotas (rc={rc}): whether the run fits is unknown"]
+            return [], [f"could not read the {src}'s quotas ({' '.join(argv[:4])} "
+                        f"{'failed, rc=' + str(rc) if rc else 'answered no JSON object'}): whether the run fits is "
+                        f"unknown"]
         quotas[src] = got
     listed: dict[str, list[dict] | None] = {}
+    unread: dict[str, str] = {}
     for kind in sorted({k for row in RUN_QUOTAS for k in row.reads}):
-        rc, out = run(region_list_command(kind, project, region_of(zone)), dry_run=False, log=quiet)
+        argv = region_list_command(kind, project, region_of(zone))
+        rc, out = run(argv, dry_run=False, log=quiet)
         got = _json(out) if rc == 0 else None
         listed[kind] = got if isinstance(got, list) else None
-    fits, refusals = region_fit(quotas, fp, listed)
+        if listed[kind] is None:
+            unread[kind] = (f"{' '.join(argv[:4])} " +
+                            (f"failed (rc={rc})" if rc else "answered no JSON list"))
+    fits, refusals = region_fit(quotas, fp, listed, unread)
     if refusals:
         return fits, refusals
     ok, msg = cluster_quota_check(project, zone, fp.clusters, run=run, fetch=fetch)
