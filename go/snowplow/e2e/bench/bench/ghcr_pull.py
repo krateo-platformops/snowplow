@@ -616,6 +616,7 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
         for pr in procs:
             if pr.poll() is None:
                 pr.kill()
+                pr.wait()
 
     def run():
         with tempfile.TemporaryDirectory(prefix="bench-render-") as d:

@@ -1187,6 +1187,7 @@ def test_dry_run_shows_both_bounded_samplers(tmp_path):
     assert ev.endswith(f"--apf {tmp_path / 'out' / 'apf.jsonl.gz'}")
 
 
+@pytest.mark.serial  # #1166/#1174: requires every fake kubectl sample to answer inside TOP_POLL_S=1 s of wall clock, which the source does not show as a clock
 def test_the_real_sequence_samples_top_and_apf_into_the_verdict(harness):  # noqa: F811
     env, state, ambient, tmp = harness
     env.update(TOP_POLL_S="1")

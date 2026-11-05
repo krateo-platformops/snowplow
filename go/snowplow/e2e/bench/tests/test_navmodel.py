@@ -309,6 +309,7 @@ def test_login_report_is_an_authn_finding():
 # ─── run606.sh: stale roots fail in seconds, before data or logins ──────────
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 60` on the wall clock
 def test_stale_roots_fail_in_seconds_before_stamping(harness):
     env, state, ambient, tmp = harness
     env = _env483(env)

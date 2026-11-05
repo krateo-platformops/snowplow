@@ -426,6 +426,7 @@ def test_the_pins_carry_the_installers_component_values_overridden_by_the_benchs
         "certReplayHop": {"replicas": 2}}
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 10` on the wall clock
 def test_a_render_that_does_not_finish_is_bounded(monkeypatch, tmp_path):
     """Past the bound, the answer AND helm itself stop (it is killed)."""
     import time
@@ -443,6 +444,7 @@ def test_a_render_that_does_not_finish_is_bounded(monkeypatch, tmp_path):
         os.kill(int(pid.read_text()), 0)
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 10` on the wall clock
 def test_a_registry_that_drips_its_answer_is_bounded(monkeypatch):
     """Each call's WHOLE answer within its bound, not each socket read."""
     import time
@@ -452,6 +454,7 @@ def test_a_registry_that_drips_its_answer_is_bounded(monkeypatch):
     assert "no whole answer within its 2 s bound" in r["error"] and time.monotonic() - t0 < 10
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 3` on the wall clock
 def test_a_registry_that_drips_its_headers_is_bounded_too(monkeypatch):
     """#1041 review F2: the WHOLE call within its bound, connect, status line
     and headers included (a header line every 0.3 s held a 1 s bound 18 s)."""
@@ -462,6 +465,7 @@ def test_a_registry_that_drips_its_headers_is_bounded_too(monkeypatch):
     assert "no whole answer within its 1 s bound" in err and time.monotonic() - t0 < 3
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 5` on the wall clock
 def test_a_render_is_bounded_through_its_parse(monkeypatch, tmp_path):
     """#1041 review F2: helm's run AND the parse of what it printed, within
     RENDER_BOUND_S (300 000 small documents parse for seconds)."""
@@ -495,6 +499,20 @@ def test_a_render_over_its_output_cap_is_refused(monkeypatch):
     r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN,
                                {"uiTokenHop": {"enabled": True}}, HELM)
     assert r["render_error"] == "helm template rendered more than its 10 byte cap"
+
+
+def test_a_render_stopped_at_its_output_cap_leaves_no_unreaped_child(monkeypatch, tmp_path):
+    """#1170: the cap kills helm AND reaps it. An unreaped child is still a process (a zombie),
+    so a signal 0 to it would succeed; right after the refusal, with no wait, it must fail."""
+    pid = tmp_path / "pid"
+    flood = tmp_path / "helm"
+    flood.write_text(f"#!/bin/sh\necho $$ > {pid}\nexec yes\n")
+    flood.chmod(0o755)
+    monkeypatch.setattr(ghcr_pull, "RENDER_OUT_MAX", 10)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, str(flood))
+    assert r["render_error"] == "helm template rendered more than its 10 byte cap"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text()), 0)
 
 
 def test_the_caps_are_helms_own_limits_and_the_render_a_measured_margin():
@@ -804,6 +822,7 @@ def _yaml_heavy_chart(sub_bytes, nsub=2):
     return buf.getvalue()
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 5` on the wall clock
 def test_the_reviews_yaml_heavy_chart_is_refused_before_any_parse(monkeypatch):
     """Round 3, M1: two 5 MiB values.yaml (within helm's own limits) took
     941 s and +496 MiB to parse. All of a chart's Chart.yaml + values.yaml
@@ -830,6 +849,7 @@ def test_a_chart_over_its_parse_cap_is_refused_through_chart_images(monkeypatch)
     assert r["error"] and "byte parse cap" in r["error"], r
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 5` on the wall clock
 def test_the_chart_files_are_read_within_their_own_bound(monkeypatch):
     """Rounds 3-4, M1/M1b: the tar walk and the parse run WHOLE in a child
     killed at PARSE_BOUND_S (counted in the step's bound): a bound no child
@@ -923,6 +943,7 @@ def _empty_values_chart(n):
     return buf.getvalue()
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 2` on the wall clock
 def test_zero_byte_files_are_counted_by_the_member_cap():
     """Round 4, M1b: 2,000,000 empty values.yaml (parsed = 38 B) took 69 s
     and +619 MiB. Every member counts against 16 x the largest real chart's
@@ -946,6 +967,7 @@ def test_the_member_cap_reaches_the_reader_through_chart_images(monkeypatch):
     assert r["error"] and "more than its 3 member cap" in r["error"], r
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 2` on the wall clock
 def test_a_parse_past_its_bound_leaves_no_work_running():
     """Round 4, M1b: the bound stops the WORK, not only the wait. A parse
     that needs seconds (just under the parse cap) given 0.5 s: the answer

@@ -73,6 +73,7 @@ def test_failed_first_load_is_retried_and_replayed_after_recovery():
     assert c.calls.count(INIT) >= 3
 
 
+@pytest.mark.serial  # #1166/#1174: floors the wall-clock gaps between two workers' retries (>= 0.08 s), which the source does not show as a clock
 def test_backoff_spaces_retries():
     c = Flaky(down=10 ** 6)                                       # never recovers
     recs = []
@@ -278,6 +279,7 @@ def _run(env):
                           capture_output=True, text=True, timeout=300)
 
 
+@pytest.mark.serial  # #1166/#1174: needs a first kubectl sample inside TOP_POLL_S=0.2 s of wall clock, which the source does not show as a clock
 def test_run_collects_memory_and_restart_state(harness):
     env, state, ambient, tmp = harness
     env = _env483(env)

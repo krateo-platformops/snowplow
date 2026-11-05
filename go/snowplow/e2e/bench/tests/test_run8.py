@@ -46,6 +46,7 @@ def test_preflight_derives_composite_pages_from_the_menu():
 # ─── the burst itself ───────────────────────────────────────────────────────
 
 
+@pytest.mark.serial  # #1166/#1174: bounds the spread of three threads' wall-clock start stamps (< 0.15 s), which the source does not show as a clock
 def test_composite_burst_cohort_arrives_together_after_idling():
     c = Fake()
     recs = []

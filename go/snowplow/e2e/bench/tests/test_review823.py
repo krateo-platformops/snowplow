@@ -215,6 +215,7 @@ def test_stop_without_a_pidfile_kills_nothing(tmp_path):
         assert victim.poll() is None, "a PID with no pidfile was killed"
     finally:
         victim.kill()
+        victim.wait()
 
 
 # ─── 6. the follower never outlives the run ────────────────────────────────

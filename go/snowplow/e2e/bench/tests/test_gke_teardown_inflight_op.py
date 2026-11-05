@@ -121,6 +121,7 @@ def test_any_other_delete_failure_raises_at_once(fakegke, monkeypatch):
     assert _calls(fakegke) == ["describe", "delete"]
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 15` on the wall clock
 def test_the_wait_is_bounded_by_the_budget(fakegke, monkeypatch):
     """An operation that outlasts the budget: the wait is cut there, and the
     teardown fails loudly (run606 prints "delete by hand")."""
@@ -141,6 +142,7 @@ def test_an_operation_still_blocking_when_the_budget_is_spent_fails(fakegke, mon
     assert _calls(fakegke).count("delete") <= 3
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 15` on the wall clock
 def test_gke_down_passes_the_budget(fakegke, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
     # #1026: deleted (exit 4, not 1); this fake cluster has no endpoint to match the bench

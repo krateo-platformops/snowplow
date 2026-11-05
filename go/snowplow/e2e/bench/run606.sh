@@ -408,16 +408,46 @@ step() {
 
 # bounded <seconds> cmd...: run cmd, TERM it after <seconds> (portable: macOS
 # has no `timeout`). Output and exit status are cmd's own (143 if killed).
+# kill_tree <signal> <pid>: the pid and every descendant, children first (#1170). A TERM to a
+# python wrapper does not reach the gcloud / kubectl it started: they would run on, orphaned.
+# A pgrep -P walk, not a process-group kill: run606_pair.sh's two runs share its group, and a
+# group kill could reach the partner run. Its limits: a descendant already re-parented is not
+# found, and a parent can react to a child's TERM before its own arrives (gke-up on a failed create
+# starts a `gcloud ... delete`, which outlives the walk; it deletes our own cluster, and gke-down
+# handles an operation in flight).
+kill_tree() {
+  local sig="$1" pid="$2" c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+# At its bound the watchdog stops the command's whole tree; stopping the watchdog stops its own
+# sleep (its TERM trap), so neither outlives the call. BOUNDED_PIDS names the call in flight:
+# a run that leaves in the middle of one (a signal or a pair stop fires its trap inside `wait`)
+# stops it at the start of its teardown instead of leaving it to run out its bound (#1170).
+BOUNDED_PIDS=""
 bounded() {
   local secs="$1"; shift
   "$@" &
   local pid=$!
-  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  BOUNDED_PIDS="$pid"     # from the fork on: a stop before the watchdog exists still stops the command
+  # The watchdog's TERM trap kills `$!`, which bash sets at the fork, so no moment leaves its sleep
+  # unnamed; the no-op job first makes `$!` a finished process until the sleep is forked.
+  ( : & trap 'kill $! 2>/dev/null; exit 0' TERM
+    sleep "$secs" & wait $!; kill_tree TERM "$pid" ) >/dev/null 2>&1 &
   local dog=$!
+  BOUNDED_PIDS="$pid $dog"
   local rc=0
   wait "$pid" || rc=$?
-  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
+  # the watchdog as a tree: its sleep first, then itself. The trap is the second line of defence:
+  # alone, it left 1 sleep in 20 calls under macOS's bash 3.2; as a tree, 0 in 600 (#1175 review)
+  kill_tree TERM "$dog"; wait "$dog" 2>/dev/null || true
+  BOUNDED_PIDS=""
   return "$rc"
+}
+stop_inflight_bounded() {
+  local p
+  for p in $BOUNDED_PIDS; do kill_tree TERM "$p"; done
+  BOUNDED_PIDS=""
 }
 # capped <seconds> <label> cmd...: run cmd in the background under ONE
 # wall-clock cap; stop early on the cap or when teardown was signalled.
@@ -466,6 +496,7 @@ teardown() {
   trap on_teardown_signal INT TERM HUP
   set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
+  stop_inflight_bounded   # a bounded call the signal or pair stop interrupted (#1170)
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   declare -F stop_sampler >/dev/null && stop_sampler top_boot
@@ -2040,7 +2071,8 @@ s_evaluate() {
   # can land mid-evaluate; the teardown's evaluate is never held
   if [[ "${BENCH_606_HOLD_IN:-}" == "evaluate" && "${IN_TEARDOWN:-0}" != "1" ]]; then
     log "test hold inside evaluate"
-    sleep 60 & wait "$!" || true
+    # a bounded call like any other, so a stop mid-hold leaves no sleep behind (#1170)
+    bounded 60 sleep 60 || true
   fi
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
