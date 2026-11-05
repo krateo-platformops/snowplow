@@ -4,6 +4,7 @@ package cache
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -35,14 +36,48 @@ import (
 // overshoot the cap and fail its own precondition. Replaced by 1:6 (still
 // firmly inverted, still L=TTL) plus i496WaitForWindow, which POLLS to the
 // window edge instead of guessing at it, so the slack is ~1s regardless of load.
+//
+// #1166: the arms now age the cell on the STORE CLOCK (SetClockForTest, #930),
+// the one clock every stamp the store makes and every age it decides is read
+// from. i496WaitForWindow moves that clock to the middle of the lead window, so
+// an arm is in the window at an exact instant instead of after ~5 s of real time
+// per wait, and a stalled machine can no longer push it past the cap.
 const (
 	i496TTL    = time.Second
 	i496MaxAge = 6 * i496TTL // L = min(TTL, maxAge/2) = TTL → window [5s, 6s), 1s wide
 )
 
+// i496Clock is the arm's store clock: it moves only when the arm moves it.
+type i496Clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (k *i496Clock) Now() time.Time {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.now
+}
+
+func (k *i496Clock) set(t time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if t.Before(k.now) {
+		panic("i496Clock: the store clock never runs backwards")
+	}
+	k.now = t
+}
+
+// i496Clocks maps an arm's store to its clock.
+var i496Clocks sync.Map
+
 func i496Store(t *testing.T) *ResolvedCacheStore {
 	t.Helper()
 	c := newResolvedCache(0, 0, i496TTL)
+	clk := &i496Clock{now: time.Unix(1_700_000_000, 0)}
+	t.Cleanup(c.SetClockForTest(clk.Now))
+	i496Clocks.Store(c, clk)
+	t.Cleanup(func() { i496Clocks.Delete(c) })
 	c.maxEntryAge = i496MaxAge
 	if lead := c.remintLead(); lead != i496TTL {
 		t.Fatalf("SETUP: remintLead()=%v, want %v — the window geometry is not the production one", lead, i496TTL)
@@ -61,32 +96,23 @@ func i496IsWarm(t *testing.T, c *ResolvedCacheStore, key string) bool {
 	if !ok {
 		t.Fatalf("SETUP: key %q is not resident", key)
 	}
-	return c.warmLocked(el.Value.(*lruItem), time.Now())
+	return c.warmLocked(el.Value.(*lruItem), c.now())
 }
 
-// i496WaitForWindow blocks until the cell's BornAt age is inside the lead
-// window [maxAge − L, maxAge), by REAL elapse, then returns. It polls rather
-// than sleeping a computed duration, so machine load shifts WHEN it returns and
-// never WHETHER the arm is in the right state — and it fails loudly if the cell
-// is already past the cap, which is an environment problem and must not be
-// mistaken for the defect under test.
+// i496WaitForWindow ages the cell into the middle of the lead window
+// [maxAge − L, maxAge) on the store clock: the cell elapses there (no
+// SetBornAtForTest, no crossed state installed), at an exact instant, and the
+// window is asserted on the store's own clock before the arm acts.
 func i496WaitForWindow(t *testing.T, c *ResolvedCacheStore, key string, bornAt time.Time) {
 	t.Helper()
+	v, ok := i496Clocks.Load(c)
+	if !ok {
+		t.Fatalf("SETUP: the store has no arm clock (i496Store)")
+	}
 	start := i496MaxAge - c.remintLead()
-	deadline := time.Now().Add(i496MaxAge + 5*time.Second)
-	for {
-		age := time.Since(bornAt)
-		if age >= i496MaxAge {
-			t.Fatalf("SETUP: the cell is already PAST the cap (age %v >= %v) before the arm acted — "+
-				"the machine stalled; this is an environment failure, not the #496 defect", age, i496MaxAge)
-		}
-		if age >= start {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("SETUP: never reached the lead window (age %v, want >= %v)", age, start)
-		}
-		time.Sleep(10 * time.Millisecond)
+	v.(*i496Clock).set(bornAt.Add(start + c.remintLead()/2))
+	if age := c.now().Sub(bornAt); age < start || age >= i496MaxAge {
+		t.Fatalf("SETUP: BornAt age %v is not inside the lead window [%v, %v)", age, start, i496MaxAge)
 	}
 }
 
@@ -118,7 +144,7 @@ func TestIssue496_ColdCellInTheWindowIsNotReMinted(t *testing.T) {
 	// (The window itself is guaranteed by i496WaitForWindow.)
 	if i496IsWarm(t, c, key) {
 		t.Fatalf("SETUP: the cell is WARM (ttl %v, BornAt age %v) — this arm must drive a COLD cell",
-			i496TTL, time.Since(e0.BornAt))
+			i496TTL, c.now().Sub(e0.BornAt))
 	}
 	refusedBefore := c.Stats().RemintRefusedColdTotal
 
@@ -178,7 +204,7 @@ func TestIssue496_WarmCellInTheWindowIsStillReMinted(t *testing.T) {
 		t.Fatalf("SETUP: a non-freshMint ReplaceIfGen must INHERIT BornAt (%v → %v); the arm would not be in the window",
 			e0.BornAt, eKept.BornAt)
 	}
-	if age := time.Since(eKept.BornAt); age < i496MaxAge-i496TTL || age >= i496MaxAge {
+	if age := c.now().Sub(eKept.BornAt); age < i496MaxAge-i496TTL || age >= i496MaxAge {
 		t.Fatalf("SETUP: BornAt age %v left the lead window [%v, %v) while keeping the body fresh",
 			age, i496MaxAge-i496TTL, i496MaxAge)
 	}
