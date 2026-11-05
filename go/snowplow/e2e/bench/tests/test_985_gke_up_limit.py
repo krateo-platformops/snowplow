@@ -22,7 +22,7 @@ import pytest
 
 from bench import gke
 from tests import fake_cloudquotas
-from tests.test_gke_pvc_disks import NAME, _calls, fakes  # noqa: F401  (fixture)
+from tests.test_gke_pvc_disks import NAME, _calls, fakes, footprint_files  # noqa: F401  (fixture)
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
@@ -66,14 +66,19 @@ def test_every_cluster_in_the_region_counts_whatever_its_owner_or_status():
 
 
 def test_gke_cluster_quota_reads_the_api_and_refuses_when_full(fakes, monkeypatch, capsys):  # noqa: F811
+    """#1171: the pair's one quota check (gke-quotas, both runs' footprints) reads the limit."""
+    pair = footprint_files(fakes, 2)
     monkeypatch.setenv("FAKE_CLUSTERS", _clusters(("krateo-installer-release", R, "RUNNING")))
-    assert gke.main(["gke-cluster-quota", "--runs", "2"]) == 0
+    assert gke.main(["gke-quotas", *pair]) == 0
     assert "1 of 3 (ClustersPerRegion)" in capsys.readouterr().out
-    assert gke.main(["gke-cluster-quota", "--runs", "3"]) == 2
+    monkeypatch.setenv("FAKE_CLUSTERS", _clusters(("krateo-installer-release", R, "RUNNING"),
+                                                  ("snowplow-bench-run17a5-x", R, "RUNNING")))
+    assert gke.main(["gke-quotas", *pair]) == 2
+    assert "2 of 3 (ClustersPerRegion)" in capsys.readouterr().err
     (fakes / "state" / "cluster_limit").write_text("4")                        # the limit is READ
-    assert gke.main(["gke-cluster-quota", "--runs", "3"]) == 0
+    assert gke.main(["gke-quotas", *pair]) == 0
     (fakes / "state" / "cluster_limit").write_text("missing")                  # an API that does not answer
-    assert gke.main(["gke-cluster-quota", "--runs", "1"]) == 2
+    assert gke.main(["gke-quotas", *footprint_files(fakes, 1)]) == 2
     assert "could not be read" in capsys.readouterr().err
 
 

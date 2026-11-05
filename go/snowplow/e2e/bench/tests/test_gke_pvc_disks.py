@@ -40,6 +40,7 @@ from pathlib import Path
 import pytest
 
 from bench import gke
+from tests import fake_region
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
@@ -141,14 +142,27 @@ def test_the_footprint_is_run14s_recorded_pvcs():
         gke.disk_gb("lots")
 
 
+def runs_footprint(runs: int, lb_services: int = 1) -> "gke.Footprint":
+    """`runs` bench runs of the default spec (#1171), each with `lb_services`."""
+    return sum((gke.footprint(gke.default_spec(NAME), lb_services=lb_services) for _ in range(runs)),
+               gke.Footprint())
+
+
+def quota_line(region: dict, fp, metric: str) -> tuple[bool, str]:
+    """(fits, line) of one quota among RUN_QUOTAS's region rows (#1171)."""
+    fits, refusals = gke.region_fit(region, fp)
+    line = next(m for m in fits + refusals if m.startswith(metric + " "))
+    return line in fits, line
+
+
 def test_quota_fit_on_the_regions_real_quotas():
     """2026-10-25: 397 of 500 GB used (the release cluster's 333 + run 16's two
     clusters): two more bench clusters fit, four do not."""
-    ok, msg = gke.ssd_quota_fit(QUOTAS, 2 * gke.BENCH_PVC_FOOTPRINT_GB)
+    ok, msg = quota_line(QUOTAS, runs_footprint(2), "SSD_TOTAL_GB")
     assert ok and "397 of 500 GB used, 103 free" in msg
-    ok, msg = gke.ssd_quota_fit(QUOTAS, 4 * gke.BENCH_PVC_FOOTPRINT_GB)
+    ok, msg = quota_line(QUOTAS, runs_footprint(4), "SSD_TOTAL_GB")
     assert not ok and "needs 128 GB" in msg
-    ok, msg = gke.ssd_quota_fit({"name": "x", "quotas": []}, 1)
+    ok, msg = quota_line({"name": "x", "quotas": []}, runs_footprint(1), "SSD_TOTAL_GB")
     assert not ok and "unknown" in msg
 
 
@@ -433,7 +447,7 @@ def fakes(tmp_path, monkeypatch):
     st.mkdir()
     (tmp_path / "pvs.json").write_text(json.dumps(PVS))
     (tmp_path / "disks.json").write_text(json.dumps(DISKS))
-    (tmp_path / "quotas.json").write_text(json.dumps(QUOTAS))
+    (tmp_path / "quotas.json").write_text(json.dumps(fake_region.quotas({})))   # #1171: the full listing
     monkeypatch.setenv("PATH", f"{b}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     for k, v in (("FAKE_STATE", st), ("FAKE_PVS", tmp_path / "pvs.json"), ("FAKE_DISKS", tmp_path / "disks.json"),
@@ -779,11 +793,22 @@ def test_gke_up_that_fits_creates_the_labelled_cluster_and_touches_no_storagecla
     assert "SSD_TOTAL_GB in europe-west4: 397 of 500 GB used, 103 free" in capsys.readouterr().out
 
 
+def footprint_files(tmp, runs: int, lb_services: int = 1) -> list[str]:
+    """--footprint F per run, each written by gke-footprint as run606's dry pass does (#1171)."""
+    args = []
+    for i in range(runs):
+        f = tmp / f"footprint-{runs}-{i}.json"
+        assert gke.main(["gke-footprint", "--name", NAME, "--address-need", str(lb_services), "--out", str(f)]) == 0
+        args += ["--footprint", str(f)]
+    return args
+
+
 def test_gke_ssd_quota_for_a_pair(fakes, capsys):
-    assert gke.main(["gke-ssd-quota", "--runs", "2"]) == 0
-    assert gke.main(["gke-ssd-quota", "--runs", "4"]) == 2
+    assert gke.main(["gke-quotas", *footprint_files(fakes, 2)]) == 0
+    assert gke.main(["gke-quotas", *footprint_files(fakes, 4)]) == 2
     err = capsys.readouterr().err
-    assert "SSD_TOTAL_GB" in err and "refusing" not in err          # the caller says "refusing" once
+    assert "SSD_TOTAL_GB in europe-west4: 397 of 500 GB used, 103 free; the run needs 128 GB" in err
+    assert "refusing" not in err          # the caller says "refusing" once
 
 
 def test_run606_pair_refuses_when_both_clusters_do_not_fit(pairbed):  # noqa: F811

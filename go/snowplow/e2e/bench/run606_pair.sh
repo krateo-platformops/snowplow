@@ -37,8 +37,8 @@
 # Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
 # OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
 # verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
-# anything was created (#895: the SSD quota read refuses too; #1026: and the
-# STATIC_ADDRESSES read, for both runs' LoadBalancer Services). A restart of B
+# anything was created (#1171: both runs' footprints, together, against every
+# regional quota they consume: bench/gke.py RUN_QUOTAS). A restart of B
 # FAILs the pair; a restart of A is recorded and
 # its not-Ready time is removed from both runs (bench/custlat.py's module doc):
 # the pair reads each run's k6 stream from its OUT for that.
@@ -106,7 +106,7 @@ runenv() {
 log "pair: A=${RUN_NAME_A} (${SNOWPLOW_TAG_A}) B=${RUN_NAME_B} (${SNOWPLOW_TAG_B}), bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
 for x in A B; do
   runenv "$x"
-  rm -f "$PAIR_OUT/dry-$x/lb-need.json"     # #1026: only THIS dry pass's derivation counts
+  rm -f "$PAIR_OUT/dry-$x/footprint.json"   # #1171: only THIS dry pass's derivation counts
   if ! env "${RUNENV[@]}" BENCH_606_DRY_RUN=1 OUT="$PAIR_OUT/dry-$x" "$BASH" "$RUN606" \
        > "$PAIR_OUT/dry-$x.console" 2>&1; then
     tail -5 "$PAIR_OUT/dry-$x.console" >&2
@@ -116,35 +116,27 @@ for x in A B; do
 done
 # What both clusters need, together (each gke-up alone would see room for
 # itself): reads only, nothing is created, so the DRY pass runs them too and
-# refuses a pair that cannot start (#985: run 18 was lost to GKE's
-# per-location cluster limit ~19 s into gke-up).
-# #895: both clusters' PVC disks must fit the region's SSD_TOTAL_GB;
-# #985: both clusters must fit GKE's per-location cluster limit
-# (ClustersPerRegion, read) beside every cluster already in the region.
+# refuses a pair that cannot start. #1171: each run's dry pass derived its
+# footprint from the spec its gke-up creates and the LoadBalancer Services its
+# install creates ($OUT/footprint.json); both together must fit every regional
+# quota they consume (bench/gke.py RUN_QUOTAS): the PVC disks (#895), GKE's
+# per-location cluster limit (#985, read), the static addresses (#1026), the
+# in-use addresses every node and LoadBalancer holds (run 21 attempt 2 failed
+# 30 min in on IN_USE_ADDRESSES), vCPUs, instances, disks, forwarding rules.
 quota_args=()
 [[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
 [[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
-for check in gke-ssd-quota gke-cluster-quota; do
-  if ! quota_msg="$(python3 -m bench.gke "$check" ${quota_args[@]+"${quota_args[@]}"} --runs 2 2>&1)"; then
-    refuse "${quota_msg#refusing: }"
-  fi
-  log "$quota_msg"
-done
-# #1026: both runs' LoadBalancer Services must fit the region's STATIC_ADDRESSES
-# (one regional static address each while GKE builds its load balancer; run 19
-# attempt 3 waited 45 min for one). Each run's dry pass derived its own from
-# what it installs ($OUT/lb-need.json, bench/lb_need.py); the pair needs both.
-lb_need=0
 for x in A B; do
-  n="$(python3 -c 'import json, sys; n = json.load(open(sys.argv[1]))["need"]; assert isinstance(n, int) and n >= 0; print(n)' \
-       "$PAIR_OUT/dry-$x/lb-need.json" 2>/dev/null)" \
-    || refuse "run $x's dry pass did not derive its LoadBalancer Services ($PAIR_OUT/dry-$x/lb-need.json): whether the pair fits STATIC_ADDRESSES is unknown; nothing was created"
-  lb_need=$(( lb_need + n ))
+  [[ -s "$PAIR_OUT/dry-$x/footprint.json" ]] \
+    || refuse "run $x's dry pass did not derive its LoadBalancer Services and cluster footprint ($PAIR_OUT/dry-$x/footprint.json): whether the pair fits the region's quotas is unknown; nothing was created"
+  quota_args+=(--footprint "$PAIR_OUT/dry-$x/footprint.json")
 done
-if ! quota_msg="$(python3 -m bench.gke gke-address-quota ${quota_args[@]+"${quota_args[@]}"} --need "$lb_need" 2>&1)"; then
-  refuse "${quota_msg#refusing: }"
+if ! quota_msg="$(python3 -m bench.gke gke-quotas "${quota_args[@]}" 2>&1)"; then
+  refuse "${quota_msg//$'\n'/$'\n'refusing: }"
 fi
-log "$quota_msg"
+while IFS= read -r ln; do
+  if [[ -n "$ln" ]]; then log "$ln"; fi
+done <<< "$quota_msg"
 eval_cmd=(python3 -m bench.custlat pair --a "$OUT_A/verdict.json" --b "$OUT_B/verdict.json"
           --a-dir "$OUT_A" --b-dir "$OUT_B"
           --replica "$REPLICA" --expect-a "$EXPECTED_IMAGE_DIGEST_A" --expect-b "$EXPECTED_IMAGE_DIGEST_B")

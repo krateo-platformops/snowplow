@@ -36,7 +36,7 @@ import pytest
 
 from bench import gke
 from bench.load606 import SCALEUSER_PASSWORD
-from tests import _planted
+from tests import _planted, fake_region
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN_NAME = "snowplow-bench-1014-1300"
@@ -63,7 +63,7 @@ _COMMON = textwrap.dedent("""\
                                  "context": context}) + "\\n")
     """)
 
-FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
+FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
     a = sys.argv[1:]
     record("gcloud", os.environ.get("KUBECONFIG"))
     def opt(name):
@@ -90,14 +90,8 @@ FAKE_GCLOUD = _COMMON + textwrap.dedent("""\
                        "clusters": [{"name": ctx, "cluster": {"server": "https://127.0.0.1:1"}}],
                        "users": []}, fh)
         sys.exit(0)
-    if a[:3] == ["compute", "regions", "describe"]:            # #895: the SSD quota read
-        print(json.dumps({"name": a[3], "quotas": [
-            {"metric": "SSD_TOTAL_GB", "limit": 500.0,
-             "usage": float(os.environ.get("FAKE_SSD_USAGE", "333"))},
-            # #1026: one static address per LoadBalancer Service the run creates
-            {"metric": "STATIC_ADDRESSES", "limit": 8.0,
-             "usage": float(os.environ.get("FAKE_STATIC_USAGE", "3"))}]}))
-        sys.exit(0)
+    if a[:3] == ["compute", "regions", "describe"]:            # #1171: every quota of the region
+        print(json.dumps(region_quotas(a[3]))); sys.exit(0)     # (tests/fake_region.py; FAKE_USAGE_<METRIC>)
     if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]):
         # #1026: the region's addresses / forwarding rules (FAKE_ADDRESSES: the addresses GCE lists)
         if a[2] == "list":

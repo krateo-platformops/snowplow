@@ -652,6 +652,24 @@ s_up() {
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
+  # #1171: what the run makes in the region (its nodes, each with an external IP,
+  # vCPUs, boot disks, node pools, LoadBalancer Services, PVC disks), from the spec
+  # gke-up creates with these same flags, offline, in the dry pass too
+  # ($OUT/footprint.json: the pair checks both runs' together); gke-up checks it
+  # against every regional quota the run consumes (RUN_QUOTAS), before anything
+  # is created. Run 21 attempt 2 failed 30 min in on IN_USE_ADDRESSES.
+  local fp_rc=0
+  rm -f "$OUT/footprint.json"
+  python3 -m bench.gke gke-footprint --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" --address-need "$LB_NEED" \
+      --out "$OUT/footprint.json" 2>"$KERR" || fp_rc=$?
+  if (( fp_rc != 0 )); then
+    record_failure "up FAILED: the run's footprint in the region could not be derived"
+    return 1
+  fi
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
   # by gke-up) goes through record_failure like every other step's; its
