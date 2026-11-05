@@ -92,6 +92,11 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         sys.exit(0)
     if a[:3] == ["compute", "regions", "describe"]:            # #1171: every quota of the region
         print(json.dumps(region_quotas(a[3]))); sys.exit(0)     # (tests/fake_region.py; FAKE_USAGE_<METRIC>)
+    if a[:3] == ["compute", "project-info", "describe"]:       # #1171: the project's global quotas
+        print(json.dumps(project_quotas())); sys.exit(0)
+    if a[:2] in (["compute", "instances"], ["compute", "forwarding-rules"], ["compute", "addresses"]) \\
+            and a[2] == "list" and "--filter" not in a:          # #1173: what holds the region's addresses
+        print(json.dumps(region_list(a[1]))); sys.exit(0)
     if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]):
         # #1026: the region's addresses / forwarding rules (FAKE_ADDRESSES: the addresses GCE lists)
         if a[2] == "list":

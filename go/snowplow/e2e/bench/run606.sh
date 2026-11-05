@@ -675,9 +675,17 @@ s_up() {
   # by gke-up) goes through record_failure like every other step's; its
   # progress is on stdout. Run 18 lost both arms with only the RUN line logged.
   local up_rc=0
+  rm -f "$OUT/quota-check.log"
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
-      --address-need "$LB_NEED" $YES 2>"$KERR" || up_rc=$?
+      --address-need "$LB_NEED" --quota-log "$OUT/quota-check.log" $YES 2>"$KERR" || up_rc=$?
+  # #1173: every pre-check line in the run's log, IN_USE_ADDRESSES's with the number counted
+  # from the region's address holders beside the one GCE reports (each launch is the falsifier)
+  if [[ -s "$OUT/quota-check.log" ]]; then
+    while IFS= read -r ln; do
+      if [[ -n "$ln" ]]; then log "quota $ln"; fi
+    done < "$OUT/quota-check.log"
+  fi
   if [[ -s "$KERR" ]]; then cat "$KERR" >&2; fi
   (( up_rc == 0 )) || { record_failure "up FAILED: gke-up exited ${up_rc}"; return 1; }
   UP_OK=1             # gke-up made the cluster: a teardown that cannot find it is a failure

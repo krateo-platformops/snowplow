@@ -148,10 +148,14 @@ def runs_footprint(runs: int, lb_services: int = 1) -> "gke.Footprint":
                gke.Footprint())
 
 
-def quota_line(region: dict, fp, metric: str) -> tuple[bool, str]:
-    """(fits, line) of one quota among RUN_QUOTAS's region rows (#1171)."""
-    fits, refusals = gke.region_fit(region, fp)
-    line = next(m for m in fits + refusals if m.startswith(metric + " "))
+def quota_line(region: dict, fp, metric: str, env: dict | None = None) -> tuple[bool, str]:
+    """(fits, line) of one quota among RUN_QUOTAS's region and project rows
+    (#1171), the region's resources and the project's quotas those of the fake
+    (`env`: FAKE_REGION_* / FAKE_PROJECT_QUOTAS; tests/fake_region.py)."""
+    env = env or {}
+    listed = {k: fake_region.region_list(k, env) for k in fake_region.LISTS}
+    fits, refusals = gke.region_fit({"region": region, "project": fake_region.project_quotas(env)}, fp, listed)
+    line = next(m for m in fits + refusals if m.startswith((metric + " ", metric + ":")))
     return line in fits, line
 
 
@@ -222,9 +226,7 @@ def test_the_backstop_without_this_clusters_id_takes_only_recorded_unlabelled_di
 
 # ─── 1+2. teardown, end to end against fakes ───────────────────────────────
 
-FAKE = textwrap.dedent("""\
-    #!/usr/bin/env python3
-    import json, os, sys
+FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + textwrap.dedent("""\
     st = os.environ["FAKE_STATE"]
     tool = os.path.basename(sys.argv[0])
     a = [x for x in sys.argv[1:] if not x.startswith(("--kubeconfig=", "--context=", "--request-timeout="))]
@@ -367,7 +369,13 @@ FAKE = textwrap.dedent("""\
                 fh.write(" ".join(names) + " ")
         sys.exit(rc)
     if a[:3] == ["compute", "regions", "describe"]:
-        q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(q)); sys.exit(0)
+        # #1173: IN_USE_ADDRESSES as the live API reports it (tests/fake_region.py)
+        q = json.load(open(os.environ["FAKE_QUOTAS"])); print(json.dumps(region_reported(q))); sys.exit(0)
+    if a[:3] == ["compute", "project-info", "describe"]:       # #1171: the project's global quotas
+        print(json.dumps(project_quotas())); sys.exit(0)
+    if a[:2] in (["compute", "instances"], ["compute", "forwarding-rules"], ["compute", "addresses"]) \\
+            and a[2] == "list" and "--filter" not in a:          # #1173: what holds the region's addresses
+        print(json.dumps(region_list(a[1]))); sys.exit(0)
     if a[:2] in (["compute", "addresses"], ["compute", "forwarding-rules"]) and a[2] == "list":
         # #1026: GCE by the filter the bench writes (name=(a b)) in --regions; the leftovers
         # (FAKE_ADDRESSES) are there once the cluster was deleted under its Services
