@@ -1976,7 +1976,12 @@ def quota_fit(quotas: dict, metric: str, need: float, what: str, unit: str = "",
     used, how = reported, ""
     if listed is not None:
         used = max(reported, float(listed[0]))
-        how = f" (listed: {listed[1]} = {listed[0]}; GCE reports {reported:g})"
+        how = f" (listed: {listed[1]} = {listed[0]}; GCE reports {reported:g}"
+        if reported > listed[0]:
+            # the model misses a holder GCE counts: said on the line, never folded away
+            how += (f"; GCE reports {reported - listed[0]:g} more than the resources counted: something holds an "
+                    f"address this check does not list")
+        how += ")"
     free = float(q["limit"]) - used
     return free >= need, (f"{metric} in {quotas.get('name')}: {used:g} of {q['limit']:g}{unit} used{how}, "
                           f"{free:g} free; {what}")

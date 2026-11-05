@@ -268,7 +268,11 @@ def test_used_is_the_larger_of_the_listed_and_the_reported():
     next(q for q in region["quotas"] if q["metric"] == "IN_USE_ADDRESSES")["usage"] = 9.0
     ok, msg = quota_line(region, _pair(), "IN_USE_ADDRESSES", region_env(vms=2))
     assert not ok and "9 of 16 used (listed: 2 VM external IP(s) + 0 forwarding-rule use(s) + 0 address(es) held " \
-                      "by neither = 2; GCE reports 9), 7 free" in msg
+                      "by neither = 2; GCE reports 9; GCE reports 7 more than the resources counted: something " \
+                      "holds an address this check does not list), 7 free" in msg
+    # when the count covers the reported usage (the observed case), no such note
+    ok, msg = _in_use(region_env(vms=3, forwarding_rules=7))
+    assert "more than the resources counted" not in msg
 
 
 def test_a_list_that_cannot_be_read_is_unknown():
