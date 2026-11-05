@@ -191,6 +191,46 @@ def test_a_stopped_sampler_reaps_the_sample_it_killed(tmp_path):
         os.kill(int(pidf.read_text()), 0)
 
 
+def test_a_stop_during_the_fork_kills_and_reaps_the_sample(tmp_path, monkeypatch):
+    """A stop that lands while Popen is still returning has no handle to kill by. It is deferred
+    across the fork, then the sample is killed and reaped (deterministic: the signal handler is
+    called from inside the constructor, the moment the child exists)."""
+    from bench import sampler
+    runner = sampler.Runner()
+    started = []
+
+    class StoppedInTheFork(subprocess.Popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            started.append(self)
+            runner.stop()
+
+    try:
+        with monkeypatch.context() as m, pytest.raises(sampler._Stopping):
+            m.setattr(sampler.subprocess, "Popen", StoppedInTheFork)
+            runner.run(["sleep", "30"], 60)
+        p = started[0]
+        assert p.returncode == -signal.SIGKILL, p.returncode            # killed, not left to finish
+        with pytest.raises(ProcessLookupError):
+            os.kill(p.pid, 0)
+        assert runner.proc is None
+    finally:
+        if started and started[0].poll() is None:
+            started[0].kill()
+            started[0].wait()
+
+
+def test_a_sample_that_cannot_start_leaves_stops_undeferred():
+    """The fork's deferral ends when the fork fails too, or the next stop would be swallowed."""
+    from bench import sampler
+    runner = sampler.Runner()
+    with pytest.raises(OSError):
+        runner.run(["/nonexistent/bench-sampler-1175"], 5)
+    assert runner.writing is False and runner.proc is None
+    with pytest.raises(sampler._Stopping):
+        runner.stop()
+
+
 def test_the_interpreters_resource_tracker_is_not_a_tests_leak(tmp_path):
     """multiprocessing's resource tracker (bench/ghcr_pull.py's spawn context starts it) lives
     as long as the test process, by design: it is the process's, not the test's that first

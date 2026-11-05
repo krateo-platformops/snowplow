@@ -51,6 +51,11 @@ REQUESTS_TOTAL = "apiserver_request_total"
 _CODE = re.compile(r'[{,]code="([^"]*)"')
 
 
+#: how long a stop waits to reap the sample it SIGKILLed. Past it (a process stuck in
+#: uninterruptible I/O) the sampler leaves: its exit must not hold the teardown before gke-down.
+REAP_BOUND_S = 5.0
+
+
 class _Stopping(Exception):
     pass
 
@@ -66,7 +71,8 @@ class Runner:
 
     def stop(self, *_):
         """SIGTERM / SIGINT: kill the sample in flight and end the loop at
-        once; a record being written is finished first."""
+        once; a record being written, or a sample being forked (no handle to
+        kill it by yet), is finished first."""
         self.stopping = True
         self._kill()
         if not self.writing:
@@ -84,9 +90,17 @@ class Runner:
         """(rc, stdout, stderr, timed_out); rc None when the bound ended it."""
         if self.stopping:
             raise _Stopping
-        self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     stdin=subprocess.DEVNULL, start_new_session=True)
+        self.writing = True         # a stop across the fork is deferred to the check below
         try:
+            self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
+        except BaseException:
+            self.writing = False
+            raise
+        try:
+            self.writing = False
+            if self.stopping:
+                raise _Stopping
             out, err = self.proc.communicate(timeout=bound_s)
             rc, timed_out = self.proc.returncode, False
         except subprocess.TimeoutExpired:
@@ -95,7 +109,10 @@ class Runner:
             rc, timed_out = None, True
         finally:
             self._kill()
-            self.proc.wait()        # a stop raises out of communicate: killed is not yet reaped
+            try:
+                self.proc.wait(timeout=REAP_BOUND_S)    # a stop raises out of communicate: not yet reaped
+            except subprocess.TimeoutExpired:
+                pass
             self.proc = None
         if self.stopping:
             raise _Stopping

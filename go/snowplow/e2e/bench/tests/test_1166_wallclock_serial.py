@@ -79,6 +79,12 @@ def _a_datetime_module_utcnow_through_a_name():
     assert elapsed < 30
 
 
+def _a_datetime_elapsed_name_read_through():
+    t0 = datetime.now(UTC)
+    elapsed = datetime.now(UTC) - t0
+    assert elapsed.total_seconds() < 30
+
+
 def _a_datetime_timestamp():
     t0 = datetime.now(UTC).timestamp()
     assert datetime.now(UTC).timestamp() - t0 < 30
@@ -114,7 +120,8 @@ def _a_moment_in_the_past_compared():
 def test_a_wall_clock_bound_is_recognised_in_each_of_its_shapes():
     for f in (_direct, _through_a_name, _in_a_conjunction, _a_module_alias, _an_alias_in_the_function,
               _a_function_imported_by_name, _reversed, _chained, _a_deadline, _a_datetime_difference,
-              _a_datetime_module_utcnow_through_a_name, _a_datetime_timestamp):
+              _a_datetime_module_utcnow_through_a_name, _a_datetime_elapsed_name_read_through,
+              _a_datetime_timestamp):
         assert bounds_wall_clock(f), f.__name__
 
 

@@ -106,6 +106,7 @@ def _bounds_from_above(names: _Names, elapsed: set[str], c: ast.Compare) -> bool
             small = b
         else:
             continue
+        small = _read_through(small)
         if names.is_difference(small) or names.is_clock(small):
             return True
         if isinstance(small, ast.Name) and small.id in elapsed:
