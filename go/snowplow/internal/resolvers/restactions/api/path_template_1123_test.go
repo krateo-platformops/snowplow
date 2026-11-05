@@ -395,3 +395,14 @@ func TestIssue1123_RefusedValueFailsItsStageAsInvalidPath(t *testing.T) {
 		})
 	}
 }
+
+// The total is every reason's: two PRs each added a class to this sum.
+func TestIssue1123_TheTotalCountsEveryReason(t *testing.T) {
+	for _, reason := range MalformedDialReasonEnum() {
+		before := MalformedDialSkippedTotal()
+		bumpMalformedDialSkipped(reason)
+		if got := MalformedDialSkippedTotal() - before; got != 1 {
+			t.Errorf("%s moved the total by %d, want 1", reason, got)
+		}
+	}
+}

@@ -401,6 +401,7 @@ func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *tes
 		"/apis/g/v/watch/x": false, "/apis/g/v/proxy/x": false, "/api/v1/watch/x": false, "/api/v1/proxy/x": false,
 		"/apis/g/v/watch": false, "/apis/g/v/proxy/": false, "/api/v1/watch": false, "/api/v1/proxy/": false,
 		"/apis/g/watch": true, "/apis/g/watch/x": true, "/api/watch/x": true, "/apis/watch": true, "/watch/x": true,
+		"/apis/watch/v1/x": true, "/apis/g/v/Watch/x": true, "/api/v1/PROXY/x": true,
 		"/apis/g/v/x/watch": true, "/api/v1/x/proxy": true,
 	} {
 		if got := servedAsWritten(p); got != want {
@@ -418,7 +419,7 @@ func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *tes
 func TestIssue1137_TheRuleRefusesExactlyTheVerbsTheApiserverStrips(t *testing.T) {
 	words := []string{"watch", "proxy", "get", "list", "create", "update", "patch", "delete", "deletecollection",
 		"log", "exec", "attach", "portforward", "status", "scale", "finalize", "binding", "eviction", "token",
-		"redirect", "connect", "impersonate", "bind", "escalate", "namespaces", "resources", "p2s"}
+		"redirect", "connect", "impersonate", "bind", "escalate", "namespaces", "resources", "p2s", "Watch", "PROXY"}
 	stripped := 0
 	for _, w := range words {
 		for _, root := range []string{"/apis/g/v/", "/api/v1/"} {
