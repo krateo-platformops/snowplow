@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"net"
 	"net/http"
@@ -14,10 +15,14 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
@@ -43,13 +48,14 @@ func stageServer847(t *testing.T) (*httptest.Server, *atomic.Int32) {
 func stageCells847() map[string]uint64 {
 	m := map[string]uint64{}
 	for _, c := range credhttp.EgressConnectionsSnapshot() {
-		m[c.Egress+"/"+c.Protocol+"/"+c.Connection] = c.Count
+		m[c.Egress+"/"+c.Protocol+"/opened"] = c.Opened
+		m[c.Egress+"/"+c.Protocol+"/handovers"] = c.Handovers
 	}
 	return m
 }
 
-// Ten fetches of one external endpoint: one connection on the wire, one new and
-// nine reused in the counter, under the stage egress and nowhere else.
+// Ten fetches of one external endpoint: one connection on the wire, one opened
+// and ten handovers, under the stage egress and nowhere else.
 func TestEgressConnections847_StageFetchCountsUnderStage(t *testing.T) {
 	srv, conns := stageServer847(t)
 	ep := &endpoints.Endpoint{ServerURL: srv.URL, Token: "third-party-token"}
@@ -65,10 +71,66 @@ func TestEgressConnections847_StageFetchCountsUnderStage(t *testing.T) {
 	for k, v := range stageCells847() {
 		want := uint64(0)
 		switch k {
-		case "stage/http1/new":
+		case "stage/http1/opened":
 			want = 1
-		case "stage/http1/reused":
-			want = 9
+		case "stage/http1/handovers":
+			want = 10
+		}
+		if d := v - before[k]; d != want {
+			t.Errorf("cell %s moved by %d, want %d", k, d, want)
+		}
+	}
+}
+
+// The live clientconfig shape, concurrently: real stage fetches over the owned
+// dialer (credhttp.EndpointDialHolder) and TLS. opened is what the server
+// accepted, surplus dials included, and handovers is what it served.
+func TestEgressConnections847_ConcurrentStageMatchesTheServer(t *testing.T) {
+	const workers, perWorker = 16, 10
+	p := newPKI1088(t)
+	cs := newConnServer1088(t, p, false)
+	ep := certEndpoint1088(t, p, cs.srv.URL, "user-847")
+	before := stageCells847()
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*perWorker)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range perWorker {
+				cp := *ep
+				st, _, _, err := httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
+					RequestInfo: httpcall.RequestInfo{Path: "/api/v1/namespaces/ns/configmaps/cm", Verb: ptr.To(http.MethodGet)},
+					Endpoint:    &cp,
+				})
+				if err == nil && st.Code != http.StatusOK {
+					err = errors.New(st.Message)
+				}
+				if err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if h2, r := cs.h2.Load(), cs.reqs.Load(); h2 != workers*perWorker || r != workers*perWorker {
+		t.Fatalf("the server served %d requests, %d of them HTTP/2; want %d of both", r, h2, workers*perWorker)
+	}
+	opened := func() uint64 { return stageCells847()["stage/http2/opened"] - before["stage/http2/opened"] }
+	for deadline := time.Now().Add(10 * time.Second); opened() != uint64(cs.connections()) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	for k, v := range stageCells847() {
+		want := uint64(0)
+		switch k {
+		case "stage/http2/opened":
+			want = uint64(cs.connections())
+		case "stage/http2/handovers":
+			want = workers * perWorker
 		}
 		if d := v - before[k]; d != want {
 			t.Errorf("cell %s moved by %d, want %d", k, d, want)
@@ -93,20 +155,20 @@ func TestEgressConnections847_Expvar(t *testing.T) {
 	}
 	read := func() map[string]map[string]map[string]uint64 {
 		t.Helper()
-		v := expvar.Get("snowplow_egress_connections_total")
+		v := expvar.Get("snowplow_egress_connections")
 		if v == nil {
-			t.Fatal("snowplow_egress_connections_total is not published with the cache on")
+			t.Fatal("snowplow_egress_connections is not published with the cache on")
 		}
 		var got map[string]map[string]map[string]uint64
 		if err := json.Unmarshal([]byte(v.String()), &got); err != nil {
-			t.Fatalf("not {egress: {protocol: {connection: n}}}: %v: %s", err, v.String())
+			t.Fatalf("not {egress: {protocol: {opened, handovers}}}: %v: %s", err, v.String())
 		}
 		return got
 	}
 	before := read()
 	for _, e := range credhttp.Egresses {
 		for _, p := range credhttp.ConnProtocols {
-			for _, c := range credhttp.ConnStates {
+			for _, c := range []string{"opened", "handovers"} {
 				if _, ok := before[e][p][c]; !ok {
 					t.Errorf("no cell %s/%s/%s: every cell is published from the start", e, p, c)
 				}
@@ -121,10 +183,10 @@ func TestEgressConnections847_Expvar(t *testing.T) {
 		}
 	}
 	after := read()
-	if d := after["stage"]["http1"]["new"] - before["stage"]["http1"]["new"]; d != 1 {
-		t.Errorf("new moved by %d, want 1", d)
+	if d := after["stage"]["http1"]["opened"] - before["stage"]["http1"]["opened"]; d != 1 {
+		t.Errorf("opened moved by %d, want 1", d)
 	}
-	if d := after["stage"]["http1"]["reused"] - before["stage"]["http1"]["reused"]; d != 1 {
-		t.Errorf("reused moved by %d, want 1", d)
+	if d := after["stage"]["http1"]["handovers"] - before["stage"]["http1"]["handovers"]; d != 2 {
+		t.Errorf("handovers moved by %d, want 2", d)
 	}
 }

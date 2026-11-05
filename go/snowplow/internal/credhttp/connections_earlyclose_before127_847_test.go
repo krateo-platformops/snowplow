@@ -26,7 +26,7 @@ func TestConnections847_EarlyClosedBodyOnHTTP1IsANewConnection(t *testing.T) {
 	get(t, EgressStage, cli, s.URL)
 	get(t, EgressStage, cli, s.URL)
 	s.assertWire(t, 2, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 2, "stage/http1/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 3})
 }
 
 // #847's first row: a retryable answer has its body closed unread, so the retry
@@ -46,5 +46,5 @@ func TestConnections847_RetryAfterAnUnreadBodyIsANewConnection(t *testing.T) {
 		t.Fatalf("status %d, want the retry's 200", resp.StatusCode)
 	}
 	s.assertWire(t, 2, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 2})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 2})
 }

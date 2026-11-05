@@ -424,10 +424,17 @@ branch and bumps `completed_total` too — so raw `completed/s` **over-estimates
 dequeue read no longer contaminates `miss_total`, so `miss_total` is miss-neutral and the
 refresher's own skip counter is the independent, #376-surviving source.
 
-### Egress connections: new vs reused (#847)
-Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egress_connections_total` (`{"<egress>": {"<protocol>": {"new": n, "reused": n}}}`), mirrored to OTLP under the same name with attributes `egress`, `protocol`, `connection`, hand-wired in `metrics.go`. All 24 cells exist from the start.
+### Egress connections: opened and handed over (#847)
+Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egress_connections` (`{"<egress>": {"<protocol>": {"opened": n, "handovers": n}}}`), mirrored to OTLP as `snowplow_egress_connections_opened_total` and `snowplow_egress_connection_handovers_total`, both with attributes `egress` and `protocol`, hand-wired in `metrics.go`. All 12 cells exist from the start.
 
-**Read the share `reused / (new + reused)`, per egress and protocol, not a latency:** a latency moves with load. A new connection costs a TCP connect and, on https, a TLS handshake.
+**Read the share `1 - opened / handovers`, per egress and protocol, over a whole phase, not a latency:** a latency moves with load. A new connection costs a TCP connect and, on https, a TLS handshake.
+
+| counter | one count is |
+|---|---|
+| `opened` | a connection that came up: TCP connected on `http://`, TLS handshake finished on `https://`. It equals what the servers accepted, however concurrent the pool. A dial that fails or is given up before it is up does not count. One that comes up after its request left does, used or not: the cost is paid |
+| `handovers` | a request handed a connection, new or pooled. One per HTTP/2 stream. A retry and a redirect hop take one each, and a request `net/http` retries by itself after a pooled connection turned out dead takes two |
+
+**Why not `GotConnInfo.Reused`.** It does not say a connection has carried a request before. A dial whose waiter was served by something else parks its connection in the idle pool, and `net/http` marks it reused there, before its first request. That is how a lost connection is normally replaced on a busy pool, so on a concurrent pool most new connections read as reused. Dials are read at the dial instead.
 
 | label | values | meaning |
 |---|---|---|
@@ -436,15 +443,20 @@ Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egre
 | | `authn`, `rum_forward` | the authn login and the browser-span forwarder |
 | | `other` | a name outside the set. No caller sends one, so anything here is a bug. It keeps the set closed |
 | `protocol` | `http1`, `http2` | what the connection negotiated. One egress can carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster `http://` service over HTTP/1 |
-| `connection` | `new` | the connection had carried no request before this one |
-| | `reused` | it had. On HTTP/2 that is every stream after a connection's first |
 
-One count is one connection handed to a request, not one request: a request `net/http` retries by itself after a pooled connection turned out dead counts one `reused` and one `new`. A dial whose connection nobody used is not counted. No label carries a host, a path, an identity or a status.
+No label carries a host, a path, an identity or a status. The three OTLP exporters (metrics, traces, logs) build their own clients and are not counted. One shape overcounts: an `https://` request through an `https://` proxy does two TLS handshakes on one connection, and each counts as opened. An interval can read more `opened` than `handovers`, when dials land after the requests that started them have finished.
 
-Reading it:
-- `apiserver/http2` stays near 100% on any toolchain. It is the control of a paired run.
-- `call` reads a share near 0 by construction: `credhttp.Do` builds a client per call, so only a retry inside one call can reuse a connection. That is not something a toolchain changes.
-- Before Go 1.27, a body closed before its end loses an HTTP/1 connection. From Go 1.27 the transport drains it in the background, up to 256 KiB or 50 ms, and keeps the connection, so `stage/http1` and `authn/http1` are where the bump shows. A body over 256 KiB, or a request sent before the drain ends, still takes a new connection, so a share below 100% is not by itself a defect.
+Reading it across Go 1.27. From Go 1.27 the transport drains an HTTP/1 body closed before its end, in the background, up to 256 KiB or 50 ms, and keeps the connection, so a cell can only move if something in it closes a body early and then sends again on the same client:
+
+| cell | across the bump | why |
+|---|---|---|
+| `stage/http1` | **the one that moves**, by as much as its non-2xx answers allow | a retried 5xx or 429 has its body closed unread, and a non-2xx body is read only to 2048 bytes. An all-2xx workload reads every body whole, and this cell stays flat |
+| `call/http1` | moves only through a retry inside one call | the early closes are here too (a refused 3xx, a wrong content type, the 2048-byte cap), but `credhttp.Do` builds a client per call, so the next `/call` opens a connection anyway. The share is near 0 on any toolchain, which is the transport's doing |
+| `authn/http1` | flat | every body is read whole |
+| `rum_forward/http1` | flat unless a collector answers over 64 KiB | bodies are read up to 64 KiB |
+| every `http2` cell | flat, so `apiserver/http2` is the control of a paired run | the drain is HTTP/1 only, and HTTP/2 keeps its connection anyway. On Go 1.27 client-go's HTTP/2 runs on a different implementation, so read this control instead of assuming it |
+
+A body over 256 KiB, or a request sent before the drain ends, still takes a new connection, so a share below 100% is not by itself a defect.
 
 ### Customer resolve-path in-flight (#386 M3)
 Defined in `internal/handlers/dispatchers/customer_inflight_metrics.go`.

@@ -255,9 +255,10 @@ func init() {
 			}
 			return out
 		}))
-		// #847 — connections taken by {egress: {protocol: {new, reused}}}
-		// (credhttp/connections.go): the paired run's reuse share.
-		expvar.Publish("snowplow_egress_connections_total", expvar.Func(func() any {
+		// #847 — connections opened and handed over, by
+		// {egress: {protocol: {opened, handovers}}} (credhttp/connections.go):
+		// the paired run's reuse share is 1 − opened / handovers.
+		expvar.Publish("snowplow_egress_connections", expvar.Func(func() any {
 			return egressConnectionsMap(credhttp.EgressConnectionsSnapshot())
 		}))
 		// #1115 — every budgeted (customer) exchange by what the page budget
@@ -288,10 +289,7 @@ func egressConnectionsMap(s []credhttp.EgressConnectionCount) map[string]map[str
 		if out[c.Egress] == nil {
 			out[c.Egress] = map[string]map[string]uint64{}
 		}
-		if out[c.Egress][c.Protocol] == nil {
-			out[c.Egress][c.Protocol] = map[string]uint64{}
-		}
-		out[c.Egress][c.Protocol][c.Connection] = c.Count
+		out[c.Egress][c.Protocol] = map[string]uint64{"opened": c.Opened, "handovers": c.Handovers}
 	}
 	return out
 }

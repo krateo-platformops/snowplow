@@ -1649,8 +1649,8 @@ func registerListQueryInstrument(m metric.Meter) error {
 // registerEndpointDialInstruments hand-wires #1088's endpoint-dial surfaces
 // onto OTLP (no expvar->OTLP bridge), from the accessors their expvar closures
 // read: every retry by site and cause, the stage fetch's per-identity client
-// cache, and #847's new vs reused connections by egress and protocol. Every
-// label is a closed, code-defined set. Registered only when the cache is on
+// cache, and #847's connections opened and handed over by egress and protocol.
+// Every label is a closed, code-defined set. Registered only when the cache is on
 // (CFG-1), like their expvar keys.
 func registerEndpointDialInstruments(m metric.Meter) error {
 	retries, err := m.Int64ObservableCounter("snowplow_endpoint_retries_total",
@@ -1658,8 +1658,13 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
-	connections, err := m.Int64ObservableCounter("snowplow_egress_connections_total",
-		metric.WithDescription("Connections handed to outbound requests, by egress {stage = RESTAction branch-E fetch, call = /call passthrough, apiserver = every client-go client, authn = the authn service login, rum_forward = the browser-span forwarder, other}, protocol {http1, http2} and connection {new = it had carried no request before, reused = it had}. Read the share reused / (new + reused), per egress and protocol: unlike a latency it does not move with load. On HTTP/2 every stream after a connection's first counts as reused. A new connection costs a TCP connect and, on https, a TLS handshake. #847."))
+	opened, err := m.Int64ObservableCounter("snowplow_egress_connections_opened_total",
+		metric.WithDescription("Outbound connections that came up, by egress {stage = RESTAction branch-E fetch, call = /call passthrough, apiserver = every client-go client, authn = the authn service login, rum_forward = the browser-span forwarder, other} and protocol {http1, http2}: TCP connected on http://, TLS handshake finished on https://. Equals what the servers accepted, however concurrent the pool: a dial that fails does not count, and one that comes up after its request left does, used or not. Read the reuse share 1 - opened / snowplow_egress_connection_handovers_total over a whole phase, per egress and protocol: unlike a latency it does not move with load. A new connection costs a TCP connect and, on https, a TLS handshake. An https request through an https proxy counts two. The OTLP exporters are not counted. #847."))
+	if err != nil {
+		return err
+	}
+	handovers, err := m.Int64ObservableCounter("snowplow_egress_connection_handovers_total",
+		metric.WithDescription("Times an outbound request was handed a connection, new or pooled, by egress and protocol as in snowplow_egress_connections_opened_total. One per HTTP/2 stream. A retry and a redirect hop take one each, and a request net/http retries by itself after a pooled connection turned out dead takes two. #847."))
 	if err != nil {
 		return err
 	}
@@ -1705,15 +1710,16 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 				attribute.String("site", c.Site), attribute.String("cause", c.Cause)))
 		}
 		for _, c := range credhttp.EgressConnectionsSnapshot() {
-			o.ObserveInt64(connections, int64(c.Count), metric.WithAttributes(
-				attribute.String("egress", c.Egress), attribute.String("protocol", c.Protocol), attribute.String("connection", c.Connection)))
+			attrs := metric.WithAttributes(attribute.String("egress", c.Egress), attribute.String("protocol", c.Protocol))
+			o.ObserveInt64(opened, int64(c.Opened), attrs)
+			o.ObserveInt64(handovers, int64(c.Handovers), attrs)
 		}
 		n, b, e := restactionsapi.StageEndpointClientsStats()
 		o.ObserveInt64(clients, int64(n))
 		o.ObserveInt64(builds, int64(b))
 		o.ObserveInt64(evictions, int64(e))
 		return nil
-	}, retries, connections, clients, builds, evictions)
+	}, retries, opened, handovers, clients, builds, evictions)
 	return err
 }
 

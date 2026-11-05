@@ -1,26 +1,46 @@
 package credhttp
 
-// connections.go — #847: snowplow_egress_connections_total{egress,protocol,connection},
-// how many exchanges took a new connection and how many reused one, by egress.
+// connections.go — #847: how many connections each egress opened, and how many
+// times a request was handed one:
 //
-// WHY. A connection that is thrown away costs the next request a TCP connect
-// and, on https, a TLS handshake. Nothing counted that: httptrace reported
-// GotConnInfo.Reused to the budget and the slow-call record, per attempt, and
-// neither adds it up. A latency cannot stand in for it, because a latency moves
-// with load. The share reused ÷ (new + reused) does not, so a paired bench run
-// that changes only the toolchain (#847: Go 1.27 drains an HTTP/1 body closed
-// early and keeps the connection) can read the effect directly.
+//	snowplow_egress_connections_opened_total{egress,protocol}
+//	snowplow_egress_connection_handovers_total{egress,protocol}
 //
-// WHAT ONE COUNT IS. One httptrace GotConn: a request was handed a connection.
-//   - new: the connection had carried no request before this one. So "new" is
-//     the number of connections that served at least one request; a dial whose
-//     connection nobody ended up using is not counted.
-//   - reused: it had. On HTTP/2 that is every stream after a connection's first.
+// THE READING. reuse share = 1 − opened / handovers, per egress and protocol. A
+// connection that is thrown away costs the next request a TCP connect and, on
+// https, a TLS handshake. A latency cannot stand in for that, because a latency
+// moves with load. The share does not, so a paired bench run that changes only
+// the toolchain (#847: Go 1.27 drains an HTTP/1 body closed early and keeps the
+// connection) can read the effect directly.
 //
-// It is per connection handed over, not per request: a request net/http retries
-// by itself after a pooled connection turned out dead counts one reused and one
-// new, which is what happened on the wire. A retry above the transport and a
-// redirect hop each take a connection of their own and count one each.
+// WHY TWO COUNTERS AND NOT GotConnInfo.Reused. Reused does not say "this
+// connection has carried a request before". A dial whose waiter was served by
+// something else, another connection coming free or a cancelled wait, parks its
+// connection in the idle pool, and net/http marks it reused there, before it has
+// carried anything. That is the normal way a lost connection is replaced on a
+// busy pool, so on a concurrent pool most new connections read as reused. And
+// nothing at hand-over time sees a surplus dial, which nobody ever uses and which
+// still cost a connect. So the two facts are read where each one happens:
+//
+//   - opened: a connection came up, read from the dial itself. A plain http://
+//     connection is up at httptrace ConnectDone; an https:// one at
+//     TLSHandshakeDone, which is also what names its protocol. Both fire on the
+//     dial's own goroutine, so they do not depend on the request that started the
+//     dial still waiting for it. A dial that fails, or is given up before it is
+//     up, does not count: there was no connection. One that comes up after its
+//     request left does: the server has accepted it and the cost is paid, whether
+//     it later serves someone or is closed unused.
+//   - handovers: a request was handed a connection (httptrace GotConn). On HTTP/2
+//     that is one per stream. A retry above the transport and a redirect hop take
+//     one each, and so does a request net/http retries by itself after a pooled
+//     connection turned out dead.
+//
+// opened then equals what the server accepted, however concurrent the pool. An
+// interval can read more opened than handovers, when dials land after the
+// requests that started them have finished, so read the share over a whole phase.
+//
+// The one shape that overcounts: an https:// request through an https:// proxy
+// does two TLS handshakes on one connection, and each counts as opened.
 //
 // WHY PROTOCOL IS A LABEL. Go 1.27's change is HTTP/1 only, and one egress can
 // carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster
@@ -29,18 +49,21 @@ package credhttp
 //
 // WHERE. One hook per request, and only one, whichever layers it crosses. Send
 // is where every stage and /call request leaves, a write included, so it counts
-// there, and its egress wins. Everything else goes through a client that names
-// its egress: Harden gives every *rest.Config the apiserver egress, and a client
-// with an egress of its own says so with CountConnectionsOn. The hook marks the
-// context, so a chain that carries it twice (Harden on a copy of a hardened
-// config, Send on a hardened client) still counts once.
+// there, and its egress wins. Harden gives every *rest.Config the apiserver
+// egress, and authn and the RUM forwarder name theirs with CountConnectionsOn.
+// The hook marks the context, so a chain that carries it twice (Harden on a copy
+// of a hardened config, Send on a hardened client) still counts once.
 //
-// It only observes: the hook reads what net/http reports and adds to an atomic.
+// WHAT IS NOT COUNTED. The three OTLP exporters (metrics, traces, logs): they
+// build their own clients and do not go through this package.
+//
+// It only observes: the hooks read what net/http reports and add to an atomic.
 // A request is sent exactly as before.
 //
-// LABELS. Three closed, code-defined sets; a value outside egress's folds into
+// LABELS. Two closed, code-defined sets; a value outside egress's folds into
 // EgressOther, so no data can grow the label set. Never a host, a path, an
-// identity or a status: nothing here reads the request or logs.
+// identity or a status: nothing here reads a header or logs, and the URL's
+// scheme is only compared.
 
 import (
 	"context"
@@ -69,57 +92,52 @@ const (
 	ConnProtocolHTTP2 = "http2"
 )
 
-// What a request got (closed set).
-const (
-	ConnNew    = "new"
-	ConnReused = "reused"
-)
-
-// Egresses, ConnProtocols and ConnStates are the closed label sets, in
-// publication order.
+// Egresses and ConnProtocols are the closed label sets, in publication order.
 var (
 	Egresses      = []string{EgressStage, EgressCall, EgressAPIServer, EgressAuthn, EgressRUMForward, EgressOther}
 	ConnProtocols = []string{ConnProtocolHTTP1, ConnProtocolHTTP2}
-	ConnStates    = []string{ConnNew, ConnReused}
 )
 
-// connectionCounter is one counter per closed {egress, protocol, connection}
-// cell, all present from construction. The maps are never written after that,
-// so reading them takes no lock.
-type connectionCounter map[string]map[string]map[string]*atomic.Uint64
+type connectionCell struct{ opened, handovers atomic.Uint64 }
+
+// connectionCounter is one cell per closed {egress, protocol}, all present from
+// construction. The maps are never written after that, so reading them takes no
+// lock.
+type connectionCounter map[string]map[string]*connectionCell
 
 func newConnectionCounter() connectionCounter {
 	m := make(connectionCounter, len(Egresses))
 	for _, e := range Egresses {
-		m[e] = make(map[string]map[string]*atomic.Uint64, len(ConnProtocols))
+		m[e] = make(map[string]*connectionCell, len(ConnProtocols))
 		for _, p := range ConnProtocols {
-			m[e][p] = make(map[string]*atomic.Uint64, len(ConnStates))
-			for _, s := range ConnStates {
-				m[e][p][s] = new(atomic.Uint64)
-			}
+			m[e][p] = new(connectionCell)
 		}
 	}
 	return m
 }
 
-func (m connectionCounter) add(egress string, info httptrace.GotConnInfo) {
+func (m connectionCounter) cell(egress, protocol string) *connectionCell {
 	byProtocol, ok := m[egress]
 	if !ok {
 		byProtocol = m[EgressOther]
 	}
-	state := ConnNew
-	if info.Reused {
-		state = ConnReused
-	}
-	byProtocol[connProtocol(info.Conn)][state].Add(1)
+	return byProtocol[protocol]
 }
 
-// connProtocol reads the protocol the connection negotiated: ALPN "h2" is
-// HTTP/2. Anything else is HTTP/1: a plain http:// connection has no ALPN, and
-// snowplow never speaks unencrypted HTTP/2.
-func connProtocol(c net.Conn) string {
-	if t, ok := c.(interface{ ConnectionState() tls.ConnectionState }); ok && t.ConnectionState().NegotiatedProtocol == "h2" {
+// alpnProtocol reads a negotiated ALPN protocol: "h2" is HTTP/2. Anything else is
+// HTTP/1: a server may negotiate "http/1.1" or nothing.
+func alpnProtocol(negotiated string) string {
+	if negotiated == "h2" {
 		return ConnProtocolHTTP2
+	}
+	return ConnProtocolHTTP1
+}
+
+// connProtocol is the protocol of a connection handed to a request. One with no
+// TLS state is HTTP/1: snowplow never speaks unencrypted HTTP/2.
+func connProtocol(c net.Conn) string {
+	if t, ok := c.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return alpnProtocol(t.ConnectionState().NegotiatedProtocol)
 	}
 	return ConnProtocolHTTP1
 }
@@ -129,15 +147,34 @@ var egressConnections = newConnectionCounter()
 // connectionsCountedKey marks a context whose requests are already counted.
 type connectionsCountedKey struct{}
 
-// countConnections returns ctx with the connection hook for egress, or ctx
-// itself when it already has one: the outermost egress wins, once.
-func countConnections(ctx context.Context, egress string) context.Context {
+// countConnections returns req's context with the connection hooks for egress,
+// or that context itself when it already has them: the outermost egress wins,
+// once. The scheme decides when a connection is up, so a hook is only valid for
+// requests of that scheme: Send's is, because no redirect hop leaves the origin.
+func countConnections(req *http.Request, egress string) context.Context {
+	ctx := req.Context()
 	if ctx.Value(connectionsCountedKey{}) != nil {
 		return ctx
 	}
-	return httptrace.WithClientTrace(context.WithValue(ctx, connectionsCountedKey{}, true), &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) { egressConnections.add(egress, info) },
-	})
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			egressConnections.cell(egress, connProtocol(info.Conn)).handovers.Add(1)
+		},
+	}
+	if req.URL != nil && req.URL.Scheme == "https" {
+		trace.TLSHandshakeDone = func(state tls.ConnectionState, err error) {
+			if err == nil {
+				egressConnections.cell(egress, alpnProtocol(state.NegotiatedProtocol)).opened.Add(1)
+			}
+		}
+	} else {
+		trace.ConnectDone = func(_, _ string, err error) {
+			if err == nil {
+				egressConnections.cell(egress, ConnProtocolHTTP1).opened.Add(1)
+			}
+		}
+	}
+	return httptrace.WithClientTrace(context.WithValue(ctx, connectionsCountedKey{}, true), trace)
 }
 
 // countConnectionsTransport wraps rt so its requests count under egress.
@@ -154,7 +191,7 @@ type connectionCountingTransport struct {
 }
 
 func (t *connectionCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return t.next.RoundTrip(req.WithContext(countConnections(req.Context(), t.egress)))
+	return t.next.RoundTrip(req.WithContext(countConnections(req, t.egress)))
 }
 
 // WrappedRoundTripper keeps the chain walkable (client-go cancellation,
@@ -169,21 +206,22 @@ func CountConnectionsOn(egress string, c *http.Client) *http.Client {
 	return c
 }
 
-// EgressConnectionCount is one snowplow_egress_connections_total cell.
+// EgressConnectionCount is one {egress, protocol} cell of
+// snowplow_egress_connections_opened_total and
+// snowplow_egress_connection_handovers_total.
 type EgressConnectionCount struct {
-	Egress, Protocol, Connection string
-	Count                        uint64
+	Egress, Protocol  string
+	Opened, Handovers uint64
 }
 
-// EgressConnectionsSnapshot returns every snowplow_egress_connections_total
-// cell, zeros included, in Egresses × ConnProtocols × ConnStates order.
+// EgressConnectionsSnapshot returns every {egress, protocol} cell, zeros
+// included, in Egresses × ConnProtocols order.
 func EgressConnectionsSnapshot() []EgressConnectionCount {
-	out := make([]EgressConnectionCount, 0, len(Egresses)*len(ConnProtocols)*len(ConnStates))
+	out := make([]EgressConnectionCount, 0, len(Egresses)*len(ConnProtocols))
 	for _, e := range Egresses {
 		for _, p := range ConnProtocols {
-			for _, s := range ConnStates {
-				out = append(out, EgressConnectionCount{Egress: e, Protocol: p, Connection: s, Count: egressConnections[e][p][s].Load()})
-			}
+			c := egressConnections[e][p]
+			out = append(out, EgressConnectionCount{Egress: e, Protocol: p, Opened: c.opened.Load(), Handovers: c.handovers.Load()})
 		}
 	}
 	return out

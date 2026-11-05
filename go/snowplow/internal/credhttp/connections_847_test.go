@@ -1,16 +1,18 @@
 package credhttp
 
-// connections_847_test.go — #847 arms for snowplow_egress_connections_total.
+// connections_847_test.go — #847 arms for the opened and handover counters.
 //
 // Every arm drives real connections through the real send path and compares the
-// counter with what the SERVER saw (http.Server.ConnState), which nothing in the
-// client can influence: the bound does not come from the instrument under test.
-// Every arm asserts the exact delta over all cells, so a double count, or a count
-// in the wrong cell, fails it too.
+// counters with what the SERVER saw (http.Server.ConnState, the requests it
+// served), which nothing in the client can influence: the bound does not come
+// from the instrument under test. Every arm asserts the exact delta over all
+// cells, so a double count, or a count in the wrong cell, fails it too.
 //
 // The arms on a body closed early are in connections_earlyclose_*_847_test.go:
 // which one compiles depends on the toolchain, because that is the behaviour the
-// counter exists to read.
+// counters exist to read. The arms on concurrent pools, and on connections whose
+// dial and whose first request are not the same event, are in
+// connections_pool_847_test.go.
 
 import (
 	"context"
@@ -20,7 +22,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httptrace"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -34,11 +35,13 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// connCells reads every cell as "egress/protocol/connection".
+// connCells reads every cell as "egress/protocol/opened" and
+// "egress/protocol/handovers".
 func connCells() map[string]uint64 {
 	m := map[string]uint64{}
 	for _, c := range EgressConnectionsSnapshot() {
-		m[c.Egress+"/"+c.Protocol+"/"+c.Connection] = c.Count
+		m[c.Egress+"/"+c.Protocol+"/opened"] = c.Opened
+		m[c.Egress+"/"+c.Protocol+"/handovers"] = c.Handovers
 	}
 	return m
 }
@@ -146,9 +149,8 @@ func get(t *testing.T, site string, cli *http.Client, url string) *http.Response
 	return send(t, context.Background(), site, cli, http.MethodGet, url)
 }
 
-// A reused connection counts as reused: one connection on the wire, three
-// requests on it.
-func TestConnections847_ReusedConnectionCountsAsReused(t *testing.T) {
+// One connection serves three requests: one opened, three handovers.
+func TestConnections847_ReusedConnectionIsOneOpenedManyHandovers(t *testing.T) {
 	s := newWireServer(t, wirePlain, nil)
 	cli := s.Client()
 	before := connCells()
@@ -156,11 +158,11 @@ func TestConnections847_ReusedConnectionCountsAsReused(t *testing.T) {
 		get(t, EgressStage, cli, s.URL)
 	}
 	s.assertWire(t, 1, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 2})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 3})
 }
 
-// A new connection counts as new: keep-alives off, every request opens its own.
-func TestConnections847_NewConnectionCountsAsNew(t *testing.T) {
+// Keep-alives off: every request opens its own connection.
+func TestConnections847_NewConnectionPerRequest(t *testing.T) {
 	s := newWireServer(t, wirePlain, nil)
 	cli := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	before := connCells()
@@ -168,12 +170,12 @@ func TestConnections847_NewConnectionCountsAsNew(t *testing.T) {
 		get(t, EgressStage, cli, s.URL)
 	}
 	s.assertWire(t, 3, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 3})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 3, "stage/http1/handovers": 3})
 }
 
-// HTTP/2 reuse is counted: one connection carries every stream, and each stream
-// after the first is a reuse. Over the stage path and over a real client-go
-// client (whose HTTP/2 is x/net's, not net/http's bundled copy).
+// HTTP/2 reuse is counted: one connection carries every stream. Over the stage
+// path and over a real client-go client (whose HTTP/2 is x/net's, not net/http's
+// bundled copy).
 func TestConnections847_HTTP2ReuseIsCounted(t *testing.T) {
 	t.Run("stage", func(t *testing.T) {
 		s := newWireServer(t, wireH2, nil)
@@ -185,7 +187,7 @@ func TestConnections847_HTTP2ReuseIsCounted(t *testing.T) {
 			}
 		}
 		s.assertWire(t, 1, 3)
-		assertConnDelta(t, before, map[string]uint64{"stage/http2/new": 1, "stage/http2/reused": 2})
+		assertConnDelta(t, before, map[string]uint64{"stage/http2/opened": 1, "stage/http2/handovers": 3})
 	})
 	t.Run("apiserver", func(t *testing.T) {
 		s := newWireServer(t, wireH2, nil)
@@ -195,7 +197,7 @@ func TestConnections847_HTTP2ReuseIsCounted(t *testing.T) {
 			clientGet(t, hc, s.URL, 2)
 		}
 		s.assertWire(t, 1, 3)
-		assertConnDelta(t, before, map[string]uint64{"apiserver/http2/new": 1, "apiserver/http2/reused": 2})
+		assertConnDelta(t, before, map[string]uint64{"apiserver/http2/opened": 1, "apiserver/http2/handovers": 3})
 	})
 }
 
@@ -208,22 +210,25 @@ func TestConnections847_EarlyClosedBodyOnHTTP2KeepsItsConnection(t *testing.T) {
 	sendUnread(t, context.Background(), cli, s.URL)
 	get(t, EgressStage, cli, s.URL)
 	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http2/new": 1, "stage/http2/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"stage/http2/opened": 1, "stage/http2/handovers": 2})
 }
 
-// TLS alone is not HTTP/2: a server that offers only HTTP/1.1 over ALPN counts
-// as http1.
-func TestConnections847_HTTP1OverTLSCountsAsHTTP1(t *testing.T) {
+// TLS alone is not HTTP/2, and neither is ALPN: the client offers h2 and
+// http/1.1, as client-go does, and the server picks http/1.1. The negotiated
+// protocol is asserted, so the arm cannot quietly stop testing that boundary.
+func TestConnections847_HTTP1NegotiatedOverALPNCountsAsHTTP1(t *testing.T) {
 	s := newWireServer(t, wireTLSH1, nil)
 	cli := s.Client()
+	cli.Transport.(*http.Transport).ForceAttemptHTTP2 = true
 	before := connCells()
 	for range 2 {
-		if resp := get(t, EgressStage, cli, s.URL); resp.ProtoMajor != 1 {
-			t.Fatalf("the arm spoke HTTP/%d, want HTTP/1", resp.ProtoMajor)
+		resp := get(t, EgressStage, cli, s.URL)
+		if resp.ProtoMajor != 1 || resp.TLS == nil || resp.TLS.NegotiatedProtocol != "http/1.1" {
+			t.Fatalf("the arm spoke HTTP/%d with ALPN %+v, want http/1.1 negotiated", resp.ProtoMajor, resp.TLS)
 		}
 	}
 	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
 }
 
 // hardenedClient is a real client-go http.Client for s, built the way every
@@ -271,7 +276,7 @@ func TestConnections847_CountsOnceThroughADoubleChain(t *testing.T) {
 			clientGet(t, hc, s.URL, 2)
 		}
 		s.assertWire(t, 1, 2)
-		assertConnDelta(t, before, map[string]uint64{"apiserver/http2/new": 1, "apiserver/http2/reused": 1})
+		assertConnDelta(t, before, map[string]uint64{"apiserver/http2/opened": 1, "apiserver/http2/handovers": 2})
 	})
 	t.Run("Send on a hardened client: the site is the egress", func(t *testing.T) {
 		s := newWireServer(t, wireH2, nil)
@@ -281,7 +286,7 @@ func TestConnections847_CountsOnceThroughADoubleChain(t *testing.T) {
 			get(t, EgressStage, hc, s.URL)
 		}
 		s.assertWire(t, 1, 2)
-		assertConnDelta(t, before, map[string]uint64{"stage/http2/new": 1, "stage/http2/reused": 1})
+		assertConnDelta(t, before, map[string]uint64{"stage/http2/opened": 1, "stage/http2/handovers": 2})
 	})
 }
 
@@ -307,7 +312,7 @@ func TestConnections847_EveryPathThroughSendCounts(t *testing.T) {
 				send(t, tc.ctx(), EgressStage, cli, tc.method, s.URL)
 			}
 			s.assertWire(t, 1, 2)
-			assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 1})
+			assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
 		})
 	}
 }
@@ -330,7 +335,7 @@ func TestConnections847_EachAttemptCounts(t *testing.T) {
 		t.Fatalf("status %d, want the retry's 200", resp.StatusCode)
 	}
 	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
 }
 
 // The /call passthrough counts under its own egress. Do builds a client per
@@ -353,7 +358,7 @@ func TestConnections847_CallEgress(t *testing.T) {
 		}
 	}
 	s.assertWire(t, 2, 2)
-	assertConnDelta(t, before, map[string]uint64{"call/http1/new": 2})
+	assertConnDelta(t, before, map[string]uint64{"call/http1/opened": 2, "call/http1/handovers": 2})
 }
 
 // A client that names its egress counts under it. The authn and RUM constructors
@@ -366,7 +371,7 @@ func TestConnections847_CountConnectionsOn(t *testing.T) {
 		clientGet(t, cli, s.URL, 1)
 	}
 	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"authn/http1/new": 1, "authn/http1/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"authn/http1/opened": 1, "authn/http1/handovers": 2})
 }
 
 // The counting layer stays walkable: the idle sweep (#1101 review B2) reaches
@@ -398,7 +403,7 @@ func TestConnections847_LabelSetIsClosed(t *testing.T) {
 	want := map[string]bool{}
 	for _, e := range []string{"stage", "call", "apiserver", "authn", "rum_forward", "other"} {
 		for _, p := range []string{"http1", "http2"} {
-			for _, c := range []string{"new", "reused"} {
+			for _, c := range []string{"opened", "handovers"} {
 				want[e+"/"+p+"/"+c] = true
 			}
 		}
@@ -415,7 +420,7 @@ func TestConnections847_LabelSetIsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	assertConnDelta(t, before, map[string]uint64{"other/http1/new": 1})
+	assertConnDelta(t, before, map[string]uint64{"other/http1/opened": 1, "other/http1/handovers": 1})
 
 	got := connCells()
 	if len(got) != len(want) {
@@ -437,28 +442,15 @@ func TestConnections847_LabelSetIsClosed(t *testing.T) {
 	}
 }
 
-// The classification, by itself: one report lands in exactly one cell. There is
-// no connection in the report, which net/http never does: it must not panic, and
-// reads as http1.
-func TestConnections847_OneReportIsOneCell(t *testing.T) {
-	for _, tc := range []struct {
-		reused bool
-		want   string
-	}{{false, ConnNew}, {true, ConnReused}} {
-		c := newConnectionCounter()
-		c.add(EgressAuthn, httptrace.GotConnInfo{Reused: tc.reused})
-		for _, e := range Egresses {
-			for _, p := range ConnProtocols {
-				for _, st := range ConnStates {
-					want := uint64(0)
-					if e == EgressAuthn && p == ConnProtocolHTTP1 && st == tc.want {
-						want = 1
-					}
-					if got := c[e][p][st].Load(); got != want {
-						t.Errorf("reused=%v: cell %s/%s/%s is %d, want %d", tc.reused, e, p, st, got, want)
-					}
-				}
-			}
+// What a connection's protocol is, by itself. The arms above go through net/http;
+// this names the case it never reaches them with (no connection in the report).
+func TestConnections847_ProtocolOfAConnection(t *testing.T) {
+	for negotiated, want := range map[string]string{"h2": ConnProtocolHTTP2, "http/1.1": ConnProtocolHTTP1, "": ConnProtocolHTTP1} {
+		if got := alpnProtocol(negotiated); got != want {
+			t.Errorf("ALPN %q reads %s, want %s", negotiated, got, want)
 		}
+	}
+	if got := connProtocol(nil); got != ConnProtocolHTTP1 {
+		t.Errorf("no connection reads %s, want %s", got, ConnProtocolHTTP1)
 	}
 }

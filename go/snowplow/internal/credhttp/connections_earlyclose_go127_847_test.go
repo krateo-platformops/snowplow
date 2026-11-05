@@ -42,7 +42,7 @@ func TestConnections847_EarlyClosedBodyOnHTTP1IsDrainedAndReused(t *testing.T) {
 	get(t, EgressStage, cli, s.URL)
 	get(t, EgressStage, cli, s.URL)
 	s.assertWire(t, 1, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 2})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 3})
 }
 
 // #847's first row: the retry after an unread body reuses the connection. This
@@ -64,7 +64,7 @@ func TestConnections847_RetryAfterAnUnreadBodyReusesTheConnection(t *testing.T) 
 		t.Fatalf("status %d, want the retry's 200", resp.StatusCode)
 	}
 	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 1, "stage/http1/reused": 1})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
 }
 
 // The drain's bound: a body longer than 256 KiB is not drained, so the
@@ -80,5 +80,5 @@ func TestConnections847_BodyOverTheDrainLimitIsANewConnection(t *testing.T) {
 	sendUnread(t, context.Background(), cli, s.URL)
 	get(t, EgressStage, cli, s.URL)
 	s.assertWire(t, 2, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/new": 2})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 2})
 }

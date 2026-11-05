@@ -31,7 +31,8 @@ func TestForwarder847_CountsUnderItsEgress(t *testing.T) {
 	cells := func() map[string]uint64 {
 		m := map[string]uint64{}
 		for _, c := range credhttp.EgressConnectionsSnapshot() {
-			m[c.Egress+"/"+c.Protocol+"/"+c.Connection] = c.Count
+			m[c.Egress+"/"+c.Protocol+"/opened"] = c.Opened
+			m[c.Egress+"/"+c.Protocol+"/handovers"] = c.Handovers
 		}
 		return m
 	}
@@ -46,8 +47,10 @@ func TestForwarder847_CountsUnderItsEgress(t *testing.T) {
 	for k, v := range cells() {
 		want := uint64(0)
 		switch k {
-		case "rum_forward/http1/new", "rum_forward/http1/reused":
+		case "rum_forward/http1/opened":
 			want = 1
+		case "rum_forward/http1/handovers":
+			want = 2
 		}
 		if d := v - before[k]; d != want {
 			t.Errorf("cell %s moved by %d, want %d", k, d, want)

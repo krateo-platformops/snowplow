@@ -99,7 +99,7 @@ func SafeMethod(method string) bool {
 // #847 — every connection this request takes counts under site, on every path
 // below, a write's included (connections.go).
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
-	req = req.WithContext(countConnections(req.Context(), site))
+	req = req.WithContext(countConnections(req, site))
 	// #1106 — no redirect hop leaves the origin this request is sent to,
 	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
 	// cli (a wire dump, a plumbing-built chain) can displace it; the budgeted

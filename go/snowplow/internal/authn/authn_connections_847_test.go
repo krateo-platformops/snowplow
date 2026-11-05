@@ -32,7 +32,8 @@ func TestNew847_CountsUnderItsEgress(t *testing.T) {
 	cells := func() map[string]uint64 {
 		m := map[string]uint64{}
 		for _, c := range credhttp.EgressConnectionsSnapshot() {
-			m[c.Egress+"/"+c.Protocol+"/"+c.Connection] = c.Count
+			m[c.Egress+"/"+c.Protocol+"/opened"] = c.Opened
+			m[c.Egress+"/"+c.Protocol+"/handovers"] = c.Handovers
 		}
 		return m
 	}
@@ -45,7 +46,7 @@ func TestNew847_CountsUnderItsEgress(t *testing.T) {
 	}
 	for k, v := range cells() {
 		want := uint64(0)
-		if k == "authn/http1/new" {
+		if k == "authn/http1/opened" || k == "authn/http1/handovers" {
 			want = 1
 		}
 		if d := v - before[k]; d != want {

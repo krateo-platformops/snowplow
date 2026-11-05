@@ -1,6 +1,6 @@
 package metrics
 
-// egress_connections_otlp_847_test.go — #847's counter reaches OTLP, hand-wired
+// egress_connections_otlp_847_test.go — #847's counters reach OTLP, hand-wired
 // in metrics.go (no expvar->OTLP bridge), observed via the REAL callback over a
 // ManualReader. The connections are real, and the server counts its own.
 
@@ -30,19 +30,23 @@ func TestEgressConnections847_ReachOTLP(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	const name = "snowplow_egress_connections_total"
+	const (
+		openedName    = "snowplow_egress_connections_opened_total"
+		handoversName = "snowplow_egress_connection_handovers_total"
+	)
 	cells := func() map[string]int64 {
 		t.Helper()
+		all := flatten(collectViaRealCallback(t, "deadbeef"))
 		m := map[string]int64{}
 		for _, e := range credhttp.Egresses {
 			for _, p := range credhttp.ConnProtocols {
-				for _, c := range credhttp.ConnStates {
-					attrs := map[string]string{"egress": e, "protocol": p, "connection": c}
-					v, ok := find643(flatten(collectViaRealCallback(t, "deadbeef")), name, attrs)
+				for _, name := range []string{openedName, handoversName} {
+					attrs := map[string]string{"egress": e, "protocol": p}
+					v, ok := find643(all, name, attrs)
 					if !ok {
 						t.Fatalf("no %s%v series: every cell is observed from the start", name, attrs)
 					}
-					m[e+"/"+p+"/"+c] = v
+					m[name+"/"+e+"/"+p] = v
 				}
 			}
 		}
@@ -65,17 +69,16 @@ func TestEgressConnections847_ReachOTLP(t *testing.T) {
 	if c := conns.Load(); c != 1 {
 		t.Fatalf("the server saw %d connections, want 1", c)
 	}
-	after := cells()
-	for k, v := range after {
+	for k, v := range cells() {
 		want := int64(0)
 		switch k {
-		case "stage/http1/new":
+		case openedName + "/stage/http1":
 			want = 1
-		case "stage/http1/reused":
-			want = 2
+		case handoversName + "/stage/http1":
+			want = 3
 		}
 		if d := v - before[k]; d != want {
-			t.Errorf("%s{%s} moved by %d, want %d", name, k, d, want)
+			t.Errorf("%s moved by %d, want %d", k, d, want)
 		}
 	}
 }
