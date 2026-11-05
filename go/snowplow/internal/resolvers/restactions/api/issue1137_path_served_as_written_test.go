@@ -238,6 +238,25 @@ var i37Shapes = []i37Shape{
 	{"proxy/", "/apis/composition.krateo.io/v1-0-0/proxy/namespaces/ns-a/p2s", i37HTTP, i37P2InA, i37LP2InA},
 }
 
+// i37Percent is the shapes the #1123 percent check refuses first: an apiserver
+// path, parsed, that holds a percent-escape. That check runs before
+// servedAsWritten, so they count under path_value_refused. A path no parser
+// reads ("no leading slash and %2F") is not here: it stays this rule's.
+var i37Percent = map[string]bool{
+	"%2F for the separators": true,
+	"%2f, lower case":        true,
+	"%2F before the name":    true,
+	"an escaped letter":      true,
+}
+
+// class is the counter a refusal of the shape moves.
+func (s i37Shape) class() string {
+	if i37Percent[s.name] {
+		return reasonPathValueRefused
+	}
+	return reasonPathNotAsServed
+}
+
 // i37Dial sends path through the dial via and returns what the apiserver read;
 // sent=false when that dial sent nothing (the internal-rest-config branch
 // answers only a path it parses).
@@ -382,6 +401,7 @@ func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *tes
 		"/apis/g/v/watch/x": false, "/apis/g/v/proxy/x": false, "/api/v1/watch/x": false, "/api/v1/proxy/x": false,
 		"/apis/g/v/watch": false, "/apis/g/v/proxy/": false, "/api/v1/watch": false, "/api/v1/proxy/": false,
 		"/apis/g/watch": true, "/apis/g/watch/x": true, "/api/watch/x": true, "/apis/watch": true, "/watch/x": true,
+		"/apis/watch/v1/x": true, "/apis/g/v/Watch/x": true, "/api/v1/PROXY/x": true,
 		"/apis/g/v/x/watch": true, "/api/v1/x/proxy": true,
 	} {
 		if got := servedAsWritten(p); got != want {
@@ -399,7 +419,7 @@ func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *tes
 func TestIssue1137_TheRuleRefusesExactlyTheVerbsTheApiserverStrips(t *testing.T) {
 	words := []string{"watch", "proxy", "get", "list", "create", "update", "patch", "delete", "deletecollection",
 		"log", "exec", "attach", "portforward", "status", "scale", "finalize", "binding", "eviction", "token",
-		"redirect", "connect", "impersonate", "bind", "escalate", "namespaces", "resources", "p2s"}
+		"redirect", "connect", "impersonate", "bind", "escalate", "namespaces", "resources", "p2s", "Watch", "PROXY"}
 	stripped := 0
 	for _, w := range words {
 		for _, root := range []string{"/apis/g/v/", "/api/v1/"} {
@@ -523,8 +543,8 @@ func i37Norm(e *i24Env, dict map[string]any) string {
 // TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet — for each shape,
 // every caller, cache on and off, live and on the refresher's
 // internal-rest-config branch: the call is refused when it is planned (no
-// request reaches the apiserver, the stage fails InvalidPath, one
-// path_not_as_served count per resolve), no composition object is returned,
+// request reaches the apiserver, the stage fails InvalidPath, one count per
+// resolve in the shape's class), no composition object is returned,
 // and every mode answers the same. The canonical form of the same request is
 // narrowed in every mode: every caller's rows equal Kubernetes' answer, so A2
 // (p1s in ns-a) reads no p2 object, which the OR across the set would have kept.
@@ -550,13 +570,13 @@ func TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet(t *testing.T) {
 				outs := map[i37Mode]string{}
 				for _, m := range i37Modes {
 					log.reset()
-					before := MalformedDialSkippedByReason(reasonPathNotAsServed)
+					before := MalformedDialSkippedByReason(sh.class())
 					o := i37Resolve(e, m, u, i37RA, nil, i37UAFStage(sh.path))
 					if n := log.count(); n != 0 {
 						t.Errorf("%s %s: %d requests reached the apiserver, want 0 (refused when planned)", m, u, n)
 					}
-					if d := MalformedDialSkippedByReason(reasonPathNotAsServed) - before; d != 1 {
-						t.Errorf("%s %s: path_not_as_served moved by %d, want 1", m, u, d)
+					if d := MalformedDialSkippedByReason(sh.class()) - before; d != 1 {
+						t.Errorf("%s %s: %s moved by %d, want 1", m, u, sh.class(), d)
 					}
 					if !strings.Contains(o.outcomes, `"name":"st"`) || !strings.Contains(o.outcomes, `"reason":"`+StageReasonInvalidPath+`"`) {
 						t.Errorf("%s %s: stage outcomes %s, want st InvalidPath", m, u, o.outcomes)
