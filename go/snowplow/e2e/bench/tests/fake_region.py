@@ -17,7 +17,9 @@ the live API rather than on an outcome:
     gcloud prints them; vm(), forwarding_rule() and address() below make rows);
   - `compute project-info describe`: the project's global quotas,
     FAKE_PROJECT_QUOTAS (a JSON list; none by default);
-  - FAKE_FAIL_READ: those reads fail as gcloud fails them (#1172 B2).
+  - FAKE_FAIL_READ: those reads fail as real gcloud fails them (#1172 B2,
+    B3; read_failure below): a failed LIST exits 0 with "[]" and a WARNING
+    unless the call sets CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false.
 
 A fake gcloud is its own process (the run606 harness runs it with `python -I`,
 no PYTHONPATH), so it loads this file by path: LOADER is the source to put in
@@ -93,13 +95,26 @@ _PERMISSION = {"instances": "compute.instances.list", "forwarding-rules": "compu
                "addresses": "compute.addresses.list", "project-info": "compute.projects.get"}
 
 
-def read_failure(what: str, env=None) -> str | None:
-    """gcloud's stderr for a failed `what` read, or None when it answers."""
-    if what not in [x.strip() for x in (_env(env).get("FAKE_FAIL_READ") or "").split(",")]:
+def read_failure(what: str, env=None) -> tuple[int, str, str] | None:
+    """(rc, stdout, stderr) of a failed `what` read as real gcloud gives them
+    (Google Cloud SDK 561, probed read-only by the #1172 re-review), or None
+    when the read answers:
+      - a describe: rc 1, an ERROR line, no stdout;
+      - a list, by default (compute/allow_partial_error true): rc 0, "[]" and
+        "WARNING: Some requests did not succeed." (the SDK's MultiScopeLister
+        only warns);
+      - a list whose environment sets CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false:
+        rc 1, "[]" and "ERROR: (gcloud.compute.<kind>.list) Some requests did not
+        succeed:"."""
+    env = _env(env)
+    if what not in [x.strip() for x in (env.get("FAKE_FAIL_READ") or "").split(",")]:
         return None
-    verb = "describe" if what == "project-info" else "list"
-    return (f"ERROR: (gcloud.compute.{what}.{verb}) Some requests did not succeed:\n"
-            f" - Required '{_PERMISSION[what]}' permission for 'projects/{PROJECT}'\n")
+    why = f" - Required '{_PERMISSION[what]}' permission for 'projects/{PROJECT}'\n"
+    if what == "project-info":
+        return 1, "", f"ERROR: (gcloud.compute.project-info.describe) Could not fetch resource:\n{why}"
+    if (env.get("CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR") or "").strip().lower() == "false":
+        return 1, "[]\n", f"ERROR: (gcloud.compute.{what}.list) Some requests did not succeed:\n{why}"
+    return 0, "[]\n", f"WARNING: Some requests did not succeed.\n{why}"
 
 
 # ─── rows, shaped as gcloud prints them ─────────────────────────────────────
@@ -145,8 +160,9 @@ LOADER = (
     "    return _frm.project_quotas()\n"
     "def answer_read(what, rows):\n"
     "    import json as _j, sys as _s\n"
-    "    err = _frm.read_failure(what)\n"
-    "    if err:\n"
-    "        _s.stderr.write(err); _s.exit(1)\n"
+    "    failed = _frm.read_failure(what)\n"
+    "    if failed:\n"
+    "        rc, out, err = failed\n"
+    "        _s.stdout.write(out); _s.stderr.write(err); _s.exit(rc)\n"
     "    print(_j.dumps(rows)); _s.exit(0)\n"
 )

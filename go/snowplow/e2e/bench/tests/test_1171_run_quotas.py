@@ -311,6 +311,63 @@ def test_gke_up_refuses_when_a_read_fails(fakes, monkeypatch, capsys, read):  # 
     assert not any(x[:4] == ["gcloud", "container", "clusters", "create"] for x in c)
 
 
+PARTIAL = "CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR"
+
+
+def _fp_pair():
+    spec = gke.default_spec(NAME, loadgen_machine_type="n2-standard-16")
+    return gke.footprint(spec, lb_services=1) + gke.footprint(spec, lb_services=1)
+
+
+def test_without_the_property_real_gclouds_failed_list_reads_attempt_2s_region_as_fit(fakes, monkeypatch):  # noqa: F811
+    """#1172 B3, the hazard the property closes: real gcloud's failed list
+    exits 0 with [] (the SDK's MultiScopeLister only warns while
+    compute/allow_partial_error is true, its default). Without the property
+    on the call, attempt 2's region (3 VMs + 7 forwarding rules, reported 3)
+    with its forwarding-rule list failing reads FIT: run 21 again."""
+    for k, v in region_env(vms=3, forwarding_rules=7).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("FAKE_FAIL_READ", "forwarding-rules")
+    monkeypatch.delenv(PARTIAL, raising=False)
+
+    def without_the_property(argv, **kw):
+        env = kw.pop("env", None)
+        if env is not None:
+            env = {k: v for k, v in env.items() if k != PARTIAL}
+        return gke.execute(argv, env=env, **kw)
+
+    fits, refusals = gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair(), run=without_the_property)
+    assert not refusals, refusals
+    assert any(m.startswith("IN_USE_ADDRESSES in europe-west4: 3 of 16 used (listed: 3 VM external IP(s) + 0 "
+                            "forwarding-rule use(s)") for m in fits), fits
+    # the same read with the property, as the pre-check makes it: refused, naming the read
+    fits, refusals = gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair())
+    assert READ_REFUSALS["forwarding-rules"] in refusals, refusals
+
+
+def test_the_pre_checks_lists_and_only_they_carry_the_property(fakes, monkeypatch):  # noqa: F811
+    """The property is passed on each of the three lists' own call (gcloud's
+    environment form of compute/allow_partial_error), never set globally."""
+    monkeypatch.delenv(PARTIAL, raising=False)
+    seen = []
+
+    def spy(argv, **kw):
+        seen.append((argv[1:4], (kw.get("env") or {}).get(PARTIAL)))
+        return gke.execute(argv, **kw)
+
+    gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair(), run=spy)
+    def is_list(a):
+        return a[:1] == ["compute"] and a[2:3] == ["list"]
+
+    lists = {tuple(a): v for a, v in seen if is_list(a)}
+    assert lists == {("compute", "addresses", "list"): "false", ("compute", "forwarding-rules", "list"): "false",
+                     ("compute", "instances", "list"): "false"}
+    others = [(a, v) for a, v in seen if not is_list(a)]
+    assert others and all(v is None for _, v in others), seen      # the describes and the #985 reads: untouched
+    import os
+    assert PARTIAL not in os.environ
+
+
 @pytest.mark.parametrize("read", fake_region.READS)
 def test_the_pair_refuses_when_a_read_fails(pairbed, read):  # noqa: F811
     repo, fake, env, tmp = pairbed

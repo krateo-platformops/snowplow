@@ -2030,6 +2030,19 @@ def region_list_command(kind: str, project: str, region: str) -> list[str]:
     return ["gcloud", "compute", kind, "list", "--project", project, *where, "--format", "json"]
 
 
+# #1172 B3: gcloud's `compute ... list` commands go through the SDK's MultiScopeLister
+# (googlecloudsdk/api_lib/compute/lister.py), which collects each failed request's
+# HttpError and, while the compute/allow_partial_error property is true (its default,
+# core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
+# requests all failed (a 401, a missing compute.forwardingRules.list permission)
+# exits 0, prints [] and writes "WARNING: Some requests did not succeed." on stderr;
+# one with an UNREACHABLE zone prints a partial list, rc 0. With the property false
+# the same list exits 1 with "ERROR: ... Some requests did not succeed", which the
+# pre-check reads as a failed read (fail closed). Set on the pre-check's three lists
+# only, through the environment form of gcloud's own property.
+PRECHECK_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+
+
 def project_quotas_command(project: str) -> list[str]:
     """The project's global quotas (CPUS_ALL_REGIONS among them, where it has one)."""
     return ["gcloud", "compute", "project-info", "describe", "--project", project, "--format", "json"]
@@ -2055,9 +2068,10 @@ def quota_check(project: str, zone: str, fp: Footprint, *, run=execute, fetch=No
         quotas[src] = got
     listed: dict[str, list[dict] | None] = {}
     unread: dict[str, str] = {}
+    list_env = dict(os.environ, **PRECHECK_LIST_ENV)
     for kind in sorted({k for row in RUN_QUOTAS for k in row.reads}):
         argv = region_list_command(kind, project, region_of(zone))
-        rc, out = run(argv, dry_run=False, log=quiet)
+        rc, out = run(argv, dry_run=False, env=list_env, log=quiet)
         got = _json(out) if rc == 0 else None
         listed[kind] = got if isinstance(got, list) else None
         if listed[kind] is None:
