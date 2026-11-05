@@ -3,24 +3,32 @@
 
 package api
 
-// sort_1152_test.go — #1152: stages run in the order the author declared,
-// wherever their dependencies allow. topologicalSort read the stages with no
-// dependency out of a Go map, so independent stages ran in a different order
-// from one resolve to the next.
+// sort_1152_test.go — #1152: independent stages run in declared order, not in a
+// Go map's. topologicalSort read the stages with no dependency out of a map, so
+// they ran in a different order from one resolve to the next. Only that
+// randomness goes: stages with no dependency still run first, and dependents
+// still run as they become ready, so every order is one main's sort could
+// produce. A stage that used to see an independent stage's result still does.
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 )
 
@@ -33,7 +41,7 @@ func s1152(name string, dep ...string) *templates.API {
 	return s
 }
 
-func TestStageOrder1152_DeclaredOrderIsKept(t *testing.T) {
+func TestStageOrder1152_IndependentStagesRunFirstInDeclaredOrder(t *testing.T) {
 	cases := []struct {
 		name  string
 		items []*templates.API
@@ -41,11 +49,13 @@ func TestStageOrder1152_DeclaredOrderIsKept(t *testing.T) {
 	}{
 		{"independent stages, not alphabetical", []*templates.API{s1152("z"), s1152("a"), s1152("m")}, []string{"z", "a", "m"}},
 		{"the #1152 pair", []*templates.API{s1152("fast"), s1152("slow")}, []string{"fast", "slow"}},
-		{"a dependency already declared first", []*templates.API{s1152("a"), s1152("b", "a"), s1152("c")}, []string{"a", "b", "c"}},
-		{"a dependent keeps its place among the ready stages", []*templates.API{s1152("a"), s1152("b"), s1152("c", "a"), s1152("d")}, []string{"a", "b", "c", "d"}},
-		{"only the dependent moves", []*templates.API{s1152("a", "c"), s1152("b"), s1152("c")}, []string{"b", "c", "a"}},
+		{"a dependent runs after every independent stage", []*templates.API{s1152("a"), s1152("b", "a"), s1152("c")}, []string{"a", "c", "b"}},
+		{"the same, one stage later", []*templates.API{s1152("a"), s1152("b"), s1152("c", "a"), s1152("d")}, []string{"a", "b", "d", "c"}},
+		{"the krateo-dashboard/events shape", []*templates.API{s1152("crds"), s1152("comps", "crds"), s1152("getEvents")}, []string{"crds", "getEvents", "comps"}},
+		{"a dependency declared after its dependent", []*templates.API{s1152("a", "c"), s1152("b"), s1152("c")}, []string{"b", "c", "a"}},
 		{"a chain declared backwards", []*templates.API{s1152("a", "b"), s1152("b", "c"), s1152("c")}, []string{"c", "b", "a"}},
-		{"two dependents of one stage", []*templates.API{s1152("x", "r"), s1152("y", "r"), s1152("r")}, []string{"r", "x", "y"}},
+		{"two dependents of one stage keep declared order", []*templates.API{s1152("x", "r"), s1152("y", "r"), s1152("r")}, []string{"r", "x", "y"}},
+		{"dependents run as they become ready", []*templates.API{s1152("r1"), s1152("r2"), s1152("x", "r2"), s1152("y", "r1")}, []string{"r1", "r2", "y", "x"}},
 		{"an empty dependsOn is no dependency", []*templates.API{s1152("b"), s1152("a", "")}, []string{"b", "a"}},
 		{"a name declared twice is one stage", []*templates.API{s1152("x"), s1152("y"), s1152("x")}, []string{"x", "y"}},
 	}
@@ -62,86 +72,199 @@ func TestStageOrder1152_DeclaredOrderIsKept(t *testing.T) {
 	}
 }
 
-// indexOrders calls visit with every order of 0..n-1 that runs each stage after
-// its dependency, smallest first when read as a sequence of declared positions.
-// It knows nothing about how topologicalSort works: it is the independent answer.
-func indexOrders(dep []int, visit func(order []int) bool) {
-	n := len(dep)
-	used := make([]bool, n)
-	order := make([]int, 0, n)
-	var walk func() bool
-	walk = func() bool {
-		if len(order) == n {
-			return visit(order)
+// mainSort1152 is main's topologicalSort before #1152, verbatim: the stages with
+// no dependency come out of a map.
+func mainSort1152(items []*templates.API) ([]string, error) {
+	graph := make(map[string][]string)
+	inDegree := make(map[string]int)
+	itemSet := make(map[string]bool)
+
+	for _, item := range items {
+		itemSet[item.Name] = true
+
+		if item.DependsOn == nil {
+			continue
 		}
-		for i := 0; i < n; i++ {
-			if used[i] || (dep[i] >= 0 && !used[dep[i]]) {
-				continue
-			}
-			used[i] = true
-			order = append(order, i)
-			stop := walk()
-			order = order[:len(order)-1]
-			used[i] = false
-			if stop {
-				return true
-			}
+
+		if dep := item.DependsOn.Name; len(dep) > 0 {
+			graph[dep] = append(graph[dep], item.Name)
+			inDegree[item.Name]++
 		}
-		return false
 	}
-	walk()
+
+	var queue []string
+	for item := range itemSet {
+		if inDegree[item] == 0 {
+			queue = append(queue, item)
+		}
+	}
+
+	return mainDrain1152(queue, graph, inDegree, len(itemSet))
 }
 
-// Dependencies win, and within what they allow the order is as close to the
-// declared one as it can be: over random specs, the result is the first valid
-// order an exhaustive walk finds. A spec's dependency can point at any stage
-// that is not its own descendant, declared before or after it.
-func TestStageOrder1152_DependenciesWinThenDeclaredOrder(t *testing.T) {
+func mainDrain1152(queue []string, graph map[string][]string, inDegree map[string]int, total int) ([]string, error) {
+	var sortedItems []string
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+		sortedItems = append(sortedItems, item)
+
+		for _, dependent := range graph[item] {
+			inDegree[dependent]--
+			if inDegree[dependent] == 0 {
+				queue = append(queue, dependent)
+			}
+		}
+	}
+
+	if len(sortedItems) != total {
+		return nil, fmt.Errorf("cyclic dependency detected")
+	}
+
+	return sortedItems, nil
+}
+
+// mainFrom1152 is what main's sort returns when its map yields the stages with
+// no dependency in the order seed. ok=false: seed is not exactly those stages.
+func mainFrom1152(items []*templates.API, seed []string) (got []string, ok bool, err error) {
+	graph := make(map[string][]string)
+	inDegree := make(map[string]int)
+	itemSet := make(map[string]bool)
+	for _, item := range items {
+		itemSet[item.Name] = true
+		if item.DependsOn != nil && item.DependsOn.Name != "" {
+			graph[item.DependsOn.Name] = append(graph[item.DependsOn.Name], item.Name)
+			inDegree[item.Name]++
+		}
+	}
+	roots := map[string]bool{}
+	for name := range itemSet {
+		if inDegree[name] == 0 {
+			roots[name] = true
+		}
+	}
+	if len(seed) != len(roots) {
+		return nil, false, nil
+	}
+	for _, name := range seed {
+		if !roots[name] {
+			return nil, false, nil
+		}
+		delete(roots, name)
+	}
+	got, err = mainDrain1152(append([]string(nil), seed...), graph, inDegree, len(itemSet))
+	return got, true, err
+}
+
+// spec1152 is an adversarial spec: a small alphabet, so names repeat, and a
+// dependency that may be absent, empty, the stage itself, unknown, or anything
+// declared before or after it. Cycles and unknown stages come out of this.
+func spec1152(rng *rand.Rand) []*templates.API {
+	names := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	n := 1 + rng.Intn(9)
+	alphabet := 1 + rng.Intn(len(names))
+	items := make([]*templates.API, n)
+	for i := range items {
+		name := names[rng.Intn(alphabet)]
+		switch rng.Intn(5) {
+		case 0:
+			items[i] = s1152(name)
+		case 1:
+			items[i] = s1152(name, "")
+		case 2:
+			items[i] = s1152(name, "ghost")
+			if rng.Intn(4) > 0 {
+				items[i] = s1152(name, names[rng.Intn(alphabet)])
+			}
+		default:
+			items[i] = s1152(name, names[rng.Intn(len(names))])
+		}
+	}
+	return items
+}
+
+// The ruling's property, over 300,000 adversarial specs: every order is one
+// main's sort could produce, whatever its map yielded. Main's sort starts by
+// emitting the seed its map yields, so the only seed that can produce an order
+// is the order's own first len(roots) names; replaying main's drain from that
+// seed must return the same order. A spec main refuses is refused here too.
+func TestStageOrder1152_EveryOrderIsOneMainCouldProduce(t *testing.T) {
 	rng := rand.New(rand.NewSource(1152))
-	specs := 0
-	for specs < 2000 {
-		n := 1 + rng.Intn(7)
-		dep := make([]int, n)
-		// A random rank makes the graph acyclic whichever way its edges point
-		// in declared order.
-		rank := rng.Perm(n)
-		for i := range dep {
-			dep[i] = -1
-			if rng.Intn(3) > 0 {
-				var below []int
-				for j := range dep {
-					if rank[j] < rank[i] {
-						below = append(below, j)
-					}
-				}
-				if len(below) > 0 {
-					dep[i] = below[rng.Intn(len(below))]
-				}
-			}
-		}
-		items := make([]*templates.API, n)
-		for i := range items {
-			if dep[i] >= 0 {
-				items[i] = s1152(fmt.Sprintf("s%d", i), fmt.Sprintf("s%d", dep[i]))
-			} else {
-				items[i] = s1152(fmt.Sprintf("s%d", i))
-			}
-		}
-		var want []string
-		indexOrders(dep, func(order []int) bool {
-			for _, i := range order {
-				want = append(want, fmt.Sprintf("s%d", i))
-			}
-			return true
-		})
+	solved, refused := 0, 0
+	for i := 0; i < 300000; i++ {
+		items := spec1152(rng)
 		got, err := topologicalSort(items)
+		_, wantErr := mainSort1152(items)
+		if (err == nil) != (wantErr == nil) {
+			t.Fatalf("spec %d %v: error %v, main's %v", i, specString1152(items), err, wantErr)
+		}
 		if err != nil {
-			t.Fatalf("deps %v: %v", dep, err)
+			if got != nil {
+				t.Fatalf("spec %d: an order with an error: %v", i, got)
+			}
+			refused++
+			continue
 		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("deps %v: got %v, want %v", dep, got, want)
+		solved++
+		seed := got
+		if n := countRoots1152(items); n <= len(got) {
+			seed = got[:n]
 		}
-		specs++
+		want, ok, mainErr := mainFrom1152(items, seed)
+		if !ok || mainErr != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("spec %d %v: order %v is not one main could produce (from seed %v: %v, %v, %v)", i, specString1152(items), got, seed, want, mainErr, ok)
+		}
+	}
+	if solved < 10000 || refused < 10000 {
+		t.Fatalf("the specs must cover both sides: %d solved, %d refused", solved, refused)
+	}
+}
+
+func countRoots1152(items []*templates.API) int {
+	blocked, all := map[string]bool{}, map[string]bool{}
+	for _, it := range items {
+		all[it.Name] = true
+		if it.DependsOn != nil && it.DependsOn.Name != "" {
+			blocked[it.Name] = true
+		}
+	}
+	return len(all) - len(blocked)
+}
+
+func specString1152(items []*templates.API) string {
+	var b strings.Builder
+	for _, it := range items {
+		dep := ""
+		if it.DependsOn != nil {
+			dep = "<" + it.DependsOn.Name
+		}
+		b.WriteString(it.Name + dep + " ")
+	}
+	return b.String()
+}
+
+// The same property against main's sort itself, map and all: over repeated runs
+// main returns this order. Up to 8 names a Go map rotates its insertion order,
+// and declared order is one rotation, so 500 runs find it. Past 8 the map's order
+// is not a rotation, so the spec is skipped here and left to the replay above.
+func TestStageOrder1152_MainsOwnSortReturnsThisOrder(t *testing.T) {
+	rng := rand.New(rand.NewSource(11520))
+	checked := 0
+	for checked < 300 {
+		items := spec1152(rng)
+		got, err := topologicalSort(items)
+		if err != nil || len(got) > 8 {
+			continue
+		}
+		checked++
+		found := false
+		for run := 0; run < 500 && !found; run++ {
+			m, err := mainSort1152(items)
+			found = err == nil && reflect.DeepEqual(m, got)
+		}
+		if !found {
+			t.Fatalf("%v: main never returned %v", specString1152(items), got)
+		}
 	}
 }
 
@@ -165,7 +288,7 @@ func TestStageOrder1152_AnUnsatisfiableSpecIsStillAnError(t *testing.T) {
 }
 
 // Independent stages run the same way on every run. A loop over a Go map cannot
-// pass this: eight names in declared order, 2000 times.
+// pass this: eight names in declared order, 2000 times, declared last to first.
 func TestStageOrder1152_IndependentStagesAreDeterministicAcrossRuns(t *testing.T) {
 	var items []*templates.API
 	var want []string
@@ -185,7 +308,7 @@ func TestStageOrder1152_IndependentStagesAreDeterministicAcrossRuns(t *testing.T
 	}
 }
 
-// Through a resolve. What the order decided before is now the same on every
+// Through a resolve. What the map decided before is now the same on every
 // run: which stage the resolve reports as its failure, the order of the outcome
 // header, and the order of the records under a shared errorKey.
 func TestStageOrder1152_AResolveReportsTheSameFailureOnEveryRun(t *testing.T) {
@@ -268,6 +391,81 @@ func TestStageOrder1152_InspectWalksTheDeclaredOrder(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("run %d: unresolved %v, want %v", run, got, want)
 		}
+	}
+}
+
+// The krateo-dashboard/events shape with its fan-out stalled past the page's
+// budget: `crds`, then `comps` (dependsOn crds, an iterator), then `getEvents`
+// (independent). Independent stages run first, so `getEvents` has answered before
+// the stall begins. A strict declared order would run the fan-out first, and the
+// stall would spend the budget getEvents needs.
+func TestStageOrder1152_AStalledFanOutStillAnswersTheIndependentStage(t *testing.T) {
+	release := make(chan struct{})
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/namespaces/"+u904AuthnNS+"/secrets/"+u904Secret:
+			b, _ := json.Marshal(corev1.Secret{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+				ObjectMeta: metav1.ObjectMeta{Name: u904Secret, Namespace: u904AuthnNS},
+				Data:       map[string][]byte{"server-url": []byte(srv.URL)},
+			})
+			_, _ = w.Write(b)
+		case r.URL.Path == "/crds":
+			_, _ = w.Write([]byte(`{"items":[{"plural":"p1s"}]}`))
+		case strings.HasPrefix(r.URL.Path, "/comps/"):
+			<-release // the fan-out stalls: connected, never answers
+		default:
+			_, _ = w.Write([]byte(`{"events":["e1"]}`))
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+
+	comps := u904Continue(u904Stage("comps", http.MethodGet, `${ "/comps/" + .plural }`))
+	comps.DependsOn = &templates.Dependency{Name: "crds", Iterator: ptr.To(".crds.items")}
+	stages := []*templates.API{
+		u904Stage("crds", http.MethodGet, "/crds"),
+		comps,
+		u904Continue(u904Stage("getEvents", http.MethodGet, "/events")),
+	}
+
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "cyberjoker", Groups: []string{"devs"}}))
+	ctx = pagebudget.WithCustomer(ctx, time.Now().Add(2*time.Second-pagebudget.PageMaxGoal))
+	ctx, outcomes := WithStageOutcomes(ctx)
+	dict, _ := ResolveWithFailure(ctx, ResolveOptions{
+		RC: &rest.Config{Host: srv.URL}, AuthnNS: u904AuthnNS, Items: stages,
+		RESTActionNamespace: "krateo-dashboard", RESTActionName: "events",
+	})
+	raw := outcomes.HeaderValue()
+	if strings.Contains(raw, `"name":"getEvents"`) {
+		t.Fatalf("getEvents did not answer: %s", raw)
+	}
+	if !strings.Contains(fmt.Sprint(dict["getEvents"]), "e1") {
+		t.Fatalf("getEvents = %v, want its events; outcomes %s", dict["getEvents"], raw)
+	}
+	if !strings.Contains(raw, `"name":"comps","ok":false,"reason":"Timeout"`) {
+		t.Fatalf("outcomes %s: want the stalled fan-out to end on the budget", raw)
+	}
+}
+
+// A dependent that reads an independent stage declared after it still sees it,
+// though it declares no dependency on that stage: independent stages run first.
+// Main's sort gave this on every run, whatever its map yielded.
+func TestStageOrder1152_ADependentStillSeesALaterDeclaredIndependentStage(t *testing.T) {
+	stages := []*templates.API{
+		u904Stage("a", http.MethodGet, "/a"),
+		u904After(u904Stage("b", http.MethodGet, `${ "/b/" + .c.id }`), "a"),
+		u904Stage("c", http.MethodGet, "/c"),
+	}
+	for run := 0; run < 40; run++ {
+		u := u904NewUpstream(t, map[string]u904Route{"GET /c": {status: http.StatusOK, body: `{"id":"from-c"}`}})
+		r := u904Resolve(t, u, stages, false)
+		if n := u.n(http.MethodGet, "/b/from-c"); n != 1 {
+			t.Fatalf("run %d: b dialled /b/from-c %d time(s), want once; outcomes %s", run, n, r.raw)
+		}
+		r.wantSucceeded(t, "a", "b", "c")
 	}
 }
 
