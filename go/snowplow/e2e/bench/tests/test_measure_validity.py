@@ -73,6 +73,9 @@ def test_failed_first_load_is_retried_and_replayed_after_recovery():
     assert c.calls.count(INIT) >= 3
 
 
+@pytest.mark.serial   # #1166: its floor is on wall-clock gaps between two workers' retries, which
+                     # tests/wallclock.py cannot read from the source; beside parallel workers it
+                     # failed once (a gap < 0.08 s). It runs alone, as it always did (#1174).
 def test_backoff_spaces_retries():
     c = Flaky(down=10 ** 6)                                       # never recovers
     recs = []

@@ -408,16 +408,36 @@ step() {
 
 # bounded <seconds> cmd...: run cmd, TERM it after <seconds> (portable: macOS
 # has no `timeout`). Output and exit status are cmd's own (143 if killed).
+# kill_tree <signal> <pid>: the pid and every descendant, children first (#1170). A TERM to a
+# python wrapper does not reach the gcloud / kubectl it started: they would run on, orphaned.
+kill_tree() {
+  local sig="$1" pid="$2" c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+# At its bound the watchdog stops the command's whole tree; stopping the watchdog stops its own
+# sleep (its TERM trap), so neither outlives the call. BOUNDED_PIDS names the call in flight:
+# a run that leaves in the middle of one (a signal or a pair stop fires its trap inside `wait`)
+# stops it at the start of its teardown instead of leaving it to run out its bound (#1170).
+BOUNDED_PIDS=""
 bounded() {
   local secs="$1"; shift
   "$@" &
   local pid=$!
-  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  ( s=""; trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" & s=$!; wait "$s"; kill_tree TERM "$pid" ) >/dev/null 2>&1 &
   local dog=$!
+  BOUNDED_PIDS="$pid $dog"
   local rc=0
   wait "$pid" || rc=$?
   kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
+  BOUNDED_PIDS=""
   return "$rc"
+}
+stop_inflight_bounded() {
+  local p
+  for p in $BOUNDED_PIDS; do kill_tree TERM "$p"; done
+  BOUNDED_PIDS=""
 }
 # capped <seconds> <label> cmd...: run cmd in the background under ONE
 # wall-clock cap; stop early on the cap or when teardown was signalled.
@@ -466,6 +486,7 @@ teardown() {
   trap on_teardown_signal INT TERM HUP
   set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
+  stop_inflight_bounded   # a bounded call the signal or pair stop interrupted (#1170)
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   declare -F stop_sampler >/dev/null && stop_sampler top_boot

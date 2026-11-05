@@ -1,5 +1,6 @@
 """#1170: every process a test starts is killed and reaped when the test ends: pass, fail, a
-subprocess timeout or Ctrl-C. The session fails if a process outlives every test.
+subprocess timeout or Ctrl-C, and a test that left one FAILS, naming it. The session fails if a
+process outlives every test.
 
 Each arm runs a small inner pytest session (with tests/procreap.py, as pytest.ini loads it)
 whose test leaves a process behind the way the bench's own leaks did: a child that backgrounds
@@ -73,7 +74,7 @@ def _inner(tmp_path: Path, body: str, *, start=False, extra=()):
 
 
 @pytest.mark.parametrize("extra", [(), ("-n", "2")], ids=["serial", "xdist"])
-def test_a_process_a_passing_test_leaves_behind_is_killed_when_the_test_ends(tmp_path, extra):
+def test_a_process_a_passing_test_leaves_behind_is_killed_and_fails_the_test(tmp_path, extra):
     token, p = _inner(tmp_path, '''
         def test_leaks():
             orphan()
@@ -84,14 +85,14 @@ def test_a_process_a_passing_test_leaves_behind_is_killed_when_the_test_ends(tmp
                 time.sleep(0.05)
     ''', extra=extra)
     try:
-        assert p.returncode == 0, p.stdout + p.stderr
+        assert p.returncode == 1, p.stdout + p.stderr
         assert _alive(token) == [], "the orphan outlived its test"
         assert "outlived every test" not in p.stdout                   # the test's end, not the session's
-        # shown, never absorbed: the summary names the test and the process
-        assert "processes a test left running" in p.stdout and "test_inner.py::test_leaks" in p.stdout
-        assert token in p.stdout
+        # a leak is a red test, never a tolerated line: the test errors at its teardown, naming it
+        assert "1 passed, 1 error" in p.stdout and "ERROR test_inner.py::test_leaks" in p.stdout, p.stdout
+        assert "#1170: the test left 1 process(es) running" in p.stdout and token in p.stdout, p.stdout
         # the command line only: a process's environment can hold credentials
-        listed = [ln for ln in p.stdout.splitlines() if ln.startswith("    pid ")]
+        listed = [ln for ln in p.stdout.splitlines() if "pid " in ln and token in ln]
         assert listed and not [ln for ln in listed if re.search(r"\s[A-Z][A-Z0-9_]*=", ln)], listed
     finally:
         _kill(token)
@@ -109,7 +110,10 @@ def test_a_test_whose_subprocess_times_out_leaves_no_process_behind(tmp_path):
     ''')
     try:
         assert p.returncode == 1 and "TimeoutExpired" in p.stdout, p.stdout + p.stderr
-        assert "1 failed, 1 passed" in p.stdout, p.stdout              # test_next saw no leftover
+        # the timed-out test fails, and errors at its teardown for the grandchild it left;
+        # test_next, after it, saw nothing of it running
+        assert "1 failed, 1 passed, 1 error" in p.stdout, p.stdout
+        assert "ERROR test_inner.py::test_times_out" in p.stdout and token in p.stdout, p.stdout
         assert "outlived every test" not in p.stdout                   # the test's end, not the session's
         assert _alive(token) == [], "the timed-out command's grandchild outlived its test"
     finally:
@@ -134,6 +138,7 @@ def test_a_test_interrupted_with_ctrl_c_leaves_no_process_behind(tmp_path):
         os.killpg(p.pid, signal.SIGINT)
         out, _ = p.communicate(timeout=60)
         assert p.returncode == 2 and "KeyboardInterrupt" in out, out          # pytest: interrupted
+        assert "#1170: the test left 1 process(es)" in out and token in out, out   # and the leak is named
         assert _alive(token) == [], "a process of the interrupted test outlived it"
         assert "outlived every test" not in out                        # the test's end, not the session's
     finally:
@@ -150,7 +155,7 @@ def test_a_child_started_with_its_own_env_is_still_the_tests(tmp_path):
             orphan(env={"PATH": os.environ["PATH"]})
     ''')
     try:
-        assert p.returncode == 0, p.stdout + p.stderr
+        assert p.returncode == 1 and "ERROR test_inner.py::test_own_env" in p.stdout, p.stdout + p.stderr
         assert _alive(token) == [], "a child started with env= escaped its test"
         assert "outlived every test" not in p.stdout                   # the test's end, not the session's
     finally:

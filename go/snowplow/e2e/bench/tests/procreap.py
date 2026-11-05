@@ -11,15 +11,17 @@ with an explicit env= gets the tag added (subprocess.Popen below). The session t
 BENCH_TEST_SESSION is set once, by the controller, and every xdist worker inherits it.
 
 When a test ends, every live process that carries its owner tag is killed (SIGKILL: an orphan
-gets no say in it) and, if it is the test process's own child, reaped. What was killed is
-recorded on the test's report and listed in the terminal summary: a leak is shown, never
-absorbed. At the end of the session the controller lists every live process that still carries
+gets no say in it) and, if it is the test process's own child, reaped, so nothing keeps
+running; then the test FAILS (an error at its teardown) naming each process: a leak is a red
+test, never a tolerated line. At the end of the session the controller lists every live process that still carries
 the session tag. Anything there escaped its test, for example a process started by a module-
 or session-scoped fixture that never stopped it. The check prints each one, kills it, and
 FAILS the run.
 
 Scope: a process that drops its environment (env -i, or an exec with a fresh environment of
-its own) is invisible to both checks. Nothing the bench starts does that.
+its own) is invisible to both checks. Nothing the bench starts does that. On macOS, ps -E does
+not show the environment of Apple's own binaries (/bin/sleep, /bin/bash: SIP), so a leaked one
+is seen on Linux (CI reads /proc/<pid>/environ) and not on a Mac.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
@@ -182,30 +185,23 @@ def _bench_test_owns_its_processes(request, monkeypatch):
     if _spawns[0] == spawned:           # it started no process: nothing can carry its tag
         return
     killed = kill_tagged(OWNER_VAR, owner)
-    if killed:
-        request.node.user_properties.append(
-            ("processes_killed_at_test_end", [f"pid {pid}: {cmd[:400]}" for pid, cmd in killed]))
-
-
-_killed_report: list[tuple[str, list[str]]] = []
-
-
-def pytest_runtest_logreport(report):
-    if report.when == "teardown":
-        for name, value in report.user_properties:
-            if name == "processes_killed_at_test_end":
-                _killed_report.append((report.nodeid, value))
-
-
-def pytest_terminal_summary(terminalreporter):
-    if not _killed_report:
+    if not killed:
         return
-    tr = terminalreporter
-    tr.section("processes a test left running (killed at its end, #1170)")
-    for nodeid, procs in _killed_report:
-        tr.write_line(nodeid)
-        for p in procs:
-            tr.write_line(f"    {p}")
+    msg = "#1170: the test left %d process(es) running at its end (killed now):\n%s" % (
+        len(killed), "\n".join(f"    pid {pid}: {cmd[:400]}" for pid, cmd in killed))
+    if _interrupted[0]:
+        # Ctrl-C: the session is being torn down, outside any test's report, and already ends
+        # as interrupted (exit 2). A failure raised here would crash it: say it instead.
+        sys.stderr.write(f"{request.node.nodeid}: {msg}\n")
+        return
+    pytest.fail(msg, pytrace=False)
+
+
+_interrupted = [False]
+
+
+def pytest_keyboard_interrupt(excinfo):
+    _interrupted[0] = True
 
 
 @pytest.hookimpl(trylast=True)          # after xdist has stopped its workers
