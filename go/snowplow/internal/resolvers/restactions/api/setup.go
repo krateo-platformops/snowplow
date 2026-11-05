@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
@@ -13,6 +14,8 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -84,9 +87,12 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		it = ptr.Deref(in.DependsOn.Iterator, "")
 	}
 
+	// #1123 — the path is compiled once per stage and rendered per call.
+	pt := pathtemplate.Compile(in.Path)
+
 	if len(it) == 0 {
 		all = make([]httpcall.RequestOptions, 0, 1)
-		el, ok, sr := createRequestOption(in, dict, apiserver)
+		el, ok, sr := createRequestOptionWith(in, pt, dict, apiserver)
 		if ok {
 			all = append(all, el)
 		} else {
@@ -127,7 +133,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 	}
 
 	for _, sa := range elems {
-		el, ok, sr := createRequestOption(in, sa, apiserver)
+		el, ok, sr := createRequestOptionWith(in, pt, sa, apiserver)
 		if !ok {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 			skips = append(skips, skippedOption{path: el.Path, reason: sr})
@@ -163,17 +169,29 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 // createRequestOption renders one api-call RequestOptions from the stage `in`
 // and the per-call data `ds`. The second return is the VALIDITY verdict: false
 // means the call must NOT be appended or dialled — a template failed (#293
-// unrendered ${...}, #302 a jq error in the path, payload or header), or, on an
+// unrendered ${...}, #302 a jq error in the path, payload or header), the
+// path template refused a value or rendered no path (#1123), or, on an
 // apiserver stage (apiserver=true), the rendered path is a malformed
 // single-object apiserver path (#288: an interpolated name/namespace segment
 // collapsed to empty, or is DNS-1123-invalid — e.g. a trailing '-').
 // valid=true for well-formed paths AND for out-of-scope paths (external URLs,
 // LIST paths).
 func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcall.RequestOptions, valid bool, sr skipReason) {
+	return createRequestOptionWith(in, pathtemplate.Compile(in.Path), ds, apiserver)
+}
+
+// createRequestOptionWith is createRequestOption with the stage path already
+// compiled (pt = pathtemplate.Compile(in.Path)), so an iterator stage compiles
+// it once rather than once per element.
+func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds any, apiserver bool) (out httpcall.RequestOptions, valid bool, sr skipReason) {
 	out.ContinueOnError = ptr.Deref(in.ContinueOnError, false)
 	out.ErrorKey = ptr.Deref(in.ErrorKey, "error")
 
-	path, pathErr := evalJQE(in.Path, ds)
+	// #1123 — the path is a TEMPLATE: the author's literals as written, every
+	// value spliced into it escaped as one segment (or one query value), and a
+	// value that cannot be one refused (pathtemplate). Payload and headers are
+	// not URIs and keep the plain render below.
+	path, pathErr := pt.Render(context.TODO(), ds)
 	out.Path = path
 	out.Verb = ptr.To(ptr.Deref(in.Verb, http.MethodGet))
 
@@ -201,6 +219,12 @@ func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcal
 		}
 	}
 
+	if pathErr != nil && pathtemplate.IsRefused(pathErr) {
+		// #1123 — a value tried to be more than one segment, or a '.'/'..'
+		// segment. Never dialed. The refusal names the rule, never the value.
+		out.Path = pathErr.Error()
+		return out, false, skipReason{class: reasonPathValueRefused, detail: pathErr.Error()}
+	}
 	if pathErr != nil {
 		// #293 sub-case 2: the path jq expression ERRORED. evalJQE surfaces the
 		// error (evalJQ would have masqueraded it as the path string and dialed it
@@ -209,6 +233,15 @@ func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcal
 		// never dialed.
 		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
+	}
+	// #1123 — a template that rendered no path names nothing to call: every value
+	// it spliced was null (`${ segments(.path) }` with .path missing, which is
+	// what a nil-extras prewarm renders), "", or it produced no output. Dialled,
+	// it would read the endpoint's root with the stage's credential. It is the
+	// #288 collapse at its limit, whatever the stage dials. A stage with no
+	// template (in.Path == "") has no value to lose and keeps its meaning.
+	if path == "" && in.Path != "" {
+		return out, false, skipReason{class: reasonEmptyInterp, detail: "the path template rendered no path (#1123)", collapsed: true}
 	}
 	// #302 — a payload or header jq error must NEVER be dialed (a garbage request
 	// body, or a garbage Authorization/header value). Skip the dial, mirroring the
@@ -253,10 +286,14 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 //   - a COLLAPSED empty namespace segment (`/api/v1/namespaces//configmaps/...`),
 //     keyed on the literal "/namespaces//" (the DOUBLE slash), NOT merely ns==""
 //     (which is ALSO true for a legit cluster-scoped namespace-by-name GET like
-//     /api/v1/namespaces/kube-system) and NOT the general "//" (which would
-//     false-reject a proxy subresource URL, e.g. /pods/p/proxy/http://host). On a
-//     spoke apiserver reached through a named ref (cluster-compositions'
-//     `<name>-endpoint`) it would otherwise read every namespace;
+//     /api/v1/namespaces/kube-system) and NOT the general "//": this check also
+//     judges a named endpoint's path, which is another API's and may hold a
+//     "//" it needs. On a spoke apiserver reached through a named ref
+//     (cluster-compositions' `<name>-endpoint`) it would otherwise read every
+//     namespace. On THIS cluster's apiserver every empty segment is refused
+//     anyway, by servedAsWritten (#1137): validInterpolatedPath runs both. That
+//     includes a proxy subresource carrying a URL
+//     (`.../services/svc/proxy/http://h/x`), which is refused there;
 //   - a collapsed trailing NAME on a mutating verb: an apiserver-shaped path
 //     whose last segment rendered empty, leaving a trailing "/"
 //     (`DELETE .../rolebindings/` from `".../rolebindings/" + .name`): dialled,
@@ -269,8 +306,9 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 //     (`.../configmaps/`, no interpolation) is false-rejected; RAs write the
 //     collection path without the trailing slash, so this is rare;
 //   - a name that collapses BEFORE a subresource (`.../resource//subresource`, a
-//     mid-path "//") is NOT caught — the targeted "/namespaces//" key deliberately
-//     avoids the general "//" (proxy-URL edge above).
+//     mid-path "//") is NOT caught HERE: the targeted "/namespaces//" key avoids
+//     the general "//" for a named endpoint's sake (above). On this cluster's
+//     apiserver, servedAsWritten (#1137) refuses it as an empty segment.
 func collapsedPath(path, verb string) (bool, skipReason) {
 	if unrenderedTemplate(path) {
 		return false, unrenderedTemplateSkip
@@ -300,6 +338,9 @@ func rawPath(path string) string {
 // on THIS cluster's apiserver (#288): collapsedPath, plus the checks that hold
 // only for a Kubernetes object path, so only for an own-cluster dial (#1112 D2:
 // on a named endpoint they refused another API's ids, `/api/v2/tickets/Ab_12`):
+//   - a path the apiserver would read as a different path (#1137,
+//     servedAsWritten): every reader of a planned call reads its path as
+//     written, so the plan holds only a path the apiserver serves as written;
 //   - a name/namespace segment that is present but DNS-1123-invalid (e.g. a
 //     trailing '-'), via IsDNS1123Subdomain / IsDNS1123Label (VALIDATE, not
 //     sanitize — sanitizing would dial a wrong-but-valid name and defeat #288);
@@ -315,6 +356,24 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 		return false, sr
 	}
 	_, ns, name, ok := cache.ParseAPIServerPathToDep(path)
+	// #1123 — no percent-escape in an apiserver path. The apiserver decodes the
+	// path before it reads namespace, resource and name; snowplow's parsers
+	// (this guard, the cache key, the dependency edge, the in-process RBAC
+	// decision) read it as sent (#1118). No valid apiserver path needs an
+	// escape — no group, version, resource, namespace or name may contain '%' —
+	// so a path that carries one is refused, and the path snowplow checks is
+	// the path the apiserver serves. An escaped value lands here: a value with
+	// '?' or '#' escapes into the segment it was spliced into.
+	//
+	// Before servedAsWritten, which refuses these paths too (#1137): this is the
+	// finer verdict, the one that says a value is the likely cause. In the other
+	// order it could never fire.
+	if ok && strings.Contains(rawPath(path), "%") {
+		return false, skipReason{class: reasonPathValueRefused, detail: "percent-escape in an apiserver path (#1123)"}
+	}
+	if !servedAsWritten(path) {
+		return false, skipReason{class: reasonPathNotAsServed, detail: "the apiserver would read this path as a different path (#1137)"}
+	}
 	if !ok {
 		// Not a single-object/list apiserver path we guard (external URL,
 		// unresolved template, or a shape ParseAPIServerPathToDep rejects).
@@ -332,10 +391,106 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 	return true, skipReason{}
 }
 
+// servedAsWritten reports whether this cluster's apiserver reads path exactly
+// as it is written (#1137), on every branch that can dial it.
+//
+// Every reader of a planned call reads its path as written:
+// ParseAPIServerPathToDep for the userAccessFilter's own resource (#1124), the
+// cache key and the dependency edge, the informer and content-cell dispatch,
+// the sensitive-resource mark (#398), and this guard's own namespace and name
+// checks. The request the apiserver serves is built two ways, each of which
+// normalises the path, and the apiserver then reads one more thing out of it:
+//   - the HTTP dials (credhttp.Do, the resolver's fetch) send
+//     credhttp.RequestURL(server, path), which puts a "/" before a path written
+//     without one, and the apiserver percent-decodes the request path before it
+//     reads namespace, resource and name (k8s.io/apiserver: the handler
+//     director and RequestInfoFactory both read req.URL.Path);
+//   - the internal-rest-config branch (the refresher's dial) asks client-go for
+//     the parsed coordinates, and client-go joins them with path.Join, which
+//     drops an empty or "." segment and resolves "..";
+//   - the apiserver reads a verb from the first segment after the version and
+//     strips it (k8s.io/apiserver RequestInfoFactory, specialVerbs).
+//
+// Where the written path and the served one differ, every reader decides about
+// a request that is not the one served: `apis/g/v/p2s` parses as nothing and
+// is served as p2s; `/apis/g/v/namespaces%2Fns-a%2Fp2s` parses as one resource
+// named with escapes and is served as p2s in ns-a; `/apis/g/v/namespaces/ns-a/
+// ./p2s` parses as resource "." and the refresher LISTs p2s in ns-a;
+// `//api/v1/namespaces/ns-a/secrets` parses as nothing, so #398 does not mark
+// it, while the apiserver authorizes it as secrets; `/apis/g/v/watch/namespaces/
+// ns-a/p2s` parses as resource "watch" and is served as a watch of p2s in ns-a.
+//
+// So the plan holds only a path that none of them changes:
+//   - decoding: the path the server decodes from the URL the dial builds
+//     equals the written path, before its query and fragment (which the
+//     apiserver does not read as coordinates; splitPathQuery is the parsers'
+//     own split). The query is not judged: a selector value may be escaped.
+//   - cleaning: no segment is empty, "." or "..". Trailing "/"s are not
+//     segments: every reader, path cleaning and the apiserver read the path
+//     without them (a mutating verb's trailing "/" is collapsedPath's refusal);
+//   - the verb: the first segment after the version is not one the apiserver
+//     strips (verbInPath).
+//
+// One rule, not a list of shapes: no own-cluster path needs a missing leading
+// "/", a percent-escape, an empty segment, a dot segment or a verb in the path
+// (no group, version, resource, namespace or name is empty, "." or "..", or
+// contains '%' or '/'; a watch is asked for in the query, `?watch=true`).
+func servedAsWritten(path string) bool {
+	p, _, _ := splitPathQuery(path)
+	// The base carries no path of its own, so u.Path is the request path the
+	// server receives, decoded exactly as net/http decodes it for the apiserver.
+	u, err := url.Parse(credhttp.RequestURL("http://apiserver.invalid", path))
+	if err != nil || u.Path != p {
+		return false
+	}
+	return cleanAsWritten(p) && !verbInPath(p)
+}
+
+// cleanAsWritten reports whether path cleaning leaves p's segments as they
+// are: every segment between the leading "/" and any trailing "/"s is
+// non-empty and neither "." nor "..". The server root ("", sent as the server
+// URL itself, or "/") has no segment to clean.
+func cleanAsWritten(p string) bool {
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return true
+	}
+	for _, seg := range strings.Split(strings.TrimPrefix(p, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// apiserverPathVerbs is RequestInfoFactory's specialVerbs (k8s.io/apiserver
+// pkg/endpoints/request/requestinfo.go): the words it strips from the first
+// segment after the version and reads as the verb. `watch/` is routed (the
+// deprecated verb-via-path form); `proxy/` has no route left, and is here
+// because the reading is the same.
+var apiserverPathVerbs = map[string]bool{"watch": true, "proxy": true}
+
+// verbInPath reports whether the apiserver reads a verb out of p: the first
+// segment after the version of /api/<version>/ or /apis/<group>/<version>/. Only
+// there: a subresource (`nodes/n/proxy/metrics`), a namespace or a name may be
+// spelled like a verb, and the apiserver reads those as written.
+func verbInPath(p string) bool {
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	first := 0 // the index of the segment after the version
+	switch segs[0] {
+	case "api":
+		first = 2
+	case "apis":
+		first = 3
+	}
+	return first > 0 && len(segs) > first && apiserverPathVerbs[segs[first]]
+}
+
 // evalJQE evaluates a jq template and SURFACES the Eval error instead of
-// swallowing it into the output string. The api-call PATH render uses it so a
-// failed jq expression is NOT dialed as a garbage apiserver path (#293
-// sub-case 2). A non-template string (MaybeQuery !ok) returns unchanged with a
+// swallowing it into the output string, so a failed jq expression is never
+// dialed (#293 sub-case 2, #302). The api-call payload and headers render
+// through it; the PATH renders through pathtemplate.Render (#1123), which
+// surfaces errors the same way. A non-template string (MaybeQuery !ok) returns unchanged with a
 // nil error.
 func evalJQE(q string, ds any) (string, error) {
 	q, ok := jqutil.MaybeQuery(q)

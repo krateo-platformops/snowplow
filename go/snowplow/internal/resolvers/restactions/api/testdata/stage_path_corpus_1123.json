@@ -1,0 +1,1901 @@
+{
+ "provenance": "portal main da5f590cd0ab6f8b603e732d89c9be4cd1476c78 (helm template of every chart under helm/), plus every RESTAction stage in snowplow yaml testdata; generated for #1123",
+ "stages": [
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-detail",
+   "stage": "alert",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/alerts/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-detail",
+   "stage": "incidents",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + (.namespace // \"default\") + \"/incidents\" }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-editdef",
+   "stage": "crd",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/alerts.observability.krateo.io",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-editdef",
+   "stage": "alert",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/alerts/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-formdef",
+   "stage": "crd",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/alerts.observability.krateo.io",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "alert-formdef",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "obs-alerts",
+   "stage": "alerts",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/alerts",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:alerts-page",
+   "ra": "obs-alerts",
+   "stage": "incidents",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/incidents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-detail",
+   "stage": "compdef",
+   "path": "${ \"/apis/core.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/compositiondefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-detail",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-detail",
+   "stage": "comps",
+   "path": "${ \"/apis/\" + .apiVersion + \"/\" + .resource }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-formdef",
+   "stage": "compdef",
+   "path": "${ \"/apis/core.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/compositiondefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-formdef",
+   "stage": "jsonschema",
+   "path": "${ \"/api/v1/namespaces/\" + .namespace + \"/configmaps/\" + .resource + \"-\" + .version + \"-jsonschema-configmap\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-formdef",
+   "stage": "crd",
+   "path": "${ \"/apis/apiextensions.k8s.io/v1/customresourcedefinitions/\" + .resource + \".\" + .group }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "blueprint-formdef",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "fleet-rollout-formdef",
+   "stage": "compdef",
+   "path": "${ \"/apis/core.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/compositiondefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "fleet-rollout-formdef",
+   "stage": "targets",
+   "path": "/apis/core.krateo.io/v1alpha1/kubernetestargets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "upgrade-impact",
+   "stage": "compdef",
+   "path": "${ \"/apis/core.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/compositiondefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:blueprints-page",
+   "ra": "upgrade-impact",
+   "stage": "impact",
+   "path": "/diff",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "blueprint-builder-deliverables",
+   "stage": "prs",
+   "path": "/apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "blueprint-builder-deliverables",
+   "stage": "cds",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "blueprint-builder-deliverables",
+   "stage": "publishes",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "blueprint-builder-deliverables",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "builder-prs",
+   "stage": "prs",
+   "path": "/apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "builder-prs",
+   "stage": "publishes",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "builder-prs",
+   "stage": "cds",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "prs",
+   "path": "/apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "publishes",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "cds",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "installs",
+   "path": "${ \"/apis/\" + .apiVersion + \"/\" + .resource }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "restdefs",
+   "path": "/apis/ogen.krateo.io/v1alpha1/restdefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-builder-deliverables",
+   "stage": "configs",
+   "path": "${ \"/apis/\" + .apiVersion + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-configure-formdef",
+   "stage": "rd",
+   "path": "${ \"/apis/ogen.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/restdefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "controller-configure-formdef",
+   "stage": "crd",
+   "path": "${ \"/apis/apiextensions.k8s.io/v1/customresourcedefinitions/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "kog-restdefinitions",
+   "stage": "restdefs",
+   "path": "/apis/ogen.krateo.io/v1alpha1/restdefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "my-drafts",
+   "stage": "records",
+   "path": "/api/v1/namespaces/krateo-preview/configmaps",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:builders-page",
+   "ra": "unowned-drafts",
+   "stage": "roots",
+   "path": "/apis/widgets.templates.krateo.io/v1beta1/namespaces/krateo-preview/flexes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "cluster-compositions",
+   "stage": "spokeCrds",
+   "path": "/apiextensions.k8s.io/v1/customresourcedefinitions",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "cluster-compositions",
+   "stage": "spokeCompositions",
+   "path": "${ \"/\" + .group + \"/\" + .version + \"/\" + .plural }",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "cluster-compositions",
+   "stage": "spokeCompositionDefinitions",
+   "path": "/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "cluster-detail",
+   "stage": "targets",
+   "path": "/apis/core.krateo.io/v1alpha1/kubernetestargets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "cluster-detail",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "clusters-list",
+   "stage": "targets",
+   "path": "/apis/core.krateo.io/v1alpha1/kubernetestargets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:clusters-page",
+   "ra": "clusters-list",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-architecture",
+   "stage": "arch",
+   "path": "${ \"/api/v1/namespaces/\" + .namespace + \"/configmaps/\" + .name + \"-architecture\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-architecture",
+   "stage": "comp",
+   "path": "${ \"/apis/\" + .apiVersion + \"/namespaces/\" + .namespace + \"/\" + .resource + \"/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-architecture",
+   "stage": "objs",
+   "path": "${ .path }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-detail",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-detail",
+   "stage": "found",
+   "path": "${ \"/apis/composition.krateo.io/\" + .version + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-editdef",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-editdef",
+   "stage": "found",
+   "path": "${ \"/apis/composition.krateo.io/\" + .version + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-editdef",
+   "stage": "jsonschema",
+   "path": "${ \"/api/v1/namespaces/\" + .cdNamespace + \"/configmaps/\" + .plural + \"-\" + .version + \"-jsonschema-configmap\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-events",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-events",
+   "stage": "found",
+   "path": "${ \"/apis/composition.krateo.io/\" + .version + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-events",
+   "stage": "getEvents",
+   "path": "${ .path }",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-events",
+   "stage": "apiresources",
+   "path": "${ \"/apis/\" + .gv }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-incidents",
+   "stage": "incidents",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/incidents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-reconcile-perf",
+   "stage": "perf",
+   "path": "${ .n as $n | .ns as $ns | \"/?query=SELECT%20count%28%29%20AS%20reconciles%2C%20round%28quantile%280.95%29%28Duration%29%2F1e6%2C0%29%20AS%20p95_ms%2C%20formatDateTime%28max%28Timestamp%29%2C%27%25Y-%25m-%25dT%25H%3A%25i%3A%25SZ%27%29%20AS%20last_ts%20FROM%20otel_traces%20WHERE%20ServiceName%3D%27composition-dynamic-controller%27%20AND%20SpanName%3D%27reconcile%27%20AND%20SpanAttributes%5B%27k8s.object.name%27%5D%3D%27\" + $n + \"%27%20AND%20SpanAttributes%5B%27k8s.object.namespace%27%5D%3D%27\" + $ns + \"%27%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%206%20HOUR%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-resources",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-resources",
+   "stage": "found",
+   "path": "${ \"/apis/composition.krateo.io/\" + (.version) + \"/\" + (.plural) }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:compositions-page",
+   "ra": "composition-resources",
+   "stage": "resources",
+   "path": "${ ._getpath }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "dashboard-data",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "dashboard-data",
+   "stage": "allCompositions",
+   "path": "${ \"/apis/composition.krateo.io/\" + (.version) + \"/\" + (.plural) }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "events",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "events",
+   "stage": "comps",
+   "path": "${ \"/apis/composition.krateo.io/\" + .version + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "events",
+   "stage": "getEvents",
+   "path": "/events",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:dashboard-page",
+   "ra": "tenant-trial",
+   "stage": "trialCm",
+   "path": "/api/v1/namespaces/default/configmaps/tenant-trial",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incident-detail",
+   "stage": "incident",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/incidents/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incident-detail",
+   "stage": "incidents",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + (.namespace // \"default\") + \"/incidents\" }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incident-detail",
+   "stage": "incidentApplies",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + (.namespace // \"default\") + \"/incidentapplies\" }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incident-detail",
+   "stage": "alert",
+   "path": "${ \"/apis/observability.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/alerts/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incidents-list",
+   "stage": "incidents",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/incidents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:incidents-page",
+   "ra": "incidents-list",
+   "stage": "alerts",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/alerts",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "marketplace-detail",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "marketplace-detail",
+   "stage": "catalogLive",
+   "path": "/charts/blueprints/index.yaml",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "marketplace-detail",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "crd",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/compositiondefinitions.core.krateo.io",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "operators",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "catalogLive",
+   "path": "/charts/blueprints/index.yaml",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "builderCds",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "builderProjections",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-formdef",
+   "stage": "targets",
+   "path": "/apis/core.krateo.io/v1alpha1/kubernetestargets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-origin",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-origin",
+   "stage": "operators",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-origin",
+   "stage": "builderCds",
+   "path": "/apis/git.krateo.io/v1alpha1/namespaces/default/localresources",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprint-install-origin",
+   "stage": "builderPrs",
+   "path": "/apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprints-catalog",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprints-catalog",
+   "stage": "catalogLive",
+   "path": "/charts/blueprints/index.yaml",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprints-catalog",
+   "stage": "operators",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:marketplace-page",
+   "ra": "blueprints-catalog",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "component-detail",
+   "stage": "dep",
+   "path": "${ \"/apis/apps/v1/namespaces/default/deployments/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "component-detail",
+   "stage": "pods",
+   "path": "/api/v1/namespaces/default/pods",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "component-detail",
+   "stage": "events",
+   "path": "/api/v1/namespaces/default/events",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-components",
+   "stage": "deployments",
+   "path": "/apis/apps/v1/namespaces/default/deployments",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-error-log-digest",
+   "stage": "digest",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | \"/?query=SELECT%20ServiceName%20AS%20service%2C%20substring%28coalesce%28nullIf%28JSONExtractString%28Body%2C%27msg%27%29%2C%27%27%29%2C%20nullIf%28Body%2C%27%27%29%2C%20%27unlabeled%20error%27%29%2C1%2C160%29%20AS%20msg%2C%20count%28%29%20AS%20occurrences%2C%20formatDateTime%28max%28Timestamp%29%2C%20%27%25Y-%25m-%25dT%25H%3A%25i%3A%25SZ%27%29%20AS%20last_ts%20FROM%20otel_logs%20WHERE%20lower%28JSONExtractString%28Body%2C%27level%27%29%29%3D%27error%27%20AND%20TimestampTime%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20service%2C%20msg%20ORDER%20BY%20occurrences%20DESC%20LIMIT%2040%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-error-log-digest",
+   "stage": "tot",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | \"/?query=SELECT%20count%28%29%20AS%20total%2C%20uniqExact%28%28ServiceName%2C%20substring%28coalesce%28nullIf%28JSONExtractString%28Body%2C%27msg%27%29%2C%27%27%29%2C%20nullIf%28Body%2C%27%27%29%2C%20%27unlabeled%20error%27%29%2C1%2C160%29%29%29%20AS%20distinct_problems%20FROM%20otel_logs%20WHERE%20lower%28JSONExtractString%28Body%2C%27level%27%29%29%3D%27error%27%20AND%20TimestampTime%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-log-stream",
+   "stage": "stream",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | ((.serviceName // \"\") | gsub(\"[^a-zA-Z0-9.-]\"; \"\")) as $svc | (if $svc == \"\" then \"\" else \"%20AND%20ServiceName%20IN%20%28SELECT%20ServiceName%20FROM%20otel_logs%20WHERE%20ServiceName%3D%27\" + $svc + \"%27%20OR%20startsWith%28%27\" + $svc + \"%27%2Cconcat%28ServiceName%2C%27-%27%29%29%20GROUP%20BY%20ServiceName%20ORDER%20BY%20length%28ServiceName%29%20DESC%20LIMIT%201%29\" end) as $svcCond | (((.limit // \"40\") | tonumber? // 40) as $n | (if $n > 1000 then 1000 elif $n < 1 then 40 else $n end) | tostring) as $lim | \"/?query=SELECT%20formatDateTime%28Timestamp%2C%27%25Y-%25m-%25dT%25H%3A%25i%3A%25SZ%27%29%20AS%20ts%2C%20ServiceName%20AS%20svc%2C%20upper%28JSONExtractString%28Body%2C%27level%27%29%29%20AS%20lvl%2C%20substring%28JSONExtractString%28Body%2C%27msg%27%29%2C1%2C120%29%20AS%20msg%20FROM%20otel_logs%20WHERE%20%28lower%28JSONExtractString%28Body%2C%27level%27%29%29%3D%27error%27%20OR%20%28lower%28JSONExtractString%28Body%2C%27level%27%29%29%3D%27warn%27%20AND%20ServiceName%21%3D%27snowplow%27%29%29%20AND%20TimestampTime%20%3E%20now%28%29-INTERVAL%20\" + $iv + $svcCond + \"%20ORDER%20BY%20Timestamp%20DESC%20LIMIT%20\" + $lim + \"%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-reconcile-by-composition",
+   "stage": "byc",
+   "path": "${ (.range // \"6h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"6%20HOUR\" end) as $iv | \"/?query=SELECT%20SpanAttributes%5B%27k8s.object.kind%27%5D%20AS%20kind%2C%20SpanAttributes%5B%27k8s.object.name%27%5D%20AS%20name%2C%20SpanAttributes%5B%27k8s.object.namespace%27%5D%20AS%20ns%2C%20count%28%29%20AS%20reconciles%2C%20round%28quantile%280.95%29%28Duration%29%2F1e6%2C0%29%20AS%20p95_ms%2C%20round%28avg%28Duration%29%2F1e6%2C0%29%20AS%20avg_ms%20FROM%20otel_traces%20WHERE%20ServiceName%3D%27composition-dynamic-controller%27%20AND%20SpanName%3D%27reconcile%27%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20kind%2Cname%2Cns%20ORDER%20BY%20p95_ms%20DESC%20LIMIT%2050%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-reconcile-metrics",
+   "stage": "recon",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | \"/?query=SELECT%20toUnixTimestamp%28toStartOfInterval%28Timestamp%2C%20INTERVAL%2010%20MINUTE%29%29%20AS%20ts%2C%20count%28%29%20AS%20reconciles%2C%20round%28quantile%280.95%29%28Duration%29%2F1e6%2C1%29%20AS%20p95_ms%2C%20round%28avg%28Duration%29%2F1e6%2C1%29%20AS%20avg_ms%20FROM%20otel_traces%20WHERE%20ServiceName%3D%27composition-dynamic-controller%27%20AND%20SpanName%3D%27reconcile%27%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20ts%20ORDER%20BY%20ts%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-reconcile-metrics",
+   "stage": "fail",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | \"/?query=SELECT%20MetricName%20AS%20m%2C%20round%28max%28Value%29-min%28Value%29%29%20AS%20v%20FROM%20otel_metrics_sum%20WHERE%20MetricName%20IN%20%28%27provider_runtime.reconcile.failure%27%2C%27provider_runtime.reconcile.success%27%29%20AND%20TimeUnix%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20m%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-reconcile-perf",
+   "stage": "pctl",
+   "path": "${ (.range // \"6h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"6%20HOUR\" end) as $iv | \"/?query=SELECT%20round%28quantile%280.5%29%28Duration%29%2F1e6%2C0%29%20AS%20p50_ms%2C%20round%28quantile%280.95%29%28Duration%29%2F1e6%2C0%29%20AS%20p95_ms%2C%20round%28quantile%280.99%29%28Duration%29%2F1e6%2C0%29%20AS%20p99_ms%2C%20round%28avg%28Duration%29%2F1e6%2C0%29%20AS%20avg_ms%2C%20count%28%29%20AS%20n%20FROM%20otel_traces%20WHERE%20ServiceName%3D%27composition-dynamic-controller%27%20AND%20SpanName%3D%27reconcile%27%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-reconcile-perf",
+   "stage": "phases",
+   "path": "${ (.range // \"6h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"24h\" then \"24%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"6%20HOUR\" end) as $iv | \"/?query=SELECT%20metric%2C%20round%28sum%28dsum%29%2Fnullif%28sum%28dcount%29%2C0%29%2A1000%2C%200%29%20AS%20mean_ms%2C%20sum%28dcount%29%20AS%20samples%20FROM%20%28%20SELECT%20MetricName%20AS%20metric%2C%20ResourceAttributes%5B%27service.instance.id%27%5D%20AS%20sid%2C%20ResourceAttributes%5B%27krateo.io%2Fcomposition-gvr%27%5D%20AS%20gvr%2C%20max%28Sum%29-min%28Sum%29%20AS%20dsum%2C%20max%28Count%29-min%28Count%29%20AS%20dcount%20FROM%20otel_metrics_histogram%20WHERE%20MetricName%20IN%20%28%27unstructured_runtime.reconcile.queue.wait.duration_seconds%27%2C%27unstructured_runtime.reconcile.get.duration_seconds%27%2C%27composition_rbac_generation_duration_seconds%27%2C%27composition_rbac_apply_duration_seconds%27%29%20AND%20TimeUnix%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20metric%2C%20sid%2C%20gvr%20%29%20GROUP%20BY%20metric%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-resource-usage-series",
+   "stage": "usage",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then {iv:\"1%20HOUR\",bk:\"2%20MINUTE\"} elif $r==\"6h\" then {iv:\"6%20HOUR\",bk:\"15%20MINUTE\"} elif $r==\"7d\" then {iv:\"7%20DAY\",bk:\"6%20HOUR\"} else {iv:\"24%20HOUR\",bk:\"1%20HOUR\"} end) as $w | \"/?query=SELECT%20toUnixTimestamp%28t%29%20AS%20ts%2C%20round%28sumIf%28v%2C%20m%3D%27cpu%27%29%2C%202%29%20AS%20cpu_cores%2C%20round%28sumIf%28v%2C%20m%3D%27mem%27%29%2F1073741824%2C%202%29%20AS%20mem_gib%20FROM%20%28%20SELECT%20toStartOfInterval%28TimeUnix%2C%20INTERVAL%20\" + $w.bk + \"%29%20AS%20t%2C%20ResourceAttributes%5B%27k8s.pod.name%27%5D%20AS%20pod%2C%20multiIf%28MetricName%3D%27k8s.pod.cpu.usage%27%2C%27cpu%27%2C%27mem%27%29%20AS%20m%2C%20avg%28Value%29%20AS%20v%20FROM%20otel_metrics_gauge%20WHERE%20MetricName%20IN%20%28%27k8s.pod.cpu.usage%27%2C%27k8s.pod.memory.working_set%27%29%20AND%20TimeUnix%20%3E%20now%28%29%20-%20INTERVAL%20\" + $w.iv + \"%20GROUP%20BY%20t%2C%20pod%2C%20m%20%29%20GROUP%20BY%20ts%20ORDER%20BY%20ts%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-resource-usage",
+   "stage": "pods",
+   "path": "/?query=SELECT%20ns%2C%20pod%2C%20round%28maxIf%28v%2Cm%3D%27cpu%27%29%2A1000%2C0%29%20AS%20cpu_m%2C%20round%28maxIf%28v%2Cm%3D%27mem%27%29%2F1048576%2C0%29%20AS%20mem_mib%20FROM%20%28%20SELECT%20ResourceAttributes%5B%27k8s.namespace.name%27%5D%20AS%20ns%2C%20ResourceAttributes%5B%27k8s.pod.name%27%5D%20AS%20pod%2C%20multiIf%28MetricName%3D%27k8s.pod.cpu.usage%27%2C%27cpu%27%2C%27mem%27%29%20AS%20m%2C%20argMax%28Value%2C%20TimeUnix%29%20AS%20v%20FROM%20otel_metrics_gauge%20WHERE%20MetricName%20IN%20%28%27k8s.pod.cpu.usage%27%2C%27k8s.pod.memory.working_set%27%29%20AND%20TimeUnix%20%3E%20now%28%29%20-%20INTERVAL%205%20MINUTE%20GROUP%20BY%20ns%2C%20pod%2C%20m%20%29%20GROUP%20BY%20ns%2C%20pod%20ORDER%20BY%20mem_mib%20DESC%20LIMIT%2025%20FORMAT%20JSON",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "obs-resource-usage",
+   "stage": "totals",
+   "path": "/?query=SELECT%20round%28sumIf%28v%2Cm%3D%27cpu%27%29%2C1%29%20AS%20cpu_cores%2C%20round%28sumIf%28v%2Cm%3D%27mem%27%29%2F1073741824%2C1%29%20AS%20mem_gib%2C%20countIf%28m%3D%27mem%27%29%20AS%20pods%20FROM%20%28%20SELECT%20ResourceAttributes%5B%27k8s.namespace.name%27%5D%20AS%20ns%2C%20ResourceAttributes%5B%27k8s.pod.name%27%5D%20AS%20pod%2C%20multiIf%28MetricName%3D%27k8s.pod.cpu.usage%27%2C%27cpu%27%2C%27mem%27%29%20AS%20m%2C%20argMax%28Value%2CTimeUnix%29%20AS%20v%20FROM%20otel_metrics_gauge%20WHERE%20MetricName%20IN%20%28%27k8s.pod.cpu.usage%27%2C%27k8s.pod.memory.working_set%27%29%20AND%20TimeUnix%20%3E%20now%28%29-INTERVAL%205%20MINUTE%20GROUP%20BY%20ns%2C%20pod%2C%20m%20%29%20FORMAT%20JSON",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "platform-pins",
+   "stage": "cd",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions/installer",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:observability-page",
+   "ra": "platform-pins",
+   "stage": "installer",
+   "path": "${ \"/apis/composition.krateo.io/\" + .version + \"/namespaces/default/\" + .plural + \"/installer\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "agent",
+   "path": "${ \"/apis/kagent.dev/v1alpha2/namespaces/\" + .namespace + \"/agents/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "models",
+   "path": "/apis/kagent.dev/v1alpha2/modelconfigs",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "peers",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "deployments",
+   "path": "${ \"/apis/apps/v1/namespaces/\" + ((.namespace // \"\") | gsub(\"[^a-zA-Z0-9.-]\"; \"\") | if . == \"\" then \"default\" else . end) + \"/deployments\" }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-detail",
+   "stage": "policies",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaypolicies",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-formdef",
+   "stage": "crd",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/agents.kagent.dev",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-formdef",
+   "stage": "models",
+   "path": "/apis/kagent.dev/v1alpha2/modelconfigs",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-formdef",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-formdef",
+   "stage": "agents",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agent-formdef",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "agents",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "models",
+   "path": "/apis/kagent.dev/v1alpha2/modelconfigs",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "policies",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaypolicies",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-gateway",
+   "stage": "pods",
+   "path": "/api/v1/namespaces/default/pods",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-list",
+   "stage": "agents",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-list",
+   "stage": "models",
+   "path": "/apis/kagent.dev/v1alpha2/modelconfigs",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-list",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-list",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-list",
+   "stage": "policies",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaypolicies",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policies",
+   "stage": "policies",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaypolicies",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policies",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "crd",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/agentgatewaypolicies.agentgateway.dev",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "gateways",
+   "path": "/apis/gateway.networking.k8s.io/v1/gateways",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "services",
+   "path": "/api/v1/namespaces/default/services",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-policy-formdef",
+   "stage": "policies",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaypolicies",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-servers",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-servers",
+   "stage": "agents",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-servers",
+   "stage": "backends",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaybackends",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-servers",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-token-timeseries",
+   "stage": "series",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"6h\" then \"6%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | (if $r==\"1h\" then \"2%20MINUTE\" elif $r==\"6h\" then \"15%20MINUTE\" elif $r==\"7d\" then \"6%20HOUR\" else \"1%20HOUR\" end) as $bk | \"/?query=SELECT%20toUnixTimestamp%28toStartOfInterval%28Timestamp%2C%20INTERVAL%20\" + $bk + \"%29%29%20AS%20t%2C%20count%28%29%20AS%20calls%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.input_tokens%27%5D%29%29%20AS%20input_total%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.output_tokens%27%5D%29%29%20AS%20output_total%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.cache_read.input_tokens%27%5D%29%29%20AS%20cached_total%2C%20round%28avg%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.input_tokens%27%5D%29%29%2C%200%29%20AS%20input_avg%2C%20round%28avg%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.output_tokens%27%5D%29%29%2C%200%29%20AS%20output_avg%20FROM%20otel_traces%20WHERE%20has%28mapKeys%28SpanAttributes%29%2C%20%27gen_ai.usage.input_tokens%27%29%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20t%20ORDER%20BY%20t%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-token-usage",
+   "stage": "usage",
+   "path": "${ (.range // \"24h\") as $r | (if $r==\"1h\" then \"1%20HOUR\" elif $r==\"6h\" then \"6%20HOUR\" elif $r==\"7d\" then \"7%20DAY\" else \"24%20HOUR\" end) as $iv | \"/?query=SELECT%20SpanAttributes%5B%27jwt.sub%27%5D%20AS%20consumer%2C%20SpanAttributes%5B%27team%27%5D%20AS%20team%2C%20SpanAttributes%5B%27gen_ai.request.model%27%5D%20AS%20model%2C%20SpanAttributes%5B%27gen_ai.provider.name%27%5D%20AS%20provider%2C%20count%28%29%20AS%20calls%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.input_tokens%27%5D%29%29%20AS%20input_tokens%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.output_tokens%27%5D%29%29%20AS%20output_tokens%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.reasoning_tokens%27%5D%29%29%20AS%20reasoning_tokens%2C%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.cache_read.input_tokens%27%5D%29%29%20AS%20cached_input_tokens%2C%20round%28100%20%2A%20sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.cache_read.input_tokens%27%5D%29%29%20%2F%20nullIf%28sum%28toUInt64OrZero%28SpanAttributes%5B%27gen_ai.usage.input_tokens%27%5D%29%29%2C%200%29%2C%201%29%20AS%20cache_pct%2C%20round%28avg%28toFloat64OrZero%28SpanAttributes%5B%27agw.ai.time_to_first_token%27%5D%29%29%2C%202%29%20AS%20avg_ttft_s%2C%20countIf%28SpanAttributes%5B%27http.status%27%5D%20%21%3D%20%27200%27%29%20AS%20errors%20FROM%20otel_traces%20WHERE%20has%28mapKeys%28SpanAttributes%29%2C%20%27gen_ai.usage.input_tokens%27%29%20AND%20Timestamp%20%3E%20now%28%29%20-%20INTERVAL%20\" + $iv + \"%20GROUP%20BY%20consumer%2C%20team%2C%20model%2C%20provider%20ORDER%20BY%20input_tokens%20DESC%20LIMIT%2050%20FORMAT%20JSON\" }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-topology",
+   "stage": "agents",
+   "path": "/apis/kagent.dev/v1alpha2/agents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-topology",
+   "stage": "gateways",
+   "path": "/apis/gateway.networking.k8s.io/v1/gateways",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-topology",
+   "stage": "routes",
+   "path": "/apis/gateway.networking.k8s.io/v1/httproutes",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-topology",
+   "stage": "backends",
+   "path": "/apis/agentgateway.dev/v1alpha1/agentgatewaybackends",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal-agents",
+   "ra": "agents-topology",
+   "stage": "servers",
+   "path": "/apis/kagent.dev/v1alpha2/remotemcpservers",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-palette",
+   "stage": "crds",
+   "path": "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-palette",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-palette",
+   "stage": "running",
+   "path": "${ \"/apis/\" + .apiVersion + \"/\" + .plural }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-palette",
+   "stage": "mayListCrds",
+   "path": "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-palette",
+   "stage": "mayListCompdefs",
+   "path": "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-render-draft",
+   "stage": "draft",
+   "path": "${ \"/api/v1/namespaces/\" + .namespace + \"/configmaps/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-render-draft",
+   "stage": "render",
+   "path": "/render",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprint-render",
+   "stage": "render",
+   "path": "/render",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "blueprints-cards",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "compositions-list",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "compositions-list",
+   "stage": "allCompositions",
+   "path": "${ \"/apis/composition.krateo.io/\" + (.version) + \"/\" + (.plural) }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "controller-render-draft",
+   "stage": "draft",
+   "path": "${ \"/api/v1/namespaces/\" + .namespace + \"/configmaps/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "controller-render-draft",
+   "stage": "render",
+   "path": "/render",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "form-options-namespaces",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "kog-oas-operations",
+   "stage": "cm",
+   "path": "${ \"/api/v1/namespaces/\" + .ns + \"/configmaps/\" + .oas }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "kog-oas-operations",
+   "stage": "bp",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions/builder-publish",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "projects",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "projects",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "sidebar-nav",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:portal",
+   "ra": "sidebar-nav",
+   "stage": "pages",
+   "path": "${ \"/apis/widgets.templates.krateo.io/v1beta1/namespaces/\" + .ns + \"/flexes\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:resources-page",
+   "ra": "resource-detail",
+   "stage": "disco",
+   "path": "${ .base }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:resources-page",
+   "ra": "resource-detail",
+   "stage": "object",
+   "path": "${ .path }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "platform-reviews",
+   "stage": "proposals",
+   "path": "/apis/review.krateo.io/v1alpha1/namespaces/default/proposals",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "platform-reviews",
+   "stage": "runs",
+   "path": "/apis/review.krateo.io/v1alpha1/namespaces/default/reviewruns",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "platform-reviews",
+   "stage": "cronjob",
+   "path": "/apis/batch/v1/namespaces/default/cronjobs/nightly-review",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "platform-reviews",
+   "stage": "apis",
+   "path": "/apis",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "platform-reviews",
+   "stage": "kinds",
+   "path": "${ .discovery }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "proposal",
+   "path": "${ \"/apis/review.krateo.io/v1alpha1/namespaces/default/proposals/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "all",
+   "path": "/apis/review.krateo.io/v1alpha1/namespaces/default/proposals",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "apis",
+   "path": "/apis",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "kinds",
+   "path": "${ .discovery }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "bp",
+   "path": "/apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions/builder-publish",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "claim",
+   "path": "${ \"/apis/\" + .apiVersion + \"/namespaces/default/\" + .resource + \"/\" + .claim }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-proposal",
+   "stage": "prs",
+   "path": "/apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-run",
+   "stage": "run",
+   "path": "${ \"/apis/review.krateo.io/v1alpha1/namespaces/default/reviewruns/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-run",
+   "stage": "all",
+   "path": "/apis/review.krateo.io/v1alpha1/namespaces/default/proposals",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-run",
+   "stage": "apis",
+   "path": "/apis",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:reviews-page",
+   "ra": "review-run",
+   "stage": "kinds",
+   "path": "${ .discovery }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "crds",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "comps",
+   "path": "${ \"/apis/composition.krateo.io/\" + (.version) + \"/\" + (.plural) }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "catalog",
+   "path": "/api/v1/namespaces/default/configmaps/blueprints-catalog-index",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "compdefs",
+   "path": "/apis/core.krateo.io/v1alpha1/compositiondefinitions",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "clusters",
+   "path": "/apis/core.krateo.io/v1alpha1/kubernetestargets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:search-page",
+   "ra": "global-search",
+   "stage": "incidents",
+   "path": "/apis/observability.krateo.io/v1alpha1/namespaces/default/incidents",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:service-desk-page",
+   "ra": "ticket-detail",
+   "stage": "ticket",
+   "path": "${ \"/apis/servicedesk.krateo.io/v1alpha1/namespaces/\" + .namespace + \"/tickets/\" + .name }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:service-desk-page",
+   "ra": "ticket-detail",
+   "stage": "object",
+   "path": "${ .path }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "portal@da5f590cd0ab:service-desk-page",
+   "ra": "tickets-list",
+   "stage": "tickets",
+   "path": "/apis/servicedesk.krateo.io/v1alpha1/namespaces/krateo-service-desk/tickets",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-grants",
+   "stage": "bindings",
+   "path": "/apis/rbac.authorization.k8s.io/v1/rolebindings?labelSelector=krateo.io%2Fmanaged-by%3Dportal-access",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-grants",
+   "stage": "roles",
+   "path": "/apis/rbac.authorization.k8s.io/v1/roles?labelSelector=krateo.io%2Fmanaged-by%3Dportal-access",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "userinfo",
+   "path": "/apis/basic.authn.krateo.io/v1alpha1/users",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_viewCompositions",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_createCompositions",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_deleteCompositions",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_viewBlueprints",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_installBlueprints",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_viewSecrets",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_viewEvents",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_registerClusters",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_viewRbac",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "access-preview",
+   "stage": "sar_grantAccess",
+   "path": "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "audit-log",
+   "stage": "audits",
+   "path": "/apis/audit.krateo.io/v1alpha1/namespaces/default/auditrecords",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "settings-users",
+   "stage": "basicUsers",
+   "path": "/apis/basic.authn.krateo.io/v1alpha1/users",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "portal@da5f590cd0ab:settings-page",
+   "ra": "settings-users",
+   "stage": "grantBindings",
+   "path": "/apis/rbac.authorization.k8s.io/v1/rolebindings?labelSelector=krateo.io%2Fmanaged-by%3Dportal-access",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:examples/cluster-namespaces/manifest.yaml",
+   "ra": "cluster-namespaces",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces?limit=15",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:examples/external-api/manifest.yaml",
+   "ra": "httpbin",
+   "stage": "one",
+   "path": "/get?name=Alice&email=alice@example.com&age=30&uid=AA-BB-CC",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:examples/external-api/manifest.yaml",
+   "ra": "httpbin",
+   "stage": "two",
+   "path": "/post",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/pagination/restaction-list-pods.yaml",
+   "ra": "list-pods",
+   "stage": "pods",
+   "path": "${ \"/api/v1/namespaces/demo-system/pods\" }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/cluster-pods.yaml",
+   "ra": "cluster-pods",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces?limit=10",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/cluster-pods.yaml",
+   "ra": "cluster-pods",
+   "stage": "pods",
+   "path": "${ \"/api/v1/namespaces/\" + (.) + \"/pods\" }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/extras.yaml",
+   "ra": "httpbin-extras",
+   "stage": "one",
+   "path": "${ \"/get?name=\" + (.name) + \"&email=\" + (.email) + \"&age=\" + (.age|tostring) + \"&uid=\" + (.uid) }",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/extras.yaml",
+   "ra": "httpbin-extras",
+   "stage": "two",
+   "path": "/post",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/github.yaml",
+   "ra": "github",
+   "stage": "all",
+   "path": "/repos/krateoplatformops/snowplow/actions/runs?per_page=2",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/github.yaml",
+   "ra": "github",
+   "stage": "jobs",
+   "path": "${ \"/repos/krateoplatformops/snowplow/actions/runs/\" + (.id|tostring) + \"/timing\" }",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/httpbin.yaml",
+   "ra": "httpbin",
+   "stage": "one",
+   "path": "/get?name=Alice&email=alice@example.com&age=30&uid=AA-BB-CC",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/httpbin.yaml",
+   "ra": "httpbin",
+   "stage": "two",
+   "path": "/post",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/kube-get.yaml",
+   "ra": "kube-get",
+   "stage": "pods",
+   "path": "/api/v1/namespaces/kube-system/pods",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/kube-get.yaml",
+   "ra": "kube-get",
+   "stage": "get",
+   "path": "${ \"/api/v1/namespaces/kube-system/pods/\" + (.) }",
+   "endpointRef": false,
+   "iterator": true
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/namespaces.yaml",
+   "ra": "cluster-namespaces",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces?limit=15",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/typicode.yaml",
+   "ra": "typicode",
+   "stage": "users",
+   "path": "/users",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/restactions/typicode.yaml",
+   "ra": "typicode",
+   "stage": "todos",
+   "path": "${ \"/todos?userId=\" + (.id|tostring) }",
+   "endpointRef": true,
+   "iterator": true
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.extras.apiref.yaml",
+   "ra": "extras-namespace-by-name",
+   "stage": "ns",
+   "path": "${ \"/api/v1/namespaces/\" + .nsName }",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.restaction.simple.yaml",
+   "ra": "httpbin-simple",
+   "stage": "one",
+   "path": "/get?label=Hello+World&icon=fa-earth-europe",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.with-api-and-jq-module.yaml",
+   "ra": "httpbin-simple",
+   "stage": "one",
+   "path": "/get?label=Hello+World&icon=fa-earth-europe",
+   "endpointRef": true,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.with.resourcesrefstemplate.yaml",
+   "ra": "cluster-namespaces",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.with.resourcesrefstemplate_ex.yaml",
+   "ra": "cluster-pods",
+   "stage": "namespaces",
+   "path": "/api/v1/namespaces?limit=10",
+   "endpointRef": false,
+   "iterator": false
+  },
+  {
+   "source": "snowplow:go/snowplow/testdata/widgets/button.with.resourcesrefstemplate_ex.yaml",
+   "ra": "cluster-pods",
+   "stage": "pods",
+   "path": "${ \"/api/v1/namespaces/\" + (.) + \"/pods\" }",
+   "endpointRef": false,
+   "iterator": true
+  }
+ ]
+}
