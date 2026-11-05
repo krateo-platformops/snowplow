@@ -69,6 +69,8 @@ type jsonHandlerOptions struct {
 	// LIST or a GET by name (servedOK false for a path that names none). The
 	// response's items are objects of it, and the userAccessFilter refilter
 	// checks an object of a checked resource on that resource alone (#1124).
+	// It is the resource served because the plan holds no own-cluster path
+	// the apiserver reads differently from how it is written (#1137).
 	served   schema.GroupResource
 	servedOK bool
 	// stageFailed records a failure of this stage that is still SERVED (#651:
