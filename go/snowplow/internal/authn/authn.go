@@ -69,7 +69,7 @@ func New(server, tokenPath string) *Client {
 		tokenPath: tokenPath,
 		// #723/#724: this client presents snowplow's projected SA token; it
 		// never follows a redirect (a same-host redirect would re-send it).
-		httpClient: credhttp.Client(&http.Client{Timeout: 30 * time.Second}),
+		httpClient: credhttp.CountConnectionsOn(credhttp.EgressAuthn, credhttp.Client(&http.Client{Timeout: 30 * time.Second})),
 		now:        time.Now,
 	}
 }

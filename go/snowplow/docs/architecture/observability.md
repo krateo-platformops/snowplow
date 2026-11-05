@@ -424,6 +424,28 @@ branch and bumps `completed_total` too — so raw `completed/s` **over-estimates
 dequeue read no longer contaminates `miss_total`, so `miss_total` is miss-neutral and the
 refresher's own skip counter is the independent, #376-surviving source.
 
+### Egress connections: new vs reused (#847)
+Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egress_connections_total` (`{"<egress>": {"<protocol>": {"new": n, "reused": n}}}`), mirrored to OTLP under the same name with attributes `egress`, `protocol`, `connection`, hand-wired in `metrics.go`. All 24 cells exist from the start.
+
+**Read the share `reused / (new + reused)`, per egress and protocol, not a latency:** a latency moves with load. A new connection costs a TCP connect and, on https, a TLS handshake.
+
+| label | values | meaning |
+|---|---|---|
+| `egress` | `stage`, `call` | the RESTAction branch-E fetch and the `/call` passthrough: every request through `credhttp.Send`, a write included. A stage that reads through a `*rest.Config` instead counts under `apiserver` |
+| | `apiserver` | every client-go client (every `*rest.Config` `credhttp.Harden` returned) |
+| | `authn`, `rum_forward` | the authn login and the browser-span forwarder |
+| | `other` | a name outside the set. No caller sends one, so anything here is a bug. It keeps the set closed |
+| `protocol` | `http1`, `http2` | what the connection negotiated. One egress can carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster `http://` service over HTTP/1 |
+| `connection` | `new` | the connection had carried no request before this one |
+| | `reused` | it had. On HTTP/2 that is every stream after a connection's first |
+
+One count is one connection handed to a request, not one request: a request `net/http` retries by itself after a pooled connection turned out dead counts one `reused` and one `new`. A dial whose connection nobody used is not counted. No label carries a host, a path, an identity or a status.
+
+Reading it:
+- `apiserver/http2` stays near 100% on any toolchain. It is the control of a paired run.
+- `call` reads a share near 0 by construction: `credhttp.Do` builds a client per call, so only a retry inside one call can reuse a connection. That is not something a toolchain changes.
+- Before Go 1.27, a body closed before its end loses an HTTP/1 connection. From Go 1.27 the transport drains it in the background, up to 256 KiB or 50 ms, and keeps the connection, so `stage/http1` and `authn/http1` are where the bump shows. A body over 256 KiB, or a request sent before the drain ends, still takes a new connection, so a share below 100% is not by itself a defect.
+
 ### Customer resolve-path in-flight (#386 M3)
 Defined in `internal/handlers/dispatchers/customer_inflight_metrics.go`.
 

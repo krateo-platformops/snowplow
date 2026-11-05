@@ -126,11 +126,18 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 //
 // #1115 — and the customer page budget (BudgetTransport, budget.go): a round
 // trip of a request that carries one runs under its deadline.
+//
+// #847 — and its connections count under EgressAPIServer (connections.go).
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
 		// #1054 — innermost: every attempt (a client-go 429 retry included)
 		// is recorded on the slow-call record of the request that sent it.
 		rc.Wrap(slowcall.Transport)
+		// #847 — new vs reused connections. Inside the budget and the hop
+		// refusal: a request either of them stops takes no connection anyway.
+		rc.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return countConnectionsTransport(EgressAPIServer, rt)
+		})
 		// #1115 — the customer page budget: a round trip of a request that
 		// carries one runs under its deadline.
 		rc.Wrap(BudgetTransport)

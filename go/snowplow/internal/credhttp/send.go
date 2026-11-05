@@ -95,7 +95,11 @@ func SafeMethod(method string) bool {
 // #1115 — a request that carries a customer page budget (pagebudget) is sent
 // inside it instead: sendBudgeted (safe methods) or sendOnceBudgeted (writes).
 // A request without one (background work) keeps the path below, unchanged.
+//
+// #847 — every connection this request takes counts under site, on every path
+// below, a write's included (connections.go).
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	req = req.WithContext(countConnections(req.Context(), site))
 	// #1106 — no redirect hop leaves the origin this request is sent to,
 	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
 	// cli (a wire dump, a plumbing-built chain) can displace it; the budgeted

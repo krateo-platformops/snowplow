@@ -1648,12 +1648,18 @@ func registerListQueryInstrument(m metric.Meter) error {
 
 // registerEndpointDialInstruments hand-wires #1088's endpoint-dial surfaces
 // onto OTLP (no expvar->OTLP bridge), from the accessors their expvar closures
-// read: every retry by site and cause, and the stage fetch's per-identity
-// client cache. site and cause are closed, code-defined sets. Registered only
-// when the cache is on (CFG-1), like their expvar keys.
+// read: every retry by site and cause, the stage fetch's per-identity client
+// cache, and #847's new vs reused connections by egress and protocol. Every
+// label is a closed, code-defined set. Registered only when the cache is on
+// (CFG-1), like their expvar keys.
 func registerEndpointDialInstruments(m metric.Meter) error {
 	retries, err := m.Int64ObservableCounter("snowplow_endpoint_retries_total",
 		metric.WithDescription("HTTP attempts re-sent by an endpoint dial's retry loop (plumbing RetryClient), one per retry, by site {stage = RESTAction branch-E fetch, call = /call passthrough} and cause, the outcome of the attempt it replaces {dns, dial (TCP connect failed), tls_handshake, connection (any other error with no response), status_429, status_5xx, other}. A write is never re-sent, so it never counts here. Each retry also logs one WARN with the failed attempt's duration. #1088."))
+	if err != nil {
+		return err
+	}
+	connections, err := m.Int64ObservableCounter("snowplow_egress_connections_total",
+		metric.WithDescription("Connections handed to outbound requests, by egress {stage = RESTAction branch-E fetch, call = /call passthrough, apiserver = every client-go client, authn = the authn service login, rum_forward = the browser-span forwarder, other}, protocol {http1, http2} and connection {new = it had carried no request before, reused = it had}. Read the share reused / (new + reused), per egress and protocol: unlike a latency it does not move with load. On HTTP/2 every stream after a connection's first counts as reused. A new connection costs a TCP connect and, on https, a TLS handshake. #847."))
 	if err != nil {
 		return err
 	}
@@ -1698,12 +1704,16 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 			o.ObserveInt64(retries, int64(c.Count), metric.WithAttributes(
 				attribute.String("site", c.Site), attribute.String("cause", c.Cause)))
 		}
+		for _, c := range credhttp.EgressConnectionsSnapshot() {
+			o.ObserveInt64(connections, int64(c.Count), metric.WithAttributes(
+				attribute.String("egress", c.Egress), attribute.String("protocol", c.Protocol), attribute.String("connection", c.Connection)))
+		}
 		n, b, e := restactionsapi.StageEndpointClientsStats()
 		o.ObserveInt64(clients, int64(n))
 		o.ObserveInt64(builds, int64(b))
 		o.ObserveInt64(evictions, int64(e))
 		return nil
-	}, retries, clients, builds, evictions)
+	}, retries, connections, clients, builds, evictions)
 	return err
 }
 

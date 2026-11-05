@@ -209,6 +209,10 @@ var closedAttributeKeys = map[string]struct{}{
 	// pinned to their producers by metrics_448_security_otlp_test.go and
 	// dispatchers' identity_class_drift_closed_sets_test.go.
 	"site": {}, "bound": {},
+	// #847 — snowplow_egress_connections_total: egress, protocol and connection
+	// are the closed credhttp.Egresses, ConnProtocols and ConnStates, pinned by
+	// credhttp's TestConnections847_LabelSetIsClosed.
+	"egress": {}, "protocol": {}, "connection": {},
 	// #643 background-pass detectors: kind is the closed prewarm scope-kind
 	// enum {boot, gvr-discovered, keepwarm, rbac-shift, learned-class}, pinned
 	// by metrics_643_prewarm_pass_otlp_test.go; origin is {background, request}
