@@ -2035,7 +2035,8 @@ s_evaluate() {
   # can land mid-evaluate; the teardown's evaluate is never held
   if [[ "${BENCH_606_HOLD_IN:-}" == "evaluate" && "${IN_TEARDOWN:-0}" != "1" ]]; then
     log "test hold inside evaluate"
-    sleep 60 & wait "$!" || true
+    # a bounded call like any other, so a stop mid-hold leaves no sleep behind (#1170)
+    bounded 60 sleep 60 || true
   fi
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
