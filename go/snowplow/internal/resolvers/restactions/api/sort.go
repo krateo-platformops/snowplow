@@ -6,6 +6,20 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
+// topologicalSort is the order a RESTAction's stages run in (the resolve's stage
+// loop and the inspect walk): first every stage with no dependency, in declared
+// order, then each dependent as it becomes ready, first ready first.
+//
+// #1152 — the first queue used to be read out of a Go map, so independent stages
+// ran in a different order from one resolve to the next: which stage spent the
+// page's budget, which failure the resolve reported, and the order of records
+// under a shared errorKey all changed between identical requests. Only that
+// randomness is gone: every order this returns is one the map could have
+// produced, so no stage runs earlier relative to the independent stages than it
+// could before.
+//
+// A dependency cycle, or a dependency on a stage the spec does not declare, is an
+// error. A name declared twice is one stage.
 func topologicalSort(items []*templates.API) ([]string, error) {
 	graph := make(map[string][]string)
 	inDegree := make(map[string]int)
@@ -25,9 +39,11 @@ func topologicalSort(items []*templates.API) ([]string, error) {
 	}
 
 	var queue []string
-	for item := range itemSet {
-		if inDegree[item] == 0 {
-			queue = append(queue, item)
+	queued := make(map[string]bool, len(itemSet))
+	for _, item := range items {
+		if inDegree[item.Name] == 0 && !queued[item.Name] {
+			queued[item.Name] = true
+			queue = append(queue, item.Name)
 		}
 	}
 

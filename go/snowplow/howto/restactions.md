@@ -94,6 +94,20 @@ Useful for chaining calls where one must complete before another.
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
 
+**Stages run one at a time, in a fixed order.** First every stage with no
+`dependsOn`, in the order you declare them. Then each stage with a `dependsOn`,
+once its dependency has run, in the order they became ready. The same spec always
+runs the same way.
+
+`dependsOn` decides order, not success: a read stage still runs when its
+dependency failed, and reads the missing value. Only a write stage is withheld
+when its dependency failed or was skipped (see below). A stage that reads another
+stage's result should declare `dependsOn` on it.
+
+Stages share the page's time budget, so a stage that stalls spends it for the
+stages after it, and a stage that starts after the budget ran out fails with
+`Timeout`. A stage with no `dependsOn` runs ahead of every stage that has one.
+
 ### Resolving a referenced `RESTAction`/`Widget` in-process
 
 A stage may reference **another `RESTAction` or `Widget`** by pointing its
