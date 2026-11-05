@@ -149,7 +149,7 @@ func limiterWrites(n ast.Node) []*ast.SelectorExpr {
 // allowed: (module-relative file, enclosing func, reference) → reason.
 // "http.Client{}" stands for a composite literal of net/http.Client.
 var allowed = map[[3]string]string{
-	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "request.HTTPClientForEndpoint"}: "endpoint client; its single caller httpClientForEndpoint applies credhttp.Client by provenance (SA dial / held credential). A named endpointRef carries its own credential and keeps the default redirect behaviour.",
+	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "request.HTTPClientForEndpoint"}: "endpoint client; its single caller httpClientForEndpoint applies credhttp.Client by provenance (SA dial / held credential). A named endpointRef carries its own credential; credhttp.Send, through which every endpoint request leaves, refuses any redirect hop to another origin (#1106).",
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "transport.New"}:                 "same as above",
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "http.Client{}"}:                 "same as above",
 }

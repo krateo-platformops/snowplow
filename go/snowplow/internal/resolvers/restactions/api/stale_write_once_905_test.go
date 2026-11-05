@@ -36,7 +36,7 @@ func TestStale905_F5_ASentWriteRefusesTheStaleServeAtTheDecision(t *testing.T) {
 	release := HoldStaleDebtRefillsForTest()
 	t.Cleanup(release)
 
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-905"), "dep-905", "restactions")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-905"), "dep-905", "restactions", "")
 	// The parallel nested item's write: begun after this read passed
 	// staleServeEligible, before the decision.
 	if !sink.BeginWrite() {
@@ -54,7 +54,7 @@ func TestStale905_F5_ASentWriteRefusesTheStaleServeAtTheDecision(t *testing.T) {
 	}
 
 	// Control: with no write sent, the same decision serves stale.
-	ctx2, sink2 := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-905c"), "dep-905c", "restactions")
+	ctx2, sink2 := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-905c"), "dep-905c", "restactions", "")
 	if _, served := serveStaleWithDebt(ctx2, sink2, f.store, f.contentKey, fill710ListCall(), "", cache.DepKey{}); !served {
 		t.Fatal("PRE (control): a known-stale read with no write sent must be served stale — else F5 is vacuous")
 	}
@@ -70,7 +70,7 @@ func TestStale905_N1_ANestedWriteIsDecidedOnTheRequestSink(t *testing.T) {
 		ext, extDials := upstream410(t)
 		env410(t, api.URL, ext.URL)
 		// The customer request: its L1 key scoped, its D2 sink on it.
-		ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(ctxWithUser(user410, group410), "outer"), "outer", "restactions")
+		ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(ctxWithUser(user410, group410), "outer"), "outer", "restactions", "")
 		if servedStale && !sink.NoteIfNoWrite("content-c") {
 			t.Fatal("PRE: the request's stale serve must be noted")
 		}

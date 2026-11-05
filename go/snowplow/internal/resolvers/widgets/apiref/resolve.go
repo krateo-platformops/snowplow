@@ -227,23 +227,33 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// declaration is visible at all. Bumping here makes the sink non-empty for the
 	// whole enclosing widget resolve, so the widget's Put declines.
 	//
-	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
-	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
-	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
-	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
-	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
-	// the ONLY one, which leaves the nested-chain case open — the blindness is
-	// asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package,
-	// and the refilter's own marking by TestA4_RefilterBumpsUAFTouchedSink in
-	// internal/resolvers/restactions/api. The two bumps are COMPLEMENTARY, not
-	// duplicates, and both are wanted:
+	// THE DECLARATION LIMB, ONE OF TWO. The refilter has its own,
+	// execution-based bump (cache.BumpUAFTouched at the top of
+	// applyUserAccessFilterOnPig, internal/resolvers/restactions/api/refilter.go;
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under). Both shipped
+	// in 1.12.3 (PR #173). The nested-chain case — a parent RA that declares
+	// nothing but consumes a UAF child — is invisible to THIS bump (pinned by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package). What
+	// covers it depends on the shape:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under the outer resolve's ctx, so the refilter's bump
+	//     marks the outer sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call — TestM1's
+	//     fixture shape): the child is a separate request and the refilter's
+	//     bump marks only that request's sink. The outer Put is declined by the
+	//     external-touched gate instead (the dial bumps the ExternalTouchedSink),
+	//     except for a widget that opts into
+	//     krateo.io/external-cache-ttl-seconds, whose verdict turns an
+	//     external-only decline into a store.
+	// The two UAF bumps are COMPLEMENTARY, not duplicates, and both are wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
 	//     empty result set still means the body is requester-dependent), and even
 	//     if a future short-circuit skips the refilter for some input.
-	//   - THEIR bump is execution-based and fires wherever a refilter actually
-	//     runs, including chains this frame never sees (a nested RA→RA hop that
-	//     does not pass through apiref).
+	//   - THE REFILTER'S bump is execution-based and fires wherever a refilter
+	//     actually runs under this ctx, including an in-process nested RA→RA
+	//     hop that does not pass through apiref.
 	// Double-bumping is harmless: the gate reads Count()>0, never an exact count.
 	//
 	// No-op when no sink is installed on ctx (BumpUAFTouched is nil-safe), so
@@ -280,8 +290,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// reaches the page-keyed resolve of the requested page.
 			Cursor: opts.Cursor,
 		}
-		if _, rerr := restactions.Resolve(rctx, raopts); rerr != nil {
+		_, tree, exact, rerr := restactions.ResolveStatusTree(rctx, raopts)
+		if rerr != nil {
 			return nil, nil, rerr
+		}
+		// #1079 — the RESTAction's filter output is already a Go tree; the
+		// bytes in Status.Raw were encoded from it a moment ago. When the tree
+		// is exactly what decoding those bytes yields, take it instead of
+		// re-parsing them (on run 20's refresher that decode was ~12% of all
+		// CPU). Otherwise decode, as always.
+		if exact {
+			return tree, local.Status.Raw, nil
 		}
 		return rawExtensionToMapEncoded(local.Status)
 	}

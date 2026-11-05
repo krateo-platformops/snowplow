@@ -186,7 +186,7 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"content hit, gated: gateListItems(parseListEnvelope(stored with metadata))",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", parsed(t))
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", "", parsed(t))
 				if gerr != nil {
 					t.Fatal("not served")
 				}
@@ -194,7 +194,7 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"rebuild: gateListEnvelope(stored with metadata)",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, gerr := gateListEnvelope(ctx, f1WidgetsGVR, "", stored)
+				v, gerr := gateListEnvelope(ctx, f1WidgetsGVR, "", "", stored)
 				if gerr != nil {
 					t.Fatal("not served")
 				}
@@ -210,7 +210,7 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"cluster-list collapse, gated (stored with metadata)",
 			[]string{"api.validateClusterListShape", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", cluster(t))
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", "", cluster(t))
 				if gerr != nil {
 					t.Fatal("not served")
 				}

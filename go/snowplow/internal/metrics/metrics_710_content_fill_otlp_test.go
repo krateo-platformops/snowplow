@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -134,7 +135,7 @@ func TestIssue710_StaleServeSeriesReachOTLP(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	restactionsapi.ResetStaleServeForTest()
 	t.Cleanup(restactionsapi.ResetStaleServeForTest)
-	t.Cleanup(func() { restactionsapi.SetStaleToPushRecorder(nil) })
+	t.Cleanup(func() { cache.SetStaleToPushRecorder(nil) })
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

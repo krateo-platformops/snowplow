@@ -396,7 +396,7 @@ func TestIssue920_BehaviouralTestCoversEveryCredhttpBuilder(t *testing.T) {
 	if got, want := strings.Join(clients, ","), "APIExtensions,Discovery,Dynamic,Kubernetes,Metadata,RESTClient"; got != want {
 		t.Errorf("client builders classified %q, want %q", got, want)
 	}
-	if got, want := strings.Join(cfgs, ","), "Harden,InClusterConfig,NewClientConfig"; got != want {
+	if got, want := strings.Join(cfgs, ","), "BindRequestBudget,Harden,InClusterConfig,NewClientConfig"; got != want {
 		t.Errorf("config builders classified %q, want %q", got, want)
 	}
 	// And the reverse: no stale entry in clientBuilders.

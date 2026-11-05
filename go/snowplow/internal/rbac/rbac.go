@@ -61,7 +61,10 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return allowed
 	}
 
-	return userCanViaSAR(ctx, opts)
+	// #1046 — the review asks about the request the apiserver would see,
+	// built by the same ObjectCheck as the in-process path: the object's
+	// name rides along iff the verb names a single object.
+	return selfSubjectAccessReview(ctx, ObjectCheck("", nil, opts.Verb, opts.target()))
 }
 
 // sarClientsetForEndpoint builds the per-user kubernetes clientset the
@@ -79,10 +82,13 @@ var sarClientsetForEndpoint = func(ctx context.Context, ep endpoints.Endpoint) (
 	return credhttp.Kubernetes(rc)
 }
 
-// userCanViaSAR is the upstream cache=off correctness baseline. It
-// MUST be reachable only when cache.Disabled() == true — any cache=on
-// call here is a Revision 1 binding violation (rollback trigger).
-func userCanViaSAR(ctx context.Context, opts UserCanOptions) (ok bool) {
+// selfSubjectAccessReview is the upstream cache=off correctness baseline:
+// it asks the apiserver, with the requester's own credential, about exactly
+// the attributes of check (its Username and Groups are not sent — the
+// credential names the requester). It MUST be reachable only when
+// cache.Disabled() == true — any cache=on call here is a Revision 1 binding
+// violation (rollback trigger).
+func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok bool) {
 	log := xcontext.Logger(ctx)
 
 	ep, err := xcontext.UserConfig(ctx)
@@ -97,11 +103,6 @@ func userCanViaSAR(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return false
 	}
 
-	// #1046 — the review asks about the request the apiserver would see, built
-	// by the same ObjectCheck as the in-process path: the object's name rides
-	// along iff the verb names a single object, so a resourceNames-scoped
-	// grant is answered here exactly as it is with the cache on.
-	check := ObjectCheck("", nil, opts.Verb, opts.target())
 	selfCheck := authv1.SelfSubjectAccessReview{
 		Spec: authv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authv1.ResourceAttributes{
@@ -115,7 +116,7 @@ func userCanViaSAR(ctx context.Context, opts UserCanOptions) (ok bool) {
 	}
 
 	resp, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().
-		Create(context.TODO(), &selfCheck, metav1.CreateOptions{})
+		Create(ctx, &selfCheck, metav1.CreateOptions{}) // #1115: the request's page budget
 	if err != nil {
 		log.Error("unable to perform SelfSubjectAccessReviews",
 			slog.Any("selfCheck", selfCheck), slog.Any("err", err))

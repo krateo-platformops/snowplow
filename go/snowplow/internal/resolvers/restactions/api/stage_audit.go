@@ -69,6 +69,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
@@ -80,13 +81,11 @@ const stageAuditAction = "restaction"
 // resolver: the audit trail (#902), the background-write refusal (#903), the
 // dependent-write rule (#904) and the stale-pass hold (#905) all read it
 // (isWriteVerb, write_verb.go). The empty method is classified as it is sent:
-// net/http sends "" as GET.
+// net/http sends "" as GET. #1088: it is credhttp.SafeMethod, which the
+// endpoint send policy reads too (a write is sent once), so "is this a write"
+// has one answer at the resolver and at the transport.
 func isSafeMethod(verb string) bool {
-	switch strings.ToUpper(verb) {
-	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-		return true
-	}
-	return false
+	return credhttp.SafeMethod(verb)
 }
 
 // stageAuditEvent builds the record for one write-verb stage dial whose
@@ -121,7 +120,7 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 	// may be any HTTP API: nothing of its path is recorded.
 	apiServerObject := false
 	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
-		path, query, _ := strings.Cut(call.Path, "?")
+		path, query, _ := splitPathQuery(call.Path) // as the apiserver receives it (#1073 F1)
 		// #957 — a stage may ask the apiserver for a dry run in its path
 		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
 		// persisted: the record says so and names no written object.

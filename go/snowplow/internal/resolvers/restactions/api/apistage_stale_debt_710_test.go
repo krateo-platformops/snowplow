@@ -125,8 +125,15 @@ func newD2Fixture(t *testing.T) *d2Fixture {
 // customer reads the list as a customer of an ARMABLE resolve producing l1Key.
 func (f *d2Fixture) customer(t *testing.T, l1Key string) (any, *cache.StaleServeSink) {
 	t.Helper()
+	return f.customerAs(t, l1Key, "")
+}
+
+// customerAs is customer for the requester subject (#1062: the D2 sink carries
+// it to the stale-push ledger, which pairs the serve with that user's stream).
+func (f *d2Fixture) customerAs(t *testing.T, l1Key, subject string) (any, *cache.StaleServeSink) {
+	t.Helper()
 	// As the dispatchers do: the L1 key is scoped first, then the sink on it.
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), l1Key), l1Key, "restactions", subject)
 	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
 		t.Fatalf("customer read not served: ok=%v served=%v err=%v", ok, s, err)
@@ -144,6 +151,36 @@ func (f *d2Fixture) putDependent(l1Key string) {
 	_, unsub := cache.SubscribeRefresh(map[string]struct{}{l1Key: {}})
 	f.unsubs = append(f.unsubs, unsub)
 	f.storeAndCommit(l1Key)
+}
+
+// d2WrittenStream arms a /refreshes stream for l1Key and WRITES every frame it
+// is offered as the handler does (refreshes.go writeRefreshFrame: the frame,
+// then stream.Wrote), forwarding the key afterwards. #1062: stale_to_push ends
+// at the write, not at the offer.
+func d2WrittenStream(t *testing.T, l1Key string) <-chan string {
+	t.Helper()
+	return d2WrittenStreamAs(t, "", l1Key)
+}
+
+// d2WrittenStreamAs is d2WrittenStream for the stream of subject.
+func d2WrittenStreamAs(t *testing.T, subject, l1Key string) <-chan string {
+	t.Helper()
+	st := cache.SubscribeRefreshStreamAs(subject, map[string]struct{}{l1Key: {}})
+	out := make(chan string, 64)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case k := <-st.Keys:
+				st.Wrote(k)
+				out <- k
+			}
+		}
+	}()
+	t.Cleanup(func() { close(done); st.Unsub() })
+	return out
 }
 
 // storeAndCommit is putDependent without the tab (D2-16: the tab arms late).
@@ -212,8 +249,9 @@ func TestStale710_D2_1_KnownStaleArmableHitIsServedStaleAndItsDebtFills(t *testi
 
 func TestStale710_D2_2_FillCommitPushesTheArmedDependent(t *testing.T) {
 	f := newD2Fixture(t)
-	keys, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-2": {}})
-	defer unsub()
+	// #1062 — the tab's frames are WRITTEN (the handler's contract): the
+	// stale_to_push sample is taken at the write of the replacing frame.
+	keys := d2WrittenStream(t, "dep-2")
 	f.customer(t, "dep-2")
 	f.putDependent("dep-2")
 	d2Push(t, keys, "dep-2", 10*time.Second)
@@ -221,7 +259,10 @@ func TestStale710_D2_2_FillCommitPushesTheArmedDependent(t *testing.T) {
 		t.Fatalf("D2-2: the stale-derived dependent was not re-resolved")
 	}
 	// The handler's own publish may arrive first; the debt lane's push follows.
-	fill710WaitFor(5*time.Second, func() bool { return StaleServeStatsSnapshot().PushTotal == 1 })
+	fill710WaitFor(5*time.Second, func() bool {
+		s := StaleServeStatsSnapshot()
+		return s.PushTotal == 1 && s.ToPush.Count == 1
+	})
 	s := StaleServeStatsSnapshot()
 	if s.PushTotal != 1 || s.ToPush.Count != 1 || s.ToPush.MaxMS > staleMaxMS {
 		t.Fatalf("D2-2: push_total=%d to_push=%+v", s.PushTotal, s.ToPush)
@@ -282,7 +323,7 @@ func TestStale710_D2_5b_NonArmableReadReadsThroughFreshWithNoDebt(t *testing.T) 
 // debt's own dependent re-resolve would read back as fresh.
 func TestStale710_D2_18_ASubstrateFillUnderAnArmableResolveReadsThrough(t *testing.T) {
 	f := newD2Fixture(t)
-	ctx, _ := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-15"), "dep-15", "widgets")
+	ctx, _ := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-15"), "dep-15", "widgets", "")
 	ctx = cache.WithL1KeyContext(ctx, "ra-full-list-15")
 	v, s, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false)
 	if err != nil || !ok || !s {
@@ -482,9 +523,12 @@ func serveParsedListEnvelopeValue(p parsedListEnvelope) any {
 // tab showed the stale body until it — so stale_to_push records it (emit −
 // servedAt), and the late arm's ≥12 s lands in the histogram (count +1, max ≥
 // 12000 ms). A publish-time-only record would drop the slowest corrections.
+// #1062: the sample is taken when the handler WRITES the arm-time frame (the
+// ledger clock is seamed 12 s on), and 12 s is past the 10 s max: the serve is
+// counted unreplaced once.
 // Mutation → RED: no owed mark (Commit without MarkStaleOwed), no emit at arm
 // (SubscribeRefreshStream's owed loop removed), or no stale_to_push record at
-// the arm-time emit.
+// the arm-time frame's write.
 func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 	f := newD2Fixture(t)
 	f.customer(t, "dep-16")
@@ -505,10 +549,8 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 		t.Fatalf("PRECONDITION: stale_to_push recorded %d sample(s) for a publish that reached no tab", tp0.Count)
 	}
 	base := time.Now()
-	setStaleClockForTest(func() time.Time { return base.Add(12 * time.Second) })
-	t.Cleanup(func() { setStaleClockForTest(nil) })
-	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-16": {}})
-	defer unsub()
+	t.Cleanup(cache.SetStalePushClockForTest(func() time.Time { return base.Add(12 * time.Second) }))
+	ch := d2WrittenStream(t, "dep-16")
 	d2Push(t, ch, "dep-16", time.Second)
 	if cache.StaleOwed("dep-16") {
 		t.Fatalf("D2-16: the owed mark survived its arm-time delivery")
@@ -520,6 +562,43 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 	if st.ToPush.Count != tp0.Count+1 || st.ToPush.MaxMS < 12000 {
 		t.Fatalf("D2-16 RED (F2): the arm-time correction must be recorded on stale_to_push (count %d→%d, max %d ms, want +1 and ≥ 12000)",
 			tp0.Count, st.ToPush.Count, st.ToPush.MaxMS)
+	}
+	for _, l := range cache.StalePushStatsSnapshot() {
+		if l.Layer == cache.StaleLayerAPIStage && (l.Unreplaced != 1 || l.Closes["pushed"] != 1 || l.Open != 0) {
+			t.Fatalf("D2-16 (#1062): apistage unreplaced=%d pushed=%d open=%d, want 1/1/0 (a 12 s push is past the 10 s max)",
+				l.Unreplaced, l.Closes["pushed"], l.Open)
+		}
+	}
+}
+
+// D2-16s — #1062 (re-review P9): the D2 sink carries its REQUESTER to the
+// stale-push ledger. A committed apistage serve of user X, with X's own stream
+// armed: the replacement's frame written on X's stream closes X's serve (one
+// sample, nothing open). Cross-user isolation itself is pinned by the cache
+// arms (RX2, NSX); this arm pins the propagation from the sink. (A stream of
+// another user cannot be shown not to close it here: any arm or delivery of the
+// key consumes the per-KEY D2 owed mark — the per-client owed push is #1081.)
+// Mutation → RED: the sink's Commit opens the serve without the subject.
+func TestStale710_D2_16s_TheCommittedServeIsPairedWithItsRequestersStream(t *testing.T) {
+	f := newD2Fixture(t)
+	const x = "user:d2-16s"
+	mine := d2WrittenStreamAs(t, x, "dep-16s")
+	f.customerAs(t, "dep-16s", x)
+	f.storeAndCommit("dep-16s")
+	d2Push(t, mine, "dep-16s", 10*time.Second)
+	apistage := func() cache.StalePushLayerStats {
+		for _, l := range cache.StalePushStatsSnapshot() {
+			if l.Layer == cache.StaleLayerAPIStage {
+				return l
+			}
+		}
+		return cache.StalePushLayerStats{}
+	}
+	if !fill710WaitFor(10*time.Second, func() bool { return apistage().Closes["pushed"] == 1 }) {
+		t.Fatalf("D2-16s RED: X's own frame did not close X's committed serve (%+v) — the sink lost its requester", apistage())
+	}
+	if l := apistage(); l.Serves != 1 || l.Open != 0 || l.ToPush.Count != 1 {
+		t.Fatalf("D2-16s: serves=%d open=%d samples=%d, want 1/0/1", l.Serves, l.Open, l.ToPush.Count)
 	}
 }
 
@@ -913,6 +992,32 @@ func TestStale710_D2_12d_AJoinResumesAParkedDebt(t *testing.T) {
 	d2WaitDebtsClosed(t)
 }
 
+// D2-12f — #1062 keeps the #740 architect ruling on the every-layer ledger: a
+// resumed debt's stale_to_push is measured from the RESUME (the arm that ended
+// the park), not from the serve. Parked 20 s, resumed, healed 2 s later: the
+// replacing frame's write records exactly 2000 ms, not 22000.
+// Mutation → RED: the Resume does not restart the dependents' clocks.
+func TestStale710_D2_12f_AResumedDebtIsMeasuredFromTheResume(t *testing.T) {
+	f := newD2Fixture(t)
+	clock, heal, debtNow := d2Parked(t, f, "dep-12f")
+	t.Cleanup(cache.SetStalePushClockForTest(func() time.Time { return time.Unix(0, debtNow.Load()) }))
+	debtNow.Add(int64(20 * time.Second)) // parked: nobody views the dependent
+	ch := d2WrittenStream(t, "dep-12f")  // the arm resumes the debt
+	if st := StaleServeStatsSnapshot(); st.DebtOpen != 1 || st.DebtParked != 0 {
+		t.Fatalf("PRECONDITION: the arm did not resume the parked debt (open=%d parked=%d)", st.DebtOpen, st.DebtParked)
+	}
+	debtNow.Add(int64(2 * time.Second))
+	heal()
+	clock.FireNext() // the resume's immediate attempt: the refill commits, the dependent is replaced
+	d2Push(t, ch, "dep-12f", 10*time.Second)
+	if !fill710WaitFor(5*time.Second, func() bool { return StaleServeStatsSnapshot().ToPush.Count == 1 }) {
+		t.Fatalf("D2-12f: no stale_to_push sample for the replacing frame (%+v)", StaleServeStatsSnapshot().ToPush)
+	}
+	if got := StaleServeStatsSnapshot().ToPush.MaxMS; got != 2000 {
+		t.Fatalf("D2-12f RED: stale_to_push = %d ms, want exactly 2000 — measured from the resume, not the 22 s since the serve (#740)", got)
+	}
+}
+
 // D2-12e — overdue counts once per VIEWED episode: two episodes past 10 s → +2.
 func TestStale710_D2_12e_TwoViewedEpisodesAreOverdueTwice(t *testing.T) {
 	f := newD2Fixture(t)
@@ -1130,7 +1235,7 @@ func TestStale710_D2_20e_AParkedDebtsEvictedContentEvictsItsDependentsWithoutReR
 	defer unsub()
 	d2Push(t, ch, "dep-20e-a", 10*time.Second) // the owed mark, at arm time
 	// The refetch under the viewer is an ordinary fill: fresh, no new debt.
-	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions")
+	ctx, sink := cache.WithStaleServeSink(cache.WithL1KeyContext(r1Ctx(), "dep-20e-a"), "dep-20e-a", "restactions", "")
 	if _, served, ok, _, err := apistageContentServe(ctx, f.store, fill710ListCall(), false); err != nil || !ok || !served {
 		t.Fatalf("D2-20e: the refetch was not served: ok=%v served=%v err=%v", ok, served, err)
 	}
@@ -1151,7 +1256,9 @@ func TestStale710_D2_20f_AnActiveDebtsEvictedContentStillReResolvesItsDependent(
 	cache.SetStaleRetryClockForTest(clock)
 	t.Cleanup(func() { cache.SetStaleRetryClockForTest(nil) })
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) { return nil, false, ctx }
+	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		return nil, false, ctx
+	}
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{"dep-20f": {}})
 	defer unsub()

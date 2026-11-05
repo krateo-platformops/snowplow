@@ -109,23 +109,27 @@ func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 				return
 			}
 
+			// #1076 — every 401 here is pre-dispatch and carries the same
+			// closed-set cause and challenge UserConfig's does
+			// (credential_status.go).
 			token, ok := refreshTokenFromRequest(req)
 			if !ok {
-				response.Unauthorized(wri, fmt.Errorf("missing credentials: no bearer header or session cookie"))
+				tokenMissing(wri, fmt.Errorf("missing credentials: no bearer header or session cookie"))
 				return
 			}
 
-			// The IDENTICAL stateless validation UserConfig performs at
-			// userconfig.go:151. Both expired + generic-invalid map to 401
-			// (jwtutil.Validate returns ErrTokenExpired / ErrTokenInvalid);
-			// a key we cannot fetch is OUR fault, so it maps to 503 instead.
+			// The IDENTICAL stateless validation UserConfig performs. Both
+			// expired and generic-invalid map to 401 (jwtutil returns
+			// ErrTokenExpired / ErrTokenInvalid; tokenRejected names which);
+			// a key we cannot fetch is OUR fault, so it maps to 503 instead,
+			// with no cause.
 			userInfo, err := jwtutil.ValidateWithKeySource(keys, token)
 			if err != nil {
 				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				response.Unauthorized(wri, err)
+				tokenRejected(wri, err)
 				return
 			}
 

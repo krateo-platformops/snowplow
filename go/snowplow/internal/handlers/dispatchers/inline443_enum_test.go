@@ -235,9 +235,14 @@ var cacheAllow443 = map[string]cacheClass443{
 	// (past serveStaleWithDebt's cache.Inert check); an accepted content fill
 	// retires a debt (R1) — an inert resolve's Put is never accepted (#443 (a)).
 	"StaleRetryResume": unreachableInert443, "StaleRetryEnd": unreachableInert443,
-	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
-	// stale_to_push recorder); no resolve reaches it.
-	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
+	// Package init wiring (the test-reset quiesce); no resolve reaches it.
+	"RegisterStaleServeQuiesce": unreachableInert443,
+	// #1062 — the stale-push ledger as the D2 family reads it: its clock and
+	// its apistage histogram (pure reads), and the #740 resume's clock restart
+	// (only a parked debt's resume reaches it, and an inert resolve never
+	// opens a debt: serveStaleWithDebt's Inert check).
+	"StalePushNow": readOnly443, "StaleToPushSnapshot": readOnly443, "StaleToPushHistogram.ExpvarValue": readOnly443,
+	"RestartStaleServeClock":    unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
 	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
@@ -332,7 +337,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// Same classification as StageErrorSink.Bump.
 	"PerIdentityForbiddenSink.BumpStage": readOnly443, "PerIdentityForbiddenSink.BumpExternal": readOnly443,
 	"PerIdentityForbiddenSinkFromContext": readOnly443,
-	"WithContentDepGenSink":               readOnly443, "WithInternalEndpoint": readOnly443,
+	// #1080: the dep worker's objAbsent probe of the process watcher — an
+	// indexer read under the watcher's read lock; it never registers a GVR.
+	"WatchedAbsent":         readOnly443,
+	"WithContentDepGenSink": readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
 	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDialValue": readOnly443,
 	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.

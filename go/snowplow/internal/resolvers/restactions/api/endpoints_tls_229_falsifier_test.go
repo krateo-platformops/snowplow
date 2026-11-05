@@ -299,11 +299,12 @@ func TestIssue229_Arm6_CertAuthEndpointUnchanged(t *testing.T) {
 		Insecure:                 false,
 	}
 
-	// Guard the routing decision itself: this endpoint must NOT take the
-	// owned branch.
-	if endpointNeedsOwnedCAClient(&ep) {
-		t.Fatalf("ARM6 FAIL: a cert-auth endpoint was routed to the owned client; " +
-			"the live <user>-clientconfig population must keep using plumbing verbatim")
+	// Guard the routing decision itself. #1088: the live <user>-clientconfig
+	// population now takes the owned client-go branch (one kept client per
+	// identity); this arm pins that it still dials with its client cert, its
+	// CA, and no Authorization header.
+	if !endpointOwnedShape(&ep) {
+		t.Fatalf("ARM6 FAIL: a cert-auth endpoint with a CA must take the owned client-go branch (#1088)")
 	}
 
 	st, jsonBytes, err := drive(t, ep, http.MethodGet, "")
@@ -323,10 +324,10 @@ func TestIssue229_Arm6_CertAuthEndpointUnchanged(t *testing.T) {
 
 // --- ARM 7: the ROUTING PREDICATE, exhaustively. ---------------------
 //
-// endpointNeedsOwnedCAClient decides which endpoints change behaviour at
-// all. Pinning it directly is what bounds the blast radius of this fix:
-// exactly one shape is rerouted and every other shape still reaches
-// plumbing untouched.
+// endpointOwnedShape (was endpointNeedsOwnedCAClient) decides which endpoints
+// take the owned client-go branch. #1088 widened it from the one #229 shape to
+// every shape client-go reproduces exactly; pinning it directly is what bounds
+// the blast radius: every exclusion is listed here.
 func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 	const ca = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
 	cases := []struct {
@@ -335,10 +336,15 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 		want bool
 	}{
 		{"nil endpoint", nil, false},
-		{"no CA at all", &endpoints.Endpoint{ServerURL: "https://x", Token: "t"}, false},
+		{"no CA at all", &endpoints.Endpoint{ServerURL: "https://x", Token: "t"}, true},
 		{"token-auth WITH a CA (the defect)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca}, true},
-		{"cert-auth with a CA (live population)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k"}, false},
-		{"insecure explicitly requested", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca, Insecure: true}, false},
+		{"cert-auth with a CA (live population, #1088)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k"}, true},
+		{"cert-auth with NO CA (plumbing verifies against an empty pool)", &endpoints.Endpoint{ServerURL: "https://x", ClientCertificateData: "c", ClientKeyData: "k"}, false},
+		{"cert-auth + insecure (plumbing ignores Insecure on cert auth)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k", Insecure: true}, false},
+		// #1112 D4: owned like any other; its wire dump is credhttp.WireDump,
+		// installed on either branch, never plumbing's.
+		{"Debug (snowplow's metadata-only wire dump)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", Debug: true}, true},
+		{"insecure explicitly requested (skip-verify, as plumbing)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca, Insecure: true}, true},
 		{"basic-auth with a CA", &endpoints.Endpoint{ServerURL: "https://x", Username: "u", Password: "p", CertificateAuthorityData: ca}, true},
 		// The EMPTY-USERNAME exclusion. plumbing calls this basic auth (it keys
 		// off Password) and sends Basic base64(":password"); client-go keys off
@@ -388,8 +394,8 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := endpointNeedsOwnedCAClient(tc.ep); got != tc.want {
-				t.Fatalf("ARM7 FAIL: endpointNeedsOwnedCAClient = %v, want %v", got, tc.want)
+			if got := endpointOwnedShape(tc.ep); got != tc.want {
+				t.Fatalf("ARM7 FAIL: endpointOwnedShape = %v, want %v", got, tc.want)
 			}
 		})
 	}

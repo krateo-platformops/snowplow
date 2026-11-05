@@ -31,7 +31,7 @@ It is stored as a Kubernetes [`Secret`](https://kubernetes.io/docs/concepts/conf
 | `certificate-authority-data` | `string (base64)` | Base64-encoded PEM CA certificate used to verify the remote server. | ❌ |
 | `client-certificate-data` | `string (base64)` | Base64-encoded PEM client certificate for mutual TLS authentication. | ❌ |
 | `client-key-data` | `string (base64)` | Base64-encoded PEM private key associated with the client certificate. | ❌ |
-| `debug` | `boolean` | Enables verbose logging of HTTP requests/responses. | ❌ |
+| `debug` | `boolean` | Logs each request and response at `LOG_LEVEL=debug`: method, URL (no userinfo, query values redacted), status, and which headers are present (`Authorization`, `Cookie`, `Content-Type`, … named, others counted) but never a header value; a request body is logged as its length and a keyed digest, a response body as its declared length; client certificates never appear (#1112). | ❌ |
 | `insecure` | `boolean` | If `true`, disables TLS certificate verification. | ❌ |
 | `aws-access-key` | `string` | AWS access key id — enables AWS SigV4 request signing. | ❌ |
 | `aws-secret-key` | `string` | AWS secret access key (SigV4 signing). | ❌ |

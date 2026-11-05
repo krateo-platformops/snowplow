@@ -29,6 +29,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -114,6 +115,12 @@ func RBAC() http.Handler {
 		}
 
 		readSet, unresolved, err := rbacInspectReadSetFn(req.Context(), &cr, extras)
+		// #1116 — extras that name a key the resolver writes: the same 400 a
+		// /call of this RESTAction answers, naming the keys. InspectReadSet
+		// refused before it enumerated anything (and logged it once).
+		if dispatchers.WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		if err != nil {
 			// A structural failure (cyclic api[], SA rest.Config unavailable):
 			// the read-set cannot be trusted — fail loud.

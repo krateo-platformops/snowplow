@@ -48,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -296,6 +297,10 @@ type refresher struct {
 	// tier (refresher_quiescence.go).
 	work *refresherWorkCount
 
+	// #1070 — per tier, when each queued key was inserted: the start of its
+	// wait for a worker (refresh_cycle.go). Measurement only.
+	normalStamps, clusterListStamps, viewedStamps *enqueueStamps
+
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
@@ -475,21 +480,26 @@ func refresherSingleton() *refresher {
 		// #930 — every tier counts its outstanding work into one total
 		// (refresher_quiescence.go).
 		work := newRefresherWorkCount()
+		// #1070 — each tier stamps its inserts (the wait for a worker).
+		normalStamps, clStamps, vStamps := &enqueueStamps{}, &enqueueStamps{}, &enqueueStamps{}
 		r := &refresher{
-			parallelism:      parallelism,
-			work:             work,
-			clusterListQueue: newRefresherTierQueue("refresher_cluster_list", clRL, work, nil),
-			inFlightKeys:     map[string]bool{},
-			handlers:         map[string]RefreshFunc{},
-			resolveLatency:   newP2Quantile(0.95),
-			dirtyStats:       newDirtyWindowStats(),
+			parallelism:       parallelism,
+			work:              work,
+			normalStamps:      normalStamps,
+			clusterListStamps: clStamps,
+			viewedStamps:      vStamps,
+			clusterListQueue:  newRefresherTierQueue("refresher_cluster_list", clRL, work, clStamps, nil),
+			inFlightKeys:      map[string]bool{},
+			handlers:          map[string]RefreshFunc{},
+			resolveLatency:    newP2Quantile(0.95),
+			dirtyStats:        newDirtyWindowStats(),
 		}
 		r.reserveCond.L = &r.priorityGetMu // #1069 — the reserved worker's park
 		// #1069 — the normal tier's shutdown also releases a parked reserved worker.
-		r.queue = newRefresherTierQueue("refresher_normal", rl, work, func(q workqueue.TypedInterface[string]) workqueue.TypedInterface[string] {
+		r.queue = newRefresherTierQueue("refresher_normal", rl, work, normalStamps, func(q workqueue.TypedInterface[string]) workqueue.TypedInterface[string] {
 			return &shutdownNotifyingQueue{TypedInterface: q, onShutDown: r.wakeReservedOnShutdown}
 		})
-		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work)
+		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work, vStamps)
 		refresherInstance.Store(r)
 	})
 	return refresherInstance.Load()
@@ -869,6 +879,8 @@ func (r *refresher) yieldToCustomer(ctx context.Context) {
 	if !customerInFlightLocked() {
 		return
 	}
+	// #1054 — parked: the process-wide count every slow-call snapshot reports.
+	defer slowcall.BeginYield(ctx).End()
 	t := time.NewTicker(refresherYieldPoll)
 	defer t.Stop()
 	cap := time.NewTimer(refresherYieldMaxParked)
@@ -975,6 +987,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// again (endViewed). #1069 — the wake key is not a turn: lastViewed
 			// stays as it was, so p=1 alternation counts only real dequeues.
 			r.leftNormalGet(true)
+			r.normalStamps.take(key) // #1070: the wake key is no refresh; drop its stamp
 			r.queue.Done(key)
 			if r.viewedQueue != nil && r.viewedQueue.Len() > 1 {
 				r.wakeViewed()
@@ -984,6 +997,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		r.leftNormalGet(false)    // the slot is held until this key's Done
 		r.lastViewed.Store(false) // #799 fix 2: p=1 alternation
 	}
+	// #1070 — measurement only: the key's insert into this tier, taken at its
+	// dequeue, so a re-add while it is processing stamps the next dequeue anew.
+	enqueuedAt := r.tierStamps(tier).take(key)
 	switch tier {
 	case tierViewed:
 		defer func() {
@@ -1216,6 +1232,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// between the two would be consumed with a seq the need does not cover.
 	if len(consumedTriggers) > 0 {
 		rctx = withRefreshTriggerAsOf(rctx, depEventSeq.Load())
+	}
+	// #1070 — measurement only: past the yield, the suppression and the rate
+	// floor, the worker starts this refresh. The wait for a worker ends here and
+	// rctx times the rest of the cycle (refresh_cycle.go). A missing entry is no
+	// refresh (skipped_no_entry).
+	if ok && entry != nil {
+		rctx = startRefreshCycle(rctx, key, tier, enqueuedAt)
 	}
 	// #354 P3 — the window is consumed here, beside the trigger GVR, NOT in the
 	// floored branch above: a floored key keeps its window open, so the floor is

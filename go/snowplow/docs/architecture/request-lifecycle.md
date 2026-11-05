@@ -29,7 +29,7 @@ other GVR falls through to a raw apiserver passthrough.
                                               │
             ┌─────────────────────────────────┴──────────────────────────────────┐
             │  main.go  mux.Handle("GET /call", chain.Append(                      │
-            │     middleware.UserConfig(signKey, authnNS)   ← authn: JWT → UserInfo│
+            │     middleware.UserConfig(jwtKeys, authnNS)   ← authn: JWT → UserInfo│
             │     cache.FallthroughScopeMiddleware(ScopeCallGeneric)               │
             │     handlers.Dispatcher(dispatchers.All()))   ← routes by GVR group  │
             │   .Then(handlers.Call()))                     ← fallthrough handler  │
@@ -105,7 +105,7 @@ bytes leave the pod (`widget_content.go`). The shell is never served verbatim.
   reversal this flips only after the synchronous boot seed (or its backstop) —
   see [prewarm.md](prewarm.md).
 - `GET /call` — the canonical read path. Its middleware chain is
-  `middleware.UserConfig(signKey, authnNS)` → `FallthroughScopeMiddleware(ScopeCallGeneric)`
+  `middleware.UserConfig(jwtKeys, authnNS)` → `FallthroughScopeMiddleware(ScopeCallGeneric)`
   → `handlers.Dispatcher(dispatchers.All())`, finally `.Then(handlers.Call())`.
 - `POST/PUT/PATCH/DELETE /call` — same `UserConfig` middleware and a
   write-scope `FallthroughScopeMiddleware`, but **no** `Dispatcher` in the

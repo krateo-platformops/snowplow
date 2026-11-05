@@ -33,7 +33,7 @@ new OTLPTraceExporter({
 |---|---|---|
 | body | 512 KiB, with or without `Content-Length` | `413` |
 | spans per request | 512 | `413` |
-| attributes per span | 64 (only 3 are forwarded; the rest are dropped) | `413` |
+| attributes per span | 64 sent (at most 4 are forwarded, see the allowlist; the rest are dropped) | `413` |
 | resource attributes | 64 | `413` |
 | resource spans / scope spans per request | 16 / 64 | `413` |
 | a key repeated within any JSON object | refused | `400` |
@@ -63,15 +63,35 @@ Everything not listed here is dropped. Nothing is forwarded as sent: the payload
   - `status.code`. `status.message` is dropped.
   - Events, links and trace state are dropped.
   - A span with a malformed id or time is dropped.
-- **Span attributes kept:**
+- **Span attributes kept:** the allowlist is per span name. A key is kept only on the spans that list it, and only when its value passes the key's check.
 
-| key | allowed values |
+| key | on spans | allowed values |
+|---|---|---|
+| `http.route` | all five | on `krateo.widget.fetch`: exactly one of snowplow's registered routes. On the page-level spans: a route **template** (`/compositions/{namespace}/{name}`) that starts with `/`, uses only `A-Z a-z 0-9 / _ . : { } -`, is at most 256 characters, and has no segment of 24 characters or more and no JWT-shaped segment; a query string, fragment or `%`-escape fails the character check. See the contract below. |
+| `http.request.method` | all five | `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` (upper case) |
+| `http.response.status_code` | all five | an integer from 100 to 599 (`intValue`) |
+| `krateo.interaction.abandoned` | `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish` only | exactly `true` (`boolValue`). See below. |
+
+Every other attribute is dropped and counted, as is an allowlisted key on a span that does not list it, or whose value fails its check. That includes `enduser.id`, `url.full` and any header.
+
+### `krateo.interaction.abandoned`: the frontend contract
+
+Agreed with the frontend owner on 2026-11-01. The frontend sets it on an interaction the user left before it finished.
+
+- **Meaning:** the interaction is **excluded from the latency SLI, but not dropped.** It still counts for throughput and for the error rate.
+- **Why an attribute, not a status:** encoding it as span status `ERROR` would move it into the error-rate SLI. Leave the status as it is and send the attribute.
+- **Value:** the bool `true`, sent as `{"boolValue": true}`. It is never sent as `false`: absent means not abandoned.
+- **Spans:** only `krateo.composition.open`, `krateo.form.submit` and `krateo.page.publish`. It is not valid on `krateo.widget.fetch` (a child span: its parent interaction carries the mark) or on `krateo.page.load`.
+
+What snowplow does with it:
+
+| sent | result |
 |---|---|
-| `http.route` | on `krateo.widget.fetch`: exactly one of snowplow's registered routes. On the page-level spans: a route **template** (`/compositions/{namespace}/{name}`) that starts with `/`, uses only `A-Z a-z 0-9 / _ . : { } -`, is at most 256 characters, and has no segment of 24 characters or more and no JWT-shaped segment; a query string, fragment or `%`-escape fails the character check. See the contract below. |
-| `http.request.method` | `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` (upper case) |
-| `http.response.status_code` | an integer from 100 to 599 (`intValue`) |
-
-Every other attribute is dropped and counted, as is an allowlisted key whose value fails its check. That includes `enduser.id`, `url.full` and any header.
+| `{"boolValue": true}` on one of the three interaction spans | forwarded as the bool `true` |
+| absent | nothing added; the span is forwarded as before |
+| `{"boolValue": false}`, `{"stringValue": "true"}`, an `intValue`, a `doubleValue`, an `arrayValue`, or a `true` with any other member beside it (`stringValue`, `intValue`, `doubleValue`, `arrayValue`, `kvlistValue`, `bytesValue`: an OTLP `AnyValue` holds exactly one) | dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| on `krateo.widget.fetch` or `krateo.page.load` | dropped and counted; the span is still forwarded |
+| `{"boolValue": "true"}` (a JSON string where OTLP/JSON requires a bool) | the body is not OTLP/JSON: the request is refused `400` |
 
 ### `http.route`: the frontend contract
 

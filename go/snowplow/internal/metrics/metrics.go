@@ -63,9 +63,11 @@ import (
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -795,7 +797,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// bumps_by_source pattern).
 	malformedDialSkipped, err := m.Int64ObservableCounter(
 		"snowplow_malformed_dial_skipped_total",
-		metric.WithDescription("Malformed single-object apiserver dials SKIPPED by the #288/#293/#302 guard, by bounded reason {empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error}. Non-zero is a DETECTOR: an upstream render defect was caught (collapsed interpolation / unrendered ${ template / jq error in path|payload|header) — fix the RESTAction or the key-minting. #311."))
+		metric.WithDescription("Malformed single-object apiserver dials SKIPPED by the #288/#293/#302 guard, by bounded reason {empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error, path_not_as_served, path_value_refused}. Non-zero is a DETECTOR: an upstream render defect was caught (collapsed interpolation / unrendered ${ template / jq error in path|payload|header / a value that cannot be one path segment or query value / an own-cluster path the apiserver would read as another path, #1137) — fix the RESTAction or the key-minting. #311."))
 	if err != nil {
 		return err
 	}
@@ -1228,6 +1230,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerRUMIngestInstruments(m); err != nil { // #1015
 		return err
 	}
+	// #1054: slow calls are recorded whatever the cache mode (the expvar keys
+	// are published unconditionally), so their OTLP series are too.
+	if err := registerSlowCallInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).
@@ -1238,6 +1245,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 	if err := registerExternalFetchCacheInstruments(m); err != nil {
+		return err
+	}
+	if err := registerEndpointDialInstruments(m); err != nil { // #1088
 		return err
 	}
 	if err := registerUAFNullSkipInstruments(m); err != nil {
@@ -1277,6 +1287,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 	if err := registerResolveCollectionListsInstrument(m); err != nil { // #988
+		return err
+	}
+	if err := registerRefreshCycleInstruments(m); err != nil { // #1070
 		return err
 	}
 	return registerSecurityInstruments(m)
@@ -1432,7 +1445,7 @@ func registerListNarrowInstruments(m metric.Meter) error {
 // described can never be set.
 func registerDenialOnlyInstruments(m metric.Meter) error {
 	denialOnly, err := m.Int64ObservableCounter("snowplow_resolved_cache_denial_only_put_total",
-		metric.WithDescription("Resolved RESTAction / widget results Put although they carried stage errors, because EVERY stage error was a per-identity forbidden (snowplow's re-gate deny, or the apiserver's 403 on the requester's own dial), by site: call_ra, call_widget, refresher, seed (#681). The cell is keyed per identity class exactly like any other; its error bodies are identity-free."))
+		metric.WithDescription("Resolved RESTAction / widget results Put although they carried stage errors, because EVERY stage error was a per-identity definite answer (snowplow's re-gate deny, the apiserver's 403 on the requester's own dial, or a watched named object's NotFound under continueOnError, #1080), by site: call_ra, call_widget, refresher, seed (#681). The cell is keyed per identity class exactly like any other; its error bodies are identity-free."))
 	if err != nil {
 		return err
 	}
@@ -1526,7 +1539,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		return err
 	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
-		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted, so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
+		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted here (they are in snowplow_endpoint_retries_total, #1088), so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
 		return err
 	}
@@ -1630,6 +1643,67 @@ func registerListQueryInstrument(m metric.Meter) error {
 		}
 		return nil
 	}, listQuery)
+	return err
+}
+
+// registerEndpointDialInstruments hand-wires #1088's endpoint-dial surfaces
+// onto OTLP (no expvar->OTLP bridge), from the accessors their expvar closures
+// read: every retry by site and cause, and the stage fetch's per-identity
+// client cache. site and cause are closed, code-defined sets. Registered only
+// when the cache is on (CFG-1), like their expvar keys.
+func registerEndpointDialInstruments(m metric.Meter) error {
+	retries, err := m.Int64ObservableCounter("snowplow_endpoint_retries_total",
+		metric.WithDescription("HTTP attempts re-sent by an endpoint dial's retry loop (plumbing RetryClient), one per retry, by site {stage = RESTAction branch-E fetch, call = /call passthrough} and cause, the outcome of the attempt it replaces {dns, dial (TCP connect failed), tls_handshake, connection (any other error with no response), status_429, status_5xx, other}. A write is never re-sent, so it never counts here. Each retry also logs one WARN with the failed attempt's duration. #1088."))
+	if err != nil {
+		return err
+	}
+	clients, err := m.Int64ObservableGauge("snowplow_stage_endpoint_clients",
+		metric.WithDescription("HTTP clients the RESTAction stage fetch keeps, one per endpoint identity (every endpoint field + provenance), each owning its kept-alive connections; an entry unused for one idle-connection timeout is dropped. #1088."))
+	if err != nil {
+		return err
+	}
+	builds, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_builds_total",
+		metric.WithDescription("Stage endpoint clients built through the per-identity cache: one per cache miss, plus one per fetch for an owned shape whose TLS material cannot be read exactly (built, then not kept). Shapes that never enter the cache (AWS SigV4, Debug, basic auth without a username, cert-auth without a CA or with Insecure) are not counted. Far below snowplow_external_fetch_total means fetches reuse their identity's connection. #1088."))
+	if err != nil {
+		return err
+	}
+	evictions, err := m.Int64ObservableCounter("snowplow_stage_endpoint_client_evictions_total",
+		metric.WithDescription("Stage endpoint clients dropped by the idle sweep (unused for one idle-connection timeout). #1088."))
+	if err != nil {
+		return err
+	}
+	budgetExchanges, err := m.Int64ObservableCounter("snowplow_page_budget_exchanges_total",
+		metric.WithDescription("Network exchanges of customer requests, by what the request's page budget (arrival + the 10 s page goal) did to them {within = it never acted, retried = a connection attempt failed or was abandoned and the one retry inside the budget answered, not_sent = the budget was spent before the exchange started, exhausted_connect = it ran out before a connection was obtained, exhausted_answer = it ran out waiting for the answer}. Background exchanges carry no budget and are not counted. #1115."))
+	if err != nil {
+		return err
+	}
+	budgetReserve, err := m.Int64ObservableGauge("snowplow_page_budget_retry_reserve_ms",
+		metric.WithDescription("The page budget's retry reserve: the goal quantile (p95, the goal's own) of the last 20 attempts that opened a new connection, from asking for it to the first response byte; the page p95 goal (3 s) before any was measured. A customer connect still pending at deadline − reserve is abandoned and retried once. #1115."))
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range pagebudget.ExchangesSnapshot() {
+			o.ObserveInt64(budgetExchanges, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Result.String())))
+		}
+		reserve, _ := credhttp.RetryReserve()
+		o.ObserveInt64(budgetReserve, reserve.Milliseconds())
+		return nil
+	}, budgetExchanges, budgetReserve)
+	if err != nil {
+		return err
+	}
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		for _, c := range credhttp.EndpointRetriesSnapshot() {
+			o.ObserveInt64(retries, int64(c.Count), metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("cause", c.Cause)))
+		}
+		n, b, e := restactionsapi.StageEndpointClientsStats()
+		o.ObserveInt64(clients, int64(n))
+		o.ObserveInt64(builds, int64(b))
+		o.ObserveInt64(evictions, int64(e))
+		return nil
+	}, retries, clients, builds, evictions)
 	return err
 }
 
@@ -1991,14 +2065,19 @@ func registerStaleServeInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	// #1062 — the apistage series of the every-layer stale-push ledger
+	// (registerStalePushInstruments records into it), kept under its #710 name
+	// for the bench: the same samples as snowplow_stale_to_push_ms{layer="apistage"}.
 	toPush, err := m.Int64Histogram("snowplow_apistage_stale_to_push_ms",
-		metric.WithDescription("Stale serve → the /refreshes push of the dependent customer cell (ms). The owner bar: p95 ≤ 3000, max ≤ 10000, target 1000. #710 PR-2b."),
+		metric.WithDescription("Stale serve → the replacing /refreshes frame WRITTEN to a stream armed for the customer cell (ms), apistage only: the same samples as snowplow_stale_to_push_ms{layer=\"apistage\"} (#1062). The owner bar: p95 ≤ 3000, max ≤ 10000, target 1000. #710 PR-2b."),
 		metric.WithUnit("ms"),
-		metric.WithExplicitBucketBoundaries(int64sToFloat64s(restactionsapi.StaleToPushBoundsMS)...))
+		metric.WithExplicitBucketBoundaries(int64sToFloat64s(cache.StaleToPushBoundsMS)...))
 	if err != nil {
 		return err
 	}
-	restactionsapi.SetStaleToPushRecorder(func(ms int64) { toPush.Record(context.Background(), ms) })
+	if err := registerStalePushInstruments(m, toPush); err != nil {
+		return err
+	}
 	serveAge, err := m.Int64Histogram("snowplow_apistage_stale_serve_age_ms",
 		metric.WithDescription("Age of the content body a stale serve delivered: since the content cell's known-stale window opened (ms). #710 PR-2b."),
 		metric.WithUnit("ms"),

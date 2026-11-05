@@ -2287,10 +2287,22 @@ func (d *DepTracker) isSelfRepresentation(store *ResolvedCacheStore, l1Key strin
 // "" namespace) and dirty-marks the dependent L1 keys via the same
 // refreshHook onChange uses.
 //
-// It deliberately ignores EXACT-object GET-dep buckets: an exact GET-dep
-// for a named object that did not resolve before the CRD existed is not
-// a stale-negative LIST and is left to OnAdd when the object itself
-// arrives. Dirty-mark only — NEVER evicts.
+// It deliberately ignores EXACT-object GET-dep buckets. Since #1080 an
+// exact edge CAN hold a cached NotFound (a watched named object's 404
+// under continueOnError), but never one taken while the type was absent:
+// the definite-NotFound rule needs the GVR's informer servable
+// (cache.WatchedAbsent), and a GVR without its CRD has no servable
+// informer. A NotFound cached BEFORE the type went away is invalidated by
+// OnResourceTypeRemoved, which marks exact buckets too: its re-resolve
+// cannot re-establish the 404 while the type is gone, so the cell ends
+// KNOWN-STALE (#547) and the next read revalidates it under the requester.
+// That is what heals a CRD restored together with its objects, whose
+// objects reach the new informer only in its initial list (the pre-sync
+// gate drops those ADDs, so no exact-edge mark follows them). An object
+// created after the type is back arrives as an ordinary post-sync ADD
+// (OnObjectEvent). Pinned end to end by #1080 C8
+// (dispatchers/issue1080_review_arms_test.go). Dirty-mark only — NEVER
+// evicts.
 //
 // Returns the number of dependent L1 keys dirty-marked. AC-D4: a no-op
 // (and idempotent) when no LIST-dep matches gvr.

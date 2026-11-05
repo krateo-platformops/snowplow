@@ -240,6 +240,31 @@ func (rw *ResourceWatcher) rememberDeliveryLogLocked(gvr schema.GroupVersionReso
 	liveDeliveryLogs.Store(dl, struct{}{})
 }
 
+// retireDeliveryLogLocked retires dl now — its pending keys, walker flag and
+// resolver go at this point, as #918 requires — and queues the removal of its
+// handler for when rw.mu is released (#1146: the removal takes the informer's
+// locks, see detach). Callers MUST hold rw.mu.Lock() and release it with
+// unlockAndDetach. A nil or already retired log is a no-op.
+func (rw *ResourceWatcher) retireDeliveryLogLocked(dl *deliveryLog) {
+	if dl != nil && dl.retire() {
+		rw.detachQueue = append(rw.detachQueue, dl)
+	}
+}
+
+// unlockAndDetach releases rw.mu.Lock() and then removes the handlers of the
+// logs the critical section retired (retireDeliveryLogLocked). Every critical
+// section that can retire a log releases the lock through it; the guard
+// TestIssue1146_RetiringSectionsUnlockThroughUnlockAndDetach pins that. A
+// section that retired nothing pays a nil check.
+func (rw *ResourceWatcher) unlockAndDetach() {
+	q := rw.detachQueue
+	rw.detachQueue = nil
+	rw.mu.Unlock()
+	for _, dl := range q {
+		dl.detach()
+	}
+}
+
 // liveDeliveryLogs is every open log, for the per-GVR pending breakdown.
 var liveDeliveryLogs sync.Map // *deliveryLog -> struct{}
 
@@ -623,18 +648,32 @@ func (l *deliveryLog) oldestPending() time.Time {
 	return oldest
 }
 
-// close stops the resolver, drops what is pending and removes the handler:
-// the GVR's informer is being torn down (deletePerGVRStateLocked), or a swap
-// replaced the copy this log records (#870). It clears exactly what it owned:
-// its pending keys and, if this log set it, the GVR's walker flag (#928 delta
-// G1, H1). Both under l.mu, so a setPending racing it either holds its keys
-// first and has them cleared here, or finds the log closed and holds nothing;
-// and a flag the live log set is not this log's to clear (setPendingFlag).
+// close retires the log and removes its handler, for a caller that holds no
+// lock (Stop). A caller holding rw.mu retires the log through
+// retireDeliveryLogLocked instead, and its handler is removed once rw.mu is
+// released (unlockAndDetach, #1146).
 func (l *deliveryLog) close() {
+	if l.retire() {
+		l.detach()
+	}
+}
+
+// retire stops the resolver and drops what is pending: the GVR's informer is
+// being torn down (deletePerGVRStateLocked), or a swap replaced the copy this
+// log records (#870). It clears exactly what it owned: its pending keys and,
+// if this log set it, the GVR's walker flag (#928 delta G1, H1). Both under
+// l.mu, so a setPending racing it either holds its keys first and has them
+// cleared here, or finds the log closed and holds nothing; and a flag the live
+// log set is not this log's to clear (setPendingFlag). It reports whether
+// this call retired the log (false: it already was).
+//
+// retire takes no informer lock — only l.mu and storeVerify.mu, leaves — so
+// it may run under rw.mu. Removing the handler may not (detach).
+func (l *deliveryLog) retire() bool {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
-		return
+		return false
 	}
 	l.closed = true
 	n := len(l.pending)
@@ -644,10 +683,21 @@ func (l *deliveryLog) close() {
 	l.mu.Unlock()
 	storePendingKeys.Add(-int64(n))
 	liveDeliveryLogs.Delete(l)
+	close(l.stop)
+	return true
+}
+
+// detach removes the log's handler from its informer. NEVER WITH rw.mu HELD
+// (#1146): RemoveEventHandler takes the informer's startedLock, blockDeltas
+// and listenersLock (shared_informer.go:1004-1014). An informer whose stop has
+// closed holds listenersLock in sharedProcessor.run until every listener
+// returns (:1143-1159), and the dep handler's listener takes rw.mu.RLock
+// (syncChState) — so under rw.mu this call waits on a listener that waits on
+// rw.mu, forever. With no lock held it waits only for that listener to finish.
+func (l *deliveryLog) detach() {
 	if l.inf != nil && l.reg != nil {
 		_ = l.inf.RemoveEventHandler(l.reg)
 	}
-	close(l.stop)
 }
 
 // resolve re-judges the pending keys on every wake until none is left.

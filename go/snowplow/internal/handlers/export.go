@@ -22,6 +22,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
@@ -250,17 +251,13 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			outcome = "failure"
 		}
-		audit.Emit(req.Context(), audit.Event{
-			Action:    "export",
-			Verb:      http.MethodGet,
-			Resource:  req.URL.Query().Get("resource"),
-			Name:      name,
-			Namespace: req.URL.Query().Get("namespace"),
-			Outcome:   outcome,
-			Code:      code,
-			Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
-				format, rowCount, pages, truncated),
-		})
+		// #1055 — the record names the method the export was sent with (GET
+		// or POST) and the target it resolved, through the helper every
+		// audited request builds its record with.
+		ev := requestAuditEvent("export", req.Method, exportAuditTarget(req.URL.Query()), outcome, code)
+		ev.Message = fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
+			format, rowCount, pages, truncated)
+		audit.Emit(req.Context(), ev)
 	}
 
 	if format == "pdf" {
@@ -452,7 +449,9 @@ func (t *pdfCells) table() (cols []string, cells [][]string) {
 // RESTAction write stage is refused (#903's refusal, origin "export"),
 // never sent. The page's stage outcomes are added to stages.
 func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int, stages *stageOutcomeSet) *exportRecorder {
-	inner := req.Clone(cache.WithExportRead(req.Context()))
+	// #1115 B2 (owner ruling: "10 s per page") — each re-dispatched page is
+	// its own resolve, with its own page budget, as a /call of it would be.
+	inner := req.Clone(pagebudget.ForResolve(cache.WithExportRead(req.Context())))
 	q := inner.URL.Query()
 	for _, p := range exportParams {
 		q.Del(p)

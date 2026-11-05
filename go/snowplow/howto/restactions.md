@@ -94,6 +94,20 @@ Useful for chaining calls where one must complete before another.
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
 
+**Stages run one at a time, in a fixed order.** First every stage with no
+`dependsOn`, in the order you declare them. Then each stage with a `dependsOn`,
+once its dependency has run, in the order they became ready. The same spec always
+runs the same way.
+
+`dependsOn` decides order, not success: a read stage still runs when its
+dependency failed, and reads the missing value. Only a write stage is withheld
+when its dependency failed or was skipped (see below). A stage that reads another
+stage's result should declare `dependsOn` on it.
+
+Stages share the page's time budget, so a stage that stalls spends it for the
+stages after it, and a stage that starts after the budget ran out fails with
+`Timeout`. A stage with no `dependsOn` runs ahead of every stage that has one.
+
 ### Resolving a referenced `RESTAction`/`Widget` in-process
 
 A stage may reference **another `RESTAction` or `Widget`** by pointing its
@@ -291,7 +305,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
 
 - `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
-  `StageNotExecuted` (a dry run). `dependsOn` is set on a `Skipped` row.
+  `StageNotExecuted` (a dry run), and for a write stage snowplow refused to
+  send (#1112) `InvalidPath`, `TemplateError` or `NotSent` (see "A write
+  that is not sent fails" below). `dependsOn` is set on a `Skipped` row.
 - A resolve that runs no stage at all (its `dependsOn` graph names a stage
   that does not exist or has a cycle) answers a resolve-level row
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
@@ -348,6 +364,43 @@ stored or served.
   Snowplow sends the header only to itself and strips it from every other
   request.
 
+## A write that is not sent fails
+
+A write stage that snowplow refuses to send never reads as a success
+(#1112). Before any request leaves, snowplow refuses a call whose `path`,
+`payload` or a header did not render (a jq error, e.g. `tonumber` on a
+non-number, or an unrendered `${…}`), and a rendered path that lost a segment
+its template meant to fill (#288): an empty namespace (`/namespaces//`), or
+an empty last segment on a `PUT`/`PATCH`/`DELETE` (a trailing `/`, which would
+turn a by-name delete into a collection delete). That holds for every stage,
+a named `endpointRef` to another cluster's apiserver included. Only on a
+stage with no `endpointRef` (this cluster's apiserver) is a name or namespace
+that is not a valid Kubernetes name refused as well: an external API's ids
+(`/api/v2/tickets/Ab_12`) are not judged as Kubernetes names. Constrain caller
+input in the template itself.
+
+For a **read** the refused call is skipped and the page renders what it can,
+as before. For a **write** each refused call (one item of an iterator
+included) fails the stage with reason `InvalidPath`, `TemplateError` or
+`NotSent` in `X-Snowplow-Stage-Outcomes`, an error under its `errorKey`
+(code 400, or 500 for `NotSent`), and, without `continueOnError`, the
+resolve's status (see "The HTTP status"). A write stage that depends on it is
+`Skipped`. An iterator write with **zero** items has nothing to send and
+succeeds.
+
+## Redirects and credentials
+
+A stage's request never goes to another host (#1106). When an endpoint
+answers a redirect to another origin (scheme, host and port), snowplow does
+not follow it, whatever the endpoint's credential (token, basic auth, client
+certificate, AWS signature) and whatever the stage's `headers`: any header
+can carry a credential (`X-Api-Key`, `PRIVATE-TOKEN`, an `exportJwt` bearer),
+and the HTTP client would forward it. The stage fails with `502`, naming the
+redirect. A redirect within the endpoint's own origin is followed. A stage
+with no `endpointRef` (this cluster's apiserver, a snowplow-held credential)
+follows no redirect at all (#723). An endpoint that legitimately redirects
+elsewhere (a CDN, a moved host) must be given its final URL.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**
@@ -356,6 +409,95 @@ dict (previous stage outputs + `extras`) before the request is issued; a plain
 string without the delimiter is passed through verbatim. (`endpointRef.name`
 supports the same templating. Whether literal or templated, it may never
 name a per-user credential Secret; see below.)
+
+### A value in a `path` is one segment (#1123)
+
+The `path` template is a **template**: its string literals are what you wrote,
+and every value it splices in (`+ .x`, `"\(.x)"`, or a whole `${ .path }`) is
+**exactly one path segment** — or, after the template's `?`, **exactly one query
+value**. Values come from the caller (`extras`), from earlier stages and from
+iterator elements, and the request goes out with the stage's credential, so a
+value must never decide what that credential is used for.
+
+| A value spliced into… | is rendered as | and refused (not dialed) when |
+|---|---|---|
+| the path (before the template's `?`) | one segment, escaped like `url.PathEscape` (`?` → `%3F`, `#` → `%23`, `%` → `%25`, space → `%20`) | it contains `/`, or the segment it lands in is `.` or `..` |
+| the query (after the template's `?`) | one query value: `&`, `=`, `+`, `;`, `#`, `%`, space and non-query characters are escaped | never |
+
+A clean value (a name, a namespace, a number, a UUID, `system:admin`) renders as
+itself. For an apiserver path (`/api/…`, `/apis/…`) a value that needed an
+escape is refused too: the apiserver decodes the path before it reads the
+namespace, resource and name, and no valid one contains `%`.
+
+What counts as **your text** rather than a value: a string literal, an
+interpolated string, `+` of those, parentheses, an `if` whose branches are
+those, the right side of `|` or of `E as $x | …`, and a variable bound to one of
+those (`(if .range == "1h" then "1%20HOUR" else "6%20HOUR" end) as $iv` keeps
+`$iv` your text), or a literal key of an object of them (`$w.bk`). Anything
+else — `.x`, `.x // "default"`, `(.x | f)`, a function call, a variable bound to
+a value — is a value.
+
+**A value that holds several segments must be declared.** Either split it into
+single values (the right form for an `apiVersion`, which is `group/version`):
+
+```yaml
+path: ${ (.apiVersion | split("/")) as [$g, $v] | "/apis/" + $g + "/" + $v + "/" + .resource }
+```
+
+or declare it with `segments(E)`, which keeps `/` between pieces and still
+escapes each piece and refuses a `.` or `..` piece:
+
+```yaml
+path: ${ segments(.path) }      # the iterator yields a whole path
+```
+
+`segments()` lets the value choose **how many** segments it is. Never use it on
+caller input for a stage whose credential the caller does not hold (an
+`endpointRef`, or a `userAccessFilter` stage, which dials with the
+ServiceAccount): split the known shape instead. `segments()` is valid only
+spliced into the path, never in the query.
+
+**A value you encoded yourself is not encoded again.** `.x | @uri` (and
+`@uri "...\(.x)..."`) renders as jq wrote it, so `"/search?q=" + (.q | @uri)`
+sends one value, escaped once. In the path it is still one segment: an encoded
+`/` is refused like a `/`. Any other format (`@base64`, `@sh`, …) is a value.
+
+**A query parameter is declared in the template:**
+`"/events?limit=200&composition_id=" + .uid` encodes `.uid` as one value. A
+whole path that carries its own query (`${ .path }` with `?…` inside) is
+refused; move the query into the template and pass only the values.
+
+A refused value makes no call. Like every refused item (#1116) it **fails its
+stage** with `InvalidPath` and a 400 under the stage's `errorKey`; without
+`continueOnError` it fails the RESTAction. It is counted in `/debug/vars`
+`snowplow_malformed_dial_skipped_total.path_value_refused`.
+
+**Edge cases of `segments(E)`:**
+
+| `E` is… | renders | |
+|---|---|---|
+| `null` or missing | nothing: the template's own text stays, as with jq's `+ null` | `"/a/" + segments(.p) + "/z"` → `/a//z`; `segments(.p) + "/z"` → `/z` |
+| `""` | nothing, the same as `null` | |
+| `a//b` | `a//b`: an empty piece inside the value is kept | a stage that dials this cluster still refuses `/namespaces//` |
+| a number, boolean, array or object | a template error: nothing is sent, the stage fails with `TemplateError` | convert it yourself: `segments(.n \| tostring)` |
+
+`segments()` in the query is refused for every `E`, `null` included.
+
+**A template that renders no path makes no call.** `${ segments(.path) }` with
+`.path` null or `""` renders nothing, and so does a template with no output
+(`${ empty }`). Dialling that would read the endpoint's root with the stage's
+credential, so it is refused, on every stage. It fails its stage with
+`InvalidPath` and a 400, and is counted as
+`snowplow_malformed_dial_skipped_total.empty_interp`. A prewarm runs with no
+`extras`, so a stage whose path comes only from `extras` fails there, and
+nothing is stored for it. To make that stage quiet rather than failed, give it
+an iterator that yields no element when the value is absent
+(`[ {path: .path} | select(.path != null) ]`): an iterator with no elements has
+nothing to call and succeeds.
+
+A stage that has no `path` at all has no template and is unchanged. `${ .path }`
+without `segments()` is one value, and jq's `tostring` of null is the text
+`null`, so write `segments()` for a value that can be absent.
 
 ### `endpointRef` never names a per-user credential
 

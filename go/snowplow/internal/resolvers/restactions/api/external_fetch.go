@@ -14,10 +14,11 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -52,7 +53,7 @@ const maxUnstructuredResponseTextBytes = 2048
 //
 // The TLS/CA/client-cert/proxy/timeout/auth apparatus
 // (HTTPClientForEndpoint, the bearer/basic/AWS roundtrippers,
-// util.NewRetryClient, ComputeAwsHeaders) is REUSED verbatim from
+// ComputeAwsHeaders) is REUSED verbatim from
 // plumbing — the only hand-written part is the request assembly and the
 // 2xx body conversion (AC7; falsifier (k) asserts the auth header on the
 // wire).
@@ -111,10 +112,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 // the same for both.
 func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
-	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
-	if len(opts.Path) > 0 {
-		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(opts.Path, "/"))
-	}
+	// #1137 — the URL is built by the one builder the plan's check reads
+	// (credhttp.RequestURL), so the path checked is the path sent.
+	uri := credhttp.RequestURL(opts.Endpoint.ServerURL, opts.Path)
 
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -239,6 +239,9 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	// byte-identical. The existing shortid X-Krateo-TraceId header set
 	// above is UNTOUCHED — both correlation ids ride the same request.
 	cli.Transport = tracing.WrapTransport(cli.Transport)
+	// #1054 — every attempt the retry client below makes (a 429's 2 s sleep, a
+	// 5xx backoff) is recorded on the request's dial.
+	cli.Transport = slowcall.Transport(cli.Transport)
 	// #615 — a non-UAF SA-endpoint dial under the impersonated-dial marker reads
 	// as the cohort (branche_impersonation.go). No-op for every other dial.
 	cli.Transport = impersonateEndpointTransport(ctx, cli.Transport)
@@ -250,10 +253,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		cli.Transport = pinSADialHost(u, cli.Transport)
 	}
 
-	// REUSED verbatim: retry wrapper.
-	retryCli := util.NewRetryClient(cli)
-
-	respo, err := retryCli.Do(call)
+	// #1088 — the endpoint send policy: a write (any method but GET, HEAD,
+	// OPTIONS, TRACE) is sent once and never re-sent once its bytes may have
+	// reached the server; a safe request keeps plumbing's RetryClient, with every
+	// retry counted and logged with its cause (credhttp/send.go).
+	respo, err := credhttp.Send(credhttp.SendSiteStage, cli, call)
 	if err != nil {
 		// #523: net/http already wraps a transport failure in a *url.Error whose
 		// URL went through its own stripPassword — which replaces the PASSWORD
@@ -261,6 +265,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		// the "https://svc@host/base?token=…" shape still renders its token in
 		// clear. redact.URL removes both.
 		redErr := redact.ErrorURL(err)
+		// #1115 — the request's page budget ended the exchange: 504 Timeout,
+		// with the ExhaustedError's identity-free text (no URL in it).
+		if st, ok := credhttp.BudgetStatus(err); ok {
+			return st, nil, "", redErr
+		}
 		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()

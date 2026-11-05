@@ -23,11 +23,13 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
 func fetchObject(req *http.Request) (got objects.Result) {
+	defer slowcall.Start(req.Context(), slowcall.PhaseObjectFetch).End() // #1054
 	log := xcontext.Logger(req.Context())
 
 	// #443 part 2 — an inline RESTAction (POST /call/read body "object",
@@ -161,6 +163,7 @@ var evaluateRBACFn = rbac.EvaluateRBAC
 // In cache=off mode the gate is implicit in fetchObject's per-user
 // apiserver call.
 func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj rbac.ObjectNamer) bool {
+	defer slowcall.Start(ctx, slowcall.PhaseRBACCheck).End() // #1054
 	log := xcontext.Logger(ctx)
 
 	ui, err := xcontext.UserInfo(ctx)
@@ -269,6 +272,7 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // collapses to the empty-identity row — same shape as cache=off's
 // transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
+	defer slowcall.Start(ctx, slowcall.PhaseKeyMint).End() // #1054
 	// #443 (f) — an inert (dry-run) resolve mints no key and gets no handle:
 	// no L1 lookup, no capture, no Put. This is also a CORRECTNESS rule: an
 	// inline draft named like a stored RESTAction must never be served the
@@ -689,6 +693,14 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 		return nil
 	}
 	return out
+}
+
+// l1Get is a customer dispatch's L1 read of its response cell, timed as the
+// request's l1_get phase (#1054): the store's single mutex plus a map read,
+// so time here is that lock.
+func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, bool) {
+	defer slowcall.Start(ctx, slowcall.PhaseL1Get).End()
+	return h.Get(key)
 }
 
 // cacheHandle is the narrow interface the dispatchers depend on. The

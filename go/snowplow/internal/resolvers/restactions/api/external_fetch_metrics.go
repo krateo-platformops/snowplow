@@ -55,6 +55,8 @@ import (
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // External-fetch origins (closed set).
@@ -240,6 +242,37 @@ func init() {
 		}))
 		expvar.Publish("snowplow_external_fetch_abandoned_by_driver_total", expvar.Func(func() any {
 			return externalFetchDriverMap(ExternalFetchAbandonedByDriverSnapshot())
+		}))
+		// #1088 — every endpoint retry by {site: {cause: n}} (credhttp/send.go),
+		// and the stage fetch's per-identity client cache.
+		expvar.Publish("snowplow_endpoint_retries_total", expvar.Func(func() any {
+			out := map[string]map[string]uint64{}
+			for _, c := range credhttp.EndpointRetriesSnapshot() {
+				if out[c.Site] == nil {
+					out[c.Site] = map[string]uint64{}
+				}
+				out[c.Site][c.Cause] = c.Count
+			}
+			return out
+		}))
+		// #1115 — every budgeted (customer) exchange by what the page budget
+		// did to it, and the retry reserve it uses.
+		expvar.Publish("snowplow_page_budget", expvar.Func(func() any {
+			byResult := map[string]uint64{}
+			for _, c := range pagebudget.ExchangesSnapshot() {
+				byResult[c.Result.String()] = c.Count
+			}
+			reserve, measured := credhttp.RetryReserve()
+			return map[string]any{
+				"exchanges_total":        byResult,
+				"retry_reserve_ms":       reserve.Milliseconds(),
+				"retry_reserve_measured": measured,
+				"reserve_samples_total":  credhttp.RetryReserveSamples(),
+			}
+		}))
+		expvar.Publish("snowplow_stage_endpoint_clients", expvar.Func(func() any {
+			n, builds, evictions := StageEndpointClientsStats()
+			return map[string]uint64{"entries": uint64(n), "builds_total": builds, "evictions_total": evictions}
 		}))
 	})
 }

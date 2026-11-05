@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -167,7 +168,10 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		slog.Warn("schema: SA discovery singleton unavailable; "+
 			"falling back to per-call client",
 			slog.String("error", err.Error()))
-		cli, err = dynamic.NewClient(rc)
+		// #1115 — this client is built for this call alone: bind the
+		// request's page budget to it (its mapper's discovery sends on
+		// client-go's own context.TODO(); background work has no budget).
+		cli, err = dynamic.NewClient(credhttp.BindRequestBudget(ctx, rc))
 		if err != nil {
 			return err
 		}

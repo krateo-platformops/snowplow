@@ -17,6 +17,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -255,7 +256,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -305,7 +306,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			setStoredStageOutcomesHeader(wri, entry) // #904
-			staleHitWritePoint(cacheKey, entry)      // #710 PR-2b
+			// #710 PR-2b; #1062 — armed (the header above), for this requester.
+			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -380,7 +382,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// resolve may be served a KNOWN-STALE content cell at once (D2, "show then
 		// replace"); the sink carries the fact to the Put below (StaleDerived) and
 		// the content layer's debt pushes this key once the fresh value lands.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
 	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
@@ -442,14 +444,20 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// above. Whatever bumps it, wherever that happens and however many resolver
 	// frames down, the Put-gate below reads Count()>0 and declines.
 	//
-	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
-	// one — its own spec declares no userAccessFilter, so the declaration limb is
-	// blind to it, while its resolved body still carries per-requester-narrowed
-	// rows. That case is NOT closed on this branch: the only bump today is
-	// declaration-based (apiref.Resolve) and inspects the parent — the blindness
-	// is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref). It
-	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
-	// is TestA4_RefilterBumpsUAFTouchedSink.
+	// A NON-UAF RESTAction that NESTS a UAF one declares no userAccessFilter, so
+	// the declaration limb (apiref.Resolve) is blind to it (asserted by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref), while its resolved
+	// body still carries per-requester-narrowed rows. Two shapes, two gates:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under this ctx, so the refilter's execution-based bump
+	//     (applyUserAccessFilterOnPig, present since 1.12.3) marks this sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call): the child
+	//     is a separate request and its refilter marks only that request's sink.
+	//     This Put is declined by the external-touched verdict below instead —
+	//     the dial is a branch-E send, which bumps extTouchedSink, and on this
+	//     handler an external touch is a permanent decline.
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under; no arm drives a nested in-process resolve against this sink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	// v7 Step 2D — DARK shadow-parity. Install the read-only shadow context (the
 	// cell's identity-free access domain D + this requester's identity + the
@@ -480,6 +488,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	})
 	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
+		// #1116 — extras that name a key the resolver writes: a 400 naming
+		// the keys. Nothing was read or dialled, so there is no stale-derived
+		// pass to withdraw.
+		if WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		// #905 (c) — an error from a stale-derived pass is withdrawn and the
 		// request re-run with D2 disabled, exactly like a declined body: a write
 		// held in that pass (rule a) makes a filter that needs its output fail,
@@ -507,7 +521,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// bytes for the next lookup. Sharing the same []byte between the
 	// http.ResponseWriter write path and the cache entry is safe
 	// because the cache treats RawJSON as immutable once put.
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
 		log.Error("unable to encode rest action response",
 			slog.String("name", cr.Name),

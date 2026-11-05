@@ -15,10 +15,12 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
@@ -139,7 +141,11 @@ func configSources(t *testing.T) map[string]*rest.Config {
 	// config already carries.
 	drained := flowcontrol.NewTokenBucketRateLimiter(5, 10)
 	hd := Harden(&rest.Config{Host: testHost, QPS: 5, Burst: 10, RateLimiter: drained})
-	return map[string]*rest.Config{"InClusterConfig": ic, "NewClientConfig": cc, "Harden": hd}
+	// #1115 — BindRequestBudget copies a config for one budgeted request; the
+	// copy of a config that carries a limiter must not carry it either.
+	bound := BindRequestBudget(pagebudget.WithCustomer(context.Background(), time.Now()),
+		&rest.Config{Host: testHost, QPS: 5, Burst: 10, RateLimiter: flowcontrol.NewTokenBucketRateLimiter(5, 10)})
+	return map[string]*rest.Config{"InClusterConfig": ic, "NewClientConfig": cc, "Harden": hd, "BindRequestBudget": bound}
 }
 
 // Control: the instrument sees the default limiter when it is there. Built

@@ -52,6 +52,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -115,9 +116,7 @@ var subresourceSuffixes = []string{
 // resource names that contain the suffix string (e.g. a Deployment
 // literally named "status") are not false-positive-rejected.
 func hasSubresourceSuffix(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	path = strings.TrimRight(path, "/")
 	for _, sfx := range subresourceSuffixes {
 		if strings.HasSuffix(path, sfx) {
@@ -464,6 +463,7 @@ func dispatchContentViaInformer(ctx context.Context, call httpcall.RequestOption
 // RecordApiserverFallthrough, so the apiserver LIST that follows is labelled
 // with it on snowplow_resolve_collection_lists. On a served call it is ctx.
 func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context, error) {
+	defer slowcall.Start(ctx, slowcall.PhaseInformerDispatch).End() // #1054
 	log := xcontext.Logger(ctx)
 
 	// 0.30.96: lazy-start the informer_dispatch.summary goroutine the
@@ -617,15 +617,19 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		servedAfterWait := false
 		if budget := syncWaitBudget(); budget > 0 && syncCh != nil {
 			timer := time.NewTimer(budget)
+			wait := slowcall.StartWait(ctx, slowcall.PhaseInformerSyncWait, "informer_sync", "", gvr.String()) // #1054
 			select {
 			case <-syncCh:
 				// Initial WaitForCacheSync completed within the budget.
 				timer.Stop()
+				wait.End()
 			case <-ctx.Done():
 				// Request cancelled — abandon the wait, fall through.
 				timer.Stop()
+				wait.EndRelease(slowcall.CauseOf(ctx.Err()))
 			case <-timer.C:
 				// Budget exhausted — informer still not synced.
+				wait.EndRelease(slowcall.ReleaseTimeout)
 			}
 			// Re-check servability ONCE after the bounded wait. A now-
 			// servable GVR proceeds to the served path below (no second
@@ -795,7 +799,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// this one are recorded identically by the caller.
 		if !cache.ApistageContentResolveFromContext(ctx) {
 			var gateErr error
-			items, gateErr = filterListByRBAC(ctx, gvr, namespace, items)
+			// #1049: the gate authorizes the request as written, query
+			// included — a metadata.name field selector carries a Name.
+			_, rawQuery, _ := splitPathQuery(call.Path)
+			items, gateErr = filterListByRBAC(ctx, gvr, namespace, rawQuery, items)
 			if isRegateDenied(gateErr) {
 				return nil, false, ctx, gateErr
 			}

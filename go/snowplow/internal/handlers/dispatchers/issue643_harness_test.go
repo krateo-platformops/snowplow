@@ -360,6 +360,9 @@ func h643Setup(t *testing.T, o h643Opts) *h643Env {
 	t.Cleanup(resetSeedUnitCostForTest)
 	resetPrewarmPassStatsForTest()
 	t.Cleanup(resetPrewarmPassStatsForTest)
+	// #1166 — every engine pass settles the registered set once; on the virtual
+	// clock that window (750 ms of real time per pass) runs on exact instants.
+	useVirtualSettleClock(t, newVirtualSettleClock())
 
 	env := &h643Env{t: t, ep: newH643Endpoint(t), external: map[string]bool{}}
 	if o.walk {
@@ -592,6 +595,51 @@ func h643Budget(t *testing.T, m map[prewarmScopeKind]time.Duration) {
 		return time.Hour
 	}
 	t.Cleanup(func() { prewarmScopeTimeoutFn = prev })
+}
+
+// h643VirtualBudget (#1166): the arm's pass budgets run out only when a unit it
+// holds says so (h643HoldUntilBudget), at that instant, instead of after the
+// budget's real seconds. The budget's VALUE is unchanged (h643Budget): processScope
+// still records it, and the pass ctx still carries its deadline. The expiry is
+// the pass ctx's cancel with cause context.DeadlineExceeded, so a derived ctx
+// ends exactly as under the real deadline (the engine treats any ctx end of a
+// pass as a cut). Only arms whose cut is a held unit use it: an arm whose budget
+// must run out by itself keeps the real deadline.
+func h643VirtualBudget(t *testing.T) {
+	t.Helper()
+	f := func(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancelCause(parent)
+		b := &h643ArmBudget{expire: func() { cancel(context.DeadlineExceeded) }}
+		return &h643BudgetCtx{Context: context.WithValue(ctx, h643BudgetKey{}, b), deadline: time.Now().Add(budget)},
+			func() { cancel(context.Canceled) }
+	}
+	prev := prewarmScopeBudget.Swap(&f)
+	t.Cleanup(func() { prewarmScopeBudget.Store(prev) })
+}
+
+type h643BudgetKey struct{}
+
+type h643ArmBudget struct{ expire func() }
+
+// h643BudgetCtx carries the budget's deadline, as context.WithTimeout's does.
+type h643BudgetCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c *h643BudgetCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+// h643HoldUntilBudget holds a unit until its pass's budget runs out, and runs it
+// out: the arm's cut lands at this unit, as it did when the unit waited for the
+// real deadline.
+func h643HoldUntilBudget(ctx context.Context) error {
+	b, ok := ctx.Value(h643BudgetKey{}).(*h643ArmBudget)
+	if !ok {
+		panic("h643HoldUntilBudget: the pass has no virtual budget (h643VirtualBudget)")
+	}
+	b.expire()
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // pass enqueues s and runs exactly ONE processScope for it through the real

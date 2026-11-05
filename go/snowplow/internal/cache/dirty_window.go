@@ -402,7 +402,8 @@ func (r *refresher) windowContinue(key string, t0 time.Time) {
 // only, no store re-entry). A window that is not in flight ends here as evicted;
 // an in-flight one is ended by its dequeue's outcome (the stamp is gone).
 func evictDirtyWindow(key string) {
-	ledgerEvicted(key) // #870 — the key left the store: its push-ledger entries close evicted
+	ledgerEvicted(key)        // #870 — the key left the store: its push-ledger entries close evicted
+	noteStalePushEvicted(key) // #1062 — its stale serves are replaced: a refetch is a fresh fill
 	r := refresherPeek()
 	if r == nil {
 		return

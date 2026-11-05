@@ -108,7 +108,8 @@ func TestIssue988_OFF_AnUnscopedResolveIsNotCounted(t *testing.T) {
 // (no held mark, no SA dial) and points at the apiserver sends a marked LIST.
 // It is a resolve's LIST and must be counted, once. A held dial, whose chain
 // already counts through credhttp.Client, must not count twice. The named
-// endpoint keeps net/http's redirect behaviour (no credhttp.Client).
+// endpoint's client carries no credhttp.Client (its cross-origin redirect
+// refusal, #1106, is applied by credhttp.Send, not by the client).
 func TestIssue988_EP_ANamedEndpointRefListIsCounted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

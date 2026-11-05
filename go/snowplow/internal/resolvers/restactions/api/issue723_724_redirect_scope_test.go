@@ -6,9 +6,9 @@ package api
 //   - A per-user clientconfig (held credential, credhttp.WithHeldCredential)
 //     with a private CA takes the OWNED client branch (buildEndpointClient →
 //     client-go transport.New). It must not follow a redirect either.
-//   - A named endpointRef (no mark) carries the third party's OWN credential
-//     and keeps net/http's default behaviour. This arm pins that the policy
-//     is keyed on provenance and did not widen.
+//   - A named endpointRef (no mark) carries the third party's OWN credential:
+//     since #1106 it never follows a cross-host redirect either, and still
+//     follows a same-host one (a held credential refuses both).
 //   - A hardened *rest.Config used by a client snowplow does NOT build
 //     (plumbing's endpoints.FromSecret builds its own REST client from rc):
 //     the rc-level hop refusal stops the hop.
@@ -48,7 +48,7 @@ func TestIssue723_HeldClientconfigOwnedCABranchNeverFollowsRedirect(t *testing.T
 		rig := newRedirectRig(t, code, true) // only rig.other is used
 		api := newTLSRedirector(t, code, rig.other.URL+"/stolen")
 		ep := &endpoints.Endpoint{ServerURL: api.URL, Token: "user-token-held", CertificateAuthorityData: caOf(api)}
-		if !endpointNeedsOwnedCAClient(ep) {
+		if !endpointOwnedShape(ep) {
 			t.Fatal("fixture must take the owned-CA branch")
 		}
 		ctx := credhttp.WithHeldCredential(context.Background())
@@ -65,14 +65,32 @@ func TestIssue723_HeldClientconfigOwnedCABranchNeverFollowsRedirect(t *testing.T
 	}
 }
 
-func TestIssue723_NamedEndpointRefKeepsDefaultRedirectBehaviour(t *testing.T) {
-	rig := newRedirectRig(t, http.StatusFound, true)
-	res, body, _, _ := httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
-		RequestInfo: httpcall.RequestInfo{Path: "/api/x", Verb: ptr.To(http.MethodGet)},
-		Endpoint:    &endpoints.Endpoint{ServerURL: rig.apiserver.URL, Token: "third-party-own-token"},
-	})
-	if len(rig.otherHits.all()) != 1 || res == nil || res.Status == response.StatusFailure || body == nil {
-		t.Fatalf("an unmarked (named endpointRef) dial must keep following redirects as before: hits=%d res=%+v", len(rig.otherHits.all()), res)
+// #1106 — this arm used to pin that a named endpointRef FOLLOWED a cross-host
+// redirect, and never looked at what the other host received: the endpoint's
+// own token. A named ref now refuses a cross-host redirect of a credentialed
+// hop (credhttp.EndpointClient), and still follows a same-host one.
+func TestIssue723_NamedEndpointRefRefusesCrossHostRedirect_FollowsSameHost(t *testing.T) {
+	for _, code := range redirectCodes {
+		rig := newRedirectRig(t, code, true)
+		res, body, _, _ := httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
+			RequestInfo: httpcall.RequestInfo{Path: "/api/x", Verb: ptr.To(http.MethodGet)},
+			Endpoint:    &endpoints.Endpoint{ServerURL: rig.apiserver.URL, Token: "third-party-own-token"},
+		})
+		if hits := rig.otherHits.all(); len(hits) != 0 {
+			t.Fatalf("code=%d: RED — %d request(s) reached the other host, the first with the endpoint's credential=%v", code, len(hits), hits[0].auth != "")
+		}
+		if res == nil || res.Status != response.StatusFailure || res.Code != code || body != nil {
+			t.Fatalf("code=%d: want the redirect itself as a Failure and no body, got %+v body=%q", code, res, body)
+		}
+
+		same := newRedirectRig(t, code, false)
+		res, body, _, _ = httpFetchAllowingNonJSON(context.Background(), httpcall.RequestOptions{
+			RequestInfo: httpcall.RequestInfo{Path: "/api/x", Verb: ptr.To(http.MethodGet)},
+			Endpoint:    &endpoints.Endpoint{ServerURL: same.apiserver.URL, Token: "third-party-own-token"},
+		})
+		if hits := same.sameHits.all(); len(hits) != 1 || hits[0].auth == "" || res == nil || res.Status == response.StatusFailure || body == nil {
+			t.Fatalf("code=%d: a same-host redirect of a named endpointRef is still followed with its credential: hits=%d res=%+v", code, len(same.sameHits.all()), res)
+		}
 	}
 }
 
