@@ -35,6 +35,15 @@ This module owns that lifecycle and nothing else:
     its forwarding rule and address before the cluster goes, then deletes
     what is left of the address names it recorded from THIS cluster's
     Services (`address_backstop`), unused ones only.
+  - Quotas (#1171, #1173): RUN_QUOTAS is every quota the run consumes
+    (clusters, SSD and standard disk, vCPUs per family and in all regions,
+    instances, in-use and static addresses, forwarding rules, backend
+    services and NEGs from GKE 1.37, instance groups); `footprint()` derives
+    the run's need of each from the spec gke-up creates and the install's
+    LoadBalancer Services; IN_USE_ADDRESSES's used is counted from the
+    region's VMs, forwarding rules and addresses (read-only lists); gke-up
+    (and run606_pair.sh for both runs) refuses a run that does not fit,
+    naming the quota and both numbers.
 
 Every command is built as an argv list and only EXECUTED by `execute()`,
 which honours dry-run. The unit tests drive the builders and never shell out.
@@ -133,6 +142,9 @@ class NodePool:
     taint: tuple[str, str, str] | None = None
     labels: tuple[tuple[str, str], ...] = ()
     disk_gb: int = 100
+    # the boot disk: pd-standard counts against the region's DISKS_TOTAL_GB
+    # (SSD_TOTAL_GB has the PVC disks to hold; #1171 RUN_QUOTAS)
+    disk_type: str = "pd-standard"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +249,8 @@ def default_spec(name: str | None = None, *, now: float | None = None,
     ~133 GB free, so node disks are pd-standard (DISKS_TOTAL_GB 4096);
     IN_USE_ADDRESSES is 16 with 3 used, so 5 nodes + ~5 LoadBalancers fit.
     With an n2-standard-16 loadgen the cluster is 48 N2 vCPUs (40 before).
+    Those readings are history: gke-up READS every quota the run consumes
+    and refuses a run that does not fit (#1171, RUN_QUOTAS).
     """
     now = time.time() if now is None else now
     if name is None:
@@ -260,6 +274,12 @@ def default_spec(name: str | None = None, *, now: float | None = None,
         extra_pools=pools,
         kubeconfig=os.path.join(kdir, f"{name}.kubeconfig"),
     )
+
+
+def node_locations(spec: ClusterSpec) -> list[str]:
+    """The zones every node pool has nodes in (--node-locations): the spec's
+    one zone. --num-nodes is per node location, so a pool makes count x this."""
+    return [spec.zone]
 
 
 def kube_context(spec: ClusterSpec) -> str:
@@ -316,7 +336,7 @@ def _pool_flags(pool: NodePool) -> list[str]:
     flags = [
         "--machine-type", pool.machine_type,
         "--num-nodes", str(pool.count),
-        "--disk-type", "pd-standard",
+        "--disk-type", pool.disk_type,
         "--disk-size", str(pool.disk_gb),
     ]
     if pool.taint:
@@ -338,7 +358,7 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
     # REGIONAL control plane, every node in ONE zone: --num-nodes is per node
     # location, so with the one zone each pool keeps its count (no extra nodes)
     loc = ["--project", spec.project, "--region", spec.region]
-    nodes = ["--node-locations", spec.zone]
+    nodes = ["--node-locations", ",".join(node_locations(spec))]
     cmds = [[
         "gcloud", "container", "clusters", "create", spec.name, *loc, *nodes,
         "--cluster-version", spec.cluster_version,
@@ -943,20 +963,10 @@ def pvc_footprint_gb(pvcs: Iterable[dict]) -> int:
 
 
 
-def ssd_quota_command(project: str, zone: str) -> list[str]:
+def region_quotas_command(project: str, zone: str) -> list[str]:
+    """Every quota of the region, its limit and usage (#1171: RUN_QUOTAS reads them)."""
     return ["gcloud", "compute", "regions", "describe", region_of(zone), "--project", project,
             "--format", "json"]
-
-
-def ssd_quota_fit(region: dict, need_gb: float) -> tuple[bool, str]:
-    """Does `need_gb` of PVC disk fit the region's SSD_TOTAL_GB (limit - usage)?"""
-    q = next((x for x in region.get("quotas") or [] if x.get("metric") == SSD_QUOTA_METRIC), None)
-    if q is None or q.get("limit") is None or q.get("usage") is None:
-        return False, f"{SSD_QUOTA_METRIC} not in the region's quotas: whether the run fits is unknown"
-    free = float(q["limit"]) - float(q["usage"])
-    msg = (f"{SSD_QUOTA_METRIC} in {region.get('name')}: {q['usage']:g} of {q['limit']:g} GB used, "
-           f"{free:g} free; the run needs {need_gb:g} GB of PVC disk")
-    return free >= need_gb, msg
 
 
 # ─── GKE's per-location cluster limit (#985) ────────────────────────────────
@@ -1690,20 +1700,388 @@ def address_backstop(spec: ClusterSpec, *, services: list[dict] | None, log: Cal
     return leaked, problems
 
 
-def address_quota_fit(region: dict, need: int) -> tuple[bool, str]:
-    """Do `need` LoadBalancer Services' static addresses fit the region's
-    STATIC_ADDRESSES (limit - usage)?"""
-    q = next((x for x in region.get("quotas") or [] if x.get("metric") == STATIC_QUOTA_METRIC), None)
-    if q is None or q.get("limit") is None or q.get("usage") is None:
-        return False, f"{STATIC_QUOTA_METRIC} not in the region's quotas: whether the run fits is unknown"
-    free = float(q["limit"]) - float(q["usage"])
-    msg = (f"{STATIC_QUOTA_METRIC} in {region.get('name')}: {q['usage']:g} of {q['limit']:g} used, {free:g} free; "
-           f"the run creates {need} LoadBalancer Service(s), each needs one while GKE builds its load balancer")
-    return free >= need, msg
-
-
 ADDRESS_REFUSAL_HINT = ("Free STATIC_ADDRESSES first (leaked addresses are RESERVED with no users: gcloud compute "
                         "addresses list --filter='status=RESERVED'; delete only those whose Service is gone)")
+
+
+# ─── Every quota the run consumes (#1171, #1173) ────────────────────────────
+#
+# Run 21 attempt 2 failed 30 min in: cluster A's gateway LoadBalancer stayed
+# pending, "Quota 'IN_USE_ADDRESSES' exceeded" (limit 16 in europe-west4),
+# while the pre-check had read STATIC_ADDRESSES only. Every node of a bench
+# cluster holds an external IP (create_commands makes public nodes) and every
+# LoadBalancer Service holds one more (its forwarding rule's).
+#
+# So the run's footprint, what it makes, is derived from the spec gke-up
+# creates (its node pools, their machine types, boot disks and node
+# locations, its GKE version) and from the LoadBalancer Services its install
+# creates (bench/lb_need.py), and RUN_QUOTAS says which quota each part counts
+# against. gke-up refuses a run whose footprint does not fit, before anything
+# is created, naming the quota and both numbers; run606_pair.sh does the same
+# for both runs' footprints together (each dry pass writes its own,
+# $OUT/footprint.json). tests/test_1171_run_quotas.py checks the table
+# against the argv create_commands builds, so a newly consumed resource
+# cannot be left out.
+#
+# IN_USE_ADDRESSES: what is USED is counted from the resources that hold an
+# address, not taken from the usage `regions describe` reports (#1173). GCE's
+# words (docs.cloud.google.com/compute/resource-usage, "External IP
+# addresses", read 2026-11-05): in-use IP addresses are "the number of static
+# and ephemeral regional external IP addresses that you can use in your
+# project simultaneously"; "Regional IP quota is for assigning IPv4 or IPv6
+# addresses to VMs in that region"; "If the same IP address is assigned to
+# more than one forwarding rule, Google Cloud counts and adds each usage of the
+# address towards the IN_USE_ADDRESSES quota". The reported usage leaves the
+# forwarding rules' out: three readings of europe-west4 (2026-10-25: 13 used
+# beside 13 instances and 13 external forwarding rules; 2026-11-04 22:20Z: 13
+# used beside 13 node IPs and 9; 2026-11-05 01:0xZ: 0 used beside 5 leaked
+# forwarding rules and no nodes), while GCE refused run 21's forwarding rule on
+# this quota. So used = every VM external IP + every external forwarding
+# rule's use of an address + every regional external address held by neither
+# (reserved and unattached, or held by another resource: the docs do not say
+# whether an unattached reservation counts, so it does). Both numbers go in
+# every line, the listed one and the one GCE reports, and used is the larger:
+# each counts addresses GCE enforces, neither is known to be complete.
+
+
+@dataclasses.dataclass
+class Footprint:
+    """What a run makes (a pair: the sum of both runs')."""
+    clusters: int = 0
+    nodes: int = 0
+    node_external_ips: int = 0                   # public nodes: one ephemeral external IP each
+    vcpus: dict[str, int] = dataclasses.field(default_factory=dict)          # machine family -> vCPUs
+    boot_disk_gb: dict[str, int] = dataclasses.field(default_factory=dict)   # disk type -> GB
+    node_groups: int = 0                         # node pools x node locations: one MIG, group, template each
+    lb_services: int = 0                         # bench/lb_need.py: a forwarding rule + its IP each
+    lb_backend_services: int = 0                 # GKE >= 1.37: a regional backend service per LB Service
+    lb_negs: int = 0                             # GKE >= 1.37: a GCE_VM_IP NEG per LB Service per zone
+    pvc_gb: int = 0                              # the install's PVC disks (BENCH_PVC_FOOTPRINT_GB a cluster)
+
+    def __add__(self, other: "Footprint") -> "Footprint":
+        out = {}
+        for f in dataclasses.fields(self):
+            a, b = getattr(self, f.name), getattr(other, f.name)
+            out[f.name] = ({k: a.get(k, 0) + b.get(k, 0) for k in sorted({*a, *b})} if isinstance(a, dict)
+                           else a + b)
+        return Footprint(**out)
+
+    def to_json(self) -> dict:
+        return {"kind": "run_footprint", **dataclasses.asdict(self)}
+
+    @classmethod
+    def from_json(cls, d) -> "Footprint":
+        if not isinstance(d, dict) or d.get("kind") != "run_footprint":
+            raise ValueError("not a run footprint")
+        names = {f.name for f in dataclasses.fields(cls)}
+        if set(d) - {"kind"} != names:
+            raise ValueError(f"a run footprint has exactly the fields {sorted(names)}")
+        fp = cls(**{k: d[k] for k in names})
+        for f in dataclasses.fields(cls):
+            v = getattr(fp, f.name)
+            vals = list(v.values()) if isinstance(v, dict) else [v]
+            if not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in vals):
+                raise ValueError(f"{f.name}: not a count")
+        return fp
+
+
+# GCE's machine type names: <family>-<class>-<vCPUs>[-<memory MB>, custom types]
+_MACHINE = re.compile(r"([a-z][a-z0-9]*)-(?:standard|highmem|highcpu|custom)-(\d+)(?:-\d+)?")
+# the regional quota each boot disk type counts against (SSD_TOTAL_GB: pd-ssd and pd-balanced)
+DISK_QUOTA = {"pd-standard": "DISKS_TOTAL_GB", "pd-balanced": SSD_QUOTA_METRIC, "pd-ssd": SSD_QUOTA_METRIC}
+# GKE's load balancer for a plain LoadBalancer Service (no loadBalancerClass, no l4-rbs
+# annotation; docs.cloud.google.com/kubernetes-engine/docs/concepts/service-load-balancer,
+# read 2026-11-05): before 1.37 a target pool-based regional external passthrough NLB
+# (target pools are a project-wide quota); from 1.37 "a backend service-based regional
+# external passthrough Network Load Balancer with GCE_VM_IP NEG backends", and "GKE creates
+# a unique GCE_VM_IP NEG in each zone for each LoadBalancer Service". Either way one
+# forwarding rule per single-stack Service.
+BACKEND_SERVICE_LB_SINCE = (1, 37)
+
+
+def gke_minor(version: str) -> tuple[int, int]:
+    """(major, minor) of a GKE version: 1.36, 1.37.2-gke.1000 -> (1, 36), (1, 37)."""
+    m = re.match(r"(\d+)\.(\d+)(?:\.|-|$)", version or "")
+    if not m:
+        raise ValueError(f"cluster version {version!r}: its GKE minor cannot be read, so neither can the kind "
+                         f"of load balancer its LoadBalancer Services get")
+    return int(m.group(1)), int(m.group(2))
+
+
+def machine_vcpus(machine_type: str) -> tuple[str, int]:
+    """(machine family, vCPUs) of a machine type: n2-standard-16 -> (n2, 16)."""
+    m = _MACHINE.fullmatch(machine_type or "")
+    if not m:
+        raise ValueError(f"machine type {machine_type!r}: its vCPUs cannot be read from its name")
+    return m.group(1), int(m.group(2))
+
+
+def footprint(spec: ClusterSpec, *, lb_services: int, pvc_gb: int = BENCH_PVC_FOOTPRINT_GB) -> Footprint:
+    """The run's footprint: the cluster create_commands(spec) makes, and the
+    install's LoadBalancer Services and PVC disks. ValueError when a part of
+    it cannot be read (a machine type, disk type or GKE version RUN_QUOTAS
+    does not know)."""
+    fp = Footprint(clusters=1, lb_services=int(lb_services), pvc_gb=int(pvc_gb))
+    locs = node_locations(spec)
+    if gke_minor(spec.cluster_version) >= BACKEND_SERVICE_LB_SINCE:
+        fp.lb_backend_services = fp.lb_services
+        fp.lb_negs = fp.lb_services * len(locs)
+    for pool in (spec.platform_pool, *spec.extra_pools):
+        if pool.disk_type not in DISK_QUOTA:
+            raise ValueError(f"node pool {pool.name}: disk type {pool.disk_type!r} counts against no quota "
+                             f"RUN_QUOTAS knows")
+        family, vcpus = machine_vcpus(pool.machine_type)
+        n = pool.count * len(locs)
+        fp.nodes += n
+        fp.node_external_ips += n
+        fp.vcpus[family] = fp.vcpus.get(family, 0) + n * vcpus
+        fp.boot_disk_gb[pool.disk_type] = fp.boot_disk_gb.get(pool.disk_type, 0) + n * pool.disk_gb
+        fp.node_groups += len(locs)
+    return fp
+
+
+def _boot_gb(fp: Footprint, metric: str) -> int:
+    return sum(gb for t, gb in fp.boot_disk_gb.items() if DISK_QUOTA[t] == metric)
+
+
+def _ssd_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    boot = _boot_gb(fp, SSD_QUOTA_METRIC)
+    parts = [f"{fp.pvc_gb} GB of PVC disk ({fp.clusters} bench cluster(s))"] + (
+        [f"{boot} GB of node boot disk"] if boot else [])
+    n = fp.pvc_gb + boot
+    return [(SSD_QUOTA_METRIC, n, f"the run needs {n} GB: " + " + ".join(parts))]
+
+
+def _disks_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    n = _boot_gb(fp, "DISKS_TOTAL_GB")
+    return [("DISKS_TOTAL_GB", n, f"the run needs {n} GB of node boot disk ({fp.nodes} nodes)")]
+
+
+def _cpus_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    return [(f"{fam.upper()}_CPUS", v, f"the run needs {v} vCPUs ({fam} nodes)") for fam, v in sorted(fp.vcpus.items())]
+
+
+def _all_regions_cpus_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    n = sum(fp.vcpus.values())
+    return [("CPUS_ALL_REGIONS", n, f"the run needs {n} vCPUs (every node, any family)")]
+
+
+def _in_use_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    n = fp.node_external_ips + fp.lb_services
+    return [("IN_USE_ADDRESSES", n, f"the run needs {n}: {fp.node_external_ips} node external IP(s) + "
+                                    f"{fp.lb_services} LoadBalancer IP(s)")]
+
+
+def _per_node_group(metric: str, what: str) -> Callable[[Footprint], list[tuple[str, int, str]]]:
+    return lambda fp: [(metric, fp.node_groups,
+                        f"the run needs {fp.node_groups}: one {what} per node pool per node location")]
+
+
+EXTERNAL_LB_SCHEMES = ("EXTERNAL", "EXTERNAL_MANAGED")
+
+
+def _in_region(url, region: str) -> bool:
+    """A zone or region URL (or name) is in `region`."""
+    return region_of(_region_of_url(url)) == region
+
+
+def in_use_addresses(listed: dict[str, list[dict]], region: str) -> tuple[int, str]:
+    """The region's external IP addresses in use, counted from what holds
+    them (module comment above): (count, what they are)."""
+    vm = 0
+    for i in listed["instances"]:
+        if not _in_region(i.get("zone"), region):
+            continue
+        for nic in i.get("networkInterfaces") or []:
+            vm += sum(1 for ac in nic.get("accessConfigs") or [] if ac.get("natIP"))
+            vm += sum(1 for ac in nic.get("ipv6AccessConfigs") or [] if ac.get("externalIpv6"))
+    fr = sum(1 for r in listed["forwarding-rules"]
+             if _in_region(r.get("region"), region) and r.get("loadBalancingScheme") in EXTERNAL_LB_SCHEMES
+             and r.get("IPAddress"))
+    held = sum(1 for a in listed["addresses"]
+               if _in_region(a.get("region"), region) and (a.get("addressType") or "EXTERNAL") == "EXTERNAL"
+               and not any("/instances/" in u or "/forwardingRules/" in u for u in a.get("users") or []))
+    return vm + fr + held, (f"{vm} VM external IP(s) + {fr} forwarding-rule use(s) + {held} address(es) held by "
+                            f"neither")
+
+
+@dataclasses.dataclass(frozen=True)
+class RunQuota:
+    """A quota the run consumes. `needs(footprint)` -> [(metric, need, what
+    of the run counts against it)]; the CPU row has one metric per machine
+    family the run's nodes are of. `used(listed, region)`, when a row has it,
+    counts what is used from the resources `reads` lists, beside the usage GCE
+    reports."""
+    quota: str
+    source: str        # "region": regions describe; "project": project-info describe; "cloudquotas": #985
+    unit: str
+    needs: Callable[[Footprint], list[tuple[str, int, str]]]
+    hint: str = ""
+    reads: tuple[str, ...] = ()
+    used: Callable[[dict[str, list[dict]], str], tuple[int, str]] | None = None
+    # the docs give the quota to some projects only: a project that does not list it has no such limit
+    some_projects_only: bool = False
+
+
+RUN_QUOTAS: tuple[RunQuota, ...] = (
+    RunQuota(CLUSTER_QUOTA_ID, "cloudquotas", "",
+             lambda fp: [(CLUSTER_QUOTA_ID, fp.clusters, f"the run needs {fp.clusters}")]),
+    RunQuota(SSD_QUOTA_METRIC, "region", " GB", _ssd_need,
+             hint="Free SSD_TOTAL_GB first (leaked PVC disks: gcloud compute disks list "
+                  "--filter='labels.created-by=bench-gke')"),
+    RunQuota("DISKS_TOTAL_GB", "region", " GB", _disks_need),
+    # a family with its own regional quota counts there, not in CPUS (2026-10-25: CPUS 24
+    # used while N2_CPUS 96); a family whose quota the region does not list is unknown
+    RunQuota("<FAMILY>_CPUS", "region", "", _cpus_need),
+    # "some new accounts and projects also have a global CPUs (All Regions) quota ... measured
+    # as a sum of all your vCPUs in all regions" (compute/resource-usage, read 2026-11-05)
+    RunQuota("CPUS_ALL_REGIONS", "project", "", _all_regions_cpus_need, some_projects_only=True),
+    RunQuota("INSTANCES", "region", "", lambda fp: [("INSTANCES", fp.nodes, f"the run needs {fp.nodes} (its nodes)")]),
+    RunQuota("IN_USE_ADDRESSES", "region", "", _in_use_need,
+             hint="Every VM external IP, every external forwarding rule and every unattached reserved address in "
+                  "the region counts, any cluster's (gcloud compute instances list; gcloud compute "
+                  "forwarding-rules list; gcloud compute addresses list)",
+             reads=("instances", "forwarding-rules", "addresses"), used=in_use_addresses),
+    RunQuota(STATIC_QUOTA_METRIC, "region", "",
+             lambda fp: [(STATIC_QUOTA_METRIC, fp.lb_services,
+                          f"the run creates {fp.lb_services} LoadBalancer Service(s), each needs one while GKE "
+                          f"builds its load balancer")],
+             hint=ADDRESS_REFUSAL_HINT),
+    RunQuota("EXTERNAL_NETWORK_LB_FORWARDING_RULES", "region", "",
+             lambda fp: [("EXTERNAL_NETWORK_LB_FORWARDING_RULES", fp.lb_services,
+                          f"the run needs {fp.lb_services}: one per LoadBalancer Service")]),
+    RunQuota("REGIONAL_EXTERNAL_NETWORK_LB_BACKEND_SERVICES", "region", "",
+             lambda fp: [("REGIONAL_EXTERNAL_NETWORK_LB_BACKEND_SERVICES", fp.lb_backend_services,
+                          f"the run needs {fp.lb_backend_services}: one per LoadBalancer Service from GKE 1.37")]),
+    RunQuota("NETWORK_ENDPOINT_GROUPS", "region", "",
+             lambda fp: [("NETWORK_ENDPOINT_GROUPS", fp.lb_negs,
+                          f"the run needs {fp.lb_negs}: one GCE_VM_IP NEG per LoadBalancer Service per zone from "
+                          f"GKE 1.37")]),
+    RunQuota("INSTANCE_GROUP_MANAGERS", "region", "", _per_node_group("INSTANCE_GROUP_MANAGERS", "group manager")),
+    RunQuota("INSTANCE_GROUPS", "region", "", _per_node_group("INSTANCE_GROUPS", "instance group")),
+    RunQuota("INSTANCE_TEMPLATES", "region", "", _per_node_group("INSTANCE_TEMPLATES", "instance template")),
+)
+
+
+def quota_fit(quotas: dict, metric: str, need: float, what: str, unit: str = "",
+              listed: tuple[int, str] | None = None) -> tuple[bool, str]:
+    """Does `need` fit `metric` of a region's (or the project's) quotas,
+    limit - used? A quota they do not list is unknown: no fit. `listed`:
+    (count, what) of what is used, counted from the resources; then used is
+    the larger of it and the reported usage, and the line names both."""
+    q = next((x for x in quotas.get("quotas") or [] if x.get("metric") == metric), None)
+    if q is None or q.get("limit") is None or q.get("usage") is None:
+        return False, f"{metric} not in the quotas of {quotas.get('name')}: whether the run fits is unknown"
+    reported = float(q["usage"])
+    used, how = reported, ""
+    if listed is not None:
+        used = max(reported, float(listed[0]))
+        how = f" (listed: {listed[1]} = {listed[0]}; GCE reports {reported:g}"
+        if reported > listed[0]:
+            # the model misses a holder GCE counts: said on the line, never folded away
+            how += (f"; GCE reports {reported - listed[0]:g} more than the resources counted: something holds an "
+                    f"address this check does not list")
+        how += ")"
+    free = float(q["limit"]) - used
+    return free >= need, (f"{metric} in {quotas.get('name')}: {used:g} of {q['limit']:g}{unit} used{how}, "
+                          f"{free:g} free; {what}")
+
+
+def region_fit(quotas: dict[str, dict], fp: Footprint, listed: dict[str, list[dict] | None] | None = None,
+               unread: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
+    """(the fits, the refusals) of every "region" and "project" row of
+    RUN_QUOTAS. `quotas`: {"region": regions describe, "project": project-info
+    describe}; `listed`: the resources the rows' `reads` name, None for a read
+    that failed (`unread`: why). A row whose read failed is unknown: refused,
+    never counted as an empty region (#1172 B2). A refusal carries its row's
+    hint."""
+    listed, unread = listed or {}, unread or {}
+    fits, refusals = [], []
+    for row in RUN_QUOTAS:
+        if row.source not in ("region", "project"):
+            continue
+        src = quotas[row.source]
+        for metric, need, what in row.needs(fp):
+            if row.some_projects_only and not any(q.get("metric") == metric for q in src.get("quotas") or []):
+                fits.append(f"{metric}: {src.get('name')} has no such quota (GCE gives it to some projects only); "
+                            f"{what}")
+                continue
+            counted = None
+            if row.used is not None:
+                failed = [k for k in row.reads if listed.get(k) is None]
+                if failed:
+                    refusals.append(f"{metric}: " + "; ".join(unread.get(k) or f"the region's {k} were not listed"
+                                                             for k in failed)
+                                    + ": what is used cannot be counted, whether the run fits is unknown")
+                    continue
+                counted = row.used(listed, src.get("name"))
+            ok, msg = quota_fit(src, metric, need, what, row.unit, counted)
+            if ok:
+                fits.append(msg)
+            else:
+                refusals.append(f"{msg}. {row.hint}" if row.hint else msg)
+    return fits, refusals
+
+
+def region_list_command(kind: str, project: str, region: str) -> list[str]:
+    """Every <kind> of the project (instances: all zones; the bench keeps the
+    region's own), the region's for the regional kinds; a read."""
+    where = [] if kind == "instances" else ["--regions", region]
+    return ["gcloud", "compute", kind, "list", "--project", project, *where, "--format", "json"]
+
+
+# #1172 B3: gcloud's `compute ... list` commands go through the SDK's MultiScopeLister
+# (googlecloudsdk/api_lib/compute/lister.py), which collects each failed request's
+# HttpError and, while the compute/allow_partial_error property is true (its default,
+# core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
+# requests all failed (a 401, a missing compute.forwardingRules.list permission)
+# exits 0, prints [] and writes "WARNING: Some requests did not succeed." on stderr;
+# one with an UNREACHABLE zone prints a partial list, rc 0. With the property false
+# the same list exits 1 with "ERROR: ... Some requests did not succeed", which the
+# pre-check reads as a failed read (fail closed). Set on the pre-check's three lists
+# only, through the environment form of gcloud's own property.
+PRECHECK_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+
+
+def project_quotas_command(project: str) -> list[str]:
+    """The project's global quotas (CPUS_ALL_REGIONS among them, where it has one)."""
+    return ["gcloud", "compute", "project-info", "describe", "--project", project, "--format", "json"]
+
+
+def quota_check(project: str, zone: str, fp: Footprint, *, run=execute, fetch=None) -> tuple[list[str], list[str]]:
+    """Every row of RUN_QUOTAS for `fp`, reads only (nothing is created): the
+    region's and the project's quotas, the resources the rows count from,
+    then GKE's cluster limit (#985) once they fit. (the fits, the refusals);
+    no refusal = the run fits."""
+    quiet = lambda _m: None  # noqa: E731
+    # every read fails closed (#1172 B2): a gcloud that exits non-zero, or answers
+    # something else than the JSON it lists, is a read that did not happen, never an
+    # empty region or a project without quotas
+    quotas = {}
+    for src, argv in (("region", region_quotas_command(project, zone)), ("project", project_quotas_command(project))):
+        rc, out = run(argv, dry_run=False, log=quiet)
+        got = _json(out) if rc == 0 else None
+        if not isinstance(got, dict):
+            return [], [f"could not read the {src}'s quotas ({' '.join(argv[:4])} "
+                        f"{'failed, rc=' + str(rc) if rc else 'answered no JSON object'}): whether the run fits is "
+                        f"unknown"]
+        quotas[src] = got
+    listed: dict[str, list[dict] | None] = {}
+    unread: dict[str, str] = {}
+    list_env = dict(os.environ, **PRECHECK_LIST_ENV)
+    for kind in sorted({k for row in RUN_QUOTAS for k in row.reads}):
+        argv = region_list_command(kind, project, region_of(zone))
+        rc, out = run(argv, dry_run=False, env=list_env, log=quiet)
+        got = _json(out) if rc == 0 else None
+        listed[kind] = got if isinstance(got, list) else None
+        if listed[kind] is None:
+            unread[kind] = (f"{' '.join(argv[:4])} " +
+                            (f"failed (rc={rc})" if rc else "answered no JSON list"))
+    fits, refusals = region_fit(quotas, fp, listed, unread)
+    if refusals:
+        return fits, refusals
+    ok, msg = cluster_quota_check(project, zone, fp.clusters, run=run, fetch=fetch)
+    return (fits + [msg], []) if ok else (fits, [msg])
 
 
 def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline: float,
@@ -1751,41 +2129,30 @@ def cmd_gke_up(a) -> int:
     print(f"cluster={spec.name} context={kube_context(spec)} "
           f"kubeconfig={spec.kubeconfig} ttl-expires={spec.ttl_expires} "
           f"({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(spec.ttl_expires))})")
-    # #895: refuse a run whose PVC disks cannot fit the region's SSD quota,
-    # before anything is created (run 16 found out 45 minutes in)
-    need = getattr(a, "ssd_need_gb", BENCH_PVC_FOOTPRINT_GB)
-    rc, out = execute(ssd_quota_command(spec.project, spec.zone), dry_run=dry)
-    if not dry:
-        region = _json(out) if rc == 0 else None
-        ok, msg = ssd_quota_fit(region if isinstance(region, dict) else {}, need)
-        if rc != 0:
-            ok, msg = False, f"could not read the region's quotas (rc={rc}): whether the run fits is unknown"
-        if not ok:
-            sys.stderr.write(f"refusing: {msg}. Free SSD_TOTAL_GB first (leaked PVC disks: "
-                             f"gcloud compute disks list --filter='labels.created-by=bench-gke'), nothing "
-                             f"was created\n")
+    # #1171: every regional quota the run consumes (RUN_QUOTAS: the PVC disks #895, the
+    # LoadBalancer Services' static addresses #1026, the cluster limit #985, the nodes'
+    # external IPs, vCPUs, boot disks...), checked against the footprint of THIS spec,
+    # before anything is created (run 16, run 19 attempt 3 and run 21 attempt 2 each
+    # found out 30-45 minutes in)
+    if dry:
+        execute(region_quotas_command(spec.project, spec.zone), dry_run=True)
+    else:
+        fp, why = _run_footprint(spec, getattr(a, "address_need", None))
+        if fp is None:
+            sys.stderr.write(f"refusing: {why}; nothing was created\n")
             return 2
-        print(msg)
-        # #1026: one regional static address per LoadBalancer Service the run's install creates
-        # (run 19 attempt 3 waited 45 min for one): the number is derived from the install
-        # (bench/lb_need.py), never assumed
-        need_lb = getattr(a, "address_need", None)
-        if need_lb is None:
-            ok, msg = False, ("the number of LoadBalancer Services this run creates was not given "
-                              "(--address-need, from bench.lb_need): whether the run fits "
-                              f"{STATIC_QUOTA_METRIC} is unknown")
-        else:
-            ok, msg = address_quota_fit(region if isinstance(region, dict) else {}, need_lb)
-        if not ok:
-            sys.stderr.write(f"refusing: {msg}. {ADDRESS_REFUSAL_HINT}; nothing was created\n")
-            return 2
-        print(msg)
-        # #985: GKE's per-location cluster limit, read (run 18 hit it ~19 s in)
-        ok, msg = cluster_quota_check(spec.project, spec.zone, 1)
-        if not ok:
+        fits, refusals = quota_check(spec.project, spec.zone, fp)
+        if getattr(a, "quota_log", None):
+            # #1173: every line, fits and refusals, in the run's record: IN_USE_ADDRESSES's carries
+            # the listed and the reported number side by side, so each launch is the falsifier
+            with open(a.quota_log, "w") as fh:
+                fh.writelines(f"{'refused' if msg in refusals else 'fits'}: {msg}\n" for msg in fits + refusals)
+        for msg in refusals:
             sys.stderr.write(f"refusing: {msg}; nothing was created\n")
+        if refusals:
             return 2
-        print(msg)
+        for msg in fits:
+            print(msg)
     if not dry:
         os.makedirs(os.path.dirname(spec.kubeconfig), exist_ok=True)
     for argv in create_commands(spec):
@@ -1887,41 +2254,52 @@ def gcloud_error_lines(stderr: str) -> str:
     return " | ".join(lines) if lines else error_summary(stderr)
 
 
-def cmd_gke_cluster_quota(a) -> int:
-    """#985: run606_pair.sh, before two clusters start at once (each gke-up
-    alone would see room for itself)."""
-    ok, msg = cluster_quota_check(a.project, a.zone, a.runs)
-    print(msg, file=sys.stdout if ok else sys.stderr)
-    return 0 if ok else 2
+def _run_footprint(spec: ClusterSpec, lb_services: int | None) -> tuple[Footprint | None, str]:
+    """(the run's footprint, "") or (None, why it is unknown)."""
+    if lb_services is None:
+        # #1026: the number is derived from the install (bench/lb_need.py), never assumed
+        return None, ("the number of LoadBalancer Services this run creates was not given (--address-need, from "
+                      "bench.lb_need): whether the run fits its regional quotas is unknown")
+    try:
+        return footprint(spec, lb_services=lb_services), ""
+    except ValueError as e:
+        return None, f"the run's footprint could not be derived ({e}): whether the run fits is unknown"
 
 
-def cmd_gke_ssd_quota(a) -> int:
-    """#895: run606_pair.sh, before two clusters start at once (each gke-up
-    alone would see room for itself)."""
-    need = a.runs * BENCH_PVC_FOOTPRINT_GB
-    rc, out = execute(ssd_quota_command(a.project, a.zone), dry_run=False, log=lambda _: None)
-    region = _json(out) if rc == 0 else None
-    ok, msg = ssd_quota_fit(region if isinstance(region, dict) else {}, need)
-    if rc != 0:
-        ok, msg = False, f"could not read the region's quotas (rc={rc}): whether the runs fit is unknown"
-    # no "refusing:" prefix: the caller (run606_pair.sh) says it once
-    print(msg + f" ({a.runs} bench cluster(s) x {BENCH_PVC_FOOTPRINT_GB} GB)",
-          file=sys.stdout if ok else sys.stderr)
-    return 0 if ok else 2
+def cmd_gke_footprint(a) -> int:
+    """#1171: the footprint of the run gke-up would create with the same
+    flags, offline (run606's dry pass too): written to --out for the pair, and
+    each quota's need on stderr."""
+    fp, why = _run_footprint(_spec_from_args(a), a.address_need)
+    if fp is None:
+        print(why, file=sys.stderr)
+        return 2
+    for row in RUN_QUOTAS:
+        for metric, _need, what in row.needs(fp):
+            print(f"footprint: {metric}: {what}", file=sys.stderr)
+    with open(a.out, "w") as fh:
+        json.dump(fp.to_json(), fh, indent=1)
+    return 0
 
 
-def cmd_gke_address_quota(a) -> int:
-    """#1026: run606_pair.sh, before two clusters start at once: both runs'
-    LoadBalancer Services (each run's dry pass derived its own) must fit the
-    region's STATIC_ADDRESSES."""
-    rc, out = execute(ssd_quota_command(a.project, a.zone), dry_run=False, log=lambda _: None)
-    region = _json(out) if rc == 0 else None
-    ok, msg = address_quota_fit(region if isinstance(region, dict) else {}, a.need)
-    if rc != 0:
-        ok, msg = False, f"could not read the region's quotas (rc={rc}): whether the runs fit is unknown"
-    # no "refusing:" prefix: the caller (run606_pair.sh) says it once
-    print(msg if ok else f"{msg}. {ADDRESS_REFUSAL_HINT}", file=sys.stdout if ok else sys.stderr)
-    return 0 if ok else 2
+def cmd_gke_quotas(a) -> int:
+    """#1171: run606_pair.sh, before two clusters start at once (each gke-up
+    alone would see room for itself): every row of RUN_QUOTAS for the sum of
+    the runs' footprints (each run's dry pass wrote its own). The fits on
+    stdout when all fit; else only the refusals, on stderr."""
+    total = Footprint()
+    for path in a.footprint:
+        try:
+            with open(path) as fh:
+                total = total + Footprint.from_json(json.load(fh))
+        except (OSError, ValueError, TypeError) as e:
+            print(f"the run footprint {path} could not be read ({type(e).__name__}: {e}): whether the runs fit "
+                  f"is unknown", file=sys.stderr)
+            return 2
+    fits, refusals = quota_check(a.project, a.zone, total)
+    # no "refusing:" prefix: the caller (run606_pair.sh) says it once a line
+    print("\n".join(refusals or fits), file=sys.stderr if refusals else sys.stdout)
+    return 2 if refusals else 0
 
 
 def cmd_gke_reap(a) -> int:
@@ -2004,6 +2382,19 @@ def _zone_arg(v: str) -> str:
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def footprint_args(p) -> None:
+    """The flags the footprint follows, the same on gke-up and gke-footprint
+    (with common(): the name, project and zone)."""
+    p.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE,
+                   help="#830: n2-standard-16 for run 11's k6 + Chrome load")
+    p.add_argument("--cluster-version", default=DEFAULT_CLUSTER_VERSION,
+                   help="#1171: also the kind of load balancer each LoadBalancer Service gets (GKE 1.37: a "
+                        "backend service and a GCE_VM_IP NEG per zone)")
+    p.add_argument("--address-need", type=int, default=None,
+                   help="#1026: the LoadBalancer Services the run's install creates (bench.lb_need), each holds "
+                        "a regional static and in-use address and a forwarding rule; required with --yes")
+
+
 def add_parsers(sub) -> None:
     def common(p, *, name_required=True):
         p.add_argument("--name", required=name_required, default=None,
@@ -2019,15 +2410,9 @@ def add_parsers(sub) -> None:
     common(up, name_required=False)
     up.add_argument("--owner", default=None)
     up.add_argument("--ttl-hours", type=int, default=DEFAULT_TTL_HOURS)
-    up.add_argument("--cluster-version", default=DEFAULT_CLUSTER_VERSION)
-    up.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE,
-                    help="#830: n2-standard-16 for run 11's k6 + Chrome load")
-    up.add_argument("--ssd-need-gb", type=float, default=BENCH_PVC_FOOTPRINT_GB,
-                    help=f"#895: PVC disk the run needs free in SSD_TOTAL_GB (one bench cluster: "
-                         f"{BENCH_PVC_FOOTPRINT_GB})")
-    up.add_argument("--address-need", type=int, default=None,
-                    help="#1026: the LoadBalancer Services the run's install creates (bench.lb_need), each needs "
-                         "a regional static address (STATIC_ADDRESSES); required with --yes")
+    up.add_argument("--quota-log", default=None,
+                    help="#1173: write every pre-check line here (run606: $OUT/quota-check.log)")
+    footprint_args(up)
     up.set_defaults(func=cmd_gke_up)
 
     shape = sub.add_parser("gke-shape", help="the cluster-shape record of a run: read back from GKE "
@@ -2036,29 +2421,21 @@ def add_parsers(sub) -> None:
     shape.add_argument("--loadgen-machine-type", default=DEFAULT_LOADGEN_MACHINE)
     shape.set_defaults(func=cmd_gke_shape)
 
-    sq = sub.add_parser("gke-ssd-quota", help="#895: exit 2 unless RUNS bench clusters' PVC disks fit "
-                                               "the region's SSD_TOTAL_GB (a read; nothing is created)")
-    sq.add_argument("--project", default=DEFAULT_PROJECT)
-    sq.add_argument("--zone", default=DEFAULT_ZONE)
-    sq.add_argument("--runs", type=int, default=1)
-    sq.set_defaults(func=cmd_gke_ssd_quota)
+    fp = sub.add_parser("gke-footprint", help="#1171: write the footprint of the run gke-up would create with "
+                                               "the same flags (offline; nothing is read or created)")
+    common(fp)
+    footprint_args(fp)
+    fp.add_argument("--out", required=True, help="the footprint JSON (run606: $OUT/footprint.json)")
+    fp.set_defaults(func=cmd_gke_footprint)
 
-    cq = sub.add_parser("gke-cluster-quota", help="#985: exit 2 unless RUNS more regional clusters fit GKE's "
-                                                   "per-location limit (ClustersPerRegion, read) beside every "
-                                                   "cluster already in the region (a read; nothing is created)")
-    cq.add_argument("--project", default=DEFAULT_PROJECT)
-    cq.add_argument("--zone", default=DEFAULT_ZONE)
-    cq.add_argument("--runs", type=int, default=1)
-    cq.set_defaults(func=cmd_gke_cluster_quota)
-
-    aq = sub.add_parser("gke-address-quota", help="#1026: exit 2 unless NEED LoadBalancer Services' static "
-                                                   "addresses fit the region's STATIC_ADDRESSES (a read; "
-                                                   "nothing is created)")
-    aq.add_argument("--project", default=DEFAULT_PROJECT)
-    aq.add_argument("--zone", default=DEFAULT_ZONE)
-    aq.add_argument("--need", type=int, required=True,
-                    help="the LoadBalancer Services the runs create, together (bench.lb_need per run)")
-    aq.set_defaults(func=cmd_gke_address_quota)
+    q = sub.add_parser("gke-quotas", help="#1171: exit 2 unless the runs' footprints, together, fit every "
+                                           "regional quota they consume (RUN_QUOTAS; reads only, nothing is "
+                                           "created)")
+    q.add_argument("--project", default=DEFAULT_PROJECT)
+    q.add_argument("--zone", default=DEFAULT_ZONE, type=_zone_arg)
+    q.add_argument("--footprint", action="append", required=True,
+                   help="a run's footprint (gke-footprint --out); once per run")
+    q.set_defaults(func=cmd_gke_quotas)
 
     down = sub.add_parser("gke-down", help="#606: delete a bench cluster "
                                            "(label-checked; dry run unless --yes)")

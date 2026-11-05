@@ -38,6 +38,7 @@ from statistics import NormalDist
 import pytest
 
 from bench import custlat, load606
+from tests import fake_region
 from tests.test_run14_list_narrow import FRESH, LN_KEY, _mem
 
 FIX = Path(__file__).resolve().parent / "fixtures"
@@ -623,8 +624,13 @@ trap on_pair_stop USR1
 mkdir -p "$OUT"
 if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then
   # #1026: run606's dry pass derives its LoadBalancer Services (FAKE/<RUN_NAME>.lbneed; "none": not derived)
+  # #1171: and its footprint, by the real gke-footprint with run606's k6 loadgen node
   lbn="$(cat "$FAKE/$RUN_NAME.lbneed" 2>/dev/null || echo 1)"
-  [[ "$lbn" == "none" ]] || echo "{\"need\": $lbn, \"services\": []}" > "$OUT/lb-need.json"
+  if [[ "$lbn" != "none" ]]; then
+    echo "{\"need\": $lbn, \"services\": []}" > "$OUT/lb-need.json"
+    python3 -m bench.gke gke-footprint --name "$RUN_NAME" --loadgen-machine-type n2-standard-16 \
+        --address-need "$lbn" --out "$OUT/footprint.json" 2>/dev/null
+  fi
   exit "$(cat "$FAKE/$RUN_NAME.dryrc" 2>/dev/null || echo 0)"
 fi
 echo "=== step measure ===" >> "$OUT/run.log"
@@ -634,19 +640,21 @@ if [[ -f "$FAKE/$RUN_NAME.sleep" ]]; then sleep "$(cat "$FAKE/$RUN_NAME.sleep")"
 exit "$(cat "$FAKE/$RUN_NAME.rc" 2>/dev/null || echo 0)"
 """
 NA, NB = "snowplow-bench-r15a", "snowplow-bench-r15b"
-# the region's quota read (#895), as gcloud returns it; FAKE_SSD_USAGE steers it
+# the region's quota read (#1171: every quota of the region, tests/fake_region.py), as gcloud
+# returns it; FAKE_USAGE_<METRIC> (FAKE_SSD_USAGE, FAKE_STATIC_USAGE) steers it
 FAKE_QUOTA_GCLOUD = (
-    "#!/usr/bin/env python3\nimport json, os, sys\n"
+    "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER +
     "if sys.argv[1:3] == ['auth', 'print-access-token']:\n"
     "    print('fake-access-token'); sys.exit(0)\n"
     "if sys.argv[1:4] == ['container', 'clusters', 'list']:\n"
     "    print(os.environ.get('FAKE_CLUSTERS', '[]')); sys.exit(0)\n"
     "if sys.argv[1:4] == ['compute', 'regions', 'describe']:\n"
-    "    print(json.dumps({'name': sys.argv[4], 'quotas': [{'metric': 'SSD_TOTAL_GB', 'limit': 500.0,\n"
-    "                      'usage': float(os.environ.get('FAKE_SSD_USAGE', '333'))},\n"
-    "                      {'metric': 'STATIC_ADDRESSES', 'limit': 8.0,\n"
-    "                       'usage': float(os.environ.get('FAKE_STATIC_USAGE', '3'))}]}))\n"
-    "    sys.exit(0)\n"
+    "    print(json.dumps(region_quotas(sys.argv[4]))); sys.exit(0)\n"
+    "if sys.argv[1:4] == ['compute', 'project-info', 'describe']:\n"
+    "    answer_read('project-info', project_quotas())\n"
+    "if sys.argv[1:2] == ['compute'] and sys.argv[2:4] in (['instances', 'list'], ['forwarding-rules', 'list'],\n"
+    "                                                       ['addresses', 'list']) and '--filter' not in sys.argv:\n"
+    "    answer_read(sys.argv[2], region_list(sys.argv[2]))\n"
     "sys.exit(9)\n")
 # the bash the script claims to support (macOS /bin/bash 3.2) and a current one
 BASHES = [b for b in dict.fromkeys(["/bin/bash", shutil.which("bash")]) if b and os.path.exists(b)]

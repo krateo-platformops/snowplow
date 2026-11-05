@@ -652,14 +652,40 @@ s_up() {
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
+  # #1171: what the run makes in the region (its nodes, each with an external IP,
+  # vCPUs, boot disks, node pools, LoadBalancer Services, PVC disks), from the spec
+  # gke-up creates with these same flags, offline, in the dry pass too
+  # ($OUT/footprint.json: the pair checks both runs' together); gke-up checks it
+  # against every regional quota the run consumes (RUN_QUOTAS), before anything
+  # is created. Run 21 attempt 2 failed 30 min in on IN_USE_ADDRESSES.
+  local fp_rc=0
+  rm -f "$OUT/footprint.json"
+  python3 -m bench.gke gke-footprint --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" --address-need "$LB_NEED" \
+      --out "$OUT/footprint.json" 2>"$KERR" || fp_rc=$?
+  if (( fp_rc != 0 )); then
+    record_failure "up FAILED: the run's footprint in the region could not be derived"
+    return 1
+  fi
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
   # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
   # by gke-up) goes through record_failure like every other step's; its
   # progress is on stdout. Run 18 lost both arms with only the RUN line logged.
   local up_rc=0
+  rm -f "$OUT/quota-check.log"
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
-      --address-need "$LB_NEED" $YES 2>"$KERR" || up_rc=$?
+      --address-need "$LB_NEED" --quota-log "$OUT/quota-check.log" $YES 2>"$KERR" || up_rc=$?
+  # #1173: every pre-check line in the run's log, IN_USE_ADDRESSES's with the number counted
+  # from the region's address holders beside the one GCE reports (each launch is the falsifier)
+  if [[ -s "$OUT/quota-check.log" ]]; then
+    while IFS= read -r ln; do
+      if [[ -n "$ln" ]]; then log "quota $ln"; fi
+    done < "$OUT/quota-check.log"
+  fi
   if [[ -s "$KERR" ]]; then cat "$KERR" >&2; fi
   (( up_rc == 0 )) || { record_failure "up FAILED: gke-up exited ${up_rc}"; return 1; }
   UP_OK=1             # gke-up made the cluster: a teardown that cannot find it is a failure

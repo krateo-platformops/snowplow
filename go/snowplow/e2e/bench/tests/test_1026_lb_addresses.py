@@ -34,7 +34,8 @@ import pytest
 import yaml
 
 from bench import gke, lb_need
-from tests.test_gke_pvc_disks import NAME, _calls, _first, _ticks, fakes  # noqa: F401  (fixture)
+from tests.test_gke_pvc_disks import (NAME, _calls, _first, _ticks, fakes,  # noqa: F401  (fixture)
+                                      quota_line, runs_footprint)
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
@@ -264,14 +265,15 @@ def test_an_address_backstop_that_could_not_do_its_job_is_loud(lbfakes, monkeypa
 
 def test_the_static_address_fit_reads_the_regions_quota():
     q = json.loads((FIX / "region_europe_west4_quotas_20261025.json").read_text())
-    ok, msg = gke.address_quota_fit(q, 5)
+    ok, msg = quota_line(q, runs_footprint(1, lb_services=5), "STATIC_ADDRESSES")
     assert ok and "STATIC_ADDRESSES in europe-west4: 3 of 8 used, 5 free; the run creates 5" in msg
-    ok, msg = gke.address_quota_fit(q, 6)
+    ok, msg = quota_line(q, runs_footprint(1, lb_services=6), "STATIC_ADDRESSES")
     assert not ok
     # run 19 attempt 3's region: 8 of 8 RESERVED by leaks
     full = {"name": R, "quotas": [{"metric": "STATIC_ADDRESSES", "limit": 8.0, "usage": 8.0}]}
-    assert not gke.address_quota_fit(full, 1)[0]
-    assert not gke.address_quota_fit({"name": R, "quotas": []}, 0)[0]          # unread: never fits
+    assert not quota_line(full, runs_footprint(1, lb_services=1), "STATIC_ADDRESSES")[0]
+    assert not quota_line({"name": R, "quotas": []}, runs_footprint(1, lb_services=0),
+                          "STATIC_ADDRESSES")[0]                               # unread: never fits
 
 
 def test_gke_up_refuses_a_run_whose_load_balancers_do_not_fit(fakes, capsys):  # noqa: F811
