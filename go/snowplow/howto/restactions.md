@@ -94,6 +94,14 @@ Useful for chaining calls where one must complete before another.
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
 
+**Stages run one at a time, in the order you declare them, wherever `dependsOn`
+allows.** At each step snowplow runs the earliest-declared stage whose dependency
+has run, so the same spec always runs the same way. Put a slow stage after the
+fast ones: stages share the page's time budget, and a stage that starts after the
+budget ran out fails with `Timeout`. A stage that reads another stage's result
+should still declare `dependsOn`: the order alone does not make that stage wait
+for a success.
+
 ### Resolving a referenced `RESTAction`/`Widget` in-process
 
 A stage may reference **another `RESTAction` or `Widget`** by pointing its
