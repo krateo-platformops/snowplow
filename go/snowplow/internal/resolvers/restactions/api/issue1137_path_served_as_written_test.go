@@ -14,16 +14,21 @@ package api
 //     resource ".", but the refresher's internal-rest-config dial asks
 //     client-go for it, and client-go's path.Join cleans it into a LIST of p2s;
 //   - a leading "//": `//api/v1/namespaces/ns-a/secrets` parses as nothing (so
-//     #398 does not mark it), while the apiserver's RequestInfo reads secrets.
+//     #398 does not mark it), while the apiserver's RequestInfo reads secrets;
+//   - a verb written in the path: `/apis/g/v/watch/namespaces/ns-a/p2s` parses
+//     as resource "watch", but the apiserver strips the verb and streams a
+//     watch of p2s in ns-a.
 // Narrowing was skipped, the check fell back to OR across the set, and a
 // caller who may list p1s in ns-a read p2 objects there. Cache on and off.
 //
 // THE RULE (servedAsWritten, in the #288 dial guard). An own-cluster path is
-// planned only when neither dial's normalisation changes it: the decoded path
-// of the URL the HTTP dial builds (credhttp.RequestURL) equals the written
-// path, and path cleaning leaves it as it is (no empty, "." or ".." segment;
-// one trailing "/" allowed). Every reader of a planned call reads its path as
-// written, so that is the only way all of them decide about the request served.
+// planned only when nothing rewrites it on the way to a resource: the decoded
+// path of the URL the HTTP dial builds (credhttp.RequestURL) equals the written
+// path, path cleaning leaves it as it is (no empty, "." or ".." segment; trailing
+// "/"s are not segments), and the apiserver has no verb to strip after the
+// version (RequestInfoFactory's specialVerbs). Every reader of a planned call
+// reads its path as written, so that is the only way all of them decide about
+// the request served.
 //
 // THE APISERVER. i37APIServer reads every request with k8s.io/apiserver's own
 // RequestInfoFactory (configured as kube-apiserver configures it), on the
@@ -31,8 +36,10 @@ package api
 // the resource THAT names. It routes as kube-apiserver v0.36.5 routes (the
 // handler director and PathRecorderMux match the decoded path against "/api/"
 // and "/apis/"): any other path is answered 404, though it is still read and
-// logged. So "what the apiserver serves" is the apiserver's code, not
-// snowplow's parser. The RBAC oracle is #1124's i24Allows.
+// logged. A watch is answered as a watch, a stream of events, and `proxy/` has
+// no route (apiserver's installer.go), so it is read and answered 404. So "what
+// the apiserver serves" is the apiserver's code, not snowplow's parser. The RBAC
+// oracle is #1124's i24Allows.
 
 import (
 	"context"
@@ -66,18 +73,32 @@ type i37Coord struct {
 	ok                                 bool
 }
 
-// i37Read is the apiserver's reading of a request: k8s.io/apiserver's
-// RequestInfoFactory over the request as net/http received it.
-func i37Read(r *http.Request) i37Coord {
+// i37Info is k8s.io/apiserver's RequestInfoFactory, configured as kube-apiserver
+// configures it, over the request as net/http received it.
+func i37Info(r *http.Request) (*request.RequestInfo, error) {
 	f := request.RequestInfoFactory{
 		APIPrefixes:          sets.NewString("api", "apis"),
 		GrouplessAPIPrefixes: sets.NewString("api"),
 	}
-	info, err := f.NewRequestInfo(r)
+	return f.NewRequestInfo(r)
+}
+
+// i37Read is the apiserver's reading of a request.
+func i37Read(r *http.Request) i37Coord {
+	info, err := i37Info(r)
 	if err != nil || !info.IsResourceRequest {
 		return i37Coord{}
 	}
 	return i37Coord{info.APIGroup, info.APIVersion, info.Resource, info.Namespace, info.Name, true}
+}
+
+// i37Verb is the verb the apiserver reads from a request.
+func i37Verb(r *http.Request) string {
+	info, err := i37Info(r)
+	if err != nil {
+		return ""
+	}
+	return info.Verb
 }
 
 // i37Routed is kube-apiserver's routing of a decoded request path: only the
@@ -107,17 +128,29 @@ func (l *i37Log) reset() { l.mu.Lock(); l.seen = nil; l.mu.Unlock() }
 func (l *i37Log) count() int { l.mu.Lock(); defer l.mu.Unlock(); return len(l.seen) }
 
 // i37APIServer serves the i24 fixture by the apiserver's own reading of each
-// routed request: a LIST (cluster-wide or in the namespace) or a GET by name.
+// routed request: a LIST (cluster-wide or in the namespace), a GET by name, or a
+// WATCH of either, which streams one ADDED event per object.
 func i37APIServer(t *testing.T, log *i37Log) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c := i37Read(r)
 		log.add(c)
-		if !c.ok || !i37Routed(r.URL.Path) {
+		verb := i37Verb(r)
+		if !c.ok || !i37Routed(r.URL.Path) || verb == "proxy" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if verb == "watch" {
+			enc := json.NewEncoder(w)
+			for _, o := range i24Objects() {
+				if o.gvr.Group == c.group && o.gvr.Version == c.version && o.gvr.Resource == c.resource &&
+					(c.ns == "" || o.ns == c.ns) && (c.name == "" || o.name == c.name) {
+					_ = enc.Encode(map[string]any{"type": "ADDED", "object": o.object()})
+				}
+			}
+			return
+		}
 		items := []any{}
 		for _, o := range i24Objects() {
 			if o.gvr.Group != c.group || o.gvr.Version != c.version || o.gvr.Resource != c.resource || (c.ns != "" && o.ns != c.ns) {
@@ -198,6 +231,11 @@ var i37Shapes = []i37Shape{
 	{"a . segment, LIST", "/apis/composition.krateo.io/v1-0-0/./p2s", i37ClientGo, i37P2, i37LP2},
 	{"an empty segment, LIST", "/apis/composition.krateo.io/v1-0-0//p2s", i37ClientGo, i37P2, i37LP2},
 	{"a . segment before a name", "/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/./p2s/b-p2-in-ns-a", i37ClientGo, i37P2InA, i37LP2InA},
+	{"watch/, namespaced", "/apis/composition.krateo.io/v1-0-0/watch/namespaces/ns-a/p2s?timeoutSeconds=1", i37HTTP, i37P2InA, i37LP2InA},
+	{"watch/, cluster-wide", "/apis/composition.krateo.io/v1-0-0/watch/p2s?timeoutSeconds=1", i37HTTP, i37P2, i37LP2},
+	{"watch/, one object", "/apis/composition.krateo.io/v1-0-0/watch/namespaces/ns-a/p2s/b-p2-in-ns-a", i37HTTP, i37P2Named, i37GP2},
+	{"watch/, Secrets", "/api/v1/watch/namespaces/ns-a/secrets", i37HTTP, i37Secrets, "/api/v1/namespaces/ns-a/secrets"},
+	{"proxy/", "/apis/composition.krateo.io/v1-0-0/proxy/namespaces/ns-a/p2s", i37HTTP, i37P2InA, i37LP2InA},
 }
 
 // i37Dial sends path through the dial via and returns what the apiserver read;
@@ -282,6 +320,14 @@ func i37Paths() []string {
 		"api/v1/namespaces/ns-a/secrets/s",
 		"/api/v1/namespaces/ns-a/secret%73/s",
 		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s//",
+		// A verb is stripped only right after the version. These are read as
+		// written: a proxy subresource, a namespace or object named like a verb,
+		// and a watch asked for in the query.
+		"/api/v1/nodes/n/proxy/metrics",
+		"/api/v1/namespaces/ns-a/pods/p/proxy/a/b",
+		"/api/v1/namespaces/watch/configmaps",
+		"/api/v1/namespaces/ns-a/configmaps/watch",
+		"/apis/composition.krateo.io/v1-0-0/namespaces/ns-a/p2s?watch=true",
 	}
 	for _, sh := range i37Shapes {
 		out = append(out, sh.path, sh.canonical)
@@ -323,16 +369,60 @@ func TestIssue1137_ServedAsWrittenKeepsOnlyWhatTheApiserverReadsAsWritten(t *tes
 		t.Fatalf("the corpus must hold both kept and refused paths: kept=%d refused=%d", kept, refused)
 	}
 	// The rule's own edges: an empty path is sent as the server URL itself;
-	// trailing "/"s are read without them; an invalid escape cannot be sent; a
-	// ".." segment is resolved by path cleaning (and is never a valid name).
+	// trailing "/"s are read without them; an invalid escape or a control byte
+	// cannot be sent, in the query either; a query or fragment alone is sent as
+	// the server root, which is not what is written; a ".." segment is resolved
+	// by path cleaning (and is never a valid name); a verb is stripped only in
+	// the first segment after the version.
 	for p, want := range map[string]bool{
 		"": true, "/": true, "/apis/x/": true, "/apis/x//": true,
 		"//apis/x": false, "///apis/x": false, "/apis//x": false, "/apis/./x": false, "/apis/x/../y": false, "/apis/x/y/..": false,
 		"/apis/x%zz": false, "https://elsewhere/apis/x": false,
+		"?x=1": false, "#f": false, "?": false, "#": false, "/apis/x?a=\x01": false, "/apis/x?\n": false,
+		"/apis/g/v/watch/x": false, "/apis/g/v/proxy/x": false, "/api/v1/watch/x": false, "/api/v1/proxy/x": false,
+		"/apis/g/v/watch": false, "/apis/g/v/proxy/": false, "/api/v1/watch": false, "/api/v1/proxy/": false,
+		"/apis/g/watch": true, "/apis/g/watch/x": true, "/api/watch/x": true, "/apis/watch": true, "/watch/x": true,
+		"/apis/g/v/x/watch": true, "/api/v1/x/proxy": true,
 	} {
 		if got := servedAsWritten(p); got != want {
 			t.Errorf("servedAsWritten(%q) = %v, want %v", p, got, want)
 		}
+	}
+}
+
+// TestIssue1137_TheRuleRefusesExactlyTheVerbsTheApiserverStrips — the verb half
+// of the rule against the apiserver's own code, so the list is not a guess: for
+// every word Kubernetes uses as a verb, a subresource or a path keyword, in the
+// first segment after the version, of both API roots, RequestInfoFactory reads
+// that word as the verb exactly when the rule refuses the path. A vendored
+// apiserver that strips another of these words turns this red.
+func TestIssue1137_TheRuleRefusesExactlyTheVerbsTheApiserverStrips(t *testing.T) {
+	words := []string{"watch", "proxy", "get", "list", "create", "update", "patch", "delete", "deletecollection",
+		"log", "exec", "attach", "portforward", "status", "scale", "finalize", "binding", "eviction", "token",
+		"redirect", "connect", "impersonate", "bind", "escalate", "namespaces", "resources", "p2s"}
+	stripped := 0
+	for _, w := range words {
+		for _, root := range []string{"/apis/g/v/", "/api/v1/"} {
+			p := root + w + "/namespaces/ns-a/p2s"
+			r, err := http.NewRequest(http.MethodGet, "http://apiserver.invalid"+p, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := i37Info(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			strips := info.Verb == w && info.Resource == "p2s"
+			if strips {
+				stripped++
+			}
+			if got := servedAsWritten(p); got == strips {
+				t.Errorf("%q: the apiserver strips the verb: %v; servedAsWritten: %v", p, strips, got)
+			}
+		}
+	}
+	if stripped != 4 {
+		t.Fatalf("%d (word, root) pairs were stripped, want 4 (watch and proxy on both roots)", stripped)
 	}
 }
 
@@ -509,11 +599,23 @@ func TestIssue1137_EachShapeIsRefusedNeverCheckedOnTheWholeSet(t *testing.T) {
 func TestIssue1137_NamedEndpointPathsAreStillSent(t *testing.T) {
 	ep := newX1106Srv(t, false, x1106OK)
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
-	for _, p := range []string{"/api/v2/items/a%2Fb", "api/v2/items/a", "/api/v2/items//a", "/api/v2/items/./a"} {
+	for p, want := range map[string]string{
+		"/api/v2/items/a%2Fb": "/api/v2/items/a/b", // the server decodes it, as any server does
+		"api/v2/items/a":      "/api/v2/items/a",
+		"/api/v2/items//a":    "/api/v2/items//a",
+		"/api/v2/items/./a":   "/api/v2/items/./a",
+		"//api/v2/items/a":    "//api/v2/items/a", // only one leading "/" is the join's
+		"/apis/g/v/watch/x":   "/apis/g/v/watch/x",
+	} {
 		before := len(ep.all())
 		o := x1106Resolve(t, nil, x1106Stage("items", http.MethodGet, p))
-		if n := len(ep.all()) - before; n != 1 {
+		hits := ep.all()
+		if n := len(hits) - before; n != 1 {
 			t.Errorf("named endpoint %q: %d requests sent, want 1", p, n)
+			continue
+		}
+		if got := hits[len(hits)-1].Path; got != want {
+			t.Errorf("named endpoint %q: the server received %q, want %q", p, got, want)
 		}
 		if strings.Contains(o.outcomes, StageReasonInvalidPath) {
 			t.Errorf("named endpoint %q: refused: %s", p, o.outcomes)

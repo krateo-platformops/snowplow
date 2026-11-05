@@ -352,8 +352,8 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 // ParseAPIServerPathToDep for the userAccessFilter's own resource (#1124), the
 // cache key and the dependency edge, the informer and content-cell dispatch,
 // the sensitive-resource mark (#398), and this guard's own namespace and name
-// checks. The request the apiserver serves is built two ways, and each one
-// normalises the path:
+// checks. The request the apiserver serves is built two ways, each of which
+// normalises the path, and the apiserver then reads one more thing out of it:
 //   - the HTTP dials (credhttp.Do, the resolver's fetch) send
 //     credhttp.RequestURL(server, path), which puts a "/" before a path written
 //     without one, and the apiserver percent-decodes the request path before it
@@ -361,7 +361,9 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 //     director and RequestInfoFactory both read req.URL.Path);
 //   - the internal-rest-config branch (the refresher's dial) asks client-go for
 //     the parsed coordinates, and client-go joins them with path.Join, which
-//     drops an empty or "." segment and resolves "..".
+//     drops an empty or "." segment and resolves "..";
+//   - the apiserver reads a verb from the first segment after the version and
+//     strips it (k8s.io/apiserver RequestInfoFactory, specialVerbs).
 //
 // Where the written path and the served one differ, every reader decides about
 // a request that is not the one served: `apis/g/v/p2s` parses as nothing and
@@ -369,20 +371,24 @@ func validInterpolatedPath(path, verb string) (bool, skipReason) {
 // named with escapes and is served as p2s in ns-a; `/apis/g/v/namespaces/ns-a/
 // ./p2s` parses as resource "." and the refresher LISTs p2s in ns-a;
 // `//api/v1/namespaces/ns-a/secrets` parses as nothing, so #398 does not mark
-// it, while the apiserver authorizes it as secrets.
+// it, while the apiserver authorizes it as secrets; `/apis/g/v/watch/namespaces/
+// ns-a/p2s` parses as resource "watch" and is served as a watch of p2s in ns-a.
 //
-// So the plan holds only a path that neither normalisation changes:
+// So the plan holds only a path that none of them changes:
 //   - decoding: the path the server decodes from the URL the dial builds
 //     equals the written path, before its query and fragment (which the
 //     apiserver does not read as coordinates; splitPathQuery is the parsers'
 //     own split). The query is not judged: a selector value may be escaped.
 //   - cleaning: no segment is empty, "." or "..". Trailing "/"s are not
 //     segments: every reader, path cleaning and the apiserver read the path
-//     without them (a mutating verb's trailing "/" is collapsedPath's refusal).
+//     without them (a mutating verb's trailing "/" is collapsedPath's refusal);
+//   - the verb: the first segment after the version is not one the apiserver
+//     strips (verbInPath).
 //
 // One rule, not a list of shapes: no own-cluster path needs a missing leading
-// "/", a percent-escape, an empty segment or a dot segment (no group, version,
-// resource, namespace or name is empty, "." or "..", or contains '%' or '/').
+// "/", a percent-escape, an empty segment, a dot segment or a verb in the path
+// (no group, version, resource, namespace or name is empty, "." or "..", or
+// contains '%' or '/'; a watch is asked for in the query, `?watch=true`).
 func servedAsWritten(path string) bool {
 	p, _, _ := splitPathQuery(path)
 	// The base carries no path of its own, so u.Path is the request path the
@@ -391,7 +397,7 @@ func servedAsWritten(path string) bool {
 	if err != nil || u.Path != p {
 		return false
 	}
-	return cleanAsWritten(p)
+	return cleanAsWritten(p) && !verbInPath(p)
 }
 
 // cleanAsWritten reports whether path cleaning leaves p's segments as they
@@ -409,6 +415,29 @@ func cleanAsWritten(p string) bool {
 		}
 	}
 	return true
+}
+
+// apiserverPathVerbs is RequestInfoFactory's specialVerbs (k8s.io/apiserver
+// pkg/endpoints/request/requestinfo.go): the words it strips from the first
+// segment after the version and reads as the verb. `watch/` is routed (the
+// deprecated verb-via-path form); `proxy/` has no route left, and is here
+// because the reading is the same.
+var apiserverPathVerbs = map[string]bool{"watch": true, "proxy": true}
+
+// verbInPath reports whether the apiserver reads a verb out of p: the first
+// segment after the version of /api/<version>/ or /apis/<group>/<version>/. Only
+// there: a subresource (`nodes/n/proxy/metrics`), a namespace or a name may be
+// spelled like a verb, and the apiserver reads those as written.
+func verbInPath(p string) bool {
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	first := 0 // the index of the segment after the version
+	switch segs[0] {
+	case "api":
+		first = 2
+	case "apis":
+		first = 3
+	}
+	return first > 0 && len(segs) > first && apiserverPathVerbs[segs[first]]
 }
 
 // evalJQE evaluates a jq template and SURFACES the Eval error instead of

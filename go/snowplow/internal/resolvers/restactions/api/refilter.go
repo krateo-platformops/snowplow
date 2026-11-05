@@ -641,8 +641,10 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 // another or as none: `apis/g/v/p2s` (no leading "/"; the dial adds it) and
 // `/apis/g/v/namespaces%2Fns-a%2Fp2s` (the apiserver decodes the escapes into
 // separators). servedOK was false or served was no member, so objects of a
-// checked resource were checked on the whole set. The same holds for an empty
-// or dot segment (`/apis/g/v/namespaces/ns-a/./p2s` parses as resource ".")
+// checked resource were checked on the whole set. The same holds for a verb in
+// the path (`/apis/g/v/watch/namespaces/ns-a/p2s` parses as resource "watch"),
+// and for an empty or dot segment (`/apis/g/v/namespaces/ns-a/./p2s` parses as
+// resource ".")
 // on the refresher's internal-rest-config dial, which client-go cleans into a
 // LIST of p2s.
 //

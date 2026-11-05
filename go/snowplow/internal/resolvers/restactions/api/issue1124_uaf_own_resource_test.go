@@ -74,9 +74,10 @@ const (
 	i24UB  = "u-1124-b"  // list p2s in ns-a and ns-b; sees the blueprints
 	i24UM  = "u-1124-m"  // list p1s in ns-a, p2s in ns-b; creates p1s in ns-c, agents in ns-b
 	i24UW  = "u-1124-w"  // list composition.krateo.io/* in ns-a; sees the blueprints
+	i24UC  = "u-1124-c"  // list p1s in every namespace, and nothing on p2s (a ClusterRoleBinding)
 )
 
-var i24Users = []string{i24UA, i24UA2, i24UB, i24UM, i24UW}
+var i24Users = []string{i24UA, i24UA2, i24UB, i24UM, i24UW, i24UC}
 
 type i24Grant struct {
 	group, resource, ns string
@@ -92,14 +93,17 @@ var i24Grants = map[string][]i24Grant{
 	i24UM: {{i24Comp, "p1s", "ns-a", i24Read}, {i24Comp, "p2s", "ns-b", i24Read}, {i24Core, i24CDs, i24BP, i24Read},
 		{i24Comp, "p1s", "ns-c", []string{"create"}}, {i24Agent, "agents", "ns-b", []string{"create"}}},
 	i24UW: {{i24Comp, "*", "ns-a", i24Read}, {i24Core, i24CDs, i24BP, i24Read}},
+	i24UC: {{i24Comp, "p1s", "", i24Read}},
 }
 
 // i24Allows is Kubernetes' RBAC decision over i24Grants (the oracle): a
-// RoleBinding grants its rule in its own namespace only; "*" matches any
-// resource. Written from Kubernetes semantics, never from snowplow's evaluator.
+// RoleBinding grants its rule in its own namespace only, a ClusterRoleBinding
+// (a grant with no namespace) in every namespace and at cluster scope; "*"
+// matches any resource. Written from Kubernetes semantics, never from
+// snowplow's evaluator.
 func i24Allows(user, verb, group, resource, ns string) bool {
 	for _, g := range i24Grants[user] {
-		if g.group != group || g.ns != ns || (g.resource != "*" && g.resource != resource) {
+		if g.group != group || (g.ns != "" && g.ns != ns) || (g.resource != "*" && g.resource != resource) {
 			continue
 		}
 		for _, v := range g.verbs {
@@ -122,12 +126,17 @@ func i24RBAC() []runtime.Object {
 	for _, u := range users {
 		for i, g := range i24Grants[u] {
 			name := fmt.Sprintf("cr-%s-%d", u, i)
-			out = append(out,
-				&rbacv1.ClusterRole{TypeMeta: tm("ClusterRole"), ObjectMeta: metav1.ObjectMeta{Name: name},
-					Rules: []rbacv1.PolicyRule{{APIGroups: []string{g.group}, Resources: []string{g.resource}, Verbs: g.verbs}}},
-				&rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"), ObjectMeta: metav1.ObjectMeta{Namespace: g.ns, Name: "rb-" + name},
-					Subjects: []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: u}},
-					RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name}})
+			subjects := []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: u}}
+			roleRef := rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name}
+			out = append(out, &rbacv1.ClusterRole{TypeMeta: tm("ClusterRole"), ObjectMeta: metav1.ObjectMeta{Name: name},
+				Rules: []rbacv1.PolicyRule{{APIGroups: []string{g.group}, Resources: []string{g.resource}, Verbs: g.verbs}}})
+			if g.ns == "" {
+				out = append(out, &rbacv1.ClusterRoleBinding{TypeMeta: tm("ClusterRoleBinding"),
+					ObjectMeta: metav1.ObjectMeta{Name: "crb-" + name}, Subjects: subjects, RoleRef: roleRef})
+				continue
+			}
+			out = append(out, &rbacv1.RoleBinding{TypeMeta: tm("RoleBinding"),
+				ObjectMeta: metav1.ObjectMeta{Namespace: g.ns, Name: "rb-" + name}, Subjects: subjects, RoleRef: roleRef})
 		}
 	}
 	return out
@@ -640,6 +649,7 @@ func TestIssue1124_RefilterParityWithKubernetes(t *testing.T) {
 						want = append(want, ns)
 					}
 				}
+				sort.Strings(want) // i24NamesIn sorts
 				if strings.Join(got, ",") != strings.Join(want, ",") {
 					t.Errorf("served %s %s %s: kept %v, want %v", s.gr, verb, u, got, want)
 				}
