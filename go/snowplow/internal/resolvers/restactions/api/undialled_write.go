@@ -19,7 +19,8 @@
 //     check (a path segment that rendered empty) judges every stage, a named
 //     endpoint's included; its Kubernetes name-validity check judges only a
 //     stage that dials this cluster's apiserver (createRequestOption). The
-//     errorKey message says which (undialledWriteCause);
+//     errorKey message says which (undialledWriteCause). The path template's
+//     own refusals (#1123) are InvalidPath too;
 //   - TemplateError — the path, payload or a header did not render: a jq error
 //     (#302) or an unrendered ${...} (#293);
 //   - NotSent       — the catch-all: the stage's items were planned but at least
@@ -70,6 +71,8 @@ func undialledWriteCause(sr skipReason) (reason, why string) {
 			return StageReasonInvalidPath, "a path segment rendered empty (#288)"
 		}
 		return StageReasonInvalidPath, "its rendered path is not a valid Kubernetes object path (#288)"
+	case reasonPathValueRefused:
+		return StageReasonInvalidPath, "a value spliced into its path cannot be one segment or one query value (#1123)"
 	case reasonUnrenderedTemplate:
 		return StageReasonTemplateError, "its path holds an unrendered ${...} template (#293)"
 	case reasonJQPathError:

@@ -443,13 +443,47 @@ caller input for a stage whose credential the caller does not hold (an
 ServiceAccount): split the known shape instead. `segments()` is valid only
 spliced into the path, never in the query.
 
+**A value you encoded yourself is not encoded again.** `.x | @uri` (and
+`@uri "...\(.x)..."`) renders as jq wrote it, so `"/search?q=" + (.q | @uri)`
+sends one value, escaped once. In the path it is still one segment: an encoded
+`/` is refused like a `/`. Any other format (`@base64`, `@sh`, …) is a value.
+
 **A query parameter is declared in the template:**
 `"/events?limit=200&composition_id=" + .uid` encodes `.uid` as one value. A
 whole path that carries its own query (`${ .path }` with `?…` inside) is
 refused; move the query into the template and pass only the values.
 
-A refused stage makes no call and is counted in `/debug/vars`
+A refused value makes no call. Like every refused item (#1116) it **fails its
+stage** with `InvalidPath` and a 400 under the stage's `errorKey`; without
+`continueOnError` it fails the RESTAction. It is counted in `/debug/vars`
 `snowplow_malformed_dial_skipped_total.path_value_refused`.
+
+**Edge cases of `segments(E)`:**
+
+| `E` is… | renders | |
+|---|---|---|
+| `null` or missing | nothing: the template's own text stays, as with jq's `+ null` | `"/a/" + segments(.p) + "/z"` → `/a//z`; `segments(.p) + "/z"` → `/z` |
+| `""` | nothing, the same as `null` | |
+| `a//b` | `a//b`: an empty piece inside the value is kept | a stage that dials this cluster still refuses `/namespaces//` |
+| a number, boolean, array or object | a template error: nothing is sent, the stage fails with `TemplateError` | convert it yourself: `segments(.n \| tostring)` |
+
+`segments()` in the query is refused for every `E`, `null` included.
+
+**A template that renders no path makes no call.** `${ segments(.path) }` with
+`.path` null or `""` renders nothing, and so does a template with no output
+(`${ empty }`). Dialling that would read the endpoint's root with the stage's
+credential, so it is refused, on every stage. It fails its stage with
+`InvalidPath` and a 400, and is counted as
+`snowplow_malformed_dial_skipped_total.empty_interp`. A prewarm runs with no
+`extras`, so a stage whose path comes only from `extras` fails there, and
+nothing is stored for it. To make that stage quiet rather than failed, give it
+an iterator that yields no element when the value is absent
+(`[ {path: .path} | select(.path != null) ]`): an iterator with no elements has
+nothing to call and succeeds.
+
+A stage that has no `path` at all has no template and is unchanged. `${ .path }`
+without `segments()` is one value, and jq's `tostring` of null is the text
+`null`, so write `segments()` for a value that can be absent.
 
 ### `endpointRef` never names a per-user credential
 

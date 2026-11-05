@@ -126,6 +126,77 @@ func TestIssue1123_DeclaredSegments(t *testing.T) {
 	wantPath(t, `${ "/a/" + segments(.p) + "/z" }`, map[string]any{}, "/a//z")
 }
 
+// The edges of segments(E), the contract the portal writes against
+// (howto/restactions.md). The render only: the dial plan's verdict on a path
+// that renders empty is pinned in restactions/api.
+func TestIssue1123_SegmentsEdges(t *testing.T) {
+	// null and "" contribute nothing; the template's own text stays.
+	for name, data := range map[string]map[string]any{
+		"missing": {},
+		"null":    {"p": nil},
+		"empty":   {"p": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantPath(t, `${ segments(.p) }`, data, "")
+			wantPath(t, `${ "/a/" + segments(.p) }`, data, "/a/")
+			wantPath(t, `${ segments(.p) + "/z" }`, data, "/z")
+			wantPath(t, `${ "/a/" + segments(.p) + "/z" }`, data, "/a//z")
+			// The query refusal reads the template, so no value escapes it.
+			wantRefused(t, `${ "/a?q=" + segments(.p) }`, data, ReasonSegmentsInQuery)
+			wantRefused(t, `${ "/a#f?q=" + segments(.p) }`, data, ReasonSegmentsInQuery)
+		})
+	}
+
+	// An inner empty piece is kept, and so are the leading and trailing ones.
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "a//b"}, "a//b")
+	wantPath(t, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"}, "/x/a//b")
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "/a/"}, "/a/")
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "//a"}, "//a")
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "/"}, "/")
+	// Each piece is still one segment: dots are refused, escapes stay escaped.
+	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "a//.."}, ReasonDotSegment)
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "a//b?c"}, "a//b%3Fc")
+
+	// A non-string is a render error, never its tostring. The error carries no
+	// part of the value.
+	for _, v := range []any{42, 1.5, true, false, []any{"a", "b"}, map[string]any{"a": "b"}} {
+		for _, tmpl := range []string{`${ segments(.p) }`, `${ "/a/" + segments(.p) }`} {
+			got, err := render(t, tmpl, map[string]any{"p": v})
+			if !errors.Is(err, errNotString) || IsRefused(err) || got != "" {
+				t.Fatalf("Render(%s) on %v = %q, %v; want the not-a-string error", tmpl, v, got, err)
+			}
+		}
+	}
+}
+
+// A value the program encoded with @uri is not encoded twice: `%2F` stays
+// `%2F`. It is one query value as it stands; in the path it is still one
+// segment, so an encoded '/' is refused like a '/'.
+func TestIssue1123_AnAuthorEncodedValueIsNotEncodedTwice(t *testing.T) {
+	// The query: as jq wrote it.
+	q := `${ "/s?labelSelector=" + ("a.io/t=" + .t | @uri) + "&x=1" }`
+	wantPath(t, q, map[string]any{"t": "b&c=d"}, "/s?labelSelector=a.io%2Ft%3Db%26c%3Dd&x=1")
+	wantPath(t, `${ "/s?q=" + (.q | @uri) }`, map[string]any{"q": "a/b#c"}, "/s?q=a%2Fb%23c")
+	wantPath(t, `${ "/s?q=" + (.q | @uri) }`, map[string]any{"q": "%26"}, "/s?q=%2526")
+	wantPath(t, `${ (.q | @uri) as $e | "/s?q=" + $e }`, map[string]any{"q": "a&b"}, "/s?q=a%26b")
+	wantPath(t, `${ @uri "/s?q=\(.q)" }`, map[string]any{"q": "a&b/c"}, "/s?q=a%26b%2Fc")
+	wantPath(t, `${ @uri "/s" }`, nil, "/s")
+
+	// The path: one segment, whichever way the value was encoded.
+	seg := `${ "/a/" + (.x | @uri) + "/z" }`
+	wantPath(t, seg, map[string]any{"x": "b c?d#e"}, "/a/b%20c%3Fd%23e/z")
+	wantPath(t, seg, map[string]any{"x": "%2F"}, "/a/%252F/z")
+	wantRefused(t, seg, map[string]any{"x": "b/c"}, ReasonValueSpansSegments)
+	wantRefused(t, seg, map[string]any{"x": ".."}, ReasonDotSegment)
+	wantRefused(t, `${ @uri "/a/\(.x)/z" }`, map[string]any{"x": "b/c"}, ReasonValueSpansSegments)
+	wantRefused(t, `${ .x | @uri }`, map[string]any{"x": "/a/b"}, ReasonValueSpansSegments)
+
+	// Only @uri: any other pipe or format is a value, and is escaped.
+	wantPath(t, `${ "/s?q=" + (.q | @base64) }`, map[string]any{"q": "a?"}, "/s?q=YT8%3D")
+	wantPath(t, `${ "/s?q=" + (.q | ascii_downcase) }`, map[string]any{"q": "A&B"}, "/s?q=a%26b")
+	wantPath(t, `${ "/s?q=" + (.q | @urid) }`, map[string]any{"q": "a%26b"}, "/s?q=a%26b")
+}
+
 // The blueprint-detail case measured in #1116: apiVersion
 // `apps/v1/deployments?x=` and resource `p1s` made the ServiceAccount dial
 // `/apis/apps/v1/deployments?x=/p1s` — deployments, while the refilter checked

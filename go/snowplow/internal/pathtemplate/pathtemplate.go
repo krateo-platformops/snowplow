@@ -42,12 +42,35 @@
 // literal key (`$w.bk`). Anything else (`.x`, `.x // "d"`, `(.x | f)`, a
 // function call, a value-bound variable) is a value.
 //
+// # A value the author already encoded
+//
+// `E | @uri` (and `@uri "...\(E)..."`) is a value the program escaped itself:
+// jq's @uri leaves nothing but unreserved characters and %XX, so it is one
+// query value as it stands, and escaping it again would send a different value
+// (`%2F` as `%252F`). It renders as written. In the path part it is still one
+// segment: an encoded '/' is refused like a '/', because a server decodes it
+// back into a separator. Any other format (@base64, @sh, ...) is a value.
+//
 // # Declared multi-segment values
 //
 // A value that is meant to span segments says so: `segments(E)`. E is split on
 // `/` and each piece is escaped as one segment; a `.` or `..` piece is still
 // refused, so a declared value can never walk up the tree, and it cannot add a
 // query. segments() is valid only where it is spliced into the path part.
+//
+// The edges of segments(E), which are the contract an author writes against:
+//
+//   - E null: contributes nothing, like jq's `+ null`, and the template's own
+//     text stays (`"/a/" + segments(.p) + "/z"` renders `/a//z`). With no text
+//     around it the render is "" and the dial plan refuses it: a path that
+//     renders empty is never dialled (createRequestOption);
+//   - E "": the same render as null, one empty piece;
+//   - an inner empty piece (`a//b`) is kept: the value said so, and the dial
+//     guard of the stage judges it (an own-cluster `/namespaces//` is refused);
+//   - E not a string (a number, a boolean, an array, an object): a render
+//     error, never a tostring;
+//   - segments() in the query is refused whatever E is, null included: the
+//     refusal reads the template, so it does not wait for a value to arrive.
 //
 // A declared value can choose HOW MANY segments it is. Never declare one built
 // from caller input on a stage whose credential the caller does not hold; split
@@ -87,15 +110,19 @@ const reservedPrefix = "__snowplow_path_"
 
 const rawFunc = reservedPrefix + "raw"
 
-// The three part kinds a rewritten program emits, besides a literal (a plain
+// The four part kinds a rewritten program emits, besides a literal (a plain
 // JSON string): a `+` operand ("v": string or null, jq's `+` identity), an
-// interpolation or a non-template program ("i": already tostring'd), and a
-// declared multi-segment value ("s").
+// interpolation or a non-template program ("i": already tostring'd), a declared
+// multi-segment value ("s"), and a value the program encoded with @uri ("u").
 const (
 	partValue    = "v"
 	partInterp   = "i"
 	partSegments = "s"
+	partEncoded  = "u"
 )
+
+// uriFormat is the jq format that makes a value one encoded value.
+const uriFormat = "@uri"
 
 // Refusal reasons: a bounded set, so a caller can count them by reason.
 const (
@@ -204,7 +231,8 @@ func (t *Template) Render(ctx context.Context, data any) (string, error) {
 	}
 	switch n {
 	case 0:
-		// No output renders "", exactly as the plain jq render did.
+		// No output renders "", exactly as the plain jq render did. The dial
+		// plan refuses a template that rendered no path (createRequestOption).
 		return "", nil
 	case 1:
 		return assemble(out)
@@ -354,27 +382,16 @@ func (r *rewriter) convTerm(t *gojq.Term, sc *scope) (*gojq.Query, shape) {
 	}
 	switch t.Type {
 	case gojq.TermTypeString:
-		if t.Str.Queries == nil {
-			return arrayOf(termQ(t)), shape{k: kTemplate}
+		return stringParts(t.Str, objOne(partInterp, call("tostring"))), shape{k: kTemplate}
+	case gojq.TermTypeFormat:
+		if t.Format != uriFormat {
+			return nil, shape{}
 		}
-		var out *gojq.Query
-		for _, e := range t.Str.Queries {
-			var p *gojq.Query
-			if e.Term != nil && e.Term.Str != nil {
-				p = arrayOf(e) // a literal piece
-			} else {
-				p = pipe(paren(e), arrayOf(objOne(partInterp, call("tostring"))))
-			}
-			if out == nil {
-				out = p
-			} else {
-				out = &gojq.Query{Left: out, Op: gojq.OpAdd, Right: p}
-			}
+		encoded := objOne(partEncoded, termQ(&gojq.Term{Type: gojq.TermTypeFormat, Format: uriFormat}))
+		if t.Str == nil {
+			return arrayOf(encoded), shape{k: kTemplate} // `E | @uri`
 		}
-		if out == nil {
-			return arrayOf(termQ(&gojq.Term{Type: gojq.TermTypeString, Str: &gojq.String{}})), shape{k: kTemplate}
-		}
-		return out, shape{k: kTemplate}
+		return stringParts(t.Str, encoded), shape{k: kTemplate} // `@uri "...\(E)..."`
 	case gojq.TermTypeQuery:
 		iq, sh := r.conv(t.Query, sc)
 		if sh.k == kValue {
@@ -398,6 +415,29 @@ func (r *rewriter) convTerm(t *gojq.Term, sc *scope) (*gojq.Query, shape) {
 		}
 	}
 	return nil, shape{}
+}
+
+// stringParts is a string's parts: its literal pieces as they are, and each
+// interpolation piped into interp, the one-part object that marks it.
+func stringParts(str *gojq.String, interp *gojq.Query) *gojq.Query {
+	var out *gojq.Query
+	for _, e := range str.Queries {
+		var p *gojq.Query
+		if e.Term != nil && e.Term.Str != nil {
+			p = arrayOf(e) // a literal piece
+		} else {
+			p = pipe(paren(e), arrayOf(interp))
+		}
+		if out == nil {
+			out = p
+		} else {
+			out = &gojq.Query{Left: out, Op: gojq.OpAdd, Right: p}
+		}
+	}
+	if out == nil {
+		return arrayOf(termQ(&gojq.Term{Type: gojq.TermTypeString, Str: &gojq.String{Str: str.Str}}))
+	}
+	return out
 }
 
 // convFieldOfBound is `$w.key` where $w is bound to an object of templates.
@@ -608,7 +648,7 @@ func partOf(p any) (string, any, bool) {
 		}
 		for k, v := range p {
 			switch k {
-			case partValue, partInterp, partSegments:
+			case partValue, partInterp, partSegments, partEncoded:
 				return k, v, true
 			}
 		}
@@ -681,6 +721,11 @@ func assemble(v any) (string, error) {
 		if !ok {
 			return "", errNotString
 		}
+		// Before the null drop: segments() in the query is the template's fault,
+		// whatever value this call happens to carry.
+		if k == partSegments && pos != inPath {
+			return "", &RefusedError{Reason: ReasonSegmentsInQuery}
+		}
 		if p == nil && k != "" {
 			continue // jq's `+ null`
 		}
@@ -701,10 +746,14 @@ func assemble(v any) (string, error) {
 			} else {
 				b.WriteString(EscapeQueryValue(s))
 			}
-		case partSegments:
-			if pos != inPath {
-				return "", &RefusedError{Reason: ReasonSegmentsInQuery}
+		case partEncoded:
+			if pos == inPath {
+				if dec, err := url.PathUnescape(s); err != nil || strings.Contains(dec, "/") {
+					return "", &RefusedError{Reason: ReasonValueSpansSegments}
+				}
 			}
+			b.WriteString(s)
+		case partSegments:
 			segs := strings.Split(s, "/")
 			for i, seg := range segs {
 				segs[i] = url.PathEscape(seg)

@@ -168,7 +168,8 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 // and the per-call data `ds`. The second return is the VALIDITY verdict: false
 // means the call must NOT be appended or dialled — a template failed (#293
 // unrendered ${...}, #302 a jq error in the path, payload or header), the
-// path template refused a value (#1123), or, on an apiserver stage (apiserver=true), the rendered path is a malformed
+// path template refused a value or rendered no path (#1123), or, on an
+// apiserver stage (apiserver=true), the rendered path is a malformed
 // single-object apiserver path (#288: an interpolated name/namespace segment
 // collapsed to empty, or is DNS-1123-invalid — e.g. a trailing '-').
 // valid=true for well-formed paths AND for out-of-scope paths (external URLs,
@@ -230,6 +231,15 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		// never dialed.
 		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
+	}
+	// #1123 — a template that rendered no path names nothing to call: every value
+	// it spliced was null (`${ segments(.path) }` with .path missing, which is
+	// what a nil-extras prewarm renders), "", or it produced no output. Dialled,
+	// it would read the endpoint's root with the stage's credential. It is the
+	// #288 collapse at its limit, whatever the stage dials. A stage with no
+	// template (in.Path == "") has no value to lose and keeps its meaning.
+	if path == "" && in.Path != "" {
+		return out, false, skipReason{class: reasonEmptyInterp, detail: "the path template rendered no path (#1123)", collapsed: true}
 	}
 	// #302 — a payload or header jq error must NEVER be dialed (a garbage request
 	// body, or a garbage Authorization/header value). Skip the dial, mirroring the

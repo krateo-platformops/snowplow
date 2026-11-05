@@ -20,7 +20,9 @@ import (
 // is rendered through the dial path (createRequestOption) and through the
 // pre-#1123 render (evalJQE), with realistic values. A stage renders
 // identically, or it is listed in corpusChanges1123 with the reason it is
-// refused and the declared form that renders what it rendered before.
+// refused and the declared form that renders what it rendered before. Every
+// stage is judged with the own-cluster guard (apiserver=true), the stricter of
+// the two verdicts (#1112 D2).
 
 // corpusInput1123 is realistic data for every field a corpus path reads: the
 // shapes these fields hold on a live cluster (an apiVersion is group/version,

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/apicall"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
@@ -24,10 +26,18 @@ import (
 // probe and inspect go through) never plans an injected path, and the path it
 // plans is the path that is sent.
 
+// plan1123 plans a stage that dials this cluster's apiserver.
 func plan1123(t *testing.T, path string, dict map[string]any) ([]httpcall.RequestOptions, []skippedOption) {
 	t.Helper()
+	return plan1123On(t, true, path, dict)
+}
+
+// plan1123On plans a stage that dials this cluster's apiserver (apiserver=true)
+// or a named endpoint (#1112 D2: only the former gets the shape guard).
+func plan1123On(t *testing.T, apiserver bool, path string, dict map[string]any) ([]httpcall.RequestOptions, []skippedOption) {
+	t.Helper()
 	in := &templates.API{Name: "s", Path: path}
-	opts, skips, err := createRequestOptionsWithSkips(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), in, dict, true)
+	opts, skips, err := createRequestOptionsWithSkips(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), in, dict, apiserver)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -38,19 +48,21 @@ func plan1123(t *testing.T, path string, dict map[string]any) ([]httpcall.Reques
 // path: never planned, counted under path_value_refused.
 func TestIssue1123_PlanNeverDialsAnInjectedPath(t *testing.T) {
 	cases := []struct {
-		name, path, id string
+		name      string
+		apiserver bool
+		path, id  string
 	}{
-		{"external dotdot", `${ "/api/v2/tickets/" + .id }`, "42/../../users/me"},
-		{"external slash", `${ "/tickets/" + .id + "/comments" }`, "42/../../users/me"},
-		{"external dot", `${ "/tickets/" + .id + "/comments" }`, ".."},
-		{"apiserver query", `${ "/api/v1/namespaces/demo/configmaps/" + .id }`, "x?role=admin"},
-		{"apiserver encoded slash", `${ "/apis/apps/v1/namespaces/demo/deployments/" + .id }`, "x%2F..%2F..%2Fsecrets"},
-		{"apiserver fragment", `${ "/api/v1/namespaces/" + .id + "/configmaps" }`, "demo#"},
+		{"external dotdot", false, `${ "/api/v2/tickets/" + .id }`, "42/../../users/me"},
+		{"external slash", false, `${ "/tickets/" + .id + "/comments" }`, "42/../../users/me"},
+		{"external dot", false, `${ "/tickets/" + .id + "/comments" }`, ".."},
+		{"apiserver query", true, `${ "/api/v1/namespaces/demo/configmaps/" + .id }`, "x?role=admin"},
+		{"apiserver encoded slash", true, `${ "/apis/apps/v1/namespaces/demo/deployments/" + .id }`, "x%2F..%2F..%2Fsecrets"},
+		{"apiserver fragment", true, `${ "/api/v1/namespaces/" + .id + "/configmaps" }`, "demo#"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			before := MalformedDialSkippedByReason(reasonPathValueRefused)
-			opts, skips := plan1123(t, c.path, map[string]any{"id": c.id})
+			opts, skips := plan1123On(t, c.apiserver, c.path, map[string]any{"id": c.id})
 			if len(opts) != 0 {
 				t.Fatalf("planned %q", opts[0].Path)
 			}
@@ -67,7 +79,7 @@ func TestIssue1123_PlanNeverDialsAnInjectedPath(t *testing.T) {
 	}
 	// On an external endpoint a '?' in a value is escaped into its segment and
 	// the call goes out (one segment, the template's resource).
-	opts, _ := plan1123(t, `${ "/tickets/" + .id + "/comments" }`, map[string]any{"id": "42?role=admin"})
+	opts, _ := plan1123On(t, false, `${ "/tickets/" + .id + "/comments" }`, map[string]any{"id": "42?role=admin"})
 	if len(opts) != 1 || opts[0].Path != "/tickets/42%3Frole=admin/comments" {
 		t.Fatalf("external escape: %+v", opts)
 	}
@@ -146,6 +158,7 @@ func TestIssue1123_CheckedPathIsSentPath(t *testing.T) {
 		`${ "/api/v1/namespaces/" + .ns + "/configmaps?fieldSelector=metadata.name%3D" + .id }`,
 		`${ "/tickets/" + .id + "/comments" }`,
 		`${ "/search?q=" + .id + "&role=viewer" }`,
+		`${ "/search?q=" + (.id | @uri) + "&role=viewer" }`,
 	}
 	ids := []string{"web", "42/../../users/me", "x?role=admin", "x#f", "%2e%2e", "x%2Fy", "a b", "x&role=admin", "system:x", ".."}
 	f := request.RequestInfoFactory{APIPrefixes: sets.NewString("api", "apis"), GrouplessAPIPrefixes: sets.NewString("api")}
@@ -197,5 +210,188 @@ func TestIssue1123_CheckedPathIsSentPath(t *testing.T) {
 	}
 	if sent < 15 {
 		t.Fatalf("only %d calls were planned; the arm does not exercise the dial", sent)
+	}
+}
+
+// A template that renders no path names nothing to call: it is refused on every
+// stage, as the #288 collapse at its limit, and counted as empty_interp. The
+// values that get there are null, missing and "": what a nil-extras prewarm
+// renders for a path read from extras.
+func TestIssue1123_TemplateThatRendersNoPathIsRefused(t *testing.T) {
+	cases := []struct {
+		name, path string
+		dict       map[string]any
+	}{
+		{"segments of a missing value", `${ segments(.path) }`, map[string]any{}},
+		{"segments of null", `${ segments(.path) }`, map[string]any{"path": nil}},
+		{"segments of the empty string", `${ segments(.path) }`, map[string]any{"path": ""}},
+		{"segments with nil extras", `${ segments(.path) }`, nil},
+		{"a whole value that is empty", `${ .path // "" }`, map[string]any{}},
+		{"no output", `${ empty }`, map[string]any{}},
+		{"an empty literal", `${ "" }`, map[string]any{}},
+	}
+	for _, apiserver := range []bool{true, false} {
+		for _, c := range cases {
+			t.Run(fmt.Sprintf("apiserver=%v/%s", apiserver, c.name), func(t *testing.T) {
+				before := MalformedDialSkippedByReason(reasonEmptyInterp)
+				opts, skips := plan1123On(t, apiserver, c.path, c.dict)
+				if len(opts) != 0 {
+					t.Fatalf("planned %q", opts[0].Path)
+				}
+				if len(skips) != 1 || skips[0].reason.class != reasonEmptyInterp || !skips[0].reason.collapsed {
+					t.Fatalf("skips = %+v, want one collapsed %s", skips, reasonEmptyInterp)
+				}
+				if got := MalformedDialSkippedByReason(reasonEmptyInterp) - before; got != 1 {
+					t.Fatalf("empty_interp moved by %d, want 1", got)
+				}
+			})
+		}
+	}
+
+	// What the rule leaves alone. A stage with no path has no template, and the
+	// author's text around a null value is a path.
+	if opts, skips := plan1123On(t, false, "", map[string]any{}); len(opts) != 1 || len(skips) != 0 {
+		t.Fatalf("a stage with no path: planned %d, skips %+v", len(opts), skips)
+	}
+	if opts, skips := plan1123On(t, false, `${ "/a/" + segments(.p) }`, map[string]any{}); len(opts) != 1 || opts[0].Path != "/a/" {
+		t.Fatalf("text around a null value: planned %+v, skips %+v", opts, skips)
+	}
+	if opts, skips := plan1123On(t, false, `${ segments(.p) }`, map[string]any{"p": "/x/y"}); len(opts) != 1 || opts[0].Path != "/x/y" {
+		t.Fatalf("a present value: planned %+v, skips %+v", opts, skips)
+	}
+}
+
+// The other segments() edges, as a stage sees them: an inner empty piece is
+// kept and judged by the stage's own guard, a non-string is a template error.
+func TestIssue1123_SegmentsEdgesAtThePlan(t *testing.T) {
+	if opts, skips := plan1123On(t, false, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"}); len(opts) != 1 || opts[0].Path != "/x/a//b" {
+		t.Fatalf("an inner empty piece on a named endpoint: planned %+v, skips %+v", opts, skips)
+	}
+	// Both verdicts refuse a collapsed namespace, whichever way it collapsed.
+	for _, apiserver := range []bool{true, false} {
+		for _, p := range []any{"", nil} {
+			opts, skips := plan1123On(t, apiserver, `${ "/api/v1/namespaces/" + segments(.p) + "/pods" }`, map[string]any{"p": p})
+			if len(opts) != 0 || len(skips) != 1 || skips[0].reason.class != reasonEmptyInterp {
+				t.Fatalf("apiserver=%v p=%v: planned %+v, skips %+v", apiserver, p, opts, skips)
+			}
+		}
+	}
+	for _, v := range []any{42, true, []any{"a"}, map[string]any{"a": "b"}} {
+		opts, skips := plan1123On(t, false, `${ "/x/" + segments(.p) }`, map[string]any{"p": v})
+		if len(opts) != 0 || len(skips) != 1 || skips[0].reason.class != reasonJQPathError {
+			t.Fatalf("p=%v: planned %+v, skips %+v, want one %s", v, opts, skips, reasonJQPathError)
+		}
+	}
+}
+
+// Through a whole resolve, with no extras: nothing reaches the endpoint, and
+// the stage reports why (#1116) on a customer read and on a prewarm alike.
+func TestIssue1123_AllNullPathFailsItsStageAndDialsNothing(t *testing.T) {
+	stage := func(coe bool) *templates.API {
+		return &templates.API{Name: "obj", Verb: ptr.To(http.MethodGet), ErrorKey: ptr.To("objErr"),
+			ContinueOnError: ptr.To(coe), Path: `${ segments(.path) }`}
+	}
+	api := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, api.srv.URL, map[string]map[string]string{})
+	for _, class := range []workclass.Class{workclass.None, workclass.Prewarm} {
+		t.Run(fmt.Sprintf("class=%v", class), func(t *testing.T) {
+			o := rr16Resolve(t, class, nil, stage(false))
+			if hits := api.all(); len(hits) != 0 {
+				t.Fatalf("dialled: %+v", hits)
+			}
+			x1106WantReason(t, o.outcomes, "obj", StageReasonInvalidPath)
+			rr16ErrRecord(t, o, "objErr", StageReasonInvalidPath)
+			if o.failure == nil || o.failure.Stage != "obj" || o.failure.Code != http.StatusBadRequest {
+				t.Fatalf("StageFailure = %+v, want the stage's 400", o.failure)
+			}
+			if o.sinkN == 0 {
+				t.Fatal("the stage-error sink was not bumped: a Put would store a body around the missing read")
+			}
+			if _, set := o.dict["obj"]; set {
+				t.Fatalf("the refused stage wrote its key: %v", o.dict["obj"])
+			}
+			o = rr16Resolve(t, class, nil, stage(true))
+			x1106WantReason(t, o.outcomes, "obj", StageReasonInvalidPath)
+			if o.failure != nil {
+				t.Fatalf("continueOnError: StageFailure = %+v, want none", o.failure)
+			}
+		})
+	}
+}
+
+// A named endpoint, and an iterator: one null element is one refused item, the
+// other elements are sent, and an iterator that yields nothing has nothing to
+// call and succeeds (the form howto/restactions.md gives for an absent value).
+func TestIssue1123_AllNullPathOnANamedEndpointAndAnIterator(t *testing.T) {
+	iterated := func(it string) *templates.API {
+		s := u904Stage("obj", http.MethodGet, `${ segments(.path) }`)
+		s.DependsOn = &templates.Dependency{Iterator: ptr.To(it)}
+		return u904Continue(s)
+	}
+	sent := func(u *u904Upstream) int {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		n := 0
+		for _, v := range u.count {
+			n += v
+		}
+		return n
+	}
+
+	u := u904NewUpstream(t, nil)
+	r := u904Resolve(t, u, []*templates.API{u904Stage("obj", http.MethodGet, `${ segments(.path) }`)}, false)
+	if n := sent(u); n != 0 {
+		t.Fatalf("a named endpoint was dialled %d time(s): %v", n, u.count)
+	}
+	r.wantRow(t, u904Row{Name: "obj", Reason: StageReasonInvalidPath})
+
+	u = u904NewUpstream(t, nil)
+	r = u904Resolve(t, u, []*templates.API{iterated(`[{path: null}, {path: "/x"}]`)}, false)
+	if n, x := sent(u), u.n(http.MethodGet, "/x"); n != 1 || x != 1 {
+		t.Fatalf("sent %d, /x %d: want only /x, once", n, x)
+	}
+	r.wantRow(t, u904Row{Name: "obj", Reason: StageReasonInvalidPath})
+
+	u = u904NewUpstream(t, nil)
+	r = u904Resolve(t, u, []*templates.API{iterated(`[ {path: .path} | select(.path != null) ]`)}, false)
+	if n := sent(u); n != 0 {
+		t.Fatalf("an empty iterator dialled %d time(s)", n)
+	}
+	r.wantSucceeded(t, "obj")
+}
+
+// #1116 meets #1123: a value the path template refuses fails its stage as an
+// InvalidPath 400, read or write, like every other refused path. The message
+// names the rule, never the value.
+func TestIssue1123_RefusedValueFailsItsStageAsInvalidPath(t *testing.T) {
+	const payload = "42/../../users/me"
+	api := newX1106Srv(t, false, x1106OK)
+	x1106Env(t, api.srv.URL, map[string]map[string]string{})
+	for _, verb := range []string{http.MethodGet, http.MethodPut} {
+		t.Run(verb, func(t *testing.T) {
+			before := MalformedDialSkippedByReason(reasonPathValueRefused)
+			o := rr16Resolve(t, workclass.None, map[string]any{"id": payload}, &templates.API{Name: "s", Verb: ptr.To(verb),
+				ErrorKey: ptr.To("sErr"), Path: `${ "/api/v1/namespaces/demo/configmaps/" + .id }`})
+			if hits := api.all(); len(hits) != 0 {
+				t.Fatalf("dialled: %+v", hits)
+			}
+			x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+			if o.failure == nil || o.failure.Code != http.StatusBadRequest {
+				t.Fatalf("StageFailure = %+v, want a 400", o.failure)
+			}
+			errs, _ := o.dict["sErr"].([]any)
+			if len(errs) != 1 {
+				t.Fatalf("errorKey = %v, want one record", o.dict["sErr"])
+			}
+			m, _ := errs[0].(map[string]any)
+			msg, _ := m["message"].(string)
+			if m["reason"] != StageReasonInvalidPath || statusCodeOf(m["code"]) != http.StatusBadRequest ||
+				!strings.Contains(msg, "(#1123)") || strings.Contains(msg, payload) {
+				t.Fatalf("errorKey record = %v", m)
+			}
+			if got := MalformedDialSkippedByReason(reasonPathValueRefused) - before; got != 1 {
+				t.Fatalf("path_value_refused moved by %d, want 1", got)
+			}
+		})
 	}
 }
