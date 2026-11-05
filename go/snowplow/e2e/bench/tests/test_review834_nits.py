@@ -18,6 +18,7 @@ import yaml
 from bench import k6_job, load606
 from tests.test_k6_830 import _run606_k6, needs_docker
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401
+import pytest
 
 FIX = BENCH_DIR / "tests" / "fixtures"
 
@@ -125,6 +126,7 @@ def test_a_running_pod_is_never_stuck():
     assert load606.driver_pod_stuck({}, T0) is None
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 240` on the wall clock
 def test_run606_fails_fast_on_a_browser_pod_stuck_in_init(harness):  # noqa: F811
     t0 = time.time()
     # k6load is still running: the browser pod is checked while the wait is on k6load

@@ -424,6 +424,7 @@ def test_freshness_probe_records_never_converged_samples():
     assert all(r["latency_ms"] is None for r in recs)
 
 
+@pytest.mark.serial  # #1166/#1174: counts the requests issued in a real 0.5 s sleep (>= 15): a rate on the wall clock
 def test_churn_driver_reaches_its_rate():
     seen = []
     c = load606.ChurnDriver(list(range(5)), 50, lambda t, m: seen.append(t) or load606.WriteResult(True))

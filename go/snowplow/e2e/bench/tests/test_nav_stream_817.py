@@ -204,6 +204,7 @@ def _recs(path):
     return [json.loads(l) for l in path.read_text().splitlines()]
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `elapsed < IDLE_S / 2` on the wall clock
 def test_drive_records_framed_navigations_and_closes_idle_viewers_promptly(portal, tmp_path):
     out = tmp_path / "nav.jsonl"
     t0 = time.monotonic()
@@ -335,6 +336,7 @@ def test_run606_missing_driver_file_is_loud(harness):
     assert "INVALID: driver.stream: no driver output was collected" in log
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 120` on the wall clock
 def test_run606_a_failed_driver_pod_fails_measure_at_once(harness):
     env, state, ambient, tmp = harness
     env["FAKE_DRIVER_FAILED"] = "1"

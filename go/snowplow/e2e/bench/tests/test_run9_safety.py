@@ -32,6 +32,7 @@ def _measure_fails(env, **extra):
 # ─── (a) teardown ──────────────────────────────────────────────────────────
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 40` on the wall clock
 def test_term_during_partial_collect_still_deletes_the_cluster(harness):
     env, state, ambient, tmp = harness
     env = _measure_fails(env, FAKE_SLOW_LOGS="40")
@@ -166,6 +167,7 @@ def test_teardown_disarms_errexit_and_signals_before_anything_else():
     assert "trap on_signal INT TERM HUP" in src and "trap 'exit 130'" not in src
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 30` on the wall clock
 def test_a_hung_gke_up_is_bounded_and_torn_down(harness):
     """R16: gke-up runs under `bounded` (UP_BUDGET_S)."""
     env, state, ambient, tmp = harness
@@ -179,6 +181,7 @@ def test_a_hung_gke_up_is_bounded_and_torn_down(harness):
     assert gcl[-3:] == TEARDOWN_TAIL
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 35` on the wall clock
 def test_partial_collect_has_one_wall_clock_cap(harness):
     env, state, ambient, tmp = harness
     env = _measure_fails(env, FAKE_SLOW_LOGS="40", COLLECT_CAP_S="2")
@@ -191,6 +194,7 @@ def test_partial_collect_has_one_wall_clock_cap(harness):
     assert gcl[-3:] == TEARDOWN_TAIL
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 35` on the wall clock
 def test_every_collect_read_is_bounded_twice(harness):
     env, state, ambient, tmp = harness
     # one hung read, bounded per read at 1 s (the total cap is not what stops it)

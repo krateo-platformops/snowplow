@@ -120,6 +120,7 @@ def test_a_test_whose_subprocess_times_out_leaves_no_process_behind(tmp_path):
         _kill(token)
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() < deadline` on the wall clock
 def test_a_test_interrupted_with_ctrl_c_leaves_no_process_behind(tmp_path):
     """Ctrl-C reaches the terminal's process group; run606 and the fakes it starts sit in a
     session of their own, so the signal never reaches them: the test's end must."""
@@ -182,7 +183,7 @@ def test_the_interpreters_resource_tracker_is_not_a_tests_leak(tmp_path):
     ''')
     try:
         assert p.returncode == 0, p.stdout + p.stderr
-        assert "processes a test left running" not in p.stdout, p.stdout
+        assert "the test left" not in p.stdout + p.stderr, p.stdout + p.stderr          # no leak was reported
         assert "resource_tracker" not in p.stdout + p.stderr, p.stdout + p.stderr
     finally:
         _kill(token)

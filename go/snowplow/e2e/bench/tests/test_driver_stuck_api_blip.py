@@ -109,6 +109,7 @@ def test_an_empty_pod_listing_answered_rc_0_is_unknown_too(harness):  # noqa: F8
     assert "measure FAILED: k6load not done within 4s" in log      # the deadline, not the empty read
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 240` on the wall clock
 def test_positive_evidence_still_fails_after_an_outage(harness):  # noqa: F811
     """The browser pod really stuck in Init (restarting sidecar): after the
     outage it is seen, and the step fails with the reason, fast."""
@@ -159,6 +160,7 @@ def test_collect_waits_out_an_outage_before_declaring_results_missing(harness): 
     ("job", 'Error from server (NotFound): jobs.batch "k6load" not found'),
     ("pods", 'Error from server (Forbidden): pods is forbidden: User "<redacted>" cannot list resource "pods"'),
 ])
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 240` on the wall clock
 def test_an_answered_error_fails_the_step_with_kubectls_line(harness, what, line):  # noqa: F811
     """1: a read the API server ANSWERED with an error (NotFound, Forbidden,
     Unauthorized, BadRequest, Invalid), /readyz answering and the one re-read
@@ -173,6 +175,7 @@ def test_an_answered_error_fails_the_step_with_kubectls_line(harness, what, line
     assert time.time() - t0 < 240
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 240` on the wall clock
 def test_a_fresh606_wait_answered_with_an_error_fails_by_readyz(harness):  # noqa: F811
     """1: the fresh606 wait's probe is /readyz: an answered Forbidden fails
     the step, it is not waited to the deadline (a `get job/fresh606` probe
@@ -317,6 +320,7 @@ def test_answered_error_carries_local_errors_patterns_verbatim():
     assert answered.endswith("|" + local), (local, answered)
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 240` on the wall clock
 def test_a_local_kubectl_misconfiguration_is_a_verdict_at_once(harness):  # noqa: F811
     """kubectl's own client-side error (here: the context does not exist)
     never reached an API server: a verdict at once, with the reason — not

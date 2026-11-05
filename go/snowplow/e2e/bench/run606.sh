@@ -410,6 +410,11 @@ step() {
 # has no `timeout`). Output and exit status are cmd's own (143 if killed).
 # kill_tree <signal> <pid>: the pid and every descendant, children first (#1170). A TERM to a
 # python wrapper does not reach the gcloud / kubectl it started: they would run on, orphaned.
+# A pgrep -P walk, not a process-group kill: run606_pair.sh's two runs share its group, and a
+# group kill could reach the partner run. Its limits: a descendant already re-parented is not
+# found, and a parent can react to a child's TERM before its own arrives (gke-up on a failed create
+# starts a `gcloud ... delete`, which outlives the walk; it deletes our own cluster, and gke-down
+# handles an operation in flight).
 kill_tree() {
   local sig="$1" pid="$2" c
   for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
@@ -424,13 +429,18 @@ bounded() {
   local secs="$1"; shift
   "$@" &
   local pid=$!
-  ( s=""; trap 'kill "$s" 2>/dev/null; exit 0' TERM
-    sleep "$secs" & s=$!; wait "$s"; kill_tree TERM "$pid" ) >/dev/null 2>&1 &
+  BOUNDED_PIDS="$pid"     # from the fork on: a stop before the watchdog exists still stops the command
+  # The watchdog's TERM trap kills `$!`, which bash sets at the fork, so no moment leaves its sleep
+  # unnamed; the no-op job first makes `$!` a finished process until the sleep is forked.
+  ( : & trap 'kill $! 2>/dev/null; exit 0' TERM
+    sleep "$secs" & wait $!; kill_tree TERM "$pid" ) >/dev/null 2>&1 &
   local dog=$!
   BOUNDED_PIDS="$pid $dog"
   local rc=0
   wait "$pid" || rc=$?
-  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
+  # the watchdog as a tree: its sleep first, then itself. The trap is the second line of defence:
+  # alone, it left 1 sleep in 20 calls under macOS's bash 3.2; as a tree, 0 in 600 (#1175 review)
+  kill_tree TERM "$dog"; wait "$dog" 2>/dev/null || true
   BOUNDED_PIDS=""
   return "$rc"
 }

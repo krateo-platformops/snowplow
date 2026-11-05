@@ -529,6 +529,7 @@ def test_the_address_sweep_waits_for_the_cluster_to_be_gone(lbfakes, monkeypatch
     assert rec["leaked_addresses"] is None and problems
 
 
+@pytest.mark.serial  # #1166/#1174: asserts `_t.monotonic() - t0 < 15` on the wall clock
 def test_a_hung_gcloud_call_is_bounded(lbfakes, monkeypatch):
     """N1: every gcloud call this teardown adds carries a timeout (what is
     left until its deadline, at least GCLOUD_CALL_MIN_S); a hung list is a
