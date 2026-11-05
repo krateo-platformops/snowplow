@@ -27,7 +27,7 @@ import (
 func plan1123(t *testing.T, path string, dict map[string]any) ([]httpcall.RequestOptions, []skippedOption) {
 	t.Helper()
 	in := &templates.API{Name: "s", Path: path}
-	opts, skips, err := createRequestOptionsWithSkips(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), in, dict)
+	opts, skips, err := createRequestOptionsWithSkips(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), in, dict, true)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}

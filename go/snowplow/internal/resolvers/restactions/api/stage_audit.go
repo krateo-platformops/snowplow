@@ -69,6 +69,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
@@ -80,13 +81,11 @@ const stageAuditAction = "restaction"
 // resolver: the audit trail (#902), the background-write refusal (#903), the
 // dependent-write rule (#904) and the stale-pass hold (#905) all read it
 // (isWriteVerb, write_verb.go). The empty method is classified as it is sent:
-// net/http sends "" as GET.
+// net/http sends "" as GET. #1088: it is credhttp.SafeMethod, which the
+// endpoint send policy reads too (a write is sent once), so "is this a write"
+// has one answer at the resolver and at the transport.
 func isSafeMethod(verb string) bool {
-	switch strings.ToUpper(verb) {
-	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-		return true
-	}
-	return false
+	return credhttp.SafeMethod(verb)
 }
 
 // stageAuditEvent builds the record for one write-verb stage dial whose

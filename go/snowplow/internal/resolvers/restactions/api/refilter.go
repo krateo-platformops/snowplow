@@ -45,6 +45,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // uafReadVerbs is the set of Kubernetes RBAC verbs that unambiguously express
@@ -202,9 +203,18 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution. No
-	// live RA forms such a chain today, which closes it by corpus accident rather
-	// than by code — one customer CR away from being false.
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed
@@ -251,6 +261,10 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 — the items are objects of the resource the path names; an object
+	// of a checked resource is checked on its own resource alone.
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(apiCall.Path)
+	resources = uafItemResources(uaf, resources, servedGVR.GroupResource(), servedOK)
 
 	raw, ok := dict[apiCall.Name]
 	if !ok || raw == nil {
@@ -452,9 +466,12 @@ type uafRBACMemoKey struct {
 // Ship 0.30.129 OR semantics: a namespace is kept iff the user can
 // perform Verb on ANY of the resolved resource plurals there.
 //
-// `resources` is the resolved plural set (resolveUAFResources): a single
-// element [uaf.Resource] when ResourcesFrom is unset (pre-0.30.129
-// behaviour, byte-identical), or the jq-derived set when it is set.
+// `resources` is the set the caller decided for these items: the resolved
+// plural set (resolveUAFResources: [uaf.Resource] when ResourcesFrom is
+// unset, the jq-derived set when it is set), narrowed by uafItemResources
+// (#1124). For objects of a checked resource it is that one resource, so the
+// OR has one term and the check is Kubernetes' own per-object decision; for
+// scope items (namespaces, names) it is the whole set.
 //
 // item is any (0.30.111 Part 1): a K8s object (map[string]any) OR a
 // bare scalar (string — the namespaces-stage name-array shape). jq
@@ -602,6 +619,45 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		}
 	}
 	return false
+}
+
+// uafItemResources is the resource set the refilter checks each item of one
+// response against, decided by what the items are (#1124, SECURITY).
+//
+// served is the Kubernetes resource the stage's request names: the group and
+// plural of the dialled path (servedOK false when the path names none). Every
+// item of that response IS an object of served. A LIST answers with members of
+// the listed collection and a GET with the named object, and Kubernetes
+// authorizes reading such an object on its own resource, in its own namespace,
+// with the caller's verb. The request is what names that resource on every
+// dispatch path: a typed list from the live apiserver carries no apiVersion or
+// kind on its items, and when an item does carry them they name served.
+//
+//   - served is a member of the checked set (served.Group == uaf.Group and
+//     served.Resource is in resources): the items are objects of a checked
+//     resource, and the set narrows to served.Resource alone. Keeping such an
+//     object because the caller may act on ANOTHER plural of the set reads it
+//     without its own grant: one p1s grant in a namespace plus the visibility
+//     of p2's definition read every p2 object there.
+//   - otherwise the items are not objects of a checked resource (namespaces
+//     checked with namespaceFrom .metadata.name, or another resource the
+//     author gates by the set), and the check asks about a scope: may the
+//     caller act on ANY of these plurals there. The OR across the set is that
+//     question, unchanged.
+//
+// A static resource is a set of one, so it checks exactly what it checked
+// before on both branches. Nothing here names a RESTAction, a stage or a
+// resource: the rule reads only the request and the stage's own stanza.
+func uafItemResources(uaf *templates.UserAccessFilterSpec, resources []string, served schema.GroupResource, servedOK bool) []string {
+	if !servedOK || served.Group != uaf.Group {
+		return resources
+	}
+	for _, r := range resources {
+		if r == served.Resource {
+			return []string{r}
+		}
+	}
+	return resources
 }
 
 // compileNamespaceFrom resolves the effective NamespaceFrom expression for a
@@ -875,7 +931,11 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 // shape for an unresolvable ResourcesFrom — identical to pre-Ship-K
 // behaviour for that case. Per-item refilter still uses `pig` items —
 // that scope is correct for items.
-func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
+//
+// #1124 — served/servedOK is the Kubernetes resource the stage's request
+// names (jsonHandlerOptions.served): the items are objects of it, and
+// uafItemResources narrows the checked set to it when it is a member.
+func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec, served schema.GroupResource, servedOK bool) refilterResult {
 	log := xcontext.Logger(ctx)
 	res := refilterResult{}
 
@@ -894,17 +954,26 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution. No
-	// live RA forms such a chain today, which closes it by corpus accident rather
-	// than by code — one customer CR away from being false.
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed
 	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
 	// every non-Put path is byte-identical.
 	//
-	// THIS IS THE LIVE SITE (jsonHandlerCore) and a hard tag condition for
-	// 1.12.3 per cache/uaf_touched_sink.go.
+	// THIS IS THE LIVE SITE (reached from jsonHandlerCore). It has been present
+	// since 1.12.3 (PR #173).
 	cache.BumpUAFTouched(ctx)
 
 	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. This
@@ -937,6 +1006,9 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 (SECURITY) — an object of a checked resource is checked on its own
+	// resource alone; a scope item (a namespace, a name) keeps the set's OR.
+	resources = uafItemResources(uaf, resources, served, servedOK)
 
 	raw, ok := pig[stageName]
 	if !ok || raw == nil {

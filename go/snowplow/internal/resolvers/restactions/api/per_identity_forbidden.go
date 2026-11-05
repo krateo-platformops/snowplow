@@ -1,6 +1,9 @@
 // per_identity_forbidden.go — #681: classify a stage error as a per-identity
 // forbidden (typed, never by message text) and replace it with ONE
-// identity-free canonical body before it enters the result.
+// identity-free canonical body before it enters the result. #1080 adds the
+// other per-identity definite answer, a named object's NotFound under
+// continueOnError (N1 / N2, see cache/per_identity_forbidden.go), counted on
+// the same sink with its own canonical body.
 //
 // WHY THE BODY IS REWRITTEN (#681 S1, security). The apiserver's Forbidden
 // message names the requester — `configmaps "x" is forbidden: User "alice"
@@ -30,10 +33,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
@@ -49,7 +54,19 @@ func canonicalForbiddenMessage(gvr schema.GroupVersionResource, namespace, name,
 
 // canonicalForbiddenBody is the identity-free value recorded under errorKey.
 func canonicalForbiddenBody(msg string) any {
-	m, err := response.AsMap(response.New(http.StatusForbidden, errors.New(msg)))
+	return canonicalStatusBody(http.StatusForbidden, msg)
+}
+
+// canonicalNotFoundBody is the identity-free value a definite NotFound (#1080)
+// records under errorKey: the apiserver's 404 Status shape with the message
+// rebuilt from the coordinates.
+func canonicalNotFoundBody(msg string) any {
+	return canonicalStatusBody(http.StatusNotFound, msg)
+}
+
+// canonicalStatusBody is plumbing's Status map for code carrying msg.
+func canonicalStatusBody(code int, msg string) any {
+	m, err := response.AsMap(response.New(code, errors.New(msg)))
 	if err != nil || len(m) == 0 {
 		return msg
 	}
@@ -85,9 +102,90 @@ func classifyOwnDialForbidden(gctx context.Context, apiCall *templates.API, call
 	return canonicalForbiddenMessage(gvr, ns, name, readVerbFor(name)), true
 }
 
-// notePerIdentityForbidden bumps the per-identity forbidden sink at the same
-// site, for the same item, as the stage-error bump. external is true for F2
-// (its dial already bumped the ExternalTouchedSink).
+// definiteNotFoundMessage holds the conditions N1 and N2 share on the call
+// (cache/per_identity_forbidden.go, #1080): the stage declares continueOnError,
+// it is a plain GET of a NAMED object on a parseable apiserver path (no
+// subresource), and the watcher is authoritative for the GVR and does not hold
+// the object (cache.WatchedAbsent), so its creation dirty-marks the cell
+// through the exact-object edge. On ok it returns the canonical, identity-free
+// NotFound message built from the coordinates — the apiserver's own phrasing,
+// the one stage_failure.go reports.
+func definiteNotFoundMessage(call httpcall.RequestOptions) (string, bool) {
+	if !call.ContinueOnError || !isPlainGet(call.Verb) || hasSubresourceSuffix(call.Path) {
+		return "", false
+	}
+	gvr, ns, name, ok := cache.ParseAPIServerPathToDep(call.Path)
+	if !ok || name == "" {
+		return "", false
+	}
+	noteDefiniteNotFoundCheck(DefiniteNotFoundBeforeWatchCheck)
+	if !cache.WatchedAbsent(gvr, ns, name) {
+		return "", false
+	}
+	noteDefiniteNotFoundCheck(DefiniteNotFoundAfterWatchCheck)
+	return apierrors.NewNotFound(gvr.GroupResource(), name).Error(), true
+}
+
+// The two #1080 check windows SetDefiniteNotFoundCheckHookForTest opens: right
+// before the watcher's absence check, and right after it said absent (the
+// classification is decided; the result has not been stored yet).
+const (
+	DefiniteNotFoundBeforeWatchCheck = "before_watch_check"
+	DefiniteNotFoundAfterWatchCheck  = "after_watch_check"
+)
+
+// definiteNotFoundCheckHook is a TEST seam (nil in production): it lets an arm
+// place an object's creation exactly on one side of the absence check — the
+// #375 put-then-remark window (#1080 C6) — instead of racing for it.
+var definiteNotFoundCheckHook atomic.Pointer[func(stage string)]
+
+func noteDefiniteNotFoundCheck(stage string) {
+	if h := definiteNotFoundCheckHook.Load(); h != nil {
+		(*h)(stage)
+	}
+}
+
+// SetDefiniteNotFoundCheckHookForTest installs fn at the two #1080 check
+// windows. Production code MUST NOT call it. Returns a restore func.
+func SetDefiniteNotFoundCheckHookForTest(fn func(stage string)) (restore func()) {
+	var p *func(string)
+	if fn != nil {
+		p = &fn
+	}
+	prev := definiteNotFoundCheckHook.Swap(p)
+	return func() { definiteNotFoundCheckHook.Store(prev) }
+}
+
+// classifyOwnDialNotFound reports whether an external-fall-through failure is
+// an N1 definite NotFound: the apiserver's typed 404 NotFound on the
+// requester's OWN dial (the F2 provenance conditions: no endpointRef, not an SA
+// dial) of a named object, under definiteNotFoundMessage. The apiserver
+// authorized this identity's `get` before it looked the object up.
+func classifyOwnDialNotFound(gctx context.Context, apiCall *templates.API, call httpcall.RequestOptions, res *response.Status) (string, bool) {
+	if res == nil || res.Code != http.StatusNotFound || res.Reason != response.StatusReasonNotFound {
+		return "", false
+	}
+	if apiCall == nil || apiCall.EndpointRef != nil || cache.ServiceAccountDialFromContext(gctx) {
+		return "", false
+	}
+	return definiteNotFoundMessage(call)
+}
+
+// classifyAuthorizedNotFound reports whether a branch C failure is an N2
+// definite NotFound: the SA dial's NotFound after the per-identity pre-dial
+// authorization allowed this identity's `get` (authorizedNotFoundError), under
+// definiteNotFoundMessage.
+func classifyAuthorizedNotFound(call httpcall.RequestOptions, err error) (string, bool) {
+	if !isAuthorizedNotFound(err) {
+		return "", false
+	}
+	return definiteNotFoundMessage(call)
+}
+
+// notePerIdentityForbidden bumps the per-identity definite-answer sink at the
+// same site, for the same item, as the stage-error bump: a forbidden (F1, F2)
+// or, #1080, a named object's NotFound (N1, N2). external is true for F2 and N1
+// (their dial already bumped the ExternalTouchedSink).
 func notePerIdentityForbidden(ctx context.Context, external bool) {
 	s := cache.PerIdentityForbiddenSinkFromContext(ctx)
 	s.BumpStage()

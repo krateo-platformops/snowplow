@@ -63,10 +63,12 @@ type r684Env struct {
 
 // The two non-denial stage errors R2 mixes in.
 var (
-	// r684Ghost: a 404. pub/ghost is not in the informer, so the read falls
-	// through to the requester's own dial — a GENUINE external touch (not an
-	// F2), declined by GenuineExternal.
-	r684Ghost = map[string]any{"name": "gho", "path": "/api/v1/namespaces/pub/configmaps/ghost", "continueOnError": true, "errorKey": "ghoErr"}
+	// r684Ghost: a 5xx. pub/boom is not in the informer, so the read falls
+	// through to the requester's own dial, which fails — a GENUINE external
+	// touch (not an F2), declined by GenuineExternal. (Before #1080 this was a
+	// 404 of pub/ghost; a watched named object's NotFound under continueOnError
+	// is now a definite answer, N1.)
+	r684Ghost = map[string]any{"name": "gho", "path": "/api/v1/namespaces/pub/configmaps/boom", "continueOnError": true, "errorKey": "ghoErr"}
 	// r684BadFilter: an in-process (informer-served) read whose stage filter
 	// fails — a stage error with NO external touch, so only the stage-error
 	// gate (DenialOnly) can decline it.
@@ -270,10 +272,10 @@ func TestIssue684_R2a_MixedDenialAndInProcessError_NotCached_BothBranches(t *tes
 	}
 }
 
-// R2b — denial + a 404 on the requester's own dial: a genuine external touch
+// R2b — denial + a 5xx on the requester's own dial: a genuine external touch
 // (not an F2), declined by GenuineExternal on both branches.
 func TestIssue684_R2b_MixedDenialAndNotFound_NotCached_BothBranches(t *testing.T) {
-	if _, ex := r684MixedNotCached(t, "denial + 404", r684Ghost); ex != 2 {
+	if _, ex := r684MixedNotCached(t, "denial + 5xx", r684Ghost); ex != 2 {
 		t.Fatalf("R2b: external declines = %d, want 2 (first sight + repopulate)", ex)
 	}
 }

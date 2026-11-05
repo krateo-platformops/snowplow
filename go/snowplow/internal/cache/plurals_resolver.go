@@ -59,6 +59,7 @@ import (
 	"sync"
 
 	"github.com/krateo-platformops/plumbing/kubeutil/plurals"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -302,7 +303,10 @@ func discoverPluralInfo(ctx context.Context, gvk schema.GroupVersionKind, rc *re
 	if rc == nil {
 		return plurals.Info{}, fmt.Errorf("plurals discovery: nil *rest.Config for %s", gvk)
 	}
-	dc, err := discoveryClientBuilder(rc)
+	// #1115 — this client is built for this miss alone: bind the request's page
+	// budget to it, since ServerResourcesForGroupVersion sends on client-go's
+	// own context.TODO() (background work has none; nothing changes for it).
+	dc, err := discoveryClientBuilder(credhttp.BindRequestBudget(ctx, rc))
 	if err != nil {
 		return plurals.Info{}, fmt.Errorf("plurals discovery: %w", err)
 	}
@@ -344,7 +348,10 @@ func discoverKindForGVR(ctx context.Context, gvr schema.GroupVersionResource, rc
 	if rc == nil {
 		return "", plurals.Info{}, fmt.Errorf("plurals discovery: nil *rest.Config for %s", gvr)
 	}
-	dc, err := discoveryClientBuilder(rc)
+	// #1115 — this client is built for this miss alone: bind the request's page
+	// budget to it, since ServerResourcesForGroupVersion sends on client-go's
+	// own context.TODO() (background work has none; nothing changes for it).
+	dc, err := discoveryClientBuilder(credhttp.BindRequestBudget(ctx, rc))
 	if err != nil {
 		return "", plurals.Info{}, fmt.Errorf("plurals discovery: %w", err)
 	}

@@ -73,6 +73,14 @@ func ResolveStatusTree(ctx context.Context, opts ResolveOptions) (ra *templates.
 // resolve is Resolve plus, when the spec.filter ran (filtered), its output
 // values: Status.Raw is their encoding.
 func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction, outputs []any, filtered bool, err error) {
+	// #1116 (SECURITY) — extras that name a key the resolver writes (a stage
+	// name, an errorKey, slice) are refused before anything runs. The error
+	// is an *api.ReservedExtrasError; the dispatchers render it as a 400
+	// naming the keys. api.ResolveWithFailure holds the same rule for any
+	// other caller of the api package.
+	if err := api.RefuseReservedExtras(ctx, opts.In.Spec.API, opts.Extras, opts.In.GetNamespace(), opts.In.GetName()); err != nil {
+		return opts.In, nil, false, err
+	}
 	dict, failure := api.ResolveWithFailure(ctx, api.ResolveOptions{
 		RC:      opts.SArc,
 		AuthnNS: opts.AuthnNS,

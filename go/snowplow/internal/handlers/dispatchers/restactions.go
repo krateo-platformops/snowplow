@@ -307,7 +307,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
 			setStoredStageOutcomesHeader(wri, entry) // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
-			staleHitWritePoint(cacheKey, entry, true, staleSubjectOf(req.Context()))
+			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
@@ -444,14 +444,20 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// above. Whatever bumps it, wherever that happens and however many resolver
 	// frames down, the Put-gate below reads Count()>0 and declines.
 	//
-	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
-	// one — its own spec declares no userAccessFilter, so the declaration limb is
-	// blind to it, while its resolved body still carries per-requester-narrowed
-	// rows. That case is NOT closed on this branch: the only bump today is
-	// declaration-based (apiref.Resolve) and inspects the parent — the blindness
-	// is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref). It
-	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
-	// is TestA4_RefilterBumpsUAFTouchedSink.
+	// A NON-UAF RESTAction that NESTS a UAF one declares no userAccessFilter, so
+	// the declaration limb (apiref.Resolve) is blind to it (asserted by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref), while its resolved
+	// body still carries per-requester-narrowed rows. Two shapes, two gates:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under this ctx, so the refilter's execution-based bump
+	//     (applyUserAccessFilterOnPig, present since 1.12.3) marks this sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call): the child
+	//     is a separate request and its refilter marks only that request's sink.
+	//     This Put is declined by the external-touched verdict below instead —
+	//     the dial is a branch-E send, which bumps extTouchedSink, and on this
+	//     handler an external touch is a permanent decline.
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under; no arm drives a nested in-process resolve against this sink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	// v7 Step 2D — DARK shadow-parity. Install the read-only shadow context (the
 	// cell's identity-free access domain D + this requester's identity + the
@@ -482,6 +488,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	})
 	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
+		// #1116 — extras that name a key the resolver writes: a 400 naming
+		// the keys. Nothing was read or dialled, so there is no stale-derived
+		// pass to withdraw.
+		if WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		// #905 (c) — an error from a stale-derived pass is withdrawn and the
 		// request re-run with D2 disabled, exactly like a declined body: a write
 		// held in that pass (rule a) makes a filter that needs its output fail,

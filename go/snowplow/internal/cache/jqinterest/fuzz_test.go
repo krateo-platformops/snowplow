@@ -79,9 +79,11 @@ func fuzzEnvelope(g *gen) emuEnv {
 }
 
 // chainEnvelope is fuzzEnvelope plus, one trial in eight, a request extras
-// key equal to the tracked stage's name. resolve.go newResolveRun seeds the
-// dict with the extras at top level, so jsonHandlerCore ACCUMULATES the
-// stage's response after the seed: [seed, response] (review finding 3).
+// key equal to the tracked stage's name. Before #1116 resolve.go
+// newResolveRun seeded the dict with it and jsonHandlerCore ACCUMULATED the
+// stage's response after the seed: [seed, response] (review finding 3). Now
+// the resolve is refused (emulate), and these trials check that the model,
+// which no longer pre-seeds dict[stage] from extras, stays sound.
 func chainEnvelope(g *gen, c Chain, st *fuzzStats) emuEnv {
 	env := fuzzEnvelope(g)
 	if g.r.Intn(8) == 0 {

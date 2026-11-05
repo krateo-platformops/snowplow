@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
@@ -79,14 +80,81 @@ import (
 // PRIOR ART (feedback_check_k8s_clientgo_prior_art): the owned branch
 // does NOT hand-roll an x509.CertPool. `k8s.io/client-go/transport.New`
 // builds precisely this RoundTripper — TLS from `TLSConfig.CAData` plus
-// the bearer/basic auth wrappers via `HTTPWrappersForConfig` — and
-// memoises the transport in client-go's `tlsCache`, so repeated calls
-// share connections instead of building a fresh transport per request
-// the way plumbing does.
+// the bearer/basic auth wrappers via `HTTPWrappersForConfig`. (Its
+// `tlsCache` does NOT keep a transport between calls: since client-go v0.36
+// the cache holds a weak pointer (ClientsAllowTLSCacheGC, default on), so a
+// client built per call is re-dialled after every GC — measured: 5 requests,
+// 5 dials. Reuse is httpClientForEndpoint's cache below, #1088.)
+//
+// #1088 — ONE CLIENT PER ENDPOINT IDENTITY, REUSED. The owned branch used to
+// take only the token-auth-with-CA shape, and every other endpoint (the whole
+// live cert-auth `<user>-clientconfig` population included) went to plumbing,
+// whose tlsConfigFor builds a NEW http.Transport on every call: every stage
+// fetch paid a fresh TCP connect and TLS handshake (run 20: one unanswered SYN
+// held a page for the 30 s connect timeout). The owned branch now takes every
+// shape client-go's transport.Config reproduces exactly (endpointOwnedShape),
+// and httpClientForEndpoint keeps each such client in stageEndpointClients,
+// keyed on every field of the endpoint plus the provenance marks, so one
+// identity's fetches share one kept-alive HTTP/2 connection.
+//
+// WHY CLIENT-GO'S TRANSPORT AND NOT PLUMBING'S, KEPT: a shared connection must
+// notice a peer that died silently, or every request multiplexed on it hangs
+// until the kernel gives up on TCP. client-go's transport (utilnet.
+// SetTransportDefaults) runs the HTTP/2 health check (read-idle ping); plumbing's
+// has none and no response timeout either. That cost nothing while every fetch
+// had its own connection; it would once fetches share one. So a plumbing-built
+// client is never kept: it stays per fetch, exactly as before.
 func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
-	cli, err := buildEndpointClient(ctx, ep, ri)
-	if err != nil {
-		return cli, err
+	held := credhttp.HeldCredential(ctx)
+	saDial := cache.ServiceAccountDialFromContext(ctx)
+	if !endpointOwnedShape(ep) {
+		cli, _, err := buildEndpointClient(ctx, ep, ri)
+		if err != nil {
+			return cli, err
+		}
+		return wrapEndpointClient(cli, ep, held, saDial), nil
+	}
+	// The provenance inputs are everything besides the endpoint that changes
+	// the chain buildEndpointClient and wrapEndpointClient build: a held
+	// credential refuses redirects, and an SA dial presents the token it reads
+	// from this file instead of ep.Token.
+	heldIn, saTokenFile := "", ""
+	if held {
+		heldIn = "held"
+	}
+	if saDial {
+		saTokenFile = "sa-token-file:" + dynamic.ServiceAccountTokenFile()
+	}
+	return stageEndpointClients.Get(credhttp.EndpointKeyOf(ep, heldIn, saTokenFile), func() (*http.Client, bool, error) {
+		cli, keep, err := buildEndpointClient(ctx, ep, ri)
+		if err != nil {
+			return cli, false, err
+		}
+		return wrapEndpointClient(cli, ep, held, saDial), keep, nil
+	})
+}
+
+// stageEndpointClients is the stage fetch's per-identity client cache (#1088).
+var stageEndpointClients = credhttp.NewEndpointClients()
+
+// StageEndpointClientsStats reads the stage client cache for the metrics:
+// entries held, clients built (one per miss), entries dropped by the idle sweep.
+func StageEndpointClientsStats() (entries int, builds, evictions uint64) {
+	return stageEndpointClients.Len(), stageEndpointClients.Builds(), stageEndpointClients.Evictions()
+}
+
+// wrapEndpointClient applies the provenance policy to a freshly built client
+// of ep, in place. Everything it installs is a function of ep and the two
+// provenance marks, all three folded into the #1088 cache key, so a kept client
+// carries exactly the policy a fresh build would.
+func wrapEndpointClient(cli *http.Client, ep *endpoints.Endpoint, held, saDial bool) *http.Client {
+	// #1112 D4 — an endpoint that asks for a wire dump gets snowplow's, which
+	// logs metadata only: no credential, cookie or body (credhttp/wiredump.go).
+	// Plumbing's own dump is never installed (buildEndpointClient hands it a
+	// copy with Debug cleared). Inside the redirect policy below, so a refused
+	// hop is not dumped either: it never leaves.
+	if ep != nil && ep.Debug {
+		cli.Transport = credhttp.WireDump(cli.Transport)
 	}
 	// #723/#724 — a dial that presents a credential snowplow holds (the SA
 	// endpoint, marked by cache.WithServiceAccountDial, or any held credential,
@@ -96,61 +164,60 @@ func httpClientForEndpoint(ctx context.Context, ep *endpoints.Endpoint, ri *http
 	// never protects them; and a followed redirect's body would be accepted as
 	// the object. credhttp.Client refuses at CheckRedirect (the caller sees the
 	// 3xx with its own code) and at the transport (no hop reaches the network).
-	// A named endpointRef carries the third party's OWN credential and keeps
-	// net/http's default redirect behaviour.
-	if credhttp.HeldCredential(ctx) || cache.ServiceAccountDialFromContext(ctx) {
+	//
+	// #1106 — a named endpointRef's dial never leaves its origin either: a
+	// redirect elsewhere is refused by credhttp.Send, the one place every
+	// endpoint request leaves, outermost on this client, so nothing installed
+	// here (the wire dump above, a plumbing-built chain) can displace it
+	// (credhttp/endpoint_redirect.go).
+	if held || saDial {
 		cli = credhttp.Client(cli)
 	}
 	// #988 — whatever credential the stage dials with, its collection LISTs
 	// are a resolve's, so every endpoint client counts them
 	// (snowplow_resolve_collection_lists). Separate from the redirect policy
-	// above: a named endpointRef keeps its own redirect behaviour, but a LIST
+	// above: a named endpointRef has its own redirect policy, but a LIST
 	// it sends to the apiserver — e.g. of a GVR whose store is being swapped
 	// (#870) — is counted like any other. On a held dial the counter is already
 	// in Client's chain and this adds none.
-	return credhttp.CountResolveListsOn(cli), nil
+	return credhttp.CountResolveListsOn(cli)
 }
 
-// buildEndpointClient builds the client for ep. It is the ONLY site in the
-// module allowed to build an endpoint client without credhttp (the structural
-// guard in internal/credhttp names it), because its single caller,
-// httpClientForEndpoint, applies credhttp.Client by provenance.
-func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, error) {
-	if !endpointNeedsOwnedCAClient(ep) {
-		return httpcall.HTTPClientForEndpoint(ep, ri)
+// buildEndpointClient builds the client for ep and reports whether it may be
+// kept across fetches (only a client-go-built one, see httpClientForEndpoint).
+// It is the ONLY site in the module allowed to build an endpoint client without
+// credhttp (the structural guard in internal/credhttp names it), because its
+// single caller, httpClientForEndpoint, applies credhttp.Client by provenance
+// (credhttp.EndpointClient otherwise, #1106). Plumbing is always handed a copy
+// of ep without Debug, so it never installs its wire dump (#1112 D4).
+func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, bool, error) {
+	if !endpointOwnedShape(ep) {
+		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
+		return cli, false, err
 	}
 
-	caPEM, ok := caPEMBytes([]byte(ep.CertificateAuthorityData))
+	tlsCfg, ok := endpointTLSConfig(ep)
 	if !ok {
-		// THE SECOND DELEGATION SITE, deliberately distinct from the predicate
-		// rejection above — do NOT collapse the two. That one is a POLICY
-		// decision ("this shape is not ours"): declarative, cheap, and the
-		// normal path for the entire live cert-auth population, where silence
-		// is correct. This one is a CAPABILITY failure ("this IS our shape, but
-		// we cannot read its CA") — a misconfiguration worth surfacing. Folding
-		// caPEMBytes into the routing predicate would make a declarative
-		// predicate do parsing work and erase which of the two occurred.
-		//
-		// The CA is present but is neither raw PEM nor (double-)base64
-		// PEM. We cannot improve on plumbing for an unrecognised shape,
-		// so delegate and let it fail exactly as it does today rather
-		// than silently building a client with an EMPTY root pool —
-		// an empty pool would fall back to the system roots and turn a
-		// loud misconfiguration into a confusing x509 error.
-		//
-		// #233 (was a KNOWN GAP): this delegation was SILENT — the operator saw
-		// plumbing's x509 error with nothing saying snowplow read the bundle and
-		// could not parse it. warnUnparseableCADelegation now surfaces it: an
-		// uncapped OTLP detector counter (snowplow_unparseable_ca_delegations_total)
-		// + a BOUNDED one-shot WARN keyed by (ServerURL, CA sha256) — the endpoint
-		// resolves per stage per /call, so an unconditional WARN would flood. It
-		// touches ONLY this capability site, never the POLICY delegation above.
-		warnUnparseableCADelegation(ep)
-		return httpcall.HTTPClientForEndpoint(ep, ri)
+		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
+		return cli, false, err
 	}
 
+	// #1088 — Proxy is always set: client-go shares one transport across every
+	// config with equal TLS material ONLY when Proxy is nil (tlsConfigKey), so
+	// an explicit proxy keeps this transport this identity's own. Two bearer
+	// tokens on one CA therefore never share a connection, and the idle sweep
+	// closing one identity's connections never closes another's. When the
+	// endpoint names no proxy, the one set is http.ProxyFromEnvironment: what
+	// client-go and plumbing both use when none is given.
 	cfg := &transport.Config{
-		TLS: transport.TLSConfig{CAData: caPEM},
+		TLS:   tlsCfg,
+		Proxy: http.ProxyFromEnvironment,
+		// #1115 — snowplow's dialer, not client-go's 30 s one: every connect
+		// gives up the page goal (10 s) after it starts, whoever started it
+		// (credhttp/budget.go). One holder for all, so cacheability is as
+		// before; the explicit Proxy still keeps each identity's transport its
+		// own.
+		DialHolder: credhttp.EndpointDialHolder,
 	}
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
 	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by
@@ -166,12 +233,22 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// the marker is provenance, not shape: a token-auth clientconfig is
 	// shape-identical to the SA endpoint (same apiserver ServerURL + cluster CAData
 	// + token-auth) and would be misclassified by a field predicate, reintroducing
-	// #268/#269. (client-go lets BearerTokenFile take precedence over BearerToken,
-	// config.go:45; the if/else sets exactly one, so precedence never matters here.)
-	if cache.ServiceAccountDialFromContext(ctx) {
+	// #268/#269.
+	//
+	// #1088: the SA dial now sets BOTH, as client-go's own rest.InClusterConfig
+	// does (BearerToken + BearerTokenFile): client-go presents the file's token
+	// whenever the file reads, and the endpoint's token only while it cannot
+	// (bearerAuthRoundTripper). Before #1088 only the token-auth-with-CA shape
+	// reached this branch and an SA-marked dial of any other shape went to
+	// plumbing with ep.Token alone; every SA-marked shape is owned now, and the
+	// endpoint's token stays its fallback rather than becoming a build failure.
+	// The file refreshes the bearer credential the endpoint CARRIES: an
+	// endpoint with no token has no bearer credential to refresh and presents
+	// none, exactly as plumbing sent it (the SA endpoint always carries its
+	// boot token, sa_client.go).
+	cfg.BearerToken = ep.Token
+	if cache.ServiceAccountDialFromContext(ctx) && ep.HasTokenAuth() {
 		cfg.BearerTokenFile = dynamic.ServiceAccountTokenFile()
-	} else {
-		cfg.BearerToken = ep.Token
 	}
 
 	// THE TWO LIBRARIES DEFINE "basic auth" ON DIFFERENT FIELDS, and copying
@@ -205,19 +282,19 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	if ep.ProxyURL != "" {
 		u, err := url.Parse(ep.ProxyURL)
 		if err != nil {
-			return nil, fmt.Errorf("could not parse: %v", ep.ProxyURL)
+			return nil, false, fmt.Errorf("could not parse: %v", ep.ProxyURL)
 		}
 		switch u.Scheme {
 		case "http", "https", "socks5":
 		default:
-			return nil, fmt.Errorf("unsupported scheme %q, must be http, https, or socks5", u.Scheme)
+			return nil, false, fmt.Errorf("unsupported scheme %q, must be http, https, or socks5", u.Scheme)
 		}
 		cfg.Proxy = http.ProxyURL(u)
 	}
 
 	rt, err := transport.New(cfg)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// NOTE on the trace-id header: plumbing wraps every client in a
@@ -227,81 +304,118 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// header on the request in both its branches — the AWS branch via
 	// opts.Headers, the non-AWS branch via call.Header.Set — before the
 	// client is built. An AWS-auth endpoint never reaches this branch
-	// anyway (see endpointNeedsOwnedCAClient).
+	// anyway (see endpointOwnedShape).
 	//
-	// KNOWN DIVERGENCE, diagnostic-only: plumbing also wraps the client in a
-	// debuggingRoundTripper when ep.Debug is set (client.go:19-23), dumping
-	// each request via httputil.DumpRequestOut. A Debug:true token-auth
-	// endpoint with a CA loses that dump on this branch. Named here rather
-	// than left to be rediscovered as a bug; it affects no request semantics.
+	// THE WIRE DUMP (#1112 D4): plumbing wraps its client in a
+	// debuggingRoundTripper when ep.Debug is set, logging the Authorization
+	// header and both bodies. No builder installs it any more; a Debug endpoint
+	// on either branch gets credhttp.WireDump from wrapEndpointClient instead.
 	//
-	// CONNECTION REUSE: transport.New memoises in client-go's tlsCache, which
-	// keys on the CA material and EXCLUDES the bearer token (and returns an
-	// uncacheable transport when a proxy is set). So two endpoints sharing a
-	// CA share TCP/TLS connections while each still presents its OWN token
-	// per request — no cross-identity credential reuse, and strictly better
-	// than plumbing, which builds a fresh transport on every call.
-	return &http.Client{Transport: rt}, nil
+	// CONNECTION REUSE (#1088): this client is kept per endpoint identity by
+	// httpClientForEndpoint, and its transport is its own (Proxy above), so one
+	// identity's fetches share its connections and no other identity's do.
+	return &http.Client{Transport: rt}, true, nil
 }
 
-// endpointNeedsOwnedCAClient reports whether ep is the exact shape
-// plumbing mishandles: it declares a CA that plumbing will DISCARD.
+// endpointOwnedShape reports whether the owned client-go branch takes ep (and
+// so whether its client is kept per identity, #1088). It is the cheap,
+// declarative POLICY half: it reads flags and field presence only, never
+// parses. endpointTLSConfig is the CAPABILITY half that parses.
 //
 // ONE PRINCIPLE GOVERNS EVERY EXCLUSION BELOW: the owned branch owns only the
 // shapes it can reproduce EXACTLY. A shape client-go's transport.Config cannot
-// express is delegated to plumbing unchanged — better to leave a shape as
-// broken as it is today than to "fix" it into a different, quieter failure.
-// Two shapes meet that test: AWS auth (SigV4 unexported upstream) and
-// basic-auth-with-no-username. They are instances of the same rule, not two
-// unrelated carve-outs.
+// express is delegated to plumbing unchanged, per fetch as before — better to
+// leave a shape as it is today than to "fix" it into a different, quieter
+// failure. Every exclusion is an instance of that rule:
 //
-// Every conjunct is a deliberate exclusion, not an accident:
+//   - ep == nil                 → nothing to build from; delegate.
+//   - HasAwsAuth()              → plumbing signs SigV4 at client BUILD time from
+//     the request (ComputeAwsSignature), through an
+//     unexported roundtripper with no client-go
+//     equivalent: the client is bound to one request,
+//     so it can be neither owned nor kept.
+//   - HasBasicAuth() &&          → plumbing keys basic auth off PASSWORD and sends
+//     Username == ""               `Authorization: Basic base64(":password")`;
+//     client-go keys it off USERNAME, so the same
+//     Config would send NO Authorization header at
+//     all. A silent credential drop is worse than any
+//     loud failure, so it is delegated, as AWS is.
+//   - HasCertAuth() && Insecure → plumbing IGNORES Insecure on a cert-auth
+//     endpoint (its cert branch replaces the
+//     skip-verify tls.Config with one that verifies
+//     against the CA pool); client-go would honour it.
+//   - HasCertAuth() && !HasCA() → plumbing verifies a cert-auth endpoint against
+//     the EMPTY pool a missing CA leaves; client-go
+//     would use the system roots.
 //
-//   - ep == nil                 → nothing to do; delegate.
-//   - !HasCA()                  → no CA to install; plumbing's system-root
-//     client is already correct.
-//   - HasCertAuth()             → plumbing DOES take its CA branch
-//     (transport.go:37 falls through), so it already
-//     works. This is the entire live
-//     `<user>-clientconfig` population — all 7
-//     Secrets on 057 are cert-auth — and it MUST
-//     stay byte-identical.
-//   - Insecure                  → the caller asked to skip verification;
-//     installing a root pool would silently
-//     override an explicit operator choice.
-//   - HasAwsAuth()              → the AWS SigV4 roundtripper is UNEXPORTED
-//     in plumbing and has no client-go
-//     equivalent. Delegating leaves an AWS+CA
-//     token-less endpoint exactly as broken as it
-//     is today — status quo, no regression — and
-//     is strictly better than hand-rolling SigV4
-//     here. Out of scope for #229.
-//   - HasBasicAuth() &&          → THE MIRROR IMAGE of the basic-auth gating
-//     Username == ""               above, and the reason it must be an
-//     EXCLUSION rather than a gate. plumbing keys
-//     basic auth off PASSWORD, so a
-//     password-set/username-EMPTY endpoint is basic
-//     auth to plumbing and it sends
-//     `Authorization: Basic base64(":password")`.
-//     client-go keys off USERNAME, so the same
-//     Config yields NO basic wrapper — and with no
-//     token there is no bearer wrapper either, so
-//     the request would go out with NO Authorization
-//     header AT ALL.
-//
-// A SILENT CREDENTIAL DROP IS WORSE THAN THE LOUD FAILURE THIS FILE REMOVES: a
-// build error is immediate and traceable, whereas a well-formed unauthenticated
-// request is rejected server-side and sends the next engineer chasing a
-// permissions problem that does not exist. Choosing the other library's
-// predicate does not help — the shape is simply NOT EXPRESSIBLE in
-// transport.Config, because the two disagree on which field defines it. So it
-// is delegated, exactly as AWS is, and keeps the behaviour it has today.
-func endpointNeedsOwnedCAClient(ep *endpoints.Endpoint) bool {
-	if ep == nil {
+// Everything else is owned: the cert-auth `<user>-clientconfig` (the whole live
+// per-user population), the token-auth SA endpoint and any token-auth endpoint
+// with a CA (#229: plumbing drops that CA), CA-less endpoints (system roots, as
+// plumbing), Insecure endpoints (skip-verify, as plumbing, which ignores the CA
+// then), bearer, basic-with-username and a proxy. A Debug endpoint is owned
+// like any other since #1112 D4: its wire dump is snowplow's own wrapper
+// (credhttp.WireDump), installed on either branch, so it no longer needs
+// plumbing's.
+func endpointOwnedShape(ep *endpoints.Endpoint) bool {
+	if ep == nil || ep.HasAwsAuth() || (ep.HasBasicAuth() && ep.Username == "") {
 		return false
 	}
-	return ep.HasCA() && !ep.HasCertAuth() && !ep.Insecure && !ep.HasAwsAuth() &&
-		!(ep.HasBasicAuth() && ep.Username == "")
+	if ep.HasCertAuth() && (ep.Insecure || !ep.HasCA()) {
+		return false
+	}
+	return true
+}
+
+// endpointTLSConfig is ep's TLS material as client-go takes it, read exactly as
+// plumbing reads it, or ok=false when ep carries material the owned branch
+// cannot read exactly — the caller then delegates to plumbing, which fails or
+// succeeds on it as it does today. Requires endpointOwnedShape(ep).
+func endpointTLSConfig(ep *endpoints.Endpoint) (transport.TLSConfig, bool) {
+	if ep.HasCertAuth() {
+		// plumbing's tlsConfigFor: cert, key and CA each base64-decoded once,
+		// the CA appended as PEM, and a key pair that does not load is an error.
+		cert, cerr := base64.StdEncoding.DecodeString(ep.ClientCertificateData)
+		key, kerr := base64.StdEncoding.DecodeString(ep.ClientKeyData)
+		ca, aerr := base64.StdEncoding.DecodeString(ep.CertificateAuthorityData)
+		if cerr != nil || kerr != nil || aerr != nil {
+			return transport.TLSConfig{}, false
+		}
+		if block, _ := pem.Decode(ca); block == nil {
+			return transport.TLSConfig{}, false
+		}
+		if _, err := tls.X509KeyPair(cert, key); err != nil {
+			return transport.TLSConfig{}, false
+		}
+		return transport.TLSConfig{CAData: ca, CertData: cert, KeyData: key}, true
+	}
+	if ep.Insecure {
+		// plumbing: skip-verify, and the CA is never read without cert auth.
+		return transport.TLSConfig{Insecure: true}, true
+	}
+	if !ep.HasCA() {
+		return transport.TLSConfig{}, true // system roots, as plumbing
+	}
+	caPEM, ok := caPEMBytes([]byte(ep.CertificateAuthorityData))
+	if !ok {
+		// THE CAPABILITY DELEGATION, deliberately distinct from the policy
+		// rejection in endpointOwnedShape — do NOT collapse the two. That one
+		// is declarative and silent; this one is "this IS our shape, but we
+		// cannot read its CA" — a misconfiguration worth surfacing.
+		//
+		// The CA is present but is neither raw PEM nor (double-)base64 PEM.
+		// Delegate and let plumbing fail exactly as it does today rather than
+		// silently building a client with an EMPTY root pool — an empty pool
+		// would fall back to the system roots and turn a loud misconfiguration
+		// into a confusing x509 error.
+		//
+		// #233: warnUnparseableCADelegation surfaces it: an uncapped OTLP
+		// detector counter (snowplow_unparseable_ca_delegations_total) + a
+		// BOUNDED one-shot WARN keyed by (ServerURL, CA sha256). Such a client
+		// is not kept (#1088), so it still counts once per fetch.
+		warnUnparseableCADelegation(ep)
+		return transport.TLSConfig{}, false
+	}
+	return transport.TLSConfig{CAData: caPEM}, true
 }
 
 // maxCABase64Unwraps bounds the base64 unwrapping loop in caPEMBytes.

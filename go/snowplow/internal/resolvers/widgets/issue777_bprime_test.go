@@ -294,6 +294,9 @@ var b777Consumers = map[string]string{
 	"widgetdatatemplate.Resolve":       "spec.widgetDataTemplate (inside resolveWidgetData)",
 	"apiref.Resolve":                   "spec.apiRef (inside resolveApiRef)",
 	"apirefOptionsFor":                 "spec.apiRef (builds the apiref.Resolve options inside resolveApiRef; #874)",
+	// #1116 — reads only the apiRef error's TYPE (a reserved-extras refusal)
+	// to keep it out of the ERROR log; it puts nothing in the body.
+	"api.AsReservedExtrasError": "spec.apiRef (classifies the apiRef error; extras-free, writes no body)",
 	// #874 — reads the apiRef RA's own output slice (continue/cursor) to emit
 	// status.resourcesRefs.slice; only reached with a resourcesRefs fan-out.
 	"cache.SourcePagination": "spec.apiRef (reads the apiRef RA output's slice; an absent apiRef yields an empty dict, declaring nothing)",

@@ -195,7 +195,7 @@ func TestIssue1123_CorpusRendersIdenticallyOrIsListed(t *testing.T) {
 		if strings.Contains(st.path, "${") {
 			templated++
 		}
-		opt, valid, sr := createRequestOption(&templates.API{Name: st.stage, Path: st.path}, in)
+		opt, valid, sr := createRequestOption(&templates.API{Name: st.stage, Path: st.path}, in, true)
 		if strings.HasPrefix(st.source, deployedSource) {
 			if _, ok := corpusChanges1123["deployed:"+key]; ok {
 				key = "deployed:" + key
@@ -225,7 +225,7 @@ func TestIssue1123_CorpusRendersIdenticallyOrIsListed(t *testing.T) {
 		if ch.declaredInput != nil {
 			din = ch.declaredInput
 		}
-		dopt, dvalid, dsr := createRequestOption(&templates.API{Name: st.stage, Path: ch.declared}, din)
+		dopt, dvalid, dsr := createRequestOption(&templates.API{Name: st.stage, Path: ch.declared}, din, true)
 		if !dvalid || dopt.Path != before {
 			t.Errorf("%s %s: declared form %s\n renders %q (valid=%v %s)\n before  %q", st.source, key, ch.declared, dopt.Path, dvalid, dsr.detail, before)
 		}

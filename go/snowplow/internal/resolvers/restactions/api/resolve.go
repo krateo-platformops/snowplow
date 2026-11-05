@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -33,6 +34,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
@@ -407,6 +409,21 @@ func (r *resolveRun) recordRBACDeny(dictMu *sync.Mutex, itemErrs []error, id str
 	notePerIdentityForbidden(r.ctx, false)
 }
 
+// recordDefiniteNotFound records a #1080 definite NotFound decided at branch C
+// (N2): the canonical identity-free NotFound body under errorKey, the item
+// error a stage without continueOnError would carry (never, by the classifier),
+// and a bump of the per-identity definite-answer sink at the same site, for the
+// same item, as the stage-error bump. Not external: branch C's SA dial is not an
+// external touch.
+func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, msg string) {
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+	}
+	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
 // recordServedListDeny is recordRBACDeny for a LIST served from the informer or
 // the api-stage content cell (dispatch names which), with the failure line an
 // expected per-identity deny logs (#711: WARN once per cell generation, DEBUG
@@ -524,6 +541,12 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
+		// #1115 — the endpointRef Secret read is a network exchange of this
+		// request: if the page budget ended it, the stage outcome reads
+		// Timeout (the truncating exit's Error ranks below it).
+		if be := (*pagebudget.ExhaustedError)(nil); errors.As(err, &be) {
+			r.outcomes.fail(id, StageReasonTimeout)
+		}
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user
@@ -592,7 +615,12 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 // passed by pointer) — its ClusterList* fields are written here exactly as
 // before. Returns tmp (possibly empty for C-3).
 func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
+	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
+	// this cluster's apiserver (the provenance runStage marked on provCtx); a
+	// write item any guard refuses is a stage failure with its reason, never a
+	// silent success (undialled_write.go).
+	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
+	r.failRefusedItems(id, apiCall, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -743,6 +771,10 @@ type stageCtx struct {
 	wireVerbose bool
 	ep          endpoints.Endpoint
 	calls       []httpcall.RequestOptions
+	// sent counts the items that reached the send (branch E, the one place a
+	// write leaves snowplow). #1112 D2: a write stage that sent fewer than it
+	// planned and recorded no failure fails with NotSent (failUnsentWrites).
+	sent atomic.Int64
 }
 
 // dispatchOneCall is one iterator item's worker — the body the stage loop
@@ -842,6 +874,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// resourcesFrom returned [] → 0-count regression on the
 	// multi-stage compositions-list RA.
 	listGVR, listOK := k8sListGVR(call.Path)
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(call.Path)
 	hOpts := jsonHandlerOptions{
 		key:         id,
 		out:         dict,
@@ -861,6 +894,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// SubjectAccessReview) answers with an object, not a list envelope.
 		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
 		listGVR: listGVR,
+		// #1124 — the resource the response's items are objects of: the
+		// userAccessFilter refilter checks such an object on its own resource.
+		served:   servedGVR.GroupResource(),
+		servedOK: servedOK,
 		// #651 — a served-but-failed stage (an unresolved userAccessFilter
 		// resource set) takes the same sink bump + Error outcome as every other
 		// stage failure (recordItemError), against THIS resolve's own stage:
@@ -954,7 +991,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			return dispatch + "-resolve-error"
 		}
 		bytesToFeed := raw
@@ -1044,7 +1081,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, cerr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, cerr.Error(), cerr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(cerr), cerr.Error(), itemErr)
 				return nil
 			}
 			if ok {
@@ -1084,7 +1121,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						if !call.ContinueOnError {
 							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 						}
-						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 						dispatch = "apistage-content-resolve-error"
 					} else {
 						var ferr error
@@ -1242,12 +1279,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
 				// canonical body (per_identity_forbidden.go).
 				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
+			} else if nf, ok := classifyAuthorizedNotFound(call, ierr); ok {
+				// #1080 N2 — an authorized GET of a named object that does not
+				// exist: a definite answer, with its canonical body.
+				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, nf)
 			} else {
 				var itemErr error
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(ierr), ierr.Error(), itemErr)
 			}
 			dispatch = "internal-rest-config-error"
 		} else {
@@ -1331,7 +1372,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, derr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, derr.Error(), derr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
 			r.log.Error("discovery response handler failed",
@@ -1400,7 +1441,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
 			r.log.Error("in-process resolve response handler failed (cache-off path)",
@@ -1501,6 +1542,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if r.refuseWriteFromStalePass(gctx, sc, i) {
 		return nil
 	}
+	sc.sent.Add(1)
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
@@ -1616,12 +1658,27 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if isOwnDenied {
 			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
 		}
+		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
+		// dial of a named object, in a continueOnError stage, that the watcher
+		// confirms absent: a definite answer for this identity (the apiserver
+		// authorized the `get` first), recorded with the canonical NotFound body
+		// and counted on the same sink (external: this dial bumped the sink).
+		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
+		if isOwnNotFound {
+			accumVal, bumpMsg = canonicalNotFoundBody(ownNotFound), ownNotFound
+		}
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
+			// #1115 — the page budget ended the fetch: the item error carries
+			// the *pagebudget.ExhaustedError (same text), so the resolve's
+			// StageFailure reports the budget, not an upstream answer.
+			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
+				itemErr = &budgetItemError{text: itemErr.Error(), cause: be}
+			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
-		if isOwnDenied {
+		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}
 		// Fall through to the success-log line (preserves
@@ -2057,6 +2114,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if r.failure == nil {
 		r.failure = firstStageFailure(itemErrs, sc.calls)
 	}
+	// #1112 D2 — the catch-all: a write stage none of whose refusals reported
+	// itself did not do what it declared (undialled_write.go).
+	r.failUnsentWrites(sc)
 
 	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
@@ -2091,6 +2151,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 // output cannot be produced; restactions.Resolve is that caller.
 func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]any, *StageFailure) {
 	if len(opts.Items) == 0 {
+		return map[string]any{}, nil
+	}
+
+	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
+	// and the resolver writes its own keys into it. Extras that name one of
+	// them (a stage name, an errorKey, slice) would stand in for the
+	// resolver's value, so the resolve does not start: nothing is read or
+	// dialled (reserved_extras.go). restactions.Resolve applies the same rule
+	// first and returns the refusal to its caller as a 400.
+	if RefuseReservedExtras(ctx, opts.Items, opts.Extras, opts.RESTActionNamespace, opts.RESTActionName) != nil {
 		return map[string]any{}, nil
 	}
 

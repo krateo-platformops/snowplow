@@ -20,6 +20,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/resourcesrefs"
@@ -182,7 +183,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	ds, err := resolveApiRefFn(ctx, opts)
 	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
-		log.Error("unable to resolve api reference", slog.Any("err", err))
+		// #1116 — a reserved-extras refusal is the caller's error, logged once
+		// at WARN where it was decided (api.RefuseReservedExtras); any caller
+		// can send one, so it must not also write an ERROR line.
+		if _, refused := api.AsReservedExtrasError(err); !refused {
+			log.Error("unable to resolve api reference", slog.Any("err", err))
+		}
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageApiRef, "resolve apiRef "+stageObject(opts.In), err)
 	}

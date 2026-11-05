@@ -608,6 +608,21 @@ func prewarmScopeTimeout(s prewarmScope) time.Duration {
 // budget literal is untouched); only a _test.go override reassigns this var.
 var prewarmScopeTimeoutFn = prewarmScopeTimeout
 
+// prewarmScopeBudget (#1166) is how processScope bounds one scope by its budget.
+// nil is context.WithTimeout, which is all production ever uses. An arm that
+// holds a unit until its pass's budget runs out installs one whose deadline it
+// fires itself, at the instant it holds, instead of waiting the budget out in
+// real time; the budget's value (prewarmScopeTimeoutFn) is unchanged.
+var prewarmScopeBudget atomic.Pointer[func(context.Context, time.Duration) (context.Context, context.CancelFunc)]
+
+// withPrewarmScopeBudget reads prewarmScopeBudget.
+func withPrewarmScopeBudget(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if f := prewarmScopeBudget.Load(); f != nil {
+		return (*f)(ctx, budget)
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
 // runWorker is the engine worker loop. It blocks on the workqueue's Get,
 // runs each scope through the handler — YIELDING to any in-flight customer
 // /call before each scope — and, on error with the process ctx still
@@ -683,7 +698,7 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// the straddle falsifier can shrink the budget without a live cluster;
 	// production ALWAYS uses prewarmScopeTimeout (8m, unchanged).
 	budget := prewarmScopeTimeoutFn(s)
-	scopeCtx, scopeCancel := context.WithTimeout(ctx, budget)
+	scopeCtx, scopeCancel := withPrewarmScopeBudget(ctx, budget)
 	// #643 PR-A — per-pass unit accounting, installed for EVERY scope kind. The
 	// seed / reseed loops write planned+done into it; it is read below, after
 	// the handler returns, to publish the pass detectors. Observation only.

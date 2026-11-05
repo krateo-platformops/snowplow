@@ -134,7 +134,65 @@ Content-Type: application/json
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
-    `NotRun`), `Error` (anything else).
+    `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
+    snowplow refused to send, below), `Error` (anything else).
+  - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
+    `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
+    item of its iterator, is listed with one of:
+    - `InvalidPath`: the rendered path lost a segment its template meant to
+      fill: an empty namespace (`/namespaces//`), or an empty last segment on
+      a `PUT`/`PATCH`/`DELETE` (a trailing `/`, which would turn a by-name
+      delete into a collection delete). This holds for every stage, named
+      `endpointRef` included. On a stage with no `endpointRef` (this
+      cluster's apiserver), a name or namespace that is not a valid
+      Kubernetes name is refused too. A named `endpointRef`'s ids are never
+      judged as Kubernetes names (`/api/v2/tickets/Ab_12` is sent).
+    - `TemplateError`: the stage's `path`, `payload` or a header did not
+      render (a jq error, e.g. `tonumber` on a non-number; or an unrendered
+      `${…}`).
+    - `NotSent`: any other write that was planned and not sent without a
+      reason of its own.
+
+    Before #1112 these answered `[]` with nothing sent: a UI that showed
+    "saved" on `[]` showed it for a write that never left snowplow. Under the
+    stage's `errorKey` the stage records
+    `{"kind":"Status","status":"Failure","code":400|500,"reason":"<code>","message":"write stage \"<id>\" verb <V> was not sent: <cause>"}`
+    (400 for `InvalidPath` and `TemplateError`, 500 for `NotSent`). The
+    message names the stage, the verb and the cause only, never the rendered
+    path or the caller's input. A stage without `continueOnError` is also the
+    resolve's failure: when the RESTAction's `filter` cannot produce a value,
+    `/call` answers that code. A failed write blocks the writes that depend on
+    it (`Skipped`, #904). An iterator write whose iterator yields **zero**
+    items has nothing to send and still succeeds; a dry run still reports
+    `StageNotExecuted`.
+  - **A read that was not sent is a failure too (#1116).** A `GET` stage, or
+    one item of its iterator, that snowplow refuses to send for the same two
+    causes is listed with `InvalidPath` or `TemplateError`. Under its
+    `errorKey` it records the same Status, with the message `read stage
+    "<id>" verb GET was not sent: <cause>`.
+    - For `InvalidPath`, the cause says which check refused the path: `a path
+      segment rendered empty` (any stage, a named endpoint's included) or `its
+      rendered path is not a valid Kubernetes object path` (a stage that dials
+      this cluster).
+    - Before #1116 it answered `[]` and left the stage's key unset, so a
+      filter read nothing there and could not tell "no data" from "never
+      read".
+    - Without `continueOnError` it is the resolve's failure, as for a write:
+      when the `filter` cannot produce a value, `/call` answers 400.
+    - With `continueOnError` the body is served with the failure in the
+      outcomes. It is not stored, so the next `/call` resolves again.
+    - The remaining valid items of an iterator read are still sent.
+    - `NotSent` stays write-only.
+  - **A redirect to another host is a failure (#1106).** A stage whose
+    endpoint answers a redirect to another origin (scheme, host, port) is
+    never followed, whatever the endpoint's credential or the stage's
+    headers: any header may carry a credential (`X-Api-Key`, …). The stage
+    fails with `502` naming the redirect (`upstream answered 302 Found, a
+    redirect snowplow does not follow`); its row reads `Error`. A redirect
+    within the endpoint's own origin is still followed (a stage with no
+    `endpointRef` follows none, #723). **Behaviour change:** an endpoint that
+    used to answer through a redirect to another host (a CDN, a moved host)
+    now fails with that 502; the endpoint Secret must be given its final URL.
     The header never carries an error message, a path, an identity or
     response data.
   - Bounded: above 4 KiB it is `{"truncated":true,"failed":<N>}` (N stages

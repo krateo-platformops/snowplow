@@ -9,7 +9,7 @@ package credhttp
 // (re-added by plumbing's bearerAuthRoundTripper on EVERY hop) would follow a
 // 3xx to whatever host the upstream named, and the redirected body would be
 // returned as the answer. Do is request.Do transcribed (plumbing v1.15.1
-// http/request/request.go) with exactly two differences:
+// http/request/request.go) with exactly three differences:
 //
 //  1. the client is the endpoint client through Client(): it never follows a
 //     redirect (CheckRedirect) and no redirect hop reaches the network
@@ -18,14 +18,21 @@ package credhttp
 //     redirect's own status code and the fixed RedirectRefusedError text —
 //     never the redirect's body, which can carry the target URL.
 //
-// Everything else (headers, the AWS-signature branch, the payload, the retry
-// client, the non-2xx envelope, the JSON content-type check, the
+//  3. (#1088) it sends through Send (send.go): a write is sent once, where
+//     request.Do's RetryClient re-sent a PUT or a DELETE.
+//
+//  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
+//     never plumbing's, which logs the Authorization header and the bodies.
+//
+// Everything else (headers, the AWS-signature branch, the payload, a read's
+// retry client, the non-2xx envelope, the JSON content-type check, the
 // ResponseHandler contract) is unchanged, so a caller swapping request.Do for
 // Do sees the same envelopes on every non-redirect path.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,8 +43,8 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -90,14 +97,27 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		call.Header.Set(el[:idx], strings.TrimSpace(el[idx+1:]))
 	}
 
-	cli, err := request.HTTPClientForEndpoint(opts.Endpoint, &opts.RequestInfo)
+	// #1112 D4 — plumbing never installs its wire dump (it logs the
+	// Authorization header and the bodies); a Debug endpoint gets WireDump,
+	// which logs metadata only (wiredump.go).
+	cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
 	if err != nil {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
 	}
+	if opts.Endpoint != nil && opts.Endpoint.Debug {
+		cli.Transport = WireDump(cli.Transport)
+	}
 
-	respo, err := util.NewRetryClient(Client(cli)).Do(call)
+	// #1088 — the endpoint send policy (send.go): a write is sent once, never
+	// re-sent once its bytes may have reached the apiserver (plumbing's
+	// RetryClient re-sent a PUT or DELETE); a read keeps the RetryClient, with
+	// every retry counted and logged with its cause.
+	respo, err := Send(SendSiteCall, Client(cli), call)
 	if err != nil {
+		if st, ok := BudgetStatus(err); ok {
+			return st // #1115 — 504 Timeout
+		}
 		return response.New(http.StatusInternalServerError, err)
 	}
 	defer respo.Body.Close()
@@ -117,11 +137,7 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		if err != nil {
 			return response.New(http.StatusInternalServerError, err)
 		}
-		res := &response.Status{}
-		if err := json.Unmarshal(dat, res); err != nil {
-			return response.New(respo.StatusCode, fmt.Errorf("%s", string(dat)))
-		}
-		return res
+		return nonOKEnvelope(respo.StatusCode, dat)
 	}
 
 	if ct := respo.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
@@ -136,4 +152,74 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	}
 
 	return response.New(http.StatusNoContent, nil)
+}
+
+// BudgetStatusReason is the reason of the envelope a page-budget exhaustion is
+// reported with: the apiserver's own reason for 504 (metav1.StatusReasonTimeout).
+const BudgetStatusReason = "Timeout"
+
+// BudgetStatus shapes an exchange its page budget ended (#1115) into the
+// envelope a stage or a /call passthrough reports: 504 Gateway Timeout, a
+// Failure, reason Timeout, the identity-free ExhaustedError text. ok=false for
+// any other error. (plumbing's response.New(504, …) would read as a Success:
+// 504 is not in its list.)
+func BudgetStatus(err error) (*response.Status, bool) {
+	var e *pagebudget.ExhaustedError
+	if !errors.As(err, &e) {
+		return nil, false
+	}
+	st := response.New(http.StatusGatewayTimeout, e)
+	st.Status = response.StatusFailure
+	st.Reason = response.StatusReason(BudgetStatusReason)
+	return st, true
+}
+
+// WriteBudgetError writes the 504 Timeout envelope (BudgetStatus) for an
+// exchange the request's page budget ended and reports true; false (nothing
+// written) for any other error. For handlers that answer an error directly.
+func WriteBudgetError(w http.ResponseWriter, err error) bool {
+	st, ok := BudgetStatus(err)
+	if !ok {
+		return false
+	}
+	_ = response.Encode(w, st)
+	return true
+}
+
+// nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
+// answer is ALWAYS a Failure carrying the status line's code (#1088). Before
+// #1088 two shapes read as a success: a JSON body that is not a Status (an
+// object, which decodes into a Status with no "Failure" and no code) and a code
+// plumbing's response.New does not list (502, 504, ...). They hid behind the
+// RetryClient for PUT and DELETE, which turned a 5xx into a transport error;
+// with a write now sent once (send.go), every write meets this shaping, and an
+// audited write that the apiserver refused must never be recorded as a success.
+// A Status body keeps its message and reason, as before.
+func nonOKEnvelope(code int, dat []byte) *response.Status {
+	res := &response.Status{}
+	if err := json.Unmarshal(dat, res); err != nil {
+		res = response.New(code, fmt.Errorf("%s", string(dat)))
+	}
+	res.Code = code
+	res.Status = response.StatusFailure
+	// A body that names no reason gets the one plumbing derives from the code
+	// (response.New), as every other non-2xx envelope here does: an object-
+	// bodied 500 reads InternalError. A code plumbing does not map (502, 504,
+	// 429) keeps no reason: before #1088 those read InternalError only because
+	// the RetryClient's give-up error was re-wrapped as a 500, which also hid
+	// the real code. Inventing one would claim what the upstream never said.
+	if res.Reason == "" {
+		res.Reason = response.New(code, nil).Reason
+	}
+	if res.Kind == "" {
+		res.Kind, res.APIVersion = "Status", "v1"
+	}
+	if res.Message == "" {
+		if len(dat) > 0 {
+			res.Message = string(dat)
+		} else {
+			res.Message = fmt.Sprintf("upstream answered %d %s with an empty body", code, http.StatusText(code))
+		}
+	}
+	return res
 }
