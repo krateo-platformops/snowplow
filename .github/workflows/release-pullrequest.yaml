@@ -52,6 +52,10 @@ jobs:
     with:
       module: go/snowplow
       crd_drift: true
+      # -p 1 (#1166): one test package at a time. Every integration-tagged package starts a
+      # kind cluster of its own (krateo-sptest-<pid>, internal/testsupport/kindguard), so a
+      # higher -p would bring several clusters up at once on one runner; and the unit arms
+      # with known machine-load flakes (#1034, #1084) stay off a contended runner.
       test_args: >-
         -race -tags=unit,integration -p 1 -coverprofile=coverage.txt
         -covermode=atomic ./...

@@ -182,6 +182,7 @@ func h643F5(t *testing.T, j int, between func(env *h643Env)) (env *h643Env, a0, 
 	env = h643Setup(t, h643Opts{cohorts: h643K, internal: h643N})
 	budgets := map[prewarmScopeKind]time.Duration{}
 	h643Budget(t, budgets)
+	h643VirtualBudget(t)
 	env.pass(prewarmScope{kind: scopeKindBoot})
 	cnt = h643CountResolves(t)
 
@@ -191,8 +192,7 @@ func h643F5(t *testing.T, j int, between func(env *h643Env)) (env *h643Env, a0, 
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 		if mode == seedModeGVRDiscovered && units.Add(1) == int64(j+1) {
-			<-ctx.Done()
-			return ctx.Err()
+			return h643HoldUntilBudget(ctx)
 		}
 		return prevW(ctx, e, authnNS, mode)
 	}
