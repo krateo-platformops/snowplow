@@ -797,7 +797,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// bumps_by_source pattern).
 	malformedDialSkipped, err := m.Int64ObservableCounter(
 		"snowplow_malformed_dial_skipped_total",
-		metric.WithDescription("Malformed single-object apiserver dials SKIPPED by the #288/#293/#302 guard, by bounded reason {empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error, path_value_refused}. Non-zero is a DETECTOR: an upstream render defect was caught (collapsed interpolation / unrendered ${ template / jq error in path|payload|header / a value that cannot be one path segment or query value) — fix the RESTAction or the key-minting. #311."))
+		metric.WithDescription("Malformed single-object apiserver dials SKIPPED by the #288/#293/#302 guard, by bounded reason {empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error, path_not_as_served, path_value_refused}. Non-zero is a DETECTOR: an upstream render defect was caught (collapsed interpolation / unrendered ${ template / jq error in path|payload|header / a value that cannot be one path segment or query value / an own-cluster path the apiserver would read as another path, #1137) — fix the RESTAction or the key-minting. #311."))
 	if err != nil {
 		return err
 	}

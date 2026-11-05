@@ -72,7 +72,7 @@ func undialledWriteCause(sr skipReason) (reason, why string) {
 		}
 		return StageReasonInvalidPath, "its rendered path is not a valid Kubernetes object path (#288)"
 	case reasonPathValueRefused:
-		return StageReasonInvalidPath, "a value spliced into its path cannot be one segment or one query value (#1123)"
+		return StageReasonInvalidPath, "its path holds a value that cannot be one segment or one query value, or a percent-escape in an apiserver path (#1123)"
 	case reasonUnrenderedTemplate:
 		return StageReasonTemplateError, "its path holds an unrendered ${...} template (#293)"
 	case reasonJQPathError:
@@ -81,6 +81,8 @@ func undialledWriteCause(sr skipReason) (reason, why string) {
 		return StageReasonTemplateError, "its payload template failed to evaluate (#302)"
 	case reasonJQHeaderError:
 		return StageReasonTemplateError, "a header template failed to evaluate (#302)"
+	case reasonPathNotAsServed:
+		return StageReasonInvalidPath, "the apiserver would read its rendered path as a different path (#1137)"
 	}
 	return StageReasonNotSent, "it was refused before it was sent"
 }
