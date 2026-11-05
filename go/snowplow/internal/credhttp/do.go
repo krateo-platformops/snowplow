@@ -32,6 +32,7 @@ package credhttp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,6 +44,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -51,12 +53,7 @@ const maxUnstructuredResponseTextBytes = 2048
 
 // Do is request.Do with a client that never follows a redirect (see do.go).
 func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
-	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
-	if len(opts.Path) > 0 {
-		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(opts.Path, "/"))
-	}
-
-	u, err := url.Parse(uri)
+	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
 		return response.New(http.StatusInternalServerError, err)
 	}
@@ -113,6 +110,9 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	// every retry counted and logged with its cause.
 	respo, err := Send(SendSiteCall, Client(cli), call)
 	if err != nil {
+		if st, ok := BudgetStatus(err); ok {
+			return st // #1115 — 504 Timeout
+		}
 		return response.New(http.StatusInternalServerError, err)
 	}
 	defer respo.Body.Close()
@@ -147,6 +147,59 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	}
 
 	return response.New(http.StatusNoContent, nil)
+}
+
+// RequestURL is the URL a call to path on the endpoint at serverURL is sent to,
+// as request.Do builds it (plumbing v1.15.1 http/request/request.go): the
+// server URL without its trailing "/", then exactly one "/", then path without
+// its leading "/". Both HTTP dials build their URL here, this one and the
+// resolver's own fetch (restactions/api httpFetchConverting), and so does the
+// plan's check of what the apiserver will read (#1137), so the check cannot
+// build that URL another way. The resolver's internal-rest-config branch does
+// not send a path: client-go joins the parsed coordinates with path.Join, and
+// the plan's check refuses every path that cleaning would change.
+//
+// A path that does not start with "/" is sent as if it did, and the server
+// percent-decodes what it receives: the request a server reads is the decoded
+// path of url.Parse(RequestURL(...)).
+func RequestURL(serverURL, path string) string {
+	uri := strings.TrimSuffix(serverURL, "/")
+	if len(path) > 0 {
+		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(path, "/"))
+	}
+	return uri
+}
+
+// BudgetStatusReason is the reason of the envelope a page-budget exhaustion is
+// reported with: the apiserver's own reason for 504 (metav1.StatusReasonTimeout).
+const BudgetStatusReason = "Timeout"
+
+// BudgetStatus shapes an exchange its page budget ended (#1115) into the
+// envelope a stage or a /call passthrough reports: 504 Gateway Timeout, a
+// Failure, reason Timeout, the identity-free ExhaustedError text. ok=false for
+// any other error. (plumbing's response.New(504, …) would read as a Success:
+// 504 is not in its list.)
+func BudgetStatus(err error) (*response.Status, bool) {
+	var e *pagebudget.ExhaustedError
+	if !errors.As(err, &e) {
+		return nil, false
+	}
+	st := response.New(http.StatusGatewayTimeout, e)
+	st.Status = response.StatusFailure
+	st.Reason = response.StatusReason(BudgetStatusReason)
+	return st, true
+}
+
+// WriteBudgetError writes the 504 Timeout envelope (BudgetStatus) for an
+// exchange the request's page budget ended and reports true; false (nothing
+// written) for any other error. For handlers that answer an error directly.
+func WriteBudgetError(w http.ResponseWriter, err error) bool {
+	st, ok := BudgetStatus(err)
+	if !ok {
+		return false
+	}
+	_ = response.Encode(w, st)
+	return true
 }
 
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx

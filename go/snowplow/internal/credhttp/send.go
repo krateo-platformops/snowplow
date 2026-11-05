@@ -31,12 +31,15 @@ package credhttp
 // process-level count, so nothing is recorded twice.
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptrace"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +47,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/util"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // Endpoint dial sites (closed set).
@@ -87,17 +91,214 @@ func SafeMethod(method string) bool {
 // no redirect hop leaves req's origin (#1106); a write is sent once; a safe
 // request goes through plumbing's RetryClient with every retry counted and
 // logged with its cause. cli is not modified.
+//
+// #1115 — a request that carries a customer page budget (pagebudget) is sent
+// inside it instead: sendBudgeted (safe methods) or sendOnceBudgeted (writes).
+// A request without one (background work) keeps the path below, unchanged.
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
 	// #1106 — no redirect hop leaves the origin this request is sent to,
 	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
-	// cli (a wire dump, a plumbing-built chain) can displace it.
+	// cli (a wire dump, a plumbing-built chain) can displace it; the budgeted
+	// paths below send on the same wrapped client.
 	cli = SameOriginOnly(cli, Origin(req.URL))
+	if b, ok := pagebudget.From(req.Context()); ok {
+		if !SafeMethod(req.Method) {
+			return sendOnceBudgeted(cli, req, b)
+		}
+		return sendBudgeted(site, cli, req, b)
+	}
 	if !SafeMethod(req.Method) {
 		return cli.Do(req)
 	}
 	observed := *cli
 	observed.Transport = &attemptObserver{next: cli.Transport, site: site}
 	return util.NewRetryClient(&observed).Do(req)
+}
+
+// sendOnceBudgeted sends a write once inside its budget (#1115 §5). A write
+// whose budget is already spent is never dialled (not_sent). Otherwise its one
+// attempt ends by the deadline; a write whose request was written is reported
+// as possibly applied, and is never re-sent (#1088, #905).
+func sendOnceBudgeted(cli *http.Client, req *http.Request, b *pagebudget.Budget) (*http.Response, error) {
+	if !budgetNow().Before(b.Deadline()) {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		b.Note(pagebudget.NotSent)
+		return nil, &pagebudget.ExhaustedError{Result: pagebudget.NotSent}
+	}
+	x, actx := beginBudgetedAttempt(req.Context(), b)
+	resp, err := cli.Do(req.WithContext(actx))
+	if err != nil {
+		e := x.exhausted(err, 1, "", req.Method)
+		x.end()
+		if e != nil {
+			b.Note(e.Result)
+			return nil, e
+		}
+		return nil, err
+	}
+	b.Note(pagebudget.Within)
+	resp.Body = x.bodyEnding(resp.Body)
+	return resp, nil
+}
+
+// sendBudgeted is a customer exchange of a safe method inside its page budget
+// (#1115 §3). Send decides; the attempt observer only records. At most two
+// attempts, in place of RetryClient's five-retry backoff, which cannot fit a
+// 10 s budget:
+//   - attempt 1 stops waiting on its connection at deadline − reserve if it has
+//     none by then (the dial goes on for whoever else waits on it);
+//   - attempt 2, once, only if the remaining budget covers the reserve plus the
+//     wait it owes: at once after a connection-phase failure (a fresh
+//     connection), after RetryClient's first backoff after a 5xx or an error on
+//     an established connection, after Retry-After after a 429;
+//   - otherwise the last answer, or a *pagebudget.ExhaustedError when the
+//     budget ended it.
+func sendBudgeted(site string, cli *http.Client, req *http.Request, b *pagebudget.Budget) (*http.Response, error) {
+	if !budgetNow().Before(b.Deadline()) {
+		b.Note(pagebudget.NotSent)
+		return nil, &pagebudget.ExhaustedError{Result: pagebudget.NotSent}
+	}
+	obs := &attemptObserver{next: cli.Transport, site: site}
+	observed := *cli
+	observed.Transport = obs
+	reserve, _ := freshAnswers.reserve()
+	policy := util.NewRetryClient(&observed)
+
+	resp, err, x := budgetedTry(&observed, req, b, b.Deadline().Add(-reserve))
+	wait, retry := budgetedRetryWait(req, resp, err, x, policy)
+	// A connect cut lands exactly at deadline − reserve: what it left IS the
+	// reserve, so a cut attempt always has room for its retry.
+	fits := x.wasCut() || b.Deadline().Sub(budgetNow()) >= reserve+wait
+	switch {
+	case retry && fits:
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		x.end()
+		if !sleepBudget(req.Context(), b, wait) {
+			b.Note(pagebudget.ExhaustedConnect)
+			return nil, &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect, Cause: obs.prevCause, Attempts: obs.attempts}
+		}
+		resp, err, x = budgetedTry(&observed, req, b, time.Time{})
+		if err == nil {
+			b.Note(pagebudget.Retried)
+			resp.Body = x.bodyEnding(resp.Body)
+			return resp, nil
+		}
+	case err == nil:
+		b.Note(pagebudget.Within)
+		resp.Body = x.bodyEnding(resp.Body)
+		return resp, nil
+	}
+	// The send failed. A connect cut whose retry did not fit is the budget's
+	// doing too: its connection phase is what ran out.
+	e := x.exhausted(err, obs.attempts, obs.prevCause, req.Method)
+	if e == nil && x.wasCut() {
+		e = &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect, Cause: obs.prevCause, Attempts: obs.attempts}
+	}
+	x.end()
+	if e != nil {
+		b.Note(e.Result)
+		return nil, e
+	}
+	return nil, err
+}
+
+// budgetedTry is one attempt of sendBudgeted, under the budget's deadline and,
+// when cutAt is set, the connect cut. On success the attempt stays open until
+// the caller ends it (or the body it hands on is closed).
+func budgetedTry(cli *http.Client, req *http.Request, b *pagebudget.Budget, cutAt time.Time) (*http.Response, error, *budgetedAttempt) {
+	x, actx := beginBudgetedAttempt(req.Context(), b)
+	if !cutAt.IsZero() {
+		x.cutConnectAt(cutAt)
+	}
+	r := req.Clone(actx)
+	if req.Body != nil && req.GetBody != nil {
+		if body, err := req.GetBody(); err == nil {
+			r.Body = body
+		}
+	}
+	resp, err := cli.Do(r)
+	x.stopCut()
+	return resp, err, x
+}
+
+// budgetedRetryWait reports whether attempt 1's outcome earns the one retry,
+// and the wait it owes first: none after a connection-phase failure (no
+// connection was obtained: the retry dials fresh), RetryClient's first backoff
+// after a 5xx or an error on an established connection, Retry-After after a
+// 429. A request with a body that cannot be replayed is not retried, and the
+// deadline itself ends the send.
+func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *budgetedAttempt, policy *util.RetryClient) (time.Duration, bool) {
+	if req.Body != nil && req.GetBody == nil {
+		return 0, false
+	}
+	if err != nil {
+		if context.Cause(x.ctx) == pagebudget.ErrExhausted {
+			return 0, false
+		}
+		if !x.connected() {
+			return 0, true
+		}
+		return firstBackoff(policy.BaseBackoff, policy.MaxBackoff), true
+	}
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return retryAfter(resp), true
+	case resp.StatusCode >= 500:
+		return firstBackoff(policy.BaseBackoff, policy.MaxBackoff), true
+	}
+	return 0, false
+}
+
+// retryPolicyTranscribedFrom is the plumbing version firstBackoff and
+// retryAfter transcribe (http/util/retry.go: backoff, parseRetryAfter, both
+// unexported). TestBudget1115_RetryPolicyPinnedToPlumbing fails when the module
+// builds against another one, so a plumbing bump re-audits them.
+const retryPolicyTranscribedFrom = "v1.15.1"
+
+// firstBackoff is RetryClient's backoff before its first retry (plumbing
+// v1.15.1 http/util/retry.go backoff(0, base, max)): base capped at max,
+// jittered into [d/2, d).
+func firstBackoff(base, maxB time.Duration) time.Duration {
+	d := min(base, maxB)
+	if d < 2 {
+		return d
+	}
+	return d/2 + time.Duration(rand.Int64N(int64(d)/2))
+}
+
+// retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the
+// Retry-After seconds or date, else 2 s.
+func retryAfter(resp *http.Response) time.Duration {
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return 2 * time.Second
+	}
+	if secs, err := strconv.Atoi(ra); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(ra); err == nil {
+		return time.Until(t)
+	}
+	return 2 * time.Second
+}
+
+// sleepBudget waits d; false if the request's own context ended first or the
+// budget ran out meanwhile.
+func sleepBudget(ctx context.Context, b *pagebudget.Budget, d time.Duration) bool {
+	if d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return ctx.Err() == nil && budgetNow().Before(b.Deadline())
 }
 
 // attemptObserver sees each attempt of one Send. The RetryClient's attempts are
@@ -134,6 +335,13 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
+	// #1115 — the retry reserve's data: how long an attempt that opened a NEW
+	// connection took from asking for it to its first response byte.
+	if err == nil {
+		if d, ok := tr.freshAnswer(); ok {
+			freshAnswers.record(d)
+		}
+	}
 	return resp, err
 }
 
@@ -145,19 +353,55 @@ type attemptTrace struct {
 	connected  bool
 	connectErr bool
 	tlsErr     bool
+	// #1115 — phases begun and not finished when the attempt ended: an attempt
+	// its waiter abandoned (a connect cut, the deadline) is classified by the
+	// phase it was in, since its detached dial reports its end later or never.
+	dnsOpen, connectOpen, tlsOpen bool
+	// #1115 — the reserve sample: GetConn to first response byte, on a new
+	// connection only.
+	getConn, firstByte time.Time
+	reused             bool
+}
+
+// freshAnswer is the attempt's reserve sample, if it opened a new connection
+// and was answered.
+func (t *attemptTrace) freshAnswer() (time.Duration, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.connected || t.reused || t.getConn.IsZero() || t.firstByte.IsZero() {
+		return 0, false
+	}
+	return t.firstByte.Sub(t.getConn), true
 }
 
 func (t *attemptTrace) hooks() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
+		GetConn: func(string) {
+			t.mu.Lock()
+			t.getConn = time.Now()
+			t.mu.Unlock()
+		},
+		DNSStart: func(httptrace.DNSStartInfo) {
+			t.mu.Lock()
+			t.dnsOpen = true
+			t.mu.Unlock()
+		},
 		DNSDone: func(i httptrace.DNSDoneInfo) {
+			t.mu.Lock()
+			t.dnsOpen = false
 			if i.Err != nil {
-				t.mu.Lock()
 				t.dnsErr = true
-				t.mu.Unlock()
 			}
+			t.mu.Unlock()
+		},
+		ConnectStart: func(_, _ string) {
+			t.mu.Lock()
+			t.connectOpen = true
+			t.mu.Unlock()
 		},
 		ConnectDone: func(_, _ string, err error) {
 			t.mu.Lock()
+			t.connectOpen = false
 			if err != nil {
 				t.connectErr = true
 			} else {
@@ -165,16 +409,28 @@ func (t *attemptTrace) hooks() *httptrace.ClientTrace {
 			}
 			t.mu.Unlock()
 		},
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
-			if err != nil {
-				t.mu.Lock()
-				t.tlsErr = true
-				t.mu.Unlock()
-			}
+		TLSHandshakeStart: func() {
+			t.mu.Lock()
+			t.tlsOpen = true
+			t.mu.Unlock()
 		},
-		GotConn: func(httptrace.GotConnInfo) {
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			t.mu.Lock()
+			t.tlsOpen = false
+			if err != nil {
+				t.tlsErr = true
+			}
+			t.mu.Unlock()
+		},
+		GotConn: func(i httptrace.GotConnInfo) {
 			t.mu.Lock()
 			t.connected = true
+			t.reused = i.Reused
+			t.mu.Unlock()
+		},
+		GotFirstResponseByte: func() {
+			t.mu.Lock()
+			t.firstByte = time.Now()
 			t.mu.Unlock()
 		},
 	}
@@ -201,6 +457,13 @@ func (t *attemptTrace) cause(resp *http.Response, err error) string {
 	case t.connectErr && !t.connected:
 		return RetryCauseDial
 	case t.dnsErr && !t.connected:
+		return RetryCauseDNS
+	// #1115 — abandoned mid-phase (no Done yet): the phase it was in.
+	case t.tlsOpen:
+		return RetryCauseTLSHandshake
+	case t.connectOpen && !t.connected:
+		return RetryCauseDial
+	case t.dnsOpen && !t.connected:
 		return RetryCauseDNS
 	}
 	return RetryCauseConnection

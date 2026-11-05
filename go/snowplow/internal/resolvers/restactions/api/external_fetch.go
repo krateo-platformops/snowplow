@@ -112,10 +112,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 // the same for both.
 func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
-	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
-	if len(opts.Path) > 0 {
-		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(opts.Path, "/"))
-	}
+	// #1137 — the URL is built by the one builder the plan's check reads
+	// (credhttp.RequestURL), so the path checked is the path sent.
+	uri := credhttp.RequestURL(opts.Endpoint.ServerURL, opts.Path)
 
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -266,6 +265,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		// the "https://svc@host/base?token=…" shape still renders its token in
 		// clear. redact.URL removes both.
 		redErr := redact.ErrorURL(err)
+		// #1115 — the request's page budget ended the exchange: 504 Timeout,
+		// with the ExhaustedError's identity-free text (no URL in it).
+		if st, ok := credhttp.BudgetStatus(err); ok {
+			return st, nil, "", redErr
+		}
 		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()

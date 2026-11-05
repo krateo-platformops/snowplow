@@ -56,7 +56,6 @@
 package middleware
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -123,7 +122,7 @@ const PinnedPlumbingVersion = "v1.15.1"
 //          pre-readiness, NS mismatch, Secret absent in snapshot).
 //          Record the fallthrough counter on the call's scope
 //          context, THEN re-issue the verbatim upstream call with
-//          IDENTICAL arguments (`endpoints.FromSecret(context.Background(),
+//          IDENTICAL arguments (`endpoints.FromSecret(req.Context() [#1115: carries the page budget],
 //          sarc, name, authnNS)`). Error handling on the re-call is
 //          byte-identical to upstream :53-60: `apierrors.IsNotFound(err)`
 //          → Unauthorized; any other error → InternalError.
@@ -165,6 +164,12 @@ const PinnedPlumbingVersion = "v1.15.1"
 func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// #1115 — a customer request's network exchanges share the page's
+			// 10 s goal budget, from its arrival (pagebudget). Set once, here,
+			// where every customer request/response route enters, before the
+			// clientconfig read below. A background self-loopback (#903's
+			// marker) is not a customer request and carries none.
+			req = withCustomerPageBudget(req)
 			// #1054 — the auth phase of the request's slow-call record: JWT
 			// validation plus the clientconfig lookup (and its apiserver
 			// re-read on a miss). It ends before the next handler runs.
@@ -289,7 +294,11 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				// cache-miss fallback's observable behaviour MUST be
 				// byte-identical to upstream — gated by
 				// TestUserConfig_ByteEquivalence_CacheMiss.
-				ep, ferr = credhttp.FromSecret(context.Background(), sarc, secretName, authnNS)
+				// #1115 — on the request's ctx: the re-read is a network exchange of
+				// this customer request and runs inside its page budget (a spent
+				// budget is never sent: 504 Timeout). Without a budget the call is
+				// byte-identical to upstream's.
+				ep, ferr = credhttp.FromSecret(req.Context(), sarc, secretName, authnNS)
 				if ferr != nil {
 					// Upstream :54-59 — NotFound → 401, else → 500.
 					// PM load-bearing pin: the IsNotFound distinction
@@ -304,6 +313,9 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// kind/apiVersion/status/message/reason/code are
 					// byte-identical to upstream's. Any other re-read error
 					// stays upstream's 500, with no cause.
+					if credhttp.WriteBudgetError(wri, ferr) {
+						return
+					}
 					if apierrors.IsNotFound(ferr) {
 						credentialMissing(wri, userInfo.Groups, ferr)
 						return

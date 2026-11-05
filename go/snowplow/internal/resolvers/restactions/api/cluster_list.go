@@ -53,6 +53,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
@@ -799,11 +800,12 @@ func deriveClusterListTarget(
 	// runtime errors. A probe that read the iterator differently from the
 	// dispatch would decide the collapse for a different element set.
 	elems, probeErr := jqsupport.IterateValues(ctx, iter, dict, nil)
+	pt := pathtemplate.Compile(apiCall.Path) // #1123: once per stage, as the dial
 	for _, sa := range elems {
 		if diverged {
 			break
 		}
-		gvr, query, ok := clusterListElementTarget(apiCall.Path, sa)
+		gvr, query, ok := clusterListElementTargetWith(pt, sa)
 		if !ok {
 			// cluster-scope / by-name / empty / jq|parse error / a query the
 			// cluster call cannot carry → collapse-unsafe.
@@ -851,12 +853,29 @@ func gvrForClusterListElement(pathTmpl string, element any) (schema.GroupVersion
 // canonical query as the CLUSTER-scope call would carry it (#602). ok=false
 // when that query cannot be applied in process on a cluster path.
 func clusterListElementTarget(pathTmpl string, element any) (schema.GroupVersionResource, string, bool) {
-	resolvedPath, jqErr := evalJQE(pathTmpl, element)
+	return clusterListElementTargetWith(pathtemplate.Compile(pathTmpl), element)
+}
+
+// clusterListElementTargetWith is clusterListElementTarget with the stage path
+// already compiled.
+func clusterListElementTargetWith(pt *pathtemplate.Template, element any) (schema.GroupVersionResource, string, bool) {
+	// #1123 — the same render as the dial (createRequestOption), so the probe
+	// reads the path that would be sent. A refused path is not a jq error: it
+	// is simply not a collapsible LIST.
+	resolvedPath, jqErr := pt.Render(context.TODO(), element)
 	if jqErr != nil {
-		bumpNondialJQError(nondialClusterListGVRProbe)
+		if !pathtemplate.IsRefused(jqErr) {
+			bumpNondialJQError(nondialClusterListGVRProbe)
+		}
 		return schema.GroupVersionResource{}, "", false
 	}
 	if resolvedPath == "" || strings.Contains(resolvedPath, "${") {
+		return schema.GroupVersionResource{}, "", false
+	}
+	// #1123 — only a path the dial would plan: an element whose path the guard
+	// refuses (an escaped value in an apiserver path, a DNS-invalid namespace)
+	// is not a list this element would read.
+	if ok, _ := validInterpolatedPath(resolvedPath, http.MethodGet); !ok {
 		return schema.GroupVersionResource{}, "", false
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)

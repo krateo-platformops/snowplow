@@ -43,8 +43,10 @@ import (
 	"time"
 )
 
-// r378RefreshPutter is the #378 refresher-terminal carrier, reached through an
-// interface so this file compiles where it does not exist yet.
+// r378RefreshPutter is the #378 refresher-terminal carrier
+// (ResolvedCacheStore.replaceIfGenRefresh, resolved.go). It is reached through
+// an interface so the arm was RED, not a compile failure, on a tree without
+// the method; it exists now, and losing it reads as the #378 RED below.
 type r378RefreshPutter interface {
 	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
 }
@@ -71,10 +73,16 @@ func r378Stat(t testing.TB, c *ResolvedCacheStore, name string) int64 {
 	return v
 }
 
-func r378SleepUntil(at time.Time) {
-	if d := time.Until(at); d > 0 {
-		time.Sleep(d)
-	}
+// r378StoreClock installs a virtual store clock (ResolvedCacheStore.clock, #930)
+// on c for the rest of the test. #1166: D1, D2 and F2c used to sleep through
+// their windows (≈ 12 s of real time); every stamp they put and every age they
+// read is the store's, so they now age their cells on this clock, at exact
+// instants.
+func r378StoreClock(t *testing.T, c *ResolvedCacheStore) *r378Clock {
+	t.Helper()
+	clk := &r378Clock{at: time.Unix(1_700_000_000, 0)}
+	t.Cleanup(c.SetClockForTest(clk.now))
+	return clk
 }
 
 // TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect — K=3 × M=4.
@@ -82,6 +90,7 @@ func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing
 	const maxAge = 3 * time.Second
 	c := newResolvedCache(0, 0, 30*time.Second)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	var keys []string
 	for _, class := range []string{"restactions", "widgets", CacheEntryClassRAFullList} {
 		for m := 0; m < 4; m++ {
@@ -91,16 +100,16 @@ func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing
 			keys = append(keys, k)
 		}
 	}
-	t0 := time.Now()
+	t0 := clk.now()
 	// Customer traffic keeps every cell warm across its lifetime.
-	r378SleepUntil(t0.Add(1500 * time.Millisecond))
+	clk.set(t0.Add(1500 * time.Millisecond))
 	for _, k := range keys {
 		if _, ok := c.Get(k); !ok {
 			t.Fatalf("SETUP: %s must still be served before the cap", k)
 		}
 	}
-	// Cross the cap by real elapse (lifetime is whole seconds: > maxAge needs ≥ maxAge+1s).
-	r378SleepUntil(t0.Add(maxAge + 1200*time.Millisecond))
+	// Cross the cap on the store clock (lifetime is whole seconds: > maxAge needs ≥ maxAge+1s).
+	clk.set(t0.Add(maxAge + 1200*time.Millisecond))
 	c.reapPastMaxEntryAge()
 	if got := c.Stats().WarmPastMaxAge; got != 12 {
 		t.Fatalf("SETUP: the reaper must keep all 12 warm past-cap cells (C3), warm_past_max_age=%d", got)
@@ -133,6 +142,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	const ttl, maxAge = 2 * time.Second, 3 * time.Second
 	c := newResolvedCache(0, 0, ttl)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	key := func(n string) string {
 		return ComputeKey(ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "d2-" + n})
 	}
@@ -144,9 +154,9 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	c.put(seeded, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("seeded"), SeededAtBoot: true})
 	c.put(warm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("warm")})
 	c.put(ttlWarm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("ttl")})
-	t0 := time.Now()
+	t0 := clk.now()
 
-	r378SleepUntil(t0.Add(1200 * time.Millisecond))
+	clk.set(t0.Add(1200 * time.Millisecond))
 	if _, ok := c.Get(warm); !ok {
 		t.Fatal("SETUP: warm must be served")
 	}
@@ -155,7 +165,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	}
 
 	// (c) a WARM customer-read cell whose BODY expired: evict_ttl_warm_customer_total.
-	r378SleepUntil(t0.Add(2300 * time.Millisecond))
+	clk.set(t0.Add(2300 * time.Millisecond))
 	ttlW0 := r378Stat(t, c, "evict_ttl_warm_customer_total")
 	ttl0 := c.Stats().EvictTTLTotal
 	if _, ok := c.Get(ttlWarm); ok {
@@ -179,7 +189,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 		t.Fatal("SETUP: warm must be served after its re-Put")
 	}
 
-	r378SleepUntil(t0.Add(maxAge + 300*time.Millisecond))
+	clk.set(t0.Add(maxAge + 300*time.Millisecond))
 	cust0 := r378Stat(t, c, "evict_max_age_warm_customer_total")
 	int0 := r378Stat(t, c, "evict_max_age_warm_internal_total")
 	age0 := c.Stats().EvictMaxAgeTotal
@@ -263,6 +273,7 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	const maxAge = 4 * time.Second // L = min(TTL=60s, maxAge/2) = 2s → window [2s, 4s)
 	c := newResolvedCache(0, 0, 60*time.Second)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	st := reflect.TypeOf(c)
 	type cell struct {
 		m    reflect.Method
@@ -302,7 +313,7 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 			t.Fatalf("#378 F2c: the enumeration did not find %s — the filter is broken (found %v)", must, names)
 		}
 	}
-	time.Sleep(maxAge/2 + 300*time.Millisecond) // every cell is now inside [maxAge-L, maxAge)
+	clk.set(clk.now().Add(maxAge/2 + 300*time.Millisecond)) // every cell is now inside [maxAge-L, maxAge)
 
 	for _, x := range cells {
 		before, ok := c.GetNoTouch(x.key)
@@ -339,7 +350,7 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	k := ComputeKey(in)
 	c.put(k, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: &in})
 	e0, _ := c.GetNoTouch(k)
-	time.Sleep(maxAge/2 + 300*time.Millisecond)
+	clk.set(clk.now().Add(maxAge/2 + 300*time.Millisecond))
 	if !put(context.Background(), k, &ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, c.CaptureGen(k)) {
 		t.Fatal("ReplaceIfGenRefresh refused a live in-window cell")
 	}

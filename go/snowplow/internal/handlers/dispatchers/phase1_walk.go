@@ -106,6 +106,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/clock"
 )
 
 // phase1SAUsername resolves the CANONICAL Kubernetes ServiceAccount
@@ -1051,27 +1052,42 @@ const phase1SettleWindow = 750 * time.Millisecond
 // phase1SettlePoll is the poll cadence for the settle check.
 const phase1SettlePoll = 150 * time.Millisecond
 
+// settleClock (#1166) is the clock settleRegisteredSet keeps its window on: the
+// stableSince stamp, the poll ticker and the window's age are all read from it.
+// nil is the wall clock (clock.RealClock: time.Now, time.NewTicker, time.Since),
+// which is all production ever uses. A test installs a virtual clock so the same
+// window logic runs on exact instants instead of 750 ms of real time per pass.
+var settleClock atomic.Pointer[clock.WithTicker]
+
+func settleClockOrReal() clock.WithTicker {
+	if c := settleClock.Load(); c != nil {
+		return *c
+	}
+	return clock.RealClock{}
+}
+
 // settleRegisteredSet polls the watcher's registered-GVR count until it
 // holds steady for phase1SettleWindow, or ctx is cancelled. This lets
 // the CRD-watch's asynchronous per-GVR registrations land before the
 // sync barrier snapshots the informer set.
 func settleRegisteredSet(ctx context.Context, rw *cache.ResourceWatcher) {
+	clk := settleClockOrReal()
 	last := rw.RegisteredCount()
-	stableSince := time.Now()
-	t := time.NewTicker(phase1SettlePoll)
+	stableSince := clk.Now()
+	t := clk.NewTicker(phase1SettlePoll)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 			now := rw.RegisteredCount()
 			if now != last {
 				last = now
-				stableSince = time.Now()
+				stableSince = clk.Now()
 				continue
 			}
-			if time.Since(stableSince) >= phase1SettleWindow {
+			if clk.Since(stableSince) >= phase1SettleWindow {
 				return
 			}
 		}
