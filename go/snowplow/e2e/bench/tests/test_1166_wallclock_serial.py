@@ -10,6 +10,7 @@ import sys
 import textwrap
 import time
 import time as _t
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
@@ -66,6 +67,23 @@ def _a_deadline():
     assert time.monotonic() < deadline
 
 
+def _a_datetime_difference():
+    t0 = datetime.now(UTC)
+    assert (datetime.now(UTC) - t0).total_seconds() < 30
+
+
+def _a_datetime_module_utcnow_through_a_name():
+    import datetime as dt
+    t0 = dt.datetime.utcnow()
+    elapsed = (dt.datetime.utcnow() - t0).total_seconds()
+    assert elapsed < 30
+
+
+def _a_datetime_timestamp():
+    t0 = datetime.now(UTC).timestamp()
+    assert datetime.now(UTC).timestamp() - t0 < 30
+
+
 def _a_lower_bound_only():
     t0 = time.monotonic()
     assert time.monotonic() - t0 >= 0         # a floor is not a load-sensitive bound
@@ -82,6 +100,11 @@ def _a_clock_never_asserted():
         pass
 
 
+def _a_datetime_only_formatted():
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    assert len(today) < 9
+
+
 def _a_moment_in_the_past_compared():
     stale_at = time.monotonic() - (3600 + 60)  # a moment, not a duration
     refreshed = time.monotonic()
@@ -90,12 +113,14 @@ def _a_moment_in_the_past_compared():
 
 def test_a_wall_clock_bound_is_recognised_in_each_of_its_shapes():
     for f in (_direct, _through_a_name, _in_a_conjunction, _a_module_alias, _an_alias_in_the_function,
-              _a_function_imported_by_name, _reversed, _chained, _a_deadline):
+              _a_function_imported_by_name, _reversed, _chained, _a_deadline, _a_datetime_difference,
+              _a_datetime_module_utcnow_through_a_name, _a_datetime_timestamp):
         assert bounds_wall_clock(f), f.__name__
 
 
 def test_what_does_not_bound_elapsed_time_is_not_flagged():
-    for f in (_a_lower_bound_only, _no_clock, _a_clock_never_asserted, _a_moment_in_the_past_compared):
+    for f in (_a_lower_bound_only, _no_clock, _a_clock_never_asserted, _a_moment_in_the_past_compared,
+              _a_datetime_only_formatted):
         assert not bounds_wall_clock(f), f.__name__
 
 
@@ -124,6 +149,18 @@ def test_an_unmarked_wall_clock_bound_fails_collection(tmp_path):
     assert p.returncode == 4, p.stdout + p.stderr                      # pytest.ExitCode.USAGE_ERROR
     assert "not marked serial" in p.stderr and "test_inner.py::test_bounded" in p.stderr, p.stderr
     assert "test_plain" not in p.stderr and "passed" not in p.stdout, p.stdout + p.stderr
+
+
+def test_an_unmarked_datetime_bound_fails_collection(tmp_path):
+    p = _inner(tmp_path, '''
+        from datetime import UTC, datetime
+
+        def test_bounded():
+            t0 = datetime.now(UTC)
+            assert (datetime.now(UTC) - t0).total_seconds() < 30
+    ''')
+    assert p.returncode == 4, p.stdout + p.stderr                      # pytest.ExitCode.USAGE_ERROR
+    assert "not marked serial" in p.stderr and "test_inner.py::test_bounded" in p.stderr, p.stderr
 
 
 def test_the_marked_bound_runs_in_the_serial_pass_only(tmp_path):

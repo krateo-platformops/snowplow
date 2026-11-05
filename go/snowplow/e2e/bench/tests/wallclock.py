@@ -15,7 +15,9 @@ test. The suite runs in two passes:
 This plugin (loaded from pytest.ini) is the GUARD, not the source of truth: collection FAILS when
 a test's own source asserts a bound on the wall clock and the test is not marked serial. A wall-
 clock reading is `time.time()`, `time.monotonic()` or `time.perf_counter()`, under any alias the
-module or the function imports (`import time as _t`, `from time import monotonic`). A bound is an
+module or the function imports (`import time as _t`, `from time import monotonic`), or
+`datetime.now()` / `datetime.utcnow()` likewise (`.total_seconds()` and `.timestamp()` read through).
+A bound is an
 assert that compares such a reading from above: `clock - t0 < X`, `X > clock - t0`, chained as in
 `0 <= clock - t0 < X`, through a name assigned from such a difference (`elapsed < X`), or as a
 deadline (`clock < deadline`). Some load-sensitive tests do not show their clock in their source
@@ -32,15 +34,26 @@ import textwrap
 import pytest
 
 _CLOCKS = {"time", "monotonic", "perf_counter"}
+_DATETIME_CLOCKS = {"now", "utcnow"}
+
+
+def _read_through(n: ast.AST) -> ast.AST:
+    """`x.total_seconds()` / `x.timestamp()` is x, for what it measures."""
+    if (isinstance(n, ast.Call) and not n.args and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("total_seconds", "timestamp")):
+        return n.func.value
+    return n
 
 
 class _Names:
-    """The names that read the wall clock in one module + function: aliases of the time
-    module, and clock functions imported by name."""
+    """The names that read the wall clock in one module + function: aliases of the time and
+    datetime modules, clock functions imported by name, and the datetime class's names."""
 
     def __init__(self):
         self.modules = {"time"}
         self.funcs: set[str] = set()
+        self.dt_modules: set[str] = set()
+        self.dt_classes: set[str] = set()
 
     def learn(self, tree: ast.AST) -> None:
         for n in ast.walk(tree):
@@ -48,22 +61,36 @@ class _Names:
                 for a in n.names:
                     if a.name == "time":
                         self.modules.add(a.asname or "time")
+                    elif a.name == "datetime":
+                        self.dt_modules.add(a.asname or "datetime")
             elif isinstance(n, ast.ImportFrom) and n.module == "time":
                 for a in n.names:
                     if a.name in _CLOCKS:
                         self.funcs.add(a.asname or a.name)
+            elif isinstance(n, ast.ImportFrom) and n.module == "datetime":
+                for a in n.names:
+                    if a.name == "datetime":
+                        self.dt_classes.add(a.asname or a.name)
 
     def is_clock(self, n: ast.AST) -> bool:
+        n = _read_through(n)
         if not isinstance(n, ast.Call):
             return False
         f = n.func
         if isinstance(f, ast.Attribute) and f.attr in _CLOCKS and isinstance(f.value, ast.Name):
             return f.value.id in self.modules
+        if isinstance(f, ast.Attribute) and f.attr in _DATETIME_CLOCKS:
+            v = f.value
+            if isinstance(v, ast.Name):                         # datetime.now()
+                return v.id in self.dt_classes
+            return (isinstance(v, ast.Attribute) and v.attr == "datetime"     # datetime.datetime.now()
+                    and isinstance(v.value, ast.Name) and v.value.id in self.dt_modules)
         return isinstance(f, ast.Name) and f.id in self.funcs
 
     def is_difference(self, n: ast.AST) -> bool:
         """`clock - stamp`, an elapsed time: the stamp a name, attribute, item or clock reading
         (not `clock - (MAX_AGE + 60)`, which is a moment in the past, not a duration)."""
+        n = _read_through(n)
         return (isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub) and self.is_clock(n.left)
                 and (isinstance(n.right, (ast.Name, ast.Attribute, ast.Subscript)) or self.is_clock(n.right)))
 
@@ -111,6 +138,8 @@ def bounds_wall_clock(fn) -> bool:
     names = _Names()
     names.modules |= module.modules
     names.funcs |= module.funcs
+    names.dt_modules |= module.dt_modules
+    names.dt_classes |= module.dt_classes
     names.learn(tree)                                   # an import inside the function
     elapsed = {t.id for a in ast.walk(tree) if isinstance(a, ast.Assign) and names.is_difference(a.value)
                for t in a.targets if isinstance(t, ast.Name)}

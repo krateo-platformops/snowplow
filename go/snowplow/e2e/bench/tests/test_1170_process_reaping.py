@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -161,6 +162,33 @@ def test_a_child_started_with_its_own_env_is_still_the_tests(tmp_path):
         assert "outlived every test" not in p.stdout                   # the test's end, not the session's
     finally:
         _kill(token)
+
+
+def test_a_stopped_sampler_reaps_the_sample_it_killed(tmp_path):
+    """bench/sampler.py: a stop (SIGTERM, its handler raises out of communicate) kills the sample in
+    flight and reaps it. An unreaped child is still a process (a zombie), so a signal 0 to it would
+    succeed; right after the stop, with no wait, it must fail."""
+    from bench import sampler
+    pidf = tmp_path / "pid"
+    runner = sampler.Runner()
+
+    def term_once_started():
+        deadline = time.monotonic() + 60
+        while not (pidf.exists() and pidf.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    prev = signal.signal(signal.SIGTERM, runner.stop)
+    t = threading.Thread(target=term_once_started)
+    t.start()
+    try:
+        with pytest.raises(sampler._Stopping):
+            runner.run(["sh", "-c", f"echo $$ > {pidf}; exec sleep 30"], 60)
+    finally:
+        t.join()
+        signal.signal(signal.SIGTERM, prev)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidf.read_text()), 0)
 
 
 def test_the_interpreters_resource_tracker_is_not_a_tests_leak(tmp_path):

@@ -279,6 +279,7 @@ def _run(env):
                           capture_output=True, text=True, timeout=300)
 
 
+@pytest.mark.serial  # #1166/#1174: needs a first kubectl sample inside TOP_POLL_S=0.2 s of wall clock, which the source does not show as a clock
 def test_run_collects_memory_and_restart_state(harness):
     env, state, ambient, tmp = harness
     env = _env483(env)

@@ -781,6 +781,7 @@ def test_a_run_that_completed_never_stops_its_partner(pairbed, va, bash):
 
 
 @pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.serial  # #1166/#1174: asserts `(datetime.now(UTC) - t0).total_seconds() < 30` on the wall clock
 def test_a_run_that_failed_as_tooling_stops_its_partner_and_its_trap_runs(pairbed, va, bash):
     repo, fake, env, tmp = pairbed
     _verdicts(fake, va)

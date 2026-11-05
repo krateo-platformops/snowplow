@@ -95,6 +95,7 @@ class Runner:
             rc, timed_out = None, True
         finally:
             self._kill()
+            self.proc.wait()        # a stop raises out of communicate: killed is not yet reaped
             self.proc = None
         if self.stopping:
             raise _Stopping
