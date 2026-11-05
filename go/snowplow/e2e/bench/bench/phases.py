@@ -486,6 +486,10 @@ class _PerStageLogStreamer:
                         proc.kill()
                     except Exception:
                         pass
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
             # Respawn-decision branch.
             if not self._running.is_set():
                 return

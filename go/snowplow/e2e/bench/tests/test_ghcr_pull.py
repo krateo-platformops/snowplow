@@ -501,6 +501,20 @@ def test_a_render_over_its_output_cap_is_refused(monkeypatch):
     assert r["render_error"] == "helm template rendered more than its 10 byte cap"
 
 
+def test_a_render_stopped_at_its_output_cap_leaves_no_unreaped_child(monkeypatch, tmp_path):
+    """#1170: the cap kills helm AND reaps it. An unreaped child is still a process (a zombie),
+    so a signal 0 to it would succeed; right after the refusal, with no wait, it must fail."""
+    pid = tmp_path / "pid"
+    flood = tmp_path / "helm"
+    flood.write_text(f"#!/bin/sh\necho $$ > {pid}\nexec yes\n")
+    flood.chmod(0o755)
+    monkeypatch.setattr(ghcr_pull, "RENDER_OUT_MAX", 10)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, str(flood))
+    assert r["render_error"] == "helm template rendered more than its 10 byte cap"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text()), 0)
+
+
 def test_the_caps_are_helms_own_limits_and_the_render_a_measured_margin():
     """The chart's files: helm's own loader limits (100 MiB a chart, 5 MiB a
     file); the blob: a gzip stream inflates to about its own size at least,
