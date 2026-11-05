@@ -432,7 +432,7 @@ bounded() {
   BOUNDED_PIDS="$pid"     # from the fork on: a stop before the watchdog exists still stops the command
   # The watchdog's TERM trap kills `$!`, which bash sets at the fork, so no moment leaves its sleep
   # unnamed; the no-op job first makes `$!` a finished process until the sleep is forked.
-  ( : & trap 'kill $! 2>/dev/null; exit 0' TERM
+  ( : & trap 'exit 0' TERM
     sleep "$secs" & wait $!; kill_tree TERM "$pid" ) >/dev/null 2>&1 &
   local dog=$!
   BOUNDED_PIDS="$pid $dog"
@@ -440,7 +440,7 @@ bounded() {
   wait "$pid" || rc=$?
   # the watchdog as a tree: its sleep first, then itself. The trap is the second line of defence:
   # alone, it left 1 sleep in 20 calls under macOS's bash 3.2; as a tree, 0 in 600 (#1175 review)
-  kill_tree TERM "$dog"; wait "$dog" 2>/dev/null || true
+  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null || true
   BOUNDED_PIDS=""
   return "$rc"
 }
