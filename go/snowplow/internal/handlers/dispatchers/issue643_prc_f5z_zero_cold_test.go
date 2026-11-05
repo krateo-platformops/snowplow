@@ -36,6 +36,7 @@ func h643F5zCut(t *testing.T, env *h643Env, j int) map[string]passDoneRecord {
 	t.Helper()
 	budgets := map[prewarmScopeKind]time.Duration{}
 	h643Budget(t, budgets)
+	h643VirtualBudget(t)
 	env.pass(prewarmScope{kind: scopeKindBoot})
 	var units int
 	prevW := seedOneWidgetFn
@@ -43,8 +44,7 @@ func h643F5zCut(t *testing.T, env *h643Env, j int) map[string]passDoneRecord {
 		if mode == seedModeGVRDiscovered {
 			units++
 			if units == j+1 {
-				<-ctx.Done()
-				return ctx.Err()
+				return h643HoldUntilBudget(ctx)
 			}
 		}
 		return prevW(ctx, e, authnNS, mode)
