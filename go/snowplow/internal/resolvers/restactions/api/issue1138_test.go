@@ -58,7 +58,7 @@ func TestIssue1138_A_NamelessPutPatchOnANamedRefIsSent(t *testing.T) {
 // Proxy-Authorization and the cookie headers on a cross-host hop; the SA dial
 // drops only Authorization and Impersonate-*).
 const (
-	x1138Cargo  = "X-Zq1138-Cargo-Hold"
+	x1138Cargo   = "X-Zq1138-Cargo-Hold"
 	x1138Carried = "cargo-canary-zq"
 )
 
