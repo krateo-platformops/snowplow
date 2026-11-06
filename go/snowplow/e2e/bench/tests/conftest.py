@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,13 @@ import pytest
 
 # Bypass the GKE context guard — tests should never contact a real cluster.
 os.environ.setdefault("BENCH_ALLOW_NON_GKE", "1")
+
+# #1194: no test writes the operator's durable run or evidence trees. These hold for an import
+# (bench.expected reads the runs root once); the `run_trees` fixture gives each test its own. And
+# pytest's tmp_path sits in a temporary directory, which bench.evidence refuses for real runs.
+os.environ["BENCH_RUNS_DIR"] = tempfile.mkdtemp(prefix="bench-suite-runs-")
+os.environ["BENCH_EVIDENCE_DIR"] = tempfile.mkdtemp(prefix="bench-suite-evidence-")
+os.environ["BENCH_ALLOW_VOLATILE_PATHS"] = "1"
 
 # BENCH_GKE_CONTEXT retargets the pinned context (cluster.canonical_gke_context).
 # An operator who exports it in their shell to drive a real bench run would
@@ -510,6 +518,16 @@ def run_lock(tmp_path, monkeypatch):
     return path
 
 
+@pytest.fixture(autouse=True)
+def run_trees(tmp_path, monkeypatch):
+    """#1194: the durable run and evidence trees, under the test's tmp_path. The same run names
+    recur across tests, and a run refuses an evidence directory an earlier run left, so each test
+    needs its own; and a test that reaches a default never writes the operator's home."""
+    monkeypatch.setenv("BENCH_RUNS_DIR", str(tmp_path / "bench-runs"))
+    monkeypatch.setenv("BENCH_EVIDENCE_DIR", str(tmp_path / "bench-evidence"))
+    return tmp_path / "bench-runs", tmp_path / "bench-evidence"
+
+
 @pytest.fixture
 def reset_k8s_state():
     """Reset bench.cluster k8s-client module globals between tests.
@@ -588,7 +606,7 @@ def mock_kubectl(monkeypatch):
 
 @pytest.fixture
 def tmp_run_dir(tmp_path):
-    """Yield a clean /tmp/snowplow-runs/{tag}/run-{ts}/-shaped path."""
+    """Yield a clean {runs_root}/{tag}/run-{ts}/-shaped path."""
     run_dir = tmp_path / "snowplow-runs" / "test-tag" / "run-20260602-test"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir

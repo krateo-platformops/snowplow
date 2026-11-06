@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 # Deferred — cluster.pct is the same helper from worktree source 939-942.
+from bench import evidence
 from bench.cluster import kubectl, pct as _pct  # type: ignore
 
 __all__ = [
@@ -273,18 +274,22 @@ def aggregate_validation(all_results: Iterable[dict]) -> dict:
 # ─── _load_per_mutation_metric (relocated; worktree source 7340-7350) ───────
 
 
+def legacy_per_mutation_path() -> Path:
+    """Phase 8's results when it was given no run_dir, in the durable runs root (#1194)."""
+    return evidence.runs_root() / "phase8" / "per_mutation_results.json"
+
+
 def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
     """Load a Phase-8 metric.
 
     Block 4 relocation: prefer `{run_dir}/phase8/per_mutation_results.json`
-    when `run_dir` is provided; fall back to the legacy hardcoded path
-    `/tmp/snowplow_per_mutation_results.json` so behaviour is identical
-    when no run_dir is supplied.
+    when `run_dir` is provided; fall back to `legacy_per_mutation_path()`
+    so behaviour is identical when no run_dir is supplied.
     """
     candidates: list[str] = []
     if run_dir is not None:
         candidates.append(str(Path(run_dir) / "phase8" / "per_mutation_results.json"))
-    candidates.append("/tmp/snowplow_per_mutation_results.json")
+    candidates.append(str(legacy_per_mutation_path()))
 
     for path in candidates:
         try:
