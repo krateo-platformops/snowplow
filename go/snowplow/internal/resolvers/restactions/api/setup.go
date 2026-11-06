@@ -33,13 +33,13 @@ import (
 // for the expansion is the existing bounded errgroup
 // (g.SetLimit(iterParallelism(ctx)), resolve.go) — no new mechanism.
 
-// skippedOption is one request option the #288 dial guard refused, carried with
-// the verdict that refused it. The DISPATCH path throws these away — not dialing
+// skippedOption is one request option the #288 dial guard refused, as the
+// verdict that refused it. The DISPATCH path throws these away — not dialing
 // is the whole point. The dispatch-free read-set enumeration must see them,
 // because "do not dial this" and "cannot enumerate this" are different
-// questions with different right answers (#504).
+// questions with different right answers (#504). It carries no rendered path:
+// that holds the values the guard refused, escaped or not (#1185 item C).
 type skippedOption struct {
-	path   string
 	reason skipReason
 }
 
@@ -96,8 +96,8 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		if ok {
 			all = append(all, el)
 		} else {
-			recordMalformedDialSkip(log, in.Name, el.Path, sr)
-			skips = append(skips, skippedOption{path: el.Path, reason: sr})
+			recordMalformedDialSkip(log, in.Name, in.Path, sr)
+			skips = append(skips, skippedOption{reason: sr})
 		}
 		return
 	}
@@ -135,8 +135,8 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 	for _, sa := range elems {
 		el, ok, sr := createRequestOptionWith(in, pt, sa, apiserver)
 		if !ok {
-			recordMalformedDialSkip(log, in.Name, el.Path, sr)
-			skips = append(skips, skippedOption{path: el.Path, reason: sr})
+			recordMalformedDialSkip(log, in.Name, in.Path, sr)
+			skips = append(skips, skippedOption{reason: sr})
 			continue
 		}
 		all = append(all, el)
@@ -153,14 +153,18 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 // coordinate-shape triage, mirroring the C-3 empty-iterator precedent (a
 // "nothing sensible to call" continue is benign + data-dependent — DEBUG, never
 // the WARN-floor firehose).
-func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason) {
+//
+// The line names the stage's TEMPLATE, the author's text, never the rendered
+// path: a refused path holds the caller's values, and escaping one does not
+// hide it (#1185 item C). The template and the reason say which segment to read.
+func recordMalformedDialSkip(log *slog.Logger, name, pathTemplate string, sr skipReason) {
 	// Two-tier (pm-1217): the bounded CLASS key drives the per-reason metric (what
 	// a spike alert needs — 3 fixed compile-time keys, no per-path cardinality); the
 	// finer sub-reason DETAIL rides the DEBUG line for coordinate-shape triage.
 	bumpMalformedDialSkipped(sr.class)
 	log.Debug("skipping api call: "+sr.detail+" — not dialing",
 		slog.String("name", name),
-		slog.String("path", path),
+		slog.String("path_template", pathTemplate),
 		slog.String("reason_class", sr.class),
 		slog.String("reason", sr.detail),
 	)
@@ -170,10 +174,10 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 // and the per-call data `ds`. The second return is the VALIDITY verdict: false
 // means the call must NOT be appended or dialled — a template failed (#293
 // unrendered ${...}, #302 a jq error in the path, payload or header), the
-// path template refused a value or rendered no path (#1123), or, on an
-// apiserver stage (apiserver=true), the rendered path is a malformed
-// single-object apiserver path (#288: an interpolated name/namespace segment
-// collapsed to empty, or is DNS-1123-invalid — e.g. a trailing '-').
+// path template refused a value (#1123, #1185) or rendered no path (#1123), or,
+// on an apiserver stage (apiserver=true), the rendered path is a malformed
+// single-object apiserver path (#288: an empty segment an author wrote, or a
+// name/namespace that is DNS-1123-invalid — e.g. a trailing '-').
 // valid=true for well-formed paths AND for out-of-scope paths (external URLs,
 // LIST paths).
 func createRequestOption(in *templates.API, ds any, apiserver bool) (out httpcall.RequestOptions, valid bool, sr skipReason) {
@@ -219,27 +223,32 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		}
 	}
 
+	if pathtemplate.IsEmptySegment(pathErr) {
+		// #1185 — a value left a path segment empty: dialled, the path would
+		// name something wider than the template meant (`DELETE /v2/tickets/`
+		// from `"/v2/tickets/" + .id`). Refused on every verb, whatever the stage
+		// dials. It is the #288 collapse, read from the template's pieces, so it
+		// is that class: inspect enumerates it from the skeleton (#504).
+		return out, false, skipReason{class: reasonEmptyInterp, detail: pathErr.Error(), collapsed: true}
+	}
 	if pathErr != nil && pathtemplate.IsRefused(pathErr) {
 		// #1123 — a value tried to be more than one segment, or a '.'/'..'
 		// segment. Never dialed. The refusal names the rule, never the value.
-		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonPathValueRefused, detail: pathErr.Error()}
 	}
 	if pathErr != nil {
 		// #293 sub-case 2: the path jq expression ERRORED. evalJQE surfaces the
 		// error (evalJQ would have masqueraded it as the path string and dialed it
 		// as a garbage apiserver path → 404). Mark invalid so the caller SKIPS the
-		// dial; the error text is surfaced in out.Path for the skip DEBUG only,
-		// never dialed.
-		out.Path = pathErr.Error()
+		// dial; the error text rides skipReason.detail, never the wire.
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
 	}
-	// #1123 — a template that rendered no path names nothing to call: every value
-	// it spliced was null (`${ segments(.path) }` with .path missing, which is
-	// what a nil-extras prewarm renders), "", or it produced no output. Dialled,
-	// it would read the endpoint's root with the stage's credential. It is the
-	// #288 collapse at its limit, whatever the stage dials. A stage with no
-	// template (in.Path == "") has no value to lose and keeps its meaning.
+	// #1123 — a template that rendered no path names nothing to call: it produced
+	// no output (`${ empty }`) or holds nothing but an empty literal (a value
+	// that rendered empty is refused above, #1185). Dialled, it would read the
+	// endpoint's root with the stage's credential. It is the #288 collapse at its
+	// limit, whatever the stage dials. A stage with no template (in.Path == "")
+	// has no value to lose and keeps its meaning.
 	if path == "" && in.Path != "" {
 		return out, false, skipReason{class: reasonEmptyInterp, detail: "the path template rendered no path (#1123)", collapsed: true}
 	}
@@ -280,7 +289,10 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 // segment its template meant to fill: the refusal that applies to EVERY dial,
 // this cluster's apiserver and a named endpoint alike (#288, split by #1112 D2).
 // A missing segment is malformed for any REST endpoint, and the shapes refused
-// here are the ones whose dial would silently mean something wider:
+// here are the ones whose dial would silently mean something wider. A VALUE that
+// left a segment empty does not get here: the template refuses it first, wherever
+// the segment is and on every verb (#1185). What gets here is text with no value
+// behind it: an author's literal, or a path with no template.
 //   - an UNRENDERED "${" template (#293 sub-case 1; a genuine URL never carries
 //     "${");
 //   - a COLLAPSED empty namespace segment (`/api/v1/namespaces//configmaps/...`),
@@ -294,21 +306,20 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 //     anyway, by servedAsWritten (#1137): validInterpolatedPath runs both. That
 //     includes a proxy subresource carrying a URL
 //     (`.../services/svc/proxy/http://h/x`), which is refused there;
-//   - a collapsed trailing NAME on a mutating verb: an apiserver-shaped path
-//     whose last segment rendered empty, leaving a trailing "/"
-//     (`DELETE .../rolebindings/` from `".../rolebindings/" + .name`): dialled,
-//     a by-name DELETE becomes a COLLECTION delete (blast radius). The check
-//     reads the RAW rendered path (query-stripped) BEFORE ParseAPIServerPathToDep's
-//     internal TrimRight erases the slash.
+//   - a trailing "/" on a mutating verb: an apiserver-shaped path whose last
+//     segment is empty (`DELETE .../rolebindings/`): dialled, it is a COLLECTION
+//     delete (blast radius). The check reads the RAW rendered path
+//     (query-stripped) BEFORE ParseAPIServerPathToDep's internal TrimRight erases
+//     the slash.
 //
 // Two residuals, both fail SAFE (reject rather than over-dial):
 //   - a collection write deliberately written WITH a trailing slash
 //     (`.../configmaps/`, no interpolation) is false-rejected; RAs write the
 //     collection path without the trailing slash, so this is rare;
-//   - a name that collapses BEFORE a subresource (`.../resource//subresource`, a
-//     mid-path "//") is NOT caught HERE: the targeted "/namespaces//" key avoids
-//     the general "//" for a named endpoint's sake (above). On this cluster's
-//     apiserver, servedAsWritten (#1137) refuses it as an empty segment.
+//   - a mid-path "//" in an author's text (`.../resource//subresource`) is NOT
+//     caught HERE: the targeted "/namespaces//" key avoids the general "//" for a
+//     named endpoint's sake (above). On this cluster's apiserver, servedAsWritten
+//     (#1137) refuses it as an empty segment.
 func collapsedPath(path, verb string) (bool, skipReason) {
 	if unrenderedTemplate(path) {
 		return false, unrenderedTemplateSkip

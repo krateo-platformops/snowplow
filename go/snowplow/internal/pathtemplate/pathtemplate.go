@@ -28,6 +28,23 @@
 // refused: the value or the template would walk the request out of the
 // resource the template names.
 //
+// A value that leaves a path segment empty is refused too (#1185), on every
+// verb and whatever the stage dials: `"/v2/tickets/" + .id` with .id "" or null
+// would name the collection, not one ticket. The rule reads the pieces, not the
+// rendered string. A segment is refused when a value was spliced into it and it
+// holds nothing, so:
+//
+//   - a value empty inside a segment that has other text is not an empty
+//     segment (`"/configmaps/" + .plural + "-" + .version + "-jsonschema"`);
+//   - the query and the fragment hold no segments (`"/x?q=" + .v` is fine);
+//   - no value, no refusal: `if .pl == "" then "" else "/" + .pl end` splices no
+//     empty value, and a `/` or `//` the author wrote stays the author's text.
+//     This rule neither refuses nor excuses it: the stage's dial guard judges it
+//     as it judges any literal;
+//   - a value is empty when it renders nothing. Whitespace renders `%20`: like
+//     the dot check, this rule compares the segment exactly and trims nothing.
+//     A dial that takes no escape refuses it there (validInterpolatedPath).
+//
 // "Spliced" is syntactic, and it is what an author reads in the program:
 //
 //   - an operand of `+` next to a template (`"/tickets/" + .id`);
@@ -60,13 +77,16 @@
 //
 // The edges of segments(E), which are the contract an author writes against:
 //
-//   - E null: contributes nothing, like jq's `+ null`, and the template's own
-//     text stays (`"/a/" + segments(.p) + "/z"` renders `/a//z`). With no text
-//     around it the render is "" and the dial plan refuses it: a path that
-//     renders empty is never dialled (createRequestOption);
-//   - E "": the same render as null, one empty piece;
-//   - an inner empty piece (`a//b`) is kept: the value said so, and the dial
-//     guard of the stage judges it (an own-cluster `/namespaces//` is refused);
+//   - E null or "": one empty piece, so an empty segment, refused like any other
+//     value. segments() does not make a value optional: the template's own `/`
+//     stays, and `"/a/" + segments(.p)` would still name `/a/`. An optional part
+//     is written so that no empty value is spliced (`if .p == "" then "" else
+//     "/" + .p end`), or gated by the stage's iterator, which then yields no
+//     element and has nothing to call;
+//   - each piece is one segment, so an empty piece is refused wherever it is:
+//     inside (`a//b`), at the end (`a/`), or a value that is only `/`. The one
+//     `/` that is not a boundary between pieces is the leading `/` of a value
+//     that opens the path (`${ segments(.path) }` with `/apis/apps/v1`): the root;
 //   - E not a string (a number, a boolean, an array, an object): a render
 //     error, never a tostring;
 //   - segments() in the query is refused whatever E is, null included: the
@@ -129,6 +149,7 @@ const (
 	ReasonValueSpansSegments = "value_spans_segments"
 	ReasonDotSegment         = "dot_segment"
 	ReasonSegmentsInQuery    = "segments_in_query"
+	ReasonEmptySegment       = "empty_segment"
 )
 
 // RefusedError is a path the template rendered but that must not be dialed:
@@ -146,6 +167,8 @@ func (e *RefusedError) Error() string {
 		return "path template: the rendered path has a '.' or '..' segment"
 	case ReasonSegmentsInQuery:
 		return "path template: segments() is spliced into the query; it declares path segments"
+	case ReasonEmptySegment:
+		return "path template: a value spliced into the path left a segment empty (write an optional part so that no empty value is spliced, or gate it with an iterator)"
 	default:
 		return "path template: refused (" + e.Reason + ")"
 	}
@@ -155,6 +178,13 @@ func (e *RefusedError) Error() string {
 func IsRefused(err error) bool {
 	var r *RefusedError
 	return errors.As(err, &r)
+}
+
+// IsEmptySegment reports whether err is the refusal of a value that left a path
+// segment empty (#1185).
+func IsEmptySegment(err error) bool {
+	var r *RefusedError
+	return errors.As(err, &r) && r.Reason == ReasonEmptySegment
 }
 
 var (
@@ -715,6 +745,7 @@ func assemble(v any) (string, error) {
 		return "", errNotString
 	}
 	var b strings.Builder
+	var segs segmentWatch
 	pos := inPath
 	for _, e := range parts {
 		k, p, ok := partOf(e)
@@ -727,7 +758,10 @@ func assemble(v any) (string, error) {
 			return "", &RefusedError{Reason: ReasonSegmentsInQuery}
 		}
 		if p == nil && k != "" {
-			continue // jq's `+ null`
+			if pos == inPath {
+				segs.value("") // jq's `+ null`: a value that rendered nothing
+			}
+			continue
 		}
 		s, ok := p.(string)
 		if !ok {
@@ -735,6 +769,9 @@ func assemble(v any) (string, error) {
 		}
 		switch k {
 		case "":
+			if pos == inPath {
+				segs.literal(s)
+			}
 			b.WriteString(s)
 			pos = advance(pos, s)
 		case partValue, partInterp:
@@ -742,6 +779,7 @@ func assemble(v any) (string, error) {
 				if strings.Contains(s, "/") {
 					return "", &RefusedError{Reason: ReasonValueSpansSegments}
 				}
+				segs.value(s)
 				b.WriteString(url.PathEscape(s))
 			} else {
 				b.WriteString(EscapeQueryValue(s))
@@ -751,21 +789,81 @@ func assemble(v any) (string, error) {
 				if dec, err := url.PathUnescape(s); err != nil || strings.Contains(dec, "/") {
 					return "", &RefusedError{Reason: ReasonValueSpansSegments}
 				}
+				segs.value(s)
 			}
 			b.WriteString(s)
 		case partSegments:
-			segs := strings.Split(s, "/")
-			for i, seg := range segs {
-				segs[i] = url.PathEscape(seg)
+			if b.Len() == 0 && strings.HasPrefix(s, "/") {
+				// The root of a value that opens the path, not a boundary
+				// between two pieces.
+				segs.literal("/")
+				b.WriteByte('/')
+				s = s[1:]
 			}
-			b.WriteString(strings.Join(segs, "/"))
+			for i, piece := range strings.Split(s, "/") {
+				if i > 0 {
+					segs.end()
+					b.WriteByte('/')
+				}
+				segs.value(piece)
+				b.WriteString(url.PathEscape(piece))
+			}
 		}
+	}
+	if pos == inPath {
+		segs.end()
 	}
 	out := b.String()
 	if hasDotSegment(out) {
 		return "", &RefusedError{Reason: ReasonDotSegment}
 	}
+	if segs.emptied {
+		return "", &RefusedError{Reason: ReasonEmptySegment}
+	}
 	return out, nil
+}
+
+// segmentWatch follows the path part as assemble writes it, piece by piece, and
+// records a segment that a value left empty (#1185). It sees what the rendered
+// string cannot: `/a/` from `"/a/" + .id` and `/a/` as the author wrote it are
+// the same text, and only the first lost a value.
+type segmentWatch struct {
+	text    bool // the current segment holds text
+	spliced bool // a value was spliced into the current segment
+	emptied bool // a finished segment had a value spliced into it and holds nothing
+}
+
+// literal takes author text that lands in the path part. Its first '?' or '#'
+// ends the path (advance's rule), and with it the current segment.
+func (w *segmentWatch) literal(s string) {
+	cut := strings.IndexAny(s, "?#")
+	if cut >= 0 {
+		s = s[:cut]
+	}
+	for {
+		seg, rest, more := strings.Cut(s, "/")
+		w.text = w.text || seg != ""
+		if !more {
+			break
+		}
+		w.end()
+		s = rest
+	}
+	if cut >= 0 {
+		w.end()
+	}
+}
+
+// value takes one value spliced into the current segment; s is what it rendered.
+func (w *segmentWatch) value(s string) {
+	w.spliced = true
+	w.text = w.text || s != ""
+}
+
+// end finishes the current segment.
+func (w *segmentWatch) end() {
+	w.emptied = w.emptied || (w.spliced && !w.text)
+	w.text, w.spliced = false, false
 }
 
 // advance moves the position past a literal: the first '?' in the path ends

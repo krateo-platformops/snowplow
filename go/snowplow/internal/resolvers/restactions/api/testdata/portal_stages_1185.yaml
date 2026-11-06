@@ -1,0 +1,56 @@
+# The portal stages #1185 names, one from each class of the measurement on the
+# issue: `path` and `dependsOn` as helm template renders them from portal tag
+# 1.8.93 (889f64acff0e0e11d45f907531ee952457e6f40d), charts compositions-page
+# and dashboard-page, unedited. The rest of each stage is not read here.
+- ra: composition-architecture
+  stage: objs
+  dependsOn:
+    name: comp
+    iterator: |
+      def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+      def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+        | if ($p[1] // "") == "apis" then true
+          elif ($p[1] // "") == "api" then
+            ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+            | ($res == "" or (fetchableCore | index($res)) != null)
+          else false end;
+      def fetchableTarget: (tostring | select(fetchablePath and (test("[?#%\\\\]") | not))) as $path | ($path | split("/")) as $p
+        | (if ($p[1] // "") == "api" then { g: "", v: ($p[2] // ""), r: $p[3:] } else { g: ($p[2] // ""), v: ($p[3] // ""), r: $p[4:] } end) as $t
+        | (if ($t.r[0] // "") == "namespaces" and ($t.r | length) > 2 then { ns: $t.r[1], r: $t.r[2:] } else { ns: "", r: $t.r } end) as $n
+        | { g: $t.g, v: $t.v, ns: $n.ns, pl: ($n.r[0] // ""), nm: ($n.r[1] // "") } as $o
+        | select(($n.r | length) <= 2 and $o.v != "" and ([$o.g, $o.v, $o.ns, $o.pl, $o.nm] | all(. != "." and . != "..")))
+        | select(((if $o.g == "" then "/api/" + $o.v else "/apis/" + $o.g + "/" + $o.v end) + (if $o.ns == "" then "" else "/namespaces/" + $o.ns end) + (if $o.pl == "" then "" else "/" + $o.pl end) + (if $o.nm == "" then "" else "/" + $o.nm end)) == $path)
+        | $o;
+      . as $r
+      | ($r.comp[0].managed // []) as $m
+      | [ ($r.arch.graph.nodes // [])[]
+          | select(.present == true and ((.lifecycle // "") == "")) as $nd
+          | $nd.names[] as $nm
+          | $m[] | select(.name == $nm and .apiVersion == $nd.apiVersion and .path != "")
+          | (.path | fetchableTarget) ]
+      | unique
+  path: ${ (if .g == "" then "/api/" + .v else "/apis/" + .g + "/" + .v end) + (if .ns == "" then "" else "/namespaces/" + .ns end) + (if .pl == "" then "" else "/" + .pl end) + (if .nm == "" then "" else "/" + .nm end) }
+- ra: composition-architecture
+  stage: arch
+  dependsOn:
+    name: ''
+    iterator: '[ { namespace: ((.compositionNamespace // .namespace) // ""), name: ((.compositionName // .name) // "") } | select(.namespace != "" and .name != "") ]'
+  path: ${ "/api/v1/namespaces/" + .namespace + "/configmaps/" + .name + "-architecture" }
+- ra: composition-editdef
+  stage: jsonschema
+  dependsOn:
+    name: found
+    iterator: .name as $n | .namespace as $ns | ([ .found[]? | select((try (.metadata.name == $n and .metadata.namespace == $ns) catch false)) ][0].kind // "") as $k | [ .crds[]? | select((try ($k != "" and .kind == $k) catch false)) ]
+  path: ${ "/api/v1/namespaces/" + .cdNamespace + "/configmaps/" + .plural + "-" + .version + "-jsonschema-configmap" }
+- ra: composition-detail
+  stage: found
+  dependsOn:
+    name: crds
+    iterator: if (.namespace // "") == "" or (.name // "") == "" then [] else [ .crds | arrays | .[] | objects ] | unique_by([.version, .plural]) end
+  path: ${ "/apis/composition.krateo.io/" + .version + "/" + .plural }
+- ra: dashboard-data
+  stage: allCompositions
+  dependsOn:
+    name: crds
+    iterator: .crds
+  path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }

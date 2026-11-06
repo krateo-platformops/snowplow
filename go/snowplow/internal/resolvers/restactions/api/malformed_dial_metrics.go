@@ -25,9 +25,9 @@ import (
 // #293/#302 reason keys — the canonical, stable metric label values (also the
 // DEBUG "reason" field). Distinct owners/urgencies, so per-reason attribution
 // matters:
-//   - empty_interp        (#288) empty / DNS-1123-invalid segment, or (#1123) a
-//     template that rendered no path at all — a key-minting / interpolation
-//     regression;
+//   - empty_interp        (#288) empty / DNS-1123-invalid segment, (#1185) a value
+//     that left a path segment empty, or (#1123) a template that rendered no
+//     path at all — a key-minting / interpolation regression;
 //   - unrendered_template (#293) a literal ${...} survived render — an
 //     RA-authoring / unresolved-template fault;
 //   - jq_path_error       (#293) the path jq expression errored — a jq fault;
