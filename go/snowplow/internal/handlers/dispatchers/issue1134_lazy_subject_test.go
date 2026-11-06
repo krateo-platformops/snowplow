@@ -5,38 +5,53 @@
 // requester's subject is a keyed digest (cache.StaleSubject, ~9 allocations);
 // NoteStaleHit derives it only when a serve opens, so a fresh hit — nearly
 // every hit — allocates nothing for it. That property was pinned only inside
-// NoteStaleHit: a hit site that computed staleSubjectOf(ctx) eagerly and
-// wrapped the result in a closure passed every arm.
+// NoteStaleHit: a hit site that computed the digest eagerly and wrapped the
+// result in a closure passed every arm.
 //
-// The digest is counted where every hit site derives it (staleSubjectOf,
-// staleSubjectHookForTest): the handler allocates on its own, so a whole-hit
-// AllocsPerRun has no baseline that excludes the digest, while a derivation
-// that does not happen allocates nothing. Sites: the RESTAction L1 hit
-// (restactions.go), the per-cohort widgets L1 hit and the identity-free
-// widgetContent shell hit (widgets.go).
+// TWO PINS, because no counter reaches the whole class.
+//
+//   - The digest is counted at the digest, inside cache.StaleSubject
+//     (SetStaleSubjectHookForTest), so an eager cache.StaleSubject is seen
+//     whether or not it goes through staleSubjectOf. The handler allocates on
+//     its own, so a whole-hit AllocsPerRun has no baseline that excludes the
+//     digest, while a derivation that does not happen allocates nothing.
+//   - Nothing below StaleSubject can be counted: it is redact.User, and a fresh
+//     hit pays redact.User for its own log labels (beginPerCall's user field is
+//     built before slog reads the level), so a count there is never 0. The
+//     structural arm closes that gap: every production NoteStaleHit call hands
+//     over staleSubjectOf itself, so no closure over an eager value of any
+//     origin can reach it.
+//
+// Sites: the RESTAction L1 hit (restactions.go), the per-cohort widgets L1 hit
+// and the identity-free widgetContent shell hit (widgets.go).
 //
 // Mutation → RED: at any one of the three sites, an eager staleSubjectOf(ctx)
-// wrapped in a closure; or staleHitWritePoint doing the same.
+// or cache.StaleSubject wrapped in a closure, or staleHitWritePoint doing the
+// same (the count); an eager redact.User wrapped in a closure (the structural
+// arm).
 package dispatchers
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
-// k1134Derivations counts staleSubjectOf calls while installed.
+// k1134Derivations counts cache.StaleSubject calls while installed.
 func k1134Derivations(t *testing.T) *atomic.Int64 {
 	t.Helper()
 	n := &atomic.Int64{}
-	f := func() { n.Add(1) }
-	staleSubjectHookForTest.Store(&f)
-	t.Cleanup(func() { staleSubjectHookForTest.Store(nil) })
+	t.Cleanup(cache.SetStaleSubjectHookForTest(func() { n.Add(1) }))
 	return n
 }
 
@@ -129,4 +144,50 @@ func TestIssue1134_AFreshArmedHitDerivesNoRequesterDigest(t *testing.T) {
 			t.Fatalf("control: a stale armed hit opens one serve (%d) and derives the digest once (%d)", s.Serves, n.Load())
 		}
 	})
+}
+
+// TestIssue1134_EveryHitSiteHandsNoteStaleHitTheLazyDerivation is the structural
+// pin: the only subject function a production hit site may hand to
+// cache.NoteStaleHit is staleSubjectOf itself, read from the package's source.
+// The derivation count above cannot see an eager redact.User in a closure (see
+// the file comment); this sees any closure, whatever it calls. The call count
+// keeps a renamed or moved site from passing with nothing inspected.
+func TestIssue1134_EveryHitSiteHandsNoteStaleHitTheLazyDerivation(t *testing.T) {
+	const wantSites = 2 // staleHitWritePoint (both L1 hits), the widgetContent shell hit
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("PRECONDITION: read the package source: %v", err)
+	}
+	fset := token.NewFileSet()
+	sites := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("PRECONDITION: parse %s: %v", name, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "NoteStaleHit" {
+				return true
+			}
+			sites++
+			last := call.Args[len(call.Args)-1]
+			if id, ok := last.(*ast.Ident); !ok || id.Name != "staleSubjectOf" {
+				t.Errorf("RED (%s): NoteStaleHit must be handed staleSubjectOf itself: anything else can carry a digest derived on every hit",
+					fset.Position(call.Pos()))
+			}
+			return true
+		})
+	}
+	if sites != wantSites {
+		t.Fatalf("PRECONDITION: %d NoteStaleHit call(s) in the package, want %d: a new hit site needs an arm above", sites, wantSites)
+	}
 }

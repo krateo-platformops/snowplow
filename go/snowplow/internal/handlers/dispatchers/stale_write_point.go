@@ -21,7 +21,6 @@ package dispatchers
 import (
 	"context"
 	"net/http"
-	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 
@@ -83,21 +82,12 @@ func staleHitWritePoint(ctx context.Context, key string, entry *cache.ResolvedEn
 // (and a widgetContent key by everyone), so the key alone never names the
 // client. "" when ctx carries no identity.
 func staleSubjectOf(ctx context.Context) string {
-	if f := staleSubjectHookForTest.Load(); f != nil {
-		(*f)()
-	}
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		return ""
 	}
 	return cache.StaleSubject(ui.Username)
 }
-
-// staleSubjectHookForTest observes every derivation of a requester's subject
-// (one keyed digest, ~9 allocations): #1134 pins that a fresh armed hit, at
-// every hit site, derives none. Atomic: the refresher's goroutines can derive
-// one while an arm installs it. Nil in production.
-var staleSubjectHookForTest atomic.Pointer[func()]
 
 // staleRerunHookForTest observes the ResponseWriter at the moment of the
 // re-run (D2-15d: nothing may have been written to it yet). Nil in production.
