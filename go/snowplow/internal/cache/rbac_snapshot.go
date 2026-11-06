@@ -1330,8 +1330,13 @@ func RebuildSubjectIndexesForTest(s *RBACSnapshot) {
 // RebuildRBACSnapshotForTest publicly exposes a synchronous snapshot
 // rebuild for tests. Production code uses `scheduleRBACRebuild` (which
 // is asynchronous, bounded, and dirty-flag-coalesced) — never this.
+//
+// #1206 — through the writer slot, like every other publish. A rebuild outside
+// it races one the informers' events started: that one read the indexers first
+// and can Store last, so a snapshot with a newer PublishSeq and older content
+// overwrites this one until the next rebuild. It is the #687 race, in a test.
 func RebuildRBACSnapshotForTest(rw *ResourceWatcher) {
-	rebuildRBACSnapshot(rw)
+	publishRBACSnapshotUnderSlot(rw)
 }
 
 // WaitInitialRBACPublishForTest blocks until THIS watcher's initial RBAC-snapshot
