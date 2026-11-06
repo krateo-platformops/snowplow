@@ -771,6 +771,9 @@ type stageCtx struct {
 	wireVerbose bool
 	ep          endpoints.Endpoint
 	calls       []httpcall.RequestOptions
+	// thirdPartyDial: this stage's dial carries nothing of the requester, so a
+	// touch of it may qualify for the external-TTL opt-in (#1221, runStage).
+	thirdPartyDial bool
 	// sent counts the items that reached the send (branch E, the one place a
 	// write leaves snowplow). #1112 D2: a write stage that sent fewer than it
 	// planned and recorded no failure fails with NotSent (failUnsentWrites).
@@ -1543,7 +1546,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		return nil
 	}
 	sc.sent.Add(1)
-	cache.ExternalTouchedSinkFromContext(gctx).Bump()
+	if sc.thirdPartyDial {
+		cache.ExternalTouchedSinkFromContext(gctx).BumpThirdParty()
+	} else {
+		cache.ExternalTouchedSinkFromContext(gctx).Bump()
+	}
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
 	recordExternalFetch(gctx)
@@ -1833,6 +1840,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// (UAF stages resolve to the SA endpoint at resolveStageEndpoint:385,
 	// never an external/loopback ref, so the `!uafActive` guard is preserved
 	// EXACTLY — UAF is untouched by the #57 self-loopback arm.)
+	requesterBearer := false
 	if !uafActive {
 		if accessToken, _ := xcontext.AccessToken(r.ctx); accessToken != "" {
 			// The append fires iff the stage sets `exportJwt: true` OR the
@@ -1846,6 +1854,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			// bearerAppendForStage's doc (self_host.go): read it there, not
 			// here (#794).
 			if bearerAppendForStage(apiCall, ep, isSA) {
+				requesterBearer = true
 				// 0.30.164: stage-local Headers — never write the user
 				// bearer back into the shared CR slice (the CR is marshaled
 				// into the /call response body at restactions.go:149; an
@@ -2030,6 +2039,12 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		wireVerbose: wireVerbose,
 		ep:          ep,
 		calls:       tmp,
+		// #1221 — PROVENANCE, never endpoint shape: a held credential is the SA or
+		// the requester's own clientconfig, and #1025 keeps a named ref off every
+		// per-user credential, so not held is a named endpoint's own credential. A
+		// requester bearer (exportJwt, the self-loopback) puts the requester on that
+		// dial all the same. Either way the answer can depend on who asked.
+		thirdPartyDial: !heldCred && !requesterBearer,
 	}
 
 	for i := range tmp {

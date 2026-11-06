@@ -534,7 +534,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// The shared Put-gate verdict (cache.PutGateVerdict), twin of
 		// restactions.go, with the widget's opt-in external-TTL cache applied
 		// (WithExternalTTL: it turns an external-ONLY decline into a store, and
-		// never a declared write (#915) or a stage error). Every decline ends
+		// never a declared write (#915), a stage error, or a touch that carried
+		// anything of the requester (#1221)). Every decline ends
 		// here; the reason only picks the log line and the counter.
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
