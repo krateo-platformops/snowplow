@@ -37,6 +37,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -121,6 +122,16 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is424(t *testing.T) {
 	f := in443Setup(t, ra)
 	i709Serve404(f)
 	alice := in443Ctx(f, psAlice)
+	// #1034 — apiref.Resolve reads the RESTAction through objects.Get, which
+	// serves it from the restactions informer only once that informer is
+	// registered AND synced. Until then it falls through to the apiserver, and
+	// the fake apiserver does not hold the RESTAction: that read is answered with
+	// the apiserver's own generic 404 ("the server could not find the requested
+	// resource"), which is a NotFound about the RESTAction, not the stage's 404
+	// this arm is about. The first resolve is what lazily registers the
+	// informer, so whether the second one is informer-served was a race with the
+	// informer's initial sync. Register it and wait for that sync, as #729 does.
+	i709SyncRESTActionInformer(t)
 
 	// The apiRef frame itself (the "resolve apiRef …" error in the issue).
 	_, err := apiref.Resolve(alice, apiref.ResolveOptions{
@@ -135,6 +146,11 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is424(t *testing.T) {
 	var se *apierrors.StatusError
 	if !errors.As(err, &se) || !apierrors.IsNotFound(err) {
 		t.Fatalf("#709 RED: want a typed 404 NotFound, got %T: %v", err, err)
+	}
+	// The 404 must be the STAGE's: a NotFound for the RESTAction itself is
+	// also a typed 404, so the code alone cannot tell the two apart.
+	if msg := se.ErrStatus.Message; !strings.Contains(msg, `"agents.kagent.dev" not found`) || !strings.Contains(msg, `stage "crd"`) {
+		t.Fatalf("#709: the apiRef 404 must name the stage and the missing resource, got %q", msg)
 	}
 
 	// The widget /call handler answers with it. widgets.Resolve wraps an apiRef
@@ -175,6 +191,27 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is424(t *testing.T) {
 	msg, _ := st["message"].(string)
 	if !strings.Contains(msg, `"agents.kagent.dev" not found`) || !strings.Contains(msg, `stage "crd"`) {
 		t.Fatalf("the message must name the stage and the missing resource, got %q", msg)
+	}
+}
+
+// i709SyncRESTActionInformer registers the restactions informer on the
+// harness watcher and waits for its initial sync, so every objects.Get of the
+// RESTAction is informer-served (see A2).
+func i709SyncRESTActionInformer(t *testing.T) {
+	t.Helper()
+	rw := cache.Global()
+	if rw == nil {
+		t.Fatal("PRE: the harness watcher must be installed")
+	}
+	if _, ch := rw.EnsureResourceType(h1RAGVR); ch != nil {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("restactions informer did not sync")
+		}
+	}
+	if !rw.IsServable(h1RAGVR) {
+		t.Fatal("PRE: the restactions informer must be servable")
 	}
 }
 

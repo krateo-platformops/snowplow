@@ -114,6 +114,21 @@ func r378RefreshDrift() map[string]int64 {
 func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 	const ttlS, maxAgeS = 4, 6 // L = min(4, 3) = 3s → lead window [3s, 6s)
 	e := r378Setup(t, ttlS, maxAgeS, 0, r378RotObjects()...)
+	// #1034 — the production world, explicitly: the bindings index is built
+	// (the boot seed builds it), so carol's binding ADD bumps her sub-generation
+	// as well as changing her binding set. Left implicit, this arm ran in
+	// whatever state an earlier arm of the package left the process-wide index
+	// in, and its key move came in one step or in two (below).
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
+	// Then settle RBAC: no rebuild in flight (an earlier arm's included), and
+	// every sub-gen bump already recorded flushed by one synchronous rebuild. From
+	// here carol's key inputs move only on this arm's own binding ADD.
+	if err := cache.Global().WaitRBACQuiescentForTest(5 * time.Second); err != nil {
+		t.Fatalf("SETUP: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(cache.Global())
 	carol, dave := psUserCtx(e.a, psCarol), psUserCtx(e.a, psDave)
 	c := cache.ResolvedCache()
 
@@ -125,7 +140,7 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 		}
 		return rec.body
 	}
-	K, _ := r378RotKey(t, carol)
+	K, carolIn0 := r378RotKey(t, carol)
 	if kd, _ := r378RotKey(t, dave); kd != K {
 		t.Fatalf("PRE: carol and dave must share one cell")
 	}
@@ -154,8 +169,26 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 		&unstructured.Unstructured{Object: m}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("binding ADD: %v", err)
 	}
+	// The key moves on TWO inputs, and they need not land in one publish: the
+	// binding set is read from the snapshot, while the sub-gen bump the ADD
+	// records is flushed by the rebuild whose indexer read follows it (#703), so
+	// a rebuild already in flight can publish the new binding set first and the
+	// next one bump the sub-gen. Waiting for the first move took that
+	// intermediate key as K′; the reseed then (rightly) inserted carol's final
+	// key, and "K′" was absent. In the failing runs carol's key had moved again
+	// by the time of the reseed, and the reseed's own Put was accepted under the
+	// final key. Wait for both inputs of carol's key to move.
+	set0, subGen0 := carolIn0.SubjectBindingSet, carolIn0.RBACSubGen
 	var Kp string
-	if !i444Wait(5*time.Second, func() bool { Kp, _ = r378RotKey(t, carol); return Kp != K }) {
+	var KpIn *cache.ResolvedKeyInputs
+	if !i444Wait(5*time.Second, func() bool {
+		Kp, KpIn = r378RotKey(t, carol)
+		return KpIn.SubjectBindingSet != set0 && KpIn.RBACSubGen != subGen0
+	}) {
+		t.Fatalf("PRE: carol's binding set and sub-generation must both move after her binding ADD "+
+			"(set moved=%v, sub-gen %d → %d)", KpIn.SubjectBindingSet != set0, subGen0, KpIn.RBACSubGen)
+	}
+	if Kp == K {
 		t.Fatalf("PRE: carol's key must move after her binding ADD")
 	}
 	if kd, _ := r378RotKey(t, dave); kd != K {
@@ -219,7 +252,8 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 	}
 	entP, ok := c.GetNoTouch(Kp)
 	if !ok {
-		t.Fatalf("#378 F3 KEY: the #258 reseed did not INSERT carol's new-class key K′")
+		kNow, _ := r378RotKey(t, carol)
+		t.Fatalf("#378 F3 KEY: the #258 reseed did not INSERT carol's new-class key K′ (carol derives K′ now: %v)", kNow == Kp)
 	}
 	if entP.BornAt.Before(before) {
 		t.Errorf("#378 F3 KEY: K′ must be a fresh birth (BornAt %v < reseed start %v)", entP.BornAt, before)
