@@ -180,7 +180,7 @@ func TestDrainKeyModel_ChildPutKeyMatchesServeTime(t *testing.T) {
 		"&page=2&perPage=7"
 
 	// Prewarm side: the child's one pagination comes from prewarmPaginationFor.
-	childPg := prewarmPaginationFor(childPath)
+	childPg := prewarmPaginationFor(context.Background(), childPath)
 	childKeyPerPage, childKeyPage := childPg.PerPage, childPg.Page
 	childPutKey, _ := widgetContentL1Key(gvr, ns, name, childKeyPerPage, childKeyPage)
 

@@ -221,6 +221,7 @@ func knownPrewarmPassKind(kind string) bool {
 // logPrewarmPass emits one finished-pass line with the pass's plan, progress,
 // budget and wall time — the shipped (Warn) form of what was Info-only before.
 func logPrewarmPass(level slog.Level, msg string, s prewarmScope, outcome string, p *prewarmPassStats, budget, elapsed time.Duration) {
+	// log-ctx-waiver: worker: the prewarm engine, which no request drives
 	slog.Default().Log(context.Background(), level, msg,
 		slog.String("subsystem", "cache"),
 		slog.String("scope", s.key()),

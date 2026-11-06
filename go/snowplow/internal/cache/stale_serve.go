@@ -317,16 +317,28 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 		s.mu.Unlock()
 		return false
 	}
-	s.state = staleSinkCommitted
-	replaceNow = s.replaceOnCommit
-	served := append([]staleServedRef(nil), s.served...)
-	servedAt := s.servedAt
-	s.mu.Unlock()
-	MarkStaleOwed(s.l1Key)
 	// #1062 — the stale-derived body is about to be written under its armed
 	// key: one apistage stale serve, timed from the D2 serve until the frame
 	// that follows its replacement is written to a stream (stale_push.go).
-	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, servedAt)
+	//
+	// #1198 — BEFORE Committed is visible, under s.mu: DebtCleared starts the
+	// replacement the moment it reads Committed, and a replacing Put that lands
+	// before the serve is open has nothing to mark, so its frame would close
+	// nothing and the overdue scan would report a viewer who has the fresh frame.
+	//
+	// The lock order this adds is s.mu → the ledger's lock, on top of the existing
+	// staleDebtsMu → s.mu (serveStaleWithDebt). It cannot invert: the ledger's lock
+	// is a leaf (stale_push.go), and noteStaleServeNow takes no other lock, so
+	// nothing under s.mu ever waits on staleDebtsMu.
+	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, s.servedAt)
+	s.state = staleSinkCommitted
+	replaceNow = s.replaceOnCommit
+	served := append([]staleServedRef(nil), s.served...)
+	s.mu.Unlock()
+	if fn := staleCommitVisibleHookForTest.Load(); fn != nil {
+		(*fn)()
+	}
+	MarkStaleOwed(s.l1Key)
 	// The stale bodies are now written: count their reads as this request's
 	// hits, exactly once (a withdrawn pass never reaches here), through the one
 	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547
@@ -338,6 +350,21 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 		}
 	}
 	return replaceNow
+}
+
+// staleCommitVisibleHookForTest runs in Commit the moment Committed is visible
+// to DebtCleared, so an arm can complete a whole replacement there (#1198: the
+// serve must already be open). TEST-ONLY (nil in production).
+var staleCommitVisibleHookForTest atomic.Pointer[func()]
+
+// SetStaleCommitVisibleHookForTest installs (nil clears) the hook. TEST-ONLY.
+func SetStaleCommitVisibleHookForTest(fn func()) (restore func()) {
+	var p *func()
+	if fn != nil {
+		p = &fn
+	}
+	prev := staleCommitVisibleHookForTest.Swap(p)
+	return func() { staleCommitVisibleHookForTest.Store(prev) }
 }
 
 // Withdraw is the dispatcher's declined-Put outcome: the stale body is never

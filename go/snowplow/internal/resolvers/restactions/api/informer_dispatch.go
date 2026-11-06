@@ -701,7 +701,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// allocation, pod pinned at 98.75% of a 4-CPU limit with ZERO
 		// users. #578.
 		if cache.ApistageContentResolveFromContext(ctx) {
-			raws, servable := rw.ListRawServable(gvr, namespace)
+			raws, servable := rw.ListRawServable(ctx, gvr, namespace)
 			if !servable {
 				log.Debug("informer_dispatch.fallthrough.list_not_servable",
 					slog.String("gvr", gvr.String()),
@@ -724,7 +724,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			recordListQuery(query)
 			raw, err := marshalAsListRaw(apiVersion, listKindForResource(gvr.Resource), raws)
 			if err != nil {
-				log.Warn("informer_dispatch.list_marshal_failed",
+				log.WarnContext(ctx, "informer_dispatch.list_marshal_failed",
 					slog.String("gvr", gvr.String()),
 					slog.String("ns", namespace),
 					slog.String("shape", "raw"),
@@ -745,7 +745,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			return raw, true, ctx, nil
 		}
 
-		items, servable := rw.ListObjectsServable(gvr, namespace)
+		items, servable := rw.ListObjectsServable(ctx, gvr, namespace)
 		if !servable {
 			log.Debug("informer_dispatch.fallthrough.list_not_servable",
 				slog.String("gvr", gvr.String()),
@@ -816,7 +816,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 
 		raw, err := marshalAsList(apiVersion, listKindForResource(gvr.Resource), items)
 		if err != nil {
-			log.Warn("informer_dispatch.list_marshal_failed",
+			log.WarnContext(ctx, "informer_dispatch.list_marshal_failed",
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", namespace),
 				slog.Any("err", err),
@@ -862,7 +862,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// expects (Status kind, code:404). Serving a synthetic 404 here
 	// would either swallow the shape or duplicate it; the cleanest
 	// contract is "miss = let apiserver answer".
-	obj, hit := rw.GetObject(gvr, namespace, name)
+	obj, hit := rw.GetObject(ctx, gvr, namespace, name)
 	if !hit {
 		log.Debug("informer_dispatch.get_miss_fallthrough",
 			slog.String("gvr", gvr.String()),
@@ -904,7 +904,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 
 	raw, err := json.Marshal(obj.Object)
 	if err != nil {
-		log.Warn("informer_dispatch.get_marshal_failed",
+		log.WarnContext(ctx, "informer_dispatch.get_marshal_failed",
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", namespace),
 			slog.String("name", name),

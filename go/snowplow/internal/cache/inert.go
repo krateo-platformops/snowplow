@@ -67,5 +67,5 @@ func (rw *ResourceWatcher) EnsureResourceTypeFor(ctx context.Context, gvr schema
 	if Inert(ctx) {
 		return false, closedInertCh
 	}
-	return rw.EnsureResourceType(gvr)
+	return rw.ensureResourceType(ctx, gvr)
 }

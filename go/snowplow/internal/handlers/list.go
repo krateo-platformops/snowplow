@@ -45,7 +45,7 @@ func List() http.HandlerFunc {
 
 		ep, err := xcontext.UserConfig(req.Context())
 		if err != nil {
-			log.Error("unable to get user endpoint", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
 			response.Unauthorized(wri, err)
 			return
 		}
@@ -54,7 +54,7 @@ func List() http.HandlerFunc {
 
 		rc, err := credhttp.NewClientConfig(req.Context(), ep)
 		if err != nil {
-			log.Error("unable to create user client config", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to create user client config", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}
@@ -70,7 +70,7 @@ func List() http.HandlerFunc {
 		// context.TODO(), so the page budget is bound to the client.
 		cli, err := dynamic.NewClient(credhttp.BindRequestBudget(req.Context(), rc))
 		if err != nil {
-			log.Error("cannot create dynamic client", slog.Any("err", err))
+			log.ErrorContext(lctx, "cannot create dynamic client", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}
@@ -80,7 +80,7 @@ func List() http.HandlerFunc {
 		res, err := cli.Discover(req.Context(), cat)
 		if err != nil {
 			if credhttp.WriteBudgetError(wri, err) {
-				log.Warn("discovery ended by the page budget", slog.String("category", cat))
+				log.WarnContext(lctx, "discovery ended by the page budget", slog.String("category", cat))
 				return
 			}
 			// #517 — A PARTIAL DISCOVERY IS DEGRADED, NOT FATAL. One stale
@@ -92,14 +92,14 @@ func List() http.HandlerFunc {
 			// whole point of discriminating.
 			pd, partial := dynamic.AsPartialDiscovery(err)
 			if !partial {
-				log.Error("discovery failed", slog.Any("err", err))
+				log.ErrorContext(lctx, "discovery failed", slog.Any("err", err))
 				response.InternalError(wri, err)
 				return
 			}
 			// WARN, because some group/versions genuinely failed: the names are
 			// the actionable datum (they identify the stale APIService), and the
 			// response below is a SHORTER list than the cluster really has.
-			log.Warn("discovery is DEGRADED: serving the healthy API groups only",
+			log.WarnContext(lctx, "discovery is DEGRADED: serving the healthy API groups only",
 				slog.String("category", cat),
 				slog.Any("failedGroups", pd.FailedGroupVersions()),
 				slog.String("cause", pd.Error()))
@@ -116,7 +116,7 @@ func List() http.HandlerFunc {
 
 			obj, err := dynamic.ListObjects(lctx, cli, opts)
 			if err != nil {
-				log.Error("cannot list resources",
+				log.ErrorContext(lctx, "cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))
 				// #1115 — the page budget ran out: a clear 504, never a list
 				// silently missing the GVRs it could not read.

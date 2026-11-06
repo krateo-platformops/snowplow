@@ -407,6 +407,7 @@ func recordDivergence(gvr schema.GroupVersionResource, site string, rep divergen
 	if rep.total() == 0 {
 		return
 	}
+	// log-ctx-waiver: worker: the store verifier, on a reflector LIST or its deadline worker
 	slog.Warn("cache.store.divergent",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),

@@ -273,13 +273,13 @@ func MetaQuerySeeds() []schema.GroupVersionResource {
 //
 // Returns the count newly registered. Nil-receiver / passthrough are
 // no-ops.
-func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
+func (rw *ResourceWatcher) RegisterMetaQuerySeeds(ctx context.Context) int {
 	if rw == nil || rw.mode == modePassthrough {
 		return 0
 	}
 	registered := 0
 	for _, gvr := range MetaQuerySeeds() {
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.ensureResourceType(ctx, gvr)
 		if added {
 			registered++
 		}
@@ -374,7 +374,7 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 
 	for pass := 1; ; pass++ {
 		if ctx.Err() != nil {
-			slog.Warn("cache.phase1.sync_wait_incomplete",
+			slog.WarnContext(ctx, "cache.phase1.sync_wait_incomplete",
 				slog.String("subsystem", "cache"),
 				slog.Int("pass", pass),
 				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
@@ -417,7 +417,7 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 		// The outer budget being exhausted is the hard backstop — surface it
 		// as the existing incomplete warning regardless of pass outcome.
 		if ctx.Err() != nil {
-			slog.Warn("cache.phase1.sync_wait_incomplete",
+			slog.WarnContext(passCtx, "cache.phase1.sync_wait_incomplete",
 				slog.String("subsystem", "cache"),
 				slog.Int("pass", pass),
 				slog.Int("informer_count", countBefore),
