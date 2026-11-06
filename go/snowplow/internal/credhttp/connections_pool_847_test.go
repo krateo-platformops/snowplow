@@ -266,13 +266,34 @@ func TestConnections847_ConcurrentPoolMatchesTheServer(t *testing.T) {
 // #1115: an attempt is cut, its dial goes on, and the retry is handed that
 // connection. One connection on the wire, opened for this request and carrying
 // its first request. GotConnInfo.Reused reads true for it.
+//
+// Nothing here races a clock. The first dial lands only once the retry has dialled
+// too, so the cut has happened and the retry is waiting. The reserve leaves the
+// cut half a second in and the retry 5 s of budget.
 func TestConnections847_ConnectCutRetryHandedItsOwnDial(t *testing.T) {
 	s := newWireServer(t, wirePlain, nil)
-	seedReserve(t, 150*time.Millisecond)
-	d := newScriptedDialer(t, s.Listener.Addr().String(), "slow:800ms", "hang")
+	seedReserve(t, 5*time.Second)
+	retrying, done := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	var dials atomic.Int32
+	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		switch dials.Add(1) {
+		case 1:
+			<-retrying
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		case 2:
+			close(retrying)
+		}
+		<-done // the retry's own dial never lands
+		return nil, errors.New("released")
+	}}
+	t.Cleanup(tr.CloseIdleConnections)
 	before := connCells()
-	if err := tryGet(budgetLeft(900*time.Millisecond), clientOn(d), s.URL); err != nil {
+	if err := tryGet(budgetLeft(5500*time.Millisecond), &http.Client{Transport: tr}, s.URL); err != nil {
 		t.Fatal(err)
+	}
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("%d dials, want 2: the arm did not reach the cut and the retry", n)
 	}
 	s.assertWire(t, 1, 1)
 	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 1})
@@ -329,9 +350,7 @@ func TestConnections847_FailedDialIsNotAConnection(t *testing.T) {
 		}()
 		before := connCells()
 		put(t, &http.Client{Transport: &http.Transport{TLSHandshakeTimeout: 50 * time.Millisecond}}, "https://"+ln.Addr().String())
-		if accepted.Load() != 1 {
-			t.Fatalf("the server accepted %d connections, want 1: the handshake must have started", accepted.Load())
-		}
+		eventually(t, "the handshake had a server to wait for", func() bool { return accepted.Load() == 1 })
 		assertConnDelta(t, before, map[string]uint64{})
 	})
 }
