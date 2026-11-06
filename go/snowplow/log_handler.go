@@ -30,7 +30,9 @@ func buildLogHandler(prettyLog bool, level slog.Level, w io.Writer) slog.Handler
 		AddSource: false,
 		// #1192: no site logs an identity (internal/redact's guard), but the
 		// text of an error can carry one that the apiserver or authn wrote
-		// there. This is the one place every record passes, plumbing's too.
+		// there. Both handlers take the scrub, so it sees every slog record
+		// written through this function, plumbing's too. klog and a context
+		// with no logger write elsewhere (#1223).
 		ReplaceAttr: redact.ScrubLogAttr,
 	}
 	var base slog.Handler

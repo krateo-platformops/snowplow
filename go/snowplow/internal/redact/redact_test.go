@@ -135,6 +135,61 @@ func TestS453_ErrorTextScrubsApiserverIdentity(t *testing.T) {
 	}
 }
 
+// TestS1192_ErrorTextKeepsServiceAccountsOnly pins Diego's ruling on #1199, both
+// ways: a service account's name stays, and a name that only looks like one does
+// not. Every shape below is a name a person's account could hold.
+func TestS1192_ErrorTextKeepsServiceAccountsOnly(t *testing.T) {
+	const person = "sentinel-zq1192"
+	long := strings.Repeat("a", 64)
+	for _, name := range []string{
+		"system:serviceaccount:krateo-system:snowplow",
+		"system:serviceaccount:a:b",
+		"system:serviceaccount:team-1:svc.with.dots",
+		"system:serviceaccount:" + strings.Repeat("a", 63) + ":" + strings.Repeat("b", 253),
+	} {
+		for _, in := range []string{
+			`configmaps is forbidden: User "` + name + `" cannot list`,
+			`users "` + name + `" is forbidden`,
+			`{"message":"pods is forbidden: User \"` + name + `\" cannot list"}`,
+		} {
+			if got := ErrorText(in); got != in {
+				t.Errorf("a service account must stay: %s became %s", in, got)
+			}
+		}
+	}
+	for name, subject := range map[string]string{
+		"the prefix alone":      "system:serviceaccount:",
+		"one segment":           "system:serviceaccount:" + person,
+		"an email in the name":  "system:serviceaccount:team:" + person + "@tenant.example",
+		"an email as one part":  "system:serviceaccount:" + person + "@tenant.example",
+		"three segments":        "system:serviceaccount:team:" + person + ":extra",
+		"an empty namespace":    "system:serviceaccount::" + person,
+		"an empty name":         "system:serviceaccount:" + person + ":",
+		"uppercase":             "system:serviceaccount:team:" + strings.ToUpper(person),
+		"a space":               "system:serviceaccount:team:" + person + " x",
+		"a leading hyphen":      "system:serviceaccount:team:-" + person,
+		"a trailing hyphen":     "system:serviceaccount:team:" + person + "-",
+		"a dotted namespace":    "system:serviceaccount:te.am:" + person,
+		"an empty name label":   "system:serviceaccount:team:" + person + "..x",
+		"the plural prefix":     "system:serviceaccounts:team:" + person,
+		"a longer word":         "system:serviceaccountx:team:" + person,
+		"text before it":        "x" + "system:serviceaccount:team:" + person,
+		"a namespace too long":  "system:serviceaccount:" + long + person[:0] + ":" + person,
+		"a name too long":       "system:serviceaccount:team:" + person + strings.Repeat("a", 253),
+		"a newline in the name": "system:serviceaccount:team:" + person + "\n",
+	} {
+		in := `configmaps is forbidden: User "` + subject + `" cannot list`
+		got := ErrorText(in)
+		if want := `configmaps is forbidden: User "` + Redacted + `" cannot list`; got != want {
+			t.Errorf("%s: got %s, want %s", name, got, want)
+		}
+	}
+	// A group is not a service account name, however it's spelled.
+	if got := ErrorText(`groups "system:serviceaccount:team:svc" is forbidden`); got != `groups "`+Redacted+`" is forbidden` {
+		t.Errorf("a group stays redacted: %s", got)
+	}
+}
+
 // typedNilError has a method that dereferences its receiver.
 type typedNilError struct{ msg string }
 

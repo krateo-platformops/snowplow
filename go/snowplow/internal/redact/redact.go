@@ -7,13 +7,22 @@
 // not allowed on a line (#453 allowed one): a stable label on a request's line
 // names everything else carrying that label as soon as one traceId is joined.
 //
-// Identity reaches a line by three routes, each closed once:
+// Two things are deliberately NOT identity here, by Diego's ruling on #1199. A
+// service account's name stays in error text, because it names a workload, not
+// a person, and it's what an operator looks for when a grant is missing. And
+// key_hash stays on lines: it identifies a cache cell, and one join names only
+// the lines of that cell.
+//
+// Identity reaches a line by three routes, each closed once, within the limits
+// #1223 records:
 //   - a site's own attribute: the structural guard (log_guard_test.go) fails on
 //     an identity key, or a label, on any slog site;
 //   - the request logger: middleware.RequestLogger replaces plumbing's
 //     use.Logger, which the guard also refuses;
 //   - the text of an error, which the apiserver or authn wrote: ScrubLogAttr, in
-//     buildLogHandler, so every record passes through it.
+//     buildLogHandler. It sees every slog record written through that handler,
+//     and it reads strings and errors, by pattern. klog and a context with no
+//     logger don't pass it, and it doesn't read other values (#1223).
 //
 // User is the keyed label of a username, for the in-process uses that need one
 // (cache.StaleSubject). It is
@@ -108,16 +117,41 @@ func Prefixed(prefix, s string) string {
 //
 // Both accept a backslash before each quote: a Status body folded into an error
 // keeps the JSON escaping of its message.
+//
+// serviceAccount is the one subject ErrorText keeps. It matches the whole name,
+// in the exact form Kubernetes gives a service account, so a username that only
+// starts like one stays redacted: system:serviceaccount:<namespace>:<name>,
+// where the namespace is a DNS-1123 label and the name a DNS-1123 subdomain.
 var (
-	apiserverSubject = regexp.MustCompile(`\b(User|user|users|groups) (\\?")[^"\\]*\\?"`)
+	apiserverSubject = regexp.MustCompile(`\b(User|user|users|groups) (\\?")([^"\\]*)\\?"`)
 	clientconfig     = regexp.MustCompile(`(\\?")[^"]*-clientconfig[^"]*"`)
+	serviceAccount   = regexp.MustCompile(`\Asystem:serviceaccount:([a-z0-9](?:[-a-z0-9]*[a-z0-9])?):([a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*)\z`)
 )
 
+// Kubernetes' length limits on a namespace and a service account name.
+const (
+	maxNamespaceLen      = 63
+	maxServiceAccountLen = 253
+)
+
+// isServiceAccount reports whether name is a well-formed service account name.
+func isServiceAccount(name string) bool {
+	m := serviceAccount.FindStringSubmatch(name)
+	return m != nil && len(m[1]) <= maxNamespaceLen && len(m[2]) <= maxServiceAccountLen
+}
+
 // ErrorText replaces the identity an apiserver or authn error string carries
-// (see apiserverSubject, clientconfig) with Redacted. It keeps the rest of the
-// text, and it is idempotent.
+// (see apiserverSubject, clientconfig) with Redacted. A service account named
+// as a user stays. It keeps the rest of the text, and it is idempotent.
 func ErrorText(s string) string {
-	s = apiserverSubject.ReplaceAllString(s, "$1 ${2}"+Redacted+"$2")
+	s = apiserverSubject.ReplaceAllStringFunc(s, func(match string) string {
+		m := apiserverSubject.FindStringSubmatch(match)
+		kind, quote, name := m[1], m[2], m[3]
+		if kind != "groups" && isServiceAccount(name) {
+			return match
+		}
+		return kind + " " + quote + Redacted + quote
+	})
 	return clientconfig.ReplaceAllString(s, "${1}"+Redacted+"$1")
 }
 
@@ -131,6 +165,7 @@ func Err(err error) string {
 
 // ScrubLogAttr is the slog.HandlerOptions.ReplaceAttr of snowplow's log
 // handlers: ErrorText over every string and error attribute, and the message.
+// Any other value (a map, a struct, a slice, a Stringer) is left as it is (#1223).
 // A handler calls it only for a record it renders, so a disabled level costs
 // nothing, and only a string holding a double quote pays for the regexps.
 func ScrubLogAttr(_ []string, a slog.Attr) slog.Attr {

@@ -1417,7 +1417,10 @@ JSON structured logs on stdout. Message strings are stable, dotted, and greppabl
 **No line carries a user name or groups, in clear or as a label** (#1192). The audit record is
 the one place that stores identity: to find who hit an error, join the line's trace id to the
 audit record. `internal/redact`'s guard fails on an identity attribute, and the log handler
-takes the identity out of the text of an error.
+takes the identity out of the forms the apiserver and authn write in the text of an error.
+The routes this doesn't cover, such as klog, are listed in #1223. A service account's name
+isn't identity here and stays in error text, and `key_hash` stays on lines (Diego's ruling on
+#1199).
 
 The operator-notable events:
 

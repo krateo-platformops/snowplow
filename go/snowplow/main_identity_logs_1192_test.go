@@ -3,7 +3,7 @@
 //
 // PRODUCTION FUNCTIONS UNDER TEST: newRequestChain and buildLogHandler, the same
 // two main() calls (F10 and TestS1192_MainBuildsTheChainFromNewRequestChain pin
-// that). Only UserConfig is a stand-in, because the real one needs a cluster for
+// that), through both of buildLogHandler's handlers. Only UserConfig is a stand-in, because the real one needs a cluster for
 // the clientconfig Secret; it attaches the sentinel identity to the request
 // exactly as the real one does, after the chain, and it logs nothing.
 //
@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -43,8 +44,12 @@ import (
 const (
 	sentinelUser1192  = "sentinel-user-zq1192@tenant.example"
 	sentinelGroup1192 = "sentinel-group-zq1192"
-	traceID1192       = "trace-zq1192"
-	probeMsg1192      = "s1192.probe"
+	// sentinelShaped1192 is a person's name that starts like a service account.
+	sentinelShaped1192 = "system:serviceaccount:team:sentinel-shaped-zq1192@tenant.example"
+	// serviceAccount1192 stays on the line, by Diego's ruling on #1199.
+	serviceAccount1192 = "system:serviceaccount:krateo-system:sa-zq1192"
+	traceID1192        = "trace-zq1192"
+	probeMsg1192       = "s1192.probe"
 )
 
 // lockedBuffer is the capture a background emitter can write to while the test
@@ -117,6 +122,8 @@ func forbiddingAPI1192(t *testing.T) (endpoints.Endpoint, func() int) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "Forbidden", "code": 403,
 			"message": `pods is forbidden: User "` + sentinelUser1192 + `" cannot list resource "pods"; ` +
+				`User "` + sentinelShaped1192 + `" cannot list resource "pods"; ` +
+				`User "` + serviceAccount1192 + `" cannot get resource "secrets"; ` +
 				`groups "` + sentinelGroup1192 + `" is forbidden; ` +
 				`secrets "` + sentinelUser1192 + `-clientconfig" not found`,
 		})
@@ -162,10 +169,10 @@ func resolveHandler1192(ep endpoints.Endpoint) http.Handler {
 // builds, and returns what that logger wrote. It installs the logger as the
 // default too, as main does (slog.SetDefault): the per-call line and every
 // slog.Warn site write there.
-func run1192(t *testing.T, chain func(*slog.Logger) use.Chain, ep endpoints.Endpoint) []string {
+func run1192(t *testing.T, chain func(*slog.Logger) use.Chain, pretty bool, ep endpoints.Endpoint) []string {
 	t.Helper()
 	capture := &lockedBuffer{}
-	log := slog.New(buildLogHandler(false, slog.LevelDebug, capture))
+	log := slog.New(buildLogHandler(pretty, slog.LevelDebug, capture))
 	prev := slog.Default()
 	slog.SetDefault(log)
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -182,117 +189,205 @@ func run1192(t *testing.T, chain func(*slog.Logger) use.Chain, ep endpoints.Endp
 	return strings.Split(strings.TrimSpace(capture.String()), "\n")
 }
 
-// keys1192 collects every key of a decoded record, nested ones included.
-func keys1192(v any, out map[string]bool) {
+// handlers1192 is both branches of buildLogHandler. The chart sets
+// PRETTY_LOG=false, but the binary's own default is the text handler, so the
+// scrub has to hold on each.
+var handlers1192 = []struct {
+	name   string
+	pretty bool
+}{{"json", false}, {"text", true}}
+
+// record1192 is one line of either handler: its top-level values, and every key
+// on it. The text handler flattens a group to user.name=, so a key is split on
+// its dots to look the same as the JSON handler's nested one.
+type record1192 struct {
+	values map[string]string
+	keys   map[string]bool
+}
+
+func (r record1192) addKey(key string) {
+	for _, part := range strings.Split(key, ".") {
+		r.keys[part] = true
+	}
+}
+
+// collectKeys adds every key of a decoded JSON value, nested ones included.
+func (r record1192) collectKeys(v any) {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, sub := range x {
-			out[k] = true
-			keys1192(sub, out)
+			r.addKey(k)
+			r.collectKeys(sub)
 		}
 	case []any:
 		for _, sub := range x {
-			keys1192(sub, out)
+			r.collectKeys(sub)
 		}
 	}
 }
 
-// TestS1192_RequestPath_NoIdentityOnAnyLine is the arm. Its controls are part of
-// it: without a line at each level, the resolver's two real lines and the
-// apiserver's text on one of them, an empty capture would pass.
-func TestS1192_RequestPath_NoIdentityOnAnyLine(t *testing.T) {
-	ep, calls := forbiddingAPI1192(t)
-	lines := run1192(t, newRequestChain, ep)
-
-	levels := map[string]bool{}
-	messages := map[string]bool{}
-	apiserverTextSeen := false
-	for _, line := range lines {
-		for _, tok := range []string{sentinelUser1192, sentinelGroup1192} {
-			if strings.Contains(line, tok) {
-				t.Errorf("#1192: identity on a log line: %s", line)
-			}
-		}
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+func decodeLine1192(t *testing.T, pretty bool, line string) record1192 {
+	t.Helper()
+	rec := record1192{values: map[string]string{}, keys: map[string]bool{}}
+	if !pretty {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			t.Fatalf("a line is not one JSON object (%v): %s", err, line)
 		}
-		keys := map[string]bool{}
-		keys1192(rec, keys)
-		for _, k := range []string{"user", "username", "groups", "identity"} {
-			if keys[k] {
-				t.Errorf("#1192: identity attribute %q on a log line: %s", k, line)
+		rec.collectKeys(obj)
+		for k, v := range obj {
+			if text, ok := v.(string); ok {
+				rec.values[k] = text
 			}
 		}
-		msg, _ := rec["msg"].(string)
-		messages[msg] = true
-		if msg == probeMsg1192 {
-			levels[rec["level"].(string)] = true
-		}
-		if msg == probeMsg1192 || msg == "read stage not sent" || msg == "api call response failure" {
-			if rec["traceId"] != traceID1192 {
-				t.Errorf("a request line must keep its traceId: %s", line)
-			}
-		}
-		if strings.Contains(line, "cannot list resource") {
-			apiserverTextSeen = true
-		}
+		return rec
 	}
+	for rest := line; rest != ""; rest = strings.TrimPrefix(rest, " ") {
+		key, after, ok := strings.Cut(rest, "=")
+		if !ok {
+			t.Fatalf("a line is not key=value pairs at %q: %s", rest, line)
+		}
+		value := after
+		if strings.HasPrefix(after, `"`) {
+			quoted, err := strconv.QuotedPrefix(after)
+			if err != nil {
+				t.Fatalf("a quoted value does not end (%v): %s", err, line)
+			}
+			if value, err = strconv.Unquote(quoted); err != nil {
+				t.Fatalf("a quoted value does not decode (%v): %s", err, line)
+			}
+			rest = after[len(quoted):]
+		} else if bare, tail, spaced := strings.Cut(after, " "); spaced {
+			value, rest = bare, " "+tail
+		} else {
+			rest = ""
+		}
+		rec.addKey(key)
+		rec.values[key] = value
+	}
+	return rec
+}
 
-	// POSITIVE CONTROL: the capture holds what the assertions above claim to
-	// have looked at.
-	for _, l := range []string{"DEBUG", "INFO", "WARN", "ERROR"} {
-		if !levels[l] {
-			t.Errorf("CONTROL: no %s line reached the capture; lines=%v", l, lines)
-		}
-	}
-	for _, m := range []string{"read stage not sent", "api call response failure"} {
-		if !messages[m] {
-			t.Errorf("CONTROL: the resolver's %q line reached no capture; lines=%v", m, lines)
-		}
-	}
-	if !apiserverTextSeen {
-		t.Errorf("CONTROL: the apiserver's refusal never reached a line, so its text was not scrubbed but absent; lines=%v", lines)
-	}
-	if calls() == 0 {
-		t.Error("CONTROL: the denied stage never dialled the apiserver")
+// TestS1192_RequestPath_NoIdentityOnAnyLine is the arm, on each handler. Its
+// controls are part of it: without a line at each level, the resolver's two real
+// lines and the apiserver's text on one of them, an empty capture would pass.
+func TestS1192_RequestPath_NoIdentityOnAnyLine(t *testing.T) {
+	for _, h := range handlers1192 {
+		t.Run(h.name, func(t *testing.T) {
+			ep, calls := forbiddingAPI1192(t)
+			lines := run1192(t, newRequestChain, h.pretty, ep)
+
+			levels := map[string]bool{}
+			messages := map[string]bool{}
+			apiserverTextSeen, serviceAccountSeen := false, false
+			for _, line := range lines {
+				for _, tok := range []string{sentinelUser1192, sentinelGroup1192, sentinelShaped1192} {
+					if strings.Contains(line, tok) {
+						t.Errorf("#1192: identity on a log line: %s", line)
+					}
+				}
+				serviceAccountSeen = serviceAccountSeen || strings.Contains(line, serviceAccount1192)
+				rec := decodeLine1192(t, h.pretty, line)
+				for _, k := range []string{"user", "username", "groups", "identity"} {
+					if rec.keys[k] {
+						t.Errorf("#1192: identity attribute %q on a log line: %s", k, line)
+					}
+				}
+				msg := rec.values["msg"]
+				messages[msg] = true
+				if msg == probeMsg1192 {
+					levels[rec.values["level"]] = true
+				}
+				if msg == probeMsg1192 || msg == "read stage not sent" || msg == "api call response failure" {
+					if rec.values["traceId"] != traceID1192 || strings.Count(line, "traceId") != 1 {
+						t.Errorf("a request line must keep its traceId, once: %s", line)
+					}
+				}
+				if strings.Contains(line, "cannot list resource") {
+					apiserverTextSeen = true
+				}
+			}
+
+			// POSITIVE CONTROL: the capture holds what the assertions above claim
+			// to have looked at.
+			for _, l := range []string{"DEBUG", "INFO", "WARN", "ERROR"} {
+				if !levels[l] {
+					t.Errorf("CONTROL: no %s line reached the capture; lines=%v", l, lines)
+				}
+			}
+			for _, m := range []string{"read stage not sent", "api call response failure"} {
+				if !messages[m] {
+					t.Errorf("CONTROL: the resolver's %q line reached no capture; lines=%v", m, lines)
+				}
+			}
+			if !apiserverTextSeen {
+				t.Errorf("CONTROL: the apiserver's refusal never reached a line, so its text was not scrubbed but absent; lines=%v", lines)
+			}
+			if !serviceAccountSeen {
+				t.Errorf("a service account's name must stay on the line (Diego's ruling on #1199); lines=%v", lines)
+			}
+			if calls() == 0 {
+				t.Error("CONTROL: the denied stage never dialled the apiserver")
+			}
+		})
 	}
 }
 
 // TestS1192_ControlPlumbingLoggerPutsIdentityOnTheLine is the arm above against
 // the wiring it replaced: the same request through use.Logger carries both
-// sentinels. It proves the token on the request is read, the sentinels would be
-// seen, and #1192 was real; it fails the day plumbing stops attaching them, which
-// is when newRequestChain can go back to use.Logger.
+// sentinels, on each handler. It proves the token on the request is read, the
+// sentinels would be seen, and #1192 was real; it fails the day plumbing stops
+// attaching them, which is when newRequestChain can go back to use.Logger.
 func TestS1192_ControlPlumbingLoggerPutsIdentityOnTheLine(t *testing.T) {
-	ep, _ := forbiddingAPI1192(t)
-	lines := run1192(t, func(log *slog.Logger) use.Chain {
-		return use.NewChain(use.TraceId(), use.Logger(log), audit.Middleware())
-	}, ep)
-	out := strings.Join(lines, "\n")
-	for _, tok := range []string{sentinelUser1192, sentinelGroup1192} {
-		if !strings.Contains(out, tok) {
-			t.Errorf("CONTROL: use.Logger's identity %q never reached the capture, so the arm above proves nothing; lines=%v", tok, lines)
-		}
+	for _, h := range handlers1192 {
+		t.Run(h.name, func(t *testing.T) {
+			ep, _ := forbiddingAPI1192(t)
+			lines := run1192(t, func(log *slog.Logger) use.Chain {
+				return use.NewChain(use.TraceId(), use.Logger(log), audit.Middleware())
+			}, h.pretty, ep)
+			seen := map[string]bool{}
+			for _, line := range lines {
+				rec := decodeLine1192(t, h.pretty, line)
+				for _, k := range []string{"user", "groups"} {
+					seen[k] = seen[k] || rec.keys[k]
+				}
+			}
+			out := strings.Join(lines, "\n")
+			for _, tok := range []string{sentinelUser1192, sentinelGroup1192} {
+				if !strings.Contains(out, tok) {
+					t.Errorf("CONTROL: use.Logger's identity %q never reached the capture, so the arm above proves nothing; lines=%v", tok, lines)
+				}
+			}
+			// The arm's key check has to see use.Logger's group on this handler
+			// too, or a re-attached group would pass it here.
+			if !seen["user"] || !seen["groups"] {
+				t.Errorf("CONTROL: the decoder did not see use.Logger's user group (%v), so the arm's key check proves nothing; lines=%v", seen, lines)
+			}
+		})
 	}
 }
 
 // TestS1192_UnauthenticatedRequestKeepsItsTraceId: the traceId is on the request
 // logger whether or not a token parsed, and once.
 func TestS1192_UnauthenticatedRequestKeepsItsTraceId(t *testing.T) {
-	capture := &lockedBuffer{}
-	log := slog.New(buildLogHandler(false, slog.LevelDebug, capture))
-	h := newRequestChain(log).Then(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		xcontext.Logger(r.Context()).Info(probeMsg1192)
-		if got := xcontext.TraceId(r.Context(), false); got != traceID1192 {
-			t.Errorf("the context's traceId = %q", got)
-		}
-	}))
-	req := httptest.NewRequest(http.MethodGet, "/capabilities", nil)
-	req.Header.Set(xcontext.LabelKrateoTraceId, traceID1192)
-	h.ServeHTTP(httptest.NewRecorder(), req)
-	if strings.Count(capture.String(), `"traceId":"`+traceID1192+`"`) != 1 {
-		t.Fatalf("the line must carry the request's traceId once: %s", capture.String())
+	for _, h := range handlers1192 {
+		t.Run(h.name, func(t *testing.T) {
+			capture := &lockedBuffer{}
+			log := slog.New(buildLogHandler(h.pretty, slog.LevelDebug, capture))
+			chain := newRequestChain(log).Then(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				xcontext.Logger(r.Context()).Info(probeMsg1192)
+				if got := xcontext.TraceId(r.Context(), false); got != traceID1192 {
+					t.Errorf("the context's traceId = %q", got)
+				}
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/capabilities", nil)
+			req.Header.Set(xcontext.LabelKrateoTraceId, traceID1192)
+			chain.ServeHTTP(httptest.NewRecorder(), req)
+			line := strings.TrimSpace(capture.String())
+			if rec := decodeLine1192(t, h.pretty, line); rec.values["traceId"] != traceID1192 || strings.Count(line, "traceId") != 1 {
+				t.Fatalf("the line must carry the request's traceId once: %s", line)
+			}
+		})
 	}
 }
 
