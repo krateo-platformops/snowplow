@@ -22,7 +22,11 @@ func TestConnections847_EarlyClosedBodyOnHTTP1IsANewConnection(t *testing.T) {
 	untilWire(t, 2, 3, "stage/http1", func(t *testing.T) *wireServer {
 		s := newWireServer(t, wirePlain, nil)
 		cli := s.Client()
-		sendUnread(t, context.Background(), cli, s.URL)
+		ctx, kept := watchPool(context.Background())
+		sendUnread(t, ctx, cli, s.URL)
+		if decided(t, s, kept) {
+			t.Fatal("the transport kept a connection whose body was closed early: this toolchain drains")
+		}
 		get(t, EgressStage, cli, s.URL)
 		get(t, EgressStage, cli, s.URL)
 		return s

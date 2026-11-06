@@ -35,6 +35,34 @@ func TestConnections847_EarlyClosedBodyOnHTTP1IsDrainedAndReused(t *testing.T) {
 	})
 }
 
+// How often the drain keeps a connection. Each arm above needs it to work once, so
+// they stay green with half of all drains failing; this is the arm that can see
+// that. The floor is not derived from anything here: stock Go 1.27.3 kept 2,400 of
+// 2,400, at load up to about 72. It catches a drain failing half the time, and not
+// one failing a tenth of the time.
+func TestConnections847_DrainKeepsNearlyEveryConnection(t *testing.T) {
+	const closes, floor = 100, 80
+	s := newWireServer(t, wirePlain, nil)
+	cli := s.Client()
+	before := connCells()
+	drained := 0
+	for range closes {
+		closedBefore := s.closed.Load()
+		ctx, kept := watchPool(context.Background())
+		sendUnread(t, ctx, cli, s.URL)
+		eventually(t, "the transport keeps or closes the connection", func() bool {
+			return kept.Load() || s.closed.Load() > closedBefore
+		})
+		if kept.Load() {
+			drained++
+		}
+	}
+	if drained < floor {
+		t.Fatalf("the transport kept %d connections of %d closed early, want at least %d", drained, closes, floor)
+	}
+	s.assertCounted(t, before, "stage/http1", closes)
+}
+
 // #847's first row: the retry after an unread body reuses the connection. This
 // one uses the path's own wait: the backoff before the retry, unseamed, so what
 // it reads is what a customer's retry gets. The attempt's context ends right

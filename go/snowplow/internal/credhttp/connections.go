@@ -12,7 +12,9 @@ package credhttp
 // moves with load. The share holds still under load as long as a pool's requests
 // in flight stay at or under its idle cap (below), so a paired bench run that
 // changes only the toolchain (#847: Go 1.27 drains an HTTP/1 body closed early and
-// keeps the connection) can read the effect directly.
+// keeps the connection) can read the effect directly, if something in the run
+// closes a body early: read to its end, a body never reaches the drain, and the
+// share is the same whether the drain works or not.
 //
 // THE IDLE CAP. Past it the share moves with load, and rightly: a connection that
 // comes free with the pool's idle slots full is closed, and the next request opens
