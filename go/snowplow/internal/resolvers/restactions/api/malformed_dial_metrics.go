@@ -25,21 +25,32 @@ import (
 // #293/#302 reason keys — the canonical, stable metric label values (also the
 // DEBUG "reason" field). Distinct owners/urgencies, so per-reason attribution
 // matters:
-//   - empty_interp        (#288) empty / DNS-1123-invalid segment — a key-minting
-//     / interpolation regression;
+//   - empty_interp        (#288) empty / DNS-1123-invalid segment, or (#1123) a
+//     template that rendered no path at all — a key-minting / interpolation
+//     regression;
 //   - unrendered_template (#293) a literal ${...} survived render — an
 //     RA-authoring / unresolved-template fault;
 //   - jq_path_error       (#293) the path jq expression errored — a jq fault;
 //   - jq_payload_error    (#302) the payload jq expression errored — a jq fault
 //     that must never be dialed as a garbage request body;
 //   - jq_header_error     (#302) a header jq expression errored — a jq fault that
-//     must never be dialed as a garbage header value (e.g. Authorization).
+//     must never be dialed as a garbage header value (e.g. Authorization);
+//   - path_value_refused  (#1123) a value spliced into the path could not be one
+//     segment or one query value, the path has a '.'/'..' segment, or an
+//     apiserver path carries a percent-escape — an injection attempt or an
+//     undeclared multi-segment value; never dialed;
+//   - path_not_as_served  (#1137) an own-cluster path the apiserver would read
+//     as a different path (no leading "/", a percent-escape in a path no parser
+//     reads, an empty or dot segment a dial would clean away): an RA-authoring
+//     or upstream-data fault that every path reader would have misread.
 const (
 	reasonEmptyInterp        = "empty_interp"
 	reasonUnrenderedTemplate = "unrendered_template"
 	reasonJQPathError        = "jq_path_error"
 	reasonJQPayloadError     = "jq_payload_error"
 	reasonJQHeaderError      = "jq_header_error"
+	reasonPathValueRefused   = "path_value_refused"
+	reasonPathNotAsServed    = "path_not_as_served"
 )
 
 // skipReason is the two-tier skip descriptor: class is one of the bounded metric
@@ -68,6 +79,8 @@ var malformedDialSkipped struct {
 	jqPathError        atomic.Uint64
 	jqPayloadError     atomic.Uint64
 	jqHeaderError      atomic.Uint64
+	pathValueRefused   atomic.Uint64
+	pathNotAsServed    atomic.Uint64
 }
 
 // bumpMalformedDialSkipped increments the per-reason skip counter. Called from
@@ -86,6 +99,10 @@ func bumpMalformedDialSkipped(reason string) {
 		malformedDialSkipped.jqPayloadError.Add(1)
 	case reasonJQHeaderError:
 		malformedDialSkipped.jqHeaderError.Add(1)
+	case reasonPathValueRefused:
+		malformedDialSkipped.pathValueRefused.Add(1)
+	case reasonPathNotAsServed:
+		malformedDialSkipped.pathNotAsServed.Add(1)
 	default:
 		malformedDialSkipped.emptyInterp.Add(1)
 	}
@@ -104,6 +121,10 @@ func MalformedDialSkippedByReason(reason string) uint64 {
 		return malformedDialSkipped.jqPayloadError.Load()
 	case reasonJQHeaderError:
 		return malformedDialSkipped.jqHeaderError.Load()
+	case reasonPathValueRefused:
+		return malformedDialSkipped.pathValueRefused.Load()
+	case reasonPathNotAsServed:
+		return malformedDialSkipped.pathNotAsServed.Load()
 	default:
 		return malformedDialSkipped.emptyInterp.Load()
 	}
@@ -117,7 +138,9 @@ func MalformedDialSkippedTotal() uint64 {
 		malformedDialSkipped.unrenderedTemplate.Load() +
 		malformedDialSkipped.jqPathError.Load() +
 		malformedDialSkipped.jqPayloadError.Load() +
-		malformedDialSkipped.jqHeaderError.Load()
+		malformedDialSkipped.jqHeaderError.Load() +
+		malformedDialSkipped.pathValueRefused.Load() +
+		malformedDialSkipped.pathNotAsServed.Load()
 }
 
 // MalformedDialSkippedByReasonSnapshot returns the per-reason skip counts keyed
@@ -134,6 +157,8 @@ func MalformedDialSkippedByReasonSnapshot() map[string]uint64 {
 		reasonJQPathError:        malformedDialSkipped.jqPathError.Load(),
 		reasonJQPayloadError:     malformedDialSkipped.jqPayloadError.Load(),
 		reasonJQHeaderError:      malformedDialSkipped.jqHeaderError.Load(),
+		reasonPathValueRefused:   malformedDialSkipped.pathValueRefused.Load(),
+		reasonPathNotAsServed:    malformedDialSkipped.pathNotAsServed.Load(),
 	}
 }
 
@@ -147,6 +172,8 @@ func MalformedDialReasonEnum() []string {
 		reasonJQPathError,
 		reasonJQPayloadError,
 		reasonJQHeaderError,
+		reasonPathValueRefused,
+		reasonPathNotAsServed,
 	}
 }
 
@@ -162,6 +189,8 @@ func ResetMalformedDialSkippedForTest() {
 	malformedDialSkipped.jqPathError.Store(0)
 	malformedDialSkipped.jqPayloadError.Store(0)
 	malformedDialSkipped.jqHeaderError.Store(0)
+	malformedDialSkipped.pathValueRefused.Store(0)
+	malformedDialSkipped.pathNotAsServed.Store(0)
 }
 
 var malformedDialExpvarOnce sync.Once
@@ -170,7 +199,8 @@ func init() { registerMalformedDialExpvar() }
 
 // registerMalformedDialExpvar publishes snowplow_malformed_dial_skipped_total to
 // /debug/vars as a PER-REASON object {empty_interp, unrendered_template,
-// jq_path_error, jq_payload_error, jq_header_error} (pm-1217: metric-level reason
+// jq_path_error, jq_payload_error, jq_header_error, path_value_refused,
+// path_not_as_served} (pm-1217: metric-level reason
 // attribution). Deliberately the SAME single key via the SAME single
 // expvar.Publish — the published KEY NAME is unchanged (only the inner reason set
 // grows), so it stays the lone ungated publisher named in the CFG-1
@@ -187,6 +217,8 @@ func registerMalformedDialExpvar() {
 				reasonJQPathError:        malformedDialSkipped.jqPathError.Load(),
 				reasonJQPayloadError:     malformedDialSkipped.jqPayloadError.Load(),
 				reasonJQHeaderError:      malformedDialSkipped.jqHeaderError.Load(),
+				reasonPathValueRefused:   malformedDialSkipped.pathValueRefused.Load(),
+				reasonPathNotAsServed:    malformedDialSkipped.pathNotAsServed.Load(),
 			}
 		}))
 	})

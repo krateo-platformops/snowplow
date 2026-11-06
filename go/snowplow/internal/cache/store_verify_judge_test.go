@@ -888,37 +888,34 @@ func TestForcedPass918_RelistTombstone_HeldAndDecidedByTheNextPass(t *testing.T)
 }
 
 // TestForcedPass918_NoDeliveryLog_StillVerifies — #875 residual B: a
-// re-registered shared-factory GVR gets its informer back from the factory
-// STOPPED (RemoveResourceType stopped it, #244), and a stopped informer takes
-// neither a transform nor a handler, so the GVR has no delivery log at all.
-// The pass still runs and the rule still orders the store against the LIST: a
-// real loss is published and the repair attempted, and #244's
-// factory-divergence age gets its input. What it cannot know — deliveries
-// received and not applied, applied deletes, a key to hold pending — is
-// #940.
+// shared-factory GVR with no delivery log at all. The pass still runs and the
+// rule still orders the store against the LIST: a real loss is published and
+// the repair attempted, and #244's factory-divergence age gets its input. What
+// it cannot know — deliveries received and not applied, applied deletes, a key
+// to hold pending — is #940.
+//
+// Until #1146 that state came from re-registering a torn-down factory GVR: the
+// factory handed its informer back STOPPED, and a stopped informer takes
+// neither a transform nor a handler. Since #1146 a factory issues a GVR's
+// informer once and a re-registration builds a standalone one, with its log
+// (TestIssue1146_ATornDownFactoryGVRIsReRegisteredStandalone). No production path now yields a GVR
+// without a log, but the forced pass still handles one (installDeliveryLog
+// returns none when the handler cannot be added), so the arm retires the live
+// factory GVR's log through the real retire path and judges it.
 func TestForcedPass918_NoDeliveryLog_StillVerifies(t *testing.T) {
 	c3Setup(t)
 	resetVerificationForArm(t)
 	ctx := context.Background()
 	rw, _ := silentWatchClusterFor(t, factory875GVR, false, ja1.obj(factory875GVR), jb1.obj(factory875GVR))
-	rw.mu.RLock()
-	first := rw.informers[factory875GVR].Informer()
-	rw.mu.RUnlock()
-	rw.RemoveResourceType(factory875GVR)
-	j9WaitFor(t, "the removed factory informer stopping", first.IsStopped)
-	_, synced := rw.EnsureResourceType(factory875GVR)
-	select {
-	case <-synced:
-	case <-time.After(verifyBound):
-		t.Fatalf("precondition: the re-registered informer never reported synced")
-	}
 	rw.RefreshDiscovery(ctx)
-	rw.mu.RLock()
-	dl := rw.deliveries[factory875GVR]
-	rw.mu.RUnlock()
-	if dl != nil {
-		t.Fatalf("precondition: the re-registered GVR has a delivery log (recording=%v)", dl.recording)
+	rw.mu.Lock()
+	if in := rw.instances[factory875GVR]; in == nil || in.shape.owned() {
+		rw.mu.Unlock()
+		t.Fatal("precondition: the GVR is not on the shared-factory path")
 	}
+	rw.retireDeliveryLogLocked(rw.deliveries[factory875GVR])
+	delete(rw.deliveries, factory875GVR)
+	rw.unlockAndDetach()
 	rec := attachMetaClient(t, rw)
 	cli := &j9Client{inner: rec.inner, gvr: factory875GVR}
 	cli.answer("4242", j9Object{ja1.name, "4100", ja1.uid}, jb1) // a real loss

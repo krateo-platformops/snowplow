@@ -266,6 +266,9 @@ func recordAttrs(r *Record, wall time.Duration, end time.Time, cause Release, bo
 		slog.Int64("wall_ms", wall.Milliseconds()),
 		slog.Int64("bound_ms", bound.Milliseconds()),
 		slog.String("outcome", cause.String()),
+		// #1115 — what the request's page budget did to its network
+		// exchanges (pagebudget's closed set; none without a budget).
+		slog.String("budget", r.budget.Load().Result().String()),
 	)
 	dominant, sum := "unattributed", int64(0)
 	var top int64

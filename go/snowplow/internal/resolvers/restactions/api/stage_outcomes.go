@@ -64,6 +64,9 @@ const (
 	StageReasonInvalidPath   = "InvalidPath"   // the #288 guard refused the rendered apiserver path
 	StageReasonTemplateError = "TemplateError" // the path, payload or a header did not render (#302, #293)
 	StageReasonNotSent       = "NotSent"       // planned, not sent, and no other failure recorded
+	// StageReasonTimeout (#1115) — the stage's exchange was ended by the
+	// request's page budget (a 504 Timeout): the page's 10 s goal ran out.
+	StageReasonTimeout = "Timeout"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -74,12 +77,13 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	StageReasonNotExecuted:   8,
-	StageReasonForbidden:     7,
-	StageReasonUnauthorized:  6,
-	StageReasonNotFound:      5,
-	StageReasonInvalidPath:   4,
-	StageReasonTemplateError: 3,
+	StageReasonNotExecuted:   9,
+	StageReasonForbidden:     8,
+	StageReasonUnauthorized:  7,
+	StageReasonNotFound:      6,
+	StageReasonInvalidPath:   5,
+	StageReasonTemplateError: 4,
+	StageReasonTimeout:       3, // #1115: a recorded budget cut, above the NotSent fallback
 	StageReasonNotSent:       2,
 	StageReasonError:         1,
 }
@@ -181,6 +185,22 @@ func (s *StageOutcomes) failed(name string) bool {
 	defer s.mu.Unlock()
 	o := s.by[name]
 	return o != nil && o.reason != ""
+}
+
+// reasonOf is the reason stage name's outcome reports (the highest-ranked
+// one it recorded, reasonRank), "" when it recorded none. #1139: a log line
+// that names a stage's cause reads it here, so it names the cause the header
+// does.
+func (s *StageOutcomes) reasonOf(name string) string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.by[name]; o != nil {
+		return o.reason
+	}
+	return ""
 }
 
 // abortedResolve (#904 review F3) is ResolveWithFailure's answer when it stops
@@ -302,6 +322,8 @@ func stageReasonOf(v any) string {
 		return StageReasonForbidden
 	case 404:
 		return StageReasonNotFound
+	case 504:
+		return StageReasonTimeout
 	}
 	return StageReasonError
 }

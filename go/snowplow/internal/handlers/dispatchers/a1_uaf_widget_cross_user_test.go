@@ -24,15 +24,15 @@
 //
 //  1. calls cache.BumpUAFTouched(ctx) — the same one-line bump production makes
 //     at the apiRef chokepoint (apiref.bumpUAFSinkIfDeclared, which fires when
-//     the apiRef'd RA declares a UAF stage) and, once dev-authz-hardening's
-//     commit lands, again inside the refilter itself;
+//     the apiRef'd RA declares a UAF stage) and again inside the refilter
+//     itself (applyUserAccessFilterOnPig);
 //  2. derives the widgetData by calling the REAL rbac.EvaluateRBAC per candidate
 //     namespace under the requester's identity — so each user's body is produced
 //     by that user's real RBAC, not by a canned fixture.
 //
-// RED on origin/main: alice's widget body is Put under the shared key, bob HITs
-// it, and bob is served alice's tenant. GREEN here: the sink makes the widgets
-// Put decline, so bob resolves under his own identity.
+// RED before 1.12.3 (PR #173): alice's widget body was Put under the shared key,
+// bob HIT it, and bob was served alice's tenant. GREEN since: the sink makes the
+// widgets Put decline, so bob resolves under his own identity.
 
 package dispatchers
 

@@ -84,6 +84,7 @@ import (
 	"sync"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -314,7 +315,7 @@ func (f *contentFlight) wait(ctx context.Context) (contentFlightResult, bool) {
 // sinks, markers), none of its cancellation, bounded by the server write
 // deadline — so the joiners never inherit the leader's cancellation.
 func detachedFillContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), cache.DemandRevalidationDeadline())
+	return context.WithTimeout(pagebudget.Detach(ctx), cache.DemandRevalidationDeadline()) // #1115: and outside the reader's page budget
 }
 
 // resetContentFlightsForTest forgets every current flight, so a flight an

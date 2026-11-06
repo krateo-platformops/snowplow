@@ -189,6 +189,26 @@ type ResourceWatcher struct {
 	// (store_divergence_unrecorded_total). Guarded by rw.mu.
 	deliveries map[schema.GroupVersionResource]*deliveryLog
 
+	// detachQueue (#1146) holds the delivery logs a critical section retired
+	// whose handlers are still attached: removing a handler takes the
+	// informer's locks, which may wait on a listener waiting on rw.mu, so it
+	// happens after the lock is released (retireDeliveryLogLocked,
+	// unlockAndDetach). Not per-GVR state: it is empty whenever rw.mu is free.
+	// Guarded by rw.mu.
+	detachQueue []*deliveryLog
+
+	// factoryIssued (#1146) records, per GVR, which shared factory (dynamic,
+	// metadata) has issued an informer for it. A factory caches one informer
+	// per GVR and has no eviction API, so after a teardown it would hand the
+	// SAME informer back: stopped and frozen (R6), and — while the teardown's
+	// handler removal still waits on its draining processor — holding the
+	// startedLock the re-registration's wiring takes under rw.mu (the #1146
+	// cycle, one hop longer). So a factory issues a GVR's informer once; a
+	// later registration of that GVR takes a standalone informer, as a
+	// removable GVR does. It describes the factory's cache, which outlives
+	// every registration: a teardown does not purge it. Guarded by rw.mu.
+	factoryIssued map[schema.GroupVersionResource]factoryIssue
+
 	// retainUnknownWarned records GVRs currently inside a #217 retain-on-unknown
 	// EPISODE — a contiguous run of discovery-UNKNOWN conjunct-4 re-evals during
 	// which a granted confirmation is being held open. It rate-limits the WARN to
@@ -476,8 +496,13 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	// silently.
 	AssertRBACTypedOverridesRegistered()
 
-	rw.factory.Start(rw.stopCh)
+	// #1016 — factory.Start is where the watcher escapes to other goroutines:
+	// its informers' handlers run from here on and can bind it to the
+	// dep-watch bridge through a submit. So the constructor's last write to
+	// the watcher comes first; everything after Start only reads it or
+	// spawns goroutines.
 	rw.started = true
+	rw.factory.Start(rw.stopCh)
 
 	// 0.30.9 Sub-scope B: now that the factory has started the
 	// constructor-registered informers (the four RBAC GVRs),
@@ -528,6 +553,15 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		slog.String("rbac.evaluate_path", "in-process"),
 		slog.String("subject_access_review_calls_in_cache_on_path", "banned"),
 	)
+
+	// #1016 — bind the watcher to the dep-watch bridge only now that it is
+	// fully built. Its dep handlers (registered above) feed the bridge, so it
+	// is the watcher the dep worker probes and the one the test reset stops
+	// (stopBoundDepWatcherForTest), from before its first event. The bind
+	// used to happen inside depEventHandler, i.e. at the first registration
+	// in the loop above: the worker could then read rw.informers while this
+	// constructor was still writing it.
+	depWatchSingleton().watcher.Store(rw)
 
 	return rw, nil
 }
@@ -1021,7 +1055,9 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// so a build constructs its copy through the same one.
 	ownsInformer := false
 	shape := shapeFactoryMetadata
-	standalone := IsNavigationDiscoveredGroup(gvr.Group)
+	// #1146 — and so does a GVR the metadata factory already issued an
+	// informer for (factoryIssued).
+	standalone := IsNavigationDiscoveredGroup(gvr.Group) || rw.factoryIssued[gvr].metadata
 	if standalone {
 		ownsInformer = true // standalone: this GVR owns it outright
 		shape = shapeStandaloneMetadata
@@ -1046,6 +1082,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 			)
 		}
 		// Shared factory: NOT owned — ownsInformer stays false.
+		rw.noteFactoryIssuedLocked(gvr, factoryIssue{metadata: true})
 		gi = rw.metaFactory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
@@ -1528,7 +1565,10 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// identical — same navigation-derived predicate, same removable-iff-
 	// walker-discovered contract.
 	if gi == nil {
-		standalone := IsNavigationDiscoveredGroup(gvr.Group)
+		// #1146 — a GVR the factory already issued an informer for (it was
+		// registered and torn down) takes a standalone informer too: see
+		// factoryIssued.
+		standalone := IsNavigationDiscoveredGroup(gvr.Group) || rw.factoryIssued[gvr].dynamic
 		if standalone {
 			ownsInformer = true // standalone: this GVR owns it outright
 			shape = shapeStandaloneDynamic
@@ -1542,6 +1582,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			)
 		} else {
 			// Shared factory: NOT owned — ownsInformer stays false.
+			rw.noteFactoryIssuedLocked(gvr, factoryIssue{dynamic: true})
 			gi = rw.factory.ForResource(gvr)
 		}
 	}
@@ -1839,7 +1880,9 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 		return
 	}
 	rw.mu.Lock()
-	defer rw.mu.Unlock()
+	// #1146 — the teardown retires the GVR's delivery log (and any build
+	// copy's) under the lock; their handlers are removed after it is released.
+	defer rw.unlockAndDetach()
 
 	// 1.12.7 — a teardown takes the GVR's confirmation with it. Count it only
 	// when one was actually held: deletePerGVRStateLocked deletes
@@ -1861,6 +1904,7 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 	// Close the per-GVR stop channel — exits the informer's Run
 	// goroutine and its sync-watcher.
 	rw.closePerGVRStopLocked(gvr)
+	teardownStep(gvr, "stop_closed")
 	// Purge every per-GVR map entry so no state outlives the informer.
 	rw.deletePerGVRStateLocked(gvr)
 
@@ -1869,6 +1913,35 @@ func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionR
 		slog.String("gvr", gvr.String()),
 		slog.String("note", "per-GVR informer torn down — Run goroutine + sync-watcher reaped, per-GVR state purged"),
 	)
+}
+
+// factoryIssue is which shared factories have issued a GVR's informer.
+type factoryIssue struct{ dynamic, metadata bool }
+
+// noteFactoryIssuedLocked records that a factory issued gvr's informer.
+// Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) noteFactoryIssuedLocked(gvr schema.GroupVersionResource, f factoryIssue) {
+	if rw.factoryIssued == nil {
+		rw.factoryIssued = map[schema.GroupVersionResource]factoryIssue{}
+	}
+	cur := rw.factoryIssued[gvr]
+	cur.dynamic = cur.dynamic || f.dynamic
+	cur.metadata = cur.metadata || f.metadata
+	rw.factoryIssued[gvr] = cur
+}
+
+// teardownStepHookForTest, when non-nil, runs at named points of
+// removeResourceTypeWithReason ("stop_closed": the informer's stop channel is
+// closed, the per-GVR state not yet purged). It runs UNDER rw.mu, so it must
+// not take it. TEST-ONLY: production pays one atomic load per teardown. The
+// #1146 arm uses it to hold the teardown until the informer's processor is
+// waiting on a listener, the interleaving the deadlock needs.
+var teardownStepHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource, step string)]
+
+func teardownStep(gvr schema.GroupVersionResource, step string) {
+	if h := teardownStepHookForTest.Load(); h != nil {
+		(*h)(gvr, step)
+	}
 }
 
 // deletePerGVRStateLocked removes gvr from every per-GVR map. Callers

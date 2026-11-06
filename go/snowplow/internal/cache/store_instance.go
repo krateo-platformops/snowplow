@@ -119,6 +119,13 @@ type storeInstance struct {
 	// error, which is healed (#928 F1).
 	broken, refused bool
 	brokenAt        string
+	// watchErrs counts the watch errors recorded above (bumped under rw.mu,
+	// read lock-free), and installAt is the instance's position read by
+	// installBuild with no lock held, with the count at that read (#1146:
+	// LastSyncResourceVersion is never read under rw.mu). An error counted
+	// after the read is newer than installAt.rv.
+	watchErrs atomic.Uint64
+	installAt instancePosition
 
 	// account is the known-stale accounting of the build that installed this
 	// instance, until its swap goroutine claims it at step 3 (or a later
@@ -140,35 +147,49 @@ func newStoreInstance(gvr schema.GroupVersionResource, gi informers.GenericInfor
 	}
 }
 
+// instancePosition is an informer's LastSyncResourceVersion read with no lock
+// held, and the instance's recorded watch-error count just before that read.
+type instancePosition struct {
+	rv   string
+	errs uint64
+}
+
+// errorAfterInstallRead reports a watch error recorded after installBuild read
+// the position: that error is the newer event. Callers hold rw.mu.
+func (in *storeInstance) errorAfterInstallRead() bool {
+	return in.watchErrs.Load() != in.installAt.errs
+}
+
 // watchStateNow is the candidate's watch state judged at the install by the
 // live copy's conjunct-3 recovery rule (watchHealed): an error the reflector
 // has since recovered from (its position advanced past the one at the error
-// and it is synced) is not copied. Callers hold rw.mu.
+// and it is synced) is not copied. The position is the one installBuild read
+// before rw.mu (#1146); an error recorded after that read is newer than it,
+// so it is not healed. Callers hold rw.mu.
 func (in *storeInstance) watchStateNow() (broken, refused bool) {
 	if !in.broken {
 		return false, false
 	}
-	inf := in.gi.Informer()
-	if watchHealed(inf.LastSyncResourceVersion(), in.brokenAt, inf.HasSynced()) {
+	if !in.errorAfterInstallRead() && watchHealed(in.installAt.rv, in.brokenAt, in.gi.Informer().HasSynced()) {
 		return false, false
 	}
 	return true, in.refused
+}
+
+// installBaseline is the conjunct-3 recovery baseline the install writes: the
+// position installBuild read, or — when the copy recorded a watch error after
+// that read — the position at that error. Callers hold rw.mu.
+func (in *storeInstance) installBaseline() string {
+	if in.broken && in.errorAfterInstallRead() {
+		return in.brokenAt
+	}
+	return in.installAt.rv
 }
 
 // closeStop closes the instance's stop channel exactly once, from any caller
 // (design v5.1 C3: every waiter closes every retiring instance's stop).
 func (in *storeInstance) closeStop() {
 	in.stopOnce.Do(func() { close(in.stop) })
-}
-
-// closeDeliveryLog closes a build copy's own delivery log when the copy is
-// dropped before its install (aborted or superseded): #918, its pending keys
-// and resolver go with the informer. A live copy's log is closed through
-// rw.deliveries (perGVRFields "deliveries").
-func (in *storeInstance) closeDeliveryLog() {
-	if in.dl != nil {
-		in.dl.close()
-	}
 }
 
 func (in *storeInstance) stopped() bool {
