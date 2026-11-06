@@ -32,6 +32,57 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("never happened: %s", what)
 }
 
+// wireAttempts bounds untilWire. net/http can lose an HTTP/1 connection by itself:
+// it keeps one only if the request's write status arrives within 50 ms of the
+// response ending (persistConn.wroteRequest, maxWriteWaitBeforeConnReuse), and a
+// thread that loses the CPU between its write and that status misses it. Measured
+// on plain net/http at load 75–115, both toolchains: 9 misses in 18,070 pairs of
+// requests, and 0 in 17,528 with only that timer raised, while 92 waits ran past
+// 50 ms. No test can prevent it, so an arm that needs a connection to survive may
+// have to try again. The count is of attempts, not of time.
+const wireAttempts = 8
+
+// untilWire runs sequence until the server saw exactly conns connections and reqs
+// requests, on a fresh server each attempt. Every attempt must count exactly what
+// its server saw, reached or not; only the literal conns can take a second try. It
+// fails if no attempt reaches it, so a toolchain or transport that stops keeping
+// connections cannot pass.
+func untilWire(t *testing.T, conns, reqs int64, cells string, sequence func(t *testing.T) *wireServer) {
+	t.Helper()
+	for range wireAttempts {
+		before := connCells()
+		s := sequence(t)
+		s.assertCounted(t, before, cells, reqs)
+		if s.conns.Load() == conns {
+			return
+		}
+	}
+	t.Fatalf("no attempt in %d reached %d connections for %d requests", wireAttempts, conns, reqs)
+}
+
+// watchPool returns ctx with a report of whether the transport kept this
+// request's connection, which net/http makes before a body read to its end
+// returns.
+func watchPool(ctx context.Context) (context.Context, *atomic.Bool) {
+	kept := new(atomic.Bool)
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		PutIdleConn: func(err error) {
+			if err == nil {
+				kept.Store(true)
+			}
+		},
+	}), kept
+}
+
+// decided waits until the transport has decided about a connection whose body was
+// closed early, and reports whether it kept it: it says so (kept) or the server
+// sees the connection close. A request sent after this cannot race the drain.
+func decided(t *testing.T, s *wireServer, kept *atomic.Bool) bool {
+	t.Helper()
+	eventually(t, "the transport keeps or closes the connection", func() bool { return kept.Load() || s.closed.Load() > 0 })
+	return kept.Load()
+}
+
 func tryGet(ctx context.Context, cli *http.Client, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -52,6 +103,18 @@ func tryGet(ctx context.Context, cli *http.Client, url string) error {
 // it reused, so a counter built on GotConnInfo.Reused never sees it, while the
 // server accepted two connections.
 func TestConnections847_DialServedByAnotherConnectionIsStillOpened(t *testing.T) {
+	for range wireAttempts {
+		if parkedDialAttempt(t) {
+			return
+		}
+	}
+	t.Fatalf("the busy connection never served the waiting request in %d attempts", wireAttempts)
+}
+
+// parkedDialAttempt reports whether the attempt reached that shape; the counters
+// must match the server either way.
+func parkedDialAttempt(t *testing.T) bool {
+	t.Helper()
 	entered, finish := make(chan struct{}), make(chan struct{})
 	s := newWireServer(t, wirePlain, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/busy" {
@@ -76,32 +139,40 @@ func TestConnections847_DialServedByAnotherConnectionIsStillOpened(t *testing.T)
 	cli := &http.Client{Transport: tr}
 	before := connCells()
 
+	busyCtx, kept := watchPool(context.Background())
 	busy := make(chan error, 1)
-	go func() { busy <- tryGet(context.Background(), cli, s.URL+"/busy") }()
+	go func() { busy <- tryGet(busyCtx, cli, s.URL+"/busy") }()
 	<-entered
 
-	var servedByTheBusyConnection atomic.Bool
+	var reused atomic.Bool
 	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
-		GotConn: func(i httptrace.GotConnInfo) { servedByTheBusyConnection.Store(i.Reused) },
+		GotConn: func(i httptrace.GotConnInfo) { reused.Store(i.Reused) },
 	})
 	second := make(chan error, 1)
 	go func() { second <- tryGet(ctx, cli, s.URL) }()
 	<-dialing // the second request is queued for a connection, and its dial is out
 	close(finish)
-	for _, c := range []chan error{busy, second} {
-		if err := <-c; err != nil {
-			t.Fatal(err)
-		}
+	if err := <-busy; err != nil {
+		t.Fatal(err)
 	}
-	if !servedByTheBusyConnection.Load() {
-		t.Fatal("the second request did not get the busy connection: the arm did not reach its shape")
+	// By now the transport has either handed the busy connection on or dropped it.
+	// If it dropped it, the second request is waiting for the dial.
+	shape := kept.Load()
+	if !shape {
+		letLand()
 	}
-
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if shape && !reused.Load() {
+		t.Fatal("the transport kept the busy connection, and the waiting request did not get it")
+	}
 	letLand()
-	eventually(t, "the server accepts the parked dial", func() bool { return s.conns.Load() == 2 })
-	eventually(t, "the parked dial is counted", func() bool { return connCells()["stage/http1/opened"]-before["stage/http1/opened"] == 2 })
+	eventually(t, "the server accepts the dial", func() bool { return s.conns.Load() == 2 })
+	eventually(t, "the dial is counted", func() bool { return connCells()["stage/http1/opened"]-before["stage/http1/opened"] == 2 })
 	s.assertWire(t, 2, 2)
 	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 2})
+	return shape
 }
 
 // A busy pool, one in twenty bodies closed unread: opened is what the server
@@ -265,53 +336,96 @@ func TestConnections847_FailedDialIsNotAConnection(t *testing.T) {
 	})
 }
 
+// heldConn holds the client's first read, which is the TLS handshake's wait for
+// the server's answer, until release returns.
+type heldConn struct {
+	net.Conn
+	once sync.Once
+	hold func()
+}
+
+func (c *heldConn) Read(p []byte) (int, error) {
+	c.once.Do(c.hold)
+	return c.Conn.Read(p)
+}
+
 // The other side of that line: a dial that comes up after its request left is a
 // connection. The server accepted it and the cost is paid, so it is opened, and
-// no request was handed it.
+// no request was handed it. https is its own hook, and the shape of every per-user
+// client, so it is pinned there too: the request leaves during the connect, and
+// during the handshake.
 func TestConnections847_DialThatLandsAfterItsRequestLeftIsOpened(t *testing.T) {
-	s := newWireServer(t, wirePlain, nil)
-	dialing, land := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	letLand := func() { once.Do(func() { close(land) }) }
-	t.Cleanup(letLand)
-	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-		close(dialing)
-		<-land
-		return (&net.Dialer{}).DialContext(ctx, network, addr)
-	}}
-	t.Cleanup(tr.CloseIdleConnections)
-	ctx, cancel := context.WithCancel(context.Background())
-	before := connCells()
-	done := make(chan error, 1)
-	go func() { done <- tryGet(ctx, &http.Client{Transport: tr}, s.URL) }()
-	<-dialing
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the request ended with %v, want its cancellation", err)
+	for _, tc := range []struct {
+		name      string
+		mode      wireMode
+		cell      string
+		handshake bool
+	}{
+		{"http, during the connect", wirePlain, "stage/http1/opened", false},
+		{"https http1, during the connect", wireTLSH1, "stage/http1/opened", false},
+		{"https http2, during the connect", wireH2, "stage/http2/opened", false},
+		{"https http1, during the handshake", wireTLSH1, "stage/http1/opened", true},
+		{"https http2, during the handshake", wireH2, "stage/http2/opened", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newWireServer(t, tc.mode, nil)
+			dialing, land := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			letLand := func() { once.Do(func() { close(land) }) }
+			t.Cleanup(letLand)
+			hold := func() {
+				close(dialing)
+				<-land
+			}
+			tr := s.Client().Transport.(*http.Transport).Clone()
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if !tc.handshake {
+					hold()
+				}
+				c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+				if err != nil || !tc.handshake {
+					return c, err
+				}
+				return &heldConn{Conn: c, hold: hold}, nil
+			}
+			t.Cleanup(tr.CloseIdleConnections)
+			ctx, cancel := context.WithCancel(context.Background())
+			before := connCells()
+			done := make(chan error, 1)
+			go func() { done <- tryGet(ctx, &http.Client{Transport: tr}, s.URL) }()
+			<-dialing
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("the request ended with %v, want its cancellation", err)
+			}
+			if d := connCells()[tc.cell] - before[tc.cell]; d != 0 {
+				t.Fatalf("%s moved by %d before the dial landed: the arm did not reach its shape", tc.cell, d)
+			}
+			letLand()
+			eventually(t, "the server accepts the dial", func() bool { return s.conns.Load() == 1 })
+			eventually(t, "the dial is counted", func() bool { return connCells()[tc.cell]-before[tc.cell] == 1 })
+			s.assertWire(t, 1, 0)
+			assertConnDelta(t, before, map[string]uint64{tc.cell: 1})
+		})
 	}
-	letLand()
-	eventually(t, "the server accepts the dial", func() bool { return s.conns.Load() == 1 })
-	eventually(t, "the dial is counted", func() bool { return connCells()["stage/http1/opened"]-before["stage/http1/opened"] == 1 })
-	s.assertWire(t, 1, 0)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1})
 }
 
 // A redirect hop takes a connection of its own.
 func TestConnections847_RedirectHops(t *testing.T) {
 	t.Run("same origin: a second handover on the same connection", func(t *testing.T) {
-		s := newWireServer(t, wirePlain, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/a" {
-				http.Redirect(w, r, "/b", http.StatusFound)
-				return
+		untilWire(t, 1, 2, "stage/http1", func(t *testing.T) *wireServer {
+			s := newWireServer(t, wirePlain, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/a" {
+					http.Redirect(w, r, "/b", http.StatusFound)
+					return
+				}
+				_, _ = w.Write([]byte("ok"))
+			})
+			if resp := get(t, EgressStage, s.Client(), s.URL+"/a"); resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d, want the hop's 200", resp.StatusCode)
 			}
-			_, _ = w.Write([]byte("ok"))
+			return s
 		})
-		before := connCells()
-		if resp := get(t, EgressStage, s.Client(), s.URL+"/a"); resp.StatusCode != http.StatusOK {
-			t.Fatalf("status %d, want the hop's 200", resp.StatusCode)
-		}
-		s.assertWire(t, 1, 2)
-		assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
 	})
 	t.Run("another origin: refused, nothing opened there", func(t *testing.T) {
 		foreign := newWireServer(t, wirePlain, nil)
@@ -333,6 +447,19 @@ func TestConnections847_RedirectHops(t *testing.T) {
 // one request; the wire saw two connections and three requests. The server is
 // raw, because it has to drop a connection at exactly that point.
 func TestConnections847_DeadPooledConnection(t *testing.T) {
+	for range wireAttempts {
+		if deadPoolAttempt(t) {
+			return
+		}
+	}
+	t.Fatalf("the first connection was never reused in %d attempts", wireAttempts)
+}
+
+// deadPoolAttempt reports whether the second request really took the pooled
+// connection (three requests on the wire); the counters must match the server
+// either way.
+func deadPoolAttempt(t *testing.T) bool {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -374,8 +501,10 @@ func TestConnections847_DeadPooledConnection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if a, r := accepted.Load(), served.Load(); a != 2 || r != 3 {
-		t.Fatalf("the server saw %d connections and %d requests, want 2 and 3", a, r)
+	a, r := accepted.Load(), served.Load()
+	if a != 2 {
+		t.Fatalf("the server saw %d connections, want 2", a)
 	}
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 3})
+	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": uint64(a), "stage/http1/handovers": uint64(r)})
+	return r == 3
 }

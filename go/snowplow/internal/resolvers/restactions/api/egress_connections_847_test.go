@@ -54,8 +54,8 @@ func stageCells847() map[string]uint64 {
 	return m
 }
 
-// Ten fetches of one external endpoint: one connection on the wire, one opened
-// and ten handovers, under the stage egress and nowhere else.
+// Ten fetches of one external endpoint: opened is what the server accepted and
+// handovers is one per fetch, under the stage egress and nowhere else.
 func TestEgressConnections847_StageFetchCountsUnderStage(t *testing.T) {
 	srv, conns := stageServer847(t)
 	ep := &endpoints.Endpoint{ServerURL: srv.URL, Token: "third-party-token"}
@@ -65,14 +65,11 @@ func TestEgressConnections847_StageFetchCountsUnderStage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if c := conns.Load(); c != 1 {
-		t.Fatalf("the server saw %d connections, want 1", c)
-	}
 	for k, v := range stageCells847() {
 		want := uint64(0)
 		switch k {
 		case "stage/http1/opened":
-			want = 1
+			want = uint64(conns.Load())
 		case "stage/http1/handovers":
 			want = 10
 		}
@@ -175,7 +172,7 @@ func TestEgressConnections847_Expvar(t *testing.T) {
 			}
 		}
 	}
-	srv, _ := stageServer847(t)
+	srv, conns := stageServer847(t)
 	ep := &endpoints.Endpoint{ServerURL: srv.URL, Token: "third-party-token"}
 	for range 2 {
 		if err := fetch1088(t, context.Background(), ep, http.MethodGet); err != nil {
@@ -183,8 +180,8 @@ func TestEgressConnections847_Expvar(t *testing.T) {
 		}
 	}
 	after := read()
-	if d := after["stage"]["http1"]["opened"] - before["stage"]["http1"]["opened"]; d != 1 {
-		t.Errorf("opened moved by %d, want 1", d)
+	if d, want := after["stage"]["http1"]["opened"]-before["stage"]["http1"]["opened"], uint64(conns.Load()); d != want {
+		t.Errorf("opened moved by %d, want the %d the server accepted", d, want)
 	}
 	if d := after["stage"]["http1"]["handovers"] - before["stage"]["http1"]["handovers"]; d != 2 {
 		t.Errorf("handovers moved by %d, want 2", d)

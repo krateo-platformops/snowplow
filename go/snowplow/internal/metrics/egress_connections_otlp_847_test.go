@@ -66,14 +66,11 @@ func TestEgressConnections847_ReachOTLP(t *testing.T) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
-	if c := conns.Load(); c != 1 {
-		t.Fatalf("the server saw %d connections, want 1", c)
-	}
 	for k, v := range cells() {
 		want := int64(0)
 		switch k {
 		case openedName + "/stage/http1":
-			want = 1
+			want = int64(conns.Load())
 		case handoversName + "/stage/http1":
 			want = 3
 		}

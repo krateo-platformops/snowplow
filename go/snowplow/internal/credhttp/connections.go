@@ -9,9 +9,18 @@ package credhttp
 // THE READING. reuse share = 1 − opened / handovers, per egress and protocol. A
 // connection that is thrown away costs the next request a TCP connect and, on
 // https, a TLS handshake. A latency cannot stand in for that, because a latency
-// moves with load. The share does not, so a paired bench run that changes only
-// the toolchain (#847: Go 1.27 drains an HTTP/1 body closed early and keeps the
-// connection) can read the effect directly.
+// moves with load. The share holds still under load as long as a pool's requests
+// in flight stay at or under its idle cap (below), so a paired bench run that
+// changes only the toolchain (#847: Go 1.27 drains an HTTP/1 body closed early and
+// keeps the connection) can read the effect directly.
+//
+// THE IDLE CAP. Past it the share moves with load, and rightly: a connection that
+// comes free with the pool's idle slots full is closed, and the next request opens
+// another one. opened counts them all, as it should, but that drop is load, not
+// reuse being lost. The cap is per host: 25 on a kept stage client (client-go's
+// MaxIdleConnsPerHost) and net/http's default of 2 on authn and the RUM forwarder,
+// which are serial. A toolchain that changes latency changes what is in flight, so
+// a pair read past the cap can show a change the toolchain's reuse did not cause.
 //
 // WHY TWO COUNTERS AND NOT GotConnInfo.Reused. Reused does not say "this
 // connection has carried a request before". A dial whose waiter was served by
@@ -40,7 +49,9 @@ package credhttp
 // requests that started them have finished, so read the share over a whole phase.
 //
 // The one shape that overcounts: an https:// request through an https:// proxy
-// does two TLS handshakes on one connection, and each counts as opened.
+// does two TLS handshakes on one connection, and each counts as opened, under the
+// protocol that handshake negotiated. So an HTTP/2 target through such a proxy also
+// adds the proxy's handshake to the http1 cell, with no handover to go with it.
 //
 // WHY PROTOCOL IS A LABEL. Go 1.27's change is HTTP/1 only, and one egress can
 // carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster

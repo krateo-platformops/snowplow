@@ -19,14 +19,14 @@ import (
 // The third request is the control: it reuses, so it was the early close that
 // lost the first connection, not the server.
 func TestConnections847_EarlyClosedBodyOnHTTP1IsANewConnection(t *testing.T) {
-	s := newWireServer(t, wirePlain, nil)
-	cli := s.Client()
-	before := connCells()
-	sendUnread(t, context.Background(), cli, s.URL)
-	get(t, EgressStage, cli, s.URL)
-	get(t, EgressStage, cli, s.URL)
-	s.assertWire(t, 2, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 2, "stage/http1/handovers": 3})
+	untilWire(t, 2, 3, "stage/http1", func(t *testing.T) *wireServer {
+		s := newWireServer(t, wirePlain, nil)
+		cli := s.Client()
+		sendUnread(t, context.Background(), cli, s.URL)
+		get(t, EgressStage, cli, s.URL)
+		get(t, EgressStage, cli, s.URL)
+		return s
+	})
 }
 
 // #847's first row: a retryable answer has its body closed unread, so the retry

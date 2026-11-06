@@ -69,10 +69,10 @@ const (
 )
 
 // wireServer counts, on the server's side of the wire, the connections it
-// accepted and the requests it served.
+// accepted, the ones that have closed, and the requests it served.
 type wireServer struct {
 	*httptest.Server
-	conns, reqs atomic.Int64
+	conns, closed, reqs atomic.Int64
 }
 
 func newWireServer(t *testing.T, mode wireMode, h http.HandlerFunc) *wireServer {
@@ -89,8 +89,11 @@ func newWireServer(t *testing.T, mode wireMode, h http.HandlerFunc) *wireServer 
 		h(w, r)
 	}))
 	s.Config.ConnState = func(_ net.Conn, st http.ConnState) {
-		if st == http.StateNew {
+		switch st {
+		case http.StateNew:
 			s.conns.Add(1)
+		case http.StateClosed:
+			s.closed.Add(1)
 		}
 	}
 	switch mode {
@@ -112,6 +115,18 @@ func (s *wireServer) assertWire(t *testing.T, conns, reqs int64) {
 	if c, r := s.conns.Load(), s.reqs.Load(); c != conns || r != reqs {
 		t.Fatalf("the server saw %d connections and %d requests, want %d and %d", c, r, conns, reqs)
 	}
+}
+
+// assertCounted fails unless the server served reqs requests and the cells moved
+// by exactly what the server saw: opened by the connections it accepted, handovers
+// by the requests it served, and nothing else. For an arm that counts and does not
+// need any particular connection to survive.
+func (s *wireServer) assertCounted(t *testing.T, before map[string]uint64, cells string, reqs int64) {
+	t.Helper()
+	if r := s.reqs.Load(); r != reqs {
+		t.Fatalf("the server served %d requests, want %d", r, reqs)
+	}
+	assertConnDelta(t, before, map[string]uint64{cells + "/opened": uint64(s.conns.Load()), cells + "/handovers": uint64(reqs)})
 }
 
 // sendOpen sends one request through Send and leaves its body to the caller.
@@ -151,14 +166,14 @@ func get(t *testing.T, site string, cli *http.Client, url string) *http.Response
 
 // One connection serves three requests: one opened, three handovers.
 func TestConnections847_ReusedConnectionIsOneOpenedManyHandovers(t *testing.T) {
-	s := newWireServer(t, wirePlain, nil)
-	cli := s.Client()
-	before := connCells()
-	for range 3 {
-		get(t, EgressStage, cli, s.URL)
-	}
-	s.assertWire(t, 1, 3)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 3})
+	untilWire(t, 1, 3, "stage/http1", func(t *testing.T) *wireServer {
+		s := newWireServer(t, wirePlain, nil)
+		cli := s.Client()
+		for range 3 {
+			get(t, EgressStage, cli, s.URL)
+		}
+		return s
+	})
 }
 
 // Keep-alives off: every request opens its own connection.
@@ -227,8 +242,7 @@ func TestConnections847_HTTP1NegotiatedOverALPNCountsAsHTTP1(t *testing.T) {
 			t.Fatalf("the arm spoke HTTP/%d with ALPN %+v, want http/1.1 negotiated", resp.ProtoMajor, resp.TLS)
 		}
 	}
-	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
+	s.assertCounted(t, before, "stage/http1", 2)
 }
 
 // hardenedClient is a real client-go http.Client for s, built the way every
@@ -311,8 +325,7 @@ func TestConnections847_EveryPathThroughSendCounts(t *testing.T) {
 			for range 2 {
 				send(t, tc.ctx(), EgressStage, cli, tc.method, s.URL)
 			}
-			s.assertWire(t, 1, 2)
-			assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
+			s.assertCounted(t, before, "stage/http1", 2)
 		})
 	}
 }
@@ -334,8 +347,7 @@ func TestConnections847_EachAttemptCounts(t *testing.T) {
 	if resp := get(t, EgressStage, cli, s.URL); resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d, want the retry's 200", resp.StatusCode)
 	}
-	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"stage/http1/opened": 1, "stage/http1/handovers": 2})
+	s.assertCounted(t, before, "stage/http1", 2)
 }
 
 // The /call passthrough counts under its own egress. Do builds a client per
@@ -370,8 +382,7 @@ func TestConnections847_CountConnectionsOn(t *testing.T) {
 	for range 2 {
 		clientGet(t, cli, s.URL, 1)
 	}
-	s.assertWire(t, 1, 2)
-	assertConnDelta(t, before, map[string]uint64{"authn/http1/opened": 1, "authn/http1/handovers": 2})
+	s.assertCounted(t, before, "authn/http1", 2)
 }
 
 // The counting layer stays walkable: the idle sweep (#1101 review B2) reaches

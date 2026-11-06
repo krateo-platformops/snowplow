@@ -429,6 +429,8 @@ Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egre
 
 **Read the share `1 - opened / handovers`, per egress and protocol, over a whole phase, not a latency:** a latency moves with load. A new connection costs a TCP connect and, on https, a TLS handshake.
 
+**The share holds still under load only while the requests in flight on one pool stay at or under its idle cap.** The cap is per host: 25 on a kept stage client (client-go's `MaxIdleConnsPerHost`), and `net/http`'s default of 2 on `authn` and `rum_forward`, which are serial. Past the cap, a connection that comes free with the idle slots full is closed and the next request opens another. `opened` counts them all, as it should, but that drop is load and not reuse being lost. A toolchain that changes latency changes what is in flight, so a pair read past the cap can show a change the toolchain's reuse did not cause. Compare phases that stayed under the cap, or say that they did not. Measured on loopback at a cap of 25 with nothing but concurrency changing: 100.00% at up to 24 in flight, about 99.6% at 32, 98.9% at 48 and 96.5–97.4% at 96. With 5% of bodies closed unread, a Go 1.26 to Go 1.27 pair gained 4.75–6.35 points at or under the cap and 5.16–16.45 past it, so a pair read past the cap can overstate the bump as well.
+
 | counter | one count is |
 |---|---|
 | `opened` | a connection that came up: TCP connected on `http://`, TLS handshake finished on `https://`. It equals what the servers accepted, however concurrent the pool. A dial that fails or is given up before it is up does not count. One that comes up after its request left does, used or not: the cost is paid |
@@ -444,7 +446,7 @@ Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egre
 | | `other` | a name outside the set. No caller sends one, so anything here is a bug. It keeps the set closed |
 | `protocol` | `http1`, `http2` | what the connection negotiated. One egress can carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster `http://` service over HTTP/1 |
 
-No label carries a host, a path, an identity or a status. The three OTLP exporters (metrics, traces, logs) build their own clients and are not counted. One shape overcounts: an `https://` request through an `https://` proxy does two TLS handshakes on one connection, and each counts as opened. An interval can read more `opened` than `handovers`, when dials land after the requests that started them have finished.
+No label carries a host, a path, an identity or a status. The three OTLP exporters (metrics, traces, logs) build their own clients and are not counted. One shape overcounts: an `https://` request through an `https://` proxy does two TLS handshakes on one connection, and each counts as opened, under the protocol that handshake negotiated. So an HTTP/2 target through such a proxy also adds the proxy's handshake to the `http1` cell, with no handover to go with it. Through a forward proxy, `opened` counts snowplow's connections to the proxy, not the proxy's onward ones. An interval can read more `opened` than `handovers`, when dials land after the requests that started them have finished.
 
 Reading it across Go 1.27. From Go 1.27 the transport drains an HTTP/1 body closed before its end, in the background, up to 256 KiB or 50 ms, and keeps the connection, so a cell can only move if something in it closes a body early and then sends again on the same client:
 
@@ -454,7 +456,9 @@ Reading it across Go 1.27. From Go 1.27 the transport drains an HTTP/1 body clos
 | `call/http1` | moves only through a retry inside one call | the early closes are here too (a refused 3xx, a wrong content type, the 2048-byte cap), but `credhttp.Do` builds a client per call, so the next `/call` opens a connection anyway. The share is near 0 on any toolchain, which is the transport's doing |
 | `authn/http1` | flat | every body is read whole |
 | `rum_forward/http1` | flat unless a collector answers over 64 KiB | bodies are read up to 64 KiB |
+| `apiserver/http1` | empty, unless a client-go target is plain `http://` | client-go negotiates HTTP/2 with every apiserver |
 | every `http2` cell | flat, so `apiserver/http2` is the control of a paired run | the drain is HTTP/1 only, and HTTP/2 keeps its connection anyway. On Go 1.27 client-go's HTTP/2 runs on a different implementation, so read this control instead of assuming it |
+| `other` | always 0 | no caller sends a name outside the set |
 
 A body over 256 KiB, or a request sent before the drain ends, still takes a new connection, so a share below 100% is not by itself a defect.
 
