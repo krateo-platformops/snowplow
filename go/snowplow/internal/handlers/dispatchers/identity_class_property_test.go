@@ -155,7 +155,20 @@ func icsPublish(t *testing.T, objs []runtime.Object) *dynamicfake.FakeDynamicCli
 		wcancel()
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #1206 — settle before reading: the watcher's own initial publish, then this
+	// complete one, then whatever its events still have in flight. Keys and
+	// verdicts must read one snapshot, or the arms compare two.
+	if err := rw.WaitInitialRBACPublishForTest(30 * time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitInitialRBACPublishForTest: %v", err)
+	}
 	cache.RebuildRBACSnapshotForTest(rw)
+	if err := cache.WaitRBACRebuildQuiesceForTest(30 * time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitRBACRebuildQuiesceForTest: %v", err)
+	}
 	// The steady state after boot: the prewarm engine has built the
 	// BindingsByGVR index (prewarm_engine_boot.go), whose role → bindings map is
 	// how a Role-rules edit reaches the sub-generation of every bound subject.
