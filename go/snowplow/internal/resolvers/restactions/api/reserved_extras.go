@@ -170,7 +170,7 @@ func RefuseReservedExtras(ctx context.Context, items []*templates.API, extras ma
 	for _, k := range re.Keys {
 		keys = append(keys, k.Owner+":"+k.Key)
 	}
-	xcontext.Logger(ctx).Warn("resolve refused: extras name keys the resolver writes (#1116)",
+	xcontext.Logger(ctx).WarnContext(ctx, "resolve refused: extras name keys the resolver writes (#1116)",
 		slog.String("restaction_namespace", raNamespace),
 		slog.String("restaction_name", raName),
 		slog.Any("reserved_keys", keys))

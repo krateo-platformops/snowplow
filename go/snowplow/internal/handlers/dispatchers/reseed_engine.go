@@ -106,7 +106,7 @@ func reseedTargets(ctx context.Context, deps rePrewarmDeps, reqs []reseedRequest
 			return append(reEnqueue, reqs[i:]...)
 		default:
 			passStats.unitDone()
-			slog.Warn("prewarm.engine.reseed.target_error",
+			slog.WarnContext(ctx, "prewarm.engine.reseed.target_error",
 				slog.String("subsystem", "cache"),
 				slog.String("mode", seedModeRBACShift.String()),
 				slog.String("class", reseedClass(reqs[i])),

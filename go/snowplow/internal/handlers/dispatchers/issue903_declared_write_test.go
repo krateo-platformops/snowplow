@@ -195,7 +195,7 @@ func TestIssue903_S3_DeclaredWriteRANeverStored_TheWriteRunsOnTheNextCall(t *tes
 	e.update(t, c681CMs, cm)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		u, ok := e.rw.GetObject(c681CMs, "pub", "p")
+		u, ok := e.rw.GetObject(context.Background(), c681CMs, "pub", "p")
 		if ok && u != nil {
 			if d, _, _ := unstructured.NestedString(u.Object, "data", "todo"); d == `["x"]` {
 				break

@@ -56,6 +56,7 @@ func EmitSlowForTest(route string, p Phase, d time.Duration) {
 	r.ph[p].ns.Store(int64(d))
 	r.ph[p].max.Store(int64(d))
 	r.ph[p].n.Store(1)
+	// log-ctx-waiver: detached: a test seam that emits a record with no request behind it
 	m.emit(context.Background(), r, m.bound+d, end, ReleaseCompleted)
 }
 

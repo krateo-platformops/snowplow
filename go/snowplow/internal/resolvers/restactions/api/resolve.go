@@ -489,7 +489,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// stageReturn); nothing was read or dialed. The Secret name embeds a
 	// username, so it is not logged, in clear or as a label (#1192).
 	if err := r.mapper.refusePerUserRef(ref); err != nil {
-		r.log.Error("endpointRef refused: it names a per-user credential Secret",
+		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
 			slog.String("name", id),
 			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
 			slog.Bool("templated", templated),
@@ -503,7 +503,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// path the caller cannot list is then the apiserver's 403 stage error.
 		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil)
 		if err != nil {
-			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
+			r.log.ErrorContext(r.ctx, "userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
 			return endpoints.Endpoint{}, false, false, stageReturn
 		}
@@ -513,7 +513,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
-			r.log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
+			r.log.ErrorContext(r.ctx, "userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
 				slog.String("name", id), slog.Any("err", saErr))
 			// Fail-closed-but-respond: per Revision 5 atomic
 			// ship there is no toggle to fall back to the
@@ -538,7 +538,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	}
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
 	if err != nil {
-		r.log.Error("unable to resolve api endpoint reference",
+		r.log.ErrorContext(r.ctx, "unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
 		// #1115 — the endpointRef Secret read is a network exchange of this
 		// request: if the page budget ended it, the stage outcome reads
@@ -631,7 +631,7 @@ func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, ap
 		// Runs on the stage-loop goroutine before any worker exists, so dict
 		// needs no lock.
 		msg := iterErr.Error()
-		r.log.Error("stage iterator failed; stage not dispatched",
+		r.log.ErrorContext(provCtx, "stage iterator failed; stage not dispatched",
 			slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
@@ -981,7 +981,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	feedRawOrResolved := func(raw []byte, dispatch string) string {
 		substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 		if rerr != nil {
-			r.log.Error("in-process resolve failed",
+			r.log.ErrorContext(gctx, "in-process resolve failed",
 				slog.String("name", id),
 				slog.String("path", call.Path),
 				slog.String("dispatch", dispatch+"-resolve"),
@@ -999,7 +999,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			dispatch += "-resolved"
 		}
 		if ferr := feedBytes(bytesToFeed); ferr != nil {
-			r.log.Error("response handler failed",
+			r.log.ErrorContext(gctx, "response handler failed",
 				slog.String("name", id),
 				slog.String("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1072,7 +1072,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage
 				// error, never a fall-through that would rebuild the refused list.
-				r.log.Error("apistage content fill not admitted",
+				r.log.ErrorContext(fallCtx, "apistage content fill not admitted",
 					slog.String("name", id),
 					slog.String("path", call.Path),
 					slog.String("error", cerr.Error()))
@@ -1111,7 +1111,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					dispatch := "apistage-content"
 					substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 					if rerr != nil {
-						r.log.Error("in-process resolve failed",
+						r.log.ErrorContext(fallCtx, "in-process resolve failed",
 							slog.String("name", id),
 							slog.String("path", call.Path),
 							slog.String("dispatch", "apistage-content-resolve"),
@@ -1135,7 +1135,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 							}
 						}
 						if ferr != nil {
-							r.log.Error("apistage-content response handler failed",
+							r.log.ErrorContext(fallCtx, "apistage-content response handler failed",
 								slog.String("name", id),
 								slog.String("path", call.Path),
 								slog.String("dispatch", dispatch),
@@ -1351,7 +1351,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, derr := dispatchViaDiscovery(gctx, call); served || derr != nil {
 		dispatch := "discovery"
 		if derr != nil {
-			r.log.Error("api call response failure", slog.String("name", id),
+			r.log.ErrorContext(gctx, "api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
@@ -1374,7 +1374,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
-			r.log.Error("discovery response handler failed",
+			r.log.ErrorContext(gctx, "discovery response handler failed",
 				slog.String("name", id),
 				slog.String("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1431,7 +1431,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve); did || rerr != nil {
 		dispatch := "cache-off-inprocess-resolve"
 		if rerr != nil {
-			r.log.Error("in-process resolve failed (cache-off path)",
+			r.log.ErrorContext(gctx, "in-process resolve failed (cache-off path)",
 				slog.String("name", id),
 				slog.String("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1443,7 +1443,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
-			r.log.Error("in-process resolve response handler failed (cache-off path)",
+			r.log.ErrorContext(gctx, "in-process resolve response handler failed (cache-off path)",
 				slog.String("name", id),
 				slog.String("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1515,7 +1515,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
-		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
+		r.log.WarnContext(gctx, "branch-E SA-endpoint dial re-gated and failed closed",
 			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
@@ -1616,7 +1616,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	}
 
 	if res.Status == response.StatusFailure {
-		r.log.Error("api call response failure", slog.String("name", id),
+		r.log.ErrorContext(fctx, "api call response failure", slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
@@ -1631,7 +1631,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 		asMap, mapErr := response.AsMap(res)
 		if mapErr != nil {
-			r.log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
+			r.log.WarnContext(fctx, "unable to encode status as dict", slog.Any("err", mapErr))
 		}
 
 		// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
@@ -1724,7 +1724,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// Get the api with this identifier
 	apiCall, ok := apiMap[id]
 	if !ok {
-		r.log.Warn("api not found in apiMap", slog.Any("name", id))
+		r.log.WarnContext(r.ctx, "api not found in apiMap", slog.Any("name", id))
 		return false
 	}
 	if apiCall.Headers == nil {
@@ -2209,14 +2209,14 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("unable to fetch user info from context", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to fetch user info from context", slog.Any("err", err))
 		return abortedResolve(ctx, opts.Items)
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
-		log.Error("unable to sorted api by deps", slog.Any("error", err))
+		log.ErrorContext(ctx, "unable to sorted api by deps", slog.Any("error", err))
 		return abortedResolve(ctx, opts.Items)
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))
@@ -2476,7 +2476,7 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 			)
 		}
 		if elapsed > lazyRegisterSlowThreshold {
-			log.Warn("cache.lazy_register.slow",
+			log.WarnContext(ctx, "cache.lazy_register.slow",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.Duration("elapsed", elapsed),

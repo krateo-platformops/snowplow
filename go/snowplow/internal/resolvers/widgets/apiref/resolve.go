@@ -199,7 +199,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// uses to verify the StatusError chain is preserved. Single
 		// emission per apiref error — no per-request fan-out.
 		if log := xcontext.Logger(ctx); log != nil {
-			log.Warn("apiref.resolve.error_preserved",
+			log.WarnContext(ctx, "apiref.resolve.error_preserved",
 				slog.Int("upstream_code", res.Err.Code),
 				slog.String("upstream_reason", string(res.Err.Reason)),
 				slog.String("gvr_group", res.GVR.Group),

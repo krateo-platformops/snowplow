@@ -209,6 +209,7 @@ func settleBindingsIndexBeforeReady() {
 		readySettleLastNanos.Store(int64(time.Since(start)))
 		if r := recover(); r != nil {
 			readySettlePanics.Add(1)
+			// log-ctx-waiver: boot: phase 1 settles the index before the pod is ready
 			slog.Error("cache.bindings_by_gvr.ready_settle_panic",
 				slog.String("subsystem", "cache"),
 				slog.String("panic_type", fmt.Sprintf("%T", r)), // metadata only, never the value
@@ -233,6 +234,7 @@ func settleBindingsIndexBeforeReady() {
 		return
 	}
 	readySettleDeferred.Add(1)
+	// log-ctx-waiver: boot: phase 1 settles the index before the pod is ready
 	slog.Warn("cache.bindings_by_gvr.ready_settle_deferred",
 		slog.String("subsystem", "cache"),
 		slog.String("effect", "Ready flips before the first complete RBAC snapshot: the bindings-index build "+

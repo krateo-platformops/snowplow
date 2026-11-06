@@ -438,6 +438,7 @@ var b777Walked = map[string]bool{"Resolve": true, "resolveApiRef": true}
 var b777Benign = map[string]bool{
 	"len": true, "make": true, "append": true,
 	"log.Error": true, "log.Warn": true, "log.Debug": true, "log.Info": true,
+	"log.ErrorContext": true, "log.WarnContext": true,
 	"slog.Any": true, "slog.String": true, "slog.Int64": true, "slog.Int": true,
 	"loggerAttr": true, "stageObject": true, "time.Since": true,
 	"maps.SetNestedField": true, "maps.StructSliceToMapSlice": true,

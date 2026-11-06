@@ -409,7 +409,7 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 			return nil, nil
 		}
 
-		slog.Warn(
+		slog.WarnContext(ctx,
 			"CACHE_ENABLED=false — typed-RBAC + informer cache + L1 ALL disabled (diagnostic mode; do not run in production)",
 			slog.String("subsystem", "cache"),
 			slog.Bool("plumbing_present", true),
@@ -459,14 +459,13 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		stopCh:                 make(chan struct{}),
 		rbacInitialPublishDone: make(chan struct{}),
 	}
-	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
 
 	// Revision 1 binding: register the four Role-Based Access Control
 	// GVRs eagerly and start the factory. This is the single set of
 	// types EvaluateRBAC reads from; without these we cannot meet the
 	// "zero SubjectAccessReview in cache=on" rule.
 	for _, gvr := range RBACResourceTypes {
-		rw.addResourceTypeLocked(gvr)
+		rw.addResourceTypeLocked(ctx, gvr)
 	}
 
 	// 0.30.99 Tag B — watch-handler coverage assertion. The SetTransform
@@ -658,7 +657,7 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 		_ = refuseUnservedVersion()
 		return
 	}
-	rw.addResourceTypeLocked(gvr)
+	rw.addResourceTypeLocked(context.Background(), gvr)
 }
 
 // EnsureResourceType is the idempotent, sync-channel-returning lazy
@@ -726,6 +725,13 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 // exists { return }`) so the classic check-then-act race window between
 // RUnlock and Lock is benign.
 func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
+	return rw.ensureResourceType(context.Background(), gvr)
+}
+
+// ensureResourceType is EnsureResourceType with the context of the caller that
+// asked (#1184): a registration a request triggers logs its WARNs with that
+// request's context, so they carry its trace_id. ctx selects nothing here.
+func (rw *ResourceWatcher) ensureResourceType(ctx context.Context, gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
 	if rw == nil {
 		return false, nil
 	}
@@ -905,7 +911,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// client, take the metadata path. Otherwise fall through to the
 	// dynamic full informer (the pre-§0.30.93 behaviour).
 	if shouldUseMetadataOnly(gvr) && rw.metaClient != nil {
-		rw.addResourceTypeMetadataOnlyLocked(gvr)
+		rw.addResourceTypeMetadataOnlyLocked(ctx, gvr)
 		ch := rw.syncCh[gvr]
 		slog.Info("cache.lazy_register.metadata_only",
 			slog.String("subsystem", "cache"),
@@ -926,7 +932,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// WARN so SRE sees the regression (Composition GVRs would land on
 	// the full-Unstructured informer and re-introduce the 0.30.92 OOM).
 	if shouldUseMetadataOnly(gvr) && rw.metaClient == nil {
-		slog.Warn("cache.lazy_register.metadata_only_unwired",
+		slog.WarnContext(ctx, "cache.lazy_register.metadata_only_unwired",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("hint", "predicate matched metadata-only routing but metaClient is nil — falling back to dynamic full informer; OOM risk at 50K scale"),
@@ -940,7 +946,7 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// sync-watcher goroutine. addResourceTypeLocked allocates the
 	// channel and stores it in rw.syncCh; we read it here and
 	// spawn the watcher so the channel closes on HasSynced.
-	rw.addResourceTypeLocked(gvr)
+	rw.addResourceTypeLocked(ctx, gvr)
 	ch := rw.syncCh[gvr]
 
 	// Falsifier per plan §"Pre-flight RUN protocol" step 2: emit a
@@ -1013,7 +1019,7 @@ func metadataOnlyReason(gvr schema.GroupVersionResource) string {
 //
 // Per `feedback_l1_invalidation_delete_only.md`: DELETE evicts, UPDATE
 // refreshes — preserved byte-for-byte from the full-informer path.
-func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVersionResource) {
+func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(ctx context.Context, gvr schema.GroupVersionResource) {
 	if rw.mode == modePassthrough {
 		return
 	}
@@ -1124,7 +1130,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// is the record alone (#870: wrapped by the reuse step, a no-op on a live
 	// instance).
 	if err := rw.installDeliveryLogLocked(gvr, in, nil); err != nil {
-		slog.Warn("cache.store.delivery_record_not_installed",
+		slog.WarnContext(ctx, "cache.store.delivery_record_not_installed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
 			slog.String("path", "metadata-only"),
@@ -1139,7 +1145,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// The obj coming through here is a *metav1.PartialObjectMetadata, which
 	// embeds ObjectMeta and therefore satisfies the nsNameAccessor interface
 	// used by metaNSName. Everything is installed BEFORE Run.
-	rw.wireInstanceLocked(gvr, in, "metadata-only")
+	rw.wireInstanceLocked(ctx, gvr, in, "metadata-only")
 	setComparatorRecord(gvr, in)
 
 	// Start the metadata informer and spawn the sync-watcher. We
@@ -1347,6 +1353,7 @@ func (rw *ResourceWatcher) EnsureResourceTypeMetadataOnly(gvr schema.GroupVersio
 	defer rw.mu.Unlock()
 
 	if rw.metaClient == nil {
+		// log-ctx-waiver: no-prod-caller: only tests call this registration entry point
 		slog.Warn("cache.metadata_only.no_client",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -1367,7 +1374,7 @@ func (rw *ResourceWatcher) EnsureResourceTypeMetadataOnly(gvr schema.GroupVersio
 		return false, refuseUnservedVersion()
 	}
 
-	rw.addResourceTypeMetadataOnlyLocked(gvr)
+	rw.addResourceTypeMetadataOnlyLocked(context.Background(), gvr)
 	ch := rw.syncCh[gvr]
 	slog.Info("cache.lazy_register.metadata_only",
 		slog.String("subsystem", "cache"),
@@ -1437,7 +1444,7 @@ func (rw *ResourceWatcher) IsSynced(gvr schema.GroupVersionResource) bool {
 // inventory set, we emit `lazy-AddResourceType-unexpected` so the
 // regression is loud. Lazy registration for a GVR NOT in the eager
 // inventory is normal (e.g. customer-added RestAction post-startup).
-func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource) {
+func (rw *ResourceWatcher) addResourceTypeLocked(ctx context.Context, gvr schema.GroupVersionResource) {
 	// 0.30.71 + 0.30.8: defensive guard. AddResourceType already
 	// early-returns in modePassthrough, and NewResourceWatcher's
 	// passthrough branch never reaches addResourceTypeLocked (no
@@ -1525,7 +1532,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	shape := shapeFactoryDynamic // #870 — the branch, recorded for a build
 	if !isStreamingException(gvr) && compositionStreamingListEnabled() {
 		if sgi, ok := newStreamingDynamicInformer(
-			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
+			ctx, rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
 		); ok {
 			gi = sgi
 			decorated = true
@@ -1627,7 +1634,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// store verification, after the strip (store_verify_delivery.go). #870 —
 	// wrapped by the reuse step, a no-op on a live instance.
 	if err := rw.installDeliveryLogLocked(gvr, in, tf); err != nil {
-		slog.Warn("cache.strip.set_transform_failed",
+		slog.WarnContext(ctx, "cache.strip.set_transform_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
 			slog.String("error", err.Error()),
@@ -1701,7 +1708,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// function, so this is in fact the single install site for them
 	// too once 0.30.99 lands. assertWatchHandlerCoverageLocked verifies
 	// the invariant at boot.
-	rw.wireInstanceLocked(gvr, in, "full-unstructured")
+	rw.wireInstanceLocked(ctx, gvr, in, "full-unstructured")
 	setComparatorRecord(gvr, in)
 
 	if rw.started && !rw.stopRequestedLocked() {
@@ -1755,7 +1762,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		// SRE wants to see it.
 		if rw.eagerDone {
 			if _, wasInEager := rw.eagerSet[gvr]; wasInEager {
-				slog.Warn("lazy-AddResourceType-unexpected",
+				slog.WarnContext(ctx, "lazy-AddResourceType-unexpected",
 					slog.String("subsystem", "cache"),
 					slog.String("resource_type", resourceType),
 					slog.String("hint", "was in eager inventory but registered lazily"),
@@ -2207,7 +2214,7 @@ const passthroughGetTimeout = 30 * time.Second
 // is routed to apiserver via the dynamic client. Each call is a fresh
 // apiserver Get; there is NO in-process caching. This is the "true
 // cache-off" path the diagnostic mode promises.
-func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, bool) {
+func (rw *ResourceWatcher) GetObject(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, bool) {
 	if rw.mode == modePassthrough {
 		ctx, cancel := context.WithTimeout(context.Background(), passthroughGetTimeout)
 		defer cancel()
@@ -2252,7 +2259,7 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 	// Defense-in-depth: assert the invariant at the serve (we are about to
 	// return obj,true). Holds by construction (gi came from servableLocked)
 	// — the assert trips if a future refactor reads the indexer without it.
-	if !rw.assertServeRequiresServableLocked(gvr, "GetObject") {
+	if !rw.assertServeRequiresServableLocked(ctx, gvr, "GetObject") {
 		return nil, false
 	}
 
@@ -2265,7 +2272,7 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 	// COUNTED, never silent.
 	uns, ok := storeItemToUnstructured(obj)
 	if !ok {
-		recordUnrenderableStoreItem(unrenderableSiteGet, gvr, newUnrenderableStoreItemError(obj))
+		recordUnrenderableStoreItem(ctx, unrenderableSiteGet, gvr, newUnrenderableStoreItemError(obj))
 		return nil, false
 	}
 	return uns, true
@@ -2325,7 +2332,7 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 	if err != nil {
 		// #624 fail-closed: never a partial list. nil is the same answer an
 		// unregistered GVR gets.
-		recordUnrenderableStoreItem(unrenderableSiteListDecoded, gvr, err)
+		recordUnrenderableStoreItem(context.Background(), unrenderableSiteListDecoded, gvr, err)
 		return nil
 	}
 	return items
@@ -2391,7 +2398,7 @@ func listFromIndexer(gi informers.GenericInformer, namespace string) ([]*unstruc
 // no per-GVR carve-out.
 //
 // Safe for concurrent use; takes rw.mu in read mode.
-func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, namespace string) ([]*unstructured.Unstructured, bool) {
+func (rw *ResourceWatcher) ListObjectsServable(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([]*unstructured.Unstructured, bool) {
 	if rw == nil {
 		return nil, false
 	}
@@ -2409,14 +2416,14 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 	// holds by construction today; the assert is the guard that trips
 	// (test-panic / prod-count="serve_requires_servable") if a future
 	// refactor returns a HIT here without the predicate.
-	if !rw.assertServeRequiresServableLocked(gvr, "ListObjectsServable") {
+	if !rw.assertServeRequiresServableLocked(ctx, gvr, "ListObjectsServable") {
 		return nil, false
 	}
 	items, err := listFromIndexer(gi, namespace)
 	if err != nil {
 		// #624: an unrenderable slot means the watcher cannot vouch for
 		// the list — fall through, counted.
-		recordUnrenderableStoreItem(unrenderableSiteListDecoded, gvr, err)
+		recordUnrenderableStoreItem(ctx, unrenderableSiteListDecoded, gvr, err)
 		return nil, false
 	}
 	return items, true
@@ -2441,7 +2448,7 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 // falsifier. No per-GVR carve-out — uniform over every servable GVR
 // (feedback_no_special_cases).
 func (rw *ResourceWatcher) ListServableEnvelopeJSON(gvr schema.GroupVersionResource, namespace string) ([]byte, bool) {
-	return rw.ListServableEnvelopeJSONWhere(gvr, namespace, nil)
+	return rw.ListServableEnvelopeJSONWhere(context.Background(), gvr, namespace, nil)
 }
 
 // ListServableEnvelopeJSONWhere is ListServableEnvelopeJSON over only the items
@@ -2449,8 +2456,8 @@ func (rw *ResourceWatcher) ListServableEnvelopeJSON(gvr schema.GroupVersionResou
 // fieldSelector, applied with the same predicate the request path uses). A nil
 // keep admits every item, byte-identical to ListServableEnvelopeJSON. The
 // predicate only reads the shared items; it must not mutate them.
-func (rw *ResourceWatcher) ListServableEnvelopeJSONWhere(gvr schema.GroupVersionResource, namespace string, keep func(*unstructured.Unstructured) bool) ([]byte, bool) {
-	items, ok := rw.ListObjectsServable(gvr, namespace)
+func (rw *ResourceWatcher) ListServableEnvelopeJSONWhere(ctx context.Context, gvr schema.GroupVersionResource, namespace string, keep func(*unstructured.Unstructured) bool) ([]byte, bool) {
+	items, ok := rw.ListObjectsServable(ctx, gvr, namespace)
 	if !ok {
 		return nil, false
 	}
@@ -2691,7 +2698,7 @@ func filterByNamespace(items []interface{}, ns string) []interface{} {
 // resolver-side reads), GetObject is preserved unchanged.
 func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, namespace, name string) (runtime.Object, bool) {
 	if rw.mode == modePassthrough {
-		uns, ok := rw.GetObject(gvr, namespace, name)
+		uns, ok := rw.GetObject(context.Background(), gvr, namespace, name)
 		if !ok || uns == nil {
 			return nil, false
 		}
@@ -2719,7 +2726,7 @@ func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, names
 		return nil, false
 	}
 
-	if !rw.assertServeRequiresServableLocked(gvr, "GetTypedObject") {
+	if !rw.assertServeRequiresServableLocked(context.Background(), gvr, "GetTypedObject") {
 		return nil, false
 	}
 

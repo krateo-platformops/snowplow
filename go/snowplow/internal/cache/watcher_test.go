@@ -420,7 +420,7 @@ func TestNewResourceWatcher_PassthroughMode_GetRoutesToApiserver(t *testing.T) {
 	}
 	defer rw.Stop()
 
-	uns, ok := rw.GetObject(gvr, "", "admin-via-apiserver")
+	uns, ok := rw.GetObject(context.Background(), gvr, "", "admin-via-apiserver")
 	if !ok || uns == nil {
 		t.Fatalf("passthrough GetObject: expected the seeded ClusterRole, got (%v, %v)", uns, ok)
 	}

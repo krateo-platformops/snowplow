@@ -1325,7 +1325,7 @@ func seedRestactionResolveAndPutProd(
 	// is wired (AC-PIP.5 — without this the refresher never wakes for
 	// the seeded entry; falsifier #5 triggers). Matches
 	// restactions.go:229-230.
-	ensureWatcherInformerForGVR(got.GVR)
+	ensureWatcherInformerForGVR(resCtx, got.GVR)
 	// #375 C3 — Recorded under resCtx (the sink the terminal PutIfGen was checked
 	// against), so an RA edit in [Put-check, this Record) — no edge yet on a cold
 	// cell — is re-checked and remarks the key once.
@@ -1850,7 +1850,7 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		// request extras). NOT the union — rrt-inline must not key this cell.
 		Extras: apiRefInline,
 	}); rerr != nil {
-		slog.Default().Warn("phase1.seed.rafulllist.skipped",
+		slog.Default().WarnContext(ctx, "phase1.seed.rafulllist.skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", ns+"/"+name),
 			slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
@@ -1953,7 +1953,7 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string, verdi
 		// Any other decline: today only cache.PutReasonUnobserved, a verdict
 		// over Put-gate sinks that were not all installed on the resolve. It
 		// admits nothing (#912 delta-3 item 3); never read as another reason.
-		slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+		slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
 			slog.String("reason", string(verdict.Reason())),
 			slog.String("effect", "body served; not persisted"),
 		)

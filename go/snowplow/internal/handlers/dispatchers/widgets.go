@@ -119,7 +119,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// already ran per-user against apiserver.
 	if !cache.Disabled() {
 		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
-			log.Warn("widget dispatch denied by EvaluateRBAC",
+			log.WarnContext(req.Context(), "widget dispatch denied by EvaluateRBAC",
 				slog.String("gvr", got.GVR.String()),
 			)
 			response.Encode(wri, response.New(http.StatusForbidden,
@@ -427,7 +427,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if staleWritePoint(r, wri, req, staleSink, false) {
 			return
 		}
-		log.Error("unable to resolve widget", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to resolve widget", slog.Any("err", err))
 		// #853 — the CR exists; a dependency's 404 is answered 424.
 		encodeWidgetResolveError(ctx, wri, err)
 		return
@@ -437,7 +437,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if traceId != "" {
 		err := maps.SetNestedField(res.Object, traceId, "status", "traceId")
 		if err != nil {
-			log.Warn("unable to set traceId in status", slog.Any("err", err))
+			log.WarnContext(ctx, "unable to set traceId in status", slog.Any("err", err))
 		}
 	}
 
@@ -462,7 +462,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	encoded, err := encodeResolvedJSON(res)
 	enc.End()
 	if err != nil {
-		log.Error("unable to encode widget response", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to encode widget response", slog.Any("err", err))
 		response.InternalError(wri, err)
 		return
 	}
@@ -550,7 +550,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// the dep Record (no informer edge can invalidate external data).
 			// Re-fetched live on every /call. Byte-identical to pre-Option-A.
 			cache.BumpExternalSkippedPut()
-			log.Warn("Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+			log.WarnContext(ctx, "Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
 				slog.Int64("external_touches", extTouchedSink.Count()),
 				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 			)
@@ -559,7 +559,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// A bare decline, twin of restactions.go: the partial envelope is
 			// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
 			// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
-			log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
+			log.WarnContext(ctx, "Widget served with per-item stage error(s); declining to cache the partial result",
 				slog.Int64("stage_errors", stageErrSink.Count()),
 				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
 			)
@@ -567,7 +567,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// Any other decline: today only cache.PutReasonUnobserved, a verdict
 			// over Put-gate sinks that were not all installed on the resolve. It
 			// admits nothing (#912 delta-3 item 3); never read as another reason.
-			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
 				slog.String("reason", string(verdict.Reason())),
 				slog.String("effect", "body served; not persisted"),
 			)
@@ -641,7 +641,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// the dep Record (no informer edge can invalidate external data).
 		// Re-fetched live on every /call. Byte-identical to pre-Option-A.
 		cache.BumpExternalSkippedPut()
-		log.Warn("Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+		log.WarnContext(ctx, "Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
@@ -661,7 +661,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// (their supplied extras are all declared, or they send none). Placed BEFORE
 		// the genuine-Put branch so a polluting request cannot fall into it.
 		bumpWidgetSkippedUndeclaredExtrasPut()
-		log.Warn("Widget request carried extras not declared in spec.keyExtras; declining to cache (would pollute the shared per-cohort cell post-F6)",
+		log.WarnContext(ctx, "Widget request carried extras not declared in spec.keyExtras; declining to cache (would pollute the shared per-cohort cell post-F6)",
 			slog.String("effect", "body served (200) under this request's own extras; not persisted — a co-cohort request without these extras must not be served this extras-shaped body"),
 		)
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {

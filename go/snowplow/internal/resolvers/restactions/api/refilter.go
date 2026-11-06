@@ -116,7 +116,7 @@ func uafVerbIsRead(verb string) bool {
 // exactly ONCE per (RA stage) evaluation, never per item — a non-read verb is a
 // single authoring choice in one CR, so per-item logging would flood the
 // operator on a 500-item list and tell them nothing extra.
-func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
+func warnUAFVerbNonRead(ctx context.Context, log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
 	if log == nil || uafVerbIsRead(uaf.Verb) {
 		return
 	}
@@ -124,7 +124,7 @@ func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserA
 	if resource == "" {
 		resource = uaf.ResourcesFrom
 	}
-	log.Warn("userAccessFilter: verb is not a read verb",
+	log.WarnContext(ctx, "userAccessFilter: verb is not a read verb",
 		slog.String("subsystem", "uaf"),
 		slog.String("api", stageName),
 		slog.String("verb", uaf.Verb),
@@ -229,11 +229,11 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// symmetric with the live applyUserAccessFilterOnPig entry so this twin
 	// cannot silently become a bypass if it is ever re-wired. Drops nothing;
 	// 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
-	warnUAFVerbNonRead(log, apiCall.Name, uaf)
+	warnUAFVerbNonRead(ctx, log, apiCall.Name, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
 			slog.String("api", apiCall.Name),
 			slog.Any("err", err),
 		)
@@ -253,7 +253,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// item (no resource to grant against), never allow-all.
 	resources, resOK := resolveRefilterUAFResources(ctx, log, apiCall.Name, uaf, dict)
 	if !resOK {
-		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", apiCall.Name),
 		)
 		_ = setRefilteredEmpty(dict, apiCall.Name)
@@ -294,7 +294,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		}
 		items, ok := itemsRaw.([]any)
 		if !ok {
-			log.Warn("userAccessFilter: items is not a slice; passing through unchanged",
+			log.WarnContext(ctx, "userAccessFilter: items is not a slice; passing through unchanged",
 				slog.String("api", apiCall.Name),
 				slog.Any("items_type", fmt.Sprintf("%T", itemsRaw)),
 			)
@@ -314,7 +314,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		res.EvaluateRBACCalls = calls
 
 	default:
-		log.Warn("userAccessFilter: unrecognised result shape; passing through unchanged",
+		log.WarnContext(ctx, "userAccessFilter: unrecognised result shape; passing through unchanged",
 			slog.String("api", apiCall.Name),
 			slog.Any("result_type", fmt.Sprintf("%T", raw)),
 		)
@@ -509,14 +509,14 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 	// failed to compile — fail-closed (deny the item), matching the pre-1b
 	// per-item EvalValue compile-error branch.
 	if nsCode == nil {
-		log.Warn("userAccessFilter: NamespaceFrom JQ compile failed; treating item as denied",
+		log.WarnContext(ctx, "userAccessFilter: NamespaceFrom JQ compile failed; treating item as denied",
 			slog.String("expr", nsExpr),
 		)
 		return false
 	}
 	ns, err := nsCode.eval(ctx, item)
 	if err != nil {
-		log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
+		log.WarnContext(ctx, "userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
 			slog.String("expr", nsExpr),
 			slog.Any("err", err),
 		)
@@ -543,14 +543,14 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		// A nil nameCode means the expression failed to compile — fail-closed
 		// (deny the item), identical to the NamespaceFrom compile-error branch.
 		if nameCode == nil {
-			log.Warn("userAccessFilter: NameFrom JQ compile failed; treating item as denied",
+			log.WarnContext(ctx, "userAccessFilter: NameFrom JQ compile failed; treating item as denied",
 				slog.String("expr", nameExpr),
 			)
 			return false
 		}
 		n, err := nameCode.eval(ctx, item)
 		if err != nil {
-			log.Warn("userAccessFilter: NameFrom JQ eval failed; treating item as denied",
+			log.WarnContext(ctx, "userAccessFilter: NameFrom JQ eval failed; treating item as denied",
 				slog.String("expr", nameExpr),
 				slog.Any("err", err),
 			)
@@ -595,7 +595,7 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		opts.SkipBindingUID = true
 		allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 		if err != nil {
-			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
+			log.WarnContext(ctx, "userAccessFilter: EvaluateRBAC error; treating resource as denied",
 				slog.String("verb", uaf.Verb),
 				slog.String("group", uaf.Group),
 				slog.String("resource", resource),
@@ -799,7 +799,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		// case surfaced as a json.Unmarshal error logged "not a JSON
 		// array". Both fail-closed identically — one warn; the distinction
 		// was never security-load-bearing.
-		log.Warn("userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
+		log.WarnContext(ctx, "userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 			slog.Any("err", err),
 		)
@@ -810,7 +810,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		// Zero-yield, or a non-array result. Pre-Ship-A json.Unmarshal of
 		// "" or of a non-array into []any errors -> "not a JSON array" ->
 		// fail-closed.
-		log.Warn("userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
+		log.WarnContext(ctx, "userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 		)
 		return nil, false, 0
@@ -825,7 +825,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		}
 		s, ok := e.(string)
 		if !ok {
-			log.Warn("userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
+			log.WarnContext(ctx, "userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
 				slog.String("expr", uaf.ResourcesFrom),
 			)
 			return nil, false, 0
@@ -993,11 +993,11 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// is the LIVE production callsite; the applyUserAccessFilter twin above
 	// carries the identical call so neither entry point can drift. Drops
 	// nothing; 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
-	warnUAFVerbNonRead(log, stageName, uaf)
+	warnUAFVerbNonRead(ctx, log, stageName, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
 			slog.String("api", stageName),
 			slog.Any("err", err),
 		)
@@ -1012,7 +1012,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// resourcesFrom expressions reference (e.g. `.crds`).
 	resources, resOK := resolveRefilterUAFResources(ctx, log, stageName, uaf, dict)
 	if !resOK {
-		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", stageName),
 		)
 		_ = setRefilteredEmpty(pig, stageName)
@@ -1049,7 +1049,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		}
 		items, ok := itemsRaw.([]any)
 		if !ok {
-			log.Warn("userAccessFilter: items is not a slice; passing through unchanged",
+			log.WarnContext(ctx, "userAccessFilter: items is not a slice; passing through unchanged",
 				slog.String("api", stageName),
 				slog.Any("items_type", fmt.Sprintf("%T", itemsRaw)),
 			)
@@ -1069,7 +1069,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		res.EvaluateRBACCalls = calls
 
 	default:
-		log.Warn("userAccessFilter: unrecognised result shape; passing through unchanged",
+		log.WarnContext(ctx, "userAccessFilter: unrecognised result shape; passing through unchanged",
 			slog.String("api", stageName),
 			slog.Any("result_type", fmt.Sprintf("%T", raw)),
 		)

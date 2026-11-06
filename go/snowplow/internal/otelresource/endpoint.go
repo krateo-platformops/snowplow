@@ -54,6 +54,7 @@ func InstallErrorHandler(log *slog.Logger) {
 		return
 	}
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		// log-ctx-waiver: worker: the OTel SDK calls this from its export goroutines, with no context
 		log.Warn("otel export/sdk error", slog.Any("err", err))
 	}))
 }

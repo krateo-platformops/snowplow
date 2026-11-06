@@ -139,7 +139,7 @@ func ResolveNestedCall(
 	// gets a 403-class error — never empty content.
 	if !cache.Disabled() {
 		if !checkDispatchRBAC(ctx, got.GVR, got.Unstructured) {
-			log.Warn("nested resolve dispatch denied by EvaluateRBAC",
+			log.WarnContext(ctx, "nested resolve dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
 				slog.String("gvr", got.GVR.String()),

@@ -312,7 +312,7 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		// FAIL-CLOSED: no identity → cannot vouch for the object. Fall
 		// through to the apiserver, whose per-user-token gate is the
 		// authoritative answer.
-		log.Warn("objects.Get.rbac_get_filter.no_identity",
+		log.WarnContext(ctx, "objects.Get.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", obj.GetNamespace()),
@@ -337,7 +337,7 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
-		log.Warn("objects.Get.rbac_get_filter.evaluate_error",
+		log.WarnContext(ctx, "objects.Get.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", obj.GetNamespace()),

@@ -1316,6 +1316,7 @@ func (c *ListCell) ComparePass() int {
 	if diverged > 0 {
 		listCellStats.divergence(reason, uint64(diverged))
 		sum := sha256.Sum256([]byte(c.key))
+		// log-ctx-waiver: worker: the comparator pass of a refresher unit, no request involved
 		slog.Error("cache.list_cell.divergence",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", c.gvr.String()),

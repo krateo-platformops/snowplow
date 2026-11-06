@@ -216,7 +216,7 @@ func TestFalsifierHealB_DeleteDirtyMarksListDepContent(t *testing.T) {
 	// ListObjectsServable is what the resolver re-reads on revalidation.
 	revalDeadline := time.After(5 * time.Second)
 	for {
-		items, servable := rw.ListObjectsServable(healBSecretsGVR, "ns-a")
+		items, servable := rw.ListObjectsServable(context.Background(), healBSecretsGVR, "ns-a")
 		if servable {
 			names := map[string]bool{}
 			for _, o := range items {
@@ -242,7 +242,7 @@ func TestFalsifierHealB_DeleteDirtyMarksListDepContent(t *testing.T) {
 		}
 		select {
 		case <-revalDeadline:
-			items, _ := rw.ListObjectsServable(healBSecretsGVR, "ns-a")
+			items, _ := rw.ListObjectsServable(context.Background(), healBSecretsGVR, "ns-a")
 			t.Fatalf("F-heal-B CONTENT: post-DELETE the servable informer still lists "+
 				"secret-doomed (content NOT absent); items=%d", len(items))
 		default:
@@ -308,7 +308,7 @@ func TestFalsifierHealB_PreFixControl_NotServableNoEviction(t *testing.T) {
 	// The revalidation read the resolver would do is NOT servable — it
 	// falls through to the apiserver instead of serving a watcher-vouched,
 	// self-healed LIST. This is the pre-fix "entry stays LIVE" arm.
-	if _, servable := rw.ListObjectsServable(healBSecretsGVR, "ns-a"); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), healBSecretsGVR, "ns-a"); servable {
 		t.Fatalf("F-heal-B pre-fix control: a not-servable GVR's revalidation read reported "+
 			"servable=true — the latch would have self-healed without the fix, "+
 			"invalidating the negative control")

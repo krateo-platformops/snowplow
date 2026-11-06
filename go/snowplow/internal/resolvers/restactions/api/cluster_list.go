@@ -428,7 +428,7 @@ func populateClusterListCellSync(
 	shape, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
 	envelopeOKElapsed := time.Since(shapeStart)
 	if envelopeOKElapsed > shapeCheckSlowThreshold {
-		log.Warn("cluster_list.shape_check.slow",
+		log.WarnContext(ctx, "cluster_list.shape_check.slow",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.Duration("elapsed", envelopeOKElapsed),
@@ -439,7 +439,7 @@ func populateClusterListCellSync(
 	if !shapeOK {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -455,7 +455,7 @@ func populateClusterListCellSync(
 	if decodeErr != "" {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -616,7 +616,7 @@ func populateClusterListCellAsync(
 			<-clusterListAsyncSemaphore
 			clusterListInflightCells.Delete(contentKey)
 			if r := recover(); r != nil {
-				log.Error("cluster_list.cell.async_populate_panic",
+				log.ErrorContext(customerCtx, "cluster_list.cell.async_populate_panic",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),
 					slog.Any("panic", r),

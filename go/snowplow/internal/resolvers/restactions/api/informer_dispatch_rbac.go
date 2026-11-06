@@ -147,7 +147,7 @@ func filterListByRBAC(
 		// served list here would also be safe, but fallthrough keeps
 		// the apiserver's per-user-token narrowing as the authoritative
 		// answer and avoids masking a genuine "no objects" result.
-		log.Warn("informer_dispatch.rbac_filter.no_identity",
+		log.WarnContext(ctx, "informer_dispatch.rbac_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.Any("err", err),
@@ -226,7 +226,7 @@ func filterListByRBAC(
 				// The error is NOT memoized — a transient evaluator
 				// failure must not poison every later item in this
 				// namespace; the next same-namespace item retries.
-				log.Warn("informer_dispatch.rbac_filter.evaluate_error",
+				log.WarnContext(ctx, "informer_dispatch.rbac_filter.evaluate_error",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),
 					slog.String("namespace", ns),
@@ -280,7 +280,7 @@ func filterListByRBAC(
 func listScopeAllowed(ctx context.Context, scope rbac.EvaluateOptions) (allowed, decided bool) {
 	ok, _, err := rbac.EvaluateRBAC(ctx, scope)
 	if err != nil {
-		xcontext.Logger(ctx).Warn("informer_dispatch.rbac_filter.scope_undecided",
+		xcontext.Logger(ctx).WarnContext(ctx, "informer_dispatch.rbac_filter.scope_undecided",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", scope.Group+"/"+scope.Resource),
 			slog.String("namespace", scope.Namespace),
@@ -369,7 +369,7 @@ func authorizeGetByRBAC(
 		// FAIL-CLOSED: no identity → cannot vouch for the object. Do not
 		// serve; fall through to the apiserver, whose per-user-token
 		// narrowing is the authoritative answer.
-		log.Warn("informer_dispatch.rbac_get_filter.no_identity",
+		log.WarnContext(ctx, "informer_dispatch.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
@@ -394,7 +394,7 @@ func authorizeGetByRBAC(
 	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
-		log.Warn("informer_dispatch.rbac_get_filter.evaluate_error",
+		log.WarnContext(ctx, "informer_dispatch.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),

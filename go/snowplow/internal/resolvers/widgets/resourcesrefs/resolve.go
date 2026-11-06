@@ -145,7 +145,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 				// #563 — the one denial that may be a REAL access problem. WHO
 				// was denied is on the audit record, not here (#1192): the
 				// line's traceId joins the two.
-				log.Warn("resource ref action not allowed",
+				log.WarnContext(ctx, "resource ref action not allowed",
 					slog.String("id", in.ID),
 					slog.String("verb", verb),
 					slog.String("group", gvr.Group),

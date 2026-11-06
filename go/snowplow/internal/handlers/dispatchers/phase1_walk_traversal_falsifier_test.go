@@ -27,6 +27,7 @@
 package dispatchers
 
 import (
+	"context"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -51,7 +52,7 @@ const noSlicePath = "/call?resource=panels&apiVersion=widgets.templates.krateo.i
 // the derivation every walk writer uses), so it honours the widget's DECLARED
 // pagination.
 func TestFAL127_SliceExtractedFromChildPath(t *testing.T) {
-	pg := prewarmPaginationFor(dashboardTablePath)
+	pg := prewarmPaginationFor(context.Background(), dashboardTablePath)
 	if !pg.paginated() {
 		t.Fatalf("FAL-127: the Dashboard table's /call Path declares page=1&perPage=5 — "+
 			"prewarmPaginationFor must extract it, got the unpaginated %+v", pg)
@@ -70,12 +71,12 @@ func TestFAL127_SliceExtractedFromChildPath(t *testing.T) {
 func TestPrewarmPagination966_NoSliceIsUnpaginated(t *testing.T) {
 	t.Setenv("PREWARM_PAGE_LIMIT", "25")
 	for _, path := range []string{noSlicePath, ""} {
-		if got := prewarmPaginationFor(path); got != unpaginatedPrewarm || got.paginated() {
-			t.Fatalf("#966: prewarmPaginationFor(%q) = %+v, want the unpaginated %+v — a URL with no "+
+		if got := prewarmPaginationFor(context.Background(), path); got != unpaginatedPrewarm || got.paginated() {
+			t.Fatalf("#966: prewarmPaginationFor(context.Background(), %q) = %+v, want the unpaginated %+v — a URL with no "+
 				"page/perPage is requested unpaginated, so its cell must be resolved unpaginated", path, got, unpaginatedPrewarm)
 		}
 	}
-	if got := prewarmPaginationFor(dashboardTablePath); got != (prewarmPagination{PerPage: 5, Page: 1}) || !got.paginated() {
+	if got := prewarmPaginationFor(context.Background(), dashboardTablePath); got != (prewarmPagination{PerPage: 5, Page: 1}) || !got.paginated() {
 		t.Fatalf("#966: a declared slice must give exactly that pagination, got %+v", got)
 	}
 }
