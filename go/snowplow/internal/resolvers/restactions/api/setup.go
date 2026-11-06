@@ -16,6 +16,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -160,7 +161,9 @@ func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason)
 	bumpMalformedDialSkipped(sr.class)
 	log.Debug("skipping api call: "+sr.detail+" — not dialing",
 		slog.String("name", name),
-		slog.String("path", path),
+		// #1138 — the rendered path can hold caller input or an author-templated
+		// query value: logged as every logged URL is, its query values replaced.
+		slog.String("path", redact.Path(path)),
 		slog.String("reason_class", sr.class),
 		slog.String("reason", sr.detail),
 	)
