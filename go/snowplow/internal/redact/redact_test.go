@@ -15,17 +15,13 @@ func TestS453_LabelsNeverCarryTheInput(t *testing.T) {
 	const g = "grp-zq453-private"
 	for name, got := range map[string]string{
 		"user":     User(u),
-		"group":    Group(g),
-		"identity": Identity(u, []string{g}),
 		"prefixed": Prefixed("learned", u+"\x00"+g),
-		"groups":   strings.Join(Groups([]string{g, "system:authenticated"}), ","),
 	} {
-		if strings.Contains(got, u) || strings.Contains(got, g) || strings.Contains(got, "system:authenticated") {
+		if strings.Contains(got, u) || strings.Contains(got, g) {
 			t.Errorf("%s label %q carries its input", name, got)
 		}
 	}
-	if !strings.HasPrefix(User(u), "user:") || !strings.HasPrefix(Group(g), "group:") ||
-		!strings.HasPrefix(Identity(u, nil), "id:") || !strings.HasPrefix(Prefixed("learned", u), "learned:") {
+	if !strings.HasPrefix(User(u), "user:") || !strings.HasPrefix(Prefixed("learned", u), "learned:") {
 		t.Error("each label family keeps its prefix")
 	}
 	if len(strings.TrimPrefix(User(u), "user:")) != labelHexLen {
@@ -34,18 +30,13 @@ func TestS453_LabelsNeverCarryTheInput(t *testing.T) {
 }
 
 func TestS453_LabelsStableWithinTheProcessAndDistinct(t *testing.T) {
-	first, second := User("a"), User("a")
-	if first != second || Identity("a", []string{"x", "y"}) != Identity("a", []string{"y", "x"}) {
-		t.Error("a label is stable for the process lifetime and the group order does not matter")
+	if User("a") != User("a") {
+		t.Error("a label is stable for the process lifetime")
 	}
-	if User("a") == User("b") || Group("a") == Group("b") || Identity("a", []string{"x"}) == Identity("a", []string{"y"}) {
+	if User("a") == User("b") {
 		t.Error("distinct inputs must render distinct labels")
 	}
-	// Domain separation: the same text as a user and as a group are different facts.
-	if strings.TrimPrefix(User("x"), "user:") == strings.TrimPrefix(Group("x"), "group:") {
-		t.Error("the user and group digests must be domain-separated")
-	}
-	if User("") != Anonymous || Group("") != Anonymous || Identity("", nil) != Anonymous {
+	if User("") != Anonymous {
 		t.Error("the empty identity is Anonymous")
 	}
 }
@@ -111,22 +102,72 @@ func TestS487_ValueAndDictAttrsNeverRenderAValue(t *testing.T) {
 
 func TestS453_ErrorTextScrubsApiserverIdentity(t *testing.T) {
 	const u = "carla.zq453@tenant.example"
-	forbidden := `configmaps is forbidden: User "` + u + `" cannot list resource "configmaps" in API group "" in the namespace "x"`
-	got := ErrorText(forbidden)
-	if strings.Contains(got, u) {
-		t.Fatalf("Forbidden requester survived: %s", got)
+	const g = "grp-zq453-private"
+	for _, c := range []struct{ name, in, stays string }{
+		{"forbidden requester", `configmaps is forbidden: User "` + u + `" cannot list resource "configmaps" in API group "" in the namespace "x"`, `User "[redacted]" cannot list resource "configmaps" in API group ""`},
+		{"impersonated user", `users "` + u + `" is forbidden: User "sa" cannot impersonate resource "users" in API group ""`, `users "[redacted]" is forbidden`},
+		{"impersonated group", `groups "` + g + `" is forbidden: User "sa" cannot impersonate resource "groups" in API group ""`, `groups "[redacted]" is forbidden`},
+		{"clientconfig Secret", `secrets "carla.zq453@tenant.example-clientconfig" not found`, `secrets "[redacted]" not found`},
+		{"Status body in an error", `{"message":"pods is forbidden: User \"` + u + `\" cannot list"}`, `User \"[redacted]\" cannot list`},
+		{"escaped clientconfig", `{"message":"secrets \"` + u + `-clientconfig\" not found"}`, `secrets \"[redacted]\" not found`},
+	} {
+		got := ErrorText(c.in)
+		if strings.Contains(got, u) || strings.Contains(got, g) {
+			t.Errorf("%s: the identity survived: %s", c.name, got)
+		}
+		if !strings.Contains(got, c.stays) {
+			t.Errorf("%s: the reason must stay readable: got %s, want it to hold %s", c.name, got, c.stays)
+		}
+		if again := ErrorText(got); again != got {
+			t.Errorf("%s: not idempotent: %s then %s", c.name, got, again)
+		}
 	}
-	if !strings.Contains(got, `User "`+User(u)+`"`) || !strings.Contains(got, `cannot list resource "configmaps"`) {
-		t.Fatalf("the reason must stay readable with the label in place: %s", got)
-	}
-	nf := `secrets "carla-zq453-clientconfig" not found`
-	if got := Err(errors.New(nf)); strings.Contains(got, "carla") || !strings.Contains(got, "not found") {
+	if got := Err(errors.New(`secrets "carla-zq453-clientconfig" not found`)); strings.Contains(got, "carla") || !strings.Contains(got, "not found") {
 		t.Fatalf("clientconfig Secret name survived: %s", got)
 	}
 	if Err(nil) != "" {
 		t.Fatal("Err(nil) is empty")
 	}
-	if plain := `templates.krateo.io "x" not found`; ErrorText(plain) != plain {
-		t.Fatal("text without an identity is unchanged")
+	for _, plain := range []string{`templates.krateo.io "x" not found`, `the server could not find the requested resource (get pods.v1 "p")`, `no group "apps" in API group "apps"`} {
+		if ErrorText(plain) != plain {
+			t.Fatalf("text without an identity is unchanged: %s", plain)
+		}
+	}
+}
+
+// typedNilError has a method that dereferences its receiver.
+type typedNilError struct{ msg string }
+
+func (e *typedNilError) Error() string { return e.msg }
+
+// TestS1192_ScrubLogAttr: the handler option scrubs a string attribute, an error
+// attribute, a nested group and the message, leaves every other kind alone, and
+// survives an error whose Error method panics.
+func TestS1192_ScrubLogAttr(t *testing.T) {
+	const u = "carla.zq1192@tenant.example"
+	forbidden := `pods is forbidden: User "` + u + `" cannot list`
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: ScrubLogAttr}))
+	log.Info(forbidden,
+		slog.String("s", forbidden),
+		slog.Any("err", errors.New(forbidden)),
+		slog.Group("g", slog.Any("nested", errors.New(forbidden))),
+		slog.Int("n", 7))
+	out := buf.String()
+	if strings.Contains(out, u) {
+		t.Fatalf("the identity survived: %s", out)
+	}
+	if got := strings.Count(out, `User \"[redacted]\" cannot list`); got != 4 {
+		t.Fatalf("message, string, error and nested error must each stay readable, %d did: %s", got, out)
+	}
+	if !strings.Contains(out, `"n":7`) {
+		t.Fatalf("a non-text attribute is untouched: %s", out)
+	}
+
+	buf.Reset()
+	var nilErr *typedNilError
+	log.Info("m", slog.Any("err", error(nilErr)))
+	if !strings.Contains(buf.String(), `"msg":"m"`) {
+		t.Fatalf("a typed nil error must not stop the line: %s", buf.String())
 	}
 }

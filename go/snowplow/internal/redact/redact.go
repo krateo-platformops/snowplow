@@ -1,29 +1,37 @@
-// Package redact is the single source of every identity label that may reach
-// a log line, a debug surface or an expvar (#453).
+// Package redact keeps identity and data values off snowplow's log lines.
 //
-// THE RULE: no username, certificate CN, `<user>-clientconfig[-stepup]` Secret name or
-// group string is ever logged in clear. A site that wants to say WHICH identity
-// it acted for renders it through this package. The label is
+// THE RULE (#1192): no username, certificate CN, `<user>-clientconfig[-stepup]`
+// Secret name or group string reaches a log line, in clear or as a label. The
+// audit record is the one place that stores identity on purpose, and a log line
+// reaches it through the traceId. That join is also why a per-identity label is
+// not allowed on a line (#453 allowed one): a stable label on a request's line
+// names everything else carrying that label as soon as one traceId is joined.
 //
-//	<prefix>:<12 hex of HMAC-SHA256(processKey, input)>
+// Identity reaches a line by three routes, each closed once:
+//   - a site's own attribute: the structural guard (log_guard_test.go) fails on
+//     an identity key, or a label, on any slog site;
+//   - the request logger: middleware.RequestLogger replaces plumbing's
+//     use.Logger, which the guard also refuses;
+//   - the text of an error, which the apiserver or authn wrote: ScrubLogAttr, in
+//     buildLogHandler, so every record passes through it.
 //
-// processKey is 32 random bytes drawn once per process. The label is stable
-// for the process lifetime, so every line one pod writes about one identity
-// carries the same label and can be correlated, and the label cannot be
-// reversed by hashing a dictionary of tenant usernames (a bare sha256 of a
-// username can be). It is NOT stable across pods or restarts, by design. The
-// cross-pod correlator is the cache key_hash, which is deterministic and
-// carries no identity in clear.
+// User is the keyed label of a username, for the in-process uses that need one
+// (cache.StaleSubject). It is
+//
+//	user:<12 hex of HMAC-SHA256(processKey, username)>
+//
+// processKey is 32 random bytes drawn once per process, so the label cannot be
+// reversed by hashing a dictionary of tenant usernames, and it is not stable
+// across pods or restarts. The same digest serves labels of opaque non-identity
+// values (Digest, Prefixed).
 //
 // DATA VALUES (#487): a resolved stage body, a JQ result or a template dict
 // may hold Secret data or per-user rows. It is never logged. ValueAttr /
 // DictAttr log its type, JSON size and keyed digest, and DictAttr adds the
 // caller's spec-defined stage ids.
 //
-// SCOPE: LOG AND DEBUG LABELS ONLY. A label is never a cache key, a memo key, a
-// map key that must survive a restart, or an SSE key, because it changes on
-// every restart. The structural guard (log_guard_test.go) fails when a
-// slog site emits an identity field without going through this package.
+// SCOPE: a label is never a cache key, a memo key, or a map key that must
+// survive a restart, because it changes on every restart.
 //
 // The package is a stdlib-only leaf, so rbac, cache, objects, the resolvers and
 // the handlers can all import it.
@@ -42,9 +50,13 @@ import (
 	"strings"
 )
 
-// Anonymous is the label of an empty identity (no username, no groups). It is
-// a constant, not an identity fact.
+// Anonymous is the label of an empty identity. It is a constant, not an
+// identity fact.
 const Anonymous = "anonymous"
+
+// Redacted stands where ErrorText removed an identity. It is one constant for
+// every identity, so two lines cannot be told apart by who they were about.
+const Redacted = "[redacted]"
 
 // labelHexLen is the hex length of a label's digest (6 bytes).
 const labelHexLen = 12
@@ -76,35 +88,6 @@ func User(username string) string {
 	return "user:" + Digest("u\x00"+username)
 }
 
-// Group labels one group name.
-func Group(group string) string {
-	if group == "" {
-		return Anonymous
-	}
-	return "group:" + Digest("g\x00"+group)
-}
-
-// Groups labels each group of a set. The order of the input is kept, so the
-// count and positions stay visible while the names do not.
-func Groups(groups []string) []string {
-	out := make([]string, len(groups))
-	for i, g := range groups {
-		out[i] = Group(g)
-	}
-	return out
-}
-
-// Identity labels a whole identity: the username plus its group set, order
-// independent (the groups are sorted). The empty identity is Anonymous.
-func Identity(username string, groups []string) string {
-	if username == "" && len(groups) == 0 {
-		return Anonymous
-	}
-	g := append([]string(nil), groups...)
-	sort.Strings(g)
-	return "id:" + Digest("i\x00"+username+"\x00"+strings.Join(g, "\x00"))
-}
-
 // Prefixed labels an opaque string under a caller-chosen prefix, for a label
 // family whose prefix carries meaning on its own (cache.LearnedClassLabel's
 // "learned:"). The input is the caller's exact class key.
@@ -112,32 +95,30 @@ func Prefixed(prefix, s string) string {
 	return prefix + ":" + Digest("p\x00"+prefix+"\x00"+s)
 }
 
-// apiserverUser matches the requester the apiserver names in a Forbidden
-// message (`pods is forbidden: User "alice" cannot list ...`); clientconfig
-// matches an authn per-user credential Secret name quoted in a NotFound: the
-// session `<user>-clientconfig` (`secrets "alice-clientconfig" not found`) and,
-// #994, the step-up `<user>-clientconfig-stepup`. It matches any quoted name
-// carrying `-clientconfig` rather than the two suffixes, because this package
-// stays a stdlib-only leaf and cannot import credsecret (which owns the
-// suffixes); a scrubber that over-matches costs only a label.
+// apiserverSubject matches the identity the apiserver names in an error: the
+// requester of a Forbidden (`pods is forbidden: User "alice" cannot list ...`)
+// and the subject of a refused impersonation (`users "alice" is forbidden`,
+// `groups "devs" is forbidden`). clientconfig matches an authn per-user
+// credential Secret name quoted in a NotFound: the session `<user>-clientconfig`
+// (`secrets "alice-clientconfig" not found`) and, #994, the step-up
+// `<user>-clientconfig-stepup`. It matches any quoted name carrying
+// `-clientconfig` rather than the two suffixes, because this package stays a
+// stdlib-only leaf and cannot import credsecret (which owns the suffixes); a
+// scrubber that over-matches costs only a word of the message.
+//
+// Both accept a backslash before each quote: a Status body folded into an error
+// keeps the JSON escaping of its message.
 var (
-	apiserverUser = regexp.MustCompile(`\b(User|user) "[^"]*"`)
-	clientconfig  = regexp.MustCompile(`"[^"]*-clientconfig[^"]*"`)
+	apiserverSubject = regexp.MustCompile(`\b(User|user|users|groups) (\\?")[^"\\]*\\?"`)
+	clientconfig     = regexp.MustCompile(`(\\?")[^"]*-clientconfig[^"]*"`)
 )
 
-// ErrorText scrubs the identity an apiserver or authn error string carries
-// (the Forbidden requester, a clientconfig Secret name) and replaces each
-// with its redact label. It is a cheap, partial mitigation for an err that a
-// snowplow site logs. The full treatment of error text is its own issue
-// (#453 residual).
+// ErrorText replaces the identity an apiserver or authn error string carries
+// (see apiserverSubject, clientconfig) with Redacted. It keeps the rest of the
+// text, and it is idempotent.
 func ErrorText(s string) string {
-	s = apiserverUser.ReplaceAllStringFunc(s, func(m string) string {
-		i := strings.IndexByte(m, '"')
-		return m[:i] + `"` + User(strings.Trim(m[i:], `"`)) + `"`
-	})
-	return clientconfig.ReplaceAllStringFunc(s, func(m string) string {
-		return `"` + Prefixed("secret", strings.Trim(m, `"`)) + `"`
-	})
+	s = apiserverSubject.ReplaceAllString(s, "$1 ${2}"+Redacted+"$2")
+	return clientconfig.ReplaceAllString(s, "${1}"+Redacted+"$1")
 }
 
 // Err is ErrorText of err ("" for a nil err).
@@ -146,6 +127,47 @@ func Err(err error) string {
 		return ""
 	}
 	return ErrorText(err.Error())
+}
+
+// ScrubLogAttr is the slog.HandlerOptions.ReplaceAttr of snowplow's log
+// handlers: ErrorText over every string and error attribute, and the message.
+// A handler calls it only for a record it renders, so a disabled level costs
+// nothing, and only a string holding a double quote pays for the regexps.
+func ScrubLogAttr(_ []string, a slog.Attr) slog.Attr {
+	var text string
+	switch a.Value.Kind() {
+	case slog.KindString:
+		text = a.Value.String()
+	case slog.KindAny:
+		err, ok := a.Value.Any().(error)
+		if !ok {
+			return a
+		}
+		if text, ok = errorString(err); !ok {
+			return a
+		}
+	default:
+		return a
+	}
+	if strings.IndexByte(text, '"') < 0 {
+		return a
+	}
+	if scrubbed := ErrorText(text); scrubbed != text {
+		a.Value = slog.StringValue(scrubbed)
+	}
+	return a
+}
+
+// errorString is err.Error(), false when it panics: a typed nil pointer in an
+// error, which the handler itself renders as <nil>. A log line never takes the
+// process down.
+func errorString(err error) (s string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			s, ok = "", false
+		}
+	}()
+	return err.Error(), true
 }
 
 // ValueDigest summarises a data value (a stage body, a JQ result, a template
@@ -231,13 +253,3 @@ func (d dictRef) LogValue() slog.Value {
 
 // KeyLabel is the log label of a dict key ("k:<hex>").
 func KeyLabel(k string) string { return Prefixed("k", k) }
-
-// Label is a value that is already a redact label. A parameter or variable of
-// this type may be logged as is: the structural guard accepts it, and it
-// rejects a Label(x) conversion of anything that is not itself redact output.
-// Use it to carry a label through a call chain (the seed primitives' cohort
-// label) without re-deriving it from the identity at each log site.
-type Label string
-
-// String returns the label text.
-func (l Label) String() string { return string(l) }

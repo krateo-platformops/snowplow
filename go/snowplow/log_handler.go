@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -25,17 +26,19 @@ import (
 // the destination stream; main passes os.Stderr for pretty and os.Stdout
 // for JSON, preserving the pre-1.12.4 stream choice exactly.
 func buildLogHandler(prettyLog bool, level slog.Level, w io.Writer) slog.Handler {
+	opts := &slog.HandlerOptions{
+		Level:     level,
+		AddSource: false,
+		// #1192: no site logs an identity (internal/redact's guard), but the
+		// text of an error can carry one that the apiserver or authn wrote
+		// there. This is the one place every record passes, plumbing's too.
+		ReplaceAttr: redact.ScrubLogAttr,
+	}
 	var base slog.Handler
 	if prettyLog {
-		base = slog.NewTextHandler(w, &slog.HandlerOptions{
-			Level:     level,
-			AddSource: false,
-		})
+		base = slog.NewTextHandler(w, opts)
 	} else {
-		base = slog.NewJSONHandler(w, &slog.HandlerOptions{
-			Level:     level,
-			AddSource: false,
-		})
+		base = slog.NewJSONHandler(w, opts)
 	}
 	return newTraceCorrelationHandler(base)
 }

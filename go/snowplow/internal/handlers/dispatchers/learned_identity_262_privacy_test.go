@@ -30,7 +30,6 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -204,9 +203,9 @@ func TestF6_262_Privacy_NoClassTokenInLogsOrDebug(t *testing.T) {
 		t.Fatalf("NON-VACUITY: the class label %s never appeared in the captured logs — the learned seed's "+
 			"records did not reach the sink, so a clean scan proves nothing", label)
 	}
-	if !strings.Contains(logs, redact.Group(baseGroup)) {
-		t.Fatalf("NON-VACUITY (#453): the base group cohort's label %s never appeared — its seed records did not "+
-			"reach the sink, so a clean base scan proves nothing", redact.Group(baseGroup))
+	if strings.Count(logs, "prewarm.engine.seed.rank") < 2 {
+		t.Fatal("NON-VACUITY (#453): the base cohort's seed records did not reach the sink, so a clean base " +
+			"scan proves nothing")
 	}
 	if !strings.Contains(logs, "l262.refresh_path.requester") || !strings.Contains(logs, "l262.resolve_path.requester") {
 		t.Fatal("NON-VACUITY: the resolve-path and refresh-path probe records were not captured")

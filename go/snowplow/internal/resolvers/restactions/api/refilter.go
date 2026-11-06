@@ -42,7 +42,6 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -597,7 +596,6 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 		if err != nil {
 			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
-				slog.String("user", redact.User(username)),
 				slog.String("verb", uaf.Verb),
 				slog.String("group", uaf.Group),
 				slog.String("resource", resource),
@@ -1087,14 +1085,9 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 	if log == nil || uaf == nil {
 		return
 	}
-	username := ""
-	if u, err := xcontext.UserInfo(ctx); err == nil {
-		username = u.Username
-	}
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", redact.User(username)),
 		slog.String("api", apiCallName),
 		slog.String("verb", uaf.Verb),
 		slog.String("group", uaf.Group),
@@ -1108,18 +1101,17 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 // emitRefilterFalsifier emits the per-call falsifier per plan
 // §"Code-path falsifier" line:
 //
-//	userAccessFilter.dispatch=service_account user=X resource_type=...
+//	userAccessFilter.dispatch=service_account resource_type=...
 //	refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 //
 // Called by the resolver right after applyUserAccessFilter completes.
-func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username string, res refilterResult) {
+func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, res refilterResult) {
 	if log == nil || apiCall == nil || apiCall.UserAccessFilter == nil {
 		return
 	}
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", redact.User(username)),
 		slog.String("api", apiCall.Name),
 		slog.String("verb", apiCall.UserAccessFilter.Verb),
 		slog.String("group", apiCall.UserAccessFilter.Group),

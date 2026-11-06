@@ -68,7 +68,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -169,7 +168,6 @@ func filterListByRBAC(
 	if !allowed {
 		log.Debug("informer_dispatch.rbac_filter.list_denied",
 			slog.String("subsystem", "cache"),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
 		)
@@ -230,7 +228,6 @@ func filterListByRBAC(
 				// namespace; the next same-namespace item retries.
 				log.Warn("informer_dispatch.rbac_filter.evaluate_error",
 					slog.String("subsystem", "cache"),
-					slog.String("user", redact.User(user.Username)),
 					slog.String("gvr", gvr.String()),
 					slog.String("namespace", ns),
 					slog.Any("err", err),
@@ -254,7 +251,6 @@ func filterListByRBAC(
 	}
 	log.Debug("informer_dispatch.rbac_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
 		slog.Int("served", len(items)),
 		slog.Int("kept", len(kept)),
@@ -286,7 +282,6 @@ func listScopeAllowed(ctx context.Context, scope rbac.EvaluateOptions) (allowed,
 	if err != nil {
 		xcontext.Logger(ctx).Warn("informer_dispatch.rbac_filter.scope_undecided",
 			slog.String("subsystem", "cache"),
-			slog.String("user", redact.User(scope.Username)),
 			slog.String("gvr", scope.Group+"/"+scope.Resource),
 			slog.String("namespace", scope.Namespace),
 			slog.Any("err", err),
@@ -401,7 +396,6 @@ func authorizeGetByRBAC(
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
 		log.Warn("informer_dispatch.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
 			slog.String("name", name),
@@ -416,7 +410,6 @@ func authorizeGetByRBAC(
 	}
 	log.Debug("informer_dispatch.rbac_get_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
 		slog.String("namespace", namespace),
 		slog.String("name", name),

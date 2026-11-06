@@ -1412,8 +1412,14 @@ integration contract they implement is `docs/howto-frontend-live-refresh-sse.md`
 
 ## Key `slog` events
 
-JSON structured logs on stdout. Message strings are stable, dotted, and greppable. The
-operator-notable ones:
+JSON structured logs on stdout. Message strings are stable, dotted, and greppable.
+
+**No line carries a user name or groups, in clear or as a label** (#1192). The audit record is
+the one place that stores identity: to find who hit an error, join the line's trace id to the
+audit record. `internal/redact`'s guard fails on an identity attribute, and the log handler
+takes the identity out of the text of an error.
+
+The operator-notable events:
 
 | Event (message) | Level | Site | What it tells an operator |
 |---|---|---|---|

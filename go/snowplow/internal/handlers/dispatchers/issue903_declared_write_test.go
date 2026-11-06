@@ -91,7 +91,7 @@ func TestIssue903_S1_SeedMarksADeclaredWriteRADeclinedExternal(t *testing.T) {
 	seedCtx = cache.WithSeedDeclinedExternalSet(seedCtx, set)
 	ref := templatesv1.ObjectReference{Reference: templatesv1.Reference{Name: c681RA, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource}
-	if err := seedOneRestaction(seedCtx, "rv", ref, c681AuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCtx, ref, c681AuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	if n := up.writes(); n != 0 {

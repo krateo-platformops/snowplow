@@ -52,7 +52,7 @@ func reseedUnderCurrentIdentity(cohortCtx context.Context, deps rePrewarmDeps, r
 	if req.isWidget {
 		return seedOneWidgetFn(cohortCtx, req.widget, deps.authnNS, mode)
 	}
-	return seedOneRestactionFn(cohortCtx, cohortLogLabel(req.identity), req.ra, deps.authnNS, mode)
+	return seedOneRestactionFn(cohortCtx, req.ra, deps.authnNS, mode)
 }
 
 // reseedOnce runs one target under a fresh per-target cohort ctx.
@@ -78,7 +78,7 @@ func reseedWithRefusalPolicy(ctx context.Context, deps rePrewarmDeps, req reseed
 	if !errors.Is(err, errSeedTerminalPutRefused) || ctx.Err() != nil {
 		return err
 	}
-	return reseedAfterTerminalPutRefusal(reseedClass(req), reseedTargetLabel(req), cohortLogLabel(req.identity),
+	return reseedAfterTerminalPutRefusal(reseedClass(req), reseedTargetLabel(req),
 		func() error { return reseedOnce(ctx, deps, req, mode) })
 }
 

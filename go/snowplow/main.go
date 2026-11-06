@@ -169,6 +169,24 @@ func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
 	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
 }
 
+// newRequestChain is the middleware every route starts from. It is a function
+// so the logger chain the pod runs is the one the tests drive
+// (main_identity_logs_1192_test.go).
+func newRequestChain(log *slog.Logger) use.Chain {
+	return use.NewChain(
+		use.TraceId(),
+		// #1192: the request logger carries the traceId and no identity.
+		middleware.RequestLogger(log),
+		// Audit correlation (D19a): mint/accept the business session id and
+		// write it into W3C baggage (session.id), carried on the request
+		// context and serialized downstream by the Baggage propagator. The
+		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
+		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
+		// traceparent; no bespoke correlation header any more.
+		audit.Middleware(),
+	)
+}
+
 // mountTelemetryRoute mounts #1015's browser RUM ingest, POST
 // /telemetry/v1/traces, and registers it as a scoped route (scope telemetry,
 // listed in requiredScopedRoutes).
@@ -480,7 +498,7 @@ func main() {
 	// no propagator, no exporter), so the global providers stay no-op and
 	// every instrumentation site degrades to zero cost. This does NOT touch
 	// the shortid X-Krateo-TraceId correlation id, the stdout->otel_logs log
-	// pipeline, or the use.TraceId()/use.Logger() chain below — OTel
+	// pipeline, or the newRequestChain() chain below — OTel
 	// coexists with all three. The deferred shutdowns flush the batch
 	// span/metric pipelines on graceful exit; they are no-ops when disabled.
 	otelCtx := context.Background()
@@ -520,17 +538,7 @@ func main() {
 		))
 	}
 
-	chain := use.NewChain(
-		use.TraceId(),
-		use.Logger(log),
-		// Audit correlation (D19a): mint/accept the business session id and
-		// write it into W3C baggage (session.id), carried on the request
-		// context and serialized downstream by the Baggage propagator. The
-		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
-		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
-		// traceparent; no bespoke correlation header any more.
-		audit.Middleware(),
-	)
+	chain := newRequestChain(log)
 
 	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
 	// #155 for the /call loopback; the loopback DISPATCH BRANCH was retired
@@ -588,7 +596,7 @@ func main() {
 	defer cacheCancel()
 	// 0.30.207 — honor DEBUG on the background path. cacheCtx is a bare
 	// context.Background() derivative; unlike the HTTP request path (which
-	// runs use.Logger(log) → xcontext.WithLogger), it carries NO logger.
+	// runs middleware.RequestLogger → xcontext.WithLogger), it carries NO logger.
 	// Every background-resolve site (refresher → resolveAndPopulateL1 →
 	// resolver, prewarm walk, discovery refresher) calls
 	// xcontext.Logger(ctx), which on a logger-less context falls back to a

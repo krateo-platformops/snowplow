@@ -14,8 +14,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 
-	"github.com/krateo-platformops/snowplow/internal/redact"
-
 	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 )
@@ -118,24 +116,24 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	user := ui.Username
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
 		requestsDroppedType.Add(1)
-		in.refuse(w, user, http.StatusUnsupportedMediaType, "content_type", "content type must be application/json (OTLP/JSON)", 0)
+		in.refuse(w, http.StatusUnsupportedMediaType, "content_type", "content type must be application/json (OTLP/JSON)", 0)
 		return
 	}
 	if ok, wait := in.limiter.allow(user, in.now()); !ok {
 		requestsDroppedRate.Add(1)
-		in.refuse(w, user, http.StatusTooManyRequests, "rate", "rate limited", wait)
+		in.refuse(w, http.StatusTooManyRequests, "rate", "rate limited", wait)
 		return
 	}
 	if r.ContentLength > MaxBodyBytes {
 		requestsDroppedSize.Add(1)
-		in.refuse(w, user, http.StatusRequestEntityTooLarge, "size", "body too large", 0)
+		in.refuse(w, http.StatusRequestEntityTooLarge, "size", "body too large", 0)
 		return
 	}
 	// One request in flight per user (D2), checked BEFORE a decode slot is
 	// taken: a user still sending one body cannot take a second slot.
 	if !in.enter(user) {
 		requestsDroppedBusy.Add(1)
-		in.refuse(w, user, http.StatusTooManyRequests, "busy_user", "a request from this user is already in flight", time.Second)
+		in.refuse(w, http.StatusTooManyRequests, "busy_user", "a request from this user is already in flight", time.Second)
 		return
 	}
 	defer in.leave(user)
@@ -143,7 +141,7 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case in.decodes <- struct{}{}:
 	default:
 		requestsDroppedBusy.Add(1)
-		in.refuse(w, user, http.StatusTooManyRequests, "busy", "ingest busy", time.Second)
+		in.refuse(w, http.StatusTooManyRequests, "busy", "ingest busy", time.Second)
 		return
 	}
 	req, err := decodeCapped(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
@@ -154,10 +152,10 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.As(err, &tooBig), errors.As(err, &tooMany):
 			requestsDroppedSize.Add(1)
-			in.refuse(w, user, http.StatusRequestEntityTooLarge, "size", "body over a size or count cap", 0)
+			in.refuse(w, http.StatusRequestEntityTooLarge, "size", "body over a size or count cap", 0)
 		default:
 			requestsDroppedFormat.Add(1)
-			in.refuse(w, user, http.StatusBadRequest, "malformed", "body is not OTLP/JSON", 0)
+			in.refuse(w, http.StatusBadRequest, "malformed", "body is not OTLP/JSON", 0)
 		}
 		return
 	}
@@ -181,7 +179,7 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				res.CancelAt(now)
 			}
 			spansForwardRateLimited.Add(uint64(n))
-			in.refuse(w, user, http.StatusTooManyRequests, "global_rate", "ingest over its global span rate", wait)
+			in.refuse(w, http.StatusTooManyRequests, "global_rate", "ingest over its global span rate", wait)
 			return
 		}
 		out, err := proto.Marshal(envelope(f.spans))
@@ -193,18 +191,14 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeExportResponse(w, rejected)
 }
 
-// refuse answers a refusal and makes it attributable (F4). Following
-// snowplow's identity-logging rule (internal/redact, #453: no username is ever
-// logged in clear; a site that must say which identity it acted for renders it
-// with redact.User, an HMAC label stable for the pod's lifetime), it writes a
-// sampled WARN line carrying the user's label, the status and the reason, and
-// nothing from the request body. The counters (by reason) are the unsampled
-// totals; the line says who.
-func (in *Ingest) refuse(w http.ResponseWriter, user string, status int, reason, msg string, retryAfter time.Duration) {
+// refuse answers a refusal. It writes a sampled WARN line carrying the status
+// and the reason, and nothing from the request body or about the caller: no
+// identity reaches a log line (internal/redact, #1192). The counters (by
+// reason) are the unsampled totals.
+func (in *Ingest) refuse(w http.ResponseWriter, status int, reason, msg string, retryAfter time.Duration) {
 	if in.refusalLog.AllowN(in.now(), 1) {
 		slog.Warn("rum.ingest.refused",
 			slog.String("subsystem", "rum"),
-			slog.String("user", redact.User(user)),
 			slog.Int("status", status),
 			slog.String("reason", reason))
 	}
