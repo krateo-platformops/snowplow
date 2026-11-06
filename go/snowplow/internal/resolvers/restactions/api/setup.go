@@ -16,6 +16,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -33,13 +34,13 @@ import (
 // for the expansion is the existing bounded errgroup
 // (g.SetLimit(iterParallelism(ctx)), resolve.go) — no new mechanism.
 
-// skippedOption is one request option the #288 dial guard refused, as the
-// verdict that refused it. The DISPATCH path throws these away — not dialing
+// skippedOption is one request option the #288 dial guard refused, carried with
+// the verdict that refused it. The DISPATCH path throws these away — not dialing
 // is the whole point. The dispatch-free read-set enumeration must see them,
 // because "do not dial this" and "cannot enumerate this" are different
-// questions with different right answers (#504). It carries no rendered path:
-// that holds the values the guard refused, escaped or not (#1185 item C).
+// questions with different right answers (#504).
 type skippedOption struct {
+	path   string
 	reason skipReason
 }
 
@@ -96,8 +97,8 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		if ok {
 			all = append(all, el)
 		} else {
-			recordMalformedDialSkip(log, in.Name, in.Path, sr)
-			skips = append(skips, skippedOption{reason: sr})
+			recordMalformedDialSkip(log, in.Name, el.Path, sr)
+			skips = append(skips, skippedOption{path: el.Path, reason: sr})
 		}
 		return
 	}
@@ -135,8 +136,8 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 	for _, sa := range elems {
 		el, ok, sr := createRequestOptionWith(in, pt, sa, apiserver)
 		if !ok {
-			recordMalformedDialSkip(log, in.Name, in.Path, sr)
-			skips = append(skips, skippedOption{reason: sr})
+			recordMalformedDialSkip(log, in.Name, el.Path, sr)
+			skips = append(skips, skippedOption{path: el.Path, reason: sr})
 			continue
 		}
 		all = append(all, el)
@@ -153,18 +154,18 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 // coordinate-shape triage, mirroring the C-3 empty-iterator precedent (a
 // "nothing sensible to call" continue is benign + data-dependent — DEBUG, never
 // the WARN-floor firehose).
-//
-// The line names the stage's TEMPLATE, the author's text, never the rendered
-// path: a refused path holds the caller's values, and escaping one does not
-// hide it (#1185 item C). The template and the reason say which segment to read.
-func recordMalformedDialSkip(log *slog.Logger, name, pathTemplate string, sr skipReason) {
+func recordMalformedDialSkip(log *slog.Logger, name, path string, sr skipReason) {
 	// Two-tier (pm-1217): the bounded CLASS key drives the per-reason metric (what
 	// a spike alert needs — 3 fixed compile-time keys, no per-path cardinality); the
 	// finer sub-reason DETAIL rides the DEBUG line for coordinate-shape triage.
 	bumpMalformedDialSkipped(sr.class)
 	log.Debug("skipping api call: "+sr.detail+" — not dialing",
 		slog.String("name", name),
-		slog.String("path_template", pathTemplate),
+		// #1138 — the rendered path can hold caller input or an author-templated
+		// query value: logged as every logged URL is, its query values replaced.
+		// A path refused for what a value holds never gets here (#1185 item C):
+		// the option carries the rule instead (createRequestOptionWith).
+		slog.String("path", redact.Path(path)),
 		slog.String("reason_class", sr.class),
 		slog.String("reason", sr.detail),
 	)
@@ -229,18 +230,22 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		// from `"/v2/tickets/" + .id`). Refused on every verb, whatever the stage
 		// dials. It is the #288 collapse, read from the template's pieces, so it
 		// is that class: inspect enumerates it from the skeleton (#504).
+		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonEmptyInterp, detail: pathErr.Error(), collapsed: true}
 	}
 	if pathErr != nil && pathtemplate.IsRefused(pathErr) {
 		// #1123 — a value tried to be more than one segment, or a '.'/'..'
 		// segment. Never dialed. The refusal names the rule, never the value.
+		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonPathValueRefused, detail: pathErr.Error()}
 	}
 	if pathErr != nil {
 		// #293 sub-case 2: the path jq expression ERRORED. evalJQE surfaces the
 		// error (evalJQ would have masqueraded it as the path string and dialed it
 		// as a garbage apiserver path → 404). Mark invalid so the caller SKIPS the
-		// dial; the error text rides skipReason.detail, never the wire.
+		// dial; the error text is surfaced in out.Path for the skip DEBUG only,
+		// never dialed.
+		out.Path = pathErr.Error()
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
 	}
 	// #1123 — a template that rendered no path names nothing to call: it produced
@@ -273,7 +278,28 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		return
 	}
 	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
+	if !valid && sr.refusesAValue() {
+		// #1185 item C — the path was refused for what a value put in it, so the
+		// rendered path is that value, escaped or not: `%3F` hides it from a
+		// search for the value, not from a reader. It carries the rule instead,
+		// like a refusal from the template above.
+		out.Path = sr.detail
+	}
 	return
+}
+
+// refusesAValue reports whether the verdict is about what a value holds, as
+// opposed to a segment that is missing or a template left unrendered: a
+// percent-escape, a path the apiserver would read differently, a name or
+// namespace that is not DNS-1123-valid. Only this cluster's guard says these.
+func (sr skipReason) refusesAValue() bool {
+	switch sr.class {
+	case reasonPathValueRefused, reasonPathNotAsServed:
+		return true
+	case reasonEmptyInterp:
+		return !sr.collapsed
+	}
+	return false
 }
 
 // unrenderedTemplate reports whether a rendered path still carries a "${"

@@ -339,10 +339,10 @@ func TestIssue1185_AuthorLiteralsKeepTheirVerdict(t *testing.T) {
 	}
 }
 
-// A rendered value never reaches the skip line (#1185 item C), in any form and
-// from any branch that refuses a path: the '%' branch held the value escaped, so
-// searching for the raw value found nothing. The canary survives escaping, so the
-// arm sees it either way, and a line that is not there cannot pass.
+// A value a path was refused for never reaches the skip line (#1185 item C), from
+// any branch: the '%' branch held it escaped, so searching for the raw value found
+// nothing. The canary survives escaping, so the arm sees it either way, and a line
+// that is not there cannot pass.
 func TestIssue1185_NoRefusalPutsARenderedValueOnTheSkipLine(t *testing.T) {
 	const canary = "sup3rsecretvalue"
 	for _, c := range []struct {
@@ -356,9 +356,8 @@ func TestIssue1185_NoRefusalPutsARenderedValueOnTheSkipLine(t *testing.T) {
 		{"a value the guard reads as a verb", `${ "/api/v1/" + .id + "/" + .id2 }`, "watch", true, reasonPathNotAsServed},
 		{"an invalid name", `${ "/api/v1/namespaces/demo/configmaps/" + .id }`, canary + "-", true, reasonEmptyInterp},
 		{"an invalid namespace", `${ "/api/v1/namespaces/" + .id + "/configmaps" }`, canary + "-", true, reasonEmptyInterp},
-		{"an author's // beside a value, own cluster", `${ "/api/v1/namespaces//configmaps/" + .id }`, canary, true, reasonEmptyInterp},
-		{"an author's // beside a value, named endpoint", `${ "/api/v1/namespaces//configmaps/" + .id }`, canary, false, reasonEmptyInterp},
 		{"an empty value beside another", `${ "/v2/" + .empty + "/" + .id }`, canary, false, reasonEmptyInterp},
+		{"an empty value beside a query value", `${ "/api/v1/namespaces/" + .empty + "/configmaps?token=" + .id }`, canary, true, reasonEmptyInterp},
 		{"a value with a slash", `${ "/v2/" + .id }`, canary + "/x", false, reasonPathValueRefused},
 		{"a dot segment beside a value", `${ "/v2/" + .id + "/.." }`, canary, false, reasonPathValueRefused},
 		{"a jq error beside a value", `${ "/v2/" + .id + "/" + (1 | error) }`, canary, false, reasonJQPathError},
@@ -381,10 +380,10 @@ func TestIssue1185_NoRefusalPutsARenderedValueOnTheSkipLine(t *testing.T) {
 					t.Fatalf("planned %+v, skips %+v, want one %s", opts, skips, c.class)
 				}
 				got := line.String()
-				if !strings.Contains(got, "skipping api call") || !strings.Contains(got, "reason_class="+c.class) || !strings.Contains(got, "path_template=") {
+				if !strings.Contains(got, "skipping api call") || !strings.Contains(got, "reason_class="+c.class) {
 					t.Fatalf("no skip line to read: %q", got)
 				}
-				if strings.Contains(got, canary) || strings.Contains(fmt.Sprintf("%+v", skips), canary) {
+				if strings.Contains(got, canary) || strings.Contains(skips[0].path, canary) || strings.Contains(fmt.Sprintf("%+v", skips), canary) {
 					t.Fatalf("a rendered value reached the skip: %q %+v", got, skips)
 				}
 			})
@@ -560,5 +559,23 @@ func TestIssue1185_InspectEnumeratesARefusedStageFromItsTemplate(t *testing.T) {
 	}
 	if got["configmaps"] != "get" || got["services"] != "list" || len(rows) != 2 {
 		t.Fatalf("rows %+v, want get on configmaps and list on services", rows)
+	}
+}
+
+// The other side of item C: a path refused for what is missing, not for what a
+// value holds, keeps its shape on the line (#1138 owns its query redaction).
+func TestIssue1185_ACollapsedPathKeepsItsShapeOnTheSkipLine(t *testing.T) {
+	var line bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&line, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	in := &templates.API{Name: "s", Path: `${ "/api/v1/namespaces//configmaps/" + .id }`}
+	for _, apiserver := range []bool{true, false} {
+		line.Reset()
+		opts, skips, err := createRequestOptionsWithSkips(context.Background(), log, in, map[string]any{"id": "cm"}, apiserver)
+		if err != nil || len(opts) != 0 || len(skips) != 1 || !skips[0].reason.collapsed {
+			t.Fatalf("apiserver=%v: planned %+v, skips %+v, err %v", apiserver, opts, skips, err)
+		}
+		if !strings.Contains(line.String(), "path=/api/v1/namespaces//configmaps/cm") {
+			t.Fatalf("apiserver=%v: the skip line lost the path: %q", apiserver, line.String())
+		}
 	}
 }

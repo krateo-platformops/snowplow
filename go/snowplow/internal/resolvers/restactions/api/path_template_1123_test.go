@@ -83,7 +83,7 @@ func TestIssue1123_PlanNeverDialsAnInjectedPath(t *testing.T) {
 				t.Fatalf("no skip line to read: %s", line.String())
 			}
 			for _, form := range []string{c.id, url.PathEscape(c.id)} {
-				if len(c.id) > 2 && (strings.Contains(skips[0].reason.detail, form) || strings.Contains(line.String(), form)) {
+				if len(c.id) > 2 && (strings.Contains(skips[0].path, form) || strings.Contains(skips[0].reason.detail, form) || strings.Contains(line.String(), form)) {
 					t.Fatalf("the refusal echoes the caller's value as %q: %+v\n%s", form, skips[0], line.String())
 				}
 			}
