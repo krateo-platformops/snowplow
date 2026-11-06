@@ -1,7 +1,7 @@
 # The portal stages #1185 names, one from each class of the measurement on the
 # issue: `path` and `dependsOn` as helm template renders them from portal tag
-# 1.8.93 (commit 9c9ad2921eb5ed0c156af5b1f53fd443551ef1ff), charts compositions-page
-# and dashboard-page, unedited. The rest of each stage is not read here.
+# 1.8.93 (commit 9c9ad2921eb5ed0c156af5b1f53fd443551ef1ff), unedited. The rest of
+# each stage is not read here.
 - ra: composition-architecture
   stage: objs
   dependsOn:
@@ -54,3 +54,18 @@
     name: crds
     iterator: .crds
   path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }
+- ra: blueprint-palette
+  stage: running
+  dependsOn:
+    name: compdefs
+    iterator: '[ ((.compdefs // []) | unique_by([(.apiVersion | split("/"))[0], .plural]))[] | select((.apiVersion // "") | test("^[^/]+/[^/]+$")) | . + ((.apiVersion | split("/")) as $p | { group: $p[0], version: $p[1] }) ]'
+  path: ${ "/apis/" + .group + "/" + .version + "/" + .plural }
+# From tag 1.8.94 (commit 6d1fa8c3a505d14ac3f64c3cf40a4ed566fc8297), the form 057
+# runs: at 1.8.93 this iterator is a jq stream, which an iterator stage refuses
+# (#638).
+- ra: cluster-compositions
+  stage: spokeCompositions
+  dependsOn:
+    name: spokeCrds
+    iterator: '[ .spokeCrds.compositionCrds[]? ]'
+  path: ${ "/" + .group + "/" + .version + "/" + .plural }

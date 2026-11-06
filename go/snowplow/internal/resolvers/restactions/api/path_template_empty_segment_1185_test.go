@@ -432,6 +432,7 @@ func TestIssue1185_RealPortalStages(t *testing.T) {
 		name, ra, stage string
 		dict            map[string]any
 		want            want
+		named           bool
 	}{
 		// The class of 8 stages with an optional part: `if .pl == "" then "" else
 		// "/" + .pl end`. Discovery (no resource, no name), then a whole object.
@@ -440,52 +441,77 @@ func TestIssue1185_RealPortalStages(t *testing.T) {
 				"present": true, "apiVersion": "apps/v1", "names": []any{"web"}}}}},
 			"comp": []any{map[string]any{"managed": []any{
 				map[string]any{"name": "web", "apiVersion": "apps/v1", "path": "/apis/apps/v1"}}}},
-		}, want{paths: []string{"/apis/apps/v1"}}},
+		}, want{paths: []string{"/apis/apps/v1"}}, false},
 		{"optional parts present", "composition-architecture", "objs", map[string]any{
 			"arch": map[string]any{"graph": map[string]any{"nodes": []any{map[string]any{
 				"present": true, "apiVersion": "apps/v1", "names": []any{"web"}}}}},
 			"comp": []any{map[string]any{"managed": []any{
 				map[string]any{"name": "web", "apiVersion": "apps/v1", "path": "/apis/apps/v1/namespaces/demo/deployments/web"}}}},
-		}, want{paths: []string{"/apis/apps/v1/namespaces/demo/deployments/web"}}},
+		}, want{paths: []string{"/apis/apps/v1/namespaces/demo/deployments/web"}}, false},
 
 		// The iterator gate: an absent value yields no element, so nothing to
 		// call and nothing to refuse.
 		{"gate open", "composition-architecture", "arch", map[string]any{"name": "app", "namespace": "demo"},
-			want{paths: []string{"/api/v1/namespaces/demo/configmaps/app-architecture"}}},
-		{"gate shut, no name", "composition-architecture", "arch", map[string]any{"namespace": "demo"}, want{}},
-		{"gate shut, empty name", "composition-architecture", "arch", map[string]any{"namespace": "demo", "name": ""}, want{}},
-		{"gate shut, nil extras", "composition-architecture", "arch", nil, want{}},
+			want{paths: []string{"/api/v1/namespaces/demo/configmaps/app-architecture"}}, false},
+		{"gate shut, no name", "composition-architecture", "arch", map[string]any{"namespace": "demo"}, want{}, false},
+		{"gate shut, empty name", "composition-architecture", "arch", map[string]any{"namespace": "demo", "name": ""}, want{}, false},
+		{"gate shut, nil extras", "composition-architecture", "arch", nil, want{}, false},
 
 		// A value empty inside a segment is not an empty segment.
 		{"inside a segment, present", "composition-editdef", "jsonschema", map[string]any{
 			"name": "app", "namespace": "demo",
 			"found": []any{map[string]any{"kind": "Thing", "metadata": map[string]any{"name": "app", "namespace": "demo"}}},
 			"crds":  []any{map[string]any{"kind": "Thing", "cdNamespace": "defs", "plural": "things", "version": "v1"}},
-		}, want{paths: []string{"/api/v1/namespaces/defs/configmaps/things-v1-jsonschema-configmap"}}},
+		}, want{paths: []string{"/api/v1/namespaces/defs/configmaps/things-v1-jsonschema-configmap"}}, false},
 		{"inside a segment, empty version", "composition-editdef", "jsonschema", map[string]any{
 			"name": "app", "namespace": "demo",
 			"found": []any{map[string]any{"kind": "Thing", "metadata": map[string]any{"name": "app", "namespace": "demo"}}},
 			"crds":  []any{map[string]any{"kind": "Thing", "cdNamespace": "defs", "plural": "things", "version": ""}},
-		}, want{paths: []string{"/api/v1/namespaces/defs/configmaps/things--jsonschema-configmap"}}},
+		}, want{paths: []string{"/api/v1/namespaces/defs/configmaps/things--jsonschema-configmap"}}, false},
 
 		// The known cost in the ruling: a CompositionDefinition with
 		// `status.resource: ""`. Real values list; an empty plural used to read
 		// discovery, and now fails that one element.
 		{"found, real values", "composition-detail", "found", map[string]any{
 			"name": "app", "namespace": "demo", "crds": []any{crd("v1-2-0", "things")},
-		}, want{paths: []string{"/apis/composition.krateo.io/v1-2-0/things"}}},
+		}, want{paths: []string{"/apis/composition.krateo.io/v1-2-0/things"}}, false},
 		{"found, an empty plural", "composition-detail", "found", map[string]any{
 			"name": "app", "namespace": "demo", "crds": []any{crd("v1-2-0", ""), crd("v1-3-0", "things")},
-		}, want{paths: []string{"/apis/composition.krateo.io/v1-3-0/things"}, skipped: 1}},
+		}, want{paths: []string{"/apis/composition.krateo.io/v1-3-0/things"}, skipped: 1}, false},
 		{"allCompositions, an empty plural", "dashboard-data", "allCompositions", map[string]any{
 			"crds": []any{crd("v1-2-0", "")},
-		}, want{skipped: 1}},
+		}, want{skipped: 1}, false},
+
+		// The two stages the live measurement added to the ruling's 8: they read
+		// the same field. The second dials a named endpoint, a spoke cluster.
+		{"running, real values", "blueprint-palette", "running", map[string]any{
+			"compdefs": []any{map[string]any{"apiVersion": "composition.krateo.io/v1-2-0", "plural": "things"}},
+		}, want{paths: []string{"/apis/composition.krateo.io/v1-2-0/things"}}, false},
+		{"running, an empty plural", "blueprint-palette", "running", map[string]any{
+			"compdefs": []any{map[string]any{"apiVersion": "composition.krateo.io/v1-2-0", "plural": ""}},
+		}, want{skipped: 1}, false},
+		{"running, an absent plural", "blueprint-palette", "running", map[string]any{
+			"compdefs": []any{map[string]any{"apiVersion": "composition.krateo.io/v1-2-0"}},
+		}, want{skipped: 1}, false},
+		{"spoke, real values", "cluster-compositions", "spokeCompositions", map[string]any{
+			"spokeCrds": map[string]any{"compositionCrds": []any{map[string]any{"group": "composition.krateo.io", "version": "v1-2-0", "plural": "things"}}},
+		}, want{paths: []string{"/composition.krateo.io/v1-2-0/things"}}, true},
+		{"spoke, an empty plural", "cluster-compositions", "spokeCompositions", map[string]any{
+			"spokeCrds": map[string]any{"compositionCrds": []any{map[string]any{"group": "composition.krateo.io", "version": "v1-2-0", "plural": ""}}},
+		}, want{skipped: 1}, true},
+		{"spoke, an absent version", "cluster-compositions", "spokeCompositions", map[string]any{
+			"spokeCrds": map[string]any{"compositionCrds": []any{map[string]any{"group": "composition.krateo.io", "plural": "things"}}},
+		}, want{skipped: 1}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			in := loadPortalStage1185(t, c.ra, c.stage)
-			paths, skips, err := planPortal1123(in, c.dict)
+			opts, skips, err := createRequestOptionsWithSkips(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), in, c.dict, !c.named)
 			if err != nil {
 				t.Fatalf("iterator: %v", err)
+			}
+			var paths []string
+			for _, o := range opts {
+				paths = append(paths, o.Path)
 			}
 			if strings.Join(paths, " ") != strings.Join(c.want.paths, " ") {
 				t.Fatalf("planned %v, want %v (skips %+v)", paths, c.want.paths, skips)
@@ -682,6 +708,52 @@ func TestIssue1185_ThePortalShapeIsSent(t *testing.T) {
 					t.Fatalf("dialled %+v, want one %s; failure %+v, outcomes %s", hits, c.want, o.failure, o.outcomes)
 				}
 			})
+		}
+	}
+}
+
+// An expression that writes nothing before a query or a fragment dials the
+// endpoint's root, on every verb: `DELETE /?q=1` with the stage's credential. The
+// review of #1197 found these sent on a named endpoint, where `.x + "?q=1"` and
+// the same text in a branch were refused. The control is the value there.
+func TestIssue1185_NothingBeforeAQueryDialsNoRoot(t *testing.T) {
+	const opt = `(if (.x // "") == "" then "" else "/" + .x end)`
+	api := server1185(t)
+	for _, c := range []struct {
+		tmpl    string
+		control string // the path a present value reaches; "" = the stage has no value
+		ownToo  bool   // the control is a path this cluster's guard also plans
+	}{
+		{`${ ` + opt + ` + "?q=1" }`, "/v", true},
+		{`${ ` + opt + ` + "#f" }`, "/v", true},
+		// With a value this spelling has no leading '/', which this cluster refuses.
+		{`${ (if (.x // "") == "" then "" else .x end) + "?q=1" }`, "/v", false},
+		{`${ "" + "?q=1" }`, "", false},
+		{`${ "" + "#f" }`, "", false},
+	} {
+		for _, target := range targets1185 {
+			for _, verb := range []string{http.MethodGet, http.MethodDelete} {
+				t.Run(fmt.Sprintf("%s/%s/%s", target.name, verb, c.tmpl), func(t *testing.T) {
+					if c.control != "" && (c.ownToo || target.name != "own cluster") {
+						dialled := len(api.all())
+						rr16Resolve(t, workclass.None, map[string]any{"x": "v"}, target.stage(verb, c.tmpl))
+						if hits := api.all()[dialled:]; len(hits) != 1 || hits[0].Path != c.control {
+							t.Fatalf("control: dialled %+v, want one %s", hits, c.control)
+						}
+					}
+					for name, extras := range map[string]map[string]any{"empty": {"x": ""}, "null": {"x": nil}, "absent": {}} {
+						dialled := len(api.all())
+						o := rr16Resolve(t, workclass.None, extras, target.stage(verb, c.tmpl))
+						if hits := api.all()[dialled:]; len(hits) != 0 {
+							t.Fatalf("%s: dialled %+v", name, hits)
+						}
+						x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+						if o.failure == nil || o.failure.Code != http.StatusBadRequest {
+							t.Fatalf("%s: StageFailure = %+v, want a 400", name, o.failure)
+						}
+					}
+				})
+			}
 		}
 	}
 }

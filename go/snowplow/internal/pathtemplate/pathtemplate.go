@@ -48,8 +48,10 @@
 //     contributes, piece by piece, as segments() reads a declared value;
 //   - nothing precedes the root, so an `if` or a `""` that writes nothing before
 //     the path's first `/` leaves no segment empty: `(if .p == "" then "" else
-//     "/" + .p end) + "/b"` is fine. A value there was meant to be text, and is
-//     refused (`.base + "/b"`);
+//     "/" + .p end) + "/b"` is fine. It needs that `/`: followed by a `?` or a `#`
+//     there is no path, and the request reads the endpoint's root, so it is
+//     refused. A value there was meant to be text, and is refused either way
+//     (`.base + "/b"`);
 //   - an expression is empty when it renders nothing. Whitespace renders `%20`:
 //     like the dot check, this rule compares the segment exactly and trims
 //     nothing. A dial that takes no escape refuses it (validInterpolatedPath).
@@ -852,7 +854,7 @@ func assemble(v any) (string, error) {
 	if hasDotSegment(out) {
 		return "", &RefusedError{Reason: ReasonDotSegment}
 	}
-	if segs.emptied {
+	if segs.emptied || (segs.unrooted && strings.IndexAny(out, "?#") == 0) {
 		return "", &RefusedError{Reason: ReasonEmptySegment}
 	}
 	return out, nil
@@ -867,6 +869,9 @@ type segmentWatch struct {
 	text    bool // the current segment holds text
 	spliced bool // an expression contributed to the current segment
 	emptied bool // a finished segment had an expression in it and holds nothing
+	// unrooted: an expression wrote nothing before the path began. That leaves no
+	// segment empty only if a path follows: a '?' or '#' first reads the root.
+	unrooted bool
 }
 
 // literal takes author text that lands in the path part. Its first '?' or '#'
@@ -922,6 +927,7 @@ func (w *segmentWatch) expression(s string, opening bool) {
 		s = s[:cut]
 	}
 	if opening && s == "" && cut < 0 {
+		w.unrooted = true
 		return
 	}
 	w.pieces(s, opening)

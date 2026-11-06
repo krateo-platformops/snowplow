@@ -501,6 +501,8 @@ a literal `""`.
 | `(if (.x // "") == "" then "/a/" else "/a/" + .x end)` | refused: the `/` is in the branch, and the segment after it is still empty |
 | `"/a" + (if (.x // "") == "" then "" else "/" + .x end)` | sent as `/a`: the `/` is inside the branch, so no segment is empty |
 | `(if (.x // "") == "" then "" else "/" + .x end) + "/z"` | sent as `/z`: nothing comes before the path's first `/`, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "?q=1"`, `"" + "?q=1"` | refused: no path follows, so the request would read the endpoint's root |
+| `(if (.x // "") == "" then null else "/" + .x end) + "/z"` | refused: `null` is a value, not your text, so write `""` here |
 
 The rule asks whether an expression contributed to a segment and left it empty,
 not what the rendered text looks like. An expression is a value, the text of an

@@ -243,6 +243,13 @@ func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
 		`${ (if (.id // "") == "" then "/?q=1" else "/" + .id end) }`,
 		// No '/' at all: the path is a query, and that reads the root.
 		`${ (if (.id // "") == "" then "?q=1" else "/" + .id end) }`,
+		// Nothing before a query or a fragment: the request reads the root.
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "?q=1" }`,
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "#f" }`,
+		`${ (if (.id // "") == "" then "" else .id end) + "?q=1" }`,
+		`${ "" + "?q=1" }`,
+		`${ "" + "#f" }`,
+		`${ "" + (if (.id // "") == "" then "?q=1" else "/" + .id end) }`,
 		// A branch's text is read piece by piece, wherever it lands.
 		`${ "/v2/" + (if (.id // "") == "" then "/x" else .id end) }`,
 		`${ (if (.id // "") == "" then "/v2//x" else "/v2/" + .id end) }`,
@@ -258,6 +265,8 @@ func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
 	// The same stages with the value there.
 	wantPath(t, `${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) }`, map[string]any{"id": "42"}, "/v2/tickets/42")
 	wantPath(t, `${ (if (.id // "") == "" then "/v2/tickets/" else "/v2/tickets/" + .id end) }`, map[string]any{"id": "42"}, "/v2/tickets/42")
+	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "?q=1" }`, map[string]any{"id": "42"}, "/42?q=1")
+	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "#f" }`, map[string]any{"id": "42"}, "/42#f")
 }
 
 // What the extended ruling leaves valid. The portal's shape holds its '/' inside
@@ -292,6 +301,9 @@ func TestIssue1185_TheBranchThatHoldsItsSlashLeavesNoSegmentEmpty(t *testing.T) 
 		wantPath(t, `${ `+opt+` + "/b" }`, data, "/b")
 		wantPath(t, `${ "" + "/b" }`, data, "/b")
 		wantPath(t, `${ (if (.p // "") == "" then "" else .p end) + "/b" }`, data, "/b")
+		wantPath(t, `${ `+opt+` + "/b?q=1" }`, data, "/b?q=1")
+		wantPath(t, `${ `+opt+` + "/b#f" }`, data, "/b#f")
+		wantPath(t, `${ `+opt+` + "/?q=1" }`, data, "/?q=1")
 		wantPath(t, `${ `+opt+` }`, data, "")
 		wantPath(t, `${ "" }`, data, "")
 		// In the query or the fragment an `if` writes what it likes.
@@ -301,6 +313,13 @@ func TestIssue1185_TheBranchThatHoldsItsSlashLeavesNoSegmentEmpty(t *testing.T) 
 		wantPath(t, `${ "/a?q=1" + (if (.p // "") == "" then "&r=//" else .p end) }`, data, "/a?q=1&r=//")
 	}
 	wantPath(t, `${ "/a" + (if (.p // "") == "" then "" else "/" + .p end) }`, map[string]any{"p": "b"}, "/a/b")
+	// A `null` branch is a value, so it is refused where a `""` branch is sent.
+	// It fails safe; the howto says so.
+	wantRefused(t, `${ (if (.p // "") == "" then null else "/" + .p end) + "/b" }`, map[string]any{}, ReasonEmptySegment)
+	// An author's literal query with no path is the author's text, not an
+	// expression: this rule leaves it to the dial guards.
+	wantPath(t, `${ "?q=1" }`, nil, "?q=1")
+	wantPath(t, `${ "/?q=1" }`, nil, "/?q=1")
 
 	// A branch's text: written as it stands, and its '?' ends the path.
 	wantPath(t, `${ (if .c then "/b" else "/a" end) + "/z" }`, nil, "/a/z")
