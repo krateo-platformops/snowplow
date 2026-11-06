@@ -8,6 +8,9 @@
 //   - R1 a viewed key starts within one wake while all N−1 unviewed slots are
 //     busy on long jobs (they never end during the arm), with no wake key.
 //   - R2 normal + cluster_list work never exceeds N−1 concurrent, and reaches it.
+//     R2b (deterministic, white-box) cluster_list work always holds an unviewed
+//     slot: with every slot held the last worker parks, however much
+//     cluster_list work waits, and takes the next viewed key.
 //   - R3 the viewed tier still never exceeds N−1 (#799 guard), and the last
 //     worker still runs unviewed work beside it.
 //   - R4 no busy-spin while there is no viewed work: the reserved worker parks
@@ -24,6 +27,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -136,6 +140,73 @@ func TestReserve1069_R2_UnviewedNeverHoldsTheLastWorker(t *testing.T) {
 		t.Fatalf("R2: only %d unviewed jobs ever ran at once, want %d — the unviewed side must keep all its N−1 workers", got, p-1)
 	}
 	t.Logf("R2: max %d unviewed jobs at once of %d workers", maxIn.Load(), p)
+}
+
+// TestReserve1069_R2b_ClusterListNeverTakesTheLastWorker is R2's rule with no
+// worker running: the test is each worker in turn, calling nextDequeue itself,
+// so the outcome is the decision and nothing else.
+//
+// R2 cannot be this guard. Its workers start before its keys are marked, so the
+// last one has usually parked by then, nothing but viewed work wakes it, and a
+// cluster_list key that skips the cap finds no worker to overrun it: the
+// strongest such mutation went RED on R2 in 21 of 40 runs. Here the last worker
+// asks with cluster_list work queued, every time.
+//
+// Every unviewed slot is held, by cluster_list jobs or by workers in the normal
+// Get. A viewed key that arrives then goes to the last worker, not to the
+// cluster_list key already waiting.
+func TestReserve1069_R2b_ClusterListNeverTakesTheLastWorker(t *testing.T) {
+	type dequeue struct {
+		key  string
+		tier refreshTier
+		pick dequeuePick
+	}
+	for _, p := range []int{2, 3, 4} {
+		for _, heldBy := range []string{"cluster_list_jobs", "normal_gets"} {
+			t.Run(fmt.Sprintf("p%d_slots_held_by_%s", p, heldBy), func(t *testing.T) {
+				t.Cleanup(withCleanRefresher(t, p, 0))
+				r := refresherSingleton() // no StartRefresher: no worker but this test
+
+				for i := 0; i < p-1; i++ {
+					want := dequeue{tier: tierNormal, pick: pickNormal}
+					if heldBy == "cluster_list_jobs" {
+						want = dequeue{fmt.Sprintf("cl-held-%d", i), tierClusterList, pickPriority}
+						r.clusterListQueue.Add(want.key)
+					}
+					k, tier, pick := r.nextDequeue()
+					if got := (dequeue{k, tier, pick}); got != want {
+						t.Fatalf("PRECONDITION: worker %d of %d dequeued %+v, want %+v", i, p, got, want)
+					}
+				}
+
+				r.clusterListQueue.Add("cl-waiting")
+				got := make(chan dequeue, 1)
+				go func() {
+					k, tier, pick := r.nextDequeue()
+					got <- dequeue{k, tier, pick}
+				}()
+				// Two exclusive outcomes, both reached by this one call: the
+				// bound is for a stuck arm, never the verdict.
+				waitFor(t, 30*time.Second, "the last worker parks or dequeues", func() bool {
+					return r.viewed.reserveParks.Load() == 1 || len(got) == 1
+				})
+				if len(got) == 1 {
+					t.Fatalf("R2b RED (#1069): with all %d unviewed slots of %d workers held, the last worker dequeued %+v: cluster_list work must hold an unviewed slot, or a viewer waits for it",
+						p-1, p, <-got)
+				}
+
+				r.enqueueViewed("viewed-key")
+				waitFor(t, 30*time.Second, "the viewed key wakes the last worker", func() bool { return len(got) == 1 })
+				want := dequeue{"viewed-key", tierViewed, pickPriority}
+				if d := <-got; d != want {
+					t.Fatalf("R2b: the last worker dequeued %+v, want %+v", d, want)
+				}
+				if n := r.clusterListQueue.Len(); n != 1 {
+					t.Fatalf("R2b: %d cluster_list key(s) queued, want the 1 left waiting", n)
+				}
+			})
+		}
+	}
 }
 
 // TestReserve1069_R3_ViewedStillCappedAtNMinus1 is R3 (#799 fix 2 under #1069).
