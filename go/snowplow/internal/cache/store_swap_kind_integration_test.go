@@ -347,7 +347,7 @@ func TestStoreSwap870_Kind_RepairUnderChurn(t *testing.T) {
 		if StoreSwapStatsSnapshot().Swaps == 1 {
 			break
 		}
-		if _, ok := rw.ListObjectsServable(gvr, nsName(1)); !ok {
+		if _, ok := rw.ListObjectsServable(context.Background(), gvr, nsName(1)); !ok {
 			t.Fatal("K1 RED: a read during the build fell through")
 		}
 		time.Sleep(10 * time.Millisecond)

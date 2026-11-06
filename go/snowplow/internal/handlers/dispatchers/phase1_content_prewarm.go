@@ -312,7 +312,7 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 		if ctx.Err() != nil {
 			// Phase-1 budget exhausted — stop the pass; whatever is left
 			// is lazy-warmed on first request.
-			log.Warn("content.prewarm.ctx_cancelled",
+			log.WarnContext(ctx, "content.prewarm.ctx_cancelled",
 				slog.String("subsystem", "cache"),
 				slog.Int("warmed", warmed),
 				slog.Int("remaining", len(refs)-warmed-failed),
@@ -322,7 +322,7 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 		envelopeBytes, err := prewarmOneRESTAction(rctx, ref, authnNS)
 		if err != nil {
 			failed++
-			log.Warn("content.prewarm.resolve_failed",
+			log.WarnContext(ctx, "content.prewarm.resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("restaction", ref.Namespace+"/"+ref.Name),
 				slog.Any("err", err),
@@ -341,7 +341,7 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 			// PREWARM_CONTENT_MAX_BYTES against the real data-source
 			// sizes. The entry IS warm; the pass continues normally.
 			oversize++
-			log.Warn("content.prewarm.envelope_oversize",
+			log.WarnContext(ctx, "content.prewarm.envelope_oversize",
 				slog.String("subsystem", "cache"),
 				slog.String("restaction", ref.Namespace+"/"+ref.Name),
 				slog.Int("envelope_bytes", envelopeBytes),

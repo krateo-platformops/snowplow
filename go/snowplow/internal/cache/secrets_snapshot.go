@@ -141,6 +141,7 @@ func scheduleSecretsRebuild() {
 		defer func() {
 			if r := recover(); r != nil {
 				secretsRebuildDirty.Store(true)
+				// log-ctx-waiver: worker: the debounced Secrets snapshot rebuild goroutine
 				slog.Error("cache.secrets.snapshot.rebuild_panic",
 					slog.String("subsystem", "cache"),
 					slog.Any("recovered", r),
@@ -191,6 +192,7 @@ func rebuildSecretsSnapshot() {
 	for _, it := range items {
 		sec, ok := it.(*corev1.Secret)
 		if !ok {
+			// log-ctx-waiver: worker: the Secrets snapshot rebuild, a pod-wide rebuild
 			slog.Warn("cache.secrets.snapshot.skip_non_typed",
 				slog.String("subsystem", "cache"),
 				slog.String("got_type", goTypeOfSecret(it)),

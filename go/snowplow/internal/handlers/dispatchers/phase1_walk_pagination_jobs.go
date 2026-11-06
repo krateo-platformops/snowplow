@@ -382,7 +382,7 @@ func drainApiRefPaginationJobs(
 	completed := 0
 	for _, j := range jobs {
 		if err := ctx.Err(); err != nil {
-			log.Warn("phase1.pagination_drain.ctx_cancel",
+			log.WarnContext(ctx, "phase1.pagination_drain.ctx_cancel",
 				slog.String("subsystem", "cache"),
 				slog.Int("completed", completed),
 				slog.Int("remaining", len(jobs)-completed),
@@ -534,7 +534,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 		defer t.Stop()
 		select {
 		case <-ctx.Done():
-			log.Warn("phase1.pagination_recollect.ctx_cancel_during_settle",
+			log.WarnContext(ctx, "phase1.pagination_recollect.ctx_cancel_during_settle",
 				slog.String("subsystem", "cache"),
 				slog.Int("candidates", len(candidates)),
 				slog.Any("err", ctx.Err()),
@@ -547,7 +547,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 	recollected := 0
 	for _, cand := range candidates {
 		if err := ctx.Err(); err != nil {
-			log.Warn("phase1.pagination_recollect.ctx_cancel",
+			log.WarnContext(ctx, "phase1.pagination_recollect.ctx_cancel",
 				slog.String("subsystem", "cache"),
 				slog.Int("recollected", recollected),
 				slog.Any("err", err),
@@ -566,7 +566,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 		}
 		got := paginationFetchPageFn(ctx, ref)
 		if got.Err != nil || got.Unstructured == nil {
-			log.Warn("phase1.pagination_recollect.fetch_failed",
+			log.WarnContext(ctx, "phase1.pagination_recollect.fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", cand.GVR.String()),
 				slog.String("ns", ns),
@@ -586,7 +586,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 			Page:    cand.Pagination.Page,
 		})
 		if err != nil || res == nil {
-			log.Warn("phase1.pagination_recollect.resolve_failed",
+			log.WarnContext(ctx, "phase1.pagination_recollect.resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", cand.GVR.String()),
 				slog.String("ns", ns),

@@ -650,6 +650,7 @@ func scanStalePushOverdue() {
 		}
 		// One line per layer per scan (metadata only, never the subject): a
 		// failure, never per-serve volume.
+		// log-ctx-waiver: worker: the stale-push overdue scanner ticker
 		slog.Warn("cache.stale_push_unreplaced",
 			slog.String("subsystem", "cache"),
 			slog.String("layer", StaleLayers[li]),

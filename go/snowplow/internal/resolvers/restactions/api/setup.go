@@ -127,7 +127,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		} else {
 			// err is query-derived (parse/compile) or a sanitized runtime
 			// error: no response bytes reach the log or the stage error.
-			log.Error("unable to execute iterator", slog.String("query", it), slog.Any("err", err))
+			log.ErrorContext(ctx, "unable to execute iterator", slog.String("query", it), slog.Any("err", err))
 			iterErr = fmt.Errorf("iterator %q failed: %w", it, err)
 		}
 		return all, skips, iterErr

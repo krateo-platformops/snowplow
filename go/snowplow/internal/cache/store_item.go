@@ -56,6 +56,7 @@
 package cache
 
 import (
+	"context"
 	"encoding/json"
 	"expvar"
 	"fmt"
@@ -180,12 +181,12 @@ var (
 )
 
 // recordUnrenderableStoreItem counts and logs one fail-closed serve.
-func recordUnrenderableStoreItem(site string, gvr schema.GroupVersionResource, err error) {
+func recordUnrenderableStoreItem(ctx context.Context, site string, gvr schema.GroupVersionResource, err error) {
 	unrenderableStoreItemsTotal.Add(1)
 	key := site + "|" + gvr.String()
 	c, _ := unrenderableStoreItemCells.LoadOrStore(key, new(atomic.Uint64))
 	c.(*atomic.Uint64).Add(1)
-	slog.Warn("cache.store_item.unrenderable",
+	slog.WarnContext(ctx, "cache.store_item.unrenderable",
 		slog.String("subsystem", "cache"),
 		slog.String("site", site),
 		slog.String("gvr", gvr.String()),
@@ -220,7 +221,7 @@ func UnrenderableStoreItemsSnapshot() []UnrenderableStoreItemCell {
 // production record path from another package's test (internal/metrics'
 // OTLP arm). Never called in production.
 func RecordUnrenderableStoreItemForTest(site string, gvr schema.GroupVersionResource) {
-	recordUnrenderableStoreItem(site, gvr, &unrenderableStoreItemError{goType: "test"})
+	recordUnrenderableStoreItem(context.Background(), site, gvr, &unrenderableStoreItemError{goType: "test"})
 }
 
 // ResetUnrenderableStoreItemsForTest zeroes the grand total and drops every

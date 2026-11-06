@@ -150,7 +150,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 				// a ctx with no UserInfo (the fail-closed denial) labels as
 				// anonymous.
 				ui, _ := xcontext.UserInfo(ctx)
-				log.Warn("resource ref action not allowed",
+				log.WarnContext(ctx, "resource ref action not allowed",
 					slog.String("id", in.ID),
 					slog.String("verb", verb),
 					slog.String("group", gvr.Group),

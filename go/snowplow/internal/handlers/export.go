@@ -263,7 +263,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if format == "pdf" {
 		code, err := servePDF(wri, req, table, labels, rowCount, truncated, filename, stages)
 		if err != nil {
-			log.Error("unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
 		}
 		auditExport(code, err)
 		return
@@ -292,7 +292,7 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		err = writeCSV(wri, rows, fields, labels)
 	}
 	if err != nil {
-		log.Error("unable to serialize export", slog.Any("err", err))
+		log.ErrorContext(req.Context(), "unable to serialize export", slog.Any("err", err))
 	}
 	auditExport(http.StatusOK, err)
 }
