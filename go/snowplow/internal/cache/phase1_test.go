@@ -387,7 +387,7 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	first := rw.RegisterMetaQuerySeeds()
+	first := rw.RegisterMetaQuerySeeds(context.Background())
 	// The 4 RBAC GVRs are already registered by NewResourceWatcher; only the
 	// non-RBAC seed (restactions) is new. Ship 0 / 0.30.222 removed
 	// customresourcedefinitions (walker-spawned via
@@ -409,7 +409,7 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 		}
 	}
 	// Idempotent — second call registers nothing new.
-	if second := rw.RegisterMetaQuerySeeds(); second != 0 {
+	if second := rw.RegisterMetaQuerySeeds(context.Background()); second != 0 {
 		t.Fatalf("second RegisterMetaQuerySeeds must be a no-op; registered %d", second)
 	}
 }
@@ -476,7 +476,7 @@ func TestWaitAllInformersSynced_ReSnapshotRace(t *testing.T) {
 
 	// Seed the barrier with the meta-query seeds so it has a non-empty
 	// starting set.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 
 	// Concurrently register the 12 late GVRs while the barrier runs.
 	lateDone := make(chan struct{})
@@ -525,7 +525,7 @@ func TestWaitAllInformersSynced_CtxBound(t *testing.T) {
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled — the loop must return promptly

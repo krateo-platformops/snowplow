@@ -97,3 +97,52 @@ func staleWaiver() {
 	// log-ctx-waiver: boot: the site this excused was removed
 	_ = 1
 }
+
+func logsWith(ctx context.Context) {
+	slog.WarnContext(ctx, "reaches a record")
+}
+
+func forwards(ctx context.Context) {
+	logsWith(ctx)
+}
+
+func literalToALogger(ctx context.Context) {
+	logsWith(context.Background())
+}
+
+func literalThroughAForward(req *http.Request) {
+	forwards(context.TODO())
+}
+
+func wrapper() {
+	forwards(context.Background())
+}
+
+func wrapperOfAWrapper() {
+	wrapper()
+}
+
+func callsAWrapper(ctx context.Context) {
+	wrapper()
+}
+
+func callsTheOuterWrapper(req *http.Request) {
+	wrapperOfAWrapper()
+}
+
+func (r *run) callsAWrapperFromAField() {
+	wrapper()
+}
+
+var wrapperValue = wrapper
+
+func takesAFunc(f func()) { f() }
+
+func passesAWrapperValue() {
+	takesAFunc(wrapper)
+}
+
+func detachedOnAPlainSite() {
+	// log-ctx-waiver: detached: this class cannot excuse a site with no context
+	slog.Warn("no context")
+}

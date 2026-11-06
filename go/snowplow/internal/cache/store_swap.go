@@ -470,6 +470,7 @@ func (rw *ResourceWatcher) constructCandidateLocked(gvr schema.GroupVersionResou
 			slog.String("error", err.Error()),
 		)
 	}
+	// log-ctx-waiver: detached: a store rebuild runs for the CRD worker or the repair path, never a request
 	rw.wireInstanceLocked(context.Background(), gvr, c, "swap-candidate")
 	if rw.stopRequestedLocked() || holdBuildsForTest.Load() {
 		return c
@@ -506,6 +507,7 @@ func (rw *ResourceWatcher) newOwnedInformerLocked(gvr schema.GroupVersionResourc
 	indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
 	switch shape {
 	case shapeStreaming:
+		// log-ctx-waiver: detached: a store rebuild runs for the CRD worker or the repair path, never a request
 		gi, ok := newStreamingDynamicInformer(context.Background(), rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak)
 		if !ok {
 			return nil

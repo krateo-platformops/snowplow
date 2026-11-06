@@ -713,7 +713,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// Composition GVRs are discovered by one-shot apiserver discovery
 	// (cache.DiscoverGroupResources) invoked synchronously from the
 	// walker the first time it reaches a templated apiserver path.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(ctx)
 
 	// Step 2 — (Ship 0 / 0.30.222) the explicit StartCRDWatch call that
 	// lived here was DELETED. Ship 0.5 / 0.30.223 (v6) DELETED the CRD
@@ -1428,7 +1428,7 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 // with no page/perPage, so prewarmPaginationFor("") is the unpaginated
 // (-1,-1), and the walk both resolves the root and keys its cell with it.
 func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource) error {
-	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(""))
+	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(ctx, ""))
 }
 
 // walkChild is the ONE entry of a walk into a child widget reached through a
@@ -1438,7 +1438,7 @@ func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstruct
 // caller fetched; the child's pagination comes from child.Path — the URL the
 // browser requests for it — and the walk resolves AND keys with it.
 func (w *phase1Walker) walkChild(ctx context.Context, child navChildRef, got objects.Result, depth int) error {
-	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(child.Path))
+	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(ctx, child.Path))
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,

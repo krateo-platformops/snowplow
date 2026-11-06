@@ -63,7 +63,7 @@ func newPrewarmPagination(perPage, page int) prewarmPagination {
 // special-case. A widget-declared page size (portal#235) plugs in HERE, and
 // only here: whatever pagination the browser will send for the widget is what
 // this returns, and every writer follows it for both its resolve and its key.
-func prewarmPaginationFor(callPath string) prewarmPagination {
+func prewarmPaginationFor(ctx context.Context, callPath string) prewarmPagination {
 	if callPath == "" {
 		return unpaginatedPrewarm
 	}
@@ -71,7 +71,7 @@ func prewarmPaginationFor(callPath string) prewarmPagination {
 	if err != nil {
 		return unpaginatedPrewarm
 	}
-	perPage, page := paginationFromQuery(context.Background(), slog.Default(), u.Query())
+	perPage, page := paginationFromQuery(ctx, slog.Default(), u.Query())
 	return prewarmPagination{PerPage: perPage, Page: page}
 }
 

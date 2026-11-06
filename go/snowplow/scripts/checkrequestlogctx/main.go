@@ -15,6 +15,9 @@
 //     has a context.Context field) and the call does not pass one. A blank or
 //     unnamed context parameter counts: name it.
 //   - L2: no context is in scope, and the site carries no waiver.
+//   - L3 and L4 (delegation.go): a function that logs with the context it is given
+//     must be given one. A literal Background handed to it with a context in scope
+//     fails, and so does calling a wrapper that delegates one.
 //
 // The scope test has no idea whether a context is a request's. It does not need
 // one: on background work the context has no span, the record is byte-identical
@@ -29,7 +32,7 @@
 // that can be WARN or above (a constant below it is skipped; a computed level is
 // not).
 //
-// THE WAIVER (L2 only). A site with no context in scope is a decision, not a
+// THE WAIVER. A site with no context in scope is a decision, not a
 // default, so it says which:
 //
 //	// log-ctx-waiver: informer-event: a watch error on the reflector goroutine
@@ -38,7 +41,8 @@
 // on the site's line or the line above. The class must be one of
 // waiverClasses and the reason is mandatory. A waiver on a site with a context
 // in scope, or on a line with no site at all, is itself a violation, so a waiver
-// cannot outlive the code it excuses.
+// cannot outlive the code it excuses. L3 and L4 take only the class "detached",
+// and L2 never does.
 //
 // Types are read with go/packages, so a logger behind any receiver is seen and
 // http.Error or an error's Error() is not. Test files, testdata/ and the scripts,
@@ -75,6 +79,7 @@ var waiverClasses = map[string]string{
 	"boot":           "process start: runs before the pod is ready, so no request exists",
 	"process-once":   "a process-wide lazy init: it reports the process's configuration, and the request that happens to run it first is not its cause",
 	"no-prod-caller": "no production caller (a test seam or retained helper)",
+	detachedClass:    "a deliberate cut of the context in scope (L3 and L4 only)",
 }
 
 const waiverMark = "log-ctx-waiver:"
@@ -159,7 +164,7 @@ func check(root string) ([]site, []violation, error) {
 	}
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports |
-			packages.NeedDeps | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+			packages.NeedDeps | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedModule,
 		Dir: abs,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
@@ -171,19 +176,33 @@ func check(root string) ([]site, []violation, error) {
 	}
 	var sites []site
 	var vs []violation
+	g := newGraph()
+	waivers := map[string][]*waiver{}
 	for _, p := range pkgs {
 		if len(p.Errors) > 0 {
 			return nil, nil, fmt.Errorf("%s: %v", p.PkgPath, p.Errors[0])
 		}
+		if p.Module == nil {
+			return nil, nil, fmt.Errorf("%s: no module", p.PkgPath)
+		}
 		for i, f := range p.Syntax {
-			name := p.CompiledGoFiles[i]
-			rel, err := filepath.Rel(abs, name)
-			if err != nil || skipped(rel) {
+			rel, ok := relTo(abs, p.CompiledGoFiles[i])
+			if !ok {
 				continue
 			}
-			s, v := checkFile(p, f, rel)
+			s, v, ws := checkFile(p, f, rel)
 			sites = append(sites, s...)
 			vs = append(vs, v...)
+			waivers[rel] = ws
+			g.walkFile(p, f, rel, p.Module.Path)
+		}
+	}
+	vs = append(vs, g.delegationViolations(waivers)...)
+	for rel, ws := range waivers {
+		for _, w := range ws {
+			if !w.used {
+				vs = append(vs, violation{rel, w.line, "waiver on no WARN/ERROR site"})
+			}
 		}
 	}
 	return sites, vs, nil
@@ -202,7 +221,7 @@ func skipped(rel string) bool {
 	return false
 }
 
-func checkFile(p *packages.Package, f *ast.File, rel string) ([]site, []violation) {
+func checkFile(p *packages.Package, f *ast.File, rel string) ([]site, []violation, []*waiver) {
 	var sites []site
 	var vs []violation
 	waivers := fileWaivers(p, f)
@@ -251,6 +270,9 @@ func checkFile(p *packages.Package, f *ast.File, rel string) ([]site, []violatio
 					w.used = true
 					vs = append(vs, violation{rel, w.line, "waiver on a site with a context in scope"})
 				}
+			case w != nil && w.class == detachedClass:
+				w.used = true
+				vs = append(vs, violation{rel, w.line, "waiver class detached excuses only a cut context, not a site with none"})
 			case w != nil:
 				w.used = true
 				s.state = "waived:" + w.class
@@ -261,12 +283,7 @@ func checkFile(p *packages.Package, f *ast.File, rel string) ([]site, []violatio
 			return true
 		})
 	}
-	for _, w := range waivers {
-		if !w.used {
-			vs = append(vs, violation{rel, w.line, "waiver on no WARN/ERROR site"})
-		}
-	}
-	return sites, vs
+	return sites, vs, waivers
 }
 
 func funcName(fd *ast.FuncDecl) string {

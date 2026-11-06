@@ -444,8 +444,8 @@ func TestPrewarmPagination966_CanonicalPathAgreesWithTheRequest(t *testing.T) {
 	} {
 		path := base + q
 		pp, p := paginationInfo(slog.Default(), httptest.NewRequest("GET", path, nil))
-		if got := prewarmPaginationFor(path); got != (prewarmPagination{PerPage: pp, Page: p}) {
-			t.Fatalf("#966: prewarmPaginationFor(%q) = %+v, the request's paginationInfo = (perPage=%d, page=%d)", path, got, pp, p)
+		if got := prewarmPaginationFor(context.Background(), path); got != (prewarmPagination{PerPage: pp, Page: p}) {
+			t.Fatalf("#966: prewarmPaginationFor(context.Background(), %q) = %+v, the request's paginationInfo = (perPage=%d, page=%d)", path, got, pp, p)
 		}
 	}
 }

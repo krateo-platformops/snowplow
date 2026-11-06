@@ -16,7 +16,12 @@
 #   - a site with no context in scope either threads one or carries a
 #     classified `// log-ctx-waiver: <class>: <reason>` on the line above.
 #     A new plain site is therefore a decision, not a default, and a waiver with
-#     no site, or on a site that has a context, fails too.
+#     no site, or on a site that has a context, fails too;
+#   - one level up, over the module's static call graph: a literal Background
+#     handed to a function that can log with it, a call to a wrapper that
+#     delegates one, and a wrapper taken as a function value all fail. A
+#     deliberate cut carries `// log-ctx-waiver: detached: <reason>`.
+#     An interface call has no body to follow, so it is not seen.
 #
 # Run it locally before pushing:
 #

@@ -40,13 +40,22 @@ func TestGate_FlagsEveryShape(t *testing.T) {
 		`sites.go:87  waiver names an unknown class "because"`,
 		"sites.go:92  waiver has no reason",
 		"sites.go:97  waiver on no WARN/ERROR site",
+		// L3 and L4
+		"sites.go:110  logsWith is handed a literal background context, with ctx in scope",
+		"sites.go:114  forwards is handed a literal background context, with req.Context() in scope",
+		"sites.go:126  wrapper delegates context.Background(), which drops the context in scope (ctx)",
+		"sites.go:130  wrapperOfAWrapper delegates context.Background(), which drops the context in scope (req.Context())",
+		"sites.go:134  wrapper delegates context.Background(), which drops the context in scope (r.ctx)",
+		"sites.go:137  wrapper delegates context.Background() and is taken as a function value",
+		"sites.go:142  wrapper delegates context.Background() and is taken as a function value",
+		"sites.go:146  waiver class detached excuses only a cut context, not a site with none",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("expected the checker to flag %q.\nOutput:\n%s", want, s)
 		}
 	}
-	if !strings.Contains(s, "ERROR: 21 WARN/ERROR log site(s)") {
-		t.Errorf("expected exactly 21 findings.\nOutput:\n%s", s)
+	if !strings.Contains(s, "ERROR: 29 WARN/ERROR log site(s)") {
+		t.Errorf("expected exactly 29 findings.\nOutput:\n%s", s)
 	}
 }
 
@@ -55,7 +64,7 @@ func TestGate_AcceptsEveryContextShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the checker flagged the clean fixture: %v\n%s", err, out)
 	}
-	if want := "OK: 7 WARN/ERROR log sites pass a context; 3 have none to pass"; !strings.Contains(string(out), want) {
+	if want := "OK: 8 WARN/ERROR log sites pass a context; 3 have none to pass"; !strings.Contains(string(out), want) {
 		t.Fatalf("expected %q (the look-alikes must not count).\nOutput:\n%s", want, out)
 	}
 }
@@ -68,8 +77,8 @@ func TestGate_ReportNamesEverySiteOnce(t *testing.T) {
 		t.Fatalf("report: %v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 10 {
-		t.Fatalf("want 10 report lines, got %d:\n%s", len(lines), out)
+	if len(lines) != 11 {
+		t.Fatalf("want 11 report lines, got %d:\n%s", len(lines), out)
 	}
 	waived := 0
 	for _, l := range lines {

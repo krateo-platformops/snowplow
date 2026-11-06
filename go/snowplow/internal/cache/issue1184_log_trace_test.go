@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 )
 
 // log1184 is the default logger's stream: informers and workers of the same
@@ -121,6 +122,41 @@ func TestIssue1184_ALazyRegistrationLogsTheRequestsTraceID(t *testing.T) {
 	// WARN, on the request's goroutine.
 	if added, _ := rw.EnsureResourceTypeFor(ctx, gvr); !added {
 		t.Fatal("PRECONDITION: the registration must run")
+	}
+	assertTrace1184(t, sink, "lazy-AddResourceType-unexpected", traceID)
+}
+
+// The review of #1201's blocker: a resolve reaches DiscoverGroupResources through
+// a function value (api.discoverGroupResourcesFn), on the request's goroutine, so
+// a composition group's lazy registration must carry the request's context.
+func TestIssue1184_AGroupDiscoveryRegistersUnderTheRequestsContext(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	withCleanCRDDiscovery(t)
+	gvr := schema.GroupVersionResource{Group: "composition.krateo.io", Version: "v1", Resource: "discovered1184s"}
+	installFakeDiscoveryForCRD(t, &fakeDiscoveryForCRD{
+		group: gvr.Group, version: gvr.Version,
+		res: []metav1.APIResource{{Name: gvr.Resource, Kind: "Discovered1184", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}}},
+	})
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		gvr: "Discovered1184List",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+	}, &unstructured.UnstructuredList{})
+	rw, err := NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	t.Cleanup(rw.Stop)
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
+	rw.MarkEagerSet([]schema.GroupVersionResource{gvr})
+	ctx, traceID, sink := spanned1184(t)
+
+	discover := DiscoverGroupResources // the shape of the resolver's call
+	if _, err := discover(ctx, &rest.Config{Host: "https://fake.test"}, gvr.Group); err != nil {
+		t.Fatalf("DiscoverGroupResources: %v", err)
 	}
 	assertTrace1184(t, sink, "lazy-AddResourceType-unexpected", traceID)
 }

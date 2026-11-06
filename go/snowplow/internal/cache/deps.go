@@ -1352,6 +1352,7 @@ func (d *DepTracker) reassertOwnEdges(ctx context.Context, key string) {
 			if !d.hasExactEdge(key, dk) {
 				// No ctx: the resolve's sink already holds dk, and the remark /
 				// capture bookkeeping a ctx would drive belongs to the original record.
+				// log-ctx-waiver: detached: the resolve's sink already holds dk, so this reassert stays off the context
 				d.recordInternalMode(context.Background(), key, dk, recordPlain)
 				d.reassertedEdgesTotal.Add(1)
 			}

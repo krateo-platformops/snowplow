@@ -54,7 +54,7 @@ func TestServeRequiresServable_SyncedServesNotSyncedFallsThrough(t *testing.T) {
 	})
 
 	// Register the healthy seeds (sync normally) + the stuck informer.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 	rw.EnsureResourceType(stuckGVR())
 
 	// Wait for the healthy seeds to become servable (the stuck one never
@@ -193,7 +193,7 @@ func TestServeRequiresServable_RaceGetListWhileFlipping(t *testing.T) {
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 	rw.EnsureResourceType(stuckGVR())
 	servableGVR := cache.MetaQuerySeeds()[0]
 

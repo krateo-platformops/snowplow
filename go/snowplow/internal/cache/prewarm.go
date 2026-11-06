@@ -163,7 +163,7 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 		// not block on these informers syncing. Tag A's four-conjunct
 		// servable() gate ensures any request that lands before sync
 		// falls through to apiserver.
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.ensureResourceType(ctx, gvr)
 		if added {
 			registered++
 			walkRegistered = append(walkRegistered, gvr)

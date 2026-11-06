@@ -57,3 +57,45 @@ func waived() {
 	slog.ErrorContext(context.Background(), "a detached context is waived the same way")
 	slog.Error("or on the line itself") // log-ctx-waiver: informer-event: same line
 }
+
+func logsWith(ctx context.Context) {
+	slog.WarnContext(ctx, "reaches a record")
+}
+
+func discards(context.Context) {}
+
+// No record is reachable from discards, so a literal is not this guard's business.
+func literalToANonLogger(ctx context.Context) {
+	discards(context.Background())
+}
+
+func deliberateCut(ctx context.Context) {
+	// log-ctx-waiver: detached: the fixture's deliberate cut
+	logsWith(context.Background())
+}
+
+// A waived cut in a function with no context means no caller needs one.
+func waivedCut() {
+	// log-ctx-waiver: detached: no caller of this needs a context
+	logsWith(context.Background())
+}
+
+func callsAWaivedCut(ctx context.Context) {
+	waivedCut()
+}
+
+// A named detached context is the author's statement.
+func namedDetach(ctx context.Context) {
+	bg := context.Background()
+	logsWith(bg)
+}
+
+// With no context anywhere up the chain, a wrapper has nothing to drop.
+func wrapper() {
+	logsWithWaiverlessWrapper()
+}
+
+func logsWithWaiverlessWrapper() {
+	// log-ctx-waiver: detached: the fixture's root
+	logsWith(context.TODO())
+}

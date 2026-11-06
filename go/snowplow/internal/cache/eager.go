@@ -88,7 +88,7 @@ func EagerRegisterAll(ctx context.Context, rw *ResourceWatcher, resourceTypes []
 			// here because EagerRegisterAll's separate
 			// WaitForCacheSync below covers the bulk-sync semantics
 			// the eager-register caller actually wants.
-			_, _ = rw.EnsureResourceType(g)
+			_, _ = rw.ensureResourceType(ctx, g)
 		}(gvr)
 	}
 	wg.Wait()

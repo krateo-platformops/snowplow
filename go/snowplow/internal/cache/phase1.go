@@ -273,13 +273,13 @@ func MetaQuerySeeds() []schema.GroupVersionResource {
 //
 // Returns the count newly registered. Nil-receiver / passthrough are
 // no-ops.
-func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
+func (rw *ResourceWatcher) RegisterMetaQuerySeeds(ctx context.Context) int {
 	if rw == nil || rw.mode == modePassthrough {
 		return 0
 	}
 	registered := 0
 	for _, gvr := range MetaQuerySeeds() {
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.ensureResourceType(ctx, gvr)
 		if added {
 			registered++
 		}

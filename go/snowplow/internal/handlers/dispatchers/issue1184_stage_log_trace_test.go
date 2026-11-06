@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -168,4 +169,43 @@ func TestIssue1184_BadPagination_ThreadsTheRequestContext(t *testing.T) {
 
 	span, buf := i1184Serve(t, f, ra, "/call?perPage=not-a-number")
 	assertI1184(t, span, buf, "unable convert perPage parameter to int", "ERROR")
+}
+
+// A demand revalidation outlives its request and keeps its context, values
+// included: its lines carry the trace_id of the request that caused the work,
+// after that request's span ended and its context was cancelled. No span is
+// created for them. The line is the attempt's real panic report, on the context
+// the production template and detach build.
+func TestIssue1184_ADetachedRevalidationKeepsTheTraceAfterItsSpanEnded(t *testing.T) {
+	quiesceDefaultSummaryForTest(t)
+	buf := &syncBuffer{}
+	log := slog.New(tracing.NewTraceCorrelationHandler(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	parent, cancel := context.WithCancel(xcontext.BuildContext(context.Background(), xcontext.WithLogger(log)))
+	ctx, span := tp.Tracer("s1184").Start(parent, "GET /call", trace.WithSpanKind(trace.SpanKindServer))
+	const key = "L1_issue1184_detached"
+	req := httptest.NewRequest(http.MethodGet, "/call", nil).WithContext(ctx)
+
+	tpl := setDemandTemplate(key, req)
+	span.End()
+	cancel()
+	if req.Context().Err() == nil {
+		t.Fatal("PRECONDITION: the request's context must be cancelled")
+	}
+
+	demandRevalidateOnce(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("s1184") }), tpl.req, key, time.Now(), "s1184")
+
+	const msg = "demand revalidation panicked; cell stays known-stale"
+	recs := i1184Records(t, buf, msg)
+	if len(recs) != 1 {
+		t.Fatalf("PRECONDITION: want one %q line, got %d:\n%s", msg, len(recs), buf.String())
+	}
+	if got, want := recs[0]["trace_id"], span.SpanContext().TraceID().String(); got != want {
+		t.Fatalf("#1184 RED: the detached line carries trace_id %v, the request's span was %s", got, want)
+	}
+	if got, want := recs[0]["span_id"], span.SpanContext().SpanID().String(); got != want {
+		t.Fatalf("#1184 RED: the detached line carries span_id %v, the request's span was %s", got, want)
+	}
 }

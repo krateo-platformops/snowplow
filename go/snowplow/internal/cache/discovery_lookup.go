@@ -481,7 +481,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 				continue
 			}
 
-			added, _ := rw.EnsureResourceType(gvr)
+			added, _ := rw.ensureResourceType(ctx, gvr)
 			if added {
 				// FD1 (Ship D / 0.30.114) — preserved invariant:
 				// dirty-mark stale-negative LIST entries when a
