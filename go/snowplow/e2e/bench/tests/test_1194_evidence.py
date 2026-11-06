@@ -22,6 +22,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -69,8 +70,10 @@ def test_both_trees_default_under_home_and_not_a_temporary_directory(monkeypatch
     assert evidence.evidence_dir("r") == Path("/Volumes/synced/evidence/606/r")
 
 
-@pytest.mark.parametrize("path", ["/tmp/snowplow-runs/606/x", "/tmp", "/var/tmp/x", "/private/tmp/x",
-                                  "/dev/shm/x", os.path.join(tempfile.gettempdir(), "x")])
+@pytest.mark.parametrize("path", ["/tmp/snowplow-runs/606/x", "/tmp", "/var/tmp/x", "/dev/shm/x",
+                                  os.path.join(tempfile.gettempdir(), "x"),
+                                  # what /tmp resolves to on macOS; on Linux, a directory like any other
+                                  *(["/private/tmp/x"] if sys.platform == "darwin" else [])])
 def test_a_temporary_directory_is_recognised_by_its_real_path(monkeypatch, path):
     _real_rules(monkeypatch)
     assert evidence.volatile_root_of(path) is not None
