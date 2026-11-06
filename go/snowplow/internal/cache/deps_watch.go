@@ -135,8 +135,13 @@ type depWatch struct {
 	// first submitDepEvent; readers use q() and nil-check.
 	queue atomic.Pointer[depQueue]
 
-	// watcher is the ResourceWatcher the worker probes. Bound at handler
-	// construction (rw.depEventHandlers); production has exactly one.
+	// watcher is the ResourceWatcher the worker probes; production has
+	// exactly one. Bound by NewResourceWatcher as its LAST step, once the
+	// watcher is fully built, and by every submit (submitDepEventMask). Never
+	// by handler construction (depEventHandler): the constructor builds its
+	// dep handlers mid-construction, so binding there published a half-built
+	// watcher whose maps the worker then read while the constructor wrote
+	// them (#1016).
 	watcher atomic.Pointer[ResourceWatcher]
 
 	startOnce sync.Once
@@ -619,8 +624,7 @@ func (h depEventHandler) onSwapUpdate(oldObj, newObj any) {
 func (h depEventHandler) onSwapDelete(obj any) { h.del(obj, dmSourceStoreSwap) }
 
 func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depEventHandler {
-	w := depWatchSingleton()
-	w.watcher.Store(rw)
+	w := depWatchSingleton() // #1016: captured, not bound — see depWatch.watcher
 	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once per
 	// handler-set construction, NOT per-event.
 	crdSideEffect := IsCRDGVR(gvr)
