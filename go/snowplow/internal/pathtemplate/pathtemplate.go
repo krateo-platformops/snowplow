@@ -28,22 +28,31 @@
 // refused: the value or the template would walk the request out of the
 // resource the template names.
 //
-// A value that leaves a path segment empty is refused too (#1185), on every
-// verb and whatever the stage dials: `"/v2/tickets/" + .id` with .id "" or null
-// would name the collection, not one ticket. The rule reads the pieces, not the
-// rendered string. A segment is refused when a value was spliced into it and it
-// holds nothing, so:
+// An expression that leaves a path segment empty is refused too (#1185), on
+// every verb and whatever the stage dials: `"/v2/tickets/" + .id` with .id "" or
+// null would name the collection, not one ticket, and so would
+// `"/v2/tickets/" + (if (.id // "") == "" then "" else .id end)`, wherever the
+// empty comes from. The rule reads the pieces, not the rendered string. A segment
+// is refused when an expression contributed to it and it holds nothing. An
+// expression is a value, the text of an `if` branch, or a literal `""`, which
+// writes nothing and so says nothing but that this place holds nothing. So:
 //
-//   - a value empty inside a segment that has other text is not an empty
-//     segment (`"/configmaps/" + .plural + "-" + .version + "-jsonschema"`);
+//   - an expression empty inside a segment that has other text is not an empty
+//     segment (`"/configmaps/" + .plural + "-" + .version + "-jsonschema"`). That
+//     is why `"/a" + (if .pl == "" then "" else "/" + .pl end)` is fine: the `/`
+//     is inside the branch, so the "" lands in the segment `a`;
 //   - the query and the fragment hold no segments (`"/x?q=" + .v` is fine);
-//   - no value, no refusal: `if .pl == "" then "" else "/" + .pl end` splices no
-//     empty value, and a `/` or `//` the author wrote stays the author's text.
+//   - a `/` or `//` in a string literal outside an `if` stays the author's text.
 //     This rule neither refuses nor excuses it: the stage's dial guard judges it
-//     as it judges any literal;
-//   - a value is empty when it renders nothing. Whitespace renders `%20`: like
-//     the dot check, this rule compares the segment exactly and trims nothing.
-//     A dial that takes no escape refuses it there (validInterpolatedPath).
+//     as it judges any literal. The same text in a branch is what that branch
+//     contributes, piece by piece, as segments() reads a declared value;
+//   - nothing precedes the root, so an `if` or a `""` that writes nothing before
+//     the path's first `/` leaves no segment empty: `(if .p == "" then "" else
+//     "/" + .p end) + "/b"` is fine. A value there was meant to be text, and is
+//     refused (`.base + "/b"`);
+//   - an expression is empty when it renders nothing. Whitespace renders `%20`:
+//     like the dot check, this rule compares the segment exactly and trims
+//     nothing. A dial that takes no escape refuses it (validInterpolatedPath).
 //
 // "Spliced" is syntactic, and it is what an author reads in the program:
 //
@@ -80,9 +89,8 @@
 //   - E null or "": one empty piece, so an empty segment, refused like any other
 //     value. segments() does not make a value optional: the template's own `/`
 //     stays, and `"/a/" + segments(.p)` would still name `/a/`. An optional part
-//     is written so that no empty value is spliced (`if .p == "" then "" else
-//     "/" + .p end`), or gated by the stage's iterator, which then yields no
-//     element and has nothing to call;
+//     holds its own `/` (`if .p == "" then "" else "/" + .p end`), or is gated by
+//     the stage's iterator, which then yields no element and has nothing to call;
 //   - each piece is one segment, so an empty piece is refused wherever it is:
 //     inside (`a//b`), at the end (`a/`), or a value that is only `/`. The one
 //     `/` that is not a boundary between pieces is the leading `/` of a value
@@ -128,17 +136,23 @@ const SegmentsFunc = "segments"
 // one of the author's names.
 const reservedPrefix = "__snowplow_path_"
 
-const rawFunc = reservedPrefix + "raw"
+const (
+	rawFunc        = reservedPrefix + "raw"
+	expressionFunc = reservedPrefix + "expression"
+)
 
-// The four part kinds a rewritten program emits, besides a literal (a plain
+// The five part kinds a rewritten program emits, besides a literal (a plain
 // JSON string): a `+` operand ("v": string or null, jq's `+` identity), an
 // interpolation or a non-template program ("i": already tostring'd), a declared
-// multi-segment value ("s"), and a value the program encoded with @uri ("u").
+// multi-segment value ("s"), a value the program encoded with @uri ("u"), and
+// text an expression contributed ("e": the author's words, so written as they
+// are, but read as #1185 reads a value).
 const (
-	partValue    = "v"
-	partInterp   = "i"
-	partSegments = "s"
-	partEncoded  = "u"
+	partValue      = "v"
+	partInterp     = "i"
+	partSegments   = "s"
+	partEncoded    = "u"
+	partExpression = "e"
 )
 
 // uriFormat is the jq format that makes a value one encoded value.
@@ -168,7 +182,7 @@ func (e *RefusedError) Error() string {
 	case ReasonSegmentsInQuery:
 		return "path template: segments() is spliced into the query; it declares path segments"
 	case ReasonEmptySegment:
-		return "path template: a value spliced into the path left a segment empty (write an optional part so that no empty value is spliced, or gate it with an iterator)"
+		return "path template: an expression left a path segment empty (put the '/' inside an optional part, or gate it with an iterator)"
 	default:
 		return "path template: refused (" + e.Reason + ")"
 	}
@@ -180,8 +194,8 @@ func IsRefused(err error) bool {
 	return errors.As(err, &r)
 }
 
-// IsEmptySegment reports whether err is the refusal of a value that left a path
-// segment empty (#1185).
+// IsEmptySegment reports whether err is the refusal of an expression that left a
+// path segment empty (#1185).
 func IsEmptySegment(err error) bool {
 	var r *RefusedError
 	return errors.As(err, &r) && r.Reason == ReasonEmptySegment
@@ -220,6 +234,7 @@ func Compile(tmpl string) *Template {
 	code, err := gojq.Compile(rewrite(parsed),
 		gojq.WithModuleLoader(jqsupport.ModuleLoader()),
 		gojq.WithFunction(rawFunc, 0, 0, func(v any, _ []any) any { return rawOf(v) }),
+		gojq.WithFunction(expressionFunc, 0, 0, func(v any, _ []any) any { return expressionParts(v) }),
 	)
 	if err != nil {
 		return &Template{err: jqsupport.SanitizeError(fmt.Errorf("unable to compile jq query %q: %w", q, err))}
@@ -465,7 +480,11 @@ func stringParts(str *gojq.String, interp *gojq.Query) *gojq.Query {
 		}
 	}
 	if out == nil {
-		return arrayOf(termQ(&gojq.Term{Type: gojq.TermTypeString, Str: &gojq.String{Str: str.Str}}))
+		lit := termQ(&gojq.Term{Type: gojq.TermTypeString, Str: &gojq.String{Str: str.Str}})
+		if str.Str == "" {
+			return arrayOf(objOne(partExpression, lit)) // `""` writes nothing (#1185)
+		}
+		return arrayOf(lit)
 	}
 	return out
 }
@@ -535,6 +554,7 @@ func (r *rewriter) convIf(x *gojq.If, sc *scope) (*gojq.Query, shape) {
 				}
 				conv[i] = valuePart(b)
 			}
+			conv[i] = pipe(paren(conv[i]), call(expressionFunc))
 		}
 		out = shape{k: kTemplate}
 	default:
@@ -678,12 +698,30 @@ func partOf(p any) (string, any, bool) {
 		}
 		for k, v := range p {
 			switch k {
-			case partValue, partInterp, partSegments, partEncoded:
+			case partValue, partInterp, partSegments, partEncoded, partExpression:
 				return k, v, true
 			}
 		}
 	}
 	return "", nil, false
+}
+
+// expressionParts is an `if` branch's parts: its literals are what the branch
+// contributes (#1185), everything else already says what it is.
+func expressionParts(v any) any {
+	parts, ok := v.([]any)
+	if !ok {
+		return errNotString
+	}
+	out := make([]any, len(parts))
+	for i, p := range parts {
+		if s, ok := p.(string); ok {
+			out[i] = map[string]any{partExpression: s}
+		} else {
+			out[i] = p
+		}
+	}
+	return out
 }
 
 // rawOf is a template's own value, unescaped: what the original expression
@@ -774,6 +812,12 @@ func assemble(v any) (string, error) {
 			}
 			b.WriteString(s)
 			pos = advance(pos, s)
+		case partExpression:
+			if pos == inPath {
+				segs.expression(s, b.Len() == 0)
+			}
+			b.WriteString(s)
+			pos = advance(pos, s)
 		case partValue, partInterp:
 			if pos == inPath {
 				if strings.Contains(s, "/") {
@@ -793,21 +837,12 @@ func assemble(v any) (string, error) {
 			}
 			b.WriteString(s)
 		case partSegments:
-			if b.Len() == 0 && strings.HasPrefix(s, "/") {
-				// The root of a value that opens the path, not a boundary
-				// between two pieces.
-				segs.literal("/")
-				b.WriteByte('/')
-				s = s[1:]
+			segs.pieces(s, b.Len() == 0)
+			pieces := strings.Split(s, "/")
+			for i, piece := range pieces {
+				pieces[i] = url.PathEscape(piece)
 			}
-			for i, piece := range strings.Split(s, "/") {
-				if i > 0 {
-					segs.end()
-					b.WriteByte('/')
-				}
-				segs.value(piece)
-				b.WriteString(url.PathEscape(piece))
-			}
+			b.WriteString(strings.Join(pieces, "/"))
 		}
 	}
 	if pos == inPath {
@@ -824,13 +859,14 @@ func assemble(v any) (string, error) {
 }
 
 // segmentWatch follows the path part as assemble writes it, piece by piece, and
-// records a segment that a value left empty (#1185). It sees what the rendered
-// string cannot: `/a/` from `"/a/" + .id` and `/a/` as the author wrote it are
-// the same text, and only the first lost a value.
+// records a segment that an expression left empty (#1185). It sees what the
+// rendered string cannot: `/a/` from `"/a/" + .id` and `/a/` as the author wrote
+// it are the same text, and only the first has an expression behind the second
+// segment.
 type segmentWatch struct {
 	text    bool // the current segment holds text
-	spliced bool // a value was spliced into the current segment
-	emptied bool // a finished segment had a value spliced into it and holds nothing
+	spliced bool // an expression contributed to the current segment
+	emptied bool // a finished segment had an expression in it and holds nothing
 }
 
 // literal takes author text that lands in the path part. Its first '?' or '#'
@@ -854,10 +890,44 @@ func (w *segmentWatch) literal(s string) {
 	}
 }
 
-// value takes one value spliced into the current segment; s is what it rendered.
+// value takes one expression's contribution to the current segment; s is what it
+// rendered, and holds no '/'.
 func (w *segmentWatch) value(s string) {
 	w.spliced = true
 	w.text = w.text || s != ""
+}
+
+// pieces takes text an expression contributed that may span segments: each piece
+// is one contribution. opening says nothing has been written: a leading '/' is
+// then the path's root, not a boundary between two pieces.
+func (w *segmentWatch) pieces(s string, opening bool) {
+	if rest, ok := strings.CutPrefix(s, "/"); ok && opening {
+		w.literal("/")
+		s = rest
+	}
+	for i, piece := range strings.Split(s, "/") {
+		if i > 0 {
+			w.end()
+		}
+		w.value(piece)
+	}
+}
+
+// expression takes an `if` branch's text or a literal `""`: pieces, up to the
+// first '?' or '#', which ends the path as it does for a literal. Before the path
+// has started, writing nothing leaves no segment: nothing precedes the root.
+func (w *segmentWatch) expression(s string, opening bool) {
+	cut := strings.IndexAny(s, "?#")
+	if cut >= 0 {
+		s = s[:cut]
+	}
+	if opening && s == "" && cut < 0 {
+		return
+	}
+	w.pieces(s, opening)
+	if cut >= 0 {
+		w.end()
+	}
 }
 
 // end finishes the current segment.

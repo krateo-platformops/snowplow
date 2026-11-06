@@ -579,3 +579,109 @@ func TestIssue1185_ACollapsedPathKeepsItsShapeOnTheSkipLine(t *testing.T) {
 		}
 	}
 }
+
+// The extended ruling at the server: the empty came from the author's literal
+// `""` branch, not from a value, on every verb and both dials. The control is the
+// same stage with its value there, dialled once.
+func TestIssue1185_ALiteralEmptyBranchIsRefusedOnEveryVerbAndDial(t *testing.T) {
+	const x = `(if (.x // "") == "" then "" else .x end)`
+	api := server1185(t)
+	for _, target := range targets1185 {
+		for pos, tmpl := range target.positions() {
+			spelled := strings.NewReplacer(`+ .x +`, `+ `+x+` +`, `+ .x }`, `+ `+x+` }`).Replace(tmpl)
+			if spelled == tmpl {
+				t.Fatalf("%s: the arm did not respell %s", pos, tmpl)
+			}
+			for _, verb := range verbs1185 {
+				t.Run(fmt.Sprintf("%s/%s/%s", target.name, pos, verb), func(t *testing.T) {
+					dialled := len(api.all())
+					o := rr16Resolve(t, workclass.None, map[string]any{"x": target.present[pos]}, target.stage(verb, spelled))
+					if got := len(api.all()) - dialled; got != 1 {
+						t.Fatalf("control: dialled %d time(s), want 1; outcomes %s", got, o.outcomes)
+					}
+					for name, extras := range map[string]map[string]any{"empty": {"x": ""}, "null": {"x": nil}, "absent": {}} {
+						dialled := len(api.all())
+						skipped := MalformedDialSkippedByReason(reasonEmptyInterp)
+						o := rr16Resolve(t, workclass.None, extras, target.stage(verb, spelled))
+						if hits := api.all()[dialled:]; len(hits) != 0 {
+							t.Fatalf("%s: dialled %+v", name, hits)
+						}
+						x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+						if o.failure == nil || o.failure.Code != http.StatusBadRequest {
+							t.Fatalf("%s: StageFailure = %+v, want a 400", name, o.failure)
+						}
+						if o.sinkN == 0 {
+							t.Fatalf("%s: the stage-error sink was not bumped", name)
+						}
+						if got := MalformedDialSkippedByReason(reasonEmptyInterp) - skipped; got != 1 {
+							t.Fatalf("%s: empty_interp moved by %d, want 1", name, got)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// The other spellings the ruling names by "wherever the empty comes from", at the
+// server, on a read and a write.
+func TestIssue1185_EverySpellingOfAnEmptyExpressionDialsNothing(t *testing.T) {
+	api := server1185(t)
+	for _, tmpl := range []string{
+		`${ (if (.x // "") == "" then "/v2/tickets/" else "/v2/tickets/" + .x end) }`,
+		`${ (if (.x // "") == "" then "" else .x end) as $v | "/v2/tickets/" + $v }`,
+		`${ "" as $e | "/v2/tickets/" + $e }`,
+		`${ "/v2/tickets/" + (.x | "") }`,
+		`${ "/v2/tickets/" + "" }`,
+		`${ (if (.x // "") == "" then "/" else "/" + .x end) }`,
+	} {
+		for _, target := range targets1185 {
+			for _, verb := range []string{http.MethodGet, http.MethodDelete} {
+				t.Run(fmt.Sprintf("%s/%s/%s", target.name, verb, tmpl), func(t *testing.T) {
+					dialled := len(api.all())
+					o := rr16Resolve(t, workclass.None, map[string]any{}, target.stage(verb, tmpl))
+					if hits := api.all()[dialled:]; len(hits) != 0 {
+						t.Fatalf("dialled %+v", hits)
+					}
+					x1106WantReason(t, o.outcomes, "s", StageReasonInvalidPath)
+				})
+			}
+		}
+	}
+}
+
+// The portal's shape on the wire: the real template (composition-architecture/objs
+// at tag 1.8.93), with its optional parts absent and present, read through both
+// dials. Each is sent, once, to exactly the path it names.
+func TestIssue1185_ThePortalShapeIsSent(t *testing.T) {
+	path := loadPortalStage1185(t, "composition-architecture", "objs").Path
+	api := server1185(t)
+	for _, c := range []struct {
+		g, v, ns, pl, nm, want string
+	}{
+		{"", "v1", "", "", "", "/api/v1"},
+		{"apps", "v1", "", "", "", "/apis/apps/v1"},
+		{"apps", "v1", "", "deployments", "", "/apis/apps/v1/deployments"},
+		{"apps", "v1", "demo", "deployments", "web", "/apis/apps/v1/namespaces/demo/deployments/web"},
+	} {
+		for _, target := range targets1185 {
+			t.Run(target.name+c.want, func(t *testing.T) {
+				dialled := len(api.all())
+				extras := map[string]any{"g": c.g, "v": c.v, "ns": c.ns, "pl": c.pl, "nm": c.nm}
+				if opts, skips := plan1123On(t, target.name == "own cluster", path, extras); len(opts) != 1 || opts[0].Path != c.want {
+					t.Fatalf("planned %+v, skips %+v, want %s", opts, skips, c.want)
+				}
+				if target.name == "own cluster" && c.pl == "" {
+					// Own-cluster discovery is dialled with the REST config, which
+					// this harness points nowhere. The plan above is the pin.
+					return
+				}
+				o := rr16Resolve(t, workclass.None, extras, target.stage(http.MethodGet, path))
+				hits := api.all()[dialled:]
+				if len(hits) != 1 || hits[0].Path != c.want || o.failure != nil {
+					t.Fatalf("dialled %+v, want one %s; failure %+v, outcomes %s", hits, c.want, o.failure, o.outcomes)
+				}
+			})
+		}
+	}
+}

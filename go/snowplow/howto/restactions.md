@@ -483,10 +483,12 @@ stage** with `InvalidPath` and a 400 under the stage's `errorKey`; without
 
 `segments()` in the query is refused for every `E`, `null` included.
 
-**A value that leaves a path segment empty makes no call.** `"/v2/tickets/" +
-.id` with `.id` empty, null or missing would name the collection, not one ticket,
-and a write there could reach every ticket. So it is refused, on every verb,
-for a stage with an `endpointRef` and for one that dials this cluster alike:
+**An expression that leaves a path segment empty makes no call.** `"/v2/tickets/"
++ .id` with `.id` empty, null or missing would name the collection, not one
+ticket, and a write there could reach every ticket. So it is refused, on every
+verb, for a stage with an `endpointRef` and for one that dials this cluster
+alike. It doesn't matter where the empty comes from: a value, an `if` branch, or
+a literal `""`.
 
 | With `.x` empty, null or missing | |
 |---|---|
@@ -495,24 +497,31 @@ for a stage with an `endpointRef` and for one that dials this cluster alike:
 | `"/a/" + .x + "-b"`, `"/a" + .x` | sent: the segment has other text, so `.x` is empty *inside* it |
 | `"/a?q=" + .x` | sent: a query value is not a segment |
 | `"/a/\(.x)"` with `.x` null | sent as `/a/null`: jq's interpolation of null is the text `null`. `""` is refused |
-| `"/a/" + (if (.x // "") == "" then "" else .x end)` | sent as `/a/`: no empty value is spliced, so the `/` is your own text |
+| `"/a/" + (if (.x // "") == "" then "" else .x end)` | refused: the `""` branch leaves the segment after `/a/` empty |
+| `(if (.x // "") == "" then "/a/" else "/a/" + .x end)` | refused: the `/` is in the branch, and the segment after it is still empty |
+| `"/a" + (if (.x // "") == "" then "" else "/" + .x end)` | sent as `/a`: the `/` is inside the branch, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "/z"` | sent as `/z`: nothing comes before the path's first `/`, so no segment is empty |
 
-The rule looks at which pieces are values, not at the rendered text. Text you
-wrote is yours: a trailing `/` or a `//` in a string literal is neither refused
-nor excused by this rule, and the checks every literal path goes through still
-apply (a stage that dials this cluster refuses a `//`, and a write
-that ends in `/`).
+The rule asks whether an expression contributed to a segment and left it empty,
+not what the rendered text looks like. An expression is a value, the text of an
+`if` branch, or a literal `""`, which writes nothing. A `/` or a `//` in a string
+literal outside an `if` is your own text: this rule neither refuses nor excuses
+it, and the checks every literal path goes through still apply (a stage that
+dials this cluster refuses a `//`, and a write that ends in `/`). The same text
+in an `if` branch counts as that branch's, so `(if .c then "/a//b" else "/c" end)`
+is refused when the branch is taken.
 
 A value of spaces is not empty: it renders `%20`, one segment. A stage that
 dials this cluster refuses it like any other escape, and a named endpoint
 receives `/a/%20`. Check for it yourself if it can occur.
 
-**An optional value is written so that no empty value is spliced.** `segments()`
-does not make a value optional: the `/` before it is your text and stays, so
-`"/v2/tickets/" + segments(.x)` would still name the collection. Use one of:
+**An optional part holds its own `/`.** `segments()` does not make a value
+optional: the `/` before it is your text and stays, so `"/v2/tickets/" +
+segments(.x)` would still name the collection, and an `if` around the value
+alone leaves that `/` behind in the same way. Use one of:
 
 ```yaml
-# Put the "/" inside the optional part, so that the part is absent as a whole.
+# Put the "/" inside the branch, so that the part is absent as a whole.
 path: ${ "/apis/g/v1/things" + (if (.name // "") == "" then "" else "/" + .name end) }
 ```
 

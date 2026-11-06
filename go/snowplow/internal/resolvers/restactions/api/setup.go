@@ -225,8 +225,8 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 	}
 
 	if pathtemplate.IsEmptySegment(pathErr) {
-		// #1185 — a value left a path segment empty: dialled, the path would
-		// name something wider than the template meant (`DELETE /v2/tickets/`
+		// #1185 — an expression left a path segment empty: dialled, the path
+		// would name something wider than the template meant (`DELETE /v2/tickets/`
 		// from `"/v2/tickets/" + .id`). Refused on every verb, whatever the stage
 		// dials. It is the #288 collapse, read from the template's pieces, so it
 		// is that class: inspect enumerates it from the skeleton (#504).
@@ -249,11 +249,11 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
 	}
 	// #1123 — a template that rendered no path names nothing to call: it produced
-	// no output (`${ empty }`) or holds nothing but an empty literal (a value
-	// that rendered empty is refused above, #1185). Dialled, it would read the
-	// endpoint's root with the stage's credential. It is the #288 collapse at its
-	// limit, whatever the stage dials. A stage with no template (in.Path == "")
-	// has no value to lose and keeps its meaning.
+	// no output (`${ empty }`), or an `if` or a `""` wrote nothing and no text
+	// followed (a value that rendered empty is refused above, #1185). Dialled, it
+	// would read the endpoint's root with the stage's credential. It is the #288
+	// collapse at its limit, whatever the stage dials. A stage with no template
+	// (in.Path == "") has no value to lose and keeps its meaning.
 	if path == "" && in.Path != "" {
 		return out, false, skipReason{class: reasonEmptyInterp, detail: "the path template rendered no path (#1123)", collapsed: true}
 	}
@@ -315,10 +315,10 @@ var unrenderedTemplateSkip = skipReason{class: reasonUnrenderedTemplate, detail:
 // segment its template meant to fill: the refusal that applies to EVERY dial,
 // this cluster's apiserver and a named endpoint alike (#288, split by #1112 D2).
 // A missing segment is malformed for any REST endpoint, and the shapes refused
-// here are the ones whose dial would silently mean something wider. A VALUE that
-// left a segment empty does not get here: the template refuses it first, wherever
-// the segment is and on every verb (#1185). What gets here is text with no value
-// behind it: an author's literal, or a path with no template.
+// here are the ones whose dial would silently mean something wider. A segment an
+// EXPRESSION left empty does not get here: the template refuses it first, wherever
+// the segment is and on every verb (#1185). What gets here is text with no
+// expression behind it: an author's literal, or a path with no template.
 //   - an UNRENDERED "${" template (#293 sub-case 1; a genuine URL never carries
 //     "${");
 //   - a COLLAPSED empty namespace segment (`/api/v1/namespaces//configmaps/...`),

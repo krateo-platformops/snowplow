@@ -112,28 +112,19 @@ func TestIssue1185_WhatIsNotAnEmptySegment(t *testing.T) {
 	wantRefused(t, `${ "/a/" + (.x // "d") }`, map[string]any{"x": ""}, ReasonEmptySegment)
 }
 
-// Decided from which pieces are values, not from the final string: `/a/` is
-// refused when a value left it so, and left alone when the author wrote it. An
-// author's `/` or `//` is neither refused nor excused here: the dial guards read
-// it as they read any literal (TestIssue1185_AuthorLiteralsKeepTheirVerdict in
-// restactions/api).
+// Decided from which pieces are expressions, not from the final string: `/a/` is
+// refused when an expression left it so, and left alone when the author wrote it.
+// An author's `/` or `//` in a plain literal is neither refused nor excused here:
+// the dial guards read it as they read any literal
+// (TestIssue1185_AuthorLiteralsKeepTheirVerdict in restactions/api).
 func TestIssue1185_AnAuthorsLiteralIsTheAuthors(t *testing.T) {
 	for _, data := range []map[string]any{{"x": "v"}, {"x": ""}, {}} {
 		wantPath(t, `${ "/a/" }`, data, "/a/")
 		wantPath(t, `${ "/a//b" }`, data, "/a//b")
 		wantPath(t, `${ "//a" }`, data, "//a")
 		wantPath(t, `${ "/" }`, data, "/")
-		wantPath(t, `${ "/a/" + "" }`, data, "/a/")
-		wantPath(t, `${ "/a/" + (if .c then "b" else "" end) }`, data, "/a/")
-		wantPath(t, `${ (if .c then "/b" else "/a/" end) }`, data, "/a/")
 		wantPath(t, `/a//b/`, data, "/a//b/") // not a template
 	}
-	// The howto's table: the author's "" for an absent value keeps the '/' as
-	// text. The branch has to catch null too: else null is the spliced value.
-	for _, data := range []map[string]any{{"x": ""}, {"x": nil}, {}} {
-		wantPath(t, `${ "/a/" + (if (.x // "") == "" then "" else .x end) }`, data, "/a/")
-	}
-	wantRefused(t, `${ "/a/" + (if .x == "" then "" else .x end) }`, map[string]any{}, ReasonEmptySegment)
 	// Around a value that is there, the same text is still the author's.
 	v := map[string]any{"x": "v"}
 	wantPath(t, `${ "/a/" + .x + "/" }`, v, "/a/v/")
@@ -223,4 +214,98 @@ func TestIssue1185_TheRefusalNamesTheRule(t *testing.T) {
 	if got := err.Error(); got != (&RefusedError{Reason: ReasonEmptySegment}).Error() {
 		t.Fatalf("the refusal depends on the render: %q", got)
 	}
+}
+
+// The extended ruling: any expression that leaves a segment empty is refused,
+// wherever the empty comes from. Each spelling here names the collection, or the
+// root, without an empty VALUE ever being spliced.
+func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
+	for _, tmpl := range []string{
+		// The ruling's spelling, at each position and however the path goes on.
+		`${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) }`,
+		`${ "/" + (if (.id // "") == "" then "" else .id end) + "/tickets" }`,
+		`${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) + "/comments" }`,
+		`${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) + "?q=1" }`,
+		`${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) + "#f" }`,
+		`${ "/v2/tickets/" + (if (.id // "") == "x" then "y" elif (.id // "") == "" then "" else .id end) }`,
+		// The empty moved behind a variable.
+		`${ (if (.id // "") == "" then "" else .id end) as $v | "/v2/tickets/" + $v }`,
+		`${ (.id // "") as $i | "/v2/tickets/" + (if $i == "" then "" else $i end) }`,
+		`${ "" as $e | "/v2/tickets/" + $e }`,
+		// The empty moved behind a pipe, or written plainly.
+		`${ "/v2/tickets/" + (.id | "") }`,
+		`${ "/v2/tickets/" + ("") }`,
+		`${ "/v2/tickets/" + "" }`,
+		// The branch holds the '/': the segment after it is still empty.
+		`${ (if (.id // "") == "" then "/v2/tickets/" else "/v2/tickets/" + .id end) }`,
+		`${ "/v2" + (if (.id // "") == "" then "/" else "/" + .id end) }`,
+		`${ (if (.id // "") == "" then "/" else "/" + .id end) }`,
+		`${ (if (.id // "") == "" then "/?q=1" else "/" + .id end) }`,
+		// A branch's text is read piece by piece, wherever it lands.
+		`${ "/v2/" + (if (.id // "") == "" then "/x" else .id end) }`,
+		`${ (if (.id // "") == "" then "/v2//x" else "/v2/" + .id end) }`,
+	} {
+		for name, data := range map[string]map[string]any{"empty": {"id": ""}, "null": {"id": nil}, "absent": {}} {
+			t.Run(name+"/"+tmpl, func(t *testing.T) {
+				wantRefused(t, tmpl, data, ReasonEmptySegment)
+			})
+		}
+	}
+	// A condition that lets a null through refuses it as a value, as before.
+	wantRefused(t, `${ "/a/" + (if .x == "" then "" else .x end) }`, map[string]any{}, ReasonEmptySegment)
+	// The same stages with the value there.
+	wantPath(t, `${ "/v2/tickets/" + (if (.id // "") == "" then "" else .id end) }`, map[string]any{"id": "42"}, "/v2/tickets/42")
+	wantPath(t, `${ (if (.id // "") == "" then "/v2/tickets/" else "/v2/tickets/" + .id end) }`, map[string]any{"id": "42"}, "/v2/tickets/42")
+}
+
+// What the extended ruling leaves valid. The portal's shape holds its '/' inside
+// the branch, so its "" lands in a segment that has text.
+func TestIssue1185_TheBranchThatHoldsItsSlashLeavesNoSegmentEmpty(t *testing.T) {
+	// portal.targetPath, helm/*/templates/_fetchable.tpl at tag 1.8.93.
+	const portal = `${ (if .g == "" then "/api/" + .v else "/apis/" + .g + "/" + .v end) + (if .ns == "" then "" else "/namespaces/" + .ns end) + (if .pl == "" then "" else "/" + .pl end) + (if .nm == "" then "" else "/" + .nm end) }`
+	for _, c := range []struct {
+		g, v, ns, pl, nm, want string
+	}{
+		{"", "v1", "", "", "", "/api/v1"},
+		{"apps", "v1", "", "", "", "/apis/apps/v1"},
+		{"apps", "v1", "", "deployments", "", "/apis/apps/v1/deployments"},
+		{"apps", "v1", "demo", "deployments", "", "/apis/apps/v1/namespaces/demo/deployments"},
+		{"apps", "v1", "demo", "deployments", "web", "/apis/apps/v1/namespaces/demo/deployments/web"},
+		{"", "v1", "demo", "configmaps", "cm", "/api/v1/namespaces/demo/configmaps/cm"},
+	} {
+		wantPath(t, portal, map[string]any{"g": c.g, "v": c.v, "ns": c.ns, "pl": c.pl, "nm": c.nm}, c.want)
+	}
+	// The same program with the one value it does not guard empty.
+	wantRefused(t, portal, map[string]any{"g": "", "v": "", "ns": "", "pl": "", "nm": ""}, ReasonEmptySegment)
+
+	for _, data := range []map[string]any{{"p": ""}, {"p": nil}, {}} {
+		opt := `(if (.p // "") == "" then "" else "/" + .p end)`
+		wantPath(t, `${ "/a" + `+opt+` }`, data, "/a")
+		wantPath(t, `${ "/a" + `+opt+` + "/z" }`, data, "/a/z")
+		wantPath(t, `${ "/a" + `+opt+` + "?q=1" }`, data, "/a?q=1")
+		wantPath(t, `${ "/a" + `+opt+` + `+opt+` }`, data, "/a")
+		wantPath(t, `${ "/a-" + (if (.p // "") == "" then "" else .p end) }`, data, "/a-")
+		// Nothing precedes the root: an optional part that opens the path leaves
+		// no segment, and a whole program of nothing is the dial plan's to refuse.
+		wantPath(t, `${ `+opt+` + "/b" }`, data, "/b")
+		wantPath(t, `${ "" + "/b" }`, data, "/b")
+		wantPath(t, `${ (if (.p // "") == "" then "" else .p end) + "/b" }`, data, "/b")
+		wantPath(t, `${ `+opt+` }`, data, "")
+		wantPath(t, `${ "" }`, data, "")
+		// In the query or the fragment an `if` writes what it likes.
+		wantPath(t, `${ "/a?q=1" + (if (.p // "") == "" then "" else "&r=" + .p end) }`, data, "/a?q=1")
+		wantPath(t, `${ "/a?q=" + (if (.p // "") == "" then "" else .p end) }`, data, "/a?q=")
+		wantPath(t, `${ "/a#" + (if (.p // "") == "" then "" else .p end) }`, data, "/a#")
+	}
+	wantPath(t, `${ "/a" + (if (.p // "") == "" then "" else "/" + .p end) }`, map[string]any{"p": "b"}, "/a/b")
+
+	// A branch's text: written as it stands, and its '?' ends the path.
+	wantPath(t, `${ (if .c then "/b" else "/a" end) + "/z" }`, nil, "/a/z")
+	wantPath(t, `${ (if .c then "/b/" else "/a/" end) + "z" }`, nil, "/a/z")
+	wantPath(t, `${ "/" + (if .c then "b" else "a" end) }`, nil, "/a")
+	wantPath(t, `${ "/a/" + (if .c then "x" else "b" end) + "/z" }`, nil, "/a/b/z")
+	wantPath(t, `${ (if .c then "/x?r=" else "/a?q=" end) + .v }`, map[string]any{"v": "a&b"}, "/a?q=a%26b")
+	wantPath(t, `${ "/a/" + ((.x // "") | if . == "" then "default" else . end) + "/z" }`, nil, "/a/default/z")
+	// jq's own reading of the branch is unchanged where the text is not a path.
+	wantPath(t, `${ (if .c then "1h" else "6h" end) as $r | "/s?w=" + $r + (if $r == "6h" then "&b=1" else "" end) }`, nil, "/s?w=6h&b=1")
 }
