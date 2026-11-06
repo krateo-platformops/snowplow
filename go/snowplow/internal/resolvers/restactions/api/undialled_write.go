@@ -118,19 +118,19 @@ func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips [
 	if len(skips) == 0 {
 		return
 	}
-	var firstReason string
 	for _, sk := range skips {
 		reason, why := undialledWriteCause(sk.reason)
-		if firstReason == "" {
-			firstReason = reason
-		}
 		r.failUndialledWrite(id, apiCall, reason, why)
 	}
 	if !isWriteVerb(apiCall.Verb) {
+		// #1139 — the reason is the stage outcome's, read back after every
+		// refusal is recorded: the highest-ranked one (reasonRank), the cause
+		// the outcome header names, never the first item's. No worker of the
+		// stage runs yet, so the outcome holds only these refusals.
 		r.log.Warn("read stage not sent",
 			slog.String("name", id),
 			slog.String("verb", ptr.Deref(apiCall.Verb, http.MethodGet)),
-			slog.String("reason", firstReason),
+			slog.String("reason", r.outcomes.reasonOf(id)),
 			slog.Int("refused_items", len(skips)),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
