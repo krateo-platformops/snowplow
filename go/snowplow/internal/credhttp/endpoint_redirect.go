@@ -134,7 +134,7 @@ func (t *refuseCrossOriginHops) RoundTrip(req *http.Request) (*http.Response, er
 	}
 	next := t.next
 	if next == nil {
-		next = http.DefaultTransport
+		next = guardedTransport
 	}
 	return next.RoundTrip(req)
 }

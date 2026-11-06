@@ -135,7 +135,8 @@ Content-Type: application/json
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
     `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
-    snowplow refused to send, below), `Error` (anything else).
+    snowplow refused to send, below), `DestinationRefused` (#1131, below),
+    `Error` (anything else).
   - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
     `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
     item of its iterator, is listed with one of:
@@ -183,6 +184,13 @@ Content-Type: application/json
       outcomes. It is not stored, so the next `/call` resolves again.
     - The remaining valid items of an iterator read are still sent.
     - `NotSent` stays write-only.
+  - **A refused destination is a failure (#1131).** A stage whose endpoint
+    resolves to a link-local (cloud metadata), unspecified or multicast
+    address is listed with `DestinationRefused`, read or write. Nothing is sent,
+    and asking again gives the same answer, so offer no retry: the endpoint has
+    to change. Under its `errorKey` the stage records a Failure with code `502`,
+    reason `DestinationRefused`, and a message naming the address and its range.
+    A write that depends on it is `Skipped` (#904).
   - **A redirect to another host is a failure (#1106).** A stage whose
     endpoint answers a redirect to another origin (scheme, host, port) is
     never followed, whatever the endpoint's credential or the stage's

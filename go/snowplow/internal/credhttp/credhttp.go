@@ -57,6 +57,10 @@
 // where a resolve's collection LISTs are counted on the wire
 // (snowplow_resolve_collection_lists, resolve_lists.go): Harden and Client
 // install CountResolveCollectionLists wherever they install RefuseRedirectHops.
+//
+// #1131 — THE DESTINATION POLICY. The dialer that carries a named endpoint
+// refuses link-local, unspecified and multicast addresses on the address it
+// dials (destination.go).
 package credhttp
 
 import (
@@ -119,7 +123,7 @@ func CheckRedirect(*http.Request, []*http.Request) error {
 // Idempotent in effect (a double wrap refuses the same requests).
 func RefuseRedirectHops(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	return &refuseRedirectHops{next: rt}
 }
@@ -184,7 +188,7 @@ func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
 	base := c.Transport
 	if base == nil {
-		base = http.DefaultTransport
+		base = guardedTransport
 	}
 	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c

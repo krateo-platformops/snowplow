@@ -216,7 +216,8 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		// gives up the page goal (10 s) after it starts, whoever started it
 		// (credhttp/budget.go). One holder for all, so cacheability is as
 		// before; the explicit Proxy still keeps each identity's transport its
-		// own.
+		// own. It is also where the owned branch gets the destination policy
+		// (#1131); the plumbing branch above gets it from plumbing's transport.
 		DialHolder: credhttp.EndpointDialHolder,
 	}
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA

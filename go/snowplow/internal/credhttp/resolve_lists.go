@@ -101,7 +101,7 @@ func ResolveReason(ctx context.Context) string {
 // client.
 func CountResolveCollectionLists(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	if chainCountsResolveLists(rt) {
 		return rt
