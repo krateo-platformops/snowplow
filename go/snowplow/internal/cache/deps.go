@@ -84,7 +84,7 @@ var ctxKeyL1Record = ctxKeyL1RecordType{}
 // chain (api.Resolve → restactions.Resolve → httpcall.Do).
 func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	if l1Key == "" {
-		loudFailEmptyL1Key("WithL1KeyContext")
+		loudFailEmptyL1Key(ctx, "WithL1KeyContext")
 		return ctx
 	}
 	if ctx == nil {
@@ -128,7 +128,7 @@ func DepGenStartSeqFromContext(ctx context.Context) (uint64, bool) {
 // accepted Put. An edit of the CR anywhere in [fetch, Put] then remarks the Put.
 func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, pre ...DepKey) context.Context {
 	if l1Key == "" {
-		loudFailEmptyL1Key("WithL1KeyContextFromEpoch")
+		loudFailEmptyL1Key(ctx, "WithL1KeyContextFromEpoch")
 		return ctx
 	}
 	if ctx == nil {
@@ -149,13 +149,13 @@ func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, 
 // test mode (so a missing-key regression cannot ship), WARN + counter in
 // production (the TTL outer net keeps the cache correct). The counter
 // lives on the Deps() singleton; Deps() is always non-nil.
-func loudFailEmptyL1Key(callsite string) {
+func loudFailEmptyL1Key(ctx context.Context, callsite string) {
 	Deps().recordDroppedNoKey.Add(1)
 	if depsTestMode.Load() {
 		panic("cache.deps: " + callsite + " called with empty l1Key — " +
 			"the L1 key was not threaded through (O15 loud-fail, test mode)")
 	}
-	slog.Warn("deps.empty_l1_key",
+	slog.WarnContext(ctx, "deps.empty_l1_key",
 		slog.String("subsystem", "cache"),
 		slog.String("callsite", callsite),
 		slog.String("hint", "dep edge dropped — L1 key was not threaded through; "+
@@ -1083,7 +1083,7 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 	if l1Key == "" {
 		// O15: a Record call with no L1 key is an unambiguous bug — a
 		// DepKey with nowhere to attach it. Loud-fail.
-		loudFailEmptyL1Key("Record")
+		loudFailEmptyL1Key(ctx, "Record")
 		return
 	}
 	if name == "" {
@@ -1109,7 +1109,7 @@ func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.Gr
 	if l1Key == "" {
 		// O15: same loud-fail as Record — a list-scope edge with no L1
 		// key cannot be attached anywhere.
-		loudFailEmptyL1Key("RecordList")
+		loudFailEmptyL1Key(ctx, "RecordList")
 		return
 	}
 	d.recordInternal(ctx, l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
@@ -1221,7 +1221,7 @@ func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk De
 			notifyResolveMemosBucketGone(dk) // #883 F4 — the GVR floor judges dk now
 		}
 		if d.capWarned.CompareAndSwap(false, true) {
-			slog.Warn("deps.record.cap_reached",
+			slog.WarnContext(ctx, "deps.record.cap_reached",
 				slog.String("subsystem", "cache"),
 				slog.Int64("max_records", d.maxRecords),
 				slog.String("hint", "subsequent records will be dropped silently — TTL purge keeps cache correct"),

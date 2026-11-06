@@ -47,7 +47,7 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 
 	// A real raw LIST envelope: marshalAsList over every seeded widget,
 	// exactly the shape dispatchViaInformer stores in a content entry.
-	items, servable := rw.ListObjectsServable(f1WidgetsGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), f1WidgetsGVR, "")
 	if !servable {
 		t.Fatalf("setup: widgets GVR not servable after sync")
 	}

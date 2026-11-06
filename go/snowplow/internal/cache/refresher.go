@@ -1337,7 +1337,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				}
 				evicted := Deps().EvictSelfGone(key, goneInputs)
 				r.selfNotFoundEvict.Add(1)
-				slog.Warn("refresher.self_object_gone_evicted",
+				slog.WarnContext(ctx, "refresher.self_object_gone_evicted",
 					slog.String("subsystem", "cache"),
 					slog.String("key_hash", key),
 					slog.Int("requeues", maxRefreshRequeues),
@@ -1361,7 +1361,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// and forget-as-fresh is the defect. The known-stale cell is served,
 			// counted, and revalidated by the next read under the requester or
 			// re-enqueued by the next change. Self-adapting: no budget to tune.
-			slog.Warn("refresher.refresh_dropped",
+			slog.WarnContext(ctx, "refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
@@ -1506,7 +1506,7 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 		// never read as the bare text `unknown` again.
 		errClass, stage := ClassifyRefreshError(err)
 		recordRefreshFailedClass(errClass, stage)
-		slog.Warn("refresher.refresh_failed",
+		slog.WarnContext(ctx, "refresher.refresh_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("handler_kind", entry.Inputs.CacheEntryClass),
 			slog.String("key_hash", key),

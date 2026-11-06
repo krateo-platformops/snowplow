@@ -77,11 +77,11 @@ func TestServeRequiresServable_SyncedServesNotSyncedFallsThrough(t *testing.T) {
 	}
 
 	// LIST a not-servable GVR → silent miss (servable=false), NO violation.
-	if _, servable := rw.ListObjectsServable(stuckGVR(), ""); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), stuckGVR(), ""); servable {
 		t.Fatalf("not-servable LIST must return servable=false (fall through), not serve")
 	}
 	// GET a not-servable GVR → silent miss, NO violation.
-	if _, hit := rw.GetObject(stuckGVR(), "", "anything"); hit {
+	if _, hit := rw.GetObject(context.Background(), stuckGVR(), "", "anything"); hit {
 		t.Fatalf("not-servable GET must return hit=false (fall through), not serve")
 	}
 
@@ -92,7 +92,7 @@ func TestServeRequiresServable_SyncedServesNotSyncedFallsThrough(t *testing.T) {
 
 	// LIST a servable GVR → servable=true (a real served answer, possibly
 	// empty — the fake has no objects, but servable means "vouched for").
-	if _, servable := rw.ListObjectsServable(servableGVR, ""); !servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), servableGVR, ""); !servable {
 		t.Fatalf("servable LIST must return servable=true")
 	}
 	// Still zero violations: serving from a servable informer is the
@@ -203,10 +203,10 @@ func TestServeRequiresServable_RaceGetListWhileFlipping(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				_, _ = rw.ListObjectsServable(servableGVR, "")
-				_, _ = rw.GetObject(servableGVR, "", "x")
-				_, _ = rw.ListObjectsServable(stuckGVR(), "")
-				_, _ = rw.GetObject(stuckGVR(), "", "x")
+				_, _ = rw.ListObjectsServable(context.Background(), servableGVR, "")
+				_, _ = rw.GetObject(context.Background(), servableGVR, "", "x")
+				_, _ = rw.ListObjectsServable(context.Background(), stuckGVR(), "")
+				_, _ = rw.GetObject(context.Background(), stuckGVR(), "", "x")
 				_ = rw.IsServable(servableGVR)
 			}
 		}()

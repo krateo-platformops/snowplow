@@ -76,6 +76,7 @@
 package cache
 
 import (
+	"context"
 	"log/slog"
 	"sort"
 	"strings"
@@ -295,13 +296,13 @@ func (rw *ResourceWatcher) actedRecordLocked(gvr schema.GroupVersionResource, na
 // wireInstanceLocked attaches the handler adapters (the dep handler, then
 // every matching extension, in registry order) and the instance-aware watch
 // error handler. Called before Run. Callers hold rw.mu.Lock.
-func (rw *ResourceWatcher) wireInstanceLocked(gvr schema.GroupVersionResource, in *storeInstance, path string) {
+func (rw *ResourceWatcher) wireInstanceLocked(ctx context.Context, gvr schema.GroupVersionResource, in *storeInstance, path string) {
 	resourceType := gvrResourceTypeString(gvr)
 	owned := in.shape.owned()
 	inf := in.gi.Informer()
 	if _, regErr := inf.AddEventHandler(in.adapt(depHandlerName, rw.depEventHandler(gvr),
 		rw.actedRecordLocked(gvr, depHandlerName, owned))); regErr != nil {
-		slog.Warn("cache.deps.add_event_handler_failed",
+		slog.WarnContext(ctx, "cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
 			slog.String("path", path),
@@ -315,7 +316,7 @@ func (rw *ResourceWatcher) wireInstanceLocked(gvr schema.GroupVersionResource, i
 			return rw.actedRecordLocked(gvr, name, owned)
 		},
 	})
-	rw.installWatchErrorHandlerFor(gvr, in)
+	rw.installWatchErrorHandlerFor(ctx, gvr, in)
 }
 
 // ── the request path ─────────────────────────────────────────────────────────
@@ -422,6 +423,7 @@ func (rw *ResourceWatcher) requestStoreBuildBound(gvr schema.GroupVersionResourc
 func refuseUnownedBuild(gvr schema.GroupVersionResource, reason string, keys []string) {
 	if reason == reasonSchema {
 		storeSwapStats.schemaUnowned.Add(1)
+		// log-ctx-waiver: worker: a store rebuild asked for by the CRD worker or the repair path
 		slog.Warn("cache.store.swap.schema_unowned",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -432,6 +434,7 @@ func refuseUnownedBuild(gvr schema.GroupVersionResource, reason string, keys []s
 		return
 	}
 	storeRepairUnsupportedTotal.Add(1)
+	// log-ctx-waiver: worker: a store rebuild asked for by the CRD worker or the repair path
 	slog.Warn("cache.store.repair_unsupported",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
@@ -459,6 +462,7 @@ func (rw *ResourceWatcher) constructCandidateLocked(gvr schema.GroupVersionResou
 		tf = StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
 	}
 	if err := rw.installDeliveryLogLocked(gvr, c, tf); err != nil {
+		// log-ctx-waiver: worker: a store rebuild asked for by the CRD worker or the repair path
 		slog.Warn("cache.store.delivery_record_not_installed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", gvrResourceTypeString(gvr)),
@@ -466,7 +470,7 @@ func (rw *ResourceWatcher) constructCandidateLocked(gvr schema.GroupVersionResou
 			slog.String("error", err.Error()),
 		)
 	}
-	rw.wireInstanceLocked(gvr, c, "swap-candidate")
+	rw.wireInstanceLocked(context.Background(), gvr, c, "swap-candidate")
 	if rw.stopRequestedLocked() || holdBuildsForTest.Load() {
 		return c
 	}
@@ -502,7 +506,7 @@ func (rw *ResourceWatcher) newOwnedInformerLocked(gvr schema.GroupVersionResourc
 	indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
 	switch shape {
 	case shapeStreaming:
-		gi, ok := newStreamingDynamicInformer(rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak)
+		gi, ok := newStreamingDynamicInformer(context.Background(), rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak)
 		if !ok {
 			return nil
 		}
@@ -814,6 +818,7 @@ type swapNotifier interface {
 func deliverM(c *storeInstance, m []string) {
 	n, ok := c.gi.Informer().(swapNotifier)
 	if !ok {
+		// log-ctx-waiver: informer-event: a build delivery on the informer pipeline
 		slog.Error("cache.store.swap.undeliverable",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", c.gvr.String()),

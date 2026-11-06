@@ -1,6 +1,7 @@
 package dispatchers
 
 import (
+	"context"
 	"log/slog"
 	"net/url"
 
@@ -70,7 +71,7 @@ func prewarmPaginationFor(callPath string) prewarmPagination {
 	if err != nil {
 		return unpaginatedPrewarm
 	}
-	perPage, page := paginationFromQuery(slog.Default(), u.Query())
+	perPage, page := paginationFromQuery(context.Background(), slog.Default(), u.Query())
 	return prewarmPagination{PerPage: perPage, Page: page}
 }
 

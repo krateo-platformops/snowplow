@@ -266,7 +266,7 @@ func NoteNarrowAuditWrite(ctx context.Context, key string, prior *ResolvedEntry,
 		a.changed.Add(1)
 		ps := sha256.Sum256(priorRaw)
 		ns := sha256.Sum256(encoded)
-		slog.Warn("deps.list_narrow.would_change",
+		slog.WarnContext(ctx, "deps.list_narrow.would_change",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("prior_sha256", hex.EncodeToString(ps[:])),

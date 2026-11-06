@@ -206,6 +206,7 @@ func StripBulkyFieldsForResourceType(resourceType string, gvr schema.GroupVersio
 		// objects" — always return (obj, nil) on the error path.
 		defer func() {
 			if r := recover(); r != nil {
+				// log-ctx-waiver: informer-event: the informer transform, on the delivery goroutine
 				slog.Warn("cache.strip.panic_recovered",
 					slog.String("subsystem", "cache"),
 					slog.String("resource_type", resourceType),
@@ -302,6 +303,7 @@ func StripBulkyFieldsForResourceType(resourceType string, gvr schema.GroupVersio
 				logFirstBytesOnce(resourceType, len(bo.raw))
 				return bo, nil
 			} else {
+				// log-ctx-waiver: informer-event: the informer transform, on the delivery goroutine
 				slog.Warn("cache.strip.bytes_conversion_failed",
 					slog.String("subsystem", "cache"),
 					slog.String("resource_type", resourceType),
@@ -332,6 +334,7 @@ func stripAndType(uns *unstructured.Unstructured, newTyped func() runtime.Object
 	typed := newTyped()
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, typed); err != nil {
 		conversionMs := float64(time.Since(start).Microseconds()) / 1000.0
+		// log-ctx-waiver: informer-event: the informer transform, on the delivery goroutine
 		slog.Warn("cache.strip.typed_conversion_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("typed_kind", typedKind),
@@ -541,6 +544,7 @@ func resetStripLoggingForTest() {
 // the defensive Unstructured fallback path in rbac.evaluateAgainstInformer
 // without requiring kind cluster integration.
 func DisableTypedOverrideForTest(gvr schema.GroupVersionResource) func() {
+	// log-ctx-waiver: no-prod-caller: a test seam
 	slog.Warn("cache.DisableTypedOverrideForTest invoked — production code MUST NOT call this",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),

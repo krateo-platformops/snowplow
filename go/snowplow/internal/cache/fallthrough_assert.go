@@ -139,6 +139,7 @@ func AssertReadPathsScoped() int {
 	// counter once per missing route. The pod stays up.
 	for _, m := range missing {
 		assertionViolationsTotal.Add(1)
+		// log-ctx-waiver: boot: main checks the route table once before serving
 		slog.Error("cache.read_paths_scoped.violation",
 			slog.String("subsystem", "cache"),
 			slog.String("check", "read_paths_scoped"),

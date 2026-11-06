@@ -4501,6 +4501,7 @@ func positiveIntFromEnv(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.parse_rejected",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4511,6 +4512,7 @@ func positiveIntFromEnv(key string, def int) int {
 		return def
 	}
 	if n <= 0 {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.out_of_range",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4548,6 +4550,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 	}
 	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if n < 0 {
+			// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 			slog.Warn("cache.env.out_of_range",
 				slog.String("subsystem", "cache"),
 				slog.String("key", key),
@@ -4562,6 +4565,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 	// strconv.ParseInt failed — try scientific / float notation (#154).
 	f, ferr := strconv.ParseFloat(v, 64)
 	if ferr != nil {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.parse_rejected",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4572,6 +4576,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 		return def
 	}
 	if f < 0 {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.out_of_range",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),

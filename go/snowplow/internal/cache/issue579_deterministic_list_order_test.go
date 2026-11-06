@@ -128,7 +128,7 @@ func issue579DecodedOrder(items []*unstructured.Unstructured) []string {
 func TestIssue579_ARM1_RawRenderingIsByteStableAcrossReads(t *testing.T) {
 	rw := issue579Watcher(t)
 
-	first, ok := rw.ListRawServable(servableTestGVR, "ns-a")
+	first, ok := rw.ListRawServable(context.Background(), servableTestGVR, "ns-a")
 	if !ok {
 		t.Fatalf("ListRawServable: want servable=true")
 	}
@@ -145,7 +145,7 @@ func TestIssue579_ARM1_RawRenderingIsByteStableAcrossReads(t *testing.T) {
 	want := join(first)
 
 	for i := 1; i < issue579Reads; i++ {
-		got, ok := rw.ListRawServable(servableTestGVR, "ns-a")
+		got, ok := rw.ListRawServable(context.Background(), servableTestGVR, "ns-a")
 		if !ok {
 			t.Fatalf("read %d: want servable=true", i)
 		}
@@ -236,7 +236,7 @@ func TestIssue579_ARM5_RawAndDecodedPathsAgreeOnOrder(t *testing.T) {
 	// read can coincide by chance (~1/8 here) when ordering is a random
 	// rotation, which would make this arm a latent flake rather than a test.
 	for i := 0; i < issue579Reads; i++ {
-		raw, ok := rw.ListRawServable(servableTestGVR, "ns-a")
+		raw, ok := rw.ListRawServable(context.Background(), servableTestGVR, "ns-a")
 		if !ok {
 			t.Fatalf("read %d: ListRawServable: want servable=true", i)
 		}

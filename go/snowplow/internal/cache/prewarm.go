@@ -109,7 +109,7 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 		return 0, 0, nil
 	}
 	if dynClient == nil {
-		slog.Warn("cache.prewarm.skipped",
+		slog.WarnContext(ctx, "cache.prewarm.skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("reason", "nil dynamic client"),
 		)
@@ -129,7 +129,7 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 	// runtime on first dispatch via recordWidgetDeps's self-dep edge).
 	inv, walkErr := CollectResourceTypesFromRestActions(ctx, dynClient)
 	if walkErr != nil {
-		slog.Warn("cache.prewarm.inventory_walk_failed",
+		slog.WarnContext(ctx, "cache.prewarm.inventory_walk_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", walkErr),
 			slog.String("effect", "no startup prewarm; lazy register-on-navigation still covers every GVR on first request"),
@@ -149,7 +149,7 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 		if ctx.Err() != nil {
 			// Boot context cancelled — stop early. Whatever we did not
 			// reach is covered by the lazy register-on-navigation path.
-			slog.Warn("cache.prewarm.context_cancelled",
+			slog.WarnContext(ctx, "cache.prewarm.context_cancelled",
 				slog.String("subsystem", "cache"),
 				slog.Int("registered", registered),
 				slog.Int("already_present", alreadyPresent),

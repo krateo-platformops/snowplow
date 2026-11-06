@@ -757,6 +757,7 @@ func scanStaleOverdue() {
 	staleDebtsMu.Unlock()
 	for _, r := range newlyRe {
 		staleOverdueTotal.Add(1)
+		// log-ctx-waiver: worker: the stale-debt overdue scanner ticker
 		slog.Warn("apistage.stale_replace_overdue",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", r.key),
@@ -766,6 +767,7 @@ func scanStaleOverdue() {
 	}
 	for _, d := range newly {
 		staleOverdueTotal.Add(1)
+		// log-ctx-waiver: worker: the stale-debt overdue scanner ticker
 		slog.Warn("apistage.stale_debt_overdue",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", d.gvr),

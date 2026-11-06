@@ -412,7 +412,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	// round-trips are now served from the memcache after the first read.
 	disco, err := getCachedDiscovery(rc)
 	if err != nil {
-		slog.Warn("cache.discovery.client_build_failed",
+		slog.WarnContext(ctx, "cache.discovery.client_build_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
 			slog.Any("err", err),
@@ -438,7 +438,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	if err != nil {
 		// Group may not exist yet — common during cluster boot. Soft
 		// fail; subsequent walks retry.
-		slog.Warn("cache.discovery.server_groups_failed",
+		slog.WarnContext(ctx, "cache.discovery.server_groups_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
 			slog.Any("err", err),
@@ -455,7 +455,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 		gv := schema.GroupVersion{Group: group, Version: version}
 		list, lerr := disco.ServerResourcesForGroupVersion(gv.String())
 		if lerr != nil || list == nil {
-			slog.Warn("cache.discovery.server_resources_failed",
+			slog.WarnContext(ctx, "cache.discovery.server_resources_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("group_version", gv.String()),
 				slog.Any("err", lerr),

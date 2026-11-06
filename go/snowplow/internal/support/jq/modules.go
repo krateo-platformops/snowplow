@@ -201,6 +201,7 @@ func (l *layeredModuleLoader) refusedCustomModules() []string {
 // The module's content is never logged.
 func logRefusedCustomModules(log *slog.Logger, customDir string, refused []string) {
 	for _, n := range refused {
+		// log-ctx-waiver: process-once: the module loader is built once; the line is about the process configuration
 		log.Error("jq custom module refused: its name is reserved by a built-in module; the built-in is used",
 			slog.String("module", n),
 			slog.String("modules_dir", customDir))

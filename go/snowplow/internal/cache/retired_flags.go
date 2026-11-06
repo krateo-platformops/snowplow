@@ -166,6 +166,7 @@ func AuditRetiredFlags(log *slog.Logger) {
 			if warn {
 				// Silent behavior change — the operator asked for OFF and
 				// now gets ON. Loud by design.
+				// log-ctx-waiver: boot: main audits the environment once at start
 				log.Warn("config.retired_flag_ignored",
 					slog.String("subsystem", "cache"),
 					slog.String("flag", rf.name),

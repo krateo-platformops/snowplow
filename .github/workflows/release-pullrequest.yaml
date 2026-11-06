@@ -111,6 +111,10 @@ jobs:
       # goes through entry.Raw() / entry.RawLen().
       - name: RawJSON readers are classified gate
         run: bash scripts/check_rawjson_readers.sh
+      # #1184: a WARN or ERROR passes the context in scope, so a request's lines
+      # carry its trace_id; a site with no context carries a classified waiver.
+      - name: WARN/ERROR sites keep their context gate
+        run: bash scripts/check_request_log_context.sh
       # No compiled executable is tracked: a `go build` in scripts/<tool>/ once
       # committed a 7 MB checker binary (#912). Content-based (ELF / Mach-O /
       # PE magic), so a tracked shell script (mode 755) stays allowed.

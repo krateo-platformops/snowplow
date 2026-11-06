@@ -359,6 +359,7 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 		}
 		w.counters.workerPanics.Add(1)
 		if respawns >= maxDepWorkerRespawns {
+			// log-ctx-waiver: worker: the dep-event worker goroutine
 			slog.Error("deps.delete_worker.panic",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
@@ -370,6 +371,7 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 			)
 			return
 		}
+		// log-ctx-waiver: worker: the dep-event worker goroutine
 		slog.Error("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.Any("panic", rec),
@@ -409,6 +411,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		}
 		w.counters.workerPanics.Add(1)
 		w.q().Forget(k)
+		// log-ctx-waiver: worker: the dep-event worker: a dequeued informer event
 		slog.Warn("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -446,6 +449,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		}
 		w.counters.probeUnknownDegraded.Add(1)
 		w.q().Forget(k)
+		// log-ctx-waiver: worker: the dep-event worker: a dequeued informer event
 		slog.Warn("deps.probe_unknown_degraded",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -765,6 +769,7 @@ func (rw *ResourceWatcher) probeObjectState(gvr schema.GroupVersionResource, nam
 func (w *depWatch) noteNilSyncCh(gvr schema.GroupVersionResource, hint string) {
 	w.counters.addNilSyncCh.Add(1)
 	if w.nilSyncWarned.CompareAndSwap(false, true) {
+		// log-ctx-waiver: informer-event: an informer ADD handler
 		slog.Warn("deps.add_nil_syncch",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),

@@ -111,8 +111,8 @@ func r684Setup(t *testing.T, extra ...map[string]any) *r684Env {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		_, okRA := e.rw.GetObject(h1RAGVR, h1NS, r684RA)
-		_, okP3 := e.rw.GetObject(c681CMs, "pub", "p3")
+		_, okRA := e.rw.GetObject(context.Background(), h1RAGVR, h1NS, r684RA)
+		_, okP3 := e.rw.GetObject(context.Background(), c681CMs, "pub", "p3")
 		if okRA && okP3 && e.rw.IsServable(h1RAGVR) {
 			break
 		}

@@ -404,7 +404,7 @@ func iterateApiRefPages(
 		}
 		got := paginationFetchPageFn(ctx, ref)
 		if got.Err != nil {
-			log.Warn("phase1.walk.apiref_pagination.fetch_failed",
+			log.WarnContext(ctx, "phase1.walk.apiref_pagination.fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", ns),
@@ -415,7 +415,7 @@ func iterateApiRefPages(
 			return
 		}
 		if got.Unstructured == nil {
-			log.Warn("phase1.walk.apiref_pagination.fetch_nil",
+			log.WarnContext(ctx, "phase1.walk.apiref_pagination.fetch_nil",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", ns),
@@ -472,7 +472,7 @@ func iterateApiRefPages(
 			Cursor:  cursor,
 		})
 		if err != nil {
-			log.Warn("phase1.walk.apiref_pagination.resolve_failed",
+			log.WarnContext(resolveCtx, "phase1.walk.apiref_pagination.resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", ns),
@@ -586,7 +586,7 @@ func iterateApiRefPages(
 	// re-evaluate). EITHER way it means coverage was TRUNCATED — log loud so it
 	// is actionable, not silent.
 	if reachedBackstop {
-		log.Warn("phase1.walk.apiref_pagination.backstop_hit",
+		log.WarnContext(ctx, "phase1.walk.apiref_pagination.backstop_hit",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", ns),

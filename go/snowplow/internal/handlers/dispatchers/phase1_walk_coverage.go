@@ -306,6 +306,7 @@ func recordWalkCoverage(walkedRoots int, outcome walkPassOutcome) {
 	}
 
 	coverageRegressedTotal.Add(1)
+	// log-ctx-waiver: worker: the navigation walk of a prewarm pass
 	slog.Warn("prewarm.coverage.regressed",
 		slog.String("subsystem", "cache"),
 		// BOTH levels on the line. "Regressed" alone is useless; the operator
