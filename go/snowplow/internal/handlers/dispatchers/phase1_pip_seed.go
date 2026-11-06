@@ -9,7 +9,7 @@
 // the errgroup back-out lever (PREWARM_ENGINE_ENABLED=false) that kept the
 // legacy path alive is retired. This file is now the SHARED SEED-PRIMITIVE
 // LIBRARY: seedOneRestaction / seedOneWidget / seedRAFullListForWidget /
-// withCohortSeedContext / cohortLogLabel + the navWidgetHarvester type — all
+// withCohortSeedContext + the navWidgetHarvester type — all
 // called by the engine boot seed. The seedTarget type + PrewarmPIPEnabled gate
 // also live here.
 //
