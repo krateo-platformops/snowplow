@@ -106,7 +106,9 @@
 // load (no open serve → no lock); eviction runs under the store's c.mu
 // (evictDirtyWindow), which is why the ledger never takes c.mu or the hub lock.
 // The overdue scanner reads the hub (HasRefreshSubscriberAs) with the ledger
-// lock released.
+// lock released, and a stale hit reads the store the same way (settleLateOpen).
+// The D2 commit opens its serve under the sink's own lock (StaleServeSink.Commit,
+// #1198), which only ever orders the sink's lock before this leaf.
 //
 // # KNOWN BIAS
 //
@@ -315,10 +317,44 @@ func NoteStaleHit(ctx context.Context, key string, entry *ResolvedEntry, subject
 	st, dirty := dirtyStampFor(key)
 	switch {
 	case entry.StaleDerived:
-		noteStaleServe(key, subjectOf(ctx), layerAPIStage, StalePushNow(), st)
+		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerAPIStage, StalePushNow(), st))
 	case dirty:
-		noteStaleServe(key, subjectOf(ctx), layerL1, StalePushNow(), st)
+		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerL1, StalePushNow(), st))
 	}
+}
+
+// settleLateOpen catches the Put that landed between a hit's read and its
+// serve's open (#1198). A hit learns it served stale bytes only after reading
+// them, so unlike the D2 commit it cannot open first: that Put found no serve to
+// mark, and no later Put is owed, so the frame that follows would close nothing.
+//
+// The cell is read AFTER the serve is open, and a Put stores before it marks
+// (noteStalePushPut, after c.mu is released). So every Put is caught by one side:
+// its mark ran after the open and found the serve, or it ran before, and then
+// its store is visible here. Both sides ask the same question (replaces).
+//
+// Only a stale hit reaches this: a fresh hit returns from NoteStaleHit first.
+func settleLateOpen(key string, s *staleServe) {
+	if s == nil {
+		return
+	}
+	//serve-probe: decides whether a just-opened stale serve is already replaced, serves no body
+	cur, ok := ResolvedCache().GetNoTouch(key)
+	if ok && !cur.replaces(s) {
+		return
+	}
+	l := stalePush
+	l.mu.Lock()
+	s.replaced = true
+	l.mu.Unlock()
+}
+
+// replaces reports whether the body in e replaces serve s: not stale-derived and,
+// when s saw a dirty stamp, resolved from at or after that stamp's latest mark
+// (the file comment's rule). The one definition, for a Put meeting an open serve
+// and a late serve meeting the cell.
+func (e *ResolvedEntry) replaces(s *staleServe) bool {
+	return !e.StaleDerived && (!s.needSeq || (e.hasResolveStart && e.resolveStart >= s.seq))
 }
 
 // noteStaleServeNow is a serve whose dirty stamp has not been read yet (the D2
@@ -331,9 +367,9 @@ func noteStaleServeNow(key, subject string, layer int, servedAt time.Time) {
 // noteStaleServe opens one serve of key for subject at servedAt. st is key's
 // dirty stamp as the serve read it (nil: none) — the mark a replacing Put must
 // have read past — read ONCE by the caller, before the leaf lock.
-func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirtyStamp) {
+func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirtyStamp) *staleServe {
 	if key == "" {
-		return
+		return nil
 	}
 	if servedAt.IsZero() {
 		servedAt = StalePushNow()
@@ -360,6 +396,7 @@ func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirt
 	}
 	l.mu.Unlock()
 	ensureStalePushScanner()
+	return s
 }
 
 // dropOldestLocked closes the oldest open serve as dropped (the capacity
@@ -425,19 +462,17 @@ func RestartStaleServeClock(key, layer string, at time.Time) {
 // noteStalePushPut is every ACCEPTED store Put of key (the four Put methods,
 // after c.mu is released, before the caller publishes): it replaces key's open
 // serves the Put corrects, for every subject (see the file comment).
-func noteStalePushPut(ctx context.Context, key string, entry *ResolvedEntry) {
+func noteStalePushPut(key string, entry *ResolvedEntry) {
 	if stalePushOpenTotal.Load() == 0 || entry == nil || entry.StaleDerived {
 		return
 	}
-	start, hasStart := DepGenStartSeqFromContext(ctx)
 	l := stalePush
 	l.mu.Lock()
 	for _, serves := range l.byKey[key] {
 		for _, s := range serves {
-			if s.replaced || (s.needSeq && (!hasStart || start < s.seq)) {
-				continue
+			if entry.replaces(s) {
+				s.replaced = true
 			}
-			s.replaced = true
 		}
 	}
 	l.mu.Unlock()

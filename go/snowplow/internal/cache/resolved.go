@@ -269,6 +269,14 @@ type ResolvedEntry struct {
 	// starts a fresh entry without the flag.
 	StaleDerived bool
 
+	// resolveStart (#1198) is where the resolve that produced this body began on
+	// the dep-event sequence (its #375 startSeq), and hasResolveStart whether it
+	// had one. Set by every Put (putPreamble) before the entry is published. It
+	// lets a stale serve that opens after this Put ask the cell what the Put could
+	// not tell it (replaces, stale_push.go).
+	resolveStart    uint64
+	hasResolveStart bool
+
 	// SeedOrigin (#841, metadata only) is the seed class whose seed INSERTED
 	// this cell — SeedOriginBase / SeedOriginLearned — or "" for a cell traffic
 	// or the refresher created. It belongs to the key's lineage like BornAt:
@@ -1683,7 +1691,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	if Inert(ctx) {
 		return
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
 	// refresh suppression waits for: clear the marker (and the consecutive-
@@ -1705,7 +1713,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen (no sink on a plain Put: a no-op)
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
-	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
 }
 
@@ -1812,7 +1820,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	if Inert(ctx) {
 		return false
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
@@ -1840,7 +1848,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	ksEnd := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
-	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
 	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
 	// any ctx without one, and for any key but the revalidated one). BEFORE the
@@ -1873,7 +1881,7 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 	if Inert(ctx) {
 		return false
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
@@ -1895,7 +1903,7 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen
 	c.mu.Unlock()
 	ksEnd.afterUnlock(key)
-	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -1962,7 +1970,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	if Inert(ctx) {
 		return false
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	// #1070 — ONE byte compare of the refresh Put against the resident prior,
 	// OFF c.mu: it counts the Put identical or changed, and it is #406's compare
 	// for an RAFullList body (raLayerEqualOf), so no body is compared twice.
@@ -2010,7 +2018,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		class = entry.Inputs.CacheEntryClass
 	}
 	noteRefreshPut(ctx, key, class, identical, windowNow())
-	noteStalePushPut(ctx, key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -2286,7 +2294,7 @@ func (c *ResolvedCacheStore) SetTombstoneTTL(d time.Duration) {
 // putPreamble does the off-critical-path preparation shared by Put and PutIfGen:
 // stamp CreatedAt/BornAt and compute the LRU byte weight + the #247 extras hash
 // (both marshal/hash work that does not need the store lock).
-func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, extrasHash string) {
+func (c *ResolvedCacheStore) putPreamble(ctx context.Context, entry *ResolvedEntry) (bytes int64, extrasHash string) {
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = c.now()
 	}
@@ -2296,6 +2304,9 @@ func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, ext
 	if entry.BornAt.IsZero() {
 		entry.BornAt = entry.CreatedAt
 	}
+	// #1198 — where this body's resolve began, for a stale serve that opens after
+	// this Put. Here, not under c.mu: the entry is not published yet.
+	entry.resolveStart, entry.hasResolveStart = DepGenStartSeqFromContext(ctx)
 	return entryBytes(entry), extrasHashForEntry(entry)
 }
 
