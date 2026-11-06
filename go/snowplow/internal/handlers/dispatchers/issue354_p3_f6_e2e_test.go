@@ -316,9 +316,20 @@ func TestIssue354_P3_F6_WindowKxM_GetByName(t *testing.T) {
 	work0 := cache.RefresherWorkSnapshot()
 	ksServed0 := p3StoreStat("known_stale_served_total")
 	d2Serve0 := restapi.StaleServeStatsSnapshot().ServeTotal
-	enq0 := p3RefStat("enqueue")
 	i431UpdateCM(t, e.dyn, p3NewValue)
-	p3Wait(t, 10*time.Second, "the 12 dirty-marks", func() bool { return p3RefStat("enqueue")-enq0 >= int64(len(keys)) })
+	// #1034 — wait for the mark on EVERY cell, by its own window. The one
+	// configmap event marks 14 keys (the 12 cells and the 2 backing content
+	// cells) one after another, so a count of 12 enqueues can be reached with
+	// two of the 12 cells still unmarked: a GET of one of them is an ordinary
+	// hit and stale_served_total came up one short under load.
+	p3Wait(t, 10*time.Second, "the 12 dirty-marks", func() bool {
+		for _, k := range keys {
+			if !cache.InputsMovedSincePut(k) {
+				return false
+			}
+		}
+		return true
+	})
 	p3Wait(t, 5*time.Second, "one refresh dequeued and in flight", func() bool { return invocations.Load() >= 1 })
 	p3Wait(t, 10*time.Second, "a window open on every backing content cell", func() bool {
 		for _, k := range substrate {
