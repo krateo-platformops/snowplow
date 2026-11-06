@@ -96,6 +96,7 @@ func (m *monitor) check(now time.Time) bool {
 
 	attrs := m.snapshotAttrs(now, customers, slow, inflight)
 	m.stats.noteSnapshot(attrMap(attrs, now))
+	// log-ctx-waiver: worker: the slowcall sampling ticker
 	m.logger().LogAttrs(context.Background(), slog.LevelWarn, "slowcall.goroutines", attrs...)
 	return true
 }

@@ -110,12 +110,12 @@ func recordWidgetDeps(ctx context.Context, log *slog.Logger, l1Key string, gvr s
 	// (the 0.30.8 dormancy bug). EnsureResourceType is idempotent +
 	// singleflight under rw.mu; concurrent first-readers share a
 	// single informer.
-	ensureWatcherInformerForGVR(gvr)
+	ensureWatcherInformerForGVR(ctx, gvr)
 	deps.Record(ctx, l1Key, gvr, w.GetNamespace(), w.GetName())
 
 	// Edge type 2: spec.apiRef → RestAction.
 	if apiRefName, apiRefNS, ok := readApiRef(w); ok {
-		ensureWatcherInformerForGVR(restActionGVR)
+		ensureWatcherInformerForGVR(ctx, restActionGVR)
 		deps.Record(ctx, l1Key, restActionGVR, apiRefNS, apiRefName)
 	}
 
@@ -131,7 +131,7 @@ func recordWidgetDeps(ctx context.Context, log *slog.Logger, l1Key string, gvr s
 		if !ok {
 			continue
 		}
-		ensureWatcherInformerForGVR(refGVR)
+		ensureWatcherInformerForGVR(ctx, refGVR)
 		if ref.Name == "" {
 			// List-scope dep (e.g., a ref that targets "all of kind X
 			// in namespace Y"). Record with name="*" (via the
@@ -161,7 +161,7 @@ func recordWidgetDeps(ctx context.Context, log *slog.Logger, l1Key string, gvr s
 // informer has synced, BUT the dep tracker records the forward edge
 // so the very next UPDATE/DELETE will fire correctly. Subsequent
 // warm reads see the now-live informer.
-func ensureWatcherInformerForGVR(gvr schema.GroupVersionResource) {
+func ensureWatcherInformerForGVR(ctx context.Context, gvr schema.GroupVersionResource) {
 	rw := cache.Global()
 	if rw == nil {
 		return
@@ -170,9 +170,9 @@ func ensureWatcherInformerForGVR(gvr schema.GroupVersionResource) {
 	// resolver-side analogue in restactions/api/resolve.go emits the
 	// same WARN on the inner-call path.
 	start := time.Now()
-	_, _ = rw.EnsureResourceType(gvr)
+	_, _ = rw.EnsureResourceTypeFor(ctx, gvr)
 	if elapsed := time.Since(start); elapsed > dispatcherLazyRegisterSlowThreshold {
-		slog.Warn("cache.lazy_register.slow",
+		slog.WarnContext(ctx, "cache.lazy_register.slow",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.Duration("elapsed", elapsed),

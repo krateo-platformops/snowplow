@@ -52,6 +52,7 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -310,7 +311,7 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 	// The iterator error (#638) is not consumed here: inspect is a
 	// dispatch-free read-set enumeration, unchanged — an errored iterator
 	// enumerates what it enumerated, exactly as before.
-	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict, true) // an in-cluster stage
+	opts, skips, _ := createRequestOptionsWithSkips(pagebudget.Detach(ctx), log, stage, dict, true) // an in-cluster stage
 	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}

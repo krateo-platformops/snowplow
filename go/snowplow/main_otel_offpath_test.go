@@ -82,7 +82,7 @@ func TestF9_OffPathRegistersNothing(t *testing.T) {
 	}}
 	var want, got bytes.Buffer
 	slog.New(slog.NewJSONHandler(&want, opts)).InfoContext(ctx, "off.path", slog.String("k", "v"))
-	slog.New(newTraceCorrelationHandler(slog.NewJSONHandler(&got, opts))).InfoContext(ctx, "off.path", slog.String("k", "v"))
+	slog.New(tracing.NewTraceCorrelationHandler(slog.NewJSONHandler(&got, opts))).InfoContext(ctx, "off.path", slog.String("k", "v"))
 	if !bytes.Equal(want.Bytes(), got.Bytes()) {
 		t.Fatalf("off-path record differs from the bare handler's\n got: %s\nwant: %s", got.String(), want.String())
 	}

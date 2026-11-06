@@ -123,7 +123,7 @@ func TestIssue853_DeleteEvictedWidget_Is404_NeverTheDependencyPath(t *testing.T)
 				t.Fatalf("delete widget: %v", err)
 			}
 			for end := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-				if _, hit := cache.Global().GetObject(h1WidgetGVR, h1NS, h1WName); !hit {
+				if _, hit := cache.Global().GetObject(context.Background(), h1WidgetGVR, h1NS, h1WName); !hit {
 					break
 				}
 				if time.Now().After(end) {

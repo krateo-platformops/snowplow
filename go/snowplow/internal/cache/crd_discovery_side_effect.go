@@ -215,6 +215,7 @@ func (c *crdDiscovery) startCRDDiscoveryWorker() {
 			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			defer func() {
 				if rec := recover(); rec != nil {
+					// log-ctx-waiver: worker: the CRD discovery worker goroutine
 					slog.Error("cache.crd_discovery.worker.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", rec),
@@ -269,6 +270,7 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 		// stays alive and the event still counts as processed below. No
 		// side-effect fires — there is no safe default action for an
 		// unknown lifecycle event.
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Error("cache.crd_discovery.unknown_kind",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", crdLifecycleKindString(ev.kind)),
@@ -349,6 +351,7 @@ func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycl
 	// indefinitely. Reaching it means something is badly wrong and the WARN
 	// says so.
 	c.eventsParked.Add(1)
+	// log-ctx-waiver: informer-event: a CRD informer event handler
 	slog.Warn("cache.crd_discovery.queue_parked",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", crdLifecycleKindString(kind)),
@@ -368,6 +371,7 @@ func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycl
 		c.eventsDropped.Add(1)
 	case <-timer.C:
 		c.eventsDropped.Add(1)
+		// log-ctx-waiver: informer-event: a CRD informer event handler
 		slog.Error("cache.crd_discovery.event_dropped",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", crdLifecycleKindString(kind)),
@@ -469,6 +473,7 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			c.panicsRecovered.Add(1)
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Error("cache.crd_discovery.trigger.panic_recovered",
 				slog.String("subsystem", "cache"),
 				slog.String("kind", crdLifecycleKindString(kind)),
@@ -522,6 +527,7 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	saRC := ProcessSARestConfig()
 	if saRC == nil {
 		c.discoverySkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.no_sa_rc",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -565,7 +571,7 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 		// registers against a stale cached read (S4/F-4 stuck-zero class).
 		ctx := context.Background()
 		if _, derr := DiscoverGroupResourcesFresh(ctx, saRC, group); derr != nil {
-			slog.Warn("cache.crd_discovery.discover_group_failed",
+			slog.WarnContext(ctx, "cache.crd_discovery.discover_group_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("group", group),
 				slog.Any("err", derr),
@@ -889,6 +895,7 @@ func triggerCRDDelete(obj interface{}) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			c.panicsRecovered.Add(1)
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Error("cache.crd_discovery.delete.panic_recovered",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
@@ -918,6 +925,7 @@ func triggerCRDDelete(obj interface{}) {
 	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
 	if group == "" || plural == "" {
 		c.deleteSkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.delete.no_group_or_plural",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -931,6 +939,7 @@ func triggerCRDDelete(obj interface{}) {
 	versions, found, vErr := unstructured.NestedSlice(u.Object, "spec", "versions")
 	if vErr != nil || !found || len(versions) == 0 {
 		c.deleteSkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.delete.no_versions",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -1016,6 +1025,7 @@ func warnOnceCRDDecodeSkip(obj interface{}, kind crdLifecycleKind) {
 	if _, loaded := crdDecodeSkipWarnedTypes.LoadOrStore(typeName, struct{}{}); loaded {
 		return
 	}
+	// log-ctx-waiver: worker: the CRD discovery worker, one line per skipped shape
 	slog.Warn("cache.crd_discovery.decode_skipped",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", crdLifecycleKindString(kind)),

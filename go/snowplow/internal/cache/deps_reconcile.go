@@ -200,6 +200,7 @@ func (r *depsReconcile) tick(sample int) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			r.panics.Add(1)
+			// log-ctx-waiver: worker: the periodic dep reconcile ticker
 			slog.Error("cache.deps_reconcile.panic",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
@@ -222,6 +223,7 @@ func (r *depsReconcile) tick(sample int) {
 			}
 			coords = append(coords, e.GVR+" "+e.Namespace+"/"+e.Name)
 		}
+		// log-ctx-waiver: worker: the periodic dep reconcile ticker
 		slog.Warn("cache.deps_reconcile.divergence",
 			slog.String("subsystem", "cache"),
 			slog.Int("sampled", res.Sampled),

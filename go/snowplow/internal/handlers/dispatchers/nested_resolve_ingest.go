@@ -264,7 +264,7 @@ func httpEdgeGuardStop(ctx context.Context, log *slog.Logger, resource, namespac
 	}
 	if cache.NestedCallDepthFromContext(ctx) >= cache.NestedCallMaxDepth() {
 		cache.BumpHTTPEdgeDepthStop()
-		log.Warn("http-edge nested resolve depth-limit backstop: refusing to recurse further",
+		log.WarnContext(ctx, "http-edge nested resolve depth-limit backstop: refusing to recurse further",
 			slog.String("node", node),
 			slog.Int("depth", cache.NestedCallDepthFromContext(ctx)),
 			slog.Int("max", cache.NestedCallMaxDepth()),

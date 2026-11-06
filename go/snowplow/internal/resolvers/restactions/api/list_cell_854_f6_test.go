@@ -181,6 +181,14 @@ func TestListCell854_F6_PortalCorpusNeverMutatesSharedItems(t *testing.T) {
 		if _, err := res.Create(context.Background(), f6Obj(i, 0), metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
+		if created := i + 1; created%50 == 0 {
+			// The fake watcher's channel holds 100 events and a full one panics
+			// (#938): let the informer take every create before writing on, so
+			// at most 50 wait in the channel however slowly it drains.
+			if !fill710WaitFor(10*time.Second, func() bool { return len(cache.Global().ListObjects(r1FsaGVR, r1Ns)) >= created }) {
+				t.Fatalf("the informer never held create %d", created)
+			}
+		}
 	}
 	if !fill710WaitFor(10e9, func() bool {
 		raw, _, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(r1Ctx()), fill710ListCall())

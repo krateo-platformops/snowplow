@@ -106,7 +106,7 @@ func RBAC() http.Handler {
 
 		var cr templatesv1.RESTAction
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
-			log.Error("rbac: unable to convert unstructured to typed RESTAction",
+			log.ErrorContext(req.Context(), "rbac: unable to convert unstructured to typed RESTAction",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("err", err))
@@ -124,7 +124,7 @@ func RBAC() http.Handler {
 		if err != nil {
 			// A structural failure (cyclic api[], SA rest.Config unavailable):
 			// the read-set cannot be trusted — fail loud.
-			log.Error("rbac: inspect pass failed",
+			log.ErrorContext(req.Context(), "rbac: inspect pass failed",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("err", err))
@@ -135,7 +135,7 @@ func RBAC() http.Handler {
 			// At least one stage could not be enumerated from the empty dict.
 			// Returning a partial read-set would silently under-grant RBAC at
 			// the first /call — fail loud, naming every unresolvable stage.
-			log.Warn("rbac: RESTAction has unresolvable stage(s); refusing partial read-set",
+			log.WarnContext(req.Context(), "rbac: RESTAction has unresolvable stage(s); refusing partial read-set",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("unresolved", unresolved))

@@ -47,7 +47,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	if !cache.Disabled() {
 		ui, err := xcontext.UserInfo(ctx)
 		if err != nil {
-			log.Error("rbac.UserCan: unable to extract UserInfo", slog.Any("err", err))
+			log.ErrorContext(ctx, "rbac.UserCan: unable to extract UserInfo", slog.Any("err", err))
 			return false
 		}
 		// Ship 0.30.242 H.c-layered Phase 2 step 2a — EvaluateRBAC returns
@@ -55,7 +55,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		// matchedBindingUID is ignored.
 		allowed, _, evalErr := EvaluateRBAC(ctx, ObjectCheck(ui.Username, ui.Groups, opts.Verb, opts.target()))
 		if evalErr != nil {
-			log.Error("rbac.UserCan: EvaluateRBAC failed", slog.Any("err", evalErr))
+			log.ErrorContext(ctx, "rbac.UserCan: EvaluateRBAC failed", slog.Any("err", evalErr))
 			return false
 		}
 		return allowed
@@ -93,13 +93,13 @@ func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok boo
 
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
-		log.Error("unable to get user endpoint", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
 		return false
 	}
 
 	clientset, err := sarClientsetForEndpoint(ctx, ep)
 	if err != nil {
-		log.Error("unable to create kubernetes clientset for SAR", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to create kubernetes clientset for SAR", slog.Any("err", err))
 		return false
 	}
 
@@ -118,7 +118,7 @@ func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok boo
 	resp, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().
 		Create(ctx, &selfCheck, metav1.CreateOptions{}) // #1115: the request's page budget
 	if err != nil {
-		log.Error("unable to perform SelfSubjectAccessReviews",
+		log.ErrorContext(ctx, "unable to perform SelfSubjectAccessReviews",
 			slog.Any("selfCheck", selfCheck), slog.Any("err", err))
 		return false
 	}

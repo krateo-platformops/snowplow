@@ -87,7 +87,7 @@ func LookupRoleRefRulesForTest(snap *cache.RBACSnapshot, namespace string, ref r
 // selectivity. log is unused by roleRefPermits (reserved), so nil is safe.
 // Thin pass-through; zero production surface.
 func RoleRefPermitsForTest(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions) (bool, error) {
-	return roleRefPermits(snap, namespace, ref, opts, nil)
+	return roleRefPermits(context.Background(), snap, namespace, ref, opts, nil)
 }
 
 // ResetRequesterProfileMemoForTest clears the v7 Step 2B requester-profile memo
