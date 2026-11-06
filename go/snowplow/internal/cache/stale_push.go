@@ -189,7 +189,30 @@ func layerIndex(layer string) (int, bool) {
 // by: the process-keyed digest of the authenticated username (redact.User).
 // The hit sites, the D2 sink and the /refreshes handler all derive it here, so
 // the two sides cannot drift. It stays in memory; nothing logs it.
-func StaleSubject(username string) string { return redact.User(username) }
+func StaleSubject(username string) string {
+	if f := staleSubjectHookForTest.Load(); f != nil {
+		(*f)()
+	}
+	return redact.User(username)
+}
+
+// staleSubjectHookForTest observes every derivation of a subject, at the digest
+// itself: #1134 pins that a fresh armed hit derives none, and a counter above
+// this function cannot see a caller that reaches it directly. Atomic: the
+// refresher's goroutines can derive one while an arm installs it. TEST-ONLY
+// (nil in production).
+var staleSubjectHookForTest atomic.Pointer[func()]
+
+// SetStaleSubjectHookForTest installs (nil clears) the derivation hook.
+// TEST-ONLY.
+func SetStaleSubjectHookForTest(fn func()) (restore func()) {
+	var p *func()
+	if fn != nil {
+		p = &fn
+	}
+	prev := staleSubjectHookForTest.Swap(p)
+	return func() { staleSubjectHookForTest.Store(prev) }
+}
 
 // staleServe is one open stale serve.
 type staleServe struct {
