@@ -452,6 +452,16 @@ kill_tree() {
   for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
   kill "-$sig" "$pid" 2>/dev/null || true
 }
+# halt_tree <pid>: TERM a tree none of which can react to it: each process is frozen before its
+# children are signalled, so a step whose command just died cannot start the next one, which
+# kill_tree's walk would miss (a collect, stopped in the teardown, ran on into the publish: #1194).
+halt_tree() {
+  local pid="$1" c
+  kill -STOP "$pid" 2>/dev/null || return 0
+  for c in $(pgrep -P "$pid" 2>/dev/null); do halt_tree "$c"; done
+  kill -TERM "$pid" 2>/dev/null || true
+  kill -CONT "$pid" 2>/dev/null || true
+}
 # At its bound the watchdog stops the command's whole tree; stopping the watchdog stops its own
 # sleep (its TERM trap), so neither outlives the call. BOUNDED_PIDS names the call in flight:
 # a run that leaves in the middle of one (a signal or a pair stop fires its trap inside `wait`)
@@ -496,7 +506,7 @@ capped() {
     if (( waited >= secs )) || [[ "$TD_SIGNALED" == "1" ]]; then
       CAPPED_HIT=1
       log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing"
-      kill_tree TERM "$CAPPED_PID"   # the whole tree: a collect left running would write into OUT during the publish (#1194)
+      halt_tree "$CAPPED_PID"
       break
     fi
     sleep 1 || true      # a process-group SIGINT kills sleep (130): never fatal here
@@ -511,7 +521,7 @@ on_teardown_signal() {
   TD_SIGNALED=1
   log "signal during teardown: collect/diagnostics cut short; proceeding to gke-down"
   if [[ -n "$CAPPED_PID" ]]; then
-    kill_tree TERM "$CAPPED_PID"   # the whole tree: a collect left running would write into OUT during the publish (#1194)
+    halt_tree "$CAPPED_PID"
   fi
 }
 
@@ -565,7 +575,7 @@ teardown() {
   stop_inflight_bounded   # a bounded call the signal or pair stop interrupted (#1170)
   # and a capped one (a step's collect): left running it would write into OUT beside the
   # teardown's own collect, and during the publish (#1194)
-  if [[ -n "$CAPPED_PID" ]]; then kill_tree TERM "$CAPPED_PID"; CAPPED_PID=""; fi
+  if [[ -n "$CAPPED_PID" ]]; then halt_tree "$CAPPED_PID"; CAPPED_PID=""; fi
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   declare -F stop_sampler >/dev/null && stop_sampler top_boot
