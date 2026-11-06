@@ -241,6 +241,8 @@ func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
 		`${ "/v2" + (if (.id // "") == "" then "/" else "/" + .id end) }`,
 		`${ (if (.id // "") == "" then "/" else "/" + .id end) }`,
 		`${ (if (.id // "") == "" then "/?q=1" else "/" + .id end) }`,
+		// No '/' at all: the path is a query, and that reads the root.
+		`${ (if (.id // "") == "" then "?q=1" else "/" + .id end) }`,
 		// A branch's text is read piece by piece, wherever it lands.
 		`${ "/v2/" + (if (.id // "") == "" then "/x" else .id end) }`,
 		`${ (if (.id // "") == "" then "/v2//x" else "/v2/" + .id end) }`,
@@ -296,6 +298,7 @@ func TestIssue1185_TheBranchThatHoldsItsSlashLeavesNoSegmentEmpty(t *testing.T) 
 		wantPath(t, `${ "/a?q=1" + (if (.p // "") == "" then "" else "&r=" + .p end) }`, data, "/a?q=1")
 		wantPath(t, `${ "/a?q=" + (if (.p // "") == "" then "" else .p end) }`, data, "/a?q=")
 		wantPath(t, `${ "/a#" + (if (.p // "") == "" then "" else .p end) }`, data, "/a#")
+		wantPath(t, `${ "/a?q=1" + (if (.p // "") == "" then "&r=//" else .p end) }`, data, "/a?q=1&r=//")
 	}
 	wantPath(t, `${ "/a" + (if (.p // "") == "" then "" else "/" + .p end) }`, map[string]any{"p": "b"}, "/a/b")
 
