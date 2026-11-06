@@ -1,6 +1,6 @@
 # The portal stages #1185 names, one from each class of the measurement on the
 # issue: `path` and `dependsOn` as helm template renders them from portal tag
-# 1.8.93 (889f64acff0e0e11d45f907531ee952457e6f40d), charts compositions-page
+# 1.8.93 (commit 9c9ad2921eb5ed0c156af5b1f53fd443551ef1ff), charts compositions-page
 # and dashboard-page, unedited. The rest of each stage is not read here.
 - ra: composition-architecture
   stage: objs
