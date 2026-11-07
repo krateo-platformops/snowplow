@@ -48,6 +48,11 @@ func k1214RealRights(t *testing.T, a psArm) (*httptest.Server, *k1214Wire) {
 	w := &k1214Wire{}
 	want := "/api/v1/namespaces/" + psTargetNS + "/" + a.target.Resource + "/" + psTargetObj
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// Discovery and the CRD, which a widget's real status validation reads:
+		// neither carries the rights this fake judges.
+		if h643ServeDiscovery(rw, r.URL.Path) {
+			return
+		}
 		rw.Header().Set("Content-Type", "application/json")
 		if r.URL.Path != want {
 			rw.WriteHeader(http.StatusNotFound)
@@ -60,7 +65,7 @@ func k1214RealRights(t *testing.T, a psArm) (*httptest.Server, *k1214Wire) {
 			body, _ := json.Marshal(map[string]any{
 				"apiVersion": "v1", "kind": "ConfigMap",
 				"metadata": map[string]any{"name": psTargetObj, "namespace": psTargetNS},
-				"data":     map[string]any{"password": psWireValue(a)},
+				"data":     map[string]any{"password": psWireValue(a) + k1214DialMark},
 			})
 			_, _ = rw.Write(body)
 		case "tok-" + psBob:
@@ -77,6 +82,12 @@ func k1214RealRights(t *testing.T, a psArm) (*httptest.Server, *k1214Wire) {
 }
 
 type k1214Wire struct{ aliceOK, bob403, other atomic.Int64 }
+
+// k1214DialMark follows the sentinel on the wire only, so a body can be told from
+// the object the informer holds: the content cell is filled from the informer by
+// design, un-gated and gated per user at serve, so the sentinel alone in a cell is
+// not the defect. This mark in a cell is: alice's dial reached a shared cell.
+const k1214DialMark = "-from-the-dial"
 
 // k1214PublishPartial publishes full without its RoleBindings and unsynced: the
 // shape of a rebuild that read the indexers before the initial LIST completed.
