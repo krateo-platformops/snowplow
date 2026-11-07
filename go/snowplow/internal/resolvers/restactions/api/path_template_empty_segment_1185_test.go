@@ -730,6 +730,11 @@ func TestIssue1185_NothingBeforeAQueryDialsNoRoot(t *testing.T) {
 		{`${ (if (.x // "") == "" then "" else .x end) + "?q=1" }`, "/v", false},
 		{`${ "" + "?q=1" }`, "", false},
 		{`${ "" + "#f" }`, "", false},
+		// The same root with its '/' written out, `DELETE /` with the credential.
+		{`${ ` + opt + ` + "/" }`, "/v/", true},
+		{`${ ` + opt + ` + "/?q=1" }`, "/v/", true},
+		{`${ "" + "/" }`, "", false},
+		{`${ "" + "/?q=1" }`, "", false},
 	} {
 		for _, target := range targets1185 {
 			for _, verb := range []string{http.MethodGet, http.MethodDelete} {

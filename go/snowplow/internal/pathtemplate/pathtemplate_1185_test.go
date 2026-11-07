@@ -250,6 +250,17 @@ func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
 		`${ "" + "?q=1" }`,
 		`${ "" + "#f" }`,
 		`${ "" + (if (.id // "") == "" then "?q=1" else "/" + .id end) }`,
+		// The same request with its root written out: `?q=1` and `/?q=1` are one
+		// URL, and nothing follows the root.
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "/" }`,
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "//" }`,
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "/?q=1" }`,
+		`${ (if (.id // "") == "" then "" else "/" + .id end) + "/#f" }`,
+		`${ "" + "/" }`,
+		`${ "" + "/?q=1" }`,
+		// Nothing at all.
+		`${ (if (.id // "") == "" then "" else "/" + .id end) }`,
+		`${ "" }`,
 		// A branch's text is read piece by piece, wherever it lands.
 		`${ "/v2/" + (if (.id // "") == "" then "/x" else .id end) }`,
 		`${ (if (.id // "") == "" then "/v2//x" else "/v2/" + .id end) }`,
@@ -267,6 +278,8 @@ func TestIssue1185_AnExpressionThatLeavesASegmentEmptyIsRefused(t *testing.T) {
 	wantPath(t, `${ (if (.id // "") == "" then "/v2/tickets/" else "/v2/tickets/" + .id end) }`, map[string]any{"id": "42"}, "/v2/tickets/42")
 	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "?q=1" }`, map[string]any{"id": "42"}, "/42?q=1")
 	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "#f" }`, map[string]any{"id": "42"}, "/42#f")
+	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "/" }`, map[string]any{"id": "42"}, "/42/")
+	wantPath(t, `${ (if (.id // "") == "" then "" else "/" + .id end) + "/?q=1" }`, map[string]any{"id": "42"}, "/42/?q=1")
 }
 
 // What the extended ruling leaves valid. The portal's shape holds its '/' inside
@@ -303,9 +316,7 @@ func TestIssue1185_TheBranchThatHoldsItsSlashLeavesNoSegmentEmpty(t *testing.T) 
 		wantPath(t, `${ (if (.p // "") == "" then "" else .p end) + "/b" }`, data, "/b")
 		wantPath(t, `${ `+opt+` + "/b?q=1" }`, data, "/b?q=1")
 		wantPath(t, `${ `+opt+` + "/b#f" }`, data, "/b#f")
-		wantPath(t, `${ `+opt+` + "/?q=1" }`, data, "/?q=1")
-		wantPath(t, `${ `+opt+` }`, data, "")
-		wantPath(t, `${ "" }`, data, "")
+		wantPath(t, `${ `+opt+` + "/b/" }`, data, "/b/")
 		// In the query or the fragment an `if` writes what it likes.
 		wantPath(t, `${ "/a?q=1" + (if (.p // "") == "" then "" else "&r=" + .p end) }`, data, "/a?q=1")
 		wantPath(t, `${ "/a?q=" + (if (.p // "") == "" then "" else .p end) }`, data, "/a?q=")

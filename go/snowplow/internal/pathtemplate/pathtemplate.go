@@ -48,10 +48,10 @@
 //     contributes, piece by piece, as segments() reads a declared value;
 //   - nothing precedes the root, so an `if` or a `""` that writes nothing before
 //     the path's first `/` leaves no segment empty: `(if .p == "" then "" else
-//     "/" + .p end) + "/b"` is fine. It needs that `/`: followed by a `?` or a `#`
-//     there is no path, and the request reads the endpoint's root, so it is
-//     refused. A value there was meant to be text, and is refused either way
-//     (`.base + "/b"`);
+//     "/" + .p end) + "/b"` is fine. It needs a path after that `/`: with none,
+//     as before a `?`, a `#`, or a bare `/`, the request reads the endpoint's
+//     root, so it is refused. A value there was meant to be text, and is refused
+//     either way (`.base + "/b"`);
 //   - an expression is empty when it renders nothing. Whitespace renders `%20`:
 //     like the dot check, this rule compares the segment exactly and trims
 //     nothing. A dial that takes no escape refuses it (validInterpolatedPath).
@@ -854,10 +854,17 @@ func assemble(v any) (string, error) {
 	if hasDotSegment(out) {
 		return "", &RefusedError{Reason: ReasonDotSegment}
 	}
-	if segs.emptied || (segs.unrooted && strings.IndexAny(out, "?#") == 0) {
+	if segs.emptied || (segs.unrooted && namesNoPath(out)) {
 		return "", &RefusedError{Reason: ReasonEmptySegment}
 	}
 	return out, nil
+}
+
+// namesNoPath reports whether a rendered URI has nothing in its path part but
+// slashes. Sent, it reads the endpoint's root: `?q=1` and `/?q=1` are one request.
+func namesNoPath(uri string) bool {
+	path, _, _ := apicall.SplitURI(uri)
+	return strings.Trim(path, "/") == ""
 }
 
 // segmentWatch follows the path part as assemble writes it, piece by piece, and
@@ -870,7 +877,7 @@ type segmentWatch struct {
 	spliced bool // an expression contributed to the current segment
 	emptied bool // a finished segment had an expression in it and holds nothing
 	// unrooted: an expression wrote nothing before the path began. That leaves no
-	// segment empty only if a path follows: a '?' or '#' first reads the root.
+	// segment empty only if a path follows the root (namesNoPath).
 	unrooted bool
 }
 

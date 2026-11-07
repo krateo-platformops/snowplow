@@ -249,11 +249,11 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		return out, false, skipReason{class: reasonJQPathError, detail: "path jq expression errored: " + pathErr.Error()}
 	}
 	// #1123 — a template that rendered no path names nothing to call: it produced
-	// no output (`${ empty }`), or an `if` or a `""` wrote nothing and no text
-	// followed (a value that rendered empty is refused above, #1185). Dialled, it
-	// would read the endpoint's root with the stage's credential. It is the #288
-	// collapse at its limit, whatever the stage dials. A stage with no template
-	// (in.Path == "") has no value to lose and keeps its meaning.
+	// no output (`${ empty }`); an expression that rendered empty is refused above
+	// (#1185). Dialled, it would read the endpoint's root with the stage's
+	// credential. It is the #288 collapse at its limit, whatever the stage dials. A
+	// stage with no template (in.Path == "") has no value to lose and keeps its
+	// meaning.
 	if path == "" && in.Path != "" {
 		return out, false, skipReason{class: reasonEmptyInterp, detail: "the path template rendered no path (#1123)", collapsed: true}
 	}
