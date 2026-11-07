@@ -91,7 +91,9 @@ lookup fires.
   the `krateo.io/external-cache-ttl-seconds` annotation
   (`internal/handlers/dispatchers/external_ttl.go`), which converts the decline into a
   bounded-staleness Put under the unchanged per-binding `widgets` key (hard-capped at 120s,
-  `ExternalTTL`-marked so the entry never arms a `/refreshes` subscription). Correctness basis for
+  `ExternalTTL`-marked so the entry never arms a `/refreshes` subscription). It applies only when
+  every touch carried nothing of the requester: a named endpoint's own credential, with no
+  requester bearer (#1221). Correctness basis for
   that path is time-bounded staleness, not dep-edge invalidation.
 - **Toggle-able / removable** per ADR 0004: the conversion is on the live external path; under
   `CACHE_ENABLED=false` the same fetch runs (the cache toggle is orthogonal).

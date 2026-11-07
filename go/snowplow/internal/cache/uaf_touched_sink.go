@@ -30,11 +30,10 @@
 //     refilter bumps only those, never this one. The outer Put is declined
 //     instead by the EXTERNAL-touched gate: the dial is a branch-E send, which
 //     bumps the ExternalTouchedSink (restactions/api resolve.go) and
-//     PutGateVerdict declines a genuine external touch. EXCEPTION: a widget
-//     that opts into krateo.io/external-cache-ttl-seconds turns an
-//     external-only decline into a store (PutVerdict.WithExternalTTL, under the
-//     per-binding widgets key for at most 120 s), so for that widget nothing in
-//     this file declines the loopback chain.
+//     PutGateVerdict declines a genuine external touch. The opt-in
+//     krateo.io/external-cache-ttl-seconds does not lift that decline here: the
+//     self-loopback carries the requester's bearer, so it is not a third-party
+//     touch (PutVerdict.WithExternalTTL, #1221).
 // That a refilter run marks the ctx it runs under is asserted by
 // TestA4_RefilterBumpsUAFTouchedSink (internal/resolvers/restactions/api). No
 // arm drives a nested in-process resolve against a sink.

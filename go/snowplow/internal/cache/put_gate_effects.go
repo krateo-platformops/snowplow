@@ -35,8 +35,10 @@ type PutGateEffects struct {
 	ForbiddenStage    int64
 	ForbiddenExternal int64
 	External          int64
-	DeclaredWrite     bool
-	UAF               int64
+	// ExternalThirdParty is how many of External carried nothing of the requester.
+	ExternalThirdParty int64
+	DeclaredWrite      bool
+	UAF                int64
 }
 
 // PutGateCapture holds the child sinks a producing resolve runs under.
@@ -77,14 +79,15 @@ func (c *PutGateCapture) Effects() PutGateEffects {
 	}
 	stage, err := c.stage.Sample()
 	return PutGateEffects{
-		StageErrors:       c.stage.Count(),
-		StageSampleStage:  stage,
-		StageSampleErr:    err,
-		ForbiddenStage:    c.forbidden.Stage(),
-		ForbiddenExternal: c.forbidden.External(),
-		External:          c.external.Count(),
-		DeclaredWrite:     c.external.DeclaredWrite(),
-		UAF:               c.uaf.Count(),
+		StageErrors:        c.stage.Count(),
+		StageSampleStage:   stage,
+		StageSampleErr:     err,
+		ForbiddenStage:     c.forbidden.Stage(),
+		ForbiddenExternal:  c.forbidden.External(),
+		External:           c.external.Count(),
+		ExternalThirdParty: c.external.thirdParty.Load(),
+		DeclaredWrite:      c.external.DeclaredWrite(),
+		UAF:                c.uaf.Count(),
 	}
 }
 
@@ -111,6 +114,7 @@ func (e PutGateEffects) Replay(ctx context.Context) {
 			cur.declaredWrite.Store(true)
 		}
 		cur.count.Add(e.External)
+		cur.thirdParty.Add(e.ExternalThirdParty)
 	}
 	for cur := UAFTouchedSinkFromContext(ctx); cur != nil; cur = cur.parent {
 		cur.count.Add(e.UAF)

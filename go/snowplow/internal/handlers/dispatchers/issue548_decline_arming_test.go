@@ -243,7 +243,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user:        h1User,
 			annotations: map[string]string{externalCacheTTLAnnotation: "30"},
 			during: func(t *testing.T, ctx context.Context, _ string) {
-				cache.ExternalTouchedSinkFromContext(ctx).Bump()
+				cache.ExternalTouchedSinkFromContext(ctx).BumpThirdParty()
 			},
 			cellStored: true,
 		},
