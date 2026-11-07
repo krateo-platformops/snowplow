@@ -623,7 +623,7 @@ func (h *k547Harness) resolve(ctx context.Context, opts widgets.ResolveOptions) 
 		}
 	}
 	if h.external.Load() {
-		cache.ExternalTouchedSinkFromContext(ctx).Bump()
+		cache.ExternalTouchedSinkFromContext(ctx).BumpThirdParty()
 	}
 	if changed && !bg {
 		h.maybeCustomerExternal(ctx)

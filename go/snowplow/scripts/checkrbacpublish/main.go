@@ -20,6 +20,18 @@
 // cannot slip through. rbacSnap may be read with Load anywhere. It is parsed, not
 // built, so every build tag is covered. Test files and testdata/ are skipped.
 //
+// THE SLOT IS HELD, NOT JUST NAMED (#1210's review). A chain that is all present
+// can still stop holding the slot, so two more rules read how it is used:
+//   - every CompareAndSwap of the slot must decide what runs: `if !CAS { ...return }`
+//     or `for !CAS`. One whose result is dropped lets two loops run at once. Only
+//     the functions that take the slot may call it at all;
+//   - the loop releases the slot after it drains. Released before, a rebuild runs
+//     with the slot free.
+//
+// WHAT THIS STILL DOES NOT SEE: a `go` statement around a link of the chain, or a
+// published snapshot mutated in place through Load. It reads references and the
+// slot's use, not what runs concurrently.
+//
 // TEST SEAMS. PublishRBACSnapshotForTest and DisableRBACSnapshotForTest Store
 // outside the slot by design. They may only be used from a function whose name
 // ends in ForTest; production code reaching one is a finding.
@@ -64,6 +76,9 @@ var onlyFrom = map[string][]string{
 	loop:    {schedule, publish},
 }
 
+// slotTakers are the only functions that may take the writer slot.
+var slotTakers = map[string]bool{schedule: true, publish: true, loop: true}
+
 // storeSeams may Store outside the slot, and may be used only by test-only code.
 var storeSeams = map[string]bool{
 	"PublishRBACSnapshotForTest": true,
@@ -85,6 +100,8 @@ type walker struct {
 	refs       map[string]map[string]token.Pos
 	cas        map[string]token.Pos
 	releases   map[string]int
+	// firstRelease is where the loop first releases the slot.
+	firstRelease token.Pos
 }
 
 func newWalker() *walker {
@@ -182,6 +199,9 @@ func (w *walker) slotMethod(s source, x *ast.SelectorExpr, fn string) {
 	switch x.Sel.Name {
 	case "Load":
 	case "CompareAndSwap":
+		if !slotTakers[fn] {
+			w.reportf(s.fset, x.Pos(), "%s.CompareAndSwap in %s: only %s, %s and %s take the writer slot (#1206)", slotVar, describe(fn), schedule, publish, loop)
+		}
 		if _, seen := w.cas[fn]; !seen {
 			w.cas[fn] = x.Pos()
 		}
@@ -189,10 +209,66 @@ func (w *walker) slotMethod(s source, x *ast.SelectorExpr, fn string) {
 		if fn != loop {
 			w.reportf(s.fset, x.Pos(), "%s.Store in %s: only %s may release the writer slot (#1206)", slotVar, describe(fn), loop)
 		}
+		if fn == loop && (w.firstRelease == token.NoPos || x.Pos() < w.firstRelease) {
+			w.firstRelease = x.Pos()
+		}
 		w.releases[fn]++
 	default:
 		w.reportf(s.fset, x.Pos(), "%s.%s in %s: the writer slot is taken by CompareAndSwap and released by %s (#1206)", slotVar, x.Sel.Name, describe(fn), loop)
 	}
+}
+
+// isSlotCAS reports whether e is a call of the slot's CompareAndSwap.
+func isSlotCAS(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "CompareAndSwap" {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == slotVar
+}
+
+// negatedCAS returns the CAS call when cond is exactly !CAS.
+func negatedCAS(cond ast.Expr) ast.Expr {
+	u, ok := cond.(*ast.UnaryExpr)
+	if !ok || u.Op != token.NOT || !isSlotCAS(u.X) {
+		return nil
+	}
+	return u.X
+}
+
+// casDecides checks that every slot CAS in fn decides what runs: the condition of
+// `if !CAS { ...return }` or of `for !CAS`. Anything else drops the result, and a
+// loser would carry on as if it held the slot.
+func (w *walker) casDecides(s source, fn *ast.FuncDecl) {
+	decided := map[ast.Expr]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.IfStmt:
+			if c := negatedCAS(x.Cond); c != nil && len(x.Body.List) > 0 {
+				if _, ret := x.Body.List[len(x.Body.List)-1].(*ast.ReturnStmt); ret {
+					decided[c] = true
+				}
+			}
+		case *ast.ForStmt:
+			if x.Cond != nil {
+				if c := negatedCAS(x.Cond); c != nil {
+					decided[c] = true
+				}
+			}
+		}
+		return true
+	})
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if e, ok := n.(ast.Expr); ok && isSlotCAS(e) && !decided[e] {
+			w.reportf(s.fset, e.Pos(), "%s.CompareAndSwap in %s does not decide what runs: it must be `if !CAS { ...return }` or `for !CAS`, or a loser carries on without the slot (#1206)", slotVar, fn.Name.Name)
+		}
+		return true
+	})
 }
 
 // check runs every rule over srcs and returns the findings, sorted. An empty
@@ -205,6 +281,9 @@ func check(srcs []source) []string {
 			case *ast.FuncDecl:
 				if decl.Body != nil {
 					w.visit(s, decl.Body, decl.Name.Name)
+					if slotTakers[decl.Name.Name] {
+						w.casDecides(s, decl)
+					}
 				}
 			case *ast.GenDecl:
 				for _, sp := range decl.Specs {
@@ -253,6 +332,9 @@ func (w *walker) requireChain() {
 	}
 	if w.releases[loop] == 0 {
 		missing("%s never releases the slot", loop)
+	}
+	if use, ok := w.refs[drain][loop]; ok && w.firstRelease != token.NoPos && w.firstRelease < use {
+		w.findings = append(w.findings, fmt.Sprintf("%s releases the writer slot before it drains: a rebuild would run with the slot free (#1206)", loop))
 	}
 }
 
@@ -310,8 +392,16 @@ func publishRBACSnapshotUnderSlot(rw int) {
 }
 
 func runRBACRebuildLoop(rw int) {
-	drainRBACRebuild(rw)
-	rbacRebuildLock.Store(false)
+	for {
+		drainRBACRebuild(rw)
+		rbacRebuildLock.Store(false)
+		if !rbacRebuildDirty.Load() {
+			return
+		}
+		if !rbacRebuildLock.CompareAndSwap(false, true) {
+			return
+		}
+	}
 }
 
 func drainRBACRebuild(rw int) { rebuildRBACSnapshot(rw) }
@@ -354,7 +444,13 @@ func defects() []defect {
 		{"a seam used unqualified", "PublishRBACSnapshotForTest used from other", add("package cache\nfunc other() { PublishRBACSnapshotForTest() }\n")},
 		{"entering the loop with no slot", "does not take the slot", swap("\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n", "")},
 		{"entering the loop before the slot", "before it takes the slot", swap("\tfor !rbacRebuildLock.CompareAndSwap(false, true) {\n\t}\n\trunRBACRebuildLoop(rw)\n", "\trunRBACRebuildLoop(rw)\n\tfor !rbacRebuildLock.CompareAndSwap(false, true) {\n\t}\n")},
-		{"a loop that never releases", "never releases the slot", swap("\trbacRebuildLock.Store(false)\n", "")},
+		{"a loop that never releases", "never releases the slot", swap("\t\trbacRebuildLock.Store(false)\n", "")},
+		{"the loop releasing before it drains", "releases the writer slot before it drains", swap("\t\tdrainRBACRebuild(rw)\n\t\trbacRebuildLock.Store(false)\n", "\t\trbacRebuildLock.Store(false)\n\t\tdrainRBACRebuild(rw)\n")},
+		{"the CAS result ignored", "does not decide what runs", swap("\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n\tgo runRBACRebuildLoop(rw)\n", "\trbacRebuildLock.CompareAndSwap(false, true)\n\tgo runRBACRebuildLoop(rw)\n")},
+		{"the CAS result assigned away", "does not decide what runs", swap("\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n\tgo runRBACRebuildLoop(rw)\n", "\t_ = rbacRebuildLock.CompareAndSwap(false, true)\n\tgo runRBACRebuildLoop(rw)\n")},
+		{"a losing CAS that carries on", "does not decide what runs", swap("\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n\tgo runRBACRebuildLoop(rw)\n", "\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\tprintln()\n\t}\n\tgo runRBACRebuildLoop(rw)\n")},
+		{"the CAS inverted", "does not decide what runs", swap("\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n\tgo runRBACRebuildLoop(rw)\n", "\tif rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n\tgo runRBACRebuildLoop(rw)\n")},
+		{"the slot taken elsewhere", "only scheduleRBACRebuild", add("package cache\nfunc other() {\n\tif !rbacRebuildLock.CompareAndSwap(false, true) {\n\t\treturn\n\t}\n}\n")},
 		{"the chain renamed away", "was not seen whole", swap("func rebuildRBACSnapshot(rw int) { rbacSnap.Store(nil) }", "func renamedRebuild(rw int) { rbacSnap.Load() }")},
 		{"nothing scanned", "was not seen whole", nil},
 	}
