@@ -530,7 +530,7 @@ on_teardown_signal() {
 # own bound, not `capped`, which stops at a signal; KILL, since the shield ignores TERM, so a hung
 # disk never holds gke-down. A failure says so and returns non-zero; the teardown goes on.
 publish_evidence() {
-  local stage="$1" err="$OUT/.evidence-publish.log" pid waited=0 rc=0
+  local stage="$1" err="$OUT/.evidence-publish.log" pid t0 rc=0
   local cmd=(python3 -m bench.evidence publish --src "$OUT" --dest "$EVIDENCE_DIR"
              --run-id "$EVIDENCE_RUN_ID" --stage "$stage" --require run.log)
   [[ -f "$VERDICT_MARK" ]] && cmd+=(--require verdict.json)
@@ -541,15 +541,17 @@ publish_evidence() {
     if [[ "${BENCH_606_HOLD_IN:-}" == "evidence" ]]; then sleep "${BENCH_606_HOLD_S:-600}"; fi
     exec "${cmd[@]}" ) > "$err" 2>&1 &
   pid=$!
+  # the cap on the real clock: a count of 1 s sleeps runs slow under load, and rounds every copy up
+  # to the next second, twice a teardown
+  t0=$SECONDS
   while kill -0 "$pid" 2>/dev/null; do
-    if (( waited >= EVIDENCE_CAP_S )); then
+    if (( SECONDS - t0 >= EVIDENCE_CAP_S )); then
       kill_tree KILL "$pid"
       rc=124
       echo "stopped at its cap of ${EVIDENCE_CAP_S}s" >> "$err"
       break
     fi
-    sleep 1 || true      # a process-group SIGINT kills sleep (130): never fatal here
-    waited=$(( waited + 1 ))
+    sleep 0.2 || true    # a process-group SIGINT kills sleep (130): never fatal here
   done
   (( rc != 0 )) || wait "$pid" || rc=$?
   if (( rc == 0 )); then
