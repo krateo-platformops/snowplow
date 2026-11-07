@@ -337,6 +337,8 @@ func TestIssue681_R1_DenialOnlyRefresh_IsPut_WindowClosesFresh(t *testing.T) {
 }
 
 func TestIssue681_R2_GrantRotates_NextRefreshPutsFuller(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
 	denied := e.body(t)

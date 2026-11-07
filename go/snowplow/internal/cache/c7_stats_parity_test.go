@@ -147,6 +147,8 @@ func registerAllExpvarForTest() {
 }
 
 func TestC7_Expvar_PublishesEveryDerivedStat(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	registerAllExpvarForTest()
 	all := expvarVars(t)

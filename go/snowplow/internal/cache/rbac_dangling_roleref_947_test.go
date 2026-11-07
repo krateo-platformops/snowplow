@@ -718,6 +718,8 @@ func (i flipIndexer947) List() []interface{} {
 // read an empty ClusterRole set, so it must not claim Synced, and the binding
 // whose role exists must not be reported as dangling.
 func TestDanglingRoleRef947_SyncedReadBeforeIndexers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	ResetDanglingRoleRefsForTest()
 	t.Cleanup(ResetDanglingRoleRefsForTest)
 	sink := captureLogs947(t)

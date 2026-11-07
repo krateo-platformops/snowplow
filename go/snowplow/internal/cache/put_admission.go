@@ -39,11 +39,11 @@
 // boot unit is refused and left cold (#506).
 //
 // THE COST. Every write in the window is refused, so the window serves uncached.
-// Once #1231 lands (Ready waits for a complete snapshot) that window is boot
-// before Ready, where only the prewarm runs. Until then a pod whose RBAC lists
-// take longer than 60 s can go Ready inside it. snowplow_l1_put_declined_rbac_incomplete
-// counts every refused write by writer and by cell class, so 057 and run 22 can
-// read it.
+// Readiness waits for the complete snapshot (#1231), so no customer call is in
+// that window, and the prewarm and the seeds wait for the same publish before
+// they resolve (rbac_complete_wait.go), so on a healthy boot nothing is refused.
+// snowplow_l1_put_declined_rbac_incomplete counts every refused write by writer
+// and by cell class, so 057 and run 22 can read it.
 
 package cache
 
