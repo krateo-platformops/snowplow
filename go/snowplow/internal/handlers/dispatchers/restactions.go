@@ -167,7 +167,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// against apiserver, which enforces RBAC inline.
 	if !cache.Disabled() {
 		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
-			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
+			log.WarnContext(req.Context(), "RESTAction dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
 				slog.String("gvr", got.GVR.String()),
@@ -338,7 +338,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
-		log.Error("unable to add apis to scheme",
+		log.ErrorContext(req.Context(), "unable to add apis to scheme",
 			slog.Any("err", err))
 		response.InternalError(wri, err)
 		return
@@ -347,7 +347,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	var cr v1.RESTAction
 	err = runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr)
 	if err != nil {
-		log.Error("unable to convert unstructured to typed rest action",
+		log.ErrorContext(req.Context(), "unable to convert unstructured to typed rest action",
 			slog.String("name", got.Unstructured.GetName()),
 			slog.String("namespace", got.Unstructured.GetNamespace()),
 			slog.Any("err", err))
@@ -437,6 +437,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// The dispatched CR was fetched before this sink existed: a fetch that left
+	// snowplow under the requester's credential marks it now (objects.Result).
+	if got.RequesterDialled {
+		extTouchedSink.Bump()
+	}
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
@@ -501,7 +506,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		if staleWritePoint(r, wri, req, staleSink, false) {
 			return
 		}
-		log.Error("unable to resolve rest action",
+		log.ErrorContext(ctx, "unable to resolve rest action",
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
 			slog.Any("err", err))
@@ -525,7 +530,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	encoded, err := encodeResolvedJSON(res)
 	enc.End()
 	if err != nil {
-		log.Error("unable to encode rest action response",
+		log.ErrorContext(ctx, "unable to encode rest action response",
 			slog.String("name", cr.Name),
 			slog.String("namespace", cr.Namespace),
 			slog.Any("err", err))
@@ -640,7 +645,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// wrong content the C4 terminal semantics and the C5 lifetime bound
 			// exist to keep OUT of L1, and a second, parallel TTL layer for it was
 			// one more mechanism to reason about for no measured gain.
-			log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
+			log.WarnContext(ctx, "RESTAction served with per-item stage error(s); declining to cache the partial result",
 				slog.String("name", cr.Name),
 				slog.String("namespace", cr.Namespace),
 				slog.Int64("stage_errors", stageErrSink.Count()),
@@ -656,7 +661,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// enters the DepTracker. BumpExternalSkippedPut is the process-wide
 			// "did the gate fire?" falsifier.
 			cache.BumpExternalSkippedPut()
-			log.Warn("RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+			log.WarnContext(ctx, "RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
 				slog.String("name", cr.Name),
 				slog.String("namespace", cr.Namespace),
 				slog.Int64("external_touches", extTouchedSink.Count()),
@@ -666,7 +671,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// Any other decline: today only cache.PutReasonUnobserved, a verdict
 			// over Put-gate sinks that were not all installed on the resolve. It
 			// admits nothing (#912 delta-3 item 3); never read as another reason.
-			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
 				slog.String("reason", string(verdict.Reason())),
 				slog.String("effect", "body served; not persisted"),
 			)
@@ -738,7 +743,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// registered BEFORE recording the dep. Without this, a
 				// previously-unseen RestAction GVR would record a forward
 				// edge whose DELETE/UPDATE events the watcher never wires.
-				ensureWatcherInformerForGVR(got.GVR)
+				ensureWatcherInformerForGVR(ctx, got.GVR)
 				cache.Deps().Record(ctx, cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 
 				// #62: GENUINE cold-dispatch Put (this else-if guarantees a real

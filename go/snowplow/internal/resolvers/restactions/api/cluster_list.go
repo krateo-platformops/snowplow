@@ -55,7 +55,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -274,7 +273,6 @@ func attemptClusterListCollapse(
 		log.Debug("cluster_list.gate_deny.rbac_deny",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.Bool("permit", permit),
 			slog.Any("eval_err", evalErr),
@@ -330,7 +328,6 @@ func attemptClusterListCollapse(
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
-			slog.String("user", redact.User(user.Username)),
 		)
 		return []httpcall.RequestOptions{clusterCall}, true, 0
 	}
@@ -351,7 +348,6 @@ func attemptClusterListCollapse(
 		slog.String("subsystem", "cache"),
 		slog.String("ra_stage", apiCall.Name),
 		slog.String("gvr", gvr.String()),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("effect", "per-NS fallback for this request; async populate scheduled — next request warm"),
 	)
 	return nil, false, 8
@@ -432,7 +428,7 @@ func populateClusterListCellSync(
 	shape, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
 	envelopeOKElapsed := time.Since(shapeStart)
 	if envelopeOKElapsed > shapeCheckSlowThreshold {
-		log.Warn("cluster_list.shape_check.slow",
+		log.WarnContext(ctx, "cluster_list.shape_check.slow",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.Duration("elapsed", envelopeOKElapsed),
@@ -443,7 +439,7 @@ func populateClusterListCellSync(
 	if !shapeOK {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -459,7 +455,7 @@ func populateClusterListCellSync(
 	if decodeErr != "" {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -620,7 +616,7 @@ func populateClusterListCellAsync(
 			<-clusterListAsyncSemaphore
 			clusterListInflightCells.Delete(contentKey)
 			if r := recover(); r != nil {
-				log.Error("cluster_list.cell.async_populate_panic",
+				log.ErrorContext(customerCtx, "cluster_list.cell.async_populate_panic",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),
 					slog.Any("panic", r),

@@ -270,6 +270,11 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		if st, ok := credhttp.BudgetStatus(err); ok {
 			return st, nil, "", redErr
 		}
+		// #1131 — the destination policy refused the address: 502
+		// DestinationRefused, with the refusal's own text (no URL in it).
+		if st, ok := credhttp.DestinationStatus(err); ok {
+			return st, nil, "", redErr
+		}
 		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()

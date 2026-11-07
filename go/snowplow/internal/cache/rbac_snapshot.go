@@ -57,6 +57,7 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -270,7 +271,7 @@ func RBACSnapshotMissCount() uint64 {
 // per state change (rbac_dangling_roleref.go) and the evaluator denies
 // silently. Before #947 every evaluation that reached such a binding logged
 // here, so the log volume scaled with traffic.
-func RecordRBACSnapshotMiss(kind, namespace, name string) {
+func RecordRBACSnapshotMiss(ctx context.Context, kind, namespace, name string) {
 	rbacSnapshotMissCount.Add(1)
 	// Snapshot-version sequence number — bumped on every publish —
 	// lets ops correlate a miss-burst with a specific snapshot version
@@ -279,7 +280,7 @@ func RecordRBACSnapshotMiss(kind, namespace, name string) {
 	// #947 — the role and namespace are redact labels, never names in clear
 	// (role names embed tenant usernames); the label matches the role label of
 	// the dangling-roleRef lines.
-	slog.Warn("rbac.evaluate.snapshot.miss",
+	slog.WarnContext(ctx, "rbac.evaluate.snapshot.miss",
 		slog.String("subsystem", "rbac"),
 		slog.String("event", "snapshot.miss"),
 		slog.String("kind", kind),
@@ -453,6 +454,7 @@ func drainRBACRebuild(rw *ResourceWatcher) (panicked bool) {
 			panicked = true
 			rebuildPanicked() // #691: counted; its events stay pending
 			rbacRebuildDirty.Store(true)
+			// log-ctx-waiver: worker: the RBAC snapshot rebuild goroutine
 			slog.Error("cache.rbac.snapshot.rebuild_panic",
 				slog.String("subsystem", "cache"),
 				slog.Any("recovered", r),
@@ -690,13 +692,15 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		// from now. Still: defence-in-depth — degrade-to-deny rather than
 		// silently publish a snapshot whose PublishSeq is the sentinel
 		// "no snapshot stamped yet" value.
+		// log-ctx-waiver: worker: the RBAC snapshot rebuild goroutine
 		slog.Error("cache.rbac.snapshot.publish_seq_wraparound",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "rbacSnapshotPublishSeq wrapped — refusing to publish"))
 		return
 	}
 	rbacSnap.Store(snap)
-	notePublished() // #691
+	notePublished()                 // #691
+	noteRBACSnapshotPublished(snap) // #1231: the first complete snapshot
 	// #947 — report the dangling roleRefs that changed with this publish:
 	// one line per binding that became dangling or stopped being dangling.
 	if snap.Synced {
@@ -971,6 +975,7 @@ func convertUnstructuredCRB(obj interface{}) (*rbacv1.ClusterRoleBinding, bool) 
 	}
 	out := &rbacv1.ClusterRoleBinding{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, out); err != nil {
+		// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 		slog.Warn("cache.rbac.snapshot.unstructured_convert_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", "ClusterRoleBinding"),
@@ -979,6 +984,7 @@ func convertUnstructuredCRB(obj interface{}) (*rbacv1.ClusterRoleBinding, bool) 
 		)
 		return nil, false
 	}
+	// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 	slog.Warn("cache.rbac.snapshot.unstructured_fallback",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", "ClusterRoleBinding"),
@@ -996,6 +1002,7 @@ func convertUnstructuredRB(obj interface{}) (*rbacv1.RoleBinding, bool) {
 	}
 	out := &rbacv1.RoleBinding{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, out); err != nil {
+		// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 		slog.Warn("cache.rbac.snapshot.unstructured_convert_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", "RoleBinding"),
@@ -1005,6 +1012,7 @@ func convertUnstructuredRB(obj interface{}) (*rbacv1.RoleBinding, bool) {
 		)
 		return nil, false
 	}
+	// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 	slog.Warn("cache.rbac.snapshot.unstructured_fallback",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", "RoleBinding"),
@@ -1023,6 +1031,7 @@ func convertUnstructuredCR(obj interface{}) (*rbacv1.ClusterRole, bool) {
 	}
 	out := &rbacv1.ClusterRole{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, out); err != nil {
+		// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 		slog.Warn("cache.rbac.snapshot.unstructured_convert_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", "ClusterRole"),
@@ -1031,6 +1040,7 @@ func convertUnstructuredCR(obj interface{}) (*rbacv1.ClusterRole, bool) {
 		)
 		return nil, false
 	}
+	// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 	slog.Warn("cache.rbac.snapshot.unstructured_fallback",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", "ClusterRole"),
@@ -1048,6 +1058,7 @@ func convertUnstructuredR(obj interface{}) (*rbacv1.Role, bool) {
 	}
 	out := &rbacv1.Role{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, out); err != nil {
+		// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 		slog.Warn("cache.rbac.snapshot.unstructured_convert_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", "Role"),
@@ -1057,6 +1068,7 @@ func convertUnstructuredR(obj interface{}) (*rbacv1.Role, bool) {
 		)
 		return nil, false
 	}
+	// log-ctx-waiver: informer-event: an RBAC informer object converted for an event or a rebuild
 	slog.Warn("cache.rbac.snapshot.unstructured_fallback",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", "Role"),
@@ -1080,6 +1092,7 @@ func rebuildSkipNonTyped(kind string, obj interface{}) {
 		name = uns.GetName()
 		namespace = uns.GetNamespace()
 	}
+	// log-ctx-waiver: worker: the RBAC snapshot rebuild goroutine
 	slog.Warn("cache.rbac.snapshot.skip_non_typed",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", kind),
@@ -1282,6 +1295,7 @@ func AssertRBACSnapshotWired() {
 // Production callers MUST NOT call this. WARN-logged on every
 // invocation so accidental use in non-test code is loud.
 func DisableRBACSnapshotForTest() func() {
+	// log-ctx-waiver: no-prod-caller: a test seam
 	slog.Warn("cache.DisableRBACSnapshotForTest invoked — production code MUST NOT call this",
 		slog.String("subsystem", "cache"),
 	)
@@ -1330,8 +1344,13 @@ func RebuildSubjectIndexesForTest(s *RBACSnapshot) {
 // RebuildRBACSnapshotForTest publicly exposes a synchronous snapshot
 // rebuild for tests. Production code uses `scheduleRBACRebuild` (which
 // is asynchronous, bounded, and dirty-flag-coalesced) — never this.
+//
+// #1206 — through the writer slot, like every other publish. A rebuild outside
+// it races one the informers' events started: that one read the indexers first
+// and can Store last, so a snapshot with a newer PublishSeq and older content
+// overwrites this one until the next rebuild. It is the #687 race, in a test.
 func RebuildRBACSnapshotForTest(rw *ResourceWatcher) {
-	rebuildRBACSnapshot(rw)
+	publishRBACSnapshotUnderSlot(rw)
 }
 
 // WaitInitialRBACPublishForTest blocks until THIS watcher's initial RBAC-snapshot
@@ -1393,6 +1412,17 @@ func rbacInitialPublishReturned(rw *ResourceWatcher) bool {
 	}
 }
 
+// initialPublishBeforeIndexHookForTest runs between the initial complete
+// publish and the deferred bindings-index build. TEST-ONLY: nil in production.
+var initialPublishBeforeIndexHookForTest atomic.Pointer[func()]
+
+// SetInitialPublishBeforeIndexHookForTest installs h and returns the restore.
+// TEST-ONLY.
+func SetInitialPublishBeforeIndexHookForTest(h func()) (restore func()) {
+	prev := initialPublishBeforeIndexHookForTest.Swap(&h)
+	return func() { initialPublishBeforeIndexHookForTest.Store(prev) }
+}
+
 // waitAndPublishInitialRBACSnapshot is the initial-publish goroutine
 // spawned by NewResourceWatcher (Ship B / AC-B.9). It blocks until all
 // 4 RBAC syncCh channels close — the "Servable" signal that the
@@ -1425,6 +1455,7 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	rw.mu.RUnlock()
 
 	if len(channels) == 0 {
+		// log-ctx-waiver: boot: the first RBAC snapshot, published before the pod is ready
 		slog.Warn("cache.rbac.snapshot.initial_publish_skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "no RBAC syncCh channels at NewResourceWatcher end — "+
@@ -1456,8 +1487,12 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	// that read the indexers earlier could overwrite a newer snapshot that
 	// already carried a revoke.
 	publishRBACSnapshotUnderSlot(rw)
+	if h := initialPublishBeforeIndexHookForTest.Load(); h != nil {
+		(*h)() // #1231 arm: between the complete publish and the deferred build
+	}
 	// #686 — the first COMPLETE snapshot: run a bindings-index build that
-	// was requested before any snapshot existed.
+	// was requested before any snapshot existed. #1231: readiness waits for
+	// this function to return, so the build is done before Ready.
 	buildPendingBindingsIndex()
 	slog.Info("cache.rbac.snapshot.initial_publish_done",
 		slog.String("subsystem", "cache"),

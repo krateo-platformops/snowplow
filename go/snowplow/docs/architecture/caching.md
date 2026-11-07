@@ -336,7 +336,10 @@ here is load-bearing:
      *Exception:* a widget annotated `krateo.io/external-cache-ttl-seconds: <n>` opts into a
      bounded-staleness Put with `TTLOverride = min(n, 120s)` (`external_ttl.go`) — general
      opt-in, no hardcoded widget names; it applies to this reason ALONE, never to a declared
-     write or a stage error (#915).
+     write or a stage error (#915), and only when every touch carried nothing of the requester
+     (#1221): a named endpoint's own credential, with no requester bearer. A stage dialled as
+     the requester, `exportJwt` and the self-loopback all stay declined, even beside a
+     third-party stage.
 
    A seed / refresher `SeedResolveMemo` hit (`apiref.Resolve`) replays the producing resolve's
    Put-gate inputs (`put_gate_effects.go`) onto the hitter's sinks, so a memo-served body gets

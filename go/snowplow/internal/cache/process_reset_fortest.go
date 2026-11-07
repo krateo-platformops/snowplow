@@ -90,6 +90,7 @@ func ResetCacheProcessStateForTest() error {
 
 	// 5 — RBAC sub-generation state.
 	ResetRBACSubGenForTest()
+	ResetRBACCompleteForTest() // #1231
 	ResetPendingSubGenBumpsForTest()
 
 	// 5b — #578 lazy LIST-item materialisation counters. Process-global

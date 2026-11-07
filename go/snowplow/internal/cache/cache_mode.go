@@ -293,7 +293,7 @@ func DiscoverMetadataOnlyAnnotations(ctx context.Context, cfg *rest.Config) {
 	}
 	clientset, err := credhttp.APIExtensions(cfg)
 	if err != nil {
-		slog.Warn("cache.discover_metadata_only.client_construct_failed",
+		slog.WarnContext(ctx, "cache.discover_metadata_only.client_construct_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("error", err.Error()),
 			slog.String("hint", "annotation discovery offline; seed-only routing remains active"))
@@ -334,7 +334,7 @@ func discoverMetadataOnlyAnnotationsWithClient(ctx context.Context, lister crdLi
 			Continue: continueToken,
 		})
 		if err != nil {
-			slog.Warn("cache.discover_metadata_only.list_failed",
+			slog.WarnContext(ctx, "cache.discover_metadata_only.list_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("error", err.Error()),
 				slog.Int("discovered_before_failure", discovered),

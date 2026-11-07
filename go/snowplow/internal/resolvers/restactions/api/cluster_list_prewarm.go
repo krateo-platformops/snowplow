@@ -284,7 +284,7 @@ func PrewarmClusterListCells(
 	parallelism int,
 ) (populated int, attempted int, err error) {
 	if apistageStore == nil {
-		log.Warn("cluster_list.prewarm.skipped",
+		log.WarnContext(ctx, "cluster_list.prewarm.skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("reason", "nil apistage store — cache off?"),
 		)
@@ -352,7 +352,7 @@ func PrewarmClusterListCells(
 
 	err = g.Wait()
 	if err == context.DeadlineExceeded || err == context.Canceled {
-		log.Warn("cluster_list.prewarm.timeout",
+		log.WarnContext(ctx, "cluster_list.prewarm.timeout",
 			slog.String("subsystem", "cache"),
 			slog.Int("populated", popOK),
 			slog.Int("attempted", len(roster.Cells)),

@@ -99,6 +99,12 @@ jobs:
       # identity registry.
       - name: Identity-key completeness gate
         run: bash scripts/check_identity_key_completeness.sh
+      # #1206: fail the PR if any production path can store the RBAC snapshot
+      # outside the writer slot. A Store there can land after a rebuild that read
+      # later, so older content goes live and a revoke is undone. The script runs
+      # its own --self-test first: a guard that sees nothing must not pass.
+      - name: RBAC snapshot published only through the writer slot gate
+        run: bash scripts/check_rbac_publish_slot.sh
       # H6 companion: the Ship 0.30.233 defect class — a raw
       # obj.(*unstructured.Unstructured) content-assert inside a literal
       # informer event-handler body — silently drops every CRD event post-H5
@@ -111,6 +117,10 @@ jobs:
       # goes through entry.Raw() / entry.RawLen().
       - name: RawJSON readers are classified gate
         run: bash scripts/check_rawjson_readers.sh
+      # #1184: a WARN or ERROR passes the context in scope, so a request's lines
+      # carry its trace_id; a site with no context carries a classified waiver.
+      - name: WARN/ERROR sites keep their context gate
+        run: bash scripts/check_request_log_context.sh
       # No compiled executable is tracked: a `go build` in scripts/<tool>/ once
       # committed a 7 MB checker binary (#912). Content-based (ELF / Mach-O /
       # PE magic), so a tracked shell script (mode 755) stays allowed.

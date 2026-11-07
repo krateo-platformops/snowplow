@@ -465,6 +465,7 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 		idx.built = false
 		idx.pendingNavigated = append([]schema.GroupVersionResource(nil), navigatedGVRs...)
 		bindingsIndexDeferredTotal.Add(1)
+		// log-ctx-waiver: worker: the debounced index build; a pod-wide index, built for no request
 		slog.Warn("cache.bindings_by_gvr.build_deferred_no_snapshot",
 			slog.String("subsystem", "cache"),
 			slog.Int("navigated", len(navigatedGVRs)),

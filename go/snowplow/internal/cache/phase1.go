@@ -21,7 +21,8 @@
 // Compositions Page DataGrid. After the walk, Phase 1 BLOCKS until every
 // registered informer reaches HasSynced, then signals Phase1Done. The
 // /readyz probe gates pod readiness on Phase1Done so traffic only
-// arrives once the navigated informers are warm.
+// arrives once the navigated informers are warm, and also on the complete
+// RBAC snapshot (#1231, rbac_readiness.go): Phase1Done alone is not Ready.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
 // configured GVR / RESTAction list. The ONLY hardcoded budget is the 5
@@ -273,13 +274,13 @@ func MetaQuerySeeds() []schema.GroupVersionResource {
 //
 // Returns the count newly registered. Nil-receiver / passthrough are
 // no-ops.
-func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
+func (rw *ResourceWatcher) RegisterMetaQuerySeeds(ctx context.Context) int {
 	if rw == nil || rw.mode == modePassthrough {
 		return 0
 	}
 	registered := 0
 	for _, gvr := range MetaQuerySeeds() {
-		added, _ := rw.EnsureResourceType(gvr)
+		added, _ := rw.ensureResourceType(ctx, gvr)
 		if added {
 			registered++
 		}
@@ -374,7 +375,7 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 
 	for pass := 1; ; pass++ {
 		if ctx.Err() != nil {
-			slog.Warn("cache.phase1.sync_wait_incomplete",
+			slog.WarnContext(ctx, "cache.phase1.sync_wait_incomplete",
 				slog.String("subsystem", "cache"),
 				slog.Int("pass", pass),
 				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
@@ -417,7 +418,7 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 		// The outer budget being exhausted is the hard backstop — surface it
 		// as the existing incomplete warning regardless of pass outcome.
 		if ctx.Err() != nil {
-			slog.Warn("cache.phase1.sync_wait_incomplete",
+			slog.WarnContext(passCtx, "cache.phase1.sync_wait_incomplete",
 				slog.String("subsystem", "cache"),
 				slog.Int("pass", pass),
 				slog.Int("informer_count", countBefore),

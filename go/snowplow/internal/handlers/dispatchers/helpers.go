@@ -21,7 +21,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -69,7 +68,7 @@ func fetchObject(req *http.Request) (got objects.Result) {
 }
 
 func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
-	return paginationFromQuery(log, req.URL.Query())
+	return paginationFromQuery(req.Context(), log, req.URL.Query())
 }
 
 // paginationFromQuery is THE derivation of a /call's pagination from its query
@@ -78,14 +77,14 @@ func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
 // path the browser will request, so a prewarm cell and the request for the same
 // URL fold the same pagination for EVERY shape the URL can take — not only the
 // canonical one buildPath emits.
-func paginationFromQuery(log *slog.Logger, q url.Values) (perPage, page int) {
+func paginationFromQuery(ctx context.Context, log *slog.Logger, q url.Values) (perPage, page int) {
 	perPage, page = -1, -1
 
 	if val := q.Get("perPage"); val != "" {
 		var err error
 		perPage, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert perPage parameter to int",
+			log.ErrorContext(ctx, "unable convert perPage parameter to int",
 				slog.Any("err", err))
 		}
 	}
@@ -94,7 +93,7 @@ func paginationFromQuery(log *slog.Logger, q url.Values) (perPage, page int) {
 		var err error
 		page, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert page parameter to int",
+			log.ErrorContext(ctx, "unable convert page parameter to int",
 				slog.Any("err", err))
 		}
 	}
@@ -168,7 +167,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj
 
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("checkDispatchRBAC: unable to extract UserInfo",
+		log.ErrorContext(ctx, "checkDispatchRBAC: unable to extract UserInfo",
 			slog.Any("err", err),
 		)
 		return false
@@ -185,8 +184,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj
 	opts.SkipBindingUID = true
 	allowed, _, evalErr := evaluateRBACFn(ctx, opts)
 	if evalErr != nil {
-		log.Error("checkDispatchRBAC: EvaluateRBAC error",
-			slog.String("user", redact.User(ui.Username)),
+		log.ErrorContext(ctx, "checkDispatchRBAC: EvaluateRBAC error",
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", target.Namespace),
 			slog.String("name", target.Name),
@@ -864,8 +862,6 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// sorted binding ids — never a name or a body). Read off the inputs,
 		// so it costs nothing at warn; "" when no inputs were derived.
 		slog.String("subject_binding_set", sbsOfInputs(inputs)),
-		slog.String("username", redact.User(username)),
-		slog.Any("groups", redact.Groups(groups)),
 		slog.String("handler_kind", handlerKind),
 		slog.String("gvr", fmt.Sprintf("%s/%s, Resource=%s", group, version, resource)),
 		slog.String("namespace", namespace),
@@ -923,8 +919,8 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 	// string).
 	if env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		fmt.Fprintf(os.Stderr,
-			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
-			site, cacheKey, bindingUID, redact.User(username), redact.Groups(groups),
+			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
+			site, cacheKey, bindingUID,
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}

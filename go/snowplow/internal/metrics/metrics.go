@@ -328,6 +328,21 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// --- #1231: readiness's RBAC half ---
+	rbacComplete, err := m.Int64ObservableGauge(
+		"snowplow_rbac_snapshot_complete",
+		metric.WithDescription("1 while the RBAC snapshot the evaluator reads is complete (every RBAC informer synced), else 0. /readyz is 503 while it is 0."),
+	)
+	if err != nil {
+		return err
+	}
+	rbacCompleteElapsed, err := m.Int64ObservableGauge(
+		"snowplow_rbac_snapshot_complete_elapsed_ms",
+		metric.WithDescription("Process-start to the first complete RBAC snapshot (ms); -1 until there is one."),
+	)
+	if err != nil {
+		return err
+	}
 
 	// --- rbac: snapshot authz memo ---
 	memoHits, err := m.Int64ObservableCounter("snowplow_authz_memo_hits",
@@ -676,7 +691,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// Hand-wired: there is no expvar->OTLP bridge.
 	phase1DeadlineReleased, err := m.Int64ObservableCounter(
 		"snowplow_phase1_deadline_released_total",
-		metric.WithDescription("1 iff this process's /readyz was released by the boot-seed / PHASE1_TIMEOUT deadline before the first-nav latch fired (nav widgets still unseeded at Ready); 0 on a latch-released boot. Healthy = 0. #397."))
+		metric.WithDescription("1 iff Phase 1's half of this process's /readyz (Ready also needs the complete RBAC snapshot, #1231) was released by the boot-seed / PHASE1_TIMEOUT deadline before the first-nav latch fired (nav widgets still unseeded at Ready); 0 on a latch-released boot. Healthy = 0. #397."))
 	if err != nil {
 		return err
 	}
@@ -689,7 +704,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// matters with the cache on).
 	phase1ExitByOutcome, err := m.Int64ObservableCounter(
 		"snowplow_phase1_readiness_exit_total",
-		metric.WithDescription("Which outcome released this process's /readyz, by outcome {latch, deadline, boot_error, seed_panic, seed_returned, boot_aborted, none-configured}: 1 at the releasing outcome, 0 elsewhere. Healthy = latch. Any other outcome = a Ready-degraded or nothing-to-warm boot — alert. #736."))
+		metric.WithDescription("Which outcome released Phase 1's half of this process's /readyz (Ready also needs the complete RBAC snapshot, #1231), by outcome {latch, deadline, boot_error, seed_panic, seed_returned, boot_aborted, none-configured}: 1 at the releasing outcome, 0 elsewhere. Healthy = latch. Any other outcome = a Ready-degraded or nothing-to-warm boot — alert. #736."))
 	if err != nil {
 		return err
 	}
@@ -905,6 +920,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		done, elapsed := cache.PrewarmCompleteSnapshot()
 		o.ObserveInt64(prewarmDone, done)
 		o.ObserveInt64(prewarmElapsed, elapsed)
+		rbacOK, rbacElapsed := cache.RBACSnapshotCompleteSnapshot()
+		o.ObserveInt64(rbacComplete, rbacOK)
+		o.ObserveInt64(rbacCompleteElapsed, rbacElapsed)
 
 		hits, misses, swaps, refused, denyUncached, entries := rbac.AuthzMemoSnapshot()
 		o.ObserveInt64(memoHits, int64(hits))
@@ -1182,7 +1200,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #260 change-4 ---
 		rbacReestablished, rbacWatchError, rbacBumpsBySource, rbacRoleNoop, rbacRoleSemanticNoop, rbacBindingUidChanged,
 		bindingNoopUpdates, bindingSemanticNoopUpdates,
-		registeredGVRs, prewarmDone, prewarmElapsed,
+		registeredGVRs, prewarmDone, prewarmElapsed, rbacComplete, rbacCompleteElapsed,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
 		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,
 		// --- #368 (registered since #455; observed but unregistered before, so
@@ -1648,12 +1666,23 @@ func registerListQueryInstrument(m metric.Meter) error {
 
 // registerEndpointDialInstruments hand-wires #1088's endpoint-dial surfaces
 // onto OTLP (no expvar->OTLP bridge), from the accessors their expvar closures
-// read: every retry by site and cause, and the stage fetch's per-identity
-// client cache. site and cause are closed, code-defined sets. Registered only
-// when the cache is on (CFG-1), like their expvar keys.
+// read: every retry by site and cause, the stage fetch's per-identity client
+// cache, and #847's connections opened and handed over by egress and protocol.
+// Every label is a closed, code-defined set. Registered only when the cache is on
+// (CFG-1), like their expvar keys.
 func registerEndpointDialInstruments(m metric.Meter) error {
 	retries, err := m.Int64ObservableCounter("snowplow_endpoint_retries_total",
 		metric.WithDescription("HTTP attempts re-sent by an endpoint dial's retry loop (plumbing RetryClient), one per retry, by site {stage = RESTAction branch-E fetch, call = /call passthrough} and cause, the outcome of the attempt it replaces {dns, dial (TCP connect failed), tls_handshake, connection (any other error with no response), status_429, status_5xx, other}. A write is never re-sent, so it never counts here. Each retry also logs one WARN with the failed attempt's duration. #1088."))
+	if err != nil {
+		return err
+	}
+	opened, err := m.Int64ObservableCounter("snowplow_egress_connections_opened_total",
+		metric.WithDescription("Outbound connections that came up, by egress {stage = RESTAction branch-E fetch, call = /call passthrough, apiserver = every client-go client, authn = the authn service login, rum_forward = the browser-span forwarder, other} and protocol {http1, http2}: TCP connected on http://, TLS handshake finished on https://. Equals what the servers accepted, however concurrent the pool: a dial that fails does not count, and one that comes up after its request left does, used or not. Read the reuse share 1 - opened / snowplow_egress_connection_handovers_total over a whole phase, per egress and protocol. It holds still under load only while the requests in flight on one pool stay at or under its idle cap (25 on a kept stage client): past the cap, connections that cannot park are closed and reopened, and the share falls with load. A new connection costs a TCP connect and, on https, a TLS handshake. An https request through an https proxy counts two. The OTLP exporters are not counted. #847."))
+	if err != nil {
+		return err
+	}
+	handovers, err := m.Int64ObservableCounter("snowplow_egress_connection_handovers_total",
+		metric.WithDescription("Times an outbound request was handed a connection, new or pooled, by egress and protocol as in snowplow_egress_connections_opened_total. One per HTTP/2 stream. A retry and a redirect hop take one each, and a request net/http retries by itself after a pooled connection turned out dead takes two. #847."))
 	if err != nil {
 		return err
 	}
@@ -1698,12 +1727,17 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 			o.ObserveInt64(retries, int64(c.Count), metric.WithAttributes(
 				attribute.String("site", c.Site), attribute.String("cause", c.Cause)))
 		}
+		for _, c := range credhttp.EgressConnectionsSnapshot() {
+			attrs := metric.WithAttributes(attribute.String("egress", c.Egress), attribute.String("protocol", c.Protocol))
+			o.ObserveInt64(opened, int64(c.Opened), attrs)
+			o.ObserveInt64(handovers, int64(c.Handovers), attrs)
+		}
 		n, b, e := restactionsapi.StageEndpointClientsStats()
 		o.ObserveInt64(clients, int64(n))
 		o.ObserveInt64(builds, int64(b))
 		o.ObserveInt64(evictions, int64(e))
 		return nil
-	}, retries, clients, builds, evictions)
+	}, retries, opened, handovers, clients, builds, evictions)
 	return err
 }
 

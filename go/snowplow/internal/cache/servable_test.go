@@ -104,7 +104,7 @@ func TestListObjectsServable_UnregisteredGVR(t *testing.T) {
 	})
 
 	// Do NOT register servableTestGVR.
-	items, servable := rw.ListObjectsServable(servableTestGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "")
 	if servable {
 		t.Fatalf("unregistered GVR: want servable=false; got true with %d items", len(items))
 	}
@@ -147,7 +147,7 @@ func TestListObjectsServable_RegisteredNotSynced(t *testing.T) {
 	// slice. We assert that invariant rather than a fixed bool, since
 	// the fake's sync timing is nondeterministic.
 	for i := 0; i < 200; i++ {
-		items, servable := rw.ListObjectsServable(servableTestGVR, "")
+		items, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "")
 		if !servable && items != nil {
 			t.Fatalf("not-servable must yield nil items; got %d", len(items))
 		}
@@ -163,7 +163,7 @@ func TestListObjectsServable_RegisteredNotSynced(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("informer did not sync within 5s")
 	}
-	if _, servable := rw.ListObjectsServable(servableTestGVR, ""); !servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, ""); !servable {
 		t.Fatalf("registered + synced GVR: want servable=true; got false")
 	}
 }
@@ -176,7 +176,7 @@ func TestListObjectsServable_RegisteredNotSynced(t *testing.T) {
 func TestListObjectsServable_SyncedEmpty(t *testing.T) {
 	rw := newSyncedServableWatcher(t)
 
-	items, servable := rw.ListObjectsServable(servableTestGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "")
 	if !servable {
 		t.Fatalf("synced + empty: want servable=true; got false (over-correction — genuinely-empty is still servable)")
 	}
@@ -247,7 +247,7 @@ func TestListObjectsServable_SyncedWithItems(t *testing.T) {
 	}
 
 	// Cluster-wide → 3 items.
-	all, servable := rw.ListObjectsServable(servableTestGVR, "")
+	all, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "")
 	if !servable {
 		t.Fatalf("synced + items (cluster-wide): want servable=true; got false")
 	}
@@ -256,7 +256,7 @@ func TestListObjectsServable_SyncedWithItems(t *testing.T) {
 	}
 
 	// Namespace-scoped → 2 items in ns-a.
-	nsA, servable := rw.ListObjectsServable(servableTestGVR, "ns-a")
+	nsA, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "ns-a")
 	if !servable {
 		t.Fatalf("synced + items (ns-a): want servable=true; got false")
 	}
@@ -265,7 +265,7 @@ func TestListObjectsServable_SyncedWithItems(t *testing.T) {
 	}
 
 	// Namespace with no objects → ([], true) — still servable.
-	nsEmpty, servable := rw.ListObjectsServable(servableTestGVR, "ns-with-nothing")
+	nsEmpty, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "ns-with-nothing")
 	if !servable {
 		t.Fatalf("synced + empty namespace partition: want servable=true; got false")
 	}
@@ -305,7 +305,7 @@ func TestListObjectsServable_PassthroughMode(t *testing.T) {
 	crbGVR := schema.GroupVersionResource{
 		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings",
 	}
-	items, servable := rw.ListObjectsServable(crbGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), crbGVR, "")
 	if !servable {
 		t.Fatalf("passthrough: want servable=true (apiserver-routed list is authoritative); got false")
 	}
@@ -319,7 +319,7 @@ func TestListObjectsServable_PassthroughMode(t *testing.T) {
 // when the cache subsystem is disabled.
 func TestListObjectsServable_NilReceiver(t *testing.T) {
 	var rw *cache.ResourceWatcher
-	items, servable := rw.ListObjectsServable(servableTestGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, "")
 	if servable {
 		t.Fatalf("nil receiver: want servable=false; got true")
 	}

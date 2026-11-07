@@ -57,6 +57,10 @@
 // where a resolve's collection LISTs are counted on the wire
 // (snowplow_resolve_collection_lists, resolve_lists.go): Harden and Client
 // install CountResolveCollectionLists wherever they install RefuseRedirectHops.
+//
+// #1131 — THE DESTINATION POLICY. The dialer that carries a named endpoint
+// refuses link-local, unspecified and multicast addresses on the address it
+// dials (destination.go).
 package credhttp
 
 import (
@@ -77,13 +81,35 @@ import (
 )
 
 // RedirectRefusedError is what a refused redirect hop returns. It carries the
-// status code of the redirect that was refused and nothing else: never a URL
-// (a Location can carry credentials), a token or an identity.
+// status code of the redirect that was refused and which credential the hop
+// carried, and nothing else: never a URL (a Location can carry credentials), a
+// token or an identity.
 type RedirectRefusedError struct {
 	StatusCode int
+	// Carried is the credential the refused hop carried, so the text names the
+	// rule that refused it (#1138): a held credential never follows any
+	// redirect, a named endpoint's never leaves its origin. The zero value is
+	// CarriedHeld.
+	Carried RedirectCredential
 }
 
+// RedirectCredential is the credential a refused redirect hop carried.
+type RedirectCredential int
+
+const (
+	// CarriedHeld: a credential snowplow holds and attaches itself (the
+	// ServiceAccount endpoint, a per-user clientconfig; WithHeldCredential).
+	// Such a client never follows a redirect (#723/#724).
+	CarriedHeld RedirectCredential = iota
+	// CarriedEndpoint: a named endpointRef's own credential, and any header
+	// its stage set. Such a dial never sends a hop to another origin (#1106).
+	CarriedEndpoint
+)
+
 func (e *RedirectRefusedError) Error() string {
+	if e.Carried == CarriedEndpoint {
+		return fmt.Sprintf("refused to follow a %d redirect to another origin: a named endpoint's own credential, and any header its stage set, never leave the origin the request was sent to (#1106)", e.StatusCode)
+	}
 	return fmt.Sprintf("refused to follow a %d redirect: a client carrying snowplow-held credentials never follows a redirect (#723/#724)", e.StatusCode)
 }
 
@@ -97,7 +123,7 @@ func CheckRedirect(*http.Request, []*http.Request) error {
 // Idempotent in effect (a double wrap refuses the same requests).
 func RefuseRedirectHops(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	return &refuseRedirectHops{next: rt}
 }
@@ -126,11 +152,18 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 //
 // #1115 — and the customer page budget (BudgetTransport, budget.go): a round
 // trip of a request that carries one runs under its deadline.
+//
+// #847 — and its connections count under EgressAPIServer (connections.go).
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
 		// #1054 — innermost: every attempt (a client-go 429 retry included)
 		// is recorded on the slow-call record of the request that sent it.
 		rc.Wrap(slowcall.Transport)
+		// #847 — new vs reused connections. Inside the budget and the hop
+		// refusal: a request either of them stops takes no connection anyway.
+		rc.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return countConnectionsTransport(EgressAPIServer, rt)
+		})
 		// #1115 — the customer page budget: a round trip of a request that
 		// carries one runs under its deadline.
 		rc.Wrap(BudgetTransport)
@@ -162,7 +195,7 @@ func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
 	base := c.Transport
 	if base == nil {
-		base = http.DefaultTransport
+		base = guardedTransport
 	}
 	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c

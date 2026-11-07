@@ -99,7 +99,7 @@ func StartStoreVerification(ctx context.Context) {
 		// position_unavailable, and store_position_unavailable is 1. A
 		// disabled detector, so ERROR, as repair_ineffective is. Nothing
 		// changes the gate here.
-		slog.Error("cache.store_verification.position_unavailable",
+		slog.ErrorContext(ctx, "cache.store_verification.position_unavailable",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "client-go's AtomicFIFO feature is off (KUBE_FEATURE_AtomicFIFO=false?), so "+
 				"Store.LastStoreSyncResourceVersion is always empty and the forced store verification cannot "+
@@ -386,7 +386,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	if err != nil {
 		publishCarried(dl, carried)
 		recordVerifySkipped(verifySkipListError)
-		slog.Warn("cache.store.verification_list_failed",
+		slog.WarnContext(ctx, "cache.store.verification_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("error", err.Error()),
@@ -436,7 +436,7 @@ func forcedVerify(ctx context.Context, gvr schema.GroupVersionResource) {
 	publishDivergence(gvr, verifySiteForced, report)
 
 	if latched {
-		slog.Error("cache.store.repair_ineffective",
+		slog.ErrorContext(ctx, "cache.store.repair_ineffective",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("hint", "a full relist of this GVR did NOT clear its divergence, so repairs for "+

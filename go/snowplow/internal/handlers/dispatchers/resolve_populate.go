@@ -489,7 +489,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("user", refreshLogUser(refreshUser)),
 				slog.String("rep_source", repSource),
 				slog.Int64("external_touches", extTouchedSink.Count()),
 				slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
@@ -522,7 +521,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("user", refreshLogUser(refreshUser)),
 				slog.String("rep_source", repSource),
 				slog.Int64("stage_errors", stageErrSink.Count()),
 				slog.String("stage_err_stage", sampleStage),
@@ -536,7 +534,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			// Any other decline: today only cache.PutReasonUnobserved, a verdict
 			// over Put-gate sinks that were not all installed on the resolve. It
 			// admits nothing (#912 delta-3 item 3); never read as another reason.
-			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
 				slog.String("reason", string(verdict.Reason())),
 				slog.String("effect", "body served; not persisted"),
 			)
@@ -575,7 +573,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
 			slog.String("rep_source", repSource),
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
@@ -738,7 +735,6 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", refreshLogUser(refreshUser)),
 		slog.String("rep_source", repSource),
 		slog.Bool("pinned", prePinned),
 	)

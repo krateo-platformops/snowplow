@@ -130,13 +130,23 @@ func (t *refuseCrossOriginHops) RoundTrip(req *http.Request) (*http.Response, er
 		if req.Body != nil {
 			_ = req.Body.Close()
 		}
-		return nil, &RedirectRefusedError{StatusCode: req.Response.StatusCode}
+		return nil, &RedirectRefusedError{StatusCode: req.Response.StatusCode, Carried: carriedBy(req)}
 	}
 	next := t.next
 	if next == nil {
-		next = http.DefaultTransport
+		next = guardedTransport
 	}
 	return next.RoundTrip(req)
+}
+
+// carriedBy is the credential a hop of req carries, by the dial's provenance
+// (WithHeldCredential, the same mark the dial site built its client from): a
+// held credential, or a named endpoint's own.
+func carriedBy(req *http.Request) RedirectCredential {
+	if HeldCredential(req.Context()) {
+		return CarriedHeld
+	}
+	return CarriedEndpoint
 }
 
 // WrappedRoundTripper lets client-go/utilnet walk the chain.

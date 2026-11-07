@@ -148,11 +148,11 @@ type viewedTierStats struct {
 	// deferredInFlight (#799 B2): dequeues not run because another tier's
 	// worker was re-resolving the same key; the key was re-added when it ended.
 	deferredInFlight atomic.Uint64
-	// #1069 — completed: successful viewed-tier dequeues (the viewed share of
-	// the pool's completed); reserveParks: parks of a worker that could take
-	// neither side's slot (the reserved worker waiting for viewed work). A park
-	// is one Wait, so its rate is bounded by the work, never by elapsed time.
-	completed    atomic.Uint64
+	// completed: successful dequeues of the viewed tier (counting only).
+	completed atomic.Uint64
+	// reserveParks (#1069): parks of a worker that could take neither side's
+	// slot (the reserved worker waiting for viewed work). A park is one Wait, so
+	// its rate is bounded by the work, never by elapsed time.
 	reserveParks atomic.Uint64
 }
 

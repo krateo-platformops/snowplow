@@ -46,10 +46,13 @@
 // Skipped, a #903 background refusal and a #905 stale-pass hold keep their own
 // recorded errors: each already reports itself.
 //
-// The errorKey message and the log line are identity-free: the stage name, the
-// verb and the cause only — never the rendered path, the payload or the jq error
-// text (which can carry caller input and response data; the DEBUG skip line
-// keeps the detail for triage, as before).
+// The errorKey message and the log line are identity-free. The message holds the
+// stage name, the verb and the cause; the line holds the stage name, the verb,
+// the reason, the RESTAction's coordinates and, on a read, the refused-item
+// count, plus the traceId the request logger adds (it carries no caller:
+// middleware.RequestLogger, #1192). Neither holds the rendered path, the payload
+// or the jq error text (which can carry caller input and response data; the
+// DEBUG skip line keeps the detail for triage, as before).
 package api
 
 import (
@@ -127,7 +130,7 @@ func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips [
 		// refusal is recorded: the highest-ranked one (reasonRank), the cause
 		// the outcome header names, never the first item's. No worker of the
 		// stage runs yet, so the outcome holds only these refusals.
-		r.log.Warn("read stage not sent",
+		r.log.WarnContext(r.ctx, "read stage not sent",
 			slog.String("name", id),
 			slog.String("verb", ptr.Deref(apiCall.Verb, http.MethodGet)),
 			slog.String("reason", r.outcomes.reasonOf(id)),
@@ -175,7 +178,7 @@ func (r *resolveRun) failUndialledWrite(id string, apiCall *templates.API, reaso
 	if class == "read" {
 		return // logged once per stage by failRefusedItems
 	}
-	r.log.Warn("write stage not sent",
+	r.log.WarnContext(r.ctx, "write stage not sent",
 		slog.String("name", id),
 		slog.String("verb", verb),
 		slog.String("reason", reason),

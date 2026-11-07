@@ -83,16 +83,33 @@ import (
 // the returned pointer's fields. plumbing's kubeconfig.NewClientConfig
 // already returns a freshly-built config per call on the per-user path.
 func ClientConfigFor(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, error) {
-	if v, ok := InternalRESTConfigFromContext(ctx); ok {
-		if rc, rcOK := v.(*rest.Config); rcOK && rc != nil {
-			return rc, nil
-		}
-		// A context carried an internal REST config of the wrong shape /
-		// a nil pointer. Fall through to the per-user path rather than
-		// fail — but the per-user path has no `<sa>-clientconfig` Secret
-		// for a synthetic SA identity and will fail loudly there, which is
-		// the diagnosable outcome. A future internal driver passing the
-		// wrong type is caught by the falsifier test in this package.
+	if rc, ok := internalRESTConfig(ctx); ok {
+		return rc, nil
 	}
 	return credhttp.NewClientConfig(ctx, ep)
+}
+
+// RequesterCredentialFor reports whether ClientConfigFor hands back the
+// requester's own credential on ctx, rather than an internal driver's (the
+// ServiceAccount's, on a seed, the walk or the refresher). It is the same test
+// ClientConfigFor makes, so a read site cannot judge the credential differently
+// from the one it dials with (#1221's wider route).
+func RequesterCredentialFor(ctx context.Context) bool {
+	_, internal := internalRESTConfig(ctx)
+	return !internal
+}
+
+// internalRESTConfig is the internal-dispatch *rest.Config ctx carries, if any.
+// A context carrying one of the wrong shape, or a nil pointer, falls back to the
+// per-user path rather than fail: the per-user path has no `<sa>-clientconfig`
+// Secret for a synthetic SA identity and fails loudly there, which is the
+// diagnosable outcome. A future internal driver passing the wrong type is caught
+// by the falsifier test in this package.
+func internalRESTConfig(ctx context.Context) (*rest.Config, bool) {
+	v, ok := InternalRESTConfigFromContext(ctx)
+	if !ok {
+		return nil, false
+	}
+	rc, ok := v.(*rest.Config)
+	return rc, ok && rc != nil
 }

@@ -22,7 +22,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -259,8 +258,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		// degrade-to-deny. Without the informer we cannot honour the
 		// "zero SubjectAccessReview in cache=on" rule, and we MUST NOT
 		// silently fall back to apiserver (would violate Revision 1).
-		log.Warn("rbac.evaluate: cache enabled but Global() is nil — denying",
-			slog.String("user", redact.User(opts.Username)),
+		log.WarnContext(ctx, "rbac.evaluate: cache enabled but Global() is nil — denying",
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),
@@ -277,8 +275,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	snap = rw.Snapshot()
 	if snap == nil {
 		// AC-B.8 — degrade-to-deny pre-readiness gate.
-		log.Warn("rbac.evaluate: typed-RBAC snapshot not yet published — denying",
-			slog.String("user", redact.User(opts.Username)),
+		log.WarnContext(ctx, "rbac.evaluate: typed-RBAC snapshot not yet published — denying",
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),
@@ -318,12 +315,11 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		if opts.WinningSubjectClassOut != nil && v.Allowed {
 			*opts.WinningSubjectClassOut = v.WinningSubjectClass
 		}
-		// The Enabled guard keeps the per-call keyed user digest (an HMAC)
-		// off the hot path at the shipped warn level.
+		// The Enabled guard keeps the attrs off the hot path at the shipped warn
+		// level.
 		if log.Enabled(ctx, slog.LevelDebug) {
 			log.Debug("rbac.evaluate",
 				slog.String("path", "in-process-memo-hit"),
-				slog.String("user", redact.User(opts.Username)),
 				slog.Bool("allowed", v.Allowed),
 				slog.String("matched_binding_uid", v.MatchedBindingUID),
 			)
@@ -334,8 +330,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	var winClass WinningSubjectClass
 	allowed, matchedBindingUID, winClass, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
-		log.Error("rbac.evaluate: informer evaluation failed",
-			slog.String("user", redact.User(opts.Username)), slog.Any("err", err))
+		log.ErrorContext(ctx, "rbac.evaluate: informer evaluation failed", slog.Any("err", err))
 		return false, "", err
 	}
 
@@ -382,7 +377,6 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	if log.Enabled(ctx, slog.LevelDebug) {
 		log.Debug("rbac.evaluate",
 			slog.String("path", "in-process"),
-			slog.String("user", redact.User(opts.Username)),
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),
@@ -452,7 +446,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 		if !anySubjectMatches(crb.Subjects, opts) {
 			continue
 		}
-		permits, err := roleRefPermits(snap, "", crb.RoleRef, opts, log)
+		permits, err := roleRefPermits(ctx, snap, "", crb.RoleRef, opts, log)
 		if err != nil {
 			return false, "", SubjectClassRegular, err
 		}
@@ -474,7 +468,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue
 			}
-			permits, err := roleRefPermits(snap, opts.Namespace, rb.RoleRef, opts, log)
+			permits, err := roleRefPermits(ctx, snap, opts.Namespace, rb.RoleRef, opts, log)
 			if err != nil {
 				return false, "", SubjectClassRegular, err
 			}
@@ -835,7 +829,7 @@ func lookupRoleRefRules(snap *cache.RBACSnapshot, namespace string, ref rbacv1.R
 // This keeps roleRefPermits byte-identical in verdict AND miss-count to
 // pre-split (F-D1); lookupRoleRefRules records nothing, so the dark profile
 // builder never reaches this bump.
-func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
+func roleRefPermits(ctx context.Context, snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
 	_ = log // reserved for future per-ref debug logging; kept in signature for parity
 	rules, ok := lookupRoleRefRules(snap, namespace, ref)
 	if ok {
@@ -853,10 +847,10 @@ func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleR
 	// consistency fault. Record it with the exact pre-split labels/selectivity.
 	switch ref.Kind {
 	case "ClusterRole":
-		cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
+		cache.RecordRBACSnapshotMiss(ctx, "ClusterRole", "", ref.Name)
 	case "Role":
 		if namespace != "" {
-			cache.RecordRBACSnapshotMiss("Role", namespace, ref.Name)
+			cache.RecordRBACSnapshotMiss(ctx, "Role", namespace, ref.Name)
 		}
 	}
 	return false, nil
@@ -1083,6 +1077,7 @@ func asClusterRoleBinding(obj interface{}, log *slog.Logger) (*rbacv1.ClusterRol
 	if !ok {
 		return nil, fmt.Errorf("rbac.asClusterRoleBinding: indexer object is neither *rbacv1.ClusterRoleBinding nor *unstructured.Unstructured (%T)", obj)
 	}
+	// log-ctx-waiver: no-prod-caller: a retained helper with no production caller
 	log.Warn("rbac.indexer.read fallback=true",
 		slog.String("subsystem", "rbac"),
 		slog.String("kind", "ClusterRoleBinding"),
@@ -1101,6 +1096,7 @@ func asRoleBinding(obj interface{}, log *slog.Logger) (*rbacv1.RoleBinding, erro
 	if !ok {
 		return nil, fmt.Errorf("rbac.asRoleBinding: indexer object is neither *rbacv1.RoleBinding nor *unstructured.Unstructured (%T)", obj)
 	}
+	// log-ctx-waiver: no-prod-caller: a retained helper with no production caller
 	log.Warn("rbac.indexer.read fallback=true",
 		slog.String("subsystem", "rbac"),
 		slog.String("kind", "RoleBinding"),
@@ -1120,6 +1116,7 @@ func asClusterRole(obj interface{}, log *slog.Logger) (*rbacv1.ClusterRole, erro
 	if !ok {
 		return nil, fmt.Errorf("rbac.asClusterRole: indexer object is neither *rbacv1.ClusterRole nor *unstructured.Unstructured (%T)", obj)
 	}
+	// log-ctx-waiver: no-prod-caller: a retained helper with no production caller
 	log.Warn("rbac.indexer.read fallback=true",
 		slog.String("subsystem", "rbac"),
 		slog.String("kind", "ClusterRole"),
@@ -1138,6 +1135,7 @@ func asRole(obj interface{}, log *slog.Logger) (*rbacv1.Role, error) {
 	if !ok {
 		return nil, fmt.Errorf("rbac.asRole: indexer object is neither *rbacv1.Role nor *unstructured.Unstructured (%T)", obj)
 	}
+	// log-ctx-waiver: no-prod-caller: a retained helper with no production caller
 	log.Warn("rbac.indexer.read fallback=true",
 		slog.String("subsystem", "rbac"),
 		slog.String("kind", "Role"),

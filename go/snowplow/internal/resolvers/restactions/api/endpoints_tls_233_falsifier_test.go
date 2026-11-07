@@ -131,7 +131,7 @@ func TestIssue233_PolicyDelegation_StaysSilent(t *testing.T) {
 	ep := &endpoints.Endpoint{ServerURL: srv, Token: saTestToken} // no CA → nothing to parse
 	// #1088: a no-CA endpoint is owned (system roots, as plumbing) and has no CA
 	// for the capability site to read, so it never reaches the #233 WARN.
-	if _, ok := endpointTLSConfig(ep); !ok {
+	if _, ok := endpointTLSConfig(context.Background(), ep); !ok {
 		t.Fatal("precondition: a no-CA endpoint must have readable TLS material (nothing to parse)")
 	}
 

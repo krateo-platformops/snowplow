@@ -100,7 +100,7 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			return rePrewarmLearnedClasses(ctx, deps)
 		default:
 			// Ship 2 future scope (scopeKindWidgetCR) lands here when unwired.
-			slog.Warn("prewarm.engine.unknown_scope",
+			slog.WarnContext(ctx, "prewarm.engine.unknown_scope",
 				slog.String("subsystem", "cache"),
 				slog.String("scope", s.key()),
 			)
@@ -229,7 +229,7 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps) error {
 	)
 	err := rePrewarmGVRDiscoveredSeed(ctx, deps)
 	if err != nil {
-		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
+		slog.WarnContext(ctx, "prewarm.engine.gvr_discovered.incomplete",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 		)
@@ -388,7 +388,7 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		var listErr error
 		roots, listErr = deps.lister(rctx)
 		if listErr != nil {
-			log.Warn("prewarm.engine.boot.roots_list_failed",
+			log.WarnContext(ctx, "prewarm.engine.boot.roots_list_failed",
 				slog.String("subsystem", "cache"),
 				slog.Any("err", listErr),
 				slog.String("effect", "boot re-walk has no roots; first /call per cohort falls back to per-user resolve"),
@@ -466,7 +466,7 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		// The SAME root entry as resolveNavigationRoot (#966 review F2:
 		// walkRoot owns the root's pagination for both walks).
 		if err := w.walkRoot(rctx, root.Root, root.GVR); err != nil {
-			log.Warn("prewarm.engine.boot.root_rewalk_failed",
+			log.WarnContext(ctx, "prewarm.engine.boot.root_rewalk_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", rootKey(root.Root)),
 				slog.Any("err", err),
@@ -732,7 +732,7 @@ func seedScopeYielding(ctx context.Context,
 		passBudgetMS = time.Until(dl).Milliseconds()
 	}
 	emitSeedAbort := func(phase string, cause error) {
-		log.Warn("prewarm.seed.abort",
+		log.WarnContext(ctx, "prewarm.seed.abort",
 			slog.String("subsystem", "cache"),
 			slog.String("phase", phase),
 			slog.Any("cause", cause),
@@ -768,14 +768,13 @@ func seedScopeYielding(ctx context.Context,
 	// back-compat grand total pipBindingSetSeedFailuresTotal is bumped for
 	// parity (= rbac_deny + operational).
 	failedSet := map[string]struct{}{}
-	classifyEngineSeedErr := func(kind, label string, target redact.Label, err error) {
+	classifyEngineSeedErr := func(kind, label string, err error) {
 		pipBindingSetSeedFailuresTotal.Add(1)
 		if classifySeedErr(err) == seedFailRBACDeny {
 			pipSeedRBACDenyTotal.Add(1)
 			slog.Info("prewarm.engine.seed.expected_deny",
 				slog.String("subsystem", "cache"),
 				slog.String("kind", kind),
-				slog.String("target", target.String()),
 				slog.String(kind, label),
 				slog.String("err", redact.Err(err)),
 			)
@@ -788,10 +787,9 @@ func seedScopeYielding(ctx context.Context,
 		// tail owns the re-enqueue (finalizeBootReEnqueue).
 		pipSeedOperationalFailTotal.Add(1)
 		failedSet[kind+"/"+label] = struct{}{}
-		slog.Warn("prewarm.engine.seed.operational_failure",
+		slog.WarnContext(ctx, "prewarm.engine.seed.operational_failure",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
-			slog.String("target", target.String()),
 			slog.String(kind, label),
 			slog.String("err", redact.Err(err)),
 			slog.String("effect", "operational seed failure (NOT an RBAC deny); recorded into the boot "+
@@ -846,7 +844,7 @@ func seedScopeYielding(ctx context.Context,
 			// up. WARN so the operator still sees the deterministic failer (the
 			// per-target operational_failure Warn also fired every pass) — this
 			// stops the re-walk AMPLIFICATION, not the visibility (design §5 reco).
-			log.Warn("prewarm.engine.boot.converged_with_skips",
+			log.WarnContext(ctx, "prewarm.engine.boot.converged_with_skips",
 				slog.String("subsystem", "cache"),
 				slog.Any("given_up_targets", givenUp),
 				slog.Int("passes", passes),
@@ -1065,7 +1063,6 @@ func seedScopeYielding(ctx context.Context,
 	// metric stays data-derived CollapsedBindings.
 	type rankedIdentity struct {
 		key       string
-		label     redact.Label // #453: the only form of the identity that is logged
 		widgetMax int
 		allMax    int
 	}
@@ -1074,7 +1071,6 @@ func seedScopeYielding(ctx context.Context,
 		k := identityKey(c)
 		ri := rankOf[k] // zero value {key:"", 0, 0} for a first observation
 		ri.key = k
-		ri.label = cohortLogLabel(c)
 		if c.CollapsedBindings > ri.allMax {
 			ri.allMax = c.CollapsedBindings
 		}
@@ -1121,7 +1117,6 @@ func seedScopeYielding(ctx context.Context,
 			log.Info("prewarm.engine.seed.rank",
 				slog.String("subsystem", "cache"),
 				slog.Int("rank", r),
-				slog.String("identity", ranked[r].label.String()),
 				slog.Int("widget_max", ranked[r].widgetMax),
 				slog.Int("all_max", ranked[r].allMax),
 			)
@@ -1184,7 +1179,7 @@ func seedScopeYielding(ctx context.Context,
 			// removed during the resolve). ONE inline re-seed in the SAME mode
 			// (so PutIfGen again, fresh capture). NOT via failedSet →
 			// finalizeBootReEnqueue: that redrives a BOOT (plain-Put) scope.
-			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c),
+			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(),
 				func() error { return seedOneTarget(c, true, do) })
 		}
 		// #397: the FINAL error of this unit, after the #394 one-shot re-seed. A
@@ -1198,7 +1193,7 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		if err != nil {
-			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), err)
 		}
 		targetsProcessed++
 		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
@@ -1212,13 +1207,13 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		do := func(cohortCtx context.Context) error {
-			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, mode)
+			return seedOneRestactionFn(cohortCtx, ref, authnNS, mode)
 		}
 		err := seedOneTarget(c, false, do)
 		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
 			// #394 — one-shot same-mode re-seed of the refused unit; see
 			// seedWidgetTarget. Never routed through failedSet.
-			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c),
+			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name,
 				func() error { return seedOneTarget(c, false, do) })
 		}
 		if err != nil && ctx.Err() != nil {
@@ -1226,7 +1221,7 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		if err != nil {
-			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
+			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, err)
 		}
 		targetsProcessed++
 		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
@@ -1434,7 +1429,7 @@ func seedScopeYielding(ctx context.Context,
 			}
 			log.Info("prewarm.keepwarm.cohort_summary",
 				slog.String("subsystem", "cache"),
-				slog.String("identity", ranked[ri].label.String()),
+				slog.Int("rank", ri),
 				slog.Int("widget_max", ranked[ri].widgetMax),
 				slog.Int64("reseeds", reseeds),
 				slog.Int64("age_skips", int64(ageSkips)),

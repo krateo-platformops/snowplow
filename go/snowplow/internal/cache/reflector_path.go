@@ -394,6 +394,7 @@ func recordReflectorPath(gvr schema.GroupVersionResource, bucket string, hasReso
 	reflectorPaths.mu.Unlock()
 
 	reflectorPathTransitionsTotal.Add(1)
+	// log-ctx-waiver: informer-event: a reflector LIST seen by its transport wrapper
 	slog.Warn("cache.reflector.path",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),

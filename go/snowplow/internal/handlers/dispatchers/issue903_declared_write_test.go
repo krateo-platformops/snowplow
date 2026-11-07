@@ -91,7 +91,7 @@ func TestIssue903_S1_SeedMarksADeclaredWriteRADeclinedExternal(t *testing.T) {
 	seedCtx = cache.WithSeedDeclinedExternalSet(seedCtx, set)
 	ref := templatesv1.ObjectReference{Reference: templatesv1.Reference{Name: c681RA, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource}
-	if err := seedOneRestaction(seedCtx, "rv", ref, c681AuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCtx, ref, c681AuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	if n := up.writes(); n != 0 {
@@ -195,7 +195,7 @@ func TestIssue903_S3_DeclaredWriteRANeverStored_TheWriteRunsOnTheNextCall(t *tes
 	e.update(t, c681CMs, cm)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		u, ok := e.rw.GetObject(c681CMs, "pub", "p")
+		u, ok := e.rw.GetObject(context.Background(), c681CMs, "pub", "p")
 		if ok && u != nil {
 			if d, _, _ := unstructured.NestedString(u.Object, "data", "todo"); d == `["x"]` {
 				break

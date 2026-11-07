@@ -248,7 +248,7 @@ func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time
 	ctx, settle := cache.BeginDemandRevalidation(ctx, key, t0)
 	defer func() {
 		if p := recover(); p != nil {
-			xcontext.Logger(ctx).Error("demand revalidation panicked; cell stays known-stale",
+			xcontext.Logger(ctx).ErrorContext(ctx, "demand revalidation panicked; cell stays known-stale",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Any("panic", p),

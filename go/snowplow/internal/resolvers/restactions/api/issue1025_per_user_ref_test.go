@@ -143,15 +143,14 @@ func i1025AssertRefused(t *testing.T, dials []su994Dial, header, logs, secretNam
 	if !strings.Contains(logs, `"msg":"endpointRef refused: it names a per-user credential Secret"`) {
 		t.Fatalf("#1025: the refusal log line is missing; logs=%s", logs)
 	}
-	for _, kv := range []string{
-		`"provenance":"` + wantProv + `"`,
-		`"secret_name":"` + redact.Prefixed("secret", secretName) + `"`,
-	} {
-		if !strings.Contains(logs, kv) {
-			t.Fatalf("#1025: the refusal log line lacks %s; logs=%s", kv, logs)
-		}
+	if kv := `"provenance":"` + wantProv + `"`; !strings.Contains(logs, kv) {
+		t.Fatalf("#1025: the refusal log line lacks %s; logs=%s", kv, logs)
 	}
-	if wantT := `"templated":` + map[bool]string{true: "true", false: "false"}[templated]; !strings.Contains(logs, wantT) {
+	// #1192: the name embeds a username, so it is not logged as a label either.
+	if strings.Contains(logs, `"secret_name"`) || strings.Contains(logs, redact.Prefixed("secret", secretName)) {
+		t.Fatalf("#1192: the refusal log line carries the Secret name's label; logs=%s", logs)
+	}
+	if wantT :=`"templated":` + map[bool]string{true: "true", false: "false"}[templated]; !strings.Contains(logs, wantT) {
 		t.Fatalf("#1025: the refusal log line lacks %s; logs=%s", wantT, logs)
 	}
 	// Never the Secret name nor the victim's username in clear.

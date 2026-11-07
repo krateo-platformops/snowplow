@@ -8,7 +8,7 @@ package credhttp
 // offers no seam to refuse a redirect, so a token-auth clientconfig's bearer
 // (re-added by plumbing's bearerAuthRoundTripper on EVERY hop) would follow a
 // 3xx to whatever host the upstream named, and the redirected body would be
-// returned as the answer. Do is request.Do transcribed (plumbing v1.15.1
+// returned as the answer. Do is request.Do transcribed (plumbing v1.28.1
 // http/request/request.go) with exactly three differences:
 //
 //  1. the client is the endpoint client through Client(): it never follows a
@@ -23,6 +23,8 @@ package credhttp
 //
 //  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
 //     never plumbing's, which logs the Authorization header and the bodies.
+//
+//  5. (#1131) a refused destination is reported as itself: DestinationStatus.
 //
 // Everything else (headers, the AWS-signature branch, the payload, a read's
 // retry client, the non-2xx envelope, the JSON content-type check, the
@@ -113,6 +115,9 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		if st, ok := BudgetStatus(err); ok {
 			return st // #1115 — 504 Timeout
 		}
+		if st, ok := DestinationStatus(err); ok {
+			return st // #1131 — 502 DestinationRefused
+		}
 		return response.New(http.StatusInternalServerError, err)
 	}
 	defer respo.Body.Close()
@@ -150,7 +155,7 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 }
 
 // RequestURL is the URL a call to path on the endpoint at serverURL is sent to,
-// as request.Do builds it (plumbing v1.15.1 http/request/request.go): the
+// as request.Do builds it (plumbing v1.28.1 http/request/request.go): the
 // server URL without its trailing "/", then exactly one "/", then path without
 // its leading "/". Both HTTP dials build their URL here, this one and the
 // resolver's own fetch (restactions/api httpFetchConverting), and so does the

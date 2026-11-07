@@ -161,7 +161,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	ep, err := xcontext.UserConfig(req.Context())
 	if err != nil {
-		log.Error("unable to get user endpoint", slog.Any("err", err))
+		log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
 		response.Unauthorized(wri, err)
 		return
 	}
@@ -255,7 +255,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	if rt.Status == response.StatusFailure {
-		log.Error("unable to call endpoint",
+		log.ErrorContext(dctx, "unable to call endpoint",
 			slog.String("verb", strings.ToUpper(opts.verb)),
 			slog.String("uri", uri),
 			slog.String("err", rt.Message))
@@ -275,7 +275,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(wri)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(dict); err != nil {
-		log.Error("unable to serve api call response", slog.Any("err", err))
+		log.ErrorContext(dctx, "unable to serve api call response", slog.Any("err", err))
 	}
 }
 

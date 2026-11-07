@@ -126,6 +126,7 @@ func asRole(obj interface{}) (*rbacv1.Role, bool) {
 // when a binding/role event object is neither typed nor convertible.
 func deltaDropNonTyped(kind string) {
 	bindingsIndexDeltaSkippedNonTyped.Add(1)
+	// log-ctx-waiver: informer-event: an RBAC informer delta dropped an object it could not type
 	slog.Warn("cache.bindings_by_gvr.delta_skipped_non_typed",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", kind),

@@ -127,13 +127,13 @@ type dirtyWindowStats struct {
 	samples atomic.Uint64
 	unfresh [unfreshReasons]atomic.Uint64
 	d2f     *windowedQuantile
-	// dequeueAge (#1069) is the age of the change a dequeue is about to
-	// refresh (its window's t0 to the dequeue that runs it, after the rate
-	// floor and the customer yield), split by side:
-	// [ageViewed] the viewed tier, [ageUnviewed] the normal and cluster_list
-	// tiers. Unlike d2f it is read at EVERY dequeue that runs inside a window,
-	// whatever the outcome, so a window that a remark or a failure keeps open is
-	// still measured at each attempt (d2f only sees the ones that close fresh).
+	// dequeueAge is the age of the change a dequeue is about to refresh (its
+	// window's t0 to the dequeue that runs it, after the rate floor and the
+	// customer yield), split by side: [ageViewed] the viewed tier,
+	// [ageUnviewed] the normal and cluster_list tiers. Unlike d2f it is read at
+	// EVERY dequeue that runs inside a window, whatever the outcome, so a window
+	// that a remark or a failure keeps open is still measured at each attempt
+	// (d2f only sees the ones that close fresh).
 	dequeueAge [2]*windowedQuantile
 }
 
@@ -150,7 +150,7 @@ func newDirtyWindowStats() *dirtyWindowStats {
 	}
 }
 
-// observeDequeueAge records the age of the change a dequeue runs (#1069).
+// observeDequeueAge records the age of the change a dequeue runs.
 func (s *dirtyWindowStats) observeDequeueAge(viewed bool, age time.Duration) {
 	if s == nil {
 		return

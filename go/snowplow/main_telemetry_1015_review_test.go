@@ -28,7 +28,6 @@ import (
 	xenv "github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/server/use"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/telemetry/rum"
 )
 
@@ -438,13 +437,13 @@ func TestS1015_RouteIsRegisteredScoped(t *testing.T) {
 	}
 }
 
-// F4 — a refusal is attributable: it writes a WARN line carrying the caller's
-// redact.User label (internal/redact, #453: never the username in clear), the
-// status and the reason, and nothing from the body.
+// F4 — a refusal is logged: it writes a WARN line carrying the status and the
+// reason, nothing from the body and nothing about the caller (#1192: no
+// identity reaches a log line, in clear or as a label).
 //
 // MUTATIONS (RED, shown in the PR): the line logs the raw username; the line
 // removed.
-func TestS1015_RefusalIsAttributable(t *testing.T) {
+func TestS1015_RefusalIsLoggedWithoutTheCaller(t *testing.T) {
 	var buf bytes.Buffer
 	var mu sync.Mutex
 	prev := slog.Default()
@@ -477,8 +476,8 @@ func TestS1015_RefusalIsAttributable(t *testing.T) {
 			continue
 		}
 		found = true
-		if rec["user"] != redact.User(user) || rec["reason"] != "content_type" || rec["status"] != float64(415) {
-			t.Fatalf("refusal line %v, want user=%s reason=content_type status=415", rec, redact.User(user))
+		if _, named := rec["user"]; named || rec["reason"] != "content_type" || rec["status"] != float64(415) {
+			t.Fatalf("refusal line %v, want reason=content_type status=415 and no user", rec)
 		}
 	}
 	if !found {

@@ -189,6 +189,7 @@ var _ informers.GenericInformer = &streamingDynamicInformer{}
 // streaming LIST carries the SAME paging policy as every other informer
 // (no streaming-only page-limit constant — see the NOTE above).
 func newStreamingDynamicInformer(
+	ctx context.Context,
 	rc *rest.Config,
 	dyn dynamic.Interface,
 	gvr schema.GroupVersionResource,
@@ -200,7 +201,7 @@ func newStreamingDynamicInformer(
 	}
 	restClient, err := streamingRESTClient(rc)
 	if err != nil {
-		slog.Warn("cache.streaming_list.rest_client_failed",
+		slog.WarnContext(ctx, "cache.streaming_list.rest_client_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("error", err.Error()),
@@ -542,6 +543,7 @@ func decodeItemsArrayStreaming(
 		// the H1-stored shape (managedFields + last-applied removed).
 		stripped, serr := stripItemJSON(itemRaw)
 		if serr != nil {
+			// log-ctx-waiver: informer-event: a reflector LIST decoded on the reflector goroutine
 			slog.Warn("cache.streaming_list.item_strip_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("item_index", *totalItems),
@@ -558,6 +560,7 @@ func decodeItemsArrayStreaming(
 		// fresh, non-aliased slice — SB-4).
 		bo, berr := newBytesObjectFromRaw(stripped)
 		if berr != nil {
+			// log-ctx-waiver: informer-event: a reflector LIST decoded on the reflector goroutine
 			slog.Warn("cache.streaming_list.item_decode_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("item_index", *totalItems),

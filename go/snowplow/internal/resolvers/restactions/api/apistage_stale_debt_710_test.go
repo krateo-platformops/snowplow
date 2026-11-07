@@ -540,6 +540,10 @@ func TestStale710_D2_16_ALateArmStillGetsTheRefresh(t *testing.T) {
 	}) {
 		t.Fatalf("PRECONDITION: the dependent cell was never replaced (%+v)", StaleServeStatsSnapshot())
 	}
+	// #1198 — the cell is replaced inside the re-resolve, and the publish that
+	// counts it unarmed comes after (finishStaleReplace): wait for that event, not
+	// for the replacement that precedes it.
+	fill710WaitFor(10*time.Second, func() bool { return StaleServeStatsSnapshot().PushUnarmed >= 1 })
 	if st := StaleServeStatsSnapshot(); st.PushUnarmed != 1 || !cache.StaleOwed("dep-16") {
 		t.Fatalf("PRECONDITION: the replacement must have been published to no tab, leaving the push owed (unarmed=%d owed=%v)",
 			st.PushUnarmed, cache.StaleOwed("dep-16"))

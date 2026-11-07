@@ -400,10 +400,10 @@ type refresher struct {
 	// "both tiers progress in proportion".
 	clusterListEnqueueTotal   atomic.Uint64
 	clusterListCompletedTotal atomic.Uint64
-	// normalCompletedTotal (#1069) ticks every successful drain of the normal
-	// tier: with the viewed (viewed.completed) and cluster_list counts it splits
-	// completed by tier, so a paired run can see the normal tier progress in
-	// every interval under the viewed reservation.
+	// normalCompletedTotal ticks every successful drain of the normal tier:
+	// with the viewed (viewed.completed) and cluster_list counts it splits
+	// completed by tier, so a paired run can see each tier progress in every
+	// interval (#1085's run-22 bars). It only counts.
 	normalCompletedTotal atomic.Uint64
 
 	startedOnce sync.Once
@@ -1053,7 +1053,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// this dequeue (runs before Done, after every branch below has settled the
 	// window).
 	var attemptDur time.Duration // #740: the failed attempt's own duration floors its backoff
-	defer func() { settleBackgroundRevalidation(key, attemptDur) }()
+	// #1232 — the claim number recorded where this dequeue begins its work
+	// (the single Get, below the yield). A revalidation claimed after it is not
+	// this dequeue's to settle: its own dequeue follows.
+	var claimedBy uint64
+	defer func() { settleBackgroundRevalidation(key, attemptDur, claimedBy) }()
 
 	// #871 — measurement only: from here this dequeue is one refresh unit. Its
 	// ctx and goroutine carry snowplow_work=refresh|refresh_viewed, and every
@@ -1117,6 +1121,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// disappears from the dependent LIST cell within ≤ floor (same
 	// stale-while-revalidate posture as any UPDATE; the self entry's own
 	// eviction via RemoveL1Key remains immediate).
+	claimedBy = revalClaimsSoFar()
 	c := ResolvedCache()
 	var (
 		entry *ResolvedEntry
@@ -1246,7 +1251,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// customer hit during the re-resolve still counts as a stale serve.
 	t0, windowOpen := r.beginWindow(key)
 	if windowOpen {
-		// #1069 — how old the change this dequeue is about to refresh is, by side.
+		// How old the change this dequeue is about to refresh is, by side. It
+		// only counts: the dequeue already happened.
 		r.dirtyStats.observeDequeueAge(tier == tierViewed, windowNow().Sub(t0))
 	}
 	// #603 PR-2 SHADOW audit — take the key's {avoided, tainted} pair with its
@@ -1300,8 +1306,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		//
 		// #608 (Q2 ruling) — a NON-RETRYABLE failure (a 403: the apiserver's
 		// authorization decision for this identity, refused identically at
-		// every backoff step) skips the budget and reaches this same drop point
-		// on its first attempt, where it is never evicted either (#547).
+		// every backoff step; #1131: a destination the policy refuses) skips the
+		// budget and reaches this same drop point on its first attempt, where it
+		// is never evicted either (#547).
 		nonRetryable := IsNonRetryableRefreshError(err)
 		if nonRetryable || q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
@@ -1361,7 +1368,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 				}
 				evicted := Deps().EvictSelfGone(key, goneInputs)
 				r.selfNotFoundEvict.Add(1)
-				slog.Warn("refresher.self_object_gone_evicted",
+				slog.WarnContext(ctx, "refresher.self_object_gone_evicted",
 					slog.String("subsystem", "cache"),
 					slog.String("key_hash", key),
 					slog.Int("requeues", maxRefreshRequeues),
@@ -1385,7 +1392,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// and forget-as-fresh is the defect. The known-stale cell is served,
 			// counted, and revalidated by the next read under the requester or
 			// re-enqueued by the next change. Self-adapting: no budget to tune.
-			slog.Warn("refresher.refresh_dropped",
+			slog.WarnContext(ctx, "refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
@@ -1452,7 +1459,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// dirty-mark of the same key starts from a clean backoff.
 	q.Forget(key)
 	r.completedTotal.Add(1)
-	switch tier { // #1069 — per-tier completions
+	switch tier { // per-tier completions; counting only
 	case tierClusterList:
 		r.clusterListCompletedTotal.Add(1)
 	case tierViewed:
@@ -1535,7 +1542,7 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 		// never read as the bare text `unknown` again.
 		errClass, stage := ClassifyRefreshError(err)
 		recordRefreshFailedClass(errClass, stage)
-		slog.Warn("refresher.refresh_failed",
+		slog.WarnContext(ctx, "refresher.refresh_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("handler_kind", entry.Inputs.CacheEntryClass),
 			slog.String("key_hash", key),
@@ -1603,16 +1610,15 @@ type refresherStats struct {
 	deferredInFlight      uint64 `stat:"deferred_in_flight"` // #799 B2
 	viewedQueueDepth      int64  `stat:"viewed_queue_depth" kind:"gauge" desc:"Live depth of the refresher's viewed tier (#765): dirty cells open on a page, drained before every other tier."`
 
-	// #1069 — the reservation of one worker for viewed work
-	// (refresher_viewed.go nextDequeue): completions by tier, the reserved
-	// worker's parks, and the age of the change a dequeue runs, by side.
+	// Completions by tier and the age of the change a dequeue runs, by side
+	// (#1085's run-22 bars: both arms publish them).
 	normalCompleted    uint64 `stat:"normal_completed"`
 	viewedCompleted    uint64 `stat:"viewed_completed"`
-	viewedReserveParks uint64 `stat:"viewed_reserve_parks"`
-	viewedAgeP95MS     int64  `stat:"viewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a viewed-tier dequeue is about to refresh (its dirty mark to the dequeue that runs it), over roughly the last OTLP export interval (#1069)."`
-	viewedAgeMaxMS     int64  `stat:"viewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a viewed-tier dequeue is about to refresh, over roughly the last OTLP export interval (#1069)."`
-	unviewedAgeP95MS   int64  `stat:"unviewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a normal or cluster_list dequeue is about to refresh (its dirty mark to the dequeue that runs it), over roughly the last OTLP export interval (#1069)."`
-	unviewedAgeMaxMS   int64  `stat:"unviewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a normal or cluster_list dequeue is about to refresh, over roughly the last OTLP export interval (#1069)."`
+	viewedReserveParks uint64 `stat:"viewed_reserve_parks"` // #1069 — the reserved worker's parks
+	viewedAgeP95MS     int64  `stat:"viewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a viewed-tier dequeue is about to refresh (its dirty mark to the dequeue), over roughly the last export interval"`
+	viewedAgeMaxMS     int64  `stat:"viewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a viewed-tier dequeue is about to refresh, over roughly the last export interval"`
+	unviewedAgeP95MS   int64  `stat:"unviewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a normal or cluster_list dequeue is about to refresh (its dirty mark to the dequeue), over roughly the last export interval"`
+	unviewedAgeMaxMS   int64  `stat:"unviewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a normal or cluster_list dequeue is about to refresh, over roughly the last export interval"`
 }
 
 func refresherStatsSnapshot() refresherStats {

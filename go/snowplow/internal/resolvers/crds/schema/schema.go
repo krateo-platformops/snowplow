@@ -165,7 +165,7 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		// Fall back LOUDLY: a systemically broken singleton would
 		// otherwise silently evaporate the caching win back to
 		// per-call discovery downloads.
-		slog.Warn("schema: SA discovery singleton unavailable; "+
+		slog.WarnContext(ctx, "schema: SA discovery singleton unavailable; "+
 			"falling back to per-call client",
 			slog.String("error", err.Error()))
 		// #1115 — this client is built for this call alone: bind the

@@ -364,7 +364,7 @@ func populateWidgetContentL1(
 			// Any other decline: today only cache.PutReasonUnobserved, a verdict
 			// over Put-gate sinks that were not all installed on the resolve. It
 			// admits nothing (#912 delta-3 item 3); never read as another reason.
-			slog.Default().Warn("resolve declined by the Put-gate verdict; declining to cache",
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
 				slog.String("reason", string(verdict.Reason())),
 				slog.String("effect", "body served; not persisted"),
 			)

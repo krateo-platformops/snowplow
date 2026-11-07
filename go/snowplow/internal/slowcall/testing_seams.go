@@ -37,6 +37,25 @@ func BodyTimedForTest(w http.ResponseWriter) bool {
 	return ok
 }
 
+// OpenWaitsForTest returns the kind of every wait open on the request ctx belongs
+// to, read under the record's lock: a wait is listed from the moment its span
+// started until it ends. Production MUST NOT use it.
+func OpenWaitsForTest(ctx context.Context) []string {
+	r := fromContext(ctx)
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var kinds []string
+	for _, w := range r.open {
+		if w.set {
+			kinds = append(kinds, w.kind)
+		}
+	}
+	return kinds
+}
+
 // WaitKeyLabelForTest is the label a record reports for a waited-on key.
 func WaitKeyLabelForTest(key string) string { return waitKeyLabel(key) }
 
@@ -56,6 +75,7 @@ func EmitSlowForTest(route string, p Phase, d time.Duration) {
 	r.ph[p].ns.Store(int64(d))
 	r.ph[p].max.Store(int64(d))
 	r.ph[p].n.Store(1)
+	// log-ctx-waiver: detached: a test seam that emits a record with no request behind it
 	m.emit(context.Background(), r, m.bound+d, end, ReleaseCompleted)
 }
 

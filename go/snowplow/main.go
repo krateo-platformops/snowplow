@@ -169,6 +169,24 @@ func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
 	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
 }
 
+// newRequestChain is the middleware every route starts from. It is a function
+// so the logger chain the pod runs is the one the tests drive
+// (main_identity_logs_1192_test.go).
+func newRequestChain(log *slog.Logger) use.Chain {
+	return use.NewChain(
+		use.TraceId(),
+		// #1192: the request logger carries the traceId and no identity.
+		middleware.RequestLogger(log),
+		// Audit correlation (D19a): mint/accept the business session id and
+		// write it into W3C baggage (session.id), carried on the request
+		// context and serialized downstream by the Baggage propagator. The
+		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
+		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
+		// traceparent; no bespoke correlation header any more.
+		audit.Middleware(),
+	)
+}
+
 // mountTelemetryRoute mounts #1015's browser RUM ingest, POST
 // /telemetry/v1/traces, and registers it as a scoped route (scope telemetry,
 // listed in requiredScopedRoutes).
@@ -408,6 +426,7 @@ func main() {
 	// changes no verdict, served byte or cache key (rbac/shadow_hook.go).
 	rbac.InitShadowParityFromEnv()
 	if rbac.ShadowParityEnabled() {
+		// log-ctx-waiver: boot: process start, before a context exists
 		log.Warn("shadow-parity ENABLED via SHADOW_PARITY_ENABLED — dark R/projection overhead active; do not run latency-acceptance on this pod",
 			slog.String("subsystem", "cache"),
 			slog.String("source", rbac.ShadowParitySource()),
@@ -433,6 +452,7 @@ func main() {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
 	}
 	if resolvedJWKSURL == "" {
+		// log-ctx-waiver: boot: process start, before a context exists
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
@@ -480,7 +500,7 @@ func main() {
 	// no propagator, no exporter), so the global providers stay no-op and
 	// every instrumentation site degrades to zero cost. This does NOT touch
 	// the shortid X-Krateo-TraceId correlation id, the stdout->otel_logs log
-	// pipeline, or the use.TraceId()/use.Logger() chain below — OTel
+	// pipeline, or the newRequestChain() chain below — OTel
 	// coexists with all three. The deferred shutdowns flush the batch
 	// span/metric pipelines on graceful exit; they are no-ops when disabled.
 	otelCtx := context.Background()
@@ -490,13 +510,13 @@ func main() {
 	otelresource.InstallErrorHandler(log)
 	traceShutdown, err := tracing.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel tracing setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel tracing setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = traceShutdown(context.Background()) }()
 
 	metricShutdown, err := metrics.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel metrics setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel metrics setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = metricShutdown(context.Background()) }()
 
@@ -511,7 +531,7 @@ func main() {
 	// untouched.
 	logProvider, logShutdown, err := logging.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel logs setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel logs setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = logShutdown(context.Background()) }()
 	if logProvider != nil {
@@ -520,17 +540,7 @@ func main() {
 		))
 	}
 
-	chain := use.NewChain(
-		use.TraceId(),
-		use.Logger(log),
-		// Audit correlation (D19a): mint/accept the business session id and
-		// write it into W3C baggage (session.id), carried on the request
-		// context and serialized downstream by the Baggage propagator. The
-		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
-		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
-		// traceparent; no bespoke correlation header any more.
-		audit.Middleware(),
-	)
+	chain := newRequestChain(log)
 
 	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
 	// #155 for the /call loopback; the loopback DISPATCH BRANCH was retired
@@ -588,7 +598,7 @@ func main() {
 	defer cacheCancel()
 	// 0.30.207 — honor DEBUG on the background path. cacheCtx is a bare
 	// context.Background() derivative; unlike the HTTP request path (which
-	// runs use.Logger(log) → xcontext.WithLogger), it carries NO logger.
+	// runs middleware.RequestLogger → xcontext.WithLogger), it carries NO logger.
 	// Every background-resolve site (refresher → resolveAndPopulateL1 →
 	// resolver, prewarm walk, discovery refresher) calls
 	// xcontext.Logger(ctx), which on a logger-less context falls back to a
@@ -605,7 +615,7 @@ func main() {
 	if !cache.Disabled() {
 		rc, rcErr := credhttp.InClusterConfig()
 		if rcErr != nil {
-			log.Warn("cache: rest.InClusterConfig failed; staying on apiserver branch",
+			log.WarnContext(cacheCtx, "cache: rest.InClusterConfig failed; staying on apiserver branch",
 				slog.Any("err", rcErr))
 		} else {
 			// #237 A3 — install the reflector-path classifier BEFORE the
@@ -647,18 +657,18 @@ func main() {
 			cache.SetImpersonationAvailable(func() bool {
 				reviewer, revErr := cache.NewSSARImpersonationReviewer(rc)
 				if revErr != nil {
-					log.Warn("cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
+					log.WarnContext(cacheCtx, "cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
 						slog.Any("err", revErr))
 					return false
 				}
 				usersOK, ssarErr := reviewer(cacheCtx, cache.ImpersonateResourceUsers, "", "")
 				if ssarErr != nil {
-					log.Warn("cache: #574 impersonation probe failed; refresher keeps the SA transport",
+					log.WarnContext(cacheCtx, "cache: #574 impersonation probe failed; refresher keeps the SA transport",
 						slog.Any("err", ssarErr))
 					return false
 				}
 				if !usersOK {
-					log.Warn("cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
 						"so background refreshes for a per-user cohort stay re-gated and continue to fail closed",
 						slog.String("needed", "impersonate on users (and allowlisted groups) in snowplow's ClusterRole"),
 						slog.String("effect", "pre-#574 behaviour; this is a MISSING RBAC GRANT, not a code fault"))
@@ -672,11 +682,11 @@ func main() {
 				cache.SetImpersonationProbeResult(true, gErr == nil && groupsAll, sErr == nil && sasAll)
 				switch {
 				case gErr != nil || sErr != nil:
-					log.Warn("cache: #574 impersonation granted for users; the groups/serviceaccounts probe FAILED — "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation granted for users; the groups/serviceaccounts probe FAILED — "+
 						"each cohort is checked on its first refresh and falls back to the re-gated SA transport if refused",
 						slog.Any("groups_err", gErr), slog.Any("serviceaccounts_err", sErr))
 				case !groupsAll:
-					log.Warn("cache: #574 impersonation granted for users only — groups are NOT granted for every name. "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation granted for users only — groups are NOT granted for every name. "+
 						"A cohort whose groups are not all in rbac.impersonateGroups is refreshed over snowplow's ServiceAccount "+
 						"with the re-gate instead of as the cohort (#608); read snowplow_impersonation{stat=impersonation_fallback_sa}",
 						slog.String("placeholder", cache.CohortPlaceholderUsername),
@@ -692,12 +702,12 @@ func main() {
 
 			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
-				log.Warn("cache: dynamic.NewForConfig failed; staying on apiserver branch",
+				log.WarnContext(cacheCtx, "cache: dynamic.NewForConfig failed; staying on apiserver branch",
 					slog.Any("err", dynErr))
 			} else {
 				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
 				if wErr != nil {
-					log.Warn("cache: NewResourceWatcher failed; staying on apiserver branch",
+					log.WarnContext(cacheCtx, "cache: NewResourceWatcher failed; staying on apiserver branch",
 						slog.Any("err", wErr))
 				} else {
 					cacheWatcher = w
@@ -761,7 +771,7 @@ func main() {
 					// without crash-looping the pod).
 					metaCli, metaErr := credhttp.Metadata(rc)
 					if metaErr != nil {
-						log.Warn("cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
+						log.WarnContext(cacheCtx, "cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
 							slog.Any("err", metaErr))
 					} else {
 						w.SetMetadataClient(metaCli)
@@ -787,7 +797,7 @@ func main() {
 					// but not crash-looping — a loud WARN flags it.
 					discoCli, discoErr := credhttp.Discovery(rc)
 					if discoErr != nil {
-						log.Warn("cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
+						log.WarnContext(cacheCtx, "cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
 							slog.Any("err", discoErr))
 					} else {
 						w.SetDiscoveryClient(discoCli)
@@ -909,14 +919,18 @@ func main() {
 					// is a no-op inside the Start fn.
 					cache.StartSliceabilityReverifier(cacheCtx)
 
-					// Block until RBAC informer LISTs complete so the
-					// first dispatch is not racing the initial sync.
-					// Bounded at 60s — soft failure (log + continue),
-					// not fatal.
+					// Wait for the informers' initial LISTs before Phase 1, so
+					// its walk is not racing the initial sync. Bounded at 60 s:
+					// on timeout boot continues. This bounds boot, never
+					// readiness (#1231): /readyz stays 503 until the RBAC
+					// snapshot is complete (cache.RBACReadiness), however long
+					// that takes. The WARN names the RBAC informers still
+					// listing, so a stalled sync says where it is stuck.
 					syncCtx, syncCancel := context.WithTimeout(cacheCtx, 60*time.Second)
 					if err := w.WaitForCacheSync(syncCtx, 60*time.Second); err != nil {
-						log.Warn("cache: initial WaitForCacheSync incomplete; first dispatches may evaluate against partial RBAC index",
-							slog.Any("err", err))
+						log.WarnContext(syncCtx, "cache: initial WaitForCacheSync incomplete after 60s; boot continues, and /readyz stays NotReady until every RBAC informer has synced",
+							slog.Any("err", err),
+							slog.Any("unsynced_rbac_informers", cache.UnsyncedRBACInformers()))
 					} else {
 						log.Info("cache: RBAC informers fully synced")
 					}
@@ -940,7 +954,7 @@ func main() {
 					if snap := cache.LiveRBACSnapshot(); snap != nil {
 						const sentinel = "system:cohort:group-only:v1"
 						if n := len(snap.CRBsByUser[sentinel]); n > 0 {
-							log.Error("cache: sentinel collision — a ClusterRoleBinding has subject Name="+sentinel,
+							log.ErrorContext(syncCtx, "cache: sentinel collision — a ClusterRoleBinding has subject Name="+sentinel,
 								slog.Int("crb_count", n),
 								slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
 							)
@@ -948,7 +962,7 @@ func main() {
 						}
 						for ns, byUser := range snap.RBsByUserByNS {
 							if n := len(byUser[sentinel]); n > 0 {
-								log.Error("cache: sentinel collision — a RoleBinding has subject Name="+sentinel,
+								log.ErrorContext(syncCtx, "cache: sentinel collision — a RoleBinding has subject Name="+sentinel,
 									slog.String("namespace", ns),
 									slog.Int("rb_count", n),
 									slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
@@ -974,7 +988,7 @@ func main() {
 					// to surface the misconfiguration.
 					if *authnNS != "" {
 						if err := cache.StartSecretsInformer(cacheCtx, rc, *authnNS); err != nil {
-							log.Warn("cache: StartSecretsInformer failed; F-3 cache offline (upstream fallback)",
+							log.WarnContext(syncCtx, "cache: StartSecretsInformer failed; F-3 cache offline (upstream fallback)",
 								slog.String("authn_ns", *authnNS),
 								slog.Any("err", err))
 						}
@@ -993,7 +1007,7 @@ func main() {
 					// only runs when cache is on.
 					controllerHealthNamespaces := splitCommaList(*controllerHealthNS)
 					if err := cache.StartControllerHealthInformer(cacheCtx, rc, controllerHealthNamespaces); err != nil {
-						log.Warn("cache: StartControllerHealthInformer failed; Resilience-1 gauges offline",
+						log.WarnContext(syncCtx, "cache: StartControllerHealthInformer failed; Resilience-1 gauges offline",
 							slog.Any("err", err))
 					}
 
@@ -1028,7 +1042,7 @@ func main() {
 						invCtx, invCancel := context.WithTimeout(cacheCtx, startupTimeout)
 						inv, invErr := cache.CollectResourceTypesFromRestActions(invCtx, dynCli)
 						if invErr != nil {
-							log.Warn("cache: RestAction inventory walk failed; falling through to lazy registration",
+							log.WarnContext(invCtx, "cache: RestAction inventory walk failed; falling through to lazy registration",
 								slog.Any("err", invErr))
 							// Mark eager-done with an empty set so any
 							// post-startup AddResourceType is treated as
@@ -1037,7 +1051,7 @@ func main() {
 						} else {
 							n, regErr := cache.EagerRegisterAll(invCtx, w, inv, fanin, startupTimeout)
 							if regErr != nil {
-								log.Warn("cache: eager registration WaitForCacheSync incomplete",
+								log.WarnContext(invCtx, "cache: eager registration WaitForCacheSync incomplete",
 									slog.Int("resource_types", n),
 									slog.Any("err", regErr))
 							}
@@ -1121,7 +1135,7 @@ func main() {
 							reg, present, pwErr := w.PrewarmRegisterFromNavigation(pwCtx, dynCli)
 							pwCancel()
 							if pwErr != nil {
-								log.Warn("cache: startup navigation GVR-walk incomplete; lazy register-on-navigation covers the gap",
+								log.WarnContext(pwCtx, "cache: startup navigation GVR-walk incomplete; lazy register-on-navigation covers the gap",
 									slog.Any("err", pwErr))
 							} else {
 								log.Info("cache: startup navigation GVR-walk done",
@@ -1185,7 +1199,7 @@ func main() {
 								p1Ctx, p1Cancel := context.WithTimeout(cacheCtx, phase1Timeout)
 								defer p1Cancel()
 								if err := dispatchers.Phase1Warmup(p1Ctx, rc, *authnNS); err != nil {
-									log.Warn("cache: Phase 1 startup warmup incomplete",
+									log.WarnContext(p1Ctx, "cache: Phase 1 startup warmup incomplete",
 										slog.String("subsystem", "cache"),
 										slog.Any("err", err))
 								}
@@ -1240,13 +1254,13 @@ func main() {
 		} else {
 			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
-				log.Warn("cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
+				log.WarnContext(cacheCtx, "cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
 					slog.Any("err", dynErr))
 				_, _ = cache.NewResourceWatcher(cacheCtx, nil)
 			} else {
 				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
 				if wErr != nil {
-					log.Warn("cache: NewResourceWatcher failed in disabled mode; watcher will be nil",
+					log.WarnContext(cacheCtx, "cache: NewResourceWatcher failed in disabled mode; watcher will be nil",
 						slog.Any("err", wErr))
 				} else if w != nil {
 					cacheWatcher = w
@@ -1526,7 +1540,7 @@ func main() {
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("server cannot run",
+			log.ErrorContext(cacheCtx, "server cannot run",
 				slog.String("addr", server.Addr),
 				slog.Any("err", err))
 		}
@@ -1545,7 +1559,7 @@ func main() {
 
 	server.SetKeepAlivesEnabled(false)
 	if err := server.Shutdown(ctx); err != nil {
-		log.Error("server forced to shutdown", slog.Any("err", err))
+		log.ErrorContext(ctx, "server forced to shutdown", slog.Any("err", err))
 	}
 
 	log.Info("server gracefully stopped")

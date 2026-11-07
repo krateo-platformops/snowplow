@@ -187,8 +187,9 @@ func rotateIfRBACEventSeenPreBuild() bool {
 //
 // THE ONE EXCEPTION: no complete RBAC snapshot yet. Building over a partial
 // one would skip a binding whose role is not listed yet, for good (#686), so
-// the flip only REQUESTS the build and the first complete publish runs it —
-// after Ready. Until that publish, EvaluateRBAC has no complete snapshot to
+// the flip only REQUESTS the build and the first complete publish runs it.
+// Since #1231 that is still before Ready: readiness waits for the initial
+// publish to return, the build included (rbac_readiness.go). Until that publish, EvaluateRBAC has no complete snapshot to
 // grant from (no snapshot: deny; a partial event-driven one: the pre-existing
 // #686 window), so few or no identity-bound keys exist to rotate. The case is
 // counted (snowplow_bindings_index_ready_settle.deferred_at_flip) and logged,
@@ -209,6 +210,7 @@ func settleBindingsIndexBeforeReady() {
 		readySettleLastNanos.Store(int64(time.Since(start)))
 		if r := recover(); r != nil {
 			readySettlePanics.Add(1)
+			// log-ctx-waiver: boot: phase 1 settles the index before the pod is ready
 			slog.Error("cache.bindings_by_gvr.ready_settle_panic",
 				slog.String("subsystem", "cache"),
 				slog.String("panic_type", fmt.Sprintf("%T", r)), // metadata only, never the value
@@ -233,10 +235,11 @@ func settleBindingsIndexBeforeReady() {
 		return
 	}
 	readySettleDeferred.Add(1)
+	// log-ctx-waiver: boot: phase 1 settles the index before the pod is ready
 	slog.Warn("cache.bindings_by_gvr.ready_settle_deferred",
 		slog.String("subsystem", "cache"),
-		slog.String("effect", "Ready flips before the first complete RBAC snapshot: the bindings-index build "+
-			"(and a #682 epoch bump, if owed) runs at that publish, after Ready (#819, #686)"))
+		slog.String("effect", "Phase 1 finished before the first complete RBAC snapshot: the bindings-index build "+
+			"(and a #682 epoch bump, if owed) runs at that publish, before Ready, which waits for it (#819, #686, #1231)"))
 }
 
 var (

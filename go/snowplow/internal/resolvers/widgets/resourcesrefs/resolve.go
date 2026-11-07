@@ -16,7 +16,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -143,20 +142,15 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			origin := cache.RefDenialOrigin(ctx)
 			cache.RecordRefDenied(origin)
 			if origin == cache.RefDenialOriginServe {
-				// #563 — the one denial that may be a REAL access problem is
-				// also the one that was unactionable: it named the verb, the
-				// resource and the namespace but never WHO was denied. The
-				// identity goes in as its redact label, never in clear (#453);
-				// a ctx with no UserInfo (the fail-closed denial) labels as
-				// anonymous.
-				ui, _ := xcontext.UserInfo(ctx)
-				log.Warn("resource ref action not allowed",
+				// #563 — the one denial that may be a REAL access problem. WHO
+				// was denied is on the audit record, not here (#1192): the
+				// line's traceId joins the two.
+				log.WarnContext(ctx, "resource ref action not allowed",
 					slog.String("id", in.ID),
 					slog.String("verb", verb),
 					slog.String("group", gvr.Group),
 					slog.String("resource", gvr.Resource),
-					slog.String("namespace", in.Namespace),
-					slog.String("user", redact.User(ui.Username)))
+					slog.String("namespace", in.Namespace))
 			} else {
 				log.Debug("resource ref action not allowed",
 					slog.String("id", in.ID),

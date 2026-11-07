@@ -113,7 +113,7 @@ type e6Row struct {
 
 func e6Table(t *testing.T) []e6Row {
 	rw := newF1Watcher(t)
-	items, servable := rw.ListObjectsServable(f1WidgetsGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), f1WidgetsGVR, "")
 	if !servable || len(items) == 0 {
 		t.Fatalf("setup: widgets GVR not servable after sync")
 	}
@@ -228,7 +228,7 @@ func e6Table(t *testing.T) []e6Row {
 		// #676). Its empty result used to drop apiVersion/kind.
 		{"cache: ListServableEnvelopeJSONWhere, every item",
 			[]string{"cache.ListServableEnvelopeJSONWhere"}, func(t *testing.T) any {
-				b, ok := rw.ListServableEnvelopeJSONWhere(f1WidgetsGVR, "", nil)
+				b, ok := rw.ListServableEnvelopeJSONWhere(context.Background(), f1WidgetsGVR, "", nil)
 				if !ok {
 					t.Fatal("not servable")
 				}
@@ -236,7 +236,7 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"cache: ListServableEnvelopeJSONWhere, a selector that matches nothing",
 			[]string{"cache.ListServableEnvelopeJSONWhere"}, func(t *testing.T) any {
-				b, ok := rw.ListServableEnvelopeJSONWhere(f1WidgetsGVR, "", func(*unstructured.Unstructured) bool { return false })
+				b, ok := rw.ListServableEnvelopeJSONWhere(context.Background(), f1WidgetsGVR, "", func(*unstructured.Unstructured) bool { return false })
 				if !ok {
 					t.Fatal("not servable")
 				}

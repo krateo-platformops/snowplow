@@ -21,7 +21,7 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 	key := cache.ComputeKey(in)
 
 	hKW := &getRecordingHandle{}
-	if seedSkipDecision(context.Background(), seedModeKeepwarm, hKW, key, "widgets", "ns/kw", "") {
+	if seedSkipDecision(context.Background(), seedModeKeepwarm, hKW, key, "widgets", "ns/kw") {
 		t.Fatal("keepwarm: a MISS must not be skipped (must re-resolve)")
 	}
 	if !hKW.sawGetNoTouch(key) {
@@ -34,7 +34,7 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 	// seedModeBoot with an empty ctx → the declined-external set is nil → not Marked →
 	// the decision reaches the liveness read (now GetNoTouch).
 	hBoot := &getRecordingHandle{}
-	if seedSkipDecision(context.Background(), seedModeBoot, hBoot, key, "widgets", "ns/kw", "") {
+	if seedSkipDecision(context.Background(), seedModeBoot, hBoot, key, "widgets", "ns/kw") {
 		t.Fatal("boot: an unmarked MISS must not be skipped")
 	}
 	if !hBoot.sawGetNoTouch(key) || hBoot.sawGetTouch(key) {
@@ -71,7 +71,7 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 	evBefore := c.Stats().EvictMaxAgeTotal
 	missBefore := c.Stats().MissTotal
 
-	if seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/warmstale", "") {
+	if seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/warmstale") {
 		t.Fatal("#376 keep-evict: a past-maxAge cell must NOT be skipped — it must re-resolve")
 	}
 	if got := c.Stats().EvictMaxAgeTotal; got != evBefore+1 {
@@ -124,7 +124,7 @@ func TestIssue376_WarmGauge_KeepwarmSweepLeavesNeitherBucket(t *testing.T) {
 	}
 
 	// The real keepwarm sweep reads via GetNoTouch and age-skips (young body) — no stamp.
-	if !seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/sweepcold", "") {
+	if !seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/sweepcold") {
 		t.Fatal("setup: a body-young cell must be keepwarm age-skipped (the sweep read happened via GetNoTouch)")
 	}
 	c.ReapPastMaxEntryAgeForTest()
