@@ -401,6 +401,16 @@ with no `endpointRef` (this cluster's apiserver, a snowplow-held credential)
 follows no redirect at all (#723). An endpoint that legitimately redirects
 elsewhere (a CDN, a moved host) must be given its final URL.
 
+snowplow is stricter here than the plumbing library other Krateo components
+use, on purpose, so a RESTAction that works through plumbing can still fail
+here:
+
+- plumbing lets a credential follow a redirect from `http` to `https` on the
+  same host. snowplow refuses it like any other change of origin: give the
+  endpoint its `https` URL.
+- the endpoint Secret's `pass-credentials-on-redirect` key has no effect in
+  snowplow. A redirect to another origin is refused with or without it.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**

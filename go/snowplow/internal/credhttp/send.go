@@ -3,7 +3,7 @@ package credhttp
 // send.go — #1088: the one send policy for an endpoint dial (the RESTAction
 // branch-E stage fetch and the /call passthrough, credhttp.Do).
 //
-// A WRITE IS SENT ONCE. plumbing's util.RetryClient (v1.15.1 http/util/retry.go)
+// A WRITE IS SENT ONCE. plumbing's util.RetryClient (v1.28.1 http/util/retry.go)
 // re-sends GET, HEAD, OPTIONS, PUT and DELETE on a network error, a 429 or a
 // 5xx. For PUT and DELETE that is a re-send after the server may already have
 // received the request: measured against a server that reads the whole request
@@ -257,10 +257,10 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // retryAfter transcribe (http/util/retry.go: backoff, parseRetryAfter, both
 // unexported). TestBudget1115_RetryPolicyPinnedToPlumbing fails when the module
 // builds against another one, so a plumbing bump re-audits them.
-const retryPolicyTranscribedFrom = "v1.15.1"
+const retryPolicyTranscribedFrom = "v1.28.1"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
-// v1.15.1 http/util/retry.go backoff(0, base, max)): base capped at max,
+// v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
 // jittered into [d/2, d).
 func firstBackoff(base, maxB time.Duration) time.Duration {
 	d := min(base, maxB)
