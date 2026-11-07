@@ -286,6 +286,7 @@ func resolveEngineProcessCtx() context.Context {
 		return engineProcessCtx
 	}
 	engineProcessCtxMissingOnce.Do(func() {
+		// log-ctx-waiver: boot: the engine lookup that found no process context, once
 		slog.Error("engine.process_ctx.missing — falling back to context.Background()",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "main.go must call dispatchers.SetEngineProcessContext(cacheCtx) before Phase1Warmup; under unit-test wiring this fallback keeps the engine alive but the production wiring is broken if this fires in production logs"),
@@ -334,7 +335,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 
 	saEP, saErr := idynamic.ServiceAccountEndpoint()
 	if saErr != nil {
-		log.Error("phase1.warmup.no_sa_endpoint",
+		log.ErrorContext(ctx, "phase1.warmup.no_sa_endpoint",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", saErr),
 			slog.String("effect", "Phase 1 cannot resolve under SA identity; readiness is released "+
@@ -361,7 +362,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// Fairness is authoritative here as everywhere else.
 	dynCli, dynErr := credhttp.Dynamic(rc)
 	if dynErr != nil {
-		log.Error("phase1.warmup.no_dyn_client",
+		log.ErrorContext(ctx, "phase1.warmup.no_dyn_client",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", dynErr),
 			slog.String("effect", "Phase 1 cannot read the navigation roots; readiness is released "+
@@ -712,7 +713,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// Composition GVRs are discovered by one-shot apiserver discovery
 	// (cache.DiscoverGroupResources) invoked synchronously from the
 	// walker the first time it reaches a templated apiserver path.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(ctx)
 
 	// Step 2 — (Ship 0 / 0.30.222) the explicit StartCRDWatch call that
 	// lived here was DELETED. Ship 0.5 / 0.30.223 (v6) DELETED the CRD
@@ -749,7 +750,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		// (Step 7) and the flip (Step 7.6/8) are unchanged and byte-identical
 		// for the deps-present-at-boot path (this branch is not even entered
 		// then). project_readyz_gates_on_prewarm_complete is intact.
-		log.Warn("phase1.warmup.roots_list_failed",
+		log.WarnContext(ctx, "phase1.warmup.roots_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", listErr),
 			slog.String("effect", "no roots to walk YET; the config-vars ConfigMap informer will drive a "+
@@ -793,7 +794,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			break
 		}
 		if err := resolve(ctx, root); err != nil {
-			log.Warn("phase1.warmup.root_resolve_failed",
+			log.WarnContext(ctx, "phase1.warmup.root_resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", rootKey(root.Root)),
 				slog.Any("err", err),
@@ -944,7 +945,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			defer func() {
 				if r := recover(); r != nil {
 					seedPanicked = true
-					log.Error("phase1.seed.panic",
+					log.ErrorContext(ctx, "phase1.seed.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
 						slog.String("effect", "per-cohort SYNC seed aborted; readiness flips to "+
@@ -966,7 +967,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			seedErr = pipSeed(seedCtx)
 			parentErrAtExit, seedCtxErrAtExit = ctx.Err(), seedCtx.Err()
 			if err := seedErr; err != nil {
-				log.Warn("phase1.seed.sync_incomplete",
+				log.WarnContext(seedCtx, "phase1.seed.sync_incomplete",
 					slog.String("subsystem", "cache"),
 					slog.Any("err", err),
 					slog.String("effect", "readiness flips (backstop); first /call per affected "+
@@ -1011,7 +1012,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error("phase1.pagination_drain.panic",
+					log.ErrorContext(ctx, "phase1.pagination_drain.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
 						slog.String("effect", "background apiRef pagination drain aborted; "+
@@ -1366,7 +1367,7 @@ func installSeedLoopbackToken(ctx context.Context) context.Context {
 		// ctx cancelled, budget/steps exhausted, or (defensively) empty token:
 		// degrade to token-less, exactly as the pre-shape-A fire-once path did.
 		seedLoopbackTokenErrTotal.Add(1)
-		slog.Warn("prewarm.seed_loopback_token_unavailable",
+		slog.WarnContext(ctx, "prewarm.seed_loopback_token_unavailable",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", waitErr),
 			slog.String("effect", "prewarm loopback ran token-less after bounded retry; a nested loopback "+
@@ -1427,7 +1428,7 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 // with no page/perPage, so prewarmPaginationFor("") is the unpaginated
 // (-1,-1), and the walk both resolves the root and keys its cell with it.
 func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource) error {
-	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(""))
+	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(ctx, ""))
 }
 
 // walkChild is the ONE entry of a walk into a child widget reached through a
@@ -1437,7 +1438,7 @@ func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstruct
 // caller fetched; the child's pagination comes from child.Path — the URL the
 // browser requests for it — and the walk resolves AND keys with it.
 func (w *phase1Walker) walkChild(ctx context.Context, child navChildRef, got objects.Result, depth int) error {
-	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(child.Path))
+	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(ctx, child.Path))
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -1543,7 +1544,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		return ctx.Err()
 	}
 	if depth > phase1MaxWalkDepth {
-		log.Warn("phase1.walk.max_depth",
+		log.WarnContext(ctx, "phase1.walk.max_depth",
 			slog.String("subsystem", "cache"),
 			slog.Int("depth", depth),
 			slog.String("widget", rootKey(in)),
@@ -1659,7 +1660,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// #643 PR-B2 ruling (c): an external-touched resolve that errored is
 		// marked only on a structural LEAF (replayed as this same error path).
 		walkMarkDeclinedExternal(resolveCtx, wcKey, in, walkUID, walkRV, nil, true)
-		log.Warn("phase1.walk.child_resolve_failed",
+		log.WarnContext(ctx, "phase1.walk.child_resolve_failed",
 			slog.String("subsystem", "cache"),
 			slog.Int("depth", depth),
 			slog.String("widget", rootKey(in)),
@@ -1839,7 +1840,7 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 			// widget only the routes loader would have found (#220). F6b is
 			// the closer — it needs no walk at all.
 			gone := w.forgetChildIfGone(ctx, ref, got.Err)
-			log.Warn("phase1.walk.child_fetch_failed",
+			log.WarnContext(ctx, "phase1.walk.child_fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("depth", depth),
 				slog.String("child", key),

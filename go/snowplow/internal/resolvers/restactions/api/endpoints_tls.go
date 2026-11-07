@@ -196,7 +196,7 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		return cli, false, err
 	}
 
-	tlsCfg, ok := endpointTLSConfig(ep)
+	tlsCfg, ok := endpointTLSConfig(ctx, ep)
 	if !ok {
 		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
 		return cli, false, err
@@ -371,7 +371,7 @@ func endpointOwnedShape(ep *endpoints.Endpoint) bool {
 // plumbing reads it, or ok=false when ep carries material the owned branch
 // cannot read exactly — the caller then delegates to plumbing, which fails or
 // succeeds on it as it does today. Requires endpointOwnedShape(ep).
-func endpointTLSConfig(ep *endpoints.Endpoint) (transport.TLSConfig, bool) {
+func endpointTLSConfig(ctx context.Context, ep *endpoints.Endpoint) (transport.TLSConfig, bool) {
 	if ep.HasCertAuth() {
 		// plumbing's tlsConfigFor: cert, key and CA each base64-decoded once,
 		// the CA appended as PEM, and a key pair that does not load is an error.
@@ -413,7 +413,7 @@ func endpointTLSConfig(ep *endpoints.Endpoint) (transport.TLSConfig, bool) {
 		// detector counter (snowplow_unparseable_ca_delegations_total) + a
 		// BOUNDED one-shot WARN keyed by (ServerURL, CA sha256). Such a client
 		// is not kept (#1088), so it still counts once per fetch.
-		warnUnparseableCADelegation(ep)
+		warnUnparseableCADelegation(ctx, ep)
 		return transport.TLSConfig{}, false
 	}
 	return transport.TLSConfig{CAData: caPEM}, true

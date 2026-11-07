@@ -779,7 +779,7 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	}
 
 	if err != nil {
-		slog.Warn("prewarm.engine.scope_incomplete",
+		slog.WarnContext(ctx, "prewarm.engine.scope_incomplete",
 			slog.String("subsystem", "cache"),
 			slog.String("scope", s.key()),
 			slog.Any("err", err),

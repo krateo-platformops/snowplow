@@ -44,7 +44,7 @@ func JQ() http.HandlerFunc {
 
 		_, err := xcontext.UserConfig(req.Context())
 		if err != nil {
-			log.Error("unable to get user endpoint", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
 			response.Unauthorized(wri, err)
 			return
 		}
@@ -52,7 +52,7 @@ func JQ() http.HandlerFunc {
 		contentType := req.Header.Get("Content-Type")
 		if !strings.Contains(contentType, "application/json") {
 			err := fmt.Errorf("unsupported content type '%s' use 'application/json'", contentType)
-			log.Error(err.Error())
+			log.ErrorContext(req.Context(), err.Error())
 			response.NotAcceptable(wri, err)
 			return
 		}
@@ -61,7 +61,7 @@ func JQ() http.HandlerFunc {
 		dec := json.NewDecoder(io.LimitReader(req.Body, MaxBodySize))
 		err = dec.Decode(in)
 		if err != nil {
-			log.Error("unable to decode JSON body", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to decode JSON body", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}
@@ -72,7 +72,7 @@ func JQ() http.HandlerFunc {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 		if err != nil {
-			log.Error("unable to evaluate JQ query", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to evaluate JQ query", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}

@@ -90,7 +90,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 			// will silently take the per-user path, which has no
 			// `<sa>-clientconfig` Secret and so will fail. Loud so a
 			// future caller passing the wrong shape is diagnosable.
-			xcontext.Logger(ctx).Warn("resolveOne: internal endpoint present but not a usable *endpoints.Endpoint; falling through to per-user clientconfig",
+			xcontext.Logger(ctx).WarnContext(ctx, "resolveOne: internal endpoint present but not a usable *endpoints.Endpoint; falling through to per-user clientconfig",
 				slog.String("subsystem", "cache"),
 				slog.String("got_type", fmt.Sprintf("%T", v)),
 				slog.String("hint", "an internal driver (e.g. Phase 1) must pass *endpoints.Endpoint to cache.WithInternalEndpoint"),

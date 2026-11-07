@@ -319,7 +319,7 @@ func StartControllerHealthInformer(ctx context.Context, rc *rest.Config, namespa
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
 	if ok := clientcache.WaitForCacheSync(syncCtx.Done(), hasSyncedFns...); !ok {
-		slog.Warn("cache.controller_health.initial_sync_timeout",
+		slog.WarnContext(ctx, "cache.controller_health.initial_sync_timeout",
 			slog.String("subsystem", "cache"),
 			slog.Any("namespaces", namespaces),
 			slog.String("hint", "controller-health gauges will populate when HasSynced flips"),
@@ -352,6 +352,7 @@ func installControllerHealthHandlers(inf clientcache.SharedIndexInformer) {
 		UpdateFunc: func(_, _ interface{}) { scheduleControllerHealthRebuild() },
 		DeleteFunc: func(_ interface{}) { scheduleControllerHealthRebuild() },
 	}); err != nil {
+		// log-ctx-waiver: boot: wired once, before the controller-health informers start
 		slog.Warn("cache.controller_health.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -364,6 +365,7 @@ func installControllerHealthHandlers(inf clientcache.SharedIndexInformer) {
 func installControllerHealthWatchErrorHandler(inf clientcache.SharedIndexInformer) {
 	handler := controllerHealthWatchErrorHandler()
 	if err := inf.SetWatchErrorHandler(handler); err != nil {
+		// log-ctx-waiver: boot: wired once, before the controller-health informers start
 		slog.Warn("cache.controller_health.watch.set_error_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -385,6 +387,7 @@ func controllerHealthWatchErrorHandler() func(*clientcache.Reflector, error) {
 		if !controllerHealthWatchBroken.CompareAndSwap(false, true) {
 			return // duplicate WARN suppressed
 		}
+		// log-ctx-waiver: informer-event: a watch error on the reflector goroutine
 		slog.Warn("cache.controller_health.watch.broken",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -406,6 +409,7 @@ func scheduleControllerHealthRebuild() {
 		defer func() {
 			if r := recover(); r != nil {
 				controllerHealthRebuildDirty.Store(true)
+				// log-ctx-waiver: worker: the debounced snapshot rebuild goroutine
 				slog.Error("cache.controller_health.rebuild_panic",
 					slog.String("subsystem", "cache"),
 					slog.Any("recovered", r),
@@ -659,6 +663,7 @@ func (h *controllerHealthHandle) podRestartCounts(dep *appsv1.Deployment) (map[s
 		// returns an error for an unknown one). Reporting nothing is
 		// the only safe answer — degrading to a namespace-wide LIST
 		// IS the defect.
+		// log-ctx-waiver: worker: the controller-health rebuild, which no request drives
 		slog.Warn("cache.controller_health.pod_selector_invalid",
 			slog.String("subsystem", "cache"),
 			slog.String("ns", dep.Namespace),
@@ -677,6 +682,7 @@ func (h *controllerHealthHandle) podRestartCounts(dep *appsv1.Deployment) (map[s
 	// must serve.)
 	selStr := sel.String()
 	if selStr == "" {
+		// log-ctx-waiver: worker: the controller-health rebuild, which no request drives
 		slog.Warn("cache.controller_health.pod_selector_empty",
 			slog.String("subsystem", "cache"),
 			slog.String("ns", dep.Namespace),
@@ -718,6 +724,7 @@ func (h *controllerHealthHandle) podRestartCounts(dep *appsv1.Deployment) (map[s
 	// a partial count that reads as a healthy one is the same
 	// detector failure as over-selection, so say so at Warn.
 	if pods.Continue != "" {
+		// log-ctx-waiver: worker: the controller-health rebuild, which no request drives
 		slog.Warn("cache.controller_health.pod_list_truncated",
 			slog.String("subsystem", "cache"),
 			slog.String("ns", dep.Namespace),

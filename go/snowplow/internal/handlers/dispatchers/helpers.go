@@ -69,7 +69,7 @@ func fetchObject(req *http.Request) (got objects.Result) {
 }
 
 func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
-	return paginationFromQuery(log, req.URL.Query())
+	return paginationFromQuery(req.Context(), log, req.URL.Query())
 }
 
 // paginationFromQuery is THE derivation of a /call's pagination from its query
@@ -78,14 +78,14 @@ func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
 // path the browser will request, so a prewarm cell and the request for the same
 // URL fold the same pagination for EVERY shape the URL can take — not only the
 // canonical one buildPath emits.
-func paginationFromQuery(log *slog.Logger, q url.Values) (perPage, page int) {
+func paginationFromQuery(ctx context.Context, log *slog.Logger, q url.Values) (perPage, page int) {
 	perPage, page = -1, -1
 
 	if val := q.Get("perPage"); val != "" {
 		var err error
 		perPage, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert perPage parameter to int",
+			log.ErrorContext(ctx, "unable convert perPage parameter to int",
 				slog.Any("err", err))
 		}
 	}
@@ -94,7 +94,7 @@ func paginationFromQuery(log *slog.Logger, q url.Values) (perPage, page int) {
 		var err error
 		page, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert page parameter to int",
+			log.ErrorContext(ctx, "unable convert page parameter to int",
 				slog.Any("err", err))
 		}
 	}
@@ -168,7 +168,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj
 
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("checkDispatchRBAC: unable to extract UserInfo",
+		log.ErrorContext(ctx, "checkDispatchRBAC: unable to extract UserInfo",
 			slog.Any("err", err),
 		)
 		return false
@@ -185,7 +185,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj
 	opts.SkipBindingUID = true
 	allowed, _, evalErr := evaluateRBACFn(ctx, opts)
 	if evalErr != nil {
-		log.Error("checkDispatchRBAC: EvaluateRBAC error",
+		log.ErrorContext(ctx, "checkDispatchRBAC: EvaluateRBAC error",
 			slog.String("user", redact.User(ui.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", target.Namespace),

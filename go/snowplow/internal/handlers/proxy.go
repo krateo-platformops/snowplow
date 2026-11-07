@@ -73,17 +73,17 @@ func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string
 
 			api := req.URL.Query().Get("apiVersion")
 			if len(api) == 0 {
-				log.Warn("missing 'apiVersion' query parameter")
+				log.WarnContext(req.Context(), "missing 'apiVersion' query parameter")
 			}
 
 			res := req.URL.Query().Get("resource")
 			if len(res) == 0 {
-				log.Warn("missing 'resource' query parameter")
+				log.WarnContext(req.Context(), "missing 'resource' query parameter")
 			}
 
 			gv, err := schema.ParseGroupVersion(api)
 			if err != nil {
-				log.Error("unable to create schema.GroupVersion",
+				log.ErrorContext(req.Context(), "unable to create schema.GroupVersion",
 					slog.String("api", api), slog.Any("err", err))
 			}
 			gvr := gv.WithResource(res)
@@ -96,7 +96,7 @@ func dispatcherForMethod(handlers map[string]http.Handler, dispatchMethod string
 
 			h, ok := handlers[key]
 			if !ok {
-				log.Warn("handler not found", slog.String("gvr", gvr.String()))
+				log.WarnContext(req.Context(), "handler not found", slog.String("gvr", gvr.String()))
 				next.ServeHTTP(wri, req)
 			} else {
 				log.Debug("handler found, forwarding request", slog.String("gvr", gvr.String()))

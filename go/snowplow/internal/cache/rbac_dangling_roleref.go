@@ -184,6 +184,7 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if _, was := danglingState.current[k]; was {
 			continue
 		}
+		// log-ctx-waiver: worker: the RBAC snapshot publish, a pod-wide rebuild
 		slog.Warn("cache.rbac.snapshot.dangling_roleref",
 			slog.String("subsystem", "cache"),
 			slog.String("binding_kind", k.bindingKind),
@@ -203,6 +204,7 @@ func noteDanglingRoleRefs(snap *RBACSnapshot, next map[danglingRoleRef]struct{})
 		if roleRefPresent(snap, k.bindingNamespace, rbacv1.RoleRef{Kind: k.roleKind, Name: k.roleName}) {
 			reason = "role_present"
 		}
+		// log-ctx-waiver: worker: the RBAC snapshot publish, a pod-wide rebuild
 		slog.Warn("cache.rbac.snapshot.dangling_roleref_resolved",
 			slog.String("subsystem", "cache"),
 			slog.String("binding_kind", k.bindingKind),

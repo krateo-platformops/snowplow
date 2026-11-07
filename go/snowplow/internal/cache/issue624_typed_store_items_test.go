@@ -184,7 +184,7 @@ func TestIssue624_TypedRBACStore_ServedEqualsApiserver(t *testing.T) {
 				}
 
 				// Decoded branch.
-				items, ok := rw.ListObjectsServable(gvr, ns)
+				items, ok := rw.ListObjectsServable(context.Background(), gvr, ns)
 				if !ok {
 					t.Fatalf("decoded: served=false on a synced typed GVR — want served=true with the items")
 				}
@@ -199,7 +199,7 @@ func TestIssue624_TypedRBACStore_ServedEqualsApiserver(t *testing.T) {
 				}
 
 				// Raw (#578) branch.
-				raws, ok := rw.ListRawServable(gvr, ns)
+				raws, ok := rw.ListRawServable(context.Background(), gvr, ns)
 				if !ok {
 					t.Fatalf("raw: served=false on a synced typed GVR — want served=true with the items")
 				}
@@ -227,7 +227,7 @@ func TestIssue624_TypedRBACStore_ServedEqualsApiserver(t *testing.T) {
 				// GET-by-name: every apiserver item is served, and equal.
 				for i := range api.Items {
 					a := &api.Items[i]
-					got, hit := rw.GetObject(gvr, a.GetNamespace(), a.GetName())
+					got, hit := rw.GetObject(context.Background(), gvr, a.GetNamespace(), a.GetName())
 					if !hit {
 						t.Fatalf("GetObject(%s/%s): miss on a stored typed object", a.GetNamespace(), a.GetName())
 					}
@@ -287,7 +287,7 @@ func TestIssue624_Guard_EveryTypedOverrideIsServable(t *testing.T) {
 				t.Fatalf("indexer add: %v", err)
 			}
 
-			items, ok := rw.ListObjectsServable(gvr, "")
+			items, ok := rw.ListObjectsServable(context.Background(), gvr, "")
 			if !ok || len(items) != 1 {
 				t.Fatalf("%s (%T): decoded list served=%v items=%d — want served=true, 1 item", gvr, out, ok, len(items))
 			}
@@ -295,14 +295,14 @@ func TestIssue624_Guard_EveryTypedOverrideIsServable(t *testing.T) {
 				t.Fatalf("%s: rendered item lost identity: name=%q apiVersion=%q kind=%q",
 					gvr, items[0].GetName(), items[0].GetAPIVersion(), items[0].GetKind())
 			}
-			raws, ok := rw.ListRawServable(gvr, "")
+			raws, ok := rw.ListRawServable(context.Background(), gvr, "")
 			if !ok || len(raws) != 1 {
 				t.Fatalf("%s (%T): raw list served=%v items=%d — want served=true, 1 item", gvr, out, ok, len(raws))
 			}
 			if d := issue624MustJSON(t, items[0].Object); string(d) != string(raws[0]) {
 				t.Fatalf("%s: raw item != decoded item:\n decoded=%s\n     raw=%s", gvr, d, raws[0])
 			}
-			if got, hit := rw.GetObject(gvr, "guard-ns", "guard-obj"); !hit || got.GetName() != "guard-obj" {
+			if got, hit := rw.GetObject(context.Background(), gvr, "guard-ns", "guard-obj"); !hit || got.GetName() != "guard-obj" {
 				t.Fatalf("%s: GetObject hit=%v", gvr, hit)
 			}
 		})
@@ -342,18 +342,18 @@ func TestIssue624_UnrenderableSlot_FailsClosedAndCounts(t *testing.T) {
 	total0 := UnrenderableStoreItemsTotal()
 	dec0, raw0, get0 := cell(unrenderableSiteListDecoded), cell(unrenderableSiteListRaw), cell(unrenderableSiteGet)
 
-	if items, ok := rw.ListObjectsServable(gvr, "ns"); ok || items != nil {
+	if items, ok := rw.ListObjectsServable(context.Background(), gvr, "ns"); ok || items != nil {
 		t.Fatalf("decoded: served=%v items=%d — an unrenderable slot must fail the list CLOSED", ok, len(items))
 	}
-	if raws, ok := rw.ListRawServable(gvr, ""); ok || raws != nil {
+	if raws, ok := rw.ListRawServable(context.Background(), gvr, ""); ok || raws != nil {
 		t.Fatalf("raw: served=%v items=%d — an unrenderable slot must fail the list CLOSED", ok, len(raws))
 	}
-	if _, hit := rw.GetObject(gvr, "ns", "bad"); hit {
+	if _, hit := rw.GetObject(context.Background(), gvr, "ns", "bad"); hit {
 		t.Fatalf("GetObject of an unrenderable slot must miss")
 	}
 	// The renderable neighbour is still served by GET — fail-closed is per
 	// read, not a poisoned GVR.
-	if got, hit := rw.GetObject(gvr, "ns", "good"); !hit || got.GetName() != "good" {
+	if got, hit := rw.GetObject(context.Background(), gvr, "ns", "good"); !hit || got.GetName() != "good" {
 		t.Fatalf("GetObject(good) hit=%v", hit)
 	}
 
@@ -427,13 +427,13 @@ func TestIssue624_PartialObjectMetadataWithTypeMeta_FailsClosed(t *testing.T) {
 			if err := idx.Add(p); err != nil {
 				t.Fatal(err)
 			}
-			if items, ok := rw.ListObjectsServable(gvr, "ns"); ok || items != nil {
+			if items, ok := rw.ListObjectsServable(context.Background(), gvr, "ns"); ok || items != nil {
 				t.Fatalf("decoded: served=%v items=%d — a PartialObjectMetadata slot must fail the list CLOSED", ok, len(items))
 			}
-			if raws, ok := rw.ListRawServable(gvr, ""); ok || raws != nil {
+			if raws, ok := rw.ListRawServable(context.Background(), gvr, ""); ok || raws != nil {
 				t.Fatalf("raw: served=%v items=%d — a PartialObjectMetadata slot must fail the list CLOSED", ok, len(raws))
 			}
-			if got, hit := rw.GetObject(gvr, "ns", "bad"); hit {
+			if got, hit := rw.GetObject(context.Background(), gvr, "ns", "bad"); hit {
 				t.Fatalf("GetObject of a PartialObjectMetadata slot must miss, got %v", got.Object)
 			}
 		})

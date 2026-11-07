@@ -203,7 +203,7 @@ func (d *DepTracker) RecordListNarrowable(ctx context.Context, l1Key string, gvr
 		return
 	}
 	if l1Key == "" {
-		loudFailEmptyL1Key("RecordListNarrowable")
+		loudFailEmptyL1Key(ctx, "RecordListNarrowable")
 		return
 	}
 	mode := recordNarrowable

@@ -84,7 +84,7 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 			// ERROR that would flood the WARN-floor firehose on a healthy cluster.
 			log.Debug("iterator yielded no items (nil upstream)", slog.String("iterator", it), slog.Any("err", err))
 		} else {
-			log.Error("unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
+			log.ErrorContext(ctx, "unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
 		}
 	}
 

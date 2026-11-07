@@ -578,6 +578,7 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 		case phase1ExitSeedReturned:
 			effect = "readiness released after a seed fn returned without the engine latch"
 		}
+		// log-ctx-waiver: boot: the end of phase 1, which precedes readiness
 		slog.Default().Log(context.Background(), level, "prewarm.phase1.readiness_exit",
 			slog.String("subsystem", "cache"),
 			slog.String("outcome", rec.Outcome),

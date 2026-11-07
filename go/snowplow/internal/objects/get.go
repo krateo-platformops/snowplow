@@ -118,7 +118,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 						slog.String("gvr", gvr.String()),
 						slog.String("ns", ref.Namespace),
 						slog.String("name", ref.Name))
-				} else if obj, hit := rw.GetObject(gvr, ref.Namespace, ref.Name); hit && filterGetByRBAC(ctx, gvr, obj) {
+				} else if obj, hit := rw.GetObject(ctx, gvr, ref.Namespace, ref.Name); hit && filterGetByRBAC(ctx, gvr, obj) {
 					// Cache hit AND the context's user is RBAC-authorized
 					// to `get` this object.
 					//
@@ -216,7 +216,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
-		log.Error("unable to parse group version", slog.Any("reference", ref), slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to parse group version", slog.Any("reference", ref), slog.Any("err", err))
 		res.Err = response.New(http.StatusBadRequest, err)
 		return
 	}
@@ -224,7 +224,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
-		log.Error("unable to get user endpoint", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
 		res.Err = response.New(http.StatusUnauthorized, err)
 		return
 	}
@@ -238,7 +238,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// cache.WithInternalRESTConfig).
 	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
-		log.Error("unable to create kubernetes client config", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to create kubernetes client config", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
 		return
 	}
@@ -252,7 +252,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// client-go's own context.TODO(), so the budget is bound to the client.
 	cli, err := dynamic.NewClient(credhttp.BindRequestBudget(ctx, rc))
 	if err != nil {
-		log.Error("unable to create kubernetes dynamic client", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to create kubernetes dynamic client", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
 		return
 	}
@@ -265,7 +265,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		GVR:       res.GVR,
 	})
 	if err != nil {
-		log.Error("unable to get resource",
+		log.ErrorContext(ctx, "unable to get resource",
 			slog.String("name", ref.Name), slog.String("namespace", ref.Namespace),
 			slog.String("gvr", res.GVR.String()), slog.Any("err", err))
 
@@ -295,7 +295,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	if rbac.MustRegateSADial(ctx) && !filterGetByRBAC(ctx, res.GVR, uns) {
 		// #574 — attribute the refusal to its driver and cell (see
 		// rbac/sa_regate_attribution.go).
-		log.Warn("objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+		log.WarnContext(ctx, "objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),

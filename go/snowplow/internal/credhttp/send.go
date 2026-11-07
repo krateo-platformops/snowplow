@@ -497,7 +497,7 @@ func recordRetry(req *http.Request, site, cause string, attempt int, prevMS int6
 	if req.URL != nil {
 		host = req.URL.Hostname()
 	}
-	xcontext.Logger(req.Context()).Warn("endpoint attempt failed; retrying",
+	xcontext.Logger(req.Context()).WarnContext(req.Context(), "endpoint attempt failed; retrying",
 		slog.String("site", site),
 		slog.String("cause", cause),
 		slog.Int("attempt", attempt+1),

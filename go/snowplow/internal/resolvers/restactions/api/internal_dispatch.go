@@ -362,7 +362,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// endpoint and fails with the x509 error. Loud so a future caller
 		// passing the wrong shape is diagnosable (mirrors resolveOne's
 		// WithInternalEndpoint wrong-type warning).
-		xcontext.Logger(ctx).Warn("dispatchViaInternalRESTConfig: internal REST config present but not a usable *rest.Config; falling through to httpcall.Do",
+		xcontext.Logger(ctx).WarnContext(ctx, "dispatchViaInternalRESTConfig: internal REST config present but not a usable *rest.Config; falling through to httpcall.Do",
 			slog.String("subsystem", "cache"),
 			slog.String("got_type", fmt.Sprintf("%T", v)),
 			slog.String("hint", "an internal driver (e.g. Phase 1) must pass *rest.Config to cache.WithInternalRESTConfig"),
@@ -542,7 +542,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// an operator see that a caller supplied a null where a name was expected,
 	// instead of the failure only surfacing as a confusing downstream jq error.
 	if pathHasNullPathSegment(call.Path) {
-		xcontext.Logger(ctx).Warn("internal_dispatch.list.unintended_collapse: api-step path resolved to a cluster LIST because a name/namespace path segment was null — check the caller's extras",
+		xcontext.Logger(ctx).WarnContext(ctx, "internal_dispatch.list.unintended_collapse: api-step path resolved to a cluster LIST because a name/namespace path segment was null — check the caller's extras",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
@@ -638,7 +638,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		syncWait.EndRelease(syncWaitRelease(ctx, synced))
 		recordServeSyncWait(time.Since(waitStart)) // #796
 		if synced && rw.IsServable(gvr) {
-			if served, ok := rw.ListServableEnvelopeJSONWhere(gvr, namespace, keep); ok {
+			if served, ok := rw.ListServableEnvelopeJSONWhere(ctx, gvr, namespace, keep); ok {
 				recordListQuery(query) // applied in process (no-op without a query)
 				xcontext.Logger(ctx).Info("internal_dispatch.list.informer_served",
 					slog.String("subsystem", "cache"),

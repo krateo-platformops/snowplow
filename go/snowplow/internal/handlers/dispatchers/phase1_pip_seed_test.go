@@ -75,7 +75,7 @@ func TestPipCohortTimeout_RestoredToFixed120s(t *testing.T) {
 // the seed cell's key and the seed's resolve, so the cell is unpaginated
 // through and through.
 func TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple(t *testing.T) {
-	pg := prewarmPaginationFor(noSlicePath)
+	pg := prewarmPaginationFor(context.Background(), noSlicePath)
 	if pg.PerPage != -1 || pg.Page != -1 {
 		t.Fatalf("D2: no-slice widget pagination = (perPage=%d, page=%d), "+
 			"want (-1, -1) — the dispatcher's paginationInfo defaults to "+
@@ -93,7 +93,7 @@ func TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple(t *testing.T) {
 // paginationInfo returns the same (page, perPage).
 func TestPhase1PIPSeedKey_DeclaredSlicePreserved(t *testing.T) {
 	// Dashboard table: declared slice page=1 perPage=5.
-	pg := prewarmPaginationFor(dashboardTablePath)
+	pg := prewarmPaginationFor(context.Background(), dashboardTablePath)
 	if pg.PerPage != 5 || pg.Page != 1 {
 		t.Fatalf("D2: declared-slice widget pagination = (perPage=%d, page=%d), "+
 			"want (perPage=5, page=1) — paginationInfo at serve time returns "+
@@ -111,7 +111,7 @@ func TestPhase1PIPSeedKey_DeclaredSlicePreserved(t *testing.T) {
 // widget URL carries no slice params, so paginationInfo returns
 // (-1, -1); the root's pagination must match.
 func TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple(t *testing.T) {
-	pg := prewarmPaginationFor("")
+	pg := prewarmPaginationFor(context.Background(), "")
 	if pg.PerPage != -1 || pg.Page != -1 {
 		t.Fatalf("D2: root widget (empty path) pagination = "+
 			"(perPage=%d, page=%d), want (-1, -1) — a root widget has no "+
