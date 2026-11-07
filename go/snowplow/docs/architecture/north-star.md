@@ -212,7 +212,7 @@ contract was met):
   the one piece of the ledger machinery that is *not* yet grounded in a
   canonical measurement.
 - **EXPECTED_CALLS overlay freshness:** a scored run refuses to start if the
-  calibration overlay at `/tmp/snowplow-runs/calibration/expected_calls.json`
+  calibration overlay at `{runs root}/calibration/expected_calls.json`
   is older than 14 days (`overlay_freshness_or_die`,
   `e2e/bench/bench/expected.py`); freshness is the file's `st_mtime`, not a
   forgeable JSON field.

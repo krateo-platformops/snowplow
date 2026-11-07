@@ -135,12 +135,19 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
                           "resourceLabels": labels}))
         sys.exit(0)
     if a[:3] == ["container", "clusters", "delete"]:
+        # #1194: FAKE_AT_DELETE=<script>: what the disk holds at the moment the cluster goes
+        if os.environ.get("FAKE_AT_DELETE"):
+            import subprocess
+            subprocess.run(["bash", "-c", os.environ["FAKE_AT_DELETE"]], check=True)
         time.sleep(float(os.environ.get("FAKE_SLOW_DOWN", "0")))   # a delete in flight
         if os.environ.get("FAKE_DOWN_FAIL") == "1":
             sys.exit(1)
         open(os.path.join(STATE, "deleted"), "w").write("1")
         sys.exit(0)
     if a[:3] == ["container", "clusters", "create"]:
+        if os.environ.get("FAKE_AT_CREATE"):                     # #1194: the disk changes mid-run
+            import subprocess
+            subprocess.run(["bash", "-c", os.environ["FAKE_AT_CREATE"]], check=True)
         time.sleep(float(os.environ.get("FAKE_SLOW_UP", "0")))   # a hung create
     sys.exit(0)   # create / node-pools create / delete
     """)
@@ -169,6 +176,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     _vj = os.path.join(os.environ.get("OUT", ""), "verdict.json")
     if _snap and not os.path.exists(_snap) and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
         open(_snap, "wb").write(open(_vj, "rb").read())
+    # #1194: FAKE_VERDICT_LOST=1: the verdict is gone by the teardown's first read
+    if os.environ.get("FAKE_VERDICT_LOST") == "1" and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
+        os.remove(_vj)
     port = os.environ["FAKE_PORT"]
     if a[:3] == ["create", "secret", "generic"]:
         # the ghcr pull Secret and the image-pull Secret: their values come on stdin

@@ -33,13 +33,20 @@
 # so a Ctrl-C (INT) or a TERM to this script is forwarded as TERM to both.
 #
 # OUT_A / OUT_B: each run's OUT (default: run606.sh's, per RUN_NAME); an OUT
-# that already holds a run (verdict.json or run.log) is refused.
+# that already holds a run (verdict.json or run.log) is refused, and so is a
+# PAIR_OUT that holds a pair (pair.json or paired-verdict.json).
 # Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
 # OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
 # verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
 # anything was created (#1171: both runs' footprints, together, against every
-# regional quota they consume: bench/gke.py RUN_QUOTAS). A restart of B
-# FAILs the pair; a restart of A is recorded and
+# regional quota they consume: bench/gke.py RUN_QUOTAS); 5 = the evidence is not
+# safe (#1194): whatever the verdict says, the pair is NOT finished. Each run
+# publishes its own before its cluster goes (run606.sh). The pair publishes
+# pair.json before either run starts, and all of PAIR_OUT once the verdict
+# exists, which is after both clusters went: it is computed from files both
+# runs already published, so it can be computed again. It then verifies both
+# runs' published copies; a run that never reached a cluster owes none.
+# A restart of B FAILs the pair; a restart of A is recorded and
 # its not-Ready time is removed from both runs (bench/custlat.py's module doc):
 # the pair reads each run's k6 stream from its OUT for that.
 set -Eeuo pipefail
@@ -80,9 +87,12 @@ dirty="$(git -C "$HERE" status --porcelain -- . | head -5)"
 if [[ -n "$dirty" ]]; then
   [[ "$DRY" == "1" ]] || refuse "uncommitted changes under the bench: the two runs must be one commit (${dirty//$'\n'/, })"
 fi
-PAIR_OUT="${PAIR_OUT:-/tmp/snowplow-runs/606/pair-${RUN_NAME_A}-${RUN_NAME_B}}"
-OUT_A="${OUT_A:-/tmp/snowplow-runs/606/${RUN_NAME_A}}"    # run606.sh's own default OUT
-OUT_B="${OUT_B:-/tmp/snowplow-runs/606/${RUN_NAME_B}}"
+PAIR_NAME="pair-${RUN_NAME_A}-${RUN_NAME_B}"
+PAIR_OUT="${PAIR_OUT:-$(python3 -m bench.evidence run-dir "$PAIR_NAME")}"
+OUT_A="${OUT_A:-$(python3 -m bench.evidence run-dir "$RUN_NAME_A")}"    # run606.sh's own default OUT
+OUT_B="${OUT_B:-$(python3 -m bench.evidence run-dir "$RUN_NAME_B")}"
+PAIR_EVIDENCE="$(python3 -m bench.evidence dest "$PAIR_NAME")"
+PAIR_RUN_ID="${PAIR_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 [[ "$OUT_A" != "$OUT_B" ]] || refuse "OUT_A and OUT_B are the same directory"
 if [[ "$DRY" != "1" ]]; then
   for x in A B; do
@@ -91,9 +101,20 @@ if [[ "$DRY" != "1" ]]; then
       [[ ! -e "${!out}/$f" ]] || refuse "OUT_$x (${!out}) already holds a run ($f): the pair would grade it; use a new RUN_NAME_$x or OUT_$x"
     done
   done
+  for f in pair.json paired-verdict.json; do
+    [[ ! -e "$PAIR_OUT/$f" ]] || refuse "PAIR_OUT ($PAIR_OUT) already holds a pair ($f): it is never written over; use new run names or a new PAIR_OUT"
+  done
 fi
+python3 -m bench.evidence preflight --dest "$PAIR_EVIDENCE" || exit 2
 mkdir -p "$PAIR_OUT"
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$PAIR_OUT/pair.log" >&2; }
+
+# publish_pair <stage> [--require F]...: all of PAIR_OUT, copied and verified (bench/evidence.py)
+publish_pair() {
+  local stage="$1"; shift
+  python3 -m bench.evidence publish --src "$PAIR_OUT" --dest "$PAIR_EVIDENCE" --run-id "$PAIR_RUN_ID" \
+      --stage "$stage" --require pair.json "$@"
+}
 
 # runenv <A|B>: RUNENV = that run's per-run variables, for `env`
 runenv() {
@@ -152,9 +173,16 @@ json.dump({"kind": "pair", "bench_sha": sys.argv[2], "started": time.time(),
           open(sys.argv[1], "w"), indent=1)' \
   "$PAIR_OUT/pair.json" "$BENCH_SHA" "$RUN_NAME_A" "$SNOWPLOW_TAG_A" "$EXPECTED_IMAGE_DIGEST_A" "$OUT_A" \
   "$RUN_NAME_B" "$SNOWPLOW_TAG_B" "$EXPECTED_IMAGE_DIGEST_B" "$OUT_B"
+# #1194: a pair that cannot publish its own record spends nothing
+if ! msg="$(publish_pair started 2>&1)"; then
+  refuse "the pair's evidence could not be published: ${msg}: nothing was created"
+fi
+log "$msg"
 PID_A="" PID_B=""
 stop_both() { kill -TERM ${PID_A:+"$PID_A"} ${PID_B:+"$PID_B"} 2>/dev/null || true; }
-trap 'log "signal: stopping both runs (each tears its own cluster down)"; stop_both; wait; exit 130' INT TERM HUP
+# a signal stops the runs, not the record: each run publishes its own in its teardown
+trap 'log "signal: stopping both runs (each tears its own cluster down)"; stop_both; wait
+      msg="$(publish_pair interrupted 2>&1)" || log "EVIDENCE NOT SAFE (pair): ${msg}"; exit 130' INT TERM HUP
 # ONE simple command each, backgrounded: env execs bash, so $! is run606's shell
 runenv A
 env "${RUNENV[@]}" "$BASH" "$RUN606" > "$PAIR_OUT/A.console" 2>&1 &
@@ -202,4 +230,26 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                 + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
                 + [r["line"] for r in v.get("b_inside_a_outage") or []]))' \
            "$PAIR_OUT/paired-verdict.json" 2>/dev/null || true)
+# #1194: the pair is finished when its evidence is safe, whatever the verdict
+safe=1
+if msg="$(publish_pair final --require paired-verdict.json 2>&1)"; then
+  log "$msg"
+else
+  safe=0
+  log "EVIDENCE NOT SAFE (pair): ${msg}"
+fi
+for x in A B; do
+  out="OUT_$x" name="RUN_NAME_$x"
+  [[ -e "${!out}/.evidence-due" ]] || continue
+  if msg="$(python3 -m bench.evidence verify --dest "$(python3 -m bench.evidence dest "${!name}")" --stage final 2>&1)"; then
+    log "run $x: $msg"
+  else
+    safe=0
+    log "EVIDENCE NOT SAFE (run $x): ${msg}"
+  fi
+done
+if [[ "$safe" != "1" ]]; then
+  log "the pair is NOT finished: its evidence is not safe (exit 5); the paired verdict, exit ${vrc}, stands in $PAIR_OUT/paired-verdict.json"
+  exit 5
+fi
 exit "$vrc"

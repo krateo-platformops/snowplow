@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from bench import cluster
+from bench import cluster, evidence
 from bench.cluster import (
     NS,
     kubectl,
@@ -614,11 +614,13 @@ def _default_run_dir(args) -> Path:
     tag = (getattr(args, "tag", None) or
            os.environ.get("EXPECTED_IMAGE_TAG", "unknown")).strip() or "unknown"
     ts = time.strftime("%Y%m%d-%H%M%S")
-    return Path("/tmp/snowplow-runs") / tag / f"run-{ts}"
+    return evidence.runs_root() / tag / f"run-{ts}"
 
 
 #: the host-wide phase6 run lock; BENCH_RUN_LOCK names another file (the test suite gives
-#: every test its own, under its tmp_path, so no test ever takes the host's lock: #1166)
+#: every test its own, under its tmp_path, so no test ever takes the host's lock: #1166).
+#: In /tmp on purpose: it guards the processes of this boot, and #1194's evidence rule is
+#: about files that must outlive one.
 _RUN_LOCK_DEFAULT = "/tmp/snowplow-bench.lock"
 
 

@@ -658,7 +658,7 @@ def test_evaluate_is_in_the_run_budget():
     src = (BENCH_DIR / "run606.sh").read_text()
     assert 'EVALUATE_EST_S="${EVALUATE_EST_S:-828}"' in src and "809 s (A) and 828 s (B)" in src
     # #1004: the full-widen stage's term (0 without its go) sits between evaluate and diag
-    assert "+ COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))" in src
+    assert "+ COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))" in src
     assert "+ evaluate ${EVALUATE_EST_S}${FW_LINE} +" in src
     # #960: both platform-definitions calls are capped, and both caps are in the budget
     assert "+ definitions 2x${DEFS_CAP_S} +" in src

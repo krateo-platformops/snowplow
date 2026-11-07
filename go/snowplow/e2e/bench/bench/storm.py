@@ -20,6 +20,7 @@ import statistics
 import sys
 import time
 
+from bench import evidence
 from bench.cluster import kubectl, NS
 
 
@@ -531,7 +532,8 @@ def run_user_scaling(tokens):
               f"{'—':>15s} "
               f"{off_results['admin_dashboard_p50']:>11d}ms")
 
-    out_file = "/tmp/phase7_user_scaling_results.json"
+    out_file = evidence.runs_root() / "phase7" / "user_scaling_results.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     all_data = {"baseline": baseline, "results": cumulative_results, "cache_off": off_results}
     with open(out_file, "w") as f:
         json.dump(all_data, f, indent=2, default=str)

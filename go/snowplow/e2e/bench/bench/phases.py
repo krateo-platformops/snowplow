@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from bench import cluster, lifecycle, browser, ledger
+from bench import cluster, evidence, lifecycle, browser, ledger
 from bench.browser import ConvergenceTimeout
 
 
@@ -3297,10 +3297,10 @@ def run_phase6(tag: str,
     if smoke is None:
         smoke = _env_smoke()
 
-    # Default run_dir under /tmp/snowplow-runs/{tag}/run-{ts}.
+    # Default run_dir under the durable runs root (#1194): {runs_root}/{tag}/run-{ts}.
     if run_dir is None:
         ts = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = Path("/tmp/snowplow-runs") / tag / f"run-{ts}"
+        run_dir = evidence.runs_root() / tag / f"run-{ts}"
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3523,7 +3523,8 @@ def run_phase8_per_mutation(tag: str | None = None,
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / "per_mutation_results.json"
     else:
-        target_file = Path("/tmp/snowplow_per_mutation_results.json")
+        target_file = ledger.legacy_per_mutation_path()
+        target_file.parent.mkdir(parents=True, exist_ok=True)
     target_file.write_text(json.dumps(out, indent=2, default=str))
     print(f"Phase 8 results saved to {target_file}", flush=True)
 

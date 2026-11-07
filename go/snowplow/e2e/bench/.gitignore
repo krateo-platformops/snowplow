@@ -9,8 +9,8 @@ __pycache__/
 htmlcov/
 
 # Bench runtime artifacts (per docs/bench-restructure-path-b-plan-2026-06-02.md §F).
-# Production artifacts live under /tmp/snowplow-runs/ — the bench tree
-# should never carry run output.
+# Production artifacts live under ~/.local/share/snowplow-bench/ (bench/evidence.py)
+# — the bench tree should never carry run output.
 *.webm
 *.gif
 *.png
