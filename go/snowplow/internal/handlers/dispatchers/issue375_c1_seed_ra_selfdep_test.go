@@ -74,7 +74,7 @@ func TestIssue375_C1_SeedRESTActionSelfDep_EditInReadToPutWindow_Remarks(t *test
 					return seedRestactionResolveAndPutProd(ctx, resCtx, cr, r, authnNS, key, handle, inputs, got, stageErrSink, extTouchedSink)
 				}
 
-				if err := seedOneRestaction(seedCohortCtx(h1User), "cohort-h1", ref, h1NS, mode); err != nil {
+				if err := seedOneRestaction(seedCohortCtx(h1User), ref, h1NS, mode); err != nil {
 					t.Fatalf("seedOneRestaction(%v): %v", mode, err)
 				}
 				if reads != 1 || seedKey == "" {

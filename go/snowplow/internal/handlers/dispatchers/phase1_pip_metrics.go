@@ -13,9 +13,7 @@
 //
 // PER-COHORT MAPS are exposed as a single expvar.Func returning a
 // map[string]uint64 — same shape as snowplow_apiserver_fallthrough_cells.
-// The cohort label is the canonical cohortLogLabel (Username for
-// user-kind cohorts, "group:<name>" for group-kind cohorts). PIP itself
-// is gated such that under PREWARM_PIP_ENABLED=false the counters
+// PIP itself is gated such that under PREWARM_PIP_ENABLED=false the counters
 // register at zero and never increment — operator sees fresh zeros
 // rather than a missing key.
 //

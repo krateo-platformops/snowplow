@@ -29,7 +29,6 @@ import (
 
 	"log/slog"
 
-	"github.com/krateo-platformops/plumbing/server/use"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
@@ -92,7 +91,7 @@ func served1184(t *testing.T) (http.Handler, *lines1184) {
 	fwd := rum.NewForwarder("http://127.0.0.1:1")
 	fwd.Start(ctx)
 
-	chain := use.NewChain(use.TraceId(), use.Logger(log))
+	chain := newRequestChain(log)
 	mux := http.NewServeMux()
 	stub := http.HandlerFunc(ok200)
 	mux.Handle("GET /call", chain.Append(handlers.Dispatcher(dispatchers.All())).Then(stub))

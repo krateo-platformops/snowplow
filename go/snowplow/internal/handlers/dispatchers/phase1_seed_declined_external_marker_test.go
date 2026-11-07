@@ -246,7 +246,7 @@ func makeBootSeedHandler(t *testing.T, reResolvedThisPass *int, sawGetOnMarked *
 			h := &getRecordingHandle{}
 			// The REAL boot skip predicate — consults the declined-external set
 			// (engine-lived on scopeCtx) BEFORE handle.Get.
-			if seedSkipDecision(ctx, seedModeBoot, h, k, "widgets", multiCohortWidget, "") {
+			if seedSkipDecision(ctx, seedModeBoot, h, k, "widgets", multiCohortWidget) {
 				// Skipped: the whale was already resolved-and-declined this boot
 				// scope. No re-resolve, no external round-trip. This is the fix.
 				if h.getCount() != 0 {
@@ -408,7 +408,7 @@ func TestF4bLeverA_EngineWide_ReusedAcrossRequeues_RetainedOnCompletion(t *testi
 			return nil
 		}
 		h := &getRecordingHandle{}
-		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget, "") {
+		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget) {
 			if h.getCount() != 0 {
 				sawGet = true
 			}
@@ -437,7 +437,7 @@ func TestF4bLeverA_EngineWide_ReusedAcrossRequeues_RetainedOnCompletion(t *testi
 	}
 	h := &getRecordingHandle{}
 	kwCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(prewarmScope{kind: scopeKindKeepwarm}.key()))
-	if !seedSkipDecision(kwCtx, seedModeKeepwarm, h, whaleKey, "widgets", widget, "") {
+	if !seedSkipDecision(kwCtx, seedModeKeepwarm, h, whaleKey, "widgets", widget) {
 		t.Fatal("#643: a keepwarm pass after boot completion must skip the whale boot declined")
 	}
 }
@@ -472,7 +472,7 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 	// A resume pass BEFORE any redrive skips the whale (reused set).
 	hBefore := &getRecordingHandle{}
 	ctxBefore := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-	if !seedSkipDecision(ctxBefore, seedModeBoot, hBefore, whaleKey, "widgets", widget, "") {
+	if !seedSkipDecision(ctxBefore, seedModeBoot, hBefore, whaleKey, "widgets", widget) {
 		t.Fatal("pre-redrive: reused set must skip the already-declined whale")
 	}
 
@@ -484,7 +484,7 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 	// the fresh set has no mark → seedSkipDecision falls through to handle.Get.
 	hAfter := &getRecordingHandle{}
 	ctxAfter := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-	if seedSkipDecision(ctxAfter, seedModeBoot, hAfter, whaleKey, "widgets", widget, "") {
+	if seedSkipDecision(ctxAfter, seedModeBoot, hAfter, whaleKey, "widgets", widget) {
 		t.Fatal("post-redrive VIOLATED: a whale stayed suppressed ACROSS a topology change — the redrive must clear the set so the whale re-resolves once under the new nav set")
 	}
 	if !hAfter.sawGet(whaleKey) {
@@ -529,7 +529,7 @@ func TestF4bLeverA_R2_RedriveClearsStaleSkip_OmitClearIsRED(t *testing.T) {
 		// Next invocation over the same key: does it skip?
 		h := &getRecordingHandle{}
 		nextCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-		return seedSkipDecision(nextCtx, seedModeBoot, h, whaleKey, "widgets", widget, "")
+		return seedSkipDecision(nextCtx, seedModeBoot, h, whaleKey, "widgets", widget)
 	}
 
 	// GREEN: redrive fired → next invocation does NOT skip (Marked()==false).
@@ -740,7 +740,7 @@ func TestF4bLeverA_MarkerIsPerKey_NoCrossCohortSkip(t *testing.T) {
 	// be skipped — B has never resolved W, so the marker must miss on B's key. A
 	// per-(class,target) marker would WRONGLY skip B here (B would serve nothing).
 	h := &getRecordingHandle{}
-	if seedSkipDecision(bootCtx, seedModeBoot, h, keyB, "widgets", widget, "") {
+	if seedSkipDecision(bootCtx, seedModeBoot, h, keyB, "widgets", widget) {
 		t.Fatal("C-F4B-2 VIOLATED: cohort B's FIRST resolve of the same widget was skipped — the marker is per-(class,target), not per-key. A cohort would lose its cell. Marker MUST key on the full dispatchCacheLookupKey.")
 	}
 	if !h.sawGet(keyB) {
@@ -749,7 +749,7 @@ func TestF4bLeverA_MarkerIsPerKey_NoCrossCohortSkip(t *testing.T) {
 
 	// And A's own key IS still marked (didn't get clobbered by B's derivation).
 	hA := &getRecordingHandle{}
-	if !seedSkipDecision(bootCtx, seedModeBoot, hA, keyA, "widgets", widget, "") {
+	if !seedSkipDecision(bootCtx, seedModeBoot, hA, keyA, "widgets", widget) {
 		t.Fatal("C-F4B-2: cohort A's own declined key must still skip on the resume pass")
 	}
 }
@@ -777,7 +777,7 @@ func TestF4bLeverA_MarkerNilOnUserPath_ReResolves(t *testing.T) {
 	// re-resolves: Marked(nil) == false → falls through to handle.Get. The user
 	// path re-resolves the external widget fresh, unaffected.
 	h := &getRecordingHandle{}
-	if seedSkipDecision(userCtx, seedModeBoot, h, key, "widgets", widget, "") {
+	if seedSkipDecision(userCtx, seedModeBoot, h, key, "widgets", widget) {
 		t.Fatal("C-F4B-3 VIOLATED: a set-less (user/keepwarm) ctx must never skip via the marker — it would fake a warm serve of an intentionally-cold external cell")
 	}
 	if !h.sawGet(key) {
@@ -818,7 +818,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 
 	// So the resume pass does NOT skip on the marker account — it re-resolves.
 	h := &getRecordingHandle{}
-	if seedSkipDecision(bootCtx, seedModeBoot, h, key, "widgets", widget, "") {
+	if seedSkipDecision(bootCtx, seedModeBoot, h, key, "widgets", widget) {
 		t.Fatal("a stage-errored (non-external) target must be re-resolved on the resume pass, NOT marker-skipped")
 	}
 	if !h.sawGet(key) {

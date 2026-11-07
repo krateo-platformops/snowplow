@@ -193,7 +193,7 @@ func TestM15_SeedOneRestaction_SkipsTemplated_PutsStatic(t *testing.T) {
 		seedObjectsGetFn = func(_ context.Context, _ templatesv1.ObjectReference) objects.Result {
 			return fetchedRestaction(templated)
 		}
-		if err := seedOneRestaction(seedCohortCtx(user), "cohort-granted", ref, "krateo-system", seedModeBoot); err != nil {
+		if err := seedOneRestaction(seedCohortCtx(user), ref, "krateo-system", seedModeBoot); err != nil {
 			t.Fatalf("seedOneRestaction returned %v; want nil (skip and success paths both return nil)", err)
 		}
 		return putReached

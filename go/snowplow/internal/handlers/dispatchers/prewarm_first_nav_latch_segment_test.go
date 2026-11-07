@@ -63,7 +63,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // ── ARM-GREEN-BOOT600 (§5 GREEN, Fix 1) ─────────────────────────────────────
@@ -383,19 +382,19 @@ func TestKeepwarmSweep_WidgetCapablePrefix_SeedsBothNotSegmentOnly(t *testing.T)
 }
 
 // countingHandler is a minimal slog.Handler that counts records whose msg matches
-// a target, capturing the "identity" attr of each — for asserting the keepwarm
+// a target, capturing the "rank" attr of each — for asserting the keepwarm
 // per-cohort cohort_summary emission (#130 F3b-r2 cond 3).
 type countingHandler struct {
-	target     string
-	identities *[]string
+	target string
+	ranks  *[]int64
 }
 
 func (h countingHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h countingHandler) Handle(_ context.Context, r slog.Record) error {
 	if r.Message == h.target {
 		r.Attrs(func(a slog.Attr) bool {
-			if a.Key == "identity" {
-				*h.identities = append(*h.identities, a.Value.String())
+			if a.Key == "rank" {
+				*h.ranks = append(*h.ranks, a.Value.Int64())
 			}
 			return true
 		})
@@ -421,10 +420,10 @@ func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
 
-	// Capture prewarm.keepwarm.cohort_summary INFO lines (their identity attr).
-	var summaries []string
+	// Capture prewarm.keepwarm.cohort_summary INFO lines (their rank attr).
+	var summaries []int64
 	prev := slog.Default()
-	slog.SetDefault(slog.New(countingHandler{target: "prewarm.keepwarm.cohort_summary", identities: &summaries}))
+	slog.SetDefault(slog.New(countingHandler{target: "prewarm.keepwarm.cohort_summary", ranks: &summaries}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	// Latch already fired at boot (keepwarm runs post-boot).
@@ -468,8 +467,10 @@ func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T
 
 	// (1) PREFIX BOUND: the widget-less machineSA cohort must NOT be swept — no
 	// cohort_summary for it (the break at widgetMax==0 stops before it).
-	for _, id := range summaries {
-		if id == redact.Group("machine") { // #453: cohorts log as their redact label
+	// A cohort is on the line by its rank (#1192: no identity reaches a log
+	// line): devs 0 and ops 1 are the widget-capable prefix, machine is 2.
+	for _, rank := range summaries {
+		if rank == 2 {
 			t.Fatalf("cond-3 PREFIX BOUND broken: widget-less cohort 'machine' (widgetMax==0) was swept "+
 				"(got a cohort_summary) — the keepwarm prefix-break at widgetMax==0 is gone. summaries=%v", summaries)
 		}
@@ -480,11 +481,11 @@ func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T
 			"widget-capable prefix), got %d: %v. A flatten-all-modes impl emits ZERO (no per-cohort boundary).", len(summaries), summaries)
 	}
 	devsSeen, opsSeen := false, false
-	for _, id := range summaries {
-		if id == redact.Group("devs") {
+	for _, rank := range summaries {
+		if rank == 0 {
 			devsSeen = true
 		}
-		if id == redact.Group("ops") {
+		if rank == 1 {
 			opsSeen = true
 		}
 	}

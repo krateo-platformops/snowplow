@@ -487,14 +487,13 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// not (a UAF stage ignores its endpointRef, but naming one is still
 	// refused). Same truncating posture as any endpoint-resolve failure (R-2
 	// stageReturn); nothing was read or dialed. The Secret name embeds a
-	// username: a redact label only.
+	// username, so it is not logged, in clear or as a label (#1192).
 	if err := r.mapper.refusePerUserRef(ref); err != nil {
 		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
 			slog.String("name", id),
 			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
 			slog.Bool("templated", templated),
-			slog.String("namespace", ref.Namespace),
-			slog.String("secret_name", redact.Prefixed("secret", ref.Name)))
+			slog.String("namespace", ref.Namespace))
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
