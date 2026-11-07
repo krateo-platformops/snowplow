@@ -2,7 +2,7 @@
 
 Tolerance = 0 per Diego 2026-06-02 (was 1 at the worktree source line 212).
 Overlay freshness gate refuses to start when
-`/tmp/snowplow-runs/calibration/expected_calls.json` is older than 14 days;
+`{runs_root}/calibration/expected_calls.json` (bench/evidence.py) is older than 14 days;
 operator must re-run `python -m bench calibrate` or set
 `--allow-stale-overlay` (escape hatch with a very loud log).
 
@@ -19,6 +19,8 @@ import os
 import re
 import sys
 import time
+
+from bench import evidence
 
 
 __all__ = [
@@ -111,7 +113,7 @@ EXPECTED_CALLS_DEFAULT_USER = "admin"  # fallback for unknown subjects
 # or any prior overlay carrying an off-by-one drops the gate.
 EXPECTED_CALLS_TOLERANCE = 0
 
-EXPECTED_CALLS_OVERLAY_PATH = "/tmp/snowplow-runs/calibration/expected_calls.json"
+EXPECTED_CALLS_OVERLAY_PATH = str(evidence.runs_root() / "calibration" / "expected_calls.json")
 
 
 # ─── Overlay loading + lookup ───────────────────────────────────────────────

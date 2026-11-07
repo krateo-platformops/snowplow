@@ -42,7 +42,7 @@ dirty-marked the patched object's L1 entry BEFORE the T+50ms probe fires
 the patched (gvr, ns, name). If absent at T+50ms → emit
 INDETERMINATE_INFORMER_NOT_ACKED.
 
-Output: JSON bundle at /tmp/snowplow-runs/<tag>/verify-serve-stale-<ts>.json
+Output: JSON bundle at <run dir>/verify-serve-stale-<ts>.json
 plus an ANSI-coloured stdout summary that mirrors cli.py:_setup_logger.
 
 VERDICT MATRIX (#159 PM review C1, 2026-06-12 §1). THE CONTRACT is

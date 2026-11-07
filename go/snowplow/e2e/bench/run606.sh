@@ -12,6 +12,13 @@
 #   3. `python -m bench.gke gke-reap --yes` (first step of every run; also by hand);
 #   4. the ttl-expires label, which 2 and 3 read.
 #
+# A paid run is not finished until its evidence is safe (#1194, bench/evidence.py):
+# OUT defaults to the durable run directory, and before gke-down the teardown
+# publishes the whole of OUT to its own evidence directory and verifies it, then
+# once more after gke-down for teardown.json and the end of run.log. A publish
+# that fails is logged as EVIDENCE NOT SAFE and the run exits non-zero; it never
+# holds gke-down, and OUT keeps what it could not copy.
+#
 # BENCH_606_DRY_RUN=1 prints every command and runs none (no cloud calls);
 # BENCH_606_FAIL_AT=<step> makes that step fail — the teardown test uses both.
 #
@@ -135,7 +142,10 @@ fi
 # cloud call; never a run without it.
 # exported: bench.diag606 reads the same file (never argv) to redact the pull
 # account from every bundle, whether the path is the default or an override
+# #1194: the default survives a reboot; an override in a temporary directory does
+# not (run 21's override, in /tmp, went with the reboot of 2026-11-06), so it is refused.
 export GHCR_PULL_ENV_FILE="${GHCR_PULL_ENV_FILE:-$HOME/.config/snowplow-bench/ghcr-pull.env}"
+python3 -m bench.evidence durable-path --what GHCR_PULL_ENV_FILE "$GHCR_PULL_ENV_FILE" || exit 2
 python3 -m bench.ghcr_pull check --env-file "$GHCR_PULL_ENV_FILE" || exit 2
 ENDPOINT_WAIT_S="${ENDPOINT_WAIT_S:-600}"
 ENDPOINT_POLL_S="${ENDPOINT_POLL_S:-15}"
@@ -231,6 +241,10 @@ DIAG_CAP_S="${DIAG_CAP_S:-900}"               # diag606 snapshot on failure
 # neither the platform step nor the teardown is held by it; a cap hit is said
 # and recorded (platform-definitions.jsonl, the verdict's platform section).
 DEFS_CAP_S="${DEFS_CAP_S:-300}"
+# #1194: the publish before gke-down (the one after it holds no cluster). It
+# bounds a hung disk, not a slow copy: it is the diagnostics' bound, and at a
+# modest 100 MB/s that is 90 GB. A cap hit is EVIDENCE NOT SAFE, never a held teardown.
+EVIDENCE_CAP_S="${EVIDENCE_CAP_S:-900}"
 DOWN_BUDGET_S="${DOWN_BUDGET_S:-900}"         # gke-down
 # evaluate runs after collect while the cluster is still up: run 15 measured
 # it at 809 s (A) and 828 s (B) ("=== step evaluate ===" -> "verdict exit=" in
@@ -306,7 +320,7 @@ FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
 RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
-                 + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + DOWN_BUDGET_S ))
+                 + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
 TTL_NEEDED_H=$(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 ))
 if [[ -z "$TTL_HOURS" ]]; then
   TTL_HOURS="$TTL_NEEDED_H"
@@ -320,7 +334,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -329,7 +343,8 @@ if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
 fi
 COMPOSITE_ROUTES=()
 PLATFORM_POLL_S="${PLATFORM_POLL_S:-60}"
-OUT="${OUT:-/tmp/snowplow-runs/606/${RUN_NAME}}"
+OUT="${OUT:-$(python3 -m bench.evidence run-dir "$RUN_NAME")}"
+EVIDENCE_DIR="$(python3 -m bench.evidence dest "$RUN_NAME")"
 
 expected_go="$(date -u +%Y%m%d)-${RUN_NAME}"
 if [[ "$DRY" != "1" && "${BENCH_606_GO:-}" != "$expected_go" ]]; then
@@ -340,6 +355,18 @@ if [[ -n "$FULL_WIDEN_GO" && "$DRY" != "1" && "$FULL_WIDEN_GO" != "$expected_go"
   echo "refusing: BENCH_1004_GO must be '${expected_go}' (Diego's go for #1004's full-widen stage on THIS run), or unset (no stage)" >&2
   exit 2
 fi
+
+# #1194: a directory left by an earlier run is never written over, and a run
+# that could not publish its evidence is refused before it costs anything
+if [[ "$DRY" != "1" ]]; then
+  for f in verdict.json run.log; do
+    if [[ -e "$OUT/$f" ]]; then
+      echo "refusing: OUT ($OUT) already holds a run ($f): use a new RUN_NAME or OUT" >&2
+      exit 2
+    fi
+  done
+fi
+python3 -m bench.evidence preflight --dest "$EVIDENCE_DIR" || exit 2
 
 YES="--yes"; [[ "$DRY" == "1" ]] && YES=""
 KCFG="$HOME/.kube/snowplow-bench/${RUN_NAME}.kubeconfig"
@@ -365,6 +392,11 @@ mkdir -p "$OUT"
 COLLECTED_MARK="$OUT/.collected"
 VERDICT_MARK="$OUT/.verdict-final"
 rm -f "$COLLECTED_MARK" "$VERDICT_MARK"
+# #1194: this run created (or tried to create) a cluster, so it owes its evidence:
+# run606_pair.sh verifies the published copy of every run that left this mark
+EVIDENCE_DUE_MARK="$OUT/.evidence-due"
+EVIDENCE_RUN_ID="${RUN_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+rm -f "$EVIDENCE_DUE_MARK"
 # The record of every failing bench command (record_failure): present from
 # the start, so an empty file reads "none failed" and a missing one is a
 # missing record, never zero (evaluate reads it like every other stream).
@@ -420,6 +452,16 @@ kill_tree() {
   for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
   kill "-$sig" "$pid" 2>/dev/null || true
 }
+# halt_tree <pid>: TERM a tree none of which can react to it: each process is frozen before its
+# children are signalled, so a step whose command just died cannot start the next one, which
+# kill_tree's walk would miss (a collect, stopped in the teardown, ran on into the publish: #1194).
+halt_tree() {
+  local pid="$1" c
+  kill -STOP "$pid" 2>/dev/null || return 0
+  for c in $(pgrep -P "$pid" 2>/dev/null); do halt_tree "$c"; done
+  kill -TERM "$pid" 2>/dev/null || true
+  kill -CONT "$pid" 2>/dev/null || true
+}
 # At its bound the watchdog stops the command's whole tree; stopping the watchdog stops its own
 # sleep (its TERM trap), so neither outlives the call. BOUNDED_PIDS names the call in flight:
 # a run that leaves in the middle of one (a signal or a pair stop fires its trap inside `wait`)
@@ -464,8 +506,7 @@ capped() {
     if (( waited >= secs )) || [[ "$TD_SIGNALED" == "1" ]]; then
       CAPPED_HIT=1
       log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing"
-      pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
-      kill -TERM "$CAPPED_PID" 2>/dev/null || true
+      halt_tree "$CAPPED_PID"
       break
     fi
     sleep 1 || true      # a process-group SIGINT kills sleep (130): never fatal here
@@ -480,9 +521,46 @@ on_teardown_signal() {
   TD_SIGNALED=1
   log "signal during teardown: collect/diagnostics cut short; proceeding to gke-down"
   if [[ -n "$CAPPED_PID" ]]; then
-    pkill -TERM -P "$CAPPED_PID" 2>/dev/null || true
-    kill -TERM "$CAPPED_PID" 2>/dev/null || true
+    halt_tree "$CAPPED_PID"
   fi
+}
+
+# publish_evidence <stage>: OUT, copied and verified (bench/evidence.py). Shielded like gke-down: a
+# signal cuts collect and diagnostics short, but this copy is what the run was paid for. Under its
+# own bound, not `capped`, which stops at a signal; KILL, since the shield ignores TERM, so a hung
+# disk never holds gke-down. A failure says so and returns non-zero; the teardown goes on.
+publish_evidence() {
+  local stage="$1" err="$OUT/.evidence-publish.log" pid t0 rc=0
+  local cmd=(python3 -m bench.evidence publish --src "$OUT" --dest "$EVIDENCE_DIR"
+             --run-id "$EVIDENCE_RUN_ID" --stage "$stage" --require run.log)
+  [[ -f "$VERDICT_MARK" ]] && cmd+=(--require verdict.json)
+  if [[ "$DRY" == "1" ]]; then log "DRY: ${cmd[*]}"; return 0; fi
+  log "=== evidence (${stage}) -> ${EVIDENCE_DIR} ==="
+  ( trap "" INT TERM HUP
+    # test hook, like BENCH_606_HOLD_IN=evaluate: a copy that takes this long, or never returns
+    if [[ "${BENCH_606_HOLD_IN:-}" == "evidence" ]]; then sleep "${BENCH_606_HOLD_S:-600}"; fi
+    exec "${cmd[@]}" ) > "$err" 2>&1 &
+  pid=$!
+  # the cap on the real clock: a count of 1 s sleeps runs slow under load, and rounds every copy up
+  # to the next second, twice a teardown
+  t0=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS - t0 >= EVIDENCE_CAP_S )); then
+      kill_tree KILL "$pid"
+      rc=124
+      echo "stopped at its cap of ${EVIDENCE_CAP_S}s" >> "$err"
+      break
+    fi
+    sleep 0.2 || true    # a process-group SIGINT kills sleep (130): never fatal here
+  done
+  (( rc != 0 )) || wait "$pid" || rc=$?
+  if (( rc == 0 )); then
+    log "$(cat "$err")"
+    return 0
+  fi
+  log "EVIDENCE NOT SAFE (${stage}, exit ${rc}): $(cut -c1-2000 "$err")"
+  log "this run is NOT finished: its files are in ${OUT}; publish them by hand: ${cmd[*]}"
+  return 1
 }
 
 CLUSTER_CREATED=0
@@ -497,6 +575,9 @@ teardown() {
   set +e   # nothing inside teardown may abort it (a Ctrl-C reaches every child: set -e would exit on their 130)
   trap - EXIT
   stop_inflight_bounded   # a bounded call the signal or pair stop interrupted (#1170)
+  # and a capped one (a step's collect): left running it would write into OUT beside the
+  # teardown's own collect, and during the publish (#1194)
+  if [[ -n "$CAPPED_PID" ]]; then halt_tree "$CAPPED_PID"; CAPPED_PID=""; fi
   declare -F stop_top_loop >/dev/null && stop_top_loop
   declare -F stop_apf_loop >/dev/null && stop_apf_loop
   declare -F stop_sampler >/dev/null && stop_sampler top_boot
@@ -547,6 +628,8 @@ teardown() {
     # Test hook (like BENCH_606_FAIL_AT): a command that fails inside teardown,
     # as one killed by a group signal would. It must not stop the delete.
     [[ "${BENCH_606_TEARDOWN_FAULT:-}" == "1" ]] && false
+    # #1194: the run's evidence is safe, or says it is not, before the cluster goes
+    publish_evidence before-teardown || rc=$(( rc == 0 ? 1 : rc ))
     log "=== teardown ${RUN_NAME} (exit ${rc}) ==="
     # shielded: a process-group Ctrl-C must not interrupt the delete itself
     down_rc=0
@@ -597,6 +680,12 @@ print("teardown record: LoadBalancer Services %s (release: %s); leaked_addresses
     else
       # printed ONLY after gke-down succeeded
       if [[ "$DRY" == "1" ]]; then log "DRY: gke-down only printed; nothing was deleted"; else log "cluster ${RUN_NAME} deleted (gke-down OK)"; fi
+    fi
+    # #1194: what only the teardown wrote: teardown.json and the end of run.log
+    if publish_evidence final; then
+      log "evidence safe: ${EVIDENCE_DIR}"
+    else
+      rc=$(( rc == 0 ? 1 : rc ))
     fi
   fi
   exit "$rc"
@@ -702,6 +791,7 @@ s_up() {
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
   CLUSTER_CREATED=1   # set BEFORE create: a half-created cluster still bills
+  : > "$EVIDENCE_DUE_MARK"
   # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
   # by gke-up) goes through record_failure like every other step's; its
   # progress is on stdout. Run 18 lost both arms with only the RUN line logged.

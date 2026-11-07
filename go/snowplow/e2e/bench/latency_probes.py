@@ -5,13 +5,13 @@ Hits /call (compositions-list RestAction) for admin + cj. Each probe is
 n=5 burst; reports per-call ms + p50/p95/mean + parsed items count.
 
 Output:
-    /tmp/phase6-<tag>/latency-probes.json
-    /tmp/phase6-<tag>/latency.log
+    <out-dir>/latency-probes.json
+    <out-dir>/latency.log
 
 Usage:
     cd e2e/bench
-    python3 latency_probes.py --out-dir /tmp/phase6-0.30.245-50K
-        # default --out-dir = /tmp/phase6-latency-probes/
+    python3 latency_probes.py --out-dir ~/some-run-dir
+        # default --out-dir = {runs_root}/phase6-latency-probes (bench/evidence.py)
 
 Task #184: this file used to live only at `/tmp/phase6-0.30.245-50K/
 latency_probes.py`, which referenced `bench.browser._http_get` — a
@@ -37,7 +37,7 @@ from pathlib import Path
 # Bench is importable when this script is run from `e2e/bench/`.
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from bench import browser  # type: ignore
+from bench import browser, evidence  # type: ignore
 
 
 # 3 probes inside a typical 30-min observation window.
@@ -85,8 +85,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--out-dir",
-        default="/tmp/phase6-latency-probes",
-        help="output directory (default: /tmp/phase6-latency-probes)",
+        default=str(evidence.runs_root() / "phase6-latency-probes"),
+        help="output directory (default: %(default)s)",
     )
     parser.add_argument(
         "--probe-minutes",
