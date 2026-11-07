@@ -386,6 +386,11 @@ type refresher struct {
 	// "both tiers progress in proportion".
 	clusterListEnqueueTotal   atomic.Uint64
 	clusterListCompletedTotal atomic.Uint64
+	// normalCompletedTotal ticks every successful drain of the normal tier:
+	// with the viewed (viewed.completed) and cluster_list counts it splits
+	// completed by tier, so a paired run can see each tier progress in every
+	// interval (#1085's run-22 bars). It only counts.
+	normalCompletedTotal atomic.Uint64
 
 	startedOnce sync.Once
 	stopOnce    sync.Once
@@ -1230,6 +1235,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// part of the measured time. The stamp stays in the map (in flight) so a
 	// customer hit during the re-resolve still counts as a stale serve.
 	t0, windowOpen := r.beginWindow(key)
+	if windowOpen {
+		// How old the change this dequeue is about to refresh is, by side. It
+		// only counts: the dequeue already happened.
+		r.dirtyStats.observeDequeueAge(tier == tierViewed, windowNow().Sub(t0))
+	}
 	// #603 PR-2 SHADOW audit — take the key's {avoided, tainted} pair with its
 	// trigger set; the terminal write reports the bytes against it.
 	rctx, auditTok := r.narrowAuditDequeue(rctx, key)
@@ -1434,8 +1444,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// dirty-mark of the same key starts from a clean backoff.
 	q.Forget(key)
 	r.completedTotal.Add(1)
-	if fromCL {
+	switch tier { // per-tier completions; counting only
+	case tierClusterList:
 		r.clusterListCompletedTotal.Add(1)
+	case tierViewed:
+		r.viewed.completed.Add(1)
+	default:
+		r.normalCompletedTotal.Add(1)
 	}
 	if windowOpen {
 		r.settleDequeue(key, t0, ok && entry != nil, outcome)
@@ -1579,6 +1594,15 @@ type refresherStats struct {
 	viewedUnsubscribed    uint64 `stat:"viewed_unsubscribed"`
 	deferredInFlight      uint64 `stat:"deferred_in_flight"` // #799 B2
 	viewedQueueDepth      int64  `stat:"viewed_queue_depth" kind:"gauge" desc:"Live depth of the refresher's viewed tier (#765): dirty cells open on a page, drained before every other tier."`
+
+	// Completions by tier and the age of the change a dequeue runs, by side
+	// (#1085's run-22 bars: both arms publish them).
+	normalCompleted  uint64 `stat:"normal_completed"`
+	viewedCompleted  uint64 `stat:"viewed_completed"`
+	viewedAgeP95MS   int64  `stat:"viewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a viewed-tier dequeue is about to refresh (its dirty mark to the dequeue), over roughly the last export interval"`
+	viewedAgeMaxMS   int64  `stat:"viewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a viewed-tier dequeue is about to refresh, over roughly the last export interval"`
+	unviewedAgeP95MS int64  `stat:"unviewed_dirty_age_ms_p95" kind:"gauge" desc:"p95 age (ms) of the change a normal or cluster_list dequeue is about to refresh (its dirty mark to the dequeue), over roughly the last export interval"`
+	unviewedAgeMaxMS int64  `stat:"unviewed_dirty_age_ms_max" kind:"gauge" desc:"Max age (ms) of the change a normal or cluster_list dequeue is about to refresh, over roughly the last export interval"`
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -1589,7 +1613,16 @@ func refresherStatsSnapshot() refresherStats {
 		return refresherStats{}
 	}
 	p95, mx := r.dirtyStats.d2f.read()
+	vP95, vMax := r.dirtyStats.dequeueAge[ageViewed].read()
+	uP95, uMax := r.dirtyStats.dequeueAge[ageUnviewed].read()
 	return refresherStats{
+		normalCompleted:  r.normalCompletedTotal.Load(),
+		viewedCompleted:  r.viewed.completed.Load(),
+		viewedAgeP95MS:   int64(vP95),
+		viewedAgeMaxMS:   int64(vMax),
+		unviewedAgeP95MS: int64(uP95),
+		unviewedAgeMaxMS: int64(uMax),
+
 		parkedMS:             r.parkedNanos.Load() / uint64(time.Millisecond),
 		dirtyToFreshSamples:  r.dirtyStats.samples.Load(),
 		unfreshRemarked:      r.dirtyStats.unfresh[unfreshRemarked].Load(),
@@ -1708,6 +1741,10 @@ func AddRefresherPoolCounterForTest(stat string, n uint64) bool {
 		r.viewed.unsubscribed.Add(n)
 	case "deferred_in_flight":
 		r.viewed.deferredInFlight.Add(n)
+	case "normal_completed":
+		r.normalCompletedTotal.Add(n)
+	case "viewed_completed":
+		r.viewed.completed.Add(n)
 	case "parked_ms":
 		r.parkedNanos.Add(n * uint64(time.Millisecond))
 	case "dirty_to_fresh_samples":

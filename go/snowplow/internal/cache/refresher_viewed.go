@@ -136,6 +136,8 @@ type viewedTierStats struct {
 	// deferredInFlight (#799 B2): dequeues not run because another tier's
 	// worker was re-resolving the same key; the key was re-added when it ended.
 	deferredInFlight atomic.Uint64
+	// completed: successful dequeues of the viewed tier (counting only).
+	completed atomic.Uint64
 }
 
 // enqueueViewed adds l1Key to the viewed tier and wakes an idle worker.
