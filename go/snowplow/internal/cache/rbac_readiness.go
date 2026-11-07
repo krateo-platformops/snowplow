@@ -20,9 +20,15 @@ package cache
 // boot WARN in main.go). Liveness (/health) does not read this, so a slow sync
 // never gets the pod killed.
 //
-// WITHOUT A WATCHER there is no in-process evaluator and nothing to wait for:
-// with the cache off, or a watcher that failed to build, requests are
-// authorised by the apiserver, so readiness is Phase1Done's alone, as before.
+// ONLY A WATCHER THAT RUNS THE RBAC INFORMERS has a snapshot to wait for, and
+// the watcher says so itself (runsRBACInformers). With the cache off main.go
+// still builds a watcher, a passthrough one with no informers at all, and a
+// cache whose setup failed builds none. In both, requests are authorised by the
+// apiserver, so readiness is Phase1Done's alone, as before.
+//
+// TWO WAYS TO WAIT, told apart in the readiness body: an RBAC informer still
+// listing (it is named), or every informer synced and the initial publish not
+// done yet (a rebuild that keeps panicking, #691, is the case that can last).
 
 import (
 	"sync/atomic"
@@ -41,20 +47,37 @@ func noteRBACSnapshotPublished(s *RBACSnapshot) {
 	}
 }
 
-// RBACReadiness reports whether readiness may come as far as RBAC is concerned:
-// the live snapshot is complete, or there is no watcher (see the file comment).
-// When it is not, unsynced names the RBAC informers that have not finished their
-// initial LIST, by resource, in a fixed order. Reads only atomics and the
-// informers' HasSynced: safe on every probe.
-func RBACReadiness() (complete bool, unsynced []string) {
+// RBACReadinessState is readiness's RBAC half.
+type RBACReadinessState struct {
+	// Complete: readiness may come as far as RBAC is concerned.
+	Complete bool
+	// Unsynced names the RBAC informers that have not finished their initial
+	// LIST, by resource, in a fixed order. Empty when Complete.
+	Unsynced []string
+	// PublishPending: not Complete although every RBAC informer has synced,
+	// so the initial publish has not completed yet.
+	PublishPending bool
+}
+
+// runsRBACInformers reports whether rw runs the RBAC informers the in-process
+// evaluator reads: every watcher but a passthrough one (CACHE_ENABLED=false),
+// which runs no informers and leaves authorisation to the apiserver.
+func (rw *ResourceWatcher) runsRBACInformers() bool {
+	return rw != nil && rw.mode != modePassthrough
+}
+
+// RBACReadiness reports readiness's RBAC half (see the file comment). Reads only
+// atomics and the informers' HasSynced: safe on every probe.
+func RBACReadiness() RBACReadinessState {
 	rw := Global()
-	if rw == nil {
-		return true, nil
+	if !rw.runsRBACInformers() {
+		return RBACReadinessState{Complete: true}
 	}
 	if s := LiveRBACSnapshot(); s != nil && s.Synced && rbacInitialPublishReturned(rw) {
-		return true, nil
+		return RBACReadinessState{Complete: true}
 	}
-	return false, unsyncedRBACInformers(rw)
+	unsynced := unsyncedRBACInformers(rw)
+	return RBACReadinessState{Unsynced: unsynced, PublishPending: len(unsynced) == 0}
 }
 
 // unsyncedRBACInformers names the RBAC informers of rw that are missing or have
@@ -84,10 +107,11 @@ func unsyncedRBACInformers(rw *ResourceWatcher) []string {
 }
 
 // UnsyncedRBACInformers names the RBAC informers of the process watcher that
-// have not synced; nil without a watcher. For the boot WARN in main.go.
+// have not synced; nil for a watcher that runs none. For the boot WARN in
+// main.go.
 func UnsyncedRBACInformers() []string {
 	rw := Global()
-	if rw == nil {
+	if !rw.runsRBACInformers() {
 		return nil
 	}
 	return unsyncedRBACInformers(rw)
@@ -98,7 +122,7 @@ func UnsyncedRBACInformers() []string {
 // elapsedMs is process start to the first complete snapshot, -1 until there is
 // one.
 func RBACSnapshotCompleteSnapshot() (complete int64, elapsedMs int64) {
-	if ok, _ := RBACReadiness(); ok {
+	if RBACReadiness().Complete {
 		complete = 1
 	}
 	return complete, rbacCompleteElapsedMs()
@@ -115,18 +139,20 @@ func rbacCompleteElapsedMs() int64 {
 
 // rbacSnapshotCompleteExpvar is the snowplow_rbac_snapshot_complete value.
 func rbacSnapshotCompleteExpvar() any {
-	ok, unsynced := RBACReadiness()
+	st := RBACReadiness()
 	complete := 0
-	if ok {
+	if st.Complete {
 		complete = 1
 	}
+	unsynced := st.Unsynced
 	if unsynced == nil {
 		unsynced = []string{}
 	}
 	return map[string]any{
-		"complete":           complete,
-		"elapsed_ms":         rbacCompleteElapsedMs(),
-		"unsynced_informers": unsynced,
+		"complete":                complete,
+		"elapsed_ms":              rbacCompleteElapsedMs(),
+		"unsynced_informers":      unsynced,
+		"initial_publish_pending": st.PublishPending,
 	}
 }
 
