@@ -345,6 +345,42 @@ def test_the_same_run_publishes_again_and_keeps_what_it_published(tmp_path):
     assert m["stage"] == "final" and evidence.verify(dest, "final") == []
 
 
+def test_an_empty_directory_holds_nothing_to_overwrite_and_is_claimed(tmp_path):
+    """The module doc: a publish refuses a directory that holds anything without this run's claim,
+    and takes an empty one; preflight refuses both, before any cloud call."""
+    dest = tmp_path / "evidence" / "r"
+    dest.mkdir(parents=True)
+    with pytest.raises(evidence.EvidenceError, match="never overwritten"):
+        evidence.preflight(dest)
+    evidence.publish(_run_dir(tmp_path), dest, "id-1", "final")
+    assert evidence.verify(dest, "final") == [] and (dest / evidence.OWNER).read_text() == "id-1"
+
+
+def _staging(parent: Path, owner: str | None, tag: str) -> Path:
+    """A claim's staging directory as a kill between staging and rename leaves it."""
+    p = parent / f".r.claim-{tag}"
+    p.mkdir(parents=True)
+    if owner is not None:
+        (p / evidence.OWNER).write_text(owner)
+    return p
+
+
+def test_a_claim_sweeps_the_staging_its_own_run_left_and_no_other(tmp_path):
+    """This run's leftover (its cap killed a copy mid-claim) goes on its next claim. Another run's,
+    and an empty one nobody can attribute, stay: one could be a claim in flight."""
+    parent = tmp_path / "evidence"
+    mine = _staging(parent, "id-1", "aaaa")
+    theirs = _staging(parent, "id-2", "bbbb")
+    empty = _staging(parent, None, "cccc")
+    other_name = parent / ".rr.claim-dddd"                 # another destination's, though it names id-1
+    other_name.mkdir()
+    (other_name / evidence.OWNER).write_text("id-1")
+    evidence.publish(_run_dir(tmp_path), parent / "r", "id-1", "before-teardown")
+    assert not mine.exists()
+    assert theirs.exists() and empty.exists() and other_name.exists()
+    assert evidence.verify(parent / "r", "before-teardown") == []
+
+
 def test_preflight_refuses_what_a_publish_would(tmp_path, monkeypatch):
     dest = tmp_path / "evidence" / "r"
     evidence.preflight(dest)

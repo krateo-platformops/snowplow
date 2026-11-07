@@ -24,9 +24,16 @@ landed is kept, and no manifest says it is complete.
 
 NEVER OVER AN EARLIER RUN. The destination is claimed by the run's own id, whole or not at all (one
 rename: a full disk leaves no half claim to refuse the retry). A publish to a directory another run
-claimed, or to one nobody claimed, is refused and touches nothing; the same id may publish again
-(the launcher does, after gke-down, for teardown.json and the end of run.log).
-`preflight` refuses the same thing before any cloud call.
+claimed, or to one that holds anything without this run's claim, is refused and touches nothing.
+An EMPTY directory holds nothing to overwrite: the rename takes it. The same id may publish again
+(the launcher does, after gke-down, for teardown.json and the end of run.log). `preflight` refuses
+any existing destination, empty or not, before any cloud call.
+
+A claim is staged in `.<NAME>.claim-<random>` beside the destination: the owner file, never any
+evidence. A run killed between the staging and the rename leaves it there; the next claim by the
+same run id sweeps it (the publish after gke-down, after a copy its cap killed). One another run
+left, or an empty one (killed before its owner file was written), is not this run's to judge and
+stays: it is never read and never a claim, and removing it by hand is safe once no run is going.
 
     python3 -m bench.evidence run-dir NAME               # the default run directory of NAME
     python3 -m bench.evidence dest NAME                  # the evidence directory of NAME
@@ -39,6 +46,7 @@ claimed, or to one nobody claimed, is refused and touches nothing; the same id m
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -140,9 +148,11 @@ def _claim(dest: Path, run_id: str) -> None:
     that fills, or a kill, before that rename leaves no `dest`, so the same command can retry
     (mkdir, then the owner, left an empty directory that refused its own retry). Of two runs only
     one rename lands: the other finds `dest` holding a claim, and a directory this call did not put
-    there must say it is this run's."""
+    there must say it is this run's, or be empty (nothing in it to overwrite: the rename takes it).
+    The staging directories this run left behind, a kill between staging and rename, go first."""
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        _sweep_own_staging(dest, run_id)
         staging = Path(tempfile.mkdtemp(dir=dest.parent, prefix=f".{dest.name}.claim-"))   # mode 0700
     except OSError as e:
         raise EvidenceError(f"the evidence directory {dest} cannot be created: {e}; nothing was claimed, "
@@ -163,6 +173,14 @@ def _claim(dest: Path, run_id: str) -> None:
     if held_by != run_id:
         raise EvidenceError(f"{dest} already exists and holds {'run ' + held_by if held_by else 'no claim by this run'}: "
                             f"an earlier run's evidence is never overwritten; nothing was copied")
+
+
+def _sweep_own_staging(dest: Path, run_id: str) -> None:
+    """Remove the claim staging directories beside `dest` whose owner file names `run_id`: this run's
+    own, left by a kill between staging and rename. Any other is left (module doc)."""
+    for p in dest.parent.glob(f".{glob.escape(dest.name)}.claim-*"):
+        if p.is_dir() and not p.is_symlink() and _held_by(p) == run_id:
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def _held_by(dest: Path) -> str | None:
