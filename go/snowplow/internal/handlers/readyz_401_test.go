@@ -93,6 +93,12 @@ func TestIssue401_MissingSAEndpoint_ReachesReadyDegraded(t *testing.T) {
 		t.Fatal("#401: Phase1Warmup must still return the SA-endpoint error for main.go's WARN line")
 	}
 
+	// #1231 — Ready also needs the complete RBAC snapshot, which this
+	// watcher's empty RBAC LISTs give it at its initial publish. That is not
+	// what #401 is about, so wait for it rather than race it.
+	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
+		t.Fatalf("initial RBAC publish: %v", err)
+	}
 	code, body := readyzRaw(t)
 	if code != http.StatusOK {
 		t.Fatalf("#401 RED: a missing SA endpoint left /readyz at %d (never-Ready); want 200 Ready-degraded; body=%v", code, body)

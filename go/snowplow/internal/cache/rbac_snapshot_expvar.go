@@ -71,5 +71,8 @@ func RegisterRBACSnapshotExpvar() {
 		// #947 — bindings whose roleRef names an absent role, by roleRef
 		// kind ({"ClusterRole": n, "Role": n}). No name in any key.
 		expvar.Publish("snowplow_rbac_dangling_roleref", expvar.Func(rbacDanglingRoleRefExpvar))
+		// #1231 — whether readiness's RBAC half holds, since when, and which
+		// informer it waits on. No name of any RBAC object in it.
+		expvar.Publish("snowplow_rbac_snapshot_complete", expvar.Func(rbacSnapshotCompleteExpvar))
 	})
 }

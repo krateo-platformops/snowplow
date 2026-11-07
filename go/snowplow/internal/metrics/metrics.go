@@ -328,6 +328,21 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err != nil {
 		return err
 	}
+	// --- #1231: readiness's RBAC half ---
+	rbacComplete, err := m.Int64ObservableGauge(
+		"snowplow_rbac_snapshot_complete",
+		metric.WithDescription("1 while the RBAC snapshot the evaluator reads is complete (every RBAC informer synced), else 0. /readyz is 503 while it is 0."),
+	)
+	if err != nil {
+		return err
+	}
+	rbacCompleteElapsed, err := m.Int64ObservableGauge(
+		"snowplow_rbac_snapshot_complete_elapsed_ms",
+		metric.WithDescription("Process-start to the first complete RBAC snapshot (ms); -1 until there is one."),
+	)
+	if err != nil {
+		return err
+	}
 
 	// --- rbac: snapshot authz memo ---
 	memoHits, err := m.Int64ObservableCounter("snowplow_authz_memo_hits",
@@ -676,7 +691,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// Hand-wired: there is no expvar->OTLP bridge.
 	phase1DeadlineReleased, err := m.Int64ObservableCounter(
 		"snowplow_phase1_deadline_released_total",
-		metric.WithDescription("1 iff this process's /readyz was released by the boot-seed / PHASE1_TIMEOUT deadline before the first-nav latch fired (nav widgets still unseeded at Ready); 0 on a latch-released boot. Healthy = 0. #397."))
+		metric.WithDescription("1 iff Phase 1's half of this process's /readyz (Ready also needs the complete RBAC snapshot, #1231) was released by the boot-seed / PHASE1_TIMEOUT deadline before the first-nav latch fired (nav widgets still unseeded at Ready); 0 on a latch-released boot. Healthy = 0. #397."))
 	if err != nil {
 		return err
 	}
@@ -689,7 +704,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// matters with the cache on).
 	phase1ExitByOutcome, err := m.Int64ObservableCounter(
 		"snowplow_phase1_readiness_exit_total",
-		metric.WithDescription("Which outcome released this process's /readyz, by outcome {latch, deadline, boot_error, seed_panic, seed_returned, boot_aborted, none-configured}: 1 at the releasing outcome, 0 elsewhere. Healthy = latch. Any other outcome = a Ready-degraded or nothing-to-warm boot — alert. #736."))
+		metric.WithDescription("Which outcome released Phase 1's half of this process's /readyz (Ready also needs the complete RBAC snapshot, #1231), by outcome {latch, deadline, boot_error, seed_panic, seed_returned, boot_aborted, none-configured}: 1 at the releasing outcome, 0 elsewhere. Healthy = latch. Any other outcome = a Ready-degraded or nothing-to-warm boot — alert. #736."))
 	if err != nil {
 		return err
 	}
@@ -905,6 +920,9 @@ func registerInstruments(m metric.Meter, build string) error {
 		done, elapsed := cache.PrewarmCompleteSnapshot()
 		o.ObserveInt64(prewarmDone, done)
 		o.ObserveInt64(prewarmElapsed, elapsed)
+		rbacOK, rbacElapsed := cache.RBACSnapshotCompleteSnapshot()
+		o.ObserveInt64(rbacComplete, rbacOK)
+		o.ObserveInt64(rbacCompleteElapsed, rbacElapsed)
 
 		hits, misses, swaps, refused, denyUncached, entries := rbac.AuthzMemoSnapshot()
 		o.ObserveInt64(memoHits, int64(hits))
@@ -1182,7 +1200,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		// --- #260 change-4 ---
 		rbacReestablished, rbacWatchError, rbacBumpsBySource, rbacRoleNoop, rbacRoleSemanticNoop, rbacBindingUidChanged,
 		bindingNoopUpdates, bindingSemanticNoopUpdates,
-		registeredGVRs, prewarmDone, prewarmElapsed,
+		registeredGVRs, prewarmDone, prewarmElapsed, rbacComplete, rbacCompleteElapsed,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
 		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,
 		// --- #368 (registered since #455; observed but unregistered before, so

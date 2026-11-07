@@ -919,14 +919,18 @@ func main() {
 					// is a no-op inside the Start fn.
 					cache.StartSliceabilityReverifier(cacheCtx)
 
-					// Block until RBAC informer LISTs complete so the
-					// first dispatch is not racing the initial sync.
-					// Bounded at 60s — soft failure (log + continue),
-					// not fatal.
+					// Wait for the informers' initial LISTs before Phase 1, so
+					// its walk is not racing the initial sync. Bounded at 60 s:
+					// on timeout boot continues. This bounds boot, never
+					// readiness (#1231): /readyz stays 503 until the RBAC
+					// snapshot is complete (cache.RBACReadiness), however long
+					// that takes. The WARN names the RBAC informers still
+					// listing, so a stalled sync says where it is stuck.
 					syncCtx, syncCancel := context.WithTimeout(cacheCtx, 60*time.Second)
 					if err := w.WaitForCacheSync(syncCtx, 60*time.Second); err != nil {
-						log.WarnContext(syncCtx, "cache: initial WaitForCacheSync incomplete; first dispatches may evaluate against partial RBAC index",
-							slog.Any("err", err))
+						log.WarnContext(syncCtx, "cache: initial WaitForCacheSync incomplete after 60s; boot continues, and /readyz stays NotReady until every RBAC informer has synced",
+							slog.Any("err", err),
+							slog.Any("unsynced_rbac_informers", cache.UnsyncedRBACInformers()))
 					} else {
 						log.Info("cache: RBAC informers fully synced")
 					}
