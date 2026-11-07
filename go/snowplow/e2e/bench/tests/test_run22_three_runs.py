@@ -176,6 +176,101 @@ def test_the_launch_exit_ranks_a_pairs_fail_above_another_pairs_invalid(pairbed,
     assert p.returncode == 1, p.stderr[-2000:]
 
 
+def _launch_env(env, tmp, spec: dict, pairs: str, **over):
+    """The pair bed's environment for any RUNS / PAIRS: spec = {label: (run name, digest)}."""
+    e = {k: v for k, v in env.items() if not k.endswith(("_A", "_B"))}
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    e.update(RUNS=" ".join(spec), PAIRS=pairs)
+    for x, (name, dig) in spec.items():
+        e.update({f"RUN_NAME_{x}": name, f"SNOWPLOW_TAG_{x}": f"tag-{x.lower()}", f"EXPECTED_IMAGE_DIGEST_{x}": dig,
+                  f"BENCH_606_GO_{x}": f"{today}-{name}", f"OUT_{x}": str(tmp / x)})
+    e.update(over)
+    return e
+
+
+def test_disjoint_pairs_a_tooling_failure_stops_only_its_own_partner(pairbed, va):  # noqa: F811
+    """The launcher is generic: A:B and C:D share no run. B fails as tooling, so A:B is lost and A's
+    cluster feeds no comparison: A alone is stopped; C and D run on and C:D is judged. (In run 22's
+    shape every pair holds C, so only disjoint pairs tell "the run's own pairs" from "every pair".)"""
+    repo, fake, env, tmp = pairbed
+    a, b = _ab(va)
+    spec = {"A": ("snowplow-bench-dja", DIG_A), "B": ("snowplow-bench-djb", DIG_B),
+            "C": ("snowplow-bench-djc", DIG_A), "D": ("snowplow-bench-djd", DIG_B)}
+    for x, (name, _) in spec.items():
+        (fake / f"{name}.verdict.json").write_text(json.dumps(a if x in "AC" else b))
+        (fake / f"{name}.sleep").write_text("3")
+    for f, v in (("sleep", "0"), ("rc", "1"), ("incomplete", "")):
+        (fake / f"snowplow-bench-djb.{f}").write_text(v)
+    (fake / "cluster_limit").write_text("4")             # four clusters, and room for them
+    p = _launch(repo, _launch_env(env, tmp, spec, "A:B C:D", **ROOM_FOR_THREE))
+    calls = _calls(fake)
+    assert "snowplow-bench-dja pair-stop" in calls, calls
+    assert not [c for c in calls if c.endswith("pair-stop") and not c.startswith("snowplow-bench-dja")], calls
+    assert "snowplow-bench-djc teardown rc=0" in calls and "snowplow-bench-djd teardown rc=0" in calls
+    assert json.loads((tmp / "pair" / "paired-verdict-C-D.json").read_text())["verdict"] == "PASS"
+    assert json.loads((tmp / "pair" / "paired-verdict-A-B.json").read_text())["verdict"] == "INVALID"
+    assert p.returncode == 3
+    log = (tmp / "pair" / "pair.log").read_text()
+    assert "run B failed as tooling: stopping run A" in log and "stopping run C" not in log and "stopping run D" not in log
+
+
+def _r20(fake, names: dict[str, str]):
+    """Run 20's recorded pair (tests/test_1053_steady_replica.py): a REAL INCONCLUSIVE, its steady
+    p99 past the within-run bar with no between-run replica. names = {"a": run name, "b": run name}."""
+    from tests.test_1053_steady_replica import R20
+    for x, name in names.items():
+        (fake / f"{name}.verdict.json").write_text(json.dumps(R20[x]))
+    return {x: R20[x]["report"]["image_digest"]["expected"] for x in ("a", "b")}
+
+
+def test_an_inconclusive_pair_never_exits_0(pairbed):  # noqa: F811
+    """One pair, INCONCLUSIVE: the launch exits 4, as custlat pair does. Ranked below PASS it would
+    exit 0 and read as a pass."""
+    repo, fake, env, tmp = pairbed
+    dig = _r20(fake, {"a": "snowplow-bench-r20a", "b": "snowplow-bench-r20b"})
+    spec = {"A": ("snowplow-bench-r20a", dig["a"]), "B": ("snowplow-bench-r20b", dig["b"])}
+    p = _launch(repo, _launch_env(env, tmp, spec, "A:B"))
+    v = json.loads((tmp / "pair" / "paired-verdict-A-B.json").read_text())
+    assert v["verdict"] == "INCONCLUSIVE", v.get("invalid_reasons")
+    assert p.returncode == 4, p.stderr[-2000:]
+
+
+def test_inconclusive_outranks_pass_across_pairs(pairbed):  # noqa: F811
+    """R:C is run 20's INCONCLUSIVE; N:C compares C with its own data under another digest (PASS).
+    The launch is INCONCLUSIVE, never PASS."""
+    repo, fake, env, tmp = pairbed
+    from tests.test_1053_steady_replica import R20
+    dig = _r20(fake, {"a": "snowplow-bench-r22r", "b": "snowplow-bench-r22c"})
+    n = copy.deepcopy(R20["b"])
+    n["report"]["image_digest"] = {"expected": DIG_N}
+    (fake / "snowplow-bench-r22n.verdict.json").write_text(json.dumps(n))
+    spec = {"R": ("snowplow-bench-r22r", dig["a"]), "N": ("snowplow-bench-r22n", DIG_N),
+            "C": ("snowplow-bench-r22c", dig["b"])}
+    p = _launch(repo, _launch_env(env, tmp, spec, "R:C N:C", **ROOM_FOR_THREE))
+    assert json.loads((tmp / "pair" / "paired-verdict-R-C.json").read_text())["verdict"] == "INCONCLUSIVE"
+    assert json.loads((tmp / "pair" / "paired-verdict-N-C.json").read_text())["verdict"] == "PASS"
+    assert p.returncode == 4, p.stderr[-2000:]
+
+
+@pytest.mark.parametrize("others, refused", [(0, False), (1, True), (2, True)])
+def test_three_runs_against_the_regions_cluster_limit(pairbed, va, others, refused):  # noqa: F811
+    """GKE's ClustersPerRegion in europe-west4 is 3 (read live 2026-11-07): run 22 takes all three.
+    Any other cluster in the region refuses the launch, before anything starts, however much room
+    every other quota has."""
+    repo, fake, env, tmp = pairbed
+    _verdicts3(fake, va)
+    clusters = json.dumps([{"name": f"krateo-other-{k}", "location": "europe-west4", "status": "RUNNING"}
+                           for k in range(others)])
+    p = _launch(repo, _three(env, tmp, BENCH_606_DRY_RUN="1", FAKE_CLUSTERS=clusters, **ROOM_FOR_THREE))
+    assert f"{others} of 3" in p.stderr and "the run needs 3" in p.stderr, p.stderr[-2000:]
+    if refused:
+        assert p.returncode == 2 and f"{3 - others} free, the run needs 3" in p.stderr
+        assert "DRY: all 3 runs would start now" not in p.stderr
+    else:
+        assert p.returncode == 0 and "DRY: all 3 runs would start now" in p.stderr
+    assert not _started(fake)
+
+
 @pytest.mark.parametrize("over, words", [
     ({"PAIRS": "R:C"}, "run N is in no pair"),
     ({"PAIRS": "R:C N:X"}, "PAIRS: N:X names a run that is not in RUNS"),
@@ -197,8 +292,9 @@ def test_a_launch_the_runs_and_pairs_cannot_make_is_refused_before_anything(pair
 
 
 def test_the_pair_log_carries_each_runs_refresher_tiers(pairbed, va):  # noqa: F811
-    """The lines `custlat pair` writes, in the launcher's log under their pair: C's from its own
-    verdict's section, R's (an evaluate before the section) as UNMEASURED."""
+    """The lines `custlat pair` writes, in the launcher's log under their pair, each named by its
+    run's label (never A/B, also a run label): C's from its own verdict's section, R's (an evaluate
+    before the section) as UNMEASURED."""
     repo, fake, env, tmp = pairbed
 
     def tiers(v):
@@ -210,9 +306,11 @@ def test_the_pair_log_carries_each_runs_refresher_tiers(pairbed, va):  # noqa: F
     p = _launch(repo, _three(env, tmp, **ROOM_FOR_THREE))
     assert p.returncode == 0, p.stderr[-2000:]
     log = (tmp / "pair" / "pair.log").read_text()
-    assert "R vs C: refresher tiers, B (candidate): viewed_reserve_parks: all 7" in log
-    assert "N vs C: refresher tiers, B (candidate): viewed_reserve_parks: all 7" in log
-    assert "R vs C: refresher tiers, A (baseline): UNMEASURED (the run's verdict.json has no " in log
+    assert "R vs C: refresher tiers, C (candidate): viewed_reserve_parks: all 7" in log
+    assert "N vs C: refresher tiers, C (candidate): viewed_reserve_parks: all 7" in log
+    assert "R vs C: refresher tiers, R (baseline): UNMEASURED (the run's verdict.json has no " in log
+    assert "N vs C: refresher tiers, N (baseline): " in log
+    assert "(baseline)" in log and "refresher tiers, A (" not in log and "refresher tiers, B (" not in log
 
 
 # ─── #1085's refresher tiers, through the evaluate CLI ─────────────────────

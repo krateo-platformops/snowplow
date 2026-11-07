@@ -1717,13 +1717,14 @@ def _provenance(d: str) -> dict:
             "k6_stream_sha256": _sha256(k6s) if os.path.exists(k6s) else None}
 
 
-def refresher_tiers_pair(va: dict | None, vb: dict | None) -> dict:
+def refresher_tiers_pair(va: dict | None, vb: dict | None, labels: tuple[str, str] = ("A", "B")) -> dict:
     """#1085, report only: each run's refresher_tiers_report_only (bench/load606.py), side by side,
-    and its lines prefixed with the run's role. A verdict without the section (an evaluate before
+    and its lines prefixed with the run's own label and role (run606_pair.sh passes each run's
+    label: "N (baseline)", "C (candidate)"). A verdict without the section (an evaluate before
     it) says so, never reads as zero."""
     out: dict = {"lines": []}
     for x, v in (("a", va), ("b", vb)):
-        role = "A (baseline)" if x == "a" else "B (candidate)"
+        role = f"{labels[0]} (baseline)" if x == "a" else f"{labels[1]} (candidate)"
         r = ((v or {}).get("report") or {}).get("refresher_tiers_report_only")
         out[x] = r if r is not None else _unmeasured_section()
         out["lines"] += ([f"refresher tiers, {role}: {ln}" for ln in r.get("lines") or []] if r is not None else
@@ -1746,6 +1747,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--expect-a", default=None, help="A's EXPECTED_IMAGE_DIGEST")
     pr.add_argument("--expect-b", default=None, help="B's EXPECTED_IMAGE_DIGEST")
     for x in ("a", "b"):
+        pr.add_argument(f"--{x}-label", default=x.upper(),
+                        help=f"{x.upper()}'s run label, which its report-only lines name (run606_pair.sh's RUNS)")
         pr.add_argument(f"--completed-{x}", type=int, choices=(0, 1), default=None,
                         help=f"1 when {x.upper()}'s evaluate step ran (run606 logged 'run complete')")
         pr.add_argument(f"--{x}-dir", default=None,
@@ -1793,7 +1796,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
         out["acceptance_ratios_report_only"] = {"error": f"{type(e).__name__}: {e}"}
     try:
-        out["refresher_tiers_report_only"] = refresher_tiers_pair(va, vb)
+        out["refresher_tiers_report_only"] = refresher_tiers_pair(va, vb, (a.a_label, a.b_label))
     except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
         out["refresher_tiers_report_only"] = {"error": f"{type(e).__name__}: {e}",
                                               "lines": [f"refresher tiers: report failed: {type(e).__name__}: {e}"]}

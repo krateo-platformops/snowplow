@@ -194,7 +194,8 @@ pair_cmd() {
   local a="${1%%:*}" b="${1##*:}"
   local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a" db="EXPECTED_IMAGE_DIGEST_$b"
   PAIR_CMD=(python3 -m bench.custlat pair --a "${!oa}/verdict.json" --b "${!ob}/verdict.json"
-            --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}")
+            --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}"
+            --a-label "$a" --b-label "$b")
 }
 
 runs_line=""
