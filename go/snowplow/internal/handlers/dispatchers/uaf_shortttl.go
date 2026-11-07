@@ -361,9 +361,9 @@ const (
 	// SELF-LOOPBACK (a named snowplow endpoint calling /call). The child is a
 	// separate request and bumps only its own sink, so this reason never fires
 	// for the outer cell. That Put is declined by the external-touched verdict
-	// (cache.PutGateVerdict) instead — except for a widget that opts into
-	// krateo.io/external-cache-ttl-seconds, whose WithExternalTTL turns the
-	// external-only decline into a store.
+	// (cache.PutGateVerdict) instead, for a widget that opts into
+	// krateo.io/external-cache-ttl-seconds too: the self-loopback carries the
+	// requester's bearer, so it is not a third-party touch (#1221).
 	// Read this constant as "something marked the resolve", never as "every
 	// narrowed shape is marked".
 	uafDeclineObserved = "observed_refilter"

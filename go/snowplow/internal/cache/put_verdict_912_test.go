@@ -108,7 +108,7 @@ func TestIssue912_V2_GatedWritesRefuseADecliningVerdict(t *testing.T) {
 		t.Fatalf("the zero PutVerdict must admit nothing and be no decline: %+v", zero)
 	}
 	ext := &ExternalTouchedSink{}
-	ext.Bump()
+	ext.BumpThirdParty()
 	external := PutGateVerdict(freshSinks(nil, nil, ext), "widgets")
 	if v := external.WithExternalTTL(true); !v.Store() || !v.ExternalTTL() {
 		t.Fatalf("an external-only decline with the opt-in must store with ExternalTTL: %+v", v)
