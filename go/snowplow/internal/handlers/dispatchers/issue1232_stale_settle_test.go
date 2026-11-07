@@ -35,12 +35,27 @@ func TestIssue1232_ADequeueThatStartedBeforeTheClaimLeavesTheSlot(t *testing.T) 
 	if n := cache.BackgroundRevalidationsInFlight(); n != 1 {
 		t.Fatalf("PRECONDITION: the revalidation claimed no slot (%d held)", n)
 	}
+	before := cache.ResolvedCache().Stats()
+	chainBefore, _ := cache.StaleRetryChainOpenForTest(contentKey)
 	close(park.release[0]) // the earlier dequeue ends
 
 	park.await(t, 1) // the revalidation's own dequeue is running
 	if n := cache.BackgroundRevalidationsInFlight(); n != 1 {
 		t.Fatalf("#1232 RED: the revalidation's slot was released before its dequeue ran (%d held): "+
 			"the dequeue that was already in flight when it was claimed settled it", n)
+	}
+	// Leaving the slot alone also means not reporting it: the earlier dequeue
+	// did not run this attempt, so it counts no outcome for it and opens no
+	// retry chain on its behalf.
+	after := cache.ResolvedCache().Stats()
+	if after.KnownStaleRevalidationFresh != before.KnownStaleRevalidationFresh ||
+		after.KnownStaleRevalidationFailed != before.KnownStaleRevalidationFailed {
+		t.Fatalf("#1232 RED: the earlier dequeue counted an outcome for an attempt it did not run "+
+			"(fresh %d→%d, failed %d→%d)", before.KnownStaleRevalidationFresh, after.KnownStaleRevalidationFresh,
+			before.KnownStaleRevalidationFailed, after.KnownStaleRevalidationFailed)
+	}
+	if chainAfter, _ := cache.StaleRetryChainOpenForTest(contentKey); chainAfter && !chainBefore {
+		t.Fatalf("#1232 RED: the earlier dequeue opened a retry chain for an attempt it did not run")
 	}
 	if got := h.bgCalls.Load() - bg0; got != 2 {
 		t.Fatalf("#1232: %d background resolves, want 2: the dirty mark's and the revalidation's", got)
