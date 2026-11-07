@@ -48,6 +48,6 @@ def test_a_pair_stop_during_the_measure_stops_it_and_tears_down_in_full(harness)
 def test_the_pair_stops_its_partner_with_a_pair_stop_not_a_term():
     from tests.test_run606_real_sequence import BENCH_DIR
     src = (BENCH_DIR / "run606_pair.sh").read_text()
-    stop = src.split("failed as tooling: stopping run", 1)[1].split("\n        fi", 1)[0]
+    stop = src.split("failed as tooling: stopping run", 1)[1].split("\n        done", 1)[0]
     assert 'kill -USR1 "${!opid}"' in stop and "kill -TERM" not in stop
     assert "trap on_pair_stop USR1" in (BENCH_DIR / "run606.sh").read_text()
