@@ -83,7 +83,12 @@ import (
 // module trees. server/, endpoints/ and jwtutil/ are byte-identical, and the
 // only non-crdgen changes are helm/getter/cache and helm/utils, which
 // snowplow does not import.
-const PinnedPlumbingVersion = "v1.15.1"
+//
+// v1.15.1 → v1.28.1 (#1135): re-audited by `git diff` of the two tags. server/
+// is byte-identical, and jwtutil/ changes only the JWKS key source's default
+// client (dialguard.Client, the same timeout). endpoints/ adds the
+// pass-credentials-on-redirect key, which this file does not read.
+const PinnedPlumbingVersion = "v1.28.1"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,

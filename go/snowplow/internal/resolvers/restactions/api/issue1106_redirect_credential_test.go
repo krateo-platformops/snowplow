@@ -211,7 +211,9 @@ func TestIssue1106_C_EveryCredentialKindStaysOnItsHost(t *testing.T) {
 // and a stage header carrying one under a name net/http does not strip on a
 // cross-host redirect. The hop is refused whatever the headers.
 func TestIssue1106_D_StageHeaderCredentialNeverLeavesTheOrigin(t *testing.T) {
-	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "PRIVATE-TOKEN"} {
+	// X-Zq7-Tenant-Cred is deliberately odd: nothing in the stack strips it by
+	// name (plumbing's guard strips Authorization alone, #1135).
+	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "PRIVATE-TOKEN", "X-Zq7-Tenant-Cred"} {
 		for _, target := range []string{"other_host", "same_hostname_other_port"} {
 			t.Run(h+"_"+target, func(t *testing.T) {
 				other := newX1106Srv(t, false, x1106OK)

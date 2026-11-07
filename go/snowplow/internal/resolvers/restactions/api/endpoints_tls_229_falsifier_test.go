@@ -359,6 +359,10 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 		// too. Same principle as the row above: the owned branch owns only what
 		// it can reproduce exactly.
 		{"AWS auth with a CA", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, AwsAccessKey: "AKIA", AwsSecretKey: "s", AwsRegion: "eu-west-1", AwsService: "execute-api"}, false},
+		// #1135 — plumbing v1.22+ reads AwsService in HasAwsAuth, so three of the
+		// four SigV4 inputs are no AWS auth at all: the shape is owned and sends
+		// its bearer token, where plumbing used to refuse the pair outright.
+		{"AWS fields with no service, beside a bearer token", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", AwsAccessKey: "AKIA", AwsSecretKey: "s", AwsRegion: "eu-west-1"}, true},
 		// THE LIVE POPULATION GUARD. Field-for-field the shape sa_client.go:126
 		// builds, which is what every non-GET no-endpointRef api-step uses. The
 		// owned branch now carries TWO exclusions beyond its original predicate,
