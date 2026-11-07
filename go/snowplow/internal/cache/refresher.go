@@ -1033,7 +1033,11 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// this dequeue (runs before Done, after every branch below has settled the
 	// window).
 	var attemptDur time.Duration // #740: the failed attempt's own duration floors its backoff
-	defer func() { settleBackgroundRevalidation(key, attemptDur) }()
+	// #1232 — the claim number recorded where this dequeue begins its work
+	// (the single Get, below the yield). A revalidation claimed after it is not
+	// this dequeue's to settle: its own dequeue follows.
+	var claimedBy uint64
+	defer func() { settleBackgroundRevalidation(key, attemptDur, claimedBy) }()
 
 	// #871 — measurement only: from here this dequeue is one refresh unit. Its
 	// ctx and goroutine carry snowplow_work=refresh|refresh_viewed, and every
@@ -1097,6 +1101,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	// disappears from the dependent LIST cell within ≤ floor (same
 	// stale-while-revalidate posture as any UPDATE; the self entry's own
 	// eviction via RemoveL1Key remains immediate).
+	claimedBy = revalClaimsSoFar()
 	c := ResolvedCache()
 	var (
 		entry *ResolvedEntry
