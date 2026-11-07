@@ -1011,7 +1011,7 @@ def test_run606_pair_logs_fail_note_excluded_lines(pairbed, case):  # noqa: F811
     _stage(tmp, fake, a, b)
     p = _launch(repo, env)
     log = (tmp / "pair" / "pair.log").read_text()
-    v = json.loads((tmp / "pair" / "paired-verdict.json").read_text())
+    v = json.loads((tmp / "pair" / "paired-verdict-A-B.json").read_text())
     assert "--a-dir" in (repo / "run606_pair.sh").read_text()
     assert "EXCLUDED from both runs: A restart #1" in log
     assert not any(c["check"].startswith("customer_latency.pair.raw_calls") and c["result"] == "FAIL"
@@ -1025,7 +1025,7 @@ def test_run606_pair_logs_fail_note_excluded_lines(pairbed, case):  # noqa: F811
         assert p.returncode == 1 and v["verdict"] == "FAIL"
         assert "FAIL: customer_latency.pair.candidate_restarts" in log
         assert "EXCLUDED from both runs: B restart #1" in log
-        assert "paired verdict exit=1" in log
+        assert "paired verdict A vs B exit=1" in log
 
 
 # ─── re-review of e94f2da9: what k6 witnesses inside B's sampler-blind stretch ─

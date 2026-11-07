@@ -2570,7 +2570,21 @@ RUN8_KEYS = {
     "retry_backoff": "snowplow_stale_retry_backoff_ms",
     "retry_abandoned": "snowplow_stale_retry_abandoned_total",   # {"no_viewer", "evicted"}
     "retry_resumed": "snowplow_stale_retry_resumed_total",
+    # #1085: the refresher's work per tier, the parks of its viewed reserve, and how old a change
+    # is when a worker dequeues it, per tier (refresher_tiers_report). #1244 carries the
+    # completions and the ages without the reserve, so a build may hold some and not others.
+    "tier_normal_completed": "snowplow_refresher_normal_completed_total",
+    "tier_viewed_completed": "snowplow_refresher_viewed_completed_total",
+    "tier_viewed_reserve_parks": "snowplow_refresher_viewed_reserve_parks_total",
+    "tier_viewed_dirty_age_p95": "snowplow_refresher_viewed_dirty_age_ms_p95",
+    "tier_viewed_dirty_age_max": "snowplow_refresher_viewed_dirty_age_ms_max",
+    "tier_unviewed_dirty_age_p95": "snowplow_refresher_unviewed_dirty_age_ms_p95",
+    "tier_unviewed_dirty_age_max": "snowplow_refresher_unviewed_dirty_age_ms_max",
 }
+#: refresher_tiers_report's counters (per-phase deltas) and gauges (per-phase max and median)
+REFRESHER_TIER_COUNTERS = ("normal_completed", "viewed_completed", "viewed_reserve_parks")
+REFRESHER_TIER_GAUGES = ("viewed_dirty_age_p95", "viewed_dirty_age_max",
+                         "unviewed_dirty_age_p95", "unviewed_dirty_age_max")
 # Members of the snowplow_resolved_cache map the Q2 report reads.
 RUN8_RESOLVED_CACHE_STATS = ("hit_total", "stale_served_total", "stale_served_age_ms_max",
                              "known_stale_served_total")
@@ -3492,6 +3506,74 @@ def refresher_gauges_report(vars_series: list[dict], mem: list[dict], k6_driver:
             "refresher_gauges_source": f"{src} ({len(rows)})"}
 
 
+def refresher_tiers_report(mem: list[dict], fresh: list[dict] | None) -> dict:
+    """#1085, report only: per phase (run_phases, "churn" summing the churn phases, "all"), the
+    deltas of the refresher's per-tier completions and of its viewed reserve's parks, and the max
+    and median of the four dirty-age gauges, from mem606's /debug/vars samples. Each value a build
+    does not publish is UNMEASURED with why, never zero: #1244 builds carry the completions and the
+    ages without the reserve, older builds none of them. `lines` is what the paired verdict prints."""
+    mems = [m for m in mem if m.get("kind") == "mem"]
+    out: dict = {"source": f"mem606's /debug/vars samples ({len(mems)})"}
+    for name in REFRESHER_TIER_COUNTERS:
+        key = RUN8_KEYS[f"tier_{name}"]
+
+        def one(m, key=key):
+            v = _num((m.get("extra") or {}).get(key))
+            return None if v is None else {"n": v}
+        r = _phase_counter_report(mem, fresh, key, one)
+        out[name] = (_unmeasured(f"{key} is in none of the {len(mems)} mem606 samples: this build does not "
+                                 f"publish it, or mem606 did not capture it")
+                     if r["status"] != "present" else
+                     {"by_phase": {ph: v["counters"].get("n", 0) for ph, v in r["by_phase"].items()},
+                      "restarts": r["restarts"], "samples": r["samples"]})
+    phases = run_phases(mem, fresh)
+    order = [n for n, _, _ in phases] + ["steady"]
+    for name in REFRESHER_TIER_GAUGES:
+        key = RUN8_KEYS[f"tier_{name}"]
+        by: dict[str, list] = {}
+        for m in sorted(mems, key=lambda m: m.get("t") or 0):
+            v = _num((m.get("extra") or {}).get(key))
+            if v is not None and m.get("t") is not None:
+                by.setdefault(_phase_of(m["t"], phases), []).append(v)
+        if not by:
+            out[name] = _unmeasured(f"{key} is in none of the {len(mems)} mem606 samples: this build does not "
+                                    f"publish it, or mem606 did not capture it")
+            continue
+        groups = {n: by[n] for n in order if n in by}
+        churn = [v for n, vs in by.items() if n.startswith("churn:") for v in vs]
+        if churn:
+            groups["churn"] = churn
+        groups["all"] = [v for vs in by.values() for v in vs]
+        out[name] = {"by_phase": {n: {"max": max(vs), "median": pct(vs, 50), "samples": len(vs)}
+                                  for n, vs in groups.items()}}
+    out["lines"] = refresher_tier_lines(out)
+    return out
+
+
+def _report_only(fn, *args):
+    """A report-only section never changes, nor stops, the verdict: its failure is its own content."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "lines": [f"report failed: {type(e).__name__}: {e}"]}
+
+
+def refresher_tier_lines(r: dict) -> list[str]:
+    """One line per value: a counter's delta per phase, a gauge's max / median per phase."""
+    lines = []
+    for name in REFRESHER_TIER_COUNTERS + REFRESHER_TIER_GAUGES:
+        v = r.get(name) or {}
+        if v.get("status") == "UNMEASURED":
+            lines.append(f"{name}: UNMEASURED ({v['why']})")
+        elif name in REFRESHER_TIER_COUNTERS:
+            lines.append(f"{name}: " + ", ".join(f"{ph} {n:g}" for ph, n in v["by_phase"].items())
+                         + (f" ({v['restarts']} restart(s) spanned)" if v.get("restarts") else ""))
+        else:
+            lines.append(f"{name} (ms, max / median): " + ", ".join(
+                f"{ph} {g['max']:g} / {g['median']:g}" for ph, g in v["by_phase"].items()))
+    return lines
+
+
 def push_refetch_field(rows: list[dict], src: str) -> dict:
     """push_refetch_report over the driver's viewers' records, or UNMEASURED
     with why (#1066): none recorded is not none happened."""
@@ -3825,6 +3907,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     # put every churn second in "steady")
     phase_src = list(fresh) + list(churns or [])
     report["list_narrow_shadow_report_only"] = list_narrow_report(mem or [], phase_src)
+    # #1085: the refresher's tiers per phase, on the same schedule
+    report["refresher_tiers_report_only"] = _report_only(refresher_tiers_report, mem or [], phase_src)
     # report-only warnings: a report that came out empty says so (run606
     # logs each one; the verdict never reads them)
     report["report_warnings"] = (
