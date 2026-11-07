@@ -699,7 +699,8 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		return
 	}
 	rbacSnap.Store(snap)
-	notePublished() // #691
+	notePublished()                 // #691
+	noteRBACSnapshotPublished(snap) // #1231: the first complete snapshot
 	// #947 — report the dangling roleRefs that changed with this publish:
 	// one line per binding that became dangling or stopped being dangling.
 	if snap.Synced {
@@ -1411,6 +1412,17 @@ func rbacInitialPublishReturned(rw *ResourceWatcher) bool {
 	}
 }
 
+// initialPublishBeforeIndexHookForTest runs between the initial complete
+// publish and the deferred bindings-index build. TEST-ONLY: nil in production.
+var initialPublishBeforeIndexHookForTest atomic.Pointer[func()]
+
+// SetInitialPublishBeforeIndexHookForTest installs h and returns the restore.
+// TEST-ONLY.
+func SetInitialPublishBeforeIndexHookForTest(h func()) (restore func()) {
+	prev := initialPublishBeforeIndexHookForTest.Swap(&h)
+	return func() { initialPublishBeforeIndexHookForTest.Store(prev) }
+}
+
 // waitAndPublishInitialRBACSnapshot is the initial-publish goroutine
 // spawned by NewResourceWatcher (Ship B / AC-B.9). It blocks until all
 // 4 RBAC syncCh channels close — the "Servable" signal that the
@@ -1475,8 +1487,12 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	// that read the indexers earlier could overwrite a newer snapshot that
 	// already carried a revoke.
 	publishRBACSnapshotUnderSlot(rw)
+	if h := initialPublishBeforeIndexHookForTest.Load(); h != nil {
+		(*h)() // #1231 arm: between the complete publish and the deferred build
+	}
 	// #686 — the first COMPLETE snapshot: run a bindings-index build that
-	// was requested before any snapshot existed.
+	// was requested before any snapshot existed. #1231: readiness waits for
+	// this function to return, so the build is done before Ready.
 	buildPendingBindingsIndex()
 	slog.Info("cache.rbac.snapshot.initial_publish_done",
 		slog.String("subsystem", "cache"),

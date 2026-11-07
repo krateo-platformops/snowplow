@@ -17,7 +17,8 @@ var aliveBody = []byte(`{"status":"alive"}`)
 // token + ca.crt from disk per call), NO namespace lookup, and NO
 // allocation per probe. This is the process-alive signal; the
 // safe-to-receive-traffic signal lives at /readyz which gates on
-// cache.IsPhase1Done().
+// cache.IsPhase1Done() and the RBAC snapshot (#1231). Liveness reads neither, so
+// a slow RBAC sync never gets the pod restarted.
 //
 // The serviceName / build / nsgetter parameters are kept in the
 // signature for API stability with prior callers — they are intentionally

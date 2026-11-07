@@ -21,7 +21,8 @@
 // Compositions Page DataGrid. After the walk, Phase 1 BLOCKS until every
 // registered informer reaches HasSynced, then signals Phase1Done. The
 // /readyz probe gates pod readiness on Phase1Done so traffic only
-// arrives once the navigated informers are warm.
+// arrives once the navigated informers are warm, and also on the complete
+// RBAC snapshot (#1231, rbac_readiness.go): Phase1Done alone is not Ready.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
 // configured GVR / RESTAction list. The ONLY hardcoded budget is the 5
