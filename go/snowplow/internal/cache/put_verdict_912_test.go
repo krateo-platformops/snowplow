@@ -103,6 +103,8 @@ func TestIssue912_V1b_MissingSinkIsUnobservedNeverStore(t *testing.T) {
 // external-TTL opt-in only turns an external-ONLY decline into a store, and
 // every verdict-gated write refuses a declining verdict (and the zero value).
 func TestIssue912_V2_GatedWritesRefuseADecliningVerdict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	var zero PutVerdict
 	if zero.Store() || zero.Permanent() {
 		t.Fatalf("the zero PutVerdict must admit nothing and be no decline: %+v", zero)
@@ -180,6 +182,8 @@ func TestIssue912_V2_GatedWritesRefuseADecliningVerdict(t *testing.T) {
 // Mutations (logic-only, RUN): drop the class check → RED on the widgets row;
 // drop the key check → RED on the foreign-key row.
 func TestIssue912_V3_PutContentIfGenWritesOnlyAContentCell(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	ctx := context.Background()
 	content := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Version: "v1", Resource: "configmaps", Namespace: "ns"}
 	contentKey := ComputeKey(content)

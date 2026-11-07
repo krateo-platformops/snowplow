@@ -156,6 +156,8 @@ func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 // raFullList entry is un-pinned here (Pinned defaults false) so the cap-1 LRU
 // sweep can evict it.
 func TestRAFullListCounters_ClassifiedByCacheEntryClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(1, 1<<20, time.Hour)
 
 	c.put("plain", &ResolvedEntry{

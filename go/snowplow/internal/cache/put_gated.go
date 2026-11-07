@@ -28,8 +28,7 @@ func (c *ResolvedCacheStore) PutResolved(v PutVerdict, key string, entry *Resolv
 	if !v.Store() {
 		return false
 	}
-	c.put(key, entry)
-	return true
+	return c.put(key, entry)
 }
 
 // PutResolvedIfGen is putIfGen, gated by v.
@@ -46,8 +45,7 @@ func (c *ResolvedCacheStore) PutResolvedThenRemark(ctx context.Context, v PutVer
 	if !v.Store() {
 		return false
 	}
-	c.putThenRemark(ctx, key, entry)
-	return true
+	return c.putThenRemark(ctx, key, entry)
 }
 
 // PutResolvedEndingKnownStale is putEndingKnownStale, gated by v. It reports
@@ -56,8 +54,7 @@ func (c *ResolvedCacheStore) PutResolvedEndingKnownStale(ctx context.Context, v 
 	if !v.Store() {
 		return false
 	}
-	c.putEndingKnownStale(ctx, key, entry)
-	return true
+	return c.putEndingKnownStale(ctx, key, entry)
 }
 
 // ReplaceResolvedIfGen is replaceIfGen (replace a live entry, never insert),
@@ -88,7 +85,8 @@ func (c *ResolvedCacheStore) PutContentIfGen(ctx context.Context, key string, en
 		return false
 	}
 	// #443 (a) — an inert (dry-run) resolve persists nothing (the resolve path
-	// reaches this method directly, so it says so itself).
+	// reaches this method directly, so it says so itself). putIfGen runs the
+	// store's admission as well (#1233).
 	if Inert(ctx) {
 		return false
 	}

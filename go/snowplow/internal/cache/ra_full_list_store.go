@@ -111,16 +111,16 @@ func (c *ResolvedCacheStore) PutRAFullList(v PutVerdict, key string, inputs Reso
 	// quietly; one that reasons about a gate can.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — see the paragraphs above.
-	c.put(key, &ResolvedEntry{
+	stored := c.put(key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,
 		TTLOverride: UAFTTLOverrideForEntry(&in),
 	})
 	// #592 acceptance signal — counted AFTER the write, so it measures cells that
-	// exist rather than Puts attempted. Put is unconditional, so every HasUAF cell
-	// reaching here is stored.
-	if in.HasUAF {
+	// exist rather than Puts attempted. The store's admission (#1233) can refuse
+	// the write, so it is gated on `stored`.
+	if stored && in.HasUAF {
 		BumpRAFullListUAFCached()
 	}
 	return encoded, pin
@@ -143,7 +143,8 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdic
 	if c == nil || !v.Store() {
 		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
+	// #443 (a) — an inert (dry-run) resolve persists nothing. putIfGen runs the
+	// store's admission as well (#1233).
 	if Inert(ctx) {
 		return false
 	}

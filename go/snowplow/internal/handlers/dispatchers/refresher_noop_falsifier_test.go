@@ -34,6 +34,8 @@ import (
 // FAILS on the unfixed dispatchers.go: the registered handler is a
 // no-op `return nil` — StoreTotal never increments past the seed Put.
 func TestFalsifierFNoop_RefreshFuncReallyReResolves(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetDepsForTest()

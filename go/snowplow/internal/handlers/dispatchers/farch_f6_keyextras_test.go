@@ -86,6 +86,8 @@ func declaredKeyExtrasCR(keys ...string) map[string]any {
 // same key → real Put-under-seed / Get-under-serve HIT, correct body, zero
 // resolver invocations. This is the cell that fixes #130 first-nav.
 func TestFARCH_F6_1_ChromeWidget_RouteParamsFoldNothing_HIT(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity() // cyberjoker / [devs]
 	const (
@@ -142,6 +144,8 @@ func TestFARCH_F6_1_ChromeWidget_RouteParamsFoldNothing_HIT(t *testing.T) {
 // ASSERTS the collision+wrong-body (the defect that mandates the declaration);
 // the paired F6-3 proves declaring it fixes both.
 func TestFARCH_F6_2_RED_UndeclaredRouteConsumer_CollidesAndServesWrongBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
@@ -215,6 +219,8 @@ func TestFARCH_F6_2_RED_UndeclaredRouteConsumer_CollidesAndServesWrongBody(t *te
 // genuine route-consumer safe. Isolated on the route-param dimension (object
 // coordinates held fixed), so the discriminant is ONLY the declared extra.
 func TestFARCH_F6_3_DeclaredWidget_PartitionsByRoute_DistinctContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
@@ -547,6 +553,8 @@ func TestFARCH_F6_6_DeclaredCounterpart_GuardInert(t *testing.T) {
 // second identical request HITs the extras_len>0 key. RED = remove the identity
 // exemption (re-introduce the divergence) → the guard declines → revisit MISS returns.
 func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity() // cyberjoker / [devs]
 	const (
