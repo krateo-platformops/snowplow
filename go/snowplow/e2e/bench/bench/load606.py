@@ -2570,21 +2570,7 @@ RUN8_KEYS = {
     "retry_backoff": "snowplow_stale_retry_backoff_ms",
     "retry_abandoned": "snowplow_stale_retry_abandoned_total",   # {"no_viewer", "evicted"}
     "retry_resumed": "snowplow_stale_retry_resumed_total",
-    # #1085: the refresher's work per tier, the parks of its viewed reserve, and how old a change
-    # is when a worker dequeues it, per tier (refresher_tiers_report). #1244 carries the
-    # completions and the ages without the reserve, so a build may hold some and not others.
-    "tier_normal_completed": "snowplow_refresher_normal_completed_total",
-    "tier_viewed_completed": "snowplow_refresher_viewed_completed_total",
-    "tier_viewed_reserve_parks": "snowplow_refresher_viewed_reserve_parks_total",
-    "tier_viewed_dirty_age_p95": "snowplow_refresher_viewed_dirty_age_ms_p95",
-    "tier_viewed_dirty_age_max": "snowplow_refresher_viewed_dirty_age_ms_max",
-    "tier_unviewed_dirty_age_p95": "snowplow_refresher_unviewed_dirty_age_ms_p95",
-    "tier_unviewed_dirty_age_max": "snowplow_refresher_unviewed_dirty_age_ms_max",
 }
-#: refresher_tiers_report's counters (per-phase deltas) and gauges (per-phase max and median)
-REFRESHER_TIER_COUNTERS = ("normal_completed", "viewed_completed", "viewed_reserve_parks")
-REFRESHER_TIER_GAUGES = ("viewed_dirty_age_p95", "viewed_dirty_age_max",
-                         "unviewed_dirty_age_p95", "unviewed_dirty_age_max")
 # Members of the snowplow_resolved_cache map the Q2 report reads.
 RUN8_RESOLVED_CACHE_STATS = ("hit_total", "stale_served_total", "stale_served_age_ms_max",
                              "known_stale_served_total")
@@ -2728,10 +2714,29 @@ RUN9_KEYS = {
 }
 
 
+# #1085 (run 22): the refresher's work per tier, the parks of its viewed reserve, and how old a
+# change is when a worker dequeues it, per tier (refresher_tiers_report). Names as #1085 publishes
+# them (its expvar.Publish calls, 8412e8cc); 1.12.50 serves none of them, so they are not RUN8_KEYS.
+# #1244 carries the completions and the ages without the reserve: a build may hold some, not all.
+TIER_KEYS = {
+    "normal_completed": "snowplow_refresher_normal_completed_total",
+    "viewed_completed": "snowplow_refresher_viewed_completed_total",
+    "viewed_reserve_parks": "snowplow_refresher_viewed_reserve_parks_total",
+    "viewed_dirty_age_p95": "snowplow_refresher_viewed_dirty_age_ms_p95",
+    "viewed_dirty_age_max": "snowplow_refresher_viewed_dirty_age_ms_max",
+    "unviewed_dirty_age_p95": "snowplow_refresher_unviewed_dirty_age_ms_p95",
+    "unviewed_dirty_age_max": "snowplow_refresher_unviewed_dirty_age_ms_max",
+}
+#: refresher_tiers_report's counters (per-phase deltas) and gauges (per-phase max and median)
+REFRESHER_TIER_COUNTERS = ("normal_completed", "viewed_completed", "viewed_reserve_parks")
+REFRESHER_TIER_GAUGES = ("viewed_dirty_age_p95", "viewed_dirty_age_max",
+                         "unviewed_dirty_age_p95", "unviewed_dirty_age_max")
+
+
 def prefixes_missing(prefixes) -> list[str]:
-    """The RUN8_KEYS / RUN9_KEYS values no prefix in `prefixes` captures."""
+    """The RUN8_KEYS / RUN9_KEYS / TIER_KEYS values no prefix in `prefixes` captures."""
     ps = tuple(p for p in prefixes if p)
-    need = set(RUN8_KEYS.values()) | set(RUN9_KEYS.values())
+    need = set(RUN8_KEYS.values()) | set(RUN9_KEYS.values()) | set(TIER_KEYS.values())
     return sorted(k for k in need if not ps or not k.startswith(ps))
 
 
@@ -3515,7 +3520,7 @@ def refresher_tiers_report(mem: list[dict], fresh: list[dict] | None) -> dict:
     mems = [m for m in mem if m.get("kind") == "mem"]
     out: dict = {"source": f"mem606's /debug/vars samples ({len(mems)})"}
     for name in REFRESHER_TIER_COUNTERS:
-        key = RUN8_KEYS[f"tier_{name}"]
+        key = TIER_KEYS[name]
 
         def one(m, key=key):
             v = _num((m.get("extra") or {}).get(key))
@@ -3529,7 +3534,7 @@ def refresher_tiers_report(mem: list[dict], fresh: list[dict] | None) -> dict:
     phases = run_phases(mem, fresh)
     order = [n for n, _, _ in phases] + ["steady"]
     for name in REFRESHER_TIER_GAUGES:
-        key = RUN8_KEYS[f"tier_{name}"]
+        key = TIER_KEYS[name]
         by: dict[str, list] = {}
         for m in sorted(mems, key=lambda m: m.get("t") or 0):
             v = _num((m.get("extra") or {}).get(key))
@@ -5944,7 +5949,8 @@ def main(argv: list[str] | None = None) -> int:
     dg.add_argument("--require-settled", action="store_true",
                     help="exit 4 (UNSETTLED) while any snowplow pod is still Terminating")
     dg.set_defaults(func=_cmd_digest_gate)
-    cp = sub.add_parser("check-prefixes", help="exit 2 unless the prefixes capture every RUN8_KEYS value")
+    cp = sub.add_parser("check-prefixes",
+                        help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS value")
     cp.add_argument("prefixes", nargs="*")
     cp.set_defaults(func=_cmd_check_prefixes)
     vp = sub.add_parser("prefixes", help="print RUN8_VARS_PREFIXES (run606's default)")

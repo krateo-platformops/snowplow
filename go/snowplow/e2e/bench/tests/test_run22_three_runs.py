@@ -217,7 +217,7 @@ def test_the_pair_log_carries_each_runs_refresher_tiers(pairbed, va):  # noqa: F
 
 # ─── #1085's refresher tiers, through the evaluate CLI ─────────────────────
 
-K = {n: load606.RUN8_KEYS[f"tier_{n}"] for n in load606.REFRESHER_TIER_COUNTERS + load606.REFRESHER_TIER_GAUGES}
+K = {n: load606.TIER_KEYS[n] for n in load606.REFRESHER_TIER_COUNTERS + load606.REFRESHER_TIER_GAUGES}
 # the schedule: two churn phases, steady around them (fresh606's churn records, t0 / t1 as it writes them)
 CHURNS = [{"kind": "churn", "label": "list_dep@1", "t0": 100, "t1": 200, "target_rate": 1},
           {"kind": "churn", "label": "list_dep@10", "t0": 300, "t1": 400, "target_rate": 10}]
@@ -320,6 +320,17 @@ def test_custlat_pair_writes_both_runs_tiers_by_role(tmp_path):
            "steady 300, churn 200, all 500" in lines
     assert any(ln.startswith("refresher tiers, A (baseline): UNMEASURED (the run's verdict.json has no ")
                for ln in lines)
+
+
+def test_the_tier_keys_are_1085s_names_and_not_1_12_50s():
+    """As #1085 publishes them (its expvar.Publish calls at 8412e8cc). 1.12.50 serves none of them, so
+    they sit apart from RUN8_KEYS, which its /debug/vars inventory pins."""
+    assert sorted(load606.TIER_KEYS.values()) == sorted([
+        "snowplow_refresher_normal_completed_total", "snowplow_refresher_viewed_completed_total",
+        "snowplow_refresher_viewed_reserve_parks_total", "snowplow_refresher_viewed_dirty_age_ms_p95",
+        "snowplow_refresher_viewed_dirty_age_ms_max", "snowplow_refresher_unviewed_dirty_age_ms_p95",
+        "snowplow_refresher_unviewed_dirty_age_ms_max"])
+    assert not set(load606.TIER_KEYS.values()) & set(load606.RUN8_KEYS.values())
 
 
 def test_the_capture_check_names_every_tier_value_a_prefix_list_would_miss():
