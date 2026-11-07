@@ -355,15 +355,22 @@ func TestIssue1221_ANamedEndpointWidgetKeepsItsCache(t *testing.T) {
 		serveTwice(t, e)
 		mustCache(t, e)
 	})
-	// The rule is on the dial, never on the snapshot: a body that does not depend on
-	// who asked may be shared.
+	// #1233 (Diego, 2026-11-07) supersedes the opt-in here: while the RBAC snapshot
+	// is incomplete no writer stores a shared entry, the opt-in included. So on the
+	// partial snapshot nothing is stored, each call dials, and bob reads the
+	// endpoint's answer through his own dial, not from alice's cell.
 	t.Run("partial_snapshot", func(t *testing.T) {
 		e := k1221Setup(t, a, k1221RA(k1221FeedStage()), k1221Widget(expr, true))
-		e.sharePartial()
+		key := e.sharePartial()
 		serveTwice(t, e)
-		mustCache(t, e)
-		if rec := e.serve(e.bobCtx); !strings.Contains(rec.Body.String(), k1221Value) || e.wire.named.Load() != 1 {
-			t.Fatalf("RED (#1221): bob must read the same third-party answer from the cell (dials=%d body=%s)",
+		if got := e.wire.named.Load(); got != 2 {
+			t.Fatalf("#1233 RED: on a partial snapshot the opt-in widget was served from a cell: %d dials over 2 calls, want 2", got)
+		}
+		if _, ok := e.store.GetNoTouch(key); ok {
+			t.Fatal("#1233 RED: the opt-in cell was stored on a partial RBAC snapshot")
+		}
+		if rec := e.serve(e.bobCtx); !strings.Contains(rec.Body.String(), k1221Value) || e.wire.named.Load() != 3 {
+			t.Fatalf("#1233 RED: bob must read the third-party answer through his own dial (dials=%d body=%s)",
 				e.wire.named.Load(), psTrunc(rec.Body.String(), 300))
 		}
 	})
