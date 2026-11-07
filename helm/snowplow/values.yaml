@@ -200,7 +200,9 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 6
 
-# Readiness probe: /readyz flips to 200 once Phase1Done is set. As of
+# Readiness probe: /readyz flips to 200 once Phase1Done is set AND the RBAC
+# snapshot is complete, i.e. all four RBAC informers have synced (#1231; no
+# timer decides this, and liveness above does not read it). As of
 # 1.5.29 (shape A prewarm-gated readiness) Phase1Done is set AFTER the
 # per-cohort prewarm seed completes (or its pipGlobalTimeout backstop, ~8min),
 # NOT merely at informer-sync — so the pod is withheld from Service endpoints
