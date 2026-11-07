@@ -190,7 +190,11 @@ Content-Type: application/json
     and asking again gives the same answer, so offer no retry: the endpoint has
     to change. Under its `errorKey` the stage records a Failure with code `502`,
     reason `DestinationRefused`, and a message naming the address and its range.
-    A write that depends on it is `Skipped` (#904).
+    A write that depends on it is `Skipped` (#904). Without `continueOnError`,
+    when the `filter` cannot produce a value, `/call` answers `502` with that
+    text. Read the reason from the header and the failure from the HTTP code: on
+    a `502` the body carries no `reason`, and its `status` is not reliable
+    (#1225).
   - **A redirect to another host is a failure (#1106).** A stage whose
     endpoint answers a redirect to another origin (scheme, host, port) is
     never followed, whatever the endpoint's credential or the stage's

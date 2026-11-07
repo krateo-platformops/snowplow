@@ -436,9 +436,13 @@ resolve is never dialled, and fails as a DNS error.
 
 A refused stage fails with reason `DestinationRefused` in
 `X-Snowplow-Stage-Outcomes` and a `502` under its `errorKey`, naming the address
-and its range. Nothing is sent and the dial is not retried. A write that depends
-on the stage is `Skipped`. There is no setting and no allowlist: to fix it, point
-the endpoint at an address the policy allows.
+and its range. Without `continueOnError`, the same `502` and text answer the
+`/call`. Nothing is sent and the dial is not retried. A write that depends on the
+stage is `Skipped`. A background refresh of a refused stage stops at its first
+attempt: the cached entry stays resident as known-stale, the failure counts as
+`destination_refused` in `snowplow_refresh_failed`, and the next change to its
+data tries again. There is no setting and no allowlist: to fix it, point the
+endpoint at an address the policy allows.
 
 With a proxy (the Secret's `proxy-url`, or the process's `HTTP_PROXY`), the address
 checked is the proxy's, because that is the address dialled.

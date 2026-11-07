@@ -40,6 +40,9 @@
 //     code and its status text;
 //   - any other path: the code and its status text only — never the URL,
 //     which can carry credentials (#523).
+// Two failures have no upstream to quote, and say so instead of "upstream
+// answered": a page budget that ended the exchange (#1115) and a destination
+// the policy refused (#1131), whose text is snowplow's own.
 // The upstream's full message is still recorded under the stage's errorKey
 // and logged at the dispatch site, exactly as before.
 //
@@ -79,6 +82,9 @@ type StageFailure struct {
 	// exchange: snowplow cut it, so the message says so, never "upstream
 	// answered".
 	budget *pagebudget.ExhaustedError
+	// refusal (#1131) is the destination policy's own text: nothing was sent,
+	// so nothing answered. It holds the address and its range, never the URL.
+	refusal string
 }
 
 // StatusError renders the failure as a typed apiserver status, so every
@@ -124,16 +130,17 @@ func itemErrorValue(err error) any {
 	return err.Error()
 }
 
-// budgetItemError (#1115) is a branch-E item error whose fetch the page budget
-// ended: the worker's text, unchanged, with the *pagebudget.ExhaustedError as
-// its cause, so newStageItemFailure can report the budget.
-type budgetItemError struct {
+// causedItemError is a branch-E item error whose fetch failed in a way the stage
+// must report as itself: the page budget ended it (#1115) or the destination
+// policy refused it (#1131). The worker's text, unchanged, with the fetch's
+// error as its cause, so newStageItemFailure can read it.
+type causedItemError struct {
 	text  string
-	cause *pagebudget.ExhaustedError
+	cause error
 }
 
-func (e *budgetItemError) Error() string { return e.text }
-func (e *budgetItemError) Unwrap() error { return e.cause }
+func (e *causedItemError) Error() string { return e.text }
+func (e *causedItemError) Unwrap() error { return e.cause }
 
 // newStageItemFailure derives the stage's code and reason from what
 // recordItemError recorded (accumVal) and the worker's item error.
@@ -160,6 +167,15 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 		if f.Code == 0 {
 			f.Code = http.StatusGatewayTimeout
 			f.Reason = credhttp.BudgetStatusReason
+		}
+	}
+	// #1131 — the destination policy refused the dial: the error chain, never a
+	// recorded value, says so.
+	if st, ok := credhttp.DestinationStatus(itemErr); ok {
+		f.refusal = st.Message
+		if f.Code == 0 {
+			f.Code = int(st.Code)
+			f.Reason = string(st.Reason)
 		}
 	}
 	if f.Code == 0 {
@@ -267,6 +283,9 @@ func firstStageFailure(itemErrs []error, calls []httpcall.RequestOptions) *Stage
 				// #1115 — the ExhaustedError's text is identity-free by
 				// construction (phase, cause, attempts; no host).
 				f.Message = stageMessage(f.Code, f.budget.Error(), call)
+			case f.refusal != "":
+				// #1131 — nothing was sent, so nothing answered.
+				f.Message = stageMessage(f.Code, f.refusal, call)
 			case f.redirect != 0:
 				f.Message = canonicalRedirectMessage(f.redirect, call)
 			default:

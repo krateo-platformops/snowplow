@@ -6,7 +6,9 @@ package api
 // dialer's control hook), and names are answered in-process (fakedns).
 //
 //   A  every credential kind, read and write: the stage fails with reason
-//      DestinationRefused, a 502 under its errorKey, the range named, no token.
+//      DestinationRefused, a 502 under its errorKey, the range named, no token,
+//      and the resolve's failure says the policy refused, never that an upstream
+//      answered, and classifies as the refresher's destination_refused.
 //   B  a write that depends on a refused stage is Skipped.
 //   C  a name resolving to a denied address, and a name that rebinds to one on
 //      a client kept across fetches (#1088), on both builder branches.
@@ -27,6 +29,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/fakedns"
 )
@@ -59,8 +62,37 @@ func TestIssue1131_A_ARefusedStageNamesItsReason(t *testing.T) {
 					t.Fatalf("RED: the stage does not say why: %s", o.dictJSON)
 				}
 				x1106NoSecretIn(t, name, o, x1106Token)
+
+				// What the HTTP caller and refresher.refresh_failed read.
+				se := o.failure.StatusError("ns", "ra")
+				msg := se.Error()
+				if strings.Contains(msg, "upstream answered") || strings.Contains(msg, "/latest/meta-data") {
+					t.Fatalf("RED: nothing answered, and the URL is not the caller's: %q", msg)
+				}
+				for _, want := range []string{`restaction ns/ra stage "r" failed`, "169.254.169.254:80", "link-local", "destination policy"} {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("RED: the failure does not say %q: %q", want, msg)
+					}
+				}
+				if class, _ := cache.ClassifyRefreshError(se); class != cache.RefreshErrDestinationRefused {
+					t.Fatalf("RED: the refresher reads this real failure as %q", class)
+				}
+				if !cache.IsNonRetryableRefreshError(se) {
+					t.Fatal("RED: the refresher would retry this real failure")
+				}
 			})
 		}
+	}
+}
+
+// A named endpoint's path can look like an apiserver path: the coordinates are
+// the stage's own, and it still says nothing answered.
+func TestIssue1131_A_AnAPIServerShapedPathKeepsItsCoordinates(t *testing.T) {
+	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret("http://169.254.169.254")})
+	o := x1106Resolve(t, x1106Extras, x1106Stage("r", http.MethodGet, "/api/v1/namespaces/team-a/pods"))
+	msg := o.failure.StatusError("ns", "ra").Error()
+	if strings.Contains(msg, "upstream answered") || !strings.Contains(msg, `pods in namespace "team-a"`) || !strings.Contains(msg, "destination policy") {
+		t.Fatalf("RED: %q", msg)
 	}
 }
 
@@ -154,6 +186,17 @@ func TestIssue1131_E_AnUpstreamCannotClaimTheReason(t *testing.T) {
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(srv.srv.URL)})
 	o := x1106Resolve(t, x1106Extras, x1106Stage("r", http.MethodPost, "/x"))
 	x1106WantReason(t, o.outcomes, "r", StageReasonError)
+	// And it stays an upstream's answer for the HTTP caller and the refresher.
+	se := o.failure.StatusError("ns", "ra")
+	if !strings.Contains(se.Error(), "upstream answered 502") {
+		t.Fatalf("RED: an upstream's 502 lost its message: %q", se.Error())
+	}
+	if class, _ := cache.ClassifyRefreshError(se); class == cache.RefreshErrDestinationRefused {
+		t.Fatal("RED: an upstream claimed the refresher's class")
+	}
+	if cache.IsNonRetryableRefreshError(se) {
+		t.Fatal("RED: an upstream made itself non-retryable")
+	}
 }
 
 func TestIssue1131_F_TheReasonRanksWithSnowplowsOwnRefusals(t *testing.T) {
