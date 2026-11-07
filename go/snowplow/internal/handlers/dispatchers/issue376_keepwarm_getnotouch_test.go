@@ -48,6 +48,8 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 // with a fresh BornAt re-seats the cell (pop-A 24h self-heal). The reaper never cold-
 // evicts a warm cell, so this Get-path evict is the ONLY thing bounding it at maxAge.
 func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
@@ -99,6 +101,8 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 // read were a touching Get (it would stamp lastRead → the cell lands in warm_lastread,
 // defeating the gauge's "collapse toward ~0 on an unbrowsed cluster" purpose).
 func TestIssue376_WarmGauge_KeepwarmSweepLeavesNeitherBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")

@@ -443,6 +443,8 @@ func TestLever1_PopulateDoesNotStorePopulatedDatagrid(t *testing.T) {
 // a poison shape and MUST be stored (the guard is confined to the apiRef+
 // template-driven shape).
 func TestLever1_PopulateStoresStaticOnlyEmptyWidget(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")

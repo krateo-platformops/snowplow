@@ -90,6 +90,8 @@ func TestFA98_1_HookWiring(t *testing.T) {
 // refresher handler enqueued WHILE a customer is in-flight does NOT
 // run until the counter drops.
 func TestFA98_2_YieldEngagesEndToEnd(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetDepsForTest()

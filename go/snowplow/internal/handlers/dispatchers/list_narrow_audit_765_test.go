@@ -14,6 +14,8 @@ import (
 )
 
 func TestListNarrow765_AuditIsWiredAtTheRefresherTerminal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	c := instrumentCacheOn(t)
 	cache.ResetRefresherForTest()
 	t.Cleanup(cache.ResetRefresherForTest)

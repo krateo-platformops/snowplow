@@ -290,6 +290,8 @@ func TestRBACSensitive_PopulateSkipsClassifiedWidget(t *testing.T) {
 // cell. The guard must not over-fire and strand the identity-free fast
 // path for widgets that are safe to share.
 func TestRBACSensitive_PopulateStillStoresUnclassified(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")

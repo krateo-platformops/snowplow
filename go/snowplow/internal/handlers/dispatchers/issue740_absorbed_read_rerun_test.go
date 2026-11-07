@@ -171,6 +171,8 @@ func TestIssue740_K1_AnAbsorbedReadEarnsTheShellOneRerunThatHeals(t *testing.T) 
 }
 
 func TestIssue740_K2_TheRerunNeverLoopsWithoutAnotherRead(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	h := newK547Harness(t, k547DenyBackground)
 	contentKey, _ := k740Shell(t, h)
 	park := k740ParkDoomed(h, true, 1)

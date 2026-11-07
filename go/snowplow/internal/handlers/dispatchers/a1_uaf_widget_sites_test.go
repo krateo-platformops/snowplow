@@ -32,6 +32,8 @@ import (
 //
 // RED on origin/main: the envelope is Put and every user reads it.
 func TestR1_WidgetContentPopulate_DeclinesOnRefilter_ControlPopulates(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")

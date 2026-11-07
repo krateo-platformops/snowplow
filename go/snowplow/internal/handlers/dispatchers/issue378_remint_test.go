@@ -180,6 +180,8 @@ func r378IdentityFreeCell(t *testing.T, ttlS, maxAgeS int, name string) (cache.R
 
 // TestIssue378_F2a_RefresherRePutBeforeTheWindowInheritsBornAt.
 func TestIssue378_F2a_RefresherRePutBeforeTheWindowInheritsBornAt(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	in, key := r378IdentityFreeCell(t, 60, 4, "f2a") // L = min(60, 2) = 2s → window [2s, 4s)
 	c := cache.ResolvedCache()
 	e0, _ := c.GetNoTouch(key)
@@ -198,6 +200,8 @@ func TestIssue378_F2a_RefresherRePutBeforeTheWindowInheritsBornAt(t *testing.T) 
 
 // TestIssue378_F2b_RefresherRePutInsideTheWindowResetsBornAt.
 func TestIssue378_F2b_RefresherRePutInsideTheWindowResetsBornAt(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	in, key := r378IdentityFreeCell(t, 60, 4, "f2b")
 	c := cache.ResolvedCache()
 	e0, _ := c.GetNoTouch(key)

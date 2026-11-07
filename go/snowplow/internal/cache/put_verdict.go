@@ -15,9 +15,11 @@
 // the log line and the metric. Mark sites read Permanent().
 //
 // It covers the sink-derived signals only. The checks that are not a property
-// of what the resolve recorded stay at their sites: the inert (dry-run) skip,
-// the sensitive-read decline, the #424 class-drift re-check and the UAF decline
-// (whose rule depends on the cell's key class, not on the sinks alone).
+// of what the resolve recorded stay at their sites: the sensitive-read decline,
+// the #424 class-drift re-check and the UAF decline (whose rule depends on the
+// cell's key class, not on the sinks alone). The inert (dry-run) skip and the
+// incomplete-RBAC-snapshot refusal (#1233) are the store's own admission
+// (put_admission.go): every write runs them, whoever writes.
 //
 // scripts/check_resolved_entry_put_sites.sh enforces that the resolve-output
 // packages write only through the verdict-gated methods.
