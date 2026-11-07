@@ -7,8 +7,10 @@
 // every cell enters the store through putCoreLocked. So, in the package that
 // declares ResolvedCacheStore:
 //
-//	RULE C1 — every function that calls putCoreLocked has, BEFORE that call, an
-//	`if` whose condition contains !admitWrite(...) and whose body ends in a return.
+//	RULE C1 — every function that calls putCoreLocked has, among its own top-level
+//	statements before the one holding that call, an `if` whose condition is
+//	!admitWrite(...) (alone or as an operand of ||) and whose body ends in a
+//	return. A guard inside a branch, a closure or behind && does not count.
 //
 //	RULE C2 — no function but putCoreLocked inserts into the store's index (an
 //	assignment to an element of a ResolvedCacheStore's `index` field) or pushes
@@ -66,35 +68,51 @@ func storeFieldOf(p *packages.Package, sel *ast.SelectorExpr) (string, bool) {
 	return sel.Sel.Name, true
 }
 
-// admitsBefore reports whether body has, before pos, an if statement whose
-// condition contains !admitWrite(...) and whose body ends in a return.
+// admitsBefore reports whether body has, as one of its OWN statements before
+// the one that holds pos, an if whose condition cannot be true without having
+// called admitWrite and found it false: !admitWrite(...) itself, or an || chain
+// with it as an operand. The if's body must end in a return. A guard nested in
+// another statement (a branch the write can skip, a closure whose return leaves
+// only the closure) or one behind && does not count (#1243 review).
 func admitsBefore(body *ast.BlockStmt, pos token.Pos) bool {
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		ifs, ok := n.(*ast.IfStmt)
-		if !ok || ifs.Pos() >= pos || len(ifs.Body.List) == 0 {
-			return true
+	for _, st := range body.List {
+		if st.End() > pos {
+			return false // reached the statement that holds the call
+		}
+		ifs, ok := st.(*ast.IfStmt)
+		if !ok || ifs.Init != nil || len(ifs.Body.List) == 0 {
+			continue
 		}
 		if _, ok := ifs.Body.List[len(ifs.Body.List)-1].(*ast.ReturnStmt); !ok {
+			continue
+		}
+		if refusesUnlessAdmitted(ifs.Cond) {
 			return true
 		}
-		ast.Inspect(ifs.Cond, func(m ast.Node) bool {
-			u, ok := m.(*ast.UnaryExpr)
-			if !ok || u.Op != token.NOT {
-				return true
-			}
-			call, ok := u.X.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == admitCheck {
-				found = true
-			}
-			return true
-		})
-		return true
-	})
-	return found
+	}
+	return false
+}
+
+// refusesUnlessAdmitted reports whether cond is !admitWrite(...) or an || chain
+// that has it as an operand, so the if is taken whenever admitWrite is false.
+func refusesUnlessAdmitted(cond ast.Expr) bool {
+	switch e := cond.(type) {
+	case *ast.ParenExpr:
+		return refusesUnlessAdmitted(e.X)
+	case *ast.BinaryExpr:
+		return e.Op == token.LOR && (refusesUnlessAdmitted(e.X) || refusesUnlessAdmitted(e.Y))
+	case *ast.UnaryExpr:
+		if e.Op != token.NOT {
+			return false
+		}
+		call, ok := e.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		return ok && id.Name == admitCheck
+	}
+	return false
 }
 
 // checkAdmissionFile applies rules C1 and C2 to one file of the package that

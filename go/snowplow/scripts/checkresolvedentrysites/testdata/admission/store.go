@@ -9,7 +9,10 @@ import (
 	"context"
 )
 
-type ResolvedEntry struct{ RawJSON []byte }
+type ResolvedEntry struct {
+	RawJSON []byte
+	Pinned  bool
+}
 
 type ResolvedCacheStore struct {
 	index map[string]*list.Element
@@ -51,4 +54,34 @@ func (c *ResolvedCacheStore) putAdmittedLate(ctx context.Context, key string, e 
 func (c *ResolvedCacheStore) insertByHand(key string, e *ResolvedEntry) {
 	el := c.order.PushFront(e)
 	c.index[key] = el
+}
+
+// FLAGGED: the #1243 review's mutant: the admission sits in a branch an unpinned
+// write skips.
+func (c *ResolvedCacheStore) putAdmittedInABranch(ctx context.Context, key string, e *ResolvedEntry) bool {
+	if e.Pinned {
+		if !admitWrite(ctx, e) {
+			return false
+		}
+	}
+	c.putCoreLocked(key, e, false)
+	return true
+}
+
+// FLAGGED: the return leaves only the closure.
+func (c *ResolvedCacheStore) putAdmittedInAClosure(ctx context.Context, key string, e *ResolvedEntry) {
+	func() {
+		if !admitWrite(ctx, e) {
+			return
+		}
+	}()
+	c.putCoreLocked(key, e, false)
+}
+
+// FLAGGED: behind &&, admitWrite runs only when the other operand is true.
+func (c *ResolvedCacheStore) putAdmittedBehindAnd(ctx context.Context, key string, e *ResolvedEntry) {
+	if e.Pinned && !admitWrite(ctx, e) {
+		return
+	}
+	c.putCoreLocked(key, e, false)
 }

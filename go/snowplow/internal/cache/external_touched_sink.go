@@ -64,9 +64,43 @@ type ExternalTouchedSink struct {
 	// sink only because this sink already travels with every resolve that may
 	// Put, child sinks included.
 	declaredWrite atomic.Bool
+	// startedIncomplete (#1233): the resolve under this sink began while the RBAC
+	// snapshot was incomplete. Set when the sink is installed (the resolve's
+	// start) and by a memo hit replaying a producer that began so. The store
+	// admits no write of such a resolve, whatever the snapshot is by its Put: what
+	// it read was filtered by the incomplete snapshot.
+	startedIncomplete atomic.Bool
 	// parent is the enclosing resolve's sink when this is a CHILD sink
 	// (WithChildPutGateSinks, #684); every bump is forwarded to it.
 	parent *ExternalTouchedSink
+}
+
+// newExternalTouchedSink is a sink for a resolve that starts now, under parent.
+func newExternalTouchedSink(parent *ExternalTouchedSink) *ExternalTouchedSink {
+	s := &ExternalTouchedSink{parent: parent}
+	if !rbacSnapshotComplete() {
+		s.startedIncomplete.Store(true)
+	}
+	return s
+}
+
+// markStartedIncomplete records that this resolve, and so every resolve that
+// encloses it, began on an incomplete snapshot (a memo hit replays it).
+func (s *ExternalTouchedSink) markStartedIncomplete() {
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.startedIncomplete.Store(true)
+	}
+}
+
+// StartedIncomplete reports whether this resolve, or a resolve enclosing it,
+// began while the RBAC snapshot was incomplete. nil-receiver-safe (false).
+func (s *ExternalTouchedSink) StartedIncomplete() bool {
+	for cur := s; cur != nil; cur = cur.parent {
+		if cur.startedIncomplete.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 // Bump records one external-fetch touch. nil-receiver-safe so the bump site
@@ -139,7 +173,7 @@ func (s *ExternalTouchedSink) Count() int64 {
 // apiref chokepoint inherits it via the widget→apiref ctx. A resolve with no
 // sink installed bumps a nil receiver (no-op) and Puts as before.
 func WithExternalTouchedSink(ctx context.Context) (context.Context, *ExternalTouchedSink) {
-	sink := &ExternalTouchedSink{}
+	sink := newExternalTouchedSink(nil)
 	if ctx == nil {
 		return ctx, sink
 	}

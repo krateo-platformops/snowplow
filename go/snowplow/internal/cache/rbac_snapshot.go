@@ -699,7 +699,8 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		return
 	}
 	rbacSnap.Store(snap)
-	notePublished() // #691
+	notePublished()          // #691
+	noteRBACSnapshotStored() // #1233: wake the prewarm waiting for a complete snapshot
 	// #947 — report the dangling roleRefs that changed with this publish:
 	// one line per binding that became dangling or stopped being dangling.
 	if snap.Synced {
@@ -1317,6 +1318,7 @@ func DisableRBACSnapshotForTest() func() {
 // `scheduleRBACRebuild` → `rebuildRBACSnapshot` only.
 func PublishRBACSnapshotForTest(s *RBACSnapshot) {
 	rbacSnap.Store(s)
+	noteRBACSnapshotStored()
 }
 
 // BumpRBACGenForTest increments rbacSnapshotPublishSeq so RBACGen() reports a

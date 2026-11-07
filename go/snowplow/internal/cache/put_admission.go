@@ -24,13 +24,19 @@
 // first, and on an index insertion anywhere but putCoreLocked. So a new Put site
 // cannot skip it.
 //
-// THE KEY, NOT ONLY THE PUT. A resolve whose key was minted on a partial snapshot
-// and whose Put lands after the snapshot completed is admitted here, because the
-// live snapshot is complete. Its key is then re-checked by the identity-class
-// guard each identity-bound Put site runs (#424 identityClassDrift; the raFullList
-// key's raKeyClassCurrent): the class is re-derived from the complete snapshot,
-// and a key whose binding set moved is declined. So a key derived from a partial
-// snapshot is stored only if the complete snapshot derives the same key.
+// THE RESOLVE'S START, NOT ONLY THE PUT. A resolve that began on an incomplete
+// snapshot is refused even when its Put lands after the snapshot completed. Its
+// body is what the incomplete snapshot let it read, and a missing Role or
+// ClusterRole moves no key dimension (binding set and sub-generation are equal
+// on both snapshots, #682), so the #424 identity-class guard cannot see it. The
+// ExternalTouchedSink every Put-capable resolve installs at its start records
+// whether the snapshot was complete then; a memo hit replays its producer's
+// (put_gate_effects.go). The key is minted before the resolve starts, so a key
+// minted on an incomplete snapshot belongs to a resolve the store refuses.
+//
+// THE PREWARM WAITS. The prewarm and the seeds start their writing work only
+// once the complete snapshot is published (WaitRBACSnapshotComplete), so no
+// boot unit is refused and left cold (#506).
 //
 // THE COST. Every write in the window is refused, so the window serves uncached.
 // Once #1231 lands (Ready waits for a complete snapshot) that window is boot
@@ -60,13 +66,20 @@ func rbacSnapshotComplete() bool {
 
 // admitWrite is the store's admission of one write. It returns false, and the
 // caller stores nothing, when:
-//   - the resolve is inert (#443 (a): a dry run persists nothing), or
-//   - the RBAC snapshot is not complete (#1233). That refusal is counted.
+//   - the resolve is inert (#443 (a): a dry run persists nothing; not counted as
+//     an RBAC decline, whatever the snapshot is), or
+//   - the RBAC snapshot is not complete now, or was not when the resolve began
+//     (#1233; the ExternalTouchedSink every Put-capable resolve installs at its
+//     start carries that, and a memo hit replays its producer's). A body read
+//     on an incomplete snapshot is filtered by it even when the Put lands after
+//     the snapshot completed: a Role the initial LIST had not delivered moves no
+//     key dimension, so no identity-class guard can see it. That refusal is
+//     counted.
 func admitWrite(ctx context.Context, entry *ResolvedEntry) bool {
 	if Inert(ctx) {
 		return false
 	}
-	if !rbacSnapshotComplete() {
+	if !rbacSnapshotComplete() || ExternalTouchedSinkFromContext(ctx).StartedIncomplete() {
 		notePutDeclinedRBACIncomplete(ctx, entry)
 		return false
 	}
