@@ -123,6 +123,19 @@ type psArm struct {
 	// noPrereg: do not pre-register the target informer (the #398 arms observe
 	// whether the REQUEST path registers it).
 	noPrereg bool
+	// raByRoleBinding: the shared ClusterRoleBinding grants the RESTAction to no
+	// one, so the arm grants it with a namespaced RoleBinding of its own: the
+	// binding a partial snapshot drops, so the read of the RESTAction falls
+	// through to the apiserver under the requester's credential.
+	raByRoleBinding bool
+}
+
+// psRASubjects is who the shared ClusterRoleBinding grants the RESTAction to.
+func psRASubjects(a psArm) []rbacv1.Subject {
+	if a.raByRoleBinding {
+		return nil
+	}
+	return psSubjects(a)
 }
 
 func psGroups(a psArm) []string {
@@ -198,7 +211,7 @@ func psBuildWatcher(t *testing.T, a psArm, extra ...runtime.Object) *dynamicfake
 		},
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "portal-ra-bind", UID: types.UID("uid-portal-shared")},
-			Subjects:   psSubjects(a),
+			Subjects:   psRASubjects(a),
 			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "ra-reader"},
 		},
 		&rbacv1.Role{

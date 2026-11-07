@@ -380,6 +380,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// widget→apiref→RA ctx inheritance (context.WithValue is preserved down
 	// the resolve chain). Additive to the stage-error sink.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// The dispatched CR was fetched before this sink existed: a fetch that left
+	// snowplow under the requester's credential marks it now (objects.Result).
+	if got.RequesterDialled {
+		extTouchedSink.Bump()
+	}
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
