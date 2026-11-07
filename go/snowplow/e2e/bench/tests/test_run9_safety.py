@@ -141,8 +141,9 @@ def test_deleted_is_only_claimed_after_gke_down_succeeds(harness):
     env = _measure_fails(env, FAKE_DOWN_FAIL="1", FAKE_SLOW_LOGS="40")
     err = _signal_at(env, [("collecting partial results", signal.SIGTERM, False)])
     assert "signal during teardown" in err and "TEARDOWN FAILED" in err
+    # (this test's own name is in the evidence directory's path)
     assert "deleted" not in err.split("collecting partial results", 1)[1].replace(
-        "nothing was deleted", "")
+        "nothing was deleted", "").replace(str(tmp), "")
 
 
 def test_a_failing_command_inside_teardown_cannot_stop_the_delete(harness):
@@ -225,7 +226,7 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     1,800 s margin = 40,518 s -> 12 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "= 38718 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 38718 s" in p.stderr
+    assert "= 39618 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 39618 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
     assert p.returncode == 0 and "fits TTL_HOURS=13 (46800 s; derived" in p.stderr
@@ -247,7 +248,7 @@ def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path)
     hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 42118 s" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 43018 s" in p.stderr
     assert "needs TTL_HOURS >= 13" in p.stderr
 
 

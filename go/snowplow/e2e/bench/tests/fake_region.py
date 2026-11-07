@@ -81,6 +81,8 @@ def quotas(env=None, name: str = "europe-west4") -> dict:
         v = env.get(f"FAKE_USAGE_{m}") or (env.get(OLDER_NAMES[m]) if m in OLDER_NAMES else None)
         if v is not None and m != "IN_USE_ADDRESSES":
             q["usage"] = float(v)
+        if env.get(f"FAKE_LIMIT_{m}") is not None:      # run 22: a region with room for three clusters
+            q["limit"] = float(env[f"FAKE_LIMIT_{m}"])
     return region_reported(region, env)
 
 

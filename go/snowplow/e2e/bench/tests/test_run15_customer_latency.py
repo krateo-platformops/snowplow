@@ -739,15 +739,16 @@ def test_pair_runs_both_after_both_dry_passes_and_writes_the_paired_verdict(pair
     real = calls[2:]
     assert any(f"go={env['BENCH_606_GO_A']} tag=1.12.54 digest={DIG_A}" in c for c in real)
     assert any(f"go={env['BENCH_606_GO_B']} tag=1.12.55 digest={DIG_B}" in c for c in real)
-    v = json.loads((tmp / "pair" / "paired-verdict.json").read_text())
+    v = json.loads((tmp / "pair" / "paired-verdict-A-B.json").read_text())
     assert v["verdict"] == "PASS" and v["method"]["replica"] == REPLICA["provenance"]
     assert next(c for c in v["validity"] if c["check"].endswith("runs_completed"))["value"] == {"a": True, "b": True}
     pj = json.loads((tmp / "pair" / "pair.json").read_text())
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
                          check=True).stdout.strip()
-    assert pj["bench_sha"] == sha and pj["a"]["digest"] == DIG_A and pj["b"]["tag"] == "1.12.55"
+    assert pj["bench_sha"] == sha and pj["runs"]["A"]["digest"] == DIG_A and pj["runs"]["B"]["tag"] == "1.12.55"
+    assert pj["pairs"] == [{"baseline": "A", "candidate": "B"}]
     log = (tmp / "pair" / "pair.log").read_text()
-    assert "paired verdict exit=0" in log
+    assert "paired verdict A vs B exit=0" in log
     # every cell, with its ratio and its bar
     assert len([ln for ln in log.splitlines() if " B/A = " in ln]) == len(v["cells"]) > 0
     assert "PASS storm p95_ms: B/A = 1.0 (<= " in log
@@ -881,7 +882,7 @@ def test_pair_refuses_an_uncommitted_bench(pairbed):
     p = _launch(repo, env)
     assert p.returncode == 2 and "uncommitted changes under the bench" in p.stderr
     p = _launch(repo, env, BENCH_606_DRY_RUN="1")                 # a dry pass may run on a working tree
-    assert p.returncode == 0 and "DRY: both runs would start now" in p.stderr
+    assert p.returncode == 0 and "DRY: all 2 runs would start now" in p.stderr
 
 
 def test_bash_versions_under_test():
@@ -923,7 +924,7 @@ def test_pair_dry_run_with_the_real_run606(tmp_path):
     for x in ("A", "B"):
         log = (tmp_path / "pair" / f"dry-{x}" / "run.log").read_text()
         assert "K6_SPAN=churn, DRIVE_S=16170 s" in log
-    assert "DRY: both runs would start now" in p.stderr
+    assert "DRY: all 2 runs would start now" in p.stderr
 
 
 # ─── run606.sh's evaluate step: a verdict is a result ─────────────────────

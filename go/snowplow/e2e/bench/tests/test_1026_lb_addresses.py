@@ -301,7 +301,7 @@ def test_the_pair_refuses_when_both_runs_load_balancers_do_not_fit(pairbed):  # 
     p = _launch(repo, env, BENCH_606_DRY_RUN="1", FAKE_STATIC_USAGE="5")        # 3 free, the pair needs 4
     assert p.returncode == 2 and "refusing: STATIC_ADDRESSES in europe-west4: 5 of 8 used, 3 free; the run " \
                                  "creates 4" in p.stderr, p.stderr[-1500:]
-    assert "DRY: both runs would start now" not in p.stderr
+    assert "DRY: all 2 runs would start now" not in p.stderr
     p = _launch(repo, env, BENCH_606_DRY_RUN="1", FAKE_STATIC_USAGE="4")
     assert p.returncode == 0 and "4 free; the run creates 4" in p.stderr, p.stderr[-1500:]
     # a dry pass that did not derive its number: unknown, refused

@@ -1717,6 +1717,25 @@ def _provenance(d: str) -> dict:
             "k6_stream_sha256": _sha256(k6s) if os.path.exists(k6s) else None}
 
 
+def refresher_tiers_pair(va: dict | None, vb: dict | None) -> dict:
+    """#1085, report only: each run's refresher_tiers_report_only (bench/load606.py), side by side,
+    and its lines prefixed with the run's role. A verdict without the section (an evaluate before
+    it) says so, never reads as zero."""
+    out: dict = {"lines": []}
+    for x, v in (("a", va), ("b", vb)):
+        role = "A (baseline)" if x == "a" else "B (candidate)"
+        r = ((v or {}).get("report") or {}).get("refresher_tiers_report_only")
+        out[x] = r if r is not None else _unmeasured_section()
+        out["lines"] += ([f"refresher tiers, {role}: {ln}" for ln in r.get("lines") or []] if r is not None else
+                         [f"refresher tiers, {role}: UNMEASURED ({out[x]['why']})"])
+    return out
+
+
+def _unmeasured_section() -> dict:
+    return {"status": "UNMEASURED",
+            "why": "the run's verdict.json has no refresher_tiers_report_only (an evaluate before #1085's report)"}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="custlat")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1773,6 +1792,11 @@ def main(argv: list[str] | None = None) -> int:
         out["acceptance_ratios_report_only"] = figures.ratios(va, vb)
     except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
         out["acceptance_ratios_report_only"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        out["refresher_tiers_report_only"] = refresher_tiers_pair(va, vb)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        out["refresher_tiers_report_only"] = {"error": f"{type(e).__name__}: {e}",
+                                              "lines": [f"refresher tiers: report failed: {type(e).__name__}: {e}"]}
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

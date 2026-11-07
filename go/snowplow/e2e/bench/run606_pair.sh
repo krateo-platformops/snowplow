@@ -1,47 +1,71 @@
 #!/usr/bin/env bash
-# #606 / #865 — PAIRED runs (Diego 2026-10-23): A (the baseline image) and B
-# (the candidate) run in parallel, each on its own TEMPORARY cluster (two
-# run606.sh, each with its own teardown layers), from ONE bench checkout at
-# one commit, on one schedule with k6's customers on through every churn step
-# (K6_SPAN=churn). Then the paired customer-latency verdict (bench/custlat.py
-# pair: B against A per phase, the spread from A's own data).
+# #606 / #865 — PAIRED runs (Diego 2026-10-23), generalised to N runs in ONE
+# window (run 22, Diego 2026-11-07): every run in parallel, each on its own
+# TEMPORARY cluster (one run606.sh each, with its own teardown layers), from
+# ONE bench checkout at one commit, on one schedule with k6's customers on
+# through every churn step (K6_SPAN=churn). Then one paired customer-latency
+# verdict per PAIR (bench/custlat.py pair: the candidate against the baseline
+# per phase, the spread from the baseline's own data).
 #
-# Per run (required):  RUN_NAME_A / _B, SNOWPLOW_TAG_A / _B,
-#                      EXPECTED_IMAGE_DIGEST_A / _B, BENCH_606_GO_A / _B
-#                      (Diego's go PER RUN, as run606.sh: <YYYYMMDD>-<RUN_NAME>)
-# #1004's full-widen stage (after each run's evaluate step): BENCH_1004_GO_A
-# and _B, Diego's go for it PER RUN in the same form; both or neither (half a
-# stage cannot be compared), and its one switch.
-# Everything else in the environment is shared by both runs, so the two
-# schedules are the same by construction (and custlat pair checks it from the
-# data). The per-run names themselves (RUN_NAME, SNOWPLOW_TAG, ...) and K6_SPAN
-# other than churn are refused: they would apply to both runs or break the pair.
+# RUNS  (default "A B"): the runs' labels, each [A-Z][A-Z0-9]*, two or more.
+# PAIRS (default "A:B"): the comparisons, each BASELINE:CANDIDATE, both labels
+#       in RUNS. A run may sit in several pairs (run 22: RUNS="R N C",
+#       PAIRS="R:C N:C", C shared): every pair reads its runs' collected files.
+#       Every run must be in at least one pair: a cluster that no comparison
+#       reads is refused. Two runs and one pair is the case PAIRS="A:B" always was.
 #
-# Nothing is created before BOTH runs passed run606.sh's own refusals: a dry
-# pass of each (BENCH_606_DRY_RUN=1) runs first. BENCH_606_DRY_RUN=1 here
-# stops after it.
+# Per run L (required):  RUN_NAME_L, SNOWPLOW_TAG_L, EXPECTED_IMAGE_DIGEST_L,
+#                        BENCH_606_GO_L (Diego's go PER RUN, as run606.sh:
+#                        <YYYYMMDD>-<RUN_NAME>); OUT_L optional.
+# #1004's full-widen stage (after each run's evaluate step): BENCH_1004_GO_L,
+# Diego's go for it PER RUN in the same form; on every run or on none (part of
+# a stage cannot be compared), and its one switch.
+# Everything else in the environment is shared by every run, so the schedules
+# are the same by construction (and custlat pair checks it from the data). The
+# per-run names themselves (RUN_NAME, SNOWPLOW_TAG, ...) and K6_SPAN other than
+# churn are refused: they would apply to every run or break the pairs. Run
+# names are unique; the two runs of a pair run two different images.
+#
+# Nothing is created before EVERY run passed run606.sh's own refusals: a dry
+# pass of each (BENCH_606_DRY_RUN=1) runs first, then ONE quota read for every
+# cluster together. BENCH_606_DRY_RUN=1 here stops after it.
 #
 # Stopping. run606.sh exits 0 once its evaluate step ran, whatever the verdict
 # (a verdict is a result); it logs "run complete: <OUT>" then. A run that
-# exits non-zero WITHOUT that line failed as tooling or infrastructure: the
-# other run is stopped (TERM), since half a pair cannot be compared. A run
-# that completed and then exited non-zero (e.g. its gke-down failed) is a
-# measurement; its partner keeps running. Each run is ONE background simple
-# command ending in exec (env -> bash run606.sh), so its PID is run606's own
-# shell under bash 3.2 as under 5: a TERM reaches run606's trap, which tears
-# its cluster down. Background jobs of a non-interactive shell ignore SIGINT,
-# so a Ctrl-C (INT) or a TERM to this script is forwarded as TERM to both.
+# exits non-zero WITHOUT that line failed as tooling or infrastructure: every
+# pair it is in can no longer be compared. A run still going is stopped when
+# EVERY pair it is in has lost a run, since its cluster then feeds no
+# comparison; while one of its pairs can still be compared, it runs on (run
+# 22: N failing leaves R:C, so R and C go on; C failing ends both pairs). A
+# run that completed and then exited non-zero (e.g. its gke-down failed) is a
+# measurement; nothing is stopped. Each run is ONE background simple command
+# ending in exec (env -> bash run606.sh), so its PID is run606's own shell
+# under bash 3.2 as under 5: a signal reaches run606's trap, which tears its
+# cluster down. Background jobs of a non-interactive shell ignore SIGINT, so a
+# Ctrl-C (INT) or a TERM to this script is forwarded as TERM to every run.
 #
-# OUT_A / OUT_B: each run's OUT (default: run606.sh's, per RUN_NAME); an OUT
-# that already holds a run (verdict.json or run.log) is refused.
-# Out: $PAIR_OUT/pair.json (bench commit, both runs' names / tags / digests /
-# OUTs), pair.log, <A|B>.console, paired-verdict.json. Exit: the paired
-# verdict's (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE); 2 = refused before
-# anything was created (#1171: both runs' footprints, together, against every
-# regional quota they consume: bench/gke.py RUN_QUOTAS). A restart of B
-# FAILs the pair; a restart of A is recorded and
-# its not-Ready time is removed from both runs (bench/custlat.py's module doc):
-# the pair reads each run's k6 stream from its OUT for that.
+# OUT_L: each run's OUT (default: run606.sh's, per RUN_NAME); an OUT that
+# already holds a run (verdict.json or run.log) is refused, and so is a
+# PAIR_OUT that holds a pair (pair.json or any paired-verdict-*.json).
+# Out: $PAIR_OUT/pair.json (bench commit, every run's name / tag / digest /
+# OUT, the pairs), pair.log, <L>.console, and per pair
+# paired-verdict-<BASELINE>-<CANDIDATE>.json. Exit: the pairs' verdicts
+# together: 1 when any pair FAILs (a pair's FAIL is that comparison's result,
+# whatever another pair says), else 3 when any is INVALID, else 4 when any is
+# INCONCLUSIVE, else 0 (every pair PASS); one pair's exit is its own verdict's.
+# 2 = refused before anything was created (#1171: every run's footprint,
+# together, against every regional quota they consume: bench/gke.py
+# RUN_QUOTAS); 5 = the evidence is not safe (#1194): whatever the verdicts
+# say, the launch is NOT finished. Each run publishes its own before its
+# cluster goes (run606.sh). The launcher publishes pair.json before any run
+# starts, and all of PAIR_OUT once the verdicts exist, which is after every
+# cluster went: they are computed from files the runs already published, so
+# they can be computed again. It then verifies every run's published copy; a
+# run that never reached a cluster owes none.
+# A restart of a pair's candidate FAILs that pair; a restart of its baseline
+# is recorded and its not-Ready time is removed from both runs of the pair
+# (bench/custlat.py's module doc): the pair reads each run's k6 stream from
+# its OUT for that.
 set -Eeuo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -50,61 +74,133 @@ RUN606="$HERE/run606.sh"
 REPLICA="$HERE/customer_latency_replica_runs12_13.json"
 
 refuse() { echo "refusing: $*" >&2; exit 2; }
-for v in RUN_NAME_A RUN_NAME_B SNOWPLOW_TAG_A SNOWPLOW_TAG_B EXPECTED_IMAGE_DIGEST_A EXPECTED_IMAGE_DIGEST_B; do
-  [[ -n "${!v:-}" ]] || refuse "$v is required (one per run of the pair)"
+read -r -a LABELS <<< "${RUNS:-A B}"
+read -r -a PAIR_LIST <<< "${PAIRS:-A:B}"
+(( ${#LABELS[@]} >= 2 )) || refuse "RUNS names ${#LABELS[@]} run(s): a comparison needs two or more"
+(( ${#PAIR_LIST[@]} >= 1 )) || refuse "PAIRS names no comparison"
+is_label() { local x; for x in "${LABELS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+seen=" "
+for x in "${LABELS[@]}"; do
+  [[ "$x" =~ ^[A-Z][A-Z0-9]*$ ]] || refuse "RUNS: '$x' is not a label ([A-Z][A-Z0-9]*: it names the run's variables, ${x}_...)"
+  [[ "$seen" != *" $x "* ]] || refuse "RUNS names $x twice"
+  seen="$seen$x "
+done
+seen=" "
+for p in "${PAIR_LIST[@]}"; do
+  [[ "$p" =~ ^([A-Z][A-Z0-9]*):([A-Z][A-Z0-9]*)$ ]] || refuse "PAIRS: '$p' is not BASELINE:CANDIDATE"
+  is_label "${BASH_REMATCH[1]}" && is_label "${BASH_REMATCH[2]}" \
+    || refuse "PAIRS: $p names a run that is not in RUNS (${LABELS[*]})"
+  [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]] || refuse "PAIRS: $p compares a run with itself"
+  [[ "$seen" != *" $p "* ]] || refuse "PAIRS names $p twice"
+  seen="$seen$p "
+done
+# in_pair <label> <pair>: the run is one of the pair's two
+in_pair() { [[ "${2%%:*}" == "$1" || "${2##*:}" == "$1" ]]; }
+for x in "${LABELS[@]}"; do
+  n=0; for p in "${PAIR_LIST[@]}"; do in_pair "$x" "$p" && n=$(( n + 1 )); done
+  (( n > 0 )) || refuse "run $x is in no pair (PAIRS: ${PAIR_LIST[*]}): its cluster would feed no comparison"
+done
+for x in "${LABELS[@]}"; do
+  for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST; do
+    w="${v}_$x"; [[ -n "${!w:-}" ]] || refuse "$w is required (one per run)"
+  done
 done
 for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT; do
-  [[ -z "${!v:-}" ]] || refuse "$v is per run (set ${v}_A / ${v}_B): unset it"
+  [[ -z "${!v:-}" ]] || refuse "$v is per run (set ${v}_<run>, one per run of ${LABELS[*]}): unset it"
 done
 [[ -z "${DRIVE_S:-}" ]] || refuse "DRIVE_S is derived by K6_SPAN=churn: unset it"
 [[ "${K6_SPAN:-churn}" == "churn" ]] || refuse "a pair runs K6_SPAN=churn (customers on through every churn step)"
 [[ "${LOAD_DRIVER:-k6}" == "k6" ]] || refuse "a pair compares k6's customers: LOAD_DRIVER=k6"
-[[ "$RUN_NAME_A" != "$RUN_NAME_B" ]] || refuse "RUN_NAME_A and RUN_NAME_B are the same: two clusters need two names"
-[[ "$EXPECTED_IMAGE_DIGEST_A" != "$EXPECTED_IMAGE_DIGEST_B" ]] || refuse "the two digests are the same image: nothing to compare"
-# #1004: the full-widen stage runs on both arms or on neither
-if [[ -n "${BENCH_1004_GO_A:-}" && -z "${BENCH_1004_GO_B:-}" ]] || [[ -z "${BENCH_1004_GO_A:-}" && -n "${BENCH_1004_GO_B:-}" ]]; then
-  refuse "BENCH_1004_GO_A and BENCH_1004_GO_B: set both (the full-widen stage on both arms) or neither"
-fi
+for x in "${LABELS[@]}"; do
+  for y in "${LABELS[@]}"; do
+    [[ "$x" < "$y" ]] || continue
+    nx="RUN_NAME_$x" ny="RUN_NAME_$y"
+    [[ "${!nx}" != "${!ny}" ]] || refuse "RUN_NAME_$x and RUN_NAME_$y are the same: every cluster needs its own name"
+  done
+done
+for p in "${PAIR_LIST[@]}"; do
+  da="EXPECTED_IMAGE_DIGEST_${p%%:*}" db="EXPECTED_IMAGE_DIGEST_${p##*:}"
+  [[ "${!da}" != "${!db}" ]] || refuse "pair $p: the two digests are the same image: nothing to compare"
+done
+# #1004: the full-widen stage runs on every run or on none
+fw=0; for x in "${LABELS[@]}"; do v="BENCH_1004_GO_$x"; [[ -n "${!v:-}" ]] && fw=$(( fw + 1 )); done
+(( fw == 0 || fw == ${#LABELS[@]} )) \
+  || refuse "BENCH_1004_GO_<run>: set it on every run of ${LABELS[*]} (the full-widen stage on every arm) or on none (${fw} set)"
 if [[ "$DRY" != "1" ]]; then
   today="$(date -u +%Y%m%d)"
-  [[ "${BENCH_606_GO_A:-}" == "${today}-${RUN_NAME_A}" ]] || refuse "BENCH_606_GO_A must be '${today}-${RUN_NAME_A}' (Diego's go for run A)"
-  [[ "${BENCH_606_GO_B:-}" == "${today}-${RUN_NAME_B}" ]] || refuse "BENCH_606_GO_B must be '${today}-${RUN_NAME_B}' (Diego's go for run B)"
-  if [[ -n "${BENCH_1004_GO_A:-}" ]]; then
-    [[ "$BENCH_1004_GO_A" == "${today}-${RUN_NAME_A}" ]] || refuse "BENCH_1004_GO_A must be '${today}-${RUN_NAME_A}' (Diego's go for the full-widen stage on run A)"
-    [[ "$BENCH_1004_GO_B" == "${today}-${RUN_NAME_B}" ]] || refuse "BENCH_1004_GO_B must be '${today}-${RUN_NAME_B}' (Diego's go for the full-widen stage on run B)"
-  fi
+  for x in "${LABELS[@]}"; do
+    go="BENCH_606_GO_$x" fwg="BENCH_1004_GO_$x" nm="RUN_NAME_$x"
+    [[ "${!go:-}" == "${today}-${!nm}" ]] || refuse "$go must be '${today}-${!nm}' (Diego's go for run $x)"
+    if (( fw > 0 )); then
+      [[ "${!fwg}" == "${today}-${!nm}" ]] || refuse "$fwg must be '${today}-${!nm}' (Diego's go for the full-widen stage on run $x)"
+    fi
+  done
 fi
-# one commit, nothing uncommitted under the bench: both runs execute it
+# one commit, nothing uncommitted under the bench: every run executes it
 BENCH_SHA="$(git -C "$HERE" rev-parse HEAD)" || refuse "the bench is not a git checkout"
 dirty="$(git -C "$HERE" status --porcelain -- . | head -5)"
 if [[ -n "$dirty" ]]; then
-  [[ "$DRY" == "1" ]] || refuse "uncommitted changes under the bench: the two runs must be one commit (${dirty//$'\n'/, })"
+  [[ "$DRY" == "1" ]] || refuse "uncommitted changes under the bench: every run must be one commit (${dirty//$'\n'/, })"
 fi
-PAIR_OUT="${PAIR_OUT:-/tmp/snowplow-runs/606/pair-${RUN_NAME_A}-${RUN_NAME_B}}"
-OUT_A="${OUT_A:-/tmp/snowplow-runs/606/${RUN_NAME_A}}"    # run606.sh's own default OUT
-OUT_B="${OUT_B:-/tmp/snowplow-runs/606/${RUN_NAME_B}}"
-[[ "$OUT_A" != "$OUT_B" ]] || refuse "OUT_A and OUT_B are the same directory"
+PAIR_NAME="pair"
+for x in "${LABELS[@]}"; do nm="RUN_NAME_$x"; PAIR_NAME="${PAIR_NAME}-${!nm}"; done
+PAIR_OUT="${PAIR_OUT:-$(python3 -m bench.evidence run-dir "$PAIR_NAME")}"
+for x in "${LABELS[@]}"; do
+  out="OUT_$x" nm="RUN_NAME_$x"
+  [[ -n "${!out:-}" ]] || printf -v "$out" '%s' "$(python3 -m bench.evidence run-dir "${!nm}")"   # run606.sh's own default OUT
+done
+for x in "${LABELS[@]}"; do
+  for y in "${LABELS[@]}"; do
+    [[ "$x" < "$y" ]] || continue
+    ox="OUT_$x" oy="OUT_$y"
+    [[ "${!ox}" != "${!oy}" ]] || refuse "OUT_$x and OUT_$y are the same directory"
+  done
+done
+PAIR_EVIDENCE="$(python3 -m bench.evidence dest "$PAIR_NAME")"
+PAIR_RUN_ID="${PAIR_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ "$DRY" != "1" ]]; then
-  for x in A B; do
+  for x in "${LABELS[@]}"; do
     out="OUT_$x"
     for f in verdict.json run.log; do
-      [[ ! -e "${!out}/$f" ]] || refuse "OUT_$x (${!out}) already holds a run ($f): the pair would grade it; use a new RUN_NAME_$x or OUT_$x"
+      [[ ! -e "${!out}/$f" ]] || refuse "OUT_$x (${!out}) already holds a run ($f): a pair would grade it; use a new RUN_NAME_$x or OUT_$x"
     done
   done
+  for f in "$PAIR_OUT/pair.json" "$PAIR_OUT"/paired-verdict*.json; do
+    [[ ! -e "$f" ]] || refuse "PAIR_OUT ($PAIR_OUT) already holds a pair (${f##*/}): it is never written over; use new run names or a new PAIR_OUT"
+  done
 fi
+python3 -m bench.evidence preflight --dest "$PAIR_EVIDENCE" || exit 2
 mkdir -p "$PAIR_OUT"
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$PAIR_OUT/pair.log" >&2; }
 
-# runenv <A|B>: RUNENV = that run's per-run variables, for `env`
+# publish_pair <stage> [--require F]...: all of PAIR_OUT, copied and verified (bench/evidence.py)
+publish_pair() {
+  local stage="$1"; shift
+  python3 -m bench.evidence publish --src "$PAIR_OUT" --dest "$PAIR_EVIDENCE" --run-id "$PAIR_RUN_ID" \
+      --stage "$stage" --require pair.json "$@"
+}
+
+# runenv <L>: RUNENV = that run's per-run variables, for `env`
 runenv() {
   local name="RUN_NAME_$1" tag="SNOWPLOW_TAG_$1" dig="EXPECTED_IMAGE_DIGEST_$1" go="BENCH_606_GO_$1"
   local out="OUT_$1" fw="BENCH_1004_GO_$1"
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
           BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}")
 }
+# verdict_file <pair>: that pair's paired verdict
+verdict_file() { echo "$PAIR_OUT/paired-verdict-${1%%:*}-${1##*:}.json"; }
+# pair_cmd <pair>: PAIR_CMD = its custlat pair, the baseline as A, the candidate as B
+pair_cmd() {
+  local a="${1%%:*}" b="${1##*:}"
+  local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a" db="EXPECTED_IMAGE_DIGEST_$b"
+  PAIR_CMD=(python3 -m bench.custlat pair --a "${!oa}/verdict.json" --b "${!ob}/verdict.json"
+            --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}")
+}
 
-log "pair: A=${RUN_NAME_A} (${SNOWPLOW_TAG_A}) B=${RUN_NAME_B} (${SNOWPLOW_TAG_B}), bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
-for x in A B; do
+runs_line=""
+for x in "${LABELS[@]}"; do nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x"; runs_line="${runs_line} ${x}=${!nm} (${!tg})"; done
+log "runs:${runs_line}; pairs (baseline:candidate) ${PAIR_LIST[*]}; bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
+for x in "${LABELS[@]}"; do
   runenv "$x"
   rm -f "$PAIR_OUT/dry-$x/footprint.json"   # #1171: only THIS dry pass's derivation counts
   if ! env "${RUNENV[@]}" BENCH_606_DRY_RUN=1 OUT="$PAIR_OUT/dry-$x" "$BASH" "$RUN606" \
@@ -114,21 +210,22 @@ for x in A B; do
   fi
   log "run $x: dry pass OK"
 done
-# What both clusters need, together (each gke-up alone would see room for
-# itself): reads only, nothing is created, so the DRY pass runs them too and
-# refuses a pair that cannot start. #1171: each run's dry pass derived its
-# footprint from the spec its gke-up creates and the LoadBalancer Services its
-# install creates ($OUT/footprint.json); both together must fit every regional
-# quota they consume (bench/gke.py RUN_QUOTAS): the PVC disks (#895), GKE's
-# per-location cluster limit (#985, read), the static addresses (#1026), the
-# in-use addresses every node and LoadBalancer holds (run 21 attempt 2 failed
-# 30 min in on IN_USE_ADDRESSES), vCPUs, instances, disks, forwarding rules.
+# What every cluster needs, together (each gke-up alone would see room for
+# itself): ONE read for all of them, reads only, nothing is created, so the DRY
+# pass runs it too and refuses a launch that cannot start. #1171: each run's
+# dry pass derived its footprint from the spec its gke-up creates and the
+# LoadBalancer Services its install creates ($OUT/footprint.json); all of them
+# together must fit every regional quota they consume (bench/gke.py
+# RUN_QUOTAS): the PVC disks (#895), GKE's per-location cluster limit (#985,
+# read), the static addresses (#1026), the in-use addresses every node and
+# LoadBalancer holds (run 21 attempt 2 failed 30 min in on IN_USE_ADDRESSES),
+# vCPUs, instances, disks, forwarding rules.
 quota_args=()
 [[ -n "${PROJECT:-}" ]] && quota_args+=(--project "$PROJECT")
 [[ -n "${ZONE:-}" ]] && quota_args+=(--zone "$ZONE")
-for x in A B; do
+for x in "${LABELS[@]}"; do
   [[ -s "$PAIR_OUT/dry-$x/footprint.json" ]] \
-    || refuse "run $x's dry pass did not derive its LoadBalancer Services and cluster footprint ($PAIR_OUT/dry-$x/footprint.json): whether the pair fits the region's quotas is unknown; nothing was created"
+    || refuse "run $x's dry pass did not derive its LoadBalancer Services and cluster footprint ($PAIR_OUT/dry-$x/footprint.json): whether the runs fit the region's quotas is unknown; nothing was created"
   quota_args+=(--footprint "$PAIR_OUT/dry-$x/footprint.json")
 done
 if ! quota_msg="$(python3 -m bench.gke gke-quotas "${quota_args[@]}" 2>&1)"; then
@@ -137,37 +234,63 @@ fi
 while IFS= read -r ln; do
   if [[ -n "$ln" ]]; then log "$ln"; fi
 done <<< "$quota_msg"
-eval_cmd=(python3 -m bench.custlat pair --a "$OUT_A/verdict.json" --b "$OUT_B/verdict.json"
-          --a-dir "$OUT_A" --b-dir "$OUT_B"
-          --replica "$REPLICA" --expect-a "$EXPECTED_IMAGE_DIGEST_A" --expect-b "$EXPECTED_IMAGE_DIGEST_B")
 if [[ "$DRY" == "1" ]]; then
-  log "DRY: both runs would start now; then ${eval_cmd[*]} > $PAIR_OUT/paired-verdict.json"
+  log "DRY: all ${#LABELS[@]} runs would start now; then, per pair:"
+  for p in "${PAIR_LIST[@]}"; do pair_cmd "$p"; log "DRY:   ${PAIR_CMD[*]} > $(verdict_file "$p")"; done
   exit 0
 fi
 
+pj_args=("$PAIR_OUT/pair.json" "$BENCH_SHA")
+for x in "${LABELS[@]}"; do
+  nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" dg="EXPECTED_IMAGE_DIGEST_$x" out="OUT_$x"
+  pj_args+=("$x" "${!nm}" "${!tg}" "${!dg}" "${!out}")
+done
+pj_args+=(-- "${PAIR_LIST[@]}")
 python3 -c 'import json, sys, time
+out, sha, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+cut = rest.index("--")
+fields, pairs = rest[:cut], rest[cut + 1:]
 keys = ("run_name", "tag", "digest", "out")
-json.dump({"kind": "pair", "bench_sha": sys.argv[2], "started": time.time(),
-           "a": dict(zip(keys, sys.argv[3:7])), "b": dict(zip(keys, sys.argv[7:11]))},
-          open(sys.argv[1], "w"), indent=1)' \
-  "$PAIR_OUT/pair.json" "$BENCH_SHA" "$RUN_NAME_A" "$SNOWPLOW_TAG_A" "$EXPECTED_IMAGE_DIGEST_A" "$OUT_A" \
-  "$RUN_NAME_B" "$SNOWPLOW_TAG_B" "$EXPECTED_IMAGE_DIGEST_B" "$OUT_B"
-PID_A="" PID_B=""
-stop_both() { kill -TERM ${PID_A:+"$PID_A"} ${PID_B:+"$PID_B"} 2>/dev/null || true; }
-trap 'log "signal: stopping both runs (each tears its own cluster down)"; stop_both; wait; exit 130' INT TERM HUP
+runs = {fields[i]: dict(zip(keys, fields[i + 1:i + 5])) for i in range(0, len(fields), 5)}
+json.dump({"kind": "pair", "bench_sha": sha, "started": time.time(), "runs": runs,
+           "pairs": [dict(zip(("baseline", "candidate"), p.split(":"))) for p in pairs]},
+          open(out, "w"), indent=1)' "${pj_args[@]}"
+# #1194: a launch that cannot publish its own record spends nothing
+if ! msg="$(publish_pair started 2>&1)"; then
+  refuse "the pair's evidence could not be published: ${msg}: nothing was created"
+fi
+log "$msg"
+for x in "${LABELS[@]}"; do printf -v "PID_$x" '%s' ""; printf -v "RC_$x" '%s' ""; printf -v "DONE_$x" '%s' 0
+                           printf -v "FAILED_$x" '%s' 0; printf -v "STOPPED_$x" '%s' 0; done
+stop_all() {
+  local x pid
+  for x in "${LABELS[@]}"; do pid="PID_$x"; [[ -z "${!pid}" ]] || kill -TERM "${!pid}" 2>/dev/null || true; done
+}
+# a signal stops the runs, not the record: each run publishes its own in its teardown
+trap 'log "signal: stopping every run (each tears its own cluster down)"; stop_all; wait
+      msg="$(publish_pair interrupted 2>&1)" || log "EVIDENCE NOT SAFE (pair): ${msg}"; exit 130' INT TERM HUP
 # ONE simple command each, backgrounded: env execs bash, so $! is run606's shell
-runenv A
-env "${RUNENV[@]}" "$BASH" "$RUN606" > "$PAIR_OUT/A.console" 2>&1 &
-PID_A=$!
-runenv B
-env "${RUNENV[@]}" "$BASH" "$RUN606" > "$PAIR_OUT/B.console" 2>&1 &
-PID_B=$!
-log "run A pid ${PID_A}, run B pid ${PID_B}"
+for x in "${LABELS[@]}"; do
+  runenv "$x"
+  env "${RUNENV[@]}" "$BASH" "$RUN606" > "$PAIR_OUT/$x.console" 2>&1 &
+  printf -v "PID_$x" '%s' "$!"
+  pid="PID_$x"; log "run $x pid ${!pid}"
+done
 completed() { local out="OUT_$1"; grep -q "run complete: " "${!out}/run.log" 2>/dev/null; }
-# bash 3.2 (macOS) has no `wait -n`: poll; a run that FAILED as tooling stops the other
-RC_A="" RC_B="" DONE_A=0 DONE_B=0
-while [[ -z "$RC_A" || -z "$RC_B" ]]; do
-  for x in A B; do
+# compared <label>: some pair the run is in has lost no run (its cluster still feeds a comparison)
+compared() {
+  local p a b fa fb
+  for p in "${PAIR_LIST[@]}"; do
+    in_pair "$1" "$p" || continue
+    fa="FAILED_${p%%:*}" fb="FAILED_${p##*:}"
+    [[ "${!fa}" == "1" || "${!fb}" == "1" ]] || return 0
+  done
+  return 1
+}
+all_exited() { local x rc; for x in "${LABELS[@]}"; do rc="RC_$x"; [[ -n "${!rc}" ]] || return 1; done; return 0; }
+# bash 3.2 (macOS) has no `wait -n`: poll; a run that FAILED as tooling stops each run left in no comparable pair
+while ! all_exited; do
+  for x in "${LABELS[@]}"; do
     pid="PID_$x" rc="RC_$x"
     if [[ -z "${!rc}" ]] && ! kill -0 "${!pid}" 2>/dev/null; then
       set +e; wait "${!pid}"; printf -v "$rc" '%s' "$?"; set -e
@@ -175,31 +298,69 @@ while [[ -z "$RC_A" || -z "$RC_B" ]]; do
       done_x="DONE_$x"
       log "run $x exited ${!rc} ($([[ "${!done_x}" == "1" ]] && echo 'its evaluate step ran' || echo 'it did not complete'))"
       if [[ "${!rc}" != "0" && "${!done_x}" != "1" ]]; then
-        other=$([[ "$x" == "A" ]] && echo B || echo A); opid="PID_$other"; orc="RC_$other"
-        if [[ -z "${!orc}" ]]; then
+        printf -v "FAILED_$x" '%s' 1
+        for y in "${LABELS[@]}"; do
+          orc="RC_$y" ost="STOPPED_$y" opid="PID_$y"
+          [[ -z "${!orc}" && "${!ost}" != "1" ]] || continue
+          compared "$y" && continue
           # a PAIR STOP (USR1), not a TERM: its measurement stops and its teardown, diagnostics
           # and disk backstop run in full (run 17 attempt 4: the TERM reached B's teardown)
-          log "run $x failed as tooling: stopping run $other (half a pair cannot be compared): its measurement stops, its teardown runs in full"
+          log "run $x failed as tooling: stopping run $y (every pair it is in has lost a run, so its cluster feeds no comparison): its measurement stops, its teardown runs in full"
+          printf -v "$ost" '%s' 1
           kill -USR1 "${!opid}" 2>/dev/null || true
-        fi
+        done
       fi
     fi
   done
-  [[ -n "$RC_A" && -n "$RC_B" ]] || sleep "${PAIR_POLL_S:-5}"
+  all_exited || sleep "${PAIR_POLL_S:-5}"
 done
 trap - INT TERM HUP
+# one paired verdict per pair; the launch's exit ranks them (header): FAIL, INVALID, INCONCLUSIVE, PASS
+rank() { case "$1" in 1) echo 4 ;; 4) echo 2 ;; 0) echo 1 ;; *) echo 3 ;; esac; }
 vrc=0
-"${eval_cmd[@]}" --completed-a "$DONE_A" --completed-b "$DONE_B" > "$PAIR_OUT/paired-verdict.json" || vrc=$?
-log "paired verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $PAIR_OUT/paired-verdict.json"
-while IFS= read -r r; do
-  [[ -n "$r" ]] && log "$r"
-done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
+required=()
+for p in "${PAIR_LIST[@]}"; do
+  a="${p%%:*}" b="${p##*:}" f="$(verdict_file "$p")"
+  pair_cmd "$p"
+  da="DONE_$a" db="DONE_$b"
+  prc=0
+  "${PAIR_CMD[@]}" --completed-a "${!da}" --completed-b "${!db}" > "$f" || prc=$?
+  required+=(--require "${f##*/}")
+  log "paired verdict ${a} vs ${b} exit=${prc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $f"
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "${a} vs ${b}: $r"
+  done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
 ex = (v.get("exclusion") or {}).get("items") or []
 print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
                 + ["INVALID: " + r for r in v["invalid_reasons"]] + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
                 + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
-                + [r["line"] for r in v.get("b_inside_a_outage") or []]))' \
-           "$PAIR_OUT/paired-verdict.json" 2>/dev/null || true)
+                + [r["line"] for r in v.get("b_inside_a_outage") or []]
+                + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])))' \
+             "$f" 2>/dev/null || true)
+  (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
+done
+# #1194: the launch is finished when its evidence is safe, whatever the verdicts
+safe=1
+if msg="$(publish_pair final "${required[@]}" 2>&1)"; then
+  log "$msg"
+else
+  safe=0
+  log "EVIDENCE NOT SAFE (pair): ${msg}"
+fi
+for x in "${LABELS[@]}"; do
+  out="OUT_$x" name="RUN_NAME_$x"
+  [[ -e "${!out}/.evidence-due" ]] || continue
+  if msg="$(python3 -m bench.evidence verify --dest "$(python3 -m bench.evidence dest "${!name}")" --stage final 2>&1)"; then
+    log "run $x: $msg"
+  else
+    safe=0
+    log "EVIDENCE NOT SAFE (run $x): ${msg}"
+  fi
+done
+if [[ "$safe" != "1" ]]; then
+  log "the launch is NOT finished: its evidence is not safe (exit 5); the paired verdicts, exit ${vrc} together, stand in $PAIR_OUT"
+  exit 5
+fi
 exit "$vrc"

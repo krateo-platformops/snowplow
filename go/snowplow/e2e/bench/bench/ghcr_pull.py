@@ -27,6 +27,9 @@ THE FILE, written by the operator (never by the bench), mode 0600:
         GHCR_PULL_USERNAME=<github user>
         GHCR_PULL_TOKEN=<a token with read:packages only>
 
+The path must survive a reboot: run606.sh refuses one in a temporary directory (#1194, the file
+went with /tmp on 2026-11-06), so a run never depends on a token the machine can clear.
+
 The TOKEN never enters argv, a shell variable, a log, the run dir or a
 diagnostic. `token` writes it to stdout for a pipe into `kubectl create
 secret ... --from-file=token=/dev/stdin`, and `username` writes a values

@@ -483,7 +483,7 @@ def test_the_pair_refuses_attempt_2s_region_and_starts_at_4_of_16(pairbed):  # n
     p = _launch(repo, env, BENCH_606_DRY_RUN="1", **region_env(vms=4))
     assert p.returncode == 0, p.stderr[-1500:]
     assert "IN_USE_ADDRESSES in europe-west4: 4 of 16 used (listed: 4 VM external IP(s)" in p.stderr
-    assert "12 free; the run needs 12" in p.stderr and "DRY: both runs would start now" in p.stderr
+    assert "12 free; the run needs 12" in p.stderr and "DRY: all 2 runs would start now" in p.stderr
     # both numbers, listed and reported, in the pair's log: each launch is #1173's falsifier
     assert "GCE reports 4)" in (tmp / "pair" / "pair.log").read_text()
 

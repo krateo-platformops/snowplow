@@ -989,7 +989,7 @@ def test_the_pair_refuses_the_stage_on_one_arm(pairbed):  # noqa: F811
     repo, fake, env, tmp = pairbed
     today = datetime.now(UTC).strftime("%Y%m%d")
     p = _launch(repo, env, BENCH_1004_GO_A=f"{today}-{NA}")
-    assert p.returncode == 2 and "set both (the full-widen stage on both arms) or neither" in p.stderr
+    assert p.returncode == 2 and "set it on every run of A B (the full-widen stage on every arm) or on none (1 set)" in p.stderr
     assert not _calls(fake)
 
 

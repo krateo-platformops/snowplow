@@ -97,7 +97,7 @@ def test_the_pair_s_dry_pass_refuses_a_pair_the_region_cannot_hold(pairbed):  # 
     p = _launch(repo, env, BENCH_606_DRY_RUN="1", FAKE_CLUSTERS=THREE)
     assert p.returncode == 2, p.stderr[-1500:]
     assert "refusing: GKE clusters in europe-west4: 3 of 3 (ClustersPerRegion)" in p.stderr
-    assert "the run needs 2" in p.stderr and "DRY: both runs would start now" not in p.stderr
+    assert "the run needs 2" in p.stderr and "DRY: all 2 runs would start now" not in p.stderr
     p = _launch(repo, env, BENCH_606_DRY_RUN="1", FAKE_CLUSTERS=_clusters(("krateo-installer-release", R, "RUNNING")))
     assert p.returncode == 0, p.stderr[-1500:]
     assert "GKE clusters in europe-west4: 1 of 3" in p.stderr

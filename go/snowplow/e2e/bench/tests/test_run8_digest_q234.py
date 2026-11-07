@@ -201,7 +201,8 @@ def test_default_capture_prefixes_cover_every_run8_key():
     assert load606.prefixes_missing(load606.RUN8_VARS_PREFIXES) == []
     assert "snowplow_stale_retry_viewers" in load606.prefixes_missing(
         [p for p in load606.RUN8_VARS_PREFIXES if p != "snowplow_stale_retry_"])
-    assert load606.prefixes_missing([]) == sorted(set(K.values()) | set(load606.RUN9_KEYS.values()))
+    assert load606.prefixes_missing([]) == sorted(set(K.values()) | set(load606.RUN9_KEYS.values())
+                                                  | set(load606.TIER_KEYS.values()))   # #1085, run 22
 
 
 # ─── 3. Q2–Q4 gates: the bars are the rulings, and both sides of each bar ──
