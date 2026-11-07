@@ -202,7 +202,7 @@ is broken out **per reason** on both surfaces.
 
 | metric | meaning | healthy range |
 |---|---|---|
-| `snowplow_malformed_dial_skipped_total` (expvar) | `/debug/vars` `map{reason → uint64}` over the fixed reason set `{empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error, path_not_as_served, path_value_refused}`. Single published KEY (the CFG-1 `nonCacheInitPublishers` exception); the inner reason set grows, the key name never does | **0** in steady state. Non-zero = the guard fired — read the per-reason breakdown: `empty_interp` (#288, and #1123 for a template that rendered no path) = a key-minting/interpolation regression; `unrendered_template` (#293) = an RA-authoring/unresolved-template fault; `jq_*_error` (#293/#302) = a jq fault that would otherwise have dialed a garbage path / body / header; `path_not_as_served` (#1137) = an own-cluster path the apiserver would read as a different path (no leading `/`, a percent-escape, an empty or dot segment), refused so no reader decides about a request other than the one served; `path_value_refused` (#1123) = a value that cannot be one segment or one query value, or a percent-escape in an apiserver path: an injection attempt or an undeclared multi-segment value |
+| `snowplow_malformed_dial_skipped_total` (expvar) | `/debug/vars` `map{reason → uint64}` over the fixed reason set `{empty_interp, unrendered_template, jq_path_error, jq_payload_error, jq_header_error, path_not_as_served, path_value_refused}`. Single published KEY (the CFG-1 `nonCacheInitPublishers` exception); the inner reason set grows, the key name never does | **0** in steady state. Non-zero = the guard fired — read the per-reason breakdown: `empty_interp` (#288, #1185 for an expression that left a path segment empty, and #1123 for a template that rendered no path) = a key-minting/interpolation regression; `unrendered_template` (#293) = an RA-authoring/unresolved-template fault; `jq_*_error` (#293/#302) = a jq fault that would otherwise have dialed a garbage path / body / header; `path_not_as_served` (#1137) = an own-cluster path the apiserver would read as a different path (no leading `/`, a percent-escape, an empty or dot segment), refused so no reader decides about a request other than the one served; `path_value_refused` (#1123) = a value that cannot be one segment or one query value, or a percent-escape in an apiserver path: an injection attempt or an undeclared multi-segment value |
 | `snowplow_malformed_dial_skipped_total{reason}` (OTLP, **#311**) | the same counter mirrored to ClickStack as one `{reason}` series per enum member, observed in `metrics.go` by ranging `MalformedDialSkippedByReasonSnapshot()`. Previously `/debug/vars`-only (observable-if-you-look); #311 makes it **alertable** | **0**. The `reason` attribute is bounded **by construction** — it is the fixed code-defined `MalformedDialReasonEnum()`, NEVER request-derived (the #260 bounded-attribute discipline), so it cannot blow up OTLP cardinality. Expvar and OTLP read the SAME snapshot, so the two surfaces never diverge (guarded by `metrics_311_malformed_dial_otlp_test.go`: `len(series) == len(enum)` + every emitted reason ∈ enum) |
 
 ### Dispatch L1 lookups — resolved-output cache hit rate
@@ -1453,8 +1453,17 @@ integration contract they implement is `docs/howto-frontend-live-refresh-sse.md`
 
 ## Key `slog` events
 
-JSON structured logs on stdout. Message strings are stable, dotted, and greppable. The
-operator-notable ones:
+JSON structured logs on stdout. Message strings are stable, dotted, and greppable.
+
+**No line carries a user name or groups, in clear or as a label** (#1192). The audit record is
+the one place that stores identity: to find who hit an error, join the line's trace id to the
+audit record. `internal/redact`'s guard fails on an identity attribute, and the log handler
+takes the identity out of the forms the apiserver and authn write in the text of an error.
+The routes this doesn't cover, such as klog, are listed in #1223. A service account's name
+isn't identity here and stays in error text, and `key_hash` stays on lines (Diego's ruling on
+#1199).
+
+The operator-notable events:
 
 | Event (message) | Level | Site | What it tells an operator |
 |---|---|---|---|

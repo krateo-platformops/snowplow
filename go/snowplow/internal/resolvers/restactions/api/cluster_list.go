@@ -55,7 +55,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -274,7 +273,6 @@ func attemptClusterListCollapse(
 		log.Debug("cluster_list.gate_deny.rbac_deny",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.Bool("permit", permit),
 			slog.Any("eval_err", evalErr),
@@ -330,7 +328,6 @@ func attemptClusterListCollapse(
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
-			slog.String("user", redact.User(user.Username)),
 		)
 		return []httpcall.RequestOptions{clusterCall}, true, 0
 	}
@@ -351,7 +348,6 @@ func attemptClusterListCollapse(
 		slog.String("subsystem", "cache"),
 		slog.String("ra_stage", apiCall.Name),
 		slog.String("gvr", gvr.String()),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("effect", "per-NS fallback for this request; async populate scheduled — next request warm"),
 	)
 	return nil, false, 8

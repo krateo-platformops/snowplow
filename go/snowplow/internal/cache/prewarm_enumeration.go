@@ -66,7 +66,7 @@ import (
 // FIELDS:
 //   - BindingUID: DIAGNOSTIC ONLY. The lexicographically-smallest binding
 //     UID among the bindings that projected to this target's identity —
-//     retained for log/telemetry (cohortLogLabel) and a stable tie-break.
+//     retained for telemetry and a stable tie-break.
 //     It is NOT the cell-key identity dimension: the cell key's BindingUID
 //     is RE-DERIVED at populate time from a first-match EvaluateRBAC over
 //     Subject (Path B — dispatchCacheLookupKey; the enumerated BindingUID

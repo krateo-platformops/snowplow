@@ -132,9 +132,6 @@ var urlSanitizers = map[string]bool{
 	"github.com/krateo-platformops/snowplow/internal/redact.ErrorURL":    true,
 	"github.com/krateo-platformops/snowplow/internal/redact.Digest":      true,
 	"github.com/krateo-platformops/snowplow/internal/redact.User":        true,
-	"github.com/krateo-platformops/snowplow/internal/redact.Group":       true,
-	"github.com/krateo-platformops/snowplow/internal/redact.Groups":      true,
-	"github.com/krateo-platformops/snowplow/internal/redact.Identity":    true,
 	"github.com/krateo-platformops/snowplow/internal/redact.Prefixed":    true,
 	"github.com/krateo-platformops/snowplow/internal/redact.KeyLabel":    true,
 	"github.com/krateo-platformops/snowplow/internal/redact.ValueDigest": true,
@@ -171,15 +168,15 @@ var urlFieldSuffixes = []string{"URL", "Url", "URI", "Uri"}
 //	if saUser, ok := phase1SAUsername(saEP.Token); ok { refreshUser = saUser }
 //
 // refreshUser is a USERNAME extracted from a service-account JWT, not the
-// token, and it reaches its log sites through refreshLogUser — a helper
-// already registered in the #453 redactingHelpers set, i.e. already redacted.
-// The findings were artefacts of this guard not sharing that registry.
+// token, and it reached its log sites through a redacting helper of #453's
+// (#1192 took it off those lines). The findings were artefacts of this guard
+// not sharing that registry.
 //
 // So the credential fields of an Endpoint are #453's territory: the syntactic
-// scan's identitySelectors, the typed half's sensitiveFieldExact, and
-// redactingHelpers. Duplicating that registry here would rebuild #453 inside
-// #503, and until it was duplicated this guard would tell a reader to "wrap it
-// in redact.URL" for a bearer token — advice that is simply wrong.
+// scan's identitySelectors and the typed half's sensitiveFieldExact.
+// Duplicating them here would rebuild #453 inside #503, and until it was
+// duplicated this guard would tell a reader to "wrap it in redact.URL" for a
+// bearer token — advice that is simply wrong.
 //
 // Checked while backing it out: NO site in the module logs a raw Endpoint
 // credential field. The five findings above were the complete result, and all

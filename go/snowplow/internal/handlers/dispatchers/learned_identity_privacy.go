@@ -26,7 +26,6 @@ import (
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // learnedRedactionTokens returns the strings a learned class's logs must never
@@ -168,24 +167,18 @@ func learnedRedactingLogger(base *slog.Logger, username string, groups []string)
 	})
 }
 
-// learnedSeedLabelKey marks a seed ctx built for a learned class; the value is
-// the class's sha256 label, the only form a log line may carry.
-type learnedSeedLabelKey struct{}
+// learnedSeedMarkKey marks a seed ctx built for a learned class.
+type learnedSeedMarkKey struct{}
 
-func withLearnedSeedLabel(ctx context.Context, label redact.Label) context.Context {
-	return context.WithValue(ctx, learnedSeedLabelKey{}, label)
-}
-
-func learnedSeedLabelFromCtx(ctx context.Context) (redact.Label, bool) {
-	l, ok := ctx.Value(learnedSeedLabelKey{}).(redact.Label)
-	return l, ok && l != ""
+func withLearnedSeedMark(ctx context.Context) context.Context {
+	return context.WithValue(ctx, learnedSeedMarkKey{}, true)
 }
 
 // seedDiagLogger is the logger the seed primitives' key diagnostic uses: the
 // ctx logger of a learned seed (redacting), else slog.Default() exactly as
 // before.
 func seedDiagLogger(ctx context.Context) *slog.Logger {
-	if _, learned := learnedSeedLabelFromCtx(ctx); learned {
+	if learned, _ := ctx.Value(learnedSeedMarkKey{}).(bool); learned {
 		return xcontext.Logger(ctx)
 	}
 	return slog.Default()

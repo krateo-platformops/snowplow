@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -62,15 +64,28 @@ func TestIssue1123_PlanNeverDialsAnInjectedPath(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			before := MalformedDialSkippedByReason(reasonPathValueRefused)
-			opts, skips := plan1123On(t, c.apiserver, c.path, map[string]any{"id": c.id})
+			var line bytes.Buffer
+			opts, skips, err := createRequestOptionsWithSkips(context.Background(),
+				slog.New(slog.NewTextHandler(&line, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				&templates.API{Name: "s", Path: c.path}, map[string]any{"id": c.id}, c.apiserver)
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
 			if len(opts) != 0 {
 				t.Fatalf("planned %q", opts[0].Path)
 			}
 			if len(skips) != 1 || skips[0].reason.class != reasonPathValueRefused {
 				t.Fatalf("skips = %+v, want one %s", skips, reasonPathValueRefused)
 			}
-			if len(c.id) > 2 && (strings.Contains(skips[0].path, c.id) || strings.Contains(skips[0].reason.detail, c.id)) {
-				t.Fatalf("the refusal echoes the caller's value: %+v", skips[0])
+			// The value in every form the refused path could hold it: as sent,
+			// and escaped, which is how the '%' branch rendered it (#1185 item C).
+			if !strings.Contains(line.String(), "reason_class="+reasonPathValueRefused) {
+				t.Fatalf("no skip line to read: %s", line.String())
+			}
+			for _, form := range []string{c.id, url.PathEscape(c.id)} {
+				if len(c.id) > 2 && (strings.Contains(skips[0].path, form) || strings.Contains(skips[0].reason.detail, form) || strings.Contains(line.String(), form)) {
+					t.Fatalf("the refusal echoes the caller's value as %q: %+v\n%s", form, skips[0], line.String())
+				}
 			}
 			if got := MalformedDialSkippedByReason(reasonPathValueRefused) - before; got != 1 {
 				t.Fatalf("path_value_refused moved by %d, want 1", got)
@@ -248,24 +263,23 @@ func TestIssue1123_TemplateThatRendersNoPathIsRefused(t *testing.T) {
 		}
 	}
 
-	// What the rule leaves alone. A stage with no path has no template, and the
-	// author's text around a null value is a path.
+	// What the rule leaves alone: a stage with no path has no template.
 	if opts, skips := plan1123On(t, false, "", map[string]any{}); len(opts) != 1 || len(skips) != 0 {
 		t.Fatalf("a stage with no path: planned %d, skips %+v", len(opts), skips)
-	}
-	if opts, skips := plan1123On(t, false, `${ "/a/" + segments(.p) }`, map[string]any{}); len(opts) != 1 || opts[0].Path != "/a/" {
-		t.Fatalf("text around a null value: planned %+v, skips %+v", opts, skips)
 	}
 	if opts, skips := plan1123On(t, false, `${ segments(.p) }`, map[string]any{"p": "/x/y"}); len(opts) != 1 || opts[0].Path != "/x/y" {
 		t.Fatalf("a present value: planned %+v, skips %+v", opts, skips)
 	}
 }
 
-// The other segments() edges, as a stage sees them: an inner empty piece is
-// kept and judged by the stage's own guard, a non-string is a template error.
+// The other segments() edges, as a stage sees them: an inner empty piece is an
+// empty segment (#1185), a non-string is a template error.
 func TestIssue1123_SegmentsEdgesAtThePlan(t *testing.T) {
-	if opts, skips := plan1123On(t, false, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"}); len(opts) != 1 || opts[0].Path != "/x/a//b" {
-		t.Fatalf("an inner empty piece on a named endpoint: planned %+v, skips %+v", opts, skips)
+	for _, apiserver := range []bool{true, false} {
+		opts, skips := plan1123On(t, apiserver, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"})
+		if len(opts) != 0 || len(skips) != 1 || skips[0].reason.class != reasonEmptyInterp || !skips[0].reason.collapsed {
+			t.Fatalf("an inner empty piece, apiserver=%v: planned %+v, skips %+v", apiserver, opts, skips)
+		}
 	}
 	// Both verdicts refuse a collapsed namespace, whichever way it collapsed.
 	for _, apiserver := range []bool{true, false} {

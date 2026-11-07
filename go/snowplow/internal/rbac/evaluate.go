@@ -22,7 +22,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -260,7 +259,6 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		// "zero SubjectAccessReview in cache=on" rule, and we MUST NOT
 		// silently fall back to apiserver (would violate Revision 1).
 		log.WarnContext(ctx, "rbac.evaluate: cache enabled but Global() is nil — denying",
-			slog.String("user", redact.User(opts.Username)),
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),
@@ -278,7 +276,6 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	if snap == nil {
 		// AC-B.8 — degrade-to-deny pre-readiness gate.
 		log.WarnContext(ctx, "rbac.evaluate: typed-RBAC snapshot not yet published — denying",
-			slog.String("user", redact.User(opts.Username)),
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),
@@ -318,12 +315,11 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		if opts.WinningSubjectClassOut != nil && v.Allowed {
 			*opts.WinningSubjectClassOut = v.WinningSubjectClass
 		}
-		// The Enabled guard keeps the per-call keyed user digest (an HMAC)
-		// off the hot path at the shipped warn level.
+		// The Enabled guard keeps the attrs off the hot path at the shipped warn
+		// level.
 		if log.Enabled(ctx, slog.LevelDebug) {
 			log.Debug("rbac.evaluate",
 				slog.String("path", "in-process-memo-hit"),
-				slog.String("user", redact.User(opts.Username)),
 				slog.Bool("allowed", v.Allowed),
 				slog.String("matched_binding_uid", v.MatchedBindingUID),
 			)
@@ -334,8 +330,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	var winClass WinningSubjectClass
 	allowed, matchedBindingUID, winClass, err = evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
-		log.ErrorContext(ctx, "rbac.evaluate: informer evaluation failed",
-			slog.String("user", redact.User(opts.Username)), slog.Any("err", err))
+		log.ErrorContext(ctx, "rbac.evaluate: informer evaluation failed", slog.Any("err", err))
 		return false, "", err
 	}
 
@@ -382,7 +377,6 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 	if log.Enabled(ctx, slog.LevelDebug) {
 		log.Debug("rbac.evaluate",
 			slog.String("path", "in-process"),
-			slog.String("user", redact.User(opts.Username)),
 			slog.String("verb", opts.Verb),
 			slog.String("group", opts.Group),
 			slog.String("resource", opts.Resource),

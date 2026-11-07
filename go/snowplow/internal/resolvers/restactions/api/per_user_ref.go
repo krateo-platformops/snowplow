@@ -30,9 +30,8 @@
 // truncates, and nothing is dialed or read.
 //
 // OBSERVABILITY. One ERROR line at the stage ("endpointRef refused") carrying
-// the stage, the provenance, whether the name was templated and the Secret
-// name as a redact label, never in clear (the name embeds a username). One
-// count per refusal in snowplow_endpointref_per_user_refused_total{provenance},
+// the stage, the provenance and whether the name was templated, never the Secret
+// name, which embeds a username. One count per refusal in snowplow_endpointref_per_user_refused_total{provenance},
 // both cells pre-populated (a 0 is a reading). Not gated on the cache mode:
 // the rule holds on every resolve.
 package api

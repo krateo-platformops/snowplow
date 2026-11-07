@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -278,9 +279,11 @@ func TestS1054_PendingFlightWaitIsRecorded(t *testing.T) {
 
 	mon, logs := slow1054Monitor()
 	done := make(chan struct{})
+	reqCtx := make(chan context.Context, 1)
 	go func() {
 		defer close(done)
 		slow1054Run(mon, func(ctx context.Context) {
+			reqCtx <- ctx
 			ctx = xcontext.BuildContext(ctx, xcontext.WithUserInfo(jwtutil.UserInfo{Username: r1User}))
 			ctx = cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(ctx), r1FsaGVR)
 			apistageContentServe(ctx, store, fill710ListCall(), false)
@@ -288,6 +291,16 @@ func TestS1054_PendingFlightWaitIsRecorded(t *testing.T) {
 	}()
 	if !fill710WaitFor(10*time.Second, func() bool { return stamp765Refused() == 1 }) {
 		t.Fatalf("PRECONDITION: the second reader was not refused by the in-flight fill")
+	}
+	// #1227: the refusal is counted before the wait starts, so the reader can
+	// still be between the two. Hold the first flight only once the wait is
+	// open on the reader's record: from then on the recorded wait spans the
+	// whole hold, however the goroutines are scheduled.
+	waiter := <-reqCtx
+	if !fill710WaitFor(10*time.Second, func() bool {
+		return slices.Contains(slowcall.OpenWaitsForTest(waiter), "content_flight_pending")
+	}) {
+		t.Fatalf("PRECONDITION: the refused reader never opened its content_flight_pending wait")
 	}
 	time.Sleep(2 * slow1054Bound)
 	release[0]()
