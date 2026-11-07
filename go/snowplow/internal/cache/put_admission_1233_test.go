@@ -153,16 +153,84 @@ func TestIssue1233_TheStoreAdmitsNoWriteOnAnIncompleteSnapshot(t *testing.T) {
 }
 
 // An inert (dry-run) resolve is refused by the same admission, and is not
-// counted as an RBAC decline.
+// counted as an RBAC decline, on a complete snapshot or a partial one (#1243
+// review: the order of the two refusals must not move a dry run into the count).
 func TestIssue1233_AnInertWriteIsRefusedButNotCountedAsAnRBACDecline(t *testing.T) {
-	setSnapshot1233(t, &RBACSnapshot{Synced: true})
-	c := newResolvedCache(10, 1<<20, time.Hour)
-	before := PutDeclinedRBACIncompleteTotal()
-	if c.PutResolvedIfGen(WithInert(context.Background()), fixtureStoreVerdict, "k", entry1233("restactions"), c.CaptureGen("k")) {
-		t.Fatal("an inert resolve stored a cell")
+	for _, st := range []struct {
+		name string
+		snap *RBACSnapshot
+	}{{"complete", &RBACSnapshot{Synced: true}}, {"partial", &RBACSnapshot{}}, {"none published", nil}} {
+		t.Run(st.name, func(t *testing.T) {
+			setSnapshot1233(t, st.snap)
+			c := newResolvedCache(10, 1<<20, time.Hour)
+			before := PutDeclinedRBACIncompleteTotal()
+			if c.PutResolvedIfGen(WithInert(context.Background()), fixtureStoreVerdict, "k", entry1233("restactions"), c.CaptureGen("k")) {
+				t.Fatal("an inert resolve stored a cell")
+			}
+			if got := PutDeclinedRBACIncompleteTotal() - before; got != 0 {
+				t.Fatalf("an inert refusal counted %d RBAC declines on a %s snapshot", got, st.name)
+			}
+		})
 	}
-	if got := PutDeclinedRBACIncompleteTotal() - before; got != 0 {
-		t.Fatalf("an inert refusal counted %d RBAC declines", got)
+}
+
+// A resolve is admitted by the snapshot it BEGAN on (#1243 review, blocker 1):
+// its sink, installed at its start on a partial snapshot, refuses its write
+// after the snapshot completed. A resolve begun on the complete snapshot writes.
+func TestIssue1233_AWriteIsAdmittedByTheSnapshotItsResolveBeganOn(t *testing.T) {
+	setSnapshot1233(t, &RBACSnapshot{})
+	partialCtx, partialSink := WithExternalTouchedSink(context.Background())
+	setSnapshot1233(t, &RBACSnapshot{Synced: true})
+	completeCtx, completeSink := WithExternalTouchedSink(context.Background())
+	if !partialSink.StartedIncomplete() || completeSink.StartedIncomplete() {
+		t.Fatalf("the sinks must record the snapshot at their start: partial=%v complete=%v",
+			partialSink.StartedIncomplete(), completeSink.StartedIncomplete())
+	}
+	c := newResolvedCache(10, 1<<20, time.Hour)
+	before := PutDeclinedRBACIncompleteSnapshot()[RefDenialOriginServe+"/restactions"]
+	if c.PutResolvedIfGen(partialCtx, fixtureStoreVerdict, "k1", entry1233("restactions"), c.CaptureGen("k1")) {
+		t.Fatal("#1233 RED: a resolve begun on a partial snapshot stored its body after the snapshot completed")
+	}
+	if got := PutDeclinedRBACIncompleteSnapshot()[RefDenialOriginServe+"/restactions"] - before; got != 1 {
+		t.Fatalf("the refusal must be counted once, counted %d", got)
+	}
+	if !c.PutResolvedIfGen(completeCtx, fixtureStoreVerdict, "k2", entry1233("restactions"), c.CaptureGen("k2")) {
+		t.Fatal("CONTROL: a resolve begun on the complete snapshot must store")
+	}
+	// A child created on the complete snapshot under a parent begun on the
+	// partial one belongs to that resolve tree: it is refused too.
+	childUnderPartial, _ := WithChildPutGateSinks(partialCtx)
+	if c.PutResolvedIfGen(childUnderPartial, fixtureStoreVerdict, "k3", entry1233("restactions"), c.CaptureGen("k3")) {
+		t.Fatal("#1233 RED: a nested resolve of a tree begun on a partial snapshot stored")
+	}
+}
+
+// A memo hit is indistinguishable from the resolve it replaces (#912 N1): a body
+// a producer resolved on a partial snapshot, replayed by a hitter that began on
+// the complete one, is refused like the producer's would be.
+func TestIssue1233_AMemoHitReplaysThatItsProducerBeganOnAPartialSnapshot(t *testing.T) {
+	setSnapshot1233(t, &RBACSnapshot{})
+	_, producer := WithPutGateEffectsCapture(context.Background())
+	effects := producer.Effects()
+	if !effects.StartedIncomplete {
+		t.Fatal("the producer's capture must record that it began on a partial snapshot")
+	}
+	setSnapshot1233(t, &RBACSnapshot{Synced: true})
+	hitterCtx, hitterSink := WithExternalTouchedSink(context.Background())
+	if hitterSink.StartedIncomplete() {
+		t.Fatal("PRECONDITION: the hitter began on the complete snapshot")
+	}
+	effects.Replay(hitterCtx)
+	c := newResolvedCache(10, 1<<20, time.Hour)
+	if c.PutResolvedIfGen(hitterCtx, fixtureStoreVerdict, "k", entry1233("widgets"), c.CaptureGen("k")) {
+		t.Fatal("#1233 RED: a memo body produced on a partial snapshot was stored by the hitter after completion")
+	}
+	// A producer that began on the complete snapshot replays nothing of the kind.
+	_, clean := WithPutGateEffectsCapture(context.Background())
+	ctx2, _ := WithExternalTouchedSink(context.Background())
+	clean.Effects().Replay(ctx2)
+	if !c.PutResolvedIfGen(ctx2, fixtureStoreVerdict, "k2", entry1233("widgets"), c.CaptureGen("k2")) {
+		t.Fatal("CONTROL: a memo body produced on the complete snapshot must store")
 	}
 }
 

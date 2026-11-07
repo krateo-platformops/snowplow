@@ -12,13 +12,26 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func declined1233(label string) uint64 {
@@ -230,3 +243,242 @@ func TestIssue1233_ContentPrewarmStoresNothingOnAPartialSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// The #1243 review's straddle: a resolve that began on a partial snapshot, whose
+// snapshot completed before its Put. The partial snapshot lacks alice's Role
+// target-reader (a Role the initial LIST has not delivered yet): her binding set
+// and sub-generation are the same on both snapshots (#682), so no identity-class
+// guard can see it, and her namespaced LIST is filtered to nothing. The complete
+// snapshot is published at the first configmaps verdict of the resolve. The body
+// must not be stored, and the next call, on the complete snapshot, must bring
+// the configmap. RED before #1243's resolve-start admission: the under-granted
+// body was stored and served from L1.
+func TestIssue1233_AResolveBegunOnAPartialSnapshotStoresNothingAfterItCompletes(t *testing.T) {
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
+	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
+	a := psArm{name: "configmaps", target: psConfigmapsGVR, watchShape: true}
+	psBuildWatcher(t, a)
+	perUser := map[string]*atomic.Int64{psAlice: {}, psBob: {}}
+	srv := psFakeAPIServer(t, a, perUser)
+	psSeedClientconfigs(t, srv.URL)
+	ctx := psUserCtx(a, psAlice)
+	list := psRACR(a)
+	_ = unstructured.SetNestedSlice(list.Object, []any{map[string]any{
+		"name": "target", "path": "/api/v1/namespaces/" + psTargetNS + "/configmaps", "continueOnError": true,
+	}}, "spec", "api")
+
+	if err := cache.WaitRBACRebuildQuiesceForTest(30 * time.Second); err != nil {
+		t.Fatalf("PRECONDITION: %v", err)
+	}
+	full := cache.RBACSnapshotForTest()
+	if full == nil || !full.Synced {
+		t.Fatal("PRECONDITION: the watcher's snapshot must be complete")
+	}
+	roles := map[string]*rbacv1.Role{}
+	for k, r := range full.RolesByNSName {
+		if r.Name != "target-reader" {
+			roles[k] = r
+		}
+	}
+	if len(roles) == len(full.RolesByNSName) {
+		t.Fatal("PRECONDITION: the complete snapshot must hold alice's Role target-reader")
+	}
+	partial := &cache.RBACSnapshot{
+		Synced:              false,
+		PublishSeq:          full.PublishSeq + 1<<32,
+		ClusterRoleBindings: full.ClusterRoleBindings,
+		RoleBindingsByNS:    full.RoleBindingsByNS,
+		ClusterRolesByName:  full.ClusterRolesByName,
+		RolesByNSName:       roles,
+	}
+	cache.RebuildSubjectIndexesForTest(partial)
+	cache.PublishRBACSnapshotForTest(partial)
+	t.Cleanup(func() { cache.PublishRBACSnapshotForTest(full) })
+
+	key, handle, in := dispatchCacheLookupKey(ctx, "restactions",
+		h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, psRAName, -1, -1, nil)
+	if handle == nil || key == "" || in == nil {
+		t.Fatal("PRECONDITION: need a live cache handle and key")
+	}
+	fullKey := func() string {
+		cache.PublishRBACSnapshotForTest(full)
+		k, _, _ := dispatchCacheLookupKey(ctx, "restactions",
+			h1RAGVR.Group, h1RAGVR.Version, h1RAGVR.Resource, h1NS, psRAName, -1, -1, nil)
+		return k
+	}
+
+	var flipped atomic.Bool
+	rbac.SetShadowHook(func(_ context.Context, snap *cache.RBACSnapshot, opts rbac.EvaluateOptions, _ bool) {
+		if snap == partial && opts.Resource == a.target.Resource && flipped.CompareAndSwap(false, true) {
+			cache.PublishRBACSnapshotForTest(full) // the initial LIST completes mid-resolve
+		}
+	})
+	t.Cleanup(func() { rbac.SetShadowHook(nil) })
+	prevParity := rbac.ShadowParityEnabled()
+	rbac.SetShadowParityEnabled(true) // the hook only runs with the dark parity on
+	t.Cleanup(func() { rbac.SetShadowParityEnabled(prevParity) })
+	label := cache.RefDenialOriginServe + "/restactions"
+	before := declined1233(label)
+
+	first := psServeCR(t, list, srv.URL, ctx)
+
+	if !flipped.Load() {
+		t.Fatal("PRECONDITION: the snapshot must complete during the resolve (the shadow hook never saw a configmaps verdict on the partial snapshot)")
+	}
+	if psHasSentinel(first.Body.Bytes()) {
+		t.Fatalf("PRECONDITION: the resolve must read through the partial snapshot, which lacks alice's Role; body=%s", first.Body.String())
+	}
+	if k := fullKey(); k != key {
+		t.Fatalf("PRECONDITION: the key must be the same on both snapshots (a missing Role moves no key dimension)")
+	}
+	if _, stored := handle.Get(key); stored {
+		t.Fatal("#1233 RED: the body read on the partial snapshot was stored after the snapshot completed")
+	}
+	if got := declined1233(label) - before; got != 1 {
+		t.Fatalf("the refusal must be counted once under %q, counted %d", label, got)
+	}
+	second := psServeCR(t, list, srv.URL, ctx)
+	if !psHasSentinel(second.Body.Bytes()) {
+		t.Fatalf("#1233 RED: after completion alice's call must bring the configmap; body=%s", second.Body.String())
+	}
+	if _, stored := handle.Get(key); !stored {
+		t.Fatal("CONTROL: the call that began on the complete snapshot must store its cell")
+	}
+}
+
+// The prewarm loses no cell across the gap (#506): with the initial RBAC LIST
+// still open, the snapshot is partial and the seed unit waits instead of
+// resolving; once the LIST completes and the complete snapshot is published,
+// it resolves and stores its cell, and nothing is refused. Before #1233's wait
+// the unit ran at once and its write was refused, leaving the cell cold.
+func TestIssue1233_ASeedWaitsForTheCompleteSnapshotAndLosesNoCell(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+	cache.ResetPhase1DoneForTest()
+	t.Cleanup(cache.ResetPhase1DoneForTest)
+	prevSnap := cache.RBACSnapshotForTest()
+	cache.PublishRBACSnapshotForTest(nil)
+	t.Cleanup(func() { cache.PublishRBACSnapshotForTest(prevSnap) })
+
+	const user = "seed-1233"
+	scheme := runtime.NewScheme()
+	_ = rbacv1.AddToScheme(scheme)
+	listKinds := map[schema.GroupVersionResource]string{
+		restActionGVR: "RESTActionList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds,
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "ra-reader"},
+			Rules: []rbacv1.PolicyRule{{Verbs: []string{"get", "list"}, APIGroups: []string{restActionGVR.Group}, Resources: []string{restActionGVR.Resource}}}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "seed-ra-bind", UID: types.UID("uid-seed-1233")},
+			Subjects: []rbacv1.Subject{{Kind: "User", Name: user}},
+			RoleRef:  rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "ra-reader"}},
+	)
+	// The initial roles LIST is held: the informer cannot sync, so the snapshot
+	// published meanwhile is partial and the initial publish is not done.
+	var released atomic.Bool
+	var heldLists atomic.Int64
+	dyn.PrependReactor("list", "roles", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if released.Load() {
+			return false, nil, nil
+		}
+		heldLists.Add(1)
+		return true, nil, errors.New("roles LIST held by the test (#1233)")
+	})
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil || rw == nil {
+		t.Fatalf("NewResourceWatcher: rw=%v err=%v", rw, err)
+	}
+	t.Cleanup(rw.Stop)
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+	t.Cleanup(func() { released.Store(true) })
+	waitUntil1233(t, 10*time.Second, "the roles LIST to be held", func() bool { return heldLists.Load() > 0 })
+	if cache.RBACSnapshotComplete() {
+		t.Fatal("PRECONDITION: the snapshot must not be complete while the roles LIST is held")
+	}
+
+	ref := templatesv1.ObjectReference{
+		Reference:  templatesv1.Reference{Name: "seeded-1233", Namespace: "krateo-system"},
+		APIVersion: restActionGVR.Group + "/" + restActionGVR.Version,
+		Resource:   restActionGVR.Resource,
+	}
+	origPut, origGet := seedRestactionResolveAndPutFn, seedObjectsGetFn
+	t.Cleanup(func() { seedRestactionResolveAndPutFn, seedObjectsGetFn = origPut, origGet })
+	var fetched atomic.Bool
+	seedObjectsGetFn = func(context.Context, templatesv1.ObjectReference) objects.Result {
+		fetched.Store(true)
+		return a1SeedFetchedRestaction(false)
+	}
+	var mu sync.Mutex
+	var wrote bool
+	var putKey string
+	seedRestactionResolveAndPutFn = func(
+		_, resCtx context.Context, _ *templatesv1.RESTAction, _ templatesv1.ObjectReference,
+		_, key string, handle cacheHandle, inputs *cache.ResolvedKeyInputs, _ objects.Result,
+		_ *cache.StageErrorSink, _ *cache.ExternalTouchedSink,
+	) error {
+		g := seedTerminalGuardFor(seedModeBoot, handle, key)
+		ok := seedTerminalPut(resCtx, handle, fixtureStoreVerdict, key,
+			&cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs}, g)
+		mu.Lock()
+		wrote, putKey = ok, key
+		mu.Unlock()
+		return nil
+	}
+	label := cache.BackgroundOriginCohortSeed + "/restactions"
+	before := declined1233(label)
+
+	done := make(chan error, 1)
+	go func() { done <- seedOneRestaction(seedCohortCtx(user), ref, "krateo-system", seedModeBoot) }()
+
+	// While the LIST is held the unit has not started: no fetch, no write, no refusal.
+	select {
+	case err := <-done:
+		t.Fatalf("#1233 RED: the seed unit ran on the partial snapshot (err=%v, fetched=%v)", err, fetched.Load())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if fetched.Load() || declined1233(label) != before {
+		t.Fatalf("#1233 RED: the seed unit started on the partial snapshot (fetched=%v, refusals=%d)",
+			fetched.Load(), declined1233(label)-before)
+	}
+
+	released.Store(true)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("seedOneRestaction: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the seed unit did not run within 30s of the roles LIST completing")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !wrote || putKey == "" {
+		t.Fatal("#1233 RED: the seed unit's write was refused: the cell is cold after the snapshot completed")
+	}
+	if _, ok := cache.ResolvedCache().Get(putKey); !ok {
+		t.Fatal("#1233 RED: the seeded cell is not resident after the snapshot completed")
+	}
+	if got := declined1233(label) - before; got != 0 {
+		t.Fatalf("no write of the seed may be refused, %d were", got)
+	}
+}
+
+func waitUntil1233(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+var _ = strings.Contains

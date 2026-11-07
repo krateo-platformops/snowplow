@@ -64,6 +64,10 @@ func rbacSnapshotComplete() bool {
 	return s != nil && s.Synced
 }
 
+// RBACSnapshotComplete reports whether the published RBAC snapshot is complete:
+// one exists, built after every RBAC informer finished its initial LIST.
+func RBACSnapshotComplete() bool { return rbacSnapshotComplete() }
+
 // admitWrite is the store's admission of one write. It returns false, and the
 // caller stores nothing, when:
 //   - the resolve is inert (#443 (a): a dry run persists nothing; not counted as
