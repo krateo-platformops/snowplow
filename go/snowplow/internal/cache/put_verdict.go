@@ -73,6 +73,10 @@ type PutVerdict struct {
 	reason      PutReason
 	denialOnly  bool
 	externalTTL bool
+	// thirdPartyOnly: an external decline whose touches all carried nothing of the
+	// requester (ExternalTouchedSink.OnlyThirdParty), the only one the external-TTL
+	// opt-in may turn into a store.
+	thirdPartyOnly bool
 }
 
 // Store reports whether the verdict allows the Put.
@@ -99,8 +103,12 @@ func (v PutVerdict) ExternalTTL() bool { return v.externalTTL }
 // is a genuine external touch becomes a store with ExternalTTL. Every other
 // verdict — a declared write (#915), a stage error, a store — is returned
 // unchanged.
+//
+// Only a touch that carried nothing of the requester qualifies (#1221). The store
+// is shared by everyone who derives the key, and a partial RBAC snapshot can give
+// two identities one key, so a body that depends on who asked must stay declined.
 func (v PutVerdict) WithExternalTTL(optedIn bool) PutVerdict {
-	if optedIn && v.reason == PutReasonExternal && v.decision == PutDeclinePermanent {
+	if optedIn && v.reason == PutReasonExternal && v.decision == PutDeclinePermanent && v.thirdPartyOnly {
 		return PutVerdict{decision: PutStore, reason: PutReasonExternal, externalTTL: true}
 	}
 	return v
@@ -138,7 +146,7 @@ func PutGateVerdict(g PutGateSinks, class string) PutVerdict {
 		}
 		return PutVerdict{decision: d, reason: PutReasonStageError}
 	case external > 0:
-		return PutVerdict{decision: PutDeclinePermanent, reason: PutReasonExternal}
+		return PutVerdict{decision: PutDeclinePermanent, reason: PutReasonExternal, thirdPartyOnly: g.External.OnlyThirdParty()}
 	}
 	return PutVerdict{decision: PutStore, denialOnly: g.Stage.Count() > 0}
 }

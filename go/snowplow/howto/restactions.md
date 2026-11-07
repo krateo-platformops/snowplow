@@ -359,6 +359,11 @@ stored or served.
   `/call` runs it, and the background never prewarms or refreshes it. This
   holds for a widget that uses it too, including a widget that opted into the
   external cache (`krateo.io/external-cache-ttl-seconds`, #915).
+- The external cache (`krateo.io/external-cache-ttl-seconds`) applies only when
+  every stage that reached an endpoint used a named `endpointRef` with its own
+  credential. A stage with no `endpointRef`, a stage with `exportJwt: true` and a
+  call to snowplow itself all carry the requester, so the answer can differ per
+  user: the widget is not cached, even if its other stages are eligible (#1221).
 - A `/call` that snowplow makes to itself on behalf of background work
   carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
   Snowplow sends the header only to itself and strips it from every other
