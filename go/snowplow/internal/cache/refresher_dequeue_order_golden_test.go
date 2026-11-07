@@ -5,10 +5,10 @@ package cache
 // the proof, because it compiles on main as well and must give the same results
 // there and with the counters. It has two halves, one instrument:
 //
-//   - ONE WORKER: a first key held in flight, then unviewed, open (viewed) and
-//     cluster_list keys marked behind it in a fixed interleaving. The re-resolve
-//     order is recorded by tier: it pins the tier priority and every turn rule,
-//     a cluster_list dequeue's included.
+//   - ONE WORKER: a first key held in flight, then unviewed and open (viewed)
+//     keys marked behind it in a fixed interleaving, once without and once with
+//     cluster_list keys. The re-resolve order is recorded by tier: it pins the
+//     tier priority and every turn rule, a cluster_list dequeue's included.
 //   - FOUR WORKERS (production's default): every re-resolve is held at a gate,
 //     and at each point where all four workers are busy the arm records how
 //     many run viewed work and how many normal. It pins the viewed cap and how
@@ -23,16 +23,32 @@ import (
 	"time"
 )
 
-// dequeueOrderGolden is main's one-worker sequence (RUN on a9b02fb9): H the held
-// key, V a key open on a page, U an unviewed key, C a cluster_list key.
-const dequeueOrderGolden = "HVCVCVCVUUUUUUUU"
+// The one-worker goldens, main's sequences (RUN on a9b02fb9): H the held key, V a
+// key open on a page, U an unviewed key, C a cluster_list key. Two interleavings:
+// without cluster_list keys the turn between viewed and normal work shows on its
+// own; with them, a cluster_list dequeue taking its turn shows as well (a
+// cluster_list turn also clears the viewed one, so it hides a normal turn that
+// stopped clearing it, and the first interleaving is what shows that).
+const (
+	dequeueOrderGolden        = "HVUVUVVUUUUUU"
+	dequeueOrderClusterGolden = "HVCVCVCVUUUUUUUU"
+)
 
 // dequeueSplitGolden is main's four-worker split (RUN on a9b02fb9): viewed and
 // normal workers busy at each point where every worker is.
 const dequeueSplitGolden = "3V0U|3V1U|3V1U|0V4U"
 
 func TestRefresherDequeueOrder_IsTheGoldenSequence(t *testing.T) {
-	const nUnviewed, nViewed, nCluster = 8, 4, 3
+	t.Run("viewed_and_normal", func(t *testing.T) { oneWorkerGolden(t, 0, dequeueOrderGolden) })
+	t.Run("with_cluster_list", func(t *testing.T) { oneWorkerGolden(t, 3, dequeueOrderClusterGolden) })
+}
+
+// oneWorkerGolden runs one worker on a held key, then 8 unviewed, 4 viewed and
+// nCluster cluster_list keys marked behind it in a fixed interleaving, and
+// compares the re-resolve order by tier with want.
+func oneWorkerGolden(t *testing.T, nCluster int, want string) {
+	t.Helper()
+	const nUnviewed, nViewed = 8, 4
 	keys, rec, firstIn, release := viewed765Start(t, 1, 1+nUnviewed+nViewed+nCluster)
 	hold := keys[0]
 	unviewed := keys[1 : 1+nUnviewed]
@@ -92,9 +108,9 @@ func TestRefresherDequeueOrder_IsTheGoldenSequence(t *testing.T) {
 		}
 	}
 	t.Logf("dequeue order: %s", got.String())
-	if got.String() != dequeueOrderGolden {
+	if got.String() != want {
 		t.Fatalf("the refresher's one-worker dequeue order is %s, want main's %s: something that should only count changed what runs next",
-			got.String(), dequeueOrderGolden)
+			got.String(), want)
 	}
 }
 
