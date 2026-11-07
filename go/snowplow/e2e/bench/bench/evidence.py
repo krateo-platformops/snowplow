@@ -22,9 +22,10 @@ read from the source. MANIFEST.json is written after that, so a manifest says th
 file that could not be copied fails the publish, after every other file was tried; the copy that
 landed is kept, and no manifest says it is complete.
 
-NEVER OVER AN EARLIER RUN. The destination is claimed by the run's own id. A publish to a directory
-another run claimed, or to one nobody claimed, is refused and touches nothing; the same id may
-publish again (the launcher does, after gke-down, for teardown.json and the end of run.log).
+NEVER OVER AN EARLIER RUN. The destination is claimed by the run's own id, whole or not at all (one
+rename: a full disk leaves no half claim to refuse the retry). A publish to a directory another run
+claimed, or to one nobody claimed, is refused and touches nothing; the same id may publish again
+(the launcher does, after gke-down, for teardown.json and the end of run.log).
 `preflight` refuses the same thing before any cloud call.
 
     python3 -m bench.evidence run-dir NAME               # the default run directory of NAME
@@ -41,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -133,25 +135,41 @@ def preflight(dest) -> None:
 
 
 def _claim(dest: Path, run_id: str) -> None:
-    """Take `dest` for `run_id`, or find it already this run's. mkdir is the atomic step: of two
-    runs only one creates the directory, and a directory this call did not create must say it is
-    this run's."""
-    owner = dest / OWNER
+    """Take `dest` for `run_id`, or find it already this run's. The claim is whole or absent: the
+    owner file is written in a private staging directory, and one rename makes it `dest`. A disk
+    that fills, or a kill, before that rename leaves no `dest`, so the same command can retry
+    (mkdir, then the owner, left an empty directory that refused its own retry). Of two runs only
+    one rename lands: the other finds `dest` holding a claim, and a directory this call did not put
+    there must say it is this run's."""
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.mkdir(mode=0o700)
-    except FileExistsError:
-        try:
-            held_by = owner.read_text().strip()
-        except OSError:
-            held_by = None
-        if held_by != run_id:
-            raise EvidenceError(f"{dest} already exists and holds {'run ' + held_by if held_by else 'no claim by this run'}: "
-                                f"an earlier run's evidence is never overwritten; nothing was copied") from None
+        staging = Path(tempfile.mkdtemp(dir=dest.parent, prefix=f".{dest.name}.claim-"))   # mode 0700
+    except OSError as e:
+        raise EvidenceError(f"the evidence directory {dest} cannot be created: {e}; nothing was claimed, "
+                            f"so the same command can retry") from e
+    try:
+        _write_durably(staging / OWNER, run_id.encode())
+        os.rename(staging, dest)
+        _fsync_dir(dest.parent)
         return
     except OSError as e:
-        raise EvidenceError(f"the evidence directory {dest} cannot be created: {e}") from e
-    _write_durably(owner, run_id.encode())
+        if not os.path.lexists(dest):
+            raise EvidenceError(f"the evidence directory {dest} cannot be claimed: {e}; nothing was claimed, "
+                                f"so the same command can retry") from e
+        # `dest` is there: this run's own earlier claim, or another's; judged below
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    held_by = _held_by(dest)
+    if held_by != run_id:
+        raise EvidenceError(f"{dest} already exists and holds {'run ' + held_by if held_by else 'no claim by this run'}: "
+                            f"an earlier run's evidence is never overwritten; nothing was copied")
+
+
+def _held_by(dest: Path) -> str | None:
+    try:
+        return (dest / OWNER).read_text().strip()
+    except OSError:
+        return None
 
 
 def _write_durably(path: Path, data: bytes) -> None:

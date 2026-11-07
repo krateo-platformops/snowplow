@@ -16,6 +16,7 @@ it for the arms that judge the refusal itself.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -235,6 +236,33 @@ def test_a_copy_that_lands_wrong_is_caught_before_a_manifest_says_it_landed(tmp_
     assert not (dest / evidence.MANIFEST).exists()
 
 
+def test_a_disk_full_at_the_claim_leaves_no_claim_and_the_same_command_retries(tmp_path, monkeypatch, capsys):
+    """The review's blocker 1: the disk fills at the publish's very first write, the claim. The
+    printed retry must work once there is space, and so must the publish after gke-down. A claim
+    made by mkdir and then its owner file left an empty, ownerless directory that refused it."""
+    real_fsync, calls = os.fsync, []
+
+    def full_once(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", full_once)
+    src = _run_dir(tmp_path)
+    dest = tmp_path / "evidence" / "r"
+    args = ["publish", "--src", str(src), "--dest", str(dest), "--run-id", "id-1", "--stage", "before-teardown"]
+    assert evidence.main(args) == 1                       # a message, not a traceback
+    err = capsys.readouterr().err
+    assert "No space left on device" in err and "same command can retry" in err
+    assert not os.path.lexists(dest)                      # no half claim
+    assert os.listdir(dest.parent) == []                  # and no staging left beside it
+    assert evidence.main(args) == 0                       # the same command, the space back
+    assert evidence.verify(dest, "before-teardown") == []
+    assert evidence.main(args[:-1] + ["final"]) == 0      # and the publish after gke-down
+    assert evidence.verify(dest, "final") == []
+
+
 def test_a_required_file_the_run_does_not_hold_fails_the_publish(tmp_path):
     src = _run_dir(tmp_path, {"run.log": b"log"})
     dest = tmp_path / "evidence" / "r"
@@ -410,6 +438,42 @@ def test_a_failed_copy_is_loud_is_not_success_and_the_cluster_still_goes(harness
     assert "cluster " + RUN_NAME + " deleted (gke-down OK)" in log
 
 
+@needs_permissions
+def test_a_copy_that_fails_before_teardown_and_succeeds_after_is_still_not_success(harness, run_trees):  # noqa: F811
+    """The evidence was not safe when the cluster went: that is the run's outcome, even though the
+    publish after gke-down then lands it whole. Only the first stage's exit says so."""
+    env, state, _, tmp = harness
+    root = run_trees[1] / "606"
+    root.mkdir(parents=True)
+    try:
+        p = _run606(env, FAKE_AT_CREATE=f'chmod 500 "{root}"', FAKE_AT_DELETE=f'chmod 700 "{root}"')
+    finally:
+        root.chmod(0o700)
+    assert p.returncode == 1, p.stderr[-2000:]
+    log = (tmp / "out" / "run.log").read_text()
+    assert "EVIDENCE NOT SAFE (before-teardown" in log and "EVIDENCE NOT SAFE (final" not in log
+    assert "evidence safe: " in log                     # the retry after gke-down worked: no half claim
+    assert evidence.verify(root / RUN_NAME, "final") == []
+
+
+@needs_permissions
+def test_a_copy_that_succeeds_before_teardown_and_fails_after_is_not_success(harness, run_trees):  # noqa: F811
+    """The mirror: the record of the teardown itself could not be kept. Only the second stage's
+    exit says so."""
+    env, state, _, tmp = harness
+    dest = run_trees[1] / "606" / RUN_NAME
+    try:
+        p = _run606(env, FAKE_AT_DELETE=f'chmod 500 "{dest}"')
+    finally:
+        if dest.exists():
+            dest.chmod(0o700)
+    assert p.returncode == 1, p.stderr[-2000:]
+    log = (tmp / "out" / "run.log").read_text()
+    assert "EVIDENCE NOT SAFE (final" in log and "EVIDENCE NOT SAFE (before-teardown" not in log
+    assert "evidence safe: " not in log
+    assert evidence.verify(dest, "before-teardown") == []
+
+
 def test_a_copy_that_never_returns_is_stopped_at_its_cap_and_never_holds_the_delete(harness):  # noqa: F811
     env, state, _, tmp = harness
     p = _run606(env, BENCH_606_HOLD_IN="evidence", EVIDENCE_CAP_S="2")       # the hold is 600 s, past _run606's bound
@@ -447,8 +511,11 @@ def test_a_signal_in_the_teardown_does_not_cost_the_evidence(harness, run_trees)
     assert evidence.verify(run_trees[1] / "606" / RUN_NAME, "final") == []
 
 
-def test_a_signal_during_the_copy_does_not_stop_the_copy(harness, run_trees):  # noqa: F811
-    """A terminal's Ctrl-C reaches the whole process group: the copy is shielded like gke-down."""
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP], ids=["TERM", "HUP"])
+def test_a_signal_during_the_copy_does_not_stop_the_copy(harness, run_trees, sig):  # noqa: F811
+    """A TERM or a HUP to the whole process group (a closed terminal, a `kill` of the group): the
+    copy is shielded like gke-down. Not SIGINT: bash already ignores it in a background job, so an
+    INT arm passes with the shield gone (the review's mutation)."""
     env, state, _, tmp = harness
     log_p = tmp / "out" / "run.log"
     with open(tmp / "console", "w") as fh:
@@ -460,7 +527,7 @@ def test_a_signal_during_the_copy_does_not_stop_the_copy(harness, run_trees):  #
             time.sleep(0.1)
         assert p.poll() is None
         time.sleep(1)
-        os.killpg(p.pid, signal.SIGINT)
+        os.killpg(p.pid, sig)
         p.wait(timeout=240)
     log = log_p.read_text()
     assert "EVIDENCE NOT SAFE" not in log, log[-2000:]
@@ -476,6 +543,41 @@ def test_a_verdict_the_run_reached_and_then_lost_is_not_safe(harness):  # noqa: 
     log = (tmp / "out" / "run.log").read_text()
     assert "verdict.json: required" in log and "EVIDENCE NOT SAFE (before-teardown" in log
     assert "evidence safe: " not in log
+
+
+# The step a stopped collect is: commands run one after another, so when one dies the next starts.
+# `kill` is wrapped to wait GAP_S after each TERM, which widens exactly the gap a parent has between
+# its child dying and its own TERM arriving (the review's harness). halt_tree is run606.sh's own,
+# read from the script.
+_HALT_HARNESS = r"""
+set -u
+%(halt_tree)s
+kill() { builtin kill "$@"; local rc=$?; [[ "$1" == "-TERM" ]] && sleep "$GAP_S"; return $rc; }
+%(step)s
+( set +e; step ) &
+pid=$!
+sleep 1                      # the step's first command is running
+halt_tree "$pid"
+wait "$pid" 2>/dev/null
+sleep 1
+if pgrep -f "sleep $TOKEN" >/dev/null; then echo SURVIVED; pkill -f "sleep $TOKEN"; else echo CLEAN; fi
+"""
+_STEPS = {
+    "loop": 'step() { while :; do sleep "$TOKEN"; done; }',
+    "nested": 'step() { ( while :; do sleep "$TOKEN"; done ); }',
+    "python": 'step() { python3 -c "import subprocess, sys\nwhile True: subprocess.run([\'sleep\', sys.argv[1]])" "$TOKEN"; }',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_STEPS))
+def test_halt_tree_stops_a_step_before_it_can_start_its_next_command(shape):
+    src = (BENCH_DIR / "run606.sh").read_text()
+    m = re.search(r"^halt_tree\(\) \{\n.*?^\}\n", src, re.S | re.M)
+    assert m, "run606.sh defines halt_tree"
+    token = f"{700 + os.getpid() % 200}.{abs(hash(shape)) % 100000}"
+    p = subprocess.run(["bash", "-c", _HALT_HARNESS % {"halt_tree": m.group(0), "step": _STEPS[shape]}],
+                       env=dict(os.environ, TOKEN=token, GAP_S="1"), capture_output=True, text=True, timeout=120)
+    assert p.stdout.strip() == "CLEAN", (p.stdout, p.stderr[-2000:])
 
 
 def test_an_out_left_by_an_earlier_run_is_refused_before_any_cloud_call(harness):  # noqa: F811
@@ -628,6 +730,29 @@ def test_a_pair_whose_own_copy_failed_exits_5_whatever_the_verdict_says(pairbed,
     log = (tmp / "pair" / "pair.log").read_text()
     assert "EVIDENCE NOT SAFE (pair)" in log and "the pair is NOT finished" in log
     assert evidence.verify(dest, "final")
+
+
+@needs_permissions
+def test_a_pair_that_cannot_publish_its_record_starts_nothing(pairbed, va, run_trees):  # noqa: F811
+    """The preflight passed; by the time pair.json exists, its evidence directory cannot be written.
+    Refused there: no run starts, so no cluster is made for a pair with no record."""
+    repo, fake, env, tmp = pairbed
+    _verdicts(fake, va)
+    root = run_trees[1] / "606"
+    s = (repo / "run606.sh").read_text()
+    a = 'if [[ "${BENCH_606_DRY_RUN:-0}" == "1" ]]; then\n'
+    assert s.count(a) == 1
+    (repo / "run606.sh").write_text(s.replace(a, a + f'  chmod 500 "{root}"\n'))
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "full"], cwd=repo,
+                   check=True, capture_output=True)
+    try:
+        p = _launch(repo, env)
+    finally:
+        root.chmod(0o700)
+    assert p.returncode == 2, p.stderr[-3000:]
+    assert "the pair's evidence could not be published" in p.stderr and "nothing was created" in p.stderr
+    calls = (fake / "calls").read_text()
+    assert " dry=1 " in calls and " dry=0 " not in calls
 
 
 def test_a_pair_whose_run_published_nothing_exits_5(pairbed, va):  # noqa: F811
