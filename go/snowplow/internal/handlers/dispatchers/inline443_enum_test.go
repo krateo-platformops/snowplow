@@ -245,7 +245,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"RestartStaleServeClock":    unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "ExternalTouchedSink.BumpThirdParty": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "RequesterCredentialFor": readOnly443, "ExternalTouchedSink.BumpThirdParty": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
 	// #988 — pure ctx value read / stamp of the fall-through reason the wire
