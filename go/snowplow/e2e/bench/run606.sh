@@ -1984,8 +1984,10 @@ stop_log_stream() {
   pid="$(cat "$LOG_STREAM_PIDFILE")"
   rm -f "$LOG_STREAM_PIDFILE"      # first: no later caller (teardown) kills this PID again
   touch "$OUT/.log-stream-stop"
-  pkill -TERM -P "$pid" 2>/dev/null || true
-  kill "$pid" 2>/dev/null || true
+  # #1249: the loop frozen before its children are signalled. A child's TERM, then the loop's,
+  # left a gap in which the loop, past its stop check, forked its next `sleep` (or its next
+  # kubectl): orphaned, it ran on after the run, on the operator's machine (CI's run 42413356862)
+  halt_tree "$pid"
   wait "$pid" 2>/dev/null || true
 }
 s_collect() {
