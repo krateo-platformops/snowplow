@@ -527,28 +527,79 @@ stage** with `InvalidPath` and a 400 under the stage's `errorKey`; without
 
 | `E` is… | renders | |
 |---|---|---|
-| `null` or missing | nothing: the template's own text stays, as with jq's `+ null` | `"/a/" + segments(.p) + "/z"` → `/a//z`; `segments(.p) + "/z"` → `/z` |
-| `""` | nothing, the same as `null` | |
-| `a//b` | `a//b`: an empty piece inside the value is kept | a stage that dials this cluster still refuses `/namespaces//` |
+| `null`, missing or `""` | refused: one empty piece is an empty segment | `"/" + segments(.p)` and `"/a/" + segments(.p) + "/z"` make no call |
+| `a//b`, `a/` or `/` | refused: every piece is one segment, so an empty piece is an empty segment | |
+| `/a/b` where it opens the path | `/a/b`: that leading `/` is the root, not an empty piece | `${ segments(.path) }`. After other text it is an empty piece: `"/x/" + segments(.p)` is refused |
 | a number, boolean, array or object | a template error: nothing is sent, the stage fails with `TemplateError` | convert it yourself: `segments(.n \| tostring)` |
 
 `segments()` in the query is refused for every `E`, `null` included.
 
+**An expression that leaves a path segment empty makes no call.** `"/v2/tickets/"
++ .id` with `.id` empty, null or missing would name the collection, not one
+ticket, and a write there could reach every ticket. So it is refused, on every
+verb, for a stage with an `endpointRef` and for one that dials this cluster
+alike. It doesn't matter where the empty comes from: a value, an `if` branch, or
+a literal `""`.
+
+| With `.x` empty, null or missing | |
+|---|---|
+| `"/a/" + .x`, `"/a/" + .x + "/z"`, `"/" + .x + "/z"`, `.x + "/z"` | refused: the segment holds nothing |
+| `"/a/" + .x + "?q=1"` | refused: the path ends at the `?` |
+| `"/a/" + .x + "-b"`, `"/a" + .x` | sent: the segment has other text, so `.x` is empty *inside* it |
+| `"/a?q=" + .x` | sent: a query value is not a segment |
+| `"/a/\(.x)"` with `.x` null | sent as `/a/null`: jq's interpolation of null is the text `null`. `""` is refused |
+| `"/a/" + (if (.x // "") == "" then "" else .x end)` | refused: the `""` branch leaves the segment after `/a/` empty |
+| `(if (.x // "") == "" then "/a/" else "/a/" + .x end)` | refused: the `/` is in the branch, and the segment after it is still empty |
+| `"/a" + (if (.x // "") == "" then "" else "/" + .x end)` | sent as `/a`: the `/` is inside the branch, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "/z"` | sent as `/z`: nothing comes before the path's first `/`, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "?q=1"`, the same with `"/"` or `"/?q=1"`, `"" + "/"` | refused: no path follows the root, so the request would read the endpoint's root |
+| `(if (.x // "") == "" then null else "/" + .x end) + "/z"` | refused: `null` is a value, not your text, so write `""` here |
+
+The rule asks whether an expression contributed to a segment and left it empty,
+not what the rendered text looks like. An expression is a value, the text of an
+`if` branch, or a literal `""`, which writes nothing. A `/` or a `//` in a string
+literal outside an `if` is your own text: this rule neither refuses nor excuses
+it, and the checks every literal path goes through still apply (a stage that
+dials this cluster refuses a `//`, and a write that ends in `/`). The same text
+in an `if` branch counts as that branch's, so `(if .c then "/a//b" else "/c" end)`
+is refused when the branch is taken.
+
+A value of spaces is not empty: it renders `%20`, one segment. A stage that
+dials this cluster refuses it like any other escape, and a named endpoint
+receives `/a/%20`. Check for it yourself if it can occur.
+
+**An optional part holds its own `/`.** `segments()` does not make a value
+optional: the `/` before it is your text and stays, so `"/v2/tickets/" +
+segments(.x)` would still name the collection, and an `if` around the value
+alone leaves that `/` behind in the same way. Use one of:
+
+```yaml
+# Put the "/" inside the branch, so that the part is absent as a whole.
+path: ${ "/apis/g/v1/things" + (if (.name // "") == "" then "" else "/" + .name end) }
+```
+
+```yaml
+# Or gate the stage: an iterator with no elements has nothing to call and succeeds.
+dependsOn:
+  iterator: '[ {name: .name} | select((.name // "") != "") ]'
+path: ${ "/apis/g/v1/things/" + .name }
+```
+
 **A template that renders no path makes no call.** `${ segments(.path) }` with
 `.path` null or `""` renders nothing, and so does a template with no output
 (`${ empty }`). Dialling that would read the endpoint's root with the stage's
-credential, so it is refused, on every stage. It fails its stage with
-`InvalidPath` and a 400, and is counted as
-`snowplow_malformed_dial_skipped_total.empty_interp`. A prewarm runs with no
-`extras`, so a stage whose path comes only from `extras` fails there, and
-nothing is stored for it. To make that stage quiet rather than failed, give it
-an iterator that yields no element when the value is absent
-(`[ {path: .path} | select(.path != null) ]`): an iterator with no elements has
-nothing to call and succeeds.
+credential.
+
+Both are refused on every stage. The stage fails with `InvalidPath` and a 400,
+which is the same failure as a refused value above: nothing is stored for it, and
+it is counted as `snowplow_malformed_dial_skipped_total.empty_interp`. A prewarm
+runs with no `extras`, so a stage whose path comes only from `extras` fails
+there. To make that stage quiet rather than failed, gate it with an iterator
+that yields no element when the value is absent.
 
 A stage that has no `path` at all has no template and is unchanged. `${ .path }`
 without `segments()` is one value, and jq's `tostring` of null is the text
-`null`, so write `segments()` for a value that can be absent.
+`null`.
 
 ### `endpointRef` never names a per-user credential
 

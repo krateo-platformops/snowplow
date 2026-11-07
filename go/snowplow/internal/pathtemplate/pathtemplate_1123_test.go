@@ -123,39 +123,40 @@ func TestIssue1123_DeclaredSegments(t *testing.T) {
 		"/apis/apps/v1/deployments%3Fx=/p1s")
 	wantPath(t, `${ segments(.path) }`, map[string]any{"path": "/a/b#c"}, "/a/b%23c")
 	wantRefused(t, `${ "/a?q=" + segments(.path) }`, map[string]any{"path": "b/c"}, ReasonSegmentsInQuery)
-	wantPath(t, `${ "/a/" + segments(.p) + "/z" }`, map[string]any{}, "/a//z")
+	wantRefused(t, `${ "/a/" + segments(.p) + "/z" }`, map[string]any{}, ReasonEmptySegment)
 }
 
 // The edges of segments(E), the contract the portal writes against
 // (howto/restactions.md). The render only: the dial plan's verdict on a path
 // that renders empty is pinned in restactions/api.
 func TestIssue1123_SegmentsEdges(t *testing.T) {
-	// null and "" contribute nothing; the template's own text stays.
+	// null and "" render nothing: a whole path of nothing, or an empty segment
+	// (#1185), which is refused. The template's own text does not save it.
 	for name, data := range map[string]map[string]any{
 		"missing": {},
 		"null":    {"p": nil},
 		"empty":   {"p": ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			wantPath(t, `${ segments(.p) }`, data, "")
-			wantPath(t, `${ "/a/" + segments(.p) }`, data, "/a/")
-			wantPath(t, `${ segments(.p) + "/z" }`, data, "/z")
-			wantPath(t, `${ "/a/" + segments(.p) + "/z" }`, data, "/a//z")
+			wantRefused(t, `${ segments(.p) }`, data, ReasonEmptySegment)
+			wantRefused(t, `${ "/a/" + segments(.p) }`, data, ReasonEmptySegment)
+			wantRefused(t, `${ segments(.p) + "/z" }`, data, ReasonEmptySegment)
+			wantRefused(t, `${ "/a/" + segments(.p) + "/z" }`, data, ReasonEmptySegment)
 			// The query refusal reads the template, so no value escapes it.
 			wantRefused(t, `${ "/a?q=" + segments(.p) }`, data, ReasonSegmentsInQuery)
 			wantRefused(t, `${ "/a#f?q=" + segments(.p) }`, data, ReasonSegmentsInQuery)
 		})
 	}
 
-	// An inner empty piece is kept, and so are the leading and trailing ones.
-	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "a//b"}, "a//b")
-	wantPath(t, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"}, "/x/a//b")
-	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "/a/"}, "/a/")
-	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "//a"}, "//a")
-	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "/"}, "/")
+	// An empty piece is an empty segment, inside or at the end (#1185).
+	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "a//b"}, ReasonEmptySegment)
+	wantRefused(t, `${ "/x/" + segments(.p) }`, map[string]any{"p": "a//b"}, ReasonEmptySegment)
+	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "/a/"}, ReasonEmptySegment)
+	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "//a"}, ReasonEmptySegment)
+	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "/"}, ReasonEmptySegment)
 	// Each piece is still one segment: dots are refused, escapes stay escaped.
 	wantRefused(t, `${ segments(.p) }`, map[string]any{"p": "a//.."}, ReasonDotSegment)
-	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "a//b?c"}, "a//b%3Fc")
+	wantPath(t, `${ segments(.p) }`, map[string]any{"p": "a/b?c"}, "a/b%3Fc")
 
 	// A non-string is a render error, never its tostring. The error carries no
 	// part of the value.
@@ -251,7 +252,7 @@ func TestIssue1123_Variables(t *testing.T) {
 // jq semantics the rewrite must keep.
 func TestIssue1123_JQSemanticsPreserved(t *testing.T) {
 	wantPath(t, `${ "/ns/" + (.namespace // "default") + "/x" }`, map[string]any{}, "/ns/default/x")
-	wantPath(t, `${ "/ns/" + .namespace + "/x" }`, map[string]any{}, "/ns//x") // + null
+	wantPath(t, `${ "/ns" + .namespace + "/x" }`, map[string]any{}, "/ns/x") // + null
 	wantPath(t, `${ "/api/v1/namespaces/demo-system/pods" }`, nil, "/api/v1/namespaces/demo-system/pods")
 	wantPath(t, `/api/v1/namespaces?limit=10`, nil, "/api/v1/namespaces?limit=10") // not a template
 	wantPath(t, `${ "/api/v1/namespaces/" + (.) + "/pods" }`, "kube-system", "/api/v1/namespaces/kube-system/pods")

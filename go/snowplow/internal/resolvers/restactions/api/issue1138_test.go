@@ -143,9 +143,9 @@ func TestIssue1138_C_MalformedDialSkipDebugPathIsRedacted(t *testing.T) {
 	const canary = "qval-canary-zq"
 	api := newX1106Srv(t, false, x1106OK)
 	x1106Env(t, api.srv.URL, map[string]map[string]string{})
-	s := x1106Own("r", http.MethodGet, `${ "/api/v1/namespaces/" + .ns + "/configmaps/cm?token=" + .tok }`)
+	s := x1106Own("r", http.MethodGet, `${ "/api/v1/namespaces//configmaps/cm?token=" + .tok }`)
 	s.Payload, s.Headers = nil, nil
-	o := x1106Resolve(t, map[string]any{"ns": "", "tok": canary}, s)
+	o := x1106Resolve(t, map[string]any{"tok": canary}, s)
 	if n := len(api.all()); n != 0 {
 		t.Fatalf("PRE: the collapsed namespace must not be dialled, %d sent", n)
 	}
