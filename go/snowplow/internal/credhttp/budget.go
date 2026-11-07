@@ -15,7 +15,8 @@ package credhttp
 // endpoint clients, #1101): every connect gives up PageMaxGoal after it starts,
 // whoever started it, instead of client-go's 30 s. A dial is shared — another
 // request may be waiting on it — so it is never cut at one customer's deadline;
-// each waiter stops waiting at its own.
+// each waiter stops waiting at its own. That dialer carries the destination
+// policy (#1131, destination.go).
 //
 // And the retry reserve: how long a fresh connection needs to answer, measured
 // on the attempts that opened one.
@@ -32,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
@@ -48,7 +50,7 @@ type budgetedExchangeKey struct{}
 // through unchanged.
 func BudgetTransport(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	if _, ok := rt.(*budgetTransport); ok {
 		return rt
@@ -276,9 +278,14 @@ var budgetNow = time.Now
 // exactly as cacheable as before (each still has its own explicit Proxy).
 var EndpointDialHolder = &transport.DialHolder{Dial: endpointDial}
 
-// endpointDialFn is the dialer the bound wraps (seamed in tests). KeepAlive is
-// client-go's; the 30 s Timeout is gone: the bound below replaces it.
-var endpointDialFn = (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext
+// endpointDialer is the dialer of every stage endpoint transport snowplow builds.
+// KeepAlive is client-go's; the 30 s Timeout is gone: endpointDial's bound
+// replaces it. Control is the destination policy (#1131): it runs on each
+// address, immediately before the connect.
+var endpointDialer = &net.Dialer{KeepAlive: 30 * time.Second, Control: dialguard.Control}
+
+// endpointDialFn is the dial the bound wraps (seamed in tests).
+var endpointDialFn = endpointDialer.DialContext
 
 // dialNow is the dial clock (seamed in tests).
 var dialNow = time.Now

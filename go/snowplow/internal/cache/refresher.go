@@ -1276,8 +1276,9 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		//
 		// #608 (Q2 ruling) — a NON-RETRYABLE failure (a 403: the apiserver's
 		// authorization decision for this identity, refused identically at
-		// every backoff step) skips the budget and reaches this same drop point
-		// on its first attempt, where it is never evicted either (#547).
+		// every backoff step; #1131: a destination the policy refuses) skips the
+		// budget and reaches this same drop point on its first attempt, where it
+		// is never evicted either (#547).
 		nonRetryable := IsNonRetryableRefreshError(err)
 		if nonRetryable || q.NumRequeues(key) >= maxRefreshRequeues {
 			q.Forget(key)
