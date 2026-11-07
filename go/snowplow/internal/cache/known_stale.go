@@ -147,12 +147,29 @@ type revalSlot struct {
 	mu       sync.Mutex
 	rerun    bool // a read was absorbed into the attempt in flight
 	released bool // the slot left the map; an absorber claims a fresh one
+	// claim orders the slot against dequeues (#1232): a dequeue that began its
+	// work before the slot was claimed did not run its attempt, and does not
+	// settle it.
+	claim uint64
 	// done is closed when the slot is released (#740): a stale-retry attempt
 	// that joined an attempt in flight waits on it.
 	done chan struct{}
 }
 
-func newRevalSlot() *revalSlot { return &revalSlot{done: make(chan struct{})} }
+func newRevalSlot() *revalSlot {
+	return &revalSlot{done: make(chan struct{}), claim: revalClaims.Add(1)}
+}
+
+// revalClaims numbers revalidation slot claims, process-wide (#1232).
+var revalClaims atomic.Uint64
+
+// revalClaimsSoFar is the claim number a dequeue records when it begins its
+// work: a slot numbered above it was claimed afterwards.
+func revalClaimsSoFar() uint64 { return revalClaims.Load() }
+
+// anyClaim settles a slot whatever its claim number: the demand path settles
+// the slot of the attempt it ran itself.
+const anyClaim = ^uint64(0)
 
 // revalSlotDone returns the done channel of key's slot in m, if one is held.
 func revalSlotDone(m *sync.Map, key string) (<-chan struct{}, bool) {
@@ -191,7 +208,7 @@ func claimRevalSlot(m *sync.Map, key string) bool {
 // and the caller re-runs at once. Otherwise the slot is released. held: there
 // was a slot to settle. #884 — a demand attempt whose Put was accepted may not
 // rerun: that attempt is the successful refresh.
-func settleRevalSlot(m *sync.Map, key string, mayRerun bool) (held, rerun bool) {
+func settleRevalSlot(m *sync.Map, key string, mayRerun bool, claimedBy uint64) (held, rerun bool) {
 	v, ok := m.Load(key)
 	if !ok {
 		return false, false
@@ -199,6 +216,12 @@ func settleRevalSlot(m *sync.Map, key string, mayRerun bool) (held, rerun bool) 
 	s := v.(*revalSlot)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.claim > claimedBy {
+		// #1232 — claimed after the settling dequeue began its work: that
+		// dequeue did not run this slot's attempt. The claim enqueued its key,
+		// so the dequeue that does run it settles it.
+		return false, false
+	}
 	if s.rerun && mayRerun {
 		if _, _, still := KnownStale(key); still {
 			s.rerun = false
@@ -412,8 +435,11 @@ func (r *refresher) enqueueRevalidation(key string) {
 // attempt while the key is still known-stale earns one rerun (#740): the slot
 // stays claimed and the key is re-queued at once — the workqueue re-adds it
 // after this dequeue's Done.
-func settleBackgroundRevalidation(key string, dur time.Duration) {
-	held, rerun := settleRevalSlot(&bgRevalidationInflight, key, true)
+//
+// #1232 — claimedBy is the claim number the dequeue recorded when it began its
+// work. A slot claimed after that belongs to a later dequeue, and is left to it.
+func settleBackgroundRevalidation(key string, dur time.Duration, claimedBy uint64) {
+	held, rerun := settleRevalSlot(&bgRevalidationInflight, key, true, claimedBy)
 	if !held {
 		return
 	}
@@ -513,7 +539,7 @@ func BeginDemandRevalidation(ctx context.Context, key string, t0 time.Time) (con
 				knownStaleRevalidationFail.Add(1)
 			}
 			out.Refused = o.refused.Load()
-			_, out.Rerun = settleRevalSlot(&demandInflight, key, !accepted)
+			_, out.Rerun = settleRevalSlot(&demandInflight, key, !accepted, anyClaim)
 			if out.Rerun {
 				knownStaleRevalidationRerun[revalSlotDemand].Add(1)
 			}
