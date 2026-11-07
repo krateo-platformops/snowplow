@@ -10,6 +10,11 @@
 // then TTL-evicted and re-fetched. Correctness basis shifts from dep-edge
 // invalidation to time-bounded staleness (design §2).
 //
+// ONLY A THIRD-PARTY TOUCH QUALIFIES (#1221): the decline is inverted only when
+// every touch carried nothing of the requester (PutVerdict.WithExternalTTL). The
+// annotation is a request, not a guarantee: a widget whose resolve dialled as the
+// requester stays declined whatever it says.
+//
 // GENERAL, NOT a widget special-case (feedback_no_special_cases): any widget
 // owner opts in by annotating; snowplow hard-codes no `obs-*` name. The portal
 // chart sets the annotation on the obs-* widget CR templates.
