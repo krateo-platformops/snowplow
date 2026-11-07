@@ -268,9 +268,14 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// allows one and refuses the other. So it marks the resolve as dialled by
 	// the requester, exactly as a stage's dial does (resolve.go), and every Put
 	// gate declines it. Marked BEFORE the dial, so a failed read still counts.
-	// Never a third-party touch: the credential is the requester's. An internal
-	// driver's read (the ServiceAccount's) is not marked here; the SA re-gate
-	// below answers for it.
+	// Never a third-party touch: the credential is the requester's.
+	//
+	// An internal driver's read is not marked here. A plain ServiceAccount read
+	// is re-gated below against the same snapshot that made the key, which only
+	// lacks bindings, so it cannot carry one identity's view to another. An
+	// IMPERSONATED read (the refresher's, #574) is not re-gated (MustRegateSADial
+	// skips it) and is not marked either: it can store the representative's view
+	// in a shared cell on a partial snapshot. That route is #1233, fixed apart.
 	if cache.RequesterCredentialFor(ctx) {
 		cache.ExternalTouchedSinkFromContext(ctx).Bump()
 		res.RequesterDialled = true

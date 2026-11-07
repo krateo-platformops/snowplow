@@ -358,6 +358,7 @@ func TestRequesterRead_OnACompleteSnapshotEachGetsTheirOwnAnswer(t *testing.T) {
 // The dispatched CR's own fetch runs before the sinks exist, so it marks them
 // through objects.Result. Driven through the fetch seam: the result is what
 // objects.getFromAPIServer returns for a read under the requester's credential.
+// The RESTAction handler's twin is TestRequesterRead_TheDispatchedRESTActionsOwnFetchMarksThePut.
 func TestRequesterRead_TheDispatchedCRsOwnFetchMarksThePut(t *testing.T) {
 	for _, dialled := range []bool{true, false} {
 		name := "fetched_in_snowplow"
@@ -382,6 +383,41 @@ func TestRequesterRead_TheDispatchedCRsOwnFetchMarksThePut(t *testing.T) {
 			_, resident := e.store.GetNoTouch(e.key(e.aliceCtx))
 			if resident == dialled {
 				t.Fatalf("RED: a dispatched CR fetched under the requester's credential=%v left the cell resident=%v", dialled, resident)
+			}
+		})
+	}
+}
+
+// The RESTAction handler fetches its CR before its sinks exist too (restactions.go),
+// and marks them from objects.Result the same way.
+func TestRequesterRead_TheDispatchedRESTActionsOwnFetchMarksThePut(t *testing.T) {
+	for _, dialled := range []bool{true, false} {
+		name := "fetched_in_snowplow"
+		if dialled {
+			name = "fetched_under_the_requester"
+		}
+		t.Run(name, func(t *testing.T) {
+			k423Env(t)
+			a := psArm{name: "restaction_fetch", target: psConfigmapsGVR, watchShape: true}
+			ra := k1221RA()
+			ra.Object["spec"].(map[string]any)["filter"] = `{value: "` + rrfContent + `"}`
+			psBuildWatcher(t, a, runtime.Object(ra))
+			srv := k1221Apiserver(t, a, &k1221Wire{})
+			psSeedClientconfigs(t, srv.URL)
+			ctx := psUserCtx(a, psAlice)
+			restore := setFetchObjectForTest(func(*http.Request) objects.Result {
+				return objects.Result{GVR: h1RAGVR, Unstructured: ra.DeepCopy(), RequesterDialled: dialled}
+			})
+			defer restore()
+			h := &restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: srv.URL}}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("GET", "/call", nil).WithContext(ctx))
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), rrfContent) {
+				t.Fatalf("PRECONDITION: alice must get the RESTAction's content (code=%d body=%s)", rec.Code, psTrunc(rec.Body.String(), 300))
+			}
+			key, _ := k423RAKey(t, ctx)
+			if _, resident := cache.ResolvedCache().GetNoTouch(key); resident == dialled {
+				t.Fatalf("RED: a dispatched RESTAction fetched under the requester's credential=%v left its cell resident=%v", dialled, resident)
 			}
 		})
 	}
