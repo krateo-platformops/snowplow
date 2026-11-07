@@ -376,7 +376,7 @@ func TestS394_BootSeed_LRUEvictionDuringResolve_StillPlainPuts(t *testing.T) {
 		t.Fatalf("#394 arm 3 RED (boot over-refused): the boot widget seed did not plain-Put into the LRU-evicted "+
 			"cell (present=%v body=%q). Boot is pre-readyz and exempt (#323) — guarding it leaves boot cells cold.", ok, body)
 	}
-	if err := seedOneRestaction(cctx, "cohort-s394", s394RARef(), h1NS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cctx, s394RARef(), h1NS, seedModeBoot); err != nil {
 		t.Fatalf("boot seedOneRestaction returned %v; want nil (boot never refuses)", err)
 	}
 	if body, ok := s394Body(handle, raKey); !ok || !strings.Contains(body, "ra-resolve-1") {

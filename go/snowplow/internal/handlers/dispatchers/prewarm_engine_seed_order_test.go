@@ -45,7 +45,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // ── recorder: ordered (class,label,identity) seed events ────────────────────
@@ -223,7 +222,7 @@ func TestF3bR2_NavOrderFlatSeedOrder(t *testing.T) {
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
 	prevR := seedOneRestactionFn
-	seedOneRestactionFn = func(ctx context.Context, _ redact.Label, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+	seedOneRestactionFn = func(ctx context.Context, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 		rec.record("restaction", ref.Name, eIdentityLabel(ctx))
 		return nil
 	}

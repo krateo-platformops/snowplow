@@ -88,7 +88,9 @@ func TestIssue1106_RefusesEveryHopToAnotherOrigin(t *testing.T) {
 
 // The hop is refused WHATEVER its headers: a stage may carry a credential in
 // any header (X-Api-Key, X-Auth-Token, PRIVATE-TOKEN), which net/http keeps on
-// a cross-host redirect.
+// a cross-host redirect. plumbing's redirect guard strips Authorization alone
+// (#1135), so the last header is a deliberately odd name: nothing in the stack
+// strips it by name, so only the refused hop can keep it from the other host.
 func TestIssue1106_SendRefusesACrossOriginHopCarryingAnyHeader(t *testing.T) {
 	var otherHits []http.Header
 	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -99,7 +101,7 @@ func TestIssue1106_SendRefusesACrossOriginHopCarryingAnyHeader(t *testing.T) {
 		http.Redirect(w, r, strings.Replace(other.URL, "127.0.0.1", "localhost", 1)+"/stolen", http.StatusFound)
 	}))
 	t.Cleanup(api.Close)
-	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "Private-Token"} {
+	for _, h := range []string{"X-Api-Key", "X-Auth-Token", "Private-Token", "X-Zq7-Tenant-Cred"} {
 		req, _ := http.NewRequest(http.MethodGet, api.URL+"/x", nil)
 		req.Header.Set(h, "KEY-canary")
 		resp, err := Send(SendSiteStage, &http.Client{}, req)

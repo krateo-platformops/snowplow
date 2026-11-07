@@ -424,6 +424,46 @@ branch and bumps `completed_total` too — so raw `completed/s` **over-estimates
 dequeue read no longer contaminates `miss_total`, so `miss_total` is miss-neutral and the
 refresher's own skip counter is the independent, #376-surviving source.
 
+### Egress connections: opened and handed over (#847)
+Defined in `internal/credhttp/connections.go`. Cache-gated expvar `snowplow_egress_connections` (`{"<egress>": {"<protocol>": {"opened": n, "handovers": n}}}`), mirrored to OTLP as `snowplow_egress_connections_opened_total` and `snowplow_egress_connection_handovers_total`, both with attributes `egress` and `protocol`, hand-wired in `metrics.go`. All 12 cells exist from the start.
+
+**Read the share `1 - opened / handovers`, per egress and protocol, over a whole phase, not a latency:** a latency moves with load. A new connection costs a TCP connect and, on https, a TLS handshake.
+
+**The share holds still under load only while the requests in flight on one pool stay at or under its idle cap.** The cap is per host: 25 on a kept stage client (client-go's `MaxIdleConnsPerHost`), and `net/http`'s default of 2 on `authn` and `rum_forward`, which are serial. Past the cap, a connection that comes free with the idle slots full is closed and the next request opens another. `opened` counts them all, as it should, but that drop is load and not reuse being lost. A toolchain that changes latency changes what is in flight, so a pair read past the cap can show a change the toolchain's reuse did not cause. Compare phases that stayed under the cap, or say that they did not. Measured on loopback at a cap of 25 with nothing but concurrency changing: 100.00% at up to 24 in flight, about 99.6% at 32, 98.9% at 48 and 96.5–97.4% at 96. With 5% of bodies closed unread, loopback pairs from Go 1.26 to Go 1.27 gained 4.75–7.83 points at up to 24 in flight and 5.16–23.38 past it. Those are readings, not bounds: the gain depends on dial time, and it can exceed the early-close rate even at the cap, because one lost connection can trigger several dials. So a pair read past the cap can overstate the bump as well.
+
+| counter | one count is |
+|---|---|
+| `opened` | a connection that came up: TCP connected on `http://`, TLS handshake finished on `https://`. It equals what the servers accepted, however concurrent the pool. A dial that fails or is given up before it is up does not count. One that comes up after its request left does, used or not: the cost is paid |
+| `handovers` | a request handed a connection, new or pooled. One per HTTP/2 stream. A retry and a redirect hop take one each, and a request `net/http` retries by itself after a pooled connection turned out dead takes two |
+
+**Why not `GotConnInfo.Reused`.** It does not say a connection has carried a request before. A dial whose waiter was served by something else parks its connection in the idle pool, and `net/http` marks it reused there, before its first request. That is how a lost connection is normally replaced on a busy pool, so on a concurrent pool most new connections read as reused. Dials are read at the dial instead.
+
+| label | values | meaning |
+|---|---|---|
+| `egress` | `stage`, `call` | the RESTAction branch-E fetch and the `/call` passthrough: every request through `credhttp.Send`, a write included. A stage that reads through a `*rest.Config` instead counts under `apiserver` |
+| | `apiserver` | every client-go client (every `*rest.Config` `credhttp.Harden` returned) |
+| | `authn`, `rum_forward` | the authn login and the browser-span forwarder |
+| | `other` | a name outside the set. No caller sends one, so anything here is a bug. It keeps the set closed |
+| `protocol` | `http1`, `http2` | what the connection negotiated. One egress can carry both: a stage reaches the apiserver over HTTP/2 and an in-cluster `http://` service over HTTP/1 |
+
+No label carries a host, a path, an identity or a status. The three OTLP exporters (metrics, traces, logs) build their own clients and are not counted. One shape overcounts: an `https://` request through an `https://` proxy does two TLS handshakes on one connection, and each counts as opened, under the protocol that handshake negotiated. So an HTTP/2 target through such a proxy also adds the proxy's handshake to the `http1` cell, with no handover to go with it. Through a forward proxy, `opened` counts snowplow's connections to the proxy, not the proxy's onward ones. An interval can read more `opened` than `handovers`, when dials land after the requests that started them have finished.
+
+Reading it across Go 1.27. From Go 1.27 the transport drains an HTTP/1 body closed before its end, in the background, up to 256 KiB or 50 ms, and keeps the connection, so a cell can only move if something in it closes a body early and then sends again on the same client:
+
+| cell | across the bump | why |
+|---|---|---|
+| `stage/http1` | **the one that moves**, by as much as its non-2xx answers allow | a retried 5xx or 429 has its body closed unread, and a non-2xx body is read only to 2048 bytes. An all-2xx workload reads every body whole, and this cell stays flat |
+| `call/http1` | moves only through a retry inside one call | the early closes are here too (a refused 3xx, a wrong content type, the 2048-byte cap), but `credhttp.Do` builds a client per call, so the next `/call` opens a connection anyway. The share is near 0 on any toolchain, which is the transport's doing |
+| `authn/http1` | flat | every body is read whole |
+| `rum_forward/http1` | flat unless a collector answers over 64 KiB | bodies are read up to 64 KiB |
+| `apiserver/http1` | empty, unless a client-go target is plain `http://` | client-go negotiates HTTP/2 with every apiserver |
+| every `http2` cell | flat, so `apiserver/http2` is the control of a paired run | the drain is HTTP/1 only, and HTTP/2 keeps its connection anyway. On Go 1.27 client-go's HTTP/2 runs on a different implementation, so read this control instead of assuming it |
+| `other` | always 0 | no caller sends a name outside the set |
+
+A body over 256 KiB, or a request sent before the drain ends, still takes a new connection, so a share below 100% is not by itself a defect.
+
+**A paired run confirms the bump only if `stage/http1` carries early closes:** a retried 5xx or 429 with a body, or a non-2xx body over 2048 bytes. A body read to its end never reaches the drain, so with no early closes the share reads 100.00% whether the drain works or is dead, and a flat reading on an all-2xx run is not evidence either way. Retried answers show in `snowplow_endpoint_retries_total{site="stage",cause=~"status_5xx|status_429"}`, though that counter has no protocol label and also counts retries on HTTP/2, and nothing counts non-2xx bodies over the cap. Check the run has some before reading the cell. No test sees a drain that fails only some of the time: `TestConnections847_DrainKeepsNearlyEveryConnection` catches about half failing, and it only runs on a Go 1.27 toolchain.
+
 ### Customer resolve-path in-flight (#386 M3)
 Defined in `internal/handlers/dispatchers/customer_inflight_metrics.go`.
 
@@ -554,7 +594,7 @@ match what the producers write.
 | `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{stat → value}` derived from the `CRDDiscoveryStats` tags (1.12.6 C7); mirrored to OTLP as `snowplow_crd_discovery{stat}`. Per-stat table below | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** |
 | `snowplow_crd_schema_memo_hits_total` / `_misses_total` / `_stale_dropped_total` / `_invalidations_total` (`internal/resolvers/crds/schema/schema_cache_metrics.go`) | compiled-CRD-schema memo counters | high hit ratio warm; stale-drops expected under concurrent CRD install |
 | `snowplow_sa_discovery_builds_total` / `_invalidations_total` / `_fallbacks_total` / `_impersonated_rejected_total` (`internal/dynamic/cached_client_metrics.go`) | SA-discovery client lifecycle; `impersonated_rejected` = an impersonating config refused by the SA singleton (#608) | fallbacks low; climb = discovery degrading; builds ~1 per process and `impersonated_rejected` 0 — non-zero is the #608 signature |
-| `snowplow_refresh_failed_by_class` (expvar map `<err_class>/<stage>`, `internal/cache/refresher_metrics.go`) / OTLP `snowplow_refresh_failed{err_class,stage}` | refresh failures by closed-set class (`forbidden`, `unauthorized`, `not_found`, `timeout`, `unavailable`, `schema_invalid`, `discovery`, `jq`, `unclassified`) and resolve stage (`apiref`, `widget_data`, `resources_refs`, `validate`, `refetch` (the refresher's re-fetch of the cell's own CR, #630), `none`) (#608) | alert on `unclassified` > 0 and on `forbidden`/`validate` > 0 |
+| `snowplow_refresh_failed_by_class` (expvar map `<err_class>/<stage>`, `internal/cache/refresher_metrics.go`) / OTLP `snowplow_refresh_failed{err_class,stage}` | refresh failures by closed-set class (`forbidden`, `unauthorized`, `not_found`, `timeout`, `unavailable`, `schema_invalid`, `discovery`, `jq`, `destination_refused`, `unclassified`) and resolve stage (`apiref`, `widget_data`, `resources_refs`, `validate`, `refetch` (the refresher's re-fetch of the cell's own CR, #630), `none`) (#608) | alert on `unclassified` > 0 and on `forbidden`/`validate` > 0 |
 | `snowplow_discovery` (`internal/dynamic/partial_discovery.go`, #517) | `{total, partial_total, fatal_total, failed_groups:[…]}` for `Client.Discover` (the `GET /list` discovery). `partial_total` counts PARTIAL discoveries honoured as degraded (one or more API group/versions failed, the healthy groups were still served); `fatal_total` counts the calls `/list` answers 500 for; `failed_groups` names the group/versions of the most recent degradation. NOT gated on `CACHE_ENABLED` — `/list` performs discovery either way | `partial_total`/`fatal_total` **0** while `total > 0` = healthy. `total == 0` means no `/list` traffic, NOT health — always read the pair. A climbing `partial_total` with a group named in `failed_groups` = a stale aggregated APIService: `/list` is serving a SHORTER list than the cluster has |
 
 #### `snowplow_informer_watch` stats
@@ -1412,8 +1452,17 @@ integration contract they implement is `docs/howto-frontend-live-refresh-sse.md`
 
 ## Key `slog` events
 
-JSON structured logs on stdout. Message strings are stable, dotted, and greppable. The
-operator-notable ones:
+JSON structured logs on stdout. Message strings are stable, dotted, and greppable.
+
+**No line carries a user name or groups, in clear or as a label** (#1192). The audit record is
+the one place that stores identity: to find who hit an error, join the line's trace id to the
+audit record. `internal/redact`'s guard fails on an identity attribute, and the log handler
+takes the identity out of the forms the apiserver and authn write in the text of an error.
+The routes this doesn't cover, such as klog, are listed in #1223. A service account's name
+isn't identity here and stays in error text, and `key_hash` stays on lines (Diego's ruling on
+#1199).
+
+The operator-notable events:
 
 | Event (message) | Level | Site | What it tells an operator |
 |---|---|---|---|

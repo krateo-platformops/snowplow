@@ -307,7 +307,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
   `Skipped`, `NotRun` (the resolve stopped before this stage),
   `StageNotExecuted` (a dry run), and for a write stage snowplow refused to
   send (#1112) `InvalidPath`, `TemplateError` or `NotSent` (see "A write
-  that is not sent fails" below). `dependsOn` is set on a `Skipped` row.
+  that is not sent fails" below), and `DestinationRefused` for an endpoint
+  address snowplow refuses to dial (see "Which addresses an endpoint can
+  dial" below). `dependsOn` is set on a `Skipped` row.
 - A resolve that runs no stage at all (its `dependsOn` graph names a stage
   that does not exist or has a cycle) answers a resolve-level row
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
@@ -405,6 +407,50 @@ redirect. A redirect within the endpoint's own origin is followed. A stage
 with no `endpointRef` (this cluster's apiserver, a snowplow-held credential)
 follows no redirect at all (#723). An endpoint that legitimately redirects
 elsewhere (a CDN, a moved host) must be given its final URL.
+
+snowplow is stricter here than the plumbing library other Krateo components
+use, on purpose, so a RESTAction that works through plumbing can still fail
+here:
+
+- plumbing lets a credential follow a redirect from `http` to `https` on the
+  same host. snowplow refuses it like any other change of origin: give the
+  endpoint its `https` URL.
+- the endpoint Secret's `pass-credentials-on-redirect` key has no effect in
+  snowplow. A redirect to another origin is refused with or without it.
+
+## Which addresses an endpoint can dial
+
+snowplow refuses to dial these addresses, on every stage and every `/call`, with
+or without a credential (#1131):
+
+| Refused | Why |
+| --- | --- |
+| `169.254.0.0/16`, `fe80::/10` | link-local, including the cloud metadata service |
+| `0.0.0.0`, `::` | unspecified |
+| `224.0.0.0/4`, `ff00::/8` | multicast |
+
+The v4-mapped IPv6 spellings of these are refused too. Loopback and private
+ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) are allowed:
+in-cluster services (`*.svc.cluster.local`) and on-prem endpoints live there.
+
+The check runs on the address actually dialled, after DNS. A hostname that
+resolves to a refused address is refused, however it is spelled, and a name that
+changes its answer is checked again on each dial. If a name resolves to several
+addresses, a refused one is skipped and the others are tried. A name that does not
+resolve is never dialled, and fails as a DNS error.
+
+A refused stage fails with reason `DestinationRefused` in
+`X-Snowplow-Stage-Outcomes` and a `502` under its `errorKey`, naming the address
+and its range. Without `continueOnError`, the same `502` and text answer the
+`/call`. Nothing is sent and the dial is not retried. A write that depends on the
+stage is `Skipped`. A background refresh of a refused stage stops at its first
+attempt: the cached entry stays resident as known-stale, the failure counts as
+`destination_refused` in `snowplow_refresh_failed`, and the next change to its
+data tries again. There is no setting and no allowlist: to fix it, point the
+endpoint at an address the policy allows.
+
+With a proxy (the Secret's `proxy-url`, or the process's `HTTP_PROXY`), the address
+checked is the proxy's, because that is the address dialled.
 
 ## jq templating of `path`, `payload` and `headers`
 

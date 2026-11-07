@@ -3,7 +3,7 @@ package credhttp
 // send.go — #1088: the one send policy for an endpoint dial (the RESTAction
 // branch-E stage fetch and the /call passthrough, credhttp.Do).
 //
-// A WRITE IS SENT ONCE. plumbing's util.RetryClient (v1.15.1 http/util/retry.go)
+// A WRITE IS SENT ONCE. plumbing's util.RetryClient (v1.28.1 http/util/retry.go)
 // re-sends GET, HEAD, OPTIONS, PUT and DELETE on a network error, a 429 or a
 // 5xx. For PUT and DELETE that is a re-send after the server may already have
 // received the request: measured against a server that reads the whole request
@@ -29,6 +29,10 @@ package credhttp
 // #1059's per-attempt slow-call fields use, so the two records join on them.
 // #1059 keeps per-attempt timings in the slow-request record; this is the
 // process-level count, so nothing is recorded twice.
+//
+// A REFUSED DESTINATION IS NEVER RETRIED (#1131). The answer cannot change by
+// asking again, and each retry would hold a worker for a backoff that ends in the
+// same refusal.
 
 import (
 	"context"
@@ -95,7 +99,11 @@ func SafeMethod(method string) bool {
 // #1115 — a request that carries a customer page budget (pagebudget) is sent
 // inside it instead: sendBudgeted (safe methods) or sendOnceBudgeted (writes).
 // A request without one (background work) keeps the path below, unchanged.
+//
+// #847 — every connection this request takes counts under site, on every path
+// below, a write's included (connections.go).
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	req = req.WithContext(countConnections(req, site))
 	// #1106 — no redirect hop leaves the origin this request is sent to,
 	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
 	// cli (a wire dump, a plumbing-built chain) can displace it; the budgeted
@@ -111,8 +119,9 @@ func Send(site string, cli *http.Client, req *http.Request) (*http.Response, err
 		return cli.Do(req)
 	}
 	observed := *cli
-	observed.Transport = &attemptObserver{next: cli.Transport, site: site}
-	return util.NewRetryClient(&observed).Do(req)
+	policy := util.NewRetryClient(&observed)
+	observed.Transport = &attemptObserver{next: cli.Transport, site: site, policy: policy}
+	return policy.Do(req)
 }
 
 // sendOnceBudgeted sends a write once inside its budget (#1115 §5). A write
@@ -236,7 +245,7 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 		return 0, false
 	}
 	if err != nil {
-		if context.Cause(x.ctx) == pagebudget.ErrExhausted {
+		if context.Cause(x.ctx) == pagebudget.ErrExhausted || DestinationRefused(err) {
 			return 0, false
 		}
 		if !x.connected() {
@@ -257,10 +266,10 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // retryAfter transcribe (http/util/retry.go: backoff, parseRetryAfter, both
 // unexported). TestBudget1115_RetryPolicyPinnedToPlumbing fails when the module
 // builds against another one, so a plumbing bump re-audits them.
-const retryPolicyTranscribedFrom = "v1.15.1"
+const retryPolicyTranscribedFrom = "v1.28.1"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
-// v1.15.1 http/util/retry.go backoff(0, base, max)): base capped at max,
+// v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
 // jittered into [d/2, d).
 func firstBackoff(base, maxB time.Duration) time.Duration {
 	d := min(base, maxB)
@@ -309,12 +318,15 @@ type attemptObserver struct {
 	attempts  int
 	prevCause string
 	prevMS    int64
+	// policy is the RetryClient of an unbudgeted send, nil on a budgeted one
+	// (budgetedRetryWait decides there). A refused destination ends it.
+	policy *util.RetryClient
 }
 
 func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 	next := o.next
 	if next == nil {
-		next = http.DefaultTransport
+		next = guardedTransport
 	}
 	// net/http sets Request.Response only on a redirect hop: part of the same
 	// attempt, not a new one.
@@ -335,6 +347,12 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
+	// #1131 — RetryClient has no way to be told an error is final, and it reads
+	// MaxRetries after each attempt, sequentially, so this ends its loop with
+	// this error. TestIssue1131_RefusalIsSentOnce pins that.
+	if o.policy != nil && DestinationRefused(err) {
+		o.policy.MaxRetries = 0
+	}
 	// #1115 — the retry reserve's data: how long an attempt that opened a NEW
 	// connection took from asking for it to its first response byte.
 	if err == nil {

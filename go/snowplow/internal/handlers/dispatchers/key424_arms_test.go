@@ -378,7 +378,7 @@ func k424SeedParity(t *testing.T, step string) {
 		Reference:  templatesv1.Reference{Name: psRAName, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource,
 	}
-	if err := seedOneRestaction(cohort, "cohort-k424", ref, psAuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cohort, ref, psAuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	key, _ := k423RAKey(t, carolCtx)

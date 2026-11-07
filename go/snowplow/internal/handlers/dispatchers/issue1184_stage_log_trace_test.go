@@ -6,7 +6,7 @@ package dispatchers
 //
 // Driven through the REAL chain on the #443 ps harness (cache ON, a real watcher,
 // the requester's clientconfig endpoint on a fake apiserver): tracing's Server
-// span → use.Logger → the RESTAction /call handler → restactions.Resolve →
+// span → middleware.RequestLogger → the RESTAction /call handler → restactions.Resolve →
 // api.Resolve → the fetch. The log chain is the real decorator over the JSON
 // handler at WARN, as the default logger and as the request logger. The trace id
 // is read from the exported span, never from a logger or a context this test
@@ -34,7 +34,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	"github.com/krateo-platformops/plumbing/server/use"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"go.opentelemetry.io/otel"
@@ -91,7 +91,7 @@ func i1184Serve(t *testing.T, f *in443API, ra map[string]any, target string) (tr
 	})
 	defer restore()
 
-	handler := use.Logger(log)(&restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}})
+	handler := middleware.RequestLogger(log)(&restActionHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}})
 	mux := http.NewServeMux()
 	mux.Handle("GET /call", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// What the UserConfig middleware leaves on the request.

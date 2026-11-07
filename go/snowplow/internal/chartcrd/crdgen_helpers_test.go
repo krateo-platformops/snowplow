@@ -20,14 +20,17 @@ const (
 	goModPath           = "../../go.mod"
 	crdsChartSchemaPath = "../../../../helm/snowplow-crds/values.schema.json"
 
-	// core-provider 2.13.23 is the version installer 0.3.419 deploys. It
-	// requires plumbing v1.15.1, and plumbing/crdgen at that version is what
-	// compiles the chart schema into the CompositionDefinition CRD. The test
-	// fails if this module resolves a different plumbing, because a guard run
-	// against another crdgen proves nothing about the one that installs us.
-	coreProviderVersion = "2.13.23"
+	// core-provider 2.13.71 requires plumbing v1.28.1, and plumbing/crdgen at
+	// that version compiles the chart schema into the CompositionDefinition
+	// CRD. The test fails if this module resolves a different plumbing, because
+	// a guard run against another crdgen proves nothing about the one that
+	// installs us. installer 0.3.517 still deploys core-provider 2.13.68, on
+	// plumbing v1.28.0: its statics/status.schema.json is byte-identical to
+	// 2.13.71's, and v1.28.0 and v1.28.1 generate byte-identical CRDs for both
+	// of snowplow's charts (#1135), so this guard speaks for that version too.
+	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.15.1"
+	crdgenVersion       = "v1.28.1"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
@@ -39,9 +42,24 @@ const (
 	costOverBudget = "estimated rule cost exceeds budget"
 )
 
-// The two CEL-carrying item nodes in the chart schema. #657: each needs a
-// bounded parent array, or its rule is cost-estimated as unbounded.
-var celItemFields = []string{"impersonateGroups", "impersonateServiceAccounts"}
+// The two allowlists whose items carry a constraint. #657: each stays bounded.
+var constrainedItemFields = []string{ruleOnlyField, nativeNotField}
+
+const (
+	// ruleOnlyField is the item node whose constraint exists ONLY as a CEL
+	// rule: crdgen drops this schema's `not`, so the rule is the enforcement,
+	// and the bounds are what keep its cost under the budget.
+	ruleOnlyField = "impersonateGroups"
+
+	// nativeNotField is the item node whose `not: {enum}` crdgen emits as a
+	// native `not` since plumbing#81 (v1.28.0). It has no CEL cost. Before, crdgen
+	// emitted costlyItemRule for it.
+	nativeNotField = "impersonateServiceAccounts"
+
+	// costlyItemRule broke the cost budget unbounded (1.363149x), which is why
+	// the negative controls put it back: they prove the cost check still runs.
+	costlyItemRule = `!(self in ["*"])`
+)
 
 // requirePinnedCrdgen reads go.mod, because a `go test` binary carries no
 // module dependency list in its build info. The module has no replace
@@ -156,9 +174,9 @@ func generate(t *testing.T, schema []byte) (*apiextensionsv1.CustomResourceDefin
 }
 
 // stripBounds returns a copy of the schema with every maxItems, maxLength and
-// maxProperties removed: the shape 1.12.45 shipped. It is the guard's negative
-// control. If crdgen stops emitting the CEL rules, this copy is accepted and
-// the guard fails instead of passing for no reason.
+// maxProperties removed: the shape 1.12.45 shipped. With withCostlyItemRule it
+// is the guard's negative control: if crdgen stops running the cost estimator,
+// that copy is accepted and the guard fails instead of passing for no reason.
 func stripBounds(t *testing.T, schema []byte) []byte {
 	t.Helper()
 	var root any
@@ -182,6 +200,34 @@ func stripBounds(t *testing.T, schema []byte) []byte {
 		}
 	}
 	walk(root)
+	out, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// withCostlyItemRule returns a copy of the schema whose nativeNotField items
+// carry costlyItemRule, the rule crdgen emitted for them before plumbing#81.
+func withCostlyItemRule(t *testing.T, schema []byte) []byte {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(schema, &root); err != nil {
+		t.Fatal(err)
+	}
+	var cur any = root
+	for _, k := range []string{"properties", "rbac", "properties", nativeNotField, "items"} {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			t.Fatalf("schema has no %s on the way to %s.items", k, nativeNotField)
+		}
+		cur = m[k]
+	}
+	items, ok := cur.(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no %s.items", nativeNotField)
+	}
+	items["x-kubernetes-validations"] = []any{map[string]any{"rule": costlyItemRule, "message": "must not be one of the forbidden values"}}
 	out, err := json.Marshal(root)
 	if err != nil {
 		t.Fatal(err)

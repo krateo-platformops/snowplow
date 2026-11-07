@@ -392,7 +392,7 @@ func s425Seed(t *testing.T, cohort seedTarget, cr *unstructured.Unstructured, sa
 	seedCtx := withCohortSeedContext(context.Background(), cohort, saEP, saRC)
 	ref := templatesv1.ObjectReference{Reference: templatesv1.Reference{Name: s425RAName, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource}
-	if err := seedOneRestaction(seedCtx, "s425", ref, s425AuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCtx, ref, s425AuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	if e, ok := cache.ResolvedCache().Get(s425Key(t, seedCtx)); ok {

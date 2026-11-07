@@ -487,14 +487,13 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// not (a UAF stage ignores its endpointRef, but naming one is still
 	// refused). Same truncating posture as any endpoint-resolve failure (R-2
 	// stageReturn); nothing was read or dialed. The Secret name embeds a
-	// username: a redact label only.
+	// username, so it is not logged, in clear or as a label (#1192).
 	if err := r.mapper.refusePerUserRef(ref); err != nil {
 		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
 			slog.String("name", id),
 			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
 			slog.Bool("templated", templated),
-			slog.String("namespace", ref.Namespace),
-			slog.String("secret_name", redact.Prefixed("secret", ref.Name)))
+			slog.String("namespace", ref.Namespace))
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
@@ -1681,7 +1680,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// the *pagebudget.ExhaustedError (same text), so the resolve's
 			// StageFailure reports the budget, not an upstream answer.
 			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
-				itemErr = &budgetItemError{text: itemErr.Error(), cause: be}
+				itemErr = &causedItemError{text: itemErr.Error(), cause: be}
+			}
+			// #1131 — the destination policy refused the dial: the same, so the
+			// StageFailure says that and not "upstream answered".
+			if credhttp.DestinationRefused(fetchErr) {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: fetchErr}
 			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
