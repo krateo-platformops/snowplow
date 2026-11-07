@@ -99,27 +99,31 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 	crds := ext.ApiextensionsV1().CustomResourceDefinitions()
 	dryRun := metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}}
 
-	// 2 first: the unbounded twin, dry-run only, so the name stays free.
+	// 2 first: the unbounded twin, dry-run only, so the name stays free. It
+	// carries the item rule crdgen emitted before plumbing#81, the 1.12.45 shape.
 	unbounded := crd.DeepCopy()
 	for _, v := range unbounded.Spec.Versions {
 		if v.Schema == nil || v.Schema.OpenAPIV3Schema == nil {
 			continue
 		}
 		rbac := v.Schema.OpenAPIV3Schema.Properties["spec"].Properties["rbac"]
-		for _, f := range celItemFields {
+		for _, f := range constrainedItemFields {
 			arr := rbac.Properties[f]
 			arr.MaxItems = nil
 			arr.Items.Schema.MaxLength = nil
+			if f == nativeNotField {
+				arr.Items.Schema.XValidations = apiextensionsv1.ValidationRules{{Rule: costlyItemRule}}
+			}
 			rbac.Properties[f] = arr
 		}
 		v.Schema.OpenAPIV3Schema.Properties["spec"].Properties["rbac"] = rbac
 	}
 	_, err = crds.Create(ctx, unbounded, dryRun)
 	if err == nil {
-		t.Fatal("the v1.36 apiserver ACCEPTED the crdgen CRD with the impersonate* bounds stripped: either crdgen " +
-			"stopped emitting the item CEL or the estimator changed; this arm no longer proves the bounds matter")
+		t.Fatal("the v1.36 apiserver ACCEPTED an unbounded CEL rule known to be over budget: the estimator changed, " +
+			"so this arm no longer proves the bounds matter")
 	}
-	if !strings.Contains(err.Error(), "properties[impersonateServiceAccounts].items.x-kubernetes-validations") ||
+	if !strings.Contains(err.Error(), "properties["+nativeNotField+"].items.x-kubernetes-validations") ||
 		!strings.Contains(err.Error(), costOverBudget) {
 		t.Fatalf("unbounded CRD refused, but not for the impersonateServiceAccounts rule cost: %v", err)
 	}
@@ -183,7 +187,7 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 			}
 		})
 	}
-	for _, f := range celItemFields {
+	for _, f := range constrainedItemFields {
 		t.Run("bounds/"+f, func(t *testing.T) {
 			arr := rbacField(t, crd, f)
 			if arr.MaxItems == nil || arr.Items.Schema.MaxLength == nil {
