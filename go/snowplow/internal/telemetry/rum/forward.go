@@ -42,7 +42,7 @@ type Forwarder struct {
 func NewForwarder(url string) *Forwarder {
 	return &Forwarder{
 		url:    url,
-		client: credhttp.Client(&http.Client{Timeout: ForwardTimeout}),
+		client: credhttp.CountConnectionsOn(credhttp.EgressRUMForward, credhttp.Client(&http.Client{Timeout: ForwardTimeout})),
 		queue:  make(chan batch, ForwardQueue),
 	}
 }
