@@ -253,7 +253,7 @@ func TestA1_Seed_UAFSkipsResolveAndPut_ControlSeeds(t *testing.T) {
 		seedObjectsGetFn = func(_ context.Context, _ templatesv1.ObjectReference) objects.Result {
 			return a1SeedFetchedRestaction(uaf)
 		}
-		if err := seedOneRestaction(seedCohortCtx(user), "cohort-granted", ref, "krateo-system", seedModeBoot); err != nil {
+		if err := seedOneRestaction(seedCohortCtx(user), ref, "krateo-system", seedModeBoot); err != nil {
 			t.Fatalf("seedOneRestaction returned %v; want nil (both the skip and the success path return nil)", err)
 		}
 		return tailReached

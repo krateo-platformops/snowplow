@@ -64,7 +64,7 @@ func (e *c681Env) seed(t *testing.T, cohort seedTarget, saURL string) []byte {
 		endpoints.Endpoint{ServerURL: saURL, Token: tok}, &rest.Config{Host: saURL, BearerToken: tok})
 	ref := templatesv1.ObjectReference{Reference: templatesv1.Reference{Name: c681RA, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource}
-	if err := seedOneRestaction(seedCtx, "c681", ref, c681AuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCtx, ref, c681AuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	got, ok := cache.ResolvedCache().GetNoTouch(e.key(t, c681A))

@@ -37,7 +37,6 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 )
 
@@ -90,7 +89,7 @@ type h643F2Run struct {
 // the skip consult when non-nil.
 // Each run is its own subtest: the harness holds engineLatchTestMu until the
 // subtest's cleanup, so two runs cannot share one test's lifetime.
-func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, string, string, string, redact.Label) bool) h643F2Run {
+func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, string, string, string) bool) h643F2Run {
 	t.Helper()
 	var out h643F2Run
 	name := "skip-as-shipped"
@@ -103,7 +102,7 @@ func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, strin
 	return out
 }
 
-func h643F2SequenceRun(t *testing.T, slow bool, consult func(context.Context, string, string, string, redact.Label) bool) h643F2Run {
+func h643F2SequenceRun(t *testing.T, slow bool, consult func(context.Context, string, string, string) bool) h643F2Run {
 	t.Helper()
 	o := h643Opts{cohorts: h643K, external: h643M, internal: h643N, things: 2, extra: []h643Extra{h643WInt}}
 	if slow {
@@ -157,7 +156,7 @@ func h643L1Diff(a, b map[string]string) []string {
 	return d
 }
 
-func h643ForcedOff(context.Context, string, string, string, redact.Label) bool { return false }
+func h643ForcedOff(context.Context, string, string, string) bool { return false }
 
 func h643F2Differential(t *testing.T, slow bool) {
 	t.Setenv("RESOLVER_SEED_EXTERNAL_FETCH_TIMEOUT_MS", "200")
@@ -195,7 +194,7 @@ func TestIssue643_F2m_DeclaresExternalEndpointAsTheCriterionFailsF2(t *testing.T
 	for i := 0; i < h643N; i++ {
 		raOf[h643NS+"/int-w"+itoaLine(i)] = "int-ra" + itoaLine(i)
 	}
-	mutant := func(ctx context.Context, key, class, target string, _ redact.Label) bool {
+	mutant := func(ctx context.Context, key, class, target string) bool {
 		ra, ok := raOf[target]
 		if class != "widgets" || !ok {
 			return false

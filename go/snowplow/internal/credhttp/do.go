@@ -24,6 +24,8 @@ package credhttp
 //  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
 //     never plumbing's, which logs the Authorization header and the bodies.
 //
+//  5. (#1131) a refused destination is reported as itself: DestinationStatus.
+//
 // Everything else (headers, the AWS-signature branch, the payload, a read's
 // retry client, the non-2xx envelope, the JSON content-type check, the
 // ResponseHandler contract) is unchanged, so a caller swapping request.Do for
@@ -112,6 +114,9 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 	if err != nil {
 		if st, ok := BudgetStatus(err); ok {
 			return st // #1115 — 504 Timeout
+		}
+		if st, ok := DestinationStatus(err); ok {
+			return st // #1131 — 502 DestinationRefused
 		}
 		return response.New(http.StatusInternalServerError, err)
 	}

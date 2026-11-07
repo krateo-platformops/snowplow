@@ -48,7 +48,7 @@ new OTLPTraceExporter({
 - **What remains, by design** (#1020 delta D2/D3):
   - **Decode slots:** one user can hold at most one of them. But GOMAXPROCS *distinct* authenticated users sending slow bodies together can still hold every slot. That blocks **telemetry only** (others get `429`), never the portal. Each slot is bounded by the server's 10 s read timeout.
   - **Span budget:** the per-user limit counts *requests*, not spans. So a few users at their limit with full 512-span batches can use up the shared 2000 spans/s, and other users' batches get `429` until it refills.
-- **Attribution:** every refusal (400, 413, 415, 429) writes a sampled WARN line `rum.ingest.refused` with the caller's `redact.User` label (never the username in clear), the status and the reason.
+- **Refusal log:** every refusal (400, 413, 415, 429) writes a sampled WARN line `rum.ingest.refused` with the status and the reason. It carries nothing about the caller: no identity reaches a snowplow log line (#1192).
 
 ## Allowlist
 

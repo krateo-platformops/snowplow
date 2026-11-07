@@ -21,8 +21,8 @@ func TestErrorText994_ScrubsTheStepUpSecretName(t *testing.T) {
 		if strings.Contains(got, u) {
 			t.Fatalf("credential Secret name %q survived ErrorText: %s", name, got)
 		}
-		if !strings.Contains(got, "not found") || !strings.HasPrefix(got, `secrets "secret:`) {
-			t.Fatalf("the reason must stay readable with the label in place: %s", got)
+		if got != `secrets "`+redact.Redacted+`" not found` {
+			t.Fatalf("the reason must stay readable with the name removed: %s", got)
 		}
 	}
 }

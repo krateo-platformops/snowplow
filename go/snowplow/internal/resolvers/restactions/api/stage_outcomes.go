@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // Per-stage outcomes of one resolve.
@@ -67,6 +68,12 @@ const (
 	// StageReasonTimeout (#1115) — the stage's exchange was ended by the
 	// request's page budget (a 504 Timeout): the page's 10 s goal ran out.
 	StageReasonTimeout = "Timeout"
+	// StageReasonDestinationRefused (#1131) — the destination policy refused the
+	// address the stage's endpoint resolved to (a 502): nothing was sent, and
+	// asking again gives the same answer. Recorded only by snowplow: the reason
+	// is no Kubernetes StatusReason, so trustedReason drops it from an upstream
+	// answer (#714).
+	StageReasonDestinationRefused = credhttp.DestinationRefusedReason
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -77,15 +84,16 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	StageReasonNotExecuted:   9,
-	StageReasonForbidden:     8,
-	StageReasonUnauthorized:  7,
-	StageReasonNotFound:      6,
-	StageReasonInvalidPath:   5,
-	StageReasonTemplateError: 4,
-	StageReasonTimeout:       3, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:       2,
-	StageReasonError:         1,
+	StageReasonNotExecuted:        10,
+	StageReasonForbidden:          9,
+	StageReasonUnauthorized:       8,
+	StageReasonNotFound:           7,
+	StageReasonInvalidPath:        6,
+	StageReasonDestinationRefused: 5,
+	StageReasonTemplateError:      4,
+	StageReasonTimeout:            3, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:            2,
+	StageReasonError:              1,
 }
 
 type stageOutcome struct {
@@ -312,7 +320,7 @@ func stageReasonOf(v any) string {
 	if !ok {
 		return StageReasonError
 	}
-	if r, _ := m["reason"].(string); r == StageReasonNotExecuted {
+	if r, _ := m["reason"].(string); r == StageReasonNotExecuted || r == StageReasonDestinationRefused {
 		return r
 	}
 	switch code := toInt(m["code"]); code {

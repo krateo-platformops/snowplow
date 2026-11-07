@@ -83,12 +83,12 @@ func TestFC3_SeedRewalk_GVRDiscovered_ReResolvesWarmCell_RepopulatesEdge(t *test
 	// re-records the edge), while a boot re-pass DOES fresh-skip it (the residual
 	// #279 gap that stays OPEN). If the two agree, the re-walk's re-population
 	// guarantee is gone.
-	if seedSkipDecision(granted, seedModeGVRDiscovered, handle, key, "widgets", "dashboard-flex", "cohort") {
+	if seedSkipDecision(granted, seedModeGVRDiscovered, handle, key, "widgets", "dashboard-flex") {
 		t.Fatalf("F-C3 REGRESSION: seedModeGVRDiscovered SKIPPED a live/warm cell — the re-walk would " +
 			"NOT re-resolve it, so the LIST edge an iterator-empty first pass missed can never be " +
 			"re-populated (the #279 mitigation is broken). It must NEVER skip (F4-C3 boundary).")
 	}
-	if !seedSkipDecision(granted, seedModeBoot, handle, key, "widgets", "dashboard-flex", "cohort") {
+	if !seedSkipDecision(granted, seedModeBoot, handle, key, "widgets", "dashboard-flex") {
 		t.Fatalf("F-C3 CONTROL: seedModeBoot must fresh-skip the SAME live cell (the discriminator that " +
 			"proves the modes genuinely differ). It did not — the control arm is inert, so the Part-A " +
 			"never-skip assertion would not discriminate a regression.")

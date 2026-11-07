@@ -146,7 +146,7 @@ func drive2ERestaction(t *testing.T, cohort context.Context, name string, dGated
 		}
 		return nil
 	}
-	if err := seedOneRestaction(cohort, "cohort-2e", seed2ERef(name), h1NS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cohort, seed2ERef(name), h1NS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction(%s): %v", name, err)
 	}
 	return seen

@@ -193,7 +193,7 @@ func countConnections(req *http.Request, egress string) context.Context {
 // countConnectionsTransport wraps rt so its requests count under egress.
 func countConnectionsTransport(egress string, rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	return &connectionCountingTransport{next: rt, egress: egress}
 }

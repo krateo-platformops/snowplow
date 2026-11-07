@@ -32,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // c2TTL pins a small fixture TTL so the age-skip threshold (TTL/4) is a
@@ -448,19 +447,17 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 		t.Fatalf("seedScopeYielding(keepwarm) returned %v; want nil", err)
 	}
 
-	// Parse the emitted cohort_summary lines and index by identity.
+	// Parse the emitted cohort_summary lines and index by rank.
 	type summary struct {
 		Msg      string `json:"msg"`
-		Identity string `json:"identity"`
+		Rank     int    `json:"rank"`
 		Reseeds  int64  `json:"reseeds"`
 		AgeSkips int64  `json:"age_skips"`
 		Attempt  int    `json:"attempted"`
 	}
-	// Index by a stable substring of the identity: the emitted `identity` field
-	// is the raw rankKey (identityKey(c) = Username + \x1f + sorted-Groups), so
-	// for a group cohort it CONTAINS the group name. Match on Contains rather
-	// than hardcoding the \x1f separator.
-	find := func(want string) (summary, bool) {
+	// Index by rank, the only cohort handle on the line (#1192: no identity
+	// reaches a log line). reseed outranks skipall on its collapsed count.
+	find := func(want int) (summary, bool) {
 		for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
 			if len(line) == 0 {
 				continue
@@ -469,7 +466,7 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 			if err := json.Unmarshal(line, &s); err != nil {
 				continue
 			}
-			if s.Msg == "prewarm.keepwarm.cohort_summary" && s.Identity == redact.Group(want) /* #453: the cohort redact label */ {
+			if s.Msg == "prewarm.keepwarm.cohort_summary" && s.Rank == want {
 				return s, true
 			}
 		}
@@ -487,7 +484,7 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 		t.Fatalf("cohort_summary: want exactly 2 lines (one per swept cohort); got %d. logs:\n%s", nLines, buf.String())
 	}
 
-	rs, ok := find("reseed")
+	rs, ok := find(0)
 	if !ok {
 		t.Fatalf("cohort_summary: missing line for the reseed cohort. logs:\n%s", buf.String())
 	}
@@ -495,7 +492,7 @@ func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
 		t.Fatalf("cohort_summary(reseed): want {attempted:2, reseeds:2, age_skips:0}; got {attempted:%d, reseeds:%d, age_skips:%d}", rs.Attempt, rs.Reseeds, rs.AgeSkips)
 	}
 
-	sk, ok := find("skipall")
+	sk, ok := find(1)
 	if !ok {
 		t.Fatalf("cohort_summary: missing line for the skipall cohort. logs:\n%s", buf.String())
 	}

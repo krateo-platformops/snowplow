@@ -153,7 +153,7 @@ func TestIssue408_PreReadyzBootSeed_DepEventWhileNonResident_PlainPutRemarksOnce
 			if err := seedOneWidget(cctx, s394WidgetEntry(), h1NS, seedModeBoot); err != nil {
 				t.Fatalf("boot seedOneWidget: %v (boot never refuses pre-readyz)", err)
 			}
-			if err := seedOneRestaction(cctx, "cohort-i408", s394RARef(), h1NS, seedModeBoot); err != nil {
+			if err := seedOneRestaction(cctx, s394RARef(), h1NS, seedModeBoot); err != nil {
 				t.Fatalf("boot seedOneRestaction: %v (boot never refuses pre-readyz)", err)
 			}
 
@@ -290,7 +290,7 @@ func TestIssue408_PostReadyzBootSeed_RemovalDuringResolve_Refused(t *testing.T) 
 			if tc.flipMidSeed {
 				cache.ResetPhase1DoneForTest() // the RA unit is captured pre-readyz too
 			}
-			raErr := seedOneRestaction(cctx, "cohort-i408", s394RARef(), h1NS, seedModeBoot)
+			raErr := seedOneRestaction(cctx, s394RARef(), h1NS, seedModeBoot)
 
 			if h.keyMismatch != "" {
 				t.Fatalf("PRECONDITION: seed ran under a different key (%s)", h.keyMismatch)

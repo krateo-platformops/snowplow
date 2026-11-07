@@ -205,7 +205,7 @@ func TestIssue375_Arm7_BootSeedResolve_IsGuarded(t *testing.T) {
 		cache.ResolvedCache().PutResolvedIfGen(resCtx, fixtureStoreVerdict, nested, &cache.ResolvedEntry{RawJSON: []byte(`{}`)}, gen0)
 		return nil
 	}
-	if err := seedOneRestaction(seedCohortCtx(user), "cohort-granted", ref, "krateo-system", seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCohortCtx(user), ref, "krateo-system", seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	if !sawSink {

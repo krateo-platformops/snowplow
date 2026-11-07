@@ -46,10 +46,13 @@
 // Skipped, a #903 background refusal and a #905 stale-pass hold keep their own
 // recorded errors: each already reports itself.
 //
-// The errorKey message and the log line are identity-free: the stage name, the
-// verb and the cause only — never the rendered path, the payload or the jq error
-// text (which can carry caller input and response data; the DEBUG skip line
-// keeps the detail for triage, as before).
+// The errorKey message and the log line are identity-free. The message holds the
+// stage name, the verb and the cause; the line holds the stage name, the verb,
+// the reason, the RESTAction's coordinates and, on a read, the refused-item
+// count, plus the traceId the request logger adds (it carries no caller:
+// middleware.RequestLogger, #1192). Neither holds the rendered path, the payload
+// or the jq error text (which can carry caller input and response data; the
+// DEBUG skip line keeps the detail for triage, as before).
 package api
 
 import (
