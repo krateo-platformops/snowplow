@@ -255,6 +255,12 @@ func init() {
 			}
 			return out
 		}))
+		// #847 — connections opened and handed over, by
+		// {egress: {protocol: {opened, handovers}}} (credhttp/connections.go):
+		// the paired run's reuse share is 1 − opened / handovers.
+		expvar.Publish("snowplow_egress_connections", expvar.Func(func() any {
+			return egressConnectionsMap(credhttp.EgressConnectionsSnapshot())
+		}))
 		// #1115 — every budgeted (customer) exchange by what the page budget
 		// did to it, and the retry reserve it uses.
 		expvar.Publish("snowplow_page_budget", expvar.Func(func() any {
@@ -275,6 +281,17 @@ func init() {
 			return map[string]uint64{"entries": uint64(n), "builds_total": builds, "evictions_total": evictions}
 		}))
 	})
+}
+
+func egressConnectionsMap(s []credhttp.EgressConnectionCount) map[string]map[string]map[string]uint64 {
+	out := map[string]map[string]map[string]uint64{}
+	for _, c := range s {
+		if out[c.Egress] == nil {
+			out[c.Egress] = map[string]map[string]uint64{}
+		}
+		out[c.Egress][c.Protocol] = map[string]uint64{"opened": c.Opened, "handovers": c.Handovers}
+	}
+	return out
 }
 
 func externalFetchMap(s []ExternalFetchCount) map[string]uint64 {

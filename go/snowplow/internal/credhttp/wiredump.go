@@ -80,7 +80,7 @@ func (t *wireDump) WrappedRoundTripper() http.RoundTripper { return t.next }
 func (t *wireDump) RoundTrip(req *http.Request) (*http.Response, error) {
 	next := t.next
 	if next == nil {
-		next = http.DefaultTransport
+		next = guardedTransport
 	}
 	log := xcontext.Logger(req.Context())
 	log.Debug("request details",

@@ -57,6 +57,10 @@
 // where a resolve's collection LISTs are counted on the wire
 // (snowplow_resolve_collection_lists, resolve_lists.go): Harden and Client
 // install CountResolveCollectionLists wherever they install RefuseRedirectHops.
+//
+// #1131 — THE DESTINATION POLICY. The dialer that carries a named endpoint
+// refuses link-local, unspecified and multicast addresses on the address it
+// dials (destination.go).
 package credhttp
 
 import (
@@ -119,7 +123,7 @@ func CheckRedirect(*http.Request, []*http.Request) error {
 // Idempotent in effect (a double wrap refuses the same requests).
 func RefuseRedirectHops(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	return &refuseRedirectHops{next: rt}
 }
@@ -148,11 +152,18 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 //
 // #1115 — and the customer page budget (BudgetTransport, budget.go): a round
 // trip of a request that carries one runs under its deadline.
+//
+// #847 — and its connections count under EgressAPIServer (connections.go).
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
 		// #1054 — innermost: every attempt (a client-go 429 retry included)
 		// is recorded on the slow-call record of the request that sent it.
 		rc.Wrap(slowcall.Transport)
+		// #847 — new vs reused connections. Inside the budget and the hop
+		// refusal: a request either of them stops takes no connection anyway.
+		rc.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return countConnectionsTransport(EgressAPIServer, rt)
+		})
 		// #1115 — the customer page budget: a round trip of a request that
 		// carries one runs under its deadline.
 		rc.Wrap(BudgetTransport)
@@ -184,7 +195,7 @@ func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
 	base := c.Transport
 	if base == nil {
-		base = http.DefaultTransport
+		base = guardedTransport
 	}
 	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c

@@ -26,8 +26,10 @@ import (
 	"net"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 )
 
@@ -63,13 +65,16 @@ const (
 	RefreshErrDiscovery     = "discovery"
 	RefreshErrJQ            = "jq"
 	RefreshErrUnclassified  = "unclassified"
+	// RefreshErrDestinationRefused (#1131): the destination policy refused the
+	// address a stage's endpoint resolved to. Nothing was sent.
+	RefreshErrDestinationRefused = "destination_refused"
 )
 
 // refreshClasses is the closed class set, in counter-index order.
 var refreshClasses = [...]string{
 	RefreshErrForbidden, RefreshErrUnauthorized, RefreshErrNotFound,
 	RefreshErrTimeout, RefreshErrUnavailable, RefreshErrSchemaInvalid,
-	RefreshErrDiscovery, RefreshErrJQ, RefreshErrUnclassified,
+	RefreshErrDiscovery, RefreshErrJQ, RefreshErrDestinationRefused, RefreshErrUnclassified,
 }
 
 // ResolveStageError carries the failing stage of a resolve and a fixed prefix
@@ -119,6 +124,8 @@ func ClassifyRefreshError(err error) (class, stage string) {
 		return RefreshErrUnauthorized, stage
 	case apierrors.IsNotFound(err):
 		return RefreshErrNotFound, stage
+	case destinationRefused(err):
+		return RefreshErrDestinationRefused, stage
 	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err):
 		return RefreshErrTimeout, stage
 	case apierrors.IsServiceUnavailable(err), apierrors.IsInternalError(err),
@@ -153,8 +160,20 @@ func ClassifyRefreshError(err error) (class, stage string) {
 // succeed). The drop point does NOT evict it: one 403 is not a determinism
 // proof, and an eviction is a cold navigation (#547 ruling). The entry stays
 // resident and served; the next dirty mark retries it.
+//
+// #1131 — a refused destination cannot clear either: the policy gives the same
+// answer until the endpoint's address changes, and each requeue is a whole
+// resolve. Same drop point, same known-stale entry, same retry on the next dirty
+// mark, which is also what picks up a corrected endpoint.
 func IsNonRetryableRefreshError(err error) bool {
-	return err != nil && apierrors.IsForbidden(err)
+	return err != nil && (apierrors.IsForbidden(err) || destinationRefused(err))
+}
+
+// destinationRefused reports a stage failure whose reason is the destination
+// policy's. Only snowplow records that reason: trustedReason drops it from an
+// upstream answer (#714).
+func destinationRefused(err error) bool {
+	return apierrors.ReasonForError(err) == metav1.StatusReason(credhttp.DestinationRefusedReason)
 }
 
 // refreshFailedByClass counts refresh failures per (class, stage). Fixed-size,

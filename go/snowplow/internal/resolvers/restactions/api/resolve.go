@@ -1673,7 +1673,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// the *pagebudget.ExhaustedError (same text), so the resolve's
 			// StageFailure reports the budget, not an upstream answer.
 			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
-				itemErr = &budgetItemError{text: itemErr.Error(), cause: be}
+				itemErr = &causedItemError{text: itemErr.Error(), cause: be}
+			}
+			// #1131 — the destination policy refused the dial: the same, so the
+			// StageFailure says that and not "upstream answered".
+			if credhttp.DestinationRefused(fetchErr) {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: fetchErr}
 			}
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
