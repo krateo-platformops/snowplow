@@ -280,6 +280,12 @@ func (h *s394RecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v
 	return true
 }
 
+// #1255 — the unstorable-eviction surface; this handle holds no cell to evict.
+func (h *s394RecordingHandle) EvictOnPermanentDecline(context.Context, cache.PutVerdict, string) bool {
+	return false
+}
+func (h *s394RecordingHandle) EvictUnstorable(context.Context, string, string) bool { return false }
+
 func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) {
 	// guardedByMode is the classification table. A new seedScopeMode constant
 	// fails below until it is added here — and only seedModeBoot may be false.

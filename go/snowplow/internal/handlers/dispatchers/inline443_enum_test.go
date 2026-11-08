@@ -79,9 +79,12 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ResolvedCacheStore.PutContentIfGen":     gatedInCache443,
 	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
-	"ResourceWatcher.EnsureResourceTypeFor":  gatedInCache443,
-	"RecordSliceabilityClassifiedCtx":        gatedInCache443,
-	"SliceabilityLookupCtx":                  gatedInCache443,
+	// #1255 — an unstorable decline evicts the older cell; both refuse an inert ctx.
+	"ResolvedCacheStore.EvictOnPermanentDecline": gatedInCache443,
+	"ResolvedCacheStore.EvictUnstorable":         gatedInCache443,
+	"ResourceWatcher.EnsureResourceTypeFor":      gatedInCache443,
+	"RecordSliceabilityClassifiedCtx":            gatedInCache443,
+	"SliceabilityLookupCtx":                      gatedInCache443,
 	// #398 decline: always returns true on a sensitive read (inert or not), so
 	// the decline is never hidden by the flag; only its counter is gated.
 	"DeclineSensitivePut": gatedInCache443,

@@ -31,9 +31,12 @@
 // load-bearing 0.30.103 SA-CA seam. When saEP/saRC are nil (no SA creds
 // — unit test / outside-cluster) the context is identity-only as before.
 //
-// Per feedback_l1_invalidation_delete_only.md: this path only ever
-// Put()s — it never evicts. A refresh that lands after the entry was
-// evicted must not resurrect it (see the post-resolve liveness re-check).
+// Per feedback_l1_invalidation_delete_only.md: this path Put()s, and evicts
+// only in the two terminal states where no refresh can ever replace the cell —
+// no in-class representative (#444) and a re-resolve whose decline proves the
+// key unstorable (#1255, evict_unstorable.go). A refresh that lands after the
+// entry was evicted must not resurrect it (see the post-resolve liveness
+// re-check).
 
 package dispatchers
 
@@ -367,13 +370,13 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// clean refresh. It obsoletes #677's known-declined mark, whose trigger was
 	// exactly that result.
 	rctx, forbiddenSink := cache.WithPerIdentityForbiddenSink(rctx)
-	// External-no-cache (proposal 2026-06-22) — defense-in-depth. The
-	// refresher only ever re-Puts already-cached keys, and external RAs never
-	// get cached in the first place (the request-path Put-gates decline them),
-	// so the refresher should never re-resolve an external RA. But install +
-	// gate the external-touched sink here too, so that IF an external RA ever
-	// reached this path it would still decline the re-Put rather than persist
-	// stale external data. Additive to the stage-error sink.
+	// External-no-cache (proposal 2026-06-22). The refresher only ever re-Puts
+	// already-cached keys, and the request-path Put-gates never cache an
+	// external result — but a cell cached BEFORE an edit made its RESTAction
+	// touch a named endpoint reaches this path with the edit's dirty mark
+	// (#1255: the 057 PageHeader after portal#384). The external-touched sink
+	// lets the verdict decline that re-Put and evict the pre-edit body.
+	// Additive to the stage-error sink.
 	rctx, extTouchedSink := cache.WithExternalTouchedSink(rctx)
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
@@ -469,32 +472,45 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// transient stage error leaves the cell KNOWN-STALE (#547).
 	if !verdict.Store() {
 		suppressed := cache.NoteRefreshDecline(key, string(verdict.Reason()), verdict.Permanent())
+		// #1255 — a PERMANENT decline proves this key can no longer be stored (an
+		// edit made the RESTAction touch a named endpoint, or declare a write): no
+		// writer will ever replace the prior body, so keeping it would serve the
+		// pre-change output until the TTL. Evict it, so the next request resolves
+		// live; the eviction clears the suppression marker with the key and is
+		// pushed to armed tabs. The epoch guard spares a body a concurrent writer
+		// stored after this resolve began, and an external-TTL cell, whose own
+		// opt-in stores exactly this resolve (cache/evict_unstorable.go). A
+		// transient decline keeps the prior entry KNOWN-STALE (#547).
+		evicted := evictOnPermanentDecline(rctx, inClassEvicter(rctx, c, &inputs), verdict, key)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
-			log.Debug("resolveAndPopulateL1: the RESTAction declares a write stage; declining to re-Put",
-				slog.String("subsystem", "cache"),
-				slog.String("key_hash", key),
-				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("effect", "never stored: every /call runs its write (#903 F1); suppressed until the next real Put"),
-			)
+			if !evicted {
+				log.Debug("resolveAndPopulateL1: the RESTAction declares a write stage; declining to re-Put",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("effect", "never stored: every /call runs its write (#903 F1); suppressed until the next real Put"),
+				)
+			}
 		case cache.PutReasonExternal:
-			// External-no-cache (proposal 2026-06-22) — defense-in-depth re-Put
-			// gate: the fresh bytes have no dep edge to invalidate them; keep the
-			// prior entry (TTL is the outer net). #681 C2 — an own-credential
-			// apiserver 403 is not a genuine external touch.
+			// External-no-cache (proposal 2026-06-22) — the fresh bytes have no dep
+			// edge to invalidate them, so they are never stored. #681 C2 — an
+			// own-credential apiserver 403 is not a genuine external touch.
 			cache.BumpExternalSkippedPut()
-			// Not a fault: a designed defense-in-depth decline (external data has no
-			// dep edge to invalidate it, so keep the prior entry; TTL is the outer
-			// net). Fires on every refresh of an external-touching entry — DEBUG.
-			// The BumpExternalSkippedPut counter carries the rate for operators.
-			log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
-				slog.String("subsystem", "cache"),
-				slog.String("key_hash", key),
-				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("rep_source", repSource),
-				slog.Int64("external_touches", extTouchedSink.Count()),
-				slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
-			)
+			// The prior entry was evicted above unless nothing older than this
+			// resolve was resident, or it is an external-TTL cell (bounded by its own
+			// short TTL by design). Those keeps are expected — DEBUG; the
+			// BumpExternalSkippedPut counter carries the rate for operators.
+			if !evicted {
+				log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("rep_source", repSource),
+					slog.Int64("external_touches", extTouchedSink.Count()),
+					slog.String("effect", "not stored; no older entry to evict, or an external-TTL cell kept to its own bounded TTL (#1255)"),
+				)
+			}
 		case cache.PutReasonStageError:
 			// #301 observability: surface the FIRST failing stage's name + err
 			// inline so a decline can be attributed without a cross-grep
@@ -513,24 +529,28 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			// #903 B2 — a stage error on a resolve that ALSO touched a genuine
 			// external endpoint can never be re-Put by the refresher (the external
 			// decline would refuse it anyway), so the verdict makes it structurally
-			// permanent: suppress, don't re-resolve it on every change.
+			// permanent: suppress, don't re-resolve it on every change. #1255 — and
+			// evict the prior entry (above), which nothing can ever replace; that
+			// eviction logged itself, and nothing was kept to describe here.
 			_, _, alreadyKnownStale := cache.KnownStale(key)
 			declineLevel := slog.LevelWarn
 			if alreadyKnownStale {
 				declineLevel = slog.LevelDebug
 			}
-			log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
-				slog.String("subsystem", "cache"),
-				slog.String("key_hash", key),
-				slog.String("handler", inputs.CacheEntryClass),
-				slog.String("rep_source", repSource),
-				slog.Int64("stage_errors", stageErrSink.Count()),
-				slog.String("stage_err_stage", sampleStage),
-				slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
-				slog.Bool("suppressed", suppressed),
-				slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
-					"on the next read under the requester, re-enqueued by the next change (#547)"),
-			)
+			if !evicted {
+				log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("rep_source", repSource),
+					slog.Int64("stage_errors", stageErrSink.Count()),
+					slog.String("stage_err_stage", sampleStage),
+					slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
+					slog.Bool("suppressed", suppressed),
+					slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
+						"on the next read under the requester, re-enqueued by the next change (#547)"),
+				)
+			}
 			cache.BumpRefresherSkippedStageError()
 		default:
 			// Any other decline: today only cache.PutReasonUnobserved, a verdict
@@ -556,8 +576,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// It still fires for an identity-free cell, where ONE cell is shared by every
 	// requester and a narrowed body in it is an unconditional cross-tenant leak
 	// no key change short of making the class identity-bound can fix. Same shape
-	// as the external-touched re-Put gate above: keep whatever entry exists,
-	// decline the write, TTL is the outer net.
+	// as the external-touched re-Put gate above: decline the write, and (#1255)
+	// evict an older entry, which no writer can ever replace.
 	if reason := uafDeclineReason(&inputs, uafTouchedSink); reason != "" {
 		// Count under the class the cell actually belongs to, so the widgets
 		// carrier's refresh declines do not get buried in the restactions number.
@@ -569,6 +589,10 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// 1.12.6 C4 (§6.2 row 8) — structurally permanent until 1.13.0 folds
 		// the UAF scope into the key (#180): suppress on first occurrence.
 		cache.NoteRefreshDecline(key, "uaf", true)
+		// #1255 — evict an older entry: no writer stores this key's current body.
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableUAF) {
+			return nil
+		}
 		// DEBUG for the same reason as the dispatch site: expected, designed, and
 		// potentially per-refresh-cycle frequent. The counter carries the rate.
 		log.Debug("resolveAndPopulateL1: re-resolve is userAccessFilter-narrowed; declining to re-Put",
@@ -578,15 +602,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("rep_source", repSource),
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
-			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
+			slog.String("effect", "not stored, no older entry to evict; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
 		)
 		return nil
 	}
 
 	// #398 — a re-resolve that read a sensitive resource is never re-Put
-	// (structurally permanent for this cell: suppress on first occurrence).
+	// (structurally permanent for this cell: suppress on first occurrence), and
+	// (#1255) an older entry is evicted: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(rctx) {
 		cache.NoteRefreshDecline(key, "sensitive_resource", true)
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableSensitive) {
+			return nil
+		}
 		log.Debug("resolveAndPopulateL1: re-resolve read a sensitive resource; declining to re-Put",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),

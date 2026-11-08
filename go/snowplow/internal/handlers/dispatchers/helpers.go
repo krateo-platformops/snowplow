@@ -736,6 +736,10 @@ type cacheHandle interface {
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.
+	//
+	// #1255 — a resolve whose decline proves the key unstorable evicts the cell
+	// it could not replace (evict_unstorable.go).
+	unstorableEvicter
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per

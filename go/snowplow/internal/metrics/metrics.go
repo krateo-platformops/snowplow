@@ -2256,6 +2256,19 @@ func registerSecurityInstruments(m metric.Meter) error {
 		return err
 	}
 
+	// --- #1255: cells evicted because a later resolve proved their key
+	// unstorable, per reason. The closed reason set (cache.EvictUnstorableReasons)
+	// is emitted in full, zeros included; the sum is
+	// snowplow_resolved_cache{stat=evict_unstorable_total}. The eviction's own log
+	// line is INFO (designed work, not a failure) and does not ship at the chart's
+	// LOG_LEVEL=warn, so this is the signal that leaves the pod. ---
+	evictUnstorable, err := m.Int64ObservableCounter(
+		"snowplow_l1_evict_unstorable_total",
+		metric.WithDescription("L1 cells evicted because a later resolve of their key was declined PERMANENTLY, so no writer could ever replace the old body (#1255), by reason {declared_write, external_touched, stage_error, sensitive_resource, uaf, other}. Each is one edit that made a cached RESTAction/widget unstorable; the next request resolves live instead of serving the pre-change body until its TTL."))
+	if err != nil {
+		return err
+	}
+
 	// --- #378: refresher-terminal re-mints (BornAt resets), per class. The
 	// closed class set (cache.RemintClasses) is emitted in full, zeros included;
 	// the sum is snowplow_resolved_cache{stat=remint_total}. ---
@@ -2374,6 +2387,9 @@ func registerSecurityInstruments(m metric.Meter) error {
 		for _, c := range cache.ResolvedCacheRemintByClass() {
 			o.ObserveInt64(remint, int64(c.Count), metric.WithAttributes(attribute.String("class", c.Class)))
 		}
+		for _, c := range cache.EvictUnstorableByReason() {
+			o.ObserveInt64(evictUnstorable, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
+		}
 		byReason := cache.KnownStaleServedByReason()
 		for _, reason := range cache.KnownStaleReasons {
 			o.ObserveInt64(knownStaleServed, int64(byReason[reason]), metric.WithAttributes(attribute.String("reason", reason)))
@@ -2414,7 +2430,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, repick, remint, knownStaleServed, knownStaleRerun, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, remint, evictUnstorable, knownStaleServed, knownStaleRerun, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err
