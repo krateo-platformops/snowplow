@@ -20,23 +20,24 @@ const (
 	goModPath           = "../../go.mod"
 	crdsChartSchemaPath = "../../../../helm/snowplow-crds/values.schema.json"
 
-	// core-provider 2.13.71 requires plumbing v1.28.1, and plumbing/crdgen at
-	// that version compiles the chart schema into the CompositionDefinition
-	// CRD. The test fails if this module resolves a different plumbing, because
-	// a guard run against another crdgen proves nothing about the one that
-	// installs us. installer 0.3.517 still deploys core-provider 2.13.68, on
-	// plumbing v1.28.0: its statics/status.schema.json is byte-identical to
-	// 2.13.71's, and v1.28.0 and v1.28.1 generate byte-identical CRDs for both
-	// of snowplow's charts (#1135), so this guard speaks for that version too.
+	// THE INVARIANT: the crdgen this module builds is byte-identical to the one
+	// core-provider compiles snowplow's chart schemas into the
+	// CompositionDefinition CRD with. A guard run against another crdgen proves
+	// nothing about the one that installs us.
 	//
-	// This module requires plumbing v1.34.0 (installer#716). core-provider
-	// 2.13.71, and 2.13.76 that the installer deploys now, still require
-	// v1.28.1. v1.34.0's crdgen/ and crdgen/schemas/, the only plumbing
-	// packages crdgen imports, are byte-identical to v1.28.1's (diff -r of the
-	// two module trees), so the guard still runs core-provider's crdgen.
+	// core-provider 2.13.71 (whose status schema is in testdata) and 2.13.76,
+	// which installer 0.3.546 deploys, both require plumbing v1.28.1:
+	// coreProviderCrdgenVersion. This module requires plumbing v1.34.0
+	// (installer#716): crdgenVersion. The crdgen code of the two is
+	// byte-identical: crdgen/ and crdgen/schemas/, the only plumbing packages
+	// crdgen imports, match under `diff -r` of the two module trees. That audit
+	// is what lets the two constants differ. requirePinnedCrdgen fails when
+	// go.mod moves off crdgenVersion, so a bump repeats it.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
 	crdgenVersion       = "v1.34.0"
+	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
+	coreProviderCrdgenVersion = "v1.28.1"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
@@ -83,9 +84,11 @@ func requirePinnedCrdgen(t *testing.T) {
 		}
 	}
 	if got != crdgenVersion {
-		t.Fatalf("this module requires %s %q, but core-provider %s compiles the chart with %s. "+
-			"Re-pin both constants together after checking which core-provider the installer deploys",
-			crdgenModule, got, coreProviderVersion, crdgenVersion)
+		t.Fatalf("this module requires %s %q, but only %s is audited: its crdgen/ and crdgen/schemas/ are "+
+			"byte-identical to %s, which core-provider %s compiles the chart with. Check which core-provider "+
+			"the installer deploys and the plumbing it requires, diff crdgen/ and crdgen/schemas/ of %q against "+
+			"that version, and re-pin crdgenVersion (and coreProviderCrdgenVersion) only if they match",
+			crdgenModule, got, crdgenVersion, coreProviderCrdgenVersion, coreProviderVersion, got)
 	}
 }
 
