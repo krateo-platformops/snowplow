@@ -219,7 +219,7 @@ func TestWrittenObject957_D_AuditCoverageDocNamesEveryAttribute(t *testing.T) {
 	// missing field: emit a second record without a verb.
 	req := httptest.NewRequest(http.MethodPost, "/call?name=x", nil)
 	req.Header.Set("User-Agent", "ua-957")
-	ctx := withRequestFacts(WithSessionID(actorCtx(), "s-957"), req)
+	ctx := withReceivedRequest(WithSessionID(actorCtx(), "s-957"), req)
 	New(rec.Logger("test-957")).Emit(ctx, ev)
 	ev.Verb = ""
 	New(rec.Logger("test-957")).Emit(ctx, ev)

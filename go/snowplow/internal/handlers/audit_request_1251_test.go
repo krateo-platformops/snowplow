@@ -1,8 +1,9 @@
 package handlers
 
 // audit_request_1251_test.go — AUDIT-3 (#1251) at the /call and /export emit
-// sites, through the REAL handlers behind audit.Middleware, as the pod mounts
-// them (newRequestChain), against a fake apiserver.
+// sites: the REAL handlers wrapped in audit.Middleware alone, against a fake
+// apiserver. The pod's whole chain (newServerHandler, newRequestChain) is driven
+// by the main package's arm, main_audit_request_1251_test.go.
 //
 // One arm per shape of the post-release probe on krateo-057 (#1251, final
 // plan): A dry-run POST; B, C, D dry-run PATCH, PATCH of the status

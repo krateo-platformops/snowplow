@@ -63,8 +63,8 @@ The record is an `event.name="audit"` LogRecord with semconv-style attributes
 | `http.response.status_code` | the outcome HTTP code |
 | `session.id` | the business correlation id, read from ctx baggage |
 | `krateo.request.source_ips` | the request's source IPs, k8s audit `sourceIPs` order (`X-Forwarded-For`, `X-Real-Ip`, TCP peer); only the last entry is established by snowplow — see [audit coverage](../docs/architecture/audit-coverage.md#where-the-request-came-from) |
-| `user_agent.original` | the request's `User-Agent`, as received |
-| `krateo.request.uri` | the request target snowplow received, path and query |
+| `user_agent.original` | the request's `User-Agent`, cut at 1024 bytes plus `...TRUNCATED` as the apiserver does |
+| `krateo.request.uri` | the path and query snowplow received (`req.URL.RequestURI()`, as the apiserver records it) |
 | `krateo.audit.no_trace_context` | `true` only in the pathological case of an emit with no active span |
 
 `TraceId`/`SpanId` are stamped onto the LogRecord by the Logs SDK from the

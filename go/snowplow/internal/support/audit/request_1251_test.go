@@ -4,8 +4,11 @@ package audit
 // received with the request it was made on: the source IPs (the apiserver's
 // audit semantics), the User-Agent and the request URI, read once by Middleware.
 //
-//   S  source_ips: X-Forwarded-For entries, then X-Real-Ip, then the TCP peer,
-//      de-duplicated; the peer is always last, whatever the headers claim.
+//   S  source_ips: the X-Forwarded-For entries (repeats kept, non-IPs dropped),
+//      then X-Real-Ip unless already listed, then the TCP peer unless it equals
+//      the last entry; the peer is always last, whatever the headers claim.
+//   U  the URI is req.URL.RequestURI(): path and query, in any request form.
+//   T  the User-Agent is truncated as the apiserver truncates it.
 //   M  Middleware -> Emit stamps all three, typed; the URI keeps its query.
 //   E  the facts are read at the edge: a handler that rewrites the request
 //      afterwards does not change the record.
@@ -13,9 +16,11 @@ package audit
 //      an absent User-Agent writes no attribute.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -138,18 +143,72 @@ func TestRequest1251_E_TheFactsAreReadAtTheEdge(t *testing.T) {
 	}
 }
 
-// A request built in process, never read off a connection, has no RequestURI:
-// its URL is the request target.
-func TestRequest1251_M_InProcessRequestFallsBackToItsURL(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "http://snowplow/export?format=json&name=demo", nil)
-	if err != nil {
-		t.Fatal(err)
+// requestFactsOf is what Emit derives for req: the edge capture, then the
+// derivation, the path every record takes.
+func requestFactsOf(req *http.Request) requestFacts {
+	f, _ := requestFactsFrom(withReceivedRequest(context.Background(), req))
+	return f
+}
+
+// U — the request URI is req.URL.RequestURI(), as the apiserver records it:
+// path and query, never a scheme or host, whatever form the request target
+// was sent in.
+func TestRequest1251_U_RequestURIIsThePathAndQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		req  func(t *testing.T) *http.Request
+		want string
+	}{
+		{"origin form", func(*testing.T) *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/call/dry-run?name=cm-x&note=a%20b", nil)
+		}, "/call/dry-run?name=cm-x&note=a%20b"},
+		{"absolute form", func(t *testing.T) *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "http://snowplow.krateo-system.svc:8081/call/dry-run?name=cm-x", nil)
+			if r.RequestURI != "http://snowplow.krateo-system.svc:8081/call/dry-run?name=cm-x" || r.URL.Host == "" {
+				t.Fatalf("precondition: the target is not absolute-form: RequestURI=%q Host=%q", r.RequestURI, r.URL.Host)
+			}
+			return r
+		}, "/call/dry-run?name=cm-x"},
+		{"built in process (no RequestURI)", func(t *testing.T) *http.Request {
+			r, err := http.NewRequest(http.MethodGet, "http://snowplow/export?format=json&name=demo", nil)
+			if err != nil || r.RequestURI != "" {
+				t.Fatalf("precondition: %v, RequestURI %q", err, r.RequestURI)
+			}
+			return r
+		}, "/export?format=json&name=demo"},
 	}
-	if req.RequestURI != "" {
-		t.Fatalf("precondition: a client request has RequestURI %q", req.RequestURI)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := requestFactsOf(c.req(t)).requestURI; got != c.want {
+				t.Fatalf("requestURI = %q, want %q", got, c.want)
+			}
+		})
 	}
-	if got := requestFactsOf(req).requestURI; got != "/export?format=json&name=demo" {
-		t.Fatalf("requestURI = %q, want the URL's path and query", got)
+}
+
+// T — the User-Agent is bounded as the apiserver bounds it: at most 1024 bytes,
+// then "...TRUNCATED"; a value at the bound is kept whole.
+func TestRequest1251_T_UserAgentIsTruncatedAsTheApiserverDoes(t *testing.T) {
+	huge := strings.Repeat("u", 1<<20) // 1 MiB
+	for _, c := range []struct {
+		name, in, want string
+	}{
+		{"1 MiB", huge, huge[:1024] + "...TRUNCATED"},
+		{"1025 bytes", huge[:1025], huge[:1024] + "...TRUNCATED"},
+		{"exactly 1024 bytes", huge[:1024], huge[:1024]},
+		{"short", "portal/1.0", "portal/1.0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/call?name=x", nil)
+			req.Header.Set("User-Agent", c.in)
+			got := serveAndEmit(t, req, nil)[AttrUserAgent].AsString()
+			if got != c.want {
+				t.Fatalf("%s: len %d (suffix %t), want len %d", AttrUserAgent, len(got), strings.HasSuffix(got, "...TRUNCATED"), len(c.want))
+			}
+			if len(got) > 1024+len("...TRUNCATED") {
+				t.Fatalf("%s is %d bytes, over the apiserver's bound", AttrUserAgent, len(got))
+			}
+		})
 	}
 }
 

@@ -4,7 +4,8 @@
 //
 // PRODUCTION FUNCTIONS UNDER TEST: newServerHandler, newRequestChain,
 // buildLogHandler and mountCallWriteRoutes, as main() composes them, through
-// both log handlers at DEBUG. Only UserConfig is a stand-in (testUserConfig443):
+// both log handlers at DEBUG, installed as the request logger AND as
+// slog.Default (main() does both). Only UserConfig is a stand-in (testUserConfig443):
 // the real one needs a cluster for the clientconfig Secret.
 package main
 
@@ -33,6 +34,13 @@ func TestS1251_RequestFactsReachTheAuditRecordAndNoLogLine(t *testing.T) {
 
 			capture := &lockedBuffer{}
 			log := slog.New(buildLogHandler(h.pretty, slog.LevelDebug, capture))
+			// main() installs the same logger as slog.Default (slog.SetDefault):
+			// a line written through the default logger, not the request's, must
+			// land in the capture too. The audit package has no request logger,
+			// so the default one is where a leak from it would go.
+			prev := slog.Default()
+			slog.SetDefault(log)
+			t.Cleanup(func() { slog.SetDefault(prev) })
 			mux := http.NewServeMux()
 			mountCallWriteRoutes(mux, newRequestChain(log), testUserConfig443(ep))
 			srv := newServerHandler(mux)

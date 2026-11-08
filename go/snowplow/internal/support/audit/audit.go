@@ -111,8 +111,9 @@ func WithSessionID(ctx context.Context, id string) context.Context {
 // request trace id -> minted) and writes it into ctx's W3C baggage as
 // `session.id`, so it (a) is stamped on every AuditEvent and (b) propagates
 // downstream via the Baggage propagator. Snowplow is the id origin. It also
-// carries on ctx what the request was received with — its source IPs, User-Agent
-// and request URI (#1251, request.go) — which Emit stamps on every record. It is
+// captures on ctx the raw values the request was received with (peer address,
+// forwarding headers, User-Agent, URL; #1251, request.go), from which Emit
+// derives the source IPs, User-Agent and request URI of every record. It is
 // additive-only: no request is ever rejected here.
 func Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -128,7 +129,7 @@ func Middleware() func(http.Handler) http.Handler {
 				id = NewID()
 			}
 			ctx = WithSessionID(ctx, id)
-			ctx = withRequestFacts(ctx, req)
+			ctx = withReceivedRequest(ctx, req)
 			next.ServeHTTP(wri, req.WithContext(ctx))
 		})
 	}

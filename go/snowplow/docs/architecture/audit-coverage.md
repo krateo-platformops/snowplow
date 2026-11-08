@@ -62,9 +62,9 @@ semantics (`sourceIPs`, `userAgent`, `requestURI`):
 
 | attribute | k8s audit field | value |
 |---|---|---|
-| `krateo.request.source_ips` | `sourceIPs` | a string list: the `X-Forwarded-For` entries, then `X-Real-Ip`, then the address of the TCP peer, de-duplicated, in that order (`k8s.io/apimachinery` `utilnet.SourceIPs`, the function the apiserver's audit calls). A malformed entry is dropped |
-| `user_agent.original` | `userAgent` | the `User-Agent` header, as received |
-| `krateo.request.uri` | `requestURI` | the request target, path and query, as snowplow received it (e.g. `/call/dry-run?apiVersion=v1&resource=configmaps&namespace=default&name=cm-x`). A proxy that rewrites the path changes it first: on krateo-057 the gateway's HTTPRoute rewrites the `/content` prefix to `/`, so a browser's `/content/call/…` is recorded as `/call/…` |
+| `krateo.request.source_ips` | `sourceIPs` | a string list, built by `k8s.io/apimachinery` `utilnet.SourceIPs`, the function the apiserver's audit calls. In order: each entry of the first `X-Forwarded-For` header line, trimmed, and dropped when it is not an IP (repeated entries are **kept**); then `X-Real-Ip`, when it is an IP not already in the list; then the address of the TCP peer, unless it equals the last entry so far |
+| `user_agent.original` | `userAgent` | the `User-Agent` header, bounded as the apiserver bounds it (`k8s.io/apiserver` `pkg/audit/request.go`, `maybeTruncateUserAgent`): a value longer than 1024 bytes is cut at 1024 bytes and `...TRUNCATED` is appended |
+| `krateo.request.uri` | `requestURI` | `req.URL.RequestURI()`, as the apiserver records it: the path and query snowplow received, never a scheme or host, even for an absolute-form request target (e.g. `/call/dry-run?apiVersion=v1&resource=configmaps&namespace=default&name=cm-x`). A proxy that rewrites the path changes it first: on krateo-057 the gateway's HTTPRoute rewrites the `/content` prefix to `/`, so a browser's `/content/call/…` is recorded as `/call/…`. The apiserver does not bound it and neither does snowplow: Go's HTTP server bounds the request line together with the headers (`http.Server.MaxHeaderBytes`, unset in `main.go`, so `http.DefaultMaxHeaderBytes`, 1 MiB) and answers 431 beyond it |
 
 **Which source IP to believe.** Only the **last** entry of
 `krateo.request.source_ips` is established by snowplow: it is the address of
@@ -75,15 +75,19 @@ caller can send any `X-Forwarded-For` it likes, and the gateway appends to it.
 There is no trusted-proxy list and no special case for the gateway. Read the
 entries from the end: the last is a fact, the one before it is what the hop you
 trust (if you trust it) says it received from, and so on. If the peer's address
-equals the last forwarded entry it is not repeated, so the last entry is still
-the peer's.
+equals the last forwarded entry it is not repeated, so the last entry is the
+peer's either way. Earlier entries can repeat, the peer's address included: a
+chain that claims the peer first records it twice, first and last.
 
-The three facts are read once, by `audit.Middleware` at the edge of the request
-chain, before any handler runs, and the emitter writes them on every record made
-for that request: a `/call` write, an export, and each RESTAction stage write
-the request caused. A stage record therefore carries the URI of the `/call` or
-`/export` that snowplow received, never the stage's own outbound path (see
-"What a record never holds"). No emit site supplies them, so none can take them
+The three facts are captured once, by `audit.Middleware` at the edge of the
+request chain, before any handler runs: the raw header values, the peer address
+and a copy of the URL. Nothing is parsed there, so a request that never emits a
+record (most are reads) pays only the capture. The emitter derives the
+attributes from that capture on every record made for the request: a `/call`
+write, an export, and each RESTAction stage write the request caused. An export
+never sends a write stage (#903), so a stage record carries the URI of the
+`/call` snowplow received, never the stage's own outbound path (see "What a
+record never holds"). No emit site supplies them, so none can take them
 from a field of a request body. `TestRequest1251_*` (`internal/support/audit`)
 and `TestCall1251_*` / `TestExport1251_*` (`internal/handlers`) pin this.
 
@@ -128,8 +132,8 @@ table does not name.
 | `krateo.restaction.namespace`, `krateo.restaction.name`, `krateo.restaction.stage` | the RESTAction and stage that acted |
 | `session.id` | the session id, from W3C baggage |
 | `krateo.request.source_ips` | a string list: the request's source IPs; only the last entry (the TCP peer) is established by snowplow (see "Where the request came from") |
-| `user_agent.original` | the request's `User-Agent` header, as received |
-| `krateo.request.uri` | the request target snowplow received, path and query |
+| `user_agent.original` | the request's `User-Agent` header, cut at 1024 bytes plus `...TRUNCATED` as the apiserver does |
+| `krateo.request.uri` | the path and query snowplow received (`req.URL.RequestURI()`, as the apiserver records it) |
 | `krateo.audit.incomplete` | the required fields the site did not supply, e.g. `method,target` |
 | `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
 
