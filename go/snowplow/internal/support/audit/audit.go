@@ -300,7 +300,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	now := time.Now()
 	rec.SetTimestamp(now)
 	rec.SetObservedTimestamp(now)
-	rec.SetBody(attribute.StringValue(validUTF8(ev.Message)))
+	rec.SetBody(validUTF8Value(attribute.StringValue(ev.Message)))
 
 	// Severity from outcome. Success (or unset) => Info; anything else
 	// (failure/denied) => Error.
@@ -411,25 +411,72 @@ func validUTF8(s string) string {
 	return strings.ToValidUTF8(s, utf8Replacement)
 }
 
-// validUTF8Attr is validUTF8 applied to a string or string-slice attribute;
-// any other attribute is returned unchanged.
+// validUTF8Attr is validUTF8Value applied to an attribute: its key and,
+// recursively, every string its value holds.
 func validUTF8Attr(kv attribute.KeyValue) attribute.KeyValue {
-	switch kv.Value.Type() {
+	return attribute.KeyValue{Key: attribute.Key(validUTF8(string(kv.Key))), Value: validUTF8Value(kv.Value)}
+}
+
+// validUTF8Value returns v with every string it holds made valid UTF-8, at any
+// depth. It is TOTAL over the attribute value kinds of
+// go.opentelemetry.io/otel/attribute (v1.45.0): every kind has its own case,
+// and TestUTF8_1251_K fails when the API defines a kind this switch does not
+// name. The record body is an attribute.Value too (log API v0.21.0), so the
+// body takes the same path.
+//
+//   - STRING, STRINGSLICE: each string is made valid.
+//   - SLICE, MAP: recursed; a MAP's keys are strings on the wire too.
+//   - BYTESLICE: left as it is. OTLP carries it as AnyValue.bytes_value, a
+//     protobuf `bytes` field, which has no UTF-8 requirement (otlploghttp
+//     v0.21.0 internal/transform/log.go AttrValue).
+//   - EMPTY, BOOL, INT64, FLOAT64 and their slices: hold no string.
+//
+// An unknown kind is returned unchanged: the exporter writes such a value as
+// the string "INVALID" (AttrValue's default), which cannot poison a batch.
+func validUTF8Value(v attribute.Value) attribute.Value {
+	switch v.Type() {
 	case attribute.STRING:
-		if v := kv.Value.AsString(); !utf8.ValidString(v) {
-			return attribute.String(string(kv.Key), validUTF8(v))
+		if s := v.AsString(); !utf8.ValidString(s) {
+			return attribute.StringValue(validUTF8(s))
 		}
 	case attribute.STRINGSLICE:
-		vs := kv.Value.AsStringSlice()
-		for i, v := range vs {
-			if !utf8.ValidString(v) {
+		vs := v.AsStringSlice()
+		for i, s := range vs {
+			if !utf8.ValidString(s) {
 				out := slices.Clone(vs)
 				for j := i; j < len(out); j++ {
 					out[j] = validUTF8(out[j])
 				}
-				return attribute.StringSlice(string(kv.Key), out)
+				return attribute.StringSliceValue(out)
 			}
 		}
+	case attribute.SLICE:
+		vs := v.AsSlice()
+		out := make([]attribute.Value, len(vs))
+		for i, e := range vs {
+			out[i] = validUTF8Value(e)
+		}
+		return attribute.SliceValue(out...)
+	case attribute.MAP:
+		kvs := v.AsMap()
+		out := make([]attribute.KeyValue, len(kvs))
+		for i, kv := range kvs {
+			out[i] = validUTF8Attr(kv)
+		}
+		return attribute.MapValue(out...)
+	case attribute.BYTESLICE:
+		// protobuf bytes: no UTF-8 requirement (see above).
+	case attribute.EMPTY, attribute.BOOL, attribute.INT64, attribute.FLOAT64,
+		attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE:
+		// no string inside.
 	}
-	return kv
+	return v
+}
+
+// utf8KindsHandled names every attribute kind validUTF8Value has a case for;
+// TestUTF8_1251_K compares it with the kinds the API defines.
+var utf8KindsHandled = []attribute.Type{
+	attribute.STRING, attribute.STRINGSLICE, attribute.SLICE, attribute.MAP, attribute.BYTESLICE,
+	attribute.EMPTY, attribute.BOOL, attribute.INT64, attribute.FLOAT64,
+	attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE,
 }

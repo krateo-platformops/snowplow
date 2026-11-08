@@ -92,8 +92,12 @@ from a field of a request body. `TestRequest1251_*` (`internal/support/audit`)
 and `TestCall1251_*` / `TestExport1251_*` (`internal/handlers`) pin this.
 
 **Every string is valid UTF-8.** The emitter replaces every invalid UTF-8
-sequence with U+FFFD in every string and string-list attribute and in the record
-body, in one place (`audit.Emitter.Emit`), for every emit site. The reason: the
+sequence with U+FFFD in every string an attribute or the record body holds, at
+any depth (a string list, a nested list, a map's keys and values), in one place
+(`audit.Emitter.Emit`), for every emit site. The rule is total over the value
+kinds of the otel attribute API: a byte list is left as it is (OTLP carries it
+as protobuf `bytes`, which need not be UTF-8), and a kind an otel upgrade adds
+fails `TestUTF8_1251_K` until it gets its own case. The reason: the
 OTLP exporter marshals with protobuf, which refuses a string that is not valid
 UTF-8, and the batch processor then drops the **whole batch**. So one request
 with a raw `0xFF` in its User-Agent or query, or a `name=cm-%FF` that decodes to
