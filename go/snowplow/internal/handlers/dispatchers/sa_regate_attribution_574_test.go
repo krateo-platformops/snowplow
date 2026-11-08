@@ -367,6 +367,38 @@ type sar574Outcome struct {
 	extSkipDelta  uint64
 	stageErrDelta uint64
 	cellHasMarker bool
+	// #1255 — a permanent decline of the resident cell evicts it (and its
+	// suppression marker goes with it): the eviction count and residency after.
+	evictUnstorableDelta uint64
+	// #1255 F4 — the same eviction counted under its reason, declared_write.
+	evictDeclaredWriteDelta uint64
+	resident                bool
+}
+
+// sar574DeclinedAsDeclaredWrite asserts the refresher declined the re-Put as a
+// declared write. Since #1255 a permanent decline of a resident cell EVICTS it,
+// so the suppression marker leaves with the key; the decline is then read off
+// the eviction's own reason (snowplow_l1_evict_unstorable_total{reason}), which
+// must be declared_write, with neither the external nor the stage-error decline
+// counted. With no resident cell left to evict, the marker itself must say
+// declared_write.
+func sar574DeclinedAsDeclaredWrite(t *testing.T, arm string, got sar574Outcome) {
+	t.Helper()
+	if got.extSkipDelta != 0 || got.stageErrDelta != 0 {
+		t.Fatalf("%s: the refresher must decline a write RESTAction as declared_write, not as external (%d) or a stage error (%d)",
+			arm, got.extSkipDelta, got.stageErrDelta)
+	}
+	if got.evictUnstorableDelta != 0 || !got.resident {
+		if got.evictUnstorableDelta != 1 || got.evictDeclaredWriteDelta != 1 || got.resident {
+			t.Fatalf("%s: the resident cell must be evicted exactly once, as declared_write (evictions=%d, as declared_write=%d, "+
+				"resident=%v)", arm, got.evictUnstorableDelta, got.evictDeclaredWriteDelta, got.resident)
+		}
+		return
+	}
+	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
+		t.Fatalf("%s: the refresher must decline a write RESTAction as declared_write: neither evicted as unstorable "+
+			"(delta=%d resident=%v) nor suppressed (suppressed=%v reason=%q)", arm, got.evictUnstorableDelta, got.resident, ok, r)
+	}
 }
 
 // sar574Refresh drives the REAL refresher entry point for an already-resident
@@ -401,12 +433,17 @@ func sar574Refresh(t *testing.T, ctx context.Context, srv *sar574Server, ns, nam
 
 	ext0 := cache.ExternalSkippedPut()
 	se0 := cache.RefresherSkippedStageError()
+	ev0 := store.Stats().EvictUnstorableTotal
+	evDW0 := cache.EvictUnstorableReasonCountForTest(string(cache.PutReasonDeclaredWrite))
 
 	saEP := &endpoints.Endpoint{ServerURL: srv.srv.URL, Token: sar574SAToken}
 	saRC := &rest.Config{Host: srv.srv.URL, BearerToken: sar574SAToken}
 	err := resolveAndPopulateL1(ctx, inputs, saEP, saRC)
 
 	out := sar574Outcome{key: key}
+	out.evictUnstorableDelta = store.Stats().EvictUnstorableTotal - ev0
+	out.evictDeclaredWriteDelta = cache.EvictUnstorableReasonCountForTest(string(cache.PutReasonDeclaredWrite)) - evDW0
+	out.resident = store.Has(key)
 	out.dialed, out.dialAuth = srv.saw(wantMethod, wantPath)
 	out.extSkipDelta = cache.ExternalSkippedPut() - ext0
 	out.stageErrDelta = cache.RefresherSkippedStageError() - se0
@@ -514,10 +551,7 @@ func TestIssue574SAR_B1s_BackgroundSARIsAWrite_NeverSent(t *testing.T) {
 	// #912 re-review — the RESTAction declares a write, so the shared Put-gate
 	// verdict declines the re-Put as declared_write (permanent), not as a
 	// stage error or an external touch.
-	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
-		t.Fatalf("B1s: the refresher must decline a write RESTAction as declared_write; suppressed=%v reason=%q "+
-			"(external_skip_delta=%d stage_err_skip_delta=%d)", ok, r, got.extSkipDelta, got.stageErrDelta)
-	}
+	sar574DeclinedAsDeclaredWrite(t, "B1s", got)
 	if d := restactionsapi.BackgroundWriteRefusedSnapshot()[cache.BackgroundOriginRefresher] - before; d < 1 {
 		t.Fatalf("#903: the refusal must be counted under origin=refresher (delta %d)", d)
 	}
@@ -677,9 +711,6 @@ func TestIssue574SAR_A1b_GateStoodDown_SARResultStillNotRePut(t *testing.T) {
 	if got.cellHasMarker {
 		t.Fatalf("A1b: the cell carries a SAR decision although no SAR was sent")
 	}
-	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
-		t.Fatalf("A1b: the re-Put of a RESTAction that declares a write must be declined as declared_write; "+
-			"suppressed=%v reason=%q (external_skip_delta=%d stage_err_skip_delta=%d)", ok, r, got.extSkipDelta, got.stageErrDelta)
-	}
+	sar574DeclinedAsDeclaredWrite(t, "A1b", got)
 	t.Logf("A1b MEASURED: SAR dialed=false (#903), cell re-Put=false, decline=declared_write")
 }

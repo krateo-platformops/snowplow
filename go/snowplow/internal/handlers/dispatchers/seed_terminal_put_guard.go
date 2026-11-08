@@ -236,8 +236,14 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, v cache.PutVerdict
 	// to boot seeds too — #323's boot exemption is about LRU eviction, not about
 	// writing a body into the wrong identity class. Runs BEFORE every write below,
 	// the pre-readyz PutThenRemark included (#408).
-	// #398 — a seed resolve that read a sensitive resource writes nothing.
+	// #398 — a seed resolve that read a sensitive resource writes nothing, and
+	// (#1255) evicts an older entry: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(ctx) {
+		var inputs *cache.ResolvedKeyInputs
+		if entry != nil {
+			inputs = entry.Inputs
+		}
+		evictUnstorable(ctx, inClassEvicter(ctx, handle, inputs), key, cache.UnstorableSensitive)
 		return false
 	}
 	if entry != nil {

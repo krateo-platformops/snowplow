@@ -601,7 +601,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
-		// the body, persist it nowhere.
+		// the body, persist it nowhere. #1255 — and evict an older cell of this key
+		// (a #547 demand revalidation re-enters here over one): no writer can
+		// ever replace it.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "body served (200); not persisted — Secret reads are always live (#398)"),
@@ -615,6 +618,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
 		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
+		// #1255 — the same class-driven gate as the refresher's: an older cell of
+		// this key can never be replaced, so it is evicted.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
 		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
 		// snowplow_restactions_uaf_put_declined_total carries the rate.
@@ -630,6 +636,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// The shared Put-gate verdict (cache.PutGateVerdict): a declared write
 		// (#903 F1), a stage error that is not per-identity forbidden (#681), a
 		// genuine external touch. Each reason keeps its own log and counter.
+		// #1255 — a PERMANENT decline also evicts an older cell of this key (a
+		// #547 demand revalidation re-enters here over a resident known-stale
+		// one): no writer can ever replace it. A transient one keeps it.
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			// DEBUG: designed, and it fires on every /call of a write RESTAction.

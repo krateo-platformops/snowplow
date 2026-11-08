@@ -318,6 +318,10 @@ func populateWidgetContentL1(
 	// refuse it anyway). recordWidgetDeps is ALSO skipped on a declined path —
 	// there is no entry to dep-track.
 	if !verdict.Store() {
+		// #1255 — a PERMANENT decline evicts an older shell of this key (the
+		// keep-warm walk re-resolves resident shells): no writer can ever replace
+		// it. A transient decline keeps it.
+		evictOnPermanentDecline(ctx, c, verdict, key)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			log.Debug("widget_content.populate.skip_declared_write",
@@ -387,6 +391,8 @@ func populateWidgetContentL1(
 	// gate makes the property hold by OBSERVATION rather than by that argument.
 	if uafSink := cache.UAFTouchedSinkFromContext(ctx); uafSink.Count() > 0 {
 		cache.BumpWidgetsUAFPutDeclined()
+		// #1255 — an older shell of this key can never be replaced: evict it.
+		evictUnstorable(ctx, c, key, cache.UnstorableUAF)
 		log.Debug("widget_content.populate.skip_user_access_filter",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -402,6 +408,8 @@ func populateWidgetContentL1(
 
 	// #398 — the identity-FREE content shell must never hold a Secret body.
 	if cache.DeclineSensitivePut(ctx) {
+		// #1255 — an older shell of this key can never be replaced: evict it.
+		evictUnstorable(ctx, c, key, cache.UnstorableSensitive)
 		log.Debug("widget_content.populate_declined_sensitive",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),

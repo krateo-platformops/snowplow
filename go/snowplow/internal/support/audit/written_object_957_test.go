@@ -20,6 +20,7 @@ package audit
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -212,10 +213,13 @@ func TestWrittenObject957_D_AuditCoverageDocNamesEveryAttribute(t *testing.T) {
 	fillEveryField(t, &ev)
 	ev.Outcome = "failure" // outcome is a closed set; any value reaches the record
 	// The context carries what the emitter reads besides the Event: the actor
-	// and groups (actorCtx), the session id. It has no span, so the
+	// and groups (actorCtx), the session id and what the request was received
+	// with (#1251: source IPs, User-Agent, request URI). It has no span, so the
 	// no-trace-context marker is written too. krateo.audit.incomplete needs a
 	// missing field: emit a second record without a verb.
-	ctx := WithSessionID(actorCtx(), "s-957")
+	req := httptest.NewRequest(http.MethodPost, "/call?name=x", nil)
+	req.Header.Set("User-Agent", "ua-957")
+	ctx := withReceivedRequest(WithSessionID(actorCtx(), "s-957"), req)
 	New(rec.Logger("test-957")).Emit(ctx, ev)
 	ev.Verb = ""
 	New(rec.Logger("test-957")).Emit(ctx, ev)
@@ -226,7 +230,8 @@ func TestWrittenObject957_D_AuditCoverageDocNamesEveryAttribute(t *testing.T) {
 			keys[string(kv.Key)] = true
 		}
 	}
-	for _, must := range []string{"k8s.object.uid", "k8s.object.generation", "k8s.object.resource_version", "krateo.audit.incomplete"} {
+	for _, must := range []string{"k8s.object.uid", "k8s.object.generation", "k8s.object.resource_version", "krateo.audit.incomplete",
+		AttrSourceIPs, AttrUserAgent, AttrRequestURI} {
 		if !keys[must] {
 			t.Fatalf("precondition: the fully-set records do not carry %s (got %v)", must, keys)
 		}

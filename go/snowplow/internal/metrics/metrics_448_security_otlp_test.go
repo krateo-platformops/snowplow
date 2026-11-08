@@ -65,6 +65,7 @@ var security448Labelled = []string{
 	"snowplow_l1_identity_class_drift_declined_total",
 	"snowplow_l1_representative_repick_total",
 	"snowplow_resolved_cache_remint_total", // #378
+	"snowplow_l1_evict_unstorable_total",   // #1255
 	"snowplow_learned_classes_capacity",
 	"snowplow_learned_classes_capacity_bound",
 }
@@ -143,6 +144,11 @@ func c7Seed448(t *testing.T) c7Want448 {
 	// through the real refresher terminal: TestIssue378_D3_P1SeriesLeaveTheProcessOnOTLP).
 	for _, c := range cache.ResolvedCacheRemintByClass() {
 		want[seriesID("snowplow_resolved_cache_remint_total", map[string]string{"class": c.Class})] = int64(c.Count)
+	}
+	// --- #1255 unstorable evictions by reason: the full closed set, live values
+	// (TestIssue1255_U7 drives distinct counts through the real store).
+	for _, c := range cache.EvictUnstorableByReason() {
+		want[seriesID("snowplow_l1_evict_unstorable_total", map[string]string{"reason": c.Reason})] = int64(c.Count)
 	}
 
 	// --- #424 binding-set memo, driven through the real memo against one
@@ -226,6 +232,7 @@ var security448Counters = map[string]bool{
 	"snowplow_l1_identity_class_drift_declined_total": true,
 	"snowplow_l1_representative_repick_total":         true,
 	"snowplow_resolved_cache_remint_total":            true, // #378: the live query reads otel_metrics_sum
+	"snowplow_l1_evict_unstorable_total":              true, // #1255
 	"snowplow_binding_set_memo_hits":                  true,
 	"snowplow_binding_set_memo_misses":                true,
 	"snowplow_binding_set_memo_refused":               true,
@@ -365,8 +372,10 @@ func TestIssue448_AttributeHygiene_ClosedSetsNoIdentity(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	c7Seed448(t)
 	allowed := map[string]map[string]bool{
-		"site":    setOf(dispatchers.IdentityClassDriftSites),
-		"reason":  setOf(dispatchers.IdentityClassDriftReasons),
+		"site": setOf(dispatchers.IdentityClassDriftSites),
+		// The #424 drift reasons and the #1255 unstorable-eviction reasons
+		// (disjoint closed sets, one attribute key).
+		"reason":  setOf(append(append([]string{}, dispatchers.IdentityClassDriftReasons...), cache.EvictUnstorableReasons...)),
 		"outcome": setOf(dispatchers.RepresentativeRepickOutcomes),
 		"stat":    setOf(learnedCapacityStats),
 		"bound":   setOf(learnedBounds),
@@ -379,6 +388,7 @@ func TestIssue448_AttributeHygiene_ClosedSetsNoIdentity(t *testing.T) {
 			!strings.HasPrefix(p.metric, "snowplow_l1_representative_repick") &&
 			!strings.HasPrefix(p.metric, "snowplow_binding_set_memo") &&
 			!strings.HasPrefix(p.metric, "snowplow_resolved_cache_remint") &&
+			!strings.HasPrefix(p.metric, "snowplow_l1_evict_unstorable") &&
 			!strings.HasPrefix(p.metric, "snowplow_learned_") {
 			continue
 		}

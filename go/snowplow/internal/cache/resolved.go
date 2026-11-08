@@ -811,6 +811,9 @@ type ResolvedCacheStore struct {
 	// representative could be found to refresh them (a cold, correct refill
 	// instead of a stale cell until the TTL).
 	evictNoRepresentativeTotal atomic.Uint64
+	// #1255: cells evicted because a later resolve of their key proved it can
+	// no longer be stored (EvictOnPermanentDecline / EvictUnstorable).
+	evictUnstorableTotal atomic.Uint64
 
 	// #248 — resident cells carrying a live refreshSuppressed marker, recomputed
 	// on every reaper walk (startResolvedCacheSummary tick). This is a GAUGE, not
@@ -2660,7 +2663,9 @@ type ResolvedCacheStats struct {
 	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (Get-lazy + #248 reaper)
 	// #444: evicted by the refresher because no in-class representative was found.
 	EvictNoRepresentativeTotal uint64
-	EvictDeleteTotal           uint64 // 0.30.8: DELETE-event-driven evictions
+	// #1255: evicted because a later resolve proved the key can no longer be stored.
+	EvictUnstorableTotal uint64
+	EvictDeleteTotal     uint64 // 0.30.8: DELETE-event-driven evictions
 
 	// #248 — resident-suppressed gauge (see suppressedResidentGauge). Non-zero
 	// DURING the UAF-decline-freeze; distinguishes decline-frozen from
@@ -2816,6 +2821,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictTTLTotal:                c.evictTTLTotal.Load(),
 		EvictMaxAgeTotal:             c.evictMaxAgeTotal.Load(),
 		EvictNoRepresentativeTotal:   c.evictNoRepresentativeTotal.Load(),
+		EvictUnstorableTotal:         c.evictUnstorableTotal.Load(),
 		EvictDeleteTotal:             c.evictDeleteTotal.Load(),
 		SuppressedResident:           c.suppressedResidentGauge.Load(),
 		WarmPastMaxAge:               c.warmPastMaxAgeGauge.Load(),
