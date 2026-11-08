@@ -25,7 +25,10 @@ type auditTarget struct {
 // export: its format and row counts). So every audited request names its
 // target by the same attributes (k8s.resource.group, version, resource,
 // subresource, name and k8s.namespace.name), and none carries a method it was
-// not sent with (#1055).
+// not sent with (#1055). What the request was received with (source IPs,
+// User-Agent, request URI, #1251) is not built here: audit.Middleware reads it
+// at the edge and the emitter stamps it on every record, this one and a
+// RESTAction stage's alike (internal/support/audit/request.go).
 func requestAuditEvent(action, method string, t auditTarget, outcome string, code int) audit.Event {
 	return audit.Event{
 		Action:      action,
