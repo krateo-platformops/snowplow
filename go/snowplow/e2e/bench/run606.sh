@@ -1550,6 +1550,7 @@ s_measure() {
   # snowplow's restart state BEFORE measure (the verdict compares after/before:
   # any restart or OOM during measure makes the run INVALID, with its reason).
   snowplow_pod_record before
+  tracing_reading before
   # Standard memory capture (#710): kubectl top every TOP_POLL_S from here
   # (each sample bounded by it, #919), plus the in-cluster mem606 Job
   # (memstats + heap profiles, metadata only). The boot's own samples end here.
@@ -1859,6 +1860,25 @@ snowplow_pod_record() {
     || log "could not record the snowplow pod ($phase); the verdict will say restart state unknown"
   log "snowplow pod ($phase): $(cat "$OUT/pod-$phase.jsonl" 2>/dev/null | cut -c1-240)"
 }
+# tracing_reading <before|after> (run 23): was the measured snowplow tracing? Its container's
+# effective OTEL_* keys (env + envFrom ConfigMaps, OTEL_* only, never a Secret), the sampler, and
+# an OTLP receiver on its node at the endpoint's port (a Running, Ready pod with that hostPort),
+# read with kubectl only, into $OUT/tracing.json (bench/tracing.py). Taken with each pod record;
+# evaluate shows it as INFO lines, never judged. All of the reading's reads share ONE bound;
+# a reading that fails leaves that phase UNKNOWN, never "off".
+tracing_reading() {
+  local phase="$1" line
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.tracing read --phase $phase --out $OUT/tracing.json -- ${K[*]} (snowplow pod, krateo-system ConfigMaps, the pods on its node)"
+    return 0
+  fi
+  if line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.tracing read --phase "$phase" --out "$OUT/tracing.json" \
+               --selector "$SNOWPLOW_POD_SELECTOR" --timeout-s "$COLLECT_TIMEOUT_S" -- "${K[@]}" 2>"$KERR")"; then
+    log "tracing ($phase): $line"
+  else
+    log "could not record the tracing state ($phase): $(kerr_line); the verdict will say it is UNKNOWN"
+  fi
+}
 # start_sampler <kind> <file> <kubectl args...> (#919): every TOP_POLL_S, one
 # kubectl read of the bench cluster, one record in <file> (bench/sampler.py).
 # Each sample is bounded by its period — kubectl's own --request-timeout and
@@ -2033,6 +2053,7 @@ s_collect() {
       || log "could not read the fresh606 log from ${p#pod/}"
   done
   snowplow_pod_record after
+  tracing_reading after
   # #1089: the netns606 samples (the TCP path under snowplow), report only;
   # flushed per line, so a copy at any moment holds whole samples
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=netns606 -o name); do
@@ -2147,13 +2168,15 @@ s_evaluate() {
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
+  # run 23: the tracing readings (tracing_reading), INFO lines; a missing file reads UNKNOWN
+  local trargs=(--tracing "$OUT/tracing.json")
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${apfargs[*]}"; return 0
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${apfargs[*]}"; return 0
   fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
@@ -2169,7 +2192,7 @@ s_evaluate() {
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
-      ${k6args[@]+"${k6args[@]}"} "${apfargs[@]}" > "$OUT/verdict.json" || vrc=$?
+      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${apfargs[@]}" > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   : > "$VERDICT_MARK"        # #1051: the verdict is final; teardown never recomputes it
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
@@ -2183,6 +2206,12 @@ s_evaluate() {
   while IFS= read -r r; do
     [[ -n "$r" ]] && log "WARNING: $r"
   done < <(python3 -c 'import json, sys; print("\n".join((json.load(open(sys.argv[1])).get("report") or {}).get("report_warnings") or []))' \
+             "$OUT/verdict.json" 2>/dev/null || true)
+  # run 23: was snowplow tracing, and its connection reuse per egress (INFO, never judged): in the run log
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "$r"
+  done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
+print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever
   # it is. Without this the loop's last `[[ -n "" ]]` (no warnings) was the
