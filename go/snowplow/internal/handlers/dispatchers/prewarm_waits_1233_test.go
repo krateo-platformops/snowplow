@@ -39,8 +39,10 @@ import (
 // lets the LIST through. Inside that watcher's initial publish, before the
 // signal, env becomes the process's watcher again and republishes its complete
 // snapshot, so a unit that waited resumes on exactly the environment it was set
-// up for.
-func gap1233(t *testing.T, env *cache.ResourceWatcher) (release func()) {
+// up for. envKinds are the environment's other list kinds: a unit that does not
+// wait then lists them on the booting watcher and finds nothing, instead of
+// panicking the fake client.
+func gap1233(t *testing.T, env *cache.ResourceWatcher, envKinds map[schema.GroupVersionResource]string) (release func()) {
 	t.Helper()
 	if env == nil || !cache.RBACSnapshotComplete() {
 		t.Fatal("PRECONDITION: gap1233 needs a synced environment with a complete RBAC snapshot")
@@ -53,6 +55,9 @@ func gap1233(t *testing.T, env *cache.ResourceWatcher) (release func()) {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+	}
+	for gvr, kind := range envKinds {
+		kinds[gvr] = kind
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, kinds)
 	var released atomic.Bool
@@ -104,6 +109,12 @@ func ran1233(t *testing.T, done <-chan struct{}, what string) {
 	}
 }
 
+// The list kinds of the two environments the arms use, besides RBAC's.
+var (
+	a1Kinds1233   = map[schema.GroupVersionResource]string{h1RAGVR: "RESTActionList", h1WidgetGVR: "PanelList"}
+	h643Kinds1233 = map[schema.GroupVersionResource]string{h643RAGVR: "RESTActionList", h643WidgetGVR: "PanelList", h643ThingsGVR: "H643ThingList"}
+)
+
 func resident1233() int { return cache.ResolvedCache().Len() }
 
 // Step 7.1: the phase-1 walk calls its writers (here the content-prewarm step)
@@ -116,7 +127,7 @@ func TestIssue1233_TheWalkCallsItsWritersOnlyAfterTheCompleteSnapshot(t *testing
 	env := cache.Global()
 	cache.ResetPhase1DoneForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	release := gap1233(t, env)
+	release := gap1233(t, env, a1Kinds1233)
 
 	declined0 := cache.PutDeclinedRBACIncompleteTotal()
 	var called atomic.Bool
@@ -178,7 +189,7 @@ func TestIssue1233_AWidgetSeedWaitsForTheCompleteSnapshotAndLosesNoCell(t *testi
 		resolves.Add(1)
 		return h1WidgetUnstructured(map[string]any{"apiRef": map[string]any{"name": a1RAName2, "namespace": h1NS}}), nil
 	}
-	release := gap1233(t, env)
+	release := gap1233(t, env, a1Kinds1233)
 
 	label := cache.BackgroundOriginCohortSeed + "/widgets"
 	declined0 := cache.PutDeclinedRBACIncompleteTotal()
@@ -223,7 +234,7 @@ func TestIssue1233_TheContentPrewarmWaitsForTheCompleteSnapshotAndLosesNoCell(t 
 	if len(env.deps.harvester.snapshot()) == 0 {
 		t.Fatal("PRECONDITION: the pass needs a harvested data source")
 	}
-	release := gap1233(t, env.rw)
+	release := gap1233(t, env.rw, h643Kinds1233)
 
 	declined0 := cache.PutDeclinedRBACIncompleteTotal()
 	resident0 := resident1233()
@@ -263,7 +274,7 @@ func TestIssue1233_TheClusterListPrewarmWaitsForTheCompleteSnapshotAndLosesNoCel
 		t.Fatal("PRECONDITION: the prewarm needs a harvested RESTAction")
 	}
 	prewarm := makeClusterListPrewarmFn(env.deps.harvester, env.deps.saEP, env.deps.saRC, env.deps.authnNS)
-	release := gap1233(t, env.rw)
+	release := gap1233(t, env.rw, h643Kinds1233)
 
 	declined0 := cache.PutDeclinedRBACIncompleteTotal()
 	resident0 := resident1233()
