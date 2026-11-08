@@ -7,6 +7,20 @@
 # verdict per PAIR (bench/custlat.py pair: the candidate against the baseline
 # per phase, the spread from the baseline's own data).
 #
+# LAUNCH (run 23 on): a paid launch is started DETACHED, never as a child of
+# the session that types it. Run 22's launcher was killed when the Claude Code
+# session restarted (its SIGTERM reached the process tree) and its teardown did
+# not complete; macOS has no setsid(1). From this directory:
+#   <every variable below> python3 -m bench.detach --log <LOG> --pidfile <PIDFILE> \
+#       -- bash run606_pair.sh
+# It prints the pid and returns at once; the launcher runs in a session and a
+# process group of its own, re-parented away from the session, SIGHUP ignored,
+# stdin /dev/null, stdout and stderr appended to <LOG> (bench/detach.py). Keep
+# <LOG> and <PIDFILE> outside every run's OUT and PAIR_OUT. Watch it with
+# `tail -f <LOG>` (and PAIR_OUT/pair.log); stop it with
+# `kill -TERM "$(cat <PIDFILE>)"`, which stops every run below, each tearing
+# its own cluster down. A BENCH_606_DRY_RUN=1 pass needs no detaching.
+#
 # RUNS  (default "A B"): the runs' labels, each [A-Z][A-Z0-9]*, two or more.
 # PAIRS (default "A:B"): the comparisons, each BASELINE:CANDIDATE, both labels
 #       in RUNS. A run may sit in several pairs (run 22: RUNS="R N C",
@@ -338,7 +352,9 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
                 + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
                 + [r["line"] for r in v.get("b_inside_a_outage") or []]
-                + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])))' \
+                + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
+                + ((v.get("tracing_report_only") or {}).get("lines") or [])
+                + ((v.get("egress_connections_report_only") or {}).get("lines") or [])))' \
              "$f" 2>/dev/null || true)
   (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
 done

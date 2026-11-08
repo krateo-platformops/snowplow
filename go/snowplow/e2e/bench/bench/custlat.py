@@ -1732,6 +1732,23 @@ def refresher_tiers_pair(va: dict | None, vb: dict | None, labels: tuple[str, st
     return out
 
 
+def info_lines_pair(va: dict | None, vb: dict | None, section: str, missing: str,
+                    labels: tuple[str, str] = ("A", "B")) -> dict:
+    """Run 23, INFO only: each run's report section `section` (its `lines`), prefixed with the run's
+    label and role, per arm. A verdict without the section (an evaluate before it) says so with
+    `missing` as its state (UNKNOWN, ABSENT), never as off or 0."""
+    out: dict = {"result": "INFO", "lines": []}
+    for x, v in (("a", va), ("b", vb)):
+        role = f"{labels[0]} (baseline)" if x == "a" else f"{labels[1]} (candidate)"
+        r = ((v or {}).get("report") or {}).get(section)
+        out[x] = r if r is not None else {"state": missing,
+                                          "why": f"the run's verdict.json has no {section} "
+                                                 f"(an evaluate before run 23's report)"}
+        out["lines"] += ([f"{role}: {ln}" for ln in r.get("lines") or []] if r is not None else
+                         [f"{role}: INFO {section}: {missing} ({out[x]['why']})"])
+    return out
+
+
 def _unmeasured_section() -> dict:
     return {"status": "UNMEASURED",
             "why": "the run's verdict.json has no refresher_tiers_report_only (an evaluate before #1085's report)"}
@@ -1800,6 +1817,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
         out["refresher_tiers_report_only"] = {"error": f"{type(e).__name__}: {e}",
                                               "lines": [f"refresher tiers: report failed: {type(e).__name__}: {e}"]}
+    # run 23: was each image tracing (bench/tracing.py), and its connection reuse per egress (#1189)
+    for section, missing in (("tracing_report_only", "UNKNOWN"), ("egress_connections_report_only", "ABSENT")):
+        try:
+            out[section] = info_lines_pair(va, vb, section, missing, (a.a_label, a.b_label))
+        except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+            out[section] = {"error": f"{type(e).__name__}: {e}",
+                            "lines": [f"INFO {section}: report failed: {type(e).__name__}: {e}"]}
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

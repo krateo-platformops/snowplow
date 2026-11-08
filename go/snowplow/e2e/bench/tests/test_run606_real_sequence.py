@@ -532,9 +532,15 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         # #922 F3: started a second ago, Ready now (the boot's end)
         now = time.time()
         cs["state"] = {"running": {"startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1))}}
+        # run 23: its env as the chart renders it (envFrom its ConfigMap; HOST_IP from the
+        # downward API; the endpoint entry that expands it), on node n1
         pods = [{"metadata": {"name": "snowplow-abc"},
-                 "spec": {"containers": [{"resources": {"limits": {"memory": "8Gi"}}}]},
-                 "status": {"containerStatuses": [cs],
+                 "spec": {"nodeName": "n1", "containers": [{
+                     "name": "snowplow", "resources": {"limits": {"memory": "8Gi"}},
+                     "envFrom": [{"configMapRef": {"name": "snowplow"}}],
+                     "env": [{"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}},
+                             {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://$(HOST_IP):4318"}]}]},
+                 "status": {"hostIP": "10.0.0.5", "containerStatuses": [cs],
                             "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime":
                                             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}]}}]
         # FAKE_TERMINATING_READS=N: the first N reads also list the old
@@ -819,6 +825,19 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                                       "imageID": f"127.0.0.1:1/krateo/{c}@sha256:" + "0" * 64}]}}
                    for n, c, r in (("oasgen-provider-0", "oasgen-provider", 0),
                                    ("installer-core-provider-0", "core-provider", 1))])
+        if what == "pods" and "--field-selector=spec.nodeName=n1" in a:
+            # run 23: the pods on snowplow's node; FAKE_OTEL_AGENT = ready (default) | not_ready | none:
+            # the collector agent DaemonSet's pod with hostPort 4318
+            mode = os.environ.get("FAKE_OTEL_AGENT", "ready")
+            agent = {"metadata": {"name": "otel-collector-daemonset-agent-x1", "namespace": "krateo-system",
+                                  "ownerReferences": [{"kind": "DaemonSet",
+                                                       "name": "otel-collector-daemonset-agent"}]},
+                     "spec": {"nodeName": "n1", "containers": [{"name": "otc", "ports": [
+                         {"containerPort": 4318, "hostPort": 4318, "protocol": "TCP"}]}]},
+                     "status": {"phase": "Running", "conditions": [{"type": "Ready",
+                                                                    "status": "True" if mode == "ready" else "False"}]}}
+            items([{"metadata": {"name": "snowplow-abc", "namespace": "krateo-system"}, "spec": {"nodeName": "n1"},
+                    "status": {"phase": "Running"}}] + ([] if mode == "none" else [agent]))
         if what == "pods":
             pull = []
             if os.environ.get("FAKE_IMAGE_PULL"):
@@ -931,8 +950,15 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             data = {"COMPOSITION_CONTROLLER_RESYNC_INTERVAL": iv} if src == "configmap" else {"OTHER": "x"}
             # #1004: snowplow's own ConfigMap, its env through envFrom (FAKE_FW_CM: its data)
             fw_cm = json.loads(os.environ.get("FAKE_FW_CM", '{"DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS": "120"}'))
+            # run 23: the chart's OTEL keys in it (FAKE_SNOWPLOW_OTEL: what it holds), last
+            # written long before the snowplow container started
+            otel = json.loads(os.environ.get("FAKE_SNOWPLOW_OTEL", '{"OTEL_ENABLED": "true", '
+                                             '"OTEL_TRACES_SAMPLER": "parentbased_always_on"}'))
             print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data},
-                                        {"metadata": {"name": "snowplow"}, "data": fw_cm}]}))
+                                        {"metadata": {"name": "snowplow", "creationTimestamp": "2026-01-01T00:00:00Z",
+                                                      "managedFields": [{"manager": "helm",
+                                                                         "time": "2026-01-01T00:00:00Z"}]},
+                                         "data": {**fw_cm, **otel}}]}))
             sys.exit(0)
         if what == "svc":
             mode = os.environ.get("FAKE_SVC", "lb")     # lb | clusterip | pending

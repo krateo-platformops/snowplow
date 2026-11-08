@@ -2584,6 +2584,16 @@ SLOW_REQUEST_PREFIX = "snowplow_slow_request"
 # changed Puts per class|tier, the worker wait and the refresh duration per
 # tier (bench/cycle_stale.py); outside snowplow_refresher_, which C7 reserves
 REFRESH_CYCLE_PREFIX = "snowplow_refresh_cycle_"
+# Run 23 (#1189): the connection-reuse reading of the Go 1.27 arm (egress_connections_report).
+# Names as snowplow main publishes them (resolvers/restactions/api/external_fetch_metrics.go, its
+# expvar.Publish calls; cache-gated): snowplow_egress_connections {egress: {protocol: {opened,
+# handovers}}} (#847, credhttp/connections.go: reuse share = 1 - opened / handovers) and
+# snowplow_endpoint_retries_total {site: {cause: n}} (#1088, credhttp/send.go). Images before
+# them serve neither: absent, never 0.
+EGRESS_KEYS = {
+    "connections": "snowplow_egress_connections",
+    "retries": "snowplow_endpoint_retries_total",
+}
 # #1082: stale serve -> the replacing frame written, per serving layer
 # (apistage, l1), with the serves left unreplaced past 10 s. Three narrow
 # prefixes, never "snowplow_stale_": that one contains snowplow_stale_retry_
@@ -2645,6 +2655,10 @@ RUN8_VARS_PREFIXES = (
     STALE_TO_PUSH_PREFIX,                 # #1082: stale serve -> frame written, per layer
     STALE_SERVE_PREFIX,                   # #1082: stale serves per layer, open, closes
     STALE_UNREPLACED_PREFIX,              # #1082: serves unreplaced past 10 s, per layer
+    # run 23 (#1189, the Go 1.27 arm's connection-reuse reading): connections opened and handed
+    # over per egress and protocol (#847), and every endpoint retry by site and cause (#1088)
+    EGRESS_KEYS["connections"],
+    "snowplow_endpoint_retries",
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -2734,9 +2748,10 @@ REFRESHER_TIER_GAUGES = ("viewed_dirty_age_p95", "viewed_dirty_age_max",
 
 
 def prefixes_missing(prefixes) -> list[str]:
-    """The RUN8_KEYS / RUN9_KEYS / TIER_KEYS values no prefix in `prefixes` captures."""
+    """The RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS values no prefix in `prefixes` captures."""
     ps = tuple(p for p in prefixes if p)
-    need = set(RUN8_KEYS.values()) | set(RUN9_KEYS.values()) | set(TIER_KEYS.values())
+    need = (set(RUN8_KEYS.values()) | set(RUN9_KEYS.values()) | set(TIER_KEYS.values())
+            | set(EGRESS_KEYS.values()))
     return sorted(k for k in need if not ps or not k.startswith(ps))
 
 
@@ -3579,6 +3594,84 @@ def refresher_tier_lines(r: dict) -> list[str]:
     return lines
 
 
+def _egress_counters(m: dict) -> dict | None:
+    """snowplow_egress_connections {egress: {protocol: {opened, handovers}}} as egress/protocol/field."""
+    v = (m.get("extra") or {}).get(EGRESS_KEYS["connections"])
+    if not isinstance(v, dict):
+        return None
+    out = {}
+    for egress, protos in v.items():
+        for proto, c in (protos.items() if isinstance(protos, dict) else ()):
+            if isinstance(c, dict):
+                for f in ("opened", "handovers"):
+                    out[f"{egress}/{proto}/{f}"] = _num(c.get(f))
+    return out
+
+
+def _retry_counters(m: dict) -> dict | None:
+    """snowplow_endpoint_retries_total {site: {cause: n}} as site/cause."""
+    v = (m.get("extra") or {}).get(EGRESS_KEYS["retries"])
+    if not isinstance(v, dict):
+        return None
+    return {f"{site}/{cause}": _num(n) for site, causes in v.items()
+            for cause, n in (causes.items() if isinstance(causes, dict) else ())}
+
+
+def _absent(key: str, n: int) -> dict:
+    return {"status": "ABSENT", "why": f"{key} is in none of the {n} mem606 samples: an image that does not "
+                                       f"publish it, or mem606 did not capture it; absent, not 0"}
+
+
+def egress_connections_report(mem: list[dict], fresh: list[dict] | None) -> dict:
+    """Run 23 (#1189), INFO only, never judged: per phase (run_phases, "churn" summing the churn
+    phases, "all" the whole measure), per egress and protocol, the connections opened and the
+    hand-overs (deltas over mem606's /debug/vars samples, a restart's pair counted from 0), and the
+    reuse share = 1 - opened / handovers (#847: read it over a whole phase; no hand-over, no share).
+    With them the endpoint retries by site and cause (#1088): a Go 1.27 drain shows only where a
+    body is closed early, and a retried 5xx / 429 is one. A build that publishes neither is ABSENT,
+    never 0. `lines` (the whole measure) is what run606 and the paired verdict print."""
+    n = sum(1 for m in mem if m.get("kind") == "mem")
+    out: dict = {"result": "INFO", "source": f"mem606's /debug/vars samples ({n})"}
+    lines = []
+    r = _phase_counter_report(mem, fresh, EGRESS_KEYS["connections"], _egress_counters)
+    if r["status"] != "present":
+        out["connections"] = _absent(EGRESS_KEYS["connections"], n)
+        lines.append(f"INFO egress connections: ABSENT ({out['connections']['why']})")
+    else:
+        by_phase = {}
+        for ph, v in r["by_phase"].items():
+            cells: dict[str, dict] = {}
+            for k, x in v["counters"].items():
+                cell, f = k.rsplit("/", 1)
+                cells.setdefault(cell, {"opened": 0, "handovers": 0})[f] = x
+            for c in cells.values():
+                c["reuse_share"] = round(1 - c["opened"] / c["handovers"], 6) if c["handovers"] else None
+            by_phase[ph] = {"seconds": v["seconds"], "cells": dict(sorted(cells.items()))}
+        out["connections"] = {"status": "present", "by_phase": by_phase, "restarts": r["restarts"],
+                              "samples": r["samples"]}
+        whole = by_phase["all"]
+        for cell, c in whole["cells"].items():
+            share = "n/a (no hand-over)" if c["reuse_share"] is None else f"{c['reuse_share']:.2%}"
+            lines.append(f"INFO egress connections {cell} (whole measure, {whole['seconds']:g} s): opened "
+                         f"{c['opened']:g}, handovers {c['handovers']:g}, reuse share {share}")
+        if r["restarts"]:
+            lines.append(f"INFO egress connections: {r['restarts']} restart(s) spanned (each pair after one "
+                         f"counted from 0)")
+    rr = _phase_counter_report(mem, fresh, EGRESS_KEYS["retries"], _retry_counters)
+    if rr["status"] != "present":
+        out["retries"] = _absent(EGRESS_KEYS["retries"], n)
+        lines.append(f"INFO endpoint retries: ABSENT ({out['retries']['why']})")
+    else:
+        out["retries"] = {"status": "present", "restarts": rr["restarts"], "samples": rr["samples"],
+                          "by_phase": {ph: {"seconds": v["seconds"], "retries": dict(sorted(v["counters"].items()))}
+                                       for ph, v in rr["by_phase"].items()}}
+        got = {k: x for k, x in out["retries"]["by_phase"]["all"]["retries"].items() if x}
+        lines.append("INFO endpoint retries (whole measure): " + (", ".join(f"{k} {x:g}" for k, x in got.items())
+                                                                  or "none"))
+    out["lines"] = lines
+    return out
+
+
 def push_refetch_field(rows: list[dict], src: str) -> dict:
     """push_refetch_report over the driver's viewers' records, or UNMEASURED
     with why (#1066): none recorded is not none happened."""
@@ -3914,6 +4007,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["list_narrow_shadow_report_only"] = list_narrow_report(mem or [], phase_src)
     # #1085: the refresher's tiers per phase, on the same schedule
     report["refresher_tiers_report_only"] = _report_only(refresher_tiers_report, mem or [], phase_src)
+    # run 23 (#1189): connection reuse per egress and protocol, and the endpoint retries, INFO only
+    report["egress_connections_report_only"] = _report_only(egress_connections_report, mem or [], phase_src)
     # report-only warnings: a report that came out empty says so (run606
     # logs each one; the verdict never reads them)
     report["report_warnings"] = (
@@ -5761,6 +5856,12 @@ def _cmd_evaluate(a) -> int:
         result["report"].setdefault("report_warnings", []).append(
             "cluster prerequisites: no cert-manager record (installer#614): what ran before the installer "
             "is unrecorded, not absent")
+    # run 23: was snowplow tracing, with which sampler, and was an OTLP receiver on its node
+    # (bench/tracing.py)? INFO lines, never judged; no reading reads UNKNOWN, never "off"
+    from bench import tracing
+    result["report"]["tracing_report_only"] = tr = _report_only(tracing.report, a.tracing)
+    for ln in tr.get("lines") or []:
+        print(ln, file=sys.stderr, flush=True)
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]
@@ -5950,7 +6051,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="exit 4 (UNSETTLED) while any snowplow pod is still Terminating")
     dg.set_defaults(func=_cmd_digest_gate)
     cp = sub.add_parser("check-prefixes",
-                        help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS value")
+                        help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS value")
     cp.add_argument("prefixes", nargs="*")
     cp.set_defaults(func=_cmd_check_prefixes)
     vp = sub.add_parser("prefixes", help="print RUN8_VARS_PREFIXES (run606's default)")
@@ -5967,6 +6068,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--apf", default=None,
                    help="#919: run606's apf.jsonl.gz (the API server's flow-control scrapes), read as a "
                         "stream; the report is per phase, report only")
+    e.add_argument("--tracing", default=None,
+                   help="run 23: run606's tracing.json (bench/tracing.py), shown as INFO lines, never "
+                        "judged; a missing file reads UNKNOWN")
     e.add_argument("--no-viewers", action="store_true",
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",
