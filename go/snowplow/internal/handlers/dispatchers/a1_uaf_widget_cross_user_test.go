@@ -94,6 +94,8 @@ func a1WidgetUAFResolve(t *testing.T, uaf bool) func(context.Context, widgets.Re
 
 // TestR2_UAFCrossUser_WidgetNoSharedCellServe is the R-1 carrier's acceptance arm.
 func TestR2_UAFCrossUser_WidgetNoSharedCellServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	cache.RegisterUAFPutDeclineMetricsForTest()
 	cache.ResetUAFPutDeclineCountersForTest()

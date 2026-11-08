@@ -21,6 +21,8 @@ import (
 // TestSeededAtBoot_RoundTripsThroughGet is M11: a boot-seeded entry reports
 // SeededAtBoot==true on Get; a same-key traffic re-Put flips it to false.
 func TestSeededAtBoot_RoundTripsThroughGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// Boot seed Put: SeededAtBoot=true.
@@ -79,6 +81,8 @@ func putPreservingSeededAtBoot(c *ResolvedCacheStore, key string, entry *Resolve
 // discriminates: the preserve-provenance wrong impl keeps reporting true after a
 // traffic re-Put — the exact behavior the GREEN arm forbids.
 func TestSeededAtBoot_PreserveOnReplace_RedArm(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", &ResolvedEntry{
 		RawJSON:      []byte(`{"seed":true}`),

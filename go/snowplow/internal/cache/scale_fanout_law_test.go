@@ -83,6 +83,8 @@ func scalePopulation(t testing.TB, compositions, cohorts, widgetsPer int, listDe
 // TestScaleLaw_FanOutGrowsWithPopulation measures dirty-marks-per-event as the
 // composition count grows with everything else held fixed.
 func TestScaleLaw_FanOutGrowsWithPopulation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const (
 		cohorts    = 2
 		widgetsPer = 10  // ~9.4/composition on 057

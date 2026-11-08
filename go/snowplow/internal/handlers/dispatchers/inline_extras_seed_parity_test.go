@@ -44,6 +44,8 @@ func seedKeyExtrasFor(crObj map[string]any) map[string]any {
 // Seed a widget carrying BOTH inline maps under the SEED's per-cohort key, then
 // look up under the DISPATCHER's serve-time key (no ?extras=) → MUST HIT.
 func TestInlineExtras_6_SeedParity_PerCohortWidgetCell(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
@@ -86,6 +88,8 @@ func TestInlineExtras_6_SeedParity_PerCohortWidgetCell(t *testing.T) {
 // request), so the seeded full-list cell is HIT on the first paginated /call.
 // The resourcesRefsTemplateExtras map MUST NOT perturb this cell (§1).
 func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	const (
 		rg, rv, rr, rns, rname = "templates.krateo.io", "v1", "restactions", "demo-system", "some-ra"

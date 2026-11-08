@@ -67,6 +67,8 @@ var (
 // AddRateLimited / burn the retry budget); the prior good entry stays
 // and TTL is the outer net.
 func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
@@ -132,6 +134,8 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 // user who legitimately has zero compositions. The empty result MUST be
 // stored: the gate must not false-positive on a legit empty.
 func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()

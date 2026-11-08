@@ -127,6 +127,8 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 }
 
 func TestResolvedCache_BasicGetPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	if _, ok := c.Get("nope"); ok {
 		t.Fatalf("Get on empty cache must miss")
@@ -146,6 +148,8 @@ func TestResolvedCache_BasicGetPut(t *testing.T) {
 }
 
 func TestResolvedCache_LRUEvictionAtEntryCap(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(3, 1<<30, time.Hour) // 3 entries, generous bytes
 	// Insert 3 entries.
 	for i := 0; i < 3; i++ {
@@ -185,6 +189,8 @@ func TestResolvedCache_ByteBudgetEviction(t *testing.T) {
 }
 
 func TestResolvedCache_ReplaceInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", &ResolvedEntry{RawJSON: []byte("aaa")})
 	c.put("k", &ResolvedEntry{RawJSON: []byte("bbbbb")})
@@ -201,6 +207,8 @@ func TestResolvedCache_ReplaceInPlace(t *testing.T) {
 }
 
 func TestResolvedCache_TTLExpiry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, 10*time.Millisecond)
 	c.put("k", &ResolvedEntry{RawJSON: []byte("x")})
 	if _, ok := c.Get("k"); !ok {
@@ -216,6 +224,8 @@ func TestResolvedCache_TTLExpiry(t *testing.T) {
 }
 
 func TestResolvedCache_StatsHitRate(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", &ResolvedEntry{RawJSON: []byte("x")})
 	c.Get("k") // hit
@@ -312,6 +322,8 @@ func TestApistageEvictPressure(t *testing.T) {
 // api-stage Put()s + evictions via the entry's CacheEntryClass — a non-
 // apistage entry never moves the api-stage counters (AC-E7).
 func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
 
 	// A non-apistage entry: api-stage counters stay 0.

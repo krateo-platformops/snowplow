@@ -51,6 +51,8 @@ func ecSum(m map[string]uint64) uint64 {
 
 // EC1 + EC2 + EC3 — every class, both build orders, plus an edge with no cell.
 func TestPR0_EntryClass_AttributionAndSumInvariant(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	ctx := context.Background()
 	gvr := gvrCompositions()
@@ -99,6 +101,8 @@ func TestPR0_EntryClass_AttributionAndSumInvariant(t *testing.T) {
 // EC2 — the guard: a class nobody registered lands in "unregistered", and
 // still sums.
 func TestPR0_EntryClass_UnregisteredGuard(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	store.put("L1-odd", ecEntry("someNewClass", "own"))
@@ -123,6 +127,8 @@ func TestPR0_EntryClass_UnregisteredGuard(t *testing.T) {
 // EC3 + EC6 — DELETE: the self entry is EVICTED (not marked) and must not be
 // counted; the list dependent is marked and counted under its class.
 func TestPR0_EntryClass_DeleteCountsMarkedNotEvicted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, _, _, _ := threeClassDeps(t) // self/exact/list, all class "restactions"
 	gvr := gvrCompositions()
 	evicted, marked := d.OnObjectEvent(gvr, "ns", "obj", objAbsent)
@@ -141,6 +147,8 @@ func TestPR0_EntryClass_DeleteCountsMarkedNotEvicted(t *testing.T) {
 // EC4 — a busy store mutex never blocks a Record: the class is simply not
 // learned, and the next accepted store of the key fills it.
 func TestPR0_EntryClass_BusyStoreLockDefersNeverBlocks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	store.put("L1-busy", ecEntry(CacheEntryClassApistage, "own"))
@@ -173,6 +181,8 @@ func TestPR0_EntryClass_BusyStoreLockDefersNeverBlocks(t *testing.T) {
 // EC3 — a strip (RemoveL1Key) and a re-record start the key's class over; the
 // key's class is fixed by its hash, so relearning yields the same value.
 func TestPR0_EntryClass_RelearnedAfterStrip(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
@@ -188,6 +198,8 @@ func TestPR0_EntryClass_RelearnedAfterStrip(t *testing.T) {
 
 // EC5 — the type path (CRD lifecycle) attributes by class too, and sums.
 func TestPR0_EntryClass_TypePath(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()
@@ -218,6 +230,8 @@ func TestPR0_EntryClass_TypePath(t *testing.T) {
 // (which would recreate the depSet and re-peek); that rests on the strip
 // living only in the delete primitive (F6a), which is INFERRED, not pinned here.
 func TestPR0_EntryClass_PeekOncePerDepSetNotPerRefresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := ecTracker(t)
 	gvr := gvrCompositions()
 	ctx := context.Background()

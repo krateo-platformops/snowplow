@@ -58,10 +58,14 @@ func workClass871Refresh(t *testing.T, viewed bool, want string) {
 }
 
 func TestWorkClass871_R_RefresherDequeueIsRefresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	workClass871Refresh(t, false, "refresh")
 }
 
 func TestWorkClass871_RV_ViewedDequeueIsRefreshViewed(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	workClass871Refresh(t, true, "refresh_viewed")
 }
 
@@ -102,6 +106,8 @@ func TestWorkClass871_CMP_DuePassIsComparatorNestedInRefresh(t *testing.T) {
 // again. Handing the pass any other ctx (context.Background()) leaves the
 // re-resolve unlabelled; skipping the pass never runs the probe.
 func TestWorkClass871_CMPq_DuePassRunsThroughTheRefresherDequeue(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)

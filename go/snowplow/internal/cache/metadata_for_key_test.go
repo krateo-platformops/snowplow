@@ -29,6 +29,8 @@ import (
 )
 
 func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 
 	const secret = `{"children":["agents-header"],"tenantSecretish":"do-not-leak"}`
@@ -88,6 +90,8 @@ func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
 }
 
 func TestMetadataForKey_DoesNotTouchTheEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 
 	store := newResolvedCache(10, 1<<20, time.Hour)

@@ -90,6 +90,8 @@ func heuristicDeclassifiedPageEnvelope(ns, name string, page int) *unstructured.
 }
 
 func TestIssue450_DrainWidgetContentPut_DeclinesOnUAFAndExternal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const ns, name = "krateo-system", "compositions-page-datagrid"
 
 	// Precondition for the whole arm: the envelope really does slip past the
@@ -280,6 +282,8 @@ var widgetContentPutGates = []widgetContentPutGate{
 }
 
 func TestIssue450_WithWidgetContentPutSinks_InstallsEveryGateSink(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Run("installs", func(t *testing.T) {
 		ctx := withWidgetContentPutSinks(context.Background())
 		if cache.StageErrorSinkFromContext(ctx) == nil {

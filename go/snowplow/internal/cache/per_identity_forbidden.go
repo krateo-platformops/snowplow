@@ -173,7 +173,7 @@ func WithChildPutGateSinks(ctx context.Context) (context.Context, PutGateSinks) 
 	g := PutGateSinks{
 		Stage:     &StageErrorSink{parent: StageErrorSinkFromContext(ctx)},
 		Forbidden: &PerIdentityForbiddenSink{parent: PerIdentityForbiddenSinkFromContext(ctx)},
-		External:  &ExternalTouchedSink{parent: ExternalTouchedSinkFromContext(ctx)},
+		External:  newExternalTouchedSink(ExternalTouchedSinkFromContext(ctx)),
 	}
 	if ctx == nil {
 		return ctx, g

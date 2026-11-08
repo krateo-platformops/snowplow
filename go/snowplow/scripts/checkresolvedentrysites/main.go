@@ -148,6 +148,22 @@ func main() {
 		return
 	}
 
+	// Site-class 6 only, over explicit package patterns (the gate's own
+	// discrimination fixture: `-admission-only ./testdata/admission`).
+	if os.Args[1] == "-admission-only" {
+		findings, files, err := checkAdmissionSites(".", os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: admission: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportAdmissionFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: every store write is admitted by admitWrite; %d file(s) scanned.\n", files)
+		return
+	}
+
 	fset := token.NewFileSet()
 	var entryFindings []entryFinding
 	var scanned, entrySites, bootScopeStamps int
@@ -295,8 +311,36 @@ func main() {
 		}
 	}
 
+	// Site-class 6 (#1233): every write of the store is admitted by admitWrite,
+	// the one place the "no shared Put on an incomplete RBAC snapshot" rule sits.
+	// Runs when a scanned root is the production `internal` tree.
+	admissionFiles, admissionScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		admissionScoped = true
+		var patterns []string
+		for _, p := range admissionScope {
+			patterns = append(patterns, "./"+filepath.ToSlash(filepath.Join(root, strings.TrimPrefix(p, "./internal/"))))
+		}
+		findings, files, err := checkAdmissionSites(".", patterns)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: admission: %v\n", err)
+			os.Exit(2)
+		}
+		admissionFiles += files
+		if len(findings) > 0 {
+			failed = true
+			reportAdmissionFindings(findings)
+		}
+	}
+
 	if failed {
 		os.Exit(1)
+	}
+	if admissionScoped {
+		fmt.Printf("OK: every store write is admitted by admitWrite; %d file(s) scanned.\n", admissionFiles)
 	}
 	if verdictScoped {
 		fmt.Printf("OK: no resolve-output write bypasses the Put-gate verdict; %d file(s) scanned.\n", verdictFiles)

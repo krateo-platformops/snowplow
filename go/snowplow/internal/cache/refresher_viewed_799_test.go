@@ -24,6 +24,8 @@ import (
 
 // TestViewed799_B1_RacingProbesNeverStrandAWorker is B1.
 func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	t.Cleanup(cleanup)
@@ -103,6 +105,8 @@ func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
 
 // TestViewed799_B2_OneReResolvePerKeyAcrossTiers is B2.
 func TestViewed799_B2_OneReResolvePerKeyAcrossTiers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	t.Cleanup(cleanup)

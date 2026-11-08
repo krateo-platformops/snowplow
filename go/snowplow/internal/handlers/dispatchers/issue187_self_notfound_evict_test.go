@@ -227,6 +227,12 @@ func i187Watcher(t *testing.T, registerSelfGVR bool) *cache.ResourceWatcher {
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
 
+	// #1233 — the store admits no write until the RBAC snapshot is complete, and
+	// this watcher's RBAC informers publish a partial one first. Clear what an
+	// earlier test left, so the wait below reads this watcher's snapshot.
+	prevSnap := cache.RBACSnapshotForTest()
+	cache.PublishRBACSnapshotForTest(nil)
+	t.Cleanup(func() { cache.PublishRBACSnapshotForTest(prevSnap) })
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: %v", err)
@@ -235,6 +241,7 @@ func i187Watcher(t *testing.T, registerSelfGVR bool) *cache.ResourceWatcher {
 		t.Fatalf("NewResourceWatcher returned nil with CACHE_ENABLED=true")
 	}
 	t.Cleanup(rw.Stop)
+	cache.WaitCompleteRBACSnapshotForTest(t, 10*time.Second)
 
 	if registerSelfGVR {
 		_, syncCh := rw.EnsureResourceType(i187GVR())

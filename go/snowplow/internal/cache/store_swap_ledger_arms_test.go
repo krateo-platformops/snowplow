@@ -448,6 +448,8 @@ func TestStoreSwap_K16c_InstallToPush(t *testing.T) {
 // (close only on fan-out / stored=false: the declined and suppressed entries
 // stay open) and X36 (close on unsubscribe: the re-armed viewer gets no frame).
 func TestStoreSwap_K16d_LedgerCloses(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLedgerRig(t, 6)
 	declined := r.cell("o00", "")
 	suppressed := r.cell("o01", "")
@@ -578,6 +580,8 @@ func TestStoreSwap_K16e_OfferIsNotAWrite(t *testing.T) {
 // opens no entry; after the build ledger_owed holds only armable keys. RED
 // under X45 and X46.
 func TestStoreSwap_K16f_WindowHolders(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLedgerRig(t, 3)
 	unviewed := r.cell("o00", "")
 	content := r.cell("o00", CacheEntryClassApistage)
@@ -615,6 +619,8 @@ func TestStoreSwap_K16f_WindowHolders(t *testing.T) {
 // window_open_seconds_max must return to 0, while the hold is still in place.
 // RED under X52 (become refreshed only at windowFresh).
 func TestStoreSwap_K16g_FrameWrittenBeforeTheDequeueSettles(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLedgerRig(t, 2)
 	dep := r.cell("o00", "")
 	v := r.view(dep)

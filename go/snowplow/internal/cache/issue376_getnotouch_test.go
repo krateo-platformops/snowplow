@@ -12,6 +12,8 @@ import (
 )
 
 func TestIssue376_GetNoTouch_NoStampNoHit(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "w"}
 	key := ComputeKey(in)
@@ -56,6 +58,8 @@ func TestIssue376_GetNoTouch_NoStampNoHit(t *testing.T) {
 }
 
 func TestIssue376_GetNoTouch_KeepsLazyEvicts(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, 50*time.Millisecond)
 	c.maxEntryAge = time.Minute
 	inA := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "maxage"}
@@ -87,6 +91,8 @@ func TestIssue376_GetNoTouch_KeepsLazyEvicts(t *testing.T) {
 }
 
 func TestIssue376_Has_NoSideEffects(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxEntryAge = time.Minute
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "n", Name: "has"}
@@ -110,6 +116,8 @@ func TestIssue376_Has_NoSideEffects(t *testing.T) {
 }
 
 func TestIssue376_InternalReadStaysCold_No316Enqueue(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")
@@ -169,6 +177,8 @@ func TestIssue376_InternalReadStaysCold_No316Enqueue(t *testing.T) {
 // later CUSTOMER Get stamps lastRead=now and moves it into warm_lastread. This is the
 // live readout that makes #376 observable (warm_lastread → ~0 on an unbrowsed cluster).
 func TestIssue376_WarmGauge_InternalReadNeitherBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, 20*time.Second)
 	c.maxEntryAge = time.Hour // nothing reaped; isolate the gauge
 	gvr := gvrFlexes()
@@ -204,6 +214,8 @@ func TestIssue376_WarmGauge_InternalReadNeitherBucket(t *testing.T) {
 }
 
 func TestIssue376_IsSelfRepresentationUsesGetNoTouch(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	gvr := gvrFlexes()
 	const ns = "krateo-system"

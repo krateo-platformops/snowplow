@@ -39,6 +39,8 @@ const (
 const dequeueSplitGolden = "3V0U|3V1U|3V1U|0V4U"
 
 func TestRefresherDequeueOrder_IsTheGoldenSequence(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Run("viewed_and_normal", func(t *testing.T) { oneWorkerGolden(t, 0, dequeueOrderGolden) })
 	t.Run("with_cluster_list", func(t *testing.T) { oneWorkerGolden(t, 3, dequeueOrderClusterGolden) })
 }
@@ -166,6 +168,8 @@ func (g *goldenGate) next(open bool) {
 }
 
 func TestRefresherDequeueOrder_FourWorkersSplitAsTheGolden(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const p, nViewed, nUnviewed = 4, 6, 8
 	terminalEnv(t)
 	t.Cleanup(withCleanRefresher(t, p, 0))

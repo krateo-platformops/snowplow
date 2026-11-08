@@ -68,6 +68,8 @@ func k884Cell(t *testing.T) (*ResolvedCacheStore, *refresher, string, time.Time)
 func k884Stat(name string) int64 { return ResolvedCacheStatsByStat()[name] }
 
 func TestIssue884_F1_AnAcceptedPutEndsKnownStaleEvenWhenANewerMarkLanded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, r, key, t0 := k884Cell(t)
 	resetKnownStaleForTest()
 	t.Cleanup(resetKnownStaleForTest)
@@ -152,6 +154,8 @@ func TestIssue884_F1_AnAcceptedPutEndsKnownStaleEvenWhenANewerMarkLanded(t *test
 // rerun, never counted failed; the remark is an ordinary open window.
 // Mutation: Fresh = accepted && !remarked (the pre-#884 settle) → RED.
 func TestIssue884_F1b_ARemarkedDemandPutStillSettlesTheRevalidation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, r, key, t0 := k884Cell(t)
 	resetKnownStaleForTest()
 	t.Cleanup(resetKnownStaleForTest)
@@ -201,6 +205,8 @@ func TestIssue884_F1b_ARemarkedDemandPutStillSettlesTheRevalidation(t *testing.T
 // the next read revalidates it as any other. Mutation: settleRevalSlot's
 // mayRerun `!accepted` → `true` → RED (a #740 rerun of a successful attempt).
 func TestIssue884_F1c_AnAcceptedDemandPutNeverRerunsAfterAConcurrentDecline(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, r, key, t0 := k884Cell(t)
 	resetKnownStaleForTest()
 	t.Cleanup(resetKnownStaleForTest)
@@ -248,6 +254,8 @@ func TestIssue884_F1c_AnAcceptedDemandPutNeverRerunsAfterAConcurrentDecline(t *t
 }
 
 func TestIssue884_F2_ARemarkedAcceptedRefreshEndsKnownStaleAtTheSettle(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, r, key, t0 := k884Cell(t)
 
 	// The refresher dequeues the cell again (a later mark re-queued it).
@@ -285,6 +293,8 @@ func TestIssue884_F2_ARemarkedAcceptedRefreshEndsKnownStaleAtTheSettle(t *testin
 }
 
 func TestIssue884_F3_AFailedRefreshStillKeepsTheCellKnownStale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, r, key, t0 := k884Cell(t)
 	resetKnownStaleForTest()
 	t.Cleanup(resetKnownStaleForTest)

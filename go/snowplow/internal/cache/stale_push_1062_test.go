@@ -103,6 +103,8 @@ func k1062Layer(t *testing.T, layer string) StalePushLayerStats {
 func written(st RefreshStream, key string) { st.Wrote(key) }
 
 func TestIssue1062_L1_AReplacedL1StaleServeRecordsItsDelayAtTheFrameWrite(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -139,6 +141,8 @@ func TestIssue1062_L1_AReplacedL1StaleServeRecordsItsDelayAtTheFrameWrite(t *tes
 }
 
 func TestIssue1062_L1b_APutThatBeganBeforeTheMarkReplacesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -159,6 +163,8 @@ func TestIssue1062_L1b_APutThatBeganBeforeTheMarkReplacesNothing(t *testing.T) {
 }
 
 func TestIssue1062_OVR_ANeverReplacedServeWithAStreamIsCountedUnreplacedOnce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -191,6 +197,8 @@ func TestIssue1062_OVR_ANeverReplacedServeWithAStreamIsCountedUnreplacedOnce(t *
 }
 
 func TestIssue1062_NS_AServeNoStreamViewsIsNotUnreplacedUntilAStreamArms(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	e.mark()
 	e.hit(t)
@@ -209,6 +217,8 @@ func TestIssue1062_NS_AServeNoStreamViewsIsNotUnreplacedUntilAStreamArms(t *test
 }
 
 func TestIssue1062_LATE_APushPastTheMaxIsCountedUnreplacedAtItsClose(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -228,6 +238,8 @@ func TestIssue1062_LATE_APushPastTheMaxIsCountedUnreplacedAtItsClose(t *testing.
 }
 
 func TestIssue1062_APS_AStaleDerivedHitIsAnApistageServeReplacedOnlyByAFreshBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -255,6 +267,8 @@ func TestIssue1062_APS_AStaleDerivedHitIsAnApistageServeReplacedOnlyByAFreshBody
 }
 
 func TestIssue1062_EVI_RSY_AnEvictionReplacesAndAResyncPushes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -269,6 +283,8 @@ func TestIssue1062_EVI_RSY_AnEvictionReplacesAndAResyncPushes(t *testing.T) {
 }
 
 func TestIssue1062_RST_TheResumeMovesTheApistageClockForwardOnly(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	t0 := StalePushNow()
 	noteStaleServeNow(e.key, "", layerAPIStage, t0)
@@ -286,6 +302,8 @@ func TestIssue1062_RST_TheResumeMovesTheApistageClockForwardOnly(t *testing.T) {
 }
 
 func TestIssue1062_CLN_AHitOnACleanCellIsNoStaleServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	e.hit(t)
 	for _, s := range StalePushStatsSnapshot() {
@@ -299,6 +317,8 @@ func TestIssue1062_CLN_AHitOnACleanCellIsNoStaleServe(t *testing.T) {
 // replaced and published BEFORE the tab's stream arms is offered no frame on
 // the stream that arms afterwards; the overdue scan counts it once at 10 s.
 func TestIssue1062_RX1_AServeReplacedBeforeItsStreamArmsIsCountedUnreplaced(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	const subj = "user:rx1"
 	e.mark()
@@ -327,6 +347,8 @@ func TestIssue1062_RX1_AServeReplacedBeforeItsStreamArmsIsCountedUnreplaced(t *t
 // unreplaced at 10 s.
 // Mutation → RED: a frame closes every subject's serves of the key.
 func TestIssue1062_RX2_AnotherClientsFrameNeverClosesAStrandedServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	const a, b = "user:rx2-a", "user:rx2-b"
 	stA := SubscribeRefreshStreamAs(a, map[string]struct{}{e.key: {}})
@@ -362,6 +384,8 @@ func TestIssue1062_RX2_AnotherClientsFrameNeverClosesAStrandedServe(t *testing.T
 // it exactly once.
 // Mutation → RED: NoteStaleHit derives the subject before the stale check.
 func TestIssue1062_LAZY_TheRequesterDigestIsDerivedOnlyForAStaleServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	calls := 0
 	subjectOf := func(context.Context) string { calls++; return "user:lazy" }
@@ -384,6 +408,8 @@ func TestIssue1062_LAZY_TheRequesterDigestIsDerivedOnlyForAStaleServe(t *testing
 // too — the one Put replaced it as well.
 // Mutation → RED: a Put replaces only one subject's serves.
 func TestIssue1062_RVALL_OnePutReplacesEveryUsersServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	subs := []string{"user:all-a", "user:all-b", "user:all-c", "user:all-d"}
 	var streams []RefreshStream
@@ -429,6 +455,8 @@ func TestIssue1062_RVALL_OnePutReplacesEveryUsersServe(t *testing.T) {
 // unreplaced (nothing can push to B); once B's own stream arms, it is.
 // Mutation → RED: the overdue scan asks for any stream on the key.
 func TestIssue1062_NSX_AnotherClientsStreamDoesNotMakeAServeViewed(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	const a, b = "user:nsx-a", "user:nsx-b"
 	stA := SubscribeRefreshStreamAs(a, map[string]struct{}{e.key: {}})
@@ -453,6 +481,8 @@ func TestIssue1062_NSX_AnotherClientsStreamDoesNotMakeAServeViewed(t *testing.T)
 // second, never the first again.
 // Mutation → RED: the second-pass once-guard is dropped.
 func TestIssue1062_N2_OverdueIsCountedOncePerServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	const subj = "user:n2"
 	st := SubscribeRefreshStreamAs(subj, map[string]struct{}{e.key: {}})
@@ -479,6 +509,8 @@ func TestIssue1062_N2_OverdueIsCountedOncePerServe(t *testing.T) {
 // the two kept.
 // Mutation → RED: the capacity loop never drops.
 func TestIssue1062_N3_TheCapacityBoundDropsTheOldestServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv(envResolvedCacheMaxEntries, "2")
 	resetResolvedCacheForTest()
 	t.Cleanup(resetResolvedCacheForTest)

@@ -122,6 +122,8 @@ func assertRefreshScoped(t *testing.T, path string, ctx context.Context) {
 }
 
 func TestIssue988_REF_ADequeuedRefreshIsScopedAndItsListCounted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
@@ -137,6 +139,8 @@ func TestIssue988_REF_ADequeuedRefreshIsScopedAndItsListCounted(t *testing.T) {
 }
 
 func TestIssue988_REF_ARunRefreshNowReplaceIsScopedAndItsListCounted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)

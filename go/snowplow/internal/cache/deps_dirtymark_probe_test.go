@@ -101,6 +101,8 @@ func probeFixture(t *testing.T, dep probeDepClass, selfRep bool) (*DepTracker, *
 // fan-out loop for every reachable cell. The short-circuit must not move a
 // single number here.
 func TestDirtyMarkProbe_BehaviourIdentity(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, ns, name := gvrCompositions(), "ns", "obj"
 
 	for _, tc := range []struct {
@@ -232,6 +234,8 @@ func TestDirtyMarkProbe_BehaviourIdentity(t *testing.T) {
 // The non-vacuity half matters as much as the assertion: it proves the fixture
 // CAN produce a self mark, so a 0 here is the defect and not an inert fixture.
 func TestDirtyMarkProbe_SelfClassStaysReachable(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, ns, name := gvrCompositions(), "ns", "obj"
 
 	d, _, _, _ := probeFixture(t, probeExactDep, true /* the entry IS the object */)
@@ -280,6 +284,8 @@ func TestDirtyMarkProbe_SelfClassStaysReachable(t *testing.T) {
 // bounded by the refresher's queue latency. This arm asserts both halves of
 // that deferral so a future change cannot quietly break the hand-off.
 func TestDirtyMarkProbe_SavingAndItsDeferredEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, name := gvrCompositions(), "obj"
 	const (
 		nListDeps = 8

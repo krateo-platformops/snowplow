@@ -103,6 +103,8 @@ func TestF367_ArmR_InitFromEnvContract(t *testing.T) {
 // the env reaches the boot-walk populate arm. RED if the env backing does not
 // enable the toggle (installs stays 0).
 func TestF367_Arm1_EnvEnablesBootWalkPopulate(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.ResetRequesterProfileMemoForTest()
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })

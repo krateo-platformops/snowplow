@@ -32,6 +32,8 @@ func q1TierLen(r *refresher) int {
 // any tier (the viewed tier's idle-wake key included). A tier counted anywhere
 // but the shared total reads short here.
 func TestIssue930_Q1_OutstandingCountsQueuedAndInFlightUntilTheLastDone(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tier := range []string{"normal", "viewed", "cluster_list"} {
 		t.Run(tier, func(t *testing.T) {
 			terminalEnv(t)
@@ -111,6 +113,8 @@ func q1Wait(t *testing.T, ch chan struct{}, what string) {
 }
 
 func TestIssue930_Q2_ADeferredReAddIsNotQuiescent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherBaseDelayMS, "60000") // the backoff outlives the arm: the re-add stays deferred

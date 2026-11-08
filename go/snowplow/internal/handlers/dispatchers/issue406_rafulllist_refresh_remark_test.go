@@ -15,6 +15,8 @@ import (
 )
 
 func TestIssue406_RefresherRAFullListRePut_RemarksSlicedWidgetOnlyOnChange(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()

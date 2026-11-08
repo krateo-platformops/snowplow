@@ -40,6 +40,8 @@ func TestUAFResolvedTTL_DisabledByDefault(t *testing.T) {
 // within the bound, while a NON-UAF cell (no override) stays a HIT — proving the
 // cap is scoped to UAF cells and does not collaterally shorten every cell.
 func TestUAFShortTTL_CapsUAFCell_NotNonUAF(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour) // standard ttl = 1h
 
 	// UAF cell: short 1s override, aged 2s → past the override, far inside 1h.

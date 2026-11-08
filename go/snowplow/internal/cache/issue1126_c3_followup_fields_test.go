@@ -33,6 +33,8 @@ import (
 )
 
 func TestIssue1126_C3_FU4b_ChunkedWalkReportsBatchesAndBoundedHolds(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 
 	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
@@ -152,6 +154,8 @@ func fu4Store(t *testing.T) (*ResolvedCacheStore, *ResourceWatcher) {
 }
 
 func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 	if _, alive := store.Get("L1_button-0"); !alive {
 		t.Fatalf("premise: entry not resident")
@@ -199,6 +203,8 @@ func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing
 }
 
 func TestIssue1126_C3_FU4_ConcurrentGetNeverBlockedForTheWholeWalk(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 	if _, alive := store.Get("L1_button-0"); !alive {
 		t.Fatalf("premise: entry not resident")

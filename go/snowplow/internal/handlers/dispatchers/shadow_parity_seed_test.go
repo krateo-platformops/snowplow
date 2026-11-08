@@ -163,6 +163,8 @@ func seed2EWidgetEntry() navWidgetEntry {
 // ───────────────────────── F-2E-LOADBEARING ─────────────────────────
 
 func TestF2E_LoadBearing_RealSeedInstallsAndChecksAllowMoves(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.ResetRequesterProfileMemoForTest()
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
@@ -194,6 +196,8 @@ func TestF2E_LoadBearing_RealSeedInstallsAndChecksAllowMoves(t *testing.T) {
 // ───────────────────────── F-2E-IDENTITY (anti-leak linchpin) ─────────────────────────
 
 func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.SetShadowParityEnabled(true)
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
@@ -239,6 +243,8 @@ func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
 // ───────────────────────── F-2E-CALIBRATION (4 buckets + sum) ─────────────────────────
 
 func TestF2E_Calibration_FourBucketsAndSumEqualsInstalls(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.SetShadowParityEnabled(true)
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })

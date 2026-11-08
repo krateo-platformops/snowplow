@@ -132,6 +132,8 @@ func k734Await(t *testing.T, seen chan k734Seen) k734Seen {
 }
 
 func TestIssue734_K1_AcceptedRePutEndsKnownStaleBeforeTheDequeueSettles(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, key, ok, _, seen := k734KnownStaleCell(t)
 	samples0 := refresherSingleton().dirtyStats.samples.Load()
 	completed0 := refresherSingleton().completedTotal.Load()
@@ -176,6 +178,8 @@ func TestIssue734_K1_AcceptedRePutEndsKnownStaleBeforeTheDequeueSettles(t *testi
 }
 
 func TestIssue734_K2_AMarkDuringTheResolveEndsKnownStaleAndKeepsAnOpenWindow(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	_, key, ok, during, seen := k734KnownStaleCell(t)
 
 	var once atomic.Bool
@@ -217,6 +221,8 @@ func TestIssue734_K2_AMarkDuringTheResolveEndsKnownStaleAndKeepsAnOpenWindow(t *
 // the end ran after the Put's unlock (CloseKnownStaleAfterPut), a microsecond
 // window this arm samples across many rounds.
 func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
 	resetRefresherForTest()

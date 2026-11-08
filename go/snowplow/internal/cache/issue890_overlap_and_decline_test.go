@@ -19,6 +19,8 @@ import (
 // write is accepted (nothing refuses an overlapping fill) and must come back
 // WITH its edge: a stored cell that no dep event can reach is the failure.
 func TestIssue890_AcceptedWriteReassertsItsOwnEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, _ := setup890(t)
 	const k = "L1_890_reassert"
 	dep := DepKey{GVR: gvr883Calm, Namespace: "ns-890", Name: "reassert"}
@@ -64,6 +66,8 @@ func TestIssue890_AcceptedWriteReassertsItsOwnEdges(t *testing.T) {
 // arrivals — and stay cached. The first #890 design (bump the generation on every refusal) refused
 // every overlapping fill and never cached the key again.
 func TestIssue890_OverlappingColdFillsCacheTheKey(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, w := range []int{2, 3, 10} {
 		t.Run(fmt.Sprintf("W=%d", w), func(t *testing.T) {
 			d, store, _ := setup890(t)
@@ -134,6 +138,8 @@ func TestIssue890_OverlappingColdFillsCacheTheKey(t *testing.T) {
 // installs an L1 resolve scope — leaves no edge and no memo link for a K that is
 // not resident; a resident K keeps everything.
 func TestIssue890_DeclinedResolveReleasesItsEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, m := setup890(t)
 	dep := DepKey{GVR: gvr883Calm, Namespace: "ns-890", Name: "declined"}
 

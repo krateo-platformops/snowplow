@@ -98,6 +98,8 @@ func newPartialMetadata(apiVersion, kind, ns, name string) *metav1.PartialObject
 // informer's processor goroutine fires DeleteFunc → metaNSName →
 // Deps().OnDelete; we assert the dep edge was evicted within 3 s.
 func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
 

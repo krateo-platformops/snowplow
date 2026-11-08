@@ -331,6 +331,8 @@ func TestRAFullList_SliceabilityMemoPerShape(t *testing.T) {
 // HG-4a.4a — Pinned entries are SKIPPED by evictUntilUnderCapsLocked under
 // transient cap pressure while transient entries evict.
 func TestRAFullList_PinnedSkipsLRUEviction(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// Transient entry cap = 2; generous transient bytes; generous resident.
 	c := newResolvedCache(2, 1<<30, time.Hour)
 	c.maxResidentBytes = 1 << 30
@@ -381,6 +383,8 @@ func TestRAFullList_PinnedSkipsLRUEviction(t *testing.T) {
 // HG-4a.4b — maxResidentBytes==0 DISABLES pinning (kill-switch): a pin
 // request is demoted to transient.
 func TestRAFullList_ResidentKillSwitch(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxResidentBytes = 0 // kill-switch
 
@@ -408,6 +412,8 @@ func TestRAFullList_ResidentKillSwitch(t *testing.T) {
 // HG-4a.4c — resident budget OVERFLOW demotes to transient rather than
 // evicting another pinned cell.
 func TestRAFullList_ResidentBudgetOverflowDemotes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(100, 1<<20, time.Hour)
 	c.maxResidentBytes = 10 // only ~10 bytes resident
 
@@ -440,6 +446,8 @@ func TestRAFullList_ResidentBudgetOverflowDemotes(t *testing.T) {
 // HG-4a.4d — re-pin in place (refresher re-resolve) keeps the cell resident
 // and updates resident bytes; demote-then-repin moves bytes between budgets.
 func TestRAFullList_RePinInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxResidentBytes = 1 << 20
 

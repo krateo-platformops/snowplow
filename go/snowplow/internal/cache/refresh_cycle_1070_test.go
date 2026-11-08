@@ -72,6 +72,8 @@ func cycleRefreshPut(c *ResolvedCacheStore, ctx context.Context, key string, in 
 }
 
 func TestRefreshCycle1070_C1_EveryRefreshPutCountsIdenticalOrChangedPerClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	installCycleClock(t)
 	for _, class := range RefreshCycleClasses[:len(RefreshCycleClasses)-1] {
@@ -119,6 +121,8 @@ func TestRefreshCycle1070_C1_EveryRefreshPutCountsIdenticalOrChangedPerClass(t *
 // equal is not the one replaced (a write landed between the off-lock compare
 // and the store lock), so the Put counts changed, as #406 voids its compare.
 func TestRefreshCycle1070_C1b_AWriteAfterTheCompareVoidsIt(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "c1070", Name: "c1b"}
 	key := ComputeKey(in)
@@ -216,12 +220,16 @@ func bucketAt(t *testing.T, h RefreshCycleHist, bound int64) uint64 {
 }
 
 func TestRefreshCycle1070_C2_WaitAndDurationRecordInjectedTimingsPerTier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tier := range RefreshQueueTiers {
 		t.Run(tier, func(t *testing.T) { cycleRunOne(t, tier) })
 	}
 }
 
 func TestRefreshCycle1070_C3_AReAddWhileProcessingWaitsFromTheReAdd(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	clk := installCycleClock(t)
 	_, keys := terminalFixtureNoReset(t, 1)
@@ -276,6 +284,8 @@ func cycleRecv(t *testing.T, st RefreshStream) string {
 }
 
 func TestRefreshCycle1070_C4_PutToFrameIsRecordedForAnOpenStreamOnly(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	t.Setenv(envRefreshCoalesceWindowMS, "0")
 	clk := installCycleClock(t)
@@ -325,6 +335,8 @@ func TestRefreshCycle1070_C4_PutToFrameIsRecordedForAnOpenStreamOnly(t *testing.
 }
 
 func TestRefreshCycle1070_C5_ACoalescedPublishKeepsTheEarliestPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	// A real window long enough that both later publishes land inside it on a
 	// loaded host; the asserted values are on the injected clock.
@@ -360,6 +372,8 @@ func TestRefreshCycle1070_C5_ACoalescedPublishKeepsTheEarliestPut(t *testing.T) 
 // TestRefreshCycle1070_C7_ADirectRefreshIsTimedFromItsStart — RunRefreshNow
 // (the D2 refill, no queue) times its duration on tier direct, and has no wait.
 func TestRefreshCycle1070_C7_ADirectRefreshIsTimedFromItsStart(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := cycleEnv(t)
 	clk := installCycleClock(t)
 	key, _ := cycleResidentKey(t, c, "c7")
@@ -388,6 +402,8 @@ func TestRefreshCycle1070_C7_ADirectRefreshIsTimedFromItsStart(t *testing.T) {
 // TestRefreshCycle1070_C6_ExpvarPublishesTheFamily — the four keys exist, the
 // put counter carries every closed-set cell, and a histogram reads its samples.
 func TestRefreshCycle1070_C6_ExpvarPublishesTheFamily(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cycleEnv(t)
 	RegisterRefreshCycleExpvarForTest()
 	if !runRefreshCycle("c6", tierNormal, true, 1500*time.Millisecond, 2500*time.Millisecond, 1200*time.Millisecond) {

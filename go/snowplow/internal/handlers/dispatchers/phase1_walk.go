@@ -850,6 +850,18 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// informer (meta-query seeds + resolution-discovered + CRD-watch-
 	// spawned) reaches HasSynced, bounded by ctx.
 	syncErr := rw.WaitAllInformersSynced(ctx)
+	// Step 7.1 — #1233: every step below writes the cache, and the store admits
+	// no write of a resolve that began on an incomplete RBAC snapshot. The RBAC
+	// informers can be synced while the complete snapshot is not published yet
+	// (the initial publish runs under the rebuild slot), so wait for the publish
+	// itself, or a unit resolved now would be refused and never redone (#506).
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		log.WarnContext(ctx, "phase1.rbac_snapshot_incomplete",
+			slog.String("subsystem", "cache"),
+			slog.Any("err", err),
+			slog.String("effect", "the content prewarm and the seeds below write nothing until the RBAC snapshot completes"),
+		)
+	}
 	steps.syncWait = time.Since(syncStart)
 
 	// Step 7.5 — Ship F2 (0.30.125): the SA content-population pass. Runs

@@ -111,6 +111,8 @@ func i506Put(t *testing.T, store *ResolvedCacheStore, name string, birthAge, bod
 }
 
 func TestIssue506_DeadlineTriggerReachesWhatTheTTLTriggerCannot(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1000)
 
 	// THE ANTI-DEGENERACY PRECONDITION. If the two terms of the min coincide,
@@ -192,6 +194,8 @@ func TestIssue506_DeadlineTriggerReachesWhatTheTTLTriggerCannot(t *testing.T) {
 // so substituting TTL for the lead becomes observable. Between this and the arm
 // above, BOTH terms of min(TTL, maxAge/2) are pinned.
 func TestIssue506_LeadThresholdIsRemintLeadNotHalfMaxAge(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// TTL 1000s, maxAge 200s -> lead = min(1000, 100) = 100 (the maxAge/2 branch).
 	store := i506Store(t, 1000, 200)
 	if got := store.remintLead(); got != 100*time.Second {
@@ -226,6 +230,8 @@ func TestIssue506_LeadThresholdIsRemintLeadNotHalfMaxAge(t *testing.T) {
 // exists to prevent. gate-573 showed both guards surviving deletion against the
 // whole internal/cache package.
 func TestIssue506_CapDisabledEnqueuesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 0) // maxEntryAge = 0 -> the cap is DISABLED
 	if store.maxEntryAge != 0 {
 		t.Fatalf("precondition: maxEntryAge must be 0 (cap disabled), got %v", store.maxEntryAge)
@@ -255,6 +261,8 @@ func TestIssue506_CapDisabledEnqueuesNothing(t *testing.T) {
 // a number whose zero reads as health. gate-573 showed `Add` -> `Store` surviving
 // the whole package.
 func TestIssue506_DeadlineCounterAccumulatesAcrossPasses(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1000)
 	i506Put(t, store, "accum", 980*time.Second, 0)
 
@@ -322,6 +330,8 @@ func TestIssue506_JitterStaysInsideTheWindowAndIsStable(t *testing.T) {
 //
 // Re-geometried to TTL=100 / maxEntryAge=1000 with the rest of this file.
 func TestIssue506_DeadlineTriggerDoesNotEnqueueColdCells(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1000)
 
 	// COLD, and getting there is NOT as simple as "do not set SeededAtBoot".
@@ -403,6 +413,8 @@ func TestIssue506_DeadlineTriggerDoesNotEnqueueColdCells(t *testing.T) {
 // `LifetimeSeconds >= maxAgeSec - 0 + 0` = `>= 1`, i.e. every resident cell more
 // than a second old — refresh-everything, on every tick.
 func TestIssue506_SubSecondLeadDisablesTheTrigger(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1)
 	if store.remintLead() >= time.Second {
 		t.Fatalf("precondition: remintLead() = %v, want sub-second so leadSec truncates to 0", store.remintLead())
@@ -465,6 +477,8 @@ func TestIssue506_SubSecondLeadDisablesTheTrigger(t *testing.T) {
 // not happen, which inverts the intent-vs-effect reading its own field doc
 // prescribes. No other arm in the tree notices.
 func TestIssue506_KeepwarmClearedCellIsColdWithAFreshBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1000)
 
 	inputs := widgetInputs(gvrFlexes(), "krateo-system", "keepwarm-cleared")
@@ -546,6 +560,8 @@ func TestIssue506_KeepwarmClearedCellIsColdWithAFreshBody(t *testing.T) {
 //	             on, so applying it here would report this pass's slice instead
 //	             of the population and the denominator would undercount.
 func TestIssue506_WarmInLeadWindowIsTheJitterFreeWarmPopulation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := i506Store(t, 100, 1000)
 	const base = 900 // maxAge 1000 - lead 100
 

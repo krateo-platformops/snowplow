@@ -36,6 +36,8 @@ func (e *k1062Env) readThenLateOpen(t *testing.T, inWindow func()) {
 }
 
 func TestStalePush1198_ALateOpenAfterAFreshPutIsReplaced(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct {
 		name, layer string
 		setup       func(e *k1062Env, t *testing.T)
@@ -81,6 +83,8 @@ func TestStalePush1198_ALateOpenAfterAFreshPutIsReplaced(t *testing.T) {
 // The serve is gone before it opens: the key left the store in the window, so a
 // refetch is a fresh fill (the same rule as an eviction of an open serve).
 func TestStalePush1198_ALateOpenAfterAnEvictionIsReplaced(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -101,6 +105,8 @@ func TestStalePush1198_ALateOpenAfterAnEvictionIsReplaced(t *testing.T) {
 // A Put that began before the mark carries the pre-change state, whichever side
 // of the serve's open it lands on (TestIssue1062_L1b is the same Put after it).
 func TestStalePush1198_ALatePutThatBeganBeforeTheMarkReplacesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -116,6 +122,8 @@ func TestStalePush1198_ALatePutThatBeganBeforeTheMarkReplacesNothing(t *testing.
 
 // A carrier with no resolve start proves nothing, as for an open serve.
 func TestStalePush1198_ALatePutWithNoResolveStartReplacesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()
@@ -130,6 +138,8 @@ func TestStalePush1198_ALatePutWithNoResolveStartReplacesNothing(t *testing.T) {
 
 // A stale-derived Put in the window leaves stale bytes in the cell.
 func TestStalePush1198_ALateStaleDerivedPutReplacesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()

@@ -284,6 +284,16 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) {
 
 	log := slog.Default()
+	// #1233 — the pass writes the cache: run it on a complete RBAC snapshot, or
+	// its writes would be refused and its cells left cold.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		log.WarnContext(ctx, "content.prewarm.skipped",
+			slog.String("subsystem", "cache"),
+			slog.String("reason", "the RBAC snapshot did not complete before the pass's deadline"),
+			slog.Any("err", err),
+		)
+		return
+	}
 	refs := h.snapshot()
 	if len(refs) == 0 {
 		log.Info("content.prewarm.skipped",

@@ -99,6 +99,8 @@ func TestI598_Arm3_MemoIsSharedAcrossResolves(t *testing.T) {
 // pinned by cache.TestIssue883_MemoNeverOutgrowsLiveServableKeys. Re-adding the
 // swap turns this RED.
 func TestI598_Arm4_MemoIsNeverSwapped(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	cacheOnForMemo(t)
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	resetRefreshMemoForTest()

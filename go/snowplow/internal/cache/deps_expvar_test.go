@@ -107,6 +107,8 @@ func TestDepsExpvar_PublishesEveryDocumentedStat(t *testing.T) {
 // three #187 numbers must MOVE for real activity. A surface pinned at zero
 // looks exactly like a healthy cluster.
 func TestDepsExpvar_TracksRealEvictionAndPanic(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	RegisterDepsExpvarForTest()
 	defer withCleanDepWatch(t)()

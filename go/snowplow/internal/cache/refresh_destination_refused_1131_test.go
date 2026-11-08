@@ -31,6 +31,8 @@ func x1131Status(reason string) error {
 func x1131Refused() error { return x1131Status(credhttp.DestinationRefusedReason) }
 
 func TestIssue1131_ARefusedDestinationReachesTheDropPointOnItsFirstAttempt(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct {
 		name      string
 		err       error
@@ -107,6 +109,8 @@ func TestIssue1131_ARefusedDestinationReachesTheDropPointOnItsFirstAttempt(t *te
 // A corrected endpoint is picked up by the next dirty mark: nothing about the
 // drop remembers the failure.
 func TestIssue1131_TheNextDirtyMarkTriesAgain(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
