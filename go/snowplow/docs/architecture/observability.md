@@ -120,6 +120,11 @@ a bench probe gets `0` rather than a missing-key error under cache-off:
   `cache.RegisterRBACBindingNoopExpvar()`
 - `snowplow_authz_memo_*` — `rbac.RegisterAuthzMemoExpvar()`
 
+Some non-cache surfaces are published from an ungated `init()` and are present
+under cache-off too (the CFG-1 probe's `nonCacheInitPublishers` list), among them
+`snowplow_customer_serves_total` / `snowplow_customer_serves_cold_total` (#1265):
+with the cache off every serve reads `cold{cause="cache_off"}`.
+
 ---
 
 ## expvars at `/debug/vars`
@@ -215,6 +220,31 @@ Defined in `internal/handlers/dispatchers/l1_lookup_metrics.go`.
 | `snowplow_internal_dispatch_informer_serve_miss_total{reason}` / `snowplow_internal_dispatch_informer_sync_wait_ms_total` (expvar + OTLP, #796) | Internal-dispatch LISTs not served from their informer, by reason (`unregistered`, `list_refused`, `sync_timeout`, `watch_broken`, `type_unconfirmed`, `not_servable`), and the total ms spent in the bounded sync-wait | `list_refused` names informers whose LIST is refused (404/403): the wait now ends at once. Rising `sync_timeout` with `wait_ms` ≈ 5 s per miss is the latency the rule does not cover |
 | `snowplow_widget_skipped_undeclared_extras_put_total` | Puts quarantined by the F6 undeclared-request-extras allowlist | non-zero means a client sends extras the widget author has not declared in `spec.keyExtras` |
 | `snowplow_widget_undeclared_extras_exempt_total` (expvar + OTLP) | Requests carrying undeclared, non-identity extras that were Put anyway because the widget has no extras-reading spec surface (no apiRef / widgetDataTemplate / resourcesRefsTemplate; #777 b′) | informational: its share next to the skipped counter is the fraction of would-be F6 declines the exemption cached |
+
+### Customer serves — zero cold navigation (#1265)
+Defined in `internal/handlers/dispatchers/customer_serves.go`; on OTLP in `internal/metrics/customer_serves_metrics.go`.
+
+**The definition (Diego, 2026-11-08).** A navigation is cold when at least one widget had nothing cached to show, fresh or stale, so the user waited on live computation. Stale-then-replace (#710) is warm. A widget-cell miss served from a stale apistage input (D2) is cold, cause `no_cell` (ruling Q6). This counter is the authority; Chrome timings are the user-side confirmation.
+
+**What is counted.** Exactly one outcome per **top-level customer** `/call` to the restactions or widgets handler, decided where snowplow answers it:
+
+| `outcome` | when |
+|---|---|
+| `fresh` | the body is a resident cell (the per-identity L1 cell, or the identity-free widgetContent shell) with no stale mark |
+| `stale` | the body is a resident cell whose inputs moved since its Put (an open invalidation window or known-stale) or that was stored from a stale input (`StaleDerived`): the #1062 stale ledger's predicate |
+| `cold` | the body comes from a live resolve run for this request; a resolve that then fails is still cold |
+| `refused` | the request ended before the serve decision (bad request, unreadable CR, RBAC denial) |
+
+**What is not counted.** Refresher, seed, prewarm and every other background driver resolve in process and never reach the handler; their self-loopbacks carry the background marker and work class. A #547 demand revalidation, a #710 withdrawn stale serve's re-run (the same request's second pass), an export's per-page re-dispatch and a customer resolve's own nested self-loopback (`X-Snowplow-Nested-Depth` on a trusted hop) are not counted either. So the population is customer traffic by construction: unlike `resolved_cache.hit_total`/`miss_total` (#376) and `stale_served_total` (#552), no internal read can move it.
+
+| series (expvar and OTLP) | labels | meaning | healthy range |
+|---|---|---|---|
+| `snowplow_customer_serves_total` | `handler` {restactions, widgets}, `outcome` (above), `class_warm` | one per top-level customer call; expvar `map[handler][outcome][class_warm]` | zero cold navigation reads `cold == 0`. `class_warm` is the requester's sign-in warm state; it reads only `none` until #1265 P3 (the `complete` / `warming` series are absent, not zero, until then) |
+| `snowplow_customer_serves_cold_total` | `handler`, `cause` | the cold serves by cause; expvar `map[handler][cause]` | `no_cell`: the lookup found no cell (never stored, Put declined, evicted, or a D2 stale-input resolve). `expired_ttl` / `evicted_maxage`: **this** lookup found the cell past its TTL / the max entry age (#378). `ineligible_key`: no servable key (a `""` first-match BindingUID, #95, or no identity). `dry_run`: an inert request (#443). `cache_off`: no resolved-output store |
+
+Every cell is pre-populated: a `0` is a reading. Scope of the expiry causes: a cell that left the store before the lookup (LRU, DELETE eviction, or an expiry an internal read or the reaper already applied) reads `no_cell`, so `expired_ttl` is a lower bound on TTL-caused cold serves.
+
+**The response header and the span.** A counted response that reached the serve decision carries `X-Snowplow-Serve-Outcome: fresh|stale|cold`, set before the first byte (exposed through CORS like `X-Snowplow-Refresh-Key`; the SPA ignores it; the bench reads it per navigation). Its server span carries `snowplow.serve.outcome` and, on a cold serve, `snowplow.serve.cold_cause` (distinct from #1264's `snowplow.stages.*`). Neither carries identity, a key, a resource name or a body. A refused response and an uncounted one carry neither, so the header and the counter describe the same population.
 
 ### RAFullList serve path — the cheap Go-slice serve for big LISTs
 Defined in `internal/cache/bindings_by_gvr_metrics.go`.

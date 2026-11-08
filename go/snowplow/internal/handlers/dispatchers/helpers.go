@@ -15,6 +15,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
@@ -239,6 +240,33 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 	return cache.ComputeKey(inputs), c, &inputs
 }
 
+// keyMintInputs is the store and identity dispatchCacheLookupKey mints a key
+// under, or why it mints none (bypass != ""): the one place those three
+// early-outs are decided, so the #1265 served-cold counter names the same
+// reason the key mint acted on (coldCauseOfLookup).
+//
+//   - coldCauseDryRun — #443 (f): an inert (dry-run) resolve mints no key and
+//     gets no handle: no L1 lookup, no capture, no Put. This is also a
+//     CORRECTNESS rule: an inline draft named like a stored RESTAction must
+//     never be served the stored cell.
+//   - coldCauseCacheOff — no resolved-output store (the cache or the L1 is off).
+//   - coldCauseIneligibleKey — defence in depth: without an identity we cannot
+//     key safely, so the request skips the cache.
+func keyMintInputs(ctx context.Context) (*cache.ResolvedCacheStore, jwtutil.UserInfo, string) {
+	if cache.Inert(ctx) {
+		return nil, jwtutil.UserInfo{}, coldCauseDryRun
+	}
+	c := cache.ResolvedCache()
+	if c == nil {
+		return nil, jwtutil.UserInfo{}, coldCauseCacheOff
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return nil, jwtutil.UserInfo{}, coldCauseIneligibleKey
+	}
+	return c, ui, ""
+}
+
 // dispatchCacheLookupKey builds the L1 resolved-output cache key and
 // returns the live cache handle, if the L1 layer is enabled. Returns
 // (key, nil, nil) when L1 is disabled — callers MUST treat handle==nil
@@ -271,21 +299,8 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	defer slowcall.Start(ctx, slowcall.PhaseKeyMint).End() // #1054
-	// #443 (f) — an inert (dry-run) resolve mints no key and gets no handle:
-	// no L1 lookup, no capture, no Put. This is also a CORRECTNESS rule: an
-	// inline draft named like a stored RESTAction must never be served the
-	// stored cell.
-	if cache.Inert(ctx) {
-		return "", nil, nil
-	}
-	c := cache.ResolvedCache()
-	if c == nil {
-		return "", nil, nil
-	}
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// Defence in depth — without an identity we cannot key
-		// safely. Skip the cache for this request.
+	c, ui, bypass := keyMintInputs(ctx)
+	if bypass != "" {
 		return "", nil, nil
 	}
 	// Path B direct call — derive BindingUID for the layer's GET-permit.
@@ -695,10 +710,11 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 
 // l1Get is a customer dispatch's L1 read of its response cell, timed as the
 // request's l1_get phase (#1054): the store's single mutex plus a map read,
-// so time here is that lock.
-func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, bool) {
+// so time here is that lock. miss is what the lookup found (cache.LookupHit on
+// a hit), the #1265 served-cold counter's cause for a miss.
+func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, cache.LookupMiss) {
 	defer slowcall.Start(ctx, slowcall.PhaseL1Get).End()
-	return h.Get(key)
+	return h.GetReportingMiss(key)
 }
 
 // cacheHandle is the narrow interface the dispatchers depend on. The
@@ -707,6 +723,9 @@ func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry
 // so it never leaks beyond dispatchers.
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
+	// #1265 P0 — Get plus what the lookup found (cache.LookupMiss): the
+	// customer serve's read (l1Get), so a cold serve names its cause.
+	GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss)
 	// #930 — Now is the store clock: a cell's age (the keep-warm age-skip) is
 	// Now() minus the CreatedAt the store stamped on that clock, never
 	// time.Since, so the decision and the store's own TTL agree on one clock.

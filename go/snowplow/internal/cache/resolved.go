@@ -1503,15 +1503,46 @@ func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Durat
 // front and bumps hitTotal — the customer-warmth effects. GetNoTouch is the
 // internal, non-stamping twin.
 func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
-	entry, ok := c.getCore(key, true)
-	if ok {
+	entry, miss := c.GetReportingMiss(key)
+	return entry, miss == LookupHit
+}
+
+// LookupMiss is what one Get found under its key (#1265 P0): a live cell
+// (LookupHit), or why it returned nothing.
+//
+// SCOPE: it is what THIS lookup saw. A cell already gone before it (an LRU or
+// DELETE eviction, a declined Put, a cell never stored, or a TTL / max-age
+// expiry that an earlier read or the reaper already removed) reads
+// LookupAbsent. Only a cell this lookup itself finds past a bound reads
+// LookupExpiredTTL or LookupPastMaxAge.
+type LookupMiss uint8
+
+const (
+	// LookupHit — a live cell was found and is returned.
+	LookupHit LookupMiss = iota
+	// LookupAbsent — no cell under the key.
+	LookupAbsent
+	// LookupExpiredTTL — the cell was past its TTL (its TTLOverride, else the
+	// store TTL) and this lookup evicted it.
+	LookupExpiredTTL
+	// LookupPastMaxAge — the cell was past the max entry age (#378) and this
+	// lookup evicted it.
+	LookupPastMaxAge
+)
+
+// GetReportingMiss is Get plus what the lookup found (LookupMiss). Get is
+// exactly this call with the reason folded to a bool: the same lookup, the same
+// customer-warmth effects and the same miss accounting.
+func (c *ResolvedCacheStore) GetReportingMiss(key string) (*ResolvedEntry, LookupMiss) {
+	entry, miss := c.getCore(key, true)
+	if miss == LookupHit {
 		// #354 P3 (C) — AFTER c.mu is released (getCore's deferred unlock). Get is
 		// the one funnel every hit_total-counted hit goes through
 		// (TestIssue354_P3_StaleServeNoteCoversEveryCountedHit), so a stale serve
 		// is counted on exactly the hit_total population.
 		c.noteServeWhileDirty(key)
 	}
-	return entry, ok
+	return entry, miss
 }
 
 // noteServeWhileDirty counts a customer hit on a cell whose invalidation→fresh
@@ -1539,7 +1570,8 @@ func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
 // it the prompt orphan backstop at maxAge (a customer-cold cell an internal read
 // touches past maxAge is still evicted, not stranded to the reaper tick).
 func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
-	return c.getCore(key, false)
+	entry, miss := c.getCore(key, false)
+	return entry, miss == LookupHit
 }
 
 // getCore is the shared body of Get (touch=true) and GetNoTouch (touch=false). The
@@ -1548,9 +1580,9 @@ func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
 // AND the miss accounting, so a GetNoTouch read is fully metric-neutral — it never
 // inflates hit_total NOR miss_total (freshness-audit: full metric neutrality for
 // internal reads). One implementation so the evict discipline can never drift.
-func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bool) {
+func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, LookupMiss) {
 	if c == nil {
-		return nil, false
+		return nil, LookupAbsent
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1560,7 +1592,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupAbsent
 	}
 	item := el.Value.(*lruItem)
 	// #315/#316 — one time reference for both bound checks AND the lastRead
@@ -1586,7 +1618,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupExpiredTTL
 	}
 	// 1.12.6 C5 (design §7) — bounded LIFETIME, measured from the first Put
 	// under this key (BornAt), which a refresh re-Put does not reset. Past
@@ -1625,7 +1657,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupPastMaxAge
 	}
 	// Customer-warmth effects — ONLY on the touch (customer Get) path (#376). A HIT
 	// here means a customer served this cell, so it is warm as of `now`: move to
@@ -1638,7 +1670,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		c.hitTotal.Add(1)
 		noteSeedOriginHitLocked(item) // #841
 	}
-	return item.entry, true
+	return item.entry, LookupHit
 }
 
 // Has reports whether key is currently resident, WITHOUT any of Get's side

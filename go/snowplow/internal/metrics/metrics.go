@@ -1253,6 +1253,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerSlowCallInstruments(m); err != nil {
 		return err
 	}
+	// #1265: customer serve outcomes, likewise whatever the cache mode (with
+	// the cache off every serve is cold{cache_off}).
+	if err := registerCustomerServeInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).

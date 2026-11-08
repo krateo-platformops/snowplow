@@ -94,6 +94,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// the slow /call class in the 8-cycle parallelism diagnostic.
 	pcs, pcEmit := beginPerCall(req, "restactions")
 	defer pcEmit()
+	// #1265 P0 — one serve outcome per top-level customer call (counter + header).
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerRestactions)
+	defer serveEnd()
 
 	// Ship 1 — customer-priority signal. Mark this /call as in-flight so
 	// the prewarm engine yields its background re-seed work for the
@@ -255,8 +258,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// to the shared empty-identity row → treat as a CACHE MISS, fall through to
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
+	lookupMiss := cache.LookupAbsent
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
+		var entry *cache.ResolvedEntry
+		if entry, lookupMiss = l1Get(req.Context(), cacheHandle, cacheKey); lookupMiss == cache.LookupHit {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -309,6 +314,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
 			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
+			serve.servedCell(cacheKey, entry)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -324,6 +330,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
+	serve.servedLive(coldCauseOfLookup(req.Context(), cacheHandle, cacheInputs, lookupMiss))
 
 	// #189 — capture the cache key's generation BEFORE the resolve below. If the
 	// RESTAction CR is DELETE-evicted during the (live-apiserver) resolve, the

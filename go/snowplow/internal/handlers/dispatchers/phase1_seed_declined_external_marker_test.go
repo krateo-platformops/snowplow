@@ -92,6 +92,12 @@ func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
 	return nil, false // MISS — the declined external cell is never Put/warmed
 }
 
+// GetReportingMiss is Get with the miss reason (#1265 P0): always absent.
+func (h *getRecordingHandle) GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	h.Get(key)
+	return nil, cache.LookupAbsent
+}
+
 // GetNoTouch is the #376 internal no-stamp read the seed-skip decision now uses
 // (seedModeBoot + seedModeKeepwarm). Recorded SEPARATELY from Get so a wiring arm
 // can assert the decision routes through GetNoTouch and NOT Get; getCount/sawGet
