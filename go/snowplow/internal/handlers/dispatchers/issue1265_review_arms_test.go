@@ -110,3 +110,111 @@ func TestIssue1265_AnUnsetLookupMissIsNotAHit(t *testing.T) {
 		t.Fatalf("the zero LookupMiss = %d, want LookupAbsent", unset)
 	}
 }
+
+// --- #1274 re-review: one "snowplow calling itself" host predicate ---------
+
+// r1265ChartSelfURL is the chart-default URL_SELF (the FQDN form).
+const r1265ChartSelfURL = "http://snowplow.krateo-system.svc.cluster.local:8081"
+
+// The egress treats every one of snowplow's own Service DNS forms on its port
+// as self and sends the loopback markers to it (api parsedHostEqualsSelf, #57
+// fix B), so the ingest must trust exactly those forms: a refresher or seed hop
+// by the short name is never a customer serve. Anything else (another
+// namespace, another port, a subdomain of self, an external host) is not self,
+// and a caller sending markers from there is counted.
+func TestIssue1265_SelfLoopbackHostFormsMatchTheEgress(t *testing.T) {
+	SetSelfLoopbackHost(r1265ChartSelfURL)
+	t.Cleanup(func() { SetSelfLoopbackHost("") })
+	selfForms := []string{
+		"snowplow.krateo-system:8081",
+		"snowplow.krateo-system.svc:8081",
+		"snowplow.krateo-system.svc.cluster.local:8081",
+	}
+	notSelf := []string{
+		"snowplow.other-ns.svc:8081",                         // another namespace
+		"snowplow.krateo-system.svc:9090",                    // another port
+		"snowplow.krateo-system.svc",                         // no port
+		"evil.snowplow.krateo-system.svc.cluster.local:8081", // a subdomain of self
+		"portal.example.com",                                 // external
+	}
+	markers := map[string]func(*http.Request){
+		"background_hop": r1265Markers["background_hop"],
+		"nested_depth":   r1265Markers["nested_depth"],
+	}
+	for _, tg := range s1265Targets {
+		h := tg.name
+		for mname, set := range markers {
+			for _, host := range selfForms {
+				t.Run(h+"/"+mname+"/self/"+host, func(t *testing.T) {
+					e := s1265Setup(t, tg)
+					before := s1265Snap(t)
+					rec := e.serve(h1ReqCtx(h1User), func(r *http.Request) { r.Host = host; set(r) })
+					e.wantResolves(t, "a self-hop", 1)
+					s1265Header(t, "a self-hop by "+host, rec, "")
+					s1265AssertDelta(t, "a self-hop by "+host, before, map[string]uint64{})
+				})
+			}
+			for _, host := range notSelf {
+				t.Run(h+"/"+mname+"/not_self/"+host, func(t *testing.T) {
+					e := s1265Setup(t, tg)
+					before := s1265Snap(t)
+					rec := e.serve(h1ReqCtx(h1User), func(r *http.Request) { r.Host = host; set(r) })
+					s1265Header(t, "markers from "+host, rec, "cold")
+					s1265AssertDelta(t, "markers from "+host, before,
+						map[string]uint64{h + "|cold": 1, "cold|" + h + "|" + coldCauseNoCell: 1})
+				})
+			}
+		}
+	}
+}
+
+// A customer's resolve whose stage calls snowplow by the short Service name:
+// the top-level call is counted once, its nested hop is not.
+func TestIssue1265_CustomerNestedHopByShortNameCountsOnceAtTheTop(t *testing.T) {
+	SetSelfLoopbackHost(r1265ChartSelfURL)
+	t.Cleanup(func() { SetSelfLoopbackHost("") })
+	for _, tg := range s1265Targets {
+		h := tg.name
+		t.Run(h, func(t *testing.T) {
+			e := s1265Setup(t, tg)
+			before := s1265Snap(t)
+			top := e.serve(h1ReqCtx(h1User), func(r *http.Request) { r.Host = "portal.example.com" })
+			s1265Header(t, "the top-level call", top, "cold")
+			// The hop resolves too (a nested hop names its own CR; here the
+			// same one, so drop the cell the top-level call just stored).
+			key, handle, _ := e.key(t, h1ReqCtx(h1User))
+			handle.(*cache.ResolvedCacheStore).DeleteForTest(key)
+			// The hop the top-level resolve's self-loopback stage makes: a
+			// customer's (no background marker, no work class), depth 1.
+			hop := e.serve(h1ReqCtx(h1User), func(r *http.Request) {
+				r.Host = "snowplow.krateo-system.svc:8081"
+				r.Header.Set(cache.NestedDepthHeader, "1")
+			})
+			s1265Header(t, "the nested hop", hop, "")
+			e.wantResolves(t, "the call and its hop", 2)
+			s1265AssertDelta(t, "a call and its short-name hop", before,
+				map[string]uint64{h + "|cold": 1, "cold|" + h + "|" + coldCauseNoCell: 1})
+		})
+	}
+}
+
+// Each exclusion signal is weighed on its own: an untrusted background marker
+// outranks an export in cache.NonCustomerWriteOrigin's order, and must not
+// hide the export (an export page is never counted).
+func TestIssue1265_AnUntrustedHopMarkerDoesNotHideAnExport(t *testing.T) {
+	SetSelfLoopbackHost(r1265ChartSelfURL)
+	t.Cleanup(func() { SetSelfLoopbackHost("") })
+	for _, tg := range s1265Targets {
+		t.Run(tg.name, func(t *testing.T) {
+			e := s1265Setup(t, tg)
+			before := s1265Snap(t)
+			rec := e.serve(cache.WithExportRead(h1ReqCtx(h1User)), func(r *http.Request) {
+				r.Host = "portal.example.com"
+				r.Header.Set(cache.BackgroundHeader, "1")
+			})
+			e.wantResolves(t, "an export page", 1)
+			s1265Header(t, "an export page with an untrusted hop marker", rec, "")
+			s1265AssertDelta(t, "an export page with an untrusted hop marker", before, map[string]uint64{})
+		})
+	}
+}

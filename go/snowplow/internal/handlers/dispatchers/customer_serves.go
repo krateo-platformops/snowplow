@@ -251,16 +251,19 @@ func isTopLevelCustomerCall(req *http.Request) bool {
 }
 
 // isNonCustomerOrigin reports whether req's resolve belongs to someone other
-// than the customer (cache.NonCustomerWriteOrigin), reading a background-hop
-// marker only on a trusted self-loopback.
+// than the customer, reading a background-hop marker only on a trusted
+// self-loopback. Every origin is weighed on its own
+// (cache.EachNonCustomerOrigin), never the first alone: an untrusted hop
+// marker outranks an export, and must not hide it.
 func isNonCustomerOrigin(req *http.Request) bool {
-	switch cache.NonCustomerWriteOrigin(req.Context()) {
-	case "":
-		return false
-	case cache.NonCustomerBackgroundHop:
-		return isTrustedSelfLoopback(req)
-	}
-	return true
+	other := false
+	cache.EachNonCustomerOrigin(req.Context(), func(o string) bool {
+		if o != cache.NonCustomerBackgroundHop || isTrustedSelfLoopback(req) {
+			other = true
+		}
+		return !other
+	})
+	return other
 }
 
 // isNestedSelfLoopback reports whether req is a hop of a resolve that called
