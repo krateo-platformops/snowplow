@@ -115,6 +115,8 @@ type s1265Env struct {
 	requesterDialled atomic.Bool
 	// onResolve runs inside the resolve seam (D2 arms note a stale input).
 	onResolve func(ctx context.Context)
+	// resolveErr, when set, is the error the resolve seam returns.
+	resolveErr error
 }
 
 func s1265Setup(t *testing.T, tg s1265Target) *s1265Env {
@@ -135,6 +137,9 @@ func s1265Setup(t *testing.T, tg s1265Target) *s1265Env {
 		if e.onResolve != nil {
 			e.onResolve(ctx)
 		}
+		if e.resolveErr != nil {
+			return nil, e.resolveErr
+		}
 		out := &templatesv1.RESTAction{}
 		out.SetName(h1RAName)
 		out.SetNamespace(h1NS)
@@ -144,6 +149,9 @@ func s1265Setup(t *testing.T, tg s1265Target) *s1265Env {
 		e.resolves.Add(1)
 		if e.onResolve != nil {
 			e.onResolve(ctx)
+		}
+		if e.resolveErr != nil {
+			return nil, e.resolveErr
 		}
 		return h1WidgetUnstructured(map[string]any{}), nil
 	})

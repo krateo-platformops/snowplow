@@ -195,12 +195,18 @@ func reseedInertFromHeaders(req *http.Request) *http.Request {
 // cache.BackgroundHeader: 1, and this hop then refuses write stages too (its
 // ctx carries no background marker of its own).
 //
-// Trust rule (the reseedInertFromHeaders precedent): honoured on ANY request
-// with a snowplow-validated identity, because the hop marker only RESTRICTS —
-// it refuses that one request's write stages and changes nothing else (not the
-// origin, the memory gates, the cache key or a log level). A user forging it
-// stops only their own request's writes. Any value but "1" is ignored. Runs
-// first in ServeHTTP, with the inert ingest.
+// Trust rule (the reseedInertFromHeaders precedent): honoured as a write
+// refusal on ANY request with a snowplow-validated identity, because for that
+// purpose the hop marker only RESTRICTS: it refuses that one request's write
+// stages and changes nothing that decides a serve (not the origin, the memory
+// gates, the cache key or a log level). A user forging it stops only their own
+// request's writes. Any value but "1" is ignored. Runs first in ServeHTTP, with
+// the inert ingest.
+//
+// The marker also takes a request out of the #1265 served-cold counter, and
+// that use is NOT a restriction: honoured from any host, it would let a caller
+// hide its own calls from the counter. So the counter reads it only on a
+// trusted self-loopback, like the nested-depth marker (isTopLevelCustomerCall).
 func reseedBackgroundFromHeaders(req *http.Request) *http.Request {
 	if req == nil || req.Header.Get(cache.BackgroundHeader) != "1" || cache.BackgroundHop(req.Context()) {
 		return req

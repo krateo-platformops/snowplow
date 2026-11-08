@@ -20,8 +20,10 @@ package dispatchers
 //     ledger's definition, read with the same predicate;
 //   - cold    — the body comes from a live resolve run for this request, with
 //     the cause in snowplow_customer_serves_cold_total;
-//   - refused — the request ended before the serve decision (a bad request, a
-//     CR that could not be read, an RBAC denial).
+//   - refused — the request was refused before anything was served or read: a
+//     bad request (an inline object at the widgets handler, unparseable
+//     extras), a CR that could not be read, an RBAC denial, or the #1116
+//     reserved-extras 400 the resolver answers before it reads anything.
 //
 // A live resolve that then fails is still cold: the user waited on it.
 //
@@ -233,12 +235,32 @@ func CustomerColdServesSnapshot() []CustomerColdServeCell {
 // isTopLevelCustomerCall reports whether req is a top-level customer /call: a
 // request a user is waiting on that is not part of another call's work (see
 // the file comment). req is the request after beginServeWorkClass.
+//
+// Every loopback marker a caller can send (the work class, the background hop,
+// the nested depth) excludes a request only on a trusted self-loopback, so a
+// caller cannot hide its own calls by sending one. The work class is already
+// read that way (loopbackWorkClass). The background hop is honoured from any
+// host as a write refusal (reseedBackgroundFromHeaders), so here it excludes
+// only when the hop arrived on the self host.
 func isTopLevelCustomerCall(req *http.Request) bool {
 	ctx := req.Context()
 	return workclass.Of(ctx) == workclass.Customer &&
 		!isStaleRerun(req) &&
-		cache.NonCustomerWriteOrigin(ctx) == "" &&
+		!isNonCustomerOrigin(req) &&
 		!isNestedSelfLoopback(req)
+}
+
+// isNonCustomerOrigin reports whether req's resolve belongs to someone other
+// than the customer (cache.NonCustomerWriteOrigin), reading a background-hop
+// marker only on a trusted self-loopback.
+func isNonCustomerOrigin(req *http.Request) bool {
+	switch cache.NonCustomerWriteOrigin(req.Context()) {
+	case "":
+		return false
+	case cache.NonCustomerBackgroundHop:
+		return isTrustedSelfLoopback(req)
+	}
+	return true
 }
 
 // isNestedSelfLoopback reports whether req is a hop of a resolve that called
@@ -276,11 +298,31 @@ func (s *customerServe) end() {
 		return
 	}
 	customerServes[s.handler][s.outcome].Add(1)
+	if s.outcome == serveOutcomeRefused {
+		return // no serve to describe: no span attribute (and no header)
+	}
+	attrs := []attribute.KeyValue{attribute.String(spanAttrServeOutcome, serveOutcomeNames[s.outcome])}
 	if s.outcome == serveOutcomeCold {
 		if i := coldCauseIndex(s.cause); i >= 0 {
 			customerColdServes[s.handler][i].Add(1)
 		}
+		attrs = append(attrs, attribute.String(spanAttrServeColdCause, s.cause))
 	}
+	// Set at the end, with the final outcome: the request's server span is
+	// still open (the handler runs inside it).
+	trace.SpanFromContext(s.ctx).SetAttributes(attrs...)
+}
+
+// refused records that the request was refused after all, by a check that
+// answers only once the resolve is entered (the #1116 reserved-extras 400:
+// nothing was read or dialled). It overrides a decision already made and
+// withdraws its header, so call it before the refusal is written.
+func (s *customerServe) refused() {
+	if !s.counted {
+		return
+	}
+	s.decided, s.outcome, s.cause = true, serveOutcomeRefused, ""
+	s.wri.Header().Del(ServeOutcomeHeader)
 }
 
 // servedCell decides a serve of the resident cell entry stored under key:
@@ -305,13 +347,7 @@ func (s *customerServe) decide(o serveOutcome, cause string) {
 		return
 	}
 	s.decided, s.outcome, s.cause = true, o, cause
-	name := serveOutcomeNames[o]
-	s.wri.Header().Set(ServeOutcomeHeader, name)
-	attrs := []attribute.KeyValue{attribute.String(spanAttrServeOutcome, name)}
-	if o == serveOutcomeCold {
-		attrs = append(attrs, attribute.String(spanAttrServeColdCause, cause))
-	}
-	trace.SpanFromContext(s.ctx).SetAttributes(attrs...)
+	s.wri.Header().Set(ServeOutcomeHeader, serveOutcomeNames[o])
 }
 
 // coldCauseOfLookup names why a request with this key mint and lookup result

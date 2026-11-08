@@ -52,6 +52,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	req, endWork := beginServeWorkClass(req)
 	defer endWork()
 	start := time.Now()
+	// #1265 P0 — one serve outcome per top-level customer call (counter +
+	// header). First, so the inline-object 400 below counts as refused.
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerWidgets)
+	defer serveEnd()
 
 	// #443 part 2 — an inline object is a RESTAction only. BodyExtrasDecode
 	// already refuses one addressed at the widgets group; this is the
@@ -66,9 +70,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// into the existing stdout->otel-daemonset->ClickHouse pipeline.
 	pcs, pcEmit := beginPerCall(req, "widgets")
 	defer pcEmit()
-	// #1265 P0 — one serve outcome per top-level customer call (counter + header).
-	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerWidgets)
-	defer serveEnd()
 
 	// #547 — a demand revalidation re-enters this handler on a detached copy of
 	// a request that was already served (demand_revalidate.go): no customer is
@@ -432,7 +433,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// is a client error, already logged once at WARN where it was decided
 		// (api.RefuseReservedExtras), and nothing was read or dialled, so
 		// there is no stale-derived pass to withdraw.
-		if WriteReservedExtrasRefusal(wri, err) {
+		if isReservedExtrasRefusal(err) {
+			serve.refused() // #1265 — refused before anything was read: not a cold serve
+			WriteReservedExtrasRefusal(wri, err)
 			return
 		}
 		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh

@@ -1521,10 +1521,11 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 type LookupMiss uint8
 
 const (
+	// LookupAbsent — no cell under the key. It is the zero value, so a
+	// LookupMiss nobody set (a default, a stub) never reads as a hit.
+	LookupAbsent LookupMiss = iota
 	// LookupHit — a live cell was found and is returned.
-	LookupHit LookupMiss = iota
-	// LookupAbsent — no cell under the key.
-	LookupAbsent
+	LookupHit
 	// LookupExpiredTTL — the cell was past its TTL (its TTLOverride, else the
 	// store TTL) and this lookup evicted it.
 	LookupExpiredTTL
