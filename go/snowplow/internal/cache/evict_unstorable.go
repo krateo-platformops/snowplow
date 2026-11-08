@@ -30,8 +30,10 @@
 // THE CELL'S OWN CONTRACT. An external-TTL cell (the widget opt-in,
 // PutVerdict.WithExternalTTL) is stored precisely BECAUSE its resolve touches an
 // external endpoint, bounded by its own short TTL. An external decline of it
-// does not prove it unstorable — its writer stores exactly that — so it is kept,
-// as before.
+// does not prove it unstorable — its writer stores exactly that — and neither
+// does a transient failure of that endpoint (a stage error beside the same
+// third-party touch: the opt-in stores the clean retry), so it is kept, as
+// before (PutVerdict.StorableUnderExternalTTL).
 //
 // THE RACE (an eviction must never drop a newer valid body). The guard is the
 // #375 dep-event epoch every resolve-output Put already carries: a body's
@@ -72,6 +74,7 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 )
 
 // The non-verdict reasons EvictUnstorable takes (the verdict's own reasons are
@@ -94,8 +97,10 @@ func (c *ResolvedCacheStore) EvictOnPermanentDecline(ctx context.Context, v PutV
 	}
 	return c.evictPredating(ctx, key, string(v.Reason()), func(e *ResolvedEntry) bool {
 		// The cell's own contract: an external-TTL cell is stored by the opt-in
-		// that turns exactly this external decline into a store.
-		return v.WithExternalTTL(e.ExternalTTL).Store()
+		// that turns a third-party external touch into a store — a clean one now,
+		// or a clean retry after a transient failure of that same endpoint (#1255
+		// F1: a 5xx must never evict a body its own contract still stores).
+		return e.ExternalTTL && v.StorableUnderExternalTTL()
 	})
 }
 
@@ -150,10 +155,13 @@ func (c *ResolvedCacheStore) evictPredating(ctx context.Context, key, reason str
 	c.mu.Unlock()
 	remarkLayerConsumers(consumers)
 	c.evictUnstorableTotal.Add(1)
-	// INFO: one line per cell whose key became unstorable — an event (an edit),
-	// not per-request volume — so it ships. Metadata only: the opaque L1 key
-	// digest, the writer, the class and the reason; never a body, an identity or
-	// a resource name.
+	noteEvictUnstorable(reason)
+	// INFO, not WARN: an eviction is designed work, not a failure. At the chart's
+	// default LOG_LEVEL=warn this line does NOT ship; the shipped signal is the
+	// counter (snowplow_l1_evict_unstorable_total{reason} on OTLP, and
+	// snowplow_resolved_cache{stat=evict_unstorable_total}). Metadata only: the
+	// opaque L1 key digest, the writer, the class and the reason; never a body,
+	// an identity or a resource name.
 	slog.Default().InfoContext(ctx, "cache.unstorable_evicted",
 		slog.String("subsystem", "cache"),
 		slog.String("writer", RefDenialOrigin(ctx)),
@@ -166,4 +174,53 @@ func (c *ResolvedCacheStore) evictPredating(ctx context.Context, key, reason str
 	)
 	publishEvictionFn(key)
 	return true
+}
+
+// EvictUnstorableReasons is the closed reason set the per-reason eviction
+// counter reports, in export order (the verdict's three permanent reasons, the
+// two non-verdict ones, then "other" for anything outside them).
+var EvictUnstorableReasons = []string{
+	string(PutReasonDeclaredWrite), string(PutReasonExternal), string(PutReasonStageError),
+	UnstorableSensitive, UnstorableUAF, "other",
+}
+
+// evictUnstorableByReason counts unstorable evictions per EvictUnstorableReasons
+// index (process-lifetime, monotonic).
+var evictUnstorableByReason [6]atomic.Uint64
+
+func noteEvictUnstorable(reason string) {
+	last := len(EvictUnstorableReasons) - 1
+	for i, r := range EvictUnstorableReasons[:last] {
+		if r == reason {
+			evictUnstorableByReason[i].Add(1)
+			return
+		}
+	}
+	evictUnstorableByReason[last].Add(1)
+}
+
+// EvictUnstorableCount is one reason's unstorable-eviction count.
+type EvictUnstorableCount struct {
+	Reason string
+	Count  uint64
+}
+
+// EvictUnstorableByReason returns every reason's count, zeros included, in
+// EvictUnstorableReasons order (the OTLP mirror emits the closed set in full).
+func EvictUnstorableByReason() []EvictUnstorableCount {
+	out := make([]EvictUnstorableCount, len(EvictUnstorableReasons))
+	for i, r := range EvictUnstorableReasons {
+		out[i] = EvictUnstorableCount{Reason: r, Count: evictUnstorableByReason[i].Load()}
+	}
+	return out
+}
+
+// EvictUnstorableReasonCountForTest reads one reason's count. TEST-ONLY.
+func EvictUnstorableReasonCountForTest(reason string) uint64 {
+	for _, c := range EvictUnstorableByReason() {
+		if c.Reason == reason {
+			return c.Count
+		}
+	}
+	return 0
 }

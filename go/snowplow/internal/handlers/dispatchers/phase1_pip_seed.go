@@ -1245,7 +1245,7 @@ func seedRestactionResolveAndPutProd(
 	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink,
 		Forbidden: cache.PerIdentityForbiddenSinkFromContext(resCtx), External: extTouchedSink}, "restactions")
 	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, verdict, stageErrSink, extTouchedSink) {
-		evictOnPermanentDecline(resCtx, handle, verdict, key)
+		evictOnPermanentDecline(resCtx, inClassEvicter(resCtx, handle, inputs), verdict, key)
 		return nil
 	}
 
@@ -1631,7 +1631,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
 	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets")
 	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, verdict, stageErrSink, extTouchedSink) {
-		evictOnPermanentDecline(resCtx, handle, verdict, key)
+		evictOnPermanentDecline(resCtx, inClassEvicter(resCtx, handle, inputs), verdict, key)
 		return nil
 	}
 

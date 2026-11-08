@@ -21,9 +21,13 @@ package cache
 //   U5  the subscriber: the eviction publishes the refresh frame, and an open
 //       stale serve of the key is replaced and closes PUSHED when that frame is
 //       written — never left as cache.stale_push_unreplaced.
-//   U6  the TTL-reset path the live evidence pointed at: a widget cell Go-sliced
-//       from a raFullList cell (#406) is remarked when that cell is evicted as
-//       unstorable (a decline makes no raKey commit, so nothing else would).
+//   U6  a TTL-reset path found in code (that it is what 057 hit is inferred, not
+//       proven): a widget cell Go-sliced from a raFullList cell (#406) is
+//       remarked when that cell is evicted as unstorable (a decline makes no
+//       raKey commit, so nothing else would).
+//   U3b a transient failure of an opt-in (external-TTL) cell's own endpoint keeps
+//       the cell (review of #1263, F1).
+//   U7  every eviction is counted under its reason (the OTLP series).
 
 import (
 	"context"
@@ -259,6 +263,99 @@ func TestIssue1255_U3_AnExternalTTLCellKeepsItsOwnContract(t *testing.T) {
 	write := PutVerdict{decision: PutDeclinePermanent, reason: PutReasonDeclaredWrite}
 	if !c.EvictOnPermanentDecline(u1255Resolve("k"), write, "k") {
 		t.Fatal("#1255 RED: a declared write kept an external-TTL cell")
+	}
+}
+
+// U3b (review of #1263, F1) — a TRANSIENT failure of the opt-in cell's own
+// third-party endpoint: the real sinks record the third-party touch and the
+// endpoint's 5xx as a stage error, which PutGateVerdict classes as a permanent
+// stage_error. The opt-in stores the clean retry, so the external-TTL cell is
+// KEPT. The same verdict on a cell that did NOT opt in still evicts it (every
+// resolve of that spec touches the endpoint, and nothing stores it), and so does
+// a failure beside a touch that carried the requester (the opt-in refuses those,
+// #1221).
+func TestIssue1255_U3b_ATransientFailureOfTheOptInEndpointKeepsTheCell(t *testing.T) {
+	failing := func(thirdParty bool) (context.Context, PutVerdict) {
+		ctx := u1255Resolve("k")
+		ctx, stage := WithStageErrorSink(ctx)
+		ctx, _ = WithPerIdentityForbiddenSink(ctx)
+		ctx, ext := WithExternalTouchedSink(ctx)
+		if thirdParty {
+			ext.BumpThirdParty()
+		} else {
+			ext.Bump()
+		}
+		stage.Bump("feed", "503 Service Unavailable")
+		return ctx, PutGateVerdict(PutGateSinksFromContext(ctx), "widgets")
+	}
+	extTTL := func(e *ResolvedEntry) { e.ExternalTTL = true; e.TTLOverride = 60 * time.Second }
+
+	t.Run("opt_in_kept", func(t *testing.T) {
+		c := u1255Store(t)
+		prior := u1255Put(t, c, u1255Resolve("k"), "k", `{"ext":1}`, extTTL)
+		u1255Change()
+		ctx, v := failing(true)
+		if !v.Permanent() || v.Reason() != PutReasonStageError {
+			t.Fatalf("PRECONDITION: a failed third-party call is a permanent stage_error, got permanent=%v reason=%s", v.Permanent(), v.Reason())
+		}
+		if c.EvictOnPermanentDecline(ctx, v, "k") {
+			t.Fatal("#1255 F1 RED: a transient failure of the opt-in cell's own endpoint evicted it")
+		}
+		if got, _ := c.GetNoTouch("k"); got != prior {
+			t.Fatal("#1255 F1 RED: the external-TTL cell is gone")
+		}
+	})
+	t.Run("not_opted_in_evicted", func(t *testing.T) {
+		c := u1255Store(t)
+		u1255Put(t, c, u1255Resolve("k"), "k", `{"pre":"edit"}`)
+		u1255Change()
+		ctx, v := failing(true)
+		if !c.EvictOnPermanentDecline(ctx, v, "k") {
+			t.Fatal("#1255 RED: a stage error beside an external touch kept a cell that did not opt in")
+		}
+	})
+	t.Run("requester_touch_evicted", func(t *testing.T) {
+		c := u1255Store(t)
+		u1255Put(t, c, u1255Resolve("k"), "k", `{"ext":1}`, extTTL)
+		u1255Change()
+		ctx, v := failing(false)
+		if !c.EvictOnPermanentDecline(ctx, v, "k") {
+			t.Fatal("#1255 RED: a failure beside a touch that carried the requester kept an external-TTL cell the opt-in would refuse")
+		}
+	})
+}
+
+// U7 — every eviction is counted under its reason (the OTLP
+// snowplow_l1_evict_unstorable_total{reason} series), the closed set in full.
+func TestIssue1255_U7_EvictionsAreCountedByReason(t *testing.T) {
+	before := map[string]uint64{}
+	for _, r := range EvictUnstorableReasons {
+		before[r] = EvictUnstorableReasonCountForTest(r)
+	}
+	evict := func(f func(c *ResolvedCacheStore, ctx context.Context) bool) {
+		t.Helper()
+		c := u1255Store(t)
+		u1255Put(t, c, u1255Resolve("k"), "k", `{"v":1}`)
+		u1255Change()
+		if !f(c, u1255Resolve("k")) {
+			t.Fatal("PRECONDITION: the cell must be evicted")
+		}
+	}
+	for _, r := range []PutReason{PutReasonDeclaredWrite, PutReasonExternal, PutReasonStageError} {
+		evict(func(c *ResolvedCacheStore, ctx context.Context) bool {
+			return c.EvictOnPermanentDecline(ctx, PutVerdict{decision: PutDeclinePermanent, reason: r}, "k")
+		})
+	}
+	for _, r := range []string{UnstorableSensitive, UnstorableUAF, "something-new"} {
+		evict(func(c *ResolvedCacheStore, ctx context.Context) bool { return c.EvictUnstorable(ctx, "k", r) })
+	}
+	for _, r := range EvictUnstorableReasons {
+		if d := EvictUnstorableReasonCountForTest(r) - before[r]; d != 1 {
+			t.Errorf("#1255: reason %q counted %d eviction(s), want 1", r, d)
+		}
+	}
+	if got := EvictUnstorableByReason(); len(got) != len(EvictUnstorableReasons) {
+		t.Fatalf("#1255: the closed reason set must be reported in full, got %d of %d", len(got), len(EvictUnstorableReasons))
 	}
 }
 

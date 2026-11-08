@@ -370,22 +370,29 @@ type sar574Outcome struct {
 	// #1255 — a permanent decline of the resident cell evicts it (and its
 	// suppression marker goes with it): the eviction count and residency after.
 	evictUnstorableDelta uint64
-	resident             bool
+	// #1255 F4 — the same eviction counted under its reason, declared_write.
+	evictDeclaredWriteDelta uint64
+	resident                bool
 }
 
 // sar574DeclinedAsDeclaredWrite asserts the refresher declined the re-Put as a
 // declared write. Since #1255 a permanent decline of a resident cell EVICTS it,
 // so the suppression marker leaves with the key; the decline is then read off
-// the eviction, with neither the external nor the stage-error decline counted
-// (the only other permanent reasons). With no resident cell left to evict, the
-// marker itself must say declared_write.
+// the eviction's own reason (snowplow_l1_evict_unstorable_total{reason}), which
+// must be declared_write, with neither the external nor the stage-error decline
+// counted. With no resident cell left to evict, the marker itself must say
+// declared_write.
 func sar574DeclinedAsDeclaredWrite(t *testing.T, arm string, got sar574Outcome) {
 	t.Helper()
 	if got.extSkipDelta != 0 || got.stageErrDelta != 0 {
 		t.Fatalf("%s: the refresher must decline a write RESTAction as declared_write, not as external (%d) or a stage error (%d)",
 			arm, got.extSkipDelta, got.stageErrDelta)
 	}
-	if got.evictUnstorableDelta == 1 && !got.resident {
+	if got.evictUnstorableDelta != 0 || !got.resident {
+		if got.evictUnstorableDelta != 1 || got.evictDeclaredWriteDelta != 1 || got.resident {
+			t.Fatalf("%s: the resident cell must be evicted exactly once, as declared_write (evictions=%d, as declared_write=%d, "+
+				"resident=%v)", arm, got.evictUnstorableDelta, got.evictDeclaredWriteDelta, got.resident)
+		}
 		return
 	}
 	if r, ok := cache.RefreshSuppressedReason(got.key); !ok || r != string(cache.PutReasonDeclaredWrite) {
@@ -427,6 +434,7 @@ func sar574Refresh(t *testing.T, ctx context.Context, srv *sar574Server, ns, nam
 	ext0 := cache.ExternalSkippedPut()
 	se0 := cache.RefresherSkippedStageError()
 	ev0 := store.Stats().EvictUnstorableTotal
+	evDW0 := cache.EvictUnstorableReasonCountForTest(string(cache.PutReasonDeclaredWrite))
 
 	saEP := &endpoints.Endpoint{ServerURL: srv.srv.URL, Token: sar574SAToken}
 	saRC := &rest.Config{Host: srv.srv.URL, BearerToken: sar574SAToken}
@@ -434,6 +442,7 @@ func sar574Refresh(t *testing.T, ctx context.Context, srv *sar574Server, ns, nam
 
 	out := sar574Outcome{key: key}
 	out.evictUnstorableDelta = store.Stats().EvictUnstorableTotal - ev0
+	out.evictDeclaredWriteDelta = cache.EvictUnstorableReasonCountForTest(string(cache.PutReasonDeclaredWrite)) - evDW0
 	out.resident = store.Has(key)
 	out.dialed, out.dialAuth = srv.saw(wantMethod, wantPath)
 	out.extSkipDelta = cache.ExternalSkippedPut() - ext0

@@ -239,7 +239,11 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, v cache.PutVerdict
 	// #398 — a seed resolve that read a sensitive resource writes nothing, and
 	// (#1255) evicts an older entry: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(ctx) {
-		evictUnstorable(ctx, handle, key, cache.UnstorableSensitive)
+		var inputs *cache.ResolvedKeyInputs
+		if entry != nil {
+			inputs = entry.Inputs
+		}
+		evictUnstorable(ctx, inClassEvicter(ctx, handle, inputs), key, cache.UnstorableSensitive)
 		return false
 	}
 	if entry != nil {

@@ -481,7 +481,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// stored after this resolve began, and an external-TTL cell, whose own
 		// opt-in stores exactly this resolve (cache/evict_unstorable.go). A
 		// transient decline keeps the prior entry KNOWN-STALE (#547).
-		evicted := evictOnPermanentDecline(rctx, c, verdict, key)
+		evicted := evictOnPermanentDecline(rctx, inClassEvicter(rctx, c, &inputs), verdict, key)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			if !evicted {
@@ -590,7 +590,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// the UAF scope into the key (#180): suppress on first occurrence.
 		cache.NoteRefreshDecline(key, "uaf", true)
 		// #1255 — evict an older entry: no writer stores this key's current body.
-		if evictUnstorable(rctx, c, key, cache.UnstorableUAF) {
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableUAF) {
 			return nil
 		}
 		// DEBUG for the same reason as the dispatch site: expected, designed, and
@@ -612,7 +612,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// (#1255) an older entry is evicted: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(rctx) {
 		cache.NoteRefreshDecline(key, "sensitive_resource", true)
-		if evictUnstorable(rctx, c, key, cache.UnstorableSensitive) {
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableSensitive) {
 			return nil
 		}
 		log.Debug("resolveAndPopulateL1: re-resolve read a sensitive resource; declining to re-Put",

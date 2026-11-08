@@ -36,15 +36,29 @@ type unstorableEvicter interface {
 	EvictUnstorable(ctx context.Context, key, reason string) bool
 }
 
-// dispatchEvicter is a customer /call's eviction surface, or nil when the
-// request may not write its cell at all — no store, no key, or the #95 ""
-// BindingUID collapse (serveFromCacheEligible): a request that may not populate
-// the shared cell may not empty it either.
-func dispatchEvicter(h cacheHandle, key string, inputs *cache.ResolvedKeyInputs) unstorableEvicter {
-	if h == nil || key == "" || !serveFromCacheEligible(inputs) {
+// inClassEvicter is h, or nil when the identity on ctx is no longer in the RBAC
+// class inputs' key was minted for (#424). A resolve whose class moved mid-resolve
+// read another class's view: its decline proves nothing about THIS key, so it
+// must not evict the key's cell (#1255 F3, review of #1263). The same predicate
+// every identity-bound Put re-checks (identityClassDriftCtx); always in class for
+// an identity-free cell.
+func inClassEvicter(ctx context.Context, h unstorableEvicter, inputs *cache.ResolvedKeyInputs) unstorableEvicter {
+	if h == nil || identityClassDriftCtx(ctx, inputs) != "" {
 		return nil
 	}
 	return h
+}
+
+// dispatchEvicter is a customer /call's eviction surface, or nil when the
+// request may not write its cell at all — no store, no key, or the #95 ""
+// BindingUID collapse (serveFromCacheEligible): a request that may not populate
+// the shared cell may not empty it either — or when its identity class moved
+// during the resolve (inClassEvicter).
+func dispatchEvicter(ctx context.Context, h cacheHandle, key string, inputs *cache.ResolvedKeyInputs) unstorableEvicter {
+	if h == nil || key == "" || !serveFromCacheEligible(inputs) {
+		return nil
+	}
+	return inClassEvicter(ctx, h, inputs)
 }
 
 // evictOnPermanentDecline evicts key's cell when v permanently declines the

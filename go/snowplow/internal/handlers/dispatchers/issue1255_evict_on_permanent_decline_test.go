@@ -23,6 +23,9 @@ package dispatchers
 //       resolve — keeps the prior entry, unsuppressed, as before.
 //   W3  the eviction is announced to an armed /refreshes subscriber (the refresh
 //       frame of a deletion), so an armed tab refetches.
+//   W4  (review F1) a 503 from an opt-in widget's own named endpoint during its
+//       refresh keeps the external-TTL cell — a transient failure never evicts.
+//   F3  (review F3) a resolve whose RBAC class moved mid-resolve evicts nothing.
 //
 // The rule, the epoch race guard, the external-TTL contract and the layered
 // (raFullList) consumer remark are pinned on the store in
@@ -33,6 +36,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,8 +64,10 @@ const (
 
 type n1255Env struct {
 	*k1221Env
-	dyn k8sdynamic.Interface
-	a   psArm
+	dyn      k8sdynamic.Interface
+	a        psArm
+	secrets  map[string]*corev1.Secret
+	downHits atomic.Int64
 }
 
 // n1255Setup is k1221Setup keeping the fake client, so the arm can edit the
@@ -68,9 +75,16 @@ type n1255Env struct {
 // re-fetches the widget CR through it).
 func n1255Setup(t *testing.T) *n1255Env {
 	t.Helper()
+	a := k1221Shapes[0]
+	return n1255SetupWith(t, k1221RA(k1221TargetStage(a)), false)
+}
+
+// n1255SetupWith is n1255Setup for a given RESTAction, the widget opted in to the
+// external-TTL cache or not.
+func n1255SetupWith(t *testing.T, ra *unstructured.Unstructured, optedIn bool) *n1255Env {
+	t.Helper()
 	a := k1221Shapes[0] // informer_servable: the RESTAction's K8s stage is served in-process
-	ra := k1221RA(k1221TargetStage(a))
-	cr := k1221Widget(n1255Expr, false)
+	cr := k1221Widget(n1255Expr, optedIn)
 
 	k423Env(t)
 	// The refresher's process-held resolve memo (#598) outlives a test's dep
@@ -113,7 +127,26 @@ func n1255Setup(t *testing.T) *n1255Env {
 		xcontext.WithAccessToken("jwt-"+psAlice))
 	e := &k1221Env{t: t, cr: cr, saURL: apiserver.URL, endpointURL: endpoint.URL, wire: w,
 		aliceCtx: alice, bobCtx: alice, store: cache.ResolvedCache()}
-	return &n1255Env{k1221Env: e, dyn: dyn, a: a}
+	return &n1255Env{k1221Env: e, dyn: dyn, a: a, secrets: byName}
+}
+
+// endpointDown points the named endpoint's Secret at a server that answers 503:
+// a transient outage of the widget's own third-party endpoint.
+func (e *n1255Env) endpointDown(t *testing.T) {
+	t.Helper()
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		e.downHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(down.Close)
+	byName := map[string]*corev1.Secret{}
+	for k, v := range e.secrets {
+		byName[k] = v
+	}
+	ep := e.secrets[k1221EP].DeepCopy()
+	ep.Data["server-url"] = []byte(down.URL)
+	byName[k1221EP] = ep
+	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: byName})
 }
 
 // edit replaces the RESTAction's stages and waits until its informer serves them.
@@ -254,6 +287,9 @@ func TestIssue1255_W2_ATransientDeclineKeepsThePriorEntry(t *testing.T) {
 	// A stage that fails under the background identity only (the refresher-only
 	// 401 of an exportJwt loopback, an upstream 500): the REAL re-resolve of the
 	// unedited RESTAction, plus one recorded stage error and no external touch.
+	// A change after the cell's body was resolved, so only the verdict's class
+	// (transient) can keep the cell — not the epoch guard.
+	cache.BumpCoordinateForTest(e.a.target, psTargetNS, psTargetObj)
 	restore := setResolveOnceForTest(func(ctx context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
 		b, err := resolveOnceProd(ctx, in)
 		cache.StageErrorSinkFromContext(ctx).Bump("broken", "upstream 500")
@@ -296,5 +332,92 @@ func TestIssue1255_W3_TheEvictionIsPushedToAnArmedSubscriber(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("#1255 RED: the eviction was silent — an armed tab keeps showing the pre-edit body (cache.stale_push_unreplaced)")
+	}
+}
+
+// W4 (review of #1263, F1) — a widget opted in to the external-TTL cache is
+// stored BECAUSE it reads a third-party endpoint. A transient outage of that
+// endpoint during its refresh (a 503: a stage error beside the same third-party
+// touch, a PERMANENT stage_error verdict) must not evict it: its own opt-in
+// stores the clean retry, so the decline proves nothing permanent. The cell is
+// kept on its bounded TTL, as before #1255. RED before the F1 fix (the verdict
+// carried no third-party fact, so the keep never matched and the cell went cold).
+func TestIssue1255_W4_ATransientFailureOfAnOptInWidgetsOwnEndpointKeepsItsCell(t *testing.T) {
+	cache.ResetRefresherForTest()
+	t.Cleanup(cache.ResetRefresherForTest)
+	a := k1221Shapes[0]
+	e := n1255SetupWith(t, k1221RA(k1221TargetStage(a), k1221FeedStage()), true)
+	rec := e.serve(e.aliceCtx)
+	if rec.Code != http.StatusOK || n1255Title(t, rec.Body.Bytes()) != k1221Value {
+		t.Fatalf("PRECONDITION: the opt-in widget must render the endpoint's answer (code=%d body=%s)",
+			rec.Code, psTrunc(rec.Body.String(), 300))
+	}
+	key := e.key(e.aliceCtx)
+	prior, ok := e.store.GetNoTouch(key)
+	if !ok || !prior.ExternalTTL {
+		t.Fatalf("PRECONDITION: the opt-in widget must be cached as an external-TTL cell (resident=%v)", ok)
+	}
+	evicted0 := e.store.Stats().EvictUnstorableTotal
+	declined0 := cache.RefresherSkippedStageError()
+
+	// The cell is refreshed because the Kubernetes object its RESTAction also
+	// reads changed (its inner-call edge): a change AFTER the cell's body was
+	// resolved, so the epoch guard alone would not spare it.
+	cache.BumpCoordinateForTest(a.target, psTargetNS, psTargetObj)
+	e.endpointDown(t)
+	e.refresh(t, key)
+	if e.downHits.Load() == 0 || cache.RefresherSkippedStageError() == declined0 {
+		t.Fatalf("PRECONDITION (non-vacuity): the refresh must have dialled the failing endpoint (%d) and been declined "+
+			"for the stage error", e.downHits.Load())
+	}
+	if got, ok := e.store.GetNoTouch(key); !ok || got != prior {
+		t.Fatalf("#1255 F1 RED: a transient failure of the opt-in widget's own endpoint evicted its cell (resident=%v) — "+
+			"the next request goes cold against the failing endpoint", ok)
+	}
+	if d := e.store.Stats().EvictUnstorableTotal - evicted0; d != 0 {
+		t.Fatalf("#1255 F1 RED: %d unstorable eviction(s) on a transient endpoint failure", d)
+	}
+}
+
+// F3 (review of #1263) — a resolve whose identity class moved mid-resolve read
+// another class's view, so its decline proves nothing about the key it was
+// minted under: every eviction site goes through inClassEvicter, which refuses
+// it. In class, the store is handed through.
+func TestIssue1255_F3_ADriftedResolveEvictsNothing(t *testing.T) {
+	cache.ResetRefresherForTest()
+	t.Cleanup(cache.ResetRefresherForTest)
+	e := n1255Setup(t)
+	key := e.warm(t)
+	cell, _ := e.store.GetNoTouch(key)
+	in := *cell.Inputs
+	if inClassEvicter(e.aliceCtx, e.store, &in) == nil {
+		t.Fatal("PRECONDITION: the cell's own requester is in its class — the store must be handed through")
+	}
+	drifted := in
+	drifted.SubjectBindingSet = "binding-set-before-a-grant"
+	if inClassEvicter(e.aliceCtx, e.store, &drifted) != nil {
+		t.Fatal("#1255 F3 RED: a resolve whose RBAC class moved since the key was minted may evict the key's cell")
+	}
+	if dispatchEvicter(e.aliceCtx, e.store, key, &drifted) != nil {
+		t.Fatal("#1255 F3 RED: the /call eviction surface does not refuse a drifted resolve")
+	}
+	// Under a permanent decline of a resolve that began after the cell's body
+	// (so only the class guard can spare it), the drifted resolve leaves the
+	// cell resident.
+	cache.BumpCoordinateForTest(h1RAGVR, h1NS, psRAName)
+	ctx := cache.WithL1KeyContext(e.aliceCtx, key)
+	ctx, _ = cache.WithStageErrorSink(ctx)
+	ctx, _ = cache.WithPerIdentityForbiddenSink(ctx)
+	ctx, ext := cache.WithExternalTouchedSink(ctx)
+	ext.Bump()
+	v := cache.PutGateVerdict(cache.PutGateSinksFromContext(ctx), "widgets")
+	if !v.Permanent() {
+		t.Fatal("PRECONDITION: an external touch must be a permanent decline")
+	}
+	if evictOnPermanentDecline(ctx, inClassEvicter(ctx, e.store, &drifted), v, key) || !e.store.Has(key) {
+		t.Fatal("#1255 F3 RED: a drifted resolve evicted the key's cell")
+	}
+	if !evictOnPermanentDecline(ctx, inClassEvicter(ctx, e.store, &in), v, key) {
+		t.Fatal("PRECONDITION (non-vacuity): the same decline in class must evict")
 	}
 }

@@ -516,7 +516,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — see restactions.go: a Secret-bearing envelope is never persisted,
 		// and (#1255) an older cell of this key is evicted.
-		evictUnstorable(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("Widget resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "envelope served (200); not persisted — Secret reads are always live (#398)"),
@@ -530,7 +530,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		)
 	} else if declineWidgetUAFPut(cacheInputs, uafTouchedSink) {
 		// #1255 — see restactions.go: an older cell of this key is evicted.
-		evictUnstorable(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: on a portal rendering UAF-backed widgets this fires on
 		// essentially every /call, and LOG_LEVEL=warn is the production floor.
 		// snowplow_widgets_uaf_put_declined_total carries the rate.
@@ -548,7 +548,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// here; the reason only picks the log line and the counter.
 		// #1255 — a PERMANENT decline also evicts an older cell of this key (see
 		// restactions.go); a transient one keeps it.
-		evictOnPermanentDecline(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			// DEBUG: designed, and it fires on every /call of such a widget.

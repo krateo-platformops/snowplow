@@ -597,7 +597,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// the body, persist it nowhere. #1255 — and evict an older cell of this key
 		// (a #547 demand revalidation re-enters here over one): no writer can
 		// ever replace it.
-		evictUnstorable(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "body served (200); not persisted — Secret reads are always live (#398)"),
@@ -613,7 +613,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
 		// #1255 — the same class-driven gate as the refresher's: an older cell of
 		// this key can never be replaced, so it is evicted.
-		evictUnstorable(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
 		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
 		// snowplow_restactions_uaf_put_declined_total carries the rate.
@@ -632,7 +632,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// #1255 — a PERMANENT decline also evicts an older cell of this key (a
 		// #547 demand revalidation re-enters here over a resident known-stale
 		// one): no writer can ever replace it. A transient one keeps it.
-		evictOnPermanentDecline(ctx, dispatchEvicter(cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			// DEBUG: designed, and it fires on every /call of a write RESTAction.

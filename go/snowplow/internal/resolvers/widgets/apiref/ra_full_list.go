@@ -553,7 +553,9 @@ func raFullListServe(
 		// apiserver 403 is not an external touch. Read through the shared
 		// Put-gate verdict, which also declines a declared write (#903 F1).
 		if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
-			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
+			if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+				c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
+			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -573,7 +575,9 @@ func raFullListServe(
 		// nothing unless it allows the Put.
 		v := raFullListVerdict(gate)
 		if cache.DeclineSensitivePut(fullCtx) {
-			c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive) // #1255
+			if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+				c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
+			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -640,7 +644,9 @@ func raFullListServe(
 	// defect the proposal kills). Read through the shared Put-gate verdict
 	// (#684: the resolve ran under the gate sinks; GenuineExternal per #681 C2).
 	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
-		c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
+		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -655,7 +661,9 @@ func raFullListServe(
 	// genuine external endpoint reached on a later page). It has run once, so
 	// S_ra is served and nothing runs again.
 	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
-		c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
+		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -762,7 +770,9 @@ func raFullListServe(
 	// #684 — nor one with a stage error that is not a per-identity forbidden.
 	v := raFullListVerdict(gate) // #912 re-review — twin of the repopulate branch
 	if cache.DeclineSensitivePut(fullCtx) {
-		c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive) // #1255
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
+		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}
@@ -856,6 +866,17 @@ func RAKeyClassDriftDeclinedForTest() uint64 { return raKeyClassDriftDeclined.Lo
 // reports whether it still equals raKey. A grant/revoke that landed during the
 // resolve moves it (#424) — including a grant-then-revoke or a Role edit that
 // leaves the binding set unchanged, via the monotone sub-gen (#435).
+// raFullListEvictable reports whether a decline of this full-list resolve may
+// evict raKey's cell (#1255): there is one, and the requester is still in the
+// RBAC class raKey was minted for. A resolve whose class moved mid-resolve read
+// another class's view, so its decline proves nothing about raKey (#424; F3 of
+// the #1263 review). Residency is read first: the class re-derivation runs only
+// when there is a cell to evict.
+func raFullListEvictable(ctx context.Context, c *cache.ResolvedCacheStore, gvr schema.GroupVersionResource,
+	namespace, name string, extras map[string]any, raKey string) bool {
+	return c.Has(raKey) && raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey)
+}
+
 func raKeyClassCurrent(ctx context.Context, gvr schema.GroupVersionResource,
 	namespace, name string, extras map[string]any, raKey string) bool {
 	_, now, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
