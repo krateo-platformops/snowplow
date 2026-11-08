@@ -467,13 +467,6 @@ func f608Setup(t *testing.T, cohortGroups []string, informerWidgets map[f608Kind
 			t.Fatalf("EnsureResourceType(%s): informer did not sync", k.gvr())
 		}
 	}
-	// #1233: the fixture's writes need this watcher's complete snapshot. Its
-	// initial publish waits for the RBAC informers, so the rebuild below reads
-	// them synced; without the wait, a slow initial LIST left the rebuild partial
-	// and the fixture's seed write was refused.
-	if err := rw.WaitInitialRBACPublishForTest(10 * time.Second); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
 	cache.RebuildRBACSnapshotForTest(rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
