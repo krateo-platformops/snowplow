@@ -1,8 +1,8 @@
 module github.com/krateo-platformops/snowplow
 
-go 1.26.0
+go 1.27.0
 
-toolchain go1.26.10
+toolchain go1.27.3
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
@@ -32,7 +32,7 @@ require (
 	golang.org/x/image v0.46.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/time v0.14.0
-	golang.org/x/tools v0.49.0
+	golang.org/x/tools v0.50.0
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	k8s.io/api v0.36.5
 	k8s.io/apiextensions-apiserver v0.36.5
