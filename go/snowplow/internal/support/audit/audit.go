@@ -110,7 +110,9 @@ func WithSessionID(ctx context.Context, id string) context.Context {
 // Middleware resolves the request session id (inbound baggage -> shortid
 // request trace id -> minted) and writes it into ctx's W3C baggage as
 // `session.id`, so it (a) is stamped on every AuditEvent and (b) propagates
-// downstream via the Baggage propagator. Snowplow is the id origin. It is
+// downstream via the Baggage propagator. Snowplow is the id origin. It also
+// carries on ctx what the request was received with — its source IPs, User-Agent
+// and request URI (#1251, request.go) — which Emit stamps on every record. It is
 // additive-only: no request is ever rejected here.
 func Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -126,6 +128,7 @@ func Middleware() func(http.Handler) http.Handler {
 				id = NewID()
 			}
 			ctx = WithSessionID(ctx, id)
+			ctx = withRequestFacts(ctx, req)
 			next.ServeHTTP(wri, req.WithContext(ctx))
 		})
 	}
@@ -306,7 +309,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		rec.SetSeverityText("ERROR")
 	}
 
-	attrs := make([]attribute.KeyValue, 0, 25)
+	attrs := make([]attribute.KeyValue, 0, 28)
 	add := func(k, v string) {
 		if v != "" {
 			attrs = append(attrs, attribute.String(k, v))
@@ -346,6 +349,16 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	}
 	if ev.Code != 0 {
 		attrs = append(attrs, attribute.Int("http.response.status_code", ev.Code))
+	}
+
+	// #1251 — what snowplow received with the request the record was made on
+	// (request.go): read once by Middleware, never from the record's caller.
+	if f, ok := requestFactsFrom(ctx); ok {
+		if len(f.sourceIPs) > 0 {
+			attrs = append(attrs, attribute.StringSlice(AttrSourceIPs, f.sourceIPs))
+		}
+		add(AttrUserAgent, f.userAgent)
+		add(AttrRequestURI, f.requestURI)
 	}
 
 	// Business/session correlation id from W3C baggage — NOT a header.

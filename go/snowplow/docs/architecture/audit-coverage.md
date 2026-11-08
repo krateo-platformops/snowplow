@@ -4,7 +4,7 @@ title: snowplow — audit coverage
 description: Which snowplow actions emit an AuditEvent, which do not and why, what a record must contain, and how to count the trail without miscounting it. The checked-in inventory AUDIT-4 (krateo-platformops/installer#410) asks for.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
 tags: [audit, observability, security, restactions]
-timestamp: 2026-10-28T00:00:00Z
+timestamp: 2026-11-08T00:00:00Z
 ---
 
 # Audit coverage
@@ -51,7 +51,50 @@ The emitter enforces it, for every emit site:
 
 Every record also carries `outcome` (`success` / `failure`),
 `http.response.status_code` (when the authority answered), `session.id` (W3C
-baggage) and the request's TraceId/SpanId.
+baggage), the request's TraceId/SpanId, and what snowplow received with the
+request (see "Where the request came from" below).
+
+### Where the request came from
+
+Decided 2026-11-07 (#1251, AUDIT-3, installer#409). Every record carries three
+facts of the request it was made on, with the Kubernetes apiserver's audit
+semantics (`sourceIPs`, `userAgent`, `requestURI`):
+
+| attribute | k8s audit field | value |
+|---|---|---|
+| `krateo.request.source_ips` | `sourceIPs` | a string list: the `X-Forwarded-For` entries, then `X-Real-Ip`, then the address of the TCP peer, de-duplicated, in that order (`k8s.io/apimachinery` `utilnet.SourceIPs`, the function the apiserver's audit calls). A malformed entry is dropped |
+| `user_agent.original` | `userAgent` | the `User-Agent` header, as received |
+| `krateo.request.uri` | `requestURI` | the request target, path and query, as snowplow received it (e.g. `/call/dry-run?apiVersion=v1&resource=configmaps&namespace=default&name=cm-x`). A proxy that rewrites the path changes it first: on krateo-057 the gateway's HTTPRoute rewrites the `/content` prefix to `/`, so a browser's `/content/call/…` is recorded as `/call/…` |
+
+**Which source IP to believe.** Only the **last** entry of
+`krateo.request.source_ips` is established by snowplow: it is the address of
+the connection the request arrived on. On krateo-057 that is the agentgateway
+hop, not the person's browser. Every earlier entry was written into a header by
+a client or a proxy, and snowplow cannot tell a true one from a forged one: a
+caller can send any `X-Forwarded-For` it likes, and the gateway appends to it.
+There is no trusted-proxy list and no special case for the gateway. Read the
+entries from the end: the last is a fact, the one before it is what the hop you
+trust (if you trust it) says it received from, and so on. If the peer's address
+equals the last forwarded entry it is not repeated, so the last entry is still
+the peer's.
+
+The three facts are read once, by `audit.Middleware` at the edge of the request
+chain, before any handler runs, and the emitter writes them on every record made
+for that request: a `/call` write, an export, and each RESTAction stage write
+the request caused. A stage record therefore carries the URI of the `/call` or
+`/export` that snowplow received, never the stage's own outbound path (see
+"What a record never holds"). No emit site supplies them, so none can take them
+from a field of a request body. `TestRequest1251_*` (`internal/support/audit`)
+and `TestCall1251_*` / `TestExport1251_*` (`internal/handlers`) pin this.
+
+**Identity.** The request URI can carry identity in its query (a name, a
+filter, an owner). The audit trail stores identity on purpose; snowplow's log
+lines never do (#1192). The facts live only on the request context and are
+written only to the audit log pipeline, never to a log line:
+`TestS1251_RequestFactsReachTheAuditRecordAndNoLogLine` (`main` package) sends
+a sentinel identity in the query, the User-Agent and `X-Forwarded-For` through
+the pod's real chain and log handler, and wants it in the record and in no
+line.
 
 A successful write to the Kubernetes apiserver also carries the **written
 object's identity**, as the apiserver returned it (see "Written object
@@ -84,15 +127,22 @@ table does not name.
 | `server.address` | host and port a RESTAction stage was sent to |
 | `krateo.restaction.namespace`, `krateo.restaction.name`, `krateo.restaction.stage` | the RESTAction and stage that acted |
 | `session.id` | the session id, from W3C baggage |
+| `krateo.request.source_ips` | a string list: the request's source IPs; only the last entry (the TCP peer) is established by snowplow (see "Where the request came from") |
+| `user_agent.original` | the request's `User-Agent` header, as received |
+| `krateo.request.uri` | the request target snowplow received, path and query |
 | `krateo.audit.incomplete` | the required fields the site did not supply, e.g. `method,target` |
 | `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
 
 **What a record never holds.** The trail is kept 365 days, so nothing that can
-carry a credential goes into it: no request path or query (a webhook path such
-as Slack's `/services/T/B/<secret>`, Discord's `/api/webhooks/<id>/<token>` or
-Telegram's `/bot<token>/…`, or a path built by jq from an earlier stage's token,
-is a secret in its own right), and no upstream response body (an error body can
-echo a token). A RESTAction stage record's body is a reason class from a closed
+carry a credential goes into it: no path or query of a request snowplow **sends**
+(a webhook path such as Slack's `/services/T/B/<secret>`, Discord's
+`/api/webhooks/<id>/<token>` or Telegram's `/bot<token>/…`, or a path built by
+jq from an earlier stage's token, is a secret in its own right), and no upstream
+response body (an error body can echo a token). The URI of the request snowplow
+**received** (`krateo.request.uri`) is recorded: snowplow reads no credential
+from a query (its token travels in the `Authorization` header), and on
+krateo-057 no access token was found in any URL field over 6 h or over all time
+(installer, measured 2026-11-07, with controls). A RESTAction stage record's body is a reason class from a closed
 set (below).
 
 ## Inventory
