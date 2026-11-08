@@ -13,7 +13,12 @@
 //     entry so far.
 //   - user_agent.original: the User-Agent header, truncated as the apiserver
 //     truncates it (maybeTruncateUserAgent): beyond maxUserAgentLength bytes it
-//     is cut there and userAgentTruncateSuffix is appended.
+//     is cut and userAgentTruncateSuffix is appended. The cut never splits a
+//     character (truncateUserAgent), so the value stays valid UTF-8.
+//
+// Every string on a record, these included, is made valid UTF-8 by Emit
+// (validUTF8, audit.go): a raw 0xFF in a header or the query would otherwise
+// make the OTLP exporter refuse the whole batch.
 //   - krateo.request.uri: req.URL.RequestURI(), as the apiserver records it:
 //     the path and query snowplow received, never a scheme or host, even when
 //     the request target is in absolute form. The apiserver does not bound it,
@@ -52,6 +57,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"unicode/utf8"
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 )
@@ -143,10 +149,22 @@ func (r *receivedRequest) facts() requestFacts {
 	return f
 }
 
-// truncateUserAgent is the apiserver's maybeTruncateUserAgent.
+// truncateUserAgent is the apiserver's maybeTruncateUserAgent, on characters:
+// a User-Agent longer than maxUserAgentLength bytes keeps at most that many
+// bytes and gets userAgentTruncateSuffix. The apiserver cuts at the byte index
+// and its JSON encoder then turns a split character into U+FFFD; this record
+// is exported over OTLP (protobuf), which refuses invalid UTF-8 outright, so
+// the cut steps back to the start of the character it would split. Invalid
+// bytes the client sent are replaced (validUTF8) before the cut, so the result
+// is valid UTF-8 within the bound either way.
 func truncateUserAgent(ua string) string {
-	if len(ua) > maxUserAgentLength {
-		return ua[:maxUserAgentLength] + userAgentTruncateSuffix
+	ua = validUTF8(ua)
+	if len(ua) <= maxUserAgentLength {
+		return ua
 	}
-	return ua
+	cut := maxUserAgentLength
+	for cut > 0 && !utf8.RuneStart(ua[cut]) {
+		cut--
+	}
+	return ua[:cut] + userAgentTruncateSuffix
 }

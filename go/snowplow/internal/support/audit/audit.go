@@ -28,9 +28,11 @@ import (
 	"encoding/hex"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 
@@ -298,7 +300,7 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	now := time.Now()
 	rec.SetTimestamp(now)
 	rec.SetObservedTimestamp(now)
-	rec.SetBody(attribute.StringValue(ev.Message))
+	rec.SetBody(attribute.StringValue(validUTF8(ev.Message)))
 
 	// Severity from outcome. Success (or unset) => Info; anything else
 	// (failure/denied) => Error.
@@ -375,7 +377,59 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 		attrs = append(attrs, attribute.Bool("krateo.audit.no_trace_context", true))
 	}
 
+	// #1251 — every string the record carries is valid UTF-8, here, in one
+	// place, for every emit site and every attribute: the OTLP exporter
+	// (protobuf) refuses a record with an invalid string, and refuses the WHOLE
+	// batch it is in, so one request could otherwise lose other people's
+	// records (see validUTF8).
+	for i, kv := range attrs {
+		attrs[i] = validUTF8Attr(kv)
+	}
 	rec.AddAttributes(attrs...)
 
 	e.logger.Emit(ctx, rec) // SDK stamps Timestamp + TraceId/SpanId from ctx
+}
+
+// utf8Replacement replaces each invalid byte sequence of a value: U+FFFD, what
+// the apiserver's JSON-encoded audit log writes for one (encoding/json).
+const utf8Replacement = "\uFFFD"
+
+// validUTF8 returns s with every invalid UTF-8 sequence replaced by U+FFFD.
+//
+// WHY. Many values on a record come from what a client sent: the User-Agent,
+// the request URI, a name decoded from the query (name=cm-%FF decodes to the
+// byte 0xFF), an upstream's failure message. otlploghttp marshals a batch with
+// protobuf, which refuses a string field that is not valid UTF-8 ("string
+// field contains invalid UTF-8"), and the batch processor then drops the whole
+// batch: every other user's record in it never reaches the trail, with nothing
+// in the trail to show the gap. The apiserver's audit, whose semantics these
+// records follow, is JSON-encoded and gets this replacement from the encoder.
+func validUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, utf8Replacement)
+}
+
+// validUTF8Attr is validUTF8 applied to a string or string-slice attribute;
+// any other attribute is returned unchanged.
+func validUTF8Attr(kv attribute.KeyValue) attribute.KeyValue {
+	switch kv.Value.Type() {
+	case attribute.STRING:
+		if v := kv.Value.AsString(); !utf8.ValidString(v) {
+			return attribute.String(string(kv.Key), validUTF8(v))
+		}
+	case attribute.STRINGSLICE:
+		vs := kv.Value.AsStringSlice()
+		for i, v := range vs {
+			if !utf8.ValidString(v) {
+				out := slices.Clone(vs)
+				for j := i; j < len(out); j++ {
+					out[j] = validUTF8(out[j])
+				}
+				return attribute.StringSlice(string(kv.Key), out)
+			}
+		}
+	}
+	return kv
 }

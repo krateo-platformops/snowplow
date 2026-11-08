@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"unicode/utf8"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -284,4 +285,28 @@ func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 		t.Fatalf("control: code %d, want the dial's 404", w.Code)
 	}
 	wantFacts1251(t, typedOne1251(t, rec), []string{browser1251, gatewayPeer1251}, "/call/dry-run?"+cmQuery443)
+}
+
+// #1251 re-review — name=cm-%FF decodes to the byte 0xFF in k8s.resource.name
+// (already possible on main). The record must carry valid UTF-8, or the OTLP
+// exporter refuses its whole batch (internal/support/audit utf8_1251_test.go).
+func TestCall1251_PercentEncodedInvalidByteInTheName(t *testing.T) {
+	api, ep := newFakeAPI443(t)
+	api.respond(http.StatusNotFound, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
+	rec := recorder957(t)
+	target := "/call/dry-run?apiVersion=v1&resource=configmaps&namespace=default&name=cm-%FF"
+	w := serve1251(CallDryRun(), ep, http.MethodPatch, target, cmRequest957, gatewayPeer1251, browser1251)
+	if len(api.requests()) != 1 {
+		t.Fatalf("precondition: the dial did not happen (code %d: %s)", w.Code, w.Body.String())
+	}
+	got := typedOne1251(t, rec)
+	if v := got["k8s.resource.name"].AsString(); v != "cm-�" {
+		t.Errorf("k8s.resource.name = %q, want %q", v, "cm-�")
+	}
+	for k, v := range got {
+		if v.Type() == attribute.STRING && !utf8.ValidString(v.AsString()) {
+			t.Errorf("%s = %q is not valid UTF-8", k, v.AsString())
+		}
+	}
+	wantFacts1251(t, got, []string{browser1251, gatewayPeer1251}, target)
 }

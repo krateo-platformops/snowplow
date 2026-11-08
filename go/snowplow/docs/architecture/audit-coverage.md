@@ -63,7 +63,7 @@ semantics (`sourceIPs`, `userAgent`, `requestURI`):
 | attribute | k8s audit field | value |
 |---|---|---|
 | `krateo.request.source_ips` | `sourceIPs` | a string list, built by `k8s.io/apimachinery` `utilnet.SourceIPs`, the function the apiserver's audit calls. In order: each entry of the first `X-Forwarded-For` header line, trimmed, and dropped when it is not an IP (repeated entries are **kept**); then `X-Real-Ip`, when it is an IP not already in the list; then the address of the TCP peer, unless it equals the last entry so far |
-| `user_agent.original` | `userAgent` | the `User-Agent` header, bounded as the apiserver bounds it (`k8s.io/apiserver` `pkg/audit/request.go`, `maybeTruncateUserAgent`): a value longer than 1024 bytes is cut at 1024 bytes and `...TRUNCATED` is appended |
+| `user_agent.original` | `userAgent` | the `User-Agent` header, bounded as the apiserver bounds it (`k8s.io/apiserver` `pkg/audit/request.go`, `maybeTruncateUserAgent`): a value longer than 1024 bytes keeps at most 1024 bytes and gets `...TRUNCATED`. The cut steps back to the start of a character rather than split one (the apiserver cuts at the byte and its JSON encoder repairs the split; OTLP does not repair, see "Every string is valid UTF-8") |
 | `krateo.request.uri` | `requestURI` | `req.URL.RequestURI()`, as the apiserver records it: the path and query snowplow received, never a scheme or host, even for an absolute-form request target (e.g. `/call/dry-run?apiVersion=v1&resource=configmaps&namespace=default&name=cm-x`). A proxy that rewrites the path changes it first: on krateo-057 the gateway's HTTPRoute rewrites the `/content` prefix to `/`, so a browser's `/content/call/…` is recorded as `/call/…`. The apiserver does not bound it and neither does snowplow: Go's HTTP server bounds the request line together with the headers (`http.Server.MaxHeaderBytes`, unset in `main.go`, so `http.DefaultMaxHeaderBytes`, 1 MiB) and answers 431 beyond it |
 
 **Which source IP to believe.** Only the **last** entry of
@@ -90,6 +90,18 @@ never sends a write stage (#903), so a stage record carries the URI of the
 record never holds"). No emit site supplies them, so none can take them
 from a field of a request body. `TestRequest1251_*` (`internal/support/audit`)
 and `TestCall1251_*` / `TestExport1251_*` (`internal/handlers`) pin this.
+
+**Every string is valid UTF-8.** The emitter replaces every invalid UTF-8
+sequence with U+FFFD in every string and string-list attribute and in the record
+body, in one place (`audit.Emitter.Emit`), for every emit site. The reason: the
+OTLP exporter marshals with protobuf, which refuses a string that is not valid
+UTF-8, and the batch processor then drops the **whole batch**. So one request
+with a raw `0xFF` in its User-Agent or query, or a `name=cm-%FF` that decodes to
+that byte, would otherwise lose every other person's record in the same batch,
+and nothing in the trail would show the gap. The apiserver's audit is JSON, and
+its encoder makes the same replacement. `TestUTF8_1251_*`
+(`internal/support/audit`) pins it through the real `otlploghttp` exporter and
+batch processor. The trace plane has the same exposure, tracked in #1269.
 
 **Identity.** The request URI can carry identity in its query (a name, a
 filter, an owner). The audit trail stores identity on purpose; snowplow's log
@@ -132,7 +144,7 @@ table does not name.
 | `krateo.restaction.namespace`, `krateo.restaction.name`, `krateo.restaction.stage` | the RESTAction and stage that acted |
 | `session.id` | the session id, from W3C baggage |
 | `krateo.request.source_ips` | a string list: the request's source IPs; only the last entry (the TCP peer) is established by snowplow (see "Where the request came from") |
-| `user_agent.original` | the request's `User-Agent` header, cut at 1024 bytes plus `...TRUNCATED` as the apiserver does |
+| `user_agent.original` | the request's `User-Agent` header, at most 1024 bytes (cut on a character boundary) plus `...TRUNCATED`, as the apiserver bounds it |
 | `krateo.request.uri` | the path and query snowplow received (`req.URL.RequestURI()`, as the apiserver records it) |
 | `krateo.audit.incomplete` | the required fields the site did not supply, e.g. `method,target` |
 | `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
