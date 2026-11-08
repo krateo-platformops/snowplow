@@ -25,6 +25,8 @@ func obsGVR() schema.GroupVersionResource {
 // evicts nothing, and must not move for the verdicts that do evict or that had
 // nothing at stake.
 func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)

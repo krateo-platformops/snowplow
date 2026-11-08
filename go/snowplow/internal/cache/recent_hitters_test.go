@@ -51,6 +51,8 @@ func TestRecentHitters_RepeatFrontHitAllocatesNothing(t *testing.T) {
 }
 
 func TestRecentHitters_CarriedAcrossReplaceInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(64, 1<<20, time.Hour)
 	const key = "k444"
 	first := &ResolvedEntry{RawJSON: []byte(`1`)}
@@ -67,6 +69,8 @@ func TestRecentHitters_CarriedAcrossReplaceInPlace(t *testing.T) {
 }
 
 func TestEvictUnrefreshable_SparesALaterPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(64, 1<<20, time.Hour)
 	const key = "k444e"
 	decided := &ResolvedEntry{RawJSON: []byte(`old`)}

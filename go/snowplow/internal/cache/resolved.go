@@ -1664,9 +1664,10 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // Put stores entry under key, evicting LRU tail entries until both
 // entry-count and byte-budget caps are satisfied. The entry's CreatedAt
 // is set to time.Now() if zero. Putting under a key that already exists
-// replaces the entry and adjusts curBytes accordingly.
-func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) {
-	c.putPlain(context.Background(), false, key, entry)
+// replaces the entry and adjusts curBytes accordingly. It reports whether it
+// wrote: the store's admission (admitWrite) can refuse.
+func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
+	return c.putPlain(context.Background(), false, key, entry)
 }
 
 // PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
@@ -1679,17 +1680,20 @@ func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) {
 // (generation preserved, unknown provenance for the #406 layer index); ctx only
 // ends the known-stale state, inside the same critical section as the write
 // (#734).
-func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
-	c.putPlain(ctx, false, key, entry)
+func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) bool {
+	return c.putPlain(ctx, false, key, entry)
 }
 
-func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) {
+// putPlain is the plain write the methods above share. It reports whether it
+// wrote.
+func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) bool {
 	if c == nil || entry == nil {
-		return
+		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return
+	// #443 (a) / #1233 — the store's admission: an inert resolve, or a write
+	// while the RBAC snapshot is incomplete, stores nothing.
+	if !admitWrite(ctx, entry) {
+		return false
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
@@ -1715,6 +1719,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	ksEnd.afterUnlock(key)
 	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
+	return true
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1736,16 +1741,15 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 // #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
 // the raKey versions the body Go-sliced, so the layer check judges this Put by them.
 // #323's plain no-gen semantics are unchanged.
-func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
-	if c == nil || entry == nil {
-		return
+func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) bool {
+	// #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh
+	// body). A write the store did not admit (an inert resolve, an incomplete
+	// RBAC snapshot) stored nothing, and there is nothing to remark.
+	if !c.putPlain(ctx, true, key, entry) {
+		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return
-	}
-	c.putPlain(ctx, true, key, entry) // #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh body)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
+	return true
 }
 
 // #890 / #893 — EDGES OF A CELL THAT IS NOT STORED.
@@ -1816,8 +1820,8 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	if c == nil || entry == nil {
 		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
@@ -1877,8 +1881,8 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 	if c == nil || entry == nil {
 		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
@@ -1966,8 +1970,8 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	if c == nil || entry == nil {
 		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
 		return false
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)

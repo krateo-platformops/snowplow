@@ -22,6 +22,8 @@ import (
 )
 
 func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(ResetUAFPutDeclineCountersForTest)
 
@@ -67,6 +69,8 @@ func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) 
 // asserts the same thing end to end; this one fails without the harness, so a
 // future refactor of raFullListServe cannot take the cap down with it silently.
 func TestS592_RAFullListUAFCap_AppliesToStoredEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// A non-zero knob, so "capped" is distinguishable from "knob off".
 	t.Setenv("UAF_RESOLVED_TTL_SECONDS", "300")
 	ResetUAFPutDeclineCountersForTest()

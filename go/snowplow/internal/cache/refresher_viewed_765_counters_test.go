@@ -18,6 +18,8 @@ import (
 // key is re-resolved exactly once, customer-triggered. Driven step by step with
 // processNext (no workers), so the order is exact.
 func TestViewedTier765_V2b_NormalCopyStepsAsideForThePendingViewedCopy(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
@@ -68,6 +70,8 @@ func TestViewedTier765_V2b_NormalCopyStepsAsideForThePendingViewedCopy(t *testin
 // that follows has nothing left to do and must not re-resolve. Driven step by
 // step with processNext (no workers), so the order is exact.
 func TestViewedTier765_V2c_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
@@ -111,6 +115,8 @@ func TestViewedTier765_V2c_ViewedCopyAfterTheOtherTierRanIsSkipped(t *testing.T)
 // key (whose second copy is skipped) and one key whose tab closed before its
 // dequeue, and reads every viewed_* stat.
 func TestViewedTier765_C_CountersMoveWithTheTier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	keys, rec, firstIn, release := viewed765Start(t, 1, 5)
 	hold, routed, promoted, closed, other := keys[0], keys[1], keys[2], keys[3], keys[4]
 	viewed765Arm(t, routed)

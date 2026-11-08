@@ -62,6 +62,8 @@ func threeClassDeps(t *testing.T) (*DepTracker, string, string, string) {
 }
 
 func TestIssue239_A_ObjectPathAttribution(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrCompositions()
 	ns, name := "ns", "obj"
 
@@ -166,6 +168,8 @@ func TestIssue239_A_SubmitSourceAttribution(t *testing.T) {
 // TestIssue239_B_Discrimination — the load-bearing arm: benign fan-out vs an
 // amplifier must produce DIFFERENT distributions.
 func TestIssue239_B_Discrimination(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrCompositions()
 	ns, name := "ns", "obj"
 

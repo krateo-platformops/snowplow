@@ -87,6 +87,8 @@ func r378StoreClock(t *testing.T, c *ResolvedCacheStore) *r378Clock {
 
 // TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect — K=3 × M=4.
 func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const maxAge = 3 * time.Second
 	c := newResolvedCache(0, 0, 30*time.Second)
 	c.maxEntryAge = maxAge
@@ -139,6 +141,8 @@ func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing
 
 // TestIssue378_D2_Discrimination — cold vs warm, customer vs internal, maxAge vs TTL.
 func TestIssue378_D2_Discrimination(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const ttl, maxAge = 2 * time.Second, 3 * time.Second
 	c := newResolvedCache(0, 0, ttl)
 	c.maxEntryAge = maxAge
@@ -270,6 +274,8 @@ func r378SynthArgs(t *testing.T, c *ResolvedCacheStore, m reflect.Method, key st
 // #258 / customer carriers all write through these. Only ReplaceIfGenRefresh
 // (the refresher terminal) resets it.
 func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const maxAge = 4 * time.Second // L = min(TTL=60s, maxAge/2) = 2s → window [2s, 4s)
 	c := newResolvedCache(0, 0, 60*time.Second)
 	c.maxEntryAge = maxAge
@@ -521,6 +527,8 @@ func itoa378(i int) string {
 // (r378RunF4aArm), so the counts are exact: every cell is refreshed exactly once,
 // at the window-entry tick (+6.5 s), in BOTH arms, tick for tick.
 func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// Control: the window predicate forced false — the same terminal write minus
 	// the re-mint is exactly ReplaceIfGen (test-only seam: chosen here, never in
 	// production code).
@@ -558,6 +566,8 @@ func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 
 // TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked — #375 carried.
 func TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envResolvedCacheTTLSeconds, "60")

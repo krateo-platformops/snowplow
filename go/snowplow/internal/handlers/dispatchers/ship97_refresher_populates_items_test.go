@@ -80,6 +80,8 @@ func ship97SetupRefresherEnv(t *testing.T) {
 // entry.Items stays nil — R3 fast-path predicate evaluates false on every
 // subsequent Get-hit.
 func TestShip97_F1_ApistageRefreshPopulatesItems(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	ship97SetupRefresherEnv(t)
 
 	// Stub the resolve seam: hand back the well-formed LIST envelope the
@@ -203,6 +205,8 @@ func TestShip97_F1_ApistageRefreshPopulatesItems(t *testing.T) {
 // GET-by-name responses are not LIST envelopes and the R3 fast-path
 // predicate at apistage.go:487 is LIST-only by design.
 func TestShip97_F2_ApistageGetByNameLeavesItemsNil(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	ship97SetupRefresherEnv(t)
 
 	getByNameBytes := []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"Widget","metadata":{"name":"w1","namespace":"team-a"}}`)
@@ -253,6 +257,8 @@ func TestShip97_F2_ApistageGetByNameLeavesItemsNil(t *testing.T) {
 // widgets-class or restactions-class refresh-Put MUST leave Items=nil
 // (those classes don't use the R3 fast path).
 func TestShip97_F3_NonApistageClassesUnaffected(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	ship97SetupRefresherEnv(t)
 
 	freshBytes := []byte(ship97LISTEnvelope) // shape doesn't matter — class is the gate

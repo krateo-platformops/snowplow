@@ -120,6 +120,8 @@ func terminalRunMarked(t *testing.T, keys []string, handler RefreshFunc, until f
 }
 
 func TestRefreshTerminal_F5a_DeterministicFailuresLeaveEntriesKnownStale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	c, keys := terminalFixture(t, 3)
 
@@ -153,6 +155,8 @@ func TestRefreshTerminal_F5a_DeterministicFailuresLeaveEntriesKnownStale(t *test
 }
 
 func TestRefreshTerminal_F5b_MassFailureStaysResidentServedAndKnownStale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	const n = 6
 	c, keys := terminalFixture(t, n)
@@ -179,6 +183,8 @@ func TestRefreshTerminal_F5b_MassFailureStaysResidentServedAndKnownStale(t *test
 // F6m — a non-permanent (stage-error) decline never suppresses since #547:
 // every change retries, and the cell is known-stale meanwhile.
 func TestRefreshTerminal_F6m_StageErrorDeclinesNeverSuppressAndStayKnownStale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	c, keys := terminalFixture(t, 1)
 	key := keys[0]
@@ -216,6 +222,8 @@ func TestRefreshTerminal_F6m_StageErrorDeclinesNeverSuppressAndStayKnownStale(t 
 
 // F6s — the structurally-permanent suppression end-to-end through the real loop.
 func TestRefreshTerminal_F6s_PermanentDeclineSuppressesSkipEndsKnownStale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	c, keys := terminalFixture(t, 1)
 	key := keys[0]
@@ -331,6 +339,8 @@ func TestRefreshTerminal_F6p_PermanentDeclinesSuppressImmediately(t *testing.T) 
 
 // F6e — an eviction clears the marker: it cannot outlive its key.
 func TestRefreshTerminal_F6e_EvictionClearsTheMarker(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	resetRefreshTerminalForTest()
 	t.Cleanup(resetRefreshTerminalForTest)

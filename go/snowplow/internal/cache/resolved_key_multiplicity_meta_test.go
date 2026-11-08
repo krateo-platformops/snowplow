@@ -66,6 +66,8 @@ func metaByKey(t *testing.T, c *ResolvedCacheStore) map[string]ResolvedEntryMeta
 // blindness capture. Four keys for one logical cell, each differing in exactly
 // one component; the surface must name which one for every pair.
 func TestResolvedMeta_AttributesKeyMultiplicityToANamedComponent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(20, 1<<20, time.Hour)
 
 	base := oneLogicalCell()
@@ -160,6 +162,8 @@ func TestResolvedMeta_AttributesKeyMultiplicityToANamedComponent(t *testing.T) {
 // the NEW body. The refresher re-Puts every cell it refreshes through exactly
 // this branch.
 func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	in := oneLogicalCell()
@@ -198,6 +202,8 @@ func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
 // so extras-equal ⟺ hash-equal. Two arms — insertion order must not matter,
 // and a same-cardinality VALUE change must be visible.
 func TestResolvedMeta_ExtrasHashIsTheComputeKeyDerivation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// Order-independence: two maps built in opposite insertion orders.
@@ -248,6 +254,8 @@ func TestResolvedMeta_ExtrasHashIsTheComputeKeyDerivation(t *testing.T) {
 // is what separates them. Every identity-free class must project a zero AND a
 // non-empty class on the same row.
 func TestResolvedMeta_SubGenZeroIsReadableOnlyWithClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(20, 1<<20, time.Hour)
 
 	// The classes whose construction sites never set RBACSubGen — enumerated
@@ -296,6 +304,8 @@ func TestResolvedMeta_SubGenZeroIsReadableOnlyWithClass(t *testing.T) {
 // between "no key-inputs record" ("") and "a record whose extras fold was
 // empty" ("e0"). Collapsing them makes an absent record read as a measured one.
 func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
@@ -320,6 +330,8 @@ func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
 // page-independent raFullList fold. The only thing separating them is
 // CacheEntryClass == "" on the same row, so that separation must hold.
 func TestResolvedMeta_NilInputsZerosAreDiscriminatedByClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
@@ -356,6 +368,8 @@ func TestResolvedMeta_NilInputsZerosAreDiscriminatedByClass(t *testing.T) {
 // field, the sibling of TestRangeMetadata_BehaviorallyEmitsNoBody. Extras can
 // carry per-identity values; the projection must never reproduce one.
 func TestResolvedMeta_ExtrasHashIsAHashNotTheExtras(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	const sentinel = "SECRET-EXTRAS-DO-NOT-LEAK-9c2b1"

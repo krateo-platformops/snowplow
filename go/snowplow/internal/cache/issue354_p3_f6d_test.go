@@ -18,6 +18,8 @@ import (
 // --- F6d ---------------------------------------------------------------------
 
 func TestIssue354_P3_F6d_WindowMapNeverOutlivesItsKeys(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	gvr := schema.GroupVersionResource{Group: "p3.example", Version: "v1", Resource: "things"}
 	const n = 1000
@@ -75,6 +77,8 @@ func TestIssue354_P3_F6d_WindowMapNeverOutlivesItsKeys(t *testing.T) {
 // F6d (refill) — a key evicted while dirty and cold-filled again before its
 // queued dequeue is a NEW cell: a customer hit on it is not a stale serve.
 func TestIssue354_P3_F6d_RefilledKeyIsNotDirty(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	gvr := schema.GroupVersionResource{Group: "p3.example", Version: "v1", Resource: "things"}
 	RegisterRefreshFunc("restactions", func(context.Context, string, ResolvedKeyInputs) error { return nil })

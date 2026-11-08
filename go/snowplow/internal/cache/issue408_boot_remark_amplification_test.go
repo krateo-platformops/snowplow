@@ -194,6 +194,8 @@ func (r i408Result) assertBound(t *testing.T, label string) {
 }
 
 func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Run("quiet-boot_zero-remarks", func(t *testing.T) {
 		r := i408Boot(t, i408BootUnits, false, false, false)
 		t.Logf("#408 quiet boot: %s", r)
@@ -234,6 +236,8 @@ func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
 // including a C3 re-check remark (moved_after_put) after a boot Put. A quiet Put counts
 // nowhere.
 func TestIssue408_MovedRemarkCounters_AttributeTheCarrier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	resetRefresherForTest()

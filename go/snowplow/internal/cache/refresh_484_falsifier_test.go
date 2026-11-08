@@ -157,6 +157,8 @@ func armSet(keys ...[]string) map[string]struct{} {
 
 // TestRefresh484_FCoalesce_TrailingChangeReachesClient — F-COALESCE.
 func TestRefresh484_FCoalesce_TrailingChangeReachesClient(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	withRealCoalesceWindow(t)
 	store := ResolvedCache()
 	if store == nil {
@@ -211,6 +213,8 @@ func TestRefresh484_FCoalesce_TrailingChangeReachesClient(t *testing.T) {
 
 // TestRefresh484_FDrop_FullSinkChangeReachesClient — F-DROP.
 func TestRefresh484_FDrop_FullSinkChangeReachesClient(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	withRealCoalesceWindow(t)
 	store := ResolvedCache()
 	if store == nil {

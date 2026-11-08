@@ -101,6 +101,8 @@ func TestExternalTTL_Isolation_TwoDimensional(t *testing.T) {
 // per-binding key, so keyA!=keyB (the TwoDimensional test) and this cross-
 // delivery cannot occur in production.
 func TestExternalTTL_Isolation_RED_IdentityFreeCell_MustCrossDeliver(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 
 	// WRONG impl: identity-free cell — BindingUID="" for BOTH users.
@@ -139,6 +141,8 @@ func TestExternalTTL_Isolation_RED_IdentityFreeCell_MustCrossDeliver(t *testing.
 // header. This proves the marker round-trips through the store unchanged (no
 // mutation, no drop) — the single runtime signal the HIT path has.
 func TestExternalTTL_PersistedMarkerSurvivesPutGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// External-TTL Put: marker true, short override.
@@ -179,6 +183,8 @@ func TestExternalTTL_PersistedMarkerSurvivesPutGet(t *testing.T) {
 // inside its TTL window is a HIT (same bytes); read past the window is a MISS
 // → the next /call re-fetches live. No new TTL machinery.
 func TestExternalTTL_StalenessBoundedByTTLOverride(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour) // store ttl long (1h)
 
 	body := []byte(`{"otel_logs":["row1","row2"]}`)
@@ -225,6 +231,8 @@ func TestExternalTTL_StalenessBoundedByTTLOverride(t *testing.T) {
 // K>1 concurrent readers (feedback_falsifier_shape_must_discriminate — a
 // degenerate K=1 would not exercise the concurrent-hit collapse).
 func TestExternalTTL_StormCollapse_ConcurrentRendersAreHits(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	key := ComputeKey(widgetInputsForBinding("R:krateo-system/uid-obs"))
 	body := []byte(`{"otel_logs":["r1","r2"]}`)
@@ -268,6 +276,8 @@ func TestExternalTTL_StormCollapse_ConcurrentRendersAreHits(t *testing.T) {
 // two entries with IDENTICAL RawJSON but DIFFERENT ExternalTTL markers serve
 // byte-identical bytes — the marker is invisible on the wire.
 func TestExternalTTL_NotWireEncoded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	body := []byte(`{"a":1,"b":[2,3]}`)
 

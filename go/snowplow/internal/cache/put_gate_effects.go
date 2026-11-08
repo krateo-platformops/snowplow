@@ -39,6 +39,10 @@ type PutGateEffects struct {
 	ExternalThirdParty int64
 	DeclaredWrite      bool
 	UAF                int64
+	// StartedIncomplete (#1233): the producing resolve began while the RBAC
+	// snapshot was incomplete, so its body was filtered by it. A hit marks the
+	// hitter so, and the store admits no write of it.
+	StartedIncomplete bool
 }
 
 // PutGateCapture holds the child sinks a producing resolve runs under.
@@ -58,7 +62,7 @@ func WithPutGateEffectsCapture(ctx context.Context) (context.Context, *PutGateCa
 	c := &PutGateCapture{
 		stage:     &StageErrorSink{parent: StageErrorSinkFromContext(ctx)},
 		forbidden: &PerIdentityForbiddenSink{parent: PerIdentityForbiddenSinkFromContext(ctx)},
-		external:  &ExternalTouchedSink{parent: ExternalTouchedSinkFromContext(ctx)},
+		external:  newExternalTouchedSink(ExternalTouchedSinkFromContext(ctx)),
 		uaf:       &UAFTouchedSink{parent: UAFTouchedSinkFromContext(ctx)},
 	}
 	if ctx == nil {
@@ -88,6 +92,7 @@ func (c *PutGateCapture) Effects() PutGateEffects {
 		ExternalThirdParty: c.external.thirdParty.Load(),
 		DeclaredWrite:      c.external.DeclaredWrite(),
 		UAF:                c.uaf.Count(),
+		StartedIncomplete:  c.external.StartedIncomplete(),
 	}
 }
 
@@ -112,6 +117,9 @@ func (e PutGateEffects) Replay(ctx context.Context) {
 	for cur := ExternalTouchedSinkFromContext(ctx); cur != nil; cur = cur.parent {
 		if e.DeclaredWrite {
 			cur.declaredWrite.Store(true)
+		}
+		if e.StartedIncomplete {
+			cur.startedIncomplete.Store(true)
 		}
 		cur.count.Add(e.External)
 		cur.thirdParty.Add(e.ExternalThirdParty)

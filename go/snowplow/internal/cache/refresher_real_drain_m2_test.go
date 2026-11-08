@@ -21,6 +21,8 @@ import (
 )
 
 func TestIssue386_M2_RealDrainExcludesSkippedNoEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 1)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "0") // no floor — every dequeue runs

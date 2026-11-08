@@ -315,6 +315,8 @@ func TestA1_Seed_UAFSkipsResolveAndPut_ControlSeeds(t *testing.T) {
 //
 // RED on origin/main: the entry is overwritten with the fresh bytes there.
 func TestA1_Refresher_DeclinesCarriedHasUAF_ControlRefreshes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()

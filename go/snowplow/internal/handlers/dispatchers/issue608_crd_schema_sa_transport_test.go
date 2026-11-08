@@ -939,6 +939,8 @@ func TestIssue608_F3_ForbiddenValidateIsClassifiedNotRelabelled(t *testing.T) {
 // and the next dirty mark re-resolves it and is accepted. Under an
 // evict-on-forbidden drop this is a cold navigation after one blip.
 func TestIssue608_F3b_TransientForbiddenKeepsTheCellResidentThenRecovers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const user, group = "cohort-f3b", "team-f3b"
 	k := f608Kinds[1]
 	e := f608Setup(t, []string{group}, map[f608Kind][]string{k: {"f3b-panel"}})

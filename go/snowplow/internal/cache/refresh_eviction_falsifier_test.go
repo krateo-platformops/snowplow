@@ -50,6 +50,8 @@ func putSelf(store *ResolvedCacheStore, d *DepTracker, key string, gvr schema.Gr
 // --- S1c — no subscriber: eviction publishes nothing --------------------------
 
 func TestRefreshEviction_S1c_NoSubscriber_PublishesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := evictionHarness(t, 100, time.Hour)
 	gvr := gvrFlexes()
 	const key = "L1_s1c"
@@ -85,6 +87,8 @@ func TestRefreshEviction_S1c_NoSubscriber_PublishesNothing(t *testing.T) {
 // --- S1d — TTL and LRU evictions stay silent ----------------------------------
 
 func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrFlexes()
 
 	t.Run("ttl", func(t *testing.T) {

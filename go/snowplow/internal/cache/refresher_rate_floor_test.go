@@ -75,6 +75,8 @@ func putAgedEntry(c *ResolvedCacheStore, key string, in *ResolvedKeyInputs) {
 // deferred = 2, regardless of N. Contrast the RED form below (floor=0 →
 // N resolves).
 func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// The env knob is seconds-granular; use 1s and a sub-second burst window
@@ -155,6 +157,8 @@ func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
 // the behavior the floor collapses (Test 1 GREEN). It also doubles as the
 // floor=0-identity falsifier (Test 4).
 func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "0") // kill switch — identity to pre-#321
@@ -204,6 +208,8 @@ func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
 // assert NO resolve before floor expiry and EXACTLY one at/after. Proves
 // the final mark is neither dropped nor resolved early.
 func TestRefresher_RateFloorDeferredFinalMarkResolvesAtExpiry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
@@ -315,6 +321,8 @@ func TestRefresher_RateFloorDeleteBypass(t *testing.T) {
 // full real chain: Deps().OnDelete → dirty-mark via the refresh hook →
 // refresher queue → floor → deferred re-resolve.
 func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
@@ -404,6 +412,8 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 // storm keeps re-marking. Asserts: no data race, every key eventually
 // re-resolves at least once, bounded (no runaway).
 func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor — many marks land inside it
@@ -485,6 +495,8 @@ func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
 // entry is FLOORED (deferred, not resolved) under that default, then
 // resolves losslessly at expiry.
 func TestRefresher_RateFloorDefaultIsTwoSecondsAndFloors(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "")

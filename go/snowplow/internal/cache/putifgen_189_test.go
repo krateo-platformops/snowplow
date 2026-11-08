@@ -31,6 +31,8 @@ func entry189(body string) *ResolvedEntry {
 
 // ACCEPT arm — a cold fill (key never present, gen 0) is stored, not over-refused.
 func TestPutIfGen_S189_ColdFillAcceptsAtGenZero(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	gen0 := c.CaptureGen("k") // absent → 0
 	if gen0 != 0 {
@@ -50,6 +52,8 @@ func TestPutIfGen_S189_ColdFillAcceptsAtGenZero(t *testing.T) {
 // ACCEPT arm — a replace-in-place with the SAME captured gen (a benign refresh,
 // no removal) succeeds and does not over-refuse.
 func TestPutIfGen_S189_ReplaceInPlaceSameGenAccepts(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", entry189(`{"v":1}`))
 	gen0 := c.CaptureGen("k")
@@ -69,6 +73,8 @@ func TestPutIfGen_S189_ReplaceInPlaceSameGenAccepts(t *testing.T) {
 // bumps the generation; the stale tail Put is refused and the deleted body is
 // NOT resurrected. RED on the pre-#189 plain Put (which resurrects).
 func TestPutIfGen_S189_RefuseAfterRealDeleteEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", entry189(`{"v":"pre-delete"}`))
 	gen0 := c.CaptureGen("k") // dispatcher captures before its resolve
@@ -118,6 +124,8 @@ func TestPutIfGen_S189_RefuseAfterLRUEvict(t *testing.T) {
 // cost is a known, tested cold-miss-then-refill, never a silent permanent
 // refusal. This makes the over-refusal a pinned behaviour, not a surprise.
 func TestPutIfGen_S189_LRUOverRefuseThenReResolveSelfHeals(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(2, 1<<20, time.Hour) // tiny cap → forced LRU eviction
 	c.put("k", entry189(`{"v":1}`))
 	staleGen := c.CaptureGen("k")
@@ -144,6 +152,8 @@ func TestPutIfGen_S189_LRUOverRefuseThenReResolveSelfHeals(t *testing.T) {
 // reports gen 0 again and a PutIfGen succeeds, so the guard self-heals within
 // the request-write-deadline window (no unbounded refusal).
 func TestPutIfGen_S189_TombstoneExpiryAllowsFreshPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.SetTombstoneTTL(30 * time.Millisecond)
 	c.put("k", entry189(`{"v":1}`))
@@ -180,6 +190,8 @@ func TestPutIfGen_S189_TTLZeroDisablesGuard(t *testing.T) {
 
 // ReplaceIfGen ACCEPT — a live key at the captured generation is replaced.
 func TestReplaceIfGen_S189_ReplacesLiveKeyAtSameGen(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", entry189(`{"v":1}`))
 	gen0 := c.CaptureGen("k")
@@ -217,6 +229,8 @@ func TestReplaceIfGen_S189_RefusesAbsentKeyNeverInserts(t *testing.T) {
 // ReplaceIfGen REFUSE — a live key whose generation moved (a cold request
 // re-inserted it) is not clobbered by a stale refresh.
 func TestReplaceIfGen_S189_RefusesWhenGenMovedUnderLiveKey(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", entry189(`{"v":1}`))
 	staleGen := c.CaptureGen("k")

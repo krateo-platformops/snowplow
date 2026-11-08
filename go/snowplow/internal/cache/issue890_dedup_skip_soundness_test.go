@@ -17,6 +17,8 @@ import (
 // must keep dk_a: the dedup noted the old set, the new record found another, so
 // the write takes the full check and restores dk_a.
 func TestIssue890_DedupFirstRecordThenStripKeepsTheEdge(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, _ := setup890(t)
 	const k = "L1_890_dedup_first"
 	a := DepKey{GVR: gvr883Calm, Namespace: "ns-dd", Name: "a"}
@@ -54,6 +56,8 @@ func TestIssue890_DedupFirstRecordThenStripKeepsTheEdge(t *testing.T) {
 // edge present with no reverse set is exactly what R1 leaves between its two
 // inserts.
 func TestIssue890_DedupWithNoEdgeSetForcesTheFullCheck(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, _ := setup890(t)
 	const k = "L1_890_window"
 	a := DepKey{GVR: gvr883Calm, Namespace: "ns-win", Name: "a"}

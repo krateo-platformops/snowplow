@@ -491,6 +491,8 @@ func TestRefreshBroadcaster_SlowConsumerNeverStalls(t *testing.T) {
 //     after draining, whose re-read is the fresh body (F-DROP's cache twin,
 //     TestRefresh484_FDrop_FullSinkChangeReachesClient, runs it K×M).
 func TestRefreshBroadcaster_DroppedTerminalSignalDegrades(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	withRefreshLayer(t)
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
 

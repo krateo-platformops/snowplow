@@ -10,6 +10,8 @@ import (
 )
 
 func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	resetRefresherForTest()
 	refresherInstance.Store(nil)
 	t.Cleanup(resetRefresherForTest)

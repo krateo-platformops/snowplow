@@ -182,6 +182,8 @@ func p3Settle(t *testing.T, base cache.RefresherWork) {
 // (main 4085c447: "sample 307 ms but the clean Put came 309 ms after the
 // ORIGINAL mark").
 func TestIssue354_P3_F6b_RemarkKeepsTheOriginalWindowOpen(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const toRemark, toClean = 300 * time.Millisecond, 100 * time.Millisecond
 	store := p3Env(t)
 	c := p3PutCell(t, store, "f6b", `{"v":"old"}`)
@@ -238,6 +240,8 @@ func TestIssue354_P3_F6b_RemarkKeepsTheOriginalWindowOpen(t *testing.T) {
 // --- F6c ---------------------------------------------------------------------
 
 func TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	store := p3Env(t)
 	c := p3PutCell(t, store, "f6c-decl", `{"v":"good"}`)
 	var calls atomic.Int64
@@ -267,6 +271,8 @@ func TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh(t *testing.T) {
 }
 
 func TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	store := p3Env(t)
 	c := p3PutCell(t, store, "f6c-del", `{"v":"old"}`)
 	var calls atomic.Int64
@@ -302,6 +308,8 @@ func TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted(t *testing.T) {
 }
 
 func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	store := p3Env(t)
 	c := p3PutCell(t, store, "f6c-drop", `{"v":"old"}`)
 	var calls atomic.Int64
@@ -339,6 +347,8 @@ func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
 // F6b shape), and a worker that dequeued more than the floor after the Put was
 // not floored at all.
 func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const deferral = time.Second // = RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
 	store := p3Env(t)
 	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "1")
@@ -388,6 +398,8 @@ func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 // --- F6u (team-lead condition 2) ---------------------------------------------
 
 func TestIssue354_P3_F6u_UnchangedContentRefreshIsFresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	store := p3Env(t)
 	const body = `{"v":"same"}`
 	c := p3PutCell(t, store, "f6u", body)
@@ -415,6 +427,8 @@ func TestIssue354_P3_F6u_UnchangedContentRefreshIsFresh(t *testing.T) {
 // --- F6e ---------------------------------------------------------------------
 
 func TestIssue354_P3_F6e_ParkedTimeIsAccumulated(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct {
 		name   string
 		hold   time.Duration

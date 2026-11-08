@@ -112,6 +112,8 @@ func inputsFor(gvr schema.GroupVersionResource, ns, name string) *ResolvedKeyInp
 // dispatched object is the deleted object is a self-representation and
 // MUST be evicted.
 func TestDeps_OnDelete_EvictsSelfRepresentation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -143,6 +145,8 @@ func TestDeps_OnDelete_EvictsSelfRepresentation(t *testing.T) {
 // depends on a DIFFERENT object must be dirty-marked, not evicted
 // (the F2 falsifier as a permanent regression test).
 func TestDeps_OnDelete_DirtyMarksDependentGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -203,6 +207,8 @@ func TestDeps_OnDelete_NilStoreIsNoOp(t *testing.T) {
 // --- OnUpdate ----------------------------------------------------------------
 
 func TestDeps_OnUpdate_EnqueuesAndDoesNotEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// Binding rule (feedback_l1_invalidation_delete_only.md): UPDATE
 	// MUST NOT evict; it enqueues into the refresher.
 	d := newTestDepTracker(t, 1_000)
@@ -482,6 +488,8 @@ func TestL1KeyContextHelpers(t *testing.T) {
 // + ns DIRTY-MARKS the L1 key (R2/R7: list-dep → dirty-mark, not evict —
 // the dependent entry's own object still exists).
 func TestRecordingInnerCallDep_ListScope(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -535,6 +543,8 @@ func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 // object DIRTY-MARKS both (R2/R7) — neither is the deleted object's own
 // self-representation.
 func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -597,6 +607,8 @@ func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 // Per plan §0.30.94 "Admin compositions-list: 49 namespaces × 1 LIST
 // each records 49 list-scope edges".
 func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 10_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -666,6 +678,8 @@ func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
 // list-scope dependency dirty-marks the dependent entry (R2/R7) and
 // leaves evictDeleteTotal at 0 — list-deps are never self-evictions.
 func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
@@ -779,6 +793,8 @@ func TestDeps_OnResourceTypeAvailable_NoMatchIsNoOp(t *testing.T) {
 // GVR, and NEVER evicts (a CRD removal is a type-removal, not a single
 // object's DELETE — feedback_l1_invalidation_delete_only.md).
 func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)

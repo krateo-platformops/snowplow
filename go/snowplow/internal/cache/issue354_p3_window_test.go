@@ -66,6 +66,8 @@ func p3RefresherStat(name string) int64 {
 // --- F6f ---------------------------------------------------------------------
 
 func TestIssue354_P3_F6f_B3KeyShapeGaugesCountWarmCellsOnly(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	classes := map[string]string{
 		"restactions":             "restactions",

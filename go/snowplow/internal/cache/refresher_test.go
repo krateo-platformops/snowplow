@@ -70,6 +70,8 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 // --- AC-C1 — dirty-mark -> re-resolved exactly once -------------------------
 
 func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -115,6 +117,8 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 // already queued is not re-queued; a key being processed and re-Added
 // is processed at most once more.
 func TestRefresher_RapidMarksCoalesce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
@@ -159,6 +163,8 @@ func TestRefresher_RapidMarksCoalesce(t *testing.T) {
 // --- AC-C3 — error -> bounded exponential-backoff retry ---------------------
 
 func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the test is fast.
@@ -216,6 +222,8 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 // drop-point eviction and its REFRESH_DROP_EVICT_MAX_PER_MINUTE breaker are
 // retired) — TestRefreshTerminal_F5a pins the known-stale stamp.
 func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the cap is reached fast.
@@ -318,6 +326,8 @@ func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
 
 // AC-C3 — a failing refresh must NOT evict the entry.
 func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherBaseDelayMS, "10")
@@ -349,6 +359,8 @@ func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 // --- AC-C5 — legacy nil-Inputs entry skips, no panic ------------------------
 
 func TestRefresher_NilInputsEntrySkips(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
@@ -371,6 +383,8 @@ func TestRefresher_NilInputsEntrySkips(t *testing.T) {
 }
 
 func TestRefresher_NoHandlerForKind(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
@@ -419,6 +433,8 @@ func TestRefresher_CleanShutdownOnCancel(t *testing.T) {
 // --- Concurrency ------------------------------------------------------------
 
 func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 
@@ -460,6 +476,8 @@ func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
 // OnUpdate dirty-mark -> refresher -> RefreshFunc that writes NEW bytes
 // -> Get returns the new content.
 func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -570,6 +588,8 @@ func TestRefresher_CacheDisabledNeverStarts(t *testing.T) {
 // --- Dep tracker -> refresher hook wiring -----------------------------------
 
 func TestRefresher_DepTrackerOnUpdateEnqueues(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 

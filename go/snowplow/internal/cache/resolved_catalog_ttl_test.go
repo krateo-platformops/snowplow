@@ -20,6 +20,8 @@ import (
 // → after the override window the entry is a MISS, while a sibling without
 // an override is still a HIT.
 func TestTTLOverride_ShortBackstopEvictsBeforeStandardTTL(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour) // standard ttl = 1h
 
 	// Degraded entry: stored "while not servable" → short 1s override,
@@ -50,6 +52,8 @@ func TestTTLOverride_ShortBackstopEvictsBeforeStandardTTL(t *testing.T) {
 // inside its override window (the backstop bounds staleness, it does not
 // evict eagerly).
 func TestTTLOverride_HonouredWithinWindow(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.put("k", &ResolvedEntry{
 		RawJSON:     []byte(`{}`),

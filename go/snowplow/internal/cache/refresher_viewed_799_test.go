@@ -32,6 +32,8 @@ import (
 // run normal work at once AND the third worker still starts a viewed key — no
 // worker is parked in a priority tier's Get.
 func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const p = 3
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
@@ -126,6 +128,8 @@ func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
 
 // TestViewed799_B2_OneReResolvePerKeyAcrossTiers is B2.
 func TestViewed799_B2_OneReResolvePerKeyAcrossTiers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	t.Cleanup(cleanup)

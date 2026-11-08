@@ -46,6 +46,8 @@ func driveDebugDeps(t *testing.T, rawQuery string) (int, string) {
 // reflects hasBackingEdge correctly, and NO resolved body ever appears in any
 // response (only its sha256).
 func TestDebugDeps_MissingBackingEdgeDetectorAndNoBodyLeak(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()

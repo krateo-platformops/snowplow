@@ -11,6 +11,8 @@ import (
 )
 
 func TestRefresherTierCounters_CountEachTiersCompletionsAndDequeueAges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const nUnviewed, nViewed = 8, 4
 	keys, rec, firstIn, release := viewed765Start(t, 1, 1+nUnviewed+nViewed)
 	hold, unviewed, viewed := keys[0], keys[1:1+nUnviewed], keys[1+nUnviewed:]
@@ -63,6 +65,8 @@ func TestRefresherTierCounters_DequeueAgeIsSplitBySide(t *testing.T) {
 // once the worker is free, the younger ones. A dequeue reported on the wrong side
 // moves the 400 ms ages to the viewed gauge.
 func TestRefresherTierCounters_EachSideGetsItsOwnDequeueAges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const nUnviewed, nViewed, gap = 4, 2, 400 * time.Millisecond
 	keys, rec, firstIn, release := viewed765Start(t, 1, 1+nUnviewed+nViewed)
 	hold, unviewed, viewed := keys[0], keys[1:1+nUnviewed], keys[1+nUnviewed:]

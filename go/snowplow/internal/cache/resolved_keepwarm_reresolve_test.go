@@ -21,6 +21,8 @@ import (
 // content. This is the mechanism c1 relies on: the sweep re-resolves before TTL
 // and the re-Put keeps the cell warm with current data.
 func TestKeepwarm_ReResolvePutSlidesCreatedAtWithFreshContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Second) // 1s standard TTL
 
 	// Warm cell, backdated 2s → already past the 1s TTL (would MISS on Get).
@@ -63,6 +65,8 @@ func TestKeepwarm_ReResolvePutSlidesCreatedAtWithFreshContent(t *testing.T) {
 // (1) directly (CreatedAt changes on read) and arm (2) if the slide precedes the
 // expiry check — either way RED, with no wall-clock dependence.
 func TestKeepwarm_ReadDoesNotSlideCreatedAt_QuietCellStillExpires(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour) // long TTL — arm (1) is timing-free
 
 	// (1) A HIT must not move CreatedAt. Put a fresh entry, capture CreatedAt,

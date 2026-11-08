@@ -942,6 +942,12 @@ var seedObjectsGetFn = objects.Get
 var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
 
 func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+	// #1233 — the key is minted and the resolve runs only on a complete RBAC
+	// snapshot: the store admits no write of a resolve that began before it, so a
+	// unit run earlier would be refused and leave its cell cold.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		return fmt.Errorf("seed RESTAction %s/%s: waiting for a complete RBAC snapshot: %w", ref.Namespace, ref.Name, err)
+	}
 	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
 	// read), carried to its terminal Put (no resume set on ctx → no-op).
 	ctx = withResolveStartEpoch(ctx)
@@ -1350,6 +1356,10 @@ func seedRestactionResolveAndPutProd(
 func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 	if e.W == nil {
 		return nil
+	}
+	// #1233 — as seedOneRestaction: mint and resolve on a complete RBAC snapshot.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		return fmt.Errorf("seed widget: waiting for a complete RBAC snapshot: %w", err)
 	}
 	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
 	// read), carried to its terminal Put (no resume set on ctx → no-op).

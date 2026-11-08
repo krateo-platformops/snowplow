@@ -270,6 +270,8 @@ func e3286Run(t *testing.T, base context.Context, wPrefix string, shadowOn bool)
 // dep-tracker LIST-edge record→match substrate with the toggle ON (honest scope
 // noted at that sub-arm; the real #279 C3 re-walk is #285's F-C3).
 func TestEdge3_286_SeedShadowParityDoesNotPerturbCapture(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	e3286BuildWatcher(t)
 	cache.Deps().SetStore(cache.ResolvedCache())
 

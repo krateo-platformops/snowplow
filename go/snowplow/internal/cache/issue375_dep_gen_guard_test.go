@@ -139,6 +139,8 @@ func body375(s string) *ResolvedEntry { return &ResolvedEntry{RawJSON: []byte(s)
 // restactions/api/issue375_dep_gen_guard_test.go.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm1_ChurnInReadToRecordWindow_Remarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const K = "arm1-K"
 	// WARM bucket: another dependent already depends on the coordinate.
@@ -166,6 +168,8 @@ func TestIssue375_Arm1_ChurnInReadToRecordWindow_Remarks(t *testing.T) {
 // remark and NO dirty-mark. RED @38f18496 (no GVR floor); NEUTER: drop the floor
 // inheritance in recordInternal + the depMovedSince fallback.
 func TestIssue375_Arm1b_ColdCoordinateChurn_RemarksViaGVRFloor(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, hl := setup375(t)
 	const K = "arm1b-K"
 	if _, ok := DepBucketLastBumpSeqForTest(g375A, "ns1", "cold"); ok {
@@ -192,6 +196,8 @@ func TestIssue375_Arm1b_ColdCoordinateChurn_RemarksViaGVRFloor(t *testing.T) {
 // remark, even while a DIFFERENT GVR churns (the floor is per-GVR, not global).
 // NEUTER: a GLOBAL floor (gvrLastBumpSeq returns depEventSeq) → RED.
 func TestIssue375_Arm1b_ColdCoordinate_OtherGVRChurn_NoRemark(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const K = "arm1b-anti-K"
 	Deps().OnUpdate(g375A, "ns1", "cold") // A's floor moves BEFORE the resolve starts
@@ -216,6 +222,8 @@ func TestIssue375_Arm1b_ColdCoordinate_OtherGVRChurn_NoRemark(t *testing.T) {
 // NEUTER: compare `>=` instead of `>` (or treat any recorded dep as moved) → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm2_IdleNoChurnAfterStart_ZeroRemarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	for i := 0; i < 50; i++ {
 		k := "arm2-K"
@@ -272,6 +280,8 @@ func TestIssue375_Arm3_S189RefusedPut_NoRemark(t *testing.T) {
 // the cluster-wide list. NEUTER: drop the listWildcard stamps in bumpCoordinateGen.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm4_ListMemberAdd_RemarksViaListBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct{ name, listNS string }{{"ns-list", "ns1"}, {"cluster-list", ""}} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, rl, _ := setup375(t)
@@ -292,6 +302,8 @@ func TestIssue375_Arm4_ListMemberAdd_RemarksViaListBucket(t *testing.T) {
 }
 
 func TestIssue375_Arm5_ListMemberRemove_RemarksViaListBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct{ name, listNS string }{{"ns-list", "ns1"}, {"cluster-list", ""}} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, rl, _ := setup375(t)
@@ -320,6 +332,8 @@ func TestIssue375_Arm5_ListMemberRemove_RemarksViaListBucket(t *testing.T) {
 // → r0/r1 miss → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm6_KResolvesTimesMMutations_ExactOracle(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	type res struct {
 		key  string
@@ -371,6 +385,8 @@ func TestIssue375_Arm6_KResolvesTimesMMutations_ExactOracle(t *testing.T) {
 // re-resolves K forever → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	c := ResolvedCache()
@@ -429,6 +445,8 @@ func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
 // write.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	st := reflect.TypeOf(c)
@@ -522,6 +540,8 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 // window, independent of the event count. NEUTER: per-dep remark → remarks = 5×.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm10_HighChurnStorm_RemarkOncePerResolve_RateFloorBounded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1")
@@ -626,6 +646,8 @@ func len64(s []string) uint64 { return uint64(len(s)) }
 // atomic. NEUTER: a non-atomic lastBumpSeq write in bumpCoordinateGen → -race RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm11_ConcurrentBumpAndPutCheck_NoTornSeq(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	var started, completed atomic.Int64
 	stop := make(chan struct{})
@@ -707,6 +729,8 @@ func TestIssue375_Arm11_ConcurrentBumpAndPutCheck_NoTornSeq(t *testing.T) {
 // unchanged, hook silent. NEUTERS: nil-sink no-remark → RED; empty treated as nil → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm12_NilSinkRemarksOnceAndDetects_EmptySinkSilent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	var hookKeys []string
 	restore := SetUnguardedPutHookForTest(func(k string) { hookKeys = append(hookKeys, k) })
@@ -802,6 +826,8 @@ func TestIssue375_R1_ReadOnlyMatchQueriesNeverBump(t *testing.T) {
 // check sees no stamp → NEITHER → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_R2_PutInsideBumpWindow_IsCaught(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, stage := range []string{"after_store", "after_add"} {
 		t.Run(stage, func(t *testing.T) {
 			c, rl, hl := setup375(t)
@@ -842,6 +868,8 @@ func TestIssue375_R2_PutInsideBumpWindow_IsCaught(t *testing.T) {
 // parent link in WithDepGenSink → the outer Put misses the nested dep → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_NestedResolveDep_ReachesOuterPutCheck(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const outer, nested = "nest-outer", "nest-inner"
 	octx := WithL1KeyContext(context.Background(), outer)
@@ -868,6 +896,8 @@ func TestIssue375_NestedResolveDep_ReachesOuterPutCheck(t *testing.T) {
 // content Put (no outer-dep FP); and a Record under the child still reaches the parent.
 // NEUTER: WithContentDepGenSink returns ctx unchanged → own-dep RED + FP RED.
 func TestIssue375_ContentChildSink_OwnDepRemarks_OuterDepSilent_ParentSees(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const outer, content = "cs-outer", "cs-content"
 	octx := WithL1KeyContext(context.Background(), outer)
@@ -916,6 +946,8 @@ func containsDK(ds []DepKey, dk DepKey) bool {
 // dirty-mark hook (tier routing + trigger set), ONE enqueue per Put. NEUTER: enqueue
 // the remark with no trigger → RED.
 func TestIssue375_RemarkCarriesMovedGVRsAsTriggers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	merged := map[schema.GroupVersionResource]int{}
 	var enq []schema.GroupVersionResource
@@ -950,6 +982,8 @@ func TestIssue375_RemarkCarriesMovedGVRsAsTriggers(t *testing.T) {
 // overwrote the first). Real OnObjectEvents, real refresher dequeue. NEUTER: Store
 // (overwrite) instead of merge → RED.
 func TestIssue375_TwoMarksDifferentGVRsBeforeDequeue_BothForceMiss(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	c := ResolvedCache()

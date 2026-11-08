@@ -12,6 +12,8 @@ import (
 )
 
 func TestPutRAFullListIfGen_S323_AcceptColdFill_RefuseAfterDelete(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	full := map[string]any{"apiVersion": "v1", "kind": "List", "items": []any{}}
 

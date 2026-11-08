@@ -86,6 +86,8 @@ func withEmitSeamHarness(t *testing.T) (cache.ResolvedKeyInputs, string) {
 // FRESH bytes (coherent-by-construction: emit is strictly post-Put). It then
 // asserts the refetch is an L1 HIT for the fresh bytes (9.1, cache-respecting).
 func TestEmitSeam_PutFiresExactlyOneCoherentSignal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	inputs, key := withEmitSeamHarness(t)
 
 	c := cache.ResolvedCache()
@@ -229,6 +231,8 @@ func TestEmitSeam_EvictedDuringRefresh_NoSignal(t *testing.T) {
 // re-inserted body survives and no signal fires. RED on the pre-#189 tree
 // (clobbered → stale), GREEN after.
 func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	inputs, key := withEmitSeamHarness(t)
 	c := cache.ResolvedCache()
 	if c == nil {

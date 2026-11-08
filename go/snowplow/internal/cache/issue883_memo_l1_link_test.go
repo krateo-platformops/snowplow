@@ -26,6 +26,8 @@ import (
 // produced or hit which entry — and therefore never more entries than there
 // are resident cells.
 func TestIssue883_MemoNeverOutgrowsLiveServableKeys(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
 	d := Deps()

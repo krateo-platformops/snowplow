@@ -496,6 +496,8 @@ func TestRestVerbToKube(t *testing.T) {
 // populateWidgetContentL1; the resolved cache MUST then carry an entry
 // under the identity-free key.
 func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
@@ -621,6 +623,8 @@ func TestRegisterRefreshHandlers_WidgetContentRegistered(t *testing.T) {
 // then after Put call recordWidgetDeps for self-dep + apiRef + resourcesRefs
 // deps (Edge types 1+2). This test pins the latter half of the contract.
 func TestPopulateWidgetContentL1_RecordsDepEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")

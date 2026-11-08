@@ -271,6 +271,8 @@ func deleteB5Object(rw *ResourceWatcher, name string) error {
 // away, so the re-resolve keeps succeeding and the entry must stay.
 
 func TestIssue187_B5b_RelistDoesNotEvictALiveObject(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	b5RefresherEnv(t)
 	withCleanCRDDiscovery(t)
 	ResetDepsForTest()
