@@ -4,14 +4,12 @@
 //
 // PROVENANCE / UPSTREAM DRIFT MONITOR (AC-D3.1 + AC-D3.14).
 //   - Upstream module:  github.com/krateo-platformops/plumbing
-//   - Upstream version: v1.14.2 (pinned in go.mod). Bumped v1.14.0→v1.14.2 for the
-//     issue #160 jqutil json.Number encoder fix (plumbing PR #27/#28). Re-audited:
-//     the v1.14.0→v1.14.2 diff touches jqutil + crdgen + CI only — server/use/
-//     userconfig.go is UNCHANGED, so this verbatim mirror remains identical.
+//   - Upstream version: PinnedPlumbingVersion below, which must equal go.mod's
+//     pin; each bump's re-audit is recorded on that constant.
 //   - Upstream file:    server/use/userconfig.go
 //   - Upstream func:    use.UserConfig(keys jwtutil.KeySource, authnNS string)
 //                       func(http.Handler) http.Handler
-//   - Upstream lines:   :19-73 (73-line single function)
+//   - Upstream lines:   :23-88 at PinnedPlumbingVersion, as every :N below
 //
 // asymmetric-signing migration: upstream now verifies RS256 against an RSA
 // public key instead of an HMAC shared secret, and resolves that key through a
@@ -27,7 +25,7 @@
 //
 // This file is a VERBATIM transcription of `use.UserConfig`'s control
 // flow with ONE intentional behaviour-additive change: the
-// `endpoints.FromSecret(...)` call at upstream :50-60 is preceded by
+// `endpoints.FromSecret(...)` call at upstream :66-75 is preceded by
 // a cache-first lookup against the Ship D.2 in-process Secrets
 // snapshot (`api.FromInformerSecret`). On any cache miss the
 // VERBATIM upstream call is then issued with the IDENTICAL arguments;
@@ -88,7 +86,18 @@ import (
 // is byte-identical, and jwtutil/ changes only the JWKS key source's default
 // client (dialguard.Client, the same timeout). endpoints/ adds the
 // pass-credentials-on-redirect key, which this file does not read.
-const PinnedPlumbingVersion = "v1.28.1"
+//
+// v1.28.1 → v1.34.0 (installer#716): re-audited by `git diff` of the two tags
+// and `diff -r` of the two module trees. server/use/userconfig.go changes one
+// call: the Secret name `fmt.Sprintf("%s-clientconfig",
+// kubeutil.MakeDNS1123Compatible(username))` becomes
+// `endpoints.SecretName(username)`, the same string (endpoints.go), which
+// credsecret.SessionName also builds. jwtutil.ValidateWithKeySource now
+// decodes the optional `act` and `principal` claims and refuses a signed token
+// whose `act` chain is malformed (ErrTokenInvalid → 401 TokenInvalid here);
+// jwt_delegation_claims_plumbing134_test.go pins both answers. The upstream
+// line numbers in this file were refreshed to v1.34.0.
+const PinnedPlumbingVersion = "v1.34.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -129,7 +138,7 @@ const PinnedPlumbingVersion = "v1.28.1"
 //          context, THEN re-issue the verbatim upstream call with
 //          IDENTICAL arguments (`endpoints.FromSecret(req.Context() [#1115: carries the page budget],
 //          sarc, name, authnNS)`). Error handling on the re-call is
-//          byte-identical to upstream :53-60: `apierrors.IsNotFound(err)`
+//          byte-identical to upstream :68-75: `apierrors.IsNotFound(err)`
 //          → Unauthorized; any other error → InternalError.
 //
 //       c. served=false, ferr!=nil → CACHE HARD ERROR. The Secret is
@@ -142,7 +151,7 @@ const PinnedPlumbingVersion = "v1.28.1"
 //
 //   6-7. `xcontext.BuildContext(ctx, WithAccessToken, WithUserInfo,
 //        WithUserConfig(ep))` + `next.ServeHTTP(wri, req.WithContext(ctx))`
-//        — verbatim from upstream :62-68. The `ep` value flowing in
+//        — verbatim from upstream :77-83. The `ep` value flowing in
 //        is byte-equivalent regardless of which branch (5.a, 5.b, 5.c)
 //        produced it; the downstream contract is identical.
 //
@@ -186,14 +195,14 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				}
 			}()
 
-			// Upstream — a missing key source is a wiring bug, surfaced on every
+			// Upstream :26-29 — a missing key source is a wiring bug, surfaced on every
 			// request as an InternalError, before the auth-header check.
 			if keys == nil {
 				response.InternalError(wri, fmt.Errorf("no JWT key source configured"))
 				return
 			}
 
-			// Upstream :22-26 — Authorization header presence. #1076 — the
+			// Upstream :31-35 — Authorization header presence. #1076 — the
 			// 401 keeps upstream's six Status fields and message, and adds
 			// the pre-dispatch cause TokenMissing (credential_status.go).
 			authHeader := req.Header.Get("Authorization")
@@ -202,7 +211,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				return
 			}
 
-			// Upstream :28-32 — Bearer prefix. #1076 — a header whose scheme
+			// Upstream :37-41 — Bearer prefix. #1076 — a header whose scheme
 			// is not Bearer presents no bearer token: TokenMissing, the cause
 			// RefreshAuth gives a non-Bearer header with no session cookie.
 			parts := strings.SplitN(authHeader, " ", 2)
@@ -220,7 +229,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				return
 			}
 
-			// Upstream :34-42 — jwtutil.ValidateWithKeySource. Upstream answers
+			// Upstream :43-58 — jwtutil.ValidateWithKeySource. Upstream answers
 			// the expired and the generic-invalid branch alike with a plain
 			// Unauthorized. #1076 — snowplow keeps that 401, its six Status
 			// fields and its message, and adds the cause jwtutil's typed error
@@ -246,7 +255,8 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 			// krateo:loa:2 (a step-up login, authn#49) reads
 			// `<DNS1123(username)>-clientconfig-stepup`; every other token
 			// reads `<DNS1123(username)>-clientconfig`, computed
-			// IDENTICALLY to upstream `userconfig.go:51-52`. The name is
+			// IDENTICALLY to upstream's `endpoints.SecretName(username)`
+			// at `userconfig.go:67` (credsecret.SessionName). The name is
 			// built from the token's own username, never from a claim or
 			// the request. There is NO fallback between the two: a step-up
 			// Secret that is neither in the informer nor on the apiserver
@@ -260,7 +270,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// (5.c) — cache HARD ERROR (Ship D.2's verbatim
 					// upstream error string for server-url missing).
 					// Upstream's equivalent branch is the non-NotFound
-					// arm at :58-59 → InternalError.
+					// arm at :73-74 → InternalError.
 					response.InternalError(wri, ferr)
 					return
 				}
@@ -270,7 +280,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				// (AC-D3.3, AC-D3.4, AC-D3.N).
 				cache.RecordApiserverFallthrough(req.Context(), cache.ReasonSecretGet, "")
 
-				// Upstream :44-48 — InClusterConfig. Required for the
+				// Upstream :60-64 — InClusterConfig. Required for the
 				// upstream `FromSecret` re-call below. Deferred from
 				// upstream's pre-FromSecret position because:
 				//
@@ -281,7 +291,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				//   (b) On cache MISS the call order vs upstream is
 				//       byte-identical: InClusterConfig immediately
 				//       precedes the FromSecret re-call, exactly as
-				//       upstream :44-50 has it. The InClusterConfig
+				//       upstream :60-67 has it. The InClusterConfig
 				//       failure mode (500 with verbatim "unable to
 				//       create in cluster config" wrap) is preserved
 				//       and tested by
@@ -292,7 +302,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					return
 				}
 
-				// Upstream call (`use.UserConfig` :50-52) with the EXACT
+				// Upstream call (`use.UserConfig` :66-67) with the EXACT
 				// same arguments, through credhttp.FromSecret: plumbing's
 				// endpoints.FromSecret over a hardened copy of sarc (#920:
 				// no client-side limiter; #723: no redirect followed). The
@@ -305,7 +315,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				// byte-identical to upstream's.
 				ep, ferr = credhttp.FromSecret(req.Context(), sarc, secretName, authnNS)
 				if ferr != nil {
-					// Upstream :54-59 — NotFound → 401, else → 500.
+					// Upstream :68-75 — NotFound → 401, else → 500.
 					// PM load-bearing pin: the IsNotFound distinction
 					// MUST be preserved here (cache-miss errors must
 					// route 401 vs 500 identically to upstream).
@@ -330,7 +340,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				}
 			}
 
-			// Upstream :62-66 — BuildContext with the 3 opts in the same
+			// Upstream :77-81 — BuildContext with the 3 opts in the same
 			// order. `ep` is byte-equivalent regardless of whether (5.a)
 			// cache-hit or (5.b) upstream re-call produced it.
 			ctx := xcontext.BuildContext(req.Context(),
@@ -342,7 +352,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 			authOpen = false
 			auth.End()
 
-			// Upstream :68 — chain to next handler.
+			// Upstream :83 — chain to next handler.
 			next.ServeHTTP(wri, req.WithContext(ctx))
 		}
 

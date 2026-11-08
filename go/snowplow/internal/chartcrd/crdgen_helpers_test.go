@@ -28,9 +28,15 @@ const (
 	// plumbing v1.28.0: its statics/status.schema.json is byte-identical to
 	// 2.13.71's, and v1.28.0 and v1.28.1 generate byte-identical CRDs for both
 	// of snowplow's charts (#1135), so this guard speaks for that version too.
+	//
+	// This module requires plumbing v1.34.0 (installer#716). core-provider
+	// 2.13.71, and 2.13.76 that the installer deploys now, still require
+	// v1.28.1. v1.34.0's crdgen/ and crdgen/schemas/, the only plumbing
+	// packages crdgen imports, are byte-identical to v1.28.1's (diff -r of the
+	// two module trees), so the guard still runs core-provider's crdgen.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.28.1"
+	crdgenVersion       = "v1.34.0"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
