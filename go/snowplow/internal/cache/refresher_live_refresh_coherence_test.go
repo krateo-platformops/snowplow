@@ -182,6 +182,8 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 // FLOORED re-resolve commits v2. The window is ~2s (the rate-floor), NOT the
 // "sub-ms–ms" the proposal assumed.
 func TestLiveRefreshCoherence_StaleWindow_ProductionDefault(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "", false, 5*time.Millisecond)
 	t.Logf("STALE-WINDOW[prod-default floor=2s, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Millisecond), observed, n, commit.Round(time.Millisecond))
@@ -200,6 +202,8 @@ func TestLiveRefreshCoherence_StaleWindow_ProductionDefault(t *testing.T) {
 // ASSUMED world: floor=0 (kill-switch), no load, sub-ms resolve. Isolates the
 // floor's contribution — the window collapses to ~ms here.
 func TestLiveRefreshCoherence_StaleWindow_FloorZeroBaseline(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "0", false, 5*time.Millisecond)
 	t.Logf("STALE-WINDOW[floor=0 baseline, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Millisecond), observed, n, commit.Round(time.Millisecond))
@@ -307,6 +311,8 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 // residual queue+commit gap, and the production window is owned by the
 // floor/yield gates, not the resolve.
 func TestLiveRefreshCoherence_RefresherMechanismOverhead(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "0", false, 0)
 	t.Logf("MECHANISM-OVERHEAD[floor=0, zero resolve cost]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Microsecond), observed, n, commit.Round(time.Microsecond))
@@ -449,6 +455,8 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 // NOT turn N marks back into N re-resolves (that would reintroduce the
 // pre-#318 amplification the floor exists to prevent).
 func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const marks = 200
 	const spread = 400 * time.Millisecond // whole wave inside the 2s floor
 	res := runFloorOnBurstCollapse(t, "", marks, spread)
@@ -478,6 +486,8 @@ func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
 // what a naive always-bypass would cost — the explicit amplification the
 // floor-bypass design must avoid for churn (non-subscribed) keys.
 func TestLiveRefreshCoherence_FloorOffAmplificationContrast(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const marks = 200
 	const spread = 400 * time.Millisecond
 	res := runFloorOnBurstCollapse(t, "0", marks, spread)

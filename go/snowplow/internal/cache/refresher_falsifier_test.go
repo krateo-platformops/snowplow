@@ -41,6 +41,8 @@ import (
 // FAILS today: the hand-rolled refresher never requeues a failed key —
 // the handler is invoked exactly once, failedTotal ticks, done.
 func TestFalsifierFBackoff_ErrorRetriesWithBoundedBackoff(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 1)
 	defer cleanup()
 
@@ -101,6 +103,8 @@ func TestFalsifierFBackoff_ErrorRetriesWithBoundedBackoff(t *testing.T) {
 // parallelism*defaultRefresherQueueBufferMultiplier; the (cap+1)-th
 // enqueue takes the `default` branch and is dropped (skippedFullTotal++).
 func TestFalsifierFDrop_BurstDropsNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const parallelism = 2
 	cleanup := withCleanRefresher(t, parallelism, 1)
 	defer cleanup()

@@ -580,6 +580,8 @@ func TestStoreSwap_K16e_OfferIsNotAWrite(t *testing.T) {
 // opens no entry; after the build ledger_owed holds only armable keys. RED
 // under X45 and X46.
 func TestStoreSwap_K16f_WindowHolders(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLedgerRig(t, 3)
 	unviewed := r.cell("o00", "")
 	content := r.cell("o00", CacheEntryClassApistage)

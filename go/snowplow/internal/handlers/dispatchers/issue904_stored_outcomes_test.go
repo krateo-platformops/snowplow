@@ -21,8 +21,6 @@ import (
 )
 
 func TestIssue904_P1_RefresherPutKeepsStageOutcomes(t *testing.T) {
-	// #1233: this test writes the store under a complete snapshot.
-	cache.CompleteRBACSnapshotForTest(t)
 	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
 	got, ok := e.store.GetNoTouch(e.key)

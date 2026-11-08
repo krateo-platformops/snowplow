@@ -287,7 +287,7 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 	// #1233 — the pass writes the cache: run it on a complete RBAC snapshot, or
 	// its writes would be refused and its cells left cold.
 	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
-		log.Warn("content.prewarm.skipped",
+		log.WarnContext(ctx, "content.prewarm.skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("reason", "the RBAC snapshot did not complete before the pass's deadline"),
 			slog.Any("err", err),

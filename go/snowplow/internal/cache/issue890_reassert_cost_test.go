@@ -18,6 +18,8 @@ import (
 // the fan-out view (a LIST edge "matches" every coordinate of the namespace) says
 // it is there, the exact index says it is not.
 func TestIssue890_ListEdgeDoesNotMaskAMissingExactEdge(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, _ := setup890(t)
 	const k = "L1_890_fa"
 	exact := DepKey{GVR: gvr883Hot, Namespace: "ns-fa", Name: "obj-1"}
@@ -45,6 +47,8 @@ func TestIssue890_ListEdgeDoesNotMaskAMissingExactEdge(t *testing.T) {
 // resolve's records and its accepted write, the re-assert never checks an edge;
 // with one, it checks (once) and restores.
 func TestIssue890_ReassertCostsNothingWithoutAStrip(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store, _ := setup890(t)
 	dep := DepKey{GVR: gvr883Calm, Namespace: "ns-cost", Name: "q"}
 

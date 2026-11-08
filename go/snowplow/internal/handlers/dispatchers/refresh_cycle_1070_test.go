@@ -15,6 +15,8 @@ import (
 )
 
 func TestRefreshCycle1070_D1_TheRefreshTerminalTimesItsPutAndItsFrame(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	c := instrumentCacheOn(t)
 	t.Setenv("REFRESH_COALESCE_WINDOW_MS", "0")
 	cache.ResetRefresherForTest()

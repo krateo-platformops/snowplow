@@ -142,6 +142,8 @@ func indexOf(order []string, k string) int {
 
 // TestViewedTier765_V1_ViewedDirtyKeyIsReResolvedFirst is V1.
 func TestViewedTier765_V1_ViewedDirtyKeyIsReResolvedFirst(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const n = 12
 	keys, rec, firstIn, release := viewed765Start(t, 1, n+2)
 	hold, unviewed, viewed := keys[0], keys[1:n+1], keys[n+1]
@@ -165,6 +167,8 @@ func TestViewedTier765_V1_ViewedDirtyKeyIsReResolvedFirst(t *testing.T) {
 
 // TestViewedTier765_V2_ArmAfterMarkPromotesAndReResolvesOnce is V2.
 func TestViewedTier765_V2_ArmAfterMarkPromotesAndReResolvesOnce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const n = 12
 	keys, rec, firstIn, release := viewed765Start(t, 1, n+2)
 	hold, unviewed, late := keys[0], keys[1:n+1], keys[n+1]
@@ -196,6 +200,8 @@ func TestViewedTier765_V2_ArmAfterMarkPromotesAndReResolvesOnce(t *testing.T) {
 
 // TestViewedTier765_V3_UnsubscribedBeforeDequeueRunsAsBackground is V3.
 func TestViewedTier765_V3_UnsubscribedBeforeDequeueRunsAsBackground(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	keys, rec, firstIn, release := viewed765Start(t, 1, 2)
 	hold, k := keys[0], keys[1]
 	unsub := viewed765Arm(t, k)
@@ -213,6 +219,8 @@ func TestViewedTier765_V3_UnsubscribedBeforeDequeueRunsAsBackground(t *testing.T
 
 // TestViewedTier765_V4_ViewedReResolveBypassesTheCap is V4.
 func TestViewedTier765_V4_ViewedReResolveBypassesTheCap(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	keys, rec, firstIn, release := viewed765Start(t, 1, 3)
 	hold, unviewed, k := keys[0], keys[1], keys[2]
 	viewed765Arm(t, k)
@@ -233,6 +241,8 @@ func TestViewedTier765_V4_ViewedReResolveBypassesTheCap(t *testing.T) {
 
 // TestViewedTier765_V5_RateFloorStillAppliesOnTheViewedTier is V5.
 func TestViewedTier765_V5_RateFloorStillAppliesOnTheViewedTier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const floor = 2 * time.Second
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
@@ -266,6 +276,8 @@ func TestViewedTier765_V5_RateFloorStillAppliesOnTheViewedTier(t *testing.T) {
 
 // TestViewedTier765_V6_IdleWorkersWakeForAViewedMark is V6.
 func TestViewedTier765_V6_IdleWorkersWakeForAViewedMark(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	t.Cleanup(cleanup)

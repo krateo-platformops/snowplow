@@ -112,6 +112,8 @@ func assertNotWrongField(t *testing.T, name string, correct float64, wrong []flo
 // not touch them; a second widgetContent Put at cap-1 evicts the first →
 // evict/store = 1/2 = 0.5.
 func TestWidgetContentCounters_ClassifiedByCacheEntryClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
 
 	// A non-widgetContent entry: widget-content counters stay 0.

@@ -107,6 +107,8 @@ func waitQuiet() { time.Sleep(300 * time.Millisecond) }
 // --- A1 — plain DELETE then ADD (same name, different content) --------------
 
 func TestIssue187_A1_DeleteThenRecreateDoesNotServePreDeleteBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	defer withCleanDepWatch(t)()
 
 	gvr := gvrFlexes()
@@ -163,6 +165,8 @@ func TestIssue187_A1_DeleteThenRecreateDoesNotServePreDeleteBody(t *testing.T) {
 // --- A2 — the production interleaving: worker stalled across the ADD ---------
 
 func TestIssue187_A2_LateDeleteDoesNotRestoreOrPinPreDeleteBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	defer withCleanDepWatch(t)()
 
 	gvr := gvrFlexes()
@@ -253,6 +257,8 @@ func TestIssue187_A3_DeletedListMemberDirtyMarksListWidget(t *testing.T) {
 // the entry is removed from the store, not merely dirty-marked.
 
 func TestIssue187_B1_PlainDeleteEvictsSelfEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	defer withCleanDepWatch(t)()
 
 	gvr := gvrFlexes()
@@ -309,6 +315,8 @@ func TestIssue187_B1_PlainDeleteEvictsSelfEntry(t *testing.T) {
 // situation and returns nil is invoked ONCE and never dropped).
 
 func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	defer withCleanDepWatch(t)()
 
@@ -367,6 +375,8 @@ func TestIssue187_B2_EvictSelfGoneRemovesEntryAndItsDepEdges(t *testing.T) {
 // Without this, the fix could evict and still burn five requeues emitting
 // refresh_failed for a deletion it had already handled.
 func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
@@ -438,6 +448,8 @@ func TestIssue187_B2_ResolvedOutcomeIsNotRequeued(t *testing.T) {
 // budget, not the classification, is what saves the entry.
 
 func TestIssue187_B3_TransientNotFoundMustNotEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
@@ -511,6 +523,8 @@ func TestIssue187_B3_TransientNotFoundMustNotEvict(t *testing.T) {
 // GONE rather than dropped-to-TTL with its stale body resident.
 
 func TestIssue187_B3b_SelfGoneEvictsAtTheDropPoint(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")

@@ -28,6 +28,8 @@ import (
 )
 
 func TestMaxEntryAge_G1_RePutsDoNotExtendTheLifetime(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "1")
@@ -63,6 +65,8 @@ func TestMaxEntryAge_G1_RePutsDoNotExtendTheLifetime(t *testing.T) {
 }
 
 func TestMaxEntryAge_G1c_BornAtInheritedAndCountedSeparately(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxEntryAge = time.Hour
 	Deps().SetStore(c)
@@ -99,6 +103,8 @@ func TestMaxEntryAge_G1c_BornAtInheritedAndCountedSeparately(t *testing.T) {
 }
 
 func TestMaxEntryAge_G2_ZeroDisablesAndFreshEntriesServe(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "0")
 	if got := maxEntryAgeFromEnv(); got != 0 {
 		t.Fatalf("G2: knob \"0\" → %v, want 0 (disabled, preserved — not the default)", got)
@@ -135,6 +141,8 @@ func TestMaxEntryAge_G2_ZeroDisablesAndFreshEntriesServe(t *testing.T) {
 }
 
 func TestMaxEntryAge_G3_FirstPutBirth(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "g3"}
 	key := ComputeKey(inputs)

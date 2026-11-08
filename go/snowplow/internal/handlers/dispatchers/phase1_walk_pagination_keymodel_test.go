@@ -85,6 +85,8 @@ func drainPageCellGVR() schema.GroupVersionResource {
 // Since #966 the first page's ONE pagination is (perPage=5, page=1) and drain
 // page 2's is pg.pageAfter(1) = (5, 2) for the install, the resolve AND the Put.
 func TestDrainKeyModel_InstallKeyEqualsPutKey(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")

@@ -32,6 +32,8 @@ func f6aGVR() schema.GroupVersionResource {
 // RED with the strip restored to the caller: deleteForDep returns with the
 // edge still present, which is the window a concurrent re-Put lands in.
 func TestIssue216_F6a_DeletePrimitiveStripsEdgesBeforeItReturns(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)

@@ -48,6 +48,8 @@ func c930Meta(t *testing.T, c *ResolvedCacheStore, k string) ResolvedEntryMeta {
 }
 
 func TestIssue930_C1_EveryStoreAgeReadsTheStoreClock(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const ttl, maxAge, tombstoneTTL = 60 * time.Second, 600 * time.Second, 30 * time.Second
 	c := newResolvedCache(0, 0, ttl)
 	c.maxEntryAge = maxAge
@@ -174,6 +176,8 @@ func TestIssue930_C1_EveryStoreAgeReadsTheStoreClock(t *testing.T) {
 }
 
 func TestIssue930_C2_StaleServedAgeReadsTheDirtyWindowClock(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const age = 250 * time.Millisecond
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()

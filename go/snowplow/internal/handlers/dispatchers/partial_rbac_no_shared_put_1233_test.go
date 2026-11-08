@@ -313,7 +313,9 @@ func TestIssue1233_AResolveBegunOnAPartialSnapshotStoresNothingAfterItCompletes(
 			cache.PublishRBACSnapshotForTest(full) // the initial LIST completes mid-resolve
 		}
 	})
-	t.Cleanup(func() { rbac.SetShadowHook(nil) })
+	// Put back the hook this package's init registers: the shadow-parity arms
+	// that run after this one read it.
+	t.Cleanup(func() { rbac.SetShadowHook(runShadowParityHook) })
 	prevParity := rbac.ShadowParityEnabled()
 	rbac.SetShadowParityEnabled(true) // the hook only runs with the dark parity on
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(prevParity) })

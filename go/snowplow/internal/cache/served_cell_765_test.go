@@ -16,6 +16,8 @@ import (
 //   - inert (dry run): served, never noted;
 //   - metric-neutral: neither read moves hit_total or miss_total.
 func TestServeCellIf765(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	ResetResolvedCacheForTest()

@@ -104,6 +104,8 @@ func reserve799Run(t *testing.T, p int, clusterList bool) (normalDone, viewedDon
 
 // TestViewed799_F3_ReservationKeepsTheNormalTierRunning is F3.
 func TestViewed799_F3_ReservationKeepsTheNormalTierRunning(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const p = 4
 	normalDone, viewedDone, maxViewed, elapsed := reserve799Run(t, p, false)
 	if normalDone < 30 {
@@ -119,6 +121,8 @@ func TestViewed799_F3_ReservationKeepsTheNormalTierRunning(t *testing.T) {
 
 // TestViewed799_F4_SingleWorkerAlternatesTiers is F4.
 func TestViewed799_F4_SingleWorkerAlternatesTiers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	normalDone, viewedDone, _, elapsed := reserve799Run(t, 1, false)
 	if normalDone < 30 {
 		t.Fatalf("F4 RED (#799): with one worker and the viewed tier saturated, the normal tier completed %d of 30 in %v "+
@@ -132,6 +136,8 @@ func TestViewed799_F4_SingleWorkerAlternatesTiers(t *testing.T) {
 
 // TestViewed799_F5_SingleWorkerAlternatesWithTheClusterListTier is F5.
 func TestViewed799_F5_SingleWorkerAlternatesWithTheClusterListTier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	clDone, viewedDone, _, elapsed := reserve799Run(t, 1, true)
 	if clDone < 30 {
 		t.Fatalf("F5 RED (#799 N4): with one worker and the viewed tier saturated, the cluster_list tier completed %d of 30 in %v "+

@@ -74,6 +74,8 @@ func TestFalsifier374_PartB_NonResidentSkipsPark(t *testing.T) {
 // does NOT skip the park for real work), then after release still RE-RESOLVES
 // (the dequeue Get is authoritative; a resident key is never dropped by Part B).
 func TestFalsifier374_PartB_ResidentStillYieldsAndRefreshes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 

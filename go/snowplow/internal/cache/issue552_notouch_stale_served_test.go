@@ -33,6 +33,8 @@ import (
 )
 
 func TestIssue552_StaleServeIsCountedOnlyThroughTheCustomerGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	gvr := schema.GroupVersionResource{Group: "p552.example", Version: "v1", Resource: "things"}
 	RegisterRefreshFunc("restactions", func(context.Context, string, ResolvedKeyInputs) error { return nil })

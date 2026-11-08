@@ -126,6 +126,8 @@ func i496WaitForWindow(t *testing.T, c *ResolvedCacheStore, key string, bornAt t
 // RED without the gate: pre-#496 inRemintWindowLocked consults only the age, so
 // this cell IS re-minted and the assertion on BornAt fails.
 func TestIssue496_ColdCellInTheWindowIsNotReMinted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := i496Store(t)
 	in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "i496", Name: "cold"}
 	key := ComputeKey(in)
@@ -177,6 +179,8 @@ func TestIssue496_ColdCellInTheWindowIsNotReMinted(t *testing.T) {
 // geometry the window is exactly one TTL wide, so a cell read inside the window
 // is warm at the refresh and #378's own population is untouched by the gate.
 func TestIssue496_WarmCellInTheWindowIsStillReMinted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := i496Store(t)
 	in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "i496", Name: "warm"}
 	key := ComputeKey(in)
@@ -241,6 +245,8 @@ func TestIssue496_WarmCellInTheWindowIsStillReMinted(t *testing.T) {
 // reads it. Without this, "seeded cells stay immortal" would be a live hole and
 // #496 would only half-close #259.
 func TestIssue496_SeededCellLosesSeedWarmthAtItsFirstRefresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := i496Store(t)
 	in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "i496", Name: "seeded"}
 	key := ComputeKey(in)

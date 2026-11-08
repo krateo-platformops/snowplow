@@ -37,6 +37,8 @@ func (q *wakeCountingQueue) Get() (string, bool) {
 }
 
 func TestViewed799_B3_FullReservationDoesNotSpinOnTheWakeKey(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 2, 0) // p=2: one viewed slot
 	t.Cleanup(cleanup)

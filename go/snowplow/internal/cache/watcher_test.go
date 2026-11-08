@@ -50,8 +50,6 @@ func newTestScheme() *k8sruntime.Scheme {
 //   - The factory MUST NOT be instantiated
 //   - Goroutine count MUST NOT increase (delta = 0; PM amendment 3 cap < 3)
 func TestNewResourceWatcher_DormantWhenCacheDisabled(t *testing.T) {
-	// #1233: this test writes the store under a complete snapshot.
-	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "")
 
 	if !cache.Disabled() {

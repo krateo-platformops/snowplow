@@ -83,6 +83,8 @@ func putAndKey(t *testing.T, class, name string) string {
 // queued AND the worker pool is single-threaded, the cluster_list-tier
 // keys MUST drain before any normal-tier key.
 func TestRefresher_ClusterListPriorityDrain(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	resetRefresherForTwoTierTest(t)
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 
@@ -236,6 +238,8 @@ func TestRefresher_TierRouting(t *testing.T) {
 // a tight unit-test ceiling (1 second). Production AC-P3.2.13 ceiling
 // is 60s.
 func TestRefresher_SustainedBurstNoStarvation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	resetRefresherForTwoTierTest(t)
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "2")
 

@@ -19,6 +19,8 @@ import (
 )
 
 func TestIssue375_C3_EventBetweenPutCheckAndPostPutRecord_RemarksOnce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Run("event-in-window_remarks-once", func(t *testing.T) {
 		c, rl, hl := setup375(t)
 		const K = "c3-window"

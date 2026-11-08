@@ -18,6 +18,8 @@ import (
 // LIST-only by contract) and a COLD LIST bucket (reached via the GVR floor).
 // RED on the pre-ruling tree. NEUTER: drop the bumpResourceTypeGen calls.
 func TestIssue375_TypeLevelDirtyMarkInsideWindow_Remarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	type src struct {
 		name     string
 		fire     func(d *DepTracker, g schema.GroupVersionResource) int

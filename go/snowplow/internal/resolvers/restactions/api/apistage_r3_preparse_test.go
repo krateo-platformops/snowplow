@@ -114,6 +114,8 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 // entry carrying Items must weigh strictly MORE than the same entry with
 // only RawJSON.
 func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()

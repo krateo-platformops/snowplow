@@ -113,6 +113,8 @@ func TestFalsifierF1_AddDirtyMarksListDep(t *testing.T) {
 // widget entry is dropped from the store even though it is not the
 // self-representation of R.
 func TestFalsifierF2_DeleteDirtyMarksDependentGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)

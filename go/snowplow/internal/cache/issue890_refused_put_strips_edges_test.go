@@ -59,6 +59,8 @@ func resident890(c *ResolvedCacheStore, key string) bool {
 // After 6: K is not resident, the tracker holds no edge for K, and once the
 // memo acts on the tracker it holds no entry for K.
 func TestIssue890_RefusedPutOfAnEvictedCellLeavesNoEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, r := range refusals890 {
 		t.Run(r.name, func(t *testing.T) {
 			d, store, m := setup890(t)
@@ -101,6 +103,8 @@ func TestIssue890_RefusedPutOfAnEvictedCellLeavesNoEdges(t *testing.T) {
 // TestIssue890_RefusalOfAResidentKeyKeepsItsEdges — a refusal because a NEWER
 // write owns the resident cell must not touch that cell's edges.
 func TestIssue890_RefusalOfAResidentKeyKeepsItsEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, r := range refusals890 {
 		t.Run(r.name, func(t *testing.T) {
 			d, store, _ := setup890(t)
