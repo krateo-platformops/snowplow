@@ -148,6 +148,12 @@ func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v 
 	return true
 }
 
+// #1255 — the unstorable-eviction surface; this handle holds no cell to evict.
+func (h *getRecordingHandle) EvictOnPermanentDecline(context.Context, cache.PutVerdict, string) bool {
+	return false
+}
+func (h *getRecordingHandle) EvictUnstorable(context.Context, string, string) bool { return false }
+
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
 // of the seed-skip read from Get to GetNoTouch.

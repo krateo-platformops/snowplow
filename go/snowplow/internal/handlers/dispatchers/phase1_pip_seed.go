@@ -1236,14 +1236,16 @@ func seedRestactionResolveAndPutProd(
 	// #102 GTTL-1: decline the Put (return nil, best-effort — NOT an error, so
 	// the engine seed loop's PROCESSED-not-SUCCEEDED latch decrement is
 	// unaffected and readyz never hangs) when the resolve observed a stage
-	// error or touched an external endpoint. Keeps the prior good entry (if
-	// any); TTL is the outer net.
+	// error or touched an external endpoint. A transient decline keeps the
+	// prior good entry (if any); a permanent one evicts an older entry, which no
+	// writer can ever replace (#1255).
 	// #643 PR-B — resCtx, not ctx: the decline's mark reads the resolve's
 	// captured deps + entry stamp and the decline unit off it. resCtx inherits
 	// everything the decline otherwise reads off ctx (identity, the set).
 	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink,
 		Forbidden: cache.PerIdentityForbiddenSinkFromContext(resCtx), External: extTouchedSink}, "restactions")
 	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, verdict, stageErrSink, extTouchedSink) {
+		evictOnPermanentDecline(resCtx, handle, verdict, key)
 		return nil
 	}
 
@@ -1624,10 +1626,12 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
-	// or external touch — keeps any prior good entry; TTL is the outer net.
+	// or external touch — a transient decline keeps any prior good entry; a
+	// permanent one evicts an older entry, which no writer can replace (#1255).
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
 	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets")
 	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, verdict, stageErrSink, extTouchedSink) {
+		evictOnPermanentDecline(resCtx, handle, verdict, key)
 		return nil
 	}
 

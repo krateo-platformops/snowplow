@@ -553,6 +553,7 @@ func raFullListServe(
 		// apiserver 403 is not an external touch. Read through the shared
 		// Put-gate verdict, which also declines a declared write (#903 F1).
 		if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -571,8 +572,12 @@ func raFullListServe(
 		// resolved, and the write itself takes it: PutRAFullListIfGen stores
 		// nothing unless it allows the Put.
 		v := raFullListVerdict(gate)
-		if cache.DeclineSensitivePut(fullCtx) || raFullListDeclines(ctx, v) ||
-			!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		if cache.DeclineSensitivePut(fullCtx) {
+			c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive) // #1255
+			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+			return sliced, true, nil
+		}
+		if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 			return sliced, true, nil
 		}
@@ -635,6 +640,7 @@ func raFullListServe(
 	// defect the proposal kills). Read through the shared Put-gate verdict
 	// (#684: the resolve ran under the gate sinks; GenuineExternal per #681 C2).
 	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+		c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -649,6 +655,7 @@ func raFullListServe(
 	// genuine external endpoint reached on a later page). It has run once, so
 	// S_ra is served and nothing runs again.
 	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+		c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey) // #1255
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
@@ -754,8 +761,12 @@ func raFullListServe(
 	// #398 — a full list built from a sensitive read is never cached.
 	// #684 — nor one with a stage error that is not a per-identity forbidden.
 	v := raFullListVerdict(gate) // #912 re-review — twin of the repopulate branch
-	if cache.DeclineSensitivePut(fullCtx) || raFullListDeclines(ctx, v) ||
-		!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+	if cache.DeclineSensitivePut(fullCtx) {
+		c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive) // #1255
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sGo, true, nil
+	}
+	if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sGo, true, nil
 	}
