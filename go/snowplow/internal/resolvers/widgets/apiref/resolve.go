@@ -387,6 +387,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			cache.ReplayRAFullListSlices(ctx, layers)
 			return body, nil
 		}
+		// MEASUREMENT ONLY: this miss's produce is in flight until Resolve
+		// returns; a produce of the same memo key starting meanwhile counts a
+		// would-join (cache.SeedResolveMemo.BeginProduce). Nothing joins.
+		defer memo.BeginProduce(memoKey).End()
 		layerMark = cache.LayeredSourcesMark(ctx)
 		// #277 / edge-3: open a capture over the PRODUCING block below so the
 		// deps recorded under l1Key (including edge-3 REPLAYED by the 4a fast

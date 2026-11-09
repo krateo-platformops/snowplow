@@ -1318,6 +1318,9 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerNestedLoopbackGuardInstruments(m); err != nil { // #1274
 		return err
 	}
+	if err := registerResolveMemoInstruments(m); err != nil {
+		return err
+	}
 	return registerSecurityInstruments(m)
 }
 

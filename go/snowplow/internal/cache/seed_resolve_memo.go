@@ -166,6 +166,11 @@ type SeedResolveMemo struct {
 	// captured dep moved past the entry's Stamp, so the caller resolved fresh.
 	// Also counted in misses (a stale entry is a miss to the caller).
 	staleMisses uint64
+
+	// shadow is the measurement-only in-flight shadow
+	// (seed_resolve_memo_shadow.go): it counts would-joins and never changes a
+	// Load or a Store.
+	shadow memoShadow
 }
 
 // memoDepIndex is one GVR's slice of the memo's dep index.
@@ -833,6 +838,18 @@ func (mo *SeedResolveMemo) BodyBytes() int64 {
 		return 0
 	}
 	return mo.bodyBytes.Load()
+}
+
+// LookupStats is Stats plus StaleMisses, read together under one lock so
+// stale <= misses in every snapshot (the exported lookup counters).
+// nil-receiver-safe.
+func (mo *SeedResolveMemo) LookupStats() (hits, misses, staleMisses uint64) {
+	if mo == nil {
+		return 0, 0, 0
+	}
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	return mo.hits, mo.misses, mo.staleMisses
 }
 
 // StaleMisses returns how many lookups found an entry whose captured deps had
