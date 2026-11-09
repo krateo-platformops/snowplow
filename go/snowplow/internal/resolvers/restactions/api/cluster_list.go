@@ -858,7 +858,9 @@ func clusterListElementTargetWith(pt *pathtemplate.Template, element any) (schem
 	// #1123 — the same render as the dial (createRequestOption), so the probe
 	// reads the path that would be sent. A refused path is not a jq error: it
 	// is simply not a collapsible LIST.
-	resolvedPath, jqErr := pt.Render(context.TODO(), element)
+	// Not cancellable, as on context.TODO() before; Background is the context
+	// the gojq fork does not poll per opcode (execute.go:24) — run 23.
+	resolvedPath, jqErr := pt.Render(context.Background(), element)
 	if jqErr != nil {
 		if !pathtemplate.IsRefused(jqErr) {
 			bumpNondialJQError(nondialClusterListGVRProbe)

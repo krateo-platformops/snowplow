@@ -179,6 +179,32 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 // learnedKey is a seed target's class key.
 func learnedKey(c seedTarget) string { return cache.LearnedClassKey(c.Username, c.Groups) }
 
+// learnedUnit is one learned unit of a seed pass: the index of the seed (a
+// widget or a RESTAction) it belongs to, and its target.
+type learnedUnit struct {
+	seed int
+	c    seedTarget
+}
+
+// learnedUnitsByClass groups the learned targets of every seed by class key.
+// learned[i] is seed i's learned list. Each class's units keep seed order, then
+// target order: for every k, the result's k entry is exactly the sequence
+//
+//	for i := range learned { for _, c := range learned[i] { if learnedKey(c) == k { visit(i, c) } } }
+//
+// visits, with learnedKey computed once per unit instead of once per (class,
+// unit) pair.
+func learnedUnitsByClass(learned [][]seedTarget) map[string][]learnedUnit {
+	out := map[string][]learnedUnit{}
+	for i, ts := range learned {
+		for _, c := range ts {
+			k := learnedKey(c)
+			out[k] = append(out[k], learnedUnit{seed: i, c: c})
+		}
+	}
+	return out
+}
+
 // ── per-unit cost measurement (the engine bound's t_unit, per kind) ─────────
 //
 // A widget seed and a RESTAction seed cost very differently (a nav widget is

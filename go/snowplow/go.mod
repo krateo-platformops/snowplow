@@ -121,4 +121,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.3 // indirect
 )
 
-replace github.com/itchyny/gojq => github.com/krateo-platformops/gojq v0.13.0
+replace github.com/itchyny/gojq => github.com/krateo-platformops/gojq v0.13.1
