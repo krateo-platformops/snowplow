@@ -74,7 +74,9 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   `<METHOD>` for a request no route serves), `http.route` = the templated mux
   pattern (never the raw path; `url.path` is dropped from Server spans at
   export), `http.request.method`, `http.response.status_code`, status `Error`
-  only for 5xx. `/health`, `/readyz`, `/debug/*` and the browser RUM upload
+  only for 5xx. A response that carries `X-Snowplow-Stage-Outcomes` also puts
+  `snowplow.stages.failed` and `snowplow.stages.failure_reasons` on its span
+  (#1264, see [Stage outcomes on the Server span](#stage-outcomes-on-the-server-span-1264)). `/health`, `/readyz`, `/debug/*` and the browser RUM upload
   `POST /telemetry/v1/traces` (#1020 D6: telemetry about the portal, not
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
   see `howto/rum-ingest.md`) get no span. Sampled at
@@ -145,6 +147,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `snowplow_resolved_cache` (`resolved_cache_expvar.go`, 1.12.4) | L1 store `Stats()` as `map{stat → value}`; per-stat table below. Mirrored to OTLP as `snowplow_resolved_cache{stat}` | previously reachable only through an INFO summary line the chart's `LOG_LEVEL=warn` suppresses |
 | `snowplow_informer_servable` (`servable.go` `ServableCounts`, 1.12.4) | `{registered, synced, servable, watch_broken, confirmed}` | the leading indicator for the `informer-fallthrough-not-synced` cell; `watch_broken > 0` = the stale-delete latch |
 | `snowplow_build_info` (`build_info_expvar.go`, 1.12.4) | `{version}` = `main.build` (the full 40-character git commit the Dockerfile stamps; `unknown` for an unstamped local build) | pins every other metric to a commit. On OTLP the same commit is the resource attribute `vcs.ref.head.revision`; the resource `service.version` is the pod's release label (`app.kubernetes.io/version`, the chart appVersion), the value the collector stamps on its own rows for the pod (#462) |
+| `snowplow_go_runtime` (`internal/memlimit`; OTLP `snowplow_go_gc_percent`, `snowplow_go_memory_limit_bytes{source}`) | `{gogc, memory_limit_bytes, memory_limit_source, cgroup_memory_limit_bytes}`: the runtime's **effective** GOGC (`-1` = off) and soft memory limit (`9223372036854775807` = none), read from `runtime/metrics` at each scrape, and where the limit came from: `env` (the operator set `GOMEMLIMIT`), `cgroup_v2` / `cgroup_v1` (7/8 of `cgroup_memory_limit_bytes`, set at startup), `none` (no cgroup limit), `unreadable` (the cgroup limit could not be read; a WARN at boot says why) | on the chart: `gogc` 100, `memory_limit_source` `cgroup_v2`, `memory_limit_bytes` = 7/8 of the container limit (7 GiB under 8Gi). Read this, not the chart, for what a pod runs with. `unreadable` = no soft limit on this pod. With `env`, `cgroup_memory_limit_bytes` is still the container's limit: `memory_limit_bytes` ≥ it is the OOM-kill misconfiguration (also a boot WARN) |
 | `snowplow_metrics_series_truncated_total` (OTLP only, 1.12.4) | per-family count of `path\|gvr\|reason` series folded into `gvr="__other__"` by the 5000-series OTLP cap | **0**. Non-zero = a cardinality regression (the cap kept it from becoming an incident); `/debug/vars` keeps the uncapped maps |
 | `snowplow_assertion_violations_total` | per-check `map[string]→uint64` of architectural-invariant breaches. Keys: `read_paths_scoped` (a `/call`-class route not wrapped with `FallthroughScopeMiddleware`, asserted at boot by `cache.AssertReadPathsScoped()`), `serve_requires_servable` (an authoritative cache HIT was about to be served from a not-servable informer — asserted per-serve in `internal/cache/serve_assert.go`) | **0** for every key. Non-zero = an invariant is broken in prod (logged ERROR, pod stays up). **`serve_requires_servable` > 0 is P1** — never-serve-from-not-synced is the most load-bearing cache guarantee |
 
@@ -246,6 +249,24 @@ Defined in `internal/handlers/dispatchers/customer_serves.go`; on OTLP in `inter
 Every cell is pre-populated: a `0` is a reading. Scope of the expiry causes: a cell that left the store before the lookup (LRU, DELETE eviction, or an expiry an internal read or the reaper already applied) reads `no_cell`, so `expired_ttl` is a lower bound on TTL-caused cold serves.
 
 **The response header and the span.** A counted response that reached the serve decision carries `X-Snowplow-Serve-Outcome: fresh|stale|cold`, set before the first byte (exposed through CORS like `X-Snowplow-Refresh-Key`; the SPA ignores it; the bench reads it per navigation). Its server span carries `snowplow.serve.outcome` and, on a cold serve, `snowplow.serve.cold_cause` (distinct from #1264's `snowplow.stages.*`). Neither carries identity, a key, a resource name or a body. A refused response and an uncounted one carry neither, so the header and the counter describe the same population.
+
+### Stage outcomes on the Server span (#1264)
+Defined in `internal/handlers/dispatchers/stage_outcomes_span.go` (the wrapper `main.go` `newServerHandler` puts around the route table) and `internal/resolvers/restactions/api/stage_outcomes_summary.go` (the parser).
+
+A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure is in the body (under each stage's `errorKey`) and in `X-Snowplow-Stage-Outcomes`. Its Server span keeps status **Unset** (semconv: a 200 is not an error), and usually has no failing child span, so a tail sampler that keeps error traces would miss it. The span therefore carries what the header says:
+
+| attribute | type | value |
+|---|---|---|
+| `snowplow.stages.failed` | int | the number of entries the header lists: every stage that did not succeed (failed, skipped, not run, refused by a dry run) plus the resolve-level `Aborted` row. **`0`** when the header is `[]` (every stage succeeded): set, not omitted, so a 0 reads "the resolve reported success" and absence reads "this response had no stage outcomes". For the truncated summary `{"truncated":true,"failed":N}` it is N. Observability's sampler keeps a trace on `snowplow.stages.failed > 0` |
+| `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of those entries, sorted (byte order), from the header's closed set: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `StageNotExecuted`, `TemplateError`, `Timeout`, `Unauthorized`. Any other value is folded to **`other`**, never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
+
+**Which responses.** Exactly those whose header carries the outcomes: a RESTAction `/call` (GET, `POST /call/read`, an inline draft), cold or an L1 hit, and an `/export` (the outcomes its pages merged into its own header). The values are read from the response's final header when the handler returns, so they always match what the client was sent; a withdrawn stale pass (#710) reports its re-run's. A response without the header gets neither attribute: a widgets `/call`, every other route, a request refused before its resolve. An export's per-page re-dispatch and a #547 demand revalidation write into their own recorders, never through the wrapper, so they cannot overwrite the span.
+
+**Cache hits.** A hit answers with the header the resolve that stored the cell produced, which every restactions-class Put keeps on the entry (`cache.ResolvedEntry.StageOutcomes`, #904), so the span of a hit carries those stored outcomes. Nothing is invented for a hit: a cell stored all-success reads `0`.
+
+**Not covered: widgets.** A widget's `apiRef` resolve runs in process; the widget response carries no `X-Snowplow-Stage-Outcomes`, and a widget cell stores none, so a widgets span carries neither attribute.
+
+**No identity.** The parser drops the header's stage names: no stage, RESTAction or target name, user, message or body reaches the span. Distinct from #1265's `snowplow.serve.*`.
 
 ### Self-loopback recursion guard — cycle and depth stops (#1274)
 Defined in `internal/cache/nested_loopback_guard_metrics.go`; on OTLP in `internal/metrics/nested_loopback_guard_metrics.go`.

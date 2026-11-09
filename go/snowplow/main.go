@@ -36,6 +36,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/logging"
+	"github.com/krateo-platformops/snowplow/internal/memlimit"
 	"github.com/krateo-platformops/snowplow/internal/metrics"
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
@@ -142,14 +143,19 @@ func snowplowCORSOptions() cors.Options {
 //     bytes while the span still measures the whole request.
 //     text/event-stream (GET /refreshes) is excluded so the SSE stream keeps
 //     its per-event flush (T2-2); non-gzip clients are byte-identical.
-//   - slowcall.Body is INNERMOST: it times the handler's writes into the
-//     compressor, so a slow record splits compression from the network write.
-//     A pass-through on a request without a record.
+//   - slowcall.Body times the handler's writes into the compressor, so a
+//     slow record splits compression from the network write. A pass-through
+//     on a request without a record.
+//   - dispatchers.StageOutcomesSpan is INNERMOST, around the route table
+//     (#1264): when the handler returns it copies the response's
+//     X-Snowplow-Stage-Outcomes (count and reason codes, no names) onto the
+//     Server span, so a 200 whose stages failed is visible to the tail
+//     sampler. A response without the header gets nothing.
 //
 // It is a function so the composition the pod serves is the one the tests
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
-	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(mux))), mux))
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux)))), mux))
 }
 
 // newRUMIngest returns #1015's ingest, with its forwarder's worker running
@@ -419,6 +425,12 @@ func main() {
 	if debugMode {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
+
+	// Soft memory limit from the container's cgroup memory limit (7/8 of it),
+	// unless the operator set GOMEMLIMIT. Done before any informer or cache
+	// allocates, so the whole heap's life runs under it. GOGC is the runtime
+	// default (the chart no longer overrides it). See internal/memlimit.
+	memlimit.Apply(log)
 
 	// #367 — boot-time env backing for the dark shadow-parity toggle. Read ONCE
 	// here, BEFORE the Phase 1 boot seed walk below, so a cold boot can run the
@@ -1495,6 +1507,9 @@ func main() {
 	// deliberate 17-byte static write with zero allocation, hit by the
 	// kubelet every 10s.
 	registerBuildInfoExpvar(build)
+	// The effective GOGC and soft memory limit (and where the limit came
+	// from), unconditionally, for the same reason as the build stamp.
+	memlimit.PublishExpvar()
 
 	// O-D3 (1.12.3) — the WHOLE /debug/* surface (pprof, vars, servable,
 	// apistage, refreshes) is mounted here, every route behind
