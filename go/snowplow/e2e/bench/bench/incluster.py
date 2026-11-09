@@ -214,10 +214,12 @@ CLEANUP = {DATA_JOB: DATA_SA, OBSERVE_JOB: OBSERVE_SA}
 
 def cleanup_names(job: str) -> list[tuple[str, list[str]]]:
     """Everything run606 created for one Job, as (namespace or "-" for cluster-scoped, [kind/name]):
-    the Job, its ServiceAccount and RBAC (and the observer's Secret). Deleted when the Job is done
-    and again at teardown."""
+    the Job, its ServiceAccount and RBAC (and the observer's Secret), and the bench code's ConfigMap
+    (a running pod extracted it at its start; each Job applies it again). Deleted when the Job is
+    done and again at teardown."""
     sa = CLEANUP[job]
-    loadgen = [f"job/{job}", f"serviceaccount/{sa}"] + ([f"secret/{OBSERVE_JOB}"] if job == OBSERVE_JOB else [])
+    loadgen = ([f"job/{job}", f"serviceaccount/{sa}"] + ([f"secret/{OBSERVE_JOB}"] if job == OBSERVE_JOB else [])
+               + [f"configmap/{SRC_CONFIGMAP}"])
     return [(NAMESPACE, loadgen), (AUTHN_NS, [f"rolebinding/{sa}", f"role/{sa}"]),
             ("-", [f"clusterrolebinding/{sa}", f"clusterrole/{sa}"])]
 

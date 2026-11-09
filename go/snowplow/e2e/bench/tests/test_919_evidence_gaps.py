@@ -1189,14 +1189,16 @@ def test_dry_run_shows_both_bounded_samplers(tmp_path):
     from tests.test_606 import _run606
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", TOP_POLL_S="15")
     assert p.returncode == 0, p.stderr[-2000:]
-    sam = [ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.sampler" in ln]
-    assert len(sam) == 3, sam
-    assert all("--every-s 15" in ln and "--request-timeout=15s" in ln for ln in sam)
-    assert "--kind apf" in sam[0] and "get --raw=/metrics" in sam[0]          # from env: the whole run
-    assert "--kind top_boot" in sam[1] and "top-boot.jsonl" in sam[1]         # #922 F3: from the restart
-    assert "--kind top " in sam[2] and "top pod -l app.kubernetes.io/name=snowplow" in sam[2]
+    # #1297: the samplers run in-cluster, in the observer on the loadgen node (bench/incluster.py)
+    lines = p.stderr.splitlines()
+    obs = next(i for i, ln in enumerate(lines) if "DRY: python3 -m bench.incluster render-observe" in ln)
+    assert "--every-s 15" in lines[obs] and "samples apf (and later top_boot, top) every 15s" in lines[obs]
+    boot = next(i for i, ln in enumerate(lines) if "DRY: observe606: top_boot samples from now" in ln)
+    top = next(i for i, ln in enumerate(lines) if "DRY: observe606: top samples from now" in ln)
+    assert obs < boot < top                                                   # env < reboot (#922 F3) < measure
+    assert "kubectl top every 15s" in lines[boot] and "kubectl top every 15s" in lines[top]
     assert "bench.flowcontrol" in p.stderr and "probe -> bench-flowschemas.yaml (kapply) -> verify" in p.stderr
-    assert "get --raw=/metrics (APF preflight)" in p.stderr
+    assert "get --raw=/metrics (APF preflight, in-cluster)" in p.stderr
     ev = next(ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.load606 evaluate" in ln)
     assert ev.endswith(f"--apf {tmp_path / 'out' / 'apf.jsonl.gz'}")
 
