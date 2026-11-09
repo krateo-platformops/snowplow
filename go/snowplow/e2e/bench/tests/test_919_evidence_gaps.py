@@ -120,25 +120,37 @@ def _reap(state: Path) -> bool:
 
 
 def _top_loop(tmp_path, run_s: float, poll_s: str = "1"):
-    """run606.sh's own start_top_loop / stop_top_loop, with a kubectl whose
-    first call hangs."""
+    """#1297: the observer's own top segment (bench/incluster.py, as it runs in its pod on the
+    loadgen node), with a kubectl whose first call hangs: started by ctl/top, stopped by /out/stop."""
     state = tmp_path / "state"
     state.mkdir()
     out = tmp_path / "out"
     out.mkdir()
-    fake = tmp_path / "kubectl"
+    fbin = tmp_path / "bin"
+    fbin.mkdir()
+    fake = fbin / "kubectl"
     fake.write_text(FAKE_TOP)
     fake.chmod(0o755)
-    script = _all_fns() + f"\nK=({fake})\nstart_top_loop\nsleep {run_s}\nstop_top_loop\nsleep 1\n"
-    env = dict(os.environ, OUT=str(out), DRY="0", TOP_POLL_S=poll_s, PW="pw",
-               SNOWPLOW_POD_SELECTOR="app.kubernetes.io/name=snowplow", FAKE_STATE=str(state),
-               PYTHONPATH=str(BENCH_DIR))
+    driver = ("import sys; from bench import incluster\n"
+              "segs = [s for s in incluster.observe_segments(sys.argv[1], float(sys.argv[2]), "
+              "'app.kubernetes.io/name=snowplow') if s.name == 'top']\n"
+              "sys.exit(incluster.supervise(sys.argv[1], segs, 0, poll_s=0.1))\n")
+    env = dict(os.environ, FAKE_STATE=str(state), PYTHONPATH=str(BENCH_DIR),
+               PATH=f"{fbin}{os.pathsep}{os.environ['PATH']}")
+    proc = subprocess.Popen([sys.executable, "-c", driver, str(out), poll_s], env=env, cwd=BENCH_DIR,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        p = subprocess.run(["bash", "-c", script], env=env, cwd=BENCH_DIR, capture_output=True,
-                           text=True, timeout=120)
+        time.sleep(0.5)
+        (out / "ctl").mkdir(exist_ok=True)
+        (out / "ctl" / "top").touch()
+        time.sleep(run_s)
+        (out / "stop").touch()
+        _, err = proc.communicate(timeout=120)
     finally:
+        if proc.poll() is None:
+            proc.kill()
         left_behind = _reap(state)
-    assert p.returncode == 0, p.stderr
+    assert proc.returncode == 0, err
     recs = [json.loads(ln) for ln in (out / "top.jsonl").read_text().splitlines()] \
         if (out / "top.jsonl").exists() else []
     return recs, state, out, left_behind
@@ -158,7 +170,9 @@ def test_a_hung_top_call_fails_alone_and_the_samples_after_it_still_arrive(tmp_p
     assert "--request-timeout=1s" in (state / "argv-0").read_text()
     # the hung call's process was killed by the sampler, not left behind
     assert (state / "hung.pid").exists() and not left_behind
-    assert not (out / ".sampler-top.pid").exists()      # stopped through its pidfile
+    # stopped by the observer's /out/stop; its record says when (#1297)
+    seg = json.loads((out / "observe606.json").read_text())["segments"][0]
+    assert seg["segment"] == "top" and seg["started"] and seg["stopped"] and (out / "exited").exists()
 
 
 def test_a_failed_sample_is_counted_as_failed_through_evaluate(tmp_path):

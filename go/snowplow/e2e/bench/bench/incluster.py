@@ -341,7 +341,8 @@ def placement(job: str, pods: dict, nodes: dict, want: dict | None = None) -> di
         return {**rec, "ok": False, "why": f"{len(items)} live pod(s) of job {job}, want 1"}
     pod = items[0]
     node = (pod.get("spec") or {}).get("nodeName")
-    labels = next(((n.get("metadata") or {}).get("labels") or {} for n in nodes.get("items") or []
+    listed = nodes.get("items") if "items" in nodes else [nodes]       # a node list, or the one node
+    labels = next(((n.get("metadata") or {}).get("labels") or {} for n in listed or []
                    if (n.get("metadata") or {}).get("name") == node), None)
     reqs = {c["name"]: ((c.get("resources") or {}).get("requests") or {}) for c in pod["spec"]["containers"]}
     rec.update({"pod": pod["metadata"]["name"], "node": node,
@@ -449,6 +450,12 @@ def run_data606(out: str, timeout_s: float, linger_s: float, data_args: list[str
                 sys.stdout.buffer.write(line)
                 sys.stdout.flush()
 
+    def _term(*_):
+        # the Job deleted (the teardown, mid-load): data606's whole group goes with the pod
+        _kill_group(p, grace_s=5.0)
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, _term)
     t = threading.Thread(target=tee, daemon=True)
     t.start()
     timed_out = False

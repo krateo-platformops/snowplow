@@ -101,10 +101,14 @@ def loadgen_fit(machine: str, requests: list[tuple[str, str]]) -> dict:
 def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
                      viewers: bool = True) -> list[tuple[str, str]]:
     """Every container the k6 plan puts on the loadgen node: k6 (+ its viewer
-    sidecar), the browser (Chrome), fresh606 and mem606."""
+    sidecar), the browser (Chrome), fresh606, mem606, and (#1297) the run's
+    observer (bench/incluster.py: the APF / top samplers and the log stream),
+    which stays on the node through the measure."""
+    from bench import incluster
     return ([(k6_cpu or K6_CPU, K6_MEMORY)]
             + ([(VIEWER_CPU, VIEWER_MEMORY)] if viewers else [])
-            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi")])
+            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi"),
+               (incluster.OBSERVE_CPU, incluster.OBSERVE_MEMORY)])
 
 
 def browser_sessions(m: rbac_model.RbacModel, n: int = 5,

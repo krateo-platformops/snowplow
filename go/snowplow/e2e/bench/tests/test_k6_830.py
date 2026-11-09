@@ -955,10 +955,10 @@ def test_k6_plan_needs_the_larger_loadgen_node():
     with pytest.raises(ValueError, match="over budget on n2-standard-8"):
         k6_job.loadgen_fit("n2-standard-8", k6_job.k6_plan_requests())
     fit = k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())
-    # k6 4 + viewer sidecar 1 + Chrome 3 + fresh606 1 + mem606 0.25
-    assert fit["cpu_m"] == 9250 and fit["cpu_m"] <= fit["budget_cpu_m"]
+    # k6 4 + viewer sidecar 1 + Chrome 3 + fresh606 1 + mem606 0.25 + the run's observer 0.5 (#1297)
+    assert fit["cpu_m"] == 9750 and fit["cpu_m"] <= fit["budget_cpu_m"]
     assert k6_job.loadgen_fit("n2-standard-16",
-                              k6_job.k6_plan_requests(viewers=False))["cpu_m"] == 8250
+                              k6_job.k6_plan_requests(viewers=False))["cpu_m"] == 8750
     with pytest.raises(ValueError, match="unknown loadgen machine type"):
         k6_job.loadgen_fit("e2-small", k6_job.k6_plan_requests())
 

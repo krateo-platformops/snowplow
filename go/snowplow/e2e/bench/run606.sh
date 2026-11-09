@@ -317,7 +317,12 @@ FW_WIDEN_WAIT_S=$(( PREFLIGHT_TIMEOUT_S + COLLECT_TIMEOUT_S + FW_EXEC_S ))
 FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
 [[ -n "$FULL_WIDEN_GO" ]] && FW_S=$(( FW_APPLIES * COLLECT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + FW_CREATE_S + FW_JOB_S
                                      + FW_READS * COLLECT_TIMEOUT_S + FW_DELETES * COLLECT_TIMEOUT_S + FW_DELETE_S ))
-RUN_BUDGET_S=$(( UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
+# #1297: the in-cluster Jobs' own waits (bench/incluster.py): the observer's pod start (env), the
+# data606 pod's start, its result's last poll and its finish (INC_FINISH_CALLS bounded calls: the
+# copy, the init log, /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
+INC_FINISH_CALLS=6
+INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + TOP_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
+RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
@@ -334,7 +339,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + last poll ${TOP_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + teardown ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -1962,7 +1967,6 @@ node_platforms() {
 # (incluster-placement.jsonl): one that is not on the loadgen pool with the rendered requests fails
 # its step.
 INC=(python3 -m bench.incluster)
-INC_FINISH_CALLS=6        # a Job's finish: its /out copy, its init log, /out/collected, 3 deletes
 OBSERVE_STOP_WAIT_S="$MEM_STOP_WAIT_S"
 BENCH_USER_PREFIX="${BENCH_USER_PREFIX:-scaleuser-}"   # load606 drive --user-prefix
 scrub() { python3 -m bench.logscrub --deny "$PW" --deny "$BENCH_USER_PREFIX" "$@"; }
@@ -2003,10 +2007,12 @@ incluster_started() {
 # incluster_placement <job> <manifest>: where its pod runs, recorded; not the loadgen pool, or not the
 # rendered requests, fails the step
 incluster_placement() {
-  local job="$1" mf="$2" rec rc=0
+  local job="$1" mf="$2" rec rc=0 node
   local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
   if ! "${KR[@]}" -n bench-loadgen get pods -l "job-name=$job" -o json > "$OUT/.pods-$job.json" 2>"$KERR" \
-      || ! "${KR[@]}" get nodes -o json > "$OUT/.nodes.json" 2>"$KERR"; then
+      || ! node="$(python3 -c 'import json, sys; print(next(((p.get("spec") or {}).get("nodeName") or "" for p in json.load(open(sys.argv[1]))["items"]), ""))' "$OUT/.pods-$job.json")" \
+      || [[ -z "$node" ]] \
+      || ! "${KR[@]}" get node "$node" -o json > "$OUT/.nodes.json" 2>"$KERR"; then
     record_failure "$job FAILED: where its pod runs could not be read" || true
     return 1
   fi
@@ -2360,7 +2366,7 @@ s_evaluate() {
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
-               "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl
+               "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl "$OUT"/incluster-placement.jsonl
                "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
