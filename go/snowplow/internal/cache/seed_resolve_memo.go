@@ -340,8 +340,12 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[stri
 	body, err := decodeMemoBody(val.Body)
 	if err != nil {
 		// Unreachable for bytes encoding/json produced; fail toward a fresh
-		// resolve and drop the entry rather than serve something else.
+		// resolve and drop the entry rather than serve something else. The
+		// caller resolves fresh, so the lookup counted as a hit above is a
+		// miss.
 		mo.mu.Lock()
+		mo.hits--
+		mo.misses++
 		if mo.m[key] == val {
 			mo.removeLocked(key, val)
 		}

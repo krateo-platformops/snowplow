@@ -135,6 +135,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	// The memo's measurement-only would-join counter: only after a memo miss,
 	// so only under a memo (seeds and the refresher), never on a live/inline ctx.
 	"SeedResolveMemo.BeginProduce": unreachableInert443, "MemoProduce.End": unreachableInert443,
+	"MemoProduce.Produced": unreachableInert443,
 	// #912 N1 — the memo's Put-gate effects capture / replay: only under a
 	// memo (seeds and the refresher), never on a live/inline ctx.
 	"WithPutGateEffectsCapture": unreachableInert443, "PutGateCapture.Effects": unreachableInert443,

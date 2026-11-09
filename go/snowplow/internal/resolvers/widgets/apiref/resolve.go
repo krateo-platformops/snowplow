@@ -348,6 +348,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// still reaches the caller's sinks), so the memo stores what it recorded and
 	// a hit replays it.
 	var memoEffects *cache.PutGateCapture
+	// memoProduce is the miss's measurement-only in-flight record.
+	var memoProduce *cache.MemoProduce
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
@@ -388,9 +390,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			return body, nil
 		}
 		// MEASUREMENT ONLY: this miss's produce is in flight until Resolve
-		// returns; a produce of the same memo key starting meanwhile counts a
-		// would-join (cache.SeedResolveMemo.BeginProduce). Nothing joins.
-		defer memo.BeginProduce(memoKey).End()
+		// returns. A produce of the same memo key starting meanwhile would
+		// have joined it, and counts as a would-join if the body this produce
+		// stores passes the memo's freshness rule when it ends
+		// (cache.SeedResolveMemo.BeginProduce). Nothing joins.
+		memoProduce = memo.BeginProduce(memoKey)
+		defer memoProduce.End()
 		layerMark = cache.LayeredSourcesMark(ctx)
 		// #277 / edge-3: open a capture over the PRODUCING block below so the
 		// deps recorded under l1Key (including edge-3 REPLAYED by the 4a fast
@@ -452,6 +457,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			}
 			encoded = b
 		}
+		memoProduce.Produced(deps, memoStamp) // measurement only: what a joiner would have taken
 		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark),
 			memoEffects.Effects())
 	}

@@ -24,7 +24,7 @@ func registerResolveMemoInstruments(m metric.Meter) error {
 		return err
 	}
 	join, err := m.Int64ObservableCounter("snowplow_resolve_memo_would_join_total",
-		metric.WithDescription("MEASUREMENT ONLY: refresher memo misses whose produce started while a produce of the same memo key was already in flight — what an in-flight join would have saved. Nothing joins."))
+		metric.WithDescription("MEASUREMENT ONLY: refresher memo misses an in-flight join would have saved: produces that started while a produce of the same memo key (their leader) was in flight, counted only when that leader handed over a body the memo would serve them (it reached the memo Store and passed the memo's #411 freshness rule when it ended; a dependency that moved after the leader started refuses it). Nothing joins."))
 	if err != nil {
 		return err
 	}

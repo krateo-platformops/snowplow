@@ -120,8 +120,10 @@ func RefreshMemoLookups() (hits, misses, staleMisses uint64) {
 	return refreshMemo.Load().LookupStats()
 }
 
-// RefreshMemoWouldJoin is the live memo's measurement-only would-join count
-// (cache.SeedResolveMemo.BeginProduce), 0 before the first memo.
+// RefreshMemoWouldJoin is the live memo's measurement-only would-join count:
+// produces an in-flight join on the memo key would have saved, judged through
+// the memo's own freshness rule (cache.SeedResolveMemo.BeginProduce). 0 before
+// the first memo.
 func RefreshMemoWouldJoin() uint64 { return refreshMemo.Load().WouldJoin() }
 
 // RefreshResolveMemoForTest returns the refresher's memo, creating it as the
@@ -163,9 +165,11 @@ func publishResolveMemoExpvar() {
 				"misses_total":       misses,
 				"stale_misses_total": staleMisses,
 				// MEASUREMENT ONLY (seed_resolve_memo_shadow.go): misses whose
-				// produce started while a produce of the same memo key was in
-				// flight — what an in-flight join would have saved. Nothing
-				// joins.
+				// produce started while a produce of the same memo key (its
+				// leader) was in flight AND whose leader handed over a body the
+				// memo would serve them (stored, and fresh by #411 when the
+				// leader ended) — the produces an in-flight join would have
+				// saved. Nothing joins.
 				"would_join_total": RefreshMemoWouldJoin(),
 			}
 		}))

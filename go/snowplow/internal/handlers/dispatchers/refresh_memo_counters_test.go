@@ -66,12 +66,14 @@ func TestRefreshMemoCounters_OnExpvarFromZero(t *testing.T) {
 	want(1, 1, 0, 0)
 
 	a := m.BeginProduce("k2")
-	want(1, 1, 0, 0)
-	b := m.BeginProduce("k2") // a produce of k2 is in flight
-	want(1, 1, 0, 1)
+	b := m.BeginProduce("k2") // joins a, which is in flight
+	want(1, 1, 0, 0)          // judged when a hands over
+	a.Produced(nil, cache.DepGenEpochNow())
 	a.End()
+	want(1, 1, 0, 1)
 	b.End()
-	c := m.BeginProduce("k2") // k2 no longer in flight
+	c := m.BeginProduce("k2") // k2 no longer in flight: a leader, no join
+	c.Produced(nil, cache.DepGenEpochNow())
 	c.End()
 	want(1, 1, 0, 1)
 	// stale_misses_total reads the same snapshot as hits and misses

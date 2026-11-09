@@ -137,7 +137,7 @@ var storeRegistry = map[string]string{
 	"cache.l1GoneSet":                                 "no-content (#883 L1 keys the resolved cache removed, pending a memo drain)",
 	"cache.SeedResolveMemo.consumers":                 "no-content (#883 memo key -> the L1 keys it served; keys only, never a body)",
 	"cache.SeedResolveMemo.byConsumer":                "no-content (#883 L1 key -> the memo keys that served it; keys only, never a body)",
-	"cache.memoShadow.inflight":                       "no-content (memo key -> produces in flight, a count for the measurement-only would-join counter; keys only, never a body)",
+	"cache.memoShadow.inflight":                       "no-content (memo key -> its in-flight leader produce, for the measurement-only would-join counter: the memo keys the memo already holds, a joiner count and the leader's dep keys and stamp; never a body)",
 	"cache.sliceabilityMemo.verdicts":                 "no-content (verdict per raKey × shape; raKey class-keyed)",
 	"cache.sliceabilityMemo.shapeNegative":            "no-content (identity-free structural verdict)",
 	"cache.raLayerIndex.byRA":                         "no-content (content versions)",

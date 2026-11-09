@@ -47,7 +47,8 @@ func TestResolveMemoOTLP_LookupsAndWouldJoinFromZero(t *testing.T) {
 	m.Load("otlp-k") // hit
 	m.Load("otlp-k") // hit
 	a := m.BeginProduce("otlp-p")
-	b := m.BeginProduce("otlp-p") // would join a
+	b := m.BeginProduce("otlp-p") // joins a
+	a.Produced(nil, 1)            // a body no dependency has moved past: servable
 	a.End()
 	b.End()
 
