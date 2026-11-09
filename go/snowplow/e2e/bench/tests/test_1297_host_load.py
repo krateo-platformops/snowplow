@@ -134,7 +134,7 @@ def test_a_run_without_a_host_load_record_reads_unknown(tmp_path):
 def test_run606_evaluates_and_logs_the_host_load():
     src = (BENCH_DIR / "run606.sh").read_text()
     assert '"$OUT"/host-load.jsonl' in src
-    assert '"host_load_report_only")' in src
+    assert '"host_load_report_only",' in src
     # checked and started before the first step; stopped in every teardown, after gke-down
     assert src.index("\nhost_load_preflight\nstart_host_load\n") < src.index("\nstep source ")
     td = src[src.index("\nteardown() {"):src.index("\ntrap teardown EXIT")]

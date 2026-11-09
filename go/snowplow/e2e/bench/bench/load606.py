@@ -5943,8 +5943,11 @@ def _cmd_evaluate(a) -> int:
     # the preflight reading, every 15 s sample, and the host's load in each API outage run606's polls saw
     from bench import hostload
     result["report"]["host_load_report_only"] = _report_only(hostload.report, recs)
+    # #1297 (INFO): where data606 and the samplers' observer ran (the loadgen node) and with what requests
+    from bench import incluster
+    result["report"]["incluster_report_only"] = _report_only(incluster.report, recs)
     for sec in ("nodes_report_only", "go_runtime_report_only", "user_buckets_report_only",
-                "host_load_report_only"):
+                "host_load_report_only", "incluster_report_only"):
         for ln in result["report"][sec].get("lines") or []:
             print(ln, file=sys.stderr, flush=True)
     # the stretches the run's measure / collect loops could not reach the API

@@ -1572,6 +1572,8 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     assert apf and all(r["kind"] == "apf" and not r.get("failed") for r in apf)
     # the host's own load (#1297), recorded and said with the verdict
     assert verdict["report"]["host_load_report_only"]["state"] == "read"
+    assert [ln.split(":")[0] for ln in verdict["report"]["incluster_report_only"]["lines"]] == [
+        "INFO in-cluster Job observe606", "INFO in-cluster Job data606"]
 
     # the synthetic users' password never reaches a log
     assert SCALEUSER_PASSWORD not in out

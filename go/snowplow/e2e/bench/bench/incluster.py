@@ -360,6 +360,18 @@ def placement(job: str, pods: dict, nodes: dict, want: dict | None = None) -> di
     return {**rec, "ok": True, "why": f"on node {node} (pool {POOL}), requests {reqs}"}
 
 
+def report(recs: list[dict]) -> dict:
+    """evaluate's incluster_report_only (INFO, never judged): where each in-cluster Job ran, with
+    which requests. None recorded reads UNKNOWN (a run before #1297, or one that never got there)."""
+    rows = [r for r in recs if r.get("kind") == "incluster_placement"]
+    if not rows:
+        why = "no incluster_placement record: the run placed no in-cluster Job (a run before #1297, or it stopped first)"
+        return {"result": "INFO", "state": "UNKNOWN", "why": why, "lines": [f"INFO in-cluster Jobs: UNKNOWN ({why})"]}
+    return {"result": "INFO", "state": "read", "placements": rows,
+            "lines": [f"INFO in-cluster Job {r['job']}: {'OK' if r.get('ok') else 'REFUSED'}: {r.get('why')}"
+                      for r in rows]}
+
+
 def rendered_requests(objs: list[dict], job: str) -> dict:
     j = next(o for o in objs if o["kind"] == "Job" and o["metadata"]["name"] == job)
     return {c["name"]: c["resources"]["requests"] for c in j["spec"]["template"]["spec"]["containers"]}
