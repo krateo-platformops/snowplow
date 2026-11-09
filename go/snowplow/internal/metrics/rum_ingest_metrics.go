@@ -27,7 +27,7 @@ func registerRUMIngestInstruments(m metric.Meter) error {
 		return err
 	}
 	attrs, err := m.Int64ObservableCounter("snowplow_rum_ingest_attributes_dropped_total",
-		metric.WithDescription("Browser RUM span attributes (#1015) dropped by the per-span-name allowlist: any key other than http.route, http.request.method and http.response.status_code (all spans) and krateo.interaction.abandoned (krateo.composition.open, krateo.form.submit and krateo.page.publish only, #1060); one of those on a span that does not list it; or one with a value it does not allow (a query string, a token-shaped segment, a non-method, a non-status, an abandoned flag that is not bool true)."))
+		metric.WithDescription("Browser RUM span attributes (#1015) dropped by the per-span-name allowlist: any key other than http.route, http.request.method and http.response.status_code (every span but krateo.agentiko.claim.unbacked), krateo.interaction.abandoned (krateo.composition.open, krateo.form.submit and krateo.page.publish only, #1060) and krateo.agentiko.claim.family and krateo.agentiko.claim.outcome (krateo.agentiko.claim.unbacked only); one of those on a span that does not list it; or one with a value it does not allow (a query string, a token-shaped segment, a non-method, a non-status, an abandoned flag that is not bool true, a claim family or outcome that is not a lower-case token)."))
 	if err != nil {
 		return err
 	}

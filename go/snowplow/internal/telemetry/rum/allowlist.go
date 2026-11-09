@@ -11,6 +11,16 @@
 // http.route is a second guard on an already allowlisted value, never the only
 // one.
 //
+// Six span names are forwarded, each with its own attribute set
+// (spanAllowlist): krateo.widget.fetch and the four page-level spans carry the
+// http.* keys (and the three interaction spans krateo.interaction.abandoned,
+// #1060); krateo.agentiko.claim.unbacked carries ONLY
+// krateo.agentiko.claim.family and krateo.agentiko.claim.outcome, each a
+// lower-case token (^[a-z][a-z0-9_]{0,31}$, claimToken), and no http.*,
+// session, conversation or identity key. An attribute that is not in its
+// span's set, or whose value fails the key's check, is dropped and counted;
+// the span is still forwarded.
+//
 // NO IDENTITY. The authenticated user keys the per-user rate limit and nothing
 // else: no span, resource or scope attribute carries it. (enduser.id is the
 // only identity attribute ever allowed on a span, and only by explicit ruling;
@@ -40,6 +50,10 @@ const (
 	SpanCompositionOpen = "krateo.composition.open"
 	SpanFormSubmit      = "krateo.form.submit"
 	SpanPagePublish     = "krateo.page.publish"
+	// SpanAgentikoClaimUnbacked is the portal's mark for an agentiko claim
+	// that is not backed (contract agreed with the frontend, 2026-11-09). It
+	// carries only AttrClaimFamily and AttrClaimOutcome.
+	SpanAgentikoClaimUnbacked = "krateo.agentiko.claim.unbacked"
 )
 
 // Attribute keys a forwarded span may carry; spanAllowlist says on which span
@@ -58,6 +72,11 @@ const (
 	// (ERROR would move it into the error-rate SLI). The frontend only ever
 	// sends true; absent means not abandoned.
 	AttrInteractionAbandoned = "krateo.interaction.abandoned"
+	// AttrClaimFamily and AttrClaimOutcome classify an unbacked agentiko
+	// claim (frontend contract, 2026-11-09): each a lower-case token
+	// (claimToken), never free text, an id or an identity.
+	AttrClaimFamily  = "krateo.agentiko.claim.family"
+	AttrClaimOutcome = "krateo.agentiko.claim.outcome"
 )
 
 // valueCheck returns the value to forward for one attribute, rebuilt from the
@@ -71,8 +90,10 @@ type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
 // whose key is not in its span's set, or whose value fails the key's check,
 // is dropped and counted (attributes_dropped).
 //
-//   - The http.* keys are allowed on every span. http.route has two checks
-//     (Diego, 2026-10-30, #1020 F3: "exact where possible, trust the rest"):
+//   - The http.* keys are allowed on krateo.widget.fetch and the four
+//     page-level spans, never on krateo.agentiko.claim.unbacked. http.route
+//     has two checks (Diego, 2026-10-30, #1020 F3: "exact where possible,
+//     trust the rest"):
 //     on krateo.widget.fetch it names a snowplow route, so it must be EXACTLY
 //     one of the live mux's routes (registeredRoute); on the page-level spans
 //     it is the portal router's pattern, which snowplow cannot know, so it
@@ -80,6 +101,10 @@ type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
 //   - krateo.interaction.abandoned is allowed only on the three interaction
 //     spans, and only as bool true (frontend contract, 2026-11-01). On
 //     krateo.widget.fetch (a child span) and krateo.page.load it is dropped.
+//   - krateo.agentiko.claim.family and krateo.agentiko.claim.outcome are
+//     allowed only on krateo.agentiko.claim.unbacked, and only as a string
+//     token (claimToken); that span carries no other attribute (frontend
+//     contract, 2026-11-09).
 var spanAllowlist = map[string]map[string]valueCheck{
 	SpanWidgetFetch: {
 		AttrRoute: registeredRoute, AttrMethod: methodToken, AttrStatus: statusCode,
@@ -98,6 +123,9 @@ var spanAllowlist = map[string]map[string]valueCheck{
 	SpanPagePublish: {
 		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
 		AttrInteractionAbandoned: boolTrue,
+	},
+	SpanAgentikoClaimUnbacked: {
+		AttrClaimFamily: claimToken, AttrClaimOutcome: claimToken,
 	},
 }
 
@@ -143,6 +171,34 @@ func boolTrue(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
 		return &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}, true
 	}
 	return nil, false
+}
+
+// claimToken: exactly a string (no other member of the value, as boolTrue)
+// matching ^[a-z][a-z0-9_]{0,31}$. Anything else, an int, a bool or a string
+// of another shape, is dropped, never coerced.
+func claimToken(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && v.members == 1 && validClaimToken(*s) {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// maxClaimTokenLen bounds a claim token (the {0,31} after the first letter).
+const maxClaimTokenLen = 32
+
+// validClaimToken reports whether v matches ^[a-z][a-z0-9_]{0,31}$: ASCII
+// only, byte by byte, so no case folding or Unicode letter can pass.
+func validClaimToken(v string) bool {
+	if v == "" || len(v) > maxClaimTokenLen || v[0] < 'a' || v[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(v); i++ {
+		c := v[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 var methods = map[string]bool{
