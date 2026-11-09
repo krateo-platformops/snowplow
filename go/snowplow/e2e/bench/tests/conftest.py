@@ -52,6 +52,12 @@ os.environ["BENCH_ALLOW_VOLATILE_PATHS"] = "1"
 # override set it explicitly via monkeypatch.
 os.environ.pop("BENCH_GKE_CONTEXT", None)
 
+# #1297: run606.sh and run606_pair.sh refuse to start on a host whose 1-minute load exceeds its CPU
+# count (bench/hostload.py). The suite's own load (one worker per CPU, a parallel CI runner) is not
+# what those runs judge: every run606 the suite starts reads this quiet stand-in, as it reads a fake
+# ghcr file; tests/test_1297_host_load.py sets its own readings.
+os.environ["BENCH_606_HOST_LOAD"] = "0.5 0.5 0.5 8"
+
 # Add e2e/bench/ to sys.path so `import bench.cluster` works without install.
 _E2E_BENCH_DIR = Path(__file__).resolve().parent.parent
 if str(_E2E_BENCH_DIR) not in sys.path:

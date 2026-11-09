@@ -5939,7 +5939,12 @@ def _cmd_evaluate(a) -> int:
     result["report"]["user_buckets_report_only"] = _report_only(
         custlat.user_bucket_report, (k6 or {}).get("k6"),
         ((result["report"].get("customer_latency") or {}).get("windows")) or [])
-    for sec in ("nodes_report_only", "go_runtime_report_only", "user_buckets_report_only"):
+    # #1297 (INFO, never judged): the orchestrator's own host load (bench/hostload.py, host-load.jsonl):
+    # the preflight reading, every 15 s sample, and the host's load in each API outage run606's polls saw
+    from bench import hostload
+    result["report"]["host_load_report_only"] = _report_only(hostload.report, recs)
+    for sec in ("nodes_report_only", "go_runtime_report_only", "user_buckets_report_only",
+                "host_load_report_only"):
         for ln in result["report"][sec].get("lines") or []:
             print(ln, file=sys.stderr, flush=True)
     # the stretches the run's measure / collect loops could not reach the API

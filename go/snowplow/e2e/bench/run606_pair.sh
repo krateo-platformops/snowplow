@@ -285,6 +285,12 @@ fi
 while IFS= read -r ln; do
   if [[ -n "$ln" ]]; then log "$ln"; fi
 done <<< "$quota_msg"
+# #1297: the orchestrator's load, once for the launch (each run checks it again, and records it every
+# 15 s): a 1-minute load above the CPU count refuses the launch before any cluster exists
+if ! hl_msg="$(python3 -m bench.hostload check --out "$PAIR_OUT/host-load.jsonl" $([[ "$DRY" == "1" ]] && printf -- --dry) 2>&1)"; then
+  refuse "${hl_msg#refusing: }: nothing was created"
+fi
+log "host load: ${hl_msg}"
 if [[ "$DRY" == "1" ]]; then
   log "DRY: all ${#LABELS[@]} runs would start now; then, per pair:"
   if [[ -n "$REPLICA_PAIR" ]]; then

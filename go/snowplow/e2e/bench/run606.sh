@@ -681,6 +681,8 @@ print("teardown record: LoadBalancer Services %s (release: %s); leaked_addresses
       # printed ONLY after gke-down succeeded
       if [[ "$DRY" == "1" ]]; then log "DRY: gke-down only printed; nothing was deleted"; else log "cluster ${RUN_NAME} deleted (gke-down OK)"; fi
     fi
+    # #1297: the host's load through gke-down too, then its file is final for the last publish
+    stop_host_load
     # #1194: what only the teardown wrote: teardown.json and the end of run.log
     if publish_evidence final; then
       log "evidence safe: ${EVIDENCE_DIR}"
@@ -688,6 +690,7 @@ print("teardown record: LoadBalancer Services %s (release: %s); leaked_addresses
       rc=$(( rc == 0 ? 1 : rc ))
     fi
   fi
+  stop_host_load
   exit "$rc"
 }
 trap teardown EXIT
@@ -2202,7 +2205,7 @@ s_evaluate() {
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
-               "$OUT"/cert-manager*.jsonl
+               "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl
                "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
@@ -2251,7 +2254,7 @@ s_evaluate() {
     [[ -n "$r" ]] && log "$r"
   done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
 print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
-                             "go_runtime_report_only", "user_buckets_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
+                             "go_runtime_report_only", "user_buckets_report_only", "host_load_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever
   # it is. Without this the loop's last `[[ -n "" ]]` (no warnings) was the
@@ -2480,6 +2483,36 @@ s_full_widen() {
   return 0
 }
 
+# #1297: the orchestrator's own load. Refused here, before any cloud call, when its 1-minute load
+# exceeds its CPU count (run 24: load ~90 on 8 CPUs failed the data step on every arm; bench/hostload.py);
+# then recorded every 15 s into host-load.jsonl for the whole run, which evaluate says with the verdict.
+# A refusal writes nothing into OUT, so the same RUN_NAME can start once the host is quiet.
+host_load_preflight() {
+  local msg rc=0
+  msg="$(python3 -m bench.hostload check --out "$OUT/host-load.jsonl" $([[ "$DRY" == "1" ]] && printf -- --dry) 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    printf '%s\n' "$msg" >&2
+    exit 2
+  fi
+  log "host load: ${msg}"
+}
+HOST_LOAD_PIDFILE="$OUT/.host-load.pid"
+start_host_load() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: python3 -m bench.hostload record --every-s 15 --out $OUT/host-load.jsonl"; return 0; fi
+  python3 -m bench.hostload record --every-s 15 --out "$OUT/host-load.jsonl" 2>>"$OUT/host-load.err" &
+  echo "$!" > "$HOST_LOAD_PIDFILE"
+  log "recording the orchestrator's host load every 15 s -> $OUT/host-load.jsonl"
+}
+stop_host_load() {
+  local pid
+  [[ -f "$HOST_LOAD_PIDFILE" ]] || return 0
+  pid="$(cat "$HOST_LOAD_PIDFILE")"
+  rm -f "$HOST_LOAD_PIDFILE"       # first: no later caller kills this PID again
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+host_load_preflight
+start_host_load
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s; ${TTL_HOW}) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
