@@ -270,7 +270,14 @@ func httpEdgeGuardStop(ctx context.Context, log *slog.Logger, resource, namespac
 	node := nestedResolveNodeKey(resource, namespace, name)
 	if cache.NestedResolveAncestorPresent(ctx, node) {
 		cache.BumpHTTPEdgeCycleStop()
-		log.Debug("http-edge nested resolve cycle-stop: node already an ancestor — returning raw CR",
+		// INFO (#1274 review): a cycle-stop is the designed outcome for a
+		// self-referential RESTAction, not a failure, so not WARN (the production
+		// floor is LOG_LEVEL=warn; snowplow_nested_loopback_guard_stops_total is
+		// the production signal). It is one line per stopped hop, and that hop
+		// is itself a /call that already logs dispatcher.call.complete at INFO,
+		// so it at most doubles a line that is already there. Metadata only: the
+		// CR coordinate and the depth, no identity.
+		log.InfoContext(ctx, "http-edge nested resolve cycle-stop: node already an ancestor — returning raw CR",
 			slog.String("node", node),
 			slog.Int("depth", cache.NestedCallDepthFromContext(ctx)),
 		)

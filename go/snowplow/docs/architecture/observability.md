@@ -247,6 +247,15 @@ Every cell is pre-populated: a `0` is a reading. Scope of the expiry causes: a c
 
 **The response header and the span.** A counted response that reached the serve decision carries `X-Snowplow-Serve-Outcome: fresh|stale|cold`, set before the first byte (exposed through CORS like `X-Snowplow-Refresh-Key`; the SPA ignores it; the bench reads it per navigation). Its server span carries `snowplow.serve.outcome` and, on a cold serve, `snowplow.serve.cold_cause` (distinct from #1264's `snowplow.stages.*`). Neither carries identity, a key, a resource name or a body. A refused response and an uncounted one carry neither, so the header and the counter describe the same population.
 
+### Self-loopback recursion guard — cycle and depth stops (#1274)
+Defined in `internal/cache/nested_loopback_guard_metrics.go`; on OTLP in `internal/metrics/nested_loopback_guard_metrics.go`.
+
+A RESTAction stage that calls snowplow's own `/call` (a trusted self-loopback, by any of snowplow's own Service DNS forms on `URL_SELF`'s port) carries its descent path and depth. The HTTP edge of the next hop stops a recursion before it resolves. Since #1274 the ingest trusts the short Service-name forms the portal's `snowplow-endpoint` uses, so these stops now also fire for chains through that endpoint.
+
+| series (expvar and OTLP) | labels | meaning | healthy range |
+|---|---|---|---|
+| `snowplow_nested_loopback_guard_stops_total` | `kind` {cycle, depth}; expvar `map[kind]` | `cycle`: the hop's own node was already on its descent path, so the raw CR was served instead of recursing. This is the designed stop for a self-referential RESTAction; it is logged at INFO, `http-edge nested resolve cycle-stop`, metadata only. `depth`: the depth-8 backstop answered 508 for a non-cyclic chain that went too deep; it is logged at WARN | `cycle` tracks the self-referential RESTActions being resolved and is not an alert. `depth` should stay **0**; a non-zero value is a chain the ancestor set could not see, and needs investigating. Both cells are present at 0 from process start; with the cache off the key is absent (CFG-1) |
+
 ### RAFullList serve path — the cheap Go-slice serve for big LISTs
 Defined in `internal/cache/bindings_by_gvr_metrics.go`.
 
