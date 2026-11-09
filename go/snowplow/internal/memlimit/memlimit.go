@@ -166,24 +166,29 @@ func decide(fsys fs.FS, getenv func(string) string, setLimit func(int64) int64, 
 // the GC back-pressures), is a WARN instead of going unseen. "off" is the
 // largest limit there is, so under any container limit it warns too.
 func decideEnv(v string, limit int64, src Source, err error, effective int64, log *slog.Logger) Decision {
-	attrs := []any{
-		slog.String("subsystem", "runtime"),
-		slog.String("gomemlimit", v),
-		slog.Int64("memory_limit_bytes", effective),
-	}
 	switch {
 	case err != nil:
 		// log-ctx-waiver: boot: main applies the limit once at start, before a context exists
 		log.Warn("memory limit: GOMEMLIMIT is set in the environment and honoured, but the container's cgroup memory limit could not be read to check it against",
-			append(attrs, slog.Any("err", err))...)
+			slog.String("subsystem", "runtime"),
+			slog.String("gomemlimit", v),
+			slog.Int64("memory_limit_bytes", effective),
+			slog.Any("err", err))
 		return Decision{Source: SourceEnv}
 	case limit > 0 && effective >= limit:
 		// log-ctx-waiver: boot: main applies the limit once at start, before a context exists
 		log.Warn("memory limit: GOMEMLIMIT is set in the environment at or above the container's cgroup memory limit; honoured, but Linux will OOM-kill the pod before the GC back-pressures",
-			append(attrs, slog.String("cgroup", string(src)), slog.Int64("cgroup_memory_limit_bytes", limit))...)
+			slog.String("subsystem", "runtime"),
+			slog.String("gomemlimit", v),
+			slog.Int64("memory_limit_bytes", effective),
+			slog.String("cgroup", string(src)),
+			slog.Int64("cgroup_memory_limit_bytes", limit))
 	default:
 		log.Info("memory limit: GOMEMLIMIT is set in the environment; honoured, not derived from the container",
-			append(attrs, slog.Int64("cgroup_memory_limit_bytes", limit))...)
+			slog.String("subsystem", "runtime"),
+			slog.String("gomemlimit", v),
+			slog.Int64("memory_limit_bytes", effective),
+			slog.Int64("cgroup_memory_limit_bytes", limit))
 	}
 	return Decision{Source: SourceEnv, CgroupLimitBytes: limit}
 }
