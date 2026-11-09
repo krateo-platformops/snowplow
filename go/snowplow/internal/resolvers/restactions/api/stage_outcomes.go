@@ -90,10 +90,10 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	// #1281: every item of such a stage is refused at dispatch, before any
-	// other refusal there; it outranks the plan's refusals of other items
-	// (InvalidPath, TemplateError), since the stage itself is misconfigured.
-	StageReasonUAFOnNonReadVerb:   11,
+	// #1281: recorded once for the whole stage, before anything else can be
+	// (the stage is refused before it is planned); ranked first because the
+	// stage itself is misconfigured.
+	StageReasonUAFOnNonReadVerb:   12,
 	StageReasonNotExecuted:        10,
 	StageReasonForbidden:          9,
 	StageReasonUnauthorized:       8,
@@ -322,16 +322,15 @@ func TruncatedStageOutcomes(failed int) string {
 // Only machine fields are read (reason / code); the message never leaves.
 //
 // #714 — the CODE decides, not a reason: a recorded reason can be an
-// upstream's claim (a 500 calling itself "Forbidden"). The reasons read are
-// the ones only snowplow writes: StageNotExecuted (the #443 dry-run refusal,
-// which has no code), DestinationRefused (#1131) and
-// UserAccessFilterOnNonReadVerb (#1281, no code either).
+// upstream's claim (a 500 calling itself "Forbidden"). The one reason read is
+// StageNotExecuted, which only snowplow writes (the #443 dry-run refusal, which
+// has no code).
 func stageReasonOf(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return StageReasonError
 	}
-	if r, _ := m["reason"].(string); r == StageReasonNotExecuted || r == StageReasonDestinationRefused || r == StageReasonUAFOnNonReadVerb {
+	if r, _ := m["reason"].(string); r == StageReasonNotExecuted || r == StageReasonDestinationRefused {
 		return r
 	}
 	switch code := toInt(m["code"]); code {

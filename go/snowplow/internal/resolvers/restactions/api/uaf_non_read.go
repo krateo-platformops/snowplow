@@ -12,26 +12,28 @@
 // the user's RBAC never decided it.
 //
 // THE RULE. The resolver refuses such a stage on the same verbs the CRD rule
-// rejects (templates.API.UserAccessFilterOnNonReadVerb is that rule in Go), at
-// the top of dispatchOneCall, where #443's dry-run refusal and #903's
-// background-write refusal already sit: before any dispatch branch, so nothing
-// is sent, whichever branch would have served the item. It runs first of the
-// three: the stage is misconfigured whatever kind of resolve this is, so a dry
-// run, a background resolve and a customer request all report the same reason.
-// No provenance is exempt: an inline draft's userAccessFilter stage dials the
-// caller's clientconfig rather than the ServiceAccount, but a draft refused
-// here is one the CRD would refuse to store.
+// rejects (templates.API.UserAccessFilterOnNonReadVerb is that rule in Go).
+// It decides on the STAGE, in the orchestrator loop of ResolveWithFailure,
+// before the #904 dependent-write decision and before runStage: no endpoint is
+// resolved, no item is planned, nothing is sent. Deciding on the stage, not on
+// its items, makes the report independent of the data: an iterator that
+// yields zero items and a dependency that failed are refused and reported the
+// same way. It holds for every kind of resolve: a dry run (where it replaces
+// #443's StageNotExecuted), a background resolve (before #903's refusal), and
+// an inline draft (whose userAccessFilter stage dials the caller's
+// clientconfig rather than the ServiceAccount, but which the CRD would refuse
+// to store).
 //
-// Each refused item is a stage failure, recorded the way every per-item
-// failure is (recordItemError): a {"reason","message"} record under the
+// The refused stage fails the way a stage snowplow refused to send fails
+// (failUndialledWrite's shape): a {"reason","message"} record under the
 // stage's errorKey, the stage-error sink bumped (no Put stores the result),
 // the outcome UserAccessFilterOnNonReadVerb in X-Snowplow-Stage-Outcomes, and,
 // without continueOnError, the resolve's StageFailure (a 500: the RESTAction,
 // not the request, is wrong). A write stage that depends on it is not sent
 // (#904): the reason is a failure.
 //
-// OBSERVABILITY. A misconfigured RESTAction is a real failure: WARN per item,
-// as #1112 logs every write snowplow did not send, and one count per item in
+// OBSERVABILITY. A misconfigured RESTAction is a real failure: one WARN per
+// refused stage and one count in
 // snowplow_uaf_non_read_verb_refused_total{provenance}. The line and the
 // message are metadata only: the RESTAction's namespace and name, the stage
 // name and the verb. No identity, no path, no payload.
@@ -45,29 +47,33 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
-// refuseUAFOnNonReadVerb refuses item i of a stage that carries
-// userAccessFilter on a verb the CRD rule rejects. It returns true when it
-// refused (the caller returns nil: a per-item error never cancels the stage,
-// #313 C-A).
-func (r *resolveRun) refuseUAFOnNonReadVerb(sc *stageCtx, i int) bool {
-	if !sc.apiCall.UserAccessFilterOnNonReadVerb() {
+// refuseUAFOnNonReadVerb refuses stage id when it carries userAccessFilter on
+// a verb the CRD rule rejects, and reports whether it did (the orchestrator
+// then moves to the next stage). It runs on the orchestrator goroutine,
+// between stages, so no worker is running and r.dict needs no lock.
+func (r *resolveRun) refuseUAFOnNonReadVerb(id string, apiCall *templates.API) bool {
+	if !apiCall.UserAccessFilterOnNonReadVerb() {
 		return false
 	}
-	call := sc.calls[i]
-	verb := ptr.Deref(sc.apiCall.Verb, http.MethodGet)
-	msg := uafNonReadVerbMessage(sc.id, verb)
-	var itemErr error
-	if !call.ContinueOnError {
-		itemErr = fmt.Errorf("api %s item %d failed: %s", sc.id, i, msg)
+	verb := ptr.Deref(apiCall.Verb, http.MethodGet)
+	msg := uafNonReadVerbMessage(id, verb)
+	accumulateErrorKey(r.dict, ptr.Deref(apiCall.ErrorKey, "error"),
+		map[string]any{"reason": StageReasonUAFOnNonReadVerb, "message": msg})
+	r.taintNarrow() // #603 PR-2 — a failed stage narrows nothing
+	r.stageErrSink.Bump(id, msg)
+	r.outcomes.fail(id, StageReasonUAFOnNonReadVerb)
+	if !ptr.Deref(apiCall.ContinueOnError, false) && r.failure == nil {
+		r.failure = &StageFailure{Stage: id, Code: http.StatusInternalServerError,
+			Reason: string(response.New(http.StatusInternalServerError, nil).Reason), Message: msg}
 	}
-	r.recordItemError(sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey,
-		map[string]any{"reason": StageReasonUAFOnNonReadVerb, "message": msg}, msg, itemErr)
 	recordUAFNonReadVerbRefused(r.opts.Provenance)
 	r.log.WarnContext(r.ctx, "stage refused: userAccessFilter on a verb other than GET or HEAD",
-		slog.String("name", sc.id),
+		slog.String("name", id),
 		slog.String("verb", verb),
 		slog.String("reason", StageReasonUAFOnNonReadVerb),
 		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
@@ -75,9 +81,9 @@ func (r *resolveRun) refuseUAFOnNonReadVerb(sc *stageCtx, i int) bool {
 	return true
 }
 
-// uafNonReadVerbMessage is the text a refused item records under its errorKey.
-// It can reach the resolved output, so it holds the stage name and the verb
-// only.
+// uafNonReadVerbMessage is the text a refused stage records under its
+// errorKey. It can reach the resolved output, so it holds the stage name and
+// the verb only.
 func uafNonReadVerbMessage(stage, verb string) string {
 	return fmt.Sprintf("stage %q verb %s was not sent: userAccessFilter dials snowplow's ServiceAccount and is allowed only on a GET or HEAD stage (#1281)", stage, verb)
 }

@@ -813,13 +813,6 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if gvr, _, _, ok := cache.ParseAPIServerPathToDep(call.Path); ok && cache.IsSensitiveResource(gvr) {
 		cache.SensitiveTouchedSinkFromContext(gctx).Bump()
 	}
-	// #1281 — userAccessFilter on a verb other than GET/HEAD (the CRD rule's
-	// set) would send it as snowplow's ServiceAccount: refused before any
-	// egress, first of the refusals below, whatever kind of resolve this is
-	// (uaf_non_read.go).
-	if r.refuseUAFOnNonReadVerb(sc, i) {
-		return nil
-	}
 	// #443 (k) — the one REFUSE of an inert (dry-run) resolve: a write-verb
 	// stage is NOT executed. It gets an explicit per-stage error and returns
 	// before any egress (no informer, no internal rest config, no discovery,
@@ -2276,6 +2269,15 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		// #1281 — a stage carrying userAccessFilter on a verb other than
+		// GET/HEAD (the CRD rule's set) would be sent as snowplow's
+		// ServiceAccount: refused here, before the #904 decision below and
+		// before any item is planned, so it is reported whatever the data
+		// (an iterator of zero items, a failed dependency) and nothing is sent
+		// (uaf_non_read.go).
+		if r.refuseUAFOnNonReadVerb(id, apiMap[id]) {
+			continue
+		}
 		// #904 — a write stage whose dependsOn stage did not succeed is not
 		// sent (dependent_write.go). Decided here, between stages, so no item
 		// of it is ever dispatched.

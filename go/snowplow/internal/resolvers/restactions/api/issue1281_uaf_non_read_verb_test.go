@@ -31,14 +31,21 @@ package api
 //   E  dry run: a userAccessFilter write reports UserAccessFilterOnNonReadVerb,
 //      a plain write keeps StageNotExecuted; neither is sent;
 //   F  no resolve kind is exempt: an inline draft (caller-supplied) and a
-//      background resolve refuse it with the same reason.
+//      background resolve refuse it with the same reason;
+//   G  the report does not depend on the data: an iterator stage whose
+//      iterator yields zero items is refused, listed and counted all the same;
+//   H  nor on a failed dependency: the stage reports its own reason, not the
+//      #904 Skipped.
 //
 // RED WITHOUT THE FIX (run 2026-11-09, refuseUAFOnNonReadVerb's call disabled
-// in dispatchOneCall): A fails on every verb, the fake receiving the write
-// with the ServiceAccount's token (e.g. POST .../namespaces/ns-a/widgets
-// Token:SA-EP-TOKEN-1281); A2 the same; B sends both writes, the first as the
-// ServiceAccount; E reports StageNotExecuted for the UAF write; F fails on
-// both kinds. C and D pass with and without the fix.
+// in ResolveWithFailure's stage loop): A fails on every verb, the fake
+// receiving the write with the ServiceAccount's token (e.g. POST
+// .../namespaces/ns-a/widgets Token:SA-EP-TOKEN-1281); A2 the same; B sends
+// both writes, the first as the ServiceAccount; E reports StageNotExecuted for
+// the UAF write; F fails on both kinds; G reads header [] (the stage is not
+// listed); H reads Skipped. G and H are also what a per-item refusal at
+// dispatch (the first cut of this fix) reports: with zero items, or a skipped
+// stage, no item reaches dispatch. C and D pass with and without the fix.
 
 import (
 	"bytes"
@@ -82,8 +89,12 @@ const (
 	u81Group     = "example.test"
 	u81Resource  = "widgets"
 	u81ListPath  = "/apis/example.test/v1/widgets"
-	u81RAName    = "ra-1281"
-	u81RANS      = "ns-1281"
+	// u81EmptyListPath answers a list with no items; u81ConflictPath answers
+	// any write with 409.
+	u81EmptyListPath = "/apis/example.test/v1/namespaces/ns-empty/widgets"
+	u81ConflictPath  = "/apis/example.test/v1/namespaces/ns-a/widgets/busy"
+	u81RAName        = "ra-1281"
+	u81RANS          = "ns-1281"
 )
 
 type u81Hit struct{ Method, Path, Token string }
@@ -134,6 +145,11 @@ func newU81Server(t *testing.T) *u81Server {
 			_, _ = io.WriteString(w, `{"apiVersion":"example.test/v1","kind":"WidgetList","metadata":{"resourceVersion":"1"},"items":[`+
 				`{"apiVersion":"example.test/v1","kind":"Widget","metadata":{"name":"w-a","namespace":"ns-a"}},`+
 				`{"apiVersion":"example.test/v1","kind":"Widget","metadata":{"name":"w-b","namespace":"ns-b"}}]}`)
+		case r.Method == http.MethodGet && r.URL.Path == u81EmptyListPath:
+			_, _ = io.WriteString(w, `{"apiVersion":"example.test/v1","kind":"WidgetList","metadata":{"resourceVersion":"1"},"items":[]}`)
+		case r.Method != http.MethodGet && r.URL.Path == u81ConflictPath:
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","code":409}`)
 		case r.Method == http.MethodGet:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
@@ -462,4 +478,48 @@ func TestIssue1281_F_InlineAndBackgroundRefuseToo(t *testing.T) {
 			}
 		})
 	}
+}
+
+// G — the refusal does not depend on the data: an iterator write whose
+// iterator yields zero items (nothing would be sent anyway) is still refused,
+// listed and counted.
+func TestIssue1281_G_ZeroItemIteratorIsRefusedToo(t *testing.T) {
+	s := newU81Server(t)
+	u81Env(t, s)
+	before := UAFNonReadVerbRefusedSnapshot()
+	src := &templates.API{Name: "src", Verb: ptr.To(http.MethodGet), Path: u81EmptyListPath}
+	w := u81WriteStage("w", http.MethodDelete, true)
+	w.Path = `${ "/apis/example.test/v1/namespaces/ns-a/widgets/" + .metadata.name }`
+	w.Payload = nil
+	w.DependsOn = &templates.Dependency{Name: "src", Iterator: ptr.To(".src.items")}
+	o := u81Resolve(t, s, u81Customer, src, w)
+	hits := s.all()
+	if len(hits) != 1 || hits[0].Method != http.MethodGet || hits[0].Path != u81EmptyListPath {
+		t.Fatalf("requests = %+v, want only the source GET %s", hits, u81EmptyListPath)
+	}
+	u81WantRefused(t, o, "w", http.MethodDelete)
+	if _, listed := u81Rows(t, o.outcomes)["src"]; listed {
+		t.Errorf("the source read failed: header %s", o.outcomes)
+	}
+	if d := UAFNonReadVerbRefusedSnapshot()[perUserRefProvenanceStored] - before[perUserRefProvenanceStored]; d != 1 {
+		t.Errorf("counter {stored} moved by %d, want 1", d)
+	}
+}
+
+// H — a dependency that failed does not hide it either: the stage reports its
+// own misconfiguration, not the #904 Skipped.
+func TestIssue1281_H_FailedDependencyDoesNotHideIt(t *testing.T) {
+	s := newU81Server(t)
+	u81Env(t, s)
+	first := u81WriteStage("first", http.MethodPut, false)
+	first.Path = u81ConflictPath
+	w := u81WriteStage("w", http.MethodPost, true)
+	w.DependsOn = &templates.Dependency{Name: "first"}
+	o := u81Resolve(t, s, u81Customer, first, w)
+	hits := s.all()
+	if len(hits) != 1 || hits[0].Method != http.MethodPut || hits[0].Path != u81ConflictPath {
+		t.Fatalf("requests = %+v, want only the PUT %s", hits, u81ConflictPath)
+	}
+	u81WantReason(t, o, "first", StageReasonError)
+	u81WantRefused(t, o, "w", http.MethodPost)
 }

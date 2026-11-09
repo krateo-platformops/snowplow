@@ -145,7 +145,10 @@ Content-Type: application/json
     other verb when a RESTAction is stored; a RESTAction stored before that
     rule, or a draft carrying one, is refused at resolve time too. Nothing is
     sent. The row reads `UserAccessFilterOnNonReadVerb`, in a dry run too
-    (where it replaces `StageNotExecuted`), and the stage's `errorKey` gets
+    (where it replaces `StageNotExecuted`). It is decided on the stage, not
+    its data: an iterator stage whose iterator yields no items is listed the
+    same way, and so is a stage whose `dependsOn` failed (instead of
+    `Skipped`). The stage's `errorKey` gets
     `{"reason":"UserAccessFilterOnNonReadVerb","message":"stage \"<id>\" verb <V> was not sent: userAccessFilter dials snowplow's ServiceAccount and is allowed only on a GET or HEAD stage (#1281)"}`.
     Without `continueOnError` it is the resolve's failure (`500`). A write
     that depends on it is `Skipped` (#904). Asking again gives the same
