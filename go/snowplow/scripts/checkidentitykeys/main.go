@@ -137,6 +137,7 @@ var storeRegistry = map[string]string{
 	"cache.l1GoneSet":                                 "no-content (#883 L1 keys the resolved cache removed, pending a memo drain)",
 	"cache.SeedResolveMemo.consumers":                 "no-content (#883 memo key -> the L1 keys it served; keys only, never a body)",
 	"cache.SeedResolveMemo.byConsumer":                "no-content (#883 L1 key -> the memo keys that served it; keys only, never a body)",
+	"cache.memoShadow.inflight":                       "no-content (memo key -> its in-flight leader produce, for the measurement-only would-join counter: the memo keys the memo already holds, a joiner count and the leader's dep keys and stamp; never a body)",
 	"cache.sliceabilityMemo.verdicts":                 "no-content (verdict per raKey × shape; raKey class-keyed)",
 	"cache.sliceabilityMemo.shapeNegative":            "no-content (identity-free structural verdict)",
 	"cache.raLayerIndex.byRA":                         "no-content (content versions)",
@@ -178,6 +179,7 @@ var storeRegistry = map[string]string{
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; every read is a full fetch, nothing is revalidated)",
+	"jq.programCache.entries":                         "no-content (run 23: compiled jq programs keyed by the filter's source text and the operator module bytes the compile read — derived from the spec alone; a program holds no state from its runs (gojq fork v0.13.1 caches regexps per run, TestCompileCache_CachedProgramRetainsNoRunState), so nothing served or identity-bound is ever kept)",
 	"api.narrowMemo":                                  "no-content (#603 PR-2: the jqinterest read set of a RESTAction spec x tracked stage — derived from the spec alone, never from a served body or an identity)",
 }
 

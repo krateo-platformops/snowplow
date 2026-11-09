@@ -121,7 +121,9 @@ Content-Type: application/json
   `{"reason":"StageNotExecuted","message":"dry-run: stage \"<id>\" verb <V> is not executed"}`.
   Both are a **stable contract**: match on `reason == "StageNotExecuted"`
   (preferred), or on the message prefix `dry-run: stage ` and suffix
-  ` is not executed`.
+  ` is not executed`. One exception: a write stage carrying a
+  `userAccessFilter` reports `UserAccessFilterOnNonReadVerb` instead (#1281,
+  below), as a real run would.
 - **Per-stage outcomes, outside the body.** Every RESTAction reply from the
   resolver carries `X-Snowplow-Stage-Outcomes`, compact JSON in topological
   stage order listing every stage that did **not** succeed:
@@ -137,8 +139,23 @@ Content-Type: application/json
     `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
     snowplow refused to send, below), `DestinationRefused` (#1131, below),
     `WriteRefused` (#1288: a write an export or background work does not
-    send; never in a dry run, whose refusal is `StageNotExecuted`), `Error`
-    (anything else).
+    send; never in a dry run, whose refusal is `StageNotExecuted`),
+    `UserAccessFilterOnNonReadVerb` (#1281, below), `Error` (anything else).
+  - **A `userAccessFilter` on a verb other than `GET`/`HEAD` is refused
+    (#1281).** `userAccessFilter` makes snowplow send the stage with its own
+    ServiceAccount, so it is allowed only on a read. The CRD rejects it on any
+    other verb when a RESTAction is stored; a RESTAction stored before that
+    rule, or a draft carrying one, is refused at resolve time too. Nothing is
+    sent. The row reads `UserAccessFilterOnNonReadVerb`, in a dry run too
+    (where it replaces `StageNotExecuted`). It is decided on the stage, not
+    its data: an iterator stage whose iterator yields no items is listed the
+    same way, and so is a stage whose `dependsOn` failed (instead of
+    `Skipped`). The stage's `errorKey` gets
+    `{"reason":"UserAccessFilterOnNonReadVerb","message":"stage \"<id>\" verb <V> was not sent: userAccessFilter dials snowplow's ServiceAccount and is allowed only on a GET or HEAD stage (#1281)"}`.
+    Without `continueOnError` it is the resolve's failure (`500`). A write
+    that depends on it is `Skipped` (#904). Asking again gives the same
+    answer: the RESTAction has to change (drop the `userAccessFilter`: the
+    write is then sent like any other write).
   - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
     `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
     item of its iterator, is listed with one of:

@@ -189,6 +189,7 @@ func s1264ReasonTable(t *testing.T) map[string]s1264Reason {
 		"StageReasonNotSent":            {StageReasonNotSent, false},
 		"StageReasonTimeout":            {StageReasonTimeout, false},
 		"StageReasonDestinationRefused": {StageReasonDestinationRefused, false},
+		"StageReasonUAFOnNonReadVerb":   {StageReasonUAFOnNonReadVerb, false}, // #1281: a misconfigured stage
 	}
 	declared := s1264DeclaredReasonConsts(t)
 	var tableNames []string

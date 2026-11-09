@@ -114,6 +114,23 @@ func refreshResolveMemo() *cache.SeedResolveMemo {
 	return refreshMemo.Load()
 }
 
+// RefreshMemoLookups is the live memo's hits, misses and #411 stale misses
+// (a stale miss is also a miss), one snapshot; zeros before the first memo.
+func RefreshMemoLookups() (hits, misses, staleMisses uint64) {
+	return refreshMemo.Load().LookupStats()
+}
+
+// RefreshMemoWouldJoin is the live memo's measurement-only would-join count:
+// produces an in-flight join on the memo key would have saved, judged through
+// the memo's own freshness rule (cache.SeedResolveMemo.BeginProduce). 0 before
+// the first memo.
+func RefreshMemoWouldJoin() uint64 { return refreshMemo.Load().WouldJoin() }
+
+// RefreshResolveMemoForTest returns the refresher's memo, creating it as the
+// refresher's first resolve would. TEST-ONLY (the metrics package's OTLP arm
+// drives the real memo through it); production code MUST NOT call it.
+func RefreshResolveMemoForTest() *cache.SeedResolveMemo { return refreshResolveMemo() }
+
 // RefreshMemoSize is the #883 gauge for the installed refresher memo: how many
 // bodies it holds and their summed encoded size. (0, 0) before the first one.
 func RefreshMemoSize() (entries, bodyBytes int64) {
@@ -129,6 +146,7 @@ func publishResolveMemoExpvar() {
 		expvar.Publish("snowplow_resolve_memo", expvar.Func(func() any {
 			entries, bodyBytes := RefreshMemoSize()
 			stale, moved, l1Gone := cache.ResolveMemoDropTotals()
+			hits, misses, staleMisses := RefreshMemoLookups()
 			return map[string]any{
 				// GAUGES — the installed refresher memo right now. They track the
 				// live working set: read them against snowplow_resolved_cache
@@ -141,6 +159,18 @@ func publishResolveMemoExpvar() {
 				"dropped_stale_total":   stale,
 				"dropped_moved_total":   moved,
 				"dropped_l1_gone_total": l1Gone,
+				// Lookups of the installed refresher memo: hits, misses
+				// (stale misses included) and the #411 stale misses alone.
+				"hits_total":         hits,
+				"misses_total":       misses,
+				"stale_misses_total": staleMisses,
+				// MEASUREMENT ONLY (seed_resolve_memo_shadow.go): misses whose
+				// produce started while a produce of the same memo key (its
+				// leader) was in flight AND whose leader handed over a body the
+				// memo would serve them (stored, and fresh by #411 when the
+				// leader ended) — the produces an in-flight join would have
+				// saved. Nothing joins.
+				"would_join_total": RefreshMemoWouldJoin(),
 			}
 		}))
 	})

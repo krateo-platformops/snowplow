@@ -4,7 +4,8 @@
 # needed to run the cache-enabled fork at 50K-composition scale:
 #   - image points at ghcr.io/krateo-platformops/snowplow
 #   - resources pre-sized for informer + in-process cache + GC headroom
-#   - env carries GOMEMLIMIT/GOGC for cgroup-aware GC
+#   - no GOMEMLIMIT/GOGC in env: snowplow derives its Go soft memory limit
+#     from the container's cgroup memory limit and runs the default GOGC
 #   - envFrom picks up the external snowplow-api-override ConfigMap
 #     (managed by the portal blueprint) in addition to the chart's
 #     own snowplow ConfigMap
@@ -152,6 +153,11 @@ ingress:
 #     attempts OOMed because GOMEMLIMIT was set >= container limit and
 #     the runtime never saw memory pressure. Validate at 50K under
 #     Phase-6 load before treating this as the new baseline.
+#   - Run 23 follow-up (runtime default GOGC + cgroup memory limit): the soft
+#     limit is no longer hand-set: snowplow reads its cgroup memory limit at
+#     startup and sets 7/8 of it (7 GiB under this 8Gi limit), so it moves
+#     with resources.limits.memory by itself. env.GOMEMLIMIT, if set, still
+#     wins.
 resources:
   limits:
     cpu: 4
@@ -266,16 +272,20 @@ env:
   # verbose logs + HTTP request tracing.
   BLIZZARD: "false"
   JQ_MODULES_PATH: /jq-modules
-  # Go runtime: trigger proactive GC at 7 GiB so we stay under the
-  # 8 Gi cgroup limit (~1 GiB headroom). Stress test peak was 3.9 GB at
-  # 1000 users.
-  # Must be BELOW the container memory limit (8 Gi) so the Go runtime
-  # backpressures via GC before Linux OOM-kills the pod. Setting this
-  # at or above the container limit is a misconfiguration that has
-  # caused OOM-kill incidents.
-  GOMEMLIMIT: 7GiB
-  # Lower GOGC (default 100) trades ~1% CPU for tighter memory headroom.
-  GOGC: "50"
+  # Go GC: neither GOMEMLIMIT nor GOGC is set here, on purpose.
+  #   - Soft memory limit: snowplow reads the container's cgroup memory limit
+  #     at startup (v2 memory.max / v1 memory.limit_in_bytes) and sets 7/8 of
+  #     it, leaving 1/8 for memory outside the heap goal (run 23 measured
+  #     ~1 GiB of it in an 8 GiB container). Under resources.limits.memory=8Gi
+  #     that is 7 GiB, and it follows the limit when you change it. Setting
+  #     GOMEMLIMIT here overrides the derivation; it must then stay BELOW the
+  #     container limit, or Linux OOM-kills the pod before the GC
+  #     back-pressures (a past incident).
+  #   - GOGC: the runtime default (100). The old GOGC=50 was not "~1% CPU":
+  #     paired run 23 (50K compositions x 1000 users, 4 cores) measured GC at
+  #     ~40% of CPU and GC assist at 28% of customer-path CPU under it.
+  # The effective values are on /debug/vars (snowplow_go_runtime) and OTLP
+  # (snowplow_go_gc_percent, snowplow_go_memory_limit_bytes).
   CACHE_ENABLED: "true"
   # #367 — boot-time backing for the DARK v7 shadow-parity measurement. DEFAULT
   # OFF: leave "false" for normal operation and for any latency-acceptance window.

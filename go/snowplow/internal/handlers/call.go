@@ -427,10 +427,16 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 // strictParams are the #443 query keys whose exact spelling is load-bearing.
 var strictParams = []string{"dryRun", "fieldValidation"}
 
+// paramKeySeparators drops '_' and '-'. One Replacer for the process: it is
+// safe for concurrent use, and building one per call was 1.65% of all CPU and
+// 4.2% of allocated bytes on run 23's customer path (every dispatched request
+// normalizes every query key).
+var paramKeySeparators = strings.NewReplacer("_", "", "-", "")
+
 // normalizeParamKey folds case and drops '_' and '-', so "dry_run", "DryRun"
 // and "dry-run" all compare equal to "dryRun".
 func normalizeParamKey(k string) string {
-	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(k))
+	return strings.ToLower(paramKeySeparators.Replace(k))
 }
 
 // nearMissParam returns the exact spelling a query key nearly matches ("" when

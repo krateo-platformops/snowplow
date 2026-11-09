@@ -1246,31 +1246,38 @@ func seedScopeYielding(ctx context.Context,
 	// onLearnedNavUnit, when set, observes each learned nav unit processed (the
 	// pre-latch phase's readiness accounting, #841).
 	var onLearnedNavUnit func()
+	// Each learned unit's class key is computed ONCE here, not once per class
+	// that asks for its units: walking every seed's learned list per admitted
+	// class recomputed LearnedClassKey O(classes × units) times, 2.4% of all
+	// CPU and 9.1% of allocated objects on run 23. The index holds exactly the
+	// units, in exactly the order, that walk visited (learnedUnitsByClass).
+	// widgetSeeds / restactionSeeds are final here: sorted above, never
+	// written below.
+	learnedWidgets := make([][]seedTarget, len(widgetSeeds))
+	for i := range widgetSeeds {
+		learnedWidgets[i] = widgetSeeds[i].learned
+	}
+	learnedRAs := make([][]seedTarget, len(restactionSeeds))
+	for i := range restactionSeeds {
+		learnedRAs[i] = restactionSeeds[i].learned
+	}
+	learnedWidgetUnits := learnedUnitsByClass(learnedWidgets)
+	learnedRAUnits := learnedUnitsByClass(learnedRAs)
 	seedLearnedWidgetsFor := func(k string) bool {
-		for _, ws := range widgetSeeds {
-			for _, c := range ws.learned {
-				if learnedKey(c) != k {
-					continue
-				}
-				if seedWidgetTarget(ws.e, c) {
-					return true
-				}
-				if onLearnedNavUnit != nil {
-					onLearnedNavUnit()
-				}
+		for _, u := range learnedWidgetUnits[k] {
+			if seedWidgetTarget(widgetSeeds[u.seed].e, u.c) {
+				return true
+			}
+			if onLearnedNavUnit != nil {
+				onLearnedNavUnit()
 			}
 		}
 		return false
 	}
 	seedLearnedRAsFor := func(k string) bool {
-		for _, rs := range restactionSeeds {
-			for _, c := range rs.learned {
-				if learnedKey(c) != k {
-					continue
-				}
-				if seedRestactionTarget(rs.ref, c) {
-					return true
-				}
+		for _, u := range learnedRAUnits[k] {
+			if seedRestactionTarget(restactionSeeds[u.seed].ref, u.c) {
+				return true
 			}
 		}
 		return false

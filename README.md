@@ -44,7 +44,7 @@ See [docs/configuration.md](docs/configuration.md). Most used:
 | Setting | Default | Effect |
 |---|---|---|
 | `env.CACHE_ENABLED` | `"true"` | The single cache master gate; `false` = transparent direct-apiserver fallback (same data, slower). |
-| `env.GOMEMLIMIT` | `7GiB` | Go GC back-pressure ceiling — must stay strictly below `resources.limits.memory` (8Gi) or Linux OOM-kills instead. |
+| `env.GOMEMLIMIT` | unset (derived: 7/8 of the container memory limit) | Go GC back-pressure ceiling. snowplow derives it from its cgroup memory limit; set it only to override, and then strictly below `resources.limits.memory` or Linux OOM-kills instead. |
 | `service.type` / `service.port` | `LoadBalancer` / `8081` | One port serves content, probes and debug surfaces. |
 
 ## Examples

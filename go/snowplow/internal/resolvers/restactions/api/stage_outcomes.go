@@ -79,6 +79,12 @@ const (
 	// is no Kubernetes StatusReason, so trustedReason drops it from an upstream
 	// answer (#714).
 	StageReasonDestinationRefused = credhttp.DestinationRefusedReason
+	// StageReasonUAFOnNonReadVerb (#1281) — the stage carries userAccessFilter
+	// on a verb other than GET or HEAD, which the CRD rejects (core.go): it
+	// would have been sent as snowplow's ServiceAccount, so nothing was sent
+	// (uaf_non_read.go). Recorded only by snowplow: the reason is no Kubernetes
+	// StatusReason, so trustedReason drops it from an upstream answer (#714).
+	StageReasonUAFOnNonReadVerb = "UserAccessFilterOnNonReadVerb"
 	// StageReasonWriteRefused (#1288) — a write stage, or one item of it, that
 	// snowplow refused to send because the request is not a customer's own
 	// write: an export (#970) or background work (#903). background_write.go
@@ -121,6 +127,9 @@ var stageReasonClasses = map[string]stageReasonClass{
 	StageReasonNotSent:            stageReasonFailed,
 	StageReasonTimeout:            stageReasonFailed,
 	StageReasonDestinationRefused: stageReasonFailed,
+	// #1281: a misconfigured stage (userAccessFilter on a write) is a real
+	// failure, in every mode, never a deliberate non-execution.
+	StageReasonUAFOnNonReadVerb: stageReasonFailed,
 }
 
 // stageNotExecutedByDesign reports whether reason says snowplow deliberately
@@ -140,7 +149,11 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	// The #443 dry-run refusal outranks every failure: a dry run reports
+	// #1281: recorded once for the whole stage, before anything else can be
+	// (the stage is refused before it is planned); ranked first because the
+	// stage itself is misconfigured.
+	StageReasonUAFOnNonReadVerb: 12,
+	// The #443 dry-run refusal outranks every other failure: a dry run reports
 	// StageNotExecuted for its write stages (#443 k, a stable contract).
 	StageReasonNotExecuted:        11,
 	StageReasonForbidden:          10,
