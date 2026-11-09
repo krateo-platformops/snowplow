@@ -609,12 +609,12 @@
         },
         "GOMEMLIMIT": {
           "type": "string",
-          "description": "Go soft memory limit; must be below the container memory limit.",
+          "description": "Optional override of the Go soft memory limit (e.g. 6GiB, or off). Unset by default: snowplow then sets 7/8 of the container's cgroup memory limit at startup, so the limit follows resources.limits.memory. If set, it is used as is and must stay below the container memory limit.",
           "title": "GOMEMLIMIT"
         },
         "GOGC": {
           "type": "string",
-          "description": "Go garbage collector target percentage.",
+          "description": "Optional override of the Go garbage collector target percentage. Unset by default, so the runtime default (100) applies.",
           "title": "GOGC"
         },
         "CACHE_ENABLED": {

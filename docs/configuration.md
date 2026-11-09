@@ -91,8 +91,8 @@ A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap ch
 | Env var | Default | Effect |
 |---|---|---|
 | `CACHE_ENABLED` | `"true"` | The single master cache gate. `false` = transparent fallback to the direct apiserver — same data, same RBAC, slower ([ADR 0004](../go/snowplow/docs/adr/0004-cache-is-provisional-and-removable.md)). |
-| `GOMEMLIMIT` | `7GiB` | **Must stay strictly below the container memory limit** (default 8Gi) so Go GC back-pressures before Linux OOM-kills. Move it with `resources.limits.memory`. |
-| `GOGC` | `"50"` | Tighter heap for ~1% CPU. |
+| `GOMEMLIMIT` | unset | Unset, snowplow sets the Go soft memory limit to **7/8 of the container's cgroup memory limit** at startup (cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`): 7 GiB under the default 8Gi, and it follows `resources.limits.memory` by itself. The 1/8 left over covers memory outside the heap goal (run 23 measured ~1 GiB of it in an 8 GiB container). With no cgroup limit, or one it cannot read (logged at WARN), no soft limit is set. Set `GOMEMLIMIT` only to override; it then **must stay strictly below the container memory limit**, or Linux OOM-kills the pod before the GC back-pressures. |
+| `GOGC` | unset (runtime default 100) | Set only to override. The chart used to set `"50"`; paired run 23 (50K compositions × 1000 users, 4 cores) measured GC at ~40% of CPU under it, GC assist 28% of customer-path CPU. |
 | `LOG_LEVEL` | `"warn"` (chart) / `info` (binary) | The single verbosity knob (`--log-level`, #163): `debug`, `info`, `warn` or `error`, case-insensitive; an unrecognised value falls back to `info` so a typo never silences logs. |
 | `DEBUG` | unset (binary default `"false"`) | **Deprecated** — `main.go` labels `--debug` / `DEBUG` a thin alias for `--log-level=debug`. The chart dropped it in #163; set `LOG_LEVEL` instead. |
 | `PRETTY_LOG` | `"false"` | `false` = single-line JSON logs (the pretty handler is a measured CPU/I/O drag in prod). |
