@@ -102,6 +102,8 @@ func registerRefresherMetrics() {
 		// side: the counters #1085's run-22 pair compares between its arms.
 		expvar.Publish("snowplow_refresher_normal_completed_total", refresherStatFunc("normal_completed"))
 		expvar.Publish("snowplow_refresher_viewed_completed_total", refresherStatFunc("viewed_completed"))
+		// #1069 — parks of the reserved worker (the viewed reservation).
+		expvar.Publish("snowplow_refresher_viewed_reserve_parks_total", refresherStatFunc("viewed_reserve_parks"))
 		expvar.Publish("snowplow_refresher_viewed_dirty_age_ms_p95", refresherStatFunc("viewed_dirty_age_ms_p95"))
 		expvar.Publish("snowplow_refresher_viewed_dirty_age_ms_max", refresherStatFunc("viewed_dirty_age_ms_max"))
 		expvar.Publish("snowplow_refresher_unviewed_dirty_age_ms_p95", refresherStatFunc("unviewed_dirty_age_ms_p95"))
