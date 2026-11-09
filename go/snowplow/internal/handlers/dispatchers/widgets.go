@@ -52,6 +52,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	req, endWork := beginServeWorkClass(req)
 	defer endWork()
 	start := time.Now()
+	// #1265 P0 — one serve outcome per top-level customer call (counter +
+	// header). First, so the inline-object 400 below counts as refused.
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerWidgets)
+	defer serveEnd()
 
 	// #443 part 2 — an inline object is a RESTAction only. BodyExtrasDecode
 	// already refuses one addressed at the widgets group; this is the
@@ -230,6 +234,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					// #1062 — an armed hit on a dirty shared shell is an l1 stale
 					// serve, timed until its replacing frame is written.
 					cache.NoteStaleHit(req.Context(), contentKey, entry, staleSubjectOf)
+					serve.servedCell(contentKey, entry)
 					writeResolvedJSON(wri, gated)
 					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
 					// instantly (counted in the Get funnel) and revalidated in the
@@ -277,8 +282,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// shared "" cell to a different ""-deriving identity (cross-identity read of
 	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
+	lookupMiss := cache.LookupAbsent
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
+		var entry *cache.ResolvedEntry
+		if entry, lookupMiss = l1Get(req.Context(), cacheHandle, cacheKey); lookupMiss == cache.LookupHit {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -296,6 +303,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
 			staleHitWritePoint(req.Context(), cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
+			serve.servedCell(cacheKey, entry)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -309,6 +317,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
+	serve.servedLive(coldCauseOfLookup(req.Context(), cacheHandle, cacheInputs, lookupMiss))
 
 	// #189 — capture the widget key's generation BEFORE the resolve below, so the
 	// tail PutIfGen (main per-user-fallback branch) refuses rather than
@@ -424,7 +433,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// is a client error, already logged once at WARN where it was decided
 		// (api.RefuseReservedExtras), and nothing was read or dialled, so
 		// there is no stale-derived pass to withdraw.
-		if WriteReservedExtrasRefusal(wri, err) {
+		if isReservedExtrasRefusal(err) {
+			serve.refused() // #1265 — refused before anything was read: not a cold serve
+			WriteReservedExtrasRefusal(wri, err)
 			return
 		}
 		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh

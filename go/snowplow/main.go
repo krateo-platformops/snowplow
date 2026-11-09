@@ -113,6 +113,10 @@ func snowplowCORSOptions() cors.Options {
 			handlers.HeaderResolveSource,
 			handlers.HeaderStageOutcomes,
 			"Warning",
+			// #1265 P0 — the serve outcome (fresh | stale | cold) of a customer
+			// /call. The SPA ignores it; a browser-side reader (the bench's
+			// Chrome driver) needs it exposed like the refresh key.
+			dispatchers.ServeOutcomeHeader,
 		},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers

@@ -162,6 +162,12 @@ var nonCacheInitPublishers = map[string][]string{
 	// so its counters, histogram and rings must stay observable with the
 	// cache off; gating them would blind the instrument exactly there.
 	"internal/slowcall/stats.go": {"snowplow_slow_request_bound_ms", "snowplow_slow_request_phase_ms", "snowplow_slow_request_snapshots_recent", "snowplow_slow_request_snapshots_suppressed_total", "snowplow_slow_request_snapshots_total", "snowplow_slow_requests_recent", "snowplow_slow_requests_total"},
+	// #1265 served-cold counter: what each top-level customer /call was served,
+	// a customer-experience measurement, not a cache surface. With the cache
+	// off every serve is cold{cache_off}, which is the true reading (a
+	// cache-off control arm reads it); gating it would report "no cold serves"
+	// as an absence exactly where every serve is cold.
+	"internal/handlers/dispatchers/customer_serves.go": {"snowplow_customer_serves_cold_total", "snowplow_customer_serves_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

@@ -235,7 +235,10 @@ type s394RecordingHandle struct {
 }
 
 func (h *s394RecordingHandle) Get(string) (*cache.ResolvedEntry, bool) { return nil, false }
-func (h *s394RecordingHandle) Now() time.Time                          { return time.Now() }
+func (h *s394RecordingHandle) GetReportingMiss(string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	return nil, cache.LookupAbsent
+}
+func (h *s394RecordingHandle) Now() time.Time { return time.Now() }
 func (h *s394RecordingHandle) GetNoTouch(string) (*cache.ResolvedEntry, bool) {
 	return nil, false
 }

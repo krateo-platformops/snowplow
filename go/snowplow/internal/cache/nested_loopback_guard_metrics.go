@@ -15,14 +15,69 @@
 //     chain hit NestedCallMaxDepth over HTTP). Should stay 0 on the
 //     composition-resources path once R converges it (the ancestor stop fires
 //     first); a non-zero here flags a chain the ancestor set could not see.
+//
+// PUBLISHED (#1274 review): until #1274 they were read only by tests. #1274
+// makes the ingest trust a self-hop by the short Service name, which switches
+// the guard on for loopbacks through the portal's short-form endpoint, so a
+// chain that re-enters itself now gets the raw CR — and that must be visible on
+// a live pod. Published as snowplow_nested_loopback_guard_stops_total{kind} on
+// /debug/vars and OTLP, kind ∈ NestedLoopbackGuardStopKinds, both cells present
+// at 0 from process start (absent and zero are different readings). No
+// RESTAction name, node or identity is a label.
 package cache
 
-import "sync/atomic"
+import (
+	"expvar"
+	"sync"
+	"sync/atomic"
+)
 
 var (
 	httpEdgeCycleStopTotal atomic.Uint64
 	httpEdgeDepthStopTotal atomic.Uint64
 )
+
+// The stop kinds, the closed label set of the published counter.
+const (
+	NestedLoopbackGuardStopCycle = "cycle" // HTTPEdgeCycleStop
+	NestedLoopbackGuardStopDepth = "depth" // HTTPEdgeDepthStop
+)
+
+// NestedLoopbackGuardStopKinds is the closed kind set, in emit order.
+var NestedLoopbackGuardStopKinds = []string{NestedLoopbackGuardStopCycle, NestedLoopbackGuardStopDepth}
+
+// NestedLoopbackGuardStopsSnapshot is every kind's count, both always present.
+func NestedLoopbackGuardStopsSnapshot() map[string]uint64 {
+	return map[string]uint64{
+		NestedLoopbackGuardStopCycle: HTTPEdgeCycleStop(),
+		NestedLoopbackGuardStopDepth: HTTPEdgeDepthStop(),
+	}
+}
+
+func init() {
+	// CFG-1: the guard runs only with the cache on (the dispatchers gate it on
+	// !Disabled()), so under cache-off the key is absent, like every other
+	// cache-side publisher.
+	if Disabled() {
+		return
+	}
+	registerNestedLoopbackGuardExpvar()
+}
+
+var nestedLoopbackGuardExpvarOnce sync.Once
+
+func registerNestedLoopbackGuardExpvar() {
+	nestedLoopbackGuardExpvarOnce.Do(func() {
+		expvar.Publish("snowplow_nested_loopback_guard_stops_total", expvar.Func(func() any {
+			return NestedLoopbackGuardStopsSnapshot()
+		}))
+	})
+}
+
+// RegisterNestedLoopbackGuardExpvarForTest publishes the key under a test that
+// set CACHE_ENABLED after init ran with it unset. Idempotent. Production code
+// MUST NOT call it.
+func RegisterNestedLoopbackGuardExpvarForTest() { registerNestedLoopbackGuardExpvar() }
 
 // BumpHTTPEdgeCycleStop increments the ancestor-set HTTP-edge cycle-stop
 // counter. Called by the dispatcher handlers when an inbound TRUSTED

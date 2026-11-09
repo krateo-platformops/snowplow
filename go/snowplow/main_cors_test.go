@@ -64,6 +64,7 @@ var requiredExposed = []string{
 	"X-Snowplow-Refresh-Key",
 	"X-Snowplow-Refresh-Class",
 	"Link",
+	"X-Snowplow-Serve-Outcome", // #1265 P0
 }
 
 // TestSnowplowCORS_ExposesRefreshHeaders — a cross-origin GET with an Origin

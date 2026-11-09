@@ -110,17 +110,39 @@ func BackgroundHop(ctx context.Context) bool {
 // customer's own request, and returns "" when it is. A write stage is sent
 // only when it returns "".
 func NonCustomerWriteOrigin(ctx context.Context) string {
+	first := ""
+	EachNonCustomerOrigin(ctx, func(o string) bool {
+		first = o
+		return false
+	})
+	return first
+}
+
+// EachNonCustomerOrigin calls yield with every non-customer origin ctx carries,
+// in NonCustomerWriteOrigin's precedence order (that function is the first
+// one), until yield returns false. A customer's own request yields nothing.
+//
+// A reader that weighs one signal differently from the others (#1265: the
+// served-cold counter trusts the background hop only on a trusted
+// self-loopback) must see each signal, not only the first: the hop outranks an
+// export, so the first origin alone would hide the export.
+func EachNonCustomerOrigin(ctx context.Context, yield func(origin string) bool) {
 	if o := RefDenialOrigin(ctx); o != RefDenialOriginServe {
-		return o
+		if !yield(o) {
+			return
+		}
 	}
 	if _, ok := DemandRevalidationFromContext(ctx); ok {
-		return NonCustomerDemandRevalidation
+		if !yield(NonCustomerDemandRevalidation) {
+			return
+		}
 	}
 	if BackgroundHop(ctx) {
-		return NonCustomerBackgroundHop
+		if !yield(NonCustomerBackgroundHop) {
+			return
+		}
 	}
 	if ExportRead(ctx) {
-		return NonCustomerExport
+		yield(NonCustomerExport)
 	}
-	return ""
 }
