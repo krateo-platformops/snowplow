@@ -162,14 +162,14 @@ response body (an error body can echo a token). The URI of the request snowplow
 **received** (`krateo.request.uri`) is recorded: snowplow reads no credential
 from a query (its token travels in the `Authorization` header), and on
 krateo-057 no access token was found in any URL field over 6 h or over all time
-(installer, measured 2026-11-07, with controls). A RESTAction stage record's body is a reason class from a closed
+(installer, measured 2026-11-07, with controls). A failed `/call` record's body and a RESTAction stage record's body are the same reason class from a closed
 set (below).
 
 ## Inventory
 
 | path | what changes | status |
 |---|---|---|
-| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write |
+| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's body is `upstream answered <code> <status text>`, never the apiserver's message or body (#1298) |
 | `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun` |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
 | `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |

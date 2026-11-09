@@ -237,9 +237,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// cover them (measured on 057: no outcome/resource/session in the gateway
 	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+		// #1298 — a failure's record body is the reason class of the code
+		// (audit.FailureMessage, the stage records' closed set), never
+		// rt.Message: that is the apiserver's Status.message, which names the
+		// user, or the raw upstream body when it is not a Status. The caller's
+		// response below still carries rt unchanged.
 		outcome, code, msg := "success", http.StatusOK, ""
 		if rt.Status == response.StatusFailure {
-			outcome, code, msg = "failure", rt.Code, rt.Message
+			outcome, code, msg = "failure", rt.Code, audit.FailureMessage(rt.Code)
 		}
 		// A dry run (#443, /call/dry-run: the apiserver is always sent
 		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded

@@ -32,7 +32,8 @@
 //     stage and server.address identify the action and the authority.
 //   - the upstream's response BODY: an error body can echo a token. The outcome
 //     is the real status code plus a short reason class from a closed set
-//     (outcomeMessage), never upstream text.
+//     (audit.FailureMessage, shared with the /call record), never upstream
+//     text.
 //
 // THE OUTCOME is what the authority answered, observed at the dial (dialAnswer):
 // the real status code (201 and 204 are not reported as 200); a 2xx whose body
@@ -60,7 +61,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -159,21 +159,12 @@ func apiServerDryRun(rawQuery string) bool {
 // The message is from a closed set and never carries upstream text.
 func outcomeOf(a *dialAnswer) (outcome string, code int, message string) {
 	if a == nil || a.code == 0 {
-		return "failure", 0, "no response from the endpoint"
+		return "failure", 0, audit.FailureMessage(0)
 	}
 	if a.code >= 200 && a.code < 300 {
 		return "success", a.code, a.bodyNote
 	}
-	return "failure", a.code, outcomeMessage(a.code)
-}
-
-// outcomeMessage is the reason class of a non-2xx answer: the status text of
-// the code, or the bare code for one with no standard text.
-func outcomeMessage(code int) string {
-	if t := http.StatusText(code); t != "" {
-		return fmt.Sprintf("upstream answered %d %s", code, t)
-	}
-	return fmt.Sprintf("upstream answered %d", code)
+	return "failure", a.code, audit.FailureMessage(a.code)
 }
 
 // auditStageWrite emits the record for one dialled stage (see stageAuditEvent).
