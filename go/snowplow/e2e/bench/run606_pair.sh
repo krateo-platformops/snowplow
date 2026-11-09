@@ -27,6 +27,17 @@
 #       PAIRS="R:C N:C", C shared): every pair reads its runs' collected files.
 #       Every run must be in at least one pair: a cluster that no comparison
 #       reads is refused. Two runs and one pair is the case PAIRS="A:B" always was.
+# REPLICA_PAIR (run 24, Diego 2026-11-09; default: none): one pair of PAIRS
+#       declared the launch's A/A replica, e.g. RUNS="N1 N2 N2B" PAIRS="N1:N2
+#       N2:N2B" REPLICA_PAIR="N2:N2B": its two runs run the SAME image on two
+#       clusters (EXPECTED_IMAGE_DIGEST equal, required; refused otherwise), and it
+#       gets no paired verdict of its own: its replica (`custlat replica --in-run`,
+#       the same ratios as customer_latency_replica_runs12_13.json, measured on this
+#       schedule, steady included) is $PAIR_OUT/replica-<L1>-<L2>.json, and it is
+#       the between-run term of EVERY other pair, in place of the committed file.
+#       A REPLICA_PAIR not in PAIRS, or with nothing to calibrate (no other pair), is
+#       refused. Without REPLICA_PAIR the committed file is the replica, as before.
+#       The replica's arms stay up only while a pair it calibrates can be compared.
 #
 # Per run L (required):  RUN_NAME_L, SNOWPLOW_TAG_L, EXPECTED_IMAGE_DIGEST_L,
 #                        BENCH_606_GO_L (Diego's go PER RUN, as run606.sh:
@@ -60,10 +71,11 @@
 #
 # OUT_L: each run's OUT (default: run606.sh's, per RUN_NAME); an OUT that
 # already holds a run (verdict.json or run.log) is refused, and so is a
-# PAIR_OUT that holds a pair (pair.json or any paired-verdict-*.json).
+# PAIR_OUT that holds a pair (pair.json, any paired-verdict-*.json or replica-*.json).
 # Out: $PAIR_OUT/pair.json (bench commit, every run's name / tag / digest /
-# OUT, the pairs), pair.log, <L>.console, and per pair
-# paired-verdict-<BASELINE>-<CANDIDATE>.json. Exit: the pairs' verdicts
+# OUT, the pairs, the replica pair), pair.log, <L>.console, per pair
+# paired-verdict-<BASELINE>-<CANDIDATE>.json, and with REPLICA_PAIR
+# replica-<L1>-<L2>.json (no verdict of its own). Exit: the pairs' verdicts
 # together: 1 when any pair FAILs (a pair's FAIL is that comparison's result,
 # whatever another pair says), else 3 when any is INVALID, else 4 when any is
 # INCONCLUSIVE, else 0 (every pair PASS); one pair's exit is its own verdict's.
@@ -132,9 +144,22 @@ for x in "${LABELS[@]}"; do
     [[ "${!nx}" != "${!ny}" ]] || refuse "RUN_NAME_$x and RUN_NAME_$y are the same: every cluster needs its own name"
   done
 done
+REPLICA_PAIR="${REPLICA_PAIR:-}"
+if [[ -n "$REPLICA_PAIR" ]]; then
+  [[ " ${PAIR_LIST[*]} " == *" $REPLICA_PAIR "* ]] \
+    || refuse "REPLICA_PAIR $REPLICA_PAIR is not in PAIRS (${PAIR_LIST[*]}): the A/A replica must be one of the launch's pairs"
+  (( ${#PAIR_LIST[@]} >= 2 )) \
+    || refuse "REPLICA_PAIR $REPLICA_PAIR is the only pair: an A/A replica calibrates other pairs, and there is none"
+  da="EXPECTED_IMAGE_DIGEST_${REPLICA_PAIR%%:*}" db="EXPECTED_IMAGE_DIGEST_${REPLICA_PAIR##*:}"
+  [[ "${!da}" == "${!db}" ]] \
+    || refuse "REPLICA_PAIR $REPLICA_PAIR: an A/A replica runs ONE image on both arms; ${da} (${!da}) and ${db} (${!db}) differ"
+fi
+# is_replica <pair>: the pair is the launch's declared A/A replica
+is_replica() { [[ -n "$REPLICA_PAIR" && "$1" == "$REPLICA_PAIR" ]]; }
 for p in "${PAIR_LIST[@]}"; do
+  is_replica "$p" && continue
   da="EXPECTED_IMAGE_DIGEST_${p%%:*}" db="EXPECTED_IMAGE_DIGEST_${p##*:}"
-  [[ "${!da}" != "${!db}" ]] || refuse "pair $p: the two digests are the same image: nothing to compare"
+  [[ "${!da}" != "${!db}" ]] || refuse "pair $p: the two digests are the same image: nothing to compare (an A/A replica is declared by REPLICA_PAIR)"
 done
 # #1004: the full-widen stage runs on every run or on none
 fw=0; for x in "${LABELS[@]}"; do v="BENCH_1004_GO_$x"; [[ -n "${!v:-}" ]] && fw=$(( fw + 1 )); done
@@ -170,6 +195,11 @@ for x in "${LABELS[@]}"; do
     [[ "${!ox}" != "${!oy}" ]] || refuse "OUT_$x and OUT_$y are the same directory"
   done
 done
+REPLICA_FILE=""
+if [[ -n "$REPLICA_PAIR" ]]; then
+  REPLICA_FILE="$PAIR_OUT/replica-${REPLICA_PAIR%%:*}-${REPLICA_PAIR##*:}.json"
+  REPLICA="$REPLICA_FILE"           # every other pair's between-run term: this launch's A/A pair
+fi
 PAIR_EVIDENCE="$(python3 -m bench.evidence dest "$PAIR_NAME")"
 PAIR_RUN_ID="${PAIR_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ "$DRY" != "1" ]]; then
@@ -179,7 +209,7 @@ if [[ "$DRY" != "1" ]]; then
       [[ ! -e "${!out}/$f" ]] || refuse "OUT_$x (${!out}) already holds a run ($f): a pair would grade it; use a new RUN_NAME_$x or OUT_$x"
     done
   done
-  for f in "$PAIR_OUT/pair.json" "$PAIR_OUT"/paired-verdict*.json; do
+  for f in "$PAIR_OUT/pair.json" "$PAIR_OUT"/paired-verdict*.json "$PAIR_OUT"/replica-*.json; do
     [[ ! -e "$f" ]] || refuse "PAIR_OUT ($PAIR_OUT) already holds a pair (${f##*/}): it is never written over; use new run names or a new PAIR_OUT"
   done
 fi
@@ -210,6 +240,12 @@ pair_cmd() {
   PAIR_CMD=(python3 -m bench.custlat pair --a "${!oa}/verdict.json" --b "${!ob}/verdict.json"
             --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}"
             --a-label "$a" --b-label "$b")
+}
+# replica_cmd: REPLICA_CMD = the declared A/A pair's in-run replica (custlat replica --in-run)
+replica_cmd() {
+  local a="${REPLICA_PAIR%%:*}" b="${REPLICA_PAIR##*:}"
+  local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a"
+  REPLICA_CMD=(python3 -m bench.custlat replica "${!oa}" "${!ob}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}")
 }
 
 runs_line=""
@@ -251,7 +287,13 @@ while IFS= read -r ln; do
 done <<< "$quota_msg"
 if [[ "$DRY" == "1" ]]; then
   log "DRY: all ${#LABELS[@]} runs would start now; then, per pair:"
-  for p in "${PAIR_LIST[@]}"; do pair_cmd "$p"; log "DRY:   ${PAIR_CMD[*]} > $(verdict_file "$p")"; done
+  if [[ -n "$REPLICA_PAIR" ]]; then
+    replica_cmd; log "DRY:   ${REPLICA_CMD[*]} --completed <0|1> <0|1> > $REPLICA_FILE (the A/A replica, first)"
+  fi
+  for p in "${PAIR_LIST[@]}"; do
+    is_replica "$p" && continue
+    pair_cmd "$p"; log "DRY:   ${PAIR_CMD[*]} > $(verdict_file "$p")"
+  done
   exit 0
 fi
 
@@ -260,16 +302,18 @@ for x in "${LABELS[@]}"; do
   nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" dg="EXPECTED_IMAGE_DIGEST_$x" out="OUT_$x"
   pj_args+=("$x" "${!nm}" "${!tg}" "${!dg}" "${!out}")
 done
-pj_args+=(-- "${PAIR_LIST[@]}")
+pj_args+=(-- "${REPLICA_PAIR:--}" "${PAIR_LIST[@]}")
 python3 -c 'import json, sys, time
 out, sha, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
 cut = rest.index("--")
-fields, pairs = rest[:cut], rest[cut + 1:]
+fields, replica, pairs = rest[:cut], rest[cut + 1], rest[cut + 2:]
 keys = ("run_name", "tag", "digest", "out")
 runs = {fields[i]: dict(zip(keys, fields[i + 1:i + 5])) for i in range(0, len(fields), 5)}
-json.dump({"kind": "pair", "bench_sha": sha, "started": time.time(), "runs": runs,
-           "pairs": [dict(zip(("baseline", "candidate"), p.split(":"))) for p in pairs]},
-          open(out, "w"), indent=1)' "${pj_args[@]}"
+doc = {"kind": "pair", "bench_sha": sha, "started": time.time(), "runs": runs,
+       "pairs": [dict(zip(("baseline", "candidate"), p.split(":"))) for p in pairs]}
+if replica != "-":
+    doc["replica_pair"] = dict(zip(("first", "second"), replica.split(":")))
+json.dump(doc, open(out, "w"), indent=1)' "${pj_args[@]}"
 # #1194: a launch that cannot publish its own record spends nothing
 if ! msg="$(publish_pair started 2>&1)"; then
   refuse "the pair's evidence could not be published: ${msg}: nothing was created"
@@ -292,13 +336,19 @@ for x in "${LABELS[@]}"; do
   pid="PID_$x"; log "run $x pid ${!pid}"
 done
 completed() { local out="OUT_$1"; grep -q "run complete: " "${!out}/run.log" 2>/dev/null; }
-# compared <label>: some pair the run is in has lost no run (its cluster still feeds a comparison)
+# intact <pair>: neither of its runs failed as tooling
+intact() { local fa="FAILED_${1%%:*}" fb="FAILED_${1##*:}"; [[ "${!fa}" != "1" && "${!fb}" != "1" ]]; }
+# compared <label>: some pair the run is in has lost no run (its cluster still feeds a comparison);
+# the A/A replica feeds one only while a pair it calibrates is intact
 compared() {
-  local p a b fa fb
+  local p q
   for p in "${PAIR_LIST[@]}"; do
     in_pair "$1" "$p" || continue
-    fa="FAILED_${p%%:*}" fb="FAILED_${p##*:}"
-    [[ "${!fa}" == "1" || "${!fb}" == "1" ]] || return 0
+    intact "$p" || continue
+    is_replica "$p" || return 0
+    for q in "${PAIR_LIST[@]}"; do
+      if ! is_replica "$q" && intact "$q"; then return 0; fi
+    done
   done
   return 1
 }
@@ -334,7 +384,41 @@ trap - INT TERM HUP
 rank() { case "$1" in 1) echo 4 ;; 4) echo 2 ;; 0) echo 1 ;; *) echo 3 ;; esac; }
 vrc=0
 required=()
+# the A/A replica first: every other pair is judged against it (REPLICA_PAIR)
+if [[ -n "$REPLICA_PAIR" ]]; then
+  ra="${REPLICA_PAIR%%:*}" rb="${REPLICA_PAIR##*:}"
+  replica_cmd
+  da="DONE_$ra" db="DONE_$rb"
+  oa="OUT_$ra" ob="OUT_$rb"
+  if "${REPLICA_CMD[@]}" --completed "${!da}" "${!db}" > "$REPLICA_FILE"; then
+    required+=(--require "${REPLICA_FILE##*/}")
+  else
+    # a crash of the replica's own tool: the file is removed, and each pair's `custlat pair
+    # --replica` then cannot read it, so every other pair is INVALID with that reason
+    log "the A/A replica ${REPLICA_PAIR} could not be computed (exit $?): every other pair will be INVALID"
+    rm -f "$REPLICA_FILE"
+  fi
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && log "replica ${REPLICA_PAIR}: $r"
+  done < <(python3 -c 'import json, sys
+from bench import custlat
+try:
+    ir = json.load(open(sys.argv[1])).get("in_run") or {}
+except (OSError, ValueError):
+    ir = {}
+out = [ir.get("line") or "", *("NOT MEASURED: " + w for w in ir.get("why") or []),
+       *("NOTE: " + n for n in ir.get("notes") or [])]
+for lab, d in ((sys.argv[2], sys.argv[3]), (sys.argv[4], sys.argv[5])):
+    try:
+        rv = json.load(open(d + "/verdict.json"))
+    except (OSError, ValueError):
+        rv = None
+    for sec, missing in custlat.INFO_SECTIONS:
+        out += custlat.arm_info_lines(rv, sec, missing, lab + " (replica arm)")[1]
+print("\n".join(out))' "$REPLICA_FILE" "$ra" "${!oa}" "$rb" "${!ob}" 2>/dev/null || true)
+fi
 for p in "${PAIR_LIST[@]}"; do
+  is_replica "$p" && continue
   a="${p%%:*}" b="${p##*:}" f="$(verdict_file "$p")"
   pair_cmd "$p"
   da="DONE_$a" db="DONE_$b"
@@ -347,14 +431,17 @@ for p in "${PAIR_LIST[@]}"; do
   done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
 ex = (v.get("exclusion") or {}).get("items") or []
 print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
-                + ["INVALID: " + r for r in v["invalid_reasons"]] + ["NOTE: " + n for n in v.get("notes") or []]
+                + ["INVALID: " + r for r in v["invalid_reasons"]]
+                + [((v.get("replica_source") or {}).get("line") or "INFO replica: not said (a verdict before run 24)")]
+                + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
                 + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
                 + [r["line"] for r in v.get("b_inside_a_outage") or []]
                 + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
-                + ((v.get("tracing_report_only") or {}).get("lines") or [])
-                + ((v.get("egress_connections_report_only") or {}).get("lines") or [])))' \
+                + [ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
+                                "go_runtime_report_only", "user_buckets_report_only")
+                   for ln in (v.get(k) or {}).get("lines") or []]))' \
              "$f" 2>/dev/null || true)
   (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
 done

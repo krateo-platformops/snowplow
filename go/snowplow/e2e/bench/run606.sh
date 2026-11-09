@@ -820,6 +820,7 @@ s_up() {
   shape_msg="$(python3 -m bench.gke gke-shape --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
       --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" $YES 2>&1 >"$OUT/cluster-shape.jsonl")"
   log "$shape_msg"
+  node_platforms up
 }
 # write_installer_values: the installer's values for this run (the registry
 # preflight reads their features; s_install applies them). registryAuth is
@@ -984,6 +985,8 @@ s_cert_manager() {
 }
 s_install() {
   [[ -s "$OUT/installer-values.yaml" ]] || write_installer_values
+  # #1276: krateo-system before anything of the install exists in it
+  tracing_preinstall
   # registryAuth's Secret and the image-pull Secret, both created BEFORE the
   # install renders. The token (and the dockerconfigjson, built in-process)
   # goes through a pipe into kubectl's stdin: never argv, a variable, a log, a
@@ -1879,6 +1882,41 @@ tracing_reading() {
     log "could not record the tracing state ($phase): $(kerr_line); the verdict will say it is UNKNOWN"
   fi
 }
+# tracing_preinstall (#1276): BEFORE the install step creates anything in krateo-system, whether
+# a snowplow pod exists and the NAMES of the namespace's ConfigMaps (nothing else of them), into
+# $OUT/tracing.json. An optional envFrom ConfigMap absent then and absent at a reading held
+# nothing when the container started (bench/tracing.py); without this reading it stays UNKNOWN.
+tracing_preinstall() {
+  local line
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.tracing read --phase preinstall --out $OUT/tracing.json -- ${K[*]} (krateo-system: snowplow pods, ConfigMap names)"
+    return 0
+  fi
+  if line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.tracing read --phase preinstall --out "$OUT/tracing.json" \
+               --selector "$SNOWPLOW_POD_SELECTOR" --timeout-s "$COLLECT_TIMEOUT_S" -- "${K[@]}" 2>"$KERR")"; then
+    log "tracing ($line)"
+  else
+    log "could not take the pre-install reading: $(kerr_line); an absent optional ConfigMap will read UNKNOWN"
+  fi
+}
+# node_platforms <up|collect> (run 24): every node's CPU platform — kubectl's node list (pool,
+# zone, machine type labels) and, per node, its GCE instance's cpuPlatform (gcloud compute
+# instances describe, projected to the platform fields) — one record appended to
+# $OUT/cluster-shape-nodes.jsonl, which evaluate reads with the cluster's shape (INFO, never
+# judged). Run 23's load-generator nodes ran 11 % apart on one machine type, and nothing said why.
+node_platforms() {
+  local phase="$1" line
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.nodes read --phase $phase --project $PROJECT --out $OUT/cluster-shape-nodes.jsonl -- ${K[*]} (kubectl get nodes; gcloud compute instances describe per node)"
+    return 0
+  fi
+  if line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.nodes read --phase "$phase" --project "$PROJECT" \
+               --out "$OUT/cluster-shape-nodes.jsonl" --timeout-s "$COLLECT_TIMEOUT_S" -- "${K[@]}" 2>"$KERR")"; then
+    log "$line"
+  else
+    log "could not record the node CPU platforms ($phase): $(kerr_line); the verdict will say they are UNKNOWN"
+  fi
+}
 # start_sampler <kind> <file> <kubectl args...> (#919): every TOP_POLL_S, one
 # kubectl read of the bench cluster, one record in <file> (bench/sampler.py).
 # Each sample is bounded by its period — kubectl's own --request-timeout and
@@ -2054,6 +2092,7 @@ s_collect() {
   done
   snowplow_pod_record after
   tracing_reading after
+  node_platforms collect
   # #1089: the netns606 samples (the TCP path under snowplow), report only;
   # flushed per line, so a copy at any moment holds whole samples
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=netns606 -o name); do
@@ -2211,7 +2250,8 @@ s_evaluate() {
   while IFS= read -r r; do
     [[ -n "$r" ]] && log "$r"
   done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
-print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
+print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
+                             "go_runtime_report_only", "user_buckets_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever
   # it is. Without this the loop's last `[[ -n "" ]]` (no warnings) was the

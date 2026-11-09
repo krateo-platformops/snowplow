@@ -58,6 +58,17 @@ rule rests on the offset argument, not on these numbers. B's own spread (or
 B / A per segment) is the instrument under test: a noisier candidate would
 loosen its own bar.
 
+The in-run replica (run 24, Diego 2026-11-09): a launch may run an A/A pair
+(one image on two clusters, run606_pair.sh REPLICA_PAIR) beside the pairs it
+calibrates. Its replica is `custlat replica --in-run` (replica_in_run): the
+same replica_ratios over the same report_from_dir as the committed file,
+measured on this launch's schedule, so every phase has its between-run term,
+steady included. It replaces the committed file for every other pair of the
+launch (never merged with it); the verdict says which source it used
+(replica_source). An A/A pair whose arms are not proven to be one image, or
+whose own measurement is void, holds no phase: the cells fall back to the
+no-replica rule above, said in a NOTE.
+
 Restarts and Ready time (run 15: both arms OOMKilled twice; team lead
 2026-10-24):
   - any snowplow restart (or pod replacement) in B, the candidate, FAILs the
@@ -872,6 +883,54 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
             "page_loads_by_phase": page_loads_by_phase(browser, k6o, pooled(wins))}
 
 
+#: navigate.js's per-request tag: the user's id range ("201-300"), beside k6's own `scenario`
+USER_BUCKET_TAG = "ub"
+
+
+def user_bucket_report(k6o: dict | None, windows) -> dict:
+    """Run 24, INFO only: k6's customer calls per gate phase split by who made them — k6's
+    `scenario` tag and navigate.js's user bucket (`ub`, a user-id range) — with n, p95 and p99
+    (the gate's own percentile, _pct). The judged cells pool every tag (calls()); this split never
+    feeds them. A call without the bucket tag (a stream from before run 24) is counted under
+    "untagged", never dropped. `windows`: the run's customer_latency windows."""
+    if not k6o:
+        return {"result": "INFO", "state": "ABSENT", "why": "no k6 stream",
+                "lines": ["INFO k6 calls by user bucket: ABSENT (no k6 stream)"]}
+    ts = (k6o.get("times") or {}).get("http_req_duration") or []
+    wins = pooled([(n, w0, w1) for n, w0, w1 in windows or []])
+    groups: dict[str, dict[tuple[str, str], list[float]]] = {}
+    untagged = 0
+    for i, (v, tags) in enumerate((k6o.get("points") or {}).get("http_req_duration") or []):
+        if i >= len(ts) or ts[i] is None or v is None:
+            continue
+        ub = (tags or {}).get(USER_BUCKET_TAG)
+        untagged += ub is None
+        key = ((tags or {}).get("scenario") or "?", ub or "untagged")
+        groups.setdefault(_phase(ts[i], wins), {}).setdefault(key, []).append(v)
+
+    def first_id(k):
+        try:
+            return (k[0], int(k[1].split("-", 1)[0]))
+        except ValueError:
+            return (k[0], 1 << 30)
+    phases = {}
+    lines = []
+    for p in [n for n in dict.fromkeys(n for n, _, _ in wins)] + [STEADY]:
+        g = groups.get(p)
+        if not g:
+            continue
+        rows = [{"scenario": sc, "users": ub, "n": len(xs), "p95_ms": round(_pct(xs, 95), 1),
+                 "p99_ms": round(_pct(xs, 99), 1)} for (sc, ub), xs in sorted(g.items(), key=lambda kv: first_id(kv[0]))]
+        phases[p] = rows
+        lines.append(f"INFO k6 calls by user bucket, {p}: " + "; ".join(
+            f"{r['scenario']} users {r['users']} n {r['n']} p95 {r['p95_ms']} p99 {r['p99_ms']}" for r in rows))
+    if untagged:
+        lines.append(f"INFO k6 calls by user bucket: {untagged} call(s) carry no '{USER_BUCKET_TAG}' tag "
+                     f"(a k6 script before run 24): counted as 'untagged'")
+    return {"result": "INFO", "tag": USER_BUCKET_TAG, "untagged": untagged, "phases": phases,
+            "lines": lines or ["INFO k6 calls by user bucket: no timed call"]}
+
+
 # the page goal (#710 ruling, the north-star): p95 <= 3 s, max <= 10 s, the
 # login storm included
 PAGE_P95_GOAL_MS, PAGE_MAX_GOAL_MS = 3000.0, 10000.0
@@ -1159,7 +1218,11 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                                     "from a t quantile on the kept block pairs - 1; INCONCLUSIVE between; "
                                     "B's stretches its sampler could not see (no restart signal): k6 is the "
                                     "witness",
-                      "replica": (replica or {}).get("provenance")}}
+                      "replica": (replica or {}).get("provenance"),
+                      # run 24: where the between-run term comes from (the committed file, or an
+                      # A/A pair of the same launch: replica_in_run)
+                      "replica_source": _replica_source(replica)}}
+    out["replica_source"] = out["method"]["replica_source"]
     # ── restarts: B's FAIL the pair; A's are recorded (module doc) ──
     rs = {x: ((rd or {}).get("restarts") or {}) for x, rd in (("a", rda), ("b", rdb))}
     out["restarts"] = rs
@@ -1199,6 +1262,10 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
             raw_cache[x] = rw if same else None
         return raw_cache[x]
     notes = []
+    src = out["replica_source"]
+    if src["kind"] == "in_run" and not src["usable"]:
+        notes.append(f"the in-run replica {src['pair']} could not be measured ({'; '.join(src['why'])}): no "
+                     f"cell has a between-run term, so none can FAIL; past the within-run bar is INCONCLUSIVE")
     if rs["a"].get("restarted"):
         lta = rs["a"].get("last_termination") or {}
         notes.append(f"A (the baseline) restarted {rs['a'].get('count')}x during measure"
@@ -1670,6 +1737,115 @@ def replica_ratios(r1: dict, r2: dict, provenance: dict) -> dict:
     return {"schema": "customer_latency_replica/1", "provenance": provenance, "phases": phases}
 
 
+def _replica_source(replica: dict | None) -> dict:
+    """Run 24: where the pair's between-run term comes from, said in the verdict: none, the
+    committed replica file (runs 12/13), or an A/A pair measured in the SAME launch
+    (replica_in_run: `custlat replica --in-run`)."""
+    if replica is None:
+        return {"kind": "none", "usable": False, "why": ["no replica was given"],
+                "line": "INFO replica: none given: no cell has a between-run term"}
+    ir = replica.get("in_run")
+    phases = sorted(replica.get("phases") or {})
+    if ir is None:
+        dirs = [p.get("dir") for p in replica.get("provenance") or [] if isinstance(p, dict)]
+        return {"kind": "file", "usable": True, "phases": phases, "dirs": dirs,
+                "line": f"INFO replica: the committed file ({', '.join(str(d) for d in dirs)}), "
+                        f"phases {', '.join(phases) or 'none'}"}
+    ok = ir.get("usable") is True
+    terms = "; ".join(f"{p} " + ", ".join(f"{m} {v}" for m, v in sorted((replica["phases"][p] or {}).items()))
+                      for p in phases)
+    return {"kind": "in_run", "usable": ok, "pair": ir.get("pair"), "image_digest": ir.get("image_digest"),
+            "phases": phases, "why": list(ir.get("why") or []),
+            "line": (f"INFO replica: in-run A/A pair {ir.get('pair')} ({ir.get('image_digest')}), measured in "
+                     f"this launch: {terms or 'no phase both arms measured'}" if ok else
+                     f"INFO replica: in-run A/A pair {ir.get('pair')} NOT measured ("
+                     f"{'; '.join(ir.get('why') or [])}): no cell has a between-run term")}
+
+
+IMAGE_DIGEST_CHECK = "snowplow.image_digest"
+
+
+def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
+                   completed: tuple[bool | None, bool | None] = (None, None)) -> dict:
+    """Run 24: the replica of an A/A pair run in the SAME launch as the pairs it calibrates (two
+    clusters, one image), so their between-run term is measured on this schedule, steady included.
+
+    The ratios are replica_ratios over report_from_dir of each run dir: exactly `custlat replica`,
+    the code that wrote customer_latency_replica_runs12_13.json (per gate phase both runs
+    measured, exp(|log(run 1 / run 2)|) per metric, over each run's whole phase). Nothing new is
+    computed.
+
+    What the launch declared is checked before the ratios count. Each failure is said, and the
+    replica then holds no phase: no cell of the pairs it calibrates has a between-run term, so
+    none can FAIL (custlat's no-replica rule, #1053):
+      - both runs' evaluate step ran (`completed`);
+      - both ran `digest`: each verdict's expected image digest is it and its own
+        snowplow.image_digest check PASSed (the pods ran that image);
+      - neither run's own verdict is INVALID (any reason: no pair judges a replica arm's k6
+        errors or restarts for it), and neither snowplow restarted nor was not Ready during the
+        measure (_candidate, as for a pair's candidate: snowplow said not Ready, or did not answer
+        readyz): the ratios are over whole phases, so a recovery would be measured as if it were
+        the cluster-to-cluster spread. A readiness-sampler gap between two Ready samples with no
+        restart signal is noted, not disqualifying (in_run.notes)."""
+    provs = [_provenance(d) for d in dirs]
+    why: list[str] = []
+    notes: list[str] = []
+    for d, c, pv, x in zip(dirs, completed, provs, ("1st", "2nd"), strict=True):
+        try:
+            with open(os.path.join(d, "verdict.json")) as fh:
+                v = json.load(fh)
+        except (OSError, ValueError):
+            v = None
+        name = pv.get("dir")
+        if c is not True:
+            why.append(f"{x} run ({name}): its evaluate step did not run" if c is False else
+                       f"{x} run ({name}): whether its evaluate step ran is not known")
+        if not isinstance(v, dict):
+            why.append(f"{x} run ({name}): no readable verdict.json")
+            continue
+        if pv.get("image_digest") != digest:
+            why.append(f"{x} run ({name}): its verdict expected {pv.get('image_digest')}, the A/A pair "
+                       f"declares {digest}")
+        dc = next((ck for ck in v.get("validity") or [] if ck.get("check") == IMAGE_DIGEST_CHECK), None)
+        if (dc or {}).get("result") != "PASS":
+            why.append(f"{x} run ({name}): its own {IMAGE_DIGEST_CHECK} check is "
+                       f"{(dc or {}).get('result') or 'missing'}: which image ran is not proven")
+        if v.get("verdict") not in COMPARABLE_VERDICTS:
+            fails = [f"{ck.get('check')}: {ck.get('why') or ck.get('value')}" for ck in v.get("validity") or []
+                     if ck.get("result") == "FAIL"]
+            why.append(f"{x} run ({name}): its own verdict is {v.get('verdict')!r}"
+                       + (f" ({'; '.join(fails)})" if fails else "") + ": its measurement cannot calibrate")
+        cand = _candidate(v)
+        if cand["restarted"]:
+            why.append(f"{x} run ({name}): snowplow restarted {cand['count']}x during the measure")
+        # not Ready: snowplow said so, or did not answer readyz at all; a sampler gap between two
+        # Ready samples with no restart signal is the sampler's, said but not disqualifying
+        gone = cand["not_ready"] + [e for e in cand["witness"] if e.get("kind") == "not_ready"]
+        if gone:
+            why.append(f"{x} run ({name}): snowplow was not Ready (or did not answer readyz) for "
+                       f"{round(sum(float(e.get('seconds') or 0) for e in gone), 1)} s during the measure")
+        gaps = [e for e in cand["witness"] if e.get("kind") == "gap"]
+        if gaps:
+            notes.append(f"{x} run ({name}): its readiness sampler saw nothing for "
+                         f"{round(sum(float(e.get('seconds') or 0) for e in gaps), 1)} s between Ready samples "
+                         f"(no restart signal)")
+    if provs[0].get("image_digest") != provs[1].get("image_digest"):
+        why.append(f"the two runs ran different images ({provs[0].get('image_digest')} vs "
+                   f"{provs[1].get('image_digest')}): not an A/A pair")
+    out = {"schema": "customer_latency_replica/1", "provenance": provs, "phases": {}}
+    if not why:
+        try:
+            out = replica_ratios(report_from_dir(dirs[0]), report_from_dir(dirs[1]), provs)
+        except Exception as e:  # noqa: BLE001 — an unmeasurable replica is said, never a crash
+            why.append(f"the replica ratios could not be computed: {type(e).__name__}: {e}")
+    out["in_run"] = {"pair": label, "image_digest": digest, "usable": not why, "why": why, "notes": notes,
+                     "method": "custlat.replica_ratios(report_from_dir(run 1), report_from_dir(run 2)), "
+                               "as `custlat replica` wrote customer_latency_replica_runs12_13.json: per gate "
+                               "phase both runs measured, exp(|log(run 1 / run 2)|) per metric"}
+    out["in_run"]["line"] = _replica_source(out)["line"]
+    return out
+
+
 def load_replica(path: str) -> dict:
     with open(path) as fh:
         r = json.load(fh)
@@ -1740,13 +1916,27 @@ def info_lines_pair(va: dict | None, vb: dict | None, section: str, missing: str
     out: dict = {"result": "INFO", "lines": []}
     for x, v in (("a", va), ("b", vb)):
         role = f"{labels[0]} (baseline)" if x == "a" else f"{labels[1]} (candidate)"
-        r = ((v or {}).get("report") or {}).get(section)
-        out[x] = r if r is not None else {"state": missing,
-                                          "why": f"the run's verdict.json has no {section} "
-                                                 f"(an evaluate before run 23's report)"}
-        out["lines"] += ([f"{role}: {ln}" for ln in r.get("lines") or []] if r is not None else
-                         [f"{role}: INFO {section}: {missing} ({out[x]['why']})"])
+        out[x], lines = arm_info_lines(v, section, missing, role)
+        out["lines"] += lines
     return out
+
+
+def arm_info_lines(v: dict | None, section: str, missing: str, role: str) -> tuple[dict, list[str]]:
+    """One run's report section `section` and its lines prefixed with `role` (info_lines_pair; the
+    launcher's A/A replica arms, run 24). Absent: `missing` with why, never off or 0."""
+    r = ((v or {}).get("report") or {}).get(section)
+    if r is None:
+        r = {"state": missing, "why": f"the run's verdict.json has no {section} (an evaluate that predates the section)"}
+        return r, [f"{role}: INFO {section}: {missing} ({r['why']})"]
+    return r, [f"{role}: {ln}" for ln in r.get("lines") or []]
+
+
+#: the per-arm report-only sections a paired verdict shows (each with the state a verdict that
+#: predates it reads as): run 23's tracing and egress reuse; run 24's node CPU platforms, Go runtime
+#: settings and k6 calls per user bucket
+INFO_SECTIONS = (("tracing_report_only", "UNKNOWN"), ("egress_connections_report_only", "ABSENT"),
+                 ("nodes_report_only", "UNKNOWN"), ("go_runtime_report_only", "UNKNOWN"),
+                 ("user_buckets_report_only", "ABSENT"))
 
 
 def _unmeasured_section() -> dict:
@@ -1773,10 +1963,22 @@ def main(argv: list[str] | None = None) -> int:
                              f"is excluded); default: the directory of --{x}")
     rp = sub.add_parser("replica", help="the replica ratios of two collected run dirs")
     rp.add_argument("dirs", nargs=2)
+    rp.add_argument("--in-run", default=None, metavar="L1:L2",
+                    help="run 24: the two dirs are an A/A pair of this launch (labels L1:L2), checked "
+                         "(replica_in_run) before its ratios count")
+    rp.add_argument("--expect-digest", default=None, help="--in-run: the one image both runs were launched with")
+    rp.add_argument("--completed", type=int, nargs=2, choices=(0, 1), default=None,
+                    help="--in-run: 1 when each run's evaluate step ran")
     a = ap.parse_args(argv)
     if a.cmd == "replica":
-        out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
-                             [_provenance(d) for d in a.dirs])
+        if a.in_run is not None:
+            if not a.expect_digest:
+                ap.error("replica --in-run needs --expect-digest")
+            done = (None, None) if a.completed is None else (bool(a.completed[0]), bool(a.completed[1]))
+            out = replica_in_run((a.dirs[0], a.dirs[1]), a.in_run, a.expect_digest, done)
+        else:
+            out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
+                                 [_provenance(d) for d in a.dirs])
         json.dump(out, sys.stdout, indent=1, sort_keys=True)
         print()
         return 0
@@ -1818,7 +2020,8 @@ def main(argv: list[str] | None = None) -> int:
         out["refresher_tiers_report_only"] = {"error": f"{type(e).__name__}: {e}",
                                               "lines": [f"refresher tiers: report failed: {type(e).__name__}: {e}"]}
     # run 23: was each image tracing (bench/tracing.py), and its connection reuse per egress (#1189)
-    for section, missing in (("tracing_report_only", "UNKNOWN"), ("egress_connections_report_only", "ABSENT")):
+    # run 24: each arm's node CPU platforms, snowplow's Go runtime settings, k6's calls per user bucket
+    for section, missing in INFO_SECTIONS:
         try:
             out[section] = info_lines_pair(va, vb, section, missing, (a.a_label, a.b_label))
         except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
