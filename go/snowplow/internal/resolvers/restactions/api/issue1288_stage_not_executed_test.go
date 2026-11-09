@@ -24,7 +24,15 @@ package api
 //   - N5 the same for a background resolve (the refresher origin);
 //   - N6 the classifier is a property of the reason: every declared code has
 //     a class, and only StageNotExecuted and WriteRefused are deliberate (the
-//     S5 arm reads the declared constants and fails on an unclassified one).
+//     S5 arm reads the declared constants and fails on an unclassified one);
+//     every code fail() can record is ranked (else fail() folds it to Error),
+//     the orchestrator-only codes are not, and WriteRefused ranks below every
+//     failure code;
+//   - N7 (review F1) a write stage with one item the plan refused
+//     (InvalidPath) and one the export / refresher refused reads InvalidPath,
+//     counts in failed, and its dependent is Skipped;
+//   - N8 (review F2) a write iterating a refused stage's output has zero items:
+//     it succeeds, unlisted, and nothing is sent.
 
 import (
 	"context"
@@ -34,6 +42,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
@@ -174,5 +183,101 @@ func TestIssue1288_N6_TheClassIsAPropertyOfTheReason(t *testing.T) {
 	}
 	if stageNotExecutedByDesign("") || stageNotExecutedByDesign(StageReasonOther) {
 		t.Fatal("an empty or unknown reason must never read as a deliberate non-execution")
+	}
+
+	// Review F1 — the rank map. Every classified code that fail() records must
+	// be ranked (a classified code missing there is folded to Error by fail(),
+	// so it could never reach the header), with a positive rank (0 is a stage
+	// that recorded nothing). The orchestrator's own codes (recorded by skip(),
+	// HeaderValue, abortedResolve: never by fail()) must NOT be ranked, so no
+	// item can record them. And WriteRefused ranks below every failure code.
+	orchestrator := map[string]bool{StageReasonSkipped: true, StageReasonNotRun: true, StageReasonAborted: true}
+	for n, c := range s1264ReasonTable(t) {
+		rank, ranked := reasonRank[c.code]
+		if orchestrator[c.code] {
+			if ranked {
+				t.Errorf("%s is recorded only by the orchestrator, yet ranked %d: fail() could record it", n, rank)
+			}
+			continue
+		}
+		if !ranked || rank <= 0 {
+			t.Errorf("%s (%q) is classified but has rank %d (ranked=%v): fail() would fold it to Error", n, c.code, rank, ranked)
+			continue
+		}
+		o := newStageOutcomes()
+		o.register([]string{"s"})
+		o.fail("s", c.code)
+		if got := o.reasonOf("s"); got != c.code {
+			t.Errorf("fail(%s) recorded %q, want %q", n, got, c.code)
+		}
+		if !c.notExecuted && rank <= reasonRank[StageReasonWriteRefused] {
+			t.Errorf("failure %s ranks %d, not above WriteRefused's %d: a mixed stage would hide it", n, rank, reasonRank[StageReasonWriteRefused])
+		}
+	}
+	for code := range reasonRank {
+		if _, ok := stageReasonClasses[code]; !ok {
+			t.Errorf("ranked code %q has no class", code)
+		}
+	}
+}
+
+// n1288Marks is the export and the refresher mode, each a non-customer resolve.
+var n1288Marks = []struct {
+	name string
+	mark func(context.Context) context.Context
+}{
+	{"export", cache.WithExportRead},
+	{"refresher", func(ctx context.Context) context.Context {
+		return cache.WithBackgroundResolveOrigin(ctx, cache.BackgroundOriginRefresher)
+	}},
+}
+
+// N7 (review F1) — a write stage whose iterator yields one item the plan
+// refuses (an empty id renders an empty path segment: InvalidPath) and one
+// valid item (refused by the export / background rule) FAILED: it reads
+// InvalidPath, counts in failed, and blocks its dependent write (Skipped).
+func TestIssue1288_N7_AMixedStageReadsItsFailureNotWriteRefused(t *testing.T) {
+	for _, m := range n1288Marks {
+		t.Run(m.name, func(t *testing.T) {
+			u := u904NewUpstream(t, map[string]u904Route{
+				"GET /cloudservers/s1": {http.StatusOK, `{"id":"s1","volumes":[{"id":"v1"},{"id":""}]}`},
+			})
+			res := n1288Resolve(t, u, u904IteratorLifecycle(), m.mark)
+			if got := u.writes(); got != 0 {
+				t.Fatalf("%s sent %d write(s) (counts=%v)", m.name, got, u.count)
+			}
+			res.wantSucceeded(t, "server")
+			res.wantRow(t, u904Row{Name: "detach", Reason: StageReasonInvalidPath})
+			res.wantRow(t, u904Row{Name: "remove", Reason: StageReasonSkipped, DependsOn: "detach"})
+			n1288Want(t, m.name+" header "+res.raw, s1264Summary(t, res.raw), 2, 0,
+				StageReasonInvalidPath, StageReasonSkipped)
+		})
+	}
+}
+
+// N8 (review F2) — a write that ITERATES the refused stage's output has zero
+// items: nothing to send, so it succeeds and is not listed (the #904 zero-item
+// rule). It reads neither WriteRefused nor Skipped, and nothing is sent.
+func TestIssue1288_N8_AnIteratorOverARefusedStageHasNothingToSend(t *testing.T) {
+	for _, m := range n1288Marks {
+		t.Run(m.name, func(t *testing.T) {
+			u := u904NewUpstream(t, map[string]u904Route{
+				"GET /cloudservers/s1": {http.StatusOK, `{"id":"s1"}`},
+			})
+			remove := u904Stage("remove", http.MethodDelete, `${ "/cloudservers/s1/items/" + .id }`)
+			remove.DependsOn = &templates.Dependency{Name: "detach", Iterator: ptr.To(".detach.items")}
+			stages := []*templates.API{
+				u904Stage("server", http.MethodGet, "/cloudservers/s1"),
+				u904After(u904Stage("detach", http.MethodPost, "/cloudservers/s1/detach"), "server"),
+				remove,
+			}
+			res := n1288Resolve(t, u, stages, m.mark)
+			if got := u.writes(); got != 0 {
+				t.Fatalf("%s sent %d write(s) (counts=%v)", m.name, got, u.count)
+			}
+			res.wantRow(t, u904Row{Name: "detach", Reason: StageReasonWriteRefused})
+			res.wantSucceeded(t, "server", "remove")
+			n1288Want(t, m.name+" header "+res.raw, s1264Summary(t, res.raw), 0, 1)
+		})
 	}
 }

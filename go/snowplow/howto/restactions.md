@@ -277,8 +277,12 @@ Each stage ends in exactly one outcome:
 - **not executed**: a write stage snowplow did not send on purpose, because
   of what the request is: a dry run (`StageNotExecuted`), an export or
   background work (`WriteRefused`). It does not block its dependent writes:
-  they are not sent for the same reason, and report the same reason, never
-  `Skipped`. So `Skipped` always follows a real failure.
+  they are not sent for the same reason and report the same reason, never
+  `Skipped`, unless the dependent's `iterator` runs over the refused stage's
+  output, which then yields zero items: it has nothing to send and succeeds
+  (not listed). So `Skipped` always follows a real failure. A write stage
+  with an item that failed on its own (`InvalidPath`, `TemplateError`) as
+  well as refused items reads that failure, not `WriteRefused`.
 
 Example: a delete lifecycle where `delete.dependsOn` is `detachVolumes`
 (an iterator over the server's data volumes), and `delete` has no

@@ -117,7 +117,11 @@ item of an iterator stage, and whatever the stage's `continueOnError`:
   did not succeed (as `/call` reports them), and the refused write stage
   is listed there with reason `WriteRefused` (before #1288 it read the
   generic `Error`). A write stage that depends on it is refused the same
-  way and listed with `WriteRefused` too, not `Skipped`. The merged value keeps the header's 4 KiB bound: above
+  way and listed with `WriteRefused` too, not `Skipped`, unless its
+  `iterator` runs over the refused stage's output: that yields zero items,
+  so it has nothing to send and is not listed. A write stage with an item
+  that failed on its own (`InvalidPath`, `TemplateError`) reads that
+  failure, not `WriteRefused`. The merged value keeps the header's 4 KiB bound: above
   it, or when a page already sent the summary, it is
   `{"truncated":true,"failed":N}`, with `N` the number of distinct
   outcomes the pages listed (or a summarised page's own `N`, when larger);

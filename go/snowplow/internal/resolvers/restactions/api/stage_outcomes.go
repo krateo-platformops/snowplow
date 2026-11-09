@@ -140,21 +140,26 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
-	// #1288: a deliberate refusal applies to every write item of the stage,
-	// so it outranks whatever else an item recorded, as StageNotExecuted
-	// always did. The two never meet: a dry run refuses before the export or
-	// background check (dispatchOneCall).
-	StageReasonWriteRefused:       11,
-	StageReasonNotExecuted:        10,
-	StageReasonForbidden:          9,
-	StageReasonUnauthorized:       8,
-	StageReasonNotFound:           7,
-	StageReasonInvalidPath:        6,
-	StageReasonDestinationRefused: 5,
-	StageReasonTemplateError:      4,
-	StageReasonTimeout:            3, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:            2,
-	StageReasonError:              1,
+	// The #443 dry-run refusal outranks every failure: a dry run reports
+	// StageNotExecuted for its write stages (#443 k, a stable contract).
+	StageReasonNotExecuted:        11,
+	StageReasonForbidden:          10,
+	StageReasonUnauthorized:       9,
+	StageReasonNotFound:           8,
+	StageReasonInvalidPath:        7,
+	StageReasonDestinationRefused: 6,
+	StageReasonTemplateError:      5,
+	StageReasonTimeout:            4, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:            3,
+	StageReasonError:              2,
+	// #1288: an export's or background work's refusal ranks BELOW every
+	// failure (and above 0, the "" of a stage that recorded nothing). Items
+	// the plan refuses (InvalidPath, TemplateError: failRefusedItems) are
+	// recorded before dispatch and never reach the refusal, so a write stage
+	// with one such item and one refused item FAILED: it reads that failure,
+	// and blocks its dependents. A stage whose every item was refused reads
+	// WriteRefused.
+	StageReasonWriteRefused: 1,
 }
 
 type stageOutcome struct {
@@ -310,9 +315,10 @@ func (s *StageOutcomes) skip(name, dependsOn string) {
 // StageNotExecuted, #443 k; an export or background refusal, WriteRefused,
 // #1288) does not block. It is not an outcome of the stage's own call (a
 // customer's real run would have sent it), and the same rule refuses the
-// dependent write for the same reason, so the dependent reports that reason,
-// never Skipped: Skipped only ever follows a failure. A name that is not a
-// stage of this resolve never blocks.
+// dependent write for the same reason, so the dependent reports that reason
+// (or, when its iterator runs over the refused stage's output, yields zero
+// items and succeeds), never Skipped: Skipped only ever follows a failure. A
+// name that is not a stage of this resolve never blocks.
 func (s *StageOutcomes) blocksDependentWrite(name string) bool {
 	if s == nil {
 		return false

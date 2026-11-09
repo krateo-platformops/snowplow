@@ -36,7 +36,11 @@
 // deliberate non-execution: it is listed in X-Snowplow-Stage-Outcomes (the
 // stage did not succeed) and is not counted in the Server span's
 // snowplow.stages.failed. A write that depends on a refused write is not
-// Skipped: it is refused too, for the same reason (blocksDependentWrite).
+// Skipped (blocksDependentWrite): it is planned and refused too, for the same
+// reason, unless its iterator runs over the refused stage's output, which
+// yields zero items: it then has nothing to send and succeeds (not listed).
+// WriteRefused ranks below every failure, so a stage that also has an item
+// the plan refused (InvalidPath, TemplateError) reads that failure.
 package api
 
 import (
