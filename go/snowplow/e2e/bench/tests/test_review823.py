@@ -185,7 +185,8 @@ def test_mem_stop_is_bounded_by_wall_clock_with_slow_execs(harness):
     log = (tmp / "out" / "run.log").read_text()
     assert "mem606-0 did not end its stream within 6s" in log
     calls = [json.loads(x) for x in (state / "calls.jsonl").read_text().splitlines()]
-    waits = [c for c in calls if c["argv"][-3:] == ["test", "-f", "/out/exited"]]
+    # mem606's own waits (#1297: the observer's collect asks its pod the same question)
+    waits = [c for c in calls if c["argv"][-3:] == ["test", "-f", "/out/exited"] and "mem606-0" in c["argv"]]
     assert 1 <= len(waits) <= 2, len(waits)          # 19 s of execs would be 3
     assert p.returncode == 0
 
