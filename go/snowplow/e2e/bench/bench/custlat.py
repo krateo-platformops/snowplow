@@ -1933,10 +1933,10 @@ def arm_info_lines(v: dict | None, section: str, missing: str, role: str) -> tup
 
 #: the per-arm report-only sections a paired verdict shows (each with the state a verdict that
 #: predates it reads as): run 23's tracing and egress reuse; run 24's node CPU platforms, Go runtime
-#: settings and k6 calls per user bucket
+#: settings and k6 calls per user bucket; snowplow #1284's resolve memo lookups and would-joins
 INFO_SECTIONS = (("tracing_report_only", "UNKNOWN"), ("egress_connections_report_only", "ABSENT"),
                  ("nodes_report_only", "UNKNOWN"), ("go_runtime_report_only", "UNKNOWN"),
-                 ("user_buckets_report_only", "ABSENT"))
+                 ("user_buckets_report_only", "ABSENT"), ("resolve_memo_report_only", "ABSENT"))
 
 
 def _unmeasured_section() -> dict:
