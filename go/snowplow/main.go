@@ -142,14 +142,19 @@ func snowplowCORSOptions() cors.Options {
 //     bytes while the span still measures the whole request.
 //     text/event-stream (GET /refreshes) is excluded so the SSE stream keeps
 //     its per-event flush (T2-2); non-gzip clients are byte-identical.
-//   - slowcall.Body is INNERMOST: it times the handler's writes into the
-//     compressor, so a slow record splits compression from the network write.
-//     A pass-through on a request without a record.
+//   - slowcall.Body times the handler's writes into the compressor, so a
+//     slow record splits compression from the network write. A pass-through
+//     on a request without a record.
+//   - dispatchers.StageOutcomesSpan is INNERMOST, around the route table
+//     (#1264): when the handler returns it copies the response's
+//     X-Snowplow-Stage-Outcomes (count and reason codes, no names) onto the
+//     Server span, so a 200 whose stages failed is visible to the tail
+//     sampler. A response without the header gets nothing.
 //
 // It is a function so the composition the pod serves is the one the tests
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
-	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(mux))), mux))
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux)))), mux))
 }
 
 // newRUMIngest returns #1015's ingest, with its forwarder's worker running

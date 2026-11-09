@@ -74,7 +74,9 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   `<METHOD>` for a request no route serves), `http.route` = the templated mux
   pattern (never the raw path; `url.path` is dropped from Server spans at
   export), `http.request.method`, `http.response.status_code`, status `Error`
-  only for 5xx. `/health`, `/readyz`, `/debug/*` and the browser RUM upload
+  only for 5xx. A response that carries `X-Snowplow-Stage-Outcomes` also puts
+  `snowplow.stages.failed` and `snowplow.stages.failure_reasons` on its span
+  (#1264, see [Stage outcomes on the Server span](#stage-outcomes-on-the-server-span-1264)). `/health`, `/readyz`, `/debug/*` and the browser RUM upload
   `POST /telemetry/v1/traces` (#1020 D6: telemetry about the portal, not
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
   see `howto/rum-ingest.md`) get no span. Sampled at
@@ -246,6 +248,24 @@ Defined in `internal/handlers/dispatchers/customer_serves.go`; on OTLP in `inter
 Every cell is pre-populated: a `0` is a reading. Scope of the expiry causes: a cell that left the store before the lookup (LRU, DELETE eviction, or an expiry an internal read or the reaper already applied) reads `no_cell`, so `expired_ttl` is a lower bound on TTL-caused cold serves.
 
 **The response header and the span.** A counted response that reached the serve decision carries `X-Snowplow-Serve-Outcome: fresh|stale|cold`, set before the first byte (exposed through CORS like `X-Snowplow-Refresh-Key`; the SPA ignores it; the bench reads it per navigation). Its server span carries `snowplow.serve.outcome` and, on a cold serve, `snowplow.serve.cold_cause` (distinct from #1264's `snowplow.stages.*`). Neither carries identity, a key, a resource name or a body. A refused response and an uncounted one carry neither, so the header and the counter describe the same population.
+
+### Stage outcomes on the Server span (#1264)
+Defined in `internal/handlers/dispatchers/stage_outcomes_span.go` (the wrapper `main.go` `newServerHandler` puts around the route table) and `internal/resolvers/restactions/api/stage_outcomes_summary.go` (the parser).
+
+A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure is in the body (under each stage's `errorKey`) and in `X-Snowplow-Stage-Outcomes`. Its Server span keeps status **Unset** (semconv: a 200 is not an error), and usually has no failing child span, so a tail sampler that keeps error traces would miss it. The span therefore carries what the header says:
+
+| attribute | type | value |
+|---|---|---|
+| `snowplow.stages.failed` | int | the number of entries the header lists: every stage that did not succeed (failed, skipped, not run, refused by a dry run) plus the resolve-level `Aborted` row. **`0`** when the header is `[]` (every stage succeeded): set, not omitted, so a 0 reads "the resolve reported success" and absence reads "this response had no stage outcomes". For the truncated summary `{"truncated":true,"failed":N}` it is N. Observability's sampler keeps a trace on `snowplow.stages.failed > 0` |
+| `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of those entries, sorted (byte order), from the header's closed set: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `StageNotExecuted`, `TemplateError`, `Timeout`, `Unauthorized`. Any other value is folded to **`other`**, never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
+
+**Which responses.** Exactly those whose header carries the outcomes: a RESTAction `/call` (GET, `POST /call/read`, an inline draft), cold or an L1 hit, and an `/export` (the outcomes its pages merged into its own header). The values are read from the response's final header when the handler returns, so they always match what the client was sent; a withdrawn stale pass (#710) reports its re-run's. A response without the header gets neither attribute: a widgets `/call`, every other route, a request refused before its resolve. An export's per-page re-dispatch and a #547 demand revalidation write into their own recorders, never through the wrapper, so they cannot overwrite the span.
+
+**Cache hits.** A hit answers with the header the resolve that stored the cell produced, which every restactions-class Put keeps on the entry (`cache.ResolvedEntry.StageOutcomes`, #904), so the span of a hit carries those stored outcomes. Nothing is invented for a hit: a cell stored all-success reads `0`.
+
+**Not covered: widgets.** A widget's `apiRef` resolve runs in process; the widget response carries no `X-Snowplow-Stage-Outcomes`, and a widget cell stores none, so a widgets span carries neither attribute.
+
+**No identity.** The parser drops the header's stage names: no stage, RESTAction or target name, user, message or body reaches the span. Distinct from #1265's `snowplow.serve.*`.
 
 ### Self-loopback recursion guard — cycle and depth stops (#1274)
 Defined in `internal/cache/nested_loopback_guard_metrics.go`; on OTLP in `internal/metrics/nested_loopback_guard_metrics.go`.
