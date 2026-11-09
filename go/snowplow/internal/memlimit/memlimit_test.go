@@ -257,38 +257,161 @@ func TestApply_NoLimit(t *testing.T) {
 }
 
 // The runtime applied GOMEMLIMIT before main; apply must leave it, even with
-// a cgroup limit readable that would have given a different value.
+// a cgroup limit readable that would have given a different value. The
+// cgroup limit is still read and published beside it, so an operator value
+// at or above the container limit (the old OOM incident) is visible: INFO
+// when it is below, WARN when it is at or above, and the operator's value is
+// never overridden either way.
 func TestApply_ExplicitGOMEMLIMITIsHonoured(t *testing.T) {
-	operator := 5 * gib
-	withProcessLimit(t, operator) // what the runtime set from GOMEMLIMIT=5GiB
-	h := &recordingHandler{}
-	getenv := func(k string) string {
-		if k == "GOMEMLIMIT" {
-			return "5GiB"
-		}
-		return ""
+	const atOrAbove = "at or above the container's cgroup memory limit"
+	cases := []struct {
+		name     string
+		env      string
+		operator int64 // what the runtime set from env before main
+		fsys     fs.FS
+		cgroup   int64
+		level    slog.Level
+		message  string
+	}{
+		{"below the container limit", "5GiB", 5 * gib, v2FS("8589934592\n"), 8 * gib, slog.LevelInfo, "GOMEMLIMIT is set"},
+		{"equal to the container limit", "8GiB", 8 * gib, v2FS("8589934592\n"), 8 * gib, slog.LevelWarn, atOrAbove},
+		{"above the container limit", "9GiB", 9 * gib, v2FS("8589934592\n"), 8 * gib, slog.LevelWarn, atOrAbove},
+		{"off under a container limit", "off", math.MaxInt64, v2FS("8589934592\n"), 8 * gib, slog.LevelWarn, atOrAbove},
+		{"above a v1 container limit", "5GiB", 5 * gib, v1FS("4294967296\n"), 4 * gib, slog.LevelWarn, atOrAbove},
+		{"no container limit", "5GiB", 5 * gib, v2FS("max\n"), 0, slog.LevelInfo, "GOMEMLIMIT is set"},
+		{"container limit unreadable", "5GiB", 5 * gib, v2FS("eight\n"), 0, slog.LevelWarn, "could not be read"},
 	}
-	set := func(n int64) int64 {
-		if n >= 0 {
-			t.Errorf("SetMemoryLimit(%d) called with GOMEMLIMIT set; want the operator's limit left alone", n)
-		}
-		return debug.SetMemoryLimit(n)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withProcessLimit(t, tc.operator)
+			h := &recordingHandler{}
+			getenv := func(k string) string {
+				if k == "GOMEMLIMIT" {
+					return tc.env
+				}
+				return ""
+			}
+			set := func(n int64) int64 {
+				if n >= 0 {
+					t.Errorf("SetMemoryLimit(%d) called with GOMEMLIMIT set; want the operator's limit left alone", n)
+				}
+				return debug.SetMemoryLimit(n)
+			}
 
-	d := apply(v2FS("8589934592\n"), getenv, set, slog.New(h))
+			d := apply(tc.fsys, getenv, set, slog.New(h))
 
-	if d.Source != SourceEnv || d.CgroupLimitBytes != 0 || d.AppliedBytes != 0 {
-		t.Fatalf("decision = %+v, want env", d)
+			if d.Source != SourceEnv || d.CgroupLimitBytes != tc.cgroup || d.AppliedBytes != 0 {
+				t.Fatalf("decision = %+v, want env with cgroup %d", d, tc.cgroup)
+			}
+			if got := debug.SetMemoryLimit(-1); got != tc.operator {
+				t.Fatalf("effective limit = %d, want the operator's %d", got, tc.operator)
+			}
+			r := h.only(t)
+			if r.Level != tc.level || !strings.Contains(r.Message, tc.message) {
+				t.Errorf("log = %v %q, want %v containing %q", r.Level, r.Message, tc.level, tc.message)
+			}
+			assertPublished(t, tc.operator, SourceEnv, tc.cgroup)
+			assertCeilingFollows(t, tc.operator)
+		})
 	}
-	if got := debug.SetMemoryLimit(-1); got != operator {
-		t.Fatalf("effective limit = %d, want the operator's %d", got, operator)
-	}
-	r := h.only(t)
-	if r.Level != slog.LevelInfo || !strings.Contains(r.Message, "GOMEMLIMIT is set") {
-		t.Errorf("log = %v %q, want INFO saying GOMEMLIMIT is honoured", r.Level, r.Message)
-	}
-	assertPublished(t, operator, SourceEnv, 0)
-	assertCeilingFollows(t, operator)
+}
+
+// The cgroup path must be reached through a mount whose root is a path
+// prefix of it, never by cleaning ".." away (the Go runtime's own rule,
+// internal/runtime/cgroup). Before the fix, (a) and (b) read ANOTHER
+// cgroup's limit and (c) missed the right mount.
+func TestApply_CgroupPathResolution(t *testing.T) {
+	t.Run("(a) mount root /.. is not the process's cgroup", func(t *testing.T) {
+		// The mount exposes the PARENT of the cgroup namespace's root: its
+		// memory.max is the parent's 16 GiB, not this container's.
+		withProcessLimit(t, math.MaxInt64)
+		h := &recordingHandler{}
+		fsys := fstest.MapFS{
+			"proc/self/cgroup":         {Data: []byte("0::/\n")},
+			"proc/self/mountinfo":      {Data: []byte("30 25 0:26 /.. /sys/fs/cgroup ro,nosuid - cgroup2 cgroup2 rw\n")},
+			"sys/fs/cgroup/memory.max": {Data: []byte("17179869184\n")},
+		}
+		d := apply(fsys, noEnv, debug.SetMemoryLimit, slog.New(h))
+		if got := debug.SetMemoryLimit(-1); d.Source != SourceUnreadable || got != math.MaxInt64 {
+			t.Fatalf("decision = %+v, effective %d; want unreadable and no limit (the mount cannot reach this cgroup)", d, got)
+		}
+		if r := h.only(t); r.Level != slog.LevelWarn {
+			t.Errorf("log level = %v, want WARN", r.Level)
+		}
+		assertPublished(t, math.MaxInt64, SourceUnreadable, 0)
+	})
+
+	t.Run("(b) a cgroup outside the namespace (/../../init) is not reachable", func(t *testing.T) {
+		withProcessLimit(t, math.MaxInt64)
+		h := &recordingHandler{}
+		fsys := fstest.MapFS{
+			"proc/self/cgroup":              {Data: []byte("0::/../../init\n")},
+			"proc/self/mountinfo":           {Data: []byte(v2Mountinfo)},
+			"sys/fs/cgroup/init/memory.max": {Data: []byte("2147483648\n")},
+			"sys/fs/cgroup/memory.max":      {Data: []byte("8589934592\n")},
+		}
+		d := apply(fsys, noEnv, debug.SetMemoryLimit, slog.New(h))
+		if got := debug.SetMemoryLimit(-1); d.Source != SourceUnreadable || got != math.MaxInt64 {
+			t.Fatalf("decision = %+v, effective %d; want unreadable and no limit (no mount reaches /../../init)", d, got)
+		}
+		if r := h.only(t); r.Level != slog.LevelWarn {
+			t.Errorf("log level = %v, want WARN", r.Level)
+		}
+	})
+
+	t.Run("(b2) /../../init is reached through a later mount rooted at /../..", func(t *testing.T) {
+		// The Go runtime's own example: the namespace-root mount (root "/")
+		// cannot reach /../../init and is skipped, not an error, so a later
+		// mount that exposes it is used.
+		withProcessLimit(t, math.MaxInt64)
+		fsys := fstest.MapFS{
+			"proc/self/cgroup": {Data: []byte("0::/../../init\n")},
+			"proc/self/mountinfo": {Data: []byte(
+				"30 25 0:26 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n" +
+					"31 25 0:26 /../.. /host/cgroup ro - cgroup2 cgroup2 rw\n")},
+			"sys/fs/cgroup/memory.max":      {Data: []byte("17179869184\n")},
+			"host/cgroup/init/memory.max":   {Data: []byte("2147483648\n")},
+			"sys/fs/cgroup/init/memory.max": {Data: []byte("1073741824\n")},
+		}
+		d := apply(fsys, noEnv, debug.SetMemoryLimit, slog.New(&recordingHandler{}))
+		want := 2*gib - 2*gib/8
+		if got := debug.SetMemoryLimit(-1); d.Source != SourceCgroupV2 || d.CgroupLimitBytes != 2*gib || got != want {
+			t.Fatalf("decision = %+v, effective %d; want cgroup_v2 2 GiB → %d through the /../.. mount", d, got, want)
+		}
+	})
+
+	t.Run("(c) an unrelated first cgroup2 mount is skipped for the one that reaches the cgroup", func(t *testing.T) {
+		withProcessLimit(t, math.MaxInt64)
+		fsys := fstest.MapFS{
+			"proc/self/cgroup": {Data: []byte("0::/kubepods/pod1/ctr1\n")},
+			"proc/self/mountinfo": {Data: []byte(
+				"29 25 0:26 /system.slice /run/other ro - cgroup2 cgroup2 rw\n" +
+					"30 25 0:26 /kubepods/pod1 /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n")},
+			"run/other/memory.max":          {Data: []byte("1073741824\n")},
+			"sys/fs/cgroup/ctr1/memory.max": {Data: []byte("8589934592\n")},
+			"sys/fs/cgroup/memory.max":      {Data: []byte("17179869184\n")},
+		}
+		d := apply(fsys, noEnv, debug.SetMemoryLimit, slog.New(&recordingHandler{}))
+		if got := debug.SetMemoryLimit(-1); d.Source != SourceCgroupV2 || d.CgroupLimitBytes != 8*gib || got != 7*gib {
+			t.Fatalf("decision = %+v, effective %d; want cgroup_v2 8 GiB → 7 GiB through the second mount", d, got)
+		}
+		assertCeilingFollows(t, 7*gib)
+	})
+
+	t.Run("a root sharing a prefix but not a path boundary does not match", func(t *testing.T) {
+		// /kube is not an ancestor of /kubepods/pod1.
+		withProcessLimit(t, math.MaxInt64)
+		fsys := fstest.MapFS{
+			"proc/self/cgroup":                   {Data: []byte("0::/kubepods/pod1\n")},
+			"proc/self/mountinfo":                {Data: []byte("30 25 0:26 /kube /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n")},
+			"sys/fs/cgroup/memory.max":           {Data: []byte("8589934592\n")},
+			"sys/fs/cgroup/pods/pod1/memory.max": {Data: []byte("4294967296\n")},
+		}
+		d := apply(fsys, noEnv, debug.SetMemoryLimit, slog.New(&recordingHandler{}))
+		if got := debug.SetMemoryLimit(-1); d.Source != SourceUnreadable || got != math.MaxInt64 {
+			t.Fatalf("decision = %+v, effective %d; want unreadable and no limit", d, got)
+		}
+	})
 }
 
 // deniedFS refuses one path with a permission error, as a cgroup file the

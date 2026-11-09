@@ -32,10 +32,16 @@
 // PRECEDENCE.
 //   - GOMEMLIMIT in the environment (any non-empty value, "off" included):
 //     the operator chose. The runtime already applied it before main; it is
-//     left alone and logged at INFO.
+//     never overridden. The cgroup limit is still read and published beside
+//     it: INFO when the operator's limit is below it, WARN when it is at or
+//     above it (Linux then OOM-kills before the GC back-pressures: a past
+//     incident) or the cgroup cannot be read to check.
 //   - Otherwise, the cgroup limit (v2 memory.max, or v1
 //     memory.limit_in_bytes, the smallest along the cgroup's visible
-//     ancestry) × 7/8 is applied with debug.SetMemoryLimit.
+//     ancestry) × 7/8 is applied with debug.SetMemoryLimit. The cgroup
+//     directory is found the way the Go runtime finds it: through the first
+//     mount whose root is a path prefix of the cgroup path, never by
+//     cleaning ".." away; no such mount is "unreadable".
 //   - No cgroup limit: no soft limit is set (the runtime default, unlimited),
 //     logged at INFO.
 //   - The cgroup files cannot be read or parsed: no soft limit is set,
@@ -54,7 +60,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -87,7 +92,8 @@ const (
 type Decision struct {
 	Source Source
 	// CgroupLimitBytes is the container's cgroup memory limit, 0 when none
-	// was found or it could not be read (and when the env took precedence).
+	// was found or it could not be read. Read and kept when the env took
+	// precedence too, so an operator limit can be compared with it.
 	CgroupLimitBytes int64
 	// AppliedBytes is the limit passed to debug.SetMemoryLimit, 0 when this
 	// package set none.
@@ -122,16 +128,13 @@ func apply(fsys fs.FS, getenv func(string) string, setLimit func(int64) int64, l
 }
 
 func decide(fsys fs.FS, getenv func(string) string, setLimit func(int64) int64, log *slog.Logger) Decision {
+	limit, src, err := cgroupMemoryLimit(fsys)
+
 	// An empty GOMEMLIMIT is unset to the runtime too.
 	if v := getenv("GOMEMLIMIT"); v != "" {
-		log.Info("memory limit: GOMEMLIMIT is set in the environment; honoured, not derived from the container",
-			slog.String("subsystem", "runtime"),
-			slog.String("gomemlimit", v),
-			slog.Int64("memory_limit_bytes", setLimit(-1)))
-		return Decision{Source: SourceEnv}
+		return decideEnv(v, limit, src, err, setLimit(-1), log)
 	}
 
-	limit, src, err := cgroupMemoryLimit(fsys)
 	if err != nil {
 		// log-ctx-waiver: boot: main applies the limit once at start, before a context exists
 		log.Warn("memory limit: the container's cgroup memory limit could not be read; no soft memory limit is set",
@@ -154,6 +157,35 @@ func decide(fsys fs.FS, getenv func(string) string, setLimit func(int64) int64, 
 		slog.Int64("memory_limit_bytes", soft),
 		slog.String("share", fmt.Sprintf("%d/%d", limitHeadroomDivisor-1, limitHeadroomDivisor)))
 	return Decision{Source: src, CgroupLimitBytes: limit, AppliedBytes: soft}
+}
+
+// decideEnv: the operator set GOMEMLIMIT and the runtime already applied it
+// (effective). It is never overridden. The container's limit is still read
+// and published beside it, so a value at or above the container limit, the
+// configuration behind a past OOM-kill incident (Linux kills the pod before
+// the GC back-pressures), is a WARN instead of going unseen. "off" is the
+// largest limit there is, so under any container limit it warns too.
+func decideEnv(v string, limit int64, src Source, err error, effective int64, log *slog.Logger) Decision {
+	attrs := []any{
+		slog.String("subsystem", "runtime"),
+		slog.String("gomemlimit", v),
+		slog.Int64("memory_limit_bytes", effective),
+	}
+	switch {
+	case err != nil:
+		// log-ctx-waiver: boot: main applies the limit once at start, before a context exists
+		log.Warn("memory limit: GOMEMLIMIT is set in the environment and honoured, but the container's cgroup memory limit could not be read to check it against",
+			append(attrs, slog.Any("err", err))...)
+		return Decision{Source: SourceEnv}
+	case limit > 0 && effective >= limit:
+		// log-ctx-waiver: boot: main applies the limit once at start, before a context exists
+		log.Warn("memory limit: GOMEMLIMIT is set in the environment at or above the container's cgroup memory limit; honoured, but Linux will OOM-kill the pod before the GC back-pressures",
+			append(attrs, slog.String("cgroup", string(src)), slog.Int64("cgroup_memory_limit_bytes", limit))...)
+	default:
+		log.Info("memory limit: GOMEMLIMIT is set in the environment; honoured, not derived from the container",
+			append(attrs, slog.Int64("cgroup_memory_limit_bytes", limit))...)
+	}
+	return Decision{Source: SourceEnv, CgroupLimitBytes: limit}
 }
 
 // cgroupMemoryLimit returns the memory limit that applies to this process's
@@ -185,20 +217,18 @@ func cgroupMemoryLimit(fsys fs.FS) (int64, Source, error) {
 	if haveV1 {
 		src, cgPath, file, parse = SourceCgroupV1, v1Path, "memory.limit_in_bytes", parseV1Limit
 	}
-	mountPoint, mountRoot, ok := findCgroupMount(string(mi), src == SourceCgroupV1)
-	if !ok {
-		return 0, SourceUnreadable, fmt.Errorf("no %s mount in proc/self/mountinfo", src)
-	}
-	rel, ok := relUnder(mountRoot, cgPath)
-	if !ok {
-		return 0, SourceUnreadable, fmt.Errorf("the %s cgroup path is not under the mount's root", src)
+	top, dir, err := cgroupDir(string(mi), cgPath, src == SourceCgroupV1)
+	if err != nil {
+		return 0, SourceUnreadable, fmt.Errorf("%s: %w", src, err)
 	}
 
-	top := strings.TrimPrefix(path.Clean(mountPoint), "/")
-	dir := path.Join(top, rel)
+	// Walk from the cgroup's directory up to the mount point, taking the
+	// smallest limit. Directories are cut at their last '/', never cleaned:
+	// cgroupDir guarantees no "." or ".." element.
 	var limit int64
 	for {
-		b, err := fs.ReadFile(fsys, path.Join(dir, file))
+		f := joinFS(dir, file)
+		b, err := fs.ReadFile(fsys, f)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 			// The root cgroup (and a v2 cgroup without the memory controller
@@ -208,18 +238,113 @@ func cgroupMemoryLimit(fsys fs.FS) (int64, Source, error) {
 		default:
 			l, err := parse(strings.TrimSpace(string(b)))
 			if err != nil {
-				return 0, SourceUnreadable, fmt.Errorf("%s: %w", path.Join(dir, file), err)
+				return 0, SourceUnreadable, fmt.Errorf("%s: %w", f, err)
 			}
 			if l > 0 && (limit == 0 || l < limit) {
 				limit = l
 			}
 		}
-		if dir == top || dir == "." || dir == "" {
+		if dir == top {
 			break
 		}
-		dir = path.Dir(dir)
+		dir = dir[:max(strings.LastIndexByte(dir, '/'), 0)]
 	}
 	return limit, src, nil
+}
+
+// joinFS joins an fs.FS directory ("" is the root) and a file name.
+func joinFS(dir, file string) string {
+	if dir == "" {
+		return file
+	}
+	return dir + "/" + file
+}
+
+// cgroupDir resolves the process's cgroup path to its directory under a
+// cgroup mount, the way the Go runtime does (internal/runtime/cgroup,
+// getCgroupMount): walk EVERY matching mount in mountinfo and take the first
+// whose root is a path prefix of the cgroup path (at a path boundary); the
+// directory is the mount point plus the rest of the path. Nothing is
+// cleaned, so ".." can never be resolved away:
+//   - a remainder starting with "/.." is a cgroup outside this cgroup
+//     namespace, which this mount cannot reach: skipped;
+//   - a mount root like "/.." is not a prefix of the cgroup path: skipped;
+//   - any other "." or ".." element is refused rather than interpreted.
+//
+// No mount reaching the cgroup is an error: the limit cannot be read.
+// Returned paths are fs.FS paths (no leading '/'): top is the mount point,
+// dir the cgroup's directory under it.
+//
+// mountinfo line: id parent maj:min root mountpoint opts [optional...] - fstype source superopts
+func cgroupDir(mountinfo, cgPath string, v1 bool) (top, dir string, err error) {
+	if !strings.HasPrefix(cgPath, "/") {
+		return "", "", fmt.Errorf("proc/self/cgroup path %q is not absolute", cgPath)
+	}
+	for _, line := range strings.Split(mountinfo, "\n") {
+		fields := strings.Fields(line)
+		sep := -1
+		for i, f := range fields {
+			if f == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 5 || len(fields) < sep+4 {
+			continue
+		}
+		fstype, superopts := fields[sep+1], fields[sep+3]
+		switch {
+		case !v1 && fstype == "cgroup2":
+		case v1 && fstype == "cgroup" && hasOpt(superopts, "memory"):
+		default:
+			continue
+		}
+		root := unescapeMountinfo(fields[3])
+		if !strings.HasPrefix(root, "/") {
+			return "", "", fmt.Errorf("proc/self/mountinfo: cgroup mount root %q is not absolute", root)
+		}
+		if !hasPathPrefix(cgPath, root) {
+			continue
+		}
+		rel := cgPath[len(root):]
+		if root == "/" {
+			rel = cgPath
+		}
+		if hasPathPrefix(rel, "/..") {
+			continue // outside this mount's reach (outside the cgroup namespace)
+		}
+		if hasDotElement(rel) {
+			return "", "", fmt.Errorf("proc/self/cgroup path %q has a '.' or '..' element", cgPath)
+		}
+		mnt := unescapeMountinfo(fields[4])
+		if !strings.HasPrefix(mnt, "/") || hasDotElement(mnt) {
+			return "", "", fmt.Errorf("proc/self/mountinfo: cgroup mount point %q is not a clean absolute path", mnt)
+		}
+		top = strings.TrimSuffix(strings.TrimPrefix(mnt, "/"), "/")
+		dir = strings.TrimPrefix(strings.TrimSuffix(top+rel, "/"), "/")
+		return top, dir, nil
+	}
+	return "", "", errors.New("no cgroup mount in proc/self/mountinfo reaches this process's cgroup")
+}
+
+// hasPathPrefix reports whether p starts with prefix at a path boundary
+// ("/" is a prefix of every absolute path). Byte comparison, no cleaning.
+func hasPathPrefix(p, prefix string) bool {
+	if prefix == "/" {
+		return true
+	}
+	return strings.HasPrefix(p, prefix) && (len(p) == len(prefix) || p[len(prefix)] == '/')
+}
+
+// hasDotElement reports whether a slash-separated path has a "." or ".."
+// element.
+func hasDotElement(p string) bool {
+	for _, e := range strings.Split(p, "/") {
+		if e == "." || e == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // parseProcCgroup reads /proc/self/cgroup ("id:controllers:path" per line):
@@ -241,36 +366,6 @@ func parseProcCgroup(s string) (v1Path, v2Path string, haveV1, haveV2 bool) {
 		}
 	}
 	return
-}
-
-// findCgroupMount finds the cgroup2 mount (v1=false) or the v1 cgroup mount
-// carrying the memory controller (v1=true) in /proc/self/mountinfo and returns
-// its mount point and the cgroup path it exposes (its root).
-//
-// mountinfo line: id parent maj:min root mountpoint opts [optional...] - fstype source superopts
-func findCgroupMount(s string, v1 bool) (mountPoint, root string, ok bool) {
-	for _, line := range strings.Split(s, "\n") {
-		fields := strings.Fields(line)
-		sep := -1
-		for i, f := range fields {
-			if f == "-" {
-				sep = i
-				break
-			}
-		}
-		if sep < 5 || len(fields) < sep+4 {
-			continue
-		}
-		fstype, superopts := fields[sep+1], fields[sep+3]
-		switch {
-		case !v1 && fstype == "cgroup2":
-		case v1 && fstype == "cgroup" && hasOpt(superopts, "memory"):
-		default:
-			continue
-		}
-		return unescapeMountinfo(fields[4]), unescapeMountinfo(fields[3]), true
-	}
-	return "", "", false
 }
 
 func hasOpt(opts, want string) bool {
@@ -300,21 +395,6 @@ func unescapeMountinfo(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
-}
-
-// relUnder returns p relative to root ("." when equal), both cgroup paths.
-func relUnder(root, p string) (string, bool) {
-	root, p = path.Clean("/"+root), path.Clean("/"+p)
-	if root == "/" {
-		return strings.TrimPrefix(p, "/"), true
-	}
-	if p == root {
-		return ".", true
-	}
-	if strings.HasPrefix(p, root+"/") {
-		return strings.TrimPrefix(p, root+"/"), true
-	}
-	return "", false
 }
 
 // parseV2Limit parses memory.max: "max" is no limit (0).

@@ -46,7 +46,7 @@ var expvarOnce sync.Once
 //	gogc                       effective GOGC (-1 = off)
 //	memory_limit_bytes         effective soft memory limit (9223372036854775807 = none)
 //	memory_limit_source        env | cgroup_v2 | cgroup_v1 | none | unreadable
-//	cgroup_memory_limit_bytes  the container's cgroup limit the limit was derived from (0 = not derived)
+//	cgroup_memory_limit_bytes  the container's cgroup memory limit (0 = none, or unreadable), also when env set the limit
 //
 // Registered unconditionally: GC settings are not a cache concept. Safe to
 // call more than once.
