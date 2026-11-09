@@ -178,6 +178,7 @@ var storeRegistry = map[string]string{
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; every read is a full fetch, nothing is revalidated)",
+	"jq.programCache.entries":                         "no-content (run 23: compiled jq programs keyed by the filter's source text and the operator module bytes the compile read — derived from the spec alone, never from a served body or an identity)",
 	"api.narrowMemo":                                  "no-content (#603 PR-2: the jqinterest read set of a RESTAction spec x tracked stage — derived from the spec alone, never from a served body or an identity)",
 }
 
