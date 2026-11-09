@@ -314,7 +314,9 @@ def test_a_pod_off_the_loadgen_pool_fails_its_step_before_the_data_load(harness)
     assert p.returncode != 0
     assert "observe606 FAILED: its pod is not where it must run: node loadgen-0 is in pool 'default', not 'loadgen'" in out
     assert "=== step data ===" not in out
-    rec = json.loads((o / "incluster-placement.jsonl").read_text().splitlines()[0])
+    recs = [json.loads(ln) for ln in (o / "incluster-placement.jsonl").read_text().splitlines()]
+    assert [r["kind"] for r in recs] == ["loadgen_room", "incluster_placement"]     # the room, then the pod
+    rec = recs[1]
     assert rec["ok"] is False and rec["node_pool"] == "default"
     # the teardown deleted the observer's Job, ServiceAccount and RBAC before the cluster
     deleted = [json.loads(ln) for ln in (state / "deleted.jsonl").read_text().splitlines()]
