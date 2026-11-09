@@ -240,17 +240,22 @@ mkdir -p "$OUTB"
   printf 'K=(kubectl %q %q)\n' "--kubeconfig=$KCFG" "--context=$CTX"
   echo 'export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX"; unset BENCH_ALLOW_NON_GKE'
   echo 'touch "$OUT/command-failures.jsonl"'
-  (cd "$BENCH" && python3 -m bench.data606_parity functions --script run606.sh \
-     --vars COLLECT_TIMEOUT_S SCALE USERS NAMESPACES LOAD_DRIVER LOADGEN_MACHINE_TYPE HOLD_PROBE_WAIT_S ENDPOINT_MODE \
-            PREFLIGHT_TIMEOUT_S PREFLIGHT_POLL_S TOP_POLL_S FRESH_MODES DATA_TIMEOUT_S COLLECT_CAP_S PW INC \
-            BENCH_USER_PREFIX \
-     -- log run kapply redact_pw kill_tree halt_tree bounded kerr_line record_failure incluster_pod \
-        incluster_started incluster_placement incluster_delete data606_wait data606_finish data606_gone s_data) \
+  # bench/data606_parity.py ARM_B_VARS / ARM_B_FUNCTIONS: refused when run606.sh's s_data path reads a
+  # variable or calls a function the lists do not carry (arm_b_coverage; at f7aa9df3 INC_POLL_S was not
+  # carried and arm B died on it)
+  (cd "$BENCH" && python3 -m bench.data606_parity functions --script run606.sh --arm-b) \
     || die "extracting run606.sh's functions"
   echo 'KERR="$OUT/.kubectl-last-error"'
   echo 'CUR_STEP=data'
+  # fail closed, and leave nothing behind: if s_data's path aborts the script (an unbound variable,
+  # set -e), the EXIT trap says so and deletes data606's Job, ServiceAccount and RBAC, so the leftover
+  # check below judges the arm, not the abort
+  echo 'DONE=0'
+  echo 'on_exit() { local rc=$?; [[ "$DONE" == "1" ]] && return; set +eu; echo "S_DATA_ABORTED exit=$rc"; incluster_delete data606 || true; exit 1; }'
+  echo 'trap on_exit EXIT'
   echo 'rc=0; s_data || rc=$?'
   echo 'gone=0; CUR_STEP=measure; data606_gone || gone=$?'
+  echo 'DONE=1'
   echo 'echo "S_DATA_RC=$rc DATA606_GONE_RC=$gone"'
   echo 'exit $(( rc != 0 || gone != 0 ))'
 } > "$WORK/armB.sh"
@@ -260,7 +265,7 @@ B_RC=0
    LOAD_DRIVER=load606 LOADGEN_MACHINE_TYPE="$LOADGEN_MACHINE_TYPE" FRESH_MODES="$FRESH" \
    bash "$WORK/armB.sh") >"$WORK/B-s_data.log" 2>&1 || B_RC=$?
 stop_standin
-say "arm B: $(grep -E '^S_DATA_RC=' "$WORK/B-s_data.log" || echo "no result line (exit $B_RC)")"
+say "arm B: $(grep -E '^(S_DATA_RC=|S_DATA_ABORTED)' "$WORK/B-s_data.log" || echo "no result line (exit $B_RC)")"
 LEFT_PODS="$("${K[@]}" -n bench-loadgen get pods -l job-name=data606 -o name 2>&1 || true)"
 LEFT_LOADGEN="$("${K[@]}" -n bench-loadgen get jobs,pods,serviceaccounts,configmaps,secrets -o name 2>&1 | tr '\n' ' ' || true)"
 snapshot "$WORK/B-snapshot.json" "$WORK/B-baseline.json"
@@ -295,7 +300,8 @@ print(json.dumps({
     "kind": "kind_1297_data606_parity", "verdict": "PASS" if ok else "FAIL",
     "diff": {k: d[k] for k in ("verdict", "objects", "counts", "counts_equal", "controller")},
     "only_in_a": d["only_in_a"][:20], "only_in_b": d["only_in_b"][:20], "different": dict(list(d["different"].items())[:20]),
-    "arm_b_exit": int(b_rc), "placement": placement,
+    "arm_b_exit": int(b_rc), "arm_b_aborted": "S_DATA_ABORTED" in open(os.path.join(work, "B-s_data.log")).read(),
+    "placement": placement,
     "loadgen_machine_type": machine, "fit": json.loads(fit),
     "cpu_request_note": None if machine == "n2-standard-16" else
         f"arm B ran with data606's requests for {machine}; the paid run's 16-vCPU loadgen (n2-standard-16) "

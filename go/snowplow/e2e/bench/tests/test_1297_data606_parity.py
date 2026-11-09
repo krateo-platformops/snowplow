@@ -19,12 +19,7 @@ from bench import data606_parity as dp
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 
-ARM_B_VARS = ["COLLECT_TIMEOUT_S", "SCALE", "USERS", "NAMESPACES", "LOAD_DRIVER", "LOADGEN_MACHINE_TYPE",
-              "HOLD_PROBE_WAIT_S", "ENDPOINT_MODE", "PREFLIGHT_TIMEOUT_S", "PREFLIGHT_POLL_S", "TOP_POLL_S",
-              "FRESH_MODES", "DATA_TIMEOUT_S", "COLLECT_CAP_S", "PW", "INC", "BENCH_USER_PREFIX"]
-ARM_B_FUNCTIONS = ["log", "run", "kapply", "redact_pw", "kill_tree", "halt_tree", "bounded", "kerr_line",
-                   "record_failure", "incluster_pod", "incluster_started", "incluster_placement",
-                   "incluster_delete", "data606_wait", "data606_finish", "data606_gone", "s_data"]
+ARM_B_VARS, ARM_B_FUNCTIONS = dp.ARM_B_VARS, dp.ARM_B_FUNCTIONS
 
 
 def _server_set(o: dict, uid: str) -> dict:
@@ -129,8 +124,52 @@ def test_arm_b_runs_run606s_own_functions_and_defaults():
         dp.functions(src, ["no_such_function_1297"])
 
 
-def test_the_harness_names_the_same_functions_and_variables_as_this_test():
+def test_the_harness_extracts_the_modules_lists():
     sh = (BENCH_DIR / "tests" / "kind_1297_data606_parity.sh").read_text()
-    for n in ARM_B_FUNCTIONS + ARM_B_VARS:
-        assert f" {n}" in sh or f"\n{n}" in sh, n
+    assert "python3 -m bench.data606_parity functions --script run606.sh --arm-b" in sh
+    assert "--vars" not in sh                      # no second list in the harness to drift
     assert subprocess.run(["bash", "-n", str(BENCH_DIR / "tests" / "kind_1297_data606_parity.sh")]).returncode == 0
+
+
+def test_arm_b_carries_every_variable_and_function_s_datas_path_reads():
+    """The guard f7aa9df3 needed: s_data's path read INC_POLL_S (run606.sh's top level) and the
+    arm's list did not carry it, so arm B died on an unbound variable. Now the lists are checked
+    against run606.sh itself."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    assert dp.arm_b_coverage(src) == {"vars_missing": [], "functions_missing": []}
+
+
+@pytest.mark.parametrize("drop, field", [("INC_POLL_S", "vars_missing"), ("PW", "vars_missing"),
+                                         ("kerr_line", "functions_missing"), ("data606_wait", "functions_missing")])
+def test_the_guard_sees_a_dropped_variable_or_function(monkeypatch, drop, field):
+    lst = "ARM_B_VARS" if field == "vars_missing" else "ARM_B_FUNCTIONS"
+    monkeypatch.setattr(dp, lst, [x for x in getattr(dp, lst) if x != drop])
+    assert drop in dp.arm_b_coverage((BENCH_DIR / "run606.sh").read_text())[field]
+    with pytest.raises(SystemExit, match="arm B would not run what run606 runs"):
+        dp.main(["functions", "--script", str(BENCH_DIR / "run606.sh"), "--arm-b"])
+
+
+def test_a_new_global_read_on_s_datas_path_fails_the_guard():
+    """A run606.sh where data606_wait reads a NEW top-level variable: refused until the arm carries it."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    assert "INC_FINISH_CALLS=6\n" in src and "data606_wait() {\n" in src
+    src = src.replace("INC_FINISH_CALLS=6\n", "INC_FINISH_CALLS=6\nNEW_1297_KNOB=1\n", 1)
+    src = src.replace("data606_wait() {\n", 'data606_wait() {\n  : "$NEW_1297_KNOB"\n', 1)
+    assert dp.arm_b_coverage(src)["vars_missing"] == ["NEW_1297_KNOB"]
+
+
+def test_an_aborted_s_data_fails_closed_and_deletes_what_it_created(tmp_path):
+    """armB.sh's EXIT trap, as the harness writes it: s_data dies on an unbound variable (set -u), the
+    trap says so, deletes data606's Job, ServiceAccount and RBAC (incluster_delete), and exits 1."""
+    sh = (BENCH_DIR / "tests" / "kind_1297_data606_parity.sh").read_text()
+    lines = [ln.strip() for ln in sh.splitlines()
+             if ln.strip().startswith("echo 'on_exit()") or ln.strip() in ("echo 'trap on_exit EXIT'", "echo 'DONE=0'")]
+    assert len(lines) == 3
+    trap = "".join(subprocess.run(["bash", "-c", ln], capture_output=True, text=True).stdout for ln in lines)
+    calls = tmp_path / "calls"
+    script = ("set -Eeuo pipefail\n" + trap
+              + f'incluster_delete() {{ echo "delete $1" >> {calls}; }}\n'
+              + 's_data() { echo "$NO_SUCH_VARIABLE"; }\nrc=0; s_data || rc=$?\nDONE=1\necho S_DATA_RC=$rc\n')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert p.returncode == 1 and "S_DATA_ABORTED" in p.stdout and "S_DATA_RC" not in p.stdout, (p.stdout, p.stderr)
+    assert calls.read_text() == "delete data606\n"

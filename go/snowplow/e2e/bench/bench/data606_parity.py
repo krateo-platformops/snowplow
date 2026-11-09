@@ -192,6 +192,94 @@ def read_cluster(k: list[str]) -> tuple[dict[str, dict], dict | None]:
 
 # ─── run606.sh, as its other tests read it ───────────────────────────────────────────────────────
 
+# What arm B extracts from run606.sh: s_data and every run606 function it reaches, and every top-level
+# run606 variable they read (with run606's own defaults). ONE list, here: the arm passes it with
+# `functions --arm-b`, and tests/test_1297_data606_parity.py checks it against run606.sh itself
+# (arm_b_coverage: a variable or function s_data's path reads that is not carried fails the suite, so
+# the next one added to run606.sh cannot silently break the arm, as INC_POLL_S did at f7aa9df3).
+ARM_B_VARS = ["COLLECT_TIMEOUT_S", "SCALE", "USERS", "NAMESPACES", "LOAD_DRIVER", "LOADGEN_MACHINE_TYPE",
+              "HOLD_PROBE_WAIT_S", "ENDPOINT_MODE", "PREFLIGHT_TIMEOUT_S", "PREFLIGHT_POLL_S", "TOP_POLL_S",
+              "FRESH_MODES", "DATA_TIMEOUT_S", "COLLECT_CAP_S", "PW", "INC", "INC_POLL_S", "BENCH_USER_PREFIX"]
+ARM_B_FUNCTIONS = ["log", "run", "kapply", "redact_pw", "kill_tree", "halt_tree", "bounded", "kerr_line",
+                   "record_failure", "incluster_pod", "incluster_started", "incluster_placement",
+                   "incluster_delete", "data606_wait", "data606_finish", "data606_gone", "s_data"]
+# set by the arm's own preamble (armB.sh), not read from run606.sh: the run dir, the script's dir, the
+# kube context it pins, kubectl's error file, the step
+ARM_B_PREAMBLE = {"OUT", "HERE", "DRY", "KCFG", "KCTX", "K", "KERR", "CUR_STEP"}
+# reached from s_data but not run by the arm, each with its reason
+ARM_B_NOT_RUN = {"fresh_classes_create": "k6 driver only (the arm runs LOAD_DRIVER=load606): the fresh "
+                                         "identity classes are not data606's objects"}
+
+
+def _top_level_globals(src: str) -> set[str]:
+    """Every variable run606.sh assigns at top level (outside any function)."""
+    out, depth = set(), 0
+    for ln in src.splitlines():
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(\) \{", ln):
+            depth = 0 if ln.rstrip().endswith("}") else 1
+            continue
+        if depth:
+            if ln == "}":
+                depth = 0
+            continue
+        for m in re.finditer(r"(?:^|[\s;(]|then |else )([A-Z][A-Z0-9_]*)(?:\+)?=", ln):
+            out.add(m.group(1))
+        m = re.match(r"^\s*(?:export|declare(?: -\w+)?|readonly)\s+(.*)", ln)
+        if m:
+            out |= {x.split("=")[0] for x in m.group(1).split() if re.match(r"^[A-Z][A-Z0-9_]*(=|$)", x)}
+    return out
+
+
+def _defined_functions(src: str) -> set[str]:
+    return set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", src, re.M))
+
+
+def _blank_plain_strings(text: str) -> str:
+    """The shell text with every quoted string that runs no command (no `$(`) blanked: a function
+    named in log text is not a call. A small scanner (double quotes with backslash escapes, single
+    quotes outside them), not a regex: a regex pairs one string's closing quote with the next one's
+    opening quote and blanks the code between them."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j, q = i + 1, c
+            while j < n and text[j] != q:
+                j += 2 if (q == '"' and text[j] == "\\") else 1
+            s = text[i:j + 1]
+            out.append(s if (q == '"' and "$(" in s) else q + q)
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def arm_b_coverage(src: str) -> dict:
+    """What the arm's extraction misses: every run606 top-level global the extracted functions read
+    (`$X`, `${X...}`, a bare X in `$(( ))` or `[[ ]]`) that neither ARM_B_VARS nor the preamble
+    carries, and every run606 function they call that is neither extracted nor in ARM_B_NOT_RUN.
+    Both lists empty: the arm runs what run606 runs."""
+    text = functions(src, ARM_B_FUNCTIONS)
+    body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    globals_ = _top_level_globals(src)
+    locals_ = set()
+    for m in re.finditer(r"\blocal\s+([^\n;]*)", body):
+        locals_ |= {x.split("=")[0] for x in m.group(1).split()}
+    # read: $X / ${X...} anywhere, and a bare X inside an arithmetic $(( )) / (( ))
+    read = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]*)", body))
+    for m in re.finditer(r"\(\((.*?)\)\)", body, re.S):
+        read |= set(re.findall(r"\b([A-Z][A-Z0-9_]*)\b", m.group(1)))
+    # assigned by the extracted functions themselves before they read it (bounded's BOUNDED_PIDS)
+    own = set(re.findall(r"(?:^|[\s;])([A-Z][A-Z0-9_]*)=", body, re.M))
+    vars_missing = sorted((read & globals_) - set(ARM_B_VARS) - ARM_B_PREAMBLE - locals_ - own)
+    # called: a function's name as a word, outside a string with no expansion in it (log text)
+    code = re.sub(r"(^|\s)#.*$", "", _blank_plain_strings(body), flags=re.M)   # and trailing comments
+    called = {f for f in _defined_functions(src) if re.search(rf"(^|[\s;|&(!]){re.escape(f)}(\s|;|$|\))", code, re.M)}
+    funcs_missing = sorted(called - set(ARM_B_FUNCTIONS) - set(ARM_B_NOT_RUN))
+    return {"vars_missing": vars_missing, "functions_missing": funcs_missing}
+
+
 def functions(src: str, names: list[str]) -> str:
     """Each named function's own text from run606.sh (a missing one fails: the arm would run less)."""
     out = []
@@ -234,7 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("functions", help="run606.sh's own functions and default assignments, as bash")
     f.add_argument("--script", required=True)
     f.add_argument("--vars", nargs="*", default=[])
-    f.add_argument("names", nargs="+")
+    f.add_argument("--arm-b", action="store_true",
+                   help="ARM_B_VARS and ARM_B_FUNCTIONS (refused when arm_b_coverage finds a gap)")
+    f.add_argument("names", nargs="*")
     a = p.parse_args(argv)
     if a.cmd == "snapshot":
         k = ["kubectl", f"--kubeconfig={a.kubeconfig}", f"--context={a.context}", "--request-timeout=120s"]
@@ -256,6 +346,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if r["verdict"] == "PASS" else 1
     elif a.cmd == "functions":
         src = Path(a.script).read_text()
+        if a.arm_b:
+            gap = arm_b_coverage(src)
+            if gap["vars_missing"] or gap["functions_missing"]:
+                raise SystemExit(f"arm B would not run what run606 runs: {gap}")
+            a.vars, a.names = ARM_B_VARS, ARM_B_FUNCTIONS
         sys.stdout.write(assignments(src, a.vars) if a.vars else "")
         sys.stdout.write(functions(src, a.names))
     return 0
