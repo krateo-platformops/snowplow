@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 )
@@ -41,5 +42,7 @@ func buildLogHandler(prettyLog bool, level slog.Level, w io.Writer) slog.Handler
 	} else {
 		base = slog.NewJSONHandler(w, opts)
 	}
-	return tracing.NewTraceCorrelationHandler(base)
+	// #1260: and work_origin, the driver that started the work, named by the
+	// one classifier of the driver markers.
+	return tracing.NewCorrelationHandler(base, cache.WorkOrigin)
 }

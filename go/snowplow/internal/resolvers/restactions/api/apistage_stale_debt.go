@@ -448,7 +448,7 @@ func staleDebtRefillOnce(d *staleDebt) (bool, cache.StaleRetryOutcome) {
 	// #871 — measurement only: one refill attempt is one fill_bg unit. Its ctx
 	// carries the label (the content fill's own pprof.Do restores to it), and
 	// the goroutine stays fill_bg when it returns.
-	ctx, endWork := workclass.Begin(workclass.Background(workclass.FillBG), workclass.FillBG)
+	ctx, endWork := workclass.Begin(staleReplaceRoot(), workclass.FillBG)
 	defer endWork()
 	ctx, cancel := context.WithTimeout(ctx, cache.DemandRevalidationDeadline())
 	defer cancel()
@@ -654,6 +654,14 @@ func replaceRetrySpec(sink *cache.StaleServeSink) cache.StaleRetrySpec {
 	}
 }
 
+// staleReplaceRoot is the context a D2 debt refill (staleDebtRefillOnce) and a
+// dependent replace (replaceStaleDependentOnce) start from: detached fill_bg
+// work, named stale-replace for the log (#1260, cache/work_origin.go). It is a
+// named builder so the #1260 driver arms read the real root.
+func staleReplaceRoot() context.Context {
+	return cache.WithStaleReplaceWork(workclass.Background(workclass.FillBG))
+}
+
 // replaceStaleDependentOnce runs one replace of sink's dependent cell and
 // reports whether it is done: replaced, already replaced or evicted, or
 // completed with a declined Put (compare-and-evicted). false: it FAILED.
@@ -670,7 +678,7 @@ func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
 	}
 	// #871 — measurement only: one replace is one fill_bg unit (see
 	// staleDebtRefillOnce).
-	wctx, endWork := workclass.Begin(workclass.Background(workclass.FillBG), workclass.FillBG)
+	wctx, endWork := workclass.Begin(staleReplaceRoot(), workclass.FillBG)
 	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(wctx), cache.DemandRevalidationDeadline())
 	err := cache.RunRefreshNow(ctx, l1Key)
 	cancel()

@@ -155,7 +155,9 @@ func snowplowCORSOptions() cors.Options {
 // It is a function so the composition the pod serves is the one the tests
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
-	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux)))), mux))
+	// #1260: cache.RequestWorkMiddleware marks every request it serves, at the
+	// root, so a request's lines say work_origin=request.
+	return cache.RequestWorkMiddleware(use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux)))), mux)))
 }
 
 // newRUMIngest returns #1015's ingest, with its forwarder's worker running

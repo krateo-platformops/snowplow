@@ -639,6 +639,10 @@ func populateClusterListCellAsync(
 		// new fill_bg unit (no user waits on it). The pre-build check's E1.
 		detachedCtx, endWork := workclass.Detach(customerCtx)
 		defer endWork()
+		// #1260 — and the log's work origin, by the same rule: a background
+		// driver's populate keeps its name, a customer's is a
+		// cluster-list-populate (cache/work_origin.go).
+		detachedCtx = cache.WithDetachedWork(detachedCtx, customerCtx, cache.WorkOriginClusterListPopulate)
 		populateCtx, cancel := context.WithTimeout(detachedCtx,
 			clusterListAsyncPopulateTimeout)
 		defer cancel()

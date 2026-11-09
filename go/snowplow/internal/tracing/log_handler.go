@@ -63,17 +63,34 @@ import (
 // platform's filelog pipeline has no json_parser, so otel_logs.TraceId
 // stays empty until the krateo-observability collector fix lands. That
 // half is out of this release (design §4.2, C9).
+//
+// WORK ORIGIN (#1260). The same top-level stamp also carries work_origin, the
+// driver whose root started the work (request, refresher, cohort-seed, …), when
+// the context names one. The names come from workOrigin, which this package does
+// not own: buildLogHandler passes cache.WorkOrigin, the single classifier of the
+// driver markers. A record whose context names no driver gets no work_origin, so
+// a context-less record is still byte-identical and allocation-free.
 type traceCorrelationHandler struct {
 	root    slog.Handler                      // the undecorated base, before any With*/WithGroup
 	ops     []func(slog.Handler) slog.Handler // derivation chain, in order
 	derived slog.Handler                      // ops applied to root, cached for the no-span path
+
+	// workOrigin names the driver on a record's context (#1260); nil: never.
+	workOrigin func(context.Context) (string, bool)
 }
 
 // NewTraceCorrelationHandler wraps base in the decorator. buildLogHandler in
 // package main is the production caller; it lives here so an arm anywhere in
 // the module can send a record through the real decorator.
 func NewTraceCorrelationHandler(base slog.Handler) slog.Handler {
-	return &traceCorrelationHandler{root: base, derived: base}
+	return NewCorrelationHandler(base, nil)
+}
+
+// NewCorrelationHandler is NewTraceCorrelationHandler that also stamps
+// work_origin from workOrigin (nil: never). buildLogHandler passes
+// cache.WorkOrigin.
+func NewCorrelationHandler(base slog.Handler, workOrigin func(context.Context) (string, bool)) slog.Handler {
+	return &traceCorrelationHandler{root: base, derived: base, workOrigin: workOrigin}
 }
 
 // Enabled defers to the derived handler so level filtering is unchanged.
@@ -82,17 +99,27 @@ func (h *traceCorrelationHandler) Enabled(ctx context.Context, l slog.Level) boo
 }
 
 // Handle stamps trace_id/span_id at the top level when a valid span is on
-// ctx, then delegates; without a span it delegates to the cached derived
-// handler untouched.
+// ctx, and work_origin when ctx names a driver, then delegates; with neither
+// it delegates to the cached derived handler untouched.
 func (h *traceCorrelationHandler) Handle(ctx context.Context, r slog.Record) error {
 	sc := trace.SpanContextFromContext(ctx)
-	if !sc.IsValid() {
+	origin, hasOrigin := "", false
+	if h.workOrigin != nil {
+		origin, hasOrigin = h.workOrigin(ctx)
+	}
+	if !sc.IsValid() && !hasOrigin {
 		return h.derived.Handle(ctx, r)
 	}
-	target := h.root.WithAttrs([]slog.Attr{
-		slog.String("trace_id", sc.TraceID().String()),
-		slog.String("span_id", sc.SpanID().String()),
-	})
+	attrs := make([]slog.Attr, 0, 3)
+	if sc.IsValid() {
+		attrs = append(attrs,
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()))
+	}
+	if hasOrigin {
+		attrs = append(attrs, slog.String("work_origin", origin))
+	}
+	target := h.root.WithAttrs(attrs)
 	for _, op := range h.ops {
 		target = op(target)
 	}
@@ -123,5 +150,5 @@ func (h *traceCorrelationHandler) extend(op func(slog.Handler) slog.Handler) slo
 	ops := make([]func(slog.Handler) slog.Handler, len(h.ops), len(h.ops)+1)
 	copy(ops, h.ops)
 	ops = append(ops, op)
-	return &traceCorrelationHandler{root: h.root, ops: ops, derived: op(h.derived)}
+	return &traceCorrelationHandler{root: h.root, ops: ops, derived: op(h.derived), workOrigin: h.workOrigin}
 }

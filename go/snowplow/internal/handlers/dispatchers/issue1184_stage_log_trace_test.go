@@ -24,6 +24,7 @@ package dispatchers
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -70,9 +71,20 @@ func i1184Records(t *testing.T, buf *syncBuffer, msg string) []map[string]any {
 // and log chain, and returns the single Server span it produced with the log.
 func i1184Serve(t *testing.T, f *in443API, ra map[string]any, target string) (tracetest.SpanStub, *syncBuffer) {
 	t.Helper()
+	return i1184ServeWith(t, f, ra, target, func(w io.Writer) slog.Handler {
+		return tracing.NewTraceCorrelationHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	}, func(h http.Handler) http.Handler { return h })
+}
+
+// i1184ServeWith is i1184Serve with the caller's log handler and an outermost
+// wrapper around the served chain (#1260: the request-root middleware).
+func i1184ServeWith(t *testing.T, f *in443API, ra map[string]any, target string,
+	newHandler func(io.Writer) slog.Handler, wrap func(http.Handler) http.Handler,
+) (tracetest.SpanStub, *syncBuffer) {
+	t.Helper()
 	quiesceDefaultSummaryForTest(t)
 	buf := &syncBuffer{}
-	log := slog.New(tracing.NewTraceCorrelationHandler(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	log := slog.New(newHandler(buf))
 	prevLog := slog.Default()
 	slog.SetDefault(log)
 	t.Cleanup(func() { slog.SetDefault(prevLog) })
@@ -102,7 +114,7 @@ func i1184Serve(t *testing.T, f *in443API, ra map[string]any, target string) (tr
 	}))
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("Authorization", "Bearer "+in443JWT())
-	tracing.NewServerHandler(mux, mux).ServeHTTP(httptest.NewRecorder(), req)
+	wrap(tracing.NewServerHandler(mux, mux)).ServeHTTP(httptest.NewRecorder(), req)
 
 	var servers []tracetest.SpanStub
 	for _, s := range exp.GetSpans() {
