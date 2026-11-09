@@ -33,6 +33,20 @@ collect) holds three things, read with kubectl only (nothing probes the network)
 
 UNKNOWN is never "off": no reading, an unreadable pod, an absent or unreadable ConfigMap, a
 Secret source, or more than one live snowplow pod each read UNKNOWN, with the reason.
+
+#1276 (run 24): an OPTIONAL envFrom ConfigMap the chart names and that normally does not exist
+(snowplow-api-override) made every key UNKNOWN on every run 23 arm. Its absence when the container
+started is now established from a fact: run606 takes a `preinstall` reading before its install
+step — no snowplow pod yet, and the NAMES of the namespace's ConfigMaps (nothing else of them).
+An optional ConfigMap that reading did not list, taken before the pod's creationTimestamp, and
+that is still absent at the reading, contributed nothing ("absent_since_before_install"); its keys
+are unset and the defaults apply. One that existed before the install and is absent now (deleted
+after the start), one present now and created or changed after the start, or any absent one with
+no pre-install reading stays UNKNOWN. What two point readings cannot see: a ConfigMap created
+after the pre-install reading and deleted again before the later one (the approach #1276 agreed).
+
+Run 24: each reading also carries `go_env`, the container's GO* keys (GOGC, GOMEMLIMIT,
+GOMAXPROCS, ...) by the same sources and rules (bench/goruntime.py).
 """
 
 from __future__ import annotations
@@ -134,14 +148,34 @@ def _cm_index(configmaps: dict | None) -> dict | None:
     return {(c.get("metadata") or {}).get("name"): c for c in configmaps.get("items") or []}
 
 
-def _cm_state(name: str, cms: dict | None, started: datetime | None) -> tuple[str, dict | None]:
+def _absent_before_pod(name: str, pre: dict | None, pod: dict | None) -> bool:
+    """#1276: the ConfigMap was proven absent BEFORE the snowplow pod existed — the pre-install
+    reading (preinstall_reading, taken before run606's install step) listed the namespace's
+    ConfigMaps, found no snowplow pod, did not see this name, and was taken before the pod's
+    creationTimestamp."""
+    if not isinstance(pre, dict) or pre.get("state") != "read" or not isinstance(pre.get("configmaps"), list):
+        return False
+    if pre.get("snowplow_pods"):
+        return False
+    created = _ts(((pod or {}).get("metadata") or {}).get("creationTimestamp"))
+    t = pre.get("t")
+    return (name not in pre["configmaps"] and created is not None and isinstance(t, (int, float))
+            and t < created.timestamp())
+
+
+def _cm_state(name: str, cms: dict | None, started: datetime | None, *, optional: bool = False,
+              pre: dict | None = None, pod: dict | None = None) -> tuple[str, dict | None]:
     """A referenced ConfigMap: read (and unchanged since the container started), or why its data
-    proves nothing about the process's environment."""
+    proves nothing about the process's environment. An OPTIONAL one that is absent now and was
+    absent before the pod was created (#1276: the pre-install reading) contributed nothing:
+    "absent_since_before_install". Absent now but present then (it may have been deleted after
+    the container started), or with no pre-install reading, stays "absent": UNKNOWN."""
     if cms is None:
         return "unreadable", None
     cm = cms.get(name)
     if cm is None:
-        return "absent", None
+        return ("absent_since_before_install" if optional and _absent_before_pod(name, pre, pod)
+                else "absent"), None
     md = cm.get("metadata") or {}
     times = [t for t in (_ts(m.get("time")) for m in md.get("managedFields") or []) if t is not None]
     created = _ts(md.get("creationTimestamp"))
@@ -172,10 +206,11 @@ def _field(pod: dict, path: str):
     return ((md.get(m.group(1)) or {}).get(m.group(2))) if m else None
 
 
-def _resolver(pod: dict, container: dict, cms: dict | None, started: datetime | None):
+def _resolver(pod: dict, container: dict, cms: dict | None, started: datetime | None, pre: dict | None = None):
     """resolve(name) -> {"state": set|unset|UNKNOWN, "value", "from", "why"}, in the kubelet's order:
     the container's env entries (the last one of a name wins) over its envFrom sources (a later
-    source over an earlier one); an optional ConfigMap key that is missing sets nothing."""
+    source over an earlier one); an optional ConfigMap key that is missing sets nothing, and so
+    does an optional ConfigMap proven absent since before the pod existed (#1276, `pre`)."""
     env = container.get("env") or []
     env_from = container.get("envFrom") or []
 
@@ -189,8 +224,10 @@ def _resolver(pod: dict, container: dict, cms: dict | None, started: datetime | 
             ref = src.get("configMapRef")
             if not isinstance(ref, dict):
                 return {"state": UNKNOWN, "why": "an envFrom source of an unknown kind"}
-            st, cm = _cm_state(ref.get("name"), cms, started)
+            st, cm = _cm_state(ref.get("name"), cms, started, optional=bool(ref.get("optional")), pre=pre, pod=pod)
             label = f"envFrom configMapRef {ref.get('name')}" + (f" (prefix {prefix})" if prefix else "")
+            if st == "absent_since_before_install":
+                continue                     # optional, and not there when the container started
             if st != "read":
                 return {"state": UNKNOWN, "why": f"{label}: {_CM_WHY[st]}"}
             data = cm.get("data") or {}
@@ -215,8 +252,11 @@ def _resolver(pod: dict, container: dict, cms: dict | None, started: datetime | 
                         {"state": UNKNOWN, "why": f"env fieldRef {path}: not in the pod's reading"})
             ref = vf.get("configMapKeyRef")
             if isinstance(ref, dict):
-                st, cm = _cm_state(ref.get("name"), cms, started)
+                st, cm = _cm_state(ref.get("name"), cms, started, optional=bool(ref.get("optional")),
+                                   pre=pre, pod=pod)
                 label = f"env configMapKeyRef {ref.get('name')}/{ref.get('key')}"
+                if st == "absent_since_before_install":
+                    return from_env_from(name)       # optional and absent: the entry sets nothing
                 if st != "read":
                     return {"state": UNKNOWN, "why": f"{label}: {_CM_WHY[st]}"}
                 data = cm.get("data") or {}
@@ -302,17 +342,59 @@ def _receiver(endpoint: dict, node: str | None, node_pods: dict | None, node_pod
                                       f"the pod(s) on hostPort {port} are not Running and Ready")})}
 
 
+def env_sources(pod: dict, container: dict, cms: dict | None, started: datetime | None, keep, field: str,
+                *, configmaps_why: str | None = None, pre: dict | None = None) -> tuple[list[dict], set]:
+    """Every env source of the container, in its order, with only the keys `keep(name)` accepts
+    (under `field`), and the set of those names. A Secret source is counted, never named or read;
+    every other key of a ConfigMap is dropped here, before anything is recorded."""
+    sources, names = [], set()
+    for src in container.get("envFrom") or []:
+        if "secretRef" in src:
+            sources.append({"source": "envFrom", "kind": "secretRef", "state": "not_read"})
+            continue
+        ref = src.get("configMapRef") or {}
+        state, cm = _cm_state(ref.get("name"), cms, started, optional=bool(ref.get("optional")), pre=pre, pod=pod)
+        prefix = src.get("prefix") or ""
+        kept = {prefix + k: v for k, v in ((cm or {}).get("data") or {}).items() if keep(prefix + k)}
+        names |= set(kept)
+        sources.append({"source": "envFrom", "kind": "configMapRef", "configmap": ref.get("name"),
+                        "prefix": prefix or None, "optional": bool(ref.get("optional")), "state": state,
+                        **({"configmaps_why": configmaps_why} if state == "unreadable" and configmaps_why else {}),
+                        field: kept})
+    env_kept = {}
+    for e in container.get("env") or []:
+        if not keep(e.get("name")):
+            continue
+        names.add(e["name"])
+        vf = e.get("valueFrom")
+        if vf is None:
+            env_kept[e["name"]] = {"value": e.get("value") or ""}
+        elif "secretKeyRef" in vf:
+            env_kept[e["name"]] = {"secretKeyRef": True, "state": "not_read"}
+        elif "configMapKeyRef" in vf:
+            ref = vf["configMapKeyRef"]
+            env_kept[e["name"]] = {"configMapKeyRef": {"configmap": ref.get("name"), "key": ref.get("key")}}
+        elif "fieldRef" in vf:
+            env_kept[e["name"]] = {"fieldRef": (vf.get("fieldRef") or {}).get("fieldPath")}
+        else:
+            env_kept[e["name"]] = {"unknown_kind": True}
+    sources.append({"source": "env", field: env_kept})
+    return sources, names
+
+
 def reading(phase: str, pods: dict | None, configmaps: dict | None, node_pods: dict | None,
             *, pods_why: str | None = None, configmaps_why: str | None = None,
-            node_pods_why: str | None = None, t: float | None = None) -> dict:
-    """One reading from what kubectl returned (None = that read failed, its *_why says how)."""
+            node_pods_why: str | None = None, t: float | None = None, preinstall: dict | None = None) -> dict:
+    """One reading from what kubectl returned (None = that read failed, its *_why says how).
+    `preinstall`: the namespace's ConfigMaps before the install (#1276, preinstall_reading)."""
     out: dict = {"phase": phase, "t": time.time() if t is None else t}
     pod, why = _live_pod(pods)
     if pod is None:
         why = dict(why, why=pods_why or why["why"]) if pods is None else why
         return {**out, "pod": why, "tracing": {"state": UNKNOWN, "why": why["why"]},
                 "sampler": {"state": UNKNOWN, "why": why["why"]}, "endpoint": {"state": UNKNOWN, "why": why["why"]},
-                "receiver": {"state": UNKNOWN, "why": why["why"]}, "effective": {}, "env_sources": []}
+                "receiver": {"state": UNKNOWN, "why": why["why"]}, "effective": {}, "env_sources": [],
+                "go_env": {"state": UNKNOWN, "why": why["why"], "effective": {}, "env_sources": []}}
     container, cstatus = _container(pod)
     md, sp, st = pod.get("metadata") or {}, pod.get("spec") or {}, pod.get("status") or {}
     started_s = (((cstatus or {}).get("state") or {}).get("running") or {}).get("startedAt")
@@ -323,45 +405,21 @@ def reading(phase: str, pods: dict | None, configmaps: dict | None, node_pods: d
         w = "the pod has no single snowplow container to read"
         return {**out, "tracing": {"state": UNKNOWN, "why": w}, "sampler": {"state": UNKNOWN, "why": w},
                 "endpoint": {"state": UNKNOWN, "why": w}, "receiver": {"state": UNKNOWN, "why": w},
-                "effective": {}, "env_sources": []}
+                "effective": {}, "env_sources": [],
+                "go_env": {"state": UNKNOWN, "why": w, "effective": {}, "env_sources": []}}
     cms = _cm_index(configmaps)
     started = _ts(started_s)
-    resolve = _resolver(pod, container, cms, started)
+    resolve = _resolver(pod, container, cms, started, preinstall)
 
     # every env source, OTEL_* only, in the container's order; a Secret source is counted, never named
-    sources, names = [], set(TRACING_KEYS)
-    for src in container.get("envFrom") or []:
-        if "secretRef" in src:
-            sources.append({"source": "envFrom", "kind": "secretRef", "state": "not_read"})
-            continue
-        ref = src.get("configMapRef") or {}
-        state, cm = _cm_state(ref.get("name"), cms, started)
-        prefix = src.get("prefix") or ""
-        otel = {prefix + k: v for k, v in ((cm or {}).get("data") or {}).items() if _is_otel(prefix + k)}
-        names |= set(otel)
-        sources.append({"source": "envFrom", "kind": "configMapRef", "configmap": ref.get("name"),
-                        "prefix": prefix or None, "optional": bool(ref.get("optional")), "state": state,
-                        **({"configmaps_why": configmaps_why} if state == "unreadable" and configmaps_why else {}),
-                        "otel": otel})
-    env_otel = {}
-    for e in container.get("env") or []:
-        if not _is_otel(e.get("name")):
-            continue
-        names.add(e["name"])
-        vf = e.get("valueFrom")
-        if vf is None:
-            env_otel[e["name"]] = {"value": e.get("value") or ""}
-        elif "secretKeyRef" in vf:
-            env_otel[e["name"]] = {"secretKeyRef": True, "state": "not_read"}
-        elif "configMapKeyRef" in vf:
-            ref = vf["configMapKeyRef"]
-            env_otel[e["name"]] = {"configMapKeyRef": {"configmap": ref.get("name"), "key": ref.get("key")}}
-        elif "fieldRef" in vf:
-            env_otel[e["name"]] = {"fieldRef": (vf.get("fieldRef") or {}).get("fieldPath")}
-        else:
-            env_otel[e["name"]] = {"unknown_kind": True}
-    sources.append({"source": "env", "otel": env_otel})
+    sources, names = env_sources(pod, container, cms, started, _is_otel, "otel",
+                                 configmaps_why=configmaps_why, pre=preinstall)
+    names |= set(TRACING_KEYS)
     eff = {k: resolve(k) for k in sorted(names)}
+    # run 24: the Go runtime's own settings (GOGC, GOMEMLIMIT, GOMAXPROCS, any GO* key), from the
+    # same sources by the same rules (bench/goruntime.py reports them)
+    from bench import goruntime
+    out["go_env"] = goruntime.go_env(pod, container, cms, started, resolve, configmaps_why, preinstall)
 
     # the trace gate, as snowplow resolves it: OTEL_TRACING_ENABLED, default OTEL_ENABLED, default false
     tracing = None
@@ -390,6 +448,32 @@ def reading(phase: str, pods: dict | None, configmaps: dict | None, node_pods: d
     receiver = _receiver(endpoint, sp.get("nodeName"), node_pods, node_pods_why)
     return {**out, "tracing": tracing, "sampler": sampler, "endpoint": endpoint, "receiver": receiver,
             "effective": eff, "env_sources": sources}
+
+
+def preinstall_reading(pods: dict | None, configmaps: dict | None, *, pods_why: str | None = None,
+                       configmaps_why: str | None = None, t: float | None = None) -> dict:
+    """#1276: the namespace BEFORE run606's install step — whether any snowplow pod exists, and
+    the NAMES of the ConfigMaps that exist (names only: no data, no other field). A later reading
+    then knows an optional envFrom ConfigMap that is absent now and was absent here, before the
+    pod was created, held nothing when the container started. A read that failed proves nothing
+    (state "unread"): those ConfigMaps stay UNKNOWN."""
+    t = time.time() if t is None else t
+    if pods is None or configmaps is None:
+        return {"phase": "preinstall", "t": t, "state": "unread",
+                "why": pods_why if pods is None else configmaps_why}
+    return {"phase": "preinstall", "t": t, "state": "read",
+            "snowplow_pods": sorted((p.get("metadata") or {}).get("name") or "?" for p in pods.get("items") or []),
+            "configmaps": sorted((c.get("metadata") or {}).get("name") for c in configmaps.get("items") or []
+                                 if (c.get("metadata") or {}).get("name"))}
+
+
+def preinstall_line(r: dict | None) -> str:
+    if not r:
+        return "pre-install: no reading (an absent optional ConfigMap stays UNKNOWN)"
+    if r.get("state") != "read":
+        return f"pre-install: not read ({r.get('why')}): an absent optional ConfigMap stays UNKNOWN"
+    return (f"pre-install: {len(r['configmaps'])} ConfigMap(s) in the namespace, "
+            f"{len(r['snowplow_pods'])} snowplow pod(s)")
 
 
 def reading_line(r: dict) -> str:
@@ -421,17 +505,24 @@ def reading_line(r: dict) -> str:
 
 # ─── the file and the report ────────────────────────────────────────────────
 
-def record(path: str, r: dict) -> dict:
-    """Add one reading to tracing.json (written whole, then renamed into place)."""
-    doc = None
+def _load(path: str) -> dict | None:
     try:
         with open(path) as fh:
             doc = json.load(fh)
     except (OSError, ValueError):
-        pass
-    if not isinstance(doc, dict) or doc.get("kind") != "tracing":
-        doc = {"kind": "tracing", "schema": 1, "readings": {}}
-    doc["readings"][r["phase"]] = r
+        return None
+    return doc if isinstance(doc, dict) and doc.get("kind") == "tracing" else None
+
+
+def record(path: str, r: dict) -> dict:
+    """Add one reading to tracing.json (written whole, then renamed into place); the pre-install
+    reading goes under "preinstall"."""
+    doc = _load(path) or {"kind": "tracing", "schema": 1, "readings": {}}
+    doc.setdefault("readings", {})
+    if r["phase"] == "preinstall":
+        doc["preinstall"] = r
+    else:
+        doc["readings"][r["phase"]] = r
     doc["span_export"] = SPAN_EXPORT
     tmp = f"{path}.tmp-{os.getpid()}"
     with open(tmp, "w") as fh:
@@ -477,6 +568,7 @@ def report(path: str | None) -> dict:
             lines.append("INFO tracing changed during the measure: " + ", ".join(changed))
     span = doc.get("span_export") or SPAN_EXPORT
     lines.append(_span_line(span))
+    lines.append("INFO tracing " + preinstall_line(doc.get("preinstall")))
     states = {((readings.get(ph) or {}).get("tracing") or {}).get("state") or UNKNOWN for ph in PHASES}
     return {"result": "INFO", "state": states.pop() if len(states) == 1 else UNKNOWN,
             "readings": {ph: readings.get(ph) for ph in PHASES}, "changed": changed,
@@ -510,8 +602,20 @@ def _read(runner: Runner, kubectl: list[str], args: list[str], deadline: float) 
     return (doc, None) if isinstance(doc, dict) else (None, "kubectl's answer is not a JSON object")
 
 
+def read_preinstall(kubectl: list[str], namespace: str, selector: str, timeout_s: float,
+                    runner: Runner | None = None) -> dict:
+    """#1276: the pre-install reading, two kubectl reads under ONE bound. ConfigMaps' names only
+    reach the record (preinstall_reading); a namespace that does not exist yet lists none."""
+    runner = runner or Runner()
+    deadline = time.monotonic() + timeout_s
+    t = time.time()
+    pods, pods_why = _read(runner, kubectl, ["-n", namespace, "get", "pods", "-l", selector, "-o", "json"], deadline)
+    cms, cms_why = _read(runner, kubectl, ["-n", namespace, "get", "configmaps", "-o", "json"], deadline)
+    return preinstall_reading(pods, cms, pods_why=pods_why, configmaps_why=cms_why, t=t)
+
+
 def read_live(phase: str, kubectl: list[str], namespace: str, selector: str, timeout_s: float,
-              runner: Runner | None = None) -> dict:
+              runner: Runner | None = None, preinstall: dict | None = None) -> dict:
     runner = runner or Runner()
     deadline = time.monotonic() + timeout_s
     pods, pods_why = _read(runner, kubectl, ["-n", namespace, "get", "pods", "-l", selector, "-o", "json"], deadline)
@@ -525,8 +629,9 @@ def read_live(phase: str, kubectl: list[str], namespace: str, selector: str, tim
                                                       "-o", "json"], deadline)
     elif pod is not None:
         node_why = "the snowplow pod names no node"
-    # the namespace's ConfigMaps stay in memory: only OTEL_* keys reach the reading
-    return reading(phase, pods, cms, node_pods, pods_why=pods_why, configmaps_why=cms_why, node_pods_why=node_why)
+    # the namespace's ConfigMaps stay in memory: only OTEL_* and GO* keys reach the reading
+    return reading(phase, pods, cms, node_pods, pods_why=pods_why, configmaps_why=cms_why, node_pods_why=node_why,
+                   preinstall=preinstall)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -538,7 +643,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tracing")
     sub = ap.add_subparsers(dest="cmd", required=True)
     rd = sub.add_parser("read", help="one reading of the live snowplow pod into tracing.json (-- kubectl ...)")
-    rd.add_argument("--phase", required=True, choices=PHASES)
+    rd.add_argument("--phase", required=True, choices=PHASES + ("preinstall",),
+                    help="preinstall (#1276): before run606's install step, the namespace's ConfigMap names")
     rd.add_argument("--out", required=True)
     rd.add_argument("--namespace", default="krateo-system")
     rd.add_argument("--selector", default="app.kubernetes.io/name=snowplow")
@@ -551,7 +657,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not kubectl:
         ap.error("read: the kubectl command goes after --")
-    r = read_live(a.phase, kubectl, a.namespace, a.selector, a.timeout_s)
+    if a.phase == "preinstall":
+        r = read_preinstall(kubectl, a.namespace, a.selector, a.timeout_s)
+        record(a.out, r)
+        print(preinstall_line(r))
+        return 0
+    r = read_live(a.phase, kubectl, a.namespace, a.selector, a.timeout_s,
+                  preinstall=(_load(a.out) or {}).get("preinstall"))
     record(a.out, r)
     print(reading_line(r))
     return 0

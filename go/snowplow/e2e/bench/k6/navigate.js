@@ -142,13 +142,25 @@ function headers (user) {
   return { Authorization: `Bearer ${TOKENS[user - 1]}` }
 }
 
+// Run 24: every request point carries its user's BUCKET (`ub`: the 1-based user-id range it falls
+// in, USER_BUCKETS ranges of equal width over CFG.users, e.g. "201-300" of 1,000) beside k6's own
+// `scenario` tag, so a phase's calls can be split by who made them (run 23's steady slowdown fell
+// on the navigate users only, and no point said which user it was). Never a username: a range of
+// ids, ~10 values. A tag is the point's metadata: it changes no request, no timing, no schedule.
+const USER_BUCKETS = 10
+const BUCKET_W = Math.max(1, Math.ceil(CFG.users / USER_BUCKETS))
+function bucketOf (user) {
+  const lo = Math.floor((user - 1) / BUCKET_W) * BUCKET_W + 1
+  return `${lo}-${lo + BUCKET_W - 1}`
+}
+
 // One level of the tree: one http.batch, at most 6 in flight per host.
 function fetcher (user, tags) {
   return (paths, depth) => {
     const reqs = paths.map((p) => ({
       method: 'GET',
       url: CFG.snowplowUrl + p,
-      params: { headers: headers(user), tags: Object.assign({ level: String(depth) }, tags),
+      params: { headers: headers(user), tags: Object.assign({ level: String(depth), ub: bucketOf(user) }, tags),
                 timeout: '60s' },
     }))
     return http.batch(reqs).map((r) => ({ status: r.status, body: r.body || '', refresh: refreshOf(r) }))

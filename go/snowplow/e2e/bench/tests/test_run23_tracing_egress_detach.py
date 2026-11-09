@@ -302,8 +302,9 @@ def test_the_dry_run_shows_both_readings_and_evaluate_reads_tracing_json(tmp_pat
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1")
     assert p.returncode == 0, p.stderr[-2000:]
     reads = [ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.tracing read" in ln]
-    # the measure takes its reading; collect (which a dry pass skips) takes the other, after its pod record
-    assert len(reads) == 1 and "--phase before" in reads[0]
+    # #1276: the pre-install reading, then the measure's; collect (which a dry pass skips) takes
+    # the other, after its pod record
+    assert len(reads) == 2 and "--phase preinstall" in reads[0] and "--phase before" in reads[1]
     src = (BENCH_DIR / "run606.sh").read_text()
     assert "  snowplow_pod_record before\n  tracing_reading before\n" in src
     assert "  snowplow_pod_record after\n  tracing_reading after\n" in src
@@ -329,6 +330,18 @@ def test_the_real_sequence_records_both_readings_into_the_verdict(harness):  # n
     assert "tracing (before): tracing ON" in log and "tracing (after): tracing ON" in log
     assert "INFO tracing before the measure: tracing ON" in log
     assert "INFO tracing spans exported: not known" in log
+    # run 24 / #1276: the pre-install reading came before the install, and the GO* env, the node
+    # CPU platforms (the fake cluster lists no node: UNKNOWN, said) and the k6 user buckets are in
+    # the verdict and the run log
+    assert doc["preinstall"]["state"] == "read" and doc["preinstall"]["snowplow_pods"] == []
+    assert "tracing (pre-install: " in log
+    assert v["report"]["go_runtime_report_only"]["state"] == "read" and "INFO Go runtime env before the measure: " in log
+    shape = [json.loads(ln) for ln in (tmp / "out" / "cluster-shape-nodes.jsonl").read_text().splitlines()]
+    assert [r["phase"] for r in shape] == ["up", "collect"]
+    assert v["report"]["nodes_report_only"]["lines"][0] == \
+        "INFO node CPU platforms (up): UNKNOWN (kubectl listed no node)"
+    assert "node CPU platforms (up): UNKNOWN (kubectl listed no node)" in log
+    assert "user_buckets_report_only" in v["report"]
     # the fake snowplow publishes no egress counters: ABSENT, never 0
     eg = v["report"]["egress_connections_report_only"]
     assert eg["connections"]["status"] == "ABSENT" and "INFO egress connections: ABSENT" in log

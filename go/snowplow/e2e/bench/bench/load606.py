@@ -5862,6 +5862,19 @@ def _cmd_evaluate(a) -> int:
     result["report"]["tracing_report_only"] = tr = _report_only(tracing.report, a.tracing)
     for ln in tr.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
+    # run 24 (INFO, never judged): every node's CPU platform (bench/nodes.py, cluster-shape-nodes.jsonl),
+    # snowplow's Go runtime settings (GO* env from the tracing readings; bench/goruntime.py) and k6's
+    # customer calls per user bucket (the judged cells pool every bucket)
+    from bench import custlat, goruntime, nodes
+    result["report"]["nodes_report_only"] = _report_only(nodes.report, recs)
+    result["report"]["go_runtime_report_only"] = _report_only(
+        goruntime.report, a.tracing, [r for r in recs if r.get("kind") == "mem"])
+    result["report"]["user_buckets_report_only"] = _report_only(
+        custlat.user_bucket_report, (k6 or {}).get("k6"),
+        ((result["report"].get("customer_latency") or {}).get("windows")) or [])
+    for sec in ("nodes_report_only", "go_runtime_report_only", "user_buckets_report_only"):
+        for ln in result["report"][sec].get("lines") or []:
+            print(ln, file=sys.stderr, flush=True)
     # the stretches the run's measure / collect loops could not reach the API
     # server (run606 api_seen): shown with the verdict, never judged
     result["report"]["api_unreachable_report_only"] = [r for r in recs if r.get("kind") == "api_unreachable"]

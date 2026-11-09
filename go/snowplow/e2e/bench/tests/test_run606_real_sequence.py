@@ -517,7 +517,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         sys.exit(0 if f483 in ("pass", "wide") else 1)
     if a[:2] == ["get", "pods"] and "app.kubernetes.io/name=snowplow" in a and "json" in a:
         # snowplow's own pod: optionally OOM-restarted between the before/after
-        # records (FAKE_RESTART_DURING_MEASURE=1).
+        # records (FAKE_RESTART_DURING_MEASURE=1). Before the installer's helm install
+        # (run 24: run606's pre-install tracing reading) there is no snowplow pod.
+        if not os.path.exists(os.path.join(STATE, "installer-installed")):
+            print(json.dumps({"items": []})); sys.exit(0)
         cnt = os.path.join(STATE, "snowplow_pod_reads")
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
         open(cnt, "w").write(str(n + 1))
@@ -1247,6 +1250,9 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         print(json.dumps({"crds": {"enabled": True}})); sys.exit(0)
     if "install" in a:
         import yaml
+        if sa[:2] == ["install", "installer"]:
+            # run 24 (#1276): the snowplow pod exists only from the install on
+            open(os.path.join(STATE, "installer-installed"), "w").close()
         merged = {}
         for i, x in enumerate(a):
             if x == "-f" and i + 1 < len(a):
