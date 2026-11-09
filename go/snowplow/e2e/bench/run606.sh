@@ -578,10 +578,7 @@ teardown() {
   # and a capped one (a step's collect): left running it would write into OUT beside the
   # teardown's own collect, and during the publish (#1194)
   if [[ -n "$CAPPED_PID" ]]; then halt_tree "$CAPPED_PID"; CAPPED_PID=""; fi
-  declare -F stop_top_loop >/dev/null && stop_top_loop
-  declare -F stop_apf_loop >/dev/null && stop_apf_loop
-  declare -F stop_sampler >/dev/null && stop_sampler top_boot
-  declare -F stop_log_stream >/dev/null && stop_log_stream
+  # #1297: no sampler runs here any more (they are in-cluster: incluster_teardown, below)
   # #1004: the full-widen stage's bodies and its password-bearing manifests
   # never outlive the run, whatever stopped it (no cluster call)
   declare -F fw_local_cleanup >/dev/null && fw_local_cleanup
@@ -624,6 +621,13 @@ teardown() {
     # controller logs once more, before the cluster goes
     if [[ "$TD_SIGNALED" != "1" ]] && { [[ "$DRY" == "1" ]] || [[ -s "$KCFG" ]]; }; then
       capped_definitions teardown
+    fi
+    # #1297: whatever stopped the run, the in-cluster Jobs' files are copied into OUT (the samplers'
+    # streams, data606's proof and log) and their Jobs, ServiceAccounts and RBAC deleted, before
+    # the evidence is published. Under its own cap; a signal cuts it short (the cluster's deletion
+    # is then the backstop for the objects, and what was not copied is said)
+    if [[ "$TD_SIGNALED" != "1" ]] && { [[ "$DRY" == "1" ]] || [[ -s "$KCFG" ]]; }; then
+      capped "$COLLECT_CAP_S" "in-cluster teardown" incluster_teardown
     fi
     # Test hook (like BENCH_606_FAIL_AT): a command that fails inside teardown,
     # as one killed by a group signal would. It must not stop the delete.
@@ -1200,10 +1204,10 @@ s_env() {
   # gke-env re-exports these; re-assert the pin regardless of what it printed.
   export KUBECONFIG="$KCFG" BENCH_GKE_CONTEXT="$KCTX" EXPECTED_IMAGE_TAG="$SNOWPLOW_TAG"
   # The platform is up: snowplow's log is streamed from here to collect, and
-  # the API server's flow control sampled (#919).
-  start_log_stream
+  # the API server's flow control sampled (#919) — in-cluster, by the observer
+  # on the loadgen node (#1297), never from this machine.
+  start_observer || return 1
   apf_preflight || return 1
-  start_apf_loop
   start_netns_sampler
   flowcontrol_attribution || return 1
 }
@@ -1362,12 +1366,30 @@ s_preflight() {
 s_data() {
   # Data stamping is kubectl-only. User LOGINS need authn over HTTP: in
   # in-cluster mode they are deferred to the in-cluster driver.
-  local login=()
+  # #1297: data606 runs IN-CLUSTER, as a Job on the loadgen node under its own
+  # ServiceAccount (bench/incluster.py), with exactly the arguments it ran
+  # with here; its proof and its log come back into OUT (data-proof.json,
+  # data606/), its Job, ServiceAccount and RBAC are deleted, and its pod is
+  # gone before the step ends (the drivers come after it, on the same node).
+  local login=() args mf="$OUT/data606-job.yaml"
   [[ "$ENDPOINT_MODE" == "incluster" ]] && login=(--no-login)
-  run bounded "$DATA_TIMEOUT_S" python3 -m bench data606 --scale "$SCALE" --users "$USERS" \
-      --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S" \
-      --out "$OUT/data-proof.json" ${login[@]+"${login[@]}"} \
-      $([[ "$FRESH_MODES" == "annotation" ]] || printf -- '--fresh-modes %s' "$FRESH_MODES")
+  args=(--scale "$SCALE" --users "$USERS" --namespaces "$NAMESPACES" --hold-probe-wait-s "$HOLD_PROBE_WAIT_S"
+        ${login[@]+"${login[@]}"})
+  # shellcheck disable=SC2206
+  [[ "$FRESH_MODES" == "annotation" ]] || args+=(--fresh-modes $FRESH_MODES)
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: ${INC[*]} render-data606 --context $KCTX --timeout-s $DATA_TIMEOUT_S --machine $LOADGEN_MACHINE_TYPE -- ${args[*]} > $mf; kapply; the pod on the loadgen node; wait for /out/done; copy /out -> $OUT/data606 (data-proof.json); delete the Job, its ServiceAccount and RBAC"
+  else
+    "${INC[@]}" render-data606 --context "$KCTX" --timeout-s "$DATA_TIMEOUT_S" --linger-s "$COLLECT_CAP_S" \
+        --machine "$LOADGEN_MACHINE_TYPE" -- "${args[@]}" > "$mf"
+    : > "$OUT/.data606-applied"     # from here the teardown collects and deletes it, whatever happens
+    kapply "$mf"
+    if ! incluster_started data606 "$mf" "$PREFLIGHT_TIMEOUT_S" || ! data606_wait; then
+      data606_finish || true
+      return 1
+    fi
+    data606_finish || return 1
+  fi
   if [[ "$LOAD_DRIVER" == "k6" ]]; then fresh_classes_create || return 1; fi
 }
 # fresh_classes_create (#935): the fresh identity classes each Chrome session
@@ -1474,7 +1496,7 @@ s_reboot() {
   # new pod's start and Ready times come from its before-record), and kubectl
   # top through it (kind top_boot, apart from the measure's samples, stopped
   # when the measure starts its own).
-  start_sampler top_boot "$OUT/top-boot.jsonl" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers
+  observer_signal top_boot
   [[ "$DRY" == "1" ]] || python3 -c 'import json, time; print(json.dumps({"kind": "boot", "t_restart": time.time()}))' \
       > "$OUT/boot.jsonl"
   run "${K[@]}" -n krateo-system rollout restart deploy/snowplow
@@ -1559,9 +1581,12 @@ s_measure() {
   tracing_reading before
   # Standard memory capture (#710): kubectl top every TOP_POLL_S from here
   # (each sample bounded by it, #919), plus the in-cluster mem606 Job
-  # (memstats + heap profiles, metadata only). The boot's own samples end here.
-  stop_sampler top_boot
-  start_top_loop
+  # (memstats + heap profiles, metadata only). The boot's own samples end here:
+  # the observer switches top_boot to top at once (#1297).
+  observer_signal top
+  # #1297: the data load and the drivers never share the loadgen node: data606's
+  # pod is gone (s_data waited for it) before any driver Job is applied
+  data606_gone || return 1
   MEASURE_STARTED=1
   kapply "$OUT/loadgen-job.yaml"
   local deadline=$(( $(date +%s) + MEASURE_WAIT_S ))
@@ -1920,136 +1945,266 @@ node_platforms() {
     log "could not record the node CPU platforms ($phase): $(kerr_line); the verdict will say they are UNKNOWN"
   fi
 }
-# start_sampler <kind> <file> <kubectl args...> (#919): every TOP_POLL_S, one
-# kubectl read of the bench cluster, one record in <file> (bench/sampler.py).
-# Each sample is bounded by its period — kubectl's own --request-timeout and
-# the sampler's wall clock (it kills the call's process group) — so a sample
-# still unanswered when the next one is due is recorded as a FAILED sample
-# (rc, timed_out, kubectl's error line redacted by bench/identity.py) and the
-# loop carries on. Run 16 B: one hung `kubectl top` with no request timeout
-# ended CPU sampling for the last 3.5 h, the stall included. The PID lives in
-# a pidfile: stop_sampler also runs inside collect's `capped` subshell.
-start_sampler() {
-  local kind="$1" file="$2"; shift 2
+# ─── #1297: the run's own work, IN-CLUSTER on the loadgen node (bench/incluster.py) ──────────────
+# Paid run 24 failed its data step on every arm because THIS machine was loaded (~90 on 8 CPUs): data606
+# and every timed sampler ran here. Now they run as Jobs on the run's loadgen node, each under a
+# ServiceAccount of its own (exactly its RBAC, created with it and deleted when it is done and at
+# teardown), and this script only applies, waits and collects:
+#   data606     the data load (s_data);
+#   observe606  the API server's APF scrape (#919, apf.jsonl.gz), `kubectl top` of snowplow through
+#               the boot (top-boot.jsonl, from s_reboot) and the measure (top.jsonl, from s_measure),
+#               and snowplow's scrubbed log stream (#822, snowplow-stream.log; bench/log_stream.sh):
+#               from the env step to collect, the same programs (bench/sampler.py, bench/logscrub.py),
+#               the same files, which evaluate reads unchanged.
+# Each sample is still bounded by its period (#919: a sample unanswered when the next is due is a
+# FAILED sample, and the loop carries on), now measured from the loadgen node, not from here.
+# Every pod's placement (its node's pool) and requests are verified and recorded
+# (incluster-placement.jsonl): one that is not on the loadgen pool with the rendered requests fails
+# its step.
+INC=(python3 -m bench.incluster)
+INC_FINISH_CALLS=6        # a Job's finish: its /out copy, its init log, /out/collected, 3 deletes
+OBSERVE_STOP_WAIT_S="$MEM_STOP_WAIT_S"
+BENCH_USER_PREFIX="${BENCH_USER_PREFIX:-scaleuser-}"   # load606 drive --user-prefix
+scrub() { python3 -m bench.logscrub --deny "$PW" --deny "$BENCH_USER_PREFIX" "$@"; }
+# incluster_pod <job>: the Job's live pod (empty if none)
+incluster_pod() {
+  "${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$1" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+      2>/dev/null | awk 'NF == 1 {print $1}' | tail -1
+}
+# incluster_started <job> <manifest> <secs>: its pod runs (its init container fetched kubectl and
+# wrote its kubeconfig) within <secs>, on the loadgen pool with the rendered requests; else the step
+# fails, with the init container's log kept in OUT/<job>-tools.log
+incluster_started() {
+  local job="$1" mf="$2" secs="$3" deadline phase pod
+  deadline=$(( $(date +%s) + secs ))
+  while true; do
+    phase="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$job" \
+               -o 'jsonpath={.items[0].status.phase}' 2>"$KERR" || true)"
+    case "$phase" in
+      Running|Succeeded) break ;;
+      Failed) pod="$(incluster_pod "$job")"
+              [[ -z "$pod" ]] || bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+                  -n bench-loadgen logs "$pod" -c tools > "$OUT/$job-tools.log" 2>/dev/null
+              record_failure "$job FAILED: its pod failed before its program ran (the init container's log: $OUT/$job-tools.log)" || true
+              return 1 ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      record_failure "$job FAILED: its pod did not start within ${secs}s (phase ${phase:-none})" || true
+      return 1
+    fi
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  pod="$(incluster_pod "$job")"
+  [[ -z "$pod" ]] || bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" \
+      -n bench-loadgen logs "$pod" -c tools > "$OUT/$job-tools.log" 2>/dev/null
+  incluster_placement "$job" "$mf"
+}
+# incluster_placement <job> <manifest>: where its pod runs, recorded; not the loadgen pool, or not the
+# rendered requests, fails the step
+incluster_placement() {
+  local job="$1" mf="$2" rec rc=0
+  local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  if ! "${KR[@]}" -n bench-loadgen get pods -l "job-name=$job" -o json > "$OUT/.pods-$job.json" 2>"$KERR" \
+      || ! "${KR[@]}" get nodes -o json > "$OUT/.nodes.json" 2>"$KERR"; then
+    record_failure "$job FAILED: where its pod runs could not be read" || true
+    return 1
+  fi
+  rec="$("${INC[@]}" placement --job "$job" --pods "$OUT/.pods-$job.json" --nodes "$OUT/.nodes.json" \
+            --manifest "$mf")" || rc=$?
+  rm -f "$OUT/.pods-$job.json" "$OUT/.nodes.json"
+  printf '%s\n' "$rec" >> "$OUT/incluster-placement.jsonl"
+  local why
+  why="$(printf '%s' "$rec" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("why"))' 2>/dev/null)"
+  if (( rc != 0 )); then
+    record_failure "$job FAILED: its pod is not where it must run: ${why}" || true
+    return 1
+  fi
+  log "$job: ${why}"
+}
+# incluster_delete <job>: the Job (its pod gone first), its ServiceAccount and RBAC (and the
+# observer's Secret), each delete bounded; idempotent (the teardown repeats it)
+incluster_delete() {
+  local job="$1" ns names rc=0
+  while read -r ns names; do
+    # shellcheck disable=SC2086
+    if [[ "$ns" == "-" ]]; then
+      bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" delete $names \
+          --ignore-not-found --wait=true --timeout="${COLLECT_TIMEOUT_S}s" >/dev/null 2>"$KERR" || rc=1
+    else
+      bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n "$ns" delete $names \
+          --ignore-not-found --cascade=foreground --wait=true --timeout="${COLLECT_TIMEOUT_S}s" >/dev/null 2>"$KERR" || rc=1
+    fi
+  done < <("${INC[@]}" cleanup-names --job "$job")
+  if (( rc != 0 )); then
+    log "WARNING: $job: its Job, ServiceAccount or RBAC could not all be deleted ($(kerr_line)); the cluster's deletion is the backstop"
+    return 1
+  fi
+  log "$job: its Job, ServiceAccount and RBAC deleted"
+}
+# data606_wait: until data606's pod is Ready (its /out/done holds data606's exit code) or failed,
+# within data606's own bound (enforced in the pod) and one poll. A read the API server does not
+# answer is polled again; only the deadline or a failed pod ends the wait.
+data606_wait() {
+  local deadline st
+  deadline=$(( $(date +%s) + DATA_TIMEOUT_S + TOP_POLL_S ))
+  log "data606: running in-cluster (bounded at ${DATA_TIMEOUT_S}s in its pod); waiting for its result"
+  while true; do
+    st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l job-name=data606 \
+            -o 'jsonpath={.items[0].status.phase}/{.items[0].status.containerStatuses[0].ready}' 2>"$KERR" || true)"
+    case "$st" in
+      */true) return 0 ;;
+      Failed/*|Succeeded/*) log "data606: its pod ended (${st%/*}) before its result was final"; return 1 ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      record_failure "data FAILED: data606 gave no result within ${DATA_TIMEOUT_S}s (+ one poll); its pod reads ${st:-unreadable}" || true
+      return 1
+    fi
+    sleep "$TOP_POLL_S"
+  done
+}
+# data606_finish: its /out into OUT/data606 (data-proof.json also at OUT's top, where it always was;
+# its log into the console, as when it ran here), then its Job, ServiceAccount and RBAC deleted.
+# Fails (with the reason) unless data606 exited 0. The teardown calls it for a data step it cut short.
+data606_finish() {
+  local pod rc
+  local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  [[ -f "$OUT/.data606-applied" && ! -f "$OUT/.data606-collected" ]] || return 0
+  pod="$(incluster_pod data606)"
+  mkdir -p "$OUT/data606"
+  if [[ -n "$pod" ]]; then
+    "${KR[@]}" -n bench-loadgen cp -c data606 "$pod:/out" "$OUT/data606" >/dev/null 2>"$KERR" \
+      || log "could not copy data606's /out from $pod ($(kerr_line)): its proof and log may be missing"
+    "${KR[@]}" -n bench-loadgen logs "$pod" -c tools > "$OUT/data606/tools.log" 2>/dev/null || true
+    "${KR[@]}" -n bench-loadgen exec "$pod" -c data606 -- touch /out/collected >/dev/null 2>&1 || true
+  else
+    log "data606: no pod to copy from: its proof and log are missing"
+  fi
+  [[ -f "$OUT/data606/data-proof.json" ]] && cp "$OUT/data606/data-proof.json" "$OUT/data-proof.json"
+  if [[ -f "$OUT/data606/data606.log" ]]; then
+    log "data606's own output (in-cluster; $OUT/data606/data606.log):"
+    cat "$OUT/data606/data606.log" >&2
+  fi
+  incluster_delete data606 || true
+  : > "$OUT/.data606-collected"
+  rc="$(tr -d '[:space:]' < "$OUT/data606/done" 2>/dev/null || true)"
+  if [[ "$rc" != "0" ]]; then
+    record_failure "data FAILED: data606 (in-cluster) exited ${rc:-with no exit code recorded}$([[ "$rc" == "124" ]] && echo " (its ${DATA_TIMEOUT_S}s bound)")" || true
+    return 1
+  fi
+  log "data606: done in-cluster: $(python3 -c 'import json, sys; p = json.load(open(sys.argv[1])); print("compositions", p.get("compositions"), "in", p.get("elapsed_s"), "s")' "$OUT/data-proof.json" 2>/dev/null)"
+}
+# data606_gone: no data606 pod is left on the loadgen node when the drivers are applied. A listing
+# that answers with one fails the measure; one that does not answer is said (s_data already waited
+# for the pod's deletion).
+data606_gone() {
+  [[ "$DRY" == "1" ]] && return 0
+  local left
+  if left="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l job-name=data606 -o name 2>"$KERR")"; then
+    if [[ -n "$left" ]]; then
+      record_failure "measure FAILED: data606's pod is still on the loadgen node (${left//$'\n'/ }): the data load would overlap the drivers" || true
+      return 1
+    fi
+    log "data606: no pod left on the loadgen node; the drivers have it to themselves"
+  else
+    log "WARNING: whether data606's pod is gone could not be read ($(kerr_line)); s_data waited for its deletion"
+  fi
+}
+# start_observer: the observer Job, from the env step; it must run (on the loadgen pool) before the
+# data load is paid for, or the run would have no APF or log evidence
+start_observer() {
+  local mf="$OUT/observe-job.yaml"
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.sampler --kind $kind --every-s $TOP_POLL_S --out $file -- ${K[*]} --request-timeout=${TOP_POLL_S}s $*"
+    log "DRY: ${INC[*]} render-observe --context $KCTX --every-s $TOP_POLL_S --retry-s $LOG_STREAM_RETRY_S > $mf; kapply; the pod on the loadgen node samples apf (and later top_boot, top) every ${TOP_POLL_S}s and streams snowplow's log -> collect"
     return 0
   fi
-  python3 -m bench.sampler --kind "$kind" --every-s "$TOP_POLL_S" --out "$file" -- \
-      "${K[@]}" --request-timeout="${TOP_POLL_S}s" "$@" 2>>"$OUT/sampler-$kind.err" &
-  echo "$!" > "$OUT/.sampler-$kind.pid"
-  log "sampling $kind every ${TOP_POLL_S}s (each sample bounded by it) -> $file"
+  "${INC[@]}" render-observe --context "$KCTX" --every-s "$TOP_POLL_S" --retry-s "$LOG_STREAM_RETRY_S" \
+      --selector "$SNOWPLOW_POD_SELECTOR" --user-prefix "$BENCH_USER_PREFIX" --password "$PW" \
+      --linger-s "$TTL_S" > "$mf"
+  : > "$OUT/.observer-started"
+  kapply "$mf"
+  incluster_started observe606 "$mf" "$PREFLIGHT_TIMEOUT_S" || return 1
+  log "observe606: sampling apf every ${TOP_POLL_S}s (each sample bounded by it) and streaming snowplow's log (scrubbed), in-cluster"
 }
-stop_sampler() {
-  local f="$OUT/.sampler-$1.pid" pid
-  [[ -f "$f" ]] || return 0
-  pid="$(cat "$f")"
-  rm -f "$f"       # first: no later caller (teardown) kills this PID again
-  kill -TERM "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+# observer_exec <cmd...>: one command in the observer's container, bounded
+observer_exec() {
+  local pod
+  pod="$(incluster_pod observe606)"
+  if [[ -z "$pod" ]]; then echo "error: no live observe606 pod" > "$KERR"; return 1; fi
+  bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -c observe -- "$@"
 }
-# Standard memory capture (#710): snowplow's pods, kubectl top.
-start_top_loop() {
-  start_sampler top "$OUT/top.jsonl" -n krateo-system top pod -l "$SNOWPLOW_POD_SELECTOR" --no-headers
+# observer_signal <top_boot|top>: that sampler segment starts now (top stops top_boot at once)
+observer_signal() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: observe606: $1 samples from now (kubectl top every ${TOP_POLL_S}s, in-cluster)"; return 0; fi
+  if observer_exec touch "/out/ctl/$1" >/dev/null 2>"$KERR"; then
+    log "observe606: $1 samples from now (kubectl top every ${TOP_POLL_S}s, each bounded by it)"
+  else
+    log "WARNING: observe606 could not be told to start its $1 samples ($(kerr_line)): they will read missing"
+  fi
 }
-stop_top_loop() { stop_sampler top; }
-# #919: the API server's flow control (APF), for the whole run (env ->
-# collect): every apiserver_flowcontrol_* series of its /metrics (request wait,
-# rejections, in-queue / executing per priority level and flow schema), and
-# process_start_time_seconds, which says which replica of the regional control
-# plane answered. evaluate reports it per phase (report only).
-start_apf_loop() { start_sampler apf "$OUT/apf.jsonl.gz" get --raw=/metrics; }
-stop_apf_loop() { stop_sampler apf; }
-# apf_preflight: one bounded scrape before the loop. The paired run judges
-# #920 by API-server load, so a /metrics the API server REFUSES (Forbidden,
-# Unauthorized: deterministic) fails the step now, before the data load and
-# the measure are paid for; any other failure is the loop's to record.
+# apf_preflight: one bounded scrape before the data load, by the observer's own ServiceAccount from
+# the loadgen node. The paired run judges #920 by API-server load, so a /metrics the API server
+# REFUSES (Forbidden, Unauthorized: deterministic) fails the step now, before the data load and the
+# measure are paid for; any other failure is the sampler's to record.
 apf_preflight() {
-  if [[ "$DRY" == "1" ]]; then log "DRY: ${K[*]} --request-timeout=${TOP_POLL_S}s get --raw=/metrics (APF preflight)"; return 0; fi
-  local m="$OUT/.apf-preflight-metrics"
-  if bounded "$TOP_POLL_S" "${K[@]}" --request-timeout="${TOP_POLL_S}s" get --raw=/metrics \
-        >"$m" 2>"$KERR" && grep -q '^apiserver_flowcontrol_' "$m"; then
-    rm -f "$m"
-    log "APF preflight: the API server's /metrics has apiserver_flowcontrol_* series"
+  if [[ "$DRY" == "1" ]]; then log "DRY: observe606: kubectl --request-timeout=${TOP_POLL_S}s get --raw=/metrics (APF preflight, in-cluster)"; return 0; fi
+  local n
+  if n="$(observer_exec sh -c "kubectl --request-timeout=${TOP_POLL_S}s get --raw=/metrics | grep -c '^apiserver_flowcontrol_'" 2>"$KERR")" \
+      && [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+    log "APF preflight: the API server's /metrics has apiserver_flowcontrol_* series (read in-cluster by observe606)"
     return 0
   fi
-  rm -f "$m"
   if answered_error; then
     record_failure "APF preflight FAILED: the API server refused /metrics (the run would have no flow-control evidence)" || true
     return 1
   fi
   log "WARNING: APF preflight read no apiserver_flowcontrol_* series ($(err_kind): $(kerr_line)); the sampler records every sample"
 }
-# #822: snowplow's log, streamed for the WHOLE run (env → collect) into
-# $OUT/snowplow-stream.log. A one-shot `kubectl logs` at collect returns only
-# the container's current file (run 9: the last ~30 s). The stream follows
-# across dropped connections (resuming at the newest kubelet timestamp seen;
-# `--since-time` is inclusive, and bench.logscrub drops the resent lines) and
-# across a REPLACED pod (it follows the new pod by name, and first reads the
-# old pod's tail while that is still readable; a tail it could not read is
-# marked). Every line passes bench.logscrub: metadata only (no body, username
-# or token reaches $OUT).
-# The loop's PID lives in a pidfile, not only in a variable: stop_log_stream
-# also runs inside collect's `capped` subshell, and a stale variable in the
-# parent would make teardown kill a PID that may have been reused (#823 review).
-BENCH_USER_PREFIX="${BENCH_USER_PREFIX:-scaleuser-}"   # load606 drive --user-prefix
-LOG_STREAM_PIDFILE=""
-scrub() { python3 -m bench.logscrub --deny "$PW" --deny "$BENCH_USER_PREFIX" "$@"; }
-# snowplow_live_pod: the newest snowplow pod not being deleted (empty if none).
-snowplow_live_pod() {
-  "${K[@]}" --request-timeout=30s -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" \
-      -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{" "}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
-      2>/dev/null | awk 'NF == 2' | sort | tail -1 | cut -d' ' -f2
+# collect_observer: the observer ends its samples and its stream (/out/stop), and its files come
+# into OUT under the names evaluate reads; then its Job, ServiceAccount and RBAC are deleted. Once
+# per run (collect, else the teardown); bounded like mem_stop (a wall-clock deadline, every exec in it).
+OBSERVE_FILES="apf.jsonl.gz top.jsonl top-boot.jsonl snowplow-stream.log snowplow-stream.err sampler-apf.err sampler-top.err sampler-top_boot.err observe606.json"
+collect_observer() {
+  [[ -f "$OUT/.observer-started" && ! -f "$OUT/.observer-collected" ]] || return 0
+  if [[ "$DRY" == "1" ]]; then log "DRY: observe606: /out/stop, then copy /out -> $OUT ($OBSERVE_FILES)"; return 0; fi
+  local pod deadline left f
+  pod="$(incluster_pod observe606)"
+  if [[ -n "$pod" ]]; then
+    if observer_exec touch /out/stop >/dev/null 2>"$KERR"; then
+      deadline=$(( $(date +%s) + OBSERVE_STOP_WAIT_S ))
+      while ! observer_exec test -f /out/exited >/dev/null 2>&1; do
+        left=$(( deadline - $(date +%s) ))
+        if (( left <= 0 )); then log "observe606 did not end its samples within ${OBSERVE_STOP_WAIT_S}s: copying them as they are"; break; fi
+        sleep "$(( left < 2 ? left : 2 ))"
+      done
+    else
+      log "could not ask observe606 to end its samples ($(kerr_line)): copying them as they are"
+    fi
+    mkdir -p "$OUT/observe606"
+    bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
+        cp -c observe "$pod:/out" "$OUT/observe606" >/dev/null 2>"$KERR" \
+      || log "could not copy observe606's /out ($(kerr_line)): the APF, top and log streams will read missing"
+    for f in $OBSERVE_FILES; do
+      [[ -f "$OUT/observe606/$f" ]] && mv "$OUT/observe606/$f" "$OUT/$f"
+    done
+    observer_exec touch /out/collected >/dev/null 2>&1 || true
+  else
+    log "observe606: no pod to copy from: the APF, top and log streams will read missing"
+  fi
+  : > "$OUT/.observer-collected"
+  incluster_delete observe606 || true
+  log "observe606 collected: $(cd "$OUT" && ls $OBSERVE_FILES 2>/dev/null | tr '\n' ' ')"
 }
-start_log_stream() {
-  if [[ "$DRY" == "1" ]]; then log "DRY: stream snowplow's log -> $OUT/snowplow-stream.log"; return 0; fi
-  local S="$OUT/.log-stream"
-  rm -f "$S-stop" "$S-state" "$S-last"
-  ( set +e
-    pod=""
-    while [[ ! -e "$S-stop" ]]; do
-      cur="$(snowplow_live_pod)"
-      if [[ -n "$pod" && -n "$cur" && "$cur" != "$pod" ]]; then
-        # The pod was replaced: its lines after the last one streamed are on
-        # the OLD pod. Read them while it is readable, then start the new
-        # pod from its beginning (its own timestamps, its own dedup state).
-        since="$(cat "$S-last" 2>/dev/null || true)"
-        if "${K[@]}" --request-timeout=60s -n krateo-system logs "pod/$pod" --timestamps \
-              ${since:+"--since-time=$since"} 2>>"$OUT/snowplow-stream.err" \
-            | scrub --kubelet-timestamps --state-file "$S-state" --last-time-file "$S-last" \
-              >> "$OUT/snowplow-stream.log"; then
-          printf '{"bench_stream":"pod_replaced","tail":"read","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
-        else
-          printf '{"bench_stream":"pod_replaced","tail":"lost","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
-        fi
-        rm -f "$S-state" "$S-last"
-      fi
-      target="deploy/snowplow"
-      if [[ -n "$cur" ]]; then pod="$cur"; target="pod/$cur"; fi
-      since="$(cat "$S-last" 2>/dev/null || true)"
-      "${K[@]}" -n krateo-system logs -f "$target" --timestamps \
-          ${since:+"--since-time=$since"} 2>>"$OUT/snowplow-stream.err" \
-        | scrub --kubelet-timestamps --state-file "$S-state" --last-time-file "$S-last" \
-          >> "$OUT/snowplow-stream.log"
-      [[ -e "$S-stop" ]] && break
-      printf '{"bench_stream":"reconnect","t":%s}\n' "$(date +%s)" >> "$OUT/snowplow-stream.log"
-      sleep "$LOG_STREAM_RETRY_S"
-    done ) >/dev/null 2>&1 &
-  LOG_STREAM_PIDFILE="$S.pid"
-  echo "$!" > "$LOG_STREAM_PIDFILE"
-  log "streaming snowplow's log (scrubbed) -> $OUT/snowplow-stream.log"
-}
-stop_log_stream() {
-  local pid
-  [[ -n "${LOG_STREAM_PIDFILE:-}" && -f "$LOG_STREAM_PIDFILE" ]] || return 0
-  pid="$(cat "$LOG_STREAM_PIDFILE")"
-  rm -f "$LOG_STREAM_PIDFILE"      # first: no later caller (teardown) kills this PID again
-  touch "$OUT/.log-stream-stop"
-  # #1249: the loop frozen before its children are signalled. A child's TERM, then the loop's,
-  # left a gap in which the loop, past its stop check, forked its next `sleep` (or its next
-  # kubectl): orphaned, it ran on after the run, on the operator's machine (CI's run 42413356862)
-  halt_tree "$pid"
-  wait "$pid" 2>/dev/null || true
+# incluster_teardown: whatever stopped the run, what the in-cluster Jobs hold comes into OUT and
+# their Jobs, ServiceAccounts and RBAC are deleted (each step is idempotent: a collect that already
+# ran is not repeated)
+incluster_teardown() {
+  if [[ "$DRY" == "1" ]]; then log "DRY: in-cluster teardown: data606 and observe606 collected if not yet, then deleted with their ServiceAccounts and RBAC"; return 0; fi
+  data606_finish || true
+  collect_observer
+  [[ -f "$OUT/.data606-applied" ]] && incluster_delete data606
+  [[ -f "$OUT/.observer-started" ]] && incluster_delete observe606
+  return 0
 }
 s_collect() {
   local p
@@ -2102,8 +2257,6 @@ s_collect() {
     "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out/netns.jsonl" "$OUT/netns.jsonl" >/dev/null 2>&1 \
       || log "could not copy the netns606 samples from ${p#pod/}: the TCP path under snowplow will read UNMEASURED"
   done
-  declare -F stop_top_loop >/dev/null && stop_top_loop
-  declare -F stop_apf_loop >/dev/null && stop_apf_loop
   # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
   # that died (OOMKilled, evicted, a crash), never ran (Pending / Unknown) or
   # has no pod at all makes the run INVALID with its reason in verdict.json.
@@ -2158,7 +2311,9 @@ s_collect() {
   done
   # #822: the streamed log is the run's snowplow log; the one-shot reads below
   # only cover a stream gap at the very end. All of it scrubbed.
-  declare -F stop_log_stream >/dev/null && stop_log_stream
+  # #1297: the observer's samplers (apf, top) and its log stream end here, and
+  # their files come into OUT under the names evaluate reads
+  collect_observer
   "${KR[@]}" -n krateo-system logs deploy/snowplow --tail=-1 --timestamps \
     | scrub --kubelet-timestamps > "$OUT/snowplow.log" \
     || log "could not read the snowplow log"
