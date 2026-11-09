@@ -204,12 +204,14 @@ def _functions(*names):
 
 def test_stop_without_a_pidfile_kills_nothing(tmp_path):
     """The parent shell's variables survive collect's subshell: once the
-    pidfile is gone, teardown's stop must not kill whatever owns that PID now."""
+    pidfile is gone, a later stop must not kill whatever owns that PID now.
+    (#1297: the log stream is in-cluster; the one local background process left
+    is the host-load recorder, stopped the same way.)"""
     victim = subprocess.Popen(["sleep", "30"])
     try:
-        script = (_functions("stop_log_stream")
-                  + f'\nOUT="{tmp_path}"; LOG_STREAM_PIDFILE="{tmp_path}/.log-stream.pid"\n'
-                  + f"LOG_STREAM_PID={victim.pid}\nstop_log_stream\n")
+        script = (_functions("stop_host_load")
+                  + f'\nOUT="{tmp_path}"; HOST_LOAD_PIDFILE="{tmp_path}/.host-load.pid"\n'
+                  + f"HOST_LOAD_PID={victim.pid}\nstop_host_load\n")
         subprocess.run(["bash", "-c", script], check=True, timeout=10)
         time.sleep(0.2)
         assert victim.poll() is None, "a PID with no pidfile was killed"

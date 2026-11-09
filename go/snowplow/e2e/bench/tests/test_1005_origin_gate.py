@@ -352,18 +352,18 @@ def test_the_gate_reads_and_records_the_cdcs_resync_from_each_source(harness, cd
     assert "WARNING: the cdc's resync" not in out
 
 
-# The harness plan's numbers (its run-budget line, #1194): budget 20,060 s
-# (19,160 s + the 900 s evidence term), TTL derived 7 h = 25,200 s, margin
-# 1,800 s -> slack 3,340 s (640 s before #1194). The TTL is whole hours, so
+# The harness plan's numbers (its run-budget line, #1194, #1297): budget 24,275 s
+# (19,160 s + the 900 s evidence term + #1297's 4,215 s in-cluster term: 2 x 300 pod starts + 15 last poll + 6 x 300 finish + 1,800 teardown), TTL derived 8 h = 28,800 s, margin
+# 1,800 s -> slack 2,725 s (3,340 s before #1297, 640 s before #1194). The TTL is whole hours, so
 # the slack is its round-up remainder: both sides of the property are pinned here
 # by hand, never derived from the code under test, so a budget change shows which
 # side moved. A resync's excess = 2 x (resync - the 180 s budget term).
-HARNESS_TTL_SLACK_S = 3340
+HARNESS_TTL_SLACK_S = 2725
 
 
 def test_a_resync_past_the_budget_term_warns_within_the_ttl_slack(harness):  # noqa: F811
     """#1006 F5 (M22) / F8: 8m reads past the budget's 180s term; its excess,
-    2 x (480 - 180) = 600 s, is under the harness plan's 3340 s slack: said, and
+    2 x (480 - 180) = 600 s, is under the harness plan's slack (2725 s): said, and
     the run goes on."""
     p, out, d = _run(harness, FAKE_CDC_RESYNC="args:8m")
     assert p.returncode == 0, out[-3000:]
@@ -373,7 +373,7 @@ def test_a_resync_past_the_budget_term_warns_within_the_ttl_slack(harness):  # n
 
 def test_a_resync_whose_excess_is_past_the_slack_is_refused(harness):  # noqa: F811
     """The twin: 31m's excess, 2 x (1860 - 180) = 3360 s, is past the harness
-    plan's 3340 s slack: refused at the gate, before data. (The slack follows
+    plan's slack (2725 s): refused at the gate, before data. (The slack follows
     the whole-hour TTL's rounding: #1194's evidence term moved it from 640 s.)"""
     p, out, d = _run(harness, FAKE_CDC_RESYNC="args:31m")
     assert p.returncode != 0

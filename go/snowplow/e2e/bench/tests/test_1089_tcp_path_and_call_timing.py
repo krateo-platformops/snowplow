@@ -275,7 +275,7 @@ def test_run606_starts_the_sampler_with_the_platform_and_collects_its_file():
     env = src[src.index("s_env() {"):]
     env = env[:env.index("\n}\n")]                                           # s_env's own body
     # a call in s_env (the platform is up, before the reboot): the boot is covered
-    assert env.index("\n  start_apf_loop\n") < env.index("\n  start_netns_sampler\n")
+    assert env.index("\n  start_observer || return 1\n") < env.index("\n  start_netns_sampler\n")   # #1297: apf in-cluster
     assert src.index("\nstep env ") < src.index("\nstep reboot ")
     start = src[src.index("start_netns_sampler() {"):]
     start = start[:start.index("\n}\n")]
