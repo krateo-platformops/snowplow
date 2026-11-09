@@ -81,8 +81,18 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
   see `howto/rum-ingest.md`) get no span. Sampled at
   100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
-  `docs/configuration.md`). The CORS options in `main.go` allow the browser
-  to send `traceparent`/`tracestate`/`baggage`.
+  `docs/configuration.md`). **Sampling trade (installer#402, #1013):** the
+  platform gateway traces 100% and decides nothing (agentgateway-policies
+  ≥ 0.2.19 `tracing.platform.filter: ""`, installer rev 460, 2026-11-09), so
+  every request reaches snowplow with `sampled=1` and gets its Server span; the
+  one sampling decision is the collectors' tail sampler (observability#118:
+  every error, 4xx and JWT trace kept, plus 5% of the rest), and the SLIs stay
+  exact because span metrics are computed before it. Orphaned snowplow spans
+  on 057 went 92% → 0% (snowplow#849). A gateway that samples at its edge, or a
+  snowplow sampler that drops spans itself (`traceidratio`,
+  `parentbased_traceidratio`), makes the SLIs estimates again. The full note is
+  the SAMPLING comment in `internal/tracing/tracing.go`. The CORS options in
+  `main.go` allow the browser to send `traceparent`/`tracestate`/`baggage`.
 - **Metrics** (`internal/metrics/metrics.go` `Setup`): an **OTLP mirror of the
   expvar surface** — observable instruments read the same live counter
   snapshots the expvar closures read (families: fallthrough, dispatch L1,
