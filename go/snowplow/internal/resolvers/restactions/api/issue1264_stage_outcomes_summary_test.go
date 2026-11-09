@@ -147,6 +147,7 @@ func TestIssue1264_S5_ReasonsComeFromTheClosedSet(t *testing.T) {
 		"StageReasonInvalidPath": StageReasonInvalidPath, "StageReasonTemplateError": StageReasonTemplateError,
 		"StageReasonNotSent": StageReasonNotSent, "StageReasonTimeout": StageReasonTimeout,
 		"StageReasonDestinationRefused": StageReasonDestinationRefused,
+		"StageReasonUAFOnNonReadVerb":   StageReasonUAFOnNonReadVerb,
 	}
 	var tableNames []string
 	for n := range values {

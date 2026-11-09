@@ -74,6 +74,12 @@ const (
 	// is no Kubernetes StatusReason, so trustedReason drops it from an upstream
 	// answer (#714).
 	StageReasonDestinationRefused = credhttp.DestinationRefusedReason
+	// StageReasonUAFOnNonReadVerb (#1281) — the stage carries userAccessFilter
+	// on a verb other than GET or HEAD, which the CRD rejects (core.go): it
+	// would have been sent as snowplow's ServiceAccount, so nothing was sent
+	// (uaf_non_read.go). Recorded only by snowplow: the reason is no Kubernetes
+	// StatusReason, so trustedReason drops it from an upstream answer (#714).
+	StageReasonUAFOnNonReadVerb = "UserAccessFilterOnNonReadVerb"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -84,6 +90,10 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
+	// #1281: recorded once for the whole stage, before anything else can be
+	// (the stage is refused before it is planned); ranked first because the
+	// stage itself is misconfigured.
+	StageReasonUAFOnNonReadVerb:   12,
 	StageReasonNotExecuted:        10,
 	StageReasonForbidden:          9,
 	StageReasonUnauthorized:       8,

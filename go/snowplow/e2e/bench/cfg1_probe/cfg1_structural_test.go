@@ -129,6 +129,10 @@ var nonCacheInitPublishers = map[string][]string{
 	// dial guard refuses is a stage failure on every RESTAction resolve, cache
 	// on or off, so it must stay observable with the cache off.
 	"internal/resolvers/restactions/api/refused_read_metrics.go": {"snowplow_refused_read_total"},
+	// #1281 userAccessFilter-on-a-non-read-verb refusal: same RESOLVER-path
+	// family — every RESTAction resolve, cache on or off, refuses such a stage
+	// before it is sent, so the refusal must stay observable with the cache off.
+	"internal/resolvers/restactions/api/uaf_non_read.go": {"snowplow_uaf_non_read_verb_refused_total"},
 	// #367 shadow-parity toggle STATE: enabled/source is a CONFIG fact (not a cache
 	// measurement) a latency-acceptance window must assert regardless of
 	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS
