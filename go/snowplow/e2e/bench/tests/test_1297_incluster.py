@@ -245,8 +245,8 @@ def test_the_dry_pass_says_where_each_job_runs_and_the_budget_counts_it(tmp_path
     assert "DRY: python3 -m bench.incluster render-data606 --context " in p.stderr
     assert "DRY: python3 -m bench.incluster render-observe --context " in p.stderr
     line = next(ln for ln in p.stderr.splitlines() if "run budget:" in ln)
-    assert ("+ in-cluster 4215 (observer start 300 + data606 start 300 + last poll 15 + finish 6x300 "
-            "+ teardown 1800)") in line
+    assert ("+ in-cluster 4203 (observer start 300 + data606 start 300 + its last poll 3 + finish 6x300 "
+            "+ cleanup 1800)") in line
     src = (BENCH_DIR / "run606.sh").read_text()
     # nothing timed or per-request runs here any more
     for gone in ("bench.sampler --kind", "logs -f", "python3 -m bench data606 --"):

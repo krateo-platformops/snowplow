@@ -25,10 +25,12 @@ import hashlib
 import http.server
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -142,6 +144,22 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         time.sleep(float(os.environ.get("FAKE_SLOW_DOWN", "0")))   # a delete in flight
         if os.environ.get("FAKE_DOWN_FAIL") == "1":
             sys.exit(1)
+        # #1297: the cluster's deletion ends every pod still on it (the fake kubectl's in-cluster
+        # Jobs, when a signal cut the teardown's own collect and deletes short): TERMed, as the
+        # kubelet would, and waited for
+        import glob, signal
+        for pf in glob.glob(os.path.join(STATE, "pods", "*", "pid")):
+            pid = int(open(pf).read())
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                continue
+            for _ in range(150):
+                try:
+                    os.killpg(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
         open(os.path.join(STATE, "deleted"), "w").write("1")
         sys.exit(0)
     if a[:3] == ["container", "clusters", "create"]:
@@ -1474,6 +1492,22 @@ def harness(tmp_path):
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME
     (tmp_path / "home").mkdir()
     yield env, state, ambient, tmp_path
+    # #1297: a cluster a test left standing (its gke-down failed, by design) still holds its
+    # in-cluster Jobs' pods, which this fake runs as processes: they end with the test
+    import glob
+    for pf in glob.glob(str(state / "pods" / "*" / "pid")):
+        pid = int(open(pf).read())
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                break
+            for _ in range(50):
+                try:
+                    os.killpg(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
     srv.shutdown()
     quotas_stop()
 

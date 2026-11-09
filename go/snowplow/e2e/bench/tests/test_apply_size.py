@@ -119,12 +119,16 @@ def test_run606_applies_everything_through_one_server_side_apply():
     # #1004's full-widen stage (after evaluate): each batch of its objects (fw_one, output
     # discarded: 50K lines), its CRD, its read + identity, its Job, and the widened CRD; its
     # single applies each under a wall-clock bound (a term of its budget).
+    # #1297: the data606 Job (data) and the samplers' observer (env), each with its ServiceAccount, RBAC
+    # and the bench-src ConfigMap (bench/incluster.py; tests/test_1297_incluster.py checks its size).
     assert sites == ['kapply "$OUT/netns-job.yaml" \\',
                      'kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
                      'kapply "$OUT/preflight-job.yaml"',
+                     'kapply "$mf"',
                      'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
                      'kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \\',
                      'kapply "$OUT/loadgen-job.yaml"',
+                     'kapply "$mf"',
                      'kapply "$f" >/dev/null 2>"$f.err" && { rm -f "$f.err"; return 0; }',
                      'bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/crd.yaml" || { fw_fail "creating the CRD ${FW_CRD}"; return 1; }',
                      'bounded "$COLLECT_TIMEOUT_S" kapply "$FW_DIR/probe.yaml" >/dev/null 2>"$KERR" || { fw_fail "the stage\'s read and identity"; return 1; }',

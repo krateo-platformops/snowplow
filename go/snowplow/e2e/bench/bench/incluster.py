@@ -424,10 +424,11 @@ def tools(dest: str, context: str, *, fetch=urllib.request.urlopen, machine=plat
           f"-> {server} as this pod's ServiceAccount", flush=True)
 
 
-def _linger(out: Path, linger_s: float, sleep=time.sleep, clock=time.monotonic) -> None:
-    """Stay up for run606's copy of /out: until it says /out/collected, at most linger_s."""
+def _linger(out: Path, linger_s: float, sleep=time.sleep, clock=time.monotonic, stop=lambda: False) -> None:
+    """Stay up for run606's copy of /out: until it says /out/collected, at most linger_s (or until
+    `stop()`: the pod is being deleted)."""
     end = clock() + linger_s
-    while clock() < end and not (out / COLLECTED).exists():
+    while clock() < end and not (out / COLLECTED).exists() and not stop():
         sleep(1)
 
 
@@ -558,7 +559,10 @@ def supervise(out: str, segments: list[Segment], linger_s: float, poll_s: float 
                                                    "segments": [s.record for s in segments]}) + "\n")
     (o / EXITED).touch()
     if not stopping.is_set():            # a TERM (the Job deleted): nothing will copy /out any more
-        linger(o, linger_s)
+        if linger is _linger:
+            _linger(o, linger_s, stop=stopping.is_set)
+        else:
+            linger(o, linger_s)
     return 0
 
 
