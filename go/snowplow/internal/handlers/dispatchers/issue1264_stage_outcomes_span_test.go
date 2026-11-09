@@ -116,7 +116,7 @@ func (s s1264Span) wantStages(t *testing.T, what string, n int, reasons []string
 
 func (s s1264Span) wantNoStages(t *testing.T, what string) {
 	t.Helper()
-	for _, k := range []attribute.Key{spanAttrStagesFailed, spanAttrStagesFailureReasons} {
+	for _, k := range []attribute.Key{spanAttrStagesFailed, spanAttrStagesNotExecuted, spanAttrStagesFailureReasons} {
 		if v, ok := s.attrs[k]; ok {
 			t.Fatalf("%s: %s = %v, want it unset (no stage outcomes in the response)", what, k, v.Emit())
 		}
@@ -205,10 +205,14 @@ func TestIssue1264_P1b_MixedReasonsAreSortedAndDistinct(t *testing.T) {
 	if !sort.StringsAreSorted(reasons) {
 		t.Fatalf("SETUP: oracle reasons unsorted %q", reasons)
 	}
-	s.wantStages(t, "an inline draft with NotFound and StageNotExecuted stages", n, reasons)
 	if !slices.Contains(reasons, api.StageReasonNotFound) || !slices.Contains(reasons, api.StageReasonNotExecuted) {
 		t.Fatalf("SETUP: reasons %q, want NotFound and StageNotExecuted", reasons)
 	}
+	// #1288: the header lists both; the span counts the dry run's refused
+	// write (one row) in not_executed, never in failed or failure_reasons.
+	failures := slices.DeleteFunc(slices.Clone(reasons), func(r string) bool { return r == api.StageReasonNotExecuted })
+	s.wantStages(t, "an inline draft with NotFound and StageNotExecuted stages", n-1, failures)
+	s.wantNotExecuted(t, "an inline draft with one refused write", 1)
 	s.wantStatusUnset(t, "an inline 200 whose stages failed")
 }
 
@@ -220,6 +224,7 @@ func TestIssue1264_P2_AllSuccessIsZeroWithNoReasons(t *testing.T) {
 		t.Fatalf("SETUP: code=%d header=%q; the arm needs an all-success 200", s.rec.Code, s.rec.Header().Get(util.HeaderStageOutcomes))
 	}
 	s.wantStages(t, "all succeeded", 0, nil)
+	s.wantNotExecuted(t, "all succeeded", 0)
 	s.wantStatusUnset(t, "all succeeded")
 }
 

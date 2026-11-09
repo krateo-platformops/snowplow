@@ -138,6 +138,8 @@ Content-Type: application/json
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
     `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
     snowplow refused to send, below), `DestinationRefused` (#1131, below),
+    `WriteRefused` (#1288: a write an export or background work does not
+    send; never in a dry run, whose refusal is `StageNotExecuted`),
     `UserAccessFilterOnNonReadVerb` (#1281, below), `Error` (anything else).
   - **A `userAccessFilter` on a verb other than `GET`/`HEAD` is refused
     (#1281).** `userAccessFilter` makes snowplow send the stage with its own

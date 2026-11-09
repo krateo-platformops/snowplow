@@ -273,7 +273,16 @@ Each stage ends in exactly one outcome:
   iterator errored, its endpoint could not be resolved);
 - **skipped**: a write stage not sent because of this rule. A skipped stage
   leaves no value in the result and blocks its own dependent writes, so a
-  chain `read → detach → delete` stops at the first failure.
+  chain `read → detach → delete` stops at the first failure;
+- **not executed**: a write stage snowplow did not send on purpose, because
+  of what the request is: a dry run (`StageNotExecuted`), an export or
+  background work (`WriteRefused`). It does not block its dependent writes:
+  they are not sent for the same reason and report the same reason, never
+  `Skipped`, unless the dependent's `iterator` runs over the refused stage's
+  output, which then yields zero items: it has nothing to send and succeeds
+  (not listed). So `Skipped` always follows a real failure. A write stage
+  with an item that failed on its own (`InvalidPath`, `TemplateError`) as
+  well as refused items reads that failure, not `WriteRefused`.
 
 Example: a delete lifecycle where `delete.dependsOn` is `detachVolumes`
 (an iterator over the server's data volumes), and `delete` has no
@@ -305,7 +314,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
 
 - `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
-  `StageNotExecuted` (a dry run), and for a write stage snowplow refused to
+  `StageNotExecuted` (a dry run), `WriteRefused` (a write stage an export or
+  background work does not send, #903/#970; before #1288 it read `Error`),
+  and for a write stage snowplow refused to
   send (#1112) `InvalidPath`, `TemplateError` or `NotSent` (see "A write
   that is not sent fails" below), and `DestinationRefused` for an endpoint
   address snowplow refuses to dial (see "Which addresses an endpoint can
