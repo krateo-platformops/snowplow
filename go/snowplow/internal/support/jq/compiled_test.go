@@ -432,6 +432,62 @@ func TestCompileCache_ConcurrentReuse(t *testing.T) {
 	wg.Wait()
 }
 
+// TestCompileCache_CachedProgramRetainsNoRunState — #1285 review: a cached
+// program is shared by every resolve, so it must hold nothing from any of
+// them. gojq's regexp cache used to live on the compiler: a hot program kept
+// every pattern its runs built from their input, for as long as it was
+// cached. With the fork's per-run cache (krateo-platformops/gojq v0.13.1) the
+// retained heap stays flat over distinct data-built patterns while the program
+// stays cached.
+func TestCompileCache_CachedProgramRetainsNoRunState(t *testing.T) {
+	const q = `.prefix as $p | .name | test("^" + $p + "-[0-9]+$")`
+	// A cache of its own: the process cache's GC-driven sweep would drop the
+	// program during the arm's own runtime.GC calls. The program is the one
+	// cached entry every run takes, exactly as every resolve takes it.
+	c := newProgramCache(processPrograms.loader)
+	first, err := c.compile(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOnce := func(i int) {
+		code, err := c.compile(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code != first {
+			t.Fatal("the program was compiled again: the arm must run one cached program")
+		}
+		in := map[string]any{"name": fmt.Sprintf("p%06d-1", i), "prefix": fmt.Sprintf("p%06d", i)}
+		if got := runAll(code, in); !reflect.DeepEqual(got, []any{true}) {
+			t.Fatalf("pattern %d: %v", i, got)
+		}
+	}
+	retained := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	for i := 0; i < 100; i++ {
+		runOnce(i)
+	}
+	base := retained()
+	const n = 20000
+	for i := 100; i < 100+n; i++ {
+		runOnce(i)
+	}
+	grown := int64(retained()) - int64(base)
+	// Absolute bound, not derived from the cache: 20,000 compiled regexps are
+	// tens of MiB (gojq v0.13.0: +47 MiB); a flat heap moves by GC noise only.
+	const bound = 1 << 20
+	if grown > bound {
+		t.Fatalf("retained heap grew %d KiB over %d distinct patterns (bound %d KiB): the cached program keeps its runs' regexps",
+			grown>>10, n, bound>>10)
+	}
+	runtime.KeepAlive(first)
+}
+
 var compileCacheSink *gojq.Code
 
 // BenchmarkCompileCache_PortalCorpus — obtaining the program for every

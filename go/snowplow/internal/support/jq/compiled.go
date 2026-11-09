@@ -30,10 +30,13 @@ package jq
 // one-off filter, fall out by themselves. The GC paces the sweep, so there is
 // nothing to tune: no size, no TTL.
 //
-// CONCURRENT REUSE. A *gojq.Code is immutable once compiled: Run builds a
-// fresh env per call (gojq: "It is safe to call this method in goroutines, to
-// reuse a compiled *Code"; the krateo fork keeps that — execute only reads
-// bc.codes, and the compile-time regexp cache it carries is a sync.Map).
+// CONCURRENT REUSE, NO RUN STATE. A *gojq.Code is immutable once compiled:
+// Run builds a fresh env per call (gojq: "It is safe to call this method in
+// goroutines, to reuse a compiled *Code"; execute only reads bc.codes), and it
+// holds nothing from any run. Upstream gojq caches the regexps test/match/sub/…
+// compile on the compiler, so a reused program would keep every pattern its
+// runs built from their input; the krateo fork (v0.13.1, gojq#4) caches them
+// per run. TestCompileCache_CachedProgramRetainsNoRunState pins it.
 //
 // SHARED CONSTANTS. A cached program's constant values (a literal object or
 // array the compiler folded) are shared by every run of it, so a program's
