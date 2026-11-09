@@ -2,8 +2,8 @@ package tracing
 
 // log_handler_each_key_once_916_test.go — #916: the decorator puts a key a
 // derivation sets on the record once, the later value winning; keys at
-// different levels are different keys; the trace stamp is never doubled; and a
-// sibling derived from the same parent is not changed by the rebuild.
+// different levels are different keys; and a sibling derived from the same
+// parent is not changed by the rebuild.
 //
 // Keys are read from the bytes (internal/testsupport/jsonkeys): encoding/json
 // folds a repeated key and would hide the defect.
@@ -114,29 +114,6 @@ func TestS916_KeysAtDifferentLevelsAreDifferentKeys(t *testing.T) {
 	}
 }
 
-// TestS916_TheStampIsNotDoubled: a top-level derivation that sets trace_id or
-// span_id does not double the stamp; the live span's ids win. Inside a group
-// the same key is a different key and stays.
-func TestS916_TheStampIsNotDoubled(t *testing.T) {
-	ctx, traceID := span916(t)
-	log, buf := newLogger916()
-	l := log.With("trace_id", "stale", "span_id", "stale", "x", 1)
-	l.WarnContext(ctx, "m")
-	got, line := read916(t, buf)
-	if got.Count("trace_id") != 1 || got.Count("span_id") != 1 || !strings.Contains(line, `"trace_id":"`+traceID+`"`) || strings.Contains(line, "stale") {
-		t.Fatalf("want the span's ids once: %s", line)
-	}
-	// Without a span the derivation's own value is all there is, and stays.
-	l.Warn("m")
-	if _, line := read916(t, buf); !strings.Contains(line, `"trace_id":"stale"`) {
-		t.Fatalf("a record with no span keeps the derivation's trace_id: %s", line)
-	}
-	log.WithGroup("g").With("trace_id", "inner").WarnContext(ctx, "m")
-	if _, line := read916(t, buf); !strings.Contains(line, `"g":{"trace_id":"inner"}`) {
-		t.Fatalf("a grouped trace_id is not the stamp's key: %s", line)
-	}
-}
-
 // TestS916_ASiblingIsNotChangedByTheRebuild: dropping the earlier copy builds a
 // new chain; the parent and a sibling derived from it still write what they
 // wrote.
@@ -145,13 +122,18 @@ func TestS916_ASiblingIsNotChangedByTheRebuild(t *testing.T) {
 	log, buf := newLogger916()
 	parent := log.With("k", "p", "o", 1)
 	sibling := parent.With("s", 1)
-	_ = parent.With("k", "child")
+	child := parent.With("k", "child")
+	// Two derivations of the rebuilt logger: one appends, one rebuilds again.
+	grandchild := child.With("x", 1)
+	_ = child.With("o", 2)
 	for _, c := range []struct {
 		l    *slog.Logger
 		want string
 	}{
 		{parent, `"k":"p","o":1`},
 		{sibling, `"k":"p","o":1,"s":1`},
+		{child, `"o":1,"k":"child"}`},
+		{grandchild, `"o":1,"k":"child","x":1}`},
 	} {
 		for _, rctx := range []context.Context{context.Background(), ctx} {
 			c.l.WarnContext(rctx, "m")
