@@ -2595,9 +2595,12 @@ EGRESS_KEYS = {
     "retries": "snowplow_endpoint_retries_total",
 }
 # The refresher's resolve memo (snowplow #1284): its lookups and the
-# measurement-only would-join count (a miss whose produce started while a
-# produce of the same memo key was in flight), on /debug/vars as members of
-# the snowplow_resolve_memo map. An image without the members reads ABSENT.
+# measurement-only would-join count — the misses an in-flight join on the memo
+# key would have saved: a produce that started while a produce of the same key
+# (its leader) was in flight, counted only when the leader's body was one the
+# memo would serve it (stored, and fresh by the memo's #411 rule at hand-over) —
+# on /debug/vars as members of the snowplow_resolve_memo map. An image without
+# the members reads ABSENT.
 RESOLVE_MEMO_KEY = "snowplow_resolve_memo"
 RESOLVE_MEMO_COUNTERS = ("hits_total", "misses_total", "stale_misses_total", "would_join_total")
 # #1082: stale serve -> the replacing frame written, per serving layer
@@ -3700,7 +3703,8 @@ def resolve_memo_report(mem: list[dict], fresh: list[dict] | None) -> dict:
     included), stale misses and would-joins (deltas over mem606's /debug/vars
     samples, a restart's pair counted from 0), with the hit share
     hits / (hits + misses) and the would-join share would_join / misses: the
-    share of the memo's produces an in-flight join could have removed. An image
+    share of the memo's produces an in-flight join would have removed (a joiner
+    counts only when its leader's body was still fresh at hand-over). An image
     without the counters is ABSENT, never 0. `lines` is the whole measure."""
     n = sum(1 for m in mem if m.get("kind") == "mem")
     out: dict = {"result": "INFO", "source": f"mem606's /debug/vars samples ({n})"}
@@ -3725,7 +3729,8 @@ def resolve_memo_report(mem: list[dict], fresh: list[dict] | None) -> dict:
     lines = [f"INFO resolve memo (whole measure, {w['seconds']:g} s): hits {w['hits']:g}, misses {w['misses']:g} "
              f"(stale {w['stale_misses']:g}), hit share {pct(w['hit_share'])}",
              f"INFO resolve memo would-join (whole measure): {w['would_join']:g} of {w['misses']:g} misses "
-             f"({pct(w['would_join_share'])}) started while a produce of the same key was in flight"]
+             f"({pct(w['would_join_share'])}) would have been saved by joining their key's in-flight produce "
+             f"(its body still fresh at hand-over)"]
     if r["restarts"]:
         lines.append(f"INFO resolve memo: {r['restarts']} restart(s) spanned (each pair after one counted from 0)")
     out["lines"] = lines

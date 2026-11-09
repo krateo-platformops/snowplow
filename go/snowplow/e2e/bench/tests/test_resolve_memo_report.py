@@ -2,7 +2,8 @@
 snowplow_resolve_memo, check-prefixes enforces it, and evaluate reports, INFO
 only and never judged, its hits, misses, stale misses and would-joins per phase
 with the hit share and the would-join share (the share of produces an
-in-flight join could remove). An image without the counters reads ABSENT,
+in-flight join would remove: a joiner counts only when its leader's body was
+still fresh at hand-over, snowplow's #411 rule). An image without the counters reads ABSENT,
 never 0. The report arms run through the evaluate CLI.
 """
 
@@ -50,8 +51,9 @@ def test_evaluate_reports_the_lookups_and_the_would_join_share(tmp_path):
     assert w["hit_share"] == 0.75 and w["would_join_share"] == 0.25
     assert rep["lines"][0].startswith("INFO resolve memo (whole measure, 20 s): hits 600, misses 200 (stale 16), "
                                       "hit share 75.00%")
-    assert rep["lines"][1] == ("INFO resolve memo would-join (whole measure): 50 of 200 misses (25.00%) started "
-                               "while a produce of the same key was in flight")
+    assert rep["lines"][1] == ("INFO resolve memo would-join (whole measure): 50 of 200 misses (25.00%) would "
+                               "have been saved by joining their key's in-flight produce (its body still fresh at "
+                               "hand-over)")
 
 
 def test_a_restart_counts_the_pair_after_it_from_zero(tmp_path):
