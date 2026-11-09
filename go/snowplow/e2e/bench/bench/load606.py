@@ -2594,6 +2594,15 @@ EGRESS_KEYS = {
     "connections": "snowplow_egress_connections",
     "retries": "snowplow_endpoint_retries_total",
 }
+# The refresher's resolve memo (snowplow #1284): its lookups and the
+# measurement-only would-join count — the misses an in-flight join on the memo
+# key would have saved: a produce that started while a produce of the same key
+# (its leader) was in flight, counted only when the leader's body was one the
+# memo would serve it (stored, and fresh by the memo's #411 rule at hand-over) —
+# on /debug/vars as members of the snowplow_resolve_memo map. An image without
+# the members reads ABSENT.
+RESOLVE_MEMO_KEY = "snowplow_resolve_memo"
+RESOLVE_MEMO_COUNTERS = ("hits_total", "misses_total", "stale_misses_total", "would_join_total")
 # #1082: stale serve -> the replacing frame written, per serving layer
 # (apistage, l1), with the serves left unreplaced past 10 s. Three narrow
 # prefixes, never "snowplow_stale_": that one contains snowplow_stale_retry_
@@ -2659,6 +2668,7 @@ RUN8_VARS_PREFIXES = (
     # over per egress and protocol (#847), and every endpoint retry by site and cause (#1088)
     EGRESS_KEYS["connections"],
     "snowplow_endpoint_retries",
+    RESOLVE_MEMO_KEY,                     # snowplow #1284: memo lookups and would-joins (resolve_memo_report)
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -2748,10 +2758,11 @@ REFRESHER_TIER_GAUGES = ("viewed_dirty_age_p95", "viewed_dirty_age_max",
 
 
 def prefixes_missing(prefixes) -> list[str]:
-    """The RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS values no prefix in `prefixes` captures."""
+    """The RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS values and RESOLVE_MEMO_KEY no prefix in
+    `prefixes` captures."""
     ps = tuple(p for p in prefixes if p)
     need = (set(RUN8_KEYS.values()) | set(RUN9_KEYS.values()) | set(TIER_KEYS.values())
-            | set(EGRESS_KEYS.values()))
+            | set(EGRESS_KEYS.values()) | {RESOLVE_MEMO_KEY})
     return sorted(k for k in need if not ps or not k.startswith(ps))
 
 
@@ -3672,6 +3683,60 @@ def egress_connections_report(mem: list[dict], fresh: list[dict] | None) -> dict
     return out
 
 
+def _resolve_memo_counters(m: dict) -> dict | None:
+    """snowplow_resolve_memo's lookup and would-join members, or None when the
+    sample has none of them (an image that predates them publishes the map
+    with its gauges only)."""
+    v = (m.get("extra") or {}).get(RESOLVE_MEMO_KEY)
+    if not isinstance(v, dict) or not any(k in v for k in RESOLVE_MEMO_COUNTERS):
+        return None
+    return {k: _num(v.get(k)) for k in RESOLVE_MEMO_COUNTERS}
+
+
+def _share(n, d) -> float | None:
+    return round(n / d, 6) if d else None
+
+
+def resolve_memo_report(mem: list[dict], fresh: list[dict] | None) -> dict:
+    """INFO only, never judged: the refresher memo per phase (run_phases, "churn"
+    summing the churn phases, "all" the whole measure) — hits, misses (stale
+    included), stale misses and would-joins (deltas over mem606's /debug/vars
+    samples, a restart's pair counted from 0), with the hit share
+    hits / (hits + misses) and the would-join share would_join / misses: the
+    share of the memo's produces an in-flight join would have removed (a joiner
+    counts only when its leader's body was still fresh at hand-over). An image
+    without the counters is ABSENT, never 0. `lines` is the whole measure."""
+    n = sum(1 for m in mem if m.get("kind") == "mem")
+    out: dict = {"result": "INFO", "source": f"mem606's /debug/vars samples ({n})"}
+    r = _phase_counter_report(mem, fresh, RESOLVE_MEMO_KEY, _resolve_memo_counters)
+    if r["status"] != "present":
+        out["memo"] = {"status": "ABSENT",
+                       "why": f"{RESOLVE_MEMO_KEY} lookup counters are in none of the {n} mem606 samples: an "
+                              f"image that does not publish them, or mem606 did not capture them; absent, not 0"}
+        out["lines"] = [f"INFO resolve memo: ABSENT ({out['memo']['why']})"]
+        return out
+    by_phase = {}
+    for ph, v in r["by_phase"].items():
+        c = {k.removesuffix("_total"): v["counters"].get(k, 0) for k in RESOLVE_MEMO_COUNTERS}
+        c["hit_share"] = _share(c["hits"], c["hits"] + c["misses"])
+        c["would_join_share"] = _share(c["would_join"], c["misses"])
+        by_phase[ph] = {"seconds": v["seconds"], **c}
+    out["memo"] = {"status": "present", "by_phase": by_phase, "restarts": r["restarts"], "samples": r["samples"]}
+    w = by_phase["all"]
+
+    def pct(x):
+        return "n/a" if x is None else f"{x:.2%}"
+    lines = [f"INFO resolve memo (whole measure, {w['seconds']:g} s): hits {w['hits']:g}, misses {w['misses']:g} "
+             f"(stale {w['stale_misses']:g}), hit share {pct(w['hit_share'])}",
+             f"INFO resolve memo would-join (whole measure): {w['would_join']:g} of {w['misses']:g} misses "
+             f"({pct(w['would_join_share'])}) would have been saved by joining their key's in-flight produce "
+             f"(its body still fresh at hand-over)"]
+    if r["restarts"]:
+        lines.append(f"INFO resolve memo: {r['restarts']} restart(s) spanned (each pair after one counted from 0)")
+    out["lines"] = lines
+    return out
+
+
 def push_refetch_field(rows: list[dict], src: str) -> dict:
     """push_refetch_report over the driver's viewers' records, or UNMEASURED
     with why (#1066): none recorded is not none happened."""
@@ -4009,6 +4074,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     report["refresher_tiers_report_only"] = _report_only(refresher_tiers_report, mem or [], phase_src)
     # run 23 (#1189): connection reuse per egress and protocol, and the endpoint retries, INFO only
     report["egress_connections_report_only"] = _report_only(egress_connections_report, mem or [], phase_src)
+    # snowplow #1284: the refresher memo's lookups and would-joins per phase, INFO only
+    report["resolve_memo_report_only"] = _report_only(resolve_memo_report, mem or [], phase_src)
     # report-only warnings: a report that came out empty says so (run606
     # logs each one; the verdict never reads them)
     report["report_warnings"] = (
@@ -6064,7 +6131,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="exit 4 (UNSETTLED) while any snowplow pod is still Terminating")
     dg.set_defaults(func=_cmd_digest_gate)
     cp = sub.add_parser("check-prefixes",
-                        help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS value")
+                        help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS value "
+                             "and RESOLVE_MEMO_KEY")
     cp.add_argument("prefixes", nargs="*")
     cp.set_defaults(func=_cmd_check_prefixes)
     vp = sub.add_parser("prefixes", help="print RUN8_VARS_PREFIXES (run606's default)")
