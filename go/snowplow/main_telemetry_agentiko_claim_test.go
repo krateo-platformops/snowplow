@@ -170,9 +170,11 @@ func TestRUMAgentikoClaim_AcceptedWithExactlyFamilyAndOutcome(t *testing.T) {
 // other, valid attribute. Each bad value is tried on family (with a valid
 // outcome) and on outcome (with a valid family).
 //
-// MUTATIONS (RED, shown in the PR): the check accepting upper case; the
-// length bound raised to 33; the first character allowed to be a digit; the
-// check accepting the empty string; the one-member check removed.
+// MUTATIONS (RED, shown in the PR): the check accepting upper case; the loop
+// over the characters after the first accepting A-Z (grounDing); the loop
+// accepting NUL (a\x00b); the length bound raised to 33; the first character
+// allowed to be a digit; the check accepting the empty string; the one-member
+// check removed.
 func TestRUMAgentikoClaim_InvalidValueDropsOnlyThatAttribute(t *testing.T) {
 	bad := []struct {
 		name  string
@@ -180,6 +182,9 @@ func TestRUMAgentikoClaim_InvalidValueDropsOnlyThatAttribute(t *testing.T) {
 	}{
 		{"upper case", map[string]any{"stringValue": "Grounding"}},
 		{"all upper case", map[string]any{"stringValue": "UNBACKED"}},
+		// Past the first character: only the loop over the rest can refuse these.
+		{"mid-string upper case", map[string]any{"stringValue": "grounDing"}},
+		{"embedded NUL", map[string]any{"stringValue": "a\u0000b"}},
 		{"33 characters", map[string]any{"stringValue": "a" + strings.Repeat("b", 32)}},
 		{"leading digit", map[string]any{"stringValue": "1grounding"}},
 		{"leading underscore", map[string]any{"stringValue": "_grounding"}},
@@ -218,6 +223,48 @@ func TestRUMAgentikoClaim_InvalidValueDropsOnlyThatAttribute(t *testing.T) {
 		}
 		if v, _ := stringAttrValue(t, s, kept); v != keptValue {
 			t.Errorf("%s: the valid %s was not forwarded as sent (%q)", b.name, kept, v)
+		}
+	}
+}
+
+// The values the frontend sends today (frontend session, 2026-11-09): every
+// family x outcome pair is forwarded through the real router with both
+// attributes, as sent, and nothing is dropped. The ingest checks the SHAPE
+// (^[a-z][a-z0-9_]{0,31}$), not this list; the arm pins that the contract's
+// real values pass it.
+//
+// MUTATIONS (RED): the check never passing; the length bound lowered to 6
+// ("controller", "declined" are longer).
+func TestRUMAgentikoClaim_FrontendValuesAllForwarded(t *testing.T) {
+	families := []string{"preview", "publish", "apply", "controller", "compose", "chart"}
+	outcomes := []string{"missing", "refused", "failed", "declined", "dropped"}
+	var pairs [][2]string
+	var spans []otlpSpan
+	for _, f := range families {
+		for _, o := range outcomes {
+			pairs = append(pairs, [2]string{f, o})
+			spans = append(spans, claimSpanWith(strAttr(claimFamilyKey, f), strAttr(claimOutcomeKey, o)))
+		}
+	}
+	if len(pairs) != 30 {
+		t.Fatalf("SETUP: %d pairs, want 30", len(pairs))
+	}
+	out, dropped := postAndExport(t, "claim-frontend-values", spans...)
+	if dropped != 0 {
+		t.Errorf("attributes_dropped delta %d, want 0", dropped)
+	}
+	for i, s := range out {
+		if s.GetName() != claimSpan {
+			t.Errorf("span %d is %q, want %q", i, s.GetName(), claimSpan)
+		}
+		if got, want := attrKeys(s), claimFamilyKey+","+claimOutcomeKey; got != want {
+			t.Errorf("%v: forwards [%s], want [%s]", pairs[i], got, want)
+		}
+		if f, _ := stringAttrValue(t, s, claimFamilyKey); f != pairs[i][0] {
+			t.Errorf("%v: family %q, want %q", pairs[i], f, pairs[i][0])
+		}
+		if o, _ := stringAttrValue(t, s, claimOutcomeKey); o != pairs[i][1] {
+			t.Errorf("%v: outcome %q, want %q", pairs[i], o, pairs[i][1])
 		}
 	}
 }

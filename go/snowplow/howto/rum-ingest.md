@@ -107,7 +107,7 @@ What snowplow does with each of the two attributes:
 
 | sent | result |
 |---|---|
-| a `stringValue` that matches, e.g. `"grounding"`, `"no_source_0"` | forwarded as the same string |
+| a `stringValue` that matches, e.g. family `"preview"`, `"publish"`, `"apply"`, `"controller"`, `"compose"`, `"chart"` and outcome `"missing"`, `"refused"`, `"failed"`, `"declined"`, `"dropped"` (the values the frontend sends today; snowplow checks the shape, not this list) | forwarded as the same string |
 | upper case anywhere, a leading digit or `_`, empty, longer than 32, any other character (`-`, `.`, space, a non-ASCII letter) | that attribute is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
 | not a string (`intValue`, `boolValue`, `doubleValue`, `arrayValue`, …), or a matching string with any other member beside it | dropped and counted; the span is still forwarded |
 | on any other span | dropped and counted; the span is still forwarded |
