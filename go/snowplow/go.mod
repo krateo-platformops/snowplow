@@ -11,7 +11,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/itchyny/gojq v0.12.17
 	github.com/klauspost/compress v1.18.7
-	github.com/krateo-platformops/plumbing v1.28.1
+	github.com/krateo-platformops/plumbing v1.34.0
 	github.com/ledongthuc/pdf v0.0.0-20261020125853-5e46805f718e
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/http-swagger v1.3.4
