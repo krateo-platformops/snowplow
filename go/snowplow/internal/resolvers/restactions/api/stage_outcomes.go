@@ -74,6 +74,12 @@ const (
 	// is no Kubernetes StatusReason, so trustedReason drops it from an upstream
 	// answer (#714).
 	StageReasonDestinationRefused = credhttp.DestinationRefusedReason
+	// StageReasonUAFOnNonReadVerb (#1281) — the stage carries userAccessFilter
+	// on a verb other than GET or HEAD, which the CRD rejects (core.go): it
+	// would have been sent as snowplow's ServiceAccount, so nothing was sent
+	// (uaf_non_read.go). Recorded only by snowplow: the reason is no Kubernetes
+	// StatusReason, so trustedReason drops it from an upstream answer (#714).
+	StageReasonUAFOnNonReadVerb = "UserAccessFilterOnNonReadVerb"
 )
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
@@ -84,6 +90,10 @@ const StageOutcomesMaxHeaderBytes = 4096
 // with many failing items): the most specific one wins, deterministically,
 // whatever order concurrent items finish in.
 var reasonRank = map[string]int{
+	// #1281: every item of such a stage is refused at dispatch, before any
+	// other refusal there; it outranks the plan's refusals of other items
+	// (InvalidPath, TemplateError), since the stage itself is misconfigured.
+	StageReasonUAFOnNonReadVerb:   11,
 	StageReasonNotExecuted:        10,
 	StageReasonForbidden:          9,
 	StageReasonUnauthorized:       8,
@@ -312,15 +322,16 @@ func TruncatedStageOutcomes(failed int) string {
 // Only machine fields are read (reason / code); the message never leaves.
 //
 // #714 — the CODE decides, not a reason: a recorded reason can be an
-// upstream's claim (a 500 calling itself "Forbidden"). The one reason read is
-// StageNotExecuted, which only snowplow writes (the #443 dry-run refusal, which
-// has no code).
+// upstream's claim (a 500 calling itself "Forbidden"). The reasons read are
+// the ones only snowplow writes: StageNotExecuted (the #443 dry-run refusal,
+// which has no code), DestinationRefused (#1131) and
+// UserAccessFilterOnNonReadVerb (#1281, no code either).
 func stageReasonOf(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return StageReasonError
 	}
-	if r, _ := m["reason"].(string); r == StageReasonNotExecuted || r == StageReasonDestinationRefused {
+	if r, _ := m["reason"].(string); r == StageReasonNotExecuted || r == StageReasonDestinationRefused || r == StageReasonUAFOnNonReadVerb {
 		return r
 	}
 	switch code := toInt(m["code"]); code {

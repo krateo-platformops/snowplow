@@ -210,10 +210,15 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	// snowplow#229 / audit A1: this was `httpcall.HTTPClientForEndpoint`
 	// verbatim, which DROPS the CA bundle of a TOKEN-AUTH endpoint
 	// (plumbing transport.go:37 returns before the CA install when
-	// !HasCertAuth()). That is snowplow's own SA endpoint — the default
-	// for every api-step with no `endpointRef` — so every non-GET such
-	// step failed TLS with x509-unknown-authority while GETs escaped by
-	// being intercepted upstream. httpClientForEndpoint covers exactly
+	// !HasCertAuth()). That is snowplow's own SA endpoint, which at #229
+	// was the default for every api-step with no `endpointRef`, so every
+	// non-GET such step failed TLS with x509-unknown-authority while GETs
+	// escaped by being intercepted upstream. Since #268/#292 a customer
+	// api-step with no `endpointRef` dials the caller's own clientconfig;
+	// the SA endpoint is dialled by a userAccessFilter stage (GET/HEAD
+	// only: #1281 refuses any other verb) and, through the ctx-carried
+	// internal endpoint, by background resolves (the seed, the refresher,
+	// prewarm). httpClientForEndpoint covers exactly
 	// that shape and DELEGATES to plumbing verbatim for every other one,
 	// so the live cert-auth population is byte-identical. See
 	// endpoints_tls.go for the full trace.

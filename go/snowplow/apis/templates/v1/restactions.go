@@ -59,6 +59,33 @@ func (in *RESTAction) HasUserAccessFilterStage() bool {
 	return false
 }
 
+// UserAccessFilterOnNonReadVerb reports whether this api-step carries a
+// userAccessFilter on a verb the CRD's first stage rule (core.go, on API)
+// rejects: anything but an absent or empty verb, GET, HEAD, get or head. It is
+// that CEL rule in Go, verb for verb (TestUAFNonReadVerb_MatchesTheCRDRule
+// drives both over the same verbs), so admission and the resolver refuse the
+// same stages.
+//
+// WHY THE RESOLVER ASKS TOO (#1281). userAccessFilter switches the stage's
+// credential to snowplow's ServiceAccount. The CEL rule is checked only when a
+// RESTAction is created or updated, so a RESTAction stored before the rule
+// existed, or admitted while it was absent or relaxed, could still carry one
+// on a POST: sent, that write would be the ServiceAccount's, not the user's.
+// The resolver refuses such a stage before anything is sent, whatever the
+// RESTAction's provenance (restactions/api uaf_non_read.go).
+//
+// Nil receiver guarded.
+func (in *API) UserAccessFilterOnNonReadVerb() bool {
+	if in == nil || in.UserAccessFilter == nil || in.Verb == nil {
+		return false
+	}
+	switch *in.Verb {
+	case "", "GET", "HEAD", "get", "head":
+		return false
+	}
+	return true
+}
+
 // HasExternalEndpointStage reports that at least one api[] stage dispatches
 // against a named EndpointRef — i.e. an endpoint OUTSIDE the apiserver, reached
 // over HTTP (#594). It is the structural cost class of a resolve, not a
