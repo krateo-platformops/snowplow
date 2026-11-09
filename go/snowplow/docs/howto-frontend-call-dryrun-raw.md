@@ -136,7 +136,9 @@ Content-Type: application/json
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
     `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
     snowplow refused to send, below), `DestinationRefused` (#1131, below),
-    `Error` (anything else).
+    `WriteRefused` (#1288: a write an export or background work does not
+    send; never in a dry run, whose refusal is `StageNotExecuted`), `Error`
+    (anything else).
   - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
     `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
     item of its iterator, is listed with one of:

@@ -18,7 +18,9 @@ package api
 //   - S4 the truncated summary: its N, and no reasons (the header has none);
 //   - S5 the closed set: an unexpected reason is folded to "other", never
 //     passed raw; every reason code the package declares is in the set
-//     (read from the source, so a new code cannot be left out);
+//     (read from the source, so a new code cannot be left out), and (#1288)
+//     classified by the arm's own table: a failure counts in failed and
+//     names its reason, a deliberate non-execution counts in NotExecuted;
 //   - S6 no header, or a value of neither shape: no summary.
 
 import (
@@ -138,31 +140,66 @@ func TestIssue1264_S5_ReasonsComeFromTheClosedSet(t *testing.T) {
 
 	// Every StageReason* code this package declares is in the closed set: a
 	// code added later without joining it would read "other" on every span.
-	declared := s1264DeclaredReasonConsts(t)
-	values := map[string]string{
-		"StageReasonNotExecuted": StageReasonNotExecuted, "StageReasonForbidden": StageReasonForbidden,
-		"StageReasonNotFound": StageReasonNotFound, "StageReasonUnauthorized": StageReasonUnauthorized,
-		"StageReasonNotRun": StageReasonNotRun, "StageReasonError": StageReasonError,
-		"StageReasonSkipped": StageReasonSkipped, "StageReasonAborted": StageReasonAborted,
-		"StageReasonInvalidPath": StageReasonInvalidPath, "StageReasonTemplateError": StageReasonTemplateError,
-		"StageReasonNotSent": StageReasonNotSent, "StageReasonTimeout": StageReasonTimeout,
-		"StageReasonDestinationRefused": StageReasonDestinationRefused,
+	// #1288: and every one is classified, here, by hand: a failure (failed 1,
+	// its reason named) or a deliberate non-execution (not_executed 1, failed
+	// 0, no reason named). A new code must be added to s1264ReasonTable with
+	// its class, or this arm fails.
+	for n, c := range s1264ReasonTable(t) {
+		if !stageReasonKnown(c.code) {
+			t.Errorf("%s (%q) is not in the closed set: a span would read it as %q", n, c.code, StageReasonOther)
+		}
+		got := s1264Summary(t, `[{"name":"s","ok":false,"reason":"`+c.code+`"}]`)
+		if c.notExecuted {
+			s1264Want(t, n, got, 0)
+			if got.NotExecuted != 1 {
+				t.Errorf("%s: NotExecuted = %d, want 1 (a deliberate non-execution)", n, got.NotExecuted)
+			}
+			continue
+		}
+		s1264Want(t, n, got, 1, c.code)
+		if got.NotExecuted != 0 {
+			t.Errorf("%s: NotExecuted = %d, want 0 (a failure)", n, got.NotExecuted)
+		}
 	}
+}
+
+// s1264Reason is one declared reason code and its expected #1288 class.
+type s1264Reason struct {
+	code        string
+	notExecuted bool // a deliberate non-execution, not a failure
+}
+
+// s1264ReasonTable is every StageReason* constant the package declares, by
+// name, with its value and class. It fails when the package declares a code
+// the table does not classify (or the table names one the package dropped).
+func s1264ReasonTable(t *testing.T) map[string]s1264Reason {
+	t.Helper()
+	table := map[string]s1264Reason{
+		"StageReasonNotExecuted":        {StageReasonNotExecuted, true},
+		"StageReasonWriteRefused":       {StageReasonWriteRefused, true},
+		"StageReasonForbidden":          {StageReasonForbidden, false},
+		"StageReasonNotFound":           {StageReasonNotFound, false},
+		"StageReasonUnauthorized":       {StageReasonUnauthorized, false},
+		"StageReasonNotRun":             {StageReasonNotRun, false},
+		"StageReasonError":              {StageReasonError, false},
+		"StageReasonSkipped":            {StageReasonSkipped, false},
+		"StageReasonAborted":            {StageReasonAborted, false},
+		"StageReasonInvalidPath":        {StageReasonInvalidPath, false},
+		"StageReasonTemplateError":      {StageReasonTemplateError, false},
+		"StageReasonNotSent":            {StageReasonNotSent, false},
+		"StageReasonTimeout":            {StageReasonTimeout, false},
+		"StageReasonDestinationRefused": {StageReasonDestinationRefused, false},
+	}
+	declared := s1264DeclaredReasonConsts(t)
 	var tableNames []string
-	for n := range values {
+	for n := range table {
 		tableNames = append(tableNames, n)
 	}
 	sort.Strings(tableNames)
 	if !slices.Equal(declared, tableNames) {
-		t.Fatalf("the package declares reason codes %v; this arm's table has %v: add the new code to the table", declared, tableNames)
+		t.Fatalf("the package declares reason codes %v; the table classifies %v: add the new code to s1264ReasonTable with its class", declared, tableNames)
 	}
-	for n, code := range values {
-		if !stageReasonKnown(code) {
-			t.Errorf("%s (%q) is not in the closed set: a span would read it as %q", n, code, StageReasonOther)
-		}
-		got := s1264Summary(t, `[{"name":"s","ok":false,"reason":"`+code+`"}]`)
-		s1264Want(t, n, got, 1, code)
-	}
+	return table
 }
 
 // s1264DeclaredReasonConsts is every StageReason* constant the package's

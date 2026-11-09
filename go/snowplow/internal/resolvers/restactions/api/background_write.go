@@ -31,7 +31,12 @@
 //
 // OBSERVABILITY. A refusal is expected work, not a failure: DEBUG, and one
 // count per refused item in snowplow_background_write_refused_total{origin},
-// every cell of the closed origin set pre-populated (a 0 is a reading).
+// every cell of the closed origin set pre-populated (a 0 is a reading). Its
+// stage outcome reads WriteRefused (#1288; before, the generic Error), a
+// deliberate non-execution: it is listed in X-Snowplow-Stage-Outcomes (the
+// stage did not succeed) and is not counted in the Server span's
+// snowplow.stages.failed. A write that depends on a refused write is not
+// Skipped: it is refused too, for the same reason (blocksDependentWrite).
 package api
 
 import (
@@ -158,7 +163,10 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 	if !call.ContinueOnError {
 		itemErr = fmt.Errorf("api %s item %d failed: %s", sc.id, i, msg)
 	}
-	r.recordItemError(sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
+	// #1288: the outcome reads WriteRefused, not the generic Error a plain-text
+	// errorKey value would read: a by-design refusal is not a failure. The
+	// errorKey value stays the text it always was.
+	r.recordItemErrorAs(StageReasonWriteRefused, sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
 	recordBackgroundWriteRefused(origin)
 	r.log.Debug("write stage refused",
 		slog.String("name", sc.id),

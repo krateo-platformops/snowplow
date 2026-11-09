@@ -7,16 +7,25 @@
 // failing child span, so the collector's tail sampler (every error trace, 5%
 // of the rest) kept it 5% of the time. The span now carries:
 //
-//   - snowplow.stages.failed (int): the number of entries the header lists,
-//     every stage that did not succeed (failed, skipped, not run, refused by
-//     a dry run) plus the resolve-level Aborted row. 0 when the header is []:
-//     the response reported every stage succeeded. Observability's sampler
-//     keeps a trace on snowplow.stages.failed > 0;
+//   - snowplow.stages.failed (int): the number of entries the header lists
+//     that are failures (failed, skipped after a failure, not run) plus the
+//     resolve-level Aborted row. A stage snowplow deliberately did not execute
+//     is not one (#1288). 0 when no listed stage failed. Observability's
+//     sampler keeps a trace on snowplow.stages.failed > 0;
+//   - snowplow.stages.not_executed (int, #1288): the number of entries the
+//     header lists that snowplow deliberately did not execute: a dry run's
+//     refused write (StageNotExecuted), an export's or background work's
+//     refused write (WriteRefused). Set whenever failed is, except for the
+//     truncated header summary, which cannot tell (its N is failed);
 //   - snowplow.stages.failure_reasons (string slice): the distinct reason
-//     codes of those entries, sorted, from the header's closed set; any other
-//     value is folded to "other" (api.StageReasonOther), never passed raw.
-//     Not set when failed is 0, nor for the truncated header summary, which
-//     no longer names its reasons (failed is still its N).
+//     codes of the failed entries, sorted, from the header's closed set; any
+//     other value is folded to "other" (api.StageReasonOther), never passed
+//     raw. Not set when failed is 0, nor for the truncated header summary,
+//     which no longer names its reasons (failed is still its N).
+//
+// The header itself is unchanged: it lists every stage that did not succeed
+// (#904), deliberate non-executions included. Only the span splits them, by
+// the reason's class (api.SummarizeStageOutcomes).
 //
 // Neither carries a stage name, a RESTAction or target name, an identity, a
 // message or a body: the header's names are dropped by the parser
@@ -53,6 +62,7 @@ import (
 // Span attribute names (#1264). Distinct from #1265's snowplow.serve.*.
 const (
 	spanAttrStagesFailed         = "snowplow.stages.failed"
+	spanAttrStagesNotExecuted    = "snowplow.stages.not_executed"
 	spanAttrStagesFailureReasons = "snowplow.stages.failure_reasons"
 )
 
@@ -80,6 +90,9 @@ func stageOutcomeSpanAttrs(v string) []attribute.KeyValue {
 		return nil
 	}
 	attrs := []attribute.KeyValue{attribute.Int(spanAttrStagesFailed, s.Failed)}
+	if !s.Truncated {
+		attrs = append(attrs, attribute.Int(spanAttrStagesNotExecuted, s.NotExecuted))
+	}
 	if len(s.Reasons) > 0 {
 		attrs = append(attrs, attribute.StringSlice(spanAttrStagesFailureReasons, s.Reasons))
 	}

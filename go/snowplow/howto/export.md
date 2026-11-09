@@ -115,7 +115,9 @@ item of an iterator stage, and whatever the stage's `continueOnError`:
 - the refusal is reported, not silent: the export response carries
   `X-Snowplow-Stage-Outcomes`, the stages of its re-dispatched pages that
   did not succeed (as `/call` reports them), and the refused write stage
-  is listed there. The merged value keeps the header's 4 KiB bound: above
+  is listed there with reason `WriteRefused` (before #1288 it read the
+  generic `Error`). A write stage that depends on it is refused the same
+  way and listed with `WriteRefused` too, not `Skipped`. The merged value keeps the header's 4 KiB bound: above
   it, or when a page already sent the summary, it is
   `{"truncated":true,"failed":N}`, with `N` the number of distinct
   outcomes the pages listed (or a summarised page's own `N`, when larger);
