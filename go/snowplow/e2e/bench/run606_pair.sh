@@ -442,7 +442,7 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                 + [r["line"] for r in v.get("b_inside_a_outage") or []]
                 + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
                 + [ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
-                                "go_runtime_report_only", "user_buckets_report_only")
+                                "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only")
                    for ln in (v.get(k) or {}).get("lines") or []]))' \
              "$f" 2>/dev/null || true)
   (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))

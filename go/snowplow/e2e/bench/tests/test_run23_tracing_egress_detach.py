@@ -345,6 +345,9 @@ def test_the_real_sequence_records_both_readings_into_the_verdict(harness):  # n
     # the fake snowplow publishes no egress counters: ABSENT, never 0
     eg = v["report"]["egress_connections_report_only"]
     assert eg["connections"]["status"] == "ABSENT" and "INFO egress connections: ABSENT" in log
+    # snowplow #1284's resolve memo: no counters in the fake snowplow either, ABSENT in the run log
+    assert v["report"]["resolve_memo_report_only"]["memo"]["status"] == "ABSENT"
+    assert "INFO resolve memo: ABSENT" in log
     assert not [c for c in _kubectl_verbs(state) if "secret" in " ".join(c).lower() and c[:1] == ["get"]]
 
 

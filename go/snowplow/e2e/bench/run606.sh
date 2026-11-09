@@ -2251,7 +2251,8 @@ s_evaluate() {
     [[ -n "$r" ]] && log "$r"
   done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
 print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
-                             "go_runtime_report_only", "user_buckets_report_only") for ln in (r.get(k) or {}).get("lines") or []))' \
+                             "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only")
+                 for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever
   # it is. Without this the loop's last `[[ -n "" ]]` (no warnings) was the
