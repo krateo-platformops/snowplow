@@ -15,8 +15,9 @@ the diff. Plus the composition controller Deployment's replicas (the hold scales
 Deployment itself is the fixture's, created before data606 holds it).
 
 Excluded, and said: the namespace of the in-cluster Jobs (bench-loadgen, the Namespace object and
-everything in it: run606 creates it for every in-cluster Job, data606's and the drivers', and keeps it
-with its bench-src ConfigMap; the arm reports what is left in it), Deployments (only the controller's replicas are compared), and the
+everything in it: run606 creates it for every in-cluster Job, data606's and the drivers', and keeps it;
+the arm checks that nothing but serviceaccount/default and configmap/kube-root-ca.crt is left in it),
+Deployments (only the controller's replicas are compared), and the
 objects Kubernetes creates in every new namespace (ConfigMap kube-root-ca.crt, ServiceAccount default:
 not of a compared kind).
 
@@ -101,7 +102,7 @@ def build(listings: dict[str, dict], controller: dict | None, baseline: dict | N
         for item in listing.get("items") or []:
             meta = item.get("metadata") or {}
             # the harness namespace: neither what is in it nor the Namespace object itself (run606
-            # keeps it, with its bench-src ConfigMap, for the drivers; the arm reports its contents)
+            # keeps it for the drivers; the arm checks what is left in it)
             if meta.get("namespace") in EXCLUDED_NAMESPACES or (kind == "Namespace"
                                                                 and meta.get("name") in EXCLUDED_NAMESPACES):
                 continue

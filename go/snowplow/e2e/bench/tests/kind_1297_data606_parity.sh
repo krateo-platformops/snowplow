@@ -284,9 +284,10 @@ for arm, path in (("A", "A.json"), ("B", "B/data-proof.json")):
     except (OSError, ValueError):
         proof[arm] = None
 gone = left_pods.strip() in ("", "No resources found in bench-loadgen namespace.")
-# bench-loadgen is not in the diff (bench/data606_parity.py): what run606 may leave there is said here,
-# and anything else (the Job, its pod or its ServiceAccount) fails the arm
-expected_left = {"serviceaccount/default", "configmap/bench-src", "configmap/kube-root-ca.crt"}
+# bench-loadgen is not in the diff (bench/data606_parity.py): after s_data it holds only what Kubernetes
+# puts in every namespace; anything else (the Job, its pod, its ServiceAccount, the bench-src ConfigMap,
+# which run606 deletes with each in-cluster Job) fails the arm
+expected_left = {"serviceaccount/default", "configmap/kube-root-ca.crt"}
 unexpected_left = sorted(set(left_loadgen.split()) - expected_left)
 ok = (d["verdict"] == "PASS" and int(b_rc) == 0 and gone and not unexpected_left
       and placement and all(p.get("ok") for p in placement))
