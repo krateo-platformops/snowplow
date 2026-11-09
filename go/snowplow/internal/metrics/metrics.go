@@ -1258,6 +1258,11 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerCustomerServeInstruments(m); err != nil {
 		return err
 	}
+	// The effective GOGC and soft memory limit, whatever the cache mode (the
+	// snowplow_go_runtime expvar key is published unconditionally).
+	if err := registerGoRuntimeInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).
