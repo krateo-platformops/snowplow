@@ -318,9 +318,9 @@ FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
 [[ -n "$FULL_WIDEN_GO" ]] && FW_S=$(( FW_APPLIES * COLLECT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + FW_CREATE_S + FW_JOB_S
                                      + FW_READS * COLLECT_TIMEOUT_S + FW_DELETES * COLLECT_TIMEOUT_S + FW_DELETE_S ))
 # #1297: the in-cluster Jobs' own waits (bench/incluster.py): the observer's pod start (env), the
-# data606 pod's start, its result's last poll and its finish (INC_FINISH_CALLS bounded calls: the
-# copy, the init log, /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
-INC_FINISH_CALLS=6
+# data606 pod's start, its result's last poll and its bounded calls (INC_FINISH_CALLS: the loadgen room's 2
+# reads, its /out copy, its init log, /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
+INC_FINISH_CALLS=8
 INC_POLL_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1])))' "$PREFLIGHT_POLL_S")"   # data606_wait's poll, rounded up
 INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + INC_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
 RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
@@ -1212,6 +1212,10 @@ s_env() {
   # The platform is up: snowplow's log is streamed from here to collect, and
   # the API server's flow control sampled (#919) — in-cluster, by the observer
   # on the loadgen node (#1297), never from this machine.
+  # #1297 review M1: the loadgen node can hold data606 (its live room, run 23's share as the floor),
+  # checked before the observer and long before the data load; s_data reads it again to render
+  if [[ "$DRY" == "1" ]]; then log "DRY: loadgen room (env): the live loadgen node's allocatable - its scheduled pods' requests - the observer's, refused below run 23's share"
+  else loadgen_room env "$OUT/.loadgen-room-env.json" || return 1; fi
   start_observer || return 1
   apf_preflight || return 1
   start_netns_sampler
@@ -1384,10 +1388,12 @@ s_data() {
   # shellcheck disable=SC2206
   [[ "$FRESH_MODES" == "annotation" ]] || args+=(--fresh-modes $FRESH_MODES)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: ${INC[*]} render-data606 --context $KCTX --timeout-s $DATA_TIMEOUT_S --machine $LOADGEN_MACHINE_TYPE -- ${args[*]} > $mf; kapply; the pod on the loadgen node; wait for /out/done; copy /out -> $OUT/data606 (data-proof.json); delete the Job, its ServiceAccount and RBAC"
+    log "DRY: ${INC[*]} render-data606 --context $KCTX --timeout-s $DATA_TIMEOUT_S --room <the live loadgen node: allocatable - scheduled requests - the observer, refused below run 23's share> -- ${args[*]} > $mf; kapply; the pod on the loadgen node; wait for /out/done; copy /out -> $OUT/data606 (data-proof.json); delete the Job, its ServiceAccount and RBAC"
   else
+    # its requests: what the live loadgen node has left now (the observer there included)
+    loadgen_room data "$OUT/loadgen-room.json" || return 1
     "${INC[@]}" render-data606 --context "$KCTX" --timeout-s "$DATA_TIMEOUT_S" --linger-s "$COLLECT_CAP_S" \
-        --machine "$LOADGEN_MACHINE_TYPE" -- "${args[@]}" > "$mf"
+        --room "$OUT/loadgen-room.json" -- "${args[@]}" > "$mf"
     : > "$OUT/.data606-applied"     # from here the teardown collects and deletes it, whatever happens
     kapply "$mf"
     if ! incluster_started data606 "$mf" "$PREFLIGHT_TIMEOUT_S" || ! data606_wait; then
@@ -2029,6 +2035,32 @@ incluster_placement() {
   fi
   log "$job: ${why}"
 }
+# loadgen_room <phase> <out.json>: what the LIVE loadgen node leaves data606 (review M1): its
+# allocatable minus the requests of every pod already scheduled on it (GKE's DaemonSets included)
+# minus the observer's when it is not there yet (bench/incluster.py loadgen_room). The record goes
+# into incluster-placement.jsonl and <out.json> (s_data renders data606's requests from it); below
+# the floor (what data606 had in run 23) the step fails, with the numbers, before data606 is applied.
+loadgen_room() {
+  local phase="$1" out="$2" node rec rc=0 why
+  local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
+  if ! "${KR[@]}" get nodes -l bench.krateo.io/pool=loadgen -o json > "$OUT/.loadgen-nodes.json" 2>"$KERR" \
+      || ! node="$(python3 -c 'import json, sys; i = json.load(open(sys.argv[1]))["items"]; print(i[0]["metadata"]["name"] if len(i) == 1 else "")' "$OUT/.loadgen-nodes.json")" \
+      || [[ -z "$node" ]] \
+      || ! "${KR[@]}" get pods -A --field-selector "spec.nodeName=${node}" -o json > "$OUT/.loadgen-pods.json" 2>"$KERR"; then
+    record_failure "loadgen room FAILED ($phase): the loadgen node or the pods on it could not be read (want one node in the pool)" || true
+    return 1
+  fi
+  rec="$("${INC[@]}" room --nodes "$OUT/.loadgen-nodes.json" --pods "$OUT/.loadgen-pods.json" --phase "$phase")" || rc=$?
+  rm -f "$OUT/.loadgen-nodes.json" "$OUT/.loadgen-pods.json"
+  printf '%s\n' "$rec" >> "$OUT/incluster-placement.jsonl"
+  printf '%s\n' "$rec" > "$out"
+  why="$(printf '%s' "$rec" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("why"))' 2>/dev/null)"
+  if (( rc != 0 )); then
+    record_failure "loadgen room FAILED ($phase): ${why}" || true
+    return 1
+  fi
+  log "loadgen room ($phase): ${why}"
+}
 # incluster_delete <job>: the Job (its pod gone first), its ServiceAccount and RBAC (and the
 # observer's Secret), each delete bounded; idempotent (the teardown repeats it)
 incluster_delete() {
@@ -2174,7 +2206,16 @@ OBSERVE_FILES="apf.jsonl.gz top.jsonl top-boot.jsonl snowplow-stream.log snowplo
 collect_observer() {
   [[ -f "$OUT/.observer-started" && ! -f "$OUT/.observer-collected" ]] || return 0
   if [[ "$DRY" == "1" ]]; then log "DRY: observe606: /out/stop, then copy /out -> $OUT ($OBSERVE_FILES)"; return 0; fi
-  local pod deadline left f
+  local pod deadline left f jp
+  # review M2: how its pod stands now, before anything stops it: an observer that died (OOM kill,
+  # eviction) is recorded with its reason and exit code (observer-pod.jsonl, evaluate's INFO)
+  if jp="$(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
+             get pods -l job-name=observe606 -o json 2>"$KERR")"; then
+    printf '%s' "$jp" | "${INC[@]}" observer-outcome >> "$OUT/observer-pod.jsonl" \
+      || log "could not record how the observe606 pod stands"
+  else
+    "${INC[@]}" observer-outcome --unreadable "$(err_kind): $(kerr_line)" >> "$OUT/observer-pod.jsonl"
+  fi
   pod="$(incluster_pod observe606)"
   if [[ -n "$pod" ]]; then
     if observer_exec touch /out/stop >/dev/null 2>"$KERR"; then
@@ -2367,7 +2408,7 @@ s_evaluate() {
                "$OUT"/top-boot.jsonl "$OUT"/boot.jsonl "$OUT"/flowcontrol-config.jsonl
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
-               "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl "$OUT"/incluster-placement.jsonl
+               "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl "$OUT"/incluster-placement.jsonl "$OUT"/observer-pod.jsonl
                "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)

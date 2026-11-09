@@ -34,11 +34,9 @@
 # status-mode RESTAction fixture is in the compared set). Arm B runs with LOAD_DRIVER=load606, which
 # only skips fresh_classes_create (s_data's next action, objects of the #935 classes, not data606's).
 #
-# LOADGEN_MACHINE_TYPE (default n2-standard-16, the paid run's loadgen): data606's requests are rendered
-# for it. A kind worker has the Docker VM's CPUs, so before arm B applies anything the rendered requests
-# are checked against the worker's allocatable, and the arm stops with the reason if they do not fit
-# (n2-standard-16 renders 14390m; on an 8-CPU Docker VM run with LOADGEN_MACHINE_TYPE=n2-standard-8,
-# 6410m). The result records the machine type and the CPU request it ran with.
+# data606's requests: arm B's s_data derives them from the LIVE loadgen worker, as a paid run does
+# (review M1, bench/incluster.py loadgen_room: allocatable minus the pods already there minus the
+# observer's), and refuses with the numbers below run 23's share. The result records that room.
 #
 # Environment: PARITY_WORK (default: a new temporary directory) holds every file of the run (the
 # snapshots, the diff, arm B's OUT, result.json); KEEP_CLUSTER=1 keeps the last arm's cluster.
@@ -53,7 +51,6 @@ KCFG="$WORK/kubeconfig"
 export KUBECONFIG="$KCFG"           # kind and every kubectl here: the scratch file, never ~/.kube/config
 unset BENCH_ALLOW_NON_GKE           # the bench's context pin applies, as in run606.sh
 K=(kubectl "--kubeconfig=$KCFG" "--context=$CTX")
-LOADGEN_MACHINE_TYPE="${LOADGEN_MACHINE_TYPE:-n2-standard-16}"
 SCALE=500 USERS=50 NAMESPACES=5 HOLD_PROBE_WAIT_S=0
 FRESH="annotation status"
 CRD_CHARTS="$BENCH/tests/fixtures/crd_charts"
@@ -208,29 +205,6 @@ delete_cluster
 make_cluster
 snapshot "$WORK/B-baseline.json"
 
-# the rendered requests must fit the loadgen worker, or the pod could only stay Pending
-(cd "$BENCH" && python3 -m bench.incluster render-data606 --context "$CTX" --timeout-s 60 --linger-s 60 \
-   --machine "$LOADGEN_MACHINE_TYPE" -- --scale 1 > "$WORK/fit.yaml") || die "render-data606 for $LOADGEN_MACHINE_TYPE"
-"${K[@]}" get nodes -l bench.krateo.io/pool=loadgen -o json > "$WORK/fit-node.json"
-FIT="$(cd "$BENCH" && python3 - "$WORK/fit.yaml" "$WORK/fit-node.json" <<'PY'
-import json, sys
-from bench import incluster, k6_job
-want = incluster.rendered_requests(incluster._load_manifest(sys.argv[1]), "data606")["data606"]
-alloc = json.load(open(sys.argv[2]))["items"][0]["status"]["allocatable"]
-def mem_mi(q):
-    for suf, f in (("Ki", 1 / 1024), ("Mi", 1), ("Gi", 1024)):
-        if q.endswith(suf):
-            return int(float(q[:-2]) * f)
-    return int(q) // (1 << 20)
-cpu_ok = k6_job._mcpu(want["cpu"]) <= k6_job._mcpu(alloc["cpu"])
-mem_ok = mem_mi(want["memory"]) <= mem_mi(alloc["memory"])
-print(json.dumps({"requests": want, "allocatable": {"cpu": alloc["cpu"], "memory": alloc["memory"]},
-                  "fits": cpu_ok and mem_ok}))
-PY
-)"
-say "fit: $LOADGEN_MACHINE_TYPE $FIT"
-[[ "$FIT" == *'"fits": true'* ]] || die "data606's requests for $LOADGEN_MACHINE_TYPE do not fit this kind worker ($FIT): run with LOADGEN_MACHINE_TYPE=n2-standard-8"
-
 start_standin
 OUTB="$WORK/B"
 mkdir -p "$OUTB"
@@ -259,10 +233,10 @@ mkdir -p "$OUTB"
   echo 'echo "S_DATA_RC=$rc DATA606_GONE_RC=$gone"'
   echo 'exit $(( rc != 0 || gone != 0 ))'
 } > "$WORK/armB.sh"
-say "arm B: run606.sh's s_data (LOADGEN_MACHINE_TYPE=$LOADGEN_MACHINE_TYPE, the data606 Job on the loadgen node)"
+say "arm B: run606.sh's s_data (the data606 Job on the loadgen node, its requests from the live worker)"
 B_RC=0
 (cd "$BENCH" && SCALE="$SCALE" USERS="$USERS" NAMESPACES="$NAMESPACES" HOLD_PROBE_WAIT_S="$HOLD_PROBE_WAIT_S" \
-   LOAD_DRIVER=load606 LOADGEN_MACHINE_TYPE="$LOADGEN_MACHINE_TYPE" FRESH_MODES="$FRESH" \
+   LOAD_DRIVER=load606 FRESH_MODES="$FRESH" \
    bash "$WORK/armB.sh") >"$WORK/B-s_data.log" 2>&1 || B_RC=$?
 stop_standin
 say "arm B: $(grep -E '^(S_DATA_RC=|S_DATA_ABORTED)' "$WORK/B-s_data.log" || echo "no result line (exit $B_RC)")"
@@ -274,12 +248,14 @@ snapshot "$WORK/B-snapshot.json" "$WORK/B-baseline.json"
 DIFF_RC=0
 (cd "$BENCH" && python3 -m bench.data606_parity diff "$WORK/A-snapshot.json" "$WORK/B-snapshot.json" \
    --out "$WORK/diff.json") | tee -a "$WORK/parity.log" >&2 || DIFF_RC=$?
-python3 - "$WORK" "$B_RC" "$DIFF_RC" "$LOADGEN_MACHINE_TYPE" "$LEFT_PODS" "$LEFT_LOADGEN" "$FIT" <<'PY' | tee "$WORK/result.json"
+python3 - "$WORK" "$B_RC" "$DIFF_RC" "$LEFT_PODS" "$LEFT_LOADGEN" <<'PY' | tee "$WORK/result.json"
 import json, os, sys
-work, b_rc, diff_rc, machine, left_pods, left_loadgen, fit = sys.argv[1:]
+work, b_rc, diff_rc, left_pods, left_loadgen = sys.argv[1:]
 d = json.load(open(os.path.join(work, "diff.json")))
-placement = [json.loads(l) for l in open(os.path.join(work, "B", "incluster-placement.jsonl"))] \
+recs = [json.loads(l) for l in open(os.path.join(work, "B", "incluster-placement.jsonl"))] \
     if os.path.exists(os.path.join(work, "B", "incluster-placement.jsonl")) else []
+placement = [r for r in recs if r.get("kind") == "incluster_placement"]
+room = [r for r in recs if r.get("kind") == "loadgen_room"]
 proof = {}
 for arm, path in (("A", "A.json"), ("B", "B/data-proof.json")):
     try:
@@ -295,17 +271,15 @@ gone = left_pods.strip() in ("", "No resources found in bench-loadgen namespace.
 expected_left = {"serviceaccount/default", "configmap/kube-root-ca.crt"}
 unexpected_left = sorted(set(left_loadgen.split()) - expected_left)
 ok = (d["verdict"] == "PASS" and int(b_rc) == 0 and gone and not unexpected_left
-      and placement and all(p.get("ok") for p in placement))
+      and placement and all(p.get("ok") for p in placement) and room and all(r.get("ok") for r in room))
 print(json.dumps({
     "kind": "kind_1297_data606_parity", "verdict": "PASS" if ok else "FAIL",
     "diff": {k: d[k] for k in ("verdict", "objects", "counts", "counts_equal", "controller")},
     "only_in_a": d["only_in_a"][:20], "only_in_b": d["only_in_b"][:20], "different": dict(list(d["different"].items())[:20]),
     "arm_b_exit": int(b_rc), "arm_b_aborted": "S_DATA_ABORTED" in open(os.path.join(work, "B-s_data.log")).read(),
     "placement": placement,
-    "loadgen_machine_type": machine, "fit": json.loads(fit),
-    "cpu_request_note": None if machine == "n2-standard-16" else
-        f"arm B ran with data606's requests for {machine}; the paid run's 16-vCPU loadgen (n2-standard-16) "
-        "renders 14390m, which a kind worker on an 8-CPU Docker VM cannot schedule",
+    "loadgen_room": room,
+    "cpu_request_note": "data606's requests are the kind worker's live room (its Docker VM's CPUs); a paid run derives them from its own loadgen node the same way",
     "data606_pod_gone": gone, "data606_pods_left": left_pods.strip(),
     "bench_loadgen_left": left_loadgen.strip(), "bench_loadgen_unexpected": unexpected_left,
     "proofs_equal_but_elapsed": proof["A"] == proof["B"], "proof_a": proof["A"], "proof_b": proof["B"],

@@ -96,7 +96,7 @@ def test_the_observer_reads_only():
 
 def test_each_job_is_pinned_to_the_loadgen_pool_with_its_own_serviceaccount():
     d = incluster.render_data606(context="gke_p_r_snowplow-bench-x", timeout_s=2400, linger_s=1800,
-                                 machine="n2-standard-16", data_args=["--scale", "50000"])
+                                 room=_room(), data_args=["--scale", "50000"])
     o = incluster.render_observe(context="gke_p_r_snowplow-bench-x", every_s=15, retry_s=5, selector="a=b",
                                  user_prefix="scaleuser-", password="pw", linger_s=9000)
     for objs, job, sa in ((d, "data606", "bench-data606"), (o, "observe606", "bench-observe606")):
@@ -112,7 +112,7 @@ def test_each_job_is_pinned_to_the_loadgen_pool_with_its_own_serviceaccount():
         text = json.dumps(objs)
         assert "token:" not in text and "client-certificate" not in text and spec["automountServiceAccountToken"]
     c = next(x for x in d if x["kind"] == "Job")["spec"]["template"]["spec"]["containers"][0]
-    assert c["resources"] == {"requests": {"cpu": "14390m", "memory": "8Gi"}}   # the node's budget but the observer's
+    assert c["resources"] == {"requests": {"cpu": "14390m", "memory": "54705Mi"}}   # the live room; no limit
     assert c["command"][-2:] == ["--scale", "50000"]
     oc = next(x for x in o if x["kind"] == "Job")["spec"]["template"]["spec"]["containers"][0]
     assert oc["resources"]["limits"]["cpu"] == "1"                              # never the browser's CPU
@@ -120,12 +120,118 @@ def test_each_job_is_pinned_to_the_loadgen_pool_with_its_own_serviceaccount():
     assert sec["stringData"] == {"deny": "pw"}                                  # kapply redacts it on disk
 
 
-def test_data606_takes_what_the_loadgen_node_leaves_and_the_k6_plan_still_fits_beside_the_observer():
+def _node(cpu="15890m", mem="59825Mi"):
+    """The loadgen node as `kubectl get nodes -l bench.krateo.io/pool=loadgen -o json` lists it
+    (default: an n2-standard-16's allocatable, k6_job.LOADGEN_ALLOCATABLE)."""
+    return {"items": [{"metadata": {"name": "gke-loadgen-1", "labels": {"bench.krateo.io/pool": "loadgen"}},
+                       "status": {"allocatable": {"cpu": cpu, "memory": mem}}}]}
+
+
+def _pod(name, cpu, mem, *, ns="kube-system", phase="Running", init=None, labels=None):
+    spec = {"containers": [{"name": "c", "resources": {"requests": {"cpu": cpu, "memory": mem}}}]}
+    if init:
+        spec["initContainers"] = [{"name": "i", "resources": {"requests": {"cpu": init[0], "memory": init[1]}}}]
+    return {"metadata": {"namespace": ns, "name": name, "labels": labels or {}}, "spec": spec, "status": {"phase": phase}}
+
+
+def _room(ds=(("ds", "1000m", "4096Mi"),), **kw):
+    return incluster.loadgen_room(_node(**kw), {"items": [_pod(n, c, m) for n, c, m in ds]})
+
+
+def test_run_23s_shape_is_unchanged():
+    """An n2-standard-16 whose DaemonSets request what run 23's plan reserved for them (1000m / 4096Mi):
+    data606 asks what it asked before (14390m), and its memory is the node's, not a guess."""
+    r = _room()
+    assert r["ok"] and (r["cpu_m"], r["memory_mi"]) == (14390, 54705) and r["observer_counted"] == "to come"
+    assert incluster.data606_requests(r) == ("14390m", "54705Mi")
     from bench import k6_job
-    assert incluster.data606_requests("n2-standard-8") == ("6410m", "8Gi")
-    k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())
-    with pytest.raises(ValueError, match="unknown loadgen machine type"):
-        incluster.data606_requests("e2-small")
+    k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())          # the drivers' plan still fits after it
+
+
+def test_heavy_daemonsets_give_a_smaller_request_that_still_schedules():
+    """Seven DaemonSets (run 24's loadgen node had 7, unrecorded) requesting 3.2 CPUs: data606 asks for
+    what is left, so it schedules; the observer, once there, is counted as scheduled, not twice."""
+    ds = [(f"ds-{i}", "457m", "700Mi") for i in range(7)]
+    r = _room(ds)
+    assert r["ok"] and r["cpu_m"] == 15890 - 7 * 457 - 500 and r["memory_mi"] == 59825 - 7 * 700 - 1024
+    sched = incluster.loadgen_room(_node(), {"items": [_pod(n, c, m) for n, c, m in ds] + [
+        _pod("observe606-x", "500m", "1Gi", ns="bench-loadgen", init=("100m", "128Mi"), labels={"job-name": "observe606"})]})
+    assert sched["observer_counted"] == "scheduled" and sched["cpu_m"] == r["cpu_m"]
+    # what the scheduler counts: finished pods do not hold requests; an init container larger than its
+    # containers counts instead of them
+    done = incluster.loadgen_room(_node(), {"items": [_pod("job-done", "8", "8Gi", phase="Succeeded")]})
+    assert done["cpu_m"] == 15890 - 500
+    assert incluster.pod_requests(_pod("p", "100m", "64Mi", init=("2", "1Gi"))) == (2000, 1024)
+    assert incluster.render_data606(context="c", timeout_s=1, linger_s=1, room=r, data_args=[])[-1][
+        "spec"]["template"]["spec"]["containers"][0]["resources"] == {
+        "requests": {"cpu": f"{r['cpu_m']}m", "memory": f"{r['memory_mi']}Mi"}}
+
+
+def test_too_little_room_is_refused_with_the_numbers():
+    # memory short only: 59825 - 51200 - 1024 = 7601Mi < 8192Mi; the CPU (3390m) is above its floor
+    r = _room((("ds", "12", "50Gi"),))
+    assert not r["ok"] and r["why"].startswith(
+        "the loadgen node gke-loadgen-1 leaves data606 too little: memory 7601Mi < floor 8192Mi (allocatable 15890m")
+    # CPU short only: 15890 - 13500 - 500 = 1890m
+    tight = _room((("ds", "13500m", "4Gi"),))
+    assert not tight["ok"] and "cpu 1890m < floor 2667m" in tight["why"] and "memory" not in tight["why"].split("(")[0]
+    with pytest.raises(ValueError, match="leaves data606 too little"):
+        incluster.data606_requests(tight)
+    two = incluster.loadgen_room({"items": [_node()["items"][0], _node()["items"][0]]}, {"items": []})
+    assert not two["ok"] and two["why"] == "2 node(s) in the loadgen pool, want 1"
+
+
+def test_the_floor_is_run_23s_share_from_its_own_records():
+    """Run 23's three 50K phases overlapped three deep (its consoles' times): each arm had at most a
+    third of the laptop's 8 CPUs / 24 GiB."""
+    assert incluster.max_overlap(incluster.RUN23_DATA606["phases_50k"]) == 3
+    assert incluster.data606_floor() == (2667, 8192)
+    assert incluster.max_overlap({"a": ("00:00:00", "00:00:10"), "b": ("00:00:10", "00:00:20")}) == 1
+
+
+def test_the_pods_are_hardened_as_netns606_is():
+    """Review L4: non-root, no privilege escalation, every capability dropped, the default seccomp
+    profile, a read-only root filesystem (all writes go to emptyDirs, /tmp included)."""
+    objs = (incluster.render_data606(context="c", timeout_s=1, linger_s=1, room=_room(), data_args=[])
+            + incluster.render_observe(context="c", every_s=15, retry_s=5, selector="a=b", user_prefix="u",
+                                       password="pw", linger_s=1))
+    for j in (o for o in objs if o["kind"] == "Job"):
+        spec = j["spec"]["template"]["spec"]
+        assert spec["securityContext"]["runAsNonRoot"] is True and spec["securityContext"]["runAsUser"] != 0
+        for c in spec["containers"] + spec["initContainers"]:
+            sc = c["securityContext"]
+            assert sc["allowPrivilegeEscalation"] is False and sc["readOnlyRootFilesystem"] is True
+            assert sc["capabilities"] == {"drop": ["ALL"]} and sc["seccompProfile"] == {"type": "RuntimeDefault"}
+            mounts = {m["mountPath"] for m in c["volumeMounts"]}
+            assert "/tmp" in mounts and {"/opt/bench", "/tools"} <= mounts
+        assert {"name": "TMPDIR", "value": "/tmp"} in spec["containers"][0]["env"]
+        vols = {v["name"]: v for v in spec["volumes"]}
+        assert all("emptyDir" in vols[m["name"]] for m in spec["containers"][0]["volumeMounts"])
+
+
+def test_an_observer_that_died_is_named_in_the_verdict(harness):  # noqa: F811
+    """Review M2: the observer OOM-killed before collect: its pod's outcome is recorded (reason, exit
+    code) and said as INFO, not left to read as streams that are merely missing."""
+    p, out, state, o = _run(harness, FAKE_INC_OOM="observe606")
+    assert p.returncode == 0, out[-3000:]
+    rec = [json.loads(ln) for ln in (o / "observer-pod.jsonl").read_text().splitlines()]
+    assert rec[0]["kind"] == "observer_pod" and rec[0]["phase"] == "Failed"
+    assert rec[0]["containers"][0]["terminated"] == {"reason": "OOMKilled", "exit_code": 137, "finished_at": None}
+    v = json.loads((o / "verdict.json").read_text())
+    line = v["report"]["incluster_report_only"]["lines"][-1]
+    assert line == ("INFO observer pod: observe606-0 Failed: DIED before collect, container observe terminated "
+                    "(OOMKilled, exit 137): the APF, top and log streams end where it died")
+    assert line in out                                          # in the run log too
+    assert v["verdict"] != "INVALID" or "observe606" not in json.dumps(v.get("invalid_reasons"))   # INFO, never judged
+
+
+def test_too_little_room_fails_the_env_step_before_anything_runs_there(harness):  # noqa: F811
+    p, out, state, o = _run(harness, FAKE_INC_DS="15000m 4Gi")
+    assert p.returncode != 0
+    assert "loadgen room FAILED (env): the loadgen node loadgen-0 leaves data606 too little: cpu 390m < floor 2667m" in out
+    assert "=== step data ===" not in out
+    calls = [json.loads(ln)["argv"] for ln in (state / "calls.jsonl").read_text().splitlines()]
+    assert not [c for c in calls if any(x.endswith(("observe-job.yaml", "data606-job.yaml")) for x in c)]
 
 
 def test_the_shipped_code_is_the_closure_and_runs_on_the_stdlib_alone(tmp_path):
@@ -245,7 +351,7 @@ def test_the_dry_pass_says_where_each_job_runs_and_the_budget_counts_it(tmp_path
     assert "DRY: python3 -m bench.incluster render-data606 --context " in p.stderr
     assert "DRY: python3 -m bench.incluster render-observe --context " in p.stderr
     line = next(ln for ln in p.stderr.splitlines() if "run budget:" in ln)
-    assert ("+ in-cluster 4203 (observer start 300 + data606 start 300 + its last poll 3 + finish 6x300 "
+    assert ("+ in-cluster 4803 (observer start 300 + data606 start 300 + its last poll 3 + finish 8x300 "
             "+ cleanup 1800)") in line
     src = (BENCH_DIR / "run606.sh").read_text()
     # nothing timed or per-request runs here any more

@@ -152,8 +152,8 @@ def test_the_guard_sees_a_dropped_variable_or_function(monkeypatch, drop, field)
 def test_a_new_global_read_on_s_datas_path_fails_the_guard():
     """A run606.sh where data606_wait reads a NEW top-level variable: refused until the arm carries it."""
     src = (BENCH_DIR / "run606.sh").read_text()
-    assert "INC_FINISH_CALLS=6\n" in src and "data606_wait() {\n" in src
-    src = src.replace("INC_FINISH_CALLS=6\n", "INC_FINISH_CALLS=6\nNEW_1297_KNOB=1\n", 1)
+    assert "INC_FINISH_CALLS=8\n" in src and "data606_wait() {\n" in src
+    src = src.replace("INC_FINISH_CALLS=8\n", "INC_FINISH_CALLS=8\nNEW_1297_KNOB=1\n", 1)
     src = src.replace("data606_wait() {\n", 'data606_wait() {\n  : "$NEW_1297_KNOB"\n', 1)
     assert dp.arm_b_coverage(src)["vars_missing"] == ["NEW_1297_KNOB"]
 

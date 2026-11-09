@@ -197,12 +197,12 @@ def read_cluster(k: list[str]) -> tuple[dict[str, dict], dict | None]:
 # `functions --arm-b`, and tests/test_1297_data606_parity.py checks it against run606.sh itself
 # (arm_b_coverage: a variable or function s_data's path reads that is not carried fails the suite, so
 # the next one added to run606.sh cannot silently break the arm, as INC_POLL_S did at f7aa9df3).
-ARM_B_VARS = ["COLLECT_TIMEOUT_S", "SCALE", "USERS", "NAMESPACES", "LOAD_DRIVER", "LOADGEN_MACHINE_TYPE",
+ARM_B_VARS = ["COLLECT_TIMEOUT_S", "SCALE", "USERS", "NAMESPACES", "LOAD_DRIVER",
               "HOLD_PROBE_WAIT_S", "ENDPOINT_MODE", "PREFLIGHT_TIMEOUT_S", "PREFLIGHT_POLL_S", "TOP_POLL_S",
               "FRESH_MODES", "DATA_TIMEOUT_S", "COLLECT_CAP_S", "PW", "INC", "INC_POLL_S", "BENCH_USER_PREFIX"]
 ARM_B_FUNCTIONS = ["log", "run", "kapply", "redact_pw", "kill_tree", "halt_tree", "bounded", "kerr_line",
                    "record_failure", "incluster_pod", "incluster_started", "incluster_placement",
-                   "incluster_delete", "data606_wait", "data606_finish", "data606_gone", "s_data"]
+                   "incluster_delete", "loadgen_room", "data606_wait", "data606_finish", "data606_gone", "s_data"]
 # set by the arm's own preamble (armB.sh), not read from run606.sh: the run dir, the script's dir, the
 # kube context it pins, kubectl's error file, the step
 ARM_B_PREAMBLE = {"OUT", "HERE", "DRY", "KCFG", "KCTX", "K", "KERR", "CUR_STEP"}

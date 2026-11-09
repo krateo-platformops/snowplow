@@ -80,7 +80,17 @@ DATA_SA, OBSERVE_SA = "bench-data606", "bench-observe606"
 AUTHN_NS = "krateo-system"
 # the observer: small, and LIMITED on CPU, so it never takes the CPU the browser measures with
 OBSERVE_CPU, OBSERVE_MEMORY, OBSERVE_CPU_LIMIT = "500m", "1Gi", "1"
-DATA_MEMORY = "8Gi"
+
+# The pods' hardening (review L4), as netns606's container has it (bench/netns606.py): a non-root
+# user (python:3.12-slim runs as root by default; 65532 is the conventional unprivileged "nonroot"
+# id), no privilege escalation, every capability dropped, the runtime's default seccomp profile, and
+# a read-only root filesystem: everything a pod writes is an emptyDir (/out, /work = HOME, /tools,
+# /opt/bench, /tmp = TMPDIR, which bash's here-strings and Python's tempfile use).
+NONROOT = 65532
+POD_SECURITY = {"runAsNonRoot": True, "runAsUser": NONROOT, "runAsGroup": NONROOT, "fsGroup": NONROOT,
+                "seccompProfile": {"type": "RuntimeDefault"}}
+CONTAINER_SECURITY = {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+                      "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}}
 
 OUT = "/out"
 CTL = "ctl"                     # /out/ctl/<segment>: a sampler segment starts (run606 observer_signal)
@@ -245,22 +255,28 @@ def _pod_spec(*, sa: str, context: str, container: dict) -> dict:
     mounts = [{"name": "bench", "mountPath": "/opt/bench", "readOnly": True},
               {"name": "tools", "mountPath": "/tools", "readOnly": True},
               {"name": "out", "mountPath": OUT}, {"name": "work", "mountPath": "/work"}]
+    env.append({"name": "TMPDIR", "value": "/tmp"})
+    mounts.append({"name": "tmp", "mountPath": "/tmp"})
     container = {**container, "image": IMAGE, "env": env + container.get("env", []),
-                 "volumeMounts": mounts, "workingDir": "/work"}
+                 "volumeMounts": mounts, "workingDir": "/work", "securityContext": CONTAINER_SECURITY}
     return {
         "serviceAccountName": sa, "automountServiceAccountToken": True, "restartPolicy": "Never",
         "nodeSelector": {POOL_LABEL: POOL}, "tolerations": [TAINT],
+        "securityContext": POD_SECURITY,
         "initContainers": [{
             "name": "tools", "image": IMAGE, "command": ["sh", "-c", _bootstrap(context)],
-            "env": [{"name": "HOME", "value": "/work"}],
+            "env": [{"name": "HOME", "value": "/work"}, {"name": "TMPDIR", "value": "/tmp"}],
             "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}},
+            "securityContext": CONTAINER_SECURITY,
             "volumeMounts": [{"name": "src", "mountPath": "/src", "readOnly": True},
                              {"name": "bench", "mountPath": "/opt/bench"},
-                             {"name": "tools", "mountPath": "/tools"}, {"name": "work", "mountPath": "/work"}]}],
+                             {"name": "tools", "mountPath": "/tools"}, {"name": "work", "mountPath": "/work"},
+                             {"name": "tmp", "mountPath": "/tmp"}]}],
         "containers": [container],
         "volumes": [{"name": "src", "configMap": {"name": SRC_CONFIGMAP}},
                     {"name": "bench", "emptyDir": {}}, {"name": "tools", "emptyDir": {}},
-                    {"name": "out", "emptyDir": {}}, {"name": "work", "emptyDir": {}}],
+                    {"name": "out", "emptyDir": {}}, {"name": "work", "emptyDir": {}},
+                    {"name": "tmp", "emptyDir": {}}],
     }
 
 
@@ -274,25 +290,137 @@ def _namespace() -> dict:
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE, "labels": {"app": "scaletest"}}}
 
 
-def data606_requests(machine: str) -> tuple[str, str]:
-    """data606's (cpu, memory) requests: the loadgen node's whole budget (allocatable minus the
-    headroom kept for its daemonsets, k6_job.loadgen_fit) but the observer's, which shares the node
-    with it; nothing else runs there during the data step (the drivers come after it)."""
-    from bench import k6_job
-    if machine not in k6_job.LOADGEN_ALLOCATABLE:
-        raise ValueError(f"unknown loadgen machine type {machine!r}: known {sorted(k6_job.LOADGEN_ALLOCATABLE)}")
-    budget = k6_job.LOADGEN_ALLOCATABLE[machine]["cpu_m"] - k6_job.LOADGEN_HEADROOM["cpu_m"]
-    cpu = f"{budget - k6_job._mcpu(OBSERVE_CPU)}m"
-    k6_job.loadgen_fit(machine, [(cpu, DATA_MEMORY), (OBSERVE_CPU, OBSERVE_MEMORY)])
-    return cpu, DATA_MEMORY
+# ─── data606's requests: what the LIVE loadgen node has left (review M1) ────────────────────────
+#
+# The node's allocatable minus the requests of every pod already scheduled there (GKE's DaemonSets
+# included: run 24's loadgen node ran 7 whose requests nothing recorded) minus the observer's, when
+# it is not scheduled yet. No reserve constant: what is left is what data606 asks for (it has no CPU
+# limit, so it may still use an idle node's whole CPU). Refused below a FLOOR: what data606 had in
+# run 23, the last run whose data step met its bound, measured from that run's own records.
+#
+# RUN23_DATA606: run 23 ran data606 on the operator's laptop, three arms at once. Its 50K phases
+# ("Deploying 50000 compositions" to "Deployed 50000/50000" in each arm's console, local time,
+# ~/.local/share/snowplow-bench/runs/606/pair-snowplow-bench-run23r-…-run23n2-c7c87a3d/{R,N1,N2}.console)
+# overlapped three deep from 23:20:27 to 23:22:27; the laptop has 8 CPUs and 24 GiB (sysctl hw.ncpu,
+# hw.memsize: the same laptop, run 24's diagnosis). So every arm finished its 50K load with at most
+# a third of each, and N1 entirely under that share or a half: that share is the floor. It is an upper
+# bound of what run 23's data606 had (the laptop ran more than data606), so a node below it holds
+# less than anything a data step was ever proven on; one above it is not proven fast, only not less.
+RUN23_DATA606 = {
+    "host_cpus": 8, "host_memory_bytes": 25769803776,
+    "phases_50k": {"R": ("23:12:21", "23:22:27"), "N1": ("23:13:40", "23:22:47"), "N2": ("23:20:27", "23:28:33")},
+}
 
 
-def render_data606(*, context: str, timeout_s: int, linger_s: int, machine: str,
+def _hms(s: str) -> int:
+    h, m, x = (int(v) for v in s.split(":"))
+    return h * 3600 + m * 60 + x
+
+
+def max_overlap(phases: dict) -> int:
+    """The most phases running at one moment."""
+    ev = sorted([(_hms(a), 1) for a, _ in phases.values()] + [(_hms(b), -1) for _, b in phases.values()],
+                key=lambda e: (e[0], e[1]))
+    cur = best = 0
+    for _, d in ev:
+        cur += d
+        best = max(best, cur)
+    return best
+
+
+def data606_floor(rec: dict = RUN23_DATA606) -> tuple[int, int]:
+    """(cpu_m, memory_mi): the share of the host each run-23 arm had at the most overlap."""
+    n = max_overlap(rec["phases_50k"])
+    return -(-rec["host_cpus"] * 1000 // n), -(-(rec["host_memory_bytes"] >> 20) // n)
+
+
+_MEM = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 ** 2, "k": 1000 / 2 ** 20, "M": 10 ** 6 / 2 ** 20,
+        "G": 10 ** 9 / 2 ** 20, "T": 10 ** 12 / 2 ** 20}
+
+
+def cpu_m(q) -> int:
+    q = str(q or "0")
+    return int(q[:-1]) if q.endswith("m") else int(round(float(q) * 1000))
+
+
+def mem_mi(q) -> int:
+    q = str(q or "0")
+    for suf in sorted(_MEM, key=len, reverse=True):
+        if q.endswith(suf):
+            return int(float(q[:-len(suf)]) * _MEM[suf])
+    return int(float(q)) >> 20
+
+
+def pod_requests(pod: dict) -> tuple[int, int]:
+    """A pod's effective requests, as the scheduler counts them: the larger of its containers'
+    sum and its largest init container, plus its overhead."""
+    spec = pod.get("spec") or {}
+
+    def req(c, f):
+        return f(((c.get("resources") or {}).get("requests") or {}).get("cpu" if f is cpu_m else "memory"))
+
+    out = []
+    for f in (cpu_m, mem_mi):
+        main = sum(req(c, f) for c in spec.get("containers") or [])
+        init = max((req(c, f) for c in spec.get("initContainers") or []), default=0)
+        over = f((spec.get("overhead") or {}).get("cpu" if f is cpu_m else "memory"))
+        out.append(max(main, init) + over)
+    return out[0], out[1]
+
+
+def loadgen_room(nodes: dict, pods: dict, floor: tuple[int, int] | None = None) -> dict:
+    """The loadgen node's room for data606, from the live node list (-l the loadgen pool) and every
+    pod scheduled on it: allocatable minus their requests (the ones still running) minus the
+    observer's when it is not among them. ok when both are at least the floor."""
+    floor = data606_floor() if floor is None else floor
+    items = nodes.get("items") if "items" in nodes else [nodes]
+    rec = {"kind": "loadgen_room", "t": round(time.time(), 3), "floor_cpu_m": floor[0], "floor_memory_mi": floor[1],
+           "floor_from": "run 23: each arm's share of the laptop at the most overlap (bench/incluster.py RUN23_DATA606)"}
+    if len(items or []) != 1:
+        return {**rec, "ok": False, "why": f"{len(items or [])} node(s) in the loadgen pool, want 1"}
+    node = items[0]
+    alloc = (node.get("status") or {}).get("allocatable") or {}
+    live = [p for p in pods.get("items") or []
+            if (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
+            and not (p.get("metadata") or {}).get("deletionTimestamp")]
+    scheduled = [{"namespace": p["metadata"].get("namespace"), "pod": p["metadata"].get("name"),
+                  "cpu_m": pod_requests(p)[0], "memory_mi": pod_requests(p)[1]} for p in live]
+    observer_there = any(((p.get("metadata") or {}).get("labels") or {}).get("job-name") == OBSERVE_JOB for p in live)
+    obs = (0, 0) if observer_there else (cpu_m(OBSERVE_CPU), mem_mi(OBSERVE_MEMORY))
+    cpu = cpu_m(alloc.get("cpu")) - sum(s["cpu_m"] for s in scheduled) - obs[0]
+    mem = mem_mi(alloc.get("memory")) - sum(s["memory_mi"] for s in scheduled) - obs[1]
+    rec.update({"node": node["metadata"]["name"], "allocatable": {"cpu": alloc.get("cpu"), "memory": alloc.get("memory")},
+                "scheduled": scheduled, "observer_counted": "scheduled" if observer_there else "to come",
+                "cpu_m": cpu, "memory_mi": mem})
+    short = ([f"cpu {cpu}m < floor {floor[0]}m"] if cpu < floor[0] else []) \
+        + ([f"memory {mem}Mi < floor {floor[1]}Mi"] if mem < floor[1] else [])
+    if short:
+        return {**rec, "ok": False, "why": (f"the loadgen node {rec['node']} leaves data606 too little: "
+                                            + ", ".join(short) + f" (allocatable {alloc.get('cpu')} / "
+                                            f"{alloc.get('memory')}, {len(scheduled)} pod(s) already requesting "
+                                            f"{sum(s['cpu_m'] for s in scheduled)}m / "
+                                            f"{sum(s['memory_mi'] for s in scheduled)}Mi, the observer's "
+                                            f"{obs[0]}m / {obs[1]}Mi to come)")}
+    return {**rec, "ok": True, "why": (f"data606 may request {cpu}m / {mem}Mi on {rec['node']} (allocatable "
+                                       f"{alloc.get('cpu')} / {alloc.get('memory')} minus {len(scheduled)} scheduled "
+                                       f"pod(s) minus the observer's to come {obs[0]}m; floor {floor[0]}m / "
+                                       f"{floor[1]}Mi from run 23)")}
+
+
+def data606_requests(room: dict) -> tuple[str, str]:
+    """data606's (cpu, memory) requests: the room loadgen_room found (refused when not ok)."""
+    if not room.get("ok"):
+        raise ValueError(room.get("why") or "no room on the loadgen node")
+    return f"{room['cpu_m']}m", f"{room['memory_mi']}Mi"
+
+
+def render_data606(*, context: str, timeout_s: int, linger_s: int, room: dict,
                    data_args: list[str]) -> list[dict]:
     """The data606 Job: `python3 -m bench data606 <data_args>` bounded by timeout_s, under its own
-    ServiceAccount, on the loadgen node. Its pod turns Ready once /out/done holds data606's exit
-    code, and stays up (at most linger_s) for run606 to copy /out."""
-    cpu, mem = data606_requests(machine)
+    ServiceAccount, on the loadgen node, requesting what the live node has left (`room`). Its pod
+    turns Ready once /out/done holds data606's exit code, and stays up (at most linger_s) for run606
+    to copy /out."""
+    cpu, mem = data606_requests(room)
     cluster, authn = data606_rbac()
     container = {
         "name": "data606",
@@ -366,12 +494,53 @@ def report(recs: list[dict]) -> dict:
     """evaluate's incluster_report_only (INFO, never judged): where each in-cluster Job ran, with
     which requests. None recorded reads UNKNOWN (a run before #1297, or one that never got there)."""
     rows = [r for r in recs if r.get("kind") == "incluster_placement"]
-    if not rows:
+    rooms = [r for r in recs if r.get("kind") == "loadgen_room"]
+    observer = [r for r in recs if r.get("kind") == OBSERVER_POD_KIND]
+    if not rows and not rooms and not observer:
         why = "no incluster_placement record: the run placed no in-cluster Job (a run before #1297, or it stopped first)"
         return {"result": "INFO", "state": "UNKNOWN", "why": why, "lines": [f"INFO in-cluster Jobs: UNKNOWN ({why})"]}
-    return {"result": "INFO", "state": "read", "placements": rows,
-            "lines": [f"INFO in-cluster Job {r['job']}: {'OK' if r.get('ok') else 'REFUSED'}: {r.get('why')}"
-                      for r in rows]}
+    lines = [f"INFO loadgen room ({r.get('phase', '?')}): {'OK' if r.get('ok') else 'REFUSED'}: {r.get('why')}"
+             for r in rooms]
+    lines += [f"INFO in-cluster Job {r['job']}: {'OK' if r.get('ok') else 'REFUSED'}: {r.get('why')}" for r in rows]
+    lines += [f"INFO observer pod: {observer_outcome_line(r)}" for r in observer]
+    if rows and not observer:
+        lines.append("INFO observer pod: its outcome was not recorded (collect never read it): its streams' "
+                     "completeness is unknown")
+    return {"result": "INFO", "state": "read", "placements": rows, "rooms": rooms, "observer": observer,
+            "lines": lines}
+
+
+OBSERVER_POD_KIND = "observer_pod"
+
+
+def observer_outcome(pods: dict) -> list[dict]:
+    """How the observer's pod stands at collect (review M2): one record per pod (load606's job_pod
+    reading: phase, pod reason such as Evicted, each container's termination reason and exit code),
+    as kind observer_pod: evaluate says it as INFO, so an observer that died (an OOM kill, an
+    eviction) is named, never left to read as streams that are merely missing. Never judged."""
+    from bench.load606 import job_pod_records
+    return [{**r, "kind": OBSERVER_POD_KIND} for r in job_pod_records(pods, OBSERVE_JOB)]
+
+
+def observer_outcome_line(r: dict) -> str:
+    if r.get("unreadable"):
+        return f"UNREADABLE at collect ({r['unreadable']}): whether it ran to the end is unknown"
+    if r.get("missing"):
+        return "NO POD at collect: it died and was removed, or never ran; its streams hold what was copied, if anything"
+    ends = []
+    for c in r.get("containers") or []:
+        t = c.get("terminated") or c.get("last_terminated")
+        if t:
+            ends.append(f"container {c.get('name')} terminated ({t.get('reason')}, exit {t.get('exit_code')})"
+                        + (f" after {c.get('restarts')} restart(s)" if c.get("restarts") else ""))
+    died = r.get("phase") == "Failed" or r.get("reason") or any(
+        (c.get("terminated") or {}).get("reason") not in (None, "Completed") or c.get("restarts")
+        for c in r.get("containers") or [])
+    head = f"{r.get('pod')} {r.get('phase')}" + (f" ({r['reason']})" if r.get("reason") else "")
+    if died:
+        return (f"{head}: DIED before collect, " + ("; ".join(ends) or "no container termination recorded")
+                + ": the APF, top and log streams end where it died")
+    return f"{head}: ran to collect" + (f" ({'; '.join(ends)})" if ends else "")
 
 
 def rendered_requests(objs: list[dict], job: str) -> dict:
@@ -581,7 +750,15 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--context", required=True)
     rd.add_argument("--timeout-s", type=int, required=True)
     rd.add_argument("--linger-s", type=int, required=True)
-    rd.add_argument("--machine", required=True, help="the loadgen node's machine type")
+    rd.add_argument("--room", required=True, help="the loadgen node's room for data606 (`room`'s record)")
+    rm = sub.add_parser("room", help="what the live loadgen node leaves data606 (one loadgen_room record); "
+                                     "exit 1 below the floor (run 23's share)")
+    rm.add_argument("--nodes", required=True, help="kubectl get nodes -l bench.krateo.io/pool=loadgen -o json")
+    rm.add_argument("--pods", required=True, help="kubectl get pods -A --field-selector spec.nodeName=<it> -o json")
+    rm.add_argument("--phase", required=True, help="where run606 read it (env, data)")
+    po = sub.add_parser("observer-outcome", help="the observer's pod at collect (kubectl get pods -o json on "
+                                                 "stdin): observer_pod records")
+    po.add_argument("--unreadable", default=None, help="the read failed: say why instead")
     ro = sub.add_parser("render-observe", help="the observer Job and its ServiceAccount (stdout)")
     ro.add_argument("--context", required=True)
     ro.add_argument("--every-s", type=float, required=True)
@@ -618,7 +795,16 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     if a.cmd == "render-data606":
         sys.stdout.write(manifest(render_data606(context=a.context, timeout_s=a.timeout_s, linger_s=a.linger_s,
-                                                 machine=a.machine, data_args=rest)))
+                                                 room=json.load(open(a.room)), data_args=rest)))
+    elif a.cmd == "room":
+        rec = {**loadgen_room(json.load(open(a.nodes)), json.load(open(a.pods))), "phase": a.phase}
+        print(json.dumps(rec))
+        return 0 if rec["ok"] else 1
+    elif a.cmd == "observer-outcome":
+        recs = ([{"kind": OBSERVER_POD_KIND, "job": OBSERVE_JOB, "t": time.time(), "unreadable": a.unreadable}]
+                if a.unreadable else observer_outcome(json.load(sys.stdin)))
+        for r in recs:
+            print(json.dumps(r))
     elif a.cmd == "render-observe":
         sys.stdout.write(manifest(render_observe(context=a.context, every_s=a.every_s, retry_s=a.retry_s,
                                                  selector=a.selector, user_prefix=a.user_prefix,

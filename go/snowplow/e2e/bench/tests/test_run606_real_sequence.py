@@ -270,9 +270,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         jp = next((x for x in a if x.startswith("jsonpath=")), "")
         if "json" in a:
             spec = json.load(open(os.path.join(inc_dir(job), "job.json")))["spec"]["template"]["spec"] if listed else {}
+            # FAKE_INC_OOM=<job>: by collect its container was OOM-killed (the pod Failed)
+            st = ({"phase": "Failed", "containerStatuses": [{"name": spec["containers"][0]["name"], "ready": False,
+                                                              "restartCount": 0, "state": {"terminated": {
+                                                                  "reason": "OOMKilled", "exitCode": 137}}}]}
+                  if listed and os.environ.get("FAKE_INC_OOM") == job else {"phase": phase})
             print(json.dumps({"items": [{"metadata": {"name": job + "-0"},
                                          "spec": {"nodeName": "loadgen-0", "containers": spec.get("containers", [])},
-                                         "status": {"phase": phase}}] if listed else []}))
+                                         "status": st}] if listed else []}))
             sys.exit(0)
         if "name" in a:
             print("pod/" + job + "-0" if listed else ""); sys.exit(0)
@@ -282,6 +287,28 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             print(f"{phase}/{'true' if done else 'false'}" if listed else ""); sys.exit(0)
         if ".status.phase" in jp:
             print(phase if listed else ""); sys.exit(0)
+        sys.exit(0)
+    # review M1: the live loadgen node and the pods on it. FAKE_INC_ALLOC="<cpu> <memory>": its
+    # allocatable (default an n2-standard-16's, k6_job.LOADGEN_ALLOCATABLE); FAKE_INC_DS="<cpu> <memory>":
+    # the requests of the DaemonSet pods already there (default run 23's plan: the 1000m / 4096Mi
+    # reserve it kept); the observer's pod counts once it runs
+    if a[:2] == ["get", "nodes"] and "bench.krateo.io/pool=loadgen" in a:
+        cpu, mem = os.environ.get("FAKE_INC_ALLOC", "15890m 59825Mi").split()
+        print(json.dumps({"items": [{"metadata": {"name": "loadgen-0", "labels": {"bench.krateo.io/pool": "loadgen"}},
+                                     "status": {"allocatable": {"cpu": cpu, "memory": mem}}}]}))
+        sys.exit(0)
+    if a[:2] == ["get", "pods"] and "spec.nodeName=loadgen-0" in a:
+        cpu, mem = os.environ.get("FAKE_INC_DS", "1000m 4096Mi").split()
+        pods = [{"metadata": {"namespace": "kube-system", "name": "gke-daemonsets"},
+                 "spec": {"containers": [{"name": "ds", "resources": {"requests": {"cpu": cpu, "memory": mem}}}]},
+                 "status": {"phase": "Running"}}]
+        if inc_alive("observe606"):
+            spec = json.load(open(os.path.join(inc_dir("observe606"), "job.json")))["spec"]["template"]["spec"]
+            pods.append({"metadata": {"namespace": "bench-loadgen", "name": "observe606-0",
+                                      "labels": {"job-name": "observe606"}},
+                         "spec": {"containers": spec["containers"], "initContainers": spec["initContainers"]},
+                         "status": {"phase": "Running"}})
+        print(json.dumps({"items": pods}))
         sys.exit(0)
     if a[:2] == ["get", "node"] and "loadgen-0" in a:
         print(json.dumps({"metadata": {"name": "loadgen-0", "labels": {
@@ -1581,10 +1608,21 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # fake, running the containers' own commands), on the loadgen pool with the rendered requests;
     # data606's pod was gone, its Job, ServiceAccount and RBAC deleted, before any driver was applied
     o = tmp / "out"
-    placed = [json.loads(ln) for ln in (o / "incluster-placement.jsonl").read_text().splitlines()]
+    recs = [json.loads(ln) for ln in (o / "incluster-placement.jsonl").read_text().splitlines()]
+    placed = [r for r in recs if r["kind"] == "incluster_placement"]
+    rooms = [r for r in recs if r["kind"] == "loadgen_room"]
     assert [(p["job"], p["ok"], p["node_pool"]) for p in placed] == [("observe606", True, "loadgen"),
                                                                       ("data606", True, "loadgen")]
-    assert placed[1]["requests"] == {"data606": {"cpu": "6410m", "memory": "8Gi"}}   # n2-standard-8 (load606)
+    # the room, read at env (the observer still to come) and at data (it is there), recorded
+    assert [(r["phase"], r["ok"], r["observer_counted"], r["cpu_m"]) for r in rooms] == [
+        ("env", True, "to come", 14390), ("data", True, "scheduled", 14390)]
+    assert rooms[1]["floor_cpu_m"] == 2667 and rooms[1]["floor_memory_mi"] == 8192
+    # review M2: the observer ran to collect, and the verdict says so
+    obs = [json.loads(ln) for ln in (o / "observer-pod.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["pod"], r["phase"]) for r in obs] == [("observer_pod", "observe606-0", "Running")]
+    # review M1: the live node's allocatable (15890m / 59825Mi) minus the DaemonSets' 1000m / 4096Mi minus the
+    # observer's 500m / 1Gi (scheduled, with its 100m / 128Mi init container under its main one): run 23's plan
+    assert placed[1]["requests"] == {"data606": {"cpu": "14390m", "memory": "54705Mi"}}
     deleted = [json.loads(ln) for ln in (state / "deleted.jsonl").read_text().splitlines()]
     gone = next(d for d in deleted if "job/data606" in d["names"])
     assert "serviceaccount/bench-data606" in gone["names"]
@@ -1607,7 +1645,9 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # the host's own load (#1297), recorded and said with the verdict
     assert verdict["report"]["host_load_report_only"]["state"] == "read"
     assert [ln.split(":")[0] for ln in verdict["report"]["incluster_report_only"]["lines"]] == [
-        "INFO in-cluster Job observe606", "INFO in-cluster Job data606"]
+        "INFO loadgen room (env)", "INFO loadgen room (data)", "INFO in-cluster Job observe606",
+        "INFO in-cluster Job data606", "INFO observer pod"]
+    assert verdict["report"]["incluster_report_only"]["lines"][-1] == "INFO observer pod: observe606-0 Running: ran to collect"
 
     # the synthetic users' password never reaches a log
     assert SCALEUSER_PASSWORD not in out
