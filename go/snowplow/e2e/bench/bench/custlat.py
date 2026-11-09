@@ -1171,7 +1171,8 @@ def _rate(reqs, ex) -> dict:
 
 def pair(va: dict, vb: dict, *, replica: dict | None = None,
          expect_a: str | None = None, expect_b: str | None = None,
-         completed: tuple[bool | None, bool | None] = (None, None), raw=(None, None)) -> dict:
+         completed: tuple[bool | None, bool | None] = (None, None), raw=(None, None),
+         launch: str | None = None) -> dict:
     """The paired verdict: B's customer latency per phase against A's (module
     doc). FAIL when B restarted, whatever else; INVALID when the pair cannot be
     compared; FAIL when a cell is past its tolerance; INCONCLUSIVE when a cell
@@ -1221,7 +1222,7 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                       "replica": (replica or {}).get("provenance"),
                       # run 24: where the between-run term comes from (the committed file, or an
                       # A/A pair of the same launch: replica_in_run)
-                      "replica_source": _replica_source(replica)}}
+                      "replica_source": _replica_source(replica, launch)}}
     out["replica_source"] = out["method"]["replica_source"]
     # ── restarts: B's FAIL the pair; A's are recorded (module doc) ──
     rs = {x: ((rd or {}).get("restarts") or {}) for x, rd in (("a", rda), ("b", rdb))}
@@ -1737,10 +1738,14 @@ def replica_ratios(r1: dict, r2: dict, provenance: dict) -> dict:
     return {"schema": "customer_latency_replica/1", "provenance": provenance, "phases": phases}
 
 
-def _replica_source(replica: dict | None) -> dict:
+def _replica_source(replica: dict | None, launch: str | None = None) -> dict:
     """Run 24: where the pair's between-run term comes from, said in the verdict: none, the
-    committed replica file (runs 12/13), or an A/A pair measured in the SAME launch
-    (replica_in_run: `custlat replica --in-run`)."""
+    committed replica file (runs 12/13), or an A/A pair's replica (replica_in_run: `custlat
+    replica --in-run`). The A/A replica is "measured in this launch" only when the launch id it
+    recorded is `launch`, the pair's own (run606_pair.sh passes its PAIR_RUN_ID to both); any
+    other replica (another launch's, one that recorded no launch id, or a pair judged with no
+    --launch, e.g. run 23's N1:N2 re-judged against run 24's replica) is said to come from
+    another launch, with its own run dirs."""
     if replica is None:
         return {"kind": "none", "usable": False, "why": ["no replica was given"],
                 "line": "INFO replica: none given: no cell has a between-run term"}
@@ -1754,11 +1759,16 @@ def _replica_source(replica: dict | None) -> dict:
     ok = ir.get("usable") is True
     terms = "; ".join(f"{p} " + ", ".join(f"{m} {v}" for m, v in sorted((replica["phases"][p] or {}).items()))
                       for p in phases)
+    rl = ir.get("launch")
+    same = launch is not None and rl is not None and rl == launch
+    dirs = [p.get("dir") for p in replica.get("provenance") or [] if isinstance(p, dict)]
+    origin = (f"measured in this launch ({launch})" if same else
+              f"from another launch ({rl or 'its launch not recorded'}), runs {', '.join(str(d) for d in dirs)}")
     return {"kind": "in_run", "usable": ok, "pair": ir.get("pair"), "image_digest": ir.get("image_digest"),
-            "phases": phases, "why": list(ir.get("why") or []),
-            "line": (f"INFO replica: in-run A/A pair {ir.get('pair')} ({ir.get('image_digest')}), measured in "
-                     f"this launch: {terms or 'no phase both arms measured'}" if ok else
-                     f"INFO replica: in-run A/A pair {ir.get('pair')} NOT measured ("
+            "phases": phases, "why": list(ir.get("why") or []), "launch": rl, "same_launch": same, "dirs": dirs,
+            "line": (f"INFO replica: in-run A/A pair {ir.get('pair')} ({ir.get('image_digest')}), {origin}: "
+                     f"{terms or 'no phase both arms measured'}" if ok else
+                     f"INFO replica: in-run A/A pair {ir.get('pair')} ({origin}) NOT measured ("
                      f"{'; '.join(ir.get('why') or [])}): no cell has a between-run term")}
 
 
@@ -1766,7 +1776,7 @@ IMAGE_DIGEST_CHECK = "snowplow.image_digest"
 
 
 def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
-                   completed: tuple[bool | None, bool | None] = (None, None)) -> dict:
+                   completed: tuple[bool | None, bool | None] = (None, None), launch: str | None = None) -> dict:
     """Run 24: the replica of an A/A pair run in the SAME launch as the pairs it calibrates (two
     clusters, one image), so their between-run term is measured on this schedule, steady included.
 
@@ -1842,7 +1852,10 @@ def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
                      "method": "custlat.replica_ratios(report_from_dir(run 1), report_from_dir(run 2)), "
                                "as `custlat replica` wrote customer_latency_replica_runs12_13.json: per gate "
                                "phase both runs measured, exp(|log(run 1 / run 2)|) per metric"}
-    out["in_run"]["line"] = _replica_source(out)["line"]
+    # the launch that measured it (run606_pair.sh's PAIR_RUN_ID): a pair says "measured in this
+    # launch" only when its own --launch is this one (_replica_source)
+    out["in_run"]["launch"] = launch
+    out["in_run"]["line"] = _replica_source(out, launch)["line"]
     return out
 
 
@@ -1933,10 +1946,10 @@ def arm_info_lines(v: dict | None, section: str, missing: str, role: str) -> tup
 
 #: the per-arm report-only sections a paired verdict shows (each with the state a verdict that
 #: predates it reads as): run 23's tracing and egress reuse; run 24's node CPU platforms, Go runtime
-#: settings and k6 calls per user bucket
+#: settings and k6 calls per user bucket; snowplow #1284's resolve memo lookups and would-joins
 INFO_SECTIONS = (("tracing_report_only", "UNKNOWN"), ("egress_connections_report_only", "ABSENT"),
                  ("nodes_report_only", "UNKNOWN"), ("go_runtime_report_only", "UNKNOWN"),
-                 ("user_buckets_report_only", "ABSENT"))
+                 ("user_buckets_report_only", "ABSENT"), ("resolve_memo_report_only", "ABSENT"))
 
 
 def _unmeasured_section() -> dict:
@@ -1953,6 +1966,9 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--replica", default=None, help="a customer_latency_replica/1 file")
     pr.add_argument("--expect-a", default=None, help="A's EXPECTED_IMAGE_DIGEST")
     pr.add_argument("--expect-b", default=None, help="B's EXPECTED_IMAGE_DIGEST")
+    pr.add_argument("--launch", default=None,
+                    help="this pair's launch id (run606_pair.sh's PAIR_RUN_ID): an in-run replica is "
+                         "'measured in this launch' only when it recorded the same id")
     for x in ("a", "b"):
         pr.add_argument(f"--{x}-label", default=x.upper(),
                         help=f"{x.upper()}'s run label, which its report-only lines name (run606_pair.sh's RUNS)")
@@ -1969,13 +1985,14 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--expect-digest", default=None, help="--in-run: the one image both runs were launched with")
     rp.add_argument("--completed", type=int, nargs=2, choices=(0, 1), default=None,
                     help="--in-run: 1 when each run's evaluate step ran")
+    rp.add_argument("--launch", default=None, help="--in-run: the launch id that measured it (PAIR_RUN_ID)")
     a = ap.parse_args(argv)
     if a.cmd == "replica":
         if a.in_run is not None:
             if not a.expect_digest:
                 ap.error("replica --in-run needs --expect-digest")
             done = (None, None) if a.completed is None else (bool(a.completed[0]), bool(a.completed[1]))
-            out = replica_in_run((a.dirs[0], a.dirs[1]), a.in_run, a.expect_digest, done)
+            out = replica_in_run((a.dirs[0], a.dirs[1]), a.in_run, a.expect_digest, done, launch=a.launch)
         else:
             out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
                                  [_provenance(d) for d in a.dirs])
@@ -1994,7 +2011,7 @@ def main(argv: list[str] | None = None) -> int:
     va, vb = load(a.a), load(a.b)
     try:
         out = pair(va, vb, replica=load_replica(a.replica) if a.replica else None,
-                   expect_a=a.expect_a, expect_b=a.expect_b, completed=done,
+                   expect_a=a.expect_a, expect_b=a.expect_b, completed=done, launch=a.launch,
                    raw=tuple((lambda d=d: raw_from_dir(d)) for d in dirs))
     except Exception as e:  # noqa: BLE001 — a crash must read INVALID, never exit 1 = FAIL
         out = {"kind": "customer_latency_pair", "verdict": "INVALID", "checks": [], "cells": [],

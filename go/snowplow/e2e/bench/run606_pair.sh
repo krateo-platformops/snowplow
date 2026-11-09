@@ -239,13 +239,15 @@ pair_cmd() {
   local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a" db="EXPECTED_IMAGE_DIGEST_$b"
   PAIR_CMD=(python3 -m bench.custlat pair --a "${!oa}/verdict.json" --b "${!ob}/verdict.json"
             --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}"
-            --a-label "$a" --b-label "$b")
+            --a-label "$a" --b-label "$b" --launch "$PAIR_RUN_ID")
 }
-# replica_cmd: REPLICA_CMD = the declared A/A pair's in-run replica (custlat replica --in-run)
+# replica_cmd: REPLICA_CMD = the declared A/A pair's in-run replica (custlat replica --in-run),
+# recording this launch's id: a pair says "measured in this launch" only on its own id
 replica_cmd() {
   local a="${REPLICA_PAIR%%:*}" b="${REPLICA_PAIR##*:}"
   local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a"
-  REPLICA_CMD=(python3 -m bench.custlat replica "${!oa}" "${!ob}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}")
+  REPLICA_CMD=(python3 -m bench.custlat replica "${!oa}" "${!ob}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}"
+               --launch "$PAIR_RUN_ID")
 }
 
 runs_line=""
@@ -446,7 +448,7 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                 + [r["line"] for r in v.get("b_inside_a_outage") or []]
                 + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
                 + [ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
-                                "go_runtime_report_only", "user_buckets_report_only")
+                                "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only")
                    for ln in (v.get(k) or {}).get("lines") or []]))' \
              "$f" 2>/dev/null || true)
   (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
