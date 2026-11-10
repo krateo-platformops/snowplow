@@ -489,10 +489,12 @@ func TestExternalFlight1320_E2E_ConcurrentResolvesDialOnce(t *testing.T) {
 	// A path unique to this run: the process-wide flight map outlives a
 	// -count=N run only while a call is in flight, never after.
 	path := fmt.Sprintf("/events-%d", time.Now().UnixNano())
-	stage := &templates.API{Name: "ev", Path: path, Verb: ptr.To(http.MethodGet), Filter: ptr.To(".ev")}
 	const n = 6
 	out := make(chan map[string]any, n)
 	for i := 0; i < n; i++ {
+		// Each resolve gets its own spec, as each /call does: runStage fills a
+		// nil Headers in place on the spec it is handed.
+		stage := &templates.API{Name: "ev", Path: path, Verb: ptr.To(http.MethodGet), Filter: ptr.To(".ev")}
 		go func() { out <- runAC6Resolve(&ac6Fixture{server: o.srv}, []*templates.API{stage}) }()
 	}
 	eventually(5*time.Second, func() bool {
