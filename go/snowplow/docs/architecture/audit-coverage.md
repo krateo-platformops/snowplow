@@ -162,14 +162,14 @@ response body (an error body can echo a token). The URI of the request snowplow
 **received** (`krateo.request.uri`) is recorded: snowplow reads no credential
 from a query (its token travels in the `Authorization` header), and on
 krateo-057 no access token was found in any URL field over 6 h or over all time
-(installer, measured 2026-11-07, with controls). A RESTAction stage record's body is a reason class from a closed
+(installer, measured 2026-11-07, with controls). A failed `/call` record's body and a RESTAction stage record's body are the same reason class from a closed
 set (below).
 
 ## Inventory
 
 | path | what changes | status |
 |---|---|---|
-| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write |
+| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298) |
 | `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun` |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
 | `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |
@@ -219,8 +219,21 @@ other `POST`. Each record carries:
   |---|---|---|---|
   | a 2xx | `success` | the real code (`201`, `204` are not reported as `200`) | empty |
   | a 2xx whose body snowplow cannot read or convert to JSON/YAML | `success` — the write was accepted | the real code | `accepted; the response body could not be read` / `accepted; the response body is not JSON or YAML` |
+  | a 3xx (snowplow follows no redirect on a credentialed dial, #729/#1106) | `failure` | the real code | `snowplow refused to follow a <code> <status text> redirect` |
   | any other status | `failure` | the real code | `upstream answered <code> <status text>` — never the upstream's body |
   | nothing (connection refused, reset, timeout) | `failure` | absent | `no response from the endpoint` |
+  | nothing: snowplow's destination policy refused the address (#1131) | `failure` | absent | `not sent: snowplow's destination policy refused the address` |
+  | nothing: the request's page budget ran out (#1115) | `failure` | absent | `not sent: snowplow's time budget for the request ran out first` (before a connection), `snowplow stopped waiting: the request's time budget ran out before an answer`, or `…ran out after the write was sent; it may have been applied` |
+
+  The same table, built from the same observation (`credhttp.Answer`, recorded
+  by `credhttp.Send`, the one place an endpoint request leaves), is the outcome
+  of a failed `/call` write (#1298). The code the caller receives is often
+  snowplow's own (500 for no response, 502 for a refused destination or
+  redirect, 504 for the page budget, 406 for a `/call` 2xx whose content type is
+  not JSON); the record never carries it as the authority's answer. That 2xx is
+  recorded as the accepted write it was: `success`, the real code, `accepted;
+  snowplow refused the response body unread: its content type is not JSON`. A
+  successful `/call` record is unchanged (`200`, empty body).
 
 ### Written object identity
 

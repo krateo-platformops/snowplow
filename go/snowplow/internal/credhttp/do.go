@@ -26,6 +26,10 @@ package credhttp
 //
 //  5. (#1131) a refused destination is reported as itself: DestinationStatus.
 //
+//  6. (#1298) what the authority answered is observed for the audit record
+//     (answer.go: Send records the status line; a 2xx body not used is noted
+//     here), because the envelope's code is often snowplow's own.
+//
 // Everything else (headers, the AWS-signature branch, the payload, a read's
 // retry client, the non-2xx envelope, the JSON content-type check, the
 // ResponseHandler contract) is unchanged, so a caller swapping request.Do for
@@ -47,6 +51,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -140,12 +145,16 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		return nonOKEnvelope(respo.StatusCode, dat)
 	}
 
+	// #1298 — the write was accepted (Send recorded its 2xx on the Answer); a
+	// body snowplow does not use is noted, never reported as the answer.
 	if ct := respo.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
+		AnswerFrom(ctx).Note(audit.NoteBodyNotJSON)
 		return response.New(http.StatusNotAcceptable, fmt.Errorf("content type %q is not allowed", ct))
 	}
 
 	if opts.ResponseHandler != nil {
 		if err := opts.ResponseHandler(respo.Body); err != nil {
+			AnswerFrom(ctx).Note(audit.NoteBodyUnread)
 			return response.New(http.StatusInternalServerError, err)
 		}
 		return response.New(http.StatusOK, nil)

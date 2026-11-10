@@ -1578,7 +1578,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// (external_fetch_cache.go). The touch above still declines the L1 Put.
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
-	fctx, answer := withDialAnswer(fctx)
+	fctx, answer := credhttp.WithAnswer(fctx)
 	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
 	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
 	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")
