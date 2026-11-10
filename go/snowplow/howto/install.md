@@ -82,12 +82,20 @@ What snowplow does with that document (`jwtutil.JWKSKeySource` in
   snowplow. Each successful fetch **replaces** the whole set: a key the issuer stops
   publishing stops verifying at the next refresh.
 - **When the key can't be resolved.** If the JWKS is unreachable, malformed or
-  empty, or holds no key for the token's `kid`, the request gets **`503`**
-  (`jwtutil.ErrKeyUnavailable`, mapped by `middleware.UserConfig` and
-  `middleware.RefreshAuth`), not `401`: the token may be fine, and the fault is on
-  the server side. If a refresh fails while the cache still holds the token's `kid`,
-  the cached key keeps serving. A bad signature, a malformed token or an expired
-  token gets **`401`**.
+  empty, or holds no key for the token's `kid` while the token may be newer than
+  the set (issued after the last successful fetch, or with no `iat`), the request
+  gets **`503`** (`jwtutil.ErrKeyUnavailable`, mapped by `middleware.UserConfig`
+  and `middleware.RefreshAuth`), not `401`: the token may be fine, and the fault is
+  on the server side. If a refresh fails while the cache still holds the token's
+  `kid`, the cached key keeps serving. A bad signature, a malformed token or an
+  expired token gets **`401`**.
+- **A retired key.** A token whose `kid` is absent from a set fetched successfully
+  **after** the token was issued was signed with a key the issuer no longer
+  publishes (retired, for example to revoke its tokens). It gets **`401`** with the
+  cause `KeyNotPublished` (`jwtutil.ErrKeyNotPublished`, plumbing v1.36.0), so the
+  portal signs the user in again instead of retrying. Until the cached set is
+  refreshed the retired key keeps verifying: a revocation lands within
+  `jwt.cacheTTL`.
 
 Generate the keypair and build the JWKS document from its public half:
 

@@ -97,7 +97,17 @@ import (
 // whose `act` chain is malformed (ErrTokenInvalid → 401 TokenInvalid here);
 // jwt_delegation_claims_plumbing134_test.go pins both answers. The upstream
 // line numbers in this file were refreshed to v1.34.0.
-const PinnedPlumbingVersion = "v1.34.0"
+//
+// v1.34.0 → v1.36.0 (plumbing#63, #107): re-audited by `diff -r` of the two
+// module trees. server/use/userconfig.go is byte-identical (only a test is
+// added beside it), so the upstream line numbers stand. jwtutil/ reports a
+// token whose kid is absent from a key set fetched successfully after the
+// token was issued as ErrTokenInvalid AND ErrKeyNotPublished instead of
+// ErrKeyUnavailable: upstream's 503 for it becomes a 401, and here
+// tokenRejected names it KeyNotPublished
+// (predispatch_401_keynotpublished_test.go). The rest of the diff is docs/
+// and helm/, which snowplow does not import.
+const PinnedPlumbingVersion = "v1.36.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -233,15 +243,20 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 			// the expired and the generic-invalid branch alike with a plain
 			// Unauthorized. #1076 — snowplow keeps that 401, its six Status
 			// fields and its message, and adds the cause jwtutil's typed error
-			// names: ErrTokenExpired → TokenExpired, anything else →
-			// TokenInvalid (tokenRejected).
+			// names: ErrKeyNotPublished (a retired signing key) →
+			// KeyNotPublished, ErrTokenExpired → TokenExpired, anything else
+			// → TokenInvalid (tokenRejected).
 			userInfo, err := jwtutil.ValidateWithKeySource(keys, parts[1])
 			if err != nil {
-				// Upstream — an unresolvable key (JWKS unreachable, unknown
-				// kid) is OUR failure, not a bad credential: 503 so the client
-				// retries instead of re-authenticating against an authn that is
-				// merely down. It carries no cause (#1076: an unknown kid can
-				// be told apart only once krateo-platformops/plumbing#63 lands).
+				// Upstream — an unresolvable key (JWKS unreachable, or a kid
+				// the cached set may predate) is OUR failure, not a bad
+				// credential: 503 so the client retries instead of
+				// re-authenticating against an authn that is merely down. It
+				// carries no cause. A kid absent from a set fetched AFTER the
+				// token was issued is not this: since plumbing v1.36.0
+				// (plumbing#63) it is ErrKeyNotPublished, which never matches
+				// ErrKeyUnavailable, and tokenRejected answers it 401
+				// KeyNotPublished.
 				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
 					response.ServiceUnavailable(wri, err)
 					return

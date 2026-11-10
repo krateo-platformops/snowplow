@@ -27,15 +27,17 @@ const (
 	//
 	// core-provider 2.13.71 (whose status schema is in testdata) and 2.13.76,
 	// which installer 0.3.546 deploys, both require plumbing v1.28.1:
-	// coreProviderCrdgenVersion. This module requires plumbing v1.34.0
-	// (installer#716): crdgenVersion. The crdgen code of the two is
-	// byte-identical: crdgen/ and crdgen/schemas/, the only plumbing packages
-	// crdgen imports, match under `diff -r` of the two module trees. That audit
-	// is what lets the two constants differ. requirePinnedCrdgen fails when
-	// go.mod moves off crdgenVersion, so a bump repeats it.
+	// coreProviderCrdgenVersion. This module requires plumbing v1.36.0
+	// (installer#716, then plumbing#107): crdgenVersion. The crdgen code of the
+	// two is byte-identical: crdgen/ and crdgen/schemas/, the only plumbing
+	// packages crdgen imports, match under `diff -r` of the module trees
+	// (v1.28.1 → v1.34.0, and v1.34.0 → v1.36.0, which changes only docs/,
+	// helm/, jwtutil/ and a server/use test). That audit is what lets the two
+	// constants differ. requirePinnedCrdgen fails when go.mod moves off
+	// crdgenVersion, so a bump repeats it.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.34.0"
+	crdgenVersion       = "v1.36.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
 	coreProviderCrdgenVersion = "v1.28.1"
 

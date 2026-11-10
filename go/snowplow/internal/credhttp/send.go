@@ -268,8 +268,9 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // builds against another one, so a plumbing bump re-audits them.
 //
 // Transcribed from v1.28.1. v1.28.1 → v1.34.0 re-audited: http/util/ (retry.go
-// included) is byte-identical between the two module trees.
-const retryPolicyTranscribedFrom = "v1.34.0"
+// included) is byte-identical between the two module trees. v1.34.0 → v1.36.0
+// re-audited the same way: http/util/ is byte-identical.
+const retryPolicyTranscribedFrom = "v1.36.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,

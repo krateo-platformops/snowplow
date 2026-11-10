@@ -10,10 +10,10 @@ This guide is for a frontend session, and for any other client of snowplow
 
 The rule is short:
 
-- **A 401 whose `details.causes[0].reason` is one of the five in section 2**
+- **A 401 whose `details.causes[0].reason` is one of the six in section 2**
   is a snowplow refusal **before dispatch**. Nothing was sent upstream: no
   apiserver call, no RESTAction stage, no write.
-- **Any other 401** (no `details`, or a reason outside the five) is one
+- **Any other 401** (no `details`, or a reason outside the six) is one
   snowplow does **not** vouch for. It may have been relayed from upstream
   after the request was dispatched, and a write may already have happened. Do
   **not** drop the token and replay the request on it.
@@ -89,7 +89,7 @@ apiserver. If the apiserver answers **NotFound**, the credential is missing.
 
 ## 2. The closed set
 
-Snowplow emits exactly these five reasons, and every one of them means
+Snowplow emits exactly these six reasons, and every one of them means
 **nothing was dispatched**:
 
 | reason | emitted when | middleware | `WWW-Authenticate` | portal outcome |
@@ -97,11 +97,20 @@ Snowplow emits exactly these five reasons, and every one of them means
 | `TokenMissing` | no bearer token: no `Authorization` header, one whose scheme is not `Bearer`, or `Bearer ` with an empty token (and, on `RefreshAuth` routes, no session cookie either) | both | `Bearer` (no error code) | **log in** |
 | `TokenInvalid` | the token failed validation: malformed, bad signature, wrong algorithm | both | `Bearer error="invalid_token"` | **log in again** |
 | `TokenExpired` | the token is correctly signed but expired | both | `Bearer error="invalid_token"` | **log in again** (the session-resume flow) |
+| `KeyNotPublished` | the token names a signing key (`kid`) that authn no longer publishes: authn's key set, fetched after the token was issued, does not hold it. The key was retired, for example to revoke the tokens it signed. No retry makes the token valid | both | `Bearer error="invalid_token"` | **log in again** |
 | `SessionCredentialMissing` | a valid token without `krateo:loa:2`; its session credential Secret is missing | `UserConfig` | `Bearer error="invalid_token"` | **log in again** |
 | `StepUpRequired` | a valid token with `krateo:loa:2`; its step-up credential Secret is missing | `UserConfig` | `Bearer error="insufficient_user_authentication"` | **prompt to step up** |
 
 `TokenExpired` is only reported once the signature has been verified. An
 expired token signed with the wrong key is `TokenInvalid`.
+
+`KeyNotPublished` is reported before the signature or the expiry is looked
+at: a token signed with a retired key is `KeyNotPublished` whether or not it
+has also expired. It needs plumbing v1.36.0 (krateo-platformops/plumbing#63);
+before it, the same token was a `503` (section 4). A retired key still in
+snowplow's cached key set keeps verifying until the set is refreshed, so a
+revocation reaches snowplow within the cache TTL (`jwt.cacheTTL`, `5m` by
+default).
 
 Each example below is byte-identical to the wire (a snowplow test checks
 it). `alice` stands for the caller's username.
@@ -147,7 +156,23 @@ WWW-Authenticate: Bearer error="invalid_token"
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"token is expired","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"TokenExpired","message":"the bearer token has expired; log in again"}]}}
 ```
 
-### 2d. SessionCredentialMissing
+### 2d. KeyNotPublished
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+WWW-Authenticate: Bearer error="invalid_token"
+
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"token is invalid: token is unverifiable: error while executing keyfunc: token signing key is not published: JWKS at http://authn.example/.well-known/jwks.json, fetched at 2026-11-10T09:30:00Z, holds no key for kid \"key-1\"; the token was issued at 2026-11-10T09:00:00Z","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"KeyNotPublished","message":"the bearer token's signing key is no longer published; log in again"}]}}
+```
+
+The `message` is plumbing's error text, as for every cause: here it names
+authn's JWKS URL, when snowplow fetched the key set, the token's `kid` and when
+the token was issued. It is not a contract; do not parse it. (The snowplow test
+substitutes the URL and the two times, after checking each against what the
+test set up.)
+
+### 2e. SessionCredentialMissing
 
 ```http
 HTTP/1.1 401 Unauthorized
@@ -160,7 +185,7 @@ WWW-Authenticate: Bearer error="invalid_token"
 Before #1076 this case sent no `WWW-Authenticate` header. It now sends
 `Bearer error="invalid_token"`. The body is unchanged.
 
-### 2e. StepUpRequired
+### 2f. StepUpRequired
 
 ```http
 HTTP/1.1 401 Unauthorized
@@ -170,7 +195,7 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"alice-clientconfig-stepup\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"StepUpRequired","message":"the step-up credential is missing or expired; step up again"}]}}
 ```
 
-### 2f. What is guaranteed
+### 2g. What is guaranteed
 
 - **The body is the contract.** Read `details.causes[0].reason`.
 - **The set is closed.** Snowplow writes no other reason on a 401. A future
@@ -207,7 +232,7 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 
 ## 3. A 401 without a snowplow cause: snowplow does not vouch that nothing was dispatched
 
-A 401 with no `details`, or with a reason outside the five, is one snowplow
+A 401 with no `details`, or with a reason outside the six, is one snowplow
 does not vouch for. It may be an upstream 401 snowplow relayed, a route
 mounted without its auth middleware (no route is, today), or a hop in front
 of snowplow.
@@ -246,11 +271,13 @@ What this means for a client:
 ## 4. Edge cases and fallback
 
 - **A 503** means the JWT signing key could not be resolved: authn's JWKS is
-  unreachable, or the token names a key id the key set does not have. It
-  carries no cause and no `WWW-Authenticate` header, and it is retryable.
-  Nothing was dispatched. (An unknown key id cannot yet be told apart from an
-  unreachable JWKS; that needs a distinct error in
-  krateo-platformops/plumbing first.)
+  unreachable or malformed, or the token names a key id that the key set may
+  simply predate (the token was issued after snowplow last fetched the set, as
+  at a key rotation; the next fetch finds the key), or the token has no `iat`,
+  or snowplow's latest fetch of the set failed. It carries no cause and no
+  `WWW-Authenticate` header, and it is retryable. Nothing was dispatched. A
+  key id absent from a set fetched successfully **after** the token was issued
+  is not a 503: it is the 401 `KeyNotPublished` (section 2).
 - **A 500 with no `details`** from the credential re-read: the apiserver
   answered 403 or 5xx, the snowplow pod cannot build its in-cluster config, or
   the Secret is malformed. Snowplow does not know the credential is missing,
@@ -288,6 +315,7 @@ components. Keep them distinct; never collapse them into one.
 | `TokenMissing` | **snowplow** | 401 | log in |
 | `TokenInvalid` | **snowplow** | 401 | log in again |
 | `TokenExpired` | **snowplow** | 401 | log in again (session resume) |
+| `KeyNotPublished` | **snowplow** | 401 | log in again |
 | `SessionCredentialMissing` | **snowplow** | 401 | log in again (session resume) |
 | `StepUpRequired` | **snowplow** | 401 | **prompt to step up** |
 | `InsufficientAssurance` | **authn** (`POST /oidc/stepup`) | 403 | prompt to step up |
@@ -314,10 +342,10 @@ It already knows `SessionCredentialMissing`, `StepUpRequired` and authn's
 reasons, including `IssuanceFailed`. An unknown or absent reason falls back
 to `reauthenticate`.
 
-The one change left for the portal is the three token reasons. Today they
+The one change left for the portal is the four token reasons. Today they
 fall to that default, which is the right action for a session token.
 
-They need a rule of their own, not three more `BY_REASON` rows, because they
+They need a rule of their own, not four more `BY_REASON` rows, because they
 are a different kind of cause. **The classification rule:**
 
 - **An absolute cause** names a fault that is the same whoever asked:
@@ -325,8 +353,9 @@ are a different kind of cause. **The classification rule:**
   and `InsufficientAssurance`. The reason alone is the answer, so a table
   keyed on the reason (`BY_REASON`) is right for it.
 - **A relative cause** says only that the credential **this request
-  presented** was absent, invalid or expired: `TokenMissing`, `TokenInvalid`,
-  `TokenExpired`. The right action depends on which credential that was. A
+  presented** was absent, invalid, expired or signed with a retired key:
+  `TokenMissing`, `TokenInvalid`, `TokenExpired`, `KeyNotPublished`. The
+  right action depends on which credential that was. A
   table keyed on the reason alone is wrong for it; the client must combine
   the reason with the token kind it sent.
 
@@ -351,6 +380,8 @@ export const AUTH_FAILURE_REASONS = {
   tokenInvalid: 'TokenInvalid',
   /** snowplow: the bearer token is correctly signed but expired (#1076). */
   tokenExpired: 'TokenExpired',
+  /** snowplow: the bearer token's signing key is no longer published (plumbing v1.36.0). */
+  keyNotPublished: 'KeyNotPublished',
 } as const
 
 /**
@@ -362,6 +393,7 @@ const TOKEN_STATE_REASONS: ReadonlySet<string> = new Set([
   AUTH_FAILURE_REASONS.tokenMissing,
   AUTH_FAILURE_REASONS.tokenInvalid,
   AUTH_FAILURE_REASONS.tokenExpired,
+  AUTH_FAILURE_REASONS.keyNotPublished,
 ])
 
 // in authFailureCauseOf, right after `reason` is computed:
@@ -387,25 +419,27 @@ means that change needs no second edit here.
 
 A client that re-sends a request by itself must gate the replay on
 **membership** in the closed set, never on "a cause is present". Only the
-four reasons a fresh login fixes may trigger "drop the token, log in, replay":
+five reasons a fresh login fixes may trigger "drop the token, log in, replay":
 
 ```ts
-// The five snowplow pre-dispatch causes (#1029, #1076): nothing was dispatched.
+// The six snowplow pre-dispatch causes (#1029, #1076, plumbing v1.36.0): nothing was dispatched.
 export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'TokenMissing',
   'TokenInvalid',
   'TokenExpired',
+  'KeyNotPublished',
   'SessionCredentialMissing',
   'StepUpRequired',
 ] as const
 
-// The four a fresh login fixes. StepUpRequired is NOT one of them: a login does
+// The five a fresh login fixes. StepUpRequired is NOT one of them: a login does
 // not restore a step-up credential, so re-login-and-replay would loop, or would
 // re-send the request under the session credential instead.
 export const LOGIN_REPLAY_CAUSES = [
   'TokenMissing',
   'TokenInvalid',
   'TokenExpired',
+  'KeyNotPublished',
   'SessionCredentialMissing',
 ] as const
 
@@ -418,7 +452,7 @@ export function causeOf(body: unknown): string | null {
   return typeof r === 'string' && r.length > 0 ? r : null
 }
 
-/** True only for a 401 whose cause is one of snowplow's five: nothing was dispatched. */
+/** True only for a 401 whose cause is one of snowplow's six: nothing was dispatched. */
 export function refusedBeforeDispatch(status: number, body: unknown): boolean {
   return status === 401 && has(SNOWPLOW_PRE_DISPATCH_CAUSES, causeOf(body))
 }
@@ -445,7 +479,7 @@ if (res.status === 401 && causeOf(body) === 'StepUpRequired') {
 At the two sites that hold the `Response` (`useWidgetQuery.ts`,
 `sseClient.ts`), you may additionally log
 `res.headers.get('WWW-Authenticate')` for diagnostics (same-origin only; see
-section 2f). Do not branch on it.
+section 2g). Do not branch on it.
 
 ## 7. How to see it
 
@@ -460,7 +494,9 @@ The output is `HTTP/1.1 401`, a bare `WWW-Authenticate: Bearer`, and a body
 whose `details.causes[0].reason` is `TokenMissing`. Send
 `-H "Authorization: Bearer not.a.jwt"` for `TokenInvalid` (with
 `WWW-Authenticate: Bearer error="invalid_token"`), or an expired JWT for
-`TokenExpired`.
+`TokenExpired`. A JWT that authn signed with a key it has since stopped
+publishing gives `KeyNotPublished` once snowplow's key set has been refreshed
+(within `jwt.cacheTTL`).
 
 Credential causes: against a test user, with a valid step-up JWT, delete the
 user's `<user>-clientconfig-stepup` Secret in AUTHN_NAMESPACE and call any
@@ -479,6 +515,10 @@ The snowplow tests that pin all of the above:
 
 - `internal/handlers/middleware/predispatch_401_1076_test.go` (token causes on
   both middlewares, the six Status fields against upstream, the 503);
+- `internal/handlers/middleware/predispatch_401_keynotpublished_test.go`
+  (`KeyNotPublished` on both middlewares against a real JWKS key source, a
+  rotation that revokes the old key, and the neighbours that stay a 503 or
+  `TokenInvalid`);
 - `internal/handlers/middleware/credential_status_1029_test.go` (credential
   causes, and every example in section 2 against the wire);
 - `internal/handlers/middleware/credential_status_closedset_1076_internal_test.go`

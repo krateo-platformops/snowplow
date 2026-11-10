@@ -41,14 +41,17 @@ var p1076Challenge = map[string]string{
 	"TokenMissing": `Bearer`,
 	"TokenInvalid": `Bearer error="invalid_token"`,
 	"TokenExpired": `Bearer error="invalid_token"`,
+	// plumbing v1.36.0: a retired signing key (jwtutil.ErrKeyNotPublished).
+	"KeyNotPublished": `Bearer error="invalid_token"`,
 }
 
 // p1076Sentence is the fixed human sentence each token cause carries, as
 // literals.
 var p1076Sentence = map[string]string{
-	"TokenMissing": "no bearer token was presented; log in",
-	"TokenInvalid": "the bearer token is not valid; log in again",
-	"TokenExpired": "the bearer token has expired; log in again",
+	"TokenMissing":    "no bearer token was presented; log in",
+	"TokenInvalid":    "the bearer token is not valid; log in again",
+	"TokenExpired":    "the bearer token has expired; log in again",
+	"KeyNotPublished": "the bearer token's signing key is no longer published; log in again",
 }
 
 // p1076Want is the exact wire body for a pre-dispatch 401: plumbing's body for
@@ -229,8 +232,10 @@ func TestPreDispatch401_1076_ValidTokenCarriesNoChallenge(t *testing.T) {
 
 // An unresolvable signing key is OUR fault: it stays plumbing's 503, byte for
 // byte, with no cause and no challenge — on both middlewares, for a key source
-// that fails outright and for the REAL JWKS source with an unknown kid (#1076
-// leaves that 503 alone until krateo-platformops/plumbing#63).
+// that fails outright and for the REAL JWKS source with an unknown kid on a
+// token issued as the set was fetched (the set may predate its key). A kid
+// absent from a set fetched AFTER the token was issued is a retired key, the
+// 401 KeyNotPublished (plumbing#63): predispatch_401_keynotpublished_test.go.
 func TestPreDispatch401_1076_KeyUnavailableIs503WithNoCause(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "false")
 	pub := &refreshAuthTestPrivateKey.PublicKey
