@@ -68,6 +68,29 @@ func (a *Answer) Note(n string) {
 	}
 }
 
+// Adopt records, on a dial that shared another dial's in-flight call (#1320,
+// the external read flight), what that call's authority answered: the shared
+// call's observation, copied, so each caller's record is its own. Nil-safe on
+// both sides (a nil from reads as no response).
+func (a *Answer) Adopt(from *Answer) {
+	if a == nil {
+		return
+	}
+	if from == nil {
+		*a = Answer{}
+		return
+	}
+	*a = *from
+}
+
+// Unanswered records a dial that ended with err and no response of its own: a
+// caller that stopped waiting on a shared call (#1320) because its page budget
+// ran out reads as the budget's refusal, exactly as if Send had returned err.
+// Nil-safe.
+func (a *Answer) Unanswered(err error) {
+	a.observe(nil, err)
+}
+
 // observe records what a Send returned: the status line, or why there is none.
 func (a *Answer) observe(resp *http.Response, err error) {
 	if a == nil {

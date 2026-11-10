@@ -178,7 +178,8 @@ var storeRegistry = map[string]string{
 	"cache.storeVerifySkipByReason":                   "no-content (counters)",
 	"api.internalClientCache":                         "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
 	"api.discoveryClientCache":                        "credential-keyed (a client per exact *rest.Config pointer; its credential IS the key)",
-	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; every read is a full fetch, nothing is revalidated)",
+	"api.externalFetchCache.conversions":              "no-content identity (content-addressed: sha256(mode + the raw response bytes) → their converted JSON; a hit hands a reader exactly what its OWN response converts to; no completed response is reused, nothing is revalidated)",
+	"api.externalFetchCache.flights":                  "credential-keyed (#1320: an in-flight external READ per exact outbound request — every endpoint field incl. its credential, method, resolved URL, every header incl. an exported JWT, payload and dial provenance — so identities never share; joinable only until the call's first response byte, dropped when it completes, never reused)",
 	"jq.programCache.entries":                         "no-content (run 23: compiled jq programs keyed by the filter's source text and the operator module bytes the compile read — derived from the spec alone; a program holds no state from its runs (gojq fork v0.13.1 caches regexps per run, TestCompileCache_CachedProgramRetainsNoRunState), so nothing served or identity-bound is ever kept)",
 	"api.narrowMemo":                                  "no-content (#603 PR-2: the jqinterest read set of a RESTAction spec x tracked stage — derived from the spec alone, never from a served body or an identity)",
 }

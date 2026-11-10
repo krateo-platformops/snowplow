@@ -911,8 +911,12 @@ func TestS443_Inline(t *testing.T) {
 		assertInlineEcho(t, rec, "filter 500")
 	})
 
-	// h — ClientCancel: a client disconnect aborts the in-flight stage
-	// request (the fake server sees it cancelled).
+	// h — ClientCancel: a client disconnect ends the handler at once. Since
+	// #1320 (owner ruling 2026-11-10) the stage's external READ is a shared
+	// call detached from every page, bounded by the server write deadline: the
+	// disconnect ends this caller's wait, never the call, which keeps running
+	// for any identical reader (before #1320 this arm asserted the upstream
+	// request was cancelled).
 	t.Run("h_ClientCancel", func(t *testing.T) {
 		f := in443Setup(t)
 		blockPath := "/api/v1/namespaces/" + psTargetNS + "/pods"
@@ -936,16 +940,13 @@ func TestS443_Inline(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("the handler did not return after the client cancelled")
 		}
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			for _, r := range f.requests() {
-				if r.path == blockPath && r.cancelled {
-					return
-				}
+		time.Sleep(300 * time.Millisecond) // a disconnect that reached the call would land here
+		for _, r := range f.requests() {
+			if r.path == blockPath && r.cancelled {
+				t.Fatalf("the client disconnect cancelled the shared external read (#1320: it ends only this caller's wait): %+v", f.requests())
 			}
-			time.Sleep(10 * time.Millisecond)
 		}
-		t.Fatalf("the in-flight stage request was not cancelled by the client disconnect: %+v", f.requests())
+		f.srv.CloseClientConnections() // release the held request; the arm is done
 	})
 }
 

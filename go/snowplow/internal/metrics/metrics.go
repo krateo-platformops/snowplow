@@ -1758,13 +1758,13 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 }
 
 // registerExternalFetchCacheInstruments hand-wires the external fetch's
-// content-addressed conversion memo (restactions/api/external_fetch_cache.go)
-// onto OTLP (no expvar->OTLP bridge), from the accessors its expvar closures
+// content-addressed conversion memo and its shared in-flight calls (#1320)
+// (restactions/api/external_fetch_cache.go, external_fetch_flight.go) onto OTLP (no expvar->OTLP bridge), from the accessors its expvar closures
 // read. outcome is a closed, code-defined set. Registered only when the cache is
 // on (CFG-1).
 func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	total, err := m.Int64ObservableCounter("snowplow_external_fetch_conversion_total",
-		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON). Every read is a full, unconditional fetch: no response is reused, by time or by revalidation. A valid-JSON body is passed through as before and counted in neither."))
+		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON). No completed response is reused, by time or by revalidation: a read shares only an identical call still in flight (snowplow_external_fetch_flight_total). A valid-JSON body is passed through as before and counted in neither."))
 	if err != nil {
 		return err
 	}
@@ -1783,16 +1783,24 @@ func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	flight, err := m.Int64ObservableCounter("snowplow_external_fetch_flight_total",
+		metric.WithDescription("External api-step fetches by whether they shared a call (#1320), by outcome: led (a read that started a call identical reads may join), joined (a read that shared an identical call already in flight: no call sent), not_shared (a write, or an endpoint the key cannot fold exactly: never shared). Identical means the whole outbound request, credentials and every header included, so identities never share; a call admits joiners only until its first response byte, never after it completes. Calls sent = led + not_shared."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		for _, c := range restactionsapi.ExternalFetchCacheSnapshot() {
 			o.ObserveInt64(total, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+		for _, c := range restactionsapi.ExternalFetchFlightSnapshot() {
+			o.ObserveInt64(flight, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
 		}
 		n, b := restactionsapi.ExternalFetchCacheHeld()
 		o.ObserveInt64(entries, int64(n))
 		o.ObserveInt64(bytes, b)
 		o.ObserveInt64(evictions, int64(restactionsapi.ExternalFetchCacheEvictions()))
 		return nil
-	}, total, bytes, entries, evictions)
+	}, total, bytes, entries, evictions, flight)
 	return err
 }
 

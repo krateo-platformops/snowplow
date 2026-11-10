@@ -1574,8 +1574,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if branchE == branchEImpersonate {
 		fctx = withEndpointImpersonation(fctx, branchEImp)
 	}
-	// Always a live fetch; the CONVERSION is memoised by the response's bytes
-	// (external_fetch_cache.go). The touch above still declines the L1 Put.
+	// Always a live call: a read may share an identical call still in flight
+	// (#1320: same request, credentials and every header included; never after
+	// it completes), and the CONVERSION is memoised by the response's bytes
+	// (external_fetch_cache.go, external_fetch_flight.go). This caller's page
+	// budget and ctx bound only its own wait, and everything below — the audit
+	// record, the item error, the stage outcome — is this caller's own. The
+	// touch above still declines the L1 Put.
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := credhttp.WithAnswer(fctx)
