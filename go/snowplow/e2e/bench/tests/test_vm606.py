@@ -1,6 +1,10 @@
 """bench/vm606.py: the paired launch from a disposable GCE VM, through its CLI (main(argv)), against a
 fake gcloud (tests/fake_vm606.py) whose VM is a directory: `compute ssh` runs the module's remote
-scripts there with bash, under the VM's environment only. Nothing is created in GCP.
+scripts there with bash, under the VM's environment only, and hangs the session up afterwards as sshd
+does. Nothing is created in GCP.
+
+Every test also checks, at its end, that the VM login user's identity-shaped home
+(fake_vm606.IDENTITY) appears in no output and no laptop record (#1307 review B1).
 """
 
 from __future__ import annotations
@@ -26,10 +30,17 @@ from tests import fake_vm606
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN = "run25"
 VM = vm606.vm_name(RUN)
+PROJECT = "operations-dev-krateo-io"
+SA = f"serviceAccount:snowplow-bench-orchestrator@{PROJECT}.iam.gserviceaccount.com"
+NODE_SA = "357378285144-compute@developer.gserviceaccount.com"
 LABELS = {"owner": "snowplow-bench", "run": RUN, "ttl-hours": "15"}
 BOOT = {"kubectl": "v1.36.2", "helm": "v3.19.0", "gcloud": "561.0.0", "gke-gcloud-auth-plugin": "Kubernetes v1.34.2",
         "python3": "Python 3.13.5", "bash": "GNU bash, version 5.2.37", "git": "git version 2.47.3"}
 SENTINEL = "GHCR_PULL_USERNAME=sentinel-user\nGHCR_PULL_TOKEN=opaque-SENTINEL-never-printed\n"
+ROLES = ["roles/container.admin", "roles/compute.viewer", "roles/compute.storageAdmin", "roles/compute.publicIpAdmin",
+         "roles/cloudquotas.viewer", "roles/serviceusage.serviceUsageConsumer", "roles/iam.serviceAccountUser"]
+
+_OUTPUT: list[str] = []
 
 
 def _in(hours: float) -> str:
@@ -38,7 +49,8 @@ def _in(hours: float) -> str:
 
 @pytest.fixture
 def fake(tmp_path, monkeypatch, run_trees):
-    """The fake gcloud on PATH, a laptop HOME and data root of the test's own."""
+    """The fake gcloud on PATH, a laptop HOME and data root of the test's own; at the end, the VM login
+    user's identity is in no output and no laptop record."""
     st = tmp_path / "gce"
     fake_vm606.install(tmp_path / "bin", st)
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
@@ -47,14 +59,22 @@ def fake(tmp_path, monkeypatch, run_trees):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "laptop-data"))
-    for k in ("FAKE_BOOTSTRAP", "FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_NO_SA"):
+    for k in ("FAKE_BOOTSTRAP", "FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_NO_SA",
+              "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES", "FAKE_SCP_CORRUPT", "FAKE_SCP_MODE", "FAKE_TAMPER_AFTER_SSH",
+              "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES"):
         monkeypatch.delenv(k, raising=False)
-    return st
+    _OUTPUT.clear()
+    yield st
+    records = [p.read_text() for p in (tmp_path / "laptop-data").rglob("*") if p.is_file() and p.suffix in
+               (".json", ".log", ".sh")]
+    for text in [*_OUTPUT, *records]:
+        assert fake_vm606.IDENTITY not in text, text[-2000:]
 
 
 def _run(capsys, *argv) -> tuple[int, str, str]:
     rc = vm606.main(list(argv))
     out, err = capsys.readouterr()
+    _OUTPUT.extend([out, err])
     return rc, out, err
 
 
@@ -62,34 +82,34 @@ def _verbs(st) -> list[str]:
     return [" ".join(c["argv"][:3]) for c in fake_vm606.calls(st)]
 
 
+def _state() -> dict:
+    return json.loads((vm606.state_dir(RUN) / "state.json").read_text())
+
+
+def test_the_fake_vm_home_is_identity_shaped(fake):
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    assert (srv.parent / "home" / fake_vm606.IDENTITY).is_dir()
+
+
 # ─── plan-iam ───────────────────────────────────────────────────────────────
-
-ROLES = ["roles/container.admin", "roles/compute.viewer", "roles/compute.storageAdmin", "roles/compute.publicIpAdmin",
-         "roles/cloudquotas.viewer", "roles/serviceusage.serviceUsageConsumer", "roles/iam.serviceAccountUser"]
-
 
 def test_plan_iam_derives_the_roles_from_the_code_and_changes_nothing(fake, capsys):
     rc, out, err = _run(capsys, "plan-iam")
     assert rc == 0, err
-    listed = [m.group(1) for m in re.finditer(r"^\d+\. (roles/\S+)", out, re.M)]
-    assert listed == ROLES
-    sa = "serviceAccount:snowplow-bench-orchestrator@operations-dev-krateo-io.iam.gserviceaccount.com"
+    assert [m.group(1) for m in re.finditer(r"^\d+\. (roles/\S+)", out, re.M)] == ROLES
     cmds = [ln for ln in out.splitlines() if ln.startswith("gcloud ")]
-    assert cmds[0].startswith("gcloud iam service-accounts create snowplow-bench-orchestrator --project "
-                              "operations-dev-krateo-io")
+    assert cmds[0].startswith(f"gcloud iam service-accounts create snowplow-bench-orchestrator --project {PROJECT}")
     for r in ROLES[:-1]:
-        assert (f"gcloud projects add-iam-policy-binding operations-dev-krateo-io --member {sa} --role {r} "
-                f"--condition None") in cmds
-    assert cmds[-1] == ("gcloud iam service-accounts add-iam-policy-binding "
-                        "357378285144-compute@developer.gserviceaccount.com --project operations-dev-krateo-io "
-                        f"--member {sa} --role roles/iam.serviceAccountUser")
-    # each role names the call that needs it, from the code
+        assert (f"gcloud projects add-iam-policy-binding {PROJECT} --member {SA} --role {r} "
+                f"--condition-from-file iam-condition.json") in cmds
+    assert cmds[-1] == (f"gcloud iam service-accounts add-iam-policy-binding {NODE_SA} --project {PROJECT} "
+                        f"--member {SA} --role roles/iam.serviceAccountUser --condition-from-file iam-condition.json")
+    assert '"expression": "request.time < timestamp(' in out and '"title": "snowplow-bench-<run>"' in out
+    assert "krateo-057 included" in out                                   # container.admin's reach, stated
+    assert "resourcemanager.projects.setIamPolicy" in out and "compute.securityAdmin" in out
     assert "gcloud compute disks delete  bench/gke.py:" in out
-    assert "gcloud compute addresses delete  bench/gke.py:" in out
     assert "REST cloudquotas.googleapis.com  bench/gke.py:" in out
-    assert "gcloud compute instances describe  bench/nodes.py:" in out
-    # the only call it makes is a read of the project number; nothing IAM is run
-    assert _verbs(fake) == ["projects describe operations-dev-krateo-io"]
+    assert _verbs(fake) == [f"projects describe {PROJECT}"]               # a read; nothing IAM is run
 
 
 def _bench_copy(tmp_path) -> Path:
@@ -106,12 +126,11 @@ def test_plan_iam_refuses_a_call_it_does_not_cover(fake, capsys, tmp_path):
         fh.write('\n\ndef _planted():\n    return ["gcloud", "compute", "firewall-rules", "create", "x"]\n')
     rc, out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
     assert rc == 1 and "gcloud compute firewall-rules create (bench/gke.py:" in err
-    assert "gcloud projects add-iam-policy-binding" not in out
+    assert "add-iam-policy-binding" not in out
 
 
 def test_plan_iam_reads_gcloud_in_shell_as_a_call_but_not_in_quotes_or_comments(fake, capsys, tmp_path):
     d = _bench_copy(tmp_path)
-    # the real run606.sh names gcloud only in log strings and comments: it passes (first test)
     with open(d / "run606.sh", "a") as fh:
         fh.write('\n# gcloud compute instances delete in a comment\nlog "gcloud in a string"\n'
                  'gcloud compute firewall-rules delete x --quiet\n')
@@ -131,54 +150,118 @@ def test_plan_iam_refuses_a_rest_api_it_does_not_cover(fake, capsys, tmp_path):
 
 # ─── up ─────────────────────────────────────────────────────────────────────
 
-def test_up_dry_prints_the_vm_and_creates_nothing(fake, capsys):
+def _flag(argv, f):
+    return argv[argv.index(f) + 1]
+
+
+def test_up_dry_prints_grants_rules_and_the_vm_and_creates_nothing(fake, capsys):
     rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
     assert rc == 0, err
     create = next(ln for ln in out.splitlines() if ln.startswith("DRY-RUN: gcloud compute instances create"))
-    for part in (f"create {VM} --project operations-dev-krateo-io --zone europe-west4-a",
-                 "--machine-type e2-standard-8", "--image-family debian-13 --image-project debian-cloud",
+    for part in (f"create {VM} --project {PROJECT} --zone europe-west4-a", "--machine-type e2-standard-8",
+                 "--image-family debian-13 --image-project debian-cloud",
                  "--boot-disk-size 50GB --boot-disk-type pd-balanced --boot-disk-auto-delete",
-                 "--service-account snowplow-bench-orchestrator@operations-dev-krateo-io.iam.gserviceaccount.com "
-                 "--scopes cloud-platform",
+                 f"--service-account snowplow-bench-orchestrator@{PROJECT}.iam.gserviceaccount.com --scopes "
+                 "cloud-platform", f"--network default --tags {VM}",
                  f"--labels owner=snowplow-bench,run={RUN},ttl-hours=15",
                  "--metadata enable-oslogin=TRUE,block-project-ssh-keys=TRUE",
                  "--instance-termination-action DELETE", "--termination-time 20"):
         assert part in create, part
     assert "--no-address" not in create            # an ephemeral external IP: no Cloud NAT in the project
+    assert out.count("DRY-RUN: gcloud projects add-iam-policy-binding") == 6
+    assert out.count("DRY-RUN: gcloud iam service-accounts add-iam-policy-binding") == 1
+    assert out.count("DRY-RUN: gcloud compute firewall-rules create") == 2
     assert "nothing was created" in out
-    assert _verbs(fake) == ["services list --enabled", "iam service-accounts describe"]    # reads only
+    assert set(_verbs(fake)) == {"services list --enabled", "iam service-accounts describe",
+                                 f"projects describe {PROJECT}", "compute regions describe",
+                                 "compute instances list", "compute forwarding-rules list",
+                                 "compute addresses list"}                                 # reads only
     script = (vm606.state_dir(RUN) / "startup.sh").read_text()
-    assert "kubectl" in script and vm606.KUBECTL_SHA256 in script and vm606.HELM_SHA256 in script
+    assert vm606.KUBECTL_SHA256 in script and vm606.HELM_SHA256 in script and "chmod 1777 /srv/snowplow-bench" in script
     assert "google-cloud-cli=561.0.0-0 google-cloud-cli-gke-gcloud-auth-plugin=561.0.0-0" in script
 
 
-def test_up_creates_the_vm_and_waits_for_the_laptops_tools(fake, capsys, monkeypatch):
+def _up(capsys, monkeypatch, *extra):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
+    return _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0", *extra)
+
+
+def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, capsys, monkeypatch):
     t0 = time.time()
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0")
+    rc, out, err = _up(capsys, monkeypatch)
     assert rc == 0, err
-    inst = json.loads((fake / "instances" / f"{VM}.json").read_text())
-    assert inst["labels"] == LABELS
-    assert inst["scheduling"]["instanceTerminationAction"] == "DELETE"
-    end = dt.datetime.fromisoformat(inst["scheduling"]["terminationTime"].replace("Z", "+00:00")).timestamp()
+    calls = [c["argv"] for c in fake_vm606.calls(fake)]
+    create = next(c for c in calls if c[:3] == ["compute", "instances", "create"])
+    tt = _flag(create, "--termination-time")
+    end = dt.datetime.fromisoformat(tt.replace("Z", "+00:00")).timestamp()
     assert t0 + 15 * 3600 - 5 <= end <= time.time() + 15 * 3600 + 5
-    assert "bootstrapped: bash GNU bash" in out and "kubectl v1.36.2" in out
-    assert json.loads((vm606.state_dir(RUN) / "state.json").read_text())["bootstrap"] == BOOT
+    want = {"title": f"snowplow-bench-{RUN}", "expression": f'request.time < timestamp("{tt}")',
+            "description": f"vm606: expires with {VM} (owner=snowplow-bench, run={RUN})"}
+    proj = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
+    assert sorted(b["role"] for b in proj) == sorted(ROLES[:-1])
+    assert all(b["members"] == [SA] and b["condition"] == want for b in proj)
+    node = fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"]
+    assert node == [{"role": "roles/iam.serviceAccountUser", "members": [SA], "condition": want}]
+    # order: every grant and both rules before the VM; the policies read back before the rules
+    idx = {i: c for i, c in enumerate(calls)}
+    first_create = min(i for i, c in idx.items() if c[:3] == ["compute", "instances", "create"])
+    grants = [i for i, c in idx.items() if "add-iam-policy-binding" in c]
+    reads = [i for i, c in idx.items() if "get-iam-policy" in c]
+    rules = [i for i, c in idx.items() if c[:3] == ["compute", "firewall-rules", "create"]]
+    assert len(grants) == 7 and max(grants) < min(reads) < min(rules) and max(rules) < first_create
+    fw = {p.stem: json.loads(p.read_text()) for p in (fake / "firewalls").glob("*.json")}
+    assert fw[f"{VM}-deny-ssh"]["sourceRanges"] == ["0.0.0.0/0"] and fw[f"{VM}-deny-ssh"]["priority"] == 1000
+    assert "denied" in fw[f"{VM}-deny-ssh"]
+    assert fw[f"{VM}-iap-ssh"]["sourceRanges"] == ["35.235.240.0/20"] and fw[f"{VM}-iap-ssh"]["priority"] == 900
+    assert all(r["targetTags"] == [VM] for r in fw.values())
+    assert _flag(create, "--tags") == VM
+    assert "bootstrapped: bash GNU bash" in out and _state()["bootstrap"] == BOOT
+    assert _state()["terminates_at"] == tt
+
+
+def test_up_reads_the_grants_back_and_creates_nothing_when_one_is_not_held(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_IAM_LOST_WRITE", "roles/compute.storageAdmin")
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and "roles/compute.storageAdmin on operations-dev-krateo-io is not held under the condition" in err
+    assert f"down --run {RUN} --yes" in err
+    assert not [v for v in _verbs(fake) if v.endswith(" create")]
 
 
 def test_up_refuses_a_vm_whose_tools_are_not_the_laptops(fake, capsys, monkeypatch):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps({**BOOT, "kubectl": "v1.35.0"}))
     rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0")
-    assert rc == 2 and "kubectl 'v1.35.0', want 'v1.36.2'" in err
+    assert rc == 2 and "kubectl 'v1.35.0', want 'v1.36.2'" in err and f"down --run {RUN} --yes" in err
+
+
+@pytest.mark.parametrize("fail, stage", [("4033", "IAP: the tunnel was refused"),
+                                         ("publickey", "OS Login: the key was refused")])
+def test_up_stops_at_once_on_an_ssh_failure_waiting_cannot_fix(fake, capsys, monkeypatch, fail, stage):
+    monkeypatch.setenv("FAKE_SSH_FAIL", fail)
+    rc, _out, err = _up(capsys, monkeypatch, "--ssh-ready-timeout-s", "5", "--bootstrap-timeout-s", "5")
+    assert rc == 2 and f"failed at {stage}" in err and "billing until its TTL" in err
+    assert f"`python3 -m bench.vm606 down --run {RUN} --yes`" in err
+    assert len([c for c in fake_vm606.calls(fake) if c["argv"][:2] == ["compute", "ssh"]]) == 1
+
+
+def test_up_waits_out_a_booting_vms_ssh_and_names_the_firewall_when_it_never_answers(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_SSH_FAIL", "4003")
+    monkeypatch.setenv("FAKE_SSH_FAIL_TIMES", "2")
+    rc, out, err = _up(capsys, monkeypatch)
+    assert rc == 0 and "bootstrapped" in out, err
+    assert len([c for c in fake_vm606.calls(fake) if c["argv"][:2] == ["compute", "ssh"]]) == 3
+    monkeypatch.setenv("FAKE_SSH_FAIL_TIMES", "1000000")
+    monkeypatch.setenv("FAKE_STATE", str(fake.parent / "gce2"))
+    rc, _out, err = _up(capsys, monkeypatch, "--ssh-ready-timeout-s", "0")
+    assert rc == 2 and "never answered in 0 s, last at firewall / sshd" in err and f"down --run {RUN}" in err
 
 
 @pytest.mark.parametrize("env, why", [("FAKE_IAP_DISABLED", "iap.googleapis.com is not enabled"),
                                       ("FAKE_NO_SA", "the orchestrator SA")])
-def test_up_refuses_before_creating_without_iap_or_the_sa(fake, capsys, monkeypatch, env, why):
+def test_up_refuses_before_granting_without_iap_or_the_sa(fake, capsys, monkeypatch, env, why):
     monkeypatch.setenv(env, "1")
     rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes")
     assert rc == 2 and why in err
-    assert "compute instances create" not in _verbs(fake)
+    assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or "create" in v]
 
 
 @pytest.mark.parametrize("args", [["--run", "Run_25", "--ttl-hours", "15"], ["--run", RUN, "--ttl-hours", "0"],
@@ -210,8 +293,14 @@ def _audit(event, args):
 sys.addaudithook(_audit)
 
 
+def _ready(fake) -> Path:
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(15))
+    fake_vm606.bootstrap_done(fake, VM, BOOT)
+    return srv
+
+
 def test_push_secret_copies_the_file_without_reading_printing_or_hashing_it(fake, capsys):
-    home = fake_vm606.put_instance(fake, VM, LABELS, _in(15))
+    srv = _ready(fake)
     tok = _token()
     _WATCH[:] = [str(tok), os.path.realpath(tok)]
     _OPENED.clear()
@@ -224,14 +313,29 @@ def test_push_secret_copies_the_file_without_reading_printing_or_hashing_it(fake
     digest = hashlib.sha256(SENTINEL.encode()).hexdigest()
     for text in (out, err):
         assert "SENTINEL" not in text and "sentinel-user" not in text and digest not in text
-    remote = home / ".config" / "snowplow-bench" / "ghcr-pull.env"
+    remote = srv / RUN / "home" / ".config" / "snowplow-bench" / "ghcr-pull.env"
     assert stat.S_IMODE(remote.stat().st_mode) == 0o600 and stat.S_IMODE(remote.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE((srv / RUN).stat().st_mode) == 0o700
     assert remote.read_text() == SENTINEL                           # the test reads it; the tool never did
-    assert f"{VM}:~/.config/snowplow-bench/ghcr-pull.env: present, mode 0600" in out
+    assert f"{VM}:/srv/snowplow-bench/{RUN}/home/.config/snowplow-bench/ghcr-pull.env: present, mode 0600" in out
+
+
+def test_push_secret_makes_the_modes_whatever_the_vm_held_or_the_copy_kept(fake, capsys, monkeypatch):
+    """A token directory left looser on the VM, and a copy that kept another mode (an scp whose remote
+    umask or protocol does not carry the source's 0600): push-secret's chmods make both, and it checks."""
+    srv = _ready(fake)
+    gdir = srv / RUN / "home" / ".config" / "snowplow-bench"
+    gdir.mkdir(parents=True)
+    gdir.chmod(0o755)
+    _token()
+    monkeypatch.setenv("FAKE_SCP_MODE", "644")
+    rc, out, err = _run(capsys, "push-secret", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert stat.S_IMODE((gdir / "ghcr-pull.env").stat().st_mode) == 0o600 and stat.S_IMODE(gdir.stat().st_mode) == 0o700
 
 
 def test_push_secret_refuses_a_token_file_not_0600(fake, capsys):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(15))
+    _ready(fake)
     _token(0o644)
     rc, _out, err = _run(capsys, "push-secret", "--run", RUN, "--yes")
     assert rc == 2 and "mode 0644, not 0600" in err
@@ -248,21 +352,39 @@ def test_push_secret_refuses_a_vm_it_did_not_make(fake, capsys):
 
 # ─── launch ─────────────────────────────────────────────────────────────────
 
-STUB_PAIR = """#!/usr/bin/env bash
+# a run606_pair.sh stand-in. Its dry pass READS STDIN (a child that would eat a script fed on bash's
+# stdin), then logs each run's gke-up argv; its paid pass (STUB_MODE) logs each run's run budget
+# into the run's OUT and waits for a release file, refuses as run606 does, or exits as the pair does
+STUB_PAIR = r"""#!/usr/bin/env bash
 set -eu
+PO="$(python3 -m bench.evidence run-dir "pair-$RUN_NAME_N1-$RUN_NAME_N2")"
 if [ "${BENCH_606_DRY_RUN:-0}" = 1 ]; then
+  cat > /dev/null
   mkdir -p "$PAIR_OUT/dry-N1" "$PAIR_OUT/dry-N2"
-  echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N1 --ttl-hours ${STUB_TTL:-13} --yes" > "$PAIR_OUT/dry-N1/run.log"
+  echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N1 --ttl-hours 13 --yes" > "$PAIR_OUT/dry-N1/run.log"
   echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N2 --ttl-hours 12 --yes" > "$PAIR_OUT/dry-N2/run.log"
   echo "DRY: all 2 runs would start now"
   exit 0
 fi
-echo "paid launch: RUNS=$RUNS PAIRS=$PAIRS INSTALLER_VERSION=$INSTALLER_VERSION go=$BENCH_606_GO_N2 $(git rev-parse HEAD)"
+echo "[07:00:00] runs: N1 N2; PAIR_OUT $PO; bench $(git rev-parse HEAD); owner $USER; zone $ZONE"
+case "${STUB_MODE:-ok}" in
+  dirty) echo "refusing: uncommitted changes under the bench: every run must be one commit" >&2; exit 2 ;;
+  refuse) echo "refusing: BENCH_606_GO must be '20261111-$RUN_NAME_N1' (Diego's explicit go for THIS run)" > "$PO/N1.console"
+          sleep 30; exit 1 ;;
+esac
+for n in "$RUN_NAME_N1" "$RUN_NAME_N2"; do
+  o="$(python3 -m bench.evidence run-dir "$n")"; mkdir -p "$o"
+  echo "[07:00:01] run budget: up 1800 + ...; fits TTL_HOURS=13" >> "$o/run.log"
+done
+echo "paid launch: RUNS=$RUNS PAIRS=$PAIRS INSTALLER_VERSION=$INSTALLER_VERSION go=$BENCH_606_GO_N2"
+i=0; while [ ! -e "$HOME/release" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+echo "finished"
 """
 
 
-def _repo(tmp_path) -> tuple[str, str]:
-    """A snowplow stand-in: the bench's own detach and evidence, a stub launcher."""
+def _repo(tmp_path) -> tuple[str, str, str]:
+    """A snowplow stand-in: the bench's own detach and evidence, a stub launcher. (path, commit, the
+    object id of an annotated tag on it)."""
     r = tmp_path / "upstream"
     b = r / "go" / "snowplow" / "e2e" / "bench"
     (b / "bench").mkdir(parents=True)
@@ -274,19 +396,21 @@ def _repo(tmp_path) -> tuple[str, str]:
     subprocess.run(["git", "init", "-q", str(r)], check=True)
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-q", "-m", "stub"], check=True)
-    subprocess.run([*git, "config", "uploadpack.allowReachableSHA1InWant", "true"], check=True)
-    sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-    return str(r), sha
+    subprocess.run([*git, "tag", "-a", "-m", "a tag", "v0"], check=True)
+    subprocess.run([*git, "config", "uploadpack.allowAnySHA1InWant", "true"], check=True)
+
+    def rev(x):
+        return subprocess.run([*git, "rev-parse", x], check=True, capture_output=True, text=True).stdout.strip()
+    return str(r), rev("HEAD"), rev("v0")
 
 
-def _venv(home: Path, sha: str) -> Path:
-    """The VM's venv for `sha`, pre-made: its python3 is this interpreter, its pip a stub (no network)."""
-    v = home / "vm606" / f"venv-{sha}" / "bin"
+def _venv(run_dir: Path) -> None:
+    """The run's venv on the VM, pre-made: its python3 is this interpreter, its pip a stub (no network)."""
+    v = run_dir / "venv" / "bin"
     v.mkdir(parents=True)
     (v / "python3").symlink_to(sys.executable)
-    (v / "pip").write_text(f"#!/bin/sh\necho \"$@\" >> {home / 'pip.log'}\n")
+    (v / "pip").write_text(f"#!/bin/sh\necho \"$@\" >> {run_dir / 'pip.log'}\n")
     (v / "pip").chmod(0o755)
-    return v
 
 
 ENV = {"RUNS": "N1 N2", "PAIRS": "N1:N2", "INSTALLER_VERSION": "0.3.545",
@@ -295,12 +419,13 @@ ENV = {"RUNS": "N1 N2", "PAIRS": "N1:N2", "INSTALLER_VERSION": "0.3.545",
        "EXPECTED_IMAGE_DIGEST_N1": "sha256:" + "a" * 64, "EXPECTED_IMAGE_DIGEST_N2": "sha256:" + "b" * 64,
        "BENCH_606_GO_N1": "20261110-snowplow-bench-run25n1-8a395c45",
        "BENCH_606_GO_N2": "20261110-snowplow-bench-run25n2-8a395c45"}
+PAIR = vm606.pair_name(ENV)
 
 
-def _env_file(tmp_path, extra: str = "") -> Path:
+def _env_file(tmp_path, extra: str = "", **more) -> Path:
     p = tmp_path / "launch.env"
-    p.write_text("# the laptop launcher's variables\n" + "".join(f"{k}={shlex.quote(v)}\n" for k, v in ENV.items())
-                 + extra)
+    p.write_text("# the laptop launcher's variables\n"
+                 + "".join(f"{k}={shlex.quote(v)}\n" for k, v in {**ENV, **more}.items()) + extra)
     return p
 
 
@@ -310,23 +435,27 @@ def _pin(tmp_path) -> tuple[Path, str]:
     return p, hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def _launch_args(tmp_path, repo, sha, pin, pin_sha, env_file=None):
+def _launch_args(tmp_path, repo, sha, pin, pin_sha, env_file=None, bench_zone="europe-west1-b"):
     return ["launch", "--run", RUN, "--bench-sha", sha, "--env-file", str(env_file or _env_file(tmp_path)),
-            "--pin-manifest", str(pin), "--pin-sha256", pin_sha, "--repo-url", repo, "--yes"]
+            "--pin-manifest", str(pin), "--pin-sha256", pin_sha, "--repo-url", repo, "--yes",
+            "--started-timeout-s", "60", "--bench-zone", bench_zone]
 
 
-def _vm_ready(fake, tmp_path, sha, hours=15.0) -> Path:
-    home = fake_vm606.put_instance(fake, VM, LABELS, _in(hours))
+def _vm_ready(fake, hours=15.0) -> Path:
+    """After up and push-secret: the run's directory with the token in it and its venv. Returns it."""
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(hours))
     fake_vm606.bootstrap_done(fake, VM, BOOT)
-    tok = home / ".config" / "snowplow-bench" / "ghcr-pull.env"
+    r = srv / RUN
+    tok = r / "home" / ".config" / "snowplow-bench" / "ghcr-pull.env"
     tok.parent.mkdir(parents=True)
     tok.write_text("opaque")
     tok.chmod(0o600)
-    _venv(home, sha)
-    return home
+    r.chmod(0o700)
+    _venv(r)
+    return r
 
 
-def _wait_for(path: Path, text: str, s: float = 20) -> str:
+def _wait_for(path: Path, text: str, s: float = 30) -> str:
     end = time.monotonic() + s
     while time.monotonic() < end:
         if path.exists() and text in path.read_text():
@@ -335,59 +464,114 @@ def _wait_for(path: Path, text: str, s: float = 20) -> str:
     raise AssertionError(f"{path} never held {text!r}: {path.read_text() if path.exists() else 'absent'}")
 
 
-def test_launch_clones_at_the_sha_dry_passes_and_starts_detached(fake, capsys, tmp_path):
-    repo, sha = _repo(tmp_path)
-    home = _vm_ready(fake, tmp_path, sha)
+def test_launch_starts_the_launcher_detached_and_it_survives_the_session(fake, capsys, tmp_path):
+    repo, sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake)
     pin, pin_sha = _pin(tmp_path)
     rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
     assert rc == 0, err + out
-    w = home / "vm606" / RUN
-    assert f"vm606: bench checkout at {sha}" in out and "vm606: dry pass OK" in out
-    assert "the run's TTL 13 h + margin fits" in out                      # the larger of the runs' TTLs
-    log = _wait_for(w / "launch.log", "paid launch:")
-    assert f"paid launch: RUNS=N1 N2 PAIRS=N1:N2 INSTALLER_VERSION=0.3.545 go={ENV['BENCH_606_GO_N2']} {sha}" in log
-    assert (w / "launch.pid").read_text().strip().isdigit()
-    pair = "pair-snowplow-bench-run25n1-8a395c45-snowplow-bench-run25n2-8a395c45"
-    placed = home / ".local" / "share" / "snowplow-bench" / "runs" / "606" / pair / pin.name
+    assert f"vm606: bench checkout at {sha}" in out and "vm606: dry pass OK" in out   # the dry pass read stdin
+    assert "the run's TTL 13 h + margin fits" in out                       # the larger of the runs' TTLs
+    assert "launched on" in out and "every run passed its paid-only checks" in out
+    pid = int((r / "launch.pid").read_text())
+    # launch returned while the launcher still waits for its release: it did not wait for it. The session
+    # was hung up (the fake SIGHUPs and TERMs its process group); the launcher lives on, in a session of
+    # its own, and finishes when released
+    os.kill(pid, 0)
+    assert os.getsid(pid) == pid
+    assert "finished" not in (r / "launch.log").read_text()
+    (r / "home" / "release").write_text("")
+    log = _wait_for(r / "launch.log", "finished")
+    assert f"paid launch: RUNS=N1 N2 PAIRS=N1:N2 INSTALLER_VERSION=0.3.545 go={ENV['BENCH_606_GO_N2']}" in log
+    assert "; owner snowplow-bench" in log and fake_vm606.IDENTITY not in log      # gke-up's owner label: $USER
+    assert "; zone europe-west1-b" in log                    # the clusters' zone, not the VM's (europe-west4-a)
+    placed = r / "home" / ".local" / "share" / "snowplow-bench" / "runs" / "606" / PAIR / pin.name
     assert placed.read_bytes() == pin.read_bytes()                        # the manifest beside the pair's files
-    assert stat.S_IMODE((w / "launch-env.sh").stat().st_mode) == 0o600
-    assert "-r" in (home / "pip.log").read_text() and "jsonschema" in (home / "pip.log").read_text()
-    st = json.loads((vm606.state_dir(RUN) / "state.json").read_text())
-    assert st["bench_sha"] == sha and st["pair"] == pair and st["runs"] == [ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]]
-    assert st["run_ttl_hours"] == 13 and st["fetched"] is False
+    assert stat.S_IMODE((r / "launch-env.sh").stat().st_mode) == 0o600
+    assert "jsonschema" in (r / "pip.log").read_text()
+    st = _state()
+    assert st["bench_sha"] == sha and st["pair"] == PAIR and st["runs"] == [ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]]
+    assert st["run_ttl_hours"] == 13 and st["fetched"] is False and st["started"] == "ok"
+    assert st["bench_zone"] == "europe-west1-b"
+    assert st["pair_out"].endswith(f"/{RUN}/home/.local/share/snowplow-bench/runs/606/{PAIR}")
 
 
-def test_launch_refuses_a_vm_that_dies_before_the_run_ends(fake, capsys, tmp_path):
-    repo, sha = _repo(tmp_path)
-    home = _vm_ready(fake, tmp_path, sha, hours=13.5)                    # 13 h run + 1 h margin does not fit
+@pytest.mark.parametrize("mode, why", [
+    ("refuse", "run N1: refusing: BENCH_606_GO must be '20261111-snowplow-bench-run25n1-8a395c45'"),
+    ("dirty", "vm606: launcher: refusing: uncommitted changes under the bench"),
+])
+def test_launch_says_launched_only_once_every_run_passed_its_paid_only_checks(fake, capsys, tmp_path, mode, why):
+    repo, sha, _tag = _repo(tmp_path)
+    _vm_ready(fake)
     pin, pin_sha = _pin(tmp_path)
-    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
-    assert rc == 2 and "the run's TTL is 13 h" in err and "--ttl-hours >= 14" in err
-    assert not (home / "vm606" / RUN / "launch.pid").exists()
+    rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha, _env_file(tmp_path, STUB_MODE=mode)))
+    assert rc == 2 and why in out and "did not get every run past its paid-only checks" in err, out + err
+    assert "launched on" not in out
+    assert _state()["started"] == ("refused" if mode == "refuse" else "exited")
+
+
+def test_launch_refuses_a_checkout_that_is_not_the_sha_asked(fake, capsys, tmp_path):
+    """An annotated tag's object id fetches, and checks out its commit: HEAD is not the id asked."""
+    repo, sha, tag = _repo(tmp_path)
+    r = _vm_ready(fake)
+    pin, pin_sha = _pin(tmp_path)
+    rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, tag, pin, pin_sha))
+    assert rc == 2 and f"the checkout is at {sha}, not {tag}" in err, err + out
+    assert not (r / "launch.pid").exists()
 
 
 def test_launch_refuses_a_sha_the_repo_does_not_have(fake, capsys, tmp_path):
-    repo, sha = _repo(tmp_path)
-    other = "0" * 40
-    home = _vm_ready(fake, tmp_path, other)
+    repo, _sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake)
     pin, pin_sha = _pin(tmp_path)
-    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, other, pin, pin_sha))
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, "0" * 40, pin, pin_sha))
     assert rc == 2 and "the VM's prepare step failed" in err
-    assert not (home / "vm606" / RUN / "launch.pid").exists()
+    assert not (r / "launch.pid").exists()
+
+
+def test_launch_refuses_a_pin_manifest_changed_on_its_way_to_the_vm(fake, capsys, tmp_path, monkeypatch):
+    repo, sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake)
+    pin, pin_sha = _pin(tmp_path)
+    monkeypatch.setenv("FAKE_SCP_CORRUPT", pin.name)
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
+    assert rc == 2 and "the pin manifest on the VM has sha256" in err and f"not {pin_sha}" in err
+    assert not (r / "snowplow").exists()
+
+
+def test_launch_refuses_a_pin_manifest_changed_in_the_pairs_directory(fake, capsys, tmp_path, monkeypatch):
+    repo, sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake)
+    pin, pin_sha = _pin(tmp_path)
+    # after the second ssh (prepare), the copy in the pair's run directory changes
+    monkeypatch.setenv("FAKE_TAMPER_AFTER_SSH",
+                       f"2:{RUN}/home/.local/share/snowplow-bench/runs/606/{PAIR}/{pin.name}")
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
+    assert rc == 2 and "the pin manifest in" in err and f"/runs/606/{PAIR} has sha256" in err
+    assert not (r / "launch.pid").exists()
+
+
+def test_launch_refuses_a_vm_that_dies_before_the_run_ends(fake, capsys, tmp_path):
+    repo, sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake, hours=13.5)                         # 13 h run + 1 h margin does not fit
+    pin, pin_sha = _pin(tmp_path)
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
+    assert rc == 2 and "the run's TTL is 13 h" in err and "--ttl-hours >= 14" in err
+    assert not (r / "launch.pid").exists()
 
 
 def test_launch_refuses_without_the_token_on_the_vm(fake, capsys, tmp_path):
-    repo, sha = _repo(tmp_path)
-    home = _vm_ready(fake, tmp_path, sha)
-    (home / ".config" / "snowplow-bench" / "ghcr-pull.env").unlink()
+    repo, sha, _tag = _repo(tmp_path)
+    r = _vm_ready(fake)
+    (r / "home" / ".config" / "snowplow-bench" / "ghcr-pull.env").unlink()
     pin, pin_sha = _pin(tmp_path)
     rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
     assert rc == 2 and "push-secret first" in err
 
 
 def test_launch_refuses_a_pin_manifest_whose_sha256_differs(fake, capsys, tmp_path):
-    repo, sha = _repo(tmp_path)
-    _vm_ready(fake, tmp_path, sha)
+    repo, sha, _tag = _repo(tmp_path)
+    _vm_ready(fake)
     pin, _ = _pin(tmp_path)
     rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, "f" * 64))
     assert rc == 2 and f"has sha256 {hashlib.sha256(pin.read_bytes()).hexdigest()}, not {'f' * 64}" in err
@@ -401,45 +585,66 @@ def test_launch_refuses_a_pin_manifest_whose_sha256_differs(fake, capsys, tmp_pa
     ("BENCH_606_DRY_RUN=1\n", "BENCH_606_DRY_RUN is a test hook"),
     ("CLOUDSDK_CORE_ACCOUNT=x\n", "CLOUDSDK_CORE_ACCOUNT is a test hook or a gcloud override"),
     ("INSTALLER_CHART=/private/tmp/chart.tgz\n", "is a path on the laptop"),
+    ("GHCR_PULL_TOKEN=opaque\n", "GHCR_PULL_TOKEN is the pull token's"),
+    ("GHCR_PULL_USERNAME=someone\n", "GHCR_PULL_USERNAME is the pull token's"),
     ("RUNS=N1 N2\n", "one literal value per variable"),
     ("SNOWPLOW_TAG_N1=$TAG\n", "no expansion"),
 ])
 def test_launch_refuses_an_env_that_cannot_travel(fake, capsys, tmp_path, extra, why):
     pin, pin_sha = _pin(tmp_path)
     env = tmp_path / "e.env"
-    env.write_text("".join(f"{k}={v!r}\n" if " " in v else f"{k}={v}\n" for k, v in ENV.items()
+    env.write_text("".join(f"{k}={shlex.quote(v)}\n" for k, v in ENV.items()
                            if not (extra.startswith("RUNS=") and k == "RUNS")) + extra)
     rc, _out, err = _run(capsys, *_launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha, env))
     assert rc == 2 and why in err, err
     assert fake_vm606.calls(fake) == []
 
 
+def test_launch_refuses_an_env_zone_that_is_not_the_bench_zone(fake, capsys, tmp_path):
+    pin, pin_sha = _pin(tmp_path)
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha,
+                                               _env_file(tmp_path, ZONE="europe-west4-a")))
+    assert rc == 2 and "the env file's ZONE=europe-west4-a is not --bench-zone europe-west1-b" in err
+    assert fake_vm606.calls(fake) == []
+
+
 def test_launch_dry_starts_nothing(fake, capsys, tmp_path):
     pin, pin_sha = _pin(tmp_path)
-    args = _launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha)[:-1]
+    args = [a for a in _launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha) if a != "--yes"]
     rc, out, err = _run(capsys, *args)
     assert rc == 0, err
-    assert f"DRY-RUN: gcloud compute scp --project operations-dev-krateo-io --zone europe-west4-a --tunnel-through-iap " \
-           f"--quiet {pin} {VM}:vm606/{RUN}/pin/{pin.name}" in out
-    assert "nothing was started" in out and fake_vm606.calls(fake) == []
+    assert (f"DRY-RUN: gcloud compute scp --project {PROJECT} --zone europe-west4-a --tunnel-through-iap --quiet "
+            f"{pin} {VM}:/srv/snowplow-bench/{RUN}/pin/{pin.name}") in out
+    assert "clusters in ZONE=europe-west1-b; nothing was started" in out and fake_vm606.calls(fake) == []
 
 
 def test_pair_name_is_run606_pairs():
     src = (BENCH_DIR / "run606_pair.sh").read_text()
     assert 'PAIR_NAME="pair"\n' in src
     assert 'for x in "${LABELS[@]}"; do nm="RUN_NAME_$x"; PAIR_NAME="${PAIR_NAME}-${!nm}"; done' in src
-    assert vm606.pair_name(ENV) == f"pair-{ENV['RUN_NAME_N1']}-{ENV['RUN_NAME_N2']}"
+    assert PAIR == f"pair-{ENV['RUN_NAME_N1']}-{ENV['RUN_NAME_N2']}"
+
+
+def test_a_remote_script_survives_a_child_that_reads_stdin(tmp_path):
+    """vm606 feeds its scripts on bash's stdin: a child reading stdin must not eat the rest."""
+    body = 'cat > /dev/null\necho "after the child"\n'
+    p = subprocess.run(["bash", "-s"], input=vm606.remote(RUN, body, in_dir=False), capture_output=True, text=True,
+                       timeout=30)
+    assert p.returncode == 0 and "after the child" in p.stdout
+    # the hazard it guards against, shown: a flat script loses its tail to the child, and exits 0
+    flat = subprocess.run(["bash", "-s"], input=body, capture_output=True, text=True, timeout=30)
+    assert flat.returncode == 0 and "after the child" not in flat.stdout
 
 
 # ─── status ─────────────────────────────────────────────────────────────────
 
 def test_status_tails_the_log_redacted_and_says_the_vms_time_left(fake, capsys):
-    home = fake_vm606.put_instance(fake, VM, LABELS, _in(10))
-    w = home / "vm606" / RUN
-    w.mkdir(parents=True)
-    (w / "launch.log").write_text("".join(f"[06:5{i}:00] line {i}\n" for i in range(5))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(10))
+    r = srv / RUN
+    r.mkdir()
+    (r / "launch.log").write_text("".join(f"[06:5{i}:00] line {i}\n" for i in range(5))
                                   + "authenticated as someone@example.com\n")
-    (w / "launch.pid").write_text(f"{os.getpid()}\n")
+    (r / "launch.pid").write_text(f"{os.getpid()}\n")
     rc, out, err = _run(capsys, "status", "--run", RUN, "--lines", "3")
     assert rc == 0, err
     assert f"{VM}: RUNNING, deleted in 10.0 h; launcher running {os.getpid()}" in out
@@ -450,19 +655,19 @@ def test_status_tails_the_log_redacted_and_says_the_vms_time_left(fake, capsys):
 # ─── fetch ──────────────────────────────────────────────────────────────────
 
 NAMES = [ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]]
-PAIR = vm606.pair_name(ENV)
 
 
 def _vm_after_run(fake, monkeypatch, *, alive=False) -> Path:
     """The VM after a launch: each run's directory and its evidence (published by bench.evidence)."""
-    home = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    r = srv / RUN
     sha = "c" * 40
-    b = home / "vm606" / RUN / "snowplow" / "go" / "snowplow" / "e2e" / "bench" / "bench"
+    b = r / "snowplow" / "go" / "snowplow" / "e2e" / "bench" / "bench"
     b.mkdir(parents=True)
     for f in ("__init__.py", "evidence.py"):
         shutil.copy(BENCH_DIR / "bench" / f, b / f)
-    _venv(home, sha)
-    data = home / ".local" / "share" / "snowplow-bench"
+    _venv(r)
+    data = r / "home" / ".local" / "share" / "snowplow-bench"
     monkeypatch.setenv("BENCH_ALLOW_VOLATILE_PATHS", "1")
     for n in [*NAMES, PAIR]:
         src = data / "runs" / "606" / n
@@ -470,9 +675,8 @@ def _vm_after_run(fake, monkeypatch, *, alive=False) -> Path:
         (src / "run.log").write_text(f"{n}: run complete\n")
         (src / "k6" / "stream.jsonl").write_text('{"t": 1}\n' * 100)
         evidence.publish(src, data / "evidence" / "606" / n, n, "final")
-    w = home / "vm606" / RUN
-    (w / "launch.log").write_text("launcher log\n")
-    (w / "launch.pid").write_text(f"{os.getpid() if alive else 2 ** 22 + 7}\n")
+    (r / "launch.log").write_text("launcher log\n")
+    (r / "launch.pid").write_text(f"{os.getpid() if alive else 2 ** 22 + 7}\n")
     vm606._save_state(RUN, bench_sha=sha, runs=NAMES, pair=PAIR, launched_at=time.time(), fetched=False)
     return data
 
@@ -487,9 +691,18 @@ def test_fetch_brings_every_directory_back_verified(fake, capsys, monkeypatch):
         assert evidence.verify(evidence.evidence_dir(n), "final") == []
         assert f"evidence {n}: verified against its MANIFEST.json (stage final)" in out
     assert (vm606.state_dir(RUN) / "vm" / "launch.log").read_text() == "launcher log\n"
-    st = json.loads((vm606.state_dir(RUN) / "state.json").read_text())
+    st = _state()
     assert st["fetched"] is True and len(st["fetch_sha256"]) == 64
     assert not (vm606.state_dir(RUN) / "staging").exists() and not (vm606.state_dir(RUN) / "fetch.tar").exists()
+
+
+def test_fetch_refuses_an_archive_changed_in_transit(fake, capsys, monkeypatch):
+    _vm_after_run(fake, monkeypatch)
+    monkeypatch.setenv("FAKE_SCP_CORRUPT", "fetch.tar")
+    rc, _out, err = _run(capsys, "fetch", "--run", RUN)
+    assert rc == 2 and "the fetch archive arrived with sha256" in err and "nothing was moved" in err
+    for n in [*NAMES, PAIR]:
+        assert not evidence.run_dir(n).exists() and not evidence.evidence_dir(n).exists()
 
 
 def test_fetch_refuses_evidence_that_does_not_verify_and_moves_nothing(fake, capsys, monkeypatch):
@@ -518,25 +731,48 @@ def test_fetch_never_overwrites_a_run_on_the_laptop(fake, capsys, monkeypatch):
 
 # ─── down ───────────────────────────────────────────────────────────────────
 
-def test_down_deletes_the_vm_and_its_disk_and_verifies_both_gone(fake, capsys):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+OTHER = {"role": "roles/container.admin", "members": [SA],
+         "condition": {"title": "snowplow-bench-run9", "expression": 'request.time < timestamp("2026-11-12T00:00:00Z")',
+                       "description": "vm606: another run's"}}
+UNCONDITIONAL = {"role": "roles/compute.viewer", "members": [SA]}
+
+
+def _upped(fake, capsys, monkeypatch):
+    """After a real (fake) up: grants, rules, VM; plus another run's binding and an unconditional one."""
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", [OTHER, UNCONDITIONAL])
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 0, err
+
+
+def test_down_deletes_the_vm_disk_rules_and_only_its_own_grants_and_verifies(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
     rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 0, err
-    assert "DRY" not in out
-    assert not (fake / "instances" / f"{VM}.json").exists() and not (fake / "disks" / VM).exists()
-    assert f"{VM} deleted and verified gone; its disk(s) ['{VM}'] too" in out
-    deletes = [c["argv"] for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "instances", "delete"]]
-    assert deletes == [["compute", "instances", "delete", VM, "--project", "operations-dev-krateo-io", "--zone",
-                        "europe-west4-a", "--delete-disks", "all", "--quiet"]]
+    assert not (fake / "instances" / f"{VM}.json").exists() and not (fake / "disks" / f"{VM}.json").exists()
+    assert list((fake / "firewalls").glob("*.json")) == []
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL]
+    assert fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"] == []
+    assert f"{VM} gone and verified: disk(s) ['{VM}']" in out and "2 firewall rule(s), 7 conditional grant(s)" in out
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
     assert lists and all(c["partial_error"] == "false" for c in lists)
 
 
-def test_down_dry_deletes_nothing(fake, capsys):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+def test_down_after_the_vms_ttl_still_removes_its_rules_and_grants(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    (fake / "instances" / f"{VM}.json").unlink()            # GCE deleted it at --termination-time
+    (fake / "disks" / f"{VM}.json").unlink()
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert "already gone" in out and list((fake / "firewalls").glob("*.json")) == []
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL]
+
+
+def test_down_dry_deletes_nothing(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
     rc, out, _err = _run(capsys, "down", "--run", RUN)
     assert rc == 0 and "DRY-RUN: gcloud compute instances delete" in out and "nothing was deleted" in out
-    assert (fake / "instances" / f"{VM}.json").exists()
+    assert out.count("DRY-RUN: gcloud projects remove-iam-policy-binding") == 6
+    assert (fake / "instances" / f"{VM}.json").exists() and len(list((fake / "firewalls").glob("*.json"))) == 2
 
 
 @pytest.mark.parametrize("labels", [{"owner": "someone-else", "run": RUN}, {"owner": "snowplow-bench", "run": "run9"},
@@ -546,6 +782,25 @@ def test_down_refuses_an_instance_not_labelled_for_the_run(fake, capsys, labels)
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "is not labelled owner=snowplow-bench, run=run25" in err
     assert "compute instances delete" not in _verbs(fake)
+
+
+def test_down_refuses_a_firewall_rule_it_did_not_make_and_deletes_nothing(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    p = fake / "firewalls" / f"{VM}-iap-ssh.json"
+    p.write_text(json.dumps({**json.loads(p.read_text()), "description": "someone else's"}))
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"firewall rule '{VM}-iap-ssh' is not one vm606 made" in err
+    assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
+
+
+def test_down_refuses_a_binding_with_its_title_but_not_its_form(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    pol = fake_vm606.policy(fake, f"project-{PROJECT}")
+    pol["bindings"].append({"role": "roles/owner", "members": [SA],
+                            "condition": {"title": f"snowplow-bench-{RUN}", "expression": "true"}})
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", pol["bindings"])
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and "not the expiry form vm606 writes" in err
 
 
 def test_down_refuses_when_the_label_selects_another_vm(fake, capsys):
@@ -573,22 +828,108 @@ def test_down_refuses_a_disk_left_behind(fake, capsys, monkeypatch):
 
 
 def test_down_refuses_an_unfetched_launch_and_a_running_launcher(fake, capsys, monkeypatch):
-    home = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
     vm606._save_state(RUN, launched_at=time.time(), fetched=False)
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "was launched and not fetched" in err
-    w = home / "vm606" / RUN
-    w.mkdir(parents=True)
-    (w / "launch.pid").write_text(f"{os.getpid()}\n")
+    r = srv / RUN
+    r.mkdir()
+    (r / "launch.pid").write_text(f"{os.getpid()}\n")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes", "--discard-unfetched")
     assert rc == 2 and "the launcher is still running" in err
     assert "compute instances delete" not in _verbs(fake)
-    (w / "launch.pid").write_text(f"{2 ** 22 + 7}\n")
+    (r / "launch.pid").write_text(f"{2 ** 22 + 7}\n")
     rc, out, err = _run(capsys, "down", "--run", RUN, "--yes", "--discard-unfetched")
     assert rc == 0, err
 
 
-def test_down_says_notfound_and_deletes_nothing(fake, capsys):
-    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and "notfound (nothing to delete)" in err
-    assert "PLACEHOLDER-OPERATOR" not in err
+def test_down_with_nothing_left_says_so(fake, capsys):
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert "already gone" in out and "0 firewall rule(s), 0 conditional grant(s)" in out
+    assert "PLACEHOLDER-OPERATOR" not in out + err
+
+
+# ─── the VM's own region; two launches at once ──────────────────────────────
+
+def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, monkeypatch):
+    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
+    assert rc == 0, err
+    for metric in ("INSTANCES", "E2_CPUS", "SSD_TOTAL_GB", "IN_USE_ADDRESSES"):
+        assert re.search(rf"^{metric} in europe-west4: .*the VM needs", out, re.M), (metric, out)
+    lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
+    assert {c["argv"][1] for c in lists} == {"instances", "forwarding-rules", "addresses"}
+    assert all(c["partial_error"] == "false" for c in lists)
+    monkeypatch.setenv("FAKE_LIMIT_E2_CPUS", "4")
+    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes")
+    assert rc == 2 and "the VM does not fit europe-west4's quotas: E2_CPUS" in err
+    assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
+
+
+def test_up_counts_a_vm_already_in_its_region_and_none_in_another(fake, capsys, monkeypatch):
+    """Run 24's VM (external IP) in europe-west4: with room for one more in-use address there, run 25's
+    VM does not fit in europe-west4 and fits in europe-west1."""
+    fake_vm606.put_instance(fake, vm606.vm_name("run24"), {**LABELS, "run": "run24"}, _in(15), zone="europe-west4-a")
+    monkeypatch.setenv("FAKE_LIMIT_IN_USE_ADDRESSES", "1")
+    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
+    assert rc == 2 and "IN_USE_ADDRESSES in europe-west4: 1 of 1 used (listed: 1 VM external IP(s)" in err
+    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--zone", "europe-west1-b")
+    assert rc == 0, err
+    assert "IN_USE_ADDRESSES in europe-west1: 0 of 1 used (listed: 0 VM external IP(s)" in out
+
+
+def test_the_benchs_pre_check_counts_the_vm_among_its_regions_external_ips(fake, capsys, monkeypatch):
+    """The VM as GCE lists it, counted by bench.gke's in-use counter (the run's pre-check) in its region only."""
+    _up(capsys, monkeypatch)
+    listed = {"instances": [json.loads((fake / "instances" / f"{VM}.json").read_text())],
+              "forwarding-rules": [], "addresses": []}
+    assert vm606.gke.in_use_addresses(listed, "europe-west4")[0] == 1
+    assert vm606.gke.in_use_addresses(listed, "europe-west1")[0] == 0
+
+
+def _two_runs(fake, capsys, monkeypatch):
+    """run24's VM in europe-west4 and run25's in europe-west1, each up as up makes it."""
+    monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
+    for run, zone in (("run24", "europe-west4-a"), (RUN, "europe-west1-b")):
+        rc, _out, err = _run(capsys, "up", "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", zone)
+        assert rc == 0, err
+
+
+def test_two_launches_at_once_down_of_one_never_touches_the_other(fake, capsys, monkeypatch):
+    _two_runs(fake, capsys, monkeypatch)
+    vm24 = vm606.vm_name("run24")
+    before = {"inst": (fake / "instances" / f"{vm24}.json").read_text(),
+              "rules": sorted(p.name for p in (fake / "firewalls").glob(f"{vm24}-*.json")),
+              "proj": [b for b in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
+                       if b["condition"]["title"] == "snowplow-bench-run24"],
+              "sa": [b for b in fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"]
+                     if b["condition"]["title"] == "snowplow-bench-run24"]}
+    assert len(before["rules"]) == 2 and len(before["proj"]) == 6 and len(before["sa"]) == 1
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes", "--zone", "europe-west1-b")
+    assert rc == 0, err
+    assert not (fake / "instances" / f"{VM}.json").exists()
+    assert (fake / "instances" / f"{vm24}.json").read_text() == before["inst"]
+    assert sorted(p.name for p in (fake / "firewalls").glob("*.json")) == before["rules"]
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == before["proj"]
+    assert fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"] == before["sa"]
+    rc, _out, err = _run(capsys, "down", "--run", "run24", "--yes")
+    assert rc == 0, err
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == []
+
+
+def test_two_launches_at_once_fetch_of_one_never_touches_the_other(fake, capsys, monkeypatch):
+    data = _vm_after_run(fake, monkeypatch)                     # run25, fetchable
+    vm24 = vm606.vm_name("run24")
+    srv24 = fake_vm606.put_instance(fake, vm24, {**LABELS, "run": "run24"}, _in(3))
+    names24 = ["snowplow-bench-run24n1-x", "snowplow-bench-run24n2-x"]
+    d24 = srv24 / "run24" / "home" / ".local" / "share" / "snowplow-bench" / "runs" / "606"
+    for n in names24:
+        (d24 / n).mkdir(parents=True)
+        (d24 / n / "run.log").write_text("run 24 going\n")
+    before = {p: p.read_bytes() for p in srv24.rglob("*") if p.is_file()}
+    rc, _out, err = _run(capsys, "fetch", "--run", RUN)
+    assert rc == 0, err
+    assert {p: p.read_bytes() for p in srv24.rglob("*") if p.is_file()} == before
+    for n in names24:
+        assert not evidence.run_dir(n).exists()
+    assert all(evidence.run_dir(n).exists() for n in NAMES) and data.exists()
