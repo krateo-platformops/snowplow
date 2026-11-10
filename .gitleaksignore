@@ -24,3 +24,12 @@
 # test constant in dd3b8b1c. Not a credential; renamed to a low-entropy canary in
 # 555c610a. Exactly this one finding; no path or rule allowlist.
 dd3b8b1c73acc2f6ee3e9d85121ae9cd24113dc1:go/snowplow/internal/resolvers/restactions/api/stage_audit_410_test.go:generic-api-key:56
+
+# Synthetic Secret fixture (#1297 / #1301): the data606 parity test proves the bench
+# normalization keeps no Secret value, using a fake Secret whose value was the base64
+# of "secret-value" written as a literal. Not a credential. Two immutable commits carry
+# it (8e5a52f5 on bench/1297-parity-arm, 8a395c45 = the #1301 squash on
+# bench/606-gke-prep); the test now encodes the value at run time, so no later commit
+# adds it. Exactly these two findings; no path or rule allowlist.
+8e5a52f5ea5bd71627659deeb357ac97d7be47e6:go/snowplow/e2e/bench/tests/test_1297_data606_parity.py:generic-api-key:43
+8a395c45f4e591f00fcc7d1d710d4cc7c58e6385:go/snowplow/e2e/bench/tests/test_1297_data606_parity.py:generic-api-key:38
