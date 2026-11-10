@@ -116,6 +116,24 @@ the laptop's trees, every evidence directory verified against its own MANIFEST.j
 {runs,evidence}/606/; a directory the laptop already holds is never overwritten. No bucket: fetch
 needs no role beyond SSH.
 
+SELECTION. vm606 passes no `--filter` to gcloud. gcloud 561 parses `name ~ ^(a|b)$` into `name eq
+".*(^).*"` and answers an empty list with rc 0 (#1307 re-review N1, --log-http), and `labels.x=y` is
+applied client-side by matching rules gcloud says are changing: a filter can fail open. Each resource
+is read by its exact name (`describe`: NotFound is "absent", any other failure refuses), or selected by
+exact equality from one unfiltered list (the project's instances, every zone, partial-error property
+false; the enabled services).
+
+A RUN NAME IS USED ONCE. `up` refuses, before granting anything, a --run of which anything exists: its
+laptop record, an instance named or labelled for it in any zone, its firewall rules, bindings under
+its condition title; and it refuses while the orchestrator SA holds any unconditional binding (on the
+project or the node SA): between runs it holds nothing.
+
+KUBERNETES API. Whether GKE's Kubernetes-API authorizer honours an IAM condition on request.time is not
+in GKE's documentation (IAM's attribute reference: request.time "is supported for all Google Cloud
+services and resource types"; GKE's IAM page does not mention conditions). run606.sh asks right after
+the first cluster exists (kubectl auth can-i create clusterrolebindings, a SelfSubjectAccessReview the
+IAM authorizer answers) and stops by name, tearing down, when the answer is no.
+
 DOWN. Checks everything before deleting anything: the instance (if GCE has not deleted it at its
 TTL) labelled owner=snowplow-bench, run=<R> and named vm_name(R), the only one the label selects; no
 launcher running; the launch fetched (--discard-unfetched says the evidence may go); the firewall
@@ -842,11 +860,11 @@ def cmd_up(a) -> int:
     if found["uncovered"]:
         raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
     roles = list(plan(found))
-    rc, out, err = gcloud(["services", "list", "--enabled", "--project", a.project,
-                           "--filter", "config.name=iap.googleapis.com", "--format", "value(config.name)"], quiet=True)
-    if rc != 0:
+    rc, out, err = gcloud(["services", "list", "--enabled", "--project", a.project, "--format", "json"], quiet=True)
+    enabled = gke._json(out) if rc == 0 else None
+    if not isinstance(enabled, list):
         raise Refused(f"could not read whether IAP is enabled (rc={rc}; {error_summary(err)})")
-    if "iap.googleapis.com" not in out.split():
+    if "iap.googleapis.com" not in {(x.get("config") or {}).get("name") for x in enabled}:
         raise Refused(f"iap.googleapis.com is not enabled in {a.project}: the VM is reached through IAP only "
                       f"(gcloud services enable iap.googleapis.com --project {a.project})")
     rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(a.project), "--project", a.project,
@@ -855,6 +873,14 @@ def cmd_up(a) -> int:
         raise Refused(f"the orchestrator SA {sa_email(a.project)} could not be read (rc={rc}; {error_summary(err)}): "
                       f"create it (plan-iam prints the command)")
     number = _project_number(a.project)
+    used = run_in_use(run, a.project, number)
+    if used:
+        raise Refused(f"run {run} is in use: {'; '.join(used)}. `down --run {run}` removes what vm606 made; a new "
+                      f"launch takes a new --run")
+    held = unconditional_bindings(a.project, number)
+    if held:
+        raise Refused(f"{sa_email(a.project)} holds unconditional binding(s): {'; '.join(held)}. Between runs it holds "
+                      f"nothing (access expires with each run): remove them first")
     fits, refusals = vm_quota_check(a.project, a.zone)
     for msg in fits:
         _say(msg)
@@ -1397,6 +1423,23 @@ def _disk_names(inst: dict) -> list[str]:
     return sorted(str(d.get("source", "")).rsplit("/", 1)[-1] for d in inst.get("disks") or [] if d.get("source"))
 
 
+def _get(args: list[str], what: str) -> dict | None:
+    """One describe: the resource, or None when GCE answers NotFound; any other failure refuses (a
+    describe cannot fail open the way a list can)."""
+    rc, out, err = gcloud([*args, "--format", "json"], quiet=True)
+    if rc != 0:
+        if re.search(r"\bcode=404\b|HTTPError 404|was not found|notFound", err or ""):
+            return None
+        raise Refused(f"{what} could not be read (rc={rc}; {error_summary(err)}): refusing")
+    try:
+        got = json.loads(out)
+    except ValueError:
+        got = None
+    if not isinstance(got, dict):
+        raise Refused(f"{what} answered no JSON object: refusing")
+    return got
+
+
 def _list(args: list[str], what: str) -> list[dict]:
     rc, out, err = gcloud(args, env=LIST_ENV, quiet=True)
     try:
@@ -1409,18 +1452,52 @@ def _list(args: list[str], what: str) -> list[dict]:
 
 
 def _run_rules(run: str, project: str) -> list[dict]:
-    """The run's firewall rules, selected by their exact names (never a prefix: another run's rules are
-    never listed); refuses one that is not exactly what up makes."""
-    want = firewall_rules(run)
-    rows = _list(["compute", "firewall-rules", "list", "--project", project,
-                  "--filter", "name ~ ^(" + "|".join(re.escape(n) for n in sorted(want)) + ")$", "--format", "json"],
-                 f"the firewall rules of {vm_name(run)}")
-    for r in rows:
-        w = want.get(r.get("name"))
-        if w is None or r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
-            raise Refused(f"firewall rule {r.get('name')!r} is not one vm606 made for run {run} (target tags "
+    """The run's firewall rules that exist, each read by its exact name (`describe`: NotFound is
+    "absent", any other failure refuses; never a list filter, which gcloud can mis-parse into an
+    empty answer with rc 0, #1307 re-review N1); refuses one that is not exactly what up makes."""
+    rows = []
+    for fw, w in firewall_rules(run).items():
+        r = _get(["compute", "firewall-rules", "describe", fw, "--project", project], f"firewall rule {fw}")
+        if r is None:
+            continue
+        if r.get("name") != fw or r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
+            raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
                           f"{r.get('targetTags')}, description {r.get('description')!r}): refusing")
+        rows.append(r)
     return rows
+
+
+def _instances_of(run: str, project: str) -> list[dict]:
+    """Every instance of the project (all zones, one unfiltered list with the partial-error property
+    false) that is the run's by name or by its run label: selected here, by exact equality."""
+    rows = _list(["compute", "instances", "list", "--project", project, "--format", "json"],
+                 f"the instances of {project}")
+    return [i for i in rows if i.get("name") == vm_name(run) or (i.get("labels") or {}).get("run") == run]
+
+
+def run_in_use(run: str, project: str, number: str) -> list[str]:
+    """What of `run` exists anywhere: its laptop record, an instance (any zone) named or labelled for it,
+    its firewall rules, bindings under its condition title. Empty: the name is free."""
+    found = []
+    if (state_dir(run) / "state.json").exists():
+        found.append(f"its record {state_dir(run) / 'state.json'}")
+    for i in _instances_of(run, project):
+        found.append(f"instance {i.get('name')} ({str(i.get('zone', '')).rsplit('/', 1)[-1]})")
+    found += [f"firewall rule {r['name']}" for r in _run_rules(run, project)]
+    for kind, res in (("project", project), ("sa", node_sa(number))):
+        found += [f"binding {role} on {res} under {c.get('title')}"
+                  for role, c in run_bindings(_policy(kind, res, project), project, run)]
+    return found
+
+
+def unconditional_bindings(project: str, number: str) -> list[str]:
+    """Every binding the orchestrator SA holds without a condition: between runs it holds nothing."""
+    member = f"serviceAccount:{sa_email(project)}"
+    held = []
+    for kind, res in (("project", project), ("sa", node_sa(number))):
+        held += [f"{b.get('role')} on {res}" for b in _policy(kind, res, project).get("bindings") or []
+                 if member in (b.get("members") or []) and not b.get("condition")]
+    return held
 
 
 def cmd_down(a) -> int:
@@ -1434,9 +1511,7 @@ def cmd_down(a) -> int:
     disks = [name]
     if inst is not None:
         _owned(inst, run)
-        listed = _list(["compute", "instances", "list", "--project", a.project,
-                        "--filter", f"labels.owner={OWNER} AND labels.run={run}", "--format", "json"],
-                       f"the instances labelled owner={OWNER}, run={run}")
+        listed = [i for i in _instances_of(run, a.project) if (i.get("labels") or {}).get("run") == run]
         if sorted(i.get("name") for i in listed) != [name]:
             raise Refused(f"the label run={run} selects {sorted(i.get('name') for i in listed)}, not [{name}]: refusing")
         if st.get("launched_at") and not st.get("fetched") and not a.discard_unfetched:
@@ -1476,14 +1551,14 @@ def cmd_down(a) -> int:
         _say(f"DRY: would verify {name} answers NotFound, its disks {disks}, its {len(rules)} firewall rule(s) and "
              f"its {removed} grant(s) gone; nothing was deleted")
         return 0
-    flt = " OR ".join(f"name={d}" for d in disks)
-    left = _list(["compute", "disks", "list", "--project", a.project, "--filter", flt, "--format", "json"],
-                 f"{name}'s disks {disks}")
+    left = [d for d in disks if _get(["compute", "disks", "describe", d, *_where(a.project, a.zone)],
+                                      f"disk {d}") is not None]
     if left:
-        raise Refused(f"disk(s) {[d.get('name') for d in left]} remain: delete them by hand (gcloud compute disks "
-                      f"delete ... --zone {a.zone}); the pull-token file is on one of them")
-    if _run_rules(run, a.project):
-        raise Refused(f"firewall rules of {name} remain after their delete")
+        raise Refused(f"disk(s) {left} remain: delete them by hand (gcloud compute disks delete ... --zone "
+                      f"{a.zone}); the pull-token file is on one of them")
+    still = [r["name"] for r in _run_rules(run, a.project)]
+    if still:
+        raise Refused(f"firewall rule(s) {still} of {name} remain after their delete")
     _save_state(run, deleted_at=time.time())
     _say(f"{name} gone and verified: disk(s) {disks} (and with them the pull-token file), {len(rules)} firewall "
          f"rule(s), {removed} conditional grant(s) of run {run}")

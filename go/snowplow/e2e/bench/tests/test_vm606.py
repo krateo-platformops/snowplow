@@ -26,6 +26,7 @@ import pytest
 
 from bench import evidence, vm606
 from tests import fake_vm606
+from tests.test_run606_real_sequence import _calls, harness  # noqa: F401  (fixture)
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN = "run25"
@@ -69,6 +70,8 @@ def fake(tmp_path, monkeypatch, run_trees):
                (".json", ".log", ".sh")]
     for text in [*_OUTPUT, *records]:
         assert fake_vm606.IDENTITY not in text, text[-2000:]
+    # no selection through a gcloud --filter (#1307 re-review N1); the fake refuses one, and says so
+    assert not [c for c in fake_vm606.calls(Path(os.environ["FAKE_STATE"])) if "--filter" in c["argv"]]
 
 
 def _run(capsys, *argv) -> tuple[int, str, str]:
@@ -172,10 +175,8 @@ def test_up_dry_prints_grants_rules_and_the_vm_and_creates_nothing(fake, capsys)
     assert out.count("DRY-RUN: gcloud iam service-accounts add-iam-policy-binding") == 1
     assert out.count("DRY-RUN: gcloud compute firewall-rules create") == 2
     assert "nothing was created" in out
-    assert set(_verbs(fake)) == {"services list --enabled", "iam service-accounts describe",
-                                 f"projects describe {PROJECT}", "compute regions describe",
-                                 "compute instances list", "compute forwarding-rules list",
-                                 "compute addresses list"}                                 # reads only
+    assert not [v for v in _verbs(fake)
+                if re.search(r"\b(create|delete|add-iam-policy-binding|remove-iam-policy-binding)\b", v)]   # reads only
     script = (vm606.state_dir(RUN) / "startup.sh").read_text()
     assert vm606.KUBECTL_SHA256 in script and vm606.HELM_SHA256 in script and "chmod 1777 /srv/snowplow-bench" in script
     assert "google-cloud-cli=561.0.0-0 google-cloud-cli-gke-gcloud-auth-plugin=561.0.0-0" in script
@@ -208,7 +209,9 @@ def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, ca
     grants = [i for i, c in idx.items() if "add-iam-policy-binding" in c]
     reads = [i for i, c in idx.items() if "get-iam-policy" in c]
     rules = [i for i, c in idx.items() if c[:3] == ["compute", "firewall-rules", "create"]]
-    assert len(grants) == 7 and max(grants) < min(reads) < min(rules) and max(rules) < first_create
+    back = [i for i in reads if i > max(grants)]                  # the read-back, after the last grant
+    assert len(grants) == 7 and back and max(back) < min(rules) and max(rules) < first_create
+    assert min(reads) < min(grants)                               # the run's name and the SA checked first
     fw = {p.stem: json.loads(p.read_text()) for p in (fake / "firewalls").glob("*.json")}
     assert fw[f"{VM}-deny-ssh"]["sourceRanges"] == ["0.0.0.0/0"] and fw[f"{VM}-deny-ssh"]["priority"] == 1000
     assert "denied" in fw[f"{VM}-deny-ssh"]
@@ -250,9 +253,10 @@ def test_up_waits_out_a_booting_vms_ssh_and_names_the_firewall_when_it_never_ans
     assert rc == 0 and "bootstrapped" in out, err
     assert len([c for c in fake_vm606.calls(fake) if c["argv"][:2] == ["compute", "ssh"]]) == 3
     monkeypatch.setenv("FAKE_SSH_FAIL_TIMES", "1000000")
-    monkeypatch.setenv("FAKE_STATE", str(fake.parent / "gce2"))
-    rc, _out, err = _up(capsys, monkeypatch, "--ssh-ready-timeout-s", "0")
-    assert rc == 2 and "never answered in 0 s, last at firewall / sshd" in err and f"down --run {RUN}" in err
+    monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
+    rc, _out, err = _run(capsys, "up", "--run", "run26", "--ttl-hours", "15", "--yes", "--poll-s", "0",
+                         "--ssh-ready-timeout-s", "0")
+    assert rc == 2 and "never answered in 0 s, last at firewall / sshd" in err and "down --run run26" in err
 
 
 @pytest.mark.parametrize("env, why", [("FAKE_IAP_DISABLED", "iap.googleapis.com is not enabled"),
@@ -738,10 +742,12 @@ UNCONDITIONAL = {"role": "roles/compute.viewer", "members": [SA]}
 
 
 def _upped(fake, capsys, monkeypatch):
-    """After a real (fake) up: grants, rules, VM; plus another run's binding and an unconditional one."""
-    fake_vm606.put_policy(fake, f"project-{PROJECT}", [OTHER, UNCONDITIONAL])
+    """After a real (fake) up: grants, rules, VM; then another run's binding and an unconditional one
+    appear (granted by someone else after up, which refuses to start beside an unconditional one)."""
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 0, err
+    pol = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", [OTHER, UNCONDITIONAL, *pol])
 
 
 def test_down_deletes_the_vm_disk_rules_and_only_its_own_grants_and_verifies(fake, capsys, monkeypatch):
@@ -942,3 +948,90 @@ def test_two_launches_at_once_fetch_of_one_never_touches_the_other(fake, capsys,
     for n in names24:
         assert not evidence.run_dir(n).exists()
     assert all(evidence.run_dir(n).exists() for n in NAMES) and data.exists()
+
+
+# ─── #1307 re-review: selection by exact name, a run name in use, the SA between runs ──
+
+def test_down_reads_each_rule_back_and_refuses_a_delete_that_did_not_take(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    monkeypatch.setenv("FAKE_FW_DELETE_LOST", "1")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"firewall rule(s) ['{VM}-deny-ssh', '{VM}-iap-ssh'] of {VM} remain after their delete" in err
+    describes = [c["argv"][3] for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "firewall-rules", "describe"]]
+    assert {f"{VM}-deny-ssh", f"{VM}-iap-ssh"} <= set(describes)
+
+
+def _in_use(fake, how):
+    if how == "record":
+        vm606._save_state(RUN, vm=VM, created_at=time.time())
+    elif how == "instance-elsewhere":
+        fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone="europe-west1-b")
+    elif how == "rule":
+        fake_vm606.put_policy(fake, f"project-{PROJECT}", [])
+        (fake / "firewalls").mkdir(parents=True, exist_ok=True)
+        (fake / "firewalls" / f"{VM}-iap-ssh.json").write_text(json.dumps({
+            "name": f"{VM}-iap-ssh", **vm606.firewall_rules(RUN)[f"{VM}-iap-ssh"]}))
+    elif how == "binding":
+        fake_vm606.put_policy(fake, f"sa-{NODE_SA}", [{"role": "roles/iam.serviceAccountUser", "members": [SA],
+                                                     "condition": vm606.iam_condition(RUN, "2026-11-11T00:00:00Z")}])
+
+
+@pytest.mark.parametrize("how, named", [
+    ("record", "its record"), ("instance-elsewhere", f"instance {VM} (europe-west1-b)"),
+    ("rule", f"firewall rule {VM}-iap-ssh"), ("binding", "binding roles/iam.serviceAccountUser on " + NODE_SA),
+])
+def test_up_refuses_a_run_name_in_use_before_granting_anything(fake, capsys, monkeypatch, how, named):
+    _in_use(fake, how)
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and f"run {RUN} is in use: " in err and named in err and f"`down --run {RUN}`" in err
+    assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
+
+
+@pytest.mark.parametrize("key", [f"project-{PROJECT}", f"sa-{NODE_SA}"])
+def test_up_refuses_while_the_sa_holds_an_unconditional_binding(fake, capsys, monkeypatch, key):
+    fake_vm606.put_policy(fake, key, [{"role": "roles/compute.viewer", "members": [SA]}])
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and "holds unconditional binding(s): roles/compute.viewer on" in err
+    assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
+
+
+def test_prefix_colliding_runs_down_of_run2_never_touches_run25(fake, capsys, monkeypatch):
+    """run2 is a prefix of run25: titles, members and rule names are matched exactly, never by prefix."""
+    monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
+    for run in ("run25", "run2"):
+        rc, _out, err = _run(capsys, "up", "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0")
+        assert rc == 0, err
+    other = {"role": "roles/compute.viewer", "members": ["serviceAccount:someone-else@example.invalid"],
+             "condition": vm606.iam_condition("run2", "2026-11-11T00:00:00Z")}
+    pol = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] + [other]
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", pol)
+
+    def run25_view():
+        return ((fake / "instances" / f"{VM}.json").read_text(),
+                sorted(p.name for p in (fake / "firewalls").glob(f"{VM}-*.json")),
+                [b for k in (f"project-{PROJECT}", f"sa-{NODE_SA}") for b in fake_vm606.policy(fake, k)["bindings"]
+                 if b.get("condition", {}).get("title") == "snowplow-bench-run25"])
+    before = run25_view()
+    assert len(before[1]) == 2 and len(before[2]) == 7
+    rc, out, err = _run(capsys, "down", "--run", "run2", "--yes")
+    assert rc == 0, err
+    assert "2 firewall rule(s), 7 conditional grant(s) of run run2" in out
+    assert run25_view() == before
+    assert other in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]          # another member's: kept
+    assert not (fake / "instances" / "snowplow-bench-orch-run2.json").exists()
+
+
+def test_run606_stops_named_when_the_kubernetes_api_refuses_the_orchestrator(harness):  # noqa: F811
+    """#1307 L7: right after the first cluster exists, one SelfSubjectAccessReview; "no" stops the run with
+    the cause named, before anything is installed, and the cluster is torn down."""
+    env, state, _ambient, _tmp = harness
+    env["FAKE_K8S_AUTHZ"] = "no"
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=600)
+    out = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert "the orchestrator SA's conditional container.admin is not honoured by the Kubernetes API" in out
+    assert "=== step psi ===" not in out and "=== step install ===" not in out
+    calls = _calls(state)
+    assert any(c["tool"] == "kubectl" and "can-i" in c["argv"] for c in calls)
+    assert not any(c["tool"] == "helm" and "install" in c["argv"] for c in calls)
+    assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)

@@ -9,13 +9,20 @@ outcome:
   - `compute instances create` records the argv and makes the instance (labels, tags, scheduling
     terminationTime, a boot disk named after it) and its disk; FAKE_BOOTSTRAP (JSON) is written as
     the VM's bootstrap marker at create, as the startup script would;
-  - `compute instances describe` / `firewall-rules describe`: the resource, or gcloud's 404 (which
-    names the account);
-  - `compute instances | disks | firewall-rules list` (--filter on labels / names): a list whose
-    requests fail (FAKE_LIST_FAILS=1) exits 0 with "[]" and a WARNING unless the call's environment
-    sets CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, then rc 1 (#1172 B3, tests/fake_region.py);
+  - `compute instances | disks describe NAME --zone Z` / `firewall-rules describe NAME`: the resource
+    (an instance or a disk only in its own zone, as GCE answers), or gcloud's 404 (which names the
+    account);
+  - NO `--filter`: any call that passes one exits 2. gcloud 561's filter parser turns
+    `name ~ ^(a|b)$` into `name eq ".*(^).*"` and answers an empty list with rc 0 (#1307 re-review N1,
+    --log-http), and `labels.x=y` is applied client-side with matching rules that are changing; a fake
+    that applied its own reading of a filter would model the outcome, not gcloud. vm606 selects by
+    describe or by exact equality on an unfiltered list;
+  - `compute instances list` (unfiltered, every zone): a list whose requests fail (FAKE_LIST_FAILS=1)
+    exits 0 with "[]" and a WARNING unless the call's environment sets
+    CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, then rc 1 (#1172 B3, tests/fake_region.py);
   - `compute instances delete --delete-disks all`: the instance and its disk go (FAKE_KEEP_DISKS=1
-    keeps the disk); `firewall-rules create / delete`;
+    keeps the disk); `firewall-rules create / delete` (FAKE_FW_DELETE_LOST=1: the delete answers rc 0
+    and the rule stays);
   - `projects | iam service-accounts get-iam-policy / add-iam-policy-binding /
     remove-iam-policy-binding` with --condition-from-file: a v3 policy per resource; a remove matches
     the condition exactly, as gcloud does. FAKE_IAM_LOST_WRITE=<role>: an add or a remove of that role
@@ -30,8 +37,9 @@ outcome:
     scp: copying is its job) and the source's mode kept, as scp does for a new file;
     FAKE_SCP_CORRUPT=<basename> flips the last byte of a file of that name in transit; FAKE_SCP_MODE
     (octal) is the mode the copy gets instead of the source's;
-  - `projects describe`, `services list --enabled`, `iam service-accounts describe`: the project
-    number, IAP enabled unless FAKE_IAP_DISABLED=1, the SA unless FAKE_NO_SA=1;
+  - `projects describe`, `services list --enabled --format json`, `iam service-accounts describe`: the
+    project number, the enabled services (IAP among them unless FAKE_IAP_DISABLED=1), the SA unless
+    FAKE_NO_SA=1;
   - `compute regions describe REGION`: tests/fake_region.py's quotas (FAKE_LIMIT_<METRIC> steers a
     limit); `compute forwarding-rules | addresses list`: none. An instance carries its zone and one
     external IP (natIP), as GCE lists an instance with an ephemeral external IP.
@@ -86,6 +94,11 @@ def failed_list(kind):
     print("[]"); sys.stderr.write(f"WARNING: Some requests did not succeed.\n{why}"); sys.exit(0)
 def notfound(kind, where, name):
     sys.stderr.write(ACCOUNT_404.format(kind=kind, where=where, name=name)); sys.exit(1)
+def in_zone(doc):
+    return doc is not None and str(doc.get("zone", "")).endswith("/zones/" + str(opt("--zone")))
+if "--filter" in a:
+    sys.stderr.write("fake gcloud: --filter is not modelled (gcloud can mis-parse one into an empty answer, rc 0)\n")
+    sys.exit(2)
 API = "https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/europe-west4-a"
 APIP = "https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io"
 # ── project, services, SA, region ──
@@ -96,9 +109,10 @@ if a[:2] == ["compute", "forwarding-rules"] or a[:2] == ["compute", "addresses"]
 if a[:2] == ["projects", "describe"]:
     print(os.environ.get("FAKE_PROJECT_NUMBER", "357378285144")); sys.exit(0)
 if a[:3] == ["services", "list", "--enabled"]:
+    names = ["compute.googleapis.com", "container.googleapis.com"]
     if os.environ.get("FAKE_IAP_DISABLED") != "1":
-        print("iap.googleapis.com")
-    sys.exit(0)
+        names.append("iap.googleapis.com")
+    print(json.dumps([{"config": {"name": n}, "state": "ENABLED"} for n in names])); sys.exit(0)
 if a[:3] == ["iam", "service-accounts", "describe"]:
     if os.environ.get("FAKE_NO_SA") == "1":
         sys.stderr.write("ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account\n"); sys.exit(1)
@@ -150,15 +164,17 @@ if a[:3] == ["compute", "firewall-rules", "create"]:
         "description": opt("--description"), "network": opt("--network"),
         ("denied" if opt("--action") == "DENY" else "allowed"): [{"IPProtocol": "tcp", "ports": ["22"]}]}))
     sys.exit(0)
-if a[:3] == ["compute", "firewall-rules", "list"]:
-    failed_list("firewalls")
-    m = re.search(r"name\s*~\s*(\S+)", opt("--filter") or "")
-    rows = [json.loads(p.read_text()) for p in sorted((st / "firewalls").glob("*.json"))]
-    print(json.dumps([r for r in rows if not m or re.search(m.group(1), r["name"])])); sys.exit(0)
+if a[:3] == ["compute", "firewall-rules", "describe"]:
+    d = load("firewalls", a[3])
+    if d is None:
+        notfound("firewall-rules", "global/firewalls", a[3])
+    print(json.dumps(d)); sys.exit(0)
 if a[:3] == ["compute", "firewall-rules", "delete"]:
     if not load("firewalls", a[3]):
         notfound("firewall-rules", "global/firewalls", a[3])
-    (st / "firewalls" / f"{a[3]}.json").unlink(); sys.exit(0)
+    if os.environ.get("FAKE_FW_DELETE_LOST") != "1":
+        (st / "firewalls" / f"{a[3]}.json").unlink()
+    sys.exit(0)
 # ── instances, disks ──
 if a[:3] == ["compute", "instances", "create"]:
     name = a[3]
@@ -171,7 +187,7 @@ if a[:3] == ["compute", "instances", "create"]:
                           "instanceTerminationAction": opt("--instance-termination-action")},
            "disks": [{"boot": True, "autoDelete": True, "source": f"{API}/disks/{name}"}]}
     (st / "instances" / f"{name}.json").write_text(json.dumps(doc))
-    (st / "disks" / f"{name}.json").write_text("{}")
+    (st / "disks" / f"{name}.json").write_text(json.dumps({"name": name, "zone": doc["zone"]}))
     (vm(name) / "home" / IDENTITY).mkdir(parents=True, exist_ok=True)
     (vm(name) / "srv").mkdir(parents=True, exist_ok=True)
     if os.environ.get("FAKE_BOOTSTRAP"):
@@ -181,22 +197,21 @@ if a[:3] == ["compute", "instances", "create"]:
     sys.exit(0)
 if a[:3] == ["compute", "instances", "describe"]:
     d = load("instances", a[3])
-    if d is None:
-        notfound("instances", "zones/europe-west4-a/instances", a[3])
+    if not in_zone(d):
+        notfound("instances", f"zones/{opt('--zone')}/instances", a[3])
+    print(json.dumps(d)); sys.exit(0)
+if a[:3] == ["compute", "disks", "describe"]:
+    d = load("disks", a[3])
+    if not in_zone(d):
+        notfound("disks", f"zones/{opt('--zone')}/disks", a[3])
     print(json.dumps(d)); sys.exit(0)
 if a[:3] == ["compute", "instances", "list"]:
     failed_list("instances")
-    want = dict(re.findall(r"labels\.([a-z-]+)=([A-Za-z0-9_-]+)", opt("--filter") or ""))
-    rows = [json.loads(p.read_text()) for p in sorted((st / "instances").glob("*.json"))]
-    print(json.dumps([r for r in rows if all(r.get("labels", {}).get(k) == v for k, v in want.items())])); sys.exit(0)
-if a[:3] == ["compute", "disks", "list"]:
-    failed_list("disks")
-    names = re.findall(r"name=([a-z0-9-]+)", opt("--filter") or "")
-    print(json.dumps([{"name": p.stem} for p in sorted((st / "disks").glob("*.json")) if p.stem in names])); sys.exit(0)
+    print(json.dumps([json.loads(p.read_text()) for p in sorted((st / "instances").glob("*.json"))])); sys.exit(0)
 if a[:3] == ["compute", "instances", "delete"]:
     name = a[3]
-    if load("instances", name) is None:
-        notfound("instances", "zones/europe-west4-a/instances", name)
+    if not in_zone(load("instances", name)):
+        notfound("instances", f"zones/{opt('--zone')}/instances", name)
     (st / "instances" / f"{name}.json").unlink()
     if opt("--delete-disks") == "all" and os.environ.get("FAKE_KEEP_DISKS") != "1":
         (st / "disks" / f"{name}.json").unlink()
@@ -280,7 +295,8 @@ def put_instance(state: Path, name: str, labels: dict, termination_time: str, zo
                                                                             "natIP": "34.90.0.9"}]}],
         "scheduling": {"terminationTime": termination_time, "instanceTerminationAction": "DELETE"},
         "disks": [{"boot": True, "autoDelete": True, "source": f"{api}/disks/{name}"}]}))
-    (state / "disks" / f"{name}.json").write_text("{}")
+    (state / "disks" / f"{name}.json").write_text(json.dumps({
+        "name": name, "zone": f"https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/{zone}"}))
     (state / "vm" / name / "home" / IDENTITY).mkdir(parents=True, exist_ok=True)
     srv = state / "vm" / name / "srv"
     srv.mkdir(parents=True, exist_ok=True)

@@ -198,6 +198,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     if os.environ.get("FAKE_VERDICT_LOST") == "1" and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
         os.remove(_vj)
     port = os.environ["FAKE_PORT"]
+    if a[:2] == ["auth", "can-i"]:
+        # #1307 L7: GKE's IAM authorizer's answer to the orchestrator's SelfSubjectAccessReview;
+        # FAKE_K8S_AUTHZ=no: the conditional container.admin is not honoured (kubectl: "no", rc 1)
+        ans = os.environ.get("FAKE_K8S_AUTHZ", "yes")
+        print(ans); sys.exit(0 if ans == "yes" else 1)
     if a[:3] == ["create", "secret", "generic"]:
         # the ghcr pull Secret and the image-pull Secret: their values come on stdin
         with open(os.path.join(STATE, "created-secrets.jsonl"), "a") as fh:
