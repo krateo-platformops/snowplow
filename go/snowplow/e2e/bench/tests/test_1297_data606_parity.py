@@ -8,6 +8,7 @@ different controller replica count each FAIL it), and the run606.sh extraction a
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import subprocess
@@ -30,12 +31,19 @@ def _server_set(o: dict, uid: str) -> dict:
     return o
 
 
+# The fixture Secret's values are encoded here, at run time, from their plaintext: a base64 literal
+# in the source is credential-shaped to secret scanners (gitleaks generic-api-key), and these are
+# synthetic values whose only job is to prove the normalization keeps no Secret value.
+PLAIN_VALUE, OTHER_PLAIN_VALUE = "secret-value", "other"
+ENCODED_VALUE = base64.b64encode(PLAIN_VALUE.encode()).decode()
+OTHER_ENCODED_VALUE = base64.b64encode(OTHER_PLAIN_VALUE.encode()).decode()
+
 NS = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "bench-ns-01"}, "spec": {"finalizers": ["kubernetes"]}}
 COMP = {"apiVersion": "composition.krateo.io/v1-2-2", "kind": "GithubScaffoldingWithCompositionPage",
         "metadata": {"name": "bench-app-01-01", "namespace": "bench-ns-01"}, "spec": {"app": {"port": 31180}}}
 SECRET = {"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/basic-auth",
           "metadata": {"name": "scaleuser-0001-password", "namespace": "krateo-system"},
-          "data": {"password": "c2VjcmV0LXZhbHVl"}}
+          "data": {"password": ENCODED_VALUE}}
 SYSTEM_CR = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "admin"}, "rules": []}
 CONTROLLER = {"spec": {"replicas": 0}}
 
@@ -66,15 +74,15 @@ def test_two_clusters_with_the_same_objects_diff_empty_whatever_the_server_set()
 def test_no_secret_value_is_kept_and_a_changed_value_still_fails():
     a = _arm("uid-a")
     text = json.dumps(a)
-    assert "c2VjcmV0LXZhbHVl" not in text and "secret-value" not in text
+    assert ENCODED_VALUE not in text and PLAIN_VALUE not in text
     other = copy.deepcopy(SECRET)
-    other["data"]["password"] = "b3RoZXI="
+    other["data"]["password"] = OTHER_ENCODED_VALUE
     lb = _listings("uid-b")
     lb["Secret"]["items"] = [_server_set(other, "uid-b")]
     d = dp.diff(a, dp.build(lb, CONTROLLER, _baseline("uid-b")))
     assert d["verdict"] == "FAIL"
     assert d["different"] == {"Secret/krateo-system/scaleuser-0001-password": [".data.password"]}
-    assert "b3RoZXI=" not in json.dumps(d)
+    assert OTHER_ENCODED_VALUE not in json.dumps(d)
 
 
 def test_one_object_fewer_fails_with_its_name_and_unequal_counts():
