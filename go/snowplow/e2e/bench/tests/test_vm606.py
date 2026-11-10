@@ -62,7 +62,8 @@ def fake(tmp_path, monkeypatch, run_trees):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "laptop-data"))
     for k in ("FAKE_BOOTSTRAP", "FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_NO_SA",
               "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES", "FAKE_SCP_CORRUPT", "FAKE_SCP_MODE", "FAKE_TAMPER_AFTER_SSH",
-              "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES"):
+              "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
+              "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -1035,3 +1036,12 @@ def test_run606_stops_named_when_the_kubernetes_api_refuses_the_orchestrator(har
     assert any(c["tool"] == "kubectl" and "can-i" in c["argv"] for c in calls)
     assert not any(c["tool"] == "helm" and "install" in c["argv"] for c in calls)
     assert any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "delete"] for c in calls)
+
+
+def test_a_describe_that_fails_otherwise_than_notfound_refuses_never_reads_as_absent(fake, capsys, monkeypatch):
+    """A 503 is not "the rule is gone": down refuses before deleting anything, and up before granting."""
+    _upped(fake, capsys, monkeypatch)
+    monkeypatch.setenv("FAKE_FW_DESCRIBE_503", "1")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"firewall rule {VM}-deny-ssh could not be read (rc=1; ResponseError: code=503)" in err
+    assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
