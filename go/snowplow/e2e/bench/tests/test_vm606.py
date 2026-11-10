@@ -757,6 +757,14 @@ def test_down_deletes_the_vm_disk_rules_and_only_its_own_grants_and_verifies(fak
     assert lists and all(c["partial_error"] == "false" for c in lists)
 
 
+def test_down_reads_the_grants_back_after_removing_them(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    monkeypatch.setenv("FAKE_IAM_LOST_WRITE", "roles/cloudquotas.viewer")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and "bindings of run run25 are still held after their removal" in err
+    assert "roles/cloudquotas.viewer" in err
+
+
 def test_down_after_the_vms_ttl_still_removes_its_rules_and_grants(fake, capsys, monkeypatch):
     _upped(fake, capsys, monkeypatch)
     (fake / "instances" / f"{VM}.json").unlink()            # GCE deleted it at --termination-time
@@ -861,7 +869,8 @@ def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, 
     assert {c["argv"][1] for c in lists} == {"instances", "forwarding-rules", "addresses"}
     assert all(c["partial_error"] == "false" for c in lists)
     monkeypatch.setenv("FAKE_LIMIT_E2_CPUS", "4")
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes")
+    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0",
+                         "--ssh-ready-timeout-s", "1", "--bootstrap-timeout-s", "1")
     assert rc == 2 and "the VM does not fit europe-west4's quotas: E2_CPUS" in err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
 

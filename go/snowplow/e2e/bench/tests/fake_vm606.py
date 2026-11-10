@@ -18,8 +18,8 @@ outcome:
     keeps the disk); `firewall-rules create / delete`;
   - `projects | iam service-accounts get-iam-policy / add-iam-policy-binding /
     remove-iam-policy-binding` with --condition-from-file: a v3 policy per resource; a remove matches
-    the condition exactly, as gcloud does. FAKE_IAM_LOST_WRITE=<role>: the add of that role answers
-    rc 0 and is lost (another writer's set-policy replaced it);
+    the condition exactly, as gcloud does. FAKE_IAM_LOST_WRITE=<role>: an add or a remove of that role
+    answers rc 0 and is lost (another writer's set-policy replaced it);
   - `compute ssh NAME ... --command CMD`: CMD runs under bash, the script on its stdin, with the
     VM's environment only (HOME = the identity-shaped home, the test's PATH), in a session of its
     own that is hung up (SIGHUP, then SIGTERM to its process group) when the command ends, as sshd
@@ -119,7 +119,7 @@ if iam:
     cond = json.loads(Path(opt("--condition-from-file")).read_text()) if opt("--condition-from-file") else None
     if cond is not None:
         cond = {k: cond[k] for k in ("title", "expression", "description") if k in cond}
-    if verb == "add-iam-policy-binding" and os.environ.get("FAKE_IAM_LOST_WRITE") == role:
+    if verb != "get-iam-policy" and os.environ.get("FAKE_IAM_LOST_WRITE") == role:
         print(json.dumps(pol)); sys.exit(0)          # answered, then lost to a concurrent policy write
     if verb == "add-iam-policy-binding":
         for b in pol["bindings"]:
