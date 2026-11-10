@@ -135,7 +135,11 @@ def test_every_gcloud_create_in_the_bench_is_one_the_footprint_reads():
         text = f.read_text()
         found |= {(f.name, *m.groups()) for m in py.finditer(text)}
         found |= {(f.name, *m.groups()) for m in sh.finditer(text)}
-    assert found == {("gke.py", "container", "clusters", "create"), ("gke.py", "container", "node-pools", "create")}
+    # bench/vm606.py's plan-iam PRINTS the orchestrator SA's create for a human (never run; an SA uses no
+    # regional quota). Its VM (`compute instances create`, an argv without "gcloud" beside it) exists
+    # before the launch, so the run's pre-check reads its share as usage, never as footprint.
+    assert found == {("gke.py", "container", "clusters", "create"), ("gke.py", "container", "node-pools", "create"),
+                     ("vm606.py", "iam", "service-accounts", "create")}
     # and those are exactly the argv create_commands builds (credentials is a read)
     made = {tuple(a[1:4]) for a in gke.create_commands(gke.default_spec(NAME))}
     assert made == {("container", "clusters", "create"), ("container", "node-pools", "create"),

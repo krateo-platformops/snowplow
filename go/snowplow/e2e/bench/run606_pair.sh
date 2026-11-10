@@ -20,6 +20,9 @@
 # `tail -f <LOG>` (and PAIR_OUT/pair.log); stop it with
 # `kill -TERM "$(cat <PIDFILE>)"`, which stops every run below, each tearing
 # its own cluster down. A BENCH_606_DRY_RUN=1 pass needs no detaching.
+# From a disposable GCE VM instead of the laptop (Diego 2026-11-10): bench/vm606.py creates the VM
+# as the orchestrator service account, copies the pull token, and runs this same detached launch
+# there at one bench commit (`python3 -m bench.vm606 --help`; its module doc is the procedure).
 #
 # RUNS  (default "A B"): the runs' labels, each [A-Z][A-Z0-9]*, two or more.
 # PAIRS (default "A:B"): the comparisons, each BASELINE:CANDIDATE, both labels
