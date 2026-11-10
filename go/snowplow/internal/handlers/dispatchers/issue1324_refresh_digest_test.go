@@ -131,6 +131,15 @@ func d1324Held(t *testing.T, ctx context.Context, shell []byte) string {
 }
 
 func TestIssue1324_D2_TwoIdentitiesOneKeyOnlyTheBehindOneCatchesUp(t *testing.T) {
+	// The RBAC change below moves process-wide RBAC state (the sub-gen and the
+	// bindings index); reset it after, as the #819 arms do, so no later test
+	// inherits it.
+	resetRBAC := func() {
+		cache.ResetBindingsByGVRIndexForTest()
+		cache.ResetRBACSubGenForTest()
+	}
+	resetRBAC()
+	t.Cleanup(resetRBAC)
 	dyn := h1BuildWatcherWithRA(t)
 	store := cache.ResolvedCache()
 	const key = "wc-1324-shared"
