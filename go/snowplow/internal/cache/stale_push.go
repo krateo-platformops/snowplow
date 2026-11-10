@@ -359,7 +359,7 @@ func servedBytesOf(e *ResolvedEntry) []byte {
 	if e == nil || e.listCell != nil {
 		return nil
 	}
-	return e.RawJSON
+	return e.Raw() // the plain branch: the stored body itself
 }
 
 // settleLateOpen catches the Put that landed between a hit's read and its

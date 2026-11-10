@@ -72,7 +72,7 @@ func isStaleRerun(req *http.Request) bool {
 // serve opens). armed is whether this hit stamped the refresh-key header.
 func staleHitWritePoint(ctx context.Context, key string, entry *cache.ResolvedEntry, armed bool) {
 	if entry != nil && entry.StaleDerived {
-		cache.MarkStaleOwed(key, entry.RawJSON) // #1321: the body this hit writes
+		cache.MarkStaleOwed(key, entry.Raw()) // #1321: the body this hit writes
 	}
 	if armed {
 		cache.NoteStaleHit(ctx, key, entry, staleSubjectOf)
