@@ -28,6 +28,14 @@
 // caller's page budget and context bound only its own wait, and each caller
 // records its own stage and audit outcome.
 //
+// IT RUNS TO ITS DEADLINE EVEN AFTER ITS LAST WAITER LEAVES — by design, the
+// ruling's purpose. Under load every page is cut at its 10 s budget; cancelling
+// the call when its last waiter left would recreate the 057 storm (each cut
+// abandons the call and the next page starts over from zero). Kept running, the
+// next page joins a call already most of the way done. Its only bound is the
+// server write deadline (cache.DemandRevalidationDeadline). A client disconnect
+// therefore ends that caller's wait, never the call (inline443 h_ClientCancel).
+//
 // WHAT IS MEMOISED: the conversion of the bytes just received. key =
 // sha256(conversion mode ‖ raw bytes) → toJSONBytes' output for them. The
 // conversion is a pure function of (mode, bytes), so a hit is byte-identical to

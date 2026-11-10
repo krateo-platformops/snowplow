@@ -34,7 +34,10 @@
 // page budget: a page cut at 10 s gets its own budget error (504 Timeout,
 // exhausted_connect or exhausted_answer by how far the shared call had got)
 // and stops waiting; the call keeps running for the others. A caller whose
-// request is cancelled cannot fail anyone else.
+// request is cancelled cannot fail anyone else. The call is NOT cancelled when
+// its last waiter leaves: it runs to completion or to the write deadline, so
+// the next page joins a call already under way instead of starting over (see
+// external_fetch_cache.go, "IT RUNS TO ITS DEADLINE").
 //
 // THE FRESHNESS CONTRACT (external_fetch_cache.go). A read joins only while
 // the call is in flight AND before its first response byte arrives: the call
