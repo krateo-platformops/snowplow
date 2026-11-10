@@ -118,6 +118,10 @@ func snowplowCORSOptions() cors.Options {
 			// /call. The SPA ignores it; a browser-side reader (the bench's
 			// Chrome driver) needs it exposed like the refresh key.
 			dispatchers.ServeOutcomeHeader,
+			// #1324 — the digest of the bytes an armed /call wrote: the SPA
+			// echoes it as `held` when it arms, so a tab that missed a frame
+			// gets one catch-up frame (docs/howto-frontend-refresh-digest-catch-up.md).
+			dispatchers.RefreshDigestHeader,
 		},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers

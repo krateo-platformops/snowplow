@@ -294,6 +294,13 @@ The consequence for the SPA is a contract, not an optimisation:
 > After a stream drops and reconnects, the client MUST re-fetch every armed widget once. Nothing
 > else will tell it what changed while it was away.
 
+**#1324: the arm/disarm re-opens and the /call→arm window.** These are not drops, so the rule
+above does not re-validate them. A frame published while the stream was being re-opened, or
+before a new widget's key was armed, would otherwise be lost. Echo each widget's
+`X-Snowplow-Refresh-Digest` as `held` when arming, and snowplow sends one frame for every key the
+tab is behind on, and none for the rest. See
+[howto-frontend-refresh-digest-catch-up.md](howto-frontend-refresh-digest-catch-up.md).
+
 Three properties that recovery must have, and why each is load-bearing:
 
 1. **Gate on CAUSE, not on "is this the first connect".** Arming and disarming abort and re-open

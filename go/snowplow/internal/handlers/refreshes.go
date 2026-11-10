@@ -110,6 +110,12 @@ type subRequest struct {
 	PerPage   int            `json:"perPage"`
 	Page      int            `json:"page"`
 	Extras    map[string]any `json:"extras"`
+	// Held (#1324, optional) is the X-Snowplow-Refresh-Digest the tab's /call
+	// for this widget answered with: what the tab HOLDS. On subscribe a key
+	// whose current served digest differs (or whose cell is gone) gets one
+	// catch-up frame. Absent or "" means no catch-up (today's behaviour). It
+	// is never part of the key derivation.
+	Held string `json:"held,omitempty"`
 }
 
 // Refreshes returns the GET /refreshes SSE handler. It takes no verification
@@ -155,7 +161,7 @@ func Refreshes() http.HandlerFunc {
 		// #819: take the class signal BEFORE deriving, so a class move during
 		// the derivation is re-checked at the first loop turn.
 		classMoved := cache.IdentityClassesMayHaveMoved()
-		armed, rotation, derr := validateSubscription(req)
+		armed, rotation, held, derr := validateSubscription(req)
 		if derr != nil {
 			// #560 — an arrival snowplow refused ITSELF. On the measured
 			// deployment this stays 0 while the ingress cliff (~22 widgets) sits
@@ -271,6 +277,19 @@ func Refreshes() http.HandlerFunc {
 			slog.String("subsystem", "cache"),
 			slog.Int("armed_keys", len(armed)),
 		)
+
+		// #1324 — the arm catch-up: /refreshes keeps no replay, so a frame
+		// published while this tab's key was not armed (between its /call and
+		// this arm, or while the SPA re-opened its stream on a mount/unmount)
+		// reached nobody. Every key whose `held` digest is not the digest of
+		// what its /call would answer NOW for this identity, or whose cell is
+		// gone, gets exactly one frame, at once. Checked AFTER subscribing, so
+		// a change landing during the check is either seen here or published
+		// to this stream (the pending set absorbs a double offer).
+		cache.NoteRefreshArmHeld(len(held))
+		if behind := dispatchers.BehindKeys(req.Context(), held); len(behind) > 0 && stream.CatchUp != nil {
+			stream.CatchUp(behind)
+		}
 
 		// #819: only a connection with an identity-bound key can rotate; a
 		// nil channel never fires.
@@ -466,21 +485,21 @@ func readSubscriptionPayload(req *http.Request) ([]byte, error) {
 // validateSubscription (see the comment above readSubscriptionPayload) also
 // returns, since #819, the rotation tracker holding the class each
 // identity-bound armed key was derived under.
-func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, error) {
+func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, map[string]dispatchers.HeldDigests, error) {
 	decoded, err := readSubscriptionPayload(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var reqs []subRequest
 	if err := json.Unmarshal(decoded, &reqs); err != nil {
-		return nil, nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
+		return nil, nil, nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
 	}
 	if len(reqs) == 0 {
-		return nil, nil, fmt.Errorf("'sub' payload is an empty array")
+		return nil, nil, nil, fmt.Errorf("'sub' payload is an empty array")
 	}
 	if len(reqs) > refreshSubMaxEntries {
-		return nil, nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
+		return nil, nil, nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
 	}
 
 	// #101: the /refreshes arming reads MUST be informer-only. The route is
@@ -492,6 +511,8 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 
 	rotation := dispatchers.NewSubscriptionRotationTracker(armCtx)
 	armed := make(map[string]struct{}, len(reqs))
+	// #1324 — the digests the tab holds, per armed key (only non-empty ones).
+	held := map[string]dispatchers.HeldDigests{}
 	var skippedInformerMiss, skippedOther int
 	for _, s := range reqs {
 		key, ok, reason := rotation.Derive(armCtx, dispatchers.SubscriptionCoordinates{
@@ -516,6 +537,12 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 			continue
 		}
 		armed[key] = struct{}{}
+		if s.Held != "" { // absent or "" — no catch-up for this coordinate
+			h := held[key]
+			h.Class = s.Class
+			h.Digests = append(h.Digests, s.Held)
+			held[key] = h
+		}
 	}
 
 	// #101 ARM condition: per-subscription INFO summary REPLACING the per-coord
@@ -531,7 +558,7 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 		slog.Int("skipped_informer_miss", skippedInformerMiss),
 		slog.Int("skipped_other", skippedOther),
 	)
-	return armed, rotation, nil
+	return armed, rotation, held, nil
 }
 
 // writeRefreshFrame writes k's refresh frame and, only when the write
