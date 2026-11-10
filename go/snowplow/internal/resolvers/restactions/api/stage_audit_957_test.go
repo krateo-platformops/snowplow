@@ -24,6 +24,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 const (
@@ -209,7 +210,7 @@ func TestStageAudit957_Fb_StageSite_FailureWithBody_RecordsNone(t *testing.T) {
 	apiCall := stage410("update", http.MethodPut, base957+"/demo")
 	body := []byte(object957("4", "502", ""))
 
-	for _, a := range []*dialAnswer{{code: http.StatusConflict}, {code: http.StatusInternalServerError}, {}} {
+	for _, a := range []*credhttp.Answer{answer410(http.StatusConflict), answer410(http.StatusInternalServerError), answer410(0)} {
 		auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, a, body)
 	}
 	got := attrs410(rec)
@@ -224,7 +225,7 @@ func TestStageAudit957_Fb_StageSite_FailureWithBody_RecordsNone(t *testing.T) {
 	}
 
 	rec2 := records410(t)
-	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, &dialAnswer{code: http.StatusOK}, body)
+	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, answer410(http.StatusOK), body)
 	got2 := attrs410(rec2)
 	if len(got2) != 1 {
 		t.Fatalf("control: records = %d, want 1", len(got2))

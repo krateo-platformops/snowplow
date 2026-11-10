@@ -36,6 +36,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"go.opentelemetry.io/otel/log/logtest"
 	corev1 "k8s.io/api/core/v1"
@@ -80,6 +81,11 @@ func upstream410(t *testing.T) (*httptest.Server, func() []dial410) {
 			return
 		case strings.HasSuffix(r.URL.Path, "/nocontent"):
 			w.WriteHeader(http.StatusNoContent)
+			return
+		case strings.HasSuffix(r.URL.Path, "/redirect"):
+			// To another origin: the stage never sends that hop (#1106).
+			w.Header().Set("Location", "http://elsewhere.invalid/x")
+			w.WriteHeader(http.StatusFound)
 			return
 		case strings.HasSuffix(r.URL.Path, "/html"):
 			w.Header().Set("Content-Type", "text/html")
@@ -354,7 +360,10 @@ func TestAudit410_E_OutcomeIsWhatTheAuthorityAnswered(t *testing.T) {
 	}{
 		{"201 created", "/things/created", "success", "201", ""},
 		{"204 no content", "/things/nocontent", "success", "204", ""},
-		{"2xx body not convertible", "/things/html", "success", "200", dialNoteBodyUnconvertible},
+		{"2xx body not convertible", "/things/html", "success", "200", audit.NoteBodyUnconvertible},
+		// #1298 review — a 3xx is the redirect snowplow refused to follow: the
+		// observed code, worded as what snowplow did.
+		{"3xx refused redirect", "/things/redirect", "failure", "302", "snowplow refused to follow a 302 Found redirect"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -401,6 +410,29 @@ func TestAudit410_E_OutcomeIsWhatTheAuthorityAnswered(t *testing.T) {
 			t.Errorf("record body = %q", b)
 		}
 	})
+
+	// #1298 review — the stage observes at the same place as /call (credhttp
+	// Send): a dial snowplow's destination policy refused was never sent, so it
+	// carries no status code and says so, never "upstream answered".
+	t.Run("refused destination", func(t *testing.T) {
+		api, _ := upstream410(t)
+		env410(t, api.URL, "http://169.254.169.254") // link-local: refused in the dialer
+		rec := records410(t)
+
+		resolve410(ctxWithUser(user410, group410), api.URL, extStage410("w", http.MethodPost, "/things"))
+
+		got := attrs410(rec)
+		if len(got) != 1 {
+			t.Fatalf("records = %d, want 1: %v", len(got), got)
+		}
+		wantAttrs410(t, got[0], map[string]string{"outcome": "failure"})
+		if v, ok := got[0]["http.response.status_code"]; ok {
+			t.Errorf("RED #1298: a refused destination got no answer, but the record carries status code %q", v)
+		}
+		if b := bodies410(rec); len(b) != 1 || b[0] != audit.MessageDestinationRefused {
+			t.Errorf("RED #1298: record body = %q, want %q", b, audit.MessageDestinationRefused)
+		}
+	})
 }
 
 // C3 — a write under a background driver (a reconcile: no requester) is never
@@ -444,7 +476,7 @@ func TestAudit410_C3_BackgroundDriverWrite_EmitsNoRecord(t *testing.T) {
 func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 	rec := records410(t)
 	call := httpcallOpts410(http.MethodPost, "/render", "https://render.example")
-	res := &dialAnswer{code: http.StatusOK}
+	res := answer410(http.StatusOK)
 	apiCall := extStage410("render", http.MethodPost, "/render")
 
 	before := audit.IncompleteCount(audit.IncompleteActor)
@@ -470,7 +502,7 @@ func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 func TestAudit410_C3e_StageSite_BackgroundDriver_NoRecord(t *testing.T) {
 	rec := records410(t)
 	call := httpcallOpts410(http.MethodPost, "/render", "https://render.example")
-	res := &dialAnswer{code: http.StatusOK}
+	res := answer410(http.StatusOK)
 	apiCall := extStage410("render", http.MethodPost, "/render")
 
 	bg := map[string]context.Context{
@@ -518,4 +550,11 @@ func TestAudit410_APIServerSubresource(t *testing.T) {
 			t.Errorf("apiServerSubresource(%q) = %q, want %q", path, got, want)
 		}
 	}
+}
+
+// answer410 is a dial observer whose authority answered code (0 = nothing).
+func answer410(code int) *credhttp.Answer {
+	a := &credhttp.Answer{}
+	a.Answered(code)
+	return a
 }

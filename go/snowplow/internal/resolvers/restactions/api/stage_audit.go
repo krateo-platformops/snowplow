@@ -35,10 +35,13 @@
 //     (audit.FailureMessage, shared with the /call record), never upstream
 //     text.
 //
-// THE OUTCOME is what the authority answered, observed at the dial (dialAnswer):
-// the real status code (201 and 204 are not reported as 200); a 2xx whose body
-// snowplow cannot read or convert is still a SUCCESS — the write was accepted —
-// with a note; a dial that got no response is a failure with no code.
+// THE OUTCOME is what the authority answered, observed at the dial
+// (credhttp.Answer, shared with the /call record): the real status code (201
+// and 204 are not reported as 200); a 2xx whose body snowplow cannot read or
+// convert is still a SUCCESS — the write was accepted — with a note; a dial
+// that got no response is a failure with no code, and so is one snowplow ended
+// itself (its destination policy, the page budget), with that refusal's own
+// message; a 3xx is the redirect snowplow refused to follow.
 //
 
 // WHAT IS NOT RECORDED, ON PURPOSE.
@@ -93,7 +96,7 @@ func isSafeMethod(verb string) bool {
 // records: a safe method, or a resolve that is not a customer request. body is
 // the 2xx response body the dial returned (nil when there is none): a write to
 // the apiserver records the identity of the object it names (#957).
-func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) (audit.Event, bool) {
+func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *credhttp.Answer, body []byte) (audit.Event, bool) {
 	verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 	if isSafeMethod(verb) {
 		return audit.Event{}, false
@@ -133,7 +136,7 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 		}
 	}
 
-	ev.Outcome, ev.Code, ev.Message = outcomeOf(a)
+	ev.Outcome, ev.Code, ev.Message = a.Outcome()
 	// #957 — the written object's identity accompanies its coordinates: only a
 	// record that names a Kubernetes object can say which object it was. It is
 	// read from the response, never from the stage's request payload.
@@ -155,69 +158,11 @@ func apiServerDryRun(rawQuery string) bool {
 	return len(q["dryRun"]) > 0
 }
 
-// outcomeOf turns what the authority answered into (outcome, code, message).
-// The message is from a closed set and never carries upstream text.
-func outcomeOf(a *dialAnswer) (outcome string, code int, message string) {
-	if a == nil || a.code == 0 {
-		return "failure", 0, audit.FailureMessage(0)
-	}
-	if a.code >= 200 && a.code < 300 {
-		return "success", a.code, a.bodyNote
-	}
-	return "failure", a.code, audit.FailureMessage(a.code)
-}
-
 // auditStageWrite emits the record for one dialled stage (see stageAuditEvent).
-func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) {
+func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *credhttp.Answer, body []byte) {
 	if ev, ok := stageAuditEvent(ctx, raNamespace, raName, apiCall, call, a, body); ok {
 		audit.Emit(ctx, ev)
 	}
-}
-
-// dialAnswer is what the authority of one branch-E dial answered, observed by
-// httpFetchConverting for the audit record only: the real status code (the
-// fetch's returned envelope reports every 2xx as 200 and a 2xx it cannot
-// convert as 422) and whether a 2xx body could not be used. Zero code means no
-// response was received. One dial, one goroutine: it is written by the fetch
-// before it returns and read after.
-type dialAnswer struct {
-	code     int
-	bodyNote string
-}
-
-// The closed set of notes on an accepted (2xx) write.
-const (
-	dialNoteBodyUnread        = "accepted; the response body could not be read"
-	dialNoteBodyUnconvertible = "accepted; the response body is not JSON or YAML"
-)
-
-// answered records the final HTTP status code. Nil-safe: a fetch with no
-// observer on its ctx records nothing.
-func (a *dialAnswer) answered(code int) {
-	if a != nil {
-		a.code = code
-	}
-}
-
-// note records why an accepted body could not be used. Nil-safe.
-func (a *dialAnswer) note(n string) {
-	if a != nil {
-		a.bodyNote = n
-	}
-}
-
-type dialAnswerCtxKey struct{}
-
-// withDialAnswer returns ctx carrying a fresh observer for one dial.
-func withDialAnswer(ctx context.Context) (context.Context, *dialAnswer) {
-	a := &dialAnswer{}
-	return context.WithValue(ctx, dialAnswerCtxKey{}, a), a
-}
-
-// dialAnswerFromContext returns the dial's observer, or nil when none.
-func dialAnswerFromContext(ctx context.Context) *dialAnswer {
-	a, _ := ctx.Value(dialAnswerCtxKey{}).(*dialAnswer)
-	return a
 }
 
 // apiServerSubresource returns the subresource an apiserver object path

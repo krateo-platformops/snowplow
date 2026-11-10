@@ -222,6 +222,9 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #1054 — the passthrough fetch is one dial: its attempts (the retry
 	// client's network-error, 5xx and 429 retries) are recorded on it.
 	dctx, dial := slowcall.StartDial(dctx, slowcall.BranchPassthrough, strings.ToUpper(opts.verb), opts.gvr.String())
+	// #1298 — what the apiserver answered, observed at the dial for the audit
+	// record below (credhttp/answer.go): rt's code is often snowplow's own.
+	dctx, answered := credhttp.WithAnswer(dctx)
 	rt := credhttp.Do(dctx, callOpts)
 	if rt != nil && rt.Status == response.StatusFailure {
 		dial.EndRelease(slowcall.ReleaseFailed)
@@ -237,14 +240,19 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// cover them (measured on 057: no outcome/resource/session in the gateway
 	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
-		// #1298 — a failure's record body is the reason class of the code
-		// (audit.FailureMessage, the stage records' closed set), never
-		// rt.Message: that is the apiserver's Status.message, which names the
-		// user, or the raw upstream body when it is not a Status. The caller's
-		// response below still carries rt unchanged.
+		// #1298 — a failed /call is recorded from what was observed at the
+		// dial (credhttp.Answer.Outcome, the stage records' closed set), never
+		// from rt: rt.Message is the apiserver's Status.message, which names
+		// the user, or the raw upstream body when it is not a Status, and
+		// rt.Code is often snowplow's own (500 for a connection refused, 502
+		// for a refused destination or redirect, 504 for the page budget, 406
+		// for a non-JSON 2xx). So a dial nothing answered carries no status
+		// code and says what happened instead, and a 2xx whose body snowplow
+		// would not use is the accepted write it was. A success keeps its
+		// record unchanged. The caller's response below still carries rt.
 		outcome, code, msg := "success", http.StatusOK, ""
 		if rt.Status == response.StatusFailure {
-			outcome, code, msg = "failure", rt.Code, audit.FailureMessage(rt.Code)
+			outcome, code, msg = answered.Outcome()
 		}
 		// A dry run (#443, /call/dry-run: the apiserver is always sent
 		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded

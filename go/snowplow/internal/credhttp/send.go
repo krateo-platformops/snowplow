@@ -102,7 +102,18 @@ func SafeMethod(method string) bool {
 //
 // #847 — every connection this request takes counts under site, on every path
 // below, a write's included (connections.go).
+//
+// #1298 — what it returned is recorded on the request's Answer (answer.go): the
+// final status line, or why there is none. Both dials record it here, so
+// neither can report a code it made up as the authority's.
 func Send(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	resp, err := sendPolicy(site, cli, req)
+	AnswerFrom(req.Context()).observe(resp, err)
+	return resp, err
+}
+
+// sendPolicy is Send without the observation.
+func sendPolicy(site string, cli *http.Client, req *http.Request) (*http.Response, error) {
 	req = req.WithContext(countConnections(req, site))
 	// #1106 — no redirect hop leaves the origin this request is sent to,
 	// whatever the client (endpoint_redirect.go). Outermost, so nothing inside
