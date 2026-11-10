@@ -181,7 +181,9 @@ unaffected (still anonymous), so the probes and the pod's lifecycle are fine; yo
 simply lose the diagnostics while the outage lasts.
 
 A `503` here means "snowplow could not fetch the verification key", not "your
-credentials are wrong" — do not go hunting for a token problem.
+credentials are wrong" — do not go hunting for a token problem. (A token signed
+with a key authn has stopped publishing is the opposite case: a `401` with the
+cause `KeyNotPublished`, since plumbing v1.36.0.)
 
 There is no break-glass path today, and a `kubectl exec` into the pod is **not**
 one: the gate sits on the mux, not on the network path, so a loopback `curl` from

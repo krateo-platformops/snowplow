@@ -118,8 +118,9 @@ func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 				return
 			}
 
-			// The IDENTICAL stateless validation UserConfig performs. Both
-			// expired and generic-invalid map to 401 (jwtutil returns
+			// The IDENTICAL stateless validation UserConfig performs. A
+			// retired signing key, an expired token and a generic-invalid one
+			// map to 401 (jwtutil returns ErrKeyNotPublished /
 			// ErrTokenExpired / ErrTokenInvalid; tokenRejected names which);
 			// a key we cannot fetch is OUR fault, so it maps to 503 instead,
 			// with no cause.
