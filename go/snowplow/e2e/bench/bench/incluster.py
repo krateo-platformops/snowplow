@@ -85,8 +85,10 @@ OBSERVE_CPU, OBSERVE_MEMORY, OBSERVE_CPU_LIMIT = "500m", "1Gi", "1"
 # user (python:3.12-slim runs as root by default; 65532 is the conventional unprivileged "nonroot"
 # id), no privilege escalation, every capability dropped, the runtime's default seccomp profile, and
 # a read-only root filesystem: everything a pod writes is an emptyDir (/out, /work = HOME, /tools,
-# /opt/bench, /tmp = TMPDIR, which bash's here-strings and Python's tempfile use).
+# /opt/bench, and /scratch = TMPDIR, which bash's here-strings and Python's tempfile use: not /tmp, so no
+# bench path anywhere names a temporary directory, tests/test_1194_evidence.py).
 NONROOT = 65532
+SCRATCH = "/scratch"          # the pods' TMPDIR (an emptyDir)
 POD_SECURITY = {"runAsNonRoot": True, "runAsUser": NONROOT, "runAsGroup": NONROOT, "fsGroup": NONROOT,
                 "seccompProfile": {"type": "RuntimeDefault"}}
 CONTAINER_SECURITY = {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
@@ -255,8 +257,8 @@ def _pod_spec(*, sa: str, context: str, container: dict) -> dict:
     mounts = [{"name": "bench", "mountPath": "/opt/bench", "readOnly": True},
               {"name": "tools", "mountPath": "/tools", "readOnly": True},
               {"name": "out", "mountPath": OUT}, {"name": "work", "mountPath": "/work"}]
-    env.append({"name": "TMPDIR", "value": "/tmp"})
-    mounts.append({"name": "tmp", "mountPath": "/tmp"})
+    env.append({"name": "TMPDIR", "value": SCRATCH})
+    mounts.append({"name": "scratch", "mountPath": SCRATCH})
     container = {**container, "image": IMAGE, "env": env + container.get("env", []),
                  "volumeMounts": mounts, "workingDir": "/work", "securityContext": CONTAINER_SECURITY}
     return {
@@ -265,18 +267,18 @@ def _pod_spec(*, sa: str, context: str, container: dict) -> dict:
         "securityContext": POD_SECURITY,
         "initContainers": [{
             "name": "tools", "image": IMAGE, "command": ["sh", "-c", _bootstrap(context)],
-            "env": [{"name": "HOME", "value": "/work"}, {"name": "TMPDIR", "value": "/tmp"}],
+            "env": [{"name": "HOME", "value": "/work"}, {"name": "TMPDIR", "value": SCRATCH}],
             "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}},
             "securityContext": CONTAINER_SECURITY,
             "volumeMounts": [{"name": "src", "mountPath": "/src", "readOnly": True},
                              {"name": "bench", "mountPath": "/opt/bench"},
                              {"name": "tools", "mountPath": "/tools"}, {"name": "work", "mountPath": "/work"},
-                             {"name": "tmp", "mountPath": "/tmp"}]}],
+                             {"name": "scratch", "mountPath": SCRATCH}]}],
         "containers": [container],
         "volumes": [{"name": "src", "configMap": {"name": SRC_CONFIGMAP}},
                     {"name": "bench", "emptyDir": {}}, {"name": "tools", "emptyDir": {}},
                     {"name": "out", "emptyDir": {}}, {"name": "work", "emptyDir": {}},
-                    {"name": "tmp", "emptyDir": {}}],
+                    {"name": "scratch", "emptyDir": {}}],
     }
 
 

@@ -191,7 +191,7 @@ def test_the_floor_is_run_23s_share_from_its_own_records():
 
 def test_the_pods_are_hardened_as_netns606_is():
     """Review L4: non-root, no privilege escalation, every capability dropped, the default seccomp
-    profile, a read-only root filesystem (all writes go to emptyDirs, /tmp included)."""
+    profile, a read-only root filesystem (all writes go to emptyDirs, TMPDIR = /scratch included)."""
     objs = (incluster.render_data606(context="c", timeout_s=1, linger_s=1, room=_room(), data_args=[])
             + incluster.render_observe(context="c", every_s=15, retry_s=5, selector="a=b", user_prefix="u",
                                        password="pw", linger_s=1))
@@ -203,8 +203,8 @@ def test_the_pods_are_hardened_as_netns606_is():
             assert sc["allowPrivilegeEscalation"] is False and sc["readOnlyRootFilesystem"] is True
             assert sc["capabilities"] == {"drop": ["ALL"]} and sc["seccompProfile"] == {"type": "RuntimeDefault"}
             mounts = {m["mountPath"] for m in c["volumeMounts"]}
-            assert "/tmp" in mounts and {"/opt/bench", "/tools"} <= mounts
-        assert {"name": "TMPDIR", "value": "/tmp"} in spec["containers"][0]["env"]
+            assert "/scratch" in mounts and {"/opt/bench", "/tools"} <= mounts
+        assert {"name": "TMPDIR", "value": "/scratch"} in spec["containers"][0]["env"]
         vols = {v["name"]: v for v in spec["volumes"]}
         assert all("emptyDir" in vols[m["name"]] for m in spec["containers"][0]["volumeMounts"])
 
