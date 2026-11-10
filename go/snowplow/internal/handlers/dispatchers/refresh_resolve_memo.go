@@ -167,8 +167,9 @@ func publishResolveMemoExpvar() {
 				// MEASUREMENT ONLY (seed_resolve_memo_shadow.go): misses whose
 				// produce started while a produce of the same memo key (its
 				// leader) was in flight AND whose leader handed over a body the
-				// memo would serve them (stored, and fresh by #411 when the
-				// leader ended) — the produces an in-flight join would have
+				// memo would serve them (it reached the memo Store — not an
+				// error, not a #398 sensitive body — and was fresh by #411 when
+				// the leader ended) — the produces an in-flight join would have
 				// saved. Nothing joins.
 				"would_join_total": RefreshMemoWouldJoin(),
 			}

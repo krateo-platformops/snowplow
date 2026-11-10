@@ -38,6 +38,9 @@ import (
 const (
 	s1264AttrFailed  = attribute.Key("snowplow.stages.failed")
 	s1264AttrReasons = attribute.Key("snowplow.stages.failure_reasons")
+	// s1288AttrNotExecuted (#1288): the stages snowplow deliberately did not
+	// execute, which failed does not count.
+	s1288AttrNotExecuted = attribute.Key("snowplow.stages.not_executed")
 )
 
 // s1264PagedCall serves two pages (a full one, then one row), each reporting a
@@ -53,7 +56,10 @@ func s1264PagedCall(w http.ResponseWriter, r *http.Request) {
 	for i := range items {
 		items[i] = fmt.Sprintf(`{"id":%d}`, (page-1)*perPage+i)
 	}
-	w.Header().Set(handlers.HeaderStageOutcomes, `[{"name":"stage-p`+strconv.Itoa(page)+`","ok":false,"reason":"`+reason+`"}]`)
+	// #1288: every page also lists the export's refused write (WriteRefused),
+	// which the merge keeps once.
+	w.Header().Set(handlers.HeaderStageOutcomes, `[{"name":"stage-p`+strconv.Itoa(page)+`","ok":false,"reason":"`+reason+`"},`+
+		`{"name":"notify","ok":false,"reason":"WriteRefused"}]`)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
 }
@@ -71,7 +77,8 @@ func TestS1264_ServedCompositionPutsStageOutcomesOnTheServerSpan(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /call", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(handlers.HeaderStageOutcomes,
-			`[{"name":"b","ok":false,"reason":"NotFound"},{"name":"a","ok":false,"reason":"Forbidden"},{"name":"c","ok":false,"reason":"Skipped","dependsOn":"a"}]`)
+			`[{"name":"b","ok":false,"reason":"NotFound"},{"name":"a","ok":false,"reason":"Forbidden"},{"name":"c","ok":false,"reason":"Skipped","dependsOn":"a"},`+
+				`{"name":"d","ok":false,"reason":"StageNotExecuted"}]`)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":{"aErr":[{"code":403}]}}`))
 	}))
@@ -121,18 +128,22 @@ func TestS1264_ServedCompositionPutsStageOutcomesOnTheServerSpan(t *testing.T) {
 		}
 		return out
 	}
-	want := func(name string, n int64, reasons ...string) {
+	want := func(name string, n, notExecuted int64, reasons ...string) {
 		t.Helper()
 		a := attrs(name)
-		if a[s1264AttrFailed].AsInt64() != n || !slices.Equal(a[s1264AttrReasons].AsStringSlice(), reasons) {
-			t.Fatalf("%s: %s=%v %s=%v, want %d %q", name, s1264AttrFailed, a[s1264AttrFailed].Emit(),
-				s1264AttrReasons, a[s1264AttrReasons].Emit(), n, reasons)
+		ne, neSet := a[s1288AttrNotExecuted]
+		if a[s1264AttrFailed].AsInt64() != n || !slices.Equal(a[s1264AttrReasons].AsStringSlice(), reasons) ||
+			!neSet || ne.AsInt64() != notExecuted {
+			t.Fatalf("%s: %s=%v %s=%v %s=%v, want %d %q %d", name, s1264AttrFailed, a[s1264AttrFailed].Emit(),
+				s1264AttrReasons, a[s1264AttrReasons].Emit(), s1288AttrNotExecuted, ne.Emit(), n, reasons, notExecuted)
 		}
 	}
-	want("GET /call", 3, "Forbidden", "NotFound", "Skipped")
-	want("GET /export", 2, "Forbidden", "NotFound")
+	// #1288: the deliberate rows (a dry run's StageNotExecuted, an export's
+	// WriteRefused) are counted in not_executed, never in failed or reasons.
+	want("GET /call", 3, 1, "Forbidden", "NotFound", "Skipped")
+	want("GET /export", 2, 1, "Forbidden", "NotFound")
 	for k := range attrs("GET /list") {
-		if k == s1264AttrFailed || k == s1264AttrReasons {
+		if k == s1264AttrFailed || k == s1264AttrReasons || k == s1288AttrNotExecuted {
 			t.Fatalf("GET /list carries %s: a response without stage outcomes must get neither attribute", k)
 		}
 	}

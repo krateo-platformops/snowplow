@@ -653,7 +653,15 @@ func populateClusterListCellAsync(
 		if irc, ok := cache.InternalRESTConfigFromContext(customerCtx); ok && irc != nil {
 			populateCtx = cache.WithInternalRESTConfig(populateCtx, irc)
 		}
-		// Carry logger.
+		// Carry the logger, and the traceId it carries (#916). WithLogger
+		// stamps the traceId of the context it builds, so without the id the
+		// populate's lines would carry this one's empty traceId as well as the
+		// request's: the log decorator keeps the later copy, and the line would
+		// lose the request it belongs to. An empty id is not set, so an
+		// outbound call still mints one (xcontext.TraceId(ctx, true)).
+		if id := xcontext.TraceId(customerCtx, false); id != "" {
+			populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithTraceId(id))
+		}
 		populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithLogger(log))
 		_ = ep // ep retained in closure for future SA-context wiring if needed
 

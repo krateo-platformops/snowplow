@@ -81,8 +81,18 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
   see `howto/rum-ingest.md`) get no span. Sampled at
   100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
-  `docs/configuration.md`). The CORS options in `main.go` allow the browser
-  to send `traceparent`/`tracestate`/`baggage`.
+  `docs/configuration.md`). **Sampling trade (installer#402, #1013):** the
+  platform gateway traces 100% and decides nothing (agentgateway-policies
+  ≥ 0.2.19 `tracing.platform.filter: ""`, installer rev 460, 2026-11-09), so
+  every request reaches snowplow with `sampled=1` and gets its Server span; the
+  one sampling decision is the collectors' tail sampler (observability#118:
+  every error, 4xx and JWT trace kept, plus 5% of the rest), and the SLIs stay
+  exact because span metrics are computed before it. Orphaned snowplow spans
+  on 057 went 92% → 0% (snowplow#849). A gateway that samples at its edge, or a
+  snowplow sampler that drops spans itself (`traceidratio`,
+  `parentbased_traceidratio`), makes the SLIs estimates again. The full note is
+  the SAMPLING comment in `internal/tracing/tracing.go`. The CORS options in
+  `main.go` allow the browser to send `traceparent`/`tracestate`/`baggage`.
 - **Metrics** (`internal/metrics/metrics.go` `Setup`): an **OTLP mirror of the
   expvar surface** — observable instruments read the same live counter
   snapshots the expvar closures read (families: fallthrough, dispatch L1,
@@ -257,8 +267,11 @@ A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure i
 
 | attribute | type | value |
 |---|---|---|
-| `snowplow.stages.failed` | int | the number of entries the header lists: every stage that did not succeed (failed, skipped, not run, refused by a dry run) plus the resolve-level `Aborted` row. **`0`** when the header is `[]` (every stage succeeded): set, not omitted, so a 0 reads "the resolve reported success" and absence reads "this response had no stage outcomes". For the truncated summary `{"truncated":true,"failed":N}` it is N. Observability's sampler keeps a trace on `snowplow.stages.failed > 0` |
-| `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of those entries, sorted (byte order), from the header's closed set: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `StageNotExecuted`, `TemplateError`, `Timeout`, `Unauthorized`. Any other value is folded to **`other`**, never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
+| `snowplow.stages.failed` | int | the number of entries the header lists that **failed** (#1288): a stage that failed, one `Skipped` after a failure, one `NotRun`, plus the resolve-level `Aborted` row. A stage snowplow deliberately did not execute is **not** counted (`not_executed` below). **`0`** when no listed stage failed: set, not omitted, so a 0 reads "no stage failed" and absence reads "this response had no stage outcomes". For the truncated summary `{"truncated":true,"failed":N}` it is N, which counts every listed stage: the summary no longer says which were deliberate, so it errs on keeping the trace. Observability's sampler keeps a trace on `snowplow.stages.failed > 0` |
+| `snowplow.stages.not_executed` | int | (#1288) the number of entries the header lists that snowplow **deliberately did not execute**, by what the request is: a dry run's refused write (`StageNotExecuted`, #443) and an export's or background work's refused write (`WriteRefused`, #903/#970). Set whenever `failed` is, `0` included; not set for the truncated summary, which cannot tell |
+| `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of the **failed** entries, sorted (byte order), from the header's closed set of failure codes: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `TemplateError`, `Timeout`, `Unauthorized`, `UserAccessFilterOnNonReadVerb` (#1281, a misconfigured stage). `StageNotExecuted` and `WriteRefused` never appear (they are not failures). Any other value is folded to **`other`** (and counted as failed), never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
+
+**Failed versus not executed (#1288).** The header lists every stage that did not succeed (its #904 meaning, which callers rely on), and it is unchanged. The span splits that list by the class of each row's reason, decided by one classifier (`stageNotExecutedByDesign`, `internal/resolvers/restactions/api/stage_outcomes.go`): a property of the reason code, never of the route, the RESTAction or the widget. Two codes are deliberate non-executions, `StageNotExecuted` and `WriteRefused`; every other code is a failure. `Skipped` is counted as failed on purpose: a write is skipped only when the stage it depends on failed (the #904 rule never blocks on a deliberate non-execution: the dependent write is then refused for the same reason and reports that reason, or, when it iterates the refused stage's output, yields zero items and succeeds), so a skip is a consequence of a real failure that the same trace already carries. `WriteRefused` ranks below every failure code, so a write stage with one item the plan refused (`InvalidPath`, `TemplateError`) and other items an export refused reads that failure and counts in `failed`. Before #1288 every dry-run preview with a write stage and every export of a RESTAction with a write stage read `failed > 0`, and the export refusal read the generic `Error`.
 
 **Which responses.** Exactly those whose header carries the outcomes: a RESTAction `/call` (GET, `POST /call/read`, an inline draft), cold or an L1 hit, and an `/export` (the outcomes its pages merged into its own header). The values are read from the response's final header when the handler returns, so they always match what the client was sent; a withdrawn stale pass (#710) reports its re-run's. A response without the header gets neither attribute: a widgets `/call`, every other route, a request refused before its resolve. An export's per-page re-dispatch and a #547 demand revalidation write into their own recorders, never through the wrapper, so they cannot overwrite the span.
 

@@ -378,12 +378,19 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 // pre-sized slot (no lock needed — same property the inline code relied on).
 // Exercised under -race by TestResolve_IteratorErrorCollection_Race.
 func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
+	r.recordItemErrorAs(stageReasonOf(accumVal), mu, itemErrs, id, i, errKey, accumVal, bumpMsg, itemErr)
+}
+
+// recordItemErrorAs is recordItemError with the stage outcome's reason named by
+// the caller instead of read from accumVal: a refusal snowplow decided whose
+// errorKey value is plain text (background_write.go, #1288 WriteRefused).
+func (r *resolveRun) recordItemErrorAs(reason string, mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
 	mu.Lock()
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
 	r.taintNarrow() // #603 PR-2 — an errored resolve narrows nothing
 	r.stageErrSink.Bump(id, bumpMsg)
-	r.outcomes.fail(id, stageReasonOf(accumVal))
+	r.outcomes.fail(id, reason)
 	if itemErr != nil {
 		// #709 — keep the status this item recorded, so a resolve whose
 		// RESTAction filter cannot produce a value reports it (stage_failure.go).

@@ -31,7 +31,12 @@ import (
 //     is a write and snowplow refused to send at least one of its items
 //     (InvalidPath, TemplateError, NotSent: undialled_write.go). Reason: a code;
 //   - skipped: a write stage that was not dialed because the stage it depends
-//     on failed or was skipped (reason Skipped).
+//     on failed or was skipped (reason Skipped);
+//   - not executed (#1288): a write stage snowplow deliberately did not send,
+//     because of what the request is, not because anything went wrong: a dry
+//     run (StageNotExecuted, #443 k), or an export or background work
+//     (WriteRefused, #903, #970). It is listed (it did not succeed), and it is
+//     no failure: stageNotExecutedByDesign is the one classifier.
 //
 // The header carries STAGE NAMES AND REASON CODES ONLY, from the closed set
 // below: never an error message, a path, an identity or any response data
@@ -80,7 +85,61 @@ const (
 	// (uaf_non_read.go). Recorded only by snowplow: the reason is no Kubernetes
 	// StatusReason, so trustedReason drops it from an upstream answer (#714).
 	StageReasonUAFOnNonReadVerb = "UserAccessFilterOnNonReadVerb"
+	// StageReasonWriteRefused (#1288) — a write stage, or one item of it, that
+	// snowplow refused to send because the request is not a customer's own
+	// write: an export (#970) or background work (#903). background_write.go
+	// records it, never from an upstream answer. Distinct from
+	// StageNotExecuted, whose #443 contract is "refused by a dry run" (its
+	// message carries the stable "dry-run: " prefix, which this refusal's
+	// message does not).
+	StageReasonWriteRefused = "WriteRefused"
 )
+
+// stageReasonClass is what a reason code says about its stage (#1288).
+type stageReasonClass uint8
+
+const (
+	// stageReasonFailed — the stage failed: it ran and an item failed, it
+	// could not be built or sent, it was skipped because the stage it depends
+	// on failed (Skipped follows a failure, never a deliberate non-execution:
+	// blocksDependentWrite), it never ran because the resolve stopped early
+	// (NotRun), or the resolve ran no stage (Aborted).
+	stageReasonFailed stageReasonClass = iota + 1
+	// stageReasonNotExecuted — snowplow deliberately did not execute the
+	// stage, by what the request is: a dry run, an export, background work.
+	stageReasonNotExecuted
+)
+
+// stageReasonClasses is the closed set of reason codes, each with its class.
+// A code the header can carry is in it, and only those (stageReasonKnown).
+var stageReasonClasses = map[string]stageReasonClass{
+	StageReasonNotExecuted:        stageReasonNotExecuted,
+	StageReasonWriteRefused:       stageReasonNotExecuted,
+	StageReasonForbidden:          stageReasonFailed,
+	StageReasonNotFound:           stageReasonFailed,
+	StageReasonUnauthorized:       stageReasonFailed,
+	StageReasonNotRun:             stageReasonFailed,
+	StageReasonError:              stageReasonFailed,
+	StageReasonSkipped:            stageReasonFailed,
+	StageReasonAborted:            stageReasonFailed,
+	StageReasonInvalidPath:        stageReasonFailed,
+	StageReasonTemplateError:      stageReasonFailed,
+	StageReasonNotSent:            stageReasonFailed,
+	StageReasonTimeout:            stageReasonFailed,
+	StageReasonDestinationRefused: stageReasonFailed,
+	// #1281: a misconfigured stage (userAccessFilter on a write) is a real
+	// failure, in every mode, never a deliberate non-execution.
+	StageReasonUAFOnNonReadVerb: stageReasonFailed,
+}
+
+// stageNotExecutedByDesign reports whether reason says snowplow deliberately
+// did not execute the stage (#1288): the one classifier, read by the span
+// summary (such a stage is not counted as failed) and by the #904 rule (such
+// a stage does not block a dependent write, which the same rule refuses for
+// the same reason).
+func stageNotExecutedByDesign(reason string) bool {
+	return stageReasonClasses[reason] == stageReasonNotExecuted
+}
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
 // {"truncated":true,"failed":N} instead of the per-stage array.
@@ -93,17 +152,27 @@ var reasonRank = map[string]int{
 	// #1281: recorded once for the whole stage, before anything else can be
 	// (the stage is refused before it is planned); ranked first because the
 	// stage itself is misconfigured.
-	StageReasonUAFOnNonReadVerb:   12,
-	StageReasonNotExecuted:        10,
-	StageReasonForbidden:          9,
-	StageReasonUnauthorized:       8,
-	StageReasonNotFound:           7,
-	StageReasonInvalidPath:        6,
-	StageReasonDestinationRefused: 5,
-	StageReasonTemplateError:      4,
-	StageReasonTimeout:            3, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:            2,
-	StageReasonError:              1,
+	StageReasonUAFOnNonReadVerb: 12,
+	// The #443 dry-run refusal outranks every other failure: a dry run reports
+	// StageNotExecuted for its write stages (#443 k, a stable contract).
+	StageReasonNotExecuted:        11,
+	StageReasonForbidden:          10,
+	StageReasonUnauthorized:       9,
+	StageReasonNotFound:           8,
+	StageReasonInvalidPath:        7,
+	StageReasonDestinationRefused: 6,
+	StageReasonTemplateError:      5,
+	StageReasonTimeout:            4, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:            3,
+	StageReasonError:              2,
+	// #1288: an export's or background work's refusal ranks BELOW every
+	// failure (and above 0, the "" of a stage that recorded nothing). Items
+	// the plan refuses (InvalidPath, TemplateError: failRefusedItems) are
+	// recorded before dispatch and never reach the refusal, so a write stage
+	// with one such item and one refused item FAILED: it reads that failure,
+	// and blocks its dependents. A stage whose every item was refused reads
+	// WriteRefused.
+	StageReasonWriteRefused: 1,
 }
 
 type stageOutcome struct {
@@ -254,11 +323,15 @@ func (s *StageOutcomes) skip(name, dependsOn string) {
 }
 
 // blocksDependentWrite reports whether a write stage that depends on name must
-// not be sent (#904): name failed or was skipped. A dry-run refusal
-// (StageNotExecuted, #443 k) does not block. It is not an outcome of the
-// stage's own call (a real run would have sent it), and the dry run refuses the
-// dependent write for the same reason, so the preview reports what a real run
-// would do. A name that is not a stage of this resolve never blocks.
+// not be sent (#904): name failed or was skipped. A stage snowplow did not
+// execute by design (stageNotExecutedByDesign: a dry-run refusal,
+// StageNotExecuted, #443 k; an export or background refusal, WriteRefused,
+// #1288) does not block. It is not an outcome of the stage's own call (a
+// customer's real run would have sent it), and the same rule refuses the
+// dependent write for the same reason, so the dependent reports that reason
+// (or, when its iterator runs over the refused stage's output, yields zero
+// items and succeeds), never Skipped: Skipped only ever follows a failure. A
+// name that is not a stage of this resolve never blocks.
 func (s *StageOutcomes) blocksDependentWrite(name string) bool {
 	if s == nil {
 		return false
@@ -266,7 +339,7 @@ func (s *StageOutcomes) blocksDependentWrite(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o := s.by[name]
-	return o != nil && o.reason != "" && o.reason != StageReasonNotExecuted
+	return o != nil && o.reason != "" && !stageNotExecutedByDesign(o.reason)
 }
 
 type stageOutcomeJSON struct {
