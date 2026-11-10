@@ -1,20 +1,32 @@
-// external_fetch_cache.go — the external api-step fetch, with its CONVERSION
-// memoised by content.
+// external_fetch_cache.go — the external api-step fetch: identical concurrent
+// reads share one in-flight call, and the CONVERSION is memoised by content.
 //
 // WHY. External results never reach L1 (the external-touched sink declines the
 // Put: they have no dependency edge to invalidate them), so every visit
 // re-fetched the same document AND re-ran YAMLToJSON on it. Bench run 12 spent
 // 15–19% of steady-state CPU in httpFetchAllowingNonJSON → toJSONBytes →
 // yaml.YAMLToJSON, and one external-backed widget ran 870 times in the storm,
-// once per user.
+// once per user. On 057 (#1320) every page load opened its own identical call,
+// up to 48 at once, each cut at its page budget while the upstream ran it on.
 //
-// WHAT IS NOT REUSED: any response. Snowplow has no event source for an
-// external endpoint, so it never serves upstream bytes it did not just
-// receive. EVERY read performs a full, unconditional fetch — no TTL, no
-// Cache-Control/Expires window, no conditional request (a 304 on
-// If-Modified-Since is second-granular and answers "not modified" for a file
-// rolled back to an older mtime, #845 review). A change upstream is in the next
-// read.
+// WHAT IS SHARED: an identical READ while it is in flight, and nothing else
+// (#1320, owner ruling 2026-11-10; external_fetch_flight.go). Snowplow has no
+// event source for an external endpoint. A read (GET, HEAD, OPTIONS, TRACE)
+// arriving while an identical one is in flight joins it; identical is the
+// whole outbound request — endpoint with every credential field, method,
+// resolved URL, every header (an exported JWT included), payload and dial
+// provenance — so identities never share. THE FRESHNESS CONTRACT: a joiner may
+// get an answer from a call that started up to one call-duration before it
+// arrived. It never gets bytes received before it arrived: a call stops
+// admitting joiners at its first response byte. Nothing is reused after
+// completion — no TTL, no Cache-Control/Expires window, no conditional request
+// (a 304 on If-Modified-Since is second-granular and answers "not modified"
+// for a file rolled back to an older mtime, #845 review) — so a read arriving
+// after a call completed makes a full, unconditional call of its own, and a
+// change upstream is in the next call. A write is never shared. The shared
+// call runs detached from every page, under the server write deadline; each
+// caller's page budget and context bound only its own wait, and each caller
+// records its own stage and audit outcome.
 //
 // WHAT IS MEMOISED: the conversion of the bytes just received. key =
 // sha256(conversion mode ‖ raw bytes) → toJSONBytes' output for them. The
@@ -32,7 +44,8 @@
 // it, so it shrinks as the heap fills even when every read is a hit. Evictions
 // are counted.
 //
-// With the cache off the memo steps aside (cache-off byte-identical).
+// With the cache off the memo and the shared call both step aside (cache-off
+// byte-identical: every read is its caller's own fetch).
 
 package api
 
@@ -70,18 +83,29 @@ type externalFetchCache struct {
 	bytes       int64
 	converting  singleflight.Group
 
+	// flights (#1320) is each outbound read's joinable in-flight call, keyed by
+	// the whole request (externalReadKeyOf): held only from the call's start to
+	// its first response byte, never after it completes.
+	flightsMu sync.Mutex
+	flights   map[externalFlightKey]*externalFlight
+
 	// fetch, toJSON and budget are seams for the tests.
 	fetch  func(context.Context, httpcall.RequestOptions, func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error)
 	toJSON func(string, []byte) ([]byte, error)
 	budget func(held int64) int64
 
 	convertHits, convertMisses, evictions atomic.Uint64
+	// #1320 — reads that started a shared call, reads that joined one, and
+	// fetches that are never shared (a write, or an endpoint the key cannot
+	// fold exactly). Calls sent = led + not_shared.
+	flightLed, flightJoined, flightNotShared atomic.Uint64
 }
 
 func newExternalFetchCache() *externalFetchCache {
 	return &externalFetchCache{
 		conversions: map[externalContentKey]*externalConversion{},
 		lru:         list.New(),
+		flights:     map[externalFlightKey]*externalFlight{},
 		fetch:       httpFetchConverting,
 		toJSON:      toJSONBytes,
 		budget:      cache.ExternalFetchCacheBudget,
@@ -91,7 +115,8 @@ func newExternalFetchCache() *externalFetchCache {
 var externalFetches = newExternalFetchCache()
 
 // sharedExternalFetch is the external dispatch's fetch (resolve.go). Same
-// return contract as httpFetchAllowingNonJSON; every call is a full fetch.
+// return contract as httpFetchAllowingNonJSON; a read may share an identical
+// in-flight call (external_fetch_flight.go), never a completed one.
 func sharedExternalFetch(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
 	return externalFetches.do(ctx, opts)
 }
@@ -100,7 +125,7 @@ func (c *externalFetchCache) do(ctx context.Context, opts httpcall.RequestOption
 	if cache.Disabled() {
 		return c.fetch(ctx, opts, toJSONBytes)
 	}
-	return c.fetch(ctx, opts, c.convert)
+	return c.fetchShared(ctx, opts)
 }
 
 // convert is toJSONBytes memoised by content: the body's bytes are looked up by
@@ -234,18 +259,35 @@ func ExternalFetchCacheSnapshot() []ExternalFetchCacheCount {
 	}
 }
 
+// ExternalFetchFlightSnapshot returns snowplow_external_fetch_flight_total by
+// outcome (closed set, zeros included; #1320):
+//   - led: a read that started a call identical reads may join;
+//   - joined: a read that shared an identical call already in flight;
+//   - not_shared: a fetch that is never shared (a write, or an endpoint the key
+//     cannot fold exactly).
+//
+// Calls sent = led + not_shared; joined is the calls not sent.
+func ExternalFetchFlightSnapshot() []ExternalFetchCacheCount {
+	c := externalFetches
+	return []ExternalFetchCacheCount{
+		{Outcome: "led", Count: c.flightLed.Load()},
+		{Outcome: "joined", Count: c.flightJoined.Load()},
+		{Outcome: "not_shared", Count: c.flightNotShared.Load()},
+	}
+}
+
 // ExternalFetchCacheHeld returns the memo's current entries and bytes.
 func ExternalFetchCacheHeld() (entries int, bytes int64) { return externalFetches.held() }
 
 // ExternalFetchCacheEvictions returns how many entries the byte bound evicted.
 func ExternalFetchCacheEvictions() uint64 { return externalFetches.evictions.Load() }
 
-// RecordExternalFetchCacheForTest bumps every outcome cell and the eviction
-// counter once — the OTLP falsifier's way to move a real series. Production
+// RecordExternalFetchCacheForTest bumps every outcome cell (conversion and
+// flight) and the eviction counter once — the OTLP falsifier's way to move a real series. Production
 // MUST NOT use it.
 func RecordExternalFetchCacheForTest() {
 	c := externalFetches
-	for _, ctr := range []*atomic.Uint64{&c.convertHits, &c.convertMisses, &c.evictions} {
+	for _, ctr := range []*atomic.Uint64{&c.convertHits, &c.convertMisses, &c.evictions, &c.flightLed, &c.flightJoined, &c.flightNotShared} {
 		ctr.Add(1)
 	}
 }
@@ -271,6 +313,13 @@ func init() {
 		}))
 		expvar.Publish("snowplow_external_fetch_conversion_evictions_total", expvar.Func(func() any {
 			return ExternalFetchCacheEvictions()
+		}))
+		expvar.Publish("snowplow_external_fetch_flight_total", expvar.Func(func() any {
+			m := map[string]uint64{}
+			for _, c := range ExternalFetchFlightSnapshot() {
+				m[c.Outcome] = c.Count
+			}
+			return m
 		}))
 	})
 }
