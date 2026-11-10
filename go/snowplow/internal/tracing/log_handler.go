@@ -67,6 +67,7 @@ type traceCorrelationHandler struct {
 	root    slog.Handler                      // the undecorated base, before any With*/WithGroup
 	ops     []func(slog.Handler) slog.Handler // derivation chain, in order
 	derived slog.Handler                      // ops applied to root, cached for the no-span path
+	level   level                             // the keys the current level holds, each once (#916)
 }
 
 // NewTraceCorrelationHandler wraps base in the decorator. buildLogHandler in
@@ -108,18 +109,25 @@ func (h *traceCorrelationHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	cp := append([]slog.Attr(nil), attrs...)
-	return h.extend(func(b slog.Handler) slog.Handler { return b.WithAttrs(cp) })
+	cp := lastOfEachKey(attrs)
+	if h.level.holdsAny(cp) {
+		return h.replacing(cp)
+	}
+	d := h.extend(func(b slog.Handler) slog.Handler { return b.WithAttrs(cp) })
+	d.level = h.level.plus(cp)
+	return d
 }
 
 func (h *traceCorrelationHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
-	return h.extend(func(b slog.Handler) slog.Handler { return b.WithGroup(name) })
+	d := h.extend(func(b slog.Handler) slog.Handler { return b.WithGroup(name) })
+	d.level = level{start: len(d.ops)}
+	return d
 }
 
-func (h *traceCorrelationHandler) extend(op func(slog.Handler) slog.Handler) slog.Handler {
+func (h *traceCorrelationHandler) extend(op func(slog.Handler) slog.Handler) *traceCorrelationHandler {
 	ops := make([]func(slog.Handler) slog.Handler, len(h.ops), len(h.ops)+1)
 	copy(ops, h.ops)
 	ops = append(ops, op)
