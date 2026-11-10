@@ -148,7 +148,7 @@ func TestIssue912_V2_GatedWritesRefuseADecliningVerdict(t *testing.T) {
 			c.PutRAFullListIfGen(ctx, v, "k4", ResolvedKeyInputs{}, full, c.CaptureGen("k4")),
 			c.PutResolved(v, "k8", entry()),
 			c.ReplaceResolvedIfGen(ctx, v, "k6", &ResolvedEntry{RawJSON: []byte(`{"new":1}`)}, c.CaptureGen("k6")),
-			c.ReplaceResolvedIfGenRefresh(ctx, v, "k7", &ResolvedEntry{RawJSON: []byte(`{"new":1}`)}, c.CaptureGen("k7")),
+			c.ReplaceResolvedIfGenRefresh(ctx, v, "k7", &ResolvedEntry{RawJSON: []byte(`{"new":1}`)}, c.CaptureGen("k7")).Stored(),
 		}
 		_, pinned := c.PutRAFullList(v, "k5", ResolvedKeyInputs{}, full)
 		for i, ok := range wrote {

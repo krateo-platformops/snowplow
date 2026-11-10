@@ -31,8 +31,11 @@ import (
 
 // staleWritePoint applies the write-point rule for a cold response. It
 // returns true when it re-ran the request (the caller writes nothing more).
+//
+// body is the response body about to be written (the accepted Put's bytes when
+// armable): #1321 — a replacement with the same bytes owes the client no frame.
 func staleWritePoint(h http.Handler, wri http.ResponseWriter, req *http.Request,
-	sink *cache.StaleServeSink, armable bool) (rerun bool) {
+	sink *cache.StaleServeSink, armable bool, body []byte) (rerun bool) {
 	if !sink.StaleDerived() {
 		return false
 	}
@@ -48,7 +51,7 @@ func staleWritePoint(h http.Handler, wri http.ResponseWriter, req *http.Request,
 		h.ServeHTTP(wri, req.WithContext(cache.WithStaleServeDisabled(req.Context())))
 		return true
 	}
-	api.CommitStaleServe(sink)
+	api.CommitStaleServe(sink, body)
 	return false
 }
 
@@ -69,7 +72,7 @@ func isStaleRerun(req *http.Request) bool {
 // serve opens). armed is whether this hit stamped the refresh-key header.
 func staleHitWritePoint(ctx context.Context, key string, entry *cache.ResolvedEntry, armed bool) {
 	if entry != nil && entry.StaleDerived {
-		cache.MarkStaleOwed(key)
+		cache.MarkStaleOwed(key, entry.RawJSON) // #1321: the body this hit writes
 	}
 	if armed {
 		cache.NoteStaleHit(ctx, key, entry, staleSubjectOf)

@@ -471,10 +471,13 @@ func (h *refreshBroadcaster) stopWindow(l1Key string) {
 // blocking the refresher goroutine or dropping. No-op when the layer is
 // disabled or no hub exists.
 //
-// Called from internal/handlers/dispatchers/resolve_populate.go,
-// immediately after the commit — strictly post-commit, so it fires only when
-// L1 actually changed (design §1.1) — and from the cold-dispatch
-// publishIfSubscribed. NOT paced: a refresher-driven refetch is an L1 HIT
+// Called (through the #1321 Put-outcome gate, put_outcome.go) from
+// internal/handlers/dispatchers/resolve_populate.go, immediately after the
+// commit — strictly post-commit, and only for a Put that changed the stored
+// bytes, so it fires only when L1 actually changed (design §1.1) — and from
+// the cold-dispatch publishIfSubscribed; and directly from the D2
+// stale-dependent replace (finishStaleReplace), which applies the same rule
+// against the body its client was served. NOT paced: a refresher-driven refetch is an L1 HIT
 // (feedback_customer_priority_over_refresher — pacing the eviction path must
 // never slow this one).
 func PublishRefresh(l1Key string) { publishRefresh(l1Key, refreshOwed{}) }
@@ -1243,6 +1246,7 @@ type RefreshBroadcasterStats struct {
 	PendingCoalesced      uint64  `stat:"pending_coalesced" desc:"Refresher-path signals absorbed because the key was already queued for that subscriber (delivered once, #484)."`
 	PendingOverflowResync uint64  `stat:"pending_overflow_resync" desc:"Subscribers force-resynced by the pending-drain stall rule: stream ended with a resync frame so the SPA re-validates every armed widget (#484)."`
 	Coalesced             uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
+	WithheldIdentical     uint64  `stat:"withheld_identical" desc:"Accepted Puts at a publish site whose bytes equal the prior they replaced, so no live-refresh signal was published (#1321). For the refresher it equals snowplow_refresh_cycle_put_total{content=identical}."`
 	Subscribers           int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
 	ArmedKeys             int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
 	MaxSinkDepth          int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
@@ -1274,6 +1278,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		Delivered:             refreshDeliveredTotal.Load(),
 		Dropped:               refreshDroppedTotal.Load(),
 		Coalesced:             refreshCoalescedTotal.Load(),
+		WithheldIdentical:     refreshWithheldIdenticalTotal.Load(),
 		Deferred:              refreshDeferredTotal.Load(),
 		TrailingEmitted:       refreshTrailingEmittedTotal.Load(),
 		PendingCoalesced:      refreshPendingCoalescedTotal.Load(),

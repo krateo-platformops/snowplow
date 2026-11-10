@@ -139,6 +139,12 @@ func (h *getRecordingHandle) PutResolved(v cache.PutVerdict, key string, entry *
 func (h *getRecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
 	return v.Store() && h.PutIfGen(ctx, key, entry, capturedGen)
 }
+func (h *getRecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome {
+	if h.PutResolvedIfGen(ctx, v, key, entry, capturedGen) {
+		return cache.PutChanged
+	}
+	return cache.PutRefused
+}
 func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
 	if !v.Store() {
 		return false

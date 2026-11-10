@@ -61,6 +61,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"expvar"
@@ -553,9 +554,10 @@ func evictStaleDependent(sink *cache.StaleServeSink) {
 // CommitStaleServe is the dispatcher's write-point outcome for a stale-derived
 // response whose Put was ACCEPTED (and whose refresh header is therefore
 // armed): it sets the key's owed-push mark and, if a content debt already
-// cleared, replaces the cell now. Call it before writing the body.
-func CommitStaleServe(sink *cache.StaleServeSink) {
-	if sink.Commit() {
+// cleared, replaces the cell now. Call it before writing the body. body is the
+// stale-derived body about to be written (the bytes the accepted Put stored).
+func CommitStaleServe(sink *cache.StaleServeSink, body []byte) {
+	if sink.Commit(body) {
 		goReplaceStaleDependent(sink)
 	}
 }
@@ -690,11 +692,28 @@ func replaceStaleDependentOnce(sink *cache.StaleServeSink) bool {
 // overdue tracking. Its stale_to_push is recorded when the frame this publish
 // offers is WRITTEN to a stream (#1062, cache/stale_push.go), the same end for
 // every layer: an offer is not a push.
+//
+// #1321 — the publish follows the replacing Put (RunRefreshNow's refresh
+// terminal), and like every Put-driven publish it announces only a change: when
+// the cell now holds, no longer stale-derived, exactly the body this
+// dependent's response was written with, the client already has those bytes and
+// nothing is published (counted stale_replace_identical_total). The ledger
+// closed the serve at that Put ("identical"), and the owed-push mark is settled
+// when every body written under it is those bytes (cache.SettleStaleOwed). A
+// cell that left the store, or holds other bytes, is announced as before.
 func finishStaleReplace(sink *cache.StaleServeSink) {
 	l1Key := sink.L1Key()
 	staleDebtsMu.Lock()
 	delete(staleReplacing, sink)
 	staleDebtsMu.Unlock()
+	if cur := replacedIdentically(sink); cur != nil && (cache.SettleStaleOwed(l1Key, cur) || !cache.StaleOwed(l1Key)) {
+		// Nothing is owed: this client holds cur, and so does every other
+		// response written under the key's mark (or the mark was already
+		// delivered). A mark another body was written under still owes its
+		// late arm a frame, so it falls through and publishes.
+		staleReplaceIdentical.Add(1)
+		return
+	}
 	if cache.HasRefreshSubscriber(l1Key) {
 		stalePushTotal.Add(1)
 	} else {
@@ -702,6 +721,27 @@ func finishStaleReplace(sink *cache.StaleServeSink) {
 		stalePushUnarmed.Add(1)
 	}
 	cache.PublishRefresh(l1Key)
+}
+
+// replacedIdentically returns the bytes sink's cell now holds when they are no
+// longer stale-derived and equal the body sink's response was written with
+// (#1321), else nil: the cell left the store, is still stale-derived, or holds
+// other bytes, and the replace is announced.
+func replacedIdentically(sink *cache.StaleServeSink) []byte {
+	body := sink.ServedBody()
+	store := cache.ResolvedCache()
+	if body == nil || store == nil {
+		return nil
+	}
+	//serve-probe: D2 replace publish gate — compares the dependent cell's bytes with the served body, serves no body
+	e, ok := store.GetNoTouch(sink.L1Key())
+	if !ok || e == nil || e.StaleDerived {
+		return nil
+	}
+	if cur := e.Raw(); bytes.Equal(cur, body) {
+		return cur
+	}
+	return nil
 }
 
 // --- overdue (G3) -------------------------------------------------------------
@@ -795,6 +835,9 @@ var (
 	staleDependentUnresolved atomic.Uint64
 	// staleReplaceRetries counts failed dependent re-resolves retried.
 	staleReplaceRetries atomic.Uint64
+	// staleReplaceIdentical (#1321) counts done dependent replaces whose cell
+	// then held exactly the served body: no frame published (none owed).
+	staleReplaceIdentical atomic.Uint64
 	// staleServeWithdrawnUnarmable is stale_serve_withdrawn_total{reason=
 	// "unarmable"}: a stale serve whose Put was declined, re-run fresh.
 	staleServeWithdrawnUnarmable atomic.Uint64
@@ -883,6 +926,10 @@ type StaleServeStats struct {
 	// ReplaceRetries is stale_replace_retries_total: failed dependent
 	// re-resolves retried (the cell kept, never evicted on failure).
 	ReplaceRetries uint64
+	// ReplaceIdentical is stale_replace_identical_total (#1321): done
+	// dependent replaces whose cell then held exactly the body the response
+	// was written with, so no /refreshes frame was published.
+	ReplaceIdentical uint64
 	// Owed is the owed-push mark family (cache.StaleOwedStats): open marks,
 	// marks dropped by the L1-capacity bound (a guarantee failure, expected
 	// 0), pushes emitted at arm time, marks cleared by a delivered publish.
@@ -907,6 +954,7 @@ func StaleServeStatsSnapshot() StaleServeStats {
 		DependentUnresolved: staleDependentUnresolved.Load(),
 		WithdrawnUnarmable:  staleServeWithdrawnUnarmable.Load(),
 		ReplaceRetries:      staleReplaceRetries.Load(),
+		ReplaceIdentical:    staleReplaceIdentical.Load(),
 		Owed:                cache.StaleOwedStatsSnapshot(),
 		ServeAge:            staleServeAgeHist.snapshot(),
 		ToPush:              apistageToPush(),
@@ -974,6 +1022,9 @@ func registerStaleExpvar() {
 		expvar.Publish("snowplow_apistage_stale_replace_retries_total", expvar.Func(func() any {
 			return staleReplaceRetries.Load()
 		}))
+		expvar.Publish("snowplow_apistage_stale_replace_identical_total", expvar.Func(func() any {
+			return staleReplaceIdentical.Load()
+		}))
 		expvar.Publish("snowplow_apistage_stale_serve_withdrawn_total", expvar.Func(func() any {
 			return map[string]uint64{"unarmable": staleServeWithdrawnUnarmable.Load()}
 		}))
@@ -985,6 +1036,9 @@ func registerStaleExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_stale_owed_arm_emits_total", expvar.Func(func() any {
 			return cache.StaleOwedStatsSnapshot().ArmEmits
+		}))
+		expvar.Publish("snowplow_apistage_stale_owed_settled_total", expvar.Func(func() any {
+			return cache.StaleOwedStatsSnapshot().Settled
 		}))
 	})
 }

@@ -440,7 +440,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh
 		// (twin of restactions.go).
-		if staleWritePoint(r, wri, req, staleSink, false) {
+		if staleWritePoint(r, wri, req, staleSink, false, nil) {
 			return
 		}
 		log.ErrorContext(ctx, "unable to resolve widget", slog.Any("err", err))
@@ -746,12 +746,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 		noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
 		// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
-		if cacheHandle.PutResolvedIfGen(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+		if put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 			RawJSON:      encoded,
 			Inputs:       cacheInputs,
 			TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
 			StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
-		}, cacheGen0) {
+		}, cacheGen0); put.Stored() {
 			if verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
 			}
@@ -769,7 +769,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// now instead of waiting for the next churn. No-op when unarmed.
 			// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
 			// fold → cross-deliver risk) per refresh_publish.go.
-			publishIfSubscribed(cacheKey)
+			// #1321 — and only when the Put changed the stored bytes.
+			publishIfSubscribed(cacheKey, put)
 
 			// #548 — ARM the browser here, and ONLY here, on the cold path. This
 			// block is the one place a cold widget dispatch stores a cell, so its
@@ -800,7 +801,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// — and stays so.
 	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
 	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
-	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable, encoded) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)

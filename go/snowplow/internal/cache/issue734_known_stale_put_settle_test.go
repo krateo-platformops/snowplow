@@ -72,7 +72,7 @@ func k734KnownStaleCell(t *testing.T) (c *ResolvedCacheStore, key string, ok *at
 		if fn := during.Load(); fn != nil {
 			(*fn)()
 		}
-		stored := c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen)
+		stored := c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen).Stored()
 		NoteRefreshWrite(rctx, k, stored)
 		// Still inside the dequeue: processNext has not settled the window.
 		served0 := ResolvedCacheStatsByStat()["known_stale_served_dropped_total"]

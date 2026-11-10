@@ -2201,6 +2201,16 @@ func registerStaleServeInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	replaceIdentical, err := m.Int64ObservableCounter("snowplow_apistage_stale_replace_identical_total",
+		metric.WithDescription("Done replaces of a stale-served customer cell whose cell then held exactly the body the response was written with: the client already has those bytes, so no /refreshes frame was published. #1321."))
+	if err != nil {
+		return err
+	}
+	owedSettled, err := m.Int64ObservableCounter("snowplow_apistage_stale_owed_settled_total",
+		metric.WithDescription("Owed-push marks cleared because the replacement's bytes equal every stale-derived body written under them: no push owed. #1321."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		s := restactionsapi.StaleServeStatsSnapshot()
 		o.ObserveInt64(serveTotal, int64(s.ServeTotal), metric.WithAttributes(attribute.String("reason", "known_stale")))
@@ -2217,8 +2227,11 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		o.ObserveInt64(owedDropped, int64(s.Owed.Dropped))
 		o.ObserveInt64(owedArm, int64(s.Owed.ArmEmits))
 		o.ObserveInt64(replaceRetries, int64(s.ReplaceRetries))
+		o.ObserveInt64(replaceIdentical, int64(s.ReplaceIdentical))
+		o.ObserveInt64(owedSettled, int64(s.Owed.Settled))
 		return nil
-	}, serveTotal, debtOpen, debtParked, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
+	}, serveTotal, debtOpen, debtParked, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries,
+		replaceIdentical, owedSettled)
 	return err
 }
 

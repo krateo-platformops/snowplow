@@ -410,7 +410,7 @@ func TestIssue507_TheColdCellStaysReclaimableAfterTheSweep(t *testing.T) {
 	refused0 := f.store.Stats().RemintRefusedColdTotal
 	if !f.store.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, f.key,
 		&cache.ResolvedEntry{RawJSON: []byte(`{"pass1":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-ttl / 2)},
-		f.store.CaptureGen(f.key)) {
+		f.store.CaptureGen(f.key)).Stored() {
 		t.Fatal("SETUP: the refresh WRITE must be accepted on a live cell — only the re-mint is gated")
 	}
 	e1, ok := f.handle.GetNoTouch(f.key)
@@ -442,7 +442,7 @@ func TestIssue507_TheColdCellStaysReclaimableAfterTheSweep(t *testing.T) {
 	i507MustBeInWindow(t, born, windowStart, maxAge, "before pass2")
 	if !f.store.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, f.key,
 		&cache.ResolvedEntry{RawJSON: []byte(`{"pass2":1}`), Inputs: f.inputs, CreatedAt: time.Now().Add(-ttl / 2)},
-		f.store.CaptureGen(f.key)) {
+		f.store.CaptureGen(f.key)).Stored() {
 		t.Fatal("SETUP: the pass2 refresh WRITE must be accepted on a live cell")
 	}
 	e2, ok := f.handle.GetNoTouch(f.key)

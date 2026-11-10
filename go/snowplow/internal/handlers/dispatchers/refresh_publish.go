@@ -41,11 +41,18 @@ import "github.com/krateo-platformops/snowplow/internal/cache"
 // (cost-proportional) or when the SSE layer / cache is off (both nil-safe via
 // the broadcaster). l1Key MUST be the just-Put genuine cache key (the
 // per-identity DeriveSubscriptionKey-equivalent the serve path stamps).
-func publishIfSubscribed(l1Key string) {
-	if l1Key == "" {
+//
+// #1321 — put is that Put's outcome, and only a PutChanged is announced
+// (cache.PublishPut). The designed case (an evicted key re-filled) has no
+// resident prior, so it is always PutChanged; but this PutIfGen also
+// re-enters over a resident cell on a #547 demand revalidation, and a
+// revalidation that resolved the same bytes announces nothing the
+// subscriber does not already hold.
+func publishIfSubscribed(l1Key string, put cache.PutOutcome) {
+	if l1Key == "" || !put.Stored() {
 		return
 	}
 	if cache.HasRefreshSubscriber(l1Key) {
-		cache.PublishRefresh(l1Key)
+		cache.PublishPut(l1Key, put)
 	}
 }

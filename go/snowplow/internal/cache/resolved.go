@@ -1853,15 +1853,27 @@ func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key str
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
 func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	return c.putIfGenOutcome(ctx, key, entry, capturedGen).Stored()
+}
+
+// putIfGenOutcome is putIfGen reporting whether the accepted Put changed the
+// stored bytes (#1321, put_outcome.go): the cold-dispatch fill publishes a
+// frame only for PutChanged. A fill of an absent key is PutChanged; a #547
+// demand revalidation re-entering over a resident cell with the same bytes is
+// PutIdentical. The compare is the refresh Put's (sameBytesPrior, off c.mu,
+// confirmed under it), and it is #406's compare for an RAFullList body, so no
+// body is compared twice.
+func (c *ResolvedCacheStore) putIfGenOutcome(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
-	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
+	same := c.sameBytesPrior(key, entry)        // #1321: byte compare OFF c.mu
+	equalPrior := c.raLayerEqualOf(entry, same) // #406
 
 	c.mu.Lock()
 	if c.currentGenLocked(key) != capturedGen {
@@ -1871,8 +1883,12 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
-		return false
+		return PutRefused
 	}
+	// #1321 — identical only if the prior that compared equal is the one this Put
+	// replaces (the replaceIfGenRefresh rule): a write that landed after the
+	// compare voids it, and the Put counts as changed.
+	identical := same != nil && c.raLayerResidentEntryLocked(key) == same
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
@@ -1902,7 +1918,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	// #406 — a raKey commit with changed content remarks the widgets holding a slice of
 	// the old body; a widget Put of a slice of a since-superseded raKey remarks itself.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return putOutcomeOf(identical)
 }
 
 // ReplaceIfGen is the #189 generation-guarded REPLACE. It stores entry under key
@@ -2000,15 +2016,20 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 // #375 — like PutIfGen / ReplaceIfGen it takes the resolve ctx and, on ACCEPT,
 // runs remarkIfDepsMoved off-lock: a dep that moved during the re-mint resolve
 // remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
-// birth. #375's arm-9 reflective enumeration covers this method. Returns true
-// iff stored.
-func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// birth. #375's arm-9 reflective enumeration covers this method.
+//
+// #1321 — it returns the Put's outcome: PutRefused, or PutIdentical /
+// PutChanged from the #1070 compare confirmed under c.mu (the `identical`
+// verdict below). The caller publishes a frame only for PutChanged
+// (PublishRefreshed): an identical refresh still runs and still Puts, but it
+// announces nothing the subscriber does not already hold.
+func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	// #1070 — ONE byte compare of the refresh Put against the resident prior,
@@ -2024,11 +2045,12 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		c.putRefusedGenerationMovedTotal.Add(1)
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
-		return false
+		return PutRefused
 	}
 	// #1070 — identical only if the prior that compared equal is the one replaced
 	// here; any other resident entry (a write landed after the compare) counts the
-	// Put as changed, as #406 voids its compare.
+	// Put as changed, as #406 voids its compare. #1321 — the same verdict decides
+	// the frame (the return value).
 	identical := same != nil && el.Value.(*lruItem).entry == same
 	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
@@ -2063,7 +2085,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return putOutcomeOf(identical)
 }
 
 // remintLead is the #378 lead L: how long before the cap the refresher terminal

@@ -39,6 +39,16 @@ func (c *ResolvedCacheStore) PutResolvedIfGen(ctx context.Context, v PutVerdict,
 	return c.putIfGen(ctx, key, entry, capturedGen)
 }
 
+// PutResolvedIfGenOutcome is putIfGenOutcome, gated by v: PutResolvedIfGen
+// reporting whether the accepted Put changed the stored bytes (#1321). The
+// cold-dispatch fill hands the outcome to its publish (PublishPut).
+func (c *ResolvedCacheStore) PutResolvedIfGenOutcome(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
+	if !v.Store() {
+		return PutRefused
+	}
+	return c.putIfGenOutcome(ctx, key, entry, capturedGen)
+}
+
 // PutResolvedThenRemark is putThenRemark, gated by v. It reports whether it
 // wrote.
 func (c *ResolvedCacheStore) PutResolvedThenRemark(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry) bool {
@@ -66,10 +76,11 @@ func (c *ResolvedCacheStore) ReplaceResolvedIfGen(ctx context.Context, v PutVerd
 	return c.replaceIfGen(ctx, key, entry, capturedGen)
 }
 
-// ReplaceResolvedIfGenRefresh is replaceIfGenRefresh, gated by v.
-func (c *ResolvedCacheStore) ReplaceResolvedIfGenRefresh(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// ReplaceResolvedIfGenRefresh is replaceIfGenRefresh, gated by v. #1321 — it
+// reports the Put's outcome; PublishRefreshed publishes only a PutChanged.
+func (c *ResolvedCacheStore) ReplaceResolvedIfGenRefresh(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if !v.Store() {
-		return false
+		return PutRefused
 	}
 	return c.replaceIfGenRefresh(ctx, key, entry, capturedGen)
 }

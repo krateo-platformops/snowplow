@@ -745,6 +745,10 @@ type cacheHandle interface {
 	// allows the Put: there is no ungated write on this interface.
 	CaptureGen(key string) uint64
 	PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	// #1321 — PutResolvedIfGen reporting whether the accepted Put changed the
+	// stored bytes; the cold-dispatch fill publishes only a PutChanged
+	// (publishIfSubscribed).
+	PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome
 	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
 	// carriers. Never refuses a storing verdict; re-marks the key once if a dep
 	// recorded on ctx's dep-gen sink moved since the resolve began.

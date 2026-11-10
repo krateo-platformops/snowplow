@@ -216,6 +216,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
+	// #1321 — the D2 replace's publish gate: the served body (a sink read), the
+	// cell's bytes (a stored entry's body, never mutated), whether the key is
+	// still owed a push (a map read). SettleStaleOwed clears an owed mark: only
+	// finishStaleReplace reaches it, on a debt serveStaleWithDebt's cache.Inert
+	// check let open (like PublishRefresh).
+	"StaleServeSink.ServedBody": readOnly443, "ResolvedEntry.Raw": readOnly443, "StaleOwed": readOnly443,
+	"SettleStaleOwed": unreachableInert443,
 	// #930 — reads the dirty-window clock (an atomic pointer load, time.Now by
 	// default) to age a known-stale mark; no state is written.
 	"DirtyWindowNow": readOnly443,
