@@ -1460,7 +1460,7 @@ def _run_rules(run: str, project: str) -> list[dict]:
         r = _get(["compute", "firewall-rules", "describe", fw, "--project", project], f"firewall rule {fw}")
         if r is None:
             continue
-        if r.get("name") != fw or r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
+        if r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
             raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
                           f"{r.get('targetTags')}, description {r.get('description')!r}): refusing")
         rows.append(r)
