@@ -397,6 +397,7 @@ var goAllow443 = map[string]bool{
 	"apistage_stale_debt.go:goReplaceStaleDependent":    false, // #710 PR-2b: a committed dependent's replace + push; only past serveStaleWithDebt's Inert check
 	"apistage_stale_debt.go:ensureStaleOverdueScanner":  false, // #710 PR-2b: once-per-process overdue ticker (counters + one WARN)
 	"apistage_stale_debt.go:joinStaleDebts":             false, // #1033 review: test joins only; waits staleDebtWG and closes a channel, no cache access
+	"external_fetch_flight.go:fetchShared":              false, // #1320: the shared external READ's detached call. Its ctx is pagebudget.Detach(caller): every value kept, the inert flag included; an inert read carries cache.InertHeader in its headers and cache.Inert in its key, so it never shares a non-inert call. Egress + the content-addressed conversion memo only; no cache, informer, dep or refresher state
 	"informer_dispatch_metrics.go:startDispatchSummary": false, // once-per-process summary log ticker
 	"informer_serve.go:startObjectsGetSummary":          false, // once-per-process summary log ticker
 }

@@ -447,6 +447,7 @@ func TestExternalFlight1320_KeyFoldsEveryRequestInput(t *testing.T) {
 		"payload": func(o *httpcall.RequestOptions, _ *context.Context) { o.Payload = ptr.To("{}") },
 		"held":    func(_ *httpcall.RequestOptions, c *context.Context) { *c = credhttp.WithHeldCredential(*c) },
 		"sa dial": func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithServiceAccountDial(*c) },
+		"inert":   func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithInert(*c) },
 		"impersonation": func(_ *httpcall.RequestOptions, c *context.Context) {
 			*c = withEndpointImpersonation(*c, rest.ImpersonationConfig{UserName: "cohort"})
 		},

@@ -14,8 +14,8 @@
 // password, proxy, flags), the method, the resolved URL, EVERY header in order
 // (an exported JWT rides there as Authorization), the payload, and the
 // provenance that changes what is sent (a held credential, a ServiceAccount
-// dial and the token file it reads, a #615 impersonation). Two identities
-// therefore never share a call. The two correlation headers snowplow adds per
+// dial and the token file it reads, a #615 impersonation, the #443 inert
+// flag). Two identities therefore never share a call. The two correlation headers snowplow adds per
 // request (X-Krateo-TraceId, and the W3C traceparent/baggage the tracing
 // transport injects) are not part of what the stage asks for, so they are not
 // in the key: a shared call carries the leader's. A key that cannot fold the
@@ -259,7 +259,10 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 	// The provenance httpClientForEndpoint and httpFetchConverting read from
 	// ctx: each changes the chain built or the headers sent.
 	held, saDial := credhttp.HeldCredential(ctx), cache.ServiceAccountDialFromContext(ctx)
-	prov := []string{"held=" + boolString(held), "sa-dial=" + boolString(saDial)}
+	// #443 — an inert (dry-run) read already differs by its cache.InertHeader;
+	// the flag is folded too, so the shared call's ctx (its starter's) is never
+	// inert for a joiner that is not, or the reverse.
+	prov := []string{"held=" + boolString(held), "sa-dial=" + boolString(saDial), "inert=" + boolString(cache.Inert(ctx))}
 	if saDial {
 		prov = append(prov, "sa-token-file:"+dynamic.ServiceAccountTokenFile())
 	}

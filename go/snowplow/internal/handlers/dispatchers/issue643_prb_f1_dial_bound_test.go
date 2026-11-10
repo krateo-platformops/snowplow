@@ -138,9 +138,15 @@ func TestIssue643_F1c_SlowEndpoint_AbandonedFetchesAreDialledOnce(t *testing.T) 
 	h643Budget(t, budgets)
 	want := h643K * h643M * 2
 
+	// #1320 — the K cohorts read each external key through ONE named
+	// endpointRef credential, so their reads are the same outbound request:
+	// the first starts a call that stalls past the bound, and every later
+	// cohort's read joins it while it is in flight. Boot dials each distinct
+	// request once; every caller still abandons its own wait at the bound.
+	distinct := h643M * 2
 	_, _, ab0 := h643ExternalCounts()
-	if d := env.pass(prewarmScope{kind: scopeKindBoot}); d != want {
-		t.Fatalf("boot dialled %d, want %d", d, want)
+	if d := env.pass(prewarmScope{kind: scopeKindBoot}); d != distinct {
+		t.Fatalf("boot dialled %d, want %d (one per distinct outbound request; identical cohort reads share the in-flight call)", d, distinct)
 	}
 	if _, _, ab1 := h643ExternalCounts(); ab1-ab0 != uint64(want) {
 		t.Fatalf("precondition: %d fetches abandoned at the bound, want %d (the slow arm must exercise the abandoned class)", ab1-ab0, want)
