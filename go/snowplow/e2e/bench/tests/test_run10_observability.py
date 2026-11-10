@@ -178,7 +178,7 @@ def test_run606_streams_a_scrubbed_snowplow_log_and_records_job_pods(harness):
     stream = (out / "snowplow-stream.log").read_text().splitlines()
     msgs = [json.loads(x).get("msg") for x in stream]
     assert "refreshes: subscribed" in msgs
-    assert (out / ".log-stream-stop").exists()                # stopped at collect
+    assert (out / "observe606" / ".log-stream-stop").exists()   # stopped at collect (#1297: in the observer)
     for f in out.glob("snowplow*.log"):
         text = f.read_text()
         assert "scaleuser" not in text and "clientconfig" not in text and PW not in text, f

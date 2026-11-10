@@ -2,68 +2,79 @@
 
 stop_log_stream signalled the stream loop's children (pkill -TERM -P), then the loop (kill). A loop
 already past its stop check could fork its next command in between: `sleep "$LOG_STREAM_RETRY_S"`,
-orphaned, outlived the run (CI's run 42413356862 on #1246: two teardown errors, `sleep 5`, seen on
-Linux only, where the reaper reads /bin/sleep's environment). It now stops the loop with halt_tree,
-which freezes each process before its children are signalled (#1220).
+orphaned, outlived the run (CI's run 42413356862 on #1246). #1249 stopped it with halt_tree.
 
-The arm runs run606.sh's OWN halt_tree and stop_log_stream (read from the script) on a loop of the
-stream loop's shape, caught past its stop check inside the step before its sleep (the real loop's
-`printf ... "$(date +%s)"`). `pkill` and `kill` are wrapped to wait after signalling: that widens
-exactly the gap between the two signals, so the old stop loses the race every time, not one run in
-many. No cluster, no kubectl.
+#1297 moved the stream in-cluster: bench/log_stream.sh runs in the observer pod, and the observer's
+supervisor (bench/incluster.py Segment.halt) stops it by creating its stop file, then TERMing (and,
+past a grace, KILLing) the loop's whole PROCESS GROUP: every command the loop forked is in that
+group, whenever it was forked, so none is left. The arm runs the observer's own stream segment on a
+fake kubectl whose `logs -f` ends at once (the loop then sits in its reconnect `sleep`), and checks
+that nothing of the loop survives the stop. No cluster.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import subprocess
-
-import pytest
+import sys
+import time
 
 from tests.test_run606_real_sequence import BENCH_DIR
 
-_HARNESS = r"""
-set -u
-%(halt_tree)s
-%(stop_log_stream)s
-S="$OUT/.log-stream"
-( set +e
-  while [[ ! -e "$S-stop" ]]; do
-    true                              # the stream (kubectl logs -f | scrub) ended on its own
-    [[ -e "$S-stop" ]] && break       # its stop check: not stopped yet
-    x="$(sleep 2)"                    # printf '{"bench_stream":"reconnect",...}' "$(date +%%s)"
-    sleep "$TOKEN"                    # sleep "$LOG_STREAM_RETRY_S"
-  done ) >/dev/null 2>&1 &
-echo "$!" > "$S.pid"
-LOG_STREAM_PIDFILE="$S.pid"
-sleep 0.7                             # the loop is inside its $(...), past the stop check
-pkill() { command pkill "$@"; local rc=$?; sleep "$GAP_S"; return $rc; }
-kill() { builtin kill "$@"; local rc=$?; [[ "$1" == "-TERM" ]] && sleep "$GAP_S"; return $rc; }
-stop_log_stream
-sleep 1
-if pgrep -f "sleep $TOKEN" >/dev/null; then echo SURVIVED; command pkill -f "sleep $TOKEN"; else echo CLEAN; fi
+FAKE = """#!/bin/sh
+case "$*" in
+  *" get pods "*) echo "2026-10-21T05:00:00Z snowplow-abc " ;;
+  *" logs "*) echo '2026-10-21T06:00:00.5Z {"msg": "x"}' ;;
+esac
+exit 0
 """
 
 
-def _fn(src: str, name: str) -> str:
-    m = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", src, re.S | re.M)
-    assert m, f"run606.sh defines {name}"
-    return m.group(0)
-
-
 def test_stopping_the_log_stream_leaves_no_command_of_its_loop_running(tmp_path):
-    src = (BENCH_DIR / "run606.sh").read_text()
-    script = _HARNESS % {"halt_tree": _fn(src, "halt_tree"), "stop_log_stream": _fn(src, "stop_log_stream")}
+    fbin = tmp_path / "bin"
+    fbin.mkdir()
+    (fbin / "kubectl").write_text(FAKE)
+    (fbin / "kubectl").chmod(0o755)
     token = f"{700 + os.getpid() % 200}.{abs(hash(str(tmp_path))) % 100000}"
-    p = subprocess.run(["bash", "-c", script], env=dict(os.environ, OUT=str(tmp_path), TOKEN=token, GAP_S="1"),
-                       capture_output=True, text=True, timeout=120)
-    assert p.stdout.strip() == "CLEAN", (p.stdout, p.stderr[-2000:])
-    assert (tmp_path / ".log-stream-stop").exists() and not (tmp_path / ".log-stream.pid").exists()
+    out = tmp_path / "out"
+    out.mkdir()
+    driver = ("import sys; from bench import incluster\n"
+              "segs = [s for s in incluster.observe_segments(sys.argv[1], 1, 'app=snowplow') if s.name == 'stream']\n"
+              "sys.exit(incluster.supervise(sys.argv[1], segs, 0, poll_s=0.1))\n")
+    env = dict(os.environ, PATH=f"{fbin}{os.pathsep}{os.environ['PATH']}", PYTHONPATH=str(BENCH_DIR),
+               PW="pw", BENCH_USER_PREFIX="scaleuser-", SNOWPLOW_POD_SELECTOR="app=snowplow",
+               LOG_STREAM_RETRY_S=token)
+    p = subprocess.Popen([sys.executable, "-c", driver, str(out)], env=env, cwd=BENCH_DIR)
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and subprocess.run(["pgrep", "-f", f"sleep {token}"],
+                                                        capture_output=True).returncode != 0:
+            time.sleep(0.2)
+        assert subprocess.run(["pgrep", "-f", f"sleep {token}"], capture_output=True).returncode == 0, \
+            "the loop never reached its reconnect sleep"
+        (out / "stop").touch()
+        p.wait(timeout=60)
+        time.sleep(0.5)
+        left = subprocess.run(["pgrep", "-f", f"sleep {token}"], capture_output=True).returncode == 0
+    finally:
+        if p.poll() is None:
+            p.kill()
+        subprocess.run(["pkill", "-f", f"sleep {token}"], capture_output=True)
+    assert not left, "a command of the stream loop outlived its stop"
+    assert (out / ".log-stream-stop").exists() and (out / "exited").exists()
+    seg = json.loads((out / "observe606.json").read_text())["segments"][0]
+    assert seg["segment"] == "stream" and seg["stopped"]
+    assert '"bench_stream":"reconnect"' in (out / "snowplow-stream.log").read_text()
 
 
-def test_stop_log_stream_stops_its_loop_with_halt_tree():
-    """What the arm above runs is what run606.sh's teardown and collect call."""
-    src = (BENCH_DIR / "run606.sh").read_text()
-    body = _fn(src, "stop_log_stream")
-    assert 'halt_tree "$pid"' in body and "pkill" not in body
+def test_the_stream_is_stopped_by_its_process_group():
+    """What the arm above runs is what the observer runs: the loop in a session of its own, its
+    stop file first, then its group."""
+    from bench import incluster
+    seg = next(s for s in incluster.observe_segments("/out", 15, "x") if s.name == "stream")
+    assert seg.on_stop == ".log-stream-stop" and seg.argv[-1].endswith("bench/log_stream.sh")
+    src = (BENCH_DIR / "bench" / "incluster.py").read_text()
+    assert "start_new_session=True" in src and "os.killpg(p.pid, sig)" in src
+    # the loop is no longer on the operator's machine
+    assert "stop_log_stream" not in (BENCH_DIR / "run606.sh").read_text()

@@ -223,13 +223,14 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     19, + the portal-origin gate's own 600 + 2 x 180 + 60 s in place of the
     env step's 600 s, #1005, + the 300 s pre-drive PSI Job, #1042, + the
     300 s cert-manager install before the installer's, installer#614); + the
-    1,800 s margin = 40,518 s -> 12 h."""
+    1,800 s margin = 40,518 s -> 12 h. #1297 adds the in-cluster term, 4,803 s (2 x 300 pod starts +
+    3 last poll + 8 x 300 data606 calls + 1,800 cleanup): the plan reads 44,421 s -> 13 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "= 39618 s" in p.stderr and "fits TTL_HOURS=12 (43200 s; derived: the plan's 39618 s" in p.stderr
+    assert "= 44421 s" in p.stderr and "fits TTL_HOURS=13 (46800 s; derived: the plan's 44421 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
-    assert p.returncode == 0 and "fits TTL_HOURS=13 (46800 s; derived" in p.stderr
+    assert p.returncode == 0 and "fits TTL_HOURS=14 (50400 s; derived" in p.stderr
 
 
 @pytest.mark.parametrize("env", [{"TTL_HOURS": "8"}, {"TTL_HOURS": "11"},
@@ -245,11 +246,12 @@ def test_a_hand_set_ttl_the_plan_does_not_fit_is_refused_before_any_cloud_call(t
 def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path):
     """R11: the margin is part of the bar. THIS plan adds 3,400 s of data
     budget to the default 38,718 s (DATA_TIMEOUT_S=5800): 42,118 s, under a
-    hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with
+    hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with (#1297: + 4,803 s
+    in-cluster = 47,821 s, now over the 12 h outright)
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 43018 s" in p.stderr
-    assert "needs TTL_HOURS >= 13" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 47821 s" in p.stderr
+    assert "needs TTL_HOURS >= 14" in p.stderr
 
 
 def test_fresh606_phases_are_bounded_and_truncation_is_recorded():

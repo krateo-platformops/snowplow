@@ -25,10 +25,12 @@ import hashlib
 import http.server
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -142,6 +144,22 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         time.sleep(float(os.environ.get("FAKE_SLOW_DOWN", "0")))   # a delete in flight
         if os.environ.get("FAKE_DOWN_FAIL") == "1":
             sys.exit(1)
+        # #1297: the cluster's deletion ends every pod still on it (the fake kubectl's in-cluster
+        # Jobs, when a signal cut the teardown's own collect and deletes short): TERMed, as the
+        # kubelet would, and waited for
+        import glob, signal
+        for pf in glob.glob(os.path.join(STATE, "pods", "*", "pid")):
+            pid = int(open(pf).read())
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                continue
+            for _ in range(150):
+                try:
+                    os.killpg(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
         open(os.path.join(STATE, "deleted"), "w").write("1")
         sys.exit(0)
     if a[:3] == ["container", "clusters", "create"]:
@@ -200,6 +218,141 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+    # #1297: the in-cluster Jobs (bench/incluster.py) RUN here, as their pods would: the container's
+    # own command, its /out at STATE/pods/<job>/out, its kubectl this fake (the run's kubeconfig),
+    # started when the Job is applied, TERMed (as the kubelet would) when the Job is deleted.
+    # FAKE_INC_FAILED=<job>: that Job's pod fails before its program runs (an init container that failed);
+    # FAKE_INC_POOL=<pool>: the pods land on a node of that pool; FAKE_INC_LEFT=1: data606's pod is
+    # still listed when the drivers are applied.
+    INC = ("data606", "observe606")
+    def inc_dir(job):
+        return os.path.join(STATE, "pods", job)
+    def inc_alive(job):
+        return (os.path.exists(os.path.join(inc_dir(job), "pid"))
+                and not os.path.exists(os.path.join(inc_dir(job), "deleted")))
+    if a[:1] == ["apply"] and "-f" in a and os.path.isfile(a[a.index("-f") + 1]):
+        import subprocess, yaml
+        docs = [d for d in yaml.safe_load_all(open(a[a.index("-f") + 1])) if isinstance(d, dict)]
+        secrets = {d["metadata"]["name"]: d.get("stringData") or {} for d in docs if d.get("kind") == "Secret"}
+        inc_jobs = [d for d in docs if d.get("kind") == "Job" and (d.get("metadata") or {}).get("name") in INC]
+        for d in inc_jobs:
+            job = (d.get("metadata") or {}).get("name")
+            if d.get("kind") != "Job" or job not in INC:
+                continue
+            os.makedirs(os.path.join(inc_dir(job), "out"), exist_ok=True)
+            json.dump(d, open(os.path.join(inc_dir(job), "job.json"), "w"))
+            if os.environ.get("FAKE_INC_FAILED") == job:
+                continue
+            c = d["spec"]["template"]["spec"]["containers"][0]
+            out = os.path.join(inc_dir(job), "out")
+            argv = [out if x == "/out" else x for x in c["command"]]
+            argv[argv.index("--linger-s") + 1] = "60"
+            env = dict(os.environ, HOME=os.path.join(inc_dir(job)))
+            for e in c.get("env", []):
+                if e["name"] in ("PATH", "KUBECONFIG", "PYTHONPATH", "HOME"):
+                    continue
+                ref = (e.get("valueFrom") or {}).get("secretKeyRef")
+                env[e["name"]] = secrets[ref["name"]][ref["key"]] if ref else e["value"]
+            p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, start_new_session=True,
+                                 stdout=open(os.path.join(inc_dir(job), "stdout.log"), "ab"), stderr=subprocess.STDOUT)
+            open(os.path.join(inc_dir(job), "pid"), "w").write(str(p.pid))
+        if inc_jobs:
+            sys.exit(0)
+    inc_sel = next((x.split("=", 1)[1] for x in a if x.startswith("job-name=") and x.split("=", 1)[1] in INC), None)
+    if a[:2] == ["get", "pods"] and inc_sel:
+        job = inc_sel
+        applied = os.path.exists(os.path.join(inc_dir(job), "job.json"))
+        listed = applied and (not os.path.exists(os.path.join(inc_dir(job), "deleted"))
+                              or (job == "data606" and os.environ.get("FAKE_INC_LEFT") == "1"))
+        failed = os.environ.get("FAKE_INC_FAILED") == job
+        done = os.path.exists(os.path.join(inc_dir(job), "out", "done"))
+        phase = "Failed" if failed else "Running"
+        jp = next((x for x in a if x.startswith("jsonpath=")), "")
+        if "json" in a:
+            spec = json.load(open(os.path.join(inc_dir(job), "job.json")))["spec"]["template"]["spec"] if listed else {}
+            # FAKE_INC_OOM=<job>: by collect its container was OOM-killed (the pod Failed)
+            st = ({"phase": "Failed", "containerStatuses": [{"name": spec["containers"][0]["name"], "ready": False,
+                                                              "restartCount": 0, "state": {"terminated": {
+                                                                  "reason": "OOMKilled", "exitCode": 137}}}]}
+                  if listed and os.environ.get("FAKE_INC_OOM") == job else {"phase": phase})
+            print(json.dumps({"items": [{"metadata": {"name": job + "-0"},
+                                         "spec": {"nodeName": "loadgen-0", "containers": spec.get("containers", [])},
+                                         "status": st}] if listed else []}))
+            sys.exit(0)
+        if "name" in a:
+            print("pod/" + job + "-0" if listed else ""); sys.exit(0)
+        if ".metadata.name" in jp:
+            print(job + "-0 " if listed else ""); sys.exit(0)
+        if "containerStatuses" in jp:
+            print(f"{phase}/{'true' if done else 'false'}" if listed else ""); sys.exit(0)
+        if ".status.phase" in jp:
+            print(phase if listed else ""); sys.exit(0)
+        sys.exit(0)
+    # review M1: the live loadgen node and the pods on it. FAKE_INC_ALLOC="<cpu> <memory>": its
+    # allocatable (default an n2-standard-16's, k6_job.LOADGEN_ALLOCATABLE); FAKE_INC_DS="<cpu> <memory>":
+    # the requests of the DaemonSet pods already there (default run 23's plan: the 1000m / 4096Mi
+    # reserve it kept); the observer's pod counts once it runs
+    if a[:2] == ["get", "nodes"] and "bench.krateo.io/pool=loadgen" in a:
+        cpu, mem = os.environ.get("FAKE_INC_ALLOC", "15890m 59825Mi").split()
+        print(json.dumps({"items": [{"metadata": {"name": "loadgen-0", "labels": {"bench.krateo.io/pool": "loadgen"}},
+                                     "status": {"allocatable": {"cpu": cpu, "memory": mem}}}]}))
+        sys.exit(0)
+    if a[:2] == ["get", "pods"] and "spec.nodeName=loadgen-0" in a:
+        cpu, mem = os.environ.get("FAKE_INC_DS", "1000m 4096Mi").split()
+        pods = [{"metadata": {"namespace": "kube-system", "name": "gke-daemonsets"},
+                 "spec": {"containers": [{"name": "ds", "resources": {"requests": {"cpu": cpu, "memory": mem}}}]},
+                 "status": {"phase": "Running"}}]
+        if inc_alive("observe606"):
+            spec = json.load(open(os.path.join(inc_dir("observe606"), "job.json")))["spec"]["template"]["spec"]
+            pods.append({"metadata": {"namespace": "bench-loadgen", "name": "observe606-0",
+                                      "labels": {"job-name": "observe606"}},
+                         "spec": {"containers": spec["containers"], "initContainers": spec["initContainers"]},
+                         "status": {"phase": "Running"}})
+        print(json.dumps({"items": pods}))
+        sys.exit(0)
+    if a[:2] == ["get", "node"] and "loadgen-0" in a:
+        print(json.dumps({"metadata": {"name": "loadgen-0", "labels": {
+            "bench.krateo.io/pool": os.environ.get("FAKE_INC_POOL", "loadgen"),
+            "node.kubernetes.io/instance-type": "n2-standard-16"}}}))
+        sys.exit(0)
+    inc_pod = next((j for j in INC for x in a if x == j + "-0" or x.startswith(j + "-0:")), None)
+    if inc_pod and a[:1] == ["exec"]:
+        import subprocess
+        cmd = a[a.index("--") + 1:] if "--" in a else a[-2:]
+        out = os.path.join(inc_dir(inc_pod), "out")
+        cmd = [x.replace("/out", out) for x in cmd]
+        sys.exit(subprocess.run(cmd).returncode)
+    if inc_pod and a[:1] == ["cp"]:
+        import shutil
+        shutil.copytree(os.path.join(inc_dir(inc_pod), "out"), a[-1], dirs_exist_ok=True)
+        sys.exit(0)
+    if inc_pod and a[:1] == ["logs"]:
+        print("tools: kubectl (fake) verified; kubeconfig as this pod's ServiceAccount"); sys.exit(0)
+    if a[:1] == ["delete"]:
+        with open(os.path.join(STATE, "deleted.jsonl"), "a") as fh:
+            fh.write(json.dumps({"ns": ns, "names": [x for x in a[1:] if not x.startswith("-")],
+                                 "t": time.time()}) + chr(10))
+        for job in INC:
+            if f"job/{job}" in a and os.path.exists(os.path.join(inc_dir(job), "job.json")):
+                open(os.path.join(inc_dir(job), "deleted"), "w").write("1")
+                pf = os.path.join(inc_dir(job), "pid")
+                if os.path.exists(pf):
+                    import signal
+                    try:
+                        os.killpg(int(open(pf).read()), signal.SIGTERM)
+                    except OSError:
+                        pass
+                    for _ in range(100):        # --cascade=foreground --wait: until the pod is gone
+                        try:
+                            os.killpg(int(open(pf).read()), 0)
+                        except OSError:
+                            break
+                        time.sleep(0.1)
+                    else:
+                        try:
+                            os.killpg(int(open(pf).read()), signal.SIGKILL)
+                        except OSError:
+                            pass
     # #1004: the full-widen stage's objects, its Job's /out and the CRD's deletion.
     # FAKE_FW_JOB: ok (default: arms once applied, exits once the widened CRD is
     # applied) | ends_unarmed (exits without arming) | never (never arms);
@@ -1366,6 +1519,22 @@ def harness(tmp_path):
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME
     (tmp_path / "home").mkdir()
     yield env, state, ambient, tmp_path
+    # #1297: a cluster a test left standing (its gke-down failed, by design) still holds its
+    # in-cluster Jobs' pods, which this fake runs as processes: they end with the test
+    import glob
+    for pf in glob.glob(str(state / "pods" / "*" / "pid")):
+        pid = int(open(pf).read())
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                break
+            for _ in range(50):
+                try:
+                    os.killpg(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
     srv.shutdown()
     quotas_stop()
 
@@ -1435,9 +1604,56 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     assert "goog-k8s-cluster-name" not in " ".join(gcl[-1])
     assert "krateo-057" not in json.dumps(calls)
 
+    # #1297: data606 and the samplers ran as the in-cluster Jobs (their pods stood in for by this
+    # fake, running the containers' own commands), on the loadgen pool with the rendered requests;
+    # data606's pod was gone, its Job, ServiceAccount and RBAC deleted, before any driver was applied
+    o = tmp / "out"
+    recs = [json.loads(ln) for ln in (o / "incluster-placement.jsonl").read_text().splitlines()]
+    placed = [r for r in recs if r["kind"] == "incluster_placement"]
+    rooms = [r for r in recs if r["kind"] == "loadgen_room"]
+    assert [(p["job"], p["ok"], p["node_pool"]) for p in placed] == [("observe606", True, "loadgen"),
+                                                                      ("data606", True, "loadgen")]
+    # the room, read at env (the observer still to come) and at data (it is there), recorded
+    assert [(r["phase"], r["ok"], r["observer_counted"], r["cpu_m"]) for r in rooms] == [
+        ("env", True, "to come", 14390), ("data", True, "scheduled", 14390)]
+    assert rooms[1]["floor_cpu_m"] == 2667 and rooms[1]["floor_memory_mi"] == 8192
+    # review M2: the observer ran to collect, and the verdict says so
+    obs = [json.loads(ln) for ln in (o / "observer-pod.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["pod"], r["phase"]) for r in obs] == [("observer_pod", "observe606-0", "Running")]
+    # review M1: the live node's allocatable (15890m / 59825Mi) minus the DaemonSets' 1000m / 4096Mi minus the
+    # observer's 500m / 1Gi (scheduled, with its 100m / 128Mi init container under its main one): run 23's plan
+    assert placed[1]["requests"] == {"data606": {"cpu": "14390m", "memory": "54705Mi"}}
+    deleted = [json.loads(ln) for ln in (state / "deleted.jsonl").read_text().splitlines()]
+    gone = next(d for d in deleted if "job/data606" in d["names"])
+    assert "serviceaccount/bench-data606" in gone["names"]
+    assert any(d["names"] == ["clusterrolebinding/bench-data606", "clusterrole/bench-data606"] for d in deleted)
+    assert any(d["ns"] == "krateo-system" and "role/bench-observe606" in d["names"] for d in deleted)
+    applied = [json.loads(ln) for ln in (state / "calls.jsonl").read_text().splitlines()]
+    i_gone = next(i for i, c in enumerate(applied) if "job/data606" in c["argv"] and "delete" in c["argv"])
+    i_drivers = next(i for i, c in enumerate(applied) if any(x.endswith("loadgen-job.yaml") for x in c["argv"]))
+    assert i_gone < i_drivers
+    assert "data606: no pod left on the loadgen node" in (o / "run.log").read_text()
+    # the samplers' files, under the names evaluate reads, from the observer's /out
+    for f in ("apf.jsonl.gz", "top.jsonl", "top-boot.jsonl", "snowplow-stream.log", "observe606.json"):
+        assert (o / f).exists(), f
+    segs = {s["segment"]: s for s in json.loads((o / "observe606.json").read_text())["segments"]}
+    assert all(segs[s]["started"] and segs[s]["stopped"] for s in ("apf", "stream", "top_boot", "top"))
+    assert segs["top_boot"]["stopped"] <= segs["top"]["started"] + 1      # top_boot hands over to top
+    import gzip as _gz
+    apf = [json.loads(ln) for ln in _gz.open(o / "apf.jsonl.gz", "rt").read().splitlines()]
+    assert apf and all(r["kind"] == "apf" and not r.get("failed") for r in apf)
+    # the host's own load (#1297), recorded and said with the verdict
+    assert verdict["report"]["host_load_report_only"]["state"] == "read"
+    assert [ln.split(":")[0] for ln in verdict["report"]["incluster_report_only"]["lines"]] == [
+        "INFO loadgen room (env)", "INFO loadgen room (data)", "INFO in-cluster Job observe606",
+        "INFO in-cluster Job data606", "INFO observer pod"]
+    assert verdict["report"]["incluster_report_only"]["lines"][-1] == "INFO observer pod: observe606-0 Running: ran to collect"
+
     # the synthetic users' password never reaches a log
     assert SCALEUSER_PASSWORD not in out
     assert SCALEUSER_PASSWORD not in (tmp / "out" / "run.log").read_text()
+    for f in ("observe-job.yaml", "data606-job.yaml"):
+        assert SCALEUSER_PASSWORD not in (o / f).read_text()
 
 
 def test_gke_entrypoint_never_imports_the_context_guard():

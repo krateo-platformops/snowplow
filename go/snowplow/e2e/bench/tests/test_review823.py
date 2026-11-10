@@ -185,7 +185,8 @@ def test_mem_stop_is_bounded_by_wall_clock_with_slow_execs(harness):
     log = (tmp / "out" / "run.log").read_text()
     assert "mem606-0 did not end its stream within 6s" in log
     calls = [json.loads(x) for x in (state / "calls.jsonl").read_text().splitlines()]
-    waits = [c for c in calls if c["argv"][-3:] == ["test", "-f", "/out/exited"]]
+    # mem606's own waits (#1297: the observer's collect asks its pod the same question)
+    waits = [c for c in calls if c["argv"][-3:] == ["test", "-f", "/out/exited"] and "mem606-0" in c["argv"]]
     assert 1 <= len(waits) <= 2, len(waits)          # 19 s of execs would be 3
     assert p.returncode == 0
 
@@ -204,12 +205,14 @@ def _functions(*names):
 
 def test_stop_without_a_pidfile_kills_nothing(tmp_path):
     """The parent shell's variables survive collect's subshell: once the
-    pidfile is gone, teardown's stop must not kill whatever owns that PID now."""
+    pidfile is gone, a later stop must not kill whatever owns that PID now.
+    (#1297: the log stream is in-cluster; the one local background process left
+    is the host-load recorder, stopped the same way.)"""
     victim = subprocess.Popen(["sleep", "30"])
     try:
-        script = (_functions("stop_log_stream")
-                  + f'\nOUT="{tmp_path}"; LOG_STREAM_PIDFILE="{tmp_path}/.log-stream.pid"\n'
-                  + f"LOG_STREAM_PID={victim.pid}\nstop_log_stream\n")
+        script = (_functions("stop_host_load")
+                  + f'\nOUT="{tmp_path}"; HOST_LOAD_PIDFILE="{tmp_path}/.host-load.pid"\n'
+                  + f"HOST_LOAD_PID={victim.pid}\nstop_host_load\n")
         subprocess.run(["bash", "-c", script], check=True, timeout=10)
         time.sleep(0.2)
         assert victim.poll() is None, "a PID with no pidfile was killed"

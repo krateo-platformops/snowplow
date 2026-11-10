@@ -120,25 +120,37 @@ def _reap(state: Path) -> bool:
 
 
 def _top_loop(tmp_path, run_s: float, poll_s: str = "1"):
-    """run606.sh's own start_top_loop / stop_top_loop, with a kubectl whose
-    first call hangs."""
+    """#1297: the observer's own top segment (bench/incluster.py, as it runs in its pod on the
+    loadgen node), with a kubectl whose first call hangs: started by ctl/top, stopped by /out/stop."""
     state = tmp_path / "state"
     state.mkdir()
     out = tmp_path / "out"
     out.mkdir()
-    fake = tmp_path / "kubectl"
+    fbin = tmp_path / "bin"
+    fbin.mkdir()
+    fake = fbin / "kubectl"
     fake.write_text(FAKE_TOP)
     fake.chmod(0o755)
-    script = _all_fns() + f"\nK=({fake})\nstart_top_loop\nsleep {run_s}\nstop_top_loop\nsleep 1\n"
-    env = dict(os.environ, OUT=str(out), DRY="0", TOP_POLL_S=poll_s, PW="pw",
-               SNOWPLOW_POD_SELECTOR="app.kubernetes.io/name=snowplow", FAKE_STATE=str(state),
-               PYTHONPATH=str(BENCH_DIR))
+    driver = ("import sys; from bench import incluster\n"
+              "segs = [s for s in incluster.observe_segments(sys.argv[1], float(sys.argv[2]), "
+              "'app.kubernetes.io/name=snowplow') if s.name == 'top']\n"
+              "sys.exit(incluster.supervise(sys.argv[1], segs, 0, poll_s=0.1))\n")
+    env = dict(os.environ, FAKE_STATE=str(state), PYTHONPATH=str(BENCH_DIR),
+               PATH=f"{fbin}{os.pathsep}{os.environ['PATH']}")
+    proc = subprocess.Popen([sys.executable, "-c", driver, str(out), poll_s], env=env, cwd=BENCH_DIR,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        p = subprocess.run(["bash", "-c", script], env=env, cwd=BENCH_DIR, capture_output=True,
-                           text=True, timeout=120)
+        time.sleep(0.5)
+        (out / "ctl").mkdir(exist_ok=True)
+        (out / "ctl" / "top").touch()
+        time.sleep(run_s)
+        (out / "stop").touch()
+        _, err = proc.communicate(timeout=120)
     finally:
+        if proc.poll() is None:
+            proc.kill()
         left_behind = _reap(state)
-    assert p.returncode == 0, p.stderr
+    assert proc.returncode == 0, err
     recs = [json.loads(ln) for ln in (out / "top.jsonl").read_text().splitlines()] \
         if (out / "top.jsonl").exists() else []
     return recs, state, out, left_behind
@@ -158,7 +170,9 @@ def test_a_hung_top_call_fails_alone_and_the_samples_after_it_still_arrive(tmp_p
     assert "--request-timeout=1s" in (state / "argv-0").read_text()
     # the hung call's process was killed by the sampler, not left behind
     assert (state / "hung.pid").exists() and not left_behind
-    assert not (out / ".sampler-top.pid").exists()      # stopped through its pidfile
+    # stopped by the observer's /out/stop; its record says when (#1297)
+    seg = json.loads((out / "observe606.json").read_text())["segments"][0]
+    assert seg["segment"] == "top" and seg["started"] and seg["stopped"] and (out / "exited").exists()
 
 
 def test_a_failed_sample_is_counted_as_failed_through_evaluate(tmp_path):
@@ -1175,14 +1189,16 @@ def test_dry_run_shows_both_bounded_samplers(tmp_path):
     from tests.test_606 import _run606
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", TOP_POLL_S="15")
     assert p.returncode == 0, p.stderr[-2000:]
-    sam = [ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.sampler" in ln]
-    assert len(sam) == 3, sam
-    assert all("--every-s 15" in ln and "--request-timeout=15s" in ln for ln in sam)
-    assert "--kind apf" in sam[0] and "get --raw=/metrics" in sam[0]          # from env: the whole run
-    assert "--kind top_boot" in sam[1] and "top-boot.jsonl" in sam[1]         # #922 F3: from the restart
-    assert "--kind top " in sam[2] and "top pod -l app.kubernetes.io/name=snowplow" in sam[2]
+    # #1297: the samplers run in-cluster, in the observer on the loadgen node (bench/incluster.py)
+    lines = p.stderr.splitlines()
+    obs = next(i for i, ln in enumerate(lines) if "DRY: python3 -m bench.incluster render-observe" in ln)
+    assert "--every-s 15" in lines[obs] and "samples apf (and later top_boot, top) every 15s" in lines[obs]
+    boot = next(i for i, ln in enumerate(lines) if "DRY: observe606: top_boot samples from now" in ln)
+    top = next(i for i, ln in enumerate(lines) if "DRY: observe606: top samples from now" in ln)
+    assert obs < boot < top                                                   # env < reboot (#922 F3) < measure
+    assert "kubectl top every 15s" in lines[boot] and "kubectl top every 15s" in lines[top]
     assert "bench.flowcontrol" in p.stderr and "probe -> bench-flowschemas.yaml (kapply) -> verify" in p.stderr
-    assert "get --raw=/metrics (APF preflight)" in p.stderr
+    assert "get --raw=/metrics (APF preflight, in-cluster)" in p.stderr
     ev = next(ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.load606 evaluate" in ln)
     assert ev.endswith(f"--apf {tmp_path / 'out' / 'apf.jsonl.gz'}")
 
