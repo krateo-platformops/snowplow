@@ -81,6 +81,17 @@ X-Krateo-Provenance: v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJhZ2VudFNlc3Npb25JZCI6InNlc18w
 | `op` | integer | with `confirmedSet` | at least 0 and less than `confirmedSet.count`: this `/call`'s index in the set | `krateo.audit.client.confirmed_set.op` |
 | `requestedAt` | string | no | RFC 3339 with exactly 3 fractional digits, `Z` or `±hh:mm` with hour 00-23 and minute 00-59, a real date and time, and an instant whose UTC form is in the years 0000-9999 (`new Date().toISOString()` of a present-day date always is) | `krateo.audit.client.requested_at`, rewritten in UTC (`...Z`) |
 
+**A write no confirm gate ran for** (a sandbox-confined preview the portal
+dispatches without showing the gate) sends `source`, `agentSessionId` when an
+agent made it, and `requestedAt`, with **no** `confirmationId`, `confirmedSet`
+or `op`. That header is valid. The missing keys are the truthful record that
+nothing was confirmed; never send placeholder values. The portal's own
+encoder output for this case is a fixture in snowplow
+(`internal/support/audit/testdata/provenance_portal_1333/samples.json`,
+sample 3, `TestProvenance1333_S_AnUnconfirmedPreviewIsValid`), next to three
+confirmed-set samples whose `sha256` is re-checked against their canonical
+bytes (`TestProvenance1333_P_ThePortalsEncoderIsRead`).
+
 Any other key is a rejection, and so is:
 
 - a key that differs only in case (`Source`), or a key given twice;
