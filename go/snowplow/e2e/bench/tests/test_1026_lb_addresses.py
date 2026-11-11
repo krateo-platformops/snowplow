@@ -261,6 +261,27 @@ def test_an_address_backstop_that_could_not_do_its_job_is_loud(lbfakes, monkeypa
     assert rec["address_problems"]
 
 
+@pytest.mark.parametrize("server", ["", "34.90.12.7"])
+def test_a_cluster_that_never_had_an_api_endpoint_is_no_possible_address_leak(lbfakes, monkeypatch, capsys,
+                                                                               server):
+    """Run 25: arms stopped while GKE was still creating their clusters, before any kubeconfig was
+    written, logged "ADDRESS BACKSTOP FAILED ... the bench kubeconfig's server (None) is not <cluster>'s
+    endpoint (None) ... may be left RESERVED"; the project held 0 static addresses. A cluster GKE gives
+    no endpoint has no API server anyone reached, so no LoadBalancer Service of it exists: said as
+    known (none), never as a leak it cannot see; nothing is read through any kubeconfig."""
+    monkeypatch.setenv("FAKE_ENDPOINT", "")
+    monkeypatch.setenv("FAKE_SERVER", server)
+    rec = {}
+    problems = gke.teardown(gke.default_spec(NAME), dry_run=False, log=lambda m: None, budget_s=60,
+                            clock=_ticks(), sleep=lambda s: None, record=rec)
+    assert problems == [] and rec["address_problems"] == [] and rec["lb_services"] == []
+    assert rec["lb_release"].startswith(f"none: GKE gives {NAME} no API endpoint")
+    assert gke.ADDRESS_BACKSTOP_FAILED not in capsys.readouterr().err
+    c = _calls(lbfakes)
+    assert not any(x[:2] == ["kubectl", "get"] and "svc" in x for x in c)
+    assert not any(x[:3] == ["gcloud", "compute", "addresses"] for x in c)
+
+
 # ─── 4. PREFLIGHT ───────────────────────────────────────────────────────────
 
 def test_the_static_address_fit_reads_the_regions_quota():

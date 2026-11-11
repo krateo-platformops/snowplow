@@ -319,7 +319,8 @@ FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
                                      + FW_READS * COLLECT_TIMEOUT_S + FW_DELETES * COLLECT_TIMEOUT_S + FW_DELETE_S ))
 # #1297: the in-cluster Jobs' own waits (bench/incluster.py): the observer's pod start (env), the
 # data606 pod's start, its result's last poll and its bounded calls (INC_FINISH_CALLS: the loadgen room's 2
-# reads, its /out copy, its init log, /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
+# reads, its /out copy, its init log (or, for a pod that never started, job_pod_why's read in its place),
+# /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
 INC_FINISH_CALLS=8
 INC_POLL_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1])))' "$PREFLIGHT_POLL_S")"   # data606_wait's poll, rounded up
 INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + INC_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
@@ -948,7 +949,13 @@ s_registry() {
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
-  (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1; }
+  # run 25: exit 4 is NO ANSWER within the step's bound (bench/ghcr_pull.py EXIT_NO_ANSWER): whether the
+  # token resolves them is unknown, and the line says so; any other failure is the registry's own answer
+  case "$rc" in
+    0) ;;
+    4) record_failure "registry FAILED: the registry gave NO ANSWER for some of this install's private charts and images within the step's bound (above: which call, how often): whether the ghcr pull token resolves them is unknown"; return 1 ;;
+    *) record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1 ;;
+  esac
 }
 # installer#614: cert-manager BEFORE the installer, exactly as krateo-057 has it
 # (bench/cert_manager.py says what and why). Installer 0.3.506 ships it only
@@ -1233,9 +1240,9 @@ s_env() {
   # The platform is up: snowplow's log is streamed from here to collect, and
   # the API server's flow control sampled (#919) — in-cluster, by the observer
   # on the loadgen node (#1297), never from this machine.
-  # #1297 review M1: the loadgen node can hold data606 (its live room, run 23's share as the floor),
-  # checked before the observer and long before the data load; s_data reads it again to render
-  if [[ "$DRY" == "1" ]]; then log "DRY: loadgen room (env): the live loadgen node's allocatable - its scheduled pods' requests - the observer's, refused below run 23's share"
+  # #1297 review M1: the loadgen node can hold data606's need (run 23's share) in its live room,
+  # checked before the observer and long before the data load; s_data checks it again before it applies
+  if [[ "$DRY" == "1" ]]; then log "DRY: loadgen room (env): the live loadgen node's allocatable - what the scheduler counts against it - the observer's, refused when it does not hold data606's need (run 23's share)"
   else loadgen_room env "$OUT/.loadgen-room-env.json" || return 1; fi
   start_observer || return 1
   apf_preflight || return 1
@@ -1313,7 +1320,7 @@ run_preflight_job() {
     return 1
   fi
   if [[ -z "$ok" || "$ok" == "0" ]]; then
-    log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s (${what})"
+    log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s (${what}): $(job_pod_why "$job")"
     return 1
   fi
   log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
@@ -1345,8 +1352,10 @@ s_psi() {
     sleep "$PREFLIGHT_POLL_S"
   done
   if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
+    why="$(job_pod_why psi606)"
+    : > "$KERR"          # the reason is what the API server said, in the line
     "${K[@]}" -n bench-loadgen delete job psi606 --wait=false >/dev/null 2>&1 || true
-    record_failure "psi FAILED: the psi606 Job did not finish within ${PREFLIGHT_TIMEOUT_S}s: the browser's starvation evidence could not be checked; refused before any drive time" || true
+    record_failure "psi FAILED: the psi606 Job did not finish within ${PREFLIGHT_TIMEOUT_S}s (${why}): the browser's starvation evidence could not be checked; refused before any drive time" || true
     return 1
   fi
   "${K[@]}" -n bench-loadgen logs job/psi606 > "$OUT/psi.jsonl" 2>&1 || true
@@ -1409,9 +1418,9 @@ s_data() {
   # shellcheck disable=SC2206
   [[ "$FRESH_MODES" == "annotation" ]] || args+=(--fresh-modes $FRESH_MODES)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: ${INC[*]} render-data606 --context $KCTX --timeout-s $DATA_TIMEOUT_S --room <the live loadgen node: allocatable - scheduled requests - the observer, refused below run 23's share> -- ${args[*]} > $mf; kapply; the pod on the loadgen node; wait for /out/done; copy /out -> $OUT/data606 (data-proof.json); delete the Job, its ServiceAccount and RBAC"
+    log "DRY: ${INC[*]} render-data606 --context $KCTX --timeout-s $DATA_TIMEOUT_S --room <the live loadgen node's room: allocatable - what the scheduler counts - the observer; data606 requests its need (run 23's share), refused when the room does not hold it> -- ${args[*]} > $mf; kapply; the pod on the loadgen node; wait for /out/done; copy /out -> $OUT/data606 (data-proof.json); delete the Job, its ServiceAccount and RBAC"
   else
-    # its requests: what the live loadgen node has left now (the observer there included)
+    # its requests: its need, once the live loadgen node's room (the observer there included) holds it
     loadgen_room data "$OUT/loadgen-room.json" || return 1
     "${INC[@]}" render-data606 --context "$KCTX" --timeout-s "$DATA_TIMEOUT_S" --linger-s "$COLLECT_CAP_S" \
         --room "$OUT/loadgen-room.json" -- "${args[@]}" > "$mf"
@@ -1694,8 +1703,9 @@ kerr_line() {
 # the step, and the command's stderr summarized and redacted (kerr_line).
 # Returns 1, so `cmd || record_failure "x FAILED: ..."` fails the step.
 record_failure() {
-  local what="$1" parts
-  log "${what}: $(kerr_line)"
+  local what="$1" parts kl
+  kl="$(kerr_line)"
+  log "${what}${kl:+: ${kl}}"       # no dangling ": " when the command wrote nothing
   parts="$(python3 "${HERE:-.}/bench/identity.py" --summary-json < "$KERR" 2>/dev/null || echo '["<withheld: the identity redactor did not run>"]')"
   python3 -c 'import json, sys, time
 print(json.dumps({"kind": "command_failure", "step": sys.argv[1], "what": sys.argv[2], "t": time.time(),
@@ -2004,9 +2014,25 @@ incluster_pod() {
       -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
       2>/dev/null | awk 'NF == 1 {print $1}' | tail -1
 }
+# job_pod_why <job>: where the bench-loadgen Job's pod stands, for a failure line, never empty
+# (bench/load606.py pod_why): its phase, the scheduler's OWN reason while it is not scheduled (the
+# FailedScheduling message of its PodScheduled condition: run 24b's data606 sat Pending on
+# "Insufficient memory" while its failure line said nothing), each waiting container's reason. One
+# bounded read; a read that fails says so, with kubectl's error.
+job_pod_why() {
+  local job="$1" pods
+  if pods="$(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
+               get pods -l "job-name=$job" -o json 2>"$KERR")"; then
+    printf '%s' "$pods" | python3 -m bench.load606 pod-why --job "$job"
+  else
+    printf 'the pods of job %s could not be read (%s): where its pod stands is unknown\n' "$job" \
+        "$(kerr_line | tr '\n' ' ' | sed 's/ *$//')"
+  fi
+}
 # incluster_started <job> <manifest> <secs>: its pod runs (its init container fetched kubectl and
 # wrote its kubeconfig) within <secs>, on the loadgen pool with the rendered requests; else the step
-# fails, with the init container's log kept in OUT/<job>-tools.log
+# fails, with the init container's log kept in OUT/<job>-tools.log, or, for a pod that never
+# started, where it stands and why (job_pod_why: the read the init log's would have been)
 incluster_started() {
   local job="$1" mf="$2" secs="$3" deadline phase pod
   deadline=$(( $(date +%s) + secs ))
@@ -2022,7 +2048,10 @@ incluster_started() {
               return 1 ;;
     esac
     if (( $(date +%s) >= deadline )); then
-      record_failure "$job FAILED: its pod did not start within ${secs}s (phase ${phase:-none})" || true
+      local why
+      why="$(job_pod_why "$job")"
+      : > "$KERR"          # the reason is what the API server said, in the line; no stale kubectl error after it
+      record_failure "$job FAILED: its pod did not start within ${secs}s: ${why}" || true
       return 1
     fi
     sleep "$PREFLIGHT_POLL_S"
@@ -2056,11 +2085,14 @@ incluster_placement() {
   fi
   log "$job: ${why}"
 }
-# loadgen_room <phase> <out.json>: what the LIVE loadgen node leaves data606 (review M1): its
-# allocatable minus the requests of every pod already scheduled on it (GKE's DaemonSets included)
-# minus the observer's when it is not there yet (bench/incluster.py loadgen_room). The record goes
-# into incluster-placement.jsonl and <out.json> (s_data renders data606's requests from it); below
-# the floor (what data606 had in run 23) the step fails, with the numbers, before data606 is applied.
+# loadgen_room <phase> <out.json>: whether the LIVE loadgen node holds data606's need (review M1): its
+# allocatable minus what the scheduler counts against it (every pod bound there and not finished,
+# terminating ones and GKE's DaemonSets included, in exact quantities) minus the observer's when it
+# is not there yet (bench/incluster.py loadgen_room). The record goes into incluster-placement.jsonl
+# and <out.json> (s_data renders data606's requests from it: its need, never the room, so a pod that
+# lands after this read cannot make it unschedulable unless it takes more than the recorded slack);
+# a room below the need (what data606 had in run 23) fails the step, with the numbers, before data606
+# is applied.
 loadgen_room() {
   local phase="$1" out="$2" node rec rc=0 why
   local KR=(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s")
@@ -2071,8 +2103,12 @@ loadgen_room() {
     record_failure "loadgen room FAILED ($phase): the loadgen node or the pods on it could not be read (want one node in the pool)" || true
     return 1
   fi
-  rec="$("${INC[@]}" room --nodes "$OUT/.loadgen-nodes.json" --pods "$OUT/.loadgen-pods.json" --phase "$phase")" || rc=$?
+  rec="$("${INC[@]}" room --nodes "$OUT/.loadgen-nodes.json" --pods "$OUT/.loadgen-pods.json" --phase "$phase" 2>"$KERR")" || rc=$?
   rm -f "$OUT/.loadgen-nodes.json" "$OUT/.loadgen-pods.json"
+  if [[ -z "$rec" ]]; then     # it said nothing (it crashed): its error is the reason, and no blank record
+    record_failure "loadgen room FAILED ($phase): bench.incluster room gave no record (exit ${rc})" || true
+    return 1
+  fi
   printf '%s\n' "$rec" >> "$OUT/incluster-placement.jsonl"
   printf '%s\n' "$rec" > "$out"
   why="$(printf '%s' "$rec" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("why"))' 2>/dev/null)"

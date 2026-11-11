@@ -360,13 +360,14 @@ def test_the_zone_fallback_keeps_every_safety_check(fakegke, monkeypatch, zone_m
     assert not any(c.startswith("delete") for c in calls(fakegke))
 
 
-def test_gke_down_cli_deletes_a_zonal_cluster(fakegke, monkeypatch):
+def test_gke_down_cli_deletes_a_zonal_cluster(fakegke, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_REGION_DESCRIBE", "notfound")
     monkeypatch.setenv("FAKE_ZONE_DESCRIBE", "found")
-    # #1026: deleted (exit 4, not 1): the cluster's API server never answered, so its LoadBalancer
-    # Services (and their address names) are unknown, said as such
+    # deleted (exit 0, not 1). This fake cluster has no endpoint: no API server anyone reached, so no
+    # LoadBalancer Service of it can exist and no address backstop alarm (#1335, run 25's false alarm)
     assert gke.main(["gke-down", "--name", NAME, "--zone", ZONE, "--budget-s", "60", "--legacy-zonal",
-                     "--yes"]) == gke.EXIT_BACKSTOP_FAILED
+                     "--yes"]) == 0
+    assert gke.ADDRESS_BACKSTOP_FAILED not in capsys.readouterr().err
     assert f"delete --zone {ZONE}" in calls(fakegke) and not any(c.startswith("delete --region") for c in calls(fakegke))
 
 
