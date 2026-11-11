@@ -204,6 +204,41 @@ def test_an_override_the_render_does_not_carry_is_refused(tmp_path):
     assert f"ghcr.io/krateo-platformops/frontend:{FTAG}" in p.stderr
 
 
+def test_an_overridden_render_with_no_answer_is_asked_again_within_the_bound(monkeypatch, tmp_path, capsys):
+    """#1335's rule for the override too: the frontend's helm template does not finish once (no
+    answer, not a refusal). Its reference is asked again within the step's own bound, renders, and
+    the overridden image is resolved; the run is not refused."""
+    from bench import ghcr_pull
+    for k, val in (("HTTP_BOUND_S", 0.5), ("BLOB_BOUND_S", 0.5), ("PARSE_BOUND_S", 8.0), ("RENDER_BOUND_S", 8.0)):
+        monkeypatch.setattr(ghcr_pull, k, val)
+    v = _installer(tmp_path)
+    # a second chart, as every real install has: the step's bound is per reference (#1335 Budget),
+    # so one reference alone never leaves room for its own retry
+    pins = tmp_path / "installer" / "files" / "component-pins.yaml"
+    pins.write_text(yaml.safe_dump({"components": yaml.safe_load(pins.read_text())["components"] + [
+        {"name": "agentgateway-controller", "version": "0.2.0", "repo": "oci://ghcr.io/krateo-agentiko/charts"}]}))
+    once = tmp_path / "rendered-once"
+    helm = tmp_path / "helm-slow-once"
+    # `helm template <release> ...`: the frontend's first render never finishes
+    helm.write_text(f"#!/bin/sh\nif [ \"$2\" = frontend ] && [ ! -e {once} ]; then : > {once}; exec sleep 60; fi\n"
+                    f"exec {os.environ['FAKE_HELM_TEMPLATE_BIN']} \"$@\"\n")
+    helm.chmod(0o755)
+    out = tmp_path / "pf.json"
+    rc = ghcr_pull.main(["preflight", "--env-file", os.environ["GHCR_PULL_ENV_FILE"], "--installer-pulled",
+                         str(tmp_path), "--values", str(v), "--out", str(out), "--helm", str(helm),
+                         "--override", f"frontend={FTAG}"])
+    err = capsys.readouterr().err
+    assert rc == 0, err[-2000:]
+    assert once.exists()                                       # the first render did get no answer
+    pf = json.loads(out.read_text())
+    fe = next(c for c in pf["charts"] if c["chart"].endswith("/frontend"))
+    assert fe["image_override"] == FTAG and fe["error"] is None and fe["attempts"] == 2
+    assert fe["render"].startswith("ok")
+    assert any(i["image"] == f"ghcr.io/krateo-platformops/frontend:{FTAG}" and i["error"] is None
+               for i in pf["images"])
+    assert pf["bound_s"] > 0
+
+
 def test_an_override_of_a_component_this_install_does_not_run_is_refused(tmp_path):
     v = _installer(tmp_path, frontend=False)
     p, _ = _preflight(tmp_path, v, "--override", f"frontend={FTAG}")
