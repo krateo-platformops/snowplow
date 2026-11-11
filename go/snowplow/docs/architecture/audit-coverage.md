@@ -206,11 +206,30 @@ when a record carries an attribute this table does not name.
 | `krateo.request.uri` | the path and query snowplow received (`req.URL.RequestURI()`, as the apiserver records it) |
 | `krateo.audit.incomplete` | the markers of the keys the record lacks, e.g. `actor_class,preview` |
 | `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
+| `krateo.audit.client.source`, `krateo.audit.client.agent_session_id`, `krateo.audit.client.confirmation_id`, `krateo.audit.client.confirmed_set.count`, `krateo.audit.client.confirmed_set.irreversible`, `krateo.audit.client.confirmed_set.sha256`, `krateo.audit.client.confirmed_set.op`, `krateo.audit.client.requested_at` | **asserted**, on a `/call` write or dry run only: what the portal's `X-Krateo-Provenance` header said, after snowplow validated it against its closed schema (#1333, see "Client provenance" below); never identity, the actor's class, the verb, the target, the outcome or the event time |
+| `krateo.audit.client.rejected` | **asserted**, on a `/call` write or dry run only: why snowplow rejected the header (`oversize`, `encoding`, `version`, `schema`); the record then carries no other `krateo.audit.client.*` key, and the write ran |
 
-Not written by snowplow yet: `krateo.audit.object_ref.content_sha256` and the
-client provenance keys `krateo.audit.client.*` (#1333). No snowplow refusal has
+Not written by snowplow yet: `krateo.audit.object_ref.content_sha256`. No snowplow refusal has
 a `krateo.audit.denial_reason`: the request writer's closed set holds authn's
 reasons only, and a denied record without one conforms.
+
+### Client provenance
+
+A `/call` write or dry run reads the request header `X-Krateo-Provenance`
+(#1333, `internal/support/audit/provenance.go`) and records what it asserts
+under `krateo.audit.client.*`, through the shared library's
+`Event.Client`. The header is the client's word: it names no identity, actor
+class, agent, verb, target, namespace, outcome, status or time snowplow
+records as its own, and a header that tries is rejected whole (`schema`). A
+rejected header never blocks or changes the write: the record carries
+`krateo.audit.client.rejected` and nothing else from it. No header, no client
+key. Reads, exports and RESTAction stage records never carry these keys (the
+library allows them on writes only). The header value is never logged, never
+put on a span and never forwarded to the apiserver. The format, limits and
+rejection rules are the frontend's contract:
+[`howto-frontend-call-provenance.md`](../howto-frontend-call-provenance.md).
+`TestCall1333_*` (`internal/handlers`) and `TestProvenance1333_*`,
+`FuzzDecodeProvenance` (`internal/support/audit`).
 
 **What a record never holds.** The trail is kept 365 days, so nothing that can
 carry a credential goes into it: no path or query of a request snowplow **sends**
@@ -228,8 +247,8 @@ set (below).
 
 | path | what changes | status |
 |---|---|---|
-| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298) |
-| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true` |
+| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298); the portal's `X-Krateo-Provenance` header adds `krateo.audit.client.*` (#1333) |
+| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true`; `krateo.audit.client.*` as on `/call` (#1333) |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
 | `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (the `/call` lane it dials always names its object), `http.request.method` the export's own; the success path, and a render or send failure |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |

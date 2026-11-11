@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -707,6 +708,13 @@ var capProbes443 = map[string]func(t *testing.T) bool{
 		}
 		return ok
 	},
+	// call.provenance (#1333): a /call write's record carries what its
+	// X-Krateo-Provenance header asserts (call_provenance_1333_test.go has
+	// the arms).
+	CapCallProvenance: func(t *testing.T) bool {
+		_, rec, _ := serve1333(t, routes1333[0], Call(), header1333(prov1333))
+		return maps.Equal(clientKeys1333(rec), want1333)
+	},
 	CapCallRaw: func(t *testing.T) bool {
 		f, ep := newFakeAPI443(t)
 		f.respond(http.StatusOK, raCR443)
@@ -735,7 +743,7 @@ func TestS443_Capabilities(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"call.dryRun", "call.fieldValidation", "call.raw", "call.read.inline"}
+		want := []string{"call.dryRun", "call.fieldValidation", "call.provenance", "call.raw", "call.read.inline"}
 		if !reflect.DeepEqual(body.Capabilities, want) {
 			t.Fatalf("capabilities=%v, want %v (sorted)", body.Capabilities, want)
 		}
