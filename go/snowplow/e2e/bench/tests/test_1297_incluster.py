@@ -547,3 +547,75 @@ def test_a_quantity_the_room_cannot_read_is_named_and_writes_no_blank_record(tmp
                         str(tmp_path / "pods.json"), "--phase", "env"], cwd=BENCH_DIR, capture_output=True, text=True)
     assert p.returncode == 1 and "node gke-loadgen-1: its allocatable memory 'lots' is not a Kubernetes quantity" in \
         json.loads(p.stdout)["why"]
+
+
+# ─── runs 24d / 25b: the API server answers quantities in canonical form ────────────────────────
+#
+# Every arm's data step: "data606 FAILED: its pod is not where it must run: requests {'data606':
+# {'cpu': '2667m', 'memory': '8Gi'}} != rendered {'data606': {'cpu': '2667m', 'memory': '8192Mi'}}".
+# The placement compared the strings; the API server had answered 8192Mi as 8Gi, the same value.
+
+def _placed(requests: dict, rendered: dict) -> dict:
+    pods = {"items": [{"metadata": {"name": "data606-x"},
+                       "spec": {"nodeName": "loadgen-0",
+                                "containers": [{"name": c, "resources": {"requests": r}} for c, r in requests.items()]}}]}
+    nodes = {"items": [{"metadata": {"name": "loadgen-0", "labels": {"bench.krateo.io/pool": "loadgen"}}}]}
+    return incluster.placement("data606", pods, nodes, rendered)
+
+
+def test_run_24d_and_25bs_placement_the_api_servers_canonical_form_is_the_rendered_value():
+    rec = _placed({"data606": {"cpu": "2667m", "memory": "8Gi"}}, {"data606": {"cpu": "2667m", "memory": "8192Mi"}})
+    assert rec["ok"] is True, rec["why"]
+    for live, want in ((({"cpu": "1", "memory": "1Gi"}), {"cpu": "1000m", "memory": "1024Mi"}),
+                       ({"cpu": "500m", "memory": "128Mi"}, {"cpu": "0.5", "memory": "134217728"})):
+        assert _placed({"c": live}, {"c": want})["ok"] is True
+
+
+@pytest.mark.parametrize("live,want,why", [
+    ({"data606": {"cpu": "2667m", "memory": "4Gi"}}, {"data606": {"cpu": "2667m", "memory": "8192Mi"}},
+     "container data606: memory 4Gi is not 8192Mi"),
+    ({"data606": {"cpu": "2"}}, {"data606": {"cpu": "2", "memory": "8Gi"}},
+     "container data606: resources ['cpu'] != ['cpu', 'memory']"),
+    ({"other": {"cpu": "2"}}, {"data606": {"cpu": "2"}}, "containers ['other'] != ['data606']"),
+    ({"data606": {"cpu": "two"}}, {"data606": {"cpu": "2"}}, "container data606: cpu: not a Kubernetes quantity: 'two'"),
+])
+def test_a_request_that_really_differs_still_fails_the_placement_and_says_where(live, want, why):
+    rec = _placed(live, want)
+    assert rec["ok"] is False and rec["why"].endswith(f"({why})"), rec["why"]
+
+
+# the reviewer's ground truth: k8s.io/apimachinery resource.ParseQuantity(q).String()
+CANONICAL = [("8192Mi", "8Gi"), ("1000m", "1"), ("0.5", "500m"), ("1000", "1k"), ("1.5e3", "1500"),
+             ("1.5Gi", "1536Mi"), ("2667m", "2667m"), ("128Mi", "128Mi"), ("4096Mi", "4Gi"), ("32M", "32M")]
+
+
+@pytest.mark.parametrize("written,answered", CANONICAL)
+def test_the_fake_api_server_answers_quantities_as_the_real_one_does(written, answered):
+    """The fake every run606 test runs against answers each pod's quantities in the API server's
+    canonical form, so a comparison by string fails here as it failed runs 24d / 25b; and each
+    canonical form is the same value (incluster.quantity)."""
+    from tests.test_run606_real_sequence import _CANON
+    ns: dict = {}
+    exec(_CANON, ns)                                   # noqa: S102 - the fake's own code, as it runs
+    assert ns["canon"](written) == answered
+    assert incluster.quantity(written) == incluster.quantity(answered)
+
+
+@pytest.mark.parametrize("q,want", [("129e6", 129_000_000), ("1k", 1000), ("500m", 1), ("8Gi", 8 * 2 ** 30),
+                                    ("1536Mi", 1536 * MIB), (None, None)])
+def test_load606_reads_every_quantity_form_the_api_server_answers(q, want):
+    """The burst check's memory limit and kubectl top's samples: the API server's canonical forms
+    (129e6, 1k, 500m) read exactly, never as None (the old parser: no limit, the check dropped)."""
+    assert load606._parse_quantity(q) == want
+
+
+def test_an_unreadable_memory_limit_or_top_sample_is_named_never_dropped():
+    with pytest.raises(ValueError, match="not a Kubernetes quantity: '12 Mi'"):
+        load606._parse_quantity("12 Mi")
+    from bench import figures
+    rows = [{"kind": "top_boot", "t": 10.0, "raw": "snowplow-a 100m 12Q"},
+            {"kind": "top_boot", "t": 11.0, "raw": "snowplow-a 100m 1Gi"}]
+    out = figures.boot_memory(rows, (0.0, 20.0), "snowplow-a")
+
+    assert out["sampled_max_memory_bytes"] == 2 ** 30
+    assert out["memory_unreadable_samples"] == ["not a Kubernetes quantity: '12Q'"]

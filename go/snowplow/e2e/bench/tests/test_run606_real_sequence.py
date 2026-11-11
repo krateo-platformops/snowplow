@@ -170,7 +170,46 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
     sys.exit(0)   # create / node-pools create / delete
     """)
 
-FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
+_CANON = textwrap.dedent("""\
+    # The API server answers every quantity in its CANONICAL form (resource.Quantity: binary
+    # suffixes kept binary, decimal ones decimal, the largest suffix that keeps the number whole:
+    # 8192Mi -> 8Gi, 1000m -> 1, 0.5 -> 500m), never as it was written: runs 24d / 25b's data606
+    # placement compared the strings and failed. Every pod this fake lists is answered that way.
+    def canon(q):
+        import re
+        from fractions import Fraction
+        m = re.fullmatch(r"([0-9.]+)(?:[eE]([+-]?[0-9]+))?(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E|)", str(q))
+        if not m:
+            return q
+        num, exp, suf = m.groups()
+        v = Fraction(num) * (Fraction(10) ** int(exp) if exp else 1)
+        binary = ["Ki", "Mi", "Gi", "Ti", "Pi", "Ei"]
+        if suf in binary:
+            v *= 1024 ** (binary.index(suf) + 1)
+            for i in range(len(binary) - 1, -1, -1):
+                if v.denominator == 1 and v.numerator % (1024 ** (i + 1)) == 0:
+                    return str(v.numerator // (1024 ** (i + 1))) + binary[i]
+            return str(v.numerator) if v.denominator == 1 else q
+        dec = {"n": -9, "u": -6, "m": -3, "": 0, "k": 3, "M": 6, "G": 9, "T": 12, "P": 15, "E": 18}
+        v *= Fraction(10) ** dec[suf]
+        for e, sf in ((18, "E"), (15, "P"), (12, "T"), (9, "G"), (6, "M"), (3, "k"), (0, ""), (-3, "m"),
+                      (-6, "u"), (-9, "n")):
+            x = v / Fraction(10) ** e
+            if x.denominator == 1:
+                return str(x.numerator) + sf
+        return q
+    def canon_containers(cs):
+        out = []
+        for c in cs or []:
+            c = dict(c)
+            r = c.get("resources")
+            if r:
+                c["resources"] = {k: {n: canon(q) for n, q in (v or {}).items()} for k, v in r.items()}
+            out.append(c)
+        return out
+    """)
+
+FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
     raw = sys.argv[1:]
     kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None; imp = []
     it = iter(raw)
@@ -296,7 +335,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 st["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
                                      "message": "0/5 nodes are available: 1 Insufficient memory, 1 node(s) had untolerated taint(s), 3 node(s) didn't match Pod's node affinity/selector."}]
             print(json.dumps({"items": [{"metadata": {"name": job + "-0"},
-                                         "spec": {**({} if pending else {"nodeName": "loadgen-0"}), "containers": spec.get("containers", [])},
+                                         "spec": {**({} if pending else {"nodeName": "loadgen-0"}),
+                                                  "containers": canon_containers(spec.get("containers", []))},
                                          "status": st}] if listed else []}))
             sys.exit(0)
         if "name" in a:
@@ -320,13 +360,14 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     if a[:2] == ["get", "pods"] and "spec.nodeName=loadgen-0" in a:
         cpu, mem = os.environ.get("FAKE_INC_DS", "1000m 4096Mi").split()
         pods = [{"metadata": {"namespace": "kube-system", "name": "gke-daemonsets"},
-                 "spec": {"containers": [{"name": "ds", "resources": {"requests": {"cpu": cpu, "memory": mem}}}]},
+                 "spec": {"containers": [{"name": "ds", "resources": {"requests": {"cpu": canon(cpu), "memory": canon(mem)}}}]},
                  "status": {"phase": "Running"}}]
         if inc_alive("observe606"):
             spec = json.load(open(os.path.join(inc_dir("observe606"), "job.json")))["spec"]["template"]["spec"]
             pods.append({"metadata": {"namespace": "bench-loadgen", "name": "observe606-0",
                                       "labels": {"job-name": "observe606"}},
-                         "spec": {"containers": spec["containers"], "initContainers": spec["initContainers"]},
+                         "spec": {"containers": canon_containers(spec["containers"]),
+                                  "initContainers": canon_containers(spec["initContainers"])},
                          "status": {"phase": "Running"}})
         print(json.dumps({"items": pods}))
         sys.exit(0)
@@ -1646,7 +1687,10 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # review M1 / run 24b: the live node's room (allocatable 15890m / 59825Mi minus the DaemonSets' 1000m /
     # 4096Mi minus the observer's 500m / 1Gi, its 100m / 128Mi init container under its main one) holds
     # data606's need, and data606 requests that need (run 23's share), never the room
-    assert placed[1]["requests"] == {"data606": {"cpu": "2667m", "memory": "8192Mi"}}
+    # runs 24d / 25b: rendered 8192Mi, answered by the API server in canonical form (8Gi), the same
+    # value: the placement is OK (it compared the strings, and failed every arm)
+    assert placed[1]["requests"] == {"data606": {"cpu": "2667m", "memory": "8Gi"}}
+    assert placed[1]["ok"] is True
     assert (rooms[1]["slack_cpu_m"], rooms[1]["slack_memory_mi"]) == (14390 - 2667, 54705 - 8192)
     deleted = [json.loads(ln) for ln in (state / "deleted.jsonl").read_text().splitlines()]
     gone = next(d for d in deleted if "job/data606" in d["names"])
