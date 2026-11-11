@@ -63,7 +63,8 @@ def fake(tmp_path, monkeypatch, run_trees):
     for k in ("FAKE_BOOTSTRAP", "FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_NO_SA",
               "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES", "FAKE_SCP_CORRUPT", "FAKE_SCP_MODE", "FAKE_TAMPER_AFTER_SSH",
               "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
-              "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503"):
+              "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
+              "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -88,6 +89,22 @@ def _verbs(st) -> list[str]:
 
 def _state() -> dict:
     return json.loads((vm606.state_dir(RUN) / "state.json").read_text())
+
+
+# the run's VM zone in these tests: not vm606's default (europe-west4-a) nor the other run's (europe-west1-b),
+# so a step that took a default or a flag instead of up's record misses the VM (#1307 round-3 R1)
+ZONE = "europe-west3-a"
+NUMBER = "357378285144"
+
+
+def _record(run: str = RUN, zone: str = ZONE, **kv) -> None:
+    """The laptop record `up --yes` writes (the run's VM, project, zone): a test that starts after up."""
+    vm606._save_state(run, vm=vm606.vm_name(run), project=PROJECT, zone=zone, project_number=NUMBER, **kv)
+
+
+def _changing(st) -> list[str]:
+    """Every call that changes GCP."""
+    return [v for v in _verbs(st) if re.search(r"\b(create|delete|add-iam-policy-binding|remove-iam-policy-binding)\b", v)]
 
 
 def test_the_fake_vm_home_is_identity_shaped(fake):
@@ -185,7 +202,7 @@ def test_up_dry_prints_grants_rules_and_the_vm_and_creates_nothing(fake, capsys)
 
 def _up(capsys, monkeypatch, *extra):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
-    return _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0", *extra)
+    return _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", ZONE, *extra)
 
 
 def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, capsys, monkeypatch):
@@ -299,8 +316,9 @@ sys.addaudithook(_audit)
 
 
 def _ready(fake) -> Path:
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(15))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(15), zone=ZONE)
     fake_vm606.bootstrap_done(fake, VM, BOOT)
+    _record()
     return srv
 
 
@@ -348,11 +366,12 @@ def test_push_secret_refuses_a_token_file_not_0600(fake, capsys):
 
 
 def test_push_secret_refuses_a_vm_it_did_not_make(fake, capsys):
-    fake_vm606.put_instance(fake, VM, {"owner": "someone-else", "run": RUN}, _in(15))
+    fake_vm606.put_instance(fake, VM, {"owner": "someone-else", "run": RUN}, _in(15), zone=ZONE)
+    _record()
     _token()
     rc, _out, err = _run(capsys, "push-secret", "--run", RUN, "--yes")
     assert rc == 2 and "not labelled owner=snowplow-bench" in err
-    assert _verbs(fake) == ["compute instances describe"]
+    assert _verbs(fake) == [f"projects describe {PROJECT}", "compute zones describe", "compute instances describe"]
 
 
 # ─── launch ─────────────────────────────────────────────────────────────────
@@ -448,8 +467,9 @@ def _launch_args(tmp_path, repo, sha, pin, pin_sha, env_file=None, bench_zone="e
 
 def _vm_ready(fake, hours=15.0) -> Path:
     """After up and push-secret: the run's directory with the token in it and its venv. Returns it."""
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(hours))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(hours), zone=ZONE)
     fake_vm606.bootstrap_done(fake, VM, BOOT)
+    _record()
     r = srv / RUN
     tok = r / "home" / ".config" / "snowplow-bench" / "ghcr-pull.env"
     tok.parent.mkdir(parents=True)
@@ -489,7 +509,7 @@ def test_launch_starts_the_launcher_detached_and_it_survives_the_session(fake, c
     log = _wait_for(r / "launch.log", "finished")
     assert f"paid launch: RUNS=N1 N2 PAIRS=N1:N2 INSTALLER_VERSION=0.3.545 go={ENV['BENCH_606_GO_N2']}" in log
     assert "; owner snowplow-bench" in log and fake_vm606.IDENTITY not in log      # gke-up's owner label: $USER
-    assert "; zone europe-west1-b" in log                    # the clusters' zone, not the VM's (europe-west4-a)
+    assert "; zone europe-west1-b" in log                    # the clusters' zone, not the VM's (ZONE)
     placed = r / "home" / ".local" / "share" / "snowplow-bench" / "runs" / "606" / PAIR / pin.name
     assert placed.read_bytes() == pin.read_bytes()                        # the manifest beside the pair's files
     assert stat.S_IMODE((r / "launch-env.sh").stat().st_mode) == 0o600
@@ -614,11 +634,12 @@ def test_launch_refuses_an_env_zone_that_is_not_the_bench_zone(fake, capsys, tmp
 
 
 def test_launch_dry_starts_nothing(fake, capsys, tmp_path):
+    _record()
     pin, pin_sha = _pin(tmp_path)
     args = [a for a in _launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha) if a != "--yes"]
     rc, out, err = _run(capsys, *args)
     assert rc == 0, err
-    assert (f"DRY-RUN: gcloud compute scp --project {PROJECT} --zone europe-west4-a --tunnel-through-iap --quiet "
+    assert (f"DRY-RUN: gcloud compute scp --project {PROJECT} --zone {ZONE} --tunnel-through-iap --quiet "
             f"{pin} {VM}:/srv/snowplow-bench/{RUN}/pin/{pin.name}") in out
     assert "clusters in ZONE=europe-west1-b; nothing was started" in out and fake_vm606.calls(fake) == []
 
@@ -644,7 +665,8 @@ def test_a_remote_script_survives_a_child_that_reads_stdin(tmp_path):
 # ─── status ─────────────────────────────────────────────────────────────────
 
 def test_status_tails_the_log_redacted_and_says_the_vms_time_left(fake, capsys):
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(10))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(10), zone=ZONE)
+    _record()
     r = srv / RUN
     r.mkdir()
     (r / "launch.log").write_text("".join(f"[06:5{i}:00] line {i}\n" for i in range(5))
@@ -664,7 +686,7 @@ NAMES = [ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]]
 
 def _vm_after_run(fake, monkeypatch, *, alive=False) -> Path:
     """The VM after a launch: each run's directory and its evidence (published by bench.evidence)."""
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
     r = srv / RUN
     sha = "c" * 40
     b = r / "snowplow" / "go" / "snowplow" / "e2e" / "bench" / "bench"
@@ -682,7 +704,7 @@ def _vm_after_run(fake, monkeypatch, *, alive=False) -> Path:
         evidence.publish(src, data / "evidence" / "606" / n, n, "final")
     (r / "launch.log").write_text("launcher log\n")
     (r / "launch.pid").write_text(f"{os.getpid() if alive else 2 ** 22 + 7}\n")
-    vm606._save_state(RUN, bench_sha=sha, runs=NAMES, pair=PAIR, launched_at=time.time(), fetched=False)
+    _record(bench_sha=sha, runs=NAMES, pair=PAIR, launched_at=time.time(), fetched=False)
     return data
 
 
@@ -793,7 +815,8 @@ def test_down_dry_deletes_nothing(fake, capsys, monkeypatch):
 @pytest.mark.parametrize("labels", [{"owner": "someone-else", "run": RUN}, {"owner": "snowplow-bench", "run": "run9"},
                                     {"run": RUN}])
 def test_down_refuses_an_instance_not_labelled_for_the_run(fake, capsys, labels):
-    fake_vm606.put_instance(fake, VM, labels, _in(3))
+    fake_vm606.put_instance(fake, VM, labels, _in(3), zone=ZONE)
+    _record()
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "is not labelled owner=snowplow-bench, run=run25" in err
     assert "compute instances delete" not in _verbs(fake)
@@ -819,16 +842,18 @@ def test_down_refuses_a_binding_with_its_title_but_not_its_form(fake, capsys, mo
 
 
 def test_down_refuses_when_the_label_selects_another_vm(fake, capsys):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3))
-    fake_vm606.put_instance(fake, "snowplow-bench-orch-other", LABELS, _in(3))
+    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    fake_vm606.put_instance(fake, "snowplow-bench-orch-other", LABELS, _in(3), zone=ZONE)
+    _record()
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and "selects ['snowplow-bench-orch-other', 'snowplow-bench-orch-run25']" in err
-    assert "compute instances delete" not in _verbs(fake)
+    assert rc == 2 and f"besides {VM} ({ZONE}), snowplow-bench-orch-other ({ZONE}) claim(s) run {RUN}" in err
+    assert _changing(fake) == []
 
 
 def test_down_fails_closed_when_a_list_fails_open(fake, capsys, monkeypatch):
     """gcloud's list exits 0 with [] when its requests fail; vm606 sets the property that makes it exit 1."""
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    _record()
     monkeypatch.setenv("FAKE_LIST_FAILS", "1")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "could not be listed (rc=1" in err
@@ -836,15 +861,16 @@ def test_down_fails_closed_when_a_list_fails_open(fake, capsys, monkeypatch):
 
 
 def test_down_refuses_a_disk_left_behind(fake, capsys, monkeypatch):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3))
+    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    _record()
     monkeypatch.setenv("FAKE_KEEP_DISKS", "1")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and f"disk(s) ['{VM}'] remain" in err and "the pull-token file is on one of them" in err
 
 
 def test_down_refuses_an_unfetched_launch_and_a_running_launcher(fake, capsys, monkeypatch):
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3))
-    vm606._save_state(RUN, launched_at=time.time(), fetched=False)
+    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    _record(launched_at=time.time(), fetched=False)
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "was launched and not fetched" in err
     r = srv / RUN
@@ -859,6 +885,7 @@ def test_down_refuses_an_unfetched_launch_and_a_running_launcher(fake, capsys, m
 
 
 def test_down_with_nothing_left_says_so(fake, capsys):
+    _record()                                       # an up that failed before its first grant
     rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 0, err
     assert "already gone" in out and "0 firewall rule(s), 0 conditional grant(s)" in out
@@ -899,8 +926,8 @@ def test_the_benchs_pre_check_counts_the_vm_among_its_regions_external_ips(fake,
     _up(capsys, monkeypatch)
     listed = {"instances": [json.loads((fake / "instances" / f"{VM}.json").read_text())],
               "forwarding-rules": [], "addresses": []}
-    assert vm606.gke.in_use_addresses(listed, "europe-west4")[0] == 1
-    assert vm606.gke.in_use_addresses(listed, "europe-west1")[0] == 0
+    assert vm606.gke.in_use_addresses(listed, "europe-west3")[0] == 1
+    assert vm606.gke.in_use_addresses(listed, "europe-west4")[0] == 0
 
 
 def _two_runs(fake, capsys, monkeypatch):
@@ -921,7 +948,7 @@ def test_two_launches_at_once_down_of_one_never_touches_the_other(fake, capsys, 
               "sa": [b for b in fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"]
                      if b["condition"]["title"] == "snowplow-bench-run24"]}
     assert len(before["rules"]) == 2 and len(before["proj"]) == 6 and len(before["sa"]) == 1
-    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes", "--zone", "europe-west1-b")
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")          # its zone: up's record, europe-west1-b
     assert rc == 0, err
     assert not (fake / "instances" / f"{VM}.json").exists()
     assert (fake / "instances" / f"{vm24}.json").read_text() == before["inst"]
@@ -967,6 +994,10 @@ def _in_use(fake, how):
         vm606._save_state(RUN, vm=VM, created_at=time.time())
     elif how == "instance-elsewhere":
         fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone="europe-west1-b")
+    elif how == "instance-name-only":
+        fake_vm606.put_instance(fake, VM, {}, _in(3), zone="europe-west1-b")
+    elif how == "instance-label-only":
+        fake_vm606.put_instance(fake, "snowplow-bench-orch-x", LABELS, _in(3), zone="europe-west1-b")
     elif how == "rule":
         fake_vm606.put_policy(fake, f"project-{PROJECT}", [])
         (fake / "firewalls").mkdir(parents=True, exist_ok=True)
@@ -979,6 +1010,8 @@ def _in_use(fake, how):
 
 @pytest.mark.parametrize("how, named", [
     ("record", "its record"), ("instance-elsewhere", f"instance {VM} (europe-west1-b)"),
+    ("instance-name-only", f"instance {VM} (europe-west1-b)"),
+    ("instance-label-only", "instance snowplow-bench-orch-x (europe-west1-b)"),
     ("rule", f"firewall rule {VM}-iap-ssh"), ("binding", "binding roles/iam.serviceAccountUser on " + NODE_SA),
 ])
 def test_up_refuses_a_run_name_in_use_before_granting_anything(fake, capsys, monkeypatch, how, named):
@@ -988,7 +1021,7 @@ def test_up_refuses_a_run_name_in_use_before_granting_anything(fake, capsys, mon
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
 
 
-@pytest.mark.parametrize("key", [f"project-{PROJECT}", f"sa-{NODE_SA}"])
+@pytest.mark.parametrize("key", [f"{k}-{r}" for k, r in vm606.grant_policies(PROJECT, NUMBER)])
 def test_up_refuses_while_the_sa_holds_an_unconditional_binding(fake, capsys, monkeypatch, key):
     fake_vm606.put_policy(fake, key, [{"role": "roles/compute.viewer", "members": [SA]}])
     rc, _out, err = _up(capsys, monkeypatch)
@@ -1045,3 +1078,207 @@ def test_a_describe_that_fails_otherwise_than_notfound_refuses_never_reads_as_ab
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and f"firewall rule {VM}-deny-ssh could not be read (rc=1; ResponseError: code=503)" in err
     assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
+
+
+# ─── #1307 round 3: the run's own project and zone, every zone read, parents confirmed ──
+
+def _snapshot(fake) -> dict:
+    """What exists in the fake GCP: instances, disks, firewall rules, every policy."""
+    return {d: {p.name: p.read_text() for p in sorted((fake / d).glob("*.json"))}
+            for d in ("instances", "disks", "firewalls", "policies")}
+
+
+@pytest.mark.parametrize("cmd", ["push-secret", "launch", "status", "fetch", "down"])
+@pytest.mark.parametrize("flag", [["--zone", "europe-west4-a"], ["--project", PROJECT]])
+def test_a_subcommand_on_an_existing_run_takes_no_zone_or_project(fake, capsys, tmp_path, cmd, flag):
+    """Only up takes --zone / --project; every later step reads them from up's record (R1)."""
+    _record()
+    pin, pin_sha = _pin(tmp_path)
+    argv = _launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha) if cmd == "launch" else [cmd, "--run", RUN]
+    with pytest.raises(SystemExit) as e:
+        vm606.main([*argv, *flag])
+    assert e.value.code == 2 and f"unrecognized arguments: {' '.join(flag)}" in capsys.readouterr().err
+    assert fake_vm606.calls(fake) == []
+
+
+@pytest.mark.parametrize("argv", [["push-secret", "--yes"], ["status"], ["fetch"], ["down", "--yes"], ["down"]])
+def test_a_subcommand_on_an_existing_run_refuses_without_ups_record(fake, capsys, argv):
+    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    _token()
+    rc, _out, err = _run(capsys, argv[0], "--run", RUN, *argv[1:])
+    assert rc == 2 and f"no record of `up --yes` for run {RUN}" in err
+    assert fake_vm606.calls(fake) == []
+
+
+def test_launch_refuses_without_ups_record(fake, capsys, tmp_path):
+    pin, pin_sha = _pin(tmp_path)
+    rc, _out, err = _run(capsys, *_launch_args(tmp_path, "unused", "a" * 40, pin, pin_sha))
+    assert rc == 2 and f"no record of `up --yes` for run {RUN}" in err
+    assert fake_vm606.calls(fake) == []
+
+
+def test_r3_down_takes_the_zone_from_the_record_reviewer_two_runs_repro(fake, capsys, monkeypatch):
+    """The reviewer's round-3 repro: run25's VM in europe-west1-b, launched and not fetched, `down` with no
+    zone. At 27e65d5f the default zone read the live VM as gone and removed its rules and grants."""
+    _two_runs(fake, capsys, monkeypatch)
+    vm606._save_state(RUN, launched_at=1.0)
+    before = _snapshot(fake)
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"{RUN} was launched and not fetched" in err
+    assert (fake / "instances" / f"{VM}.json").exists()
+    assert _snapshot(fake) == before                  # the VM, its disk, its 2 rules, its 7 grants: all there
+    assert "deleted_at" not in _state()
+
+
+@pytest.mark.parametrize("zone, why", [
+    ("europe-west4-a", f"{VM} answers NotFound in europe-west4-a (the run's recorded zone), but {VM} (europe-west1-b) "
+                       f"claim(s) run {RUN}"),
+    ("europe-west9-z", "zone europe-west9-z of project operations-dev-krateo-io could not be read"),
+])
+def test_down_with_a_wrong_zone_refuses_and_changes_nothing(fake, capsys, monkeypatch, zone, why):
+    """A record whose zone is not the VM's (a zone that exists, and one GCE does not know): down refuses
+    before any change, naming where the run's VM is."""
+    _two_runs(fake, capsys, monkeypatch)
+    _record(zone=zone)
+    before = _snapshot(fake)
+    n = len(fake_vm606.calls(fake))
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and why in err, err
+    assert "already gone" not in out
+    assert _snapshot(fake) == before
+    assert not [c for c in fake_vm606.calls(fake)[n:]
+                if re.search(r"\b(delete|remove-iam-policy-binding)\b", " ".join(c["argv"][:3]))]
+
+
+@pytest.mark.parametrize("labels, name", [({}, VM), (LABELS, "snowplow-bench-orch-x")])
+def test_down_refuses_while_an_instance_of_the_run_exists_in_another_zone(fake, capsys, monkeypatch, labels, name):
+    """The VM is gone from the recorded zone, but an instance claiming the run (by its exact name alone, or by
+    its run label alone) is in another: never "already gone"."""
+    _upped(fake, capsys, monkeypatch)
+    (fake / "instances" / f"{VM}.json").unlink()
+    (fake / "disks" / f"{VM}.json").unlink()
+    fake_vm606.put_instance(fake, name, labels, _in(3), zone="europe-west1-b")
+    before = _snapshot(fake)
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"answers NotFound in {ZONE}" in err and f"{name} (europe-west1-b) claim(s) run {RUN}" in err
+    assert "already gone" not in out and _snapshot(fake) == before
+    assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
+
+
+def test_down_refuses_while_the_vm_has_a_namesake_in_another_zone(fake, capsys, monkeypatch):
+    """GCE names an instance per zone: a second snowplow-bench-orch-run25, in europe-west1-b, claims the run
+    too. down deletes only the one instance that claims it, so it refuses."""
+    _upped(fake, capsys, monkeypatch)
+    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone="europe-west1-b", namesake=True)
+    before = _snapshot(fake)
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"besides {VM} ({ZONE}), {VM} (europe-west1-b) claim(s) run {RUN}" in err
+    assert _snapshot(fake) == before
+    assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
+
+
+@pytest.mark.parametrize("code", ["403", "503"])
+def test_down_refuses_an_instance_describe_that_fails_otherwise_than_notfound(fake, capsys, monkeypatch, code):
+    """S4: a 403 or a 503 on the instance is not "gone": down refuses before any change."""
+    _upped(fake, capsys, monkeypatch)
+    before = _snapshot(fake)
+    monkeypatch.setenv("FAKE_INSTANCE_DESCRIBE_FAIL", code)
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"instance {VM} ({ZONE}) could not be read (rc=1;" in err
+    assert "already gone" not in out and _snapshot(fake) == before
+    assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
+
+
+def test_down_reads_the_instance_back_after_its_delete(fake, capsys, monkeypatch):
+    """L9: an instance delete that answers rc 0 and does not take stops down before its rules and grants."""
+    _upped(fake, capsys, monkeypatch)
+    monkeypatch.setenv("FAKE_INSTANCE_DELETE_LOST", "1")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"{VM} still answers in {ZONE} after its delete" in err
+    assert (fake / "instances" / f"{VM}.json").exists() and len(list((fake / "firewalls").glob(f"{VM}-*.json"))) == 2
+    assert len([b for k in (f"project-{PROJECT}", f"sa-{NODE_SA}") for b in fake_vm606.policy(fake, k)["bindings"]
+                if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]) == 7
+    assert not [v for v in _verbs(fake) if "firewall-rules delete" in v or "remove-iam" in v]
+
+
+def test_up_refuses_an_unknown_project_or_zone_up_front(fake, capsys, monkeypatch):
+    """S5: before anything else: the project, then the zone."""
+    rc, _out, err = _up(capsys, monkeypatch, "--project", "no-such-project-zz123")
+    assert rc == 2 and "project no-such-project-zz123 could not be read" in err
+    assert "PLACEHOLDER-OPERATOR" not in err
+    assert _verbs(fake) == ["projects describe no-such-project-zz123"]
+    rc, _out, err = _up(capsys, monkeypatch, "--zone", "europe-west9-z")
+    assert rc == 2 and f"zone europe-west9-z of project {PROJECT} could not be read" in err
+    assert [" ".join(c["argv"][:4]) for c in fake_vm606.calls(fake)][1:] == [
+        f"projects describe {PROJECT} --format", "compute zones describe europe-west9-z"]
+
+
+def test_down_refuses_a_record_whose_project_is_unknown(fake, capsys):
+    """S5: a missing project answers every describe in it with "The resource 'projects/<p>' was not found":
+    down refuses at the parent, before any describe could read as "absent"."""
+    vm606._save_state(RUN, vm=VM, project="no-such-project-zz123", zone=ZONE)
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and "project no-such-project-zz123 could not be read" in err and "already gone" not in out
+    assert _verbs(fake) == ["projects describe no-such-project-zz123"]
+
+
+def test_down_refuses_a_project_that_is_not_active(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    before = _snapshot(fake)
+    monkeypatch.setenv("FAKE_PROJECT_STATE", "DELETE_REQUESTED")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"project {PROJECT} is DELETE_REQUESTED, not ACTIVE" in err
+    assert _snapshot(fake) == before
+
+
+def test_down_refuses_a_record_whose_project_number_is_not_the_projects(fake, capsys, monkeypatch):
+    _upped(fake, capsys, monkeypatch)
+    before = _snapshot(fake)
+    monkeypatch.setenv("FAKE_PROJECT_NUMBER", "1")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"names project number {NUMBER}, {PROJECT} is 1" in err
+    assert _snapshot(fake) == before
+
+
+# gcloud 561's own answers, read live on 2026-11-11 (#1307 round 4; the PR body has the calls)
+REAL_ABSENT = ("ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - The resource "
+               "'projects/operations-dev-krateo-io/zones/europe-west4-a/instances/snowplow-bench-orch-zz-absent' was "
+               "not found\n")
+REAL_PARENT = ("ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - The resource "
+               "'projects/no-such-project-zz123' was not found\n")
+REAL_ZONE = ("ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - Invalid value for field "
+             "'zone': 'europe-west9-z'. Unknown zone.\n")
+REAL_DISK = ("ERROR: (gcloud.compute.disks.describe) HTTPError 404: The resource "
+             "'projects/operations-dev-krateo-io/zones/europe-west4-a/disks/snowplow-bench-orch-zz-absent' was not "
+             "found. This command is authenticated as <redacted> which is the active account specified by the "
+             "[core/account] property\n")
+REAL_DISK_PARENT = ("ERROR: (gcloud.compute.disks.describe) NOT_FOUND: The resource 'projects/no-such-project-zz123' "
+                    "was not found. This command is authenticated as <redacted> which is the active account specified "
+                    "by the [core/account] property\n")
+REAL_FW = ("ERROR: (gcloud.compute.firewall-rules.describe) Could not fetch resource:\n - The resource "
+           "'projects/operations-dev-krateo-io/global/firewalls/snowplow-bench-orch-zz-absent-deny-ssh' was not "
+           "found\n")
+
+
+def test_a_notfound_is_about_the_resource_only_when_it_names_its_own_path():
+    """S5: gcloud's words for a missing parent are a missing resource's; only the full path tells them apart."""
+    inst = "projects/operations-dev-krateo-io/zones/europe-west4-a/instances/snowplow-bench-orch-zz-absent"
+    disk = "projects/operations-dev-krateo-io/zones/europe-west4-a/disks/snowplow-bench-orch-zz-absent"
+    fw = "projects/operations-dev-krateo-io/global/firewalls/snowplow-bench-orch-zz-absent-deny-ssh"
+    assert vm606._not_found(REAL_ABSENT, inst) and vm606._not_found(REAL_DISK, disk) and vm606._not_found(REAL_FW, fw)
+    for err in (REAL_PARENT, REAL_ZONE, REAL_DISK_PARENT):
+        assert not vm606._not_found(err, inst) and not vm606._not_found(err, disk)
+    assert not vm606._not_found(REAL_PARENT.replace("instances.describe", "firewall-rules.describe"), fw)
+    # another resource's NotFound (a prefix of the name) is not this one's
+    assert not vm606._not_found(REAL_ABSENT, inst[:-1])
+
+
+def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
+    """L11: the run-in-use, unconditional-binding and revoke reads go over grant_policies: exactly the
+    policies up's grants are written to."""
+    assert vm606.grant_policies(PROJECT, NUMBER) == [("project", PROJECT), ("sa", NODE_SA)]
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 0, err
+    written = {("project" if c["argv"][0] == "projects" else "sa", c["argv"][2 if c["argv"][0] == "projects" else 3])
+               for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:3])}
+    assert written == set(vm606.grant_policies(PROJECT, NUMBER))

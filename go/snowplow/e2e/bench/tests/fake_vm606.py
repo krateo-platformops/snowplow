@@ -10,8 +10,14 @@ outcome:
     terminationTime, a boot disk named after it) and its disk; FAKE_BOOTSTRAP (JSON) is written as
     the VM's bootstrap marker at create, as the startup script would;
   - `compute instances | disks describe NAME --zone Z` / `firewall-rules describe NAME`: the resource
-    (an instance or a disk only in its own zone, as GCE answers), or gcloud's 404 (which names the
-    account);
+    (an instance or a disk only in its own zone, as GCE answers), or gcloud's 404 naming the resource's
+    full path (a disk's names the account). In a project other than operations-dev-krateo-io every
+    compute call answers the PARENT's NotFound ("The resource 'projects/<p>' was not found", the same
+    words), and in a zone gcloud does not know, "Invalid value for field 'zone'", as gcloud 561 does;
+    `projects describe` of another project answers gcloud's permission-or-absent 403 (FAKE_PROJECT_STATE: this
+    one's lifecycleState), and `compute zones
+    describe` knows ZONES. FAKE_INSTANCE_DESCRIBE_FAIL=403|503: an instance describe fails otherwise
+    than NotFound;
   - NO `--filter`: any call that passes one exits 2. gcloud 561's filter parser turns
     `name ~ ^(a|b)$` into `name eq ".*(^).*"` and answers an empty list with rc 0 (#1307 re-review N1,
     --log-http), and `labels.x=y` is applied client-side with matching rules that are changing; a fake
@@ -21,13 +27,13 @@ outcome:
     exits 0 with "[]" and a WARNING unless the call's environment sets
     CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, then rc 1 (#1172 B3, tests/fake_region.py);
   - `compute instances delete --delete-disks all`: the instance and its disk go (FAKE_KEEP_DISKS=1
-    keeps the disk); `firewall-rules create / delete` (FAKE_FW_DELETE_LOST=1: the delete answers rc 0
+    keeps the disk; FAKE_INSTANCE_DELETE_LOST=1: the delete answers rc 0 and nothing goes); `firewall-rules create / delete` (FAKE_FW_DELETE_LOST=1: the delete answers rc 0
     and the rule stays; FAKE_FW_DESCRIBE_503=1: a describe answers 503, not NotFound);
   - `projects | iam service-accounts get-iam-policy / add-iam-policy-binding /
     remove-iam-policy-binding` with --condition-from-file: a v3 policy per resource; a remove matches
     the condition exactly, as gcloud does. FAKE_IAM_LOST_WRITE=<role>: an add or a remove of that role
     answers rc 0 and is lost (another writer's set-policy replaced it);
-  - `compute ssh NAME ... --command CMD`: CMD runs under bash, the script on its stdin, with the
+  - `compute ssh NAME ... --command CMD` (and scp), for an instance in that --zone only: CMD runs under bash, the script on its stdin, with the
     VM's environment only (HOME = the identity-shaped home, the test's PATH), in a session of its
     own that is hung up (SIGHUP, then SIGTERM to its process group) when the command ends, as sshd
     does. FAKE_SSH_FAIL=4033|4003|publickey answers as gcloud does when IAP / the firewall / OS Login
@@ -57,9 +63,30 @@ from tests import fake_region
 IDENTITY = "jane_doe_example_com"       # an OS Login POSIX name: the operator's account
 VM_ROOT = "/srv/snowplow-bench"
 
+PROJECT = "operations-dev-krateo-io"
+# gcloud 561's answers, read live (#1307 round 4): an absent instance or firewall rule, an absent disk,
+# a describe in a project that does not exist (the PARENT's NotFound, in the same words), an unknown zone
 ACCOUNT_404 = ("ERROR: (gcloud.compute.{kind}.describe) Could not fetch resource:\n - The resource "
-               "'projects/operations-dev-krateo-io/{where}/{name}' was not found. This command "
-               "is authenticated as PLACEHOLDER-OPERATOR@example.invalid\n")
+               "'projects/{project}/{where}/{name}' was not found\n")
+DISK_404 = ("ERROR: (gcloud.compute.disks.describe) HTTPError 404: The resource 'projects/{project}/{where}/{name}' "
+            "was not found. This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the "
+            "active account specified by the [core/account] property\n")
+PARENT_404 = ("ERROR: (gcloud.compute.{kind}.{verb}) Could not fetch resource:\n - The resource 'projects/{project}' "
+              "was not found\n")
+PROJECT_403 = ("ERROR: (gcloud.projects.describe) [PLACEHOLDER-OPERATOR@example.invalid] does not have permission to "
+               "access projects instance [{project}] (or it may not exist): The caller does not have permission. "
+               "This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account "
+               "specified by the [core/account] property\n")
+ZONE_400 = ("ERROR: (gcloud.compute.{kind}.{verb}) Could not fetch resource:\n - Invalid value for field 'zone': "
+            "'{zone}'. Unknown zone.\n")
+DESCRIBE_FAILURES = {
+    "403": "ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - Required 'compute.instances.get' "
+           "permission for 'projects/{project}/zones/{zone}/instances/{name}'\n",
+    "503": "ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - The service is currently "
+           "unavailable. code=503\n",
+}
+ZONES = ("europe-west1-b", "europe-west1-c", "europe-west1-d", "europe-west3-a", "europe-west3-b", "europe-west3-c",
+         "europe-west4-a", "europe-west4-b", "europe-west4-c")
 SSH_FAILURES = {
     "4033": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4033: 'not authorized'].\n"),
     "4003": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4003: 'failed to connect to "
@@ -93,9 +120,24 @@ def failed_list(kind):
         print("[]"); sys.stderr.write(f"ERROR: (gcloud.compute.{kind}.list) Some requests did not succeed:\n{why}"); sys.exit(1)
     print("[]"); sys.stderr.write(f"WARNING: Some requests did not succeed.\n{why}"); sys.exit(0)
 def notfound(kind, where, name):
-    sys.stderr.write(ACCOUNT_404.format(kind=kind, where=where, name=name)); sys.exit(1)
+    sys.stderr.write((DISK_404 if kind == "disks" else ACCOUNT_404).format(kind=kind, where=where, name=name,
+                                                                           project=opt("--project"))); sys.exit(1)
 def in_zone(doc):
     return doc is not None and str(doc.get("zone", "")).endswith("/zones/" + str(opt("--zone")))
+def instance(name):
+    """(the instance NAME in --zone, its file) or (None, None). GCE names an instance per zone: a namesake in
+    another zone is the file NAME@ZONE.json (put_instance(..., namesake=True))."""
+    for p in (st / "instances" / f"{name}.json", st / "instances" / f"{name}@{opt('--zone')}.json"):
+        d = json.loads(p.read_text()) if p.exists() else None
+        if in_zone(d):
+            return d, p
+    return None, None
+def parents(kind, verb, zonal):
+    """GCE's answer when the project does not exist, or the zone is unknown: before the resource's own."""
+    if opt("--project") != PROJECT:
+        sys.stderr.write(PARENT_404.format(kind=kind, verb=verb, project=opt("--project"))); sys.exit(1)
+    if zonal and opt("--zone") not in ZONES:
+        sys.stderr.write(ZONE_400.format(kind=kind, verb=verb, zone=opt("--zone"))); sys.exit(1)
 if "--filter" in a:
     sys.stderr.write("fake gcloud: --filter is not modelled (gcloud can mis-parse one into an empty answer, rc 0)\n")
     sys.exit(2)
@@ -107,7 +149,19 @@ if a[:3] == ["compute", "regions", "describe"]:
 if a[:2] == ["compute", "forwarding-rules"] or a[:2] == ["compute", "addresses"]:
     failed_list(a[1]); print("[]"); sys.exit(0)
 if a[:2] == ["projects", "describe"]:
-    print(os.environ.get("FAKE_PROJECT_NUMBER", "357378285144")); sys.exit(0)
+    if a[2] != PROJECT:
+        sys.stderr.write(PROJECT_403.format(project=a[2])); sys.exit(1)
+    number = os.environ.get("FAKE_PROJECT_NUMBER", "357378285144")
+    print(json.dumps({"projectId": PROJECT, "projectNumber": number,
+                      "lifecycleState": os.environ.get("FAKE_PROJECT_STATE", "ACTIVE")})
+          if opt("--format") == "json" else number); sys.exit(0)
+if a[:3] == ["compute", "zones", "describe"]:
+    parents("zones", "describe", False)
+    if a[3] not in ZONES:
+        sys.stderr.write(ZONE_400.format(kind="zones", verb="describe", zone=a[3])); sys.exit(1)
+    print(json.dumps({"name": a[3], "status": "UP",
+                      "region": f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/regions/{a[3][:-2]}"}))
+    sys.exit(0)
 if a[:3] == ["services", "list", "--enabled"]:
     names = ["compute.googleapis.com", "container.googleapis.com"]
     if os.environ.get("FAKE_IAP_DISABLED") != "1":
@@ -168,6 +222,7 @@ if a[:3] == ["compute", "firewall-rules", "describe"] and os.environ.get("FAKE_F
     sys.stderr.write("ERROR: (gcloud.compute.firewall-rules.describe) Could not fetch resource:\n - "
                      "The service is currently unavailable. code=503\n"); sys.exit(1)
 if a[:3] == ["compute", "firewall-rules", "describe"]:
+    parents("firewall-rules", "describe", False)
     d = load("firewalls", a[3])
     if d is None:
         notfound("firewall-rules", "global/firewalls", a[3])
@@ -199,11 +254,16 @@ if a[:3] == ["compute", "instances", "create"]:
         m.write_text(os.environ["FAKE_BOOTSTRAP"])
     sys.exit(0)
 if a[:3] == ["compute", "instances", "describe"]:
-    d = load("instances", a[3])
-    if not in_zone(d):
+    parents("instances", "describe", True)
+    if os.environ.get("FAKE_INSTANCE_DESCRIBE_FAIL"):
+        sys.stderr.write(DESCRIBE_FAILURES[os.environ["FAKE_INSTANCE_DESCRIBE_FAIL"]].format(
+            project=opt("--project"), zone=opt("--zone"), name=a[3])); sys.exit(1)
+    d, _p = instance(a[3])
+    if d is None:
         notfound("instances", f"zones/{opt('--zone')}/instances", a[3])
     print(json.dumps(d)); sys.exit(0)
 if a[:3] == ["compute", "disks", "describe"]:
+    parents("disks", "describe", True)
     d = load("disks", a[3])
     if not in_zone(d):
         notfound("disks", f"zones/{opt('--zone')}/disks", a[3])
@@ -213,18 +273,24 @@ if a[:3] == ["compute", "instances", "list"]:
     print(json.dumps([json.loads(p.read_text()) for p in sorted((st / "instances").glob("*.json"))])); sys.exit(0)
 if a[:3] == ["compute", "instances", "delete"]:
     name = a[3]
-    if not in_zone(load("instances", name)):
+    parents("instances", "delete", True)
+    d, path = instance(name)
+    if d is None:
         notfound("instances", f"zones/{opt('--zone')}/instances", name)
-    (st / "instances" / f"{name}.json").unlink()
-    if opt("--delete-disks") == "all" and os.environ.get("FAKE_KEEP_DISKS") != "1":
+    if os.environ.get("FAKE_INSTANCE_DELETE_LOST") == "1":
+        sys.exit(0)                                    # answered, and the instance is still there
+    path.unlink()
+    if path.name == f"{name}.json" and opt("--delete-disks") == "all" and os.environ.get("FAKE_KEEP_DISKS") != "1":
         (st / "disks" / f"{name}.json").unlink()
         shutil.rmtree(vm(name), ignore_errors=True)
     sys.exit(0)
 # ── ssh, scp ──
 if a[:2] == ["compute", "ssh"]:
     name = a[2]
-    if load("instances", name) is None:
-        sys.stderr.write("ERROR: (gcloud.compute.ssh) Could not fetch resource\n"); sys.exit(1)
+    parents("ssh", "ssh", True)
+    if instance(name)[0] is None:                       # an instance in another zone is not found here
+        sys.stderr.write(f"ERROR: (gcloud.compute.ssh) Could not fetch resource:\n - The resource 'projects/"
+                         f"{opt('--project')}/zones/{opt('--zone')}/instances/{name}' was not found\n"); sys.exit(1)
     n = len([1 for ln in (st / "calls.jsonl").read_text().splitlines() if json.loads(ln)["argv"][:2] == ["compute", "ssh"]])
     fail = os.environ.get("FAKE_SSH_FAIL")
     if fail and n <= int(os.environ.get("FAKE_SSH_FAIL_TIMES", "1000000")):
@@ -253,8 +319,11 @@ if a[:2] == ["compute", "scp"]:
     def where(x):
         if ":" in x and not x.startswith("/"):
             name, rel = x.split(":", 1)
-            if load("instances", name) is None:
-                sys.stderr.write("ERROR: (gcloud.compute.scp) Could not fetch resource\n"); sys.exit(1)
+            parents("scp", "scp", True)
+            if instance(name)[0] is None:
+                sys.stderr.write(f"ERROR: (gcloud.compute.scp) Could not fetch resource:\n - The resource "
+                                 f"'projects/{opt('--project')}/zones/{opt('--zone')}/instances/{name}' was not "
+                                 f"found\n"); sys.exit(1)
             return onvm(name, rel)
         return Path(x)
     s, d = where(src), where(dst)
@@ -275,8 +344,9 @@ def install(bin_dir: Path, state: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     state.mkdir(parents=True, exist_ok=True)
     g = bin_dir / "gcloud"
-    consts = (f"ACCOUNT_404 = {ACCOUNT_404!r}\nSSH_FAILURES = {SSH_FAILURES!r}\nIDENTITY = {IDENTITY!r}\n"
-              f"VM_ROOT = {VM_ROOT!r}\n")
+    consts = "".join(f"{k} = {globals()[k]!r}\n" for k in (
+        "PROJECT", "ACCOUNT_404", "DISK_404", "PARENT_404", "PROJECT_403", "ZONE_400", "DESCRIBE_FAILURES", "ZONES",
+        "SSH_FAILURES", "IDENTITY", "VM_ROOT"))
     g.write_text(SOURCE.replace("API = ", consts + fake_region.LOADER + "API = ", 1))
     g.chmod(0o755)
 
@@ -286,18 +356,22 @@ def calls(state: Path) -> list[dict]:
     return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
 
-def put_instance(state: Path, name: str, labels: dict, termination_time: str, zone: str = "europe-west4-a") -> Path:
-    """An instance as `create` makes it, for a test that starts after `up`; returns the VM's VM_ROOT."""
+def put_instance(state: Path, name: str, labels: dict, termination_time: str, zone: str = "europe-west4-a",
+                 namesake: bool = False) -> Path:
+    """An instance as `create` makes it, for a test that starts after `up`; returns the VM's VM_ROOT.
+    namesake: a second instance of that name, in another zone (no disk or VM directory of its own)."""
     for d in ("instances", "disks"):
         (state / d).mkdir(parents=True, exist_ok=True)
     api = "https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/europe-west4-a"
-    (state / "instances" / f"{name}.json").write_text(json.dumps({
+    (state / "instances" / (f"{name}@{zone}.json" if namesake else f"{name}.json")).write_text(json.dumps({
         "name": name, "status": "RUNNING", "labels": labels, "tags": {"items": [name]},
         "zone": f"https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/{zone}",
         "networkInterfaces": [{"networkIP": "10.164.0.9", "accessConfigs": [{"type": "ONE_TO_ONE_NAT",
                                                                             "natIP": "34.90.0.9"}]}],
         "scheduling": {"terminationTime": termination_time, "instanceTerminationAction": "DELETE"},
         "disks": [{"boot": True, "autoDelete": True, "source": f"{api}/disks/{name}"}]}))
+    if namesake:
+        return state / "vm" / name / "srv"
     (state / "disks" / f"{name}.json").write_text(json.dumps({
         "name": name, "zone": f"https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/{zone}"}))
     (state / "vm" / name / "home" / IDENTITY).mkdir(parents=True, exist_ok=True)
