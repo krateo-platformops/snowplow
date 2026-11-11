@@ -10,9 +10,10 @@ package audit
 //   N  no header asserts nothing; several field lines are one (rejected) value.
 //   G  the golden vector of the #1333 comment: the canonical confirmed set's
 //      bytes and sha256, which the portal and snowplow both prove.
-//   F  FuzzDecodeProvenance: for ANY value, the result is a closed-set
-//      rejection alone, or an assertion that re-encodes to itself and that
-//      the shared library's Check accepts on a write record.
+//   F  FuzzDecodeProvenance (the header value) and FuzzProvenanceJSON (the
+//      JSON in it): for ANY value, the result is a closed-set rejection
+//      alone, or an assertion that re-encodes to itself and that the shared
+//      library's Check accepts on a write record.
 
 import (
 	"bytes"
@@ -30,12 +31,16 @@ import (
 
 	krateoaudit "github.com/krateo-platformops/audit"
 	"github.com/krateo-platformops/audit/audittest"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // encode1333 is the header value of a JSON text: "v1." + base64url, no padding.
 func encode1333(js string) string {
 	return provenancePrefix + base64.RawURLEncoding.EncodeToString([]byte(js))
 }
+
+// bs1333 is a backslash, so a JSON escape in a raw string reads as one.
+const bs1333 = `\`
 
 const (
 	sha1333  = "0a08bb91090b111f15a045b6061bccc4d0b8488d85f99ba57d8632e17061c277"
@@ -65,7 +70,11 @@ func TestProvenance1333_A_ValidHeaderIsReadExactly(t *testing.T) {
 		{"whitespace and key order are JSON's", " {\n \"op\" : 0 , \"confirmedSet\":{\"sha256\":\"" + sha1333 +
 			"\",\"irreversible\":false,\"count\":1},\"source\":\"portal\"}\t",
 			ClientProvenance{Source: "portal", ConfirmedSet: &krateoaudit.ConfirmedSet{Count: 1, SHA256: sha1333}}},
-		{"a JSON escape is its character", `{"source":"portal"}`, ClientProvenance{Source: "portal"}},
+		{"a JSON escape is its character", `{"source":"` + bs1333 + `u0070ortal"}`, ClientProvenance{Source: "portal"}},
+		{"requestedAt at year 0000", `{"source":"portal","requestedAt":"0000-01-01T00:00:00.000-00:01"}`,
+			ClientProvenance{Source: "portal", RequestedAt: time.Date(0, 1, 1, 0, 1, 0, 0, time.UTC)}},
+		{"requestedAt at year 9999", `{"source":"portal","requestedAt":"9999-12-31T23:59:59.999+23:59"}`,
+			ClientProvenance{Source: "portal", RequestedAt: time.Date(9999, 12, 31, 0, 0, 59, 999e6, time.UTC)}},
 		{"requestedAt with an offset", `{"source":"portal","requestedAt":"2026-11-11T12:20:30.456+02:00"}`,
 			ClientProvenance{Source: "portal", RequestedAt: time.Date(2026, 11, 11, 10, 20, 30, 456e6, time.UTC)}},
 	}
@@ -122,7 +131,7 @@ var rejections1333 = []struct {
 	{"the outcome is never the header's", encode1333(`{"source":"portal","outcome":"success"}`), "schema"},
 	{"a key in another case", encode1333(`{"Source":"portal"}`), "schema"},
 	{"a key twice", encode1333(`{"source":"portal","source":"portal"}`), "schema"},
-	{"a key twice, once escaped", encode1333(`{"source":"portal","source":"portal"}`), "schema"},
+	{"a key twice, once escaped", encode1333(`{"source":"portal","` + bs1333 + `u0073ource":"portal"}`), "schema"},
 	{"not an object", encode1333(`["portal"]`), "schema"},
 	{"a bare string", encode1333(`"portal"`), "schema"},
 	{"null", encode1333(`null`), "schema"},
@@ -159,6 +168,11 @@ var rejections1333 = []struct {
 	{"requestedAt microseconds", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456789Z"}`), "schema"},
 	{"requestedAt no zone", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456"}`), "schema"},
 	{"requestedAt month 13", encode1333(`{"source":"portal","requestedAt":"2026-13-11T10:20:30.456Z"}`), "schema"},
+	{"requestedAt before year 0000 in UTC", encode1333(`{"source":"portal","requestedAt":"0000-01-01T00:00:00.000+00:01"}`), "schema"},
+	{"requestedAt past year 9999 in UTC", encode1333(`{"source":"portal","requestedAt":"9999-12-31T23:59:59.999-01:00"}`), "schema"},
+	{"requestedAt offset hour 24", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456+24:00"}`), "schema"},
+	{"requestedAt offset minute 60", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456+23:60"}`), "schema"},
+	{"requestedAt hour 24", encode1333(`{"source":"portal","requestedAt":"2026-11-11T24:00:00.000Z"}`), "schema"},
 	{"requestedAt epoch millis", encode1333(`{"source":"portal","requestedAt":1762856430456}`), "schema"},
 }
 
@@ -364,7 +378,7 @@ func TestProvenance1333_G_GoldenVector(t *testing.T) {
 	// and sha256 below are JavaScript's JSON.stringify of the same op (node
 	// v-any, ES2019 well-formed stringify), the portal's own encoder.
 	esc := canonical1333([]canonicalOp1333{{
-		name: "café- <&>\"\\\t\u0001", namespace: "ns-é", resource: "configmaps", verb: "DELETE", version: "v1", irreversible: true,
+		name: "café-" + string(rune(0x2028)) + "<&>\"\\\t" + string(rune(0x01)), namespace: "ns-é", resource: "configmaps", verb: "DELETE", version: "v1", irreversible: true,
 	}})
 	const escHex = "5b7b2267726f7570223a22222c22697272657665727369626c65223a747275652c226e616d65223a22636166c3a92de280a83c263e5c225c5c5c745c7530303031222c226e616d657370616365223a226e732dc3a9222c227265736f75726365223a22636f6e6669676d617073222c2276657262223a2244454c455445222c2276657273696f6e223a227631227d5d"
 	if hex.EncodeToString(esc) != escHex {
@@ -399,49 +413,86 @@ func reencode1333(c ClientProvenance) string {
 	return encode1333("{" + strings.Join(parts, ",") + "}")
 }
 
+// fuzz1333 holds what both fuzz targets check every value with.
+type fuzz1333 struct {
+	rec *audittest.Recorder
+	em  *krateoaudit.Emitter
+}
+
+func newFuzz1333(f *testing.F) *fuzz1333 {
+	rec := audittest.NewRecorder(f)
+	return &fuzz1333{rec: rec, em: krateoaudit.New(rec.Logger(Scope), krateoaudit.WithWriter(Writer))}
+}
+
+var reasons1333 = []string{krateoaudit.ClientRejectedOversize, krateoaudit.ClientRejectedEncoding,
+	krateoaudit.ClientRejectedVersion, krateoaudit.ClientRejectedSchema}
+
+// check is the property: for ANY header value, the result is a closed-set
+// reason alone, or an assertion that re-encodes to itself, reaches the record
+// and that the shared library's Check accepts on a write record.
+func (z *fuzz1333) check(t *testing.T, v string) {
+	c := decodeProvenance(v)
+	if len(v) > MaxProvenanceBytes && c != (ClientProvenance{Rejected: krateoaudit.ClientRejectedOversize}) {
+		t.Fatalf("a %d-byte value decoded %+v, want oversize", len(v), c)
+	}
+	if c.Rejected != "" {
+		if !slices.Contains(reasons1333, c.Rejected) {
+			t.Fatalf("rejected %q: not a closed-set reason", c.Rejected)
+		}
+		if c != (ClientProvenance{Rejected: c.Rejected}) {
+			t.Fatalf("a rejected header asserted %+v", c)
+		}
+		return
+	}
+	if c.Source != krateoaudit.ClientSourcePortal {
+		t.Fatalf("accepted with source %q", c.Source)
+	}
+	again := decodeProvenance(reencode1333(c))
+	assertProvenance1333(t, again, c)
+
+	z.rec.Reset()
+	z.em.Emit(t.Context(), krateoaudit.Event{
+		Action: "call", Verb: "create", HTTPMethod: http.MethodPost, Outcome: krateoaudit.OutcomeSuccess,
+		StatusCode: http.StatusCreated, Version: "v1", Resource: "configmaps", ObjectName: "x", Namespace: "ns",
+		Client: c,
+	})
+	attrs := audittest.Attributes(z.rec.Only(t))
+	if !slices.ContainsFunc(attrs, func(kv attribute.KeyValue) bool { return string(kv.Key) == krateoaudit.KeyClientSource }) {
+		t.Fatalf("an accepted header put no client key on the record")
+	}
+	for _, vio := range krateoaudit.Check(Writer, attrs) {
+		if strings.HasPrefix(vio.Key, "krateo.audit.client.") {
+			t.Fatalf("the library refuses what the decoder accepted: %s (from %q)", vio, v)
+		}
+	}
+}
+
+// FuzzDecodeProvenance fuzzes the header value itself: the bound, the
+// version, the base64.
 func FuzzDecodeProvenance(f *testing.F) {
 	f.Add(encode1333(full1333))
 	f.Add(encode1333(`{"source":"portal"}`))
 	for _, c := range rejections1333 {
 		f.Add(c.value)
 	}
-	rec := audittest.NewRecorder(f)
-	em := krateoaudit.New(rec.Logger(Scope), krateoaudit.WithWriter(Writer))
-	reasons := []string{krateoaudit.ClientRejectedOversize, krateoaudit.ClientRejectedEncoding,
-		krateoaudit.ClientRejectedVersion, krateoaudit.ClientRejectedSchema}
+	z := newFuzz1333(f)
+	f.Fuzz(func(t *testing.T, v string) { z.check(t, v) })
+}
 
-	f.Fuzz(func(t *testing.T, v string) {
-		c := decodeProvenance(v)
-		if len(v) > MaxProvenanceBytes && c != (ClientProvenance{Rejected: krateoaudit.ClientRejectedOversize}) {
-			t.Fatalf("a %d-byte value decoded %+v, want oversize", len(v), c)
+// FuzzProvenanceJSON fuzzes the JSON the header carries, encoded as a client
+// would, so the mutator works on the schema's own values (a byte of a date,
+// an offset, a count) instead of on base64, where almost every change only
+// breaks the encoding.
+func FuzzProvenanceJSON(f *testing.F) {
+	f.Add(full1333)
+	f.Add(`{"source":"portal"}`)
+	f.Add(`{"source":"portal","requestedAt":"0000-01-01T00:00:00.000-00:01"}`)
+	f.Add(`{"source":"portal","requestedAt":"9999-12-31T23:59:59.999+23:59"}`)
+	for _, c := range rejections1333 {
+		if js, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(c.value, provenancePrefix)); err == nil {
+			f.Add(string(js))
 		}
-		if c.Rejected != "" {
-			if !slices.Contains(reasons, c.Rejected) {
-				t.Fatalf("rejected %q: not a closed-set reason", c.Rejected)
-			}
-			if c != (ClientProvenance{Rejected: c.Rejected}) {
-				t.Fatalf("a rejected header asserted %+v", c)
-			}
-			return
-		}
-		// Accepted: it says what it said, and the library accepts it.
-		if c.Source != krateoaudit.ClientSourcePortal {
-			t.Fatalf("accepted with source %q", c.Source)
-		}
-		again := decodeProvenance(reencode1333(c))
-		assertProvenance1333(t, again, c)
-
-		rec.Reset()
-		em.Emit(t.Context(), krateoaudit.Event{
-			Action: "call", Verb: "create", HTTPMethod: http.MethodPost, Outcome: krateoaudit.OutcomeSuccess,
-			StatusCode: http.StatusCreated, Version: "v1", Resource: "configmaps", ObjectName: "x", Namespace: "ns",
-			Client: c,
-		})
-		attrs := audittest.Attributes(rec.Only(t))
-		for _, vio := range krateoaudit.Check(Writer, attrs) {
-			if strings.HasPrefix(vio.Key, "krateo.audit.client.") {
-				t.Fatalf("the library refuses what the decoder accepted: %s (from %q)", vio, v)
-			}
-		}
-	})
+	}
+	z := newFuzz1333(f)
+	f.Fuzz(func(t *testing.T, js string) { z.check(t, encode1333(js)) })
 }

@@ -79,7 +79,7 @@ X-Krateo-Provenance: v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJhZ2VudFNlc3Npb25JZCI6InNlc18w
 | `confirmedSet.irreversible` | boolean | yes | `true` when any op of the set is irreversible | `krateo.audit.client.confirmed_set.irreversible` |
 | `confirmedSet.sha256` | string | yes | 64 lower-case hex digits: section 7 | `krateo.audit.client.confirmed_set.sha256` |
 | `op` | integer | with `confirmedSet` | at least 0 and less than `confirmedSet.count`: this `/call`'s index in the set | `krateo.audit.client.confirmed_set.op` |
-| `requestedAt` | string | no | RFC 3339 with exactly 3 fractional digits, `Z` or `±hh:mm` (`new Date().toISOString()`) | `krateo.audit.client.requested_at`, rewritten in UTC (`...Z`) |
+| `requestedAt` | string | no | RFC 3339 with exactly 3 fractional digits, `Z` or `±hh:mm` with hour 00-23 and minute 00-59, a real date and time, and an instant whose UTC form is in the years 0000-9999 (`new Date().toISOString()` of a present-day date always is) | `krateo.audit.client.requested_at`, rewritten in UTC (`...Z`) |
 
 Any other key is a rejection, and so is:
 

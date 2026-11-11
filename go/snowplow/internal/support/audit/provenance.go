@@ -136,7 +136,7 @@ var (
 	lowerSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	// rfc3339Millis is requestedAt: RFC 3339 with exactly three fractional
 	// digits, "Z" or a numeric offset (JavaScript's Date.toISOString form).
-	rfc3339Millis = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(Z|[+-]\d{2}:\d{2})$`)
+	rfc3339Millis = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?P<offset>Z|[+-]\d{2}:\d{2})$`)
 )
 
 // provenanceSchema reads raw (a JSON text) against the header's closed schema,
@@ -148,7 +148,8 @@ var (
 //	confirmedSet    object, with op: {count int >= 1, irreversible bool,
 //	                sha256 64 lowercase hex}, all three required, no other key
 //	op              int, with confirmedSet: >= 0 and < confirmedSet.count
-//	requestedAt     string, optional, RFC 3339 with milliseconds
+//	requestedAt     string, optional, RFC 3339 with milliseconds, in range
+//	                (requestedAt)
 //
 // The top level is an object; a key not listed, a key given twice, a value of
 // another JSON type (null included) or a value outside its rule fails it.
@@ -194,14 +195,12 @@ func provenanceSchema(raw []byte) (ClientProvenance, bool) {
 			hasOp = true
 		case fieldRequestedAt:
 			s, ok := jsonString(v)
-			if !ok || !rfc3339Millis.MatchString(s) {
+			if !ok {
 				return ClientProvenance{}, false
 			}
-			t, err := time.Parse(time.RFC3339, s)
-			if err != nil {
+			if c.RequestedAt, ok = requestedAt(s); !ok {
 				return ClientProvenance{}, false
 			}
-			c.RequestedAt = t
 		default:
 			return ClientProvenance{}, false
 		}
@@ -217,6 +216,35 @@ func provenanceSchema(raw []byte) (ClientProvenance, bool) {
 		c.ConfirmedSet = set
 	}
 	return c, true
+}
+
+// requestedAt reads the requestedAt value: RFC 3339 with milliseconds
+// (rfc3339Millis), a real date and time, a numeric offset of hour 00-23 and
+// minute 00-59 (time.Parse also takes +24:00 and +23:60, which RFC 3339 does
+// not), and an instant whose UTC form, the one the record writes, still has a
+// four-digit year (0000-9999): "0000-01-01T00:00:00.000+00:01" is year -1 in
+// UTC and "9999-12-31T23:59:59.999-01:00" year 10000, neither of which RFC
+// 3339 can write.
+func requestedAt(s string) (time.Time, bool) {
+	m := rfc3339Millis.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}, false
+	}
+	if off := m[rfc3339Millis.SubexpIndex("offset")]; off != "Z" {
+		hh, _ := strconv.Atoi(off[1:3])
+		mm, _ := strconv.Atoi(off[4:6])
+		if hh > 23 || mm > 59 {
+			return time.Time{}, false
+		}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if y := t.UTC().Year(); y < 0 || y > 9999 {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // confirmedSet reads the confirmedSet object: exactly count, irreversible and

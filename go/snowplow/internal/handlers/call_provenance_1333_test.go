@@ -10,6 +10,10 @@ package handlers
 //   R  every rejection reason: the write still runs and answers as it would,
 //      and the record carries krateo.audit.client.rejected alone, with the
 //      identity, verb, target and outcome snowplow established.
+//   F  the same on a failed or refused write (403, a refused destination, a
+//      refused connection; POST and DELETE): the record is the one without
+//      the header plus exactly its client keys, and the answer is the same
+//      bytes.
 //   N  no header: no client key.
 //   S  the header never leaves snowplow (not sent to the apiserver), never
 //      reaches a log line (debug wire dump on) and never a span, and no
@@ -177,9 +181,7 @@ func TestCall1333_R_ARejectedHeaderStillWritesAndAssertsNothing(t *testing.T) {
 		name, reason string
 		values       []string
 	}{
-		// #1333's contract, 2 KiB, written out: never derived from the
-		// constant under test.
-		{"oversize", "oversize", []string{"v1." + strings.Repeat("A", 2048-len("v1.")+1)}},
+		{"oversize", "oversize", []string{rejections1333[0].value}},
 		{"version", "version", []string{"v2." + strings.TrimPrefix(header1333(prov1333), "v1.")}},
 		{"encoding", "encoding", []string{header1333(prov1333) + "="}},
 		{"encoding: two field lines", "encoding", []string{header1333(prov1333), header1333(prov1333)}},
