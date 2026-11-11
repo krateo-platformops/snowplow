@@ -36,6 +36,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -285,9 +286,20 @@ func Refreshes() http.HandlerFunc {
 		// what its /call would answer NOW for this identity, or whose cell is
 		// gone, gets exactly one frame, at once. Checked AFTER subscribing, so
 		// a change landing during the check is either seen here or published
-		// to this stream (the pending set absorbs a double offer).
+		// to this stream.
+		//
+		// #1325 m1 — CatchUp is the arm's last step and runs on EVERY arm (an
+		// empty behind list included): a key this arm already offered (the #710
+		// owed emit, the #870 ledger arm, a publish since subscribe) is not
+		// offered again, and CatchUp then closes the arm. One arm, at most one
+		// frame per key.
+		//
+		// #1325 m3 — BehindKeys reads on the #101 arm ctx (informer-only), the
+		// same derivation validateSubscription's arm reads use: the invariant
+		// holds by construction if the gate it runs ever grows an objects.Get.
 		cache.NoteRefreshArmHeld(len(held))
-		if behind := dispatchers.BehindKeys(req.Context(), held); len(behind) > 0 && stream.CatchUp != nil {
+		behind := dispatchers.BehindKeys(refreshArmCtx(req), held)
+		if stream.CatchUp != nil {
 			stream.CatchUp(behind)
 		}
 
@@ -485,6 +497,15 @@ func readSubscriptionPayload(req *http.Request) ([]byte, error) {
 // validateSubscription (see the comment above readSubscriptionPayload) also
 // returns, since #819, the rotation tracker holding the class each
 // identity-bound armed key was derived under.
+// refreshArmCtx is the ctx of every /refreshes arm-time read (#101): the
+// request's, marked informer-only, so no arm read can reach the apiserver
+// fall-through (the route carries UserInfo but no UserConfig). The key
+// derivation (validateSubscription) and the #1324 catch-up check
+// (BehindKeys) both read on it (#1325 m3).
+func refreshArmCtx(req *http.Request) context.Context {
+	return cache.WithInformerOnlyReads(req.Context())
+}
+
 func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, map[string]dispatchers.HeldDigests, error) {
 	decoded, err := readSubscriptionPayload(req)
 	if err != nil {
@@ -507,7 +528,7 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 	// so subscriptionKeyExtras's per-coord objects.Get cannot reach the apiserver
 	// fall-through without dying at the endpoint read (378-error storm). The
 	// marker makes an informer GET-miss a quiet NotFound-shaped skip instead.
-	armCtx := cache.WithInformerOnlyReads(req.Context())
+	armCtx := refreshArmCtx(req)
 
 	rotation := dispatchers.NewSubscriptionRotationTracker(armCtx)
 	armed := make(map[string]struct{}, len(reqs))
