@@ -106,10 +106,14 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   downstream by the Baggage propagator. It **replaces** the old
   `X-Krateo-Correlation-Id` header entirely; the shortid `X-Krateo-TraceId`
   and the OTel `traceparent` coexist. Which actions emit an AuditEvent, which
-  do not, and why: [audit-coverage.md](audit-coverage.md). A record with no
-  actor is refused at the emitter; one missing its action, method or target is
-  emitted marked `krateo.audit.incomplete`. Both are counted in
-  `snowplow_audit_incomplete_total{actor,action,method,target}`.
+  do not, and why: [audit-coverage.md](audit-coverage.md). The record is
+  written by the shared writer (`github.com/krateo-platformops/audit`, #1291),
+  which never drops one: a record missing a key (its actor included) is
+  emitted marked `krateo.audit.incomplete`, and each marker is counted in
+  `krateo.audit.records.incomplete{marker}` on OTLP, mirrored at `/debug/vars`
+  as `snowplow_audit_incomplete_total{<marker>}`.
+  The Server span of a request that wrote a record carries
+  `krateo.audit.recorded=true` (a boolean, never identity).
 
 ---
 

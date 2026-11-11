@@ -121,7 +121,7 @@ func newFakeAPI443(t *testing.T) (*fakeAPI443, endpoints.Endpoint) {
 func withCaller443(req *http.Request, ep endpoints.Endpoint) *http.Request {
 	ctx := xcontext.BuildContext(req.Context(),
 		xcontext.WithAccessToken("test-token"),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}}),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}),
 		xcontext.WithUserConfig(ep),
 	)
 	return req.WithContext(ctx)

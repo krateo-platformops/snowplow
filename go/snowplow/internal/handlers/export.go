@@ -247,14 +247,17 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// The audit closure captures the row count, never the rows: it must not
 	// keep a pdf export's rows reachable through the render.
 	auditExport := func(code int, err error) {
-		outcome := "success"
+		outcome := audit.OutcomeSuccess
 		if err != nil {
-			outcome = "failure"
+			outcome = audit.OutcomeFailure
 		}
 		// #1055 — the record names the method the export was sent with (GET
 		// or POST) and the target it resolved, through the helper every
-		// audited request builds its record with.
-		ev := requestAuditEvent("export", req.Method, exportAuditTarget(req.URL.Query()), outcome, code)
+		// audited request builds its record with. #1291 — its verb is the
+		// apiserver's for the read the export dialled through /call (get, or
+		// list for a collection), whichever method the export came with.
+		target := exportAuditTarget(req.URL.Query())
+		ev := requestAuditEvent("export", req.Method, target.dialledVerb(), target, outcome, code)
 		ev.Message = fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
 			format, rowCount, pages, truncated)
 		audit.Emit(req.Context(), ev)

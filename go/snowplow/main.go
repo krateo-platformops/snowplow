@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	krateoaudit "github.com/krateo-platformops/audit"
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
@@ -138,6 +139,12 @@ func snowplowCORSOptions() cors.Options {
 //     extracts the inbound W3C traceparent/baggage (#1013). With tracing off
 //     the global TracerProvider is the no-op default and it records nothing;
 //     otelhttp's HTTP server metrics still flow when metrics are on.
+//   - krateoaudit.RecordedMiddleware (#1291) is the first layer inside the
+//     span: it installs the holder every audit record emitted on the request
+//     sets (a RESTAction stage's, on a client span's context, included), and
+//     when the handler exits, a panic included, it marks the Server span
+//     krateo.audit.recorded=true when one was. The tail sampler keeps such a
+//     trace whole. The attribute is a boolean, never identity (#848).
 //   - slowcall.Middleware (#1054) runs inside the span, where r.Pattern
 //     already names the route: it gives each API request its phase record
 //     and logs one WARN line for a request slower than the page goal's bound
@@ -159,7 +166,7 @@ func snowplowCORSOptions() cors.Options {
 // It is a function so the composition the pod serves is the one the tests
 // drive (main_server_spans_test.go).
 func newServerHandler(mux *http.ServeMux) http.Handler {
-	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux)))), mux))
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(krateoaudit.RecordedMiddleware(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux))))), mux))
 }
 
 // newRUMIngest returns #1015's ingest, with its forwarder's worker running
@@ -555,9 +562,12 @@ func main() {
 	}
 	defer func() { _ = logShutdown(context.Background()) }()
 	if logProvider != nil {
-		audit.SetDefault(audit.New(
-			logProvider.Logger("github.com/krateo-platformops/snowplow/audit"),
-		))
+		// #1291 — the shared writer (github.com/krateo-platformops/audit),
+		// declared as the request writer. Built after metrics.Setup, so its
+		// krateo.audit.records.incomplete counter is on the real global
+		// MeterProvider (OTLP) when metrics are on; /debug/vars mirrors it.
+		audit.SetDefault(audit.New(logProvider.Logger(audit.Scope)))
+		startAuditNamespaceReader(otelCtx, log)
 	}
 
 	chain := newRequestChain(log)
@@ -1660,4 +1670,24 @@ func splitCommaList(s string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// startAuditNamespaceReader installs the reader the audit records' preview
+// flag is read through (#1291, internal/support/audit/preview.go): a
+// metadata-only informer on namespaces over snowplow's own ServiceAccount,
+// with a GET for a Namespace it does not hold. Without in-cluster config it
+// installs none, and a record of a namespaced target is marked preview: the
+// gap is recorded, never guessed.
+func startAuditNamespaceReader(ctx context.Context, log *slog.Logger) {
+	rc, err := credhttp.InClusterConfig()
+	if err != nil {
+		log.WarnContext(ctx, "audit: no in-cluster config; records of a namespaced target are marked preview", slog.Any("err", err))
+		return
+	}
+	mc, err := credhttp.Metadata(rc)
+	if err != nil {
+		log.WarnContext(ctx, "audit: metadata client failed; records of a namespaced target are marked preview", slog.Any("err", err))
+		return
+	}
+	audit.SetNamespaceReader(audit.StartNamespaceReader(ctx, mc))
 }
