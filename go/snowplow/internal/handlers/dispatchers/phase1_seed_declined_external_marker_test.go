@@ -145,19 +145,19 @@ func (h *getRecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cach
 	}
 	return cache.PutRefused
 }
-func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutThenRemark(ctx, key, entry)
-	return true
+	return cache.PutChanged
 }
-func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutEndingKnownStale(ctx, key, entry)
-	return true
+	return cache.PutChanged
 }
 
 // #1255 — the unstorable-eviction surface; this handle holds no cell to evict.

@@ -31,7 +31,10 @@ func (c *ResolvedCacheStore) PutResolved(v PutVerdict, key string, entry *Resolv
 	return c.put(key, entry)
 }
 
-// PutResolvedIfGen is putIfGen, gated by v.
+// PutResolvedIfGen is putIfGen, gated by v. It reports only whether it wrote,
+// so it compares nothing (#1321 M1), and no production write of a cell a
+// /refreshes stream can be armed on may use it: they use
+// PutResolvedIfGenOutcome (the C1w write-site census).
 func (c *ResolvedCacheStore) PutResolvedIfGen(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if !v.Store() {
 		return false
@@ -40,8 +43,10 @@ func (c *ResolvedCacheStore) PutResolvedIfGen(ctx context.Context, v PutVerdict,
 }
 
 // PutResolvedIfGenOutcome is putIfGenOutcome, gated by v: PutResolvedIfGen
-// reporting whether the accepted Put changed the stored bytes (#1321). The
-// cold-dispatch fill hands the outcome to its publish (PublishPut).
+// reporting whether the accepted Put changed the stored bytes (#1321). Every
+// production gen-guarded write of an armable cell uses it and hands the
+// outcome to the publish gate: the cold-dispatch fills, the seed terminal Put
+// and the walker's widgetContent shell Put (put_outcome.go, WRITE SITES).
 func (c *ResolvedCacheStore) PutResolvedIfGenOutcome(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if !v.Store() {
 		return PutRefused
@@ -49,20 +54,22 @@ func (c *ResolvedCacheStore) PutResolvedIfGenOutcome(ctx context.Context, v PutV
 	return c.putIfGenOutcome(ctx, key, entry, capturedGen)
 }
 
-// PutResolvedThenRemark is putThenRemark, gated by v. It reports whether it
-// wrote.
-func (c *ResolvedCacheStore) PutResolvedThenRemark(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry) bool {
+// PutResolvedThenRemark is putThenRemark, gated by v. #1321 — it reports the
+// write's outcome, which its callers (the pre-readyz boot seed and walker
+// carriers) hand to the publish gate.
+func (c *ResolvedCacheStore) PutResolvedThenRemark(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry) PutOutcome {
 	if !v.Store() {
-		return false
+		return PutRefused
 	}
 	return c.putThenRemark(ctx, key, entry)
 }
 
-// PutResolvedEndingKnownStale is putEndingKnownStale, gated by v. It reports
-// whether it wrote.
-func (c *ResolvedCacheStore) PutResolvedEndingKnownStale(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry) bool {
+// PutResolvedEndingKnownStale is putEndingKnownStale, gated by v. #1321 — it
+// reports the write's outcome, which the external-TTL widget Put hands to the
+// publish gate.
+func (c *ResolvedCacheStore) PutResolvedEndingKnownStale(ctx context.Context, v PutVerdict, key string, entry *ResolvedEntry) PutOutcome {
 	if !v.Store() {
-		return false
+		return PutRefused
 	}
 	return c.putEndingKnownStale(ctx, key, entry)
 }

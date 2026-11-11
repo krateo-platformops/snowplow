@@ -736,26 +736,29 @@ type cacheHandle interface {
 	// they never fake #315/#316 warmth or contaminate the customer hit/miss ratio.
 	GetNoTouch(key string) (*cache.ResolvedEntry, bool)
 	// #189 — generation-guarded write. CaptureGen reads the key's generation
-	// before a resolve; PutResolvedIfGen stores only if it has not moved (a
-	// DELETE-eviction during the resolve would refuse the write rather than
+	// before a resolve; PutResolvedIfGenOutcome stores only if it has not moved
+	// (a DELETE-eviction during the resolve would refuse the write rather than
 	// resurrect the pre-delete body).
 	//
 	// #912 re-review — every write a dispatcher makes takes the resolve's
 	// Put-gate verdict (cache.PutGateVerdict) and stores nothing unless it
 	// allows the Put: there is no ungated write on this interface.
+	//
+	// #1321 — and every write on this interface reports its cache.PutOutcome,
+	// which the writer hands to the publish gate (publishIfSubscribed): a write
+	// that changes a resident cell's bytes is announced by that write. There is
+	// no outcome-discarding write here (the bool PutResolvedIfGen is not on the
+	// interface), and TestIssue1321_C1w_EveryWriteSiteHandsItsOutcomeToThePublishGate
+	// pins that each call site passes the outcome on.
 	CaptureGen(key string) uint64
-	PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
-	// #1321 — PutResolvedIfGen reporting whether the accepted Put changed the
-	// stored bytes; the cold-dispatch fill publishes only a PutChanged
-	// (publishIfSubscribed).
 	PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome
 	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
 	// carriers. Never refuses a storing verdict; re-marks the key once if a dep
 	// recorded on ctx's dep-gen sink moved since the resolve began.
-	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
+	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #547/#734 — the external-TTL widget's plain Put: exactly Put, plus ending a
 	// KNOWN-STALE state in the write's own critical section (ctx's dep-gen sink).
-	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
+	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.

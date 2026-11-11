@@ -252,16 +252,28 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, v cache.PutVerdict
 			return false
 		}
 	}
+	var put cache.PutOutcome
 	if g.guarded || (g.boot && cache.IsPhase1Done()) {
 		// Post-readyz (any mode, or a boot unit whose Put crossed the /readyz
 		// flip): gen-guarded. The IfGen method runs the #375 remark on accept.
-		return handle.PutResolvedIfGen(ctx, v, key, entry, g.gen)
+		put = handle.PutResolvedIfGenOutcome(ctx, v, key, entry, g.gen)
+	} else {
+		// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
+		// with the #375 remark (#408). A dep that moved during this resolve dirty-
+		// marked a key that was not resident yet, so the refresher skipped it; the
+		// remark re-marks it now that it is.
+		put = handle.PutResolvedThenRemark(ctx, v, key, entry)
 	}
-	// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
-	// with the #375 remark (#408). A dep that moved during this resolve dirty-
-	// marked a key that was not resident yet, so the refresher skipped it; the
-	// remark re-marks it now that it is.
-	return handle.PutResolvedThenRemark(ctx, v, key, entry)
+	// #1321 B1 — a seed write that changed a resident cell's bytes announces the
+	// change itself. A keepwarm, gvr-discovered or rbac-shift seed re-Puts an
+	// ALREADY-RESIDENT cell (#507 above), and a /refreshes stream can be armed on
+	// it. If it stored new bytes without a frame, the refresher's later Put of
+	// those same bytes is identical and publishes nothing, so a tab holding the
+	// old bytes would never be told. The gate (publishIfSubscribed) announces a
+	// PutChanged to an armed stream and nothing else: a no-op when none is armed
+	// (every pre-readyz boot Put) or the bytes did not change.
+	publishIfSubscribed(key, put)
+	return put.Stored()
 }
 
 // seedTerminalGuardCtxKey carries the captured seedTerminalGuard from

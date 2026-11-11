@@ -7,10 +7,13 @@ package cache
 // ledger clock seamed (exact delays, no sleeps outside the #484 window).
 //
 //	O1  the store reports the outcome: identical vs the confirmed prior,
-//	    changed for new bytes or a fill of an absent key, and a write that
-//	    lands between the off-lock compare and the store lock voids the
-//	    compare (changed: a frame is never withheld on a guess) — for the
-//	    refresh replace AND the cold PutIfGen.
+//	    changed for new bytes or a fill of an absent key — for the refresh
+//	    replace AND the cold PutIfGen. The refresh replace compares before
+//	    its lock (#1070), so a write that lands between that compare and the
+//	    lock voids it (changed: a frame is never withheld on a guess). The
+//	    cold PutIfGen compares against the entry it actually replaced, read
+//	    in its own critical section (writeOutcome): a write landing before
+//	    its lock is simply what it replaces, compared exactly.
 //	L1  a stale l1 serve replaced (a Put that began after the mark) by the
 //	    very bytes it served: no frame is published, and the ledger closes the
 //	    serve at the Put, close="identical", with the exact delay.
@@ -44,13 +47,26 @@ func TestIssue1321_O1_TheStoreReportsWhetherAPutChangedTheBytes(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		put  func(ctx context.Context, key string, e *ResolvedEntry) PutOutcome
+		// racer is the bytes a write landing between the RAFullList compare and
+		// the store lock stores, and want the outcome of the Put of {"v":2} then.
+		racer string
+		want  PutOutcome
 	}{
+		// The refresh replace compared {"v":2} against the prior BEFORE the racer
+		// replaced it with equal bytes: void, so changed.
 		{"refresh_replace", func(ctx context.Context, key string, e *ResolvedEntry) PutOutcome {
 			return c.replaceIfGenRefresh(ctx, key, e, c.CaptureGen(key))
-		}},
+		}, `{"v":2}`, PutChanged},
+		// The cold PutIfGen replaces the racer's {"v":3}: the #406 compare saw
+		// {"v":2} == {"v":2}, but the bytes it actually replaced differ.
 		{"cold_putifgen", func(ctx context.Context, key string, e *ResolvedEntry) PutOutcome {
 			return c.putIfGenOutcome(ctx, key, e, c.CaptureGen(key))
-		}},
+		}, `{"v":3}`, PutChanged},
+		// … and when the racer stored the same bytes, the Put replaced equal
+		// bytes: identical, exactly (the racer's own write announced its change).
+		{"cold_putifgen_same_racer", func(ctx context.Context, key string, e *ResolvedEntry) PutOutcome {
+			return c.putIfGenOutcome(ctx, key, e, c.CaptureGen(key))
+		}, `{"v":2}`, PutIdentical},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "o1-1321", Name: tc.name}
@@ -63,20 +79,21 @@ func TestIssue1321_O1_TheStoreReportsWhetherAPutChangedTheBytes(t *testing.T) {
 			if got := tc.put(context.Background(), key, body(`{"v":2}`)); got != PutChanged {
 				t.Fatalf("O1 RED: new bytes reported %v, want changed", got)
 			}
-			// A write between the compare and the lock: same bytes, ANOTHER entry.
+			// A write between the compare and the lock: ANOTHER entry (tc.racer).
 			fired := false
 			hook := func() {
 				if !fired {
 					fired = true
-					c.put(key, body(`{"v":2}`))
+					c.put(key, body(tc.racer))
 				}
 			}
 			raLayerAfterCompareHook.Store(&hook)
 			got := tc.put(context.Background(), key, body(`{"v":2}`))
 			raLayerAfterCompareHook.Store(nil)
-			if !fired || got != PutChanged {
-				t.Fatalf("O1 RED: a write that landed between compare and lock reported %v (fired=%v), want changed — "+
-					"the compare is void, and a frame must never be withheld on a void compare", got, fired)
+			if !fired || got != tc.want {
+				t.Fatalf("O1 RED: a write of %s that landed between compare and lock → %v (fired=%v), want %v — the outcome "+
+					"must be decided against the entry the Put REPLACED, and never withhold a frame on a void compare",
+					tc.racer, got, fired, tc.want)
 			}
 		})
 	}

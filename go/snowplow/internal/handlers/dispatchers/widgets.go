@@ -645,17 +645,23 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
 			// write's own critical section (#734).
 			// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
-			cacheHandle.PutResolvedEndingKnownStale(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+			put := cacheHandle.PutResolvedEndingKnownStale(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 				RawJSON:     encoded,
 				Inputs:      cacheInputs,
 				TTLOverride: extTTL,
 				ExternalTTL: true,
 			})
+			// #1321 B1 — this response arms nothing, but the key is the per-binding
+			// widgets key, which an earlier non-external serve of the same widget
+			// stamped. A tab still armed on it from then is told when this write
+			// changed the bytes, like after every other write of an armable cell. A
+			// no-op when nothing is armed on the key.
+			publishIfSubscribed(cacheKey, put)
 		}
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),
-			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO publish, NO /refreshes arm"),
+			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO /refreshes arm (a change is announced only to a tab already armed on the key)"),
 		)
 	} else if verdict.ExternalTTL() {
 		// Opted in, but this request's key may not populate the shared cell
@@ -770,8 +776,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// (it re-armed after a TTL-eviction, and this cold-fill replaces the
 			// evicted entry), announce the fill so the viewer's frame goes fresh
 			// now instead of waiting for the next churn. No-op when unarmed.
-			// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
-			// fold → cross-deliver risk) per refresh_publish.go.
+			// (The widgetContent shell is written by the walker, which announces
+			// its own writes the same way: widget_content.go, #1321 B1.)
 			// #1321 — and only when the Put changed the stored bytes.
 			publishIfSubscribed(cacheKey, put)
 

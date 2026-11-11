@@ -14,13 +14,23 @@
 // after an eviction sees one stale frame until the NEXT churn. This closes
 // that gap: announce the cold-fill to any already-armed subscriber.
 //
-// SCOPE IS THE SAFETY BOUNDARY (C62-4 placement + class scope): call this
-// ONLY from the genuine-Put else-if of restactions.go + widgets.go — AFTER the
-// Put + dep-Record, NEVER on the stage-error / external-skip / declined
-// branches (no Put there → publishing would signal a non-event). Do NOT call
-// it for widgetContent (the one class ComputeKey does NOT fold BindingUID into
-// — resolved.go:669 — so a publish on its shared key could cross-deliver to a
-// differently-authorized viewer) or apistage (never armed — dead surface).
+// SCOPE IS THE SAFETY BOUNDARY (C62-4 placement): call this ONLY with the
+// outcome of a write that happened — never on the stage-error / external-skip
+// / declined branches (no Put there → publishing would signal a non-event; a
+// refused write's outcome is PutRefused, which publishes nothing either).
+//
+// #1321 B1 — and it is called after EVERY write of a cell a /refreshes stream
+// can be armed on, not only the cold dispatch: the seed terminal Put
+// (seedTerminalPut), the walker's widgetContent shell Put
+// (populateWidgetContentL1) and the external-TTL widget Put too
+// (cache/put_outcome.go, WRITE SITES). A write that changes an armed cell's
+// bytes and does not announce it breaks the rule that lets an identical Put
+// withhold its frame. The widgetContent shell key folds no BindingUID; a
+// frame on it names the key and nothing else, it reaches only streams armed
+// on that key, and each tab's refetch is gated for its own user
+// (gateWidgetEnvelope) — the refresher has always published that key the
+// same way. apistage content cells are never armed (no response stamps their
+// key), and are written through PutContentIfGen, which reports no outcome.
 //
 // Cost-proportional + leak-safe by construction: HasRefreshSubscriber is an
 // O(1) RLock map read; when no connection is armed for the key it returns
@@ -49,10 +59,5 @@ import "github.com/krateo-platformops/snowplow/internal/cache"
 // revalidation that resolved the same bytes announces nothing the
 // subscriber does not already hold.
 func publishIfSubscribed(l1Key string, put cache.PutOutcome) {
-	if l1Key == "" || !put.Stored() {
-		return
-	}
-	if cache.HasRefreshSubscriber(l1Key) {
-		cache.PublishPut(l1Key, put)
-	}
+	cache.PublishPutIfSubscribed(l1Key, put)
 }

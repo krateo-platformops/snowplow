@@ -39,7 +39,7 @@ import (
 var rawPublishers1321 = map[string]bool{"PublishRefresh": true, "publishRefresh": true, "fanoutRefresh": true}
 
 // gatedPublishers1321 take a PutOutcome, at this argument index.
-var gatedPublishers1321 = map[string]int{"PublishRefreshed": 2, "PublishPut": 1, "publishPut": 1, "publishIfSubscribed": 1}
+var gatedPublishers1321 = map[string]int{"PublishRefreshed": 2, "PublishPut": 1, "publishPut": 1, "publishIfSubscribed": 1, "PublishPutIfSubscribed": 1}
 
 // allowedRawSites1321 is every reviewed raw publish site: "<package dir>:
 // <enclosing func>-><callee>", with the rule that makes it a change.
@@ -173,7 +173,7 @@ func TestIssue1321_C1_PublishSiteCensus(t *testing.T) {
 	if len(stale) > 0 {
 		t.Fatalf("#1321 C1: listed raw site(s) no longer in the tree (remove them, or the scan is broken): %v", stale)
 	}
-	want := []string{"dispatchers:resolveAndPopulateL1->PublishRefreshed", "dispatchers:publishIfSubscribed->PublishPut"}
+	want := []string{"dispatchers:resolveAndPopulateL1->PublishRefreshed", "dispatchers:publishIfSubscribed->PublishPutIfSubscribed", "cache:PublishPutIfSubscribed->PublishPut"}
 	for _, w := range want {
 		found := false
 		for _, g := range gated {

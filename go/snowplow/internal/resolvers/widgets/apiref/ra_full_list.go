@@ -589,7 +589,12 @@ func raFullListServe(
 		// resolve that built `full` has run by now, so a nested refilter has
 		// bumped the sink).
 		stampObservedUAF()
-		if c.PutRAFullListIfGen(fullCtx, v, raKey, keyInputs, full, raGen0) {
+		put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, raGen0)
+		// #1321 B1 — this repopulate replaces a resident raKey cell, which a
+		// /refreshes connection can arm (raFullList coordinates, #426): a write
+		// that changed its bytes announces the change itself.
+		cache.PublishPutIfSubscribed(raKey, put)
+		if put.Stored() {
 			noteRAFullListDenialOnlyPut(v)
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
@@ -782,7 +787,9 @@ func raFullListServe(
 	}
 	// #592 — observed limb, twin of the repopulate branch above.
 	stampObservedUAF()
-	if c.PutRAFullListIfGen(fullCtx, v, raKey, keyInputs, full, raGen0) {
+	put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, raGen0)
+	cache.PublishPutIfSubscribed(raKey, put) // #1321 B1 — see the repopulate branch
+	if put.Stored() {
 		noteRAFullListDenialOnlyPut(v)
 	}
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
