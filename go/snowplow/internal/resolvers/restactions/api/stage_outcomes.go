@@ -132,6 +132,55 @@ var stageReasonClasses = map[string]stageReasonClass{
 	StageReasonUAFOnNonReadVerb: stageReasonFailed,
 }
 
+// Stage reason groups (#1319): the client contract for a widget's
+// exception-only notice. Every code of the closed set is in exactly one group
+// (TestIssue1319_G1 fails otherwise), and the frontend integration doc lists
+// them as this map says (TestIssue1319_G2). A client reads a code it does not
+// know as StageGroupCutFailed.
+const (
+	// StageGroupCutFailed — the stage's data was cut short or failed: the
+	// portal shows its notice.
+	StageGroupCutFailed = "cut / failed"
+	// StageGroupDenied — the stage got a definitive answer for THIS requester
+	// (a per-user refusal, an object that is not there for them) or snowplow
+	// deliberately did not run it for this request: nothing was cut short, and
+	// the portal shows no notice.
+	StageGroupDenied = "denied"
+)
+
+// StageReasonGroups places every reason code of the closed set in one group.
+var StageReasonGroups = map[string]string{
+	StageReasonForbidden:    StageGroupDenied,
+	StageReasonUnauthorized: StageGroupDenied,
+	// A NotFound is the per-identity definite answer #1080 / #681 store as a
+	// denial (DenialOnly): the object is not there for this requester.
+	StageReasonNotFound: StageGroupDenied,
+	// Deliberate non-executions (#1288): a dry run, an export or background work.
+	StageReasonNotExecuted:  StageGroupDenied,
+	StageReasonWriteRefused: StageGroupDenied,
+
+	StageReasonTimeout:            StageGroupCutFailed, // the page budget cut it (#1115)
+	StageReasonNotRun:             StageGroupCutFailed,
+	StageReasonError:              StageGroupCutFailed,
+	StageReasonSkipped:            StageGroupCutFailed, // follows a failure only (blocksDependentWrite)
+	StageReasonAborted:            StageGroupCutFailed,
+	StageReasonInvalidPath:        StageGroupCutFailed,
+	StageReasonTemplateError:      StageGroupCutFailed,
+	StageReasonNotSent:            StageGroupCutFailed,
+	StageReasonDestinationRefused: StageGroupCutFailed, // the destination policy, not the requester
+	// #1281: a misconfigured stage (userAccessFilter on a write verb), never a
+	// per-user refusal: it fails for every requester.
+	StageReasonUAFOnNonReadVerb: StageGroupCutFailed,
+}
+
+// StageReasonGroup is reason's group; an unknown code is StageGroupCutFailed.
+func StageReasonGroup(reason string) string {
+	if g, ok := StageReasonGroups[reason]; ok {
+		return g
+	}
+	return StageGroupCutFailed
+}
+
 // stageNotExecutedByDesign reports whether reason says snowplow deliberately
 // did not execute the stage (#1288): the one classifier, read by the span
 // summary (such a stage is not counted as failed) and by the #904 rule (such

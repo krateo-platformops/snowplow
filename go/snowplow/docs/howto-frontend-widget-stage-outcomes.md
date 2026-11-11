@@ -50,28 +50,47 @@ X-Snowplow-Stage-Outcomes: [{"name":"<stage>","ok":false,"reason":"<code>"}]
   user, a body or any upstream error text. Only stage names (from the CR) and
   codes.
 
-## 3. Reason codes (closed set)
+## 3. Reason codes (closed set), in two groups
+
+The portal shows its notice only when data was cut short or failed, never for
+a per-user denial. Every code snowplow can send is in exactly one of the two
+groups below. The groups come from the code's own map
+(`api.StageReasonGroups` in `internal/resolvers/restactions/api/stage_outcomes.go`):
+- `TestIssue1319_G1` fails when a code is added without a group.
+- `TestIssue1319_G2` fails when these tables differ from the map.
+
+**Show the notice when at least one row's code is in "cut / failed".** If every
+row is "denied", nothing was cut short, so show no notice. A truncated header
+(`{"truncated":true,"failed":N}`) names no codes: treat it as "cut / failed".
+
+**Treat an unknown code (from a future snowplow) as "cut / failed".**
+
+### cut / failed
 
 | code | meaning |
 |---|---|
-| `Forbidden` | the requester may not read it (an apiserver 403) |
-| `NotFound` | the object does not exist (404) |
-| `Unauthorized` | the credential was refused (401) |
-| `Timeout` | the page budget ended the exchange (504): the page's 10 s goal ran out (#1115) |
+| `Timeout` | the page budget ended the exchange (504): the page's 10 s goal ran out (#1115). This is the budget code; there is no separate "Budget" code |
 | `Error` | any other failure |
 | `NotRun` | the resolve stopped before this stage ran |
-| `Skipped` | a write stage not sent because the stage in `dependsOn` did not succeed |
+| `Skipped` | a write stage not sent because the stage in `dependsOn` failed |
 | `Aborted` | the resolve-level row (`name` `""`): no stage ran |
 | `InvalidPath` | snowplow refused the rendered apiserver path (a write) |
 | `TemplateError` | the path, payload or a header did not render (a write) |
 | `NotSent` | a write planned and not sent |
-| `DestinationRefused` | the destination policy refused the stage's address |
-| `UserAccessFilterOnNonReadVerb` | the stage is misconfigured (`userAccessFilter` on a write verb) |
-| `StageNotExecuted` | a dry run did not send this write stage (by design, not a failure) |
-| `WriteRefused` | snowplow did not send this write because the request is not the user's own write (by design, not a failure) |
+| `DestinationRefused` | the destination policy refused the stage's address (the same for every user) |
+| `UserAccessFilterOnNonReadVerb` | the stage is misconfigured (`userAccessFilter` on a write verb). It fails for every user, so it is not a per-user denial |
 
-Only these codes are ever sent. For forward compatibility, read an unknown
-code as a generic failure.
+### denied
+
+| code | meaning |
+|---|---|
+| `Forbidden` | the requester may not read it (an apiserver 403) |
+| `Unauthorized` | the requester's credential was refused (401) |
+| `NotFound` | the object is not there for this requester (404): a definite answer, stored like a denial (#681, #1080) |
+| `StageNotExecuted` | a dry run did not send this write stage (by design) |
+| `WriteRefused` | snowplow did not send this write because the request is not the user's own write (by design) |
+
+Only these codes are ever sent.
 
 ## 4. Presence: absent means complete
 
