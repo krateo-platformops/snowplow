@@ -175,21 +175,23 @@ type s1264Reason struct {
 func s1264ReasonTable(t *testing.T) map[string]s1264Reason {
 	t.Helper()
 	table := map[string]s1264Reason{
-		"StageReasonNotExecuted":        {StageReasonNotExecuted, true},
-		"StageReasonWriteRefused":       {StageReasonWriteRefused, true},
-		"StageReasonForbidden":          {StageReasonForbidden, false},
-		"StageReasonNotFound":           {StageReasonNotFound, false},
-		"StageReasonUnauthorized":       {StageReasonUnauthorized, false},
-		"StageReasonNotRun":             {StageReasonNotRun, false},
-		"StageReasonError":              {StageReasonError, false},
-		"StageReasonSkipped":            {StageReasonSkipped, false},
-		"StageReasonAborted":            {StageReasonAborted, false},
-		"StageReasonInvalidPath":        {StageReasonInvalidPath, false},
-		"StageReasonTemplateError":      {StageReasonTemplateError, false},
-		"StageReasonNotSent":            {StageReasonNotSent, false},
-		"StageReasonTimeout":            {StageReasonTimeout, false},
-		"StageReasonDestinationRefused": {StageReasonDestinationRefused, false},
-		"StageReasonUAFOnNonReadVerb":   {StageReasonUAFOnNonReadVerb, false}, // #1281: a misconfigured stage
+		"StageReasonNotExecuted":  {StageReasonNotExecuted, true},
+		"StageReasonWriteRefused": {StageReasonWriteRefused, true},
+		"StageReasonForbidden":    {StageReasonForbidden, false},
+		"StageReasonNotFound":     {StageReasonNotFound, false},
+		// #1319: the definite per-identity NotFound, a denial (counted failed, like Forbidden).
+		"StageReasonNotFoundForRequester": {StageReasonNotFoundForRequester, false},
+		"StageReasonUnauthorized":         {StageReasonUnauthorized, false},
+		"StageReasonNotRun":               {StageReasonNotRun, false},
+		"StageReasonError":                {StageReasonError, false},
+		"StageReasonSkipped":              {StageReasonSkipped, false},
+		"StageReasonAborted":              {StageReasonAborted, false},
+		"StageReasonInvalidPath":          {StageReasonInvalidPath, false},
+		"StageReasonTemplateError":        {StageReasonTemplateError, false},
+		"StageReasonNotSent":              {StageReasonNotSent, false},
+		"StageReasonTimeout":              {StageReasonTimeout, false},
+		"StageReasonDestinationRefused":   {StageReasonDestinationRefused, false},
+		"StageReasonUAFOnNonReadVerb":     {StageReasonUAFOnNonReadVerb, false}, // #1281: a misconfigured stage
 	}
 	declared := s1264DeclaredReasonConsts(t)
 	var tableNames []string

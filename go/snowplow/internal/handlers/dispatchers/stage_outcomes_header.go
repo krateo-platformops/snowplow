@@ -22,7 +22,7 @@
 // verdict (cache.PutGateVerdict), unchanged by #1319 and identical for every
 // class: a result whose resolve recorded a stage error is not stored unless
 // every error is a per-identity denial (#681 DenialOnly: Forbidden, a definite
-// NotFound). So a stored cell's outcomes are one of two kinds:
+// NotFoundForRequester). So a stored cell's outcomes are one of two kinds:
 //   - the denials of the binding-set class it is keyed by;
 //   - an aborted resolve's (api.abortedResolve: the resolve-level Aborted row
 //     plus every stage NotRun). The stage graph could not be ordered, or there

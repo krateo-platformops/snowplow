@@ -61,7 +61,7 @@ import (
 // w1319Codes is the closed reason-code set the frontend doc publishes
 // (docs/howto-frontend-widget-stage-outcomes.md §3), written out here.
 var w1319Codes = map[string]bool{
-	"StageNotExecuted": true, "WriteRefused": true, "Forbidden": true, "NotFound": true,
+	"StageNotExecuted": true, "WriteRefused": true, "Forbidden": true, "NotFound": true, "NotFoundForRequester": true,
 	"Unauthorized": true, "NotRun": true, "Error": true, "Skipped": true, "Aborted": true,
 	"InvalidPath": true, "TemplateError": true, "NotSent": true, "Timeout": true,
 	"DestinationRefused": true, "UserAccessFilterOnNonReadVerb": true,
@@ -365,13 +365,14 @@ func TestIssue1319_W5_ARefetchThatCompletesHasNoHeader(t *testing.T) {
 	})
 	t.Run("after a refresher re-resolve", func(t *testing.T) {
 		// A definite NotFound (#1080, a watched named object that does not
-		// exist) is a per-identity answer: stored WITH its outcome. The object
+		// exist) is a per-identity answer: stored WITH its outcome, which reads
+		// its own closed code NotFoundForRequester (#1319 ruling). The object
 		// is then created; the refresher's re-resolve completes and replaces
 		// the cell (a /refreshes frame), and the refetch has no header.
 		e := w1319Setup(t, "/api/v1/namespaces/pub/configmaps/q")
 		cold, _ := e.call(t, e.ctx())
-		if r := w1319Rows(t, "W5 stored NotFound", cold)["sa"]; r.Reason != "NotFound" {
-			t.Fatalf("SETUP: sa reads %+v, want NotFound", r)
+		if r := w1319Rows(t, "W5 stored definite NotFound", cold)["sa"]; r.Reason != "NotFoundForRequester" {
+			t.Fatalf("NotFoundForRequester RED: the definite NotFound reads %+v, want NotFoundForRequester", r)
 		}
 		if cell, ok := e.cell(t, e.ctx()); !ok || cell.StageOutcomes == "" {
 			t.Fatalf("SETUP: the NotFound result must be stored with its outcome (present=%v)", ok)

@@ -93,6 +93,13 @@ const (
 	// message carries the stable "dry-run: " prefix, which this refusal's
 	// message does not).
 	StageReasonWriteRefused = "WriteRefused"
+	// StageReasonNotFoundForRequester (#1319 ruling) — the definite
+	// per-identity NotFound (#1080): a watched named object that does not
+	// exist for THIS requester, the answer #681 stores as a denial. Recorded
+	// only by snowplow, at the two #1080 sites: N2 (recordDefiniteNotFound,
+	// branch C) and N1 (classifyOwnDialNotFound, the requester's own dial).
+	// Never read from an upstream answer (#714); a plain 404 stays NotFound.
+	StageReasonNotFoundForRequester = "NotFoundForRequester"
 )
 
 // stageReasonClass is what a reason code says about its stage (#1288).
@@ -113,20 +120,22 @@ const (
 // stageReasonClasses is the closed set of reason codes, each with its class.
 // A code the header can carry is in it, and only those (stageReasonKnown).
 var stageReasonClasses = map[string]stageReasonClass{
-	StageReasonNotExecuted:        stageReasonNotExecuted,
-	StageReasonWriteRefused:       stageReasonNotExecuted,
-	StageReasonForbidden:          stageReasonFailed,
-	StageReasonNotFound:           stageReasonFailed,
-	StageReasonUnauthorized:       stageReasonFailed,
-	StageReasonNotRun:             stageReasonFailed,
-	StageReasonError:              stageReasonFailed,
-	StageReasonSkipped:            stageReasonFailed,
-	StageReasonAborted:            stageReasonFailed,
-	StageReasonInvalidPath:        stageReasonFailed,
-	StageReasonTemplateError:      stageReasonFailed,
-	StageReasonNotSent:            stageReasonFailed,
-	StageReasonTimeout:            stageReasonFailed,
-	StageReasonDestinationRefused: stageReasonFailed,
+	StageReasonNotExecuted:  stageReasonNotExecuted,
+	StageReasonWriteRefused: stageReasonNotExecuted,
+	StageReasonForbidden:    stageReasonFailed,
+	StageReasonNotFound:     stageReasonFailed,
+	// A denial, counted like Forbidden on the span (snowplow.stages.failed).
+	StageReasonNotFoundForRequester: stageReasonFailed,
+	StageReasonUnauthorized:         stageReasonFailed,
+	StageReasonNotRun:               stageReasonFailed,
+	StageReasonError:                stageReasonFailed,
+	StageReasonSkipped:              stageReasonFailed,
+	StageReasonAborted:              stageReasonFailed,
+	StageReasonInvalidPath:          stageReasonFailed,
+	StageReasonTemplateError:        stageReasonFailed,
+	StageReasonNotSent:              stageReasonFailed,
+	StageReasonTimeout:              stageReasonFailed,
+	StageReasonDestinationRefused:   stageReasonFailed,
 	// #1281: a misconfigured stage (userAccessFilter on a write) is a real
 	// failure, in every mode, never a deliberate non-execution.
 	StageReasonUAFOnNonReadVerb: stageReasonFailed,
@@ -157,12 +166,10 @@ var StageReasonGroups = map[string]string{
 	StageReasonNotExecuted:  StageGroupByDesign, // a dry run's write (#443 k)
 	StageReasonWriteRefused: StageGroupByDesign, // an export's or background work's write (#1288)
 
-	// NotFound is ALSO the code of the definite per-identity NotFound (#1080,
-	// recordDefiniteNotFound, stored as a denial by #681), but the same code
-	// is recorded for a plain 404 of a dial, which is a failure. The code alone
-	// cannot tell them apart, so it is cut / failed (the safe direction); a
-	// distinct code for the definite answer is proposed on #1347.
-	StageReasonNotFound: StageGroupCutFailed,
+	// The definite per-identity NotFound (#1080) has its own code and is a
+	// denial; a plain 404 of a dial stays NotFound, a failure.
+	StageReasonNotFoundForRequester: StageGroupDenied,
+	StageReasonNotFound:             StageGroupCutFailed,
 	// A refused credential is never a #681 per-identity denial.
 	StageReasonUnauthorized:       StageGroupCutFailed,
 	StageReasonTimeout:            StageGroupCutFailed, // the page budget cut it (#1115)
@@ -207,19 +214,23 @@ var reasonRank = map[string]int{
 	// #1281: recorded once for the whole stage, before anything else can be
 	// (the stage is refused before it is planned); ranked first because the
 	// stage itself is misconfigured.
-	StageReasonUAFOnNonReadVerb: 12,
+	StageReasonUAFOnNonReadVerb: 13,
 	// The #443 dry-run refusal outranks every other failure: a dry run reports
 	// StageNotExecuted for its write stages (#443 k, a stable contract).
-	StageReasonNotExecuted:        11,
-	StageReasonForbidden:          10,
-	StageReasonUnauthorized:       9,
-	StageReasonNotFound:           8,
-	StageReasonInvalidPath:        7,
-	StageReasonDestinationRefused: 6,
-	StageReasonTemplateError:      5,
-	StageReasonTimeout:            4, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:            3,
-	StageReasonError:              2,
+	StageReasonNotExecuted:  12,
+	StageReasonForbidden:    11,
+	StageReasonUnauthorized: 10,
+	StageReasonNotFound:     9,
+	// #1319: a stage where one item is a plain 404 and another the definite
+	// per-identity answer reads the plain NotFound (a failure outranks the
+	// denial of the same kind), deterministically.
+	StageReasonNotFoundForRequester: 8,
+	StageReasonInvalidPath:          7,
+	StageReasonDestinationRefused:   6,
+	StageReasonTemplateError:        5,
+	StageReasonTimeout:              4, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:              3,
+	StageReasonError:                2,
 	// #1288: an export's or background work's refusal ranks BELOW every
 	// failure (and above 0, the "" of a stage that recorded nothing). Items
 	// the plan refuses (InvalidPath, TemplateError: failRefusedItems) are

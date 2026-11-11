@@ -72,7 +72,7 @@ row is "denied" or "by design", show no notice. A truncated header
 |---|---|
 | `Timeout` | the page budget ended the exchange (504): the page's 10 s goal ran out (#1115). This is the budget code; there is no separate "Budget" code |
 | `Error` | any other failure |
-| `NotFound` | a 404. See the note below: this code is also the definite per-user NotFound |
+| `NotFound` | a plain 404: the upstream answered "not found" to a dial |
 | `Unauthorized` | the credential was refused (401). Never a per-user denial (#681) |
 | `NotRun` | the resolve stopped before this stage ran |
 | `Skipped` | a write stage not sent because the stage in `dependsOn` failed |
@@ -88,6 +88,7 @@ row is "denied" or "by design", show no notice. A truncated header
 | code | meaning |
 |---|---|
 | `Forbidden` | the requester may not read it (a 403) |
+| `NotFoundForRequester` | a watched named object that does not exist for this requester: the definite per-user NotFound (#1080), stored like a denial (#681) |
 
 ### by design
 
@@ -98,17 +99,12 @@ row is "denied" or "by design", show no notice. A truncated header
 
 Only these codes are ever sent.
 
-**`NotFound` is ambiguous today.** snowplow records `NotFound` for two
-different answers:
-- a definite per-user NotFound: a watched named object that does not exist for
-  this requester (#1080). It is stored like a denial (#681), and the ruling
-  puts it in "denied";
-- a plain 404 from a dial, which is a failure.
-
-The header carries the same code for both, so a client cannot tell them apart.
-`NotFound` is therefore "cut / failed": a definite NotFound shows the notice
-too. The proposed fix, on #1347, is a distinct closed code for the definite
-answer, placed in "denied".
+**Two NotFound codes.** A watched named object that does not exist for this
+requester is the definite per-user answer (#1080): it reads
+`NotFoundForRequester` ("denied", no notice). A plain 404 from a dial reads
+`NotFound` ("cut / failed"). `NotFoundForRequester` is new in #1319 and is in
+the closed set for RESTAction `/call` too; an older snowplow sends `NotFound`
+for both.
 
 ## 4. Presence: absent means complete
 
@@ -138,9 +134,9 @@ answer, placed in "denied".
 - **What can be stored.** Storage did not change: the same Put gate decides it
   for every class. It refuses a result whose resolve recorded a stage error,
   unless every error was a per-identity denial (#681: `Forbidden`, or the
-  definite `NotFound` of #1080). Two kinds of incomplete answer pass it, so a
+  definite `NotFoundForRequester` of #1080). Two kinds of incomplete answer pass it, so a
   hit's header lists one of them:
-  - **per-identity denials** (`Forbidden`, `NotFound` rows). The answer is
+  - **per-identity denials** (`Forbidden`, `NotFoundForRequester` rows). The answer is
     correct and repeatable for everyone who shares the cell's RBAC class;
   - **a resolve that ran no stage** (`Aborted` and one `NotRun` row per
     stage). Its stages cannot be ordered (a `dependsOn` naming no stage, a

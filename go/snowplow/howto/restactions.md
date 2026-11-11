@@ -312,7 +312,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
  {"name":"delete","ok":false,"reason":"Skipped","dependsOn":"detachVolumes"}]
 ```
 
-- `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
+- `reason` is a code: `Forbidden`, `NotFound`, `NotFoundForRequester` (#1319:
+  a watched named object that does not exist for this requester, #1080),
+  `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
   `StageNotExecuted` (a dry run), `WriteRefused` (a write stage an export or
   background work does not send, #903/#970; before #1288 it read `Error`),

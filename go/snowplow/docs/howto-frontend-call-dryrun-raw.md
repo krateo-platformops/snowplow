@@ -131,7 +131,9 @@ Content-Type: application/json
   stage succeeded. Use it when the draft's own `filter` drops the error keys
   from the body.
   - `reason` is a code from a closed set: `StageNotExecuted`, `Forbidden`,
-    `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
+    `NotFound` (a 404), `NotFoundForRequester` (#1319: a watched named
+    object that does not exist for this requester, the definite per-user
+    answer of #1080), `Unauthorized`, `NotRun` (the resolve stopped before this
     stage), `Skipped` (#904: a write stage not sent because the stage it depends
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
