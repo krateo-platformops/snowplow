@@ -71,6 +71,29 @@
 // mark and refresh. The C1w census lists those sites with that reason, and
 // TestIssue1321_C1w_ApistageCellsAreNeverArmable pins it.
 //
+// GATED KEYS: WHAT A TAB IS SERVED, NOT ONLY WHAT IS STORED (#1328). A
+// widgetContent shell is one identity-free cell narrowed per requester at
+// serve time (dispatchers gateWidgetEnvelope re-derives each action's
+// `allowed` with rbac.UserCan). What a tab is served from it therefore moves
+// with the shell's bytes, which the rule above announces, AND with the
+// requester's RBAC, which no write touches. Nothing else announced the second:
+// the key folds no identity, so #819 never rotates it (dispatchers
+// refresh_rotation.go Derive tracks identity-bound keys only); the #258
+// RBAC-shift re-seed re-mints identity-bound keys only; and no RBAC event
+// dirty-marks a shell (its edges are the widget, its apiRef and its action
+// targets). On main a tab healed only when some unrelated refresh of the shell
+// re-Put identical bytes under a new generation; withholding those frames
+// would make the stale view permanent. So the frame decision for a gated key
+// also follows the SERVED view, per subscriber (dispatchers
+// refresh_gated_view.go): the /refreshes connection keeps, per armed gated
+// key, the #1324 served digest its tab holds; when an RBAC publish moves THIS
+// identity's class (cache.IdentityClassesMayHaveMoved, rbac.IdentityClassOf),
+// it recomputes the digest for this identity and sends one frame for every key
+// whose view moved (RefreshStream.GatedMoved, counted
+// snowplow_refresh_broadcaster.gated_view_moved). Equal classes give equal
+// verdicts (#423, #435), so a publish that leaves the class alone cannot move
+// the view. Pinned end to end by TestRefreshes1328_G1 (internal/handlers).
+//
 // "IDENTICAL" IS THE BODY (#1321 M2). The compare and the #1324 digest cover
 // the response body only, not the X-Snowplow-Stage-Outcomes a restactions
 // /call also answers with (entry.StageOutcomes, #904). That is decided by

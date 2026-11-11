@@ -844,6 +844,10 @@ type RefreshStream struct {
 	// `refresh` frame per key on THIS connection, at once (not paced), the
 	// same path as Rotated. The handler decides which keys.
 	CatchUp func(keys []string)
+	// GatedMoved (#1328) announces armed gated keys whose served view for this
+	// connection's identity moved with an RBAC change while the stored bytes
+	// did not. Same delivery as CatchUp. The handler decides which keys.
+	GatedMoved func(keys []string)
 	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
 	// ledger that a frame was WRITTEN to this stream — called by the handler
 	// after its writeFrame returned true, with no lock held. An offer is not a
@@ -884,7 +888,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}, CatchUp: func([]string) {},
+		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}, CatchUp: func([]string) {}, GatedMoved: func([]string) {},
 			Wrote: func(string) {}, WroteResync: func() {}}
 	}
 	limit, burst := refreshEvictionBucket()
@@ -964,7 +968,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	for k := range armedKeys {
 		armedCopy[k] = struct{}{}
 	}
-	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated, CatchUp: s.offerCatchUp,
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated, CatchUp: s.offerCatchUp, GatedMoved: s.offerGatedMoved,
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
@@ -1035,6 +1039,28 @@ func (s *refreshSub) offerCatchUp(keys []string) {
 		s.offerRefreshLocked(k, refreshOwed{})
 		s.pmu.Unlock()
 		refreshArmCatchUpTotal.Add(1)
+	}
+}
+
+// offerGatedMoved announces armed gated (identity-free, serve-time-gated) keys
+// whose served view for THIS connection's identity moved with an RBAC change
+// while the stored bytes did not (#1328; the handler decides which,
+// dispatchers refresh_gated_view.go). No Put announces such a change, so this
+// is its only frame. Same delivery as offerRotated / offerCatchUp: un-paced,
+// never dropped, only to this connection.
+func (s *refreshSub) offerGatedMoved(keys []string) {
+	h := s.hub
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, k := range keys {
+		if _, armed := s.keys[k]; !armed {
+			continue
+		}
+		s.pmu.Lock()
+		delete(s.pending, k)
+		s.offerRefreshLocked(k, refreshOwed{})
+		s.pmu.Unlock()
+		refreshGatedViewMovedTotal.Add(1)
 	}
 }
 
@@ -1212,6 +1238,9 @@ var (
 	// keys whose arm carried a `held` digest (its denominator).
 	refreshArmCatchUpTotal atomic.Uint64
 	refreshArmHeldTotal    atomic.Uint64
+	// refreshGatedViewMovedTotal counts (key -> subscriber) frames for an RBAC
+	// change that moved a gated key's served view with no write (#1328).
+	refreshGatedViewMovedTotal atomic.Uint64
 
 	// C12 — stream lifetime. stream_seconds_total / streams_closed_total is
 	// the mean stream lifetime; the instrument S8 found missing at every hop.
@@ -1299,6 +1328,7 @@ type RefreshBroadcasterStats struct {
 	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent at once on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
 	ArmHeld               uint64  `stat:"arm_held" desc:"Armed keys whose /refreshes arm carried a held digest (the X-Snowplow-Refresh-Digest of the tab's /call answer); the denominator of arm_catch_up (#1324)."`
 	ArmCatchUp            uint64  `stat:"arm_catch_up" desc:"Refresh frames sent at once on arm because the tab was behind: its held digest is not the digest of what its /call would answer now, or the cell is gone (#1324)."`
+	GatedViewMoved        uint64  `stat:"gated_view_moved" desc:"Refresh frames for an RBAC change that moved what a tab is served from a gated (identity-free, serve-time-gated) key while its stored bytes did not: no write announces it (#1328)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
@@ -1335,6 +1365,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		RotationAnnounced:     refreshRotationAnnouncedTotal.Load(),
 		ArmHeld:               refreshArmHeldTotal.Load(),
 		ArmCatchUp:            refreshArmCatchUpTotal.Load(),
+		GatedViewMoved:        refreshGatedViewMovedTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
@@ -1450,6 +1481,7 @@ func resetRefreshBroadcasterForTest() {
 	refreshEvictPublishedTotal.Store(0)
 	refreshRotationAnnouncedTotal.Store(0)
 	refreshArmCatchUpTotal.Store(0)
+	refreshGatedViewMovedTotal.Store(0)
 	refreshArmHeldTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)

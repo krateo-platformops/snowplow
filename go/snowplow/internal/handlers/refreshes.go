@@ -287,12 +287,17 @@ func Refreshes() http.HandlerFunc {
 		// a change landing during the check is either seen here or published
 		// to this stream (the pending set absorbs a double offer).
 		cache.NoteRefreshArmHeld(len(held))
+		// #1328 — seed what this tab is served from each gated key (read the
+		// class first: an RBAC change after it moves the class again, and the
+		// classMoved turn below re-checks).
+		rotation.ArmGated()
 		if behind := dispatchers.BehindKeys(req.Context(), held); len(behind) > 0 && stream.CatchUp != nil {
 			stream.CatchUp(behind)
 		}
 
-		// #819: only a connection with an identity-bound key can rotate; a
-		// nil channel never fires.
+		// #819: only a connection with an identity-bound key can rotate, or
+		// (#1328) with a gated key whose served view an RBAC change can move;
+		// a nil channel never fires.
 		if !rotation.Tracking() {
 			classMoved = nil
 		}
@@ -323,6 +328,8 @@ func Refreshes() http.HandlerFunc {
 				if !writeRefreshFrame(writeFrame, stream, k) {
 					return // client write failed or exceeded the deadline — disconnect
 				}
+				// #1328 — the tab's refetch reads at least the view served now.
+				rotation.NoteFrameWritten(k)
 			case <-classMoved:
 				// #819: an RBAC publish or the #682 epoch may have moved this
 				// identity's class. Re-acquire first (coalesced: notes during the
@@ -332,6 +339,12 @@ func Refreshes() http.HandlerFunc {
 				classMoved = cache.IdentityClassesMayHaveMoved()
 				if rotated := rotation.Rotated(); len(rotated) > 0 {
 					stream.Rotated(rotated)
+				}
+				// #1328 — a gated key folds no class and never rotates, but what
+				// THIS identity is served from it can move with the class: one
+				// frame per gated key whose served view is not the tab's.
+				if moved := rotation.GatedMoved(); len(moved) > 0 && stream.GatedMoved != nil {
+					stream.GatedMoved(moved)
 				}
 			case <-heartbeat.C:
 				if !writeFrame(": keepalive\n\n") {
