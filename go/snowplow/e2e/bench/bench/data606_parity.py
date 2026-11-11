@@ -201,7 +201,7 @@ ARM_B_VARS = ["COLLECT_TIMEOUT_S", "SCALE", "USERS", "NAMESPACES", "LOAD_DRIVER"
               "HOLD_PROBE_WAIT_S", "ENDPOINT_MODE", "PREFLIGHT_TIMEOUT_S", "PREFLIGHT_POLL_S", "TOP_POLL_S",
               "FRESH_MODES", "DATA_TIMEOUT_S", "COLLECT_CAP_S", "PW", "INC", "INC_POLL_S", "BENCH_USER_PREFIX"]
 ARM_B_FUNCTIONS = ["log", "run", "kapply", "redact_pw", "kill_tree", "halt_tree", "bounded", "kerr_line",
-                   "record_failure", "incluster_pod", "incluster_started", "incluster_placement",
+                   "record_failure", "incluster_pod", "job_pod_why", "incluster_started", "incluster_placement",
                    "incluster_delete", "loadgen_room", "data606_wait", "data606_finish", "data606_gone", "s_data"]
 # set by the arm's own preamble (armB.sh), not read from run606.sh: the run dir, the script's dir, the
 # kube context it pins, kubectl's error file, the step

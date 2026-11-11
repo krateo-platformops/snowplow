@@ -116,9 +116,10 @@ def test_a_restarting_sidecar_is_stuck_at_once():
 def test_a_pod_pending_past_its_bound_is_stuck_with_the_reason():
     assert load606.driver_pod_stuck(_pod(), T0 + load606.DRIVER_PENDING_S - 1) is None
     why = load606.driver_pod_stuck(_pod(sched="Unschedulable"), T0 + load606.DRIVER_PENDING_S)
+    # run 24b: the scheduler's own message is the reason (node counts and predicates); a container's
+    # message is never said (it can echo the program's output)
     assert why == (f"pod k6browser-x is still Pending {load606.DRIVER_PENDING_S} s after it was "
-                   f"created (unscheduled: Unschedulable) (waiting: browser PodInitializing)")
-    assert "0/3 nodes" not in why                  # reasons only, never messages
+                   f"created (unscheduled: Unschedulable: 0/3 nodes are available) (waiting: browser PodInitializing)")
 
 
 def test_a_running_pod_is_never_stuck():

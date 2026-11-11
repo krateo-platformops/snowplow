@@ -145,11 +145,11 @@ def test_an_operation_still_blocking_when_the_budget_is_spent_fails(fakegke, mon
 @pytest.mark.serial  # #1166/#1174: asserts `time.monotonic() - t0 < 15` on the wall clock
 def test_gke_down_passes_the_budget(fakegke, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_BLOCKING_OPS", OP1)
-    # #1026: deleted (exit 4, not 1); this fake cluster has no endpoint to match the bench
-    # kubeconfig, so its LoadBalancer Services were never read: whether an address is left is unknown
-    assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "60", "--yes"]) == gke.EXIT_BACKSTOP_FAILED
+    # deleted (exit 0). This fake cluster has no endpoint: no API server anyone reached, so no
+    # LoadBalancer Service of it can exist, and no address backstop alarm (run 25's false alarm)
+    assert gke.main(["gke-down", "--name", SPEC.name, "--budget-s", "60", "--yes"]) == 0
     err = capsys.readouterr().err
-    assert f"{gke.ADDRESS_BACKSTOP_FAILED} for {SPEC.name}" in err and gke.BACKSTOP_FAILED not in err
+    assert gke.ADDRESS_BACKSTOP_FAILED not in err and gke.BACKSTOP_FAILED not in err
     assert f"wait {OP1} {SPEC.project} {SPEC.region}" in _calls(fakegke)
     # and honours it: an operation that outlasts --budget-s fails gke-down, fast
     (fakegke / "calls").unlink()

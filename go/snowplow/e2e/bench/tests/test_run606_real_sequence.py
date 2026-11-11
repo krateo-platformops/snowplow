@@ -228,7 +228,8 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     # started when the Job is applied, TERMed (as the kubelet would) when the Job is deleted.
     # FAKE_INC_FAILED=<job>: that Job's pod fails before its program runs (an init container that failed);
     # FAKE_INC_POOL=<pool>: the pods land on a node of that pool; FAKE_INC_LEFT=1: data606's pod is
-    # still listed when the drivers are applied.
+    # still listed when the drivers are applied; FAKE_INC_PENDING=<job>: that Job's pod is never
+    # scheduled (Pending, its PodScheduled condition carrying run 24b's FailedScheduling message).
     INC = ("data606", "observe606")
     def inc_dir(job):
         return os.path.join(STATE, "pods", job)
@@ -246,7 +247,7 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                 continue
             os.makedirs(os.path.join(inc_dir(job), "out"), exist_ok=True)
             json.dump(d, open(os.path.join(inc_dir(job), "job.json"), "w"))
-            if os.environ.get("FAKE_INC_FAILED") == job:
+            if job in (os.environ.get("FAKE_INC_FAILED"), os.environ.get("FAKE_INC_PENDING")):
                 continue
             c = d["spec"]["template"]["spec"]["containers"][0]
             out = os.path.join(inc_dir(job), "out")
@@ -263,6 +264,16 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             open(os.path.join(inc_dir(job), "pid"), "w").write(str(p.pid))
         if inc_jobs:
             sys.exit(0)
+    # run 24b: a Job whose pod is never scheduled (FAKE_PSI=pending, FAKE_PREFLIGHT=pending): its pod as
+    # the API server lists it, Pending with the scheduler's own reason on its PodScheduled condition
+    stuck = {"psi606": os.environ.get("FAKE_PSI") == "pending",
+             "preflight606": os.environ.get("FAKE_PREFLIGHT") == "pending"}
+    if a[:2] == ["get", "pods"] and "json" in a and any(x in ("job-name=" + j for j, on in stuck.items() if on) for x in a):
+        job = next(x for x in a if x.startswith("job-name=")).split("=", 1)[1]
+        print(json.dumps({"items": [{"metadata": {"name": job + "-0"}, "spec": {}, "status": {
+            "phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                                                "message": "0/5 nodes are available: 1 Insufficient cpu."}]}}]}))
+        sys.exit(0)
     inc_sel = next((x.split("=", 1)[1] for x in a if x.startswith("job-name=") and x.split("=", 1)[1] in INC), None)
     if a[:2] == ["get", "pods"] and inc_sel:
         job = inc_sel
@@ -270,8 +281,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
         listed = applied and (not os.path.exists(os.path.join(inc_dir(job), "deleted"))
                               or (job == "data606" and os.environ.get("FAKE_INC_LEFT") == "1"))
         failed = os.environ.get("FAKE_INC_FAILED") == job
+        pending = os.environ.get("FAKE_INC_PENDING") == job
         done = os.path.exists(os.path.join(inc_dir(job), "out", "done"))
-        phase = "Failed" if failed else "Running"
+        phase = "Failed" if failed else "Pending" if pending else "Running"
         jp = next((x for x in a if x.startswith("jsonpath=")), "")
         if "json" in a:
             spec = json.load(open(os.path.join(inc_dir(job), "job.json")))["spec"]["template"]["spec"] if listed else {}
@@ -280,8 +292,11 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
                                                               "restartCount": 0, "state": {"terminated": {
                                                                   "reason": "OOMKilled", "exitCode": 137}}}]}
                   if listed and os.environ.get("FAKE_INC_OOM") == job else {"phase": phase})
+            if pending:
+                st["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                                     "message": "0/5 nodes are available: 1 Insufficient memory, 1 node(s) had untolerated taint(s), 3 node(s) didn't match Pod's node affinity/selector."}]
             print(json.dumps({"items": [{"metadata": {"name": job + "-0"},
-                                         "spec": {"nodeName": "loadgen-0", "containers": spec.get("containers", [])},
+                                         "spec": {**({} if pending else {"nodeName": "loadgen-0"}), "containers": spec.get("containers", [])},
                                          "status": st}] if listed else []}))
             sys.exit(0)
         if "name" in a:
@@ -1217,6 +1232,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             # FAKE_PREFLIGHT=refused: the run's preflight refuses; FAKE_PREFLIGHT_REFUSE_JOB: that Job alone
             refused = (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
                        or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
+            # FAKE_PREFLIGHT=pending: the run's preflight Job never finishes (its pod is never scheduled)
+            if os.environ.get("FAKE_PREFLIGHT") == "pending" and job == "preflight606":
+                print(""); sys.exit(0)
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("" if refused else "1"); sys.exit(0)
             if any(x.endswith("{.status.failed}") for x in a):
@@ -1641,9 +1659,11 @@ def test_real_sequence_under_wrong_ambient_context(harness):
     # review M2: the observer ran to collect, and the verdict says so
     obs = [json.loads(ln) for ln in (o / "observer-pod.jsonl").read_text().splitlines()]
     assert [(r["kind"], r["pod"], r["phase"]) for r in obs] == [("observer_pod", "observe606-0", "Running")]
-    # review M1: the live node's allocatable (15890m / 59825Mi) minus the DaemonSets' 1000m / 4096Mi minus the
-    # observer's 500m / 1Gi (scheduled, with its 100m / 128Mi init container under its main one): run 23's plan
-    assert placed[1]["requests"] == {"data606": {"cpu": "14390m", "memory": "54705Mi"}}
+    # review M1 / run 24b: the live node's room (allocatable 15890m / 59825Mi minus the DaemonSets' 1000m /
+    # 4096Mi minus the observer's 500m / 1Gi, its 100m / 128Mi init container under its main one) holds
+    # data606's need, and data606 requests that need (run 23's share), never the room
+    assert placed[1]["requests"] == {"data606": {"cpu": "2667m", "memory": "8192Mi"}}
+    assert (rooms[1]["slack_cpu_m"], rooms[1]["slack_memory_mi"]) == (14390 - 2667, 54705 - 8192)
     deleted = [json.loads(ln) for ln in (state / "deleted.jsonl").read_text().splitlines()]
     gone = next(d for d in deleted if "job/data606" in d["names"])
     assert "serviceaccount/bench-data606" in gone["names"]

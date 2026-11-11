@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bench import data_manifests, incluster, rbac_model
+from bench import data_manifests, incluster, load606, rbac_model
 from bench.load606 import list_dep_fixture_yaml, list_dep_status_fixture_yaml
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
@@ -112,12 +112,15 @@ def test_each_job_is_pinned_to_the_loadgen_pool_with_its_own_serviceaccount():
         text = json.dumps(objs)
         assert "token:" not in text and "client-certificate" not in text and spec["automountServiceAccountToken"]
     c = next(x for x in d if x["kind"] == "Job")["spec"]["template"]["spec"]["containers"][0]
-    assert c["resources"] == {"requests": {"cpu": "14390m", "memory": "54705Mi"}}   # the live room; no limit
+    assert c["resources"] == {"requests": {"cpu": "2667m", "memory": "8192Mi"}}     # its need, not the room; no limit
     assert c["command"][-2:] == ["--scale", "50000"]
     oc = next(x for x in o if x["kind"] == "Job")["spec"]["template"]["spec"]["containers"][0]
     assert oc["resources"]["limits"]["cpu"] == "1"                              # never the browser's CPU
     sec = next(x for x in o if x["kind"] == "Secret")
     assert sec["stringData"] == {"deny": "pw"}                                  # kapply redacts it on disk
+
+
+MIB = 1 << 20
 
 
 def _node(cpu="15890m", mem="59825Mi"):
@@ -140,17 +143,19 @@ def _room(ds=(("ds", "1000m", "4096Mi"),), **kw):
 
 def test_run_23s_shape_is_unchanged():
     """An n2-standard-16 whose DaemonSets request what run 23's plan reserved for them (1000m / 4096Mi):
-    data606 asks what it asked before (14390m), and its memory is the node's, not a guess."""
+    its room is what it was (14390m / 54705Mi); data606 asks for its need, the rest is slack."""
     r = _room()
     assert r["ok"] and (r["cpu_m"], r["memory_mi"]) == (14390, 54705) and r["observer_counted"] == "to come"
-    assert incluster.data606_requests(r) == ("14390m", "54705Mi")
+    assert incluster.data606_requests(r) == ("2667m", "8192Mi")
+    assert (r["slack_cpu_m"], r["slack_memory_mi"]) == (14390 - 2667, 54705 - 8192)
     from bench import k6_job
     k6_job.loadgen_fit("n2-standard-16", k6_job.k6_plan_requests())          # the drivers' plan still fits after it
 
 
-def test_heavy_daemonsets_give_a_smaller_request_that_still_schedules():
-    """Seven DaemonSets (run 24's loadgen node had 7, unrecorded) requesting 3.2 CPUs: data606 asks for
-    what is left, so it schedules; the observer, once there, is counted as scheduled, not twice."""
+def test_heavy_daemonsets_give_a_smaller_room_and_the_same_request():
+    """Seven DaemonSets (run 24's loadgen node had 7, unrecorded) requesting 3.2 CPUs: the room is
+    smaller, data606 still asks for its need; the observer, once there, is counted as scheduled, not
+    twice."""
     ds = [(f"ds-{i}", "457m", "700Mi") for i in range(7)]
     r = _room(ds)
     assert r["ok"] and r["cpu_m"] == 15890 - 7 * 457 - 500 and r["memory_mi"] == 59825 - 7 * 700 - 1024
@@ -161,20 +166,19 @@ def test_heavy_daemonsets_give_a_smaller_request_that_still_schedules():
     # containers counts instead of them
     done = incluster.loadgen_room(_node(), {"items": [_pod("job-done", "8", "8Gi", phase="Succeeded")]})
     assert done["cpu_m"] == 15890 - 500
-    assert incluster.pod_requests(_pod("p", "100m", "64Mi", init=("2", "1Gi"))) == (2000, 1024)
+    assert incluster.pod_requests(_pod("p", "100m", "64Mi", init=("2", "1Gi"))) == (2000, 1024 * MIB)
     assert incluster.render_data606(context="c", timeout_s=1, linger_s=1, room=r, data_args=[])[-1][
-        "spec"]["template"]["spec"]["containers"][0]["resources"] == {
-        "requests": {"cpu": f"{r['cpu_m']}m", "memory": f"{r['memory_mi']}Mi"}}
+        "spec"]["template"]["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "2667m", "memory": "8192Mi"}}
 
 
 def test_too_little_room_is_refused_with_the_numbers():
     # memory short only: 59825 - 51200 - 1024 = 7601Mi < 8192Mi; the CPU (3390m) is above its floor
     r = _room((("ds", "12", "50Gi"),))
     assert not r["ok"] and r["why"].startswith(
-        "the loadgen node gke-loadgen-1 leaves data606 too little: memory 7601Mi < floor 8192Mi (allocatable 15890m")
+        "the loadgen node gke-loadgen-1 leaves data606 too little: memory 7601Mi < its need 8192Mi (allocatable 15890m")
     # CPU short only: 15890 - 13500 - 500 = 1890m
     tight = _room((("ds", "13500m", "4Gi"),))
-    assert not tight["ok"] and "cpu 1890m < floor 2667m" in tight["why"] and "memory" not in tight["why"].split("(")[0]
+    assert not tight["ok"] and "cpu 1890m < its need 2667m" in tight["why"] and "memory" not in tight["why"].split("(")[0]
     with pytest.raises(ValueError, match="leaves data606 too little"):
         incluster.data606_requests(tight)
     two = incluster.loadgen_room({"items": [_node()["items"][0], _node()["items"][0]]}, {"items": []})
@@ -228,7 +232,7 @@ def test_an_observer_that_died_is_named_in_the_verdict(harness):  # noqa: F811
 def test_too_little_room_fails_the_env_step_before_anything_runs_there(harness):  # noqa: F811
     p, out, state, o = _run(harness, FAKE_INC_DS="15000m 4Gi")
     assert p.returncode != 0
-    assert "loadgen room FAILED (env): the loadgen node loadgen-0 leaves data606 too little: cpu 390m < floor 2667m" in out
+    assert "loadgen room FAILED (env): the loadgen node loadgen-0 leaves data606 too little: cpu 390m < its need 2667m" in out
     assert "=== step data ===" not in out
     calls = [json.loads(ln)["argv"] for ln in (state / "calls.jsonl").read_text().splitlines()]
     assert not [c for c in calls if any(x.endswith(("observe-job.yaml", "data606-job.yaml")) for x in c)]
@@ -359,3 +363,187 @@ def test_the_dry_pass_says_where_each_job_runs_and_the_budget_counts_it(tmp_path
     # nothing timed or per-request runs here any more
     for gone in ("bench.sampler --kind", "logs -f", "python3 -m bench data606 --"):
         assert gone not in src.replace("bench/log_stream.sh", ""), gone
+
+
+# ─── run 24b: data606 Pending on "Insufficient memory" on every arm ─────────────────────────────
+#
+# Its loadgen-room.json (snowplow-bench-run24n1-f8eaceb9): allocatable 15890m / 60040096Ki, eight pods
+# (the observer among them), data606 told to request 15089m / 56940Mi, the scheduler: "0/5 nodes are
+# available: 1 Insufficient memory, ...". The gmp-system collector's requests are decimal (GMP's
+# operator manifest: prometheus 4m / 32M, config-reloader 1m / 4M, init config-init 1m / 4M); the
+# room counted 32M + 4M as 30 + 3 Mi. The other pods' requests as that record counted them.
+RUN24B_ALLOC = ("15890m", "60040096Ki")
+
+
+def _c(name, cpu, mem, **extra):
+    return {"name": name, "resources": {"requests": {k: v for k, v in (("cpu", cpu), ("memory", mem)) if v}}, **extra}
+
+
+def _pod_of(ns, name, containers, init=(), labels=None, **meta):
+    return {"metadata": {"namespace": ns, "name": name, "labels": labels or {}, **meta},
+            "spec": {"containers": list(containers), "initContainers": list(init)}, "status": {"phase": "Running"}}
+
+
+RUN24B_PODS = [
+    _pod_of("bench-loadgen", "observe606-smwh6", [_c("observe", "500m", "1Gi")], [_c("tools", "100m", "128Mi")],
+            labels={"job-name": "observe606"}),
+    _pod_of("gmp-system", "collector-wsjmm", [_c("config-reloader", "1m", "4M"), _c("prometheus", "4m", "32M")],
+            [_c("config-init", "1m", "4M")]),
+    _pod_of("kube-system", "filestore-node-rrwk9", [_c("c", "25m", "160Mi")]),
+    _pod_of("kube-system", "fluentbit-gke-7qgrb", [_c("c", "105m", "230Mi")]),
+    _pod_of("kube-system", "gke-metrics-agent-td7rl", [_c("c", "21m", "145Mi")]),
+    _pod_of("kube-system", "kube-proxy-gke-x", [_c("c", "100m", None)]),
+    _pod_of("kube-system", "node-local-dns-46kt9", [_c("c", "30m", "50Mi")]),
+    _pod_of("kube-system", "pdcsi-node-7mzv4", [_c("c", "15m", "50Mi")]),
+]
+# the scheduler's arithmetic, by hand (not incluster's): allocatable and every request in bytes
+RUN24B_ALLOC_BYTES = 60040096 * 1024
+RUN24B_USED_BYTES = (1024 + 160 + 230 + 145 + 50 + 50) * MIB + 36_000_000
+
+
+def _fits(request_mem: str, used_bytes: int) -> bool:
+    """The scheduler's NodeResourcesFit on memory, by hand: used + the request within allocatable."""
+    n, unit = int(request_mem[:-2]), request_mem[-2:]
+    assert unit == "Mi"
+    return used_bytes + n * MIB <= RUN24B_ALLOC_BYTES
+
+
+def _cpu_m_of(q: str) -> int:
+    assert q.endswith("m")
+    return int(q[:-1])
+
+
+def test_run_24bs_node_holds_the_data606_it_renders_and_a_pod_that_lands_after_the_read():
+    """Run 24b's own node: the room is the scheduler's exact free memory (not 0.43 MiB more), and
+    data606's request fits it, before and after a pod lands on the node after the read (the
+    bench-self-destruct CronJob's, every 10 min there: 100Mi here). The old request (the room
+    itself, 56940Mi) fit neither."""
+    r = incluster.loadgen_room(_node(*RUN24B_ALLOC), {"items": RUN24B_PODS})
+    assert r["ok"] and r["observer_counted"] == "scheduled"
+    assert r["memory_bytes"] == RUN24B_ALLOC_BYTES - RUN24B_USED_BYTES        # exact, decimal units included
+    used_cpu = 500 + 5 + 25 + 105 + 21 + 100 + 30 + 15
+    assert r["cpu_m"] == 15890 - used_cpu
+    collector = next(s for s in r["scheduled"] if s["pod"] == "collector-wsjmm")
+    assert collector == {"namespace": "gmp-system", "pod": "collector-wsjmm", "cpu_m": 5, "memory_bytes": 36_000_000}
+    assert not _fits("56940Mi", RUN24B_USED_BYTES)                            # what run 24b asked: refused
+    cpu, mem = incluster.data606_requests(r)
+    assert _fits(mem, RUN24B_USED_BYTES) and _fits(mem, RUN24B_USED_BYTES + 100 * MIB)
+    assert _cpu_m_of(cpu) + used_cpu + 100 <= 15890
+    # the record says the slack beside the request: the room a late pod has
+    assert r["slack_memory_mi"] == (RUN24B_ALLOC_BYTES - RUN24B_USED_BYTES - 8192 * MIB) // MIB
+    assert "of slack beside it" in r["why"] and f"requesting {used_cpu}m / 1693.33Mi" in r["why"], r["why"]
+
+
+def test_the_request_is_the_need_whatever_the_room():
+    """The request does not depend on the read: two rooms, one request (data606_floor: run 23's
+    share). A room below the need is refused, never rendered smaller."""
+    big = _room((("ds", "100m", "100Mi"),))
+    small = _room((("ds", "10", "40Gi"),))
+    assert big["ok"] and small["ok"] and big["cpu_m"] != small["cpu_m"]
+    assert incluster.data606_requests(big) == incluster.data606_requests(small) == (
+        f"{incluster.data606_floor()[0]}m", f"{incluster.data606_floor()[1]}Mi")
+    short = _room((("ds", "10", "50Gi"),))
+    assert not short["ok"]
+    with pytest.raises(ValueError):
+        incluster.data606_requests(short)
+
+
+def test_a_terminating_pod_still_holds_its_requests():
+    """The scheduler frees a pod's requests once it is deleted, not when its deletion starts: a pod
+    with a deletionTimestamp counts (and is said so); a finished one does not."""
+    term = _pod("old-job-x", "2", "8Gi")
+    term["metadata"]["deletionTimestamp"] = "2026-11-11T13:17:15Z"
+    r = incluster.loadgen_room(_node(), {"items": [term]})
+    assert r["cpu_m"] == 15890 - 2000 - 500 and r["memory_mi"] == 59825 - 8192 - 1024
+    assert r["scheduled"][0].get("terminating") is True and "(1 of them terminating)" in r["why"]
+    done = incluster.loadgen_room(_node(), {"items": [_pod("j", "2", "8Gi", phase="Succeeded")]})
+    assert done["cpu_m"] == 15890 - 500
+
+
+def test_pod_requests_follow_the_schedulers_formula():
+    """k8s.io/component-helpers resource.PodRequests: native sidecars (restartPolicy Always init
+    containers) run beside the containers and add to them; a plain init container counts with the
+    sidecars started before it; pod-level requests replace the containers'; overhead adds."""
+    sidecar = _pod_of("ns", "p", [_c("main", "1", "200Mi")],
+                      [_c("side", "100m", "100Mi", restartPolicy="Always"), _c("init", "200m", "500Mi")])
+    assert incluster.pod_requests(sidecar) == (1100, 600 * MIB)       # memory: the init (500) + the sidecar (100)
+    late_sidecar = _pod_of("ns", "p", [_c("main", "1", "200Mi")],
+                           [_c("init", "200m", "500Mi"), _c("side", "100m", "100Mi", restartPolicy="Always")])
+    assert incluster.pod_requests(late_sidecar) == (1100, 500 * MIB)
+    over = _pod_of("ns", "p", [_c("main", "1", "1Gi")])
+    over["spec"]["overhead"] = {"cpu": "250m", "memory": "120Mi"}
+    assert incluster.pod_requests(over) == (1250, 1144 * MIB)
+    pod_level = _pod_of("ns", "p", [_c("a", "1", "1Gi"), _c("b", "1", "1Gi")])
+    pod_level["spec"]["resources"] = {"requests": {"cpu": "1500m", "memory": "1536Mi"}}
+    assert incluster.pod_requests(pod_level) == (1500, 1536 * MIB)
+
+
+@pytest.mark.parametrize("q,cpu,mem", [
+    ("32M", None, 32_000_000), ("4M", None, 4_000_000), ("60040096Ki", None, 60040096 * 1024),
+    ("1.5Gi", None, 3 * 2 ** 29), ("129e6", None, 129_000_000), ("1e3", None, 1000), ("0.1", 100, 1),
+    ("100m", 100, 1), ("1", 1000, 1), ("100u", 1, 1), ("2.0005", 2001, 3), ("", 0, 0),
+])
+def test_quantities_are_exact_and_rounded_up_as_the_scheduler_rounds(q, cpu, mem):
+    if cpu is not None:
+        assert incluster.cpu_m(q) == cpu
+    assert incluster.mem_bytes(q) == mem
+    with pytest.raises(ValueError):
+        incluster.mem_bytes("12 Mi")
+
+
+def test_a_pod_that_never_schedules_fails_its_step_with_the_schedulers_own_reason(harness):  # noqa: F811
+    """Run 24b: `data606 FAILED: its pod did not start within 300s (phase Pending): ` said nothing of
+    why. Now the line carries the scheduler's own FailedScheduling message (the pod's PodScheduled
+    condition)."""
+    p, out, state, o = _run(harness, FAKE_INC_PENDING="data606", PREFLIGHT_TIMEOUT_S="3")
+    assert p.returncode != 0
+    want = ("data606 FAILED: its pod did not start within 3s: pod data606-0 Pending, not scheduled: Unschedulable: "
+            "0/5 nodes are available: 1 Insufficient memory, 1 node(s) had untolerated taint(s), 3 node(s) didn't "
+            "match Pod's node affinity/selector.")
+    assert want in out, out[-3000:]
+    fails = [json.loads(ln) for ln in (o / "command-failures.jsonl").read_text().splitlines()]
+    assert any(f["step"] == "data" and "Insufficient memory" in f["what"] for f in fails)
+
+
+@pytest.mark.parametrize("pods,want", [
+    (None, "the pods of job data606 could not be read (no pod listing): where its pod stands is unknown"),
+    ({"items": []}, "job data606 has no pod (the Job controller created none, or it was deleted)"),
+    ({"items": [{"metadata": {"name": "data606-x"}, "status": {"phase": "Pending"}}]},
+     "pod data606-x Pending, the scheduler has not said why yet"),
+    ({"items": [{"metadata": {"name": "data606-x"}, "spec": {"nodeName": "n"}, "status": {
+        "phase": "Pending", "initContainerStatuses": [{"name": "tools", "state": {"waiting": {
+            "reason": "ImagePullBackOff", "message": "secret program output"}}}]}}]},
+     "pod data606-x Pending, waiting: tools ImagePullBackOff"),
+])
+def test_where_a_pod_stands_is_never_empty_and_never_a_containers_message(pods, want):
+    why = load606.pod_why(pods, "data606")
+    assert why == want and "secret program output" not in why
+
+
+def test_a_preflight_job_that_never_schedules_says_the_schedulers_reason(harness):  # noqa: F811
+    """run_preflight_job's timeout line carries where its pod stands (review #1335 M1)."""
+    p, out, state, o = _run(harness, FAKE_PREFLIGHT="pending", PREFLIGHT_TIMEOUT_S="3")
+    assert p.returncode != 0
+    assert ("PREFLIGHT did not finish within 3s (the run): pod preflight606-0 Pending, not scheduled: Unschedulable: "
+            "0/5 nodes are available: 1 Insufficient cpu.") in out, out[-3000:]
+
+
+def test_a_quantity_the_room_cannot_read_is_named_and_writes_no_blank_record(tmp_path):
+    """Review #1335 L1: `room` on a pod whose request is not a Kubernetes quantity answers one
+    refused record naming it (exit 1), never an empty line."""
+    nodes, pods = tmp_path / "nodes.json", tmp_path / "pods.json"
+    nodes.write_text(json.dumps(_node()))
+    pods.write_text(json.dumps({"items": [_pod("odd-ds-x", "100m", "12 Mi")]}))
+    p = subprocess.run([sys.executable, "-m", "bench.incluster", "room", "--nodes", str(nodes), "--pods", str(pods),
+                        "--phase", "data"], cwd=BENCH_DIR, capture_output=True, text=True)
+    assert p.returncode == 1 and p.stdout.count("\n") == 1, (p.stdout, p.stderr)
+    rec = json.loads(p.stdout)
+    assert rec["kind"] == "loadgen_room" and rec["ok"] is False and rec["phase"] == "data"
+    assert rec["why"] == ("the loadgen room could not be read: pod kube-system/odd-ds-x: its memory request "
+                          "'12 Mi' is not a Kubernetes quantity")
+    bad_node = tmp_path / "bad-node.json"
+    bad_node.write_text(json.dumps(_node(mem="lots")))
+    p = subprocess.run([sys.executable, "-m", "bench.incluster", "room", "--nodes", str(bad_node), "--pods",
+                        str(tmp_path / "pods.json"), "--phase", "env"], cwd=BENCH_DIR, capture_output=True, text=True)
+    assert p.returncode == 1 and "node gke-loadgen-1: its allocatable memory 'lots' is not a Kubernetes quantity" in \
+        json.loads(p.stdout)["why"]
