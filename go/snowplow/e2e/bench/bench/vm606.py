@@ -11,6 +11,7 @@ judges the VM.
 
     python3 -m bench.vm606 plan-iam                         # the roles, derived from the code; prints only
     python3 -m bench.vm606 up --run R --ttl-hours H [--yes]  # grants, firewall, the VM; waits for its bootstrap
+    python3 -m bench.vm606 up --run R [--yes]                # resumes an up stopped in its bootstrap wait
     python3 -m bench.vm606 push-secret --run R [--yes]       # the ghcr pull-token file, as an opaque file
     python3 -m bench.vm606 launch --run R --bench-sha SHA --env-file F \\
         --pin-manifest M --pin-sha256 HEX [--yes]            # clone at SHA, dry pass, start detached
@@ -74,7 +75,31 @@ THE VM (up).
     (enable-oslogin=TRUE, project keys blocked). `up` refuses while iap.googleapis.com is not enabled.
   - A failed `up` says so and names `down`, which removes whatever up made (grants, rules, VM): the
     SSH wait reads every failure (IAP / firewall / OS Login / ssh) and stops at once on one that
-    waiting cannot fix, never as a silent timeout.
+    waiting cannot fix, never as a silent timeout. An IAP tunnel failure is read by its close code
+    (IAP_CODES, from IAP's own table, https://docs.cloud.google.com/iap/docs/faq#error-codes): 4003
+    (port 22 not answering yet) and 4047 (the instance has not completed its startup: run 24's first
+    up, 2026-11-11) are waited out within --ssh-ready-timeout-s, 4033 (not authorized) and 4010 (the
+    VM closed the connection) stop at once, a code the table does not list is waited out; every
+    refusal names the code, the number only.
+  - RESUMING. An up that stopped in its bootstrap wait (its record: the VM created, its bootstrap
+    never verified, nothing after) is resumed by `up --run R --yes` again, with no --ttl-hours (a
+    --project / --zone / --ttl-hours that is not the record's refuses): it reads back everything up
+    made against the record (the instance, named, labelled, tagged, deleting itself at the record's
+    time and the only one claiming the run; both SSH rules exactly as made; exactly the run's
+    conditional bindings; no unconditional one) and then waits for the bootstrap again. Anything
+    missing or different refuses and changes nothing (down, then a new --run). Any other record is a
+    run in use. push-secret and launch refuse a run whose record holds no verified bootstrap.
+  - AS MADE. Wherever an existing resource is trusted (resume, push-secret, launch, status, fetch,
+    and right after up creates it), it is read back field for field against what up's create
+    commands set: FIREWALL_FIELDS / INSTANCE_FIELDS map each describe field to the create flags that
+    set it (a test checks that the flags of firewall_create_argv and create_command are exactly
+    these), plus the defaults up relies on (a rule enabled, selecting by source range and target tag
+    only). A disabled deny rule, a rule on another network or for other service accounts, the VM on
+    another service account, OS Login or project-key blocking switched off, an added ssh-keys item:
+    each refuses, naming the field, and changes nothing. down is the exception (ruling on #1331,
+    2026-11-11): deleting is the safe direction, so it reads the same fields and reports each that
+    drifted (named, no identity: a service account by its role) as a warning, keeps them in the
+    run's record (down_drift), and deletes all the same.
 
 ON THE VM, NOTHING NAMES THE OPERATOR. An OS Login home is /home/<the operator's account, as a POSIX
 name>, so no remote path this module prints or stores may sit under it. Every remote step runs in
@@ -149,7 +174,9 @@ answer but its own NotFound refuses); every zone's instances (one unfiltered lis
 zone answers NotFound, the VM is "already gone" only if no zone holds an instance named vm_name(R) or
 labelled run=<R>, and when it answers, it must be labelled owner=snowplow-bench, run=<R>, named
 vm_name(R), and be the only instance claiming the run; no launcher running; the launch fetched
-(--discard-unfetched says the evidence may go); the firewall rules and the grants its own. Then
+(--discard-unfetched says the evidence may go); the firewall rules its own (exact name, target tag,
+description) and the grants the orchestrator SA's under the run's exact title. Ownership is that and
+nothing more: a field that drifted since up (AS MADE) is a warning, never a reason to leave it. Then
 deletes the instance with --delete-disks=all and reads it back (it must answer NotFound before any
 rule or grant is touched), the two rules and the run's conditional grants, and reads each back: its
 disks answer NotFound (the pull-token file lived on that disk only), no rule and no binding of the
@@ -371,19 +398,44 @@ def _marker(out: str, key: str) -> str | None:
     return None
 
 
+# IAP TCP forwarding's tunnel close code, as gcloud prints it: "Error while connecting [<code>: '<reason>']"
+# (gcloud 561, api_lib/compute/iap_tunnel_websocket.py: 'Error while connecting [%s].' of the WebSocket's
+# '%r: %r' % (close_code, close_reason)). Only the number is ever printed: the code, not gcloud's text.
+IAP_TUNNEL_CODE = re.compile(r"Error while connecting \[(4\d{3})\b")
+# What each code means, from IAP's own table (IAP FAQ, "Error codes":
+# https://docs.cloud.google.com/iap/docs/faq#error-codes), and whether waiting can fix it on a VM up
+# just made, with its firewall rules: (stage, waiting can fix it)
+IAP_CODES = {
+    # "Connection or firewall issue": "Check that your VM process is running and listening on the expected
+    # port", and that the firewall allows it: sshd not up yet on a booting VM, or a rule just created
+    "4003": ("IAP 4003: IAP reached the VM's network, port 22 did not answer (sshd or the firewall rule not up "
+             "yet)", True),
+    # "Instance doesn't exist or is stopped": "Make sure your VM is powered on and has fully completed its
+    # startup sequence": a VM just created (run 24's first up, 2026-11-11: answered minutes later)
+    "4047": ("IAP 4047: IAP does not find the instance running yet (it has not completed its startup)", True),
+    # "Connection closed by destination": the remedy is to reset the VM
+    "4010": ("IAP 4010: the VM closed the connection (IAP's remedy: reset the VM)", False),
+    # "Permission, existence, or VM state issue": the Tunnel User role (iap.tunnelInstances.accessViaIAP)
+    "4033": ("IAP 4033: not authorized to tunnel to the VM (iap.tunnelInstances.accessViaIAP)", False),
+}
+
+
+def iap_code(err: str | None) -> str | None:
+    m = IAP_TUNNEL_CODE.search(err or "")
+    return m.group(1) if m else None
+
+
 def _failed(what: str, rc: int, out: str, err: str, tail: int = 20) -> Refused:
     lines = [ln for ln in _remote_lines(out) if ln.startswith("vm606:")] or _remote_lines(out)[-tail:]
     body = ("\n  " + "\n  ".join(lines[-tail:])) if lines else ""
-    return Refused(f"{what} failed (rc={rc}; gcloud: {error_summary(err)}){body}")
+    code = iap_code(err)
+    iap = f"; IAP tunnel code {code}" if code else ""
+    return Refused(f"{what} failed (rc={rc}; gcloud: {error_summary(err)}{iap}){body}")
 
 
-# gcloud compute ssh --tunnel-through-iap: which stage refused, from its stderr (never printed: an OS
-# Login refusal names the POSIX user). (pattern, stage, waiting can fix it)
+# gcloud compute ssh --tunnel-through-iap, a failure without an IAP code: which stage refused, from its
+# stderr (never printed: an OS Login refusal names the POSIX user). (pattern, stage, waiting can fix it)
 SSH_STAGES = (
-    (re.compile(r"\b4033\b|not authorized"), "IAP: the tunnel was refused (iap.tunnelInstances.accessViaIAP)", False),
-    (re.compile(r"\b4047\b|\b4049\b|iap\.googleapis\.com"), "IAP: the API refused the tunnel", False),
-    (re.compile(r"\b4003\b|failed to connect to backend"),
-     "firewall / sshd: IAP reached the network, port 22 did not answer (the VM may still be booting)", True),
     (re.compile(r"Permission denied \(publickey"), "OS Login: the key was refused (compute.osAdminLogin)", False),
     (re.compile(r"Could not fetch resource|was not found|code=404"), "the instance: GCE does not know it", False),
     (re.compile(r"Connection (refused|reset|closed|timed out)|timed out after|kex_exchange"),
@@ -392,6 +444,11 @@ SSH_STAGES = (
 
 
 def ssh_stage(rc: int, err: str) -> tuple[str, bool]:
+    """(stage, waiting can fix it). An IAP tunnel code decides first (ssh's own "connection closed" follows
+    every tunnel failure); a code IAP's table does not list is waited out, and named."""
+    code = iap_code(err)
+    if code:
+        return IAP_CODES.get(code, (f"IAP {code}: a tunnel code IAP's table does not list", True))
     for rx, stage, transient in SSH_STAGES:
         if rx.search(err or ""):
             return stage, transient
@@ -719,6 +776,18 @@ def _cond_file(run: str, cond: dict, tag: str) -> str:
     return str(p)
 
 
+def grants_as_made(run: str, project: str, number: str, roles: list[str], terminates_at: str) -> list[str]:
+    """What differs between the bindings held under the run's title and exactly the ones up grants (each target,
+    under the run's condition, nothing else): empty when they are the same."""
+    cond = iam_condition(run, terminates_at)
+    want = {(res, role, cond["title"], cond["expression"]) for _k, res, role in grant_targets(project, number, roles)}
+    held = {(res, role, c.get("title"), c.get("expression")) for kind, res in grant_policies(project, number)
+            for role, c in run_bindings(_policy(kind, res, project), project, run)}
+    return ([f"{role} on {res} is not held under the condition {expr!r}" for res, role, _t, expr in sorted(want - held)]
+            + [f"{role} on {res} is held under {t} with {expr!r}, which up does not grant"
+               for res, role, t, expr in sorted(held - want)])
+
+
 def grant(run: str, project: str, number: str, roles: list[str], terminates_at: str, *, dry: bool) -> None:
     cond = iam_condition(run, terminates_at)
     f = _cond_file(run, cond, "grant")
@@ -730,25 +799,24 @@ def grant(run: str, project: str, number: str, roles: list[str], terminates_at: 
     if dry:
         _say(f"DRY: would read both policies back and verify {len(targets)} bindings under the condition {cond}")
         return
-    policies = {(k, r): _policy(k, r, project) for k, r in {(k, r) for k, r, _ in targets}}
-    for kind, res, role in targets:
-        held = [c for r, c in run_bindings(policies[(kind, res)], project, run) if r == role]
-        if not any(c.get("expression") == cond["expression"] and c.get("title") == cond["title"] for c in held):
-            raise Refused(f"{role} on {res} is not held under the condition {cond['expression']!r} after the grant; "
-                          f"{down_hint(run)}")
+    off = grants_as_made(run, project, number, roles, terminates_at)
+    if off:
+        raise Refused(f"after the grant, {'; '.join(off)}; {down_hint(run)}")
     _say(f"granted and read back: {len(targets)} bindings of {sa_email(project)}, each under condition "
          f"{cond['title']}: {cond['expression']}")
 
 
-def revoke(run: str, project: str, number: str, *, dry: bool) -> int:
-    """Remove the run's conditional bindings (exactly; never another's, never an unconditional one), then
-    verify none is left. Returns how many were removed."""
-    found = []
+def revoke(run: str, project: str, number: str, *, dry: bool) -> tuple[int, list[str]]:
+    """Remove the run's conditional bindings: the orchestrator SA's, under the run's exact condition title
+    (never another's, never an unconditional one), then verify none is left. One whose expression is not
+    the expiry form vm606 writes is the run's too and goes, reported as drift (removing access is the safe
+    direction). Returns (how many were removed, the drift)."""
+    found, drift = [], []
     for kind, res in grant_policies(project, number):
         for role, cond in run_bindings(_policy(kind, res, project), project, run):
             if not _EXPIRY_FORM.fullmatch(cond.get("expression") or ""):
-                raise Refused(f"a binding of {role} on {res} carries the title {cond.get('title')!r} but not the "
-                              f"expiry form vm606 writes ({cond.get('expression')!r}): refusing to remove it")
+                drift.append(f"binding {role} on {res} under {cond.get('title')}: expression "
+                             f"{_short(cond.get('expression'))}, not the expiry form vm606 writes")
             found.append((kind, res, role, cond))
     for i, (kind, res, role, cond) in enumerate(found):
         f = _cond_file(run, {k: cond[k] for k in ("title", "expression", "description") if k in cond}, f"revoke-{i}")
@@ -761,7 +829,7 @@ def revoke(run: str, project: str, number: str, *, dry: bool) -> int:
                 for r, _c in run_bindings(_policy(kind, res, project), project, run)]
         if left:
             raise Refused(f"bindings of run {run} are still held after their removal: {left}")
-    return len(found)
+    return len(found), drift
 
 
 def iam_commands(project: str, roles: list[str], number: str) -> list[str]:
@@ -867,6 +935,14 @@ mv "$M/bootstrap.json.tmp" "$M/bootstrap.json"
 """
 
 
+def _bootstrapped(st: dict, run: str) -> None:
+    """push-secret and launch act only on a VM whose bootstrap up verified (the record's `bootstrap`)."""
+    got = st.get("bootstrap")
+    if not isinstance(got, dict) or bootstrap_mismatch(got):
+        raise Refused(f"run {run}'s record holds no verified bootstrap of {vm_name(run)}: "
+                      f"`python3 -m bench.vm606 up --run {run} --yes` resumes its bootstrap wait")
+
+
 def bootstrap_mismatch(got: dict) -> list[str]:
     want = {"kubectl": KUBECTL_VERSION, "helm": HELM_VERSION, "gcloud": GCLOUD_APT_VERSION.split("-")[0]}
     bad = [f"{k} {got.get(k)!r}, want {v!r}" for k, v in want.items() if got.get(k) != v]
@@ -912,6 +988,196 @@ def create_command(run: str, project: str, zone: str, ttl_hours: int, startup_fi
             "--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"]
 
 
+# ─── as made: every field up's create commands set, read back wherever a resource is trusted ───────
+# (#1331 review: a read-back of a hand-picked subset let a disabled deny rule, a VM on the node SA, or
+# OS Login switched off, read as "as up made them".) Each table maps a field of gcloud's `describe` to
+# the create flags that set it; () is a default up relies on that no flag sets (a rule is enabled, and
+# selects by source range and target tag only). tests/test_vm606.py checks that the flags of
+# firewall_create_argv and create_command are exactly the tables' flags.
+COMPUTE_API = "https://www.googleapis.com/compute/v1"
+SCOPES = {"cloud-platform": "https://www.googleapis.com/auth/cloud-platform"}
+TCP_22 = [{"IPProtocol": "tcp", "ports": ["22"]}]
+FIREWALL_FIELDS = {
+    "name": ("<name>",), "network": ("--project", "--network"), "direction": ("--direction",),
+    "allowed/denied": ("--action", "--rules"), "sourceRanges": ("--source-ranges",),
+    "targetTags": ("--target-tags",), "priority": ("--priority",), "description": ("--description",),
+    "disabled": (), "sourceTags": (), "sourceServiceAccounts": (), "targetServiceAccounts": (),
+    "destinationRanges": (),
+}
+INSTANCE_FIELDS = {
+    "name": ("<name>",), "zone": ("--project", "--zone"), "machineType": ("--machine-type",),
+    "boot image": ("--image-family", "--image-project"),
+    "boot disk": ("--boot-disk-size", "--boot-disk-type", "--boot-disk-auto-delete"),
+    "serviceAccounts": ("--service-account", "--scopes"), "network": ("--network",), "tags": ("--tags",),
+    "labels": ("--labels",), "metadata": ("--metadata", "--metadata-from-file"),
+    "terminationTime": ("--termination-time",), "instanceTerminationAction": ("--instance-termination-action",),
+    "shieldedInstanceConfig": ("--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"),
+}
+
+
+def _network_url(project: str) -> str:
+    return f"{COMPUTE_API}/projects/{project}/global/networks/{NETWORK}"
+
+
+def firewall_want(fw: str, rule: dict, project: str) -> dict:
+    """The rule as firewall_create_argv makes it, in describe's shape (FIREWALL_FIELDS)."""
+    return {"name": fw, "network": _network_url(project), "direction": "INGRESS",
+            "allowed/denied": {"allowed": TCP_22 if rule["action"] == "ALLOW" else [],
+                               "denied": TCP_22 if rule["action"] == "DENY" else []},
+            "sourceRanges": sorted(rule["sourceRanges"]), "targetTags": sorted(rule["targetTags"]),
+            "priority": rule["priority"], "description": rule["description"], "disabled": False,
+            "sourceTags": [], "sourceServiceAccounts": [], "targetServiceAccounts": [], "destinationRanges": []}
+
+
+def firewall_view(r: dict) -> dict:
+    return {"name": r.get("name"), "network": r.get("network"), "direction": r.get("direction"),
+            "allowed/denied": {"allowed": r.get("allowed") or [], "denied": r.get("denied") or []},
+            "sourceRanges": sorted(r.get("sourceRanges") or []), "targetTags": sorted(r.get("targetTags") or []),
+            "priority": r.get("priority"), "description": r.get("description"),
+            "disabled": r.get("disabled") is not False,
+            **{k: sorted(r.get(k) or []) for k in ("sourceTags", "sourceServiceAccounts", "targetServiceAccounts",
+                                                    "destinationRanges")}}
+
+
+def _utc(t) -> str | None:
+    try:
+        return _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None if t is None else str(t)
+
+
+def instance_want(run: str, st: dict) -> dict:
+    """The VM as create_command makes it for the run's record, in describe's shape (INSTANCE_FIELDS)."""
+    name, project, zone = vm_name(run), st["project"], st["zone"]
+    zurl = f"{COMPUTE_API}/projects/{project}/zones/{zone}"
+    return {"name": name, "zone": zurl, "machineType": f"{zurl}/machineTypes/{MACHINE_TYPE}",
+            "boot image": {"project": IMAGE_PROJECT, "family": IMAGE_FAMILY},
+            "boot disk": {"disks": 1, "boot": True, "autoDelete": True, "source": f"{zurl}/disks/{name}",
+                          "sizeGb": str(BOOT_DISK_GB), "type": f"{zurl}/diskTypes/{BOOT_DISK_TYPE}"},
+            "serviceAccounts": [{"email": "the orchestrator SA", "scopes": [SCOPES["cloud-platform"]]}],
+            "network": [{"network": _network_url(project), "accessConfigs": ["ONE_TO_ONE_NAT"]}],
+            "tags": [name],
+            "labels": {"owner": OWNER, "run": run, "ttl-hours": str(st.get("ttl_hours"))},
+            "metadata": {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE",
+                         "startup-script": _sha256_text(startup_script())},
+            "terminationTime": _utc(st.get("terminates_at")), "instanceTerminationAction": "DELETE",
+            "shieldedInstanceConfig": {"enableSecureBoot": True, "enableVtpm": True, "enableIntegrityMonitoring": True}}
+
+
+def _account(email: str | None, project: str, number: str | None) -> str:
+    """A service account by its role, never its address (output passes no email)."""
+    if email == sa_email(project):
+        return "the orchestrator SA"
+    if number and email == node_sa(number):
+        return "the GKE node SA"
+    return "another account"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def as_made(run: str, project: str, zone: str, ttl_hours, terminates_at) -> dict:
+    """What up creates for the run, field for field (INSTANCE_FIELDS, FIREWALL_FIELDS; the startup script by
+    its sha256): `up --yes` writes it to the run's record before it creates anything, and every later
+    read-back compares against THAT, never against this checkout's constants (a checkout changed between up
+    and down must not make the run's own VM read as drifted)."""
+    st = {"project": project, "zone": zone, "ttl_hours": ttl_hours, "terminates_at": terminates_at}
+    return {"instance": instance_want(run, st),
+            "rules": {fw: firewall_want(fw, rule, project) for fw, rule in firewall_rules(run).items()}}
+
+
+def _made(st: dict, run: str) -> dict:
+    made = st.get("made")
+    if not isinstance(made, dict) or not isinstance(made.get("instance"), dict) \
+            or set(made.get("rules") or {}) != set(firewall_rules(run)):
+        raise Refused(f"run {run}'s record holds no as-made of what up created ({state_dir(run) / 'state.json'}): "
+                      f"its resources cannot be read back")
+    return made
+
+
+def instance_view(inst: dict, disk: dict | None, image: dict | None, project: str, number: str | None) -> dict:
+    """labels: the keys up sets (a label grants nothing); metadata: every item (an ssh-keys item, another
+    startup script or OS Login switched off each change who gets in); a service account by its role."""
+    disks = inst.get("disks") or []
+    d0 = disks[0] if disks else {}
+    labels = inst.get("labels") or {}
+    sched = inst.get("scheduling") or {}
+    return {"name": inst.get("name"), "zone": inst.get("zone"), "machineType": inst.get("machineType"),
+            "boot image": {"project": (re.search(r"/projects/([^/]+)/global/images/", str((disk or {}).get(
+                "sourceImage", ""))) or [None, None])[1], "family": (image or {}).get("family")},
+            "boot disk": {"disks": len(disks), "boot": d0.get("boot"), "autoDelete": d0.get("autoDelete"),
+                          "source": d0.get("source"), "sizeGb": (disk or {}).get("sizeGb"),
+                          "type": (disk or {}).get("type")},
+            "serviceAccounts": [{"email": _account(a.get("email"), project, number),
+                                 "scopes": sorted(a.get("scopes") or [])}
+                                for a in inst.get("serviceAccounts") or []],
+            "network": [{"network": n.get("network"), "accessConfigs": [c.get("type") for c in n.get("accessConfigs")
+                                                                         or []]}
+                        for n in inst.get("networkInterfaces") or []],
+            "tags": sorted((inst.get("tags") or {}).get("items") or []),
+            "labels": {k: labels.get(k) for k in ("owner", "run", "ttl-hours")},
+            "metadata": {i.get("key"): (_sha256_text(i.get("value") or "") if i.get("key") == "startup-script"
+                                         else i.get("value"))
+                         for i in (inst.get("metadata") or {}).get("items") or []},
+            "terminationTime": _utc(sched.get("terminationTime")),
+            "instanceTerminationAction": sched.get("instanceTerminationAction"),
+            "shieldedInstanceConfig": {k: (inst.get("shieldedInstanceConfig") or {}).get(k)
+                                       for k in ("enableSecureBoot", "enableVtpm", "enableIntegrityMonitoring")}}
+
+
+def _short(v) -> str:
+    t = redact_identity(json.dumps(v, sort_keys=True))
+    return t if len(t) <= 100 else t[:97] + "..."
+
+
+def _diff(what: str, got: dict, want: dict) -> list[str]:
+    """Each field that differs, named; a mapping field names its differing keys (never a whole startup script)."""
+    out = []
+    for k, w in want.items():
+        g = got.get(k)
+        if g == w:
+            continue
+        if isinstance(w, dict) and isinstance(g, dict):
+            keys = sorted(x for x in {*w, *g} if g.get(x) != w.get(x))
+            out.append(f"{what} {k}: " + ", ".join(
+                f"{x} {_short(g.get(x)) if x != 'startup-script' else '(differs)'}, up made "
+                f"{_short(w.get(x)) if x != 'startup-script' else 'its own'}" for x in keys))
+        else:
+            out.append(f"{what} {k}: {_short(g)}, up made {_short(w)}")
+    return out
+
+
+def instance_as_made(run: str, st: dict, inst: dict) -> list[str]:
+    """What of the run's VM differs from what up made (its boot disk and its image read too); empty when none."""
+    project, zone = st["project"], st["zone"]
+    disks = inst.get("disks") or []
+    d = str((disks[0] if disks else {}).get("source", "")).rsplit("/", 1)[-1]
+    disk = _get(["compute", "disks", "describe", d, *_where(project, zone)],
+                f"projects/{project}/zones/{zone}/disks/{d}", f"disk {d}") if d else None
+    image = None
+    m = re.search(r"/projects/([^/]+)/global/images/([^/]+)$", str((disk or {}).get("sourceImage", "")))
+    if m:
+        image = _get(["compute", "images", "describe", m[2], "--project", m[1]],
+                     f"projects/{m[1]}/global/images/{m[2]}", f"image {m[2]}")
+    return _diff(f"instance {vm_name(run)}", instance_view(inst, disk, image, project, st.get("project_number")),
+                 _made(st, run)["instance"])
+
+
+def rule_as_made(run: str, st: dict, fw: str, r: dict) -> list[str]:
+    return _diff(f"firewall rule {fw}", firewall_view(r), _made(st, run)["rules"][fw])
+
+
+def _trusted(run: str, st: dict, inst: dict) -> dict:
+    """The run's instance, vm606's (_owned) and every field as up made it: anything else refuses."""
+    _owned(inst, run)
+    off = instance_as_made(run, st, inst)
+    if off:
+        raise Refused(f"{vm_name(run)} is not as up made it: {'; '.join(off)}: refusing; nothing was changed")
+    return inst
+
+
 VM_FOOTPRINT = (("INSTANCES", 1, "the VM", ""),
                 ("E2_CPUS", VM_VCPUS, f"its {MACHINE_TYPE}", ""),
                 ("SSD_TOTAL_GB", BOOT_DISK_GB, f"its {BOOT_DISK_TYPE} boot disk", " GB"),
@@ -944,28 +1210,100 @@ def vm_quota_check(project: str, zone: str) -> tuple[list[str], list[str]]:
     return fits, refusals
 
 
-def cmd_up(a) -> int:
-    run = check_run(a.run)
-    if not 1 <= a.ttl_hours <= MAX_TTL_HOURS:
-        raise Refused(f"--ttl-hours {a.ttl_hours}: 1 to {MAX_TTL_HOURS} (the run's own TTL + the hours fetch may wait)")
-    name = vm_name(run)
-    found = scan(BENCH_DIR)
-    if found["uncovered"]:
-        raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
-    roles = list(plan(found))
-    number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
-    rc, out, err = gcloud(["services", "list", "--enabled", "--project", a.project, "--format", "json"], quiet=True)
+def _project_ready(project: str) -> None:
+    """IAP enabled (the VM is reached through it only) and the orchestrator SA there."""
+    rc, out, err = gcloud(["services", "list", "--enabled", "--project", project, "--format", "json"], quiet=True)
     enabled = gke._json(out) if rc == 0 else None
     if not isinstance(enabled, list):
         raise Refused(f"could not read whether IAP is enabled (rc={rc}; {error_summary(err)})")
     if "iap.googleapis.com" not in {(x.get("config") or {}).get("name") for x in enabled}:
-        raise Refused(f"iap.googleapis.com is not enabled in {a.project}: the VM is reached through IAP only "
-                      f"(gcloud services enable iap.googleapis.com --project {a.project})")
-    rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(a.project), "--project", a.project,
+        raise Refused(f"iap.googleapis.com is not enabled in {project}: the VM is reached through IAP only "
+                      f"(gcloud services enable iap.googleapis.com --project {project})")
+    rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
-    if rc != 0 or out.strip() != sa_email(a.project):
-        raise Refused(f"the orchestrator SA {sa_email(a.project)} could not be read (rc={rc}; {error_summary(err)}): "
+    if rc != 0 or out.strip() != sa_email(project):
+        raise Refused(f"the orchestrator SA {sa_email(project)} could not be read (rc={rc}; {error_summary(err)}): "
                       f"create it (plan-iam prints the command)")
+
+
+def resumable(st: dict, run: str) -> bool:
+    """up stopped in its bootstrap wait: its record says the VM was created, and nothing after (no verified
+    bootstrap, no secret, no launch, no down)."""
+    return bool(st.get("vm") == vm_name(run) and st.get("instance_created_at") and not st.get("bootstrap")
+                and not any(st.get(k) for k in ("secret_pushed_at", "launched_at", "deleted_at")))
+
+
+def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
+    """Everything up makes for `run`, read back against its record: the instance (named, labelled, tagged, its
+    termination time and action, the only one claiming the run in any zone), both SSH rules exactly as made,
+    exactly the run's conditional bindings, and no unconditional one. What differs; empty when all is."""
+    name, project, zone = vm_name(run), st["project"], st["zone"]
+    off = []
+    inst = _instance(name, project, zone)
+    if inst is None:
+        off.append(f"instance {name} answers NotFound in {zone}")
+    else:
+        _owned(inst, run)
+        off += instance_as_made(run, st, inst)
+    others = [i for i in _instances_of(run, project) if not (i.get("name") == name and _zone_of(i) == zone)]
+    if others:
+        off.append(f"{_named(others)} claim(s) run {run} too")
+    rules = {r.get("name"): r for r in _rule_docs(run, project)}
+    for fw in firewall_rules(run):
+        if fw not in rules:
+            off.append(f"firewall rule {fw} answers NotFound")
+        else:
+            off += rule_as_made(run, st, fw, rules[fw])
+    off += grants_as_made(run, project, number, roles, st["terminates_at"])
+    off += [f"{sa_email(project)} holds {b} unconditionally" for b in unconditional_bindings(project, number)]
+    return off
+
+
+def resume_up(run: str, st: dict, a, roles: list[str]) -> int:
+    """up again on a run whose up stopped in its bootstrap wait: its project, zone and TTL are the record's (a
+    flag that differs refuses); everything up made is read back against the record; then the wait resumes."""
+    name = vm_name(run)
+    for flag, got, rec in (("--project", a.project, st.get("project")), ("--zone", a.zone, st.get("zone")),
+                           ("--ttl-hours", a.ttl_hours, st.get("ttl_hours"))):
+        if got is not None and got != rec:
+            raise Refused(f"{flag} {got} is not run {run}'s recorded {rec}: a resumed up is the recorded one")
+    _st, project, zone = _recorded(run)
+    number = _parents(project, zone, st)
+    _project_ready(project)
+    off = made_by_up(run, st, roles, number)
+    if off:
+        raise Refused(f"run {run}'s up stopped before its bootstrap was verified, and not everything is as up made "
+                      f"it: {'; '.join(off)}. Nothing was changed; {down_hint(run)}, and a new launch takes a new "
+                      f"--run")
+    _say(f"run {run}: {name} ({zone}), its 2 SSH rules and its {len(grant_targets(project, number, roles))} "
+         f"conditional bindings read back as up made them; resuming the bootstrap wait")
+    if not a.yes:
+        _say(f"DRY: would wait for {BOOTSTRAP_MARKER} on {name}; nothing was changed")
+        return 0
+    a.project, a.zone = project, zone
+    wait_for_bootstrap(run, a)
+    return 0
+
+
+def cmd_up(a) -> int:
+    run = check_run(a.run)
+    name = vm_name(run)
+    st = _state(run)
+    if not resumable(st, run):
+        if a.ttl_hours is None:
+            raise Refused("--ttl-hours: required for a new run")
+        if not 1 <= a.ttl_hours <= MAX_TTL_HOURS:
+            raise Refused(f"--ttl-hours {a.ttl_hours}: 1 to {MAX_TTL_HOURS} (the run's own TTL + the hours fetch may "
+                          f"wait)")
+    found = scan(BENCH_DIR)
+    if found["uncovered"]:
+        raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
+    roles = list(plan(found))
+    if resumable(st, run):
+        return resume_up(run, st, a, roles)
+    a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
+    number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
+    _project_ready(a.project)
     used = run_in_use(run, a.project, number)
     if used:
         raise Refused(f"run {run} is in use: {'; '.join(used)}. `down --run {run}` removes what vm606 made; a new "
@@ -985,6 +1323,7 @@ def cmd_up(a) -> int:
     sf.write_text(startup_script())
     terminates_at = termination_time(time.time(), a.ttl_hours)
     if a.yes:
+        _save_state(run, made=as_made(run, a.project, a.zone, a.ttl_hours, terminates_at))
         _save_state(run, vm=name, project=a.project, zone=a.zone, ttl_hours=a.ttl_hours, terminates_at=terminates_at,
                     node_sa=node_sa(number), project_number=number, created_at=time.time())
     # 1. the grants, expiring with the VM, before the VM exists
@@ -994,6 +1333,11 @@ def cmd_up(a) -> int:
         rc, _out, err = gcloud(firewall_create_argv(fw, rule, a.project), dry=not a.yes)
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+    if a.yes:
+        made = {r.get("name") for r in _run_rules(run, a.project, _state(run))}   # each as made, or it refuses
+        if made != set(firewall_rules(run)):
+            raise Refused(f"firewall rule(s) {sorted(set(firewall_rules(run)) - made)} answer NotFound after their "
+                          f"create; {down_hint(run)}")
     # 3. the VM
     rc, _out, err = gcloud(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at), dry=not a.yes)
     if not a.yes:
@@ -1002,9 +1346,22 @@ def cmd_up(a) -> int:
         return 0
     if rc != 0:
         raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+    _save_state(run, instance_created_at=time.time())
+    inst = _instance(name, a.project, a.zone)
+    if inst is None:
+        raise Refused(f"{name} answers NotFound in {a.zone} after its create; {down_hint(run)}")
+    try:
+        _trusted(run, _state(run), inst)
+    except Refused as e:
+        raise Refused(f"{e}; {down_hint(run)}") from None
     _say(f"{name} created; it deletes itself (and its disk) at {terminates_at}, when its grants expire")
     wait_for_bootstrap(run, a)
     return 0
+
+
+def resume_hint(run: str) -> str:
+    return (f"`python3 -m bench.vm606 up --run {run} --yes` resumes this wait (it reads back everything up made "
+            f"first), or {down_hint(run)}")
 
 
 def wait_for_bootstrap(run: str, a) -> None:
@@ -1021,10 +1378,10 @@ def wait_for_bootstrap(run: str, a) -> None:
             stage, transient = ssh_stage(rc, err)
             if not transient:
                 raise Refused(f"SSH to {name} failed at {stage}; the VM is up and billing until its TTL: "
-                              f"{down_hint(run)}")
+                              f"{resume_hint(run)}")
             if not reached and now >= a.ssh_ready_timeout_s:
                 raise Refused(f"SSH to {name} never answered in {a.ssh_ready_timeout_s} s, last at {stage}; the VM "
-                              f"is up and billing until its TTL: {down_hint(run)}")
+                              f"is up and billing until its TTL: {resume_hint(run)}")
         else:
             reached = True
             try:
@@ -1041,7 +1398,7 @@ def wait_for_bootstrap(run: str, a) -> None:
         if now >= a.bootstrap_timeout_s:
             raise Refused(f"{name}'s bootstrap did not finish in {a.bootstrap_timeout_s} s ({BOOTSTRAP_MARKER} "
                           f"absent; SSH {'answers' if reached else 'never answered'}; the startup script's log: "
-                          f"sudo journalctl -u google-startup-scripts on the VM); {down_hint(run)}")
+                          f"sudo journalctl -u google-startup-scripts on the VM); {resume_hint(run)}")
         time.sleep(a.poll_s)
 
 
@@ -1071,6 +1428,7 @@ def cmd_push_secret(a) -> int:
     run = check_run(a.run)
     name = vm_name(run)
     st, project, zone = _recorded(run)
+    _bootstrapped(st, run)
     local = os.path.expanduser("~/" + GHCR_FILE_REL)
     _local_secret(local)
     _say(f"local {local}: present, mode 0600")
@@ -1093,7 +1451,7 @@ echo "VM606_DIR_MODE=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os
         _say(f"DRY: on {name}: chmod 600 {remote_ghcr(run)}; check presence and mode; nothing was copied")
         return 0
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, prep, timeout=300)
     if rc != 0:
         raise _failed("preparing the token's directory on the VM", rc, out, err)
@@ -1302,6 +1660,7 @@ def cmd_launch(a) -> int:
     pair = pair_name(env)
     names = [env[f"RUN_NAME_{x}"] for x in labels]
     st, project, zone = _recorded(run)
+    _bootstrapped(st, run)
     remote_pin = f"{vm_dir(run)}/pin/{pin.name}"
     prep = prepare_script(run, a.bench_sha, a.repo_url, env, pin.name, got, pair)
     go = launch_script(run, a.bench_sha, env, labels, pin.name, got, pair, a.started_timeout_s)
@@ -1315,7 +1674,7 @@ def cmd_launch(a) -> int:
         _say(f"DRY: runs {', '.join(names)}; pair {pair}; clusters in ZONE={a.bench_zone}; nothing was started")
         return 0
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, remote(run, 'umask 077\nmkdir -p "$R/pin"\n'), timeout=300)
     if rc != 0:
         raise _failed("mkdir on the VM", rc, out, err)
@@ -1333,8 +1692,7 @@ def cmd_launch(a) -> int:
     if not (ttl or "").isdigit():
         raise Refused("the dry pass handed gke-up no --ttl-hours (no `bench.gke gke-up ... --ttl-hours N` in any "
                       f"dry-*/run.log under {vm_dir(run)}/dry): how long the run lasts is unknown")
-    inst = _present(name, project, zone)
-    _owned(inst, run)
+    inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
     need = int(ttl) * 3600 + LAUNCH_MARGIN_S
     if left is None or left < need:
@@ -1378,8 +1736,7 @@ def cmd_status(a) -> int:
     name = vm_name(run)
     st, project, zone = _recorded(run)
     _parents(project, zone, st)
-    inst = _present(name, project, zone)
-    _owned(inst, run)
+    inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
     script = remote(run, LAUNCHER_STATE + 'echo "VM606_LAUNCHER=$(launcher_state)"\necho ---\n'
                     f'tail -n {int(a.lines)} "$R/launch.log" 2>/dev/null || true\n', in_dir=False)
@@ -1447,7 +1804,7 @@ def cmd_fetch(a) -> int:
             if dest.exists():
                 raise Refused(f"{dest} exists on the laptop: a fetch never overwrites a run")
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, fetch_script(run, st["bench_sha"], names), timeout=3600)
     if rc != 0:
         raise _failed("packing the run on the VM", rc, out, err)
@@ -1530,20 +1887,38 @@ def _list(args: list[str], what: str) -> list[dict]:
     return got
 
 
-def _run_rules(run: str, project: str) -> list[dict]:
+def _rule_docs(run: str, project: str) -> list[dict]:
     """The run's firewall rules that exist, each read by its exact name (`describe`: NotFound for that
     rule is "absent", any other failure refuses; never a list filter, which gcloud can mis-parse into an
-    empty answer with rc 0, #1307 re-review N1); refuses one that is not exactly what up makes."""
+    empty answer with rc 0, #1307 re-review N1)."""
     rows = []
-    for fw, w in firewall_rules(run).items():
+    for fw in firewall_rules(run):
         r = _get(["compute", "firewall-rules", "describe", fw, "--project", project],
                  f"projects/{project}/global/firewalls/{fw}", f"firewall rule {fw}")
-        if r is None:
-            continue
-        if r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
-            raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
-                          f"{r.get('targetTags')}, description {r.get('description')!r}): refusing")
-        rows.append(r)
+        if r is not None:
+            rows.append(r)
+    return rows
+
+
+def _owned_rule(run: str, st: dict, r: dict) -> None:
+    """A rule of the run's exact name is the run's when its target tag and description are the ones up recorded
+    creating: else it is someone else's, and refuses."""
+    fw = r.get("name")
+    w = _made(st, run)["rules"][fw]
+    if sorted(r.get("targetTags") or []) != sorted(w["targetTags"]) or r.get("description") != w["description"]:
+        raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
+                      f"{_short(r.get('targetTags'))}, description {_short(r.get('description'))}): refusing; nothing "
+                      f"was changed")
+
+
+def _run_rules(run: str, project: str, st: dict) -> list[dict]:
+    """The run's firewall rules that exist; refuses one that is not, field for field, what up recorded making."""
+    rows = _rule_docs(run, project)
+    for r in rows:
+        off = rule_as_made(run, st, r.get("name"), r)
+        if off:
+            raise Refused(f"firewall rule {r.get('name')!r} is not as vm606 made it for run {run}: {'; '.join(off)}: "
+                          f"refusing; nothing was changed")
     return rows
 
 
@@ -1565,7 +1940,7 @@ def run_in_use(run: str, project: str, number: str) -> list[str]:
         found.append(f"its record {state_dir(run) / 'state.json'}")
     for i in _instances_of(run, project):
         found.append(f"instance {i.get('name')} ({_zone_of(i)})")
-    found += [f"firewall rule {r['name']}" for r in _run_rules(run, project)]
+    found += [f"firewall rule {r['name']}" for r in _rule_docs(run, project)]
     for kind, res in grant_policies(project, number):
         found += [f"binding {role} on {res} under {c.get('title')}"
                   for role, c in run_bindings(_policy(kind, res, project), project, run)]
@@ -1592,13 +1967,15 @@ def cmd_down(a) -> int:
     inst = _instance(name, project, zone)
     claims = _instances_of(run, project)
     disks = [name]
+    drift: list[str] = []
     if inst is None:
         # a NotFound in the recorded zone is "gone" only when no zone holds an instance claiming the run
         if claims:
             raise Refused(f"{name} answers NotFound in {zone} (the run's recorded zone), but {_named(claims)} "
                           f"claim(s) run {run} by name or run label: refusing; nothing was changed")
     else:
-        _owned(inst, run)
+        _owned(inst, run)                   # ownership: the exact name and owner/run labels, the record's zone
+        drift += instance_as_made(run, st, inst)
         others = [i for i in claims if not (i.get("name") == name and _zone_of(i) == zone)]
         if others:
             raise Refused(f"besides {name} ({zone}), {_named(others)} claim(s) run {run} by name or run label: "
@@ -1616,7 +1993,15 @@ def cmd_down(a) -> int:
                 raise Refused(f"the launcher is still running on {name} ({state}): deleting the VM would kill every "
                               f"run's teardown; stop it (kill -TERM <pid> on the VM) and wait for it to exit")
         disks = _disk_names(inst)
-    rules = _run_rules(run, project)
+    rules = _rule_docs(run, project)
+    for r in rules:
+        _owned_rule(run, st, r)
+        drift += rule_as_made(run, st, r["name"], r)
+    # what drifted since up is deleted all the same (deleting is the safe direction), and said
+    for d in drift:
+        _say(f"WARNING: drifted since up, deleted all the same: {d}")
+    if a.yes:
+        _save_state(run, down_drift=drift)
     # ── then delete, each read back ──
     if inst is not None:
         rc, _o, err = gcloud(["compute", "instances", "delete", name, *_where(project, zone),
@@ -1632,7 +2017,11 @@ def cmd_down(a) -> int:
                              dry=not a.yes)
         if rc != 0:
             raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {error_summary(err)})")
-    removed = revoke(run, project, number, dry=not a.yes)
+    removed, bdrift = revoke(run, project, number, dry=not a.yes)
+    for d in bdrift:
+        _say(f"WARNING: drifted since up, removed all the same: {d}")
+    if a.yes and bdrift:
+        _save_state(run, down_drift=drift + bdrift)
     if not a.yes:
         _say(f"DRY: would verify {name} answers NotFound, its disks {disks}, its {len(rules)} firewall rule(s) and "
              f"its {removed} grant(s) gone; nothing was deleted")
@@ -1642,12 +2031,14 @@ def cmd_down(a) -> int:
     if left:
         raise Refused(f"disk(s) {left} remain: delete them by hand (gcloud compute disks delete ... --zone "
                       f"{zone}); the pull-token file is on one of them")
-    still = [r["name"] for r in _run_rules(run, project)]
+    still = [r["name"] for r in _rule_docs(run, project)]
     if still:
         raise Refused(f"firewall rule(s) {still} of {name} remain after their delete")
     _save_state(run, deleted_at=time.time())
     _say(f"{name} gone and verified: disk(s) {disks} (and with them the pull-token file), {len(rules)} firewall "
-         f"rule(s), {removed} conditional grant(s) of run {run}")
+         f"rule(s), {removed} conditional grant(s) of run {run}"
+         + (f"; {len(drift) + len(bdrift)} field(s) had drifted since up (above, and in the run's record)"
+            if drift or bdrift else ""))
     return 0
 
 
@@ -1668,8 +2059,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--run", required=True, help=f"the launch's name; the VM is {VM_PREFIX}<run>")
         if place:
             # up only: every later subcommand reads the run's project and zone from up's record, never a flag
-            p.add_argument("--project", default=DEFAULT_PROJECT)
-            p.add_argument("--zone", default=DEFAULT_ZONE, type=_zone, help="the VM's zone (recorded for the run)")
+            p.add_argument("--project", default=None, help=f"default {DEFAULT_PROJECT} (a resumed up: the record's)")
+            p.add_argument("--zone", default=None, type=_zone,
+                           help=f"the VM's zone, recorded for the run; default {DEFAULT_ZONE} (a resumed up: the "
+                                f"record's)")
         if yes:
             p.add_argument("--yes", action="store_true", help="actually do it (default: dry run)")
 
@@ -1681,7 +2074,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("up", help="the run's grants and SSH rules, the VM; wait for its bootstrap")
     common(p, place=True)
-    p.add_argument("--ttl-hours", type=int, required=True,
+    p.add_argument("--ttl-hours", type=int, default=None,
                    help="the VM deletes itself, and its grants expire, after this: the run's TTL + the hours fetch "
                         "may wait")
     p.add_argument("--ssh-ready-timeout-s", type=int, default=300,

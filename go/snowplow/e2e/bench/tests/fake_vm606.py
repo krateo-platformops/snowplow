@@ -6,7 +6,7 @@ outcome:
     (home/IDENTITY, the operator's account as a POSIX name); VM_ROOT (/srv/snowplow-bench) is
     <state>/vm/NAME/srv: the fake rewrites that prefix in what it runs and copies, so the module's
     remote scripts carry no test hook;
-  - `compute instances create` records the argv and makes the instance (labels, tags, scheduling
+  - `compute instances create` (FAKE_CREATE_FAIL=1: a 503) records the argv and makes the instance (labels, tags, scheduling
     terminationTime, a boot disk named after it) and its disk; FAKE_BOOTSTRAP (JSON) is written as
     the VM's bootstrap marker at create, as the startup script would;
   - `compute instances | disks describe NAME --zone Z` / `firewall-rules describe NAME`: the resource
@@ -37,7 +37,7 @@ outcome:
   - `compute ssh NAME ... --command CMD` (and scp), for an instance in that --zone only: CMD runs under bash, the script on its stdin, with the
     VM's environment only (HOME = the identity-shaped home, the test's PATH), in a session of its
     own that is hung up (SIGHUP, then SIGTERM to its process group) when the command ends, as sshd
-    does. FAKE_SSH_FAIL=4033|4003|publickey answers as gcloud does when IAP / the firewall / OS Login
+    does. FAKE_SSH_FAIL=4033|4003|4047|4010|4049|publickey answers as gcloud does when IAP / the firewall / OS Login
     refuse, FAKE_SSH_FAIL_TIMES times (default: always). FAKE_TAMPER_AFTER_SSH="<n>:<path under srv>"
     appends a byte to that file when the n-th ssh call ends;
   - `compute scp`: the side written NAME:<path> is on the VM; the bytes are copied (this process is
@@ -88,11 +88,76 @@ DESCRIBE_FAILURES = {
 }
 ZONES = ("europe-west1-b", "europe-west1-c", "europe-west1-d", "europe-west3-a", "europe-west3-b", "europe-west3-c",
          "europe-west4-a", "europe-west4-b", "europe-west4-c")
+# gcloud's start-iap-tunnel ProxyCommand fails with IAP's close code ("Error while connecting [<code>:
+# '<reason>']", gcloud 561 iap_tunnel_websocket.py), and ssh then reports the closed connection, exit 255
+_KEX = "kex_exchange_identification: Connection closed by remote host\nConnection closed by UNKNOWN port 65535\n"
+
+
+def _iap(code: str, reason: str) -> tuple[int, str]:
+    return 255, (f"ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [{code}: '{reason}'].\n" + _KEX)
+
+
+# ── one builder of what GCE's describe answers, in its shapes (read live, 2026-11-11: a firewall rule, an
+# instance and its boot disk): the fake's `create` and put_instance / put_rule both use it ──
+BUILDER = r'''
+COMPUTE = "https://www.googleapis.com/compute/v1"
+SCOPE_URLS = {"cloud-platform": "https://www.googleapis.com/auth/cloud-platform"}
+IMAGE_SUFFIX = "-trixie-v20251111"          # an image of the family, as debian-cloud names them
+
+
+def firewall_doc(name, project, network, direction, action, rules, source_ranges, target_tags, priority,
+                 description):
+    proto, port = rules.split(":")
+    return {"kind": "compute#firewall", "name": name, "network": f"{COMPUTE}/projects/{project}/global/networks/{network}",
+            "direction": direction, "priority": int(priority), "sourceRanges": list(source_ranges),
+            "targetTags": list(target_tags), "description": description, "disabled": False,
+            "logConfig": {"enable": False}, ("denied" if action == "DENY" else "allowed"): [{"IPProtocol": proto,
+                                                                                            "ports": [port]}],
+            "selfLink": f"{COMPUTE}/projects/{project}/global/firewalls/{name}"}
+
+
+def instance_docs(name, project, zone, labels, tags, termination_time, action, sa, scopes, metadata, machine,
+                  disk_gb, disk_type, image_project, image_family, shielded, network):
+    zurl = f"{COMPUTE}/projects/{project}/zones/{zone}"
+    net = f"{COMPUTE}/projects/{project}/global/networks/{network}"
+    inst = {"kind": "compute#instance", "name": name, "status": "RUNNING", "zone": zurl,
+            "machineType": f"{zurl}/machineTypes/{machine}", "labels": dict(labels),
+            "tags": {"fingerprint": "Zm9v", "items": list(tags)},
+            "networkInterfaces": [{"kind": "compute#networkInterface", "name": "nic0", "network": net,
+                                   "subnetwork": f"{COMPUTE}/projects/{project}/regions/{zone[:-2]}/subnetworks/{network}",
+                                   "networkIP": "10.164.0.9", "stackType": "IPV4_ONLY",
+                                   "accessConfigs": [{"kind": "compute#accessConfig", "name": "external-nat",
+                                                      "networkTier": "PREMIUM", "type": "ONE_TO_ONE_NAT",
+                                                      "natIP": "34.90.0.9"}]}],
+            "serviceAccounts": [{"email": sa, "scopes": [SCOPE_URLS.get(x, x) for x in scopes]}],
+            "metadata": {"kind": "compute#metadata", "fingerprint": "Zm9v",
+                         "items": [{"key": k, "value": v} for k, v in metadata.items()]},
+            "scheduling": {"automaticRestart": False, "onHostMaintenance": "MIGRATE", "preemptible": False,
+                           "provisioningModel": "STANDARD", "terminationTime": termination_time,
+                           "instanceTerminationAction": action},
+            "shieldedInstanceConfig": {"enableSecureBoot": shielded, "enableVtpm": shielded,
+                                       "enableIntegrityMonitoring": shielded},
+            "disks": [{"kind": "compute#attachedDisk", "boot": True, "autoDelete": True, "mode": "READ_WRITE",
+                       "interface": "SCSI", "type": "PERSISTENT", "source": f"{zurl}/disks/{name}",
+                       "diskSizeGb": str(disk_gb)}]}
+    disk = {"kind": "compute#disk", "name": name, "zone": zurl, "sizeGb": str(disk_gb), "status": "READY",
+            "type": f"{zurl}/diskTypes/{disk_type}",
+            "sourceImage": f"{COMPUTE}/projects/{image_project}/global/images/{image_family}{IMAGE_SUFFIX}"}
+    image = {"kind": "compute#image", "name": f"{image_family}{IMAGE_SUFFIX}", "family": image_family,
+             "selfLink": disk["sourceImage"]}
+    return inst, disk, image
+'''
+exec(BUILDER)
+
+
 SSH_FAILURES = {
-    "4033": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4033: 'not authorized'].\n"),
-    "4003": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4003: 'failed to connect to "
-                "backend'].\n"),
-    "publickey": (255, f"{IDENTITY}@compute.123: Permission denied (publickey).\n"),
+    "4033": _iap("4033", "not authorized"),
+    "4003": _iap("4003", "failed to connect to backend"),
+    "4047": _iap("4047", "Failed to lookup instance"),
+    "4010": _iap("4010", "destination read failed"),
+    "4049": _iap("4049", "a code IAP's table does not list"),
+    # OS Login names the instance by its numeric id (19 digits; this one starts like an IAP code)
+    "publickey": (255, f"{IDENTITY}@compute.4096312768531209876: Permission denied (publickey).\n"),
 }
 
 SOURCE = r'''#!/usr/bin/env python3
@@ -213,11 +278,11 @@ if a[:3] == ["compute", "firewall-rules", "create"]:
     name = a[3]
     if load("firewalls", name):
         sys.stderr.write(f"ERROR: (gcloud.compute.firewall-rules.create) The resource '{name}' already exists\n"); sys.exit(1)
-    (st / "firewalls" / f"{name}.json").write_text(json.dumps({
-        "name": name, "direction": opt("--direction"), "priority": int(opt("--priority")),
-        "sourceRanges": opt("--source-ranges").split(","), "targetTags": opt("--target-tags").split(","),
-        "description": opt("--description"), "network": opt("--network"),
-        ("denied" if opt("--action") == "DENY" else "allowed"): [{"IPProtocol": "tcp", "ports": ["22"]}]}))
+    doc = firewall_doc(name, opt("--project"), opt("--network"), opt("--direction"), opt("--action"), opt("--rules"),
+                       opt("--source-ranges").split(","), opt("--target-tags").split(","), opt("--priority"),
+                       opt("--description"))
+    doc.update(json.loads(os.environ.get("FAKE_FW_ON_CREATE") or "{}"))
+    (st / "firewalls" / f"{name}.json").write_text(json.dumps(doc))
     sys.exit(0)
 if a[:3] == ["compute", "firewall-rules", "describe"] and os.environ.get("FAKE_FW_DESCRIBE_NOT_OBJECT") == "1":
     print("[]"); sys.exit(0)
@@ -239,16 +304,25 @@ if a[:3] == ["compute", "firewall-rules", "delete"]:
 # ── instances, disks ──
 if a[:3] == ["compute", "instances", "create"]:
     name = a[3]
+    if os.environ.get("FAKE_CREATE_FAIL") == "1":
+        sys.stderr.write("ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The service is "
+                         "currently unavailable. code=503\n"); sys.exit(1)
     labels = dict(kv.split("=", 1) for kv in opt("--labels").split(","))
-    doc = {"name": name, "status": "RUNNING", "labels": labels, "tags": {"items": opt("--tags").split(",")},
-           "zone": f"{APIP}/zones/{opt('--zone')}",
-           "networkInterfaces": [{"networkIP": "10.164.0.9", "accessConfigs": [{"type": "ONE_TO_ONE_NAT",
-                                                                               "natIP": "34.90.0.9"}]}],
-           "scheduling": {"terminationTime": opt("--termination-time"),
-                          "instanceTerminationAction": opt("--instance-termination-action")},
-           "disks": [{"boot": True, "autoDelete": True, "source": f"{API}/disks/{name}"}]}
+    metadata = dict(kv.split("=", 1) for kv in opt("--metadata").split(","))
+    for kv in opt("--metadata-from-file").split(","):
+        k, path = kv.split("=", 1)
+        metadata[k] = Path(path).read_text()
+    shielded = all(f in a for f in ("--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"))
+    doc, disk, image = instance_docs(
+        name, opt("--project"), opt("--zone"), labels, opt("--tags").split(","), opt("--termination-time"),
+        opt("--instance-termination-action"), opt("--service-account"), opt("--scopes").split(","), metadata,
+        opt("--machine-type"), opt("--boot-disk-size").removesuffix("GB"), opt("--boot-disk-type"),
+        opt("--image-project"), opt("--image-family"), shielded, opt("--network"))
+    doc.update(json.loads(os.environ.get("FAKE_INSTANCE_ON_CREATE") or "{}"))
     (st / "instances" / f"{name}.json").write_text(json.dumps(doc))
-    (st / "disks" / f"{name}.json").write_text(json.dumps({"name": name, "zone": doc["zone"]}))
+    (st / "disks" / f"{name}.json").write_text(json.dumps(disk))
+    (st / "images").mkdir(exist_ok=True)
+    (st / "images" / f"{image['name']}.json").write_text(json.dumps(image))
     (vm(name) / "home" / IDENTITY).mkdir(parents=True, exist_ok=True)
     (vm(name) / "srv").mkdir(parents=True, exist_ok=True)
     if os.environ.get("FAKE_BOOTSTRAP"):
@@ -264,6 +338,12 @@ if a[:3] == ["compute", "instances", "describe"]:
     d, _p = instance(a[3])
     if d is None:
         notfound("instances", f"zones/{opt('--zone')}/instances", a[3])
+    print(json.dumps(d)); sys.exit(0)
+if a[:3] == ["compute", "images", "describe"]:
+    d = load("images", a[3])
+    if d is None:
+        sys.stderr.write(f"ERROR: (gcloud.compute.images.describe) Could not fetch resource:\n - The resource "
+                         f"'projects/{opt('--project')}/global/images/{a[3]}' was not found\n"); sys.exit(1)
     print(json.dumps(d)); sys.exit(0)
 if a[:3] == ["compute", "disks", "describe"]:
     parents("disks", "describe", True)
@@ -349,7 +429,7 @@ def install(bin_dir: Path, state: Path) -> None:
     g = bin_dir / "gcloud"
     consts = "".join(f"{k} = {globals()[k]!r}\n" for k in (
         "PROJECT", "ACCOUNT_404", "DISK_404", "PARENT_404", "PROJECT_403", "ZONE_400", "DESCRIBE_FAILURES", "ZONES",
-        "SSH_FAILURES", "IDENTITY", "VM_ROOT"))
+        "SSH_FAILURES", "IDENTITY", "VM_ROOT")) + BUILDER
     g.write_text(SOURCE.replace("API = ", consts + fake_region.LOADER + "API = ", 1))
     g.chmod(0o755)
 
@@ -361,22 +441,22 @@ def calls(state: Path) -> list[dict]:
 
 def put_instance(state: Path, name: str, labels: dict, termination_time: str, zone: str = "europe-west4-a",
                  namesake: bool = False) -> Path:
-    """An instance as `create` makes it, for a test that starts after `up`; returns the VM's VM_ROOT.
-    namesake: a second instance of that name, in another zone (no disk or VM directory of its own)."""
-    for d in ("instances", "disks"):
+    """An instance as up's create_command makes it (the same builder as the fake's `create`), for a test that
+    starts after `up`; returns the VM's VM_ROOT. namesake: a second instance of that name, in another zone
+    (no disk or VM directory of its own)."""
+    from bench import vm606
+    for d in ("instances", "disks", "images"):
         (state / d).mkdir(parents=True, exist_ok=True)
-    api = "https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/europe-west4-a"
-    (state / "instances" / (f"{name}@{zone}.json" if namesake else f"{name}.json")).write_text(json.dumps({
-        "name": name, "status": "RUNNING", "labels": labels, "tags": {"items": [name]},
-        "zone": f"https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/{zone}",
-        "networkInterfaces": [{"networkIP": "10.164.0.9", "accessConfigs": [{"type": "ONE_TO_ONE_NAT",
-                                                                            "natIP": "34.90.0.9"}]}],
-        "scheduling": {"terminationTime": termination_time, "instanceTerminationAction": "DELETE"},
-        "disks": [{"boot": True, "autoDelete": True, "source": f"{api}/disks/{name}"}]}))
+    doc, disk, image = instance_docs(
+        name, PROJECT, zone, labels, [name], termination_time, "DELETE", vm606.sa_email(PROJECT), ["cloud-platform"],
+        {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE", "startup-script": vm606.startup_script()},
+        vm606.MACHINE_TYPE, vm606.BOOT_DISK_GB, vm606.BOOT_DISK_TYPE, vm606.IMAGE_PROJECT, vm606.IMAGE_FAMILY, True,
+        vm606.NETWORK)
+    (state / "instances" / (f"{name}@{zone}.json" if namesake else f"{name}.json")).write_text(json.dumps(doc))
     if namesake:
         return state / "vm" / name / "srv"
-    (state / "disks" / f"{name}.json").write_text(json.dumps({
-        "name": name, "zone": f"https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io/zones/{zone}"}))
+    (state / "disks" / f"{name}.json").write_text(json.dumps(disk))
+    (state / "images" / f"{image['name']}.json").write_text(json.dumps(image))
     (state / "vm" / name / "home" / IDENTITY).mkdir(parents=True, exist_ok=True)
     srv = state / "vm" / name / "srv"
     srv.mkdir(parents=True, exist_ok=True)
@@ -398,3 +478,13 @@ def policy(state: Path, key: str) -> dict:
 def put_policy(state: Path, key: str, bindings: list) -> None:
     (state / "policies").mkdir(parents=True, exist_ok=True)
     (state / "policies" / f"{key}.json").write_text(json.dumps({"version": 3, "etag": "BwX=", "bindings": bindings}))
+
+
+def put_rule(state: Path, run: str, fw: str) -> None:
+    """One of the run's SSH rules as up's firewall_create_argv makes it (the fake's `create` builder)."""
+    from bench import vm606
+    r = vm606.firewall_rules(run)[fw]
+    (state / "firewalls").mkdir(parents=True, exist_ok=True)
+    (state / "firewalls" / f"{fw}.json").write_text(json.dumps(firewall_doc(
+        fw, PROJECT, vm606.NETWORK, "INGRESS", r["action"], "tcp:22", r["sourceRanges"], r["targetTags"], r["priority"],
+        r["description"])))
