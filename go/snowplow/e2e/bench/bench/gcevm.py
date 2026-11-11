@@ -27,6 +27,8 @@ copied: each rule below is vm606's, stated once.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime as _dt
 import hashlib
 import json
@@ -63,10 +65,29 @@ def say(msg: str) -> None:
     print(msg, flush=True)
 
 
+# Every gcloud call is bounded, and the bound is the calling tool's, never a constant here: `timeout=` on the call,
+# else the bound the tool set for its scope (call_bound: testvm, its session's declared length; vm606, its own).
+_CALL_BOUND: contextvars.ContextVar[float | None] = contextvars.ContextVar("gcevm_call_bound_s", default=None)
+
+
+@contextlib.contextmanager
+def call_bound(seconds: float):
+    """Bound every gcloud call made inside this scope (that passes no timeout of its own) by `seconds`."""
+    token = _CALL_BOUND.set(float(seconds))
+    try:
+        yield
+    finally:
+        _CALL_BOUND.reset(token)
+
+
 def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input_data: str | None = None,
-           timeout: float = 600, quiet: bool = False) -> tuple[int, str, str]:
+           timeout: float | None = None, quiet: bool = False) -> tuple[int, str, str]:
     """One gcloud call: (rc, stdout, stderr). Dry: printed, not run. Its stdout and stderr are the
     caller's (stderr names the account; an IAM call's stdout is the whole policy): never printed here."""
+    if timeout is None:
+        timeout = _CALL_BOUND.get()
+    if timeout is None:
+        raise Refused("a gcloud call with no bound: its tool sets one (gcevm.call_bound)")
     argv = ["gcloud", *args]
     if dry:
         say("DRY-RUN: " + shlex.join(argv))
@@ -91,8 +112,8 @@ def ssh_argv(name: str, project: str, zone: str, command: str) -> list[str]:
             "--command", command]
 
 
-def ssh(name: str, project: str, zone: str, script: str, *, timeout: float = 1800) -> tuple[int, str, str]:
-    """Run `script` with bash on the VM (the script on stdin), OS Login through IAP."""
+def ssh(name: str, project: str, zone: str, script: str, *, timeout: float | None = None) -> tuple[int, str, str]:
+    """Run `script` with bash on the VM (the script on stdin), OS Login through IAP; bounded as gcloud() is."""
     return gcloud(ssh_argv(name, project, zone, "bash -s"), input_data=script, timeout=timeout, quiet=True)
 
 
@@ -166,14 +187,18 @@ def ssh_stage(rc: int, err: str) -> tuple[str, bool]:
 
 
 def wait_for_marker(name: str, project: str, zone: str, script: str, *, ready_timeout_s: float,
-                    timeout_s: float, poll_s: float, hint: str, marker_path: str) -> dict:
+                    timeout_s: float, poll_s: float, hint: str, marker_path: str,
+                    attempt_s: float | None = None) -> dict:
     """SSH until `script` prints a JSON object (a bootstrap marker). Each failure is read: one waiting cannot
     fix stops at once, naming its stage; a booting VM's (port 22 not yet answering) is waited out until
-    ready_timeout_s. `hint` says what the operator does next."""
+    ready_timeout_s. Each attempt is bounded by `attempt_s` (vm606's own), else by what is left of timeout_s.
+    `hint` says what the operator does next."""
     t0 = time.monotonic()
     reached = False
     while True:
-        rc, out, err = ssh(name, project, zone, script, timeout=120)
+        rc, out, err = ssh(name, project, zone, script,
+                           timeout=attempt_s if attempt_s is not None else max(timeout_s - (time.monotonic() - t0),
+                                                                               poll_s))
         now = time.monotonic() - t0
         if rc != 0:
             stage, transient = ssh_stage(rc, err)
@@ -661,9 +686,21 @@ def _bash_c(script: str) -> str:
     return "bash -c " + shlex.quote(script)
 
 
+def round_trip(name: str, project: str, zone: str, bound_s: float) -> float:
+    """The seconds one SSH session through IAP takes, connection and all, measured now (a no-op, under bound_s)."""
+    t0 = time.monotonic()
+    rc, out, err = ssh(name, project, zone, "true\n", timeout=bound_s)
+    if rc != 0:
+        raise failed("the SSH round trip before a transfer", rc, out, err, prefix="GCEVM")
+    return time.monotonic() - t0
+
+
 def probe(name: str, project: str, zone: str, direction: str, scratch: str, bound_s: float) -> Rate:
     """The rate of `direction` ("up" to the VM, "down" from it), measured by PROBE_BYTES through the same ssh
-    path, under the caller's `bound_s`. `scratch`: a directory of this run on the VM."""
+    path, under the caller's `bound_s`. Its stall bound is derived like a transfer's: no byte for SLACK x an SSH
+    round trip measured just before it (the probe's own connection costs one) is a stall, refused by name.
+    `scratch`: a directory of this run on the VM."""
+    stall_s = SLACK * round_trip(name, project, zone, bound_s)
     with tempfile.TemporaryDirectory() as d:
         t0 = time.monotonic()
         if direction == "up":
@@ -672,13 +709,13 @@ def probe(name: str, project: str, zone: str, direction: str, scratch: str, boun
                 fh.write(b"\0" * PROBE_BYTES)
             cmd = _bash_c(_RECEIVE.format(dst=shlex.quote(f"{scratch}/probe"), n=PROBE_BYTES))
             rc, out, err = stream(ssh_argv(name, project, zone, cmd), what="the upload probe", nbytes=PROBE_BYTES,
-                                  bound_s=bound_s, stall_s=bound_s, src=src)
+                                  bound_s=bound_s, stall_s=stall_s, src=src)
             if rc == 0 and marker(out, "GCEVM_BYTES") != str(PROBE_BYTES):
                 raise Refused(f"the upload probe arrived as {marker(out, 'GCEVM_BYTES')} bytes, not {PROBE_BYTES}")
         else:
             cmd = _bash_c(f"head -c {PROBE_BYTES} /dev/zero")
             rc, out, err = stream(ssh_argv(name, project, zone, cmd), what="the download probe", nbytes=PROBE_BYTES,
-                                  bound_s=bound_s, stall_s=bound_s, dst=os.path.join(d, "probe"))
+                                  bound_s=bound_s, stall_s=stall_s, dst=os.path.join(d, "probe"))
         if rc != 0:
             raise failed(f"the {direction}load probe", rc, out, err, prefix="GCEVM")
         rate = Rate(PROBE_BYTES, time.monotonic() - t0)

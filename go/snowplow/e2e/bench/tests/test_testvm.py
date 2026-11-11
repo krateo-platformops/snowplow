@@ -181,6 +181,7 @@ def _repo(tmp_path, origin: str = f"https://github.com/{REPO}.git", files: dict 
     _git(r, "add", "-A")
     _git(r, "commit", "-q", "-m", "c1")
     _git(r, "remote", "add", "origin", origin)
+    _git(r, "update-ref", "refs/remotes/origin/main", "HEAD")           # as a fetch of origin leaves it
     return r, _git(r, "rev-parse", "HEAD")
 
 
@@ -190,6 +191,7 @@ def _commit(r: Path, files: dict) -> str:
         (r / rel).write_text(body)
     _git(r, "add", "-A")
     _git(r, "commit", "-q", "-m", "next")
+    _git(r, "update-ref", "refs/remotes/origin/main", "HEAD")           # pushed
     return _git(r, "rev-parse", "HEAD")
 
 
@@ -515,15 +517,21 @@ def test_many_runs_on_one_vm_each_with_its_results_and_the_session_survives(fake
     assert len([v for v in _verbs(fake) if "instances create" in v]) == 1     # one VM for the whole session
 
 
-@pytest.mark.serial  # #1166/#1174: asserts the run ends `< 60` s of wall clock
+@pytest.mark.serial  # #1166/#1174: bounds the run's wall clock by a multiple of its budget
 def test_a_command_past_its_budget_is_stopped_with_its_whole_process_group(fake, capsys, tmp_path):
     _up(fake, capsys, tmp_path)
+    budget_s = 12
     t0 = time.monotonic()
-    rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "0.05", "--", "bash", "-c",
-                        "trap '' TERM; sleep 60 & sleep 60; wait")
+    rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", str(budget_s / 60), "--", "bash", "-c",
+                        "trap '' TERM; sleep 600 & sleep 600; wait")
+    took = time.monotonic() - t0
     assert rc == 1, err + out
-    assert "RUN: command: stopped at its budget of 3 s (its process group killed" in out
-    assert time.monotonic() - t0 < 60
+    assert f"RUN: command: stopped at its budget of {budget_s} s (its process group killed" in out
+    cmd = json.loads((_rundir(fake) / "runs" / "1" / "command.json").read_text())
+    # relative to the budget, never an additive allowance: the command never outlives its budget, and the whole
+    # run (SSH, start, kill, its records) stays inside twice it
+    assert cmd["ended"] == "budget" and cmd["elapsed_s"] <= budget_s
+    assert took < 2 * budget_s, took
     pid = int((_rundir(fake) / "runs" / "1" / "pid.cmd").read_text())
     with pytest.raises(ProcessLookupError):
         os.killpg(pid, 0)                                             # nothing it started outlives it
@@ -593,8 +601,9 @@ def _ssh_calls(fake) -> int:
 @pytest.mark.serial  # #1166/#1174: asserts the refusal inside its bound and stall window, on the wall clock
 def test_a_stalled_bundle_upload_is_refused_by_name_within_its_bound(fake, capsys, tmp_path, monkeypatch):
     clone, sha = _repo(tmp_path, files={"blob.bin": os.urandom(3 << 20)})       # beyond any pipe's buffer
-    # up's ssh calls: the bootstrap marker (1), the run's directory (2), the upload probe (3), the bundle (4)
-    monkeypatch.setenv("FAKE_STREAM_STALL", "4:131072")
+    # up's ssh calls: the bootstrap marker (1), the run's directory (2), the round trip (3), the upload probe (4),
+    # the bundle (5)
+    monkeypatch.setenv("FAKE_STREAM_STALL", "5:131072")
     seen = {}
     real = gcevm.stream
 
@@ -616,8 +625,8 @@ def test_a_stalled_results_download_is_refused_and_nothing_is_kept(fake, capsys,
     rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "5", "--", "true")
     assert rc == 0, err
     n = _ssh_calls(fake)
-    # fetch's ssh calls: the pack (n+1), the download probe (n+2), the archive (n+3)
-    monkeypatch.setenv("FAKE_STREAM_STALL", f"{n + 3}:0")
+    # fetch's ssh calls: the pack (n+1), the round trip (n+2), the download probe (n+3), the archive (n+4)
+    monkeypatch.setenv("FAKE_STREAM_STALL", f"{n + 4}:0")
     rc, out, err = _run(capsys, "fetch", "--run", RUN)
     assert rc == 2 and re.search(r"the results transfer stalled at 0 of \d+ bytes", err)
     assert not (testvm.state_dir(RUN) / "results").exists() and _state()["runs"][0]["fetched"] is False
@@ -684,7 +693,8 @@ def test_down_deletes_what_drifted_and_reports_it(fake, capsys, tmp_path):
 
 
 @pytest.mark.parametrize("lost, why", [("FAKE_INSTANCE_DELETE_LOST", "still answers"),
-                                       ("FAKE_FW_DELETE_LOST", "remain after their delete")])
+                                       ("FAKE_FW_DELETE_LOST", "remain after their delete"),
+                                       ("FAKE_KEEP_DISKS", "remain: delete them by hand")])
 def test_down_verifies_each_delete_and_refuses_one_that_did_not_happen(fake, capsys, tmp_path, monkeypatch, lost, why):
     _up(fake, capsys, tmp_path)
     monkeypatch.setenv(lost, "1")
@@ -814,3 +824,170 @@ def test_testvm_and_vm606_share_one_implementation_of_the_gce_rules():
             if f.startswith("--")} == {f for fl in gcevm.FIREWALL_FIELDS.values() for f in fl if f.startswith("--")}
     # plan-iam does not scan the operator-side modules, and refuses an orchestrator module that imports one
     assert not vm606.scan()["uncovered"]
+
+
+# ─── #1340 review: a test per safety site ───────────────────────────────────
+
+def _instance_doc(fake) -> Path:
+    return fake / "instances" / f"{VM}.json"
+
+
+def test_down_refuses_a_rule_of_the_runs_name_that_someone_else_made(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    p = fake / "firewalls" / f"{VM}-deny-ssh.json"
+    doc = json.loads(p.read_text())
+    doc["description"] = "someone else's rule"
+    p.write_text(json.dumps(doc))
+    rc, _o, err = _run(capsys, "down", "--run", RUN, "--yes", "--discard-unfetched")
+    assert rc == 2 and f"firewall rule '{VM}-deny-ssh' is not one testvm made for run {RUN}" in err
+    assert _instance_doc(fake).exists() and p.exists()                    # nothing was changed
+    assert "compute instances delete" not in _verbs(fake)
+
+
+def test_down_refuses_while_another_instance_claims_the_run(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    fake_vm606.put_instance(fake, "another-vm", {"run": RUN}, "2030-01-01T00:00:00Z", zone="europe-west1-b")
+    rc, _o, err = _run(capsys, "down", "--run", RUN, "--yes", "--discard-unfetched")
+    assert rc == 2 and "another-vm (europe-west1-b) claim(s) run" in err
+    assert _instance_doc(fake).exists() and "compute instances delete" not in _verbs(fake)
+
+
+def test_up_refuses_a_run_name_whose_firewall_rule_is_left_over(fake, capsys, tmp_path):
+    clone, sha = _repo(tmp_path)
+    r = testvm.firewall_rules(RUN)[f"{VM}-deny-ssh"]
+    (fake / "firewalls").mkdir(parents=True, exist_ok=True)
+    (fake / "firewalls" / f"{VM}-deny-ssh.json").write_text(json.dumps(fake_vm606.firewall_doc(
+        f"{VM}-deny-ssh", PROJECT, "default", "INGRESS", r["action"], "tcp:22", r["sourceRanges"], r["targetTags"],
+        r["priority"], r["description"])))
+    rc, _o, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and f"run {RUN} is in use: firewall rule {VM}-deny-ssh" in err
+    assert not [v for v in _verbs(fake) if re.search(r"\b(create|delete)\b", v)]
+
+
+def test_a_sha_on_none_of_origins_refs_is_refused_at_bundle_time(fake, capsys, tmp_path):
+    """A commit only another repository has (a twin's, fetched into the clone from elsewhere) is not bundled."""
+    clone, _sha = _repo(tmp_path)
+    (clone / "pkg" / "twin.go").write_text("package pkg\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "only on a twin")
+    twin = _git(clone, "rev-parse", "HEAD")                               # origin's refs do not hold it
+    rc, _o, err = _run(capsys, *_up_args(clone, twin, "--yes"))
+    assert rc == 2 and f"{twin} is on none of origin's refs" in err
+    assert fake_vm606.calls(fake) == []
+
+
+def _vm_push(fake, sha: str, tree: str):
+    tc = {"go": None, "python": None, "requirements": []}
+    return gcevm.ssh(VM, PROJECT, ZONE, testvm.push_script(RUN, sha, tree, tc), timeout=120)
+
+
+def test_the_vm_refuses_a_bundle_whose_head_is_not_the_sha(fake, capsys, tmp_path):
+    clone, sha1, _ = _up(fake, capsys, tmp_path)
+    sha2 = _commit(clone, {"pkg/b.go": "package pkg\n"})
+    sha3 = _commit(clone, {"pkg/c.go": "package pkg\n"})
+    # the bundle of sha2 where the VM expects sha3's
+    testvm.make_bundle(str(clone), sha2, [sha1], _rundir(fake) / "incoming" / f"{sha3}.bundle")
+    rc, out, _e = _vm_push(fake, sha3, _git(clone, "rev-parse", f"{sha3}^{{tree}}"))
+    assert rc == 3 and f"the bundle's heads are not exactly {sha3}" in out
+    assert _git(_rundir(fake) / "src", "rev-parse", "HEAD") == sha1        # the checkout did not move
+
+
+def test_the_vm_refuses_a_checkout_whose_tree_is_not_the_one_the_laptop_read(fake, capsys, tmp_path):
+    clone, sha1, _ = _up(fake, capsys, tmp_path)
+    sha2 = _commit(clone, {"pkg/b.go": "package pkg\n"})
+    testvm.make_bundle(str(clone), sha2, [sha1], _rundir(fake) / "incoming" / f"{sha2}.bundle")
+    rc, out, _e = _vm_push(fake, sha2, "0" * 40)
+    assert rc == 3 and f"the checkout's tree is {_git(clone, 'rev-parse', f'{sha2}^{{tree}}')}, not {'0' * 40}" in out
+
+
+def test_the_laptop_refuses_a_vm_that_reports_another_tree(fake, capsys, tmp_path, monkeypatch):
+    """The laptop checks what the VM reports, whatever the VM's own check said."""
+    clone, sha1, _ = _up(fake, capsys, tmp_path)
+    sha2 = _commit(clone, {"pkg/b.go": "package pkg\n"})
+    monkeypatch.setattr(testvm, "push_script", lambda run, sha, tree, tc: testvm.remote(
+        run, f"echo TESTVM_HEAD={sha}\necho TESTVM_TREE={'0' * 40}\n"))
+    rc, _o, err = _run(capsys, "push", "--run", RUN, "--repo", REPO, "--clone", str(clone), "--sha", sha2)
+    assert rc == 2 and f"the VM reports its checkout at {sha2} (tree {'0' * 40}), not {sha2}" in err
+    assert _state()["checkout"]["sha"] == sha1
+
+
+def test_nothing_a_command_started_outlives_its_normal_exit(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "5", "--", "bash", "-c",
+                        "sleep 600 & echo $! > child.pid")
+    assert rc == 0 and "RUN: command: exit 0" in out, err + out
+    child = int((_rundir(fake) / "src" / "child.pid").read_text())
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)                                               # its group was killed at the exit
+
+
+def test_a_hung_probe_is_refused_as_a_stall_derived_from_a_measured_round_trip(fake, capsys, tmp_path, monkeypatch):
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_STREAM_STALL", "4:0")                        # the upload probe's tunnel never moves
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and re.search(r"the upload probe stalled at \d+ of 4194304 bytes \(no byte moved for \d+ s", err)
+    stall = float(re.search(r"the upload probe: 4194304 bytes, bound \d+ s, stall ([0-9.]+) s", out).group(1))
+    assert stall < 3600                                                   # SLACK x a round trip, not the session
+
+
+def test_a_cluster_token_never_outlives_the_vm(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    _gke(fake)
+    soon = gcevm.rfc3339(time.time() + 300)                              # under the API's 10 min floor
+    inst = json.loads(_instance_doc(fake).read_text())
+    inst["scheduling"]["terminationTime"] = soon
+    _instance_doc(fake).write_text(json.dumps(inst))
+    st = _state()
+    st["made"]["instance"]["terminationTime"] = soon
+    testvm._save_state(RUN, made=st["made"], terminates_at=soon)
+    rc, _o, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "1", "--cluster", "snowplow-bench-oasgen",
+                       "--cluster-location", "europe-west3", "--", "true")
+    assert rc == 2 and "under the TokenRequest API's 600 s floor: a token would outlive the VM" in err
+    log = (fake / "kubectl.log").read_text() if (fake / "kubectl.log").exists() else ""
+    assert "token" not in log
+
+
+def test_a_later_run_of_the_cluster_reuses_its_token_while_it_outlives_the_runs_budget(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    _gke(fake)
+    for _ in range(2):
+        rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "1", "--cluster", "snowplow-bench-oasgen",
+                            "--cluster-location", "europe-west3", "--", "true")
+        assert rc == 0, err + out
+    tokens = [x for x in (fake / "kubectl.log").read_text().splitlines() if '"token"' in x]
+    assert len(tokens) == 1
+
+
+def test_report_says_not_run_for_a_host_reading_that_is_not_there(capsys):
+    code = testvm.report(1, {"command": {"rc": 0, "ended": "exited", "elapsed_s": 1.0, "budget_s": 60.0},
+                             "host": {"start": {"error": "OSError"}, "end": {}}, "junit": 0}, False)
+    out = capsys.readouterr().out
+    assert code == 0
+    code = testvm.report(1, {"command": {"rc": 0, "ended": "exited", "elapsed_s": 1.0, "budget_s": 60.0},
+                             "host": {"error": "FileNotFoundError"}, "junit": 0}, False)
+    out += capsys.readouterr().out
+    assert "NOT RUN: host health at start: no reading on the VM" in out
+    assert "NOT RUN: host health at end: no reading on the VM" in out
+    assert "RUN: host health" not in out.replace("NOT RUN: host health", "")
+
+
+def test_run_says_how_much_of_the_vm_is_left_for_the_fetch(fake, capsys, tmp_path):
+    _up(fake, capsys, tmp_path)
+    rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "5", "--", "true")
+    assert rc == 0, err + out
+    assert re.search(r"after this run's 5 min budget, \d+ min remain for its fetch \(testvm reserves none", out)
+
+
+def test_every_gcloud_call_is_bounded_by_its_tool_never_by_a_constant_here():
+    with pytest.raises(gcevm.Refused, match="a gcloud call with no bound"):
+        gcevm.gcloud(["version"])
+    import inspect
+    assert inspect.signature(gcevm.gcloud).parameters["timeout"].default is None
+    assert inspect.signature(gcevm.ssh).parameters["timeout"].default is None

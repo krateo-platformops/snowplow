@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from bench import diag606, gke, identity, load606, logscrub, sampler, vm606
+from bench import diag606, gcevm, gke, identity, load606, logscrub, sampler, testvm, vm606
 from tests.test_run606_real_sequence import BENCH_DIR
 
 D256 = "sha256:" + "0123456789abcdef" * 4
@@ -94,12 +94,28 @@ SITES = {
     "gke.gcloud_error_lines (a failed create's reason)": lambda s: gke.gcloud_error_lines("ERROR: " + s),
     # bench/vm606.py: the orchestrator VM's output (the launcher's log tail, a remote refusal)
     "vm606._remote_lines (the VM's output)": lambda s: "\n".join(vm606._remote_lines(s)),
+    # #1338: bench/gcevm.py, shared by vm606 and testvm: a VM's output, a failed remote step, a drifted field
+    "gcevm.remote_lines (a VM's output)": lambda s: "\n".join(gcevm.remote_lines(s)),
+    "gcevm.failed (a failed remote step's lines)": lambda s: str(gcevm.failed("a step", 1, s, "", prefix="x")),
+
+    # bench/testvm.py: a failed git on the laptop, the cluster probe's error, the VM's bootstrap marker
+    "testvm.git_failure (a failed git's stderr)": lambda s: testvm.git_failure("/c", ["fetch"], 1, "noise\n" + s),
+    "testvm._probe_line (a cluster probe's error)": lambda s: testvm._probe_line({"error": s})[1],
+    "testvm.bootstrap_line (the VM's tool versions)": lambda s: testvm.bootstrap_line({"git": s}),
 }
 
 
 @pytest.mark.parametrize("site", sorted(SITES))
 def test_every_redaction_site_keeps_digests_and_drops_identities(site):
     _check(SITES[site](LINE))
+
+
+def test_gcevm_short_redacts_a_drifted_fields_value_before_it_shortens_it():
+    """gcevm.short (a drifted field named in a refusal) cuts at 100 characters by design, so a whole digest cannot
+    survive it the way the sweep above asks; the identities in what it keeps must not."""
+    out = gcevm.short({"owner": "someone@example.invalid", "user": 'User "scaleuser-0001"', "pad": "x" * 200})
+    assert "someone@example.invalid" not in out and "scaleuser-0001" not in out and "<redacted>" in out
+    assert len(out) == 100
 
 
 def test_error_summary_never_carries_free_text():
@@ -113,7 +129,8 @@ def test_the_call_sites_are_the_ones_swept():
     """A new place that redacts is added to SITES, not left out of the sweep."""
     src = {p.name: p.read_text() for p in (BENCH_DIR / "bench").glob("*.py")}
     users = sorted(n for n, t in src.items() if "redact_identity" in t and n != "identity.py")
-    assert users == ["diag606.py", "gke.py", "load606.py", "logscrub.py", "sampler.py", "vm606.py"]
+    assert users == ["diag606.py", "gcevm.py", "gke.py", "load606.py", "logscrub.py", "sampler.py", "testvm.py",
+                     "vm606.py"]
     assert "bench/identity.py" in (BENCH_DIR / "run606.sh").read_text()
 
 

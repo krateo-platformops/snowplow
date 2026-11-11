@@ -125,6 +125,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import functools
 import json
 import os
@@ -241,9 +242,19 @@ def remote(run: str, body: str, *, in_dir: bool = True) -> str:
 def _git(clone: str, *args: str, check: bool = True) -> str:
     p = subprocess.run(["git", "-C", clone, *args], capture_output=True, text=True)
     if check and p.returncode != 0:
-        raise Refused(f"git {' '.join(args[:2])} in {clone} failed (rc={p.returncode}): "
-                      f"{redact_identity((p.stderr or '').strip().splitlines()[-1] if p.stderr.strip() else '')}")
+        raise Refused(git_failure(clone, args, p.returncode, p.stderr))
     return p.stdout
+
+
+def git_failure(clone: str, args, rc: int, stderr: str) -> str:
+    """A failed git call: its last stderr line, redacted (a remote URL or a credential helper names the user)."""
+    last = (stderr or "").strip().splitlines()[-1] if (stderr or "").strip() else ""
+    return f"git {' '.join(args[:2])} in {clone} failed (rc={rc}): {redact_identity(last)}"
+
+
+def bootstrap_line(got: dict) -> str:
+    """The VM's bootstrap marker as up prints it, each tool's version redacted (a version line can name a path)."""
+    return ", ".join(f"{k} {redact_identity(str(v))}" for k, v in sorted(got.items()))
 
 
 _SCP_LIKE = re.compile(r"^(?:[^@/:]+@)?([^/:]+):(?!//)(.+)$")
@@ -290,8 +301,14 @@ def source(clone: str, repo: str, sha: str) -> dict:
     commit = _git(clone, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False).strip()
     if commit != sha:
         raise Refused(f"{sha} is not a commit in {clone} (fetch it first)")
+    # the SHA must be on one of origin's refs as the clone last fetched them: a commit only another repository has
+    # (a twin's, fetched into this clone from elsewhere) is not the declared repo's
+    on = _git(clone, "for-each-ref", "--format=%(refname)", "--contains", sha, "refs/remotes/origin").split()
+    if not on:
+        raise Refused(f"{sha} is on none of origin's refs in {clone} (refs/remotes/origin/*): a commit not in "
+                      f"{host}/{path} is not bundled (push it, or `git fetch origin` if it is there)")
     tree = _git(clone, "rev-parse", f"{sha}^{{tree}}").strip()
-    return {"repo": f"{host}/{path}", "origin": safe_url(origin), "sha": sha, "tree": tree}
+    return {"repo": f"{host}/{path}", "origin": safe_url(origin), "sha": sha, "tree": tree, "origin_refs": on}
 
 
 def make_bundle(clone: str, sha: str, have: list[str], out: Path) -> dict:
@@ -692,7 +709,7 @@ def cmd_up(a) -> int:
     if missing:
         raise Refused(f"{name}'s bootstrap lacks {missing}; {down_hint(run)}")
     _save_state(run, bootstrap=got)
-    gcevm.say(f"{name} bootstrapped: " + ", ".join(f"{k} {redact_identity(str(v))}" for k, v in sorted(got.items())))
+    gcevm.say(f"{name} bootstrapped: {bootstrap_line(got)}")
     rc, out, err = ssh(name, project, zone, remote(run, 'umask 077\nmkdir -p "$R/home" "$R/incoming" "$R/runs"\n'
                                                    'chmod 700 "$R"\n', in_dir=False),
                        timeout=_bounded(st, "making the run's directory"))
@@ -1097,13 +1114,15 @@ echo "TESTVM_DONE=$(python3 -c 'import json,sys; print(json.dumps(json.load(open
 """
 
 
-def _host_line(h: dict | None) -> str:
-    if not isinstance(h, dict):
-        return "absent"
+def _host_line(h: dict | None) -> tuple[bool, str]:
+    """(recorded, the line): a reading that is not there is NOT RUN, never a RUN line saying "absent"."""
+    if not isinstance(h, dict) or "cpus" not in h:
+        return False, "no reading on the VM"
     load = h.get("load")
     j = h.get("cpu_jiffies") or {}
-    return (f"load {'/'.join(f'{x:.2f}' for x in load) if load else '?'} on {h.get('cpus')} CPU, MemAvailable "
-            f"{h.get('mem_available_kb')} kB, steal {j.get('steal', '?')} of {sum(j.values()) if j else '?'} jiffies")
+    return True, (f"load {'/'.join(f'{x:.2f}' for x in load) if load else '?'} on {h.get('cpus')} CPU, MemAvailable "
+                  f"{h.get('mem_available_kb')} kB, steal {j.get('steal', '?')} of {sum(j.values()) if j else '?'} "
+                  f"jiffies")
 
 
 def _probe_line(p: dict | None) -> tuple[bool, str]:
@@ -1119,7 +1138,8 @@ def report(n: int, done: dict, probe: bool) -> int:
     """A RUN / NOT RUN line per phase of run n; the command's exit code (1 for any failure, 0 when it passed)."""
     host = done.get("host") or {}
     cmd = done.get("command") or {}
-    gcevm.say(f"RUN: host health at start: {_host_line(host.get('start'))}")
+    ok, line = _host_line(host.get("start"))
+    gcevm.say(f"{'RUN' if ok else 'NOT RUN'}: host health at start: {line}")
     if probe:
         ok, line = _probe_line(done.get("cluster_probe_start"))
         gcevm.say(f"{'RUN' if ok else 'NOT RUN'}: cluster probe at start: {line}")
@@ -1133,8 +1153,9 @@ def report(n: int, done: dict, probe: bool) -> int:
                   f"exit {rc})")
     j = done.get("junit")
     gcevm.say(f"RUN: junit: {j} file(s)" if j else "NOT RUN: junit: the command wrote no JUnit XML")
-    gcevm.say(f"RUN: host health at end: {_host_line(host.get('end'))}; steal share over the run "
-              f"{host.get('steal_share') if host.get('steal_share') is not None else 'unknown'}")
+    ok, line = _host_line(host.get("end"))
+    gcevm.say(f"{'RUN' if ok else 'NOT RUN'}: host health at end: {line}"
+              + (f"; steal share over the run {host['steal_share']}" if host.get("steal_share") is not None else ""))
     if probe:
         ok, line = _probe_line(done.get("cluster_probe_end"))
         gcevm.say(f"{'RUN' if ok else 'NOT RUN'}: cluster probe at end: {line}")
@@ -1165,9 +1186,13 @@ def cmd_run(a) -> int:
     left = gcevm.time_left_s(inst, time.time())
     if left is None or left < budget_s:
         raise Refused(f"{name} is deleted in {'an unknown time' if left is None else f'{left / 60:.0f} min'}: a "
-                      f"{a.budget_minutes} min budget does not fit (its fetch after it neither); a longer session is "
-                      f"`down`, then `up` with a new --run and the --session-hours it needs")
-    kubeconfig = attach_cluster(run, st, a.cluster, a.cluster_location) if a.cluster else None
+                      f"{a.budget_minutes} min budget does not fit; a longer session is `down`, then `up` with a new "
+                      f"--run and the --session-hours it needs")
+    # testvm reserves no time for the fetch: what is left after the budget is all the fetch gets, and it is said
+    gcevm.say(f"{name}: {left / 60:.0f} min left; after this run's {budget_s / 60:.0f} min budget, "
+              f"{(left - budget_s) / 60:.0f} min remain for its fetch (testvm reserves none: declare a budget that "
+              f"leaves it room)")
+    kubeconfig = attach_cluster(run, st, a.cluster, a.cluster_location, budget_s) if a.cluster else None
     st = _state(run)
     n = len(st.get("runs") or []) + 1
     header = {"run": run, "n": n, "vm": name, "machine": st.get("machine"), "repo": co["repo"],
@@ -1268,7 +1293,7 @@ def _jwt_exp(token: str) -> float | None:
         return None
 
 
-def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
+def attach_cluster(run: str, st: dict, name: str, location: str | None, budget_s: float) -> str:
     """The VM path of the kubeconfig for cluster `name`, made the first time a run of the session targets it (see
     the module doc): a disposable bench cluster only; a token of ServiceAccount testvm-<run>, expiring at the
     VM's deadline. The laptop keeps no copy of the token."""
@@ -1278,8 +1303,8 @@ def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
     remote_kc = f"{vm_dir(run)}/kube/{name}.json"
     att = (st.get("clusters") or {}).get(name)
     ends = gcevm.epoch(st.get("terminates_at")) or 0
-    if att and att.get("location") == location and (att.get("expires") or 0) >= time.time() + 60:
-        return remote_kc
+    if att and att.get("location") == location and (att.get("expires") or 0) >= time.time() + budget_s:
+        return remote_kc                                     # its token outlives this run's budget
     doc = _cluster(name, location, project)
     if doc is None:
         raise Refused(f"GKE cluster {name} ({location}) answers NotFound")
@@ -1300,8 +1325,12 @@ def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
         if rc != 0:
             raise Refused(f"the ServiceAccount testvm-{run} in {name} could not be made (rc={rc}; "
                           f"{error_summary(err)})")
-        # until the VM's deadline; the TokenRequest API's own floor is 10 min (a shorter one it refuses)
-        duration = max(int(ends - time.time()), TOKEN_MIN_S)
+        # exactly until the VM's deadline, never past it; the TokenRequest API's own floor is 10 min (it refuses a
+        # shorter one), so a VM with less left gets no token at all
+        duration = int(ends - time.time())
+        if duration < TOKEN_MIN_S:
+            raise Refused(f"{vm_name(run)} is deleted in {duration} s, under the TokenRequest API's {TOKEN_MIN_S} s "
+                          f"floor: a token would outlive the VM, so none is made")
         rc, token, err = _kubectl(kc, "-n", CLUSTER_NS, "create", "token", f"testvm-{run}",
                                   f"--duration={duration}s", timeout=_bounded(st, "the cluster's token"))
         token = token.strip()
@@ -1559,7 +1588,11 @@ def main(argv: list[str] | None = None) -> int:
 
     a = ap.parse_args(argv)
     try:
-        return a.func(a)
+        # every gcloud call of a session is bounded by the session's declared length (waits on the VM, by what is
+        # left of it); a command on a run with no record refuses before any call
+        hours = a.session_hours if a.cmd == "up" else _state(check_run(a.run)).get("session_hours")
+        with gcevm.call_bound(hours * 3600) if hours else contextlib.nullcontext():
+            return a.func(a)
     except Refused as e:
         print(f"refusing: {e}", file=sys.stderr)
         return 2

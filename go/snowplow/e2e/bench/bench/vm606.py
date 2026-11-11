@@ -287,6 +287,10 @@ MAX_TTL_HOURS = 72
 # the VM must outlive the run's own TTL by this much at launch: the launch-to-gke-up time, the pair's
 # verdicts after the last gke-down, and the fetch
 LAUNCH_MARGIN_S = 3600
+# vm606's own bounds, as they were before #1338 moved gcloud() into bench.gcevm (which has none of its own): any
+# gcloud call that names no timeout, and each SSH attempt of the bootstrap wait
+GCLOUD_TIMEOUT_S = 600
+SSH_ATTEMPT_S = 120
 
 # the laptop's tool versions (kubectl version --client, helm version, gcloud version: 2026-11-10)
 KUBECTL_VERSION = "v1.36.2"
@@ -1087,7 +1091,7 @@ def wait_for_bootstrap(run: str, a) -> None:
     script = remote(run, f'cat {shlex.quote(BOOTSTRAP_MARKER)} 2>/dev/null || true\n', in_dir=False)
     got = gcevm.wait_for_marker(name, a.project, a.zone, script, ready_timeout_s=a.ssh_ready_timeout_s,
                                 timeout_s=a.bootstrap_timeout_s, poll_s=a.poll_s, hint=resume_hint(run),
-                                marker_path=BOOTSTRAP_MARKER)
+                                marker_path=BOOTSTRAP_MARKER, attempt_s=SSH_ATTEMPT_S)
     bad = bootstrap_mismatch(got)
     if bad:
         raise Refused(f"{name}'s tools are not the laptop's: {'; '.join(bad)}; {down_hint(run)}")
@@ -1763,7 +1767,8 @@ def main(argv: list[str] | None = None) -> int:
 
     a = ap.parse_args(argv)
     try:
-        return a.func(a)
+        with gcevm.call_bound(GCLOUD_TIMEOUT_S):
+            return a.func(a)
     except Refused as e:
         print(f"refusing: {e}", file=sys.stderr)
         return 2
