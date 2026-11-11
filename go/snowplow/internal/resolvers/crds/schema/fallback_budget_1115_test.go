@@ -1,14 +1,17 @@
 package schema
 
-// fallback_budget_1115_test.go — #1115 final sweep: when the SA discovery
-// singleton refuses the config (an impersonating rc, or nil), the CRD GET
-// falls back to a per-call dynamic.NewClient whose mapper discovers on
-// client-go's own context.TODO(). That client is bound to the request's page
-// budget: with the budget spent, the fallback sends nothing; without a budget
-// (background work) it sends as before.
+// fallback_budget_1115_test.go — #1115 final sweep, revised by #1318: when the
+// SA discovery singleton refuses the config (an impersonating rc, or nil), the
+// CRD GET falls back to a per-call dynamic.NewClient whose mapper discovers on
+// client-go's own context.TODO(). #1115 bound that client to the request's page
+// budget. Since #1318 the CRD read is the memo's shared refill, run under a
+// DETACHED fill ctx (schema_fill.go), so the fallback client serves the flight,
+// not the request: with the request's budget spent, the miss is still sent (and
+// the memo refills when the CRD exists, TestIssue1318_SpentBudgetMissStillRefills).
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,12 +51,14 @@ func fallbackBudgetServer(t *testing.T) (*rest.Config, *atomic.Int32) {
 	return &rest.Config{Host: srv.URL, Impersonate: rest.ImpersonationConfig{UserName: "budget-1115-probe"}}, &n
 }
 
-func TestSchemaFallback1115_PerCallClientRunsInsideTheBudget(t *testing.T) {
+func TestSchemaFallback1115_PerCallClientServesTheDetachedFill(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	cache.ResetPluralsStoreForTest()
 	t.Cleanup(cache.ResetPluralsStoreForTest)
 	resetCRDSchemaMemoForTest()
 	t.Cleanup(resetCRDSchemaMemoForTest)
+	resetCRDSchemaFlightsForTest()
+	t.Cleanup(resetCRDSchemaFlightsForTest)
 
 	rc, n := fallbackBudgetServer(t)
 	obj := map[string]any{
@@ -72,11 +77,14 @@ func TestSchemaFallback1115_PerCallClientRunsInsideTheBudget(t *testing.T) {
 	}
 
 	// Spent budget: the plural is now stored (no send), so the only sends left
-	// are the fallback client's — bound, they are refused before the wire.
+	// are the fallback client's — the fill's, outside the request's budget.
 	resetCRDSchemaMemoForTest()
 	spent := pagebudget.WithCustomer(context.Background(), time.Now().Add(-2*pagebudget.PageMaxGoal))
 	err := ValidateObjectStatus(spent, rc, obj)
-	if err == nil || n.Load() != warm {
-		t.Fatalf("SPENT budget: err %v after %d new request(s); want an error and 0 sent", err, n.Load()-warm)
+	if err == nil || n.Load() == warm {
+		t.Fatalf("SPENT budget: err %v after %d new request(s); want the fill sent (the CRD is absent: an error)", err, n.Load()-warm)
+	}
+	if errors.Is(err, pagebudget.ErrExhausted) {
+		t.Fatalf("SPENT budget: %v; the fill was cut by the request's budget", err)
 	}
 }

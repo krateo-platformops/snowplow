@@ -8,11 +8,9 @@ package schema
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,81 +125,17 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		return invalidStatus(validateCustomResource(crv, widgetData))
 	}
 
-	// MISS — snapshot the memo generation BEFORE the CRD GET below. If a CRD
-	// lifecycle reset (InvalidateCRDSchemaMemo) lands during the GET+compile
-	// window, the generation moves and storeCRDSchema drops the (potentially
-	// stale-bytes) install, so the next call recompiles from fresh bytes
-	// (architect A1 generation fence).
-	gen := currentSchemaGen()
-
-	// Ship 0.30.231 (2026-06-01) — inlined CRD GET. The deleted
-	// internal/resolvers/crds.Get helper wrapped the same two-line
-	// dynamic.NewClient + Get call below; inlining removes the
-	// indirection. Earlier (Ship 2) attempted to also skip the
-	// mapper build via dynamic.WithSkipMapper, but the contract was
-	// unsafe — resourceInterfaceFor (client.go:146) calls
-	// uc.mapper.RESTMapping unconditionally; the opts.GVR/opts.GVK
-	// branch at line 138 only chooses the source GVK, it does not
-	// skip the mapper. WithSkipMapper has been removed.
-	//
-	// Task #322 (#318-R2) Commit 1 — the per-call dynamic.NewClient
-	// here built a FRESH memCacheClient + DeferredDiscoveryRESTMapper
-	// every child GET, so the first GVR-only KindFor re-downloaded the
-	// full API surface per call (TRACED 2.13% of the 0.30.258 drain
-	// profile). SharedSADiscoveryClient returns a process-singleton
-	// whose mapper is built ONCE and reused warm; the discovery
-	// download is amortised to one boot download. rc here is ALWAYS the
-	// SA rest.Config (opts.RC = widgets.go:228 r.saRC on the customer
-	// /call path; phase1_walk_pagination_jobs.go:433/:579 saRC on the
-	// drain) — the singleton's identity invariant. This is the cached-
-	// mapper correction, NOT the WithSkipMapper revival: the mapper is
-	// always non-nil and populated (cached_client.go header).
-	//
-	// FALLBACK — if the singleton errors (nil rc / startup race),
-	// fall back to the per-call dynamic.NewClient so the path is never
-	// worse than today (project_cache_off_is_transparent_fallback).
-	cli, err := dynamic.SharedSADiscoveryClient(rc)
+	// MISS — #1318: the memo is shared server state, so it is refilled by ONE
+	// shared, detached fill (schema_fill.go), never under this request's page
+	// budget: a request whose budget is spent still gets the schema, and the
+	// memo refills whatever the request that happened to miss. The fill
+	// snapshots the memo generation BEFORE its CRD GET, so a CRD lifecycle reset
+	// during the GET+compile window drops its store (architect A1 fence) and
+	// the next call recompiles from fresh bytes.
+	crv, err := fillCRDSchema(ctx, rc, gvr)
 	if err != nil {
-		// Fall back LOUDLY: a systemically broken singleton would
-		// otherwise silently evaporate the caching win back to
-		// per-call discovery downloads.
-		slog.WarnContext(ctx, "schema: SA discovery singleton unavailable; "+
-			"falling back to per-call client",
-			slog.String("error", err.Error()))
-		// #1115 — this client is built for this call alone: bind the
-		// request's page budget to it (its mapper's discovery sends on
-		// client-go's own context.TODO(); background work has no budget).
-		cli, err = dynamic.NewClient(credhttp.BindRequestBudget(ctx, rc))
-		if err != nil {
-			return err
-		}
+		return err
 	}
-	crdName := fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group)
-	crdObj, err := cli.Get(ctx, crdName, dynamic.Options{
-		GVR:       crdGVR,
-		Namespace: "",
-	})
-	if err != nil {
-		return fmt.Errorf("crd schema %s: %w", crdName, err)
-	}
-	var crd map[string]any
-	if crdObj != nil {
-		crd = crdObj.UnstructuredContent()
-	} else {
-		crd = map[string]any{}
-	}
-
-	// Miss — compile the CRV (the 0.91% extract + v1->internal build) and
-	// memoise it per GVR. compileCRDSchemaFn is the package-private seam the
-	// RED/GREEN falsifier counts (per-call recompile N -> 1 with the memo);
-	// it is initialised once to extractOpenAPISchemaFromCRD and only
-	// reassigned by test code (mirrors discoveryClientForConfigFn,
-	// dynamic/cached_client.go:176).
-	crv, err := compileCRDSchemaFn(crd, gvr.Version)
-	if err != nil {
-		return fmt.Errorf("compile crd schema %s: %w", crdName, err)
-	}
-	storeCRDSchema(gvr, crv, gen)
 
 	return invalidStatus(validateCustomResource(crv, widgetData))
 }
