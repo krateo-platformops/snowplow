@@ -408,6 +408,13 @@ type ResolvedEntry struct {
 	// Written only under mu before the entry is readable; never mutated after.
 	contentVersion uint64
 
+	// digest — #1324: the memoised ContentDigest of the entry's body (Raw()),
+	// computed on first use (the first armed response that stamps
+	// X-Snowplow-Refresh-Digest, or the first /refreshes arm that compares
+	// against it) and published once (content_digest.go). A pure function of
+	// the immutable body, so every racer computes the same value.
+	digest atomic.Pointer[string]
+
 	// recentHitters — #444: the last few DISTINCT identities (username + groups,
 	// nothing else) that were served this cell on a customer hit, most recent
 	// first, at most recentHittersCap. The refresher draws a replacement

@@ -310,7 +310,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
-			setStoredStageOutcomesHeader(wri, entry) // #904
+			stampRefreshDigest(wri, entry.ContentDigest) // #1324: the cell is served verbatim
+			setStoredStageOutcomesHeader(wri, entry)     // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
 			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
@@ -808,6 +809,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.ContentDigest(encoded) }) // #1324: the stored and written bytes
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }
