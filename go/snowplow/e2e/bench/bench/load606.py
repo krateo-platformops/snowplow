@@ -1688,16 +1688,54 @@ def driver_pod_stuck(pod_list: dict, now: float, *, pending_s: float = DRIVER_PE
                         + ": a sidecar whose startupProbe never passes, or a crashing init step")
         created = _ts((p.get("metadata") or {}).get("creationTimestamp"))
         if created is not None and now - created >= pending_s:
-            sched = next((c for c in st.get("conditions") or []
-                          if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
-            waiting = [f"{cs.get('name')} {((cs.get('state') or {}).get('waiting') or {}).get('reason')}"
-                       for cs in (st.get("initContainerStatuses") or [])
-                       + (st.get("containerStatuses") or [])
-                       if (cs.get("state") or {}).get("waiting")]
+            sched = unscheduled(p)
+            waiting = _waiting(st)
             return (f"pod {name} is still Pending {int(now - created)} s after it was created"
-                    + (f" (unscheduled: {sched.get('reason')})" if sched else "")
+                    + (f" (unscheduled: {sched})" if sched else "")
                     + (f" (waiting: {', '.join(waiting)})" if waiting else ""))
     return None
+
+
+def unscheduled(pod: dict) -> str | None:
+    """Why the scheduler has not placed the pod, in its own words: its PodScheduled condition's
+    reason and message (the message is the scheduler's FailedScheduling text: "0/5 nodes are
+    available: 1 Insufficient memory, ..."; node counts and predicates, nothing of the pod's
+    program). None once scheduled, or before the scheduler said anything."""
+    c = next((c for c in (pod.get("status") or {}).get("conditions") or []
+              if c.get("type") == "PodScheduled" and c.get("status") != "True"), None)
+    if c is None:
+        return None
+    return ": ".join(x for x in (c.get("reason") or "not scheduled", (c.get("message") or "").strip()) if x)
+
+
+def _waiting(st: dict) -> list[str]:
+    """Each waiting container's name and reason (ImagePullBackOff, PodInitializing, ...): reasons only,
+    never a container's message (it can echo the program's output)."""
+    return [f"{cs.get('name')} {((cs.get('state') or {}).get('waiting') or {}).get('reason')}"
+            for cs in (st.get("initContainerStatuses") or []) + (st.get("containerStatuses") or [])
+            if (cs.get("state") or {}).get("waiting")]
+
+
+def pod_why(pod_list: dict | None, job: str) -> str:
+    """Where a Job's pod stands, as the API server says it, for a failure line: never empty. Per pod
+    its phase, the scheduler's own reason when it is not scheduled (unscheduled), each waiting
+    container's reason, the pod's own reason (Evicted, ...). No pod at all, or a listing that holds
+    none, is said as such."""
+    if not isinstance(pod_list, dict) or not isinstance(pod_list.get("items"), list):
+        return f"the pods of job {job} could not be read (no pod listing): where its pod stands is unknown"
+    if not pod_list["items"]:
+        return f"job {job} has no pod (the Job controller created none, or it was deleted)"
+    out = []
+    for p in pod_list["items"]:
+        st = p.get("status") or {}
+        sched, waiting = unscheduled(p), _waiting(st)
+        out.append(f"pod {(p.get('metadata') or {}).get('name')} {st.get('phase') or 'with no phase'}"
+                   + (f" ({st['reason']})" if st.get("reason") else "")
+                   + (f", not scheduled: {sched}" if sched else "")
+                   + (f", waiting: {', '.join(waiting)}" if waiting else "")
+                   + ("" if sched or waiting or (p.get("spec") or {}).get("nodeName")
+                      else ", the scheduler has not said why yet"))
+    return "; ".join(out)
 
 
 def job_pod_checks(recs: list[dict]) -> list[dict]:
@@ -5766,6 +5804,17 @@ def _cmd_driver_stuck(a) -> int:
     return 0
 
 
+def _cmd_pod_why(a) -> int:
+    """pod_why of `kubectl get pods -l job-name=<job> -o json` on stdin: one line, never empty."""
+    raw = sys.stdin.read()
+    try:
+        pods = json.loads(raw) if raw.strip() else None
+    except ValueError:
+        pods = None
+    print(pod_why(pods, a.job))
+    return 0
+
+
 def _cmd_pod_record(a) -> int:
     print(json.dumps(pod_record(json.loads(sys.stdin.read() or "{}"), a.phase)))
     return 0
@@ -6104,6 +6153,10 @@ def main(argv: list[str] | None = None) -> int:
     ds.add_argument("--pending-s", type=float, default=DRIVER_PENDING_S)
     ds.add_argument("--init-restarts", type=int, default=DRIVER_INIT_RESTARTS)
     ds.set_defaults(func=lambda a: _cmd_driver_stuck(a))
+    pw = sub.add_parser("pod-why", help="kubectl get pods -l job-name=<job> -o json on stdin -> where its "
+                        "pod stands (the scheduler's own reason when it is not scheduled), one line")
+    pw.add_argument("--job", required=True)
+    pw.set_defaults(func=_cmd_pod_why)
     jp = sub.add_parser("job-pod-record",
                         help="kubectl get pods -l job-name=<job> -o json on stdin -> job_pod records")
     jp.add_argument("--job", required=True)

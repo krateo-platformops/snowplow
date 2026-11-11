@@ -10,8 +10,9 @@ k6 drivers use), and the laptop applies, waits and collects.
   data606     the 50K data load, `python3 -m bench data606 ...` exactly as the laptop ran it (the same
               code, shipped; the same arguments), in a Job of its own (render_data606). Its proof
               (/out/data-proof.json) and its log are copied into the run dir as before. It requests
-              the loadgen node's whole budget but the observer's, and it runs before the measure: the
-              Job and its pod are gone before any k6 Job is applied, so the two never share the node.
+              its need (run 23's share, no limit: it may still use the whole idle node), refused when
+              the live node's room does not hold it, and it runs before the measure: the Job and its
+              pod are gone before any k6 Job is applied, so the two never share the node.
   observe606  every timed sampler the laptop ran (render_observe; one pod, one supervisor): the API
               server's APF scrape (apf), `kubectl top` of snowplow through the boot (top_boot) and the
               measure (top), and snowplow's scrubbed log stream (bench/log_stream.sh). Each is the same
@@ -44,6 +45,7 @@ import io
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -51,6 +53,7 @@ import tarfile
 import threading
 import time
 import urllib.request
+from fractions import Fraction
 from pathlib import Path
 
 __all__ = ["KUBECTL_VERSION", "KUBECTL_SHA256", "source_closure", "source_configmap", "data606_rbac",
@@ -292,26 +295,44 @@ def _namespace() -> dict:
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE, "labels": {"app": "scaletest"}}}
 
 
-# ─── data606's requests: what the LIVE loadgen node has left (review M1) ────────────────────────
+# ─── data606's requests: its NEED, gated on what the LIVE loadgen node has left (review M1) ─────
 #
-# The node's allocatable minus the requests of every pod already scheduled there (GKE's DaemonSets
-# included: run 24's loadgen node ran 7 whose requests nothing recorded) minus the observer's, when
-# it is not scheduled yet. No reserve constant: what is left is what data606 asks for (it has no CPU
-# limit, so it may still use an idle node's whole CPU). Refused below a FLOOR: what data606 had in
-# run 23, the last run whose data step met its bound, measured from that run's own records.
+# data606 requests what it needs, a constant derived below, NOT the node's remaining room. Run 24b
+# (2026-11-11, all three arms) requested the room exactly and stayed Pending on "Insufficient
+# memory": the room counted each container's memory request floored to whole MiB, and the gmp-system
+# collector's requests are decimal (32M + 4M = 34.33 MiB, counted 33), so the room it gave was 0.43
+# MiB more than the scheduler's own sum left. A request equal to the remainder has no slack by
+# definition: any difference between this arithmetic and the scheduler's, or any pod that lands on
+# the node after the read (a DaemonSet pod, a CronJob's: bench-self-destruct runs there every 10
+# min), makes it unschedulable. Asking for the room buys nothing either: requests do not cap use
+# (data606 has no CPU or memory limit, so it still uses an idle node's whole CPU and memory), and
+# nothing contends for the node during the data step (the k6 drivers come after data606's pod is
+# gone; the observer is limited to OBSERVE_CPU_LIMIT). So the request is the need, which does not
+# depend on the read at all, and the read only gates: the room must hold the need, refused with the
+# numbers otherwise. The room minus the need is the slack (recorded): only a pod landing after the
+# read that requests more than that could still keep data606 Pending, and then its failure line
+# carries the scheduler's own reason (run606 incluster_started, load606.pod_why).
 #
-# RUN23_DATA606: run 23 ran data606 on the operator's laptop, three arms at once. Its 50K phases
-# ("Deploying 50000 compositions" to "Deployed 50000/50000" in each arm's console, local time,
-# ~/.local/share/snowplow-bench/runs/606/pair-snowplow-bench-run23r-…-run23n2-c7c87a3d/{R,N1,N2}.console)
-# overlapped three deep from 23:20:27 to 23:22:27; the laptop has 8 CPUs and 24 GiB (sysctl hw.ncpu,
-# hw.memsize: the same laptop, run 24's diagnosis). So every arm finished its 50K load with at most
-# a third of each, and N1 entirely under that share or a half: that share is the floor. It is an upper
-# bound of what run 23's data606 had (the laptop ran more than data606), so a node below it holds
-# less than anything a data step was ever proven on; one above it is not proven fast, only not less.
+# The room is the node's allocatable minus what the scheduler counts against it (pod_requests,
+# scheduler_counts): every pod bound to the node and not finished, a terminating one included (the
+# scheduler frees its requests only once it is deleted), in exact quantities (bytes and millicores,
+# each rounded up as the scheduler's Quantity.Value / MilliValue does), minus the observer's when it
+# is not there yet.
+#
+# The NEED: what data606 had in run 23, the last run whose data step met its bound, measured from
+# that run's own records (RUN23_DATA606). Run 23 ran data606 on the operator's laptop, three arms at
+# once. Its 50K phases ("Deploying 50000 compositions" to "Deployed 50000/50000" in each arm's console,
+# local time, ~/.local/share/snowplow-bench/runs/606/pair-snowplow-bench-run23r-…-run23n2-c7c87a3d/
+# {R,N1,N2}.console) overlapped three deep from 23:20:27 to 23:22:27; the laptop has 8 CPUs and 24
+# GiB (sysctl hw.ncpu, hw.memsize: the same laptop, run 24's diagnosis). So every arm finished its
+# 50K load with at most a third of each, and N1 entirely under that share or a half: that share is
+# proven enough. It is an upper bound of what run 23's data606 had (the laptop ran more than
+# data606); a node whose room is below it holds less than anything a data step was ever proven on.
 RUN23_DATA606 = {
     "host_cpus": 8, "host_memory_bytes": 25769803776,
     "phases_50k": {"R": ("23:12:21", "23:22:27"), "N1": ("23:13:40", "23:22:47"), "N2": ("23:20:27", "23:28:33")},
 }
+MIB = 1 << 20
 
 
 def _hms(s: str) -> int:
@@ -331,49 +352,94 @@ def max_overlap(phases: dict) -> int:
 
 
 def data606_floor(rec: dict = RUN23_DATA606) -> tuple[int, int]:
-    """(cpu_m, memory_mi): the share of the host each run-23 arm had at the most overlap."""
+    """(cpu_m, memory_mi): the share of the host each run-23 arm had at the most overlap: data606's
+    need (what it requests) and so the room's floor."""
     n = max_overlap(rec["phases_50k"])
     return -(-rec["host_cpus"] * 1000 // n), -(-(rec["host_memory_bytes"] >> 20) // n)
 
 
-_MEM = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 ** 2, "k": 1000 / 2 ** 20, "M": 10 ** 6 / 2 ** 20,
-        "G": 10 ** 9 / 2 ** 20, "T": 10 ** 12 / 2 ** 20}
+# Kubernetes quantities, exactly (k8s.io/apimachinery resource.Quantity): a decimal number, an
+# optional exponent, a binary (Ki..Ei) or decimal (n..E) suffix
+_BIN = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40, "Pi": 2 ** 50, "Ei": 2 ** 60}
+_DEC = {"n": Fraction(1, 10 ** 9), "u": Fraction(1, 10 ** 6), "m": Fraction(1, 1000), "": Fraction(1),
+        "k": Fraction(10 ** 3), "M": Fraction(10 ** 6), "G": Fraction(10 ** 9), "T": Fraction(10 ** 12),
+        "P": Fraction(10 ** 15), "E": Fraction(10 ** 18)}
+_QTY = re.compile(r"([+-]?(?:\d+\.?\d*|\.\d+))(?:[eE]([+-]?\d+))?(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E|)")
+
+
+def quantity(q) -> Fraction:
+    """A quantity's exact value (ValueError when it is not one)."""
+    m = _QTY.fullmatch(str(q).strip())
+    if not m:
+        raise ValueError(f"not a Kubernetes quantity: {q!r}")
+    num, exp, suf = m.groups()
+    v = Fraction(num) * (Fraction(10) ** int(exp) if exp else 1)
+    return v * (_BIN[suf] if suf in _BIN else _DEC[suf])
+
+
+def _ceil(v: Fraction) -> int:
+    return -((-v.numerator) // v.denominator)
 
 
 def cpu_m(q) -> int:
-    q = str(q or "0")
-    return int(q[:-1]) if q.endswith("m") else int(round(float(q) * 1000))
+    """Millicores, rounded up (the scheduler's Quantity.MilliValue)."""
+    return _ceil(quantity(q or "0") * 1000)
+
+
+def mem_bytes(q) -> int:
+    """Bytes, rounded up (the scheduler's Quantity.Value)."""
+    return _ceil(quantity(q or "0"))
 
 
 def mem_mi(q) -> int:
-    q = str(q or "0")
-    for suf in sorted(_MEM, key=len, reverse=True):
-        if q.endswith(suf):
-            return int(float(q[:-len(suf)]) * _MEM[suf])
-    return int(float(q)) >> 20
+    """Whole MiB, rounded DOWN: for a capacity (what is left never reads larger than it is)."""
+    return mem_bytes(q) // MIB
 
 
 def pod_requests(pod: dict) -> tuple[int, int]:
-    """A pod's effective requests, as the scheduler counts them: the larger of its containers'
-    sum and its largest init container, plus its overhead."""
+    """A pod's effective (cpu millicores, memory bytes), as the scheduler counts them
+    (k8s.io/component-helpers resource.PodRequests): its containers' sum plus its restartable init
+    containers' (native sidecars, which run beside them), or more when an init container needs more
+    while it runs (itself plus the sidecars started before it); pod-level requests
+    (spec.resources.requests) in place of the containers' where the pod sets them; plus its
+    overhead."""
     spec = pod.get("spec") or {}
-
-    def req(c, f):
-        return f(((c.get("resources") or {}).get("requests") or {}).get("cpu" if f is cpu_m else "memory"))
-
     out = []
-    for f in (cpu_m, mem_mi):
-        main = sum(req(c, f) for c in spec.get("containers") or [])
-        init = max((req(c, f) for c in spec.get("initContainers") or []), default=0)
-        over = f((spec.get("overhead") or {}).get("cpu" if f is cpu_m else "memory"))
-        out.append(max(main, init) + over)
+    for key, f in (("cpu", cpu_m), ("memory", mem_bytes)):
+        def req(c):
+            return f(((c.get("resources") or {}).get("requests") or {}).get(key))
+        total = sum(req(c) for c in spec.get("containers") or [])
+        sidecars = init_peak = 0
+        for c in spec.get("initContainers") or []:
+            if c.get("restartPolicy") == "Always":
+                total += req(c)
+                sidecars += req(c)
+                init_peak = max(init_peak, sidecars)
+            else:
+                init_peak = max(init_peak, req(c) + sidecars)
+        pod_level = ((spec.get("resources") or {}).get("requests") or {}).get(key)
+        eff = f(pod_level) if pod_level is not None else max(total, init_peak)
+        out.append(eff + f((spec.get("overhead") or {}).get(key)))
     return out[0], out[1]
+
+
+def scheduler_counts(pod: dict) -> bool:
+    """Whether the scheduler counts the pod's requests against its node: every pod bound there that
+    has not finished. A terminating pod (deletionTimestamp) still counts, until it is deleted."""
+    return (pod.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
+
+
+def _mib(b: int) -> str:
+    """Bytes as MiB, to 1/100 (a decimal-unit request is not a whole MiB)."""
+    return f"{b / MIB:.2f}".rstrip("0").rstrip(".")
 
 
 def loadgen_room(nodes: dict, pods: dict, floor: tuple[int, int] | None = None) -> dict:
     """The loadgen node's room for data606, from the live node list (-l the loadgen pool) and every
-    pod scheduled on it: allocatable minus their requests (the ones still running) minus the
-    observer's when it is not among them. ok when both are at least the floor."""
+    pod scheduled on it: allocatable minus what the scheduler counts against it (scheduler_counts,
+    pod_requests) minus the observer's when it is not among them. ok when the room holds data606's
+    need (`floor`, default data606_floor()); `request_*` is what data606 then asks for (the need, never
+    the room), `slack_*` what is left beside it."""
     floor = data606_floor() if floor is None else floor
     items = nodes.get("items") if "items" in nodes else [nodes]
     rec = {"kind": "loadgen_room", "t": round(time.time(), 3), "floor_cpu_m": floor[0], "floor_memory_mi": floor[1],
@@ -382,44 +448,52 @@ def loadgen_room(nodes: dict, pods: dict, floor: tuple[int, int] | None = None) 
         return {**rec, "ok": False, "why": f"{len(items or [])} node(s) in the loadgen pool, want 1"}
     node = items[0]
     alloc = (node.get("status") or {}).get("allocatable") or {}
-    live = [p for p in pods.get("items") or []
-            if (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
-            and not (p.get("metadata") or {}).get("deletionTimestamp")]
-    scheduled = [{"namespace": p["metadata"].get("namespace"), "pod": p["metadata"].get("name"),
-                  "cpu_m": pod_requests(p)[0], "memory_mi": pod_requests(p)[1]} for p in live]
+    live = [p for p in pods.get("items") or [] if scheduler_counts(p)]
+    scheduled = []
+    for p in live:
+        c, m = pod_requests(p)
+        scheduled.append({"namespace": p["metadata"].get("namespace"), "pod": p["metadata"].get("name"),
+                          "cpu_m": c, "memory_bytes": m,
+                          **({"terminating": True} if (p.get("metadata") or {}).get("deletionTimestamp") else {})})
     observer_there = any(((p.get("metadata") or {}).get("labels") or {}).get("job-name") == OBSERVE_JOB for p in live)
-    obs = (0, 0) if observer_there else (cpu_m(OBSERVE_CPU), mem_mi(OBSERVE_MEMORY))
-    cpu = cpu_m(alloc.get("cpu")) - sum(s["cpu_m"] for s in scheduled) - obs[0]
-    mem = mem_mi(alloc.get("memory")) - sum(s["memory_mi"] for s in scheduled) - obs[1]
+    obs = (0, 0) if observer_there else (cpu_m(OBSERVE_CPU), mem_bytes(OBSERVE_MEMORY))
+    used_cpu, used_mem = sum(s["cpu_m"] for s in scheduled), sum(s["memory_bytes"] for s in scheduled)
+    cpu = cpu_m(alloc.get("cpu")) - used_cpu - obs[0]
+    mem_b = mem_bytes(alloc.get("memory")) - used_mem - obs[1]
+    mem = mem_b // MIB
     rec.update({"node": node["metadata"]["name"], "allocatable": {"cpu": alloc.get("cpu"), "memory": alloc.get("memory")},
                 "scheduled": scheduled, "observer_counted": "scheduled" if observer_there else "to come",
-                "cpu_m": cpu, "memory_mi": mem})
-    short = ([f"cpu {cpu}m < floor {floor[0]}m"] if cpu < floor[0] else []) \
-        + ([f"memory {mem}Mi < floor {floor[1]}Mi"] if mem < floor[1] else [])
+                "cpu_m": cpu, "memory_bytes": mem_b, "memory_mi": mem,
+                "request_cpu_m": floor[0], "request_memory_mi": floor[1],
+                "slack_cpu_m": cpu - floor[0], "slack_memory_mi": (mem_b - floor[1] * MIB) // MIB})
+    terminating = sum(1 for s in scheduled if s.get("terminating"))
+    counted = (f"allocatable {alloc.get('cpu')} / {alloc.get('memory')} minus {len(scheduled)} scheduled pod(s) "
+               f"requesting {used_cpu}m / {_mib(used_mem)}Mi"
+               + (f" ({terminating} of them terminating)" if terminating else "")
+               + f" minus the observer's to come {obs[0]}m / {_mib(obs[1])}Mi")
+    short = ([f"cpu {cpu}m < its need {floor[0]}m"] if cpu < floor[0] else []) \
+        + ([f"memory {mem}Mi < its need {floor[1]}Mi"] if mem_b < floor[1] * MIB else [])
     if short:
         return {**rec, "ok": False, "why": (f"the loadgen node {rec['node']} leaves data606 too little: "
-                                            + ", ".join(short) + f" (allocatable {alloc.get('cpu')} / "
-                                            f"{alloc.get('memory')}, {len(scheduled)} pod(s) already requesting "
-                                            f"{sum(s['cpu_m'] for s in scheduled)}m / "
-                                            f"{sum(s['memory_mi'] for s in scheduled)}Mi, the observer's "
-                                            f"{obs[0]}m / {obs[1]}Mi to come)")}
-    return {**rec, "ok": True, "why": (f"data606 may request {cpu}m / {mem}Mi on {rec['node']} (allocatable "
-                                       f"{alloc.get('cpu')} / {alloc.get('memory')} minus {len(scheduled)} scheduled "
-                                       f"pod(s) minus the observer's to come {obs[0]}m; floor {floor[0]}m / "
-                                       f"{floor[1]}Mi from run 23)")}
+                                            + ", ".join(short) + f" ({counted}; its need: run 23's share)")}
+    return {**rec, "ok": True, "why": (f"data606 requests its need {floor[0]}m / {floor[1]}Mi (run 23's share) on "
+                                       f"{rec['node']}, whose room is {cpu}m / {mem}Mi ({counted}): "
+                                       f"{rec['slack_cpu_m']}m / {rec['slack_memory_mi']}Mi of slack beside it")}
 
 
 def data606_requests(room: dict) -> tuple[str, str]:
-    """data606's (cpu, memory) requests: the room loadgen_room found (refused when not ok)."""
+    """data606's (cpu, memory) requests: its need, once loadgen_room found the room holds it (refused
+    when not ok). Never the room itself (the section's comment says why)."""
     if not room.get("ok"):
         raise ValueError(room.get("why") or "no room on the loadgen node")
-    return f"{room['cpu_m']}m", f"{room['memory_mi']}Mi"
+    return f"{room['request_cpu_m']}m", f"{room['request_memory_mi']}Mi"
 
 
 def render_data606(*, context: str, timeout_s: int, linger_s: int, room: dict,
                    data_args: list[str]) -> list[dict]:
     """The data606 Job: `python3 -m bench data606 <data_args>` bounded by timeout_s, under its own
-    ServiceAccount, on the loadgen node, requesting what the live node has left (`room`). Its pod
+    ServiceAccount, on the loadgen node, requesting its need once the live node's room holds it
+    (`room`, data606_requests). Its pod
     turns Ready once /out/done holds data606's exit code, and stays up (at most linger_s) for run606
     to copy /out."""
     cpu, mem = data606_requests(room)
