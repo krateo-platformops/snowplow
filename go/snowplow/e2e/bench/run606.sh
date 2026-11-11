@@ -1578,25 +1578,38 @@ s_digest() {
   # snowplow pod; the record (expected, every pod's imageID and digest) is
   # kept in $OUT/image-digest.jsonl and fed to the verdict. Run 26: with
   # FRONTEND_TAG, the same gate over every live frontend pod against
-  # EXPECTED_FRONTEND_DIGEST ($OUT/frontend-digest.jsonl), before any load too.
+  # EXPECTED_FRONTEND_DIGEST ($OUT/frontend-digest.jsonl), before any load too,
+  # once its rollout is complete (a pod still Pending is not judged). The whole
+  # step is bounded by DIGEST_SETTLE_S, its share of the run budget.
+  local deadline=$(( $(date +%s) + DIGEST_SETTLE_S ))
   digest_gate snowplow "$SNOWPLOW_POD_SELECTOR" "$EXPECTED_IMAGE_DIGEST" image_digest "$OUT/image-digest.jsonl" \
-    || return 1
-  [[ -z "$FRONTEND_TAG" ]] \
-    || digest_gate frontend "$FRONTEND_POD_SELECTOR" "$EXPECTED_FRONTEND_DIGEST" frontend_image_digest \
-         "$OUT/frontend-digest.jsonl"
+    "$deadline" || return 1
+  [[ -n "$FRONTEND_TAG" ]] || return 0
+  local left=$(( deadline - $(date +%s) ))
+  if (( left < 1 )); then
+    log "FAILED: the digest step's ${DIGEST_SETTLE_S}s bound is spent before the frontend's rollout could be read; no load is applied"
+    return 1
+  fi
+  if ! run "${K[@]}" -n krateo-system rollout status deploy/frontend --timeout="${left}s"; then
+    log "FAILED: the frontend's rollout did not complete within the digest step's ${DIGEST_SETTLE_S}s bound; no load is applied"
+    return 1
+  fi
+  digest_gate frontend "$FRONTEND_POD_SELECTOR" "$EXPECTED_FRONTEND_DIGEST" frontend_image_digest \
+    "$OUT/frontend-digest.jsonl" "$deadline"
 }
-# digest_gate <what> <pod selector> <expected digest> <record kind> <record file>
+# digest_gate <what> <pod selector> <expected digest> <record kind> <record file> <deadline (epoch s)>
 digest_gate() {
-  local what="$1" sel="$2" expected="$3" kind="$4" rec="$5"
+  local what="$1" sel="$2" expected="$3" kind="$4" rec="$5" deadline="$6"
   if [[ "$DRY" == "1" ]]; then
     log "DRY: ${what} pods imageID == $expected (else VOID)"
     return 0
   fi
   # `rollout status` returns once the old ReplicaSet reports 0 replicas, while
-  # its pod may still be Terminating: wait (bounded) until no such pod has
-  # a deletionTimestamp, so neither this gate nor the before-record can read
-  # a leftover. A leftover that never clears fails the step, by name.
-  local rc deadline=$(( $(date +%s) + DIGEST_SETTLE_S ))
+  # its pod may still be Terminating: wait (bounded, by the step's deadline)
+  # until no such pod has a deletionTimestamp, so neither this gate nor the
+  # before-record can read a leftover. A leftover that never clears fails the
+  # step, by name.
+  local rc
   while true; do
     rc=0
     "${K[@]}" -n krateo-system get pods -l "$sel" -o json \

@@ -288,6 +288,11 @@ def test_run606_a_frontend_on_another_digest_aborts_void_before_any_load(harness
     assert any(i["image"] == f"ghcr.io/krateo-platformops/frontend:{FTAG}" for i in pf["images"])
 
 
+def _sub(argv, words):
+    """`words` appear in kubectl's argv in order, contiguous (its --kubeconfig / --context / -n aside)."""
+    return any(argv[i:i + len(words)] == words for i in range(len(argv)))
+
+
 def test_run606_a_matching_frontend_is_recorded_in_the_verdict(harness):  # noqa: F811
     env, state, ambient, tmp = harness
     env = dict(_fenv(env), FAKE_FRONTEND_DIGEST=FD)
@@ -300,6 +305,43 @@ def test_run606_a_matching_frontend_is_recorded_in_the_verdict(harness):  # noqa
     assert c["result"] == "PASS" and c["value"] == FD
     fi = v["report"]["frontend_image"]
     assert fi["override_tag"] == FTAG and fi["expected"] == FD and fi["observed"] == [FD]
+    # the gate judges the frontend's pods only once its rollout is complete, within the step's bound
+    kc = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"]
+    ro = [i for i, a in enumerate(kc) if _sub(a, ["rollout", "status", "deploy/frontend"])]
+    gp = [i for i, a in enumerate(kc) if _sub(a, ["get", "pods"]) and "app.kubernetes.io/name=frontend" in a]
+    assert len(ro) == 1 and gp and ro[0] < gp[0], (ro, gp)
+    t = next(x for x in kc[ro[0]] if x.startswith("--timeout="))
+    assert 0 < int(t[len("--timeout="):-1]) <= int(env.get("DIGEST_SETTLE_S", "300"))
+
+
+def test_run606_a_frontend_rollout_that_does_not_complete_is_never_judged(harness):  # noqa: F811
+    """A frontend pod still Pending is not read by the gate (a false VOID would waste a paid run): the
+    step fails on the rollout, by name, before any load."""
+    env, state, ambient, tmp = harness
+    env = dict(_fenv(env), FAKE_FRONTEND_DIGEST=FD, FAKE_FRONTEND_ROLLOUT_FAIL="1")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=300)
+    assert p.returncode != 0
+    assert f"image digest MATCH: every live snowplow pod runs {FAKE_DIGEST}" in p.stderr
+    assert "FAILED: the frontend's rollout did not complete within the digest step's" in p.stderr
+    assert "=== step measure ===" not in p.stderr
+    assert not (tmp / "out" / "frontend-digest.jsonl").exists()        # never judged
+    assert not (state / "frontend_pod_reads").exists()
+    applied = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl" and c["argv"][:1] == ["apply"]]
+    assert not any("loadgen-job.yaml" in " ".join(a) for a in applied)
+
+
+def test_run606_without_an_override_reads_no_frontend_rollout(harness):  # noqa: F811
+    env, state, ambient, tmp = harness
+    env = _env483(env)
+    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1", FAKE_FRONTEND_PIN="1")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    kc = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"]
+    assert not any(_sub(a, ["rollout", "status", "deploy/frontend"]) for a in kc)
+    assert not any(_sub(a, ["get", "pods"]) and "app.kubernetes.io/name=frontend" in a for a in kc)
+    assert any(_sub(a, ["get", "pods"]) and "app.kubernetes.io/name=snowplow" in a for a in kc)   # the instrument works
+    assert not (tmp / "out" / "frontend-digest.jsonl").exists()
+    assert "frontend_image" not in json.loads((tmp / "out" / "verdict.json").read_text())["report"]
 
 
 # ─── run606_pair.sh ─────────────────────────────────────────────────────────

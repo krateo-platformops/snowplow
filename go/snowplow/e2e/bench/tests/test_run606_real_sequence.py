@@ -673,6 +673,10 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
+    if a[:3] == ["rollout", "status", "deploy/frontend"] and os.environ.get("FAKE_FRONTEND_ROLLOUT_FAIL") == "1":
+        # run 26: the frontend's rollout never completes (a pod still Pending)
+        print('error: timed out waiting for the condition', file=sys.stderr)
+        sys.exit(1)
     if (a[:2] == ["get", "pods"] and "app.kubernetes.io/name=frontend" in a and "json" in a
             and os.environ.get("FAKE_FRONTEND_DIGEST")):
         # run 26: the frontend's pod, its imageID at FAKE_FRONTEND_DIGEST (FRONTEND_TAG runs)
