@@ -4,6 +4,8 @@ package credhttp
 
 import (
 	"net/http"
+	"strings"
+	"syscall/js"
 
 	"k8s.io/client-go/transport"
 )
@@ -14,9 +16,25 @@ import (
 // credential and Impersonate-* round trippers, the redirect refusal, the
 // budget and the counters. Only the connection changes hands. The package doc
 // says which policies that leaves to the browser.
-var BrowserEgress transport.WrapperFunc = func(http.RoundTripper) http.RoundTripper {
+//
+// Where net/http does not use fetch (usesFetch), it is the identity: the
+// transport it wraps dials as on a server build.
+var BrowserEgress transport.WrapperFunc = func(rt http.RoundTripper) http.RoundTripper {
+	if !usesFetch {
+		return rt
+	}
 	return browserFetch{next: fetchTransport}
 }
+
+// usesFetch mirrors net/http's own choice on js/wasm (net/http/roundtrip_js.go,
+// jsFetchMissing and jsFetchDisabled): fetch is used when the global fetch
+// exists and the program is not running under Node.js, whose argv0 starts
+// with "node". Under Node, net/http dials Go's in-process network instead, and
+// it refuses the js.fetch: option headers as invalid field names, so replacing
+// the transport there would break every request rather than reroute it.
+var usesFetch = !js.Global().Get("fetch").IsUndefined() &&
+	!(js.Global().Get("process").Type() == js.TypeObject &&
+		strings.HasPrefix(js.Global().Get("process").Get("argv0").String(), "node"))
 
 // fetchTransport is net/http's Fetch API transport: on js/wasm an
 // http.Transport with no dial function of its own takes the fetch path
