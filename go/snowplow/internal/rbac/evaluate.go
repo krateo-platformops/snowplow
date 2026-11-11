@@ -500,6 +500,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 // the first matching subject wins).
 func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) WinningSubjectClass {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	implicit := implicitGroup(opts)
 	for _, s := range subjects {
 		switch s.Kind {
 		case rbacv1.UserKind:
@@ -520,9 +521,9 @@ func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) Win
 			if isSA && (s.Name == allServiceAccountsGroup || s.Name == serviceAccountsNamespacePfx+saNS) {
 				return SubjectClassImplicitGroup
 			}
-			// system:authenticated is an IMPLICIT group for every authenticated
-			// request (mirrors anySubjectMatches' username-gated branch).
-			if s.Name == "system:authenticated" && opts.Username != "" {
+			// The apiserver's implicit group (implicitGroup — mirrors
+			// anySubjectMatches' branch) is an IMPLICIT match.
+			if implicit != "" && s.Name == implicit {
 				return SubjectClassImplicitGroup
 			}
 		case rbacv1.ServiceAccountKind:
@@ -578,10 +579,10 @@ func sortRBsStable(rbs []*rbacv1.RoleBinding) {
 //     effectiveGroups adds the synthetic system:serviceaccounts groups
 //     for SA identities, evaluate.go:451-462 — REUSED here so the index
 //     and the matcher agree on group expansion)
-//  3. CRBsByGroup["system:authenticated"]                (implicit group;
-//     mirrors anySubjectMatches' s.Name == "system:authenticated" branch.
-//     The matcher requires opts.Username != "", so we only include this
-//     index landing when the request is authenticated.)
+//  3. CRBsByGroup[implicitGroup(opts)]                   (the apiserver's
+//     implicit group — system:authenticated for an authenticated request;
+//     none for an empty username or one presenting system:unauthenticated,
+//     #1334. Same predicate as anySubjectMatches' implicit branch.)
 //  4. CRBsByServiceAccount["<ns>/<name>"]                (SA subjects;
 //     only when opts.Username is a canonical SA)
 //  5. CRBsCatchAll                                        (unrecognised
@@ -628,12 +629,12 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 	for _, g := range groups {
 		add(snap.CRBsByGroup[g])
 	}
-	// system:authenticated is implicit for every authenticated request.
-	// anySubjectMatches gates this on opts.Username != "" — mirror that
-	// here so we don't include the implicit-group landing for an empty
-	// (unauthenticated) identity.
-	if opts.Username != "" {
-		add(snap.CRBsByGroup["system:authenticated"])
+	// The apiserver's implicit group (implicitGroup: system:authenticated
+	// for an authenticated request, none for an empty username or one
+	// presenting system:unauthenticated, #1334) — the SAME predicate
+	// anySubjectMatches uses, so the index landing and the matcher agree.
+	if ig := implicitGroup(opts); ig != "" {
+		add(snap.CRBsByGroup[ig])
 	}
 	if isSA {
 		add(snap.CRBsByServiceAccount[saNS+"/"+saName])
@@ -697,10 +698,10 @@ func routeRBSubjects(
 	for _, g := range groups {
 		add(byGroup[g])
 	}
-	// system:authenticated is implicit for every authenticated request;
-	// mirror anySubjectMatches by gating it on a non-empty username.
-	if opts.Username != "" {
-		add(byGroup["system:authenticated"])
+	// The apiserver's implicit group — the same implicitGroup predicate
+	// anySubjectMatches uses (#1334).
+	if ig := implicitGroup(opts); ig != "" {
+		add(byGroup[ig])
 	}
 	if isSA {
 		add(byServiceAccount[saNS+"/"+saName])
@@ -967,6 +968,7 @@ func stringSliceMatches(allowed []string, want string) bool {
 func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
 	groups := effectiveGroups(opts, isSA, saNS)
+	implicit := implicitGroup(opts)
 
 	for _, s := range subjects {
 		switch s.Kind {
@@ -980,10 +982,11 @@ func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 					return true
 				}
 			}
-			// Every authenticated request gains the
-			// system:authenticated group implicitly (Kubernetes
-			// auth chain).
-			if s.Name == "system:authenticated" && opts.Username != "" {
+			// The apiserver's implicit group (system:authenticated
+			// for an authenticated request, none for one presenting
+			// system:unauthenticated, #1334). Username=="" is "no
+			// requester": no implicit group.
+			if implicit != "" && s.Name == implicit {
 				return true
 			}
 		case rbacv1.ServiceAccountKind:
@@ -1001,6 +1004,23 @@ const (
 	allServiceAccountsGroup     = "system:serviceaccounts"
 	serviceAccountsNamespacePfx = "system:serviceaccounts:"
 )
+
+// implicitGroup is the group the kube-apiserver adds to opts' requester
+// (cache.ImplicitGroup: system:authenticated unless the user is
+// system:anonymous or the groups already name system:authenticated or
+// system:unauthenticated; system:unauthenticated for system:anonymous), or ""
+// for none. Username=="" is "no requester" and gets none — the prewarm group
+// representative carries system:authenticated as a presented group instead
+// (WithAuthenticatedGroup). The ONE place the evaluator decides that a
+// requester is authenticated (#1334): anySubjectMatches, firstMatchSubjectClass
+// and both candidate selectors read it, so the index route and the matcher
+// cannot disagree.
+func implicitGroup(opts EvaluateOptions) string {
+	if opts.Username == "" {
+		return ""
+	}
+	return cache.ImplicitGroup(opts.Username, opts.Groups)
+}
 
 // effectiveGroups returns the group set used for Group-subject matching.
 // It is opts.Groups plus, when the request identity is a canonical

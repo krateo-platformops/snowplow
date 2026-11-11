@@ -637,11 +637,13 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		// non-empty username; without the explicit group the seeded body would
 		// lack every grant a real member gets through system:authenticated —
 		// a NARROWER body under the very key that member derives (the binding-set
-		// digest always counts system:authenticated). Every real /call is
-		// authenticated, so this is the member's effective group set.
+		// digest counts the apiserver's implicit group). WithAuthenticatedGroup
+		// is the apiserver's rule (#1334), so this is the member's effective
+		// group set — system:authenticated for an authenticated cohort, none for
+		// a cohort presenting system:unauthenticated.
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: cohort.Username,
-			Groups:   rbac.WithAuthenticatedGroup(cohort.Groups),
+			Groups:   rbac.WithAuthenticatedGroup(cohort.Username, cohort.Groups),
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)

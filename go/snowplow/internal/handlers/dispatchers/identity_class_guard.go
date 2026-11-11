@@ -206,7 +206,7 @@ func repickRepresentative(ctx context.Context, inputs *cache.ResolvedKeyInputs, 
 	if inputs == nil {
 		return "", nil, "", false
 	}
-	g := rbac.WithAuthenticatedGroup(inputs.RepresentativeGroups)
+	g := rbac.WithAuthenticatedGroup("", inputs.RepresentativeGroups)
 	if identityClassDrift(ctx, inputs, "", g) == "" {
 		return "", g, repSourceGroup, true
 	}

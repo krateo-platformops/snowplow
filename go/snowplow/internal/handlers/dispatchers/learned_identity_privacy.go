@@ -31,9 +31,13 @@ import (
 // learnedRedactionTokens returns the strings a learned class's logs must never
 // carry: the username, both of its credential Secret names (the DNS-1123 forms
 // authn writes: the session `-clientconfig` and, #994, the step-up
-// `-clientconfig-stepup`) and every group except system:authenticated (a
-// constant every identity carries, not an identity fact). Longest first, so a
-// token that contains another is replaced whole.
+// `-clientconfig-stepup`) and every group except system:authenticated (an
+// apiserver-defined constant name, not an identity fact). #1334: not every
+// identity carries it any more (one presenting system:unauthenticated does
+// not), but the exemption never depended on that — it only keeps a Kubernetes
+// constant readable in logs. system:unauthenticated is NOT exempted, so it is
+// redacted like any other group (over-redaction is the safe direction).
+// Longest first, so a token that contains another is replaced whole.
 func learnedRedactionTokens(username string, groups []string) []string {
 	seen := map[string]struct{}{}
 	var out []string

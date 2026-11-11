@@ -16,13 +16,19 @@
 //
 // Scope: User / Group / ServiceAccount subjects, ClusterRoleBindings,
 // RoleBindings to a Role or a ClusterRole, the "*" wildcards, the implicit
-// system:authenticated group. Aggregated ClusterRoles and non-resource URLs
+// system:authenticated group as the apiserver's own group adder decides it
+// (requestGroups). Aggregated ClusterRoles and non-resource URLs
 // are out of scope (no #1046 arm uses them).
 package k8sauthz
 
 import (
+	"net/http"
+
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/group"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
 // Attributes are the authorization attributes of one resource request, as the
@@ -86,9 +92,27 @@ func RequestName(verb, name string) string {
 	}
 }
 
+// requestGroups is the group set the apiserver's authorizer sees for a request
+// authenticated as (user, groups). It is not modelled: it runs the apiserver's
+// own k8s.io/apiserver/pkg/authentication/group.AuthenticatedGroupAdder, which
+// adds system:authenticated unless the user is system:anonymous or the groups
+// already hold system:authenticated or system:unauthenticated (#1334). Before
+// #1334 this model appended system:authenticated unconditionally — the same
+// mistake as the evaluator it judges, so it could not have caught it.
+func requestGroups(user string, groups []string) []string {
+	inner := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
+		return &authenticator.Response{User: &kuser.DefaultInfo{Name: user, Groups: append([]string(nil), groups...)}}, true, nil
+	})
+	resp, ok, err := group.NewAuthenticatedGroupAdder(inner).AuthenticateRequest(&http.Request{})
+	if err != nil || !ok {
+		return append([]string(nil), groups...)
+	}
+	return resp.User.GetGroups()
+}
+
 // Allowed reports whether Kubernetes RBAC allows attr.
 func (a *Authorizer) Allowed(attr Attributes) bool {
-	groups := append(append([]string(nil), attr.Groups...), "system:authenticated")
+	groups := requestGroups(attr.User, attr.Groups)
 	for _, b := range a.crbs {
 		if !subjectsMatch(b.Subjects, attr.User, groups, "") {
 			continue

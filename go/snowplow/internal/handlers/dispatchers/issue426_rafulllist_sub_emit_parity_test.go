@@ -195,14 +195,14 @@ func i426MoveSubGen(t *testing.T, dyn *dynamicfake.FakeDynamicClient) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cache.RBACSubGenForSubject(i426User, rbac.WithAuthenticatedGroup(i426Groups())) != 0 &&
+		if cache.RBACSubGenForSubject(i426User, rbac.WithAuthenticatedGroup(i426User, i426Groups())) != 0 &&
 			rbac.SubjectBindingSetDigest(i426User, i426Groups()) != before {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("PRE: the RoleBinding never moved alice's RBACSubGen and binding set (subgen=%d digestMoved=%v allowedOther=%v)",
-		cache.RBACSubGenForSubject(i426User, rbac.WithAuthenticatedGroup(i426Groups())),
+		cache.RBACSubGenForSubject(i426User, rbac.WithAuthenticatedGroup(i426User, i426Groups())),
 		rbac.SubjectBindingSetDigest(i426User, i426Groups()) != before, func() bool {
 			ok, _, _ := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{Username: i426User, Verb: "get",
 				Group: "templates.krateo.io", Resource: "restactions", Namespace: i426OtherNS, Name: "z"})
