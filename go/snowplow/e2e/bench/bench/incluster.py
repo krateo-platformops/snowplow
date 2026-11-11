@@ -407,7 +407,7 @@ def pod_requests(pod: dict) -> tuple[int, int]:
     out = []
     for key, f in (("cpu", cpu_m), ("memory", mem_bytes)):
         def req(c):
-            return f(((c.get("resources") or {}).get("requests") or {}).get(key))
+            return _read_q(f, ((c.get("resources") or {}).get("requests") or {}).get(key), f"{key} request")
         total = sum(req(c) for c in spec.get("containers") or [])
         sidecars = init_peak = 0
         for c in spec.get("initContainers") or []:
@@ -418,9 +418,17 @@ def pod_requests(pod: dict) -> tuple[int, int]:
             else:
                 init_peak = max(init_peak, req(c) + sidecars)
         pod_level = ((spec.get("resources") or {}).get("requests") or {}).get(key)
-        eff = f(pod_level) if pod_level is not None else max(total, init_peak)
-        out.append(eff + f((spec.get("overhead") or {}).get(key)))
+        eff = _read_q(f, pod_level, f"pod-level {key} request") if pod_level is not None else max(total, init_peak)
+        out.append(eff + _read_q(f, (spec.get("overhead") or {}).get(key), f"{key} overhead"))
     return out[0], out[1]
+
+
+def _read_q(f, q, what: str) -> int:
+    """f(q), or ValueError naming what the quantity is and its text."""
+    try:
+        return f(q)
+    except ValueError:
+        raise ValueError(f"its {what} {q!r} is not a Kubernetes quantity") from None
 
 
 def scheduler_counts(pod: dict) -> bool:
@@ -450,16 +458,25 @@ def loadgen_room(nodes: dict, pods: dict, floor: tuple[int, int] | None = None) 
     alloc = (node.get("status") or {}).get("allocatable") or {}
     live = [p for p in pods.get("items") or [] if scheduler_counts(p)]
     scheduled = []
+    try:                    # review #1335 L1: what cannot be read is named, never an empty refusal
+        alloc_q = {k: _read_q(f, alloc.get(k), f"allocatable {k}") for k, f in (("cpu", cpu_m), ("memory", mem_bytes))}
+    except ValueError as e:
+        return {**rec, "ok": False, "why": f"the loadgen room could not be read: node {node['metadata']['name']}: {e}"}
     for p in live:
-        c, m = pod_requests(p)
+        try:
+            c, m = pod_requests(p)
+        except ValueError as e:
+            md = p.get("metadata") or {}
+            return {**rec, "ok": False,
+                    "why": f"the loadgen room could not be read: pod {md.get('namespace')}/{md.get('name')}: {e}"}
         scheduled.append({"namespace": p["metadata"].get("namespace"), "pod": p["metadata"].get("name"),
                           "cpu_m": c, "memory_bytes": m,
                           **({"terminating": True} if (p.get("metadata") or {}).get("deletionTimestamp") else {})})
     observer_there = any(((p.get("metadata") or {}).get("labels") or {}).get("job-name") == OBSERVE_JOB for p in live)
     obs = (0, 0) if observer_there else (cpu_m(OBSERVE_CPU), mem_bytes(OBSERVE_MEMORY))
     used_cpu, used_mem = sum(s["cpu_m"] for s in scheduled), sum(s["memory_bytes"] for s in scheduled)
-    cpu = cpu_m(alloc.get("cpu")) - used_cpu - obs[0]
-    mem_b = mem_bytes(alloc.get("memory")) - used_mem - obs[1]
+    cpu = alloc_q["cpu"] - used_cpu - obs[0]
+    mem_b = alloc_q["memory"] - used_mem - obs[1]
     mem = mem_b // MIB
     rec.update({"node": node["metadata"]["name"], "allocatable": {"cpu": alloc.get("cpu"), "memory": alloc.get("memory")},
                 "scheduled": scheduled, "observer_counted": "scheduled" if observer_there else "to come",
@@ -828,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--linger-s", type=int, required=True)
     rd.add_argument("--room", required=True, help="the loadgen node's room for data606 (`room`'s record)")
     rm = sub.add_parser("room", help="what the live loadgen node leaves data606 (one loadgen_room record); "
-                                     "exit 1 below the floor (run 23's share)")
+                                     "exit 1 when it does not hold data606's need (run 23's share) or cannot be read")
     rm.add_argument("--nodes", required=True, help="kubectl get nodes -l bench.krateo.io/pool=loadgen -o json")
     rm.add_argument("--pods", required=True, help="kubectl get pods -A --field-selector spec.nodeName=<it> -o json")
     rm.add_argument("--phase", required=True, help="where run606 read it (env, data)")

@@ -518,3 +518,32 @@ def test_a_pod_that_never_schedules_fails_its_step_with_the_schedulers_own_reaso
 def test_where_a_pod_stands_is_never_empty_and_never_a_containers_message(pods, want):
     why = load606.pod_why(pods, "data606")
     assert why == want and "secret program output" not in why
+
+
+def test_a_preflight_job_that_never_schedules_says_the_schedulers_reason(harness):  # noqa: F811
+    """run_preflight_job's timeout line carries where its pod stands (review #1335 M1)."""
+    p, out, state, o = _run(harness, FAKE_PREFLIGHT="pending", PREFLIGHT_TIMEOUT_S="3")
+    assert p.returncode != 0
+    assert ("PREFLIGHT did not finish within 3s (the run): pod preflight606-0 Pending, not scheduled: Unschedulable: "
+            "0/5 nodes are available: 1 Insufficient cpu.") in out, out[-3000:]
+
+
+def test_a_quantity_the_room_cannot_read_is_named_and_writes_no_blank_record(tmp_path):
+    """Review #1335 L1: `room` on a pod whose request is not a Kubernetes quantity answers one
+    refused record naming it (exit 1), never an empty line."""
+    nodes, pods = tmp_path / "nodes.json", tmp_path / "pods.json"
+    nodes.write_text(json.dumps(_node()))
+    pods.write_text(json.dumps({"items": [_pod("odd-ds-x", "100m", "12 Mi")]}))
+    p = subprocess.run([sys.executable, "-m", "bench.incluster", "room", "--nodes", str(nodes), "--pods", str(pods),
+                        "--phase", "data"], cwd=BENCH_DIR, capture_output=True, text=True)
+    assert p.returncode == 1 and p.stdout.count("\n") == 1, (p.stdout, p.stderr)
+    rec = json.loads(p.stdout)
+    assert rec["kind"] == "loadgen_room" and rec["ok"] is False and rec["phase"] == "data"
+    assert rec["why"] == ("the loadgen room could not be read: pod kube-system/odd-ds-x: its memory request "
+                          "'12 Mi' is not a Kubernetes quantity")
+    bad_node = tmp_path / "bad-node.json"
+    bad_node.write_text(json.dumps(_node(mem="lots")))
+    p = subprocess.run([sys.executable, "-m", "bench.incluster", "room", "--nodes", str(bad_node), "--pods",
+                        str(tmp_path / "pods.json"), "--phase", "env"], cwd=BENCH_DIR, capture_output=True, text=True)
+    assert p.returncode == 1 and "node gke-loadgen-1: its allocatable memory 'lots' is not a Kubernetes quantity" in \
+        json.loads(p.stdout)["why"]

@@ -264,6 +264,16 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             open(os.path.join(inc_dir(job), "pid"), "w").write(str(p.pid))
         if inc_jobs:
             sys.exit(0)
+    # run 24b: a Job whose pod is never scheduled (FAKE_PSI=pending, FAKE_PREFLIGHT=pending): its pod as
+    # the API server lists it, Pending with the scheduler's own reason on its PodScheduled condition
+    stuck = {"psi606": os.environ.get("FAKE_PSI") == "pending",
+             "preflight606": os.environ.get("FAKE_PREFLIGHT") == "pending"}
+    if a[:2] == ["get", "pods"] and "json" in a and any(x in ("job-name=" + j for j, on in stuck.items() if on) for x in a):
+        job = next(x for x in a if x.startswith("job-name=")).split("=", 1)[1]
+        print(json.dumps({"items": [{"metadata": {"name": job + "-0"}, "spec": {}, "status": {
+            "phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                                                "message": "0/5 nodes are available: 1 Insufficient cpu."}]}}]}))
+        sys.exit(0)
     inc_sel = next((x.split("=", 1)[1] for x in a if x.startswith("job-name=") and x.split("=", 1)[1] in INC), None)
     if a[:2] == ["get", "pods"] and inc_sel:
         job = inc_sel
@@ -1209,6 +1219,9 @@ FAKE_KUBECTL = _COMMON + textwrap.dedent("""\
             # FAKE_PREFLIGHT=refused: the run's preflight refuses; FAKE_PREFLIGHT_REFUSE_JOB: that Job alone
             refused = (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
                        or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
+            # FAKE_PREFLIGHT=pending: the run's preflight Job never finishes (its pod is never scheduled)
+            if os.environ.get("FAKE_PREFLIGHT") == "pending" and job == "preflight606":
+                print(""); sys.exit(0)
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("" if refused else "1"); sys.exit(0)
             if any(x.endswith("{.status.failed}") for x in a):

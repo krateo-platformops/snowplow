@@ -2031,7 +2031,8 @@ def test_run606_k6_psi_readable_lets_the_run_proceed(harness):
 @pytest.mark.parametrize("mode,unreadable", [("nocgroup", "/sys/fs/cgroup/cpu.pressure: unreadable"),
                                              ("nonode", "/proc/stat: unreadable"),
                                              ("sharedns", "/proc/self/cgroup: 0::/kubepods/burstable/pod1/c1"),
-                                             ("pending", "the psi606 Job did not finish within 10s")])
+                                             ("pending", "the psi606 Job did not finish within 10s (pod psi606-0 Pending, not scheduled: "
+                                              "Unschedulable: 0/5 nodes are available: 1 Insufficient cpu.)")])
 def test_run606_k6_psi_unreadable_refuses_before_the_drive(harness, mode, unreadable):
     """#1042: a kernel without PSI would make every judged page load
     UNMEASURED: refused right after the loadgen node exists, before install

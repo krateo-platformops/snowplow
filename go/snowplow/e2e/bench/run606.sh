@@ -1353,7 +1353,7 @@ s_psi() {
   done
   if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
     why="$(job_pod_why psi606)"
-    : > "$KERR"          # the reason is the API server's, in the line
+    : > "$KERR"          # the reason is what the API server said, in the line
     "${K[@]}" -n bench-loadgen delete job psi606 --wait=false >/dev/null 2>&1 || true
     record_failure "psi FAILED: the psi606 Job did not finish within ${PREFLIGHT_TIMEOUT_S}s (${why}): the browser's starvation evidence could not be checked; refused before any drive time" || true
     return 1
@@ -2050,7 +2050,7 @@ incluster_started() {
     if (( $(date +%s) >= deadline )); then
       local why
       why="$(job_pod_why "$job")"
-      : > "$KERR"          # the reason is the API server's, in the line; no stale kubectl error after it
+      : > "$KERR"          # the reason is what the API server said, in the line; no stale kubectl error after it
       record_failure "$job FAILED: its pod did not start within ${secs}s: ${why}" || true
       return 1
     fi
@@ -2103,8 +2103,12 @@ loadgen_room() {
     record_failure "loadgen room FAILED ($phase): the loadgen node or the pods on it could not be read (want one node in the pool)" || true
     return 1
   fi
-  rec="$("${INC[@]}" room --nodes "$OUT/.loadgen-nodes.json" --pods "$OUT/.loadgen-pods.json" --phase "$phase")" || rc=$?
+  rec="$("${INC[@]}" room --nodes "$OUT/.loadgen-nodes.json" --pods "$OUT/.loadgen-pods.json" --phase "$phase" 2>"$KERR")" || rc=$?
   rm -f "$OUT/.loadgen-nodes.json" "$OUT/.loadgen-pods.json"
+  if [[ -z "$rec" ]]; then     # it said nothing (it crashed): its error is the reason, and no blank record
+    record_failure "loadgen room FAILED ($phase): bench.incluster room gave no record (exit ${rc})" || true
+    return 1
+  fi
   printf '%s\n' "$rec" >> "$OUT/incluster-placement.jsonl"
   printf '%s\n' "$rec" > "$out"
   why="$(printf '%s' "$rec" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("why"))' 2>/dev/null)"
