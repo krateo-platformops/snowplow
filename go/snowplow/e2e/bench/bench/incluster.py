@@ -578,9 +578,32 @@ def placement(job: str, pods: dict, nodes: dict, want: dict | None = None) -> di
         return {**rec, "ok": False, "why": f"node {node} is not in the node list"}
     if labels.get(POOL_LABEL) != POOL:
         return {**rec, "ok": False, "why": f"node {node} is in pool {labels.get(POOL_LABEL)!r}, not {POOL!r}"}
-    if want is not None and reqs != want:
-        return {**rec, "ok": False, "why": f"requests {reqs} != rendered {want}"}
+    if want is not None:
+        differ = requests_differ(reqs, want)
+        if differ:
+            return {**rec, "ok": False, "why": f"requests {reqs} != rendered {want} ({differ})"}
     return {**rec, "ok": True, "why": f"on node {node} (pool {POOL}), requests {reqs}"}
+
+
+def requests_differ(live: dict, want: dict) -> str | None:
+    """Where a pod's container requests, as the API server answers them, differ from the rendered
+    ones BY VALUE (quantity, exact), or None when they are the same. The API server answers each
+    quantity in its canonical form (8192Mi as 8Gi, 1000m as 1): runs 24d / 25b failed every arm's
+    data step comparing the strings. The same containers and the same resources, each the same value;
+    a quantity that does not parse is a difference, named."""
+    if set(live) != set(want):
+        return f"containers {sorted(live)} != {sorted(want)}"
+    for c in sorted(want):
+        a, b = live[c] or {}, want[c] or {}
+        if set(a) != set(b):
+            return f"container {c}: resources {sorted(a)} != {sorted(b)}"
+        for k in sorted(b):
+            try:
+                if quantity(a[k]) != quantity(b[k]):
+                    return f"container {c}: {k} {a[k]} is not {b[k]}"
+            except ValueError as e:
+                return f"container {c}: {k}: {e}"
+    return None
 
 
 def report(recs: list[dict]) -> dict:

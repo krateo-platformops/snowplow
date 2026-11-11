@@ -2833,21 +2833,15 @@ def hist_p95_bound(h: dict) -> str | None:
 
 
 def _parse_quantity(q) -> int | None:
+    """A memory quantity in bytes, exactly (bench/incluster.py's parser: every form the API server
+    answers, its canonical ones included: 129e6, 1k, 500m, 8Gi); None for no value. A value that is
+    not a Kubernetes quantity raises ValueError naming it: never None, which would read as "no
+    limit" and silently drop the check that reads it (#1335 follow-up: the old parser returned None
+    for 129e6, 1k and 500m)."""
     if q is None:
         return None
-    q = str(q)
-    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
-             "K": 1000, "M": 1000 ** 2, "G": 1000 ** 3}
-    for u, m in units.items():
-        if q.endswith(u):
-            try:
-                return int(float(q[:-len(u)]) * m)
-            except ValueError:
-                return None
-    try:
-        return int(q)
-    except ValueError:
-        return None
+    from bench.incluster import mem_bytes
+    return mem_bytes(q)
 
 
 def _extra_values(mem: list[dict], key: str, t0=None, t1=None) -> list:
@@ -3307,7 +3301,16 @@ def run8_report(navs: list[dict], mem: list[dict], tops: list[dict],
     # ── memory under the two bursts ──────────────────────────────────────
     limit = None
     for pr in pods or []:
-        limit = _parse_quantity(((pr.get("limits") or {}).get("memory"))) or limit
+        raw = (pr.get("limits") or {}).get("memory")
+        try:
+            limit = _parse_quantity(raw) or limit
+        except ValueError as e:
+            chk("run8.memory_limit", "limits.memory", raw, "a Kubernetes quantity", "FAIL",
+                f"snowplow's memory limit cannot be read ({e}): the burst shares against it are unknown")
+    unread = [t for t in tops or [] if t.get("rss_unreadable")]
+    if unread:
+        chk("run8.top_samples", "top", len(unread), "every sample a Kubernetes quantity", "FAIL",
+            f"{len(unread)} kubectl top sample(s) unreadable, the first: {unread[0]['rss_unreadable']}")
     windows = {}
     for kind, label in (("first_load", "first_load_burst"),
                         ("composite_first_load", "composite_page_burst")):
@@ -5936,7 +5939,10 @@ def _cmd_evaluate(a) -> int:
     for r in recs:
         if r.get("kind") == "top":
             parts = (r.get("raw") or "").split()
-            r["rss_bytes"] = _parse_quantity(parts[2]) if len(parts) >= 3 else None
+            try:
+                r["rss_bytes"] = _parse_quantity(parts[2]) if len(parts) >= 3 else None
+            except ValueError as e:
+                r["rss_bytes"], r["rss_unreadable"] = None, str(e)
             tops.append(r)
     result = evaluate(navs, fresh, vs, tops=tops, run8=a.run8,
                       login_curves=[r for r in recs if r.get("kind") == "login_curve"],

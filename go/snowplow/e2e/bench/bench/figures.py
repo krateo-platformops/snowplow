@@ -95,16 +95,21 @@ def boot_memory(recs: list[dict], window, pod: str | None) -> dict:
     top_boot) in the window."""
     rows = [r for r in recs if r.get("kind") == "top_boot" and r.get("t") is not None
             and window is not None and window[0] <= r["t"] <= window[1]]
-    peak = None
+    peak, unreadable = None, []
     for r in rows:
         parts = (r.get("raw") or "").split()
         for i in range(0, len(parts) - 2, 3):
             if parts[i] == pod:
-                v = load606._parse_quantity(parts[i + 2])
+                try:
+                    v = load606._parse_quantity(parts[i + 2])
+                except ValueError as e:        # named, never read as a sample with no memory
+                    unreadable.append(str(e))
+                    continue
                 if v is not None and (peak is None or v > peak):
                     peak = v
     return {"sampled_max_memory_bytes": peak, "memory_samples": sum(1 for r in rows if not r.get("failed")),
-            "memory_failed_samples": sum(1 for r in rows if r.get("failed"))}
+            "memory_failed_samples": sum(1 for r in rows if r.get("failed")),
+            **({"memory_unreadable_samples": unreadable} if unreadable else {})}
 
 
 def steady_refreshes_per_core(cl: dict | None) -> dict:
