@@ -152,6 +152,16 @@ def _bench_copy(tmp_path) -> Path:
     return d
 
 
+def test_plan_iam_refuses_an_orchestrator_module_that_imports_an_operator_side_one(fake, capsys, tmp_path):
+    """bench.gcevm and bench.testvm are the operator's (#1338): plan-iam does not scan them, so a module the
+    orchestrator runs may not import them (their calls would run as the SA, unscanned)."""
+    d = _bench_copy(tmp_path)
+    with open(d / "bench" / "nodes.py", "a") as fh:
+        fh.write("\nfrom bench import gcevm  # noqa: E402,F401\n")
+    rc, _out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
+    assert rc == 1 and "an operator-side module (gcevm) imported, its calls unscanned (bench/nodes.py:" in err
+
+
 def test_plan_iam_refuses_a_call_it_does_not_cover(fake, capsys, tmp_path):
     d = _bench_copy(tmp_path)
     with open(d / "bench" / "gke.py", "a") as fh:

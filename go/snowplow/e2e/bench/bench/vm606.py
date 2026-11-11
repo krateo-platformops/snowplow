@@ -33,8 +33,10 @@ plan-iam SCANS the code for the orchestrator's GCP calls (every `["gcloud", ...]
 the Cloud Quotas REST read, kubectl / helm against the bench cluster), maps each to the predefined
 role that holds its permission, and refuses (exit 1, naming the call) when the code makes a call it
 does not cover; `up` grants from the same derivation, of THIS checkout: run vm606 from a checkout at
-(or after) the bench commit the VM runs. This module's own calls are not in the scan: they run on the
-laptop as the operator (roles/owner covers them: plan-iam lists them). Nor is the in-cluster
+(or after) the bench commit the VM runs. The operator-side modules' calls are not in the scan
+(OPERATOR_SIDE: this module, bench.gcevm it shares with bench.testvm, and bench.testvm): they run on the
+laptop as the operator (roles/owner covers them: plan-iam lists them); a scanned module that imports one
+of them refuses, since its calls would then run as the SA unscanned. Nor is the in-cluster
 ttl-self-destruct CronJob's gcloud (bench.gke.self_destruct_manifest): it runs as the GKE node SA.
 
 THE VM (up).
@@ -226,23 +228,47 @@ gcloud's error text names the operator's account: only its code reaches the outp
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
-import hashlib
+import functools
 import json
 import os
 import re
 import shlex
 import shutil
 import stat
-import subprocess
 import sys
 import tarfile
 import time
 from pathlib import Path
 
-from bench import evidence, gke
+from bench import evidence, gcevm, gke
+from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE, LIST_ENV,  # noqa: F401
+                         NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
+                         ssh, ssh_stage)
 from bench.gke import DEFAULT_PROJECT, DEFAULT_ZONE, ZONE_PATTERN
-from bench.identity import error_summary, redact_identity
+from bench.identity import error_summary
+
+# the shared primitives under vm606's own names (bench/gcevm.py says what each one guarantees)
+_say = gcevm.say
+_where = gcevm.where
+_remote_lines = gcevm.remote_lines
+_marker = gcevm.marker
+_not_found = gcevm.not_found
+_get = gcevm.get
+_list = gcevm.list_json
+_instance = gcevm.instance
+_project = gcevm.project_doc
+_time_left_s = gcevm.time_left_s
+_utc = gcevm.utc
+_short = gcevm.short
+_diff = gcevm.diff
+_sha256 = gcevm.sha256_file
+_sha256_text = gcevm.sha256_text
+_zone_of = gcevm.zone_of
+_named = gcevm.named
+_disk_names = gcevm.disk_names
+_network_url = gcevm.network_url
+firewall_want = gcevm.firewall_want
+_failed = functools.partial(gcevm.failed, prefix="vm606:")
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 
@@ -256,8 +282,6 @@ VM_VCPUS = 8                           # e2-standard-8: in E2_CPUS, the family's
 BOOT_DISK_GB = 50
 BOOT_DISK_TYPE = "pd-balanced"
 IMAGE_FAMILY, IMAGE_PROJECT = "debian-13", "debian-cloud"
-NETWORK = "default"
-IAP_RANGE = "35.235.240.0/20"          # IAP's TCP-forwarding source range
 REPO_URL = "https://github.com/krateo-platformops/snowplow.git"
 MAX_TTL_HOURS = 72
 # the VM must outlive the run's own TTL by this much at launch: the launch-to-gke-up time, the pair's
@@ -279,15 +303,6 @@ GHCR_FILE_REL = ".config/snowplow-bench/ghcr-pull.env"    # bench.ghcr_pull.DEFA
 RUN_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,30}[a-z0-9]")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
-
-# gcloud's `compute ... list` exits 0 with "[]" when its requests failed unless this is false
-# (bench.gke.PRECHECK_LIST_ENV, #1172 B3)
-LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
-
-
-class Refused(Exception):
-    """A refusal; the message says why. Nothing after it ran."""
-
 
 def vm_name(run: str) -> str:
     return VM_PREFIX + run
@@ -335,33 +350,7 @@ def _save_state(run: str, **kv) -> dict:
     return st
 
 
-# ─── running gcloud ─────────────────────────────────────────────────────────
-
-def _say(msg: str) -> None:
-    print(msg, flush=True)
-
-
-def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input_data: str | None = None,
-           timeout: float = 600, quiet: bool = False) -> tuple[int, str, str]:
-    """One gcloud call: (rc, stdout, stderr). Dry: printed, not run. Its stdout and stderr are the
-    caller's (stderr names the account; an IAM call's stdout is the whole policy): never printed here."""
-    argv = ["gcloud", *args]
-    if dry:
-        _say("DRY-RUN: " + shlex.join(argv))
-        return 0, "", ""
-    if not quiet:
-        _say("RUN: " + shlex.join(argv))
-    try:
-        p = subprocess.run(argv, capture_output=True, text=True, input=input_data, timeout=timeout,
-                           env=dict(os.environ, **(env or {})))
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout:.0f} s"
-    return p.returncode, p.stdout, p.stderr
-
-
-def _where(project: str, zone: str) -> list[str]:
-    return ["--project", project, "--zone", zone]
-
+# ─── running gcloud (bench.gcevm) ──────────────────────────────────────────
 
 def remote(run: str, body: str, *, in_dir: bool = True) -> str:
     """A remote script. Wrapped in main(), called with stdin /dev/null: bash reads the whole function
@@ -375,118 +364,6 @@ def remote(run: str, body: str, *, in_dir: bool = True) -> str:
     return "main() {\n" + head + body + "}\nmain </dev/null\n"
 
 
-def ssh(name: str, project: str, zone: str, script: str, *, timeout: float = 1800) -> tuple[int, str, str]:
-    """Run `script` (remote()) with bash on the VM, OS Login through IAP."""
-    return gcloud(["compute", "ssh", name, *_where(project, zone), "--tunnel-through-iap", "--quiet",
-                   "--ssh-flag=-T", "--command", "bash -s"], input_data=script, timeout=timeout, quiet=True)
-
-
-def scp(src: str, dst: str, project: str, zone: str, *, dry: bool = False,
-        timeout: float = 3600) -> tuple[int, str, str]:
-    return gcloud(["compute", "scp", *_where(project, zone), "--tunnel-through-iap", "--quiet", src, dst],
-                  dry=dry, timeout=timeout)
-
-
-def _remote_lines(out: str) -> list[str]:
-    return [redact_identity(ln) for ln in (out or "").splitlines()]
-
-
-def _marker(out: str, key: str) -> str | None:
-    for ln in (out or "").splitlines():
-        if ln.startswith(key + "="):
-            return ln[len(key) + 1:]
-    return None
-
-
-# IAP TCP forwarding's tunnel close code, as gcloud prints it: "Error while connecting [<code>: '<reason>']"
-# (gcloud 561, api_lib/compute/iap_tunnel_websocket.py: 'Error while connecting [%s].' of the WebSocket's
-# '%r: %r' % (close_code, close_reason)). Only the number is ever printed: the code, not gcloud's text.
-IAP_TUNNEL_CODE = re.compile(r"Error while connecting \[(4\d{3})\b")
-# What each code means, from IAP's own table (IAP FAQ, "Error codes":
-# https://docs.cloud.google.com/iap/docs/faq#error-codes), and whether waiting can fix it on a VM up
-# just made, with its firewall rules: (stage, waiting can fix it)
-IAP_CODES = {
-    # "Connection or firewall issue": "Check that your VM process is running and listening on the expected
-    # port", and that the firewall allows it: sshd not up yet on a booting VM, or a rule just created
-    "4003": ("IAP 4003: IAP reached the VM's network, port 22 did not answer (sshd or the firewall rule not up "
-             "yet)", True),
-    # "Instance doesn't exist or is stopped": "Make sure your VM is powered on and has fully completed its
-    # startup sequence": a VM just created (run 24's first up, 2026-11-11: answered minutes later)
-    "4047": ("IAP 4047: IAP does not find the instance running yet (it has not completed its startup)", True),
-    # "Connection closed by destination": the remedy is to reset the VM
-    "4010": ("IAP 4010: the VM closed the connection (IAP's remedy: reset the VM)", False),
-    # "Permission, existence, or VM state issue": the Tunnel User role (iap.tunnelInstances.accessViaIAP)
-    "4033": ("IAP 4033: not authorized to tunnel to the VM (iap.tunnelInstances.accessViaIAP)", False),
-}
-
-
-def iap_code(err: str | None) -> str | None:
-    m = IAP_TUNNEL_CODE.search(err or "")
-    return m.group(1) if m else None
-
-
-def _failed(what: str, rc: int, out: str, err: str, tail: int = 20) -> Refused:
-    lines = [ln for ln in _remote_lines(out) if ln.startswith("vm606:")] or _remote_lines(out)[-tail:]
-    body = ("\n  " + "\n  ".join(lines[-tail:])) if lines else ""
-    code = iap_code(err)
-    iap = f"; IAP tunnel code {code}" if code else ""
-    return Refused(f"{what} failed (rc={rc}; gcloud: {error_summary(err)}{iap}){body}")
-
-
-# gcloud compute ssh --tunnel-through-iap, a failure without an IAP code: which stage refused, from its
-# stderr (never printed: an OS Login refusal names the POSIX user). (pattern, stage, waiting can fix it)
-SSH_STAGES = (
-    (re.compile(r"Permission denied \(publickey"), "OS Login: the key was refused (compute.osAdminLogin)", False),
-    (re.compile(r"Could not fetch resource|was not found|code=404"), "the instance: GCE does not know it", False),
-    (re.compile(r"Connection (refused|reset|closed|timed out)|timed out after|kex_exchange"),
-     "ssh: the connection failed (the VM may still be booting)", True),
-)
-
-
-def ssh_stage(rc: int, err: str) -> tuple[str, bool]:
-    """(stage, waiting can fix it). An IAP tunnel code decides first (ssh's own "connection closed" follows
-    every tunnel failure); a code IAP's table does not list is waited out, and named."""
-    code = iap_code(err)
-    if code:
-        return IAP_CODES.get(code, (f"IAP {code}: a tunnel code IAP's table does not list", True))
-    for rx, stage, transient in SSH_STAGES:
-        if rx.search(err or ""):
-            return stage, transient
-    return f"ssh: rc={rc}, {error_summary(err)}", True
-
-
-def _not_found(err: str, path: str) -> bool:
-    """GCE's NotFound for `path` ITSELF. gcloud 561 says "The resource '<path>' was not found" for a missing
-    instance, disk or firewall rule, and the same words for a missing PARENT ("The resource
-    'projects/<p>' was not found" when the project does not exist): only the resource's own full path
-    makes a NotFound about it (#1307 round-3 S5)."""
-    return f"The resource '{path}' was not found" in (err or "")
-
-
-def _get(args: list[str], path: str, what: str) -> dict | None:
-    """One describe: the resource, or None when GCE answers NotFound for `path` itself; any other failure,
-    a parent's NotFound among them, refuses (a describe cannot fail open the way a list can)."""
-    rc, out, err = gcloud([*args, "--format", "json"], quiet=True)
-    if rc != 0:
-        if _not_found(err, path):
-            return None
-        raise Refused(f"{what} could not be read (rc={rc}; {error_summary(err)}): refusing")
-    try:
-        got = json.loads(out)
-    except ValueError:
-        got = None
-    if not isinstance(got, dict):
-        raise Refused(f"{what} answered no JSON object: refusing")
-    return got
-
-
-def _instance(name: str, project: str, zone: str) -> dict | None:
-    """The instance `name` in `zone`, or None when GCE answers NotFound for it there (a wrong zone answers
-    that too: down also reads every zone before it calls a VM gone)."""
-    return _get(["compute", "instances", "describe", name, *_where(project, zone)],
-                f"projects/{project}/zones/{zone}/instances/{name}", f"instance {name} ({zone})")
-
-
 def _present(name: str, project: str, zone: str) -> dict:
     """The run's instance, there and vm606's (push-secret / launch / status / fetch act on nothing else)."""
     inst = _instance(name, project, zone)
@@ -495,38 +372,15 @@ def _present(name: str, project: str, zone: str) -> dict:
     return inst
 
 
-def _project(project: str) -> dict:
-    """The project (`projects describe`): it exists, is ACTIVE and is the one asked. A parent every
-    absent verdict in it needs (#1307 round-3 S5); an unknown project refuses here, before anything."""
-    rc, out, err = gcloud(["projects", "describe", project, "--format", "json"], quiet=True)
-    try:
-        got = json.loads(out) if rc == 0 else None
-    except ValueError:
-        got = None
-    if not isinstance(got, dict) or got.get("projectId") != project or not str(got.get("projectNumber", "")).isdigit():
-        raise Refused(f"project {project} could not be read (rc={rc}; {error_summary(err)}): unknown, or not "
-                      f"visible to this account; nothing in it is read as absent")
-    if got.get("lifecycleState") != "ACTIVE":
-        raise Refused(f"project {project} is {got.get('lifecycleState')}, not ACTIVE: refusing")
-    return got
+def scp(src: str, dst: str, project: str, zone: str, *, dry: bool = False,
+        timeout: float = 3600) -> tuple[int, str, str]:
+    return gcloud(["compute", "scp", *_where(project, zone), "--tunnel-through-iap", "--quiet", src, dst],
+                  dry=dry, timeout=timeout)
 
 
 def _parents(project: str, zone: str, st: dict | None = None) -> str:
-    """Confirm the run's parents exist before any describe there is read as "absent": the project
-    (`projects describe`) and the zone in it (`compute zones describe`: an unknown zone answers "Invalid
-    value for field 'zone'"). A record's project number must be the project's. Returns the number."""
-    number = str(_project(project)["projectNumber"])
-    rc, out, err = gcloud(["compute", "zones", "describe", zone, "--project", project, "--format", "json"], quiet=True)
-    try:
-        got = json.loads(out) if rc == 0 else None
-    except ValueError:
-        got = None
-    if not isinstance(got, dict) or got.get("name") != zone:
-        raise Refused(f"zone {zone} of project {project} could not be read (rc={rc}; {error_summary(err)}): nothing "
-                      f"in it is read as absent")
-    if st and st.get("project_number") and str(st["project_number"]) != number:
-        raise Refused(f"the run's record names project number {st['project_number']}, {project} is {number}: refusing")
-    return number
+    """The run's project and zone confirmed (bench.gcevm.parents); a record's project number must be the project's."""
+    return gcevm.parents(project, zone, (st or {}).get("project_number"))
 
 
 def _recorded(run: str) -> tuple[dict, str, str]:
@@ -549,15 +403,6 @@ def _owned(inst: dict, run: str) -> None:
     if labels.get("owner") != OWNER or labels.get("run") != run:
         raise Refused(f"instance {inst.get('name')!r} is not labelled owner={OWNER}, run={run} "
                       f"(labels: {labels}): refusing")
-
-
-def _time_left_s(inst: dict, now: float) -> float | None:
-    t = ((inst.get("scheduling") or {}).get("terminationTime")) or ""
-    try:
-        end = _dt.datetime.fromisoformat(t.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return end.timestamp() - now
 
 
 def _project_number(project: str) -> str:
@@ -638,17 +483,25 @@ _REST_HOST = re.compile(r"https?://([a-z0-9-]+)\.googleapis\.com")
 _SH_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 _SH_COMMENT = re.compile(r"(?:^|\s)#.*$")
 _SH_TOOL = re.compile(r"(?:^|[\s;&|(`])(gcloud|kubectl|helm)\b")
-SELF = Path(__file__).name     # this module's calls are the operator's, run on the laptop
+# the operator's modules: their calls run on the laptop as the operator, never as the orchestrator SA
+OPERATOR_SIDE = (Path(__file__).name, "gcevm.py", "testvm.py")
+_IMPORTS = re.compile(r"^\s*(?:from\s+bench(?:\.(\w+))?\s+import\s+([\w, ()]+)|import\s+bench\.(\w+))", re.M)
 
 
 def scan(bench_dir: Path = BENCH_DIR) -> dict:
     """Every GCP call the orchestrator makes, read from the code: {"calls": [(key, where)],
     "rest": [(host, where)], "headers": [(header, where)], "kube": [where], "uncovered": [text]}."""
     calls, rest, headers, kube, uncovered = [], [], [], [], []
-    py = sorted(p for p in (bench_dir / "bench").glob("*.py") if p.name != SELF)
+    py = sorted(p for p in (bench_dir / "bench").glob("*.py") if p.name not in OPERATOR_SIDE)
+    side = {n.removesuffix(".py") for n in OPERATOR_SIDE}
     for f in py:
         src = f.read_text()
         rel = f.relative_to(bench_dir)
+        for m in _IMPORTS.finditer(src):
+            mods = {m.group(1) or "", m.group(3) or ""} | {x.strip(" ()") for x in (m.group(2) or "").split(",")}
+            if mods & side:
+                uncovered.append(f"an operator-side module ({', '.join(sorted(mods & side))}) imported, its calls "
+                                 f"unscanned ({rel}:{src.count(chr(10), 0, m.start()) + 1})")
         for m in _PY_ARGV.finditer(src):
             toks = [t.strip() for t in m.group(1).split(",") if t.strip()]
             key = tuple(t[1:-1] if t.startswith('"') else "*" for t in toks)
@@ -856,7 +709,7 @@ def cmd_plan_iam(a) -> int:
     need = plan(found)
     _say(f"# vm606 plan-iam: {sa_email(a.project)}")
     _say(f"# derived from the code under {Path(a.bench_dir).resolve()} (every [\"gcloud\", ...] argv in bench/*.py "
-         f"but {SELF}, REST hosts, kubectl/helm in run606*.sh and bench/*.sh); plan-iam runs nothing")
+         f"but {', '.join(OPERATOR_SIDE)}, REST hosts, kubectl/helm in run606*.sh and bench/*.sh); plan-iam runs nothing")
     _say("")
     for i, (role, uses) in enumerate(need.items(), 1):
         on = f"  (ON {node_sa(number)} only)" if role == NODE_SA_ROLE else "  (project)"
@@ -952,23 +805,12 @@ def bootstrap_mismatch(got: dict) -> list[str]:
 
 
 def termination_time(now: float, ttl_hours: int) -> str:
-    return _dt.datetime.fromtimestamp(now + ttl_hours * 3600, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return gcevm.rfc3339(now + ttl_hours * 3600)
 
 
 def firewall_rules(run: str) -> dict[str, dict]:
-    """The run's two SSH rules, by name: what up makes and the only rules down deletes."""
-    tag, desc = vm_name(run), f"vm606 owner={OWNER} run={run}"
-    return {f"{tag}-deny-ssh": {"action": "DENY", "sourceRanges": ["0.0.0.0/0"], "priority": 1000,
-                                "targetTags": [tag], "description": desc},
-            f"{tag}-iap-ssh": {"action": "ALLOW", "sourceRanges": [IAP_RANGE], "priority": 900,
-                               "targetTags": [tag], "description": desc}}
-
-
-def firewall_create_argv(name: str, rule: dict, project: str) -> list[str]:
-    return ["compute", "firewall-rules", "create", name, "--project", project, "--network", NETWORK,
-            "--direction", "INGRESS", "--action", rule["action"], "--rules", "tcp:22",
-            "--source-ranges", ",".join(rule["sourceRanges"]), "--target-tags", ",".join(rule["targetTags"]),
-            "--priority", str(rule["priority"]), "--description", rule["description"]]
+    """The run's two SSH rules, by name (bench.gcevm.ssh_rules): what up makes and the only rules down deletes."""
+    return gcevm.ssh_rules(vm_name(run), f"vm606 owner={OWNER} run={run}")
 
 
 def create_command(run: str, project: str, zone: str, ttl_hours: int, startup_file: str,
@@ -994,16 +836,7 @@ def create_command(run: str, project: str, zone: str, ttl_hours: int, startup_fi
 # the create flags that set it; () is a default up relies on that no flag sets (a rule is enabled, and
 # selects by source range and target tag only). tests/test_vm606.py checks that the flags of
 # firewall_create_argv and create_command are exactly the tables' flags.
-COMPUTE_API = "https://www.googleapis.com/compute/v1"
 SCOPES = {"cloud-platform": "https://www.googleapis.com/auth/cloud-platform"}
-TCP_22 = [{"IPProtocol": "tcp", "ports": ["22"]}]
-FIREWALL_FIELDS = {
-    "name": ("<name>",), "network": ("--project", "--network"), "direction": ("--direction",),
-    "allowed/denied": ("--action", "--rules"), "sourceRanges": ("--source-ranges",),
-    "targetTags": ("--target-tags",), "priority": ("--priority",), "description": ("--description",),
-    "disabled": (), "sourceTags": (), "sourceServiceAccounts": (), "targetServiceAccounts": (),
-    "destinationRanges": (),
-}
 INSTANCE_FIELDS = {
     "name": ("<name>",), "zone": ("--project", "--zone"), "machineType": ("--machine-type",),
     "boot image": ("--image-family", "--image-project"),
@@ -1013,38 +846,6 @@ INSTANCE_FIELDS = {
     "terminationTime": ("--termination-time",), "instanceTerminationAction": ("--instance-termination-action",),
     "shieldedInstanceConfig": ("--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"),
 }
-
-
-def _network_url(project: str) -> str:
-    return f"{COMPUTE_API}/projects/{project}/global/networks/{NETWORK}"
-
-
-def firewall_want(fw: str, rule: dict, project: str) -> dict:
-    """The rule as firewall_create_argv makes it, in describe's shape (FIREWALL_FIELDS)."""
-    return {"name": fw, "network": _network_url(project), "direction": "INGRESS",
-            "allowed/denied": {"allowed": TCP_22 if rule["action"] == "ALLOW" else [],
-                               "denied": TCP_22 if rule["action"] == "DENY" else []},
-            "sourceRanges": sorted(rule["sourceRanges"]), "targetTags": sorted(rule["targetTags"]),
-            "priority": rule["priority"], "description": rule["description"], "disabled": False,
-            "sourceTags": [], "sourceServiceAccounts": [], "targetServiceAccounts": [], "destinationRanges": []}
-
-
-def firewall_view(r: dict) -> dict:
-    return {"name": r.get("name"), "network": r.get("network"), "direction": r.get("direction"),
-            "allowed/denied": {"allowed": r.get("allowed") or [], "denied": r.get("denied") or []},
-            "sourceRanges": sorted(r.get("sourceRanges") or []), "targetTags": sorted(r.get("targetTags") or []),
-            "priority": r.get("priority"), "description": r.get("description"),
-            "disabled": r.get("disabled") is not False,
-            **{k: sorted(r.get(k) or []) for k in ("sourceTags", "sourceServiceAccounts", "targetServiceAccounts",
-                                                    "destinationRanges")}}
-
-
-def _utc(t) -> str | None:
-    try:
-        return _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(_dt.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError:
-        return None if t is None else str(t)
 
 
 def instance_want(run: str, st: dict) -> dict:
@@ -1074,10 +875,6 @@ def _account(email: str | None, project: str, number: str | None) -> str:
     return "another account"
 
 
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
 def as_made(run: str, project: str, zone: str, ttl_hours, terminates_at) -> dict:
     """What up creates for the run, field for field (INSTANCE_FIELDS, FIREWALL_FIELDS; the startup script by
     its sha256): `up --yes` writes it to the run's record before it creates anything, and every later
@@ -1098,69 +895,15 @@ def _made(st: dict, run: str) -> dict:
 
 
 def instance_view(inst: dict, disk: dict | None, image: dict | None, project: str, number: str | None) -> dict:
-    """labels: the keys up sets (a label grants nothing); metadata: every item (an ssh-keys item, another
-    startup script or OS Login switched off each change who gets in); a service account by its role."""
-    disks = inst.get("disks") or []
-    d0 = disks[0] if disks else {}
-    labels = inst.get("labels") or {}
-    sched = inst.get("scheduling") or {}
-    return {"name": inst.get("name"), "zone": inst.get("zone"), "machineType": inst.get("machineType"),
-            "boot image": {"project": (re.search(r"/projects/([^/]+)/global/images/", str((disk or {}).get(
-                "sourceImage", ""))) or [None, None])[1], "family": (image or {}).get("family")},
-            "boot disk": {"disks": len(disks), "boot": d0.get("boot"), "autoDelete": d0.get("autoDelete"),
-                          "source": d0.get("source"), "sizeGb": (disk or {}).get("sizeGb"),
-                          "type": (disk or {}).get("type")},
-            "serviceAccounts": [{"email": _account(a.get("email"), project, number),
-                                 "scopes": sorted(a.get("scopes") or [])}
-                                for a in inst.get("serviceAccounts") or []],
-            "network": [{"network": n.get("network"), "accessConfigs": [c.get("type") for c in n.get("accessConfigs")
-                                                                         or []]}
-                        for n in inst.get("networkInterfaces") or []],
-            "tags": sorted((inst.get("tags") or {}).get("items") or []),
-            "labels": {k: labels.get(k) for k in ("owner", "run", "ttl-hours")},
-            "metadata": {i.get("key"): (_sha256_text(i.get("value") or "") if i.get("key") == "startup-script"
-                                         else i.get("value"))
-                         for i in (inst.get("metadata") or {}).get("items") or []},
-            "terminationTime": _utc(sched.get("terminationTime")),
-            "instanceTerminationAction": sched.get("instanceTerminationAction"),
-            "shieldedInstanceConfig": {k: (inst.get("shieldedInstanceConfig") or {}).get(k)
-                                       for k in ("enableSecureBoot", "enableVtpm", "enableIntegrityMonitoring")}}
-
-
-def _short(v) -> str:
-    t = redact_identity(json.dumps(v, sort_keys=True))
-    return t if len(t) <= 100 else t[:97] + "..."
-
-
-def _diff(what: str, got: dict, want: dict) -> list[str]:
-    """Each field that differs, named; a mapping field names its differing keys (never a whole startup script)."""
-    out = []
-    for k, w in want.items():
-        g = got.get(k)
-        if g == w:
-            continue
-        if isinstance(w, dict) and isinstance(g, dict):
-            keys = sorted(x for x in {*w, *g} if g.get(x) != w.get(x))
-            out.append(f"{what} {k}: " + ", ".join(
-                f"{x} {_short(g.get(x)) if x != 'startup-script' else '(differs)'}, up made "
-                f"{_short(w.get(x)) if x != 'startup-script' else 'its own'}" for x in keys))
-        else:
-            out.append(f"{what} {k}: {_short(g)}, up made {_short(w)}")
-    return out
+    """bench.gcevm.instance_view with vm606's labels (owner, run, ttl-hours) and its accounts named by role."""
+    return gcevm.instance_view(inst, disk, image, label_keys=("owner", "run", "ttl-hours"),
+                               account=lambda e: _account(e, project, number))
 
 
 def instance_as_made(run: str, st: dict, inst: dict) -> list[str]:
     """What of the run's VM differs from what up made (its boot disk and its image read too); empty when none."""
     project, zone = st["project"], st["zone"]
-    disks = inst.get("disks") or []
-    d = str((disks[0] if disks else {}).get("source", "")).rsplit("/", 1)[-1]
-    disk = _get(["compute", "disks", "describe", d, *_where(project, zone)],
-                f"projects/{project}/zones/{zone}/disks/{d}", f"disk {d}") if d else None
-    image = None
-    m = re.search(r"/projects/([^/]+)/global/images/([^/]+)$", str((disk or {}).get("sourceImage", "")))
-    if m:
-        image = _get(["compute", "images", "describe", m[2], "--project", m[1]],
-                     f"projects/{m[1]}/global/images/{m[2]}", f"image {m[2]}")
+    disk, image = gcevm.boot_disk_and_image(inst, project, zone)
     return _diff(f"instance {vm_name(run)}", instance_view(inst, disk, image, project, st.get("project_number")),
                  _made(st, run)["instance"])
 
@@ -1185,40 +928,13 @@ VM_FOOTPRINT = (("INSTANCES", 1, "the VM", ""),
 
 
 def vm_quota_check(project: str, zone: str) -> tuple[list[str], list[str]]:
-    """The VM's own footprint against the quotas of the region it sits in, reads only, each failing
-    closed (bench.gke's primitives: the region's quotas, its instances / forwarding rules / addresses
-    listed with the partial-error property false, in-use addresses counted from their holders)."""
-    region = gke.region_of(zone)
-    rc, out, err = gcloud(gke.region_quotas_command(project, zone)[1:], quiet=True)
-    quotas = gke._json(out) if rc == 0 else None
-    if not isinstance(quotas, dict):
-        raise Refused(f"the quotas of {region} could not be read (rc={rc}; {error_summary(err)}): whether the VM fits "
-                      f"is unknown")
-    listed: dict[str, list[dict]] = {}
-    for kind in ("instances", "forwarding-rules", "addresses"):
-        rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], env=LIST_ENV, quiet=True)
-        got = gke._json(out) if rc == 0 else None
-        if not isinstance(got, list):
-            raise Refused(f"the {kind} of {region} could not be listed (rc={rc}; {error_summary(err)}): whether the "
-                          f"VM fits is unknown")
-        listed[kind] = got
-    fits, refusals = [], []
-    for metric, need, what, unit in VM_FOOTPRINT:
-        used = gke.in_use_addresses(listed, region) if metric == "IN_USE_ADDRESSES" else None
-        ok, msg = gke.quota_fit(quotas, metric, need, f"the VM needs {need}{unit}: {what}", unit, used)
-        (fits if ok else refusals).append(msg)
-    return fits, refusals
+    """The VM's own footprint against the quotas of the region it sits in (bench.gcevm.quota_check)."""
+    return gcevm.quota_check(project, zone, VM_FOOTPRINT)
 
 
 def _project_ready(project: str) -> None:
     """IAP enabled (the VM is reached through it only) and the orchestrator SA there."""
-    rc, out, err = gcloud(["services", "list", "--enabled", "--project", project, "--format", "json"], quiet=True)
-    enabled = gke._json(out) if rc == 0 else None
-    if not isinstance(enabled, list):
-        raise Refused(f"could not read whether IAP is enabled (rc={rc}; {error_summary(err)})")
-    if "iap.googleapis.com" not in {(x.get("config") or {}).get("name") for x in enabled}:
-        raise Refused(f"iap.googleapis.com is not enabled in {project}: the VM is reached through IAP only "
-                      f"(gcloud services enable iap.googleapis.com --project {project})")
+    gcevm.require_iap(project)
     rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
     if rc != 0 or out.strip() != sa_email(project):
@@ -1365,41 +1081,18 @@ def resume_hint(run: str) -> str:
 
 
 def wait_for_bootstrap(run: str, a) -> None:
-    """SSH until the marker answers. Each failure is read: one waiting cannot fix stops at once, naming its
-    stage; a booting VM's (port 22 not yet answering) is waited out until --ssh-ready-timeout-s."""
+    """SSH until the marker answers (bench.gcevm.wait_for_marker: each failure read, one waiting cannot fix
+    stops at once, a booting VM's waited out until --ssh-ready-timeout-s); then its tools are checked."""
     name = vm_name(run)
-    t0 = time.monotonic()
-    reached = False
     script = remote(run, f'cat {shlex.quote(BOOTSTRAP_MARKER)} 2>/dev/null || true\n', in_dir=False)
-    while True:
-        rc, out, err = ssh(name, a.project, a.zone, script, timeout=120)
-        now = time.monotonic() - t0
-        if rc != 0:
-            stage, transient = ssh_stage(rc, err)
-            if not transient:
-                raise Refused(f"SSH to {name} failed at {stage}; the VM is up and billing until its TTL: "
-                              f"{resume_hint(run)}")
-            if not reached and now >= a.ssh_ready_timeout_s:
-                raise Refused(f"SSH to {name} never answered in {a.ssh_ready_timeout_s} s, last at {stage}; the VM "
-                              f"is up and billing until its TTL: {resume_hint(run)}")
-        else:
-            reached = True
-            try:
-                got = json.loads(out) if out.strip() else None
-            except ValueError:
-                got = None
-            if isinstance(got, dict):
-                bad = bootstrap_mismatch(got)
-                if bad:
-                    raise Refused(f"{name}'s tools are not the laptop's: {'; '.join(bad)}; {down_hint(run)}")
-                _save_state(run, bootstrap=got)
-                _say(f"{name} bootstrapped: " + ", ".join(f"{k} {v}" for k, v in sorted(got.items())))
-                return
-        if now >= a.bootstrap_timeout_s:
-            raise Refused(f"{name}'s bootstrap did not finish in {a.bootstrap_timeout_s} s ({BOOTSTRAP_MARKER} "
-                          f"absent; SSH {'answers' if reached else 'never answered'}; the startup script's log: "
-                          f"sudo journalctl -u google-startup-scripts on the VM); {resume_hint(run)}")
-        time.sleep(a.poll_s)
+    got = gcevm.wait_for_marker(name, a.project, a.zone, script, ready_timeout_s=a.ssh_ready_timeout_s,
+                                timeout_s=a.bootstrap_timeout_s, poll_s=a.poll_s, hint=resume_hint(run),
+                                marker_path=BOOTSTRAP_MARKER)
+    bad = bootstrap_mismatch(got)
+    if bad:
+        raise Refused(f"{name}'s tools are not the laptop's: {'; '.join(bad)}; {down_hint(run)}")
+    _save_state(run, bootstrap=got)
+    _say(f"{name} bootstrapped: " + ", ".join(f"{k} {v}" for k, v in sorted(got.items())))
 
 
 # ─── push-secret ────────────────────────────────────────────────────────────
@@ -1537,14 +1230,6 @@ def pair_name(env: dict[str, str]) -> str:
     """run606_pair.sh's PAIR_NAME: "pair" then "-<RUN_NAME_L>" per label of RUNS, in order (its
     `PAIR_NAME="pair"` / `PAIR_NAME="${PAIR_NAME}-${!nm}"` lines; tests/test_vm606.py holds them to it)."""
     return "pair" + "".join(f"-{env['RUN_NAME_' + x]}" for x in env["RUNS"].split())
-
-
-def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for b in iter(lambda: fh.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
 
 
 def _exports(env: dict[str, str]) -> str:
@@ -1864,51 +1549,15 @@ def cmd_fetch(a) -> int:
 
 # ─── down ───────────────────────────────────────────────────────────────────
 
-def _disk_names(inst: dict) -> list[str]:
-    return sorted(str(d.get("source", "")).rsplit("/", 1)[-1] for d in inst.get("disks") or [] if d.get("source"))
-
-
-def _zone_of(inst: dict) -> str:
-    return str(inst.get("zone", "")).rsplit("/", 1)[-1]
-
-
-def _named(instances: list[dict]) -> str:
-    return ", ".join(sorted(f"{i.get('name')} ({_zone_of(i)})" for i in instances))
-
-
-def _list(args: list[str], what: str) -> list[dict]:
-    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True)
-    try:
-        got = json.loads(out) if rc == 0 else None
-    except ValueError:
-        got = None
-    if not isinstance(got, list):
-        raise Refused(f"{what} could not be listed (rc={rc}; {error_summary(err)}): refusing")
-    return got
-
-
 def _rule_docs(run: str, project: str) -> list[dict]:
-    """The run's firewall rules that exist, each read by its exact name (`describe`: NotFound for that
-    rule is "absent", any other failure refuses; never a list filter, which gcloud can mis-parse into an
-    empty answer with rc 0, #1307 re-review N1)."""
-    rows = []
-    for fw in firewall_rules(run):
-        r = _get(["compute", "firewall-rules", "describe", fw, "--project", project],
-                 f"projects/{project}/global/firewalls/{fw}", f"firewall rule {fw}")
-        if r is not None:
-            rows.append(r)
-    return rows
+    """The run's firewall rules that exist, each read by its exact name (bench.gcevm.rule_docs)."""
+    return gcevm.rule_docs(firewall_rules(run), project)
 
 
 def _owned_rule(run: str, st: dict, r: dict) -> None:
     """A rule of the run's exact name is the run's when its target tag and description are the ones up recorded
-    creating: else it is someone else's, and refuses."""
-    fw = r.get("name")
-    w = _made(st, run)["rules"][fw]
-    if sorted(r.get("targetTags") or []) != sorted(w["targetTags"]) or r.get("description") != w["description"]:
-        raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
-                      f"{_short(r.get('targetTags'))}, description {_short(r.get('description'))}): refusing; nothing "
-                      f"was changed")
+    creating: else it is someone else's, and refuses (bench.gcevm.owned_rule)."""
+    gcevm.owned_rule(r, _made(st, run)["rules"][r.get("name")], "vm606", run)
 
 
 def _run_rules(run: str, project: str, st: dict) -> list[dict]:
@@ -1923,13 +1572,9 @@ def _run_rules(run: str, project: str, st: dict) -> list[dict]:
 
 
 def _instances_of(run: str, project: str) -> list[dict]:
-    """Every instance of the project (all zones, one unfiltered list with the partial-error property
-    false) that claims `run`: named vm_name(run), or labelled run=<run>, each by exact equality. Either
-    claim alone selects it (the run is in use, the VM is not gone); only an instance with both, and
-    owner=snowplow-bench, is ever acted on (_owned)."""
-    rows = _list(["compute", "instances", "list", "--project", project, "--format", "json"],
-                 f"the instances of {project}")
-    return [i for i in rows if i.get("name") == vm_name(run) or (i.get("labels") or {}).get("run") == run]
+    """Every instance of the project claiming `run` by name or run label (bench.gcevm.instances_claiming); only an
+    instance with both, and owner=snowplow-bench, is ever acted on (_owned)."""
+    return gcevm.instances_claiming(project, vm_name(run), run)
 
 
 def run_in_use(run: str, project: str, number: str) -> list[str]:
