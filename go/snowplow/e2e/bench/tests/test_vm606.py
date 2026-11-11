@@ -63,7 +63,7 @@ def fake(tmp_path, monkeypatch, run_trees):
     for k in ("FAKE_BOOTSTRAP", "FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_NO_SA",
               "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES", "FAKE_SCP_CORRUPT", "FAKE_SCP_MODE", "FAKE_TAMPER_AFTER_SSH",
               "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
-              "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
+              "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
@@ -1271,6 +1271,9 @@ def test_a_notfound_is_about_the_resource_only_when_it_names_its_own_path():
     assert not vm606._not_found(REAL_PARENT.replace("instances.describe", "firewall-rules.describe"), fw)
     # another resource's NotFound (a prefix of the name) is not this one's
     assert not vm606._not_found(REAL_ABSENT, inst[:-1])
+    # the same name under another zone or project is another resource: its NotFound is not this one's
+    assert not vm606._not_found(REAL_ABSENT, inst.replace("/zones/europe-west4-a/", "/zones/europe-west1-b/"))
+    assert not vm606._not_found(REAL_ABSENT, inst.replace("operations-dev-krateo-io", "other-project"))
 
 
 def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
@@ -1282,3 +1285,14 @@ def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
     written = {("project" if c["argv"][0] == "projects" else "sa", c["argv"][2 if c["argv"][0] == "projects" else 3])
                for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:3])}
     assert written == set(vm606.grant_policies(PROJECT, NUMBER))
+
+
+def test_a_describe_that_answers_no_object_refuses_never_reads_as_absent(fake, capsys, monkeypatch):
+    """rc 0 with something other than one resource (here `[]`) is not "the rule is gone": down refuses
+    before any change (round-3 M12: an empty answer read as absent)."""
+    _upped(fake, capsys, monkeypatch)
+    before = _snapshot(fake)
+    monkeypatch.setenv("FAKE_FW_DESCRIBE_NOT_OBJECT", "1")
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and f"firewall rule {VM}-deny-ssh answered no JSON object: refusing" in err
+    assert _snapshot(fake) == before

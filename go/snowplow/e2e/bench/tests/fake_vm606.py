@@ -28,7 +28,8 @@ outcome:
     CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, then rc 1 (#1172 B3, tests/fake_region.py);
   - `compute instances delete --delete-disks all`: the instance and its disk go (FAKE_KEEP_DISKS=1
     keeps the disk; FAKE_INSTANCE_DELETE_LOST=1: the delete answers rc 0 and nothing goes); `firewall-rules create / delete` (FAKE_FW_DELETE_LOST=1: the delete answers rc 0
-    and the rule stays; FAKE_FW_DESCRIBE_503=1: a describe answers 503, not NotFound);
+    and the rule stays; FAKE_FW_DESCRIBE_503=1: a describe answers 503, not NotFound;
+    FAKE_FW_DESCRIBE_NOT_OBJECT=1: it answers rc 0 with `[]`, not a rule);
   - `projects | iam service-accounts get-iam-policy / add-iam-policy-binding /
     remove-iam-policy-binding` with --condition-from-file: a v3 policy per resource; a remove matches
     the condition exactly, as gcloud does. FAKE_IAM_LOST_WRITE=<role>: an add or a remove of that role
@@ -218,6 +219,8 @@ if a[:3] == ["compute", "firewall-rules", "create"]:
         "description": opt("--description"), "network": opt("--network"),
         ("denied" if opt("--action") == "DENY" else "allowed"): [{"IPProtocol": "tcp", "ports": ["22"]}]}))
     sys.exit(0)
+if a[:3] == ["compute", "firewall-rules", "describe"] and os.environ.get("FAKE_FW_DESCRIBE_NOT_OBJECT") == "1":
+    print("[]"); sys.exit(0)
 if a[:3] == ["compute", "firewall-rules", "describe"] and os.environ.get("FAKE_FW_DESCRIBE_503") == "1":
     sys.stderr.write("ERROR: (gcloud.compute.firewall-rules.describe) Could not fetch resource:\n - "
                      "The service is currently unavailable. code=503\n"); sys.exit(1)
