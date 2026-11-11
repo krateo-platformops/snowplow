@@ -155,7 +155,7 @@ func TestRefreshes_SubscriptionSummary_CountsMatchFixture(t *testing.T) {
 		t.Fatalf("NewRequest: %v", err)
 	}
 
-	armed, _, derr := validateSubscription(req)
+	armed, _, _, derr := validateSubscription(req)
 	if derr != nil {
 		t.Fatalf("validateSubscription: unexpected error %v", derr)
 	}
@@ -205,7 +205,7 @@ func TestRefreshes_SubscriptionSummary_AllInformerMiss(t *testing.T) {
 	)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/refreshes?sub="+sub, nil)
 
-	armed, _, derr := validateSubscription(req)
+	armed, _, _, derr := validateSubscription(req)
 	if derr != nil {
 		t.Fatalf("validateSubscription: unexpected error %v", derr)
 	}

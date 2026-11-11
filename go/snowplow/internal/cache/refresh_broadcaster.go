@@ -835,6 +835,12 @@ type RefreshStream struct {
 	// Rotated announces armed keys whose identity class moved (#819): one
 	// `refresh` frame per key on THIS connection, sent at once (not paced).
 	Rotated func(keys []string)
+	// CatchUp (#1324) announces armed keys this tab is BEHIND on: the bytes
+	// its /call answered with (the `held` digest it armed with) are not the
+	// bytes that /call would answer with now, or the cell is gone. One
+	// `refresh` frame per key on THIS connection, at once (not paced), the
+	// same path as Rotated. The handler decides which keys.
+	CatchUp func(keys []string)
 	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
 	// ledger that a frame was WRITTEN to this stream — called by the handler
 	// after its writeFrame returned true, with no lock held. An offer is not a
@@ -875,7 +881,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {},
+		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}, CatchUp: func([]string) {},
 			Wrote: func(string) {}, WroteResync: func() {}}
 	}
 	limit, burst := refreshEvictionBucket()
@@ -955,7 +961,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	for k := range armedKeys {
 		armedCopy[k] = struct{}{}
 	}
-	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated,
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated, CatchUp: s.offerCatchUp,
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
@@ -1002,6 +1008,39 @@ func (s *refreshSub) offerRotated(keys []string) {
 		s.offerRefreshLocked(k, refreshOwed{})
 		s.pmu.Unlock()
 		refreshRotationAnnouncedTotal.Add(1)
+	}
+}
+
+// offerCatchUp announces keys this connection armed that its tab is behind on
+// (#1324; the handler decides which, by comparing the tab's `held` digest with
+// the digest of what its /call would answer now). /refreshes keeps no replay,
+// so a frame published while the key was not armed — between the /call and
+// the arm, or while the SPA re-opened its stream on a mount/unmount — reached
+// nobody; this is that frame, once. Same delivery as offerRotated: un-paced,
+// never dropped, only to this connection, and a key waiting in the paced
+// eviction backlog moves onto this path (it is the same frame).
+func (s *refreshSub) offerCatchUp(keys []string) {
+	h := s.hub
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, k := range keys {
+		if _, armed := s.keys[k]; !armed {
+			continue
+		}
+		s.pmu.Lock()
+		delete(s.pending, k)
+		s.offerRefreshLocked(k, refreshOwed{})
+		s.pmu.Unlock()
+		refreshArmCatchUpTotal.Add(1)
+	}
+}
+
+// NoteRefreshArmHeld counts n armed keys whose arm carried a `held` digest
+// (#1324): the denominator of arm_catch_up, so a zero catch-up reads as "no
+// tab was behind", not as "no tab sends held".
+func NoteRefreshArmHeld(n int) {
+	if n > 0 {
+		refreshArmHeldTotal.Add(uint64(n))
 	}
 }
 
@@ -1165,6 +1204,11 @@ var (
 	// refreshRotationAnnouncedTotal counts (key -> subscriber) frames offered
 	// because the armed key's identity class moved (#819).
 	refreshRotationAnnouncedTotal atomic.Uint64
+	// refreshArmCatchUpTotal counts (key -> subscriber) frames offered at arm
+	// because the tab was behind (#1324); refreshArmHeldTotal counts armed
+	// keys whose arm carried a `held` digest (its denominator).
+	refreshArmCatchUpTotal atomic.Uint64
+	refreshArmHeldTotal    atomic.Uint64
 
 	// C12 — stream lifetime. stream_seconds_total / streams_closed_total is
 	// the mean stream lifetime; the instrument S8 found missing at every hop.
@@ -1249,6 +1293,8 @@ type RefreshBroadcasterStats struct {
 	EvictPublished        uint64  `stat:"evict_published" desc:"Eviction-driven live-refresh publishes that reached at least one subscriber."`
 	EvictDeferred         uint64  `stat:"evict_deferred" desc:"Eviction-driven signals deferred by the per-subscriber token bucket (the bound engaged)."`
 	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent at once on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
+	ArmHeld               uint64  `stat:"arm_held" desc:"Armed keys whose /refreshes arm carried a held digest (the X-Snowplow-Refresh-Digest of the tab's /call answer); the denominator of arm_catch_up (#1324)."`
+	ArmCatchUp            uint64  `stat:"arm_catch_up" desc:"Refresh frames sent at once on arm because the tab was behind: its held digest is not the digest of what its /call would answer now, or the cell is gone (#1324)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
@@ -1282,6 +1328,8 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		EvictPublished:        refreshEvictPublishedTotal.Load(),
 		EvictDeferred:         refreshEvictDeferredTotal.Load(),
 		RotationAnnounced:     refreshRotationAnnouncedTotal.Load(),
+		ArmHeld:               refreshArmHeldTotal.Load(),
+		ArmCatchUp:            refreshArmCatchUpTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
@@ -1396,6 +1444,8 @@ func resetRefreshBroadcasterForTest() {
 	refreshPendingHighWaterForTest.Store(0)
 	refreshEvictPublishedTotal.Store(0)
 	refreshRotationAnnouncedTotal.Store(0)
+	refreshArmCatchUpTotal.Store(0)
+	refreshArmHeldTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)
 	refreshStreamsClosedTotal.Store(0)

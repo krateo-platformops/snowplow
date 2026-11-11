@@ -231,6 +231,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 						contentKey, true, entry.SeededAtBoot, len(gated))
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
+					// #1324 — the GATED bytes this requester is served, not the shared shell.
+					stampRefreshDigest(wri, func() string { return cache.ContentDigest(gated) })
 					// #1062 — an armed hit on a dirty shared shell is an l1 stale
 					// serve, timed until its replacing frame is written.
 					cache.NoteStaleHit(req.Context(), contentKey, entry, staleSubjectOf)
@@ -301,6 +303,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// never fire. entry.ExternalTTL is false for every normal entry →
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
+			stampRefreshDigest(wri, entry.ContentDigest)                           // #1324: the cell is served verbatim
 			staleHitWritePoint(req.Context(), cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
 			serve.servedCell(cacheKey, entry)
@@ -804,6 +807,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.ContentDigest(encoded) }) // #1324: the stored and written bytes
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }
