@@ -55,7 +55,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
-	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
@@ -84,9 +83,23 @@ type w1319Env struct {
 // binding set and is cacheable).
 func w1319Setup(t *testing.T, raPaths ...string) *w1319Env {
 	t.Helper()
+	return w1319SetupRA(t, c681RAObj(raPaths...))
+}
+
+// w1319AbortedRA is a RESTAction whose stage depends on a stage that does not
+// exist: its stages cannot be ordered, so the resolve runs none (an Aborted
+// resolve, api.abortedResolve) and records no stage error.
+func w1319AbortedRA() *unstructured.Unstructured {
+	ra := c681RAObj("/api/v1/namespaces/pub/configmaps/p")
+	ra.Object["spec"].(map[string]any)["api"].([]any)[0].(map[string]any)["dependsOn"] = map[string]any{"name": "ghost"}
+	return ra
+}
+
+func w1319SetupRA(t *testing.T, ra *unstructured.Unstructured) *w1319Env {
+	t.Helper()
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "false")
 	e := &w1319Env{c681Env: c681Setup(t)}
-	e.create(t, h1RAGVR, c681RAObj(raPaths...))
+	e.create(t, h1RAGVR, ra)
 	e.create(t, c681CRGVR, c681CR("widget-reader1319",
 		rbacv1.PolicyRule{APIGroups: []string{h1WidgetGVR.Group}, Resources: []string{h1WidgetGVR.Resource}, Verbs: []string{"get", "list"}}))
 	e.create(t, c681CRBGVR, &rbacv1.ClusterRoleBinding{
@@ -432,53 +445,100 @@ func (e *w1319Env) refresh(t *testing.T, ctx context.Context) {
 	}
 }
 
-// C — the identity-free content shell (the walker's populate, the widgets
-// handler's content hit) keeps and replays the outcomes like every other cell.
+// W7 — the external-TTL Put (a widget that opts into
+// krateo.io/external-cache-ttl-seconds, #1221), on the #1221 harness (a
+// third-party named endpoint, a per-user apiserver). It stores only a resolve
+// with no stage error: a stage error beside a genuine external touch is never
+// DenialOnly (cache.DenialOnly requires GenuineExternal == 0), so the verdict
+// declines it. Its stored outcomes are therefore always complete:
+//   - clean: the cell is stored under the external TTL with no outcomes, and
+//     neither the cold answer nor the hit carries a header;
+//   - a denial beside the third-party touch (bob's own 403): answered cold
+//     with its header, and not stored.
+func TestIssue1319_W7_TheExternalTTLPutStoresOnlyCompleteOutcomes(t *testing.T) {
+	a := k1221Shapes[2] // informer_not_registered: bob's read is his own dial
+	t.Run("clean", func(t *testing.T) {
+		e := k1221Setup(t, a, k1221RA(k1221FeedStage()), k1221Widget("${ .feed.value }", true))
+		cold := e.serve(e.aliceCtx)
+		if cold.Code != http.StatusOK || e.wire.named.Load() != 1 {
+			t.Fatalf("SETUP: alice's cold /call: code=%d named=%d", cold.Code, e.wire.named.Load())
+		}
+		w1319Absent(t, "W7 clean cold", cold)
+		cell, ok := e.store.GetNoTouch(e.key(e.aliceCtx))
+		if !ok || !cell.ExternalTTL {
+			t.Fatalf("SETUP: the external-TTL Put must store the clean cell (present=%v)", ok)
+		}
+		if cell.StageOutcomes != "" {
+			t.Fatalf("W7 RED: the clean external-TTL cell stores outcomes %q", cell.StageOutcomes)
+		}
+		hit := e.serve(e.aliceCtx)
+		w1319Served(t, "hit", hit, "fresh")
+		w1319Absent(t, "W7 clean hit", hit)
+	})
+	t.Run("a denial beside the third-party touch", func(t *testing.T) {
+		e := k1221Setup(t, a, k1221RA(k1221FeedStage(), k1221TargetStage(a)), k1221Widget("${ .feed.value }", true))
+		cold := e.serve(e.bobCtx)
+		if cold.Code != http.StatusOK || e.wire.bob403.Load() != 1 || e.wire.named.Load() != 1 {
+			t.Fatalf("SETUP: bob's cold /call: code=%d bob403=%d named=%d", cold.Code, e.wire.bob403.Load(), e.wire.named.Load())
+		}
+		if r := w1319Rows(t, "W7 denial cold", cold); r["target"].Reason != "Forbidden" || len(r) != 1 {
+			t.Fatalf("W7 RED: rows %v, want exactly target Forbidden", r)
+		}
+		if _, ok := e.store.GetNoTouch(e.key(e.bobCtx)); ok {
+			t.Fatal("W7 RED: a denial beside a genuine external touch was stored under the external TTL")
+		}
+	})
+}
+
+// C — the identity-free content shell keeps and replays the outcomes like
+// every other cell. Reachable state: the walker's own sequence
+// (withWidgetContentPutSinks → widgets.Resolve → populateWidgetContentL1,
+// phase1_walk.go) over a widget with no templates (the class the content
+// layer serves) whose RESTAction aborts; then the widgets handler's content
+// hit. A complete RESTAction's shell answers no header.
 func TestIssue1319_C_ContentShellKeepsAndReplaysOutcomes(t *testing.T) {
-	const stored = `[{"name":"sa","ok":false,"reason":"Forbidden"}]`
-	t.Run("populate keeps the walker resolve's outcomes", func(t *testing.T) {
-		s1265Setup(t, s1265Targets[1])
-		t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
-		ctx := withWidgetContentPutSinks(h1ReqCtx(h1User))
-		// The walker's widgets.Resolve: its apiRef RESTAction reports here.
-		api.ReplayStageOutcomes(ctx, stored)
-		in := h1WidgetUnstructured(map[string]any{})
-		res := h1WidgetUnstructured(map[string]any{})
-		res.Object["status"] = map[string]any{"widgetData": map[string]any{"x": 1}}
-		populateWidgetContentL1(ctx, h1WidgetGVR, in, -1, -1, res, 0)
-		key, _ := widgetContentL1Key(h1WidgetGVR, h1NS, h1WName, -1, -1)
-		got, ok := cache.ResolvedCache().GetNoTouch(key)
-		if !ok {
-			t.Fatal("SETUP: the walker's populate stored no shell")
-		}
-		if got.StageOutcomes != stored {
-			t.Fatalf("C RED: the shell keeps %q, want the walker resolve's %q", got.StageOutcomes, stored)
-		}
-	})
-	hit := func(t *testing.T, outcomes string) *httptest.ResponseRecorder {
-		e := s1265Setup(t, s1265Targets[1])
-		t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
-		ctx := h1ReqCtx(h1User)
-		cr := h1WidgetUnstructured(map[string]any{})
-		contentKey, contentHandle, _ := dispatchWidgetContentKey(ctx,
-			h1WidgetGVR.Group, h1WidgetGVR.Version, h1WidgetGVR.Resource, h1NS, h1WName, -1, -1,
-			effectiveKeyExtras(ctx, cr.Object, nil))
-		if contentHandle == nil {
-			t.Fatal("SETUP: expected a live widgetContent handle")
-		}
-		putFixture(contentHandle, contentKey, &cache.ResolvedEntry{
-			RawJSON: []byte(`{"status":{"widgetData":{"x":1},"resourcesRefs":{"items":[]}}}`), StageOutcomes: outcomes})
-		rec := e.serve(ctx, nil)
-		e.wantResolves(t, "a content hit", 0)
-		return rec
+	for _, c := range []struct {
+		name     string
+		ra       *unstructured.Unstructured
+		complete bool
+	}{
+		{"aborted", w1319AbortedRA(), false},
+		{"complete", c681RAObj("/api/v1/namespaces/pub/configmaps/p"), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := w1319SetupRA(t, c.ra)
+			t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
+			e.widget = h1WidgetUnstructured(map[string]any{"apiRef": map[string]any{"name": c681RA, "namespace": h1NS,
+				"resource": h1RAGVR.Resource, "apiVersion": h1RAGVR.Group + "/" + h1RAGVR.Version}})
+			if isRBACSensitiveApiRefWidget(e.widget.Object) {
+				t.Fatal("SETUP: a template-less apiRef widget must be served by the content layer")
+			}
+			// The walker's resolve and populate.
+			wctx := withWidgetContentPutSinks(e.ctx())
+			in := e.widget.DeepCopy()
+			res, err := widgets.Resolve(wctx, widgets.ResolveOptions{In: in.DeepCopy(), RC: &rest.Config{Host: e.user.URL},
+				AuthnNS: c681AuthnNS, PerPage: -1, Page: -1})
+			if err != nil {
+				t.Fatalf("SETUP: the walker's widgets.Resolve: %v", err)
+			}
+			populateWidgetContentL1(wctx, h1WidgetGVR, in, -1, -1, res, 0)
+			key, _ := widgetContentL1Key(h1WidgetGVR, h1NS, h1WName, -1, -1)
+			shell, ok := cache.ResolvedCache().GetNoTouch(key)
+			if !ok {
+				t.Fatal("SETUP: the walker's populate stored no shell")
+			}
+			if c.complete != (shell.StageOutcomes == "") {
+				t.Fatalf("C RED: the %s shell stores outcomes %q", c.name, shell.StageOutcomes)
+			}
+			hit, _ := e.call(t, e.ctx())
+			if got := hit.Header().Get(util.HeaderStageOutcomes); got != shell.StageOutcomes {
+				t.Fatalf("C RED: the content hit answers %q, the shell stores %q (serve=%s)", got, shell.StageOutcomes, hit.Header().Get(ServeOutcomeHeader))
+			}
+			if c.complete {
+				w1319Absent(t, "C complete content hit", hit)
+			} else if r := w1319Rows(t, "C aborted content hit", hit); r[""].Reason != "Aborted" {
+				t.Fatalf("SETUP: rows %v, want the Aborted row", r)
+			}
+		})
 	}
-	t.Run("a content hit replays them", func(t *testing.T) {
-		rec := hit(t, stored)
-		if got := rec.Header().Get(util.HeaderStageOutcomes); got != stored {
-			t.Fatalf("C RED: a content hit answers %q, want the stored %q", got, stored)
-		}
-	})
-	t.Run("a complete shell's hit has no header", func(t *testing.T) {
-		w1319Absent(t, "C complete content hit", hit(t, ""))
-	})
 }

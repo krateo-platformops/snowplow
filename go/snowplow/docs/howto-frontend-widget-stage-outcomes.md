@@ -50,17 +50,18 @@ X-Snowplow-Stage-Outcomes: [{"name":"<stage>","ok":false,"reason":"<code>"}]
   user, a body or any upstream error text. Only stage names (from the CR) and
   codes.
 
-## 3. Reason codes (closed set), in two groups
+## 3. Reason codes (closed set), in three groups
 
-The portal shows its notice only when data was cut short or failed, never for
-a per-user denial. Every code snowplow can send is in exactly one of the two
-groups below. The groups come from the code's own map
-(`api.StageReasonGroups` in `internal/resolvers/restactions/api/stage_outcomes.go`):
+The portal shows its notice only when data was cut short or failed. It never
+shows it for a per-user denial or for a stage snowplow skipped by design.
+Every code snowplow can send is in exactly one of the three groups below. The
+groups come from the code's own map (`api.StageReasonGroups` in
+`internal/resolvers/restactions/api/stage_outcomes.go`):
 - `TestIssue1319_G1` fails when a code is added without a group.
 - `TestIssue1319_G2` fails when these tables differ from the map.
 
 **Show the notice when at least one row's code is in "cut / failed".** If every
-row is "denied", nothing was cut short, so show no notice. A truncated header
+row is "denied" or "by design", show no notice. A truncated header
 (`{"truncated":true,"failed":N}`) names no codes: treat it as "cut / failed".
 
 **Treat an unknown code (from a future snowplow) as "cut / failed".**
@@ -71,6 +72,8 @@ row is "denied", nothing was cut short, so show no notice. A truncated header
 |---|---|
 | `Timeout` | the page budget ended the exchange (504): the page's 10 s goal ran out (#1115). This is the budget code; there is no separate "Budget" code |
 | `Error` | any other failure |
+| `NotFound` | a 404. See the note below: this code is also the definite per-user NotFound |
+| `Unauthorized` | the credential was refused (401). Never a per-user denial (#681) |
 | `NotRun` | the resolve stopped before this stage ran |
 | `Skipped` | a write stage not sent because the stage in `dependsOn` failed |
 | `Aborted` | the resolve-level row (`name` `""`): no stage ran |
@@ -84,13 +87,28 @@ row is "denied", nothing was cut short, so show no notice. A truncated header
 
 | code | meaning |
 |---|---|
-| `Forbidden` | the requester may not read it (an apiserver 403) |
-| `Unauthorized` | the requester's credential was refused (401) |
-| `NotFound` | the object is not there for this requester (404): a definite answer, stored like a denial (#681, #1080) |
-| `StageNotExecuted` | a dry run did not send this write stage (by design) |
-| `WriteRefused` | snowplow did not send this write because the request is not the user's own write (by design) |
+| `Forbidden` | the requester may not read it (a 403) |
+
+### by design
+
+| code | meaning |
+|---|---|
+| `StageNotExecuted` | a dry run did not send this write stage |
+| `WriteRefused` | snowplow did not send this write because the request is not the user's own write (an export, background work) |
 
 Only these codes are ever sent.
+
+**`NotFound` is ambiguous today.** snowplow records `NotFound` for two
+different answers:
+- a definite per-user NotFound: a watched named object that does not exist for
+  this requester (#1080). It is stored like a denial (#681), and the ruling
+  puts it in "denied";
+- a plain 404 from a dial, which is a failure.
+
+The header carries the same code for both, so a client cannot tell them apart.
+`NotFound` is therefore "cut / failed": a definite NotFound shows the notice
+too. The proposed fix, on #1347, is a distinct closed code for the definite
+answer, placed in "denied".
 
 ## 4. Presence: absent means complete
 
@@ -118,10 +136,16 @@ Only these codes are ever sent.
   answered. This also holds when the RESTAction output came from a stored
   full list (a paginated widget) or from the seed memo.
 - **What can be stored.** Storage did not change: the same Put gate decides it
-  for every class. A result with a failed stage is stored only when every
-  failure is a per-identity denial (`Forbidden`, or a definite `NotFound`).
-  That answer is correct and repeatable for everyone who shares the cell's
-  RBAC class (#681). So a hit's header lists denials.
+  for every class. It refuses a result whose resolve recorded a stage error,
+  unless every error was a per-identity denial (#681: `Forbidden`, or the
+  definite `NotFound` of #1080). Two kinds of incomplete answer pass it, so a
+  hit's header lists one of them:
+  - **per-identity denials** (`Forbidden`, `NotFound` rows). The answer is
+    correct and repeatable for everyone who shares the cell's RBAC class;
+  - **a resolve that ran no stage** (`Aborted` and one `NotRun` row per
+    stage). Its stages cannot be ordered (a `dependsOn` naming no stage, a
+    cycle), or it had no identity or no client configuration. Nothing ran, so
+    no stage error was recorded, and the cell is stored with these rows.
 - **A budget cut is answered, not stored.** A stage cut by the page budget
   (`Timeout`), or any other failure, is answered cold with its header. The
   cell is not stored, so the next `/call` resolves again and can complete.

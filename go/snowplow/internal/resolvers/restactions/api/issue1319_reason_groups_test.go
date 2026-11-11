@@ -2,14 +2,14 @@ package api
 
 // issue1319_reason_groups_test.go — #1319 contract addition: every stage
 // reason code of the closed set is in exactly one client group ("cut /
-// failed" or "denied"), and the frontend integration doc lists exactly those
-// groups, so neither can drift.
+// failed", "denied" or "by design"), and the frontend integration doc lists
+// exactly those groups, so neither can drift.
 //
 //   G1 the closed set, read from the CODE (every StageReason* constant
 //      declared in this package, the classes map and the rank map), equals
 //      the set StageReasonGroups places, and every placement is one of the
-//      two groups; an unknown code reads "cut / failed";
-//   G2 the doc's two tables list exactly StageReasonGroups.
+//      three groups; an unknown code reads "cut / failed";
+//   G2 the doc's three tables list exactly StageReasonGroups.
 
 import (
 	"go/ast"
@@ -92,8 +92,12 @@ func TestIssue1319_G1_EveryReasonCodeIsInExactlyOneGroup(t *testing.T) {
 		}
 	}
 	for code, g := range StageReasonGroups {
-		if g != StageGroupCutFailed && g != StageGroupDenied {
-			t.Fatalf("G1 RED: %s is in group %q, want one of the two groups", code, g)
+		if g != StageGroupCutFailed && g != StageGroupDenied && g != StageGroupByDesign {
+			t.Fatalf("G1 RED: %s is in group %q, want one of the three groups", code, g)
+		}
+		// The by-design group is exactly the #1288 classifier's.
+		if (g == StageGroupByDesign) != stageNotExecutedByDesign(code) {
+			t.Fatalf("G1 RED: %s is in %q but stageNotExecutedByDesign=%v", code, g, stageNotExecutedByDesign(code))
 		}
 	}
 	if g := StageReasonGroup("SomeFutureCode"); g != StageGroupCutFailed {

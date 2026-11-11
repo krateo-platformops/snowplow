@@ -20,11 +20,17 @@
 //
 // WHICH CELLS CAN HOLD OUTCOMES. Storage is decided by the shared Put-gate
 // verdict (cache.PutGateVerdict), unchanged by #1319 and identical for every
-// class: a result with a stage error is not stored unless every error is a
-// per-identity denial (#681 DenialOnly: Forbidden, a definite NotFound). So a
-// stored cell's outcomes are the denials of the binding-set class it is keyed
-// by; a stage cut by the page budget (Timeout, #1115) or any other failure is
-// answered cold with its header and never stored (#1319 storage decision,
+// class: a result whose resolve recorded a stage error is not stored unless
+// every error is a per-identity denial (#681 DenialOnly: Forbidden, a definite
+// NotFound). So a stored cell's outcomes are one of two kinds:
+//   - the denials of the binding-set class it is keyed by;
+//   - an aborted resolve's (api.abortedResolve: the resolve-level Aborted row
+//     plus every stage NotRun). The stage graph could not be ordered, or there
+//     was no identity or client config. No stage ran, so no stage error was
+//     recorded, and the gate stores it.
+//
+// A stage cut by the page budget (Timeout, #1115) or any other stage failure
+// is answered cold with its header and never stored (#1319 storage decision,
 // docs/howto-frontend-widget-stage-outcomes.md §5).
 package dispatchers
 

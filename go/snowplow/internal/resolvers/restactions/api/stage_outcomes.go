@@ -133,32 +133,38 @@ var stageReasonClasses = map[string]stageReasonClass{
 }
 
 // Stage reason groups (#1319): the client contract for a widget's
-// exception-only notice. Every code of the closed set is in exactly one group
-// (TestIssue1319_G1 fails otherwise), and the frontend integration doc lists
-// them as this map says (TestIssue1319_G2). A client reads a code it does not
-// know as StageGroupCutFailed.
+// exception-only notice (owner ruling on #1347: three groups). Every code of
+// the closed set is in exactly one group (TestIssue1319_G1 fails otherwise),
+// and the frontend integration doc lists them as this map says
+// (TestIssue1319_G2). A client reads a code it does not know as
+// StageGroupCutFailed.
 const (
 	// StageGroupCutFailed — the stage's data was cut short or failed: the
 	// portal shows its notice.
 	StageGroupCutFailed = "cut / failed"
-	// StageGroupDenied — the stage got a definitive answer for THIS requester
-	// (a per-user refusal, an object that is not there for them) or snowplow
-	// deliberately did not run it for this request: nothing was cut short, and
-	// the portal shows no notice.
+	// StageGroupDenied — a per-user refusal: the requester may not read it.
+	// The portal shows no notice.
 	StageGroupDenied = "denied"
+	// StageGroupByDesign — snowplow deliberately did not execute the stage for
+	// this request (#1288, stageNotExecutedByDesign). Never a notice.
+	StageGroupByDesign = "by design"
 )
 
 // StageReasonGroups places every reason code of the closed set in one group.
 var StageReasonGroups = map[string]string{
-	StageReasonForbidden:    StageGroupDenied,
-	StageReasonUnauthorized: StageGroupDenied,
-	// A NotFound is the per-identity definite answer #1080 / #681 store as a
-	// denial (DenialOnly): the object is not there for this requester.
-	StageReasonNotFound: StageGroupDenied,
-	// Deliberate non-executions (#1288): a dry run, an export or background work.
-	StageReasonNotExecuted:  StageGroupDenied,
-	StageReasonWriteRefused: StageGroupDenied,
+	StageReasonForbidden: StageGroupDenied,
 
+	StageReasonNotExecuted:  StageGroupByDesign, // a dry run's write (#443 k)
+	StageReasonWriteRefused: StageGroupByDesign, // an export's or background work's write (#1288)
+
+	// NotFound is ALSO the code of the definite per-identity NotFound (#1080,
+	// recordDefiniteNotFound, stored as a denial by #681), but the same code
+	// is recorded for a plain 404 of a dial, which is a failure. The code alone
+	// cannot tell them apart, so it is cut / failed (the safe direction); a
+	// distinct code for the definite answer is proposed on #1347.
+	StageReasonNotFound: StageGroupCutFailed,
+	// A refused credential is never a #681 per-identity denial.
+	StageReasonUnauthorized:       StageGroupCutFailed,
 	StageReasonTimeout:            StageGroupCutFailed, // the page budget cut it (#1115)
 	StageReasonNotRun:             StageGroupCutFailed,
 	StageReasonError:              StageGroupCutFailed,
