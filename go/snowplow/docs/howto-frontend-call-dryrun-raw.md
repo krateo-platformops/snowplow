@@ -17,7 +17,7 @@ is advertised as `call.read.inline`.
 
 ```
 GET /capabilities            (no auth)
-200 {"capabilities":["call.dryRun","call.fieldValidation","call.raw","call.read.inline"]}
+200 {"capabilities":["call.dryRun","call.fieldValidation","call.provenance","call.raw","call.read.inline"]}
 ```
 
 - The list is static and sorted.
@@ -30,6 +30,7 @@ GET /capabilities            (no auth)
 |---|---|
 | `call.dryRun` | `POST\|PUT\|PATCH /call/dry-run` sends the apiserver `dryRun=All` and echoes `X-Snowplow-Dry-Run: All`. |
 | `call.fieldValidation` | `fieldValidation=Ignore\|Strict` is forwarded on write verbs of `/call` and `/call/dry-run`, and echoed in `X-Snowplow-Field-Validation`. |
+| `call.provenance` | `POST\|PUT\|PATCH\|DELETE /call` and `POST\|PUT\|PATCH /call/dry-run` read the `X-Krateo-Provenance` header into the write's audit record (#1333): [howto-frontend-call-provenance.md](howto-frontend-call-provenance.md). |
 | `call.raw` | `raw=true` on `GET /call` and `POST /call/read` returns the stored object for restactions and the widgets group, read as the caller, and echoes `X-Snowplow-Raw: true`. |
 | `call.read.inline` | `POST /call/read` on a RESTAction with body `{"extras":{…},"object":{<RESTAction>}}` resolves the body instead of the stored CR, as the caller, persisting nothing, and echoes `X-Snowplow-Dry-Run: All` and `X-Snowplow-Resolve-Source: request-body`. |
 

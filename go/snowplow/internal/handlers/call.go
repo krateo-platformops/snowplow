@@ -263,6 +263,11 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}, outcome, code)
 		ev.DryRun = opts.dryRun
 		ev.Message = msg
+		// #1333 — the client's provenance (X-Krateo-Provenance), validated
+		// against its closed schema: the asserted krateo.audit.client.* keys,
+		// or krateo.audit.client.rejected alone. It is the client's word and
+		// sets nothing else on the record; the write above ran either way.
+		ev.Client = audit.ProvenanceOf(req.Header)
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		audit.RecordWrittenObject(&ev, answer)

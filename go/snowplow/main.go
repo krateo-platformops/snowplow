@@ -103,6 +103,9 @@ func snowplowCORSOptions() cors.Options {
 			"traceparent",
 			"tracestate",
 			"baggage",
+			// #1333 — the portal's write provenance on /call writes and
+			// dry runs (docs/howto-frontend-call-provenance.md).
+			audit.ProvenanceHeader,
 		},
 		ExposedHeaders: []string{
 			"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class",
