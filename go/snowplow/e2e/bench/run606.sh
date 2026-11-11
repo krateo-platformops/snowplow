@@ -949,7 +949,13 @@ s_registry() {
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
-  (( rc == 0 )) || { record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1; }
+  # run 25: exit 4 is NO ANSWER within the step's bound (bench/ghcr_pull.py EXIT_NO_ANSWER): whether the
+  # token resolves them is unknown, and the line says so; any other failure is the registry's own answer
+  case "$rc" in
+    0) ;;
+    4) record_failure "registry FAILED: the registry gave NO ANSWER for some of this install's private charts and images within the step's bound (above: which call, how often): whether the ghcr pull token resolves them is unknown"; return 1 ;;
+    *) record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1 ;;
+  esac
 }
 # installer#614: cert-manager BEFORE the installer, exactly as krateo-057 has it
 # (bench/cert_manager.py says what and why). Installer 0.3.506 ships it only

@@ -74,6 +74,24 @@ manifest or a token answer at the distribution spec's 4 MiB) and in time (each
 call's whole answer within its own bound, not only each socket read); the
 render is bounded too. The step's bound is the sum of its calls' bounds and is
 recorded with the preflight.
+
+NO ANSWER is not a refusal of the token (run 25: one manifest read's 30 s
+timeout, from one region, refused a run that another region's identical check
+had passed minutes earlier, as "does not resolve"). A call that ends with no
+answer (a timeout, a connection reset or dropped, HTTP 429 / 5xx: _NoAnswer) is
+asked again within the step's own bound (Budget, _phase: once every reference
+had its first attempt, its reference again while what is left of the bound
+holds the reference's whole share; the step never runs past its bound). Only
+when the bound has no room left is it refused, as NO ANSWER, naming the call
+(the token exchange, the manifest read, the chart blob read, the chart files
+read, helm template), its attempts and the bound: exit 4 (EXIT_NO_ANSWER),
+apart from the registry's own answers (a 401 / 403 / 404, a manifest that does
+not parse: exit 3, EXIT_REFUSED, as before).
+
+WHEN it runs: run606.sh's `registry` step, before `reap` and `up`: before this
+run's cluster exists, in the dry pass too. run606_pair.sh runs every arm's dry
+pass, this check included, before ANY arm starts, so a launch the token cannot
+serve creates nothing; each arm's real run checks again before its own `up`.
 """
 
 from __future__ import annotations
@@ -81,6 +99,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import io
 import json
 import multiprocessing
@@ -174,6 +193,9 @@ CAPS = {"helm_max_chart": HELM_MAX_CHART, "helm_max_file": HELM_MAX_FILE, "rende
 #: a `measured` key -> the REAL_LARGEST input it is compared with
 MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated", "render": "render",
                   "parsed": "parsed", "members": "members"}
+#: preflight's exits: the registry's own answer refuses (a 401 / 403 / 404, a manifest that does not
+#: parse, ...); no answer within the step's bound is a refusal of its own, said as such (run 25)
+EXIT_REFUSED, EXIT_NO_ANSWER = 3, 4
 #: the registry API. GHCR_API_URL may point it elsewhere (the suite's fake
 #: registry), over https only: the token is never sent in clear text.
 API = os.environ.get("GHCR_API_URL", "https://ghcr.io")
@@ -345,7 +367,63 @@ class _Refused(Exception):
     """Why a reference does not resolve (never carries a credential)."""
 
 
-def _call(fn, bound_s: float, on_timeout=None):
+class _NoAnswer(_Refused):
+    """NO answer within a call's bound (run 25): the call timed out, its connection was reset or
+    dropped, or the registry said it cannot answer now (HTTP 429, 5xx). Not evidence about the
+    token: its reference is asked again while the step's bound has room (Budget, _phase); refused only
+    when it has none, and then said as "no answer", never as "does not resolve"."""
+
+
+#: what ends a call with no answer: a timeout, a connection reset / aborted / dropped mid-answer
+NO_ANSWER_ERRORS = (TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                    http.client.IncompleteRead)
+
+
+def _transport(e: BaseException) -> str:
+    return "timed out" if isinstance(e, TimeoutError) else f"the connection ended ({type(e).__name__})"
+
+
+class Budget:
+    """The step's bound, as a deadline (run 25: one call's 30 s timeout refused the whole run).
+
+    The bound is the one the step already derives: every call it makes at its own whole bound.
+    `extend` adds a phase's share once its references are known (the charts first, then the images
+    their charts run). Every reference is tried once first; one that got NO ANSWER is tried again
+    (main: `_phase`) while what is left of the bound holds that reference's whole share, so the step
+    never runs past its bound and each retry is paid for by time the answered calls did not use. A
+    call with no answer counts its whole bound (_attempt waits out the rest of it after a fast
+    reset), so how often a reference can be asked follows from the bound alone."""
+
+    def __init__(self, clock=time.monotonic, sleep=time.sleep):
+        self.clock, self.sleep = clock, sleep
+        self.deadline: float | None = None
+        self.total = 0.0
+
+    def extend(self, s: float) -> None:
+        self.deadline = (self.clock() if self.deadline is None else self.deadline) + s
+        self.total += s
+
+    def holds(self, s: float) -> bool:
+        """Whether what is left of the bound holds `s` more seconds."""
+        return self.deadline is not None and self.deadline - self.clock() >= s
+
+
+def _attempt(what: str, bound_s: float, fn, budget: Budget | None):
+    """fn(): one call, `what` (the token exchange, the manifest read, ...), bounded by `bound_s`.
+    Within the step (`budget`), no answer names the call and counts as the call's whole bound: after
+    a fast reset the rest of it is waited out, so a retry of its reference can never come sooner.
+    Outside the step (no budget), fn's own _NoAnswer is raised as it is."""
+    if budget is None:
+        return fn()
+    t0 = budget.clock()
+    try:
+        return fn()
+    except _NoAnswer as e:
+        budget.sleep(max(0.0, t0 + bound_s - budget.clock()))
+        raise _NoAnswer(f"no answer from the {what} ({e})") from None
+
+
+def _call(fn, bound_s: float, on_timeout=None, whole: float | None = None):
     """fn() within `bound_s` of wall clock, WHOLE: the caller is answered at
     the bound whatever fn is doing. A thread cannot be killed, so this bounds
     the WAIT, not the work (#1041 review round 4): it is used only where the
@@ -356,7 +434,8 @@ def _call(fn, bound_s: float, on_timeout=None):
     gone with the preflight. helm template: `on_timeout` kills helm and the
     reading ends at its EOF. Work that is not capped that way (a YAML parse)
     runs in a killed child instead (_in_child). fn's own exception is raised
-    here."""
+    here; past the bound, _NoAnswer (naming `whole`, the call's own bound,
+    when this wait is what is left of it)."""
     box: dict = {}
 
     def run():
@@ -370,29 +449,42 @@ def _call(fn, bound_s: float, on_timeout=None):
     if t.is_alive():
         if on_timeout:
             on_timeout()
-        raise _Refused(f"no whole answer within its {bound_s:g} s bound")
+        raise _NoAnswer(f"no whole answer within its {bound_s if whole is None else whole:g} s bound")
     if "e" in box:
         raise box["e"]
     return box["v"]
 
 
-def _read(req, cap: int, bound_s: float) -> bytes:
+def _read(req, cap: int, bound_s: float, whole: float | None = None) -> bytes:
     """The answer to `req`, at most `cap` bytes, the whole call (connect,
-    status, headers, body) within `bound_s` (_call)."""
+    status, headers, body) within `bound_s` (_call). No answer (a timeout, a
+    reset, HTTP 429 or 5xx) is _NoAnswer; any other HTTP status is the
+    registry's answer (HTTPError)."""
     def call():
-        with _OPEN(req, timeout=bound_s) as r:
-            out = bytearray()
-            while True:
-                chunk = r.read1(min(65536, cap + 1 - len(out)))
-                if not chunk:
-                    return bytes(out)
-                out += chunk
-                if len(out) > cap:
-                    raise _Refused(f"an answer larger than its {cap} byte bound")
-    return _call(call, bound_s)
+        try:
+            with _OPEN(req, timeout=bound_s) as r:
+                out = bytearray()
+                while True:
+                    chunk = r.read1(min(65536, cap + 1 - len(out)))
+                    if not chunk:
+                        return bytes(out)
+                    out += chunk
+                    if len(out) > cap:
+                        raise _Refused(f"an answer larger than its {cap} byte bound")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                raise _NoAnswer(f"HTTP {e.code} {e.reason}: the registry did not answer for it now") from None
+            raise
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, NO_ANSWER_ERRORS):
+                raise _NoAnswer(_transport(e.reason)) from None
+            raise
+        except NO_ANSWER_ERRORS as e:
+            raise _NoAnswer(_transport(e)) from None
+    return _call(call, bound_s, whole=whole)
 
 
-def _exchange(host: str, name: str, user: str, token: str) -> str:
+def _exchange(host: str, name: str, user: str, token: str, budget: Budget | None = None) -> str:
     """The registry's bearer for pulling `name` (its token exchange)."""
     if not API.startswith("https://"):
         raise _Refused(f"the registry API {API!r} is not https: the token is never sent in clear text")
@@ -400,7 +492,8 @@ def _exchange(host: str, name: str, user: str, token: str) -> str:
     req = urllib.request.Request(f"{API}/token?scope=repository:{name}:pull&service={host}",
                                  headers={"Authorization": f"Basic {basic}"})
     try:
-        bearer = json.loads(_read(req, MANIFEST_MAX, HTTP_BOUND_S) or b"{}").get("token")
+        bearer = json.loads(_attempt("token exchange", HTTP_BOUND_S, lambda: _read(req, MANIFEST_MAX, HTTP_BOUND_S),
+                                     budget) or b"{}").get("token")
     except ValueError:
         raise _Refused(f"{host} answered the token exchange for {name} with no JSON") from None
     if not bearer:
@@ -408,23 +501,36 @@ def _exchange(host: str, name: str, user: str, token: str) -> str:
     return bearer
 
 
+class Why(str):
+    """An error string (`ref: why`) that also says whether it is NO ANSWER (`no_answer`: the registry
+    did not answer within the step's bound) or the registry's own answer (a refusal)."""
+    no_answer = False
+
+
+def _why(text: str, no_answer: bool) -> Why:
+    w = Why(text)
+    w.no_answer = no_answer
+    return w
+
+
 def _ref_error(ref: str, fn):
-    """fn() with every failure as `ref: why` (an error string), never raised."""
+    """fn() with every failure as `ref: why` (a Why), never raised."""
     try:
         return fn()
     except _Refused as e:
-        return f"{ref}: {e}" if not str(e).startswith(("the registry API", ref)) else str(e)
+        return _why(f"{ref}: {e}" if not str(e).startswith(("the registry API", ref)) else str(e),
+                    isinstance(e, _NoAnswer))
     except urllib.error.HTTPError as e:
-        return f"{ref}: HTTP {e.code} {e.reason}"
+        return _why(f"{ref}: HTTP {e.code} {e.reason}", False)
     except (urllib.error.URLError, OSError) as e:
-        return f"{ref}: {getattr(e, 'reason', e)}"
+        return _why(f"{ref}: {getattr(e, 'reason', e)}", False)
 
 
-def _head_manifest(host: str, name: str, tag: str, user: str, token: str) -> None:
-    bearer = _exchange(host, name, user, token)
+def _head_manifest(host: str, name: str, tag: str, user: str, token: str, budget: Budget | None = None) -> None:
+    bearer = _exchange(host, name, user, token, budget)
     req = urllib.request.Request(f"{API}/v2/{name}/manifests/{tag}", method="HEAD",
                                  headers={"Authorization": f"Bearer {bearer}", "Accept": MANIFEST_TYPES})
-    _read(req, 0, HTTP_BOUND_S)
+    _attempt("manifest read", HTTP_BOUND_S, lambda: _read(req, 0, HTTP_BOUND_S), budget)
     return None
 
 
@@ -433,13 +539,14 @@ def _split_repo(repo: str, chart: str) -> tuple[str, str]:
     return host, f"{path}/{chart}".strip("/")
 
 
-def resolve(repo: str, chart: str, version: str, user: str, token: str) -> str | None:
+def resolve(repo: str, chart: str, version: str, user: str, token: str, budget: Budget | None = None) -> str | None:
     """None when oci://<repo>/<chart>:<version> resolves with these credentials
-    (the registry's token exchange, then the manifest), else why not."""
+    (the registry's token exchange, then the manifest), else why not (a Why)."""
     if not repo.startswith("oci://"):
-        return f"{repo} is not an OCI repo"
+        return _why(f"{repo} is not an OCI repo", False)
     host, name = _split_repo(repo, chart)
-    return _ref_error(f"oci://{host}/{name}:{version}", lambda: _head_manifest(host, name, version, user, token))
+    return _ref_error(f"oci://{host}/{name}:{version}",
+                      lambda: _head_manifest(host, name, version, user, token, budget))
 
 
 def split_image(ref: str) -> tuple[str, str, str]:
@@ -452,10 +559,10 @@ def split_image(ref: str) -> tuple[str, str, str]:
     return host, name, tag
 
 
-def resolve_image(ref: str, user: str, token: str) -> str | None:
-    """None when the image's manifest resolves with these credentials, else why not."""
+def resolve_image(ref: str, user: str, token: str, budget: Budget | None = None) -> str | None:
+    """None when the image's manifest resolves with these credentials, else why not (a Why)."""
     host, name, tag = split_image(ref)
-    return _ref_error(ref, lambda: _head_manifest(host, name, tag, user, token))
+    return _ref_error(ref, lambda: _head_manifest(host, name, tag, user, token, budget))
 
 
 def _blob(host: str, name: str, digest: str, size: int, bearer: str) -> bytes:
@@ -467,8 +574,13 @@ def _blob(host: str, name: str, digest: str, size: int, bearer: str) -> bytes:
         raise _Refused(f"blob {digest[:19]} declares no size")
     if size > BLOB_MAX:
         raise _Refused(f"blob {digest[:19]} declares {size} bytes, over the {BLOB_MAX} byte ceiling of a chart")
-    def get(r):                          # the one read of a blob, from the registry or its storage
-        return _read(r, size, BLOB_BOUND_S)
+    t0 = time.monotonic()
+
+    def get(r):                          # a read of the blob, from the registry or its storage: both
+        left = BLOB_BOUND_S - (time.monotonic() - t0)       # hops within the blob's ONE bound
+        if left <= 0:
+            raise _NoAnswer(f"no whole answer within its {BLOB_BOUND_S:g} s bound")
+        return _read(r, size, left, whole=BLOB_BOUND_S)
     req = urllib.request.Request(f"{API}/v2/{name}/blobs/{digest}", headers={"Authorization": f"Bearer {bearer}"})
     try:
         data = get(req)
@@ -567,7 +679,7 @@ def _in_child(fn_name: str, args: tuple, bound_s: float, late: str):
     thread (_call), the work itself ends at the bound, with its memory
     (#1041 review round 4, M1b: an abandoned parse ran on for 57 s). The
     answer comes back pickled; a child that dies without one is a refusal.
-    `late` is the refusal at the bound."""
+    `late` is the refusal at the bound: no answer (_NoAnswer)."""
     ctx = multiprocessing.get_context("spawn")
     rd, wr = ctx.Pipe(duplex=False)
     pr = ctx.Process(target=_child_main, args=(wr, fn_name, args), daemon=True)
@@ -575,7 +687,7 @@ def _in_child(fn_name: str, args: tuple, bound_s: float, late: str):
     wr.close()
     try:
         if not rd.poll(bound_s):
-            raise _Refused(late)
+            raise _NoAnswer(late)
         try:
             kind, v = rd.recv()
         except (EOFError, OSError):
@@ -661,10 +773,8 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
     t0 = time.monotonic()
     try:
         out = _call(run, RENDER_BOUND_S, on_timeout=kill)
-    except _Refused as e:
-        if str(e).startswith("no whole answer"):
-            raise _Refused(late) from None
-        raise
+    except _NoAnswer:                       # helm did not finish: no answer, not a render failure
+        raise _NoAnswer(late) from None
     return _in_child("_parse_manifests", (out,), max(0.0, RENDER_BOUND_S - (time.monotonic() - t0)), late)
 
 
@@ -785,7 +895,8 @@ def path_results(docs, paths: list[list[str]], effective: dict) -> list[dict]:
 
 
 def chart_images(repo: str, chart: str, version: str, user: str, token: str, values: dict | None = None,
-                 helm: str = "helm", name: str | None = None, paths: list[list[str]] | None = None) -> dict:
+                 helm: str = "helm", name: str | None = None, paths: list[list[str]] | None = None,
+                 budget: Budget | None = None) -> dict:
     """What oci://<repo>/<chart>:<version> runs: {images, rendered,
     render_error, error}. The chart is fetched in-process (manifest, its helm
     layer); `rendered` is what `helm template` with `values` (the installer's
@@ -797,29 +908,35 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
     `name` is the release name (the installer renders a component under its
     own name, $c.name). `paths`: the component's pull-secret paths when it is
     a private-image component; then `paths` gets each one's pods (see
-    path_results)."""
+    path_results). `budget`: the step's (each call asked again after no
+    answer while it has room); `no_answer` / `render_no_answer` say that
+    `error` / `render_error` is NO ANSWER, not the registry's or helm's."""
     import yaml
     release = name or chart
     host, name = _split_repo(repo, chart)
     ref = f"oci://{host}/{name}:{version}"
-    out = {"images": [], "rendered": None, "render_error": None, "error": None, "paths": None, "measured": None}
+    out = {"images": [], "rendered": None, "render_error": None, "error": None, "paths": None, "measured": None,
+           "no_answer": False, "render_no_answer": False}
 
     def fetch():
-        bearer = _exchange(host, name, user, token)
+        bearer = _exchange(host, name, user, token, budget)
         req = urllib.request.Request(f"{API}/v2/{name}/manifests/{version}",
                                      headers={"Authorization": f"Bearer {bearer}",
                                               "Accept": "application/vnd.oci.image.manifest.v1+json"})
         try:
-            manifest = json.loads(_read(req, MANIFEST_MAX, HTTP_BOUND_S) or b"{}")
+            manifest = json.loads(_attempt("manifest read", HTTP_BOUND_S,
+                                           lambda: _read(req, MANIFEST_MAX, HTTP_BOUND_S), budget) or b"{}")
         except ValueError:
             raise _Refused("its manifest is not JSON") from None
         layers = [x for x in manifest.get("layers") or [] if x.get("mediaType") == HELM_CHART_LAYER]
         if len(layers) != 1:
             raise _Refused(f"{len(layers)} helm chart layers in its manifest")
-        data = _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer)
-        charts, vals, inflated, largest, parsed, members = _in_child(
-            "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
-            f"its chart files were not read within their {PARSE_BOUND_S:g} s bound")
+        data = _attempt("chart blob read", BLOB_BOUND_S,
+                        lambda: _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer), budget)
+        charts, vals, inflated, largest, parsed, members = _attempt(
+            "chart files read", PARSE_BOUND_S, lambda: _in_child(
+                "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
+                f"its chart files were not read within their {PARSE_BOUND_S:g} s bound"), budget)
         if not charts:
             raise _Refused("no Chart.yaml in its chart layer")
         out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
@@ -836,21 +953,24 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
             imgs.update(images_in_values(v, str(c.get("appVersion") or c.get("version") or version)))
         try:
             given = with_markers(values or {}, paths) if paths else (values or {})
-            docs = render(data, release, given, helm, meta=out["measured"])
+            docs = _attempt("helm template", RENDER_BOUND_S,
+                            lambda: render(data, release, given, helm, meta=out["measured"]), budget)
             out["rendered"] = images_in_manifests(docs)
             imgs.update(out["rendered"])
             if paths:
                 top = min(vals, key=len) if vals else None
                 out["paths"] = path_results(docs, paths, _merge(vals.get(top) or {}, given))
         except _Refused as e:
-            out["render_error"] = str(e)
+            out["render_error"], out["render_no_answer"] = str(e), isinstance(e, _NoAnswer)
         return sorted(imgs)
 
     res = _ref_error(ref, fetch)
     if isinstance(res, list):
         out["images"] = res
     else:
-        out["error"] = f"{ref}: its images unreadable: " + (res[len(ref) + 2:] if res.startswith(f"{ref}: ") else res)
+        why = res[len(ref) + 2:] if res.startswith(f"{ref}: ") else res
+        out["no_answer"] = res.no_answer
+        out["error"] = f"{ref}: " + ("its images unknown: " if res.no_answer else "its images unreadable: ") + why
     return out
 
 
@@ -950,6 +1070,24 @@ def dockerconfigjson(user: str, token: str) -> str:
     return json.dumps({"auths": {REGISTRY_HOST: {"username": user, "password": token, "auth": auth}}})
 
 
+def _phase(budget: Budget, items: list, share: float, one, no_answer) -> tuple[list, list[int]]:
+    """`one(item)` for every item (a chart, an image) within the step's bound, extended by this
+    phase's `share` per item: each once, then each whose result is NO ANSWER (`no_answer(result)`)
+    again, the least-tried first, while what is left of the bound holds one more whole share. Returns
+    the results (in `items`' order) and each one's number of attempts. A registry's own answer (a
+    refusal) is never asked again: it is an answer."""
+    budget.extend(len(items) * share)
+    out = [one(x) for x in items]
+    tries = [1] * len(items)
+    while True:
+        open_ = [k for k in range(len(items)) if no_answer(out[k])]
+        if not open_ or not budget.holds(share):
+            return out, tries
+        k = min(open_, key=lambda k: (tries[k], k))
+        out[k] = one(items[k])
+        tries[k] += 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.ghcr_pull")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -985,20 +1123,31 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:              # the installer's enable rule unreadable: nothing to resolve against
         print(f"refusing: {e}", file=sys.stderr)
         return 2
-    res, images, other = [], {}, {}
-    for p in pins:
+    # the step's bound, the one it always derived: every call it makes at its own WHOLE bound (_call;
+    # a resolve = 2 calls; a chart read = 2 calls, its blob and its files' parse; an image = 2 calls)
+    # and each render at its own. Run 25: it now also BOUNDS the step (Budget): every reference is
+    # tried once, then one with NO ANSWER again while what is left holds its whole share (_phase).
+    chart_s, image_s = 4 * HTTP_BOUND_S + BLOB_BOUND_S + PARSE_BOUND_S + RENDER_BOUND_S, 2 * HTTP_BOUND_S
+    budget = Budget()
+
+    def one_chart(p):
         ref = f"{p['repo']}/{p['chart']}"
-        err, render, ci = resolve(p["repo"], p["chart"], p["version"], user, token), None, None
+        err = resolve(p["repo"], p["chart"], p["version"], user, token, budget)
+        render, ci, no_answer = None, None, bool(err) and err.no_answer
         if not err:
             ci = chart_images(p["repo"], p["chart"], p["version"], user, token, p["values"], a.helm,
-                              name=p["name"], paths=(paths or {}).get(p["name"]))
-            err = ci["error"]
+                              name=p["name"], paths=(paths or {}).get(p["name"]), budget=budget)
+            err, no_answer = ci["error"], ci["no_answer"]
             render = (None if ci["error"] else ("failed: " + ci["render_error"]) if ci["render_error"]
                       else f"ok ({len(ci['rendered'])} images)")
             if not err and private is not None and p["name"] in private:
                 # the installer injects image-pull Secrets into this one: its images MUST be known
                 missing = [r["path"] for r in ci["paths"] or [] if r["result"] == "missing"]
-                if ci["render_error"]:
+                if ci["render_error"] and ci["render_no_answer"]:
+                    err, no_answer = (f"{ref}:{p['version']}: the installer lists it as a private-image "
+                                      f"component (inst.privateImageComponents) and its render gave no answer: "
+                                      f"{ci['render_error']}"), True
+                elif ci["render_error"]:
                     err = (f"{ref}:{p['version']}: the installer lists it as a private-image component "
                            f"(inst.privateImageComponents) and it cannot be rendered: {ci['render_error']}")
                 elif missing:
@@ -1006,17 +1155,30 @@ def main(argv: list[str] | None = None) -> int:
                            f"(inst.privateImageComponents), yet no rendered pod running a {REGISTRY_HOST} "
                            f"image carries the pull secret it injects at {', '.join(missing)} (the image "
                            f"behind it was never seen)")
-            for i in ci["images"]:
-                (images if i.startswith(REGISTRY_HOST + "/") else other).setdefault(i, []).append(p["name"])
-        res.append({"chart": ref, "version": p["version"], "render": render,
-                    "private_image_component": bool(private and p["name"] in private),
-                    "paths": ci["paths"] if ci else None, "measured": ci["measured"] if ci else None,
-                    "error": err})
-    img_res = [{"image": i, "charts": c, "error": resolve_image(i, user, token)} for i, c in sorted(images.items())]
-    # the step's bound: every call it made at its own WHOLE bound (_call; a resolve = 2 calls; a chart
-    # read = 2 calls, its blob and its files' parse; an image = 2 calls) and each render at its own
-    bound = (len(pins) * (4 * HTTP_BOUND_S + BLOB_BOUND_S + PARSE_BOUND_S + RENDER_BOUND_S)
-             + len(img_res) * 2 * HTTP_BOUND_S)
+        return ({"chart": ref, "version": p["version"], "render": render,
+                 "private_image_component": bool(private and p["name"] in private),
+                 "paths": ci["paths"] if ci else None, "measured": ci["measured"] if ci else None,
+                 "error": err, "no_answer": bool(err) and no_answer}, ci)
+
+    charts, chart_tries = _phase(budget, pins, chart_s, one_chart, lambda r: r[0]["no_answer"])
+    res, images, other = [], {}, {}
+    for p, (r, ci), n in zip(pins, charts, chart_tries):
+        res.append({**r, "attempts": n})
+        for i in (ci or {}).get("images") or []:
+            (images if i.startswith(REGISTRY_HOST + "/") else other).setdefault(i, []).append(p["name"])
+
+    def one_image(item):
+        i, c = item
+        err = resolve_image(i, user, token, budget)
+        return {"image": i, "charts": c, "error": err, "no_answer": bool(err) and err.no_answer}
+
+    imgs, img_tries = _phase(budget, sorted(images.items()), image_s, one_image, lambda r: r["no_answer"])
+    img_res = [{**r, "attempts": n} for r, n in zip(imgs, img_tries)]
+    for r in res + img_res:
+        if r["no_answer"]:
+            r["error"] = (f"{r['error']}; {r['attempts']} attempt(s), the step's {budget.total:g} s bound spent: "
+                          f"whether the token resolves it is unknown")
+    bound = budget.total
     how = (f"{len(pins)} charts x (4 x {HTTP_BOUND_S:g} + {BLOB_BOUND_S:g} + {PARSE_BOUND_S:g} + "
            f"{RENDER_BOUND_S:g} s) + {len(img_res)} images x (2 x {HTTP_BOUND_S:g} s)")
     stale = stale_inputs(res)
@@ -1026,7 +1188,8 @@ def main(argv: list[str] | None = None) -> int:
                    "private_image_components": sorted(private) if private is not None else None,
                    "charts": res, "images": img_res,
                    "images_elsewhere": [{"image": i, "charts": c} for i, c in sorted(other.items())]}, fh, indent=1)
-    print(f"[ghcr] the step's bound: {bound:g} s ({how})", file=sys.stderr)
+    print(f"[ghcr] the step's bound: {bound:g} s ({how}); a call with no answer is asked again within it",
+          file=sys.stderr)
     if private is None:
         print("[ghcr] this installer declares no inst.privateImageComponents: no private-image self-check",
               file=sys.stderr)
@@ -1041,11 +1204,19 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
     for line in stale_notes(stale):
         print(line, file=sys.stderr)
-    bad = [r["error"] for r in res + img_res if r["error"]]
-    if bad:
+    refused = [r["error"] for r in res + img_res if r["error"] and not r["no_answer"]]
+    unanswered = [r["error"] for r in res + img_res if r["error"] and r["no_answer"]]
+    if refused:
         print("refusing: the ghcr pull token does not resolve every chart and image this install pulls: "
-              + "; ".join(bad), file=sys.stderr)
-        return 3
+              + "; ".join(refused)
+              + (f" (and NO ANSWER for {len(unanswered)} more: " + "; ".join(unanswered) + ")" if unanswered else ""),
+              file=sys.stderr)
+        return EXIT_REFUSED
+    if unanswered:
+        print(f"refusing: NO ANSWER from the registry within the step's {bound:g} s bound for "
+              f"{len(unanswered)} of this install's charts and images, so whether the ghcr pull token resolves "
+              f"them is unknown (not that it does not): " + "; ".join(unanswered), file=sys.stderr)
+        return EXIT_NO_ANSWER
     return 0
 
 

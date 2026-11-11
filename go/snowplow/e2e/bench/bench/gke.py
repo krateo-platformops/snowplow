@@ -1592,6 +1592,15 @@ def release_lb_services(spec: ClusterSpec, describe: dict, *, log: Callable[[str
     run), "state": what happened}. Best effort, like the PVC release: what is
     left is the address backstop's, after the delete."""
     k = _kubectl(spec)
+    if not describe.get("endpoint"):
+        # run 25: clusters stopped while GKE was still creating them, before any kubeconfig was written,
+        # read as "an address may be left RESERVED". A cluster GKE gives no endpoint has no API server
+        # anyone could have reached: no Service, so no LoadBalancer address, of it can exist. Known,
+        # not unread: the address backstop has nothing of it to look for.
+        why = (f"GKE gives {spec.name} no API endpoint (its describe has none): no client ever reached its "
+               f"API server, so it has no LoadBalancer Service")
+        log(f"LB release: none: {why}")
+        return {"services": [], "state": f"none: {why}"}
     server, endpoint = _kubeconfig_server(k, describe, log=log)
     if not server or not endpoint or server != endpoint:
         why = (f"the bench kubeconfig's server ({server}) is not {spec.name}'s endpoint ({endpoint}): "
