@@ -1461,6 +1461,14 @@ def _break(fake, how):
         inst.write_text(json.dumps(d))
     elif how == "namesake":
         fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone="europe-west1-b", namesake=True)
+    elif how == "ttl-label":
+        d = json.loads(inst.read_text())
+        d["labels"] = {**d["labels"], "ttl-hours": "72"}
+        inst.write_text(json.dumps(d))
+    elif how == "termination-action":
+        d = json.loads(inst.read_text())
+        d["scheduling"]["instanceTerminationAction"] = "STOP"
+        inst.write_text(json.dumps(d))
 
 
 @pytest.mark.parametrize("how, why", [
@@ -1476,6 +1484,8 @@ def _break(fake, how):
     ("tags", f"{VM}'s network tags are []"),
     ("label", "is not labelled owner=snowplow-bench, run=run25"),
     ("namesake", f"{VM} (europe-west1-b) claim(s) run {RUN} too"),
+    ("ttl-label", f"{VM}'s ttl-hours label is not the record's 15"),
+    ("termination-action", f"{VM} does not delete itself at the record's"),
 ])
 def test_up_resume_refuses_anything_partial_or_not_as_made_and_changes_nothing(fake, capsys, monkeypatch, how, why):
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
@@ -1511,3 +1521,12 @@ def test_an_up_whose_create_failed_is_not_resumed(fake, capsys, monkeypatch):
     monkeypatch.delenv("FAKE_CREATE_FAIL")
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 2 and f"run {RUN} is in use: its record" in err
+
+
+def test_up_resume_confirms_the_parents_first(fake, capsys, monkeypatch):
+    _stopped_in_bootstrap(fake, capsys, monkeypatch)
+    monkeypatch.setenv("FAKE_PROJECT_STATE", "DELETE_REQUESTED")
+    n = len(fake_vm606.calls(fake))
+    rc, _out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
+    assert rc == 2 and f"project {PROJECT} is DELETE_REQUESTED, not ACTIVE" in err
+    assert [" ".join(c["argv"][:2]) for c in fake_vm606.calls(fake)[n:]] == ["projects describe"]
