@@ -36,7 +36,7 @@ func TestIssue1325_O1_AnOwedEmitAndACatchUpOfOneKeyAreOneFrame(t *testing.T) {
 	e := newK1062(t)
 	ResetStaleOwedForTest()
 	t.Cleanup(ResetStaleOwedForTest)
-	MarkStaleOwed(e.key) // the cell holds the fresh replacement
+	MarkStaleOwed(e.key, []byte(`{"body":"stale-derived"}`)) // the cell holds the fresh replacement
 	b0 := RefreshBroadcasterStatsSnapshot()
 	st := SubscribeRefreshStream(map[string]struct{}{e.key: {}})
 	defer st.Unsub()

@@ -1710,7 +1710,7 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // replaces the entry and adjusts curBytes accordingly. It reports whether it
 // wrote: the store's admission (admitWrite) can refuse.
 func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
-	return c.putPlain(context.Background(), false, key, entry)
+	return c.putPlain(context.Background(), false, false, key, entry).Stored()
 }
 
 // PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
@@ -1723,20 +1723,26 @@ func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
 // (generation preserved, unknown provenance for the #406 layer index); ctx only
 // ends the known-stale state, inside the same critical section as the write
 // (#734).
-func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) bool {
-	return c.putPlain(ctx, false, key, entry)
+//
+// #1321 — it reports the write's outcome (writeOutcome): the external-TTL
+// widget Put hands it to the publish gate, like every write of a cell a
+// /refreshes stream can be armed on.
+func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
+	return c.putPlain(ctx, false, true, key, entry)
 }
 
-// putPlain is the plain write the methods above share. It reports whether it
-// wrote.
-func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) bool {
+// putPlain is the plain write the methods above share. It reports the write's
+// outcome: PutRefused, or (#1321) PutIdentical / PutChanged against the entry
+// it replaced when outcome is set (writeOutcome). With outcome unset a stored
+// write reports PutChanged without comparing: the caller asks only Stored().
+func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown, outcome bool, key string, entry *ResolvedEntry) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission: an inert resolve, or a write
 	// while the RBAC snapshot is incomplete, stores nothing.
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
@@ -1754,6 +1760,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
 	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
 	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
@@ -1762,7 +1769,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	ksEnd.afterUnlock(key)
 	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1784,15 +1791,18 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 // #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
 // the raKey versions the body Go-sliced, so the layer check judges this Put by them.
 // #323's plain no-gen semantics are unchanged.
-func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) bool {
+//
+// #1321 — it reports the write's outcome (writeOutcome) for the publish gate.
+func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
 	// #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh
 	// body). A write the store did not admit (an inert resolve, an incomplete
 	// RBAC snapshot) stored nothing, and there is nothing to remark.
-	if !c.putPlain(ctx, true, key, entry) {
-		return false
+	put := c.putPlain(ctx, true, true, key, entry)
+	if !put.Stored() {
+		return PutRefused
 	}
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
-	return true
+	return put
 }
 
 // #890 / #893 — EDGES OF A CELL THAT IS NOT STORED.
@@ -1860,12 +1870,32 @@ func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key str
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
 func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, false).Stored()
+}
+
+// putIfGenOutcome is putIfGen reporting whether the accepted Put changed the
+// stored bytes (#1321, put_outcome.go): every caller hands the outcome to the
+// publish gate. A fill of an absent key is PutChanged; a #547 demand
+// revalidation or a keep-warm re-Put over a resident cell with the same bytes
+// is PutIdentical. The compare is writeOutcome's: against the entry this write
+// replaced, read in the write's own critical section (no extra c.mu), and run
+// off the lock.
+func (c *ResolvedCacheStore) putIfGenOutcome(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, true)
+}
+
+// putIfGenWrite is the gen-guarded write putIfGen and putIfGenOutcome share.
+// outcome says whether the caller consumes the outcome (writeOutcome). Only
+// then is anything compared beyond #406's own RAFullList compare: putIfGen's
+// callers (the GET-only content cells, the raFullList layer, fixtures) take no
+// frame decision, so they pay no compare (#1321 M1).
+func (c *ResolvedCacheStore) putIfGenWrite(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64, outcome bool) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
@@ -1878,13 +1908,14 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
-		return false
+		return PutRefused
 	}
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
@@ -1909,7 +1940,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	// #406 — a raKey commit with changed content remarks the widgets holding a slice of
 	// the old body; a widget Put of a slice of a since-superseded raKey remarks itself.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // ReplaceIfGen is the #189 generation-guarded REPLACE. It stores entry under key
@@ -2007,15 +2038,20 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 // #375 — like PutIfGen / ReplaceIfGen it takes the resolve ctx and, on ACCEPT,
 // runs remarkIfDepsMoved off-lock: a dep that moved during the re-mint resolve
 // remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
-// birth. #375's arm-9 reflective enumeration covers this method. Returns true
-// iff stored.
-func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// birth. #375's arm-9 reflective enumeration covers this method.
+//
+// #1321 — it returns the Put's outcome: PutRefused, or PutIdentical /
+// PutChanged from the #1070 compare confirmed under c.mu (the `identical`
+// verdict below). The caller publishes a frame only for PutChanged
+// (PublishRefreshed): an identical refresh still runs and still Puts, but it
+// announces nothing the subscriber does not already hold.
+func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	// #1070 — ONE byte compare of the refresh Put against the resident prior,
@@ -2031,11 +2067,12 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		c.putRefusedGenerationMovedTotal.Add(1)
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
-		return false
+		return PutRefused
 	}
 	// #1070 — identical only if the prior that compared equal is the one replaced
 	// here; any other resident entry (a write landed after the compare) counts the
-	// Put as changed, as #406 voids its compare.
+	// Put as changed, as #406 voids its compare. #1321 — the same verdict decides
+	// the frame (the return value).
 	identical := same != nil && el.Value.(*lruItem).entry == same
 	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
@@ -2070,7 +2107,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return putOutcomeOf(identical)
 }
 
 // remintLead is the #378 lead L: how long before the cap the refresher terminal

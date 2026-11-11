@@ -245,7 +245,7 @@ var closedAttributeKeys = map[string]struct{}{
 	// #1062 — layer on the stale-push instruments (snowplow_stale_to_push_ms,
 	// _stale_unreplaced_total, _stale_serves_total, _stale_serves_open,
 	// _stale_serve_closes_total): the closed cache.StaleLayers set {apistage,
-	// l1}, with close from cache.StalePushCloses {pushed, dropped}; pinned by
+	// l1}, with close from cache.StalePushCloses {pushed, dropped, identical}; pinned by
 	// stale_push_1062_otlp_test.go.
 	"layer": {},
 	// #1265 — handler and class_warm on snowplow_customer_serves_total (with

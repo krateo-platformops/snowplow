@@ -730,7 +730,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	rebuildPrior, hadRebuildPrior := c.GetNoTouch(key)
 	noteRefreshRebuild(rebuildPrior, hadRebuildPrior, encoded)
 
-	stored := c.ReplaceResolvedIfGenRefresh(rctx, verdict, key, entry, gen0)
+	put := c.ReplaceResolvedIfGenRefresh(rctx, verdict, key, entry, gen0)
+	stored := put.Stored()
 	cache.NoteRefreshWrite(rctx, key, stored)
 	// #603 PR-2 / #765 SHADOW audit — when every mark this cell received since
 	// its last refresh was a would-avoid, classify this rebuild against the
@@ -749,18 +750,23 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	}
 	// Ship 1 (live-refresh-coherence, option A) — emit the live-refresh
 	// signal STRICTLY post-commit, on the refresher path only. This line is
-	// reached ONLY after the Put returned and ONLY on a genuine L1 change:
-	// the four no-Put success-returns above (cache-off :96-99, declined
-	// :214-218, evicted-during-refresh :223-229, stage-error decline
-	// :243-260) all return before here, so the signal never fires when L1
-	// did not actually change (design §1.1 — coherent by construction).
+	// reached ONLY after the Put returned, and the signal fires ONLY on a
+	// genuine L1 change: the no-Put success-returns above (cache-off, declined,
+	// evicted-during-refresh, stage-error decline) all return before here, and
+	// #1321 — an ACCEPTED Put whose bytes equal the prior it replaced (put ==
+	// PutIdentical, the compare confirmed under the store lock) publishes
+	// nothing either: PublishRefreshed fans out only a PutChanged. Before #1321
+	// this gated on the new generation alone, so ~84% of frames on an idle 057
+	// announced bytes the subscriber already held (design §1.1 — coherent by
+	// construction). The refresh and its Put still ran; only the frame is
+	// withheld, counted snowplow_refresh_broadcaster.withheld_identical.
 	// resolveAndPopulateL1 is invoked ONLY from the refresher closure
 	// (dispatchers.go:86), never from cold dispatch or the prewarm walker, so
 	// this announces dep-change-driven re-resolves only. PublishRefresh is
 	// nil-safe and a no-op when the SSE layer is disabled or cache is off.
 	// #1070 — PublishRefreshed is PublishRefresh carrying this refresh's Put time
 	// (on rctx) so the frame it causes is timed from it (measurement only).
-	cache.PublishRefreshed(rctx, key)
+	cache.PublishRefreshed(rctx, key, put)
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),

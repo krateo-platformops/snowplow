@@ -268,19 +268,25 @@ func (h *s394RecordingHandle) PutResolved(v cache.PutVerdict, k string, e *cache
 func (h *s394RecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) bool {
 	return v.Store() && h.PutIfGen(ctx, k, e, g)
 }
-func (h *s394RecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+func (h *s394RecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) cache.PutOutcome {
+	if h.PutResolvedIfGen(ctx, v, k, e, g) {
+		return cache.PutChanged
+	}
+	return cache.PutRefused
+}
+func (h *s394RecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutThenRemark(ctx, k, e)
-	return true
+	return cache.PutChanged
 }
-func (h *s394RecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+func (h *s394RecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutEndingKnownStale(ctx, k, e)
-	return true
+	return cache.PutChanged
 }
 
 // #1255 — the unstorable-eviction surface; this handle holds no cell to evict.

@@ -40,7 +40,7 @@ func TestRefreshes1325_A1_AnOwedPushAndACatchUpOnOneKeyAreOneFrame(t *testing.T)
 	put1324(t, k, name, `{"v":"fresh"}`) // the replacement is stored
 	// The stale-derived response the tab holds, whose replacement's frame was
 	// published while no stream was armed: an owed mark, and a stale `held`.
-	cache.MarkStaleOwed(k)
+	cache.MarkStaleOwed(k, []byte(stale))
 	held := cache.ContentDigest([]byte(stale))
 	before := cache.RefreshBroadcasterStatsSnapshot()
 

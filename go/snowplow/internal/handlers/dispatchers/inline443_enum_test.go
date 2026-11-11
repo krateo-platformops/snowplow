@@ -69,15 +69,19 @@ var cacheAllow443 = map[string]cacheClass443{
 	"DepTracker.RecordList": gatedInCache443,
 	// #603 PR-2 SHADOW: RecordListNarrowable checks Inert itself; the commit
 	// and the widen are ctx-less and run only from commitNarrow, which checks it.
-	"DepTracker.RecordListNarrowable":        gatedInCache443,
-	"DepTracker.CommitListInterest":          gatedAtCaller443,
-	"DepTracker.WidenListInterest":           gatedAtCaller443,
-	"ListNarrowShadowOn":                     readOnly443,
-	"CommitWhyOfAnalysis":                    readOnly443,
-	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
-	"DepTracker.ReleaseUnstored":             gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
-	"ResolvedCacheStore.PutContentIfGen":     gatedInCache443,
-	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
+	"DepTracker.RecordListNarrowable":              gatedInCache443,
+	"DepTracker.CommitListInterest":                gatedAtCaller443,
+	"DepTracker.WidenListInterest":                 gatedAtCaller443,
+	"ListNarrowShadowOn":                           readOnly443,
+	"CommitWhyOfAnalysis":                          readOnly443,
+	"DepTracker.ReplayEdgesWithStates":             gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
+	"DepTracker.ReleaseUnstored":                   gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
+	"ResolvedCacheStore.PutContentIfGen":           gatedInCache443,
+	"ResolvedCacheStore.PutRAFullListIfGenOutcome": gatedInCache443, // #1321: PutRAFullListIfGen reporting its outcome; same Inert check (putRAFullListIfGen)
+	"PutOutcome.Stored":                            readOnly443,
+	// #1321 — publishes only a STORED outcome, and an inert resolve stores nothing
+	// (#443 (a)): under the flag it is always handed PutRefused and returns.
+	"PublishPutIfSubscribed":                 unreachableInert443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
 	// #1255 — an unstorable decline evicts the older cell; both refuse an inert ctx.
 	"ResolvedCacheStore.EvictOnPermanentDecline": gatedInCache443,
@@ -216,6 +220,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
+	// #1321 — the D2 replace's publish gate: the served body (a sink read), the
+	// cell's bytes (a stored entry's body, never mutated), whether the key is
+	// still owed a push (a map read). SettleStaleOwed clears an owed mark: only
+	// finishStaleReplace reaches it, on a debt serveStaleWithDebt's cache.Inert
+	// check let open (like PublishRefresh).
+	"StaleServeSink.ServedBody": readOnly443, "ResolvedEntry.Raw": readOnly443, "StaleOwed": readOnly443,
+	"SettleStaleOwed": unreachableInert443,
 	// #930 — reads the dirty-window clock (an atomic pointer load, time.Now by
 	// default) to age a known-stale mark; no state is written.
 	"DirtyWindowNow": readOnly443,

@@ -48,7 +48,7 @@ import (
 // an interface so the arm was RED, not a compile failure, on a tree without
 // the method; it exists now, and losing it reads as the #378 RED below.
 type r378RefreshPutter interface {
-	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
+	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome
 }
 
 func r378RefreshPut(t testing.TB, c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
@@ -58,7 +58,9 @@ func r378RefreshPut(t testing.TB, c *ResolvedCacheStore) func(context.Context, s
 		t.Fatalf("#378 RED: *ResolvedCacheStore has no replaceIfGenRefresh — the refresher terminal has no re-mint carrier, " +
 			"so a warm cell the refresher keeps body-fresh still reaches the C5 cap under a customer")
 	}
-	return rp.replaceIfGenRefresh
+	return func(ctx context.Context, key string, entry *ResolvedEntry, gen uint64) bool {
+		return rp.replaceIfGenRefresh(ctx, key, entry, gen).Stored()
+	}
 }
 
 // r378Stat reads one snowplow_resolved_cache stat; an absent stat is RED.

@@ -483,10 +483,13 @@ func (h *refreshBroadcaster) stopWindow(l1Key string) {
 // blocking the refresher goroutine or dropping. No-op when the layer is
 // disabled or no hub exists.
 //
-// Called from internal/handlers/dispatchers/resolve_populate.go,
-// immediately after the commit — strictly post-commit, so it fires only when
-// L1 actually changed (design §1.1) — and from the cold-dispatch
-// publishIfSubscribed. NOT paced: a refresher-driven refetch is an L1 HIT
+// Called (through the #1321 Put-outcome gate, put_outcome.go) from
+// internal/handlers/dispatchers/resolve_populate.go, immediately after the
+// commit — strictly post-commit, and only for a Put that changed the stored
+// bytes, so it fires only when L1 actually changed (design §1.1) — and from
+// the cold-dispatch publishIfSubscribed; and directly from the D2
+// stale-dependent replace (finishStaleReplace), which applies the same rule
+// against the body its client was served. NOT paced: a refresher-driven refetch is an L1 HIT
 // (feedback_customer_priority_over_refresher — pacing the eviction path must
 // never slow this one).
 func PublishRefresh(l1Key string) { publishRefresh(l1Key, refreshOwed{}) }
@@ -878,6 +881,10 @@ type RefreshStream struct {
 	// `refresh` frame per key on THIS connection, at once (not paced), the
 	// same path as Rotated. The handler decides which keys.
 	CatchUp func(keys []string)
+	// GatedMoved (#1328) announces armed gated keys whose served view for this
+	// connection's identity moved with an RBAC change while the stored bytes
+	// did not. Same delivery as CatchUp. The handler decides which keys.
+	GatedMoved func(keys []string)
 	// Wrote and WroteResync (#870, design v5.1 C2) tell the store-swap push
 	// ledger that a frame was WRITTEN to this stream — called by the handler
 	// after its writeFrame returned true, with no lock held. An offer is not a
@@ -918,7 +925,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	if h == nil {
 		ch := make(chan string)
 		close(ch)
-		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}, CatchUp: func([]string) {},
+		return RefreshStream{Keys: ch, Unsub: func() {}, Rotated: func([]string) {}, CatchUp: func([]string) {}, GatedMoved: func([]string) {},
 			Wrote: func(string) {}, WroteResync: func() {}}
 	}
 	limit, burst := refreshEvictionBucket()
@@ -1005,7 +1012,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	for k := range armedKeys {
 		armedCopy[k] = struct{}{}
 	}
-	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated, CatchUp: s.offerCatchUp,
+	return RefreshStream{Keys: s.ch, Resync: s.resync, Unsub: unsub, Rotated: s.offerRotated, CatchUp: s.offerCatchUp, GatedMoved: s.offerGatedMoved,
 		Wrote: func(k string) {
 			_, armed := onArm[k]
 			ledgerFrameWritten(k, armed)
@@ -1092,6 +1099,28 @@ func (s *refreshSub) offerCatchUp(keys []string) {
 	s.pmu.Lock()
 	s.armOffered = nil
 	s.pmu.Unlock()
+}
+
+// offerGatedMoved announces armed gated (identity-free, serve-time-gated) keys
+// whose served view for THIS connection's identity moved with an RBAC change
+// while the stored bytes did not (#1328; the handler decides which,
+// dispatchers refresh_gated_view.go). No Put announces such a change, so this
+// is its only frame. Same delivery as offerRotated / offerCatchUp: un-paced,
+// never dropped, only to this connection.
+func (s *refreshSub) offerGatedMoved(keys []string) {
+	h := s.hub
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, k := range keys {
+		if _, armed := s.keys[k]; !armed {
+			continue
+		}
+		s.pmu.Lock()
+		delete(s.pending, k)
+		s.offerRefreshLocked(k, refreshOwed{})
+		s.pmu.Unlock()
+		refreshGatedViewMovedTotal.Add(1)
+	}
 }
 
 // NoteRefreshArmHeld counts n armed keys whose arm carried a `held` digest
@@ -1272,6 +1301,9 @@ var (
 	// #870 ledger arm, #1324 catch-up) absorbed because the same arm had already
 	// offered the key (#1325 m1): one arm, one frame per key.
 	refreshArmDuplicateAbsorbedTotal atomic.Uint64
+	// refreshGatedViewMovedTotal counts (key -> subscriber) frames for an RBAC
+	// change that moved a gated key's served view with no write (#1328).
+	refreshGatedViewMovedTotal atomic.Uint64
 
 	// C12 — stream lifetime. stream_seconds_total / streams_closed_total is
 	// the mean stream lifetime; the instrument S8 found missing at every hop.
@@ -1350,6 +1382,7 @@ type RefreshBroadcasterStats struct {
 	PendingCoalesced      uint64  `stat:"pending_coalesced" desc:"Refresher-path signals absorbed because the key was already queued for that subscriber (delivered once, #484)."`
 	PendingOverflowResync uint64  `stat:"pending_overflow_resync" desc:"Subscribers force-resynced by the pending-drain stall rule: stream ended with a resync frame so the SPA re-validates every armed widget (#484)."`
 	Coalesced             uint64  `stat:"coalesced" desc:"Live-refresh signals coalesced."`
+	WithheldIdentical     uint64  `stat:"withheld_identical" desc:"Accepted Puts at a publish site whose bytes equal the prior they replaced, so no live-refresh signal was published (#1321). For the refresher it equals snowplow_refresh_cycle_put_total{content=identical}."`
 	Subscribers           int     `stat:"subscribers" kind:"gauge" desc:"Current live-refresh subscriber count."`
 	ArmedKeys             int     `stat:"armed_keys" kind:"gauge" desc:"Distinct L1 keys with at least one armed live-refresh subscriber (reverse-index size)."`
 	MaxSinkDepth          int64   `stat:"max_sink_depth" kind:"gauge" desc:"High-water mark of a subscriber sink after a send (consumer lag, 0..64)."`
@@ -1359,6 +1392,7 @@ type RefreshBroadcasterStats struct {
 	ArmHeld               uint64  `stat:"arm_held" desc:"Armed keys whose /refreshes arm carried a held digest (the X-Snowplow-Refresh-Digest of the tab's /call answer); the denominator of arm_catch_up (#1324)."`
 	ArmCatchUp            uint64  `stat:"arm_catch_up" desc:"Refresh frames sent at once on arm because the tab was behind: its held digest is not the digest of what its /call would answer now, or the cell is gone (#1324)."`
 	ArmDuplicateAbsorbed  uint64  `stat:"arm_duplicate_absorbed" desc:"Arm-time refresh offers (owed-push emit, store-swap ledger arm, catch-up) absorbed because the same arm had already offered that key: one arm writes at most one frame per key (#1325 m1)."`
+	GatedViewMoved        uint64  `stat:"gated_view_moved" desc:"Refresh frames for an RBAC change that moved what a tab is served from a gated (identity-free, serve-time-gated) key while its stored bytes did not: no write announces it (#1328)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
@@ -1384,6 +1418,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		Delivered:             refreshDeliveredTotal.Load(),
 		Dropped:               refreshDroppedTotal.Load(),
 		Coalesced:             refreshCoalescedTotal.Load(),
+		WithheldIdentical:     refreshWithheldIdenticalTotal.Load(),
 		Deferred:              refreshDeferredTotal.Load(),
 		TrailingEmitted:       refreshTrailingEmittedTotal.Load(),
 		PendingCoalesced:      refreshPendingCoalescedTotal.Load(),
@@ -1395,6 +1430,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		ArmHeld:               refreshArmHeldTotal.Load(),
 		ArmCatchUp:            refreshArmCatchUpTotal.Load(),
 		ArmDuplicateAbsorbed:  refreshArmDuplicateAbsorbedTotal.Load(),
+		GatedViewMoved:        refreshGatedViewMovedTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
@@ -1511,6 +1547,7 @@ func resetRefreshBroadcasterForTest() {
 	refreshRotationAnnouncedTotal.Store(0)
 	refreshArmCatchUpTotal.Store(0)
 	refreshArmDuplicateAbsorbedTotal.Store(0)
+	refreshGatedViewMovedTotal.Store(0)
 	refreshArmHeldTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)

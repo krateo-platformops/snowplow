@@ -434,12 +434,14 @@ func populateWidgetContentL1(
 		RawJSON: encoded,
 		Inputs:  inputs,
 	}
+	var put cache.PutOutcome
 	if cache.IsPhase1Done() {
 		// Post-readyz (keep-warm / gvr-discovered) re-Put — generation-guarded.
 		// PutIfGen (insert-or-replace): gvr-discovered cells FIRST-fill post-readyz,
 		// so an insert-on-absent (gen 0) must succeed; a mid-resolve DELETE tombstones
 		// the gen → refuse.
-		if !c.PutResolvedIfGen(ctx, verdict, key, entry, capturedGen) {
+		put = c.PutResolvedIfGenOutcome(ctx, verdict, key, entry, capturedGen)
+		if !put.Stored() {
 			log.Debug("widget_content.populate_refused_gen_moved",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -456,7 +458,8 @@ func populateWidgetContentL1(
 		// before this Put; a dep event in between dirty-marked a key that was not
 		// resident yet. The remark re-marks it once if any of those deps moved since
 		// the resolve began. It never refuses.
-		if !c.PutResolvedThenRemark(ctx, verdict, key, entry) {
+		put = c.PutResolvedThenRemark(ctx, verdict, key, entry)
+		if !put.Stored() {
 			return
 		}
 	}
@@ -470,6 +473,16 @@ func populateWidgetContentL1(
 	// recordWidgetDeps reads (the walker's `in` and `res` are the same CR
 	// shape; recordWidgetDeps is robust to either, but we mirror widgets.go).
 	recordWidgetDeps(ctx, log, key, gvr, res)
+
+	// #1321 B1 — the keep-warm walker re-Puts an ALREADY-RESIDENT shell, and a
+	// /refreshes stream can be armed on it (widgets.go stamps the shell key on a
+	// widgetContent hit). A re-Put that changed the shell's bytes announces the
+	// change itself: otherwise the refresher's later Put of the same bytes is
+	// identical, publishes nothing, and a tab holding the old shell is never
+	// told. The shell key folds no identity, exactly as on the refresher path,
+	// which has always published it: a frame names the key and nothing else, and
+	// each armed tab's refetch is gated for its own user (gateWidgetEnvelope).
+	publishIfSubscribed(key, put)
 }
 
 // isRBACSensitiveApiRefWidget reports whether `obj` (a widget CR's

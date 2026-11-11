@@ -39,16 +39,16 @@ var storeWrites1233 = []storeWrite1233{
 		return c.PutResolvedIfGen(ctx, fixtureStoreVerdict, k, entry1233("restactions"), c.CaptureGen(k))
 	}},
 	{name: "PutResolvedThenRemark", class: "widgets", do: func(ctx context.Context, c *ResolvedCacheStore, k string) bool {
-		return c.PutResolvedThenRemark(ctx, fixtureStoreVerdict, k, entry1233("widgets"))
+		return c.PutResolvedThenRemark(ctx, fixtureStoreVerdict, k, entry1233("widgets")).Stored()
 	}},
 	{name: "PutResolvedEndingKnownStale", class: "widgets", do: func(ctx context.Context, c *ResolvedCacheStore, k string) bool {
-		return c.PutResolvedEndingKnownStale(ctx, fixtureStoreVerdict, k, entry1233("widgets"))
+		return c.PutResolvedEndingKnownStale(ctx, fixtureStoreVerdict, k, entry1233("widgets")).Stored()
 	}},
 	{name: "ReplaceResolvedIfGen", class: "widgets", replace: true, do: func(ctx context.Context, c *ResolvedCacheStore, k string) bool {
 		return c.ReplaceResolvedIfGen(ctx, fixtureStoreVerdict, k, entry1233("widgets"), c.CaptureGen(k))
 	}},
 	{name: "ReplaceResolvedIfGenRefresh", class: "widgets", replace: true, do: func(ctx context.Context, c *ResolvedCacheStore, k string) bool {
-		return c.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, k, entry1233("widgets"), c.CaptureGen(k))
+		return c.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, k, entry1233("widgets"), c.CaptureGen(k)).Stored()
 	}},
 	{name: "PutRAFullList", class: CacheEntryClassRAFullList, noCtx: true, do: func(_ context.Context, c *ResolvedCacheStore, k string) bool {
 		c.PutRAFullList(fixtureStoreVerdict, k, ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList}, map[string]any{"items": []any{}})

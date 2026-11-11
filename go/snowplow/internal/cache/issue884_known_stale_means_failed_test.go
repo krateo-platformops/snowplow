@@ -270,7 +270,7 @@ func TestIssue884_F2_ARemarkedAcceptedRefreshEndsKnownStaleAtTheSettle(t *testin
 	// nothing) and the guard remarks it fail-fresh. The refresh still succeeded.
 	octx, o := withRefreshOutcome(context.Background(), key)
 	gen := c.CaptureGen(key)
-	stored := c.replaceIfGenRefresh(octx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen)
+	stored := c.replaceIfGenRefresh(octx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: mustInputs(t, c, key)}, gen).Stored()
 	NoteRefreshWrite(octx, key, stored)
 	if !stored || !o.accepted.Load() || !o.remarked.Load() {
 		t.Fatalf("PRECONDITION: want an accepted, remarked write (stored=%v accepted=%v remarked=%v)",
