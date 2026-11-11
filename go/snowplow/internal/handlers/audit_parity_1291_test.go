@@ -36,6 +36,8 @@ import (
 	"github.com/krateo-platformops/audit/audittest"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type parityShape1291 struct {
@@ -163,6 +165,71 @@ func TestAudit1291_Handlers_P_C_V_EveryShapeKeepsItsKeysAndConforms(t *testing.T
 		})
 	}
 	assertCoverageDocNames1291(t, docKeys)
+}
+
+// V (export) — an export's verb is the apiserver's verb for the read it
+// dialled through /call, never a constant.
+//
+// Through the handler: the /call lane an export dispatches always names its
+// object (it answers 400 to a read with no name, and an export passes that
+// failure through unaudited), so every audited export is a get, a
+// cluster-scoped one included (no namespace on the record, preview false).
+//
+// At the derivation (dialledVerb): a target with no name is a collection, and
+// the apiserver's verb for it is list. This is what tells "the dialled read's
+// verb" from a constant get.
+func TestAudit1291_Handlers_V_ExportVerbIsTheDialledRead(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		target auditTarget
+		want   string
+	}{
+		{"namespaced collection", auditTarget{gvr: schema.GroupVersionResource{Group: group1055, Version: version1055, Resource: "fireworksapps"},
+			nsn: types.NamespacedName{Namespace: "team-a"}}, "list"},
+		{"cluster-scoped collection", auditTarget{gvr: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}}, "list"},
+		{"namespaced object", auditTarget{gvr: schema.GroupVersionResource{Group: group1055, Version: version1055, Resource: "fireworksapps"},
+			nsn: types.NamespacedName{Namespace: "team-a", Name: "demo"}}, "get"},
+		{"cluster-scoped object", auditTarget{gvr: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+			nsn: types.NamespacedName{Name: "viewer"}}, "get"},
+		{"core object's status", auditTarget{gvr: schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, subresource: "status",
+			nsn: types.NamespacedName{Namespace: "default", Name: "cm-x"}}, "get"},
+	} {
+		if got := c.target.dialledVerb(); got != c.want {
+			t.Errorf("dialledVerb(%s) = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	cluster := func() http.Handler {
+		return Export(CallWithScopeResolver(func(schema.GroupVersionResource) (bool, error) { return false, nil }))
+	}
+	for _, c := range []struct {
+		shape         parityShape1291
+		verb, inNamed string
+	}{
+		{parityShape1291{name: "export.cluster-scoped", h: cluster, method: http.MethodGet,
+			target: "/export?format=json&apiVersion=rbac.authorization.k8s.io/v1&resource=clusterroles&name=viewer",
+			status: http.StatusOK, resp: body1055}, "get", ""},
+	} {
+		t.Run(c.shape.name, func(t *testing.T) {
+			r := serveParity1291(t, c.shape)
+			got := asStrings1291(r)
+			if got[krateoaudit.KeyVerb] != c.verb {
+				t.Errorf("krateo.audit.verb = %q, want %q", got[krateoaudit.KeyVerb], c.verb)
+			}
+			if got["k8s.namespace.name"] != c.inNamed {
+				t.Errorf("k8s.namespace.name = %q, want %q", got["k8s.namespace.name"], c.inNamed)
+			}
+			if got[krateoaudit.KeyPreview] != "false" {
+				t.Errorf("krateo.audit.preview = %q, want false", got[krateoaudit.KeyPreview])
+			}
+			if v, ok := got[krateoaudit.KeyDryRun]; ok {
+				t.Errorf("an export (a read) carries krateo.audit.dry_run=%q", v)
+			}
+			audittest.AssertConformant(t, audit.Writer, r)
+			audittest.AssertRequiredKeysDetected(t, audit.Writer, r)
+			audittest.AssertEnumsDetected(t, audit.Writer, r)
+		})
+	}
 }
 
 // assertCoverageDocNames1291 fails unless docs/architecture/audit-coverage.md

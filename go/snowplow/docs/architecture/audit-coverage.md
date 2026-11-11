@@ -43,7 +43,7 @@ shared schema (the library's `docs/schema.md`):
 | actor class | `krateo.audit.actor_class` | authn's signed `principal` claim of that actor (`UserInfo.ActorPrincipal()`, through `audit.ParseClaim`): `human`, `agent`, `controller` or `service`. A token with no claim (issued before authn 0.39.0) or an unknown value gets none, and the record is marked `actor_class`: **never defaulted** (Diego's ruling, #1291) |
 | delegation | `krateo.audit.on_behalf_of.user.name`, `krateo.audit.delegation` | only on a delegated (RFC 8693) token: the person the actor acts for (the token's `sub`), and the signed `act` chain, outermost actor first and ending with the subject, each `<class>:<subject>` (`:<subject>` when the token gives no class). One record names one principal |
 | action | `krateo.action` | the emit site: `call`, `call.dryRun`, `export`, `restaction`, `restaction.dryRun` (snowplow's own literals; readers use `krateo.audit.dry_run`) |
-| verb | `krateo.audit.verb` | the verb of what snowplow dialled, as its authority derives it: for a Kubernetes target the apiserver's own `RequestInfoFactory` on the method and URI that were dialled (`create`, `update`, `patch`, `delete`, `deletecollection`; `get` or `list` for an export), else the lowercase method (`post`, `put`, ...) |
+| verb | `krateo.audit.verb` | the verb of what snowplow dialled, as its authority derives it: for a Kubernetes target the apiserver's own `RequestInfoFactory` on the method and URI that were dialled (`create`, `update`, `patch`, `delete`, `deletecollection`; for an export, the verb of the read its `/call` lane dialled, which is `get`: that lane always names its object), else the lowercase method (`post`, `put`, ...) |
 | method | `http.request.method` | the method actually sent |
 | target | exactly one: `krateo.audit.object_ref.*` + `k8s.namespace.name` (and the v0.3 twins `k8s.resource.*`), or `server.address` | the Kubernetes object acted on, or the host a RESTAction stage wrote to |
 
@@ -80,7 +80,10 @@ apiserver state, and `false` for any other Kubernetes target, a cluster-scoped
 one included. It is never read from the object itself (whoever creates an
 object writes its labels). Snowplow keeps a metadata-only informer on
 namespaces over its own ServiceAccount (its grant reads every resource) and
-reads a Namespace the informer does not hold with one GET. When the Namespace
+reads a Namespace the informer does not hold with one GET. So until the
+informer has synced, and for a write into a Namespace that does not exist, the
+preview read is a synchronous GET on the request's context, made before the
+record is emitted (a NotFound answer is `false`). When the Namespace
 cannot be read, the flag is omitted and the record marked `preview`. A record
 that names only an external endpoint carries none. `TestAudit1291_P_*` and
 `TestAudit1291_R_*` pin it.
@@ -228,7 +231,7 @@ set (below).
 | `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298) |
 | `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true` |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
-| `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (or `list` for a collection), `http.request.method` the export's own; the success path, and a render or send failure |
+| `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (the `/call` lane it dials always names its object), `http.request.method` the export's own; the success path, and a render or send failure |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
 | a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, the #288 malformed-dial guard refuses the path, the resolve is not a customer request (#903, the row above), the stage it depends on did not succeed (#904: reported `Skipped` in `X-Snowplow-Stage-Outcomes`), or the pass was served stale content and its fresh re-run sends the write instead (#905: the withdrawn pass sends nothing, the re-run's dial is the one recorded) | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
