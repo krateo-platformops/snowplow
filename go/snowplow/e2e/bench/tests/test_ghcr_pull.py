@@ -1164,3 +1164,146 @@ def test_the_phase_retries_the_least_tried_and_stops_when_the_bound_cannot_hold_
     # 30 s bound; the first pass took 12 s; 18 s left holds one more share (10), then 8 s does not
     assert tries == [1, 2, 1] and t[0] == 22.0 and t[0] <= b.total == 30.0
     assert [r["x"] for r in out] == ["a", "dark", "c"]
+
+
+# ─── #1335 final review: every "no answer" the transport can give, and the claims the PR makes ──
+
+def _ssl_reason(reason):
+    import ssl
+    e = ssl.SSLError(1, f"[SSL: {reason}] {reason.lower()}")
+    e.reason = reason
+    return e
+
+
+@pytest.mark.parametrize("exc,want", [
+    (lambda: __import__("urllib.error").error.URLError(__import__("ssl").SSLEOFError(8, "EOF occurred")),
+     "the TLS connection ended (SSLEOFError)"),
+    (lambda: __import__("urllib.error").error.URLError(_ssl_reason("UNEXPECTED_EOF_WHILE_READING")),
+     "the TLS connection ended (SSLError: UNEXPECTED_EOF_WHILE_READING)"),
+    (lambda: _ssl_reason("UNEXPECTED_EOF_WHILE_READING"), "the TLS connection ended (SSLError: UNEXPECTED_EOF_WHILE_READING)"),
+    (lambda: __import__("urllib.error").error.URLError(
+        __import__("socket").gaierror(__import__("socket").EAI_AGAIN, "Temporary failure in name resolution")),
+     "name resolution failed for now (Temporary failure in name resolution)"),
+    (lambda: __import__("urllib.error").error.HTTPError("u", 408, "Request Timeout", {}, None),
+     "HTTP 408 Request Timeout: the registry did not answer for it now"),
+])
+def test_a_tls_drop_a_temporary_dns_failure_and_408_are_no_answer(monkeypatch, exc, want):
+    """Every call is https: a dropped connection surfaces as an SSL EOF; a resolver that cannot
+    answer now says EAI_AGAIN; 408 is the registry's own "no answer in time"."""
+    _flaky(monkeypatch, _is_chart_manifest_get, times=None, exc=exc)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM,
+                               budget=ghcr_pull.Budget(sleep=lambda s: None))
+    assert r["no_answer"] and f"no answer from the manifest read ({want})" in r["error"], r["error"]
+
+
+@pytest.mark.parametrize("exc", [
+    lambda: __import__("urllib.error").error.URLError(__import__("ssl").SSLCertVerificationError(1, "verify failed")),
+    lambda: __import__("urllib.error").error.URLError(
+        __import__("socket").gaierror(__import__("socket").EAI_NONAME, "nodename nor servname provided")),
+    lambda: __import__("urllib.error").error.URLError(ConnectionRefusedError(61, "Connection refused")),
+])
+def test_a_certificate_a_name_that_does_not_exist_and_a_refused_connection_are_answers(monkeypatch, exc):
+    _flaky(monkeypatch, _is_chart_manifest_get, times=None, exc=exc)
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM,
+                               budget=ghcr_pull.Budget(sleep=lambda s: None))
+    assert r["error"] and not r["no_answer"] and "its images unreadable: " in r["error"], r["error"]
+
+
+def _s_registry(tmp_path, rc: int, lines: list[str]) -> str:
+    """run606.sh's own s_registry (extracted as the kind arm extracts its functions), with the
+    preflight standing in: it writes `lines` to stderr and exits `rc`. Returns the run's log."""
+    from bench import data606_parity as dp
+    fn = dp.functions((BENCH_DIR / "run606.sh").read_text(), ["s_registry"])
+    log = tmp_path / "log"
+    stub = "".join(f"echo {json.dumps(ln)} >&2; " for ln in lines)
+    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; GHCR_PULL_ENV_FILE=x\n"
+              f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
+              f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
+              "write_installer_values() { :; }\n"
+              f"python3() {{ {stub}return {rc}; }}\n"
+              f"{fn}s_registry; echo \"rc=$?\" >> {log}\n")
+    subprocess.run(["bash", "-c", script], check=True)
+    return log.read_text()
+
+
+def test_run606_says_no_answer_for_the_preflights_exit_4_and_does_not_resolve_for_its_exit_3(tmp_path):
+    """The operator's line (run606 s_registry) follows the preflight's exit: 4 is NO ANSWER, never
+    "does not resolve"; 3 is the registry's own refusal; 0 passes."""
+    out = _s_registry(tmp_path, 4, ["[ghcr] the step's bound: 2280 s", "refusing: NO ANSWER from the registry ..."])
+    assert ("RECORD: registry FAILED: the registry gave NO ANSWER for some of this install's private charts and "
+            "images within the step's bound (above: which call, how often): whether the ghcr pull token resolves "
+            "them is unknown") in out and "does not resolve" not in out and out.endswith("rc=1\n")
+    assert "refusing: NO ANSWER from the registry ..." in out              # the preflight's own lines, logged
+    out = _s_registry(tmp_path, 3, ["refusing: the ghcr pull token does not resolve ..."])
+    assert "RECORD: registry FAILED: the ghcr pull token does not resolve this install's private charts" in out
+    out = _s_registry(tmp_path, 0, ["[ghcr] all OK"])
+    assert "RECORD" not in out.split("all OK")[-1] and out.endswith("rc=0\n")
+
+
+def _installer_private(tmp_path):
+    """An installer whose pins are agentgateway-controller and alert-provider, the latter a
+    private-image component (inst.privateImageComponents: its imagePullSecrets)."""
+    argv = _installer(tmp_path, charts=(("agentgateway-controller", "0.2.0"),))
+    pins = tmp_path / "installer" / "files" / "component-pins.yaml"
+    comps = yaml.safe_load(pins.read_text())["components"] + [
+        {"name": "alert-provider", "version": "0.2.53", "repo": "oci://ghcr.io/krateo-platformops/charts"}]
+    pins.write_text(yaml.safe_dump({"components": comps}))
+    (tmp_path / "installer" / "templates" / "_helpers.tpl").write_text(
+        '{{- define "inst.coreFeatures" -}}{{- end -}}\n'
+        '{{- define "inst.privateImageComponents" -}}\ncomponents:\n- name: alert-provider\n'
+        '  path: [imagePullSecrets]\n{{- end -}}\n')
+    return argv
+
+
+def test_a_private_image_render_with_no_answer_is_asked_again_not_refused(monkeypatch, tmp_path, capsys):
+    """A private-image component whose helm template does not finish once: its reference is asked
+    again within the bound, and renders."""
+    _small_bounds(monkeypatch)
+    state = tmp_path / "rendered-once"
+    helm = tmp_path / "helm-slow-once"
+    # `helm template <release> ...`: alert-provider's first render never finishes
+    helm.write_text(f"#!/bin/sh\nif [ \"$2\" = alert-provider ] && [ ! -e {state} ]; then : > {state}; exec sleep 60; fi\n"
+                    f"exec {HELM} \"$@\"\n")
+    helm.chmod(0o755)
+    argv = _installer_private(tmp_path)
+    argv[argv.index("--helm") + 1] = str(helm)
+    rc = ghcr_pull.main(argv)
+    err = capsys.readouterr().err
+    assert rc == 0, err[-2000:]
+    pf = json.loads((tmp_path / "pf.json").read_text())
+    ap = next(c for c in pf["charts"] if c["chart"].endswith("/alert-provider"))
+    assert ap["private_image_component"] and ap["error"] is None and ap["attempts"] == 2
+
+
+def test_an_image_with_no_answer_is_asked_again_in_its_own_phase(monkeypatch, tmp_path, capsys):
+    _small_bounds(monkeypatch)
+    seen = _flaky(monkeypatch, lambda r: r.get_method() == "HEAD" and "/agw-init/manifests/" in r.full_url,
+                  times=1, exc=ConnectionResetError)
+    rc = ghcr_pull.main(_installer(tmp_path))
+    err = capsys.readouterr().err
+    assert rc == 0 and seen["n"] == 1, err[-2000:]
+    pf = json.loads((tmp_path / "pf.json").read_text())
+    img = next(i for i in pf["images"] if "/agw-init:" in i["image"])
+    assert img["error"] is None and img["attempts"] == 2
+
+
+def test_a_definitive_refusal_wins_over_no_answer(monkeypatch, tmp_path, capsys):
+    """One chart refused (403) and one image never answered: exit 3, the refusal first, the
+    unanswered named beside it, never the other way round."""
+    import urllib.error
+    _small_bounds(monkeypatch)
+    real = ghcr_pull._OPEN
+
+    def opener(req, timeout=None):
+        if _is_chart_manifest_get(req):
+            raise urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+        if req.get_method() == "HEAD" and "/agw-init/manifests/" in req.full_url:
+            raise ConnectionResetError()
+        return real(req, timeout=timeout)
+    monkeypatch.setattr(ghcr_pull, "_OPEN", opener)
+    rc = ghcr_pull.main(_installer(tmp_path))
+    err = capsys.readouterr().err
+    assert rc == ghcr_pull.EXIT_REFUSED, err[-2000:]
+    head = next(ln for ln in err.splitlines() if ln.startswith("refusing: "))
+    assert head.startswith("refusing: the ghcr pull token does not resolve every chart and image this install pulls: ")
+    assert "HTTP 403 Forbidden" in head and " (and NO ANSWER for 1 more: " in head and "agw-init" in head

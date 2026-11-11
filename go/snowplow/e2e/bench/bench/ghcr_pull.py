@@ -105,6 +105,8 @@ import json
 import multiprocessing
 import os
 import re
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -374,13 +376,33 @@ class _NoAnswer(_Refused):
     when it has none, and then said as "no answer", never as "does not resolve"."""
 
 
-#: what ends a call with no answer: a timeout, a connection reset / aborted / dropped mid-answer
+#: what ends a call with no answer (#1335 review): a timeout; a connection reset, aborted or dropped
+#: mid-answer; a TLS connection that ended (every call is https: a dropped connection usually surfaces
+#: as an SSL EOF); a name resolution that failed for now (EAI_AGAIN, getaddrinfo's own "temporary
+#: failure"). Never a certificate that does not verify, a refused connection or a name that does not
+#: exist: those are answers.
 NO_ANSWER_ERRORS = (TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
                     http.client.IncompleteRead)
+SSL_DROPS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError)
+SSL_DROP_REASONS = frozenset({"UNEXPECTED_EOF_WHILE_READING"})
+TEMPORARY_EAI = frozenset({socket.EAI_AGAIN})
+#: HTTP statuses that say the registry cannot answer NOW (request timeout, too many requests, its
+#: own failure): no answer about the reference
+NO_ANSWER_STATUS = frozenset({408, 429})
 
 
-def _transport(e: BaseException) -> str:
-    return "timed out" if isinstance(e, TimeoutError) else f"the connection ended ({type(e).__name__})"
+def _unanswered(e: BaseException) -> str | None:
+    """Why `e` is no answer (its NO_ANSWER_ERRORS class, said), or None when it is an answer."""
+    if isinstance(e, TimeoutError):
+        return "timed out"
+    if isinstance(e, NO_ANSWER_ERRORS):
+        return f"the connection ended ({type(e).__name__})"
+    if isinstance(e, SSL_DROPS) or (isinstance(e, ssl.SSLError) and getattr(e, "reason", None) in SSL_DROP_REASONS):
+        reason = getattr(e, "reason", None)
+        return f"the TLS connection ended ({type(e).__name__}{': ' + reason if reason else ''})"
+    if isinstance(e, socket.gaierror) and e.errno in TEMPORARY_EAI:
+        return f"name resolution failed for now ({e.strerror or 'EAI_AGAIN'})"
+    return None
 
 
 class Budget:
@@ -472,15 +494,19 @@ def _read(req, cap: int, bound_s: float, whole: float | None = None) -> bytes:
                     if len(out) > cap:
                         raise _Refused(f"an answer larger than its {cap} byte bound")
         except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
+            if e.code in NO_ANSWER_STATUS or e.code >= 500:
                 raise _NoAnswer(f"HTTP {e.code} {e.reason}: the registry did not answer for it now") from None
             raise
         except urllib.error.URLError as e:
-            if isinstance(e.reason, NO_ANSWER_ERRORS):
-                raise _NoAnswer(_transport(e.reason)) from None
+            why = _unanswered(e.reason) if isinstance(e.reason, BaseException) else None
+            if why:
+                raise _NoAnswer(why) from None
             raise
-        except NO_ANSWER_ERRORS as e:
-            raise _NoAnswer(_transport(e)) from None
+        except (OSError, http.client.IncompleteRead) as e:
+            why = _unanswered(e)
+            if why:
+                raise _NoAnswer(why) from None
+            raise
     return _call(call, bound_s, whole=whole)
 
 
