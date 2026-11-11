@@ -84,6 +84,31 @@ if [[ ! "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "refusing: EXPECTED_IMAGE_DIGEST must be sha256:<64 lowercase hex>, got '${EXPECTED_IMAGE_DIGEST}'" >&2
   exit 2
 fi
+# Run 26: the frontend image, overridden per run like snowplow's (optional;
+# BOTH or NEITHER). FRONTEND_TAG is rendered as componentValues.frontend.image.tag
+# (the frontend chart's own key: values.yaml image.tag, empty = its appVersion,
+# chart 1.8.34; deployment.yaml renders image.registry/image.repository:image.tag),
+# the registry preflight renders and resolves the frontend chart with it, and
+# after the reboot, BEFORE any load, every live frontend pod's imageID must
+# carry EXPECTED_FRONTEND_DIGEST, or the run is VOID, exactly as snowplow's.
+# Unset: the installer's pinned frontend runs, and nothing here changes.
+FRONTEND_TAG="${FRONTEND_TAG:-}"
+EXPECTED_FRONTEND_DIGEST="${EXPECTED_FRONTEND_DIGEST:-}"
+if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
+  if [[ -z "$FRONTEND_TAG" || -z "$EXPECTED_FRONTEND_DIGEST" ]]; then
+    echo "refusing: FRONTEND_TAG and EXPECTED_FRONTEND_DIGEST are set together or not at all (FRONTEND_TAG='${FRONTEND_TAG}', EXPECTED_FRONTEND_DIGEST='${EXPECTED_FRONTEND_DIGEST}')" >&2
+    exit 2
+  fi
+  if [[ ! "$FRONTEND_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo "refusing: FRONTEND_TAG must be an image tag ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}), got '${FRONTEND_TAG}'" >&2
+    exit 2
+  fi
+  if [[ ! "$EXPECTED_FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "refusing: EXPECTED_FRONTEND_DIGEST must be sha256:<64 lowercase hex>, got '${EXPECTED_FRONTEND_DIGEST}'" >&2
+    exit 2
+  fi
+fi
+FRONTEND_POD_SELECTOR="${FRONTEND_POD_SELECTOR:-app.kubernetes.io/name=frontend}"
 # Bound on waiting for the old ReplicaSet's Terminating pod to go before the
 # digest gate judges (10x the default 30 s termination grace period).
 DIGEST_SETTLE_S="${DIGEST_SETTLE_S:-300}"
@@ -871,6 +896,12 @@ s_up() {
 # once that ships the derived path ("") works too, and going back is a later
 # decision.
 write_installer_values() {
+  # run 26: the frontend's image override, appended to componentValues only when
+  # FRONTEND_TAG is set (unset: the file is byte-identical to before)
+  local frontend_values=""
+  if [[ -n "$FRONTEND_TAG" ]]; then
+    frontend_values=$'\n  frontend:\n    image:\n      tag: "'"${FRONTEND_TAG}"'"'
+  fi
   cat > "$OUT/installer-values.yaml" <<EOF
 bootstrap:
   coreProvider:
@@ -918,7 +949,7 @@ componentValues:
     - key: dedicated
       operator: Equal
       value: snowplow
-      effect: NoSchedule
+      effect: NoSchedule${frontend_values}
 registryAuth:
   enabled: true
   # username: set at install from the pull-token file, piped into helm's -f - (not kept)
@@ -942,9 +973,15 @@ EOF
 # token).
 s_registry() {
   write_installer_values
-  local rc=0 ln
+  local rc=0 ln override=()
+  # run 26: the frontend image the run overrides is rendered and resolved too
+  if [[ -n "$FRONTEND_TAG" ]]; then
+    override=(--override "frontend=${FRONTEND_TAG}")
+    log "frontend image override: componentValues.frontend.image.tag=${FRONTEND_TAG}, expected digest ${EXPECTED_FRONTEND_DIGEST} (gated before any load)"
+  fi
   python3 -m bench.ghcr_pull preflight --env-file "$GHCR_PULL_ENV_FILE" --installer-pulled "$OUT/installer-pulled" \
-      --values "$OUT/installer-values.yaml" --out "$OUT/ghcr-pull-preflight.json" 2>"$KERR" || rc=$?
+      --values "$OUT/installer-values.yaml" --out "$OUT/ghcr-pull-preflight.json" \
+      ${override[@]+"${override[@]}"} 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
@@ -1539,36 +1576,47 @@ s_digest() {
   # VOID gate (run 8): after the reboot, before any load. Reads what the
   # kubelet PULLED (status.containerStatuses[].imageID) for every live
   # snowplow pod; the record (expected, every pod's imageID and digest) is
-  # kept in $OUT/image-digest.jsonl and fed to the verdict.
+  # kept in $OUT/image-digest.jsonl and fed to the verdict. Run 26: with
+  # FRONTEND_TAG, the same gate over every live frontend pod against
+  # EXPECTED_FRONTEND_DIGEST ($OUT/frontend-digest.jsonl), before any load too.
+  digest_gate snowplow "$SNOWPLOW_POD_SELECTOR" "$EXPECTED_IMAGE_DIGEST" image_digest "$OUT/image-digest.jsonl" \
+    || return 1
+  [[ -z "$FRONTEND_TAG" ]] \
+    || digest_gate frontend "$FRONTEND_POD_SELECTOR" "$EXPECTED_FRONTEND_DIGEST" frontend_image_digest \
+         "$OUT/frontend-digest.jsonl"
+}
+# digest_gate <what> <pod selector> <expected digest> <record kind> <record file>
+digest_gate() {
+  local what="$1" sel="$2" expected="$3" kind="$4" rec="$5"
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: snowplow pods imageID == $EXPECTED_IMAGE_DIGEST (else VOID)"
+    log "DRY: ${what} pods imageID == $expected (else VOID)"
     return 0
   fi
   # `rollout status` returns once the old ReplicaSet reports 0 replicas, while
-  # its pod may still be Terminating: wait (bounded) until no snowplow pod has
+  # its pod may still be Terminating: wait (bounded) until no such pod has
   # a deletionTimestamp, so neither this gate nor the before-record can read
   # a leftover. A leftover that never clears fails the step, by name.
   local rc deadline=$(( $(date +%s) + DIGEST_SETTLE_S ))
   while true; do
     rc=0
-    "${K[@]}" -n krateo-system get pods -l "$SNOWPLOW_POD_SELECTOR" -o json \
-      | python3 -m bench.load606 digest-gate --expected "$EXPECTED_IMAGE_DIGEST" \
-          --require-settled > "$OUT/image-digest.jsonl" || rc=$?
+    "${K[@]}" -n krateo-system get pods -l "$sel" -o json \
+      | python3 -m bench.load606 digest-gate --expected "$expected" --kind "$kind" --what "$what" \
+          --require-settled > "$rec" || rc=$?
     (( rc == 4 )) || break
     if (( $(date +%s) >= deadline )); then
-      log "digest gate: a snowplow pod is still Terminating after ${DIGEST_SETTLE_S}s: $(cut -c1-600 "$OUT/image-digest.jsonl")"
+      log "digest gate: a ${what} pod is still Terminating after ${DIGEST_SETTLE_S}s: $(cut -c1-600 "$rec")"
       log "FAILED: rollout leftovers did not clear; no load is applied"
       return 1
     fi
-    log "digest gate: waiting for Terminating snowplow pod(s) to go ($(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["terminating"]))' < "$OUT/image-digest.jsonl"))"
+    log "digest gate: waiting for Terminating ${what} pod(s) to go ($(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["terminating"]))' < "$rec"))"
     sleep "$DIGEST_POLL_S"
   done
-  log "image digest gate: $(cut -c1-600 "$OUT/image-digest.jsonl" 2>/dev/null)"
+  log "image digest gate: $(cut -c1-600 "$rec" 2>/dev/null)"
   if (( rc != 0 )); then
-    log "VOID: a snowplow pod does not run ${EXPECTED_IMAGE_DIGEST} (gate exit ${rc}); no load is applied"
+    log "VOID: a ${what} pod does not run ${expected} (gate exit ${rc}); no load is applied"
     return 1
   fi
-  log "image digest MATCH: every live snowplow pod runs ${EXPECTED_IMAGE_DIGEST}"
+  log "image digest MATCH: every live ${what} pod runs ${expected}"
 }
 s_measure() {
   # Load: in-cluster on the tainted loadgen pool, one Indexed-Job pod per
@@ -2430,19 +2478,24 @@ s_evaluate() {
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
                "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl "$OUT"/incluster-placement.jsonl "$OUT"/observer-pod.jsonl
-               "$OUT"/netns*.jsonl)   # a glob: nullglob drops it when the sampler left no file
+               "$OUT"/netns*.jsonl "$OUT"/frontend-digest*.jsonl)   # globs: nullglob drops them when no file is there (frontend-digest: run 26, only with FRONTEND_TAG)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
   # run 23: the tracing readings (tracing_reading), INFO lines; a missing file reads UNKNOWN
   local trargs=(--tracing "$OUT/tracing.json")
+  # run 26: the frontend override and its digest, judged like snowplow's (none without FRONTEND_TAG)
+  local feargs=()
+  if [[ -n "$FRONTEND_TAG" ]]; then
+    feargs=(--frontend-tag "$FRONTEND_TAG" --expect-frontend-digest "$EXPECTED_FRONTEND_DIGEST")
+  fi
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${apfargs[*]}"; return 0
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${apfargs[*]}${feargs[*]+ ${feargs[*]}}"; return 0
   fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
@@ -2458,7 +2511,7 @@ s_evaluate() {
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
-      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${apfargs[@]}" > "$OUT/verdict.json" || vrc=$?
+      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} > "$OUT/verdict.json" || vrc=$?
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   : > "$VERDICT_MARK"        # #1051: the verdict is final; teardown never recomputes it
   # Every INVALID reason in the run log, not only in verdict.json (#817: run

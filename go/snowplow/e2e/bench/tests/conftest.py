@@ -125,6 +125,11 @@ FAKE_CHART_VALUES = {
     # ServiceAccount, and its Deployment and Job only name that ServiceAccount
     "alert-provider": {"imagePullSecrets": [],
                        "image": {"repository": "ghcr.io/krateo-platformops/alert-provider", "tag": ""}},
+    # run 26: the frontend in the REAL 1.8.34 shape (helm show values): registry and repository
+    # apart, an empty tag = the chart's appVersion; deployment.yaml joins them (krateo.image)
+    "frontend": {"global": {"imageRegistry": ""},
+                 "image": {"registry": "ghcr.io", "repository": "krateo-platformops/frontend",
+                           "pullPolicy": "IfNotPresent", "tag": ""}},
 }
 #: each chart's templates, real Helm templates (rendered by the real helm)
 FAKE_CHART_TEMPLATES = {
@@ -209,6 +214,28 @@ spec:
       containers:
       - name: c
         image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+"""},
+    # run 26: frontend 1.8.34's deployment.yaml image line, through its krateo.image helper
+    "frontend": {"templates/_helpers.tpl": """{{- define "krateo.image" -}}
+{{- $g := .global | default dict -}}
+{{- $registry := $g.imageRegistry | default .img.registry -}}
+{{- $tag := .img.tag | default .defaultTag -}}
+{{- if $registry -}}
+{{- printf "%s/%s:%s" $registry .img.repository $tag -}}
+{{- else -}}
+{{- printf "%s:%s" .img.repository $tag -}}
+{{- end -}}
+{{- end -}}
+""", "templates/deployment.yaml": """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  template:
+    spec:
+      containers:
+      - name: frontend
+        image: {{ include "krateo.image" (dict "img" .Values.image "global" .Values.global "defaultTag" .Chart.AppVersion) | quote }}
 """},
 }
 
