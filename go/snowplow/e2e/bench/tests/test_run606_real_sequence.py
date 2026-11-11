@@ -729,6 +729,19 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
+    if a[:3] == ["rollout", "status", "deploy/frontend"] and os.environ.get("FAKE_FRONTEND_ROLLOUT_FAIL") == "1":
+        # run 26: the frontend's rollout never completes (a pod still Pending)
+        print('error: timed out waiting for the condition', file=sys.stderr)
+        sys.exit(1)
+    if (a[:2] == ["get", "pods"] and "app.kubernetes.io/name=frontend" in a and "json" in a
+            and os.environ.get("FAKE_FRONTEND_DIGEST")):
+        # run 26: the frontend's pod, its imageID at FAKE_FRONTEND_DIGEST (FRONTEND_TAG runs)
+        with open(os.path.join(STATE, "frontend_pod_reads"), "a") as fh:
+            fh.write("1")
+        print(json.dumps({"items": [{"metadata": {"name": "frontend-abc"}, "status": {"containerStatuses": [{
+            "name": "frontend", "ready": True, "image": "ghcr.io/krateo-platformops/frontend:1.8.38",
+            "imageID": "ghcr.io/krateo-platformops/frontend@" + os.environ["FAKE_FRONTEND_DIGEST"]}]}}]}))
+        sys.exit(0)
     if a[:2] == ["get", "pods"] and "app.kubernetes.io/name=snowplow" in a and "json" in a:
         # snowplow's own pod: optionally OOM-restarted between the before/after
         # records (FAKE_RESTART_DURING_MEASURE=1). Before the installer's helm install
@@ -1449,7 +1462,10 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 # a private pin of a feature that is off unless the chart makes it a core feature,
                 # at a version the fake registry has not published: preflighted only when on
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
-                 "feature": "specialistAgents"}]}))
+                 "feature": "specialistAgents"}]
+                # run 26 (FAKE_FRONTEND_PIN=1): the frontend, as 0.3.545 pins it (no repo of its own)
+                + ([{"name": "frontend", "kind": "Frontend", "chart": "frontend", "version": "1.8.34",
+                     "feature": "portal"}] if os.environ.get("FAKE_FRONTEND_PIN") == "1" else [])}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")

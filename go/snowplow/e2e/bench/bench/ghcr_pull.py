@@ -68,6 +68,11 @@ The preflight resolves, before any cluster exists:
     and must render at least one ghcr.io image, or the derivation is not to
     be trusted and the run is refused. A render failure of any other chart is
     recorded, not refused.
+  - every component whose image the run overrides (--override COMPONENT=TAG;
+    run606's FRONTEND_TAG, run 26), whatever its repo: this install must
+    enable it, it must render with the run's values, and a ghcr.io image it
+    renders must carry that tag (then resolved like every other image), or
+    the run is refused: the overridden image is the one the run will pull.
 
 Every registry read is bounded: in size (a blob at its declared size, a
 manifest or a token answer at the distribution spec's 4 MiB) and in time (each
@@ -1125,6 +1130,9 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--values", required=True)
     pf.add_argument("--out", required=True)
     pf.add_argument("--helm", default="helm", help="the helm that renders each chart (helm template)")
+    pf.add_argument("--override", action="append", default=[], metavar="COMPONENT=TAG",
+                    help="a component whose image this run overrides (its componentValues in --values): "
+                         "preflighted whatever its repo; refused unless a ghcr.io image it renders has TAG")
     a = ap.parse_args(argv)
     why = check(a.env_file)
     if why:
@@ -1142,12 +1150,24 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "dockerconfigjson":
         sys.stdout.write(dockerconfigjson(user, token))
         return 0
+    overrides = {}
+    for o in a.override:
+        comp, eq, tag = o.partition("=")
+        if not (comp and eq and tag) or comp in overrides:
+            print(f"refusing: --override {o!r}: COMPONENT=TAG, one per component", file=sys.stderr)
+            return 2
+        overrides[comp] = tag
     try:
         paths = private_image_paths(a.installer_pulled)
         private = None if paths is None else set(paths)
-        pins = private_pins(a.installer_pulled, a.values, include=private or frozenset())
+        pins = private_pins(a.installer_pulled, a.values, include=(private or set()) | set(overrides))
     except ValueError as e:              # the installer's enable rule unreadable: nothing to resolve against
         print(f"refusing: {e}", file=sys.stderr)
+        return 2
+    absent = sorted(set(overrides) - {p["name"] for p in pins})
+    if absent:
+        print(f"refusing: the run overrides the image of {', '.join(absent)}, which this install does not "
+              f"enable (no pin, or its feature is off): the override would run nowhere", file=sys.stderr)
         return 2
     # the step's bound, the one it always derived: every call it makes at its own WHOLE bound (_call;
     # a resolve = 2 calls; a chart read = 2 calls, its blob and its files' parse; an image = 2 calls)
@@ -1181,8 +1201,24 @@ def main(argv: list[str] | None = None) -> int:
                            f"(inst.privateImageComponents), yet no rendered pod running a {REGISTRY_HOST} "
                            f"image carries the pull secret it injects at {', '.join(missing)} (the image "
                            f"behind it was never seen)")
+            if not err and p["name"] in overrides:
+                # the run overrides this one's image: the image it renders must be the one overridden
+                want = overrides[p["name"]]
+                hits = [i for i in ci["rendered"] or []
+                        if i.startswith(REGISTRY_HOST + "/") and split_image(i)[2] == want]
+                if ci["render_error"] and ci["render_no_answer"]:
+                    err, no_answer = (f"{ref}:{p['version']}: the run overrides its image (tag {want}) and its "
+                                      f"render gave no answer: {ci['render_error']}"), True
+                elif ci["render_error"]:
+                    err = (f"{ref}:{p['version']}: the run overrides its image (tag {want}) and it cannot be "
+                           f"rendered: {ci['render_error']}")
+                elif not hits:
+                    err = (f"{ref}:{p['version']}: the run overrides its image (tag {want}), yet no "
+                           f"{REGISTRY_HOST} image it renders carries that tag (rendered: "
+                           f"{', '.join(ci['rendered'] or []) or 'none'})")
         return ({"chart": ref, "version": p["version"], "render": render,
                  "private_image_component": bool(private and p["name"] in private),
+                 **({"image_override": overrides[p["name"]]} if p["name"] in overrides else {}),
                  "paths": ci["paths"] if ci else None, "measured": ci["measured"] if ci else None,
                  "error": err, "no_answer": bool(err) and no_answer}, ci)
 

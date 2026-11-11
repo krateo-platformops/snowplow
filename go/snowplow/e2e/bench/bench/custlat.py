@@ -1204,6 +1204,25 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                   {"a": dig[0], "b": dig[1]}, "two different images, each the one its run was launched with",
                   "the pair is not the two images it was launched to compare"),
     ]
+    # run 26: a run that overrode its frontend (FRONTEND_TAG) says so in report.frontend_image; then
+    # the pair compares snowplow only when both runs ran the SAME frontend, each its gate's MATCH
+    fe = [(v.get("report") or {}).get("frontend_image") for v in (va, vb)]
+    frontend = None
+    if fe[0] is not None or fe[1] is not None:
+        sig = [None if f is None else (f.get("override_tag"), f.get("expected")) for f in fe]
+        validity.append(_validity(
+            "frontends", None not in sig and sig[0] == sig[1] and all(f.get("result") == "MATCH" for f in fe),
+            {"a": sig[0] and list(sig[0]), "b": sig[1] and list(sig[1])},
+            "both runs ran one frontend (the same override tag and digest, each its gate's MATCH)",
+            "the pair compares two frontends, or a frontend its gate did not see: only snowplow may differ"))
+
+        def one(x, f):
+            if f is None:
+                return f"{x} the installer's pinned frontend (no override)"
+            return (f"{x} frontend {f.get('override_tag')} (override), expected {f.get('expected')}, "
+                    f"observed {', '.join(f.get('observed') or []) or 'none'} ({f.get('result')})")
+        frontend = {"a": fe[0], "b": fe[1], "line": "INFO frontend: " + "; ".join(
+            one(x, f) for x, f in (("A", fe[0]), ("B", fe[1])))}
     out = {"kind": "customer_latency_pair", "checks": [], "cells": [], "validity": validity,
            "method": {"block_s": BLOCK_S, "half_samples": HALF_SAMPLES, "half_seed": HALF_SEED,
                       "family_alpha": FAMILY_ALPHA,
@@ -1224,6 +1243,8 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                       # A/A pair of the same launch: replica_in_run)
                       "replica_source": _replica_source(replica, launch)}}
     out["replica_source"] = out["method"]["replica_source"]
+    if frontend is not None:
+        out["frontend"] = frontend
     # ── restarts: B's FAIL the pair; A's are recorded (module doc) ──
     rs = {x: ((rd or {}).get("restarts") or {}) for x, rd in (("a", rda), ("b", rdb))}
     out["restarts"] = rs

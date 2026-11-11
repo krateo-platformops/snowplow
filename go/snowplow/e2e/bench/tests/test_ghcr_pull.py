@@ -1216,7 +1216,8 @@ def _s_registry(tmp_path, rc: int, lines: list[str]) -> str:
     fn = dp.functions((BENCH_DIR / "run606.sh").read_text(), ["s_registry"])
     log = tmp_path / "log"
     stub = "".join(f"echo {json.dumps(ln)} >&2; " for ln in lines)
-    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; GHCR_PULL_ENV_FILE=x\n"
+    # FRONTEND_TAG: run606 always sets it (empty: no frontend override, run 26)
+    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; GHCR_PULL_ENV_FILE=x; FRONTEND_TAG=\n"
               f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
               f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
               "write_installer_values() { :; }\n"

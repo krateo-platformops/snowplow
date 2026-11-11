@@ -45,6 +45,12 @@
 # Per run L (required):  RUN_NAME_L, SNOWPLOW_TAG_L, EXPECTED_IMAGE_DIGEST_L,
 #                        BENCH_606_GO_L (Diego's go PER RUN, as run606.sh:
 #                        <YYYYMMDD>-<RUN_NAME>); OUT_L optional.
+# Per run L (optional, run 26): FRONTEND_TAG_L + EXPECTED_FRONTEND_DIGEST_L, both
+#       or neither: run606.sh's frontend override (componentValues.frontend.image.tag,
+#       its registry preflight, its digest gate before any load). The same on EVERY
+#       run (refused otherwise): a pair compares snowplow only. pair.json and the
+#       runs line record it per run; each paired verdict's `frontend` says what
+#       both runs' gates observed.
 # #1004's full-widen stage (after each run's evaluate step): BENCH_1004_GO_L,
 # Diego's go for it PER RUN in the same form; on every run or on none (part of
 # a stage cannot be compared), and its one switch.
@@ -134,8 +140,25 @@ for x in "${LABELS[@]}"; do
     w="${v}_$x"; [[ -n "${!w:-}" ]] || refuse "$w is required (one per run)"
   done
 done
-for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT; do
+for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT FRONTEND_TAG EXPECTED_FRONTEND_DIGEST; do
   [[ -z "${!v:-}" ]] || refuse "$v is per run (set ${v}_<run>, one per run of ${LABELS[*]}): unset it"
+done
+# Run 26: the frontend image, per run like snowplow's (FRONTEND_TAG_<L> and
+# EXPECTED_FRONTEND_DIGEST_<L>, both or neither; run606.sh renders and gates it).
+# A pair compares SNOWPLOW only: every run runs one frontend, so every run's
+# FRONTEND_TAG and EXPECTED_FRONTEND_DIGEST are the same (all unset: the
+# installer's pinned frontend on every run, as before).
+fx="${LABELS[0]}"
+for x in "${LABELS[@]}"; do
+  ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x"
+  if [[ -n "${!ft:-}" && -z "${!fd:-}" ]] || [[ -z "${!ft:-}" && -n "${!fd:-}" ]]; then
+    refuse "$ft and $fd are set together or not at all (run $x)"
+  fi
+  ftx="FRONTEND_TAG_$fx" fdx="EXPECTED_FRONTEND_DIGEST_$fx"
+  [[ "${!ft:-}" == "${!ftx:-}" ]] \
+    || refuse "$ft (${!ft:-unset}) and $ftx (${!ftx:-unset}) differ: a pair compares snowplow only, every run runs one frontend"
+  [[ "${!fd:-}" == "${!fdx:-}" ]] \
+    || refuse "$fd (${!fd:-unset}) and $fdx (${!fdx:-unset}) differ: a pair compares snowplow only, every run runs one frontend"
 done
 [[ -z "${DRIVE_S:-}" ]] || refuse "DRIVE_S is derived by K6_SPAN=churn: unset it"
 [[ "${K6_SPAN:-churn}" == "churn" ]] || refuse "a pair runs K6_SPAN=churn (customers on through every churn step)"
@@ -233,6 +256,11 @@ runenv() {
   local out="OUT_$1" fw="BENCH_1004_GO_$1"
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
           BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}")
+  # run 26: the run's frontend override, only when it has one
+  local ft="FRONTEND_TAG_$1" fd="EXPECTED_FRONTEND_DIGEST_$1"
+  if [[ -n "${!ft:-}" ]]; then
+    RUNENV+=(FRONTEND_TAG="${!ft}" EXPECTED_FRONTEND_DIGEST="${!fd}")
+  fi
 }
 # verdict_file <pair>: that pair's paired verdict
 verdict_file() { echo "$PAIR_OUT/paired-verdict-${1%%:*}-${1##*:}.json"; }
@@ -254,7 +282,14 @@ replica_cmd() {
 }
 
 runs_line=""
-for x in "${LABELS[@]}"; do nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x"; runs_line="${runs_line} ${x}=${!nm} (${!tg})"; done
+for x in "${LABELS[@]}"; do
+  nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x"
+  if [[ -n "${!ft:-}" ]]; then
+    runs_line="${runs_line} ${x}=${!nm} (${!tg}, frontend ${!ft} ${!fd})"
+  else
+    runs_line="${runs_line} ${x}=${!nm} (${!tg})"
+  fi
+done
 log "runs:${runs_line}; pairs (baseline:candidate) ${PAIR_LIST[*]}; bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
 for x in "${LABELS[@]}"; do
   runenv "$x"
@@ -311,7 +346,8 @@ fi
 pj_args=("$PAIR_OUT/pair.json" "$BENCH_SHA")
 for x in "${LABELS[@]}"; do
   nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" dg="EXPECTED_IMAGE_DIGEST_$x" out="OUT_$x"
-  pj_args+=("$x" "${!nm}" "${!tg}" "${!dg}" "${!out}")
+  ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x"
+  pj_args+=("$x" "${!nm}" "${!tg}" "${!dg}" "${!out}" "${!ft:--}" "${!fd:--}")
 done
 pj_args+=(-- "${REPLICA_PAIR:--}" "${PAIR_LIST[@]}")
 python3 -c 'import json, sys, time
@@ -319,7 +355,11 @@ out, sha, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
 cut = rest.index("--")
 fields, replica, pairs = rest[:cut], rest[cut + 1], rest[cut + 2:]
 keys = ("run_name", "tag", "digest", "out")
-runs = {fields[i]: dict(zip(keys, fields[i + 1:i + 5])) for i in range(0, len(fields), 5)}
+runs = {}
+for i in range(0, len(fields), 7):
+    runs[fields[i]] = r = dict(zip(keys, fields[i + 1:i + 5]))
+    if fields[i + 5] != "-":          # run 26: the run overrode its frontend (FRONTEND_TAG_<L>)
+        r["frontend_tag"], r["frontend_digest"] = fields[i + 5], fields[i + 6]
 doc = {"kind": "pair", "bench_sha": sha, "started": time.time(), "runs": runs,
        "pairs": [dict(zip(("baseline", "candidate"), p.split(":"))) for p in pairs]}
 if replica != "-":
@@ -444,6 +484,7 @@ ex = (v.get("exclusion") or {}).get("items") or []
 print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
                 + ["INVALID: " + r for r in v["invalid_reasons"]]
                 + [((v.get("replica_source") or {}).get("line") or "INFO replica: not said (a verdict before run 24)")]
+                + ([v["frontend"]["line"]] if v.get("frontend") else [])
                 + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
                    sum(b - a for a, b in i["b"]), i["why"]) for i in ex]

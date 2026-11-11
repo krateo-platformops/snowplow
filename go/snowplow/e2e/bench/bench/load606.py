@@ -1795,8 +1795,14 @@ def image_digest_of(image_id: str | None) -> str | None:
     return tail if DIGEST_RE.match(tail) else None
 
 
-def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = False) -> dict:
+def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = False,
+                      kind: str = "image_digest", what: str = "snowplow") -> dict:
     """`kubectl get pods -l <snowplow> -o json` → one `image_digest` record.
+
+    `kind` / `what`: the record's kind and the component its messages name;
+    the frontend's gate (FRONTEND_TAG, run 26) is the same gate over the
+    frontend's pods, recorded as `frontend_image_digest`, so the snowplow
+    check never reads it.
 
     MATCH only when the expected digest is well formed, at least one live
     snowplow pod exists, and EVERY container status of EVERY live pod reports
@@ -1806,7 +1812,7 @@ def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = Fal
     terminating (deletionTimestamp set: the rollout's leftovers) are recorded
     but not judged.
     """
-    rec = {"kind": "image_digest", "expected": expected, "t": time.time(),
+    rec = {"kind": kind, "expected": expected, "t": time.time(),
            "pods": [], "result": "VOID", "why": None}
     if not DIGEST_RE.match(expected or ""):
         rec["why"] = "expected digest is not sha256:<64 hex>"
@@ -1832,7 +1838,7 @@ def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = Fal
     leftovers = sorted({r["pod"] for r in rec["pods"] if r["terminating"]})
     rec["terminating"] = leftovers
     if live == 0:
-        rec["why"] = "no live snowplow pod"
+        rec["why"] = f"no live {what} pod"
     elif bad:
         rec["why"] = "digest mismatch: " + "; ".join(bad)
     elif leftovers and require_settled:
@@ -1846,13 +1852,14 @@ def image_digest_gate(pod_list: dict, expected: str, require_settled: bool = Fal
 
 
 def digest_check(expected: str | None, gates: list[dict],
-                 pods: list[dict] | None) -> dict | None:
+                 pods: list[dict] | None, kind: str = "image_digest", what: str = "snowplow") -> dict | None:
     """Validity check over the gate record(s) and the before/after pod records.
-    None when no digest is expected (unit callers)."""
+    None when no digest is expected (unit callers). `kind` / `what`: as
+    image_digest_gate's (the frontend's: `frontend_image_digest`, no pod records)."""
     if not expected:
         return None
-    c = {"check": "snowplow.image_digest", "bar": f"== {expected}"}
-    seen = [g for g in gates if g.get("kind") == "image_digest"]
+    c = {"check": f"{what}.image_digest", "bar": f"== {expected}"}
+    seen = [g for g in gates if g.get("kind") == kind]
     if not seen:
         return dict(c, value=None, result="FAIL",
                     why="VOID: no image-digest gate record (the gate did not run)")
@@ -1863,8 +1870,23 @@ def digest_check(expected: str | None, gates: list[dict],
     for pr in pods or []:
         if pr.get("pod") is not None and pr.get("digest") != expected:
             return dict(c, value=pr.get("digest"), result="FAIL",
-                        why=f"VOID: snowplow pod ({pr.get('phase')}) runs {pr.get('digest')}")
+                        why=f"VOID: {what} pod ({pr.get('phase')}) runs {pr.get('digest')}")
     return dict(c, value=expected, result="PASS")
+
+
+def frontend_image_report(tag: str | None, expected: str | None, gates: list[dict]) -> dict | None:
+    """The run's frontend image when the run overrode it (FRONTEND_TAG +
+    EXPECTED_FRONTEND_DIGEST, run 26): the tag rendered into
+    componentValues.frontend.image.tag, the digest expected, the digests the
+    last gate read off the live frontend pods, and every gate record. None when
+    the run did not override it (the installer's pin ran, as before)."""
+    if not tag and not expected:
+        return None
+    seen = [g for g in gates if g.get("kind") == "frontend_image_digest"]
+    last = seen[-1] if seen else {}
+    observed = sorted({r.get("digest") or "no digest" for r in last.get("pods") or [] if not r.get("terminating")})
+    return {"override_tag": tag, "expected": expected, "observed": observed or None,
+            "result": last.get("result"), "gate": seen or None}
 
 
 def memory_report(mem: list[dict]) -> dict | None:
@@ -3917,6 +3939,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              run8: bool = False,
              expected_digest: str | None = None,
              image_digests: list[dict] | None = None,
+             frontend_tag: str | None = None,
+             expected_frontend_digest: str | None = None,
+             frontend_digests: list[dict] | None = None,
              push_refetches: list[dict] | None = None,
              viewer_stats: list[dict] | None = None,
              fresh_truncated: list[dict] | None = None,
@@ -4103,6 +4128,14 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     if dig is not None:
         validity.append(dig)
     report["image_digest"] = {"expected": expected_digest, "gate": image_digests or None}
+    # run 26: the frontend's image, when the run overrode it (FRONTEND_TAG): the same gate and check
+    fdig = digest_check(expected_frontend_digest, frontend_digests or [], None,
+                        kind="frontend_image_digest", what="frontend")
+    if fdig is not None:
+        validity.append(fdig)
+    fimg = frontend_image_report(frontend_tag, expected_frontend_digest, frontend_digests or [])
+    if fimg is not None:
+        report["frontend_image"] = fimg
     report["snowplow_pod"] = snowplow_pods
     report["memory"] = memory_report(mem or [])
     report["key_rotation_report_only"] = rotation_report(mem or [])
@@ -5825,7 +5858,7 @@ def _cmd_pod_record(a) -> int:
 
 def _cmd_digest_gate(a) -> int:
     rec = image_digest_gate(json.loads(sys.stdin.read() or "{}"), a.expected,
-                            require_settled=a.require_settled)
+                            require_settled=a.require_settled, kind=a.kind, what=a.what)
     print(json.dumps(rec))
     return {"MATCH": 0, "UNSETTLED": 4}.get(rec["result"], 3)
 
@@ -5952,6 +5985,8 @@ def _cmd_evaluate(a) -> int:
                            ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")],
                       expected_digest=a.expect_digest,
                       image_digests=[r for r in recs if r.get("kind") == "image_digest"],
+                      frontend_tag=a.frontend_tag, expected_frontend_digest=a.expect_frontend_digest,
+                      frontend_digests=[r for r in recs if r.get("kind") == "frontend_image_digest"],
                       push_refetches=[r for r in recs if r.get("kind") == "push_refetch"],
                       viewer_stats=[r for r in recs if r.get("kind") == "viewer_stats"],
                       fresh_truncated=[r for r in recs if r.get("kind") == "fresh_truncated"],
@@ -6196,6 +6231,9 @@ def main(argv: list[str] | None = None) -> int:
     dg.add_argument("--expected", required=True, help="sha256:<64 hex>")
     dg.add_argument("--require-settled", action="store_true",
                     help="exit 4 (UNSETTLED) while any snowplow pod is still Terminating")
+    dg.add_argument("--kind", default="image_digest",
+                    help="the record's kind (the frontend's gate: frontend_image_digest)")
+    dg.add_argument("--what", default="snowplow", help="the component the record's messages name")
     dg.set_defaults(func=_cmd_digest_gate)
     cp = sub.add_parser("check-prefixes",
                         help="exit 2 unless the prefixes capture every RUN8_KEYS / RUN9_KEYS / TIER_KEYS / EGRESS_KEYS value "
@@ -6208,6 +6246,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("inputs", nargs="+")
     e.add_argument("--expect-digest", default=None,
                    help="INVALID (VOID) unless the image-digest gate and pod records show this digest")
+    e.add_argument("--frontend-tag", default=None,
+                   help="run 26: the frontend tag the run rendered (FRONTEND_TAG); recorded in report.frontend_image")
+    e.add_argument("--expect-frontend-digest", default=None,
+                   help="run 26: INVALID (VOID) unless the frontend_image_digest gate shows this digest")
     e.add_argument("--k6-out", default=None,
                    help="#830: the k6 pod's collected /out (k6.json.gz, summary, exit)")
     e.add_argument("--browser-out", default=None,
