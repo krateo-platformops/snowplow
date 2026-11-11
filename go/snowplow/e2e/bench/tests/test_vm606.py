@@ -100,6 +100,8 @@ NUMBER = "357378285144"
 def _record(run: str = RUN, zone: str = ZONE, **kv) -> None:
     """The laptop record `up --yes` writes (the run's VM, project, zone, TTL): a test that starts after up."""
     kv.setdefault("ttl_hours", 15)
+    if "terminates_at" in kv or "made" not in vm606._state(run):      # what up records creating, as up does
+        kv.setdefault("made", vm606.as_made(run, PROJECT, zone, kv["ttl_hours"], kv.get("terminates_at")))
     vm606._save_state(run, vm=vm606.vm_name(run), project=PROJECT, zone=zone, project_number=NUMBER, **kv)
 
 
@@ -839,14 +841,22 @@ def test_down_refuses_a_firewall_rule_it_did_not_make_and_deletes_nothing(fake, 
     assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
 
 
-def test_down_refuses_a_binding_with_its_title_but_not_its_form(fake, capsys, monkeypatch):
+def test_down_removes_a_binding_with_its_title_but_not_its_form_and_reports_it(fake, capsys, monkeypatch):
+    """The run's exact title and the orchestrator SA: the run's binding, whatever its expression became. Removing
+    access is the safe direction: it goes, and the drift is said (ruling on #1331, 2026-11-11)."""
     _upped(fake, capsys, monkeypatch)
     pol = fake_vm606.policy(fake, f"project-{PROJECT}")
     pol["bindings"].append({"role": "roles/owner", "members": [SA],
                             "condition": {"title": f"snowplow-bench-{RUN}", "expression": "true"}})
     fake_vm606.put_policy(fake, f"project-{PROJECT}", pol["bindings"])
-    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and "not the expiry form vm606 writes" in err
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert ("WARNING: drifted since up, removed all the same: binding roles/owner on operations-dev-krateo-io under "
+            f"snowplow-bench-{RUN}: expression \"true\", not the expiry form vm606 writes") in out
+    assert "8 conditional grant(s)" in out and "1 field(s) had drifted since up" in out
+    assert not [b for b in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
+                if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]
+    assert any("roles/owner" in d for d in _state()["down_drift"])
 
 
 def test_down_refuses_when_the_label_selects_another_vm(fake, capsys):
@@ -1608,16 +1618,53 @@ def test_up_resume_confirms_the_parents_first(fake, capsys, monkeypatch):
 
 
 
-@pytest.mark.parametrize("how, why", [(h, w) for h, w, _p in TAMPER])
-def test_down_refuses_a_resource_not_as_up_made_it_and_changes_nothing(fake, capsys, monkeypatch, how, why):
-    """down's ownership check is the same read-back: a rule or a VM changed after up is not deleted on trust."""
+# down's ownership is the exact name, owner/run labels, record's zone (a rule: its exact name, target tag and
+# description); a field that drifted since up is deleted all the same, and said (ruling on #1331, 2026-11-11)
+OWNERSHIP = {"rule-target-tags"}
+
+
+@pytest.mark.parametrize("how, why", [(h, w) for h, w, _p in TAMPER if h not in OWNERSHIP])
+def test_down_deletes_a_drifted_resource_and_reports_the_drift(fake, capsys, monkeypatch, how, why):
+    """A VM moved to the node SA, OS Login off, a disabled deny rule...: exactly what is to go. down deletes it,
+    prints each drifted field (named, no identity) and keeps them in the run's record."""
+    _upped(fake, capsys, monkeypatch)
+    _tamper(fake, how)
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert f"WARNING: drifted since up, deleted all the same: {why}" in out
+    assert "field(s) had drifted since up" in out
+    assert not (fake / "instances" / f"{VM}.json").exists() and not (fake / "disks" / f"{VM}.json").exists()
+    assert list((fake / "firewalls").glob("*.json")) == []
+    assert not [b for k in (f"project-{PROJECT}", f"sa-{NODE_SA}") for b in fake_vm606.policy(fake, k)["bindings"]
+                if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]
+    st = _state()
+    assert st["deleted_at"] and any(why in d for d in st["down_drift"])
+    assert NODE_SA not in out + err and "@" not in "".join(st["down_drift"])          # roles, never addresses
+
+
+@pytest.mark.parametrize("how", sorted(OWNERSHIP))
+def test_down_refuses_a_rule_whose_ownership_fields_are_not_ups(fake, capsys, monkeypatch, how):
     _upped(fake, capsys, monkeypatch)
     _tamper(fake, how)
     before = _snapshot(fake)
     n = len(fake_vm606.calls(fake))
-    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and why in err and "nothing was changed" in err, err
+    rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and "is not one vm606 made for run run25" in err and "nothing was changed" in err
     assert _snapshot(fake) == before and _no_writes_since(fake, n) == []
+
+
+@pytest.mark.parametrize("how", ["vm-sa", "oslogin-off", "ssh-keys"])
+@pytest.mark.parametrize("argv", [["status"], ["fetch"], ["push-secret", "--yes"]])
+def test_every_other_step_still_refuses_any_drift(fake, capsys, monkeypatch, how, argv):
+    """Only down acts on a drifted VM (to delete it): status, fetch and push-secret refuse, before any ssh / scp
+    (resume refuses too: test_up_resume_refuses_anything_partial_or_not_as_made_and_changes_nothing)."""
+    _ready(fake)
+    _record(runs=NAMES, pair=PAIR, bench_sha="c" * 40, launched_at=1.0, fetched=False)
+    _tamper(fake, how)
+    _token()
+    rc, _out, err = _run(capsys, argv[0], "--run", RUN, *argv[1:])
+    assert rc == 2 and f"{VM} is not as up made it" in err
+    assert not [c for c in fake_vm606.calls(fake) if c["argv"][1] in ("ssh", "scp")]
 
 
 @pytest.mark.parametrize("cmd", ["push-secret", "status"])
@@ -1707,3 +1754,46 @@ def test_the_fakes_describe_answers_in_gces_shapes(fake, capsys, monkeypatch):
     assert set(inst["shieldedInstanceConfig"]) == {"enableIntegrityMonitoring", "enableSecureBoot", "enableVtpm"}
     assert disk["sizeGb"] == "50" and disk["type"] == f"{api}/zones/{ZONE}/diskTypes/pd-balanced"
     assert disk["sourceImage"].startswith("https://www.googleapis.com/compute/v1/projects/debian-cloud/global/images/")
+
+
+
+def test_the_read_back_is_against_what_up_recorded_not_this_checkout(fake, capsys, monkeypatch):
+    """A vm606 checkout changed between up and down (a git pull mid-run: another machine type, disk size, startup
+    script) does not make the run's own VM read as drifted: up records what it created, and every later
+    read-back compares against the record. Real drift still refuses."""
+    _vm_after_run(fake, monkeypatch)
+    _record(bootstrap=BOOT)
+    monkeypatch.setattr(vm606, "MACHINE_TYPE", "e2-standard-16")
+    monkeypatch.setattr(vm606, "BOOT_DISK_GB", 100)
+    monkeypatch.setattr(vm606, "startup_script", lambda: "#!/bin/bash\necho a later checkout\n")
+    rc, out, err = _run(capsys, "status", "--run", RUN)
+    assert rc == 0 and "is not as up made it" not in err, err
+    rc, out, err = _run(capsys, "fetch", "--run", RUN)
+    assert rc == 0, err
+    fake_vm606.put_rule(fake, RUN, f"{VM}-deny-ssh")
+    fake_vm606.put_rule(fake, RUN, f"{VM}-iap-ssh")
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes", "--skip-launcher-check")
+    assert rc == 0 and "drifted" not in out, err + out
+
+
+def test_a_resume_after_a_checkout_change_still_refuses_real_drift(fake, capsys, monkeypatch):
+    _stopped_in_bootstrap(fake, capsys, monkeypatch)
+    monkeypatch.setattr(vm606, "MACHINE_TYPE", "e2-standard-16")
+    monkeypatch.setattr(vm606, "startup_script", lambda: "#!/bin/bash\necho a later checkout\n")
+    n = len(fake_vm606.calls(fake))
+    rc, out, err = _run(capsys, "up", "--run", RUN, "--poll-s", "0")              # dry: the read-back only
+    assert rc == 0 and "read back as up made them" in out, err                   # the record, not the checkout
+    _tamper(fake, "oslogin-off")
+    before = _snapshot(fake)
+    rc, out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
+    assert rc == 2 and f'instance {VM} metadata: enable-oslogin "FALSE", up made "TRUE"' in err
+    assert _snapshot(fake) == before and _no_writes_since(fake, n) == []
+
+
+def test_a_record_without_what_up_made_reads_nothing_as_made(fake, capsys):
+    _ready(fake)
+    st = vm606._state(RUN)
+    st.pop("made")
+    (vm606.state_dir(RUN) / "state.json").write_text(json.dumps(st))
+    rc, _out, err = _run(capsys, "status", "--run", RUN)
+    assert rc == 2 and f"run {RUN}'s record holds no as-made of what up created" in err

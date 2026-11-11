@@ -89,14 +89,17 @@ THE VM (up).
     conditional bindings; no unconditional one) and then waits for the bootstrap again. Anything
     missing or different refuses and changes nothing (down, then a new --run). Any other record is a
     run in use. push-secret and launch refuse a run whose record holds no verified bootstrap.
-  - AS MADE. Wherever an existing resource is trusted (resume, down, push-secret, launch, status,
-    fetch, and right after up creates it), it is read back field for field against what up's create
+  - AS MADE. Wherever an existing resource is trusted (resume, push-secret, launch, status, fetch,
+    and right after up creates it), it is read back field for field against what up's create
     commands set: FIREWALL_FIELDS / INSTANCE_FIELDS map each describe field to the create flags that
     set it (a test checks that the flags of firewall_create_argv and create_command are exactly
     these), plus the defaults up relies on (a rule enabled, selecting by source range and target tag
     only). A disabled deny rule, a rule on another network or for other service accounts, the VM on
     another service account, OS Login or project-key blocking switched off, an added ssh-keys item:
-    each refuses, naming the field, and changes nothing.
+    each refuses, naming the field, and changes nothing. down is the exception (ruling on #1331,
+    2026-11-11): deleting is the safe direction, so it reads the same fields and reports each that
+    drifted (named, no identity: a service account by its role) as a warning, keeps them in the
+    run's record (down_drift), and deletes all the same.
 
 ON THE VM, NOTHING NAMES THE OPERATOR. An OS Login home is /home/<the operator's account, as a POSIX
 name>, so no remote path this module prints or stores may sit under it. Every remote step runs in
@@ -171,7 +174,9 @@ answer but its own NotFound refuses); every zone's instances (one unfiltered lis
 zone answers NotFound, the VM is "already gone" only if no zone holds an instance named vm_name(R) or
 labelled run=<R>, and when it answers, it must be labelled owner=snowplow-bench, run=<R>, named
 vm_name(R), and be the only instance claiming the run; no launcher running; the launch fetched
-(--discard-unfetched says the evidence may go); the firewall rules and the grants its own. Then
+(--discard-unfetched says the evidence may go); the firewall rules its own (exact name, target tag,
+description) and the grants the orchestrator SA's under the run's exact title. Ownership is that and
+nothing more: a field that drifted since up (AS MADE) is a warning, never a reason to leave it. Then
 deletes the instance with --delete-disks=all and reads it back (it must answer NotFound before any
 rule or grant is touched), the two rules and the run's conditional grants, and reads each back: its
 disks answer NotFound (the pull-token file lived on that disk only), no rule and no binding of the
@@ -801,15 +806,17 @@ def grant(run: str, project: str, number: str, roles: list[str], terminates_at: 
          f"{cond['title']}: {cond['expression']}")
 
 
-def revoke(run: str, project: str, number: str, *, dry: bool) -> int:
-    """Remove the run's conditional bindings (exactly; never another's, never an unconditional one), then
-    verify none is left. Returns how many were removed."""
-    found = []
+def revoke(run: str, project: str, number: str, *, dry: bool) -> tuple[int, list[str]]:
+    """Remove the run's conditional bindings: the orchestrator SA's, under the run's exact condition title
+    (never another's, never an unconditional one), then verify none is left. One whose expression is not
+    the expiry form vm606 writes is the run's too and goes, reported as drift (removing access is the safe
+    direction). Returns (how many were removed, the drift)."""
+    found, drift = [], []
     for kind, res in grant_policies(project, number):
         for role, cond in run_bindings(_policy(kind, res, project), project, run):
             if not _EXPIRY_FORM.fullmatch(cond.get("expression") or ""):
-                raise Refused(f"a binding of {role} on {res} carries the title {cond.get('title')!r} but not the "
-                              f"expiry form vm606 writes ({cond.get('expression')!r}): refusing to remove it")
+                drift.append(f"binding {role} on {res} under {cond.get('title')}: expression "
+                             f"{_short(cond.get('expression'))}, not the expiry form vm606 writes")
             found.append((kind, res, role, cond))
     for i, (kind, res, role, cond) in enumerate(found):
         f = _cond_file(run, {k: cond[k] for k in ("title", "expression", "description") if k in cond}, f"revoke-{i}")
@@ -822,7 +829,7 @@ def revoke(run: str, project: str, number: str, *, dry: bool) -> int:
                 for r, _c in run_bindings(_policy(kind, res, project), project, run)]
         if left:
             raise Refused(f"bindings of run {run} are still held after their removal: {left}")
-    return len(found)
+    return len(found), drift
 
 
 def iam_commands(project: str, roles: list[str], number: str) -> list[str]:
@@ -1052,7 +1059,8 @@ def instance_want(run: str, st: dict) -> dict:
             "network": [{"network": _network_url(project), "accessConfigs": ["ONE_TO_ONE_NAT"]}],
             "tags": [name],
             "labels": {"owner": OWNER, "run": run, "ttl-hours": str(st.get("ttl_hours"))},
-            "metadata": {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE", "startup-script": startup_script()},
+            "metadata": {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE",
+                         "startup-script": _sha256_text(startup_script())},
             "terminationTime": _utc(st.get("terminates_at")), "instanceTerminationAction": "DELETE",
             "shieldedInstanceConfig": {"enableSecureBoot": True, "enableVtpm": True, "enableIntegrityMonitoring": True}}
 
@@ -1064,6 +1072,29 @@ def _account(email: str | None, project: str, number: str | None) -> str:
     if number and email == node_sa(number):
         return "the GKE node SA"
     return "another account"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def as_made(run: str, project: str, zone: str, ttl_hours, terminates_at) -> dict:
+    """What up creates for the run, field for field (INSTANCE_FIELDS, FIREWALL_FIELDS; the startup script by
+    its sha256): `up --yes` writes it to the run's record before it creates anything, and every later
+    read-back compares against THAT, never against this checkout's constants (a checkout changed between up
+    and down must not make the run's own VM read as drifted)."""
+    st = {"project": project, "zone": zone, "ttl_hours": ttl_hours, "terminates_at": terminates_at}
+    return {"instance": instance_want(run, st),
+            "rules": {fw: firewall_want(fw, rule, project) for fw, rule in firewall_rules(run).items()}}
+
+
+def _made(st: dict, run: str) -> dict:
+    made = st.get("made")
+    if not isinstance(made, dict) or not isinstance(made.get("instance"), dict) \
+            or set(made.get("rules") or {}) != set(firewall_rules(run)):
+        raise Refused(f"run {run}'s record holds no as-made of what up created ({state_dir(run) / 'state.json'}): "
+                      f"its resources cannot be read back")
+    return made
 
 
 def instance_view(inst: dict, disk: dict | None, image: dict | None, project: str, number: str | None) -> dict:
@@ -1087,7 +1118,9 @@ def instance_view(inst: dict, disk: dict | None, image: dict | None, project: st
                         for n in inst.get("networkInterfaces") or []],
             "tags": sorted((inst.get("tags") or {}).get("items") or []),
             "labels": {k: labels.get(k) for k in ("owner", "run", "ttl-hours")},
-            "metadata": {i.get("key"): i.get("value") for i in (inst.get("metadata") or {}).get("items") or []},
+            "metadata": {i.get("key"): (_sha256_text(i.get("value") or "") if i.get("key") == "startup-script"
+                                         else i.get("value"))
+                         for i in (inst.get("metadata") or {}).get("items") or []},
             "terminationTime": _utc(sched.get("terminationTime")),
             "instanceTerminationAction": sched.get("instanceTerminationAction"),
             "shieldedInstanceConfig": {k: (inst.get("shieldedInstanceConfig") or {}).get(k)
@@ -1129,11 +1162,11 @@ def instance_as_made(run: str, st: dict, inst: dict) -> list[str]:
         image = _get(["compute", "images", "describe", m[2], "--project", m[1]],
                      f"projects/{m[1]}/global/images/{m[2]}", f"image {m[2]}")
     return _diff(f"instance {vm_name(run)}", instance_view(inst, disk, image, project, st.get("project_number")),
-                 instance_want(run, st))
+                 _made(st, run)["instance"])
 
 
-def rule_as_made(run: str, fw: str, r: dict, project: str) -> list[str]:
-    return _diff(f"firewall rule {fw}", firewall_view(r), firewall_want(fw, firewall_rules(run)[fw], project))
+def rule_as_made(run: str, st: dict, fw: str, r: dict) -> list[str]:
+    return _diff(f"firewall rule {fw}", firewall_view(r), _made(st, run)["rules"][fw])
 
 
 def _trusted(run: str, st: dict, inst: dict) -> dict:
@@ -1220,7 +1253,7 @@ def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
         if fw not in rules:
             off.append(f"firewall rule {fw} answers NotFound")
         else:
-            off += rule_as_made(run, fw, rules[fw], project)
+            off += rule_as_made(run, st, fw, rules[fw])
     off += grants_as_made(run, project, number, roles, st["terminates_at"])
     off += [f"{sa_email(project)} holds {b} unconditionally" for b in unconditional_bindings(project, number)]
     return off
@@ -1290,6 +1323,7 @@ def cmd_up(a) -> int:
     sf.write_text(startup_script())
     terminates_at = termination_time(time.time(), a.ttl_hours)
     if a.yes:
+        _save_state(run, made=as_made(run, a.project, a.zone, a.ttl_hours, terminates_at))
         _save_state(run, vm=name, project=a.project, zone=a.zone, ttl_hours=a.ttl_hours, terminates_at=terminates_at,
                     node_sa=node_sa(number), project_number=number, created_at=time.time())
     # 1. the grants, expiring with the VM, before the VM exists
@@ -1300,7 +1334,7 @@ def cmd_up(a) -> int:
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {error_summary(err)}); {down_hint(run)}")
     if a.yes:
-        made = {r.get("name") for r in _run_rules(run, a.project)}       # each as made, or it refuses
+        made = {r.get("name") for r in _run_rules(run, a.project, _state(run))}   # each as made, or it refuses
         if made != set(firewall_rules(run)):
             raise Refused(f"firewall rule(s) {sorted(set(firewall_rules(run)) - made)} answer NotFound after their "
                           f"create; {down_hint(run)}")
@@ -1866,11 +1900,22 @@ def _rule_docs(run: str, project: str) -> list[dict]:
     return rows
 
 
-def _run_rules(run: str, project: str) -> list[dict]:
-    """The run's firewall rules that exist; refuses one that is not, field for field, what up makes."""
+def _owned_rule(run: str, st: dict, r: dict) -> None:
+    """A rule of the run's exact name is the run's when its target tag and description are the ones up recorded
+    creating: else it is someone else's, and refuses."""
+    fw = r.get("name")
+    w = _made(st, run)["rules"][fw]
+    if sorted(r.get("targetTags") or []) != sorted(w["targetTags"]) or r.get("description") != w["description"]:
+        raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
+                      f"{_short(r.get('targetTags'))}, description {_short(r.get('description'))}): refusing; nothing "
+                      f"was changed")
+
+
+def _run_rules(run: str, project: str, st: dict) -> list[dict]:
+    """The run's firewall rules that exist; refuses one that is not, field for field, what up recorded making."""
     rows = _rule_docs(run, project)
     for r in rows:
-        off = rule_as_made(run, r.get("name"), r, project)
+        off = rule_as_made(run, st, r.get("name"), r)
         if off:
             raise Refused(f"firewall rule {r.get('name')!r} is not as vm606 made it for run {run}: {'; '.join(off)}: "
                           f"refusing; nothing was changed")
@@ -1922,13 +1967,15 @@ def cmd_down(a) -> int:
     inst = _instance(name, project, zone)
     claims = _instances_of(run, project)
     disks = [name]
+    drift: list[str] = []
     if inst is None:
         # a NotFound in the recorded zone is "gone" only when no zone holds an instance claiming the run
         if claims:
             raise Refused(f"{name} answers NotFound in {zone} (the run's recorded zone), but {_named(claims)} "
                           f"claim(s) run {run} by name or run label: refusing; nothing was changed")
     else:
-        _trusted(run, st, inst)
+        _owned(inst, run)                   # ownership: the exact name and owner/run labels, the record's zone
+        drift += instance_as_made(run, st, inst)
         others = [i for i in claims if not (i.get("name") == name and _zone_of(i) == zone)]
         if others:
             raise Refused(f"besides {name} ({zone}), {_named(others)} claim(s) run {run} by name or run label: "
@@ -1946,7 +1993,15 @@ def cmd_down(a) -> int:
                 raise Refused(f"the launcher is still running on {name} ({state}): deleting the VM would kill every "
                               f"run's teardown; stop it (kill -TERM <pid> on the VM) and wait for it to exit")
         disks = _disk_names(inst)
-    rules = _run_rules(run, project)
+    rules = _rule_docs(run, project)
+    for r in rules:
+        _owned_rule(run, st, r)
+        drift += rule_as_made(run, st, r["name"], r)
+    # what drifted since up is deleted all the same (deleting is the safe direction), and said
+    for d in drift:
+        _say(f"WARNING: drifted since up, deleted all the same: {d}")
+    if a.yes:
+        _save_state(run, down_drift=drift)
     # ── then delete, each read back ──
     if inst is not None:
         rc, _o, err = gcloud(["compute", "instances", "delete", name, *_where(project, zone),
@@ -1962,7 +2017,11 @@ def cmd_down(a) -> int:
                              dry=not a.yes)
         if rc != 0:
             raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {error_summary(err)})")
-    removed = revoke(run, project, number, dry=not a.yes)
+    removed, bdrift = revoke(run, project, number, dry=not a.yes)
+    for d in bdrift:
+        _say(f"WARNING: drifted since up, removed all the same: {d}")
+    if a.yes and bdrift:
+        _save_state(run, down_drift=drift + bdrift)
     if not a.yes:
         _say(f"DRY: would verify {name} answers NotFound, its disks {disks}, its {len(rules)} firewall rule(s) and "
              f"its {removed} grant(s) gone; nothing was deleted")
@@ -1972,12 +2031,14 @@ def cmd_down(a) -> int:
     if left:
         raise Refused(f"disk(s) {left} remain: delete them by hand (gcloud compute disks delete ... --zone "
                       f"{zone}); the pull-token file is on one of them")
-    still = [r["name"] for r in _run_rules(run, project)]
+    still = [r["name"] for r in _rule_docs(run, project)]
     if still:
         raise Refused(f"firewall rule(s) {still} of {name} remain after their delete")
     _save_state(run, deleted_at=time.time())
     _say(f"{name} gone and verified: disk(s) {disks} (and with them the pull-token file), {len(rules)} firewall "
-         f"rule(s), {removed} conditional grant(s) of run {run}")
+         f"rule(s), {removed} conditional grant(s) of run {run}"
+         + (f"; {len(drift) + len(bdrift)} field(s) had drifted since up (above, and in the run's record)"
+            if drift or bdrift else ""))
     return 0
 
 
