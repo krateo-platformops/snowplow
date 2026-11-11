@@ -766,6 +766,26 @@ s_schema() {
 }
 s_reap()   { run python3 -m bench.gke gke-reap --project "$PROJECT" $YES; }
 LB_NEED=""   # #1026: the LoadBalancer Services this install creates (s_up), for gke-down's record
+# k8s_authz: may this orchestrator be the cluster's admin? (#1307 L7) Its first authorized kubectl
+# call, right after the create: one SelfSubjectAccessReview for what the installer's helm install
+# needs most (ClusterRoleBindings), answered by GKE's IAM authorizer. From the vm606 VM the
+# orchestrator SA holds roles/container.admin only under an IAM condition on request.time (access
+# expires with each run, bench/vm606.py); GKE's documentation does not say whether its Kubernetes-API
+# authorizer honours that condition, so the run finds out here, by name, and tears down, not in a
+# generic error deep in the install. `version` (above) is not authorized by IAM: any caller may read it.
+k8s_authz() {
+  local ans rc=0
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: ${K[*]} auth can-i create clusterrolebindings.rbac.authorization.k8s.io (must answer yes)"
+    return 0
+  fi
+  ans="$("${K[@]}" auth can-i create clusterrolebindings.rbac.authorization.k8s.io 2>"$KERR")" || rc=$?
+  if [[ "$ans" != "yes" ]]; then
+    record_failure "up FAILED: the Kubernetes API refused this orchestrator cluster-admin (can-i create clusterrolebindings: ${ans:-no answer}, rc ${rc}): from the vm606 VM, the orchestrator SA's conditional container.admin is not honoured by the Kubernetes API (or not yet propagated)"
+    return 1
+  fi
+  log "kubernetes authorization: this orchestrator may create ClusterRoleBindings (can-i: yes)"
+}
 s_up() {
   log "control plane: regional (${REGION}); every node in ${ZONE}; context ${KCTX}"
   # #1026: each LoadBalancer Service the install creates needs a regional static
@@ -824,6 +844,7 @@ s_up() {
   (( up_rc == 0 )) || { record_failure "up FAILED: gke-up exited ${up_rc}"; return 1; }
   UP_OK=1             # gke-up made the cluster: a teardown that cannot find it is a failure
   run "${K[@]}" version
+  k8s_authz || return 1
   # the run's record of the cluster's shape (runs 14-16: zonal control plane;
   # 17+: regional), READ BACK from GKE after create (#899 F1): where the control
   # plane is, where the nodes are and how many — not what the spec asked for.
