@@ -103,7 +103,8 @@ SSH_FAILURES = {
     "4047": _iap("4047", "Failed to lookup instance"),
     "4010": _iap("4010", "destination read failed"),
     "4049": _iap("4049", "a code IAP's table does not list"),
-    "publickey": (255, f"{IDENTITY}@compute.123: Permission denied (publickey).\n"),
+    # OS Login names the instance by its numeric id (19 digits; this one starts like an IAP code)
+    "publickey": (255, f"{IDENTITY}@compute.4096312768531209876: Permission denied (publickey).\n"),
 }
 
 SOURCE = r'''#!/usr/bin/env python3
