@@ -40,6 +40,12 @@ outcome:
     does. FAKE_SSH_FAIL=4033|4003|4047|4010|4049|publickey answers as gcloud does when IAP / the firewall / OS Login
     refuse, FAKE_SSH_FAIL_TIMES times (default: always). FAKE_TAMPER_AFTER_SSH="<n>:<path under srv>"
     appends a byte to that file when the n-th ssh call ends;
+  - `compute ssh ... --command CMD` with any CMD but `bash -s` (bench.gcevm's byte streams, tests/test_testvm.py):
+    stdin and stdout are bytes pumped through, as the tunnel does; FAKE_STREAM_STALL="<n>:<bytes>" makes the
+    n-th ssh call's tunnel stop moving after that many bytes (#1336's hang), until its caller kills it. Both
+    VM roots (vm606's /srv/snowplow-bench, testvm's /srv/testvm, VM_ROOTS) are <state>/vm/NAME/srv;
+  - `compute instances create --no-service-account --no-scopes`: an instance with no service account;
+    `compute machine-types list --zones Z`: e2-standard and n2-standard 2..32 and e2-highcpu-64 in Z;
   - `compute scp`: the side written NAME:<path> is on the VM; the bytes are copied (this process is
     scp: copying is its job) and the source's mode kept, as scp does for a new file;
     FAKE_SCP_CORRUPT=<basename> flips the last byte of a file of that name in transit; FAKE_SCP_MODE
@@ -63,6 +69,8 @@ from tests import fake_region
 
 IDENTITY = "jane_doe_example_com"       # an OS Login POSIX name: the operator's account
 VM_ROOT = "/srv/snowplow-bench"
+# every VM root a tool under test uses (vm606, testvm): each is <state>/vm/NAME/srv on the fake VM
+VM_ROOTS = (VM_ROOT, "/srv/testvm")
 
 PROJECT = "operations-dev-krateo-io"
 # gcloud 561's answers, read live (#1307 round 4): an absent instance or firewall rule, an absent disk,
@@ -129,7 +137,7 @@ def instance_docs(name, project, zone, labels, tags, termination_time, action, s
                                    "accessConfigs": [{"kind": "compute#accessConfig", "name": "external-nat",
                                                       "networkTier": "PREMIUM", "type": "ONE_TO_ONE_NAT",
                                                       "natIP": "34.90.0.9"}]}],
-            "serviceAccounts": [{"email": sa, "scopes": [SCOPE_URLS.get(x, x) for x in scopes]}],
+            "serviceAccounts": [{"email": sa, "scopes": [SCOPE_URLS.get(x, x) for x in scopes]}] if sa else [],
             "metadata": {"kind": "compute#metadata", "fingerprint": "Zm9v",
                          "items": [{"key": k, "value": v} for k, v in metadata.items()]},
             "scheduling": {"automaticRestart": False, "onHostMaintenance": "MIGRATE", "preemptible": False,
@@ -176,8 +184,12 @@ def load(kind, name):
     return json.loads(p.read_text()) if p.exists() else None
 def vm(name):
     return st / "vm" / name
+def onvm_text(name, text):
+    for root in VM_ROOTS:
+        text = text.replace(root, str(vm(name) / "srv"))
+    return text
 def onvm(name, path):
-    return Path(path.replace(VM_ROOT, str(vm(name) / "srv"), 1)) if path.startswith(VM_ROOT) else vm(name) / "home" / IDENTITY / path
+    return Path(onvm_text(name, path)) if path.startswith(VM_ROOTS) else vm(name) / "home" / IDENTITY / path
 def failed_list(kind):
     if os.environ.get("FAKE_LIST_FAILS") != "1":
         return
@@ -315,7 +327,8 @@ if a[:3] == ["compute", "instances", "create"]:
     shielded = all(f in a for f in ("--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"))
     doc, disk, image = instance_docs(
         name, opt("--project"), opt("--zone"), labels, opt("--tags").split(","), opt("--termination-time"),
-        opt("--instance-termination-action"), opt("--service-account"), opt("--scopes").split(","), metadata,
+        opt("--instance-termination-action"), opt("--service-account"),
+        [] if "--no-scopes" in a else opt("--scopes").split(","), metadata,
         opt("--machine-type"), opt("--boot-disk-size").removesuffix("GB"), opt("--boot-disk-type"),
         opt("--image-project"), opt("--image-family"), shielded, opt("--network"))
     doc.update(json.loads(os.environ.get("FAKE_INSTANCE_ON_CREATE") or "{}"))
@@ -351,6 +364,14 @@ if a[:3] == ["compute", "disks", "describe"]:
     if not in_zone(d):
         notfound("disks", f"zones/{opt('--zone')}/disks", a[3])
     print(json.dumps(d)); sys.exit(0)
+if a[:3] == ["compute", "machine-types", "list"]:
+    failed_list("machineTypes")
+    zone = opt("--zones")
+    print(json.dumps([{"kind": "compute#machineType", "name": f"{fam}-{n}", "guestCpus": n, "memoryMb": n * 4096,
+                       "zone": zone} for fam in ("e2-standard", "n2-standard") for n in (2, 4, 8, 16, 32)]
+                     + [{"kind": "compute#machineType", "name": "e2-highcpu-64", "guestCpus": 64, "memoryMb": 65536,
+                         "zone": zone}]))
+    sys.exit(0)
 if a[:3] == ["compute", "instances", "list"]:
     failed_list("instances")
     print(json.dumps([json.loads(p.read_text()) for p in sorted((st / "instances").glob("*.json"))])); sys.exit(0)
@@ -382,11 +403,45 @@ if a[:2] == ["compute", "ssh"]:
     home = vm(name) / "home" / IDENTITY
     home.mkdir(parents=True, exist_ok=True)
     (vm(name) / "srv").mkdir(parents=True, exist_ok=True)
-    script = sys.stdin.read().replace(VM_ROOT, str(vm(name) / "srv"))
     env = {"HOME": str(home), "PATH": os.environ["PATH"], "LANG": "C.UTF-8", "USER": IDENTITY}
-    p = subprocess.Popen(["bash", "-c", opt("--command")], cwd=home, env=env, stdin=subprocess.PIPE,
-                         start_new_session=True, text=True)
-    p.communicate(script)
+    command = onvm_text(name, opt("--command"))
+    if command == "bash -s":
+        script = onvm_text(name, sys.stdin.read())
+        p = subprocess.Popen(["bash", "-c", command], cwd=home, env=env, stdin=subprocess.PIPE,
+                             start_new_session=True, text=True)
+        p.communicate(script)
+    else:
+        # a byte stream (an upload on stdin, a download on stdout), pumped as the tunnel does;
+        # FAKE_STREAM_STALL="<n>:<bytes>": on the n-th ssh call, the tunnel stops after that many bytes
+        stall = os.environ.get("FAKE_STREAM_STALL", "")
+        limit = int(stall.split(":")[1]) if stall and int(stall.split(":")[0]) == n else None
+        # in this process's group: a caller that kills a stalled transfer's gcloud kills its remote end too
+        p = subprocess.Popen(["bash", "-c", command], cwd=home, env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE)
+        import threading, time
+        def pump(src, dst, close):
+            moved = 0
+            while True:
+                b = src.read1(65536) if hasattr(src, "read1") else src.read(65536)
+                if not b:
+                    break
+                if limit is not None and moved + len(b) > limit:
+                    dst.write(b[:max(limit - moved, 0)]); dst.flush()
+                    time.sleep(3600)                  # the tunnel stalls: nothing more moves
+                try:
+                    dst.write(b); dst.flush()
+                except BrokenPipeError:
+                    break
+                moved += len(b)
+            if close:
+                try:
+                    dst.close()
+                except BrokenPipeError:
+                    pass
+        up = threading.Thread(target=pump, args=(sys.stdin.buffer, p.stdin, True), daemon=True)
+        down = threading.Thread(target=pump, args=(p.stdout, sys.stdout.buffer, False), daemon=True)
+        up.start(); down.start()
+        p.wait(); down.join()
     for sig in (signal.SIGHUP, signal.SIGTERM):          # sshd hangs the session up
         try:
             os.killpg(p.pid, sig)
@@ -418,6 +473,17 @@ if a[:2] == ["compute", "scp"]:
     d.write_bytes(data)
     os.chmod(d, int(os.environ["FAKE_SCP_MODE"], 8) if os.environ.get("FAKE_SCP_MODE") else s.stat().st_mode & 0o777)
     sys.exit(0)
+# ── GKE (bench.testvm --cluster): <state>/gke/NAME.json is a cluster; get-credentials writes $KUBECONFIG ──
+if a[:3] in (["container", "clusters", "describe"], ["container", "clusters", "get-credentials"]):
+    d = load("gke", a[3])
+    if d is None or (d.get("location") and d["location"] != opt("--location")):
+        sys.stderr.write(f"ERROR: (gcloud.container.clusters.{a[2]}) ResponseError: code=404, message=Not found: "
+                         f"projects/{opt('--project')}/locations/{opt('--location')}/clusters/{a[3]}.\n"); sys.exit(1)
+    if a[2] == "describe":
+        print(json.dumps(d)); sys.exit(0)
+    Path(os.environ["KUBECONFIG"]).write_text(json.dumps({"apiVersion": "v1", "kind": "Config",
+                                                         "current-context": a[3], "operator": "gcloud-auth-plugin"}))
+    sys.exit(0)
 sys.stderr.write("fake gcloud: unknown call " + " ".join(a) + "\n")
 sys.exit(2)
 '''
@@ -429,7 +495,7 @@ def install(bin_dir: Path, state: Path) -> None:
     g = bin_dir / "gcloud"
     consts = "".join(f"{k} = {globals()[k]!r}\n" for k in (
         "PROJECT", "ACCOUNT_404", "DISK_404", "PARENT_404", "PROJECT_403", "ZONE_400", "DESCRIBE_FAILURES", "ZONES",
-        "SSH_FAILURES", "IDENTITY", "VM_ROOT")) + BUILDER
+        "SSH_FAILURES", "IDENTITY", "VM_ROOT", "VM_ROOTS")) + BUILDER
     g.write_text(SOURCE.replace("API = ", consts + fake_region.LOADER + "API = ", 1))
     g.chmod(0o755)
 
