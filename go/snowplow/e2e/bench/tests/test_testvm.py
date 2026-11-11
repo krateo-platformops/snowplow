@@ -931,10 +931,91 @@ def test_nothing_a_command_started_outlives_its_normal_exit(fake, capsys, tmp_pa
 def test_a_hung_probe_is_refused_as_a_stall_derived_from_a_measured_round_trip(fake, capsys, tmp_path, monkeypatch):
     clone, sha = _repo(tmp_path)
     monkeypatch.setenv("FAKE_STREAM_STALL", "4:0")                        # the upload probe's tunnel never moves
+    trips, stalls = [], {}
+    real_trip, real_stream = gcevm.round_trip, gcevm.stream
+
+    def trip(*a, **kw):
+        trips.append(real_trip(*a, **kw))
+        return trips[-1]
+
+    def stream(argv, **kw):
+        stalls[kw["what"]] = kw["stall_s"]
+        return real_stream(argv, **kw)
+    monkeypatch.setattr(gcevm, "round_trip", trip)
+    monkeypatch.setattr(gcevm, "stream", stream)
     rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
     assert rc == 2 and re.search(r"the upload probe stalled at \d+ of 4194304 bytes \(no byte moved for \d+ s", err)
-    stall = float(re.search(r"the upload probe: 4194304 bytes, bound \d+ s, stall ([0-9.]+) s", out).group(1))
-    assert stall < 3600                                                   # SLACK x a round trip, not the session
+    # exactly SLACK x the round trip measured just before it: neither the session's bound nor any widening of it
+    assert len(trips) == 1 and stalls["the upload probe"] == gcevm.SLACK * trips[0]
+
+
+def _trickle_gcloud(tmp_path, monkeypatch, body: str) -> None:
+    d = tmp_path / "trickle-bin"
+    d.mkdir()
+    (d / "gcloud").write_text(f"#!{sys.executable}\n" + body)
+    (d / "gcloud").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.mark.serial  # #1166/#1174: a transfer paced on the wall clock against its stall window
+def test_a_slow_but_moving_download_is_not_a_stall(tmp_path, monkeypatch):
+    """Each byte resets the stall clock: a transfer that keeps moving, slower than one stall window in total, passes;
+    a clock timed from the start would refuse it."""
+    _trickle_gcloud(tmp_path, monkeypatch, "import sys, time\nfor _ in range(20):\n"
+                    "    sys.stdout.buffer.write(b'x' * 1024); sys.stdout.buffer.flush(); time.sleep(0.15)\n")
+    dst = tmp_path / "dst"
+    t0 = time.monotonic()
+    rc, _o, _e = gcevm.stream(["x"], what="the trickle", nbytes=20 * 1024, bound_s=60, stall_s=1.0, dst=str(dst))
+    assert rc == 0 and dst.stat().st_size == 20 * 1024
+    assert time.monotonic() - t0 > 2 * 1.0                               # longer than the stall window, in total
+
+
+@pytest.mark.serial  # #1166/#1174: a transfer paced on the wall clock against its stall window
+def test_a_slow_but_moving_upload_is_not_a_stall(tmp_path, monkeypatch):
+    """The far end takes the bytes slowly (a pipe's worth at a time): each write it accepts resets the stall clock."""
+    _trickle_gcloud(tmp_path, monkeypatch, "import sys, time\nn = 0\nwhile True:\n"
+                    "    b = sys.stdin.buffer.read(65536)\n    if not b:\n        break\n    n += len(b)\n"
+                    "    time.sleep(0.15)\nprint('GOT=%d' % n)\n")
+    src = tmp_path / "src"
+    src.write_bytes(os.urandom(2 << 20))                                 # 32 reads of 64 KiB, ~5 s in all
+    t0 = time.monotonic()
+    rc, out, _e = gcevm.stream(["x"], what="the trickle", nbytes=2 << 20, bound_s=60, stall_s=1.0, src=str(src))
+    assert rc == 0 and f"GOT={2 << 20}" in out
+    assert time.monotonic() - t0 > 2 * 1.0
+
+
+@pytest.mark.parametrize("marker, why", [
+    ("TESTVM_PYTHON=Python 3.11.9", "python: Python 3.11.9, the repo wants 3.12"),
+    ("TESTVM_GO=go version go1.24.0 linux/amd64", f"go: go version go1.24.0 linux/amd64, the repo wants go{GO}"),
+])
+def test_the_laptop_refuses_a_vm_whose_toolchain_is_not_the_repos(fake, capsys, tmp_path, monkeypatch, marker, why):
+    """The laptop checks the versions the VM reports against what the repo declares, whatever the VM said."""
+    clone, sha1, _ = _up(fake, capsys, tmp_path)
+    sha2 = _commit(clone, PY_FILES)
+    tree2 = _git(clone, "rev-parse", f"{sha2}^{{tree}}")
+    good = {"TESTVM_GO": f"go version go{GO} linux/amd64", "TESTVM_PYTHON": f"Python {PY}"}
+    good.update([marker.split("=", 1)])
+    lines = "".join(f"echo {shlex.quote(f'{k}={v}')}\n" for k, v in good.items())
+    monkeypatch.setattr(testvm, "push_script", lambda run, sha, tree, tc: testvm.remote(
+        run, f"echo TESTVM_HEAD={sha}\necho TESTVM_TREE={tree2}\n{lines}"))
+    rc, _o, err = _run(capsys, "push", "--run", RUN, "--repo", REPO, "--clone", str(clone), "--sha", sha2)
+    assert rc == 2 and f"the VM's toolchain is not the repo's: {why}" in err
+    assert _state()["checkout"]["sha"] == sha1
+
+
+def test_fetch_refuses_an_archive_holding_anything_but_the_runs_that_ended(fake, capsys, tmp_path, monkeypatch):
+    _up(fake, capsys, tmp_path)
+    rc, _o, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "5", "--", "true")
+    assert rc == 0, err
+    (_rundir(fake) / "home" / "planted").write_text("not a result")
+    real = testvm.fetch_script
+
+    def planted(run, ns):                                                # the VM packs one more member than it says
+        return real(run, ns).replace('tar -czf "$R/fetch.tgz" $have', 'tar -czf "$R/fetch.tgz" $have home/planted')
+    monkeypatch.setattr(testvm, "fetch_script", planted)
+    rc, _o, err = _run(capsys, "fetch", "--run", RUN)
+    assert rc == 2 and "the results archive holds 'home/planted', outside runs [1]: nothing was kept" in err
+    assert not (testvm.state_dir(RUN) / "results").exists() and _state()["runs"][0]["fetched"] is False
 
 
 def test_a_cluster_token_never_outlives_the_vm(fake, capsys, tmp_path):
