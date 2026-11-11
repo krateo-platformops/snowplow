@@ -189,6 +189,12 @@ type StageOutcomes struct {
 	aborted bool // the resolve stopped before running any stage (F3)
 	order   []string
 	by      map[string]*stageOutcome
+	// replayed (#1319) is set when the body this collector reports on was
+	// served WITHOUT running its resolve (a stored cell, a seed-memo entry):
+	// stored is then the StorableStageOutcomes value the producing resolve
+	// left, and HeaderValue reports it instead of the (empty) stage list.
+	replayed bool
+	stored   string
 }
 
 func newStageOutcomes() *StageOutcomes {
@@ -217,6 +223,58 @@ func claimStageOutcomes(ctx context.Context) *StageOutcomes {
 	}
 	return newStageOutcomes()
 }
+
+// StageOutcomesFromContext returns the collector WithStageOutcomes installed
+// on ctx, nil when none is. A Put site that installed it on a ctx it passed
+// down (the walker's content populate) reads it back here.
+func StageOutcomesFromContext(ctx context.Context) *StageOutcomes {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(stageOutcomesKey{}).(*StageOutcomes)
+	return s
+}
+
+// StorableStageOutcomes (#904, #1319) is the value a Put keeps on the cell it
+// stores: "" when every stage succeeded (HeaderValue's []), so a complete cell
+// costs no memory for it, else the header value. nil (no collector) is "".
+func StorableStageOutcomes(o *StageOutcomes) string {
+	if o == nil {
+		return ""
+	}
+	if v := o.HeaderValue(); v != stageOutcomesAllSucceeded {
+		return v
+	}
+	return ""
+}
+
+// stageOutcomesAllSucceeded is HeaderValue's value for a resolve with no
+// failed, skipped or not-run stage.
+const stageOutcomesAllSucceeded = "[]"
+
+// ReplayStageOutcomes (#1319) reports stored (a StorableStageOutcomes value)
+// as the outcomes of the resolve the collector on ctx waits for, when the
+// body is served without running that resolve: a stored cell (a RESTAction
+// full list), or a seed-memo entry. It claims the collector exactly as that
+// resolve would have (claimStageOutcomes), so a resolve that runs later on
+// ctx keeps its own outcomes privately. No-op when ctx carries no collector
+// or a resolve already claimed it.
+func ReplayStageOutcomes(ctx context.Context, stored string) {
+	s := StageOutcomesFromContext(ctx)
+	if s == nil || !s.claimed.CompareAndSwap(false, true) {
+		return
+	}
+	s.mu.Lock()
+	s.replayed, s.stored = true, stored
+	s.mu.Unlock()
+}
+
+// SealStageOutcomes (#1319) ends the collector's claim window: the resolve it
+// reports on is over (or there was none: a widget with no apiRef), so a
+// resolve that runs later on ctx (a widget's inline child) never reports into
+// it. A collector nothing claimed reads every stage succeeded. No-op when
+// ctx carries no collector or it is already claimed.
+func SealStageOutcomes(ctx context.Context) { ReplayStageOutcomes(ctx, "") }
 
 func (s *StageOutcomes) register(names []string) {
 	if s == nil {
@@ -360,6 +418,14 @@ func (s *StageOutcomes) HeaderValue() string {
 		return ""
 	}
 	s.mu.Lock()
+	if s.replayed {
+		v := s.stored
+		s.mu.Unlock()
+		if v == "" {
+			return stageOutcomesAllSucceeded
+		}
+		return v
+	}
 	out := make([]stageOutcomeJSON, 0, len(s.order)+1)
 	if s.aborted {
 		out = append(out, stageOutcomeJSON{Name: "", Reason: StageReasonAborted})

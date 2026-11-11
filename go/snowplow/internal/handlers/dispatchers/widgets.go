@@ -12,6 +12,7 @@ import (
 	"github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/rest"
@@ -232,7 +233,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					// #1324 — the GATED bytes this requester is served, not the shared shell.
-					stampRefreshDigest(wri, func() string { return cache.ContentDigest(gated) })
+					stampRefreshDigest(wri, func() string { return cache.AnswerDigest(gated, entry.StageOutcomes) })
+					// #1319 — the outcomes the walker's resolve stored with the shell.
+					setWidgetStageOutcomesHeader(wri, entry.StageOutcomes)
 					// #1062 — an armed hit on a dirty shared shell is an l1 stale
 					// serve, timed until its replacing frame is written.
 					cache.NoteStaleHit(req.Context(), contentKey, entry, staleSubjectOf)
@@ -304,6 +307,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
 			stampRefreshDigest(wri, entry.ContentDigest)                           // #1324: the cell is served verbatim
+			setWidgetStageOutcomesHeader(wri, entry.StageOutcomes)                 // #1319: the outcomes stored with the cell
 			staleHitWritePoint(req.Context(), cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
 			serve.servedCell(cacheKey, entry)
@@ -421,6 +425,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// changes no verdict, served byte, or cache key.
 	ctx = installShadowParityWidget(ctx, got.Unstructured.Object)
 
+	// #1319 — the widget's apiRef RESTAction reports its per-stage outcomes
+	// here (its top-level resolve claims the collector; a full-list slice or a
+	// memo entry served without a resolve replays the stored ones). The header
+	// is set before the error branch, as on a RESTAction /call, and only when a
+	// stage did not succeed; the Puts below keep the same value on the cell.
+	ctx, outcomes := api.WithStageOutcomes(ctx)
 	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
 		RC:      r.saRC,
@@ -429,6 +439,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Page:    page,
 		Extras:  extras,
 	})
+	stageOutcomes := storableStageOutcomes(outcomes)
+	setWidgetStageOutcomesHeader(wri, stageOutcomes)
 	if err != nil {
 		// #1116 — the request's extras name a key the widget's apiRef
 		// RESTAction writes itself: the same 400 a RESTAction /call answers,
@@ -644,12 +656,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// external widget whose RA also reads K8s is dirty-marked through its
 			// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
 			// write's own critical section (#734).
-			// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 			put := cacheHandle.PutResolvedEndingKnownStale(ctx, verdict, cacheKey, &cache.ResolvedEntry{
-				RawJSON:     encoded,
-				Inputs:      cacheInputs,
-				TTLOverride: extTTL,
-				ExternalTTL: true,
+				RawJSON:       encoded,
+				Inputs:        cacheInputs,
+				TTLOverride:   extTTL,
+				ExternalTTL:   true,
+				StageOutcomes: stageOutcomes, // #1319
 			})
 			// #1321 B1 — this response arms nothing, but the key is the per-binding
 			// widgets key, which an earlier non-external serve of the same widget
@@ -754,12 +766,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			cacheInputs.HasUAF = true
 		}
 		noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-		// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 		if put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
-			RawJSON:      encoded,
-			Inputs:       cacheInputs,
-			TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
-			StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
+			RawJSON:       encoded,
+			Inputs:        cacheInputs,
+			TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
+			StaleDerived:  staleSink.StaleDerived(), // #710 PR-2b
+			StageOutcomes: stageOutcomes,            // #1319
 		}, cacheGen0); put.Stored() {
 			if verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
@@ -814,7 +826,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)
-	stampRefreshDigest(wri, func() string { return cache.ContentDigest(encoded) }) // #1324: the stored and written bytes
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, stageOutcomes) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

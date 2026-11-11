@@ -285,13 +285,16 @@ type ResolvedEntry struct {
 	// feeds snowplow_prewarm_seed_origin only (seed_origin.go).
 	SeedOrigin string
 
-	// StageOutcomes (#904, restactions class only) is the X-Snowplow-Stage-
-	// Outcomes value of the resolve that produced RawJSON, so an L1 hit answers
-	// with the same header as the cold resolve did. "" means every stage
-	// succeeded (the header is then []), which is the only outcome most stored
-	// cells can have: a cell is stored only when no stage failed, or when every
-	// failure is a per-identity Forbidden (#681 DenialOnly). Stage names and
-	// reason codes only, never identity or data.
+	// StageOutcomes (#904; every resolving class since #1319) is the
+	// X-Snowplow-Stage-Outcomes value of the resolve that produced RawJSON, so
+	// an L1 hit answers with the same header as the cold resolve did: a
+	// RESTAction cell's own stages, a widget cell's apiRef RESTAction's stages,
+	// a RESTAction full list's (replayed to the widget sliced from it). ""
+	// means every stage succeeded (a RESTAction header is then [], a widget
+	// carries none), which is the only outcome most stored cells can have: a
+	// cell is stored only when no stage failed, or when every failure is a
+	// per-identity denial (#681 DenialOnly). Stage names and reason codes
+	// only, never identity or data.
 	StageOutcomes string
 
 	// Inputs is the canonical key-input bundle the entry was resolved

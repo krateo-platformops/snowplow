@@ -38,6 +38,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -421,8 +422,20 @@ func raFullListServe(
 	if !haveEpoch {
 		raEpoch = cache.DepGenEpochNow()
 	}
-	fullCtx := cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
-		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	// #1319 — the unpaginated resolve reports its stage outcomes into its OWN
+	// collector: they are the full list's, stored with the raKey cell and
+	// replayed to the widget whenever the served body is a slice of it (a hit
+	// replays the stored ones). The page-keyed resolve (sRA) reports into the
+	// caller's collector on ctx as any resolve does.
+	fullCtx, fullOutcomes := api.WithStageOutcomes(cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
+		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name}))
+	// servedFromFull returns a slice of the full list this call resolved, and
+	// hands the caller the full list's outcomes (a no-op when a page-keyed
+	// resolve on ctx already reported its own).
+	servedFromFull := func(m map[string]any) (map[string]any, bool, error) {
+		api.ReplayStageOutcomes(ctx, api.StorableStageOutcomes(fullOutcomes))
+		return m, true, nil
+	}
 	// #890/#893 — an unpaginated resolve under fullCtx records edges under raKey;
 	// if its full list is not stored they are released when this serve returns.
 	// The fast-path hit records nothing under raKey, so it releases nothing.
@@ -515,6 +528,9 @@ func raFullListServe(
 					// later raKey commit at a new version remarks the stored widget.
 					c.NoteRAFullListSlice(ctx, raKey, entry)
 					cache.RecordRAFullListServe(cache.RAFullListServeHit)
+					// #1319 — served without a resolve: the caller gets the
+					// outcomes the resolve that stored the full list produced.
+					api.ReplayStageOutcomes(ctx, entry.StageOutcomes)
 					return sliced, true, nil
 				}
 			}
@@ -557,7 +573,7 @@ func raFullListServe(
 				c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
 			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-			return sliced, true, nil
+			return servedFromFull(sliced)
 		}
 		// #323 — generation-guarded write: on accept, record the self-dep + replay
 		// the backing edges; on REFUSE (a DELETE-eviction bumped the generation
@@ -579,17 +595,17 @@ func raFullListServe(
 				c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
 			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-			return sliced, true, nil
+			return servedFromFull(sliced)
 		}
 		if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-			return sliced, true, nil
+			return servedFromFull(sliced)
 		}
 		// #592 — observed limb, immediately before the write (the unpaginated
 		// resolve that built `full` has run by now, so a nested refilter has
 		// bumped the sink).
 		stampObservedUAF()
-		put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, raGen0)
+		put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, api.StorableStageOutcomes(fullOutcomes), raGen0)
 		// #1321 B1 — this repopulate replaces a resident raKey cell, which a
 		// /refreshes connection can arm (raFullList coordinates, #426): a write
 		// that changed its bytes announces the change itself.
@@ -613,7 +629,7 @@ func raFullListServe(
 				cache.Deps().EdgeNarrowStates(raKey, edges), cache.ReplaySiteFullList)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
-		return sliced, true, nil
+		return servedFromFull(sliced)
 	}
 
 	// --- First sight of (RA × shape): byte-VERIFY, then memoise ---------
@@ -779,21 +795,21 @@ func raFullListServe(
 			c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-		return sGo, true, nil
+		return servedFromFull(sGo)
 	}
 	if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-		return sGo, true, nil
+		return servedFromFull(sGo)
 	}
 	// #592 — observed limb, twin of the repopulate branch above.
 	stampObservedUAF()
-	put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, raGen0)
+	put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, api.StorableStageOutcomes(fullOutcomes), raGen0)
 	cache.PublishPutIfSubscribed(raKey, put) // #1321 B1 — see the repopulate branch
 	if put.Stored() {
 		noteRAFullListDenialOnlyPut(v)
 	}
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
-	return sGo, true, nil
+	return servedFromFull(sGo)
 }
 
 // raFullListStageErrorDeclined counts raFullList cell writes declined by the
