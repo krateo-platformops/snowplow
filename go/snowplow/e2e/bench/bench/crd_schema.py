@@ -115,18 +115,25 @@ def crd_sources(installer_dir: str) -> list[dict]:
     return out
 
 
-def pull(src: dict, workdir: str, run=subprocess.run) -> dict:
+def pull(src: dict, workdir: str, run=subprocess.run, budget=None) -> dict:
     """helm pull --untar at the pinned version into its own directory; the
-    pulled Chart.yaml must carry that version."""
+    pulled Chart.yaml must carry that version. Through bench/noanswer.py (run 26):
+    no answer is asked again within `budget` (the caller extends it by every
+    pull's share); `no_answer` says the error is that, not the registry's."""
+    from bench import noanswer
     dest = os.path.join(workdir, f"{src['chart']}-{src['version']}")
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest)
     argv = ["helm", "pull", src["ref"], "--version", src["version"], "--untar", "-d", dest]
     if src.get("repo"):
         argv += ["--repo", src["repo"]]
-    p = run(argv, capture_output=True, text=True)
-    if p.returncode != 0:
-        return dict(src, error=f"helm pull failed: {(p.stderr or '').strip()[:300]}")
+    try:
+        noanswer.helm(argv, f"helm pull of {src['ref']} --version {src['version']}", noanswer.helm_read_bound(),
+                      budget, run)
+    except noanswer.Refused as e:
+        return dict(src, error=f"helm pull failed: {e}")
+    except noanswer.NoAnswer as e:
+        return dict(src, error=str(e), no_answer=True)
     sub = [d for d in os.listdir(dest) if os.path.isdir(os.path.join(dest, d))]
     if len(sub) != 1:
         return dict(src, error=f"unexpected pull layout: {sub}")
@@ -406,7 +413,7 @@ def check(docs: list[tuple[str, dict]], sources: list[dict]) -> dict:
     return {"kind": "crd_check", "ok": ok, "kinds": sorted(kinds.values(), key=lambda e: e["kind"]),
             "builtin_not_validated": builtin,
             "sources": [{x: s.get(x) for x in ("component", "chart", "version", "from", "error",
-                                                "templated_unread")} | {"crds": len(s.get("crds") or [])}
+                                                "templated_unread", "no_answer")} | {"crds": len(s.get("crds") or [])}
                         for s in sources]}
 
 
@@ -487,12 +494,18 @@ def main(argv=None) -> int:
     c.add_argument("--duration-s", type=float, default=0)
     c.add_argument("--user-prefix", default="scaleuser-")
     c.add_argument("--full-widen", action="store_true", help="the #1004 stage runs (BENCH_1004_GO)")
+    c.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
+                   "(bench/noanswer.py Budget.shared)")
     a = ap.parse_args(argv)
     docs = run_documents(a)
     srcs = crd_sources(_installer_dir(a.installer_pulled))
     os.makedirs(a.workdir, exist_ok=True)
+    from bench import noanswer
+    budget = noanswer.Budget.shared(a.budget_file) if a.budget_file else None
+    if budget is not None:
+        budget.extend(sum(1 for s in srcs if s["from"] == "pin") * noanswer.helm_read_bound())
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        srcs = list(ex.map(lambda s: pull(s, a.workdir) if s["from"] == "pin" else s, srcs))
+        srcs = list(ex.map(lambda s: pull(s, a.workdir, budget=budget) if s["from"] == "pin" else s, srcs))
     srcs = [read_crds(s) for s in srcs]
     if a.full_widen:
         from bench import full_widen
@@ -502,6 +515,11 @@ def main(argv=None) -> int:
         json.dump(res, fh, indent=2)
     for ln in report_lines(res):
         print(ln, file=sys.stderr, flush=True)
+    unanswered = [s for s in res["sources"] if s.get("no_answer")]
+    if not res["ok"] and unanswered:            # run 26: not the CRDs' refusal: their charts got no answer
+        print("crd check: NO ANSWER for " + ", ".join(f"{s['chart']} {s['version']}" for s in unanswered)
+              + ": what their CRDs would refuse is unknown", file=sys.stderr, flush=True)
+        return 4
     return 0 if res["ok"] else 1
 
 

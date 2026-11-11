@@ -100,7 +100,7 @@ def preflight(chart_dir: str, requirements=PR483_REQUIREMENTS) -> dict:
 
 
 def oci_preflight(chart_ref: str, version: str, workdir: str,
-                  requirements=PR483_REQUIREMENTS, run=subprocess.run) -> dict:
+                  requirements=PR483_REQUIREMENTS, run=subprocess.run, budget=None) -> dict:
     """Registry preflight for the ORDINARY install path (run 5+).
 
     1. `helm show chart <ref> --version <v>` must resolve (published, pullable);
@@ -109,12 +109,27 @@ def oci_preflight(chart_ref: str, version: str, workdir: str,
        krateo-observability.deps contains alert-provider-crd).
     Read-only (ghcr only); runs before any cluster exists.
     """
+    from bench import noanswer
     res: dict = {"chart": chart_ref, "version": version, "ok": False, "failures": []}
-    show = run(["helm", "show", "chart", chart_ref, "--version", version],
-               capture_output=True, text=True)
-    if show.returncode != 0:
-        res["failures"].append(f"helm show chart {chart_ref} --version {version} "
-                               f"failed: {(show.stderr or '').strip()[:300]}")
+    # run 26: both reads through bench/noanswer.py (no answer asked again within the run's one bound
+    # of its pre-cluster registry reads, `budget`, extended here by both reads' share)
+    bound = noanswer.helm_read_bound()
+    if budget is not None:
+        budget.extend(2 * bound)
+
+    def read(argv, what, failed):
+        try:
+            return noanswer.helm(argv, what, bound, budget, run)
+        except noanswer.Refused as e:
+            res["failures"].append(f"{failed}: {e}")
+        except noanswer.NoAnswer as e:
+            res["no_answer"] = True
+            res["failures"].append(str(e))
+        return None
+    show = read(["helm", "show", "chart", chart_ref, "--version", version],
+                f"helm show chart {chart_ref} --version {version}",
+                f"helm show chart {chart_ref} --version {version} failed")
+    if show is None:
         return res
     meta = yaml.safe_load(show.stdout or "") or {}
     res["resolved_version"] = meta.get("version")
@@ -122,10 +137,8 @@ def oci_preflight(chart_ref: str, version: str, workdir: str,
         res["failures"].append(f"resolved version {meta.get('version')!r} != {version!r}")
         return res
     os.makedirs(workdir, exist_ok=True)
-    pull = run(["helm", "pull", chart_ref, "--version", version, "--untar",
-                "-d", workdir], capture_output=True, text=True)
-    if pull.returncode != 0:
-        res["failures"].append(f"helm pull failed: {(pull.stderr or '').strip()[:300]}")
+    if read(["helm", "pull", chart_ref, "--version", version, "--untar", "-d", workdir],
+            f"helm pull of {chart_ref} --version {version}", "helm pull failed") is None:
         return res
     sub = [d for d in os.listdir(workdir) if os.path.isdir(os.path.join(workdir, d))]
     if len(sub) != 1:
@@ -174,6 +187,8 @@ def main(argv=None) -> int:
     op.add_argument("--out", default=None)
     op.add_argument("--no-pins", action="store_true",
                     help="only check the chart resolves (no #483 pin assertions)")
+    op.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
+                    "(bench/noanswer.py Budget.shared)")
     pf = sub.add_parser("preflight")
     pf.add_argument("--chart-dir", required=True)
     pf.add_argument("--require-pin", action="append", default=None,
@@ -184,12 +199,18 @@ def main(argv=None) -> int:
         print(prepare(a.ref, a.dest, a.version, a.repo))
         return 0
     if a.cmd == "oci-preflight":
+        from bench import noanswer
         res = oci_preflight(a.chart, a.version, a.workdir,
-                            () if a.no_pins else PR483_REQUIREMENTS)
+                            () if a.no_pins else PR483_REQUIREMENTS,
+                            budget=noanswer.Budget.shared(a.budget_file) if a.budget_file else None)
         if a.out:
             with open(a.out, "w") as fh:
                 json.dump(res, fh, indent=2)
         print(json.dumps(res, indent=2), file=sys.stderr)
+        if res.get("no_answer"):
+            print("installer registry preflight: NO ANSWER (not a refusal of the chart): "
+                  + "; ".join(res["failures"]), file=sys.stderr)
+            return 4
         if not res["ok"]:
             print("installer registry preflight REFUSED: " + "; ".join(res["failures"]),
                   file=sys.stderr)

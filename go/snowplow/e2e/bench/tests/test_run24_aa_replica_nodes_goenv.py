@@ -599,7 +599,7 @@ def test_run606_takes_the_preinstall_reading_before_anything_of_the_install_exis
     src = (BENCH / "run606.sh").read_text()
     body = src[src.index("s_install() {"):]
     assert body.index("tracing_preinstall") < body.index("create namespace krateo-system")
-    assert body.index("tracing_preinstall") < body.index('install installer "$INSTALLER_CHART"')
+    assert body.index("tracing_preinstall") < body.index('install installer "$INSTALLER_LOCAL"')
 
 
 # ─── 4. k6's user bucket tag ────────────────────────────────────────────────

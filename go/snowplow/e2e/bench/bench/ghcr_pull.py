@@ -110,8 +110,6 @@ import json
 import multiprocessing
 import os
 import re
-import socket
-import ssl
 import stat
 import subprocess
 import sys
@@ -121,6 +119,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+from bench.noanswer import (NO_ANSWER_ERRORS, NO_ANSWER_STATUS, SSL_DROP_REASONS,  # noqa: F401
+                            SSL_DROPS, TEMPORARY_EAI, Budget, NoAnswer, attempt, phase, unanswered)
 
 KEYS = ("GHCR_PULL_USERNAME", "GHCR_PULL_TOKEN")
 DEFAULT_ENV_FILE = os.path.expanduser("~/.config/snowplow-bench/ghcr-pull.env")
@@ -374,80 +375,15 @@ class _Refused(Exception):
     """Why a reference does not resolve (never carries a credential)."""
 
 
-class _NoAnswer(_Refused):
-    """NO answer within a call's bound (run 25): the call timed out, its connection was reset or
-    dropped, or the registry said it cannot answer now (HTTP 429, 5xx). Not evidence about the
-    token: its reference is asked again while the step's bound has room (Budget, _phase); refused only
-    when it has none, and then said as "no answer", never as "does not resolve"."""
+class _NoAnswer(_Refused, NoAnswer):
+    """NO answer within a call's bound (run 25; bench/noanswer.py): not evidence about the token. Its
+    reference is asked again while the step's bound has room (Budget, _phase); refused only when it
+    has none, and then said as "no answer", never as "does not resolve"."""
 
 
-#: what ends a call with no answer (#1335 review): a timeout; a connection reset, aborted or dropped
-#: mid-answer; a TLS connection that ended (every call is https: a dropped connection usually surfaces
-#: as an SSL EOF); a name resolution that failed for now (EAI_AGAIN, getaddrinfo's own "temporary
-#: failure"). Never a certificate that does not verify, a refused connection or a name that does not
-#: exist: those are answers.
-NO_ANSWER_ERRORS = (TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
-                    http.client.IncompleteRead)
-SSL_DROPS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError)
-SSL_DROP_REASONS = frozenset({"UNEXPECTED_EOF_WHILE_READING"})
-TEMPORARY_EAI = frozenset({socket.EAI_AGAIN})
-#: HTTP statuses that say the registry cannot answer NOW (request timeout, too many requests, its
-#: own failure): no answer about the reference
-NO_ANSWER_STATUS = frozenset({408, 429})
-
-
-def _unanswered(e: BaseException) -> str | None:
-    """Why `e` is no answer (its NO_ANSWER_ERRORS class, said), or None when it is an answer."""
-    if isinstance(e, TimeoutError):
-        return "timed out"
-    if isinstance(e, NO_ANSWER_ERRORS):
-        return f"the connection ended ({type(e).__name__})"
-    if isinstance(e, SSL_DROPS) or (isinstance(e, ssl.SSLError) and getattr(e, "reason", None) in SSL_DROP_REASONS):
-        reason = getattr(e, "reason", None)
-        return f"the TLS connection ended ({type(e).__name__}{': ' + reason if reason else ''})"
-    if isinstance(e, socket.gaierror) and e.errno in TEMPORARY_EAI:
-        return f"name resolution failed for now ({e.strerror or 'EAI_AGAIN'})"
-    return None
-
-
-class Budget:
-    """The step's bound, as a deadline (run 25: one call's 30 s timeout refused the whole run).
-
-    The bound is the one the step already derives: every call it makes at its own whole bound.
-    `extend` adds a phase's share once its references are known (the charts first, then the images
-    their charts run). Every reference is tried once first; one that got NO ANSWER is tried again
-    (main: `_phase`) while what is left of the bound holds that reference's whole share, so the step
-    never runs past its bound and each retry is paid for by time the answered calls did not use. A
-    call with no answer counts its whole bound (_attempt waits out the rest of it after a fast
-    reset), so how often a reference can be asked follows from the bound alone."""
-
-    def __init__(self, clock=time.monotonic, sleep=time.sleep):
-        self.clock, self.sleep = clock, sleep
-        self.deadline: float | None = None
-        self.total = 0.0
-
-    def extend(self, s: float) -> None:
-        self.deadline = (self.clock() if self.deadline is None else self.deadline) + s
-        self.total += s
-
-    def holds(self, s: float) -> bool:
-        """Whether what is left of the bound holds `s` more seconds."""
-        return self.deadline is not None and self.deadline - self.clock() >= s
-
-
-def _attempt(what: str, bound_s: float, fn, budget: Budget | None):
-    """fn(): one call, `what` (the token exchange, the manifest read, ...), bounded by `bound_s`.
-    Within the step (`budget`), no answer names the call and counts as the call's whole bound: after
-    a fast reset the rest of it is waited out, so a retry of its reference can never come sooner.
-    Outside the step (no budget), fn's own _NoAnswer is raised as it is."""
-    if budget is None:
-        return fn()
-    t0 = budget.clock()
-    try:
-        return fn()
-    except _NoAnswer as e:
-        budget.sleep(max(0.0, t0 + bound_s - budget.clock()))
-        raise _NoAnswer(f"no answer from the {what} ({e})") from None
+# the classification and the bounded retry are bench/noanswer.py's, shared with every other
+# pre-cluster registry read (run 26: cert-manager's helm pull)
+_unanswered, _attempt, _phase = unanswered, attempt, phase
 
 
 def _call(fn, bound_s: float, on_timeout=None, whole: float | None = None):
@@ -1101,24 +1037,6 @@ def dockerconfigjson(user: str, token: str) -> str:
     return json.dumps({"auths": {REGISTRY_HOST: {"username": user, "password": token, "auth": auth}}})
 
 
-def _phase(budget: Budget, items: list, share: float, one, no_answer) -> tuple[list, list[int]]:
-    """`one(item)` for every item (a chart, an image) within the step's bound, extended by this
-    phase's `share` per item: each once, then each whose result is NO ANSWER (`no_answer(result)`)
-    again, the least-tried first, while what is left of the bound holds one more whole share. Returns
-    the results (in `items`' order) and each one's number of attempts. A registry's own answer (a
-    refusal) is never asked again: it is an answer."""
-    budget.extend(len(items) * share)
-    out = [one(x) for x in items]
-    tries = [1] * len(items)
-    while True:
-        open_ = [k for k in range(len(items)) if no_answer(out[k])]
-        if not open_ or not budget.holds(share):
-            return out, tries
-        k = min(open_, key=lambda k: (tries[k], k))
-        out[k] = one(items[k])
-        tries[k] += 1
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.ghcr_pull")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1130,6 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--values", required=True)
     pf.add_argument("--out", required=True)
     pf.add_argument("--helm", default="helm", help="the helm that renders each chart (helm template)")
+    pf.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
+                    "(bench/noanswer.py Budget.shared): this step adds its share")
     pf.add_argument("--override", action="append", default=[], metavar="COMPONENT=TAG",
                     help="a component whose image this run overrides (its componentValues in --values): "
                          "preflighted whatever its repo; refused unless a ghcr.io image it renders has TAG")
@@ -1174,7 +1094,8 @@ def main(argv: list[str] | None = None) -> int:
     # and each render at its own. Run 25: it now also BOUNDS the step (Budget): every reference is
     # tried once, then one with NO ANSWER again while what is left holds its whole share (_phase).
     chart_s, image_s = 4 * HTTP_BOUND_S + BLOB_BOUND_S + PARSE_BOUND_S + RENDER_BOUND_S, 2 * HTTP_BOUND_S
-    budget = Budget()
+    budget = Budget.shared(a.budget_file) if a.budget_file else Budget()
+    before = budget.total                      # the run's earlier registry reads' share, if shared
 
     def one_chart(p):
         ref = f"{p['repo']}/{p['chart']}"
@@ -1240,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
         if r["no_answer"]:
             r["error"] = (f"{r['error']}; {r['attempts']} attempt(s), the step's {budget.total:g} s bound spent: "
                           f"whether the token resolves it is unknown")
-    bound = budget.total
+    bound = budget.total - before                # this step's own share of the bound
     how = (f"{len(pins)} charts x (4 x {HTTP_BOUND_S:g} + {BLOB_BOUND_S:g} + {PARSE_BOUND_S:g} + "
            f"{RENDER_BOUND_S:g} s) + {len(img_res)} images x (2 x {HTTP_BOUND_S:g} s)")
     stale = stale_inputs(res)

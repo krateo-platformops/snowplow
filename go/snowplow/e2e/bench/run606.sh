@@ -758,12 +758,20 @@ s_source() {
   # the chart must resolve at INSTALLER_VERSION and, with VERIFY483=1, its
   # pins must carry the #483 gate. Either failure refuses the run for free.
   # It runs in the dry pass too: s_schema validates against what it pulls.
-  local pins=(--no-pins)
+  local pins=(--no-pins) rc=0
   [[ "$VERIFY483" == "1" ]] && pins=()
   rm -rf "$OUT/installer-pulled"
+  # run 26: this run's pre-cluster registry reads (here, cert-manager's source, the CRD charts, the ghcr
+  # pull token's charts and images) spend ONE bound together (bench/noanswer.py Budget.shared): a new one
+  rm -f "$REGISTRY_BUDGET"
   python3 -m bench.installer_src oci-preflight --chart "$INSTALLER_CHART" \
       --version "$INSTALLER_VERSION" --workdir "$OUT/installer-pulled" \
-      --out "$OUT/installer-preflight.json" ${pins[@]+"${pins[@]}"}
+      --out "$OUT/installer-preflight.json" --budget-file "$REGISTRY_BUDGET" ${pins[@]+"${pins[@]}"} || rc=$?
+  case "$rc" in
+    0) ;;
+    4) record_failure "source FAILED: the registry gave NO ANSWER for the installer chart within the registry reads' bound (above: which read, how often): whether it resolves is unknown"; return 1 ;;
+    *) record_failure "source FAILED: the installer chart does not resolve or verify ($OUT/installer-preflight.json)"; return 1 ;;
+  esac
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
 }
 # s_schema: every manifest the run applies, rendered offline and validated
@@ -781,11 +789,15 @@ s_schema() {
                                          --browser-think-s "$BROWSER_THINK_S" --duration-s "$DRIVE_S")
   [[ -n "$FULL_WIDEN_GO" ]] && args+=(--full-widen)
   local rc=0 ln
-  python3 -m bench.crd_schema check "${args[@]}" >/dev/null 2>"$KERR" || rc=$?
+  python3 -m bench.crd_schema check "${args[@]}" --budget-file "$REGISTRY_BUDGET" >/dev/null 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
   (( rc == 0 )) && return 0
+  if (( rc == 4 )); then
+    record_failure "schema FAILED: the registry gave NO ANSWER for some of the CRD charts installer ${INSTALLER_VERSION} pins (above): what their CRDs would refuse is unknown"
+    return 1
+  fi
   # the record keeps the refusals (every line when it failed otherwise, e.g. a traceback)
   if grep -F "crd check FAILED" "$KERR" > "$KERR.refusals"; then mv "$KERR.refusals" "$KERR"; else rm -f "$KERR.refusals"; fi
   record_failure "schema FAILED: the manifests of this run do not satisfy the CRDs installer ${INSTALLER_VERSION} pins (exit ${rc}, $OUT/crd-check.json)"
@@ -982,7 +994,7 @@ s_registry() {
   fi
   python3 -m bench.ghcr_pull preflight --env-file "$GHCR_PULL_ENV_FILE" --installer-pulled "$OUT/installer-pulled" \
       --values "$OUT/installer-values.yaml" --out "$OUT/ghcr-pull-preflight.json" \
-      ${override[@]+"${override[@]}"} 2>"$KERR" || rc=$?
+      --budget-file "$REGISTRY_BUDGET" ${override[@]+"${override[@]}"} 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
@@ -1009,11 +1021,15 @@ s_registry() {
 s_cert_manager_source() {
   local rc=0 ln
   python3 -m bench.cert_manager preflight --workdir "$OUT/cert-manager" \
-      --out "$OUT/cert-manager-preflight.json" 2>"$KERR" || rc=$?
+      --out "$OUT/cert-manager-preflight.json" --budget-file "$REGISTRY_BUDGET" 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
-  (( rc == 0 )) || { record_failure "cert-manager source FAILED: the pinned chart did not verify ($OUT/cert-manager-preflight.json)"; return 1; }
+  case "$rc" in      # run 26: exit 4 is NO ANSWER within the registry reads' bound, not a chart that fails
+    0) ;;
+    4) record_failure "cert-manager source FAILED: the registry gave NO ANSWER for the pinned chart within the registry reads' bound (above: which read, how often): whether it verifies is unknown"; return 1 ;;
+    *) record_failure "cert-manager source FAILED: the pinned chart did not verify ($OUT/cert-manager-preflight.json)"; return 1 ;;
+  esac
 }
 # cm_field <field>: one field of the preflight's record (a list, space-joined)
 cm_field() {
@@ -1086,17 +1102,25 @@ s_install() {
           >/dev/null 2>"$KERR" \
       || { record_failure "install FAILED: creating the image-pull Secret"; return 1; }
   fi
+  # #1335 follow-up (R6): the installer is installed from the chart s_source pulled and verified
+  # (INSTALLER_VERSION, its pins checked), never read from the registry a second time once the cluster
+  # exists: a registry with no answer here would cost a paid cluster, and the copy is the one checked
+  local INSTALLER_LOCAL="$OUT/installer-pulled/${INSTALLER_CHART##*/}"
+  if [[ ! -f "$INSTALLER_LOCAL/Chart.yaml" ]]; then
+    record_failure "install FAILED: the verified installer chart is not at $INSTALLER_LOCAL (s_source pulls it)"
+    return 1
+  fi
   # registryAuth.username through a pipe into helm's `-f -` (helm reads that
   # values document from stdin): no file holds it, so no exit path can leave
   # one behind (#1007 review F2)
   if [[ "$DRY" == "1" ]]; then
-    run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+    run "${H[@]}" install installer "$INSTALLER_LOCAL" \
         -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
         --wait --timeout "${INSTALL_TIMEOUT_S}s"
     return 0
   fi
   python3 -m bench.ghcr_pull username --env-file "$GHCR_PULL_ENV_FILE" \
-    | run "${H[@]}" install installer "$INSTALLER_CHART" --version "$INSTALLER_VERSION" \
+    | run "${H[@]}" install installer "$INSTALLER_LOCAL" \
         -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
         --wait --timeout "${INSTALL_TIMEOUT_S}s"
 }
@@ -1740,6 +1764,9 @@ kwait() {
 # the same bench kubeconfig and context.)
 api_answers() { "${K[@]}" --request-timeout=30s get --raw=/readyz >/dev/null 2>&1; }
 KERR="$OUT/.kubectl-last-error"
+# run 26: the ONE bound this run's pre-cluster registry reads spend together (bench/noanswer.py
+# Budget.shared; s_source starts it, each read step adds its own calls' share)
+REGISTRY_BUDGET="$OUT/.registry-read-bound.json"
 # kerr_line: kubectl's first error line, for the log and collect's record —
 # every identity redacted first by bench/identity.py, the bench's ONE identity
 # redaction (bench.gke's error summary uses it too): 'User "…"', 'users "…"',

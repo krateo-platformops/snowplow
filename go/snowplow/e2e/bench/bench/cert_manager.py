@@ -108,9 +108,12 @@ def rendered_waits(manifest: str) -> tuple[list[str], list[str]]:
     return sorted(deps), sorted(crds)
 
 
-def preflight(workdir: str, run=subprocess.run) -> dict:
+def preflight(workdir: str, run=subprocess.run, budget=None) -> dict:
     """Pull the pinned chart into `workdir`, verify it, render it with VALUES.
-    The record says what was refused, if anything (`ok` False)."""
+    The record says what was refused, if anything (`ok` False); `no_answer` when the pull got
+    none within the bound (run 26: bench/noanswer.py, asked again within `budget`, the run's one
+    bound of its pre-cluster registry reads, which this step extends by its pull's share)."""
+    from bench import noanswer
     res: dict = {"kind": "cluster_prerequisite", "name": "cert-manager", "chart_ref": CHART_REF,
                  "version": CHART_VERSION, "chart_sha256": CHART_SHA256, "release": RELEASE,
                  "namespace": NAMESPACE, "values": VALUES, "mirrors": MIRRORS, "reason": REASON,
@@ -119,11 +122,18 @@ def preflight(workdir: str, run=subprocess.run) -> dict:
     for f in os.listdir(workdir):                 # a previous run's archive never counts
         if f.endswith(".tgz"):
             os.remove(os.path.join(workdir, f))
-    pull = run(["helm", "pull", CHART_REF, "--version", CHART_VERSION, "-d", workdir],
-               capture_output=True, text=True)
-    if pull.returncode != 0:
-        res["failures"].append(f"helm pull {CHART_REF} --version {CHART_VERSION} failed: "
-                               f"{(pull.stderr or '').strip()[:300]}")
+    bound = noanswer.helm_read_bound()
+    if budget is not None:
+        budget.extend(bound)
+    try:
+        noanswer.helm(["helm", "pull", CHART_REF, "--version", CHART_VERSION, "-d", workdir],
+                      f"helm pull of {CHART_REF} --version {CHART_VERSION}", bound, budget, run)
+    except noanswer.Refused as e:
+        res["failures"].append(f"helm pull {CHART_REF} --version {CHART_VERSION} failed: {e}")
+        return res
+    except noanswer.NoAnswer as e:
+        res["no_answer"] = True
+        res["failures"].append(str(e))
         return res
     tgzs = sorted(f for f in os.listdir(workdir) if f.endswith(".tgz"))
     if tgzs != [f"{CHART_NAME}-{CHART_VERSION}.tgz"]:
@@ -148,7 +158,7 @@ def preflight(workdir: str, run=subprocess.run) -> dict:
     tpl = run(["helm", "template", RELEASE, tgz, "--namespace", NAMESPACE, "-f", values],
               capture_output=True, text=True)
     if tpl.returncode != 0:
-        res["failures"].append(f"helm template of the verified chart failed: {(tpl.stderr or '').strip()[:300]}")
+        res["failures"].append(f"helm template of the verified chart failed: {noanswer.cause(tpl.stderr or '')}")
         return res
     deps, crds = rendered_waits(tpl.stdout or "")
     res["deployments"], res["crds"] = deps, crds
@@ -184,6 +194,8 @@ def main(argv=None) -> int:
     pf = sub.add_parser("preflight")
     pf.add_argument("--workdir", required=True)
     pf.add_argument("--out", required=True)
+    pf.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
+                    "(bench/noanswer.py Budget.shared)")
     rc = sub.add_parser("record")
     rc.add_argument("--preflight", required=True, help="the preflight's record")
     rc.add_argument("--helm-list", required=True, help="helm list -n cert-manager -o json")
@@ -191,9 +203,14 @@ def main(argv=None) -> int:
     rc.add_argument("--out", required=True, help="the run's record (jsonl, appended)")
     a = p.parse_args(argv)
     if a.cmd == "preflight":
-        res = preflight(a.workdir)
+        from bench import noanswer
+        res = preflight(a.workdir, budget=noanswer.Budget.shared(a.budget_file) if a.budget_file else None)
         with open(a.out, "w") as fh:
             json.dump(res, fh, indent=2)
+        if res.get("no_answer"):
+            print("cert-manager preflight: NO ANSWER (not a refusal of the chart): " + "; ".join(res["failures"]),
+                  file=sys.stderr)
+            return 4
         if not res["ok"]:
             print("cert-manager preflight REFUSED: " + "; ".join(res["failures"]), file=sys.stderr)
             return 2
