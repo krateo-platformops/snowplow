@@ -126,3 +126,8 @@ jobs:
       # PE magic), so a tracked shell script (mode 755) stays allowed.
       - name: No tracked executable binaries gate
         run: bash scripts/check_no_tracked_binaries.sh --self-test && bash scripts/check_no_tracked_binaries.sh
+      # The browser build (GOOS=js GOARCH=wasm, the Agentiko sandbox): it compiles and vets, the
+      # bridge's tests pass under Go's wasm runner (Node.js), and the server build contains none
+      # of the browser code.
+      - name: js/wasm browser build gate
+        run: bash scripts/check_js_wasm.sh

@@ -61,6 +61,30 @@
 // #1131 — THE DESTINATION POLICY. The dialer that carries a named endpoint
 // refuses link-local, unspecified and multicast addresses on the address it
 // dials (destination.go).
+//
+// THE BROWSER BUILD (js/wasm, the Agentiko sandbox). A program in a browser
+// worker cannot open a connection: every request leaves through the
+// browser's fetch (BrowserEgress, egress_js.go), installed innermost, so
+// every wrapper and rule above still applies to the request. Three things
+// below the request are the browser's, not this package's, on that build:
+//
+//   - THE DESTINATION POLICY (#1131) does not apply. Go never sees the
+//     address fetch connects to, so there is nothing for the dial-time check
+//     to check; the browser's own rules for where a page may send a request
+//     apply instead.
+//   - TLS CLIENT CERTIFICATES do not apply. fetch presents no certificate a
+//     program supplies, so a config's client certificate (a cert-auth
+//     clientconfig) is not sent, and server certificates are verified by the
+//     browser against its own roots, not against a config's CA data.
+//   - A REDIRECT, on the paths BrowserEgress serves (every hardened config
+//     and the owned branch of a stage fetch), fails the request instead of
+//     being returned: fetch is told to refuse it, so the never-follow rule
+//     holds, but the caller gets an error rather than the 3xx response. A
+//     client plumbing builds (the JWKS key source, the /call passthrough,
+//     the plumbing branch of a stage fetch) reaches fetch through plumbing's
+//     dialguard transport and gets fetch's own redirect handling.
+//
+// A server build is unaffected: BrowserEgress is nil there (egress.go).
 package credhttp
 
 import (
@@ -78,6 +102,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 )
 
 // RedirectRefusedError is what a refused redirect hop returns. It carries the
@@ -156,6 +181,11 @@ func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.
 // #847 — and its connections count under EgressAPIServer (connections.go).
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
+		// js/wasm only, below every wrapper, the ones rc already carries
+		// included: the browser's fetch replaces the dial (egress_js.go). On
+		// a server build BrowserEgress is nil and this leaves WrapTransport
+		// as it was.
+		rc.WrapTransport = transport.Wrappers(BrowserEgress, rc.WrapTransport)
 		// #1054 — innermost: every attempt (a client-go 429 retry included)
 		// is recorded on the slow-call record of the request that sent it.
 		rc.Wrap(slowcall.Transport)

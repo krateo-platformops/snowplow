@@ -219,6 +219,11 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		// own. It is also where the owned branch gets the destination policy
 		// (#1131); the plumbing branch above gets it from plumbing's transport.
 		DialHolder: credhttp.EndpointDialHolder,
+		// js/wasm only: the browser's fetch below the credential wrappers
+		// replaces the dial, as credhttp.Harden installs it (credhttp's package
+		// doc says what that leaves to the browser). nil on a server build,
+		// which is the field's zero value.
+		WrapTransport: credhttp.BrowserEgress,
 	}
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
 	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by

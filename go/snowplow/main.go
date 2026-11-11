@@ -4,6 +4,13 @@
 // /readyz, /debug/vars, pprof and swagger), the per-GVR dispatchers, the
 // informer/L1 caches and prewarm engine, RBAC, and the in-cluster
 // Kubernetes clients, then runs the server until signalled to shut down.
+//
+// The same program also builds for js/wasm, to run in a browser worker for
+// the Agentiko sandbox. That build adds only files constrained to js && wasm:
+// bridge_js.go serves the page's requests from this server
+// (internal/browserbridge, whose package doc says what does not apply in a
+// browser), egress leaves through the browser's fetch (internal/credhttp's
+// package doc), and no shutdown signal ever arrives.
 package main
 
 import (
@@ -18,7 +25,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	krateoaudit "github.com/krateo-platformops/audit"
@@ -1541,14 +1547,9 @@ func main() {
 	// MUST come after the expvar publishers registered just above.
 	registerDebugRoutes(mux, chain, jwtKeys)
 
-	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGKILL,
-		syscall.SIGHUP,
-		syscall.SIGQUIT,
-	}...)
+	// The signals that start a graceful shutdown: shutdown_signals.go on a
+	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
 
 	server := &http.Server{
