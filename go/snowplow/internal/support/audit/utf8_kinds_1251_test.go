@@ -3,9 +3,11 @@ package audit
 // utf8_kinds_1251_test.go — #1251 re-review: the UTF-8 sanitiser is TOTAL over
 // the attribute value kinds of go.opentelemetry.io/otel/attribute.
 //
-//   K  every kind the API defines (every Type its stringer names) has a case
-//      in validUTF8Value and a sample here; a kind added by an otel upgrade
-//      fails this arm until it gets both;
+//   K  every kind the API defines (every Type its stringer names) has a
+//      sample here and comes out of the shared writer's sanitiser
+//      (audit.SanitizeValue, which Emit applies to every attribute and the
+//      body, #1291) of the same kind with every string valid UTF-8; a kind
+//      added by an otel upgrade fails this arm until it gets a sample;
 //   W  one record per kind, each holding invalid UTF-8 wherever the kind can
 //      hold a string (a nested SLICE, a MAP key and value), sanitised and sent
 //      through the REAL otlploghttp exporter and BatchProcessor in ONE batch:
@@ -14,11 +16,11 @@ package audit
 import (
 	"context"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	krateoaudit "github.com/krateo-platformops/audit"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
@@ -90,9 +92,6 @@ func allValidUTF8(v attribute.Value) bool {
 
 func TestUTF8_1251_K_EveryKindHasACase(t *testing.T) {
 	for _, k := range definedKinds1251() {
-		if !slices.Contains(utf8KindsHandled, k) {
-			t.Errorf("attribute kind %v has no case in validUTF8Value: decide what an invalid string in it becomes", k)
-		}
 		in, ok := kindSamples1251[k]
 		if !ok {
 			t.Errorf("attribute kind %v has no sample in this arm", k)
@@ -101,7 +100,7 @@ func TestUTF8_1251_K_EveryKindHasACase(t *testing.T) {
 		if in.Type() != k {
 			t.Fatalf("precondition: the %v sample is a %v", k, in.Type())
 		}
-		out := validUTF8Value(in)
+		out := krateoaudit.SanitizeValue(in)
 		if out.Type() != k {
 			t.Errorf("%v: the sanitiser changed the kind to %v", k, out.Type())
 		}
@@ -113,11 +112,11 @@ func TestUTF8_1251_K_EveryKindHasACase(t *testing.T) {
 		}
 	}
 	// A key that is not valid UTF-8.
-	if kv := validUTF8Attr(attribute.String("bad-\xff-key", "v")); !utf8.ValidString(string(kv.Key)) {
+	if kv := krateoaudit.Sanitize(attribute.String("bad-\xff-key", "v")); !utf8.ValidString(string(kv.Key)) {
 		t.Errorf("key %q is still not valid UTF-8", kv.Key)
 	}
 	// The body takes the same path: a nested body.
-	if b := validUTF8Value(kindSamples1251[attribute.MAP]); !allValidUTF8(b) {
+	if b := krateoaudit.SanitizeValue(kindSamples1251[attribute.MAP]); !allValidUTF8(b) {
 		t.Errorf("a MAP body is still not valid UTF-8")
 	}
 }
@@ -137,10 +136,10 @@ func TestUTF8_1251_W_EveryKindSurvivesTheRealExporterInOneBatch(t *testing.T) {
 	kinds := definedKinds1251()
 	for _, k := range kinds {
 		var rec otellog.Record
-		rec.SetBody(validUTF8Value(kindSamples1251[k]))
+		rec.SetBody(krateoaudit.SanitizeValue(kindSamples1251[k]))
 		rec.AddAttributes(
 			attribute.String("kind", k.String()),
-			validUTF8Attr(attribute.KeyValue{Key: "value-\xff", Value: kindSamples1251[k]}),
+			krateoaudit.Sanitize(attribute.KeyValue{Key: "value-\xff", Value: kindSamples1251[k]}),
 		)
 		logger.Emit(ctx, rec)
 	}

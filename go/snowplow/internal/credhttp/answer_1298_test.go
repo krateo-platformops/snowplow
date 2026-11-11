@@ -32,7 +32,7 @@ func TestAnswer1298_OutcomeOfWhatSendReturned(t *testing.T) {
 		{"302", &http.Response{StatusCode: 302}, nil, "", "failure", 302, "snowplow refused to follow a 302 Found redirect"},
 		{"403", &http.Response{StatusCode: 403}, nil, "", "failure", 403, "upstream answered 403 Forbidden"},
 		{"transport error", nil, errors.New("connect: connection refused"), "", "failure", 0, audit.MessageNoResponse},
-		{"destination refused", nil, denied, "", "failure", 0, audit.MessageDestinationRefused},
+		{"destination refused", nil, denied, "", "denied", 0, audit.MessageDestinationRefused}, // #1291: snowplow refused, no authority answered
 		{"budget not sent", nil, &pagebudget.ExhaustedError{Result: pagebudget.NotSent}, "", "failure", 0, audit.MessageBudgetNotSent},
 		{"budget while connecting", nil, &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect}, "", "failure", 0, audit.MessageBudgetNotSent},
 		{"budget awaiting the answer", nil, &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedAnswer}, "", "failure", 0, audit.MessageBudgetNoAnswer},

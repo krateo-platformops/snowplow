@@ -250,20 +250,22 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// code and says what happened instead, and a 2xx whose body snowplow
 		// would not use is the accepted write it was. A success keeps its
 		// record unchanged. The caller's response below still carries rt.
-		outcome, code, msg := "success", http.StatusOK, ""
+		outcome, code, msg := audit.OutcomeSuccess, http.StatusOK, ""
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = answered.Outcome()
 		}
 		// A dry run (#443, /call/dry-run: the apiserver is always sent
 		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
-		// as krateo.action=call.dryRun and with no written object (#957).
-		ev := requestAuditEvent("call", opts.verb,
+		// as krateo.action=call.dryRun, krateo.audit.dry_run=true and with no
+		// written object (#957). The verb is the apiserver's for the URI that
+		// was dialled (#1291).
+		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri),
 			auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}, outcome, code)
 		ev.DryRun = opts.dryRun
 		ev.Message = msg
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
-		ev.RecordWrittenObject(answer)
+		audit.RecordWrittenObject(&ev, answer)
 		audit.Emit(req.Context(), ev)
 	}
 

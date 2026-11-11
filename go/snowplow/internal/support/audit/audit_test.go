@@ -30,7 +30,7 @@ func flattenRecords(rec logtest.Recording) []logtest.Record {
 // audited route's UserConfig middleware leaves it.
 func actorCtx() context.Context {
 	return xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}))
 }
 
 func TestSanitizeID(t *testing.T) {
@@ -126,15 +126,15 @@ func TestEmitOTLPRecord(t *testing.T) {
 	ctx := WithSessionID(actorCtx(), "corr-42")
 
 	e.Emit(ctx, Event{
-		Action:    "call",
-		Verb:      "POST",
-		Group:     "composition.krateo.io",
-		Version:   "v1alpha1",
-		Resource:  "fireworksapps",
-		Name:      "demo",
-		Namespace: "team-a",
-		Outcome:   "success",
-		Code:      200,
+		Action:     "call",
+		HTTPMethod: "POST", Verb: "create",
+		Group:      "composition.krateo.io",
+		Version:    "v1alpha1",
+		Resource:   "fireworksapps",
+		ObjectName: "demo",
+		Namespace:  "team-a",
+		Outcome:    "success",
+		StatusCode: 200,
 	})
 
 	got := flattenRecords(rec.Result())
@@ -178,7 +178,7 @@ func TestEmitOTLPRecord(t *testing.T) {
 func TestEmitFailureSeverity(t *testing.T) {
 	rec := logtest.NewRecorder()
 	e := New(rec.Logger("test"))
-	e.Emit(actorCtx(), Event{Action: "call", Verb: "POST", Resource: "fireworksapps", Outcome: "failure", Code: 500})
+	e.Emit(actorCtx(), Event{Action: "call", HTTPMethod: "POST", Verb: "create", Resource: "fireworksapps", Outcome: "failure", StatusCode: 500})
 
 	got := flattenRecords(rec.Result())
 	if len(got) != 1 {
@@ -203,9 +203,9 @@ func TestPackageEmitNoOpWhenUnset(t *testing.T) {
 func TestEmitRecordsSubresource(t *testing.T) {
 	rec := logtest.NewRecorder()
 	New(rec.Logger("test")).Emit(actorCtx(), Event{
-		Action: "call", Verb: "PUT", Group: "example.com", Version: "v1",
-		Resource: "widgets", Subresource: "status", Name: "w1", Namespace: "ns1",
-		Outcome: "success", Code: 200,
+		Action: "call", HTTPMethod: "PUT", Verb: "update", Group: "example.com", Version: "v1",
+		Resource: "widgets", Subresource: "status", ObjectName: "w1", Namespace: "ns1",
+		Outcome: "success", StatusCode: 200,
 	})
 	got := flattenRecords(rec.Result())
 	if len(got) != 1 {
@@ -222,8 +222,8 @@ func TestEmitRecordsSubresource(t *testing.T) {
 	// A whole-object call (no subresource) must OMIT the attribute entirely.
 	rec2 := logtest.NewRecorder()
 	New(rec2.Logger("test")).Emit(actorCtx(), Event{
-		Action: "call", Verb: "PUT", Resource: "widgets", Name: "w1",
-		Namespace: "ns1", Outcome: "success", Code: 200,
+		Action: "call", HTTPMethod: "PUT", Verb: "update", Resource: "widgets", ObjectName: "w1",
+		Namespace: "ns1", Outcome: "success", StatusCode: 200,
 	})
 	g2 := flattenRecords(rec2.Result())
 	if len(g2) != 1 {

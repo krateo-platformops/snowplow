@@ -91,9 +91,9 @@ func serveAndEmit(t *testing.T, req *http.Request, mutate func(*http.Request)) m
 		if mutate != nil {
 			mutate(r)
 		}
-		e.Emit(r.Context(), Event{Action: "call", Verb: http.MethodPost, Resource: "configmaps", Outcome: "success"})
+		e.Emit(r.Context(), Event{Action: "call", HTTPMethod: http.MethodPost, Verb: "create", Resource: "configmaps", Outcome: "success"})
 	}))
-	req = req.WithContext(xcontext.BuildContext(req.Context(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}})))
+	req = req.WithContext(xcontext.BuildContext(req.Context(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})))
 	h.ServeHTTP(httptest.NewRecorder(), req)
 	return attrsOf957(t, rec)
 }
@@ -215,7 +215,7 @@ func TestRequest1251_T_UserAgentIsTruncatedAsTheApiserverDoes(t *testing.T) {
 func TestRequest1251_A_NoRequestNoFacts(t *testing.T) {
 	// A context no request went through.
 	rec := logtest.NewRecorder()
-	New(rec.Logger("test-1251")).Emit(actorCtx(), Event{Action: "call", Verb: http.MethodPost, Resource: "configmaps", Outcome: "success"})
+	New(rec.Logger("test-1251")).Emit(actorCtx(), Event{Action: "call", HTTPMethod: http.MethodPost, Verb: "create", Resource: "configmaps", Outcome: "success"})
 	got := attrsOf957(t, rec)
 	for _, k := range []string{AttrSourceIPs, AttrUserAgent, AttrRequestURI} {
 		if v, ok := got[k]; ok {

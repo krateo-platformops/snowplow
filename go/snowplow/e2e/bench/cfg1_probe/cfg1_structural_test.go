@@ -154,11 +154,13 @@ var nonCacheInitPublishers = map[string][]string{
 	// snowplow_work pprof label every CPU profile carries; gating them on
 	// Disabled() would hide the customer count cache-off while the label stays.
 	"internal/workclass/workclass.go": {"snowplow_work_class"},
-	// AUDIT-4 (installer#410) refused-audit-record counter: the audit emitter is
-	// not a cache surface — /call writes and RESTAction write stages emit in
-	// either cache mode, so a record refused for a missing actor/action/method/
-	// target must stay observable with the cache off. Gating it would hide the
-	// refusals in a configuration where writes still happen.
+	// AUDIT-4 (installer#410, #1291) incomplete-audit-record counter, the
+	// /debug/vars mirror of the shared writer's krateo.audit.records.incomplete:
+	// the audit emitter is not a cache surface — /call writes and RESTAction
+	// write stages emit in either cache mode, so a record emitted marked for a
+	// missing actor, class, action, verb, method, preview flag or target must
+	// stay observable with the cache off. Gating it would hide the gaps in a
+	// configuration where writes still happen.
 	"internal/support/audit/incomplete_metrics.go": {"snowplow_audit_incomplete_total"},
 	// #1054 slow-call record: a measurement of request latency, not a cache
 	// surface. Every API request is recorded in either cache mode (cache-off
