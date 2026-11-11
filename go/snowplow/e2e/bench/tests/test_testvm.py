@@ -42,22 +42,38 @@ GO = "1.25.11"
 _OUTPUT: list[str] = []
 
 FAKE_CURL = r'''#!/usr/bin/env python3
-# go.dev for the fake VM: its download index (JSON) and one archive, as curl -fsSL[o] fetches them. The fake VM
-# passes its commands none of the test's environment: the archive, the log and the version are written in here
-import hashlib, json, sys
-TGZ, STATE, VERSION = "@TGZ@", "@STATE@", "@VERSION@"
+# go.dev and python-build-standalone for the fake VM, as curl -fsSL[o] fetches them: go.dev's download index and
+# its archive; GitHub's release list, one release's SHA256SUMS and its CPython archive. The fake VM passes its
+# commands none of the test's environment: the archives, the log and the versions are written in here
+import hashlib, json, os, sys
+TGZ, PYTGZ, STATE, VERSION, PY = "@TGZ@", "@PYTGZ@", "@STATE@", "@VERSION@", "@PY@"
+# <state>/go_bad_sum, <state>/pbs_bad_sum: that index lists a sha256 its archive does not have
+sum_of = lambda path, kind: "0" * 64 if os.path.exists(f"{STATE}/{kind}_bad_sum") else \
+    hashlib.sha256(open(path, "rb").read()).hexdigest()
 a = sys.argv[1:]
 url = next(x for x in a if x.startswith("https://"))
-out = a[a.index("-o") + 1] if "-o" in a else a[a.index("-fsSLo") + 1]
-tgz = open(TGZ, "rb").read()
+out = a[a.index("-o") + 1] if "-o" in a else (a[a.index("-fsSLo") + 1] if "-fsSLo" in a else None)
 with open(STATE + "/curl.log", "a") as fh:
     fh.write(url + "\n")
+tag = "20261110"
+pyname = lambda arch: f"cpython-{PY}+{tag}-{arch}-unknown-linux-gnu-install_only.tar.gz"
 if "mode=json" in url:
     files = [{"filename": f"go{VERSION}.linux-{arch}.tar.gz", "kind": "archive",
-              "sha256": hashlib.sha256(tgz).hexdigest()} for arch in ("amd64", "arm64")]
-    open(out, "w").write(json.dumps([{"version": "go" + VERSION, "files": files}]))
+              "sha256": sum_of(TGZ, "go")} for arch in ("amd64", "arm64")]
+    body = json.dumps([{"version": "go" + VERSION, "files": files}]).encode()
+elif url.startswith("https://api.github.com/"):
+    body = json.dumps([{"tag_name": tag, "draft": False, "prerelease": False}] if "page=1" in url else []).encode()
+elif url.endswith("/SHA256SUMS"):
+    sha = sum_of(PYTGZ, "pbs")
+    body = "".join(f"{sha}  {pyname(arch)}\n" for arch in ("x86_64", "aarch64")).encode()
+elif "/python-build-standalone/" in url:
+    body = open(PYTGZ, "rb").read()
 else:
-    open(out, "wb").write(tgz)
+    body = open(TGZ, "rb").read()
+if out:
+    open(out, "wb").write(body)
+else:
+    sys.stdout.buffer.write(body)
 '''
 
 FAKE_KUBECTL = r'''#!/usr/bin/env python3
@@ -71,6 +87,22 @@ if "token" in a:
     body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
     print("eyJhbGciOiJSUzI1NiJ9." + body + "." + os.environ["FAKE_TOKEN_SIG"])
 '''
+
+
+PY = "3.12.16"
+
+
+def _py_tgz(path: Path) -> None:
+    """A python-build-standalone install_only archive's shape: python/bin/python3, which says the declared version and
+    is otherwise this interpreter (its venv and pip work offline)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        body = (f'#!/bin/sh\n[ "$1" = --version ] && {{ echo "Python {PY}"; exit 0; }}\n'
+                f'exec {shlex.quote(sys.executable)} "$@"\n').encode()
+        ti = tarfile.TarInfo("python/bin/python3")
+        ti.size, ti.mode = len(body), 0o755
+        tf.addfile(ti, io.BytesIO(body))
+    path.write_bytes(buf.getvalue())
 
 
 def _go_tgz(path: Path) -> None:
@@ -88,7 +120,9 @@ def _go_tgz(path: Path) -> None:
 def fake(tmp_path, monkeypatch, run_trees):
     st = tmp_path / "gce"
     fake_vm606.install(tmp_path / "bin", st)
-    curl = FAKE_CURL.replace("@TGZ@", str(tmp_path / "go.tgz")).replace("@STATE@", str(st)).replace("@VERSION@", GO)
+    curl = (FAKE_CURL.replace("@TGZ@", str(tmp_path / "go.tgz")).replace("@PYTGZ@", str(tmp_path / "py.tgz"))
+            .replace("@STATE@", str(st)).replace("@VERSION@", GO).replace("@PY@", PY))
+    _py_tgz(tmp_path / "py.tgz")
     for name, body in (("curl", curl), ("kubectl", FAKE_KUBECTL)):
         (tmp_path / "bin" / name).write_text(body)
         (tmp_path / "bin" / name).chmod(0o755)
@@ -103,7 +137,7 @@ def fake(tmp_path, monkeypatch, run_trees):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "laptop-data"))
     for k in ("FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES",
               "FAKE_STREAM_STALL", "FAKE_LIMIT_E2_CPUS", "FAKE_FW_DELETE_LOST", "FAKE_INSTANCE_DELETE_LOST",
-              "FAKE_INSTANCE_ON_CREATE", "FAKE_SET_SCHEDULING_FAIL", "FAKE_CREATE_FAIL"):
+              "FAKE_INSTANCE_ON_CREATE", "FAKE_CREATE_FAIL"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -129,14 +163,16 @@ def _git(repo: Path, *args: str) -> str:
                           check=True, capture_output=True, text=True).stdout.strip()
 
 
-def _repo(tmp_path, origin: str = f"https://github.com/{REPO}.git", files: dict | None = None) -> tuple[Path, str]:
-    """A clone of REPO's stand-in: a go.mod (go line and toolchain line), a package; returns (clone, its commit)."""
+def _repo(tmp_path, origin: str = f"https://github.com/{REPO}.git", files: dict | None = None,
+          go: bool = True) -> tuple[Path, str]:
+    """A clone of REPO's stand-in: a go.mod (go line and toolchain line; none when not `go`), a package; returns
+    (clone, its commit)."""
     r = tmp_path / "clone"
     r.mkdir()
     subprocess.run(["git", "init", "-q", str(r)], check=True)
-    for rel, body in {"go.mod": f"module example.com/x\n\ngo 1.25.6\n\ntoolchain go{GO}\n",
-                      "tools/go.mod": "module example.com/x/tools\n\ngo 1.22\n",
-                      "pkg/a.go": "package pkg\n", **(files or {})}.items():
+    mods = {"go.mod": f"module example.com/x\n\ngo 1.25.6\n\ntoolchain go{GO}\n",
+            "tools/go.mod": "module example.com/x/tools\n\ngo 1.22\n"} if go else {}
+    for rel, body in {**mods, "pkg/a.go": "package pkg\n", **(files or {})}.items():
         (r / rel).parent.mkdir(parents=True, exist_ok=True)
         if isinstance(body, bytes):
             (r / rel).write_bytes(body)
@@ -157,9 +193,9 @@ def _commit(r: Path, files: dict) -> str:
     return _git(r, "rev-parse", "HEAD")
 
 
-def _up_args(clone, sha, *extra, hours="2", session="6", parallelism="4"):
+def _up_args(clone, sha, *extra, session="6", parallelism="4"):
     return ["up", "--run", RUN, "--repo", REPO, "--clone", str(clone), "--sha", sha, "--parallelism", parallelism,
-            "--hours", hours, "--session-hours", session, "--zone", ZONE, "--poll-s", "0", *extra]
+            "--session-hours", session, "--zone", ZONE, "--poll-s", "0", *extra]
 
 
 def _srv(fake) -> Path:
@@ -267,17 +303,22 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - name: deps
-        run: python -m pip install --help
+        run: python -m pip install -r requirements.txt -c ../constraints.txt --index-url https://pypi.example pyyaml
       - run: go test ./...
 """
+PY_FILES = {".github/workflows/ci.yaml": WORKFLOW, "tools/requirements.txt": "", "constraints.txt": ""}
 
 
 def test_the_toolchain_is_read_from_the_shas_tree(tmp_path):
-    clone, sha = _repo(tmp_path, files={".github/workflows/ci.yaml": WORKFLOW, "tools/x.txt": ""})
+    clone, sha = _repo(tmp_path, files=PY_FILES)
     tc = testvm.toolchain(str(clone), sha)
     assert tc["go"] == GO and tc["go_from"] == ["go.mod"]                 # the highest: go.mod's toolchain line
     assert tc["python"] == "3.12" and tc["python_from"] == [".github/workflows/ci.yaml"]
-    assert tc["pip"] == [{"workflow": ".github/workflows/ci.yaml", "dir": "tools", "run": "python -m pip install --help"}]
+    # the files the pip step names, each in its working-directory; a package outside them is no declaration
+    assert tc["requirements"] == [
+        {"workflow": ".github/workflows/ci.yaml", "dir": "tools", "step": 0, "flag": "-r", "file": "tools/requirements.txt"},
+        {"workflow": ".github/workflows/ci.yaml", "dir": "tools", "step": 0, "flag": "-c", "file": "constraints.txt"}]
+    assert tc["not_installed"] == ["pyyaml"]                             # the index URL is an option's value
     assert tc["not_provided"] == ["actions/setup-go (.github/workflows/ci.yaml)",
                                   "actions/setup-node (.github/workflows/ci.yaml)"]
     assert testvm.go_release("1.22") == "1.22.0" and testvm.go_release("1.20") == "1.20"
@@ -286,9 +327,26 @@ def test_the_toolchain_is_read_from_the_shas_tree(tmp_path):
     assert testvm.toolchain(str(clone), sha2)["go"] == "1.26.1"
 
 
+@pytest.mark.parametrize("files, why", [
+    ({}, "declares no toolchain: no go.mod, and no actions/setup-python"),
+    ({".github/workflows/ci.yaml": WORKFLOW.replace("-r requirements.txt -c ../constraints.txt ", "")},
+     "declares Python 3.12 but no requirements: no pip step names a requirement file (-r"),
+    ({".github/workflows/ci.yaml": WORKFLOW.replace("      - uses: actions/setup-python@v5\n        with: "
+                                                    "{python-version: \"3.12\"}\n", ""), **{
+        k: v for k, v in PY_FILES.items() if k != ".github/workflows/ci.yaml"}},
+     "installs Python packages but declares no python-version"),
+    ({**PY_FILES, "tools/uv.lock": ""}, "tools/uv.lock: a lock file of another tool"),
+    ({".github/workflows/ci.yaml": WORKFLOW}, "names tools/requirements.txt, which is not in the tree"),
+])
+def test_a_repo_that_declares_no_toolchain_or_python_without_its_requirements_refuses_naming_it(tmp_path, files, why):
+    clone, sha = _repo(tmp_path, files=files, go=bool(files))
+    with pytest.raises(testvm.Refused, match=re.escape(why)):
+        testvm.toolchain(str(clone), sha)
+
+
 def test_workflows_that_disagree_on_python_refuse_until_one_is_named(tmp_path):
-    other = WORKFLOW.replace('"3.12"', '"3.11"').replace("python -m pip install --help", "echo no pip")
-    clone, sha = _repo(tmp_path, files={".github/workflows/ci.yaml": WORKFLOW, ".github/workflows/old.yml": other})
+    other = WORKFLOW.replace('"3.12"', '"3.11"')
+    clone, sha = _repo(tmp_path, files={**PY_FILES, ".github/workflows/old.yml": other})
     with pytest.raises(testvm.Refused, match=r"different Pythons \(3.11: .github/workflows/old.yml; 3.12: "):
         testvm.toolchain(str(clone), sha)
     assert testvm.toolchain(str(clone), sha, ".github/workflows/old.yml")["python"] == "3.11"
@@ -309,12 +367,15 @@ def test_create_flags_are_exactly_the_as_made_fields_and_carry_no_service_accoun
     assert argv[argv.index("--instance-termination-action") + 1] == "DELETE"
 
 
-def test_the_termination_time_and_the_ceiling_are_derived_from_the_declared_hours():
-    now = 1_800_000_000.0
-    t, ceiling = testvm.deadlines(now, 2, 6)
-    setup = testvm.BOOTSTRAP_TIMEOUT_S + testvm.PREPARE_TIMEOUT_S
-    assert gcevm.epoch(t) == now + setup + 2 * 3600 + testvm.FETCH_WINDOW_S
-    assert gcevm.epoch(ceiling) == now + setup + 6 * 3600 + testvm.FETCH_WINDOW_S
+def test_the_deadline_is_set_once_at_up_and_nothing_moves_it(capsys):
+    with pytest.raises(SystemExit):
+        testvm.main(["extend", "--run", RUN, "--hours", "3", "--yes"])       # no such subcommand
+    assert "invalid choice: 'extend'" in capsys.readouterr().err
+    assert not [c for c in vars(testvm) if "extend" in c.lower()]
+    for gone in ("FETCH_WINDOW_S", "KILL_GRACE_S", "BOOTSTRAP_TIMEOUT_S", "PREPARE_TIMEOUT_S", "CLUSTER_PROBE_BOUND_S",
+                 "SSH_READY_TIMEOUT_S", "MAX_SESSION_HOURS"):
+        assert not hasattr(testvm, gone)                                   # no fixed window: each derives
+    assert not hasattr(gcevm, "PROBE_BOUND_S")
 
 
 def test_up_dry_prints_the_vm_and_creates_nothing(fake, capsys, tmp_path):
@@ -347,10 +408,11 @@ def test_up_makes_a_vm_with_no_credentials_and_pushes_the_exact_sha(fake, capsys
     assert inst["serviceAccounts"] == []                              # no metadata token on the VM
     assert inst["labels"] == {"owner": "snowplow-testvm", "testvm": "true", "run": RUN}
     assert inst["scheduling"]["instanceTerminationAction"] == "DELETE"
-    setup = testvm.BOOTSTRAP_TIMEOUT_S + testvm.PREPARE_TIMEOUT_S
     got = gcevm.epoch(inst["scheduling"]["terminationTime"])
-    assert t0 + setup + 2 * 3600 + testvm.FETCH_WINDOW_S - 1 <= got <= time.time() + setup + 2 * 3600 + testvm.FETCH_WINDOW_S
-    assert st["machine"]["name"] == "e2-standard-4" and st["ceiling"] > st["terminates_at"]
+    assert t0 + 6 * 3600 - 1 <= got <= time.time() + 6 * 3600                 # exactly the declared --session-hours
+    assert gcevm.utc(inst["scheduling"]["terminationTime"]) == st["terminates_at"] == \
+        st["made"]["instance"]["terminationTime"]
+    assert st["machine"]["name"] == "e2-standard-4" and "ceiling" not in st
     # record before create: the as-made was on the laptop before the first create call
     assert st["made"]["instance"]["serviceAccounts"] == []
     src = _rundir(fake) / "src"
@@ -454,14 +516,13 @@ def test_many_runs_on_one_vm_each_with_its_results_and_the_session_survives(fake
 
 
 @pytest.mark.serial  # #1166/#1174: asserts the run ends `< 60` s of wall clock
-def test_a_command_past_its_budget_is_stopped_with_its_whole_process_group(fake, capsys, tmp_path, monkeypatch):
+def test_a_command_past_its_budget_is_stopped_with_its_whole_process_group(fake, capsys, tmp_path):
     _up(fake, capsys, tmp_path)
-    monkeypatch.setattr(testvm, "KILL_GRACE_S", 1)
     t0 = time.monotonic()
     rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "0.05", "--", "bash", "-c",
                         "trap '' TERM; sleep 60 & sleep 60; wait")
     assert rc == 1, err + out
-    assert "RUN: command: stopped at its budget of 3 s (budget, killed" in out
+    assert "RUN: command: stopped at its budget of 3 s (its process group killed" in out
     assert time.monotonic() - t0 < 60
     pid = int((_rundir(fake) / "runs" / "1" / "pid.cmd").read_text())
     with pytest.raises(ProcessLookupError):
@@ -471,35 +532,41 @@ def test_a_command_past_its_budget_is_stopped_with_its_whole_process_group(fake,
 def test_run_refuses_a_budget_the_vm_does_not_outlive(fake, capsys, tmp_path):
     _up(fake, capsys, tmp_path)
     rc, _o, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "600", "--", "true")
-    assert rc == 2 and "do not fit" in err and f"extend --run {RUN}" in err
+    assert rc == 2 and "does not fit" in err and "a longer session is `down`, then `up` with a new --run" in err
     assert _state()["runs"] == []
 
 
 def test_push_moves_the_same_vm_to_a_later_sha_with_its_own_toolchain(fake, capsys, tmp_path):
     clone, sha1, _ = _up(fake, capsys, tmp_path)
-    sha2 = _commit(clone, {"pkg/a.go": "package pkg\n// fixed\n", ".github/workflows/ci.yaml": WORKFLOW,
-                           "tools/x.txt": ""})
-    # uv, as the VM's earlier push would have installed it: a stub whose venv reports the Python asked
-    uv = _rundir(fake) / "toolchains" / "uv" / "bin" / "uv"
-    uv.parent.mkdir(parents=True)
-    uv.write_text("#!/bin/sh\nfor a; do v=\"$a\"; done\nmkdir -p \"$v/bin\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --python ] "
-                  "&& p=\"$2\"; shift; done\n"
-                  f"printf '#!/bin/sh\\n[ \"$1\" = --version ] && {{ echo \"Python %s.7\"; exit 0; }}\\nexec {sys.executable} "
-                  f"\"$@\"\\n' \"$p\" > \"$v/bin/python\"\nchmod 755 \"$v/bin/python\"\n")
-    uv.chmod(0o755)
+    sha2 = _commit(clone, {"pkg/a.go": "package pkg\n// fixed\n", **PY_FILES})
     (_rundir(fake) / "src" / "build-output.bin").write_text("left by run 1")        # an untracked build output
     rc, out, err = _run(capsys, "push", "--run", RUN, "--repo", REPO, "--clone", str(clone), "--sha", sha2)
     assert rc == 0, err + out
     assert "(1 earlier SHA(s) as prerequisites)" in out
     assert "NOT PROVIDED: actions/setup-node (.github/workflows/ci.yaml)" in out
+    assert "NOT INSTALLED: pyyaml" in out
     src = _rundir(fake) / "src"
     assert _git(src, "rev-parse", "HEAD") == sha2 and not (src / "build-output.bin").exists()
     st = _state()
-    assert st["checkout"]["sha"] == sha2 and st["checkout"]["python_version"] == "Python 3.12.7"
-    assert "Usage:" in (_rundir(fake) / "prepare.log").read_text()       # the workflow's pip step, in tools/
+    # the declared Python: the newest 3.12 of python-build-standalone, its sha256 from the release's SHA256SUMS
+    assert st["checkout"]["sha"] == sha2 and st["checkout"]["python_version"] == f"Python {PY}"
+    assert f"testvm: CPython from python-build-standalone 20261110: cpython-{PY}+20261110-" in out
+    assert "testvm: pip install -r tools/requirements.txt -c constraints.txt (.github/workflows/ci.yaml)" in out
+    assert (_rundir(fake) / "venv" / "bin" / "python").exists()
+    curls = (fake / "curl.log").read_text().splitlines()
+    assert not [u for u in curls if "pypi" in u or "uv" in u.split("/")[-1]]   # no installer fetched from PyPI
     assert [p["sha"] for p in st["pushes"]] == [sha1, sha2]
     rc, out, err = _run(capsys, "run", "--run", RUN, "--budget-minutes", "5", "--", "cat", "pkg/a.go")
     assert rc == 0 and "exit 0" in out
+
+
+@pytest.mark.parametrize("bad, why", [("go", f"go{GO}.linux-"), ("pbs", f"cpython-{PY}+20261110-")])
+def test_a_toolchain_archive_whose_sha256_is_not_its_indexs_is_refused(fake, capsys, tmp_path, bad, why):
+    clone, sha = _repo(tmp_path, files=PY_FILES)
+    (fake / f"{bad}_bad_sum").write_text("")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and why in err and "arrived with sha256" in err and "0" * 64 in err
+    assert "checkout" not in _state()
 
 
 def test_push_refuses_while_a_run_is_running(fake, capsys, tmp_path):
@@ -586,44 +653,6 @@ def test_the_bound_and_the_stall_window_scale_with_the_measured_rate():
     assert slow.stall_s() == 10 * fast.stall_s() == gcevm.SLACK * 10.0
 
 
-# ─── extend: an explicit, recorded deadline under the ceiling ───────────────
-
-def test_extend_moves_the_termination_time_within_the_ceiling_and_records_it(fake, capsys, tmp_path):
-    _up(fake, capsys, tmp_path)
-    rc, out, err = _run(capsys, "extend", "--run", RUN, "--hours", "5", "--yes", "--poll-s", "0")
-    assert rc == 0, err + out
-    st = _state()
-    inst = json.loads((fake / "instances" / f"{VM}.json").read_text())
-    assert gcevm.utc(inst["scheduling"]["terminationTime"]) == st["terminates_at"] == st["extends"][-1]["to"]
-    assert inst["status"] == "RUNNING" and st["extend_pending"] is None
-    verbs = _verbs(fake)
-    i = verbs.index("compute instances stop")
-    assert verbs[i + 1] == "compute instances set-scheduling" and verbs[i + 2] == "compute instances start"
-    rc, _o, err = _run(capsys, "extend", "--run", RUN, "--hours", "7", "--yes")
-    assert rc == 2 and "past the session's ceiling" in err
-    assert len([v for v in _verbs(fake) if v == "compute instances stop"]) == 1
-
-
-def test_extend_refuses_while_a_run_is_running_and_names_a_stopped_vm_with_no_time(fake, capsys, tmp_path, monkeypatch):
-    _up(fake, capsys, tmp_path)
-    res = _rundir(fake) / "runs" / "1"
-    res.mkdir(parents=True)
-    p = subprocess.Popen(["sleep", "30"])
-    try:
-        (res / "pid").write_text(str(p.pid))
-        rc, _o, err = _run(capsys, "extend", "--run", RUN, "--hours", "3", "--yes")
-        assert rc == 2 and "run 1 is running" in err and "stopped VM" in err
-    finally:
-        p.kill()
-        p.wait()
-    assert "compute instances stop" not in _verbs(fake)
-    (res / "done.json").write_text("{}")
-    monkeypatch.setenv("FAKE_SET_SCHEDULING_FAIL", "1")
-    rc, _o, err = _run(capsys, "extend", "--run", RUN, "--hours", "3", "--yes")
-    assert rc == 2 and "STOPPED and holds no termination time" in err and "down --run" in err
-    assert _state()["extend_pending"]["to"]                               # recorded before the change
-
-
 # ─── down: the whole VM, verified ───────────────────────────────────────────
 
 def test_down_deletes_the_whole_vm_its_disk_and_rules_and_verifies(fake, capsys, tmp_path):
@@ -692,8 +721,8 @@ def test_run_cluster_hands_the_suite_a_scoped_kubeconfig_and_down_revokes_it(fak
     applied = json.loads(log[0]["stdin"])["items"]
     assert [i["kind"] for i in applied] == ["Namespace", "ServiceAccount", "ClusterRoleBinding"]
     assert log[1]["argv"][-3:-1] == ["token", f"testvm-{RUN}"]
-    want = gcevm.epoch(_state()["ceiling"]) - time.time()
-    assert abs(int(log[1]["argv"][-1].split("=")[1][:-1]) - want) < 30            # expires at the ceiling
+    want = gcevm.epoch(_state()["terminates_at"]) - time.time()
+    assert abs(int(log[1]["argv"][-1].split("=")[1][:-1]) - want) < 30            # expires with the VM
     # the laptop's own kubeconfig is never written; the token lives on the VM only
     assert not (Path(os.environ["HOME"]) / ".kube" / "config").exists()
     rc, out, err = _run(capsys, "down", "--run", RUN, "--yes", "--discard-unfetched")
@@ -753,17 +782,21 @@ def test_the_cluster_probe_times_how_long_a_replicaset_outlives_its_deployment(t
         kc.write_text(json.dumps({"clusters": [{"cluster": {"server": f"http://127.0.0.1:{srv.server_address[1]}"}}],
                                   "users": [{"user": {"token": "t"}}]}))
         (tmp_path / "probe.py").write_text(testvm.PROBE_PY)
-        p = subprocess.run([sys.executable, str(tmp_path / "probe.py"), str(kc), "testvm-probe-1-start", "10"],
-                           capture_output=True, text=True, timeout=60)
+        p = subprocess.run([sys.executable, str(tmp_path / "probe.py"), str(kc), "testvm-probe-1-start",
+                            str(time.time() + 10)], capture_output=True, text=True, timeout=60)
         got = json.loads(p.stdout)
         assert "error" not in got, got
         assert 0.3 <= got["replicaset_survived_s"] < 5 and got["replicaset_appeared_s"] < 5
         ok, line = testvm._probe_line(got)
         assert ok and "survived its Deployment by" in line
         _FakeAPI.gc_s = 60
-        p = subprocess.run([sys.executable, str(tmp_path / "probe.py"), str(kc), "testvm-probe-1-end", "1"],
-                           capture_output=True, text=True, timeout=60)
-        assert "outlived its Deployment by more than 1 s" in json.loads(p.stdout)["error"]
+        p = subprocess.run([sys.executable, str(tmp_path / "probe.py"), str(kc), "testvm-probe-1-end",
+                            str(time.time() + 1)], capture_output=True, text=True, timeout=60)
+        err = json.loads(p.stdout)["error"]
+        assert "the ReplicaSet outlived its Deployment by more than" in err and "budget" in err
+        p = subprocess.run([sys.executable, str(tmp_path / "probe.py"), str(kc), "testvm-probe-1-x",
+                            str(time.time() - 1)], capture_output=True, text=True, timeout=60)
+        assert "the run's budget is spent" in json.loads(p.stdout)["error"]     # none left: NOT RUN, said
     finally:
         srv.shutdown()
 

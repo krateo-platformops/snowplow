@@ -46,8 +46,6 @@ outcome:
     VM roots (vm606's /srv/snowplow-bench, testvm's /srv/testvm, VM_ROOTS) are <state>/vm/NAME/srv;
   - `compute instances create --no-service-account --no-scopes`: an instance with no service account;
     `compute machine-types list --zones Z`: e2-standard and n2-standard 2..32 and e2-highcpu-64 in Z;
-    `compute instances stop | start | set-scheduling` (set-scheduling only on a stopped VM, as GCE; stop clears
-    the termination time, as GCE's docs say; FAKE_SET_SCHEDULING_FAIL=1: a 503);
   - `compute scp`: the side written NAME:<path> is on the VM; the bytes are copied (this process is
     scp: copying is its job) and the source's mode kept, as scp does for a new file;
     FAKE_SCP_CORRUPT=<basename> flips the last byte of a file of that name in transit; FAKE_SCP_MODE
@@ -373,28 +371,6 @@ if a[:3] == ["compute", "machine-types", "list"]:
                        "zone": zone} for fam in ("e2-standard", "n2-standard") for n in (2, 4, 8, 16, 32)]
                      + [{"kind": "compute#machineType", "name": "e2-highcpu-64", "guestCpus": 64, "memoryMb": 65536,
                          "zone": zone}]))
-    sys.exit(0)
-if a[:3] in (["compute", "instances", "stop"], ["compute", "instances", "start"],
-             ["compute", "instances", "set-scheduling"]):
-    parents("instances", a[2], True)
-    d, path = instance(a[3])
-    if d is None:
-        notfound("instances", f"zones/{opt('--zone')}/instances", a[3])
-    if a[2] == "stop":
-        d["status"] = "TERMINATED"
-        d["scheduling"].pop("terminationTime", None)     # stopping a VM clears its termination time (GCE's docs)
-    elif a[2] == "start":
-        d["status"] = "RUNNING"
-    else:
-        if d["status"] != "TERMINATED":
-            sys.stderr.write("ERROR: (gcloud.compute.instances.set-scheduling) Could not fetch resource:\n - The "
-                             "instance must be stopped. code=400\n"); sys.exit(1)
-        if os.environ.get("FAKE_SET_SCHEDULING_FAIL") == "1":
-            sys.stderr.write("ERROR: (gcloud.compute.instances.set-scheduling) Could not fetch resource:\n - The "
-                             "service is currently unavailable. code=503\n"); sys.exit(1)
-        d["scheduling"]["terminationTime"] = opt("--termination-time")
-        d["scheduling"]["instanceTerminationAction"] = opt("--instance-termination-action")
-    path.write_text(json.dumps(d))
     sys.exit(0)
 if a[:3] == ["compute", "instances", "list"]:
     failed_list("instances")

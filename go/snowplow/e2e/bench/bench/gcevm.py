@@ -526,10 +526,9 @@ def quota_check(project: str, zone: str, footprint) -> tuple[list[str], list[str
 # ─── bounded transfers over ssh (#1336) ─────────────────────────────────────
 
 # The probe that measures a direction's rate: this many bytes through the same `gcloud compute ssh` path the
-# transfer takes, right before it. Its own bound is a constant: it is the one transfer with no rate to derive
-# from (a fixed size: at 1/100 of the rate IAP gave on 2026-11-11 it still finishes well inside it).
+# transfer takes, right before it. It is the one transfer with no rate to derive a bound from: its caller bounds
+# it (testvm: by what is left of the VM's own deadline).
 PROBE_BYTES = 4 << 20
-PROBE_BOUND_S = 300
 # A transfer may take SLACK times what the probe's rate predicts (connection included), and a stall is no byte
 # moving for SLACK times the whole probe: multiplicative both, so a k-fold slowdown beyond SLACK is refused,
 # never hidden under an additive allowance.
@@ -555,16 +554,13 @@ class Rate:
 
 
 def _kill(p: subprocess.Popen) -> None:
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(p.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        try:
-            p.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    """A refused transfer's gcloud and everything it started (its IAP tunnel helper among them): SIGKILL to the
+    group, which nothing can outlive or delay (no grace window to choose)."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    p.wait()
 
 
 def stream(argv: list[str], *, what: str, nbytes: int, bound_s: float, stall_s: float,
@@ -602,7 +598,8 @@ def stream(argv: list[str], *, what: str, nbytes: int, bound_s: float, stall_s: 
                     _kill(p)
                     raise Refused(f"{what} ran past its bound of {bound_s:.0f} s at {moved} of {nbytes} bytes "
                                   f"(derived from the size and the probe's rate): refusing")
-                events = sel.select(timeout=min(1.0, stall_s, bound_s))
+                # wake exactly at the nearer of the two verdicts' times, or at the next byte
+                events = sel.select(timeout=max(min(stall_s - (now - last), bound_s - (now - t0)), 0) + 1e-3)
                 for key, _ev in events:
                     if key.fileobj is p.stdout:
                         b = os.read(p.stdout.fileno(), CHUNK)
@@ -664,9 +661,9 @@ def _bash_c(script: str) -> str:
     return "bash -c " + shlex.quote(script)
 
 
-def probe(name: str, project: str, zone: str, direction: str, scratch: str) -> Rate:
+def probe(name: str, project: str, zone: str, direction: str, scratch: str, bound_s: float) -> Rate:
     """The rate of `direction` ("up" to the VM, "down" from it), measured by PROBE_BYTES through the same ssh
-    path, under PROBE_BOUND_S. `scratch`: a directory of this run on the VM."""
+    path, under the caller's `bound_s`. `scratch`: a directory of this run on the VM."""
     with tempfile.TemporaryDirectory() as d:
         t0 = time.monotonic()
         if direction == "up":
@@ -675,13 +672,13 @@ def probe(name: str, project: str, zone: str, direction: str, scratch: str) -> R
                 fh.write(b"\0" * PROBE_BYTES)
             cmd = _bash_c(_RECEIVE.format(dst=shlex.quote(f"{scratch}/probe"), n=PROBE_BYTES))
             rc, out, err = stream(ssh_argv(name, project, zone, cmd), what="the upload probe", nbytes=PROBE_BYTES,
-                                  bound_s=PROBE_BOUND_S, stall_s=PROBE_BOUND_S, src=src)
+                                  bound_s=bound_s, stall_s=bound_s, src=src)
             if rc == 0 and marker(out, "GCEVM_BYTES") != str(PROBE_BYTES):
                 raise Refused(f"the upload probe arrived as {marker(out, 'GCEVM_BYTES')} bytes, not {PROBE_BYTES}")
         else:
             cmd = _bash_c(f"head -c {PROBE_BYTES} /dev/zero")
             rc, out, err = stream(ssh_argv(name, project, zone, cmd), what="the download probe", nbytes=PROBE_BYTES,
-                                  bound_s=PROBE_BOUND_S, stall_s=PROBE_BOUND_S, dst=os.path.join(d, "probe"))
+                                  bound_s=bound_s, stall_s=bound_s, dst=os.path.join(d, "probe"))
         if rc != 0:
             raise failed(f"the {direction}load probe", rc, out, err, prefix="GCEVM")
         rate = Rate(PROBE_BYTES, time.monotonic() - t0)
@@ -689,12 +686,13 @@ def probe(name: str, project: str, zone: str, direction: str, scratch: str) -> R
     return rate
 
 
-def upload(name: str, project: str, zone: str, src: str, dst: str, *, what: str, scratch: str) -> str:
-    """`src` to `dst` on the VM over ssh, bounded by its size and a fresh probe's rate; the VM's sha256 of what
-    arrived must be the laptop's. Returns the sha256."""
+def upload(name: str, project: str, zone: str, src: str, dst: str, *, what: str, scratch: str,
+           probe_bound_s: float) -> str:
+    """`src` to `dst` on the VM over ssh, bounded by its size and a fresh probe's rate (the probe under
+    `probe_bound_s`); the VM's sha256 of what arrived must be the laptop's. Returns the sha256."""
     nbytes = os.path.getsize(src)
     want = sha256_file(src)
-    rate = probe(name, project, zone, "up", scratch)
+    rate = probe(name, project, zone, "up", scratch, probe_bound_s)
     cmd = _bash_c(_RECEIVE.format(dst=shlex.quote(dst), n=nbytes))
     rc, out, err = stream(ssh_argv(name, project, zone, cmd), what=what, nbytes=nbytes,
                           bound_s=rate.bound_s(nbytes), stall_s=rate.stall_s(), src=src)
@@ -706,10 +704,11 @@ def upload(name: str, project: str, zone: str, src: str, dst: str, *, what: str,
     return got
 
 
-def download(name: str, project: str, zone: str, src: str, dst: str, *, nbytes: int, sha256: str, what: str) -> None:
+def download(name: str, project: str, zone: str, src: str, dst: str, *, nbytes: int, sha256: str, what: str,
+             probe_bound_s: float) -> None:
     """`src` on the VM (whose size and sha256 the VM reported) to `dst` over ssh (`cat`), bounded by its size and a
-    fresh probe's rate; refused unless the bytes that arrived have that sha256."""
-    rate = probe(name, project, zone, "down", os.path.dirname(src))
+    fresh probe's rate (the probe under `probe_bound_s`); refused unless the bytes that arrived have that sha256."""
+    rate = probe(name, project, zone, "down", os.path.dirname(src), probe_bound_s)
     rc, out, err = stream(ssh_argv(name, project, zone, _bash_c(f"cat {shlex.quote(src)}")), what=what,
                           nbytes=nbytes, bound_s=rate.bound_s(nbytes), stall_s=rate.stall_s(), dst=dst)
     if rc != 0:

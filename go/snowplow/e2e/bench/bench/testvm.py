@@ -4,27 +4,32 @@ instance"; "only CI should provision kind clusters. if local tests are done, pro
 cluster or gce instance").
 
     python3 -m bench.testvm up --run R --repo OWNER/NAME --clone PATH --sha SHA \\
-        --parallelism N --session-hours S --hours H [--workflow W] [--project P] [--zone Z] [--yes]
+        --parallelism N --session-hours S [--workflow W] [--project P] [--zone Z] [--yes]
     python3 -m bench.testvm push --run R --repo OWNER/NAME --clone PATH --sha SHA [--workflow W]
     python3 -m bench.testvm run --run R --budget-minutes M [--cluster NAME --cluster-location L]
         [--cluster-probe] -- COMMAND [ARG...]
-    python3 -m bench.testvm extend --run R --hours H [--yes]
     python3 -m bench.testvm fetch --run R
     python3 -m bench.testvm down --run R [--discard-unfetched] [--yes]
 
 ONE VM PER WORK SESSION. `up` once, then any number of `run`s against the same VM and checkout, `push`
 of a later SHA to the same VM (fix and retest without reprovisioning), `fetch` whenever, one `down`.
-up / extend / down change GCP and print their gcloud argv, running none unless --yes; push, run and
-fetch create nothing in GCP (SSH only).
+up / down change GCP and print their gcloud argv, running none unless --yes; push, run and fetch create
+nothing in GCP (SSH only).
 
 NO CREDENTIALS ON THE VM. It is created with --no-service-account --no-scopes: no metadata token, no
 IAM grant of any kind (so no grant to manage or expire), no GitHub or registry token. The code arrives
 as a `git bundle` of the exact 40-hex SHA, made on the laptop from the caller's local clone (a bare
 scratch repository borrowing the clone's objects: the clone itself is never written), streamed over
-IAP, fetched into the VM's checkout and checked out there: HEAD must be the SHA and HEAD^{tree} the
-SHA's tree as the laptop read it, with a clean status. A later push bundles only what the VM lacks
-(every SHA pushed before is a prerequisite). The one exception is opt-in and scoped: `run --cluster`
-(below) hands the suite a Kubernetes token for ONE disposable GKE cluster.
+IAP, fetched into the VM's checkout and checked out there: the bundle's one head must be the SHA, HEAD
+the SHA and HEAD^{tree} the SHA's tree as the laptop read it, with a clean status. A later push bundles
+only what the VM lacks (every SHA pushed before is a prerequisite).
+
+THE ONE CREDENTIAL testvm CAN PLACE on the VM is a Kubernetes token for ONE disposable bench GKE cluster,
+and only when a run asks for that cluster (`run --cluster`, CLUSTERS below). Why: Diego's ruling is that
+local suites run against "a disposable gke cluster or gce instance", never kind, so a suite that needs a
+cluster must reach one from the VM, and the VM holds nothing else that could. Its scope keeps it
+disposable too: one cluster that bench.gke made with its own TTL, a ServiceAccount of this session only,
+a token expiring with the VM, deleted (revoked) at `down`. It is never a GCP credential.
 
 PROVENANCE. testvm never types a remote: --clone is a local path. --repo OWNER/NAME (or HOST/OWNER/NAME;
 the host defaults to github.com) is the caller's declaration of the repository the clone is of, and the
@@ -35,52 +40,60 @@ every result's header.json (a no-hyphen org still serves stale twins of krateo r
 traced to the repo it tested).
 
 DISPOSABLE BY CONSTRUCTION. The VM deletes itself, and its boot disk, at GCE's own --termination-time
-with --instance-termination-action=DELETE, whatever happens to the session that made it. up's
-termination time is now + the setup window (BOOTSTRAP_TIMEOUT_S + PREPARE_TIMEOUT_S) + the declared
---hours + FETCH_WINDOW_S. The session's CEILING, recorded at up, is the same sum with --session-hours:
-`extend --hours H` moves the termination time to now + H + FETCH_WINDOW_S, never past the ceiling, and
-records the new deadline before it changes anything. GCE changes a termination time only on a STOPPED
-VM (set-scheduling's own help), so extend refuses while a command runs, then stops the VM, sets the new
-time, starts it, reads the time back, and waits for its SSH again; a stopped VM holds no termination
-time (GCE clears it at stop), so a failure between stop and start says so and names `down`. `run`
-refuses a budget the VM does not outlive by FETCH_WINDOW_S (and names `extend`). Labels:
-owner=snowplow-testvm, testvm=true, run=<R>. `down` deletes the WHOLE VM, never only its processes: a
-suite whose TestMain made a cluster and was killed leaks nothing past the VM.
+with --instance-termination-action=DELETE, whatever happens to the session that made it. The deadline
+is set ONCE, at up: now + the declared --session-hours, recorded before the VM exists. Nothing moves it
+(GCE changes a termination time only on a stopped VM, and a stopped VM holds none, a leak path): a
+longer session is `down`, then `up` with a new --run. Every wait of the session is bounded by that
+deadline (the bootstrap, a push's toolchain install, a transfer's probe), and `run` refuses a budget the
+VM does not outlive. Labels: owner=snowplow-testvm, testvm=true, run=<R>. `down` deletes the WHOLE VM,
+never only its processes: a suite whose TestMain made a cluster and was killed leaks nothing past the VM.
 
 CLUSTERS. testvm never installs or runs kind. A suite that needs a cluster runs against a disposable GKE
 cluster the caller made (bench.gke gke-up): `run --cluster NAME --cluster-location L` reads the cluster
 (it must pass bench.gke.assert_deletable: a bench-made cluster with its TTL, never a forbidden one such as
 krateo-057), and, the first time, makes ServiceAccount testvm-<R> in namespace testvm with a
 ClusterRoleBinding to cluster-admin, through a scratch kubeconfig (never ~/.kube/config), and a token
-for it from the TokenRequest API that expires at the session's ceiling. The token goes to the VM in a
-kubeconfig (JSON, mode 0600, <VM_ROOT>/<R>/kube/<NAME>.json, kept for the session's later runs of that
-cluster), exported as KUBECONFIG only for a run that names the cluster (any other run has KUBECONFIG
-unset); the laptop keeps no copy, and `down` deletes the binding and the ServiceAccount (revoking the
-token) once the VM is gone. This is the one credential that ever reaches the VM: opt-in, one disposable
-cluster, never a GCP credential. A suite whose TestMain creates kind must find the existing cluster through KUBECONFIG
+for it from the TokenRequest API that expires with the VM. The token goes to the VM in a kubeconfig
+(JSON, mode 0600, <VM_ROOT>/<R>/kube/<NAME>.json, kept for the session's later runs of that cluster),
+exported as KUBECONFIG only for a run that names the cluster (any other run has KUBECONFIG unset); the
+laptop keeps no copy, and `down` deletes the binding and the ServiceAccount (revoking the token) once the
+VM is gone. A suite whose TestMain creates kind must find the existing cluster through KUBECONFIG
 instead: that is the owning repo's harness change, not testvm's. --cluster-probe (opt-in, with --cluster)
 records a cheap liveness probe of the cluster's controllers at the run's start and end (ironic's, from a
 day of contended measurements): create a 1-replica Deployment, wait for its ReplicaSet, delete the
 Deployment, and time how long the ReplicaSet survives (~1 s when healthy). Recorded only, no verdict.
 
-THE TOOLCHAIN COMES FROM THE REPO, at each pushed SHA, read on the laptop from the SHA's tree: Go is the
-highest of every go.mod's `toolchain` line (else its `go` line), installed from go.dev's own download
-index with its sha256 checked, under GOTOOLCHAIN=local; Python is the CI workflow's actions/setup-python
-`python-version` (every workflow must agree, or --workflow names the one the suite mirrors), installed
-by uv, and the workflow's own `pip install` steps run in a fresh venv in their working-directory. No
-version is pinned here. A workflow's other setup-* actions are named as not provided.
+THE TOOLCHAIN IS WHAT THE REPO DECLARES, at each pushed SHA, read on the laptop from the SHA's tree, and
+nothing else is installed:
+  - Go: the highest of every go.mod's `toolchain` line (else its `go` line), from go.dev's own download
+    index with its sha256 checked, run under GOTOOLCHAIN=local;
+  - Python: the CI workflow's actions/setup-python `python-version` (every workflow must agree, or
+    --workflow names the one the suite mirrors), the newest CPython of that version in the newest
+    python-build-standalone release that has one (the CPython builds uv installs), its sha256
+    checked against that release's SHA256SUMS; then, in a fresh venv, the requirement and constraint files
+    (-r / -c) the workflow's pip steps name, from their working-directory. A package a pip step names
+    outside any file is reported as NOT INSTALLED (it is no declaration of the repo's: declare it in a
+    requirements file). A lock file of another tool (uv.lock, poetry.lock, Pipfile.lock) refuses: its tool
+    would be one more thing installed unpinned.
+  - a repo that declares NO toolchain (no go.mod, no setup-python), or Python without its requirements
+    (setup-python and no -r file, or a pip step and no python-version), refuses, naming what is missing.
+A workflow's other setup-* actions are named as NOT PROVIDED.
 
 MACHINE SIZE from the suite's parallelism: the smallest e2-standard type of the zone (read from GCE, by
 exact equality over the zone's machine types) with at least --parallelism vCPU. E2 has its own regional
 quota (E2_CPUS), so the VM takes nothing from the N2_CPUS the bench's clusters use; the footprint
 (INSTANCES 1, E2_CPUS, SSD_TOTAL_GB of its boot disk, IN_USE_ADDRESSES 1 for its ephemeral external IP,
-which reaches go.dev, PyPI and the module proxies: ingress is SSH from IAP only) is read against the
-region's quotas before anything is made (bench.gcevm.quota_check, vm606's).
+which reaches go.dev, GitHub, PyPI and the module proxies: ingress is SSH from IAP only) is read against
+the region's quotas before anything is made (bench.gcevm.quota_check, vm606's).
 
 RUN. `run -- COMMAND...` runs the argv, as given, in the checkout, detached on the VM (it survives the SSH
-session and the laptop), under --budget-minutes: past it, its process group gets SIGTERM and, KILL_GRACE_S
-later, SIGKILL; its group is killed when it exits too, so nothing it started outlives it. One run at a
-time. Each run's results directory (<VM_ROOT>/<R>/runs/<n>) holds header.json (the run's provenance and
+session and the laptop). The caller's --budget-minutes is the bound of the WHOLE run, and every wait in it
+derives from that one deadline: the cluster probe at start gets what is left of it, the command then gets
+what is left (its process group is SIGKILLed at the deadline; a suite that wants a graceful stop sets its
+own timeout inside its budget, e.g. `go test -timeout`), the probe at end gets what is left after the
+command (none left: it is NOT RUN, and says so). The command's group is killed when it exits too, so
+nothing it started outlives it. The laptop waits for the run's end, bounded by the VM's own deadline.
+One run at a time. Each run's results directory (<VM_ROOT>/<R>/runs/<n>) holds header.json (the run's provenance and
 argv), stdout.log, stderr.log, done.json (exit code, how it ended, elapsed), host.json (the VM's
 1/5/15-min load, CPU count, MemAvailable and /proc/stat's cpu jiffies, steal among them, at start and at
 end, and the steal share between: a "ran clean" on a starved e2 host is visible; recorded, no
@@ -90,7 +103,8 @@ $TESTVM_RESULTS. `run` prints a RUN / NOT RUN line per phase and exits 0 only wh
 
 TRANSFERS ARE BOUNDED (#1336): the bundle up and the results down go as ssh byte streams (bench.gcevm:
 never `compute scp`, which hung for 55 min twice on 2026-11-11), each bounded by its byte count and a
-rate measured just before it, a stall refused by name; the bytes' sha256 is checked on the far side.
+rate measured just before it (the probe itself bounded by the VM's deadline), a stall refused by name;
+the bytes' sha256 is checked on the far side.
 `fetch` brings back every finished, unfetched run, into <data root>/testvm/<R>/results/<n>.
 
 THE SHARED RULES (bench.gcevm, factored out of vm606): IAP-only SSH through two per-run rules (deny
@@ -142,15 +156,11 @@ IMAGE_FAMILY, IMAGE_PROJECT = "debian-13", "debian-cloud"
 VM_ROOT = "/srv/testvm"
 BOOTSTRAP_MARKER = f"{VM_ROOT}/.bootstrap/bootstrap.json"
 
-# the setup window up's termination time includes: the bootstrap wait and the first push's prepare step
-SSH_READY_TIMEOUT_S = 600
-BOOTSTRAP_TIMEOUT_S = 1200
-PREPARE_TIMEOUT_S = 1800               # a Go download, uv's Python, the workflow's pip installs
-FETCH_WINDOW_S = 1800                  # what every deadline leaves after the last run: its fetch, then down
-MAX_SESSION_HOURS = 72
-KILL_GRACE_S = 30                      # SIGTERM to SIGKILL, past the budget
-CLUSTER_PROBE_BOUND_S = 120            # each wait of the cluster probe; past it, the probe says so
-POLL_S = 15
+POLL_S = 15                            # between bootstrap reads (a cadence, not a bound)
+PBS_RELEASES = "https://api.github.com/repos/astral-sh/python-build-standalone/releases"
+PBS_DOWNLOAD = "https://github.com/astral-sh/python-build-standalone/releases/download"
+FOREIGN_LOCKS = ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock")
+TOKEN_MIN_S = 600                      # the TokenRequest API's shortest expiry (kubectl create token --duration)
 
 RUN_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,30}[a-z0-9]")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -300,6 +310,11 @@ def make_bundle(clone: str, sha: str, have: list[str], out: Path) -> dict:
 _GOMOD_TOOLCHAIN = re.compile(r"^toolchain\s+go(\S+)\s*$", re.M)
 _GOMOD_GO = re.compile(r"^go\s+(\S+)\s*$", re.M)
 _PIP = re.compile(r"^\s*(?:python3?\s+-m\s+)?pip3?\s+install\b")
+# pip install's options that take a separate value (pip's own `pip install --help`)
+_PIP_VALUED = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links", "-t", "--target", "--prefix", "--root",
+               "--src", "--platform", "--python-version", "--implementation", "--abi", "--progress-bar", "--cache-dir",
+               "--log", "--timeout", "--retries", "--trusted-host", "--proxy", "--cert", "--client-cert",
+               "--upgrade-strategy", "--only-binary", "--no-binary", "--config-settings", "-C", "--report"}
 
 
 def go_release(v: str) -> str:
@@ -316,8 +331,9 @@ def _go_key(v: str) -> tuple:
 
 
 def toolchain(clone: str, sha: str, workflow: str | None = None) -> dict:
-    """What the suite's toolchain is, read from the SHA's tree: {"go", "go_from", "python", "python_from", "pip":
-    [{"workflow", "dir", "run"}], "not_provided": [...]}."""
+    """What the repo declares as the suite's toolchain, read from the SHA's tree: {"go", "go_from", "python",
+    "python_from", "requirements": [{"workflow", "dir", "step", "flag", "file"}], "not_installed": [...],
+    "not_provided": [...]}; refuses a repo that declares none, or Python without its requirements."""
     files = _git(clone, "ls-tree", "-r", "--name-only", sha).splitlines()
     gos = {}
     for f in files:
@@ -364,16 +380,74 @@ def toolchain(clone: str, sha: str, workflow: str | None = None) -> dict:
         raise Refused(f"{len(pip)} workflows install Python packages ({', '.join(sorted(pip))}): --workflow names the "
                       f"one the suite mirrors")
     python = next(iter(pythons), None)
+    steps = next(iter(pip.values()), [])
+    reqs, not_installed = _requirement_files(steps, set(files))
+    if go is None and python is None and not steps:
+        raise Refused(f"{sha} declares no toolchain: no go.mod, and no actions/setup-python in "
+                      f"{', '.join(flows) or '.github/workflows (none)'}")
+    if steps and python is None:
+        raise Refused(f"{steps[0]['workflow']} installs Python packages but declares no python-version "
+                      f"(actions/setup-python): which Python is undeclared")
+    if python is not None and not [r for r in reqs if r["flag"] == "-r"]:
+        raise Refused(f"{', '.join(sorted(pythons[python]))} declares Python {python} but no requirements: no pip "
+                      f"step names a requirement file (-r; a constraint file, -c, only constrains one)")
+    if python is not None:
+        dirs = {"."} | {s["dir"] for s in steps}
+        foreign = sorted(f for f in files if os.path.basename(f) in FOREIGN_LOCKS
+                         and os.path.normpath(os.path.dirname(f) or ".") in {os.path.normpath(d) for d in dirs})
+        if foreign:
+            raise Refused(f"{', '.join(foreign)}: a lock file of another tool, which testvm does not install (it would "
+                          f"be one more tool installed unpinned): declare the suite's packages in a requirements file")
     return {"go": go, "go_from": sorted(f for f, v in gos.items() if v == go), "python": python,
-            "python_from": sorted(pythons.get(python, ())), "pip": next(iter(pip.values()), []),
+            "python_from": sorted(pythons.get(python, ())), "requirements": reqs, "not_installed": not_installed,
             "not_provided": sorted(other)}
+
+
+def _requirement_files(steps: list[dict], tree: set[str]) -> tuple[list[dict], list[str]]:
+    """The requirement (-r) and constraint (-c) files the pip steps name, each resolved in its working-directory
+    and present in the tree; and what else a step names (a package outside any file: no declaration)."""
+    reqs, loose = [], []
+    for k, s in enumerate(steps):
+        for line in s["run"].splitlines():
+            toks = shlex.split(line)
+            toks = toks[toks.index("install") + 1:]
+            i = 0
+            while i < len(toks):
+                t = toks[i]
+                m = re.fullmatch(r"(-r|--requirement|-c|--constraint)(?:=(.+))?|(-[rc])(.+)", t)
+                if t in _PIP_VALUED:
+                    i += 2                                  # an option and its value: no package
+                    continue
+                if m:
+                    flag = "-r" if (m.group(1) or m.group(3)) in ("-r", "--requirement") else "-c"
+                    path = m.group(2) or m.group(4)
+                    if path is None:
+                        i += 1
+                        path = toks[i] if i < len(toks) else ""
+                    rel = os.path.normpath(os.path.join(s["dir"], path))
+                    if rel not in tree:
+                        raise Refused(f"{s['workflow']}: `{line.strip()}` names {rel}, which is not in the tree")
+                    reqs.append({"workflow": s["workflow"], "dir": s["dir"], "step": k, "flag": flag, "file": rel})
+                elif not t.startswith("-"):
+                    loose.append(t)
+                i += 1
+    return reqs, sorted(set(loose))
 
 
 def _describe_toolchain(tc: dict) -> str:
     return (f"go {tc['go'] or '(no go.mod)'}" + (f" ({', '.join(tc['go_from'])})" if tc["go_from"] else "")
             + f", python {tc['python'] or '(no setup-python)'}"
             + (f" ({', '.join(tc['python_from'])})" if tc["python_from"] else "")
-            + f", {len(tc['pip'])} pip step(s)")
+            + (f", requirements {', '.join(r['flag'] + ' ' + r['file'] for r in tc['requirements'])}"
+               if tc["requirements"] else ""))
+
+
+def _say_toolchain(tc: dict) -> None:
+    for x in tc["not_provided"]:
+        gcevm.say(f"NOT PROVIDED: {x}: testvm installs the repo's Go and Python only")
+    for x in tc["not_installed"]:
+        gcevm.say(f"NOT INSTALLED: {x}: a pip step names it outside any requirements file (no declaration of the "
+                  f"repo's; declare it in one)")
 
 
 # ─── the VM, as made ────────────────────────────────────────────────────────
@@ -532,11 +606,16 @@ def run_in_use(run: str, project: str) -> list[str]:
     return found
 
 
-def deadlines(now: float, hours: float, session_hours: float) -> tuple[str, str]:
-    """(up's termination time, the session's ceiling): the setup window + the declared hours + the fetch window."""
-    setup = BOOTSTRAP_TIMEOUT_S + PREPARE_TIMEOUT_S
-    return (gcevm.rfc3339(now + setup + hours * 3600 + FETCH_WINDOW_S),
-            gcevm.rfc3339(now + setup + session_hours * 3600 + FETCH_WINDOW_S))
+def left_s(st: dict) -> float:
+    """What is left of the session: the seconds until the VM's recorded deadline (every wait is bounded by it)."""
+    return max((gcevm.epoch(st.get("terminates_at")) or 0) - time.time(), 0.0)
+
+
+def _bounded(st: dict, what: str) -> float:
+    left = left_s(st)
+    if left <= 0:
+        raise Refused(f"{what}: the VM's deadline {st.get('terminates_at')} has passed (it deletes itself)")
+    return left
 
 
 # ─── up ─────────────────────────────────────────────────────────────────────
@@ -547,14 +626,12 @@ def cmd_up(a) -> int:
     check_sha(a.sha)
     if a.parallelism < 1:
         raise Refused("--parallelism: at least 1 (the suite's -p / -n: the vCPU it wants)")
-    if not 0 < a.hours <= a.session_hours <= MAX_SESSION_HOURS:
-        raise Refused(f"--hours {a.hours} and --session-hours {a.session_hours}: 0 < hours <= session-hours <= "
-                      f"{MAX_SESSION_HOURS}")
+    if not a.session_hours > 0:
+        raise Refused(f"--session-hours {a.session_hours}: the session's declared length, more than 0")
     src = source(a.clone, a.repo, a.sha)
     tc = toolchain(a.clone, a.sha, a.workflow)
     gcevm.say(f"{src['repo']} at {a.sha} (tree {src['tree']}; origin {src['origin']}): {_describe_toolchain(tc)}")
-    for x in tc["not_provided"]:
-        gcevm.say(f"NOT PROVIDED: {x}: testvm installs Go and Python only")
+    _say_toolchain(tc)
     project, zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
     number = gcevm.parents(project, zone)
     gcevm.require_iap(project)
@@ -568,7 +645,7 @@ def cmd_up(a) -> int:
         gcevm.say(msg)
     if refusals:
         raise Refused(f"the VM does not fit {gke.region_of(zone)}'s quotas: " + "; ".join(refusals))
-    terminates_at, ceiling = deadlines(time.time(), a.hours, a.session_hours)
+    terminates_at = gcevm.rfc3339(time.time() + a.session_hours * 3600)          # set once, here
     d = state_dir(run)
     sf = d / "startup.sh"
     if a.yes:
@@ -577,9 +654,8 @@ def cmd_up(a) -> int:
         # record before create: what up is about to make, field for field, and the session it serves
         _save_state(run, made=as_made(run, project, zone, machine["name"], terminates_at))
         _save_state(run, vm=name, project=project, zone=zone, project_number=number, machine=machine,
-                    parallelism=a.parallelism, hours=a.hours, session_hours=a.session_hours,
-                    terminates_at=terminates_at, ceiling=ceiling, created_at=time.time(), source=src, runs=[],
-                    pushes=[])
+                    parallelism=a.parallelism, session_hours=a.session_hours, terminates_at=terminates_at,
+                    created_at=time.time(), source=src, runs=[], pushes=[])
     for fw, rule in firewall_rules(run).items():
         rc, _o, err = gcloud(gcevm.firewall_create_argv(fw, rule, project), dry=not a.yes)
         if rc != 0:
@@ -594,29 +670,32 @@ def cmd_up(a) -> int:
     rc, _o, err = gcloud(create_command(run, project, zone, machine["name"], str(sf), terminates_at), dry=not a.yes)
     if not a.yes:
         gcevm.say(f"DRY: {machine['name']} ({machine['guestCpus']} vCPU) for --parallelism {a.parallelism}; deletes "
-                  f"itself at {terminates_at}, extendable to {ceiling}; would bundle {a.sha} and push it; nothing "
-                  f"was created")
+                  f"itself at {terminates_at} (--session-hours {a.session_hours}); would bundle {a.sha} and push it; "
+                  f"nothing was created")
         return 0
     if rc != 0:
         raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
     _save_state(run, instance_created_at=time.time())
+    st = _state(run)
     try:
-        _trusted(run, _state(run))
+        _trusted(run, st)
     except Refused as e:
         raise Refused(f"{e}; {down_hint(run)}") from None
     gcevm.say(f"{name} created ({machine['name']}, no service account); it deletes itself and its disk at "
               f"{terminates_at}")
+    left = _bounded(st, "the bootstrap wait")
     got = gcevm.wait_for_marker(name, project, zone, remote(run, f"cat {shlex.quote(BOOTSTRAP_MARKER)} 2>/dev/null "
                                                                  f"|| true\n", in_dir=False),
-                                ready_timeout_s=SSH_READY_TIMEOUT_S, timeout_s=BOOTSTRAP_TIMEOUT_S, poll_s=a.poll_s,
-                                hint=down_hint(run), marker_path=BOOTSTRAP_MARKER)
+                                ready_timeout_s=left, timeout_s=left, poll_s=a.poll_s, hint=down_hint(run),
+                                marker_path=BOOTSTRAP_MARKER)
     missing = [k for k in ("git", "python3") if not got.get(k)]
     if missing:
         raise Refused(f"{name}'s bootstrap lacks {missing}; {down_hint(run)}")
     _save_state(run, bootstrap=got)
     gcevm.say(f"{name} bootstrapped: " + ", ".join(f"{k} {redact_identity(str(v))}" for k, v in sorted(got.items())))
     rc, out, err = ssh(name, project, zone, remote(run, 'umask 077\nmkdir -p "$R/home" "$R/incoming" "$R/runs"\n'
-                                                   'chmod 700 "$R"\n', in_dir=False), timeout=120)
+                                                   'chmod 700 "$R"\n', in_dir=False),
+                       timeout=_bounded(st, "making the run's directory"))
     if rc != 0:
         raise _failed("making the run's directory on the VM", rc, out, err)
     push(run, src, tc, a.clone)
@@ -631,16 +710,58 @@ _RUNNING = ('running_run() {\n  for p in "$R"/runs/*/pid; do\n    [ -s "$p" ] ||
             '    if [ ! -e "$(dirname "$p")/done.json" ] && kill -0 "$(cat "$p")" 2>/dev/null; then\n'
             '      basename "$(dirname "$p")"; return\n    fi\n  done\n}\n')
 
+# On the VM: the newest CPython of the declared version in the newest python-build-standalone release that has
+# one, from that release's own SHA256SUMS (its asset list): prints "<asset name> <sha256> <tag>", or nothing.
+PBS_PICK_PY = r'''
+import json, re, subprocess, sys
+version, arch, releases, download = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+pat = re.compile(r"cpython-%s(\.\d+)?\+(\d+)-%s-unknown-linux-gnu-install_only\.tar\.gz" % (re.escape(version), arch))
+def get(url):                                     # the VM's one fetch path, as for Go: curl
+    return subprocess.run(["curl", "-fsSL", url], capture_output=True, check=True).stdout
+def key(name):
+    m = re.match(r"cpython-(\d+)\.(\d+)\.(\d+)\+", name)
+    return tuple(int(x) for x in m.groups())
+page = 0
+while True:                                       # newest first, until GitHub lists no more
+    page += 1
+    rels = json.loads(get("%s?per_page=10&page=%d" % (releases, page)))
+    if not rels:
+        break
+    for rel in rels:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        tag = rel["tag_name"]
+        sums = dict(reversed(ln.split()) for ln in get("%s/%s/SHA256SUMS" % (download, tag)).decode().splitlines()
+                    if ln.strip())
+        hits = sorted((n for n in sums if pat.fullmatch(n)), key=key)
+        if hits:
+            print(hits[-1], sums[hits[-1]], tag)
+            sys.exit(0)
+'''
+
+
+def _by_step(reqs: list[dict]) -> list[list[dict]]:
+    groups: dict[int, list[dict]] = {}
+    for r in reqs:
+        groups.setdefault(r.get("step", 0), []).append(r)
+    return [g for _k, g in sorted(groups.items()) if any(r["flag"] == "-r" for r in g)]
+
+
+def _pip_command(group: list[dict]) -> str:
+    """One pip step's files as one install (a constraint file constrains the requirements beside it), in the
+    step's working-directory, into the venv."""
+    q = shlex.quote
+    args = " ".join(f'{r["flag"]} "$S"/{q(r["file"])}' for r in group)
+    shown = " ".join(f'{r["flag"]} {r["file"]}' for r in group)
+    return (f'echo "testvm: pip install {shown} ({group[0]["workflow"]})"\n'
+            f'( cd "$S"/{q(group[0]["dir"])} && "$R/venv/bin/python" -m pip install -q {args} ) >> "$R/prepare.log" '
+            f'2>&1 || {{ tail -n 20 "$R/prepare.log"; refuse "pip install {shown} failed ($R/prepare.log)"; }}\n')
+
 
 def push_script(run: str, sha: str, tree: str, tc: dict) -> str:
     q = shlex.quote
     go = tc["go"]
     py = tc["python"]
-    pip = "".join(f'echo "testvm: pip step in {s["dir"]} ({s["workflow"]})"\n'
-                  f'( cd "$S"/{q(s["dir"])} && PATH="$R/venv/bin:$PATH" bash -euo pipefail -c {q(s["run"])} ) '
-                  f'>> "$R/prepare.log" 2>&1 || {{ tail -n 20 "$R/prepare.log"; refuse "the pip step in {s["dir"]} '
-                  f'failed ($R/prepare.log)"; }}\n'
-                  for s in tc["pip"])
     go_block = "" if not go else f"""\
 G="$T/go{go}"
 if [ ! -x "$G/bin/go" ]; then
@@ -656,16 +777,25 @@ if [ ! -x "$G/bin/go" ]; then
 fi
 echo "TESTVM_GO=$("$G/bin/go" version)"
 """
-    if py:
-        venv = f"""\
-U="$T/uv"
-if [ ! -x "$U/bin/uv" ]; then python3 -m venv "$U"; "$U/bin/pip" install -q uv; fi
-UV_PYTHON_INSTALL_DIR="$T/python" "$U/bin/uv" venv -q --seed --python {q(py)} "$R/venv"
-"""
-    elif tc["pip"]:
-        venv = 'python3 -m venv "$R/venv"\n'
-    else:
-        venv = ""
+    py_block = "" if not py else f"""\
+P="$T/python{py}"
+if [ ! -x "$P/bin/python3" ]; then
+  case "$(uname -m)" in x86_64) arch=x86_64;; aarch64|arm64) arch=aarch64;; *) refuse "no CPython build for $(uname -m)";; esac
+  cat > "$T/pbs_pick.py" <<'TESTVM_PICK'
+{PBS_PICK_PY}TESTVM_PICK
+  pick="$(python3 "$T/pbs_pick.py" {q(py)} "$arch" {q(PBS_RELEASES)} {q(PBS_DOWNLOAD)})"
+  [ -n "$pick" ] || refuse "no python-build-standalone release has a CPython {py} for $arch"
+  set -- $pick
+  curl -fsSLo "$T/$1" "{PBS_DOWNLOAD}/$3/$1"
+  got="$({_HASH_PY} "$T/$1")"
+  [ "$got" = "$2" ] || refuse "$1 arrived with sha256 $got, the release's SHA256SUMS lists $2"
+  rm -rf "$P.tmp"; mkdir -p "$P.tmp"; tar -C "$P.tmp" -xzf "$T/$1"; mv "$P.tmp/python" "$P"; rm -rf "$P.tmp" "$T/$1"
+  echo "testvm: CPython from python-build-standalone $3: $1"
+fi
+echo "TESTVM_PYTHON=$("$P/bin/python3" --version 2>&1)"
+rm -rf "$R/venv"
+"$P/bin/python3" -m venv "$R/venv"
+""" + "".join(_pip_command(group) for group in _by_step(tc["requirements"]))
     return remote(run, _RUNNING + f"""\
 r="$(running_run)"; [ -z "$r" ] || refuse "run $r is still running: push once it has ended"
 S="$R/src"; B="$R/incoming/{sha}.bundle"; T="$R/toolchains"
@@ -685,9 +815,7 @@ echo "testvm: checkout at {sha} (tree {tree})"
 echo "TESTVM_HEAD=$head"
 echo "TESTVM_TREE=$t"
 : > "$R/prepare.log"
-{go_block}rm -rf "$R/venv"
-{venv}{pip}if [ -x "$R/venv/bin/python" ]; then echo "TESTVM_PYTHON=$("$R/venv/bin/python" --version 2>&1)"; fi
-""")
+{go_block}{py_block}""")
 
 
 def _toolchain_mismatch(tc: dict, out: str) -> list[str]:
@@ -713,10 +841,12 @@ def push(run: str, src: dict, tc: dict, clone: str) -> None:
               + (f" ({len(have)} earlier SHA(s) as prerequisites)" if have else ""))
     try:
         gcevm.upload(name, project, zone, str(bundle), f"{vm_dir(run)}/incoming/{sha}.bundle",
-                     what="the bundle transfer", scratch=f"{vm_dir(run)}/incoming")
+                     what="the bundle transfer", scratch=f"{vm_dir(run)}/incoming",
+                     probe_bound_s=_bounded(st, "the bundle transfer"))
     finally:
         bundle.unlink(missing_ok=True)
-    rc, out, err = ssh(name, project, zone, push_script(run, sha, src["tree"], tc), timeout=PREPARE_TIMEOUT_S)
+    rc, out, err = ssh(name, project, zone, push_script(run, sha, src["tree"], tc),
+                       timeout=_bounded(st, "the checkout and toolchain"))
     for ln in gcevm.remote_lines(out):
         if ln.startswith("testvm:"):
             gcevm.say(ln)
@@ -732,7 +862,7 @@ def push(run: str, src: dict, tc: dict, clone: str) -> None:
              "go_version": gcevm.marker(out, "TESTVM_GO"), "python_version": gcevm.marker(out, "TESTVM_PYTHON"),
              "pushed_at": time.time()}
     _save_state(run, pushes=[*(st.get("pushes") or []), entry], checkout=entry, source=src)
-    tools = ", ".join(x for x in (entry["go_version"], entry["python_version"]) if x) or "no toolchain declared"
+    tools = ", ".join(x for x in (entry["go_version"], entry["python_version"]) if x)
     gcevm.say(f"RUN: push of {sha}: checkout verified (HEAD and tree); {tools}")
 
 
@@ -747,8 +877,7 @@ def cmd_push(a) -> int:
         raise Refused(f"run {run} tests {st['source']['repo']}, not {src['repo']}: a session tests one repository")
     tc = toolchain(a.clone, a.sha, a.workflow)
     gcevm.say(f"{src['repo']} at {a.sha} (tree {src['tree']}; origin {src['origin']}): {_describe_toolchain(tc)}")
-    for x in tc["not_provided"]:
-        gcevm.say(f"NOT PROVIDED: {x}: testvm installs Go and Python only")
+    _say_toolchain(tc)
     gcevm.parents(project, zone, st.get("project_number"))
     _trusted(run, st)
     push(run, src, tc, a.clone)
@@ -781,7 +910,9 @@ def host():
 
 RUNNER_PY = HOST_PY + r'''
 import signal, subprocess
-res, budget, grace = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+# the run's deadline (epoch, from its declared budget): the command gets what is left of it, and its process
+# group is SIGKILLed there (no grace window: a suite that wants a graceful stop sets its own timeout inside it)
+res, deadline, budget = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 argv = sys.argv[5:]
 start = host()
 t0 = time.monotonic()
@@ -790,16 +921,11 @@ with open(os.path.join(res, "stdout.log"), "wb") as out, open(os.path.join(res, 
     open(os.path.join(res, "pid.cmd"), "w").write(str(p.pid))
     ended = "exited"
     try:
-        rc = p.wait(timeout=budget)
+        rc = p.wait(timeout=max(deadline - time.time(), 0))
     except subprocess.TimeoutExpired:
         ended = "budget"
-        os.killpg(p.pid, signal.SIGTERM)
-        try:
-            rc = p.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            ended = "budget, killed"
-            os.killpg(p.pid, signal.SIGKILL)
-            rc = p.wait()
+        os.killpg(p.pid, signal.SIGKILL)
+        rc = p.wait()
     try:
         os.killpg(p.pid, signal.SIGKILL)       # nothing the command started outlives it
     except (ProcessLookupError, PermissionError):
@@ -849,7 +975,7 @@ print(found)
 # has no kubectl); the kubeconfig is the JSON one testvm wrote. Recorded, never judged.
 PROBE_PY = r'''
 import base64, json, os, ssl, sys, time, urllib.request
-kc, name, bound = sys.argv[1], sys.argv[2], float(sys.argv[3])
+kc, name, deadline = sys.argv[1], sys.argv[2], float(sys.argv[3])      # every wait: what is left of the run
 cfg = json.load(open(kc))
 server = cfg["clusters"][0]["cluster"]["server"]
 ca = cfg["clusters"][0]["cluster"].get("certificate-authority-data")
@@ -858,7 +984,10 @@ ctx = ssl.create_default_context(cadata=base64.b64decode(ca).decode()) if ca els
 def call(method, path, body=None):
     req = urllib.request.Request(server + path, method=method, data=json.dumps(body).encode() if body else None,
                                  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, context=ctx, timeout=bound) as r:
+    left = deadline - time.time()
+    if left <= 0:
+        raise TimeoutError("the run's budget is spent")
+    with urllib.request.urlopen(req, context=ctx, timeout=left) as r:
         return json.loads(r.read() or b"{}")
 ns = "testvm"
 sel = "/apis/apps/v1/namespaces/%s/replicasets?labelSelector=testvm-probe%%3D%s" % (ns, name)
@@ -870,16 +999,22 @@ try:
         "spec": {"replicas": 1, "selector": {"matchLabels": {"testvm-probe": name}},
                  "template": {"metadata": {"labels": {"testvm-probe": name}},
                               "spec": {"containers": [{"name": "probe", "image": "registry.k8s.io/pause"}]}}}})
-    while not call("GET", sel).get("items"):
-        if time.monotonic() - t0 > bound:
-            raise TimeoutError("no ReplicaSet within %.0f s of the Deployment's create" % bound)
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError("no ReplicaSet %.1f s after the Deployment's create, when the run's budget ended"
+                               % (time.monotonic() - t0))
+        if call("GET", sel).get("items"):
+            break
         time.sleep(0.05)
     out["replicaset_appeared_s"] = round(time.monotonic() - t0, 3)
     t1 = time.monotonic()
     call("DELETE", "/apis/apps/v1/namespaces/%s/deployments/%s" % (ns, name), {"propagationPolicy": "Background"})
-    while call("GET", sel).get("items"):
-        if time.monotonic() - t1 > bound:
-            raise TimeoutError("the ReplicaSet outlived its Deployment by more than %.0f s" % bound)
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError("the ReplicaSet outlived its Deployment by more than %.1f s, when the run's budget "
+                               "ended" % (time.monotonic() - t1))
+        if not call("GET", sel).get("items"):
+            break
         time.sleep(0.05)
     out["replicaset_survived_s"] = round(time.monotonic() - t1, 3)
 except Exception as e:
@@ -892,7 +1027,7 @@ def run_env(st: dict, kubeconfig: str | None) -> str:
     """The command's environment on the VM: the repo's toolchain first on PATH, Go's own caches under the run's
     HOME, GOTOOLCHAIN=local (the installed Go is the repo's: nothing downloads another silently)."""
     tc = (st.get("checkout") or {}).get("toolchain") or {}
-    lines = ['export PATH="$R/venv/bin:$PATH"\n'] if (tc.get("python") or tc.get("pip")) else []
+    lines = ['export PATH="$R/venv/bin:$PATH"\n'] if tc.get("python") else []
     if tc.get("go"):
         lines.append(f'export PATH="$R/toolchains/go{tc["go"]}/bin:$HOME/go/bin:$PATH" GOTOOLCHAIN=local '
                      'GOPATH="$HOME/go" GOCACHE="$HOME/.cache/go-build"\n')
@@ -905,14 +1040,17 @@ def run_env(st: dict, kubeconfig: str | None) -> str:
 
 def start_script(run: str, n: int, header: dict, argv: list[str], budget_s: int, env: str, kubeconfig: str | None,
                  probe: bool, wait_s: float) -> str:
+    """Run n, detached on the VM. Its one deadline is the VM's clock at start + the declared budget, and every
+    phase of it takes what is left (the module doc's RUN)."""
     q = shlex.quote
-    probe_at = (lambda at: f'python3 "$RES/probe.py" {q(kubeconfig)} testvm-probe-{n}-{at} {CLUSTER_PROBE_BOUND_S} '
+    probe_at = (lambda at: f'python3 "$RES/probe.py" {q(kubeconfig)} testvm-probe-{n}-{at} "$DL" '
                 f'> "$RES/cluster-probe-{at}.json" 2>&1 || true\n') if probe else (lambda at: "")
     wrapper = (f"#!/bin/bash\nset -uo pipefail\nR={q(vm_dir(run))}\nRES=\"$R/runs/{n}\"\n"
                f"export HOME=\"$R/home\" USER=testvm LOGNAME=testvm TESTVM_RESULTS=\"$RES\"\n{env}"
-               f"cd \"$R/src\"\n{probe_at('start')}"
                f"t0=\"$(python3 -c 'import time; print(time.time())')\"\n"
-               f"python3 \"$RES/runner.py\" \"$RES\" {budget_s} {KILL_GRACE_S} -- {shlex.join(argv)}\n"
+               f"DL=\"$(python3 -c 'import sys; print(float(sys.argv[1]) + {budget_s})' \"$t0\")\"\n"
+               f"cd \"$R/src\"\n{probe_at('start')}"
+               f"python3 \"$RES/runner.py\" \"$RES\" \"$DL\" {budget_s} -- {shlex.join(argv)}\n"
                f"{probe_at('end')}"
                f"python3 \"$RES/junit.py\" \"$R/src\" \"$RES\" \"$t0\" > \"$RES/junit.count\" 2>/dev/null || true\n"
                "python3 - \"$RES\" <<'PY'\nimport json, os, sys\nres = sys.argv[1]\n"
@@ -991,7 +1129,8 @@ def report(n: int, done: dict, probe: bool) -> int:
     elif cmd.get("ended") == "exited":
         gcevm.say(f"RUN: command: exit {rc} in {cmd.get('elapsed_s')} s (budget {cmd.get('budget_s'):.0f} s)")
     else:
-        gcevm.say(f"RUN: command: stopped at its budget of {cmd.get('budget_s'):.0f} s ({cmd.get('ended')}; exit {rc})")
+        gcevm.say(f"RUN: command: stopped at its budget of {cmd.get('budget_s'):.0f} s (its process group killed; "
+                  f"exit {rc})")
     j = done.get("junit")
     gcevm.say(f"RUN: junit: {j} file(s)" if j else "NOT RUN: junit: the command wrote no JUnit XML")
     gcevm.say(f"RUN: host health at end: {_host_line(host.get('end'))}; steal share over the run "
@@ -1011,7 +1150,7 @@ def cmd_run(a) -> int:
     if not argv:
         raise Refused("run: the command goes after `--`")
     if a.budget_minutes <= 0:
-        raise Refused("--budget-minutes: the command's declared budget, more than 0")
+        raise Refused("--budget-minutes: the run's declared budget, more than 0")
     if a.cluster_probe and not a.cluster:
         raise Refused("--cluster-probe probes the run's cluster: it needs --cluster")
     st, project, zone = _recorded(run)
@@ -1024,10 +1163,10 @@ def cmd_run(a) -> int:
     inst = _trusted(run, st)
     budget_s = int(a.budget_minutes * 60)
     left = gcevm.time_left_s(inst, time.time())
-    if left is None or left < budget_s + FETCH_WINDOW_S:
+    if left is None or left < budget_s:
         raise Refused(f"{name} is deleted in {'an unknown time' if left is None else f'{left / 60:.0f} min'}: a "
-                      f"{a.budget_minutes} min budget and the {FETCH_WINDOW_S // 60} min fetch window do not fit "
-                      f"(`extend --run {run} --hours H --yes`, up to the session's ceiling {st.get('ceiling')})")
+                      f"{a.budget_minutes} min budget does not fit (its fetch after it neither); a longer session is "
+                      f"`down`, then `up` with a new --run and the --session-hours it needs")
     kubeconfig = attach_cluster(run, st, a.cluster, a.cluster_location) if a.cluster else None
     st = _state(run)
     n = len(st.get("runs") or []) + 1
@@ -1038,10 +1177,12 @@ def cmd_run(a) -> int:
     entry = {"n": n, "sha": co["sha"], "argv": argv, "budget_s": budget_s, "cluster": a.cluster,
              "started_at": time.time(), "fetched": False}
     _save_state(run, runs=[*(st.get("runs") or []), entry])            # recorded before it starts
-    wait_s = budget_s + KILL_GRACE_S + (2 * 2 * CLUSTER_PROBE_BOUND_S if a.cluster_probe else 0) + 120
+    # the laptop waits for the run's end bounded by the VM's own deadline (the run ends at its budget; past the
+    # VM's deadline there is no VM to wait on)
+    wait_s = left
     script = start_script(run, n, header, argv, budget_s, run_env(st, kubeconfig), kubeconfig, a.cluster_probe, wait_s)
-    t_end = time.monotonic() + wait_s + 300
-    rc, out, err = ssh(name, project, zone, script, timeout=wait_s + 300)
+    t_end = time.monotonic() + wait_s
+    rc, out, err = ssh(name, project, zone, script, timeout=wait_s)
     started = gcevm.marker(out, "TESTVM_STARTED")
     if rc != 0 and not started:
         raise _failed(f"starting run {n}", rc, out, err)
@@ -1058,7 +1199,7 @@ def cmd_run(a) -> int:
         stage, transient = gcevm.ssh_stage(rc, err) if rc != 0 else ("", True)
         if not transient:
             raise Refused(f"waiting for run {n}: SSH failed at {stage}; the run goes on, detached")
-        rc, out, err = ssh(name, project, zone, remote(run, wait_body(n, max(t_end - time.monotonic() - 60, 1))),
+        rc, out, err = ssh(name, project, zone, remote(run, wait_body(n, max(t_end - time.monotonic(), 1))),
                            timeout=max(t_end - time.monotonic(), 1))
     done = json.loads(gcevm.marker(out, "TESTVM_DONE"))
     code = report(n, done, a.cluster_probe)
@@ -1074,9 +1215,12 @@ def cmd_run(a) -> int:
 
 # ─── clusters: a disposable GKE cluster's token, for one session ────────────
 
-def _kubectl(kubeconfig: str, *args: str, input_data: str | None = None) -> tuple[int, str, str]:
-    p = subprocess.run(["kubectl", "--kubeconfig", kubeconfig, *args], capture_output=True, text=True,
-                       input=input_data, timeout=300)
+def _kubectl(kubeconfig: str, *args: str, timeout: float, input_data: str | None = None) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(["kubectl", "--kubeconfig", kubeconfig, *args], capture_output=True, text=True,
+                           input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout:.0f} s"
     return p.returncode, p.stdout, p.stderr
 
 
@@ -1127,13 +1271,13 @@ def _jwt_exp(token: str) -> float | None:
 def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
     """The VM path of the kubeconfig for cluster `name`, made the first time a run of the session targets it (see
     the module doc): a disposable bench cluster only; a token of ServiceAccount testvm-<run>, expiring at the
-    session's ceiling. The laptop keeps no copy of the token."""
+    VM's deadline. The laptop keeps no copy of the token."""
     if not location:
         raise Refused("--cluster: --cluster-location names its zone or region")
     project = st["project"]
     remote_kc = f"{vm_dir(run)}/kube/{name}.json"
     att = (st.get("clusters") or {}).get(name)
-    ceiling = gcevm.epoch(st.get("ceiling")) or 0
+    ends = gcevm.epoch(st.get("terminates_at")) or 0
     if att and att.get("location") == location and (att.get("expires") or 0) >= time.time() + 60:
         return remote_kc
     doc = _cluster(name, location, project)
@@ -1151,13 +1295,15 @@ def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
     _save_state(run, clusters={**(st.get("clusters") or {}), name: {"location": location, "attached_at": time.time()}})
     with tempfile.TemporaryDirectory() as d:
         kc = _scratch_kubeconfig(run, name, location, project, d)
-        rc, _o, err = _kubectl(kc, "apply", "-f", "-", input_data=_cluster_rbac(run))
+        rc, _o, err = _kubectl(kc, "apply", "-f", "-", input_data=_cluster_rbac(run),
+                               timeout=_bounded(st, "the cluster's ServiceAccount"))
         if rc != 0:
             raise Refused(f"the ServiceAccount testvm-{run} in {name} could not be made (rc={rc}; "
                           f"{error_summary(err)})")
-        duration = max(int(ceiling - time.time()), 600)
+        # until the VM's deadline; the TokenRequest API's own floor is 10 min (a shorter one it refuses)
+        duration = max(int(ends - time.time()), TOKEN_MIN_S)
         rc, token, err = _kubectl(kc, "-n", CLUSTER_NS, "create", "token", f"testvm-{run}",
-                                  f"--duration={duration}s")
+                                  f"--duration={duration}s", timeout=_bounded(st, "the cluster's token"))
         token = token.strip()
         if rc != 0 or not token:
             raise Refused(f"no token for testvm-{run} in {name} (rc={rc}; {error_summary(err)})")
@@ -1173,21 +1319,26 @@ def attach_cluster(run: str, st: dict, name: str, location: str | None) -> str:
             json.dump(cfg, fh)
         del token, cfg
         gcevm.upload(vm_name(run), project, st["zone"], local, remote_kc, what=f"the kubeconfig of {name}",
-                     scratch=f"{vm_dir(run)}/incoming")
+                     scratch=f"{vm_dir(run)}/incoming", probe_bound_s=_bounded(st, "the kubeconfig's transfer"))
     st = _state(run)
     _save_state(run, clusters={**(st.get("clusters") or {}), name: {"location": location, "attached_at": time.time(),
                                                                     "expires": exp}})
     gcevm.say(f"RUN: cluster {name}: ServiceAccount {CLUSTER_NS}/testvm-{run} (cluster-admin), its token on the VM "
               f"only, expiring at {gcevm.rfc3339(exp) if exp else 'an unknown time'}"
-              + ("" if exp is None or exp >= ceiling - 60 else " (the API server's cap: before the session's ceiling)"))
+              + ("" if exp is None or exp >= ends else " (the API server's cap: before the VM's deadline)"))
     return remote_kc
 
 
 def detach_clusters(run: str, st: dict) -> list[str]:
     """After the VM is gone: each attached cluster's binding and ServiceAccount deleted (the token revoked). What
-    could not be revoked is reported, never a reason to stop: the token expires at the session's ceiling anyway."""
+    could not be revoked is reported, never a reason to stop: the token expires with the VM's deadline anyway."""
     notes = []
     for name, att in (st.get("clusters") or {}).items():
+        left = left_s(st)
+        if left <= 0:
+            gcevm.say(f"cluster {name}: the token expired with the VM's deadline {st.get('terminates_at')}; its "
+                      f"ServiceAccount {CLUSTER_NS}/testvm-{run} goes with the disposable cluster")
+            continue
         doc = _cluster(name, att["location"], st["project"])
         if doc is None:
             gcevm.say(f"cluster {name}: gone (its ServiceAccount with it)")
@@ -1200,68 +1351,12 @@ def detach_clusters(run: str, st: dict) -> list[str]:
                 continue
             for args in (["delete", "clusterrolebinding", f"testvm-{run}", "--ignore-not-found"],
                          ["-n", CLUSTER_NS, "delete", "serviceaccount", f"testvm-{run}", "--ignore-not-found"]):
-                rc, _o, err = _kubectl(kc, *args)
+                rc, _o, err = _kubectl(kc, *args, timeout=left)
                 if rc != 0:
                     notes.append(f"cluster {name}: kubectl {' '.join(args[:3])} failed (rc={rc}; {error_summary(err)})")
         if not any(x.startswith(f"cluster {name}:") for x in notes):
             gcevm.say(f"cluster {name}: ServiceAccount {CLUSTER_NS}/testvm-{run} and its binding deleted (token revoked)")
     return notes
-
-
-# ─── extend ─────────────────────────────────────────────────────────────────
-
-def cmd_extend(a) -> int:
-    run = check_run(a.run)
-    name = vm_name(run)
-    st, project, zone = _recorded(run)
-    if a.hours <= 0:
-        raise Refused("--hours: more than 0")
-    new = gcevm.rfc3339(time.time() + a.hours * 3600 + FETCH_WINDOW_S)
-    if gcevm.epoch(new) > gcevm.epoch(st["ceiling"]):
-        raise Refused(f"{new} is past the session's ceiling {st['ceiling']} (up's --session-hours): a longer session "
-                      f"takes a new up")
-    gcevm.parents(project, zone, st.get("project_number"))
-    _trusted(run, st)
-    rc, out, err = ssh(name, project, zone, remote(run, _RUNNING + 'echo "TESTVM_RUNNING=$(running_run)"\n'),
-                       timeout=120)
-    if rc != 0 or gcevm.marker(out, "TESTVM_RUNNING") is None:
-        raise _failed("reading whether a run is running", rc, out, err)
-    if gcevm.marker(out, "TESTVM_RUNNING"):
-        raise Refused(f"run {gcevm.marker(out, 'TESTVM_RUNNING')} is running: GCE changes a termination time only on a "
-                      f"stopped VM, which would kill it; extend once it has ended")
-    stop = ["compute", "instances", "stop", name, *gcevm.where(project, zone), "--quiet"]
-    sched = ["compute", "instances", "set-scheduling", name, *gcevm.where(project, zone), "--termination-time", new,
-             "--instance-termination-action", "DELETE"]
-    start = ["compute", "instances", "start", name, *gcevm.where(project, zone), "--quiet"]
-    if not a.yes:
-        for c in (stop, sched, start):
-            gcloud(c, dry=True)
-        gcevm.say(f"DRY: {name} would be deleted at {new} instead of {st['terminates_at']} (ceiling {st['ceiling']}); "
-                  f"nothing was changed")
-        return 0
-    _save_state(run, extend_pending={"to": new, "from": st["terminates_at"], "at": time.time()})
-    stopped = "the VM is STOPPED and holds no termination time (GCE clears it at stop): " + down_hint(run)
-    rc, _o, err = gcloud(stop)
-    if rc != 0:
-        raise Refused(f"instances stop failed (rc={rc}; {error_summary(err)}); the VM still holds {st['terminates_at']}")
-    rc, _o, err = gcloud(sched)
-    if rc != 0:
-        raise Refused(f"set-scheduling failed (rc={rc}; {error_summary(err)}); {stopped}")
-    rc, _o, err = gcloud(start)
-    if rc != 0:
-        raise Refused(f"instances start failed (rc={rc}; {error_summary(err)}); the VM is stopped, deleted at {new}; "
-                      f"{down_hint(run)}")
-    made = _made(st, run)
-    made["instance"]["terminationTime"] = gcevm.utc(new)
-    st = _save_state(run, made=made, terminates_at=new, extend_pending=None,
-                     extends=[*(st.get("extends") or []), {"to": new, "at": time.time()}])
-    _trusted(run, st)
-    gcevm.wait_for_marker(name, project, zone, remote(run, f"cat {shlex.quote(BOOTSTRAP_MARKER)} 2>/dev/null || true\n",
-                                                      in_dir=False),
-                          ready_timeout_s=SSH_READY_TIMEOUT_S, timeout_s=BOOTSTRAP_TIMEOUT_S, poll_s=a.poll_s,
-                          hint=down_hint(run), marker_path=BOOTSTRAP_MARKER)
-    gcevm.say(f"{name} now deletes itself at {new} (read back; ceiling {st['ceiling']}); SSH answers again")
-    return 0
 
 
 # ─── fetch ──────────────────────────────────────────────────────────────────
@@ -1292,7 +1387,7 @@ def cmd_fetch(a) -> int:
         return 0
     gcevm.parents(project, zone, st.get("project_number"))
     _trusted(run, st)
-    rc, out, err = ssh(name, project, zone, fetch_script(run, todo), timeout=1800)
+    rc, out, err = ssh(name, project, zone, fetch_script(run, todo), timeout=_bounded(st, "packing the results"))
     if rc != 0:
         raise _failed("packing the results on the VM", rc, out, err)
     got = [int(x.split("/")[1]) for x in (gcevm.marker(out, "TESTVM_FETCH_RUNS") or "").split()]
@@ -1305,7 +1400,7 @@ def cmd_fetch(a) -> int:
     d = state_dir(run)
     tgz = d / "fetch.tgz"
     gcevm.download(name, project, zone, f"{vm_dir(run)}/fetch.tgz", str(tgz), nbytes=int(nbytes), sha256=sha,
-                   what="the results transfer")
+                   what="the results transfer", probe_bound_s=_bounded(st, "the results transfer"))
     staging = d / "staging"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
@@ -1398,7 +1493,7 @@ def cmd_down(a) -> int:
         raise Refused(f"firewall rule(s) {still} of {name} remain after their delete")
     notes = detach_clusters(run, st)
     for x in notes:
-        gcevm.say(f"WARNING: not revoked (the token expires at {st.get('ceiling')}): {x}")
+        gcevm.say(f"WARNING: not revoked (the token expires with the VM's deadline, {st.get('terminates_at')}): {x}")
     _save_state(run, deleted_at=time.time(), detach_notes=notes)
     gcevm.say(f"{name} gone and verified: disk(s) {disks}, {len(rules)} firewall rule(s)"
               + (f"; {len(drift)} field(s) had drifted since up (above, and in the run's record)" if drift else ""))
@@ -1429,8 +1524,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run", required=True)
     source_args(p)
     p.add_argument("--parallelism", type=int, required=True, help="the suite's parallelism: the vCPU it wants")
-    p.add_argument("--hours", type=float, required=True, help="the hours of runs before the VM deletes itself")
-    p.add_argument("--session-hours", type=float, required=True, help="the most `extend` may stretch the session to")
+    p.add_argument("--session-hours", type=float, required=True,
+                   help="the session's declared length: the VM deletes itself then, and nothing moves it")
     p.add_argument("--project", default=None, help=f"default {DEFAULT_PROJECT}")
     p.add_argument("--zone", default=None, type=_zone, help=f"default {DEFAULT_ZONE}")
     p.add_argument("--yes", action="store_true")
@@ -1451,13 +1546,6 @@ def main(argv: list[str] | None = None) -> int:
                                                                 "and end")
     p.add_argument("command", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_run)
-
-    p = sub.add_parser("extend", help="move the VM's termination time, up to the session's ceiling")
-    p.add_argument("--run", required=True)
-    p.add_argument("--hours", type=float, required=True)
-    p.add_argument("--yes", action="store_true")
-    p.add_argument("--poll-s", type=float, default=POLL_S, help=argparse.SUPPRESS)
-    p.set_defaults(func=cmd_extend)
 
     p = sub.add_parser("fetch", help="copy every ended run's results back, sha256 verified")
     p.add_argument("--run", required=True)
