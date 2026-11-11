@@ -48,6 +48,7 @@ import (
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
@@ -205,11 +206,10 @@ func readCRDSchema(ctx context.Context, rc *rest.Config, gvr runtimeschema.Group
 		slog.WarnContext(ctx, "schema: SA discovery singleton unavailable; "+
 			"falling back to per-call client",
 			slog.String("error", err.Error()))
-		// #1318 — the per-call client serves this flight alone. The flight is
-		// detached (no customer budget, #1115's background rule): its mapper's
-		// discovery, on client-go's own context.TODO(), is not a request's
-		// network, and its CRD GET below runs under the flight's deadline.
-		cli, err = dynamic.NewClient(rc)
+		// #1318 — the per-call client serves this flight alone, so every
+		// exchange it sends ends with the flight: its mapper's discovery, which
+		// client-go sends on its own context.TODO(), included (review F1).
+		cli, err = dynamic.NewClient(credhttp.BindContext(ctx, rc))
 		if err != nil {
 			return nil, err
 		}

@@ -51,6 +51,9 @@ type fill1318Server struct {
 	gate    chan struct{} // nil: never blocks
 	once    sync.Once
 	deny    string
+	// hangDiscovery (#1318 review F1): every discovery document is held until
+	// the request's own ctx ends (or the arm's cleanup releases the gate).
+	hangDiscovery atomic.Bool
 }
 
 func newFill1318Server(t *testing.T, gated bool, deny string) *fill1318Server {
@@ -96,6 +99,13 @@ func newFill1318Server(t *testing.T, gated bool, deny string) *fill1318Server {
 			return
 		}
 		if d, ok := docs[r.URL.Path]; ok {
+			if s.hangDiscovery.Load() {
+				select {
+				case <-s.gate:
+				case <-r.Context().Done():
+					return
+				}
+			}
 			_, _ = io.WriteString(w, d)
 			return
 		}
