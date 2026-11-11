@@ -207,37 +207,77 @@ func stageNotExecutedByDesign(reason string) bool {
 // {"truncated":true,"failed":N} instead of the per-stage array.
 const StageOutcomesMaxHeaderBytes = 4096
 
-// reasonRank orders reasons when one stage records several (an iterator stage
-// with many failing items): the most specific one wins, deterministically,
-// whatever order concurrent items finish in.
+// stageGroupPrecedence orders the three groups when one stage records reasons
+// of more than one (#1347 ruling): cut / failed outranks denied, which
+// outranks by design. A stage whose data was cut or failed reports a reason of
+// that group whatever else it recorded, so a client that reads the group
+// (StageReasonGroups) shows its notice. A stage with a denied item and an item
+// cut by the page budget reads Timeout, never Forbidden. A higher value wins.
+//
+// The precedence is read from the group of each code (StageReasonGroup), so a
+// new code takes its group's place by being placed in a group: it can never
+// outrank a group above its own. An unknown code reads cut / failed.
+var stageGroupPrecedence = map[string]int{
+	StageGroupCutFailed: 3,
+	StageGroupDenied:    2,
+	StageGroupByDesign:  1,
+}
+
+// reasonOutranks reports whether reason a takes precedence over b when one
+// stage records both: the group first (stageGroupPrecedence), then reasonRank
+// inside the group. Any code outranks "" (a stage that recorded nothing).
+// fail() keeps the reason this order puts first, so a stage reports one
+// reason, deterministically, whatever order its items finish in. It is the
+// one order: the RESTAction header and a widget's header both read the
+// reason fail() kept.
+func reasonOutranks(a, b string) bool {
+	if b == "" {
+		return a != ""
+	}
+	if ga, gb := stageGroupPrecedence[StageReasonGroup(a)], stageGroupPrecedence[StageReasonGroup(b)]; ga != gb {
+		return ga > gb
+	}
+	return reasonRank[a] > reasonRank[b]
+}
+
+// reasonRank orders reasons of the SAME group (stageGroupPrecedence orders the
+// groups) when one stage records several (an iterator stage with many failing
+// items): the most specific one wins. A rank compares only codes of one group;
+// across groups it decides nothing. It is also the set of codes fail() records
+// (any other folds to Error).
 var reasonRank = map[string]int{
+	// cut / failed.
 	// #1281: recorded once for the whole stage, before anything else can be
 	// (the stage is refused before it is planned); ranked first because the
 	// stage itself is misconfigured.
-	StageReasonUAFOnNonReadVerb: 13,
-	// The #443 dry-run refusal outranks every other failure: a dry run reports
-	// StageNotExecuted for its write stages (#443 k, a stable contract).
-	StageReasonNotExecuted:  12,
-	StageReasonForbidden:    11,
-	StageReasonUnauthorized: 10,
-	StageReasonNotFound:     9,
-	// #1319: a stage where one item is a plain 404 and another the definite
-	// per-identity answer reads the plain NotFound (a failure outranks the
-	// denial of the same kind), deterministically.
+	StageReasonUAFOnNonReadVerb:   13,
+	StageReasonUnauthorized:       10,
+	StageReasonNotFound:           9,
+	StageReasonInvalidPath:        7,
+	StageReasonDestinationRefused: 6,
+	StageReasonTemplateError:      5,
+	StageReasonTimeout:            4, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:            3,
+	StageReasonError:              2,
+
+	// denied.
+	StageReasonForbidden: 11,
+	// #1319: the definite per-identity NotFound (#1080). A stage where one item
+	// is a plain 404 and another this answer reads the plain NotFound: its
+	// group (cut / failed) outranks denied.
 	StageReasonNotFoundForRequester: 8,
-	StageReasonInvalidPath:          7,
-	StageReasonDestinationRefused:   6,
-	StageReasonTemplateError:        5,
-	StageReasonTimeout:              4, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:              3,
-	StageReasonError:                2,
-	// #1288: an export's or background work's refusal ranks BELOW every
-	// failure (and above 0, the "" of a stage that recorded nothing). Items
-	// the plan refuses (InvalidPath, TemplateError: failRefusedItems) are
-	// recorded before dispatch and never reach the refusal, so a write stage
-	// with one such item and one refused item FAILED: it reads that failure,
-	// and blocks its dependents. A stage whose every item was refused reads
-	// WriteRefused.
+
+	// by design.
+	// The #443 dry-run refusal: a dry run reports StageNotExecuted for its
+	// write stages (#443 k, a stable contract), above WriteRefused.
+	StageReasonNotExecuted: 12,
+	// #1288: an export's or background work's refusal. Items the plan refuses
+	// (InvalidPath, TemplateError: failRefusedItems) are recorded before
+	// dispatch and never reach the refusal, so a write stage with one such
+	// item and one refused item FAILED: it reads that failure (its group
+	// outranks by design), and blocks its dependents. A stage whose every item
+	// was refused reads WriteRefused. The same holds for a dry run's
+	// StageNotExecuted.
 	StageReasonWriteRefused: 1,
 }
 
@@ -381,7 +421,7 @@ func (s *StageOutcomes) fail(name, reason string) {
 		return // not a stage of this resolve (cannot happen for a registered run)
 	}
 	o.ran = true
-	if reasonRank[reason] > reasonRank[o.reason] {
+	if reasonOutranks(reason, o.reason) {
 		o.reason = reason
 	}
 }
@@ -398,8 +438,8 @@ func (s *StageOutcomes) failed(name string) bool {
 	return o != nil && o.reason != ""
 }
 
-// reasonOf is the reason stage name's outcome reports (the highest-ranked
-// one it recorded, reasonRank), "" when it recorded none. #1139: a log line
+// reasonOf is the reason stage name's outcome reports (the one it recorded
+// that reasonOutranks puts first), "" when it recorded none. #1139: a log line
 // that names a stage's cause reads it here, so it names the cause the header
 // does.
 func (s *StageOutcomes) reasonOf(name string) string {

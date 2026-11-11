@@ -99,6 +99,23 @@ row is "denied" or "by design", show no notice. A truncated header
 
 Only these codes are ever sent.
 
+**One reason per stage: the group decides first (#1347).** A stage can have
+several items (an `iterator`), and each item can fail with its own code. The
+row still carries ONE `reason`. snowplow picks it by group first:
+
+1. any "cut / failed" code, if one item has one;
+2. else any "denied" code;
+3. else a "by design" code.
+
+Inside a group, snowplow picks the most specific code by a fixed order. So a
+stage with one `403` item and one item cut by the page budget reads
+`Timeout`, never `Forbidden`: data was cut, and the notice shows. A stage
+whose only failures are denials reads a "denied" code. The order comes from
+the group each code is in (`stageGroupPrecedence` in `stage_outcomes.go`), so
+a new code takes its group's place. The RESTAction `/call` header uses the
+same rule: both headers read the one reason the stage kept. The portal can
+keep reading each row's group: one row never hides a cut behind a denial.
+
 **Two NotFound codes.** A watched named object that does not exist for this
 requester is the definite per-user answer (#1080): it reads
 `NotFoundForRequester` ("denied", no notice). A plain 404 from a dial reads

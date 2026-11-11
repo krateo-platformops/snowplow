@@ -323,6 +323,19 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
   that is not sent fails" below), and `DestinationRefused` for an endpoint
   address snowplow refuses to dial (see "Which addresses an endpoint can
   dial" below). `dependsOn` is set on a `Skipped` row.
+- One row has one `reason`, even when the stage's items failed with
+  different codes (an `iterator`). The codes are in three groups: **cut /
+  failed** (every code not listed below), **denied** (`Forbidden`,
+  `NotFoundForRequester`) and **by design** (`StageNotExecuted`,
+  `WriteRefused`). The row reads a code of the highest group any item
+  recorded: cut / failed, then denied, then by design (#1347). Inside one
+  group the most specific code wins, by a fixed order. So a stage with a
+  `403` item and an item cut by the page budget reads `Timeout`, not
+  `Forbidden`. A stage with a refused item and an item that failed on its own
+  (`InvalidPath`, `TemplateError`) reads that failure, not `WriteRefused` or
+  `StageNotExecuted`, and it blocks its dependent writes. A widget `/call`
+  header uses the same rule
+  ([docs/howto-frontend-widget-stage-outcomes.md](../docs/howto-frontend-widget-stage-outcomes.md)).
 - A resolve that runs no stage at all (its `dependsOn` graph names a stage
   that does not exist or has a cycle) answers a resolve-level row
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as

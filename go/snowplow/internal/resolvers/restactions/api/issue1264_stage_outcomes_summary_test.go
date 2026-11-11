@@ -59,9 +59,10 @@ func TestIssue1264_S1_FailedStagesCountAndSortedDistinctReasons(t *testing.T) {
 	o := newStageOutcomes()
 	o.register([]string{"ok", "forbidden", "notfound-a", "notfound-b", "skipped", "never"})
 	o.ran("ok")
-	// Two items of one stage fail with different reasons: the ranked one is
-	// the stage's outcome, and the stage counts once.
-	o.fail("forbidden", StageReasonNotFound)
+	// Two items of one stage fail with different reasons of one group
+	// (denied): the ranked one is the stage's outcome, and the stage counts
+	// once. (#1347: across groups the group decides, issue1347_*.)
+	o.fail("forbidden", StageReasonNotFoundForRequester)
 	o.fail("forbidden", StageReasonForbidden)
 	o.fail("notfound-a", StageReasonNotFound)
 	o.fail("notfound-b", StageReasonNotFound)
