@@ -837,7 +837,8 @@ def test_down_refuses_a_firewall_rule_it_did_not_make_and_deletes_nothing(fake, 
     p = fake / "firewalls" / f"{VM}-iap-ssh.json"
     p.write_text(json.dumps({**json.loads(p.read_text()), "description": "someone else's"}))
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and f"firewall rule '{VM}-iap-ssh' is not as vm606 made it" in err and "description" in err
+    assert rc == 2 and f"firewall rule '{VM}-iap-ssh' is not one vm606 made for run {RUN}" in err
+    assert "someone else" in err and "nothing was changed" in err
     assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
 
 
@@ -1639,7 +1640,8 @@ def test_down_deletes_a_drifted_resource_and_reports_the_drift(fake, capsys, mon
                 if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]
     st = _state()
     assert st["deleted_at"] and any(why in d for d in st["down_drift"])
-    assert NODE_SA not in out + err and "@" not in "".join(st["down_drift"])          # roles, never addresses
+    warnings = [ln for ln in out.splitlines() if ln.startswith("WARNING: drifted since up")]
+    assert warnings and not [w for w in warnings + st["down_drift"] if "@" in w]      # roles, never addresses
 
 
 @pytest.mark.parametrize("how", sorted(OWNERSHIP))
