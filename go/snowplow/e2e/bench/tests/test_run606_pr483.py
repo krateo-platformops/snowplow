@@ -171,8 +171,10 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert helm[0][:2] == ["show", "chart"] and "0.3.425" in helm[0]
     install = [a for a in helm if "install" in a and "installer" in a]   # installer#614: not cert-manager's
     assert len(install) == 1
-    assert "oci://ghcr.io/krateo-platformops/charts/installer" in install[0]
-    assert install[0][install[0].index("--version") + 1] == "0.3.425"
+    # #1335 follow-up (R6): installed from the copy s_source pulled and verified, not read from the
+    # registry again once the cluster exists
+    assert str(tmp / "out" / "installer-pulled" / "installer") in install[0]
+    assert not any(x.startswith("oci://") for x in install[0]) and "--version" not in install[0]
     pre = json.loads((tmp / "out" / "installer-preflight.json").read_text())
     assert pre["ok"] and pre["resolved_version"] == "0.3.425"
     assert pre["requirements"]

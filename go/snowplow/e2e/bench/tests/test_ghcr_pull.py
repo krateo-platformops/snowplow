@@ -1217,7 +1217,7 @@ def _s_registry(tmp_path, rc: int, lines: list[str]) -> str:
     log = tmp_path / "log"
     stub = "".join(f"echo {json.dumps(ln)} >&2; " for ln in lines)
     # FRONTEND_TAG: run606 always sets it (empty: no frontend override, run 26)
-    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; GHCR_PULL_ENV_FILE=x; FRONTEND_TAG=\n"
+    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; GHCR_PULL_ENV_FILE=x; FRONTEND_TAG=; REGISTRY_BUDGET={tmp_path}/bound.json\n"
               f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
               f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
               "write_installer_values() { :; }\n"
