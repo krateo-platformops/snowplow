@@ -194,10 +194,29 @@ BLOB_MAX = HELM_MAX_CHART
 RENDER_OUT_MAX = RENDER_MARGIN * REAL_LARGEST["render"]
 CHART_PARSED_MAX = RENDER_MARGIN * REAL_LARGEST["parsed"]
 CHART_MEMBERS_MAX = RENDER_MARGIN * REAL_LARGEST["members"]
+#: Nesting cap (#1356): every YAML document the preflight parses (a chart's Chart.yaml / values.yaml,
+#: helm template's output) nests at most NEST_MAX maps and lists deep, as built (an alias counts the
+#: depth of the node it names). Read from the parser's events, which nest nothing, before any
+#: document is built (_nest_check), so no walk over a chart's data ever nears Python's recursion
+#: limit: the preflight's own walks are iterative besides, and the parent never relies on a
+#: RecursionError. It used to: a values.yaml 1,000 deep was walked recursively to the limit and the
+#: RecursionError caught; whatever else ran at that depth (a finalizer the garbage collector chose
+#: that moment for, and pytest's hook reporting it) failed for want of stack (CI run 43110378256,
+#: "Failed to process unraisable exception"). The same rule as the size caps: 16 x the deepest
+#: real document, measured 2026-11-12 (maps and lists, the top one counted) on the charts run 20
+#: pulls (rendered with their defaults): agentgateway-controller 0.2.0 render 40 (its CRDs' schemas), values 4;
+#: alert-provider 0.2.53 10 / 4; github-provider-kog 0.6.0 10 / 2; agentgateway-policies 0.2.18
+#: 9 / 6; installer 0.3.468 7 / 6; krateo-marketplace-catalog 0.1.2 3 / 1. libyaml (pip's PyYAML
+#: wheels) builds a document in C, 3,000 deep measured; without it the pure-Python composer recurses
+#: two frames a level and reaches Python's limit near 490: in the child (_in_child), a refusal by that
+#: error's own name, never the parent's stack.
+REAL_DEEPEST = 40
+NEST_MAX = RENDER_MARGIN * REAL_DEEPEST
 CAPS = {"helm_max_chart": HELM_MAX_CHART, "helm_max_file": HELM_MAX_FILE, "render_margin": RENDER_MARGIN,
         "real_largest": REAL_LARGEST, "blob_max": BLOB_MAX, "chart_inflated_max": CHART_INFLATED_MAX,
         "chart_file_max": CHART_FILE_MAX, "render_out_max": RENDER_OUT_MAX,
-        "chart_parsed_max": CHART_PARSED_MAX, "chart_members_max": CHART_MEMBERS_MAX}
+        "chart_parsed_max": CHART_PARSED_MAX, "chart_members_max": CHART_MEMBERS_MAX,
+        "real_deepest": REAL_DEEPEST, "nest_max": NEST_MAX}
 #: a `measured` key -> the REAL_LARGEST input it is compared with
 MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated", "render": "render",
                   "parsed": "parsed", "members": "members"}
@@ -568,15 +587,17 @@ def images_in_values(values, app_version: str) -> list[str]:
     """Every image a chart's values name, as the charts template them: a dict
     under an `image` key with a `repository` (an optional `registry` before
     it; its `tag`, else its `digest`, else the chart's appVersion), or a
-    string under an `image` key. Sorted, unique."""
+    string under an `image` key. Sorted, unique. Walked with a stack of its
+    own, never Python's: no depth nears the recursion limit (NEST_MAX)."""
     out, seen = set(), set()
-
-    def walk(o, key):
+    todo = [(values, None)]
+    while todo:
+        o, key = todo.pop()
         if isinstance(o, (dict, list)):
             # a YAML alias is the SAME object again: each one is walked once (an alias chain
             # would otherwise double the walk at every level)
             if (id(o), key) in seen:
-                return
+                continue
             seen.add((id(o), key))
         if isinstance(o, dict):
             if key == "image" and isinstance(o.get("repository"), str) and o["repository"]:
@@ -589,42 +610,70 @@ def images_in_values(values, app_version: str) -> list[str]:
                     out.add(f"{repo}@{o['digest']}")
                 else:
                     out.add(f"{repo}:{app_version}")
-            for k, v in o.items():
-                walk(v, k)
+            todo.extend((v, k) for k, v in o.items())
         elif isinstance(o, list):
-            for v in o:
-                walk(v, key)
+            todo.extend((v, key) for v in o)
         elif key == "image" and isinstance(o, str) and "/" in o:
             out.add(o if (":" in o.rpartition("/")[2] or "@" in o) else f"{o}:latest")
-    walk(values, None)
     return sorted(out)
 
 
 def images_in_manifests(docs) -> list[str]:
     """Every image the rendered manifests run: each string under an `image`
     key, at any depth (containers, init containers, CRs that carry one).
-    Sorted, unique; YAML aliases walked once."""
+    Sorted, unique; YAML aliases walked once; a stack of its own (NEST_MAX)."""
     out, seen = set(), set()
-
-    def walk(o, key):
+    todo = [(docs, None)]
+    while todo:
+        o, key = todo.pop()
         if isinstance(o, (dict, list)):
             if id(o) in seen:
-                return
+                continue
             seen.add(id(o))
         if isinstance(o, dict):
-            for k, v in o.items():
-                walk(v, k)
+            todo.extend((v, k) for k, v in o.items())
         elif isinstance(o, list):
-            for v in o:
-                walk(v, key)
+            todo.extend((v, key) for v in o)
         elif key == "image" and isinstance(o, str) and o.strip():
             out.add(o.strip())
-    walk(docs, None)
     return sorted(out)
 
 
-#: a refusal for input nested past Python's recursion limit (a values.yaml 1,000 deep), named
-DEEP = "it nests deeper than Python's recursion limit"
+#: the refusal of a YAML document nested past NEST_MAX (a values.yaml 1,000 deep), named
+DEEP = f"it nests deeper than its {NEST_MAX} level cap ({RENDER_MARGIN} x the deepest real document's)"
+
+
+def _nest_check(text, loader, name: str = "") -> None:
+    """Refuses (`name` + DEEP) a YAML stream any document of which, as built,
+    nests past NEST_MAX maps and lists: read from the parser's events, which
+    nest nothing, before any document is built. An alias counts the depth of
+    the node it names (a chain of aliases builds depth no event shows)."""
+    import yaml
+    height, open_, depth = {}, [], 0       # anchor -> its node's depth; per open map / list: [anchor, start, deepest]
+    for ev in yaml.parse(text, Loader=loader):
+        if isinstance(ev, yaml.DocumentStartEvent):
+            height.clear()
+            continue
+        if isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            depth += 1
+            open_.append([ev.anchor, depth, depth])
+            reach = depth
+        elif isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            anchor, start, deepest = open_.pop()
+            if anchor:
+                height[anchor] = deepest - start + 1
+            depth -= 1
+            reach = deepest
+        elif isinstance(ev, yaml.AliasEvent):
+            reach = depth + height.get(ev.anchor, 0)
+        else:
+            if isinstance(ev, yaml.ScalarEvent) and ev.anchor:
+                height.pop(ev.anchor, None)  # the name now names a scalar
+            continue
+        if open_:
+            open_[-1][2] = max(open_[-1][2], reach)
+        if reach > NEST_MAX:
+            raise _Refused(f"{name}{DEEP}")
 
 
 def _child_main(conn, fn_name: str, args: tuple) -> None:
@@ -633,8 +682,6 @@ def _child_main(conn, fn_name: str, args: tuple) -> None:
         conn.send(("ok", globals()[fn_name](*args)))
     except _Refused as e:
         conn.send(("refused", str(e)))
-    except RecursionError:
-        conn.send(("refused", DEEP))
     except Exception as e:                  # noqa: BLE001 - reported to the caller, never lost
         conn.send(("error", f"{type(e).__name__}: {str(e)[:300]}"))
     finally:
@@ -659,8 +706,6 @@ def _in_child(fn_name: str, args: tuple, bound_s: float, late: str):
             kind, v = rd.recv()
         except (EOFError, OSError):
             raise _Refused(f"its reader ended with no answer (exit {pr.exitcode})") from None
-        except RecursionError:
-            raise _Refused(DEEP) from None
     finally:
         if pr.is_alive():
             pr.kill()
@@ -746,10 +791,13 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
 
 
 def _parse_manifests(out: bytes) -> list:
-    """helm template's output as documents (run in a child: render)."""
+    """helm template's output as documents (run in a child: render), each
+    within NEST_MAX (_nest_check)."""
     import yaml
     try:
-        return [x for x in yaml.load_all(out.decode(), Loader=_yaml_loader()) if x is not None]  # noqa: S506
+        text, loader = out.decode(), _yaml_loader()
+        _nest_check(text, loader, "helm template rendered YAML: ")
+        return [x for x in yaml.load_all(text, Loader=loader) if x is not None]  # noqa: S506
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise _Refused(f"helm template rendered no YAML: {str(e).splitlines()[0][:200]}") from None
 
@@ -772,7 +820,8 @@ def pods(docs) -> list[dict]:
     (#1041 review N1: alert-provider 0.2.53 puts its secret on its
     ServiceAccount), in the pod's OWN namespace (round 3, F): a manifest's
     metadata.namespace, else the release's (helm template --namespace).
-    YAML aliases walked once."""
+    YAML aliases walked once; a stack of its own, in the manifests' order
+    (NEST_MAX)."""
     docs = docs if isinstance(docs, list) else [docs]
 
     def ns_of(d):
@@ -782,11 +831,14 @@ def pods(docs) -> list[dict]:
         if isinstance(d, dict) and d.get("kind") == "ServiceAccount":
             accounts[(ns_of(d), (d.get("metadata") or {}).get("name"))] = _secret_names(d.get("imagePullSecrets"))
     out, seen = [], set()
-
-    def walk(o, ns):
+    # depth first, each node's children pushed last first: the pods in the order a recursive
+    # walk met them
+    todo = [(d, ns_of(d)) for d in reversed(docs)]
+    while todo:
+        o, ns = todo.pop()
         if isinstance(o, (dict, list)):
             if id(o) in seen:
-                return
+                continue
             seen.add(id(o))
         if isinstance(o, dict):
             if isinstance(o.get("containers"), list):
@@ -796,13 +848,9 @@ def pods(docs) -> list[dict]:
                                                    | accounts.get((ns, sa), set())),
                             "service_account": sa, "namespace": ns,
                             "images": sorted({c["image"] for c in cs if isinstance(c.get("image"), str)})})
-            for v in o.values():
-                walk(v, ns)
+            todo.extend((v, ns) for v in reversed(list(o.values())))
         elif isinstance(o, list):
-            for v in o:
-                walk(v, ns)
-    for d in docs:
-        walk(d, ns_of(d))
+            todo.extend((v, ns) for v in reversed(o))
     return out
 
 
@@ -908,10 +956,7 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
             raise _Refused("no Chart.yaml in its chart layer")
         out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
                            "members": members}
-        try:
-            return walk(charts, vals, data)
-        except RecursionError:
-            raise _Refused(DEEP) from None
+        return walk(charts, vals, data)
 
     def walk(charts, vals, data):
         imgs = set()
@@ -999,11 +1044,10 @@ def read_chart_files(data: bytes, caps: dict | None = None) -> tuple[dict, dict,
     loader = _yaml_loader()
     for d, base, body in raw:
         try:
+            _nest_check(body, loader, f"{d + '/' if d else ''}{base}: ")
             doc = yaml.load(body, Loader=loader) or {}      # noqa: S506 - a safe loader (_yaml_loader)
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise _Refused(f"{d + '/' if d else ''}{base} is not YAML: {str(e).splitlines()[0][:200]}") from None
-        except RecursionError:
-            raise _Refused(f"{d + '/' if d else ''}{base}: {DEEP}") from None
         (charts if base == "Chart.yaml" else vals)[d] = doc
     return charts, vals, inflated, largest, parsed, members
 

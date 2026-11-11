@@ -24,6 +24,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import subprocess
 
 import pytest
@@ -989,9 +990,117 @@ def test_a_parse_past_its_bound_leaves_no_work_running():
 
 def test_a_values_file_nested_past_the_recursion_limit_is_a_named_refusal():
     """Round 4 (info): a values.yaml nested 1,000 deep made RecursionError
-    escape chart_images (a traceback). It is a named refusal."""
+    escape chart_images (a traceback). It is a named refusal: past NEST_MAX,
+    read from the parse's events, never from Python's recursion limit
+    (#1356: the walk that ran to the limit starved whatever else ran there)."""
     r = ghcr_pull.chart_images(AGW, "agentgateway-policies", FAKE_CHART_DEEP, FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
-    assert r["error"] and ghcr_pull.DEEP in r["error"], r
+    assert r["error"] and ghcr_pull.DEEP in r["error"] and "values.yaml: " in r["error"], r
+
+
+def _nested(n, leaf):
+    """`leaf` under n nested maps (n >= 1), built without recursion."""
+    o = leaf
+    for _ in range(n):
+        o = {"a": o}
+    return o
+
+
+def _deepest_stack(fn):
+    """fn()'s answer, and the most frames of bench/ghcr_pull.py on this thread's stack at once
+    while it ran (its own frames only: a finalizer the collector runs meanwhile is not the walk's)."""
+    import sys
+    deepest, mine = [0], ghcr_pull.__file__
+
+    def prof(frame, event, arg):
+        if event == "call":
+            n, f = 0, frame
+            while f is not None:
+                n, f = n + (f.f_code.co_filename == mine), f.f_back
+            deepest[0] = max(deepest[0], n)
+    sys.setprofile(prof)
+    try:
+        out = fn()
+    finally:
+        sys.setprofile(None)
+    return out, deepest[0]
+
+
+def test_the_walks_take_no_stack_from_the_documents_depth():
+    """#1356 root cause: the walks over a chart's data recursed one frame a
+    level, so a document 1,000 deep ran the stack to Python's limit; whatever
+    else ran there (a finalizer the collector picked that moment for, then
+    pytest's hook reporting it) failed: "Failed to process unraisable
+    exception" in the parallel suite. The walks keep a stack of their own:
+    the deepest Python stack is the same for a document 3 and 5,000 deep (5,000:
+    past the recursion limit, the old walks raised RecursionError)."""
+    img = {"image": {"repository": "ghcr.io/x/y", "tag": "1"}}
+    pod = {"containers": [{"image": "ghcr.io/x/y:1"}]}
+    for fn, leaf, want in ((lambda o: ghcr_pull.images_in_values(o, "0"), img, ["ghcr.io/x/y:1"]),
+                           (ghcr_pull.images_in_manifests, {"image": "ghcr.io/x/y:1"}, ["ghcr.io/x/y:1"]),
+                           (lambda o: [p["images"] for p in ghcr_pull.pods([o])], pod, [["ghcr.io/x/y:1"]])):
+        shallow, s_depth = _deepest_stack(lambda: fn(_nested(3, leaf)))
+        deep, d_depth = _deepest_stack(lambda: fn(_nested(5000, leaf)))
+        assert shallow == deep == want
+        assert d_depth == s_depth, (d_depth, s_depth)
+
+
+def test_pods_keep_the_manifests_order():
+    """The iterative walk meets the pods in the order the recursive one did: depth first, in
+    document and key order, an alias once."""
+    a = {"containers": [{"image": "ghcr.io/x/a:1"}]}
+    docs = [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"image": "ghcr.io/x/b:1"}]}}},
+             "z": a},
+            {"kind": "Job", "spec": {"jobTemplate": a, "x": [{"containers": [{"image": "ghcr.io/x/c:1"}]}]}}]
+    assert [p["images"] for p in ghcr_pull.pods(docs)] == [["ghcr.io/x/b:1"], ["ghcr.io/x/a:1"], ["ghcr.io/x/c:1"]]
+
+
+def _deep_yaml(n):
+    """A document n maps deep (the top one counted)."""
+    return "a: " + "{a: " * (n - 1) + "1" + "}" * (n - 1) + "\n"
+
+
+@pytest.mark.parametrize("loader", ["SafeLoader", "CSafeLoader"])
+def test_the_nesting_cap_is_its_own_bound_not_the_interpreters(loader):
+    """NEST_MAX deep is read; one level more is refused by name, before any document is built,
+    by either loader (the pure-Python one could not even build it: its composer recurses two
+    frames a level). The cap is 16 x the deepest real document (#1356)."""
+    import yaml
+    if not hasattr(yaml, loader):
+        pytest.skip(f"PyYAML has no {loader} here")
+    L = getattr(yaml, loader)
+    assert ghcr_pull.NEST_MAX == 16 * ghcr_pull.REAL_DEEPEST == 640 == ghcr_pull.CAPS["nest_max"]
+    ghcr_pull._nest_check(_deep_yaml(ghcr_pull.NEST_MAX), L)
+    with pytest.raises(ghcr_pull._Refused, match="^" + re.escape(f"values.yaml: {ghcr_pull.DEEP}") + "$"):
+        ghcr_pull._nest_check(_deep_yaml(ghcr_pull.NEST_MAX + 1), L, "values.yaml: ")
+    # a later document is measured on its own, and a list nests as a map does
+    ghcr_pull._nest_check("---\n" + _deep_yaml(ghcr_pull.NEST_MAX) + "---\n" + _deep_yaml(ghcr_pull.NEST_MAX), L)
+    with pytest.raises(ghcr_pull._Refused):
+        ghcr_pull._nest_check("x: " + "[" * ghcr_pull.NEST_MAX + "]" * ghcr_pull.NEST_MAX + "\n", L)
+
+
+def test_an_alias_counts_the_depth_of_what_it_names():
+    """A chain of aliases builds depth no single event shows: each line nests two deep, the
+    document it builds NEST_MAX + 1. Refused; the same chain one link shorter is read."""
+    import yaml
+    L = ghcr_pull._yaml_loader()
+
+    def chain(links):          # l0 is a map 2 deep under the top one; each link wraps the one before
+        return "l0: &l0 {a: 1}\n" + "".join(f"l{i}: &l{i} [*l{i - 1}]\n" for i in range(1, links + 1))
+    over = ghcr_pull.NEST_MAX - 1          # top (1) + l_n's lists (over) + l0's map (1) = NEST_MAX + 1
+    with pytest.raises(ghcr_pull._Refused, match="nests deeper"):
+        ghcr_pull._nest_check(chain(over), L)
+    ghcr_pull._nest_check(chain(over - 1), L)
+    built = yaml.load(chain(over - 1), Loader=L)        # noqa: S506 - a safe loader
+    depth, o = 1, built[f"l{over - 1}"]
+    while isinstance(o, list):
+        depth, o = depth + 1, o[0]
+    assert depth + 1 == ghcr_pull.NEST_MAX           # + l0's map: exactly the cap
+
+
+def test_helm_output_past_the_nesting_cap_is_a_named_refusal():
+    with pytest.raises(ghcr_pull._Refused, match="^helm template rendered YAML: it nests deeper"):
+        ghcr_pull._in_child("_parse_manifests", (_deep_yaml(ghcr_pull.NEST_MAX + 1).encode(),), 60, "late")
+    assert ghcr_pull._in_child("_parse_manifests", (_deep_yaml(ghcr_pull.NEST_MAX).encode(),), 60, "late")
 
 
 def test_a_child_that_dies_or_fails_is_a_refusal_never_a_hang():
