@@ -285,6 +285,18 @@ type refreshSub struct {
 	// (frameWritten). Subset of keys; nil after close or resync.
 	owed map[string]refreshOwed
 
+	// armOffered (#1325 m1; guarded by pmu): every key offered on the
+	// refresher path (offerRefreshLocked) since subscribe, until the arm's last
+	// step (offerCatchUp) closes the arm; nil from then on. An ARM-TIME offer —
+	// the #710 owed-push emit, the #870 ledger arm, the #1324 catch-up — of a
+	// key already in it is absorbed (offerArmLocked), so one arm writes at most
+	// one frame per key whatever its source. That is never a loss: an arm-time
+	// frame announces a change that landed BEFORE subscribe, and any frame
+	// offered after subscribe makes the tab refetch bytes at least that new;
+	// every change after subscribe is published to this stream as usual.
+	// Bounded by the armed set (only armed keys are offered).
+	armOffered map[string]struct{}
+
 	// per-connection attribution (C12), read by RefreshSubSnapshotForTest.
 	delivered     atomic.Uint64
 	evictDeferred atomic.Uint64
@@ -538,6 +550,9 @@ func (s *refreshSub) offerRefreshLocked(l1Key string, owed refreshOwed) {
 	if s.closed || s.resynced {
 		return
 	}
+	if s.armOffered != nil { // #1325 m1 — the arm is open: remember the key
+		s.armOffered[l1Key] = struct{}{}
+	}
 	s.noteOwedLocked(l1Key, owed)
 	_, rdup := s.rpending[l1Key]
 	_, edup := s.pending[l1Key]
@@ -565,6 +580,28 @@ func (s *refreshSub) offerRefreshLocked(l1Key string, owed refreshOwed) {
 		s.rdraining = true
 		go s.drainRefreshes()
 	}
+}
+
+// offerArmLocked is an ARM-TIME offer of l1Key (#710 owed emit, #870 ledger
+// arm, #1324 catch-up): absorbed when this arm already offered the key, from
+// any source (armOffered), else offerRefreshLocked. Reports whether it
+// offered. Caller holds s.pmu (and h.mu read, as for offerRefresh).
+func (s *refreshSub) offerArmLocked(l1Key string) bool {
+	if s.armOffered != nil {
+		if _, dup := s.armOffered[l1Key]; dup {
+			refreshArmDuplicateAbsorbedTotal.Add(1)
+			return false
+		}
+	}
+	s.offerRefreshLocked(l1Key, refreshOwed{})
+	return true
+}
+
+// offerArm is offerArmLocked taking s.pmu. Caller holds h.mu (read).
+func (s *refreshSub) offerArm(l1Key string) bool {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	return s.offerArmLocked(l1Key)
 }
 
 // drainRefreshes releases this subscriber's deferred refresh keys in FIFO
@@ -901,6 +938,7 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 		limiter:      rate.NewLimiter(limit, burst),
 		pending:      map[string]struct{}{},
 		rpending:     map[string]struct{}{},
+		armOffered:   map[string]struct{}{}, // #1325 m1 — open until offerCatchUp
 		done:         make(chan struct{}),
 		resync:       make(chan struct{}),
 	}
@@ -915,24 +953,30 @@ func SubscribeRefreshStreamAs(subject string, armedKeys map[string]struct{}) Ref
 	// #710 PR-2b — /refreshes has no replay: a stale-derived body whose
 	// replacement was published before this tab armed is announced NOW, to
 	// this subscriber (a spurious emit costs one refetch).
+	// #1325 m1 — an arm-time offer (offerArm): absorbed if this arm already
+	// offered the key (a publish since subscribe). The mark is cleared either
+	// way: the frame already offered delivers the push.
 	for k := range armedKeys {
 		if !staleOwedReady(k) {
 			continue
 		}
 		h.mu.RLock()
-		s.offerRefresh(k, refreshOwed{})
+		s.offerArm(k)
 		h.mu.RUnlock()
 		noteStaleOwedArmEmit(k)
 	}
 	// #870 (P4) — the store-swap push ledger: every open entry for these keys
 	// has a subscriber now, and an entry already REFRESHED is owed a frame on
 	// this stream at once (it closes pushed_on_arm when the handler writes it).
-	// The ledger mutex is a leaf, taken with no hub lock held.
+	// The ledger mutex is a leaf, taken with no hub lock held. #1325 m1 — an
+	// arm-time offer: a key the owed emit (or a publish) already offered gets
+	// no second frame, and that frame's write closes the entry pushed_on_arm
+	// (onArm is set either way).
 	onArm := map[string]struct{}{}
 	for _, k := range ledgerArmed(armedKeys) {
 		onArm[k] = struct{}{}
 		h.mu.RLock()
-		s.offerRefresh(k, refreshOwed{})
+		s.offerArm(k)
 		h.mu.RUnlock()
 	}
 	// #740 — an arm of a dependent resumes an abandoned stale-retry chain with an
@@ -1026,6 +1070,14 @@ func (s *refreshSub) offerRotated(keys []string) {
 // nobody; this is that frame, once. Same delivery as offerRotated: un-paced,
 // never dropped, only to this connection, and a key waiting in the paced
 // eviction backlog moves onto this path (it is the same frame).
+//
+// #1325 m1 — it is the arm's LAST step, and the handler calls it on every arm
+// (keys may be empty). A key this arm already offered on the refresher path
+// (the #710 owed emit, the #870 ledger arm, or a publish since subscribe) is
+// absorbed: that frame makes the tab refetch bytes at least as new as those
+// BehindKeys compared, so a second frame would only cost a second refetch of
+// the same bytes. Then the arm closes (armOffered = nil): from here on every
+// offer is an ordinary publish, never absorbed by this rule.
 func (s *refreshSub) offerCatchUp(keys []string) {
 	h := s.hub
 	h.mu.RLock()
@@ -1035,11 +1087,18 @@ func (s *refreshSub) offerCatchUp(keys []string) {
 			continue
 		}
 		s.pmu.Lock()
-		delete(s.pending, k)
-		s.offerRefreshLocked(k, refreshOwed{})
+		if _, dup := s.armOffered[k]; !dup {
+			delete(s.pending, k) // off the paced eviction backlog onto this path
+		}
+		offered := s.offerArmLocked(k)
 		s.pmu.Unlock()
-		refreshArmCatchUpTotal.Add(1)
+		if offered {
+			refreshArmCatchUpTotal.Add(1)
+		}
 	}
+	s.pmu.Lock()
+	s.armOffered = nil
+	s.pmu.Unlock()
 }
 
 // offerGatedMoved announces armed gated (identity-free, serve-time-gated) keys
@@ -1238,6 +1297,10 @@ var (
 	// keys whose arm carried a `held` digest (its denominator).
 	refreshArmCatchUpTotal atomic.Uint64
 	refreshArmHeldTotal    atomic.Uint64
+	// refreshArmDuplicateAbsorbedTotal counts arm-time offers (#710 owed emit,
+	// #870 ledger arm, #1324 catch-up) absorbed because the same arm had already
+	// offered the key (#1325 m1): one arm, one frame per key.
+	refreshArmDuplicateAbsorbedTotal atomic.Uint64
 	// refreshGatedViewMovedTotal counts (key -> subscriber) frames for an RBAC
 	// change that moved a gated key's served view with no write (#1328).
 	refreshGatedViewMovedTotal atomic.Uint64
@@ -1328,6 +1391,7 @@ type RefreshBroadcasterStats struct {
 	RotationAnnounced     uint64  `stat:"rotation_announced" desc:"Refresh frames sent at once on an armed key whose identity class moved, so the tab refetches and re-arms under its new key (#819)."`
 	ArmHeld               uint64  `stat:"arm_held" desc:"Armed keys whose /refreshes arm carried a held digest (the X-Snowplow-Refresh-Digest of the tab's /call answer); the denominator of arm_catch_up (#1324)."`
 	ArmCatchUp            uint64  `stat:"arm_catch_up" desc:"Refresh frames sent at once on arm because the tab was behind: its held digest is not the digest of what its /call would answer now, or the cell is gone (#1324)."`
+	ArmDuplicateAbsorbed  uint64  `stat:"arm_duplicate_absorbed" desc:"Arm-time refresh offers (owed-push emit, store-swap ledger arm, catch-up) absorbed because the same arm had already offered that key: one arm writes at most one frame per key (#1325 m1)."`
 	GatedViewMoved        uint64  `stat:"gated_view_moved" desc:"Refresh frames for an RBAC change that moved what a tab is served from a gated (identity-free, serve-time-gated) key while its stored bytes did not: no write announces it (#1328)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
@@ -1365,6 +1429,7 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		RotationAnnounced:     refreshRotationAnnouncedTotal.Load(),
 		ArmHeld:               refreshArmHeldTotal.Load(),
 		ArmCatchUp:            refreshArmCatchUpTotal.Load(),
+		ArmDuplicateAbsorbed:  refreshArmDuplicateAbsorbedTotal.Load(),
 		GatedViewMoved:        refreshGatedViewMovedTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
@@ -1481,6 +1546,7 @@ func resetRefreshBroadcasterForTest() {
 	refreshEvictPublishedTotal.Store(0)
 	refreshRotationAnnouncedTotal.Store(0)
 	refreshArmCatchUpTotal.Store(0)
+	refreshArmDuplicateAbsorbedTotal.Store(0)
 	refreshGatedViewMovedTotal.Store(0)
 	refreshArmHeldTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
