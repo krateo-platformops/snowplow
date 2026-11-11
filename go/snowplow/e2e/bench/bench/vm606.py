@@ -89,6 +89,14 @@ THE VM (up).
     conditional bindings; no unconditional one) and then waits for the bootstrap again. Anything
     missing or different refuses and changes nothing (down, then a new --run). Any other record is a
     run in use. push-secret and launch refuse a run whose record holds no verified bootstrap.
+  - AS MADE. Wherever an existing resource is trusted (resume, down, push-secret, launch, status,
+    fetch, and right after up creates it), it is read back field for field against what up's create
+    commands set: FIREWALL_FIELDS / INSTANCE_FIELDS map each describe field to the create flags that
+    set it (a test checks that the flags of firewall_create_argv and create_command are exactly
+    these), plus the defaults up relies on (a rule enabled, selecting by source range and target tag
+    only). A disabled deny rule, a rule on another network or for other service accounts, the VM on
+    another service account, OS Login or project-key blocking switched off, an added ssh-keys item:
+    each refuses, naming the field, and changes nothing.
 
 ON THE VM, NOTHING NAMES THE OPERATOR. An OS Login home is /home/<the operator's account, as a POSIX
 name>, so no remote path this module prints or stores may sit under it. Every remote step runs in
@@ -973,6 +981,170 @@ def create_command(run: str, project: str, zone: str, ttl_hours: int, startup_fi
             "--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"]
 
 
+# ─── as made: every field up's create commands set, read back wherever a resource is trusted ───────
+# (#1331 review: a read-back of a hand-picked subset let a disabled deny rule, a VM on the node SA, or
+# OS Login switched off, read as "as up made them".) Each table maps a field of gcloud's `describe` to
+# the create flags that set it; () is a default up relies on that no flag sets (a rule is enabled, and
+# selects by source range and target tag only). tests/test_vm606.py checks that the flags of
+# firewall_create_argv and create_command are exactly the tables' flags.
+COMPUTE_API = "https://www.googleapis.com/compute/v1"
+SCOPES = {"cloud-platform": "https://www.googleapis.com/auth/cloud-platform"}
+TCP_22 = [{"IPProtocol": "tcp", "ports": ["22"]}]
+FIREWALL_FIELDS = {
+    "name": ("<name>",), "network": ("--project", "--network"), "direction": ("--direction",),
+    "allowed/denied": ("--action", "--rules"), "sourceRanges": ("--source-ranges",),
+    "targetTags": ("--target-tags",), "priority": ("--priority",), "description": ("--description",),
+    "disabled": (), "sourceTags": (), "sourceServiceAccounts": (), "targetServiceAccounts": (),
+    "destinationRanges": (),
+}
+INSTANCE_FIELDS = {
+    "name": ("<name>",), "zone": ("--project", "--zone"), "machineType": ("--machine-type",),
+    "boot image": ("--image-family", "--image-project"),
+    "boot disk": ("--boot-disk-size", "--boot-disk-type", "--boot-disk-auto-delete"),
+    "serviceAccounts": ("--service-account", "--scopes"), "network": ("--network",), "tags": ("--tags",),
+    "labels": ("--labels",), "metadata": ("--metadata", "--metadata-from-file"),
+    "terminationTime": ("--termination-time",), "instanceTerminationAction": ("--instance-termination-action",),
+    "shieldedInstanceConfig": ("--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring"),
+}
+
+
+def _network_url(project: str) -> str:
+    return f"{COMPUTE_API}/projects/{project}/global/networks/{NETWORK}"
+
+
+def firewall_want(fw: str, rule: dict, project: str) -> dict:
+    """The rule as firewall_create_argv makes it, in describe's shape (FIREWALL_FIELDS)."""
+    return {"name": fw, "network": _network_url(project), "direction": "INGRESS",
+            "allowed/denied": {"allowed": TCP_22 if rule["action"] == "ALLOW" else [],
+                               "denied": TCP_22 if rule["action"] == "DENY" else []},
+            "sourceRanges": sorted(rule["sourceRanges"]), "targetTags": sorted(rule["targetTags"]),
+            "priority": rule["priority"], "description": rule["description"], "disabled": False,
+            "sourceTags": [], "sourceServiceAccounts": [], "targetServiceAccounts": [], "destinationRanges": []}
+
+
+def firewall_view(r: dict) -> dict:
+    return {"name": r.get("name"), "network": r.get("network"), "direction": r.get("direction"),
+            "allowed/denied": {"allowed": r.get("allowed") or [], "denied": r.get("denied") or []},
+            "sourceRanges": sorted(r.get("sourceRanges") or []), "targetTags": sorted(r.get("targetTags") or []),
+            "priority": r.get("priority"), "description": r.get("description"),
+            "disabled": r.get("disabled") is not False,
+            **{k: sorted(r.get(k) or []) for k in ("sourceTags", "sourceServiceAccounts", "targetServiceAccounts",
+                                                    "destinationRanges")}}
+
+
+def _utc(t) -> str | None:
+    try:
+        return _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None if t is None else str(t)
+
+
+def instance_want(run: str, st: dict) -> dict:
+    """The VM as create_command makes it for the run's record, in describe's shape (INSTANCE_FIELDS)."""
+    name, project, zone = vm_name(run), st["project"], st["zone"]
+    zurl = f"{COMPUTE_API}/projects/{project}/zones/{zone}"
+    return {"name": name, "zone": zurl, "machineType": f"{zurl}/machineTypes/{MACHINE_TYPE}",
+            "boot image": {"project": IMAGE_PROJECT, "family": IMAGE_FAMILY},
+            "boot disk": {"disks": 1, "boot": True, "autoDelete": True, "source": f"{zurl}/disks/{name}",
+                          "sizeGb": str(BOOT_DISK_GB), "type": f"{zurl}/diskTypes/{BOOT_DISK_TYPE}"},
+            "serviceAccounts": [{"email": "the orchestrator SA", "scopes": [SCOPES["cloud-platform"]]}],
+            "network": [{"network": _network_url(project), "accessConfigs": ["ONE_TO_ONE_NAT"]}],
+            "tags": [name],
+            "labels": {"owner": OWNER, "run": run, "ttl-hours": str(st.get("ttl_hours"))},
+            "metadata": {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE", "startup-script": startup_script()},
+            "terminationTime": _utc(st.get("terminates_at")), "instanceTerminationAction": "DELETE",
+            "shieldedInstanceConfig": {"enableSecureBoot": True, "enableVtpm": True, "enableIntegrityMonitoring": True}}
+
+
+def _account(email: str | None, project: str, number: str | None) -> str:
+    """A service account by its role, never its address (output passes no email)."""
+    if email == sa_email(project):
+        return "the orchestrator SA"
+    if number and email == node_sa(number):
+        return "the GKE node SA"
+    return "another account"
+
+
+def instance_view(inst: dict, disk: dict | None, image: dict | None, project: str, number: str | None) -> dict:
+    """labels: the keys up sets (a label grants nothing); metadata: every item (an ssh-keys item, another
+    startup script or OS Login switched off each change who gets in); a service account by its role."""
+    disks = inst.get("disks") or []
+    d0 = disks[0] if disks else {}
+    labels = inst.get("labels") or {}
+    sched = inst.get("scheduling") or {}
+    return {"name": inst.get("name"), "zone": inst.get("zone"), "machineType": inst.get("machineType"),
+            "boot image": {"project": (re.search(r"/projects/([^/]+)/global/images/", str((disk or {}).get(
+                "sourceImage", ""))) or [None, None])[1], "family": (image or {}).get("family")},
+            "boot disk": {"disks": len(disks), "boot": d0.get("boot"), "autoDelete": d0.get("autoDelete"),
+                          "source": d0.get("source"), "sizeGb": (disk or {}).get("sizeGb"),
+                          "type": (disk or {}).get("type")},
+            "serviceAccounts": [{"email": _account(a.get("email"), project, number),
+                                 "scopes": sorted(a.get("scopes") or [])}
+                                for a in inst.get("serviceAccounts") or []],
+            "network": [{"network": n.get("network"), "accessConfigs": [c.get("type") for c in n.get("accessConfigs")
+                                                                         or []]}
+                        for n in inst.get("networkInterfaces") or []],
+            "tags": sorted((inst.get("tags") or {}).get("items") or []),
+            "labels": {k: labels.get(k) for k in ("owner", "run", "ttl-hours")},
+            "metadata": {i.get("key"): i.get("value") for i in (inst.get("metadata") or {}).get("items") or []},
+            "terminationTime": _utc(sched.get("terminationTime")),
+            "instanceTerminationAction": sched.get("instanceTerminationAction"),
+            "shieldedInstanceConfig": {k: (inst.get("shieldedInstanceConfig") or {}).get(k)
+                                       for k in ("enableSecureBoot", "enableVtpm", "enableIntegrityMonitoring")}}
+
+
+def _short(v) -> str:
+    t = redact_identity(json.dumps(v, sort_keys=True))
+    return t if len(t) <= 100 else t[:97] + "..."
+
+
+def _diff(what: str, got: dict, want: dict) -> list[str]:
+    """Each field that differs, named; a mapping field names its differing keys (never a whole startup script)."""
+    out = []
+    for k, w in want.items():
+        g = got.get(k)
+        if g == w:
+            continue
+        if isinstance(w, dict) and isinstance(g, dict):
+            keys = sorted(x for x in {*w, *g} if g.get(x) != w.get(x))
+            out.append(f"{what} {k}: " + ", ".join(
+                f"{x} {_short(g.get(x)) if x != 'startup-script' else '(differs)'}, up made "
+                f"{_short(w.get(x)) if x != 'startup-script' else 'its own'}" for x in keys))
+        else:
+            out.append(f"{what} {k}: {_short(g)}, up made {_short(w)}")
+    return out
+
+
+def instance_as_made(run: str, st: dict, inst: dict) -> list[str]:
+    """What of the run's VM differs from what up made (its boot disk and its image read too); empty when none."""
+    project, zone = st["project"], st["zone"]
+    disks = inst.get("disks") or []
+    d = str((disks[0] if disks else {}).get("source", "")).rsplit("/", 1)[-1]
+    disk = _get(["compute", "disks", "describe", d, *_where(project, zone)],
+                f"projects/{project}/zones/{zone}/disks/{d}", f"disk {d}") if d else None
+    image = None
+    m = re.search(r"/projects/([^/]+)/global/images/([^/]+)$", str((disk or {}).get("sourceImage", "")))
+    if m:
+        image = _get(["compute", "images", "describe", m[2], "--project", m[1]],
+                     f"projects/{m[1]}/global/images/{m[2]}", f"image {m[2]}")
+    return _diff(f"instance {vm_name(run)}", instance_view(inst, disk, image, project, st.get("project_number")),
+                 instance_want(run, st))
+
+
+def rule_as_made(run: str, fw: str, r: dict, project: str) -> list[str]:
+    return _diff(f"firewall rule {fw}", firewall_view(r), firewall_want(fw, firewall_rules(run)[fw], project))
+
+
+def _trusted(run: str, st: dict, inst: dict) -> dict:
+    """The run's instance, vm606's (_owned) and every field as up made it: anything else refuses."""
+    _owned(inst, run)
+    off = instance_as_made(run, st, inst)
+    if off:
+        raise Refused(f"{vm_name(run)} is not as up made it: {'; '.join(off)}: refusing; nothing was changed")
+    return inst
+
+
 VM_FOOTPRINT = (("INSTANCES", 1, "the VM", ""),
                 ("E2_CPUS", VM_VCPUS, f"its {MACHINE_TYPE}", ""),
                 ("SSD_TOTAL_GB", BOOT_DISK_GB, f"its {BOOT_DISK_TYPE} boot disk", " GB"),
@@ -1028,22 +1200,6 @@ def resumable(st: dict, run: str) -> bool:
                 and not any(st.get(k) for k in ("secret_pushed_at", "launched_at", "deleted_at")))
 
 
-def _same_time(a: str, b: str) -> bool:
-    try:
-        return (_dt.datetime.fromisoformat(str(a).replace("Z", "+00:00"))
-                == _dt.datetime.fromisoformat(str(b).replace("Z", "+00:00")))
-    except ValueError:
-        return False
-
-
-def _rule_as_made(r: dict, want: dict) -> bool:
-    key = "denied" if want["action"] == "DENY" else "allowed"
-    return (r.get("direction") == "INGRESS" and r.get("priority") == want["priority"]
-            and sorted(r.get("sourceRanges") or []) == sorted(want["sourceRanges"])
-            and r.get(key) == [{"IPProtocol": "tcp", "ports": ["22"]}]
-            and not r.get("allowed" if key == "denied" else "denied"))
-
-
 def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
     """Everything up makes for `run`, read back against its record: the instance (named, labelled, tagged, its
     termination time and action, the only one claiming the run in any zone), both SSH rules exactly as made,
@@ -1055,23 +1211,16 @@ def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
         off.append(f"instance {name} answers NotFound in {zone}")
     else:
         _owned(inst, run)
-        if (inst.get("labels") or {}).get("ttl-hours") != str(st.get("ttl_hours")):
-            off.append(f"{name}'s ttl-hours label is not the record's {st.get('ttl_hours')}")
-        if (inst.get("tags") or {}).get("items") != [name]:
-            off.append(f"{name}'s network tags are {(inst.get('tags') or {}).get('items')}, not [{name!r}]")
-        sched = inst.get("scheduling") or {}
-        if not _same_time(sched.get("terminationTime"), st.get("terminates_at")) \
-                or sched.get("instanceTerminationAction") != "DELETE":
-            off.append(f"{name} does not delete itself at the record's {st.get('terminates_at')}")
+        off += instance_as_made(run, st, inst)
     others = [i for i in _instances_of(run, project) if not (i.get("name") == name and _zone_of(i) == zone)]
     if others:
         off.append(f"{_named(others)} claim(s) run {run} too")
-    rules = {r.get("name"): r for r in _run_rules(run, project)}
-    for fw, want in firewall_rules(run).items():
+    rules = {r.get("name"): r for r in _rule_docs(run, project)}
+    for fw in firewall_rules(run):
         if fw not in rules:
             off.append(f"firewall rule {fw} answers NotFound")
-        elif not _rule_as_made(rules[fw], want):
-            off.append(f"firewall rule {fw} is not as up made it")
+        else:
+            off += rule_as_made(run, fw, rules[fw], project)
     off += grants_as_made(run, project, number, roles, st["terminates_at"])
     off += [f"{sa_email(project)} holds {b} unconditionally" for b in unconditional_bindings(project, number)]
     return off
@@ -1150,6 +1299,11 @@ def cmd_up(a) -> int:
         rc, _out, err = gcloud(firewall_create_argv(fw, rule, a.project), dry=not a.yes)
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+    if a.yes:
+        made = {r.get("name") for r in _run_rules(run, a.project)}       # each as made, or it refuses
+        if made != set(firewall_rules(run)):
+            raise Refused(f"firewall rule(s) {sorted(set(firewall_rules(run)) - made)} answer NotFound after their "
+                          f"create; {down_hint(run)}")
     # 3. the VM
     rc, _out, err = gcloud(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at), dry=not a.yes)
     if not a.yes:
@@ -1159,6 +1313,13 @@ def cmd_up(a) -> int:
     if rc != 0:
         raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
     _save_state(run, instance_created_at=time.time())
+    inst = _instance(name, a.project, a.zone)
+    if inst is None:
+        raise Refused(f"{name} answers NotFound in {a.zone} after its create; {down_hint(run)}")
+    try:
+        _trusted(run, _state(run), inst)
+    except Refused as e:
+        raise Refused(f"{e}; {down_hint(run)}") from None
     _say(f"{name} created; it deletes itself (and its disk) at {terminates_at}, when its grants expire")
     wait_for_bootstrap(run, a)
     return 0
@@ -1256,7 +1417,7 @@ echo "VM606_DIR_MODE=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os
         _say(f"DRY: on {name}: chmod 600 {remote_ghcr(run)}; check presence and mode; nothing was copied")
         return 0
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, prep, timeout=300)
     if rc != 0:
         raise _failed("preparing the token's directory on the VM", rc, out, err)
@@ -1479,7 +1640,7 @@ def cmd_launch(a) -> int:
         _say(f"DRY: runs {', '.join(names)}; pair {pair}; clusters in ZONE={a.bench_zone}; nothing was started")
         return 0
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, remote(run, 'umask 077\nmkdir -p "$R/pin"\n'), timeout=300)
     if rc != 0:
         raise _failed("mkdir on the VM", rc, out, err)
@@ -1497,8 +1658,7 @@ def cmd_launch(a) -> int:
     if not (ttl or "").isdigit():
         raise Refused("the dry pass handed gke-up no --ttl-hours (no `bench.gke gke-up ... --ttl-hours N` in any "
                       f"dry-*/run.log under {vm_dir(run)}/dry): how long the run lasts is unknown")
-    inst = _present(name, project, zone)
-    _owned(inst, run)
+    inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
     need = int(ttl) * 3600 + LAUNCH_MARGIN_S
     if left is None or left < need:
@@ -1542,8 +1702,7 @@ def cmd_status(a) -> int:
     name = vm_name(run)
     st, project, zone = _recorded(run)
     _parents(project, zone, st)
-    inst = _present(name, project, zone)
-    _owned(inst, run)
+    inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
     script = remote(run, LAUNCHER_STATE + 'echo "VM606_LAUNCHER=$(launcher_state)"\necho ---\n'
                     f'tail -n {int(a.lines)} "$R/launch.log" 2>/dev/null || true\n', in_dir=False)
@@ -1611,7 +1770,7 @@ def cmd_fetch(a) -> int:
             if dest.exists():
                 raise Refused(f"{dest} exists on the laptop: a fetch never overwrites a run")
     _parents(project, zone, st)
-    _owned(_present(name, project, zone), run)
+    _trusted(run, st, _present(name, project, zone))
     rc, out, err = ssh(name, project, zone, fetch_script(run, st["bench_sha"], names), timeout=3600)
     if rc != 0:
         raise _failed("packing the run on the VM", rc, out, err)
@@ -1694,20 +1853,27 @@ def _list(args: list[str], what: str) -> list[dict]:
     return got
 
 
-def _run_rules(run: str, project: str) -> list[dict]:
+def _rule_docs(run: str, project: str) -> list[dict]:
     """The run's firewall rules that exist, each read by its exact name (`describe`: NotFound for that
     rule is "absent", any other failure refuses; never a list filter, which gcloud can mis-parse into an
-    empty answer with rc 0, #1307 re-review N1); refuses one that is not exactly what up makes."""
+    empty answer with rc 0, #1307 re-review N1)."""
     rows = []
-    for fw, w in firewall_rules(run).items():
+    for fw in firewall_rules(run):
         r = _get(["compute", "firewall-rules", "describe", fw, "--project", project],
                  f"projects/{project}/global/firewalls/{fw}", f"firewall rule {fw}")
-        if r is None:
-            continue
-        if r.get("targetTags") != w["targetTags"] or r.get("description") != w["description"]:
-            raise Refused(f"firewall rule {fw!r} is not one vm606 made for run {run} (target tags "
-                          f"{r.get('targetTags')}, description {r.get('description')!r}): refusing")
-        rows.append(r)
+        if r is not None:
+            rows.append(r)
+    return rows
+
+
+def _run_rules(run: str, project: str) -> list[dict]:
+    """The run's firewall rules that exist; refuses one that is not, field for field, what up makes."""
+    rows = _rule_docs(run, project)
+    for r in rows:
+        off = rule_as_made(run, r.get("name"), r, project)
+        if off:
+            raise Refused(f"firewall rule {r.get('name')!r} is not as vm606 made it for run {run}: {'; '.join(off)}: "
+                          f"refusing; nothing was changed")
     return rows
 
 
@@ -1729,7 +1895,7 @@ def run_in_use(run: str, project: str, number: str) -> list[str]:
         found.append(f"its record {state_dir(run) / 'state.json'}")
     for i in _instances_of(run, project):
         found.append(f"instance {i.get('name')} ({_zone_of(i)})")
-    found += [f"firewall rule {r['name']}" for r in _run_rules(run, project)]
+    found += [f"firewall rule {r['name']}" for r in _rule_docs(run, project)]
     for kind, res in grant_policies(project, number):
         found += [f"binding {role} on {res} under {c.get('title')}"
                   for role, c in run_bindings(_policy(kind, res, project), project, run)]
@@ -1762,7 +1928,7 @@ def cmd_down(a) -> int:
             raise Refused(f"{name} answers NotFound in {zone} (the run's recorded zone), but {_named(claims)} "
                           f"claim(s) run {run} by name or run label: refusing; nothing was changed")
     else:
-        _owned(inst, run)
+        _trusted(run, st, inst)
         others = [i for i in claims if not (i.get("name") == name and _zone_of(i) == zone)]
         if others:
             raise Refused(f"besides {name} ({zone}), {_named(others)} claim(s) run {run} by name or run label: "
