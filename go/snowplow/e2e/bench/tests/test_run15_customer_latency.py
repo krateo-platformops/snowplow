@@ -956,7 +956,8 @@ def test_run606_evaluate_step_succeeds_whatever_the_verdict(tmp_path, verdict, w
         f'exec {real} "$@"\n')
     (bin_ / "python3").chmod(0o755)
     script = ("set -Eeuo pipefail\nlog() { echo \"$*\" >> \"$OUT/run.log\"; }\n"
-              "DRY=0 RUN8_REPORT=1 LOAD_DRIVER=k6 VIEWERS=1 BROWSER_SESSIONS=5 EXPECTED_IMAGE_DIGEST=x\n"
+              # FRONTEND_TAG: run606 always sets it (empty: no frontend override, run 26)
+              "DRY=0 RUN8_REPORT=1 LOAD_DRIVER=k6 VIEWERS=1 BROWSER_SESSIONS=5 EXPECTED_IMAGE_DIGEST=x FRONTEND_TAG=\n"
               # #1051: run606.sh defines the mark beside OUT; s_evaluate writes it
               "VERDICT_MARK=\"$OUT/.verdict-final\"\n"
               + _s_evaluate_body() + "\ns_evaluate\necho step-ok\n")
