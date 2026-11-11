@@ -6,7 +6,7 @@ outcome:
     (home/IDENTITY, the operator's account as a POSIX name); VM_ROOT (/srv/snowplow-bench) is
     <state>/vm/NAME/srv: the fake rewrites that prefix in what it runs and copies, so the module's
     remote scripts carry no test hook;
-  - `compute instances create` records the argv and makes the instance (labels, tags, scheduling
+  - `compute instances create` (FAKE_CREATE_FAIL=1: a 503) records the argv and makes the instance (labels, tags, scheduling
     terminationTime, a boot disk named after it) and its disk; FAKE_BOOTSTRAP (JSON) is written as
     the VM's bootstrap marker at create, as the startup script would;
   - `compute instances | disks describe NAME --zone Z` / `firewall-rules describe NAME`: the resource
@@ -37,7 +37,7 @@ outcome:
   - `compute ssh NAME ... --command CMD` (and scp), for an instance in that --zone only: CMD runs under bash, the script on its stdin, with the
     VM's environment only (HOME = the identity-shaped home, the test's PATH), in a session of its
     own that is hung up (SIGHUP, then SIGTERM to its process group) when the command ends, as sshd
-    does. FAKE_SSH_FAIL=4033|4003|publickey answers as gcloud does when IAP / the firewall / OS Login
+    does. FAKE_SSH_FAIL=4033|4003|4047|4010|4049|publickey answers as gcloud does when IAP / the firewall / OS Login
     refuse, FAKE_SSH_FAIL_TIMES times (default: always). FAKE_TAMPER_AFTER_SSH="<n>:<path under srv>"
     appends a byte to that file when the n-th ssh call ends;
   - `compute scp`: the side written NAME:<path> is on the VM; the bytes are copied (this process is
@@ -88,10 +88,21 @@ DESCRIBE_FAILURES = {
 }
 ZONES = ("europe-west1-b", "europe-west1-c", "europe-west1-d", "europe-west3-a", "europe-west3-b", "europe-west3-c",
          "europe-west4-a", "europe-west4-b", "europe-west4-c")
+# gcloud's start-iap-tunnel ProxyCommand fails with IAP's close code ("Error while connecting [<code>:
+# '<reason>']", gcloud 561 iap_tunnel_websocket.py), and ssh then reports the closed connection, exit 255
+_KEX = "kex_exchange_identification: Connection closed by remote host\nConnection closed by UNKNOWN port 65535\n"
+
+
+def _iap(code: str, reason: str) -> tuple[int, str]:
+    return 255, (f"ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [{code}: '{reason}'].\n" + _KEX)
+
+
 SSH_FAILURES = {
-    "4033": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4033: 'not authorized'].\n"),
-    "4003": (1, "ERROR: (gcloud.compute.start-iap-tunnel) Error while connecting [4003: 'failed to connect to "
-                "backend'].\n"),
+    "4033": _iap("4033", "not authorized"),
+    "4003": _iap("4003", "failed to connect to backend"),
+    "4047": _iap("4047", "Failed to lookup instance"),
+    "4010": _iap("4010", "destination read failed"),
+    "4049": _iap("4049", "a code IAP's table does not list"),
     "publickey": (255, f"{IDENTITY}@compute.123: Permission denied (publickey).\n"),
 }
 
@@ -239,6 +250,9 @@ if a[:3] == ["compute", "firewall-rules", "delete"]:
 # ── instances, disks ──
 if a[:3] == ["compute", "instances", "create"]:
     name = a[3]
+    if os.environ.get("FAKE_CREATE_FAIL") == "1":
+        sys.stderr.write("ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The service is "
+                         "currently unavailable. code=503\n"); sys.exit(1)
     labels = dict(kv.split("=", 1) for kv in opt("--labels").split(","))
     doc = {"name": name, "status": "RUNNING", "labels": labels, "tags": {"items": opt("--tags").split(",")},
            "zone": f"{APIP}/zones/{opt('--zone')}",

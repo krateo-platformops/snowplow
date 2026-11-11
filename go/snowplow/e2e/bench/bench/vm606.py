@@ -11,6 +11,7 @@ judges the VM.
 
     python3 -m bench.vm606 plan-iam                         # the roles, derived from the code; prints only
     python3 -m bench.vm606 up --run R --ttl-hours H [--yes]  # grants, firewall, the VM; waits for its bootstrap
+    python3 -m bench.vm606 up --run R [--yes]                # resumes an up stopped in its bootstrap wait
     python3 -m bench.vm606 push-secret --run R [--yes]       # the ghcr pull-token file, as an opaque file
     python3 -m bench.vm606 launch --run R --bench-sha SHA --env-file F \\
         --pin-manifest M --pin-sha256 HEX [--yes]            # clone at SHA, dry pass, start detached
@@ -74,7 +75,20 @@ THE VM (up).
     (enable-oslogin=TRUE, project keys blocked). `up` refuses while iap.googleapis.com is not enabled.
   - A failed `up` says so and names `down`, which removes whatever up made (grants, rules, VM): the
     SSH wait reads every failure (IAP / firewall / OS Login / ssh) and stops at once on one that
-    waiting cannot fix, never as a silent timeout.
+    waiting cannot fix, never as a silent timeout. An IAP tunnel failure is read by its close code
+    (IAP_CODES, from IAP's own table, https://docs.cloud.google.com/iap/docs/faq#error-codes): 4003
+    (port 22 not answering yet) and 4047 (the instance has not completed its startup: run 24's first
+    up, 2026-11-11) are waited out within --ssh-ready-timeout-s, 4033 (not authorized) and 4010 (the
+    VM closed the connection) stop at once, a code the table does not list is waited out; every
+    refusal names the code, the number only.
+  - RESUMING. An up that stopped in its bootstrap wait (its record: the VM created, its bootstrap
+    never verified, nothing after) is resumed by `up --run R --yes` again, with no --ttl-hours (a
+    --project / --zone / --ttl-hours that is not the record's refuses): it reads back everything up
+    made against the record (the instance, named, labelled, tagged, deleting itself at the record's
+    time and the only one claiming the run; both SSH rules exactly as made; exactly the run's
+    conditional bindings; no unconditional one) and then waits for the bootstrap again. Anything
+    missing or different refuses and changes nothing (down, then a new --run). Any other record is a
+    run in use. push-secret and launch refuse a run whose record holds no verified bootstrap.
 
 ON THE VM, NOTHING NAMES THE OPERATOR. An OS Login home is /home/<the operator's account, as a POSIX
 name>, so no remote path this module prints or stores may sit under it. Every remote step runs in
@@ -371,19 +385,44 @@ def _marker(out: str, key: str) -> str | None:
     return None
 
 
+# IAP TCP forwarding's tunnel close code, as gcloud prints it: "Error while connecting [<code>: '<reason>']"
+# (gcloud 561, api_lib/compute/iap_tunnel_websocket.py: 'Error while connecting [%s].' of the WebSocket's
+# '%r: %r' % (close_code, close_reason)). Only the number is ever printed: the code, not gcloud's text.
+IAP_TUNNEL_CODE = re.compile(r"Error while connecting \[(4\d{3})\b")
+# What each code means, from IAP's own table (IAP FAQ, "Error codes":
+# https://docs.cloud.google.com/iap/docs/faq#error-codes), and whether waiting can fix it on a VM up
+# just made, with its firewall rules: (stage, waiting can fix it)
+IAP_CODES = {
+    # "Connection or firewall issue": "Check that your VM process is running and listening on the expected
+    # port", and that the firewall allows it: sshd not up yet on a booting VM, or a rule just created
+    "4003": ("IAP 4003: IAP reached the VM's network, port 22 did not answer (sshd or the firewall rule not up "
+             "yet)", True),
+    # "Instance doesn't exist or is stopped": "Make sure your VM is powered on and has fully completed its
+    # startup sequence": a VM just created (run 24's first up, 2026-11-11: answered minutes later)
+    "4047": ("IAP 4047: IAP does not find the instance running yet (it has not completed its startup)", True),
+    # "Connection closed by destination": the remedy is to reset the VM
+    "4010": ("IAP 4010: the VM closed the connection (IAP's remedy: reset the VM)", False),
+    # "Permission, existence, or VM state issue": the Tunnel User role (iap.tunnelInstances.accessViaIAP)
+    "4033": ("IAP 4033: not authorized to tunnel to the VM (iap.tunnelInstances.accessViaIAP)", False),
+}
+
+
+def iap_code(err: str | None) -> str | None:
+    m = IAP_TUNNEL_CODE.search(err or "")
+    return m.group(1) if m else None
+
+
 def _failed(what: str, rc: int, out: str, err: str, tail: int = 20) -> Refused:
     lines = [ln for ln in _remote_lines(out) if ln.startswith("vm606:")] or _remote_lines(out)[-tail:]
     body = ("\n  " + "\n  ".join(lines[-tail:])) if lines else ""
-    return Refused(f"{what} failed (rc={rc}; gcloud: {error_summary(err)}){body}")
+    code = iap_code(err)
+    iap = f"; IAP tunnel code {code}" if code else ""
+    return Refused(f"{what} failed (rc={rc}; gcloud: {error_summary(err)}{iap}){body}")
 
 
-# gcloud compute ssh --tunnel-through-iap: which stage refused, from its stderr (never printed: an OS
-# Login refusal names the POSIX user). (pattern, stage, waiting can fix it)
+# gcloud compute ssh --tunnel-through-iap, a failure without an IAP code: which stage refused, from its
+# stderr (never printed: an OS Login refusal names the POSIX user). (pattern, stage, waiting can fix it)
 SSH_STAGES = (
-    (re.compile(r"\b4033\b|not authorized"), "IAP: the tunnel was refused (iap.tunnelInstances.accessViaIAP)", False),
-    (re.compile(r"\b4047\b|\b4049\b|iap\.googleapis\.com"), "IAP: the API refused the tunnel", False),
-    (re.compile(r"\b4003\b|failed to connect to backend"),
-     "firewall / sshd: IAP reached the network, port 22 did not answer (the VM may still be booting)", True),
     (re.compile(r"Permission denied \(publickey"), "OS Login: the key was refused (compute.osAdminLogin)", False),
     (re.compile(r"Could not fetch resource|was not found|code=404"), "the instance: GCE does not know it", False),
     (re.compile(r"Connection (refused|reset|closed|timed out)|timed out after|kex_exchange"),
@@ -392,6 +431,11 @@ SSH_STAGES = (
 
 
 def ssh_stage(rc: int, err: str) -> tuple[str, bool]:
+    """(stage, waiting can fix it). An IAP tunnel code decides first (ssh's own "connection closed" follows
+    every tunnel failure); a code IAP's table does not list is waited out, and named."""
+    code = iap_code(err)
+    if code:
+        return IAP_CODES.get(code, (f"IAP {code}: a tunnel code IAP's table does not list", True))
     for rx, stage, transient in SSH_STAGES:
         if rx.search(err or ""):
             return stage, transient
@@ -719,6 +763,18 @@ def _cond_file(run: str, cond: dict, tag: str) -> str:
     return str(p)
 
 
+def grants_as_made(run: str, project: str, number: str, roles: list[str], terminates_at: str) -> list[str]:
+    """What differs between the bindings held under the run's title and exactly the ones up grants (each target,
+    under the run's condition, nothing else): empty when they are the same."""
+    cond = iam_condition(run, terminates_at)
+    want = {(res, role, cond["title"], cond["expression"]) for _k, res, role in grant_targets(project, number, roles)}
+    held = {(res, role, c.get("title"), c.get("expression")) for kind, res in grant_policies(project, number)
+            for role, c in run_bindings(_policy(kind, res, project), project, run)}
+    return ([f"{role} on {res} is not held under the condition {expr!r}" for res, role, _t, expr in sorted(want - held)]
+            + [f"{role} on {res} is held under {t} with {expr!r}, which up does not grant"
+               for res, role, t, expr in sorted(held - want)])
+
+
 def grant(run: str, project: str, number: str, roles: list[str], terminates_at: str, *, dry: bool) -> None:
     cond = iam_condition(run, terminates_at)
     f = _cond_file(run, cond, "grant")
@@ -730,12 +786,9 @@ def grant(run: str, project: str, number: str, roles: list[str], terminates_at: 
     if dry:
         _say(f"DRY: would read both policies back and verify {len(targets)} bindings under the condition {cond}")
         return
-    policies = {(k, r): _policy(k, r, project) for k, r in {(k, r) for k, r, _ in targets}}
-    for kind, res, role in targets:
-        held = [c for r, c in run_bindings(policies[(kind, res)], project, run) if r == role]
-        if not any(c.get("expression") == cond["expression"] and c.get("title") == cond["title"] for c in held):
-            raise Refused(f"{role} on {res} is not held under the condition {cond['expression']!r} after the grant; "
-                          f"{down_hint(run)}")
+    off = grants_as_made(run, project, number, roles, terminates_at)
+    if off:
+        raise Refused(f"after the grant, {'; '.join(off)}; {down_hint(run)}")
     _say(f"granted and read back: {len(targets)} bindings of {sa_email(project)}, each under condition "
          f"{cond['title']}: {cond['expression']}")
 
@@ -867,6 +920,14 @@ mv "$M/bootstrap.json.tmp" "$M/bootstrap.json"
 """
 
 
+def _bootstrapped(st: dict, run: str) -> None:
+    """push-secret and launch act only on a VM whose bootstrap up verified (the record's `bootstrap`)."""
+    got = st.get("bootstrap")
+    if not isinstance(got, dict) or bootstrap_mismatch(got):
+        raise Refused(f"run {run}'s record holds no verified bootstrap of {vm_name(run)}: "
+                      f"`python3 -m bench.vm606 up --run {run} --yes` resumes its bootstrap wait")
+
+
 def bootstrap_mismatch(got: dict) -> list[str]:
     want = {"kubectl": KUBECTL_VERSION, "helm": HELM_VERSION, "gcloud": GCLOUD_APT_VERSION.split("-")[0]}
     bad = [f"{k} {got.get(k)!r}, want {v!r}" for k, v in want.items() if got.get(k) != v]
@@ -944,28 +1005,123 @@ def vm_quota_check(project: str, zone: str) -> tuple[list[str], list[str]]:
     return fits, refusals
 
 
-def cmd_up(a) -> int:
-    run = check_run(a.run)
-    if not 1 <= a.ttl_hours <= MAX_TTL_HOURS:
-        raise Refused(f"--ttl-hours {a.ttl_hours}: 1 to {MAX_TTL_HOURS} (the run's own TTL + the hours fetch may wait)")
-    name = vm_name(run)
-    found = scan(BENCH_DIR)
-    if found["uncovered"]:
-        raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
-    roles = list(plan(found))
-    number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
-    rc, out, err = gcloud(["services", "list", "--enabled", "--project", a.project, "--format", "json"], quiet=True)
+def _project_ready(project: str) -> None:
+    """IAP enabled (the VM is reached through it only) and the orchestrator SA there."""
+    rc, out, err = gcloud(["services", "list", "--enabled", "--project", project, "--format", "json"], quiet=True)
     enabled = gke._json(out) if rc == 0 else None
     if not isinstance(enabled, list):
         raise Refused(f"could not read whether IAP is enabled (rc={rc}; {error_summary(err)})")
     if "iap.googleapis.com" not in {(x.get("config") or {}).get("name") for x in enabled}:
-        raise Refused(f"iap.googleapis.com is not enabled in {a.project}: the VM is reached through IAP only "
-                      f"(gcloud services enable iap.googleapis.com --project {a.project})")
-    rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(a.project), "--project", a.project,
+        raise Refused(f"iap.googleapis.com is not enabled in {project}: the VM is reached through IAP only "
+                      f"(gcloud services enable iap.googleapis.com --project {project})")
+    rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
-    if rc != 0 or out.strip() != sa_email(a.project):
-        raise Refused(f"the orchestrator SA {sa_email(a.project)} could not be read (rc={rc}; {error_summary(err)}): "
+    if rc != 0 or out.strip() != sa_email(project):
+        raise Refused(f"the orchestrator SA {sa_email(project)} could not be read (rc={rc}; {error_summary(err)}): "
                       f"create it (plan-iam prints the command)")
+
+
+def resumable(st: dict, run: str) -> bool:
+    """up stopped in its bootstrap wait: its record says the VM was created, and nothing after (no verified
+    bootstrap, no secret, no launch, no down)."""
+    return bool(st.get("vm") == vm_name(run) and st.get("instance_created_at") and not st.get("bootstrap")
+                and not any(st.get(k) for k in ("secret_pushed_at", "launched_at", "deleted_at")))
+
+
+def _same_time(a: str, b: str) -> bool:
+    try:
+        return (_dt.datetime.fromisoformat(str(a).replace("Z", "+00:00"))
+                == _dt.datetime.fromisoformat(str(b).replace("Z", "+00:00")))
+    except ValueError:
+        return False
+
+
+def _rule_as_made(r: dict, want: dict) -> bool:
+    key = "denied" if want["action"] == "DENY" else "allowed"
+    return (r.get("direction") == "INGRESS" and r.get("priority") == want["priority"]
+            and sorted(r.get("sourceRanges") or []) == sorted(want["sourceRanges"])
+            and r.get(key) == [{"IPProtocol": "tcp", "ports": ["22"]}]
+            and not r.get("allowed" if key == "denied" else "denied"))
+
+
+def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
+    """Everything up makes for `run`, read back against its record: the instance (named, labelled, tagged, its
+    termination time and action, the only one claiming the run in any zone), both SSH rules exactly as made,
+    exactly the run's conditional bindings, and no unconditional one. What differs; empty when all is."""
+    name, project, zone = vm_name(run), st["project"], st["zone"]
+    off = []
+    inst = _instance(name, project, zone)
+    if inst is None:
+        off.append(f"instance {name} answers NotFound in {zone}")
+    else:
+        _owned(inst, run)
+        if (inst.get("labels") or {}).get("ttl-hours") != str(st.get("ttl_hours")):
+            off.append(f"{name}'s ttl-hours label is not the record's {st.get('ttl_hours')}")
+        if (inst.get("tags") or {}).get("items") != [name]:
+            off.append(f"{name}'s network tags are {(inst.get('tags') or {}).get('items')}, not [{name!r}]")
+        sched = inst.get("scheduling") or {}
+        if not _same_time(sched.get("terminationTime"), st.get("terminates_at")) \
+                or sched.get("instanceTerminationAction") != "DELETE":
+            off.append(f"{name} does not delete itself at the record's {st.get('terminates_at')}")
+    others = [i for i in _instances_of(run, project) if not (i.get("name") == name and _zone_of(i) == zone)]
+    if others:
+        off.append(f"{_named(others)} claim(s) run {run} too")
+    rules = {r.get("name"): r for r in _run_rules(run, project)}
+    for fw, want in firewall_rules(run).items():
+        if fw not in rules:
+            off.append(f"firewall rule {fw} answers NotFound")
+        elif not _rule_as_made(rules[fw], want):
+            off.append(f"firewall rule {fw} is not as up made it")
+    off += grants_as_made(run, project, number, roles, st["terminates_at"])
+    off += [f"{sa_email(project)} holds {b} unconditionally" for b in unconditional_bindings(project, number)]
+    return off
+
+
+def resume_up(run: str, st: dict, a, roles: list[str]) -> int:
+    """up again on a run whose up stopped in its bootstrap wait: its project, zone and TTL are the record's (a
+    flag that differs refuses); everything up made is read back against the record; then the wait resumes."""
+    name = vm_name(run)
+    for flag, got, rec in (("--project", a.project, st.get("project")), ("--zone", a.zone, st.get("zone")),
+                           ("--ttl-hours", a.ttl_hours, st.get("ttl_hours"))):
+        if got is not None and got != rec:
+            raise Refused(f"{flag} {got} is not run {run}'s recorded {rec}: a resumed up is the recorded one")
+    _st, project, zone = _recorded(run)
+    number = _parents(project, zone, st)
+    _project_ready(project)
+    off = made_by_up(run, st, roles, number)
+    if off:
+        raise Refused(f"run {run}'s up stopped before its bootstrap was verified, and not everything is as up made "
+                      f"it: {'; '.join(off)}. Nothing was changed; {down_hint(run)}, and a new launch takes a new "
+                      f"--run")
+    _say(f"run {run}: {name} ({zone}), its 2 SSH rules and its {len(grant_targets(project, number, roles))} "
+         f"conditional bindings read back as up made them; resuming the bootstrap wait")
+    if not a.yes:
+        _say(f"DRY: would wait for {BOOTSTRAP_MARKER} on {name}; nothing was changed")
+        return 0
+    a.project, a.zone = project, zone
+    wait_for_bootstrap(run, a)
+    return 0
+
+
+def cmd_up(a) -> int:
+    run = check_run(a.run)
+    name = vm_name(run)
+    st = _state(run)
+    if not resumable(st, run):
+        if a.ttl_hours is None:
+            raise Refused("--ttl-hours: required for a new run")
+        if not 1 <= a.ttl_hours <= MAX_TTL_HOURS:
+            raise Refused(f"--ttl-hours {a.ttl_hours}: 1 to {MAX_TTL_HOURS} (the run's own TTL + the hours fetch may "
+                          f"wait)")
+    found = scan(BENCH_DIR)
+    if found["uncovered"]:
+        raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
+    roles = list(plan(found))
+    if resumable(st, run):
+        return resume_up(run, st, a, roles)
+    a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
+    number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
+    _project_ready(a.project)
     used = run_in_use(run, a.project, number)
     if used:
         raise Refused(f"run {run} is in use: {'; '.join(used)}. `down --run {run}` removes what vm606 made; a new "
@@ -1002,9 +1158,15 @@ def cmd_up(a) -> int:
         return 0
     if rc != 0:
         raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+    _save_state(run, instance_created_at=time.time())
     _say(f"{name} created; it deletes itself (and its disk) at {terminates_at}, when its grants expire")
     wait_for_bootstrap(run, a)
     return 0
+
+
+def resume_hint(run: str) -> str:
+    return (f"`python3 -m bench.vm606 up --run {run} --yes` resumes this wait (it reads back everything up made "
+            f"first), or {down_hint(run)}")
 
 
 def wait_for_bootstrap(run: str, a) -> None:
@@ -1021,10 +1183,10 @@ def wait_for_bootstrap(run: str, a) -> None:
             stage, transient = ssh_stage(rc, err)
             if not transient:
                 raise Refused(f"SSH to {name} failed at {stage}; the VM is up and billing until its TTL: "
-                              f"{down_hint(run)}")
+                              f"{resume_hint(run)}")
             if not reached and now >= a.ssh_ready_timeout_s:
                 raise Refused(f"SSH to {name} never answered in {a.ssh_ready_timeout_s} s, last at {stage}; the VM "
-                              f"is up and billing until its TTL: {down_hint(run)}")
+                              f"is up and billing until its TTL: {resume_hint(run)}")
         else:
             reached = True
             try:
@@ -1041,7 +1203,7 @@ def wait_for_bootstrap(run: str, a) -> None:
         if now >= a.bootstrap_timeout_s:
             raise Refused(f"{name}'s bootstrap did not finish in {a.bootstrap_timeout_s} s ({BOOTSTRAP_MARKER} "
                           f"absent; SSH {'answers' if reached else 'never answered'}; the startup script's log: "
-                          f"sudo journalctl -u google-startup-scripts on the VM); {down_hint(run)}")
+                          f"sudo journalctl -u google-startup-scripts on the VM); {resume_hint(run)}")
         time.sleep(a.poll_s)
 
 
@@ -1071,6 +1233,7 @@ def cmd_push_secret(a) -> int:
     run = check_run(a.run)
     name = vm_name(run)
     st, project, zone = _recorded(run)
+    _bootstrapped(st, run)
     local = os.path.expanduser("~/" + GHCR_FILE_REL)
     _local_secret(local)
     _say(f"local {local}: present, mode 0600")
@@ -1302,6 +1465,7 @@ def cmd_launch(a) -> int:
     pair = pair_name(env)
     names = [env[f"RUN_NAME_{x}"] for x in labels]
     st, project, zone = _recorded(run)
+    _bootstrapped(st, run)
     remote_pin = f"{vm_dir(run)}/pin/{pin.name}"
     prep = prepare_script(run, a.bench_sha, a.repo_url, env, pin.name, got, pair)
     go = launch_script(run, a.bench_sha, env, labels, pin.name, got, pair, a.started_timeout_s)
@@ -1668,8 +1832,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--run", required=True, help=f"the launch's name; the VM is {VM_PREFIX}<run>")
         if place:
             # up only: every later subcommand reads the run's project and zone from up's record, never a flag
-            p.add_argument("--project", default=DEFAULT_PROJECT)
-            p.add_argument("--zone", default=DEFAULT_ZONE, type=_zone, help="the VM's zone (recorded for the run)")
+            p.add_argument("--project", default=None, help=f"default {DEFAULT_PROJECT} (a resumed up: the record's)")
+            p.add_argument("--zone", default=None, type=_zone,
+                           help=f"the VM's zone, recorded for the run; default {DEFAULT_ZONE} (a resumed up: the "
+                                f"record's)")
         if yes:
             p.add_argument("--yes", action="store_true", help="actually do it (default: dry run)")
 
@@ -1681,7 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("up", help="the run's grants and SSH rules, the VM; wait for its bootstrap")
     common(p, place=True)
-    p.add_argument("--ttl-hours", type=int, required=True,
+    p.add_argument("--ttl-hours", type=int, default=None,
                    help="the VM deletes itself, and its grants expire, after this: the run's TTL + the hours fetch "
                         "may wait")
     p.add_argument("--ssh-ready-timeout-s", type=int, default=300,
