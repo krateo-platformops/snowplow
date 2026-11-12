@@ -26,9 +26,9 @@ func (s *Server) review(c *reqCtx) error {
 	if mt != "" && mt != "application/json" && mt != "application/vnd.kubernetes.protobuf" {
 		return unsupportedMediaType(s.bodyTypes(c))
 	}
-	obj, _, err := scheme.Codecs.UniversalDeserializer().Decode(body, nil, nil)
+	obj, bodyKind, err := scheme.Codecs.UniversalDeserializer().Decode(body, nil, nil)
 	if err != nil {
-		return apierrors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized: %v", err))
+		return transformDecodeError(c, bodyKind, body, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

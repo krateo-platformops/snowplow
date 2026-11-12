@@ -218,7 +218,10 @@ func (s *Server) validateCustomResource(c *reqCtx, obj, old map[string]any) erro
 		}
 	}
 	if len(errs) > 0 {
-		return apierrors.NewInvalid(schema.GroupKind{Group: info.group, Kind: info.kind}, c.name, errs)
+		// Named by the object's own metadata.name, as rest/create.go:130 and update.go:156 do: on a
+		// create the URL has no name.
+		name, _ := meta(obj)["name"].(string)
+		return apierrors.NewInvalid(schema.GroupKind{Group: info.group, Kind: info.kind}, name, errs)
 	}
 	return nil
 }

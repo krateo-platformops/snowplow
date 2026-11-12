@@ -3,6 +3,7 @@
 package fakeapiserver
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -36,16 +37,44 @@ func fieldValidation(c *reqCtx) (string, error) {
 
 func strictDecoding(fv string) bool { return fv == "Warn" || fv == "Strict" }
 
-// decodeError is a create or update body that did not decode, as transformDecodeError
-// (rest.go:245-256) words it.
-func decodeError(c *reqCtx, obj map[string]any, err error) error {
+// transformDecodeError is rest.go:245-256: a create or update body that did not decode, named by the
+// kind the decoder read from it when it read one, else summarised (summarizeData, rest.go:355-370).
+func transformDecodeError(c *reqCtx, gvk *schema.GroupVersionKind, body []byte, err error) error {
+	if gvk != nil && len(gvk.Kind) > 0 {
+		return apierrors.NewBadRequest(fmt.Sprintf("%s in version %q cannot be handled as a %s: %v", gvk.Kind, gvk.Version, c.api.Kind, err))
+	}
+	return apierrors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized (must be of type %s): %v (%s)", c.api.Kind, err, summarizeData(body, 30)))
+}
+
+// summarizeData is rest.go:355-370.
+func summarizeData(data []byte, maxLength int) string {
+	switch {
+	case len(data) == 0:
+		return "<empty>"
+	case data[0] == '{':
+		if len(data) > maxLength {
+			return string(data[:maxLength]) + " ..."
+		}
+		return string(data)
+	default:
+		if len(data) > maxLength {
+			return hex.EncodeToString(data[:maxLength]) + " ..."
+		}
+		return hex.EncodeToString(data)
+	}
+}
+
+// decodeError is transformDecodeError for a decoded custom resource body: its kind is the one in
+// the object.
+func decodeError(c *reqCtx, obj map[string]any, body []byte, err error) error {
+	var gvk *schema.GroupVersionKind
 	if v, _ := obj["apiVersion"].(string); v != "" {
 		if k, _ := obj["kind"].(string); k != "" {
 			gv, _ := schema.ParseGroupVersion(v)
-			return apierrors.NewBadRequest(fmt.Sprintf("%s in version %q cannot be handled as a %s: %v", k, gv.Version, c.api.Kind, err))
+			gvk = &schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: k}
 		}
 	}
-	return apierrors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized (must be of type %s): %v", c.api.Kind, err))
+	return transformDecodeError(c, gvk, body, err)
 }
 
 // patchDecodeError is a patched object that did not decode (patch.go:339-347): 422 on "patch".
@@ -87,7 +116,7 @@ func patchStrictErrors(fv, patchType string, body []byte) ([]error, error) {
 // strictOutcome answers a write's strict decoding errors per fieldValidation: Warn as one Warning
 // header each, Strict as the handler's error (a create or update body: 400 through
 // transformDecodeError; a patch: 422 on "patch", patch.go:348-366). Ignore never has any.
-func strictOutcome(c *reqCtx, fv string, obj map[string]any, patched []byte, errs []error) error {
+func strictOutcome(c *reqCtx, fv string, obj map[string]any, body, patched []byte, errs []error) error {
 	if len(errs) == 0 || !strictDecoding(fv) {
 		return nil
 	}
@@ -99,7 +128,7 @@ func strictOutcome(c *reqCtx, fv string, obj map[string]any, patched []byte, err
 	if c.verb == "patch" {
 		return patchDecodeError(patched, sde)
 	}
-	return decodeError(c, obj, sde)
+	return decodeError(c, obj, body, sde)
 }
 
 // addStrictDecodingWarnings is rest.go:419-446 with the warning recorder's header (k8s.io/apiserver

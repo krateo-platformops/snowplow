@@ -106,12 +106,12 @@ func (s *Server) decodeObject(c *reqCtx, body []byte, fv string) (map[string]any
 		return nil, nil, unsupportedMediaType(s.bodyTypes(c))
 	}
 	if builtin {
-		obj, strict, err := decodeBuiltin(mt, body, fv)
+		obj, gvk, strict, err := decodeBuiltin(mt, body, fv)
 		if err != nil {
 			if mt == "application/vnd.kubernetes.protobuf" {
 				return nil, nil, unsupportedMediaType(s.bodyTypes(c))
 			}
-			return nil, nil, apierrors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized: %v", err))
+			return nil, nil, transformDecodeError(c, gvk, body, err)
 		}
 		return obj, strict, nil
 	}
@@ -120,7 +120,7 @@ func (s *Server) decodeObject(c *reqCtx, body []byte, fv string) (map[string]any
 	}
 	obj, err := decodeJSONObject(body)
 	if err != nil {
-		return nil, nil, apierrors.NewBadRequest(fmt.Sprintf("the object provided is unrecognized: %v", err))
+		return nil, nil, transformDecodeError(c, nil, body, err)
 	}
 	var strict []error
 	if strictDecoding(fv) {
@@ -134,10 +134,10 @@ func (s *Server) decodeObject(c *reqCtx, body []byte, fv string) (map[string]any
 // decodeBuiltin decodes a kind client-go's scheme registers with the codec factory's serializer for
 // the media type, its strict serializer under Warn or Strict (protobuf has none), and returns the
 // typed form as JSON with the strict decoding errors.
-func decodeBuiltin(mt string, body []byte, fv string) (map[string]any, []error, error) {
+func decodeBuiltin(mt string, body []byte, fv string) (map[string]any, *schema.GroupVersionKind, []error, error) {
 	info, ok := runtime.SerializerInfoForMediaType(scheme.Codecs.SupportedMediaTypes(), mt)
 	if !ok {
-		return nil, nil, fmt.Errorf("no serializer for %s", mt)
+		return nil, nil, nil, fmt.Errorf("no serializer for %s", mt)
 	}
 	dec := info.Serializer
 	if strictDecoding(fv) && info.StrictSerializer != nil {
@@ -148,30 +148,30 @@ func decodeBuiltin(mt string, body []byte, fv string) (map[string]any, []error, 
 	if err != nil {
 		se, isStrict := runtime.AsStrictDecodingError(err)
 		if !isStrict || obj == nil {
-			return nil, nil, err
+			return nil, gvk, nil, err
 		}
 		strict = se.Errors()
 	}
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
-		return nil, nil, err
+		return nil, gvk, nil, err
 	}
 	u["apiVersion"], u["kind"] = gvk.GroupVersion().String(), gvk.Kind
 	n, err := normalize(u)
-	return n, strict, err
+	return n, gvk, strict, err
 }
 
 // decodeCustom runs a custom resource's decoding (coerceCustomResource) and answers fieldValidation
 // for the write's strict errors (prior ones first: the body's or the patch's own).
-func (s *Server) decodeCustom(c *reqCtx, obj map[string]any, fv string, patched []byte, prior []error) (map[string]any, error) {
+func (s *Server) decodeCustom(c *reqCtx, obj map[string]any, fv string, body, patched []byte, prior []error) (map[string]any, error) {
 	out, strict, err := s.coerceCustomResource(c, obj, fv)
 	if err != nil {
 		if c.verb == "patch" {
 			return nil, patchDecodeError(patched, err)
 		}
-		return nil, decodeError(c, obj, err)
+		return nil, decodeError(c, obj, body, err)
 	}
-	if err := strictOutcome(c, fv, obj, patched, append(prior, strict...)); err != nil {
+	if err := strictOutcome(c, fv, obj, body, patched, append(prior, strict...)); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -372,10 +372,10 @@ func (s *Server) create(c *reqCtx) error {
 		return err
 	}
 	if s.custom[c.gr] {
-		if obj, err = s.decodeCustom(c, obj, fv, nil, strict); err != nil {
+		if obj, err = s.decodeCustom(c, obj, fv, body, nil, strict); err != nil {
 			return err
 		}
-	} else if err := strictOutcome(c, fv, obj, nil, strict); err != nil {
+	} else if err := strictOutcome(c, fv, obj, body, nil, strict); err != nil {
 		return err
 	}
 	if obj["apiVersion"] != c.gv || obj["kind"] != c.api.Kind {
@@ -454,10 +454,10 @@ func (s *Server) update(c *reqCtx) error {
 		return err
 	}
 	if s.custom[c.gr] {
-		if obj, err = s.decodeCustom(c, obj, fv, nil, strict); err != nil {
+		if obj, err = s.decodeCustom(c, obj, fv, body, nil, strict); err != nil {
 			return err
 		}
-	} else if err := strictOutcome(c, fv, obj, nil, strict); err != nil {
+	} else if err := strictOutcome(c, fv, obj, body, nil, strict); err != nil {
 		return err
 	}
 	if err := checkName(c, obj); err != nil {
@@ -572,20 +572,20 @@ func (s *Server) patch(c *reqCtx) error {
 	// into its typed form, a custom resource through its schema; strict errors per fieldValidation.
 	switch {
 	case s.typed(c):
-		obj, decodeStrict, err := decodeBuiltin("application/json", patched, fv)
+		obj, _, decodeStrict, err := decodeBuiltin("application/json", patched, fv)
 		if err != nil {
 			return patchDecodeError(patched, err)
 		}
-		if err := strictOutcome(c, fv, obj, patched, append(strict, decodeStrict...)); err != nil {
+		if err := strictOutcome(c, fv, obj, nil, patched, append(strict, decodeStrict...)); err != nil {
 			return err
 		}
 		next = obj
 	case s.custom[c.gr]:
-		if next, err = s.decodeCustom(c, next, fv, patched, strict); err != nil {
+		if next, err = s.decodeCustom(c, next, fv, nil, patched, strict); err != nil {
 			return err
 		}
 	default:
-		if err := strictOutcome(c, fv, next, patched, strict); err != nil {
+		if err := strictOutcome(c, fv, next, nil, patched, strict); err != nil {
 			return err
 		}
 	}
