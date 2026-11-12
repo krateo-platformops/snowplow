@@ -26,6 +26,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
@@ -165,6 +166,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.BadRequest(wri, errDialNotAsked)
 		return
 	}
+	if callAudited(opts.verb) {
+		// The handler's one descriptor of what this request asks for: the
+		// route's record of any later exit is built from it (#1379 review
+		// LOW a), never by parsing the request again.
+		audit.SetAsked(req.Context(), callAuditEvent(req, opts, uri, dialled, "", nil))
+	}
 
 	log := xcontext.Logger(req.Context())
 
@@ -173,6 +180,15 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	ep, err := xcontext.UserConfig(req.Context())
 	if err != nil {
 		log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
+		// #1379 review LOW b — the verified caller's own credential is not
+		// on the request: snowplow refuses before anything is sent, for the
+		// reason audit v0.12.0 names for exactly this, not the caller's
+		// invalid request.
+		if callAudited(opts.verb) {
+			ev := callAuditEvent(req, opts, uri, dialled, "", nil)
+			ev.Outcome, ev.DenialReason, ev.Message = audit.OutcomeDenied, credentialMissingReason(req), audit.MessageRefused
+			audit.EmitRoute(req.Context(), ev)
+		}
 		response.Unauthorized(wri, err)
 		return
 	}
@@ -299,6 +315,23 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
+	if opts, err = r.parseRequest(req); err != nil {
+		return
+	}
+	// #186 — a read-only handler NEVER reads the body into opts.dat, so
+	// callOpts.Payload can never be set (ServeHTTP gates Payload on
+	// opts.dat != nil AND a write verb). On POST /call/read the body has
+	// already been consumed by the BodyExtrasDecode middleware anyway.
+	if req.Body != nil && !r.readOnly {
+		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
+	}
+	return
+}
+
+// parseRequest is validateRequest without the body: the request's method,
+// path and query, checked. The route's audit descriptor (asked) reads it for
+// an exit before the handler ran, so no body is ever read twice.
+func (r *callHandler) parseRequest(req *http.Request) (opts callOptions, err error) {
 	// #443 part 2 — an inline object is resolved only by the RESTAction
 	// handler. BodyExtrasDecode already refuses one for any other GVR; this is
 	// the backstop for one that still reaches the passthrough (e.g. with
@@ -424,17 +457,6 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 
 	if val := req.URL.Query().Get("page"); val != "" {
 		opts.page, err = strconv.Atoi(val)
-		if err != nil {
-			return
-		}
-	}
-
-	// #186 — a read-only handler NEVER reads the body into opts.dat, so
-	// callOpts.Payload can never be set (ServeHTTP gates Payload on
-	// opts.dat != nil AND a write verb). On POST /call/read the body has
-	// already been consumed by the BodyExtrasDecode middleware anyway.
-	if req.Body != nil && !r.readOnly {
-		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
 		if err != nil {
 			return
 		}
@@ -787,14 +809,18 @@ func CallRoute() audit.Route { return audit.Route{Asked: Call().(*callHandler).a
 // CallDryRunRoute is the audit descriptor of /call/dry-run (see CallRoute).
 func CallDryRunRoute() audit.Route { return audit.Route{Asked: CallDryRun().(*callHandler).asked} }
 
-// asked is the record of what req asks the handler to write, by the rules its
-// dial is built with: the object the apiserver would act on, when the request
-// names one the handler would dial; otherwise the action and the method alone
-// (the method is the one /call sends, the verb that method's lowercase, the
-// apiserver's non-resource rule), and the shared writer marks the target.
+// asked is the record of what req asks the handler to write, from its
+// method, path and query alone (parseRequest: the body is never read here),
+// by the rules its dial is built with: the object the apiserver would act on,
+// when the query names one the handler would dial; otherwise the action and
+// the method alone (the method is the one /call sends, the verb that
+// method's lowercase, the apiserver's non-resource rule), and the shared
+// writer marks the target. It describes an exit before the handler parsed
+// the request; after that the handler's own descriptor (audit.SetAsked) is
+// used.
 func (r *callHandler) asked(req *http.Request) audit.Event {
 	unresolved := audit.Event{Action: "call", HTTPMethod: req.Method, Verb: audit.MethodVerb(req.Method), DryRun: r.dryRun}
-	opts, err := r.validateRequest(req)
+	opts, err := r.parseRequest(req)
 	if err != nil {
 		return unresolved
 	}
@@ -803,6 +829,17 @@ func (r *callHandler) asked(req *http.Request) audit.Event {
 		return unresolved
 	}
 	return callAuditEvent(req, opts, uri, dialled, "", nil)
+}
+
+// credentialMissingReason is the denial reason of a verified caller whose own
+// credential is not on the request: step_up_required for a krateo:loa:2
+// token (the step-up credential), session_credential_missing otherwise, chosen
+// from the validated token's groups as the login middleware chose the Secret.
+func credentialMissingReason(req *http.Request) string {
+	if ui, err := xcontext.UserInfo(req.Context()); err == nil && credsecret.IsStepUp(ui.Groups) {
+		return audit.DenialStepUpRequired
+	}
+	return audit.DenialSessionCredentialMissing
 }
 
 // nameInPath reports whether buildURIPath puts the object's name in the path

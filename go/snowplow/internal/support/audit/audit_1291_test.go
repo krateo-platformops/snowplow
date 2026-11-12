@@ -226,7 +226,8 @@ func TestAudit1291_C_RecordShapesConform(t *testing.T) {
 	}
 	dry := callEvent1291()
 	dry.DryRun, dry.ObjectUID, dry.ObjectGeneration, dry.ObjectResourceVersion = true, "", 0, ""
-	export := Event{Action: "export", HTTPMethod: http.MethodPost, Verb: "get", Outcome: OutcomeSuccess, StatusCode: http.StatusOK,
+	export := Event{Action: "export", HTTPMethod: http.MethodGet, Verb: "get", // F1: the method sent
+		Outcome: OutcomeSuccess, StatusCode: http.StatusOK,
 		Group: "templates.krateo.io", Version: "v1", Resource: "restactions", ObjectName: "ra", Namespace: "team-a"}
 	cluster := Event{Action: "call", HTTPMethod: http.MethodDelete, Verb: "delete", Outcome: OutcomeSuccess, StatusCode: http.StatusOK,
 		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles", ObjectName: "r", ObjectUID: "u"}

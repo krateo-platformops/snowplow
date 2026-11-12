@@ -245,6 +245,8 @@ func (e *Emitter) Emit(ctx context.Context, ev Event) {
 	if ev.Resource != "" {
 		ev.Preview = previewOf(ctx, ev.Namespace)
 	}
+	// F1 (#1379 review): the method is the one sent, the verb's.
+	checkDialMethod(ev)
 	e.lib.Emit(ctx, ev)
 }
 

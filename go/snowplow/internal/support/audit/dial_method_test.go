@@ -10,8 +10,40 @@ import (
 	"testing"
 
 	krateoaudit "github.com/krateo-platformops/audit"
+	"github.com/krateo-platformops/audit/audittest"
 	"go.opentelemetry.io/otel/attribute"
 )
+
+// The emitter's own check (checkDialMethod, run on every record) can say yes:
+// a record whose method is not its verb's moves the counter and reaches the
+// test guard; one whose method is its verb's does neither.
+func TestDialMethod_F1_TheEmitterChecksEveryRecord(t *testing.T) {
+	var caught []string
+	SetDialMethodGuardForTest(func(method, verb string) { caught = append(caught, method+" "+verb) })
+	t.Cleanup(func() {
+		SetDialMethodGuardForTest(func(method, verb string) {
+			panic("F1 falsifier: a record names http.request.method " + method + ", not the method of its verb " + verb)
+		})
+	})
+	rec := audittest.NewRecorder(t)
+	e := New(rec.Logger(Scope))
+	before := DialMethodMismatchCount()
+	ctx := actorCtx()
+	e.Emit(ctx, Event{Action: "export", HTTPMethod: http.MethodGet, Verb: "get", Outcome: OutcomeSuccess, ServerAddress: "x.test"})
+	if len(caught) != 0 || DialMethodMismatchCount() != before {
+		t.Fatalf("a record whose method is its verb's was judged a mismatch: %v", caught)
+	}
+	e.Emit(ctx, Event{Action: "export", HTTPMethod: http.MethodPost, Verb: "get", Outcome: OutcomeSuccess, ServerAddress: "x.test"})
+	if len(caught) != 1 || caught[0] != "POST get" {
+		t.Errorf("the guard saw %v, want [POST get]", caught)
+	}
+	if d := DialMethodMismatchCount() - before; d != 1 {
+		t.Errorf("%s moved by %d, want 1", DialMethodMismatchVar, d)
+	}
+	if n := len(rec.Records()); n != 2 {
+		t.Errorf("%d records, want 2: the check never drops one", n)
+	}
+}
 
 func TestDialMethod_F1_TheMethodIsTheVerbs(t *testing.T) {
 	rec := func(method, verb string) []attribute.KeyValue {

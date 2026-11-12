@@ -11,7 +11,7 @@ timestamp: 2026-11-11T00:00:00Z
 
 Snowplow writes one **AuditEvent** per action it performs for a person, as an
 OTLP LogRecord on the shared logs plane. Since #1291 the record is written by
-the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.11.0,
+the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.12.0,
 schema v1), declared as the `request` writer on the scope
 `github.com/krateo-platformops/snowplow/audit`; `internal/support/audit`
 supplies what only snowplow knows (the actor from the validated token, the
@@ -187,7 +187,7 @@ when a record carries an attribute this table does not name.
 | `krateo.audit.on_behalf_of.user.name`, `krateo.audit.delegation` | a delegated token's subject and signed `act` chain |
 | `krateo.action` | `call`, `export`, `restaction`; a dry-run write carries the suffix `.dryRun` (`call.dryRun`, `restaction.dryRun`) |
 | `krateo.audit.verb` | the authority's verb for what was dialled |
-| `http.request.method` | the method of the authority request snowplow SENT, the method of its verb, never the method of the request snowplow served (schema v1; an export sends GET, whatever it was served with); `_OTHER` for one semconv does not name. `audit.DialMethodMismatch` is the falsifier every handler arm runs |
+| `http.request.method` | the method of the authority request snowplow SENT, the method of its verb, never the method of the request snowplow served (schema v1; an export sends GET, whatever it was served with); `_OTHER` for one semconv does not name. The emitter checks every record: one whose method is not its verb's is counted (`snowplow_audit_dial_method_mismatch_total`, zero is the only correct value) and, in a test binary, fails the arm that emitted it (`SetDialMethodGuardForTest`, installed in every package that records), so the falsifier runs in every arm that emits a record |
 | `http.request.method_original` | the method as sent, only when `http.request.method` is `_OTHER` |
 | `krateo.audit.dry_run` | on every write: `true` for a dry run (`/call/dry-run`, a stage path with `?dryRun=All`), else `false`; never on a read (an export) |
 | `krateo.audit.outcome`, `outcome` | `success` / `failure` / `denied` (snowplow itself refused; no status code) |
@@ -256,18 +256,33 @@ DELETE, or none), so a new route is never silently rowless
 `audit.OpenRecord`, before any middleware decodes a body or verifies a token,
 so every exit emits exactly one record (#1379 review F2):
 
-- the handler emits it (`audit.EmitRoute`) with what the authority answered;
-- an exit that emitted none, a refusal by snowplow before anything was sent
-  (a body the decoder refuses, a malformed query, a `/call` dial that would
-  act on another object), is recorded when the request ends: what the
-  descriptor says it asked for, `denied`, `krateo.audit.denial_reason`
-  `invalid_request`, no status code, and the target when the request names
-  one the handler would dial, else none (marked `target`); a server error
-  before anything was sent is a `failure` with no code;
+- the handler emits it (`audit.EmitRoute`) with what the authority answered.
+  A verified caller whose own credential is not on the request (`/call`'s
+  401 after the login middleware) is the handler's own record: `denied`,
+  `session_credential_missing` or, for a `krateo:loa:2` token,
+  `step_up_required`, no status code;
+- a 4xx exit that emitted none, a refusal by snowplow before anything was
+  sent (a body the decoder refuses, a malformed query, a `/call` dial that
+  would act on another object), is recorded when the request ends: what it
+  asked for, `denied`, `krateo.audit.denial_reason` `invalid_request`, no
+  status code. What it asked for is the descriptor the handler stored once
+  it parsed the request (`audit.SetAsked`), else the route's descriptor of
+  the method, path and query alone (no body is read twice); the target when
+  the request names one the handler would dial, else none (marked `target`);
+- any other exit that emitted none (a 2xx, 3xx or 5xx answer, or a panic) is
+  a design error of the handler, never a description of what was sent: it is
+  recorded as a `failure` (the outcome is required) with its own body, "the
+  handler answered without recording its outcome" or "panic: …", and
+  counted in `snowplow_audit_unrecorded_exit_total{answered,panic}`, whose
+  only correct value is zero; a panic is re-raised after its record;
 - a request that never got a verified caller (an authentication failure) gets
   none: those are counted, never recorded (see "Authentication failures").
 
-`TestAudit_OpenRecord_*` (`internal/handlers`) pins it.
+`TestAudit_E2E_*` (`main` package) drives each audited route class through
+the real route table and the real login middleware (one row per refusal and
+per success, zero for an unverified request, one saying panic for a panic,
+and the design-error counter unmoved); `TestAudit_OpenRecord_*` and
+`TestOpenRecord_*` pin the parts.
 
 ## Inventory
 

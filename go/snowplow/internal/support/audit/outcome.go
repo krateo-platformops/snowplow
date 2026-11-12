@@ -12,6 +12,19 @@ import (
 // writer's closed set).
 const DenialInvalidRequest = krateoaudit.DenialReasonInvalidRequest
 
+// DenialSessionCredentialMissing and DenialStepUpRequired are
+// krateo.audit.denial_reason on a denied record of a verified caller snowplow
+// refused because the caller's own credential (the session clientconfig, or
+// the step-up one for a krateo:loa:2 token) is missing (audit v0.12.0).
+const (
+	DenialSessionCredentialMissing = krateoaudit.DenialReasonSessionCredentialMissing
+	DenialStepUpRequired           = krateoaudit.DenialReasonStepUpRequired
+)
+
+// MessageRefused is the body of a denied record whose reason says why
+// snowplow refused before sending anything.
+const MessageRefused = "not sent: snowplow refused the request"
+
 // outcome.go — the closed set of a record's body for an action that dialled an
 // authority: the /call write record (handlers/call.go) and the RESTAction stage
 // record (resolvers/restactions/api/stage_audit.go). Both build it from what
