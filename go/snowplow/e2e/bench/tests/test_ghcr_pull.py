@@ -183,7 +183,8 @@ def test_the_install_carries_057s_registry_auth_and_the_token_reaches_only_the_s
         ("imagePullSecrets", "ok", ["ghcr.io/krateo-platformops/alert-provider:0.2.53"])]
     assert pf["caps"]["chart_inflated_max"] == pf["caps"]["blob_max"] == 100 * 1024 * 1024
     assert pf["caps"]["chart_file_max"] == 5 * 1024 * 1024
-    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "parsed", "members", "render"}
+    assert all(set(c["measured"]) == {"blob", "largest_file", "inflated", "parsed", "members", "render", "deepest",
+                                      "render_deepest"}
                for c in pf["charts"])
     assert pf["caps"]["chart_members_max"] == 16 * ghcr_pull.REAL_LARGEST["members"] == 2000
     assert pf["caps"]["chart_parsed_max"] == 16 * ghcr_pull.REAL_LARGEST["parsed"]
@@ -560,7 +561,7 @@ def test_a_chart_of_many_members_is_walked_in_constant_memory():
     (about 420 B each); walked one at a time they add nearly nothing. A
     difference, not an absolute bound, so other threads' allocations do not
     count."""
-    (charts, vals, _, _, _, _), small = _walk_peak(_many_member_chart(10_000))
+    (charts, vals, _, _, _, _, _), small = _walk_peak(_many_member_chart(10_000))
     _, large = _walk_peak(_many_member_chart(100_000))
     assert charts["c"]["name"] == "c" and vals["c"] == {"a": 1}
     assert large - small < 90_000 * 420 // 4, (small, large)
