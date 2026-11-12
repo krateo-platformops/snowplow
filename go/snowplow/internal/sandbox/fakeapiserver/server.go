@@ -41,7 +41,7 @@ type Server struct {
 	snap     Snapshot
 	mu       sync.Mutex
 	rv       uint64
-	startRV  uint64 // the snapshot's resourceVersion: every watch cache starts from that state
+	startRV  uint64                                   // the snapshot's resourceVersion: every watch cache starts from that state
 	gvs      map[string]map[string]metav1.APIResource // "group/version" (or "v1") -> name -> resource
 	custom   map[string]bool                          // "group/resource" served from a CRD
 	store    map[string]map[string]map[string]any     // "group/resource" -> "ns/name" -> object

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"syscall/js"
+	"time"
 )
 
 // HostConfig is the global bridge.js defines before it runs the program:
@@ -82,6 +83,8 @@ func Listen() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	go func() { _ = http.Serve(ln, s) }()
+	// Watches are long-lived, so only the header read is bounded, as for snowplow's own server.
+	srv := &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
 	return addr, nil
 }
