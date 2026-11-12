@@ -36,11 +36,12 @@ package credhttp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -127,6 +128,7 @@ func sendPolicy(site string, cli *http.Client, req *http.Request) (*http.Respons
 		return sendBudgeted(site, cli, req, b)
 	}
 	if !SafeMethod(req.Method) {
+		// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 		return cli.Do(req)
 	}
 	observed := *cli
@@ -148,6 +150,7 @@ func sendOnceBudgeted(cli *http.Client, req *http.Request, b *pagebudget.Budget)
 		return nil, &pagebudget.ExhaustedError{Result: pagebudget.NotSent}
 	}
 	x, actx := beginBudgetedAttempt(req.Context(), b)
+	// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 	resp, err := cli.Do(req.WithContext(actx))
 	if err != nil {
 		e := x.exhausted(err, 1, "", req.Method)
@@ -240,6 +243,7 @@ func budgetedTry(cli *http.Client, req *http.Request, b *pagebudget.Budget, cutA
 			r.Body = body
 		}
 	}
+	// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 	resp, err := cli.Do(r)
 	x.stopCut()
 	return resp, err, x
@@ -288,13 +292,18 @@ const retryPolicyTranscribedFrom = "v1.54.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
-// jittered into [d/2, d).
+// jittered into [d/2, d). The jitter's random source is crypto/rand where plumbing's is
+// math/rand: the distribution is the same, uniform over [0, d/2).
 func firstBackoff(base, maxB time.Duration) time.Duration {
 	d := min(base, maxB)
 	if d < 2 {
 		return d
 	}
-	return d/2 + time.Duration(rand.Int64N(int64(d)/2))
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(d)/2))
+	if err != nil { // only for a bound <= 0, which d >= 2 rules out
+		return d / 2
+	}
+	return d/2 + time.Duration(n.Int64())
 }
 
 // retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the

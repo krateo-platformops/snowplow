@@ -6,7 +6,9 @@
 #   3. the browser bridge's tests run for js/wasm under Go's own wasm runner (Node.js);
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
-#   5. the server build contains none of the browser code (main_browser_build_test.go:
+#   5. gosec, run as the browser build (GOOS=js GOARCH=wasm), finds nothing in the packages
+#      that hold browser-only files;
+#   6. the server build contains none of the browser code (main_browser_build_test.go:
 #      no internal/browserbridge, no syscall/js, credhttp.BrowserEgress nil,
 #      credhttp's guardedTransport dialguard's own).
 #
@@ -56,6 +58,22 @@ for pkg in ./internal/credhttp ./internal/resolvers/restactions/api; do
   run_node node "$TMP/pkg.test"
   run_fetch "$TMP/pkg.test"
 done
+
+# gosec over the browser build: the org's security workflow runs gosec with the default GOOS, so it
+# never sees a js && wasm file. This runs it with GOOS=js GOARCH=wasm over every package that holds
+# one (found from the build constraints, so a new browser package is covered without an edit), and
+# fails on any finding. The tool is pinned by version and its module checksum is checked against
+# the one recorded here (sum.golang.org's, also verified by the go command through GOSUMDB).
+GOSEC_VERSION=v2.30.0
+GOSEC_SUM="h1:67aF6LHa7SAL6QEc4es857GrXTT50gUqmrl0XPhtDx0="
+echo "== js/wasm: gosec $GOSEC_VERSION"
+sum="$(go mod download -json "github.com/securego/gosec/v2@$GOSEC_VERSION" | sed -n 's/^[[:space:]]*"Sum": "\(.*\)",$/\1/p')"
+[ "$sum" = "$GOSEC_SUM" ] || { echo "gosec $GOSEC_VERSION module checksum is $sum, want $GOSEC_SUM" >&2; exit 1; }
+GOBIN="$TMP/bin" go install "github.com/securego/gosec/v2/cmd/gosec@$GOSEC_VERSION"
+JS_PKGS="$(grep -rlE --include='*.go' '^//go:build .*\bjs\b' . | grep -v '_test\.go$' | xargs -n1 dirname | sort -u)"
+[ -n "$JS_PKGS" ] || { echo "no package holds a js/wasm file: the gosec scope is empty" >&2; exit 1; }
+# shellcheck disable=SC2086
+GOOS=js GOARCH=wasm "$TMP/bin/gosec" -quiet -fmt text $JS_PKGS
 
 echo "== server build: contains none of the browser code"
 go test -count=1 -run 'TestBrowserBuild_' . ./internal/credhttp

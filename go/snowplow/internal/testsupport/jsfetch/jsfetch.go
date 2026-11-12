@@ -148,7 +148,7 @@ func NetHTTPUsesFetch(t testing.TB) bool {
 	}
 	resp, err := tr.RoundTrip(req)
 	if err == nil {
-		resp.Body.Close()
+		_ = resp.Body.Close() // the probe fails on the next line; the close cannot change that
 		t.Fatal("jsfetch: a request to 127.0.0.1:1 succeeded, so the probe cannot tell net/http's mode")
 	}
 	switch msg := err.Error(); {
