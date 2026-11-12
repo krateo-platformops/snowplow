@@ -414,7 +414,7 @@ func newN46API(t *testing.T, objs []*unstructured.Unstructured, rbacObjs []runti
 func n46ClientconfigSecret(user, srvURL string) *corev1.Secret {
 	return &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: n46AuthNS, Name: credsecret.For(user, n46Groups())[0]},
+		ObjectMeta: authnMeta(n46AuthNS, credsecret.For(user, n46Groups())[0], user),
 		Data:       map[string][]byte{"server-url": []byte(srvURL), "token": []byte("tok-" + user)},
 	}
 }

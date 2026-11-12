@@ -98,7 +98,7 @@ func su994Setup(t *testing.T, extra ...runtime.Object) *su994Env {
 	for _, u := range psUsers {
 		for _, name := range []string{credsecret.SessionNames(u)[0], credsecret.StepUpNames(u)[0]} {
 			byName[name] = &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Namespace: psAuthnNS, Name: name},
+				ObjectMeta: authnMeta(psAuthnNS, name, u),
 				Data:       map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok-" + u)},
 			}
 		}
