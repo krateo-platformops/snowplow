@@ -47,9 +47,27 @@ type cpuSample struct {
 	procOK  bool
 }
 
-// cgroupStatPaths are cpu.stat's places: cgroup v2 (one unified file), then
-// v1's cpu controller.
-var cgroupStatPaths = []string{"/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu,cpuacct/cpu.stat", "/sys/fs/cgroup/cpu/cpu.stat"}
+// cgroupDir is the cgroup filesystem's mount point.
+const cgroupDir = "/sys/fs/cgroup"
+
+// cgroupStatPaths are cpu.stat's places under cgroupDir: cgroup v2 (one
+// unified file), then v1's cpu controller.
+var cgroupStatPaths = []string{"cpu.stat", "cpu,cpuacct/cpu.stat", "cpu/cpu.stat"}
+
+// cgroupRoot is cgroupDir opened as an os.Root, so a cgroupStatPaths entry is
+// read beneath it and cannot reach any other file, whatever the entry holds.
+// It is opened at the first sample and kept for the process: one descriptor,
+// shared by the sampler's goroutine and the requests' emit reads (os.Root's
+// methods are safe for concurrent use). nil when the directory cannot be
+// opened (no cgroup filesystem: not Linux, the browser build); a sample then
+// carries no cgroup fields, as it does when no cpu.stat is found.
+var cgroupRoot = sync.OnceValue(func() *os.Root {
+	r, err := os.OpenRoot(cgroupDir)
+	if err != nil {
+		return nil
+	}
+	return r
+})
 
 type cpuSampler struct {
 	read func() cpuSample
@@ -139,20 +157,24 @@ func (c *cpuSampler) windowAttrs(start time.Time) []slog.Attr {
 	return out
 }
 
-func readCPU() cpuSample {
+func readCPU() cpuSample { return readCPUFrom(cgroupRoot()) }
+
+// readCPUFrom is one sample, its cpu.stat read beneath cg (none when cg is nil).
+func readCPUFrom(cg *os.Root) cpuSample {
 	t0 := time.Now() // the sample's own instant
 	s := cpuSample{at: t0}
 	s.procNS, s.procOK = processCPU()
+	if cg == nil {
+		return s
+	}
 	for _, p := range cgroupStatPaths {
-		// #nosec G304,G703 -- p is one of cgroupStatPaths, the fixed /sys/fs/cgroup cpu.stat paths; no input reaches it
-		if b, err := os.ReadFile(p); err == nil {
+		if b, err := cg.ReadFile(p); err == nil {
 			s.usageNS, s.periods, s.thrPer, s.thrNS, s.cgOK = parseCPUStat(b)
 			if s.cgOK {
 				break
 			}
 		}
 	}
-
 	return s
 }
 
