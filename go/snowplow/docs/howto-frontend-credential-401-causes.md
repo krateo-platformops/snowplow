@@ -74,8 +74,21 @@ JWT's `groups`**:
 | `groups` contains `krateo:loa:2` (a step-up login, authn `POST /oidc/stepup`) | `<user>-clientconfig-stepup` |
 | any other token | `<user>-clientconfig` |
 
-If that Secret is not in snowplow's informer, snowplow re-reads it from the
-apiserver. If the apiserver answers **NotFound**, the credential is missing.
+`<user>` is the exact username when it is a valid Secret name (authn#140),
+and otherwise, or for a Secret written before authn#140, the username made
+DNS-1123 compatible (`john.doe` → `johndoe`). Snowplow tries the exact name
+first, then the other one where they differ (#1382). A Secret found under
+either is used only when it is provably the requester's: its
+`authn.krateo.io/username` annotation names the requester and, when it holds
+a client certificate, the certificate's CN does too; a Secret without the
+annotation counts when its certificate's CN is the requester. Any other
+Secret, for example `johndoe`'s Secret when `john.doe` asks, is treated as
+missing.
+
+If no such Secret is in snowplow's informer, snowplow re-reads the names from
+the apiserver. If none is found there (NotFound, or found but not the
+requester's), the credential is missing, and the 401 names the first, exact,
+name.
 
 - **Step-up case.** Two facts here come from authn, and snowplow cannot verify
   them:

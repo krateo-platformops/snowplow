@@ -106,12 +106,14 @@ func forbiddingAPI1192(t *testing.T) (endpoints.Endpoint, func() int) {
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// The caller's clientconfig Secret: the one read that succeeds, so a
-		// stage gets as far as its own dial.
+		// stage gets as far as its own dial. #1382: stamped as the caller's,
+		// as authn writes it, or the reader refuses it as not theirs.
 		if strings.Contains(r.URL.Path, "/secrets/") {
 			b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"apiVersion": "v1", "kind": "Secret",
-				"data": map[string]string{"server-url": b64(srv.URL), "token": b64("tok"), "insecure": b64("true")},
+				"metadata": map[string]any{"annotations": map[string]string{endpoints.UsernameAnnotation: sentinelUser1192}},
+				"data":     map[string]string{"server-url": b64(srv.URL), "token": b64("tok"), "insecure": b64("true")},
 			})
 			return
 		}

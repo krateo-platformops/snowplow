@@ -132,9 +132,9 @@ func TestC113_2_InternalSynthesisResolves_NamedPerUserRefRefused(t *testing.T) {
 	// real cell to resolve (the legitimate path).
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{
 		ByName: map[string]*corev1.Secret{
-			"victim-clientconfig": mkSecret(authnNS, "victim-clientconfig", map[string]string{
+			"victim-clientconfig": authnOwned(mkSecret(authnNS, "victim-clientconfig", map[string]string{
 				"server-url": "https://victim.example.com",
-			}),
+			}), "victim"),
 		},
 	})
 	cache.ForceSecretsCacheReadyForTest(authnNS)

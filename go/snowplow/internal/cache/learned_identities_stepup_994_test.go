@@ -22,12 +22,12 @@ func TestLearned994_StepUpSecretsAreNeverLearned(t *testing.T) {
 
 	SyncLearnedFromSecretsForTest([]*corev1.Secret{
 		// dave: a session Secret and a live step-up Secret side by side.
-		liSecret(t, credsecret.SessionName("dave"), "dave", []string{"devs"}, nb, "1"),
-		liSecret(t, credsecret.StepUpName("dave"), "dave", stepUpGroups, nb.Add(time.Minute), "2"),
+		liSecret(t, credsecret.SessionNames("dave")[0], "dave", []string{"devs"}, nb, "1"),
+		liSecret(t, credsecret.StepUpNames("dave")[0], "dave", stepUpGroups, nb.Add(time.Minute), "2"),
 		// erin: only a step-up Secret (her session Secret is gone).
-		liSecret(t, credsecret.StepUpName("erin"), "erin", stepUpGroups, nb, "3"),
+		liSecret(t, credsecret.StepUpNames("erin")[0], "erin", stepUpGroups, nb, "3"),
 		// frank: a step-up Secret whose certificate does not parse.
-		{ObjectMeta: metav1.ObjectMeta{Name: credsecret.StepUpName("frank"), ResourceVersion: "4"},
+		{ObjectMeta: metav1.ObjectMeta{Name: credsecret.StepUpNames("frank")[0], ResourceVersion: "4"},
 			Data: map[string][]byte{clientCertificateDataKey: []byte("not a certificate")}},
 	})
 
