@@ -17,6 +17,8 @@ import (
 	"syscall/js"
 	"testing"
 	"time"
+
+	"github.com/krateo-platformops/plumbing/dialguard"
 )
 
 // waitFor bounds every wait on a JavaScript promise.
@@ -130,16 +132,21 @@ func (s *FetchSpy) CallsTo(prefix string) []Call {
 }
 
 // NetHTTPUsesFetch is net/http's own choice, observed: a Transport with no
-// dial function sends through fetch where net/http uses it, and its error
-// then names fetch(); elsewhere it dials Go's in-process network and fails as
-// a dial does. Port 1 on loopback listens on neither.
+// dial function (dialguard.Transport on js/wasm, the one every snowplow
+// request leaves through) sends through fetch where net/http uses it, and its
+// error then names fetch(); elsewhere it dials Go's in-process network and
+// fails as a dial does. Port 1 on loopback listens on neither.
 func NetHTTPUsesFetch(t testing.TB) bool {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := (&http.Transport{}).RoundTrip(req)
+	tr := dialguard.Transport()
+	if tr.DialContext != nil || tr.Dial != nil || tr.DialTLSContext != nil || tr.DialTLS != nil {
+		t.Fatal("jsfetch: dialguard.Transport has a dial function on js/wasm, so it never uses fetch and the probe cannot tell net/http's mode")
+	}
+	resp, err := tr.RoundTrip(req)
 	if err == nil {
 		resp.Body.Close()
 		t.Fatal("jsfetch: a request to 127.0.0.1:1 succeeded, so the probe cannot tell net/http's mode")

@@ -35,7 +35,6 @@ var destinationExempt = map[[3]string]string{
 	{"internal/credhttp/endpoint_clients.go", "endpointIdle", "http.DefaultTransport"}:                              "reads IdleConnTimeout, the value client-go's transports take from it. No dial.",
 	{"internal/credhttp/do.go", "Do", "request.HTTPClientForEndpoint"}:                                              "/call: plumbing's transport dials through dialguard (TestIssue1131_EveryDeniedSpellingIsRefused, plumbing chain).",
 	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "request.HTTPClientForEndpoint"}: "the plumbing branch of a stage fetch, the same transport.",
-	{"internal/testsupport/jsfetch/jsfetch.go", "NetHTTPUsesFetch", "http.Transport{} without DialContext"}:         "js/wasm test support only: the probe that observes whether net/http sends through fetch, by sending to 127.0.0.1:1, which nothing listens on. It carries no named endpoint.",
 	{"internal/browserbridge/bridge.go", "", "net.Dialer{} without Control"}:                                        "js/wasm build only: the browser bridge's loopback dial to snowplow's own in-process server, never egress. Go's in-process network refuses any dial with a Control hook (ENOTSUP).",
 }
 
