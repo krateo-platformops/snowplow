@@ -42,12 +42,12 @@ var (
 // groups). The verb is the lowercase method, as the apiserver derives it for a
 // non-resource request: GET is "get", POST is "post", HEAD is "head". The path
 // is passed through unchanged. path must not be empty: an empty
-// NonResourceURL is a resource check.
+// NonResourcePath is a resource check.
 func NonResourceCheck(username string, groups []string, method, path string) EvaluateOptions {
 	return EvaluateOptions{
-		Username:       username,
-		Groups:         groups,
-		Verb:           strings.ToLower(method),
-		NonResourceURL: path,
+		Username:        username,
+		Groups:          groups,
+		Verb:            strings.ToLower(method),
+		NonResourcePath: path,
 	}
 }

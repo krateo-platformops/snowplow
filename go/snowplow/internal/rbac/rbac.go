@@ -93,7 +93,7 @@ var sarClientsetForEndpoint = func(ctx context.Context, ep endpoints.Endpoint) (
 // cache.Disabled() == true — any cache=on call here is a Revision 1 binding
 // violation (rollback trigger).
 //
-// A check with a NonResourceURL (#1362) is sent as NonResourceAttributes
+// A check with a NonResourcePath (#1362) is sent as NonResourceAttributes
 // {Path, Verb}: the attributes the apiserver authorizes a non-resource request
 // with. Every other check is sent as ResourceAttributes.
 //
@@ -118,9 +118,9 @@ func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok boo
 	}
 
 	selfCheck := authv1.SelfSubjectAccessReview{}
-	if check.NonResourceURL != "" {
+	if check.NonResourcePath != "" {
 		selfCheck.Spec.NonResourceAttributes = &authv1.NonResourceAttributes{
-			Path: check.NonResourceURL,
+			Path: check.NonResourcePath,
 			Verb: check.Verb,
 		}
 	} else {

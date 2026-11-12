@@ -145,9 +145,9 @@ func TestIssue1362_NonResourceCheck_ParityWithRequestInfo(t *testing.T) {
 			t.Fatalf("PRE: the apiserver treats %s %s as a resource request: %+v", r.method, r.path, info)
 		}
 		got := rbac.NonResourceCheck("u", []string{"g"}, r.method, r.path)
-		if got.Verb != info.Verb || got.NonResourceURL != info.Path {
+		if got.Verb != info.Verb || got.NonResourcePath != info.Path {
 			t.Errorf("%s %s: snowplow (verb=%q path=%q), apiserver (verb=%q path=%q)",
-				r.method, r.path, got.Verb, got.NonResourceURL, info.Verb, info.Path)
+				r.method, r.path, got.Verb, got.NonResourcePath, info.Verb, info.Path)
 		}
 		if got.Group != "" || got.Resource != "" || got.Namespace != "" || got.Name != "" {
 			t.Errorf("%s %s: a non-resource check carries resource attributes: %+v", r.method, r.path, got)

@@ -90,11 +90,11 @@ type snapshotAuthzKey struct {
 	Resource   string
 	Namespace  string
 	Name       string
-	// NonResourceURL (#1362) is the path of a non-resource check, "" for a
+	// NonResourcePath (#1362) is the path of a non-resource check, "" for a
 	// resource check. Without it a permit for one /debug path would be served
 	// for another.
-	NonResourceURL string
-	SkipUID        bool
+	NonResourcePath string
+	SkipUID         bool
 }
 
 // snapshotAuthzVerdict is the cached result — exactly EvaluateRBAC's

@@ -110,7 +110,7 @@ type EvaluateOptions struct {
 	// not carry would match a rule the apiserver never matches.
 	Name string
 
-	// NonResourceURL (#1362), when non-empty, makes this a NON-RESOURCE check:
+	// NonResourcePath (#1362), when non-empty, makes this a NON-RESOURCE check:
 	// the request path the apiserver authorizes a request outside /api and
 	// /apis with (RequestInfo.Path, IsResourceRequest=false). Group, Resource,
 	// Namespace and Name are then empty, and Verb is the lowercase HTTP method.
@@ -119,7 +119,7 @@ type EvaluateOptions struct {
 	// (NonResourceURLMatches: "*", exact, or a trailing-"*" prefix). Only
 	// ClusterRoleBindings can grant it: with Namespace "" no RoleBinding is
 	// visited, as upstream. Build it with NonResourceCheck, never by hand.
-	NonResourceURL string
+	NonResourcePath string
 
 	// SkipBindingUID, when true, lets the evaluator SKIP the
 	// (Name, UID) stable-sort of the CRB/RB candidate sets
@@ -323,8 +323,8 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		Name:       opts.Name,
 		// #1362: a non-resource verdict is about one path. Without it here, a
 		// permit for /debug/vars would be served for /debug/apistage.
-		NonResourceURL: opts.NonResourceURL,
-		SkipUID:        opts.SkipBindingUID,
+		NonResourcePath: opts.NonResourcePath,
+		SkipUID:         opts.SkipBindingUID,
 	}
 	if v, ok := authzMemoLookup(snap.PublishSeq, memoKey); ok {
 		// #261 case-2 — a memo HIT is the HOT at-risk serve path; surface the
@@ -886,7 +886,7 @@ func roleRefPermits(ctx context.Context, snap *cache.RBACSnapshot, namespace str
 // Before 0.30.109 this check was absent: a resourceNames-scoped rule
 // over-exposed every object (cross-user leak in filterListByRBAC).
 //
-// #1362 — a non-resource check (opts.NonResourceURL != "") is upstream
+// #1362 — a non-resource check (opts.NonResourcePath != "") is upstream
 // RuleAllows' other branch: VerbMatches && NonResourceURLMatches, and nothing
 // else. The resource fields are NOT consulted for it. Otherwise the empty
 // Group/Resource of a non-resource check would match a rule's "*" apiGroups
@@ -898,8 +898,8 @@ func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 		if !stringSliceMatches(rule.Verbs, opts.Verb) {
 			continue
 		}
-		if opts.NonResourceURL != "" {
-			if nonResourceURLMatches(rule.NonResourceURLs, opts.NonResourceURL) {
+		if opts.NonResourcePath != "" {
+			if nonResourceURLMatches(rule.NonResourceURLs, opts.NonResourcePath) {
 				return true
 			}
 			continue

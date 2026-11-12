@@ -93,9 +93,9 @@ func DebugAuthz() func(http.Handler) http.Handler {
 			if !allowed {
 				log.DebugContext(ctx, "debug.authz.denied",
 					slog.String("verb", check.Verb),
-					slog.String("path", check.NonResourceURL))
+					slog.String("path", check.NonResourcePath))
 				response.Forbidden(wri, fmt.Errorf("forbidden: User %q cannot %s path %q",
-					ui.Username, check.Verb, check.NonResourceURL))
+					ui.Username, check.Verb, check.NonResourcePath))
 				return
 			}
 			next.ServeHTTP(wri, req)
