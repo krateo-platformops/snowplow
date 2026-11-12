@@ -355,7 +355,7 @@ func newN46API(t *testing.T, objs []*unstructured.Unstructured, rbacObjs []runti
 			// through snowplow's own config.
 			if resource == "secrets" {
 				for _, u := range n46Users {
-					if ns == n46AuthNS && name == credsecret.For(u, n46Groups()) {
+					if ns == n46AuthNS && name == credsecret.For(u, n46Groups())[0] {
 						out, _ := json.Marshal(n46ClientconfigSecret(u, f.urlFor(u)))
 						_, _ = w.Write(out)
 						return
@@ -414,7 +414,7 @@ func newN46API(t *testing.T, objs []*unstructured.Unstructured, rbacObjs []runti
 func n46ClientconfigSecret(user, srvURL string) *corev1.Secret {
 	return &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: n46AuthNS, Name: credsecret.For(user, n46Groups())},
+		ObjectMeta: metav1.ObjectMeta{Namespace: n46AuthNS, Name: credsecret.For(user, n46Groups())[0]},
 		Data:       map[string][]byte{"server-url": []byte(srvURL), "token": []byte("tok-" + user)},
 	}
 }

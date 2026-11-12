@@ -123,7 +123,7 @@ func setup1011(t *testing.T, u *up1011) context.Context {
 	cache.ResetSecretsSnapshotForTest()
 	own := kubeutil.MakeDNS1123Compatible(clusterListBroadUser) + "-clientconfig"
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		own: {ObjectMeta: metav1.ObjectMeta{Namespace: ns1011, Name: own},
+		own: {ObjectMeta: authnMeta(ns1011, own, clusterListBroadUser),
 			Data: map[string][]byte{"server-url": []byte(u.srv.URL), "token": []byte("tok")}},
 		extRef1011: {ObjectMeta: metav1.ObjectMeta{Namespace: ns1011, Name: extRef1011},
 			Data: map[string][]byte{"server-url": []byte(u.srv.URL), "token": []byte("ext-tok")}},
