@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -484,6 +485,11 @@ func main() {
 	//   - authn stays off the hot path of every token validation.
 	// Absent an explicit --jwks-url, derive it from the authn base URL already
 	// configured for the #57 token exchange — one URL to get wrong, not two.
+	if err := checkJWKSRequestTimeout(*jwksTimeout); err != nil {
+		// log-ctx-waiver: boot: process start, before a context exists
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
 	if resolvedJWKSURL == "" {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
@@ -494,7 +500,8 @@ func main() {
 		os.Exit(1)
 	}
 	// The client is the one plumbing builds by default (dialguard.Client, with
-	// the request timeout), passed through credhttp.PlumbingClient: on js/wasm
+	// the request timeout, positive: checkJWKSRequestTimeout above), passed
+	// through credhttp.PlumbingClient: on js/wasm
 	// that sets fetch's credentials mode, so the browser attaches none of the
 	// frame's cookies to the JWKS fetch (credhttp/egress_js.go); on a server
 	// build it is the client itself.
@@ -1646,6 +1653,22 @@ func main() {
 // only inside the !cache.Disabled() branch), not here.
 func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
+}
+
+// errJWKSRequestTimeoutNotPositive refuses a non-positive
+// --jwks-request-timeout / JWT_JWKS_REQUEST_TIMEOUT at startup. The timeout
+// bounds every JWKS fetch, and a token validation waits on one, so without a
+// bound an authn that accepts the connection and never answers hangs every
+// authentication. The default is 5 s.
+var errJWKSRequestTimeoutNotPositive = errors.New("--jwks-request-timeout/JWT_JWKS_REQUEST_TIMEOUT must be positive: it bounds every JWKS fetch, and an unbounded one can hang every authentication")
+
+// checkJWKSRequestTimeout is errJWKSRequestTimeoutNotPositive, with the value
+// given, when d is not positive.
+func checkJWKSRequestTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w (got %s)", errJWKSRequestTimeoutNotPositive, d)
+	}
+	return nil
 }
 
 // parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
