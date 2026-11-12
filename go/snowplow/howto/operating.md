@@ -183,7 +183,7 @@ Any identity bound to `cluster-admin` already holds it (`nonResourceURLs:
 ["*"]`). Without the grant → **`403`** (`forbidden: User "<u>" cannot get path
 "/debug/vars"`). If the authorization cannot be decided → **`503`**, with the
 reason named in the message. During the boot window before the RBAC snapshot is
-published it is `rbac_snapshot_not_built`. With `CACHE_ENABLED=false` it is
+published it is `rbac_snapshot_not_built` (#1368: that includes `pprof/goroutine`). With `CACHE_ENABLED=false` it is
 **always** `review_unavailable`: the cache-off authorizer is the caller's own
 SelfSubjectAccessReview, which needs the `<user>-clientconfig` endpoint this
 route never reads. It fails closed and never answers `200`.

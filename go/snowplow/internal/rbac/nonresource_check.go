@@ -35,6 +35,10 @@ var (
 	// not be asked or answered (no user endpoint, no clientset, a failed
 	// Create). The cause is wrapped.
 	ErrReviewUnavailable = errors.New("rbac: SelfSubjectAccessReview unavailable")
+	// ErrMalformedNonResourceCheck: a check with a NonResourcePath that also
+	// carries a Namespace, Group, Resource or Name. The apiserver has no such
+	// request, so EvaluateRBAC refuses it rather than guess.
+	ErrMalformedNonResourceCheck = errors.New("rbac: a non-resource check carries resource attributes")
 )
 
 // NonResourceCheck builds the EvaluateOptions for an HTTP request with the

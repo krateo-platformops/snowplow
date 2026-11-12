@@ -74,7 +74,7 @@ and two probe endpoints used by the chart.
 > | no token, an expired token, or a token only in the query string | `401` |
 > | a JWKS the pod cannot fetch | `503` |
 > | a valid token whose identity lacks the grant | `403`, a `Status` body: `forbidden: User "<u>" cannot get path "/debug/vars"` |
-> | the authorization cannot be decided | `503`, with the reason in the message `debug authorization unavailable (<reason>)`: `rbac_snapshot_not_built` (the boot window before the RBAC snapshot is published), `rbac_watcher_not_wired`, `review_unavailable` (cache off, see below), `evaluator_error`, `no_identity` |
+> | the authorization cannot be decided | `503`, with the reason in the message `debug authorization unavailable (<reason>)`: `rbac_snapshot_not_built` (the boot window before the RBAC snapshot is published, pprof included: #1368), `rbac_watcher_not_wired`, `review_unavailable` (cache off, see below), `evaluator_error`, `no_identity` |
 >
 > **Known limitation (cache off).** With `CACHE_ENABLED=false` the authorizer is
 > the requester's own SelfSubjectAccessReview, which needs the requester's

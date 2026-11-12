@@ -56,8 +56,9 @@ grant. Every /debug read (`/debug/vars`, `/debug/apistage`) therefore presents
 a SEPARATE operator token, `SNOWPLOW_DEBUG_TOKEN`, the same variable the bench's
 own /debug readers use (`bench/browser.py`). Every measured request (the /call
 grant probes, the browser half) keeps the harness user's token. Neither token
-ever reaches the other's requests. `_debug_token()` refuses BY NAME at preflight,
-before any measurement, when the operator token is absent. It never skips the
+ever reaches the other's requests. When the operator token is absent,
+`_debug_token()` refuses BY NAME as the FIRST preflight step, before any cluster
+read, any HTTP request and any measurement. It never skips the
 /debug checks. The operator token is supplied by whoever runs S6 (on 057, Diego
 supplies it); this module never mints or fetches one.
 
@@ -1126,6 +1127,12 @@ def stage_preflight(ctx: dict) -> dict:
     """A0 — every precondition, read live. Fails loudly, never skips."""
     portal, reqlog = ctx["portal_base"], ctx["reqlog"]
 
+    # TWO TOKENS (#1362, see CREDENTIALS). The operator token is an
+    # environment read, the cheapest check there is, so it runs FIRST. A run
+    # without it stops here by name, before any cluster read, any HTTP request
+    # (including the anonymous bundle-hash GET below) and any measurement.
+    debug_token = _debug_token()
+
     got_ctx = cluster.canonical_gke_context()
     if got_ctx != EXPECTED_CONTEXT:
         raise PreflightFailed(
@@ -1185,10 +1192,6 @@ def stage_preflight(ctx: dict) -> dict:
     if problems:
         raise PreflightFailed("; ".join(problems))
 
-    # TWO TOKENS (#1362, see CREDENTIALS). The operator token is checked first,
-    # by name, so a run that lacks it stops here, before the harness login and
-    # before any measurement.
-    debug_token = _debug_token()
     token = login(portal, reqlog)
     snap = read_debug_vars(portal, debug_token, reqlog)
     missing = [k for k in (K_DEPS, K_RESOLVED, K_BROADCAST) if k not in snap]

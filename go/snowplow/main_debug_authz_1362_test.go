@@ -23,9 +23,11 @@
 //	B4  an authorized operator sees on /debug/apistage an entry created by a
 //	    DIFFERENT identity, so the grant is meaningful, and that identity cannot
 //	    read its own entry's metadata without the grant.
-//	B5  structural: no /debug route is mounted anywhere in package main
-//	    outside registerDebugRoutes, every route there is mounted through
-//	    `gated`, and `gated` contains DebugAuthz.
+//	B5  no /debug route can be mounted without the gate. At runtime,
+//	    routeTable panics on a /debug pattern outside the gated lane, whatever
+//	    form the pattern takes. Structurally, by type, nothing in package main
+//	    registers on an *http.ServeMux except routeTable, the one /debug lane is
+//	    registerDebugRoutes' mount, and `gated` contains DebugAuthz.
 //
 // The grant the arms bind is PARSED FROM THE CHART
 // (helm/snowplow/templates/clusterrole-debug.yaml), so B1 also proves the
@@ -37,22 +39,23 @@ import (
 	"context"
 	"encoding/json"
 	"go/ast"
-	"go/parser"
 	"go/token"
+	"go/types"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/server/use"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/fakewatch"
 
+	"golang.org/x/tools/go/packages"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -357,8 +360,11 @@ func TestIssue1362_UndecidableAuthorizationIs503(t *testing.T) {
 				continue
 			}
 			s := i1362DecodeStatus(t, rec)
-			if s.Code != 503 || s.Reason != "ServiceUnavailable" || !strings.Contains(s.Message, "("+reason+")") {
-				t.Errorf("%s: 503 body %+v, want a ServiceUnavailable Status naming %q", pattern, s, reason)
+			// The named reason ONLY: the evaluator's or the review's own
+			// error text stays in the server log (#1362 review finding 5).
+			want := "debug authorization unavailable (" + reason + ")"
+			if s.Code != 503 || s.Reason != "ServiceUnavailable" || s.Message != want {
+				t.Errorf("%s: 503 body %+v, want a ServiceUnavailable Status with message exactly %q", pattern, s, want)
 			}
 		}
 	}
@@ -468,55 +474,162 @@ func TestIssue1362_ApistageShowsTheOperatorAnotherIdentitysEntry(t *testing.T) {
 }
 
 // ─── B5 — no /debug route can be mounted without the gate ───────────────────
+//
+// Two halves, neither of which reads pattern TEXT, so a constant, a computed
+// pattern or a table entry cannot slip past (#1362 review finding 4):
+//
+//   - RUNTIME: routeTable, main's only registrar, panics on a /debug pattern
+//     given to Handle, and on a non-debug one given to handleDebug.
+//   - STRUCTURE, by TYPE (go/types): no code in package main calls
+//     Handle/HandleFunc on an *http.ServeMux, or http.Handle/HandleFunc, except
+//     routeTable's own two delegations. The only handleDebug call is
+//     registerDebugRoutes' mount, whose handler is gated.Then(...). gated holds
+//     both RefreshAuth and DebugAuthz, and mount is called once per
+//     debugRoutePatterns entry.
+
+func TestIssue1362_RouteTableRefusesDebugOutsideTheGate(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mustPanic := func(name string, f func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: did not panic", name)
+			}
+		}()
+		f()
+	}
+	method := "GET"
+	computed := method + " " + "/de" + "bug/new" // not a constant anywhere
+	for _, p := range []string{
+		"GET /debug/new", "/debug/new", "/debug", "/debug/", "POST /debug/x",
+		"example.com/debug/x", "GET /%64ebug/x", "GET /debug/{rest...}", computed,
+	} {
+		p := p
+		mustPanic("Handle("+p+")", func() { newRouteTable(http.NewServeMux()).Handle(p, ok) })
+	}
+	for _, p := range []string{"GET /call", "/debugger", "GET /debugx/y", "GET /api/debug"} {
+		p := p
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Handle(%q) panicked on a non-debug pattern: %v", p, r)
+				}
+			}()
+			newRouteTable(http.NewServeMux()).Handle(p, ok)
+		}()
+		mustPanic("handleDebug("+p+")", func() { newRouteTable(http.NewServeMux()).handleDebug(p, ok) })
+	}
+
+	// The production registrar builds, through the lane it must use, without
+	// panicking, and serves what it mounted.
+	mux := http.NewServeMux()
+	registerDebugRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys)
+	if _, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, "/debug/vars", nil)); pattern != "GET /debug/vars" {
+		t.Errorf("registerDebugRoutes via routeTable did not mount GET /debug/vars (got %q)", pattern)
+	}
+}
 
 func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
-	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+		Dir:  ".",
+	}, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sawGatedDef, mountsInRegistrar := false, 0
-	for _, file := range files {
-		if strings.HasSuffix(file, "_test.go") {
-			continue
+	if len(pkgs) != 1 || len(pkgs[0].Errors) > 0 || pkgs[0].Name != "main" {
+		t.Fatalf("load package main: %d packages, errors %v", len(pkgs), pkgs[0].Errors)
+	}
+	pkg := pkgs[0]
+	info, fset := pkg.TypesInfo, pkg.Fset
+
+	isServeMux := func(tp types.Type) bool {
+		if p, ok := tp.(*types.Pointer); ok {
+			tp = p.Elem()
 		}
-		f, err := parser.ParseFile(fset, file, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", file, err)
+		n, ok := tp.(*types.Named)
+		return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == "net/http" && n.Obj().Name() == "ServeMux"
+	}
+	recvName := func(fn *ast.FuncDecl) string {
+		if fn.Recv == nil || len(fn.Recv.List) == 0 {
+			return ""
 		}
+		e := fn.Recv.List[0].Type
+		if st, ok := e.(*ast.StarExpr); ok {
+			e = st.X
+		}
+		if id, ok := e.(*ast.Ident); ok {
+			return id.Name
+		}
+		return ""
+	}
+
+	rawMuxInTable, handleDebugCalls, mountCalls, tableHandleCalls := 0, 0, 0, 0
+	sawGatedDef := false
+	for _, f := range pkg.Syntax {
 		for _, decl := range f.Decls {
-			fn, _ := decl.(*ast.FuncDecl)
-			inRegistrar := fn != nil && fn.Name.Name == "registerDebugRoutes"
-			ast.Inspect(decl, func(n ast.Node) bool {
-				// `gated := chain.Append(..., middleware.DebugAuthz())`
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			inTable := recvName(fn) == "routeTable"
+			inRegistrar := fn.Name.Name == "registerDebugRoutes" && fn.Recv == nil
+			ast.Inspect(fn, func(n ast.Node) bool {
 				if as, ok := n.(*ast.AssignStmt); ok && inRegistrar && len(as.Lhs) == 1 {
 					if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name == "gated" {
-						if strings.Contains(i1362Src(fset, as.Rhs[0]), "middleware.DebugAuthz()") &&
-							strings.Contains(i1362Src(fset, as.Rhs[0]), "middleware.RefreshAuth(") {
-							sawGatedDef = true
-						}
+						src := i1362Src(fset, as.Rhs[0])
+						sawGatedDef = strings.Contains(src, "middleware.RefreshAuth(") &&
+							strings.Contains(src, "middleware.DebugAuthz()")
 					}
 				}
 				call, ok := n.(*ast.CallExpr)
-				if !ok || len(call.Args) < 2 {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || (sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc") {
-					return true
-				}
-				lit, ok := call.Args[0].(*ast.BasicLit)
-				if !ok || !strings.Contains(lit.Value, "/debug") {
+				if !ok {
 					return true
 				}
 				pos := fset.Position(call.Pos())
-				if !inRegistrar {
-					t.Errorf("%s: %s mounted outside registerDebugRoutes, so not behind the #1362 gate", pos, lit.Value)
-					return true
-				}
-				mountsInRegistrar++
-				if !strings.HasPrefix(i1362Src(fset, call.Args[1]), "gated.Then(") {
-					t.Errorf("%s: %s is mounted with %s, not gated.Then(...)", pos, lit.Value, i1362Src(fset, call.Args[1]))
+				switch fun := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					name := fun.Sel.Name
+					// http.Handle / http.HandleFunc: the DefaultServeMux.
+					if obj, ok := info.Uses[fun.Sel].(*types.Func); ok && obj.Pkg() != nil &&
+						obj.Pkg().Path() == "net/http" && (name == "Handle" || name == "HandleFunc") &&
+						info.Selections[fun] == nil {
+						t.Errorf("%s: http.%s registers on the DefaultServeMux; mount through routeTable", pos, name)
+						return true
+					}
+					sel := info.Selections[fun]
+					if sel == nil {
+						return true
+					}
+					switch {
+					case (name == "Handle" || name == "HandleFunc") && isServeMux(sel.Recv()):
+						if !inTable {
+							t.Errorf("%s: %s on an *http.ServeMux outside routeTable (%s): it bypasses the /debug "+
+								"lane check; mount through routeTable", pos, name, i1362Src(fset, call))
+						} else {
+							rawMuxInTable++
+						}
+					case name == "handleDebug":
+						if inTable {
+							return true
+						}
+						handleDebugCalls++
+						if !inRegistrar {
+							t.Errorf("%s: handleDebug called outside registerDebugRoutes' mount", pos)
+						} else if len(call.Args) != 2 || !strings.HasPrefix(i1362Src(fset, call.Args[1]), "gated.Then(") {
+							t.Errorf("%s: handleDebug's handler is not gated.Then(...): %s", pos, i1362Src(fset, call))
+						}
+					case name == "Handle":
+						if n, ok := sel.Recv().(*types.Pointer); ok {
+							if nn, ok := n.Elem().(*types.Named); ok && nn.Obj().Name() == "routeTable" {
+								tableHandleCalls++
+							}
+						}
+					}
+				case *ast.Ident:
+					if fun.Name == "mount" && inRegistrar {
+						mountCalls++
+					}
 				}
 				return true
 			})
@@ -525,9 +638,19 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 	if !sawGatedDef {
 		t.Error("registerDebugRoutes does not define gated with both middleware.RefreshAuth and middleware.DebugAuthz()")
 	}
-	if mountsInRegistrar != len(debugRoutePatterns) {
-		t.Errorf("found %d /debug mounts in registerDebugRoutes, debugRoutePatterns lists %d (the scan is not seeing the registrar)",
-			mountsInRegistrar, len(debugRoutePatterns))
+	if handleDebugCalls != 1 {
+		t.Errorf("handleDebug is called %d times outside routeTable; want exactly 1 (mount's)", handleDebugCalls)
+	}
+	if mountCalls != len(debugRoutePatterns) {
+		t.Errorf("registerDebugRoutes calls mount %d times; debugRoutePatterns lists %d", mountCalls, len(debugRoutePatterns))
+	}
+	// Non-vacuity: the scan sees routeTable's own two delegations and main's
+	// route mounts, so a broken type resolution cannot read as a clean bill.
+	if rawMuxInTable != 2 {
+		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 2", rawMuxInTable)
+	}
+	if tableHandleCalls < 10 {
+		t.Errorf("NON-VACUITY: saw only %d routeTable.Handle calls in main", tableHandleCalls)
 	}
 }
 

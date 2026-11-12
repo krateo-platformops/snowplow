@@ -192,7 +192,7 @@ func newRecordingMux() *recordingMux {
 	return &recordingMux{inner: http.NewServeMux()}
 }
 
-func (m *recordingMux) Handle(pattern string, handler http.Handler) {
+func (m *recordingMux) handleDebug(pattern string, handler http.Handler) {
 	m.patterns = append(m.patterns, pattern)
 	m.inner.Handle(pattern, handler)
 }

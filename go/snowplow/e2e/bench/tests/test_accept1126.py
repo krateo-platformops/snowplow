@@ -646,11 +646,26 @@ def _preflight_world_1362(monkeypatch, *, debug_token):
     Returns (ctx, sent): `sent` records (url, Authorization) for every request
     the module makes, in order.
     """
-    monkeypatch.setattr(a.cluster, "canonical_gke_context", lambda: a.EXPECTED_CONTEXT)
-    monkeypatch.setattr(a, "_deployed_image", lambda d: {
-        "snowplow": f"ghcr.io/x/snowplow:{a.EXPECTED_SNOWPLOW_VERSION}",
-        "frontend": f"ghcr.io/x/frontend:{a.EXPECTED_FRONTEND_VERSION}"}[d])
-    monkeypatch.setattr(a, "_served_bundle_hash", lambda portal, reqlog: "index-abc.js")
+    sent = []
+
+    # Every cluster read and the anonymous bundle-hash GET are recorded too, so
+    # "refuses before anything ran" is checked, not assumed.
+    def ctx_read():
+        sent.append(("kube-context", None))
+        return a.EXPECTED_CONTEXT
+
+    def image_read(d):
+        sent.append((f"deployment/{d}", None))
+        return {"snowplow": f"ghcr.io/x/snowplow:{a.EXPECTED_SNOWPLOW_VERSION}",
+                "frontend": f"ghcr.io/x/frontend:{a.EXPECTED_FRONTEND_VERSION}"}[d]
+
+    def bundle_read(portal, reqlog):
+        sent.append((f"{portal}/ (bundle hash, anonymous)", None))
+        return "index-abc.js"
+
+    monkeypatch.setattr(a.cluster, "canonical_gke_context", ctx_read)
+    monkeypatch.setattr(a, "_deployed_image", image_read)
+    monkeypatch.setattr(a, "_served_bundle_hash", bundle_read)
     monkeypatch.setenv("HARNESS_USER", "s6-harness")
     monkeypatch.setenv("HARNESS_PASSWORD", "pw")
     monkeypatch.delenv("S6_PASSWORD_FROM_SECRET", raising=False)
@@ -659,7 +674,6 @@ def _preflight_world_1362(monkeypatch, *, debug_token):
     else:
         monkeypatch.setenv(a.DEBUG_TOKEN_ENV, debug_token)
 
-    sent = []
     snap = json.dumps({a.K_DEPS: {}, a.K_RESOLVED: {}, a.K_BROADCAST: {}}).encode()
 
     def fake_urlopen(req, timeout=None, context=None):
@@ -683,8 +697,9 @@ def test_1362_absent_debug_token_refuses_by_name_before_any_request(monkeypatch)
     with pytest.raises(a.PreflightFailed) as e:
         a.stage_preflight(ctx)
     assert a.DEBUG_TOKEN_ENV in str(e.value)
-    # Before the harness login and before any /debug read or measured request.
-    assert sent == [], f"requests were made before the refusal: {sent}"
+    # Before any cluster read, the anonymous bundle GET, the harness login, any
+    # /debug read and any measured request.
+    assert sent == [], f"work was done before the refusal: {sent}"
 
 
 def test_1362_debug_reads_carry_only_the_operator_token_measured_only_the_harness(monkeypatch):

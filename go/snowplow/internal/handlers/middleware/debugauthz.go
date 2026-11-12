@@ -106,11 +106,16 @@ func DebugAuthz() func(http.Handler) http.Handler {
 // debugAuthzUnavailable answers 503 with the named reason and logs it once at
 // WARN: a 503 here is a failure, so it belongs at the level that counts
 // failures.
+//
+// The BODY carries the named reason only. The evaluator's or the review's
+// own error text (an apiserver message, a context error) is logged here,
+// server-side, and never echoed to the caller: an unauthorized caller has no
+// business reading the internals of why its request could not be decided.
 func debugAuthzUnavailable(wri http.ResponseWriter, req *http.Request, reason string, err error) {
 	ctx := req.Context()
 	xcontext.Logger(ctx).WarnContext(ctx, "debug.authz.unavailable",
 		slog.String("reason", reason),
 		slog.String("path", req.URL.Path),
 		slog.Any("err", err))
-	response.ServiceUnavailable(wri, fmt.Errorf("debug authorization unavailable (%s): %w", reason, err))
+	response.ServiceUnavailable(wri, fmt.Errorf("debug authorization unavailable (%s)", reason))
 }

@@ -113,7 +113,9 @@ type EvaluateOptions struct {
 	// NonResourcePath (#1362), when non-empty, makes this a NON-RESOURCE check:
 	// the request path the apiserver authorizes a request outside /api and
 	// /apis with (RequestInfo.Path, IsResourceRequest=false). Group, Resource,
-	// Namespace and Name are then empty, and Verb is the lowercase HTTP method.
+	// Namespace and Name must then be empty (EvaluateRBAC refuses a check that
+	// carries any: ErrMalformedNonResourceCheck), and Verb is the lowercase
+	// HTTP method.
 	// A rule permits it as upstream RuleAllows does for a non-resource request:
 	// the verb matches and one of the rule's nonResourceURLs matches the path
 	// (NonResourceURLMatches: "*", exact, or a trailing-"*" prefix). Only
@@ -250,6 +252,17 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		defer func() { _ = recover() }()
 		(*h)(ctx, snap, opts, allowed)
 	}()
+
+	// #1362: a non-resource request has no namespace and no resource
+	// attributes, so upstream visits ClusterRoleBindings only. A check that
+	// carries both is malformed. It is refused here, in both modes, and not
+	// left to the field's doc comment: with a Namespace the walk below would
+	// also visit that namespace's RoleBindings, which the apiserver never
+	// does for a non-resource request.
+	if opts.NonResourcePath != "" &&
+		(opts.Namespace != "" || opts.Group != "" || opts.Resource != "" || opts.Name != "") {
+		return false, "", ErrMalformedNonResourceCheck
+	}
 
 	if cache.Disabled() {
 		// Cache=off correctness baseline: a SelfSubjectAccessReview with

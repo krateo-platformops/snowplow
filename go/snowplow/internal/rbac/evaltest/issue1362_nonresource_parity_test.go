@@ -376,3 +376,45 @@ func TestIssue1362_UndecidableIsAnError(t *testing.T) {
 		}
 	})
 }
+
+// TestIssue1362_MalformedNonResourceCheckIsRefused: a non-resource check that
+// also carries a Namespace (or any resource attribute) is refused by the
+// evaluator, in both modes. It is not walked. With a Namespace the walk would
+// visit that namespace's RoleBindings, and here a RoleBinding of the
+// all-powerful role would ALLOW it. The apiserver has no such request.
+func TestIssue1362_MalformedNonResourceCheckIsRefused(t *testing.T) {
+	objs := []runtime.Object{
+		clusterRole("i1362m-all", nonResourceRule([]string{"*"}, []string{"*"})),
+		roleBinding("default", "i1362m-rb", "ClusterRole", "i1362m-all", userSubject("u-rb")),
+	}
+	malformed := map[string]func(*rbac.EvaluateOptions){
+		"namespace": func(o *rbac.EvaluateOptions) { o.Namespace = "default" },
+		"group":     func(o *rbac.EvaluateOptions) { o.Group = "apps" },
+		"resource":  func(o *rbac.EvaluateOptions) { o.Resource = "pods" },
+		"name":      func(o *rbac.EvaluateOptions) { o.Name = "x" },
+	}
+	check := func(t *testing.T, ctx context.Context) {
+		t.Helper()
+		for field, set := range malformed {
+			opts := rbac.NonResourceCheck("u-rb", nil, "GET", "/debug/vars")
+			set(&opts)
+			ok, _, err := rbac.EvaluateRBAC(ctx, opts)
+			if ok || !errors.Is(err, rbac.ErrMalformedNonResourceCheck) {
+				t.Errorf("non-resource check with a %s: got (%v, %v), want (false, ErrMalformedNonResourceCheck)",
+					field, ok, err)
+			}
+		}
+	}
+	t.Run("cache-on", func(t *testing.T) {
+		rbac.ResetAuthzMemoForTest()
+		newTestWatcher(t, objs...)
+		check(t, context.Background())
+	})
+	t.Run("cache-off", func(t *testing.T) {
+		t.Setenv("CACHE_ENABLED", "false")
+		i1362SARFake(t, k8sauthz.New(objs...), nil)
+		check(t, xcontext.BuildContext(context.Background(),
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: "u-rb"}),
+			xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: "https://sar.test", Token: "u-rb"})))
+	})
+}
