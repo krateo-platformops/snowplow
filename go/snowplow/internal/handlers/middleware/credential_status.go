@@ -50,10 +50,12 @@ import (
 	"errors"
 	"net/http"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // The closed set of causes snowplow emits on a pre-dispatch 401 (#1029,
@@ -187,6 +189,22 @@ func tokenRejected(w http.ResponseWriter, err error) error {
 		return preDispatchUnauthorized(w, CauseTokenExpired, err)
 	}
 	return preDispatchUnauthorized(w, CauseTokenInvalid, err)
+}
+
+// auditCredentialMissing records req, refused because the verified caller's
+// own credential Secret is missing (credentialMissing): denied, reason
+// step_up_required for a krateo:loa:2 token, session_credential_missing
+// otherwise, chosen from the same validated groups. The record names what the
+// request asked for, by its route's descriptor, never the credential Secret
+// (its name embeds the username). A route whose request would produce no record
+// admitted (a read) gets none refused either.
+func auditCredentialMissing(req *http.Request, ui jwtutil.UserInfo) {
+	reason := audit.DenialSessionCredentialMissing
+	if credsecret.IsStepUp(ui.Groups) {
+		reason = audit.DenialStepUpRequired
+	}
+	ctx := xcontext.BuildContext(req.Context(), xcontext.WithUserInfo(ui))
+	audit.EmitRefused(ctx, req, reason, audit.MessageRefused)
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

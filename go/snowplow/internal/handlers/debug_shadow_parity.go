@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // shadowParityBody is the JSON body both shadow-parity routes return: the one
@@ -91,14 +92,53 @@ func DebugShadowParityGet() http.HandlerFunc {
 // @Router /debug/shadow-parity [post]
 func DebugShadowParitySet() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
+		// #909 — the toggle is a state change, so every request is recorded
+		// (AUDIT-4): a flip as a success, an unparseable value as snowplow's
+		// own refusal (denied, invalid_request, no status code).
+		ev, _ := ShadowParityRoute().Asked(req)
 		v, err := strconv.ParseBool(req.URL.Query().Get("enabled"))
 		if err != nil {
 			http.Error(wri, "enabled must be a boolean (true|false)", http.StatusBadRequest)
+			ev.Outcome, ev.DenialReason, ev.Message = audit.OutcomeDenied, audit.DenialInvalidRequest, shadowParityRefused
+			audit.Emit(req.Context(), ev)
 			return
 		}
 		rbac.SetShadowParityEnabled(v)
+		enabled := rbac.ShadowParityEnabled()
+		ev.Outcome, ev.StatusCode, ev.Message = audit.OutcomeSuccess, http.StatusOK, "enabled="+strconv.FormatBool(enabled)
+		audit.Emit(req.Context(), ev)
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(wri).Encode(shadowParityBody{Enabled: rbac.ShadowParityEnabled()})
+		_ = json.NewEncoder(wri).Encode(shadowParityBody{Enabled: enabled})
 	}
+}
+
+// ShadowParityPath is the toggle's route path: the record's url.path, the
+// request writer's non-resource target (audit v0.12.0). The route's own path,
+// never the URL received (a gateway may have rewritten its prefix; the
+// received URI is krateo.request.uri).
+const ShadowParityPath = "/debug/shadow-parity"
+
+// shadowParityAction is the toggle's krateo.action (#909, the lead's ruling:
+// camelCase, as call.dryRun).
+const shadowParityAction = "debug.shadowParity"
+
+// shadowParityRefused is the body of a refused toggle: the rule, never the
+// value the caller sent.
+const shadowParityRefused = "refused: enabled must be a boolean"
+
+// ShadowParityRoute is the audit descriptor of POST /debug/shadow-parity: every
+// request asks to flip the toggle, a state change, so every one is recorded.
+// The target is the route's path (url.path): the toggle is a per-process flag,
+// no Kubernetes object and no external endpoint. Verb post (the apiserver's
+// non-resource rule), method POST; a write, so dry_run=false.
+func ShadowParityRoute() audit.Route {
+	return audit.Route{Asked: func(*http.Request) (audit.Event, bool) {
+		return audit.Event{
+			Action:     shadowParityAction,
+			Verb:       audit.MethodVerb(http.MethodPost),
+			HTTPMethod: http.MethodPost,
+			URLPath:    ShadowParityPath,
+		}, true
+	}}
 }

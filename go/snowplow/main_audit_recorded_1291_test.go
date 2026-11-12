@@ -54,7 +54,7 @@ func TestS1291_RecordedMarkerOnlyOnTheServerSpanOfARequestThatWroteARecord(t *te
 	got, ep := fakeAPIMain443(t)
 	mux := http.NewServeMux()
 	chain := newRequestChain(discardLogger1291())
-	mountCallWriteRoutes(mux, chain, testUserConfig443(ep))
+	mountCallWriteRoutes(newRouteTable(mux), chain, testUserConfig443(ep))
 	// A read whose RESTAction stage wrote: the stage's record is emitted on the
 	// context of the stage's own (ended) span.
 	mux.Handle("GET /call", chain.Then(testUserConfig443(ep)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

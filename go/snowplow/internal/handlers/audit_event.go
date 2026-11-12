@@ -135,6 +135,15 @@ func exportAuditEvent(req *http.Request, outcome string, code int) audit.Event {
 	return requestAuditEvent("export", req.Method, t.dialledVerb(), t, outcome, code)
 }
 
+// ExportRoute is the audit descriptor of GET and POST /export: every export
+// is recorded, on every exit (#986), so a refused one always is too, built by
+// the record's own builder (exportAuditEvent).
+func ExportRoute() audit.Route {
+	return audit.Route{Asked: func(req *http.Request) (audit.Event, bool) {
+		return exportAuditEvent(req, audit.OutcomeDenied, 0), true
+	}}
+}
+
 // dialledURI is the apiserver URI the GET /call lane dials for t
 // (buildURIPath), and false when the lane cannot dial it.
 func (t auditTarget) dialledURI() (string, bool) {

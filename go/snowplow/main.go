@@ -242,7 +242,7 @@ func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySo
 			cache.FallthroughScopeMiddleware(cache.ScopeTelemetry)).
 			Then(ingest))
 	}
-	mux.Handle(rum.Pattern, h)
+	mux.HandleUnaudited(rum.Pattern, "browser spans forwarded to the trace plane: no platform state changes (#1015)", h)
 	cache.RegisterScopedRoute(rum.Pattern, cache.ScopeTelemetry)
 }
 
@@ -277,7 +277,7 @@ func mountCallWriteRoutes(mux routeRegistrar, chain use.Chain, userConfig func(h
 	}
 	for _, w := range writes {
 		pattern := w.method + " /call"
-		mux.Handle(pattern, chain.Append(
+		mux.HandleAudited(pattern, handlers.CallRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.Call()))
@@ -289,7 +289,7 @@ func mountCallWriteRoutes(mux routeRegistrar, chain use.Chain, userConfig func(h
 			continue
 		}
 		dryPattern := w.method + " /call/dry-run"
-		mux.Handle(dryPattern, chain.Append(
+		mux.HandleAudited(dryPattern, handlers.CallDryRunRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.CallDryRun()))
@@ -318,7 +318,7 @@ func mountExportRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http
 		{"GET /export", handlers.ExportGET()},
 		{"POST /export", handlers.ExportPOST()},
 	} {
-		mux.Handle(r.pattern, chain.Append(
+		mux.HandleAudited(r.pattern, handlers.ExportRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
 			Then(r.handler))
@@ -1408,7 +1408,7 @@ func main() {
 	// never a create. Same read-path invariant as GET /call, so it is
 	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
 	// fails if either half is missing).
-	routes.Handle("POST /call/read", chain.Append(
+	routes.HandleUnaudited("POST /call/read", "a read: the body carries extras, the verb sent is GET (#186); a RESTAction write stage it reaches is recorded by the stage", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		middleware.BodyExtrasDecode,
@@ -1455,7 +1455,7 @@ func main() {
 	// coordinate array in the body, which has no request-line limit. Same path,
 	// same auth, same semantics, still zero apiserver reads — and GET stays
 	// byte-identical so the server can land ahead of the client.
-	routes.Handle("POST /refreshes", refreshesHandler)
+	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: the coordinates ride the body; no state changes (#560)", refreshesHandler)
 
 	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
 	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
@@ -1478,7 +1478,7 @@ func main() {
 	// so it is outside the read-path-scoped invariant (like /refreshes).
 	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
-	routes.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+	routes.HandleUnaudited("POST /jq", "evaluates jq over the request body: no I/O, no state changes", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 
 	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
 	// On only under the OTel trace contract with a collector endpoint

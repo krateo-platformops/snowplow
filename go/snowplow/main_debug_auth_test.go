@@ -52,6 +52,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 const debugAuthTestKeyID = "test-kid-for-debug-auth-od3-1.12.3"
@@ -193,6 +194,11 @@ func newRecordingMux() *recordingMux {
 }
 
 func (m *recordingMux) handleDebug(pattern string, handler http.Handler) {
+	m.patterns = append(m.patterns, pattern)
+	m.inner.Handle(pattern, handler)
+}
+
+func (m *recordingMux) handleDebugAudited(pattern string, _ audit.Route, handler http.Handler) {
 	m.patterns = append(m.patterns, pattern)
 	m.inner.Handle(pattern, handler)
 }

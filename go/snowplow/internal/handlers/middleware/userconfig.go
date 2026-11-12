@@ -361,6 +361,11 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 						return
 					}
 					if apierrors.IsNotFound(ferr) {
+						// audit#22 (a) — the caller is verified and snowplow
+						// refuses for its own reason: the request gets the
+						// denied record its route would have given it admitted
+						// (audit.EmitRefused reads the route's descriptor).
+						auditCredentialMissing(req, userInfo)
 						credentialMissing(wri, userInfo.Groups, ferr)
 						return
 					}

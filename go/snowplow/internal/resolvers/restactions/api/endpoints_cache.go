@@ -28,7 +28,7 @@ package api
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strconv"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -174,7 +174,7 @@ func extractEndpointFromSecret(sec *corev1.Secret) (endpoints.Endpoint, error) {
 	if v, ok := sec.Data[serverUrlLabel]; ok {
 		res.ServerURL = string(v)
 	} else {
-		return res, fmt.Errorf("missed required attribute for endpoint: server-url")
+		return res, errors.New(msgEndpointSecretNoServerURL)
 	}
 
 	if v, ok := sec.Data[proxyUrlLabel]; ok {

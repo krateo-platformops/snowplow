@@ -242,7 +242,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// mutations. The request log and trace id once named as their cover do not
 	// cover them (measured on 057: no outcome/resource/session in the gateway
 	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
-	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+	if callAudited(opts.verb) {
 		// #1298 — a failed /call is recorded from what was observed at the
 		// dial (credhttp.Answer.Outcome, the stage records' closed set), never
 		// from rt: rt.Message is the apiserver's Status.message, which names
@@ -253,28 +253,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// code and says what happened instead, and a 2xx whose body snowplow
 		// would not use is the accepted write it was. A success keeps its
 		// record unchanged. The caller's response below still carries rt.
-		outcome, code, msg := audit.OutcomeSuccess, http.StatusOK, ""
+		// A dial the destination policy refused is denied, with reason
+		// destination_refused (audit v0.12.0).
+		outcome, code, msg, reason := audit.OutcomeSuccess, http.StatusOK, "", ""
 		if rt.Status == response.StatusFailure {
-			outcome, code, msg = answered.Outcome()
+			outcome, code, msg, reason = answered.OutcomeWithReason()
 		}
-		// A dry run (#443, /call/dry-run: the apiserver is always sent
-		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
-		// as krateo.action=call.dryRun, krateo.audit.dry_run=true and with no
-		// written object (#957). The verb is the apiserver's for the URI that
-		// was dialled (#1291).
-		// #1378 — the record names the object the apiserver wrote: the
-		// dialled path's name, or, for a create (no name in the path), the
-		// name the apiserver gave it (dialledObjectName).
-		target := auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}
-		target.nsn.Name = dialledObjectName(opts, outcome, answer)
-		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, code)
-		ev.DryRun = opts.dryRun
-		ev.Message = msg
-		// #1333 — the client's provenance (X-Krateo-Provenance), validated
-		// against its closed schema: the asserted krateo.audit.client.* keys,
-		// or krateo.audit.client.rejected alone. It is the client's word and
-		// sets nothing else on the record; the write above ran either way.
-		ev.Client = audit.ProvenanceOf(req.Header)
+		ev := callAuditEvent(req, opts, uri, outcome, answer)
+		ev.StatusCode, ev.Message, ev.DenialReason = code, msg, reason
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		audit.RecordWrittenObject(&ev, answer)
@@ -750,6 +736,62 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 
 	return uriPath, nil
+}
+
+// callAudited reports whether a /call request with verb is audited: every
+// write. Reads are not (AUDIT-4 covers mutations).
+func callAudited(verb string) bool {
+	return has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, verb)
+}
+
+// callAuditEvent is a /call write's record before what happened is added:
+// what the request asked for, by the rules the dial is built with. It is the
+// one builder of the record, for the handler (which adds what the apiserver
+// answered) and for the route's audit descriptor (CallRoute, which a refusal
+// before the handler reads).
+//
+//   - A dry run (#443, /call/dry-run: the apiserver is always sent
+//     dryRun=All, and a plain /call refuses an inbound dryRun) is recorded as
+//     krateo.action=call.dryRun, krateo.audit.dry_run=true and with no written
+//     object (#957). The verb is the apiserver's for the URI that is dialled
+//     (#1291).
+//   - #1378 — the record names the object the apiserver wrote: the dialled
+//     path's name, or, for a create (no name in the path), the name the
+//     apiserver gave it (dialledObjectName).
+//   - #1333 — the client's provenance (X-Krateo-Provenance), validated
+//     against its closed schema: the asserted krateo.audit.client.* keys, or
+//     krateo.audit.client.rejected alone. It is the client's word and sets
+//     nothing else on the record.
+func callAuditEvent(req *http.Request, opts callOptions, uri, outcome string, answer []byte) audit.Event {
+	target := auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}
+	target.nsn.Name = dialledObjectName(opts, outcome, answer)
+	ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, 0)
+	ev.DryRun = opts.dryRun
+	ev.Client = audit.ProvenanceOf(req.Header)
+	return ev
+}
+
+// CallRoute is the audit descriptor of the write /call routes; CallDryRunRoute
+// of /call/dry-run. Each asks the route's own handler what a request asked
+// for: a request it would refuse as malformed (validateRequest, buildURIPath)
+// would have produced no record, so it gets none when refused either.
+func CallRoute() audit.Route { return audit.Route{Asked: Call().(*callHandler).asked} }
+
+// CallDryRunRoute is the audit descriptor of /call/dry-run (see CallRoute).
+func CallDryRunRoute() audit.Route { return audit.Route{Asked: CallDryRun().(*callHandler).asked} }
+
+// asked is the record of what req asks the handler to write, or false when
+// the handler would answer it without one.
+func (r *callHandler) asked(req *http.Request) (audit.Event, bool) {
+	opts, err := r.validateRequest(req)
+	if err != nil || !callAudited(opts.verb) {
+		return audit.Event{}, false
+	}
+	uri, err := buildURIPath(opts)
+	if err != nil {
+		return audit.Event{}, false
+	}
+	return callAuditEvent(req, opts, uri, audit.OutcomeDenied, nil), true
 }
 
 // nameInPath reports whether buildURIPath puts the object's name in the path
