@@ -37,9 +37,10 @@ type shadowParityBody struct {
 // source}) so a latency-acceptance window can ASSERT enabled==0 instead of trusting
 // the default (#367).
 //
-// GATE. Mounted behind the SAME authn-only /debug gate as its siblings
-// (debug_routes.go, middleware.RefreshAuth). That gate is authn-only: any valid
-// Krateo JWT can read — and, via the POST sibling, flip — this toggle. That is a
+// GATE. Mounted behind the SAME /debug gate as its siblings (debug_routes.go:
+// middleware.RefreshAuth, then since #1362 middleware.DebugAuthz). Reading it
+// needs `get` on its path, and flipping it via the POST sibling needs `post`
+// (nonResourceURLs ["/debug/*"]). Any holder of that grant may flip it. That is a
 // deliberate, accepted blast radius: the shadow-parity hook is read-only and
 // panic-isolated and changes no verdict, no served byte and no cache key
 // (rbac/shadow_hook.go), so flipping it perturbs no served traffic — it only

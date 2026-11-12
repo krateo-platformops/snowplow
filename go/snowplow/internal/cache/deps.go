@@ -2806,6 +2806,9 @@ func MovedRemarkTotals() (total, boot uint64) {
 // NOT call this. Also clears the O15 test-mode toggle so a test that
 // forgot to reset it cannot leak panic-on-empty-key into the next test.
 func resetDepsForTest() {
+	// A tracked resolve memo's entries are judged against this tracker's
+	// buckets: they cannot outlive it (dropTrackedResolveMemoEntriesForTest).
+	dropTrackedResolveMemoEntriesForTest()
 	depsInstance = nil
 	depsOnce = sync.Once{}
 	depsTestMode.Store(false)

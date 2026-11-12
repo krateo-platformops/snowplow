@@ -3,9 +3,11 @@
 // which of its keys the tab is BEHIND on (cache/content_digest.go has the
 // why; docs/howto-frontend-refresh-digest-catch-up.md is the contract).
 //
-// WHICH BYTES. The digest names exactly the bytes the response wrote, and the
-// arm-time check recomputes exactly the bytes the same /call would write NOW
-// for the subscriber's identity. Every transform between the stored L1 cell
+// WHICH BYTES. The digest names exactly the bytes the response wrote (and,
+// #1319, the stored X-Snowplow-Stage-Outcomes it answered with when a stage
+// did not succeed: cache.AnswerDigest), and the arm-time check recomputes
+// exactly the answer the same /call would write NOW for the subscriber's
+// identity. Every transform between the stored L1 cell
 // and the served body, by armed class:
 //
 //   - restactions (hit and cold) and widgets (hit and cold): none. The body is
@@ -106,7 +108,7 @@ func servedDigestNow(ctx context.Context, class string, e *cache.ResolvedEntry) 
 		if !served {
 			return ""
 		}
-		return cache.ContentDigest(gated)
+		return cache.AnswerDigest(gated, e.StageOutcomes)
 	}
 	return e.ContentDigest()
 }

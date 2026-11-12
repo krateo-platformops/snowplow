@@ -48,14 +48,14 @@ type writtenObjectResponse struct {
 }
 
 // RecordWrittenObject sets ev's object identity from response, the body the
-// apiserver answered ev's write with. ev.Verb, ev.Outcome and ev.DryRun must
-// already be set: only a successful POST, PUT, PATCH or DELETE that is not a
-// dry run records anything. Every other case leaves the three fields empty.
-func (ev *Event) RecordWrittenObject(response []byte) {
-	if ev.DryRun || ev.Outcome != "success" || len(response) == 0 {
+// apiserver answered ev's write with. ev.HTTPMethod, ev.Outcome and ev.DryRun
+// must already be set: only a successful POST, PUT, PATCH or DELETE that is not
+// a dry run records anything. Every other case leaves the three fields empty.
+func RecordWrittenObject(ev *Event, response []byte) {
+	if ev.DryRun || ev.Outcome != OutcomeSuccess || len(response) == 0 {
 		return
 	}
-	switch ev.Verb {
+	switch ev.HTTPMethod {
 	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
 		return
@@ -64,7 +64,7 @@ func (ev *Event) RecordWrittenObject(response []byte) {
 	if err := json.Unmarshal(response, &r); err != nil {
 		return // not a single JSON object: nothing it names can be trusted
 	}
-	if ev.Verb == http.MethodDelete {
+	if ev.HTTPMethod == http.MethodDelete {
 		ev.ObjectUID = r.Metadata.UID
 		if ev.ObjectUID == "" && r.Kind == "Status" && r.APIVersion == "v1" && len(r.Details) > 0 {
 			var d struct {

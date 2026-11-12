@@ -10,10 +10,12 @@ package credhttp
 // silently unguarded — an unguarded credentialed request succeeds, so nothing
 // would surface it. This test makes "the set of guarded sends" and "the set of
 // endpoint sends" the same by construction:
-//   - every function that obtains an endpoint client (httpClientForEndpoint, or
-//     plumbing's request.HTTPClientForEndpoint) sends through Send in the same
-//     function, except buildEndpointClient, the builder whose single caller is
-//     httpClientForEndpoint;
+//   - every function that obtains an endpoint client (httpClientForEndpoint,
+//     credhttp.PlumbingEndpointClient, or plumbing's
+//     request.HTTPClientForEndpoint) sends through Send in the same function,
+//     except the builders: buildEndpointClient, whose single caller is
+//     httpClientForEndpoint, and PlumbingEndpointClient, whose single caller is
+//     buildEndpointClient (#1359: only credhttp builds plumbing's clients);
 //   - control: at least one such site and one Send call are found, so a scan
 //     of the wrong tree cannot pass with a meaningless zero.
 
@@ -73,7 +75,7 @@ func TestIssue1106_EveryEndpointRequestLeavesThroughSend(t *testing.T) {
 						sends = true
 					}
 				case *ast.SelectorExpr:
-					if fun.Sel.Name == "HTTPClientForEndpoint" {
+					if fun.Sel.Name == "HTTPClientForEndpoint" || fun.Sel.Name == "PlumbingEndpointClient" {
 						obtains = true
 					}
 					if id, ok := fun.X.(*ast.Ident); ok && id.Name == "credhttp" && fun.Sel.Name == "Send" {
@@ -91,6 +93,9 @@ func TestIssue1106_EveryEndpointRequestLeavesThroughSend(t *testing.T) {
 			sites++
 			if fn.Name.Name == "buildEndpointClient" && rel == "internal/resolvers/restactions/api/endpoints_tls.go" {
 				continue // the builder; its single caller is httpClientForEndpoint
+			}
+			if fn.Name.Name == "PlumbingEndpointClient" && rel == "internal/credhttp/plumbing_clients.go" {
+				continue // the plumbing branch's builder; its single caller is buildEndpointClient
 			}
 			if fn.Name.Name == "httpClientForEndpoint" && rel == "internal/resolvers/restactions/api/endpoints_tls.go" {
 				continue // the builder's wrapper; its callers are checked here
