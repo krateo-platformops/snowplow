@@ -182,6 +182,11 @@ func (s *Server) commit(c *reqCtx, typ string, obj, prev map[string]any) map[str
 	if c.group == "rbac.authorization.k8s.io" {
 		s.reloadRBAC()
 	}
+	if c.gr == "apiextensions.k8s.io/customresourcedefinitions" && typ != "DELETED" {
+		if gr, info, err := loadCRD(obj); err == nil {
+			s.crds[gr], s.custom[gr] = info, true
+		}
+	}
 	s.emit(c.gr, typ, obj, prev)
 	return obj
 }
@@ -352,6 +357,12 @@ func (s *Server) create(c *reqCtx) error {
 		delete(obj, "status")
 	}
 	c.line["name"] = name
+	if s.custom[c.gr] {
+		var err error
+		if obj, err = s.admitCustomResource(c, obj, nil); err != nil {
+			return err
+		}
+	}
 	stored, err := normalize(obj)
 	if err != nil {
 		return apierrors.NewInternalError(err)
@@ -396,7 +407,13 @@ func (s *Server) update(c *reqCtx) error {
 	if c.ns != "" {
 		meta(obj)["namespace"] = c.ns
 	}
-	out, err := s.write(c, prev, s.restrict(c, prev, obj))
+	next := s.restrict(c, prev, obj)
+	if s.custom[c.gr] {
+		if next, err = s.admitCustomResource(c, next, prev); err != nil {
+			return err
+		}
+	}
+	out, err := s.write(c, prev, next)
 	if err != nil {
 		return err
 	}
@@ -489,7 +506,13 @@ func (s *Server) patch(c *reqCtx) error {
 			return apierrors.NewBadRequest(err.Error())
 		}
 	}
-	out, err := s.write(c, prev, s.restrict(c, prev, next))
+	next = s.restrict(c, prev, next)
+	if s.custom[c.gr] {
+		if next, err = s.admitCustomResource(c, next, prev); err != nil {
+			return err
+		}
+	}
+	out, err := s.write(c, prev, next)
 	if err != nil {
 		return err
 	}

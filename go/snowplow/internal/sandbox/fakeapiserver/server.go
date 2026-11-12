@@ -48,14 +48,16 @@ type Server struct {
 	custom  map[string]bool                          // "group/resource" served from a CRD
 	// selectable is each custom resource's CRD selectableFields, as field labels.
 	selectable map[string][]string
-	store      map[string]map[string]map[string]any // "group/resource" -> "ns/name" -> object
-	caches     map[string]*watchCache
-	watchers   map[*watcher]struct{}
-	conts      map[string]*continuation
-	authz      *authorizer
-	sa         identity
-	visitor    identity
-	rules      []Rule
+	// crds is each custom resource's CRD schemas, by "group/resource".
+	crds     map[string]*crdInfo
+	store    map[string]map[string]map[string]any // "group/resource" -> "ns/name" -> object
+	caches   map[string]*watchCache
+	watchers map[*watcher]struct{}
+	conts    map[string]*continuation
+	authz    *authorizer
+	sa       identity
+	visitor  identity
+	rules    []Rule
 }
 
 type continuation struct {
@@ -87,7 +89,7 @@ func New(o Options) (*Server, error) {
 		o.NewUID = newUID
 	}
 	s := &Server{o: o, gvs: map[string]map[string]metav1.APIResource{}, custom: map[string]bool{}, store: map[string]map[string]map[string]any{},
-		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}, selectable: map[string][]string{}}
+		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}, selectable: map[string][]string{}, crds: map[string]*crdInfo{}}
 	if err := json.Unmarshal(o.Snapshot, &s.snap); err != nil {
 		return nil, fmt.Errorf("snapshot.json: %w", err)
 	}
@@ -125,6 +127,11 @@ func New(o Options) (*Server, error) {
 			names, _ := spec["names"].(map[string]any)
 			gr := fmt.Sprint(spec["group"]) + "/" + fmt.Sprint(names["plural"])
 			s.custom[gr] = true
+			if _, info, err := loadCRD(obj); err != nil {
+				return nil, fmt.Errorf("CustomResourceDefinition %s: %w", gr, err)
+			} else {
+				s.crds[gr] = info
+			}
 			// spec.versions[].selectableFields[].jsonPath (".spec.color") is the field label "spec.color".
 			versions, _ := spec["versions"].([]any)
 			for _, v := range versions {

@@ -186,6 +186,7 @@ type resp struct {
 	code int
 	body map[string]any
 	ct   string
+	hdr  http.Header
 }
 
 func (h *harness) do(method, path string, r req) resp {
@@ -196,7 +197,7 @@ func (h *harness) do(method, path string, r req) resp {
 	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil && rec.Body.Len() > 0 {
 		h.t.Fatalf("%s %s: not JSON: %q", method, path, rec.Body.String())
 	}
-	return resp{rec.Code, m, rec.Header().Get("Content-Type")}
+	return resp{rec.Code, m, rec.Header().Get("Content-Type"), rec.Header()}
 }
 
 // stream is a watch: events arrive as the server writes them.
