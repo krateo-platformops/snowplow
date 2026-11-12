@@ -262,8 +262,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// as krateo.action=call.dryRun, krateo.audit.dry_run=true and with no
 		// written object (#957). The verb is the apiserver's for the URI that
 		// was dialled (#1291).
-		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri),
-			auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}, outcome, code)
+		// #1378 — the record names the object the apiserver wrote: the
+		// dialled path's name, or, for a create (no name in the path), the
+		// name the apiserver gave it (dialledObjectName).
+		target := auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}
+		target.nsn.Name = dialledObjectName(opts, outcome, answer)
+		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, code)
 		ev.DryRun = opts.dryRun
 		ev.Message = msg
 		// #1333 — the client's provenance (X-Krateo-Provenance), validated
@@ -707,12 +711,7 @@ func buildURIPath(opts callOptions) (string, error) {
 		return "", err
 	}
 
-	if opts.nsn.Name != "" && has([]string{
-		http.MethodDelete,
-		http.MethodGet,
-		http.MethodPut,
-		http.MethodPatch,
-	}, opts.verb) {
+	if opts.nsn.Name != "" && nameInPath(opts.verb) {
 		if err := add("name", opts.nsn.Name); err != nil {
 			return "", err
 		}
@@ -751,6 +750,13 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 
 	return uriPath, nil
+}
+
+// nameInPath reports whether buildURIPath puts the object's name in the path
+// for verb: a by-name verb does; a POST is a create, sent to the collection,
+// and the apiserver takes the new object's name from the body (#1378).
+func nameInPath(verb string) bool {
+	return has([]string{http.MethodDelete, http.MethodGet, http.MethodPut, http.MethodPatch}, verb)
 }
 
 // errBadPathSegment is buildURIPath's refusal of a query value that is not one

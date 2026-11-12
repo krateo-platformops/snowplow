@@ -6,8 +6,10 @@ import (
 	"strings"
 
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/yaml"
 )
 
 // auditTarget is the Kubernetes object a request addressed, as its audit
@@ -45,6 +47,61 @@ func requestAuditEvent(action, method, verb string, t auditTarget, outcome strin
 		Outcome:     outcome,
 		StatusCode:  code,
 	}
+}
+
+// dialledObjectName is the name of the object a /call write acted on, as its
+// record names it (#1378): the object the apiserver wrote, never a value only
+// the record saw.
+//
+//   - A by-name verb (PUT, PATCH, DELETE) names the object in the dialled path
+//     (buildURIPath, nameInPath): that name, which the apiserver resolves.
+//   - A create (POST) is sent to the collection, so the query's name never
+//     reaches the apiserver: its create handler takes the name from the body
+//     (k8s.io/apiserver pkg/endpoints/handlers/create.go createHandler, with
+//     includeName=false for a collection POST: the path names no object, and
+//     the name is the decoded object's), generating it from
+//     metadata.generateName when the body has none (pkg/registry/rest/
+//     create.go BeforeCreate). So the record names the object the apiserver
+//     answered with: its metadata.name, which covers a generated name.
+//   - A create the apiserver answered with no object (a failure) names the
+//     body's metadata.name, what the apiserver was asked to create, when it is
+//     one valid path segment; otherwise none (the record names the resource
+//     without a name, as the apiserver's audit does for a create whose object
+//     it could not decode).
+//
+// A disagreeing query name is not refused: it is never sent, and the create
+// succeeds under the body's name, so the request can create something; it
+// is only never recorded.
+func dialledObjectName(opts callOptions, outcome string, answer []byte) string {
+	if nameInPath(opts.verb) {
+		return opts.nsn.Name
+	}
+	if outcome == audit.OutcomeSuccess {
+		if n := metadataName(answer); n != "" {
+			return n
+		}
+	}
+	if n := metadataName(opts.dat); n != "" && len(content.IsPathSegmentName(n)) == 0 {
+		return n
+	}
+	return ""
+}
+
+// metadataName is the metadata.name of a JSON or YAML object, or "" when doc
+// is not one or names none.
+func metadataName(doc []byte) string {
+	if len(doc) == 0 {
+		return ""
+	}
+	var o struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+	}
+	if yaml.Unmarshal(doc, &o) != nil {
+		return ""
+	}
+	return o.Metadata.Name
 }
 
 // exportAuditTarget is the target an export resolves: the apiVersion,

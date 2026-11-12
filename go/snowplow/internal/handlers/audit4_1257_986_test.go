@@ -264,3 +264,60 @@ func TestAudit986_X_ARefusalNamesTheRuleNeverTheValue(t *testing.T) {
 		t.Errorf("the record body is not the refusal's closed phrase")
 	}
 }
+
+// TestAudit4_1378_N_C_ACreateRecordsTheObjectTheApiserverWrote — a create
+// (POST) is sent to the collection: the query's name never reaches the
+// apiserver, which takes the name from the body or generates it. The record
+// names what the apiserver answered with; on a failure, the body's name when
+// it is one path segment, else none. Never the query's name.
+func TestAudit4_1378_N_C_ACreateRecordsTheObjectTheApiserverWrote(t *testing.T) {
+	const (
+		query    = "apiVersion=v1&resource=configmaps&namespace=default&name=query-name"
+		bodyName = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default"},"data":{"k":"v"}}`
+		bodyGen  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"generateName":"cm-","namespace":"default"},"data":{"k":"v"}}`
+		bodyBad  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a/b","namespace":"default"},"data":{"k":"v"}}`
+		bodyYAML = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: yaml-name\n  namespace: default\n"
+		respBody = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default","uid":"u1","generation":1,"resourceVersion":"1"}}`
+		respGen  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-x7k2p","namespace":"default","uid":"u2","generation":1,"resourceVersion":"2"}}`
+	)
+	for _, c := range []struct {
+		name   string
+		h      func() http.Handler
+		route  string
+		body   string
+		status int
+		resp   string
+		want   string // object_ref.name, "" = absent
+	}{
+		{"query and body names differ", Call, "/call?", bodyName, http.StatusCreated, respBody, "body-name"},
+		{"generateName", Call, "/call?", bodyGen, http.StatusCreated, respGen, "cm-x7k2p"},
+		{"generateName, dry run", CallDryRun, "/call/dry-run?", bodyGen, http.StatusCreated, respGen, "cm-x7k2p"},
+		{"refused, body names the object", Call, "/call?", bodyName, http.StatusForbidden, cmForbidden957, "body-name"},
+		{"refused, generateName names none yet", Call, "/call?", bodyGen, http.StatusForbidden, cmForbidden957, ""},
+		{"refused, body name is not one segment", Call, "/call?", bodyBad, http.StatusUnprocessableEntity, cmForbidden957, ""},
+		{"refused, a YAML body", Call, "/call?", bodyYAML, http.StatusForbidden, cmForbidden957, "yaml-name"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			recs, reqs, _ := serveAudit4(t, c.h(), http.MethodPost, c.route+query, c.body, c.status, c.resp)
+			if len(reqs) != 1 || len(recs) != 1 {
+				t.Fatalf("%d dials and %d records, want 1 and 1", len(reqs), len(recs))
+			}
+			if strings.Contains(reqs[0].path, "query-name") {
+				t.Fatalf("precondition: the create's path carries the query's name")
+			}
+			got := asStrings1291(recs[0])
+			if n, ok := got[krateoaudit.KeyObjectName]; n != c.want || (c.want == "" && ok) {
+				t.Errorf("object_ref.name = %q (present %t), want %q", n, ok, c.want)
+			}
+			for _, v := range got {
+				if strings.Contains(v, "query-name") && !strings.Contains(v, "/call") {
+					t.Errorf("the record carries the query's name, which never reached the apiserver")
+				}
+			}
+			if got[krateoaudit.KeyObjectResource] != "configmaps" || got[krateoaudit.KeyVerb] != "create" {
+				t.Errorf("resource %q verb %q, want configmaps create", got[krateoaudit.KeyObjectResource], got[krateoaudit.KeyVerb])
+			}
+			assertConforms4(t, recs[0])
+		})
+	}
+}
