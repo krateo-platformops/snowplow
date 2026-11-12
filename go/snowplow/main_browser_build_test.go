@@ -3,6 +3,8 @@
 package main
 
 import (
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,9 +15,9 @@ import (
 
 // The browser build (js/wasm, the Agentiko sandbox) adds code only in files
 // constrained to js && wasm. These tests prove the server build contains none
-// of it: neither the bridge package nor syscall/js, and the one seam
-// the server build does compile, credhttp.BrowserEgress, is nil there, so it
-// installs nothing.
+// of it: neither the bridge package nor syscall/js, and the two seams the
+// server build does compile install nothing there: credhttp.BrowserEgress is
+// nil and credhttp.PlumbingClient returns its client unchanged.
 
 const browserBridgePkg = "github.com/krateo-platformops/snowplow/internal/browserbridge"
 
@@ -62,6 +64,14 @@ func TestBrowserBuild_ServerBuildContainsNoneOfIt(t *testing.T) {
 func TestBrowserBuild_EgressSeamIsNilOnTheServerBuild(t *testing.T) {
 	if credhttp.BrowserEgress != nil {
 		t.Fatal("credhttp.BrowserEgress is set on a server build: every hardened config and owned endpoint client would leave through it instead of dialling")
+	}
+}
+
+func TestBrowserBuild_PlumbingClientIsTheIdentityOnTheServerBuild(t *testing.T) {
+	rt := http.RoundTripper(&http.Transport{DialContext: (&net.Dialer{}).DialContext})
+	c := &http.Client{Transport: rt}
+	if got := credhttp.PlumbingClient(c); got != c || c.Transport != rt {
+		t.Fatalf("credhttp.PlumbingClient changed a client on a server build (transport %T): every plumbing client would send through it", c.Transport)
 	}
 }
 

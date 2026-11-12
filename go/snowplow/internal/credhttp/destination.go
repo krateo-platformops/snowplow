@@ -42,6 +42,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/plumbing/http/response"
+	"k8s.io/client-go/transport"
 )
 
 // DestinationRefusedReason is the reason of the envelope a refused destination
@@ -57,7 +58,11 @@ const DestinationRefusedReason = "DestinationRefused"
 // On a server build that returns the transport itself. On js/wasm it refuses
 // every redirect, because the browser's fetch would follow one where neither
 // CheckRedirect nor RefuseRedirectHops sees it (#1360).
-var guardedTransport http.RoundTripper = dialguard.RoundTripper(dialguard.Transport())
+//
+// Then through browserFetchOptions, which is nil on a server build
+// (transport.Wrappers skips it) and on js/wasm sets fetch's credentials mode to
+// "omit" (egress_js.go).
+var guardedTransport http.RoundTripper = transport.Wrappers(dialguard.RoundTripper, browserFetchOptions)(dialguard.Transport())
 
 // DestinationRefused reports whether err is the destination policy's refusal.
 func DestinationRefused(err error) bool {

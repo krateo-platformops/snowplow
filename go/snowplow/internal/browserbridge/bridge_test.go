@@ -290,3 +290,164 @@ func hasHeader(h [][2]string, name, value string) bool {
 	}
 	return false
 }
+
+// L3: once the request is cancelled, nothing reaches the sink, whichever call
+// comes next. Each of the four calls is made after the cancel.
+func TestCancelGuard_PassesNothingOnceCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	inner := newSink()
+	g := cancelGuard{ctx: ctx, sink: inner}
+
+	g.Head(200, "OK", nil)
+	g.Chunk([]byte("x"))
+	g.End()
+	g.Error("e")
+	if got := len(inner.all()); got != 4 {
+		t.Fatalf("PRE: before the cancel all four calls pass, got %d", got)
+	}
+
+	cancel()
+	for name, call := range map[string]func(){
+		"head":  func() { g.Head(200, "OK", nil) },
+		"chunk": func() { g.Chunk([]byte("x")) },
+		"end":   func() { g.End() },
+		"error": func() { g.Error("e") },
+	} {
+		before := len(inner.all())
+		call()
+		if len(inner.all()) != before {
+			t.Errorf("%s reached the sink after the cancel", name)
+		}
+	}
+}
+
+// cancellingSink cancels the request when the head arrives: the body, already
+// buffered, is then read after the cancel.
+type cancellingSink struct {
+	*recordingSink
+	cancel context.CancelFunc
+}
+
+func (s cancellingSink) Head(status int, statusText string, header [][2]string) {
+	s.recordingSink.Head(status, statusText, header)
+	s.cancel()
+}
+
+// L3, through Forward: a request cancelled once its head has been reported
+// reports nothing more, not even the chunk that arrived with the head.
+func TestForward_NothingAfterACancelThatFollowsTheHead(t *testing.T) {
+	addr := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "body that arrives with the head")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := cancellingSink{recordingSink: newSink(), cancel: cancel}
+	Forward(ctx, addr, get("/x"), sink)
+	evs := sink.all()
+	if len(evs) == 0 || evs[0].kind != "head" {
+		t.Fatalf("sink got %+v, want the head first", evs)
+	}
+	for _, e := range evs[1:] {
+		t.Errorf("after the cancel the sink got %+v", e)
+	}
+}
+
+// L2: every value of every header, names sorted, each name's values in order.
+func TestHeaderList_SortedWithEveryValue(t *testing.T) {
+	h := http.Header{}
+	for _, name := range []string{"X-J", "X-C", "X-H", "X-A", "X-F", "X-D", "X-I", "X-B", "X-G", "X-E"} {
+		h.Add(name, name+"-1")
+	}
+	h.Add("X-C", "X-C-2")
+	h.Add("X-C", "X-C-0")
+	want := [][2]string{
+		{"X-A", "X-A-1"}, {"X-B", "X-B-1"}, {"X-C", "X-C-1"}, {"X-C", "X-C-2"}, {"X-C", "X-C-0"},
+		{"X-D", "X-D-1"}, {"X-E", "X-E-1"}, {"X-F", "X-F-1"}, {"X-G", "X-G-1"}, {"X-H", "X-H-1"},
+		{"X-I", "X-I-1"}, {"X-J", "X-J-1"},
+	}
+	// Map order varies from walk to walk: ten walks make an unsorted one pass
+	// by chance with odds of (1/10!)^10.
+	for i := 0; i < 10; i++ {
+		if got := headerList(h); !equalHeaders(got, want) {
+			t.Fatalf("headerList = %v, want %v", got, want)
+		}
+	}
+}
+
+// L2, through Forward: a header the handler sent twice reaches the page twice.
+func TestForward_EveryValueOfAHeaderReachesTheHead(t *testing.T) {
+	addr := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "a=1")
+		w.Header().Add("Set-Cookie", "b=2")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	sink := newSink()
+	Forward(context.Background(), addr, get("/x"), sink)
+	evs := sink.all()
+	if len(evs) == 0 || evs[0].kind != "head" {
+		t.Fatalf("sink got %+v, want a head", evs)
+	}
+	if !hasHeader(evs[0].header, "Set-Cookie", "a=1") || !hasHeader(evs[0].header, "Set-Cookie", "b=2") {
+		t.Fatalf("head headers %v, want both Set-Cookie values", evs[0].header)
+	}
+}
+
+func equalHeaders(a, b [][2]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// L1: the error names the cause the answer gives. snowplow's own 401s carry a
+// reason code from a closed set, with its fixed sentence
+// (middleware/credential_status.go); a relayed 401 carries none. Only some of
+// the causes are about the token and the JWKS.
+func TestForward_A401NamesItsCauseFromTheReasonCode(t *testing.T) {
+	const tokenInvalid = `{"kind":"Status","status":"Failure","message":"user alice: bad signature","reason":"Unauthorized","code":401,` +
+		`"details":{"causes":[{"reason":"TokenInvalid","message":"the bearer token is not valid; log in again"}]}}`
+	const sessionMissing = `{"kind":"Status","status":"Failure","message":"secret alice-clientconfig not found","reason":"Unauthorized","code":401,` +
+		`"details":{"causes":[{"reason":"SessionCredentialMissing","message":"the session credential is missing; log in again"}]}}`
+	const stepUp = `{"kind":"Status","status":"Failure","message":"secret alice-stepup not found","reason":"Unauthorized","code":401,` +
+		`"details":{"causes":[{"reason":"StepUpRequired","message":"the step-up credential is missing or expired; step up again"}]}}`
+	const relayed = `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"Unauthorized: user alice","reason":"Unauthorized","code":401}`
+	for _, tc := range []struct {
+		name, body string
+		want       []string
+	}{
+		{"TokenInvalid", tokenInvalid, []string{"refused GET /call", "TokenInvalid: the bearer token is not valid"}},
+		{"SessionCredentialMissing", sessionMissing, []string{"refused GET /call", "SessionCredentialMissing: the session credential is missing"}},
+		{"StepUpRequired", stepUp, []string{"refused GET /call", "StepUpRequired: the step-up credential is missing"}},
+		{"relayed", relayed, []string{"relayed a 401 to GET /call", "upstream", "no cause"}},
+		{"not JSON", "Unauthorized\n", []string{"relayed a 401 to GET /call"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			sink := newSink()
+			Forward(context.Background(), addr, get("/call?extras=%7B%22username%22%3A%22alice%22%7D"), sink)
+			evs := sink.all()
+			if len(evs) != 1 || evs[0].kind != "error" {
+				t.Fatalf("sink got %+v, want exactly one error and no head", evs)
+			}
+			msg := evs[0].text
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("error %q does not say %q", msg, w)
+				}
+			}
+			if strings.Contains(msg, "JWKS") {
+				t.Errorf("error %q blames the JWKS, which the reason code does not name", msg)
+			}
+			if strings.Contains(msg, "alice") {
+				t.Errorf("error %q carries the identity from the query or the message", msg)
+			}
+		})
+	}
+}

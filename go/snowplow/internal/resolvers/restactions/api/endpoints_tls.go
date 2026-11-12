@@ -191,15 +191,18 @@ func wrapEndpointClient(cli *http.Client, ep *endpoints.Endpoint, held, saDial b
 // (credhttp.EndpointClient otherwise, #1106). Plumbing is always handed a copy
 // of ep without Debug, so it never installs its wire dump (#1112 D4).
 func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, bool, error) {
+	// js/wasm only: credhttp.PlumbingClient sets fetch's credentials mode on
+	// the plumbing branch (credhttp/egress_js.go); it is the client itself on
+	// a server build.
 	if !endpointOwnedShape(ep) {
 		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
-		return cli, false, err
+		return credhttp.PlumbingClient(cli), false, err
 	}
 
 	tlsCfg, ok := endpointTLSConfig(ctx, ep)
 	if !ok {
 		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
-		return cli, false, err
+		return credhttp.PlumbingClient(cli), false, err
 	}
 
 	// #1088 — Proxy is always set: client-go shares one transport across every

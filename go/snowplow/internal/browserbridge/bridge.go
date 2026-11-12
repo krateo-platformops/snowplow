@@ -18,10 +18,10 @@
 // WHAT DOES NOT APPLY IN THE BROWSER BUILD:
 //
 //   - The page never sees a 401. Every 401 path in the portal leaves the
-//     sandbox, and the sandbox's token is the build's own, so a 401 means the
-//     token and the JWKS snowplow verifies it with do not match: a build or
-//     configuration defect. Forward reports it as an error on that request,
-//     with the reason snowplow gave, and sends no head.
+//     sandbox, and the sandbox's token and credentials are the build's own, so
+//     a 401 is a defect in how the sandbox was built or configured, never a
+//     sign-in problem. Forward reports it as an error on that request, naming
+//     the cause from the reason code snowplow gave, and sends no head.
 //   - Egress, the destination policy and TLS client certificates: see the
 //     credhttp package doc. Every outbound request leaves through the
 //     browser's fetch.
@@ -40,6 +40,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,8 +85,10 @@ const unauthorizedBodyBytes = 64 << 10
 // Forward sends req to the server listening on addr, over the in-process
 // network, and streams the response to sink. When ctx is cancelled it closes
 // the connection, so the handler's request context ends and a long-lived
-// handler returns, and it reports nothing more to sink.
+// handler returns, and it reports nothing more to sink: every call to sink
+// goes through cancelGuard.
 func Forward(ctx context.Context, addr string, req Request, sink Sink) {
+	sink = cancelGuard{ctx: ctx, sink: sink}
 	hreq, err := newRequest(ctx, addr, req)
 	if err != nil {
 		sink.Error(err.Error())
@@ -93,9 +96,7 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 	}
 	conn, err := loopback.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		if ctx.Err() == nil {
-			sink.Error("snowplow's in-process server did not accept the connection: " + err.Error())
-		}
+		sink.Error("snowplow's in-process server did not accept the connection: " + err.Error())
 		return
 	}
 	defer conn.Close()
@@ -103,16 +104,12 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 	defer stop()
 
 	if err := hreq.Write(conn); err != nil {
-		if ctx.Err() == nil {
-			sink.Error("writing the request to snowplow failed: " + err.Error())
-		}
+		sink.Error("writing the request to snowplow failed: " + err.Error())
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), hreq)
 	if err != nil {
-		if ctx.Err() == nil {
-			sink.Error("reading snowplow's response failed: " + err.Error())
-		}
+		sink.Error("reading snowplow's response failed: " + err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -126,20 +123,53 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 	buf := make([]byte, chunkBytes)
 	for {
 		n, rerr := resp.Body.Read(buf)
-		if n > 0 && ctx.Err() == nil {
+		if n > 0 {
 			sink.Chunk(buf[:n])
 		}
 		if rerr == nil {
 			continue
 		}
-		switch {
-		case ctx.Err() != nil:
-		case errors.Is(rerr, io.EOF):
+		if errors.Is(rerr, io.EOF) {
 			sink.End()
-		default:
+		} else {
 			sink.Error("snowplow's response body failed: " + rerr.Error())
 		}
 		return
+	}
+}
+
+// cancelGuard is the sink Forward reports to: once ctx is cancelled it passes
+// nothing on, whichever call comes next (a head read just before the cancel,
+// a chunk already buffered, the error a closed connection becomes). Go's
+// wasm runtime runs one goroutine at a time and a cancel arrives from the
+// browser's event loop, which runs only while every goroutine is blocked, so
+// a request is never cancelled between the check and the call.
+type cancelGuard struct {
+	ctx  context.Context
+	sink Sink
+}
+
+func (g cancelGuard) Head(status int, statusText string, header [][2]string) {
+	if g.ctx.Err() == nil {
+		g.sink.Head(status, statusText, header)
+	}
+}
+
+func (g cancelGuard) Chunk(b []byte) {
+	if g.ctx.Err() == nil {
+		g.sink.Chunk(b)
+	}
+}
+
+func (g cancelGuard) End() {
+	if g.ctx.Err() == nil {
+		g.sink.End()
+	}
+}
+
+func (g cancelGuard) Error(message string) {
+	if g.ctx.Err() == nil {
+		g.sink.Error(message)
 	}
 }
 
@@ -171,32 +201,47 @@ func newRequest(ctx context.Context, addr string, req Request) (*http.Request, e
 	return hreq, nil
 }
 
-// unauthorizedMessage is the error a 401 becomes: the route and the reason
-// code snowplow gave (details.causes[].reason of its Status), never the
-// query, which can carry identity, nor the message, which can name the user.
+// unauthorizedMessage is the error a 401 becomes. It names the route and the
+// cause snowplow's answer gives, and never the query, which can carry
+// identity, nor the Status message, which can name the user.
+//
+// The cause comes from the answer's reason codes (details.causes[].reason).
+// snowplow writes one on every 401 it answers itself, from a closed set
+// (internal/handlers/middleware/credential_status.go), each with a fixed
+// sentence that carries no identity (details.causes[].message): that sentence
+// is the explanation. A 401 with no cause is one snowplow relayed: an upstream
+// it called for the request (in the sandbox, the fake cluster or an endpoint
+// it serves) refused the credential snowplow sent.
 func unauthorizedMessage(hreq *http.Request, resp *http.Response) string {
 	var st struct {
 		Details struct {
 			Causes []struct {
-				Reason string `json:"reason"`
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
 			} `json:"causes"`
 		} `json:"details"`
 	}
-	reason := "no reason given"
+	var causes []string
 	if b, err := io.ReadAll(io.LimitReader(resp.Body, unauthorizedBodyBytes)); err == nil && json.Unmarshal(b, &st) == nil {
-		var rs []string
 		for _, c := range st.Details.Causes {
-			if c.Reason != "" {
-				rs = append(rs, c.Reason)
+			if c.Reason == "" {
+				continue
 			}
-		}
-		if len(rs) > 0 {
-			reason = strings.Join(rs, ", ")
+			cause := c.Reason
+			if c.Message != "" {
+				cause += ": " + c.Message
+			}
+			causes = append(causes, cause)
 		}
 	}
-	return fmt.Sprintf("snowplow answered 401 (%s) to %s %s. The sandbox's token and the JWKS snowplow verifies it with do not match: "+
-		"this is a defect in how the sandbox was built or configured, not a sign-in problem, so it is reported as an error and never as a 401.",
-		reason, hreq.Method, hreq.URL.Path)
+	route := hreq.Method + " " + hreq.URL.Path
+	what := "snowplow relayed a 401 to " + route + ": an upstream it called for this request (in the sandbox, the fake cluster or an endpoint it serves) " +
+		"refused the credential snowplow sent; the answer gives no cause of snowplow's own."
+	if len(causes) > 0 {
+		what = "snowplow refused " + route + " with 401 before dispatching it (" + strings.Join(causes, "; ") + ")."
+	}
+	return what + " In the sandbox the token and every credential are the build's own, so this is a defect in how the sandbox was built or configured, " +
+		"not a sign-in problem: it is reported as an error and never as a 401."
 }
 
 // statusText is the reason phrase of the status line ("OK" of "200 OK").
@@ -204,11 +249,19 @@ func statusText(resp *http.Response) string {
 	return strings.TrimPrefix(resp.Status, strconv.Itoa(resp.StatusCode)+" ")
 }
 
-// headerList is h as name/value pairs, one per value, in a stable order.
+// headerList is h as name/value pairs, one per value: the names sorted, and
+// each name's values in the order they were received.
 func headerList(h http.Header) [][2]string {
-	out := make([][2]string, 0, len(h))
+	names := make([]string, 0, len(h))
+	n := 0
 	for name, values := range h {
-		for _, v := range values {
+		names = append(names, name)
+		n += len(values)
+	}
+	sort.Strings(names)
+	out := make([][2]string, 0, n)
+	for _, name := range names {
+		for _, v := range h[name] {
 			out = append(out, [2]string{name, v})
 		}
 	}
