@@ -79,9 +79,16 @@ func mediaType(r *http.Request) string {
 	return mt
 }
 
-// decodeObject reads a create or update body. A built-in kind goes through client-go's scheme, JSON
-// or protobuf, and is stored in its typed form's JSON (canonical, as the apiserver stores it); a
-// custom resource is JSON. A protobuf body of a kind the scheme does not register is 415.
+// typed reports whether client-go's scheme registers the resource's kind. Such a kind is decoded
+// through it and stored in its typed form's JSON (quantities canonical, as the apiserver stores
+// them); any other kind (a custom resource, or one the apiserver serves that the scheme lacks:
+// CustomResourceDefinitions, APIServices) is JSON, as unstructured.
+func (s *Server) typed(c *reqCtx) bool {
+	return !s.custom[c.gr] && scheme.Scheme.Recognizes(schema.GroupVersionKind{Group: c.group, Version: c.version, Kind: c.api.Kind})
+}
+
+// decodeObject reads a create or update body. A protobuf body of a kind the scheme does not
+// register is 415.
 func (s *Server) decodeObject(c *reqCtx, body []byte) (map[string]any, error) {
 	mt := mediaType(c.r)
 	if mt == "" {
@@ -92,7 +99,7 @@ func (s *Server) decodeObject(c *reqCtx, body []byte) (map[string]any, error) {
 	default:
 		return nil, unsupportedMediaType(s.bodyTypes(c))
 	}
-	builtin := !s.custom[c.gr]
+	builtin := s.typed(c)
 	if mt == "application/vnd.kubernetes.protobuf" && !builtin {
 		return nil, unsupportedMediaType(s.bodyTypes(c))
 	}
@@ -112,7 +119,7 @@ func (s *Server) decodeObject(c *reqCtx, body []byte) (map[string]any, error) {
 		return normalize(u)
 	}
 	if mt == "application/yaml" {
-		return nil, s.unimplemented("a YAML body for a custom resource")
+		return nil, s.unimplemented("a YAML body for a kind client-go's scheme does not register")
 	}
 	obj, err := decodeJSONObject(body)
 	if err != nil {
@@ -150,7 +157,20 @@ func (s *Server) ensureNamespace(c *reqCtx) error {
 }
 
 // commit stores obj at the next resourceVersion and emits the event. Holds s.mu.
+//
+// A dry run (dryRun=All) has run the whole write path to here and commits nothing: no RV bump, no
+// event, no stored change (k8s.io/apiserver v0.36.5 pkg/registry/generic/registry/dryrun.go: a
+// dry-run create answers without a resourceVersion, an update keeps the stored one).
 func (s *Server) commit(c *reqCtx, typ string, obj, prev map[string]any) map[string]any {
+	if c.dryRun {
+		switch typ {
+		case "ADDED":
+			delete(meta(obj), "resourceVersion")
+		case "MODIFIED":
+			meta(obj)["resourceVersion"] = meta(prev)["resourceVersion"]
+		}
+		return obj
+	}
 	s.rv++
 	meta(obj)["resourceVersion"] = strconv.FormatUint(s.rv, 10)
 	key := c.ns + "/" + fmt.Sprint(meta(obj)["name"])
@@ -211,9 +231,31 @@ func (s *Server) restrict(c *reqCtx, prev, next map[string]any) map[string]any {
 	return next
 }
 
-// bumpGeneration: metadata.generation increments when anything but metadata (and, with a status
-// subresource, status) changes.
+// generationKinds are the built-in kinds whose strategy sets metadata.generation (k8s.io/kubernetes
+// v1.36.2 pkg/registry/<group>/<kind>/strategy.go, PrepareForCreate: Generation = 1). Custom
+// resources always have it (apiextensions-apiserver pkg/registry/customresource/strategy.go).
+// Any other kind has no generation.
+var generationKinds = map[string]bool{
+	"admissionregistration.k8s.io/mutatingadmissionpolicies": true, "admissionregistration.k8s.io/mutatingadmissionpolicybindings": true,
+	"admissionregistration.k8s.io/mutatingwebhookconfigurations": true, "admissionregistration.k8s.io/validatingadmissionpolicies": true,
+	"admissionregistration.k8s.io/validatingadmissionpolicybindings": true, "admissionregistration.k8s.io/validatingwebhookconfigurations": true,
+	"apps/daemonsets": true, "apps/deployments": true, "apps/replicasets": true, "apps/statefulsets": true,
+	"batch/cronjobs": true, "batch/jobs": true, "/pods": true, "/podtemplates": true, "/replicationcontrollers": true,
+	"discovery.k8s.io/endpointslices": true, "flowcontrol.apiserver.k8s.io/flowschemas": true,
+	"flowcontrol.apiserver.k8s.io/prioritylevelconfigurations": true, "networking.k8s.io/ingresses": true,
+	"networking.k8s.io/ingressclasses": true, "networking.k8s.io/networkpolicies": true, "policy/poddisruptionbudgets": true,
+	"resource.k8s.io/deviceclasses": true, "resource.k8s.io/devicetaintrules": true, "resource.k8s.io/resourceslices": true,
+	"scheduling.k8s.io/priorityclasses": true,
+}
+
+func (s *Server) hasGeneration(c *reqCtx) bool { return s.custom[c.gr] || generationKinds[c.gr] }
+
+// bumpGeneration: for a kind that has a generation, metadata.generation increments when anything
+// but metadata (and, with a status subresource, status) changes.
 func (s *Server) bumpGeneration(c *reqCtx, prev, next map[string]any) {
+	if !s.hasGeneration(c) {
+		return
+	}
 	strip := func(o map[string]any) map[string]any {
 		x := deepCopy(o).(map[string]any)
 		delete(x, "metadata")
@@ -242,6 +284,13 @@ func (s *Server) write(c *reqCtx, prev, next map[string]any) (map[string]any, er
 	}
 	if c.subresource != "status" {
 		s.bumpGeneration(c, prev, next)
+	}
+	// k8s.io/apiserver v0.36.5 pkg/registry/generic/registry/store.go ShouldDeleteDuringUpdate
+	// (:568-580): an object marked for deletion whose last finalizer is removed is deleted.
+	if _, deleting := meta(next)["deletionTimestamp"]; deleting {
+		if fin, _ := meta(next)["finalizers"].([]any); len(fin) == 0 {
+			return s.commit(c, "DELETED", next, prev), nil
+		}
 	}
 	return s.commit(c, "MODIFIED", next, prev), nil
 }
@@ -293,7 +342,11 @@ func (s *Server) create(c *reqCtx) error {
 	}
 	md["uid"] = s.o.NewUID()
 	md["creationTimestamp"] = s.now()
-	md["generation"] = json.Number("1")
+	if s.hasGeneration(c) {
+		md["generation"] = json.Number("1")
+	} else {
+		delete(md, "generation")
+	}
 	delete(md, "resourceVersion")
 	if s.hasStatus(c) {
 		delete(obj, "status")
@@ -367,8 +420,7 @@ func (s *Server) patch(c *reqCtx) error {
 	mt := mediaType(c.r)
 	accepted := s.patchTypes(c)
 	if !hasString(accepted, mt) {
-		return apierrors.NewGenericServerResponse(http.StatusUnsupportedMediaType, "", schema.GroupResource{}, "",
-			"the body of the request was in an unknown format - accepted media types include: "+strings.Join(accepted, ", "), 0, false)
+		return unsupportedMediaType(accepted)
 	}
 	switch mt {
 	case "application/apply-patch+yaml":
@@ -425,7 +477,7 @@ func (s *Server) patch(c *reqCtx) error {
 	if err := checkName(c, next); err != nil {
 		return err
 	}
-	if !s.custom[c.gr] {
+	if s.typed(c) {
 		// A built-in kind is stored in its typed form, as after a create or update.
 		b, _ := json.Marshal(next)
 		if obj, _, err := scheme.Codecs.UniversalDeserializer().Decode(b, nil, nil); err == nil {
@@ -462,6 +514,10 @@ func (s *Server) remove(c *reqCtx) error {
 		if _, ok := meta(next)["deletionTimestamp"]; !ok {
 			meta(next)["deletionTimestamp"] = s.now()
 			meta(next)["deletionGracePeriodSeconds"] = json.Number("0")
+			// The first deletion bumps a set generation (pkg/registry/rest/delete.go:165-172).
+			if g, err := strconv.ParseInt(fmt.Sprint(meta(next)["generation"]), 10, 64); err == nil && g > 0 {
+				meta(next)["generation"] = json.Number(strconv.FormatInt(g+1, 10))
+			}
 		}
 		out, err := s.write(c, prev, next)
 		if err != nil {

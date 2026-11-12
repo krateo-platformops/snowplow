@@ -61,6 +61,9 @@ func (s *Server) review(c *reqCtx) error {
 		if c.resource != "selfsubjectrulesreviews" {
 			return kindMismatch(c, r.Kind)
 		}
+		if r.Spec.Namespace == "" { // k8s.io/kubernetes v1.36.2 pkg/registry/authorization/selfsubjectrulesreview/rest.go:70-73
+			return apierrors.NewBadRequest("no namespace on request")
+		}
 		r.Status = s.rulesStatus(c.id, r.Spec.Namespace)
 		out = r
 	default:
@@ -91,8 +94,8 @@ func (s *Server) accessStatus(who identity, ra *authorizationv1.ResourceAttribut
 	default:
 		return authorizationv1.SubjectAccessReviewStatus{EvaluationError: "exactly one of nonResourceAttributes or resourceAttributes must be specified"}
 	}
-	if s.authz.allowed(who, at) {
-		return authorizationv1.SubjectAccessReviewStatus{Allowed: true, Reason: "RBAC: allowed"}
+	if ok, why := s.authz.authorize(who, at); ok {
+		return authorizationv1.SubjectAccessReviewStatus{Allowed: true, Reason: why}
 	}
 	return authorizationv1.SubjectAccessReviewStatus{Allowed: false}
 }
@@ -102,12 +105,15 @@ func (s *Server) accessStatus(who identity, ra *authorizationv1.ResourceAttribut
 // cluster with a webhook authorizer after RBAC, the rules are RBAC's and the answer is incomplete.
 func (s *Server) rulesStatus(who identity, ns string) authorizationv1.SubjectRulesReviewStatus {
 	st := authorizationv1.SubjectRulesReviewStatus{ResourceRules: []authorizationv1.ResourceRule{}, NonResourceRules: []authorizationv1.NonResourceRule{}}
+	// k8s.io/kubernetes v1.36.2 plugin/pkg/auth/authorizer/rbac/rbac.go:129-150: a rule is a
+	// resource rule only if it names resources, and a non-resource rule only if it names URLs.
 	for _, r := range s.authz.rulesFor(who, ns) {
+		if len(r.Resources) > 0 {
+			st.ResourceRules = append(st.ResourceRules, authorizationv1.ResourceRule{Verbs: r.Verbs, APIGroups: r.APIGroups, Resources: r.Resources, ResourceNames: r.ResourceNames})
+		}
 		if len(r.NonResourceURLs) > 0 {
 			st.NonResourceRules = append(st.NonResourceRules, authorizationv1.NonResourceRule{Verbs: r.Verbs, NonResourceURLs: r.NonResourceURLs})
-			continue
 		}
-		st.ResourceRules = append(st.ResourceRules, authorizationv1.ResourceRule{Verbs: r.Verbs, APIGroups: r.APIGroups, Resources: r.Resources, ResourceNames: r.ResourceNames})
 	}
 	if rr := s.snap.CapturedFrom.SelfSubjectRulesReview; rr != nil {
 		st.Incomplete, st.EvaluationError = rr.Incomplete, rr.EvaluationError
@@ -152,6 +158,9 @@ func normalizeScalar(v any) any {
 
 // fireRules schedules every rule a write matches. Holds s.mu.
 func (s *Server) fireRules(c *reqCtx, verb string, stored map[string]any) {
+	if c.dryRun {
+		return // a dry run commits nothing, so no controller reacts to it
+	}
 	name, _ := meta(stored)["name"].(string)
 	for _, rule := range s.rules {
 		on := rule.On

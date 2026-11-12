@@ -10,7 +10,6 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -28,7 +27,7 @@ type watcher struct {
 	gr     string
 	ns     string
 	ls     labels.Selector
-	fs     fields.Selector
+	fs     *selector
 	view   func(map[string]any) map[string]any
 	ch     chan watchEvent
 	closed bool
@@ -107,7 +106,7 @@ func (s *Server) emit(gr, typ string, obj, prev map[string]any) {
 
 func boolParam(v string) bool { return v == "true" || v == "1" }
 
-func (s *Server) watch(c *reqCtx, fs fields.Selector) (bool, error) {
+func (s *Server) watch(c *reqCtx, fs *selector) (bool, error) {
 	n, err := negotiate(c.r, false)
 	if err != nil {
 		return false, err
@@ -226,32 +225,33 @@ func (s *Server) watch(c *reqCtx, fs fields.Selector) (bool, error) {
 	}
 
 	// Bookmarks every minute (the cacher's bookmarkFrequency) and the watch's own timeout come from
-	// the injectable clock, so tests drive them.
-	ticks := make(chan watchEvent, 1)
-	var stops []func() bool
-	var schedule func()
-	schedule = func() {
-		stops = append(stops, s.o.AfterFunc(bookmarkFrequency, func() {
-			s.mu.Lock()
-			ev := bookmark(nil)
-			s.mu.Unlock()
+	// the injectable clock, so tests drive them. This goroutine is the timers' one owner: a timer's
+	// callback only signals, and only this loop arms the next bookmark or stops a timer, so nothing
+	// races on them and no timer outlives the watch.
+	tick := make(chan struct{}, 1)
+	signal := func(ch chan struct{}) func() {
+		return func() {
 			select {
-			case ticks <- ev:
+			case ch <- struct{}{}:
 			default:
 			}
-			schedule()
-		}))
+		}
 	}
+	var stopBookmark func() bool
 	if bookmarks {
-		schedule()
+		stopBookmark = s.o.AfterFunc(bookmarkFrequency, signal(tick))
 	}
-	done := make(chan struct{})
+	deadline := make(chan struct{}, 1)
+	var stopDeadline func() bool
 	if timeout > 0 {
-		stops = append(stops, s.o.AfterFunc(time.Duration(timeout)*time.Second, func() { close(done) }))
+		stopDeadline = s.o.AfterFunc(time.Duration(timeout)*time.Second, signal(deadline))
 	}
 	defer func() {
-		for _, stop := range stops {
-			stop()
+		if stopBookmark != nil {
+			stopBookmark()
+		}
+		if stopDeadline != nil {
+			stopDeadline()
 		}
 		s.stop(w)
 	}()
@@ -261,11 +261,15 @@ func (s *Server) watch(c *reqCtx, fs fields.Selector) (bool, error) {
 			if !ok || !send(ev) {
 				return true, nil
 			}
-		case ev := <-ticks:
+		case <-tick:
+			s.mu.Lock()
+			ev := bookmark(nil)
+			s.mu.Unlock()
 			if !send(ev) {
 				return true, nil
 			}
-		case <-done:
+			stopBookmark = s.o.AfterFunc(bookmarkFrequency, signal(tick))
+		case <-deadline:
 			if bookmarks {
 				s.mu.Lock()
 				ev := bookmark(nil)

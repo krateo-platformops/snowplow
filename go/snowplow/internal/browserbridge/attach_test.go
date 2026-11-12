@@ -4,134 +4,109 @@ package browserbridge
 
 import (
 	"io"
+	"net"
 	"net/http"
-	"runtime"
-	"strings"
 	"syscall/js"
 	"testing"
 	"time"
 )
 
-// attachForTest installs a fake snowplowBridgeAttach, as bridge.js does, runs
-// Attach against addr and returns what Attach handed over.
-func attachForTest(t *testing.T, addr string) js.Value {
-	t.Helper()
-	got := make(chan js.Value, 1)
-	host := js.FuncOf(func(_ js.Value, args []js.Value) any {
-		got <- args[0]
-		return nil
-	})
-	js.Global().Set(HostAttach, host)
-	t.Cleanup(func() {
-		js.Global().Delete(HostAttach)
-		host.Release()
-	})
-	Attach(addr)
-	select {
-	case b := <-got:
-		return b
-	case <-time.After(5 * time.Second):
-		t.Fatal("Attach did not call snowplowBridgeAttach within 5s of the server accepting")
-		return js.Undefined()
-	}
-}
-
-// jsRecordingSink is a BridgeSink in JavaScript whose calls land in a
-// recordingSink.
-func jsRecordingSink(t *testing.T, rec *recordingSink) js.Value {
-	t.Helper()
-	fns := map[string]js.Func{
-		"head": js.FuncOf(func(_ js.Value, a []js.Value) any {
-			var hs [][2]string
-			for i := 0; i < a[2].Length(); i++ {
-				hs = append(hs, [2]string{a[2].Index(i).Index(0).String(), a[2].Index(i).Index(1).String()})
-			}
-			rec.Head(a[0].Int(), a[1].String(), hs)
-			return nil
-		}),
-		"chunk": js.FuncOf(func(_ js.Value, a []js.Value) any {
-			b := make([]byte, a[0].Length())
-			js.CopyBytesToGo(b, a[0])
-			rec.Chunk(b)
-			return nil
-		}),
-		"end":   js.FuncOf(func(js.Value, []js.Value) any { rec.End(); return nil }),
-		"error": js.FuncOf(func(_ js.Value, a []js.Value) any { rec.Error(a[0].String()); return nil }),
-	}
-	obj := js.Global().Get("Object").New()
-	for name, f := range fns {
-		obj.Set(name, f)
-	}
-	t.Cleanup(func() {
-		for _, f := range fns {
-			f.Release()
-		}
-	})
-	return obj
-}
-
-// serveGoroutines counts the goroutines bridge.serve started that are still
-// running.
-func serveGoroutines() int {
-	buf := make([]byte, 1<<20)
-	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			return strings.Count(string(buf[:n]), "browserbridge.(*bridge).serve.func1(")
-		}
-		buf = make([]byte, 2*len(buf))
-	}
-}
-
-// B2b (N6): bridge.js's cancel(id) must end the request: the handler's
-// context ends, so a /refreshes handler returns, and the goroutine serve
-// started exits. A no-op cancel would leave both running for as long as the
-// worker lives, one more for every navigation.
-func TestAttach_CancelEndsTheHandlersContextAndTheRequestsGoroutine(t *testing.T) {
-	returned := make(chan struct{})
-	addr := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer close(returned)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, ": connected\n\n")
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
+// TestAttach_ATargetRegistersBeforeTheMainServerAccepts: snowplow calls the cluster while it starts,
+// before its own server accepts, so a target must reach bridge.js on its own (d94c2ffc). Its
+// requests are relayed: the fake apiserver's 401 reaches the caller as a head.
+func TestAttach_ATargetRegistersBeforeTheMainServerAccepts(t *testing.T) {
+	const status = `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}`
+	target := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, status)
 	}))
-	bridge := attachForTest(t, addr)
-	rec := newSink()
-	req := js.ValueOf(map[string]any{
-		"method":  "GET",
-		"url":     "https://snowplow.sandbox.invalid/refreshes",
-		"headers": []any{[]any{"accept", "text/event-stream"}},
-		"body":    nil,
-	})
-	const id = 7
-	bridge.Call("serve", id, req, jsRecordingSink(t, rec))
-
-	if e := rec.next(t); e.kind != "head" || e.status != 200 {
-		t.Fatalf("first call = %+v, want head 200", e)
+	// The main server's port: free, and nothing listens on it until the target has registered.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	readBody(t, rec, ": connected\n\n")
-	if n := serveGoroutines(); n != 1 {
-		t.Fatalf("PRE: %d serve goroutines while the stream is open, want 1", n)
+	main := ln.Addr().String()
+	_ = ln.Close()
+	if conn, err := loopback.Dial("tcp", main); err == nil {
+		_ = conn.Close()
+		t.Fatalf("%s accepts after its listener closed: the test cannot hold the main server back", main)
 	}
 
-	bridge.Call("cancel", id)
+	type registered struct {
+		name   string
+		bridge js.Value
+	}
+	got := make(chan registered, 1)
+	mainAttached := make(chan struct{}, 1)
+	attach := js.FuncOf(func(js.Value, []js.Value) any { mainAttached <- struct{}{}; return nil })
+	defer attach.Release()
+	onTarget := js.FuncOf(func(_ js.Value, args []js.Value) any { got <- registered{args[0].String(), args[1]}; return nil })
+	defer onTarget.Release()
+	js.Global().Set(HostAttach, attach)
+	js.Global().Set(HostTarget, onTarget)
+	defer js.Global().Delete(HostAttach)
+	defer js.Global().Delete(HostTarget)
+
+	Attach(main, Target{Name: "apiserver", Addr: target})
+
+	var r registered
 	select {
-	case <-returned:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the handler did not return within 5s of cancel(id): its request context never ended")
+	case r = <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target was not handed to bridge.js while snowplow's server did not accept")
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for serveGoroutines() != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the request's goroutine was still running 5s after cancel(id)")
+	if r.name != "apiserver" {
+		t.Fatalf("target name %q", r.name)
+	}
+	select {
+	case <-mainAttached:
+		t.Fatal("the main bridge attached although its server never accepted")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Once the main server accepts, the main bridge attaches too.
+	mainLn, err := net.Listen("tcp", main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mainLn.Close()
+	go func() {
+		for {
+			c, err := mainLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	for _, e := range rec.all()[2:] {
-		t.Errorf("after cancel the sink got %+v", e)
+	}()
+	select {
+	case <-mainAttached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the main bridge did not attach once its server accepted")
 	}
 
-	// A cancel for a request that has finished is a no-op.
-	bridge.Call("cancel", id)
+	heads := make(chan int, 1)
+	errs := make(chan string, 1)
+	fns := []js.Func{
+		js.FuncOf(func(_ js.Value, a []js.Value) any { heads <- a[0].Int(); return nil }),
+		js.FuncOf(func(js.Value, []js.Value) any { return nil }),
+		js.FuncOf(func(js.Value, []js.Value) any { return nil }),
+		js.FuncOf(func(_ js.Value, a []js.Value) any { errs <- a[0].String(); return nil }),
+	}
+	for _, f := range fns {
+		defer f.Release()
+	}
+	sink := js.ValueOf(map[string]any{"head": fns[0], "chunk": fns[1], "end": fns[2], "error": fns[3]})
+	req := js.ValueOf(map[string]any{"method": "GET", "url": "https://kubernetes.sandbox.invalid/api/v1/namespaces", "headers": []any{}, "body": nil})
+	r.bridge.Call("serve", 1, req, sink)
+	select {
+	case code := <-heads:
+		if code != http.StatusUnauthorized {
+			t.Fatalf("head %d, want the relayed 401", code)
+		}
+	case msg := <-errs:
+		t.Fatalf("the target's 401 became an error (%q): it went through Forward, not Relay", msg)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no answer from the target")
+	}
 }

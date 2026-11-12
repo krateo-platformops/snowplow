@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -18,9 +19,10 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 )
 
 // Options configure a Server. Clock, AfterFunc and NewUID are injectable for tests.
@@ -37,21 +39,23 @@ type Options struct {
 
 // Server is the fake apiserver: an http.Handler.
 type Server struct {
-	o        Options
-	snap     Snapshot
-	mu       sync.Mutex
-	rv       uint64
-	startRV  uint64                                   // the snapshot's resourceVersion: every watch cache starts from that state
-	gvs      map[string]map[string]metav1.APIResource // "group/version" (or "v1") -> name -> resource
-	custom   map[string]bool                          // "group/resource" served from a CRD
-	store    map[string]map[string]map[string]any     // "group/resource" -> "ns/name" -> object
-	caches   map[string]*watchCache
-	watchers map[*watcher]struct{}
-	conts    map[string]*continuation
-	authz    *authorizer
-	sa       identity
-	visitor  identity
-	rules    []Rule
+	o       Options
+	snap    Snapshot
+	mu      sync.Mutex
+	rv      uint64
+	startRV uint64                                   // the snapshot's resourceVersion: every watch cache starts from that state
+	gvs     map[string]map[string]metav1.APIResource // "group/version" (or "v1") -> name -> resource
+	custom  map[string]bool                          // "group/resource" served from a CRD
+	// selectable is each custom resource's CRD selectableFields, as field labels.
+	selectable map[string][]string
+	store      map[string]map[string]map[string]any // "group/resource" -> "ns/name" -> object
+	caches     map[string]*watchCache
+	watchers   map[*watcher]struct{}
+	conts      map[string]*continuation
+	authz      *authorizer
+	sa         identity
+	visitor    identity
+	rules      []Rule
 }
 
 type continuation struct {
@@ -83,7 +87,7 @@ func New(o Options) (*Server, error) {
 		o.NewUID = newUID
 	}
 	s := &Server{o: o, gvs: map[string]map[string]metav1.APIResource{}, custom: map[string]bool{}, store: map[string]map[string]map[string]any{},
-		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}}
+		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}, selectable: map[string][]string{}}
 	if err := json.Unmarshal(o.Snapshot, &s.snap); err != nil {
 		return nil, fmt.Errorf("snapshot.json: %w", err)
 	}
@@ -105,13 +109,34 @@ func New(o Options) (*Server, error) {
 		if err := json.Unmarshal(p, &pg); err != nil {
 			return nil, fmt.Errorf("object page %d: %w", i, err)
 		}
-		objects = append(objects, pg.Items...)
+		for _, it := range pg.Items {
+			// The stored form (normalize): numbers as json.Number, as every write stores them, so the
+			// first no-op write to a loaded object compares equal and commits nothing.
+			n, err := normalize(it)
+			if err != nil {
+				return nil, fmt.Errorf("object page %d: %w", i, err)
+			}
+			objects = append(objects, n)
+		}
 	}
 	for _, obj := range objects {
 		if obj["kind"] == "CustomResourceDefinition" {
 			spec, _ := obj["spec"].(map[string]any)
 			names, _ := spec["names"].(map[string]any)
-			s.custom[fmt.Sprint(spec["group"])+"/"+fmt.Sprint(names["plural"])] = true
+			gr := fmt.Sprint(spec["group"]) + "/" + fmt.Sprint(names["plural"])
+			s.custom[gr] = true
+			// spec.versions[].selectableFields[].jsonPath (".spec.color") is the field label "spec.color".
+			versions, _ := spec["versions"].([]any)
+			for _, v := range versions {
+				vm, _ := v.(map[string]any)
+				sf, _ := vm["selectableFields"].([]any)
+				for _, f := range sf {
+					fm, _ := f.(map[string]any)
+					if jp, ok := fm["jsonPath"].(string); ok && !hasString(s.selectable[gr], strings.TrimPrefix(jp, ".")) {
+						s.selectable[gr] = append(s.selectable[gr], strings.TrimPrefix(jp, "."))
+					}
+				}
+			}
 		}
 	}
 	for _, obj := range objects {
@@ -134,6 +159,9 @@ func New(o Options) (*Server, error) {
 			"server-url": base64.StdEncoding.EncodeToString([]byte("https://kubernetes.sandbox.invalid")),
 			"token":      base64.StdEncoding.EncodeToString([]byte(o.VisitorToken)),
 		},
+	}
+	if sec, err := normalize(s.bucket("/secrets")[id.AuthnNamespace+"/"+name]); err == nil {
+		s.bucket("/secrets")[id.AuthnNamespace+"/"+name] = sec
 	}
 	if s.authz, err = newAuthorizer(objects); err != nil {
 		return nil, err
@@ -266,24 +294,33 @@ func (s *Server) authenticate(r *http.Request) (identity, error) {
 	return identity{}, apierrors.NewUnauthorized("Unauthorized")
 }
 
-// impersonate applies Impersonate-* headers (apiserver filters/impersonation.go): each
-// impersonated value needs the impersonate verb.
+// impersonate applies Impersonate-* headers as k8s.io/apiserver v0.36.5
+// pkg/endpoints/filters/impersonation/impersonation.go does: each impersonated value needs the
+// impersonate verb on its own resource (:72-122); groups or extras or a uid without a user is
+// 400 (:268-271); without Impersonate-Group a ServiceAccount gets its fixed groups (:85-91); then a
+// non-anonymous user gains system:authenticated unless a group already is it or
+// system:unauthenticated, and system:anonymous gains system:unauthenticated (:126-157).
 func (s *Server) impersonate(r *http.Request, id identity) (identity, error) {
 	user := r.Header.Get("Impersonate-User")
-	var groups []string
-	for _, g := range r.Header.Values("Impersonate-Group") {
-		groups = append(groups, g)
-	}
+	groups := r.Header.Values("Impersonate-Group")
+	groupsSpecified := len(groups) > 0
 	uid := r.Header.Get("Impersonate-Uid")
-	var extras []string
-	for h := range r.Header {
-		if strings.HasPrefix(strings.ToLower(h), "impersonate-extra-") {
-			extras = append(extras, h)
+	type extra struct{ key, value string }
+	var extras []extra
+	for h, vs := range r.Header {
+		if k, ok := strings.CutPrefix(h, "Impersonate-Extra-"); ok {
+			key := strings.ToLower(k)
+			if u, err := url.PathUnescape(key); err == nil {
+				key = u
+			}
+			for _, v := range vs {
+				extras = append(extras, extra{key, v})
+			}
 		}
 	}
 	if user == "" {
-		if len(groups) > 0 || uid != "" || len(extras) > 0 {
-			return id, apierrors.NewInternalError(errors.New("requested impersonation of groups or extra without impersonating a user"))
+		if groupsSpecified || uid != "" || len(extras) > 0 {
+			return id, apierrors.NewBadRequest("requested impersonation of groups, extra or uid without impersonating a user")
 		}
 		return id, nil
 	}
@@ -293,15 +330,14 @@ func (s *Server) impersonate(r *http.Request, id identity) (identity, error) {
 		}
 		return nil
 	}
-	var saNS, saName string
-	if rest, ok := strings.CutPrefix(user, saPrefix); ok {
-		if parts := strings.SplitN(rest, ":", 2); len(parts) == 2 {
-			saNS, saName = parts[0], parts[1]
-		}
-	}
-	if saName != "" {
-		if err := check(attributes{Verb: "impersonate", Resource: "serviceaccounts", Namespace: saNS, Name: saName}); err != nil {
+	out := identity{User: user}
+	if rest, ok := strings.CutPrefix(user, saPrefix); ok && strings.Count(rest, ":") == 1 {
+		ns, name, _ := strings.Cut(rest, ":")
+		if err := check(attributes{Verb: "impersonate", Resource: "serviceaccounts", Namespace: ns, Name: name}); err != nil {
 			return id, err
+		}
+		if !groupsSpecified {
+			out.Groups = []string{"system:serviceaccounts", "system:serviceaccounts:" + ns}
 		}
 	} else if err := check(attributes{Verb: "impersonate", Resource: "users", Name: user}); err != nil {
 		return id, err
@@ -310,29 +346,33 @@ func (s *Server) impersonate(r *http.Request, id identity) (identity, error) {
 		if err := check(attributes{Verb: "impersonate", Resource: "groups", Name: g}); err != nil {
 			return id, err
 		}
+		out.Groups = append(out.Groups, g)
+	}
+	for _, e := range extras {
+		if err := check(attributes{Verb: "impersonate", Group: "authentication.k8s.io", Resource: "userextras", Subresource: e.key, Name: e.value}); err != nil {
+			return id, err
+		}
 	}
 	if uid != "" {
 		if err := check(attributes{Verb: "impersonate", Group: "authentication.k8s.io", Resource: "uids", Name: uid}); err != nil {
 			return id, err
 		}
 	}
-	if len(extras) > 0 {
-		return id, s.unimplemented("Impersonate-Extra-* headers")
+	if user != "system:anonymous" {
+		if !hasString(out.Groups, "system:authenticated") && !hasString(out.Groups, "system:unauthenticated") {
+			out.Groups = append(out.Groups, "system:authenticated")
+		}
+	} else if !hasString(out.Groups, "system:unauthenticated") {
+		out.Groups = append(out.Groups, "system:unauthenticated")
 	}
-	switch {
-	case saName != "" && len(groups) == 0:
-		groups = serviceAccountIdentity(saNS, saName).Groups
-	case user != "system:anonymous" && !hasString(groups, "system:authenticated"):
-		groups = append(groups, "system:authenticated")
-	}
-	label := "other"
+	out.Label = "other"
 	switch user {
 	case s.visitor.User:
-		label = "visitor"
+		out.Label = "visitor"
 	case s.sa.User:
-		label = "sa"
+		out.Label = "sa"
 	}
-	return identity{User: user, Groups: groups, Label: label}, nil
+	return out, nil
 }
 
 func hasString(list []string, v string) bool {
@@ -388,7 +428,7 @@ func (s *Server) nonResource(path string, id identity, line map[string]any) erro
 	line["verb"] = "get"
 	at := attributes{Verb: "get", Path: path, NonResource: true}
 	if !s.authz.allowed(id, at) {
-		return apierrors.NewGenericServerResponse(http.StatusForbidden, "", schema.GroupResource{}, "", "forbidden: "+reason(id, at), 0, false)
+		return apierrors.NewForbidden(schema.GroupResource{}, "", errors.New(reason(id, at)))
 	}
 	return nil
 }
@@ -403,6 +443,27 @@ type reqCtx struct {
 	gr                                                  string
 	api                                                 metav1.APIResource
 	verb                                                string
+	// dryRun: the write runs in full and commits nothing (dryRun=All).
+	dryRun bool
+}
+
+// parseDryRun reads dryRun as the apiserver's option validation does: "All" is the only value
+// (k8s.io/apimachinery pkg/apis/meta/v1/validation ValidateDryRun), anything else is 422.
+func parseDryRun(verb string, q url.Values) (bool, error) {
+	vs, ok := q["dryRun"]
+	if !ok {
+		return false, nil
+	}
+	kind := map[string]string{"create": "CreateOptions", "update": "UpdateOptions", "patch": "PatchOptions", "delete": "DeleteOptions", "deletecollection": "DeleteOptions"}[verb]
+	if kind == "" {
+		return false, nil
+	}
+	for _, v := range vs {
+		if v != "All" {
+			return false, apierrors.NewInvalid(schema.GroupKind{Group: "meta.k8s.io", Kind: kind}, "", field.ErrorList{field.NotSupported(field.NewPath("dryRun"), v, []string{"All"})})
+		}
+	}
+	return true, nil
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, id identity, line map[string]any) (bool, error) {
@@ -524,20 +585,15 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, id identity, line
 		return false, apierrors.NewMethodNotSupported(schema.GroupResource{Group: group, Resource: resource}, r.Method)
 	}
 	line["verb"] = verb
-	var fs fields.Selector
 	if verb == "list" || verb == "watch" {
 		line["name"] = "*"
 		if ns == "" {
 			line["namespace"] = "*"
 		}
-		var err error
-		if fs, err = parseFieldSelector(q.Get("fieldSelector")); err != nil {
-			return false, apierrors.NewBadRequest(err.Error())
-		}
 	}
 	at := attributes{Verb: verb, Group: group, Resource: resource, Subresource: sub, Namespace: authzNS, Name: name}
-	if at.Name == "" {
-		at.Name = selectorName(fs) // RequestInfo: a list/watch pinned by metadata.name= authorizes as that name
+	if at.Name == "" && (verb == "list" || verb == "watch") {
+		at.Name = selectorName(q.Get("fieldSelector")) // RequestInfo: a list/watch pinned by metadata.name= authorizes as that name
 	}
 	// Authorization comes before routing, as in the apiserver's handler chain: an identity that may
 	// not read a resource gets 403 for it whether or not it exists.
@@ -556,7 +612,23 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, id identity, line
 	if !api.Namespaced && ns != "" {
 		return false, notFoundPath()
 	}
-	c := &reqCtx{r: r, w: w, id: id, line: line, group: group, version: version, gv: gv, resource: resource, subresource: sub, ns: ns, name: name, gr: group + "/" + resource, api: api, verb: verb}
+	// The selector is the handler's to parse, after authorization: a caller that may not list gets
+	// 403 whatever its selector says.
+	var fs *selector
+	if verb == "list" || verb == "watch" {
+		var err error
+		if fs, err = parseFieldSelector(q.Get("fieldSelector"), s.fieldsFor(group+"/"+resource)); err != nil {
+			return false, apierrors.NewBadRequest(err.Error())
+		}
+	}
+	dryRun, err := parseDryRun(verb, q)
+	if err != nil {
+		return false, err
+	}
+	if dryRun {
+		line["dryRun"] = true
+	}
+	c := &reqCtx{r: r, w: w, id: id, line: line, group: group, version: version, gv: gv, resource: resource, subresource: sub, ns: ns, name: name, gr: group + "/" + resource, api: api, verb: verb, dryRun: dryRun}
 	if group == "authorization.k8s.io" && verb == "create" {
 		line["verb"] = "review"
 		return false, s.review(c)
@@ -621,8 +693,7 @@ func negotiate(r *http.Request, list bool) (negotiated, error) {
 			return negotiated{meta: true, v: p["v"], ct: "application/json;as=" + as + ";g=meta.k8s.io;v=" + p["v"]}, nil
 		}
 	}
-	return negotiated{}, apierrors.NewGenericServerResponse(http.StatusNotAcceptable, "", schema.GroupResource{}, "",
-		"only the following media types are accepted: application/json, application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1", 0, false)
+	return negotiated{}, negotiation.NewNotAcceptableError([]string{"application/json", "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"})
 }
 
 func metaOf(obj map[string]any, v string) map[string]any {
@@ -698,7 +769,7 @@ func (s *Server) get(c *reqCtx) error {
 	return nil
 }
 
-func (s *Server) matching(c *reqCtx, ls labels.Selector, fs fields.Selector) []map[string]any {
+func (s *Server) matching(c *reqCtx, ls labels.Selector, fs *selector) []map[string]any {
 	type kv struct {
 		k string
 		o map[string]any
@@ -721,7 +792,7 @@ func (s *Server) matching(c *reqCtx, ls labels.Selector, fs fields.Selector) []m
 	return objs
 }
 
-func (s *Server) list(c *reqCtx, fs fields.Selector) error {
+func (s *Server) list(c *reqCtx, fs *selector) error {
 	n, err := negotiate(c.r, true)
 	if err != nil {
 		return err
@@ -736,6 +807,13 @@ func (s *Server) list(c *reqCtx, fs fields.Selector) error {
 	cont := q.Get("continue")
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A continue token lives as long as etcd keeps its revision: the apiserver compacts every
+	// 5 minutes (k8s.io/apiserver v0.36.5 pkg/storage/storagebackend/config.go:38).
+	for tok, cn := range s.conts {
+		if s.o.Clock().Sub(cn.created) > continueTTL {
+			delete(s.conts, tok)
+		}
+	}
 	kind, apiVersion := c.api.Kind+"List", c.gv
 	if n.meta {
 		kind, apiVersion = "PartialObjectMetadataList", "meta.k8s.io/"+n.v
@@ -757,11 +835,11 @@ func (s *Server) list(c *reqCtx, fs fields.Selector) error {
 		}
 	}
 	md := map[string]any{"resourceVersion": listRV}
-	// resourceVersion=0 is served from the watch cache, which ignores limit.
-	if cont == "" && (rv == "0" || limit <= 0) {
-		limit = len(all)
+	// No limit, or resourceVersion=0 (served from the watch cache, which ignores limit): the rest.
+	end := len(all)
+	if limit > 0 && !(cont == "" && rv == "0") {
+		end = min(start+limit, len(all))
 	}
-	end := min(start+limit, len(all))
 	pageItems := all[start:end]
 	if end < len(all) {
 		tok := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s/%s/%d/%s", c.gr, listRV, end, s.o.NewUID())))

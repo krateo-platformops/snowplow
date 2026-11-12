@@ -53,8 +53,9 @@ type harness struct {
 }
 
 type opts struct {
-	edit  func(snap map[string]any)
-	extra []map[string]any
+	edit     func(snap map[string]any)
+	pageEdit func(objects []map[string]any)
+	extra    []map[string]any
 }
 
 func readFixture(t *testing.T, rel string) []byte {
@@ -78,7 +79,18 @@ func newHarness(t *testing.T, o opts) *harness {
 		o.edit(m)
 		snap, _ = json.Marshal(m)
 	}
-	pages := [][]byte{readFixture(t, "objects/000.json")}
+	page0 := readFixture(t, "objects/000.json")
+	if o.pageEdit != nil {
+		var pg struct {
+			Items []map[string]any `json:"items"`
+		}
+		if err := json.Unmarshal(page0, &pg); err != nil {
+			t.Fatal(err)
+		}
+		o.pageEdit(pg.Items)
+		page0, _ = json.Marshal(pg)
+	}
+	pages := [][]byte{page0}
 	if len(o.extra) > 0 {
 		b, _ := json.Marshal(map[string]any{"items": o.extra})
 		pages = append(pages, b)

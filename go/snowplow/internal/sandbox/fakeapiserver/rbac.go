@@ -12,10 +12,17 @@ import (
 )
 
 // RBAC authorization over the snapshot's Roles, ClusterRoles and bindings, as kube-apiserver's
-// RBAC authorizer decides it: plugin/pkg/auth/authorizer/rbac/rbac.go for the binding walk, and
-// pkg/apis/rbac/v1/evaluation_helpers.go for the rule matching (k8s.io/kubernetes, which no
-// library exports, so the two are transcribed here). It is the only authorizer: no allow-all, no
-// node authorizer, no webhook.
+// RBAC authorizer decides it. k8s.io/kubernetes is not a library, so these are transcribed from
+// v1.36.2:
+//
+//	plugin/pkg/auth/authorizer/rbac/rbac.go:56-66       the visitor and the allow reason
+//	plugin/pkg/auth/authorizer/rbac/rbac.go:129-150     RulesFor: a rule with no resources is no resource rule
+//	pkg/registry/rbac/validation/rule.go:139-177        describing a binding and its subject
+//	pkg/registry/rbac/validation/rule.go:280-305        appliesToUser (a ServiceAccount subject with
+//	                                                    no namespace takes the RoleBinding's)
+//	pkg/apis/rbac/v1/evaluation_helpers.go              the rule matching
+//
+// It is the only authorizer: no allow-all, no node authorizer, no webhook.
 
 const saPrefix = "system:serviceaccount:"
 
@@ -84,16 +91,41 @@ func newAuthorizer(objects []map[string]any) (*authorizer, error) {
 	return a, nil
 }
 
-func subjectMatches(s rbacv1.Subject, id identity) bool {
-	switch s.Kind {
-	case rbacv1.UserKind:
-		return s.Name == id.User
-	case rbacv1.GroupKind:
-		return slices.Contains(id.Groups, s.Name)
-	case rbacv1.ServiceAccountKind:
-		return id.User == saPrefix+s.Namespace+":"+s.Name
+// appliesTo is rule.go appliesToUser: the first subject that names id, if any. bindingNS is ""
+// for a ClusterRoleBinding.
+func appliesTo(subjects []rbacv1.Subject, id identity, bindingNS string) (rbacv1.Subject, bool) {
+	for _, s := range subjects {
+		switch s.Kind {
+		case rbacv1.UserKind:
+			if s.Name == id.User {
+				return s, true
+			}
+		case rbacv1.GroupKind:
+			if slices.Contains(id.Groups, s.Name) {
+				return s, true
+			}
+		case rbacv1.ServiceAccountKind:
+			ns := s.Namespace
+			if ns == "" {
+				ns = bindingNS
+			}
+			if ns != "" && id.User == saPrefix+ns+":"+s.Name {
+				return s, true
+			}
+		}
 	}
-	return false
+	return rbacv1.Subject{}, false
+}
+
+func describeSubject(s rbacv1.Subject, bindingNS string) string {
+	if s.Kind == rbacv1.ServiceAccountKind {
+		ns := s.Namespace
+		if ns == "" {
+			ns = bindingNS
+		}
+		return fmt.Sprintf("%s %q", s.Kind, s.Name+"/"+ns)
+	}
+	return fmt.Sprintf("%s %q", s.Kind, s.Name)
 }
 
 func (a *authorizer) roleRules(ref rbacv1.RoleRef, ns string) []rbacv1.PolicyRule {
@@ -110,24 +142,45 @@ func (a *authorizer) roleRules(ref rbacv1.RoleRef, ns string) []rbacv1.PolicyRul
 	return nil
 }
 
-// rulesFor is the rules that apply to id in namespace ns ("" = cluster scope only).
+// visit calls f with each rule that applies to id in namespace ns ("" = cluster scope only) and
+// the description of the binding it came through, until f returns false.
+func (a *authorizer) visit(id identity, ns string, f func(source string, r rbacv1.PolicyRule) bool) {
+	for _, b := range a.clusterRoleBindings {
+		s, ok := appliesTo(b.Subjects, id, "")
+		if !ok {
+			continue
+		}
+		src := fmt.Sprintf("ClusterRoleBinding %q of %s %q to %s", b.Name, b.RoleRef.Kind, b.RoleRef.Name, describeSubject(s, ""))
+		for _, r := range a.roleRules(b.RoleRef, "") {
+			if !f(src, r) {
+				return
+			}
+		}
+	}
+	if ns == "" {
+		return
+	}
+	for _, b := range a.roleBindings {
+		if b.Namespace != ns {
+			continue
+		}
+		s, ok := appliesTo(b.Subjects, id, b.Namespace)
+		if !ok {
+			continue
+		}
+		src := fmt.Sprintf("RoleBinding %q of %s %q to %s", b.Name+"/"+b.Namespace, b.RoleRef.Kind, b.RoleRef.Name, describeSubject(s, b.Namespace))
+		for _, r := range a.roleRules(b.RoleRef, ns) {
+			if !f(src, r) {
+				return
+			}
+		}
+	}
+}
+
+// rulesFor is the rules that apply to id in namespace ns.
 func (a *authorizer) rulesFor(id identity, ns string) []rbacv1.PolicyRule {
 	var rules []rbacv1.PolicyRule
-	for _, b := range a.clusterRoleBindings {
-		if slices.ContainsFunc(b.Subjects, func(s rbacv1.Subject) bool { return subjectMatches(s, id) }) {
-			rules = append(rules, a.roleRules(b.RoleRef, "")...)
-		}
-	}
-	if ns != "" {
-		for _, b := range a.roleBindings {
-			if b.Namespace != ns {
-				continue
-			}
-			if slices.ContainsFunc(b.Subjects, func(s rbacv1.Subject) bool { return subjectMatches(s, id) }) {
-				rules = append(rules, a.roleRules(b.RoleRef, ns)...)
-			}
-		}
-	}
+	a.visit(id, ns, func(_ string, r rbacv1.PolicyRule) bool { rules = append(rules, r); return true })
 	return rules
 }
 
@@ -158,15 +211,30 @@ func ruleAllows(r rbacv1.PolicyRule, at attributes) bool {
 	return len(r.ResourceNames) == 0 || (at.Name != "" && slices.Contains(r.ResourceNames, at.Name))
 }
 
-func (a *authorizer) allowed(id identity, at attributes) bool {
+// authorize is rbac.go Authorize: allowed, with "RBAC: allowed by <binding>" as its reason.
+func (a *authorizer) authorize(id identity, at attributes) (bool, string) {
 	ns := at.Namespace
 	if at.NonResource {
 		ns = ""
 	}
-	return slices.ContainsFunc(a.rulesFor(id, ns), func(r rbacv1.PolicyRule) bool { return ruleAllows(r, at) })
+	allowed, why := false, ""
+	a.visit(id, ns, func(src string, r rbacv1.PolicyRule) bool {
+		if ruleAllows(r, at) {
+			allowed, why = true, "RBAC: allowed by "+src
+			return false
+		}
+		return true
+	})
+	return allowed, why
 }
 
-// reason is the RBAC authorizer's denial text (rbac.go: "User %q cannot %s resource %q ...").
+func (a *authorizer) allowed(id identity, at attributes) bool {
+	ok, _ := a.authorize(id, at)
+	return ok
+}
+
+// reason is the apiserver's denial text (k8s.io/apiserver pkg/endpoints/handlers/responsewriters
+// errors.go forbiddenMessage); RBAC's own deny reason is empty when no rule failed to resolve.
 func reason(id identity, at attributes) string {
 	if at.NonResource {
 		return fmt.Sprintf("User %q cannot %s path %q", id.User, at.Verb, at.Path)
@@ -175,9 +243,8 @@ func reason(id identity, at attributes) string {
 	if at.Subresource != "" {
 		res += "/" + at.Subresource
 	}
-	scope := "at the cluster scope"
 	if at.Namespace != "" {
-		scope = fmt.Sprintf("in the namespace %q", at.Namespace)
+		return fmt.Sprintf("User %q cannot %s resource %q in API group %q in the namespace %q", id.User, at.Verb, res, at.Group, at.Namespace)
 	}
-	return fmt.Sprintf("User %q cannot %s resource %q in API group %q %s", id.User, at.Verb, res, at.Group, scope)
+	return fmt.Sprintf("User %q cannot %s resource %q in API group %q at the cluster scope", id.User, at.Verb, res, at.Group)
 }
