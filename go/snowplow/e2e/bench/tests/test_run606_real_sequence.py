@@ -1463,9 +1463,12 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 # at a version the fake registry has not published: preflighted only when on
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
                  "feature": "specialistAgents"}]
-                # run 26 (FAKE_FRONTEND_PIN=1): the frontend, as 0.3.545 pins it (no repo of its own)
-                + ([{"name": "frontend", "kind": "Frontend", "chart": "frontend", "version": "1.8.34",
-                     "feature": "portal"}] if os.environ.get("FAKE_FRONTEND_PIN") == "1" else [])}))
+                # run 26: the frontend, pinned as 0.3.545 pins it (no repo of its own) at
+                # FAKE_FRONTEND_PIN (0.3.545's own is 1.8.34); by default one that carries the login
+                # form contract (bench/login_contract.py, run 26d); "none": no frontend pin
+                + ([{"name": "frontend", "kind": "Frontend", "chart": "frontend",
+                     "version": os.environ.get("FAKE_FRONTEND_PIN", "1.8.40"), "feature": "portal"}]
+                   if os.environ.get("FAKE_FRONTEND_PIN") != "none" else [])}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")

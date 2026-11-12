@@ -255,7 +255,8 @@ runenv() {
   local name="RUN_NAME_$1" tag="SNOWPLOW_TAG_$1" dig="EXPECTED_IMAGE_DIGEST_$1" go="BENCH_606_GO_$1"
   local out="OUT_$1" fw="BENCH_1004_GO_$1"
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
-          BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}")
+          BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}"
+          FRONTEND_TAG_VAR="FRONTEND_TAG_$1")   # run 26d: its login-contract refusal names this run's variable
   # run 26: the run's frontend override, only when it has one
   local ft="FRONTEND_TAG_$1" fd="EXPECTED_FRONTEND_DIGEST_$1"
   if [[ -n "${!ft:-}" ]]; then

@@ -387,4 +387,31 @@ export function recordOps (r, tags, timeoutMs, actionAt) {
   return ops
 }
 
+// Run 26d (frontend 1.8.40: 0 of 5 sessions signed in): the login form contract, frontend#659
+// (ui/src/pages/Login/LoginForm/LoginForm.tsx loginFormNameOf; pinned by
+// ui/src/pages/Login/AuthMethods/AuthMethods.ids.test.tsx). Basic login is the form named
+// `login_basic`, whose field ids antd prefixes with that name, submitted by that form's own
+// submit control (antd htmlType='submit', exactly one per form). Never a label, a button's text or
+// autocomplete: with two strategies on the page the labels repeat, and the button's text is not
+// part of the contract (1.8.36-1.8.39 render "Sign In", 1.8.40 "Sign in").
+// bench/login_contract.py SELECTORS holds the same strings and refuses a frontend older than the
+// first release carrying them (1.8.36).
+export const LOGIN = {
+  form: 'form#login_basic',
+  username: '#login_basic_username',
+  password: '#login_basic_password',
+  submit: 'button[type="submit"]',      // inside `form`
+}
+
+// The time after which a session's first sign-in can no longer land, from the script's own
+// bounds (browser.js uses each of them on that path): the login page's navigation (gotoLogin:
+// `tries` attempts of pageTimeoutMs each, `retryMs` apart), the two fills and the submit click
+// (pageTimeoutMs each), the arrival (settled: pageTimeoutMs + signinTimeoutMs) and its record
+// (readMs). browser.js's sign-in gate: no session signed in by then, and none can.
+export function signinBoundMs (cfg, tries, retryMs, readMs) {
+  const page = cfg.pageTimeoutMs
+  const signin = cfg.signinTimeoutMs || 60000
+  return tries * page + (tries - 1) * retryMs + 3 * page + page + signin + readMs
+}
+
 export { callOf, loadOf, settledNow, sseStreamOf, timingOf }

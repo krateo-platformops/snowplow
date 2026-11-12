@@ -92,6 +92,9 @@ fi
 # after the reboot, BEFORE any load, every live frontend pod's imageID must
 # carry EXPECTED_FRONTEND_DIGEST, or the run is VOID, exactly as snowplow's.
 # Unset: the installer's pinned frontend runs, and nothing here changes.
+# Either way (run 26d), with LOAD_DRIVER=k6 the frontend that runs must carry the login form
+# contract k6/browser.js signs in through (frontend#659, first in 1.8.36): the login-contract
+# step refuses an older one by name, before any cluster (bench/login_contract.py).
 FRONTEND_TAG="${FRONTEND_TAG:-}"
 EXPECTED_FRONTEND_DIGEST="${EXPECTED_FRONTEND_DIGEST:-}"
 if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
@@ -107,6 +110,13 @@ if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
     echo "refusing: EXPECTED_FRONTEND_DIGEST must be sha256:<64 lowercase hex>, got '${EXPECTED_FRONTEND_DIGEST}'" >&2
     exit 2
   fi
+fi
+# The variable an operator sets this run's frontend with, named in the login-contract refusal
+# (s_login_contract): FRONTEND_TAG here, FRONTEND_TAG_<L> when run606_pair.sh launches run L.
+FRONTEND_TAG_VAR="${FRONTEND_TAG_VAR:-FRONTEND_TAG}"
+if [[ ! "$FRONTEND_TAG_VAR" =~ ^FRONTEND_TAG(_[A-Za-z0-9]+)?$ ]]; then
+  echo "refusing: FRONTEND_TAG_VAR must be FRONTEND_TAG or FRONTEND_TAG_<run>, got '${FRONTEND_TAG_VAR}'" >&2
+  exit 2
 fi
 FRONTEND_POD_SELECTOR="${FRONTEND_POD_SELECTOR:-app.kubernetes.io/name=frontend}"
 # Bound on waiting for the old ReplicaSet's Terminating pod to go before the
@@ -773,6 +783,25 @@ s_source() {
     *) record_failure "source FAILED: the installer chart does not resolve or verify ($OUT/installer-preflight.json)"; return 1 ;;
   esac
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
+}
+# s_login_contract (run 26d: 0 of 5 browser sessions signed in, frontend 1.8.40 renamed the login
+# form): the frontend this install runs (the installer's pin, or FRONTEND_TAG through
+# componentValues.frontend.image.tag, read as every pin is read) must carry the login form contract
+# k6/browser.js signs in through (frontend#659, bench/login_contract.py), or the run is refused by
+# name, BEFORE any cluster exists, in the dry pass too. Only the k6 driver signs in through the UI.
+s_login_contract() {
+  [[ "$LOAD_DRIVER" == "k6" ]] || { log "login form contract: not checked (LOAD_DRIVER=${LOAD_DRIVER} signs in through no UI)"; return 0; }
+  write_installer_values
+  local rc=0 ln why
+  python3 -m bench.login_contract check --installer-pulled "$OUT/installer-pulled" \
+      --values "$OUT/installer-values.yaml" --var "$FRONTEND_TAG_VAR" --out "$OUT/login-contract.json" 2>"$KERR" || rc=$?
+  (( rc == 0 )) || why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) && return 0
+  : > "$KERR"     # the refusal is the failure's own line, said once
+  record_failure "login-contract FAILED: ${why:-bench.login_contract exited ${rc} ($OUT/login-contract.json)}"
 }
 # s_schema: every manifest the run applies, rendered offline and validated
 # against the CRDs of the components INSTALLER_VERSION pins (bench/crd_schema.py),
@@ -1953,12 +1982,14 @@ wait_drive_done() {
       want="${want:-1}"
       if [[ -n "$st" && "${ready:-0}" -ge "$want" ]]; then
         driver_exit_codes "$j" "${ready}/${want}"
+        DRIVERS_OVER+="$j "      # its end is taken: never judged again as ending early
         break
       fi
       if [[ "${failed:-0}" -ge 1 ]]; then
         log "measure FAILED: a $j driver pod failed before its results were final"
         return 1
       fi
+      driver_ended_early "$j" || return 1
       for k in $(driver_jobs); do
         # only positive evidence fails the step: a pod seen Pending past
         # DRIVER_PENDING_S (its own creationTimestamp) or a restarting init step
@@ -1990,6 +2021,45 @@ wait_drive_done() {
       sleep "$DRIVE_POLL_S"
     done
   done
+}
+# driver_ended_early <job being waited on>: run 26d measured for hours with 0 browser sessions:
+# every session's sign-in failed in its first minute, the k6browser pod's run was over (Ready),
+# and this wait only looked at it once k6load's whole drive was. Now every OTHER driver Job is
+# read at each poll: one whose run is over (its pods Ready) with a non-zero exit, while the drive
+# goes on, fails the step at once, by name (k6/browser.js's sign-in gate aborts its test with
+# k6's threshold exit, 99, when no session signed in within its bound). Only positive evidence
+# fails: a read that does not answer says nothing here (the wait's own reads judge the API).
+# A driver over with exit 0, or one this wait already saw end, is left alone (DRIVERS_OVER): after
+# the drive a non-zero exit stays the verdict's to judge (driver_exit_codes).
+DRIVERS_OVER=" "
+driver_ended_early() {
+  local j="$1" k st ready want names p rc bad why
+  for k in $(driver_jobs); do
+    [[ "$k" != "$j" && "$DRIVERS_OVER" != *" $k "* ]] || continue
+    st="$("${K[@]}" --request-timeout=60s -n bench-loadgen get "job/$k" \
+             -o jsonpath='{.status.ready}/{.status.failed}/{.spec.completions}' 2>/dev/null)" || continue
+    IFS=/ read -r ready _ want <<< "$st"
+    [[ -n "$st" && "${ready:-0}" -ge "${want:-1}" ]] || continue
+    names="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l "job-name=$k" -o name 2>/dev/null)" || continue
+    [[ -n "$names" ]] || continue
+    bad="" why=""
+    for p in $names; do
+      rc="$(bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "${p#pod/}" -- cat /out/done 2>/dev/null | tr -d '[:space:]')"
+      [[ -n "$rc" ]] || continue 2          # unread: nothing is concluded at this poll
+      [[ "$rc" == "0" ]] || bad+=" ${p#pod/}=rc${rc}"
+      if [[ "$k" == "k6browser" && "$rc" == "99" ]]; then
+        why=": no browser session signed in within k6/browser.js's sign-in bound (its sign-in gate, browser_first_signins, aborted the test; the browser log names each session's failed step)"
+      fi
+    done
+    if [[ -z "$bad" ]]; then
+      DRIVERS_OVER+="$k "
+      continue
+    fi
+    : > "$KERR"      # this failure's evidence is its own line
+    record_failure "measure FAILED: the $k driver's run ended while $j still drives:${bad}${why}" || true
+    return 1
+  done
+  return 0
 }
 # driver_exit_codes <job> <ready>: Ready only says the run is OVER; each
 # pod's /out/done holds its exit code, and the log says which it was. A
@@ -2871,6 +2941,7 @@ start_host_load
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s; ${TTL_HOW}) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
 step source    s_source
+step login-contract s_login_contract
 step cert-manager-source s_cert_manager_source
 step schema    s_schema
 step registry  s_registry
