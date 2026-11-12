@@ -168,14 +168,14 @@ def test_the_table_reads_every_part_of_the_footprint_and_each_row_reads_one():
     # every regional row names a quota the region really lists (the 10-25 reading)
     region_metrics = {m for row in gke.RUN_QUOTAS if row.source == "region" for m, _, _ in row.needs(fp)}
     assert region_metrics <= LISTED, region_metrics - LISTED
-    assert set(base) == region_metrics | {gke.CLUSTER_QUOTA_ID, "CPUS_ALL_REGIONS"}
+    assert set(base) == region_metrics | {gke.CLUSTER_QUOTA_ID, "CPUS_ALL_REGIONS", "FIREWALLS"}
 
 
 def test_the_table_holds_every_quota_the_issues_name():
     quotas = {row.quota for row in gke.RUN_QUOTAS}
     assert {"SSD_TOTAL_GB", "ClustersPerRegion", "STATIC_ADDRESSES", "IN_USE_ADDRESSES", "<FAMILY>_CPUS",
             "EXTERNAL_NETWORK_LB_FORWARDING_RULES", "REGIONAL_EXTERNAL_NETWORK_LB_BACKEND_SERVICES",
-            "NETWORK_ENDPOINT_GROUPS", "CPUS_ALL_REGIONS"} <= quotas
+            "NETWORK_ENDPOINT_GROUPS", "CPUS_ALL_REGIONS", "FIREWALLS"} <= quotas
 
 
 def test_a_machine_family_disk_type_or_version_the_table_does_not_know_is_refused():

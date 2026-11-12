@@ -2,8 +2,14 @@
 and bench/testvm.py (#1338, a VM for any team's heavy test suite) share. Factored out of vm606, not
 copied: each rule below is vm606's, stated once.
 
-  - gcloud(): one call, its argv printed (RUN: / DRY-RUN:), its stdout and stderr the caller's: gcloud's
-    error text names the operator's account, so only its code ever reaches output (error_summary).
+  - gcloud(): one call, its argv printed (RUN: / DRY-RUN:), its stdout and stderr the caller's. A refusal of a
+    gcloud call says gcloud's own CAUSE (gcloud_cause, #1361): the API's error and message (QUOTA_EXCEEDED,
+    "Quota 'FIREWALLS' exceeded", an invalid or unrecognized argument), with only the identity removed (the
+    authenticated-as sentence, every e-mail: bench.identity) and the end kept (bench.noanswer.cause, #1354).
+    SSH and scp keep error_summary's code only: an OS Login refusal names the POSIX user.
+  - create(): a create GCE refuses at once because a resource it uses "is not ready" (run tvsmoke2: another
+    tenant's GKE create patching the region's default subnetwork) waits for the operation changing that resource
+    to end, then creates again, within the call's bound; nothing was made by the refused call.
   - SELECTION by exact name. A resource is read by `describe` (its own NotFound is "absent", any other
     failure refuses: not_found() counts a NotFound only when it names the resource's own full path, since
     gcloud words a missing PARENT the same way), or by exact equality over one unfiltered list read with
@@ -18,7 +24,8 @@ copied: each rule below is vm606's, stated once.
     waiting can fix is waited out within a bound, any other stops at once, named by its number only.
   - AS MADE: a describe is reduced to the fields a create command sets (FIREWALL_FIELDS; each tool's own
     instance table), and diff() names each field that differs from what the tool RECORDED creating.
-  - quota_check(): a VM's footprint against its region's quotas (bench.gke's primitives), failing closed.
+  - quota_check(): a VM's footprint against its region's quotas and the project's (FIREWALLS, #1361:
+    project-info describe), bench.gke's primitives, failing closed.
   - BOUNDED TRANSFERS (#1336): a byte stream over `gcloud compute ssh` (never `compute scp`: on 2026-11-11
     scp of a 31 MB file through IAP hung twice for 55 min, while an ssh-streamed tar went through), bounded
     by a deadline derived from its byte count and a rate measured by a probe of the same direction just
@@ -42,8 +49,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from bench import gke
-from bench.identity import error_summary, redact_identity
+from bench import gke, noanswer
+from bench.identity import error_summary, redact_identity, redact_text
 
 NETWORK = "default"
 IAP_RANGE = "35.235.240.0/20"          # IAP's TCP-forwarding source range
@@ -100,6 +107,106 @@ def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:.0f} s"
     return p.returncode, p.stdout, p.stderr
+
+
+def gcloud_cause(err: str | None) -> str:
+    """A failed gcloud call's own words, for its refusal (#1361: "no error code; the error text is withheld" hid
+    run tvsmoke1's `Quota 'FIREWALLS' exceeded`). Only the identity goes (bench.identity.redact_text: the
+    authenticated-as sentence whole, wrapped or not; every e-mail, principal URI, bracketed or quoted account);
+    then bench.noanswer.cause, #1354's redaction that keeps the cause (credentials removed, lines joined, a long
+    text shortened from its START: gcloud says the cause last). The API's error code, status and message stay."""
+    return noanswer.cause(redact_text(err)) or "no error text"
+
+
+# GCE refuses an insert at once, before any operation exists (nothing was made), while a resource it uses is being
+# changed by an operation: INVALID_ARGUMENT "The resource '<path>' is not ready". Run tvsmoke2 (2026-11-11 23:51:03Z,
+# audit log) met it for 'projects/<p>/regions/europe-west3/subnetworks/default': another tenant's GKE create was
+# patching that subnetwork (setPrivateIpGoogleAccess, then compute.subnetworks.patch 23:50:49-23:51:08Z; the regional
+# operations list held 96 patches of it that day). What waiting fixes is that operation's end, so it is waited for.
+NOT_READY = re.compile(r"The resource '(projects/[^']+)' is not ready")
+
+
+def _op_scope(path: str) -> tuple[str, list[str], list[str]] | None:
+    """(project, the operations list's scope flags, the describe's) of a resource path, or None for a path that is not
+    a project's regional, zonal or global resource."""
+    p = path.split("/")
+    if len(p) >= 4 and p[0] == "projects" and p[2] == "global":
+        return p[1], ["--global"], ["--global"]
+    if len(p) >= 5 and p[0] == "projects" and p[2] in ("regions", "zones"):
+        return p[1], [f"--{p[2]}", p[3]], [f"--{p[2][:-1]}", p[3]]
+    return None
+
+
+def pending_operations(path: str, timeout: float) -> list[dict]:
+    """The operations of `path`'s scope that change `path` and have not ended: one unfiltered list (partial errors
+    off) within `timeout`, each selected by its targetLink ending in the exact path (an API version may lead it) and
+    a status other than DONE (the list keeps every recent operation, those that ended among them)."""
+    scope = _op_scope(path)
+    if scope is None:
+        return []
+    project, flags, _ = scope
+    rows = list_json(["compute", "operations", "list", *flags, "--project", project, "--format", "json"],
+                     f"the operations of {' '.join(flags)}", timeout=timeout)
+    return [o for o in rows if str(o.get("targetLink", "")).endswith("/" + path) and o.get("status") != "DONE"]
+
+
+def create(args: list[str], *, dry: bool, poll_s: float, what: str, hint: str) -> tuple[int, str, str]:
+    """One create (`gcloud <args>`). When GCE answers that a resource it uses is not ready (NOT_READY: nothing was
+    made), each operation still changing that resource is waited for (read by `operations describe` every poll_s
+    until DONE, its name and type printed), and the create is made again. Every call of it (the creates, the list,
+    each describe) gets what is left of ONE deadline, the call's bound (call_bound), and none is made once it is
+    spent: that refuses, with the create's last answer. An answer naming no operation that has not ended, or only
+    ones already waited for, is the create's result, for its caller to refuse with its cause. Every refusal raised
+    here ends with `hint` (what was made before this create is the caller's down to remove)."""
+    bound = _CALL_BOUND.get()
+    if bound is None:
+        raise Refused("a gcloud call with no bound: its tool sets one (gcevm.call_bound)")
+    deadline = time.monotonic() + bound
+
+    def spent(last: str) -> Refused:
+        return Refused(f"{what}: the call's bound of {bound:.0f} s is spent; GCE's last answer: {last}: nothing was "
+                       f"created by this call; {hint}")
+
+    waited: set[str] = set()
+    last = ""
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise spent(last)
+        rc, out, err = gcloud(args, dry=dry, timeout=left)
+        m = NOT_READY.search(err or "") if rc != 0 else None
+        if m is None:
+            return rc, out, err
+        last = gcloud_cause(err)
+        path = m.group(1)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise spent(last)
+        try:
+            ops = [o for o in pending_operations(path, left) if o.get("name") not in waited]
+        except Refused as e:
+            raise Refused(f"{what}: {e}; {hint}") from None
+        if not ops:
+            return rc, out, err
+        project, _, dflags = _op_scope(path)
+        for o in ops:
+            say(f"{what}: GCE answers {path} is not ready; waiting for its operation {o.get('name')} "
+                f"({o.get('operationType')}, since {o.get('insertTime')})")
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise spent(f"{last} (operation {o.get('name')} had not ended)")
+                rc2, out2, err2 = gcloud(["compute", "operations", "describe", str(o.get("name")), *dflags,
+                                          "--project", project, "--format", "json"], quiet=True, timeout=left)
+                got = gke._json(out2) if rc2 == 0 else None
+                if not isinstance(got, dict):
+                    raise Refused(f"{what}: operation {o.get('name')} on {path} could not be read (rc={rc2}; "
+                                  f"{gcloud_cause(err2)}): nothing was created by this call; {hint}")
+                if got.get("status") == "DONE":
+                    break
+                time.sleep(min(poll_s, max(deadline - time.monotonic(), 0.0)))
+            waited.add(str(o.get("name")))
+            say(f"{what}: operation {o.get('name')} on {path} ended; creating again")
 
 
 def where(project: str, zone: str) -> list[str]:
@@ -239,7 +346,7 @@ def get(args: list[str], path: str, what: str) -> dict | None:
     if rc != 0:
         if not_found(err, path):
             return None
-        raise Refused(f"{what} could not be read (rc={rc}; {error_summary(err)}): refusing")
+        raise Refused(f"{what} could not be read (rc={rc}; {gcloud_cause(err)}): refusing")
     try:
         got = json.loads(out)
     except ValueError:
@@ -249,15 +356,16 @@ def get(args: list[str], path: str, what: str) -> dict | None:
     return got
 
 
-def list_json(args: list[str], what: str) -> list[dict]:
-    """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]")."""
-    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True)
+def list_json(args: list[str], what: str, timeout: float | None = None) -> list[dict]:
+    """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]"). `timeout`:
+    its caller's (else the tool's call bound)."""
+    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True, timeout=timeout)
     try:
         got = json.loads(out) if rc == 0 else None
     except ValueError:
         got = None
     if not isinstance(got, list):
-        raise Refused(f"{what} could not be listed (rc={rc}; {error_summary(err)}): refusing")
+        raise Refused(f"{what} could not be listed (rc={rc}; {gcloud_cause(err)}): refusing")
     return got
 
 
@@ -282,7 +390,7 @@ def project_doc(project: str) -> dict:
     except ValueError:
         got = None
     if not isinstance(got, dict) or got.get("projectId") != project or not str(got.get("projectNumber", "")).isdigit():
-        raise Refused(f"project {project} could not be read (rc={rc}; {error_summary(err)}): unknown, or not "
+        raise Refused(f"project {project} could not be read (rc={rc}; {gcloud_cause(err)}): unknown, or not "
                       f"visible to this account; nothing in it is read as absent")
     if got.get("lifecycleState") != "ACTIVE":
         raise Refused(f"project {project} is {got.get('lifecycleState')}, not ACTIVE: refusing")
@@ -300,7 +408,7 @@ def parents(project: str, zone: str, recorded_number: str | None = None) -> str:
     except ValueError:
         got = None
     if not isinstance(got, dict) or got.get("name") != zone:
-        raise Refused(f"zone {zone} of project {project} could not be read (rc={rc}; {error_summary(err)}): nothing "
+        raise Refused(f"zone {zone} of project {project} could not be read (rc={rc}; {gcloud_cause(err)}): nothing "
                       f"in it is read as absent")
     if recorded_number and str(recorded_number) != number:
         raise Refused(f"the run's record names project number {recorded_number}, {project} is {number}: refusing")
@@ -312,7 +420,7 @@ def require_iap(project: str) -> None:
     rc, out, err = gcloud(["services", "list", "--enabled", "--project", project, "--format", "json"], quiet=True)
     enabled = gke._json(out) if rc == 0 else None
     if not isinstance(enabled, list):
-        raise Refused(f"could not read whether IAP is enabled (rc={rc}; {error_summary(err)})")
+        raise Refused(f"could not read whether IAP is enabled (rc={rc}; {gcloud_cause(err)})")
     if "iap.googleapis.com" not in {(x.get("config") or {}).get("name") for x in enabled}:
         raise Refused(f"iap.googleapis.com is not enabled in {project}: the VM is reached through IAP only "
                       f"(gcloud services enable iap.googleapis.com --project {project})")
@@ -522,28 +630,43 @@ def diff(what: str, got: dict, want: dict) -> list[str]:
 
 # ─── quota ──────────────────────────────────────────────────────────────────
 
+def ssh_rules_footprint(rules: dict[str, dict]) -> tuple:
+    """The FIREWALLS a VM's SSH rules take (#1361): one per rule up creates (ssh_rules), project-global."""
+    return ("FIREWALLS", len(rules), f"its {len(rules)} IAP-only SSH rules ({', '.join(sorted(rules))})", "")
+
+
 def quota_check(project: str, zone: str, footprint) -> tuple[list[str], list[str]]:
-    """A VM's footprint ((metric, need, what, unit), ...) against the quotas of the region it sits in, reads
-    only, each failing closed (bench.gke's primitives: the region's quotas, its instances / forwarding rules /
-    addresses listed with the partial-error property false, in-use addresses counted from their holders)."""
+    """A VM's footprint ((metric, need, what, unit), ...) against the quotas of the region it sits in, and the
+    project's for a metric bench.gke counts project-wide (gke.PROJECT_QUOTAS: FIREWALLS, #1361), reads only, each
+    failing closed (bench.gke's primitives: the region's quotas, `project-info describe`, its instances /
+    forwarding rules / addresses listed with the partial-error property false, in-use addresses counted from
+    their holders)."""
     region = gke.region_of(zone)
     rc, out, err = gcloud(gke.region_quotas_command(project, zone)[1:], quiet=True)
     quotas = gke._json(out) if rc == 0 else None
     if not isinstance(quotas, dict):
-        raise Refused(f"the quotas of {region} could not be read (rc={rc}; {error_summary(err)}): whether the VM fits "
+        raise Refused(f"the quotas of {region} could not be read (rc={rc}; {gcloud_cause(err)}): whether the VM fits "
                       f"is unknown")
+    project_quotas = None
+    if any(metric in gke.PROJECT_QUOTAS for metric, *_ in footprint):
+        rc, out, err = gcloud(gke.project_quotas_command(project)[1:], quiet=True)
+        project_quotas = gke._json(out) if rc == 0 else None
+        if not isinstance(project_quotas, dict):
+            raise Refused(f"the quotas of project {project} could not be read (rc={rc}; {gcloud_cause(err)}): whether "
+                          f"the VM fits is unknown")
     listed: dict[str, list[dict]] = {}
     for kind in ("instances", "forwarding-rules", "addresses"):
         rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], env=LIST_ENV, quiet=True)
         got = gke._json(out) if rc == 0 else None
         if not isinstance(got, list):
-            raise Refused(f"the {kind} of {region} could not be listed (rc={rc}; {error_summary(err)}): whether the "
+            raise Refused(f"the {kind} of {region} could not be listed (rc={rc}; {gcloud_cause(err)}): whether the "
                           f"VM fits is unknown")
         listed[kind] = got
     fits, refusals = [], []
     for metric, need, what, unit in footprint:
         used = gke.in_use_addresses(listed, region) if metric == "IN_USE_ADDRESSES" else None
-        ok, msg = gke.quota_fit(quotas, metric, need, f"the VM needs {need}{unit}: {what}", unit, used)
+        src = project_quotas if metric in gke.PROJECT_QUOTAS else quotas
+        ok, msg = gke.quota_fit(src, metric, need, f"the VM needs {need}{unit}: {what}", unit, used)
         (fits if ok else refusals).append(msg)
     return fits, refusals
 

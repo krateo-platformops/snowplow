@@ -66,13 +66,16 @@ def test_an_email_is_still_redacted(line, want):
 
 # ─── every call site: a digest survives, an e-mail and a user do not ────────
 
+# #1361 review B1: and an external IdP's account, which is no e-mail (a workforce principal, its subject opaque)
+WORKFORCE = "principal://iam.googleapis.com/locations/global/workforcePools/acme-pool/subject/0f3c2a91-77aa-4c1e"
 LINE = (f'pulled {DIGESTS[0]} for User "scaleuser-0001" (owner someone@example.invalid); '
-        f"next {DIGESTS[1]}")
+        f"next {DIGESTS[1]} by {WORKFORCE} now")
 
 
 def _check(out: str):
     assert DIGESTS[0] in out and DIGESTS[1] in out, out
     assert "someone@example.invalid" not in out and "scaleuser-0001" not in out, out
+    assert "0f3c2a91-77aa-4c1e" not in out and "acme-pool" not in out, out
 
 
 def _script(line):
@@ -97,6 +100,8 @@ SITES = {
     # #1338: bench/gcevm.py, shared by vm606 and testvm: a VM's output, a failed remote step, a drifted field
     "gcevm.remote_lines (a VM's output)": lambda s: "\n".join(gcevm.remote_lines(s)),
     "gcevm.failed (a failed remote step's lines)": lambda s: str(gcevm.failed("a step", 1, s, "", prefix="x")),
+    # #1361: a failed gcloud call's cause, in every testvm / vm606 refusal of one
+    "gcevm.gcloud_cause (a refused gcloud call's cause)": lambda s: gcevm.gcloud_cause("ERROR: " + s),
 
     # bench/testvm.py: a failed git on the laptop, the cluster probe's error, the VM's bootstrap marker
     "testvm.git_failure (a failed git's stderr)": lambda s: testvm.git_failure("/c", ["fetch"], 1, "noise\n" + s),

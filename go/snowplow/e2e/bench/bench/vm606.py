@@ -192,7 +192,8 @@ never touch the other. The VM's zone (up's --zone, then the run's record) and th
 zone (launch --bench-zone, handed to run606_pair.sh as ZONE) are separate. `up` reads the VM's own
 footprint against the quotas of the region it sits in (INSTANCES 1, E2_CPUS 8, SSD_TOTAL_GB 50,
 IN_USE_ADDRESSES 1, counted from the region's instances / forwarding rules / addresses as the bench's
-pre-check counts them); once the VM exists, the bench's own pre-check counts it among the instances
+pre-check counts them) and the project's FIREWALLS (its 2 SSH rules, #1361; each cluster's GKE and
+LoadBalancer rules are the run's own pre-check's, bench.gke RUN_QUOTAS); once the VM exists, the bench's own pre-check counts it among the instances
 and external IPs of its region when the clusters share it.
 
 THE OPERATOR'S SEQUENCE (the team lead, from the laptop; every step but status/fetch is a dry run
@@ -221,7 +222,8 @@ Stopping a paid run on the VM: `gcloud compute ssh <vm> --tunnel-through-iap -- 
 cluster down). A detached launcher survives the SSH session ending (bench.detach: its own session,
 SIGHUP ignored; tests/test_vm606.py hangs up the session's process group and checks).
 
-gcloud's error text names the operator's account: only its code reaches the output
+gcloud's error text names the operator's account: a failed gcloud call's refusal says its cause with the
+identity removed (bench.gcevm.gcloud_cause, #1361), an SSH / scp failure its code only
 (bench.identity.error_summary); the VM's own output is passed through redact_identity.
 """
 
@@ -613,7 +615,7 @@ def _policy(kind: str, resource: str, project: str) -> dict:
     except ValueError:
         got = None
     if not isinstance(got, dict):
-        raise Refused(f"the IAM policy of {resource} could not be read (rc={rc}; {error_summary(err)})")
+        raise Refused(f"the IAM policy of {resource} could not be read (rc={rc}; {gcevm.gcloud_cause(err)})")
     return got
 
 
@@ -652,7 +654,7 @@ def grant(run: str, project: str, number: str, roles: list[str], terminates_at: 
     for kind, res, role in targets:
         rc, _out, err = gcloud(_binding_argv("add", kind, res, project, role, f), dry=dry)
         if rc != 0:
-            raise Refused(f"granting {role} on {res} failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+            raise Refused(f"granting {role} on {res} failed (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if dry:
         _say(f"DRY: would read both policies back and verify {len(targets)} bindings under the condition {cond}")
         return
@@ -680,7 +682,7 @@ def revoke(run: str, project: str, number: str, *, dry: bool) -> tuple[int, list
         rc, _out, err = gcloud(_binding_argv("remove", kind, res, project, role, f), dry=dry)
         if rc != 0:
             raise Refused(f"removing {role} on {res} (condition {cond.get('title')}) failed (rc={rc}; "
-                          f"{error_summary(err)})")
+                          f"{gcevm.gcloud_cause(err)})")
     if not dry:
         left = [(r, res) for kind, res in grant_policies(project, number)
                 for r, _c in run_bindings(_policy(kind, res, project), project, run)]
@@ -931,9 +933,16 @@ VM_FOOTPRINT = (("INSTANCES", 1, "the VM", ""),
                 ("IN_USE_ADDRESSES", 1, "its ephemeral external IP", ""))
 
 
-def vm_quota_check(project: str, zone: str) -> tuple[list[str], list[str]]:
-    """The VM's own footprint against the quotas of the region it sits in (bench.gcevm.quota_check)."""
-    return gcevm.quota_check(project, zone, VM_FOOTPRINT)
+def vm_footprint(run: str) -> tuple:
+    """The VM's own footprint: VM_FOOTPRINT and the project's FIREWALLS its SSH rules take (#1361). The run's
+    clusters' rules are its own pre-check's (bench.gke RUN_QUOTAS FIREWALLS, run on this VM, when this VM's rules
+    are already in the project's usage)."""
+    return (*VM_FOOTPRINT, gcevm.ssh_rules_footprint(firewall_rules(run)))
+
+
+def vm_quota_check(project: str, zone: str, run: str) -> tuple[list[str], list[str]]:
+    """The VM's own footprint against the quotas of its region and of the project (bench.gcevm.quota_check)."""
+    return gcevm.quota_check(project, zone, vm_footprint(run))
 
 
 def _project_ready(project: str) -> None:
@@ -942,7 +951,7 @@ def _project_ready(project: str) -> None:
     rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
     if rc != 0 or out.strip() != sa_email(project):
-        raise Refused(f"the orchestrator SA {sa_email(project)} could not be read (rc={rc}; {error_summary(err)}): "
+        raise Refused(f"the orchestrator SA {sa_email(project)} could not be read (rc={rc}; {gcevm.gcloud_cause(err)}): "
                       f"create it (plan-iam prints the command)")
 
 
@@ -1032,11 +1041,11 @@ def cmd_up(a) -> int:
     if held:
         raise Refused(f"{sa_email(a.project)} holds unconditional binding(s): {'; '.join(held)}. Between runs it holds "
                       f"nothing (access expires with each run): remove them first")
-    fits, refusals = vm_quota_check(a.project, a.zone)
+    fits, refusals = vm_quota_check(a.project, a.zone, run)
     for msg in fits:
         _say(msg)
     if refusals:
-        raise Refused(f"the VM does not fit {gke.region_of(a.zone)}'s quotas: " + "; ".join(refusals))
+        raise Refused(f"the VM does not fit {gke.region_of(a.zone)}'s or {a.project}'s quotas: " + "; ".join(refusals))
     d = state_dir(run)
     d.mkdir(parents=True, exist_ok=True)
     sf = d / "startup.sh"
@@ -1050,22 +1059,24 @@ def cmd_up(a) -> int:
     grant(run, a.project, number, roles, terminates_at, dry=not a.yes)
     # 2. SSH through IAP only, before the VM exists
     for fw, rule in firewall_rules(run).items():
-        rc, _out, err = gcloud(firewall_create_argv(fw, rule, a.project), dry=not a.yes)
+        rc, _out, err = gcevm.create(firewall_create_argv(fw, rule, a.project), dry=not a.yes, poll_s=a.poll_s,
+                                    what=f"firewall rule {fw}", hint=down_hint(run))
         if rc != 0:
-            raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+            raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if a.yes:
         made = {r.get("name") for r in _run_rules(run, a.project, _state(run))}   # each as made, or it refuses
         if made != set(firewall_rules(run)):
             raise Refused(f"firewall rule(s) {sorted(set(firewall_rules(run)) - made)} answer NotFound after their "
                           f"create; {down_hint(run)}")
     # 3. the VM
-    rc, _out, err = gcloud(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at), dry=not a.yes)
+    rc, _out, err = gcevm.create(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at),
+                                dry=not a.yes, poll_s=a.poll_s, what=f"instance {name}", hint=down_hint(run))
     if not a.yes:
         _say(f"DRY: would wait for {BOOTSTRAP_MARKER} on {name} (kubectl {KUBECTL_VERSION}, helm {HELM_VERSION}, "
              f"gcloud {GCLOUD_APT_VERSION.split('-')[0]}); nothing was created")
         return 0
     if rc != 0:
-        raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+        raise Refused(f"instances create failed (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     _save_state(run, instance_created_at=time.time())
     inst = _instance(name, a.project, a.zone)
     if inst is None:
@@ -1656,7 +1667,7 @@ def cmd_down(a) -> int:
         rc, _o, err = gcloud(["compute", "instances", "delete", name, *_where(project, zone),
                               "--delete-disks", "all", "--quiet"], dry=not a.yes)
         if rc != 0:
-            raise Refused(f"instances delete failed (rc={rc}; {error_summary(err)})")
+            raise Refused(f"instances delete failed (rc={rc}; {gcevm.gcloud_cause(err)})")
         if a.yes and _instance(name, project, zone) is not None:
             raise Refused(f"{name} still answers in {zone} after its delete: its rules and grants are left in place")
     else:
@@ -1665,7 +1676,7 @@ def cmd_down(a) -> int:
         rc, _o, err = gcloud(["compute", "firewall-rules", "delete", r["name"], "--project", project, "--quiet"],
                              dry=not a.yes)
         if rc != 0:
-            raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {error_summary(err)})")
+            raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {gcevm.gcloud_cause(err)})")
     removed, bdrift = revoke(run, project, number, dry=not a.yes)
     for d in bdrift:
         _say(f"WARNING: drifted since up, removed all the same: {d}")

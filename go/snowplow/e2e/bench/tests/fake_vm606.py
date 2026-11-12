@@ -55,7 +55,15 @@ outcome:
     FAKE_NO_SA=1;
   - `compute regions describe REGION`: tests/fake_region.py's quotas (FAKE_LIMIT_<METRIC> steers a
     limit); `compute forwarding-rules | addresses list`: none. An instance carries its zone and one
-    external IP (natIP), as GCE lists an instance with an ephemeral external IP.
+    external IP (natIP), as GCE lists an instance with an ephemeral external IP;
+  - #1361: `compute project-info describe`: tests/fake_region.py's project quotas (the 2026-11-12 reading),
+    FIREWALLS in use = the project's other rules (FAKE_PROJECT_USAGE_FIREWALLS, default the reading's 68) + the
+    rules this fake holds, and a firewall-rules create at the limit answers GCE's QUOTA_EXCEEDED
+    (FAKE_PROJECT_INFO_FAIL=1: the describe fails); FAKE_FW_CREATE_FAIL / FAKE_CREATE_FAIL=<a GCLOUD_FAILURES
+    key>: the create answers that cause as gcloud prints it; FAKE_NOT_READY=<n>: an instances create answers
+    "The resource '.../subnetworks/default' is not ready" (run tvsmoke2) while a subnetwork patch operation runs,
+    which `compute operations list` lists and which ends after n `operations describe`s of it (never: no
+    operation is listed).
 
 Every call is one JSON line in <FAKE_STATE>/calls.jsonl: its argv and the partial-error property.
 """
@@ -168,6 +176,60 @@ SSH_FAILURES = {
     "publickey": (255, f"{IDENTITY}@compute.4096312768531209876: Permission denied (publickey).\n"),
 }
 
+# #1361: a create that GCE or gcloud refuses, as gcloud 561 prints it (FAKE_FW_CREATE_FAIL=<key> for a
+# firewall-rules create, FAKE_CREATE_FAIL=<key> for an instances create; "1" is the older 503): an operation's
+# error ("Could not fetch resource:" and its message, with the reason detail when the API gives one), an HTTP
+# error before any operation (its JSON body), an argument gcloud's own parser refuses. Two name the operator's
+# account, as gcloud's do. Each key is the cause a refusal must name (tests/test_testvm.py).
+GCLOUD_FAILURES = {
+    "QUOTA_EXCEEDED": "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - Quota 'FIREWALLS' exceeded.  Limit: "
+                      "100.0 globally.\n\tmetric name = compute.googleapis.com/firewalls\n\tlimit name = FIREWALLS-per-"
+                      "project\n\treason = QUOTA_EXCEEDED\n",
+    "RESOURCE_EXHAUSTED": "ERROR: (gcloud.compute.{cmd}) HttpError accessing <https://compute.googleapis.com/compute/v1/"
+                          "projects/{project}/zones/{zone}/instances?alt=json>: response: <{{'status': '429'}}>, "
+                          "content <{{\n  \"error\": {{\n    \"code\": 429,\n    \"message\": \"Quota exceeded for "
+                          "quota metric 'Queries' and limit 'Queries per minute' of service 'compute.googleapis.com'"
+                          "\",\n    \"status\": \"RESOURCE_EXHAUSTED\"\n  }}\n}}\n>\n",
+    "ZONE_RESOURCE_POOL_EXHAUSTED": "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - The zone 'projects/"
+                                    "{project}/zones/{zone}' does not have enough resources available to fulfill the "
+                                    "request.  Try a different zone, or try again later.\n\treason = "
+                                    "ZONE_RESOURCE_POOL_EXHAUSTED\n",
+    "Invalid value": "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - Invalid value for field "
+                     "'resource.scheduling.terminationTime': '2026-11-12T01:51:00Z'. Termination time must be in the "
+                     "future.\n",
+    "unrecognized arguments": "ERROR: (gcloud.compute.{cmd}) unrecognized arguments: --no-such-flag \n\nTo search "
+                              "the help text of gcloud commands, run:\n  gcloud help -- SEARCH_TERMS\n",
+    "the account": "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - Required 'compute.instances.create' "
+                   "permission for 'projects/{project}/zones/{zone}/instances/x'. This command is authenticated as "
+                   "PLACEHOLDER-OPERATOR@example.invalid which is the active account specified by the [core/account] "
+                   "property.\n",
+    "the account in brackets": "ERROR: (gcloud.compute.{cmd}) [PLACEHOLDER-OPERATOR@example.invalid] does not have "
+                               "permission to access projects instance [{project}] (or it may not exist): The caller "
+                               "does not have permission\n",
+    # #1361 review B1: an external IdP's account (workforce identity federation) is no e-mail: a principal URI whose
+    # subject is the IdP's own id (a GUID, an opaque string). gcloud names it in brackets, in quotes, bare, and in an
+    # authenticated-as sentence it wraps across lines
+    "a workforce account without credentials": (
+        "ERROR: (gcloud.compute.{cmd}) Your current active account [principal://iam.googleapis.com/locations/global/"
+        "workforcePools/PLACEHOLDER-POOL/subject/PLACEHOLDER-SUBJECT-7d2b3e1a] does not have any valid credentials\n"
+        "Please run:\n\n  $ gcloud auth login\n\nto obtain new credentials.\n"),
+    "a workforce principal without access": (
+        "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - principal://iam.googleapis.com/locations/global/"
+        "workforcePools/PLACEHOLDER-POOL/subject/PLACEHOLDER-SUBJECT-7d2b3e1a does not have compute.instances.create "
+        "access to the Google Cloud project.\n"),
+    "a workforce principal quoted": (
+        "ERROR: (gcloud.compute.{cmd}) Could not fetch resource:\n - Required 'compute.firewalls.create' permission "
+        "for 'projects/{project}/global/firewalls/x' for principal 'principal://iam.googleapis.com/locations/global/"
+        "workforcePools/PLACEHOLDER-POOL/subject/0f3c2a91-PLACEHOLDER-guid'\n"),
+    "a wrapped authenticated-as sentence": (
+        "ERROR: (gcloud.compute.{cmd}) HTTPError 404: The resource 'projects/{project}/global/networks/nope' was not "
+        "found. This command is authenticated as\nprincipal://iam.googleapis.com/locations/global/workforcePools/"
+        "PLACEHOLDER-POOL/subject/PLACEHOLDER-SUBJECT-7d2b3e1a which is the active account specified by the\n"
+        "[core/account] property.\n"),
+}
+# a create the fake has answered "not ready" more often than this was made again in a loop (FAKE_NOT_READY)
+NOT_READY_CAP = 4
+
 SOURCE = r'''#!/usr/bin/env python3
 import json, os, re, shutil, signal, subprocess, sys
 from pathlib import Path
@@ -224,6 +286,54 @@ APIP = "https://www.googleapis.com/compute/v1/projects/operations-dev-krateo-io"
 # ── project, services, SA, region ──
 if a[:3] == ["compute", "regions", "describe"]:
     print(json.dumps(region_quotas(a[3]))); sys.exit(0)
+def firewalls_used():
+    """#1361: FIREWALLS in use: the project's other rules (the 2026-11-12 reading; FAKE_PROJECT_USAGE_FIREWALLS
+    steers it) and every rule this fake holds. (used, limit)"""
+    fw = next(x for x in project_quotas()["quotas"] if x["metric"] == "FIREWALLS")
+    return fw["usage"] + len(list((st / "firewalls").glob("*.json"))), fw["limit"]
+def op_view(o, status):
+    return {**{k: v for k, v in o.items() if k not in ("left", "listed_status")}, "status": status}
+def scope_flags(verb, allowed):
+    """gcloud 561's scope flags: `operations list` takes --regions / --zones / --global, `operations describe`
+    --region / --zone / --global; any other is gcloud's own argument error, before any request."""
+    given = [f for f in ("--regions", "--zones", "--region", "--zone", "--global") if f in a]
+    bad = [f for f in given if f not in allowed]
+    if bad or len(given) != 1:
+        sys.stderr.write(f"ERROR: (gcloud.compute.operations.{verb}) " + (f"unrecognized arguments: {' '.join(bad)}"
+                         if bad else "exactly one scope flag is needed") + "\n"); sys.exit(2)
+    return given[0], (opt(given[0]) if given[0] != "--global" else None)
+if a[:3] == ["compute", "operations", "list"]:
+    failed_list("operations")
+    flag, where_ = scope_flags("list", ("--regions", "--zones", "--global"))
+    ops = [json.loads(p.read_text()) for p in sorted((st / "operations").glob("*.json"))] \
+        if (st / "operations").is_dir() else []
+    scope = {"--regions": "regions", "--zones": "zones", "--global": "global"}[flag]
+    ops = [o for o in ops if f"/{scope}/" + (f"{where_}/" if where_ else "") in o["selfLink"]]
+    # the list's view of an operation may lag its describe's (FAKE_NOT_READY=stale: it keeps saying RUNNING)
+    print(json.dumps([op_view(o, o.get("listed_status") or o["status"]) for o in ops])); sys.exit(0)
+if a[:3] == ["compute", "operations", "describe"]:
+    flag, where_ = scope_flags("describe", ("--region", "--zone", "--global"))
+    p = st / "operations" / f"{a[3]}.json"
+    o = json.loads(p.read_text()) if p.exists() else None
+    scope = {"--region": "regions", "--zone": "zones", "--global": "global"}[flag]
+    if o is None or f"/{scope}/" + (f"{where_}/" if where_ else "") not in o["selfLink"]:
+        sys.stderr.write(f"ERROR: (gcloud.compute.operations.describe) Could not fetch resource:\n - The resource "
+                         f"'{a[3]}' was not found\n"); sys.exit(1)
+    if os.environ.get("FAKE_OP_DESCRIBE_FAIL") == "1":
+        sys.stderr.write("ERROR: (gcloud.compute.operations.describe) Could not fetch resource:\n - The service is "
+                         "currently unavailable. code=503\n"); sys.exit(1)
+    o["left"] -= 1
+    if o["left"] <= 0:
+        o["status"] = "DONE"
+    p.write_text(json.dumps(o))
+    print(json.dumps(op_view(o, o["status"]))); sys.exit(0)
+if a[:3] == ["compute", "project-info", "describe"]:
+    if os.environ.get("FAKE_PROJECT_INFO_FAIL") == "1":
+        sys.stderr.write("ERROR: (gcloud.compute.project-info.describe) Could not fetch resource:\n - Required "
+                         "'compute.projects.get' permission for 'projects/operations-dev-krateo-io'\n"); sys.exit(1)
+    q = project_quotas()
+    next(x for x in q["quotas"] if x["metric"] == "FIREWALLS")["usage"] = firewalls_used()[0]
+    print(json.dumps(q)); sys.exit(0)
 if a[:2] == ["compute", "forwarding-rules"] or a[:2] == ["compute", "addresses"]:
     failed_list(a[1]); print("[]"); sys.exit(0)
 if a[:2] == ["projects", "describe"]:
@@ -286,8 +396,16 @@ if iam:
     p.write_text(json.dumps(pol))
     print(json.dumps(pol)); sys.exit(0)
 # ── firewall rules ──
+def refused_create(var, cmd):
+    key = os.environ.get(var)
+    if key and key != "1":
+        sys.stderr.write(GCLOUD_FAILURES[key].format(cmd=cmd, project=opt("--project"), zone=opt("--zone"))); sys.exit(1)
 if a[:3] == ["compute", "firewall-rules", "create"]:
     name = a[3]
+    refused_create("FAKE_FW_CREATE_FAIL", "firewall-rules.create")
+    used, limit = firewalls_used()
+    if used >= limit:                                # GCE's own refusal at the limit (run tvsmoke1's)
+        sys.stderr.write(GCLOUD_FAILURES["QUOTA_EXCEEDED"].format(cmd="firewall-rules.create")); sys.exit(1)
     if load("firewalls", name):
         sys.stderr.write(f"ERROR: (gcloud.compute.firewall-rules.create) The resource '{name}' already exists\n"); sys.exit(1)
     doc = firewall_doc(name, opt("--project"), opt("--network"), opt("--direction"), opt("--action"), opt("--rules"),
@@ -316,6 +434,42 @@ if a[:3] == ["compute", "firewall-rules", "delete"]:
 # ── instances, disks ──
 if a[:3] == ["compute", "instances", "create"]:
     name = a[3]
+    refused_create("FAKE_CREATE_FAIL", "instances.create")
+    # #1361 (run tvsmoke2): the zone's subnetwork is being patched by another tenant's operation. The region's
+    # operations list also holds an earlier patch of it that ended (DONE), as the live list does (96 that day).
+    # FAKE_NOT_READY=<n>: the running one ends after n describes of it, then the create goes through; =never: GCE
+    # says not ready and only the ended one is listed; =stale: describe says DONE at once while the list keeps
+    # saying RUNNING, and GCE keeps saying not ready (the two reads disagree). After NOT_READY_CAP not-ready answers
+    # the fake answers something else, so a create that loops is counted, never hung.
+    if os.environ.get("FAKE_NOT_READY"):
+        mode = os.environ["FAKE_NOT_READY"]
+        region = opt("--zone")[:-2]
+        subnet = f"projects/{opt('--project')}/regions/{region}/subnetworks/default"
+        ops_dir = st / "operations"
+        ops_dir.mkdir(exist_ok=True)
+        base = {"operationType": "compute.subnetworks.patch",
+                "targetLink": f"https://www.googleapis.com/compute/beta/{subnet}"}
+        def op_doc(name, **kw):
+            return {"name": name, **base, "selfLink": f"https://www.googleapis.com/compute/v1/projects/"
+                                                      f"{opt('--project')}/regions/{region}/operations/{name}", **kw}
+        ended = ops_dir / "operation-1794436860115-subnet-patch-ended.json"
+        if not ended.exists():
+            ended.write_text(json.dumps(op_doc(ended.stem, status="DONE", left=0,
+                                               insertTime="2026-11-11T14:41:01.052-08:00")))
+        op = ops_dir / "operation-1794441048556-subnet-patch.json"
+        if mode != "never" and not op.exists():
+            op.write_text(json.dumps(op_doc(op.stem, status="RUNNING", insertTime="2026-11-11T15:50:49.493-08:00",
+                                            left=1 if mode == "stale" else int(mode),
+                                            **({"listed_status": "RUNNING"} if mode == "stale" else {}))))
+        answered = st / "not_ready_answers"
+        n = int(answered.read_text()) if answered.exists() else 0
+        if mode in ("never", "stale") or json.loads(op.read_text())["status"] != "DONE":
+            answered.write_text(str(n + 1))
+            if n + 1 > NOT_READY_CAP:
+                sys.stderr.write("ERROR: (gcloud.compute.instances.create) fake: the create was made again "
+                                 f"{n + 1} times while not ready\n"); sys.exit(1)
+            sys.stderr.write(f"ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The resource "
+                             f"'{subnet}' is not ready\n"); sys.exit(1)
     if os.environ.get("FAKE_CREATE_FAIL") == "1":
         sys.stderr.write("ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The service is "
                          "currently unavailable. code=503\n"); sys.exit(1)
@@ -495,7 +649,7 @@ def install(bin_dir: Path, state: Path) -> None:
     g = bin_dir / "gcloud"
     consts = "".join(f"{k} = {globals()[k]!r}\n" for k in (
         "PROJECT", "ACCOUNT_404", "DISK_404", "PARENT_404", "PROJECT_403", "ZONE_400", "DESCRIBE_FAILURES", "ZONES",
-        "SSH_FAILURES", "IDENTITY", "VM_ROOT", "VM_ROOTS")) + BUILDER
+        "SSH_FAILURES", "IDENTITY", "VM_ROOT", "VM_ROOTS", "GCLOUD_FAILURES", "NOT_READY_CAP")) + BUILDER
     g.write_text(SOURCE.replace("API = ", consts + fake_region.LOADER + "API = ", 1))
     g.chmod(0o755)
 
