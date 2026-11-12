@@ -3,13 +3,81 @@ package slowcall
 // cgroup_root_1380_test.go — #1380: cpu.stat is read beneath cgroupDir opened as
 // an os.Root. Without the Root (no cgroup filesystem) and without a cpu.stat in
 // it, a sample carries no cgroup fields, as before; a cpu.stat that resolves
-// outside the Root is not read.
+// outside the Root is not read. The Root is kept once opened, and a directory
+// that does not exist is settled as nil; any other open failure is retried at
+// the next sample.
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
+
+// countingOpen1380 is os.OpenRoot behind fail: the first len(fail) calls
+// return those errors, later ones open for real. calls counts every call.
+func countingOpen1380(fail ...error) (open func(string) (*os.Root, error), calls *int) {
+	n := 0
+	return func(dir string) (*os.Root, error) {
+		n++
+		if n <= len(fail) {
+			return nil, &fs.PathError{Op: "openat", Path: dir, Err: fail[n-1]}
+		}
+		return os.OpenRoot(dir)
+	}, &n
+}
+
+// A transient failure (EMFILE) at the first sample is not kept: the next
+// sample opens the Root and carries cgroup fields, and the samples after it
+// reuse that Root without opening again.
+func TestCgroupRoot1380_TransientOpenFailureIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	write1380(t, filepath.Join(dir, "cpu.stat"), v2Stat1380)
+	open, calls := countingOpen1380(syscall.EMFILE)
+	c := &rootCache{dir: dir, open: open}
+	t.Cleanup(func() {
+		if c.root != nil {
+			_ = c.root.Close()
+		}
+	})
+
+	if s := readCPUFrom(c.get()); s.cgOK {
+		t.Fatalf("sample 1, open failed with EMFILE, yet cgOK: %+v", s)
+	}
+	if s := readCPUFrom(c.get()); !s.cgOK || s.periods != 40 {
+		t.Fatalf("sample 2, after a transient open failure: want the cgroup fields, got %+v", s)
+	}
+	for range 3 {
+		if s := readCPUFrom(c.get()); !s.cgOK {
+			t.Fatalf("a later sample lost the cgroup fields: %+v", s)
+		}
+	}
+	if *calls != 2 {
+		t.Fatalf("open called %d times over 5 samples, want 2 (the failure, then one success kept)", *calls)
+	}
+}
+
+// A directory that does not exist is settled as nil: no cgroup fields, and no
+// open at later samples.
+func TestCgroupRoot1380_MissingDirectoryIsSettledAsNil(t *testing.T) {
+	open, calls := countingOpen1380(fs.ErrNotExist, fs.ErrNotExist)
+	c := &rootCache{dir: t.TempDir(), open: open}
+	for i := range 3 {
+		if r := c.get(); r != nil {
+			t.Fatalf("get %d returned a Root for a directory that does not exist", i+1)
+		}
+	}
+	if *calls != 1 {
+		t.Fatalf("open called %d times for a directory that does not exist, want 1", *calls)
+	}
+
+	// The real os.OpenRoot on a missing directory is classified the same way.
+	missing := &rootCache{dir: filepath.Join(t.TempDir(), "no-such-cgroup-fs"), open: os.OpenRoot}
+	if missing.get() != nil || !missing.settled {
+		t.Fatalf("os.OpenRoot on a missing directory: root %v settled %v, want nil and settled", missing.root, missing.settled)
+	}
+}
 
 const v2Stat1380 = "usage_usec 5000\nuser_usec 1\nsystem_usec 2\nnr_periods 40\nnr_throttled 7\nthrottled_usec 9000\n"
 

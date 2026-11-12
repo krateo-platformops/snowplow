@@ -20,6 +20,8 @@ package slowcall
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -56,18 +58,39 @@ var cgroupStatPaths = []string{"cpu.stat", "cpu,cpuacct/cpu.stat", "cpu/cpu.stat
 
 // cgroupRoot is cgroupDir opened as an os.Root, so a cgroupStatPaths entry is
 // read beneath it and cannot reach any other file, whatever the entry holds.
-// It is opened at the first sample and kept for the process: one descriptor,
-// shared by the sampler's goroutine and the requests' emit reads (os.Root's
-// methods are safe for concurrent use). nil when the directory cannot be
-// opened (no cgroup filesystem: not Linux, the browser build); a sample then
-// carries no cgroup fields, as it does when no cpu.stat is found.
-var cgroupRoot = sync.OnceValue(func() *os.Root {
-	r, err := os.OpenRoot(cgroupDir)
-	if err != nil {
-		return nil
+var cgroupRoot = &rootCache{dir: cgroupDir, open: os.OpenRoot}
+
+// rootCache opens dir as an os.Root once it can and keeps it for the process:
+// one descriptor, shared by the sampler's goroutine and the requests' emit
+// reads (os.Root's methods are safe for concurrent use). A directory that does
+// not exist (no cgroup filesystem: not Linux, the browser build) is settled
+// too, as nil; a sample then carries no cgroup fields, as it does when no
+// cpu.stat is found. Any other failure (a transient one such as EMFILE) is not
+// kept: that sample carries no cgroup fields and the next one opens again.
+type rootCache struct {
+	dir  string
+	open func(string) (*os.Root, error)
+
+	mu      sync.Mutex
+	settled bool
+	root    *os.Root
+}
+
+func (c *rootCache) get() *os.Root {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.settled {
+		return c.root
 	}
-	return r
-})
+	r, err := c.open(c.dir)
+	switch {
+	case err == nil:
+		c.root, c.settled = r, true
+	case errors.Is(err, fs.ErrNotExist):
+		c.settled = true
+	}
+	return c.root
+}
 
 type cpuSampler struct {
 	read func() cpuSample
@@ -157,7 +180,7 @@ func (c *cpuSampler) windowAttrs(start time.Time) []slog.Attr {
 	return out
 }
 
-func readCPU() cpuSample { return readCPUFrom(cgroupRoot()) }
+func readCPU() cpuSample { return readCPUFrom(cgroupRoot.get()) }
 
 // readCPUFrom is one sample, its cpu.stat read beneath cg (none when cg is nil).
 func readCPUFrom(cg *os.Root) cpuSample {
