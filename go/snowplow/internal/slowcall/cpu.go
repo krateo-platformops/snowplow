@@ -144,6 +144,7 @@ func readCPU() cpuSample {
 	s := cpuSample{at: t0}
 	s.procNS, s.procOK = processCPU()
 	for _, p := range cgroupStatPaths {
+		// #nosec G304,G703 -- p is one of cgroupStatPaths, the fixed /sys/fs/cgroup cpu.stat paths; no input reaches it
 		if b, err := os.ReadFile(p); err == nil {
 			s.usageNS, s.periods, s.thrPer, s.thrNS, s.cgOK = parseCPUStat(b)
 			if s.cgOK {

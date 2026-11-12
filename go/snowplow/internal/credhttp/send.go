@@ -293,16 +293,18 @@ const retryPolicyTranscribedFrom = "v1.54.0"
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
 // jittered into [d/2, d). The jitter's random source is crypto/rand where plumbing's is
-// math/rand: the distribution is the same, uniform over [0, d/2).
+// math/rand: the distribution is the same, d/2 plus a draw uniform over [0, d/2).
 func firstBackoff(base, maxB time.Duration) time.Duration {
 	d := min(base, maxB)
 	if d < 2 {
 		return d
 	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(d)/2))
-	if err != nil { // only for a bound <= 0, which d >= 2 rules out
-		return d / 2
-	}
+	// rand.Int has two failures and neither can happen here. It panics for a bound <= 0, and the
+	// bound d/2 is >= 1 because d >= 2. It returns an error only when its reader does, and since
+	// Go 1.24 crypto/rand's Reader never returns one (a failure to read random data stops the
+	// program instead; nothing in snowplow replaces rand.Reader). So the error is discarded, not
+	// handled.
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(d)/2))
 	return d/2 + time.Duration(n.Int64())
 }
 
