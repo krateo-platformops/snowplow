@@ -85,13 +85,12 @@
 //     of a stage fetch), which plumbing >= v1.52.0 sends through
 //     dialguard.RoundTripper (#1360).
 //
-// And the browser's own credentials are never sent: every request reaches
-// fetch with its credentials mode "omit", through guardedTransport or a
-// plumbing client passed through plumbingClient (egress_js.go says which
-// paths take which).
+// And the browser's own credentials are never sent: dialguard.RoundTripper
+// also sets fetch's credentials mode "omit" (plumbing >= v1.54.0), on the same
+// paths (egress_js.go).
 //
-// A server build is unaffected: BrowserEgress is nil there and plumbingClient
-// returns its client unchanged (egress.go).
+// A server build is unaffected: BrowserEgress is nil there (egress.go), and
+// dialguard.RoundTripper is the identity.
 package credhttp
 
 import (

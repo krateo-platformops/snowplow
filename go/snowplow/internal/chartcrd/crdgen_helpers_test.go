@@ -47,9 +47,14 @@ const (
 	// and by v1.52.0 with generate()'s options, are byte-identical (measured at
 	// the bump). TestCrdgenPin_NoNotShapeWhereTheTwoCoreProviderCrdgensDiffer
 	// keeps that true: it fails on the one schema shape where the two differ.
+	//
+	// v1.52.0 → v1.54.0 (plumbing#141, dialguard's fetch credentials mode):
+	// `diff -r` of the two module trees changes only dialguard/, helm/ and
+	// http/request's js test; crdgen/ and crdgen/schemas/ are byte-identical, so
+	// the output above stands.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.52.0"
+	crdgenVersion       = "v1.54.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
 	coreProviderCrdgenVersion = "v1.28.1"
 

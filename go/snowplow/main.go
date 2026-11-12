@@ -500,10 +500,9 @@ func main() {
 	}
 	// credhttp builds the key source's client: the one plumbing builds by
 	// default (dialguard.Client) at the request timeout, positive by
-	// checkJWKSRequestTimeout above. On js/wasm it sets fetch's credentials
-	// mode, so the browser attaches none of the frame's cookies to the JWKS
-	// fetch (credhttp/plumbing_clients.go); on a server build it is plumbing's
-	// client itself.
+	// checkJWKSRequestTimeout above. On js/wasm plumbing sets fetch's
+	// credentials mode on it, so the browser attaches none of the frame's
+	// cookies to the JWKS fetch (credhttp/plumbing_clients.go).
 	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
 		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))

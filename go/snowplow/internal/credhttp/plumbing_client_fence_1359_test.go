@@ -1,10 +1,10 @@
 package credhttp
 
 // plumbing_client_fence_1359_test.go — #1359: only credhttp builds the clients
-// plumbing builds, and hands each out already passed through plumbingClient
-// (plumbing_clients.go, do.go). On js/wasm that is what sets fetch's
-// credentials mode to "omit" on them; a client built anywhere else would send
-// the frame's cookies.
+// plumbing builds, and hands each out (plumbing_clients.go, do.go), so every
+// client snowplow sends on is on plumbing's guarded path
+// (dialguard.RoundTripper, which on js/wasm sets fetch's redirect mode "error"
+// and credentials mode "omit"). A client built anywhere else could skip it.
 //
 // The fence, type-checked over every build of the module (loadWholeModule: the
 // server build, rbac_narrow_baseline and js/wasm), on every non-test file,
