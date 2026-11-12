@@ -12,7 +12,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/itchyny/gojq v0.12.17
 	github.com/klauspost/compress v1.18.7
-	github.com/krateo-platformops/audit v0.10.0
+	github.com/krateo-platformops/audit v0.11.1-0.20261112132309-6a497f9e0d72
 	github.com/krateo-platformops/plumbing v1.54.0
 	github.com/ledongthuc/pdf v0.0.0-20261020125853-5e46805f718e
 	github.com/stretchr/testify v1.11.1

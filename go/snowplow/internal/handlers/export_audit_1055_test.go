@@ -50,8 +50,8 @@ const (
 func helperRecord(t *testing.T, ev audit.Event) map[string]string {
 	t.Helper()
 	rec := logtest.NewRecorder()
-	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}))
+	ctx := audit.WithSessionID(xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})), "s-443")
 	audit.New(rec.Logger("helper-1055")).Emit(ctx, ev)
 	got := records957(rec)
 	if len(got) != 1 {
@@ -224,9 +224,9 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				rec := recorder957(t)
 				req := httptest.NewRequest(method, fullTarget+e.query, nil)
-				req = req.WithContext(xcontext.BuildContext(req.Context(),
+				req = req.WithContext(audit.WithSessionID(xcontext.BuildContext(req.Context(),
 					xcontext.WithLogger(slog.New(slog.DiscardHandler)),
-					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman})))
+					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman})), "s-1055"))
 				Export(e.inner(t)).ServeHTTP(e.writer(), req)
 
 				got := records957(rec)

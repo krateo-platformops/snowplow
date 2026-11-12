@@ -46,7 +46,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
-	"regexp"
 	"sync/atomic"
 	"time"
 
@@ -84,21 +83,15 @@ const (
 	// literal; readers use krateo.audit.dry_run, which the shared writer sets
 	// on every write record.
 	DryRunSuffix = ".dryRun"
-
-	// maxIDLen bounds an inbound session id; anything longer (or with
-	// characters outside idPattern) is rejected and replaced, so a hostile
-	// caller cannot inject baggage/pipeline control characters.
-	maxIDLen = 128
 )
 
-// idPattern is the accepted shape of an inbound session id. Kept to
-// baggage-safe token characters.
-var idPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-
-// SanitizeID validates an inbound session id; it returns "" when the id is
-// empty, oversized or contains unexpected characters.
+// SanitizeID validates an inbound session id; it returns "" when the id is not
+// of the schema's session_id format (audit.ValidSessionID: 1 to 128 of
+// [A-Za-z0-9._-]), so a hostile caller cannot inject baggage or pipeline
+// control characters. The shared writer omits any other shape too; this is
+// where snowplow, the id's origin, refuses it and mints its own.
 func SanitizeID(id string) string {
-	if id == "" || len(id) > maxIDLen || !idPattern.MatchString(id) {
+	if !krateoaudit.ValidSessionID(id) {
 		return ""
 	}
 	return id

@@ -90,7 +90,7 @@ func withNamespaces1291(t *testing.T, r NamespaceReader) {
 }
 
 func userCtx(ui jwtutil.UserInfo) context.Context {
-	return xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(ui))
+	return WithSessionID(xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(ui)), "s-test")
 }
 
 // delegatedCtx1291 is the request context of an RFC 8693 token: agent-x acts
@@ -277,11 +277,11 @@ func TestAudit1291_M_IncompleteCountedOnOTLPAndDebugVars(t *testing.T) {
 	for _, m := range krateoaudit.Markers() {
 		before[m] = IncompleteCount(m)
 	}
-	withNamespaces1291(t, nil)          // the Namespace cannot be read: preview
-	ev := callEvent1291()               // a Kubernetes target in team-a
-	ev.Verb = ""                        // verb
-	e.Emit(context.Background(), ev)    // no actor: actor, actor_class
-	e.Emit(actorCtx(), callEvent1291()) // preview only
+	withNamespaces1291(t, nil)                                // the Namespace cannot be read: preview
+	ev := callEvent1291()                                     // a Kubernetes target in team-a
+	ev.Verb = ""                                              // verb
+	e.Emit(WithSessionID(context.Background(), "s-test"), ev) // no actor: actor, actor_class
+	e.Emit(actorCtx(), callEvent1291())                       // preview only
 	want := map[string]int64{IncompleteActor: 1, IncompleteActorClass: 1, IncompleteVerb: 1, IncompletePreview: 2}
 
 	var rm metricdata.ResourceMetrics
