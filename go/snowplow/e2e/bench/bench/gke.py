@@ -793,6 +793,8 @@ def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
 # teardown — the PV release, an in-flight operation, the NotFound poll —
 # including gke-up's own teardown after a failed create.
 DEFAULT_DOWN_BUDGET_S = 900.0
+# #1383 gap 2: what a delete GKE accepted is, until a describe answers NotFound
+NOT_CONFIRMED_GONE = "delete requested, NOT confirmed gone"
 BACKSTOP_FAILED = "DISK BACKSTOP FAILED"
 ADDRESS_BACKSTOP_FAILED = "ADDRESS BACKSTOP FAILED"
 
@@ -810,8 +812,11 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     this cluster's leftover disks and addresses by exact name. Raises when
     not deletable or the delete call fails, so run_with_teardown reports it.
     Returns the backstops' problems (each also written to stderr as DISK
-    BACKSTOP FAILED / ADDRESS BACKSTOP FAILED): the cluster is deleted, but
-    disks or addresses of it may be left.
+    BACKSTOP FAILED / ADDRESS BACKSTOP FAILED): disks or addresses of the
+    cluster may be left. `record["confirmed_gone"]` says whether the cluster
+    IS deleted: True only once its describe answered NotFound; False when
+    the budget ran out first (NOT_CONFIRMED_GONE, said on stderr: the delete
+    was requested, never "deleted"; #1383 gap 2).
 
     #1026: the LoadBalancer Services go first (release_lb_services, within a
     quarter of the budget), their address names recorded; after the delete
@@ -890,6 +895,14 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
             rec.update({"deleted_disks": None, "leaked_addresses": None})
             cid = cluster_id_b32(describe)
             gone = wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep, location=location)
+            # #1383 gap 2: "deleted" only from the describe that answered NotFound; a delete GKE
+            # accepted (--async) whose cluster still answered at the budget's end is NOT deleted
+            rec["confirmed_gone"] = gone
+            if not gone:
+                msg = (f"{spec.name}: {NOT_CONFIRMED_GONE}: its describe still answered when the {budget:g} s "
+                       f"budget ran out; check it with {' '.join(describe_command(spec, location))}")
+                log(msg)
+                sys.stderr.write(msg + "\n")
             try:
                 if gone:
                     rec["deleted_disks"] = disk_backstop(spec, cluster_id=cid, recorded=recorded, log=log,
@@ -2291,6 +2304,9 @@ EXIT_BACKSTOP_FAILED = 4
 # gke-down's exit when no such cluster exists (exact-name describe: NotFound):
 # nothing to delete (#985; run606 says so, never "TEARDOWN FAILED")
 EXIT_NOTHING_TO_DELETE = 5
+# gke-down's exit when GKE accepted the delete but no describe answered NotFound within
+# the budget: NOT_CONFIRMED_GONE, never "deleted" (#1383 gap 2; run606 says so)
+EXIT_NOT_CONFIRMED_GONE = 6
 
 
 def _write_record(path: str | None, rec: dict) -> None:
@@ -2317,6 +2333,10 @@ def cmd_gke_down(a) -> int:
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         _write_record(getattr(a, "record", None), dict(rec, outcome=f"failed: {type(e).__name__}"))
         return 1
+    if a.yes and rec.get("confirmed_gone") is not True:
+        # #1383 gap 2: GKE accepted the delete, and no describe answered NotFound within the budget
+        _write_record(getattr(a, "record", None), dict(rec, outcome=NOT_CONFIRMED_GONE))
+        return EXIT_NOT_CONFIRMED_GONE
     _write_record(getattr(a, "record", None),
                   dict(rec, outcome="dry run" if not a.yes else ("deleted, backstop failed" if problems
                                                                  else "deleted")))

@@ -108,7 +108,9 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         if os.environ.get("FAKE_DISKS_FAIL") == "1":
             sys.exit(1)
         print(os.environ.get("FAKE_DISKS", "[]")); sys.exit(0)
-    if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")):
+    # #1383: FAKE_NEVER_GONE=1: GKE accepted the delete, and its describe still answers
+    if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")) \\
+            and os.environ.get("FAKE_NEVER_GONE") != "1":
         sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
                          "message=Not found: clusters/" + a[3] + ".\\n")
         sys.exit(1)

@@ -705,8 +705,13 @@ print("teardown record: LoadBalancer Services %s (release: %s); leaked_addresses
       # gke-up made it, and its region no longer has it: not ours to explain away
       log "TEARDOWN FAILED — the cluster gke-up made is not in ${REGION} (exact-name describe: NotFound); check by hand: gcloud container clusters list --project ${PROJECT}"
       rc=$(( rc == 0 ? 1 : rc ))
+    elif [[ "$down_rc" == "6" ]]; then
+      # #1383 gap 2: GKE accepted the delete, but its describe never answered NotFound within
+      # the budget: the cluster is NOT known to be gone, and its disks and addresses were never checked
+      log "cluster ${RUN_NAME}: delete requested, NOT confirmed gone (its describe still answered when gke-down's ${DOWN_BUDGET_S} s budget ran out; its disk and address backstops never ran): check by hand: gcloud container clusters describe ${RUN_NAME} --project ${PROJECT} --region ${REGION}"
+      rc=$(( rc == 0 ? 1 : rc ))
     elif [[ "$down_rc" == "4" ]]; then
-      # #895: the cluster IS deleted, but its PVC disks could not be checked or deleted
+      # #895: the cluster IS deleted (its describe answered NotFound), but its PVC disks could not be checked or deleted
       # #954: its disks are found by the cluster's ID label (cluster-id-gke-io), not its name
       # label (a disk provisioned late carries the id alone); gke-down's stderr names each disk
       # left and the exact list command

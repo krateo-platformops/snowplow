@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -143,3 +144,42 @@ def test_the_executors_know_a_compute_list(argv, listing):
 def test_the_property_wins_over_a_callers_own_value():
     env = gke.gcloud_env(["gcloud", "compute", "disks", "list"], {PARTIAL: "true"})
     assert env[PARTIAL] == "false"
+
+
+# ─── gap 2: "deleted" only from a describe that answered NotFound ───────────
+
+def test_gke_down_whose_cluster_never_reads_gone_says_not_confirmed(pvc_fakes, monkeypatch, capsys):
+    """GKE accepted the delete (--async) and the describe still answers when the budget runs out:
+    gke-down says "delete requested, NOT confirmed gone", records it, never "deleted", exit 6."""
+    monkeypatch.setenv("FAKE_NEVER_GONE", "1")
+    monkeypatch.setattr(gke, "_POLL_S", 0.01)
+    rec_path = pvc_fakes / "teardown.json"
+    rc = gke.main(["gke-down", "--name", NAME, "--budget-s", "1", "--record", str(rec_path), "--yes"])
+    err = capsys.readouterr().err
+    assert rc == gke.EXIT_NOT_CONFIRMED_GONE != 0
+    assert f"{NAME}: delete requested, NOT confirmed gone" in err, err
+    rec = json.loads(rec_path.read_text())
+    assert rec["outcome"] == "delete requested, NOT confirmed gone" and rec["confirmed_gone"] is False
+
+
+def test_gke_down_whose_cluster_reads_gone_is_deleted(pvc_fakes):
+    rec_path = pvc_fakes / "teardown.json"
+    assert gke.main(["gke-down", "--name", NAME, "--budget-s", "60", "--record", str(rec_path), "--yes"]) == 0
+    rec = json.loads(rec_path.read_text())
+    assert rec["outcome"] == "deleted" and rec["confirmed_gone"] is True
+
+
+def test_run606_never_claims_deleted_for_a_cluster_not_confirmed_gone(harness):  # noqa: F811
+    """run606's teardown: gke-down's exit 6 is said as such, the run exits non-zero, and no line
+    claims the cluster deleted."""
+    env, state, _, tmp = harness
+    env = dict(env, FAKE_NEVER_GONE="1", DOWN_BUDGET_S="1", BENCH_606_FAIL_AT="psi")
+    p = subprocess.run(["bash", str(BENCH / "run606.sh")], env=env, capture_output=True, text=True, timeout=600)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0
+    assert f"cluster {env['RUN_NAME']}: delete requested, NOT confirmed gone" in log, log[-3000:]
+    assert "deleted (gke-down OK)" not in log and "deleted, but" not in log
+
+
+from tests.test_gke_pvc_disks import fakes as pvc_fakes  # noqa: E402,F401
+from tests.test_run606_real_sequence import harness  # noqa: E402,F401

@@ -627,10 +627,12 @@ def test_a_backstop_that_could_not_do_its_job_is_loud(fakes, monkeypatch, capsys
     err = capsys.readouterr().err
     assert problems and f"{gke.BACKSTOP_FAILED} for {NAME}" in err, how
     assert not any("no disk of" in m for m in log)
-    # gke-down: exit 4 (the cluster is deleted; its disks may not be)
+    # gke-down: exit 4 (the cluster is deleted; its disks may not be); #1383 gap 2: exit 6 when the
+    # cluster never read gone (its delete requested, NOT confirmed: not "deleted")
     (fakes / "state" / "deleted").unlink()
     monkeypatch.setattr(gke, "_POLL_S", 0.01)                # gke-down's real clock and sleep
-    assert gke.main(["gke-down", "--name", NAME, "--budget-s", "1", "--yes"]) == gke.EXIT_BACKSTOP_FAILED
+    want = gke.EXIT_NOT_CONFIRMED_GONE if "FAKE_NEVER_GONE" in env else gke.EXIT_BACKSTOP_FAILED
+    assert gke.main(["gke-down", "--name", NAME, "--budget-s", "1", "--yes"]) == want
 
 
 def test_a_claim_re_created_during_the_release_is_recorded_and_its_disk_deleted(fakes, monkeypatch):
