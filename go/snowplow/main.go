@@ -4,10 +4,18 @@
 // /readyz, /debug/vars, pprof and swagger), the per-GVR dispatchers, the
 // informer/L1 caches and prewarm engine, RBAC, and the in-cluster
 // Kubernetes clients, then runs the server until signalled to shut down.
+//
+// The same program also builds for js/wasm, to run in a browser worker for
+// the Agentiko sandbox. That build adds only files constrained to js && wasm:
+// bridge_js.go serves the page's requests from this server
+// (internal/browserbridge, whose package doc says what does not apply in a
+// browser), egress leaves through the browser's fetch (internal/credhttp's
+// package doc), and no shutdown signal ever arrives.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +26,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	krateoaudit "github.com/krateo-platformops/audit"
@@ -477,6 +484,11 @@ func main() {
 	//   - authn stays off the hot path of every token validation.
 	// Absent an explicit --jwks-url, derive it from the authn base URL already
 	// configured for the #57 token exchange — one URL to get wrong, not two.
+	if err := checkJWKSRequestTimeout(*jwksTimeout); err != nil {
+		// log-ctx-waiver: boot: process start, before a context exists
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
 	if resolvedJWKSURL == "" {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
@@ -486,10 +498,15 @@ func main() {
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
-	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
+	// credhttp builds the key source's client: the one plumbing builds by
+	// default (dialguard.Client) at the request timeout, positive by
+	// checkJWKSRequestTimeout above. On js/wasm it sets fetch's credentials
+	// mode, so the browser attaches none of the frame's cookies to the JWKS
+	// fetch (credhttp/plumbing_clients.go); on a server build it is plumbing's
+	// client itself.
+	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
-		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh),
-		jwtutil.WithJWKSRequestTimeout(*jwksTimeout))
+		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
 	log.Info("JWT verification keys sourced from authn JWKS",
 		slog.String("jwks_url", resolvedJWKSURL),
 		slog.Duration("cache_ttl", *jwksCacheTTL),
@@ -1546,14 +1563,9 @@ func main() {
 	// MUST come after the expvar publishers registered just above.
 	registerDebugRoutes(routes, chain, jwtKeys)
 
-	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGKILL,
-		syscall.SIGHUP,
-		syscall.SIGQUIT,
-	}...)
+	// The signals that start a graceful shutdown: shutdown_signals.go on a
+	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
 
 	server := &http.Server{
@@ -1644,6 +1656,22 @@ func main() {
 // only inside the !cache.Disabled() branch), not here.
 func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
+}
+
+// errJWKSRequestTimeoutNotPositive refuses a non-positive
+// --jwks-request-timeout / JWT_JWKS_REQUEST_TIMEOUT at startup. The timeout
+// bounds every JWKS fetch, and a token validation waits on one, so without a
+// bound an authn that accepts the connection and never answers hangs every
+// authentication. The default is 5 s.
+var errJWKSRequestTimeoutNotPositive = errors.New("--jwks-request-timeout/JWT_JWKS_REQUEST_TIMEOUT must be positive: it bounds every JWKS fetch, and an unbounded one can hang every authentication")
+
+// checkJWKSRequestTimeout is errJWKSRequestTimeoutNotPositive, with the value
+// given, when d is not positive.
+func checkJWKSRequestTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w (got %s)", errJWKSRequestTimeoutNotPositive, d)
+	}
+	return nil
 }
 
 // parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
