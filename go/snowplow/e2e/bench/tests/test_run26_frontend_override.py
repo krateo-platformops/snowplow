@@ -252,7 +252,7 @@ def test_an_override_of_a_component_this_install_does_not_run_is_refused(tmp_pat
 
 
 def _dry(tmp_path, **env):
-    return _run606(tmp_path, BENCH_606_DRY_RUN="1", FAKE_FRONTEND_PIN="1", **env)
+    return _run606(tmp_path, BENCH_606_DRY_RUN="1", FAKE_FRONTEND_PIN="1.8.40", **env)
 
 
 def test_unset_the_installer_values_are_byte_identical_and_nothing_is_added(tmp_path):
@@ -299,7 +299,7 @@ def test_run606_refuses_a_half_or_malformed_frontend_override(tmp_path, env, why
 
 def _fenv(env):
     env = _env483(env)
-    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1", FAKE_FRONTEND_PIN="1",
+    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1", FAKE_FRONTEND_PIN="1.8.34",
                FRONTEND_TAG=FTAG, EXPECTED_FRONTEND_DIGEST=FD)
     return env
 
@@ -368,7 +368,7 @@ def test_run606_a_frontend_rollout_that_does_not_complete_is_never_judged(harnes
 def test_run606_without_an_override_reads_no_frontend_rollout(harness):  # noqa: F811
     env, state, ambient, tmp = harness
     env = _env483(env)
-    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1", FAKE_FRONTEND_PIN="1")
+    env.update(FAKE_483="pass", FAKE_KOG="1", PREFLIGHT_POLL_S="0.1", FAKE_FRONTEND_PIN="1.8.34")
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=300)
     assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
     kc = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"]

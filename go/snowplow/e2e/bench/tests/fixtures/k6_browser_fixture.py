@@ -1,9 +1,16 @@
 """A tiny SPA with the portal's observable contract, for running k6/browser.js
 in real Chrome under test (tests/test_k6_830.py, #831 gate):
 
-  /login       the antd form ids (#basic_username, #basic_password); Enter
-               "signs in" after SIGNIN_MS (authn's x509 login), then the app
-               navigates to /dashboard (history.pushState, like Login.tsx:92)
+  /login       DOM=contract (the default): frontend 1.8.40's page, frontend#659's
+               contract: an LDAPConfig's form FIRST (form#login_ldap_corp, the
+               same "Username" / "Password" labels, its own "LDAP sign in"
+               button, which signs nobody in), then basic's form#login_basic
+               (#login_basic_username, #login_basic_password) and its "Sign in"
+               submit button. DOM=old: the page before #659 (the antd form ids
+               #basic_username, #basic_password; Enter). Either "signs in" after
+               SIGNIN_MS (authn's x509 login), then the app navigates to
+               /dashboard (history.pushState, like Login.tsx:92)
+  /__seen      every GET path served so far (a test's proof of what was reached)
   a route      renders, after SKELETON_DELAY_MS, `[data-widget-renderer]`
                skeletons (WidgetLoading) that resolve PAGE_MS later
   /never       its skeleton never resolves (a page timeout)
@@ -16,7 +23,7 @@ in real Chrome under test (tests/test_k6_830.py, #831 gate):
   /debug/vars  (#935) Bearer-only (401 without): snowplow's two learned-class
                counters; a class is "learned" the first time its token reads
 
-Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS"""
+Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS [contract|old]"""
 import http.server
 import json
 import sys
@@ -24,11 +31,14 @@ import threading
 import time
 
 PORT, SIGNIN_MS, SKEL_MS, PAGE_MS = (int(x) for x in sys.argv[1:5])
+DOM = sys.argv[5] if len(sys.argv) > 5 else "contract"
+if DOM not in ("contract", "old"):
+    sys.exit(f"DOM must be contract or old, got {DOM!r}")
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>fixture</title></head>
 <body><ul id="menu"></ul><div id="content"></div><script>
 const ROUTES = ['/dashboard', '/compositions', '/never', '/err'];
-const SIGNIN = @SIGNIN@, SKEL = @SKEL@, PAGE = @PAGE@;
+const SIGNIN = @SIGNIN@, SKEL = @SKEL@, PAGE = @PAGE@, DOM = '@DOM@';
 const content = document.getElementById('content');
 function menu () {
   const ul = document.getElementById('menu');
@@ -47,15 +57,34 @@ function render (path) {
   const g = ++gen;
   content.innerHTML = '';
   if (path === '/login') {
-    content.innerHTML = '<form><input id="basic_username"><input id="basic_password" type="password"></form>';
-    document.getElementById('basic_password').addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter') return;
+    const signIn = (who) => setTimeout(() => {
+      localStorage.setItem('K_user', JSON.stringify({ accessToken: 'fixture-token-' + who }));
+      history.pushState({}, '', '/dashboard'); menu(); render('/dashboard'); live();
+    }, SIGNIN);
+    if (DOM === 'old') {
+      content.innerHTML = '<form><input id="basic_username"><input id="basic_password" type="password"></form>';
+      document.getElementById('basic_password').addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        signIn(document.getElementById('basic_username').value);
+      });
+      return;
+    }
+    // antd: the form's name is its id and every field id's prefix; the button's label in a span
+    const form = (name, button) => '<section><form id="' + name + '">' +
+      '<label for="' + name + '_username">Username</label><input id="' + name + '_username" autocomplete="username">' +
+      '<label for="' + name + '_password">Password</label>' +
+      '<input id="' + name + '_password" type="password" autocomplete="current-password">' +
+      '<button type="submit" class="ant-btn"><span>' + button + '</span></button></form></section>';
+    content.innerHTML = form('login_ldap_corp', 'LDAP sign in') + form('login_basic', 'Sign in') +
+      '<div id="login-error"></div>';
+    document.getElementById('login_ldap_corp').addEventListener('submit', (e) => {
       e.preventDefault();
-      const who = document.getElementById('basic_username').value;
-      setTimeout(() => {
-        localStorage.setItem('K_user', JSON.stringify({ accessToken: 'fixture-token-' + who }));
-        history.pushState({}, '', '/dashboard'); menu(); render('/dashboard'); live();
-      }, SIGNIN);
+      document.getElementById('login-error').textContent = 'LDAP: invalid credentials';
+    });
+    document.getElementById('login_basic').addEventListener('submit', (e) => {
+      e.preventDefault();
+      signIn(document.getElementById('login_basic_username').value);
     });
     return;
   }
@@ -83,10 +112,13 @@ window.addEventListener('popstate', () => render(location.pathname));
 if (location.pathname !== '/login') { menu(); live(); }
 render(location.pathname);
 </script></body></html>""".replace("@SIGNIN@", str(SIGNIN_MS)).replace(
-    "@SKEL@", str(SKEL_MS)).replace("@PAGE@", str(PAGE_MS))
+    "@SKEL@", str(SKEL_MS)).replace("@PAGE@", str(PAGE_MS)).replace("@DOM@", DOM)
 
 
 LEARNED: set = set()
+#: every GET path served, in order (GET /__seen answers them, itself excluded)
+SEEN: list = []
+SEEN_LOCK = threading.Lock()
 LEARNED_LOCK = threading.Lock()
 
 
@@ -127,6 +159,11 @@ class H(http.server.BaseHTTPRequestHandler):
         self._send(body, "application/json")
 
     def do_GET(self):
+        if self.path == "/__seen":
+            with SEEN_LOCK:
+                return self._send(json.dumps(SEEN).encode(), "application/json")
+        with SEEN_LOCK:
+            SEEN.append(self.path)
         if self.path.startswith("/debug/vars"):
             return self._vars()
         if self.path.startswith("/notifications"):

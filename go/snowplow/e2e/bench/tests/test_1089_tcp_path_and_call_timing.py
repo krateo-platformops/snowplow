@@ -521,7 +521,7 @@ def test_browser_js_puts_timing_the_load_and_the_vu_in_metadata_never_tags():
     assert "record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)" in loop
     assert "loadStart(r, actionAt), loadId)" in loop
     login = src[src.index("const loginAt = Date.now()"):src.index("while (Date.now() < deadline")]
-    assert login.index("nextLoadId()") < login.index("press('Enter')") < login.index("loginAt, firstId)")
+    assert login.index("nextLoadId()") < login.index("submit.click(opts)") < login.index("loginAt, firstId)")
     # no url / name system tag still: the extras (the user) never reach a point
     import re
     assert re.search(r"systemTags: \[([^\]]*)\]", src).group(1).count("'url'") == 0

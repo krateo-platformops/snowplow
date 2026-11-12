@@ -122,7 +122,7 @@ def test_browser_js_runs_each_class_in_its_own_context_and_reads_the_counters_ar
     src = (BENCH_DIR / "k6" / "browser.js").read_text()
     body = src[src.index("async function runClass"):]
     assert body.index("const context = await browser.newContext()") < body.index("await gotoLogin(page)")
-    assert body.index("learnedCounts(prevToken)") < body.index("press('Enter')") < body.index("learnedCounts(token)")
+    assert body.index("learnedCounts(prevToken)") < body.index("submit.click(opts)") < body.index("learnedCounts(token)")
     assert "while (Date.now() < deadline && !switchDue(visits, CFG.routes, last))" in body
     assert "const users = [s.user].concat(s.fresh || [])" in src
     assert "new Counter('browser_fresh_class')" in src and "browser_fresh_class|" in src

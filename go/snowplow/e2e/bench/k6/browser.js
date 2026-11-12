@@ -4,8 +4,10 @@
 // tested under node); this file drives Chrome.
 //
 // Each VU is one person in one browser context:
-//   - signs in through the UI: /login, the antd form `basic` (username,
-//     password: pages/Login/LoginForm/LoginForm.tsx:20-34), submitted; the SPA
+//   - signs in through the UI: /login, the antd form `login_basic` (username,
+//     password; frontend#659's contract, pageload.LOGIN, frontend >= 1.8.36:
+//     bench/login_contract.py refuses an older one), submitted by its own
+//     "Sign in" button; the SPA
 //     sends GET {AUTHN_API_BASE_URL}{path} with Basic auth (pages/Login/
 //     Login.tsx:78-86), stores the payload in localStorage K_user (:90) and
 //     navigates (:92) — `/` redirects to the first menu route (widgets/Menu/
@@ -27,10 +29,27 @@ import exec from 'k6/execution'
 import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
 import {
-  OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, settledNow, switchDue,
+  LOGIN, OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, settledNow,
+  signinBoundMs, switchDue,
 } from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
+
+// The first navigation, retried (run 11: a refused localhost port killed 4
+// of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
+// loginTries / loginRetryMs; tests set 1 to reproduce run 11).
+const GOTO_TRIES = CFG.loginTries || 6
+const GOTO_WAIT_MS = CFG.loginRetryMs || 5000
+// a settled page's record, read back from the page (settled)
+const LOAD_READ_MS = 10000
+// Run 26d's sign-in gate: frontend 1.8.40 renamed the login form, every session's sign-in threw,
+// and the run measured on with 0 browser sessions. Each session adds 0 to browser_first_signins
+// when it starts (a Counter with no sample is not judged while the test runs) and 1 when its
+// first sign-in lands; if none has landed by SIGNIN_BOUND_MS, the bound past which none can
+// (pageload.signinBoundMs), k6 aborts the whole test (abortOnFail: exit 99, the summary still
+// written). run606.sh's measure step sees the browser driver end before the drive and fails by name.
+const SIGNIN_BOUND_MS = signinBoundMs(CFG, GOTO_TRIES, GOTO_WAIT_MS, LOAD_READ_MS)
+const SIGNED_IN = new Counter('browser_first_signins')
 
 const METRICS = {
   browser_page_load_ms: new Trend('browser_page_load_ms', true),
@@ -74,6 +93,8 @@ export const options = {
     bench_frame: ['count>=0'],
     browser_request_failed_start_unseen: ['count>=0'],
     browser_fresh_class: ['count>=0'],
+    // the only threshold that can fail: see SIGNIN_BOUND_MS
+    browser_first_signins: [{ threshold: 'count>0', abortOnFail: true, delayAbortEval: `${Math.ceil(SIGNIN_BOUND_MS / 1000)}s` }],
   },
   summaryTrendStats: ['count', 'min', 'med', 'p(95)', 'max'],
   // no url/name tags: the SPA puts the signed-in user into /call extras
@@ -110,7 +131,7 @@ async function settled (page, path) {
   await page.waitForFunction(
     `(window.__benchLoad = (${loadOf.toString()})(window.__bench, window.location.pathname, ` +
     `Array.from(document.querySelectorAll('[data-testid^="widget-"]')).map((e) => e.getAttribute('data-testid'))), true)`,
-    { polling: 'raf', timeout: 10000 })
+    { polling: 'raf', timeout: LOAD_READ_MS })
   return await page.evaluate(() => window.__benchLoad)
 }
 
@@ -175,11 +196,7 @@ async function drainCalls (page, tags, loadT0, loadId) {
 let LOADS = 0
 function nextLoadId () { return `${exec.vu.idInTest}:${++LOADS}` }
 
-// The first navigation, retried (run 11: a refused localhost port killed 4
-// of 5 sessions outright). Bounded: GOTO_TRIES x GOTO_WAIT_MS (config
-// loginTries / loginRetryMs; tests set 1 to reproduce run 11).
-const GOTO_TRIES = CFG.loginTries || 6
-const GOTO_WAIT_MS = CFG.loginRetryMs || 5000
+// The first navigation, retried within GOTO_TRIES x GOTO_WAIT_MS (above).
 async function gotoLogin (page) {
   for (let i = 1; ; i++) {
     try {
@@ -220,6 +237,7 @@ async function tokenOf (page) {
 export default async function () {
   exec.vu.metrics.metadata.vu = String(exec.vu.idInTest)      // #1089: see nextLoadId
   const s = CFG.sessions[exec.vu.idInTest - 1]
+  SIGNED_IN.add(0, { session: s.name })                       // the gate judges from here (SIGNIN_BOUND_MS)
   const deadline = Date.now() + CFG.durationS * 1000
   // #935: the session's identity classes, its initial user first, then each
   // FRESH class (bench/fresh_classes.py); one browser context each, like a
@@ -255,8 +273,18 @@ async function runClass (s, user, k, last, deadline, prevToken) {
     // #935: snowplow's learned classes right before a fresh class's sign-in
     const tBefore = Date.now() / 1000
     const before = k > 0 ? learnedCounts(prevToken) : null
-    await page.locator('#basic_username').fill(user)
-    await page.locator('#basic_password').fill(CFG.password)
+    const opts = { timeout: CFG.pageTimeoutMs }
+    const form = page.locator(LOGIN.form)
+    const submit = form.getByRole('button', { name: LOGIN.submit, exact: true })
+    try {
+      await page.locator(LOGIN.username).fill(user, opts)
+      await page.locator(LOGIN.password).fill(CFG.password, opts)
+    } catch (e) {
+      // named, and without the identity (k6's error quotes the value it was filling): the
+      // session ends here, as an uncaught error carrying this message only
+      throw new Error(`session ${s.name}: the login form ${LOGIN.form} (${LOGIN.username}, ${LOGIN.password}) ` +
+        `could not be filled: ${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
+    }
     // the first page's clock starts when the app leaves /login (pageload.js)
     await page.evaluate(() => {
       const b = window.__bench
@@ -264,11 +292,17 @@ async function runClass (s, user, k, last, deadline, prevToken) {
     })
     const loginAt = Date.now()
     const firstId = nextLoadId()
-    await page.locator('#basic_password').press('Enter')
+    try {
+      await submit.click(opts)
+    } catch (e) {
+      throw new Error(`session ${s.name}: the "${LOGIN.submit}" button of ${LOGIN.form} could not be clicked: ` +
+        `${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
+    }
     const first = await settled(page, null)
     const landed = first === null ? '(none)' : first.path
     if (first !== null) {
       LOGINS.add(1, { session: s.name })
+      if (k === 0) SIGNED_IN.add(1, { session: s.name })
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
