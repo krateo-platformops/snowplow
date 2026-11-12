@@ -26,7 +26,6 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
-	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
@@ -180,15 +179,6 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	ep, err := xcontext.UserConfig(req.Context())
 	if err != nil {
 		log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
-		// #1379 review LOW b — the verified caller's own credential is not
-		// on the request: snowplow refuses before anything is sent, for the
-		// reason audit v0.12.0 names for exactly this, not the caller's
-		// invalid request.
-		if callAudited(opts.verb) {
-			ev := callAuditEvent(req, opts, uri, dialled, "", nil)
-			ev.Outcome, ev.DenialReason, ev.Message = audit.OutcomeDenied, credentialMissingReason(req), audit.MessageRefused
-			audit.EmitRoute(req.Context(), ev)
-		}
 		response.Unauthorized(wri, err)
 		return
 	}
@@ -829,17 +819,6 @@ func (r *callHandler) asked(req *http.Request) audit.Event {
 		return unresolved
 	}
 	return callAuditEvent(req, opts, uri, dialled, "", nil)
-}
-
-// credentialMissingReason is the denial reason of a verified caller whose own
-// credential is not on the request: step_up_required for a krateo:loa:2
-// token (the step-up credential), session_credential_missing otherwise, chosen
-// from the validated token's groups as the login middleware chose the Secret.
-func credentialMissingReason(req *http.Request) string {
-	if ui, err := xcontext.UserInfo(req.Context()); err == nil && credsecret.IsStepUp(ui.Groups) {
-		return audit.DenialStepUpRequired
-	}
-	return audit.DenialSessionCredentialMissing
 }
 
 // nameInPath reports whether buildURIPath puts the object's name in the path

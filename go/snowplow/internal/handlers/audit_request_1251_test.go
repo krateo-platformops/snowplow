@@ -247,12 +247,12 @@ func wantFacts1251(t *testing.T, got map[string]attribute.Value, ips []string, u
 	}
 }
 
-// The exits before the dial. A request that does not validate (400) gets no
-// record from the HANDLER: its route's record is audit.OpenRecord's
-// (TestAudit_OpenRecord_*, TestAudit_E2E_*), and this arm drives the handler
-// alone. A verified caller with no user endpoint (401) is the handler's own
-// denied record, reason session_credential_missing (#1379 re-review LOW b,
-// audit v0.12.0): nothing was sent, and the record says why.
+// The exits before the dial — a request that does not validate (400) and one
+// with no user endpoint (401) — emit no record from the HANDLER: nothing was
+// sent. Each is its route's record from audit.OpenRecord, with the reason the
+// login middleware or the refusal gives it (TestAudit_OpenRecord_*,
+// TestAudit_E2E_*); this arm drives the handler alone. The control in the
+// same arm is a write that reaches the dial.
 func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 	api, ep := newFakeAPI443(t)
 	api.respond(http.StatusNotFound, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}`)
@@ -280,13 +280,8 @@ func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("no user endpoint: code %d, want 401", w.Code)
 	}
-	got := records957(rec)
-	if len(got) != 1 {
-		t.Fatalf("the exits before the dial emitted %d records, want 1 (the 401's)", len(got))
-	}
-	if got[0]["krateo.audit.outcome"] != "denied" || got[0]["krateo.audit.denial_reason"] != "session_credential_missing" {
-		t.Errorf("the 401's record: outcome %q reason %q, want denied session_credential_missing",
-			got[0]["krateo.audit.outcome"], got[0]["krateo.audit.denial_reason"])
+	if n := len(records957(rec)); n != 0 {
+		t.Fatalf("the exits before the dial emitted %d records from the handler, want 0", n)
 	}
 	if n := len(api.requests()); n != 0 {
 		t.Fatalf("precondition: %d requests reached the apiserver before a 400/401", n)

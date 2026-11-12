@@ -256,11 +256,16 @@ DELETE, or none), so a new route is never silently rowless
 `audit.OpenRecord`, before any middleware decodes a body or verifies a token,
 so every exit emits exactly one record (#1379 review F2):
 
-- the handler emits it (`audit.EmitRoute`) with what the authority answered.
-  A verified caller whose own credential is not on the request (`/call`'s
-  401 after the login middleware) is the handler's own record: `denied`,
+- the handler emits it (`audit.EmitRoute`) with what the authority answered;
+- the login middleware (UserConfig) names the verified caller as soon as the
+  token validates (`audit.SetCaller`), before its credential lookup, so its
+  own exits are the route's record too: a verified caller whose own
+  credential Secret is missing (its 401) is `denied`,
   `session_credential_missing` or, for a `krateo:loa:2` token,
-  `step_up_required`, no status code;
+  `step_up_required`, no status code (`audit.DenyRoute`); a lookup that fails
+  for any other reason (its 500, or the page budget's 504) is a `failure`
+  with the code the apiserver answered the Secret read with, else snowplow's
+  own (`audit.FailRoute`), a legitimate server error, not a design error;
 - a 4xx exit that emitted none, a refusal by snowplow before anything was
   sent (a body the decoder refuses, a malformed query, a `/call` dial that
   would act on another object), is recorded when the request ends: what it

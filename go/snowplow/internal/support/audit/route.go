@@ -7,6 +7,11 @@
 //
 //   - the handler emits it, through EmitRoute, with what the authority
 //     answered (a /call write, an export);
+//   - the login middleware's own exits after it verified the caller are
+//     described by it: a refusal for its own reason (DenyRoute: the caller's
+//     credential is missing) is denied with that reason, a failure before
+//     anything was sent (FailRoute: the credential lookup failed) is a
+//     failure with its code;
 //   - a refusal by snowplow before anything was sent (a 4xx exit with no
 //     handler record: a body the decoder refuses, a malformed query) is
 //     recorded by OpenRecord when the request ends: what the request asked
@@ -74,6 +79,7 @@ type recordSlot struct {
 	base   context.Context   // the request context as Middleware established it
 	caller *jwtutil.UserInfo // the verified caller (SetCaller)
 	asked  *Event            // the handler's parsed descriptor (SetAsked)
+	end    *routeEnd         // how a middleware said it ended (DenyRoute, FailRoute)
 }
 
 // OpenRecord is the outermost middleware of an audited route (see the file
@@ -117,6 +123,42 @@ func SetCaller(ctx context.Context, ui jwtutil.UserInfo) {
 	}
 }
 
+// DenyRoute records on ctx's audited request that snowplow refused the
+// verified caller before anything was sent, for reason (one of the request
+// writer's closed denial reasons): OpenRecord's record of the exit is then
+// denied with that reason, no status code. Called by the middleware that
+// refused (a verified caller whose own credential is missing).
+func DenyRoute(ctx context.Context, reason string) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeDenied, reason: reason, message: MessageRefused}
+		s.mu.Unlock()
+	}
+}
+
+// FailRoute records on ctx's audited request that it failed before anything
+// was sent, with code: the status the authority answered (a Secret read the
+// apiserver refused) or snowplow's own (an error of its own). OpenRecord's
+// record of the exit is then a failure with that code: a legitimate server
+// error, not a design error.
+func FailRoute(ctx context.Context, code int) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeFailure, code: code, message: MessageFailedBeforeSend}
+		s.mu.Unlock()
+	}
+}
+
+// MessageFailedBeforeSend is the body of a record of a request that failed
+// before anything was sent (FailRoute).
+const MessageFailedBeforeSend = "failed before anything was sent"
+
+// routeEnd is how a middleware said the request ended, for OpenRecord.
+type routeEnd struct {
+	outcome, reason, message string
+	code                     int
+}
+
 // SetAsked records on ctx's audited request the handler's own descriptor of
 // what it asked for, once the handler parsed it: OpenRecord describes a later
 // exit with no record by it, never by parsing the request again.
@@ -143,7 +185,7 @@ func (s *recordSlot) close(req *http.Request, sw *statusWriter, panicked bool) {
 		return
 	}
 	s.mu.Lock()
-	base, caller, asked := s.base, s.caller, s.asked
+	base, caller, asked, end := s.base, s.caller, s.asked, s.end
 	s.mu.Unlock()
 	if caller == nil {
 		return // never verified: counted, never recorded
@@ -160,6 +202,11 @@ func (s *recordSlot) close(req *http.Request, sw *statusWriter, panicked bool) {
 		status = http.StatusOK // net/http's answer to a handler that never set one
 	}
 	switch {
+	case end != nil && !panicked:
+		ev.Outcome, ev.DenialReason, ev.Message = end.outcome, end.reason, end.message
+		ev.StatusCode = end.code
+		Emit(ctx, ev)
+		return
 	case panicked:
 		designErrors.Add("panic", 1)
 		ev.Outcome, ev.DenialReason, ev.Message = OutcomeFailure, "", MessagePanic

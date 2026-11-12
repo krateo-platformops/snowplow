@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
@@ -48,6 +50,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -72,9 +75,31 @@ func (e2eNamespaces) NamespaceLabels(context.Context, string) (map[string]string
 // recorder.
 func e2eEnv(t *testing.T, extra func(rt *routeTable, chain use.Chain, login func(http.Handler) http.Handler)) (http.Handler, string, *audittest.Recorder) {
 	t.Helper()
+	return e2eEnvWith(t, e2eLogin{groups: []string{"devs"}, seed: []string{credsecret.SessionName(e2eUser)}}, extra)
+}
+
+// e2eLogin is the caller's login state: the token's groups, the credential
+// Secrets the informer holds, and how the apiserver answers a re-read of a
+// Secret the informer does not hold (404 by default).
+type e2eLogin struct {
+	groups       []string
+	seed         []string
+	secretStatus int
+}
+
+func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain use.Chain, login func(http.Handler) http.Handler)) (http.Handler, string, *audittest.Recorder) {
+	t.Helper()
+	if login.secretStatus == 0 {
+		login.secretStatus = http.StatusNotFound
+	}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/secrets/") {
+			w.WriteHeader(login.secretStatus)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":`+strconv.Itoa(login.secretStatus)+`}`)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			if strings.HasSuffix(r.URL.Path, "/cm-x") {
@@ -99,12 +124,19 @@ func e2eEnv(t *testing.T, extra func(rt *routeTable, chain use.Chain, login func
 	cache.ResetSecretsInformerForTest()
 	t.Cleanup(func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() })
 	cli := fake.NewSimpleClientset()
-	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e2eNS, Name: credsecret.SessionName(e2eUser)},
-		Data: map[string][]byte{"server-url": []byte(api.URL), "token": []byte("tok")}}
-	if _, err := cli.CoreV1().Secrets(e2eNS).Create(context.Background(), sec, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
+	for _, name := range login.seed {
+		sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e2eNS, Name: name},
+			Data: map[string][]byte{"server-url": []byte(api.URL), "token": []byte("tok")}}
+		if _, err := cli.CoreV1().Secrets(e2eNS).Create(context.Background(), sec, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(cache.SetSecretsClientForTest(cli))
+	// The UserConfig re-read of a Secret the informer does not hold goes to
+	// the fake apiserver.
+	t.Cleanup(credhttp.SetInClusterConfigForTest(func() (*rest.Config, error) {
+		return &rest.Config{Host: api.URL, BearerToken: "tok-sa"}, nil
+	}))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	if err := cache.StartSecretsInformer(ctx, nil, e2eNS); err != nil {
@@ -115,7 +147,7 @@ func e2eEnv(t *testing.T, extra func(rt *routeTable, chain use.Chain, login func
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{Username: e2eUser, Groups: []string{"devs"},
+	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{Username: e2eUser, Groups: login.groups,
 		Duration: time.Hour, KeyID: e2eKID, PrivateKey: key, Principal: jwtutil.PrincipalHuman})
 	if err != nil {
 		t.Fatal(err)
@@ -129,11 +161,11 @@ func e2eEnv(t *testing.T, extra func(rt *routeTable, chain use.Chain, login func
 	mux := http.NewServeMux()
 	rt := newRouteTable(mux)
 	chain := newRequestChain(slog.New(slog.DiscardHandler))
-	login := middleware.UserConfig(jwtutil.NewStaticKeySource(&key.PublicKey), e2eNS)
-	mountCallWriteRoutes(rt, chain, login)
-	mountExportRoutes(rt, chain, login)
+	userConfig := middleware.UserConfig(jwtutil.NewStaticKeySource(&key.PublicKey), e2eNS)
+	mountCallWriteRoutes(rt, chain, userConfig)
+	mountExportRoutes(rt, chain, userConfig)
 	if extra != nil {
-		extra(rt, chain, login)
+		extra(rt, chain, userConfig)
 	}
 	return mux, tok, rec
 }
@@ -267,5 +299,70 @@ func TestAudit_E2E_P_APanicAfterTheDialIsOneRowSayingPanic(t *testing.T) {
 	}
 	if d := audit.DesignErrorCount("panic") - before; d != 1 {
 		t.Errorf("snowplow_audit_unrecorded_exit_total{panic} moved by %d, want 1", d)
+	}
+}
+
+// #1379 re-review — the login middleware's own refusals of a VERIFIED caller,
+// through the real route table and the real UserConfig: a token whose
+// session Secret is missing, and a krateo:loa:2 token whose step-up Secret is
+// missing, are each exactly one denied row with the credential reason, no
+// status code; a credential read the apiserver refuses (403) is one failure
+// row with that code. None moves the design-error counter.
+func TestAudit_E2E_C_TheLoginsOwnRefusalsAreOneRowEach(t *testing.T) {
+	stepUp := []string{"devs", credsecret.StepUpGroup}
+	for _, login := range []struct {
+		name    string
+		login   e2eLogin
+		code    int
+		outcome string
+		reason  string
+		status  string
+	}{
+		{"no session Secret", e2eLogin{groups: []string{"devs"}},
+			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialSessionCredentialMissing, ""},
+		{"a krateo:loa:2 token with no step-up Secret", e2eLogin{groups: stepUp, seed: []string{credsecret.SessionName(e2eUser)}},
+			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialStepUpRequired, ""},
+		{"the credential read refused (403)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusForbidden},
+			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", "403"},
+	} {
+		for _, route := range []struct {
+			name, method, target, body, action string
+		}{
+			{"POST /call", http.MethodPost, "/call?" + e2eCMQuery, e2eCM, "call"},
+			{"GET /export", http.MethodGet, "/export?format=json&" + e2eCMQuery, "", "export"},
+		} {
+			t.Run(login.name+", "+route.name, func(t *testing.T) {
+				h, tok, rec := e2eEnvWith(t, login.login, nil)
+				before := audit.DesignErrorCount("answered")
+				if code := e2eDo(h, tok, route.method, route.target, route.body); code != login.code {
+					t.Fatalf("answered %d, want %d", code, login.code)
+				}
+				if d := audit.DesignErrorCount("answered") - before; d != 0 {
+					t.Errorf("the design-error counter moved by %d on a legitimate refusal or failure", d)
+				}
+				a, _ := e2eRow(t, rec.Records())
+				if a[krateoaudit.KeyOutcome] != login.outcome || a[krateoaudit.KeyDenialReason] != login.reason || a[krateoaudit.KeyAction] != route.action {
+					t.Errorf("action %q outcome %q reason %q, want %s %s %q", a[krateoaudit.KeyAction], a[krateoaudit.KeyOutcome], a[krateoaudit.KeyDenialReason], route.action, login.outcome, login.reason)
+				}
+				if got, ok := a[krateoaudit.KeyHTTPStatusCode]; got != login.status || (login.status == "" && ok) {
+					t.Errorf("http.response.status_code %q (present %t), want %q", got, ok, login.status)
+				}
+				if a[krateoaudit.KeyUserName] != e2eUser {
+					t.Errorf("user.name %q: the row does not name the verified caller", a[krateoaudit.KeyUserName])
+				}
+				for k, v := range a {
+					if strings.Contains(v, "-clientconfig") {
+						t.Errorf("%s names the credential Secret", k)
+					}
+				}
+				opts := []audittest.Option{}
+				if _, named := a[krateoaudit.KeyObjectResource]; !named {
+					opts = append(opts, audittest.AllowIncomplete(krateoaudit.RuleTarget))
+				}
+				audittest.AssertConformant(t, audit.Writer, rec.Records()[0], opts...)
+				audittest.AssertRequiredKeysDetected(t, audit.Writer, rec.Records()[0], opts...)
+				audittest.AssertEnumsDetected(t, audit.Writer, rec.Records()[0], opts...)
+			})
+		}
 	}
 }
