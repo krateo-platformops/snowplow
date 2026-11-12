@@ -240,8 +240,15 @@ func (s *Server) applyStatus(rule Rule, t target) {
 		fail("", fmt.Sprintf("the ServiceAccount may not patch %s/status", t.Resource))
 		return
 	}
-	admitted, err := s.admitCustomResource(c, s.restrict(c, prev, next), prev)
+	coerced, _, err := s.coerceCustomResource(c, next, "Ignore")
 	if err != nil {
+		line["status"] = 400
+		s.o.Log(line)
+		fail("", err.Error())
+		return
+	}
+	admitted := s.restrict(c, prev, coerced)
+	if err := s.validateCustomResource(c, admitted, prev); err != nil {
 		line["status"] = 422
 		s.o.Log(line)
 		fail("", err.Error())

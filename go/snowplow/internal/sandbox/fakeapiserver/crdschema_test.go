@@ -55,8 +55,12 @@ func TestCRDSchema_UnknownFieldsPerFieldValidation(t *testing.T) {
 	eq(t, get(warn.body, "spec", "unknown"), nil, "pruned")
 	eq(t, warn.hdr.Get("Warning"), `299 - "unknown field \"spec.unknown\""`, "the warning")
 	strict := patchSpec(h, "?fieldValidation=Strict", map[string]any{"applied": true, "other": 1})
-	eq(t, strict.code, 400, "Strict")
-	eq(t, strict.body["message"], `strict decoding error: unknown field "spec.other"`, "message")
+	// A patched object's strict errors are 422 on "patch" (k8s.io/apiserver v0.36.5
+	// pkg/endpoints/handlers/patch.go:348-356); a create or update body's are 400 (crupdate_test.go).
+	eq(t, strict.code, 422, "Strict")
+	if m := fmt.Sprint(strict.body["message"]); !strings.Contains(m, `patch: Invalid value: `) || !strings.HasSuffix(m, `: strict decoding error: unknown field "spec.other"`) {
+		t.Fatalf("message %q", m)
+	}
 	ignore := patchSpec(h, "?fieldValidation=Ignore", map[string]any{"applied": true, "other": 1})
 	eq(t, ignore.code, 200, "Ignore")
 	eq(t, ignore.hdr.Get("Warning"), "", "no warning")
