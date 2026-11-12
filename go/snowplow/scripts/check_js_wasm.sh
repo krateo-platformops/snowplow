@@ -7,7 +7,8 @@
 #      own wasm runner (Node.js);
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
-#   5. the fake apiserver's field selectors equal kube-apiserver's (scripts/checkfieldlabels);
+#   5. the fake apiserver's field selectors equal kube-apiserver's, labels and value paths
+#      (scripts/checkfieldlabels);
 #   6. gosec, run as the browser build (GOOS=js GOARCH=wasm), finds nothing in the packages
 #      whose browser build compiles other files than their server build;
 #   7. the server build contains none of the browser code (main_browser_build_test.go:
