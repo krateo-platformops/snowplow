@@ -1914,6 +1914,42 @@ def in_use_addresses(listed: dict[str, list[dict]], region: str) -> tuple[int, s
                             f"neither")
 
 
+# #1361: the FIREWALLS quota is the PROJECT's (project-info describe; 100 in operations-dev-krateo-io), and every
+# cluster takes rules of it that GKE makes. Read live in that project on 2026-11-12 (gcloud compute firewall-rules
+# list, tests/fixtures/firewalls_bench_20261112.json: the rules targeting each of the nine bench clusters' nodes, GKE
+# 1.36, and the three orchestrators'), every bench cluster held exactly these, by name:
+#   - gke-<cluster>-<hash>-all (its pod range) and gke-<cluster>-<hash>-vms (its nodes' range): every cluster;
+#   - k8s-<cluster-id>-node-http-hc (the load balancers' health checks to the nodes): one per cluster that has a
+#     LoadBalancer Service;
+#   - k8s-fw-<lb-id> (ALLOW to the Service's IP) and k8s-fw-<lb-id>-deny (DENY the rest to that IP): two per
+#     LoadBalancer Service.
+# Those are target pool-based load balancers (GKE < 1.37, BACKEND_SERVICE_LB_SINCE); a 1.37 cluster's backend
+# service-based ones have not been read here yet, and are counted the same until one is.
+# The LoadBalancer Services are the install's own (Footprint.lb_services, bench/lb_need.py from the pulled chart and
+# the run's values). In a footprint of several clusters, those with a LoadBalancer Service are at most
+# min(clusters, lb_services): that bound is counted. A testvm / vm606 VM takes its two SSH rules (gcevm.ssh_rules,
+# counted by its own preflight: an orchestrator exists, and is in the usage, before its run's pre-check reads it).
+GKE_FIREWALLS = (("gke-<cluster>-<hash>-all", "cluster"), ("gke-<cluster>-<hash>-vms", "cluster"),
+                 ("k8s-<cluster-id>-node-http-hc", "cluster with a LoadBalancer Service"),
+                 ("k8s-fw-<lb-id>", "LoadBalancer Service"), ("k8s-fw-<lb-id>-deny", "LoadBalancer Service"))
+
+
+def _firewalls_need(fp: Footprint) -> list[tuple[str, int, str]]:
+    per = {k: sum(1 for _, w in GKE_FIREWALLS if w == k) for k in {w for _, w in GKE_FIREWALLS}}
+    lb_clusters = min(fp.clusters, fp.lb_services)
+    n = (per["cluster"] * fp.clusters + per["cluster with a LoadBalancer Service"] * lb_clusters
+         + per["LoadBalancer Service"] * fp.lb_services)
+    return [("FIREWALLS", n, f"the run needs {n}: {per['cluster']} GKE rules x {fp.clusters} cluster(s) + "
+                             f"{per['cluster with a LoadBalancer Service']} health-check rule x {lb_clusters} cluster(s) "
+                             f"with a LoadBalancer Service + {per['LoadBalancer Service']} (allow, deny) x "
+                             f"{fp.lb_services} LoadBalancer Service(s)")]
+
+
+FIREWALLS_HINT = ("Every firewall rule of the project counts, any cluster's or VM's (gcloud compute firewall-rules "
+                  "list); a k8s-fw-* / k8s-*-node-http-hc rule whose cluster is gone is a leftover of that cluster's "
+                  "load balancers, its owner's to delete")
+
+
 @dataclasses.dataclass(frozen=True)
 class RunQuota:
     """A quota the run consumes. `needs(footprint)` -> [(metric, need, what
@@ -1945,6 +1981,7 @@ RUN_QUOTAS: tuple[RunQuota, ...] = (
     # "some new accounts and projects also have a global CPUs (All Regions) quota ... measured
     # as a sum of all your vCPUs in all regions" (compute/resource-usage, read 2026-11-05)
     RunQuota("CPUS_ALL_REGIONS", "project", "", _all_regions_cpus_need, some_projects_only=True),
+    RunQuota("FIREWALLS", "project", "", _firewalls_need, hint=FIREWALLS_HINT),
     RunQuota("INSTANCES", "region", "", lambda fp: [("INSTANCES", fp.nodes, f"the run needs {fp.nodes} (its nodes)")]),
     RunQuota("IN_USE_ADDRESSES", "region", "", _in_use_need,
              hint="Every VM external IP, every external forwarding rule and every unattached reserved address in "
@@ -1970,6 +2007,10 @@ RUN_QUOTAS: tuple[RunQuota, ...] = (
     RunQuota("INSTANCE_GROUPS", "region", "", _per_node_group("INSTANCE_GROUPS", "instance group")),
     RunQuota("INSTANCE_TEMPLATES", "region", "", _per_node_group("INSTANCE_TEMPLATES", "instance template")),
 )
+
+
+# the quotas counted project-wide (project-info describe), not per region: bench.gcevm reads a VM's from there too
+PROJECT_QUOTAS = frozenset(row.quota for row in RUN_QUOTAS if row.source == "project")
 
 
 def quota_fit(quotas: dict, metric: str, need: float, what: str, unit: str = "",

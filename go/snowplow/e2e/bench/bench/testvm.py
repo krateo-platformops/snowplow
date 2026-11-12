@@ -83,8 +83,9 @@ MACHINE SIZE from the suite's parallelism: the smallest e2-standard type of the 
 exact equality over the zone's machine types) with at least --parallelism vCPU. E2 has its own regional
 quota (E2_CPUS), so the VM takes nothing from the N2_CPUS the bench's clusters use; the footprint
 (INSTANCES 1, E2_CPUS, SSD_TOTAL_GB of its boot disk, IN_USE_ADDRESSES 1 for its ephemeral external IP,
-which reaches go.dev, GitHub, PyPI and the module proxies: ingress is SSH from IAP only) is read against
-the region's quotas before anything is made (bench.gcevm.quota_check, vm606's).
+which reaches go.dev, GitHub, PyPI and the module proxies: ingress is SSH from IAP only; and the project's
+FIREWALLS, one per SSH rule it makes, #1361) is read against the region's and the project's quotas before
+anything is made (bench.gcevm.quota_check, vm606's).
 
 RUN. `run -- COMMAND...` runs the argv, as given, in the checkout, detached on the VM (it survives the SSH
 session and the laptop). The caller's --budget-minutes is the bound of the WHOLE run, and every wait in it
@@ -117,8 +118,9 @@ IS USED ONCE: up refuses a --run of which anything exists (its record, an instan
 it in any zone, its firewall rules). The project and zone of an existing run come from its record only.
 
 ON THE VM, NOTHING NAMES THE OPERATOR: every step runs under <VM_ROOT>/<R> with HOME there and USER
-testvm (an OS Login home is the operator's account as a POSIX name); gcloud's error text reaches output
-as its code only (bench.identity.error_summary), the VM's output through redact_identity.
+testvm (an OS Login home is the operator's account as a POSIX name); a failed gcloud call's refusal says its
+cause with the identity removed (bench.gcevm.gcloud_cause, #1361), an SSH / kubectl failure its code only
+(bench.identity.error_summary), the VM's output through redact_identity.
 """
 
 from __future__ import annotations
@@ -606,11 +608,12 @@ def machine_for(project: str, zone: str, parallelism: int) -> dict:
     return {k: best.get(k) for k in ("name", "guestCpus", "memoryMb")}
 
 
-def footprint(machine: dict) -> tuple:
+def footprint(machine: dict, run: str) -> tuple:
     return (("INSTANCES", 1, "the VM", ""),
             (CPU_QUOTA, machine["guestCpus"], f"its {machine['name']}", ""),
             ("SSD_TOTAL_GB", BOOT_DISK_GB, f"its {BOOT_DISK_TYPE} boot disk", " GB"),
-            ("IN_USE_ADDRESSES", 1, "its ephemeral external IP", ""))
+            ("IN_USE_ADDRESSES", 1, "its ephemeral external IP", ""),
+            gcevm.ssh_rules_footprint(firewall_rules(run)))
 
 
 def run_in_use(run: str, project: str) -> list[str]:
@@ -657,11 +660,11 @@ def cmd_up(a) -> int:
         raise Refused(f"run {run} is in use: {'; '.join(used)}. A run name is used once: a new session takes a new "
                       f"--run")
     machine = machine_for(project, zone, a.parallelism)
-    fits, refusals = gcevm.quota_check(project, zone, footprint(machine))
+    fits, refusals = gcevm.quota_check(project, zone, footprint(machine, run))
     for msg in fits:
         gcevm.say(msg)
     if refusals:
-        raise Refused(f"the VM does not fit {gke.region_of(zone)}'s quotas: " + "; ".join(refusals))
+        raise Refused(f"the VM does not fit {gke.region_of(zone)}'s or {project}'s quotas: " + "; ".join(refusals))
     terminates_at = gcevm.rfc3339(time.time() + a.session_hours * 3600)          # set once, here
     d = state_dir(run)
     sf = d / "startup.sh"
@@ -674,9 +677,10 @@ def cmd_up(a) -> int:
                     parallelism=a.parallelism, session_hours=a.session_hours, terminates_at=terminates_at,
                     created_at=time.time(), source=src, runs=[], pushes=[])
     for fw, rule in firewall_rules(run).items():
-        rc, _o, err = gcloud(gcevm.firewall_create_argv(fw, rule, project), dry=not a.yes)
+        rc, _o, err = gcevm.create(gcevm.firewall_create_argv(fw, rule, project), dry=not a.yes, poll_s=a.poll_s,
+                                  what=f"firewall rule {fw}")
         if rc != 0:
-            raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+            raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if a.yes:
         st = _state(run)
         rules = {r["name"]: r for r in gcevm.rule_docs(firewall_rules(run), project)}
@@ -684,14 +688,15 @@ def cmd_up(a) -> int:
         off += [x for r in rules.values() for x in _rule_as_made(run, st, r)]
         if off:
             raise Refused(f"after their create, {'; '.join(off)}; {down_hint(run)}")
-    rc, _o, err = gcloud(create_command(run, project, zone, machine["name"], str(sf), terminates_at), dry=not a.yes)
+    rc, _o, err = gcevm.create(create_command(run, project, zone, machine["name"], str(sf), terminates_at), dry=not a.yes,
+                              poll_s=a.poll_s, what=f"instance {name}")
     if not a.yes:
         gcevm.say(f"DRY: {machine['name']} ({machine['guestCpus']} vCPU) for --parallelism {a.parallelism}; deletes "
                   f"itself at {terminates_at} (--session-hours {a.session_hours}); would bundle {a.sha} and push it; "
                   f"nothing was created")
         return 0
     if rc != 0:
-        raise Refused(f"instances create failed (rc={rc}; {error_summary(err)}); {down_hint(run)}")
+        raise Refused(f"instances create failed (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     _save_state(run, instance_created_at=time.time())
     st = _state(run)
     try:
@@ -1269,7 +1274,7 @@ def _cluster(name: str, location: str, project: str) -> dict | None:
     if rc != 0:
         if gke._NOT_FOUND.search(err or ""):
             return None
-        raise Refused(f"GKE cluster {name} could not be read (rc={rc}; {error_summary(err)}): refusing")
+        raise Refused(f"GKE cluster {name} could not be read (rc={rc}; {gcevm.gcloud_cause(err)}): refusing")
     got = gke._json(out)
     if not isinstance(got, dict) or got.get("name") != name:
         raise Refused(f"GKE cluster {name} answered no description of itself: refusing")
@@ -1281,7 +1286,7 @@ def _scratch_kubeconfig(run: str, name: str, location: str, project: str, d: str
     rc, _o, err = gcloud(["container", "clusters", "get-credentials", name, "--location", location,
                           "--project", project], env={"KUBECONFIG": kc})
     if rc != 0:
-        raise Refused(f"credentials for GKE cluster {name} could not be read (rc={rc}; {error_summary(err)})")
+        raise Refused(f"credentials for GKE cluster {name} could not be read (rc={rc}; {gcevm.gcloud_cause(err)})")
     return kc
 
 
@@ -1500,7 +1505,7 @@ def cmd_down(a) -> int:
         rc, _o, err = gcloud(["compute", "instances", "delete", name, *gcevm.where(project, zone), "--delete-disks",
                               "all", "--quiet"], dry=not a.yes)
         if rc != 0:
-            raise Refused(f"instances delete failed (rc={rc}; {error_summary(err)})")
+            raise Refused(f"instances delete failed (rc={rc}; {gcevm.gcloud_cause(err)})")
         if a.yes and gcevm.instance(name, project, zone) is not None:
             raise Refused(f"{name} still answers in {zone} after its delete: its rules are left in place")
     else:
@@ -1509,7 +1514,7 @@ def cmd_down(a) -> int:
         rc, _o, err = gcloud(["compute", "firewall-rules", "delete", r["name"], "--project", project, "--quiet"],
                              dry=not a.yes)
         if rc != 0:
-            raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {error_summary(err)})")
+            raise Refused(f"firewall rule {r['name']} could not be deleted (rc={rc}; {gcevm.gcloud_cause(err)})")
     if not a.yes:
         gcevm.say(f"DRY: would verify {name} answers NotFound, its disks {disks} and its {len(rules)} firewall rule(s) "
                   f"gone, and revoke {len(st.get('clusters') or {})} cluster token(s); nothing was deleted")

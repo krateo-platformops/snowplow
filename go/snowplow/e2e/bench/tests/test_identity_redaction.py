@@ -97,6 +97,8 @@ SITES = {
     # #1338: bench/gcevm.py, shared by vm606 and testvm: a VM's output, a failed remote step, a drifted field
     "gcevm.remote_lines (a VM's output)": lambda s: "\n".join(gcevm.remote_lines(s)),
     "gcevm.failed (a failed remote step's lines)": lambda s: str(gcevm.failed("a step", 1, s, "", prefix="x")),
+    # #1361: a failed gcloud call's cause, in every testvm / vm606 refusal of one
+    "gcevm.gcloud_cause (a refused gcloud call's cause)": lambda s: gcevm.gcloud_cause("ERROR: " + s),
 
     # bench/testvm.py: a failed git on the laptop, the cluster probe's error, the VM's bootstrap marker
     "testvm.git_failure (a failed git's stderr)": lambda s: testvm.git_failure("/c", ["fetch"], 1, "noise\n" + s),

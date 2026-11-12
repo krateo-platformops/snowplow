@@ -15,8 +15,11 @@ the live API rather than on an outcome:
     pre-check's reads): the region's resources, FAKE_REGION_INSTANCES,
     FAKE_REGION_FORWARDING_RULES, FAKE_REGION_ADDRESSES (JSON lists shaped as
     gcloud prints them; vm(), forwarding_rule() and address() below make rows);
-  - `compute project-info describe`: the project's global quotas,
-    FAKE_PROJECT_QUOTAS (a JSON list; none by default);
+  - `compute project-info describe`: the project's global quotas as gcloud
+    returned them on 2026-11-12 (fixtures/project_quotas_20261112.json: FIREWALLS
+    68 of 100 among them, no CPUS_ALL_REGIONS), FAKE_PROJECT_USAGE_<METRIC>
+    steering a usage, and FAKE_PROJECT_QUOTAS (a JSON list) replacing or adding
+    quotas by metric;
   - FAKE_FAIL_READ: those reads fail as real gcloud fails them (#1172 B2,
     B3; read_failure below): a failed LIST exits 0 with "[]" and a WARNING
     unless the call sets CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false.
@@ -34,6 +37,7 @@ import os
 from pathlib import Path
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "region_europe_west4_quotas_20261025.json"
+PROJECT_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "project_quotas_20261112.json"
 OLDER_NAMES = {"SSD_TOTAL_GB": "FAKE_SSD_USAGE", "STATIC_ADDRESSES": "FAKE_STATIC_USAGE"}
 LISTS = {"instances": "FAKE_REGION_INSTANCES", "forwarding-rules": "FAKE_REGION_FORWARDING_RULES",
          "addresses": "FAKE_REGION_ADDRESSES"}
@@ -87,7 +91,14 @@ def quotas(env=None, name: str = "europe-west4") -> dict:
 
 
 def project_quotas(env=None) -> dict:
-    return {"name": PROJECT, "quotas": json.loads(_env(env).get("FAKE_PROJECT_QUOTAS") or "[]")}
+    env = _env(env)
+    got = {q["metric"]: q for q in json.loads(PROJECT_FIXTURE.read_text())["quotas"]}
+    for q in json.loads(env.get("FAKE_PROJECT_QUOTAS") or "[]"):
+        got[q["metric"]] = q
+    for m, q in got.items():
+        if env.get(f"FAKE_PROJECT_USAGE_{m}") is not None:
+            q["usage"] = float(env[f"FAKE_PROJECT_USAGE_{m}"])
+    return {"name": PROJECT, "quotas": list(got.values())}
 
 
 # FAKE_FAIL_READ: the pre-check reads that fail as gcloud fails them (comma-separated:

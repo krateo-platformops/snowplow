@@ -137,7 +137,8 @@ def fake(tmp_path, monkeypatch, run_trees):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "laptop-data"))
     for k in ("FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES",
               "FAKE_STREAM_STALL", "FAKE_LIMIT_E2_CPUS", "FAKE_FW_DELETE_LOST", "FAKE_INSTANCE_DELETE_LOST",
-              "FAKE_INSTANCE_ON_CREATE", "FAKE_CREATE_FAIL"):
+              "FAKE_INSTANCE_ON_CREATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL", "FAKE_PROJECT_USAGE_FIREWALLS",
+              "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -1072,3 +1073,97 @@ def test_every_gcloud_call_is_bounded_by_its_tool_never_by_a_constant_here():
     import inspect
     assert inspect.signature(gcevm.gcloud).parameters["timeout"].default is None
     assert inspect.signature(gcevm.ssh).parameters["timeout"].default is None
+
+
+# ─── #1361: a refused create says its cause; the project's FIREWALLS first; a resource not ready ─────────
+
+# what each of the fake's refusals (fake_vm606.GCLOUD_FAILURES, gcloud 561's forms) must still say in testvm's refusal
+CAUSES = {
+    "QUOTA_EXCEEDED": ("Quota 'FIREWALLS' exceeded", "QUOTA_EXCEEDED"),
+    "RESOURCE_EXHAUSTED": ("RESOURCE_EXHAUSTED", "429"),
+    "ZONE_RESOURCE_POOL_EXHAUSTED": ("ZONE_RESOURCE_POOL_EXHAUSTED", "does not have enough resources"),
+    "Invalid value": ("Invalid value for field 'resource.scheduling.terminationTime'",),
+    "unrecognized arguments": ("unrecognized arguments: --no-such-flag",),
+    "the account": ("Required 'compute.instances.create' permission",),
+    "the account in brackets": ("does not have permission to access projects instance",),
+}
+
+
+def _no_identity(text: str) -> None:
+    assert "PLACEHOLDER-OPERATOR" not in text and "@example.invalid" not in text and "authenticated as" not in text, text
+
+
+@pytest.mark.parametrize("which", ["FAKE_FW_CREATE_FAIL", "FAKE_CREATE_FAIL"])
+@pytest.mark.parametrize("cause", sorted(CAUSES))
+def test_a_refused_create_names_its_cause_and_never_the_account(fake, capsys, tmp_path, monkeypatch, which, cause):
+    """Run tvsmoke1 refused with "no error code; the error text is withheld" while GCE had said QUOTA_EXCEEDED:
+    the refusal keeps gcloud's cause and drops only the identity."""
+    assert set(CAUSES) == set(fake_vm606.GCLOUD_FAILURES)
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv(which, cause)
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    what = f"firewall rule {VM}-deny-ssh could not be created" if which == "FAKE_FW_CREATE_FAIL" \
+        else "instances create failed"
+    assert rc == 2 and f"refusing: {what} (rc=1; ERROR: (gcloud.compute." in err, err
+    for word in CAUSES[cause]:
+        assert word in err, (word, err)
+    assert "no error code" not in err and "withheld" not in err
+    _no_identity(out + err)
+    assert f"down --run {RUN}" in err                                  # what was made is left to down, by name
+
+
+def test_up_refuses_before_creating_anything_when_the_projects_firewalls_do_not_fit(fake, capsys, tmp_path,
+                                                                                     monkeypatch):
+    """The issue's falsifier: FIREWALLS at 99 of 100 refuses before any create (tvsmoke1 made the deny rule as the
+    100th, then failed the allow rule)."""
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_PROJECT_USAGE_FIREWALLS", "99")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2, err
+    assert ("FIREWALLS in operations-dev-krateo-io: 99 of 100 used, 1 free; the VM needs 2: its 2 IAP-only SSH rules "
+            f"({VM}-deny-ssh, {VM}-iap-ssh)") in err
+    assert not [v for v in _verbs(fake) if re.search(r"\b(create|delete)\b", v)]
+    assert not (testvm.state_dir(RUN) / "state.json").exists()
+    # 98 of 100: the two rules fit, said in the same form as the regional lines
+    monkeypatch.setenv("FAKE_PROJECT_USAGE_FIREWALLS", "98")
+    rc, out, err = _run(capsys, *_up_args(clone, sha))
+    assert rc == 0, err
+    assert re.search(r"^FIREWALLS in operations-dev-krateo-io: 98 of 100 used, 2 free; the VM needs 2: ", out, re.M)
+    assert re.search(r"^E2_CPUS in europe-west3: .* used, .* free; the VM needs 4: ", out, re.M)
+
+
+def test_up_refuses_when_the_projects_quotas_cannot_be_read(fake, capsys, tmp_path, monkeypatch):
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_PROJECT_INFO_FAIL", "1")
+    rc, _o, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and ("the quotas of project operations-dev-krateo-io could not be read (rc=1; ERROR: "
+                        "(gcloud.compute.project-info.describe) Could not fetch resource: | - Required "
+                        "'compute.projects.get' permission") in err, err
+    assert not [v for v in _verbs(fake) if re.search(r"\b(create|delete)\b", v)]
+
+
+def test_a_subnetwork_not_ready_is_waited_for_by_its_operation_then_created(fake, capsys, tmp_path, monkeypatch):
+    """Run tvsmoke2: GCE refused the insert at once ("subnetworks/default is not ready") while another tenant's GKE
+    create patched the subnetwork. up waits for that operation to end and creates again."""
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_NOT_READY", "3")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 0, err + out
+    sub = f"projects/{PROJECT}/regions/europe-west3/subnetworks/default"
+    assert (f"instance {VM}: GCE answers {sub} is not ready; waiting for its operation "
+            f"operation-1794441048556-subnet-patch (compute.subnetworks.patch, since ") in out
+    assert f"instance {VM}: operation operation-1794441048556-subnet-patch on {sub} ended; creating again" in out
+    verbs = _verbs(fake)
+    assert verbs.count("compute instances create") == 2 and verbs.count("compute operations describe") == 3
+    lists = [c for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "operations", "list"]]
+    assert lists and all(c["partial_error"] == "false" and "--regions" in c["argv"] for c in lists)
+
+
+def test_a_resource_not_ready_with_no_operation_to_wait_for_refuses_naming_it(fake, capsys, tmp_path, monkeypatch):
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_NOT_READY", "never")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and (f"instances create failed (rc=1; ERROR: (gcloud.compute.instances.create) Could not fetch "
+                        f"resource: | - The resource 'projects/{PROJECT}/regions/europe-west3/subnetworks/default' is "
+                        f"not ready)") in err, err
+    assert _verbs(fake).count("compute instances create") == 1

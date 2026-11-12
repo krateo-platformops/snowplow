@@ -1,0 +1,455 @@
+{
+ "read": "2026-11-12 (gcloud 561): gcloud compute firewall-rules list --project operations-dev-krateo-io; only the rules targeting a snowplow bench cluster's nodes or a vm606 orchestrator, and of each its name, target tags, action and the kubernetes.io keys of its description",
+ "project_usage": {
+  "metric": "FIREWALLS",
+  "usage": 66.0,
+  "limit": 100.0,
+  "rules_listed": 66
+ },
+ "rules": [
+  {
+   "name": "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-all",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run24n1b-c2967676-d0278485-all",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1b-c2967676-d0278485-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run24n1b-c2967676-d0278485-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1b-c2967676-d0278485-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-all",
+   "targetTags": [
+    "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n1-c2967676-5e6986f1-all",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1-c2967676-5e6986f1-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n1-c2967676-5e6986f1-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1-c2967676-5e6986f1-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-all",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n2-c2967676-9093f041-all",
+   "targetTags": [
+    "gke-snowplow-bench-run25n2-c2967676-9093f041-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run25n2-c2967676-9093f041-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run25n2-c2967676-9093f041-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n1-c22e6884-2aa05902-all",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1-c22e6884-2aa05902-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n1-c22e6884-2aa05902-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1-c22e6884-2aa05902-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n1b-c22e6884-191791a2-all",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1b-c22e6884-191791a2-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n1b-c22e6884-191791a2-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1b-c22e6884-191791a2-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n2-c22e6884-949682ba-all",
+   "targetTags": [
+    "gke-snowplow-bench-run26n2-c22e6884-949682ba-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "gke-snowplow-bench-run26n2-c22e6884-949682ba-vms",
+   "targetTags": [
+    "gke-snowplow-bench-run26n2-c22e6884-949682ba-node"
+   ],
+   "action": "ALLOW"
+  },
+  {
+   "name": "k8s-2351c147e0d519cd-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "2351c147e0d519cd"
+   }
+  },
+  {
+   "name": "k8s-4cbfae1c54819e83-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "4cbfae1c54819e83"
+   }
+  },
+  {
+   "name": "k8s-5756e3ddcfe67f77-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run25n2-c2967676-9093f041-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "5756e3ddcfe67f77"
+   }
+  },
+  {
+   "name": "k8s-591f79338590b13e-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1b-c2967676-d0278485-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "591f79338590b13e"
+   }
+  },
+  {
+   "name": "k8s-947ee9a2f2757705-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run26n2-c22e6884-949682ba-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "947ee9a2f2757705"
+   }
+  },
+  {
+   "name": "k8s-97951043316db420-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "97951043316db420"
+   }
+  },
+  {
+   "name": "k8s-a347ef27edefc914-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1-c2967676-5e6986f1-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "a347ef27edefc914"
+   }
+  },
+  {
+   "name": "k8s-a3b67e515258c817-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1-c22e6884-2aa05902-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "a3b67e515258c817"
+   }
+  },
+  {
+   "name": "k8s-dec66c411d64a99c-node-http-hc",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1b-c22e6884-191791a2-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/cluster-id": "dec66c411d64a99c"
+   }
+  },
+  {
+   "name": "k8s-fw-a19aaf1734c7b4a80a5fd7b6a393aa9e",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1b-c22e6884-191791a2-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a19aaf1734c7b4a80a5fd7b6a393aa9e-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1b-c22e6884-191791a2-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a1c8937da3b594f41877325dbb72e26c",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1-c2967676-5e6986f1-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a1c8937da3b594f41877325dbb72e26c-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1-c2967676-5e6986f1-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a3475c7fc3849466caac66725f652d2a",
+   "targetTags": [
+    "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a3475c7fc3849466caac66725f652d2a-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run24n2-c2967676-cc9f5b57-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a67d5cd4f14ca4f57a6fbd20d640e8ee",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-a67d5cd4f14ca4f57a6fbd20d640e8ee-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run25n1b-c2967676-ec51e37d-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-ab95b0644f9ff4882898e9f245bace1c",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1-c22e6884-2aa05902-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-ab95b0644f9ff4882898e9f245bace1c-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run26n1-c22e6884-2aa05902-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-accc1aebf4c5348e69bd062e31c5d1c8",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1b-c2967676-d0278485-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-accc1aebf4c5348e69bd062e31c5d1c8-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1b-c2967676-d0278485-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-ae7e0c37f40204ba2be2f3389f8c8ae6",
+   "targetTags": [
+    "gke-snowplow-bench-run25n2-c2967676-9093f041-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-ae7e0c37f40204ba2be2f3389f8c8ae6-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run25n2-c2967676-9093f041-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-aeecd17d1dd5947939b8fef6b9a72471",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-aeecd17d1dd5947939b8fef6b9a72471-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run24n1-c2967676-c03bb5d8-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-af896dcc5e84e481694559c7c79f67ad",
+   "targetTags": [
+    "gke-snowplow-bench-run26n2-c22e6884-949682ba-node"
+   ],
+   "action": "ALLOW",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "k8s-fw-af896dcc5e84e481694559c7c79f67ad-deny",
+   "targetTags": [
+    "gke-snowplow-bench-run26n2-c22e6884-949682ba-node"
+   ],
+   "action": "DENY",
+   "description": {
+    "kubernetes.io/service-name": "krateo-system/krateo-agent-gateway-platform"
+   }
+  },
+  {
+   "name": "snowplow-bench-orch-run24e-deny-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run24e"
+   ],
+   "action": "DENY",
+   "description": "vm606 owner=snowplow-bench run=run24e"
+  },
+  {
+   "name": "snowplow-bench-orch-run24e-iap-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run24e"
+   ],
+   "action": "ALLOW",
+   "description": "vm606 owner=snowplow-bench run=run24e"
+  },
+  {
+   "name": "snowplow-bench-orch-run25c-deny-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run25c"
+   ],
+   "action": "DENY",
+   "description": "vm606 owner=snowplow-bench run=run25c"
+  },
+  {
+   "name": "snowplow-bench-orch-run25c-iap-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run25c"
+   ],
+   "action": "ALLOW",
+   "description": "vm606 owner=snowplow-bench run=run25c"
+  },
+  {
+   "name": "snowplow-bench-orch-run26d-deny-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run26d"
+   ],
+   "action": "DENY",
+   "description": "vm606 owner=snowplow-bench run=run26d"
+  },
+  {
+   "name": "snowplow-bench-orch-run26d-iap-ssh",
+   "targetTags": [
+    "snowplow-bench-orch-run26d"
+   ],
+   "action": "ALLOW",
+   "description": "vm606 owner=snowplow-bench run=run26d"
+  }
+ ]
+}

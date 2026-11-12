@@ -64,7 +64,8 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES", "FAKE_SCP_CORRUPT", "FAKE_SCP_MODE", "FAKE_TAMPER_AFTER_SSH",
               "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
               "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
-              "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL"):
+              "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
+              "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -925,13 +926,16 @@ def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, 
     assert rc == 0, err
     for metric in ("INSTANCES", "E2_CPUS", "SSD_TOTAL_GB", "IN_USE_ADDRESSES"):
         assert re.search(rf"^{metric} in europe-west4: .*the VM needs", out, re.M), (metric, out)
+    # #1361: and the project's FIREWALLS, one per SSH rule up makes
+    assert re.search(rf"^FIREWALLS in operations-dev-krateo-io: 68 of 100 used, 32 free; the VM needs 2: its 2 "
+                     rf"IAP-only SSH rules \({VM}-deny-ssh, {VM}-iap-ssh\)$", out, re.M), out
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
     assert {c["argv"][1] for c in lists} == {"instances", "forwarding-rules", "addresses"}
     assert all(c["partial_error"] == "false" for c in lists)
     monkeypatch.setenv("FAKE_LIMIT_E2_CPUS", "4")
     rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0",
                          "--ssh-ready-timeout-s", "1", "--bootstrap-timeout-s", "1")
-    assert rc == 2 and "the VM does not fit europe-west4's quotas: E2_CPUS" in err
+    assert rc == 2 and "the VM does not fit europe-west4's or operations-dev-krateo-io's quotas: E2_CPUS" in err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
 
 
@@ -1100,7 +1104,9 @@ def test_a_describe_that_fails_otherwise_than_notfound_refuses_never_reads_as_ab
     _upped(fake, capsys, monkeypatch)
     monkeypatch.setenv("FAKE_FW_DESCRIBE_503", "1")
     rc, _out, err = _run(capsys, "down", "--run", RUN, "--yes")
-    assert rc == 2 and f"firewall rule {VM}-deny-ssh could not be read (rc=1; ResponseError: code=503)" in err
+    # #1361: gcloud's cause, not its code alone
+    assert rc == 2 and (f"firewall rule {VM}-deny-ssh could not be read (rc=1; ERROR: (gcloud.compute.firewall-rules."
+                        f"describe) Could not fetch resource: | - The service is currently unavailable. code=503)") in err
     assert not [v for v in _verbs(fake) if v.endswith(" delete") or "remove-iam" in v]
 
 
@@ -1809,3 +1815,35 @@ def test_a_record_without_what_up_made_reads_nothing_as_made(fake, capsys):
     (vm606.state_dir(RUN) / "state.json").write_text(json.dumps(st))
     rc, _out, err = _run(capsys, "status", "--run", RUN)
     assert rc == 2 and f"run {RUN}'s record holds no as-made of what up created" in err
+
+
+# ─── #1361: the project's FIREWALLS before any grant; a refused create's cause; a resource not ready ─
+
+def test_up_refuses_before_any_grant_when_the_projects_firewalls_do_not_fit(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_PROJECT_USAGE_FIREWALLS", "99")
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and ("the VM does not fit europe-west3's or operations-dev-krateo-io's quotas: FIREWALLS in "
+                        "operations-dev-krateo-io: 99 of 100 used, 1 free; the VM needs 2: its 2 IAP-only SSH rules "
+                        f"({VM}-deny-ssh, {VM}-iap-ssh)") in err, err
+    assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
+
+
+@pytest.mark.parametrize("which, what", [("FAKE_FW_CREATE_FAIL", f"firewall rule {VM}-deny-ssh could not be created"),
+                                         ("FAKE_CREATE_FAIL", "instances create failed")])
+@pytest.mark.parametrize("cause, words", [("QUOTA_EXCEEDED", ("Quota 'FIREWALLS' exceeded", "QUOTA_EXCEEDED")),
+                                          ("ZONE_RESOURCE_POOL_EXHAUSTED", ("ZONE_RESOURCE_POOL_EXHAUSTED",)),
+                                          ("the account", ("Required 'compute.instances.create' permission",))])
+def test_a_refused_create_names_its_cause_and_never_the_account(fake, capsys, monkeypatch, which, what, cause, words):
+    monkeypatch.setenv(which, cause)
+    rc, out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and f"refusing: {what} (rc=1; ERROR: (gcloud.compute." in err, err
+    assert all(w in err for w in words), err
+    assert "PLACEHOLDER-OPERATOR" not in out + err and "authenticated as" not in out + err
+
+
+def test_a_subnetwork_not_ready_is_waited_for_by_its_operation_then_created(fake, capsys, monkeypatch):
+    monkeypatch.setenv("FAKE_NOT_READY", "2")
+    rc, out, err = _up(capsys, monkeypatch)
+    assert rc == 0, err
+    assert f"instance {VM}: GCE answers projects/{PROJECT}/regions/europe-west3/subnetworks/default is not ready" in out
+    assert _verbs(fake).count("compute instances create") == 2
