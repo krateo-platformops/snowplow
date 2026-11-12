@@ -243,7 +243,7 @@ import time
 from pathlib import Path
 
 from bench import evidence, gcevm, gke
-from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE, LIST_ENV,  # noqa: F401
+from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE,  # noqa: F401
                          NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
                          ssh, ssh_stage)
 from bench.gke import DEFAULT_PROJECT, DEFAULT_ZONE, ZONE_PATTERN

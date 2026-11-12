@@ -12,8 +12,9 @@ copied: each rule below is vm606's, stated once.
     to end, then creates again, within the call's bound; nothing was made by the refused call.
   - SELECTION by exact name. A resource is read by `describe` (its own NotFound is "absent", any other
     failure refuses: not_found() counts a NotFound only when it names the resource's own full path, since
-    gcloud words a missing PARENT the same way), or by exact equality over one unfiltered list read with
-    CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false (a list whose requests failed otherwise exits 0 with "[]").
+    gcloud words a missing PARENT the same way), or by exact equality over one unfiltered list, which gcloud()
+    runs with bench.gke.COMPUTE_LIST_ENV, as every compute list (a list whose requests failed otherwise exits 0
+    with "[]").
     No --filter: gcloud 561 can mis-parse one into an empty answer with rc 0 (#1307 re-review N1).
   - PARENTS FIRST: the project (exists, ACTIVE, the record's number) and the zone are confirmed before any
     describe there is read as "absent".
@@ -57,9 +58,8 @@ IAP_RANGE = "35.235.240.0/20"          # IAP's TCP-forwarding source range
 COMPUTE_API = "https://www.googleapis.com/compute/v1"
 TCP_22 = [{"IPProtocol": "tcp", "ports": ["22"]}]
 
-# gcloud's `compute ... list` exits 0 with "[]" when its requests failed unless this is false
-# (bench.gke.PRECHECK_LIST_ENV, #1172 B3)
-LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+# gcloud's `compute ... list` exits 0 with "[]" when its requests failed unless the partial-error property is
+# false: gcloud() runs every compute list with bench.gke.COMPUTE_LIST_ENV, its one definition (#1172 B3, #1383)
 
 
 class Refused(Exception):
@@ -103,7 +103,7 @@ def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input
         say("RUN: " + shlex.join(argv))
     try:
         p = subprocess.run(argv, capture_output=True, text=True, input=input_data, timeout=timeout,
-                           env=dict(os.environ, **(env or {})))
+                           env=gke.gcloud_env(argv, dict(os.environ, **(env or {}))))
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:.0f} s"
     return p.returncode, p.stdout, p.stderr
@@ -359,7 +359,7 @@ def get(args: list[str], path: str, what: str) -> dict | None:
 def list_json(args: list[str], what: str, timeout: float | None = None) -> list[dict]:
     """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]"). `timeout`:
     its caller's (else the tool's call bound)."""
-    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True, timeout=timeout)
+    rc, out, err = gcloud(args, quiet=True, timeout=timeout)
     try:
         got = json.loads(out) if rc == 0 else None
     except ValueError:
@@ -656,7 +656,7 @@ def quota_check(project: str, zone: str, footprint) -> tuple[list[str], list[str
                           f"the VM fits is unknown")
     listed: dict[str, list[dict]] = {}
     for kind in ("instances", "forwarding-rules", "addresses"):
-        rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], env=LIST_ENV, quiet=True)
+        rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], quiet=True)
         got = gke._json(out) if rc == 0 else None
         if not isinstance(got, list):
             raise Refused(f"the {kind} of {region} could not be listed (rc={rc}; {gcloud_cause(err)}): whether the "

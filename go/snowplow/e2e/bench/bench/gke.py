@@ -648,6 +648,39 @@ spec:
 from bench.identity import error_summary  # noqa: E402,F401  (imports nothing from bench)
 
 
+# #1172 B3 / #1383 gap 1: gcloud's `compute ... list` commands go through the SDK's
+# MultiScopeLister (googlecloudsdk/api_lib/compute/lister.py), which collects each failed
+# request's HttpError and, while the compute/allow_partial_error property is true (its
+# default, core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
+# requests failed (a 401, a missing compute.*.list permission, an unreachable zone) exits
+# 0, prints [] (or a partial list) and writes "WARNING: Some requests did not succeed." on
+# stderr. With the property false the same list exits 1 with "ERROR: ... Some requests did
+# not succeed", which every caller reads as a failed read (fail closed). ONE definition,
+# applied by the two executors that run gcloud (execute() below, bench.gcevm.gcloud()) to
+# every compute list they run, so no call site can leave it out: the disk backstop, the LB
+# release and the address backstop, the quota pre-check, vm606's and testvm's lists.
+COMPUTE_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+
+
+def is_compute_list(argv: list[str]) -> bool:
+    """A `gcloud compute <collection ...> list` argv (with or without the leading "gcloud"):
+    its command words (each word before the first flag) start with compute and hold list."""
+    words: list[str] = []
+    for t in argv[1:] if argv[:1] == ["gcloud"] else argv:
+        if str(t).startswith("-"):
+            break
+        words.append(str(t))
+    return words[:1] == ["compute"] and "list" in words[1:]
+
+
+def gcloud_env(argv: list[str], env: dict | None) -> dict | None:
+    """The environment `argv` runs with: `env` (None: inherited) and, for a compute list,
+    COMPUTE_LIST_ENV over it (it wins over a caller's own value)."""
+    if not is_compute_list(argv):
+        return env
+    return dict(os.environ if env is None else env, **COMPUTE_LIST_ENV)
+
+
 def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
             input_data: str | None = None, timeout: float = 3600,
             log: Callable[[str], None] = print,
@@ -660,7 +693,7 @@ def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
         return 0, ""
     log(f"RUN: {shown}")
     proc = subprocess.run(argv, capture_output=True, text=True,
-                          env=env, input=input_data, timeout=timeout)
+                          env=gcloud_env(argv, env), input=input_data, timeout=timeout)
     if proc.returncode != 0:
         # never the free stderr: gcloud's names the operator's account (error_summary)
         log(f"  rc={proc.returncode} ({error_summary(proc.stderr)})")
@@ -2084,17 +2117,8 @@ def region_list_command(kind: str, project: str, region: str) -> list[str]:
     return ["gcloud", "compute", kind, "list", "--project", project, *where, "--format", "json"]
 
 
-# #1172 B3: gcloud's `compute ... list` commands go through the SDK's MultiScopeLister
-# (googlecloudsdk/api_lib/compute/lister.py), which collects each failed request's
-# HttpError and, while the compute/allow_partial_error property is true (its default,
-# core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
-# requests all failed (a 401, a missing compute.forwardingRules.list permission)
-# exits 0, prints [] and writes "WARNING: Some requests did not succeed." on stderr;
-# one with an UNREACHABLE zone prints a partial list, rc 0. With the property false
-# the same list exits 1 with "ERROR: ... Some requests did not succeed", which the
-# pre-check reads as a failed read (fail closed). Set on the pre-check's three lists
-# only, through the environment form of gcloud's own property.
-PRECHECK_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+# The pre-check's lists fail closed like every compute list: execute() runs them with
+# COMPUTE_LIST_ENV (#1172 B3, #1383 gap 1), never a call site.
 
 
 def project_quotas_command(project: str) -> list[str]:
@@ -2122,10 +2146,9 @@ def quota_check(project: str, zone: str, fp: Footprint, *, run=execute, fetch=No
         quotas[src] = got
     listed: dict[str, list[dict] | None] = {}
     unread: dict[str, str] = {}
-    list_env = dict(os.environ, **PRECHECK_LIST_ENV)
     for kind in sorted({k for row in RUN_QUOTAS for k in row.reads}):
         argv = region_list_command(kind, project, region_of(zone))
-        rc, out = run(argv, dry_run=False, env=list_env, log=quiet)
+        rc, out = run(argv, dry_run=False, log=quiet)      # execute() runs it with COMPUTE_LIST_ENV
         got = _json(out) if rc == 0 else None
         listed[kind] = got if isinstance(got, list) else None
         if listed[kind] is None:
