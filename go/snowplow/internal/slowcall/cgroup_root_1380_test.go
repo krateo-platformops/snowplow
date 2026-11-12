@@ -3,14 +3,17 @@ package slowcall
 // cgroup_root_1380_test.go — #1380: cpu.stat is read beneath cgroupDir opened as
 // an os.Root. Without the Root (no cgroup filesystem) and without a cpu.stat in
 // it, a sample carries no cgroup fields, as before; a cpu.stat that resolves
-// outside the Root is not read. The Root is kept once opened, and a directory
-// that does not exist is settled as nil; any other open failure is retried at
-// the next sample.
+// outside the Root is not read. The Root is kept once opened; a directory that
+// does not exist and a platform with no file access are settled as nil; any
+// other open failure is retried at the next sample.
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 )
@@ -58,22 +61,66 @@ func TestCgroupRoot1380_TransientOpenFailureIsRetried(t *testing.T) {
 	}
 }
 
-// A directory that does not exist is settled as nil: no cgroup fields, and no
-// open at later samples.
-func TestCgroupRoot1380_MissingDirectoryIsSettledAsNil(t *testing.T) {
-	open, calls := countingOpen1380(fs.ErrNotExist, fs.ErrNotExist)
-	c := &rootCache{dir: t.TempDir(), open: open}
-	for i := range 3 {
-		if r := c.get(); r != nil {
-			t.Fatalf("get %d returned a Root for a directory that does not exist", i+1)
+// The same, with the samples taken concurrently through one cache (the
+// sampler's goroutine and the requests' emit reads share it): one sample
+// meets the failure, one open succeeds and is kept, every other sample carries
+// the cgroup fields. Under -race, a get without its lock is a data race.
+func TestCgroupRoot1380_ConcurrentSamplesShareOneRetriedOpen(t *testing.T) {
+	dir := t.TempDir()
+	write1380(t, filepath.Join(dir, "cpu.stat"), v2Stat1380)
+	open, calls := countingOpen1380(syscall.EMFILE)
+	c := &rootCache{dir: dir, open: open}
+	t.Cleanup(func() {
+		if c.root != nil {
+			_ = c.root.Close()
 		}
+	})
+
+	const goroutines, samples = 64, 50
+	var without atomic.Int64
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range samples {
+				if !readCPUFrom(c.get()).cgOK {
+					without.Add(1)
+				}
+			}
+		})
 	}
-	if *calls != 1 {
-		t.Fatalf("open called %d times for a directory that does not exist, want 1", *calls)
+	wg.Wait()
+	if *calls != 2 || without.Load() != 1 {
+		t.Fatalf("%d concurrent samples: open called %d times and %d samples without cgroup fields, want 2 opens (the EMFILE, one success kept) and 1 sample (the one that met the EMFILE)", goroutines*samples, *calls, without.Load())
+	}
+}
+
+// The permanent failures are settled as nil, with one open: a directory that
+// does not exist, and a platform with no file access (errors.ErrUnsupported;
+// ENOSYS is what a browser page's wasm_exec.js answers to every filesystem
+// call, and syscall reports it as ErrUnsupported).
+func TestCgroupRoot1380_PermanentOpenFailuresAreSettledAsNil(t *testing.T) {
+	for name, err := range map[string]error{
+		"not exist":   fs.ErrNotExist,
+		"unsupported": errors.ErrUnsupported,
+		"ENOSYS":      syscall.ENOSYS,
+	} {
+		t.Run(name, func(t *testing.T) {
+			open, calls := countingOpen1380(err, err, err)
+			c := &rootCache{dir: cgroupDir, open: open} // the open is faked: no filesystem needed
+			for i := range 3 {
+				if r := c.get(); r != nil {
+					t.Fatalf("get %d returned a Root after %v", i+1, err)
+				}
+			}
+			if *calls != 1 || !c.settled {
+				t.Fatalf("after %v: open called %d times, settled %v; want 1 and settled", err, *calls, c.settled)
+			}
+		})
 	}
 
-	// The real os.OpenRoot on a missing directory is classified the same way.
-	missing := &rootCache{dir: filepath.Join(t.TempDir(), "no-such-cgroup-fs"), open: os.OpenRoot}
+	// The real os.OpenRoot on a missing directory is classified the same way
+	// (ErrNotExist; ErrUnsupported where the platform has no file access).
+	missing := &rootCache{dir: filepath.Join(os.TempDir(), "snowplow-1380-no-such-dir", "cgroup"), open: os.OpenRoot}
 	if missing.get() != nil || !missing.settled {
 		t.Fatalf("os.OpenRoot on a missing directory: root %v settled %v, want nil and settled", missing.root, missing.settled)
 	}

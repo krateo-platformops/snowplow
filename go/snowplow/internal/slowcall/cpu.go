@@ -62,11 +62,15 @@ var cgroupRoot = &rootCache{dir: cgroupDir, open: os.OpenRoot}
 
 // rootCache opens dir as an os.Root once it can and keeps it for the process:
 // one descriptor, shared by the sampler's goroutine and the requests' emit
-// reads (os.Root's methods are safe for concurrent use). A directory that does
-// not exist (no cgroup filesystem: not Linux, the browser build) is settled
-// too, as nil; a sample then carries no cgroup fields, as it does when no
-// cpu.stat is found. Any other failure (a transient one such as EMFILE) is not
-// kept: that sample carries no cgroup fields and the next one opens again.
+// reads (os.Root's methods are safe for concurrent use). Two failures are
+// permanent and settled too, as nil: a directory that does not exist
+// (fs.ErrNotExist: no cgroup filesystem, as on macOS or under Node's real
+// filesystem) and a platform with no file access at all (errors.ErrUnsupported:
+// in a browser page wasm_exec.js answers every filesystem call with ENOSYS,
+// which syscall reports as ErrUnsupported). A sample then carries no cgroup
+// fields, as it does when no cpu.stat is found. Any other failure (a transient
+// one such as EMFILE) is not kept: that sample carries no cgroup fields and the
+// next one opens again.
 type rootCache struct {
 	dir  string
 	open func(string) (*os.Root, error)
@@ -86,7 +90,7 @@ func (c *rootCache) get() *os.Root {
 	switch {
 	case err == nil:
 		c.root, c.settled = r, true
-	case errors.Is(err, fs.ErrNotExist):
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, errors.ErrUnsupported):
 		c.settled = true
 	}
 	return c.root
