@@ -51,7 +51,13 @@ const DestinationRefusedReason = "DestinationRefused"
 // guardedTransport is what every client built here uses when it names no
 // transport of its own. It has http.DefaultTransport's settings and the guarded
 // dialer, and it is shared, as http.DefaultTransport was.
-var guardedTransport http.RoundTripper = dialguard.Transport()
+//
+// It goes through dialguard.RoundTripper, as plumbing requires of any client
+// built on dialguard.Transport (plumbing v1.52.0, dialguard/roundtripper.go).
+// On a server build that returns the transport itself. On js/wasm it refuses
+// every redirect, because the browser's fetch would follow one where neither
+// CheckRedirect nor RefuseRedirectHops sees it (#1360).
+var guardedTransport http.RoundTripper = dialguard.RoundTripper(dialguard.Transport())
 
 // DestinationRefused reports whether err is the destination policy's refusal.
 func DestinationRefused(err error) bool {

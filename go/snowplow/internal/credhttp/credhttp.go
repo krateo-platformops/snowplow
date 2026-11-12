@@ -76,13 +76,14 @@
 //     program supplies, so a config's client certificate (a cert-auth
 //     clientconfig) is not sent, and server certificates are verified by the
 //     browser against its own roots, not against a config's CA data.
-//   - A REDIRECT, on the paths BrowserEgress serves (every hardened config
-//     and the owned branch of a stage fetch), fails the request instead of
-//     being returned: fetch is told to refuse it, so the never-follow rule
-//     holds, but the caller gets an error rather than the 3xx response. A
-//     client plumbing builds (the JWKS key source, the /call passthrough,
-//     the plumbing branch of a stage fetch) reaches fetch through plumbing's
-//     dialguard transport and gets fetch's own redirect handling.
+//   - A REDIRECT fails the request instead of being returned: fetch is told
+//     to refuse it, so the never-follow rule holds, but the caller gets an
+//     error rather than the 3xx response. That holds on every egress path:
+//     BrowserEgress (every hardened config, the owned branch of a stage
+//     fetch), guardedTransport (destination.go), and every client plumbing
+//     builds (the JWKS key source, the /call passthrough, the plumbing branch
+//     of a stage fetch), which plumbing >= v1.52.0 sends through
+//     dialguard.RoundTripper (#1360).
 //
 // A server build is unaffected: BrowserEgress is nil there (egress.go).
 package credhttp
