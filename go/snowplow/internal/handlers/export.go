@@ -167,6 +167,13 @@ type exportHandler struct {
 func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	log := xcontext.Logger(req.Context())
 
+	// #986 — every export emits exactly one record, on every exit path: the
+	// record is emitted once, deferred, with what the exit that returned set
+	// on it. An exit that sets nothing is recorded as a failure with no code,
+	// never as a success.
+	rec := &exportAudit{req: req}
+	defer rec.emit()
+
 	format := strings.ToLower(req.URL.Query().Get("format"))
 	if format == "" {
 		format = "csv"
@@ -174,14 +181,17 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if format != "csv" && format != "json" && format != "pdf" {
 		writeExportError(wri, http.StatusBadRequest,
 			fmt.Errorf("unsupported export format %q (want csv, json or pdf)", format))
+		rec.denied(exportRefusedFormat)
 		return
 	}
+	rec.format = format
 
 	rowsPath := req.URL.Query().Get("path")
 	fields := parseFields(req.URL.Query().Get("fields"))
 	labels, err := parseHeaderLabels(req.URL.Query()["header"], fields)
 	if err != nil {
 		writeExportError(wri, http.StatusBadRequest, err)
+		rec.denied(exportRefusedHeader)
 		return
 	}
 
@@ -211,14 +221,16 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		consume = table.add
 	}
 	if callerPaginated {
-		rec := r.dispatchCall(req, 0, 0, stages)
-		if rec.status != http.StatusOK {
-			passThroughCallFailure(wri, rec)
+		page := r.dispatchCall(req, 0, 0, stages)
+		if page.status != http.StatusOK {
+			passThroughCallFailure(wri, page)
+			rec.done(page.status, errExportCallFailed)
 			return
 		}
-		pageRows, code, err := extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
+		pageRows, code, err := extractFromEnvelope(req.Context(), page.body.Bytes(), rowsPath)
 		if err != nil {
 			writeExportError(wri, code, err)
+			rec.done(code, err)
 			return
 		}
 		consume(pageRows)
@@ -230,10 +242,12 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath, consume, stages)
 		if failed != nil {
 			passThroughCallFailure(wri, failed)
+			rec.done(failed.status, errExportCallFailed)
 			return
 		}
 		if err != nil {
 			writeExportError(wri, code, err)
+			rec.done(code, err)
 			return
 		}
 	}
@@ -241,34 +255,19 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if table != nil {
 		rowCount = table.len()
 	}
+	// The record keeps the counts, never the rows: it must not keep a pdf
+	// export's rows reachable through the render.
+	rec.rows, rec.pages, rec.truncated = rowCount, pages, truncated
 
 	name := req.URL.Query().Get("name")
 	filename := attachmentName(req.URL.Query().Get("filename"), name, format)
-	// The audit closure captures the row count, never the rows: it must not
-	// keep a pdf export's rows reachable through the render.
-	auditExport := func(code int, err error) {
-		outcome := audit.OutcomeSuccess
-		if err != nil {
-			outcome = audit.OutcomeFailure
-		}
-		// #1055 — the record names the method the export was sent with (GET
-		// or POST) and the target it resolved, through the helper every
-		// audited request builds its record with. #1291 — its verb is the
-		// apiserver's for the read the export dialled through /call (get, or
-		// list for a collection), whichever method the export came with.
-		target := exportAuditTarget(req.URL.Query())
-		ev := requestAuditEvent("export", req.Method, target.dialledVerb(), target, outcome, code)
-		ev.Message = fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
-			format, rowCount, pages, truncated)
-		audit.Emit(req.Context(), ev)
-	}
 
 	if format == "pdf" {
 		code, err := servePDF(wri, req, table, labels, rowCount, truncated, filename, stages)
 		if err != nil {
 			log.ErrorContext(req.Context(), "unable to serve pdf export", slog.Int("code", code), slog.Any("err", err))
 		}
-		auditExport(code, err)
+		rec.done(code, err)
 		return
 	}
 
@@ -297,7 +296,64 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		log.ErrorContext(req.Context(), "unable to serialize export", slog.Any("err", err))
 	}
-	auditExport(http.StatusOK, err)
+	rec.done(http.StatusOK, err)
+}
+
+// errExportCallFailed marks an export whose /call lane answered a page with
+// a non-200: the export relays that answer and is recorded as a failure.
+var errExportCallFailed = errors.New("the /call lane answered a page with a failure")
+
+// The export's own refusals, before any page is dispatched (#986): the record
+// body names which rule refused, never the caller's value.
+const (
+	exportRefusedFormat = "refused: unsupported export format"
+	exportRefusedHeader = "refused: the header labels do not match the fields"
+)
+
+// exportAudit is the one record of one export (#986). ServeHTTP defers emit,
+// so it is emitted exactly once whichever exit returns; each exit sets what
+// it answered before returning.
+type exportAudit struct {
+	req *http.Request
+
+	set     bool
+	outcome string
+	code    int
+	message string
+
+	format      string
+	rows, pages int
+	truncated   bool
+}
+
+// denied records a refusal of the export itself, before any page was
+// dispatched: snowplow refused, nothing answered, so no status code (schema
+// v1: denied carries none).
+func (a *exportAudit) denied(message string) {
+	a.set, a.outcome, a.code, a.message = true, audit.OutcomeDenied, 0, message
+}
+
+// done records an exit after the /call lane was dispatched: code is the status
+// the export answered with, a success when err is nil.
+func (a *exportAudit) done(code int, err error) {
+	a.set, a.outcome, a.code = true, audit.OutcomeSuccess, code
+	if err != nil {
+		a.outcome = audit.OutcomeFailure
+	}
+	a.message = fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t", a.format, a.rows, a.pages, a.truncated)
+}
+
+// emit writes the record. #1055 — it names the method the export was sent
+// with (GET or POST) and the target it resolved, through the helper every
+// audited request builds its record with; #1291 — its verb is the
+// apiserver's for the read the export dialled through /call (exportAuditEvent).
+func (a *exportAudit) emit() {
+	if !a.set {
+		a.outcome, a.code, a.message = audit.OutcomeFailure, 0, "the export ended without an answer"
+	}
+	ev := exportAuditEvent(a.req, a.outcome, a.code)
+	ev.Message = a.message
+	audit.Emit(a.req.Context(), ev)
 }
 
 // renderPDF builds the document. A variable so a test can make the render

@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -151,7 +151,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	uri, err := buildURIPath(opts)
 	if err != nil {
-		response.InternalError(wri, err)
+		// #1257 — a value that is not one path segment is the caller's
+		// error: refused before anything is dialled, as validateRequest's
+		// refusals are.
+		response.BadRequest(wri, err)
 		return
 	}
 
@@ -644,37 +647,75 @@ type callOptions struct {
 	raw bool
 }
 
+// buildURIPath is the apiserver path and query /call dials for opts. It is the
+// one place that path is built: /call, /call/dry-run and /call/read dial it,
+// and an export's record reads its verb from it (auditTarget.dialledVerb).
+//
+// #1257 — every value that becomes a path segment (the API group and version,
+// the resource, the namespace, the name and the subresource) is exactly one
+// segment of the path, or the request is refused (errBadPathSegment, a 400)
+// before anything is dialled. A value is a segment only when the apiserver
+// accepts it as one (content.IsPathSegmentName: never "." or "..", never a "/"
+// or a "%", which the apiserver decodes back into a "/"), and it is sent
+// escaped (url.PathEscape), so a "?" or a "#" in a name stays in the name
+// instead of starting a query or a fragment. So the object the apiserver
+// resolves from the dialled path is, by construction, the object opts names,
+// which is the object the audit record names. Before, path.Join turned
+// name=cm-x/status into the status subresource of cm-x, and name=../secrets/s1
+// into another resource, while the record named the query's values.
+//
+// An empty group is the core group (/api), and an empty name a collection, as
+// before; an empty version, resource, or namespace on a namespaced path is
+// refused (path.Join used to drop it, which dials a different path).
 func buildURIPath(opts callOptions) (string, error) {
-	base := path.Join("/apis", opts.gvr.Group, opts.gvr.Version)
+	var parts []string
+	add := func(param, v string) error {
+		if v == "" {
+			return &errBadPathSegment{param: param, reason: "may not be empty"}
+		}
+		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
+			return &errBadPathSegment{param: param, reason: strings.Join(errs, ", ")}
+		}
+		parts = append(parts, url.PathEscape(v))
+		return nil
+	}
+
 	if len(opts.gvr.Group) == 0 {
-		base = path.Join("/api", opts.gvr.Version)
+		parts = append(parts, "api")
+	} else {
+		parts = append(parts, "apis")
+		if err := add("apiVersion", opts.gvr.Group); err != nil {
+			return "", err
+		}
+	}
+	if err := add("apiVersion", opts.gvr.Version); err != nil {
+		return "", err
 	}
 
 	// Issue #156 — the ONLY scope-dependent difference is the
-	// namespaces/<ns> segment. namespaced==true reproduces today's path
-	// byte-for-byte; namespaced==false (a POSITIVE cluster scope resolved
-	// upstream) omits the segment → base/resource. The name-append block
-	// below is scope-independent and unchanged.
-	var uriPath string
-	if opts.namespaced {
-		uriPath = path.Join(base, "namespaces", opts.nsn.Namespace, opts.gvr.Resource)
-	} else {
-		uriPath = path.Join(base, opts.gvr.Resource)
+	// namespaces/<ns> segment: namespaced==true emits it, namespaced==false (a
+	// POSITIVE cluster scope resolved upstream) omits it → base/resource.
+	// namespaces is itself cluster-scoped, so it never takes the segment
+	// (kept explicit for backward compatibility).
+	if opts.namespaced && !strings.EqualFold("namespaces", opts.gvr.Resource) {
+		parts = append(parts, "namespaces")
+		if err := add("namespace", opts.nsn.Namespace); err != nil {
+			return "", err
+		}
 	}
-	if strings.EqualFold("namespaces", opts.gvr.Resource) {
-		// namespaces is itself cluster-scoped; either branch above yields
-		// base/resource for it, but keep this explicit special case for
-		// zero churn / backward-compat (harmless with the new branch).
-		uriPath = path.Join(base, opts.gvr.Resource)
+	if err := add("resource", opts.gvr.Resource); err != nil {
+		return "", err
 	}
 
-	if has([]string{
+	if opts.nsn.Name != "" && has([]string{
 		http.MethodDelete,
 		http.MethodGet,
 		http.MethodPut,
 		http.MethodPatch,
 	}, opts.verb) {
-		uriPath = path.Join(uriPath, opts.nsn.Name)
+		if err := add("name", opts.nsn.Name); err != nil {
+			return "", err
+		}
 	}
 
 	// #282 — append the subresource segment (.../{name}/<subresource>, e.g.
@@ -682,8 +723,11 @@ func buildURIPath(opts callOptions) (string, error) {
 	// verb, so the name was just appended above; hang the subresource off it.
 	// Empty subresource → byte-identical to the pre-#282 whole-object path.
 	if opts.subresource != "" {
-		uriPath = path.Join(uriPath, opts.subresource)
+		if err := add("subresource", opts.subresource); err != nil {
+			return "", err
+		}
 	}
+	uriPath := "/" + strings.Join(parts, "/")
 
 	// Aggiunta dei query parametri, se necessario
 	query := url.Values{}
@@ -707,6 +751,15 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 
 	return uriPath, nil
+}
+
+// errBadPathSegment is buildURIPath's refusal of a query value that is not one
+// apiserver path segment (#1257). It names the parameter and the rule, never
+// the value.
+type errBadPathSegment struct{ param, reason string }
+
+func (e *errBadPathSegment) Error() string {
+	return fmt.Sprintf("invalid %q query parameter: %s", e.param, e.reason)
 }
 
 func has(s []string, e string) bool {

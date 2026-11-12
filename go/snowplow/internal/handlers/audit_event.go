@@ -64,16 +64,39 @@ func exportAuditTarget(q url.Values) auditTarget {
 	}
 }
 
-// dialledVerb is the krateo.audit.verb of the read an export dials for t: the
-// GET /call lane's apiserver URI for that target (buildURIPath), classified as
-// the apiserver classifies it.
-func (t auditTarget) dialledVerb() string {
+// exportAuditEvent is an export's record: the target it addressed, with the
+// verb of the read its /call lane dials for it (dialledVerb). #1257 — a
+// target the /call lane cannot dial (a value that is not one apiserver path
+// segment: buildURIPath refuses it, and so does the lane) names no object,
+// since none was or could be read: the record carries no Kubernetes target,
+// so the shared writer marks it target.
+func exportAuditEvent(req *http.Request, outcome string, code int) audit.Event {
+	t := exportAuditTarget(req.URL.Query())
+	if _, ok := t.dialledURI(); !ok {
+		t = auditTarget{}
+	}
+	return requestAuditEvent("export", req.Method, t.dialledVerb(), t, outcome, code)
+}
+
+// dialledURI is the apiserver URI the GET /call lane dials for t
+// (buildURIPath), and false when the lane cannot dial it.
+func (t auditTarget) dialledURI() (string, bool) {
 	uri, err := buildURIPath(callOptions{
 		gvr: t.gvr, nsn: t.nsn, subresource: t.subresource,
 		verb: http.MethodGet, namespaced: t.nsn.Namespace != "",
 	})
-	if err != nil {
-		return ""
+	return uri, err == nil
+}
+
+// dialledVerb is the krateo.audit.verb of the read an export dials for t: the
+// GET /call lane's apiserver URI for that target, classified as the apiserver
+// classifies it. A target with no URI to dial is no Kubernetes object, and
+// its verb is the lowercase method of the read, the apiserver's non-resource
+// rule.
+func (t auditTarget) dialledVerb() string {
+	uri, ok := t.dialledURI()
+	if !ok {
+		return audit.MethodVerb(http.MethodGet)
 	}
 	return audit.KubernetesVerb(http.MethodGet, uri)
 }

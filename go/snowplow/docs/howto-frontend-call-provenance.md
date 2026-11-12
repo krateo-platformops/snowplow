@@ -11,7 +11,7 @@ Everything below comes from the code: the decoder
 `internal/support/audit/provenance.go`, the emit site in
 `internal/handlers/call.go`, the CORS options and the route table in
 `main.go`, and the shared audit library
-`github.com/krateo-platformops/audit` v0.6.0 (`docs/schema.md`, "Client-asserted
+`github.com/krateo-platformops/audit` v0.10.0 (`docs/schema.md`, "Client-asserted
 provenance"). The tests named in each section are the proof.
 
 ## 1. Gate on the capability
