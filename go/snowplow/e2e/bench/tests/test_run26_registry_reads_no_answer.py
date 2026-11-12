@@ -97,6 +97,10 @@ def test_a_long_error_is_shortened_from_its_start_never_its_cause():
     ("401 Unauthorized", False), ("403 Forbidden", False), ("manifest unknown", False),
     ("dial tcp 1.2.3.4:443: connect: connection refused", False), ("dial tcp: lookup nope.invalid: no such host", False),
     ("x509: certificate signed by unknown authority", False),
+    # #1354 review M1: no answer, not refusals
+    ("read tcp 10.0.0.2:5432->52.1.2.3:443: read: connection timed out", True),
+    ("stream error: stream ID 3; INTERNAL_ERROR; received from peer", True),
+    ("http2: client connection lost", True),
 ])
 def test_helms_error_text_is_read_as_no_answer_or_an_answer(tail, no_answer):
     assert (noanswer.unanswered_text(noanswer.cause(_helm_error(tail))) is not None) is no_answer
@@ -199,3 +203,125 @@ def test_the_registry_reads_of_a_run_spend_one_bound_across_their_steps(tmp_path
     assert b.total == 240 and abs(b.deadline - a.deadline) < 1e-6
     b.extend(120)
     assert json.load(open(path))["total"] == 360 and b.holds(300)
+
+
+# ─── #1354 review: run606's operator lines, and every site wired to the run's one bound ─────────
+
+def _step(tmp_path, fn: str, rc: int) -> str:
+    """run606.sh's own `fn` (extracted as the kind arm extracts it), every python3 it runs standing in
+    with exit `rc`. Returns its log."""
+    from bench import data606_parity as dp
+    from tests.test_run606_real_sequence import BENCH_DIR
+    body = dp.functions((BENCH_DIR / "run606.sh").read_text(), [fn])
+    log = tmp_path / f"{fn}-{rc}.log"
+    script = (f"set -u\nOUT={tmp_path}; KERR={tmp_path}/kerr; REGISTRY_BUDGET={tmp_path}/b.json\n"
+              "INSTALLER_CHART=oci://ghcr.io/x/installer; INSTALLER_VERSION=0.3.1; VERIFY483=0\n"
+              "USERS=1; NAMESPACES=1; FRESH_MODES=annotation; BENCH_USER_PREFIX=u-; LOAD_DRIVER=load606\n"
+              "FULL_WIDEN_GO=; BROWSER_SESSIONS=0; BROWSER_THINK_S=0; DRIVE_S=0\n"
+              f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
+              f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
+              f"python3() {{ echo 'the stand-in said why' >&2; return {rc}; }}\n"
+              f"{body}{fn}; echo \"rc=$?\" >> {log}\n")
+    subprocess.run(["bash", "-c", script], check=True)
+    return log.read_text()
+
+
+@pytest.mark.parametrize("fn,no_answer,refusal", [
+    ("s_cert_manager_source",
+     "RECORD: cert-manager source FAILED: the registry gave NO ANSWER for the pinned chart within the registry "
+     "reads' bound (above: which read, how often): whether it verifies is unknown",
+     "RECORD: cert-manager source FAILED: the pinned chart did not verify"),
+    ("s_source",
+     "RECORD: source FAILED: the registry gave NO ANSWER for the installer chart within the registry reads' bound "
+     "(above: which read, how often): whether it resolves is unknown",
+     "RECORD: source FAILED: the installer chart does not resolve or verify"),
+    ("s_schema",
+     "RECORD: schema FAILED: the registry gave NO ANSWER for some of the CRD charts installer 0.3.1 pins (above): "
+     "what their CRDs would refuse is unknown",
+     "RECORD: schema FAILED: the manifests of this run do not satisfy the CRDs installer 0.3.1 pins"),
+])
+def test_run606_says_no_answer_for_each_registry_steps_exit_4(tmp_path, fn, no_answer, refusal):
+    out = _step(tmp_path, fn, 4)
+    assert no_answer in out and out.endswith("rc=1\n")
+    out = _step(tmp_path, fn, 2 if fn != "s_schema" else 1)
+    assert refusal in out and "NO ANSWER" not in out
+
+
+def _savings(monkeypatch, seconds=10_000.0):
+    """Budget.shared as the run's one bound with `seconds` the earlier steps did not use, on a clock of
+    its own: a site wired to it can pay a retry from them; one that is not, cannot."""
+    def shared(cls, path, sleep=None):
+        clock = _Clock()
+        b = cls(clock=clock, sleep=clock.sleep)
+        b.extend(seconds)
+        return b
+    monkeypatch.setattr(noanswer.Budget, "shared", classmethod(shared))
+
+
+def _once_then(ok, fail_on):
+    """A helm `run`: the first call whose argv[:2] is `fail_on` gets no answer; the rest are `ok`."""
+    seen = {"n": 0}
+
+    def run(argv, **kw):
+        if argv[:len(fail_on)] == fail_on and not seen["n"]:
+            seen["n"] += 1
+            return subprocess.CompletedProcess(argv, 1, "", _helm_error("context deadline exceeded"))
+        return ok(argv, **kw)
+    return run, seen
+
+
+def test_the_crd_pulls_pay_a_retry_from_the_runs_one_bound(tmp_path, monkeypatch):
+    _savings(monkeypatch)
+
+    def ok(argv, **kw):
+        dest = argv[argv.index("-d") + 1]
+        (tmp_path / dest / "authn-crds").mkdir(parents=True, exist_ok=True)
+        (tmp_path / dest / "authn-crds" / "Chart.yaml").write_text("name: authn-crds\nversion: 0.27.3\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    run, seen = _once_then(ok, ["helm", "pull"])
+    got = crd_schema.pull_all([{"chart": "authn-crds", "version": "0.27.3", "ref": "oci://ghcr.io/x/authn-crds",
+                                "from": "pin"}], str(tmp_path / "w"), str(tmp_path / "b.json"), run=run)
+    assert seen["n"] == 1 and got[0].get("path") and not got[0].get("error"), got
+
+
+def test_the_installers_reads_pay_a_retry_from_the_runs_one_bound(tmp_path, monkeypatch):
+    _savings(monkeypatch)
+    import shutil
+    import types
+
+    def ok(argv, **kw):
+        if argv[:3] == ["helm", "show", "chart"]:
+            return types.SimpleNamespace(returncode=0, stdout="version: 0.3.425\n", stderr="")
+        d = argv[argv.index("-d") + 1]
+        from tests.test_run606_pr483 import _chart
+        shutil.copytree(_chart(tmp_path, version="0.3.425"), f"{d}/installer")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    run, seen = _once_then(ok, ["helm", "show"])
+    orig = installer_src.oci_preflight
+    monkeypatch.setattr(installer_src, "oci_preflight",
+                        lambda *a, budget=None, **kw: orig(*a, run=run, budget=budget, **kw))
+    rc = installer_src.main(["oci-preflight", "--chart", "oci://x/installer", "--version", "0.3.425",
+                             "--workdir", str(tmp_path / "p"), "--no-pins", "--budget-file", str(tmp_path / "b.json")])
+    assert rc == 0 and seen["n"] == 1
+
+
+def test_the_ghcr_preflight_pays_a_retry_from_the_runs_one_bound(tmp_path, monkeypatch, capsys):
+    """One chart (no slack of its own: its share is one attempt): its reference is asked again only
+    from what the run's earlier registry reads left."""
+    _savings(monkeypatch)
+    from tests.test_ghcr_pull import _flaky, _installer, _is_chart_manifest_get, _timeout
+    seen = _flaky(monkeypatch, _is_chart_manifest_get, times=1, exc=_timeout)
+    argv = _installer(tmp_path, charts=(("agentgateway-policies", "0.2.18"),))
+    from bench import ghcr_pull
+    rc = ghcr_pull.main(argv + ["--budget-file", str(tmp_path / "b.json")])
+    assert rc == 0 and seen["n"] == 1, capsys.readouterr().err[-2000:]
+
+
+def test_a_crd_refusal_wins_over_no_answer():
+    base = {"ok": False, "kinds": [], "sources": [{"chart": "a", "version": "1", "from": "pin", "error": "x",
+                                                   "no_answer": True}]}
+    assert crd_schema.check_exit(base) == 4
+    assert crd_schema.check_exit({**base, "kinds": [{"status": "REFUSED"}]}) == 1
+    assert crd_schema.check_exit({**base, "sources": base["sources"] + [
+        {"chart": "b", "version": "1", "from": "pin", "error": "helm pull failed: 403"}]}) == 1
+    assert crd_schema.check_exit({**base, "ok": True}) == 0

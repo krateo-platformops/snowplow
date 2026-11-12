@@ -83,6 +83,9 @@ _NO_ANSWER_TEXT = [
         r"context deadline exceeded", r"i/o timeout", r"Client\.Timeout exceeded",
         r"TLS handshake timeout", r"timeout awaiting response headers",
         r"connection reset by peer", r"broken pipe", r"unexpected EOF", r"(?:^|[\s:])EOF\s*$",
+        r"read: connection timed out",                         # ETIMEDOUT on an open connection
+        r"stream error: stream ID \d+; INTERNAL_ERROR",         # an HTTP/2 RST_STREAM from the CDN
+        r"http2: client connection lost",
         r"server sent GOAWAY", r"server closed idle connection",
         r"temporary failure in name resolution", r"server misbehaving",
         r"status code:? (?:408|429|5\d\d)\b", r"\b(?:408|429|5\d\d) (?:Request Timeout|Too Many Requests|"

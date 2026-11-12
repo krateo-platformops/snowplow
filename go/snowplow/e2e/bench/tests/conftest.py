@@ -107,7 +107,7 @@ FAKE_CHART_HEADER_DRIP = "8.8.8"
 # (#1041 review F4)
 FAKE_CHART_HOP_UNRENDERED = "1.1.1"
 # FAKE_CHART_DEEP: a chart whose values.yaml nests 1,000 deep (2 KB; #1041 review round 4): past
-# Python's recursion limit for the preflight's walks, a named refusal, never a traceback
+# the preflight's nesting cap (ghcr_pull.NEST_MAX, #1356), a named refusal, never a traceback
 FAKE_CHART_DEEP = "2.2.2"
 FAKE_CHART_VALUES = {
     # the two private hops, as run 19's dry pass found them: certReplayHop's image is in the values;
