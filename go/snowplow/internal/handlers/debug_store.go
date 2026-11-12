@@ -34,7 +34,7 @@ type debugStoreBody struct {
 //
 // NO APISERVER CONTACT, BY CONSTRUCTION. There is no compare mode and no
 // client on this path. Reading the apiserver as the snowplow ServiceAccount
-// would let any valid-JWT holder learn the existence and resourceVersion of
+// would let any debug-surface caller learn the existence and resourceVersion of
 // objects their own RBAC forbids — a cross-identity read of exactly the class
 // the standing debug-surface rule prevents. /debug/apistage is metadata-only
 // AND per-identity-scoped by construction; a served comparison would have been

@@ -24,21 +24,81 @@ Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`, `GET
 dependency-tracker section) and `GET /debug/store` (#237 — the per-object informer-store read),
 and two probe endpoints used by the chart.
 
-> **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
-> pprof, vars, servable, apistage, refreshes — is registered by
-> `registerDebugRoutes` (`debug_routes.go`) behind `middleware.RefreshAuth`,
-> the stateless header-or-cookie RS256 gate `/refreshes` uses. Before 1.12.3
-> only `/debug/refreshes` was gated (#69) and the rest were world-readable on
-> the chart's LoadBalancer Service. Pass the token explicitly:
+> **Every `/debug/*` route needs a JWT (since 1.12.3) AND an RBAC grant (since
+> #1362).** The whole surface (pprof, vars, servable, apistage, refreshes,
+> reconcile, harvest, store, shadow-parity, deps) is registered by
+> `registerDebugRoutes` (`debug_routes.go`) behind one chain:
+> `middleware.RefreshAuth`, the stateless header-or-cookie RS256 gate
+> `/refreshes` uses, then `middleware.DebugAuthz`.
+>
+> **A valid JWT alone is not enough.** Several routes report metadata about
+> *every* identity's cache entries and about objects the caller's own RBAC may
+> forbid. `/debug/apistage`, for example, lists each resident entry's
+> coordinates and item count, whoever created it. So `DebugAuthz` authorizes
+> each request through Kubernetes RBAC as a **non-resource request**, exactly as
+> the apiserver would authorize the same request against itself. The verb is
+> the lowercase HTTP method (`get`, or `post` for `POST /debug/shadow-parity`),
+> and the path is the request path, decided for the JWT's username and groups.
+> The decision is the same authorizer every other snowplow RBAC check uses
+> (`rbac.EvaluateRBAC`, the same group-set rules and authz memo). With the cache
+> on it runs in-process against the informer-cached RBAC, so a diagnostic pull
+> still makes zero apiserver calls. With the cache off it is a
+> SelfSubjectAccessReview.
+>
+> The grant is an ordinary ClusterRole rule. The chart ships it as
+> `<fullname>-debug-<namespace>` (`helm/snowplow/templates/clusterrole-debug.yaml`)
+> and **binds it to no one**, because the chart has no notion of an admin
+> group. Bind it to your operator group:
+>
+> ```yaml
+> rules:
+> - nonResourceURLs: ["/debug/*"]
+>   verbs: ["get", "post"]
+> ```
+>
+> ```bash
+> kubectl create clusterrolebinding snowplow-debug-operators \
+>   --clusterrole=snowplow-debug-krateo-system --group=<your-operator-group>
+> ```
+>
+> An identity bound to `cluster-admin` already holds it, because cluster-admin
+> carries `nonResourceURLs: ["*"]`. A RoleBinding cannot grant it: a
+> non-resource request has no namespace. Pass the token explicitly:
 >
 > ```bash
 > curl -H "Authorization: Bearer $TOKEN" http://pod:8081/debug/vars
 > ```
 >
-> No token, an expired token, or a token supplied only in the query string →
-> `401`. A JWKS the pod cannot fetch → `503`. `/health` and `/readyz` stay
-> anonymous — the kubelet presents no credentials. Operator recipes are in
-> [operating.md](../../howto/operating.md).
+> | outcome | status |
+> |---|---|
+> | no token, an expired token, or a token only in the query string | `401` |
+> | a JWKS the pod cannot fetch | `503` |
+> | a valid token whose identity lacks the grant | `403`, a `Status` body: `forbidden: User "<u>" cannot get path "/debug/vars"` |
+> | the authorization cannot be decided | `503`, with the reason in the message `debug authorization unavailable (<reason>)`: `rbac_snapshot_not_built` (the boot window before the RBAC snapshot is published, pprof included: #1368), `rbac_watcher_not_wired`, `review_unavailable` (cache off, see below), `evaluator_error`, `no_identity` |
+>
+> **Known limitation (cache off).** With `CACHE_ENABLED=false` the authorizer is
+> the requester's own SelfSubjectAccessReview, which needs the requester's
+> `<user>-clientconfig` endpoint. `RefreshAuth` deliberately never reads that
+> Secret, so with the cache off **every** `/debug` route answers `503
+> review_unavailable`. It fails closed and never serves unauthorized.
+>
+> `/health` and `/readyz` stay anonymous, because the kubelet presents no
+> credentials. Operator recipes are in [operating.md](../../howto/operating.md).
+>
+> **Which routes expose what** (#1362):
+>
+> | route | output depends on other identities' state? |
+> |---|---|
+> | `GET /debug/pprof/` (`heap`, `goroutine`, `allocs`, …), `/cmdline`, `/profile`, `/symbol`, `/trace` | process-wide: memory, stacks and argv of the process serving every identity. No per-identity records. `/profile` and `/trace` also pin a CPU for their window. |
+> | `GET /debug/vars` | aggregate across all identities. It includes per-cell maps keyed by `path\|gvr\|reason` and learned-identity class counts, a map of the tenant's GVRs. |
+> | `GET /debug/servable` | no: per-GVR informer status (cluster shape), regardless of the caller's RBAC. |
+> | `GET /debug/apistage` | **yes**: every resident L1 entry, whoever created it: coordinates, item count, binding UID, key-attribution fields; `?key_hash` adds a body sha256. Never a body. |
+> | `GET /debug/refreshes` | aggregate: totals and the live subscriber count across all identities, with no per-key breakdown. |
+> | `GET /debug/reconcile` | **yes**: walks every identity's L1 entries, returns the divergent ones' metadata, and evicts them. |
+> | `GET /debug/harvest` | process-wide, not per-identity: counts of what the Phase-1 harvesters hold, and whether a given widget coordinate is held, whatever the caller's RBAC (an existence oracle). |
+> | `GET /debug/store` | **yes**: an object's existence, resourceVersion and uid from the snowplow SA's informer store, whatever the caller's RBAC. |
+> | `GET`/`POST /debug/shadow-parity` | no: one process-local boolean. POST flips it. |
+> | `GET /debug/deps` | **yes**: dependency edges and freshness of every identity's cells, by key hash. |
 
 The probe endpoints:
 
@@ -1000,7 +1060,7 @@ tighter bound costs `DEPS_RECONCILE_SAMPLE` (O(sample) under the store mutex per
 4096 / 30 s the 99 % figure is ≈ 56 min at 100K. Go's map iteration samples a random *window*
 rather than 512 independent draws, so these figures are slightly optimistic.
 
-`GET /debug/reconcile` (JWT-gated like its siblings) runs ONE full walk on demand and returns
+`GET /debug/reconcile` (JWT-gated and RBAC-authorized like its siblings) runs ONE full walk on demand and returns
 the divergent set as metadata only (key hash / class / gvr / namespace / name — never a body).
 It is a reconcile, not a dry run: the entries it lists are evicted by the worker right after.
 The full walk is **chunked** (`RangeMetadataBatched`): the store mutex is held once for a key
@@ -1062,7 +1122,7 @@ its `indexerCount`, `gvrLastSyncResourceVersion` and `gvrLastEventAgeSeconds`. C
 and the divergence IS the staleness — no inference.
 
 **It does NOT read the apiserver, and that is deliberate.** Serving the comparison here would
-read as the snowplow ServiceAccount, telling any valid-JWT holder the existence and
+read as the snowplow ServiceAccount, telling any holder of the /debug grant the existence and
 `resourceVersion` of objects their own RBAC forbids. The operator runs that half themselves, under
 their own identity.
 
@@ -1134,7 +1194,7 @@ The OTLP mirror is **aggregate, not per-GVR** — a production cluster carries ~
 informers, so three per-GVR gauges would add ~500 series per collection interval, the same
 cardinality class 1.12.4 had to cap. Stats: `indexer_objects`, `gvrs_never_event`,
 `max_event_age_seconds`, `gvrs_stale_over_hour`. The dashboard says *something* is stale; the
-JWT-gated `/debug/servable` route says which.
+JWT-gated, RBAC-authorized `/debug/servable` route says which.
 
 ### Upstream controller health — "is snowplow broken, or is an upstream controller crash-looping?"
 Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`.
