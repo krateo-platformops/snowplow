@@ -152,7 +152,11 @@ func (s *recordSlot) close(req *http.Request, sw *statusWriter) {
 	Emit(ctx, ev)
 }
 
-// statusWriter keeps the status the response was answered with.
+// statusWriter keeps the status the response was answered with, read from
+// WriteHeader only. It never wraps Write: the body goes to the original
+// writer untouched (no second write sink). A handler that writes a body
+// without calling WriteHeader answered 200, as net/http answers it, so
+// close reads a status never set as 200.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -163,13 +167,6 @@ func (w *statusWriter) WriteHeader(code int) {
 		w.status = code
 	}
 	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusWriter) Write(p []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	return w.ResponseWriter.Write(p)
 }
 
 // Unwrap lets http.ResponseController reach the wrapped writer.
