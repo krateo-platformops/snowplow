@@ -478,6 +478,18 @@ def _installer_dir(pulled: str) -> str:
     return os.path.join(pulled, sub[0])
 
 
+def pull_all(srcs: list[dict], workdir: str, budget_file: str | None, run=subprocess.run) -> list[dict]:
+    """Every pinned CRD chart pulled (pull), in parallel, within the run's one bound of its
+    pre-cluster registry reads (`budget_file`, bench/noanswer.py Budget.shared), extended here by
+    every pull's share: a pull with no answer is asked again while it holds another."""
+    from bench import noanswer
+    budget = noanswer.Budget.shared(budget_file) if budget_file else None
+    if budget is not None:
+        budget.extend(sum(1 for s in srcs if s["from"] == "pin") * noanswer.helm_read_bound())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(lambda s: pull(s, workdir, run=run, budget=budget) if s["from"] == "pin" else s, srcs))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bench.crd_schema")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -500,12 +512,7 @@ def main(argv=None) -> int:
     docs = run_documents(a)
     srcs = crd_sources(_installer_dir(a.installer_pulled))
     os.makedirs(a.workdir, exist_ok=True)
-    from bench import noanswer
-    budget = noanswer.Budget.shared(a.budget_file) if a.budget_file else None
-    if budget is not None:
-        budget.extend(sum(1 for s in srcs if s["from"] == "pin") * noanswer.helm_read_bound())
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        srcs = list(ex.map(lambda s: pull(s, a.workdir, budget=budget) if s["from"] == "pin" else s, srcs))
+    srcs = pull_all(srcs, a.workdir, a.budget_file)
     srcs = [read_crds(s) for s in srcs]
     if a.full_widen:
         from bench import full_widen
@@ -515,12 +522,23 @@ def main(argv=None) -> int:
         json.dump(res, fh, indent=2)
     for ln in report_lines(res):
         print(ln, file=sys.stderr, flush=True)
-    unanswered = [s for s in res["sources"] if s.get("no_answer")]
-    if not res["ok"] and unanswered:            # run 26: not the CRDs' refusal: their charts got no answer
+    code = check_exit(res)
+    if code == 4:
+        unanswered = [s for s in res["sources"] if s.get("no_answer")]
         print("crd check: NO ANSWER for " + ", ".join(f"{s['chart']} {s['version']}" for s in unanswered)
               + ": what their CRDs would refuse is unknown", file=sys.stderr, flush=True)
-        return 4
-    return 0 if res["ok"] else 1
+    return code
+
+
+def check_exit(res: dict) -> int:
+    """The check's exit: 0 ok; 4 NO ANSWER (run 26) only when nothing definitive refuses the run; else
+    1. A CRD's own refusal, or a chart the registry answered with a refusal, wins over no answer."""
+    if res["ok"]:
+        return 0
+    unanswered = [s for s in res["sources"] if s.get("no_answer")]
+    refused = (any(e["status"] == "REFUSED" for e in res["kinds"])
+               or any(s.get("error") and not s.get("no_answer") and s.get("from") == "pin" for s in res["sources"]))
+    return 4 if unanswered and not refused else 1
 
 
 if __name__ == "__main__":

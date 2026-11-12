@@ -1,5 +1,5 @@
 {
- "what": "the real charts run 20 pulls, measured by bench.ghcr_pull preflight's own `measured` record (installer 0.3.468, the bench's values, 2026-11-01); REAL_LARGEST is the largest of each",
+ "what": "the real charts run 20 pulls, measured by bench.ghcr_pull preflight's own `measured` record (installer 0.3.468, the bench's values, 2026-11-01); REAL_LARGEST is the largest of each; deepest / render_deepest (levels, #1356): measured 2026-11-12 by the same preflight's own read_chart_files and render (_nest_check) over the same chart versions from a local helm cache, rendered with installer 0.3.468's componentValues for each (no bench override)",
  "charts": [
   {
    "chart": "oci://ghcr.io/krateo-blueprints/charts/krateo-marketplace-catalog",
@@ -10,7 +10,9 @@
     "inflated": 363923,
     "parsed": 681,
     "members": 6,
-    "render": 390039
+    "render": 390039,
+    "deepest": 1,
+    "render_deepest": 3
    }
   },
   {
@@ -22,7 +24,9 @@
     "inflated": 386177,
     "parsed": 1644,
     "members": 125,
-    "render": 361843
+    "render": 361843,
+    "deepest": 2,
+    "render_deepest": 10
    }
   },
   {
@@ -34,7 +38,9 @@
     "inflated": 31001,
     "parsed": 7451,
     "members": 8,
-    "render": 15495
+    "render": 15495,
+    "deepest": 4,
+    "render_deepest": 10
    }
   },
   {
@@ -46,7 +52,9 @@
     "inflated": 2753178,
     "parsed": 17621,
     "members": 30,
-    "render": 2665855
+    "render": 2665855,
+    "deepest": 4,
+    "render_deepest": 40
    }
   },
   {
@@ -58,7 +66,9 @@
     "inflated": 593530,
     "parsed": 141293,
     "members": 41,
-    "render": 99113
+    "render": 99113,
+    "deepest": 6,
+    "render_deepest": 10
    }
   },
   {
@@ -68,7 +78,9 @@
     "blob": 363138,
     "largest_file": 833982,
     "inflated": 1622254,
-    "render": 32104
+    "render": 32104,
+    "deepest": 6,
+    "render_deepest": 7
    },
    "source": "measured once, outside the preflight (the installer is pulled by run606, not fetched here)"
   }
