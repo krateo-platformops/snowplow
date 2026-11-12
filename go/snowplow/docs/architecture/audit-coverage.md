@@ -4,13 +4,18 @@ title: snowplow — audit coverage
 description: Which snowplow actions emit an AuditEvent, which do not and why, what a record must contain, and how to count the trail without miscounting it. The checked-in inventory AUDIT-4 (krateo-platformops/installer#410) asks for.
 resource: oci://ghcr.io/krateo-platformops/charts/snowplow
 tags: [audit, observability, security, restactions]
-timestamp: 2026-11-08T00:00:00Z
+timestamp: 2026-11-11T00:00:00Z
 ---
 
 # Audit coverage
 
 Snowplow writes one **AuditEvent** per action it performs for a person, as an
-OTLP LogRecord on the shared logs plane (`internal/support/audit`). This page is
+OTLP LogRecord on the shared logs plane. Since #1291 the record is written by
+the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.6.0,
+schema v1), declared as the `request` writer on the scope
+`github.com/krateo-platformops/snowplow/audit`; `internal/support/audit`
+supplies what only snowplow knows (the actor from the validated token, the
+request it was made on, the preview flag). This page is
 the inventory of snowplow's paths that change something: each one is marked
 **audited**, **not audited** (an open gap) or **out of scope** (a decision, with
 its reason). Keep it current: a new route or a new emit site changes this page in
@@ -29,30 +34,69 @@ admission-side enforcement (AUDIT-5, installer#411) can give that guarantee.
 
 ## What every record contains
 
-A record should answer "who did what to which target":
+A record should answer "who did what to which target", in the terms of the
+shared schema (the library's `docs/schema.md`):
 
 | field | attribute | source |
 |---|---|---|
-| actor | `enduser.id`, `user.name` (+ `user.roles`) | the request's authenticated user, read from the request context, never reconstructed |
-| action | `krateo.action` | the emit site: `call`, `call.dryRun`, `export`, `restaction`, `restaction.dryRun` |
-| method | `http.request.method` | the verb actually sent |
-| target | `k8s.resource.*` + `k8s.namespace.name`, or `server.address` | the object acted on, or the host a RESTAction stage wrote to |
+| actor | `user.name` (+ `user.roles`), and its v0.3 twin `enduser.id` | the validated JWT on the request context, never reconstructed: the token's actor (`UserInfo.Actor()`), i.e. its outermost `act` subject on a delegated token, else its subject |
+| actor class | `krateo.audit.actor_class` | authn's signed `principal` claim of that actor (`UserInfo.ActorPrincipal()`, through `audit.ParseClaim`): `human`, `agent`, `controller` or `service`. A token with no claim (issued before authn 0.39.0) or an unknown value gets none, and the record is marked `actor_class`: **never defaulted** (Diego's ruling, #1291) |
+| delegation | `krateo.audit.on_behalf_of.user.name`, `krateo.audit.delegation` | only on a delegated (RFC 8693) token: the person the actor acts for (the token's `sub`), and the signed `act` chain, outermost actor first and ending with the subject, each `<class>:<subject>` (`:<subject>` when the token gives no class). One record names one principal |
+| action | `krateo.action` | the emit site: `call`, `call.dryRun`, `export`, `restaction`, `restaction.dryRun` (snowplow's own literals; readers use `krateo.audit.dry_run`) |
+| verb | `krateo.audit.verb` | the verb of what snowplow dialled, as its authority derives it: for a Kubernetes target the apiserver's own `RequestInfoFactory` on the method and URI that were dialled (`create`, `update`, `patch`, `delete`, `deletecollection`; for an export, the verb of the read its `/call` lane dialled, which is `get`: that lane always names its object), else the lowercase method (`post`, `put`, ...) |
+| method | `http.request.method` | the method actually sent |
+| target | exactly one: `krateo.audit.object_ref.*` + `k8s.namespace.name` (and the v0.3 twins `k8s.resource.*`), or `server.address` | the Kubernetes object acted on, or the host a RESTAction stage wrote to |
 
-The emitter enforces it, for every emit site:
+**A record is never dropped** (the shared writer's rule, #1291). One that lacks
+a key snowplow's writer class must write is emitted without it, marked
+`krateo.audit.incomplete=<markers>` (in the schema's order: `actor`,
+`actor_class`, `action`, `verb`, `method`, `preview`, `target`), and each marker
+is counted in `krateo.audit.records.incomplete{marker}`: on OTLP, the shared
+writer's own counter on the process MeterProvider (when metrics are on), and on
+`/debug/vars` in its mirror, `snowplow_audit_incomplete_total{<marker>}`, one
+cell per marker of the schema, counted from the record itself. Until #1291 a
+record with no actor was refused (counted in that cell `actor`); it is now
+emitted, marked `actor`. A gap is in the trail, never hidden.
 
-- **no actor, no record.** A record without an authenticated user is worse than
-  none, because it looks like coverage. It is refused and counted in
-  `snowplow_audit_incomplete_total{actor}` (`/debug/vars`).
-- **an actor but a missing action, method or target**: the record is still
-  emitted, marked `krateo.audit.incomplete=<fields>` (e.g. `method,target`), and
-  each missing field is counted in `snowplow_audit_incomplete_total`. The person
-  is known, so the action is not hidden; the mark says what the site failed to
-  supply.
+Every record also carries `krateo.audit.schema_version` (`1`),
+`krateo.audit.outcome` and its v0.3 twin `outcome` (`success`, `failure`, or
+`denied` when snowplow itself refused), `http.response.status_code` (when the
+authority answered; never on a denied record), `krateo.audit.dry_run` on every
+write (`true` for a dry run), `krateo.audit.preview` for a Kubernetes target,
+`session.id` (W3C baggage), the request's TraceId/SpanId, and what snowplow
+received with the request (see "Where the request came from" below). Since
+#1291, `TestAudit1291_Handlers_*` (`internal/handlers`) and
+`TestAudit1291_Stage_*` (`internal/resolvers/restactions/api`) drive every
+record shape through the real emit sites and check it with the library's
+`Check` (`audittest.AssertConformant`, `AssertRequiredKeysDetected`,
+`AssertEnumsDetected`) for the request writer; an agent's `/call` record
+conforms as the action writer too (`TestAudit1291_C_*`).
 
-Every record also carries `outcome` (`success` / `failure`),
-`http.response.status_code` (when the authority answered), `session.id` (W3C
-baggage), the request's TraceId/SpanId, and what snowplow received with the
-request (see "Where the request came from" below).
+### The preview flag
+
+`krateo.audit.preview` is `true` when the target is a namespaced object whose
+Namespace carries the label `krateo.io/purpose=preview-sandbox`, read from
+apiserver state, and `false` for any other Kubernetes target, a cluster-scoped
+one included. It is never read from the object itself (whoever creates an
+object writes its labels). Snowplow keeps a metadata-only informer on
+namespaces over its own ServiceAccount (its grant reads every resource) and
+reads a Namespace the informer does not hold with one GET. So until the
+informer has synced, and for a write into a Namespace that does not exist, the
+preview read is a synchronous GET on the request's context, made before the
+record is emitted (a NotFound answer is `false`). When the Namespace
+cannot be read, the flag is omitted and the record marked `preview`. A record
+that names only an external endpoint carries none. `TestAudit1291_P_*` and
+`TestAudit1291_R_*` pin it.
+
+### The recorded span marker
+
+The Server span of a request that wrote an audit record carries
+`krateo.audit.recorded=true` (`audit.RecordedMiddleware`, inside the span in
+`newServerHandler`), so the tail sampler keeps that trace whole; a RESTAction
+stage's record, emitted on its own span's context, marks the Server span too.
+It is a boolean: no identity ever goes on a span (#848).
+`TestS1291_RecordedMarkerOnlyOnTheServerSpanOfARequestThatWroteARecord`
+(`main` package) pins it.
 
 ### Where the request came from
 
@@ -94,10 +138,11 @@ and `TestCall1251_*` / `TestExport1251_*` (`internal/handlers`) pin this.
 **Every string is valid UTF-8.** The emitter replaces every invalid UTF-8
 sequence with U+FFFD in every string an attribute or the record body holds, at
 any depth (a string list, a nested list, a map's keys and values), in one place
-(`audit.Emitter.Emit`), for every emit site. The rule is total over the value
-kinds of the otel attribute API: a byte list is left as it is (OTLP carries it
-as protobuf `bytes`, which need not be UTF-8), and a kind an otel upgrade adds
-fails `TestUTF8_1251_K` until it gets its own case. The reason: the
+(the shared writer's `audit.Sanitize`, applied by its `Emit`), for every emit
+site. The rule is total over the value kinds of the otel attribute API: a byte
+list is left as it is (OTLP carries it as protobuf `bytes`, which need not be
+UTF-8), and a kind an otel upgrade adds fails `TestUTF8_1251_K` until it gets a
+sample. The reason: the
 OTLP exporter marshals with protobuf, which refuses a string that is not valid
 UTF-8, and the batch processor then drops the **whole batch**. So one request
 with a raw `0xFF` in its User-Agent or query, or a `name=cm-%FF` that decodes to
@@ -123,35 +168,68 @@ missing, and a record without them is not incomplete.
 
 ### Every attribute
 
-Each attribute is written only when it has a value. The names are those of the
-shared Krateo audit emitter (`github.com/krateo-platformops/audit`), so a join
-with another component's records uses the same keys.
+Each attribute is written only when it has a value. The names are the shared
+schema's (`github.com/krateo-platformops/audit`, schema v1), so a join with
+another component's records uses the same keys. The v0.3 keys snowplow wrote
+before #1291 are all still written, with the same values (the migration window
+W1: each beside its replacement, until the library closes W1).
 `TestWrittenObject957_D_AuditCoverageDocNamesEveryAttribute`
-(`internal/support/audit`) fails when the emitter can write an attribute this
-table does not name.
+(`internal/support/audit`) and the #1291 parity arms of the emit sites fail
+when a record carries an attribute this table does not name.
 
 | attribute | value |
 |---|---|
 | `event.name` | always `audit` |
-| `enduser.id`, `user.name` | the authenticated user |
-| `user.roles` | the user's groups |
+| `krateo.audit.schema_version` | always `1` |
+| `user.name`, `enduser.id` | the actor (see "What every record contains"); `enduser.id` is its v0.3 twin, always equal |
+| `user.roles` | the token's groups |
+| `krateo.audit.actor_class` | the actor's signed class: `human`, `agent`, `controller`, `service`; absent (and marked) when the token does not say |
+| `krateo.audit.on_behalf_of.user.name`, `krateo.audit.delegation` | a delegated token's subject and signed `act` chain |
 | `krateo.action` | `call`, `export`, `restaction`; a dry-run write carries the suffix `.dryRun` (`call.dryRun`, `restaction.dryRun`) |
-| `http.request.method` | the verb sent |
-| `outcome` | `success` / `failure` |
+| `krateo.audit.verb` | the authority's verb for what was dialled |
+| `http.request.method` | the method sent; `_OTHER` for one semconv does not name |
+| `http.request.method_original` | the method as sent, only when `http.request.method` is `_OTHER` |
+| `krateo.audit.dry_run` | on every write: `true` for a dry run (`/call/dry-run`, a stage path with `?dryRun=All`), else `false`; never on a read (an export) |
+| `krateo.audit.outcome`, `outcome` | `success` / `failure` / `denied` (snowplow itself refused; no status code) |
 | `http.response.status_code` | the authority's code, when it answered |
-| `k8s.resource.group`, `k8s.resource.version`, `k8s.resource.resource`, `k8s.resource.name`, `k8s.namespace.name` | the Kubernetes object's coordinates |
-| `k8s.resource.subresource` | the addressed subresource (`status`, `scale`), when there is one |
-| `k8s.object.uid` | **optional**: the written object's `metadata.uid`, from the apiserver's response; on a DELETE, the deleted object's uid |
-| `k8s.object.generation` | **optional**, an integer: the written object's `metadata.generation`, from the response; never on a DELETE |
-| `k8s.object.resource_version` | **optional**: the written object's `metadata.resourceVersion`, from the response; never on a DELETE |
-| `server.address` | host and port a RESTAction stage was sent to |
+| `krateo.audit.preview` | for a Kubernetes target: whether its Namespace is the preview sandbox (see "The preview flag") |
+| `krateo.audit.object_ref.api_group`, `krateo.audit.object_ref.api_version`, `krateo.audit.object_ref.resource`, `krateo.audit.object_ref.name`, `k8s.namespace.name`, and their v0.3 twins `k8s.resource.group`, `k8s.resource.version`, `k8s.resource.resource`, `k8s.resource.name` | the Kubernetes object's coordinates |
+| `krateo.audit.object_ref.subresource`, `k8s.resource.subresource` | the addressed subresource (`status`, `scale`), when there is one |
+| `krateo.audit.object_ref.uid`, `k8s.object.uid` | **optional**: the written object's `metadata.uid`, from the apiserver's response; on a DELETE, the deleted object's uid |
+| `krateo.audit.object_ref.generation`, `k8s.object.generation` | **optional**, an integer: the written object's `metadata.generation`, from the response; never on a DELETE |
+| `krateo.audit.object_ref.resource_version`, `k8s.object.resource_version` | **optional**: the written object's `metadata.resourceVersion`, from the response; never on a DELETE |
+| `server.address` | host and port a RESTAction stage was sent to, when the record names no Kubernetes object |
 | `krateo.restaction.namespace`, `krateo.restaction.name`, `krateo.restaction.stage` | the RESTAction and stage that acted |
 | `session.id` | the session id, from W3C baggage |
 | `krateo.request.source_ips` | a string list: the request's source IPs; only the last entry (the TCP peer) is established by snowplow (see "Where the request came from") |
 | `user_agent.original` | the request's `User-Agent` header, at most 1024 bytes (cut on a character boundary) plus `...TRUNCATED`, as the apiserver bounds it |
 | `krateo.request.uri` | the path and query snowplow received (`req.URL.RequestURI()`, as the apiserver records it) |
-| `krateo.audit.incomplete` | the required fields the site did not supply, e.g. `method,target` |
+| `krateo.audit.incomplete` | the markers of the keys the record lacks, e.g. `actor_class,preview` |
 | `krateo.audit.no_trace_context` | `true` when the record was emitted with no span (so it has no TraceId) |
+| `krateo.audit.client.source`, `krateo.audit.client.agent_session_id`, `krateo.audit.client.confirmation_id`, `krateo.audit.client.confirmed_set.count`, `krateo.audit.client.confirmed_set.irreversible`, `krateo.audit.client.confirmed_set.sha256`, `krateo.audit.client.confirmed_set.op`, `krateo.audit.client.requested_at` | **asserted**, on a `/call` write or dry run only: what the portal's `X-Krateo-Provenance` header said, after snowplow validated it against its closed schema (#1333, see "Client provenance" below); never identity, the actor's class, the verb, the target, the outcome or the event time |
+| `krateo.audit.client.rejected` | **asserted**, on a `/call` write or dry run only: why snowplow rejected the header (`oversize`, `encoding`, `version`, `schema`); the record then carries no other `krateo.audit.client.*` key, and the write ran |
+
+Not written by snowplow yet: `krateo.audit.object_ref.content_sha256`. No snowplow refusal has
+a `krateo.audit.denial_reason`: the request writer's closed set holds authn's
+reasons only, and a denied record without one conforms.
+
+### Client provenance
+
+A `/call` write or dry run reads the request header `X-Krateo-Provenance`
+(#1333, `internal/support/audit/provenance.go`) and records what it asserts
+under `krateo.audit.client.*`, through the shared library's
+`Event.Client`. The header is the client's word: it names no identity, actor
+class, agent, verb, target, namespace, outcome, status or time snowplow
+records as its own, and a header that tries is rejected whole (`schema`). A
+rejected header never blocks or changes the write: the record carries
+`krateo.audit.client.rejected` and nothing else from it. No header, no client
+key. Reads, exports and RESTAction stage records never carry these keys (the
+library allows them on writes only). The header value is never logged, never
+put on a span and never forwarded to the apiserver. The format, limits and
+rejection rules are the frontend's contract:
+[`howto-frontend-call-provenance.md`](../howto-frontend-call-provenance.md).
+`TestCall1333_*` (`internal/handlers`) and `TestProvenance1333_*`,
+`FuzzDecodeProvenance` (`internal/support/audit`).
 
 **What a record never holds.** The trail is kept 365 days, so nothing that can
 carry a credential goes into it: no path or query of a request snowplow **sends**
@@ -169,10 +247,10 @@ set (below).
 
 | path | what changes | status |
 |---|---|---|
-| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298) |
-| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun` |
+| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298); the portal's `X-Krateo-Provenance` header adds `krateo.audit.client.*` (#1333) |
+| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true`; `krateo.audit.client.*` as on `/call` (#1333) |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
-| `GET /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export` |
+| `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (the `/call` lane it dials always names its object), `http.request.method` the export's own; the success path, and a render or send failure |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
 | a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, the #288 malformed-dial guard refuses the path, the resolve is not a customer request (#903, the row above), the stage it depends on did not succeed (#904: reported `Skipped` in `X-Snowplow-Stage-Outcomes`), or the pass was served stale content and its fresh re-run sends the write instead (#905: the withdrawn pass sends nothing, the re-run's dial is the one recorded) | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
@@ -180,6 +258,7 @@ set (below).
 | reads: `GET /call`, `POST /call/read`, `GET /list`, `GET /rbac`, `GET /api-info/names` | nothing | **out of scope** for AUDIT-4, which covers mutations. Note that the request log and trace id these were once delegated to do not cover them today (installer#410: the gateway access log has no outcome, resource or session id, and the trace is sampled) |
 | `GET/POST /refreshes` | nothing: the live-refresh SSE subscription | **out of scope** — cache machinery, no user action |
 | `POST /jq` | nothing: evaluates a jq program over the request body; no I/O | **out of scope** |
+| `POST /telemetry/v1/traces` | nothing on the platform: browser spans forwarded to the trace plane (#1015) | **out of scope** — no platform state changes |
 | `POST /convert` | not mounted (commented out in `main.go`) | **out of scope** — unreachable |
 | `POST /debug/shadow-parity` | toggles a dark parity measurement; cannot change an authorization verdict | **not audited** — open hygiene gap (an authenticated state change with no record) |
 | snowplow's own writes to the cluster | none: its ClusterRole grants `get/list/watch`, `create` on (Self)SubjectAccessReviews (non-persistent queries) and `impersonate` | **out of scope** — there are no controller writes to record |
@@ -194,12 +273,17 @@ other `POST`. Each record carries:
 
 - `krateo.restaction.namespace`, `krateo.restaction.name`,
   `krateo.restaction.stage`: the RESTAction and the stage that acted;
-- `server.address`: host and port only — never userinfo, a path or a query;
-- for a stage with no `endpointRef` (the caller's own clientconfig, i.e. the
-  apiserver): `k8s.resource.{group,version,resource,subresource,name}` and
-  `k8s.namespace.name`, the object's coordinates as a `/call` record holds them.
-  A named endpoint may be any HTTP API: its record names no Kubernetes resource
-  and nothing of its path;
+- exactly one target (schema v1). For a stage with no `endpointRef` (the
+  caller's own clientconfig, i.e. the apiserver) whose path names an object:
+  `krateo.audit.object_ref.{api_group,api_version,resource,subresource,name}`
+  (and `k8s.resource.*`) and `k8s.namespace.name`, the object's coordinates as
+  a `/call` record holds them, with the apiserver's verb for that path. Until
+  #1291 such a record also carried `server.address`, the host of the caller's
+  own clientconfig (the apiserver's): two targets, which the schema forbids, so
+  it is no longer written there. Any other stage (a named endpoint may be any
+  HTTP API) names `server.address`, host and port only — never userinfo, a path
+  or a query — no Kubernetes resource, nothing of its path, and the lowercase
+  method as its verb;
 - for the same stages, on success: `k8s.object.uid`, `k8s.object.generation`
   and `k8s.object.resource_version` of the object the apiserver answered with
   (see "Written object identity"). A stage to a named endpoint records none of
@@ -222,7 +306,7 @@ other `POST`. Each record carries:
   | a 3xx (snowplow follows no redirect on a credentialed dial, #729/#1106) | `failure` | the real code | `snowplow refused to follow a <code> <status text> redirect` |
   | any other status | `failure` | the real code | `upstream answered <code> <status text>` — never the upstream's body |
   | nothing (connection refused, reset, timeout) | `failure` | absent | `no response from the endpoint` |
-  | nothing: snowplow's destination policy refused the address (#1131) | `failure` | absent | `not sent: snowplow's destination policy refused the address` |
+  | nothing: snowplow's destination policy refused the address (#1131) | `denied` (since #1291: snowplow itself refused, the schema's denied; it was `failure`) | absent (a denied record never carries one) | `not sent: snowplow's destination policy refused the address` |
   | nothing: the request's page budget ran out (#1115) | `failure` | absent | `not sent: snowplow's time budget for the request ran out first` (before a connection), `snowplow stopped waiting: the request's time budget ran out before an answer`, or `…ran out after the write was sent; it may have been applied` |
 
   The same table, built from the same observation (`credhttp.Answer`, recorded
@@ -244,14 +328,16 @@ records, both name the object by its identity: snowplow records the uid,
 generation and resourceVersion the apiserver returned for the write, and the
 controller records the uid and the generation it acted on
 (oasgen-provider#253). Join `krateo_audit` on
-`(k8s.object.uid, k8s.object.generation)`, adding
-`k8s.object.resource_version` where both sides have it. Snowplow never
+`(krateo.audit.object_ref.uid, krateo.audit.object_ref.generation)` (a
+controller row carries them as `krateo.audit.cause_ref.*` since audit v0.5.0;
+during W1 the v0.3 twins `k8s.object.uid`, `k8s.object.generation` hold the same
+values), adding the resourceVersion where both sides have it. Snowplow never
 annotates or otherwise changes the user's object for this: an annotation would
 name "the last write through snowplow", not the cause of a reconcile, and would
 trigger server-side-apply, GitOps and webhook side effects.
 
 The rules, the same for `/call` and for a RESTAction stage
-(`audit.Event.RecordWrittenObject`):
+(`audit.RecordWrittenObject`); each key is written with its v0.3 twin:
 
 | the write | `k8s.object.uid` | `k8s.object.generation` | `k8s.object.resource_version` |
 |---|---|---|---|
@@ -326,7 +412,7 @@ written by `ServiceName='audit-filter-probe'`, carrying only `event.name`,
 ```sql
 SELECT LogAttributes['krateo.action'] AS action,
        LogAttributes['http.request.method'] AS method,
-       LogAttributes['outcome'] AS outcome,
+       LogAttributes['krateo.audit.outcome'] AS outcome,
        count() AS n
 FROM krateo_audit
 WHERE ScopeName = 'github.com/krateo-platformops/snowplow/audit'

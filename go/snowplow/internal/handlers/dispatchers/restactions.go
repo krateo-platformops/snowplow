@@ -809,7 +809,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
-	stampRefreshDigest(wri, func() string { return cache.ContentDigest(encoded) }) // #1324: the stored and written bytes
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, storableStageOutcomes(outcomes)) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

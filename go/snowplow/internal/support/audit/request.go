@@ -11,14 +11,15 @@
 //     (repeated entries are KEPT); then X-Real-Ip, when it is an IP not already
 //     in that list; then the address of the TCP peer, unless it equals the last
 //     entry so far.
-//   - user_agent.original: the User-Agent header, truncated as the apiserver
-//     truncates it (maybeTruncateUserAgent): beyond maxUserAgentLength bytes it
-//     is cut and userAgentTruncateSuffix is appended. The cut never splits a
-//     character (truncateUserAgent), so the value stays valid UTF-8.
+//   - user_agent.original: the User-Agent header as received. The shared
+//     emitter (github.com/krateo-platformops/audit, Event.UserAgent) truncates
+//     it as the apiserver truncates it (maybeTruncateUserAgent: beyond 1024
+//     bytes it is cut and "...TRUNCATED" is appended), never splitting a
+//     character.
 //
-// Every string on a record, these included, is made valid UTF-8 by Emit
-// (validUTF8, audit.go): a raw 0xFF in a header or the query would otherwise
-// make the OTLP exporter refuse the whole batch.
+// Every string on a record, these included, is made valid UTF-8 by the shared
+// emitter (audit.Sanitize): a raw 0xFF in a header or the query would
+// otherwise make the OTLP exporter refuse the whole batch.
 //   - krateo.request.uri: req.URL.RequestURI(), as the apiserver records it:
 //     the path and query snowplow received, never a scheme or host, even when
 //     the request target is in absolute form. The apiserver does not bound it,
@@ -57,23 +58,16 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"unicode/utf8"
 
+	krateoaudit "github.com/krateo-platformops/audit"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 )
 
-// The attribute keys of the request facts.
+// The attribute keys of the request facts: the shared schema's.
 const (
-	AttrSourceIPs  = "krateo.request.source_ips"
-	AttrUserAgent  = "user_agent.original"
-	AttrRequestURI = "krateo.request.uri"
-)
-
-// The apiserver's User-Agent bound and marker (k8s.io/apiserver
-// pkg/audit/request.go maxUserAgentLength, userAgentTruncateSuffix).
-const (
-	maxUserAgentLength      = 1024
-	userAgentTruncateSuffix = "...TRUNCATED"
+	AttrSourceIPs  = krateoaudit.KeySourceIPs
+	AttrUserAgent  = krateoaudit.KeyUserAgent
+	AttrRequestURI = krateoaudit.KeyRequestURI
 )
 
 // The header names utilnet.SourceIPs reads, in canonical form.
@@ -142,29 +136,9 @@ func (r *receivedRequest) facts() requestFacts {
 	for i, ip := range ips {
 		src[i] = ip.String()
 	}
-	f := requestFacts{sourceIPs: src, userAgent: truncateUserAgent(r.userAgent)}
+	f := requestFacts{sourceIPs: src, userAgent: r.userAgent}
 	if r.hasURL {
 		f.requestURI = r.url.RequestURI()
 	}
 	return f
-}
-
-// truncateUserAgent is the apiserver's maybeTruncateUserAgent, on characters:
-// a User-Agent longer than maxUserAgentLength bytes keeps at most that many
-// bytes and gets userAgentTruncateSuffix. The apiserver cuts at the byte index
-// and its JSON encoder then turns a split character into U+FFFD; this record
-// is exported over OTLP (protobuf), which refuses invalid UTF-8 outright, so
-// the cut steps back to the start of the character it would split. Invalid
-// bytes the client sent are replaced (validUTF8) before the cut, so the result
-// is valid UTF-8 within the bound either way.
-func truncateUserAgent(ua string) string {
-	ua = validUTF8(ua)
-	if len(ua) <= maxUserAgentLength {
-		return ua
-	}
-	cut := maxUserAgentLength
-	for cut > 0 && !utf8.RuneStart(ua[cut]) {
-		cut--
-	}
-	return ua[:cut] + userAgentTruncateSuffix
 }

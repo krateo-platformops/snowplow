@@ -17,12 +17,16 @@
 // Scope: User / Group / ServiceAccount subjects, ClusterRoleBindings,
 // RoleBindings to a Role or a ClusterRole, the "*" wildcards, the implicit
 // system:authenticated group as the apiserver's own group adder decides it
-// (requestGroups). Aggregated ClusterRoles and non-resource URLs
-// are out of scope (no #1046 arm uses them).
+// (requestGroups), and (#1362) non-resource requests: Attributes
+// with a Path are authorized as upstream RuleAllows authorizes a request whose
+// RequestInfo has IsResourceRequest=false, which means VerbMatches &&
+// NonResourceURLMatches, with ClusterRoleBindings only (the namespace is "").
+// Aggregated ClusterRoles are out of scope (no arm uses them).
 package k8sauthz
 
 import (
 	"net/http"
+	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -41,6 +45,11 @@ type Attributes struct {
 	Resource  string
 	Namespace string
 	Name      string
+	// Path, when non-empty, makes this a NON-RESOURCE request (#1362): the
+	// request path, as RequestInfo.Path carries it. Group, Resource, Namespace
+	// and Name are then ignored, as upstream ignores them, and Verb is the
+	// lowercase HTTP method.
+	Path string
 }
 
 // Authorizer holds a fixed set of RBAC objects.
@@ -124,7 +133,9 @@ func (a *Authorizer) Allowed(attr Attributes) bool {
 			return true
 		}
 	}
-	if attr.Namespace == "" {
+	// A non-resource request has no namespace, so upstream visits no
+	// RoleBinding for it.
+	if attr.Namespace == "" || attr.Path != "" {
 		return false
 	}
 	for _, b := range a.rbs {
@@ -177,6 +188,12 @@ func subjectsMatch(subjects []rbacv1.Subject, user string, groups []string, bind
 
 func rulesAllow(rules []rbacv1.PolicyRule, attr Attributes) bool {
 	for _, r := range rules {
+		if attr.Path != "" {
+			if has(r.Verbs, attr.Verb) && nonResourceURLMatches(r.NonResourceURLs, attr.Path) {
+				return true
+			}
+			continue
+		}
 		if has(r.Verbs, attr.Verb) && has(r.APIGroups, attr.Group) &&
 			has(r.Resources, attr.Resource) && nameMatches(r.ResourceNames, attr.Name) {
 			return true
@@ -204,6 +221,21 @@ func nameMatches(names []string, name string) bool {
 	}
 	for _, n := range names {
 		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// nonResourceURLMatches is upstream NonResourceURLMatches
+// (pkg/apis/rbac/v1/evaluation_helpers.go): "*", an exact entry, or an entry
+// ending in "*" whose TrimRight("*") is a prefix of the path.
+func nonResourceURLMatches(ruleURLs []string, path string) bool {
+	for _, u := range ruleURLs {
+		if u == rbacv1.NonResourceAll || u == path {
+			return true
+		}
+		if strings.HasSuffix(u, "*") && strings.HasPrefix(path, strings.TrimRight(u, "*")) {
 			return true
 		}
 	}

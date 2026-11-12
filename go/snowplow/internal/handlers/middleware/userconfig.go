@@ -107,7 +107,21 @@ import (
 // tokenRejected names it KeyNotPublished
 // (predispatch_401_keynotpublished_test.go). The rest of the diff is docs/
 // and helm/, which snowplow does not import.
-const PinnedPlumbingVersion = "v1.36.0"
+//
+// v1.36.0 → v1.52.0 (plumbing#138, the js/wasm dialguard; snowplow#1359):
+// re-audited by `diff -r` of the two module trees. server/ and jwtutil/ are
+// byte-identical, so this file's upstream line numbers stand. endpoints/
+// changes only the write path, Store (now StoreWritten, reporting the Secret
+// it wrote), which snowplow never calls; FromSecret and SecretName are
+// unchanged. http/request wraps its clients in dialguard.RoundTripper, the
+// identity on a server build.
+//
+// v1.52.0 → v1.54.0 (plumbing#141): re-audited by `diff -r` of the two module
+// trees. server/, jwtutil/, endpoints/ and http/request's non-test files are
+// byte-identical; the diff is dialguard/ (RoundTripper also sets fetch's
+// credentials mode "omit" on js/wasm, still the identity on a server build),
+// helm/, which snowplow does not import, and tests.
+const PinnedPlumbingVersion = "v1.54.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,

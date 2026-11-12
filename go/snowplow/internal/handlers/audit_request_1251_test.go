@@ -268,7 +268,7 @@ func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 	// would not refuse a record) but no user endpoint is.
 	req := httptest.NewRequest(http.MethodPatch, "/call/dry-run?"+cmQuery443, bytes.NewReader([]byte(cmRequest957)))
 	req = req.WithContext(xcontext.BuildContext(req.Context(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}})))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})))
 	w := httptest.NewRecorder()
 	audit.Middleware()(CallDryRun()).ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {

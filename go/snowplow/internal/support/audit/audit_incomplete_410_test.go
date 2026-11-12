@@ -1,29 +1,35 @@
 package audit
 
 // audit_incomplete_410_test.go — AUDIT-4 (krateo-platformops/installer#410)
-// criterion 5: "no record is emitted without an actor; prefer no record to a
-// recordless actor". The live trail on krateo-057 held one record carrying only
+// criterion 5, as the shared schema settles it (#1291, audit#7): a record is
+// never dropped. The live trail on krateo-057 held one record carrying only
 // event.name, outcome and session.id (no method, no resource, no actor). It was
-// not written by snowplow (ServiceName "audit-filter-probe"), but nothing in the
-// emitter would have refused it either.
+// not written by snowplow (ServiceName "audit-filter-probe"). Until #1291,
+// snowplow refused a record with no actor; the shared writer emits it instead,
+// marked, so the gap is in the trail and in the count, never hidden:
 //
-// The contract, enforced in Emitter.Emit:
-//   - no actor → no record, counted under "actor";
-//   - an actor but a missing action/method/target → the record IS emitted,
-//     marked krateo.audit.incomplete=<fields>, and each field is counted.
+//   - no actor → the record IS emitted, marked krateo.audit.incomplete=actor
+//     (and actor_class: no actor, no class), and counted under "actor";
+//   - an actor but a missing action/verb/method/target → emitted, marked with
+//     each missing marker, each counted.
+//
+// The count is krateo.audit.records.incomplete{marker}, on /debug/vars
+// (IncompleteCount) and OTLP (audit_1291_test.go, M arm).
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel/log/logtest"
 )
 
-// complete410 is an answerable record: actor (from ctx), action, method, target.
+// complete410 is an answerable record: actor (from ctx), action, verb, method,
+// target.
 func complete410() Event {
 	return Event{
-		Action: "restaction", Verb: "POST", Group: "composition.krateo.io", Version: "v1alpha1",
-		Resource: "fireworksapps", Name: "demo", Namespace: "team-a", Outcome: "success", Code: 200,
+		Action: "restaction", HTTPMethod: "POST", Verb: "create", Group: "composition.krateo.io", Version: "v1alpha1",
+		Resource: "fireworksapps", ObjectName: "demo", Namespace: "team-a", Outcome: "success", StatusCode: 200,
 	}
 }
 
@@ -43,26 +49,52 @@ func emit410(t *testing.T, ctx context.Context, ev Event) []map[string]string {
 	return out
 }
 
-// TestAudit410_RecordlessActorShape_IsNotEmitted is the 057 shape exactly: no
-// actor on ctx, only outcome and a session id. It must produce no record, and the
-// refusal must be counted under "actor".
-func TestAudit410_RecordlessActorShape_IsNotEmitted(t *testing.T) {
+// hasMarker reports whether a krateo.audit.incomplete value lists marker.
+func hasMarker(list, marker string) bool {
+	for _, m := range strings.Split(list, ",") {
+		if m == marker {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAudit410_RecordlessActorShape_IsEmittedMarked is the 057 shape exactly:
+// no actor on ctx, only outcome and a session id. It is emitted, marked with
+// every gap it has (the actor first), and counted under "actor".
+func TestAudit410_RecordlessActorShape_IsEmittedMarked(t *testing.T) {
 	before := IncompleteCount(IncompleteActor)
 	ctx := WithSessionID(context.Background(), "probe-1")
-	if got := emit410(t, ctx, Event{Outcome: "success"}); len(got) != 0 {
-		t.Fatalf("a record with only outcome + session.id was emitted (%v); it must not be", got)
+	got := emit410(t, ctx, Event{Outcome: "success"})
+	if len(got) != 1 {
+		t.Fatalf("the 057 shape emitted %d records, want 1 (emitted, marked; a record is never dropped)", len(got))
+	}
+	if m := got[0]["krateo.audit.incomplete"]; m != "actor,actor_class,action,verb,method,target" {
+		t.Fatalf("krateo.audit.incomplete = %q, want every gap of the shape in the schema's order", m)
+	}
+	if _, ok := got[0]["user.name"]; ok {
+		t.Fatalf("an actorless record carries user.name=%q", got[0]["user.name"])
 	}
 	if d := IncompleteCount(IncompleteActor) - before; d != 1 {
 		t.Fatalf("incomplete{actor} moved by %d, want 1", d)
 	}
 }
 
-// TestAudit410_NoActor_RefusesEvenAnOtherwiseCompleteRecord: the actor is the
-// one field whose absence refuses the record.
-func TestAudit410_NoActor_RefusesEvenAnOtherwiseCompleteRecord(t *testing.T) {
+// TestAudit410_NoActor_EmitsAnOtherwiseCompleteRecordMarkedActor: the actor's
+// absence is a gap like any other, not a reason to drop the record.
+func TestAudit410_NoActor_EmitsAnOtherwiseCompleteRecordMarkedActor(t *testing.T) {
 	before := IncompleteCount(IncompleteActor)
-	if got := emit410(t, context.Background(), complete410()); len(got) != 0 {
-		t.Fatalf("a complete record with no actor was emitted (%v); it must not be", got)
+	got := emit410(t, context.Background(), complete410())
+	if len(got) != 1 {
+		t.Fatalf("a complete record with no actor emitted %d records, want 1", len(got))
+	}
+	if m := got[0]["krateo.audit.incomplete"]; m != "actor,actor_class" {
+		t.Fatalf("krateo.audit.incomplete = %q, want actor,actor_class", m)
+	}
+	for _, k := range []string{"user.name", "enduser.id", "user.roles", "krateo.audit.actor_class"} {
+		if v, ok := got[0][k]; ok {
+			t.Errorf("an actorless record carries %s=%q", k, v)
+		}
 	}
 	if d := IncompleteCount(IncompleteActor) - before; d != 1 {
 		t.Fatalf("incomplete{actor} moved by %d, want 1", d)
@@ -70,8 +102,9 @@ func TestAudit410_NoActor_RefusesEvenAnOtherwiseCompleteRecord(t *testing.T) {
 }
 
 // TestAudit410_MissingNonActorField_EmitsMarkedIncomplete removes action,
-// method or target from a record that has an actor. Each is emitted, marked
-// with the missing field(s), and counted; the complete control carries no mark.
+// verb, method or target from a record that has an actor. Each is emitted,
+// marked with the missing marker(s), and counted; the complete control carries
+// no mark.
 func TestAudit410_MissingNonActorField_EmitsMarkedIncomplete(t *testing.T) {
 	control := emit410(t, actorCtx(), complete410())
 	if len(control) != 1 {
@@ -88,9 +121,14 @@ func TestAudit410_MissingNonActorField_EmitsMarkedIncomplete(t *testing.T) {
 		counts []string
 	}{
 		{"action", func(e *Event) { e.Action = "" }, "action", []string{IncompleteAction}},
-		{"method", func(e *Event) { e.Verb = "" }, "method", []string{IncompleteMethod}},
-		{"target", func(e *Event) { e.Resource = "" }, "target", []string{IncompleteTarget}},
-		{"method+target", func(e *Event) { e.Verb, e.Resource = "", "" }, "method,target", []string{IncompleteMethod, IncompleteTarget}},
+		{"verb", func(e *Event) { e.Verb = "" }, "verb", []string{IncompleteVerb}},
+		{"method", func(e *Event) { e.HTTPMethod = "" }, "method", []string{IncompleteMethod}},
+		// No Kubernetes object left: no target, and no preview flag to read.
+		{"target", func(e *Event) { e.Group, e.Version, e.Resource, e.ObjectName, e.Namespace = "", "", "", "", "" }, "target", []string{IncompleteTarget}},
+		{"method+target", func(e *Event) {
+			e.HTTPMethod = ""
+			e.Group, e.Version, e.Resource, e.ObjectName, e.Namespace = "", "", "", "", ""
+		}, "method,target", []string{IncompleteMethod, IncompleteTarget}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -129,9 +167,9 @@ func TestAudit410_MissingNonActorField_EmitsMarkedIncomplete(t *testing.T) {
 // target, and the record carries the stage's RESTAction attributes and no path.
 func TestAudit410_ServerAddressIsATarget(t *testing.T) {
 	got := emit410(t, actorCtx(), Event{
-		Action: "restaction", Verb: "POST", ServerAddress: "render.example:8080",
-		RESTActionNamespace: "krateo-system", RESTActionName: "blueprint-render", Stage: "render",
-		Outcome: "success", Code: 201,
+		Action: "restaction", HTTPMethod: "POST", Verb: "post", ServerAddress: "render.example:8080",
+		RESTActionNamespace: "krateo-system", RESTActionName: "blueprint-render", RESTActionStage: "render",
+		Outcome: "success", StatusCode: 201,
 	})
 	if len(got) != 1 {
 		t.Fatalf("want 1 record, got %d", len(got))
@@ -144,6 +182,7 @@ func TestAudit410_ServerAddressIsATarget(t *testing.T) {
 		"enduser.id":                  "alice",
 		"user.name":                   "alice",
 		"http.request.method":         "POST",
+		"krateo.audit.verb":           "post",
 		"http.response.status_code":   "201",
 	}
 	for k, v := range want {
@@ -151,7 +190,7 @@ func TestAudit410_ServerAddressIsATarget(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, got[0][k], v)
 		}
 	}
-	for _, k := range []string{"k8s.resource.resource", "url.path", "krateo.audit.incomplete"} {
+	for _, k := range []string{"k8s.resource.resource", "url.path", "krateo.audit.incomplete", "krateo.audit.preview"} {
 		if v, ok := got[0][k]; ok {
 			t.Errorf("%s must be absent, got %q", k, v)
 		}

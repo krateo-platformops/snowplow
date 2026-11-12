@@ -17,7 +17,7 @@ is advertised as `call.read.inline`.
 
 ```
 GET /capabilities            (no auth)
-200 {"capabilities":["call.dryRun","call.fieldValidation","call.raw","call.read.inline"]}
+200 {"capabilities":["call.dryRun","call.fieldValidation","call.provenance","call.raw","call.read.inline"]}
 ```
 
 - The list is static and sorted.
@@ -30,6 +30,7 @@ GET /capabilities            (no auth)
 |---|---|
 | `call.dryRun` | `POST\|PUT\|PATCH /call/dry-run` sends the apiserver `dryRun=All` and echoes `X-Snowplow-Dry-Run: All`. |
 | `call.fieldValidation` | `fieldValidation=Ignore\|Strict` is forwarded on write verbs of `/call` and `/call/dry-run`, and echoed in `X-Snowplow-Field-Validation`. |
+| `call.provenance` | `POST\|PUT\|PATCH\|DELETE /call` and `POST\|PUT\|PATCH /call/dry-run` read the `X-Krateo-Provenance` header into the write's audit record (#1333): [howto-frontend-call-provenance.md](howto-frontend-call-provenance.md). |
 | `call.raw` | `raw=true` on `GET /call` and `POST /call/read` returns the stored object for restactions and the widgets group, read as the caller, and echoes `X-Snowplow-Raw: true`. |
 | `call.read.inline` | `POST /call/read` on a RESTAction with body `{"extras":{…},"object":{<RESTAction>}}` resolves the body instead of the stored CR, as the caller, persisting nothing, and echoes `X-Snowplow-Dry-Run: All` and `X-Snowplow-Resolve-Source: request-body`. |
 
@@ -131,7 +132,9 @@ Content-Type: application/json
   stage succeeded. Use it when the draft's own `filter` drops the error keys
   from the body.
   - `reason` is a code from a closed set: `StageNotExecuted`, `Forbidden`,
-    `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
+    `NotFound` (a 404), `NotFoundForRequester` (#1319: a watched named
+    object that does not exist for this requester, the definite per-user
+    answer of #1080), `Unauthorized`, `NotRun` (the resolve stopped before this
     stage), `Skipped` (#904: a write stage not sent because the stage it depends
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
@@ -238,8 +241,13 @@ Content-Type: application/json
     edited).
   - Changed in #904: a succeeded stage is no longer listed (it was
     `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
-    rows is unaffected. In a dry run a write stage depending on another write
-    stage still reports `StageNotExecuted`, never `Skipped`.
+    rows is unaffected. In a dry run, a write stage that depends on another
+    write stage reports `StageNotExecuted`, not `Skipped`, when the stage it
+    depends on only reports `StageNotExecuted`. If the stage it depends on
+    has an item that failed on its own (`InvalidPath`, `TemplateError`),
+    that stage reports the failure (a failure outranks `StageNotExecuted`,
+    #1347). Its dependent writes then report `Skipped`, exactly as in the
+    real run.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
   error). An endpointRef naming a per-user credential Secret

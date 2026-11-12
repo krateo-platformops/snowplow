@@ -148,7 +148,7 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdic
 	if Inert(ctx) {
 		return false
 	}
-	return c.putRAFullListIfGen(ctx, v, key, inputs, full, capturedGen, false).Stored()
+	return c.putRAFullListIfGen(ctx, v, key, inputs, full, "", capturedGen, false).Stored()
 }
 
 // PutRAFullListIfGenOutcome is PutRAFullListIfGen reporting the write's
@@ -158,18 +158,22 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdic
 // serve path's write, which can replace a resident cell, hands its outcome to
 // the publish gate (PublishPutIfSubscribed) like every write of an armable
 // cell (put_outcome.go, WRITE SITES).
-func (c *ResolvedCacheStore) PutRAFullListIfGenOutcome(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) PutOutcome {
+//
+// stageOutcomes (#1319) is the stored X-Snowplow-Stage-Outcomes value of the
+// unpaginated resolve that produced full ("" = every stage succeeded): a hit
+// of the cell hands it to the widget it is sliced for.
+func (c *ResolvedCacheStore) PutRAFullListIfGenOutcome(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, stageOutcomes string, capturedGen uint64) PutOutcome {
 	// #443 (a) — as PutRAFullListIfGen.
 	if Inert(ctx) {
 		return PutRefused
 	}
-	return c.putRAFullListIfGen(ctx, v, key, inputs, full, capturedGen, true)
+	return c.putRAFullListIfGen(ctx, v, key, inputs, full, stageOutcomes, capturedGen, true)
 }
 
 // putRAFullListIfGen is the write PutRAFullListIfGen and
 // PutRAFullListIfGenOutcome share (each checks cache.Inert first, #443 (a));
 // outcome as for putIfGenWrite.
-func (c *ResolvedCacheStore) putRAFullListIfGen(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64, outcome bool) PutOutcome {
+func (c *ResolvedCacheStore) putRAFullListIfGen(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, stageOutcomes string, capturedGen uint64, outcome bool) PutOutcome {
 	if c == nil || !v.Store() {
 		return PutRefused
 	}
@@ -195,10 +199,11 @@ func (c *ResolvedCacheStore) putRAFullListIfGen(ctx context.Context, v PutVerdic
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — twin of PutRAFullList above.
 	put := c.putIfGenWrite(ctx, key, &ResolvedEntry{
-		RawJSON:     encoded,
-		Inputs:      &in,
-		Pinned:      pin,
-		TTLOverride: UAFTTLOverrideForEntry(&in),
+		RawJSON:       encoded,
+		Inputs:        &in,
+		Pinned:        pin,
+		TTLOverride:   UAFTTLOverrideForEntry(&in),
+		StageOutcomes: stageOutcomes, // #1319
 	}, capturedGen, outcome)
 	// #592 acceptance signal — gated on `stored`, NOT on reaching the Put: a
 	// generation-REFUSED write (a DELETE-eviction bumped the gen during the

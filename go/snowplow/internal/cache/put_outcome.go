@@ -94,19 +94,18 @@
 // verdicts (#423, #435), so a publish that leaves the class alone cannot move
 // the view. Pinned end to end by TestRefreshes1328_G1 (internal/handlers).
 //
-// "IDENTICAL" IS THE BODY (#1321 M2). The compare and the #1324 digest cover
-// the response body only, not the X-Snowplow-Stage-Outcomes a restactions
-// /call also answers with (entry.StageOutcomes, #904). That is decided by
-// what an armed client consumes: the only /refreshes subscriber is the SPA,
-// which reads the body and the X-Snowplow-Refresh-Key/-Class headers and
-// never the stage outcomes (frontend main 89ea41ee, ui/src). The one client
-// that reads the stage outcomes, builder-gate, reads them from the inline
-// resolve (POST /call/read), which stores no cell and stamps no refresh key,
-// so it is never armed. A Put whose body is unchanged but whose stage outcomes
-// moved therefore changes nothing an armed client renders, and announcing it
-// would only cost a refetch of the same body. If a /refreshes client ever
-// renders the stage outcomes, they must join both the compare and the digest
-// (TestIssue1321_M2_StageOutcomesAreNotPartOfIdentical pins today's rule).
+// "IDENTICAL" IS THE ANSWER (#1321 M2, #1319). The compare and the #1324
+// digest cover what an armed client renders. Until #1319 that was the body
+// only. Since #1319 the SPA renders a widget's X-Snowplow-Stage-Outcomes (an
+// exception-only notice that must clear when a refetch comes back complete),
+// so the stored stage outcomes (entry.StageOutcomes) joined both, as this
+// paragraph required: a Put whose body is unchanged but whose stage outcomes
+// moved is PutChanged and publishes a frame, and its digest moves (SameAnswer,
+// AnswerDigest in content_digest.go). The rule is the same for every class: a
+// RESTAction cell's stored outcomes are non-empty only for a denial-only cell
+// (#681), so a RESTAction tab sees an extra frame only when a denial appears
+// or clears under the same key. TestIssue1321_M2_StageOutcomesArePartOfIdentical
+// pins the rule.
 //
 // MEASUREMENT. snowplow_refresh_broadcaster.withheld_identical counts the
 // identical Puts whose frame was withheld, so frames (published) and
@@ -186,6 +185,8 @@ func writeOutcome(outcome bool, replaced, samePrior, entry *ResolvedEntry) PutOu
 	switch {
 	case !outcome, replaced == nil:
 		return PutChanged
+	case replaced.StageOutcomes != entry.StageOutcomes:
+		return PutChanged // #1319: the same body with other stage outcomes is another answer
 	case samePrior != nil:
 		return PutIdentical
 	case replaced.RawLen() != entry.RawLen():

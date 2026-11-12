@@ -1,5 +1,6 @@
 // debug_routes.go — O-D3 (1.12.3): the whole /debug/* surface behind the same
-// JWT gate /debug/refreshes already uses.
+// JWT gate /debug/refreshes already uses; #1362: and behind an RBAC
+// authorization of the caller for the route's path.
 //
 // WHY THIS FILE EXISTS
 //
@@ -26,8 +27,40 @@
 // validation `/debug/refreshes` has used since #69, chosen deliberately over
 // `middleware.UserConfig` because it performs ZERO apiserver reads (no
 // `<user>-clientconfig` Secret GET), so a diagnostic pull never perturbs the
-// cache-respecting invariant it is being used to diagnose. Any valid Krateo JWT
-// passes; missing/expired/invalid → 401, unfetchable JWKS → 503.
+// cache-respecting invariant it is being used to diagnose. Missing, expired or
+// invalid → 401; unfetchable JWKS → 503.
+//
+// #1362: AUTHENTICATION IS NOT ENOUGH. A valid JWT alone no longer passes.
+// Several routes report metadata about EVERY identity's cache entries and about
+// objects the caller's own RBAC may forbid. /debug/apistage, for example, lists
+// each resident entry's coordinates and item count, whoever created it. So
+// every route is ALSO wrapped in middleware.DebugAuthz, which authorizes the
+// request through Kubernetes RBAC as a non-resource request: verb = lowercase
+// HTTP method, path = req.URL.Path, for the JWT's username and groups. The
+// decision is rbac.EvaluateRBAC, the one authorizer snowplow has: in-process
+// with cache on, so still zero apiserver reads, and a SelfSubjectAccessReview
+// with cache off. Denied → 403. Undecidable → 503 with a named reason, never
+// 200. The grant is an ordinary ClusterRole rule, `nonResourceURLs:
+// ["/debug/*"]` with verbs get and post. The chart ships it as
+// `<fullname>-debug-<namespace>` (helm/snowplow/templates/
+// clusterrole-debug.yaml) and binds it to no one. Any identity bound to
+// cluster-admin already holds it (`nonResourceURLs: ["*"]`). The guard is
+// mechanical, at three levels:
+//   - every route below goes through one `mount`, which wraps it in the
+//     `gated` chain;
+//   - at runtime, routeTable refuses (panics at boot) a /debug pattern
+//     mounted any other way;
+//   - in the tests, TestIssue1362_EveryRoute_DeniesWithoutTheGrantAdmitsWithIt
+//     (B1) drives every registered route without and with the grant, and
+//     TestIssue1362_NoDebugRouteMountedOutsideTheGate (B5) checks the lanes
+//     structurally, by type.
+//
+// KNOWN LIMITATION (#1362). With CACHE_ENABLED=false the authorizer is the
+// requester's own SelfSubjectAccessReview, which needs the requester's
+// clientconfig endpoint. RefreshAuth deliberately does not read that Secret, so
+// with the cache off every /debug route answers 503 `review_unavailable`. With
+// the cache on, the same 503 (`rbac_snapshot_not_built`) covers the boot window
+// before the RBAC snapshot is published, pprof included (#1368, see #174).
 //
 // NOT GATED (deliberate): `/health` and `/readyz` stay anonymous — they are the
 // kubelet probe targets (howto/operating.md, "the chart ⇄ binary probe
@@ -53,8 +86,11 @@ package main
 
 import (
 	"expvar"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
+	"strings"
 
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
@@ -85,16 +121,79 @@ var debugRoutePatterns = []string{
 	"GET /debug/deps",
 }
 
-// debugMux is the minimal registration surface registerDebugRoutes needs.
-// *http.ServeMux satisfies it; the falsifier passes a recording wrapper so it
-// can assert the EXACT set of patterns production registers (drift between
-// registerDebugRoutes and debugRoutePatterns fails the test).
+// debugMux is the registration surface registerDebugRoutes needs: the ONE
+// lane onto /debug (routeTable.handleDebug). The method is unexported, so only
+// a package-main type can offer it. The falsifier passes a recording wrapper,
+// so it can assert the EXACT set of patterns production registers: drift
+// between registerDebugRoutes and debugRoutePatterns fails the test.
 type debugMux interface {
+	handleDebug(pattern string, handler http.Handler)
+}
+
+// routeRegistrar is what a non-debug route registrar (mountCallWriteRoutes,
+// mountExportRoutes, mountTelemetryRoute) needs. *http.ServeMux satisfies it
+// for tests; main passes its routeTable, which refuses a /debug pattern.
+type routeRegistrar interface {
 	Handle(pattern string, handler http.Handler)
 }
 
+// routeTable is the ONLY registrar of snowplow's server mux (#1362 review). It
+// keeps /debug behind the RBAC gate at RUNTIME, whatever form a pattern takes:
+// a literal, a constant, a computed string, or a table entry.
+//
+//   - Handle mounts every non-debug route. A pattern under /debug PANICS, at
+//     boot, naming the route. A /debug route cannot reach the mux by the
+//     general lane, so a new one mounted without the gate fails the first time
+//     the binary starts (and in every test that builds the route).
+//   - handleDebug is the /debug lane. Its only caller is registerDebugRoutes'
+//     mount, which wraps every handler in the gated chain. It refuses a
+//     non-debug pattern, so the two lanes stay disjoint.
+//
+// TestIssue1362_NoDebugRouteMountedOutsideTheGate checks the rest
+// structurally, by TYPE rather than by pattern text. No code in package main
+// calls Handle/HandleFunc on an *http.ServeMux except routeTable itself. The
+// only handleDebug call is mount's, and mount's handler is gated.Then(...).
+type routeTable struct {
+	mux *http.ServeMux
+}
+
+func newRouteTable(mux *http.ServeMux) *routeTable { return &routeTable{mux: mux} }
+
+// Handle mounts a non-debug route; a /debug pattern panics (see routeTable).
+func (t *routeTable) Handle(pattern string, handler http.Handler) {
+	if isDebugPattern(pattern) {
+		panic(fmt.Sprintf("route %q is under /debug: it must be mounted by registerDebugRoutes, "+
+			"behind the RefreshAuth + DebugAuthz gate (#1362)", pattern))
+	}
+	t.mux.Handle(pattern, handler)
+}
+
+// handleDebug is the /debug lane (see routeTable).
+func (t *routeTable) handleDebug(pattern string, handler http.Handler) {
+	if !isDebugPattern(pattern) {
+		panic(fmt.Sprintf("route %q is not under /debug: mount it with Handle", pattern))
+	}
+	t.mux.Handle(pattern, handler)
+}
+
+// isDebugPattern reports whether a ServeMux pattern ("[METHOD ][HOST]/PATH")
+// serves a path that is /debug or below it. The path is unescaped first: the
+// mux unescapes pattern segments, so "/%64ebug/x" routes /debug/x and must
+// count. An unescapable path counts as debug, so the check fails closed.
+func isDebugPattern(pattern string) bool {
+	i := strings.IndexByte(pattern, '/')
+	if i < 0 {
+		return false
+	}
+	path, err := url.PathUnescape(pattern[i:])
+	if err != nil {
+		return true
+	}
+	return path == "/debug" || strings.HasPrefix(path, "/debug/")
+}
+
 // registerDebugRoutes mounts the whole /debug/* surface on mux, each route
-// wrapped in chain + middleware.RefreshAuth(jwtKeys).
+// wrapped in chain + middleware.RefreshAuth(jwtKeys) + middleware.DebugAuthz().
 //
 // Behaviour past the gate is byte-identical to the pre-1.12.3 handlers: the
 // same pprof.Index/Cmdline/Profile/Symbol/Trace funcs, the same
@@ -106,17 +205,25 @@ type debugMux interface {
 // rbac.RegisterAuthzMemoExpvar, …) BEFORE calling this — the mount accepts
 // scrapes as soon as the server starts.
 func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySource) {
-	gated := chain.Append(middleware.RefreshAuth(jwtKeys))
+	// #1362: authenticate (RefreshAuth), THEN authorize (DebugAuthz) every
+	// route. Both are in this one chain, so no route can take one without the
+	// other.
+	gated := chain.Append(middleware.RefreshAuth(jwtKeys), middleware.DebugAuthz())
+	// mount is the only call of handleDebug: every route below goes through
+	// it, so every route takes the gated chain.
+	mount := func(pattern string, handler http.Handler) {
+		mux.handleDebug(pattern, gated.Then(handler))
+	}
 
 	// /debug/pprof/* — registered on the custom mux (server does NOT use
 	// http.DefaultServeMux). Exposes goroutine, heap, profile, allocs, mutex,
 	// block, cmdline, symbol, threadcreate, trace. pprof's handlers are plain
 	// http.HandlerFunc values, so they wrap exactly like any other handler.
-	mux.Handle("GET /debug/pprof/", gated.Then(http.HandlerFunc(pprof.Index)))
-	mux.Handle("GET /debug/pprof/cmdline", gated.Then(http.HandlerFunc(pprof.Cmdline)))
-	mux.Handle("GET /debug/pprof/profile", gated.Then(http.HandlerFunc(pprof.Profile)))
-	mux.Handle("GET /debug/pprof/symbol", gated.Then(http.HandlerFunc(pprof.Symbol)))
-	mux.Handle("GET /debug/pprof/trace", gated.Then(http.HandlerFunc(pprof.Trace)))
+	mount("GET /debug/pprof/", http.HandlerFunc(pprof.Index))
+	mount("GET /debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	mount("GET /debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	mount("GET /debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	mount("GET /debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 
 	// Ship D.1 (0.30.142) — expvar.Handler() carries Ship D's counters
 	// (snowplow_apiserver_fallthrough_total / _cells,
@@ -124,7 +231,7 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// (cache.RegisterRBACSnapshotExpvar) and the Ship L2 snapshot authz-memo
 	// counters (rbac.RegisterAuthzMemoExpvar). All of those are registered by
 	// main() BEFORE this mount.
-	mux.Handle("GET /debug/vars", gated.Then(expvar.Handler()))
+	mount("GET /debug/vars", expvar.Handler())
 
 	// Fix #1 / stale-delete diagnostic — read-only per-GVR servability
 	// snapshot {HasSynced, watchBroken, confirmed, servable}
@@ -132,7 +239,7 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// Mutates no state; available in both cache-on and cache-off so the
 	// stale-delete latch (registered-but-unconfirmed / watch-broken GVR) is
 	// diagnosable without a kubectl exec.
-	mux.Handle("GET /debug/servable", gated.Then(handlers.DebugServable()))
+	mount("GET /debug/servable", handlers.DebugServable())
 
 	// R1 diagnostic — read-only METADATA-ONLY snapshot of resolved-output
 	// cache entries (class/path/gvr/age/ttl/items_count), for diagnosing a
@@ -141,7 +248,7 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// bodies (per-identity RBAC-sensitive) — the structural leak guard is
 	// cache.ResolvedEntryMeta's type shape
 	// (docs/design-r1-allcompositionresources-invalidation-2026-06-26.md §6).
-	mux.Handle("GET /debug/apistage", gated.Then(handlers.DebugApistage()))
+	mount("GET /debug/apistage", handlers.DebugApistage())
 
 	// #61 diagnostic — read-only AGGREGATE-ONLY refresh-broadcaster counters
 	// (published/delivered/dropped/coalesced + subscriber count), the
@@ -154,7 +261,7 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// #69 gated this route first; 1.12.3 (O-D3) extends the SAME gate to its
 	// four unauthenticated siblings above, so this line is now the general
 	// case rather than the exception.
-	mux.Handle("GET /debug/refreshes", gated.Then(handlers.DebugRefreshes()))
+	mount("GET /debug/refreshes", handlers.DebugRefreshes())
 
 	// 1.12.6 C3 — opt-in FULL reconcile audit: walks every resident L1
 	// entry, probes each self coordinate against the informer indexer and
@@ -165,14 +272,14 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// the same gate as its siblings because it is a reconcile, not a dry
 	// run, and because the full walk holds the store mutex for its duration
 	// (docs/architecture/observability.md).
-	mux.Handle("GET /debug/reconcile", gated.Then(handlers.DebugReconcile()))
+	mount("GET /debug/reconcile", handlers.DebugReconcile())
 
 	// 1.12.7 observability — the Phase-1 harvester diagnostic. Same JWT gate,
 	// same metadata-only contract as /debug/apistage: counts and booleans, no
 	// harvested object ever leaves the pod. This is what lets the acceptance
 	// step prove a confirmed-gone coordinate was actually FORGOTTEN, which
 	// until now was observable only in tests.
-	mux.Handle("GET /debug/harvest", gated.Then(handlers.DebugHarvest()))
+	mount("GET /debug/harvest", handlers.DebugHarvest())
 
 	// #237 — the per-object informer-store read. The incident it exists for
 	// could not be diagnosed because every surface above is DOWNSTREAM of the
@@ -183,21 +290,22 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	//
 	// Same gate, same metadata-and-hashes-only contract as its siblings, and
 	// it reads NOTHING from the apiserver: a comparison served as the snowplow
-	// ServiceAccount would tell any valid-JWT holder the existence and
-	// resourceVersion of objects their own RBAC forbids. The operator runs
+	// ServiceAccount would tell any holder of the /debug grant the existence
+	// and resourceVersion of objects their own RBAC forbids. The operator runs
 	// that half with kubectl, under their own identity.
-	mux.Handle("GET /debug/store", gated.Then(handlers.DebugStore()))
+	mount("GET /debug/store", handlers.DebugStore())
 
 	// #272 (1.12.17) — the runtime flip surface for the v7 Step-2 shadow-parity
 	// toggle. GET reports the process-local, default-off toggle; POST
 	// ?enabled=true|false flips it and reports the committed live state (absent
-	// or unparseable → 400). Same authn-only gate as every sibling: any valid
-	// Krateo JWT can flip it, an accepted zero-blast-radius control because the
+	// or unparseable → 400). Same gate as every sibling; since #1362 the POST
+	// needs the `post` verb on its path (any authenticated caller could flip
+	// it before). It is a zero-blast-radius control because the
 	// shadow-parity hook is read-only and changes no verdict/byte/key — it only
 	// turns the dark parity MEASUREMENT on or off. The toggle is per-pod, so a
 	// measurement that uses it must pin to one pod (see the handler doc).
-	mux.Handle("GET /debug/shadow-parity", gated.Then(handlers.DebugShadowParityGet()))
-	mux.Handle("POST /debug/shadow-parity", gated.Then(handlers.DebugShadowParitySet()))
+	mount("GET /debug/shadow-parity", handlers.DebugShadowParityGet())
+	mount("POST /debug/shadow-parity", handlers.DebugShadowParitySet())
 
 	// #277 (edge-3) — the read-only dep-graph diagnostic. Same JWT gate, same
 	// METADATA-ONLY contract as /debug/apistage: it returns dependency edges as
@@ -207,5 +315,5 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// (the C3 residual detector). The ?filter scans are lock-free (reverse-index
 	// Range) and capped, so a diagnostic pull never holds a store/serve mutex
 	// for a scan-length span.
-	mux.Handle("GET /debug/deps", gated.Then(handlers.DebugDeps()))
+	mount("GET /debug/deps", handlers.DebugDeps())
 }

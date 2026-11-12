@@ -16,20 +16,23 @@
 // that only evaluates (an access review, a render) is recorded like any other
 // POST.
 //
-// A successful write to the apiserver (no endpointRef) also records the written
-// object's uid, generation and resourceVersion, read from the apiserver's
-// answer (#957, audit.Event.RecordWrittenObject): three object identifiers,
-// never the body itself. A write to a named endpoint records none of them. A
-// stage whose apiserver path asks for a dry run (?dryRun=All) is recorded as
-// krateo.action=restaction.dryRun and names no written object: nothing was
-// persisted.
+// A record names exactly one target (schema v1, #1291): the Kubernetes object
+// a stage with no endpointRef wrote (with the apiserver's verb for its path),
+// or else the host the write was sent to (server.address, with the lowercase
+// method as its verb). A successful write to the apiserver also records the
+// written object's uid, generation and resourceVersion, read from the
+// apiserver's answer (#957, audit.RecordWrittenObject): three object
+// identifiers, never the body itself. A write to a named endpoint records none
+// of them. A stage whose apiserver path asks for a dry run (?dryRun=All) is
+// recorded as krateo.action=restaction.dryRun, krateo.audit.dry_run=true, and
+// names no written object: nothing was persisted.
 //
 // WHAT A RECORD NEVER HOLDS. This trail is kept for 365 days, so nothing that
 // can carry a credential goes into it:
 //   - the request PATH: a webhook path (Slack /services/T/B/<secret>, Discord
 //     /api/webhooks/<id>/<token>, Telegram /bot<token>/…) or one built by jq from
 //     an earlier stage's token is a secret in its own right. The RESTAction, its
-//     stage and server.address identify the action and the authority.
+//     stage and its target identify the action and the authority.
 //   - the upstream's response BODY: an error body can echo a token. The outcome
 //     is the real status code plus a short reason class from a closed set
 //     (audit.FailureMessage, shared with the /call record), never upstream
@@ -97,8 +100,8 @@ func isSafeMethod(verb string) bool {
 // the 2xx response body the dial returned (nil when there is none): a write to
 // the apiserver records the identity of the object it names (#957).
 func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *credhttp.Answer, body []byte) (audit.Event, bool) {
-	verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
-	if isSafeMethod(verb) {
+	method := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
+	if isSafeMethod(method) {
 		return audit.Event{}, false
 	}
 	if cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe {
@@ -107,41 +110,55 @@ func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *t
 
 	ev := audit.Event{
 		Action:              stageAuditAction,
-		Verb:                verb,
+		HTTPMethod:          method,
 		RESTActionNamespace: raNamespace,
 		RESTActionName:      raName,
-		Stage:               apiCall.Name,
-	}
-	if call.Endpoint != nil {
-		if u, err := url.Parse(call.Endpoint.ServerURL); err == nil {
-			ev.ServerAddress = u.Host // never userinfo, a path or a query
-		}
+		RESTActionStage:     apiCall.Name,
 	}
 	// A stage with no endpointRef dials the caller's own clientconfig, which is
 	// the Kubernetes apiserver: its path names the object acted on, and the
-	// object's coordinates are recorded as /call records them. A named endpoint
-	// may be any HTTP API: nothing of its path is recorded.
+	// object's coordinates are recorded as /call records them, with the verb
+	// the apiserver derives for that path. A named endpoint may be any HTTP
+	// API: nothing of its path is recorded, and the record names the host it
+	// went to and the lowercase method.
 	apiServerObject := false
 	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
-		path, query, _ := splitPathQuery(call.Path) // as the apiserver receives it (#1073 F1)
+		path, query, hasQuery := splitPathQuery(call.Path) // as the apiserver receives it (#1073 F1)
 		// #957 — a stage may ask the apiserver for a dry run in its path
 		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
 		// persisted: the record says so and names no written object.
 		ev.DryRun = apiServerDryRun(query)
 		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
 			ev.Group, ev.Version, ev.Resource = gvr.Group, gvr.Version, gvr.Resource
-			ev.Namespace, ev.Name = ns, name
+			ev.Namespace, ev.ObjectName = ns, name
 			ev.Subresource = apiServerSubresource(path)
+			dialled := path
+			if hasQuery {
+				dialled += "?" + query
+			}
+			ev.Verb = audit.KubernetesVerb(method, dialled)
 			apiServerObject = true
 		}
 	}
+	// #1291 — a record names exactly one target (schema v1): the Kubernetes
+	// object above, or else the host the write was sent to. The host of the
+	// caller's own clientconfig is the apiserver's, which the object already
+	// names.
+	if !apiServerObject {
+		if call.Endpoint != nil {
+			if u, err := url.Parse(call.Endpoint.ServerURL); err == nil {
+				ev.ServerAddress = u.Host // never userinfo, a path or a query
+			}
+		}
+		ev.Verb = audit.MethodVerb(method)
+	}
 
-	ev.Outcome, ev.Code, ev.Message = a.Outcome()
+	ev.Outcome, ev.StatusCode, ev.Message = a.Outcome()
 	// #957 — the written object's identity accompanies its coordinates: only a
 	// record that names a Kubernetes object can say which object it was. It is
 	// read from the response, never from the stage's request payload.
 	if apiServerObject {
-		ev.RecordWrittenObject(body)
+		audit.RecordWrittenObject(&ev, body)
 	}
 	return ev, true
 }

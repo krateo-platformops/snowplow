@@ -1,5 +1,19 @@
-// Package audit emits the canonical Krateo AuditEvent as an OTLP LogRecord
-// on the shared OTel Collector -> ClickHouse otel_logs plane (D19a).
+// Package audit is snowplow's side of the canonical Krateo AuditEvent: what
+// snowplow knows about the request a record is made on, handed to the shared
+// writer, github.com/krateo-platformops/audit (schema v1, #1291). The shared
+// writer builds the OTLP LogRecord, marks and counts its gaps, sanitises every
+// string and writes the v0.3 keys beside their replacements; this package
+// supplies, for every emit site alike, what only snowplow knows:
+//
+//   - the actor, from the validated JWT on the request context: user.name is
+//     the token's actor (its outermost act subject on a delegated token), the
+//     actor class is its signed `principal` claim through audit.ParseClaim,
+//     omitted (and so marked) when the claim is absent or unknown, never
+//     defaulted; a delegated token adds on_behalf_of and the act chain;
+//   - what the request was received with (request.go) and its session id;
+//   - the preview flag of a Kubernetes target, read from apiserver state
+//     (preview.go);
+//   - the dry-run suffix of krateo.action, snowplow's own literal.
 //
 // It is TRACE-CORRELATED: when a valid span is on ctx (snowplow wraps every
 // HTTP request in an otelhttp server span) the Logs SDK stamps
@@ -20,6 +34,11 @@
 // xcontext.TraceId) and the OTel W3C `traceparent` are UNTOUCHED. This
 // package no longer defines or forwards any bespoke correlation header; the
 // session id lives only in baggage.
+//
+// IDENTITY. A record carries identity on purpose (the actor, the request URI,
+// the source IPs). It goes to the audit LoggerProvider and nowhere else: never
+// to a span (#848; the only span attribute the shared writer sets is the
+// boolean krateo.audit.recorded) and never to slog (#1192).
 package audit
 
 import (
@@ -28,18 +47,15 @@ import (
 	"encoding/hex"
 	"net/http"
 	"regexp"
-	"slices"
-	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
+	krateoaudit "github.com/krateo-platformops/audit"
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -47,15 +63,26 @@ const (
 	// session correlation id. The edge (portal) may seed it; snowplow mints
 	// it when absent. It REPLACES the old X-Krateo-Correlation-Id header
 	// entirely — the `session.id` semconv attribute on each audit record is
-	// read from here.
-	BaggageSessionKey = "session.id"
+	// read from here (by the shared writer).
+	BaggageSessionKey = krateoaudit.BaggageSessionKey
 
 	// EventName is the discriminator stamped on every audit LogRecord
 	// (event.name="audit") — the constant every audit row is filtered on.
-	EventName = "audit"
+	EventName = krateoaudit.EventName
+
+	// Scope is the instrumentation scope of snowplow's records: the
+	// population the shared schema maps to the request writer.
+	Scope = "github.com/krateo-platformops/snowplow/audit"
+
+	// Writer is snowplow's writer class (schema v1 "request", H): it serves a
+	// person's or an agent's request. An agent's /call record is also an
+	// action-writer (T) record of the same population; it conforms to both.
+	Writer = krateoaudit.WriterRequest
 
 	// DryRunSuffix is appended to krateo.action for a dry-run write
-	// (Event.DryRun): "call.dryRun", "restaction.dryRun".
+	// (Event.DryRun): "call.dryRun", "restaction.dryRun". It is snowplow's own
+	// literal; readers use krateo.audit.dry_run, which the shared writer sets
+	// on every write record.
 	DryRunSuffix = ".dryRun"
 
 	// maxIDLen bounds an inbound session id; anything longer (or with
@@ -137,112 +164,47 @@ func Middleware() func(http.Handler) http.Handler {
 	}
 }
 
-// Event is the caller-facing input for one AuditEvent. All fields are
-// optional; unset fields are omitted from the record. Field names map to the
-// semconv attribute keys in D19a §1.
-type Event struct {
-	// Action is the logical operation -> krateo.action ("call", "export",
-	// "restaction").
-	Action string
-	// DryRun marks a write the apiserver was asked to validate and not
-	// persist (dryRun=All). krateo.action then carries the suffix DryRunSuffix
-	// ("call.dryRun", "restaction.dryRun"), and RecordWrittenObject records no
-	// object identity: nothing was written (#957).
-	DryRun bool
-	// Verb is the HTTP verb -> http.request.method.
-	Verb string
-	// Group/Version/Resource/Name/Namespace identify the object acted on ->
-	// k8s.resource.{group,version,resource,name} and k8s.namespace.name.
-	Group     string
-	Version   string
-	Resource  string
-	Name      string
-	Namespace string
-	// Subresource is the addressed subresource (#282), e.g. "status" ->
-	// k8s.resource.subresource. Empty for a whole-object call (omitted).
-	Subresource string
-	// Outcome is "success" | "failure" | "denied" -> outcome (and drives
-	// SeverityNumber: Info on success, Error otherwise).
-	Outcome string
-	// Code is the HTTP status code of the outcome (0 => omitted) ->
-	// http.response.status_code.
-	Code int
-	// Message is an optional human-readable detail -> LogRecord.Body.
-	Message string
+// Event is the shared writer's Event: one emit site's record, in the schema's
+// own terms. An emit site sets what it did (Action, Verb, HTTPMethod, Outcome,
+// StatusCode, Message, DryRun), and to which target: a Kubernetes object
+// (Group, Version, Resource, Subresource, ObjectName, Namespace and, for a
+// successful write, the written object's identity, RecordWrittenObject) or an
+// external endpoint (ServerAddress), never both. Emit fills in everything the
+// request context holds; whatever an emit site puts in those fields is
+// replaced.
+type Event = krateoaudit.Event
 
-	// ServerAddress is the host (and port) the action was sent to ->
-	// server.address. Set by the RESTAction stage emit (AUDIT-4), where a
-	// write can go to an external API rather than the Kubernetes apiserver;
-	// it never carries userinfo, a path or a query. The request PATH is
-	// deliberately not recorded: a webhook path (/services/T/B/<secret>,
-	// /bot<token>/…) or a jq-built one can carry a credential, and this trail
-	// is kept for 365 days. The RESTAction, its stage and this host identify
-	// the action and the authority without it.
-	ServerAddress string
-	// RESTActionNamespace/RESTActionName/Stage name the RESTAction and the
-	// api[] stage that performed the action -> krateo.restaction.{namespace,
-	// name,stage}. Empty for an action that is not a RESTAction stage.
-	RESTActionNamespace string
-	RESTActionName      string
-	Stage               string
+// The outcomes (krateo.audit.outcome).
+const (
+	OutcomeSuccess = krateoaudit.OutcomeSuccess
+	OutcomeFailure = krateoaudit.OutcomeFailure
+	// OutcomeDenied: snowplow itself refused, so no authority answered and
+	// the record carries no status code (schema v1; audit#13).
+	OutcomeDenied = krateoaudit.OutcomeDenied
+)
 
-	// ObjectUID/ObjectGeneration/ObjectResourceVersion are the identity of the
-	// object a successful Kubernetes write wrote, as the apiserver RETURNED it
-	// (#957, krateo-acmp#59 Option B) -> k8s.object.{uid,generation,
-	// resource_version}. They are the join key to the audit record of the
-	// controller that later reconciles that object: it records the same uid and
-	// the generation it acted on. The attribute keys are those of the shared
-	// emitter, github.com/krateo-platformops/audit, so the join cannot drift.
-	// Optional: set only by RecordWrittenObject (written_object.go), so a failed
-	// write, a read, a dry run or a write to a non-Kubernetes endpoint carries
-	// none of them. A zero generation is omitted.
-	ObjectUID             string
-	ObjectGeneration      int64
-	ObjectResourceVersion string
-}
-
-// actionOf is the krateo.action value of ev: its Action, marked DryRunSuffix
-// when the write was a dry run. An absent action stays absent (and is counted
-// missing).
-func actionOf(ev Event) string {
-	if ev.DryRun && ev.Action != "" {
-		return ev.Action + DryRunSuffix
-	}
-	return ev.Action
-}
-
-// missingFields returns, in a fixed order, the fields other than the actor
-// that ev lacks to answer "what was done to which target": action, method,
-// target (a Kubernetes resource or a server address). Empty when complete.
-//
-// The written object's identity (ObjectUID, ObjectGeneration,
-// ObjectResourceVersion) is OPTIONAL and never listed here: only a successful
-// Kubernetes write has a returned object, so its absence on a failure, a read,
-// a dry run or an external endpoint is the correct record, not a gap.
-func missingFields(ev Event) []string {
-	var out []string
-	if ev.Action == "" {
-		out = append(out, IncompleteAction)
-	}
-	if ev.Verb == "" {
-		out = append(out, IncompleteMethod)
-	}
-	if ev.Resource == "" && ev.ServerAddress == "" {
-		out = append(out, IncompleteTarget)
-	}
-	return out
-}
-
-// Emitter wraps a single OTel Logs API Logger. Construct once at startup
-// from the process LoggerProvider (see internal/logging) and install it via
+// Emitter is snowplow's emitter: the shared writer, declared as the request
+// writer, behind the enrichment every snowplow record gets (Emit). Construct
+// once at startup from the process LoggerProvider and install it via
 // SetDefault. A nil Emitter (pipeline disabled / not installed) is a no-op.
 type Emitter struct {
-	logger log.Logger
+	lib *krateoaudit.Emitter
 }
 
-// New returns an Emitter bound to logger. Obtain logger from the
-// LoggerProvider via provider.Logger("github.com/krateo-platformops/snowplow/audit").
-func New(logger log.Logger) *Emitter { return &Emitter{logger: logger} }
+// New returns an Emitter bound to logger: the shared writer, declared as
+// snowplow's writer class, so it marks every gap that class must mark, writes
+// krateo.audit.dry_run on every write record, and counts each marker under
+// krateo.audit.records.incomplete on the global MeterProvider (OTLP, when
+// metrics are on). opts are the shared writer's (a test passes its own
+// MeterProvider). Obtain logger from the LoggerProvider via
+// provider.Logger(Scope). A nil logger is a no-op Emitter.
+func New(logger log.Logger, opts ...krateoaudit.Option) *Emitter {
+	if logger == nil {
+		return &Emitter{}
+	}
+	all := append([]krateoaudit.Option{krateoaudit.WithWriter(Writer)}, opts...)
+	return &Emitter{lib: krateoaudit.New(incompleteMirror{Logger: logger}, all...)}
+}
 
 // defaultEmitter is the process-wide audit emitter installed from main once
 // the Logs pipeline is up. When nil (default-off / disabled), the package
@@ -262,221 +224,78 @@ func Emit(ctx context.Context, ev Event) {
 	}
 }
 
-// Emit writes one canonical AuditEvent as an OTLP LogRecord. ctx MUST carry
-// the active span (so the SDK stamps TraceId/SpanId) and baggage (so
-// session.id is captured). A nil Emitter is a no-op.
+// Emit writes one canonical AuditEvent. ctx MUST carry the active span (so the
+// SDK stamps TraceId/SpanId), the baggage (so session.id is captured) and the
+// request's validated user info. A nil Emitter is a no-op.
 //
-// AUDIT-4 (installer#410) completeness, enforced here because every emit site
-// passes through it:
-//   - NO ACTOR, NO RECORD. "Prefer no record to a recordless actor": a record
-//     with no authenticated user on ctx is refused and counted under "actor".
-//   - Any other missing field (action, method, target) does not hide the record:
-//     it is emitted marked krateo.audit.incomplete=<fields> and each missing
-//     field is counted, so a gap in a site is visible both in the trail and in
-//     snowplow_audit_incomplete_total.
+// AUDIT-4 (installer#410) completeness is the shared writer's, for every emit
+// site: a record is never dropped. One that lacks a key snowplow's writer
+// class must write (the actor, its class, the action, the verb, the method,
+// the preview flag, a target) is emitted without it, marked
+// krateo.audit.incomplete=<markers>, and each marker is counted
+// (krateo.audit.records.incomplete{marker}, OTLP and /debug/vars).
 func (e *Emitter) Emit(ctx context.Context, ev Event) {
-	if e == nil || e.logger == nil {
+	if e == nil || e.lib == nil {
 		return
 	}
-
-	// Acting user identity, from the request's authenticated user info.
-	user := ""
-	var groups []string
-	if ui, err := xcontext.UserInfo(ctx); err == nil {
-		user = ui.Username
-		groups = ui.Groups
+	setActor(ctx, &ev)
+	if ev.DryRun && ev.Action != "" {
+		ev.Action += DryRunSuffix
 	}
-	if user == "" {
-		incomplete.Add(IncompleteActor, 1)
-		return
-	}
-	missing := missingFields(ev)
-	for _, f := range missing {
-		incomplete.Add(f, 1)
-	}
-
-	var rec log.Record
-
-	now := time.Now()
-	rec.SetTimestamp(now)
-	rec.SetObservedTimestamp(now)
-	rec.SetBody(validUTF8Value(attribute.StringValue(ev.Message)))
-
-	// Severity from outcome. Success (or unset) => Info; anything else
-	// (failure/denied) => Error.
-	if ev.Outcome == "success" || ev.Outcome == "" {
-		rec.SetSeverity(log.SeverityInfo)
-		rec.SetSeverityText("INFO")
-	} else {
-		rec.SetSeverity(log.SeverityError)
-		rec.SetSeverityText("ERROR")
-	}
-
-	attrs := make([]attribute.KeyValue, 0, 28)
-	add := func(k, v string) {
-		if v != "" {
-			attrs = append(attrs, attribute.String(k, v))
-		}
-	}
-	// event.name="audit" — the discriminator every audit row is filtered on.
-	// The otel/log v0.10.0 Record has no dedicated event-name field, so it is
-	// carried as the semconv `event.name` attribute (lands in
-	// otel_logs.LogAttributes['event.name']).
-	add("event.name", EventName)
-	add("enduser.id", user)
-	add("user.name", user)
-	add("k8s.namespace.name", ev.Namespace)
-	add("k8s.resource.group", ev.Group)
-	add("k8s.resource.version", ev.Version)
-	add("k8s.resource.resource", ev.Resource)
-	add("k8s.resource.subresource", ev.Subresource)
-	add("k8s.resource.name", ev.Name)
-	add("k8s.object.uid", ev.ObjectUID)
-	add("k8s.object.resource_version", ev.ObjectResourceVersion)
-	add("krateo.action", actionOf(ev))
-	add("http.request.method", ev.Verb)
-	add("outcome", ev.Outcome)
-	add("server.address", ev.ServerAddress)
-	add("krateo.audit.incomplete", strings.Join(missing, ","))
-	add("krateo.restaction.namespace", ev.RESTActionNamespace)
-	add("krateo.restaction.name", ev.RESTActionName)
-	add("krateo.restaction.stage", ev.Stage)
-
-	if len(groups) > 0 {
-		// v0.21.0: the log API adopted the shared attribute value types, so the
-		// hand-rolled []log.Value is now just a typed string slice.
-		attrs = append(attrs, attribute.StringSlice("user.roles", groups))
-	}
-	if ev.ObjectGeneration != 0 {
-		attrs = append(attrs, attribute.Int64("k8s.object.generation", ev.ObjectGeneration))
-	}
-	if ev.Code != 0 {
-		attrs = append(attrs, attribute.Int("http.response.status_code", ev.Code))
-	}
-
-	// #1251 — what snowplow received with the request the record was made on
-	// (request.go): read once by Middleware, never from the record's caller.
+	ev.SourceIPs, ev.UserAgent, ev.RequestURI = nil, "", ""
 	if f, ok := requestFactsFrom(ctx); ok {
-		if len(f.sourceIPs) > 0 {
-			attrs = append(attrs, attribute.StringSlice(AttrSourceIPs, f.sourceIPs))
-		}
-		add(AttrUserAgent, f.userAgent)
-		add(AttrRequestURI, f.requestURI)
+		ev.SourceIPs, ev.UserAgent, ev.RequestURI = f.sourceIPs, f.userAgent, f.requestURI
 	}
-
-	// Business/session correlation id from W3C baggage — NOT a header.
-	if id := SessionID(ctx); id != "" {
-		attrs = append(attrs, attribute.String(BaggageSessionKey, id))
+	if ev.Resource != "" {
+		ev.Preview = previewOf(ctx, ev.Namespace)
 	}
-
-	// Belt-and-suspenders: the Logs SDK stamps TraceId/SpanId from ctx's
-	// span (they are LogRecord fields, not LogAttributes — we do NOT re-add
-	// them). Only surface the pathological case of an audit event emitted
-	// with no trace context at all, so it is detectable in otel_logs.
-	if sc := trace.SpanContextFromContext(ctx); !sc.IsValid() {
-		attrs = append(attrs, attribute.Bool("krateo.audit.no_trace_context", true))
-	}
-
-	// #1251 — every string the record carries is valid UTF-8, here, in one
-	// place, for every emit site and every attribute: the OTLP exporter
-	// (protobuf) refuses a record with an invalid string, and refuses the WHOLE
-	// batch it is in, so one request could otherwise lose other people's
-	// records (see validUTF8).
-	for i, kv := range attrs {
-		attrs[i] = validUTF8Attr(kv)
-	}
-	rec.AddAttributes(attrs...)
-
-	e.logger.Emit(ctx, rec) // SDK stamps Timestamp + TraceId/SpanId from ctx
+	e.lib.Emit(ctx, ev)
 }
 
-// utf8Replacement replaces each invalid byte sequence of a value: U+FFFD, what
-// the apiserver's JSON-encoded audit log writes for one (encoding/json).
-const utf8Replacement = "\uFFFD"
-
-// validUTF8 returns s with every invalid UTF-8 sequence replaced by U+FFFD.
+// setActor sets ev's actor from the request's validated user info, and only
+// from it (the UserConfig middleware puts it there after verifying the JWT):
 //
-// WHY. Many values on a record come from what a client sent: the User-Agent,
-// the request URI, a name decoded from the query (name=cm-%FF decodes to the
-// byte 0xFF), an upstream's failure message. otlploghttp marshals a batch with
-// protobuf, which refuses a string field that is not valid UTF-8 ("string
-// field contains invalid UTF-8"), and the batch processor then drops the whole
-// batch: every other user's record in it never reaches the trail, with nothing
-// in the trail to show the gap. The apiserver's audit, whose semantics these
-// records follow, is JSON-encoded and gets this replacement from the encoder.
-func validUTF8(s string) string {
-	if utf8.ValidString(s) {
-		return s
-	}
-	return strings.ToValidUTF8(s, utf8Replacement)
-}
-
-// validUTF8Attr is validUTF8Value applied to an attribute: its key and,
-// recursively, every string its value holds.
-func validUTF8Attr(kv attribute.KeyValue) attribute.KeyValue {
-	return attribute.KeyValue{Key: attribute.Key(validUTF8(string(kv.Key))), Value: validUTF8Value(kv.Value)}
-}
-
-// validUTF8Value returns v with every string it holds made valid UTF-8, at any
-// depth. It is TOTAL over the attribute value kinds of
-// go.opentelemetry.io/otel/attribute (v1.45.0): every kind has its own case,
-// and TestUTF8_1251_K fails when the API defines a kind this switch does not
-// name. The record body is an attribute.Value too (log API v0.21.0), so the
-// body takes the same path.
+//   - user.name is the principal performing the action, the token's Actor():
+//     its outermost act subject on a delegated token, else its subject;
+//   - enduser.id, the v0.3 key snowplow has always written, carries the same
+//     value (the shared writer requires the two to agree during W1);
+//   - user.roles is the token's groups;
+//   - krateo.audit.actor_class is that principal's signed class
+//     (ActorPrincipal(), through audit.ParseClaim). A token with no
+//     `principal` claim, or one this schema does not know, gets none: the
+//     record is emitted marked actor_class, never defaulted to human;
+//   - a delegated token adds on_behalf_of (the subject, the person) and the
+//     signed act chain, outermost actor first and ending with the subject.
 //
-//   - STRING, STRINGSLICE: each string is made valid.
-//   - SLICE, MAP: recursed; a MAP's keys are strings on the wire too.
-//   - BYTESLICE: left as it is. OTLP carries it as AnyValue.bytes_value, a
-//     protobuf `bytes` field, which has no UTF-8 requirement (otlploghttp
-//     v0.21.0 internal/transform/log.go AttrValue).
-//   - EMPTY, BOOL, INT64, FLOAT64 and their slices: hold no string.
-//
-// An unknown kind is returned unchanged: the exporter writes such a value as
-// the string "INVALID" (AttrValue's default), which cannot poison a batch.
-func validUTF8Value(v attribute.Value) attribute.Value {
-	switch v.Type() {
-	case attribute.STRING:
-		if s := v.AsString(); !utf8.ValidString(s) {
-			return attribute.StringValue(validUTF8(s))
-		}
-	case attribute.STRINGSLICE:
-		vs := v.AsStringSlice()
-		for i, s := range vs {
-			if !utf8.ValidString(s) {
-				out := slices.Clone(vs)
-				for j := i; j < len(out); j++ {
-					out[j] = validUTF8(out[j])
-				}
-				return attribute.StringSliceValue(out)
-			}
-		}
-	case attribute.SLICE:
-		vs := v.AsSlice()
-		out := make([]attribute.Value, len(vs))
-		for i, e := range vs {
-			out[i] = validUTF8Value(e)
-		}
-		return attribute.SliceValue(out...)
-	case attribute.MAP:
-		kvs := v.AsMap()
-		out := make([]attribute.KeyValue, len(kvs))
-		for i, kv := range kvs {
-			out[i] = validUTF8Attr(kv)
-		}
-		return attribute.MapValue(out...)
-	case attribute.BYTESLICE:
-		// protobuf bytes: no UTF-8 requirement (see above).
-	case attribute.EMPTY, attribute.BOOL, attribute.INT64, attribute.FLOAT64,
-		attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE:
-		// no string inside.
+// No user info on ctx: the record names no actor and is marked actor.
+func setActor(ctx context.Context, ev *Event) {
+	ev.UserName, ev.EndUserID, ev.UserRoles, ev.ActorClass = "", "", nil, ""
+	ev.OnBehalfOf, ev.Delegation = "", nil
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return
 	}
-	return v
+	ev.UserName = ui.Actor()
+	ev.EndUserID = ev.UserName
+	ev.UserRoles = ui.Groups
+	if c, ok := krateoaudit.ParseClaim(ui.ActorPrincipal()); ok {
+		ev.ActorClass = c
+	}
+	if ui.Act != nil {
+		ev.OnBehalfOf = ui.Username
+		ev.Delegation = delegationOf(ui)
+	}
 }
 
-// utf8KindsHandled names every attribute kind validUTF8Value has a case for;
-// TestUTF8_1251_K compares it with the kinds the API defines.
-var utf8KindsHandled = []attribute.Type{
-	attribute.STRING, attribute.STRINGSLICE, attribute.SLICE, attribute.MAP, attribute.BYTESLICE,
-	attribute.EMPTY, attribute.BOOL, attribute.INT64, attribute.FLOAT64,
-	attribute.BOOLSLICE, attribute.INT64SLICE, attribute.FLOAT64SLICE,
+// delegationOf is a delegated token's signed act chain as the schema writes
+// it: each actor, outermost first, then the subject, each with its signed
+// class ("" when the token does not say).
+func delegationOf(ui jwtutil.UserInfo) []krateoaudit.Link {
+	var chain []krateoaudit.Link
+	for a := ui.Act; a != nil; a = a.Act {
+		c, _ := krateoaudit.ParseClaim(a.Principal)
+		chain = append(chain, krateoaudit.Link{Class: c, Subject: a.Sub})
+	}
+	c, _ := krateoaudit.ParseClaim(ui.Principal)
+	return append(chain, krateoaudit.Link{Class: c, Subject: ui.Username})
 }

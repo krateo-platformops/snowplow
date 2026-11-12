@@ -18,7 +18,7 @@ package api
 //   C3  the same write under a BACKGROUND driver (no requester: a reconcile,
 //       not a request) is never sent (#903) and emits nothing.
 //   C5  is the audit package's (audit_incomplete_410_test.go); here the stage
-//       emit site handed a write with no actor emits nothing.
+//       emit site handed a write with no actor emits it marked actor (#1291).
 
 import (
 	"context"
@@ -425,7 +425,7 @@ func TestAudit410_E_OutcomeIsWhatTheAuthorityAnswered(t *testing.T) {
 		if len(got) != 1 {
 			t.Fatalf("records = %d, want 1: %v", len(got), got)
 		}
-		wantAttrs410(t, got[0], map[string]string{"outcome": "failure"})
+		wantAttrs410(t, got[0], map[string]string{"outcome": "denied", "krateo.audit.outcome": "denied"}) // #1291: snowplow itself refused
 		if v, ok := got[0]["http.response.status_code"]; ok {
 			t.Errorf("RED #1298: a refused destination got no answer, but the record carries status code %q", v)
 		}
@@ -470,10 +470,11 @@ func TestAudit410_C3_BackgroundDriverWrite_EmitsNoRecord(t *testing.T) {
 }
 
 // C5 (emit-site arm) — the stage site handed a customer write with no actor on
-// its context emits no record and counts the refusal. (A real actorless /call
+// its context emits the record, marked actor, and counts it (#1291: the shared
+// writer never drops a record; it used to be refused). (A real actorless /call
 // resolve never reaches the dial: the caller's endpoint is found by username.)
-// The control with an actor proves the site emits at all.
-func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
+// The control with an actor proves the mark is the actor's absence.
+func TestAudit410_C5_StageSite_NoActor_EmittedMarked(t *testing.T) {
 	rec := records410(t)
 	call := httpcallOpts410(http.MethodPost, "/render", "https://render.example")
 	res := answer410(http.StatusOK)
@@ -481,16 +482,27 @@ func TestAudit410_C5_StageSite_NoActor_NoRecord(t *testing.T) {
 
 	before := audit.IncompleteCount(audit.IncompleteActor)
 	auditStageWrite(context.Background(), raNS410, raName410, apiCall, call, res, nil)
-	if got := attrs410(rec); len(got) != 0 {
-		t.Fatalf("an actorless write emitted %d records, want 0: %v", len(got), got)
+	got := attrs410(rec)
+	if len(got) != 1 {
+		t.Fatalf("an actorless write emitted %d records, want 1 (emitted, marked): %v", len(got), got)
+	}
+	if m := got[0]["krateo.audit.incomplete"]; !strings.HasPrefix(m, audit.IncompleteActor+",") {
+		t.Fatalf("an actorless write is marked %q, want the actor first", m)
+	}
+	if v, ok := got[0]["user.name"]; ok {
+		t.Fatalf("an actorless write names user.name=%q", v)
 	}
 	if d := audit.IncompleteCount(audit.IncompleteActor) - before; d != 1 {
 		t.Fatalf("incomplete{actor} moved by %d, want 1", d)
 	}
 
 	auditStageWrite(ctxWithUser(user410, group410), raNS410, raName410, apiCall, call, res, nil)
-	if got := attrs410(rec); len(got) != 1 || got[0]["enduser.id"] != user410 {
-		t.Fatalf("control: the same write with an actor emitted %v, want one record for %q", got, user410)
+	got = attrs410(rec)
+	if len(got) != 2 || got[1]["enduser.id"] != user410 || strings.Contains(got[1]["krateo.audit.incomplete"], audit.IncompleteActor+",") {
+		t.Fatalf("control: the same write with an actor emitted %v, want a second record for %q not marked actor", got, user410)
+	}
+	if d := audit.IncompleteCount(audit.IncompleteActor) - before; d != 1 {
+		t.Fatalf("control: incomplete{actor} moved by %d in all, want 1", d)
 	}
 }
 

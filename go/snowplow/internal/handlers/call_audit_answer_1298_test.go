@@ -89,7 +89,9 @@ func TestCall1298_RecordIsWhatWasObservedAtTheDial(t *testing.T) {
 				ep.ServerURL = "http://169.254.169.254" // link-local: refused in the dialer, never sent
 				return serve443(Call(), ep, http.MethodPost, "/call?"+cmQuery443, cmRequest957)
 			},
-			wantCaller: http.StatusBadGateway, wantOutcome: "failure", wantCode: 0,
+			// #1291 — snowplow itself refused: denied (schema v1), and a
+			// denied record never carries a status code (audit#13).
+			wantCaller: http.StatusBadGateway, wantOutcome: "denied", wantCode: 0,
 			wantBody: audit.MessageDestinationRefused,
 		},
 		{

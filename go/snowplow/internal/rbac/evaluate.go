@@ -110,6 +110,19 @@ type EvaluateOptions struct {
 	// not carry would match a rule the apiserver never matches.
 	Name string
 
+	// NonResourcePath (#1362), when non-empty, makes this a NON-RESOURCE check:
+	// the request path the apiserver authorizes a request outside /api and
+	// /apis with (RequestInfo.Path, IsResourceRequest=false). Group, Resource,
+	// Namespace and Name must then be empty (EvaluateRBAC refuses a check that
+	// carries any: ErrMalformedNonResourceCheck), and Verb is the lowercase
+	// HTTP method.
+	// A rule permits it as upstream RuleAllows does for a non-resource request:
+	// the verb matches and one of the rule's nonResourceURLs matches the path
+	// (NonResourceURLMatches: "*", exact, or a trailing-"*" prefix). Only
+	// ClusterRoleBindings can grant it: with Namespace "" no RoleBinding is
+	// visited, as upstream. Build it with NonResourceCheck, never by hand.
+	NonResourcePath string
+
 	// SkipBindingUID, when true, lets the evaluator SKIP the
 	// (Name, UID) stable-sort of the CRB/RB candidate sets
 	// (sortCRBsStable / sortRBsStable). That sort exists ONLY to make
@@ -240,6 +253,17 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		(*h)(ctx, snap, opts, allowed)
 	}()
 
+	// #1362: a non-resource request has no namespace and no resource
+	// attributes, so upstream visits ClusterRoleBindings only. A check that
+	// carries both is malformed. It is refused here, in both modes, and not
+	// left to the field's doc comment: with a Namespace the walk below would
+	// also visit that namespace's RoleBindings, which the apiserver never
+	// does for a non-resource request.
+	if opts.NonResourcePath != "" &&
+		(opts.Namespace != "" || opts.Group != "" || opts.Resource != "" || opts.Name != "") {
+		return false, "", ErrMalformedNonResourceCheck
+	}
+
 	if cache.Disabled() {
 		// Cache=off correctness baseline: a SelfSubjectAccessReview with
 		// the user's endpoint from ctx. No BindingUID is available (no
@@ -249,7 +273,12 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		// path honours is denied here; #1049 — it carries a list's
 		// field-selector Name, which re-deriving it from the verb would
 		// drop.
-		return selfSubjectAccessReview(ctx, opts), "", nil
+		//
+		// #1362: a review that could not be answered is returned as an
+		// error, not as a deny. Every caller fails closed on an error, and the
+		// /debug gate turns it into a 503.
+		ok, sarErr := selfSubjectAccessReview(ctx, opts)
+		return ok, "", sarErr
 	}
 
 	rw := cache.Global()
@@ -264,7 +293,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, "", fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
+		return false, "", ErrWatcherNotWired
 	}
 
 	// Ship B (0.30.138, AC-B.3) — SINGLE rbacSnap.Load() at the top of
@@ -281,7 +310,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, "", fmt.Errorf("rbac: snapshot not yet built")
+		return false, "", ErrSnapshotNotBuilt
 	}
 
 	// Ship L2 (0.30.253) — snapshot-generation authz memo. Sits AFTER the
@@ -305,7 +334,10 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		Resource:   opts.Resource,
 		Namespace:  opts.Namespace,
 		Name:       opts.Name,
-		SkipUID:    opts.SkipBindingUID,
+		// #1362: a non-resource verdict is about one path. Without it here, a
+		// permit for /debug/vars would be served for /debug/apistage.
+		NonResourcePath: opts.NonResourcePath,
+		SkipUID:         opts.SkipBindingUID,
 	}
 	if v, ok := authzMemoLookup(snap.PublishSeq, memoKey); ok {
 		// #261 case-2 — a memo HIT is the HOT at-risk serve path; surface the
@@ -867,9 +899,23 @@ func roleRefPermits(ctx context.Context, snap *cache.RBACSnapshot, namespace str
 // the Kubernetes `ResourceNameMatches` semantics — see its doc comment.
 // Before 0.30.109 this check was absent: a resourceNames-scoped rule
 // over-exposed every object (cross-user leak in filterListByRBAC).
+//
+// #1362 — a non-resource check (opts.NonResourcePath != "") is upstream
+// RuleAllows' other branch: VerbMatches && NonResourceURLMatches, and nothing
+// else. The resource fields are NOT consulted for it. Otherwise the empty
+// Group/Resource of a non-resource check would match a rule's "*" apiGroups
+// and resources, and `resources: ["*"]` (the snowplow SA's own read rule, or
+// any wildcard reader) would grant every /debug path, which the apiserver
+// never allows.
 func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	for _, rule := range rules {
 		if !stringSliceMatches(rule.Verbs, opts.Verb) {
+			continue
+		}
+		if opts.NonResourcePath != "" {
+			if nonResourceURLMatches(rule.NonResourceURLs, opts.NonResourcePath) {
+				return true
+			}
 			continue
 		}
 		if !stringSliceMatches(rule.APIGroups, opts.Group) {
@@ -933,6 +979,24 @@ func resourceNameMatches(rule rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	}
 	for _, n := range rule.ResourceNames {
 		if n == opts.Name {
+			return true
+		}
+	}
+	return false
+}
+
+// nonResourceURLMatches is Kubernetes' NonResourceURLMatches for one
+// PolicyRule's nonResourceURLs (pkg/apis/rbac/v1 evaluation_helpers.go),
+// exactly: "*" matches every path, an exact entry matches itself, and an entry
+// ending in "*" matches every path that starts with what precedes the "*"
+// (strings.TrimRight, so "/debug/**" is the same as "/debug/*"). "/debug/*"
+// therefore matches "/debug/vars" and "/debug/pprof/heap", but not "/debug".
+func nonResourceURLMatches(ruleURLs []string, path string) bool {
+	for _, u := range ruleURLs {
+		if u == rbacv1.NonResourceAll || u == path {
+			return true
+		}
+		if strings.HasSuffix(u, "*") && strings.HasPrefix(path, strings.TrimRight(u, "*")) {
 			return true
 		}
 	}

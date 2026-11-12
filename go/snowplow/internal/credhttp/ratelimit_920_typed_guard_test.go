@@ -398,11 +398,21 @@ func modulePathOf(t *testing.T, root string) string {
 
 func loadTyped(t *testing.T, root string, overlay map[string][]byte, buildFlags []string, patterns ...string) []*packages.Package {
 	t.Helper()
+	return loadTypedIn(t, root, nil, overlay, buildFlags, patterns...)
+}
+
+// loadTypedIn is loadTyped for a build named by environment as well as by
+// flags (GOOS/GOARCH: the js/wasm browser build). env nil is the host's.
+func loadTypedIn(t *testing.T, root string, env []string, overlay map[string][]byte, buildFlags []string, patterns ...string) []*packages.Package {
+	t.Helper()
 	cfg := &packages.Config{
 		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:        root,
 		Overlay:    overlay,
 		BuildFlags: buildFlags,
+	}
+	if env != nil {
+		cfg.Env = append(os.Environ(), env...)
 	}
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
@@ -416,16 +426,22 @@ func loadTyped(t *testing.T, root string, overlay map[string][]byte, buildFlags 
 	return pkgs
 }
 
-// moduleTagSets are the build-tag sets under which the module's non-test
-// files are type-checked. The default set is the production build;
-// rbac_narrow_baseline swaps in the *_baseline.go files. A tagged file in
+// moduleTagSets are the builds under which the module's non-test files are
+// type-checked. The default set is the production build;
+// rbac_narrow_baseline swaps in the *_baseline.go files; the js/wasm browser
+// build (the Agentiko sandbox) compiles the *_js.go and js && wasm files,
+// which no other build sees. A tagged file in
 // none of them that is a standalone program (//go:build ignore, run with go
 // run) is loaded on its own. A file that declares nothing but imports holds
 // no code to check (apis/generate.go: go:generate directives and a blank
 // import of a codegen program, which no build can type-check). Any other
 // non-test file still unchecked fails the test, so a new tag is added here
 // rather than skipped silently (F6).
-var moduleTagSets = [][]string{nil, {"-tags=rbac_narrow_baseline"}}
+var moduleTagSets = []moduleBuild{{}, {flags: []string{"-tags=rbac_narrow_baseline"}}, {env: []string{"GOOS=js", "GOARCH=wasm"}}}
+
+// moduleBuild is one build the typed gate type-checks: build flags and, for
+// another platform, the GOOS/GOARCH environment.
+type moduleBuild struct{ flags, env []string }
 
 // importsOnly reports whether the file at path declares nothing but imports.
 func importsOnly(t *testing.T, path string) bool {
@@ -460,8 +476,8 @@ func loadWholeModule(t *testing.T, root string) ([]*packages.Package, map[string
 			}
 		}
 	}
-	for i, flags := range moduleTagSets {
-		note(loadTyped(t, root, nil, flags, "./..."), "tags:"+strconv.Itoa(i))
+	for i, b := range moduleTagSets {
+		note(loadTypedIn(t, root, b.env, nil, b.flags, "./..."), "tags:"+strconv.Itoa(i))
 	}
 	var missing []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -520,7 +536,7 @@ func TestIssue920_NoRESTConfigFromOutsideTheModuleOutsideCredhttp(t *testing.T) 
 	for _, how := range covered {
 		byHow[how]++
 	}
-	for _, how := range []string{"tags:0", "tags:1", "standalone"} {
+	for _, how := range []string{"tags:0", "tags:1", "tags:2", "standalone"} {
 		if byHow[how] == 0 {
 			t.Errorf("NON-VACUITY: no non-test file was type-checked as %q (coverage %v)", how, byHow)
 		}

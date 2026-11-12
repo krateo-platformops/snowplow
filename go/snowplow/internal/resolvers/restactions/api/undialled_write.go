@@ -127,7 +127,7 @@ func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips [
 	}
 	if !isWriteVerb(apiCall.Verb) {
 		// #1139 — the reason is the stage outcome's, read back after every
-		// refusal is recorded: the highest-ranked one (reasonRank), the cause
+		// refusal is recorded: the one reasonOutranks puts first, the cause
 		// the outcome header names, never the first item's. No worker of the
 		// stage runs yet, so the outcome holds only these refusals.
 		r.log.WarnContext(r.ctx, "read stage not sent",
