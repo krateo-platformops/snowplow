@@ -11,7 +11,7 @@ timestamp: 2026-11-11T00:00:00Z
 
 Snowplow writes one **AuditEvent** per action it performs for a person, as an
 OTLP LogRecord on the shared logs plane. Since #1291 the record is written by
-the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.12.0, pinned to the audit#34 draft until its tag,
+the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.12.0,
 schema v1), declared as the `request` writer on the scope
 `github.com/krateo-platformops/snowplow/audit`; `internal/support/audit`
 supplies what only snowplow knows (the actor from the validated token, the
