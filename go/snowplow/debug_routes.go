@@ -129,13 +129,18 @@ var debugRoutePatterns = []string{
 // between registerDebugRoutes and debugRoutePatterns fails the test.
 type debugMux interface {
 	handleDebug(pattern string, handler http.Handler)
-	handleDebugAudited(pattern string, route audit.Route, handler http.Handler)
+	// declareUnaudited declares, before it is mounted, that a debug route
+	// that can change something is not audited, and why (see routeTable).
+	declareUnaudited(pattern, reason string)
+	// declareAudited declares, before it is mounted, a debug route's audit
+	// descriptor: handleDebug then wraps it outermost in audit.OpenRecord.
+	declareAudited(pattern string, route audit.Route)
 }
 
 // routeRegistrar is what a non-debug route registrar (mountCallWriteRoutes,
 // mountExportRoutes, mountTelemetryRoute) needs: routeTable, which refuses a
-// /debug pattern and an undeclared route that can change something (tests
-// pass newRouteTable over their own mux).
+// /debug pattern and an undeclared route that can change something (tests pass
+// newRouteTable over their own mux).
 type routeRegistrar interface {
 	Handle(pattern string, handler http.Handler)
 	HandleAudited(pattern string, route audit.Route, handler http.Handler)
@@ -159,24 +164,24 @@ type routeRegistrar interface {
 // calls Handle/HandleFunc on an *http.ServeMux except routeTable itself. The
 // only handleDebug call is mount's, and mount's handler is gated.Then(...).
 //
-// AUDIT (audit#22 (a), AUDIT-4 installer#410). Which routes are audited, and as
-// what, is declared here, once, at registration:
+// AUDIT (AUDIT-4 installer#410; #1379 review F2). Which routes are audited,
+// and as what, is declared here, once, at registration:
 //
-//   - HandleAudited mounts a route with its audit descriptor (audit.Route): the
-//     descriptor rides every request's context (audit.WithRoute, outermost),
-//     so a refusal before the handler (middleware.UserConfig) records what
-//     the request asked for exactly as the handler would, and the handler
-//     builds its record with the same descriptor's builder.
-//   - HandleUnaudited mounts a route that changes nothing a record is owed
-//     for, with the reason in words.
-//   - Handle (and handleDebug) PANIC, at boot, for a pattern whose method can
-//     change something (POST, PUT, PATCH, DELETE, or a pattern with no
-//     method): such a route must say which of the two it is, so a new one
-//     can never be silently rowless.
+//   - HandleAudited mounts a route with its audit descriptor (audit.Route),
+//     wrapped OUTERMOST in audit.OpenRecord, before any middleware decodes a
+//     body or verifies a token: every exit of the route then emits exactly
+//     one record, the handler's or, for an exit that emitted none, the
+//     descriptor's.
+//   - HandleUnaudited mounts a route that is not audited, with the reason in
+//     words; a debug route declares it (declareUnaudited) before mount.
+//   - Handle and handleDebug PANIC, at boot, for a pattern whose method can
+//     change something (POST, PUT, PATCH, DELETE, or no method) and that is
+//     not declared: such a route must say which of the two it is, so a new
+//     one is never silently rowless. TestAudit_RouteTable_* pins it.
 type routeTable struct {
 	mux *http.ServeMux
-	// audited and unaudited are the declarations made so far: pattern ->
-	// descriptor, pattern -> reason.
+	// audited and unaudited are the declarations: pattern -> descriptor,
+	// pattern -> reason.
 	audited   map[string]audit.Route
 	unaudited map[string]string
 }
@@ -186,60 +191,68 @@ func newRouteTable(mux *http.ServeMux) *routeTable {
 }
 
 // Handle mounts a non-debug route whose method changes nothing (GET, HEAD,
-// OPTIONS); a /debug pattern or a method that can change something panics (see
-// routeTable).
+// OPTIONS); a /debug pattern, or a method that can change something, panics
+// (see routeTable).
 func (t *routeTable) Handle(pattern string, handler http.Handler) {
-	if isDebugPattern(pattern) {
-		panic(fmt.Sprintf("route %q is under /debug: it must be mounted by registerDebugRoutes, "+
-			"behind the RefreshAuth + DebugAuthz gate (#1362)", pattern))
-	}
+	t.notDebug(pattern)
 	mustBeSafe(pattern)
 	t.mux.Handle(pattern, handler)
 }
 
-// HandleAudited mounts a non-debug route with its audit descriptor.
+// HandleAudited mounts a non-debug route with its audit descriptor (see
+// routeTable).
 func (t *routeTable) HandleAudited(pattern string, route audit.Route, handler http.Handler) {
-	if isDebugPattern(pattern) {
-		panic(fmt.Sprintf("route %q is under /debug: it must be mounted by registerDebugRoutes (#1362)", pattern))
+	t.notDebug(pattern)
+	if route.Asked == nil {
+		panic(fmt.Sprintf("route %q is declared audited with no descriptor", pattern))
 	}
-	t.mux.Handle(pattern, t.audit(pattern, route, handler))
+	t.audited[pattern] = route
+	t.mux.Handle(pattern, audit.OpenRecord(route)(handler))
 }
 
 // HandleUnaudited mounts a non-debug route that is not audited, with the
 // reason; an empty reason panics.
 func (t *routeTable) HandleUnaudited(pattern, reason string, handler http.Handler) {
-	if isDebugPattern(pattern) {
-		panic(fmt.Sprintf("route %q is under /debug: it must be mounted by registerDebugRoutes (#1362)", pattern))
-	}
+	t.notDebug(pattern)
 	t.unaudit(pattern, reason)
 	t.mux.Handle(pattern, handler)
 }
 
-// handleDebug is the /debug lane (see routeTable) for a route whose method
-// changes nothing.
+func (t *routeTable) notDebug(pattern string) {
+	if isDebugPattern(pattern) {
+		panic(fmt.Sprintf("route %q is under /debug: it must be mounted by registerDebugRoutes, "+
+			"behind the RefreshAuth + DebugAuthz gate (#1362)", pattern))
+	}
+}
+
+// handleDebug is the /debug lane (see routeTable). A route whose method can
+// change something must have been declared (declareUnaudited) first.
 func (t *routeTable) handleDebug(pattern string, handler http.Handler) {
 	if !isDebugPattern(pattern) {
 		panic(fmt.Sprintf("route %q is not under /debug: mount it with Handle", pattern))
 	}
-	mustBeSafe(pattern)
+	if route, audited := t.audited[pattern]; audited {
+		t.mux.Handle(pattern, audit.OpenRecord(route)(handler))
+		return
+	}
+	if _, declared := t.unaudited[pattern]; !declared {
+		mustBeSafe(pattern)
+	}
 	t.mux.Handle(pattern, handler)
 }
 
-// handleDebugAudited is the /debug lane for an audited route.
-func (t *routeTable) handleDebugAudited(pattern string, route audit.Route, handler http.Handler) {
-	if !isDebugPattern(pattern) {
-		panic(fmt.Sprintf("route %q is not under /debug: mount it with HandleAudited", pattern))
-	}
-	t.mux.Handle(pattern, t.audit(pattern, route, handler))
-}
-
-func (t *routeTable) audit(pattern string, route audit.Route, handler http.Handler) http.Handler {
+// declareAudited declares a debug route's audit descriptor before mount (see
+// handleDebug); a descriptor with no Asked panics.
+func (t *routeTable) declareAudited(pattern string, route audit.Route) {
 	if route.Asked == nil {
 		panic(fmt.Sprintf("route %q is declared audited with no descriptor", pattern))
 	}
 	t.audited[pattern] = route
-	return audit.WithRoute(route)(handler)
 }
+
+// declareUnaudited declares that pattern, a route that can change something,
+// is not audited, and why; an empty reason panics.
+func (t *routeTable) declareUnaudited(pattern, reason string) { t.unaudit(pattern, reason) }
 
 func (t *routeTable) unaudit(pattern, reason string) {
 	if strings.TrimSpace(reason) == "" {
@@ -250,14 +263,14 @@ func (t *routeTable) unaudit(pattern, reason string) {
 
 // mustBeSafe panics unless pattern's method changes nothing: GET (which the
 // mux also serves for HEAD), HEAD or OPTIONS. A pattern with no method serves
-// every method.
+// every method, so it is not safe.
 func mustBeSafe(pattern string) {
 	method, _, ok := strings.Cut(pattern, " ")
 	if ok && (method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions) {
 		return
 	}
 	panic(fmt.Sprintf("route %q can change something: mount it with HandleAudited (its audit descriptor) "+
-		"or HandleUnaudited (and the reason) — audit#22 (a)", pattern))
+		"or HandleUnaudited (and the reason)", pattern))
 }
 
 // isDebugPattern reports whether a ServeMux pattern ("[METHOD ][HOST]/PATH")
@@ -389,9 +402,10 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// turns the dark parity MEASUREMENT on or off. The toggle is per-pod, so a
 	// measurement that uses it must pin to one pod (see the handler doc).
 	mount("GET /debug/shadow-parity", handlers.DebugShadowParityGet())
-	// #909 — the flip is a state change: audited (handlers.ShadowParityRoute),
-	// on the same gated chain.
-	mux.handleDebugAudited("POST /debug/shadow-parity", handlers.ShadowParityRoute(), gated.Then(handlers.DebugShadowParitySet()))
+	// #909 — the flip is a state change: audited (handlers.ShadowParityRoute,
+	// target url.path), on the same gated chain.
+	mux.declareAudited("POST /debug/shadow-parity", handlers.ShadowParityRoute())
+	mount("POST /debug/shadow-parity", handlers.DebugShadowParitySet())
 
 	// #277 (edge-3) — the read-only dep-graph diagnostic. Same JWT gate, same
 	// METADATA-ONLY contract as /debug/apistage: it returns dependency edges as

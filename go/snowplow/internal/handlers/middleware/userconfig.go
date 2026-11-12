@@ -69,6 +69,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // PinnedPlumbingVersion is the upstream `plumbing` module version this
@@ -382,6 +383,9 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
 			)
+			// An audited route's record (audit.OpenRecord) names this
+			// verified caller, whatever exit the request takes from here.
+			audit.SetCaller(ctx, userInfo)
 
 			authOpen = false
 			auth.End()

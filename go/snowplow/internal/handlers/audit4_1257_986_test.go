@@ -86,6 +86,17 @@ func assertConforms4(t *testing.T, r sdklog.Record, opts ...audittest.Option) {
 	audittest.AssertConformant(t, audit.Writer, r, opts...)
 	audittest.AssertRequiredKeysDetected(t, audit.Writer, r, opts...)
 	audittest.AssertEnumsDetected(t, audit.Writer, r, opts...)
+	assertDialMethod(t, r)
+}
+
+// assertDialMethod is F1's falsifier (#1379 review): a record's
+// http.request.method is the method of its verb, the request snowplow SENT,
+// never the one it served. The library's Check cannot see the difference.
+func assertDialMethod(t *testing.T, r sdklog.Record) {
+	t.Helper()
+	if method, verb, bad := audit.DialMethodMismatch(audittest.Attributes(r)); bad {
+		t.Errorf("http.request.method %q is not the method of verb %q: the record names the request snowplow served, not the one it sent", method, verb)
+	}
 }
 
 func TestAudit4_1257_D_C_TheRecordNamesTheObjectTheApiserverResolved(t *testing.T) {
@@ -105,6 +116,9 @@ func TestAudit4_1257_D_C_TheRecordNamesTheObjectTheApiserverResolved(t *testing.
 			"apiVersion=rbac.authorization.k8s.io/v1&resource=clusterroles&name=" + url.QueryEscape("system:viewer"), false},
 		{"a ? in the namespace", Call, http.MethodPut, "apiVersion=v1&resource=configmaps&namespace=" + url.QueryEscape("ns?x") + "&name=cm-x", false},
 		{"dry run, a ? in the name", CallDryRun, http.MethodPut, "apiVersion=v1&resource=configmaps&namespace=default&name=" + url.QueryEscape("cm-x?dryRun=None"), true},
+		// F3 (#1379 review): a namespace is named by its own name.
+		{"a namespace (cluster-scoped)", func() http.Handler { return CallWithScopeResolver(clusterScoped1257) }, http.MethodDelete,
+			"apiVersion=v1&resource=namespaces&name=bar", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			route := "/call?"
@@ -159,6 +173,10 @@ func TestAudit4_1257_R_AValueThatIsNotOneSegmentIsRefusedBeforeTheDial(t *testin
 		{"slash in the resource", "apiVersion=v1&resource=" + esc("configmaps/../secrets") + "&namespace=default&name=cm-x", "resource"},
 		{"dot-dot version", "apiVersion=" + esc("apps/..") + "&resource=deployments&namespace=default&name=d", "apiVersion"},
 		{"dot group", "apiVersion=" + esc("./v1") + "&resource=deployments&namespace=default&name=d", "apiVersion"},
+		// F3 (#1379 review): the apiserver would act on another object.
+		{"a namespace named by another namespace", "apiVersion=v1&resource=namespaces&namespace=foo&name=bar", ""},
+		{"a namespace subresource posing as a resource", "apiVersion=v1&resource=finalize&namespace=x&name=y", ""},
+		{"status posing as a resource", "apiVersion=v1&resource=status&namespace=x&name=y", ""},
 	} {
 		for _, route := range []struct {
 			path string
@@ -169,7 +187,7 @@ func TestAudit4_1257_R_AValueThatIsNotOneSegmentIsRefusedBeforeTheDial(t *testin
 				if w.Code != http.StatusBadRequest {
 					t.Errorf("code %d, want 400", w.Code)
 				}
-				if !strings.Contains(w.Body.String(), `\"`+c.param+`\"`) {
+				if c.param != "" && !strings.Contains(w.Body.String(), `\"`+c.param+`\"`) {
 					t.Errorf("the refusal does not name parameter %q", c.param)
 				}
 				if len(reqs) != 0 {
@@ -243,8 +261,10 @@ func TestAudit986_X_C_EveryExportExitEmitsExactlyOneRecord(t *testing.T) {
 				if _, ok := got[krateoaudit.KeyObjectResource]; ok != c.want.target {
 					t.Errorf("names a Kubernetes object: %t, want %t", ok, c.want.target)
 				}
-				if got[krateoaudit.KeyAction] != "export" || got[krateoaudit.KeyVerb] != "get" || got[krateoaudit.KeyHTTPMethod] != m.method {
-					t.Errorf("action %q verb %q method %q, want export get %s", got[krateoaudit.KeyAction], got[krateoaudit.KeyVerb], got[krateoaudit.KeyHTTPMethod], m.method)
+				// F1 (#1379 review): the method the export SENT, GET, for a
+				// GET and a POST /export alike.
+				if got[krateoaudit.KeyAction] != "export" || got[krateoaudit.KeyVerb] != "get" || got[krateoaudit.KeyHTTPMethod] != http.MethodGet {
+					t.Errorf("action %q verb %q method %q, want export get GET", got[krateoaudit.KeyAction], got[krateoaudit.KeyVerb], got[krateoaudit.KeyHTTPMethod])
 				}
 				assertConforms4(t, recs[0], audittest.AllowIncomplete(c.incomple...))
 			})
@@ -272,13 +292,14 @@ func TestAudit986_X_ARefusalNamesTheRuleNeverTheValue(t *testing.T) {
 // it is one path segment, else none. Never the query's name.
 func TestAudit4_1378_N_C_ACreateRecordsTheObjectTheApiserverWrote(t *testing.T) {
 	const (
-		query    = "apiVersion=v1&resource=configmaps&namespace=default&name=query-name"
-		bodyName = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default"},"data":{"k":"v"}}`
-		bodyGen  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"generateName":"cm-","namespace":"default"},"data":{"k":"v"}}`
-		bodyBad  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a/b","namespace":"default"},"data":{"k":"v"}}`
-		bodyYAML = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: yaml-name\n  namespace: default\n"
-		respBody = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default","uid":"u1","generation":1,"resourceVersion":"1"}}`
-		respGen  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-x7k2p","namespace":"default","uid":"u2","generation":1,"resourceVersion":"2"}}`
+		query     = "apiVersion=v1&resource=configmaps&namespace=default&name=query-name"
+		bodyName  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default"},"data":{"k":"v"}}`
+		bodyGen   = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"generateName":"cm-","namespace":"default"},"data":{"k":"v"}}`
+		bodyBad   = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a/b","namespace":"default"},"data":{"k":"v"}}`
+		bodyYAML  = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: yaml-name\n  namespace: default\n"
+		bodyDecoy = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"Name":"decoy","namespace":"default"}}`
+		respBody  = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"body-name","namespace":"default","uid":"u1","generation":1,"resourceVersion":"1"}}`
+		respGen   = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-x7k2p","namespace":"default","uid":"u2","generation":1,"resourceVersion":"2"}}`
 	)
 	for _, c := range []struct {
 		name   string
@@ -296,6 +317,8 @@ func TestAudit4_1378_N_C_ACreateRecordsTheObjectTheApiserverWrote(t *testing.T) 
 		{"refused, generateName names none yet", Call, "/call?", bodyGen, http.StatusForbidden, cmForbidden957, ""},
 		{"refused, body name is not one segment", Call, "/call?", bodyBad, http.StatusUnprocessableEntity, cmForbidden957, ""},
 		{"refused, a YAML body", Call, "/call?", bodyYAML, http.StatusForbidden, cmForbidden957, "yaml-name"},
+		// F5 (#1379 review): keys match exactly, as apimachinery decodes them.
+		{"refused, a body whose name key is not metadata.name", Call, "/call?", bodyDecoy, http.StatusForbidden, cmForbidden957, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			recs, reqs, _ := serveAudit4(t, c.h(), http.MethodPost, c.route+query, c.body, c.status, c.resp)

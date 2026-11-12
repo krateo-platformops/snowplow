@@ -95,18 +95,18 @@ func DebugShadowParitySet() http.HandlerFunc {
 		// #909 — the toggle is a state change, so every request is recorded
 		// (AUDIT-4): a flip as a success, an unparseable value as snowplow's
 		// own refusal (denied, invalid_request, no status code).
-		ev, _ := ShadowParityRoute().Asked(req)
+		ev := ShadowParityRoute().Asked(req)
 		v, err := strconv.ParseBool(req.URL.Query().Get("enabled"))
 		if err != nil {
 			http.Error(wri, "enabled must be a boolean (true|false)", http.StatusBadRequest)
 			ev.Outcome, ev.DenialReason, ev.Message = audit.OutcomeDenied, audit.DenialInvalidRequest, shadowParityRefused
-			audit.Emit(req.Context(), ev)
+			audit.EmitRoute(req.Context(), ev)
 			return
 		}
 		rbac.SetShadowParityEnabled(v)
 		enabled := rbac.ShadowParityEnabled()
 		ev.Outcome, ev.StatusCode, ev.Message = audit.OutcomeSuccess, http.StatusOK, "enabled="+strconv.FormatBool(enabled)
-		audit.Emit(req.Context(), ev)
+		audit.EmitRoute(req.Context(), ev)
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(wri).Encode(shadowParityBody{Enabled: enabled})
@@ -133,12 +133,12 @@ const shadowParityRefused = "refused: enabled must be a boolean"
 // no Kubernetes object and no external endpoint. Verb post (the apiserver's
 // non-resource rule), method POST; a write, so dry_run=false.
 func ShadowParityRoute() audit.Route {
-	return audit.Route{Asked: func(*http.Request) (audit.Event, bool) {
+	return audit.Route{Asked: func(*http.Request) audit.Event {
 		return audit.Event{
 			Action:     shadowParityAction,
 			Verb:       audit.MethodVerb(http.MethodPost),
 			HTTPMethod: http.MethodPost,
 			URLPath:    ShadowParityPath,
-		}, true
+		}
 	}}
 }

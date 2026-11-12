@@ -1408,7 +1408,7 @@ func main() {
 	// never a create. Same read-path invariant as GET /call, so it is
 	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
 	// fails if either half is missing).
-	routes.HandleUnaudited("POST /call/read", "a read: the body carries extras, the verb sent is GET (#186); a RESTAction write stage it reaches is recorded by the stage", chain.Append(
+	routes.HandleUnaudited("POST /call/read", "a read: the body carries extras and the verb sent is GET (#186); a RESTAction write stage it reaches is the stage's record", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		middleware.BodyExtrasDecode,
@@ -1455,7 +1455,7 @@ func main() {
 	// coordinate array in the body, which has no request-line limit. Same path,
 	// same auth, same semantics, still zero apiserver reads — and GET stays
 	// byte-identical so the server can land ahead of the client.
-	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: the coordinates ride the body; no state changes (#560)", refreshesHandler)
+	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: its coordinates ride the body; no state changes (#560)", refreshesHandler)
 
 	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
 	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It

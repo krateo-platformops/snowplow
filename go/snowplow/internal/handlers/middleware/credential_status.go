@@ -50,7 +50,6 @@ import (
 	"errors"
 	"net/http"
 
-	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 
@@ -203,8 +202,7 @@ func auditCredentialMissing(req *http.Request, ui jwtutil.UserInfo) {
 	if credsecret.IsStepUp(ui.Groups) {
 		reason = audit.DenialStepUpRequired
 	}
-	ctx := xcontext.BuildContext(req.Context(), xcontext.WithUserInfo(ui))
-	audit.EmitRefused(ctx, req, reason, audit.MessageRefused)
+	audit.RefuseRoute(req.Context(), req, ui, reason)
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

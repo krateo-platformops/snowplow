@@ -85,8 +85,10 @@ func TestExport1055_M_T_MethodIsTheRequestsAndTheTargetHasGroupAndVersion(t *tes
 			}
 			got := one957(t, rec)
 			want := map[string]string{
-				"krateo.action":         "export",
-				"http.request.method":   c.method,
+				"krateo.action": "export",
+				// F1 (#1379 review): the method of the request the export
+				// SENT, GET for a GET and a POST /export alike (schema v1).
+				"http.request.method":   http.MethodGet,
 				"k8s.resource.group":    group1055,
 				"k8s.resource.version":  version1055,
 				"k8s.resource.resource": "fireworksapps",
@@ -235,7 +237,7 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				r := got[0]
 				for k, v := range map[string]string{
-					"http.request.method":       method,
+					"http.request.method":       http.MethodGet, // F1: the method sent
 					"k8s.resource.group":        group1055,
 					"k8s.resource.version":      version1055,
 					"k8s.resource.resource":     "fireworksapps",

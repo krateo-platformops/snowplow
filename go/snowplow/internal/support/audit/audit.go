@@ -152,6 +152,9 @@ func Middleware() func(http.Handler) http.Handler {
 			}
 			ctx = WithSessionID(ctx, id)
 			ctx = withReceivedRequest(ctx, req)
+			// An audited route's record (OpenRecord) is written on this
+			// context when the request ends without one.
+			established(ctx)
 			next.ServeHTTP(wri, req.WithContext(ctx))
 		})
 	}

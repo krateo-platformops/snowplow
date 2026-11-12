@@ -12,8 +12,9 @@ package middleware_test
 //      token), no status code, the action, verb and target the handler would
 //      have recorded. It names the object asked for, never the credential
 //      Secret (its name embeds the username).
-//   N  GET /call (a read) refused: no row; a route with no descriptor: no row;
-//      a /call write the handler would refuse as malformed: no row.
+//   N  a route with no descriptor (not audited): no row.
+//   M  a /call write the handler would refuse as malformed, refused here
+//      first: one denied row, its target unresolved (marked target).
 //   C  every row conforms, and the library's falsifiers bite on it.
 
 import (
@@ -55,7 +56,7 @@ func serve22(t *testing.T, route *audit.Route, h http.Handler, method, target, b
 
 	mws := []func(http.Handler) http.Handler{audit.Middleware()}
 	if route != nil {
-		mws = append([]func(http.Handler) http.Handler{audit.WithRoute(*route)}, mws...)
+		mws = append([]func(http.Handler) http.Handler{audit.OpenRecord(*route)}, mws...)
 	}
 	mws = append(mws, middleware.UserConfig(testKeys, testAuthnNS))
 	wrapped := use.NewChain(mws...).Then(h)
@@ -171,10 +172,7 @@ func TestAudit22_UserConfig_N_NoRowWhenTheAdmittedRequestHasNone(t *testing.T) {
 		method, target string
 		body           string
 	}{
-		{"GET /call (a read)", ptrRoute(handlers.CallRoute()), handlers.Call(), http.MethodGet, "/call?" + q, ""},
 		{"a route with no descriptor", nil, handlers.Call(), http.MethodPost, "/call?" + q, cm22},
-		{"a malformed /call write", ptrRoute(handlers.CallRoute()), handlers.Call(), http.MethodPut,
-			"/call?apiVersion=v1&resource=configmaps&namespace=default&name=" + "cm-x%2Fstatus", cm22},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			code, recs := serve22(t, c.route, c.h, c.method, c.target, c.body, su994Group)
