@@ -13,6 +13,12 @@ import (
 // server accepts connections; bridge.js's start() resolves then.
 const HostAttach = "snowplowBridgeAttach"
 
+// HostTarget is the global function bridge.js defines for Targets. Attach
+// calls it once per target, with that target's name and functions, as soon as
+// the target accepts connections: before snowplow's own server does, because
+// snowplow calls its targets (the cluster) while it starts.
+const HostTarget = "snowplowBridgeTarget"
+
 // Attach waits, in its own goroutine, until the server on addr accepts, then
 // hands bridge.js an object with two functions:
 //
@@ -25,34 +31,36 @@ const HostAttach = "snowplowBridgeAttach"
 // numbers the requests, so a cancel for a request that has finished is a
 // no-op rather than a call into a released function.
 //
-// Each Target adds an entry under targets[name] with its own serve and
-// cancel. A target's requests are relayed (Relay), not forwarded: bridge.js's
-// network seam sends it snowplow's own egress to that server's address.
+// Each Target gets the same two functions through HostTarget. A target's
+// requests are relayed (Relay), not forwarded: bridge.js's network seam sends
+// it snowplow's own egress to that server's address.
 func Attach(addr string, targets ...Target) {
 	host := js.Global().Get(HostAttach)
 	if host.Type() != js.TypeFunction {
 		panic("browserbridge: " + HostAttach + " is not defined; this program runs only under snowplow-wasm's bridge.js")
 	}
+	hostTarget := js.Global().Get(HostTarget)
+	if len(targets) > 0 && hostTarget.Type() != js.TypeFunction {
+		panic("browserbridge: " + HostTarget + " is not defined; this program runs only under snowplow-wasm's bridge.js")
+	}
+	// The servers are wired by main in this same process; there is nothing
+	// to give up on, so each wait lasts as long as it takes.
+	for _, t := range targets {
+		t := t
+		tb := &bridge{addr: t.Addr, live: map[int]context.CancelFunc{}, forward: func(ctx context.Context, addr string, req Request, sink Sink) {
+			Relay(ctx, addr, t.Name, req, sink)
+		}}
+		go func() {
+			_ = WaitAccepting(context.Background(), t.Addr)
+			hostTarget.Invoke(t.Name, js.ValueOf(map[string]any{"serve": js.FuncOf(tb.serve), "cancel": js.FuncOf(tb.cancel)}))
+		}()
+	}
 	b := &bridge{addr: addr, live: map[int]context.CancelFunc{}, forward: Forward}
 	go func() {
-		// The servers are wired by main in this same process; there is
-		// nothing to give up on, so this waits for as long as it takes.
-		for _, t := range targets {
-			_ = WaitAccepting(context.Background(), t.Addr)
-		}
 		_ = WaitAccepting(context.Background(), addr)
-		named := map[string]any{}
-		for _, t := range targets {
-			t := t
-			tb := &bridge{addr: t.Addr, live: map[int]context.CancelFunc{}, forward: func(ctx context.Context, addr string, req Request, sink Sink) {
-				Relay(ctx, addr, t.Name, req, sink)
-			}}
-			named[t.Name] = map[string]any{"serve": js.FuncOf(tb.serve), "cancel": js.FuncOf(tb.cancel)}
-		}
 		host.Invoke(js.ValueOf(map[string]any{
-			"serve":   js.FuncOf(b.serve),
-			"cancel":  js.FuncOf(b.cancel),
-			"targets": named,
+			"serve":  js.FuncOf(b.serve),
+			"cancel": js.FuncOf(b.cancel),
 		}))
 	}()
 }
