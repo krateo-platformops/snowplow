@@ -30,7 +30,6 @@ import (
 
 	krateoaudit "github.com/krateo-platformops/audit"
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/kubeutil"
@@ -499,14 +498,13 @@ func main() {
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
-	// The client is the one plumbing builds by default (dialguard.Client, with
-	// the request timeout, positive: checkJWKSRequestTimeout above), passed
-	// through credhttp.PlumbingClient: on js/wasm
-	// that sets fetch's credentials mode, so the browser attaches none of the
-	// frame's cookies to the JWKS fetch (credhttp/egress_js.go); on a server
-	// build it is the client itself.
-	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
-		jwtutil.WithJWKSHTTPClient(credhttp.PlumbingClient(dialguard.Client(*jwksTimeout))),
+	// credhttp builds the key source's client: the one plumbing builds by
+	// default (dialguard.Client) at the request timeout, positive by
+	// checkJWKSRequestTimeout above. On js/wasm it sets fetch's credentials
+	// mode, so the browser attaches none of the frame's cookies to the JWKS
+	// fetch (credhttp/plumbing_clients.go); on a server build it is plumbing's
+	// client itself.
+	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
 		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
 	log.Info("JWT verification keys sourced from authn JWKS",

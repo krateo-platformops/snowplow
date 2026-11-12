@@ -8,7 +8,7 @@
 #      ones against a real Node HTTP server through Node's real fetch;
 #   5. the server build contains none of the browser code (main_browser_build_test.go:
 #      no internal/browserbridge, no syscall/js, credhttp.BrowserEgress nil,
-#      credhttp.PlumbingClient the identity).
+#      credhttp's plumbing clients plumbing's own).
 #
 # Run from go/snowplow. Needs node on PATH for steps 3 and 4.
 set -euo pipefail
@@ -27,7 +27,7 @@ GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
-# "node": Go's in-process network, where BrowserEgress and PlumbingClient must
+# "node": Go's in-process network, where BrowserEgress and credhttp's plumbing clients must
 # be the identity) and a renamed argv0 (net/http uses Node's fetch, as a
 # browser's). In fetch mode no TestBrowserFetch_ test may skip: a skip there
 # means the mode was not the one this script meant, and nothing was checked.
@@ -58,6 +58,6 @@ for pkg in ./internal/credhttp ./internal/resolvers/restactions/api; do
 done
 
 echo "== server build: contains none of the browser code"
-go test -count=1 -run 'TestBrowserBuild_' .
+go test -count=1 -run 'TestBrowserBuild_' . ./internal/credhttp
 
 echo "check_js_wasm: OK"
