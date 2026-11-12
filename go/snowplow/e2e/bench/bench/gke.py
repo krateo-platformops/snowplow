@@ -1923,8 +1923,12 @@ def in_use_addresses(listed: dict[str, list[dict]], region: str) -> tuple[int, s
 #     LoadBalancer Service;
 #   - k8s-fw-<lb-id> (ALLOW to the Service's IP) and k8s-fw-<lb-id>-deny (DENY the rest to that IP): two per
 #     LoadBalancer Service.
-# Those are target pool-based load balancers (GKE < 1.37, BACKEND_SERVICE_LB_SINCE); a 1.37 cluster's backend
-# service-based ones have not been read here yet, and are counted the same until one is.
+# Those are target pool-based external load balancers (GKE < 1.37, BACKEND_SERVICE_LB_SINCE), every Service with the
+# default externalTrafficPolicy. NOT COUNTED, none of them made by a bench install so far and none read here:
+#   - a Service with externalTrafficPolicy: Local gets its own health-check rule (k8s-<id>-http-hc), one more each;
+#   - an internal load balancer (networking.gke.io/load-balancer-type: Internal) gets k8s2-* rules of its own;
+#   - other k8s2-* rules (GKE's L4 controller: a backend service-based LB's rules and its shared health-check rule);
+#   - a GKE 1.37 cluster's backend service-based external LBs, counted as the target pool-based ones until read.
 # The LoadBalancer Services are the install's own (Footprint.lb_services, bench/lb_need.py from the pulled chart and
 # the run's values). In a footprint of several clusters, those with a LoadBalancer Service are at most
 # min(clusters, lb_services): that bound is counted. A testvm / vm606 VM takes its two SSH rules (gcevm.ssh_rules,

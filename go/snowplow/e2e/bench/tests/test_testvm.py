@@ -138,7 +138,7 @@ def fake(tmp_path, monkeypatch, run_trees):
     for k in ("FAKE_LIST_FAILS", "FAKE_KEEP_DISKS", "FAKE_IAP_DISABLED", "FAKE_SSH_FAIL", "FAKE_SSH_FAIL_TIMES",
               "FAKE_STREAM_STALL", "FAKE_LIMIT_E2_CPUS", "FAKE_FW_DELETE_LOST", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_INSTANCE_ON_CREATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL", "FAKE_PROJECT_USAGE_FIREWALLS",
-              "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY"):
+              "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -1086,11 +1086,18 @@ CAUSES = {
     "unrecognized arguments": ("unrecognized arguments: --no-such-flag",),
     "the account": ("Required 'compute.instances.create' permission",),
     "the account in brackets": ("does not have permission to access projects instance",),
+    # #1361 review B1: identities that are no e-mail (an external IdP's account through workforce federation)
+    "a workforce account without credentials": ("does not have any valid credentials", "gcloud auth login"),
+    "a workforce principal without access": ("does not have compute.instances.create access",),
+    "a workforce principal quoted": ("Required 'compute.firewalls.create' permission",),
+    "a wrapped authenticated-as sentence": ("HTTPError 404", "networks/nope' was not found."),
 }
 
 
 def _no_identity(text: str) -> None:
-    assert "PLACEHOLDER-OPERATOR" not in text and "@example.invalid" not in text and "authenticated as" not in text, text
+    """No account of the fake's, whatever its shape: an e-mail, a workforce pool, a subject, a principal URI."""
+    for leak in ("PLACEHOLDER", "@example.invalid", "authenticated as", "principal://", "workforcePools/P"):
+        assert leak not in text, (leak, text)
 
 
 @pytest.mark.parametrize("which", ["FAKE_FW_CREATE_FAIL", "FAKE_CREATE_FAIL"])
@@ -1157,9 +1164,16 @@ def test_a_subnetwork_not_ready_is_waited_for_by_its_operation_then_created(fake
     assert verbs.count("compute instances create") == 2 and verbs.count("compute operations describe") == 3
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "operations", "list"]]
     assert lists and all(c["partial_error"] == "false" and "--regions" in c["argv"] for c in lists)
+    # the list also held an earlier patch of the subnetwork that had ENDED: it is never waited for
+    assert "operation-1794436860115-subnet-patch-ended" not in out
+    describes = [c["argv"] for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "operations", "describe"]]
+    assert {d[3] for d in describes} == {"operation-1794441048556-subnet-patch"}
+    assert all(d[d.index("--region") + 1] == "europe-west3" for d in describes)     # describe's own scope flag
 
 
 def test_a_resource_not_ready_with_no_operation_to_wait_for_refuses_naming_it(fake, capsys, tmp_path, monkeypatch):
+    """The list holds only an operation of the subnetwork that ended: nothing to wait for, so the not-ready answer
+    is the refusal, its cause named; the create is not made again."""
     clone, sha = _repo(tmp_path)
     monkeypatch.setenv("FAKE_NOT_READY", "never")
     rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
@@ -1167,3 +1181,33 @@ def test_a_resource_not_ready_with_no_operation_to_wait_for_refuses_naming_it(fa
                         f"resource: | - The resource 'projects/{PROJECT}/regions/europe-west3/subnetworks/default' is "
                         f"not ready)") in err, err
     assert _verbs(fake).count("compute instances create") == 1
+    assert "compute operations describe" not in _verbs(fake)
+
+
+def test_an_operation_already_waited_for_is_not_waited_for_again(fake, capsys, tmp_path, monkeypatch):
+    """The list and describe disagree: describe says the patch is DONE, the list still says RUNNING and GCE still
+    says not ready. The operation is waited for once; the next not-ready answer, naming only it, is the refusal."""
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_NOT_READY", "stale")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and "subnetworks/default' is not ready)" in err and f"down --run {RUN}" in err, err
+    verbs = _verbs(fake)
+    assert verbs.count("compute instances create") == 2 and verbs.count("compute operations describe") == 1
+    assert out.count("waiting for its operation operation-1794441048556-subnet-patch") == 1
+
+
+def test_a_refusal_inside_the_not_ready_wait_names_down(fake, capsys, tmp_path, monkeypatch):
+    """The SSH rules exist by then: an operation that cannot be read refuses with the hint that removes them."""
+    clone, sha = _repo(tmp_path)
+    monkeypatch.setenv("FAKE_NOT_READY", "3")
+    monkeypatch.setenv("FAKE_OP_DESCRIBE_FAIL", "1")
+    rc, out, err = _run(capsys, *_up_args(clone, sha, "--yes"))
+    assert rc == 2 and (f"instance {VM}: operation operation-1794441048556-subnet-patch on projects/{PROJECT}/regions/"
+                        f"europe-west3/subnetworks/default could not be read (rc=1; ERROR: (gcloud.compute.operations."
+                        f"describe) Could not fetch resource: | - The service is currently unavailable. code=503): "
+                        f"nothing was created by this call; `python3 -m bench.testvm down --run {RUN} --yes`") in err, err
+    assert {f.stem for f in (fake / "firewalls").glob("*.json")} == set(testvm.firewall_rules(RUN))
+    monkeypatch.delenv("FAKE_OP_DESCRIBE_FAIL")
+    rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
+    assert rc == 0, err
+    assert not list((fake / "firewalls").glob("*.json"))

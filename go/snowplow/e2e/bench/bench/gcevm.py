@@ -50,7 +50,7 @@ import time
 from pathlib import Path
 
 from bench import gke, noanswer
-from bench.identity import error_summary, redact_identity
+from bench.identity import error_summary, redact_identity, redact_text
 
 NETWORK = "default"
 IAP_RANGE = "35.235.240.0/20"          # IAP's TCP-forwarding source range
@@ -109,20 +109,13 @@ def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input
     return p.returncode, p.stdout, p.stderr
 
 
-# gcloud's sentence that names the operator ("This command is authenticated as <account> which is the active
-# account specified by the [core/account] property", in its 403 / 404 / 503 answers): removed whole, from the
-# sentence's start to its end (a "." that ends it; an e-mail's own dots do not)
-_AUTHENTICATED_AS = re.compile(r"[^.\n]*\bauthenticated as\b(?:[^.\n]|\.(?=\S))*\.?")
-
-
 def gcloud_cause(err: str | None) -> str:
     """A failed gcloud call's own words, for its refusal (#1361: "no error code; the error text is withheld" hid
-    run tvsmoke1's `Quota 'FIREWALLS' exceeded`). Only the identity goes: the authenticated-as sentence whole,
-    then bench.identity's redaction (every e-mail, a `User "..."`); then bench.noanswer.cause, #1354's redaction
-    that keeps the cause (credentials removed, lines joined, a long text shortened from its START: gcloud says
-    the cause last). The API's error code, status and message stay."""
-    text = "\n".join(redact_identity(_AUTHENTICATED_AS.sub("", ln)) for ln in (err or "").splitlines())
-    return noanswer.cause(text) or "no error text"
+    run tvsmoke1's `Quota 'FIREWALLS' exceeded`). Only the identity goes (bench.identity.redact_text: the
+    authenticated-as sentence whole, wrapped or not; every e-mail, principal URI, bracketed or quoted account);
+    then bench.noanswer.cause, #1354's redaction that keeps the cause (credentials removed, lines joined, a long
+    text shortened from its START: gcloud says the cause last). The API's error code, status and message stay."""
+    return noanswer.cause(redact_text(err)) or "no error text"
 
 
 # GCE refuses an insert at once, before any operation exists (nothing was made), while a resource it uses is being
@@ -144,36 +137,55 @@ def _op_scope(path: str) -> tuple[str, list[str], list[str]] | None:
     return None
 
 
-def pending_operations(path: str) -> list[dict]:
+def pending_operations(path: str, timeout: float) -> list[dict]:
     """The operations of `path`'s scope that change `path` and have not ended: one unfiltered list (partial errors
-    off), each selected by its targetLink ending in the exact path (an API version may lead it)."""
+    off) within `timeout`, each selected by its targetLink ending in the exact path (an API version may lead it) and
+    a status other than DONE (the list keeps every recent operation, those that ended among them)."""
     scope = _op_scope(path)
     if scope is None:
         return []
     project, flags, _ = scope
     rows = list_json(["compute", "operations", "list", *flags, "--project", project, "--format", "json"],
-                     f"the operations of {' '.join(flags)}")
+                     f"the operations of {' '.join(flags)}", timeout=timeout)
     return [o for o in rows if str(o.get("targetLink", "")).endswith("/" + path) and o.get("status") != "DONE"]
 
 
-def create(args: list[str], *, dry: bool, poll_s: float, what: str) -> tuple[int, str, str]:
+def create(args: list[str], *, dry: bool, poll_s: float, what: str, hint: str) -> tuple[int, str, str]:
     """One create (`gcloud <args>`). When GCE answers that a resource it uses is not ready (NOT_READY: nothing was
     made), each operation still changing that resource is waited for (read by `operations describe` every poll_s
-    until DONE, its name and type printed), and the create is made again; all of it within the call's bound
-    (call_bound). An answer naming no operation that has not ended, or one already waited for, is the create's
-    result, for its caller to refuse with its cause."""
+    until DONE, its name and type printed), and the create is made again. Every call of it (the creates, the list,
+    each describe) gets what is left of ONE deadline, the call's bound (call_bound), and none is made once it is
+    spent: that refuses, with the create's last answer. An answer naming no operation that has not ended, or only
+    ones already waited for, is the create's result, for its caller to refuse with its cause. Every refusal raised
+    here ends with `hint` (what was made before this create is the caller's down to remove)."""
     bound = _CALL_BOUND.get()
     if bound is None:
         raise Refused("a gcloud call with no bound: its tool sets one (gcevm.call_bound)")
     deadline = time.monotonic() + bound
+
+    def spent(last: str) -> Refused:
+        return Refused(f"{what}: the call's bound of {bound:.0f} s is spent; GCE's last answer: {last}: nothing was "
+                       f"created by this call; {hint}")
+
     waited: set[str] = set()
+    last = ""
     while True:
-        rc, out, err = gcloud(args, dry=dry, timeout=max(deadline - time.monotonic(), 1.0))
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise spent(last)
+        rc, out, err = gcloud(args, dry=dry, timeout=left)
         m = NOT_READY.search(err or "") if rc != 0 else None
         if m is None:
             return rc, out, err
+        last = gcloud_cause(err)
         path = m.group(1)
-        ops = [o for o in pending_operations(path) if o.get("name") not in waited]
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise spent(last)
+        try:
+            ops = [o for o in pending_operations(path, left) if o.get("name") not in waited]
+        except Refused as e:
+            raise Refused(f"{what}: {e}; {hint}") from None
         if not ops:
             return rc, out, err
         project, _, dflags = _op_scope(path)
@@ -183,14 +195,13 @@ def create(args: list[str], *, dry: bool, poll_s: float, what: str) -> tuple[int
             while True:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    raise Refused(f"{what}: {path} was still not ready when the call's bound of {bound:.0f} s ended "
-                                  f"(operation {o.get('name')} had not ended): nothing was created by this call")
+                    raise spent(f"{last} (operation {o.get('name')} had not ended)")
                 rc2, out2, err2 = gcloud(["compute", "operations", "describe", str(o.get("name")), *dflags,
                                           "--project", project, "--format", "json"], quiet=True, timeout=left)
                 got = gke._json(out2) if rc2 == 0 else None
                 if not isinstance(got, dict):
                     raise Refused(f"{what}: operation {o.get('name')} on {path} could not be read (rc={rc2}; "
-                                  f"{gcloud_cause(err2)})")
+                                  f"{gcloud_cause(err2)}): nothing was created by this call; {hint}")
                 if got.get("status") == "DONE":
                     break
                 time.sleep(min(poll_s, max(deadline - time.monotonic(), 0.0)))
@@ -345,9 +356,10 @@ def get(args: list[str], path: str, what: str) -> dict | None:
     return got
 
 
-def list_json(args: list[str], what: str) -> list[dict]:
-    """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]")."""
-    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True)
+def list_json(args: list[str], what: str, timeout: float | None = None) -> list[dict]:
+    """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]"). `timeout`:
+    its caller's (else the tool's call bound)."""
+    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True, timeout=timeout)
     try:
         got = json.loads(out) if rc == 0 else None
     except ValueError:

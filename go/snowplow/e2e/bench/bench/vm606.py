@@ -1060,7 +1060,7 @@ def cmd_up(a) -> int:
     # 2. SSH through IAP only, before the VM exists
     for fw, rule in firewall_rules(run).items():
         rc, _out, err = gcevm.create(firewall_create_argv(fw, rule, a.project), dry=not a.yes, poll_s=a.poll_s,
-                                    what=f"firewall rule {fw}")
+                                    what=f"firewall rule {fw}", hint=down_hint(run))
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if a.yes:
@@ -1070,7 +1070,7 @@ def cmd_up(a) -> int:
                           f"create; {down_hint(run)}")
     # 3. the VM
     rc, _out, err = gcevm.create(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at),
-                                dry=not a.yes, poll_s=a.poll_s, what=f"instance {name}")
+                                dry=not a.yes, poll_s=a.poll_s, what=f"instance {name}", hint=down_hint(run))
     if not a.yes:
         _say(f"DRY: would wait for {BOOTSTRAP_MARKER} on {name} (kubectl {KUBECTL_VERSION}, helm {HELM_VERSION}, "
              f"gcloud {GCLOUD_APT_VERSION.split('-')[0]}); nothing was created")

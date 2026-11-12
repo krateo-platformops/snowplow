@@ -678,7 +678,7 @@ def cmd_up(a) -> int:
                     created_at=time.time(), source=src, runs=[], pushes=[])
     for fw, rule in firewall_rules(run).items():
         rc, _o, err = gcevm.create(gcevm.firewall_create_argv(fw, rule, project), dry=not a.yes, poll_s=a.poll_s,
-                                  what=f"firewall rule {fw}")
+                                  what=f"firewall rule {fw}", hint=down_hint(run))
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if a.yes:
@@ -689,7 +689,7 @@ def cmd_up(a) -> int:
         if off:
             raise Refused(f"after their create, {'; '.join(off)}; {down_hint(run)}")
     rc, _o, err = gcevm.create(create_command(run, project, zone, machine["name"], str(sf), terminates_at), dry=not a.yes,
-                              poll_s=a.poll_s, what=f"instance {name}")
+                              poll_s=a.poll_s, what=f"instance {name}", hint=down_hint(run))
     if not a.yes:
         gcevm.say(f"DRY: {machine['name']} ({machine['guestCpus']} vCPU) for --parallelism {a.parallelism}; deletes "
                   f"itself at {terminates_at} (--session-hours {a.session_hours}); would bundle {a.sha} and push it; "

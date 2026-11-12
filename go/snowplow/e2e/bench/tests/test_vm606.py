@@ -65,7 +65,7 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
               "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
-              "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY"):
+              "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -1832,13 +1832,17 @@ def test_up_refuses_before_any_grant_when_the_projects_firewalls_do_not_fit(fake
                                          ("FAKE_CREATE_FAIL", "instances create failed")])
 @pytest.mark.parametrize("cause, words", [("QUOTA_EXCEEDED", ("Quota 'FIREWALLS' exceeded", "QUOTA_EXCEEDED")),
                                           ("ZONE_RESOURCE_POOL_EXHAUSTED", ("ZONE_RESOURCE_POOL_EXHAUSTED",)),
-                                          ("the account", ("Required 'compute.instances.create' permission",))])
+                                          ("the account", ("Required 'compute.instances.create' permission",)),
+                                          ("a workforce principal quoted",
+                                           ("Required 'compute.firewalls.create' permission",)),
+                                          ("a wrapped authenticated-as sentence", ("HTTPError 404",))])
 def test_a_refused_create_names_its_cause_and_never_the_account(fake, capsys, monkeypatch, which, what, cause, words):
     monkeypatch.setenv(which, cause)
     rc, out, err = _up(capsys, monkeypatch)
     assert rc == 2 and f"refusing: {what} (rc=1; ERROR: (gcloud.compute." in err, err
     assert all(w in err for w in words), err
-    assert "PLACEHOLDER-OPERATOR" not in out + err and "authenticated as" not in out + err
+    for leak in ("PLACEHOLDER", "authenticated as", "principal://"):
+        assert leak not in out + err, (leak, err)
 
 
 def test_a_subnetwork_not_ready_is_waited_for_by_its_operation_then_created(fake, capsys, monkeypatch):

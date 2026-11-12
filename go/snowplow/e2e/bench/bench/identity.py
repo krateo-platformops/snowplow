@@ -9,9 +9,14 @@ verdict.json. Two policies, one place:
   (run606.sh kerr_line pipes through this file) with every identity
   replaced by <redacted>: `User "…"`, `users "…"`, whatever follows
   "authenticated as" (an e-mail, a numeric id, system:serviceaccount:…),
-  any e-mail address, a Secret's name (`secrets/…`, `secrets "…"`) and a
+  any e-mail address, a principal URI of an external IdP's account and a
+  workforce / workload pool's path, an account gcloud names in brackets or
+  quotes (#1361), a Secret's name (`secrets/…`, `secrets "…"`) and a
   certificate's `CN=…`. A closing ")" or "," stays. bench/logscrub.py runs
   it over snowplow's non-JSON (klog) log lines too (#919).
+- redact_text(text): a whole multi-line error text kept for its cause
+  (bench.gcevm.gcloud_cause): the authenticated-as sentence dropped whole,
+  wrapped across lines or not, then redact_identity on every line.
 - error_summary(stderr): a failed gcloud / kubectl call as bench.gke logs
   and records it — its code only (`ResponseError: code=<n>`, or `Error from
   server (<Reason>)`), never its free text (#900 B1), and passed through
@@ -31,7 +36,19 @@ REDACTED = "<redacted>"
 _RULES = (
     (re.compile(r'User "[^"]*"'), 'User "<redacted>"'),
     (re.compile(r'users "[^"]*"'), 'users "<redacted>"'),
-    (re.compile(r"authenticated as:? [^)\s,]+"), "authenticated as <redacted>"),
+    # #1361 review B1: identities that are no e-mail. An external IdP's account through workforce identity
+    # federation is a principal URI (principal://iam.googleapis.com/locations/global/workforcePools/<pool>/subject/
+    # <subject>, principalSet://.../group/<group>), whole, up to the punctuation that closes it; a pool's path
+    # without its scheme; an account gcloud names in brackets ("Your current active account [<account>] does not
+    # have any valid credentials", "[<account>] does not have permission to access ...") or in quotes ("for
+    # principal '<account>'"), whatever its shape
+    (re.compile(r"""\bprincipal(?:Set)?://\S+?(?=["'\]),.;:]*(?:\s|$))"""), "<redacted>"),
+    (re.compile(r"""\b(workforcePools|workloadIdentityPools)/[^\s"'\]),]+"""), r"\1/<redacted>"),
+    (re.compile(r"(?i)\b(account|principal|member|identity|user)(\s*)\[[^\]\n]*\]"), r"\1\2[<redacted>]"),
+    (re.compile(r"\[[^\]\n]*\](?=\s+does not have\b)"), "[<redacted>]"),
+    (re.compile(r"""(?i)\b(account|principal|member|identity)(\s+)(['"])[^'"\n]*\3"""), r"\1\2\3<redacted>\3"),
+    # "authenticated as" and the account after it, a line break between them included (gcloud wraps its text)
+    (re.compile(r"authenticated\s+as:?\s+[^)\s,]+"), "authenticated as <redacted>"),
     # an e-mail address: a local part, "@", and a MAIL-SHAPED domain: dot-separated
     # labels with no ":" and a letters-only last label. So never an OCI digest
     # reference (`name@sha256:<hex>`: an algorithm and a colon after the "@", no
@@ -64,6 +81,21 @@ def redact_identity(line: str) -> str:
     for rx, rep in _RULES:
         line = rx.sub(rep, line)
     return line
+
+
+# gcloud's sentence that names the operator ("This command is authenticated as <account> which is the active
+# account specified by the [core/account] property."), whole, from its start to its end, across the line breaks
+# gcloud wraps it with: it ends at "[core/account] property", or at a "." followed by a space or the end (an
+# e-mail's or a URI's own dots are followed by more of it). A sentence that never ends takes the rest of the text.
+_AUTHENTICATED_AS = re.compile(r"[^.\n]*\bauthenticated\s+as\b(?:[^.]|\.(?=\S))*?"
+                               r"(?:\[core/account\]\s+property\b\.?|\.(?=\s|$)|$)")
+
+
+def redact_text(text: str | None) -> str:
+    """A tool's whole error text (several lines), for a record that keeps its cause (bench.gcevm.gcloud_cause): the
+    authenticated-as sentence removed whole, wrapped or not, then every line through redact_identity."""
+    t = _AUTHENTICATED_AS.sub("", text or "")
+    return "\n".join(redact_identity(ln) for ln in t.splitlines())
 
 
 # a line of run606's own log (`[hh:mm:ss] RUN: kubectl ...`): it shares the captured

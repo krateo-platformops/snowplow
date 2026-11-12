@@ -45,9 +45,132 @@ def test_gcloud_cause_keeps_each_cause_and_drops_the_account(key):
     got = gcevm.gcloud_cause(_text(key))
     for word in CAUSES[key]:
         assert word in got, (word, got)
-    assert "PLACEHOLDER-OPERATOR" not in got and "@" not in got and "authenticated as" not in got, got
+    _no_identity(got)
+    assert "@" not in got
     # the code-only summary it replaces had no word for any of them (the instrument with no vocabulary)
     assert identity.error_summary(_text(key)).startswith("no error code")
+
+
+# #1361 review B1: an account that is no e-mail, in each form gcloud and the IAM API name one; every line through the
+# bench's one redaction (bench.identity, so every caller of it), the subject an IdP's own opaque id
+SUBJECT = "0f3c2a91-77aa-4c1e-9d2b-3e1a5b6c7d8e"
+PRINCIPAL = f"principal://iam.googleapis.com/locations/global/workforcePools/acme-pool/subject/{SUBJECT}"
+NON_EMAIL = [
+    f"Your current active account [{PRINCIPAL}] does not have any valid credentials",
+    f"{PRINCIPAL} does not have compute.instances.create access to the Google Cloud project.",
+    f"Required 'compute.firewalls.create' permission for 'projects/p/global/firewalls/x' for principal '{PRINCIPAL}'",
+    f'member "{PRINCIPAL}" is not allowed',
+    f"principalSet://iam.googleapis.com/locations/global/workforcePools/acme-pool/group/{SUBJECT}: denied",
+    f"granted to locations/global/workforcePools/acme-pool/subject/{SUBJECT} (no scheme)",
+    f"[{SUBJECT}] does not have permission to access projects instance [p]",
+    f"Your current active account [{SUBJECT}] does not have any valid credentials",
+    f"Reauthentication for account [{SUBJECT}] failed; run gcloud auth login",
+    f"for account '{SUBJECT}'",
+]
+
+
+@pytest.mark.parametrize("line", NON_EMAIL)
+def test_an_identity_that_is_no_email_is_redacted_everywhere(line):
+    for out in (identity.redact_identity(line), identity.redact_text(line), gcevm.gcloud_cause(line),
+                identity.error_summary(line), " | ".join(identity.summarize(line))):
+        assert SUBJECT not in out and "acme-pool" not in out and "principal://" not in out, out
+
+
+def test_a_wrapped_authenticated_as_sentence_goes_whole():
+    text = ("ERROR: (gcloud.compute.networks.describe) HTTPError 404: The resource 'projects/p/global/networks/n' was "
+            f"not found. This command is authenticated as\n{PRINCIPAL} which is the active account specified by the\n"
+            "[core/account] property.\n - next line stays\n")
+    assert identity.redact_text(text) == ("ERROR: (gcloud.compute.networks.describe) HTTPError 404: The resource "
+                                          "'projects/p/global/networks/n' was not found.\n - next line stays")
+    # and line by line (redact_identity's callers), the account on the next line still goes
+    assert all(SUBJECT not in identity.redact_identity(ln) for ln in text.splitlines())
+    assert identity.redact_identity(f"authenticated as\n{SUBJECT}") == "authenticated as <redacted>"
+
+
+def _no_identity(text: str) -> None:
+    for leak in ("PLACEHOLDER", "@example.invalid", "authenticated as", "principal://", "workforcePools/P"):
+        assert leak not in text, (leak, text)
+
+
+# ─── the not-ready wait: one deadline, every call within what is left of it (review m2) ─
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, s):
+        self.now += s
+
+
+NOT_READY_ERR = ("ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The resource "
+                 f"'projects/{PROJECT}/regions/europe-west3/subnetworks/default' is not ready\n")
+OP = {"name": "op-1", "operationType": "compute.subnetworks.patch", "status": "RUNNING",
+      "targetLink": f"https://www.googleapis.com/compute/beta/projects/{PROJECT}/regions/europe-west3/subnetworks/default"}
+
+
+def _scripted(monkeypatch, durations: dict, done_after: int | None):
+    """gcevm's gcloud, played: each call takes durations[verb] seconds of the fake clock and is recorded with the
+    timeout it was given and the time left when it started; describe says DONE on its `done_after`-th call."""
+    clock, calls, n = _Clock(), [], {"describe": 0}
+    monkeypatch.setattr(gcevm, "time", clock)
+
+    def gcloud(args, *, dry=False, env=None, input_data=None, timeout=None, quiet=False):
+        verb = args[2] if args[:2] == ["compute", "operations"] else "create"
+        calls.append({"verb": verb, "timeout": timeout, "at": clock.now})
+        clock.now += durations[verb]
+        if verb == "create":
+            return 1, "", NOT_READY_ERR
+        if verb == "list":
+            return 0, json.dumps([OP]), ""
+        n["describe"] += 1
+        return 0, json.dumps({**OP, "status": "DONE" if n["describe"] == done_after else "RUNNING"}), ""
+
+    monkeypatch.setattr(gcevm, "gcloud", gcloud)
+    return clock, calls
+
+
+def test_every_call_of_the_wait_gets_what_is_left_of_one_deadline_and_none_runs_past_it(monkeypatch):
+    clock, calls = _scripted(monkeypatch, {"create": 10, "list": 10, "describe": 10}, done_after=None)
+    with gcevm.call_bound(100), pytest.raises(gcevm.Refused) as e:
+        gcevm.create(["compute", "instances", "create", "x"], dry=False, poll_s=15, what="instance x", hint="HINT")
+    msg = str(e.value)
+    assert msg.startswith("instance x: the call's bound of 100 s is spent; GCE's last answer: ") and "is not ready" in msg
+    assert msg.endswith("(operation op-1 had not ended): nothing was created by this call; HINT")
+    assert [c["verb"] for c in calls][:3] == ["create", "list", "describe"]
+    for c in calls:
+        assert c["timeout"] == pytest.approx(100 - c["at"]) and c["at"] < 100, c       # the list's too: never its own
+    assert clock.now <= 100 + 10                                                       # the last call's own length
+
+
+def test_a_create_made_again_gets_only_what_is_left_no_floor(monkeypatch):
+    """The patch ends 0.5 s before the deadline: the create is made again within 0.5 s, not a floor of its own;
+    once the deadline passes, the refusal says GCE's last answer and the hint."""
+    clock, calls = _scripted(monkeypatch, {"create": 10, "list": 10, "describe": 79.5}, done_after=1)
+    with gcevm.call_bound(100), pytest.raises(gcevm.Refused) as e:
+        gcevm.create(["compute", "instances", "create", "x"], dry=False, poll_s=15, what="instance x", hint="HINT")
+    creates = [c for c in calls if c["verb"] == "create"]
+    assert len(creates) == 2 and creates[1]["timeout"] == pytest.approx(0.5)
+    assert "the call's bound of 100 s is spent" in str(e.value) and str(e.value).endswith("; HINT")
+    assert "subnetworks/default' is not ready" in str(e.value)
+
+
+def test_a_list_that_fails_inside_the_wait_refuses_with_the_hint(monkeypatch):
+    clock, calls = _scripted(monkeypatch, {"create": 1, "list": 1, "describe": 1}, done_after=1)
+    real = gcevm.gcloud
+
+    def gcloud(args, **kw):
+        if args[:3] == ["compute", "operations", "list"]:
+            return 1, "", "ERROR: (gcloud.compute.operations.list) Some requests did not succeed:\n - code=503\n"
+        return real(args, **kw)
+
+    monkeypatch.setattr(gcevm, "gcloud", gcloud)
+    with gcevm.call_bound(100), pytest.raises(gcevm.Refused) as e:
+        gcevm.create(["compute", "instances", "create", "x"], dry=False, poll_s=15, what="instance x", hint="HINT")
+    assert str(e.value).startswith("instance x: the operations of --regions europe-west3 could not be listed (rc=1; ")
+    assert str(e.value).endswith("; HINT")
 
 
 def test_the_authenticated_as_sentence_goes_whole_and_the_rest_of_the_line_stays():

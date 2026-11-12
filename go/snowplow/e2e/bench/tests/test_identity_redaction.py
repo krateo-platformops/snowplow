@@ -66,13 +66,16 @@ def test_an_email_is_still_redacted(line, want):
 
 # ─── every call site: a digest survives, an e-mail and a user do not ────────
 
+# #1361 review B1: and an external IdP's account, which is no e-mail (a workforce principal, its subject opaque)
+WORKFORCE = "principal://iam.googleapis.com/locations/global/workforcePools/acme-pool/subject/0f3c2a91-77aa-4c1e"
 LINE = (f'pulled {DIGESTS[0]} for User "scaleuser-0001" (owner someone@example.invalid); '
-        f"next {DIGESTS[1]}")
+        f"next {DIGESTS[1]} by {WORKFORCE} now")
 
 
 def _check(out: str):
     assert DIGESTS[0] in out and DIGESTS[1] in out, out
     assert "someone@example.invalid" not in out and "scaleuser-0001" not in out, out
+    assert "0f3c2a91-77aa-4c1e" not in out and "acme-pool" not in out, out
 
 
 def _script(line):
