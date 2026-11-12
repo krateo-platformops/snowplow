@@ -3,11 +3,12 @@
 #
 #   1. the whole program compiles for js/wasm;
 #   2. go vet passes for js/wasm on the packages that carry browser-only code;
-#   3. the browser bridge's tests run for js/wasm under Go's own wasm runner (Node.js);
+#   3. the browser bridge's and the sandbox fake apiserver's tests run for js/wasm under Go's
+#      own wasm runner (Node.js);
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
 #   5. the server build contains none of the browser code (main_browser_build_test.go:
-#      no internal/browserbridge, no syscall/js, credhttp.BrowserEgress nil,
+#      no internal/browserbridge, no internal/sandbox/..., no syscall/js, credhttp.BrowserEgress nil,
 #      credhttp.PlumbingClient the identity).
 #
 # Run from go/snowplow. Needs node on PATH for steps 3 and 4.
@@ -19,12 +20,12 @@ echo "== js/wasm: build"
 GOOS=js GOARCH=wasm go build -o /dev/null .
 
 echo "== js/wasm: vet"
-GOOS=js GOARCH=wasm go vet . ./internal/browserbridge ./internal/credhttp ./internal/testsupport/jsfetch
+GOOS=js GOARCH=wasm go vet . ./internal/browserbridge ./internal/sandbox/... ./internal/credhttp ./internal/testsupport/jsfetch
 
-echo "== js/wasm: bridge tests under Node"
+echo "== js/wasm: bridge and fake apiserver tests under Node"
 command -v node >/dev/null || { echo "node is required to run the js/wasm tests" >&2; exit 1; }
 GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
-  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge
+  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge ./internal/sandbox/...
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
 # "node": Go's in-process network, where BrowserEgress and PlumbingClient must

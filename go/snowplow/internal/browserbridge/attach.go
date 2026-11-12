@@ -24,27 +24,50 @@ const HostAttach = "snowplowBridgeAttach"
 // runs in a goroutine and reports to sink (head, chunk, end, error). bridge.js
 // numbers the requests, so a cancel for a request that has finished is a
 // no-op rather than a call into a released function.
-func Attach(addr string) {
+//
+// Each Target adds an entry under targets[name] with its own serve and
+// cancel. A target's requests are relayed (Relay), not forwarded: bridge.js's
+// network seam sends it snowplow's own egress to that server's address.
+func Attach(addr string, targets ...Target) {
 	host := js.Global().Get(HostAttach)
 	if host.Type() != js.TypeFunction {
 		panic("browserbridge: " + HostAttach + " is not defined; this program runs only under snowplow-wasm's bridge.js")
 	}
-	b := &bridge{addr: addr, live: map[int]context.CancelFunc{}}
+	b := &bridge{addr: addr, live: map[int]context.CancelFunc{}, forward: Forward}
 	go func() {
-		// The server is wired by main in this same process; there is
+		// The servers are wired by main in this same process; there is
 		// nothing to give up on, so this waits for as long as it takes.
+		for _, t := range targets {
+			_ = WaitAccepting(context.Background(), t.Addr)
+		}
 		_ = WaitAccepting(context.Background(), addr)
+		named := map[string]any{}
+		for _, t := range targets {
+			t := t
+			tb := &bridge{addr: t.Addr, live: map[int]context.CancelFunc{}, forward: func(ctx context.Context, addr string, req Request, sink Sink) {
+				Relay(ctx, addr, t.Name, req, sink)
+			}}
+			named[t.Name] = map[string]any{"serve": js.FuncOf(tb.serve), "cancel": js.FuncOf(tb.cancel)}
+		}
 		host.Invoke(js.ValueOf(map[string]any{
-			"serve":  js.FuncOf(b.serve),
-			"cancel": js.FuncOf(b.cancel),
+			"serve":   js.FuncOf(b.serve),
+			"cancel":  js.FuncOf(b.cancel),
+			"targets": named,
 		}))
 	}()
 }
 
+// Target is another server in this program that bridge.js reaches by name.
+type Target struct {
+	Name string
+	Addr string
+}
+
 type bridge struct {
-	addr string
-	mu   sync.Mutex
-	live map[int]context.CancelFunc
+	addr    string
+	mu      sync.Mutex
+	live    map[int]context.CancelFunc
+	forward func(ctx context.Context, addr string, req Request, sink Sink)
 }
 
 func (b *bridge) serve(_ js.Value, args []js.Value) any {
@@ -55,7 +78,7 @@ func (b *bridge) serve(_ js.Value, args []js.Value) any {
 	b.mu.Unlock()
 	go func() {
 		defer b.finish(id)
-		Forward(ctx, b.addr, req, sink)
+		b.forward(ctx, b.addr, req, sink)
 	}()
 	return nil
 }
