@@ -5,7 +5,8 @@ and the run measured on for hours with no browser session.
 
   - k6/browser.js signs in through the contract (pageload.LOGIN = login_contract.SELECTORS):
     #login_basic_username / #login_basic_password in form#login_basic, submitted by that form's
-    "Sign in" button. No fallback to the old ids.
+    one submit control, whatever its text (1.8.36 .. 1.8.39 "Sign In", 1.8.40 "Sign in"). No
+    fallback to the old ids.
   - run606.sh's login-contract step refuses, before any cluster, a frontend older than the first
     release carrying #659 (1.8.36), read from the installer's pin or FRONTEND_TAG, by name.
   - browser.js's sign-in gate: no session signed in within its bound -> k6 exits 99 (and aborts a
@@ -50,7 +51,7 @@ def test_the_first_contract_release_is_1_8_36():
     commit is in 1.8.36 .. 1.8.40 and not in 1.8.35."""
     assert login_contract.FIRST_RELEASE == "1.8.36" and login_contract.CONTRACT_PR == "#659"
     assert login_contract.SELECTORS == {"form": "form#login_basic", "username": "#login_basic_username",
-                                        "password": "#login_basic_password", "submit": "Sign in"}
+                                        "password": "#login_basic_password", "submit": 'button[type="submit"]'}
 
 
 @pytest.mark.parametrize("tag", ["1.8.36", "1.8.40", "1.9.0", "1.10.1", "2.0.0"])
@@ -168,11 +169,13 @@ def test_browser_js_signs_in_through_the_contract_only():
     assert "#basic_" not in src and "press('Enter')" not in src
     assert "page.locator(LOGIN.username).fill(user, opts)" in body
     assert "page.locator(LOGIN.password).fill(CFG.password, opts)" in body
-    # the submit is the "Sign in" button OF form#login_basic, never a page-wide button
+    # the submit is form#login_basic's own submit control, never a page-wide button, never by its text
     assert "const form = page.locator(LOGIN.form)" in body
-    assert "const submit = form.getByRole('button', { name: LOGIN.submit, exact: true })" in body
-    assert body.index("submit.click(opts)") < body.index("await settled(page, null)")
-    for s in ("getByLabel", "autocomplete", "button[type"):
+    assert "const submit = form.locator(LOGIN.submit)" in body
+    # exactly one, checked once the form is rendered (after the fills), before the click
+    assert (body.index("fill(CFG.password, opts)") < body.index("const submits = await submit.count()")
+            < body.index("if (submits !== 1)") < body.index("submit.click(opts)") < body.index("await settled(page, null)"))
+    for s in ("getByLabel", "getByRole", "getByText", "has-text", "autocomplete", "Sign in", "Sign In"):
         assert s not in body, s
 
 
@@ -343,7 +346,7 @@ def test_run606_after_the_drive_a_non_zero_browser_exit_stays_the_verdicts(harne
 
 def _browser(tmp_path, *, dom, signin_ms=300, sessions=2, duration_s=12, k6dir=None, timeout=240):
     """k6/browser.js in the pinned k6 browser image against the fixture SPA serving `dom`."""
-    net = f"k6lc-{os.getpid()}-{dom}-{signin_ms}"
+    net = f"k6lc-{os.getpid()}-{dom.replace('.', '')}-{signin_ms}"
     spa = f"{net}-spa"
     out = tmp_path / "out"
     out.mkdir(mode=0o777)
@@ -390,15 +393,30 @@ def _first_signins(tmp_path):
 
 
 @needs_docker
-def test_in_chrome_the_1_8_40_page_signs_in_through_form_login_basic(tmp_path):
-    """frontend 1.8.40's login page, an LDAPConfig's form first with the same labels: every
-    session signs in through form#login_basic's "Sign in" (the LDAP button signs nobody in)."""
-    p, o = _browser(tmp_path, dom="contract", sessions=3)          # the evaluator's bar is 3 sessions
+@pytest.mark.parametrize("dom", ["1.8.40", "1.8.36"])
+def test_in_chrome_every_release_the_gate_accepts_signs_in_through_form_login_basic(tmp_path, dom):
+    """The login page of each release in the gate's range, as LoginForm.tsx renders it: 1.8.40
+    ("Sign in") and 1.8.36 .. 1.8.39 ("Sign In"), an LDAPConfig's form first with the same
+    labels: every session signs in through form#login_basic's own submit control (the LDAP
+    form's signs nobody in)."""
+    p, o = _browser(tmp_path, dom=dom, sessions=3)          # the evaluator's bar is 3 sessions
     assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
     c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
     assert c["result"] == "PASS" and c["value"] == 3
     assert _first_signins(tmp_path) == [("s1", 0), ("s1", 1), ("s2", 0), ("s2", 1), ("s3", 0), ("s3", 1)]
     assert "could not be filled" not in p.stdout + p.stderr
+
+
+@needs_docker
+def test_in_chrome_a_form_with_two_submit_controls_is_refused_by_name(tmp_path):
+    """No release has one, and which control signs in is not the contract's: every session stops,
+    by name, before it clicks either (either would sign in on this page), and the gate fails."""
+    p, o = _browser(tmp_path, dom="two-submits")
+    err = p.stdout + p.stderr
+    assert p.returncode == 99, err[-3000:]
+    assert ('the login form form#login_basic holds 2 button[type="submit"] controls, not exactly 1' in err
+            or 'the login form form#login_basic holds 2 button[type=\\"submit\\"] controls, not exactly 1' in err), err[-3000:]
+    assert _first_signins(tmp_path) == [("s1", 0), ("s2", 0)]
 
 
 @needs_docker
@@ -422,7 +440,7 @@ def test_in_chrome_a_sign_in_that_never_lands_is_aborted_at_the_bound(tmp_path):
     without the gate, it would walk routes for its whole duration (600 s here) signed out. The
     gate aborts the whole test at its bound (27 s with this config); the 240 s subprocess bound
     is what a missing abort would hit."""
-    p, o = _browser(tmp_path, dom="contract", signin_ms=10**7, duration_s=600)
+    p, o = _browser(tmp_path, dom="1.8.40", signin_ms=10**7, duration_s=600)
     err = p.stdout + p.stderr
     assert p.returncode == 99, err[-3000:]
     assert ("thresholds on metrics 'browser_first_signins' were crossed; at least one has abortOnFail enabled, "

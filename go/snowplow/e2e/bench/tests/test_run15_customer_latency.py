@@ -575,7 +575,9 @@ def test_cli_evaluate_feeds_churn_records_to_the_phase_reports(tmp_path, capsys)
 def _run606(env_extra):
     env = dict(os.environ, PYTHONPATH=str(BENCH), RUN_NAME="snowplow-bench-r15lat", INSTALLER_VERSION="0.3.422",
                SNOWPLOW_TAG="1.12.46", BENCH_606_DRY_RUN="1",
-               EXPECTED_IMAGE_DIGEST="sha256:" + "0" * 64, **env_extra)
+               EXPECTED_IMAGE_DIGEST="sha256:" + "0" * 64,
+               # installer 0.3.422 pins frontend 1.8.4, older than the login form contract (run 26d)
+               FRONTEND_TAG="1.8.40", EXPECTED_FRONTEND_DIGEST="sha256:" + "1a" * 32, **env_extra)
     for k in [k for k, v in env.items() if v is None]:
         env.pop(k)
     return subprocess.run(["bash", str(BENCH / "run606.sh")], env=env, capture_output=True,
@@ -916,7 +918,10 @@ def test_pair_dry_run_with_the_real_run606(tmp_path):
                OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), BENCH_606_DRY_RUN="1",
                INSTALLER_VERSION="0.3.422", RUN_NAME_A=NA, RUN_NAME_B=NB,
                SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
-               EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B)
+               EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B,
+               # installer 0.3.422 pins frontend 1.8.4, older than the login form contract (run 26d)
+               FRONTEND_TAG_A="1.8.40", FRONTEND_TAG_B="1.8.40",
+               EXPECTED_FRONTEND_DIGEST_A="sha256:" + "1a" * 32, EXPECTED_FRONTEND_DIGEST_B="sha256:" + "1a" * 32)
     p = subprocess.run(["bash", str(repo / "run606_pair.sh")], env=env, capture_output=True, text=True,
                        timeout=300, check=False)
     quotas_stop()

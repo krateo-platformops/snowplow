@@ -5,9 +5,13 @@ THE CONTRACT. frontend#659 ("fix(login): four #657 follow-ups") renamed the antd
 literal 'basic' to a name derived from its /strategies entry (ui/src/pages/Login/LoginForm/
 LoginForm.tsx, loginFormNameOf: `login_<kind>` for basic, `login_<kind>_<name>` for an
 LDAPConfig named <name>). antd prefixes that name to every field id, so basic sign-in is
-`#login_basic_username` / `#login_basic_password` inside `form#login_basic`, submitted with that
-form's "Sign in" button; frontend pins it in ui/src/pages/Login/AuthMethods/AuthMethods.ids.test.tsx.
-Labels and autocomplete are NOT selectors: with two strategies on the page both repeat.
+`#login_basic_username` / `#login_basic_password` inside `form#login_basic`; frontend pins the ids
+in ui/src/pages/Login/AuthMethods/AuthMethods.ids.test.tsx. The form is submitted by its own
+submit control (`form#login_basic button[type="submit"]`: antd's htmlType='submit', one per form
+in every release since #659; k6/browser.js refuses a form holding any other number). Not the
+button's TEXT: it is not pinned, and it changed inside the contract's range (1.8.36 .. 1.8.39
+render "Sign In", 1.8.40 "Sign in"; read from LoginForm.tsx at each tag). Labels and autocomplete
+are not selectors either: with two strategies on the page both repeat.
 k6/browser.js signs in through exactly these (SELECTORS; a test holds the two equal).
 
 THE FIRST RELEASE CARRYING IT, read from the frontend repository, not from dates (2026-11-12):
@@ -46,7 +50,7 @@ CONTRACT_PR = "#659"
 FIRST_RELEASE = "1.8.36"
 #: what k6/browser.js signs in through (basic login); a test holds browser.js to these strings
 SELECTORS = {"form": "form#login_basic", "username": "#login_basic_username",
-             "password": "#login_basic_password", "submit": "Sign in"}
+             "password": "#login_basic_password", "submit": 'button[type="submit"]'}   # inside "form"
 _RELEASE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 

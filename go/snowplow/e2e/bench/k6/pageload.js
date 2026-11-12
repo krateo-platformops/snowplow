@@ -390,15 +390,17 @@ export function recordOps (r, tags, timeoutMs, actionAt) {
 // Run 26d (frontend 1.8.40: 0 of 5 sessions signed in): the login form contract, frontend#659
 // (ui/src/pages/Login/LoginForm/LoginForm.tsx loginFormNameOf; pinned by
 // ui/src/pages/Login/AuthMethods/AuthMethods.ids.test.tsx). Basic login is the form named
-// `login_basic`, whose field ids antd prefixes with that name, submitted by its own "Sign in"
-// button. Never a label or autocomplete: with two strategies on the page both repeat, and an
-// LDAPConfig's form carries the same labels. bench/login_contract.py SELECTORS holds the same
-// strings and refuses a frontend older than the first release carrying them (1.8.36).
+// `login_basic`, whose field ids antd prefixes with that name, submitted by that form's own
+// submit control (antd htmlType='submit', exactly one per form). Never a label, a button's text or
+// autocomplete: with two strategies on the page the labels repeat, and the button's text is not
+// part of the contract (1.8.36-1.8.39 render "Sign In", 1.8.40 "Sign in").
+// bench/login_contract.py SELECTORS holds the same strings and refuses a frontend older than the
+// first release carrying them (1.8.36).
 export const LOGIN = {
   form: 'form#login_basic',
   username: '#login_basic_username',
   password: '#login_basic_password',
-  submit: 'Sign in',
+  submit: 'button[type="submit"]',      // inside `form`
 }
 
 // The time after which a session's first sign-in can no longer land, from the script's own

@@ -7,7 +7,7 @@
 //   - signs in through the UI: /login, the antd form `login_basic` (username,
 //     password; frontend#659's contract, pageload.LOGIN, frontend >= 1.8.36:
 //     bench/login_contract.py refuses an older one), submitted by its own
-//     "Sign in" button; the SPA
+//     (single) submit control, whatever its text; the SPA
 //     sends GET {AUTHN_API_BASE_URL}{path} with Basic auth (pages/Login/
 //     Login.tsx:78-86), stores the payload in localStorage K_user (:90) and
 //     navigates (:92) — `/` redirects to the first menu route (widgets/Menu/
@@ -275,7 +275,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
     const before = k > 0 ? learnedCounts(prevToken) : null
     const opts = { timeout: CFG.pageTimeoutMs }
     const form = page.locator(LOGIN.form)
-    const submit = form.getByRole('button', { name: LOGIN.submit, exact: true })
+    const submit = form.locator(LOGIN.submit)
     try {
       await page.locator(LOGIN.username).fill(user, opts)
       await page.locator(LOGIN.password).fill(CFG.password, opts)
@@ -284,6 +284,13 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       // session ends here, as an uncaught error carrying this message only
       throw new Error(`session ${s.name}: the login form ${LOGIN.form} (${LOGIN.username}, ${LOGIN.password}) ` +
         `could not be filled: ${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
+    }
+    // the form is rendered (its fields took the fills): it holds exactly one submit control, or
+    // which one submits is not the contract's to say
+    const submits = await submit.count()
+    if (submits !== 1) {
+      throw new Error(`session ${s.name}: the login form ${LOGIN.form} holds ${submits} ${LOGIN.submit} ` +
+        'controls, not exactly 1: which one signs in is not the contract\'s')
     }
     // the first page's clock starts when the app leaves /login (pageload.js)
     await page.evaluate(() => {
@@ -295,7 +302,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
     try {
       await submit.click(opts)
     } catch (e) {
-      throw new Error(`session ${s.name}: the "${LOGIN.submit}" button of ${LOGIN.form} could not be clicked: ` +
+      throw new Error(`session ${s.name}: the ${LOGIN.submit} control of ${LOGIN.form} could not be clicked: ` +
         `${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
     }
     const first = await settled(page, null)

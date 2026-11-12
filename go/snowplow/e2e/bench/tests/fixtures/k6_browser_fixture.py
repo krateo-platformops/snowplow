@@ -1,13 +1,17 @@
 """A tiny SPA with the portal's observable contract, for running k6/browser.js
 in real Chrome under test (tests/test_k6_830.py, #831 gate):
 
-  /login       DOM=contract (the default): frontend 1.8.40's page, frontend#659's
+  /login       DOM=1.8.40 (the default): frontend 1.8.40's page, frontend#659's
                contract: an LDAPConfig's form FIRST (form#login_ldap_corp, the
                same "Username" / "Password" labels, its own "LDAP sign in"
-               button, which signs nobody in), then basic's form#login_basic
-               (#login_basic_username, #login_basic_password) and its "Sign in"
-               submit button. DOM=old: the page before #659 (the antd form ids
-               #basic_username, #basic_password; Enter). Either "signs in" after
+               submit button, which signs nobody in), then basic's
+               form#login_basic (#login_basic_username, #login_basic_password)
+               and its "Sign in" submit button. DOM=1.8.36: the same page as
+               1.8.36 .. 1.8.39 render it ("Sign In", "LDAP Sign In").
+               DOM=two-submits: 1.8.40's with a second submit button in
+               form#login_basic (no release has one). DOM=old: the page before
+               #659 (the antd form ids #basic_username, #basic_password;
+               Enter). Either "signs in" after
                SIGNIN_MS (authn's x509 login), then the app navigates to
                /dashboard (history.pushState, like Login.tsx:92)
   /__seen      every GET path served so far (a test's proof of what was reached)
@@ -23,7 +27,7 @@ in real Chrome under test (tests/test_k6_830.py, #831 gate):
   /debug/vars  (#935) Bearer-only (401 without): snowplow's two learned-class
                counters; a class is "learned" the first time its token reads
 
-Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS [contract|old]"""
+Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS [1.8.40|1.8.36|two-submits|old]"""
 import http.server
 import json
 import sys
@@ -31,9 +35,9 @@ import threading
 import time
 
 PORT, SIGNIN_MS, SKEL_MS, PAGE_MS = (int(x) for x in sys.argv[1:5])
-DOM = sys.argv[5] if len(sys.argv) > 5 else "contract"
-if DOM not in ("contract", "old"):
-    sys.exit(f"DOM must be contract or old, got {DOM!r}")
+DOM = sys.argv[5] if len(sys.argv) > 5 else "1.8.40"
+if DOM not in ("1.8.40", "1.8.36", "two-submits", "old"):
+    sys.exit(f"DOM must be 1.8.40, 1.8.36, two-submits or old, got {DOM!r}")
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>fixture</title></head>
 <body><ul id="menu"></ul><div id="content"></div><script>
@@ -70,13 +74,18 @@ function render (path) {
       });
       return;
     }
-    // antd: the form's name is its id and every field id's prefix; the button's label in a span
-    const form = (name, button) => '<section><form id="' + name + '">' +
+    // antd: the form's name is its id and every field id's prefix; the button's label in a span.
+    // The labels as LoginForm.tsx renders them: 1.8.36 .. 1.8.39 "Sign In" / "LDAP Sign In",
+    // 1.8.40 "Sign in" / "LDAP sign in"
+    const v36 = DOM === '1.8.36';
+    const submit = (text) => '<button type="submit" class="ant-btn"><span>' + text + '</span></button>';
+    const form = (name, button, extra) => '<section><form id="' + name + '">' +
       '<label for="' + name + '_username">Username</label><input id="' + name + '_username" autocomplete="username">' +
       '<label for="' + name + '_password">Password</label>' +
       '<input id="' + name + '_password" type="password" autocomplete="current-password">' +
-      '<button type="submit" class="ant-btn"><span>' + button + '</span></button></form></section>';
-    content.innerHTML = form('login_ldap_corp', 'LDAP sign in') + form('login_basic', 'Sign in') +
+      submit(button) + (extra || '') + '</form></section>';
+    content.innerHTML = form('login_ldap_corp', v36 ? 'LDAP Sign In' : 'LDAP sign in') +
+      form('login_basic', v36 ? 'Sign In' : 'Sign in', DOM === 'two-submits' ? submit('Sign in again') : '') +
       '<div id="login-error"></div>';
     document.getElementById('login_ldap_corp').addEventListener('submit', (e) => {
       e.preventDefault();
