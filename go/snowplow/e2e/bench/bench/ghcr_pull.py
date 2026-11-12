@@ -181,12 +181,16 @@ PARSE_BOUND_S = RENDER_BOUND_S
 #: agentgateway-controller 0.2.0 17,621; alert-provider 0.2.53 7,451; github-provider-kog 0.6.0 1,644;
 #: krateo-marketplace-catalog 0.1.2 681. Tar members (2026-11-01): github-provider-kog 0.6.0 125;
 #: agentgateway-policies 0.2.18 41; agentgateway-controller 0.2.0 30; alert-provider 0.2.53 8;
-#: krateo-marketplace-catalog 0.1.2 6. tests/fixtures/ghcr_measured_0_3_468.json
-#: holds that record, and a test pins REAL_LARGEST to it. Every run records its own under
+#: krateo-marketplace-catalog 0.1.2 6. Deepest (maps and lists, the top one counted: NEST_MAX below;
+#: a chart's own files / its render, 2026-11-12, the same versions from a local helm cache rendered
+#: with installer 0.3.468's componentValues): agentgateway-controller 0.2.0 4 / 40 (its CRDs'
+#: schemas); agentgateway-policies 0.2.18 6 / 10; alert-provider 0.2.53 4 / 10; github-provider-kog
+#: 0.6.0 2 / 10; installer 0.3.468 6 / 7; krateo-marketplace-catalog 0.1.2 1 / 3.
+#: tests/fixtures/ghcr_measured_0_3_468.json holds that record, and a test pins REAL_LARGEST to it. Every run records its own under
 #: `measured`, and the preflight says so when one exceeds REAL_LARGEST (a stale input, #1041 R31).
 HELM_MAX_CHART, HELM_MAX_FILE = 100 * 1024 * 1024, 5 * 1024 * 1024
 REAL_LARGEST = {"blob": 363_138, "file": 1_041_093, "inflated": 2_753_178, "render": 2_665_855,
-                "parsed": 141_293, "members": 125}
+                "parsed": 141_293, "members": 125, "deepest": 40}
 RENDER_MARGIN = 16
 CHART_INFLATED_MAX = HELM_MAX_CHART
 CHART_FILE_MAX = HELM_MAX_FILE
@@ -194,32 +198,31 @@ BLOB_MAX = HELM_MAX_CHART
 RENDER_OUT_MAX = RENDER_MARGIN * REAL_LARGEST["render"]
 CHART_PARSED_MAX = RENDER_MARGIN * REAL_LARGEST["parsed"]
 CHART_MEMBERS_MAX = RENDER_MARGIN * REAL_LARGEST["members"]
-#: Nesting cap (#1356): every YAML document the preflight parses (a chart's Chart.yaml / values.yaml,
-#: helm template's output) nests at most NEST_MAX maps and lists deep, as built (an alias counts the
-#: depth of the node it names). Read from the parser's events, which nest nothing, before any
-#: document is built (_nest_check), so no walk over a chart's data ever nears Python's recursion
-#: limit: the preflight's own walks are iterative besides, and the parent never relies on a
-#: RecursionError. It used to: a values.yaml 1,000 deep was walked recursively to the limit and the
-#: RecursionError caught; whatever else ran at that depth (a finalizer the garbage collector chose
-#: that moment for, and pytest's hook reporting it) failed for want of stack (CI run 43110378256,
-#: "Failed to process unraisable exception"). The same rule as the size caps: 16 x the deepest
-#: real document, measured 2026-11-12 (maps and lists, the top one counted) on the charts run 20
-#: pulls (rendered with their defaults): agentgateway-controller 0.2.0 render 40 (its CRDs' schemas), values 4;
-#: alert-provider 0.2.53 10 / 4; github-provider-kog 0.6.0 10 / 2; agentgateway-policies 0.2.18
-#: 9 / 6; installer 0.3.468 7 / 6; krateo-marketplace-catalog 0.1.2 3 / 1. libyaml (pip's PyYAML
-#: wheels) builds a document in C, 3,000 deep measured; without it the pure-Python composer recurses
-#: two frames a level and reaches Python's limit near 490: in the child (_in_child), a refusal by that
-#: error's own name, never the parent's stack.
-REAL_DEEPEST = 40
-NEST_MAX = RENDER_MARGIN * REAL_DEEPEST
+#: Nesting cap (#1356): every YAML document the preflight reads (the installer's files, the bench's
+#: values, a chart's Chart.yaml / values.yaml, helm template's output) nests at most NEST_MAX maps
+#: and lists deep, as built (an alias counts the depth of the node it names): _load_yaml, the
+#: preflight's one YAML reader. The depth is read from the parser's events, which nest nothing,
+#: before any document is built (_nest_check), and the document is then built by libyaml, in C
+#: (_yaml_loader; no libyaml is a named refusal, never PyYAML's pure-Python composer, which recurses
+#: two frames a level and reaches Python's limit near 490). Nothing the preflight does with a
+#: document recurses either (its walks, _merge, with_markers, _dump_yaml keep stacks of their own),
+#: so no depth ever nears Python's recursion limit and no RecursionError is ever relied on. One was:
+#: a values.yaml 1,000 deep was walked recursively to the limit and the RecursionError caught;
+#: whatever else ran at that depth (a finalizer the garbage collector chose that moment for, and
+#: pytest's hook reporting it) failed for want of stack (CI run 43110378256, "Failed to process
+#: unraisable exception"). The same rule as the size caps: 16 x the deepest real document
+#: (REAL_LARGEST["deepest"]: agentgateway-controller 0.2.0's render, its CRDs' schemas), measured
+#: by the preflight itself (`measured`: `deepest` of a chart's own files, `render_deepest` of its
+#: render) and re-checked by every run like the sizes (stale_inputs).
+NEST_MAX = RENDER_MARGIN * REAL_LARGEST["deepest"]
 CAPS = {"helm_max_chart": HELM_MAX_CHART, "helm_max_file": HELM_MAX_FILE, "render_margin": RENDER_MARGIN,
         "real_largest": REAL_LARGEST, "blob_max": BLOB_MAX, "chart_inflated_max": CHART_INFLATED_MAX,
         "chart_file_max": CHART_FILE_MAX, "render_out_max": RENDER_OUT_MAX,
-        "chart_parsed_max": CHART_PARSED_MAX, "chart_members_max": CHART_MEMBERS_MAX,
-        "real_deepest": REAL_DEEPEST, "nest_max": NEST_MAX}
+        "chart_parsed_max": CHART_PARSED_MAX, "chart_members_max": CHART_MEMBERS_MAX, "nest_max": NEST_MAX}
 #: a `measured` key -> the REAL_LARGEST input it is compared with
 MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated", "render": "render",
-                  "parsed": "parsed", "members": "members"}
+                  "parsed": "parsed", "members": "members", "deepest": "deepest",
+                  "render_deepest": "deepest"}
 #: preflight's exits: the registry's own answer refuses (a 401 / 403 / 404, a manifest that does not
 #: parse, ...); no answer within the step's bound is a refusal of its own, said as such (run 25)
 EXIT_REFUSED, EXIT_NO_ANSWER = 3, 4
@@ -303,27 +306,22 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
     fill-if-absent and forced writes come after (cors.enabled,
     gateway.internalDataPlane, platformRoutes, subAgents, mcpBackendHash; the
     image pull secrets, mirrored by with_markers). The release name is the
-    component's own name, as the installer's."""
-    import yaml
-
+    component's own name, as the installer's. Every file read by _load_yaml
+    (NEST_MAX)."""
     from bench import diag606
     root = os.path.join(installer_pulled, "installer")
     core = set(diag606.core_features(installer_pulled))
-    with open(os.path.join(root, "files", "component-pins.yaml")) as fh:
-        pins = yaml.safe_load(fh) or {}
+    with open(os.path.join(root, "files", "component-pins.yaml"), "rb") as fh:
+        pins = _load_yaml(fh.read(), "the installer's files/component-pins.yaml: ") or {}
     try:
-        with open(os.path.join(root, "values.yaml")) as fh:
-            features = dict((yaml.safe_load(fh) or {}).get("features") or {})
-    except OSError:
-        features = {}
-    with open(values) as fh:
-        bench = yaml.safe_load(fh) or {}
-    features.update(bench.get("features") or {})
-    try:
-        with open(os.path.join(root, "values.yaml")) as fh:
-            inst_values = yaml.safe_load(fh) or {}
+        with open(os.path.join(root, "values.yaml"), "rb") as fh:
+            inst_values = _load_yaml(fh.read(), "the installer's values.yaml: ") or {}
     except OSError:
         inst_values = {}
+    features = dict(inst_values.get("features") or {})
+    with open(values, "rb") as fh:
+        bench = _load_yaml(fh.read(), f"{values}: ") or {}
+    features.update(bench.get("features") or {})
     cv = dict(inst_values.get("componentValues") or {})
     oci = bench.get("ociRepo") or inst_values.get("ociRepo")
     out = []
@@ -345,13 +343,20 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
 
 def _merge(base: dict, over: dict) -> dict:
     """helm's values merge: maps merge key by key, anything else is replaced,
-    and a null deletes the key."""
+    and a null deletes the key. A stack of its own (NEST_MAX): each map
+    merged into is a copy, `base` and `over` are left as they are."""
     out = dict(base)
-    for k, v in over.items():
-        if v is None:
-            out.pop(k, None)
-        else:
-            out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    todo = [(out, over)]
+    while todo:
+        into, frm = todo.pop()
+        for k, v in frm.items():
+            if v is None:
+                into.pop(k, None)
+            elif isinstance(v, dict) and isinstance(into.get(k), dict):
+                into[k] = dict(into[k])
+                todo.append((into[k], v))
+            else:
+                into[k] = v
     return out
 
 
@@ -371,7 +376,6 @@ def private_image_paths(installer_pulled: str) -> dict[str, list[list[str]]] | N
     Secrets into, and at which values paths), by component. None when this
     installer has no such define; raises ValueError when the define is not a
     static list (it is then not the installer's rule this mirrors)."""
-    import yaml
     tdir = os.path.join(installer_pulled, "installer", "templates")
     bodies = []
     for n in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
@@ -382,7 +386,7 @@ def private_image_paths(installer_pulled: str) -> dict[str, list[list[str]]] | N
         return None
     if len(bodies) != 1 or "{{" in bodies[0]:
         raise ValueError("inst.privateImageComponents is not one static list: its rule cannot be read")
-    doc = yaml.safe_load(bodies[0]) or {}
+    doc = _load_yaml(bodies[0], "the installer's inst.privateImageComponents: ") or {}
     out: dict[str, list[list[str]]] = {}
     for c in doc.get("components") or []:
         if isinstance(c, dict) and c.get("name"):
@@ -643,13 +647,14 @@ def images_in_manifests(docs) -> list[str]:
 DEEP = f"it nests deeper than its {NEST_MAX} level cap ({RENDER_MARGIN} x the deepest real document's)"
 
 
-def _nest_check(text, loader, name: str = "") -> None:
-    """Refuses (`name` + DEEP) a YAML stream any document of which, as built,
-    nests past NEST_MAX maps and lists: read from the parser's events, which
-    nest nothing, before any document is built. An alias counts the depth of
-    the node it names (a chain of aliases builds depth no event shows)."""
+def _nest_check(text, loader, name: str = "") -> int:
+    """The deepest level any document of a YAML stream reaches as built (maps
+    and lists, the top one counted; 0 for scalars only); refuses (`name` +
+    DEEP) past NEST_MAX. Read from the parser's events, which nest nothing,
+    before any document is built. An alias counts the depth of the node it
+    names (a chain of aliases builds depth no event shows)."""
     import yaml
-    height, open_, depth = {}, [], 0       # anchor -> its node's depth; per open map / list: [anchor, start, deepest]
+    height, open_, depth, top = {}, [], 0, 0  # anchor -> its node's depth; per open map / list: [anchor, start, deepest]
     for ev in yaml.parse(text, Loader=loader):
         if isinstance(ev, yaml.DocumentStartEvent):
             height.clear()
@@ -674,6 +679,96 @@ def _nest_check(text, loader, name: str = "") -> None:
             open_[-1][2] = max(open_[-1][2], reach)
         if reach > NEST_MAX:
             raise _Refused(f"{name}{DEEP}")
+        top = max(top, reach)
+    return top
+
+
+def _libyaml(what: str):
+    """PyYAML's libyaml class `what` (CSafeLoader, CSafeDumper), else a named
+    refusal: the pure-Python composer and representer recurse (NEST_MAX)."""
+    import yaml
+    cls = getattr(yaml, what, None)
+    if cls is None:
+        raise _Refused(f"libyaml not available: this PyYAML has no {what}, and its pure-Python one recurses "
+                       f"(Python's limit near 400-490 levels, under the {NEST_MAX} level cap): install PyYAML "
+                       f"built with libyaml (pip's wheels are)")
+    return cls
+
+
+def _parse_yaml(text, name: str = "", all_docs: bool = False):
+    """(the document, or every document, of `text`; the deepest level it reaches): the preflight's
+    one YAML reader. Within NEST_MAX (_nest_check), then built by libyaml (_yaml_loader). `name`
+    prefixes a refusal."""
+    import yaml
+    loader = _yaml_loader()
+    deepest = _nest_check(text, loader, name)
+    if all_docs:
+        return list(yaml.load_all(text, Loader=loader)), deepest   # noqa: S506 - a safe loader
+    return yaml.load(text, Loader=loader), deepest                  # noqa: S506 - a safe loader
+
+
+def _load_yaml(text, name: str = ""):
+    """_parse_yaml's document."""
+    return _parse_yaml(text, name)[0]
+
+
+def _dump_yaml(data) -> str:
+    """`data` (a map, as values are) as yaml.safe_dump writes it (keys sorted when they sort, block
+    style, a map or list met again an alias of its first), emitted by libyaml
+    from events built with a stack of their own: PyYAML's representer and
+    serializer recurse a few frames a level (Python's limit near 400 levels,
+    under NEST_MAX). Each scalar is still PyYAML's representation."""
+    import io
+    import yaml
+    seen, again, todo = set(), set(), [data]      # maps and lists met more than once: anchored at the first
+    while todo:
+        o = todo.pop()
+        if isinstance(o, (dict, list)):
+            if id(o) in seen:
+                again.add(id(o))
+                continue
+            seen.add(id(o))
+            todo.extend(o.values() if isinstance(o, dict) else o)
+    stream = io.StringIO()
+    d = _libyaml("CSafeDumper")(stream)
+    anchors = {}
+    todo = [("event", yaml.StreamEndEvent()), ("event", yaml.DocumentEndEvent(explicit=False)), ("node", data)]
+    d.emit(yaml.StreamStartEvent())
+    d.emit(yaml.DocumentStartEvent(explicit=False))
+    while todo:
+        kind, o = todo.pop()
+        if kind == "event":
+            d.emit(o)
+        elif isinstance(o, (dict, list)):
+            if id(o) in anchors:
+                d.emit(yaml.AliasEvent(anchors[id(o)]))
+                continue
+            anchor = None
+            if id(o) in again:
+                anchor = anchors[id(o)] = f"id{len(anchors) + 1:03d}"
+            if isinstance(o, dict):
+                items = list(o.items())
+                try:
+                    items = sorted(items)                 # as SafeRepresenter.represent_mapping
+                except TypeError:
+                    pass
+                d.emit(yaml.MappingStartEvent(anchor, None, True, flow_style=False))
+                todo.append(("event", yaml.MappingEndEvent()))
+                for k, v in reversed(items):
+                    todo += [("node", v), ("node", k)]
+            else:
+                d.emit(yaml.SequenceStartEvent(anchor, None, True, flow_style=False))
+                todo.append(("event", yaml.SequenceEndEvent()))
+                todo += [("node", v) for v in reversed(o)]
+        else:
+            node = d.represent_data(o)
+            if not isinstance(node, yaml.ScalarNode):
+                raise yaml.representer.RepresenterError(f"cannot represent {type(o).__name__} as a values scalar")
+            implicit = (node.tag == d.resolve(yaml.ScalarNode, node.value, (True, False)),
+                        node.tag == d.resolve(yaml.ScalarNode, node.value, (False, True)))
+            d.emit(yaml.ScalarEvent(None, node.tag, implicit, node.value, style=node.style))
+    d.dispose()
+    return stream.getvalue()
 
 
 def _child_main(conn, fn_name: str, args: tuple) -> None:
@@ -735,8 +830,8 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
     the reading ends with it), then parsed in a child process killed at what
     is left of the bound (_in_child: the parse stops, not only the wait). Raises _Refused with helm's own reason when it cannot render.
     The chart (never a credential) is written to a private temporary
-    directory removed at once; the values go on stdin, stderr to a file."""
-    import yaml
+    directory removed at once; the values go on stdin (_dump_yaml), stderr
+    to a file. `meta` gets `render` (bytes) and `render_deepest` (levels)."""
     procs: list = []
 
     def kill():
@@ -759,7 +854,7 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                 procs.append(pr)
                 unread = False
                 try:
-                    pr.stdin.write(yaml.safe_dump(values or {}).encode())
+                    pr.stdin.write(_dump_yaml(values or {}).encode())
                     pr.stdin.close()
                 except OSError:             # helm exited before reading its values: its own reason follows
                     unread = True
@@ -787,17 +882,19 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
         out = _call(run, RENDER_BOUND_S, on_timeout=kill)
     except _NoAnswer:                       # helm did not finish: no answer, not a render failure
         raise _NoAnswer(late) from None
-    return _in_child("_parse_manifests", (out,), max(0.0, RENDER_BOUND_S - (time.monotonic() - t0)), late)
+    docs, deepest = _in_child("_parse_manifests", (out,), max(0.0, RENDER_BOUND_S - (time.monotonic() - t0)), late)
+    if meta is not None:
+        meta["render_deepest"] = deepest
+    return docs
 
 
-def _parse_manifests(out: bytes) -> list:
-    """helm template's output as documents (run in a child: render), each
-    within NEST_MAX (_nest_check)."""
+def _parse_manifests(out: bytes) -> tuple[list, int]:
+    """(helm template's output as documents, the deepest level they nest):
+    run in a child (render), each within NEST_MAX (_parse_yaml)."""
     import yaml
     try:
-        text, loader = out.decode(), _yaml_loader()
-        _nest_check(text, loader, "helm template rendered YAML: ")
-        return [x for x in yaml.load_all(text, Loader=loader) if x is not None]  # noqa: S506
+        docs, deepest = _parse_yaml(out.decode(), "helm template rendered YAML: ", all_docs=True)
+        return [x for x in docs if x is not None], deepest
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise _Refused(f"helm template rendered no YAML: {str(e).splitlines()[0][:200]}") from None
 
@@ -864,15 +961,15 @@ def with_markers(values: dict, paths: list[list[str]]) -> dict:
     the shape the installer injects (`list (dict "name" ...)`,
     compositions.yaml): which pod carries which path's secret is then read
     from the render. The leaf is set whatever it held: the image a path
-    serves does not depend on the secret's name."""
-    import copy
-    out = copy.deepcopy(values or {})
+    serves does not depend on the secret's name. `values` is left as it is:
+    each map on a path is copied before it is set (copy.deepcopy would
+    recurse a frame or two a level: NEST_MAX), the rest is shared."""
+    out = dict(values or {})
     for i, path in enumerate(paths):
         cur = out
         for seg in path[:-1]:
             nxt = cur.get(seg)
-            if not isinstance(nxt, dict):
-                nxt = cur[seg] = {}
+            nxt = cur[seg] = dict(nxt) if isinstance(nxt, dict) else {}
             cur = nxt
         cur[path[-1]] = [{"name": marker(i)}]
     return out
@@ -948,14 +1045,14 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
             raise _Refused(f"{len(layers)} helm chart layers in its manifest")
         data = _attempt("chart blob read", BLOB_BOUND_S,
                         lambda: _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer), budget)
-        charts, vals, inflated, largest, parsed, members = _attempt(
+        charts, vals, inflated, largest, parsed, members, deepest = _attempt(
             "chart files read", PARSE_BOUND_S, lambda: _in_child(
                 "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
                 f"its chart files were not read within their {PARSE_BOUND_S:g} s bound"), budget)
         if not charts:
             raise _Refused("no Chart.yaml in its chart layer")
         out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
-                           "members": members}
+                           "members": members, "deepest": deepest}
         return walk(charts, vals, data)
 
     def walk(charts, vals, data):
@@ -987,11 +1084,12 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
 
 
 def _yaml_loader():
-    """libyaml's safe loader when PyYAML has it (about 4x faster), else the
-    pure-Python one: the same documents either way. Speed only: the bound is
-    CHART_PARSED_MAX and PARSE_BOUND_S."""
-    import yaml
-    return getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    """libyaml's safe loader (CSafeLoader), else a named refusal ("libyaml not
+    available"): it builds a document in C, where PyYAML's pure-Python
+    composer recurses two frames a level and reaches Python's limit near 490,
+    under NEST_MAX (#1356). The probe in the caps comment: libyaml parses
+    about 4x faster besides."""
+    return _libyaml("CSafeLoader")
 
 
 def chart_caps() -> dict:
@@ -1000,9 +1098,10 @@ def chart_caps() -> dict:
             "members": CHART_MEMBERS_MAX}
 
 
-def read_chart_files(data: bytes, caps: dict | None = None) -> tuple[dict, dict, int, int, int, int]:
+def read_chart_files(data: bytes, caps: dict | None = None) -> tuple[dict, dict, int, int, int, int, int]:
     """(Chart.yaml by dir, values.yaml by dir, bytes inflated, largest file,
-    bytes parsed) of a chart blob. The tar is walked header by header,
+    bytes parsed, members, the deepest level any of them nests: _nest_check)
+    of a chart blob. The tar is walked header by header,
     streamed, stopping at the first cap passed; the headers never accumulate
     (tarfile would keep every one). The Chart.yaml / values.yaml bytes are
     kept raw while walking and counted against CHART_PARSED_MAX, then
@@ -1041,15 +1140,15 @@ def read_chart_files(data: bytes, caps: dict | None = None) -> tuple[dict, dict,
                     raise _Refused(f"its Chart.yaml and values.yaml files come to more than its "
                                    f"{cap['parsed']} byte parse cap ({RENDER_MARGIN} x the largest real total)")
                 raw.append((d, base, tf.extractfile(m).read(cap["file"] + 1)))
-    loader = _yaml_loader()
+    deepest = 0
     for d, base, body in raw:
         try:
-            _nest_check(body, loader, f"{d + '/' if d else ''}{base}: ")
-            doc = yaml.load(body, Loader=loader) or {}      # noqa: S506 - a safe loader (_yaml_loader)
+            doc, deep = _parse_yaml(body, f"{d + '/' if d else ''}{base}: ")
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise _Refused(f"{d + '/' if d else ''}{base} is not YAML: {str(e).splitlines()[0][:200]}") from None
-        (charts if base == "Chart.yaml" else vals)[d] = doc
-    return charts, vals, inflated, largest, parsed, members
+        (charts if base == "Chart.yaml" else vals)[d] = doc or {}
+        deepest = max(deepest, deep)
+    return charts, vals, inflated, largest, parsed, members, deepest
 
 
 def stale_inputs(charts: list[dict]) -> list[dict]:
@@ -1068,9 +1167,11 @@ def stale_inputs(charts: list[dict]) -> list[dict]:
 
 
 def stale_notes(stale: list[dict]) -> list[str]:
-    """The preflight's report line per stale input (stale_inputs)."""
-    return [f"[ghcr] NOTE: {x['chart']} {x['version']} measured {x['measured']} = {x['value']} B, over the caps' "
-            f"measured input REAL_LARGEST[{x['input']!r}] = {x['real_largest']} B: re-measure it (the "
+    """The preflight's report line per stale input (stale_inputs): bytes, or levels for a depth."""
+    def unit(x):
+        return "levels" if x["input"] == "deepest" else "B"
+    return [f"[ghcr] NOTE: {x['chart']} {x['version']} measured {x['measured']} = {x['value']} {unit(x)}, over the "
+            f"caps' measured input REAL_LARGEST[{x['input']!r}] = {x['real_largest']} {unit(x)}: re-measure it (the "
             f"{RENDER_MARGIN} x margin is over a stale input; reported, not refused)" for x in stale]
 
 
@@ -1125,7 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
         paths = private_image_paths(a.installer_pulled)
         private = None if paths is None else set(paths)
         pins = private_pins(a.installer_pulled, a.values, include=(private or set()) | set(overrides))
-    except ValueError as e:              # the installer's enable rule unreadable: nothing to resolve against
+    except (ValueError, _Refused) as e:  # the installer's enable rule unreadable: nothing to resolve against
         print(f"refusing: {e}", file=sys.stderr)
         return 2
     absent = sorted(set(overrides) - {p["name"] for p in pins})

@@ -33,7 +33,7 @@ import yaml
 from bench import ghcr_pull
 from tests.conftest import (FAKE_CHART_BAD_DIGEST, FAKE_CHART_BIG_MANIFEST, FAKE_CHART_BLOB_OVER_SIZE,
                             FAKE_CHART_DRIP, FAKE_CHART_HEADER_DRIP, FAKE_CHART_HOP_UNRENDERED, FAKE_CHART_HTTP_BLOB,
-                            FAKE_CHART_DEEP, FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer)
+                            FAKE_CHART_DEEP, FAKE_CHART_VALUES, FAKE_GHCR_TOKEN, FAKE_GHCR_USER, fake_bearer)
 
 HELM = os.environ["FAKE_HELM_TEMPLATE_BIN"]
 AGW = "oci://ghcr.io/krateo-agentiko/charts"
@@ -959,7 +959,7 @@ def test_zero_byte_files_are_counted_by_the_member_cap():
     assert time.monotonic() - t0 < 2
     assert ghcr_pull.CHART_MEMBERS_MAX == 16 * 125
     # at the cap it is read: the cap is the rule, not the shape
-    charts, vals, _, _, parsed, members = ghcr_pull.read_chart_files(_empty_values_chart(1999))
+    charts, vals, _, _, parsed, members, _ = ghcr_pull.read_chart_files(_empty_values_chart(1999))
     assert (members, parsed, len(vals)) == (2000, 38, 1999)
 
 
@@ -1032,26 +1032,72 @@ def test_the_walks_take_no_stack_from_the_documents_depth():
     pytest's hook reporting it) failed: "Failed to process unraisable
     exception" in the parallel suite. The walks keep a stack of their own:
     the deepest Python stack is the same for a document 3 and 5,000 deep (5,000:
-    past the recursion limit, the old walks raised RecursionError)."""
+    past the recursion limit, the old walks raised RecursionError). So for
+    what the preflight does with values (_merge, with_markers, _dump_yaml:
+    deepcopy and safe_dump recursed, near 400-500 levels, under NEST_MAX)."""
     img = {"image": {"repository": "ghcr.io/x/y", "tag": "1"}}
     pod = {"containers": [{"image": "ghcr.io/x/y:1"}]}
-    for fn, leaf, want in ((lambda o: ghcr_pull.images_in_values(o, "0"), img, ["ghcr.io/x/y:1"]),
-                           (ghcr_pull.images_in_manifests, {"image": "ghcr.io/x/y:1"}, ["ghcr.io/x/y:1"]),
-                           (lambda o: [p["images"] for p in ghcr_pull.pods([o])], pod, [["ghcr.io/x/y:1"]])):
-        shallow, s_depth = _deepest_stack(lambda: fn(_nested(3, leaf)))
-        deep, d_depth = _deepest_stack(lambda: fn(_nested(5000, leaf)))
+    cap = ghcr_pull.NEST_MAX
+    for fn, leaf, want, deep_n in (
+            (lambda o, n: ghcr_pull.images_in_values(o, "0"), img, ["ghcr.io/x/y:1"], 5000),
+            (lambda o, n: ghcr_pull.images_in_manifests(o), {"image": "ghcr.io/x/y:1"}, ["ghcr.io/x/y:1"], 5000),
+            (lambda o, n: [p["images"] for p in ghcr_pull.pods([o])], pod, [["ghcr.io/x/y:1"]], 5000),
+            (lambda o, n: _bottom(ghcr_pull._merge(o, _nested(n, {"b": 2, "x": None}))), {"x": 1, "c": 3},
+             {"b": 2, "c": 3}, 5000),
+            (lambda o, n: _bottom(ghcr_pull.with_markers(o, [["a"] * n + ["s"]])), {"t": 1},
+             {"t": 1, "s": [{"name": ghcr_pull.marker(0)}]}, 5000),
+            (lambda o, n: _bottom(ghcr_pull._load_yaml(ghcr_pull._dump_yaml(o))), {"t": [1, "1"]},
+             {"t": [1, "1"]}, cap - 2)):     # 638 maps + the leaf map + its list: NEST_MAX
+        shallow, s_depth = _deepest_stack(lambda: fn(_nested(3, leaf), 3))
+        deep, d_depth = _deepest_stack(lambda: fn(_nested(deep_n, leaf), deep_n))
         assert shallow == deep == want
         assert d_depth == s_depth, (d_depth, s_depth)
 
 
+def _bottom(o):
+    """What _nested put under its maps."""
+    while isinstance(o, dict) and list(o) == ["a"]:
+        o = o["a"]
+    return o
+
+
+def test_merge_and_markers_leave_their_inputs_as_they_are():
+    base, over = {"a": {"b": 1, "c": {"d": 2}}, "k": [1]}, {"a": {"c": {"d": None, "e": 3}}, "z": 0}
+    b0, o0 = json.dumps(base, sort_keys=True), json.dumps(over, sort_keys=True)
+    assert ghcr_pull._merge(base, over) == {"a": {"b": 1, "c": {"e": 3}}, "k": [1], "z": 0}
+    v = {"a": {"image": {"pullSecrets": ["old"]}, "x": 1}}
+    v0 = json.dumps(v, sort_keys=True)
+    got = ghcr_pull.with_markers(v, [["a", "image", "pullSecrets"], ["a", "other", "pullSecrets"], ["n", "p"]])
+    assert got == {"a": {"image": {"pullSecrets": [{"name": ghcr_pull.marker(0)}]}, "x": 1,
+                         "other": {"pullSecrets": [{"name": ghcr_pull.marker(1)}]}},
+                   "n": {"p": [{"name": ghcr_pull.marker(2)}]}}
+    assert (json.dumps(base, sort_keys=True), json.dumps(over, sort_keys=True), json.dumps(v, sort_keys=True)) == \
+        (b0, o0, v0)
+
+
+def test_the_values_dump_is_safe_dumps():
+    """What helm reads on stdin is, byte for byte, what yaml.safe_dump wrote (keys sorted when they
+    sort, quoting, a map met twice anchored then aliased)."""
+    import datetime
+    shared = {"k": [1, 2]}
+    for v in ({"b": [1, "x", None, True, "1", "yes", 1.5, {}, "", "0012", "~", "a: b", "- x", " lead"],
+               "a": {"image": {"repository": "r", "tag": ""}}, "c": [], "d": "multi\nline",
+               "f": datetime.date(2024, 1, 1), "é": "ünï", 3: "an int key: unsorted", "z": b"\x00"},
+              {"p": shared, "q": shared, "r": [shared]}, {}, FAKE_CHART_VALUES):
+        assert ghcr_pull._dump_yaml(v) == yaml.safe_dump(v)
+
+
 def test_pods_keep_the_manifests_order():
     """The iterative walk meets the pods in the order the recursive one did: depth first, in
-    document and key order, an alias once."""
-    a = {"containers": [{"image": "ghcr.io/x/a:1"}]}
-    docs = [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"image": "ghcr.io/x/b:1"}]}}},
-             "z": a},
-            {"kind": "Job", "spec": {"jobTemplate": a, "x": [{"containers": [{"image": "ghcr.io/x/c:1"}]}]}}]
-    assert [p["images"] for p in ghcr_pull.pods(docs)] == [["ghcr.io/x/b:1"], ["ghcr.io/x/a:1"], ["ghcr.io/x/c:1"]]
+    document, key and list order, an alias once."""
+    def pod(n):
+        return {"containers": [{"image": f"ghcr.io/x/{n}:1"}]}
+    a = pod("a")
+    docs = [{"kind": "Deployment", "spec": {"template": {"spec": pod("b")}}, "z": a},
+            {"kind": "Job", "spec": {"jobTemplate": a, "x": [pod("c"), pod("d"), {"y": [pod("e"), pod("f")]}]}},
+            {"kind": "List", "items": [pod("g"), pod("h"), pod("i")]}]
+    assert [p["images"][0].split("/")[2] for p in ghcr_pull.pods(docs)] == \
+        ["b:1", "a:1", "c:1", "d:1", "e:1", "f:1", "g:1", "h:1", "i:1"]
 
 
 def _deep_yaml(n):
@@ -1061,46 +1107,139 @@ def _deep_yaml(n):
 
 @pytest.mark.parametrize("loader", ["SafeLoader", "CSafeLoader"])
 def test_the_nesting_cap_is_its_own_bound_not_the_interpreters(loader):
-    """NEST_MAX deep is read; one level more is refused by name, before any document is built,
-    by either loader (the pure-Python one could not even build it: its composer recurses two
-    frames a level). The cap is 16 x the deepest real document (#1356)."""
+    """NEST_MAX deep is read; one level more is refused by name, before any document is built
+    (the depth is read from the parser's events, which either parser gives without recursing).
+    The cap is 16 x the deepest real document (#1356), that input re-checked by every run."""
     import yaml
-    if not hasattr(yaml, loader):
-        pytest.skip(f"PyYAML has no {loader} here")
     L = getattr(yaml, loader)
-    assert ghcr_pull.NEST_MAX == 16 * ghcr_pull.REAL_DEEPEST == 640 == ghcr_pull.CAPS["nest_max"]
-    ghcr_pull._nest_check(_deep_yaml(ghcr_pull.NEST_MAX), L)
+    assert ghcr_pull.NEST_MAX == 16 * ghcr_pull.REAL_LARGEST["deepest"] == 640 == ghcr_pull.CAPS["nest_max"]
+    assert ghcr_pull._nest_check(_deep_yaml(ghcr_pull.NEST_MAX), L) == ghcr_pull.NEST_MAX
     with pytest.raises(ghcr_pull._Refused, match="^" + re.escape(f"values.yaml: {ghcr_pull.DEEP}") + "$"):
         ghcr_pull._nest_check(_deep_yaml(ghcr_pull.NEST_MAX + 1), L, "values.yaml: ")
     # a later document is measured on its own, and a list nests as a map does
-    ghcr_pull._nest_check("---\n" + _deep_yaml(ghcr_pull.NEST_MAX) + "---\n" + _deep_yaml(ghcr_pull.NEST_MAX), L)
+    assert ghcr_pull._nest_check("---\n" + _deep_yaml(5) + "---\n" + _deep_yaml(ghcr_pull.NEST_MAX), L) == \
+        ghcr_pull.NEST_MAX
     with pytest.raises(ghcr_pull._Refused):
         ghcr_pull._nest_check("x: " + "[" * ghcr_pull.NEST_MAX + "]" * ghcr_pull.NEST_MAX + "\n", L)
 
 
-def test_an_alias_counts_the_depth_of_what_it_names():
-    """A chain of aliases builds depth no single event shows: each line nests two deep, the
-    document it builds NEST_MAX + 1. Refused; the same chain one link shorter is read."""
+@pytest.mark.parametrize("doc,deepest", [
+    ("1\n", 0), ("a: 1\n", 1), ("[]\n", 1), ("a: [{b: 1}, 2]\n", 3),
+    # the deepest is the closed node's own deepest, carried up through each level that closes: a shallow
+    # sibling after a deep one does not lower it
+    ("a: {b: {c: [1]}}\nd: 1\n", 4), ("a: [[[[x]]], [y]]\nb: {c: 1}\n", 5),
+    # an alias counts what it names, nested anchors included: x is 3 deep, aliased 2 deep
+    ("a: &x {b: {c: [1]}}\nd: {e: *x}\n", 5), ("a: &x {b: {c: [1]}}\nd: {e: [*x]}\n", 6),
+    ("a: &s 1\nb: [*s]\n", 2), ("---\na: [1]\n---\nb: {c: {d: 1}}\n", 3),
+    ("---\nb: {c: {d: 1}}\n---\na: [1]\n---\nz\n", 3)])  # the deepest document first: the max, not the last
+def test_the_depth_read_is_the_documents_as_built(doc, deepest):
     import yaml
+    assert ghcr_pull._nest_check(doc, ghcr_pull._yaml_loader()) == deepest
+
+    def built_depth(o):                    # the built document's depth, walked here with a stack of its own
+        best, todo = 0, [(o, 1)]
+        while todo:
+            x, d = todo.pop()
+            if isinstance(x, (dict, list)):
+                best = max(best, d)
+                todo += [(v, d + 1) for v in (x.values() if isinstance(x, dict) else x)]
+        return best
+    assert max(built_depth(d) for d in yaml.load_all(doc, Loader=ghcr_pull._yaml_loader())) == deepest  # noqa: S506
+
+
+def test_an_alias_counts_the_depth_of_what_it_names():
+    """A chain of aliases builds depth no single event shows. Each link here wraps the one before
+    TWO levels down (a list in an anchored map), so the depth of each anchor is carried up through
+    a level that closes: link n builds 2n + 2. 319 links: exactly NEST_MAX, read; 320: 642, refused."""
     L = ghcr_pull._yaml_loader()
 
-    def chain(links):          # l0 is a map 2 deep under the top one; each link wraps the one before
-        return "l0: &l0 {a: 1}\n" + "".join(f"l{i}: &l{i} [*l{i - 1}]\n" for i in range(1, links + 1))
-    over = ghcr_pull.NEST_MAX - 1          # top (1) + l_n's lists (over) + l0's map (1) = NEST_MAX + 1
+    def chain(links):          # l0 is a map 2 deep under the top one (its height 1)
+        return "l0: &l0 {a: 1}\n" + "".join(f"l{i}: &l{i} {{x: [*l{i - 1}]}}\n" for i in range(1, links + 1))
+    assert ghcr_pull._nest_check(chain(1), L) == 4 and ghcr_pull._nest_check(chain(2), L) == 6
+    assert ghcr_pull._nest_check(chain(319), L) == ghcr_pull.NEST_MAX
     with pytest.raises(ghcr_pull._Refused, match="nests deeper"):
-        ghcr_pull._nest_check(chain(over), L)
-    ghcr_pull._nest_check(chain(over - 1), L)
-    built = yaml.load(chain(over - 1), Loader=L)        # noqa: S506 - a safe loader
-    depth, o = 1, built[f"l{over - 1}"]
-    while isinstance(o, list):
-        depth, o = depth + 1, o[0]
-    assert depth + 1 == ghcr_pull.NEST_MAX           # + l0's map: exactly the cap
+        ghcr_pull._nest_check(chain(320), L)
+    # and one level down: each link a bare list (as run 26's review shape)
+    flat = "l0: &l0 {a: 1}\n" + "".join(f"l{i}: &l{i} [*l{i - 1}]\n" for i in range(1, ghcr_pull.NEST_MAX - 1))
+    assert ghcr_pull._nest_check(flat, L) == ghcr_pull.NEST_MAX
+    with pytest.raises(ghcr_pull._Refused, match="nests deeper"):
+        ghcr_pull._nest_check(flat + f"l{ghcr_pull.NEST_MAX - 1}: [*l{ghcr_pull.NEST_MAX - 2}]\n", L)
 
 
 def test_helm_output_past_the_nesting_cap_is_a_named_refusal():
     with pytest.raises(ghcr_pull._Refused, match="^helm template rendered YAML: it nests deeper"):
         ghcr_pull._in_child("_parse_manifests", (_deep_yaml(ghcr_pull.NEST_MAX + 1).encode(),), 60, "late")
-    assert ghcr_pull._in_child("_parse_manifests", (_deep_yaml(ghcr_pull.NEST_MAX).encode(),), 60, "late")
+    docs, deepest = ghcr_pull._in_child("_parse_manifests", (_deep_yaml(ghcr_pull.NEST_MAX).encode(),), 60, "late")
+    assert len(docs) == 1 and deepest == ghcr_pull.NEST_MAX
+
+
+def test_every_run_measures_its_depths_and_says_when_one_is_over_the_input():
+    """Review MEDIUM: REAL_LARGEST["deepest"] is a measured input like the sizes: each chart's
+    `measured` carries `deepest` (its own files) and `render_deepest` (its render), and a run whose
+    chart nests deeper than the input says so (a NOTE, in levels), as for any stale input."""
+    r = ghcr_pull.chart_images(AGW, "agentgateway-policies", "0.2.18", FAKE_GHCR_USER, FAKE_GHCR_TOKEN, {}, HELM)
+    assert r["error"] is None and r["render_error"] is None, r
+    m = r["measured"]
+    assert isinstance(m["deepest"], int) and m["deepest"] >= 2 and isinstance(m["render_deepest"], int), m
+    over = ghcr_pull.REAL_LARGEST["deepest"] + 1
+    for key in ("deepest", "render_deepest"):
+        charts = [{"chart": "oci://ghcr.io/o/c", "version": "1.0.0", "measured": dict(m, **{key: over})}]
+        st = ghcr_pull.stale_inputs(charts)
+        assert [(x["measured"], x["input"], x["value"]) for x in st] == [(key, "deepest", over)], st
+        (line,) = ghcr_pull.stale_notes(st)
+        assert f"measured {key} = {over} levels, over the caps' measured input REAL_LARGEST['deepest'] = " \
+               f"{ghcr_pull.REAL_LARGEST['deepest']} levels" in line, line
+    at = [{"chart": "c", "version": "1", "measured": dict(m, deepest=over - 1, render_deepest=over - 1)}]
+    assert ghcr_pull.stale_inputs(at) == []
+
+
+def test_no_libyaml_is_a_named_refusal(monkeypatch):
+    """Review 4a: PyYAML's pure-Python composer recurses two frames a level (Python's limit near 490,
+    under NEST_MAX), its representer a few: without libyaml the preflight refuses by name."""
+    import yaml
+    data = _deep_chart_blob()
+    monkeypatch.delattr(yaml, "CSafeLoader")
+    monkeypatch.delattr(yaml, "CSafeDumper")
+    for fn in (lambda: ghcr_pull.read_chart_files(data), lambda: ghcr_pull._parse_manifests(b"a: 1\n"),
+               lambda: ghcr_pull._load_yaml("a: 1\n"), lambda: ghcr_pull._dump_yaml({"a": 1})):
+        with pytest.raises(ghcr_pull._Refused, match="^libyaml not available: this PyYAML has no CSafe"):
+            fn()
+
+
+def _deep_chart_blob(values=b"a: 1\n"):
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for n, body in (("c/Chart.yaml", b"apiVersion: v2\nname: c\nversion: 1.0.0\n"), ("c/values.yaml", values)):
+            ti = tarfile.TarInfo(n)
+            ti.size = len(body)
+            tf.addfile(ti, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def test_every_yaml_the_preflight_reads_is_within_the_cap(tmp_path, capsys):
+    """Review 4b: the installer's files and the bench's values are read by the same guarded
+    reader as a chart's (_load_yaml): a values file past NEST_MAX is refused by name before
+    anything is built, never PyYAML's recursive composer."""
+    argv = _installer(tmp_path)
+    v = argv[argv.index("--values") + 1]
+    with open(v, "w") as fh:
+        fh.write(_deep_yaml(ghcr_pull.NEST_MAX + 1))
+    assert ghcr_pull.main(argv) == 2
+    assert f"refusing: {v}: {ghcr_pull.DEEP}" in capsys.readouterr().err
+    with open(v, "w") as fh:
+        fh.write("features: {}\n")
+    for f, name in (("values.yaml", "the installer's values.yaml"),
+                    ("files/component-pins.yaml", "the installer's files/component-pins.yaml")):
+        p = tmp_path / "installer" / f
+        good = p.read_text()
+        p.write_text(_deep_yaml(ghcr_pull.NEST_MAX + 1))
+        assert ghcr_pull.main(argv) == 2
+        assert f"refusing: {name}: {ghcr_pull.DEEP}" in capsys.readouterr().err
+        p.write_text(good)
+    # a chart's own files: their deepest recorded
+    assert ghcr_pull.read_chart_files(_deep_chart_blob(_deep_yaml(10).encode()))[6] == 10
 
 
 def test_a_child_that_dies_or_fails_is_a_refusal_never_a_hang():
