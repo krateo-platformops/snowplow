@@ -26,10 +26,14 @@ No cluster access: everything here is a pure-function or filesystem arm
 
 from __future__ import annotations
 
+import ast
 import base64
+import io
 import json
 import os
+import pathlib
 import subprocess
+import urllib.error
 
 import pytest
 
@@ -608,3 +612,144 @@ def test_s6_manifest_IS_ACCEPTED_BY_THE_LIVE_CRD():
         input=sb._manifests("dryrunprobe0"), capture_output=True, text=True)
     assert proc.returncode == 0, (
         f"the live CRDs REJECT the manifest pair:\n{proc.stderr.strip()[:500]}")
+
+
+# ─── #1362 — two tokens: /debug reads as the operator, measured as the harness ─
+#
+# Since snowplow #1362 /debug/* is RBAC-authorized, and the harness user holds
+# no /debug grant by design. Diego's ruling (2026-11-12): /debug reads present a
+# SEPARATE operator token (SNOWPLOW_DEBUG_TOKEN); measured requests keep
+# HARNESS_USER; neither token reaches the other's requests; an absent operator
+# token refuses by name before any measurement.
+
+_HARNESS_TOK = "harness.header.sig-1362"
+_DEBUG_TOK = "operator.header.sig-1362"
+
+
+class _FakeResp1362:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _preflight_world_1362(monkeypatch, *, debug_token):
+    """stage_preflight with every cluster read stubbed and the HTTP seam faked.
+
+    Returns (ctx, sent): `sent` records (url, Authorization) for every request
+    the module makes, in order.
+    """
+    monkeypatch.setattr(a.cluster, "canonical_gke_context", lambda: a.EXPECTED_CONTEXT)
+    monkeypatch.setattr(a, "_deployed_image", lambda d: {
+        "snowplow": f"ghcr.io/x/snowplow:{a.EXPECTED_SNOWPLOW_VERSION}",
+        "frontend": f"ghcr.io/x/frontend:{a.EXPECTED_FRONTEND_VERSION}"}[d])
+    monkeypatch.setattr(a, "_served_bundle_hash", lambda portal, reqlog: "index-abc.js")
+    monkeypatch.setenv("HARNESS_USER", "s6-harness")
+    monkeypatch.setenv("HARNESS_PASSWORD", "pw")
+    monkeypatch.delenv("S6_PASSWORD_FROM_SECRET", raising=False)
+    if debug_token is None:
+        monkeypatch.delenv(a.DEBUG_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(a.DEBUG_TOKEN_ENV, debug_token)
+
+    sent = []
+    snap = json.dumps({a.K_DEPS: {}, a.K_RESOLVED: {}, a.K_BROADCAST: {}}).encode()
+
+    def fake_urlopen(req, timeout=None, context=None):
+        url = req.full_url
+        sent.append((url, req.get_header("Authorization")))
+        if "/auth/basic/login" in url:
+            return _FakeResp1362(200, json.dumps({"accessToken": _HARNESS_TOK}).encode())
+        if "/debug/" in url:
+            return _FakeResp1362(200, snap)
+        # The /call grant probe: 404 = the grant is present, the object absent.
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(a.urllib.request, "urlopen", fake_urlopen)
+    ctx = {"portal_base": "https://portal.test", "reqlog": a._RequestLog(),
+           "run_id": "r1362", "expect_bundle": "index-abc.js"}
+    return ctx, sent
+
+
+def test_1362_absent_debug_token_refuses_by_name_before_any_request(monkeypatch):
+    ctx, sent = _preflight_world_1362(monkeypatch, debug_token=None)
+    with pytest.raises(a.PreflightFailed) as e:
+        a.stage_preflight(ctx)
+    assert a.DEBUG_TOKEN_ENV in str(e.value)
+    # Before the harness login and before any /debug read or measured request.
+    assert sent == [], f"requests were made before the refusal: {sent}"
+
+
+def test_1362_debug_reads_carry_only_the_operator_token_measured_only_the_harness(monkeypatch):
+    ctx, sent = _preflight_world_1362(monkeypatch, debug_token=_DEBUG_TOK)
+    proof = a.stage_preflight(ctx)
+    assert ctx["token"] == _HARNESS_TOK and ctx["debug_token"] == _DEBUG_TOK
+    assert proof["debug_token_source"] == a.DEBUG_TOKEN_ENV
+    assert _DEBUG_TOK not in json.dumps(proof), "the operator token leaked into the proof"
+
+    debug = [(u, h) for u, h in sent if "/debug/" in u]
+    measured = [(u, h) for u, h in sent if "/call" in u]
+    assert debug and measured, f"vacuous: debug={debug} measured={measured}"
+    for u, h in debug:
+        assert h == f"Bearer {_DEBUG_TOK}", f"/debug read {u} carried {h!r}, not the operator token"
+    for u, h in measured:
+        assert h == f"Bearer {_HARNESS_TOK}", f"measured request {u} carried {h!r}, not the harness token"
+
+
+def test_1362_debug_reader_403_names_the_grant_not_the_token(monkeypatch):
+    """A 403 is a missing GRANT, reported as such, never as a bad token."""
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(
+            json.dumps({"message": 'forbidden: User "x" cannot get path "/debug/vars"'}).encode()))
+    monkeypatch.setattr(a.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(a.PreflightFailed) as e:
+        a.read_debug_vars("https://portal.test", _DEBUG_TOK, a._RequestLog())
+    assert "403" in str(e.value) and "#1362" in str(e.value) and "cannot get path" in str(e.value)
+
+
+def test_1362_every_debug_reader_and_measured_call_site_uses_its_own_token():
+    """Every call site in the module, including the stages the preflight arm
+    cannot drive hermetically (they wait on the browser half's hooks): a /debug
+    reader is passed the operator token, the operator token reaches nothing
+    else, and no /debug URL is fetched with any other token."""
+    src = pathlib.Path(a.__file__).read_text()
+    tree = ast.parse(src)
+    readers = {"read_debug_vars", "read_apistage_key"}
+    funcs = [f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)]
+
+    def enclosing(lineno):
+        return min((f for f in funcs if f.lineno <= lineno <= f.end_lineno),
+                   key=lambda f: f.end_lineno - f.lineno).name
+
+    def is_debug_token(node):
+        return (isinstance(node, ast.Name) and node.id == "debug_token") or (
+            isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "debug_token")
+
+    reader_sites, problems = 0, []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        seg = ast.get_source_segment(src, node)
+        if name in readers:
+            reader_sites += 1
+            if len(node.args) < 2 or not is_debug_token(node.args[1]):
+                problems.append(f"line {node.lineno}: {name} not passed the operator token: {seg}")
+        elif name == "_http_get" and len(node.args) >= 2:
+            carries = is_debug_token(node.args[1])
+            in_reader = enclosing(node.lineno) in readers
+            if carries != in_reader:
+                problems.append(f"line {node.lineno}: _http_get token/route mismatch in "
+                                f"{enclosing(node.lineno)}: {seg}")
+        elif any(is_debug_token(arg) for arg in node.args):
+            problems.append(f"line {node.lineno}: the operator token reaches {name}: {seg}")
+    assert reader_sites >= 8, f"vacuous: only {reader_sites} reader call sites found"
+    assert not problems, "\n".join(problems)

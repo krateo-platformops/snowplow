@@ -1536,7 +1536,9 @@ func main() {
 	// Extracted into a named registrar (debug_routes.go) so the gating is
 	// testable against production wiring — the same shape snowplowCORSOptions
 	// uses for the CORS contract. /health + /readyz above stay ANONYMOUS (the
-	// kubelet presents no JWT); /swagger/ is unchanged.
+	// kubelet presents no JWT); /swagger/ is unchanged. #1362: every route is
+	// also authorized (middleware.DebugAuthz): RBAC `nonResourceURLs` for the
+	// JWT's identity, so an authenticated caller without the grant gets 403.
 	//
 	// MUST come after the expvar publishers registered just above.
 	registerDebugRoutes(mux, chain, jwtKeys)

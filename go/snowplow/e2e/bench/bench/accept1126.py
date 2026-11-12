@@ -49,6 +49,18 @@ report. `_redact()` guards the one place a token could leak into a proof.
 The harness user is a DEDICATED least-privilege account (see
 `reports/harness-user-spec.md`) — never a platform secret, never admin.
 
+TWO TOKENS, NEVER MIXED (snowplow #1362). Since #1362 snowplow AUTHORIZES every
+/debug/* request through Kubernetes RBAC (`nonResourceURLs: ["/debug/*"]`), so a
+valid JWT is no longer enough. The harness user deliberately holds no such
+grant. Every /debug read (`/debug/vars`, `/debug/apistage`) therefore presents
+a SEPARATE operator token, `SNOWPLOW_DEBUG_TOKEN`, the same variable the bench's
+own /debug readers use (`bench/browser.py`). Every measured request (the /call
+grant probes, the browser half) keeps the harness user's token. Neither token
+ever reaches the other's requests. `_debug_token()` refuses BY NAME at preflight,
+before any measurement, when the operator token is absent. It never skips the
+/debug checks. The operator token is supplied by whoever runs S6 (on 057, Diego
+supplies it); this module never mints or fetches one.
+
 MEASUREMENT VANTAGE (`feedback_northstar_measurement_vantage`)
 
 Every counter read is an HTTP GET to `/content/debug/vars` **through the platform
@@ -228,9 +240,10 @@ def _creds() -> tuple[str, str]:
           explicitly) when that scoped read has been granted.
 
     Raises PreflightFailed (not a skip) when neither route yields a credential —
-    a run without an identity cannot read /debug and must not silently degrade
-    to "counters unavailable". There is deliberately no third route: no token is
-    ever accepted from another process.
+    a run without an identity cannot make its measured requests and must not
+    silently degrade. There is deliberately no third route: no token is ever
+    accepted from another process. (The /debug reads use a separate operator
+    token since snowplow #1362, `_debug_token`.)
     """
     user = os.environ.get("HARNESS_USER", "").strip()
     pw = os.environ.get("HARNESS_PASSWORD", "")
@@ -248,6 +261,34 @@ def _creds() -> tuple[str, str]:
             "reports/harness-user-spec.md) — never a platform credential, and "
             "never a token handed over by another process.")
     return user, pw
+
+
+#: The operator JWT every /debug read presents (see CREDENTIALS). The same name
+#: as the bench readers' (`bench/browser.py` DEBUG_TOKEN).
+DEBUG_TOKEN_ENV = "SNOWPLOW_DEBUG_TOKEN"
+
+
+def _debug_token() -> str:
+    """The operator token for /debug reads. Never logged, never persisted.
+
+    Raises PreflightFailed BY NAME when it is absent. A run without it cannot
+    read a single counter, and the harness user's token must not stand in for
+    it: that identity holds no /debug grant by design, so every /debug read
+    would 403 mid-run. Refusing at preflight is the only honest outcome.
+    """
+    tok = os.environ.get(DEBUG_TOKEN_ENV, "").strip()
+    if not tok:
+        raise PreflightFailed(
+            f"{DEBUG_TOKEN_ENV} is not set. Since snowplow #1362 every /debug/* "
+            f"read is authorized through Kubernetes RBAC (nonResourceURLs "
+            f"[\"/debug/*\"], verb get), and HARNESS_USER deliberately holds no "
+            f"such grant. Set {DEBUG_TOKEN_ENV} to an operator JWT whose "
+            f"identity is bound to the grant (the chart's "
+            f"snowplow-debug-<namespace> ClusterRole, or cluster-admin). It is "
+            f"used ONLY for /debug reads; measured requests stay on "
+            f"HARNESS_USER. Refusing before any measurement rather than "
+            f"skipping the counter checks.")
+    return tok
 
 
 def _redact(value: Any) -> Any:
@@ -354,42 +395,60 @@ def login(portal_base: str, reqlog: _RequestLog) -> str:
 # ─── The expvar surface, parent-qualified by construction (§2) ──────────────
 
 
-def read_debug_vars(portal_base: str, token: str,
-                    reqlog: _RequestLog) -> dict:
-    """GET /content/debug/vars through the gateway.
+def _status_message(body: bytes) -> str:
+    """The `message` of a plumbing Status body, for a refusal's text."""
+    try:
+        return str(json.loads(body).get("message", ""))[:300]
+    except Exception:
+        return ""
 
-    Distinguishes the three outcomes the facts doc §1.2 calls out, because they
-    mean different things and a harness that conflates them misreports:
+
+def read_debug_vars(portal_base: str, debug_token: str,
+                    reqlog: _RequestLog) -> dict:
+    """GET /content/debug/vars through the gateway, as the OPERATOR token.
+
+    `debug_token` is `SNOWPLOW_DEBUG_TOKEN` (`_debug_token`), never the harness
+    user's. Distinguishes the outcomes the facts doc §1.2 calls out (plus #1362's
+    403), because they mean different things and a harness that conflates them
+    misreports:
       200 → the snapshot;
-      401 → the token is missing/expired/invalid;
-      503 → authn or its JWKS is UNREACHABLE. This is NOT a snowplow fault and
-            must never be reported as one (there is no break-glass; the whole
-            debug surface answers 503 while authn is down).
+      401 → the operator token is missing/expired/invalid;
+      403 → the token is valid but its identity lacks the /debug grant (#1362);
+      503 → snowplow could not decide: authn or its JWKS is unreachable, or
+            (#1362) the authorization itself is unavailable, and the message
+            names the reason (e.g. rbac_snapshot_not_built during boot).
     """
     url = f"{portal_base}{SNOWPLOW_PREFIX}/debug/vars"
-    status, body = _http_get(url, token, reqlog)
+    status, body = _http_get(url, debug_token, reqlog)
     if status == 503:
         raise PreflightFailed(
-            "/debug/vars returned 503 — RefreshAuth maps ErrKeyUnavailable to "
-            "503, so authn or its JWKS endpoint is unreachable. THIS IS NOT A "
-            "SNOWPLOW FAULT. Fix authn, then re-run; do not record a snowplow "
-            "failure for it.")
+            "/debug/vars returned 503: snowplow could not decide the request. "
+            "Either authn or its JWKS endpoint is unreachable (RefreshAuth), or "
+            "the #1362 authorization is unavailable (the message names the "
+            f"reason). Message: {_status_message(body)!r}. Fix that, then "
+            "re-run; do not record a cache-proof failure for it.")
     if status == 401:
         raise PreflightFailed(
-            "/debug/vars returned 401 — the harness JWT is missing, expired or "
-            "invalid. RefreshAuth accepts ANY valid Krateo JWT and checks no "
-            "role/group/scope, so a 401 here means the token itself, not RBAC.")
+            f"/debug/vars returned 401: the {DEBUG_TOKEN_ENV} JWT is missing, "
+            "expired or invalid.")
+    if status == 403:
+        raise PreflightFailed(
+            f"/debug/vars returned 403: the {DEBUG_TOKEN_ENV} identity is "
+            "authenticated but not granted the /debug surface (snowplow #1362: "
+            "nonResourceURLs [\"/debug/*\"], verb get). Bind it, or use an "
+            f"operator token that holds it. Message: {_status_message(body)!r}")
     if status != 200:
         raise PreflightFailed(f"/debug/vars returned HTTP {status}")
     return json.loads(body)
 
 
-def read_apistage_key(portal_base: str, token: str, key: str,
+def read_apistage_key(portal_base: str, debug_token: str, key: str,
                       reqlog: _RequestLog) -> dict:
     """Ask the L1 store whether ONE key is resident right now.
 
     `GET /content/debug/apistage?key_hash=<key>` → `MetadataForKey(key)`, JWT-gated by
-    RefreshAuth like the rest of /debug. The value the SPA arms on — the
+    RefreshAuth and (#1362) RBAC-authorized like the rest of /debug, so it is read as the
+    OPERATOR token (`SNOWPLOW_DEBUG_TOKEN`), never the harness user's. The value the SPA arms on — the
     `X-Snowplow-Refresh-Key` header — IS the store key, so the key the browser reports is
     the key this looks up. Verified live on 057: a bogus key answers 200 with
     `{"cacheEnabled": true, "count": 0, "entries": []}`.
@@ -407,11 +466,16 @@ def read_apistage_key(portal_base: str, token: str, key: str,
     the answer at the delete step.
     """
     url = f"{portal_base}{SNOWPLOW_PREFIX}/debug/apistage?key_hash={key}"
-    status, body = _http_get(url, token, reqlog)
+    status, body = _http_get(url, debug_token, reqlog)
     if status == 503:
         raise PreflightFailed(
-            "/debug/apistage returned 503 — authn or its JWKS is unreachable. NOT a snowplow "
-            "fault; fix authn and re-run rather than recording a cache-proof failure.")
+            "/debug/apistage returned 503: authn or its JWKS is unreachable, or the #1362 "
+            f"authorization is unavailable. Message: {_status_message(body)!r}. Fix that and "
+            "re-run rather than recording a cache-proof failure.")
+    if status == 403:
+        raise PreflightFailed(
+            f"/debug/apistage returned 403: the {DEBUG_TOKEN_ENV} identity is not granted the "
+            f"/debug surface (snowplow #1362). Message: {_status_message(body)!r}")
     if status != 200:
         raise PreflightFailed(
             f"/debug/apistage?key_hash=… returned {status}, expected 200. The cache proof "
@@ -1121,8 +1185,12 @@ def stage_preflight(ctx: dict) -> dict:
     if problems:
         raise PreflightFailed("; ".join(problems))
 
+    # TWO TOKENS (#1362, see CREDENTIALS). The operator token is checked first,
+    # by name, so a run that lacks it stops here, before the harness login and
+    # before any measurement.
+    debug_token = _debug_token()
     token = login(portal, reqlog)
-    snap = read_debug_vars(portal, token, reqlog)
+    snap = read_debug_vars(portal, debug_token, reqlog)
     missing = [k for k in (K_DEPS, K_RESOLVED, K_BROADCAST) if k not in snap]
     if missing:
         raise PreflightFailed(
@@ -1130,7 +1198,10 @@ def stage_preflight(ctx: dict) -> dict:
             f"CACHE_ENABLED=false these publishers are not registered at all "
             f"(CFG-1), so every assertion in the table would be a false zero.")
 
+    # ctx["token"] is the HARNESS user's: measured requests only.
+    # ctx["debug_token"] is the OPERATOR's: /debug reads only.
     ctx["token"] = token
+    ctx["debug_token"] = debug_token
     # WIDGET-READ GRANT — the precondition run 4 died on, mid-run, after creating objects.
     #
     # /call is RBAC-narrowed at resolve under the CALLER's identity. The harness-user spec
@@ -1175,6 +1246,8 @@ def stage_preflight(ctx: dict) -> dict:
             "crd_suffix": OWNED_CRD_SUFFIX,
         },
         "identity": os.environ.get("HARNESS_USER", ""),   # name only, no secret
+        # #1362: where the /debug reads' operator token came from (never its value).
+        "debug_token_source": DEBUG_TOKEN_ENV,
     }
 
 
@@ -1198,7 +1271,7 @@ def stage_counters_before(ctx: dict) -> dict:
     # one in it. Neither alone is enough: the counters cannot tell our entry from foreign
     # traffic, and a single channel reported by the half the counters exist to corroborate
     # is not corroboration. Both are required and must agree — see crosscheck_cache_proof.
-    pre = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
+    pre = snapshot_counters(read_debug_vars(portal, ctx["debug_token"], reqlog))
 
     rendered = wait_hook(run_dir, "rendered", rid, began)   # first /call → cold fill
     rd = rendered.get("data", {})
@@ -1217,13 +1290,13 @@ def stage_counters_before(ctx: dict) -> dict:
     # lands STRICTLY below it and the comparison discriminates. crosscheck_cache_proof refuses
     # to pass when age 0 reaches it anyway, so a faster box cannot silently reinstate the hole.
     time.sleep(AGE_SETTLE_SECONDS)
-    insp_render = read_apistage_key(portal, ctx["token"], key, reqlog)
+    insp_render = read_apistage_key(portal, ctx["debug_token"], key, reqlog)
 
     hit = wait_hook(run_dir, "hit_proved", rid, began)      # second /call → served from L1
     hd = hit.get("data", {})
 
     # Step 2: still resident, same body, age not reset → served from the store, not re-resolved.
-    insp_hit = read_apistage_key(portal, ctx["token"], key, reqlog)
+    insp_hit = read_apistage_key(portal, ctx["debug_token"], key, reqlog)
 
     # POLL for server-side arming rather than sampling once. This does NOT weaken the
     # assertion below: arming must still become visible before the delete, and a run where it
@@ -1234,7 +1307,7 @@ def stage_counters_before(ctx: dict) -> dict:
     deadline = time.time() + ARMING_VISIBLE_TIMEOUT_S
     arming_waited_s = 0.0
     while True:
-        post = snapshot_counters(read_debug_vars(portal, ctx["token"], reqlog))
+        post = snapshot_counters(read_debug_vars(portal, ctx["debug_token"], reqlog))
         armed = post[f"{K_BROADCAST}.armed_keys"] - pre[f"{K_BROADCAST}.armed_keys"]
         subs = post[f"{K_BROADCAST}.subscribers"] - pre[f"{K_BROADCAST}.subscribers"]
         if (armed >= 1 and subs >= 1) or time.time() >= deadline:
@@ -1336,7 +1409,7 @@ def stage_counters_after(ctx: dict) -> dict:
     # dropped the subscriber (A13 -1). Every failing row in run 8 was this.
     time.sleep(COUNTER_SETTLE_SECONDS)
 
-    snap = read_debug_vars(portal, ctx["token"], reqlog)
+    snap = read_debug_vars(portal, ctx["debug_token"], reqlog)
     ctx["window_end"] = _now_iso()
     after = snapshot_counters(snap)
     d = delta(ctx["before"], after)
@@ -1351,7 +1424,7 @@ def stage_counters_after(ctx: dict) -> dict:
     # same reason store_total cannot — on 1.12.6 evict_drop_point_total (retired by #547) was
     # already 1 at rest on an idle 057. A Count of 0 for the armed key is the per-key fact, and it is the one that closes
     # the loop: the object we deleted is the object whose entry left the store.
-    insp_after = read_apistage_key(portal, ctx["token"], ctx["refresh_key"], reqlog)
+    insp_after = read_apistage_key(portal, ctx["debug_token"], ctx["refresh_key"], reqlog)
     evicted = insp_after.get("count") == 0
 
     # THE WINDOW IS NOW CLOSED. Release the browser's teardown only here — after the snapshot
@@ -1606,7 +1679,7 @@ def stage_crd_relist(ctx: dict) -> dict:
         wait_hook(run_dir, "crd_rendered", rid, began)
 
         before = snapshot_crd_counters(
-            read_debug_vars(portal, ctx["token"], reqlog))
+            read_debug_vars(portal, ctx["debug_token"], reqlog))
 
         # (4) the bump: one extra OPTIONAL property in the structural schema.
         _kubectl_apply(_crd_manifest(group, plural, kind, widened=True),
@@ -1615,7 +1688,7 @@ def stage_crd_relist(ctx: dict) -> dict:
         time.sleep(SETTLE_SECONDS)
 
         after = snapshot_crd_counters(
-            read_debug_vars(portal, ctx["token"], reqlog))
+            read_debug_vars(portal, ctx["debug_token"], reqlog))
         d = delta(before, after)
         ok, results = evaluate(crd_rows(), d)
 

@@ -144,17 +144,49 @@ Everything is on the single `http` port (mux registrations in `debug_routes.go`)
 - **`GET /debug/apistage`** — resolved-cache entry metadata (never bodies).
 - **`GET /debug/refreshes`** — aggregate live-refresh broadcaster counters.
 
-### The debug surface is authenticated
+### The debug surface is authenticated AND authorized
 
 **Since 1.12.3 every route above returns `401` without a valid Krateo JWT.**
 Before then only `/debug/refreshes` was gated (#69) and the rest were readable
 by anyone who could reach the Service — which, with the chart's default
 `service.type: LoadBalancer`, means anyone who could reach the load balancer.
 
-The gate is `middleware.RefreshAuth`: a stateless RS256 validation of any
+The first gate is `middleware.RefreshAuth`: a stateless RS256 validation of any
 authn-issued token, read from an `Authorization: Bearer` header **or** the
-session cookie, with no apiserver read of its own. Any authenticated identity is
-accepted — the endpoints return process-wide diagnostics, not per-user data.
+session cookie, with no apiserver read of its own.
+
+**Since #1362 a valid JWT is not enough: the identity must also hold an RBAC
+grant.** Several of these routes report metadata about every identity's cache
+entries (`/debug/apistage`, `/debug/reconcile`, `/debug/deps`) or about objects
+the caller's own RBAC may forbid (`/debug/store`). `middleware.DebugAuthz`
+therefore authorizes each request as a Kubernetes non-resource request: verb =
+the lowercase HTTP method, path = the request path, for the JWT's username and
+groups. It is the same in-process evaluator as every other snowplow RBAC check,
+so with the cache on there is still no apiserver read. The grant is:
+
+```yaml
+rules:
+- nonResourceURLs: ["/debug/*"]
+  verbs: ["get", "post"]   # post only for POST /debug/shadow-parity
+```
+
+The chart ships it as the ClusterRole `<fullname>-debug-<namespace>` and binds
+it to **no one**, because the chart has no admin group to bind it to. Bind it
+to your operators:
+
+```bash
+kubectl create clusterrolebinding snowplow-debug-operators \
+  --clusterrole=snowplow-debug-krateo-system --group=<your-operator-group>
+```
+
+Any identity bound to `cluster-admin` already holds it (`nonResourceURLs:
+["*"]`). Without the grant → **`403`** (`forbidden: User "<u>" cannot get path
+"/debug/vars"`). If the authorization cannot be decided → **`503`**, with the
+reason named in the message. During the boot window before the RBAC snapshot is
+published it is `rbac_snapshot_not_built`. With `CACHE_ENABLED=false` it is
+**always** `review_unavailable`: the cache-off authorizer is the caller's own
+SelfSubjectAccessReview, which needs the `<user>-clientconfig` endpoint this
+route never reads. It fails closed and never answers `200`.
 
 ```bash
 TOKEN=$(curl -su "$USER:$PASS" http://authn:8082/basic/login | jq -r .accessToken)
@@ -192,8 +224,13 @@ bind the debug mux to localhost so `kubectl port-forward` always reaches it
 regardless of authn's state, or failing that a static operator token.
 
 The Phase 6 bench harness presents this token automatically: `login_all()`
-parks the first JWT it obtains and the expvar readers send it. For a
-probe-only invocation that never logs in, export `SNOWPLOW_DEBUG_TOKEN`.
+parks the first JWT it obtains, which is `admin`'s (`admin` is in group
+`admins`, bound to cluster-admin, so it holds the grant), and the expvar readers
+send it. For a probe-only invocation that never logs in, export
+`SNOWPLOW_DEBUG_TOKEN` with a token that holds the grant. The S6 acceptance
+harness (`bench/accept1126.py`) reads /debug ONLY with `SNOWPLOW_DEBUG_TOKEN`,
+an operator token, and refuses at preflight without it. Its measured requests
+stay on the unprivileged `HARNESS_USER`.
 
 What "healthy and warm" looks like:
 

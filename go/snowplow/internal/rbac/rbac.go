@@ -2,6 +2,7 @@ package rbac
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -64,7 +65,10 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	// #1046 — the review asks about the request the apiserver would see,
 	// built by the same ObjectCheck as the in-process path: the object's
 	// name rides along iff the verb names a single object.
-	return selfSubjectAccessReview(ctx, ObjectCheck("", nil, opts.Verb, opts.target()))
+	// A review that could not be answered is a deny here: UserCan answers a
+	// bool, and its callers have no "unavailable" to give.
+	ok, _ = selfSubjectAccessReview(ctx, ObjectCheck("", nil, opts.Verb, opts.target()))
+	return ok
 }
 
 // sarClientsetForEndpoint builds the per-user kubernetes clientset the
@@ -88,31 +92,45 @@ var sarClientsetForEndpoint = func(ctx context.Context, ep endpoints.Endpoint) (
 // credential names the requester). It MUST be reachable only when
 // cache.Disabled() == true — any cache=on call here is a Revision 1 binding
 // violation (rollback trigger).
-func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok bool) {
+//
+// A check with a NonResourceURL (#1362) is sent as NonResourceAttributes
+// {Path, Verb}: the attributes the apiserver authorizes a non-resource request
+// with. Every other check is sent as ResourceAttributes.
+//
+// (false, nil) is the apiserver's deny. When the review cannot be ASKED or
+// cannot be ANSWERED (no user endpoint on ctx, no clientset, a failed Create),
+// the result wraps ErrReviewUnavailable and is never a bare deny. A caller that
+// can answer "unavailable" (the /debug gate's 503) must be able to tell the
+// two apart. Every resource caller already fails closed on an error.
+func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok bool, err error) {
 	log := xcontext.Logger(ctx)
 
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
-		return false
+		return false, fmt.Errorf("%w: no user endpoint: %w", ErrReviewUnavailable, err)
 	}
 
 	clientset, err := sarClientsetForEndpoint(ctx, ep)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to create kubernetes clientset for SAR", slog.Any("err", err))
-		return false
+		return false, fmt.Errorf("%w: no clientset: %w", ErrReviewUnavailable, err)
 	}
 
-	selfCheck := authv1.SelfSubjectAccessReview{
-		Spec: authv1.SelfSubjectAccessReviewSpec{
-			ResourceAttributes: &authv1.ResourceAttributes{
-				Group:     check.Group,
-				Resource:  check.Resource,
-				Namespace: check.Namespace,
-				Verb:      check.Verb,
-				Name:      check.Name,
-			},
-		},
+	selfCheck := authv1.SelfSubjectAccessReview{}
+	if check.NonResourceURL != "" {
+		selfCheck.Spec.NonResourceAttributes = &authv1.NonResourceAttributes{
+			Path: check.NonResourceURL,
+			Verb: check.Verb,
+		}
+	} else {
+		selfCheck.Spec.ResourceAttributes = &authv1.ResourceAttributes{
+			Group:     check.Group,
+			Resource:  check.Resource,
+			Namespace: check.Namespace,
+			Verb:      check.Verb,
+			Name:      check.Name,
+		}
 	}
 
 	resp, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().
@@ -120,10 +138,10 @@ func selfSubjectAccessReview(ctx context.Context, check EvaluateOptions) (ok boo
 	if err != nil {
 		log.ErrorContext(ctx, "unable to perform SelfSubjectAccessReviews",
 			slog.Any("selfCheck", selfCheck), slog.Any("err", err))
-		return false
+		return false, fmt.Errorf("%w: %w", ErrReviewUnavailable, err)
 	}
 
 	log.Debug("SelfSubjectAccessReviews result", slog.Any("response", resp))
 
-	return resp.Status.Allowed
+	return resp.Status.Allowed, nil
 }

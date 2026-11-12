@@ -288,13 +288,20 @@ func TestProbeEndpointsStayAnonymous(t *testing.T) {
 
 // ─── A3 — a valid JWT still gets the diagnostic ─────────────────────────────
 
+// #1362: a valid JWT is no longer enough; the token's identity must hold the
+// chart's /debug grant. Without the grant, the same token gets 403 (B1 in
+// main_debug_authz_1362_test.go drives every route both ways).
 func TestDebugSurface_ValidJWTIs200(t *testing.T) {
+	i1362Watcher(t, i1362World(t)...)
 	_, h := buildProdDebugMux(t)
-	tok := mintDebugToken(t, time.Hour)
+	tok := i1362Token(t, i1362Operator)
 	for _, path := range debugPathsSafeToDriveAuthenticated {
 		if code := getStatus(t, h, path, tok); code != http.StatusOK {
-			t.Errorf("%s with a valid JWT = %d, want 200 (the gate must not brick the surface)", path, code)
+			t.Errorf("%s with a valid, granted JWT = %d, want 200 (the gate must not brick the surface)", path, code)
 		}
+	}
+	if code := getStatus(t, h, "/debug/vars", mintDebugToken(t, time.Hour)); code != http.StatusForbidden {
+		t.Errorf("/debug/vars with a valid JWT whose identity holds no grant = %d, want 403", code)
 	}
 }
 
@@ -394,8 +401,11 @@ func TestDebugSurface_EachPatternGatedUnderDeclaredMethod(t *testing.T) {
 func TestDebugShadowParityRoute_MethodGatingAndAuth(t *testing.T) {
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
 
+	// #1362: the POST needs the `post` verb on the path, which the chart's
+	// grant carries.
+	i1362Watcher(t, i1362World(t)...)
 	_, h := buildProdDebugMux(t)
-	tok := mintDebugToken(t, time.Hour)
+	tok := i1362Token(t, i1362Operator)
 
 	// Valid JWT POST ?enabled=true → 200 (flips the toggle past the gate).
 	if code := statusForMethod(t, h, http.MethodPost, "/debug/shadow-parity?enabled=true", tok); code != http.StatusOK {

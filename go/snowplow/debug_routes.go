@@ -1,5 +1,6 @@
 // debug_routes.go — O-D3 (1.12.3): the whole /debug/* surface behind the same
-// JWT gate /debug/refreshes already uses.
+// JWT gate /debug/refreshes already uses; #1362: and behind an RBAC
+// authorization of the caller for the route's path.
 //
 // WHY THIS FILE EXISTS
 //
@@ -26,8 +27,34 @@
 // validation `/debug/refreshes` has used since #69, chosen deliberately over
 // `middleware.UserConfig` because it performs ZERO apiserver reads (no
 // `<user>-clientconfig` Secret GET), so a diagnostic pull never perturbs the
-// cache-respecting invariant it is being used to diagnose. Any valid Krateo JWT
-// passes; missing/expired/invalid → 401, unfetchable JWKS → 503.
+// cache-respecting invariant it is being used to diagnose. Missing, expired or
+// invalid → 401; unfetchable JWKS → 503.
+//
+// #1362: AUTHENTICATION IS NOT ENOUGH. A valid JWT alone no longer passes.
+// Several routes report metadata about EVERY identity's cache entries and about
+// objects the caller's own RBAC may forbid. /debug/apistage, for example, lists
+// each resident entry's coordinates and item count, whoever created it. So
+// every route is ALSO wrapped in middleware.DebugAuthz, which authorizes the
+// request through Kubernetes RBAC as a non-resource request: verb = lowercase
+// HTTP method, path = req.URL.Path, for the JWT's username and groups. The
+// decision is rbac.EvaluateRBAC, the one authorizer snowplow has: in-process
+// with cache on, so still zero apiserver reads, and a SelfSubjectAccessReview
+// with cache off. Denied → 403. Undecidable → 503 with a named reason, never
+// 200. The grant is an ordinary ClusterRole rule, `nonResourceURLs:
+// ["/debug/*"]` with verbs get and post. The chart ships it as
+// `<release>-debug-reader-<namespace>` (helm/snowplow/templates/
+// clusterrole-debug.yaml) and binds it to no one. Any identity bound to
+// cluster-admin already holds it (`nonResourceURLs: ["*"]`). The guard is
+// mechanical: every route is wrapped by the same `gated` chain below, and
+// TestDebugSurface_EveryRegisteredRouteIsAuthorized fails a route mounted
+// without it.
+//
+// KNOWN LIMITATION (#1362). With CACHE_ENABLED=false the authorizer is the
+// requester's own SelfSubjectAccessReview, which needs the requester's
+// clientconfig endpoint. RefreshAuth deliberately does not read that Secret, so
+// with the cache off every /debug route answers 503 `review_unavailable`. With
+// the cache on, the same 503 (`rbac_snapshot_not_built`) covers the boot window
+// before the RBAC snapshot is published.
 //
 // NOT GATED (deliberate): `/health` and `/readyz` stay anonymous — they are the
 // kubelet probe targets (howto/operating.md, "the chart ⇄ binary probe
@@ -106,7 +133,10 @@ type debugMux interface {
 // rbac.RegisterAuthzMemoExpvar, …) BEFORE calling this — the mount accepts
 // scrapes as soon as the server starts.
 func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySource) {
-	gated := chain.Append(middleware.RefreshAuth(jwtKeys))
+	// #1362: authenticate (RefreshAuth), THEN authorize (DebugAuthz) every
+	// route. Both are in this one chain, so no route can take one without the
+	// other.
+	gated := chain.Append(middleware.RefreshAuth(jwtKeys), middleware.DebugAuthz())
 
 	// /debug/pprof/* — registered on the custom mux (server does NOT use
 	// http.DefaultServeMux). Exposes goroutine, heap, profile, allocs, mutex,
@@ -183,16 +213,17 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	//
 	// Same gate, same metadata-and-hashes-only contract as its siblings, and
 	// it reads NOTHING from the apiserver: a comparison served as the snowplow
-	// ServiceAccount would tell any valid-JWT holder the existence and
-	// resourceVersion of objects their own RBAC forbids. The operator runs
+	// ServiceAccount would tell any holder of the /debug grant the existence
+	// and resourceVersion of objects their own RBAC forbids. The operator runs
 	// that half with kubectl, under their own identity.
 	mux.Handle("GET /debug/store", gated.Then(handlers.DebugStore()))
 
 	// #272 (1.12.17) — the runtime flip surface for the v7 Step-2 shadow-parity
 	// toggle. GET reports the process-local, default-off toggle; POST
 	// ?enabled=true|false flips it and reports the committed live state (absent
-	// or unparseable → 400). Same authn-only gate as every sibling: any valid
-	// Krateo JWT can flip it, an accepted zero-blast-radius control because the
+	// or unparseable → 400). Same gate as every sibling; since #1362 the POST
+	// needs the `post` verb on its path (any authenticated caller could flip
+	// it before). It is a zero-blast-radius control because the
 	// shadow-parity hook is read-only and changes no verdict/byte/key — it only
 	// turns the dark parity MEASUREMENT on or off. The toggle is per-pod, so a
 	// measurement that uses it must pin to one pod (see the handler doc).
