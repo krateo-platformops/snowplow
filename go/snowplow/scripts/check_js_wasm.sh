@@ -7,7 +7,8 @@
 #      own wasm runner (Node.js);
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
-#   5. the server build contains none of the browser code (main_browser_build_test.go:
+#   5. the fake apiserver's field selectors equal kube-apiserver's (scripts/checkfieldlabels);
+#   6. the server build contains none of the browser code (main_browser_build_test.go:
 #      no internal/browserbridge, no internal/sandbox/..., no syscall/js, credhttp.BrowserEgress nil,
 #      credhttp's plumbing clients plumbing's own).
 #
@@ -57,6 +58,15 @@ for pkg in ./internal/credhttp ./internal/resolvers/restactions/api; do
   run_node node "$TMP/pkg.test"
   run_fetch "$TMP/pkg.test"
 done
+
+# The fake apiserver's field selectors (fieldlabels.json) against kube-apiserver's own source for
+# the version the table names: every v1 AddFieldLabelConversionFunc, read with go/ast.
+echo "== fake apiserver: field selectors equal kube-apiserver's"
+K8S_VERSION="$(sed -n 's/^[[:space:]]*"upstream": "k8s.io\/kubernetes \(v[0-9.]*\)",$/\1/p' internal/sandbox/fakeapiserver/fieldlabels.json)"
+[ -n "$K8S_VERSION" ] || { echo "fieldlabels.json names no upstream version" >&2; exit 1; }
+K8S_DIR="$(go mod download -json "k8s.io/kubernetes@$K8S_VERSION" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
+[ -d "$K8S_DIR" ] || { echo "could not download k8s.io/kubernetes@$K8S_VERSION" >&2; exit 1; }
+go run ./scripts/checkfieldlabels "$K8S_DIR" internal/sandbox/fakeapiserver/fieldlabels.json
 
 echo "== server build: contains none of the browser code"
 go test -count=1 -run 'TestBrowserBuild_' . ./internal/credhttp

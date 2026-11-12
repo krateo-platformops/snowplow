@@ -1,6 +1,6 @@
 {
-  "comment": "Field selectors per built-in kind, as kube-apiserver v1.36 accepts them: the labels each kind's AddFieldLabelConversionFunc accepts (k8s.io/kubernetes v1.36.2 pkg/apis/<group>/<version>/conversion.go), each with the JSON path of its value in the served object (the strategy's GetAttrs / ToSelectableFields). A kind not listed takes apimachinery's default: metadata.name and metadata.namespace. scripts/checkfieldlabels compares the labels with upstream's source.",
-  "upstream": "k8s.io/kubernetes v1.36.2",
+  "comment": "Field selectors per built-in kind, as kube-apiserver v1.36 accepts them: the labels each kind's AddFieldLabelConversionFunc accepts (k8s.io/kubernetes v1.36.4, the version 057 runs, pkg/apis/<group>/<version>/conversion.go), each with the JSON path of its value in the served object (the strategy's GetAttrs / ToSelectableFields). A kind not listed takes apimachinery's default: metadata.name and metadata.namespace. scripts/checkfieldlabels compares the labels with upstream's source.",
+  "upstream": "k8s.io/kubernetes v1.36.4",
   "kinds": [
     { "group": "", "version": "v1", "kind": "Pod", "resource": "pods",
       "source": "pkg/apis/core/v1/conversion.go:36-57; pkg/registry/core/pod/strategy.go:504-526",

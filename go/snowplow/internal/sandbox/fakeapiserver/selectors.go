@@ -15,7 +15,7 @@ import (
 
 // Label selectors are parsed by apimachinery as the apiserver parses them. Field selectors are
 // accepted per kind exactly as kube-apiserver v1.36 accepts them (fieldlabels.json, taken from
-// k8s.io/kubernetes v1.36.2 and compared with its source by scripts/checkfieldlabels): a built-in
+// k8s.io/kubernetes v1.36.4 and compared with its source by scripts/checkfieldlabels): a built-in
 // kind's registered field labels with their values as its strategy computes them; any other kind,
 // apimachinery's default, metadata.name and metadata.namespace (pkg/runtime/conversion.go
 // DefaultMetaV1FieldSelectorConversion); a custom resource, those plus its CRD's selectableFields.
