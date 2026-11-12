@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
@@ -63,8 +62,8 @@ func TestBrowserEgress_IdentityWhereFetchIsNotUsed(t *testing.T) {
 		t.Fatalf("browserFetchOptions wrapped the transport where net/http dials (%T)", got)
 	}
 	c := &http.Client{Transport: rec}
-	if PlumbingClient(c) != c || c.Transport != http.RoundTripper(rec) {
-		t.Fatal("PlumbingClient changed a client where net/http dials")
+	if plumbingClient(c) != c || c.Transport != http.RoundTripper(rec) {
+		t.Fatal("plumbingClient changed a client where net/http dials")
 	}
 
 	// And a hardened chain still reaches a server on the in-process network.
@@ -172,9 +171,10 @@ func TestBrowserFetch_HardenKeepsTheWrappersRcCarried(t *testing.T) {
 
 // L4: every way a request reaches fetch sets credentials "omit" (and redirect
 // "error"): guardedTransport, a hardened config (BrowserEgress), the /call
-// passthrough (Do, plumbing's client through PlumbingClient) and the JWKS key
-// source's client as main builds it. The fetch spy records the options fetch
-// was actually called with.
+// passthrough (Do, plumbing's client through plumbingClient), the JWKS key
+// source main builds (JWKSKeySource) and the stage fetch's plumbing branch
+// (PlumbingEndpointClient). The fetch spy records the options fetch was
+// actually called with.
 func TestBrowserFetch_EveryPathOmitsCredentials(t *testing.T) {
 	jsfetch.FetchOnly(t)
 	srv := jsfetch.Start(t)
@@ -202,8 +202,16 @@ func TestBrowserFetch_EveryPathOmitsCredentials(t *testing.T) {
 			})
 		},
 		"/jwks.json": func() {
-			c := PlumbingClient(dialguard.Client(5 * time.Second))
-			if resp, err := c.Get(srv.URL + "/jwks.json"); err == nil {
+			// The key source main builds; the server's answer is no key set,
+			// so the lookup fails after the fetch, which is all this needs.
+			_, _ = JWKSKeySource(srv.URL+"/jwks.json", 5*time.Second).PublicKey("")
+		},
+		"/stage-plumbing": func() {
+			cli, err := PlumbingEndpointClient(&endpoints.Endpoint{ServerURL: srv.URL, Password: "p"}, &request.RequestInfo{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp, err := cli.Get(srv.URL + "/stage-plumbing"); err == nil {
 				resp.Body.Close()
 			}
 		},

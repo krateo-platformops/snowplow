@@ -709,6 +709,27 @@ func TrackDepMoves(mo *SeedResolveMemo) (untrack func()) {
 	return func() { UntrackDepMoves(mo) }
 }
 
+// dropTrackedResolveMemoEntriesForTest empties every memo TrackDepMoves
+// tracks. ResetDepsForTest calls it: an entry's freshness is judged against
+// the DepTracker's per-coordinate buckets (seedMemoDepsMovedSince), and the
+// reset discards that tracker. An entry produced before it would read
+// "unmoved" against the fresh tracker forever, so a process-global memo (the
+// refresher's, refreshResolveMemo) served one test's RESTAction output to the
+// next test's resolve of a same-named RESTAction (#1347 review F1). Production
+// never resets the tracker: there every delete, recreate or edit of a captured
+// dep bumps its bucket and drops the entry.
+func dropTrackedResolveMemoEntriesForTest() {
+	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
+		mo := k.(*SeedResolveMemo)
+		mo.mu.Lock()
+		for key, v := range mo.m {
+			mo.removeLocked(key, v)
+		}
+		mo.mu.Unlock()
+		return true
+	})
+}
+
 // UntrackDepMoves stops TrackDepMoves for mo. nil-safe and idempotent.
 func UntrackDepMoves(mo *SeedResolveMemo) {
 	if mo == nil {

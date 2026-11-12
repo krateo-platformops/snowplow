@@ -32,12 +32,15 @@
 // (api.SummarizeStageOutcomes). Distinct from #1265's snowplow.serve.*.
 //
 // WHICH RESPONSES. Exactly the ones whose header carries the outcomes: a
-// RESTAction /call (GET, POST /call/read, inline), cold or an L1 hit, and an
-// /export (its pages merged). A hit answers with the outcomes the resolve that
-// stored the cell produced, kept on the entry (stage_outcomes_header.go), so
-// the span carries those: nothing is invented for a hit. A response without
-// the header (a widget, any other route, a request refused before the
-// resolve) gets neither attribute. The value read is the response's FINAL
+// RESTAction /call (GET, POST /call/read, inline), cold or an L1 hit, an
+// /export (its pages merged), and (#1319) a widget /call whose apiRef
+// RESTAction had a stage that did not succeed, cold or an L1 hit. A hit
+// answers with the outcomes the resolve that stored the cell produced, kept on
+// the entry (stage_outcomes_header.go), so the span carries those: nothing is
+// invented for a hit. A response without the header (a complete widget,
+// whose header is absent by contract; any other route; a request refused
+// before the resolve) gets neither attribute. So a widget span never reads
+// snowplow.stages.failed=0: absent means complete, on the wire and the span. The value read is the response's FINAL
 // header, after the handler returned, so a withdrawn stale pass (#710, which
 // deletes the header and re-runs) reports its re-run's outcomes.
 //

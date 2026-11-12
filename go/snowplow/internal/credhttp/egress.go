@@ -19,6 +19,6 @@ var BrowserEgress transport.WrapperFunc
 // build sets it (egress_js.go).
 var browserFetchOptions transport.WrapperFunc
 
-// PlumbingClient is c itself on a server build. Only the js/wasm build changes
+// plumbingClient is c itself on a server build. Only the js/wasm build changes
 // it (egress_js.go).
-func PlumbingClient(c *http.Client) *http.Client { return c }
+func plumbingClient(c *http.Client) *http.Client { return c }

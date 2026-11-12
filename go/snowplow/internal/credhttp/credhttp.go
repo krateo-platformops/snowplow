@@ -87,10 +87,10 @@
 //
 // And the browser's own credentials are never sent: every request reaches
 // fetch with its credentials mode "omit", through guardedTransport or a
-// plumbing client passed through PlumbingClient (egress_js.go says which
+// plumbing client passed through plumbingClient (egress_js.go says which
 // paths take which).
 //
-// A server build is unaffected: BrowserEgress is nil there and PlumbingClient
+// A server build is unaffected: BrowserEgress is nil there and plumbingClient
 // returns its client unchanged (egress.go).
 package credhttp
 

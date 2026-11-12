@@ -27,13 +27,15 @@ import (
 //     it fetch's default, same-origin, sends the frame's cookies with a
 //     request to the frame's origin (the JWKS, for one). guardedTransport goes
 //     through it, and every client plumbing builds does through
-//     PlumbingClient.
+//     plumbingClient.
 //
 // Every request therefore reaches fetch through one of two chains, both
 // carrying both options: guardedTransport (every client built here that names
 // no transport of its own, and BrowserEgress, which IS guardedTransport) and a
-// plumbing client passed through PlumbingClient (the /call passthrough, the
-// plumbing branch of a stage fetch, the JWKS key source).
+// plumbing client passed through plumbingClient (the /call passthrough, do.go;
+// PlumbingEndpointClient, the plumbing branch of a stage fetch; JWKSKeySource,
+// the JWKS key source: plumbing_clients.go). Only credhttp builds plumbing's
+// clients (plumbing_client_fence_1359_test.go).
 
 // BrowserEgress, on js/wasm, replaces the transport it wraps with
 // guardedTransport, which sends through the browser's fetch. It is installed
@@ -61,13 +63,13 @@ var browserFetchOptions transport.WrapperFunc = func(rt http.RoundTripper) http.
 	return omitCredentials{next: rt}
 }
 
-// PlumbingClient is c, a client plumbing built (request.HTTPClientForEndpoint,
+// plumbingClient is c, a client plumbing built (request.HTTPClientForEndpoint,
 // dialguard.Client), as snowplow sends on it: its transport goes through
 // browserFetchOptions. plumbing's chain already refuses redirects
 // (dialguard.RoundTripper) and leaves the credentials mode at fetch's default.
 // nil-safe; a client with no transport of its own is left as it is (plumbing
 // builds none).
-func PlumbingClient(c *http.Client) *http.Client {
+func plumbingClient(c *http.Client) *http.Client {
 	if c != nil && c.Transport != nil {
 		c.Transport = browserFetchOptions(c.Transport)
 	}

@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,7 +30,6 @@ import (
 
 	krateoaudit "github.com/krateo-platformops/audit"
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/kubeutil"
@@ -234,7 +234,7 @@ func newRequestChain(log *slog.Logger) use.Chain {
 //
 // It is a function so the route the pod serves is the one the tests drive
 // (main_telemetry_1015_test.go).
-func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
+func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
 	var h http.Handler = http.NotFoundHandler()
 	if ingest != nil {
 		h = rum.CountAuthFailures(chain.Append(
@@ -265,7 +265,7 @@ func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySo
 //
 // It is a function (not inline in main) so the route table is testable with a
 // test identity middleware in place of the JWT + clientconfig lookup.
-func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+func mountCallWriteRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
 	writes := []struct {
 		method string
 		scope  string
@@ -310,7 +310,7 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 //
 // It is a function (not inline in main) so the route table is testable with a
 // test identity middleware, as mountCallWriteRoutes is.
-func mountExportRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+func mountExportRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
 	for _, r := range []struct {
 		pattern string
 		handler http.Handler
@@ -484,6 +484,11 @@ func main() {
 	//   - authn stays off the hot path of every token validation.
 	// Absent an explicit --jwks-url, derive it from the authn base URL already
 	// configured for the #57 token exchange — one URL to get wrong, not two.
+	if err := checkJWKSRequestTimeout(*jwksTimeout); err != nil {
+		// log-ctx-waiver: boot: process start, before a context exists
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
 	if resolvedJWKSURL == "" {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
@@ -493,13 +498,13 @@ func main() {
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
-	// The client is the one plumbing builds by default (dialguard.Client, with
-	// the request timeout), passed through credhttp.PlumbingClient: on js/wasm
-	// that sets fetch's credentials mode, so the browser attaches none of the
-	// frame's cookies to the JWKS fetch (credhttp/egress_js.go); on a server
-	// build it is the client itself.
-	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
-		jwtutil.WithJWKSHTTPClient(credhttp.PlumbingClient(dialguard.Client(*jwksTimeout))),
+	// credhttp builds the key source's client: the one plumbing builds by
+	// default (dialguard.Client) at the request timeout, positive by
+	// checkJWKSRequestTimeout above. On js/wasm it sets fetch's credentials
+	// mode, so the browser attaches none of the frame's cookies to the JWKS
+	// fetch (credhttp/plumbing_clients.go); on a server build it is plumbing's
+	// client itself.
+	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
 		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
 	log.Info("JWT verification keys sourced from authn JWKS",
@@ -1352,23 +1357,26 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// #1362: every route goes through routeTable, which refuses a /debug
+	// pattern outside registerDebugRoutes (see debug_routes.go).
+	routes := newRouteTable(mux)
 
-	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
+	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
-	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
-	mux.Handle("GET /readyz", handlers.ReadyCheck())
+	routes.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	routes.Handle("GET /readyz", handlers.ReadyCheck())
 	// Ship D (0.30.141, architectural-consistency invariant) —
 	// /api-info/names is `/call`-class read; scope as `plurals` so the
 	// invariant counter classifies any apiserver fall-through from this
 	// route. cache.FallthroughScopeMiddleware is a no-op when
 	// CACHE_ENABLED=false (project_caching_is_provisional).
-	mux.Handle("GET /api-info/names", chain.Append(
+	routes.Handle("GET /api-info/names", chain.Append(
 		cache.FallthroughScopeMiddleware(cache.ScopePlurals)).
 		Then(handlers.Plurals()))
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 
-	mux.Handle("GET /list", chain.Append(
+	routes.Handle("GET /list", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeList)).
 		Then(handlers.List()))
@@ -1379,7 +1387,7 @@ func main() {
 	// scope label we use call-generic (the dispatcher's fallthrough lane
 	// is the F-1 site). The restactions / widgets dispatcher entries
 	// inherit the scope via the same ctx.
-	mux.Handle("GET /call", chain.Append(
+	routes.Handle("GET /call", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
@@ -1401,7 +1409,7 @@ func main() {
 	// never a create. Same read-path invariant as GET /call, so it is
 	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
 	// fails if either half is missing).
-	mux.Handle("POST /call/read", chain.Append(
+	routes.Handle("POST /call/read", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		middleware.BodyExtrasDecode,
@@ -1424,7 +1432,7 @@ func main() {
 	// ?extras=); it mirrors POST /call/read exactly. Both export routes are
 	// mounted by mountExportRoutes (so the route table is testable) and are
 	// required scoped routes (requiredScopedRoutes).
-	mountExportRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	mountExportRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
@@ -1440,7 +1448,7 @@ func main() {
 	refreshesHandler := chain.Append(
 		middleware.RefreshAuth(jwtKeys)).
 		Then(handlers.Refreshes())
-	mux.Handle("GET /refreshes", refreshesHandler)
+	routes.Handle("GET /refreshes", refreshesHandler)
 	// #560 — the SAME handler on POST. The GET form carries the subscription set
 	// in `?sub=`, which grows ~361 bytes per widget: a 50-widget page sends an
 	// 18 KB URL and the ingress returns 431 before snowplow sees it, so live
@@ -1448,7 +1456,7 @@ func main() {
 	// coordinate array in the body, which has no request-line limit. Same path,
 	// same auth, same semantics, still zero apiserver reads — and GET stays
 	// byte-identical so the server can land ahead of the client.
-	mux.Handle("POST /refreshes", refreshesHandler)
+	routes.Handle("POST /refreshes", refreshesHandler)
 
 	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
 	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
@@ -1460,18 +1468,18 @@ func main() {
 	// before any binding exists. DELIBERATELY NOT cache.RegisterScopedRoute'd:
 	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
 	// outside the read-path-scoped invariant (fallthrough_assert.go).
-	mux.Handle("GET /rbac", chain.Append(
+	routes.Handle("GET /rbac", chain.Append(
 		middleware.UserConfig(jwtKeys, *authnNS)).
 		Then(handlers.RBAC()))
 
-	mountCallWriteRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	mountCallWriteRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
 	// #443 — GET /capabilities: a static, unauthenticated token list a client
 	// gates on by presence (a 404 means none). No identity, no apiserver call,
 	// so it is outside the read-path-scoped invariant (like /refreshes).
-	mux.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
+	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
-	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+	routes.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 
 	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
 	// On only under the OTel trace contract with a collector endpoint
@@ -1479,7 +1487,7 @@ func main() {
 	// runs until main returns.
 	rumCtx, rumStop := context.WithCancel(context.Background())
 	defer rumStop()
-	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx, mux))
+	mountTelemetryRoute(routes, chain, jwtKeys, newRUMIngest(rumCtx, mux))
 	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register
@@ -1548,10 +1556,12 @@ func main() {
 	// Extracted into a named registrar (debug_routes.go) so the gating is
 	// testable against production wiring — the same shape snowplowCORSOptions
 	// uses for the CORS contract. /health + /readyz above stay ANONYMOUS (the
-	// kubelet presents no JWT); /swagger/ is unchanged.
+	// kubelet presents no JWT); /swagger/ is unchanged. #1362: every route is
+	// also authorized (middleware.DebugAuthz): RBAC `nonResourceURLs` for the
+	// JWT's identity, so an authenticated caller without the grant gets 403.
 	//
 	// MUST come after the expvar publishers registered just above.
-	registerDebugRoutes(mux, chain, jwtKeys)
+	registerDebugRoutes(routes, chain, jwtKeys)
 
 	// The signals that start a graceful shutdown: shutdown_signals.go on a
 	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.
@@ -1646,6 +1656,22 @@ func main() {
 // only inside the !cache.Disabled() branch), not here.
 func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
+}
+
+// errJWKSRequestTimeoutNotPositive refuses a non-positive
+// --jwks-request-timeout / JWT_JWKS_REQUEST_TIMEOUT at startup. The timeout
+// bounds every JWKS fetch, and a token validation waits on one, so without a
+// bound an authn that accepts the connection and never answers hangs every
+// authentication. The default is 5 s.
+var errJWKSRequestTimeoutNotPositive = errors.New("--jwks-request-timeout/JWT_JWKS_REQUEST_TIMEOUT must be positive: it bounds every JWKS fetch, and an unbounded one can hang every authentication")
+
+// checkJWKSRequestTimeout is errJWKSRequestTimeoutNotPositive, with the value
+// given, when d is not positive.
+func checkJWKSRequestTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w (got %s)", errJWKSRequestTimeoutNotPositive, d)
+	}
+	return nil
 }
 
 // parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
