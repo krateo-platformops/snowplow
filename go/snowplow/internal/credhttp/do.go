@@ -107,9 +107,6 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
 	}
-	// js/wasm only: fetch's credentials mode (egress_js.go). Innermost of
-	// snowplow's layers, so the wire dump never sees the option.
-	cli = plumbingClient(cli)
 	if opts.Endpoint != nil && opts.Endpoint.Debug {
 		cli.Transport = WireDump(cli.Transport)
 	}

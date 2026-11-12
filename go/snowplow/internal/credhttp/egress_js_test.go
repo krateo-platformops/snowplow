@@ -58,13 +58,6 @@ func TestBrowserEgress_IdentityWhereFetchIsNotUsed(t *testing.T) {
 	if got := BrowserEgress(rec); got != http.RoundTripper(rec) {
 		t.Fatalf("BrowserEgress replaced the transport where net/http dials (%T)", got)
 	}
-	if got := browserFetchOptions(rec); got != http.RoundTripper(rec) {
-		t.Fatalf("browserFetchOptions wrapped the transport where net/http dials (%T)", got)
-	}
-	c := &http.Client{Transport: rec}
-	if plumbingClient(c) != c || c.Transport != http.RoundTripper(rec) {
-		t.Fatal("plumbingClient changed a client where net/http dials")
-	}
 
 	// And a hardened chain still reaches a server on the in-process network.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -84,24 +77,6 @@ func TestBrowserEgress_IdentityWhereFetchIsNotUsed(t *testing.T) {
 	resp.Body.Close()
 	if string(b) != "ok" {
 		t.Fatalf("body %q", b)
-	}
-}
-
-func TestBrowserEgress_OmitCredentialsSetsTheOptionOnAClone(t *testing.T) {
-	if !usesFetch {
-		t.Skip("fetch is not used here")
-	}
-	rec := &egressRecordingRT{}
-	req, _ := http.NewRequest(http.MethodGet, "https://kubernetes.sandbox.invalid/api", nil)
-	req.Header.Set(fetchCredentialsOption, "include")
-	if _, err := browserFetchOptions(rec).RoundTrip(req); err != nil {
-		t.Fatal(err)
-	}
-	if got := rec.got.Header.Get(fetchCredentialsOption); got != "omit" {
-		t.Errorf("credentials mode %q, want omit", got)
-	}
-	if got := req.Header.Get(fetchCredentialsOption); got != "include" {
-		t.Errorf("the caller's request was modified: %q", got)
 	}
 }
 
@@ -171,7 +146,7 @@ func TestBrowserFetch_HardenKeepsTheWrappersRcCarried(t *testing.T) {
 
 // L4: every way a request reaches fetch sets credentials "omit" (and redirect
 // "error"): guardedTransport, a hardened config (BrowserEgress), the /call
-// passthrough (Do, plumbing's client through plumbingClient), the JWKS key
+// passthrough (Do, plumbing's own client), the JWKS key
 // source main builds (JWKSKeySource) and the stage fetch's plumbing branch
 // (PlumbingEndpointClient). The fetch spy records the options fetch was
 // actually called with.

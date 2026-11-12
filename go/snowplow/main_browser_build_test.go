@@ -15,8 +15,8 @@ import (
 // constrained to js && wasm. These tests prove the server build contains none
 // of it: neither the bridge package nor syscall/js, and the seams the server
 // build does compile install nothing there: credhttp.BrowserEgress is nil
-// here, and credhttp's own TestBrowserBuild_ test shows its plumbing clients
-// are plumbing's unchanged (egress_server_test.go).
+// here, and credhttp's own TestBrowserBuild_ test shows guardedTransport is
+// dialguard's transport unchanged (egress_server_test.go).
 
 const browserBridgePkg = "github.com/krateo-platformops/snowplow/internal/browserbridge"
 

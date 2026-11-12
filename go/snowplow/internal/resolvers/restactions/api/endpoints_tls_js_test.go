@@ -67,9 +67,9 @@ func TestBrowserFetch_OwnedStageFetchLeavesThroughFetch(t *testing.T) {
 }
 
 // L4: the plumbing branch (here a password-only basic endpoint, which the
-// owned branch does not take) is plumbing's client, which sets fetch's
-// redirect mode itself and not its credentials mode: credhttp.PlumbingEndpointClient
-// sets that.
+// owned branch does not take) is plumbing's client
+// (credhttp.PlumbingEndpointClient), on which plumbing's dialguard.RoundTripper
+// sets fetch's redirect and credentials modes.
 func TestBrowserFetch_PlumbingStageFetchOmitsCredentials(t *testing.T) {
 	jsfetch.FetchOnly(t)
 	ep := &endpoints.Endpoint{Password: "p"}
