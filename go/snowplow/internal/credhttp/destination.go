@@ -42,7 +42,6 @@ import (
 
 	"github.com/krateo-platformops/plumbing/dialguard"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"k8s.io/client-go/transport"
 )
 
 // DestinationRefusedReason is the reason of the envelope a refused destination
@@ -54,15 +53,12 @@ const DestinationRefusedReason = "DestinationRefused"
 // dialer, and it is shared, as http.DefaultTransport was.
 //
 // It goes through dialguard.RoundTripper, as plumbing requires of any client
-// built on dialguard.Transport (plumbing v1.52.0, dialguard/roundtripper.go).
-// On a server build that returns the transport itself. On js/wasm it refuses
-// every redirect, because the browser's fetch would follow one where neither
-// CheckRedirect nor RefuseRedirectHops sees it (#1360).
-//
-// Then through browserFetchOptions, which is nil on a server build
-// (transport.Wrappers skips it) and on js/wasm sets fetch's credentials mode to
-// "omit" (egress_js.go).
-var guardedTransport http.RoundTripper = transport.Wrappers(dialguard.RoundTripper, browserFetchOptions)(dialguard.Transport())
+// built on dialguard.Transport (dialguard/roundtripper.go). On a server build
+// that returns the transport itself. On js/wasm it refuses every redirect,
+// because the browser's fetch would follow one where neither CheckRedirect nor
+// RefuseRedirectHops sees it (#1360), and sends no browser credentials
+// (plumbing >= v1.54.0; egress_js.go).
+var guardedTransport http.RoundTripper = dialguard.RoundTripper(dialguard.Transport())
 
 // DestinationRefused reports whether err is the destination policy's refusal.
 func DestinationRefused(err error) bool {

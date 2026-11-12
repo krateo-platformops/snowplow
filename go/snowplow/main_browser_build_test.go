@@ -16,8 +16,8 @@ import (
 // of it: neither the bridge package, the sandbox's fake apiserver
 // (internal/sandbox/...) nor syscall/js, and the seams the server build does
 // compile install nothing there: credhttp.BrowserEgress is nil here, and
-// credhttp's own TestBrowserBuild_ test shows its plumbing clients are
-// plumbing's unchanged (egress_server_test.go).
+// credhttp's own TestBrowserBuild_ test shows guardedTransport is
+// dialguard's transport unchanged (egress_server_test.go).
 
 const (
 	browserBridgePkg = "github.com/krateo-platformops/snowplow/internal/browserbridge"

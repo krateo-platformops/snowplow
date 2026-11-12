@@ -10,7 +10,7 @@
 #   5. the fake apiserver's field selectors equal kube-apiserver's (scripts/checkfieldlabels);
 #   6. the server build contains none of the browser code (main_browser_build_test.go:
 #      no internal/browserbridge, no internal/sandbox/..., no syscall/js, credhttp.BrowserEgress nil,
-#      credhttp's plumbing clients plumbing's own).
+#      credhttp's guardedTransport dialguard's own).
 #
 # Run from go/snowplow. Needs node on PATH for steps 3 and 4.
 set -euo pipefail
@@ -29,7 +29,7 @@ GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge ./internal/sandbox/...
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
-# "node": Go's in-process network, where BrowserEgress and credhttp's plumbing clients must
+# "node": Go's in-process network, where BrowserEgress must
 # be the identity) and a renamed argv0 (net/http uses Node's fetch, as a
 # browser's). In fetch mode no TestBrowserFetch_ test may skip: a skip there
 # means the mode was not the one this script meant, and nothing was checked.
