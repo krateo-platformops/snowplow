@@ -4,17 +4,20 @@
 //
 // THE DEFECT CLASS: X-Snowplow-Stage-Outcomes on a CACHED answer is the value
 // the resolve that stored the cell kept on the entry (#904). It is kept by hand
-// at each restactions-class Put site (the /call dispatcher, the cohort seed, the
-// refresher), exactly the "stamp ALL sites of a class, or none" shape #118(d)
-// found: a new Put site that forgets the field silently answers [] ("all
-// succeeded") for a resolve whose write was skipped. This gate makes that a hard
-// failure:
+// at each Put site that resolves (the /call dispatchers, the cohort seed, the
+// refresher, the walker's content populate), exactly the "stamp ALL sites of a
+// class, or none" shape #118(d) found: a new Put site that forgets the field
+// silently answers "all succeeded" ([] on a RESTAction, no header on a widget,
+// #1319) for a resolve whose stage did not complete. This gate makes that a
+// hard failure:
 //
 //   - every `ResolvedEntry{...}` literal under internal/handlers/dispatchers
 //     must set StageOutcomes as a keyed element, OR
 //   - carry `// stage-outcomes-waiver: <reason>` on its line or in the comment
-//     block directly above it — a cell of a class that never answers a
-//     RESTAction /call (widgets, widgetContent). The reason is mandatory.
+//     block directly above it — a cell whose answer carries no stage outcomes.
+//     Since #1319 every class that answers a /call does (widgets and
+//     widgetContent included), so no production site carries one today. The
+//     reason is mandatory.
 package main
 
 import (
@@ -31,8 +34,8 @@ import (
 // stageOutcomesField is the entry field the site-class 5 invariant is keyed on.
 const stageOutcomesField = "StageOutcomes"
 
-// stageOutcomesWaiverPrefix exempts a literal of a class that never answers a
-// RESTAction /call.
+// stageOutcomesWaiverPrefix exempts a literal of a cell whose answer carries
+// no stage outcomes.
 const stageOutcomesWaiverPrefix = "stage-outcomes-waiver:"
 
 // stageOutcomesScope is the path segment of the dispatcher Put sites.
