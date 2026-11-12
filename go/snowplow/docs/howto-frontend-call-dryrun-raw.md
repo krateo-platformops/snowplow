@@ -240,8 +240,13 @@ Content-Type: application/json
     edited).
   - Changed in #904: a succeeded stage is no longer listed (it was
     `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
-    rows is unaffected. In a dry run a write stage depending on another write
-    stage still reports `StageNotExecuted`, never `Skipped`.
+    rows is unaffected. In a dry run, a write stage that depends on another
+    write stage reports `StageNotExecuted`, not `Skipped`, when the stage it
+    depends on only reports `StageNotExecuted`. If the stage it depends on
+    has an item that failed on its own (`InvalidPath`, `TemplateError`),
+    that stage reports the failure (a failure outranks `StageNotExecuted`,
+    #1347). Its dependent writes then report `Skipped`, exactly as in the
+    real run.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
   error). An endpointRef naming a per-user credential Secret
