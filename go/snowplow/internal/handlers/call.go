@@ -8,6 +8,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -149,12 +150,19 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	uri, err := buildURIPath(opts)
+	uri, dialled, asked, err := dialledTarget(opts)
 	if err != nil {
 		// #1257 — a value that is not one path segment is the caller's
 		// error: refused before anything is dialled, as validateRequest's
 		// refusals are.
 		response.BadRequest(wri, err)
+		return
+	}
+	if callAudited(opts.verb) && !asked {
+		// F3 (#1379 review) — the apiserver would act on another object than
+		// the one the request names, so its record could not describe both:
+		// refused before the dial.
+		response.BadRequest(wri, errDialNotAsked)
 		return
 	}
 
@@ -242,7 +250,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// mutations. The request log and trace id once named as their cover do not
 	// cover them (measured on 057: no outcome/resource/session in the gateway
 	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
-	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+	if callAudited(opts.verb) {
 		// #1298 — a failed /call is recorded from what was observed at the
 		// dial (credhttp.Answer.Outcome, the stage records' closed set), never
 		// from rt: rt.Message is the apiserver's Status.message, which names
@@ -257,28 +265,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = answered.Outcome()
 		}
-		// A dry run (#443, /call/dry-run: the apiserver is always sent
-		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
-		// as krateo.action=call.dryRun, krateo.audit.dry_run=true and with no
-		// written object (#957). The verb is the apiserver's for the URI that
-		// was dialled (#1291).
-		// #1378 — the record names the object the apiserver wrote: the
-		// dialled path's name, or, for a create (no name in the path), the
-		// name the apiserver gave it (dialledObjectName).
-		target := auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}
-		target.nsn.Name = dialledObjectName(opts, outcome, answer)
-		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, code)
-		ev.DryRun = opts.dryRun
-		ev.Message = msg
-		// #1333 — the client's provenance (X-Krateo-Provenance), validated
-		// against its closed schema: the asserted krateo.audit.client.* keys,
-		// or krateo.audit.client.rejected alone. It is the client's word and
-		// sets nothing else on the record; the write above ran either way.
-		ev.Client = audit.ProvenanceOf(req.Header)
+		ev := callAuditEvent(req, opts, uri, dialled, outcome, answer)
+		ev.StatusCode, ev.Message = code, msg
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		audit.RecordWrittenObject(&ev, answer)
-		audit.Emit(req.Context(), ev)
+		audit.EmitRoute(req.Context(), ev)
 	}
 
 	if rt.Status == response.StatusFailure {
@@ -750,6 +742,67 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 
 	return uriPath, nil
+}
+
+// errDialNotAsked is the refusal of a /call write whose dial the apiserver
+// would resolve to another object than the one the request names.
+var errDialNotAsked = errors.New("the request names an object the apiserver would not act on: the path it builds resolves to another one")
+
+// callAudited reports whether a /call request with verb is audited: every
+// write. Reads are not (AUDIT-4 covers mutations).
+func callAudited(verb string) bool {
+	return has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, verb)
+}
+
+// callAuditEvent is a /call write's record before what the authority answered
+// is added: the one builder of it, for the handler and for the route's audit
+// descriptor (CallRoute).
+//
+//   - A dry run (#443, /call/dry-run: the apiserver is always sent
+//     dryRun=All, and a plain /call refuses an inbound dryRun) is recorded as
+//     krateo.action=call.dryRun, krateo.audit.dry_run=true and with no written
+//     object (#957). The verb is the apiserver's for the URI that is dialled
+//     (#1291), and the method the one sent, which is that verb's.
+//   - F3 (#1379 review) — the target is the apiserver's classification of the
+//     dial (dialledTarget), so it describes the dial by construction; #1378 —
+//     a create's name is the object the apiserver wrote (dialledObjectName).
+//   - #1333 — the client's provenance (X-Krateo-Provenance), validated
+//     against its closed schema: the asserted krateo.audit.client.* keys, or
+//     krateo.audit.client.rejected alone. It is the client's word and sets
+//     nothing else on the record.
+func callAuditEvent(req *http.Request, opts callOptions, uri string, dialled auditTarget, outcome string, answer []byte) audit.Event {
+	target := dialled
+	target.nsn.Name = dialledObjectName(opts, dialled, outcome, answer)
+	ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, 0)
+	ev.DryRun = opts.dryRun
+	ev.Client = audit.ProvenanceOf(req.Header)
+	return ev
+}
+
+// CallRoute is the audit descriptor of the write /call routes (POST, PUT,
+// PATCH, DELETE /call); CallDryRunRoute of /call/dry-run. Each asks the
+// route's own handler what a request asked for.
+func CallRoute() audit.Route { return audit.Route{Asked: Call().(*callHandler).asked} }
+
+// CallDryRunRoute is the audit descriptor of /call/dry-run (see CallRoute).
+func CallDryRunRoute() audit.Route { return audit.Route{Asked: CallDryRun().(*callHandler).asked} }
+
+// asked is the record of what req asks the handler to write, by the rules its
+// dial is built with: the object the apiserver would act on, when the request
+// names one the handler would dial; otherwise the action and the method alone
+// (the method is the one /call sends, the verb that method's lowercase, the
+// apiserver's non-resource rule), and the shared writer marks the target.
+func (r *callHandler) asked(req *http.Request) audit.Event {
+	unresolved := audit.Event{Action: "call", HTTPMethod: req.Method, Verb: audit.MethodVerb(req.Method), DryRun: r.dryRun}
+	opts, err := r.validateRequest(req)
+	if err != nil {
+		return unresolved
+	}
+	uri, dialled, asked, err := dialledTarget(opts)
+	if err != nil || !asked {
+		return unresolved
+	}
+	return callAuditEvent(req, opts, uri, dialled, "", nil)
 }
 
 // nameInPath reports whether buildURIPath puts the object's name in the path

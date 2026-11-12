@@ -507,7 +507,9 @@ func TestIssue1362_RouteTableRefusesDebugOutsideTheGate(t *testing.T) {
 		p := p
 		mustPanic("Handle("+p+")", func() { newRouteTable(http.NewServeMux()).Handle(p, ok) })
 	}
-	for _, p := range []string{"GET /call", "/debugger", "GET /debugx/y", "GET /api/debug"} {
+	// #1379 review F2: Handle also refuses a pattern whose method can change
+	// something (no method included), so the non-debug patterns name GET.
+	for _, p := range []string{"GET /call", "GET /debugger", "GET /debugx/y", "GET /api/debug"} {
 		p := p
 		func() {
 			defer func() {
@@ -619,7 +621,7 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 						} else if len(call.Args) != 2 || !strings.HasPrefix(i1362Src(fset, call.Args[1]), "gated.Then(") {
 							t.Errorf("%s: handleDebug's handler is not gated.Then(...): %s", pos, i1362Src(fset, call))
 						}
-					case name == "Handle":
+					case name == "Handle" || name == "HandleAudited" || name == "HandleUnaudited":
 						if n, ok := sel.Recv().(*types.Pointer); ok {
 							if nn, ok := n.Elem().(*types.Named); ok && nn.Obj().Name() == "routeTable" {
 								tableHandleCalls++
@@ -644,10 +646,11 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 	if mountCalls != len(debugRoutePatterns) {
 		t.Errorf("registerDebugRoutes calls mount %d times; debugRoutePatterns lists %d", mountCalls, len(debugRoutePatterns))
 	}
-	// Non-vacuity: the scan sees routeTable's own two delegations and main's
-	// route mounts, so a broken type resolution cannot read as a clean bill.
-	if rawMuxInTable != 2 {
-		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 2", rawMuxInTable)
+	// Non-vacuity: the scan sees routeTable's own four delegations (Handle,
+	// HandleAudited, HandleUnaudited, handleDebug) and main's route mounts, so
+	// a broken type resolution cannot read as a clean bill.
+	if rawMuxInTable != 4 {
+		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 4", rawMuxInTable)
 	}
 	if tableHandleCalls < 10 {
 		t.Errorf("NON-VACUITY: saw only %d routeTable.Handle calls in main", tableHandleCalls)

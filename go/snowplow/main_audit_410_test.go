@@ -70,7 +70,7 @@ func TestAudit410_C4_AuthenticationFailure_IsNotAudited(t *testing.T) {
 	got, ep := fakeAPIMain443(t)
 
 	mux := http.NewServeMux()
-	mountCallWriteRoutes(mux, use.NewChain(audit.Middleware()),
+	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(audit.Middleware()),
 		middleware.UserConfig(jwtutil.NewStaticKeySource(&trusted.PublicKey), "krateo-system"))
 
 	cases := map[string]string{
@@ -101,7 +101,7 @@ func TestAudit410_C4_AuthenticationFailure_IsNotAudited(t *testing.T) {
 
 	// Control: the same route table, an authenticated caller — one record.
 	ok := http.NewServeMux()
-	mountCallWriteRoutes(ok, use.NewChain(audit.Middleware()), testUserConfig443(ep))
+	mountCallWriteRoutes(newRouteTable(ok), use.NewChain(audit.Middleware()), testUserConfig443(ep))
 	if code := serve410(ok, do443Req(http.MethodPost, "/call"+cmQ443)); code != http.StatusOK {
 		t.Fatalf("control: authenticated POST /call → %d, want 200", code)
 	}

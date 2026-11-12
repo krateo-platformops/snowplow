@@ -197,8 +197,11 @@ func TestExport1251_GETAndPOSTCarryTheRequestFacts(t *testing.T) {
 			if a := got["krateo.action"].AsString(); a != "export" {
 				t.Fatalf("precondition: krateo.action = %q", a)
 			}
-			if m := got["http.request.method"].AsString(); m != c.method {
-				t.Fatalf("precondition: http.request.method = %q, want %q", m, c.method)
+			// F1 (#1379 review): the method the export SENT, GET, whatever
+			// method it was served with; krateo.request.uri says what it
+			// received.
+			if m := got["http.request.method"].AsString(); m != http.MethodGet {
+				t.Fatalf("precondition: http.request.method = %q, want GET", m)
 			}
 			wantFacts1251(t, got, []string{browser1251, gatewayPeer1251}, target)
 			if v, has := got["k8s.object.uid"]; has {

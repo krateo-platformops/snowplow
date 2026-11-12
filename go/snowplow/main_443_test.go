@@ -125,7 +125,7 @@ func TestS443_Capabilities(t *testing.T) {
 func TestS443_Routes(t *testing.T) {
 	got, ep := fakeAPIMain443(t)
 	mux := http.NewServeMux()
-	mountCallWriteRoutes(mux, use.NewChain(), testUserConfig443(ep))
+	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(), testUserConfig443(ep))
 
 	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
 		before := len(got())

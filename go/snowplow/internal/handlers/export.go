@@ -353,7 +353,7 @@ func (a *exportAudit) emit() {
 	}
 	ev := exportAuditEvent(a.req, a.outcome, a.code)
 	ev.Message = a.message
-	audit.Emit(a.req.Context(), ev)
+	audit.EmitRoute(a.req.Context(), ev)
 }
 
 // renderPDF builds the document. A variable so a test can make the render

@@ -3,7 +3,14 @@ package audit
 import (
 	"fmt"
 	"net/http"
+
+	krateoaudit "github.com/krateo-platformops/audit"
 )
+
+// DenialInvalidRequest is krateo.audit.denial_reason on a denied record of a
+// request snowplow refused as invalid before sending anything (the request
+// writer's closed set).
+const DenialInvalidRequest = krateoaudit.DenialReasonInvalidRequest
 
 // outcome.go — the closed set of a record's body for an action that dialled an
 // authority: the /call write record (handlers/call.go) and the RESTAction stage
