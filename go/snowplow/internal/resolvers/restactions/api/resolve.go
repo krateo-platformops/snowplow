@@ -427,7 +427,10 @@ func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error
 	if !call.ContinueOnError {
 		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
 	}
-	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
+	// #1319 — its own closed code (NotFoundForRequester, a denial for the
+	// client), not the NotFound a plain 404 reads: the errorKey body is the
+	// same canonical 404 Status.
+	r.recordItemErrorAs(StageReasonNotFoundForRequester, dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
 	notePerIdentityForbidden(r.ctx, false)
 }
 
@@ -1695,7 +1698,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				itemErr = &causedItemError{text: itemErr.Error(), cause: fetchErr}
 			}
 		}
-		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
+		// #1319 — the definite per-identity NotFound reads its own closed
+		// code; every other answer's reason is read from its code as before.
+		reason := stageReasonOf(accumVal)
+		if isOwnNotFound {
+			reason = StageReasonNotFoundForRequester
+		}
+		r.recordItemErrorAs(reason, dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
 		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}

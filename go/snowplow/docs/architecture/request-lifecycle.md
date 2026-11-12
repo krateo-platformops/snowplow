@@ -140,7 +140,10 @@ bytes leave the pod (`widget_content.go`). The shell is never served verbatim.
   `GET /debug/pprof/*` registered on this mux directly (the server does not
   use `http.DefaultServeMux`); `GET /debug/servable` and `GET /debug/apistage`
   — cache diagnostics; `GET /debug/refreshes` — the refresh-subscription
-  registry, auth-gated with the same `RefreshAuth` as `/refreshes`.
+  registry. Every `/debug/*` route (`registerDebugRoutes`, `debug_routes.go`)
+  is authenticated with the same `RefreshAuth` as `/refreshes` and then
+  authorized by `middleware.DebugAuthz`, an RBAC non-resource check
+  (`nonResourceURLs: ["/debug/*"]`) for the JWT's identity (#1362).
 
 The mux is wrapped (inner → outer) by **gzip** (`gzhttp` via
 `middleware/compression.go` — Accept-Encoding-gated, SSE-excluded so

@@ -132,7 +132,9 @@ Content-Type: application/json
   stage succeeded. Use it when the draft's own `filter` drops the error keys
   from the body.
   - `reason` is a code from a closed set: `StageNotExecuted`, `Forbidden`,
-    `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
+    `NotFound` (a 404), `NotFoundForRequester` (#1319: a watched named
+    object that does not exist for this requester, the definite per-user
+    answer of #1080), `Unauthorized`, `NotRun` (the resolve stopped before this
     stage), `Skipped` (#904: a write stage not sent because the stage it depends
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
@@ -239,8 +241,13 @@ Content-Type: application/json
     edited).
   - Changed in #904: a succeeded stage is no longer listed (it was
     `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
-    rows is unaffected. In a dry run a write stage depending on another write
-    stage still reports `StageNotExecuted`, never `Skipped`.
+    rows is unaffected. In a dry run, a write stage that depends on another
+    write stage reports `StageNotExecuted`, not `Skipped`, when the stage it
+    depends on only reports `StageNotExecuted`. If the stage it depends on
+    has an item that failed on its own (`InvalidPath`, `TemplateError`),
+    that stage reports the failure (a failure outranks `StageNotExecuted`,
+    #1347). Its dependent writes then report `Skipped`, exactly as in the
+    real run.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
   error). An endpointRef naming a per-user credential Secret

@@ -36,7 +36,12 @@ X-Snowplow-Refresh-Digest: v1.<32 lowercase hex>
   changes it, every held digest simply differs once (one extra refetch per
   widget), never matches by accident.
 - It names **exactly the bytes of that response body**, the bytes this tab
-  rendered. For the identity-free `widgetContent` class the body is narrowed per
+  rendered, plus (#1319) the `X-Snowplow-Stage-Outcomes` the response carried
+  when a stage did not succeed. A complete answer's digest is the body's
+  alone, as before. An answer with incomplete stages digests differently, so a
+  cell that later completes with the same body still catches the tab up
+  ([howto-frontend-widget-stage-outcomes.md](howto-frontend-widget-stage-outcomes.md)
+  section 6). For the identity-free `widgetContent` class the body is narrowed per
   user (`status.resourcesRefs.items[].allowed`), so two users of the same key
   get different digests. That is intended: each tab is compared with what *its*
   `/call` would answer now.

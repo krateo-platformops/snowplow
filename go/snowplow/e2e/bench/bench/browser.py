@@ -853,11 +853,18 @@ def login_all():
 # it with urlopen mocked and no cluster). A probe-only invocation that never
 # called login_all sets SNOWPLOW_DEBUG_TOKEN, or calls set_debug_token().
 #
-# Any authenticated identity works: the gate validates the JWT signature and
-# does not authorize per-key, so the counters an operator sees are the ones the
-# bench reads. With no token the readers issue an anonymous GET — against a
-# pre-1.12.3 pod that still succeeds, and against a 1.12.3 pod it 401s and the
-# reader returns None, which every caller already fails closed on.
+# NOT every authenticated identity works since snowplow #1362. The gate also
+# AUTHORIZES the request through Kubernetes RBAC (`nonResourceURLs:
+# ["/debug/*"]`, verb get), so the token's identity must hold that grant, and
+# one without it gets 403. The parked login_all token is the FIRST user that
+# logged in: USERS lists `admin` first, and `admin` is in group `admins`, bound
+# to cluster-admin, which carries `nonResourceURLs: ["*"]`. So the normal bench
+# path holds the grant. If admin's login fails, cyberjoker's token is parked
+# instead, and the readers get 403. Note that set_debug_token overwrites an
+# environment-supplied SNOWPLOW_DEBUG_TOKEN once login_all runs, so on that path
+# it is admin's token that is read, not the environment's. With no token the
+# readers issue an anonymous GET, which 401s. A 401 or a 403 makes the reader
+# return None, and every caller already fails closed on that.
 
 DEBUG_TOKEN: str | None = os.environ.get("SNOWPLOW_DEBUG_TOKEN") or None
 

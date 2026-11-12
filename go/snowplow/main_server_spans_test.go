@@ -107,7 +107,7 @@ func buildSpanTestMux() *http.ServeMux {
 	mountCallWriteRoutes(mux, use.NewChain(), func(http.Handler) http.Handler { return stub })
 	mux.Handle("GET /capabilities", stub)
 	mux.Handle("POST /jq", stub)
-	registerDebugRoutes(mux, use.NewChain(), debugAuthTestKeys)
+	registerDebugRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys)
 	return mux
 }
 
