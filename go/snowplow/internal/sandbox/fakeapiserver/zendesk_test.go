@@ -200,6 +200,16 @@ func TestZendesk_RaiseIsFilingThenFiledInOrder(t *testing.T) {
 	eq(t, list.code, 200, "the ServiceAccount lists requests cluster-wide")
 	listRV := rv(list)
 	w := h.watch(zrAllPath+"?watch=1&resourceVersion="+listRV, req{as: "sa"})
+	// The watch's request line is logged once it is registered: from then on the ADDED event is a
+	// live delivery, not a replay from the watch cache.
+	for deadline := time.Now().Add(10 * time.Second); !logged(h, func(l map[string]any) bool {
+		return l["verb"] == "watch" && l["resource"] == "zendeskrequests" && l["identity"] == "sa"
+	}); {
+		if time.Now().After(deadline) {
+			t.Fatal("the watch was not registered within 10s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	name := "zr-sandbox-visitor-1794600000"
 	before := len(h.log())
