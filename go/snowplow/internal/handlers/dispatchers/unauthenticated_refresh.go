@@ -6,27 +6,46 @@ package dispatchers
 
 import (
 	"expvar"
+	"sync/atomic"
+
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
-// unauthenticatedRefreshRefused counts the refreshes resolveAndPopulateL1
-// refused because the cell's identity is not authenticated (cache.Authenticated)
-// and could not be impersonated, by whether the cell was evicted.
-// snowplow_unauthenticated_refresh_refused{evicted|absent} on /debug/vars.
-var unauthenticatedRefreshRefused = expvar.NewMap("snowplow_unauthenticated_refresh_refused")
+// unauthenticatedRefreshEvicted / unauthenticatedRefreshAbsent count the
+// refreshes resolveAndPopulateL1 refused because the cell's identity is not
+// authenticated (cache.Authenticated) and could not be impersonated, by whether
+// a cell was evicted.
+var unauthenticatedRefreshEvicted, unauthenticatedRefreshAbsent atomic.Int64
+
+// The refresher is a cache surface: published only with the cache on (CFG-1).
+func init() {
+	if cache.Disabled() {
+		return
+	}
+	expvar.Publish("snowplow_unauthenticated_refresh_refused", expvar.Func(func() any {
+		return map[string]int64{
+			"evicted": unauthenticatedRefreshEvicted.Load(),
+			"absent":  unauthenticatedRefreshAbsent.Load(),
+		}
+	}))
+}
 
 func noteUnauthenticatedRefreshRefused(evicted bool) {
 	if evicted {
-		unauthenticatedRefreshRefused.Add("evicted", 1)
+		unauthenticatedRefreshEvicted.Add(1)
 		return
 	}
-	unauthenticatedRefreshRefused.Add("absent", 1)
+	unauthenticatedRefreshAbsent.Add(1)
 }
 
 // UnauthenticatedRefreshRefused reads one snowplow_unauthenticated_refresh_refused
 // counter ("evicted" or "absent").
 func UnauthenticatedRefreshRefused(outcome string) int64 {
-	if v, ok := unauthenticatedRefreshRefused.Get(outcome).(*expvar.Int); ok {
-		return v.Value()
+	switch outcome {
+	case "evicted":
+		return unauthenticatedRefreshEvicted.Load()
+	case "absent":
+		return unauthenticatedRefreshAbsent.Load()
 	}
 	return 0
 }
