@@ -281,6 +281,28 @@ replica_cmd() {
   REPLICA_CMD=(python3 -m bench.custlat replica "${!oa}" "${!ob}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}"
                --launch "$PAIR_RUN_ID")
 }
+# stat_step <step> <out> <command> <dir 1> <dir 2> -- <cmd...>: #1390, one statistics step. Its start and end
+# lines in the pair log, with the input it reads; the command's own progress lines (custlat.progress, its
+# stderr) between them, each prefixed with the step; its stdout to <out>; its duration and input recorded in
+# $PAIR_OUT/statistics.jsonl (bench/statstime.py: what a later launch's TTL budget is measured from). Returns
+# the command's exit code.
+stat_step() {
+  local step="$1" out="$2" cmd="$3" d1="$4" d2="$5" t0 t1 rc bytes
+  shift 6
+  bytes="$(python3 -m bench.statstime input-bytes "$d1" "$d2" 2>/dev/null)" || bytes="unknown"
+  t0="$(date +%s)"
+  log "statistics: ${step} started (${bytes} bytes of k6 and browser streams)"
+  set +e
+  "$@" 2>&1 >"$out" | while IFS= read -r ln; do log "statistics: ${step}: ${ln}"; done
+  rc="${PIPESTATUS[0]}"
+  set -e
+  t1="$(date +%s)"
+  log "statistics: ${step} ended exit=${rc} after $(( t1 - t0 )) s"
+  python3 -m bench.statstime record --file "$PAIR_OUT/statistics.jsonl" --step "$step" --command "$cmd" \
+      --started "$t0" --ended "$t1" --exit "$rc" "$d1" "$d2" >/dev/null \
+    || log "statistics: ${step}: its duration could not be recorded in $PAIR_OUT/statistics.jsonl"
+  return "$rc"
+}
 
 runs_line=""
 for x in "${LABELS[@]}"; do
@@ -442,7 +464,8 @@ if [[ -n "$REPLICA_PAIR" ]]; then
   replica_cmd
   da="DONE_$ra" db="DONE_$rb"
   oa="OUT_$ra" ob="OUT_$rb"
-  if "${REPLICA_CMD[@]}" --completed "${!da}" "${!db}" > "$REPLICA_FILE"; then
+  if stat_step "replica ${REPLICA_PAIR}" "$REPLICA_FILE" replica "${!oa}" "${!ob}" -- \
+       "${REPLICA_CMD[@]}" --completed "${!da}" "${!db}"; then
     required+=(--require "${REPLICA_FILE##*/}")
   else
     # a crash of the replica's own tool: the file is removed, and each pair's `custlat pair
@@ -474,8 +497,10 @@ for p in "${PAIR_LIST[@]}"; do
   a="${p%%:*}" b="${p##*:}" f="$(verdict_file "$p")"
   pair_cmd "$p"
   da="DONE_$a" db="DONE_$b"
+  oa="OUT_$a" ob="OUT_$b"
   prc=0
-  "${PAIR_CMD[@]}" --completed-a "${!da}" --completed-b "${!db}" > "$f" || prc=$?
+  stat_step "pair ${a}:${b}" "$f" pair "${!oa}" "${!ob}" -- \
+      "${PAIR_CMD[@]}" --completed-a "${!da}" --completed-b "${!db}" || prc=$?
   required+=(--require "${f##*/}")
   log "paired verdict ${a} vs ${b} exit=${prc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $f"
   while IFS= read -r r; do

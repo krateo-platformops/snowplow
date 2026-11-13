@@ -154,6 +154,7 @@ import random
 import re
 import statistics
 import sys
+import time
 from statistics import NormalDist
 
 from bench import k6eval, load606
@@ -167,6 +168,12 @@ LOWER_IS_WORSE = ("req_s",)
 BLOCK_S = 10.0
 HALF_SAMPLES = 400
 HALF_SEED = 606
+
+
+def progress(msg: str) -> None:
+    """#1390 item 5: one line per statistics sub-step on stderr (run606_pair.sh writes each to the pair log with
+    the step it belongs to), so a watcher tells a slow step from a stuck one. stdout stays the JSON."""
+    print(f"custlat {time.strftime('%H:%M:%S', time.gmtime())}Z {msg}", file=sys.stderr, flush=True)
 FAMILY_ALPHA = 0.05
 STEADY = "steady"
 REFRESHER_KEY = "snowplow_refresher_completed_total"
@@ -417,6 +424,8 @@ def phase_stats(cs: list[tuple[float, float]], wins, excl=()) -> dict:
     """Per phase with any k6 second: n, seconds, p95/p99 ms, req/s and their
     half-sample sd (over the time `excl` leaves)."""
     out = {}
+    t0 = time.monotonic()
+    progress(f"phase statistics: {len(cs)} calls, {len(wins)} window(s)" + (f", {len(excl)} excluded" if excl else ""))
     for p, b in blocks(cs, wins, excl).items():
         if not b:
             continue
@@ -425,6 +434,8 @@ def phase_stats(cs: list[tuple[float, float]], wins, excl=()) -> dict:
                   **{m: (round(x, 2) if (x := _stat(b, m)) is not None else None) for m in METRICS},
                   "half_sd": {m: (round(s, 4) if (s := half_sd(b, m)) is not None else None)
                               for m in METRICS}}
+        progress(f"  phase {p}: {out[p]['n']} calls in {len(b)} blocks done ({time.monotonic() - t0:.1f} s)")
+    progress(f"phase statistics done: {len(out)} phase(s) in {time.monotonic() - t0:.1f} s")
     return out
 
 
@@ -1195,8 +1206,11 @@ def _ex_text(e: dict) -> str:
 def raw_from_dir(d: str) -> dict:
     """One run's k6 calls and requests from its collected dir (run606's $OUT),
     and every customer stream the witness reads (`customers`)."""
+    t0 = time.monotonic()
+    progress(f"raw calls of {d}: reading its streams")
     o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
     ob = k6eval.read_k6_out(os.path.join(d, "browser"), "browser")
+    progress(f"raw calls of {d}: streams read ({time.monotonic() - t0:.1f} s)")
     return {"calls": calls(o), "requests": requests(o),
             "customers": {"k6load": request_spans(o), "browser": browser_request_spans(ob),
                           "browser_incomplete": browser_incomplete_spans(ob)}}
@@ -1939,6 +1953,9 @@ def load_replica(path: str) -> dict:
 
 def report_from_dir(d: str) -> dict:
     """A collected run directory's report (run606's $OUT layout)."""
+    t0 = time.monotonic()
+    progress(f"report of {d}: reading its streams")
+
     def jsonl(pattern):
         out = []
         for p in sorted(glob.glob(os.path.join(d, pattern))):
@@ -1948,11 +1965,14 @@ def report_from_dir(d: str) -> dict:
            ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")]
     fr = jsonl("fresh-*.jsonl")
     tops = [r for r in jsonl("top.jsonl") if r.get("kind") == "top"]
-    return report(k6eval.read_k6_out(os.path.join(d, "k6"), "k6"),
-                  k6eval.read_k6_out(os.path.join(d, "browser"), "browser"), mem,
-                  [r for r in fr if r.get("kind") == "fresh"],
-                  [r for r in fr if r.get("kind") == "churn"], tops,
-                  [r for r in jsonl("pod-*.jsonl") if r.get("kind") == "snowplow_pod"])
+    k6o = k6eval.read_k6_out(os.path.join(d, "k6"), "k6")
+    bo = k6eval.read_k6_out(os.path.join(d, "browser"), "browser")
+    progress(f"report of {d}: streams read ({time.monotonic() - t0:.1f} s)")
+    out = report(k6o, bo, mem, [r for r in fr if r.get("kind") == "fresh"],
+                 [r for r in fr if r.get("kind") == "churn"], tops,
+                 [r for r in jsonl("pod-*.jsonl") if r.get("kind") == "snowplow_pod"])
+    progress(f"report of {d}: done ({time.monotonic() - t0:.1f} s)")
+    return out
 
 
 def _sha256(p: str) -> str:
@@ -2079,6 +2099,8 @@ def main(argv: list[str] | None = None) -> int:
     done = tuple(None if c is None else bool(c) for c in (a.completed_a, a.completed_b))
     dirs = [d or os.path.dirname(os.path.abspath(v)) for d, v in ((a.a_dir, a.a), (a.b_dir, a.b))]
     va, vb = load(a.a), load(a.b)
+    t0 = time.monotonic()
+    progress(f"pair {a.a_label} vs {a.b_label}: judging {a.a} against {a.b}")
     try:
         out = pair(va, vb, replica=load_replica(a.replica) if a.replica else None,
                    expect_a=a.expect_a, expect_b=a.expect_b, completed=done, launch=a.launch,
@@ -2095,6 +2117,7 @@ def main(argv: list[str] | None = None) -> int:
                                     f"{cand['count']}x during measure"] if cand["restarted"] else []) + (
                 [f"customer_latency.pair.candidate_not_ready: B (the candidate) was not Ready for "
                  f"{cand['not_ready_s']} s without restarting"] if cand["not_ready"] else [])
+    progress(f"pair {a.a_label} vs {a.b_label}: {out.get('verdict')} ({time.monotonic() - t0:.1f} s)")
     # #922 F3: the acceptance figures as B/A ratios, report only
     try:
         from bench import figures
