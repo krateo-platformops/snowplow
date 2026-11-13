@@ -185,11 +185,14 @@ def ttl_proof_logs(applied_text: str, mode: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The module (and bench.gke with it) is loaded on the first ttl_proof_logs call only: a fake kubectl runs this for
+# every call it answers, and loading it each time made run606's fake runs ~6 s slower (test_run9_safety's 35 s
+# wall-clock bound failed in CI at 35.6 s)
 LOADER = (
-    "import importlib.util as _ilu\n"
-    f"_fgs = _ilu.spec_from_file_location('fake_gke_api', {str(Path(__file__).resolve())!r})\n"
-    "_fgm = _ilu.module_from_spec(_fgs)\n"
-    "_fgs.loader.exec_module(_fgm)\n"
     "def ttl_proof_logs(applied_text, mode):\n"
+    "    import importlib.util as _ilu\n"
+    f"    _fgs = _ilu.spec_from_file_location('fake_gke_api', {str(Path(__file__).resolve())!r})\n"
+    "    _fgm = _ilu.module_from_spec(_fgs)\n"
+    "    _fgs.loader.exec_module(_fgm)\n"
     "    return _fgm.ttl_proof_logs(applied_text, mode)\n"
 )
