@@ -39,7 +39,12 @@ BOOT = {"kubectl": "v1.36.2", "helm": "v3.19.0", "gcloud": "561.0.0", "gke-gclou
         "python3": "Python 3.13.5", "bash": "GNU bash, version 5.2.37", "git": "git version 2.47.3"}
 SENTINEL = "GHCR_PULL_USERNAME=sentinel-user\nGHCR_PULL_TOKEN=opaque-SENTINEL-never-printed\n"
 ROLES = ["roles/container.admin", "roles/compute.viewer", "roles/compute.storageAdmin", "roles/compute.publicIpAdmin",
-         "roles/cloudquotas.viewer", "roles/serviceusage.serviceUsageConsumer", "roles/iam.serviceAccountUser"]
+         "roles/cloudquotas.viewer", "roles/serviceusage.serviceUsageConsumer",
+         "roles/storage.objectCreator", "roles/storage.objectViewer", "roles/iam.serviceAccountUser"]
+# #1390: the storage roles are granted on the evidence bucket only; the rest but the node SA's on the project
+BUCKET = "gs://snowplow-bench-evidence-operations-dev-krateo-io"
+STORAGE_ROLES = ["roles/storage.objectCreator", "roles/storage.objectViewer"]
+PROJECT_ROLES = [r for r in ROLES[:-1] if r not in STORAGE_ROLES]
 
 _OUTPUT: list[str] = []
 
@@ -133,11 +138,17 @@ def test_plan_iam_derives_the_roles_from_the_code_and_changes_nothing(fake, caps
     assert [m.group(1) for m in re.finditer(r"^\d+\. (roles/\S+)", out, re.M)] == ROLES
     cmds = [ln for ln in out.splitlines() if ln.startswith("gcloud ")]
     assert cmds[0].startswith(f"gcloud iam service-accounts create snowplow-bench-orchestrator --project {PROJECT}")
-    for r in ROLES[:-1]:
+    for r in PROJECT_ROLES:
         assert (f"gcloud projects add-iam-policy-binding {PROJECT} --member {SA} --role {r} "
                 f"--condition-from-file iam-condition.json") in cmds
-    assert cmds[-1] == (f"gcloud iam service-accounts add-iam-policy-binding {NODE_SA} --project {PROJECT} "
-                        f"--member {SA} --role roles/iam.serviceAccountUser --condition-from-file iam-condition.json")
+    assert (f"gcloud iam service-accounts add-iam-policy-binding {NODE_SA} --project {PROJECT} "
+            f"--member {SA} --role roles/iam.serviceAccountUser --condition-from-file iam-condition.json") in cmds
+    for r in STORAGE_ROLES:                       # #1390: on the evidence bucket only, under the same condition
+        assert (f"gcloud storage buckets add-iam-policy-binding {BUCKET} --member {SA} --role {r} "
+                f"--condition-from-file iam-condition.json") in cmds
+        assert not any(f"projects add-iam-policy-binding {PROJECT} --member {SA} --role {r}" in c for c in cmds)
+    assert f"roles/storage.objectCreator  (ON {BUCKET} only)" in out
+    assert f"the evidence bucket {BUCKET} (#1390): one per project, in europe-west4" in out
     assert '"expression": "request.time < timestamp(' in out and '"title": "snowplow-bench-<run>"' in out
     assert "krateo-057 included" in out                                   # container.admin's reach, stated
     assert "resourcemanager.projects.setIamPolicy" in out and "compute.securityAdmin" in out
@@ -240,8 +251,11 @@ def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, ca
     want = {"title": f"snowplow-bench-{RUN}", "expression": f'request.time < timestamp("{tt}")',
             "description": f"vm606: expires with {VM} (owner=snowplow-bench, run={RUN})"}
     proj = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
-    assert sorted(b["role"] for b in proj) == sorted(ROLES[:-1])
+    assert sorted(b["role"] for b in proj) == sorted(PROJECT_ROLES)
     assert all(b["members"] == [SA] and b["condition"] == want for b in proj)
+    bucket = fake_vm606.policy(fake, "bucket-" + BUCKET[len("gs://"):])["bindings"]      # #1390
+    assert sorted(b["role"] for b in bucket) == STORAGE_ROLES
+    assert all(b["members"] == [SA] and b["condition"] == want for b in bucket)
     node = fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"]
     assert node == [{"role": "roles/iam.serviceAccountUser", "members": [SA], "condition": want}]
     # order: every grant and both rules before the VM; the policies read back before the rules
@@ -251,7 +265,7 @@ def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, ca
     reads = [i for i, c in idx.items() if "get-iam-policy" in c]
     rules = [i for i, c in idx.items() if c[:3] == ["compute", "firewall-rules", "create"]]
     back = [i for i in reads if i > max(grants)]                  # the read-back, after the last grant
-    assert len(grants) == 7 and back and max(back) < min(rules) and max(rules) < first_create
+    assert len(grants) == len(ROLES) and back and max(back) < min(rules) and max(rules) < first_create
     assert min(reads) < min(grants)                               # the run's name and the SA checked first
     fw = {p.stem: json.loads(p.read_text()) for p in (fake / "firewalls").glob("*.json")}
     assert fw[f"{VM}-deny-ssh"]["sourceRanges"] == ["0.0.0.0/0"] and fw[f"{VM}-deny-ssh"]["priority"] == 1000
@@ -268,7 +282,8 @@ def test_up_reads_the_grants_back_and_creates_nothing_when_one_is_not_held(fake,
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 2 and "roles/compute.storageAdmin on operations-dev-krateo-io is not held under the condition" in err
     assert f"down --run {RUN} --yes" in err
-    assert not [v for v in _verbs(fake) if v.endswith(" create")]
+    # nothing of the run: the evidence bucket (#1390) is the project's, ensured before any grant can name it
+    assert not [v for v in _verbs(fake) if v.endswith(" create") and v != "storage buckets create"]
 
 
 def test_up_refuses_a_vm_whose_tools_are_not_the_laptops(fake, capsys, monkeypatch):
@@ -411,6 +426,8 @@ if [ "${BENCH_606_DRY_RUN:-0}" = 1 ]; then
   mkdir -p "$PAIR_OUT/dry-N1" "$PAIR_OUT/dry-N2"
   echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N1 --ttl-hours 13 --yes" > "$PAIR_OUT/dry-N1/run.log"
   echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N2 --ttl-hours 12 --yes" > "$PAIR_OUT/dry-N2/run.log"
+  echo "[06:52:59] k6 customers: K6_SPAN=churn, DRIVE_S=${STUB_DRIVE_S:-16170} s, composite burst at 900 s" >> "$PAIR_OUT/dry-N1/run.log"
+  echo "[06:52:59] k6 customers: K6_SPAN=churn, DRIVE_S=${STUB_DRIVE_S2:-14000} s, composite burst at 900 s" >> "$PAIR_OUT/dry-N2/run.log"
   echo "DRY: all 2 runs would start now"
   exit 0
 fi
@@ -520,7 +537,8 @@ def test_launch_starts_the_launcher_detached_and_it_survives_the_session(fake, c
     rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
     assert rc == 0, err + out
     assert f"vm606: bench checkout at {sha}" in out and "vm606: dry pass OK" in out   # the dry pass read stdin
-    assert "the run's TTL 13 h + margin fits" in out                       # the larger of the runs' TTLs
+    assert "the run's TTL 13 h + its statistics budget " in out           # the larger of the runs' TTLs
+    assert " + the 3600 s margin fit the VM's" in out
     assert "launched on" in out and "every run passed its paid-only checks" in out
     pid = int((r / "launch.pid").read_text())
     # launch returned while the launcher still waits for its release: it did not wait for it. The session
@@ -605,7 +623,8 @@ def test_launch_refuses_a_vm_that_dies_before_the_run_ends(fake, capsys, tmp_pat
     r = _vm_ready(fake, hours=13.5)                         # 13 h run + 1 h margin does not fit
     pin, pin_sha = _pin(tmp_path)
     rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
-    assert rc == 2 and "the run's TTL is 13 h" in err and "--ttl-hours >= 14" in err
+    # #1390: the run's 13 h + its measured statistics budget + the margin: 14.05 h
+    assert rc == 2 and "the run's TTL is 13 h, its statistics budget" in err and "--ttl-hours >= 15" in err
     assert not (r / "launch.pid").exists()
 
 
@@ -804,7 +823,7 @@ def test_down_deletes_the_vm_disk_rules_and_only_its_own_grants_and_verifies(fak
     assert list((fake / "firewalls").glob("*.json")) == []
     assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL]
     assert fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"] == []
-    assert f"{VM} gone and verified: disk(s) ['{VM}']" in out and "2 firewall rule(s), 7 conditional grant(s)" in out
+    assert f"{VM} gone and verified: disk(s) ['{VM}']" in out and "2 firewall rule(s), 9 conditional grant(s)" in out
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
     assert lists and all(c["partial_error"] == "false" for c in lists)
 
@@ -866,7 +885,7 @@ def test_down_removes_a_binding_with_its_title_but_not_its_form_and_reports_it(f
     assert rc == 0, err
     assert ("WARNING: drifted since up, removed all the same: binding roles/owner on operations-dev-krateo-io under "
             f"snowplow-bench-{RUN}: expression \"true\", not the expiry form vm606 writes") in out
-    assert "8 conditional grant(s)" in out and "1 field(s) had drifted since up" in out
+    assert "10 conditional grant(s)" in out and "1 field(s) had drifted since up" in out
     assert not [b for b in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
                 if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]
     assert any("roles/owner" in d for d in _state()["down_drift"])
@@ -1073,13 +1092,14 @@ def test_prefix_colliding_runs_down_of_run2_never_touches_run25(fake, capsys, mo
     def run25_view():
         return ((fake / "instances" / f"{VM}.json").read_text(),
                 sorted(p.name for p in (fake / "firewalls").glob(f"{VM}-*.json")),
-                [b for k in (f"project-{PROJECT}", f"sa-{NODE_SA}") for b in fake_vm606.policy(fake, k)["bindings"]
+                [b for k in (f"project-{PROJECT}", f"sa-{NODE_SA}", "bucket-" + BUCKET[len("gs://"):])
+                 for b in fake_vm606.policy(fake, k)["bindings"]
                  if b.get("condition", {}).get("title") == "snowplow-bench-run25"])
     before = run25_view()
-    assert len(before[1]) == 2 and len(before[2]) == 7
+    assert len(before[1]) == 2 and len(before[2]) == 9
     rc, out, err = _run(capsys, "down", "--run", "run2", "--yes")
     assert rc == 0, err
-    assert "2 firewall rule(s), 7 conditional grant(s) of run run2" in out
+    assert "2 firewall rule(s), 9 conditional grant(s) of run run2" in out
     assert run25_view() == before
     assert other in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]          # another member's: kept
     assert not (fake / "instances" / "snowplow-bench-orch-run2.json").exists()
@@ -1311,11 +1331,12 @@ def test_a_notfound_is_about_the_resource_only_when_it_names_its_own_path():
 def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
     """L11: the run-in-use, unconditional-binding and revoke reads go over grant_policies: exactly the
     policies up's grants are written to."""
-    assert vm606.grant_policies(PROJECT, NUMBER) == [("project", PROJECT), ("sa", NODE_SA)]
+    assert vm606.grant_policies(PROJECT, NUMBER) == [("bucket", BUCKET), ("project", PROJECT), ("sa", NODE_SA)]
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 0, err
-    written = {("project" if c["argv"][0] == "projects" else "sa", c["argv"][2 if c["argv"][0] == "projects" else 3])
-               for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:3])}
+    kind = {"projects": ("project", 2), "storage": ("bucket", 3), "iam": ("sa", 3)}
+    written = {(kind[c["argv"][0]][0], c["argv"][kind[c["argv"][0]][1]])
+               for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:4])}
     assert written == set(vm606.grant_policies(PROJECT, NUMBER))
 
 
@@ -1422,7 +1443,7 @@ def test_up_resumes_a_run_that_stopped_in_its_bootstrap_wait(fake, capsys, monke
     before = _snapshot(fake)
     rc, out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0", *extra)
     assert rc == 0, err
-    assert "its 2 SSH rules and its 7 conditional bindings read back as up made them; resuming" in out
+    assert "its 2 SSH rules and its 9 conditional bindings read back as up made them; resuming" in out
     assert f"{VM} bootstrapped" in out and _state()["bootstrap"] == BOOT
     assert _no_writes_since(fake, n) == [] and _snapshot(fake) == before        # nothing made again
     zones = {c["argv"][c["argv"].index("--zone") + 1] for c in fake_vm606.calls(fake)[n:] if "--zone" in c["argv"]}

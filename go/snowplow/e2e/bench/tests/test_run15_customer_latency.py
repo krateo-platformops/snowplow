@@ -38,7 +38,7 @@ from statistics import NormalDist
 import pytest
 
 from bench import custlat, load606
-from tests import fake_region
+from tests import fake_gcs, fake_region
 from tests.test_run14_list_narrow import FRESH, LN_KEY, _mem
 
 FIX = Path(__file__).resolve().parent / "fixtures"
@@ -647,9 +647,11 @@ exit "$(cat "$FAKE/$RUN_NAME.rc" 2>/dev/null || echo 0)"
 """
 NA, NB = "snowplow-bench-r15a", "snowplow-bench-r15b"
 # the region's quota read (#1171: every quota of the region, tests/fake_region.py), as gcloud
-# returns it; FAKE_USAGE_<METRIC> (FAKE_SSD_USAGE, FAKE_STATIC_USAGE) steers it
+# returns it; FAKE_USAGE_<METRIC> (FAKE_SSD_USAGE, FAKE_STATIC_USAGE) steers it; #1390: and the evidence
+# bucket each run's directory is copied to (tests/fake_gcs.py, under $FAKE/gcs)
 FAKE_QUOTA_GCLOUD = (
-    "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER +
+    "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + fake_gcs.HANDLER +
+    "gcs(sys.argv[1:])\n"
     "if sys.argv[1:3] == ['auth', 'print-access-token']:\n"
     "    print('fake-access-token'); sys.exit(0)\n"
     "if sys.argv[1:4] == ['container', 'clusters', 'list']:\n"
@@ -684,6 +686,7 @@ def pairbed(tmp_path):
     repo = tmp_path / "bench"
     repo.mkdir()
     shutil.copy(BENCH / "run606_pair.sh", repo)
+    shutil.copy(BENCH / "run606_stats.sh", repo)          # #1390: the statistics stage it sources
     shutil.copy(BENCH / "customer_latency_replica_runs12_13.json", repo)
     (repo / "run606.sh").write_text(FAKE_RUN606)
     fake = tmp_path / "fake"

@@ -1015,7 +1015,7 @@ def test_run606_pair_logs_fail_note_excluded_lines(pairbed, case):  # noqa: F811
     p = _launch(repo, env)
     log = (tmp / "pair" / "pair.log").read_text()
     v = json.loads((tmp / "pair" / "paired-verdict-A-B.json").read_text())
-    assert "--a-dir" in (repo / "run606_pair.sh").read_text()
+    assert "--a-dir" in (repo / "run606_stats.sh").read_text()       # #1390: the statistics stage
     assert "EXCLUDED from both runs: A restart #1" in log
     assert not any(c["check"].startswith("customer_latency.pair.raw_calls") and c["result"] == "FAIL"
                    for c in v["validity"])

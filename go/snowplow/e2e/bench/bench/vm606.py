@@ -247,7 +247,7 @@ import tarfile
 import time
 from pathlib import Path
 
-from bench import evidence, gcevm, gke
+from bench import durable, evidence, gcevm, gke
 from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE,  # noqa: F401
                          NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
                          ssh, ssh_stage)
@@ -291,8 +291,8 @@ BOOT_DISK_TYPE = "pd-balanced"
 IMAGE_FAMILY, IMAGE_PROJECT = "debian-13", "debian-cloud"
 REPO_URL = "https://github.com/krateo-platformops/snowplow.git"
 MAX_TTL_HOURS = 72
-# the VM must outlive the run's own TTL by this much at launch: the launch-to-gke-up time, the pair's
-# verdicts after the last gke-down, and the fetch
+# the VM must outlive the run's own TTL and its measured statistics budget (#1390: statistics_budget) by this much
+# at launch: the launch-to-gke-up time and the fetch
 LAUNCH_MARGIN_S = 3600
 # vm606's own bounds, as they were before #1338 moved gcloud() into bench.gcevm (which has none of its own): any
 # gcloud call that names no timeout, and each SSH attempt of the bootstrap wait
@@ -449,7 +449,19 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("compute", "disks", "delete"): ("roles/compute.storageAdmin",),
     ("compute", "addresses", "delete"): ("roles/compute.publicIpAdmin",),
     ("auth", "print-access-token"): (),          # gcloud's own credential: the VM's metadata token
+    # #1390: bench/durable.py copies each arm's run directory to the evidence bucket and reads it back
+    ("storage", "cp"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),
+    ("storage", "cp", "*"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),   # its source a variable
+    ("storage", "objects", "list"): ("roles/storage.objectViewer",),
 }
+# #1390 (Diego, 2026-11-13): the only storage roles the orchestrator SA may hold, each ON THE EVIDENCE BUCKET only
+# (bench.durable.bucket_name), under the run's expiring condition: create and read objects; never delete or
+# overwrite one (objectUser / objectAdmin), never a storage role on the project. check_storage_roles refuses any other.
+BUCKET_ROLES = ("roles/storage.objectCreator", "roles/storage.objectViewer")
+#: where the evidence bucket lives: one bucket per project, in the bench's default region, whatever region a run uses
+EVIDENCE_LOCATION = gke.region_of(gke.DEFAULT_ZONE)
+EVIDENCE_RETENTION_S = 7 * 24 * 3600
+EVIDENCE_LIFECYCLE = {"rule": [{"action": {"type": "Delete"}, "condition": {"age": 30}}]}
 # a Google API the code calls over REST, by host, and a request header that needs a role of its own
 REST_ROLES = {"cloudquotas": ("roles/cloudquotas.viewer",)}
 HEADER_ROLES = {"x-goog-user-project": ("roles/serviceusage.serviceUsageConsumer",)}
@@ -482,6 +494,12 @@ WHY = {
         "cloudquotas.quotas.get: the #985 read of ClustersPerRegion over REST."),
     "roles/serviceusage.serviceUsageConsumer": (
         "serviceusage.services.use: that request bills the project (x-goog-user-project)."),
+    "roles/storage.objectCreator": (
+        "storage.objects.create ON THE EVIDENCE BUCKET only (#1390): each arm's run directory, copied off the VM "
+        "before the pair statistics; no delete and no overwrite (the bucket's 7-day retention holds every object)."),
+    "roles/storage.objectViewer": (
+        "storage.objects.get / list ON THE EVIDENCE BUCKET only (#1390): each copy listed back against its manifest, "
+        "and the statistics' fresh verified download."),
     NODE_SA_ROLE: (
         "granted ON the GKE node SA only: clusters / node-pools create pass no --service-account, so the "
         "nodes run as the Compute Engine default SA, and GKE requires actAs on it."),
@@ -489,7 +507,8 @@ WHY = {
 NOT_NEEDED = (
     "firewall roles for the SA: no gcloud firewall call in the bench code (GKE's own service agent writes the "
     "k8s-fw-* rules); the VM's two SSH rules are the operator's (up / down)",
-    "storage roles: fetch copies over IAP SSH, no bucket",
+    "storage roles on the project, or objectUser / objectAdmin: the SA creates and reads objects of the evidence "
+    "bucket only (BUCKET_ROLES); fetch copies over IAP SSH",
     "compute.instances.* writes for the VM itself: its TTL delete is GCE's (--termination-time, "
     "--instance-termination-action=DELETE), no permission of the SA",
     "logging / monitoring roles: the bench calls neither",
@@ -605,10 +624,26 @@ def iam_condition(run: str, terminates_at: str) -> dict:
 _EXPIRY_FORM = re.compile(r'request\.time < timestamp\("\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"\)')
 
 
+def check_storage_roles(roles) -> None:
+    """#1390: refuse a plan holding a storage role other than BUCKET_ROLES (objectUser, objectAdmin, admin, ...):
+    those could delete or overwrite evidence, and grant_targets would put them on the project."""
+    bad = sorted(r for r in roles if r.startswith("roles/storage.") and r not in BUCKET_ROLES)
+    if bad:
+        raise Refused(f"the plan derives {', '.join(bad)}: the orchestrator SA holds no storage role but "
+                      f"{' and '.join(BUCKET_ROLES)}, on the evidence bucket only (#1390)")
+
+
+def bucket_url(project: str) -> str:
+    return f"gs://{durable.bucket_name(project)}"
+
+
 def grant_targets(project: str, number: str, roles: list[str]) -> list[tuple[str, str, str]]:
-    """(kind, resource, role): each project role on the project, iam.serviceAccountUser on the node SA."""
-    return ([("project", project, r) for r in roles if r != NODE_SA_ROLE]
-            + ([("sa", node_sa(number), NODE_SA_ROLE)] if NODE_SA_ROLE in roles else []))
+    """(kind, resource, role): each project role on the project, iam.serviceAccountUser on the node SA, the
+    storage roles on the evidence bucket only (#1390)."""
+    check_storage_roles(roles)
+    return ([("project", project, r) for r in roles if r != NODE_SA_ROLE and r not in BUCKET_ROLES]
+            + ([("sa", node_sa(number), NODE_SA_ROLE)] if NODE_SA_ROLE in roles else [])
+            + [("bucket", bucket_url(project), r) for r in roles if r in BUCKET_ROLES])
 
 
 def grant_policies(project: str, number: str) -> list[tuple[str, str]]:
@@ -623,14 +658,18 @@ def grant_policies(project: str, number: str) -> list[tuple[str, str]]:
 def _binding_argv(verb: str, kind: str, resource: str, project: str, role: str, cond_file: str) -> list[str]:
     member = f"serviceAccount:{sa_email(project)}"
     head = (["projects", f"{verb}-iam-policy-binding", resource] if kind == "project"
+            else ["storage", "buckets", f"{verb}-iam-policy-binding", resource] if kind == "bucket"
             else ["iam", "service-accounts", f"{verb}-iam-policy-binding", resource, "--project", project])
     return [*head, "--member", member, "--role", role, "--condition-from-file", cond_file]
 
 
 def _policy(kind: str, resource: str, project: str) -> dict:
     argv = (["projects", "get-iam-policy", resource, "--format", "json"] if kind == "project"
+            else ["storage", "buckets", "get-iam-policy", resource, "--format", "json"] if kind == "bucket"
             else ["iam", "service-accounts", "get-iam-policy", resource, "--project", project, "--format", "json"])
     rc, out, err = gcloud(argv, quiet=True)
+    if kind == "bucket" and rc != 0 and _bucket_absent(err, resource):
+        return {"bindings": []}          # a bucket that does not exist holds no binding (a dry up before it does)
     try:
         got = json.loads(out) if rc == 0 else None
     except ValueError:
@@ -712,6 +751,92 @@ def revoke(run: str, project: str, number: str, *, dry: bool) -> tuple[int, list
     return len(found), drift
 
 
+# ─── the evidence bucket (#1390): ensured by up, every property read back ───
+
+_BUCKET_404 = re.compile(r"not found: 404|NotFoundException|code=404|\b404\b.*[Nn]ot [Ff]ound")
+
+
+def _bucket_absent(err: str, url: str) -> bool:
+    """gcloud's answer for a bucket that does not exist: its own URL, not found (404)."""
+    return url in (err or "") and bool(_BUCKET_404.search(err or ""))
+
+
+def bucket_doc(project: str) -> dict | None:
+    """The evidence bucket as the API describes it (`--raw`), or None when it does not exist; any other failure
+    refuses."""
+    url = bucket_url(project)
+    rc, out, err = gcloud(["storage", "buckets", "describe", url, "--raw", "--format", "json"], quiet=True)
+    if rc != 0:
+        if _bucket_absent(err, url):
+            return None
+        raise Refused(f"the evidence bucket {url} could not be read (rc={rc}; {gcevm.gcloud_cause(err)})")
+    try:
+        got = json.loads(out)
+    except ValueError:
+        got = None
+    if not isinstance(got, dict) or got.get("name") != durable.bucket_name(project):
+        raise Refused(f"the evidence bucket {url} answered no description of itself")
+    return got
+
+
+def bucket_drift(doc: dict) -> list[str]:
+    """Each property of the evidence bucket that is not the one #1390 requires, named."""
+    iam = doc.get("iamConfiguration") or {}
+    ret = doc.get("retentionPolicy") or {}
+    want = {
+        "location": (str(doc.get("location") or "").lower(), EVIDENCE_LOCATION),
+        "uniform bucket-level access": (bool((iam.get("uniformBucketLevelAccess") or {}).get("enabled")), True),
+        "public access prevention": (iam.get("publicAccessPrevention"), "enforced"),
+        "retention period": (str(ret.get("retentionPeriod")), str(EVIDENCE_RETENTION_S)),
+        "retention locked": (bool(ret.get("isLocked")), False),
+        "lifecycle": ((doc.get("lifecycle") or {}).get("rule"), EVIDENCE_LIFECYCLE["rule"]),
+    }
+    return [f"{k}: {_short(got)}, #1390 requires {_short(w)}" for k, (got, w) in want.items() if got != w]
+
+
+def ensure_bucket(project: str, run: str, *, dry: bool) -> str:
+    """The evidence bucket, created when absent, then READ BACK and every property verified (bucket_drift): a bucket
+    that differs refuses (nothing of it is changed: a human looks). Returns what happened."""
+    url = bucket_url(project)
+    doc = bucket_doc(project)
+    if doc is None:
+        lf = state_dir(run) / "evidence-lifecycle.json"
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        lf.write_text(json.dumps(EVIDENCE_LIFECYCLE, indent=1) + "\n")
+        rc, _o, err = gcloud(["storage", "buckets", "create", url, "--project", project, "--location", EVIDENCE_LOCATION,
+                              "--uniform-bucket-level-access", "--public-access-prevention",
+                              "--retention-period", f"{EVIDENCE_RETENTION_S}s", "--lifecycle-file", str(lf)], dry=dry)
+        if dry:
+            return f"DRY: would create the evidence bucket {url} ({EVIDENCE_LOCATION}) and read it back"
+        if rc != 0:
+            raise Refused(f"the evidence bucket {url} could not be created (rc={rc}; {gcevm.gcloud_cause(err)})")
+        doc = bucket_doc(project)
+        if doc is None:
+            raise Refused(f"the evidence bucket {url} answers NotFound after its create")
+        made = "created"
+    else:
+        made = "exists"
+    off = bucket_drift(doc)
+    if off:
+        raise Refused(f"the evidence bucket {url} is not as #1390 requires: {'; '.join(off)}: refusing (nothing was "
+                      f"changed on it)")
+    return (f"the evidence bucket {url} {made}, read back: {EVIDENCE_LOCATION}, uniform access, public access "
+            f"prevention enforced, retention {EVIDENCE_RETENTION_S // 86400} days (not locked), lifecycle delete at "
+            f"{EVIDENCE_LIFECYCLE['rule'][0]['condition']['age']} days")
+
+
+def cmd_fetch_evidence(a) -> int:
+    """#1390: a launch's evidence from the bucket, verified, and its statistics re-run from it offline (the
+    launcher's own statistics stage, bench.durable.rejudge): what a lost VM leaves is enough for its verdicts."""
+    dest = a.dest or str(evidence.runs_root() / "606" / f"durable-{a.launch}")
+    return durable.rejudge(durable.bucket_name(a.project), a.launch, dest, say=_say)
+
+
+def cmd_bucket(a) -> int:
+    _say(ensure_bucket(a.project, "_bucket", dry=not a.yes))
+    return 0
+
+
 def iam_commands(project: str, roles: list[str], number: str) -> list[str]:
     cmds = [shlex.join(["gcloud", "iam", "service-accounts", "create", SA_NAME, "--project", project,
                         "--display-name", "snowplow bench orchestrator (vm606)",
@@ -734,16 +859,26 @@ def cmd_plan_iam(a) -> int:
         print(f"refusing: {e}; pass --project-number", file=sys.stderr)
         return 1
     need = plan(found)
+    try:
+        check_storage_roles(need)
+    except Refused as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return 1
     _say(f"# vm606 plan-iam: {sa_email(a.project)}")
     _say(f"# derived from the code under {Path(a.bench_dir).resolve()} (every [\"gcloud\", ...] argv in bench/*.py "
          f"but {', '.join(OPERATOR_SIDE)}, REST hosts, kubectl/helm in run606*.sh and bench/*.sh); plan-iam runs nothing")
     _say("")
     for i, (role, uses) in enumerate(need.items(), 1):
-        on = f"  (ON {node_sa(number)} only)" if role == NODE_SA_ROLE else "  (project)"
+        on = (f"  (ON {node_sa(number)} only)" if role == NODE_SA_ROLE
+              else f"  (ON {bucket_url(a.project)} only)" if role in BUCKET_ROLES else "  (project)")
         _say(f"{i}. {role}{on}")
         _say(f"   why: {WHY.get(role, '')}")
         for u in uses:
             _say(f"   - {u}")
+    _say("")
+    _say(f"the evidence bucket {bucket_url(a.project)} (#1390): one per project, in {EVIDENCE_LOCATION} (the bench's "
+         f"default region) whatever region a run uses, so up's read-back verifies its location exactly; a VM in "
+         f"another region pays cross-region egress for its copies (a few cents a run)")
     _say("")
     _say("not needed:")
     for n in NOT_NEEDED:
@@ -1073,6 +1208,7 @@ def cmd_up(a) -> int:
     if found["uncovered"]:
         raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
     roles = list(plan(found))
+    check_storage_roles(roles)
     if resumable(st, run):
         return resume_up(run, st, a, roles)
     a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
@@ -1103,6 +1239,9 @@ def cmd_up(a) -> int:
         _save_state(run, made=as_made(run, a.project, a.zone, a.ttl_hours, terminates_at))
         _save_state(run, vm=name, project=a.project, zone=a.zone, ttl_hours=a.ttl_hours, terminates_at=terminates_at,
                     node_sa=node_sa(number), project_number=number, created_at=time.time())
+    # 0. #1390: the evidence bucket every arm is copied to, created when absent and read back, every property
+    # verified, after every refusal above (nothing is created for a refused up) and before any grant names it
+    _say(ensure_bucket(a.project, run, dry=not a.yes))
     # 1. the grants, expiring with the VM, before the VM exists
     grant(run, a.project, number, roles, terminates_at, dry=not a.yes)
     # 2. SSH through IAP only, before the VM exists
@@ -1302,6 +1441,8 @@ def _exports(env: dict[str, str]) -> str:
 _HASH_PY = ("python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],\"rb\"); "
             "[h.update(b) for b in iter(lambda: f.read(1<<20), b\"\")]; print(h.hexdigest())'")
 _TTL_RX = r"bench\.gke gke-up .*--ttl-hours ([0-9]+)"
+# #1390: each run's planned k6 seconds, as its dry pass logs them (run606.sh: "k6 customers: K6_SPAN=..., DRIVE_S=N s")
+_DRIVE_RX = r"k6 customers: K6_SPAN=\S+, DRIVE_S=([0-9]+) s"
 
 
 def _bench_vars(sha: str) -> str:
@@ -1344,6 +1485,10 @@ hours = []
 for f in sorted(glob.glob(sys.argv[1] + "/dry-*/run.log")):
     hours += [int(m.group(1)) for m in re.finditer({_TTL_RX!r}, open(f).read())]
 print("VM606_RUN_TTL_HOURS=" + (str(max(hours)) if hours else ""))
+drive = []
+for f in sorted(glob.glob(sys.argv[1] + "/dry-*/run.log")):
+    drive += [int(m.group(1)) for m in re.finditer({_DRIVE_RX!r}, open(f).read())]
+print("VM606_RUN_K6_SECONDS=" + (str(max(drive)) if drive else ""))
 PY
 echo "VM606_PAIR_OUT=$PO"
 """)
@@ -1384,6 +1529,28 @@ while :; do
 done
 echo "VM606_PID=$pid"
 """)
+
+
+def statistics_records() -> list[str]:
+    """Every statistics.jsonl this laptop holds: each fetched launch's, each offline re-judge's (#1390)."""
+    root = evidence.runs_root() / "606"
+    return sorted(str(p) for p in root.rglob("statistics.jsonl")) if root.exists() else []
+
+
+def statistics_budget(k6_seconds: str | None, pairs: str) -> tuple[float, str]:
+    """#1390 item 3: the launch's statistics budget, measured (bench.statstime.budget over every recorded step and
+    the committed measurement), for its planned k6 seconds per arm (the dry pass) and its steps (each pair of
+    PAIRS: the replica's and every other pair's). Unknown refuses: a VM that cannot be shown to outlive its
+    statistics is not launched."""
+    if not (k6_seconds or "").isdigit():
+        raise Refused("the dry pass logged no planned k6 seconds (run606.sh's `k6 customers: K6_SPAN=..., DRIVE_S=N s`):"
+                      " the statistics budget is unknown")
+    from bench import statstime
+    secs, how = statstime.budget(statstime.load_records([statstime.MEASURED, *statistics_records()]),
+                                 k6_seconds_per_arm=float(k6_seconds), steps=len(pairs.split()))
+    if secs is None:
+        raise Refused(how)
+    return secs, how
 
 
 def cmd_launch(a) -> int:
@@ -1440,14 +1607,16 @@ def cmd_launch(a) -> int:
     if not (ttl or "").isdigit():
         raise Refused("the dry pass handed gke-up no --ttl-hours (no `bench.gke gke-up ... --ttl-hours N` in any "
                       f"dry-*/run.log under {vm_dir(run)}/dry): how long the run lasts is unknown")
+    stats_s, stats_how = statistics_budget(_marker(out, "VM606_RUN_K6_SECONDS"), env["PAIRS"])
     inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
-    need = int(ttl) * 3600 + LAUNCH_MARGIN_S
+    need = int(ttl) * 3600 + stats_s + LAUNCH_MARGIN_S
     if left is None or left < need:
         raise Refused(f"{name} is deleted in {'an unknown time' if left is None else f'{left / 3600:.1f} h'}; the run's "
-                      f"TTL is {ttl} h and the launch needs {need / 3600:.1f} h with the margin: `down` it and `up` "
-                      f"with --ttl-hours >= {-(-need // 3600)}")
-    _say(f"the run's TTL {ttl} h + margin fits the VM's {left / 3600:.1f} h left")
+                      f"TTL is {ttl} h, its {stats_how}, and the launch needs {need / 3600:.1f} h with the "
+                      f"{LAUNCH_MARGIN_S} s margin: `down` it and `up` with --ttl-hours >= {-(-int(need) // 3600)}")
+    _say(f"the run's TTL {ttl} h + its {stats_how} + the {LAUNCH_MARGIN_S} s margin fit the VM's "
+         f"{left / 3600:.1f} h left")
     rc, out, err = ssh(name, project, zone, go, timeout=a.started_timeout_s + 300)
     for ln in _remote_lines(out):
         if ln.startswith("vm606:") or ln.startswith("detached:"):
@@ -1457,7 +1626,8 @@ def cmd_launch(a) -> int:
     started = _marker(out, "VM606_STARTED") or "unknown"
     _save_state(run, launched_at=time.time(), bench_sha=a.bench_sha, bench_zone=a.bench_zone, runs=names, pair=pair,
                 pair_out=pair_out,
-                pin_manifest=pin.name, pin_sha256=got, run_ttl_hours=int(ttl), started=started, fetched=False)
+                pin_manifest=pin.name, pin_sha256=got, run_ttl_hours=int(ttl), started=started, fetched=False,
+                statistics_budget_s=round(stats_s), statistics_budget=stats_how)
     if started != "ok":
         raise Refused(f"the launcher on {name} did not get every run past its paid-only checks ({started}; the lines "
                       f"above say why). Whatever it wrote is on the VM: `fetch` it, or `down --discard-unfetched`")
@@ -1817,6 +1987,19 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fetch", help="copy the run and evidence directories back, verified")
     common(p, yes=False)
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("fetch-evidence", help="#1390: download a launch's durable copy from the evidence bucket, "
+                                              "verified, and re-run its statistics from it (offline)")
+    p.add_argument("--launch", required=True, help="the launch id (PAIR_RUN_ID, the bucket's runs/<id>/)")
+    p.add_argument("--project", default=DEFAULT_PROJECT)
+    p.add_argument("--dest", default=None, help="default: <data root>/runs/606/durable-<launch>")
+    p.set_defaults(func=cmd_fetch_evidence)
+
+    p = sub.add_parser("bucket", help="#1390: ensure the evidence bucket (create when absent) and verify every "
+                                      "property it must have (up does it first)")
+    p.add_argument("--project", default=DEFAULT_PROJECT)
+    p.add_argument("--yes", action="store_true", help="actually do it (default: dry run)")
+    p.set_defaults(func=cmd_bucket)
 
     p = sub.add_parser("reap", help="#1383: delete the SSH rules of earlier runs whose recorded expiry has passed "
                                     "and whose VM is gone (every up does it first), each verified")
