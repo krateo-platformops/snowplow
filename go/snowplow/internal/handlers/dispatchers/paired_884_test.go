@@ -181,7 +181,7 @@ func TestPaired884KnownStaleChurn(t *testing.T) {
 	secrets := map[string]*corev1.Secret{}
 	for i := 0; i < ids; i++ {
 		name := p884User(i) + "-clientconfig"
-		secrets[name] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: p865AuthnNS, Name: name},
+		secrets[name] = &corev1.Secret{ObjectMeta: authnMeta(p865AuthnNS, name, p884User(i)),
 			Data: map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok-" + p884User(i))}}
 	}
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: secrets})

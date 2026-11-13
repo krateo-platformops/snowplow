@@ -172,7 +172,7 @@ func (e *w1319Env) pointAtGranting(t *testing.T, on bool) {
 			url = e.granting.URL
 		}
 		n := kubeutil.MakeDNS1123Compatible(i.user) + "-clientconfig"
-		secrets[n] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c681AuthnNS, Name: n},
+		secrets[n] = &corev1.Secret{ObjectMeta: authnMeta(c681AuthnNS, n, i.user),
 			Data: map[string][]byte{"server-url": []byte(url), "token": []byte(i.token())}}
 	}
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: secrets})

@@ -17,7 +17,6 @@ import (
 
 	"github.com/krateo-platformops/plumbing/server/use"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -100,7 +99,7 @@ func seedClientconfig1115(t *testing.T) {
 		cache.ResetSecretsInformerForTest()
 	})
 	cli := fake.NewSimpleClientset(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: testAuthnNS, Name: testUsername + "-clientconfig"},
+		ObjectMeta: authnMeta(testAuthnNS, testUsername+"-clientconfig", testUsername),
 		Data:       map[string][]byte{"server-url": []byte("https://alice.example/k8s"), "token": []byte("t")},
 	})
 	t.Cleanup(cache.SetSecretsClientForTest(cli))
