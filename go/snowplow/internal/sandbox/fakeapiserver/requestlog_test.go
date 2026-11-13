@@ -136,6 +136,10 @@ func TestRequestLog_EveryLineIsARequestLineOrAListedEvent(t *testing.T) {
 	if !logged(h, statusWrite) {
 		t.Error("the applied status write has no request line")
 	}
+	// The network seam's egress lines are the bridge's, on their own channel: never the fake's.
+	if logged(h, func(l map[string]any) bool { return l["event"] == "egress" }) {
+		t.Error("an egress line in the fake's request log")
+	}
 }
 
 // The check bites: an extra key, a missing items, an unknown event and an event with an extra key
