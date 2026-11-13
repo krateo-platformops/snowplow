@@ -3,13 +3,16 @@
 #
 #   1. the whole program compiles for js/wasm;
 #   2. go vet passes for js/wasm on the packages that carry browser-only code;
-#   3. the browser bridge's tests run for js/wasm under Go's own wasm runner (Node.js);
+#   3. the browser bridge's and the sandbox fake apiserver's tests run for js/wasm under Go's
+#      own wasm runner (Node.js);
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
-#   5. gosec, run as the browser build (GOOS=js GOARCH=wasm), finds nothing in the packages
+#   5. the fake apiserver's field selectors equal kube-apiserver's, labels and value paths
+#      (scripts/checkfieldlabels);
+#   6. gosec, run as the browser build (GOOS=js GOARCH=wasm), finds nothing in the packages
 #      whose browser build compiles other files than their server build;
-#   6. the server build contains none of the browser code (main_browser_build_test.go:
-#      no internal/browserbridge, no syscall/js, credhttp.BrowserEgress nil,
+#   7. the server build contains none of the browser code (main_browser_build_test.go:
+#      no internal/browserbridge, no internal/sandbox/..., no syscall/js, credhttp.BrowserEgress nil,
 #      credhttp's guardedTransport dialguard's own).
 #
 # Run from go/snowplow. Needs node on PATH for steps 3 and 4.
@@ -21,12 +24,12 @@ echo "== js/wasm: build"
 GOOS=js GOARCH=wasm go build -o /dev/null .
 
 echo "== js/wasm: vet"
-GOOS=js GOARCH=wasm go vet . ./internal/browserbridge ./internal/credhttp ./internal/testsupport/jsfetch
+GOOS=js GOARCH=wasm go vet . ./internal/browserbridge ./internal/sandbox/... ./internal/credhttp ./internal/testsupport/jsfetch
 
-echo "== js/wasm: bridge tests under Node"
+echo "== js/wasm: bridge and fake apiserver tests under Node"
 command -v node >/dev/null || { echo "node is required to run the js/wasm tests" >&2; exit 1; }
 GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
-  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge
+  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge ./internal/sandbox/...
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
 # "node": Go's in-process network, where BrowserEgress must
@@ -58,6 +61,15 @@ for pkg in ./internal/credhttp ./internal/resolvers/restactions/api; do
   run_node node "$TMP/pkg.test"
   run_fetch "$TMP/pkg.test"
 done
+
+# The fake apiserver's field selectors (fieldlabels.json) against kube-apiserver's own source for
+# the version the table names: every v1 AddFieldLabelConversionFunc, read with go/ast.
+echo "== fake apiserver: field selectors equal kube-apiserver's"
+K8S_VERSION="$(sed -n 's/^[[:space:]]*"upstream": "k8s.io\/kubernetes \(v[0-9.]*\)",$/\1/p' internal/sandbox/fakeapiserver/fieldlabels.json)"
+[ -n "$K8S_VERSION" ] || { echo "fieldlabels.json names no upstream version" >&2; exit 1; }
+K8S_DIR="$(go mod download -json "k8s.io/kubernetes@$K8S_VERSION" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
+[ -d "$K8S_DIR" ] || { echo "could not download k8s.io/kubernetes@$K8S_VERSION" >&2; exit 1; }
+go run ./scripts/checkfieldlabels "$K8S_DIR" internal/sandbox/fakeapiserver/fieldlabels.json
 
 # gosec over the browser build: the org's security workflow runs gosec with the default GOOS, so it
 # never sees a file only the browser build compiles. This runs it with GOOS=js GOARCH=wasm over every
