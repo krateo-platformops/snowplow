@@ -277,6 +277,11 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
     # FAKE_TTL_PROOF=granted (default) | denied (IAM answers {})
     if a[:3] == ["get", "job", "ttl-delete-proof"]:
         print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
+    if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:       # its pod, on a platform node
+        print(json.dumps({"items": [{"metadata": {"name": "ttl-delete-proof-x"},
+                                     "spec": {"nodeName": "gke-node-proof"}}]})); sys.exit(0)
+    if a[:3] == ["get", "node", "gke-node-proof"]:
+        print(json.dumps({"metadata": {"name": a[2], "labels": {"bench.krateo.io/pool": "platform"}}})); sys.exit(0)
     if a[:2] == ["logs", "job/ttl-delete-proof"]:
         granted = os.environ.get("FAKE_TTL_PROOF", "granted") == "granted"
         print("TTL_PROOF " + json.dumps({"permissions": ["container.clusters.delete"]} if granted else {}))
