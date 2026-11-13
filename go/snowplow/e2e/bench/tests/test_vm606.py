@@ -931,7 +931,8 @@ def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, 
     assert re.search(rf"^FIREWALLS in operations-dev-krateo-io: 68 of 100 used, 32 free; the VM needs 2: its 2 "
                      rf"IAP-only SSH rules \({VM}-deny-ssh, {VM}-iap-ssh\)$", out, re.M), out
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
-    assert {c["argv"][1] for c in lists} == {"instances", "forwarding-rules", "addresses"}
+    # the quota pre-check's lists, and #1383 gap 6's reap of the project's expired SSH rules before them
+    assert {c["argv"][1] for c in lists} == {"firewall-rules", "instances", "forwarding-rules", "addresses"}
     assert all(c["partial_error"] == "false" for c in lists)
     monkeypatch.setenv("FAKE_LIMIT_E2_CPUS", "4")
     rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0",
