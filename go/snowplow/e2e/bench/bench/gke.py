@@ -575,20 +575,50 @@ def lb_progress(svc_list: dict, events: list[dict] | None = None) -> tuple[dict,
 # ─── In-cluster dead-man switch ─────────────────────────────────────────────
 
 
-# gke-up's exit when the cluster exists but its TTL backstop is not applied
+TTL_NAMESPACE = "bench-self-destruct"
+TTL_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli:slim"
+TTL_PERMISSION = "container.clusters.delete"
+TTL_PROOF_JOB = "ttl-delete-proof"
+TTL_PROOF_MARK = "TTL_PROOF "
+# the permission test runs IN the cluster, as the CronJob's own identity (the GKE node SA);
+# vm606's plan-iam lists this host as the node SA's, not the orchestrator's (NODE_SA_REST)
+TTL_PROOF_API = "https://cloudresourcemanager.googleapis.com/v1"
+# how long the proof Job may take: the image pull on a new node, gcloud's token, one request
+TTL_PROOF_BUDGET_S = 600.0
+# gke-up's exit when the cluster exists but its TTL backstop is not applied or not proven
 EXIT_TTL_BACKSTOP_MISSING = 3
 
-def self_destruct_manifest(spec: ClusterSpec,
-                           image: str = "gcr.io/google.com/cloudsdktool/"
-                                        "google-cloud-cli:slim") -> str:
+
+def _ttl_pod_spec(image: str, script: str, indent: int) -> str:
+    """The pod spec the TTL CronJob's Job runs, and the proof Job (ttl_proof_manifest) too: the
+    same image, tolerations, namespace and (default) Kubernetes service account, so the proof's
+    identity is the CronJob's: the GKE node SA, from the metadata server (the cluster has no
+    Workload Identity), with the nodes' cloud-platform scope."""
+    body = "\n".join("    " + ln for ln in script.splitlines())
+    pod = f"""\
+restartPolicy: Never
+tolerations:
+- operator: Exists
+containers:
+- name: reaper
+  image: {image}
+  command: ["/bin/sh", "-c"]
+  args:
+  - |
+{body}"""
+    return "\n".join(" " * indent + ln for ln in pod.splitlines())
+
+
+def self_destruct_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
     """A CronJob that deletes THIS cluster once its TTL has passed.
 
     The only teardown layer that survives the operator's machine dying. It
     runs with the node service account (the cluster is created with the
     cloud-platform scope), so it works only if that account may call
-    container.clusters.delete — UNVERIFIED for operations-dev-krateo-io; the
-    run plan lists it as a check before the first run. It re-checks the
-    labels itself, so a copy applied to the wrong cluster deletes nothing.
+    container.clusters.delete: gke-up PROVES that on every run, right after
+    applying it, as that very identity (prove_ttl_delete; #1383 gap 3), and
+    a run whose proof fails does not go on. It re-checks the labels itself,
+    so a copy applied to the wrong cluster deletes nothing.
     """
     _check_name(spec.name)
     exp = spec.ttl_expires
@@ -605,18 +635,17 @@ def self_destruct_manifest(spec: ClusterSpec,
         f"gcloud container clusters delete {spec.name} --project {spec.project} "
         f"--region {spec.region} --quiet --async\n"
     )
-    indented = "\n".join("              " + ln for ln in script.splitlines())
     return f"""\
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: bench-self-destruct
+  name: {TTL_NAMESPACE}
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: ttl-self-destruct
-  namespace: bench-self-destruct
+  namespace: {TTL_NAMESPACE}
   labels:
     purpose: snowplow-bench
 spec:
@@ -627,17 +656,104 @@ spec:
       backoffLimit: 0
       template:
         spec:
-          restartPolicy: Never
-          tolerations:
-          - operator: Exists
-          containers:
-          - name: reaper
-            image: {image}
-            command: ["/bin/sh", "-c"]
-            args:
-            - |
-{indented}
+{_ttl_pod_spec(image, script, 10)}
 """
+
+
+def ttl_proof_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
+    """#1383 gap 3: a Job of the CronJob's own pod spec (_ttl_pod_spec) that asks IAM, as the
+    identity the CronJob runs as, whether it holds TTL_PERMISSION on the project
+    (projects.testIamPermissions: IAM answers for the CALLER, with every inherited and
+    conditional grant applied; GKE has no per-cluster IAM, so the project's answer is the
+    cluster's). It prints IAM's answer on one TTL_PROOF_MARK line; the token never leaves the
+    pod. Deletes nothing."""
+    _check_name(spec.name)
+    body = json.dumps({"permissions": [TTL_PERMISSION]})
+    script = (
+        "set -eu\n"
+        "tok=$(gcloud auth print-access-token)\n"
+        "resp=$(curl -sS -X POST -H \"Authorization: Bearer $tok\" -H 'Content-Type: application/json' "
+        f"--data '{body}' '{TTL_PROOF_API}/projects/{spec.project}:testIamPermissions')\n"
+        f"echo \"{TTL_PROOF_MARK}$(printf '%s' \"$resp\" | tr -d '\\n')\"\n"
+    )
+    return f"""\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {TTL_PROOF_JOB}
+  namespace: {TTL_NAMESPACE}
+  labels:
+    purpose: snowplow-bench
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {int(TTL_PROOF_BUDGET_S)}
+  template:
+    spec:
+{_ttl_pod_spec(image, script, 6)}
+"""
+
+
+def ttl_proof_answer(logs: str) -> tuple[bool, str]:
+    """(proven, why) from the proof pod's log: proven only when IAM's testIamPermissions answer
+    (the TTL_PROOF_MARK line) lists TTL_PERMISSION. An error answer is named by its code and
+    status only (its message can name the account)."""
+    line = next((ln[len(TTL_PROOF_MARK):] for ln in (logs or "").splitlines() if ln.startswith(TTL_PROOF_MARK)),
+                None)
+    if line is None:
+        return False, "the proof pod printed no answer (its gcloud token or its request failed before IAM answered)"
+    try:
+        got = json.loads(line)
+    except ValueError:
+        return False, "IAM's answer is not JSON"
+    if not isinstance(got, dict):
+        return False, "IAM's answer is not a JSON object"
+    if "error" in got:
+        e = got.get("error") or {}
+        return False, (f"IAM refused the permission test (HTTP {e.get('code')}, {e.get('status')}): whether the "
+                       f"node SA may delete the cluster is unknown")
+    perms = got.get("permissions") or []
+    if TTL_PERMISSION in perms:
+        return True, f"IAM answers that the CronJob's identity (the GKE node SA) holds {TTL_PERMISSION}"
+    return False, f"IAM answers that the CronJob's identity (the GKE node SA) does NOT hold {TTL_PERMISSION}"
+
+
+def prove_ttl_delete(spec: ClusterSpec, *, run=None, clock: Callable[[], float] = time.monotonic,
+                     sleep: Callable[[float], None] = time.sleep,
+                     budget_s: float = TTL_PROOF_BUDGET_S) -> tuple[bool, str]:
+    """#1383 gap 3: PROVE the TTL CronJob can delete the cluster, on this run: apply the proof
+    Job (ttl_proof_manifest: the CronJob's pod spec), wait for it to end within `budget_s`, read
+    its answer (ttl_proof_answer), delete it. (proven, the line saying so). Anything not read
+    is "not proven", never proven."""
+    run = run or execute
+    k = _kubectl(spec)
+    quiet = lambda _m: None  # noqa: E731
+    rc, _ = run(k + ["apply", "-f", "-"], dry_run=False, input_data=ttl_proof_manifest(spec), log=quiet)
+    if rc != 0:
+        return False, f"the proof Job could not be applied (rc={rc})"
+    try:
+        deadline = clock() + budget_s
+        state = None
+        while True:
+            rc, out = run(k + ["get", "job", TTL_PROOF_JOB, "-n", TTL_NAMESPACE, "-o", "json"], dry_run=False,
+                          log=quiet)
+            st = ((_json(out) or {}).get("status") or {}) if rc == 0 else {}
+            if st.get("succeeded"):
+                state = "succeeded"
+            elif st.get("failed"):
+                state = "failed"
+            if state or clock() >= deadline:
+                break
+            sleep(_POLL_S)
+        if state is None:
+            return False, f"the proof Job did not end within {budget_s:g} s (its pod never answered)"
+        rc, logs = run(k + ["logs", f"job/{TTL_PROOF_JOB}", "-n", TTL_NAMESPACE], dry_run=False, log=quiet)
+        if rc != 0:
+            return False, f"the proof Job {state}, and its log could not be read (rc={rc})"
+        ok, why = ttl_proof_answer(logs)
+        return ok, why if ok or state == "succeeded" else f"the proof Job failed: {why}"
+    finally:
+        run(k + ["delete", "job", TTL_PROOF_JOB, "-n", TTL_NAMESPACE, "--ignore-not-found", "--wait=false"],
+            dry_run=False, log=quiet)
 
 
 # ─── Execution ──────────────────────────────────────────────────────────────
@@ -2271,6 +2387,27 @@ def cmd_gke_up(a) -> int:
                          f"go on; the run's teardown deletes {spec.name} (by hand: python3 -m bench.gke gke-down "
                          f"--name {spec.name} --yes)\n")
         return EXIT_TTL_BACKSTOP_MISSING
+    # #1383 gap 3: and the backstop is PROVEN able to delete the cluster, on this run, as its own identity
+    if dry:
+        execute(_kubectl(spec) + ["apply", "-f", "-"], dry_run=True)
+        print(f"DRY-RUN: (stdin: Job {TTL_NAMESPACE}/{TTL_PROOF_JOB}, the CronJob's pod spec, asking IAM's "
+              f"testIamPermissions for {TTL_PERMISSION} as the node SA; then its log is read and it is deleted)")
+        return 0
+    ok, why = prove_ttl_delete(spec)
+    proof = {"kind": "ttl_backstop_proof", "cluster": spec.name, "project": spec.project,
+             "permission": TTL_PERMISSION, "proven": ok, "why": why,
+             "method": "projects.testIamPermissions, from a Job of the ttl-self-destruct CronJob's pod spec"}
+    if getattr(a, "ttl_proof_out", None):
+        with open(a.ttl_proof_out, "w") as fh:
+            json.dump(proof, fh)
+            fh.write("\n")
+    if not ok:
+        sys.stderr.write(f"TTL backstop NOT proven: {why}: the ttl-self-destruct CronJob could not delete "
+                         f"{spec.name} at its TTL, so the run does not go on; the run's teardown deletes it (by "
+                         f"hand: python3 -m bench.gke gke-down --name {spec.name} --yes)\n")
+        return EXIT_TTL_BACKSTOP_MISSING
+    print(f"TTL backstop proven: {why} in {spec.project} (projects.testIamPermissions from a Job of the "
+          f"ttl-self-destruct CronJob's own pod spec)")
     return 0
 
 
@@ -2516,6 +2653,8 @@ def add_parsers(sub) -> None:
     up.add_argument("--ttl-hours", type=int, default=DEFAULT_TTL_HOURS)
     up.add_argument("--quota-log", default=None,
                     help="#1173: write every pre-check line here (run606: $OUT/quota-check.log)")
+    up.add_argument("--ttl-proof-out", default=None,
+                    help="#1383: write the TTL backstop's proof record (JSON) here (run606: $OUT/ttl-proof.json)")
     footprint_args(up)
     up.set_defaults(func=cmd_gke_up)
 

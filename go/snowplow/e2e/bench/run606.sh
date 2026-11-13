@@ -8,8 +8,12 @@
 #
 # Teardown layers (any one deletes the cluster):
 #   1. `trap teardown EXIT` below (+ INT/TERM/HUP → exit → EXIT trap);
-#   2. the in-cluster ttl-self-destruct CronJob applied by `gke-up`;
-#   3. `python -m bench.gke gke-reap --yes` (first step of every run; also by hand);
+#   2. the in-cluster ttl-self-destruct CronJob applied by `gke-up`, which proves
+#      on every run that the CronJob's identity may delete the cluster (IAM
+#      testIamPermissions from a Job of its own pod spec, $OUT/ttl-proof.json):
+#      a run whose CronJob is not applied or not proven stops (#1383);
+#   3. `python -m bench.gke gke-reap --yes` (first step of every run; also by hand;
+#      each delete verified by its describe's NotFound);
 #   4. the ttl-expires label, which 2 and 3 read.
 #
 # A paid run is not finished until its evidence is safe (#1194, bench/evidence.py):
@@ -904,7 +908,8 @@ s_up() {
   rm -f "$OUT/quota-check.log"
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
-      --address-need "$LB_NEED" --quota-log "$OUT/quota-check.log" $YES 2>"$KERR" || up_rc=$?
+      --address-need "$LB_NEED" --quota-log "$OUT/quota-check.log" --ttl-proof-out "$OUT/ttl-proof.json" \
+      $YES 2>"$KERR" || up_rc=$?
   # #1173: every pre-check line in the run's log, IN_USE_ADDRESSES's with the number counted
   # from the region's address holders beside the one GCE reports (each launch is the falsifier)
   if [[ -s "$OUT/quota-check.log" ]]; then

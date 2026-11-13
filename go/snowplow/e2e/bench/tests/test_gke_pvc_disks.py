@@ -311,7 +311,10 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
                  "spec": {"volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "data"}}]}},
                 {"metadata": {"name": "web-0", "namespace": "krateo-system"},
                  "spec": {"volumes": [{"name": "c", "configMap": {"name": "x"}}]}}]})); sys.exit(0)
-        # #1383 gap 4: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused)
+        # #1383: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused) and its proof Job, as the API server and
+        # IAM answer: FAKE_TTL_PROOF=granted (default) | denied (testIamPermissions answers {}) | error (an IAM
+        # error naming the account) | silent (the pod printed no answer) | failed (the Job failed) | never
+        proof = os.environ.get("FAKE_TTL_PROOF", "granted")
         if a[:2] == ["apply", "-f"]:
             text = sys.stdin.read()
             with open(os.path.join(st, "applied.txt"), "a") as fh:
@@ -319,7 +322,19 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             if "ttl-self-destruct" in text and os.environ.get("FAKE_TTL_APPLY_RC"):
                 sys.exit(int(os.environ["FAKE_TTL_APPLY_RC"]))
             sys.exit(0)
+        if a[:3] == ["get", "job", "ttl-delete-proof"]:
+            st_ = {"failed": {"failed": 1}, "never": {"active": 1}}.get(proof, {"succeeded": 1})
+            print(json.dumps({"kind": "Job", "status": st_})); sys.exit(0)
+        if a[:2] == ["logs", "job/ttl-delete-proof"]:
+            ans = {"granted": {"permissions": ["container.clusters.delete"]}, "denied": {},
+                   "error": {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                                       "message": "denied for someone@example.invalid"}}}.get(proof)
+            if ans is not None:
+                print("TTL_PROOF " + json.dumps(ans))
+            sys.exit(0)
         sys.exit(0)
+    if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)
+        print(json.dumps(server_config())); sys.exit(0)
     if a[:3] == ["container", "clusters", "describe"]:
         if has("deleted") and not os.environ.get("FAKE_NEVER_GONE"):
             sys.stderr.write("ERROR: ResponseError: code=404, message=Not found: clusters/x.\\n"); sys.exit(1)
@@ -807,7 +822,9 @@ def test_gke_up_that_fits_creates_the_labelled_cluster_and_touches_no_storagecla
     assert _first(c, ["gcloud", "compute", "regions", "describe", "europe-west4"]) < _first(
         c, ["gcloud", "container", "clusters", "create"])
     assert not any("storageclass" in x for x in c)
-    assert [x[:2] for x in _mutating(c)] == [["kubectl", "apply"]]               # the self-destruct only
+    # the self-destruct only, and its proof Job (#1383 gap 3), applied and deleted
+    assert [x[:3] for x in _mutating(c)] == [["kubectl", "apply", "-f"], ["kubectl", "apply", "-f"],
+                                            ["kubectl", "delete", "job"]]
     assert "SSD_TOTAL_GB in europe-west4: 397 of 500 GB used, 103 free" in capsys.readouterr().out
 
 

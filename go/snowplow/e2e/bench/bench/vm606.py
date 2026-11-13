@@ -447,6 +447,11 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
 REST_ROLES = {"cloudquotas": ("roles/cloudquotas.viewer",)}
 HEADER_ROLES = {"x-goog-user-project": ("roles/serviceusage.serviceUsageConsumer",)}
 KUBE_ROLE = "roles/container.admin"
+# A REST API the orchestrator never calls itself: a module constant (by name, in its file, on its host) whose URL
+# only a pod in the bench cluster requests, as the GKE node SA. #1383 gap 3: gke-up's TTL proof Job asks IAM's
+# projects.testIamPermissions AS the identity the ttl-self-destruct CronJob runs as (like the CronJob's own gcloud,
+# not in the scan). Any other use of the host is scanned like every REST call.
+NODE_SA_REST = {"TTL_PROOF_API": ("gke.py", "cloudresourcemanager")}
 
 WHY = {
     "roles/container.admin": (
@@ -481,6 +486,8 @@ NOT_NEEDED = (
     "compute.instances.* writes for the VM itself: its TTL delete is GCE's (--termination-time, "
     "--instance-termination-action=DELETE), no permission of the SA",
     "logging / monitoring roles: the bench calls neither",
+    "resourcemanager roles for the SA: gke-up's TTL proof (#1383) asks IAM's testIamPermissions from a Job in the "
+    "bench cluster, as the GKE node SA (NODE_SA_REST), never as the orchestrator SA",
 )
 
 _PY_ARGV = re.compile(r'\[\s*"gcloud"\s*((?:,\s*(?:"[^"]*"|[A-Za-z_][A-Za-z_0-9]*)\s*){1,3})')
@@ -518,6 +525,10 @@ def scan(bench_dir: Path = BENCH_DIR) -> dict:
         for m in _REST_HOST.finditer(src):
             where = f"{rel}:{src.count(chr(10), 0, m.start()) + 1}"
             host = m.group(1)
+            line = src[src.rfind("\n", 0, m.start()) + 1:m.start()]
+            named = re.match(r"\s*([A-Z_][A-Z0-9_]*)\s*=", line)
+            if named and NODE_SA_REST.get(named.group(1)) == (rel.name, host):
+                continue                    # called in the bench cluster as the GKE node SA, not by the SA
             if host in REST_ROLES:
                 rest.append((host, where))
             else:
