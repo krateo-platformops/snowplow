@@ -11,7 +11,7 @@ timestamp: 2026-11-11T00:00:00Z
 
 Snowplow writes one **AuditEvent** per action it performs for a person, as an
 OTLP LogRecord on the shared logs plane. Since #1291 the record is written by
-the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.6.0,
+the shared Krateo writer, `github.com/krateo-platformops/audit` (v0.12.0,
 schema v1), declared as the `request` writer on the scope
 `github.com/krateo-platformops/snowplow/audit`; `internal/support/audit`
 supplies what only snowplow knows (the actor from the validated token, the
@@ -187,7 +187,7 @@ when a record carries an attribute this table does not name.
 | `krateo.audit.on_behalf_of.user.name`, `krateo.audit.delegation` | a delegated token's subject and signed `act` chain |
 | `krateo.action` | `call`, `export`, `restaction`; a dry-run write carries the suffix `.dryRun` (`call.dryRun`, `restaction.dryRun`) |
 | `krateo.audit.verb` | the authority's verb for what was dialled |
-| `http.request.method` | the method sent; `_OTHER` for one semconv does not name |
+| `http.request.method` | the method of the authority request snowplow SENT, the method of its verb, never the method of the request snowplow served (schema v1; an export sends GET, whatever it was served with); `_OTHER` for one semconv does not name. The emitter checks every record: one whose method is not its verb's is counted (`snowplow_audit_dial_method_mismatch_total`, zero is the only correct value) and, in a test binary, fails the arm that emitted it (`SetDialMethodGuardForTest`, installed in every package that records), so the falsifier runs in every arm that emits a record |
 | `http.request.method_original` | the method as sent, only when `http.request.method` is `_OTHER` |
 | `krateo.audit.dry_run` | on every write: `true` for a dry run (`/call/dry-run`, a stage path with `?dryRun=All`), else `false`; never on a read (an export) |
 | `krateo.audit.outcome`, `outcome` | `success` / `failure` / `denied` (snowplow itself refused; no status code) |
@@ -243,14 +243,63 @@ krateo-057 no access token was found in any URL field over 6 h or over all time
 (installer, measured 2026-11-07, with controls). A failed `/call` record's body and a RESTAction stage record's body are the same reason class from a closed
 set (below).
 
+## One record per audited request
+
+Which routes are audited, and as what, is declared once, where the route is
+registered (`routeTable` in `debug_routes.go`): `HandleAudited` mounts a route
+with its audit descriptor (`audit.Route`: what a request asked for, by the
+handler's own rules: `handlers.CallRoute`, `CallDryRunRoute`, `ExportRoute`),
+`HandleUnaudited` mounts one that is not, with the reason, and `Handle` panics
+at boot for a pattern whose method can change something (POST, PUT, PATCH,
+DELETE, or none), so a new route is never silently rowless
+(`TestAudit_RouteTable_*`). An audited route is wrapped OUTERMOST in
+`audit.OpenRecord`, before any middleware decodes a body or verifies a token,
+so every exit emits exactly one record (#1379 review F2):
+
+- the handler emits it (`audit.EmitRoute`) with what the authority answered;
+- the login middleware (UserConfig) names the verified caller as soon as the
+  token validates (`audit.SetCaller`), before its credential lookup, so its
+  own exits are the route's record too: a verified caller whose own
+  credential Secret is missing (its 401) is `denied`,
+  `session_credential_missing` or, for a `krateo:loa:2` token,
+  `step_up_required`, no status code (`audit.DenyRoute`); a lookup that fails
+  for any other reason (its 500, or the page budget's 504) is a `failure`
+  with NO status code and the body "the caller's credential could not be
+  read; nothing was sent" (`audit.FailRoute`): snowplow's own code, and its
+  ServiceAccount's read of the credential Secret, are never an answer of the
+  authority the record names (never a code snowplow made up, #1298). A
+  legitimate server error, not a design error;
+- a 4xx exit that emitted none, a refusal by snowplow before anything was
+  sent (a body the decoder refuses, a malformed query, a `/call` dial that
+  would act on another object), is recorded when the request ends: what it
+  asked for, `denied`, `krateo.audit.denial_reason` `invalid_request`, no
+  status code. What it asked for is the descriptor the handler stored once
+  it parsed the request (`audit.SetAsked`), else the route's descriptor of
+  the method, path and query alone (no body is read twice); the target when
+  the request names one the handler would dial, else none (marked `target`);
+- any other exit that emitted none (a 2xx, 3xx or 5xx answer, or a panic) is
+  a design error of the handler, never a description of what was sent: it is
+  recorded as a `failure` (the outcome is required) with its own body, "the
+  handler answered without recording its outcome" or "panic: …", and
+  counted in `snowplow_audit_unrecorded_exit_total{answered,panic}`, whose
+  only correct value is zero; a panic is re-raised after its record;
+- a request that never got a verified caller (an authentication failure) gets
+  none: those are counted, never recorded (see "Authentication failures").
+
+`TestAudit_E2E_*` (`main` package) drives each audited route class through
+the real route table and the real login middleware (one row per refusal and
+per success, zero for an unverified request, one saying panic for a panic,
+and the design-error counter unmoved); `TestAudit_OpenRecord_*` and
+`TestOpenRecord_*` pin the parts.
+
 ## Inventory
 
 | path | what changes | status |
 |---|---|---|
-| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298); the portal's `X-Krateo-Provenance` header adds `krateo.audit.client.*` (#1333) |
-| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true`; `krateo.audit.client.*` as on `/call` (#1333) |
+| `POST/PUT/PATCH/DELETE /call` | an object, on the caller's own credential | **audited** — `call`, one record per request, including `failure` with the apiserver's code when it refuses the write; the failure record's outcome, code and body are what was observed at the dial, from the same closed set as a stage record (the outcome table below), never the apiserver's message or body, and never a code snowplow made up (#1298); the portal's `X-Krateo-Provenance` header adds `krateo.audit.client.*` (#1333). The record names the object the apiserver resolves from the dialled path, by construction (#1257): `buildURIPath` sends each query value as exactly one escaped path segment (a `?` or `#` in a name stays in the name), and refuses with a 400, before any dial, a value the apiserver does not accept as one segment (`.`, `..`, or one holding `/` or `%`) in the API version, resource, namespace, name or subresource. Before, `name=cm-x/status` dialled the status subresource and `name=../secrets/s1` another resource, while the record named the query's values. Then the dialled URI is classified with the apiserver's own `RequestInfoFactory` (`audit.KubernetesObject`, `dialledTarget`): a write whose classification differs from what the request named (a group, version, resource or subresource, a namespace it gave, a name the path carries) is refused with a 400 before the dial (`resource=namespaces&namespace=foo&name=bar` would delete namespace `bar`; `resource=finalize` under a namespace is that namespace's subresource), and otherwise the record's target is that classification, so it describes the dial by construction (#1379 review F3). A create (POST) is sent to the collection, so the query's `name` never reaches the apiserver, which names the object from the body or generates it (`k8s.io/apiserver` `createHandler`, `BeforeCreate`): its record names the object the apiserver answered with (`metadata.name`, a generated name included), and on a failure (a 403 included) the body's `metadata.name`, what was asked, when it is one path segment, else no name (#1378). The body's keys are matched exactly, as apimachinery decodes them: `{"metadata":{"Name":"decoy"}}` names nothing. `krateo.request.uri` keeps the query, `name` included, as received. A refusal before the dial (a malformed query, a dial that would act on another object, a `dryRun` on the plain route) is the route's one record too (see "One record per audited request") |
+| `POST/PUT/PATCH /call/dry-run` | nothing persisted; the apiserver admits or refuses the write | **audited** — `call.dryRun`, `krateo.audit.dry_run=true`; `krateo.audit.client.*` as on `/call` (#1333); the dialled path is built, classified and refused as on `/call` (#1257, #1379 review F3) |
 | a RESTAction `api[]` stage with a write verb, reached by `GET /call`, `POST /call/read` or `GET /export` | whatever the stage's target does with the request: the caller's own apiserver (no `endpointRef`) or a named endpoint | **audited** — `restaction` (`restaction.dryRun` when the stage's apiserver path asks for a dry run), one record per dialled call (an iterator stage of N calls is N records). See below |
-| `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (the `/call` lane it dials always names its object), `http.request.method` the export's own; the success path, and a render or send failure |
+| `GET /export`, `POST /export` | nothing; a file is produced from the caller's own `/call` | **audited** — `export`, verb `get` (the `/call` lane it dials always names its object), `http.request.method` `GET` for a GET and a POST export alike: the method of the read it sends (#1379 review F1); `krateo.request.uri` says what it received. Its target is the apiserver's classification of that read's URI. Exactly one record per export, on every exit (#986; the handler's record is emitted once, deferred, by `exportAudit`, and an exit before the handler, a body `BodyExtrasDecode` refuses included, is the route's record, see "One record per audited request"): `success` with the code it answered; `failure` with the code it answered for a page the `/call` lane failed (relayed), a row path that does not evaluate, a pdf over the row bound, or a render or send failure; `denied`, with no status code, for the export's own refusals before any page is dispatched (an unsupported `format`, `header` labels that do not match `fields`), whose body is the rule's fixed phrase, never the caller's value. A target the `/call` lane cannot dial (#1257) names no object, since none was read: the record carries no Kubernetes target and is marked `target` |
 | a RESTAction write stage in a background resolve (refresher, cohort seed, prewarm, content prewarm, pagination drain, a #547 demand revalidation, or a `/call` snowplow makes to itself for one of them) | nothing: the stage is refused before any request leaves (#903) | **out of scope** — nothing was sent; see "Writes nobody requested" |
 | a RESTAction write stage in a dry run (inline object on `POST /call/read`) | nothing: the stage is refused before any request leaves (#443) | **out of scope** — no authority was asked, nothing was done |
 | a RESTAction write stage abandoned before the dial: its endpoint Secret cannot be resolved, its iterator or path template fails, the #288 malformed-dial guard refuses the path, the resolve is not a customer request (#903, the row above), the stage it depends on did not succeed (#904: reported `Skipped` in `X-Snowplow-Stage-Outcomes`), or the pass was served stale content and its fresh re-run sends the write instead (#905: the withdrawn pass sends nothing, the re-run's dial is the one recorded) | nothing: no request leaves | **out of scope** — nothing was sent; the stage error is in the response and the log, not in the trail |
