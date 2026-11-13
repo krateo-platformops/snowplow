@@ -132,6 +132,9 @@ type debugMux interface {
 	// declareUnaudited declares, before it is mounted, that a debug route
 	// that can change something is not audited, and why (see routeTable).
 	declareUnaudited(pattern, reason string)
+	// declareAudited declares, before it is mounted, a debug route's audit
+	// descriptor: handleDebug then wraps it outermost in audit.OpenRecord.
+	declareAudited(pattern string, route audit.Route)
 }
 
 // routeRegistrar is what a non-debug route registrar (mountCallWriteRoutes,
@@ -228,10 +231,23 @@ func (t *routeTable) handleDebug(pattern string, handler http.Handler) {
 	if !isDebugPattern(pattern) {
 		panic(fmt.Sprintf("route %q is not under /debug: mount it with Handle", pattern))
 	}
+	if route, audited := t.audited[pattern]; audited {
+		t.mux.Handle(pattern, audit.OpenRecord(route)(handler))
+		return
+	}
 	if _, declared := t.unaudited[pattern]; !declared {
 		mustBeSafe(pattern)
 	}
 	t.mux.Handle(pattern, handler)
+}
+
+// declareAudited declares a debug route's audit descriptor before mount (see
+// handleDebug); a descriptor with no Asked panics.
+func (t *routeTable) declareAudited(pattern string, route audit.Route) {
+	if route.Asked == nil {
+		panic(fmt.Sprintf("route %q is declared audited with no descriptor", pattern))
+	}
+	t.audited[pattern] = route
 }
 
 // declareUnaudited declares that pattern, a route that can change something,
@@ -386,8 +402,9 @@ func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySourc
 	// turns the dark parity MEASUREMENT on or off. The toggle is per-pod, so a
 	// measurement that uses it must pin to one pod (see the handler doc).
 	mount("GET /debug/shadow-parity", handlers.DebugShadowParityGet())
-	mux.declareUnaudited("POST /debug/shadow-parity",
-		"not yet: its record needs a non-resource target, url.path, which audit v0.12.0 adds (#909)")
+	// #909 — the flip is a state change: audited (handlers.ShadowParityRoute,
+	// target url.path), on the same gated chain.
+	mux.declareAudited("POST /debug/shadow-parity", handlers.ShadowParityRoute())
 	mount("POST /debug/shadow-parity", handlers.DebugShadowParitySet())
 
 	// #277 (edge-3) — the read-only dep-graph diagnostic. Same JWT gate, same

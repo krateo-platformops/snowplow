@@ -318,6 +318,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
 	// demand revalidation, the background hop). Pure ctx reads.
 	"NonCustomerWriteOrigin": readOnly443,
+	// AUDIT-4 (audit#22) — "does this resolve have a requester?" for a stage's
+	// audit record (stage_audit.go stageRecorded): every non-customer origin
+	// NonCustomerWriteOrigin reads, walked in its order. Pure ctx reads.
+	"EachNonCustomerOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.

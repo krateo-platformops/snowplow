@@ -671,11 +671,12 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 	if mountCalls != len(debugRoutePatterns) {
 		t.Errorf("registerDebugRoutes calls mount %d times; debugRoutePatterns lists %d", mountCalls, len(debugRoutePatterns))
 	}
-	// Non-vacuity: the scan sees routeTable's own four delegations (Handle,
-	// HandleAudited, HandleUnaudited, handleDebug) and main's route mounts, so
-	// a broken type resolution cannot read as a clean bill.
-	if rawMuxInTable != 4 {
-		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 4", rawMuxInTable)
+	// Non-vacuity: the scan sees routeTable's own five delegations (Handle,
+	// HandleAudited, HandleUnaudited, and handleDebug's audited and plain
+	// mounts) and main's route mounts, so a broken type resolution cannot
+	// read as a clean bill.
+	if rawMuxInTable != 5 {
+		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 5", rawMuxInTable)
 	}
 	if tableHandleCalls < 10 {
 		t.Errorf("NON-VACUITY: saw only %d routeTable/routeRegistrar Handle calls in package main", tableHandleCalls)

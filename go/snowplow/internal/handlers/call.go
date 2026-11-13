@@ -276,12 +276,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// code and says what happened instead, and a 2xx whose body snowplow
 		// would not use is the accepted write it was. A success keeps its
 		// record unchanged. The caller's response below still carries rt.
-		outcome, code, msg := audit.OutcomeSuccess, http.StatusOK, ""
+		// A dial the destination policy refused is denied, with reason
+		// destination_refused (audit v0.12.0).
+		outcome, code, msg, reason := audit.OutcomeSuccess, http.StatusOK, "", ""
 		if rt.Status == response.StatusFailure {
-			outcome, code, msg = answered.Outcome()
+			outcome, code, msg, reason = answered.OutcomeWithReason()
 		}
 		ev := callAuditEvent(req, opts, uri, dialled, outcome, answer)
-		ev.StatusCode, ev.Message = code, msg
+		ev.StatusCode, ev.Message, ev.DenialReason = code, msg, reason
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		audit.RecordWrittenObject(&ev, answer)
