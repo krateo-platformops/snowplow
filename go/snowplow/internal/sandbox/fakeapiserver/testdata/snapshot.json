@@ -1,0 +1,407 @@
+{
+  "schema": 1,
+  "capturedFrom": {
+    "cluster": "test-fixture",
+    "at": "2026-11-12T00:00:00Z",
+    "server": "v1.36.4",
+    "snowplow": "test-fixture",
+    "frontend": "test-fixture",
+    "files": {},
+    "demo": {
+      "seed": 1,
+      "generator": "hand-written test fixture"
+    },
+    "review": []
+  },
+  "resourceVersion": "100",
+  "discovery": {
+    "api": {
+      "kind": "APIVersions",
+      "versions": [
+        "v1"
+      ]
+    },
+    "apis": {
+      "kind": "APIGroupList",
+      "apiVersion": "v1",
+      "groups": [
+        {
+          "name": "observability.krateo.io",
+          "versions": [
+            {
+              "groupVersion": "observability.krateo.io/v1alpha1",
+              "version": "v1alpha1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "observability.krateo.io/v1alpha1",
+            "version": "v1alpha1"
+          }
+        },
+        {
+          "name": "rbac.authorization.k8s.io",
+          "versions": [
+            {
+              "groupVersion": "rbac.authorization.k8s.io/v1",
+              "version": "v1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "rbac.authorization.k8s.io/v1",
+            "version": "v1"
+          }
+        },
+        {
+          "name": "apiextensions.k8s.io",
+          "versions": [
+            {
+              "groupVersion": "apiextensions.k8s.io/v1",
+              "version": "v1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "apiextensions.k8s.io/v1",
+            "version": "v1"
+          }
+        },
+        {
+          "name": "authorization.k8s.io",
+          "versions": [
+            {
+              "groupVersion": "authorization.k8s.io/v1",
+              "version": "v1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "authorization.k8s.io/v1",
+            "version": "v1"
+          }
+        },
+        {
+          "name": "apps",
+          "versions": [
+            {
+              "groupVersion": "apps/v1",
+              "version": "v1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "apps/v1",
+            "version": "v1"
+          }
+        },
+        {
+          "name": "admissionregistration.k8s.io",
+          "versions": [
+            {
+              "groupVersion": "admissionregistration.k8s.io/v1",
+              "version": "v1"
+            }
+          ],
+          "preferredVersion": {
+            "groupVersion": "admissionregistration.k8s.io/v1",
+            "version": "v1"
+          }
+        }
+      ]
+    },
+    "resources": {
+      "v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "v1",
+        "resources": [
+          {
+            "name": "namespaces",
+            "singularName": "namespace",
+            "namespaced": false,
+            "kind": "Namespace",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "secrets",
+            "singularName": "secret",
+            "namespaced": true,
+            "kind": "Secret",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "configmaps",
+            "singularName": "configmap",
+            "namespaced": true,
+            "kind": "ConfigMap",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "endpoints",
+            "singularName": "endpoints",
+            "namespaced": true,
+            "kind": "Endpoints",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      "observability.krateo.io/v1alpha1": {
+        "kind": "APIResourceList",
+        "groupVersion": "observability.krateo.io/v1alpha1",
+        "resources": [
+          {
+            "name": "incidents",
+            "singularName": "incident",
+            "namespaced": true,
+            "kind": "Incident",
+            "verbs": [
+              "get",
+              "list",
+              "watch",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "name": "incidents/status",
+            "singularName": "",
+            "namespaced": true,
+            "kind": "Incident",
+            "verbs": [
+              "get",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "name": "alerts",
+            "singularName": "alert",
+            "namespaced": true,
+            "kind": "Alert",
+            "verbs": [
+              "get",
+              "list",
+              "watch",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "name": "alerts/status",
+            "singularName": "",
+            "namespaced": true,
+            "kind": "Alert",
+            "verbs": [
+              "get",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      "rbac.authorization.k8s.io/v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "rbac.authorization.k8s.io/v1",
+        "resources": [
+          {
+            "name": "clusterroles",
+            "singularName": "clusterrole",
+            "namespaced": false,
+            "kind": "ClusterRole",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "clusterrolebindings",
+            "singularName": "clusterrolebinding",
+            "namespaced": false,
+            "kind": "ClusterRoleBinding",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "roles",
+            "singularName": "role",
+            "namespaced": true,
+            "kind": "Role",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "rolebindings",
+            "singularName": "rolebinding",
+            "namespaced": true,
+            "kind": "RoleBinding",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      "apiextensions.k8s.io/v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "apiextensions.k8s.io/v1",
+        "resources": [
+          {
+            "name": "customresourcedefinitions",
+            "singularName": "customresourcedefinition",
+            "namespaced": false,
+            "kind": "CustomResourceDefinition",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      "authorization.k8s.io/v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "authorization.k8s.io/v1",
+        "resources": [
+          {
+            "name": "selfsubjectaccessreviews",
+            "singularName": "",
+            "namespaced": false,
+            "kind": "SelfSubjectAccessReview",
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "name": "selfsubjectrulesreviews",
+            "singularName": "",
+            "namespaced": false,
+            "kind": "SelfSubjectRulesReview",
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "name": "subjectaccessreviews",
+            "singularName": "",
+            "namespaced": false,
+            "kind": "SubjectAccessReview",
+            "verbs": [
+              "create"
+            ]
+          }
+        ]
+      },
+      "apps/v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "apps/v1",
+        "resources": [
+          {
+            "name": "deployments",
+            "singularName": "deployment",
+            "namespaced": true,
+            "kind": "Deployment",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      "admissionregistration.k8s.io/v1": {
+        "kind": "APIResourceList",
+        "groupVersion": "admissionregistration.k8s.io/v1",
+        "resources": [
+          {
+            "name": "mutatingwebhookconfigurations",
+            "singularName": "mutatingwebhookconfiguration",
+            "namespaced": false,
+            "kind": "MutatingWebhookConfiguration",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "name": "validatingwebhookconfigurations",
+            "singularName": "validatingwebhookconfiguration",
+            "namespaced": false,
+            "kind": "ValidatingWebhookConfiguration",
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "objects": [
+    "objects/000.json"
+  ],
+  "identity": {
+    "authnNamespace": "krateo-system",
+    "serviceAccount": {
+      "namespace": "krateo-system",
+      "name": "snowplow"
+    },
+    "visitor": {
+      "username": "sandbox-visitor",
+      "groups": [
+        "sandbox-viewers"
+      ],
+      "name": "Sandbox Visitor"
+    }
+  },
+  "scripted": {
+    "applyStatus": [
+      {
+        "id": "resolve-on-applied",
+        "on": {
+          "verb": "patch",
+          "group": "observability.krateo.io",
+          "resource": "incidents",
+          "namespace": "krateo-system",
+          "name": "sre-volume-attach-failure-20261012-140005",
+          "match": {
+            "spec": {
+              "applied": true
+            }
+          }
+        },
+        "afterMs": 1500,
+        "target": "trigger",
+        "status": {
+          "state": "Resolved",
+          "resolution": {
+            "by": "verify"
+          }
+        },
+        "stamp": [
+          "/status/resolution/at"
+        ]
+      }
+    ]
+  }
+}

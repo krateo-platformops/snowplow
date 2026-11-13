@@ -82,12 +82,34 @@ const chunkBytes = 32 << 10
 // the reason snowplow gave.
 const unauthorizedBodyBytes = 64 << 10
 
-// Forward sends req to the server listening on addr, over the in-process
-// network, and streams the response to sink. When ctx is cancelled it closes
-// the connection, so the handler's request context ends and a long-lived
-// handler returns, and it reports nothing more to sink: every call to sink
-// goes through cancelGuard.
+// Forward sends a page's request to snowplow's server listening on addr, over
+// the in-process network, and streams the response to sink. A 401 becomes an
+// error (the package doc says why). When ctx is cancelled it closes the
+// connection, so the handler's request context ends and a long-lived handler
+// returns, and it reports nothing more to sink: every call to sink goes
+// through cancelGuard.
 func Forward(ctx context.Context, addr string, req Request, sink Sink) {
+	exchange(ctx, addr, "snowplow", req, sink, func(hreq *http.Request, resp *http.Response) bool {
+		if resp.StatusCode == http.StatusUnauthorized {
+			sink.Error(unauthorizedMessage(hreq, resp))
+			return false
+		}
+		return true
+	})
+}
+
+// Relay is Forward for another in-process server (a Target), which the page
+// does not call: snowplow's own egress reaches it through bridge.js's network
+// seam, as a request to a cluster address reaches a Service. Every answer,
+// a 401 included, is relayed as the server gave it, because the caller is
+// snowplow, which handles it as it handles the real server's.
+func Relay(ctx context.Context, addr, name string, req Request, sink Sink) {
+	exchange(ctx, addr, name, req, sink, func(*http.Request, *http.Response) bool { return true })
+}
+
+// exchange writes req to the server on addr and streams the answer to sink,
+// once accept lets the response through.
+func exchange(ctx context.Context, addr, name string, req Request, sink Sink, accept func(*http.Request, *http.Response) bool) {
 	sink = cancelGuard{ctx: ctx, sink: sink}
 	hreq, err := newRequest(ctx, addr, req)
 	if err != nil {
@@ -96,7 +118,7 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 	}
 	conn, err := loopback.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		sink.Error("snowplow's in-process server did not accept the connection: " + err.Error())
+		sink.Error(name + "'s in-process server did not accept the connection: " + err.Error())
 		return
 	}
 	defer conn.Close()
@@ -104,18 +126,17 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 	defer stop()
 
 	if err := hreq.Write(conn); err != nil {
-		sink.Error("writing the request to snowplow failed: " + err.Error())
+		sink.Error("writing the request to " + name + " failed: " + err.Error())
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), hreq)
 	if err != nil {
-		sink.Error("reading snowplow's response failed: " + err.Error())
+		sink.Error("reading " + name + "'s response failed: " + err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		sink.Error(unauthorizedMessage(hreq, resp))
+	if !accept(hreq, resp) {
 		return
 	}
 
@@ -132,7 +153,7 @@ func Forward(ctx context.Context, addr string, req Request, sink Sink) {
 		if errors.Is(rerr, io.EOF) {
 			sink.End()
 		} else {
-			sink.Error("snowplow's response body failed: " + rerr.Error())
+			sink.Error(name + "'s response body failed: " + rerr.Error())
 		}
 		return
 	}
