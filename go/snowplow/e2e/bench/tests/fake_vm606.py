@@ -362,8 +362,41 @@ if a[:3] == ["iam", "service-accounts", "describe"]:
     if os.environ.get("FAKE_NO_SA") == "1":
         sys.stderr.write("ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account\n"); sys.exit(1)
     print(a[3]); sys.exit(0)
+# ── #1390: the evidence bucket (its API description, as `--raw` gives it) ──
+def bucket_404(url):
+    sys.stderr.write(f"ERROR: (gcloud.storage.buckets.describe) {url} not found: 404.\n"); sys.exit(1)
+if a[:3] == ["storage", "buckets", "describe"]:
+    (st / "buckets").mkdir(exist_ok=True)
+    bp = st / "buckets" / (a[3][len("gs://"):] + ".json")
+    if not bp.exists():
+        bucket_404(a[3])
+    print(bp.read_text()); sys.exit(0)
+if a[:3] == ["storage", "buckets", "create"]:
+    (st / "buckets").mkdir(exist_ok=True)
+    name = a[3][len("gs://"):]
+    bp = st / "buckets" / (name + ".json")
+    if bp.exists():
+        sys.stderr.write(f"ERROR: (gcloud.storage.buckets.create) HTTPError 409: The requested bucket name is not "
+                         f"available.\n"); sys.exit(1)
+    rp = opt("--retention-period") or ""
+    doc = {"kind": "storage#bucket", "name": name, "location": (opt("--location") or "US").upper(),
+           "iamConfiguration": {"uniformBucketLevelAccess": {"enabled": "--uniform-bucket-level-access" in a},
+                                "publicAccessPrevention": "enforced" if "--public-access-prevention" in a
+                                else "inherited"}}
+    if rp:
+        doc["retentionPolicy"] = {"retentionPeriod": str(int(rp.rstrip("s"))), "effectiveTime": "2026-11-13T00:00:00Z"}
+    if opt("--lifecycle-file"):
+        lc = json.loads(Path(opt("--lifecycle-file")).read_text())
+        doc["lifecycle"] = {"rule": (lc.get("lifecycle") or lc)["rule"]}
+    doc.update(json.loads(os.environ.get("FAKE_BUCKET_ON_CREATE") or "{}"))   # what GCS made differs
+    bp.write_text(json.dumps(doc))
+    sys.exit(0)
 # ── IAM policies ──
 iam = None
+if a[:3] == ["storage", "buckets", "get-iam-policy"] or (a[:2] == ["storage", "buckets"] and "iam-policy" in a[2]):
+    if not (st / "buckets" / (a[3][len("gs://"):] + ".json")).exists():
+        bucket_404(a[3])
+    iam = (a[2], "bucket-" + a[3][len("gs://"):])
 if a[:1] == ["projects"] and "iam-policy" in a[1]:
     iam = (a[1], "project-" + a[2])
 if a[:2] == ["iam", "service-accounts"] and "iam-policy" in a[2]:

@@ -228,6 +228,8 @@ if [[ -n "$REPLICA_PAIR" ]]; then
 fi
 PAIR_EVIDENCE="$(python3 -m bench.evidence dest "$PAIR_NAME")"
 PAIR_RUN_ID="${PAIR_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# #1390: the evidence bucket every arm's run directory is copied to (bench/durable.py; vm606 up ensures it)
+EVIDENCE_BUCKET="$(python3 -m bench.durable bucket ${PROJECT:+"$PROJECT"})"
 if [[ "$DRY" != "1" ]]; then
   for x in "${LABELS[@]}"; do
     out="OUT_$x"
@@ -363,6 +365,7 @@ if [[ "$DRY" == "1" ]]; then
     is_replica "$p" && continue
     pair_cmd "$p"; log "DRY:   ${PAIR_CMD[*]} > $(verdict_file "$p")"
   done
+  log "DRY: the launch's record (pair.json) and, as each run exits, its run directory would be copied to gs://${EVIDENCE_BUCKET}/runs/${PAIR_RUN_ID}/ and verified (python3 -m bench.durable upload) before any statistics"
   exit 0
 fi
 
@@ -393,6 +396,29 @@ if ! msg="$(publish_pair started 2>&1)"; then
   refuse "the pair's evidence could not be published: ${msg}: nothing was created"
 fi
 log "$msg"
+# #1390 item 1: the evidence leaves the VM (gs://$EVIDENCE_BUCKET/runs/$PAIR_RUN_ID/, bench/durable.py): first the
+# launch's record (pair.json: its runs, pairs and replica pair), before any run starts, then each run's directory
+# as the run exits, each copy verified, before any statistics. A launch whose record cannot be copied (no bucket,
+# no grant) spends nothing.
+mkdir -p "$PAIR_OUT/plan"
+cp "$PAIR_OUT/pair.json" "$PAIR_OUT/plan/pair.json"
+if ! msg="$(python3 -m bench.durable upload --bucket "$EVIDENCE_BUCKET" --launch "$PAIR_RUN_ID" --src "$PAIR_OUT/plan" 2>&1)"; then
+  refuse "the launch's record could not be copied to the evidence bucket: ${msg}: nothing was created"
+fi
+log "$msg"
+DURABLE_FAILED=0
+# durable_copy <label>: the run's directory to the bucket, verified (DURABLE_<label> = 1), or said loudly
+durable_copy() {
+  local out="OUT_$1" msg
+  if msg="$(python3 -m bench.durable upload --bucket "$EVIDENCE_BUCKET" --launch "$PAIR_RUN_ID" --src "${!out}" 2>&1)"; then
+    printf -v "DURABLE_$1" '%s' 1
+    log "run $1: ${msg}"
+  else
+    printf -v "DURABLE_$1" '%s' 0
+    DURABLE_FAILED=1
+    log "EVIDENCE NOT DURABLE (run $1): ${msg}: its run directory is only on this machine"
+  fi
+}
 for x in "${LABELS[@]}"; do printf -v "PID_$x" '%s' ""; printf -v "RC_$x" '%s' ""; printf -v "DONE_$x" '%s' 0
                            printf -v "FAILED_$x" '%s' 0; printf -v "STOPPED_$x" '%s' 0; done
 stop_all() {
@@ -436,6 +462,7 @@ while ! all_exited; do
       if completed "$x"; then printf -v "DONE_$x" '%s' 1; fi
       done_x="DONE_$x"
       log "run $x exited ${!rc} ($([[ "${!done_x}" == "1" ]] && echo 'its evaluate step ran' || echo 'it did not complete'))"
+      durable_copy "$x"
       if [[ "${!rc}" != "0" && "${!done_x}" != "1" ]]; then
         printf -v "FAILED_$x" '%s' 1
         for y in "${LABELS[@]}"; do
@@ -541,6 +568,10 @@ for x in "${LABELS[@]}"; do
     log "EVIDENCE NOT SAFE (run $x): ${msg}"
   fi
 done
+if [[ "$DURABLE_FAILED" == "1" ]]; then
+  safe=0
+  log "EVIDENCE NOT DURABLE: a run's directory could not be copied to gs://${EVIDENCE_BUCKET}/runs/${PAIR_RUN_ID}/ (above)"
+fi
 if [[ "$safe" != "1" ]]; then
   log "the launch is NOT finished: its evidence is not safe (exit 5); the paired verdicts, exit ${vrc} together, stand in $PAIR_OUT"
   exit 5
