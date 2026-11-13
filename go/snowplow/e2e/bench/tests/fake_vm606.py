@@ -54,8 +54,9 @@ outcome:
     FAKE_SCP_CORRUPT=<basename> flips the last byte of a file of that name in transit; FAKE_SCP_MODE
     (octal) is the mode the copy gets instead of the source's;
   - `projects describe`, `services list --enabled --format json`, `iam service-accounts describe`: the
-    project number, the enabled services (IAP among them unless FAKE_IAP_DISABLED=1), the SA unless
-    FAKE_NO_SA=1;
+    project number, the enabled services (tests/fake_region.py services_answer: the project's 2026-11-13
+    listing plus cloudresourcemanager; FAKE_SERVICES / FAKE_SERVICES_DISABLED / FAKE_IAP_DISABLED=1), the SA
+    unless FAKE_NO_SA=1;
   - `compute regions describe REGION`: tests/fake_region.py's quotas (FAKE_LIMIT_<METRIC> steers a
     limit); `compute forwarding-rules | addresses list`: none. An instance carries its zone and one
     external IP (natIP), as GCE lists an instance with an ephemeral external IP;
@@ -354,10 +355,7 @@ if a[:3] == ["compute", "zones", "describe"]:
                       "region": f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/regions/{a[3][:-2]}"}))
     sys.exit(0)
 if a[:3] == ["services", "list", "--enabled"]:
-    names = ["compute.googleapis.com", "container.googleapis.com"]
-    if os.environ.get("FAKE_IAP_DISABLED") != "1":
-        names.append("iap.googleapis.com")
-    print(json.dumps([{"config": {"name": n}, "state": "ENABLED"} for n in names])); sys.exit(0)
+    answer_services()          # run 26g: tests/fake_region.py services_answer (FAKE_SERVICES, FAKE_IAP_DISABLED)
 if a[:3] == ["iam", "service-accounts", "describe"]:
     if os.environ.get("FAKE_NO_SA") == "1":
         sys.stderr.write("ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account\n"); sys.exit(1)

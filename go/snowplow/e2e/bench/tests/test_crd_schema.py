@@ -191,9 +191,12 @@ def test_the_refusal_line_counts_and_names_no_object():
 
 # ─── run606: the dry pass, before any cluster exists ───────────────────────
 
-def test_the_dry_pass_refuses_a_field_the_pinned_crd_requires_before_any_cluster(tmp_path):
+def test_the_dry_pass_refuses_a_field_the_pinned_crd_requires_before_any_cluster(tmp_path, monkeypatch):
     """The registry serves an authn-crds whose User requires one more field:
-    the dry pass fails at the schema step, and nothing after it runs."""
+    the dry pass fails at the schema step, and nothing after it runs. (Run 26g: the
+    ghcr.io CRD charts come from the suite's fake registry, in this process: it reads
+    FAKE_CRD_REQUIRE from here.)"""
+    monkeypatch.setenv("FAKE_CRD_REQUIRE", "User:nickname")
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", LOAD_DRIVER="k6", FAKE_CRD_REQUIRE="User:nickname")
     assert p.returncode != 0
     err = p.stderr

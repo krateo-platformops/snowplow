@@ -78,7 +78,9 @@ THE VM (up).
     a rule, so the description also records the run's expiry (expires=<the VM's termination time>,
     #1383): once it has passed and no instance claims the run, `reap` deletes the rule (exact name
     and tag, one fail-closed list, each delete read back NotFound), and every `up` reaps first. OS Login
-    (enable-oslogin=TRUE, project keys blocked). `up` refuses while iap.googleapis.com is not enabled.
+    (enable-oslogin=TRUE, project keys blocked). `up` (dry or not, before it creates anything) refuses
+    while any Google API the run calls is not enabled in the project, naming each (bench.gcp_apis, run
+    26g: the TTL proof's cloudresourcemanager was not; iap.googleapis.com is among them).
   - A failed `up` says so and names `down`, which removes whatever up made (grants, rules, VM): the
     SSH wait reads every failure (IAP / firewall / OS Login / ssh) and stops at once on one that
     waiting cannot fix, never as a silent timeout. An IAP tunnel failure is read by its close code
@@ -254,7 +256,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from bench import durable, evidence, gcevm, ghcr_pull, gke, installer_src, installer_values
+from bench import durable, evidence, gcevm, gcp_apis, ghcr_pull, gke, installer_src, installer_values
 from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE,  # noqa: F401
                          NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
                          ssh, ssh_stage)
@@ -460,6 +462,8 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("storage", "cp"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),
     ("storage", "cp", "*"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),   # its source a variable
     ("storage", "objects", "list"): ("roles/storage.objectViewer",),
+    # run 26g: run606's `apis` step reads which APIs are enabled in the project (bench.gcp_apis)
+    ("services", "list"): ("roles/serviceusage.serviceUsageConsumer",),
 }
 # #1390 (Diego, 2026-11-13): the only storage roles the orchestrator SA may hold, each ON THE EVIDENCE BUCKET only
 # (bench.durable.bucket_name), under the run's expiring condition: create and read objects; never delete or
@@ -476,8 +480,9 @@ KUBE_ROLE = "roles/container.admin"
 # A REST API the orchestrator never calls itself: a module constant (by name, in its file, on its host) whose URL
 # only a pod in the bench cluster requests, as the GKE node SA. #1383 gap 3: gke-up's TTL proof Job asks IAM's
 # projects.testIamPermissions AS the identity the ttl-self-destruct CronJob runs as (like the CronJob's own gcloud,
-# not in the scan). Any other use of the host is scanned like every REST call.
-NODE_SA_REST = {"TTL_PROOF_API": ("gke.py", "cloudresourcemanager")}
+# not in the scan). Any other use of the host is scanned like every REST call. Its one source is bench.gcp_apis,
+# which also counts it among the APIs the run needs enabled (run 26g).
+NODE_SA_REST = gcp_apis.NODE_SA_REST
 
 WHY = {
     "roles/container.admin": (
@@ -500,7 +505,8 @@ WHY = {
     "roles/cloudquotas.viewer": (
         "cloudquotas.quotas.get: the #985 read of ClustersPerRegion over REST."),
     "roles/serviceusage.serviceUsageConsumer": (
-        "serviceusage.services.use: that request bills the project (x-goog-user-project)."),
+        "serviceusage.services.use: the Cloud Quotas request bills the project (x-goog-user-project); and "
+        "serviceusage.services.list: run606's apis step reads which Google APIs are enabled (run 26g)."),
     "roles/storage.objectCreator": (
         "storage.objects.create ON THE EVIDENCE BUCKET only (#1390): each arm's run directory, copied off the VM "
         "before the pair statistics; no delete and no overwrite (the bucket's 7-day retention holds every object)."),
@@ -530,7 +536,7 @@ _SH_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 _SH_COMMENT = re.compile(r"(?:^|\s)#.*$")
 _SH_TOOL = re.compile(r"(?:^|[\s;&|(`])(gcloud|kubectl|helm)\b")
 # the operator's modules: their calls run on the laptop as the operator, never as the orchestrator SA
-OPERATOR_SIDE = (Path(__file__).name, "gcevm.py", "testvm.py")
+OPERATOR_SIDE = gcp_apis.OPERATOR_SIDE
 _IMPORTS = re.compile(r"^\s*(?:from\s+bench(?:\.(\w+))?\s+import\s+([\w, ()]+)|import\s+bench\.(\w+))", re.M)
 
 
@@ -1133,8 +1139,13 @@ def vm_quota_check(project: str, zone: str, run: str) -> tuple[list[str], list[s
 
 
 def _project_ready(project: str) -> None:
-    """IAP enabled (the VM is reached through it only) and the orchestrator SA there."""
-    gcevm.require_iap(project)
+    """Every Google API the run calls enabled (bench.gcp_apis, run 26g: IAP among them, the VM is reached
+    through it only) and the orchestrator SA there."""
+    try:
+        for line in gcp_apis.check(project, run=lambda argv: gcloud(argv[1:], quiet=True, env=gke.COMPUTE_LIST_ENV)):
+            _say(line)
+    except gcp_apis.Refused as e:
+        raise Refused(str(e)) from None
     rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
     if rc != 0 or out.strip() != sa_email(project):
