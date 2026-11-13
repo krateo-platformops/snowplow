@@ -197,6 +197,8 @@ func (m *recordingMux) handleDebug(pattern string, handler http.Handler) {
 	m.inner.Handle(pattern, handler)
 }
 
+func (m *recordingMux) declareUnaudited(string, string) {}
+
 // buildProdDebugMux builds the mux exactly the way main() does for the routes
 // under test: the anonymous probe endpoints, then the production
 // registerDebugRoutes call with the production chain shape.

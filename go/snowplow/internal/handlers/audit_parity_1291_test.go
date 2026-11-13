@@ -110,12 +110,26 @@ func before1291(t *testing.T) map[string]map[string]string {
 	return out
 }
 
+// schemaChanges1291 are the values the schema changed since the before
+// capture, per shape, each with its reason.
+var schemaChanges1291 = map[string]map[string]string{
+	// F1 (#1379 review): http.request.method is the method of the request the
+	// export SENT (schema v1, audit v0.9.0+), GET, never the POST it served.
+	"export.post": {"http.request.method": http.MethodGet},
+}
+
 // assertParity1291 fails for every key of before that after lacks or holds
-// with another value.
+// with another value than before's, or than the schema's change.
 func assertParity1291(t *testing.T, shape string, before, after map[string]string) {
 	t.Helper()
 	for _, k := range slices.Sorted(maps.Keys(before)) {
 		v, ok := after[k]
+		if want, changed := schemaChanges1291[shape][k]; changed {
+			if v != want {
+				t.Errorf("%s: key %s = %q, want the schema's %q", shape, k, v, want)
+			}
+			continue
+		}
 		switch {
 		case !ok:
 			t.Errorf("%s: key %s, written before #1291, is gone", shape, k)
@@ -146,6 +160,7 @@ func TestAudit1291_Handlers_P_C_V_EveryShapeKeepsItsKeysAndConforms(t *testing.T
 			audittest.AssertConformant(t, audit.Writer, r)
 			audittest.AssertRequiredKeysDetected(t, audit.Writer, r)
 			audittest.AssertEnumsDetected(t, audit.Writer, r)
+			assertDialMethod(t, r)
 
 			if after[krateoaudit.KeyVerb] != s.verb {
 				t.Errorf("krateo.audit.verb = %q, want %q", after[krateoaudit.KeyVerb], s.verb)

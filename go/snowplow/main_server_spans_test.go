@@ -104,7 +104,7 @@ func buildSpanTestMux() *http.ServeMux {
 	mux.Handle("GET /rbac", stub)
 	// Production registrar; the identity middleware is replaced by the stub
 	// handler (no JWT / clientconfig in a unit test).
-	mountCallWriteRoutes(mux, use.NewChain(), func(http.Handler) http.Handler { return stub })
+	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(), func(http.Handler) http.Handler { return stub })
 	mux.Handle("GET /capabilities", stub)
 	mux.Handle("POST /jq", stub)
 	registerDebugRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys)
