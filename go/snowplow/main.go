@@ -382,6 +382,10 @@ func main() {
 	// and needs the seed bearer. PORT-anchored to the listen port.
 	urlSelf := flag.String("url-self", env.String("URL_SELF", "http://snowplow.krateo-system.svc.cluster.local:8081"),
 		"snowplow's own service URL — the self-loopback host for the #57 bearer-append arm (exact scheme+host+port match)")
+	// #1334 — opt-in per install, off by default. The chart sets it from the
+	// same value (publicIdentity.enabled) that ships the impersonate grant.
+	publicIdentityOn := flag.Bool("public-identity", env.Bool(envPublicIdentityEnabled, false),
+		"serve requests that carry no Authorization header as the public identity (user krateo:public, group system:unauthenticated), by impersonation")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -1366,6 +1370,11 @@ func main() {
 	// pattern outside registerDebugRoutes (see debug_routes.go).
 	routes := newRouteTable(mux)
 
+	// #1334 — every route whose work is authorized by the caller's identity:
+	// mountCallerIdentityRoutes (public_identity.go), so the route table that
+	// decides which routes accept the public identity is testable.
+	mountCallerIdentityRoutes(routes, chain, jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn))
+
 	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
@@ -1380,64 +1389,6 @@ func main() {
 		cache.FallthroughScopeMiddleware(cache.ScopePlurals)).
 		Then(handlers.Plurals()))
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
-
-	routes.Handle("GET /list", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeList)).
-		Then(handlers.List()))
-	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
-
-	// Ship D — GET /call is the canonical `/call` read path. Dispatcher
-	// routes into the per-group restactions / widgets handlers; for the
-	// scope label we use call-generic (the dispatcher's fallthrough lane
-	// is the F-1 site). The restactions / widgets dispatcher entries
-	// inherit the scope via the same ctx.
-	routes.Handle("GET /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		handlers.Dispatcher(dispatchers.All())).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
-
-	// #186 — POST /call/read is the body-carrying READ path. It exists so a
-	// large `extras` input rides the request BODY instead of the URL query,
-	// where over HTTP/2 it is charged against the gateway's ~16 KiB header
-	// budget and 431s before Snowplow is invoked. It shares the GET /call
-	// chain EXACTLY — UserConfig, the call-generic read scope, and crucially
-	// the dispatcher into the restactions / widgets resolve handlers — with
-	// two additions: BodyExtrasDecode (decodes {"extras":{...}} → context, so
-	// the context-first util.ParseExtras returns it) runs BEFORE the
-	// dispatcher, and the dispatcher is the POST variant (ReadDispatcher —
-	// the plain Dispatcher is GET-only by design). The terminal fallthrough
-	// is handlers.CallRead(), the READ-ONLY /call (verb forced GET, no
-	// Payload): a POST /call/read to an unhandled GVR is a read passthrough,
-	// never a create. Same read-path invariant as GET /call, so it is
-	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
-	// fails if either half is missing).
-	routes.HandleUnaudited("POST /call/read", "a read: the body carries extras and the verb sent is GET (#186); a RESTAction write stage it reaches is the stage's record", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		middleware.BodyExtrasDecode,
-		handlers.ReadDispatcher(dispatchers.All())).
-		Then(handlers.CallRead()))
-	cache.RegisterScopedRoute("POST /call/read", cache.ScopeCallGeneric)
-
-	// GET /export — GENERIC export: any /call-resolvable list
-	// (RESTAction or list/table Widget) serialized as a CSV/JSON/PDF
-	// attachment. The handler re-dispatches IN-PROCESS through the same
-	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
-	// and serve-time user-aware filtering — export can never see more
-	// than the caller's own /call), then serializes the extracted rows.
-	// The route shares the /call middleware chain, so the scope
-	// classification and the read-path invariant hold; a scheduled
-	// export is just a CronJob curling this route (see howto/export.md).
-	//
-	// POST /export (#970) is the same export with the extras in the request
-	// BODY, for a filter too large for the URL (the gateway 431s a long
-	// ?extras=); it mirrors POST /call/read exactly. Both export routes are
-	// mounted by mountExportRoutes (so the route table is testable) and are
-	// required scoped routes (requiredScopedRoutes).
-	mountExportRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
@@ -1463,28 +1414,10 @@ func main() {
 	// byte-identical so the server can land ahead of the client.
 	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: its coordinates ride the body; no state changes (#560)", refreshesHandler)
 
-	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
-	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
-	// resolves a referenced RESTAction's api[] stages to the (group, version,
-	// resource, verb) tuples a /call WOULD read, WITHOUT dispatching.
-	// Authenticated with the SAME JWT+clientconfig as /call (middleware.UserConfig):
-	// the JWT authenticates the caller, but the enumeration uses NONE of the
-	// caller's RBAC perms (it runs under the SA), so the read-set is computable
-	// before any binding exists. DELIBERATELY NOT cache.RegisterScopedRoute'd:
-	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
-	// outside the read-path-scoped invariant (fallthrough_assert.go).
-	routes.Handle("GET /rbac", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS)).
-		Then(handlers.RBAC()))
-
-	mountCallWriteRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
-
 	// #443 — GET /capabilities: a static, unauthenticated token list a client
 	// gates on by presence (a 404 means none). No identity, no apiserver call,
 	// so it is outside the read-path-scoped invariant (like /refreshes).
 	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
-
-	routes.HandleUnaudited("POST /jq", "evaluates jq over the request body: no I/O, no state changes", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 
 	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
 	// On only under the OTel trace contract with a collector endpoint

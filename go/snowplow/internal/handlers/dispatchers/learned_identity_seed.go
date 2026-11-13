@@ -144,6 +144,16 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 	out := make([]cache.PrewarmTarget, 0, len(base)+len(classes))
 	unmatched := 0
 	for _, t := range base {
+		// #1334 — every seed resolves under snowplow's own ServiceAccount
+		// transport (withCohortSeedContext). An identity the apiserver does not
+		// treat as authenticated holds no credential snowplow could act for it
+		// with, so it is never a seed target: snowplow acts for it only
+		// impersonated, on its own request. The apiserver's group rule decides
+		// (cache.Authenticated), never a name.
+		if !cache.Authenticated(t.Subject.Username, t.Subject.Groups) {
+			unmatched++
+			continue
+		}
 		sig := learnedClassSignature(t.Subject.Username, t.Subject.Groups)
 		pop := known[sig]
 		if pop == 0 {
@@ -158,6 +168,10 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 	for _, sc := range sigs {
 		c, sig := sc.c, sc.sig
 		if _, dup := seen[sig]; dup {
+			continue
+		}
+		// #1334 — as for a representative above.
+		if !cache.Authenticated(c.Username, c.Groups) {
 			continue
 		}
 		if !cache.IdentityAuthorisedForGVR(gvr, c.Username, c.Groups) {

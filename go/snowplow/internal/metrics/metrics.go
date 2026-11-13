@@ -532,7 +532,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// impersonation_fallback_sa is non-zero while a cohort's group is NOT
 	// allowlisted — it reads the defect's condition, not a health zero.
 	impersonation, err := m.Int64ObservableCounter("snowplow_impersonation",
-		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_capability_check_error, reviews, memo_*."))
+		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_refused_no_fallback (#1334), impersonation_capability_check_error, reviews, memo_*."))
 	if err != nil {
 		return err
 	}

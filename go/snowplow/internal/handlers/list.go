@@ -52,7 +52,12 @@ func List() http.HandlerFunc {
 
 		log.Debug("user config succesfully loaded", endpointLogAttr(&ep)) // #453: never the struct
 
-		rc, err := credhttp.NewClientConfig(req.Context(), ep)
+		// #1334 — cache.ClientConfigFor, not credhttp.NewClientConfig: for a
+		// caller whose only credential is an impersonating config (the public
+		// identity) that config, so the apiserver decides as that identity. A
+		// live authenticated request carries none and gets its clientconfig,
+		// exactly as before.
+		rc, err := cache.ClientConfigFor(req.Context(), ep)
 		if err != nil {
 			log.ErrorContext(req.Context(), "unable to create user client config", slog.Any("err", err))
 			response.InternalError(wri, err)

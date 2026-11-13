@@ -95,6 +95,16 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 				slog.String("hint", "an internal driver (e.g. Phase 1) must pass *endpoints.Endpoint to cache.WithInternalEndpoint"),
 			)
 		}
+		// #1334 — an identity the apiserver does not treat as authenticated
+		// (the public identity) holds no clientconfig credential: the auth
+		// middleware never reads one for it, and the name credsecret.For
+		// would build is a REAL user's Secret (`krateo-public-clientconfig`
+		// belongs to a user named krateo-public). Its own-credential stage
+		// dials only through the impersonating context above; without it the
+		// stage fails here, before any Secret is read.
+		if !cache.Authenticated(m.username, m.groups) {
+			return endpoints.Endpoint{}, false, fmt.Errorf("an unauthenticated identity has no clientconfig credential; its stage needs the impersonating context")
+		}
 		// #994 — the caller's OWN credential, chosen exactly as the auth
 		// middleware chose it: the step-up Secret for an identity whose
 		// groups carry krateo:loa:2, else the session Secret. No fallback: a

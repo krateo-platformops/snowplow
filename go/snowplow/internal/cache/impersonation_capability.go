@@ -157,7 +157,9 @@ var impCapMemo = &impCapMemoT{entries: map[impPrincipal]bool{}}
 var (
 	impPermitted       atomic.Uint64
 	impFallbackSA      atomic.Uint64
-	impCheckError      atomic.Uint64
+	// #1334 — a refusal for a caller with no ServiceAccount fallback.
+	impRefusedNoFallback atomic.Uint64
+	impCheckError        atomic.Uint64
 	impReviews         atomic.Uint64
 	impMemoHits        atomic.Uint64
 	impMemoEvictions   atomic.Uint64
@@ -364,6 +366,21 @@ func ImpersonationPermitted(ctx context.Context, username string, groups []strin
 // itself (impersonation unavailable, no identity) is the pre-#608 path and is
 // not counted here.
 func PermittedImpersonatingRESTConfig(ctx context.Context, base *rest.Config, username string, groups []string) *rest.Config {
+	return permittedImpersonatingRESTConfig(ctx, base, username, groups, &impFallbackSA)
+}
+
+// ImpersonatingRESTConfigNoFallback is PermittedImpersonatingRESTConfig for a
+// caller that has NO ServiceAccount fallback (#1334): an identity snowplow may
+// act for only by impersonation, so a refusal is answered without the
+// ServiceAccount (the public identity's 503, the refresher's eviction). Its
+// refusals count as impersonation_refused_no_fallback, never as
+// impersonation_fallback_sa, which keeps meaning "dialled as the ServiceAccount
+// with the re-gate instead".
+func ImpersonatingRESTConfigNoFallback(ctx context.Context, base *rest.Config, username string, groups []string) *rest.Config {
+	return permittedImpersonatingRESTConfig(ctx, base, username, groups, &impRefusedNoFallback)
+}
+
+func permittedImpersonatingRESTConfig(ctx context.Context, base *rest.Config, username string, groups []string, refused *atomic.Uint64) *rest.Config {
 	cfg := ImpersonatingRESTConfig(base, username, groups)
 	if cfg == nil {
 		return nil
@@ -371,11 +388,11 @@ func PermittedImpersonatingRESTConfig(ctx context.Context, base *rest.Config, us
 	ok, err := ImpersonationPermitted(ctx, cfg.Impersonate.UserName, cfg.Impersonate.Groups)
 	if err != nil {
 		impCheckError.Add(1)
-		impFallbackSA.Add(1)
+		refused.Add(1)
 		return nil
 	}
 	if !ok {
-		impFallbackSA.Add(1)
+		refused.Add(1)
 		return nil
 	}
 	impPermitted.Add(1)
@@ -390,6 +407,7 @@ func ImpersonationCapabilityStats() map[string]uint64 {
 	return map[string]uint64{
 		"impersonation_permitted":              impPermitted.Load(),
 		"impersonation_fallback_sa":            impFallbackSA.Load(),
+		"impersonation_refused_no_fallback":    impRefusedNoFallback.Load(),
 		"impersonation_capability_check_error": impCheckError.Load(),
 		"reviews":                              impReviews.Load(),
 		"memo_hits":                            impMemoHits.Load(),
@@ -447,7 +465,7 @@ func RegisterImpersonationCapabilityExpvar() {
 func ResetImpersonationCapabilityForTest() {
 	impersonationReviewer.Store(nil)
 	impCapMemo.reset()
-	for _, c := range []*atomic.Uint64{&impPermitted, &impFallbackSA, &impCheckError, &impReviews,
+	for _, c := range []*atomic.Uint64{&impPermitted, &impFallbackSA, &impRefusedNoFallback, &impCheckError, &impReviews,
 		&impMemoHits, &impMemoEvictions, &impMemoInvalidates} {
 		c.Store(0)
 	}

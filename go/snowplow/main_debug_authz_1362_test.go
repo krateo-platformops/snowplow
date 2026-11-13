@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -622,9 +623,33 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 							t.Errorf("%s: handleDebug's handler is not gated.Then(...): %s", pos, i1362Src(fset, call))
 						}
 					case name == "Handle" || name == "HandleAudited" || name == "HandleUnaudited":
-						if n, ok := sel.Recv().(*types.Pointer); ok {
-							if nn, ok := n.Elem().(*types.Named); ok && nn.Obj().Name() == "routeTable" {
-								tableHandleCalls++
+						// A mount through the routeTable itself OR through the
+						// routeRegistrar interface every mount helper takes
+						// (mountCallerIdentityRoutes, mountExportRoutes,
+						// mountCallWriteRoutes, mountTelemetryRoute, #1334):
+						// both reach the table, so both are counted, and a
+						// literal /debug pattern on either is refused here as
+						// the table refuses it at run time.
+						recv := sel.Recv()
+						if p, ok := recv.(*types.Pointer); ok {
+							recv = p.Elem()
+						}
+						nn, ok := recv.(*types.Named)
+						if !ok || (nn.Obj().Name() != "routeTable" && nn.Obj().Name() != "routeRegistrar") {
+							return true
+						}
+						tableHandleCalls++
+						if len(call.Args) > 0 {
+							if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+								if pat, err := strconv.Unquote(lit.Value); err == nil {
+									_, path, found := strings.Cut(pat, " ")
+									if !found {
+										path = pat
+									}
+									if strings.HasPrefix(path, "/debug") {
+										t.Errorf("%s: %s(%q) mounts a /debug route outside registerDebugRoutes' gate", pos, name, pat)
+									}
+								}
 							}
 						}
 					}
@@ -654,7 +679,7 @@ func TestIssue1362_NoDebugRouteMountedOutsideTheGate(t *testing.T) {
 		t.Errorf("NON-VACUITY: saw %d ServeMux.Handle calls inside routeTable, want 5", rawMuxInTable)
 	}
 	if tableHandleCalls < 10 {
-		t.Errorf("NON-VACUITY: saw only %d routeTable.Handle calls in main", tableHandleCalls)
+		t.Errorf("NON-VACUITY: saw only %d routeTable/routeRegistrar Handle calls in package main", tableHandleCalls)
 	}
 }
 

@@ -300,6 +300,40 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		opts = append(opts, xcontext.WithLogger(log))
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
+	// #574/#608 — the cohort's impersonating transport, when the apiserver
+	// will accept every principal on it (used below).
+	// An unauthenticated identity has no ServiceAccount fallback (below), so its
+	// refusal is counted as such, never as impersonation_fallback_sa.
+	authenticated := cache.Authenticated(refreshUser, refreshGroups)
+	var imp *rest.Config
+	if saRC != nil {
+		if authenticated {
+			imp = cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups)
+		} else {
+			imp = cache.ImpersonatingRESTConfigNoFallback(rctx, saRC, refreshUser, refreshGroups)
+		}
+	}
+	// #1334 — an identity the apiserver does not treat as authenticated (the
+	// public identity: system:unauthenticated) has no credential of its own:
+	// snowplow may act for it ONLY by impersonation. So when its cell cannot be
+	// refreshed impersonated, it is not refreshed under snowplow's own
+	// ServiceAccount with the re-gate (the fallback an authenticated cohort
+	// keeps): it is evicted, and the next request resolves it fresh on its own
+	// impersonated path. Decided by the apiserver's own group rule, never by a
+	// name.
+	if imp == nil && !authenticated {
+		prior, _ := c.GetNoTouch(key)
+		evicted := c.EvictUnrefreshable(key, prior)
+		noteUnauthenticatedRefreshRefused(evicted)
+		log.Debug("resolveAndPopulateL1: an unauthenticated identity cannot be refreshed impersonated; evicting instead of refreshing under the ServiceAccount",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.Bool("evicted", evicted),
+			slog.String("effect", "the next request resolves the cell fresh, impersonated (#1334)"),
+		)
+		return nil
+	}
 	// WithInternalEndpoint / WithInternalRESTConfig make cache.ClientConfigFor
 	// (internal_client.go) return the pre-built SA *rest.Config verbatim
 	// for the objects.Get apiserver fall-through and resourcesrefs.Resolve
@@ -325,7 +359,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// RBAC snapshot generation) and a refused cohort takes the SAME re-gated
 		// SA branch below — no impersonated-dial marker, so the re-gate and the
 		// UAF refilter apply exactly as before #574.
-		if imp := cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups); imp != nil {
+		if imp != nil {
 			rctx = cache.WithInternalRESTConfig(rctx, imp)
 			rctx = cache.WithImpersonatedDial(rctx)
 		} else {

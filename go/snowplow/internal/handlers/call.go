@@ -242,7 +242,16 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #1298 — what the apiserver answered, observed at the dial for the audit
 	// record below (credhttp/answer.go): rt's code is often snowplow's own.
 	dctx, answered := credhttp.WithAnswer(dctx)
-	rt := credhttp.Do(dctx, callOpts)
+	// #1334 — a caller with no clientconfig of its own (the public identity)
+	// is dialled with the impersonating config its context carries, so the
+	// apiserver decides this read or write for that identity, exactly. Its
+	// UserConfig endpoint is empty, so it can never be dialled as anyone.
+	var rt *response.Status
+	if rc, ok := cache.ImpersonatingConfigFor(dctx); ok {
+		rt = credhttp.DoAs(dctx, callOpts, rc)
+	} else {
+		rt = credhttp.Do(dctx, callOpts)
+	}
 	if rt != nil && rt.Status == response.StatusFailure {
 		dial.EndRelease(slowcall.ReleaseFailed)
 	} else {
