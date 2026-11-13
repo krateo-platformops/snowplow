@@ -39,7 +39,7 @@ func newPublicIdentity(on bool) *middleware.PublicIdentity {
 // ServiceAccount, never under the caller's credential, so serving it token-less
 // would act as the ServiceAccount for an anonymous caller
 // (TestIssue1334_RouteTable_RBACNeverServesThePublicIdentity).
-func mountCallerIdentityRoutes(routes *routeTable, chain use.Chain, keys jwtutil.KeySource, authnNS string, public *middleware.PublicIdentity) {
+func mountCallerIdentityRoutes(routes routeRegistrar, chain use.Chain, keys jwtutil.KeySource, authnNS string, public *middleware.PublicIdentity) {
 	callerIdentity := middleware.UserConfigOrPublic(keys, authnNS, public)
 
 	routes.Handle("GET /list", chain.Append(
