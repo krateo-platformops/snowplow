@@ -78,8 +78,8 @@ func saRESTConfig(t *testing.T) *rest.Config {
 // TestClientConfigFor_InternalRESTConfig_UsedVerbatim is the fix-side
 // falsifier. With a SA *rest.Config attached via WithInternalRESTConfig,
 // ClientConfigFor MUST return it verbatim — never routing the SA through
-// kubeconfig.NewClientConfig (which would drop the token and reject the
-// raw-PEM CA).
+// kubeconfig.NewClientConfig (which rejects the raw-PEM CA; up to plumbing
+// v1.67.0 it also dropped the token).
 func TestClientConfigFor_InternalRESTConfig_UsedVerbatim(t *testing.T) {
 	saRC := saRESTConfig(t)
 	ctx := WithInternalRESTConfig(context.Background(), saRC)
@@ -103,7 +103,7 @@ func TestClientConfigFor_InternalRESTConfig_UsedVerbatim(t *testing.T) {
 	}
 	// The SA's real credentials must be intact — usable client config.
 	if got.BearerToken != realShapedSAToken {
-		t.Fatalf("SA bearer token lost — kubeconfig.NewClientConfig would have dropped it; "+
+		t.Fatalf("SA bearer token lost — the context-injected config must reach the caller intact; "+
 			"ClientConfigFor must preserve it. got len=%d", len(got.BearerToken))
 	}
 	if len(got.TLSClientConfig.CAData) == 0 {

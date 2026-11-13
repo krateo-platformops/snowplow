@@ -140,7 +140,17 @@ import (
 // and docs. This file now reads every name SessionSecretNames gives and uses
 // a Secret only when OwnsSecret holds: the step-5 lookup's one intentional
 // change for #1382.
-const PinnedPlumbingVersion = "v1.61.0"
+//
+// v1.61.0 → v1.68.0 (plumbing#159, the token-only endpoint's bearer token):
+// re-audited by `diff -r` of the two module trees. server/, jwtutil/ and
+// endpoints/ are byte-identical, so this file's upstream line numbers stand.
+// The diff is kubeconfig/ (Marshal writes the endpoint's token and proxy URL
+// into the kubeconfig it builds, so NewClientConfig carries a token-only
+// endpoint's credential; its DEBUG round tripper logs metadata only), helm/,
+// which snowplow does not import, signup/ (each CSR gets a name of its own;
+// reached only through plumbing/e2e in integration tests), a comment in
+// kubeutil/content, tests and docs.
+const PinnedPlumbingVersion = "v1.68.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,

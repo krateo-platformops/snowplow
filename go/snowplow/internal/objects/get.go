@@ -238,9 +238,11 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// internal-dispatch *rest.Config when an internal/startup driver
 	// (Phase 1's SA-credentialed walk) is in flight, else delegates to
 	// the unchanged kubeconfig.NewClientConfig per-user path. This is
-	// what makes Phase 1's SA fetch work — the SA's raw-PEM CA + bearer
-	// token cannot survive kubeconfig.NewClientConfig (see
-	// cache.WithInternalRESTConfig).
+	// what makes Phase 1's SA fetch work — the SA's raw-PEM CA cannot
+	// survive kubeconfig.NewClientConfig, which base64-decodes it (see
+	// cache.WithInternalRESTConfig). A token-only per-user endpoint (the
+	// sandbox visitor's) does: plumbing v1.68.0 carries its bearer token
+	// (token_only_endpoint_dial_test.go).
 	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to create kubernetes client config", slog.Any("err", err))
