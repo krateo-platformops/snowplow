@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -187,9 +188,36 @@ func issue1334KindArms(t *testing.T, ctx context.Context, cfg *rest.Config, crCr
 	public := as(i1334PublicUser, []string{i1334PublicGroup})
 
 	t.Run("impersonated/effective-groups", func(t *testing.T) {
-		got, err := public.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authnv1.SelfSubjectReview{}, metav1.CreateOptions{})
+		// Creating a SelfSubjectReview is granted by system:basic-user, which is
+		// bound to system:authenticated only. The public identity is refused it:
+		// that refusal is the first proof it is not authenticated.
+		_, err := public.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authnv1.SelfSubjectReview{}, metav1.CreateOptions{})
+		if !apierrors.IsForbidden(err) {
+			t.Fatalf("the public identity created a SelfSubjectReview (err=%v): it holds system:basic-user's grant, which only system:authenticated has", err)
+		}
+		// To READ its group set, grant the review to the USER for this arm only.
+		_, err = cs.RbacV1().ClusterRoles().Create(ctx, &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "issue1334-whoami"},
+			Rules:      []rbacv1.PolicyRule{{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"selfsubjectreviews"}, Verbs: []string{"create"}}},
+		}, metav1.CreateOptions{})
+		mustCreate("ClusterRole whoami", err)
+		_, err = cs.RbacV1().ClusterRoleBindings().Create(ctx, &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "issue1334-whoami"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: g, Name: i1334PublicUser}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: g, Kind: "ClusterRole", Name: "issue1334-whoami"},
+		}, metav1.CreateOptions{})
+		mustCreate("ClusterRoleBinding whoami", err)
+		var got *authnv1.SelfSubjectReview
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			got, err = public.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authnv1.SelfSubjectReview{}, metav1.CreateOptions{})
+			if err == nil || !apierrors.IsForbidden(err) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(500 * time.Millisecond) // the new binding reaches the authorizer's cache
+		}
 		if err != nil {
-			t.Fatalf("SelfSubjectReview as the public identity: %v", err)
+			t.Fatalf("SelfSubjectReview as the public identity, with the review granted to its user: %v", err)
 		}
 		ui := got.Status.UserInfo
 		if ui.Username != i1334PublicUser || !slices.Equal(ui.Groups, []string{i1334PublicGroup}) {
