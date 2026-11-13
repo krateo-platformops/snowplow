@@ -297,13 +297,53 @@ def _stat(bl: list[tuple[list[float], float]], metric: str) -> float | None:
     return _pct([x for v, _ in bl for x in v], {"p95_ms": 95, "p99_ms": 99}[metric])
 
 
+def _half_pct(sb: list[list[float]], lens: list[int], every: list[float], p: float):
+    """#1390: _stat's percentile of the blocks a half-sample picks, by their indices, without
+    concatenating and sorting them: `sb` each block's calls sorted once, `every` all of them
+    sorted once. The r-th smallest call of the picked blocks is the smallest value v of `every`
+    with at least r + 1 picked calls <= v (counted by a bisect per picked block): a picked call
+    itself, since the count only steps at picked calls. The two order statistics, k, lo and hi
+    are _pct's, and so is the arithmetic: the same float, bit for bit."""
+    def pick(idx: list[int]):
+        n = sum(lens[i] for i in idx)
+        if not n:
+            return None
+        k = (n - 1) * p / 100.0
+        lo, hi = int(k), min(int(k) + 1, n - 1)
+        blocks_ = [sb[i] for i in idx]
+
+        def nth(r: int) -> float:
+            a, b = 0, len(every) - 1
+            while a < b:
+                m = (a + b) // 2
+                if sum(map(bisect.bisect_right, blocks_, itertools.repeat(every[m]))) > r:
+                    b = m
+                else:
+                    a = m + 1
+            return every[a]
+        v_lo = nth(lo)
+        v_hi = v_lo if hi == lo else nth(hi)
+        return v_lo + (v_hi - v_lo) * (k - lo)
+    return pick
+
+
 def half_sd(bl: list[tuple[list[float], float]], metric: str,
             n: int = HALF_SAMPLES, seed: int = HALF_SEED) -> float | None:
-    """sd of log(metric) from paired half-samples (see the module doc)."""
+    """sd of log(metric) from paired half-samples (see the module doc). #1390: the same draws
+    and the same numbers as before, but each block's calls are sorted once per call, not every
+    half-sample's concatenation once per draw (run 26e: hours on ~120 MB of k6 calls per arm);
+    tests/test_1390_fast_stats.py checks equality against the former implementation."""
     rnd = random.Random(seed)
-    pairs = [(bl[i], bl[i + 1]) for i in range(0, len(bl) - 1, 2)]
+    pairs = [(i, i + 1) for i in range(0, len(bl) - 1, 2)]
     if len(pairs) < 2:
         return None
+    if metric == "req_s":
+        def stat(idx):
+            return _stat([bl[i] for i in idx], metric)
+    else:
+        sb = [sorted(v) for v, _ in bl]
+        stat = _half_pct(sb, [len(v) for v in sb], sorted(x for v in sb for x in v),
+                         {"p95_ms": 95, "p99_ms": 99}[metric])
     logs = []
     for _ in range(n):
         a, b = [], []
@@ -312,9 +352,9 @@ def half_sd(bl: list[tuple[list[float], float]], metric: str,
                 x, y = y, x
             a.append(x)
             b.append(y)
-        sa, sb = _stat(a, metric), _stat(b, metric)
-        if sa and sb:
-            logs.append(math.log(sa / sb))
+        sa, sb_ = stat(a), stat(b)
+        if sa and sb_:
+            logs.append(math.log(sa / sb_))
     return statistics.pstdev(logs) / 2 if len(logs) >= n // 2 else None
 
 
