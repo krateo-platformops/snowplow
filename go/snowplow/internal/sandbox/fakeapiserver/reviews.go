@@ -233,7 +233,9 @@ func (s *Server) applyStatus(rule Rule, t target) {
 		gv = loc.version
 	}
 	c := &reqCtx{group: t.Group, version: loc.version, gv: gv, resource: t.Resource, subresource: "status", ns: t.Namespace, name: t.Name, gr: gr, api: loc.api}
-	line := map[string]any{"verb": "patch", "group": t.Group, "version": loc.version, "resource": t.Resource + "/status", "namespace": t.Namespace, "name": t.Name, "query": "", "status": 200, "identity": "sa", "applyStatus": rule.ID}
+	// The scripted write's request line is a plain one: the ServiceAccount's patch of /status.
+	line := requestLine("")
+	line["verb"], line["group"], line["version"], line["resource"], line["namespace"], line["name"], line["status"], line["identity"] = "patch", t.Group, loc.version, t.Resource+"/status", t.Namespace, t.Name, 200, "sa"
 	if !s.authz.allowed(s.sa, attributes{Verb: "patch", Group: t.Group, Resource: t.Resource, Subresource: "status", Namespace: t.Namespace, Name: t.Name}) {
 		line["status"] = 403
 		s.o.Log(line)

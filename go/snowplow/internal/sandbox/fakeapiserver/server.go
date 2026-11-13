@@ -382,12 +382,17 @@ func hasString(list []string, v string) bool {
 
 // ------------------------------------------------------------------ serving
 
+// requestLine is a request-log line (sandbox SNAPSHOT.md §4): exactly the 10 keys verb, group,
+// version, resource, namespace, name, query, status, items and identity. items is 0 for a verb that
+// returns no items (writes, reviews, discovery, errors); a get, list or watch sets it. The fake's
+// only other lines are its two event lines, applyStatus.failed and fake.unimplemented.
+func requestLine(query string) map[string]any {
+	return map[string]any{"verb": "", "group": "", "version": "", "resource": "", "namespace": "", "name": "", "query": query, "status": 0, "items": 0, "identity": "none"}
+}
+
 // ServeHTTP serves one request and logs it.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	line := map[string]any{"verb": "", "group": "", "version": "", "resource": "", "namespace": "", "name": "", "query": r.URL.RawQuery, "status": 0, "identity": "none"}
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		line["contentType"] = ct
-	}
+	line := requestLine(r.URL.RawQuery)
 	id, err := s.authenticate(r)
 	if err == nil {
 		line["identity"] = id.Label
@@ -620,9 +625,6 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, id identity, line
 	dryRun, err := parseDryRun(verb, q)
 	if err != nil {
 		return false, err
-	}
-	if dryRun {
-		line["dryRun"] = true
 	}
 	c := &reqCtx{r: r, w: w, id: id, line: line, group: group, version: version, gv: gv, resource: resource, subresource: sub, ns: ns, name: name, gr: group + "/" + resource, api: api, verb: verb, dryRun: dryRun}
 	if group == "authorization.k8s.io" && verb == "create" {
