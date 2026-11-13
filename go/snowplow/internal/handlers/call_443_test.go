@@ -125,7 +125,9 @@ func withCaller443(req *http.Request, ep endpoints.Endpoint) *http.Request {
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}),
 		xcontext.WithUserConfig(ep),
 	)
-	return req.WithContext(ctx)
+	// The session id audit.Middleware establishes on every request in the pod
+	// (the request writer must write one, audit v0.12.0).
+	return req.WithContext(audit.WithSessionID(ctx, "s-443"))
 }
 
 const (

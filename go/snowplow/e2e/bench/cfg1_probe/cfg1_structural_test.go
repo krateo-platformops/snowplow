@@ -162,6 +162,11 @@ var nonCacheInitPublishers = map[string][]string{
 	// stay observable with the cache off. Gating it would hide the gaps in a
 	// configuration where writes still happen.
 	"internal/support/audit/incomplete_metrics.go": {"snowplow_audit_incomplete_total"},
+	// #1379 review: the audit trail's design-error counters (an audited exit
+	// with no handler record, a record whose method is not its verb's). The
+	// emitter is not a cache surface and records in either cache mode, so a
+	// design error must stay observable with the cache off.
+	"internal/support/audit/integrity_metrics.go": {"snowplow_audit_dial_method_mismatch_total", "snowplow_audit_unrecorded_exit_total"},
 	// #1054 slow-call record: a measurement of request latency, not a cache
 	// surface. Every API request is recorded in either cache mode (cache-off
 	// serves every /call from the apiserver, where slow calls are likeliest),

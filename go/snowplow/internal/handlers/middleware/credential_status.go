@@ -54,6 +54,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // The closed set of causes snowplow emits on a pre-dispatch 401 (#1029,
@@ -187,6 +188,17 @@ func tokenRejected(w http.ResponseWriter, err error) error {
 		return preDispatchUnauthorized(w, CauseTokenExpired, err)
 	}
 	return preDispatchUnauthorized(w, CauseTokenInvalid, err)
+}
+
+// credentialMissingReason is the audit denial reason of credentialMissing's
+// refusal, chosen from the same validated groups that chose the Secret:
+// step_up_required for a krateo:loa:2 token, session_credential_missing
+// otherwise (audit v0.12.0).
+func credentialMissingReason(groups []string) string {
+	if credsecret.IsStepUp(groups) {
+		return audit.DenialStepUpRequired
+	}
+	return audit.DenialSessionCredentialMissing
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

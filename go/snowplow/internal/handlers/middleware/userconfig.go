@@ -74,6 +74,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // PinnedPlumbingVersion is the upstream `plumbing` module version this
@@ -296,6 +297,11 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				tokenRejected(wri, err)
 				return
 			}
+			// #1379 re-review — the caller is verified from here on: an
+			// audited route's one record (audit.OpenRecord) names them,
+			// whatever exit the request takes, the credential lookup's below
+			// included.
+			audit.SetCaller(req.Context(), userInfo)
 
 			// Ship D.3 — cache-first lookup. #994 — the Secret is chosen
 			// from the VALIDATED token alone: a token whose groups carry
@@ -325,6 +331,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// upstream error string for server-url missing).
 					// Upstream's equivalent branch is the non-NotFound
 					// arm at :73-74 → InternalError.
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, ferr)
 					return
 				}
@@ -352,6 +359,7 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				//       TestUserConfig_ByteEquivalence_CacheMiss.
 				sarc, ierr := credhttp.InClusterConfig()
 				if ierr != nil {
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, fmt.Errorf("unable to create in cluster config: %w", ierr))
 					return
 				}
@@ -386,12 +394,18 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// byte-identical to upstream's. Any other re-read error
 					// stays upstream's 500, with no cause.
 					if credhttp.WriteBudgetError(wri, ferr) {
+						audit.FailRoute(req.Context())
 						return
 					}
 					if apierrors.IsNotFound(ferr) {
+						// The verified caller's own credential is missing:
+						// snowplow refuses before anything is sent, and
+						// the audited route's record says why.
+						audit.DenyRoute(req.Context(), credentialMissingReason(userInfo.Groups))
 						credentialMissing(wri, userInfo.Groups, ferr)
 						return
 					}
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, ferr)
 					return
 				}
