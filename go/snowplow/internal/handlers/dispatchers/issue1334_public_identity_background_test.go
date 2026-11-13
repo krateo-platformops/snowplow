@@ -26,7 +26,12 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -152,8 +157,67 @@ func TestIssue1334_Refresher_UnauthenticatedIdentityNeverRefreshedUnderTheServic
 	})
 }
 
+// i1334SeedableWatcher publishes a snapshot in which the USER krateo:public
+// holds a seedable grant (get+list on restactions, no resourceNames), so the
+// binding index authorises it for the GVR and the learned filter, not the
+// authorisation check, is what keeps it out of the seed targets.
+func i1334SeedableWatcher(t *testing.T) {
+	t.Helper()
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetRBACSubGenForTest)
+	g := "rbac.authorization.k8s.io"
+	scheme := runtime.NewScheme()
+	_ = rbacv1.AddToScheme(scheme)
+	listKinds := map[schema.GroupVersionResource]string{
+		h1RAGVR:     "RESTActionList",
+		h1WidgetGVR: "PanelList",
+		{Group: g, Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
+		{Group: g, Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
+		{Group: g, Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: g, Version: "v1", Resource: "roles"}:               "RoleList",
+	}
+	seed := []runtime.Object{
+		&rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Namespace: h1NS, Name: "public-list-1334"},
+			Rules: []rbacv1.PolicyRule{{Verbs: []string{"get", "list"}, APIGroups: []string{h1RAGVR.Group},
+				Resources: []string{h1RAGVR.Resource}}},
+		},
+		&rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Namespace: h1NS, Name: "public-list-1334", UID: types.UID("uid-rb-1334-public-list")},
+			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: g, Name: i1334Public}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: g, Kind: "Role", Name: "public-list-1334"},
+		},
+	}
+	wctx, wcancel := context.WithCancel(context.Background())
+	rw, err := cache.NewResourceWatcher(wctx, dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...))
+	if err != nil {
+		wcancel()
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitForCacheSync: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(rw)
+	prev := cache.Global()
+	cache.SetGlobal(rw)
+	t.Cleanup(func() {
+		rw.Stop()
+		wcancel()
+		cache.SetGlobal(prev)
+		cache.PublishRBACSnapshotForTest(nil)
+	})
+}
+
 func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
-	i1334BuildWatcher(t)
+	i1334SeedableWatcher(t)
 	cache.ResetLearnedIdentitiesForTest()
 	t.Cleanup(cache.ResetLearnedIdentitiesForTest)
 	unauth := []string{i1334Unauth}
