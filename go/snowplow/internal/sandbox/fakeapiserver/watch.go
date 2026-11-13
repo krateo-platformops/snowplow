@@ -199,6 +199,12 @@ func (s *Server) watch(c *reqCtx, fs *selector) (bool, error) {
 
 	c.line["items"], c.line["status"] = items, 200
 	s.o.Log(c.line)
+	if expired != nil {
+		// The apiserver answers a watch from a resourceVersion that left its window 200, then one
+		// ERROR event (410 Expired). The request line says 200 as it does; this event line says the
+		// watch expired, so a reader of the log (the sandbox's capture) can fail closed on it.
+		s.o.Log(map[string]any{"event": "fake.watchExpired", "what": watchName(c, rvRaw)})
+	}
 	c.w.Header().Set("Content-Type", n.ct)
 	c.w.Header().Set("Transfer-Encoding", "chunked")
 	c.w.WriteHeader(http.StatusOK)
@@ -296,4 +302,18 @@ func withStatusKind(st any) any {
 	_ = json.Unmarshal(b, &m)
 	m["kind"], m["apiVersion"] = "Status", "v1"
 	return m
+}
+
+// watchName names a watch for its fake.watchExpired line: the resource, the namespace (or all
+// namespaces) and the resourceVersion the watch asked for.
+func watchName(c *reqCtx, rv string) string {
+	where := "all namespaces"
+	if c.ns != "" {
+		where = "namespace " + c.ns
+	}
+	resource := c.resource
+	if c.group != "" {
+		resource += "." + c.group
+	}
+	return fmt.Sprintf("watch of %s in %s from resourceVersion %s", resource, where, rv)
 }

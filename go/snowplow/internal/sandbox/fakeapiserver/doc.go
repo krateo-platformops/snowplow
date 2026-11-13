@@ -18,7 +18,8 @@
 //   - errors are k8s.io/apimachinery/pkg/api/errors Status values, so messages, reasons and details
 //     are the apiserver's own;
 //   - the watch cache is sized as k8s.io/apiserver's cacher sizes it (watchcache.go), so a watch
-//     from a resourceVersion that left the window gets the same 410 Expired.
+//     from a resourceVersion that left the window gets the same 410 Expired (the request line says
+//     200, as the apiserver answers, and a `fake.watchExpired` event line names the watch).
 //
 // WHAT IT DOES NOT DO, each answered loudly (a `fake.unimplemented` request-log line and a 500),
 // never leniently: strategic merge patch, server-side apply with a fieldManager, deletecollection,
