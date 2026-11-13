@@ -72,6 +72,31 @@ def test_a_bucket_not_as_required_refuses_before_any_grant(fake, capsys, monkeyp
     assert "storage buckets create" not in [" ".join(c["argv"][:3]) for c in fake_vm606.calls(fake)][len(verbs):]
 
 
+def _in_use(fake):  # noqa: F811
+    fake_vm606.put_rule(fake, RUN, f"{vm606.vm_name(RUN)}-iap-ssh", expires="2026-11-20T00:00:00Z")
+
+
+def _unconditional(fake):  # noqa: F811
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", [{"role": "roles/compute.viewer", "members": [SA]}])
+
+
+@pytest.mark.parametrize("refusal, says, env", [
+    (_in_use, f"run {RUN} is in use", {}),
+    (_unconditional, "holds unconditional binding(s)", {}),
+    (None, "the VM does not fit", {"FAKE_LIMIT_E2_CPUS": "4"}),
+])
+def test_a_refused_up_leaves_no_bucket(fake, capsys, monkeypatch, refusal, says, env):  # noqa: F811
+    """Each refusal of up comes before the bucket: a refused up creates nothing, the bucket included."""
+    if refusal:
+        refusal(fake)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    rc, out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and says in err, err
+    assert _bucket(fake) is None
+    assert "storage buckets create" not in [" ".join(c["argv"][:3]) for c in fake_vm606.calls(fake)]
+
+
 def test_a_dry_bucket_creates_nothing(fake, capsys):  # noqa: F811
     rc, out, err = _run(capsys, "bucket")
     assert rc == 0 and f"DRY: would create the evidence bucket {BUCKET}" in out
