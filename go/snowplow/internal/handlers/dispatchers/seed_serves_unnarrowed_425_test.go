@@ -336,7 +336,7 @@ func s425UserServer(t *testing.T, dials *atomic.Int64) *httptest.Server {
 	cache.ResetSecretsSnapshotForTest()
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
 		s425Carol + "-clientconfig": {
-			ObjectMeta: metav1.ObjectMeta{Namespace: s425AuthnNS, Name: s425Carol + "-clientconfig"},
+			ObjectMeta: authnMeta(s425AuthnNS, s425Carol+"-clientconfig", s425Carol),
 			Data:       map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok-" + s425Carol)},
 		},
 	}})

@@ -166,8 +166,9 @@ func kubeRX(t *testing.T, rec *rxRec, secrets func() map[string]map[string]strin
 			for k, v := range d {
 				data[k] = base64.StdEncoding.EncodeToString([]byte(v))
 			}
+			owned := authnOwned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: p[5]}}, rxUsers()...)
 			_ = json.NewEncoder(w).Encode(map[string]any{"apiVersion": "v1", "kind": "Secret",
-				"metadata": map[string]any{"name": p[5], "namespace": p[3]}, "data": data})
+				"metadata": map[string]any{"name": p[5], "namespace": p[3], "annotations": owned.Annotations}, "data": data})
 			return
 		}
 		// /apis/zendesk.krateo.io/v1alpha1/namespaces/<ns>/tickets[/<name>]
@@ -319,7 +320,7 @@ func (e *rxEnv) resolve(arm rxArm, user string, resetL1 bool, extras map[string]
 			for k, v := range d {
 				b[k] = []byte(v)
 			}
-			by[n] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: rxAuth, Name: n}, Data: b}
+			by[n] = authnOwned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: rxAuth, Name: n}, Data: b}, rxUsers()...)
 		}
 		cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: by})
 		cache.ForceSecretsCacheReadyForTest(rxAuth)
@@ -386,4 +387,14 @@ func rxShort(s string, n int) string {
 		return s[:n] + "…"
 	}
 	return s
+}
+
+// rxUsers is the users rxUserTok holds a credential Secret for (#1382: each
+// fixture Secret is stamped as its user's, authnOwned).
+func rxUsers() []string {
+	out := make([]string, 0, len(rxUserTok))
+	for u := range rxUserTok {
+		out = append(out, u)
+	}
+	return out
 }

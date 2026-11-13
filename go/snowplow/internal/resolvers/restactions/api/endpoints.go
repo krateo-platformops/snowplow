@@ -55,7 +55,6 @@ type endpointReferenceMapper struct {
 // other returns (wrong-type fall-through, clientconfig cache-hit, FromSecret,
 // errors) report false.
 func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
-	isInternal := false
 	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
 	// CALLER, never through the ServiceAccount or the SA-backed Secrets
 	// snapshot, so a draft can only use credentials its author can already
@@ -110,52 +109,29 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		// middleware chose it: the step-up Secret for an identity whose
 		// groups carry krateo:loa:2, else the session Secret. No fallback: a
 		// step-up identity whose Secret is gone fails this stage rather than
-		// dialing the session credential.
-		ref = &templates.Reference{
-			Namespace: m.authnNS,
-			Name:      credsecret.For(m.username, m.groups),
-		}
-		isInternal = true
+		// dialing the session credential. #1382 — read exact-then-legacy
+		// (credsecret.For), and only a Secret the caller owns
+		// (endpoints.OwnsSecret): another user's Secret under a shared name
+		// is a miss, never a dial with their credential.
+		return m.resolveOwn(ctx)
 	}
 
-	// Ship D.2 (0.30.143) — F-3 cache lookup FIRST. The Secrets
-	// snapshot covers AUTHN_NAMESPACE `<user>-clientconfig` Secrets
-	// in-process; on a hit we skip the apiserver round-trip
-	// entirely. On any soft miss (cache=off, namespace mismatch,
-	// pre-sync, Secret absent, snapshot nil pre-readiness) the
-	// function returns served=false and we fall through to the
-	// upstream plumbing call below — the pre-D.2 behavior preserved
-	// exactly (AC-D2.4). The Ship D RecordApiserverFallthrough call
-	// is BELOW the cache-hit return so the F-3 counter measures
-	// only the fallback path; the F-3 falsifier (134/60s → ≤5/60s)
-	// reads that drop.
-	if ep, served, ferr := FromInformerSecret(ctx, ref.Namespace, ref.Name); served {
-		// Hard error path: Secret present but malformed
-		// (server-url missing). Upstream FromSecret would have
-		// returned the same error verbatim — we propagate it.
-		if ferr != nil {
-			return ep, false, ferr
-		}
-		// AC-D2.7 — the isInternal+!env.TestMode ServerURL override
-		// applies UNIFORMLY on both the cache-hit and the upstream-
-		// fallback path. Kept here (not factored into
-		// FromInformerSecret) per PM-explicit `feedback_no_special_cases`:
-		// the override is the resolver's contextual decision (the
-		// stage is internal-driven), not a Secret-cache concern.
-		if isInternal && !env.TestMode() {
-			ep.ServerURL = "https://kubernetes.default.svc"
-		}
+	// A NAMED ref: the Secret it names, read through the ServiceAccount.
+	// Ship D.2 (0.30.143) — F-3 cache lookup FIRST. On any soft miss
+	// (cache=off, namespace mismatch, pre-sync, Secret absent, snapshot nil
+	// pre-readiness) the function returns served=false and we fall through
+	// to the upstream plumbing call below — the pre-D.2 behavior preserved
+	// exactly (AC-D2.4). A malformed Secret in the snapshot (served=false
+	// with an error) falls through too: the apiserver is authoritative, and
+	// answers the same verbatim error when the Secret really is malformed.
+	if ep, served, _ := FromInformerSecret(ctx, ref.Namespace, ref.Name); served {
 		return ep, false, nil
 	}
 
-	// Ship D (0.30.141) — F-3: endpoints.FromSecret issues a per-user
-	// clientconfig-Secret GET (apiserver) per non-UAF stage per /call —
-	// architect's largest snowplow-attributable apiserver traffic
-	// source on the request path. Record BEFORE the plumbing call so a
-	// panicking secret-GET still increments the counter (AC-D.3). The
-	// gvr label is left empty: the Secret being read is fixed per user,
-	// not per resolver target, and synthesizing a placeholder would
-	// inflate cardinality without diagnostic value.
+	// Ship D (0.30.141) — F-3: record BEFORE the plumbing call so a
+	// panicking secret-GET still increments the counter (AC-D.3). The gvr
+	// label is left empty: synthesizing a placeholder would inflate
+	// cardinality without diagnostic value.
 	sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
 	ep, err := credhttp.FromSecret(sctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
@@ -163,13 +139,41 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	}
 	// Ship 0.30.165 — normalize CA bytes to the single-base64-encoded
 	// PEM shape that plumbing's transport expects (see endpoints_ca.go).
-	// Live `<user>-clientconfig` Secrets store double-base64 PEM; without
-	// this normalization plumbing silently fails to populate RootCAs and
-	// requests die with `x509: certificate signed by unknown authority`.
 	ep.CertificateAuthorityData = string(normalizeCAData([]byte(ep.CertificateAuthorityData)))
-	if isInternal && !env.TestMode() {
+	return ep, false, nil
+}
+
+// resolveOwn resolves the caller's OWN credential (#994, #1382): the names
+// credsecret.For gives, exact first, from the Secrets informer and then, when
+// it holds no Secret the caller owns, from the apiserver
+// (own_credential.go). A Secret the caller does not own, under any name, is a
+// miss; when no name holds one the error is a NotFound, which fails the stage
+// as a missing credential does. The endpoint is never the ServiceAccount's
+// (isSAEndpoint=false).
+//
+// AC-D2.7 — the !env.TestMode ServerURL override applies UNIFORMLY on the
+// informer and the apiserver path: the stage dials the in-cluster apiserver
+// with the caller's credential. Kept here, not in the readers, per
+// feedback_no_special_cases: it is the resolver's contextual decision, not a
+// Secret-cache concern.
+func (m *endpointReferenceMapper) resolveOwn(ctx context.Context) (endpoints.Endpoint, bool, error) {
+	names := credsecret.For(m.username, m.groups)
+	// A malformed owned Secret in the snapshot (served=false with an error)
+	// falls through to the apiserver, as on the named path: the apiserver is
+	// authoritative and answers the same verbatim error when it is malformed.
+	ep, served, _ := FromInformerOwnSecret(ctx, m.authnNS, m.username, names)
+	if !served {
+		var err error
+		// Ship D (0.30.141) — F-3: one fallthrough per miss, recorded before
+		// the reads, however many names they try.
+		sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
+		ep, err = FromAPIServerOwnSecret(sctx, m.rc, m.authnNS, m.username, names)
+		if err != nil {
+			return ep, false, err
+		}
+	}
+	if !env.TestMode() {
 		ep.ServerURL = "https://kubernetes.default.svc"
 	}
-
 	return ep, false, nil
 }

@@ -52,9 +52,15 @@ const (
 	// `diff -r` of the two module trees changes only dialguard/, helm/ and
 	// http/request's js test; crdgen/ and crdgen/schemas/ are byte-identical, so
 	// the output above stands.
+	//
+	// v1.54.0 → v1.61.0 (snowplow#1382, authn#140's names and plumbing#152's
+	// OwnsSecret): `diff -r` of the module trees changes endpoints/,
+	// kubeutil/objectclient, kubeutil/content, usernames/, signup tests and
+	// docs; crdgen/ and crdgen/schemas/ are byte-identical, so the output above
+	// stands.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.54.0"
+	crdgenVersion       = "v1.61.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
 	coreProviderCrdgenVersion = "v1.28.1"
 
