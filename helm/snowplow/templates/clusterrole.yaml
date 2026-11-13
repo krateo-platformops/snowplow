@@ -94,3 +94,29 @@ rules:
     {{- toYaml . | nindent 4 }}
   verbs: ["impersonate"]
 {{- end }}
+{{- /*
+  #1334 — the public identity. Rendered ONLY when publicIdentity.enabled, from
+  the same helper that sets PUBLIC_IDENTITY_ENABLED in the ConfigMap.
+
+  snowplow has no credential for the public identity and acts for it only by
+  impersonating exactly user krateo:public with the single group
+  system:unauthenticated. Both rules name those principals by resourceNames and
+  nothing else, and neither list can be empty.
+
+  The groups rule is what keeps the identity unauthenticated: with
+  system:unauthenticated impersonated the apiserver adds no
+  system:authenticated (impersonation.go), so the identity reaches only
+  RoleBindings naming the USER krateo:public plus what any anonymous caller of
+  the apiserver already has. It is not part of rbac.impersonateGroups, which
+  refuses every system: group for refresher cohorts (#631).
+*/ -}}
+{{- if eq (include "snowplow.publicIdentityEnabled" .) "true" }}
+- apiGroups: [""]
+  resources: ["users"]
+  resourceNames: ["krateo:public"]
+  verbs: ["impersonate"]
+- apiGroups: [""]
+  resources: ["groups"]
+  resourceNames: ["system:unauthenticated"]
+  verbs: ["impersonate"]
+{{- end }}

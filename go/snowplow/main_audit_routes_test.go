@@ -9,8 +9,8 @@ package main
 //      HEAD and OPTIONS; HandleAudited panics with no descriptor and
 //      HandleUnaudited with no reason.
 //   M  the mount functions main uses declare every route they mount: the
-//      write /call and /call/dry-run routes and both /export routes audited,
-//      the telemetry ingest and POST /debug/shadow-parity unaudited, each
+//      write /call and /call/dry-run routes, both /export routes and POST
+//      /debug/shadow-parity (#909) audited, the telemetry ingest unaudited,
 //      with its reason.
 
 import (
@@ -71,6 +71,7 @@ func TestAudit_RouteTable_M_EveryMountedRouteIsDeclared(t *testing.T) {
 		"POST /call", "PUT /call", "PATCH /call", "DELETE /call",
 		"POST /call/dry-run", "PUT /call/dry-run", "PATCH /call/dry-run",
 		"GET /export", "POST /export",
+		"POST /debug/shadow-parity", // #909
 	}
 	for _, p := range audited {
 		if _, ok := rt.audited[p]; !ok {
@@ -82,7 +83,7 @@ func TestAudit_RouteTable_M_EveryMountedRouteIsDeclared(t *testing.T) {
 			t.Errorf("%s is declared audited, not in the expected set", p)
 		}
 	}
-	for _, p := range []string{"POST /telemetry/v1/traces", "POST /debug/shadow-parity"} {
+	for _, p := range []string{"POST /telemetry/v1/traces"} {
 		if reason, ok := rt.unaudited[p]; !ok || strings.TrimSpace(reason) == "" {
 			t.Errorf("%s is not declared unaudited with a reason", p)
 		}

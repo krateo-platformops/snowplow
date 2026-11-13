@@ -107,8 +107,8 @@ func sendRefusal(err error) string {
 //   - a dial snowplow's destination policy refused was never sent: snowplow
 //     itself refused, which is what the schema's denied means (#1291), so it is
 //     denied, with no code (no authority answered; audit#13) and the refusal's
-//     own message. The request writer's closed set of denial reasons has no
-//     value for it, and a denied record without one conforms;
+//     own message, and its reason is destination_refused (OutcomeWithReason,
+//     audit v0.12.0);
 //   - a dial the page budget ended is a failure with no code and the budget's
 //     own message: it ran out of time, nothing refused it;
 //   - anything else is a failure with audit.FailureMessage of the observed code
@@ -117,6 +117,22 @@ func sendRefusal(err error) string {
 //
 // A nil Answer (no observer) reads as no response.
 func (a *Answer) Outcome() (outcome string, code int, message string) {
+	outcome, code, message, _ = a.OutcomeWithReason()
+	return outcome, code, message
+}
+
+// OutcomeWithReason is Outcome plus, on a denied outcome, why snowplow refused
+// (krateo.audit.denial_reason, audit v0.12.0): the destination policy's
+// refusal is destination_refused. "" on any other outcome.
+func (a *Answer) OutcomeWithReason() (outcome string, code int, message, reason string) {
+	outcome, code, message = a.outcome()
+	if outcome == audit.OutcomeDenied {
+		reason = audit.DenialDestinationRefused
+	}
+	return outcome, code, message, reason
+}
+
+func (a *Answer) outcome() (outcome string, code int, message string) {
 	if a == nil {
 		return audit.OutcomeFailure, 0, audit.FailureMessage(0)
 	}

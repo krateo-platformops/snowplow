@@ -40,6 +40,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // The named reasons a /debug request answers 503 with. They are part of the
@@ -87,10 +88,18 @@ func DebugAuthz() func(http.Handler) http.Handler {
 			check.SkipBindingUID = true
 			allowed, _, err := rbac.EvaluateRBAC(ctx, check)
 			if err != nil {
+				// An audited route's record: the authorization could not be
+				// evaluated, nothing was sent (a failure, no status code).
+				audit.FailAuthorizationRoute(ctx)
 				debugAuthzUnavailable(wri, req, debugAuthzReason(err), err)
 				return
 			}
 			if !allowed {
+				// An audited route's record: snowplow's own RBAC evaluation
+				// refused the verified caller before any dial (audit
+				// v0.13.0, rbac_not_allowed). An authority's 403 stays a
+				// status code; this one is snowplow's, so it has none.
+				audit.DenyRoute(ctx, audit.DenialRBACNotAllowed)
 				log.DebugContext(ctx, "debug.authz.denied",
 					slog.String("verb", check.Verb),
 					slog.String("path", check.NonResourcePath))

@@ -83,6 +83,24 @@ func ImplicitGroup(username string, groups []string) string {
 	return systemAuthenticatedGroup
 }
 
+// Authenticated reports whether the kube-apiserver treats a request by
+// (username, groups) as authenticated: whether its effective group set
+// (WithAuthenticatedGroup, the apiserver's rule) holds system:authenticated.
+//
+// An identity it does not treat as authenticated — one presenting
+// system:unauthenticated, or system:anonymous — holds no credential snowplow
+// could present for it, so snowplow may act for it only by impersonation, never
+// under its own ServiceAccount (#1334). The background drivers read this to
+// refuse their ServiceAccount fallback for such an identity.
+func Authenticated(username string, groups []string) bool {
+	for _, g := range WithAuthenticatedGroup(username, groups) {
+		if g == systemAuthenticatedGroup {
+			return true
+		}
+	}
+	return false
+}
+
 // SubjectIdentity is the minimal subject shape consumed by the RBAC
 // evaluator. Equivalent in surface to k8s authn/v1.UserInfo's required
 // fields (Username + Groups). The cache-package mirror exists because
