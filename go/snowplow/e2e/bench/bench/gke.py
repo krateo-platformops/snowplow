@@ -2714,10 +2714,19 @@ def reap_expired(project: str, *, yes: bool, now: float, budget_s: float = DEFAU
         # `location` is the cluster's own (a region now; a zone for an older one)
         loc = c.get("location") or c.get("zone") or region_of(DEFAULT_ZONE)
         argv = delete_command(c["name"], project=project, location=loc)
-        rc, _ = execute(argv, dry_run=not yes, log=log)
+        err: list[str] = []
+        rc, _ = execute(argv, dry_run=not yes, log=log, stderr_out=err)
         if not yes:
             continue
-        if rc != 0:
+        busy = _INCOMPATIBLE_OP.search(err[-1] if err else "") if rc != 0 else None
+        if busy:
+            # #1387 review: GKE refuses a delete while another operation runs on the cluster: its own
+            # ttl-self-destruct CronJob's delete, or a partner launch's reap, got there first. That is a
+            # delete in progress, not a failed one: the NotFound poll below says whether it ends (an
+            # operation that is not a delete leaves the cluster there, and the poll says so)
+            log(f"{c['name']}: {busy.group(1)} is already running on it (a delete in progress, its own CronJob's "
+                f"or another reap's): waiting for its describe to answer NotFound")
+        elif rc != 0:
             problems.append(f"{c['name']}: its delete failed (rc={rc}): it is still there, past its TTL")
             continue
         asked.append((c["name"], describe_argv(c["name"], project, loc)))

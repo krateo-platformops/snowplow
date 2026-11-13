@@ -356,6 +356,12 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             fh.write(a[3] + "\\n")
         if os.environ.get("FAKE_CLUSTER_DELETE_RC"):           # #1383 gap 5: GKE refused the delete
             sys.exit(int(os.environ["FAKE_CLUSTER_DELETE_RC"]))
+        if os.environ.get("FAKE_CLUSTER_DELETE_BUSY"):         # #1387 review: its CronJob is deleting it already
+            open(os.path.join(st, "deleted"), "w").write("1")
+            sys.stderr.write("ERROR: (gcloud.container.clusters.delete) Some requests did not succeed:\\n"
+                             " - ResponseError: code=400, message=Cluster is running incompatible operation "
+                             + os.environ["FAKE_CLUSTER_DELETE_BUSY"] + ".\\n")
+            sys.exit(1)
         open(os.path.join(st, "deleted"), "w").write("1"); sys.exit(0)
     if a[:3] == ["compute", "disks", "list"]:
         if os.environ.get("FAKE_DISK_LIST_RC"):

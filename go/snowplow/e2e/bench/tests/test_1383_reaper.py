@@ -87,3 +87,28 @@ def test_the_cluster_quota_check_reads_the_same_fail_closed_list(reapfakes, monk
     monkeypatch.setenv("FAKE_MISSING_ZONES", "europe-west4-b")
     ok, msg = gke.cluster_quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, 1)
     assert not ok and "could not be listed" in msg
+
+
+# ─── #1387 review: a delete already running is a delete in progress, not a failed one ───
+
+OP = "operation-1794560000000-5a7d2c1e-91b3-4c2f-8e0d-6f1b2a3c4d5e"
+
+
+def test_a_cluster_its_cronjob_is_already_deleting_is_reaped_once_it_reads_gone(reapfakes, monkeypatch, capsys):
+    """GKE's answer to a delete while the cluster's own ttl-self-destruct CronJob (or a partner launch's reap) is
+    deleting it: "Cluster is running incompatible operation operation-...", rc 1. The reaper waits for the
+    describe's NotFound instead of reporting a failed delete."""
+    monkeypatch.setenv("FAKE_CLUSTER_DELETE_BUSY", OP)
+    assert gke.main(["gke-reap", "--yes"]) == 0
+    out = capsys.readouterr()
+    assert f"{EXPIRED['name']}: {OP} is already running on it (a delete in progress" in out.out
+    assert f"reaped: {EXPIRED['name']} (past its TTL): deleted, its describe answers NotFound" in out.out
+    assert "its delete failed" not in out.err
+
+
+def test_an_operation_that_never_ends_the_cluster_is_still_not_reaped(reapfakes, monkeypatch, capsys):
+    """The running operation may be no delete (an upgrade): the cluster stays, and the poll says so."""
+    monkeypatch.setenv("FAKE_CLUSTER_DELETE_BUSY", OP)
+    monkeypatch.setenv("FAKE_NEVER_GONE", "1")
+    assert gke.main(["gke-reap", "--yes", "--budget-s", "0.05"]) == 1
+    assert f"{EXPIRED['name']}: delete requested, NOT confirmed gone" in capsys.readouterr().err
