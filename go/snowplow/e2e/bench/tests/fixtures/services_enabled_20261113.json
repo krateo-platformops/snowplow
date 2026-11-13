@@ -1,0 +1,362 @@
+[
+ {
+  "config": {
+   "name": "aiplatform.googleapis.com",
+   "title": "Agent Platform API"
+  },
+  "name": "projects/357378285144/services/aiplatform.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "analyticshub.googleapis.com",
+   "title": "Analytics Hub API"
+  },
+  "name": "projects/357378285144/services/analyticshub.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "artifactregistry.googleapis.com",
+   "title": "Artifact Registry API"
+  },
+  "name": "projects/357378285144/services/artifactregistry.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "autoscaling.googleapis.com",
+   "title": "Cloud Autoscaling API"
+  },
+  "name": "projects/357378285144/services/autoscaling.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigquery.googleapis.com",
+   "title": "BigQuery API"
+  },
+  "name": "projects/357378285144/services/bigquery.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigqueryconnection.googleapis.com",
+   "title": "BigQuery Connection API"
+  },
+  "name": "projects/357378285144/services/bigqueryconnection.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigquerydatapolicy.googleapis.com",
+   "title": "BigQuery Data Policy API"
+  },
+  "name": "projects/357378285144/services/bigquerydatapolicy.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigquerydatatransfer.googleapis.com",
+   "title": "BigQuery Data Transfer API"
+  },
+  "name": "projects/357378285144/services/bigquerydatatransfer.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigquerymigration.googleapis.com",
+   "title": "BigQuery Migration API"
+  },
+  "name": "projects/357378285144/services/bigquerymigration.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigqueryreservation.googleapis.com",
+   "title": "BigQuery Reservation API"
+  },
+  "name": "projects/357378285144/services/bigqueryreservation.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "bigquerystorage.googleapis.com",
+   "title": "BigQuery Storage API"
+  },
+  "name": "projects/357378285144/services/bigquerystorage.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "cloudapis.googleapis.com",
+   "title": "Google Cloud APIs"
+  },
+  "name": "projects/357378285144/services/cloudapis.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "cloudquotas.googleapis.com",
+   "title": "Cloud Quotas API"
+  },
+  "name": "projects/357378285144/services/cloudquotas.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "cloudtrace.googleapis.com",
+   "title": "Cloud Trace API"
+  },
+  "name": "projects/357378285144/services/cloudtrace.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "compute.googleapis.com",
+   "title": "Compute Engine API"
+  },
+  "name": "projects/357378285144/services/compute.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "container.googleapis.com",
+   "title": "Kubernetes Engine API"
+  },
+  "name": "projects/357378285144/services/container.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "containerfilesystem.googleapis.com",
+   "title": "Container File System API"
+  },
+  "name": "projects/357378285144/services/containerfilesystem.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "containerregistry.googleapis.com",
+   "title": "Container Registry API"
+  },
+  "name": "projects/357378285144/services/containerregistry.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "dataform.googleapis.com",
+   "title": "Dataform API"
+  },
+  "name": "projects/357378285144/services/dataform.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "dataplex.googleapis.com",
+   "title": "Cloud Dataplex API"
+  },
+  "name": "projects/357378285144/services/dataplex.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "datastore.googleapis.com",
+   "title": "Cloud Datastore API"
+  },
+  "name": "projects/357378285144/services/datastore.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "dns.googleapis.com",
+   "title": "Cloud DNS API"
+  },
+  "name": "projects/357378285144/services/dns.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "gkebackup.googleapis.com",
+   "title": "Backup for GKE API"
+  },
+  "name": "projects/357378285144/services/gkebackup.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "iam.googleapis.com",
+   "title": "Identity and Access Management (IAM) API"
+  },
+  "name": "projects/357378285144/services/iam.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "iamcredentials.googleapis.com",
+   "title": "IAM Service Account Credentials API"
+  },
+  "name": "projects/357378285144/services/iamcredentials.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "iap.googleapis.com",
+   "title": "Cloud Identity-Aware Proxy API"
+  },
+  "name": "projects/357378285144/services/iap.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "logging.googleapis.com",
+   "title": "Cloud Logging API"
+  },
+  "name": "projects/357378285144/services/logging.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "monitoring.googleapis.com",
+   "title": "Cloud Monitoring API"
+  },
+  "name": "projects/357378285144/services/monitoring.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "networkconnectivity.googleapis.com",
+   "title": "Network Connectivity API"
+  },
+  "name": "projects/357378285144/services/networkconnectivity.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "oslogin.googleapis.com",
+   "title": "Cloud OS Login API"
+  },
+  "name": "projects/357378285144/services/oslogin.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "pubsub.googleapis.com",
+   "title": "Cloud Pub/Sub API"
+  },
+  "name": "projects/357378285144/services/pubsub.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "secretmanager.googleapis.com",
+   "title": "Secret Manager API"
+  },
+  "name": "projects/357378285144/services/secretmanager.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "servicemanagement.googleapis.com",
+   "title": "Service Management API"
+  },
+  "name": "projects/357378285144/services/servicemanagement.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "serviceusage.googleapis.com",
+   "title": "Service Usage API"
+  },
+  "name": "projects/357378285144/services/serviceusage.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "speech.googleapis.com",
+   "title": "Cloud Speech-to-Text API"
+  },
+  "name": "projects/357378285144/services/speech.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "sql-component.googleapis.com",
+   "title": "Cloud SQL"
+  },
+  "name": "projects/357378285144/services/sql-component.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "storage-api.googleapis.com",
+   "title": "Google Cloud Storage JSON API"
+  },
+  "name": "projects/357378285144/services/storage-api.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "storage-component.googleapis.com",
+   "title": "Cloud Storage"
+  },
+  "name": "projects/357378285144/services/storage-component.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "storage.googleapis.com",
+   "title": "Cloud Storage API"
+  },
+  "name": "projects/357378285144/services/storage.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ },
+ {
+  "config": {
+   "name": "texttospeech.googleapis.com",
+   "title": "Cloud Text-to-Speech API"
+  },
+  "name": "projects/357378285144/services/texttospeech.googleapis.com",
+  "parent": "projects/357378285144",
+  "state": "ENABLED"
+ }
+]

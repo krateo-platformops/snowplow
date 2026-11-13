@@ -323,7 +323,8 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + f
         # #1383: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused) and its proof Job, as the API server and
         # GKE answer (run 26h, tests/fake_gke_api.py): FAKE_TTL_PROOF=granted (default: node-sa's grant) | denied
         # (no grant) | unlimited (the role with no condition) | disabled (the GKE API off; its 403 names the
-        # caller) | silent (the pod printed no answer) | failed (the Job failed, its log empty) | never
+        # caller) | silent (the pod printed no answer) | failed (the Job failed, its log empty) | never |
+        # body (run 26g: every probe answers the Google API error in the JSON file FAKE_TTL_PROOF_BODY names)
         proof = os.environ.get("FAKE_TTL_PROOF", "granted")
         if a[:2] == ["apply", "-f"]:
             text = sys.stdin.read()

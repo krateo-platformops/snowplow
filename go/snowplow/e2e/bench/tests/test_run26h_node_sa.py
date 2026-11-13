@@ -177,6 +177,13 @@ def test_404_inside_and_403_outside_for_both_calls_is_proven():
     (_logs(delete=(("403", _err(403, "PERMISSION_DENIED", "ACCESS_TOKEN_SCOPE_INSUFFICIENT")), PD)),
      "ACCESS_TOKEN_SCOPE_INSUFFICIENT"),
     (_logs(delete=(NF, ("401", _err(401, "UNAUTHENTICATED")))), "HTTP 401 (401 UNAUTHENTICATED)"),
+    # a 404 is GKE's lookup only when its error body says so too: a body whose status or code disagrees refuses
+    (_logs(get=(("404", _err(404, "PERMISSION_DENIED", "IAM_PERMISSION_DENIED")), PD)),
+     "container.clusters.get: snowplow-bench-ttlprobe-abcdef0123 answered HTTP 404 (404 PERMISSION_DENIED; reason: "
+     "IAM_PERMISSION_DENIED) and ttlprobe-abcdef0123 answered HTTP 403"),
+    (_logs(delete=(("404", _err(403, "NOT_FOUND")), PD)), "answered HTTP 404 (403 NOT_FOUND) and"),
+    (_logs(delete=(NF, ("403", _err(403, "NOT_FOUND")))), "answered HTTP 403 (403 NOT_FOUND), not 404"),
+    (_logs(delete=(NF, ("403", _err(404, "PERMISSION_DENIED")))), "answered HTTP 403 (404 PERMISSION_DENIED), not 404"),
     (_logs(drop=(("container.clusters.delete", CONTROL),)), "container.clusters.delete: the proof pod printed no "
                                                             "answer for its control name"),
     (_logs(drop=(("container.clusters.get", INSIDE),)), "printed no answer for its snowplow-bench- name"),
@@ -383,7 +390,8 @@ def test_node_sa_makes_the_sa_the_role_and_the_bindings_then_reads_them_back(fak
 def test_up_refuses_before_any_grant_while_the_node_sa_does_not_exist(fake, capsys, monkeypatch):  # noqa: F811
     monkeypatch.setenv("FAKE_NO_NODE_SA", "1")
     rc, _out, err = _up(capsys, monkeypatch)
-    assert rc == 2 and f"the bench clusters' node SA {NODE_SA} answers NOT_FOUND" in err
+    assert rc == 2 and "the bench clusters' node SA is not as node-sa makes it: " in err, err
+    assert f"the node SA {NODE_SA} answers NOT_FOUND" in err and f"the role {REAPER} answers not found" in err
     assert "python3 -m bench.vm606 node-sa --yes" in err
     assert _changing(fake) == []
 
@@ -466,3 +474,76 @@ def test_a_denied_read_is_never_read_as_absent(fake, capsys, monkeypatch, verb, 
     assert rc == 2 and says in err and "PERMISSION_DENIED" in err, err
     assert "PLACEHOLDER-OPERATOR" not in err
     assert _changing(fake) == []
+
+
+# ─── 5. up pays for nothing unless the node SA's grants are exactly node-sa's ─
+
+_DEFAULT_NODE = {"role": "roles/container.defaultNodeServiceAccount", "members": [f"serviceAccount:{NODE_SA}"]}
+_REAPER_BOUND = {"role": REAPER, "members": [f"serviceAccount:{NODE_SA}"], "condition": gke.reaper_condition()}
+# the reaper binding under a condition that reads the same but for its description: another binding in IAM
+_REAPER_OTHER_DESC = {"role": REAPER, "members": [f"serviceAccount:{NODE_SA}"],
+                      "condition": {**gke.reaper_condition(), "description": "made by hand"}}
+
+
+def _no_role(f):
+    """The SA and both bindings there, the role not (FAKE_NO_NODE_SA=1 below: the fake serves no role by itself)."""
+    fake_vm606.put_sa(f, NODE_SA)
+    fake_vm606.put_policy(f, f"project-{PROJECT}", [_DEFAULT_NODE, _REAPER_BOUND])
+
+
+@pytest.mark.parametrize("setup, says", [
+    (lambda f: fake_vm606.put_sa(f, NODE_SA, disabled=True), f"the node SA {NODE_SA} is disabled"),
+    (_no_role, f"the role {REAPER} answers not found"),
+    (lambda f: fake_vm606.put_role(f, "snowplowBenchClusterReaper", list(gke.REAPER_PERMISSIONS), deleted=True),
+     f"the role {REAPER} is deleted"),
+    (lambda f: fake_vm606.put_role(f, "snowplowBenchClusterReaper",
+                                   [*gke.REAPER_PERMISSIONS, "container.clusters.update"]),
+     "'container.clusters.update'], not exactly"),
+    (lambda f: fake_vm606.put_policy(f, f"project-{PROJECT}", [_DEFAULT_NODE]),
+     f"the node SA does not hold {REAPER} under snowplow-bench-clusters-only"),
+    (lambda f: fake_vm606.put_policy(f, f"project-{PROJECT}", [_REAPER_BOUND]),
+     "the node SA does not hold roles/container.defaultNodeServiceAccount unconditionally"),
+    (lambda f: _granted(f, {"role": "roles/editor", "members": [f"serviceAccount:{NODE_SA}"]}),
+     "the node SA holds roles/editor unconditionally, which node-sa does not grant"),
+    (lambda f: _granted(f, {"role": REAPER, "members": [f"serviceAccount:{NODE_SA}"]}),
+     f"the node SA holds {REAPER} unconditionally, which node-sa does not grant"),
+    (lambda f: fake_vm606.put_policy(f, f"project-{PROJECT}", [
+        _DEFAULT_NODE, {**_REAPER_BOUND, "condition": {"title": "snowplow-bench-clusters-only", "expression": "true"}}]),
+     f"the node SA holds {REAPER} under snowplow-bench-clusters-only: true, which node-sa does not grant"),
+    (lambda f: _granted(f, _REAPER_OTHER_DESC), "(description: made by hand), which node-sa does not grant"),
+], ids=["sa-disabled", "role-missing", "role-deleted", "role-more-permissions", "reaper-binding-missing",
+        "node-binding-missing", "extra-binding", "reaper-unconditional", "wrong-condition", "same-condition-other-desc"])
+def test_up_refuses_before_anything_unless_the_node_sa_is_exactly_as_node_sa_makes_it(fake, capsys, monkeypatch,  # noqa: F811
+                                                                                      setup, says):
+    """#1406 review: the SA present but its grants wrong would pass up, pay for a VM and clusters, and fail at gke-up's
+    TTL proof (or worse, a wider grant would pass it): up reads node_sa_drift and refuses on any difference."""
+    if setup is _no_role:
+        monkeypatch.setenv("FAKE_NO_NODE_SA", "1")
+    setup(fake)
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 2 and "the bench clusters' node SA is not as node-sa makes it: " in err and says in err, err
+    assert "Nothing was created" in err
+    assert _changing(fake) == []
+    assert not [c for c in fake_vm606.calls(fake) if c["argv"][:3] == ["compute", "instances", "create"]]
+
+
+def test_up_passes_the_node_sa_check_when_all_is_exactly_as_node_sa_makes_it(fake, capsys, monkeypatch):  # noqa: F811
+    _granted(fake)
+    rc, _out, err = _up(capsys, monkeypatch)
+    assert rc == 0, err
+
+
+@pytest.mark.parametrize("extra, says", [
+    (_REAPER_OTHER_DESC, f"after node-sa, the node SA holds {REAPER} under snowplow-bench-clusters-only: "),
+    ({"role": "roles/editor", "members": [f"serviceAccount:{NODE_SA}"]},
+     "after node-sa, the node SA holds roles/editor unconditionally, which node-sa does not grant"),
+])
+def test_node_sa_refuses_an_extra_binding_on_its_read_back(fake, capsys, monkeypatch, extra, says):  # noqa: F811
+    """#1406 review: a binding another writer adds while node-sa runs (here: with node-sa's own first grant) is read
+    back and refused, never counted away: "exactly 2 project bindings" is a count of what IAM holds."""
+    monkeypatch.setenv("FAKE_NO_NODE_SA", "1")
+    monkeypatch.setenv("FAKE_IAM_EXTRA_WRITE", json.dumps(extra))
+    rc, out, err = _run(capsys, "node-sa", "--yes")
+    assert rc == 2 and says in err, out + err
+    assert "read back:" not in out and "exactly 2 project bindings" not in out
+    assert len(_node_bindings(fake)) == 3                          # what IAM holds: node-sa's two and the extra

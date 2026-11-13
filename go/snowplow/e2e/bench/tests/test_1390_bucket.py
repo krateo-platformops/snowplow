@@ -77,7 +77,8 @@ def _in_use(fake):  # noqa: F811
 
 
 def _unconditional(fake):  # noqa: F811
-    fake_vm606.put_policy(fake, f"project-{PROJECT}", [{"role": "roles/compute.viewer", "members": [SA]}])
+    fake_vm606.put_policy(fake, f"project-{PROJECT}", [{"role": "roles/compute.viewer", "members": [SA]},
+                                                       *fake_vm606.NODE_SA_BINDINGS])
 
 
 @pytest.mark.parametrize("refusal, says, env", [

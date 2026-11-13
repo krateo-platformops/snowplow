@@ -25,6 +25,7 @@ script's body; it defines ttl_proof_logs(applied_text, mode).
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -166,7 +167,8 @@ def answer(mode: str, perm: str, url: str, cluster: str) -> tuple[int, dict]:
 def ttl_proof_logs(applied_text: str, mode: str) -> str:
     """The proof pod's log for the LAST proof Job applied (its own probe calls, read from its manifest), as its
     script prints GKE's answers: "TTL_PROOF <permission> <name> <code> <body>". mode: granted | denied |
-    unlimited | disabled (module doc), silent (no line: the token failed)."""
+    unlimited | disabled (module doc), silent (no line: the token failed), body (run 26g: every probe answered
+    the Google API error in the JSON file FAKE_TTL_PROOF_BODY names, at its error.code)."""
     if mode == "silent":
         return ""
     docs = [d for d in applied_text.split("\n---\n") if gke.TTL_PROOF_JOB in d and "probe()" in d]
@@ -174,7 +176,11 @@ def ttl_proof_logs(applied_text: str, mode: str) -> str:
         return ""
     lines = []
     for perm, _method, url, cluster in _PROBE.findall(docs[-1]):
-        code, body = answer(mode, perm, url, cluster)
+        if mode == "body":
+            body = json.loads(Path(os.environ["FAKE_TTL_PROOF_BODY"]).read_text())
+            code = body["error"]["code"]
+        else:
+            code, body = answer(mode, perm, url, cluster)
         lines.append(f"{gke.TTL_PROOF_MARK}{perm} {cluster} {code} {json.dumps(body)}")
     return "\n".join(lines) + "\n"
 

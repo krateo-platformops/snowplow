@@ -189,9 +189,9 @@ def test_the_installers_reads_and_the_crd_pulls_go_through_the_same_classificati
                                       budget=noanswer.Budget(clock=clock, sleep=clock.sleep))
     assert not res.get("no_answer") and res["failures"] == [
         "helm show chart oci://ghcr.io/x/installer --version 0.3.1 failed: Error: 403 Forbidden"]
-    got = crd_schema.pull({"chart": "authn-crds", "version": "0.27.3", "ref": "oci://ghcr.io/x/authn-crds"},
+    got = crd_schema.pull({"chart": "authn-crds", "version": "0.27.3", "ref": "oci://quay.io/x/authn-crds"},
                           str(tmp_path / "w"), run=never, budget=None)
-    assert got["no_answer"] and got["error"].startswith("no answer from the helm pull of oci://ghcr.io/x/authn-crds")
+    assert got["no_answer"] and got["error"].startswith("no answer from the helm pull of oci://quay.io/x/authn-crds")
 
 
 def test_the_registry_reads_of_a_run_spend_one_bound_across_their_steps(tmp_path):
@@ -279,7 +279,9 @@ def test_the_crd_pulls_pay_a_retry_from_the_runs_one_bound(tmp_path, monkeypatch
         (tmp_path / dest / "authn-crds" / "Chart.yaml").write_text("name: authn-crds\nversion: 0.27.3\n")
         return subprocess.CompletedProcess(argv, 0, "", "")
     run, seen = _once_then(ok, ["helm", "pull"])
-    got = crd_schema.pull_all([{"chart": "authn-crds", "version": "0.27.3", "ref": "oci://ghcr.io/x/authn-crds",
+    # a CRD chart on another registry than ghcr.io is read with helm pull (a ghcr.io one in-process with the pull
+    # token, run 26g: tests/test_run26g_forensics.py)
+    got = crd_schema.pull_all([{"chart": "authn-crds", "version": "0.27.3", "ref": "oci://quay.io/x/authn-crds",
                                 "from": "pin"}], str(tmp_path / "w"), str(tmp_path / "b.json"), run=run)
     assert seen["n"] == 1 and got[0].get("path") and not got[0].get("error"), got
 

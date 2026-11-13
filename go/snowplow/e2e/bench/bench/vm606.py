@@ -48,7 +48,8 @@ custom role holding only container.clusters.get and delete, bound under a condit
 named snowplow-bench-* only, so the TTL CronJob can delete its own cluster and never krateo-057. `node-sa`
 makes the SA, the role and both bindings when absent (dry run unless --yes) and reads them back; anything
 present but different (a disabled SA, a deleted role or one with more permissions, a binding it does not
-grant) refuses and changes nothing. plan-iam prints them; up refuses while the SA does not exist; gke-up
+grant) refuses and changes nothing. plan-iam prints them; up (dry or not, before it creates anything) refuses
+unless all of it reads back exactly as node-sa makes it (node_sa_drift: nothing missing, nothing more); gke-up
 proves on every run, as the SA, that the grant reaches bench clusters and stops there.
 
 THE VM (up).
@@ -89,7 +90,9 @@ THE VM (up).
     a rule, so the description also records the run's expiry (expires=<the VM's termination time>,
     #1383): once it has passed and no instance claims the run, `reap` deletes the rule (exact name
     and tag, one fail-closed list, each delete read back NotFound), and every `up` reaps first. OS Login
-    (enable-oslogin=TRUE, project keys blocked). `up` refuses while iap.googleapis.com is not enabled.
+    (enable-oslogin=TRUE, project keys blocked). `up` (dry or not, before it creates anything) refuses
+    while any Google API the run calls is not enabled in the project, naming each (bench.gcp_apis, run
+    26g: the TTL proof's cloudresourcemanager then was not; iap.googleapis.com is among them).
   - A failed `up` says so and names `down`, which removes whatever up made (grants, rules, VM): the
     SSH wait reads every failure (IAP / firewall / OS Login / ssh) and stops at once on one that
     waiting cannot fix, never as a silent timeout. An IAP tunnel failure is read by its close code
@@ -251,6 +254,7 @@ identity removed (bench.gcevm.gcloud_cause, #1361), an SSH / scp failure its cod
 from __future__ import annotations
 
 import argparse
+import collections
 import functools
 import itertools
 import json
@@ -265,7 +269,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from bench import durable, evidence, gcevm, ghcr_pull, gke, installer_src, installer_values
+from bench import durable, evidence, gcevm, gcp_apis, ghcr_pull, gke, installer_src, installer_values
 from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE,  # noqa: F401
                          NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
                          ssh, ssh_stage)
@@ -468,6 +472,8 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("storage", "cp"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),
     ("storage", "cp", "*"): ("roles/storage.objectCreator", "roles/storage.objectViewer"),   # its source a variable
     ("storage", "objects", "list"): ("roles/storage.objectViewer",),
+    # run 26g: run606's `apis` step reads which APIs are enabled in the project (bench.gcp_apis)
+    ("services", "list"): ("roles/serviceusage.serviceUsageConsumer",),
 }
 # #1390 (Diego, 2026-11-13): the only storage roles the orchestrator SA may hold, each ON THE EVIDENCE BUCKET only
 # (bench.durable.bucket_name), under the run's expiring condition: create and read objects; never delete or
@@ -484,8 +490,9 @@ KUBE_ROLE = "roles/container.admin"
 # A REST API the orchestrator never calls itself: a module constant (by name, in its file, on its host) whose URL
 # only a pod in the bench cluster requests, as the GKE node SA. #1383 gap 3 / run 26h: gke-up's TTL proof Job calls
 # the GKE API AS the identity the ttl-self-destruct CronJob runs as (like the CronJob's own gcloud, not in the
-# scan), on two cluster names that do not exist. Any other use of the host is scanned like every REST call.
-NODE_SA_REST = {"TTL_PROOF_API": ("gke.py", "container")}
+# scan), on two cluster names that do not exist. Any other use of the host is scanned like every REST call. Its one
+# source is bench.gcp_apis, which also counts it among the APIs the run needs enabled (run 26g).
+NODE_SA_REST = gcp_apis.NODE_SA_REST
 
 WHY = {
     "roles/container.admin": (
@@ -508,7 +515,8 @@ WHY = {
     "roles/cloudquotas.viewer": (
         "cloudquotas.quotas.get: the #985 read of ClustersPerRegion over REST."),
     "roles/serviceusage.serviceUsageConsumer": (
-        "serviceusage.services.use: that request bills the project (x-goog-user-project)."),
+        "serviceusage.services.use: the Cloud Quotas request bills the project (x-goog-user-project); and "
+        "serviceusage.services.list: run606's apis step reads which Google APIs are enabled (run 26g)."),
     "roles/storage.objectCreator": (
         "storage.objects.create ON THE EVIDENCE BUCKET only (#1390): each arm's run directory, copied off the VM "
         "before the pair statistics; no delete and no overwrite (the bucket's 7-day retention holds every object)."),
@@ -538,7 +546,7 @@ _SH_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 _SH_COMMENT = re.compile(r"(?:^|\s)#.*$")
 _SH_TOOL = re.compile(r"(?:^|[\s;&|(`])(gcloud|kubectl|helm)\b")
 # the operator's modules: their calls run on the laptop as the operator, never as the orchestrator SA
-OPERATOR_SIDE = (Path(__file__).name, "gcevm.py", "testvm.py")
+OPERATOR_SIDE = gcp_apis.OPERATOR_SIDE
 _IMPORTS = re.compile(r"^\s*(?:from\s+bench(?:\.(\w+))?\s+import\s+([\w, ()]+)|import\s+bench\.(\w+))", re.M)
 
 
@@ -950,27 +958,48 @@ def reaper_role_drift(doc: dict) -> list[str]:
     return off
 
 
-def node_sa_held(policy: dict, project: str) -> set[tuple[str, str | None, str | None]]:
-    """(role, condition title, condition expression) of every project binding naming the node SA."""
+Binding = tuple[str, str | None, str | None, str | None]
+
+
+def _binding_key(role, cond) -> Binding:
+    """(role, condition title, expression, description): the whole of what makes a binding one in IAM's policy
+    (a condition differing in its description alone is another binding)."""
+    c = cond if isinstance(cond, dict) else {}
+    return role, c.get("title"), c.get("expression"), c.get("description")
+
+
+def node_sa_held(policy: dict, project: str) -> collections.Counter[Binding]:
+    """Every project binding naming the node SA (_binding_key), counted: two bindings that differ in nothing this
+    key reads are two, never one (node-sa's "exactly N bindings" is a count)."""
     member = f"serviceAccount:{node_sa(project)}"
-    return {(b.get("role"), (b.get("condition") or {}).get("title"), (b.get("condition") or {}).get("expression"))
-            for b in policy.get("bindings") or [] if member in (b.get("members") or [])}
+    return collections.Counter(_binding_key(b.get("role"), b.get("condition"))
+                               for b in policy.get("bindings") or [] if member in (b.get("members") or []))
 
 
-def node_sa_want(project: str) -> set[tuple[str, str | None, str | None]]:
-    return {(role, (cond or {}).get("title"), (cond or {}).get("expression"))
-            for role, cond in gke.node_sa_bindings(project)}
+def node_sa_want(project: str) -> collections.Counter[Binding]:
+    return collections.Counter(_binding_key(role, cond) for role, cond in gke.node_sa_bindings(project))
 
 
-def _binding_text(b: tuple[str, str | None, str | None]) -> str:
-    role, title, expr = b
-    return f"{role} unconditionally" if title is None and expr is None else f"{role} under {title}: {expr}"
+def _binding_text(b: Binding) -> str:
+    role, title, expr, desc = b
+    if title is None and expr is None and desc is None:
+        return f"{role} unconditionally"
+    return f"{role} under {title}: {expr}" + (f" (description: {desc})" if desc is not None else "")
+
+
+def _bindings(c: collections.Counter[Binding]) -> list[Binding]:
+    return sorted(c.elements(), key=str)
 
 
 def node_sa_drift(project: str) -> list[str]:
     """Everything that differs from what node-sa makes (read-only): the SA (present, enabled), the reaper role
     (present, not deleted, exactly REAPER_PERMISSIONS) and the node SA's project bindings (exactly
-    node_sa_bindings: none missing, none more). Empty when all is as declared."""
+    node_sa_bindings: none missing, none more, counted). Empty when all is as declared."""
+    return _node_sa_read(project)[0]
+
+
+def _node_sa_read(project: str) -> tuple[list[str], collections.Counter[Binding]]:
+    """node_sa_drift's (what differs, the node SA's project bindings as read)."""
     off = []
     sa = node_sa_doc(project)
     if sa is None:
@@ -980,9 +1009,9 @@ def node_sa_drift(project: str) -> list[str]:
     role = reaper_role_doc(project)
     off += [f"the role {gke.reaper_role(project)} answers not found"] if role is None else reaper_role_drift(role)
     held, want = node_sa_held(_policy("project", project, project), project), node_sa_want(project)
-    off += [f"the node SA does not hold {_binding_text(b)}" for b in sorted(want - held, key=str)]
-    off += [f"the node SA holds {_binding_text(b)}, which node-sa does not grant" for b in sorted(held - want, key=str)]
-    return off
+    off += [f"the node SA does not hold {_binding_text(b)}" for b in _bindings(want - held)]
+    off += [f"the node SA holds {_binding_text(b)}, which node-sa does not grant" for b in _bindings(held - want)]
+    return off, held
 
 
 def ensure_node_sa(project: str, *, dry: bool, clock=time.monotonic, sleep=time.sleep) -> list[str]:
@@ -1001,7 +1030,7 @@ def ensure_node_sa(project: str, *, dry: bool, clock=time.monotonic, sleep=time.
     held, want = node_sa_held(_policy("project", project, project), project), node_sa_want(project)
     extra = held - want
     if extra:
-        raise Refused(f"the node SA holds {'; '.join(_binding_text(b) for b in sorted(extra, key=str))}, which node-sa "
+        raise Refused(f"the node SA holds {'; '.join(_binding_text(b) for b in _bindings(extra))}, which node-sa "
                       f"does not grant: refusing (nothing was changed; remove it by hand)")
     if sa is None:
         rc, _o, err = gcloud(node_sa_create_argv(project), dry=dry)
@@ -1027,7 +1056,7 @@ def ensure_node_sa(project: str, *, dry: bool, clock=time.monotonic, sleep=time.
     else:
         out.append(f"the role {gke.reaper_role(project)} exists, with exactly {', '.join(gke.REAPER_PERMISSIONS)}")
     for role_name, cond in gke.node_sa_bindings(project):
-        if (role_name, (cond or {}).get("title"), (cond or {}).get("expression")) in held:
+        if _binding_key(role_name, cond) in held:
             out.append(f"the node SA holds {role_name}" + (f" under {cond['title']}" if cond else ""))
             continue
         cf = None
@@ -1045,12 +1074,13 @@ def ensure_node_sa(project: str, *, dry: bool, clock=time.monotonic, sleep=time.
     if dry:
         out.append("DRY: nothing was changed; with --yes, everything is read back after")
         return out
-    off = node_sa_drift(project)
+    off, got = _node_sa_read(project)
     if off:
         raise Refused(f"after node-sa, {'; '.join(off)}")
+    # what was read back, counted (empty drift: the same bindings as node_sa_want, each once)
     out.append(f"read back: {node_sa(project)} enabled, {gke.reaper_role(project)} with exactly "
-               f"{', '.join(gke.REAPER_PERMISSIONS)}, and exactly {len(want)} project bindings of it: "
-               + "; ".join(_binding_text(b) for b in sorted(want, key=str)))
+               f"{', '.join(gke.REAPER_PERMISSIONS)}, and exactly {got.total()} project bindings of it: "
+               + "; ".join(_binding_text(b) for b in _bindings(got)))
     return out
 
 
@@ -1341,20 +1371,28 @@ def vm_quota_check(project: str, zone: str, run: str) -> tuple[list[str], list[s
 
 
 def _project_ready(project: str) -> None:
-    """IAP enabled (the VM is reached through it only), the orchestrator SA there, and the bench clusters' node SA."""
-    gcevm.require_iap(project)
+    """Every Google API the run calls enabled (bench.gcp_apis, run 26g: IAP among them, the VM is reached
+    through it only), the orchestrator SA there, and the bench clusters' node SA with exactly the grants node-sa
+    makes (run 26h)."""
+    try:
+        for line in gcp_apis.check(project, run=lambda argv: gcloud(argv[1:], quiet=True, env=gke.COMPUTE_LIST_ENV)):
+            _say(line)
+    except gcp_apis.Refused as e:
+        raise Refused(str(e)) from None
     rc, out, err = gcloud(["iam", "service-accounts", "describe", sa_email(project), "--project", project,
                            "--format", "value(email)"], quiet=True)
     if rc != 0 or out.strip() != sa_email(project):
         raise Refused(f"the orchestrator SA {sa_email(project)} could not be read (rc={rc}; {gcevm.gcloud_cause(err)}): "
                       f"create it (plan-iam prints the command)")
     # run 26h: up grants the orchestrator actAs ON the bench clusters' node SA, which gke-up creates every cluster
-    # with; node-sa makes it (and its grants), once
-    sa = node_sa_doc(project)
-    if sa is None or sa.get("disabled"):
-        raise Refused(f"the bench clusters' node SA {node_sa(project)} "
-                      f"{'answers NOT_FOUND' if sa is None else 'is disabled'}: `python3 -m bench.vm606 node-sa --yes` "
-                      f"makes it and its grants (plan-iam prints them)")
+    # with, and gke-up's TTL proof fails (after the clusters are paid for) unless its grants are exactly node-sa's:
+    # any difference (the SA missing or disabled, the role missing, deleted or with other permissions, a binding
+    # missing, more, or under another condition) refuses here, before anything is made
+    off = node_sa_drift(project)
+    if off:
+        raise Refused(f"the bench clusters' node SA is not as node-sa makes it: {'; '.join(off)}. Nothing was created. "
+                      f"`python3 -m bench.vm606 node-sa --yes` makes what is missing (plan-iam prints it all); a grant "
+                      f"it does not make, or a disabled SA, a human removes or fixes by hand")
 
 
 def resumable(st: dict, run: str) -> bool:

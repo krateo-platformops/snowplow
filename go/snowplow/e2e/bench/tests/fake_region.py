@@ -188,6 +188,42 @@ def server_config(env=None) -> dict:
                           "validVersions": ["1.35.9-gke.1180000"]}]}
 
 
+# run 26g: `gcloud services list --enabled --project P --format json`. The fixture is gcloud's answer for the bench
+# project on 2026-11-13 (config trimmed to name and title): 40 services, cloudresourcemanager.googleapis.com NOT
+# among them, which is what failed run 26g's TTL proof. The fakes answer, by FAKE_SERVICES:
+#   unset      the fixture plus cloudresourcemanager.googleapis.com, as the operator enables it after run 26g (a
+#              project the run works in); FAKE_SERVICES_DISABLED (comma-separated) and FAKE_IAP_DISABLED=1
+#              (iap.googleapis.com) leave those out;
+#   captured   the fixture as it is (the project run 26g ran in);
+#   empty      rc 0 and "[]", the shape a gcloud list gives when its request failed and it only warned;
+#   fail       rc 1 and gcloud's PERMISSION_DENIED line (it names the account: a placeholder here).
+SERVICES_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "services_enabled_20261113.json"
+ENABLED_AFTER_26G = ("cloudresourcemanager.googleapis.com", "Cloud Resource Manager API")
+
+
+def services_answer(env=None) -> tuple[int, str, str]:
+    """(rc, stdout, stderr) of `gcloud services list --enabled --format json` (above)."""
+    env = _env(env)
+    mode = env.get("FAKE_SERVICES", "")
+    if mode == "empty":
+        return 0, "[]\n", ""
+    if mode == "fail":
+        return 1, "", ("ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services for "
+                       "consumer container [projects/357378285144]. This command is authenticated as "
+                       "PLACEHOLDER-OPERATOR@example.invalid which is the active account specified by the "
+                       "[core/account] property.\n")
+    rows = json.loads(SERVICES_FIXTURE.read_text())
+    if mode != "captured":
+        name, title = ENABLED_AFTER_26G
+        rows.append({"config": {"name": name, "title": title}, "name": f"projects/357378285144/services/{name}",
+                     "parent": "projects/357378285144", "state": "ENABLED"})
+        off = {x for x in (env.get("FAKE_SERVICES_DISABLED") or "").split(",") if x}
+        if env.get("FAKE_IAP_DISABLED") == "1":
+            off.add("iap.googleapis.com")
+        rows = [r for r in rows if r["config"]["name"] not in off]
+    return 0, json.dumps(rows) + "\n", ""
+
+
 LOADER = (
     "import importlib.util as _ilu\n"
     f"_frs = _ilu.spec_from_file_location('fake_region', {str(Path(__file__).resolve())!r})\n"
@@ -211,4 +247,8 @@ LOADER = (
     "        rc, out, err = failed\n"
     "        _s.stdout.write(out); _s.stderr.write(err); _s.exit(rc)\n"
     "    print(_j.dumps(rows)); _s.exit(0)\n"
+    "def answer_services():\n"
+    "    import sys as _s\n"
+    "    rc, out, err = _frm.services_answer()\n"
+    "    _s.stdout.write(out); _s.stderr.write(err); _s.exit(rc)\n"
 )

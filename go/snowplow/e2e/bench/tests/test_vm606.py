@@ -73,7 +73,7 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
               "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL",
               "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL", "FAKE_NO_NODE_SA", "FAKE_ROLE_EXTRA_PERMISSIONS",
-              "FAKE_RC0_EMPTY", "FAKE_READ_DENIED"):
+              "FAKE_RC0_EMPTY", "FAKE_READ_DENIED", "FAKE_SERVICES", "FAKE_SERVICES_DISABLED", "FAKE_IAM_EXTRA_WRITE"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     # #1395: up and launch check the installer chart on the laptop (registry + helm); these tests are
@@ -267,7 +267,7 @@ def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, ca
     assert t0 + 15 * 3600 - 5 <= end <= time.time() + 15 * 3600 + 5
     want = {"title": f"snowplow-bench-{RUN}", "expression": f'request.time < timestamp("{tt}")',
             "description": f"vm606: expires with {VM} (owner=snowplow-bench, run={RUN})"}
-    proj = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
+    proj = fake_vm606.without_node_sa(fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"])
     assert sorted(b["role"] for b in proj) == sorted(PROJECT_ROLES)
     assert all(b["members"] == [SA] and b["condition"] == want for b in proj)
     bucket = fake_vm606.policy(fake, "bucket-" + BUCKET[len("gs://"):])["bindings"]      # #1390
@@ -838,7 +838,8 @@ def test_down_deletes_the_vm_disk_rules_and_only_its_own_grants_and_verifies(fak
     assert rc == 0, err
     assert not (fake / "instances" / f"{VM}.json").exists() and not (fake / "disks" / f"{VM}.json").exists()
     assert list((fake / "firewalls").glob("*.json")) == []
-    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL]
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL,
+                                                                          *fake_vm606.NODE_SA_BINDINGS]
     assert fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"] == []
     assert f"{VM} gone and verified: disk(s) ['{VM}']" in out and "2 firewall rule(s), 9 conditional grant(s)" in out
     lists = [c for c in fake_vm606.calls(fake) if c["argv"][2:3] == ["list"]]
@@ -860,7 +861,8 @@ def test_down_after_the_vms_ttl_still_removes_its_rules_and_grants(fake, capsys,
     rc, out, err = _run(capsys, "down", "--run", RUN, "--yes")
     assert rc == 0, err
     assert "already gone" in out and list((fake / "firewalls").glob("*.json")) == []
-    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL]
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == [OTHER, UNCONDITIONAL,
+                                                                          *fake_vm606.NODE_SA_BINDINGS]
 
 
 def test_down_dry_deletes_nothing(fake, capsys, monkeypatch):
@@ -1012,7 +1014,7 @@ def test_two_launches_at_once_down_of_one_never_touches_the_other(fake, capsys, 
     before = {"inst": (fake / "instances" / f"{vm24}.json").read_text(),
               "rules": sorted(p.name for p in (fake / "firewalls").glob(f"{vm24}-*.json")),
               "proj": [b for b in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
-                       if b["condition"]["title"] == "snowplow-bench-run24"],
+                       if (b.get("condition") or {}).get("title") == "snowplow-bench-run24"],
               "sa": [b for b in fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"]
                      if b["condition"]["title"] == "snowplow-bench-run24"]}
     assert len(before["rules"]) == 2 and len(before["proj"]) == 6 and len(before["sa"]) == 1
@@ -1021,11 +1023,11 @@ def test_two_launches_at_once_down_of_one_never_touches_the_other(fake, capsys, 
     assert not (fake / "instances" / f"{VM}.json").exists()
     assert (fake / "instances" / f"{vm24}.json").read_text() == before["inst"]
     assert sorted(p.name for p in (fake / "firewalls").glob("*.json")) == before["rules"]
-    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == before["proj"]
+    assert fake_vm606.without_node_sa(fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]) == before["proj"]
     assert fake_vm606.policy(fake, f"sa-{NODE_SA}")["bindings"] == before["sa"]
     rc, _out, err = _run(capsys, "down", "--run", "run24", "--yes")
     assert rc == 0, err
-    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == []
+    assert fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"] == fake_vm606.NODE_SA_BINDINGS
 
 
 def test_two_launches_at_once_fetch_of_one_never_touches_the_other(fake, capsys, monkeypatch):
@@ -1067,7 +1069,7 @@ def _in_use(fake, how):
     elif how == "instance-label-only":
         fake_vm606.put_instance(fake, "snowplow-bench-orch-x", LABELS, _in(3), zone="europe-west1-b")
     elif how == "rule":
-        fake_vm606.put_policy(fake, f"project-{PROJECT}", [])
+        fake_vm606.put_policy(fake, f"project-{PROJECT}", fake_vm606.NODE_SA_BINDINGS)
         fake_vm606.put_rule(fake, RUN, f"{VM}-iap-ssh")
     elif how == "binding":
         fake_vm606.put_policy(fake, f"sa-{NODE_SA}", [{"role": "roles/iam.serviceAccountUser", "members": [SA],
@@ -1089,7 +1091,8 @@ def test_up_refuses_a_run_name_in_use_before_granting_anything(fake, capsys, mon
 
 @pytest.mark.parametrize("key", [f"{k}-{r}" for k, r in vm606.grant_policies(PROJECT)])
 def test_up_refuses_while_the_sa_holds_an_unconditional_binding(fake, capsys, monkeypatch, key):
-    fake_vm606.put_policy(fake, key, [{"role": "roles/compute.viewer", "members": [SA]}])
+    fake_vm606.put_policy(fake, key, [{"role": "roles/compute.viewer", "members": [SA]},
+                                      *fake_vm606.policy(fake, key)["bindings"]])    # (node-sa's kept)
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 2 and "holds unconditional binding(s): roles/compute.viewer on" in err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
@@ -1577,12 +1580,12 @@ def _break(fake, how):
     elif how == "binding-extra":
         pol = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
         title = f"snowplow-bench-{RUN}"
-        cond = next(b["condition"] for b in pol if b["condition"]["title"] == title)
+        cond = next(b["condition"] for b in pol if (b.get("condition") or {}).get("title") == title)
         fake_vm606.put_policy(fake, f"project-{PROJECT}", pol + [{"role": "roles/owner", "members": [SA],
                                                                   "condition": cond}])
     elif how == "binding-other-expiry":
         pol = fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
-        b = pol[0]
+        b = next(b for b in pol if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}")
         b["condition"] = {**b["condition"], "expression": 'request.time < timestamp("2026-12-31T00:00:00Z")'}
         fake_vm606.put_policy(fake, f"project-{PROJECT}", pol)
     elif how == "unconditional":

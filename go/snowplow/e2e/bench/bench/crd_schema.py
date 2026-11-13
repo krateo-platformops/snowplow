@@ -12,7 +12,10 @@ requires. The dry pass could not see it. Now it can:
      component (pin `kind` ending in `Crds`: AuthnCrds, SnowplowCrds, ...),
      pulled at the PINNED version from the pin's `repo` (else the installer's
      `ociRepo`), as the installer's own CompositionDefinitions resolve them
-     (templates/definitions.yaml).
+     (templates/definitions.yaml). One on ghcr.io is fetched in-process with
+     the ghcr pull token (--ghcr-env-file, by path), as the registry step
+     reads every chart (run 26g: an anonymous helm pull answered the private
+     kagent-crds with 401); any other with helm pull.
    CRD files are read as the chart ships them. A file that is templated
    (`{{`) AND declares a CustomResourceDefinition is recorded unread: it
    would need the installer's values to render.
@@ -115,15 +118,55 @@ def crd_sources(installer_dir: str) -> list[dict]:
     return out
 
 
-def pull(src: dict, workdir: str, run=subprocess.run, budget=None) -> dict:
-    """helm pull --untar at the pinned version into its own directory; the
-    pulled Chart.yaml must carry that version. Through bench/noanswer.py (run 26):
-    no answer is asked again within `budget` (the caller extends it by every
-    pull's share); `no_answer` says the error is that, not the registry's."""
+def on_ghcr(src: dict) -> bool:
+    """A pinned chart on the registry the ghcr pull token authenticates (an OCI ref there, not a chart repo's)."""
+    from bench import ghcr_pull
+    return not src.get("repo") and str(src.get("ref") or "").startswith(f"oci://{ghcr_pull.REGISTRY_HOST}/")
+
+
+def pull_share(src: dict) -> float:
+    """One pull's share of the registry reads' bound: an in-process ghcr fetch, or a helm read."""
+    from bench import ghcr_pull, noanswer
+    return ghcr_pull.FETCH_CHART_BOUND_S if on_ghcr(src) else noanswer.helm_read_bound()
+
+
+def _pull_ghcr(src: dict, dest: str, creds: tuple[str, str] | None, budget) -> dict:
+    """Run 26g: a chart on ghcr.io is fetched in-process WITH the ghcr pull token, as the registry step reads
+    every chart (bench.ghcr_pull.pull_chart: the token never enters argv, a file or a log); an anonymous helm
+    pull answered kagent-crds' private chart with 401. Its archive is kept as `<chart>-<version>.tgz` (read as a
+    packaged chart). No answer is asked again while `budget` holds another whole fetch."""
+    from bench import ghcr_pull
+    if creds is None:
+        return dict(src, error=f"{src['ref']} is on {ghcr_pull.REGISTRY_HOST} and no ghcr pull credential was "
+                               f"given (--ghcr-env-file): not pulled")
+    while True:
+        got = ghcr_pull.pull_chart(src["ref"], src["version"], *creds, budget=budget)
+        if not isinstance(got, str):
+            break
+        if not got.no_answer:
+            return dict(src, error=f"ghcr pull failed: {got}")
+        if budget is None or not budget.holds(ghcr_pull.FETCH_CHART_BOUND_S):
+            return dict(src, error=f"no answer from the ghcr fetch of {got}", no_answer=True)
+    data, meta = got
+    if str((meta or {}).get("version")) != src["version"]:
+        return dict(src, error=f"pulled version {str((meta or {}).get('version'))!r} != pinned {src['version']!r}")
+    path = os.path.join(dest, f"{src['chart']}-{src['version']}.tgz")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return dict(src, path=path)
+
+
+def pull(src: dict, workdir: str, run=subprocess.run, budget=None, creds: tuple[str, str] | None = None) -> dict:
+    """The pinned chart, at its version, into its own directory: from ghcr.io in-process with the pull token
+    `creds` (_pull_ghcr), else helm pull --untar; the pulled Chart.yaml must carry that version. Through
+    bench/noanswer.py (run 26): no answer is asked again within `budget` (the caller extends it by every
+    pull's share, pull_share); `no_answer` says the error is that, not the registry's."""
     from bench import noanswer
     dest = os.path.join(workdir, f"{src['chart']}-{src['version']}")
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest)
+    if on_ghcr(src):
+        return _pull_ghcr(src, dest, creds, budget)
     argv = ["helm", "pull", src["ref"], "--version", src["version"], "--untar", "-d", dest]
     if src.get("repo"):
         argv += ["--repo", src["repo"]]
@@ -478,16 +521,19 @@ def _installer_dir(pulled: str) -> str:
     return os.path.join(pulled, sub[0])
 
 
-def pull_all(srcs: list[dict], workdir: str, budget_file: str | None, run=subprocess.run) -> list[dict]:
-    """Every pinned CRD chart pulled (pull), in parallel, within the run's one bound of its
-    pre-cluster registry reads (`budget_file`, bench/noanswer.py Budget.shared), extended here by
-    every pull's share: a pull with no answer is asked again while it holds another."""
+def pull_all(srcs: list[dict], workdir: str, budget_file: str | None, run=subprocess.run,
+             creds: tuple[str, str] | None = None) -> list[dict]:
+    """Every pinned CRD chart pulled (pull; a ghcr.io one with the ghcr pull token `creds`), in parallel,
+    within the run's one bound of its pre-cluster registry reads (`budget_file`, bench/noanswer.py
+    Budget.shared), extended here by every pull's share: a pull with no answer is asked again while it
+    holds another."""
     from bench import noanswer
     budget = noanswer.Budget.shared(budget_file) if budget_file else None
     if budget is not None:
-        budget.extend(sum(1 for s in srcs if s["from"] == "pin") * noanswer.helm_read_bound())
+        budget.extend(sum(pull_share(s) for s in srcs if s["from"] == "pin"))
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        return list(ex.map(lambda s: pull(s, workdir, run=run, budget=budget) if s["from"] == "pin" else s, srcs))
+        return list(ex.map(lambda s: pull(s, workdir, run=run, budget=budget, creds=creds) if s["from"] == "pin"
+                           else s, srcs))
 
 
 def main(argv=None) -> int:
@@ -508,11 +554,19 @@ def main(argv=None) -> int:
     c.add_argument("--full-widen", action="store_true", help="the #1004 stage runs (BENCH_1004_GO)")
     c.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
                    "(bench/noanswer.py Budget.shared)")
+    c.add_argument("--ghcr-env-file", required=True,
+                   help="the ghcr pull token file (bench/ghcr_pull.py), by path: the CRD charts on ghcr.io are "
+                        "fetched with it, as the registry step reads every chart (run 26g); never printed")
     a = ap.parse_args(argv)
+    from bench import ghcr_pull
+    why = ghcr_pull.check(a.ghcr_env_file)
+    if why:
+        print(f"refusing: the ghcr pull token: {why}", file=sys.stderr)
+        return 2
     docs = run_documents(a)
     srcs = crd_sources(_installer_dir(a.installer_pulled))
     os.makedirs(a.workdir, exist_ok=True)
-    srcs = pull_all(srcs, a.workdir, a.budget_file)
+    srcs = pull_all(srcs, a.workdir, a.budget_file, creds=ghcr_pull.creds(a.ghcr_env_file))
     srcs = [read_crds(s) for s in srcs]
     if a.full_widen:
         from bench import full_widen
