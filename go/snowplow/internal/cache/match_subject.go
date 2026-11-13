@@ -33,18 +33,55 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
-// systemAuthenticatedGroup is the canonical implicit-group name the
-// Kubernetes apiserver injects into every authenticated request. Mirrored
-// from upstream rbac evaluation; used by the prewarm enumerator to skip
-// the universal-authenticated Group-only cohort (every authenticated user
-// carries it, so it is not a meaningful narrowing dimension).
+// The kube-apiserver's implicit identities (k8s.io/apiserver
+// pkg/authentication/user: AllAuthenticated, AllUnauthenticated, Anonymous).
+// match_subject.go is the canonical home for RBAC subject-matching primitives
+// (design §4.3). Which implicit group a request carries is decided ONLY by
+// ImplicitGroup below: nothing in snowplow may assume that every requester is
+// authenticated (#1334).
+const (
+	systemAuthenticatedGroup   = "system:authenticated"
+	systemUnauthenticatedGroup = "system:unauthenticated"
+	systemAnonymousUser        = "system:anonymous"
+)
+
+// ImplicitGroup returns the one group the kube-apiserver adds to a request
+// whose user is username and whose groups are groups, or "" when it adds none.
+// It is the apiserver's own rule, which both of its paths apply identically
+// (k8s.io/apiserver v0.36.5 — the module's pin — and v0.37.2, same lines):
 //
-// Pre-Ship-S.2 (Phase 2 step 2a) this constant lived in
-// binding_set_enumeration.go; that file was deleted in Phase 2 step 1
-// (commit 1d93d02). The constant moves here because the H.c-layered
-// design positions match_subject.go as the canonical home for RBAC
-// subject-matching primitives (design §4.3).
-const systemAuthenticatedGroup = "system:authenticated"
+//   - authentication: pkg/authentication/group/authenticated_group_adder.go
+//     AuthenticateRequest adds system:authenticated unless the user is
+//     system:anonymous or the groups already hold system:authenticated or
+//     system:unauthenticated. A real anonymous request is authenticated by
+//     pkg/authentication/request/anonymous as system:anonymous with exactly
+//     [system:unauthenticated], and the adder leaves it alone.
+//   - impersonation: pkg/endpoints/filters/impersonation/impersonation.go
+//     126-144 applies the same rule to an impersonated non-anonymous user, and
+//     145-157 adds system:unauthenticated to an impersonated system:anonymous
+//     unless it is already present.
+//
+// The rule does not special-case an empty username (the apiserver never sees
+// one). Snowplow's evaluator separately treats Username=="" as "no requester"
+// and matches no implicit group for it (rbac.anySubjectMatches); the prewarm
+// group representative ({"", [g]}) gets system:authenticated explicitly via
+// WithAuthenticatedGroup, exactly as a real member of g would.
+func ImplicitGroup(username string, groups []string) string {
+	if username == systemAnonymousUser {
+		for _, g := range groups {
+			if g == systemUnauthenticatedGroup {
+				return ""
+			}
+		}
+		return systemUnauthenticatedGroup
+	}
+	for _, g := range groups {
+		if g == systemAuthenticatedGroup || g == systemUnauthenticatedGroup {
+			return ""
+		}
+	}
+	return systemAuthenticatedGroup
+}
 
 // SubjectIdentity is the minimal subject shape consumed by the RBAC
 // evaluator. Equivalent in surface to k8s authn/v1.UserInfo's required

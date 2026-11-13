@@ -189,7 +189,7 @@ func TestIssue435_B_RoleRulesRevokeBetweenRequests(t *testing.T) {
 		t.Fatalf("SETUP: alice (granted) must see the row; err=%v", err)
 	}
 	_, keyBefore, _ := seedFullListRAKey(carol, gvr(), ns, name, nil)
-	sgBefore := cache.RBACSubGenForSubject("carol-423", rbac.WithAuthenticatedGroup([]string{"portal-423"}))
+	sgBefore := cache.RBACSubGenForSubject("carol-423", rbac.WithAuthenticatedGroup("carol-423", []string{"portal-423"}))
 
 	// Role-rules revoke: the Role keeps its name (binding set unchanged), loses the rule.
 	role.Rules = []rbacv1.PolicyRule{{Verbs: []string{"get"}, APIGroups: []string{""}, Resources: []string{"secrets"}}}
@@ -207,7 +207,7 @@ func TestIssue435_B_RoleRulesRevokeBetweenRequests(t *testing.T) {
 		}
 	}
 	_, keyAfter, _ := seedFullListRAKey(carol, gvr(), ns, name, nil)
-	sgAfter := cache.RBACSubGenForSubject("carol-423", rbac.WithAuthenticatedGroup([]string{"portal-423"}))
+	sgAfter := cache.RBACSubGenForSubject("carol-423", rbac.WithAuthenticatedGroup("carol-423", []string{"portal-423"}))
 	t.Logf("raKey moved=%v (restactions/widgets key would move: subgen %d -> %d)", keyAfter != keyBefore, sgBefore, sgAfter)
 
 	before := calls.Load()

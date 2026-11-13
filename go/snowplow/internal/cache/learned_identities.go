@@ -163,7 +163,7 @@ func WasLearnedUsername(username string) bool {
 // so records its representative, with system:authenticated added, #424),
 // \x00-separated. Never logged.
 func LearnedClassKey(username string, groups []string) string {
-	g := append([]string(nil), WithAuthenticatedGroup(groups)...)
+	g := append([]string(nil), WithAuthenticatedGroup(username, groups)...)
 	sort.Strings(g)
 	return username + "\x00" + strings.Join(g, "\x00")
 }
