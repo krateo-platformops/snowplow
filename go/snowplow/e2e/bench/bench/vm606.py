@@ -876,6 +876,10 @@ def cmd_plan_iam(a) -> int:
         for u in uses:
             _say(f"   - {u}")
     _say("")
+    _say(f"the evidence bucket {bucket_url(a.project)} (#1390): one per project, in {EVIDENCE_LOCATION} (the bench's "
+         f"default region) whatever region a run uses, so up's read-back verifies its location exactly; a VM in "
+         f"another region pays cross-region egress for its copies (a few cents a run)")
+    _say("")
     _say("not needed:")
     for n in NOT_NEEDED:
         _say(f"   - {n}")

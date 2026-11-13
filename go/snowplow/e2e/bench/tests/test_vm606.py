@@ -148,6 +148,7 @@ def test_plan_iam_derives_the_roles_from_the_code_and_changes_nothing(fake, caps
                 f"--condition-from-file iam-condition.json") in cmds
         assert not any(f"projects add-iam-policy-binding {PROJECT} --member {SA} --role {r}" in c for c in cmds)
     assert f"roles/storage.objectCreator  (ON {BUCKET} only)" in out
+    assert f"the evidence bucket {BUCKET} (#1390): one per project, in europe-west4" in out
     assert '"expression": "request.time < timestamp(' in out and '"title": "snowplow-bench-<run>"' in out
     assert "krateo-057 included" in out                                   # container.admin's reach, stated
     assert "resourcemanager.projects.setIamPolicy" in out and "compute.securityAdmin" in out
