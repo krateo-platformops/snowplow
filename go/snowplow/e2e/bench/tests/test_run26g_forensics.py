@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -100,6 +101,30 @@ def test_a_node_sa_pods_calls_are_read_from_its_manifests():
     assert got["unmapped"] == ["gcloud logging (a pod): no API mapped (GCLOUD_API)"]
 
 
+def test_the_clusters_logging_and_monitoring_apis_are_read_from_its_create_argv():
+    """bench.gke creates the cluster with --logging SYSTEM --monitoring SYSTEM: its nodes then write to Cloud Logging
+    and Cloud Monitoring as the node SA, so both APIs are required, read from the argv gke builds (one source)."""
+    apis = gcp_apis.required()["apis"]
+    for flag, api in (("--logging", "logging.googleapis.com"), ("--monitoring", "monitoring.googleapis.com")):
+        assert apis[api] == [f"GKE node SA: container clusters create {flag} SYSTEM (bench.gke.create_commands)"]
+    # read from the argv, never a list: a flag set to NONE (either spelling) or left out requires nothing
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--logging=NONE",
+                                      "--monitoring", "SYSTEM,API_SERVER"]])["apis"]
+    assert "logging.googleapis.com" not in got
+    assert got["monitoring.googleapis.com"] == [
+        "GKE node SA: container clusters create --monitoring SYSTEM,API_SERVER (bench.gke.create_commands)"]
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--monitoring", "NONE"]])
+    assert not {"logging.googleapis.com", "monitoring.googleapis.com"} & set(got["apis"])
+
+
+def test_a_disabled_logging_api_refuses_naming_the_node_sa():
+    with pytest.raises(gcp_apis.Refused) as e:
+        gcp_apis.check("operations-dev-krateo-io",
+                       run=_services({"FAKE_SERVICES_DISABLED": "logging.googleapis.com"}))
+    assert ("logging.googleapis.com is not enabled (called by GKE node SA: container clusters create --logging "
+            "SYSTEM (bench.gke.create_commands))") in str(e.value)
+
+
 def test_with_the_projects_services_of_run_26g_the_check_refuses_naming_cloudresourcemanager():
     """The project's listing on 2026-11-13 (tests/fixtures/services_enabled_20261113.json): every API the run calls
     is enabled but the TTL proof's, and the refusal names it, who calls it and how to enable it."""
@@ -146,18 +171,41 @@ def test_the_read_sets_the_partial_error_property_false(tmp_path, monkeypatch):
     assert (tmp_path / "env").read_text().strip() == "false"
 
 
+class _NoRefusal(BaseException):
+    """up did not return within its bound (a BaseException, so no `except Exception` in up swallows it)."""
+
+
+#: how long `vm606 up` may take to refuse at its first check: it refuses in about a second against the fakes. An up
+#: that got past the check goes on to make and wait for a VM (a reviewer's mutation hung there for 34 minutes):
+#: that fails here, fast, never as a hang.
+UP_REFUSES_WITHIN_S = 60
+
+
+def _up_bounded(capsys, *argv):
+    """_run(capsys, "up", *argv), failed by SIGALRM if it has not returned within UP_REFUSES_WITHIN_S."""
+    def boom(*_):
+        raise _NoRefusal(f"vm606 up did not return within {UP_REFUSES_WITHIN_S} s: it went past the API check")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(UP_REFUSES_WITHIN_S)
+    try:
+        return _run(capsys, "up", *argv)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 @pytest.mark.parametrize("yes", [True, False])
 def test_vm606_up_refuses_before_anything_while_an_api_is_disabled(fake, capsys, monkeypatch, yes):  # noqa: F811
     monkeypatch.setenv("FAKE_SERVICES", "captured")
-    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15",
-                         *(["--yes"] if yes else []))
+    rc, _out, err = _up_bounded(capsys, "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15",
+                                *(["--yes"] if yes else []))
     assert rc == 2 and f"{CRM} is not enabled (called by GKE node SA" in err, err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or "create" in v or "delete" in v]
 
 
 def test_vm606_up_refuses_an_empty_services_answer(fake, capsys, monkeypatch):  # noqa: F811
     monkeypatch.setenv("FAKE_SERVICES", "empty")
-    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes")
+    rc, _out, err = _up_bounded(capsys, "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes")
     assert rc == 2 and "could not be read" in err and "never 'nothing disabled'" in err
     assert not [v for v in _verbs(fake) if "create" in v or "add-iam-policy-binding" in v]
 

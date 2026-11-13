@@ -17,7 +17,7 @@ import yaml
 
 from bench import diag606, installer_src
 from tests.test_run606_real_sequence import (  # noqa: F401  (fixture import)
-    BENCH_DIR, KCTX, RUN_NAME, _calls, harness)
+    BENCH_DIR, KCTX, PROJECT, RUN_NAME, _calls, harness)
 
 
 def _chart(tmp_path, *, feature="portal", obs_deps=("alert-provider-crd",),
@@ -192,7 +192,10 @@ def test_registry_preflight_refuses_before_any_cluster_call(harness, envkv, need
     assert p.returncode != 0
     assert "installer registry preflight REFUSED" in p.stderr and needle in p.stderr
     calls = _calls(state)
-    assert not [c for c in calls if c["tool"] in ("gcloud", "kubectl")]
+    # the one GCP call before it: the run's first step (`apis`, run 26g) reads which Google APIs the project has
+    # enabled, read-only, exactly this argv; no other gcloud call and no kubectl call happens before the refusal
+    assert [(c["tool"], c["argv"]) for c in calls if c["tool"] in ("gcloud", "kubectl")] == [
+        ("gcloud", ["services", "list", "--enabled", "--project", PROJECT, "--format", "json"])]
     assert all(c["argv"][:1] in (["show"], ["pull"]) for c in calls if c["tool"] == "helm")
     assert "teardown" not in p.stderr
 

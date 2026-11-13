@@ -17,14 +17,16 @@ WHO CALLS WHAT, read from the code (`required`), never from a list kept by hand:
   - the GKE node SA: what the in-cluster pods that run as it do, read from the manifests bench.gke renders for
     them (the ttl-self-destruct CronJob, the TTL proof Job): their gcloud calls and REST URLs; and every REST
     constant NODE_SA_REST names (the one source of which URLs only the node SA requests; bench.vm606's plan-iam
-    reads it too).
+    reads it too); and what the cluster create argv bench.gke builds makes the nodes send as the node SA
+    (CLUSTER_FLAG_API: --logging SYSTEM, --monitoring SYSTEM: GKE's system logging and monitoring agents).
 A gcloud command group no entry of GCLOUD_API maps (a call the derivation cannot place) refuses the check by name:
 the set is never silently short.
 
 THE CHECK (`check`): one read-only `gcloud services list --enabled` of the project. An answer that is not a
 non-empty JSON list of services is a refusal, never "nothing disabled": gcloud's list commands can exit 0 with an
-empty answer when their request failed (CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR is set false on the call all the
-same). Each API the run calls that is not ENABLED is named, with who calls it and where, and the run refuses.
+empty answer when their request failed (bench.gke.COMPUTE_LIST_ENV, the partial-error property set false, is on
+the call all the same). Each API the run calls that is not ENABLED is named, with who calls it and where, and the
+run refuses.
 
 WHERE: bench.vm606 `up` (dry or not, before any grant, rule, bucket or VM: its _project_ready) and run606.sh's
 `apis` step, its first, before any cluster (its dry pass derives the set offline and reads nothing from GCP, as
@@ -64,6 +66,9 @@ GCLOUD_API: dict[str, str | None] = {
 #: a gcloud flag or a VM setting (as the code writes it, quoted) -> the API it makes gcloud call: an SSH / scp
 #: through an IAP tunnel, and OS Login's key import on an instance with enable-oslogin
 FLAG_API = {"--tunnel-through-iap": "iap.googleapis.com", "enable-oslogin": "oslogin.googleapis.com"}
+#: a flag of the cluster create argv bench.gke builds -> the API the cluster's nodes then write to as the GKE node SA
+#: (GKE's system logging and monitoring agents), unless its value is NONE (the cluster then sends nothing there)
+CLUSTER_FLAG_API = {"--logging": "logging.googleapis.com", "--monitoring": "monitoring.googleapis.com"}
 #: a URL on the www host of googleapis.com names its API by its first path segment (www.googleapis.com/compute/v1:
 #: compute.googleapis.com), except an OAuth scope (www.googleapis.com/auth/...)
 WWW_NOT_API = frozenset({"auth"})
@@ -107,7 +112,15 @@ def node_sa_manifests() -> list[tuple[str, str]]:
             ("the TTL proof Job (bench.gke.ttl_proof_manifest)", gke.ttl_proof_manifest(spec))]
 
 
-def required(bench_dir: Path = BENCH_DIR, manifests=None) -> dict:
+def cluster_creates() -> list[list[str]]:
+    """The gcloud argv lists bench.gke runs to create a bench cluster and its node pools (create_commands)."""
+    spec = gke.default_spec(gke.BENCH_NAME_PREFIX + "apis")
+    # (indexed, not compared to an argv literal: a literal here would read as a call of this module's own to
+    # vm606's plan-iam scan and to `required`)
+    return [c for c in gke.create_commands(spec) if c[1:2] == ["container"] and c[3:4] == ["create"]]
+
+
+def required(bench_dir: Path = BENCH_DIR, manifests=None, creates=None) -> dict:
     """{"apis": {api: [who: what (where)]}, "unmapped": [text]}: every Google API the run calls (module doc)."""
     apis: dict[str, set[str]] = {}
     unmapped: list[str] = []
@@ -151,6 +164,14 @@ def required(bench_dir: Path = BENCH_DIR, manifests=None) -> dict:
             group(m.group(1), NODE_SA, what)
         for m in _REST.finditer(text):
             add(_rest_api(m.group(1), m.group(2)), NODE_SA, f"REST {m.group(1)}.googleapis.com ({what})")
+    for argv in (cluster_creates() if creates is None else creates):
+        for i, a in enumerate(argv):
+            flag, eq, val = a.partition("=")
+            if flag in CLUSTER_FLAG_API:
+                val = val if eq else (argv[i + 1] if i + 1 < len(argv) else "")
+                if val.upper() != "NONE":
+                    add(CLUSTER_FLAG_API[flag], NODE_SA,
+                        f"{' '.join(argv[1:4])} {flag} {val} (bench.gke.create_commands)")
     return {"apis": {a: sorted(w) for a, w in sorted(apis.items())}, "unmapped": sorted(set(unmapped))}
 
 
