@@ -154,8 +154,14 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=300)
     out = p.stdout + p.stderr
-    assert p.returncode != 0 and ("registry FAILED" in out or "refusing: " in out) and why in out, out[-2000:]
-    assert "=== step registry ===" in out and "=== step up ===" not in out
+    # run 26g: the schema step reads the ghcr.io CRD charts with the token first, so a token (or a registry API)
+    # that reads no chart at all is refused there, by the same cause; any other case reaches the registry step
+    if case in ("bad_token", "network", "http", "redirect"):
+        assert p.returncode != 0 and "schema FAILED" in out and why in out, out[-2000:]
+        assert "=== step registry ===" not in out and "=== step up ===" not in out
+    else:
+        assert p.returncode != 0 and ("registry FAILED" in out or "refusing: " in out) and why in out, out[-2000:]
+        assert "=== step registry ===" in out and "=== step up ===" not in out
     assert not any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "create"]
                    for c in _calls(state))
     for what, v in _leaks().items():
