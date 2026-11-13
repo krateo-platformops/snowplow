@@ -133,8 +133,12 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "endpoint": "127.0.0.1",    # the server get-credentials writes below
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
+                          # #1383 gap 7: the versions GKE gave it (FAKE_GKE_VERSION: another patch)
+                          "currentMasterVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,
+                          "currentNodeVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,
                           "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
-                                         "locations": ["europe-west4-a"]}
+                                         "locations": ["europe-west4-a"],
+                                         "version": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION}
                                         for n, m, c in (("default-pool", "n2-standard-8", 3),
                                                         ("snowplow", "n2-standard-8", 1),
                                                         ("loadgen", "n2-standard-8", 1))],

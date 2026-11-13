@@ -35,6 +35,7 @@ from statistics import NormalDist
 import pytest
 
 from bench import custlat
+from tests import fake_region
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
@@ -42,6 +43,9 @@ REPLICA_FILE = BENCH / "customer_latency_replica_runs12_13.json"
 REPLICA = custlat.load_replica(str(REPLICA_FILE))
 with gzip.open(FIX / "customer_latency_run20_pair.json.gz", "rt") as fh:
     R20 = json.load(fh)
+# #1383 gap 7: each arm's cluster shape with its GKE versions (run 20 predates the record)
+for _x in ("a", "b"):
+    R20[_x]["report"]["cluster_shape"] = fake_region.cluster_shape()
 P99 = "customer_latency.pair[steady].p99_ms"
 
 

@@ -306,7 +306,10 @@ def observed_shape(describe: dict) -> dict:
     clusters describe` AFTER create (#899 F1): where GKE put the control plane
     (`location`: a region → regional, a zone → zonal), where it put the nodes
     (`locations`) and how many there are (`currentNodeCount`) — not what the
-    spec asked for."""
+    spec asked for. #1383 gap 7: and the GKE versions GKE gave it (create asks
+    for a minor; GKE picks the patch): the control plane's
+    (`currentMasterVersion`), the nodes' (`currentNodeVersion`) and each
+    pool's (`version`); the pair compares them (shape_versions)."""
     loc = describe.get("location") or describe.get("zone") or ""
     return {"kind": "cluster_shape", "source": "gcloud container clusters describe, after create",
             "control_plane": "zonal" if _is_zone(loc) else ("regional" if loc else None),
@@ -314,11 +317,29 @@ def observed_shape(describe: dict) -> dict:
             "node_locations": list(describe.get("locations") or []),
             "current_node_count": describe.get("currentNodeCount"),
             "cluster": describe.get("name"),
+            "master_version": describe.get("currentMasterVersion"),
+            "node_version": describe.get("currentNodeVersion"),
             "node_pools": [{"name": p.get("name"),
                             "machine_type": (p.get("config") or {}).get("machineType"),
                             "locations": list(p.get("locations") or []),
-                            "nodes_per_location": p.get("initialNodeCount")}
+                            "nodes_per_location": p.get("initialNodeCount"),
+                            "version": p.get("version")}
                            for p in describe.get("nodePools") or []]}
+
+
+def shape_versions(shape: dict | None) -> dict | None:
+    """The GKE versions a cluster-shape record (observed_shape) holds:
+    {"master": <currentMasterVersion>, "nodes": [<each distinct node version>]},
+    the nodes' from every pool's own version (the cluster's currentNodeVersion
+    when the record lists no pool). None when any is unrecorded: a dry run's
+    spec, an unobserved shape, a record made before #1383."""
+    if not isinstance(shape, dict) or not shape.get("master_version"):
+        return None
+    pools = shape.get("node_pools") or []
+    nodes = [p.get("version") for p in pools] if pools else [shape.get("node_version")]
+    if not nodes or not all(nodes):
+        return None
+    return {"master": shape["master_version"], "nodes": sorted(set(nodes))}
 
 
 def unobserved_shape(spec: ClusterSpec, why: str) -> dict:
@@ -2522,9 +2543,12 @@ def cmd_gke_shape(a) -> int:
     if rec["control_plane"] is None:
         say(f"cluster shape UNKNOWN: {rec['source']}")
     else:
+        v = shape_versions(rec)
         say(f"cluster shape ({rec['source']}): control plane {rec['control_plane']} "
             f"({rec.get('location') or rec.get('region')}); nodes in {','.join(rec['node_locations']) or '?'}"
-            + (f"; {rec['current_node_count']} nodes" if rec.get("current_node_count") is not None else ""))
+            + (f"; {rec['current_node_count']} nodes" if rec.get("current_node_count") is not None else "")
+            + (f"; GKE {v['master']} (control plane), {', '.join(v['nodes'])} (nodes)" if v
+               else "; GKE versions unrecorded"))
     print(json.dumps(rec))
     return 0
 

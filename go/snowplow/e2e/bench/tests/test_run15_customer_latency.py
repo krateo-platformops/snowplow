@@ -91,7 +91,9 @@ def _write_run(d: Path, doc=P14, scale=lambda t, v: v, drop=lambda t: False, con
                                  "data": {"time": _iso(t), "value": v, "tags": {"scenario": "navigate"}}}) + "\n")
     (d / "k6" / "k6-summary.json").write_text(json.dumps({"config": config or doc["config"]}))
     (d / "browser" / "browser-summary.json").write_text(json.dumps({"sessions": doc["browser_sessions"]}))
+    # #1383 gap 7: the cluster's shape, with the GKE versions the pair compares (gke-shape's record)
     files = {"mem-x.jsonl": doc["mem"], "fresh-x.jsonl": doc["churns"], "top.jsonl": doc["tops"],
+             "cluster-shape.jsonl": [fake_region.cluster_shape()],
              **({"pod-x.jsonl": doc["pods"]} if doc.get("pods") else {}),
              **({"api-outages.jsonl": doc["api_outages"]} if doc.get("api_outages") else {})}
     for name, rows in files.items():
@@ -238,7 +240,8 @@ def _run14_pair(scale: dict, phases=("storm", "churn"), extra=None):
         gpb[p][m] = round(gpb[p][m] * k, 4)
 
     def v(gp, dig):
-        return {"verdict": "FAIL", "report": {"image_digest": {"expected": dig}, "customer_latency": {
+        return {"verdict": "FAIL", "report": {"image_digest": {"expected": dig},
+                                              "cluster_shape": fake_region.cluster_shape(), "customer_latency": {
             "gate_phases": gp, "phases": {}, "k6_span": [0, 100], "schedule": {}, **READY_NO_ERRORS,
             "windows": [["storm", float("-inf"), 10], ["churn:list_dep@1", 10, 90]]}}}
     return custlat.pair(v(gpa, DIG_A), v(gpb, DIG_B), replica=REPLICA)
@@ -299,7 +302,8 @@ def test_the_tolerance_is_the_method():
     def rep(sd, p95=100.0):
         ph = {"n": 10, "p95_ms": p95, "p99_ms": 200.0, "req_s": 50.0,
               "half_sd": {"p95_ms": sd, "p99_ms": sd, "req_s": sd}}
-        return {"verdict": "FAIL", "report": {"image_digest": {"expected": DIG_A}, "customer_latency": {
+        return {"verdict": "FAIL", "report": {"image_digest": {"expected": DIG_A},
+                                              "cluster_shape": fake_region.cluster_shape(), "customer_latency": {
             "gate_phases": {"storm": dict(ph), "churn": dict(ph)}, "phases": {}, "k6_span": [0, 100],
             "windows": [["storm", float("-inf"), 10], ["churn:list_dep@10", 10, 90]], "schedule": {},
             **READY_NO_ERRORS}}}
