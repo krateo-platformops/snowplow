@@ -444,17 +444,47 @@ def reap_commands(clusters: Iterable[dict], *, now: float,
 
 
 def list_command(project: str = DEFAULT_PROJECT) -> list[str]:
-    return ["gcloud", "container", "clusters", "list", "--project", project,
-            "--filter", "resourceLabels.purpose=snowplow-bench",
-            "--format", "json"]
+    """The reaper's list (#1383 gap 5): every cluster of the project, unfiltered. No label
+    --filter: gcloud applies one client-side and can answer [] with rc 0 (bench.gcevm's
+    SELECTION); expired_clusters selects by exact label equality (assert_deletable)."""
+    return all_clusters_command(project)
+
+
+# gcloud container clusters list answers rc 0 when a location did not respond: the API's
+# ListClustersResponse names it in `missingZones` and gcloud only warns (SDK 561,
+# surface/container/clusters/list.py: "The following zones did not respond: <zones>. List
+# results may be incomplete."). compute/allow_partial_error does not govern it (it is read by
+# the compute lister only), so the warning is the one signal the CLI gives: a list that
+# carries it is a failed read.
+_MISSING_ZONES = re.compile(r"did not respond.*may be\s+incomplete", re.S)
+
+
+def list_clusters(project: str, *, run=None) -> tuple[list[dict] | None, str]:
+    """(every cluster of the project, "") or (None, why the list is not known whole): fails
+    closed on a non-zero exit, an answer that is not a JSON list, and gcloud's missing-zones
+    warning (a list GKE says is incomplete)."""
+    run = run or execute
+    err: list[str] = []
+    argv = all_clusters_command(project)
+    rc, out = run(argv, dry_run=False, log=lambda _m: None, stderr_out=err)
+    got = _json(out) if rc == 0 else None
+    if not isinstance(got, list):
+        return None, (f"{' '.join(argv[:4])} " + (f"failed (rc={rc})" if rc else "answered no JSON list"))
+    if _MISSING_ZONES.search(err[-1] if err else ""):
+        return None, f"{' '.join(argv[:4])} answered with locations that did not respond: the list may be incomplete"
+    return got, ""
+
+
+def describe_argv(name: str, project: str, location: str) -> list[str]:
+    _check_name(name)
+    return ["gcloud", "container", "clusters", "describe", name,
+            "--project", project, *_location_flag(location), "--format", "json"]
 
 
 def describe_command(spec: ClusterSpec, location: str | None = None) -> list[str]:
     """`location`: the region (default), or the node zone for a zonal cluster
     made before run 17."""
-    return ["gcloud", "container", "clusters", "describe", spec.name,
-            "--project", spec.project, *_location_flag(location or spec.region),
-            "--format", "json"]
+    return describe_argv(spec.name, spec.project, location or spec.region)
 
 
 # ─── Endpoint resolution ────────────────────────────────────────────────────
@@ -1224,10 +1254,8 @@ def cluster_quota_check(project: str, zone: str, need: int, *, run=execute, fetc
     info, why = read_cluster_quota(project, run=run, fetch=fetch)
     if info is None:
         return False, f"GKE's {CLUSTER_QUOTA_ID} limit could not be read ({why}): whether the run fits is unknown"
-    rc, out = run(all_clusters_command(project), dry_run=False, log=lambda _m: None)
-    clusters = _json(out) if rc == 0 else None
-    return cluster_count_fit(cluster_limit(info, region), clusters if isinstance(clusters, list) else None,
-                             region, need)
+    clusters, _why = list_clusters(project, run=run)          # fails closed (#1383: missing zones too)
+    return cluster_count_fit(cluster_limit(info, region), clusters, region, need)
 
 
 def _kubectl(spec: ClusterSpec) -> list[str]:
@@ -2303,9 +2331,15 @@ def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline
     made before run 17) — polled THERE, or the region's describe 404s at once
     and the backstop runs while the nodes still hold the PVC disks (#896
     reviewer: a false "no disk left")."""
+    return _wait_gone(describe_command(spec, location), deadline=deadline, clock=clock, sleep=sleep)
+
+
+def _wait_gone(describe: list[str], *, deadline: float, clock: Callable[[], float],
+               sleep: Callable[[float], None]) -> bool:
+    """Poll one exact-name describe until GKE answers NotFound for it (True), or `deadline` (False)."""
     while True:
         err: list[str] = []
-        rc, _ = execute(describe_command(spec, location), dry_run=False, log=lambda _: None, stderr_out=err)
+        rc, _ = execute(describe, dry_run=False, log=lambda _: None, stderr_out=err)
         # the same NotFound test as the lookup (find_cluster): code=404 / NOT_FOUND only — a
         # looser match ("not found" anywhere, any 404) could run the disk backstop early (#907 N1)
         if rc != 0 and _NOT_FOUND.search(err[-1] if err else ""):
@@ -2543,17 +2577,53 @@ def cmd_gke_quotas(a) -> int:
     return 2 if refusals else 0
 
 
+def reap_expired(project: str, *, yes: bool, now: float, budget_s: float = DEFAULT_DOWN_BUDGET_S,
+         log: Callable[[str], None] = print, clock: Callable[[], float] = time.monotonic,
+         sleep: Callable[[float], None] = time.sleep) -> tuple[list[str], list[str]]:
+    """#1383 gap 5: delete every bench cluster past its TTL, each verified. One unfiltered,
+    fail-closed list (list_clusters); expired_clusters selects by exact labels; each delete's
+    exit code is read; then each cluster whose delete GKE accepted is polled by its exact-name
+    describe until NotFound, all within one `budget_s`. (reaped, problems): problems is empty
+    only when every expired cluster answered NotFound (a list that is not known whole, a
+    failed delete or a cluster still there at the deadline is one)."""
+    clusters, why = list_clusters(project)
+    if clusters is None:
+        return [], [f"the project's clusters could not be listed ({why}): whether any bench cluster is past its "
+                    f"TTL is unknown"]
+    expired = expired_clusters(clusters, now=now)
+    if not expired:
+        log("no expired bench clusters")
+        return [], []
+    problems: list[str] = []
+    asked: list[tuple[str, list[str]]] = []
+    for c in expired:
+        # `location` is the cluster's own (a region now; a zone for an older one)
+        loc = c.get("location") or c.get("zone") or region_of(DEFAULT_ZONE)
+        argv = delete_command(c["name"], project=project, location=loc)
+        rc, _ = execute(argv, dry_run=not yes, log=log)
+        if not yes:
+            continue
+        if rc != 0:
+            problems.append(f"{c['name']}: its delete failed (rc={rc}): it is still there, past its TTL")
+            continue
+        asked.append((c["name"], describe_argv(c["name"], project, loc)))
+    deadline = clock() + budget_s
+    reaped = []
+    for name, describe in asked:
+        if _wait_gone(describe, deadline=deadline, clock=clock, sleep=sleep):
+            log(f"reaped: {name} (past its TTL): deleted, its describe answers NotFound")
+            reaped.append(name)
+        else:
+            problems.append(f"{name}: {NOT_CONFIRMED_GONE}: its describe still answered when the {budget_s:g} s "
+                            f"budget ran out; check it with {' '.join(describe)}")
+    return reaped, problems
+
+
 def cmd_gke_reap(a) -> int:
-    rc, out = execute(list_command(a.project), dry_run=False)
-    if rc != 0:
-        return rc
-    cmds = reap_commands(json.loads(out or "[]"), now=time.time(),
-                         project=a.project)
-    if not cmds:
-        print("no expired bench clusters")
-    for argv in cmds:
-        execute(argv, dry_run=not a.yes)
-    return 0
+    _reaped, problems = reap_expired(a.project, yes=a.yes, now=time.time(), budget_s=a.budget_s)
+    for p in problems:
+        sys.stderr.write(f"gke-reap: {p}\n")
+    return 1 if problems else 0
 
 
 def cmd_gke_env(a) -> int:
@@ -2702,6 +2772,9 @@ def add_parsers(sub) -> None:
                                            "their TTL (dry run unless --yes)")
     reap.add_argument("--project", default=DEFAULT_PROJECT)
     reap.add_argument("--yes", action="store_true")
+    reap.add_argument("--budget-s", type=float, default=DEFAULT_DOWN_BUDGET_S,
+                      help="#1383: how long the reaped clusters may take to answer NotFound (default "
+                           f"{DEFAULT_DOWN_BUDGET_S:g} s)")
     reap.set_defaults(func=cmd_gke_reap)
 
     env = sub.add_parser("gke-env", help="#606: print SNOWPLOW_URL/AUTHN_URL/"

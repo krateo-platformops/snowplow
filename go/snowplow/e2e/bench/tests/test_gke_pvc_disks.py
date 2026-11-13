@@ -343,6 +343,10 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             "purpose": "snowplow-bench", "issue": "606", "created-by": "bench-gke", "owner": "t",
             "ttl-expires": "9999999999"}})); sys.exit(0)
     if a[:3] == ["container", "clusters", "delete"]:
+        with open(os.path.join(st, "cluster_deletes"), "a") as fh:
+            fh.write(a[3] + "\\n")
+        if os.environ.get("FAKE_CLUSTER_DELETE_RC"):           # #1383 gap 5: GKE refused the delete
+            sys.exit(int(os.environ["FAKE_CLUSTER_DELETE_RC"]))
         open(os.path.join(st, "deleted"), "w").write("1"); sys.exit(0)
     if a[:3] == ["compute", "disks", "list"]:
         if os.environ.get("FAKE_DISK_LIST_RC"):
@@ -443,7 +447,13 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
     if a[:3] == ["auth", "print-access-token"]:          # #985: the Cloud Quotas read
         print("fake-access-token"); sys.exit(0)
     if a[:3] == ["container", "clusters", "list"]:
-        print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
+        # #1383 gap 5: FAKE_MISSING_ZONES: GKE's ListClusters names locations that did not respond; gcloud 561
+        # (surface/container/clusters/list.py) prints what did answer, rc 0, and only warns
+        print(os.environ.get("FAKE_CLUSTERS", "[]"))
+        if os.environ.get("FAKE_MISSING_ZONES"):
+            sys.stderr.write("WARNING: The following zones did not respond: " + os.environ["FAKE_MISSING_ZONES"]
+                             + ". List results may be incomplete.\\n")
+        sys.exit(0)
     sys.exit(0)
     """)
 
