@@ -282,7 +282,7 @@ func resolve961(t *testing.T, rw *cache.ResourceWatcher, arm arm961, user, path 
 	cache.ResetSecretsSnapshotForTest()
 	secret := kubeutil.MakeDNS1123Compatible(user) + "-clientconfig"
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		secret: {ObjectMeta: metav1.ObjectMeta{Namespace: "krateo-system", Name: secret},
+		secret: {ObjectMeta: authnMeta("krateo-system", secret, user),
 			Data: map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok")}},
 	}})
 	cache.ForceSecretsCacheReadyForTest("krateo-system")

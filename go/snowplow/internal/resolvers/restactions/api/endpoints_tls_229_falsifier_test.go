@@ -452,13 +452,21 @@ func TestIssue229_Arm8_CAShapeDetection(t *testing.T) {
 // than asserting on the routing predicate alone.
 func selfSignedClientPair(t *testing.T) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return selfSignedClientPairFor(t, "snowplow-test-client")
+}
+
+// selfSignedClientPairFor is selfSignedClientPair issued to cn, as authn issues
+// a user's session certificate to the username (#1382: a credential Secret is
+// its user's when its certificate's CommonName is the username).
+func selfSignedClientPairFor(t *testing.T, cn string) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "snowplow-test-client"},
+		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

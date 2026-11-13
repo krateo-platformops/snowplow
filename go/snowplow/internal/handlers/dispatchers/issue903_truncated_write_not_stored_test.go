@@ -74,7 +74,7 @@ func t903PublishSecrets(e *c681Env, upstreamURL string, withEP bool) {
 	secrets := map[string]*corev1.Secret{}
 	for _, i := range []ident681{c681A, c681B, c681C} {
 		n := kubeutil.MakeDNS1123Compatible(i.user) + "-clientconfig"
-		secrets[n] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c681AuthnNS, Name: n},
+		secrets[n] = &corev1.Secret{ObjectMeta: authnMeta(c681AuthnNS, n, i.user),
 			Data: map[string][]byte{"server-url": []byte(e.user.URL), "token": []byte(i.token())}}
 	}
 	if withEP {

@@ -36,7 +36,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -61,7 +60,7 @@ func TestUserInfoSetBeforeDispatch_ArmE_Middleware(t *testing.T) {
 	// Seed the <user>-clientconfig Secret so the middleware takes the cache-HIT
 	// path and reaches next.ServeHTTP (no out-of-cluster InClusterConfig 500).
 	seedSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: testAuthnNS, Name: testUsername + "-clientconfig"},
+		ObjectMeta: authnMeta(testAuthnNS, testUsername+"-clientconfig", testUsername),
 		Data: map[string][]byte{
 			"server-url": []byte("https://alice.example/k8s"),
 			"token":      []byte("alice-bearer-token-from-cache"),

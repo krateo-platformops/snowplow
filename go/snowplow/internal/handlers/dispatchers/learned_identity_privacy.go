@@ -29,9 +29,9 @@ import (
 )
 
 // learnedRedactionTokens returns the strings a learned class's logs must never
-// carry: the username, both of its credential Secret names (the DNS-1123 forms
-// authn writes: the session `-clientconfig` and, #994, the step-up
-// `-clientconfig-stepup`) and every group except system:authenticated (a
+// carry: the username, every name its credential Secrets may have (the
+// session and, #994, the step-up Secret, each under its exact and its legacy
+// DNS-1123 name, #1382: credsecret.AllNames) and every group except system:authenticated (a
 // constant every identity carries, not an identity fact). Longest first, so a
 // token that contains another is replaced whole.
 func learnedRedactionTokens(username string, groups []string) []string {
@@ -49,8 +49,10 @@ func learnedRedactionTokens(username string, groups []string) []string {
 	}
 	add(username)
 	if username != "" {
-		add(credsecret.StepUpName(username))
-		add(credsecret.SessionName(username))
+		// #1382 — every name either Secret may have: exact and legacy.
+		for _, name := range credsecret.AllNames(username) {
+			add(name)
+		}
 		add(kubeutil.MakeDNS1123Compatible(username))
 	}
 	for _, g := range groups {

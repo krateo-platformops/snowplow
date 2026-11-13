@@ -209,7 +209,7 @@ func k1221Setup(t *testing.T, a psArm, ra, cr *unstructured.Unstructured) *k1221
 	}
 	for _, u := range psUsers {
 		byName[u+"-clientconfig"] = &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: psAuthnNS, Name: u + "-clientconfig"},
+			ObjectMeta: authnMeta(psAuthnNS, u+"-clientconfig", u),
 			Data:       map[string][]byte{"server-url": []byte(apiserver.URL), "token": []byte("tok-" + u)},
 		}
 	}
