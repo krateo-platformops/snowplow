@@ -62,19 +62,7 @@ const maxUnstructuredResponseTextBytes = 2048
 
 // Do is request.Do with a client that never follows a redirect (see do.go).
 func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
-	return do(ctx, opts, func() (*http.Client, error) {
-		// #1112 D4 — plumbing never installs its wire dump (it logs the
-		// Authorization header and the bodies); a Debug endpoint gets WireDump,
-		// which logs metadata only (wiredump.go).
-		cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
-		if err != nil {
-			return nil, err
-		}
-		if opts.Endpoint != nil && opts.Endpoint.Debug {
-			cli.Transport = WireDump(cli.Transport)
-		}
-		return cli, nil
-	})
+	return do(ctx, opts, nil)
 }
 
 // DoAs is Do sent with rc's credential instead of opts.Endpoint's (#1334):
@@ -90,12 +78,13 @@ func DoAs(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *re
 		return response.New(http.StatusInternalServerError, fmt.Errorf("unable to create HTTP Client: no rest config"))
 	}
 	opts.Endpoint = &endpoints.Endpoint{ServerURL: rc.Host}
-	return do(ctx, opts, func() (*http.Client, error) {
-		return rest.HTTPClientFor(rc)
-	})
+	return do(ctx, opts, rc)
 }
 
-func do(ctx context.Context, opts request.RequestOptions, client func() (*http.Client, error)) *response.Status {
+// do is Do's body. With rc nil the client is the endpoint client plumbing builds
+// for opts.Endpoint; with rc set it is rc's (DoAs). Both are sent through Send,
+// in this function, so the #1106 guard sees the obtain and the send together.
+func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *response.Status {
 	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
 		return response.New(http.StatusInternalServerError, err)
@@ -135,7 +124,18 @@ func do(ctx context.Context, opts request.RequestOptions, client func() (*http.C
 		call.Header.Set(el[:idx], strings.TrimSpace(el[idx+1:]))
 	}
 
-	cli, err := client()
+	var cli *http.Client
+	if rc != nil {
+		cli, err = rest.HTTPClientFor(rc)
+	} else {
+		// #1112 D4 — plumbing never installs its wire dump (it logs the
+		// Authorization header and the bodies); a Debug endpoint gets WireDump,
+		// which logs metadata only (wiredump.go).
+		cli, err = request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
+		if err == nil && opts.Endpoint != nil && opts.Endpoint.Debug {
+			cli.Transport = WireDump(cli.Transport)
+		}
+	}
 	if err != nil {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))

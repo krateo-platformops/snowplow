@@ -30,6 +30,8 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 func i1334BGCapability(t *testing.T, permitPublic bool) {
@@ -194,6 +196,44 @@ func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
 	}
 	if authenticated == 0 {
 		t.Fatal("instrument: the control (alice) produced no seed target, so the filter's verdict is unobserved")
+	}
+}
+
+// The SA-producer census (sa_producer_census_268_267_test.go) classifies the
+// public identity's ctx as the refresher's impersonating call is classified: a
+// REAL identity whose ServiceAccount config is an impersonating copy, carried
+// with the impersonated-dial marker. This pins each half against the REAL
+// builder (PublicIdentity.Context), with the same ctx shown re-gated when the
+// marker is absent so the arm can fail.
+func TestIssue1334_PublicContext_IsImpersonatedNotRegated(t *testing.T) {
+	i1334BuildWatcher(t)
+	i1334BGCapability(t, true)
+	saEP, saRC := i1334SA()
+	pub := middleware.NewPublicIdentity(
+		func() (*endpoints.Endpoint, error) { return saEP, nil },
+		func() (*rest.Config, error) { return saRC, nil })
+	ctx, err := pub.Context(context.Background())
+	if err != nil {
+		t.Fatalf("PublicIdentity.Context: %v", err)
+	}
+	if _, ok := cache.InternalRESTConfigFromContext(ctx); !ok {
+		t.Fatal("non-vacuity: the public ctx must carry the ServiceAccount transport the census counts")
+	}
+	if rbac.ServesUnnarrowed(ctx) {
+		t.Fatal("the public identity is a REAL narrowing identity; it must never be ServesUnnarrowed")
+	}
+	rc, ok := cache.ImpersonatingConfigFor(ctx)
+	if !ok || rc.Impersonate.UserName != i1334Public || !slices.Equal(rc.Impersonate.Groups, []string{i1334Unauth}) {
+		t.Fatalf("the public ctx's transport must impersonate exactly %s [%s]; got %+v (ok=%v)", i1334Public, i1334Unauth, rc, ok)
+	}
+	if rbac.MustRegateSADial(ctx) {
+		t.Fatal("an impersonated dial reads as the identity; the re-gate stands down for it as for the refresher's")
+	}
+	// Control: the same shape WITHOUT the marker, under a background stamp, is
+	// re-gated: the stand-down above is the marker's doing.
+	plain := cache.WithInternalRESTConfig(cache.WithBackgroundResolve(i1334Ctx(i1334Public, []string{i1334Unauth})), saRC)
+	if !rbac.MustRegateSADial(plain) {
+		t.Fatal("CONTROL: an un-impersonated ServiceAccount transport under the public identity must be re-gated")
 	}
 }
 
