@@ -686,16 +686,26 @@ TTL_PROOF_BUDGET_S = 600.0
 EXIT_TTL_BACKSTOP_MISSING = 3
 
 
-def _ttl_pod_spec(image: str, script: str, indent: int) -> str:
+def ttl_pool(spec: ClusterSpec) -> tuple[str, str]:
+    """(label, value) of the one node pool whose nodes carry the cloud-platform OAuth scope: the platform
+    (default) pool, which the cluster create makes with --scopes cloud-platform. The snowplow and loadgen
+    pools (node-pools create, gcloud's default gke-default scopes) cannot call the GKE API: a TTL pod there
+    could never delete the cluster (#1387 review, blocker)."""
+    return spec.platform_pool.labels[0]
+
+
+def _ttl_pod_spec(image: str, script: str, indent: int, pool: tuple[str, str]) -> str:
     """The pod spec the TTL CronJob's Job runs, and the proof Job (ttl_proof_manifest) too: the
-    same image, tolerations, namespace and (default) Kubernetes service account, so the proof's
+    same image, node pool, namespace and (default) Kubernetes service account, so the proof's
     identity is the CronJob's: the GKE node SA, from the metadata server (the cluster has no
-    Workload Identity), with the nodes' cloud-platform scope."""
+    Workload Identity), with the nodes' cloud-platform scope. Both pods are pinned to the pool that
+    carries that scope (ttl_pool: nodeSelector). That pool has no taint, so neither pod tolerates any:
+    a pod that tolerated every taint could land on a dedicated pool without the scope."""
     body = "\n".join("    " + ln for ln in script.splitlines())
     pod = f"""\
 restartPolicy: Never
-tolerations:
-- operator: Exists
+nodeSelector:
+  {pool[0]}: {pool[1]}
 containers:
 - name: reaper
   image: {image}
@@ -753,7 +763,7 @@ spec:
       backoffLimit: 0
       template:
         spec:
-{_ttl_pod_spec(image, script, 10)}
+{_ttl_pod_spec(image, script, 10, ttl_pool(spec))}
 """
 
 
@@ -786,7 +796,7 @@ spec:
   activeDeadlineSeconds: {int(TTL_PROOF_BUDGET_S)}
   template:
     spec:
-{_ttl_pod_spec(image, script, 6)}
+{_ttl_pod_spec(image, script, 6, ttl_pool(spec))}
 """
 
 
@@ -814,19 +824,38 @@ def ttl_proof_answer(logs: str) -> tuple[bool, str]:
     return False, f"IAM answers that the CronJob's identity (the GKE node SA) does NOT hold {TTL_PERMISSION}"
 
 
+def proof_placement(spec: ClusterSpec, *, run=None) -> dict:
+    """{"node", "pool"} the proof Job's pod ran on: its pod's spec.nodeName, and that node's ttl_pool label
+    (None for either that could not be read)."""
+    run = run or execute
+    k = _kubectl(spec)
+    label, _value = ttl_pool(spec)
+    rc, out = run(k + ["get", "pods", "-n", TTL_NAMESPACE, "-l", f"job-name={TTL_PROOF_JOB}", "-o", "json"],
+                  dry_run=False, log=lambda _m: None)
+    items = ((_json(out) or {}).get("items") or []) if rc == 0 else []
+    node = ((items[0].get("spec") or {}).get("nodeName") if len(items) == 1 else None)
+    pool = None
+    if node:
+        rc, out = run(k + ["get", "node", node, "-o", "json"], dry_run=False, log=lambda _m: None)
+        pool = (((_json(out) or {}).get("metadata") or {}).get("labels") or {}).get(label) if rc == 0 else None
+    return {"node": node, "pool": pool}
+
+
 def prove_ttl_delete(spec: ClusterSpec, *, run=None, clock: Callable[[], float] = time.monotonic,
                      sleep: Callable[[float], None] = time.sleep,
-                     budget_s: float = TTL_PROOF_BUDGET_S) -> tuple[bool, str]:
+                     budget_s: float = TTL_PROOF_BUDGET_S) -> tuple[bool, str, dict]:
     """#1383 gap 3: PROVE the TTL CronJob can delete the cluster, on this run: apply the proof
     Job (ttl_proof_manifest: the CronJob's pod spec), wait for it to end within `budget_s`, read
-    its answer (ttl_proof_answer), delete it. (proven, the line saying so). Anything not read
-    is "not proven", never proven."""
+    where its pod ran (placement: its node and that node's pool, which must be ttl_pool's) and its
+    answer (ttl_proof_answer), delete it. (proven, the line saying so, the placement). Anything not
+    read is "not proven", never proven."""
     run = run or execute
     k = _kubectl(spec)
     quiet = lambda _m: None  # noqa: E731
+    placement: dict = {"node": None, "pool": None}
     rc, _ = run(k + ["apply", "-f", "-"], dry_run=False, input_data=ttl_proof_manifest(spec), log=quiet)
     if rc != 0:
-        return False, f"the proof Job could not be applied (rc={rc})"
+        return False, f"the proof Job could not be applied (rc={rc})", placement
     try:
         deadline = clock() + budget_s
         state = None
@@ -842,12 +871,18 @@ def prove_ttl_delete(spec: ClusterSpec, *, run=None, clock: Callable[[], float] 
                 break
             sleep(_POLL_S)
         if state is None:
-            return False, f"the proof Job did not end within {budget_s:g} s (its pod never answered)"
+            return False, f"the proof Job did not end within {budget_s:g} s (its pod never answered)", placement
+        placement = proof_placement(spec, run=run)
+        label, value = ttl_pool(spec)
+        if placement["pool"] != value:
+            return False, (f"the proof pod ran on node {placement['node']} of pool {placement['pool']}, not the "
+                           f"{label}={value} pool the CronJob runs on (the one with the cloud-platform scope): "
+                           f"what it proves is not the CronJob's"), placement
         rc, logs = run(k + ["logs", f"job/{TTL_PROOF_JOB}", "-n", TTL_NAMESPACE], dry_run=False, log=quiet)
         if rc != 0:
-            return False, f"the proof Job {state}, and its log could not be read (rc={rc})"
+            return False, f"the proof Job {state}, and its log could not be read (rc={rc})", placement
         ok, why = ttl_proof_answer(logs)
-        return ok, why if ok or state == "succeeded" else f"the proof Job failed: {why}"
+        return ok, why if ok or state == "succeeded" else f"the proof Job failed: {why}", placement
     finally:
         run(k + ["delete", "job", TTL_PROOF_JOB, "-n", TTL_NAMESPACE, "--ignore-not-found", "--wait=false"],
             dry_run=False, log=quiet)
@@ -2501,9 +2536,11 @@ def cmd_gke_up(a) -> int:
         print(f"DRY-RUN: (stdin: Job {TTL_NAMESPACE}/{TTL_PROOF_JOB}, the CronJob's pod spec, asking IAM's "
               f"testIamPermissions for {TTL_PERMISSION} as the node SA; then its log is read and it is deleted)")
         return 0
-    ok, why = prove_ttl_delete(spec)
+    ok, why, placement = prove_ttl_delete(spec)
     proof = {"kind": "ttl_backstop_proof", "cluster": spec.name, "project": spec.project,
              "permission": TTL_PERMISSION, "proven": ok, "why": why,
+             "node": placement["node"], "pool": placement["pool"],
+             "pool_required": "=".join(ttl_pool(spec)),
              "method": "projects.testIamPermissions, from a Job of the ttl-self-destruct CronJob's pod spec"}
     if getattr(a, "ttl_proof_out", None):
         with open(a.ttl_proof_out, "w") as fh:
@@ -2677,10 +2714,19 @@ def reap_expired(project: str, *, yes: bool, now: float, budget_s: float = DEFAU
         # `location` is the cluster's own (a region now; a zone for an older one)
         loc = c.get("location") or c.get("zone") or region_of(DEFAULT_ZONE)
         argv = delete_command(c["name"], project=project, location=loc)
-        rc, _ = execute(argv, dry_run=not yes, log=log)
+        err: list[str] = []
+        rc, _ = execute(argv, dry_run=not yes, log=log, stderr_out=err)
         if not yes:
             continue
-        if rc != 0:
+        busy = _INCOMPATIBLE_OP.search(err[-1] if err else "") if rc != 0 else None
+        if busy:
+            # #1387 review: GKE refuses a delete while another operation runs on the cluster: its own
+            # ttl-self-destruct CronJob's delete, or a partner launch's reap, got there first. That is a
+            # delete in progress, not a failed one: the NotFound poll below says whether it ends (an
+            # operation that is not a delete leaves the cluster there, and the poll says so)
+            log(f"{c['name']}: {busy.group(1)} is already running on it (a delete in progress, its own CronJob's "
+                f"or another reap's): waiting for its describe to answer NotFound")
+        elif rc != 0:
             problems.append(f"{c['name']}: its delete failed (rc={rc}): it is still there, past its TTL")
             continue
         asked.append((c["name"], describe_argv(c["name"], project, loc)))

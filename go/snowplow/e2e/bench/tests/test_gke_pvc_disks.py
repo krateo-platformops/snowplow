@@ -235,6 +235,15 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
     def has(f):
         return os.path.exists(os.path.join(st, f))
     if tool == "kubectl":
+        # #1387 review: where the proof Job's pod ran, as the API server lists it (FAKE_TTL_PROOF_POOL: the pool
+        # label of its node, default platform; "none": no pod listed)
+        if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:
+            none = os.environ.get("FAKE_TTL_PROOF_POOL") == "none"
+            print(json.dumps({"items": [] if none else [{"metadata": {"name": "ttl-delete-proof-x"},
+                                                         "spec": {"nodeName": "gke-node-proof"}}]})); sys.exit(0)
+        if a[:3] == ["get", "node", "gke-node-proof"]:
+            print(json.dumps({"metadata": {"name": a[2], "labels": {
+                "bench.krateo.io/pool": os.environ.get("FAKE_TTL_PROOF_POOL", "platform")}}})); sys.exit(0)
         if a[:2] == ["config", "view"]:
             print("https://" + os.environ.get("FAKE_SERVER", "127.0.0.1") + ":443", end=""); sys.exit(0)
         if a[:2] == ["get", "pv"]:
@@ -347,6 +356,12 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             fh.write(a[3] + "\\n")
         if os.environ.get("FAKE_CLUSTER_DELETE_RC"):           # #1383 gap 5: GKE refused the delete
             sys.exit(int(os.environ["FAKE_CLUSTER_DELETE_RC"]))
+        if os.environ.get("FAKE_CLUSTER_DELETE_BUSY"):         # #1387 review: its CronJob is deleting it already
+            open(os.path.join(st, "deleted"), "w").write("1")
+            sys.stderr.write("ERROR: (gcloud.container.clusters.delete) Some requests did not succeed:\\n"
+                             " - ResponseError: code=400, message=Cluster is running incompatible operation "
+                             + os.environ["FAKE_CLUSTER_DELETE_BUSY"] + ".\\n")
+            sys.exit(1)
         open(os.path.join(st, "deleted"), "w").write("1"); sys.exit(0)
     if a[:3] == ["compute", "disks", "list"]:
         if os.environ.get("FAKE_DISK_LIST_RC"):

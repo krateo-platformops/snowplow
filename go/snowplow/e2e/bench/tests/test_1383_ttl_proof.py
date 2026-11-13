@@ -40,6 +40,11 @@ def test_the_proof_jobs_pod_spec_is_the_cronjobs():
     script_cron, script_job = a["containers"][0].pop("args"), b["containers"][0].pop("args")
     assert a == b
     assert "serviceAccountName" not in a and "serviceAccount" not in a        # the namespace's default KSA
+    # #1387 review (blocker): BOTH pods on the one pool whose nodes carry the cloud-platform scope, and neither
+    # tolerates a taint (that pool has none; the dedicated pools, which lack the scope, are tainted)
+    for pod in (_pod(cron), _pod(job)):
+        assert pod["nodeSelector"] == {"bench.krateo.io/pool": "platform"}
+        assert "tolerations" not in pod
     assert "testIamPermissions" in script_job[0] and gke.TTL_PERMISSION in script_job[0]
     assert "clusters delete" in script_cron[0] and "delete" not in script_job[0].replace(gke.TTL_PERMISSION, "")
     assert job["spec"]["backoffLimit"] == 0 and job["spec"]["activeDeadlineSeconds"] == gke.TTL_PROOF_BUDGET_S
@@ -66,6 +71,8 @@ def test_gke_up_proves_the_backstop_and_records_it(fakes, capsys):
     assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--ttl-proof-out", str(out), "--yes"]) == 0
     rec = json.loads(out.read_text())
     assert rec["proven"] is True and rec["permission"] == "container.clusters.delete" and rec["cluster"] == NAME
+    assert (rec["node"], rec["pool"], rec["pool_required"]) == ("gke-node-proof", "platform",
+                                                                "bench.krateo.io/pool=platform")
     assert "TTL backstop proven" in capsys.readouterr().out
     c = _calls(fakes)
     order = [i for i, x in enumerate(c) if x[:2] == ["kubectl", "apply"] or x[1:3] in (["get", "job"], ["logs", "job/ttl-delete-proof"])
@@ -97,7 +104,7 @@ def test_a_backstop_not_proven_fails_gke_up(fakes, monkeypatch, capsys, proof, s
 def test_a_proof_job_that_never_ends_is_not_proven(fakes, monkeypatch):
     monkeypatch.setenv("FAKE_TTL_PROOF", "never")
     t = iter(range(0, 10**6, 100))
-    ok, why = gke.prove_ttl_delete(gke.default_spec(NAME), clock=lambda: next(t), sleep=lambda s: None)
+    ok, why, _placement = gke.prove_ttl_delete(gke.default_spec(NAME), clock=lambda: next(t), sleep=lambda s: None)
     assert not ok and "did not end within" in why
     assert any(x[1:3] == ["delete", "job"] for x in _calls(fakes))            # cleaned up all the same
 
@@ -127,3 +134,32 @@ def test_plan_iam_reads_the_proof_as_the_node_sas_call_and_nothing_else(tmp_path
     with open(d / "bench" / "nodes.py", "a") as fh:
         fh.write('\nOTHER = "https://cloudresourcemanager.googleapis.com/v1"\n')
     assert [u for u in vm606.scan(d)["uncovered"] if "cloudresourcemanager" in u]
+
+
+# ─── #1387 review (blocker): the CronJob and its proof run on the pool that can delete the cluster ──
+
+def test_only_the_platform_pool_carries_the_cloud_platform_scope():
+    """The selector's pool is the cluster create's own (--scopes cloud-platform, its --node-labels); the node-pools
+    create for snowplow and loadgen sets no scope (gcloud's gke-default: no GKE API) and taints them."""
+    spec = gke.default_spec(NAME)
+    create, *pools, _creds = gke.create_commands(spec)
+    label, value = gke.ttl_pool(spec)
+    assert create[create.index("--scopes") + 1] == "cloud-platform"
+    assert f"{label}={value}" in create[create.index("--node-labels") + 1].split(",")
+    assert spec.platform_pool.taint is None
+    for p in pools:
+        assert "--scopes" not in p and f"{label}={value}" not in " ".join(p) and "--node-taints" in p
+
+
+@pytest.mark.parametrize("pool, says", [
+    ("snowplow", "the proof pod ran on node gke-node-proof of pool snowplow, not the bench.krateo.io/pool=platform pool"),
+    ("none", "the proof pod ran on node None of pool None"),
+])
+def test_a_proof_from_another_pool_proves_nothing(fakes, monkeypatch, capsys, pool, says):  # noqa: F811
+    monkeypatch.setenv("FAKE_TTL_PROOF_POOL", pool)
+    out = fakes / "ttl-proof.json"
+    rc = gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--ttl-proof-out", str(out), "--yes"])
+    err = capsys.readouterr().err
+    assert rc == gke.EXIT_TTL_BACKSTOP_MISSING and says in err, err
+    rec = json.loads(out.read_text())
+    assert rec["proven"] is False and rec["pool"] == (None if pool == "none" else pool)
