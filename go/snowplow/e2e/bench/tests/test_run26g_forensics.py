@@ -119,14 +119,25 @@ def test_the_clusters_logging_and_monitoring_apis_are_read_from_its_create_argv(
     apis = gcp_apis.required()["apis"]
     for flag, api in (("--logging", "logging.googleapis.com"), ("--monitoring", "monitoring.googleapis.com")):
         assert apis[api] == [f"GKE node SA: container clusters create {flag} SYSTEM (bench.gke.create_commands)"]
-    # read from the argv, never a list: a flag set to NONE (either spelling) or left out requires nothing
+    # read from the argv, never a list: only a flag set to NONE (either spelling) requires nothing
     got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--logging=NONE",
                                       "--monitoring", "SYSTEM,API_SERVER"]])["apis"]
     assert "logging.googleapis.com" not in got
     assert got["monitoring.googleapis.com"] == [
         "GKE node SA: container clusters create --monitoring SYSTEM,API_SERVER (bench.gke.create_commands)"]
-    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--monitoring", "NONE"]])
-    assert not {"logging.googleapis.com", "monitoring.googleapis.com"} & set(got["apis"])
+    # fail closed (#1404 review): a flag left out is GKE's default, system logging and monitoring ON, so the API is
+    # required; a node pool's create takes neither flag and requires neither
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--monitoring", "NONE"],
+                                     ["gcloud", "container", "node-pools", "create", "p", "--cluster", "c"]])["apis"]
+    assert "monitoring.googleapis.com" not in got
+    assert got["logging.googleapis.com"] == [
+        "GKE node SA: container clusters create without --logging (GKE's default: SYSTEM logging and monitoring on; "
+        "bench.gke.create_commands)"]
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c"]])["apis"]
+    assert {"logging.googleapis.com", "monitoring.googleapis.com"} <= set(got)
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--logging", "none",
+                                      "--monitoring=NONE"]])["apis"]
+    assert not {"logging.googleapis.com", "monitoring.googleapis.com"} & set(got)
 
 
 def test_a_disabled_logging_api_refuses_naming_the_node_sa():
