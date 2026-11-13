@@ -60,9 +60,11 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // undialledWriteCause is the outcome reason and the errorKey phrase for one
@@ -117,13 +119,20 @@ func undialledWriteCode(reason string) int {
 // background resolve that refuses reads routinely, shows in the counter, not
 // as one WARN line per item. Runs on the stage-loop goroutine before any
 // worker exists, so dict needs no lock.
-func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips []skippedOption) {
+func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, ep *endpoints.Endpoint, skips []skippedOption) {
 	if len(skips) == 0 {
 		return
 	}
 	for _, sk := range skips {
 		reason, why := undialledWriteCause(sk.reason)
 		r.failUndialledWrite(id, apiCall, reason, why)
+		// audit#22 (a) — denied, invalid_path or template_error. The refused
+		// path is never named (it is not a valid object path, or did not
+		// render): the record names the endpoint it was for, or none.
+		if d := undialledDenial(reason); d != "" {
+			r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall, ep: ep, ref: r.stageRef,
+				outcome: audit.OutcomeDenied, reason: d})
+		}
 	}
 	if !isWriteVerb(apiCall.Verb) {
 		// #1139 — the reason is the stage outcome's, read back after every
@@ -138,6 +147,18 @@ func (r *resolveRun) failRefusedItems(id string, apiCall *templates.API, skips [
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
 	}
+}
+
+// undialledDenial is the denial reason of an undialled item's outcome reason,
+// or "" for one that is not snowplow's refusal of the item.
+func undialledDenial(reason string) string {
+	switch reason {
+	case StageReasonInvalidPath:
+		return audit.DenialInvalidPath
+	case StageReasonTemplateError:
+		return audit.DenialTemplateError
+	}
+	return ""
 }
 
 // failUnsentWrites is the catch-all: after a write stage's workers finished,

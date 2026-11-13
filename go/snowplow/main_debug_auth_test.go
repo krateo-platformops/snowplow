@@ -52,6 +52,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 const debugAuthTestKeyID = "test-kid-for-debug-auth-od3-1.12.3"
@@ -198,6 +199,8 @@ func (m *recordingMux) handleDebug(pattern string, handler http.Handler) {
 }
 
 func (m *recordingMux) declareUnaudited(string, string) {}
+
+func (m *recordingMux) declareAudited(string, audit.Route) {}
 
 // buildProdDebugMux builds the mux exactly the way main() does for the routes
 // under test: the anonymous probe endpoints, then the production
