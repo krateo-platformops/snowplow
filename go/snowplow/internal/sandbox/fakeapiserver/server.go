@@ -17,12 +17,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
+
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 // Options configure a Server. Clock, AfterFunc and NewUID are injectable for tests.
@@ -68,10 +71,8 @@ type continuation struct {
 }
 
 const (
-	continueTTL      = 5 * time.Minute // etcd's default compaction interval; an older continue is 410
-	maxJSONPatchOps  = 10000           // apiserver patch.go maxJSONPatchOperations
-	stepUpGroup      = "krateo:loa:2"
-	clientconfigName = "-clientconfig"
+	continueTTL     = 5 * time.Minute // etcd's default compaction interval; an older continue is 410
+	maxJSONPatchOps = 10000           // apiserver patch.go maxJSONPatchOperations
 )
 
 // New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first.
@@ -157,11 +158,18 @@ func New(o Options) (*Server, error) {
 	s.sa = serviceAccountIdentity(id.ServiceAccount.Namespace, id.ServiceAccount.Name)
 	s.sa.Label = "sa"
 	s.visitor = identity{User: id.Visitor.Username, Groups: append(append([]string{}, id.Visitor.Groups...), "system:authenticated"), Label: "visitor"}
-	// §8: the one Secret, synthesised; the snapshot holds none.
-	name := clientconfigSecretName(id.Visitor.Username, id.Visitor.Groups)
+	// §8: the one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
+	// under the visitor's exact name (credsecret.For's first, preferred name: the session name, or
+	// the step-up one for a step-up identity), owned through the username annotation
+	// (plumbing endpoints.OwnsSecret's annotation arm), so snowplow's own-credential readers serve
+	// it to the visitor and to no one else. authn's certificate Secret is not reproduced: the
+	// browser's fetch cannot present a client certificate, so the fake authenticates the visitor by
+	// the token.
+	name := credsecret.For(id.Visitor.Username, id.Visitor.Groups)[0]
 	s.bucket("/secrets")[id.AuthnNamespace+"/"+name] = map[string]any{
 		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-		"metadata": map[string]any{"name": name, "namespace": id.AuthnNamespace, "uid": o.NewUID(), "resourceVersion": s.snap.ResourceVersion, "creationTimestamp": s.now()},
+		"metadata": map[string]any{"name": name, "namespace": id.AuthnNamespace, "uid": o.NewUID(), "resourceVersion": s.snap.ResourceVersion, "creationTimestamp": s.now(),
+			"annotations": map[string]any{endpoints.UsernameAnnotation: id.Visitor.Username}},
 		"data": map[string]any{
 			"server-url": base64.StdEncoding.EncodeToString([]byte("https://kubernetes.sandbox.invalid")),
 			"token":      base64.StdEncoding.EncodeToString([]byte(o.VisitorToken)),
@@ -183,25 +191,6 @@ func newUID() string {
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-}
-
-var dns1123Bad = regexp.MustCompile(`[^-a-z0-9]`)
-var dns1123Start = regexp.MustCompile(`^[^a-z0-9]+`)
-
-// clientconfigSecretName is snowplow's credsecret.For (internal/credsecret/credsecret.go:52-70),
-// with plumbing kubeutil.MakeDNS1123Compatible (dns1123.go:18-31).
-func clientconfigSecretName(username string, groups []string) string {
-	n := dns1123Start.ReplaceAllString(dns1123Bad.ReplaceAllString(strings.ToLower(username), ""), "")
-	if len(n) > 63 {
-		n = n[:63]
-	}
-	n += clientconfigName
-	for _, g := range groups {
-		if g == stepUpGroup {
-			return n + "-stepup"
-		}
-	}
-	return n
 }
 
 func (s *Server) now() string { return s.o.Clock().UTC().Format(time.RFC3339) }
