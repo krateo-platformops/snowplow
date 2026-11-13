@@ -33,7 +33,7 @@ RUN = "run25"
 VM = vm606.vm_name(RUN)
 PROJECT = "operations-dev-krateo-io"
 SA = f"serviceAccount:snowplow-bench-orchestrator@{PROJECT}.iam.gserviceaccount.com"
-NODE_SA = "357378285144-compute@developer.gserviceaccount.com"
+NODE_SA = f"snowplow-bench-node@{PROJECT}.iam.gserviceaccount.com"     # run 26h: the bench clusters' own node SA
 LABELS = {"owner": "snowplow-bench", "run": RUN, "ttl-hours": "15"}
 BOOT = {"kubectl": "v1.36.2", "helm": "v3.19.0", "gcloud": "561.0.0", "gke-gcloud-auth-plugin": "Kubernetes v1.34.2",
         "python3": "Python 3.13.5", "bash": "GNU bash, version 5.2.37", "git": "git version 2.47.3"}
@@ -72,7 +72,8 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
               "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL",
-              "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL"):
+              "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL", "FAKE_NO_NODE_SA", "FAKE_ROLE_EXTRA_PERMISSIONS",
+              "FAKE_RC0_EMPTY", "FAKE_READ_DENIED"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     # #1395: up and launch check the installer chart on the laptop (registry + helm); these tests are
@@ -170,7 +171,7 @@ def test_plan_iam_derives_the_roles_from_the_code_and_changes_nothing(fake, caps
     assert "resourcemanager.projects.setIamPolicy" in out and "compute.securityAdmin" in out
     assert "gcloud compute disks delete  bench/gke.py:" in out
     assert "REST cloudquotas.googleapis.com  bench/gke.py:" in out
-    assert _verbs(fake) == [f"projects describe {PROJECT}"]               # a read; nothing IAM is run
+    assert _verbs(fake) == []                                             # run 26h: prints only, no GCP call
 
 
 def _bench_copy(tmp_path) -> Path:
@@ -187,7 +188,7 @@ def test_plan_iam_refuses_an_orchestrator_module_that_imports_an_operator_side_o
     d = _bench_copy(tmp_path)
     with open(d / "bench" / "nodes.py", "a") as fh:
         fh.write("\nfrom bench import gcevm  # noqa: E402,F401\n")
-    rc, _out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
+    rc, _out, err = _run(capsys, "plan-iam", "--bench-dir", str(d))
     assert rc == 1 and "an operator-side module (gcevm) imported, its calls unscanned (bench/nodes.py:" in err
 
 
@@ -195,7 +196,7 @@ def test_plan_iam_refuses_a_call_it_does_not_cover(fake, capsys, tmp_path):
     d = _bench_copy(tmp_path)
     with open(d / "bench" / "gke.py", "a") as fh:
         fh.write('\n\ndef _planted():\n    return ["gcloud", "compute", "firewall-rules", "create", "x"]\n')
-    rc, out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
+    rc, out, err = _run(capsys, "plan-iam", "--bench-dir", str(d))
     assert rc == 1 and "gcloud compute firewall-rules create (bench/gke.py:" in err
     assert "add-iam-policy-binding" not in out
 
@@ -205,7 +206,7 @@ def test_plan_iam_reads_gcloud_in_shell_as_a_call_but_not_in_quotes_or_comments(
     with open(d / "run606.sh", "a") as fh:
         fh.write('\n# gcloud compute instances delete in a comment\nlog "gcloud in a string"\n'
                  'gcloud compute firewall-rules delete x --quiet\n')
-    rc, _out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
+    rc, _out, err = _run(capsys, "plan-iam", "--bench-dir", str(d))
     assert rc == 1
     uncovered = [ln for ln in err.splitlines() if "gcloud in shell" in ln]
     assert len(uncovered) == 1 and "firewall-rules delete" in uncovered[0]
@@ -215,7 +216,7 @@ def test_plan_iam_refuses_a_rest_api_it_does_not_cover(fake, capsys, tmp_path):
     d = _bench_copy(tmp_path)
     with open(d / "bench" / "nodes.py", "a") as fh:
         fh.write('\nURL = "https://storage.googleapis.com/b/o"\n')
-    rc, _out, err = _run(capsys, "plan-iam", "--project-number", "1", "--bench-dir", str(d))
+    rc, _out, err = _run(capsys, "plan-iam", "--bench-dir", str(d))
     assert rc == 1 and "REST storage.googleapis.com (bench/nodes.py:" in err
 
 
@@ -1086,7 +1087,7 @@ def test_up_refuses_a_run_name_in_use_before_granting_anything(fake, capsys, mon
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
 
 
-@pytest.mark.parametrize("key", [f"{k}-{r}" for k, r in vm606.grant_policies(PROJECT, NUMBER)])
+@pytest.mark.parametrize("key", [f"{k}-{r}" for k, r in vm606.grant_policies(PROJECT)])
 def test_up_refuses_while_the_sa_holds_an_unconditional_binding(fake, capsys, monkeypatch, key):
     fake_vm606.put_policy(fake, key, [{"role": "roles/compute.viewer", "members": [SA]}])
     rc, _out, err = _up(capsys, monkeypatch)
@@ -1347,13 +1348,13 @@ def test_a_notfound_is_about_the_resource_only_when_it_names_its_own_path():
 def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
     """L11: the run-in-use, unconditional-binding and revoke reads go over grant_policies: exactly the
     policies up's grants are written to."""
-    assert vm606.grant_policies(PROJECT, NUMBER) == [("bucket", BUCKET), ("project", PROJECT), ("sa", NODE_SA)]
+    assert vm606.grant_policies(PROJECT) == [("bucket", BUCKET), ("project", PROJECT), ("sa", NODE_SA)]
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 0, err
     kind = {"projects": ("project", 2), "storage": ("bucket", 3), "iam": ("sa", 3)}
     written = {(kind[c["argv"][0]][0], c["argv"][kind[c["argv"][0]][1]])
                for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:4])}
-    assert written == set(vm606.grant_policies(PROJECT, NUMBER))
+    assert written == set(vm606.grant_policies(PROJECT))
 
 
 def test_a_describe_that_answers_no_object_refuses_never_reads_as_absent(fake, capsys, monkeypatch):

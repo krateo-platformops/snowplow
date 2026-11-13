@@ -55,7 +55,11 @@ outcome:
     (octal) is the mode the copy gets instead of the source's;
   - `projects describe`, `services list --enabled --format json`, `iam service-accounts describe`: the
     project number, the enabled services (IAP among them unless FAKE_IAP_DISABLED=1), the SA unless
-    FAKE_NO_SA=1;
+    FAKE_NO_SA=1 (the bench node SA unless FAKE_NO_NODE_SA=1; one made by `iam service-accounts create` or
+    put_sa as made), IAM's NOT_FOUND as gcloud 561 prints it (read live 2026-11-13);
+  - run 26h: `iam roles describe / create ID --project P`: the project's custom roles (none until made, or put_role);
+    a describe of an absent one answers IAM's "The role named projects/P/roles/ID was not found" (read live
+    2026-11-13); FAKE_ROLE_EXTRA_PERMISSIONS (JSON list): the role IAM makes holds these too;
   - `compute regions describe REGION`: tests/fake_region.py's quotas (FAKE_LIMIT_<METRIC> steers a
     limit); `compute forwarding-rules | addresses list`: none. An instance carries its zone and one
     external IP (natIP), as GCE lists an instance with an ephemeral external IP;
@@ -244,6 +248,16 @@ with open(st / "calls.jsonl", "a") as fh:
     fh.write(json.dumps({"argv": a, "partial_error": os.environ.get("CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR")}) + "\n")
 def opt(n):
     return a[a.index(n) + 1] if n in a else None
+# run 26h: FAKE_RC0_EMPTY="<first 3 words>;...": that call answers rc 0 with "[]" and a WARNING, as a gcloud read
+# whose request failed can (the shape gcloud's lists fail open with): a read that trusts rc 0 reads it as an answer
+if " ".join(a[:3]) in [x for x in os.environ.get("FAKE_RC0_EMPTY", "").split(";") if x]:
+    sys.stderr.write("WARNING: Some requests did not succeed.\n"); print("[]"); sys.exit(0)
+# run 26h: FAKE_READ_DENIED="<first 3 words>;...": that call answers IAM's PERMISSION_DENIED (rc 1), which is not
+# its NotFound
+if " ".join(a[:3]) in [x for x in os.environ.get("FAKE_READ_DENIED", "").split(";") if x]:
+    sys.stderr.write(f"ERROR: (gcloud.{a[0]}.{a[1]}) PERMISSION_DENIED: Permission denied on the resource. This "
+                     "command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account "
+                     "specified by the [core/account] property\n"); sys.exit(1)
 def load(kind, name):
     p = st / kind / f"{name}.json"
     return json.loads(p.read_text()) if p.exists() else None
@@ -358,10 +372,54 @@ if a[:3] == ["services", "list", "--enabled"]:
     if os.environ.get("FAKE_IAP_DISABLED") != "1":
         names.append("iap.googleapis.com")
     print(json.dumps([{"config": {"name": n}, "state": "ENABLED"} for n in names])); sys.exit(0)
+SA_404 = ("ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account. This command is "
+          "authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account specified by the "
+          "[core/account] property\n")
+ROLE_404 = ("ERROR: (gcloud.iam.roles.describe) NOT_FOUND: The role named projects/{project}/roles/{role} was not "
+            "found. This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the active account "
+            "specified by the [core/account] property.\n")
+def sa_doc(email):
+    """run 26h: an SA this fake created (or put_sa), else the orchestrator SA (unless FAKE_NO_SA=1) or the bench node
+    SA (unless FAKE_NO_NODE_SA=1, as before node-sa made it); None: IAM's NOT_FOUND."""
+    p = st / "sas" / f"{email}.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    node = email.startswith("snowplow-bench-node@")
+    if os.environ.get("FAKE_NO_NODE_SA" if node else "FAKE_NO_SA") == "1":
+        return None
+    return {"email": email, "name": f"projects/{PROJECT}/serviceAccounts/{email}", "disabled": False}
 if a[:3] == ["iam", "service-accounts", "describe"]:
-    if os.environ.get("FAKE_NO_SA") == "1":
-        sys.stderr.write("ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account\n"); sys.exit(1)
-    print(a[3]); sys.exit(0)
+    doc = sa_doc(a[3])
+    if doc is None:
+        sys.stderr.write(SA_404); sys.exit(1)
+    print(json.dumps(doc) if opt("--format") == "json" else doc["email"]); sys.exit(0)
+if a[:3] == ["iam", "service-accounts", "create"]:
+    email = f"{a[3]}@{opt('--project')}.iam.gserviceaccount.com"
+    if sa_doc(email) is not None:
+        sys.stderr.write("ERROR: (gcloud.iam.service-accounts.create) Resource in projects [x] is the subject of a "
+                         "conflict: Service account already exists within project.\n"); sys.exit(1)
+    (st / "sas").mkdir(exist_ok=True)
+    (st / "sas" / f"{email}.json").write_text(json.dumps({"email": email, "displayName": opt("--display-name"),
+                                                            "description": opt("--description"), "disabled": False}))
+    sys.exit(0)
+# ── run 26h: the project's custom roles (bench.vm606 node-sa's reaper role) ──
+if a[:3] == ["iam", "roles", "describe"]:
+    p = st / "roles" / f"{a[3]}.json"
+    if not p.exists():
+        sys.stderr.write(ROLE_404.format(project=opt("--project"), role=a[3])); sys.exit(1)
+    print(p.read_text()); sys.exit(0)
+if a[:3] == ["iam", "roles", "create"]:
+    (st / "roles").mkdir(exist_ok=True)
+    p = st / "roles" / f"{a[3]}.json"
+    if p.exists():
+        sys.stderr.write("ERROR: (gcloud.iam.roles.create) ALREADY_EXISTS: A role named x already exists.\n")
+        sys.exit(1)
+    perms = sorted((opt("--permissions") or "").split(","))
+    perms += json.loads(os.environ.get("FAKE_ROLE_EXTRA_PERMISSIONS") or "[]")   # what IAM made differs
+    p.write_text(json.dumps({"name": f"projects/{opt('--project')}/roles/{a[3]}", "title": opt("--title"),
+                             "description": opt("--description"), "includedPermissions": perms,
+                             "stage": opt("--stage"), "etag": "BwX="}))
+    sys.exit(0)
 # ── #1390: the evidence bucket (its API description, as `--raw` gives it) ──
 def bucket_404(url):
     sys.stderr.write(f"ERROR: (gcloud.storage.buckets.describe) {url} not found: 404.\n"); sys.exit(1)
@@ -751,6 +809,19 @@ def put_policy(state: Path, key: str, bindings: list) -> None:
             bp.write_text(json.dumps({"kind": "storage#bucket", "name": key[len("bucket-"):]}))
     (state / "policies").mkdir(parents=True, exist_ok=True)
     (state / "policies" / f"{key}.json").write_text(json.dumps({"version": 3, "etag": "BwX=", "bindings": bindings}))
+
+
+def put_sa(state: Path, email: str, **fields) -> None:
+    """run 26h: an SA as IAM describes it (fields over the defaults: enabled)."""
+    (state / "sas").mkdir(parents=True, exist_ok=True)
+    (state / "sas" / f"{email}.json").write_text(json.dumps({"email": email, "disabled": False, **fields}))
+
+
+def put_role(state: Path, role_id: str, permissions: list[str], **fields) -> None:
+    """run 26h: a custom role of the project as IAM describes it."""
+    (state / "roles").mkdir(parents=True, exist_ok=True)
+    (state / "roles" / f"{role_id}.json").write_text(json.dumps(
+        {"name": f"projects/{PROJECT}/roles/{role_id}", "includedPermissions": permissions, "stage": "GA", **fields}))
 
 
 def put_rule(state: Path, run: str, fw: str, expires: str | None = None) -> None:

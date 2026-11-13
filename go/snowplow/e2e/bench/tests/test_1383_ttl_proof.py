@@ -3,9 +3,10 @@ the GKE node SA, and nothing checked that identity may delete the cluster ("UNVE
 every run, right after applying the CronJob, and fails the run when it is not proven, so run606's EXIT trap tears
 the cluster down.
 
-The proof Job runs only inside a real bench run (it asks IAM, from the cluster, as the node SA). Here: its pod
-spec IS the CronJob's (the identity it proves is the CronJob's own), and IAM's answers, played by a fake kubectl,
-decide gke-up's exit.
+The proof Job runs only inside a real bench run (it calls the GKE API, from the cluster, as the node SA). Here: its
+pod spec IS the CronJob's (the identity it proves is the CronJob's own), and GKE's answers, played by a fake kubectl
+(tests/fake_gke_api.py), decide gke-up's exit. Run 26h replaced IAM's testIamPermissions with the effective test
+(tests/test_run26h_node_sa.py holds its decision table).
 """
 
 from __future__ import annotations
@@ -45,32 +46,19 @@ def test_the_proof_jobs_pod_spec_is_the_cronjobs():
     for pod in (_pod(cron), _pod(job)):
         assert pod["nodeSelector"] == {"bench.krateo.io/pool": "platform"}
         assert "tolerations" not in pod
-    assert "testIamPermissions" in script_job[0] and gke.TTL_PERMISSION in script_job[0]
-    assert "clusters delete" in script_cron[0] and "delete" not in script_job[0].replace(gke.TTL_PERMISSION, "")
+    assert "clusters delete" in script_cron[0]
+    # the proof calls the GKE API on two names that do not exist, never on the cluster itself, and runs no gcloud
+    # but its token
+    assert f"{gke.TTL_PROOF_API}/projects/{spec.project}/locations/{spec.region}/clusters" in script_job[0]
+    assert spec.name not in script_job[0] and "gcloud container" not in script_job[0]
     assert job["spec"]["backoffLimit"] == 0 and job["spec"]["activeDeadlineSeconds"] == gke.TTL_PROOF_BUDGET_S
-    assert f"projects/{spec.project}:testIamPermissions" in script_job[0]
-
-
-@pytest.mark.parametrize("logs, proven, says", [
-    ('TTL_PROOF {"permissions": ["container.clusters.delete"]}', True, "holds container.clusters.delete"),
-    ("TTL_PROOF {}", False, "does NOT hold container.clusters.delete"),
-    ('TTL_PROOF {"permissions": ["container.clusters.get"]}', False, "does NOT hold"),
-    ('TTL_PROOF {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "for x@example.invalid"}}',
-     False, "HTTP 403, PERMISSION_DENIED"),
-    ("gcloud: no credentials\n", False, "printed no answer"),
-    ("TTL_PROOF <html>", False, "not JSON"),
-])
-def test_only_iams_own_yes_proves_it(logs, proven, says):
-    ok, why = gke.ttl_proof_answer(logs)
-    assert ok is proven and says in why
-    assert "@" not in why                                       # an error's message (it names the account) never
 
 
 def test_gke_up_proves_the_backstop_and_records_it(fakes, capsys):
     out = fakes / "ttl-proof.json"
     assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--ttl-proof-out", str(out), "--yes"]) == 0
     rec = json.loads(out.read_text())
-    assert rec["proven"] is True and rec["permission"] == "container.clusters.delete" and rec["cluster"] == NAME
+    assert rec["proven"] is True and rec["permissions"] == list(gke.TTL_PROBE_METHODS) and rec["cluster"] == NAME
     assert (rec["node"], rec["pool"], rec["pool_required"]) == ("gke-node-proof", "platform",
                                                                 "bench.krateo.io/pool=platform")
     assert "TTL backstop proven" in capsys.readouterr().out
@@ -85,8 +73,8 @@ def test_gke_up_proves_the_backstop_and_records_it(fakes, capsys):
 
 
 @pytest.mark.parametrize("proof, says", [
-    ("denied", "does NOT hold container.clusters.delete"),
-    ("error", "IAM refused the permission test (HTTP 403, PERMISSION_DENIED)"),
+    ("denied", "container.clusters.get is not granted to the node SA"),
+    ("disabled", "HTTP 403 (403 PERMISSION_DENIED; reason: SERVICE_DISABLED (service container.googleapis.com))"),
     ("silent", "printed no answer"),
     ("failed", "the proof Job failed"),
 ])
@@ -123,7 +111,7 @@ def test_run606_stops_and_tears_down_when_the_backstop_is_not_proven(harness):  
 
 
 def test_plan_iam_reads_the_proof_as_the_node_sas_call_and_nothing_else(tmp_path):
-    """The orchestrator SA gets no resourcemanager role for it (vm606.NODE_SA_REST: that one constant, in
+    """The orchestrator SA gets no role for it (vm606.NODE_SA_REST: that one constant, in
     bench/gke.py); the same host anywhere else is an orchestrator call plan-iam does not cover."""
     import shutil
 
@@ -132,8 +120,8 @@ def test_plan_iam_reads_the_proof_as_the_node_sas_call_and_nothing_else(tmp_path
     d = tmp_path / "copy"
     shutil.copytree(BENCH / "bench", d / "bench", ignore=shutil.ignore_patterns("__pycache__"))
     with open(d / "bench" / "nodes.py", "a") as fh:
-        fh.write('\nOTHER = "https://cloudresourcemanager.googleapis.com/v1"\n')
-    assert [u for u in vm606.scan(d)["uncovered"] if "cloudresourcemanager" in u]
+        fh.write('\nOTHER = "https://container.googleapis.com/v1"\n')
+    assert [u for u in vm606.scan(d)["uncovered"] if "REST container.googleapis.com" in u]
 
 
 # ─── #1387 review (blocker): the CronJob and its proof run on the pool that can delete the cluster ──

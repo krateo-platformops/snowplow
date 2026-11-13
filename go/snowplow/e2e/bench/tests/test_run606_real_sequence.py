@@ -38,7 +38,7 @@ import pytest
 
 from bench import gke
 from bench.load606 import SCALEUSER_PASSWORD
-from tests import _planted, fake_region
+from tests import _planted, fake_gke_api, fake_region
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN_NAME = "snowplow-bench-1014-1300"
@@ -217,7 +217,7 @@ _CANON = textwrap.dedent("""\
         return out
     """)
 
-FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
+FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     raw = sys.argv[1:]
     kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None; imp = []
     it = iter(raw)
@@ -261,6 +261,8 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
         import yaml
         f = a[a.index("-f") + 1]
         text = sys.stdin.read() if f == "-" else (open(f).read() if os.path.isfile(f) else "")
+        if "name: ttl-delete-proof" in text:          # run 26h: the proof Job, whose probes GKE answers (logs)
+            open(os.path.join(STATE, "ttl-proof-job.yaml"), "w").write(text)
         with open(os.path.join(STATE, "applied-kinds.jsonl"), "a") as fh, \\
                 open(os.path.join(STATE, "applied-jobs"), "a") as jobs:
             for d in yaml.safe_load_all(text):
@@ -273,8 +275,9 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
         # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
         if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
             sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
-    # #1383 gap 3: gke-up's TTL proof Job (the CronJob's pod spec asking IAM's testIamPermissions as the node SA):
-    # FAKE_TTL_PROOF=granted (default) | denied (IAM answers {})
+    # #1383 gap 3 / run 26h: gke-up's TTL proof Job (the CronJob's pod spec calling the GKE API as the node SA on two
+    # names that do not exist), GKE answering per tests/fake_gke_api.py: FAKE_TTL_PROOF=granted (default: node-sa's
+    # grant) | denied (no grant: 403 for both)
     if a[:3] == ["get", "job", "ttl-delete-proof"]:
         print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
     if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:       # its pod, on a platform node
@@ -283,8 +286,9 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
     if a[:3] == ["get", "node", "gke-node-proof"]:
         print(json.dumps({"metadata": {"name": a[2], "labels": {"bench.krateo.io/pool": "platform"}}})); sys.exit(0)
     if a[:2] == ["logs", "job/ttl-delete-proof"]:
-        granted = os.environ.get("FAKE_TTL_PROOF", "granted") == "granted"
-        print("TTL_PROOF " + json.dumps({"permissions": ["container.clusters.delete"]} if granted else {}))
+        p = os.path.join(STATE, "ttl-proof-job.yaml")
+        sys.stdout.write(ttl_proof_logs(open(p).read() if os.path.exists(p) else "",
+                                        os.environ.get("FAKE_TTL_PROOF", "granted")))
         sys.exit(0)
     # #1297: the in-cluster Jobs (bench/incluster.py) RUN here, as their pods would: the container's
     # own command, its /out at STATE/pods/<job>/out, its kubectl this fake (the run's kubeconfig),
