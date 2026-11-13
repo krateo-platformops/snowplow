@@ -154,6 +154,12 @@ is read by its exact name (`describe`: its own NotFound is "absent", any other f
 selected by exact equality from one unfiltered list (the project's instances, every zone,
 partial-error property false; the enabled services).
 
+THE CHART IS CHECKED BEFORE ANYTHING IS MADE (#1395). `up` takes the env file the launch will take and,
+before any GCP call, pulls the installer chart at its INSTALLER_VERSION and renders the installer's
+private-image component list with every run's values (chart_check: the derivation the VM's own
+preflight runs); a list that cannot be rendered refuses the up, and no VM exists. `launch` checks
+its env file the same way before any SSH. Run 26f was refused by that list in the VM's dry pass.
+
 A RUN NAME IS USED ONCE. `up` refuses, before granting anything, a --run of which anything exists: its
 laptop record, an instance named or labelled for it in any zone, its firewall rules, bindings under
 its condition title; and it refuses while the orchestrator SA holds any unconditional binding (on the
@@ -212,7 +218,7 @@ without --yes). The env file is the laptop launcher's variables, e.g. for run 24
     EXPECTED_IMAGE_DIGEST_N1=sha256:<64 hex>      # and _N2, _N1B, read from the registry
     BENCH_606_GO_N1=<YYYYMMDD>-snowplow-bench-run25n1-<sha8>   # Diego's go per run (UTC date)
 
-    python3 -m bench.vm606 up --run run25 --ttl-hours 15 --yes
+    python3 -m bench.vm606 up --run run25 --ttl-hours 15 --env-file run25.env --yes
     python3 -m bench.vm606 push-secret --run run25 --yes
     python3 -m bench.vm606 launch --run run25 --bench-sha <40-hex> --env-file run25.env \\
         --bench-zone europe-west1-b --pin-manifest .../installer-0.3.545-pin-manifest.json \\
@@ -244,10 +250,11 @@ import shutil
 import stat
 import sys
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 
-from bench import durable, evidence, gcevm, gke
+from bench import durable, evidence, gcevm, ghcr_pull, gke, installer_src, installer_values
 from bench.gcevm import (COMPUTE_API, FIREWALL_FIELDS, IAP_CODES, IAP_RANGE, IAP_TUNNEL_CODE,  # noqa: F401
                          NETWORK, SSH_STAGES, TCP_22, Refused, firewall_create_argv, firewall_view, gcloud, iap_code,
                          ssh, ssh_stage)
@@ -1209,6 +1216,10 @@ def cmd_up(a) -> int:
         raise Refused("the code makes GCP calls plan-iam does not cover: " + "; ".join(found["uncovered"]))
     roles = list(plan(found))
     check_storage_roles(roles)
+    # #1395: what the launch will install, checked on the laptop before anything is made or resumed
+    env = read_env_file(a.env_file)
+    for line in chart_check(env, check_env(env)):
+        _say(line)
     if resumable(st, run):
         return resume_up(run, st, a, roles)
     a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
@@ -1428,6 +1439,43 @@ def check_env(env: dict[str, str]) -> list[str]:
     return labels
 
 
+#: run606.sh's INSTALLER_CHART default (tests/test_1395_private_render.py holds the two equal): the
+#: chart an env file without INSTALLER_CHART installs
+INSTALLER_CHART = "oci://ghcr.io/krateo-platformops/charts/installer"
+
+
+def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> list[str]:
+    """#1395: the installer's private-image component list (inst.privateImageComponents), rendered on
+    the LAPTOP from the chart the launch installs and every run's values, before any paid step. Run
+    26f: the first place that list was read was the launcher's dry pass ON THE VM, after `up` had
+    made it, and it refused there. The same derivation the VM's preflight runs
+    (bench.ghcr_pull.private_image_paths: helm template of the published chart pulled at the env
+    file's INSTALLER_VERSION, through bench.installer_src as s_source pulls it), with each run's
+    values as run606.sh writes them (bench.installer_values: SNOWPLOW_TAG_<L>, FRONTEND_TAG_<L>).
+    Only registryAuth.username is missing: it lives in the pull-token file, which vm606 never
+    opens; the VM's preflight renders with it. Registry and helm reads only; no GCP call. Returns
+    the lines to say; raises Refused with the reason (fail closed)."""
+    chart, version = env.get("INSTALLER_CHART") or INSTALLER_CHART, env["INSTALLER_VERSION"]
+    lines = []
+    with tempfile.TemporaryDirectory(prefix="vm606-chart-check-") as d:
+        pulled = os.path.join(d, "installer-pulled")
+        res = installer_src.oci_preflight(chart, version, pulled, requirements=())
+        if not res.get("ok"):
+            raise Refused(f"the installer chart {chart} {version} could not be pulled on the laptop"
+                          f"{' (NO ANSWER from the registry)' if res.get('no_answer') else ''}: "
+                          + "; ".join(res.get("failures") or ["no reason given"]))
+        for x in labels:
+            doc = installer_values.document(env[f"SNOWPLOW_TAG_{x}"], env.get(f"FRONTEND_TAG_{x}", ""))
+            try:
+                values = ghcr_pull._load_yaml(doc, f"run {x}'s installer values: ") or {}
+                paths = ghcr_pull.private_image_paths(pulled, values, helm)
+            except (ValueError, ghcr_pull._Refused) as e:
+                raise Refused(f"installer {version}, run {x}'s values: {e}") from None
+            lines.append(f"installer {version}, run {x}'s values: private-image components (rendered on the laptop, "
+                         f"{sum(map(len, paths.values()))} entries): {', '.join(sorted(paths))}")
+    return lines
+
+
 def pair_name(env: dict[str, str]) -> str:
     """run606_pair.sh's PAIR_NAME: "pair" then "-<RUN_NAME_L>" per label of RUNS, in order (its
     `PAIR_NAME="pair"` / `PAIR_NAME="${PAIR_NAME}-${!nm}"` lines; tests/test_vm606.py holds them to it)."""
@@ -1562,6 +1610,8 @@ def cmd_launch(a) -> int:
         raise Refused("--pin-sha256: 64 lowercase hex")
     env = read_env_file(a.env_file)
     labels = check_env(env)
+    for line in chart_check(env, labels):      # #1395: before any SSH (the env file may differ from up's)
+        _say(line)
     if env.get("ZONE", a.bench_zone) != a.bench_zone:
         raise Refused(f"the env file's ZONE={env['ZONE']} is not --bench-zone {a.bench_zone}: one zone for the clusters")
     env["ZONE"] = a.bench_zone
@@ -1959,6 +2009,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="how long a booting VM's SSH may stay unanswered")
     p.add_argument("--bootstrap-timeout-s", type=int, default=1200)
     p.add_argument("--poll-s", type=float, default=15, help=argparse.SUPPRESS)
+    p.add_argument("--env-file", required=True,
+                   help="the env file the launch will take (#1395: the installer chart it installs is checked "
+                        "on the laptop before anything is made)")
     p.set_defaults(func=cmd_up)
 
     p = sub.add_parser("push-secret", help="copy the ghcr pull-token file to the VM (never read)")

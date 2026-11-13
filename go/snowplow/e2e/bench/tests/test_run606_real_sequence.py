@@ -1435,7 +1435,12 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
         os.makedirs(os.path.join(d, "charts"), exist_ok=True)
-        open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w").write("x")
+        # a chart helm loads (#1395: the installer chart is rendered, its private-image list read)
+        import io, tarfile
+        cp = json.dumps({"apiVersion": "v2", "name": "core-provider", "version": "2.13.24"}).encode()
+        with tarfile.open(os.path.join(d, "charts", "core-provider-2.13.24.tgz"), "w:gz") as tf:
+            ti = tarfile.TarInfo("core-provider/Chart.yaml"); ti.size = len(cp)
+            tf.addfile(ti, io.BytesIO(cp))
         crd_chart("core-provider-crds", os.path.join(d, "charts", "core-provider-crds"))
         open(os.path.join(d, "values.yaml"), "w").write(
             "ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10)
@@ -1446,16 +1451,22 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         core = os.environ.get("FAKE_CORE_FEATURES", "")
         if core == "dynamic":
             core = "{{ .Values.coreFeatures }}"
-        # inst.privateImageComponents as at 0.3.468 (FAKE_PRIVATE_IMAGES: none = no such define;
-        # dynamic = not a static list)
-        priv = {"none": "", "dynamic": '{{- define "inst.privateImageComponents" -}}{{ toYaml .Values.x }}{{- end -}}'
-                }.get(os.environ.get("FAKE_PRIVATE_IMAGES", ""), chr(10).join([
-                    '{{- define "inst.privateImageComponents" -}}', "components:",
-                    "- name: core-provider-agent", "  path: [mcpServers, chartGate, imagePullSecrets]",
-                    "- name: agentgateway-policies", "  path: [certReplayHop, image, pullSecrets]",
-                    "- name: agentgateway-policies", "  path: [uiTokenHop, image, pullSecrets]",
-                    "- name: alert-provider", "  path: [imagePullSecrets]",
-                    "{{- end -}}"]))
+        # inst.privateImageComponents as at 0.3.468, rendered by the preflight (#1395). FAKE_PRIVATE_IMAGES:
+        # none = no such define; empty = one that lists nothing; commented = installer 0.3.616's form, a
+        # template comment inside the list (run 26f); dynamic = one entry from a rule over the values
+        # (alert-provider's only while the portal feature is on, which the installer's values turn on)
+        mode = os.environ.get("FAKE_PRIVATE_IMAGES", "")
+        entries = ["- name: core-provider-agent", "  path: [mcpServers, chartGate, imagePullSecrets]",
+                   "- name: agentgateway-policies", "  path: [certReplayHop, image, pullSecrets]",
+                   "- name: agentgateway-policies", "  path: [uiTokenHop, image, pullSecrets]"]
+        last = {"commented": ["{{/* a comment, as installer 0.3.616 has one inside its list */}}",
+                              "- name: alert-provider", "  path: [imagePullSecrets]"],
+                "dynamic": ["{{- if .Values.features.portal }}", "- name: alert-provider",
+                            "  path: [imagePullSecrets]", "{{- end }}"]}.get(
+            mode, ["- name: alert-provider", "  path: [imagePullSecrets]"])
+        priv = {"none": "", "empty": '{{- define "inst.privateImageComponents" -}}components: []{{- end -}}'
+                }.get(mode, chr(10).join(['{{- define "inst.privateImageComponents" -}}', "components:", *entries,
+                                          *last, "{{- end -}}"]))
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
             '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({

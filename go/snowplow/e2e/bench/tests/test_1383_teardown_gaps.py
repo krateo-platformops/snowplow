@@ -189,7 +189,7 @@ from tests.test_run606_real_sequence import harness  # noqa: E402,F401
 
 from bench import vm606  # noqa: E402
 from tests import fake_vm606  # noqa: E402
-from tests.test_vm606 import _in, _run  # noqa: E402
+from tests.test_vm606 import _in, _run, _up_env  # noqa: E402
 from tests.test_vm606 import fake as vmfake  # noqa: E402,F401
 
 
@@ -282,7 +282,7 @@ def test_reap_reads_each_deletes_rc_and_its_describe(vmfake, capsys, monkeypatch
 
 def test_every_up_reaps_first(vmfake, capsys):
     _seed(vmfake)
-    rc, out, err = _run(capsys, "up", "--run", "run99", "--ttl-hours", "15")    # a dry run: prints, deletes nothing
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", "run99", "--ttl-hours", "15")    # a dry run: prints, deletes nothing
     assert rc == 0, err
     verbs = [" ".join(c["argv"][:3]) for c in fake_vm606.calls(vmfake)]
     assert "compute firewall-rules list" in verbs

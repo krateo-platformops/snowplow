@@ -43,6 +43,30 @@ jobs:
       - name: Install the bench's Python dependencies
         run: python -m pip install -r requirements.txt
 
+      # #1395 review: the suite renders charts with the real helm, so it renders with the helm the
+      # vm606 VM runs (bench/vm606.py HELM_VERSION, its archive verified against HELM_SHA256), not
+      # whichever one the runner image ships (a newer helm lays its errors out differently)
+      - name: The helm the VM pins, first on PATH
+        run: |
+          set -euo pipefail
+          read -r v s < <(python -c 'from bench import vm606; print(vm606.HELM_VERSION, vm606.HELM_SHA256)')
+          d="$RUNNER_TEMP/helm-$v"
+          mkdir -p "$d"
+          curl -fsSLo "$d/helm.tgz" "https://get.helm.sh/helm-$v-linux-amd64.tar.gz"
+          echo "$s  $d/helm.tgz" | sha256sum -c -
+          tar -xzf "$d/helm.tgz" -C "$d"
+          echo "$d/linux-amd64" >> "$GITHUB_PATH"
+          got="$("$d/linux-amd64/helm" version --short)"
+          [[ "${got%%+*}" == "$v" ]] || { echo "helm says $got, not $v" >&2; exit 1; }
+
+      - name: The suite's helm is the VM's
+        run: |
+          set -euo pipefail
+          want="$(python -c 'from bench import vm606; print(vm606.HELM_VERSION)')"
+          got="$(helm version --short)"
+          echo "helm on PATH: $(command -v helm) $got"
+          [[ "${got%%+*}" == "$want" ]] || { echo "helm on PATH says $got, not $want" >&2; exit 1; }
+
       - name: Docker is there (the k6 / Chrome tests skip without it)
         run: docker info
 

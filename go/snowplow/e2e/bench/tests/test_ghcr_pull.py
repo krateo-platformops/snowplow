@@ -118,7 +118,13 @@ def _leaks():
     # #1041 review F1: a private-image component with no repo of its own is checked too
     ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-provider:0.2.53: the installer lists it as a "
                          "private-image component (inst.privateImageComponents) and it cannot be rendered"),
-    ("private_rule_dynamic", "inst.privateImageComponents is not one static list"),
+    # #1395: the list is RENDERED from the installer chart; one that cannot be read refuses the run, by name
+    # helm's cause, whatever its version's line layout (#1395 review: helm_reason)
+    ("private_rule_missing", 'no template "inst.privateImageComponents" associated with template "gotpl"'),
+    ("private_rule_empty", "the installer's private-image components (inst.privateImageComponents) cannot be "
+                           "read from its rendered chart: the define renders no `components` list, or an empty one"),
+    ("private_rule_unrendered", "the installer's private-image components (inst.privateImageComponents) cannot be "
+                                "read from its rendered chart: helm template failed: Error: execution error"),
 ])
 def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, case, why):  # noqa: F811
     env, state, ambient, tmp = harness
@@ -141,7 +147,9 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "private_no_image": lambda: {"FAKE_HELM_TEMPLATE_EMPTY": "agentgateway-policies"},
         "private_path_unrendered": lambda: {"FAKE_POLICIES_VERSION": FAKE_CHART_HOP_UNRENDERED},
         "private_repoless": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "alert-provider"},
-        "private_rule_dynamic": lambda: {"FAKE_PRIVATE_IMAGES": "dynamic"},
+        "private_rule_missing": lambda: {"FAKE_PRIVATE_IMAGES": "none"},
+        "private_rule_empty": lambda: {"FAKE_PRIVATE_IMAGES": "empty"},
+        "private_rule_unrendered": lambda: {"FAKE_HELM_TEMPLATE_FAIL": "installer"},
     }[case]())
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=300)
@@ -719,11 +727,13 @@ def test_the_image_pull_failure_redacts_the_pull_account():
 
 
 @pytest.mark.parametrize("env,render", [({"FAKE_HELM_TEMPLATE_FAIL": "agentgateway-controller"}, "failed: helm template failed: "),
-                                        ({"FAKE_PRIVATE_IMAGES": "none"}, "ok")])
+                                        ({"FAKE_PRIVATE_IMAGES": "commented"}, "ok"),
+                                        ({"FAKE_PRIVATE_IMAGES": "dynamic"}, "ok")])
 def test_what_is_not_a_private_image_component_is_recorded_not_refused(harness, env, render):  # noqa: F811
     """A chart the installer injects no pull Secret into may fail to render:
-    recorded (its values' images still preflighted), the run goes on. An
-    installer with no inst.privateImageComponents says so."""
+    recorded (its values' images still preflighted), the run goes on. #1395: the
+    installer's list is rendered, so a comment inside it (installer 0.3.616, run
+    26f) and an entry from a rule over the values read as the list they render."""
     env0, state, ambient, tmp = harness
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env0, **env), capture_output=True,
                        text=True, timeout=300)
@@ -732,8 +742,11 @@ def test_what_is_not_a_private_image_component_is_recorded_not_refused(harness, 
     pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
     ctl = next(c for c in pf["charts"] if c["chart"].endswith("/agentgateway-controller"))
     assert ctl["render"].startswith(render) and ctl["error"] is None
-    if "FAKE_PRIVATE_IMAGES" in env:
-        assert pf["private_image_components"] is None and "declares no inst.privateImageComponents" in out
+    assert pf["private_image_components"] == ["agentgateway-policies", "alert-provider", "core-provider-agent"]
+    assert ("the installer's private-image components (inst.privateImageComponents, rendered): "
+            "agentgateway-policies, alert-provider, core-provider-agent") in out
+    ap = next(c for c in pf["charts"] if c["chart"].endswith("/alert-provider"))
+    assert ap["private_image_component"] and ap["error"] is None
 
 
 def test_an_init_container_that_cannot_pull_is_named_too():
@@ -1262,7 +1275,12 @@ def _installer(tmp_path, charts=(("agentgateway-controller", "0.2.0"), ("agentga
     (root / "files").mkdir(parents=True)
     (root / "templates").mkdir()
     (root / "Chart.yaml").write_text("apiVersion: v2\nname: installer\nversion: 0.3.468\n")
-    (root / "templates" / "_helpers.tpl").write_text('{{- define "inst.coreFeatures" -}}{{- end -}}\n')
+    # #1395: the installer's private-image list is rendered; this one names a component none of
+    # these tests pins
+    (root / "templates" / "_helpers.tpl").write_text(
+        '{{- define "inst.coreFeatures" -}}{{- end -}}\n'
+        '{{- define "inst.privateImageComponents" -}}\ncomponents:\n- name: core-provider-agent\n'
+        '  path: [mcpServers, chartGate, imagePullSecrets]\n{{- end -}}\n')
     (root / "files" / "component-pins.yaml").write_text(yaml.safe_dump({"components": [
         {"name": c, "version": v, "repo": AGW} for c, v in charts]}))
     (root / "values.yaml").write_text(yaml.safe_dump({"features": {}}))
