@@ -238,11 +238,11 @@ type stageRefusal struct {
 	path string
 	ep   *endpoints.Endpoint
 	ref  *templates.Reference
-	// outcome is denied (snowplow refused, with reason) or failure (a read
-	// snowplow needed to send it failed: code is what that authority
-	// answered, 0 when nothing did).
+	// outcome is denied (snowplow refused, with reason) or failure (the
+	// endpoint snowplow needed to send it could not be read). Neither row
+	// carries a status code: the write was never sent, so no authority
+	// answered it.
 	outcome, reason string
-	code            int
 }
 
 // auditStageRefusal emits the record of a write stage snowplow did not send,
@@ -260,11 +260,11 @@ func (r *resolveRun) auditStageRefusal(ctx context.Context, sr stageRefusal) {
 	}
 	ev := stageEvent(r.opts.RESTActionNamespace, r.opts.RESTActionName, sr.apiCall, method)
 	stageTarget(ctx, &ev, sr.apiCall, sr.path, sr.ep, sr.ref, false)
-	ev.Outcome, ev.DenialReason, ev.StatusCode = sr.outcome, sr.reason, sr.code
+	ev.Outcome, ev.DenialReason = sr.outcome, sr.reason
 	if sr.outcome == audit.OutcomeDenied {
-		ev.StatusCode, ev.Message = 0, audit.MessageRefused
+		ev.Message = audit.MessageRefused
 	} else {
-		ev.Message = audit.FailureMessage(sr.code)
+		ev.Message = audit.MessageEndpointUnreadable
 	}
 	audit.Emit(ctx, ev)
 }

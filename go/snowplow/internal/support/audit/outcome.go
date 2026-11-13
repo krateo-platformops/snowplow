@@ -98,6 +98,12 @@ const (
 // sending anything. The reason is krateo.audit.denial_reason, never the body.
 const MessageRefused = "not sent: snowplow refused the request"
 
+// MessageEndpointUnreadable is the body of the failure record of a write stage
+// whose endpoint could not be read: nothing was sent, so the record carries no
+// status code (the read's answer is the apiserver's to snowplow, not the
+// write's).
+const MessageEndpointUnreadable = "the stage's endpoint could not be read; nothing was sent"
+
 // codeText is "<code> <status text>", or the bare code when it has no
 // standard text.
 func codeText(code int) string {

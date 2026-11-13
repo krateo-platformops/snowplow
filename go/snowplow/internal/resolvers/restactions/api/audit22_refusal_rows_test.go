@@ -11,8 +11,13 @@ package api
 //      per_user_credential_ref, endpoint_ref_malformed, dependency_failed,
 //      uaf_on_write_verb, invalid_path, template_error, dry_run_not_executed,
 //      write_refused (an export). A target not resolved is marked target.
-//   F  a write stage whose endpoint Secret read failed is a failure row with
-//      the code the apiserver answered that read with.
+//   F  a write stage whose endpoint Secret read failed (a NotFound, a
+//      Forbidden) is a failure row with NO status code and the fixed body
+//      MessageEndpointUnreadable: the write was never sent, and the read's
+//      answer is the apiserver's to snowplow, not the write's.
+//   X  a write stage dialled to a destination snowplow's policy refuses
+//      (link-local) was never sent: denied with
+//      krateo.audit.denial_reason=destination_refused, no status code.
 //   N  no row: background work (no requester), and a refused READ stage.
 //   S  a per_user_credential_ref row never carries the Secret's name, which
 //      embeds the username: no attribute and no body holds "-clientconfig".
@@ -43,11 +48,13 @@ import (
 const (
 	brokenRef22 = "broken-endpoint" // a Secret with no server-url
 	absentRef22 = "absent-endpoint" // a Secret the apiserver answers 404 for
+	hiddenRef22 = "hidden-endpoint" // a Secret the apiserver answers 403 for
 	base22      = "/apis/composition.krateo.io/v1alpha1/namespaces/team-a/fireworksapps"
 )
 
 // upstream22 is the apiserver and the named endpoint in one: a Secret read is
-// a 404 Status, a path under team-b a 403, and any other write is created.
+// a 404 Status (hiddenRef22's a 403), a path under team-b a 403, and any other
+// write is created.
 func upstream22(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +64,9 @@ func upstream22(t *testing.T) *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/secrets/"+brokenRef22):
 			// The Secret exists and is not a usable endpoint: no server-url.
 			_, _ = io.WriteString(w, `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"`+brokenRef22+`","namespace":"`+raNS410+`"},"data":{"token":"ZXh0LXRvaw=="}}`)
+		case strings.HasSuffix(r.URL.Path, "/secrets/"+hiddenRef22):
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`)
 		case strings.Contains(r.URL.Path, "/secrets/"):
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
@@ -175,29 +185,30 @@ func TestAudit22_R_F_S_C_EveryRefusalOfAWriteStageIsOneRow(t *testing.T) {
 		stage   string // the refused stage's row
 		outcome string
 		reason  string
-		code    string
 		target  bool // the row names a target
 	}{
 		{"per_user_credential_ref", nil, []*templates.API{refStage22("s", http.MethodPost, "/render", own)},
-			"s", krateoaudit.OutcomeDenied, audit.DenialPerUserCredentialRef, "", false},
+			"s", krateoaudit.OutcomeDenied, audit.DenialPerUserCredentialRef, false},
 		{"endpoint_ref_malformed", nil, []*templates.API{refStage22("s", http.MethodPost, "/render", brokenRef22)},
-			"s", krateoaudit.OutcomeDenied, audit.DenialEndpointRefMalformed, "", false},
-		{"the Secret read failed", nil, []*templates.API{refStage22("s", http.MethodPost, "/render", absentRef22)},
-			"s", krateoaudit.OutcomeFailure, "", "404", false},
+			"s", krateoaudit.OutcomeDenied, audit.DenialEndpointRefMalformed, false},
+		{"the Secret read failed: NotFound", nil, []*templates.API{refStage22("s", http.MethodPost, "/render", absentRef22)},
+			"s", krateoaudit.OutcomeFailure, "", false},
+		{"the Secret read failed: Forbidden", nil, []*templates.API{refStage22("s", http.MethodPost, "/render", hiddenRef22)},
+			"s", krateoaudit.OutcomeFailure, "", false},
 		{"dependency_failed", nil, []*templates.API{stage410("first", http.MethodPost, denyPath410), dependent},
-			"after", krateoaudit.OutcomeDenied, audit.DenialDependencyFailed, "", false},
+			"after", krateoaudit.OutcomeDenied, audit.DenialDependencyFailed, false},
 		{"uaf_on_write_verb", nil, []*templates.API{uaf},
-			"uaf", krateoaudit.OutcomeDenied, audit.DenialUAFOnWriteVerb, "", false},
+			"uaf", krateoaudit.OutcomeDenied, audit.DenialUAFOnWriteVerb, false},
 		{"invalid_path", nil, []*templates.API{stage410("s", http.MethodPost, base22+"/a%2Fb")},
-			"s", krateoaudit.OutcomeDenied, audit.DenialInvalidPath, "", false},
+			"s", krateoaudit.OutcomeDenied, audit.DenialInvalidPath, false},
 		{"template_error", nil, []*templates.API{stage410("s", http.MethodPost, `${ error("x22") }`)},
-			"s", krateoaudit.OutcomeDenied, audit.DenialTemplateError, "", false},
+			"s", krateoaudit.OutcomeDenied, audit.DenialTemplateError, false},
 		{"dry_run_not_executed", cache.WithInert, []*templates.API{stage410("s", http.MethodPost, base22)},
-			"s", krateoaudit.OutcomeDenied, audit.DenialDryRunNotExecuted, "", true},
+			"s", krateoaudit.OutcomeDenied, audit.DenialDryRunNotExecuted, true},
 		{"dry_run_not_executed, named endpoint", cache.WithInert, []*templates.API{extStage410("s", http.MethodPost, "/render")},
-			"s", krateoaudit.OutcomeDenied, audit.DenialDryRunNotExecuted, "", true},
+			"s", krateoaudit.OutcomeDenied, audit.DenialDryRunNotExecuted, true},
 		{"write_refused (an export)", cache.WithExportRead, []*templates.API{stage410("s", http.MethodPost, base22)},
-			"s", krateoaudit.OutcomeDenied, audit.DenialWriteRefused, "", true},
+			"s", krateoaudit.OutcomeDenied, audit.DenialWriteRefused, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var row *sdklog.Record
@@ -216,8 +227,18 @@ func TestAudit22_R_F_S_C_EveryRefusalOfAWriteStageIsOneRow(t *testing.T) {
 			if a[krateoaudit.KeyOutcome] != c.outcome || a[krateoaudit.KeyDenialReason] != c.reason {
 				t.Errorf("outcome %q reason %q, want %q %q", a[krateoaudit.KeyOutcome], a[krateoaudit.KeyDenialReason], c.outcome, c.reason)
 			}
-			if code, ok := a[krateoaudit.KeyHTTPStatusCode]; code != c.code || (c.code == "" && ok) {
-				t.Errorf("status code %q (present %t), want %q", code, ok, c.code)
+			// No row carries a status code: the write was never sent, so no
+			// authority answered it (a Secret read's 403/404 is the
+			// apiserver's answer to snowplow, never the write's).
+			if code, ok := a[krateoaudit.KeyHTTPStatusCode]; ok {
+				t.Errorf("status code %q on a write that was never sent", code)
+			}
+			wantBody := audit.MessageRefused
+			if c.outcome == krateoaudit.OutcomeFailure {
+				wantBody = audit.MessageEndpointUnreadable
+			}
+			if got := row.Body().AsString(); got != wantBody {
+				t.Errorf("body %q, want %q", got, wantBody)
 			}
 			_, obj := a[krateoaudit.KeyObjectResource]
 			_, host := a[krateoaudit.KeyServerAddress]
@@ -243,6 +264,35 @@ func TestAudit22_R_F_S_C_EveryRefusalOfAWriteStageIsOneRow(t *testing.T) {
 			conforms22(t, *row, opts...)
 		})
 	}
+}
+
+func TestAudit22_X_C_ARefusedDestinationIsDeniedWithItsReason(t *testing.T) {
+	var shape *stageParityShape1291
+	for i := range stageParityShapes1291 {
+		if stageParityShapes1291[i].name == "stage.endpointRef.refused" {
+			shape = &stageParityShapes1291[i]
+		}
+	}
+	if shape == nil {
+		t.Fatal("precondition: no stage.endpointRef.refused shape")
+	}
+	r, a := serveStageParity1291(t, *shape)
+	for k, want := range map[string]string{
+		krateoaudit.KeyRESTActionStage: "s",
+		krateoaudit.KeyOutcome:         krateoaudit.OutcomeDenied,
+		krateoaudit.KeyDenialReason:    audit.DenialDestinationRefused,
+	} {
+		if a[k] != want {
+			t.Errorf("%s = %q, want %q", k, a[k], want)
+		}
+	}
+	if code, ok := a[krateoaudit.KeyHTTPStatusCode]; ok {
+		t.Errorf("status code %q on a write that was never sent", code)
+	}
+	if got := r.Body().AsString(); got != audit.MessageDestinationRefused {
+		t.Errorf("body %q, want %q", got, audit.MessageDestinationRefused)
+	}
+	conforms22(t, r)
 }
 
 func TestAudit22_N_NoRowWithoutARequesterOrForARead(t *testing.T) {
