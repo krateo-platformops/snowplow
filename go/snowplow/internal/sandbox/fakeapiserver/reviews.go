@@ -215,18 +215,14 @@ func (s *Server) applyStatus(rule Rule, t target) {
 	next["status"] = merged
 	at := s.now()
 	for _, p := range rule.Stamp {
-		toks := pointerTokens(p)
-		var node any = next
-		for _, tok := range toks[:len(toks)-1] {
-			m, _ := node.(map[string]any)
-			node = m[tok]
+		toks, reason := pointerTokens(p)
+		if reason == "" {
+			reason = stampAt(next, toks, at)
 		}
-		m, ok := node.(map[string]any)
-		if !ok {
-			fail(p, "parent is not an object after the status merge")
+		if reason != "" {
+			fail(p, reason)
 			return
 		}
-		m[toks[len(toks)-1]] = at
 	}
 	gv := loc.group + "/" + loc.version
 	if loc.group == "" {
@@ -265,13 +261,80 @@ func (s *Server) applyStatus(rule Rule, t target) {
 	s.o.Log(line)
 }
 
-// pointerTokens splits an RFC 6901 pointer.
-func pointerTokens(p string) []string {
-	parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
+// stampAt sets the value at an RFC 6901 pointer's location in doc: through objects by key and arrays
+// by index (decimal, no leading zero, in range), the last token naming an object member (set or
+// added) or an existing array element (replaced). "-", the element past an array's end, is refused:
+// a stamp sets a field, it never appends. It returns why it could not, or "".
+func stampAt(doc any, toks []string, v any) string {
+	node := doc
+	for i, tok := range toks {
+		last := i == len(toks)-1
+		switch n := node.(type) {
+		case map[string]any:
+			if last {
+				n[tok] = v
+				return ""
+			}
+			node = n[tok]
+		case []any:
+			if tok == "-" {
+				return "\"-\" names no element: a stamp sets an existing array element, it never appends"
+			}
+			idx, ok := arrayIndex(tok, len(n))
+			if !ok {
+				return fmt.Sprintf("%q is not an index of an array of %d after the status merge", tok, len(n))
+			}
+			if last {
+				n[idx] = v
+				return ""
+			}
+			node = n[idx]
+		default:
+			return "parent is not an object or an array after the status merge"
+		}
+	}
+	return "a stamp names a field, not the whole document"
+}
+
+// arrayIndex is RFC 6901's array-index: "0", or a digit 1-9 followed by digits; and below n.
+func arrayIndex(tok string, n int) (int, bool) {
+	if tok == "" || (len(tok) > 1 && tok[0] == '0') {
+		return 0, false
+	}
+	idx := 0
+	for _, c := range tok {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		idx = idx*10 + int(c-'0')
+		if idx >= n {
+			return 0, false
+		}
+	}
+	return idx, true
+}
+
+// pointerTokens splits an RFC 6901 pointer into its reference tokens, unescaped: "~1" is "/" and
+// "~0" is "~", in that order, so "~01" is the token "~1". A pointer is "" (the whole document, no
+// tokens) or "/" followed by tokens; a "~" not followed by "0" or "1" is not one. It returns why p
+// is not a pointer, or "".
+func pointerTokens(p string) ([]string, string) {
+	if p == "" {
+		return nil, ""
+	}
+	if p[0] != '/' {
+		return nil, fmt.Sprintf("%q is not an RFC 6901 pointer: it does not start with \"/\"", p)
+	}
+	parts := strings.Split(p[1:], "/")
 	for i, t := range parts {
+		for j := 0; j < len(t); j++ {
+			if t[j] == '~' && (j+1 == len(t) || (t[j+1] != '0' && t[j+1] != '1')) {
+				return nil, fmt.Sprintf("%q is not an RFC 6901 pointer: \"~\" must be followed by \"0\" or \"1\"", p)
+			}
+		}
 		parts[i] = strings.ReplaceAll(strings.ReplaceAll(t, "~1", "/"), "~0", "~")
 	}
-	return parts
+	return parts, ""
 }
 
 // mergeStatus is an RFC 7386 merge of the rule's status into the stored one.

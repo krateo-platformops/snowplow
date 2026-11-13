@@ -571,7 +571,7 @@ func TestApplyStatusRuntimeFailure(t *testing.T) {
 			fail = l
 		}
 	}
-	eq(t, fail, map[string]any{"event": "applyStatus.failed", "id": "resolve-on-applied", "pointer": "/status/resolution/at", "reason": "parent is not an object after the status merge"}, "failure line")
+	eq(t, fail, map[string]any{"event": "applyStatus.failed", "id": "resolve-on-applied", "pointer": "/status/resolution/at", "reason": "parent is not an object or an array after the status merge"}, "failure line")
 	eq(t, get(h.do("GET", inc+"/"+incident, req{as: "sa"}).body, "status"), get(before.body, "status"), "nothing written")
 }
 
