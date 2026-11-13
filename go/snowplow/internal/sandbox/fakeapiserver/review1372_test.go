@@ -94,7 +94,7 @@ func TestDryRun_PatchCommitsNothing(t *testing.T) {
 	eq(t, incidentRV(h), before, "nothing stored")
 	eq(t, get(h.do("GET", inc+"/"+incident, req{as: "sa"}).body, "spec", "applied"), false, "spec unchanged")
 	h.advance(5 * time.Second)
-	if logged(h, func(l map[string]any) bool { return l["applyStatus"] != nil }) {
+	if logged(h, statusWrite) {
 		t.Fatal("a dry run fired a rule")
 	}
 	w.quiet()
