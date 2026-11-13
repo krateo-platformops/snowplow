@@ -235,6 +235,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import itertools
 import json
 import os
 import re
@@ -436,6 +437,8 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("container", "clusters", "describe"): ("roles/container.admin",),
     ("container", "clusters", "list"): ("roles/container.admin",),
     ("container", "operations", "wait"): ("roles/container.admin",),
+    # #1383 gap 8: gke-up's preflight reads which versions the release channel offers in the region
+    ("container", "get-server-config"): ("roles/container.admin",),
     ("compute", "regions", "describe"): ("roles/compute.viewer",),
     ("compute", "project-info", "describe"): ("roles/compute.viewer",),
     ("compute", "instances", "describe"): ("roles/compute.viewer",),
@@ -522,6 +525,8 @@ def scan(bench_dir: Path = BENCH_DIR) -> dict:
         for m in _PY_ARGV.finditer(src):
             toks = [t.strip() for t in m.group(1).split(",") if t.strip()]
             key = tuple(t[1:-1] if t.startswith('"') else "*" for t in toks)
+            # the command words only: a flag ends them (`container get-server-config --project`, #1383)
+            key = tuple(itertools.takewhile(lambda t: not t.startswith("-"), key))
             key = key[:2] if key[:1] == ("auth",) else key[:3]
             where = f"{rel}:{src.count(chr(10), 0, m.start()) + 1}"
             (calls if key in CALL_ROLES else uncovered).append(

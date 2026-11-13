@@ -74,6 +74,8 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         print("fake-access-token"); sys.exit(0)
     if a[:3] == ["container", "clusters", "list"]:
         print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
+    if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)
+        print(json.dumps(server_config())); sys.exit(0)
     # FAKE_CREATE_ERROR: the create refused with this stderr (run 18: the
     # per-location limit); no cluster exists, so its describe answers NotFound
     if a[:3] == ["container", "clusters", "create"] and os.environ.get("FAKE_CREATE_ERROR"):

@@ -158,6 +158,36 @@ def region_env(vms: int = 0, forwarding_rules: int = 0, addresses: list | None =
             "FAKE_REGION_ADDRESSES": json.dumps(addresses or [])}
 
 
+# #1383 gap 8: `gcloud container get-server-config --region R --format json`, shaped as the GKE API's ServerConfig
+# (channels[].channel / defaultVersion / validVersions). FAKE_REGULAR_VERSIONS (comma-separated) replaces the
+# REGULAR channel's validVersions. GKE_VERSION is what the fakes' cluster describes report it runs.
+GKE_VERSION = "1.36.4-gke.1391002"
+
+
+def cluster_shape(version: str = GKE_VERSION) -> dict:
+    """#1383 gap 7: a run's cluster-shape record (bench.gke.observed_shape) of a bench cluster GKE gave `version`,
+    control plane and every node: what a run's verdict carries (report.cluster_shape) for the pair to compare."""
+    from bench import gke
+    return gke.observed_shape({
+        "name": "snowplow-bench-fake", "location": "europe-west4", "locations": ["europe-west4-a"],
+        "currentNodeCount": 5, "currentMasterVersion": version, "currentNodeVersion": version,
+        "nodePools": [{"name": n, "config": {"machineType": "n2-standard-8"}, "initialNodeCount": c,
+                       "locations": ["europe-west4-a"], "version": version}
+                      for n, c in (("default-pool", 3), ("snowplow", 1), ("loadgen", 1))]})
+
+
+def server_config(env=None) -> dict:
+    env = _env(env)
+    regular = [v for v in (env.get("FAKE_REGULAR_VERSIONS") or f"{GKE_VERSION},1.35.9-gke.1180000").split(",") if v]
+    return {"defaultClusterVersion": regular[0] if regular else "",
+            "channels": [{"channel": "RAPID", "defaultVersion": "1.37.1-gke.1000000",
+                          "validVersions": ["1.37.1-gke.1000000", GKE_VERSION]},
+                         {"channel": "REGULAR", "defaultVersion": regular[0] if regular else "",
+                          "validVersions": regular},
+                         {"channel": "STABLE", "defaultVersion": "1.35.9-gke.1180000",
+                          "validVersions": ["1.35.9-gke.1180000"]}]}
+
+
 LOADER = (
     "import importlib.util as _ilu\n"
     f"_frs = _ilu.spec_from_file_location('fake_region', {str(Path(__file__).resolve())!r})\n"
@@ -171,6 +201,9 @@ LOADER = (
     "    return _frm.region_list(kind)\n"
     "def project_quotas():\n"
     "    return _frm.project_quotas()\n"
+    "def server_config():\n"
+    "    return _frm.server_config()\n"
+    "GKE_VERSION = _frm.GKE_VERSION\n"
     "def answer_read(what, rows):\n"
     "    import json as _j, sys as _s\n"
     "    failed = _frm.read_failure(what)\n"

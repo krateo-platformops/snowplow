@@ -347,6 +347,51 @@ def _pool_flags(pool: NodePool) -> list[str]:
     return flags
 
 
+RELEASE_CHANNEL = "regular"
+
+
+def server_config_command(spec: ClusterSpec) -> list[str]:
+    """What GKE offers in the cluster's region (a read): each release channel's validVersions."""
+    return ["gcloud", "container", "get-server-config", "--project", spec.project, "--region", spec.region,
+            "--format", "json"]
+
+
+def version_offered(server_config, version: str, channel: str = RELEASE_CHANNEL,
+                    where: str = "") -> tuple[bool, str]:
+    """#1383 gap 8: does `channel` (get-server-config's `channels`) offer `version`? A minor
+    ("1.36") when one of the channel's validVersions is a patch of it (gcloud resolves a minor to
+    the newest patch the channel offers), a full version when it is one of them exactly. (ok, the
+    line saying so, naming the requirement). `where`: the region the config is of, for the line."""
+    want = channel.upper()
+    on = f"the {want} channel" + (f" in {where}" if where else "")
+    row = next((c for c in (server_config or {}).get("channels") or [] if c.get("channel") == want), None) \
+        if isinstance(server_config, dict) else None
+    need = (f"gke-up creates --cluster-version {version} --release-channel {channel}, so {on} must offer "
+            f"{'a ' + version + '.x patch' if version.count('.') == 1 else version} "
+            f"(DEFAULT_CLUSTER_VERSION, bench/gke.py)")
+    if row is None:
+        return False, f"get-server-config lists no {want} channel: {need}"
+    valid = [str(v) for v in row.get("validVersions") or []]
+    match = [v for v in valid if v == version or v.startswith((version + ".", version + "-"))]
+    if not match:
+        offered = sorted({".".join(v.split("-")[0].split(".")[:2]) for v in valid})
+        return False, f"GKE {version} is not offered on {on} (its minors: {', '.join(offered) or 'none'}): {need}"
+    return True, f"GKE {version}: offered on {on} ({', '.join(sorted(match))})"
+
+
+def version_check(spec: ClusterSpec, *, run=None) -> tuple[bool, str]:
+    """version_offered for the spec's cluster_version in its region, from one read; a read that
+    fails or answers no JSON object is "unknown", never "offered"."""
+    run = run or execute
+    rc, out = run(server_config_command(spec), dry_run=False, log=lambda _m: None)
+    got = _json(out) if rc == 0 else None
+    if not isinstance(got, dict):
+        return False, (f"GKE's server config for {spec.region} could not be read (gcloud container "
+                       f"get-server-config {'failed, rc=' + str(rc) if rc else 'answered no JSON object'}): whether "
+                       f"the {RELEASE_CHANNEL.upper()} channel offers {spec.cluster_version} is unknown")
+    return version_offered(got, spec.cluster_version, where=spec.region)
+
+
 def create_commands(spec: ClusterSpec) -> list[list[str]]:
     """gcloud argv lists, in order: cluster, extra node pools, credentials.
 
@@ -363,8 +408,9 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
         "gcloud", "container", "clusters", "create", spec.name, *loc, *nodes,
         "--cluster-version", spec.cluster_version,
         # REGULAR carries 1.36.4-gke.1391002, the exact version 057 runs
-        # (rapid only offers newer 1.36 patches).
-        "--release-channel", "regular",
+        # (rapid only offers newer 1.36 patches). gke-up checks the channel
+        # offers the version before anything is created (version_check).
+        "--release-channel", RELEASE_CHANNEL,
         "--labels", _labels_arg(spec.labels()),
         "--scopes", "cloud-platform",
         "--enable-ip-alias",
@@ -2378,8 +2424,15 @@ def cmd_gke_up(a) -> int:
     # before anything is created (run 16, run 19 attempt 3 and run 21 attempt 2 each
     # found out 30-45 minutes in)
     if dry:
+        execute(server_config_command(spec), dry_run=True)
         execute(region_quotas_command(spec.project, spec.zone), dry_run=True)
     else:
+        # #1383 gap 8: the version gke-up asks for is one the release channel offers in the region
+        ok, msg = version_check(spec)
+        if not ok:
+            sys.stderr.write(f"refusing: {msg}; nothing was created\n")
+            return 2
+        print(msg)
         fp, why = _run_footprint(spec, getattr(a, "address_need", None))
         if fp is None:
             sys.stderr.write(f"refusing: {why}; nothing was created\n")
