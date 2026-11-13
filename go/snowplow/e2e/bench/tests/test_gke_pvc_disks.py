@@ -311,6 +311,14 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
                  "spec": {"volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "data"}}]}},
                 {"metadata": {"name": "web-0", "namespace": "krateo-system"},
                  "spec": {"volumes": [{"name": "c", "configMap": {"name": "x"}}]}}]})); sys.exit(0)
+        # #1383 gap 4: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused)
+        if a[:2] == ["apply", "-f"]:
+            text = sys.stdin.read()
+            with open(os.path.join(st, "applied.txt"), "a") as fh:
+                fh.write(text + "\\n---\\n")
+            if "ttl-self-destruct" in text and os.environ.get("FAKE_TTL_APPLY_RC"):
+                sys.exit(int(os.environ["FAKE_TTL_APPLY_RC"]))
+            sys.exit(0)
         sys.exit(0)
     if a[:3] == ["container", "clusters", "describe"]:
         if has("deleted") and not os.environ.get("FAKE_NEVER_GONE"):

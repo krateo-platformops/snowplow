@@ -264,6 +264,9 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+        # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
+        if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
+            sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
     # #1297: the in-cluster Jobs (bench/incluster.py) RUN here, as their pods would: the container's
     # own command, its /out at STATE/pods/<job>/out, its kubectl this fake (the run's kubeconfig),
     # started when the Job is applied, TERMed (as the kubelet would) when the Job is deleted.

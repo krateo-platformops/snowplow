@@ -575,6 +575,9 @@ def lb_progress(svc_list: dict, events: list[dict] | None = None) -> tuple[dict,
 # ─── In-cluster dead-man switch ─────────────────────────────────────────────
 
 
+# gke-up's exit when the cluster exists but its TTL backstop is not applied
+EXIT_TTL_BACKSTOP_MISSING = 3
+
 def self_destruct_manifest(spec: ClusterSpec,
                            image: str = "gcr.io/google.com/cloudsdktool/"
                                         "google-cloud-cli:slim") -> str:
@@ -2261,9 +2264,13 @@ def cmd_gke_up(a) -> int:
     rc, _ = execute(["kubectl", f"--kubeconfig={spec.kubeconfig}",
                      f"--context={kube_context(spec)}", "apply", "-f", "-"],
                     dry_run=dry, input_data=self_destruct_manifest(spec))
+    # #1383 gap 4: a run without its TTL backstop does not go on: gke-up fails, and the caller's
+    # teardown (run606's EXIT trap: CLUSTER_CREATED is set before the create) deletes the cluster
     if rc != 0:
-        sys.stderr.write("self-destruct CronJob NOT applied; the trap and "
-                         "`gke-reap` are the remaining teardown layers\n")
+        sys.stderr.write(f"self-destruct CronJob NOT applied (rc={rc}): a run without its TTL backstop does not "
+                         f"go on; the run's teardown deletes {spec.name} (by hand: python3 -m bench.gke gke-down "
+                         f"--name {spec.name} --yes)\n")
+        return EXIT_TTL_BACKSTOP_MISSING
     return 0
 
 
