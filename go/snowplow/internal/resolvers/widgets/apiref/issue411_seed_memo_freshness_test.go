@@ -572,6 +572,6 @@ func TestIssue411_MemoDoesNotCrossRBACSubGenClass(t *testing.T) {
 			t.Fatalf("update ClusterRole: %v", err)
 		}
 	}, func() string {
-		return fmt.Sprint(cache.RBACSubGenForSubject("admin", rbac.WithAuthenticatedGroup([]string{"system:masters"})))
+		return fmt.Sprint(cache.RBACSubGenForSubject("admin", rbac.WithAuthenticatedGroup("admin", []string{"system:masters"})))
 	})
 }
