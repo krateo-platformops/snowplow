@@ -162,7 +162,7 @@ func (p *PublicIdentity) serve(wri http.ResponseWriter, req *http.Request, next 
 		publicIdentityOutcomes.Add(publicOutcomeUnavailable, 1)
 		xcontext.Logger(req.Context()).WarnContext(req.Context(), "public identity unavailable; token-less request refused",
 			"identity_class", PublicIdentityClass,
-			"needed", "impersonate on users [krateo:public] and groups [system:unauthenticated] (chart value publicIdentity.enabled)")
+			"needed", "the impersonate grant the chart value publicIdentity.enabled renders")
 		response.ServiceUnavailable(wri, err)
 		return
 	}

@@ -22,6 +22,6 @@ func newPublicIdentity(on bool) *middleware.PublicIdentity {
 	// log-ctx-waiver: boot: main wires the routes once at start
 	slog.Info("public identity enabled: a request with no Authorization header is served as the public identity, by impersonation",
 		slog.String("identity_class", middleware.PublicIdentityClass),
-		slog.String("needs", "impersonate on users [krateo:public] and groups [system:unauthenticated]"))
+		slog.String("needs", "the impersonate grant the chart value publicIdentity.enabled renders"))
 	return middleware.NewPublicIdentity(idynamic.ServiceAccountEndpoint, idynamic.ServiceAccountRESTConfig)
 }
