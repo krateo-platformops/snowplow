@@ -235,15 +235,21 @@ func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
 	// system:unauthenticated) and the bindings produced unauthenticated
 	// representatives, none becomes a seed target.
 	exp := time.Now().Add(time.Hour)
-	cache.ObserveLiveIdentity(i1334Public, unauth, exp)
-	cache.ObserveLiveIdentity(i1334Visitor, unauth, exp)
-	cache.ObserveLiveIdentity(i1334Alice, nil, exp)
 	// CONTROL class: the same user with no group — authenticated, and
 	// authorised for the GVR by the very RoleBinding that authorises the public
 	// identity (it names the USER). It must be emitted as a learned target, so
 	// the public class's absence is the filter's verdict, not the authorisation
-	// check's.
+	// check's. In this world no binding names either implicit group, so the two
+	// classes share one RBAC class signature and the enumeration dedups the
+	// later-ordered one onto the earlier. Classes are ordered newest first, so
+	// the control is observed FIRST (oldest): without the filter the public
+	// class is emitted and the control is the one deduped.
 	cache.ObserveLiveIdentity(i1334Public, nil, exp)
+	time.Sleep(5 * time.Millisecond)
+	cache.ObserveLiveIdentity(i1334Alice, nil, exp)
+	cache.ObserveLiveIdentity(i1334Visitor, unauth, exp)
+	time.Sleep(5 * time.Millisecond)
+	cache.ObserveLiveIdentity(i1334Public, unauth, exp)
 	gvr := schema.GroupVersionResource{Group: h1RAGVR.Group, Version: h1RAGVR.Version, Resource: h1RAGVR.Resource}
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
