@@ -948,71 +948,11 @@ s_up() {
 # once that ships the derived path ("") works too, and going back is a later
 # decision.
 write_installer_values() {
-  # run 26: the frontend's image override, appended to componentValues only when
-  # FRONTEND_TAG is set (unset: the file is byte-identical to before)
-  local frontend_values=""
-  if [[ -n "$FRONTEND_TAG" ]]; then
-    frontend_values=$'\n  frontend:\n    image:\n      tag: "'"${FRONTEND_TAG}"'"'
-  fi
-  cat > "$OUT/installer-values.yaml" <<EOF
-bootstrap:
-  coreProvider:
-    enabled: true
-# The portal stack behind ONE origin, as krateo-057's installer-platform
-# release has it (helm get values, read-only 2026-10-29): exposure Gateway,
-# path mode (/ frontend, /auth authn, /content snowplow, /events sse-proxy,
-# each prefix rewritten to /), the two-gateway split, the agentgateway. 057
-# also sets tls (its own hostname and certificate): the bench has neither, so
-# its origin is http://<platform gateway ip>:<platformPort>. 057's
-# exposure.port: 80 is left out: inert in Gateway mode (installer 0.3.468
-# values.schema.json: "Ignored when type=Gateway"; compositions.yaml reads it
-# only for LoadBalancer/NodePort and outside the path-mode branch).
-# Comparability: from run 19 on, the browser reaches the portal through the
-# agentgateway (runs <= 17 went direct, through a localhost forwarder), so
-# browser figures are not comparable across that line; A/B inside one run is
-# unaffected, and k6's users still reach snowplow by its Service DNS.
-exposure:
-  type: Gateway
-  gatewayMode: path
-  gatewayRef:
-    name: krateo-agent-gateway
-  internalDataPlane: true
-  platformPort: 80
-features:
-  agentGateway: true
-  coreAgents: false
-  specialistAgents: false
-vertexAI:
-  enabled: false
-# Installer 0.3.422 schema: top-level additionalProperties=false and the
-# engine subchart key is core-provider (the fresh-install runbook's
-# krateo-core-provider key is rejected by helm schema validation).
-core-provider:
-  resources:
-    limits:
-      memory: 4Gi
-componentValues:
-  snowplow:
-    image:
-      tag: "${SNOWPLOW_TAG}"
-    nodeSelector:
-      bench.krateo.io/pool: snowplow
-    tolerations:
-    - key: dedicated
-      operator: Equal
-      value: snowplow
-      effect: NoSchedule${frontend_values}
-registryAuth:
-  enabled: true
-  # username: set at install from the pull-token file, piped into helm's -f - (not kept)
-  passwordRef:
-    name: krateo-agentiko-pull
-    namespace: krateo-system
-    key: token
-  imagePullSecretName: bench-ghcr-image-pull
-  insecureSkipVerifyTLS: false
-  registries: []
-EOF
+  # #1395: the document is bench/installer_values.py's, ONE source with bench.vm606's laptop-side
+  # chart check (which renders the installer's private-image components with these same values
+  # before any paid step); run 26: FRONTEND_TAG appends the frontend's image override
+  python3 -m bench.installer_values --snowplow-tag "$SNOWPLOW_TAG" --frontend-tag "$FRONTEND_TAG" \
+      --out "$OUT/installer-values.yaml"
 }
 # s_registry: BEFORE any cluster exists, the pull token must resolve every
 # repo-override chart the installer turns on, and every private-image

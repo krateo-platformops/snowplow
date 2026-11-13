@@ -64,10 +64,12 @@ The preflight resolves, before any cluster exists:
     turn on). An image the token cannot read is refused here, never as an
     ImagePullBackOff on a paid cluster.
   - the installer's own list of private-image components
-    (inst.privateImageComponents): each one this install enables must render,
-    and must render at least one ghcr.io image, or the derivation is not to
-    be trusted and the run is refused. A render failure of any other chart is
-    recorded, not refused.
+    (inst.privateImageComponents), RENDERED from the installer chart the run
+    installs (#1395, private_image_paths): each one this install enables must
+    render, and must render at least one ghcr.io image, or the derivation is
+    not to be trusted and the run is refused. A list that cannot be rendered
+    and read refuses the run with the reason. A render failure of any other
+    chart is recorded, not refused.
   - every component whose image the run overrides (--override COMPONENT=TAG;
     run606's FRONTEND_TAG, run 26), whatever its repo: this install must
     enable it, it must render with the run's values, and a ghcr.io image it
@@ -109,7 +111,7 @@ import io
 import json
 import multiprocessing
 import os
-import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -120,6 +122,7 @@ import time
 import urllib.error
 import urllib.request
 
+from bench.gke import DEFAULT_CLUSTER_VERSION
 from bench.noanswer import (NO_ANSWER_ERRORS, NO_ANSWER_STATUS, SSL_DROP_REASONS,  # noqa: F401
                             SSL_DROPS, TEMPORARY_EAI, Budget, NoAnswer, attempt, phase, unanswered)
 
@@ -360,38 +363,99 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
-_PRIVATE_IMAGE_RX = re.compile(
-    r'\{\{-?\s*define\s+"inst\.privateImageComponents"\s*-?\}\}(.*?)\{\{-?\s*end\s*-?\}\}', re.S)
+#: #1395: the installer's own list of its private-image components, as a define of its chart
+PRIVATE_DEFINE = "inst.privateImageComponents"
+#: the Kubernetes version the installer chart is rendered for: the one every bench cluster is created
+#: at (gke-up --cluster-version); the chart's kubeVersion constraint refuses helm's own default
+KUBE_VERSION = DEFAULT_CLUSTER_VERSION
+#: the release the run installs the installer as (run606.sh s_install: `helm install installer`)
+INSTALLER_RELEASE = "installer"
+_PROBE_KEY = "privateImageComponents"
 
 
-def private_image_components(installer_pulled: str) -> set[str] | None:
-    """The names in private_image_paths()."""
-    paths = private_image_paths(installer_pulled)
-    return None if paths is None else set(paths)
+def _probe_template(name: str) -> str:
+    """A template that renders the installer's own list into one ConfigMap value. It reads the
+    define exactly as the installer's consumers do (`include "inst.privateImageComponents" $top |
+    fromYaml`: inst.imagePullAuths, compositions.yaml), then hands it over as JSON, so no form of
+    the define's source changes what is read: a comment, a delegation, a rule over values."""
+    return ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + name + "\ndata:\n  " + _PROBE_KEY
+            + ': {{ include "' + PRIVATE_DEFINE + '" . | fromYaml | toJson | quote }}\n')
 
 
-def private_image_paths(installer_pulled: str) -> dict[str, list[list[str]]] | None:
-    """The installer's own list of components with PRIVATE images (its
-    inst.privateImageComponents define: the components it injects image-pull
-    Secrets into, and at which values paths), by component. None when this
-    installer has no such define; raises ValueError when the define is not a
-    static list (it is then not the installer's rule this mirrors)."""
-    tdir = os.path.join(installer_pulled, "installer", "templates")
-    bodies = []
-    for n in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
-        if n.endswith((".tpl", ".yaml")):
-            with open(os.path.join(tdir, n)) as fh:
-                bodies += _PRIVATE_IMAGE_RX.findall(fh.read())
-    if not bodies:
-        return None
-    if len(bodies) != 1 or "{{" in bodies[0]:
-        raise ValueError("inst.privateImageComponents is not one static list: its rule cannot be read")
-    doc = _load_yaml(bodies[0], "the installer's inst.privateImageComponents: ") or {}
+def _chart_with(root: str, extra: dict[str, str]) -> bytes:
+    """The chart directory `root` as a helm archive (its files under one top directory, as helm
+    packs it) with `extra` (path in the chart -> text) added. In memory: the directory, which
+    s_install installs from, is never written to."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+        tf.add(root, arcname="installer")
+        for rel, text in extra.items():
+            data = text.encode()
+            ti = tarfile.TarInfo("installer/" + rel)
+            ti.size, ti.mode, ti.mtime = len(data), 0o644, int(time.time())
+            tf.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _read_probe(docs: list) -> dict[str, list[list[str]]]:
+    """The rendered list, by component: each entry a name and a non-empty values path of non-empty
+    keys. Raises _Refused naming what is not that."""
+    cms = [d for d in docs if isinstance(d, dict) and d.get("kind") == "ConfigMap"]
+    if len(docs) != 1 or len(cms) != 1:
+        raise _Refused(f"the render gave {len(docs)} document(s), not the one probe")
+    raw = (cms[0].get("data") or {}).get(_PROBE_KEY)
+    if not isinstance(raw, str):
+        raise _Refused("the render holds no rendered list")
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise _Refused(f"the rendered list is not JSON ({e})") from None
+    if not isinstance(doc, dict):
+        raise _Refused(f"the define renders {type(doc).__name__}, not a map")
+    if "Error" in doc:                 # helm's fromYaml: a map holding only the parse error
+        raise _Refused(f"the define does not render as YAML: {str(doc['Error'])[:300]}")
+    comps = doc.get("components")
+    if not isinstance(comps, list) or not comps:
+        raise _Refused("the define renders no `components` list, or an empty one: the self-check would "
+                       "check nothing")
     out: dict[str, list[list[str]]] = {}
-    for c in doc.get("components") or []:
-        if isinstance(c, dict) and c.get("name"):
-            out.setdefault(c["name"], []).append([str(x) for x in c.get("path") or []])
+    for i, c in enumerate(comps):
+        name = c.get("name") if isinstance(c, dict) else None
+        path = c.get("path") if isinstance(c, dict) else None
+        if not (isinstance(name, str) and name and isinstance(path, list) and path
+                and all(isinstance(k, str) and k for k in path)):
+            raise _Refused(f"its entry {i} is not a name and a non-empty path of keys: {json.dumps(c)[:200]}")
+        out.setdefault(name, []).append(list(path))
     return out
+
+
+def private_image_paths(installer_pulled: str, values: dict, helm: str = "helm") -> dict[str, list[list[str]]]:
+    """The installer's own list of components with PRIVATE images (its inst.privateImageComponents
+    define: the components it injects image-pull Secrets into, and at which values paths), by
+    component, RENDERED (#1395): `helm template` of the pulled chart (`installer_pulled`/installer,
+    the copy s_install installs) as the run installs it (release INSTALLER_RELEASE, namespace
+    SECRET_NS, KUBE_VERSION) with `values`, plus one probe template (_probe_template) under a name
+    of its own, shown alone. Bounded as every render is (render). Run 26f: a regex over the
+    template source read the comment installer 0.3.616 put inside the define as an unknown rule.
+
+    Raises _Refused (fail closed) with the reason whenever the render does not answer: helm fails
+    (the define gone, a value the chart refuses, ...), does not finish, or what it renders is not
+    a non-empty list of names and paths."""
+    root = os.path.join(installer_pulled, "installer")
+    why = ("the installer's private-image components (inst.privateImageComponents) cannot be read from its "
+           "rendered chart")
+    if not os.path.isfile(os.path.join(root, "Chart.yaml")):
+        raise _Refused(f"{why}: no pulled installer chart at {root}")
+    probe = f"templates/zz-bench-probe-{secrets.token_hex(4)}.yaml"
+    try:
+        data = _chart_with(root, {probe: _probe_template("bench-private-image-probe")})
+        docs = render(data, INSTALLER_RELEASE, values, helm,
+                      args=("--kube-version", KUBE_VERSION, "--show-only", probe))
+        return _read_probe(docs)
+    except _Refused as e:
+        raise _Refused(f"{why}: {e}") from None
+    except OSError as e:
+        raise _Refused(f"{why}: the chart could not be read ({e})") from None
 
 
 class _Refused(Exception):
@@ -823,7 +887,8 @@ def _tail(fh, n: int = STDERR_TAIL) -> str:
     return fh.read(n).decode("utf-8", "replace")
 
 
-def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict | None = None) -> list:
+def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict | None = None,
+           args: tuple = ()) -> list:
     """`helm template` of the chart `data` with `values`: its manifests. The
     WHOLE of it within RENDER_BOUND_S: helm run and its stdout read streamed
     and capped at RENDER_OUT_MAX (_call; past the bound helm is killed, and
@@ -831,7 +896,8 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
     is left of the bound (_in_child: the parse stops, not only the wait). Raises _Refused with helm's own reason when it cannot render.
     The chart (never a credential) is written to a private temporary
     directory removed at once; the values go on stdin (_dump_yaml), stderr
-    to a file. `meta` gets `render` (bytes) and `render_deepest` (levels)."""
+    to a file. `meta` gets `render` (bytes) and `render_deepest` (levels). `args`: helm template's
+    own flags, after the chart (private_image_paths: --kube-version, --show-only)."""
     procs: list = []
 
     def kill():
@@ -847,7 +913,7 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                 fh.write(data)
             with open(err, "w+b") as ef:
                 try:
-                    pr = subprocess.Popen([helm, "template", name, path, "--namespace", SECRET_NS, "-f", "-"],
+                    pr = subprocess.Popen([helm, "template", name, path, "--namespace", SECRET_NS, *args, "-f", "-"],
                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=ef)
                 except OSError as e:
                     raise _Refused(f"helm template could not run: {e}") from None
@@ -868,7 +934,10 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                         kill()
                         raise _Refused(f"helm template rendered more than its {RENDER_OUT_MAX} byte cap")
                 rc = pr.wait()
-                why = (_tail(ef).strip().splitlines() or [f"exit {rc}"])[-1]
+                # helm's reason is its last `Error:` line: after a template error helm adds a hint
+                # ("Use --debug flag to render out invalid YAML"), which is not one (#1395)
+                said = _tail(ef).strip().splitlines() or [f"exit {rc}"]
+                why = ([x for x in said if x.startswith("Error")] or said)[-1]
                 if meta is not None:
                     meta["render"] = len(out)
         if rc != 0:
@@ -1223,11 +1292,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         overrides[comp] = tag
     try:
-        paths = private_image_paths(a.installer_pulled)
-        private = None if paths is None else set(paths)
-        pins = private_pins(a.installer_pulled, a.values, include=(private or set()) | set(overrides))
+        # #1395: rendered with the values the run installs with: the bench's file, then the
+        # username document s_install pipes after it (`-f values -f -`), merged as helm merges them
+        with open(a.values, "rb") as fh:
+            run_values = _merge(_load_yaml(fh.read(), f"{a.values}: ") or {}, {"registryAuth": {"username": user}})
+        paths = private_image_paths(a.installer_pulled, run_values, a.helm)
+        private = set(paths)
+        pins = private_pins(a.installer_pulled, a.values, include=private | set(overrides))
     except (ValueError, _Refused) as e:  # the installer's enable rule unreadable: nothing to resolve against
-        print(f"refusing: {e}", file=sys.stderr)
+        print(f"refusing: {str(e).replace(user, '<registry user>') if user else e}", file=sys.stderr)
         return 2
     absent = sorted(set(overrides) - {p["name"] for p in pins})
     if absent:
@@ -1248,11 +1321,11 @@ def main(argv: list[str] | None = None) -> int:
         render, ci, no_answer = None, None, bool(err) and err.no_answer
         if not err:
             ci = chart_images(p["repo"], p["chart"], p["version"], user, token, p["values"], a.helm,
-                              name=p["name"], paths=(paths or {}).get(p["name"]), budget=budget)
+                              name=p["name"], paths=paths.get(p["name"]), budget=budget)
             err, no_answer = ci["error"], ci["no_answer"]
             render = (None if ci["error"] else ("failed: " + ci["render_error"]) if ci["render_error"]
                       else f"ok ({len(ci['rendered'])} images)")
-            if not err and private is not None and p["name"] in private:
+            if not err and p["name"] in private:
                 # the installer injects image-pull Secrets into this one: its images MUST be known
                 missing = [r["path"] for r in ci["paths"] or [] if r["result"] == "missing"]
                 if ci["render_error"] and ci["render_no_answer"]:
@@ -1283,7 +1356,7 @@ def main(argv: list[str] | None = None) -> int:
                            f"{REGISTRY_HOST} image it renders carries that tag (rendered: "
                            f"{', '.join(ci['rendered'] or []) or 'none'})")
         return ({"chart": ref, "version": p["version"], "render": render,
-                 "private_image_component": bool(private and p["name"] in private),
+                 "private_image_component": p["name"] in private,
                  **({"image_override": overrides[p["name"]]} if p["name"] in overrides else {}),
                  "paths": ci["paths"] if ci else None, "measured": ci["measured"] if ci else None,
                  "error": err, "no_answer": bool(err) and no_answer}, ci)
@@ -1313,14 +1386,13 @@ def main(argv: list[str] | None = None) -> int:
     with open(a.out, "w") as fh:
         json.dump({"kind": "ghcr_pull_preflight", "bound_s": bound, "bound": how, "caps": CAPS,
                    "stale_inputs": stale,
-                   "private_image_components": sorted(private) if private is not None else None,
+                   "private_image_components": sorted(private),
                    "charts": res, "images": img_res,
                    "images_elsewhere": [{"image": i, "charts": c} for i, c in sorted(other.items())]}, fh, indent=1)
     print(f"[ghcr] the step's bound: {bound:g} s ({how}); a call with no answer is asked again within it",
           file=sys.stderr)
-    if private is None:
-        print("[ghcr] this installer declares no inst.privateImageComponents: no private-image self-check",
-              file=sys.stderr)
+    print(f"[ghcr] the installer's private-image components (inst.privateImageComponents, rendered): "
+          f"{', '.join(sorted(private))}", file=sys.stderr)
     for r in res:
         print(f"[ghcr] {r['chart']} {r['version']}: {'OK' if not r['error'] else r['error']}"
               + (f" (render {r['render']})" if r["render"] else ""), file=sys.stderr)

@@ -155,7 +155,11 @@ def _installer(tmp_path, frontend=True):
     (root / "files").mkdir(parents=True)
     (root / "templates").mkdir()
     (root / "Chart.yaml").write_text("apiVersion: v2\nname: installer\nversion: 0.3.545\n")
-    (root / "templates" / "_helpers.tpl").write_text('{{- define "inst.coreFeatures" -}}{{- end -}}\n')
+    # #1395: the installer's private-image list is rendered; this one names a component not pinned here
+    (root / "templates" / "_helpers.tpl").write_text(
+        '{{- define "inst.coreFeatures" -}}{{- end -}}\n'
+        '{{- define "inst.privateImageComponents" -}}\ncomponents:\n- name: core-provider-agent\n'
+        '  path: [mcpServers, chartGate, imagePullSecrets]\n{{- end -}}\n')
     comps = [{"name": "snowplow", "version": "1.12.66", "feature": "portal"}]
     if frontend:   # as 0.3.545 pins it: no repo of its own (the installer's ociRepo)
         comps.append({"name": "frontend", "kind": "Frontend", "chart": "frontend", "version": "1.8.34",

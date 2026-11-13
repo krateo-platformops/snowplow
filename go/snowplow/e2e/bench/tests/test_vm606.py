@@ -47,6 +47,7 @@ STORAGE_ROLES = ["roles/storage.objectCreator", "roles/storage.objectViewer"]
 PROJECT_ROLES = [r for r in ROLES[:-1] if r not in STORAGE_ROLES]
 
 _OUTPUT: list[str] = []
+CHART_CHECKS: list[tuple[str, list[str]]] = []
 
 
 def _in(hours: float) -> str:
@@ -74,6 +75,14 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
+    # #1395: up and launch check the installer chart on the laptop (registry + helm); these tests are
+    # about the VM, so the check is recorded here and tests/test_1395_private_render.py runs the real one
+    CHART_CHECKS.clear()
+
+    def chart_check(env, labels, helm="helm"):
+        CHART_CHECKS.append((env["INSTALLER_VERSION"], list(labels)))
+        return [f"chart check (recorded): installer {env['INSTALLER_VERSION']}"]
+    monkeypatch.setattr(vm606, "chart_check", chart_check)
     yield st
     records = [p.read_text() for p in (tmp_path / "laptop-data").rglob("*") if p.is_file() and p.suffix in
                (".json", ".log", ".sh")]
@@ -88,6 +97,13 @@ def _run(capsys, *argv) -> tuple[int, str, str]:
     out, err = capsys.readouterr()
     _OUTPUT.extend([out, err])
     return rc, out, err
+
+
+def _up_env() -> str:
+    """The env file up takes (#1395): the launch's, in the test's laptop HOME."""
+    p = Path(os.environ["HOME"]) / "up.env"
+    p.write_text("".join(f"{k}={shlex.quote(v)}\n" for k, v in ENV.items()))
+    return str(p)
 
 
 def _verbs(st) -> list[str]:
@@ -210,7 +226,7 @@ def _flag(argv, f):
 
 
 def test_up_dry_prints_grants_rules_and_the_vm_and_creates_nothing(fake, capsys):
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15")
     assert rc == 0, err
     create = next(ln for ln in out.splitlines() if ln.startswith("DRY-RUN: gcloud compute instances create"))
     for part in (f"create {VM} --project {PROJECT} --zone europe-west4-a", "--machine-type e2-standard-8",
@@ -236,7 +252,7 @@ def test_up_dry_prints_grants_rules_and_the_vm_and_creates_nothing(fake, capsys)
 
 def _up(capsys, monkeypatch, *extra):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
-    return _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", ZONE, *extra)
+    return _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", ZONE, *extra)
 
 
 def test_up_grants_expiring_with_the_vm_before_the_vm_then_iap_only_ssh(fake, capsys, monkeypatch):
@@ -288,7 +304,7 @@ def test_up_reads_the_grants_back_and_creates_nothing_when_one_is_not_held(fake,
 
 def test_up_refuses_a_vm_whose_tools_are_not_the_laptops(fake, capsys, monkeypatch):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps({**BOOT, "kubectl": "v1.35.0"}))
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0")
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0")
     assert rc == 2 and "kubectl 'v1.35.0', want 'v1.36.2'" in err and f"down --run {RUN} --yes" in err
 
 
@@ -310,7 +326,7 @@ def test_up_waits_out_a_booting_vms_ssh_and_names_the_firewall_when_it_never_ans
     assert len([c for c in fake_vm606.calls(fake) if c["argv"][:2] == ["compute", "ssh"]]) == 3
     monkeypatch.setenv("FAKE_SSH_FAIL_TIMES", "1000000")
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
-    rc, _out, err = _run(capsys, "up", "--run", "run26", "--ttl-hours", "15", "--yes", "--poll-s", "0",
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", "run26", "--ttl-hours", "15", "--yes", "--poll-s", "0",
                          "--ssh-ready-timeout-s", "0")
     assert rc == 2 and "never answered in 0 s, last at IAP 4003: IAP reached the VM's network" in err
     assert "down --run run26" in err
@@ -320,7 +336,7 @@ def test_up_waits_out_a_booting_vms_ssh_and_names_the_firewall_when_it_never_ans
                                       ("FAKE_NO_SA", "the orchestrator SA")])
 def test_up_refuses_before_granting_without_iap_or_the_sa(fake, capsys, monkeypatch, env, why):
     monkeypatch.setenv(env, "1")
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes")
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes")
     assert rc == 2 and why in err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or "create" in v]
 
@@ -328,7 +344,7 @@ def test_up_refuses_before_granting_without_iap_or_the_sa(fake, capsys, monkeypa
 @pytest.mark.parametrize("args", [["--run", "Run_25", "--ttl-hours", "15"], ["--run", RUN, "--ttl-hours", "0"],
                                   ["--run", RUN, "--ttl-hours", "73"]])
 def test_up_refuses_bad_names_and_ttls(fake, capsys, args):
-    rc, _out, _err = _run(capsys, "up", *args, "--yes")
+    rc, _out, _err = _run(capsys, "up", "--env-file", _up_env(), *args, "--yes")
     assert rc == 2 and fake_vm606.calls(fake) == []
 
 
@@ -942,7 +958,7 @@ def test_down_with_nothing_left_says_so(fake, capsys):
 # ─── the VM's own region; two launches at once ──────────────────────────────
 
 def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, monkeypatch):
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15")
     assert rc == 0, err
     for metric in ("INSTANCES", "E2_CPUS", "SSD_TOTAL_GB", "IN_USE_ADDRESSES"):
         assert re.search(rf"^{metric} in europe-west4: .*the VM needs", out, re.M), (metric, out)
@@ -954,7 +970,7 @@ def test_up_reads_the_vms_footprint_against_the_region_it_sits_in(fake, capsys, 
     assert {c["argv"][1] for c in lists} == {"firewall-rules", "instances", "forwarding-rules", "addresses"}
     assert all(c["partial_error"] == "false" for c in lists)
     monkeypatch.setenv("FAKE_LIMIT_E2_CPUS", "4")
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0",
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--yes", "--poll-s", "0",
                          "--ssh-ready-timeout-s", "1", "--bootstrap-timeout-s", "1")
     assert rc == 2 and "the VM does not fit europe-west4's or operations-dev-krateo-io's quotas: E2_CPUS" in err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or v.endswith(" create")]
@@ -965,9 +981,9 @@ def test_up_counts_a_vm_already_in_its_region_and_none_in_another(fake, capsys, 
     VM does not fit in europe-west4 and fits in europe-west1."""
     fake_vm606.put_instance(fake, vm606.vm_name("run24"), {**LABELS, "run": "run24"}, _in(15), zone="europe-west4-a")
     monkeypatch.setenv("FAKE_LIMIT_IN_USE_ADDRESSES", "1")
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15")
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15")
     assert rc == 2 and "IN_USE_ADDRESSES in europe-west4: 1 of 1 used (listed: 1 VM external IP(s)" in err
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--ttl-hours", "15", "--zone", "europe-west1-b")
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15", "--zone", "europe-west1-b")
     assert rc == 0, err
     assert "IN_USE_ADDRESSES in europe-west1: 0 of 1 used (listed: 0 VM external IP(s)" in out
 
@@ -985,7 +1001,7 @@ def _two_runs(fake, capsys, monkeypatch):
     """run24's VM in europe-west4 and run25's in europe-west1, each up as up makes it."""
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
     for run, zone in (("run24", "europe-west4-a"), (RUN, "europe-west1-b")):
-        rc, _out, err = _run(capsys, "up", "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", zone)
+        rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0", "--zone", zone)
         assert rc == 0, err
 
 
@@ -1082,7 +1098,7 @@ def test_prefix_colliding_runs_down_of_run2_never_touches_run25(fake, capsys, mo
     """run2 is a prefix of run25: titles, members and rule names are matched exactly, never by prefix."""
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
     for run in ("run25", "run2"):
-        rc, _out, err = _run(capsys, "up", "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0")
+        rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0")
         assert rc == 0, err
     other = {"role": "roles/compute.viewer", "members": ["serviceAccount:someone-else@example.invalid"],
              "condition": vm606.iam_condition("run2", "2026-11-11T00:00:00Z")}
@@ -1441,7 +1457,7 @@ def test_up_resumes_a_run_that_stopped_in_its_bootstrap_wait(fake, capsys, monke
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
     n = len(fake_vm606.calls(fake))
     before = _snapshot(fake)
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0", *extra)
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--yes", "--poll-s", "0", *extra)
     assert rc == 0, err
     assert "its 2 SSH rules and its 9 conditional bindings read back as up made them; resuming" in out
     assert f"{VM} bootstrapped" in out and _state()["bootstrap"] == BOOT
@@ -1453,7 +1469,7 @@ def test_up_resumes_a_run_that_stopped_in_its_bootstrap_wait(fake, capsys, monke
 def test_up_resume_dry_reads_back_and_changes_nothing(fake, capsys, monkeypatch):
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
     n = len(fake_vm606.calls(fake))
-    rc, out, err = _run(capsys, "up", "--run", RUN)
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN)
     assert rc == 0 and "DRY: would wait for" in out, err
     assert _no_writes_since(fake, n) == [] and not [c for c in fake_vm606.calls(fake)[n:] if c["argv"][1] == "ssh"]
     assert "bootstrap" not in _state()
@@ -1464,7 +1480,7 @@ def test_up_resume_dry_reads_back_and_changes_nothing(fake, capsys, monkeypatch)
 def test_up_resume_refuses_a_flag_that_is_not_the_records(fake, capsys, monkeypatch, flag, value):
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
     n = len(fake_vm606.calls(fake))
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--yes", flag, value)
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--yes", flag, value)
     assert rc == 2 and f"{flag} {value} is not run {RUN}'s recorded" in err
     assert fake_vm606.calls(fake)[n:] == []
 
@@ -1617,7 +1633,7 @@ def test_up_resume_refuses_anything_partial_or_not_as_made_and_changes_nothing(f
     _break(fake, how)
     before = _snapshot(fake)
     n = len(fake_vm606.calls(fake))
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--yes", "--poll-s", "0")
     assert rc == 2 and why in err, err
     assert "resuming" not in out and _snapshot(fake) == before and _no_writes_since(fake, n) == []
     assert not [c for c in fake_vm606.calls(fake)[n:] if c["argv"][1] == "ssh"]
@@ -1652,7 +1668,7 @@ def test_up_resume_confirms_the_parents_first(fake, capsys, monkeypatch):
     _stopped_in_bootstrap(fake, capsys, monkeypatch)
     monkeypatch.setenv("FAKE_PROJECT_STATE", "DELETE_REQUESTED")
     n = len(fake_vm606.calls(fake))
-    rc, _out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
+    rc, _out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--yes", "--poll-s", "0")
     assert rc == 2 and f"project {PROJECT} is DELETE_REQUESTED, not ACTIVE" in err
     assert [" ".join(c["argv"][:2]) for c in fake_vm606.calls(fake)[n:]] == ["projects describe"]
 
@@ -1822,11 +1838,11 @@ def test_a_resume_after_a_checkout_change_still_refuses_real_drift(fake, capsys,
     monkeypatch.setattr(vm606, "MACHINE_TYPE", "e2-standard-16")
     monkeypatch.setattr(vm606, "startup_script", lambda: "#!/bin/bash\necho a later checkout\n")
     n = len(fake_vm606.calls(fake))
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--poll-s", "0")              # dry: the read-back only
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--poll-s", "0")              # dry: the read-back only
     assert rc == 0 and "read back as up made them" in out, err                   # the record, not the checkout
     _tamper(fake, "oslogin-off")
     before = _snapshot(fake)
-    rc, out, err = _run(capsys, "up", "--run", RUN, "--yes", "--poll-s", "0")
+    rc, out, err = _run(capsys, "up", "--env-file", _up_env(), "--run", RUN, "--yes", "--poll-s", "0")
     assert rc == 2 and f'instance {VM} metadata: enable-oslogin "FALSE", up made "TRUE"' in err
     assert _snapshot(fake) == before and _no_writes_since(fake, n) == []
 

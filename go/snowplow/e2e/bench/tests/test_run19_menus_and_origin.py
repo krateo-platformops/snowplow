@@ -266,10 +266,9 @@ def test_the_cli_exports_the_origin_or_says_why_not(tmp_path):
 
 
 def test_the_installer_values_expose_the_portal_as_057_does():
+    from bench import installer_values          # #1395: run606.sh's values, from their one source
     src = (BENCH_DIR / "run606.sh").read_text()
-    block = src[src.index('cat > "$OUT/installer-values.yaml" <<EOF'):]
-    block = block[block.index("\n") + 1:block.index("\nEOF\n")]
-    v = yaml.safe_load(block.replace("${SNOWPLOW_TAG}", "x"))
+    v = yaml.safe_load(installer_values.document("x"))
     assert v["exposure"] == {"type": "Gateway", "gatewayMode": "path", "gatewayRef": {"name": "krateo-agent-gateway"},
                              "internalDataPlane": True, "platformPort": 80}
     assert v["features"]["agentGateway"] is True
