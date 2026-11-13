@@ -139,8 +139,22 @@ pointer (a multi-subject binding appears once):
 
 1. `CRBsByUser[Username]` when `Username != ""`
 2. `CRBsByGroup[g]` for every `g` in `effectiveGroups(opts)`
-3. `CRBsByGroup["system:authenticated"]`, gated on `Username != ""` so an unauthenticated
-   identity never lands the implicit group
+3. `CRBsByGroup[implicitGroup(opts)]` — the one group the kube-apiserver adds to the requester,
+   decided only by `cache.ImplicitGroup` (#1334), when it adds one:
+   - `system:anonymous` gets `system:unauthenticated` (unless its groups already hold it);
+   - any other user gets `system:authenticated`, unless its groups already hold
+     `system:authenticated` or `system:unauthenticated` — then nothing is added, so an identity
+     presenting `system:unauthenticated` is never authenticated;
+   - `system:anonymous` is never given `system:authenticated`.
+
+   This is the apiserver's own rule in k8s.io/apiserver v0.36.5 (the module's pin):
+   `pkg/endpoints/filters/impersonation/impersonation.go:126-144` (non-anonymous:
+   `system:authenticated` unless either implicit group is present) and `:145-157`
+   (`system:anonymous`: `system:unauthenticated` unless present), and
+   `pkg/authentication/group/authenticated_group_adder.go:45-56` on the authentication path (adds
+   nothing for `system:anonymous`, whose anonymous authenticator already yields
+   `[system:unauthenticated]`; otherwise the same `system:authenticated` rule). An empty
+   `Username` is "no requester" and lands no implicit group.
 4. `CRBsByServiceAccount["<ns>/<name>"]` when the username is a canonical SA
 5. `CRBsCatchAll` — always
 
@@ -159,8 +173,10 @@ the index routes a User but the matcher only checks Groups (or vice-versa), the 
 The matcher `anySubjectMatches` is the canonical statement of the predicate:
 
 - `UserKind` → exact `s.Name == opts.Username`
-- `GroupKind` → membership test against `effectiveGroups`, **plus** the implicit
-  `system:authenticated` for any authenticated identity
+- `GroupKind` → membership test against `effectiveGroups`, **plus** the apiserver's implicit
+  group `implicitGroup(opts)` (route 3 above: `system:authenticated` for an authenticated
+  identity, `system:unauthenticated` for `system:anonymous`, none for an identity presenting
+  `system:unauthenticated`)
 - `ServiceAccountKind` → `(Namespace, Name)` match on a parsed canonical SA username
 - any other kind → no case → no match
 
