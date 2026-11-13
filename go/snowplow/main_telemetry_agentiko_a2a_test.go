@@ -216,6 +216,52 @@ func TestRUMAgentikoA2A_RouteIsTheTemplateCheck(t *testing.T) {
 	}
 }
 
+// http.response.status_code on this span is an integer in 100–599 (the
+// contract, second comment on #1398; howto/rum-ingest.md): 0, 99 and 600,
+// and a value that is not an integer (the string "200", a double) are each
+// dropped and counted, and the span is forwarded with its other three
+// attributes (POST, the template route, the a2a method) as sent.
+//
+// MUTATION (RED, shown in the PR): the row's status check replaced by one
+// that accepts any integer (0, 99 and 600 are forwarded).
+func TestRUMAgentikoA2A_BadStatusCodeDropped(t *testing.T) {
+	bad := []struct {
+		name  string
+		value map[string]any
+	}{
+		{"0", map[string]any{"intValue": "0"}},
+		{"99", map[string]any{"intValue": "99"}},
+		{"600", map[string]any{"intValue": "600"}},
+		{"string 200", map[string]any{"stringValue": "200"}},
+		{"double 200", map[string]any{"doubleValue": 200.0}},
+	}
+	var spans []otlpSpan
+	for _, b := range bad {
+		spans = append(spans, a2aSpanWith("message/send", []map[string]any{rawAttr("http.response.status_code", b.value)}))
+	}
+	out, dropped, _ := postA2AAndExport(t, "a2a-bad-status", otlpBody(t, rum.ServiceName, nil, spans...), len(spans))
+	if want := uint64(len(bad)); dropped != want {
+		t.Errorf("attributes_dropped delta %d, want %d (one per bad status)", dropped, want)
+	}
+	for i, s := range out {
+		if s.GetName() != a2aSpan {
+			t.Errorf("%s: span is %q, want %q", bad[i].name, s.GetName(), a2aSpan)
+		}
+		if got, want := attrKeys(s), "http.request.method,http.route,"+a2aMethodKey; got != want {
+			t.Errorf("%s: forwards [%s], want [%s]", bad[i].name, got, want)
+		}
+		if v, _ := stringAttrValue(t, s, "http.request.method"); v != "POST" {
+			t.Errorf("%s: method %q, want POST", bad[i].name, v)
+		}
+		if v, _ := stringAttrValue(t, s, "http.route"); v != a2aRoute {
+			t.Errorf("%s: route %q, want %q", bad[i].name, v, a2aRoute)
+		}
+		if v, _ := stringAttrValue(t, s, a2aMethodKey); v != "message/send" {
+			t.Errorf("%s: a2a method %q, want message/send", bad[i].name, v)
+		}
+	}
+}
+
 // krateo.a2a.method is a closed set: anything else is dropped and counted,
 // the span forwarded with its other three attributes.
 //
