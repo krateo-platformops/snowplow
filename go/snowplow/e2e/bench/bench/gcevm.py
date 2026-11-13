@@ -12,8 +12,9 @@ copied: each rule below is vm606's, stated once.
     to end, then creates again, within the call's bound; nothing was made by the refused call.
   - SELECTION by exact name. A resource is read by `describe` (its own NotFound is "absent", any other
     failure refuses: not_found() counts a NotFound only when it names the resource's own full path, since
-    gcloud words a missing PARENT the same way), or by exact equality over one unfiltered list read with
-    CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false (a list whose requests failed otherwise exits 0 with "[]").
+    gcloud words a missing PARENT the same way), or by exact equality over one unfiltered list, which gcloud()
+    runs with bench.gke.COMPUTE_LIST_ENV, as every compute list (a list whose requests failed otherwise exits 0
+    with "[]").
     No --filter: gcloud 561 can mis-parse one into an empty answer with rc 0 (#1307 re-review N1).
   - PARENTS FIRST: the project (exists, ACTIVE, the record's number) and the zone are confirmed before any
     describe there is read as "absent".
@@ -57,9 +58,8 @@ IAP_RANGE = "35.235.240.0/20"          # IAP's TCP-forwarding source range
 COMPUTE_API = "https://www.googleapis.com/compute/v1"
 TCP_22 = [{"IPProtocol": "tcp", "ports": ["22"]}]
 
-# gcloud's `compute ... list` exits 0 with "[]" when its requests failed unless this is false
-# (bench.gke.PRECHECK_LIST_ENV, #1172 B3)
-LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+# gcloud's `compute ... list` exits 0 with "[]" when its requests failed unless the partial-error property is
+# false: gcloud() runs every compute list with bench.gke.COMPUTE_LIST_ENV, its one definition (#1172 B3, #1383)
 
 
 class Refused(Exception):
@@ -103,7 +103,7 @@ def gcloud(args: list[str], *, dry: bool = False, env: dict | None = None, input
         say("RUN: " + shlex.join(argv))
     try:
         p = subprocess.run(argv, capture_output=True, text=True, input=input_data, timeout=timeout,
-                           env=dict(os.environ, **(env or {})))
+                           env=gke.gcloud_env(argv, dict(os.environ, **(env or {}))))
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:.0f} s"
     return p.returncode, p.stdout, p.stderr
@@ -359,7 +359,7 @@ def get(args: list[str], path: str, what: str) -> dict | None:
 def list_json(args: list[str], what: str, timeout: float | None = None) -> list[dict]:
     """One unfiltered list, the partial-error property false: a list, or a refusal (never a failed "[]"). `timeout`:
     its caller's (else the tool's call bound)."""
-    rc, out, err = gcloud(args, env=LIST_ENV, quiet=True, timeout=timeout)
+    rc, out, err = gcloud(args, quiet=True, timeout=timeout)
     try:
         got = json.loads(out) if rc == 0 else None
     except ValueError:
@@ -562,6 +562,103 @@ def owned_rule(r: dict, want: dict, tool: str, run: str) -> None:
                       f"was changed")
 
 
+# ─── the SSH rules' recorded expiry, and their reaper (#1383 gap 6) ─────────
+#
+# A firewall rule has no labels and no TTL of its own: GCE never deletes one. A tool's two SSH rules therefore
+# carry their expiry in their description (rule_description: the VM's own --termination-time), and the reaper
+# deletes a rule only when ALL of: its description is exactly that form for the tool and its owner; its name is
+# exactly one of the rules the tool makes for the run the description names (ssh_rules: never a prefix or a
+# pattern); its target tag is that run's; the expiry has passed; and no instance of the project (one unfiltered
+# list, every zone) claims the run (its VM gone: deleting the DENY rule of a live VM would open its port 22 to
+# the project's default-allow-ssh). One unfiltered list of the project's rules, read fail-closed; no --filter.
+# Each delete's exit code is read, and each rule is read back by its exact name until it answers NotFound.
+
+_RULE_EXPIRY = re.compile(r"(?P<tool>[a-z0-9]+) owner=(?P<owner>\S+) run=(?P<run>[a-z][a-z0-9-]*) "
+                          r"expires=(?P<expires>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+
+
+def rule_description(tool: str, owner: str, run: str, expires: str) -> str:
+    """A tool's SSH rule description, carrying the run's expiry (the VM's own termination time, RFC 3339 UTC)."""
+    return f"{tool} owner={owner} run={run} expires={expires}"
+
+
+def expired_rules(rows: list[dict], *, tool: str, owner: str, rules_of, now: float) -> list[tuple[str, dict]]:
+    """(run, rule) of each listed rule the reaper may delete by its description, name and tag (the module note
+    above), whose recorded expiry is before `now`. `rules_of(run, expires)`: the rules the tool makes for that run
+    (ssh_rules), by name."""
+    out = []
+    for r in rows:
+        m = _RULE_EXPIRY.fullmatch(str(r.get("description") or ""))
+        if not m or m["tool"] != tool or m["owner"] != owner:
+            continue
+        want = rules_of(m["run"], m["expires"]).get(r.get("name"))
+        if want is None or sorted(r.get("targetTags") or []) != sorted(want["targetTags"]) \
+                or r.get("description") != want["description"]:
+            continue
+        end = epoch(m["expires"])
+        if end is not None and end < now:
+            out.append((m["run"], r))
+    return sorted(out, key=lambda x: x[1].get("name") or "")
+
+
+# how long a deleted rule may take to answer NotFound, and how often it is read meanwhile
+RULE_GONE_WAIT_S = 120.0
+RULE_GONE_POLL_S = 5.0
+
+
+def reap_rules(project: str, *, tool: str, owner: str, rules_of, vm_of, now: float,
+               dry: bool) -> tuple[list[str], list[str]]:
+    """Delete the project's expired SSH rules of `tool` (expired_rules), each verified. `vm_of(run)`: the run's VM
+    name (an instance named so, or labelled run=<run>, in any zone, keeps its rules). (deleted, problems): problems
+    is empty only when every expired rule answered NotFound after its delete (within RULE_GONE_WAIT_S)."""
+    poll_s, wait_s = RULE_GONE_POLL_S, RULE_GONE_WAIT_S
+    rows = list_json(["compute", "firewall-rules", "list", "--project", project, "--format", "json"],
+                     f"the firewall rules of {project}")
+    expired = expired_rules(rows, tool=tool, owner=owner, rules_of=rules_of, now=now)
+    if not expired:
+        say(f"{tool} reap: no expired SSH rule of {tool} in {project}")
+        return [], []
+    instances = list_json(["compute", "instances", "list", "--project", project, "--format", "json"],
+                          f"the instances of {project}")
+    problems, asked = [], []
+    for run, r in expired:
+        name = r["name"]
+        alive = [i for i in instances if i.get("name") == vm_of(run) or (i.get("labels") or {}).get("run") == run]
+        if alive:
+            problems.append(f"firewall rule {name}: run {run}'s expiry has passed, but {named(alive)} still claim(s) "
+                            f"the run: not deleted")
+            continue
+        rc, _o, err = gcloud(["compute", "firewall-rules", "delete", name, "--project", project, "--quiet"], dry=dry)
+        if dry:
+            continue
+        if rc != 0:
+            problems.append(f"firewall rule {name} (run {run}, expired): its delete failed (rc={rc}; "
+                            f"{gcloud_cause(err)})")
+            continue
+        asked.append(name)
+    deleted = []
+    deadline = time.monotonic() + wait_s
+    for name in asked:
+        path = f"projects/{project}/global/firewalls/{name}"
+        while True:
+            try:
+                gone = get(["compute", "firewall-rules", "describe", name, "--project", project], path,
+                           f"firewall rule {name}") is None
+            except Refused as e:
+                problems.append(f"firewall rule {name}: deleted, then {e}")
+                break
+            if gone:
+                say(f"{tool} reap: firewall rule {name} (expired) deleted; its describe answers NotFound")
+                deleted.append(name)
+                break
+            if time.monotonic() >= deadline:
+                problems.append(f"firewall rule {name}: delete requested, NOT confirmed gone (its describe still "
+                                f"answers after {wait_s:g} s)")
+                break
+            time.sleep(poll_s)
+    return deleted, problems
+
+
 # ─── as made: an instance's describe in the shape of its create flags ───────
 
 def boot_disk_and_image(inst: dict, project: str, zone: str) -> tuple[dict | None, dict | None]:
@@ -656,7 +753,7 @@ def quota_check(project: str, zone: str, footprint) -> tuple[list[str], list[str
                           f"the VM fits is unknown")
     listed: dict[str, list[dict]] = {}
     for kind in ("instances", "forwarding-rules", "addresses"):
-        rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], env=LIST_ENV, quiet=True)
+        rc, out, err = gcloud(gke.region_list_command(kind, project, region)[1:], quiet=True)
         got = gke._json(out) if rc == 0 else None
         if not isinstance(got, list):
             raise Refused(f"the {kind} of {region} could not be listed (rc={rc}; {gcloud_cause(err)}): whether the "

@@ -1204,6 +1204,15 @@ def pair(va: dict, vb: dict, *, replica: dict | None = None,
                   {"a": dig[0], "b": dig[1]}, "two different images, each the one its run was launched with",
                   "the pair is not the two images it was launched to compare"),
     ]
+    # #1383 gap 7: create asks GKE for a minor and GKE picks the patch, per cluster; the two clusters of a pair
+    # run the same control-plane and node versions (each run's gke-shape record), or the pair compares platforms
+    from bench.gke import shape_versions
+    gv = [shape_versions((v.get("report") or {}).get("cluster_shape")) for v in (va, vb)]
+    validity.append(_validity(
+        "gke_versions", None not in gv and gv[0] == gv[1], {"a": gv[0], "b": gv[1]},
+        "both clusters run the same GKE control-plane and node versions (gke-shape, read back after create)",
+        "the two clusters run different GKE versions, or a run's are unrecorded: the pair would compare two "
+        "platforms, not only snowplow"))
     # run 26: a run that overrode its frontend (FRONTEND_TAG) says so in report.frontend_image; then
     # the pair compares snowplow only when both runs ran the SAME frontend, each its gate's MATCH
     fe = [(v.get("report") or {}).get("frontend_image") for v in (va, vb)]

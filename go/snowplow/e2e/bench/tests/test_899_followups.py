@@ -154,7 +154,8 @@ def test_the_record_is_what_gke_reports_not_the_spec(fakegke, monkeypatch, capsy
     assert (rec["control_plane"], rec["location"], rec["region"]) == ("regional", REGION, REGION)
     assert rec["node_locations"] == ["europe-west4-b"] and rec["current_node_count"] == 4
     assert rec["node_pools"] == [{"name": "default-pool", "machine_type": "n2-standard-8",
-                                  "locations": [ZONE], "nodes_per_location": 3}]
+                                  "locations": [ZONE], "nodes_per_location": 3,
+                                  "version": None}]           # #1383 gap 7: this describe reports none
     assert calls(fakegke) == [f"describe --region {REGION}"]          # one read-only call
     assert "control plane regional (europe-west4); nodes in europe-west4-b; 4 nodes" in err
 

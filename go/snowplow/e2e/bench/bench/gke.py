@@ -306,7 +306,10 @@ def observed_shape(describe: dict) -> dict:
     clusters describe` AFTER create (#899 F1): where GKE put the control plane
     (`location`: a region → regional, a zone → zonal), where it put the nodes
     (`locations`) and how many there are (`currentNodeCount`) — not what the
-    spec asked for."""
+    spec asked for. #1383 gap 7: and the GKE versions GKE gave it (create asks
+    for a minor; GKE picks the patch): the control plane's
+    (`currentMasterVersion`), the nodes' (`currentNodeVersion`) and each
+    pool's (`version`); the pair compares them (shape_versions)."""
     loc = describe.get("location") or describe.get("zone") or ""
     return {"kind": "cluster_shape", "source": "gcloud container clusters describe, after create",
             "control_plane": "zonal" if _is_zone(loc) else ("regional" if loc else None),
@@ -314,11 +317,29 @@ def observed_shape(describe: dict) -> dict:
             "node_locations": list(describe.get("locations") or []),
             "current_node_count": describe.get("currentNodeCount"),
             "cluster": describe.get("name"),
+            "master_version": describe.get("currentMasterVersion"),
+            "node_version": describe.get("currentNodeVersion"),
             "node_pools": [{"name": p.get("name"),
                             "machine_type": (p.get("config") or {}).get("machineType"),
                             "locations": list(p.get("locations") or []),
-                            "nodes_per_location": p.get("initialNodeCount")}
+                            "nodes_per_location": p.get("initialNodeCount"),
+                            "version": p.get("version")}
                            for p in describe.get("nodePools") or []]}
+
+
+def shape_versions(shape: dict | None) -> dict | None:
+    """The GKE versions a cluster-shape record (observed_shape) holds:
+    {"master": <currentMasterVersion>, "nodes": [<each distinct node version>]},
+    the nodes' from every pool's own version (the cluster's currentNodeVersion
+    when the record lists no pool). None when any is unrecorded: a dry run's
+    spec, an unobserved shape, a record made before #1383."""
+    if not isinstance(shape, dict) or not shape.get("master_version"):
+        return None
+    pools = shape.get("node_pools") or []
+    nodes = [p.get("version") for p in pools] if pools else [shape.get("node_version")]
+    if not nodes or not all(nodes):
+        return None
+    return {"master": shape["master_version"], "nodes": sorted(set(nodes))}
 
 
 def unobserved_shape(spec: ClusterSpec, why: str) -> dict:
@@ -347,6 +368,51 @@ def _pool_flags(pool: NodePool) -> list[str]:
     return flags
 
 
+RELEASE_CHANNEL = "regular"
+
+
+def server_config_command(spec: ClusterSpec) -> list[str]:
+    """What GKE offers in the cluster's region (a read): each release channel's validVersions."""
+    return ["gcloud", "container", "get-server-config", "--project", spec.project, "--region", spec.region,
+            "--format", "json"]
+
+
+def version_offered(server_config, version: str, channel: str = RELEASE_CHANNEL,
+                    where: str = "") -> tuple[bool, str]:
+    """#1383 gap 8: does `channel` (get-server-config's `channels`) offer `version`? A minor
+    ("1.36") when one of the channel's validVersions is a patch of it (gcloud resolves a minor to
+    the newest patch the channel offers), a full version when it is one of them exactly. (ok, the
+    line saying so, naming the requirement). `where`: the region the config is of, for the line."""
+    want = channel.upper()
+    on = f"the {want} channel" + (f" in {where}" if where else "")
+    row = next((c for c in (server_config or {}).get("channels") or [] if c.get("channel") == want), None) \
+        if isinstance(server_config, dict) else None
+    need = (f"gke-up creates --cluster-version {version} --release-channel {channel}, so {on} must offer "
+            f"{'a ' + version + '.x patch' if version.count('.') == 1 else version} "
+            f"(DEFAULT_CLUSTER_VERSION, bench/gke.py)")
+    if row is None:
+        return False, f"get-server-config lists no {want} channel: {need}"
+    valid = [str(v) for v in row.get("validVersions") or []]
+    match = [v for v in valid if v == version or v.startswith((version + ".", version + "-"))]
+    if not match:
+        offered = sorted({".".join(v.split("-")[0].split(".")[:2]) for v in valid})
+        return False, f"GKE {version} is not offered on {on} (its minors: {', '.join(offered) or 'none'}): {need}"
+    return True, f"GKE {version}: offered on {on} ({', '.join(sorted(match))})"
+
+
+def version_check(spec: ClusterSpec, *, run=None) -> tuple[bool, str]:
+    """version_offered for the spec's cluster_version in its region, from one read; a read that
+    fails or answers no JSON object is "unknown", never "offered"."""
+    run = run or execute
+    rc, out = run(server_config_command(spec), dry_run=False, log=lambda _m: None)
+    got = _json(out) if rc == 0 else None
+    if not isinstance(got, dict):
+        return False, (f"GKE's server config for {spec.region} could not be read (gcloud container "
+                       f"get-server-config {'failed, rc=' + str(rc) if rc else 'answered no JSON object'}): whether "
+                       f"the {RELEASE_CHANNEL.upper()} channel offers {spec.cluster_version} is unknown")
+    return version_offered(got, spec.cluster_version, where=spec.region)
+
+
 def create_commands(spec: ClusterSpec) -> list[list[str]]:
     """gcloud argv lists, in order: cluster, extra node pools, credentials.
 
@@ -363,8 +429,9 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
         "gcloud", "container", "clusters", "create", spec.name, *loc, *nodes,
         "--cluster-version", spec.cluster_version,
         # REGULAR carries 1.36.4-gke.1391002, the exact version 057 runs
-        # (rapid only offers newer 1.36 patches).
-        "--release-channel", "regular",
+        # (rapid only offers newer 1.36 patches). gke-up checks the channel
+        # offers the version before anything is created (version_check).
+        "--release-channel", RELEASE_CHANNEL,
         "--labels", _labels_arg(spec.labels()),
         "--scopes", "cloud-platform",
         "--enable-ip-alias",
@@ -444,17 +511,47 @@ def reap_commands(clusters: Iterable[dict], *, now: float,
 
 
 def list_command(project: str = DEFAULT_PROJECT) -> list[str]:
-    return ["gcloud", "container", "clusters", "list", "--project", project,
-            "--filter", "resourceLabels.purpose=snowplow-bench",
-            "--format", "json"]
+    """The reaper's list (#1383 gap 5): every cluster of the project, unfiltered. No label
+    --filter: gcloud applies one client-side and can answer [] with rc 0 (bench.gcevm's
+    SELECTION); expired_clusters selects by exact label equality (assert_deletable)."""
+    return all_clusters_command(project)
+
+
+# gcloud container clusters list answers rc 0 when a location did not respond: the API's
+# ListClustersResponse names it in `missingZones` and gcloud only warns (SDK 561,
+# surface/container/clusters/list.py: "The following zones did not respond: <zones>. List
+# results may be incomplete."). compute/allow_partial_error does not govern it (it is read by
+# the compute lister only), so the warning is the one signal the CLI gives: a list that
+# carries it is a failed read.
+_MISSING_ZONES = re.compile(r"did not respond.*may be\s+incomplete", re.S)
+
+
+def list_clusters(project: str, *, run=None) -> tuple[list[dict] | None, str]:
+    """(every cluster of the project, "") or (None, why the list is not known whole): fails
+    closed on a non-zero exit, an answer that is not a JSON list, and gcloud's missing-zones
+    warning (a list GKE says is incomplete)."""
+    run = run or execute
+    err: list[str] = []
+    argv = all_clusters_command(project)
+    rc, out = run(argv, dry_run=False, log=lambda _m: None, stderr_out=err)
+    got = _json(out) if rc == 0 else None
+    if not isinstance(got, list):
+        return None, (f"{' '.join(argv[:4])} " + (f"failed (rc={rc})" if rc else "answered no JSON list"))
+    if _MISSING_ZONES.search(err[-1] if err else ""):
+        return None, f"{' '.join(argv[:4])} answered with locations that did not respond: the list may be incomplete"
+    return got, ""
+
+
+def describe_argv(name: str, project: str, location: str) -> list[str]:
+    _check_name(name)
+    return ["gcloud", "container", "clusters", "describe", name,
+            "--project", project, *_location_flag(location), "--format", "json"]
 
 
 def describe_command(spec: ClusterSpec, location: str | None = None) -> list[str]:
     """`location`: the region (default), or the node zone for a zonal cluster
     made before run 17."""
-    return ["gcloud", "container", "clusters", "describe", spec.name,
-            "--project", spec.project, *_location_flag(location or spec.region),
-            "--format", "json"]
+    return describe_argv(spec.name, spec.project, location or spec.region)
 
 
 # ─── Endpoint resolution ────────────────────────────────────────────────────
@@ -575,17 +672,60 @@ def lb_progress(svc_list: dict, events: list[dict] | None = None) -> tuple[dict,
 # ─── In-cluster dead-man switch ─────────────────────────────────────────────
 
 
-def self_destruct_manifest(spec: ClusterSpec,
-                           image: str = "gcr.io/google.com/cloudsdktool/"
-                                        "google-cloud-cli:slim") -> str:
+TTL_NAMESPACE = "bench-self-destruct"
+TTL_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli:slim"
+TTL_PERMISSION = "container.clusters.delete"
+TTL_PROOF_JOB = "ttl-delete-proof"
+TTL_PROOF_MARK = "TTL_PROOF "
+# the permission test runs IN the cluster, as the CronJob's own identity (the GKE node SA);
+# vm606's plan-iam lists this host as the node SA's, not the orchestrator's (NODE_SA_REST)
+TTL_PROOF_API = "https://cloudresourcemanager.googleapis.com/v1"
+# how long the proof Job may take: the image pull on a new node, gcloud's token, one request
+TTL_PROOF_BUDGET_S = 600.0
+# gke-up's exit when the cluster exists but its TTL backstop is not applied or not proven
+EXIT_TTL_BACKSTOP_MISSING = 3
+
+
+def ttl_pool(spec: ClusterSpec) -> tuple[str, str]:
+    """(label, value) of the one node pool whose nodes carry the cloud-platform OAuth scope: the platform
+    (default) pool, which the cluster create makes with --scopes cloud-platform. The snowplow and loadgen
+    pools (node-pools create, gcloud's default gke-default scopes) cannot call the GKE API: a TTL pod there
+    could never delete the cluster (#1387 review, blocker)."""
+    return spec.platform_pool.labels[0]
+
+
+def _ttl_pod_spec(image: str, script: str, indent: int, pool: tuple[str, str]) -> str:
+    """The pod spec the TTL CronJob's Job runs, and the proof Job (ttl_proof_manifest) too: the
+    same image, node pool, namespace and (default) Kubernetes service account, so the proof's
+    identity is the CronJob's: the GKE node SA, from the metadata server (the cluster has no
+    Workload Identity), with the nodes' cloud-platform scope. Both pods are pinned to the pool that
+    carries that scope (ttl_pool: nodeSelector). That pool has no taint, so neither pod tolerates any:
+    a pod that tolerated every taint could land on a dedicated pool without the scope."""
+    body = "\n".join("    " + ln for ln in script.splitlines())
+    pod = f"""\
+restartPolicy: Never
+nodeSelector:
+  {pool[0]}: {pool[1]}
+containers:
+- name: reaper
+  image: {image}
+  command: ["/bin/sh", "-c"]
+  args:
+  - |
+{body}"""
+    return "\n".join(" " * indent + ln for ln in pod.splitlines())
+
+
+def self_destruct_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
     """A CronJob that deletes THIS cluster once its TTL has passed.
 
     The only teardown layer that survives the operator's machine dying. It
     runs with the node service account (the cluster is created with the
     cloud-platform scope), so it works only if that account may call
-    container.clusters.delete — UNVERIFIED for operations-dev-krateo-io; the
-    run plan lists it as a check before the first run. It re-checks the
-    labels itself, so a copy applied to the wrong cluster deletes nothing.
+    container.clusters.delete: gke-up PROVES that on every run, right after
+    applying it, as that very identity (prove_ttl_delete; #1383 gap 3), and
+    a run whose proof fails does not go on. It re-checks the labels itself,
+    so a copy applied to the wrong cluster deletes nothing.
     """
     _check_name(spec.name)
     exp = spec.ttl_expires
@@ -602,18 +742,17 @@ def self_destruct_manifest(spec: ClusterSpec,
         f"gcloud container clusters delete {spec.name} --project {spec.project} "
         f"--region {spec.region} --quiet --async\n"
     )
-    indented = "\n".join("              " + ln for ln in script.splitlines())
     return f"""\
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: bench-self-destruct
+  name: {TTL_NAMESPACE}
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: ttl-self-destruct
-  namespace: bench-self-destruct
+  namespace: {TTL_NAMESPACE}
   labels:
     purpose: snowplow-bench
 spec:
@@ -624,17 +763,129 @@ spec:
       backoffLimit: 0
       template:
         spec:
-          restartPolicy: Never
-          tolerations:
-          - operator: Exists
-          containers:
-          - name: reaper
-            image: {image}
-            command: ["/bin/sh", "-c"]
-            args:
-            - |
-{indented}
+{_ttl_pod_spec(image, script, 10, ttl_pool(spec))}
 """
+
+
+def ttl_proof_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
+    """#1383 gap 3: a Job of the CronJob's own pod spec (_ttl_pod_spec) that asks IAM, as the
+    identity the CronJob runs as, whether it holds TTL_PERMISSION on the project
+    (projects.testIamPermissions: IAM answers for the CALLER, with every inherited and
+    conditional grant applied; GKE has no per-cluster IAM, so the project's answer is the
+    cluster's). It prints IAM's answer on one TTL_PROOF_MARK line; the token never leaves the
+    pod. Deletes nothing."""
+    _check_name(spec.name)
+    body = json.dumps({"permissions": [TTL_PERMISSION]})
+    script = (
+        "set -eu\n"
+        "tok=$(gcloud auth print-access-token)\n"
+        "resp=$(curl -sS -X POST -H \"Authorization: Bearer $tok\" -H 'Content-Type: application/json' "
+        f"--data '{body}' '{TTL_PROOF_API}/projects/{spec.project}:testIamPermissions')\n"
+        f"echo \"{TTL_PROOF_MARK}$(printf '%s' \"$resp\" | tr -d '\\n')\"\n"
+    )
+    return f"""\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {TTL_PROOF_JOB}
+  namespace: {TTL_NAMESPACE}
+  labels:
+    purpose: snowplow-bench
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {int(TTL_PROOF_BUDGET_S)}
+  template:
+    spec:
+{_ttl_pod_spec(image, script, 6, ttl_pool(spec))}
+"""
+
+
+def ttl_proof_answer(logs: str) -> tuple[bool, str]:
+    """(proven, why) from the proof pod's log: proven only when IAM's testIamPermissions answer
+    (the TTL_PROOF_MARK line) lists TTL_PERMISSION. An error answer is named by its code and
+    status only (its message can name the account)."""
+    line = next((ln[len(TTL_PROOF_MARK):] for ln in (logs or "").splitlines() if ln.startswith(TTL_PROOF_MARK)),
+                None)
+    if line is None:
+        return False, "the proof pod printed no answer (its gcloud token or its request failed before IAM answered)"
+    try:
+        got = json.loads(line)
+    except ValueError:
+        return False, "IAM's answer is not JSON"
+    if not isinstance(got, dict):
+        return False, "IAM's answer is not a JSON object"
+    if "error" in got:
+        e = got.get("error") or {}
+        return False, (f"IAM refused the permission test (HTTP {e.get('code')}, {e.get('status')}): whether the "
+                       f"node SA may delete the cluster is unknown")
+    perms = got.get("permissions") or []
+    if TTL_PERMISSION in perms:
+        return True, f"IAM answers that the CronJob's identity (the GKE node SA) holds {TTL_PERMISSION}"
+    return False, f"IAM answers that the CronJob's identity (the GKE node SA) does NOT hold {TTL_PERMISSION}"
+
+
+def proof_placement(spec: ClusterSpec, *, run=None) -> dict:
+    """{"node", "pool"} the proof Job's pod ran on: its pod's spec.nodeName, and that node's ttl_pool label
+    (None for either that could not be read)."""
+    run = run or execute
+    k = _kubectl(spec)
+    label, _value = ttl_pool(spec)
+    rc, out = run(k + ["get", "pods", "-n", TTL_NAMESPACE, "-l", f"job-name={TTL_PROOF_JOB}", "-o", "json"],
+                  dry_run=False, log=lambda _m: None)
+    items = ((_json(out) or {}).get("items") or []) if rc == 0 else []
+    node = ((items[0].get("spec") or {}).get("nodeName") if len(items) == 1 else None)
+    pool = None
+    if node:
+        rc, out = run(k + ["get", "node", node, "-o", "json"], dry_run=False, log=lambda _m: None)
+        pool = (((_json(out) or {}).get("metadata") or {}).get("labels") or {}).get(label) if rc == 0 else None
+    return {"node": node, "pool": pool}
+
+
+def prove_ttl_delete(spec: ClusterSpec, *, run=None, clock: Callable[[], float] = time.monotonic,
+                     sleep: Callable[[float], None] = time.sleep,
+                     budget_s: float = TTL_PROOF_BUDGET_S) -> tuple[bool, str, dict]:
+    """#1383 gap 3: PROVE the TTL CronJob can delete the cluster, on this run: apply the proof
+    Job (ttl_proof_manifest: the CronJob's pod spec), wait for it to end within `budget_s`, read
+    where its pod ran (placement: its node and that node's pool, which must be ttl_pool's) and its
+    answer (ttl_proof_answer), delete it. (proven, the line saying so, the placement). Anything not
+    read is "not proven", never proven."""
+    run = run or execute
+    k = _kubectl(spec)
+    quiet = lambda _m: None  # noqa: E731
+    placement: dict = {"node": None, "pool": None}
+    rc, _ = run(k + ["apply", "-f", "-"], dry_run=False, input_data=ttl_proof_manifest(spec), log=quiet)
+    if rc != 0:
+        return False, f"the proof Job could not be applied (rc={rc})", placement
+    try:
+        deadline = clock() + budget_s
+        state = None
+        while True:
+            rc, out = run(k + ["get", "job", TTL_PROOF_JOB, "-n", TTL_NAMESPACE, "-o", "json"], dry_run=False,
+                          log=quiet)
+            st = ((_json(out) or {}).get("status") or {}) if rc == 0 else {}
+            if st.get("succeeded"):
+                state = "succeeded"
+            elif st.get("failed"):
+                state = "failed"
+            if state or clock() >= deadline:
+                break
+            sleep(_POLL_S)
+        if state is None:
+            return False, f"the proof Job did not end within {budget_s:g} s (its pod never answered)", placement
+        placement = proof_placement(spec, run=run)
+        label, value = ttl_pool(spec)
+        if placement["pool"] != value:
+            return False, (f"the proof pod ran on node {placement['node']} of pool {placement['pool']}, not the "
+                           f"{label}={value} pool the CronJob runs on (the one with the cloud-platform scope): "
+                           f"what it proves is not the CronJob's"), placement
+        rc, logs = run(k + ["logs", f"job/{TTL_PROOF_JOB}", "-n", TTL_NAMESPACE], dry_run=False, log=quiet)
+        if rc != 0:
+            return False, f"the proof Job {state}, and its log could not be read (rc={rc})", placement
+        ok, why = ttl_proof_answer(logs)
+        return ok, why if ok or state == "succeeded" else f"the proof Job failed: {why}", placement
+    finally:
+        run(k + ["delete", "job", TTL_PROOF_JOB, "-n", TTL_NAMESPACE, "--ignore-not-found", "--wait=false"],
+            dry_run=False, log=quiet)
 
 
 # ─── Execution ──────────────────────────────────────────────────────────────
@@ -646,6 +897,39 @@ spec:
 # record or verdict.json (#900 review): only the code — bench.identity, the
 # bench's one identity redaction (run606.sh's kerr_line uses it too).
 from bench.identity import error_summary  # noqa: E402,F401  (imports nothing from bench)
+
+
+# #1172 B3 / #1383 gap 1: gcloud's `compute ... list` commands go through the SDK's
+# MultiScopeLister (googlecloudsdk/api_lib/compute/lister.py), which collects each failed
+# request's HttpError and, while the compute/allow_partial_error property is true (its
+# default, core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
+# requests failed (a 401, a missing compute.*.list permission, an unreachable zone) exits
+# 0, prints [] (or a partial list) and writes "WARNING: Some requests did not succeed." on
+# stderr. With the property false the same list exits 1 with "ERROR: ... Some requests did
+# not succeed", which every caller reads as a failed read (fail closed). ONE definition,
+# applied by the two executors that run gcloud (execute() below, bench.gcevm.gcloud()) to
+# every compute list they run, so no call site can leave it out: the disk backstop, the LB
+# release and the address backstop, the quota pre-check, vm606's and testvm's lists.
+COMPUTE_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+
+
+def is_compute_list(argv: list[str]) -> bool:
+    """A `gcloud compute <collection ...> list` argv (with or without the leading "gcloud"):
+    its command words (each word before the first flag) start with compute and hold list."""
+    words: list[str] = []
+    for t in argv[1:] if argv[:1] == ["gcloud"] else argv:
+        if str(t).startswith("-"):
+            break
+        words.append(str(t))
+    return words[:1] == ["compute"] and "list" in words[1:]
+
+
+def gcloud_env(argv: list[str], env: dict | None) -> dict | None:
+    """The environment `argv` runs with: `env` (None: inherited) and, for a compute list,
+    COMPUTE_LIST_ENV over it (it wins over a caller's own value)."""
+    if not is_compute_list(argv):
+        return env
+    return dict(os.environ if env is None else env, **COMPUTE_LIST_ENV)
 
 
 def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
@@ -660,7 +944,7 @@ def execute(argv: list[str], *, dry_run: bool, env: dict | None = None,
         return 0, ""
     log(f"RUN: {shown}")
     proc = subprocess.run(argv, capture_output=True, text=True,
-                          env=env, input=input_data, timeout=timeout)
+                          env=gcloud_env(argv, env), input=input_data, timeout=timeout)
     if proc.returncode != 0:
         # never the free stderr: gcloud's names the operator's account (error_summary)
         log(f"  rc={proc.returncode} ({error_summary(proc.stderr)})")
@@ -760,6 +1044,8 @@ def find_cluster(spec: ClusterSpec, *, log: Callable[[str], None] = print,
 # teardown — the PV release, an in-flight operation, the NotFound poll —
 # including gke-up's own teardown after a failed create.
 DEFAULT_DOWN_BUDGET_S = 900.0
+# #1383 gap 2: what a delete GKE accepted is, until a describe answers NotFound
+NOT_CONFIRMED_GONE = "delete requested, NOT confirmed gone"
 BACKSTOP_FAILED = "DISK BACKSTOP FAILED"
 ADDRESS_BACKSTOP_FAILED = "ADDRESS BACKSTOP FAILED"
 
@@ -777,8 +1063,11 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
     this cluster's leftover disks and addresses by exact name. Raises when
     not deletable or the delete call fails, so run_with_teardown reports it.
     Returns the backstops' problems (each also written to stderr as DISK
-    BACKSTOP FAILED / ADDRESS BACKSTOP FAILED): the cluster is deleted, but
-    disks or addresses of it may be left.
+    BACKSTOP FAILED / ADDRESS BACKSTOP FAILED): disks or addresses of the
+    cluster may be left. `record["confirmed_gone"]` says whether the cluster
+    IS deleted: True only once its describe answered NotFound; False when
+    the budget ran out first (NOT_CONFIRMED_GONE, said on stderr: the delete
+    was requested, never "deleted"; #1383 gap 2).
 
     #1026: the LoadBalancer Services go first (release_lb_services, within a
     quarter of the budget), their address names recorded; after the delete
@@ -857,6 +1146,14 @@ def teardown(spec: ClusterSpec, *, dry_run: bool,
             rec.update({"deleted_disks": None, "leaked_addresses": None})
             cid = cluster_id_b32(describe)
             gone = wait_cluster_gone(spec, log=log, deadline=deadline, clock=clock, sleep=sleep, location=location)
+            # #1383 gap 2: "deleted" only from the describe that answered NotFound; a delete GKE
+            # accepted (--async) whose cluster still answered at the budget's end is NOT deleted
+            rec["confirmed_gone"] = gone
+            if not gone:
+                msg = (f"{spec.name}: {NOT_CONFIRMED_GONE}: its describe still answered when the {budget:g} s "
+                       f"budget ran out; check it with {' '.join(describe_command(spec, location))}")
+                log(msg)
+                sys.stderr.write(msg + "\n")
             try:
                 if gone:
                     rec["deleted_disks"] = disk_backstop(spec, cluster_id=cid, recorded=recorded, log=log,
@@ -1059,10 +1356,8 @@ def cluster_quota_check(project: str, zone: str, need: int, *, run=execute, fetc
     info, why = read_cluster_quota(project, run=run, fetch=fetch)
     if info is None:
         return False, f"GKE's {CLUSTER_QUOTA_ID} limit could not be read ({why}): whether the run fits is unknown"
-    rc, out = run(all_clusters_command(project), dry_run=False, log=lambda _m: None)
-    clusters = _json(out) if rc == 0 else None
-    return cluster_count_fit(cluster_limit(info, region), clusters if isinstance(clusters, list) else None,
-                             region, need)
+    clusters, _why = list_clusters(project, run=run)          # fails closed (#1383: missing zones too)
+    return cluster_count_fit(cluster_limit(info, region), clusters, region, need)
 
 
 def _kubectl(spec: ClusterSpec) -> list[str]:
@@ -2084,17 +2379,8 @@ def region_list_command(kind: str, project: str, region: str) -> list[str]:
     return ["gcloud", "compute", kind, "list", "--project", project, *where, "--format", "json"]
 
 
-# #1172 B3: gcloud's `compute ... list` commands go through the SDK's MultiScopeLister
-# (googlecloudsdk/api_lib/compute/lister.py), which collects each failed request's
-# HttpError and, while the compute/allow_partial_error property is true (its default,
-# core/properties.py), only warns (utils.WarnIfPartialRequestFail): a list whose
-# requests all failed (a 401, a missing compute.forwardingRules.list permission)
-# exits 0, prints [] and writes "WARNING: Some requests did not succeed." on stderr;
-# one with an UNREACHABLE zone prints a partial list, rc 0. With the property false
-# the same list exits 1 with "ERROR: ... Some requests did not succeed", which the
-# pre-check reads as a failed read (fail closed). Set on the pre-check's three lists
-# only, through the environment form of gcloud's own property.
-PRECHECK_LIST_ENV = {"CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR": "false"}
+# The pre-check's lists fail closed like every compute list: execute() runs them with
+# COMPUTE_LIST_ENV (#1172 B3, #1383 gap 1), never a call site.
 
 
 def project_quotas_command(project: str) -> list[str]:
@@ -2122,10 +2408,9 @@ def quota_check(project: str, zone: str, fp: Footprint, *, run=execute, fetch=No
         quotas[src] = got
     listed: dict[str, list[dict] | None] = {}
     unread: dict[str, str] = {}
-    list_env = dict(os.environ, **PRECHECK_LIST_ENV)
     for kind in sorted({k for row in RUN_QUOTAS for k in row.reads}):
         argv = region_list_command(kind, project, region_of(zone))
-        rc, out = run(argv, dry_run=False, env=list_env, log=quiet)
+        rc, out = run(argv, dry_run=False, log=quiet)      # execute() runs it with COMPUTE_LIST_ENV
         got = _json(out) if rc == 0 else None
         listed[kind] = got if isinstance(got, list) else None
         if listed[kind] is None:
@@ -2148,9 +2433,15 @@ def wait_cluster_gone(spec: ClusterSpec, *, log: Callable[[str], None], deadline
     made before run 17) — polled THERE, or the region's describe 404s at once
     and the backstop runs while the nodes still hold the PVC disks (#896
     reviewer: a false "no disk left")."""
+    return _wait_gone(describe_command(spec, location), deadline=deadline, clock=clock, sleep=sleep)
+
+
+def _wait_gone(describe: list[str], *, deadline: float, clock: Callable[[], float],
+               sleep: Callable[[float], None]) -> bool:
+    """Poll one exact-name describe until GKE answers NotFound for it (True), or `deadline` (False)."""
     while True:
         err: list[str] = []
-        rc, _ = execute(describe_command(spec, location), dry_run=False, log=lambda _: None, stderr_out=err)
+        rc, _ = execute(describe, dry_run=False, log=lambda _: None, stderr_out=err)
         # the same NotFound test as the lookup (find_cluster): code=404 / NOT_FOUND only — a
         # looser match ("not found" anywhere, any 404) could run the disk backstop early (#907 N1)
         if rc != 0 and _NOT_FOUND.search(err[-1] if err else ""):
@@ -2189,8 +2480,15 @@ def cmd_gke_up(a) -> int:
     # before anything is created (run 16, run 19 attempt 3 and run 21 attempt 2 each
     # found out 30-45 minutes in)
     if dry:
+        execute(server_config_command(spec), dry_run=True)
         execute(region_quotas_command(spec.project, spec.zone), dry_run=True)
     else:
+        # #1383 gap 8: the version gke-up asks for is one the release channel offers in the region
+        ok, msg = version_check(spec)
+        if not ok:
+            sys.stderr.write(f"refusing: {msg}; nothing was created\n")
+            return 2
+        print(msg)
         fp, why = _run_footprint(spec, getattr(a, "address_need", None))
         if fp is None:
             sys.stderr.write(f"refusing: {why}; nothing was created\n")
@@ -2225,9 +2523,36 @@ def cmd_gke_up(a) -> int:
     rc, _ = execute(["kubectl", f"--kubeconfig={spec.kubeconfig}",
                      f"--context={kube_context(spec)}", "apply", "-f", "-"],
                     dry_run=dry, input_data=self_destruct_manifest(spec))
+    # #1383 gap 4: a run without its TTL backstop does not go on: gke-up fails, and the caller's
+    # teardown (run606's EXIT trap: CLUSTER_CREATED is set before the create) deletes the cluster
     if rc != 0:
-        sys.stderr.write("self-destruct CronJob NOT applied; the trap and "
-                         "`gke-reap` are the remaining teardown layers\n")
+        sys.stderr.write(f"self-destruct CronJob NOT applied (rc={rc}): a run without its TTL backstop does not "
+                         f"go on; the run's teardown deletes {spec.name} (by hand: python3 -m bench.gke gke-down "
+                         f"--name {spec.name} --yes)\n")
+        return EXIT_TTL_BACKSTOP_MISSING
+    # #1383 gap 3: and the backstop is PROVEN able to delete the cluster, on this run, as its own identity
+    if dry:
+        execute(_kubectl(spec) + ["apply", "-f", "-"], dry_run=True)
+        print(f"DRY-RUN: (stdin: Job {TTL_NAMESPACE}/{TTL_PROOF_JOB}, the CronJob's pod spec, asking IAM's "
+              f"testIamPermissions for {TTL_PERMISSION} as the node SA; then its log is read and it is deleted)")
+        return 0
+    ok, why, placement = prove_ttl_delete(spec)
+    proof = {"kind": "ttl_backstop_proof", "cluster": spec.name, "project": spec.project,
+             "permission": TTL_PERMISSION, "proven": ok, "why": why,
+             "node": placement["node"], "pool": placement["pool"],
+             "pool_required": "=".join(ttl_pool(spec)),
+             "method": "projects.testIamPermissions, from a Job of the ttl-self-destruct CronJob's pod spec"}
+    if getattr(a, "ttl_proof_out", None):
+        with open(a.ttl_proof_out, "w") as fh:
+            json.dump(proof, fh)
+            fh.write("\n")
+    if not ok:
+        sys.stderr.write(f"TTL backstop NOT proven: {why}: the ttl-self-destruct CronJob could not delete "
+                         f"{spec.name} at its TTL, so the run does not go on; the run's teardown deletes it (by "
+                         f"hand: python3 -m bench.gke gke-down --name {spec.name} --yes)\n")
+        return EXIT_TTL_BACKSTOP_MISSING
+    print(f"TTL backstop proven: {why} in {spec.project} (projects.testIamPermissions from a Job of the "
+          f"ttl-self-destruct CronJob's own pod spec)")
     return 0
 
 
@@ -2255,9 +2580,12 @@ def cmd_gke_shape(a) -> int:
     if rec["control_plane"] is None:
         say(f"cluster shape UNKNOWN: {rec['source']}")
     else:
+        v = shape_versions(rec)
         say(f"cluster shape ({rec['source']}): control plane {rec['control_plane']} "
             f"({rec.get('location') or rec.get('region')}); nodes in {','.join(rec['node_locations']) or '?'}"
-            + (f"; {rec['current_node_count']} nodes" if rec.get("current_node_count") is not None else ""))
+            + (f"; {rec['current_node_count']} nodes" if rec.get("current_node_count") is not None else "")
+            + (f"; GKE {v['master']} (control plane), {', '.join(v['nodes'])} (nodes)" if v
+               else "; GKE versions unrecorded"))
     print(json.dumps(rec))
     return 0
 
@@ -2268,6 +2596,9 @@ EXIT_BACKSTOP_FAILED = 4
 # gke-down's exit when no such cluster exists (exact-name describe: NotFound):
 # nothing to delete (#985; run606 says so, never "TEARDOWN FAILED")
 EXIT_NOTHING_TO_DELETE = 5
+# gke-down's exit when GKE accepted the delete but no describe answered NotFound within
+# the budget: NOT_CONFIRMED_GONE, never "deleted" (#1383 gap 2; run606 says so)
+EXIT_NOT_CONFIRMED_GONE = 6
 
 
 def _write_record(path: str | None, rec: dict) -> None:
@@ -2294,6 +2625,10 @@ def cmd_gke_down(a) -> int:
         sys.stderr.write(f"gke-down: {type(e).__name__}: {e}\n")
         _write_record(getattr(a, "record", None), dict(rec, outcome=f"failed: {type(e).__name__}"))
         return 1
+    if a.yes and rec.get("confirmed_gone") is not True:
+        # #1383 gap 2: GKE accepted the delete, and no describe answered NotFound within the budget
+        _write_record(getattr(a, "record", None), dict(rec, outcome=NOT_CONFIRMED_GONE))
+        return EXIT_NOT_CONFIRMED_GONE
     _write_record(getattr(a, "record", None),
                   dict(rec, outcome="dry run" if not a.yes else ("deleted, backstop failed" if problems
                                                                  else "deleted")))
@@ -2356,17 +2691,62 @@ def cmd_gke_quotas(a) -> int:
     return 2 if refusals else 0
 
 
+def reap_expired(project: str, *, yes: bool, now: float, budget_s: float = DEFAULT_DOWN_BUDGET_S,
+         log: Callable[[str], None] = print, clock: Callable[[], float] = time.monotonic,
+         sleep: Callable[[float], None] = time.sleep) -> tuple[list[str], list[str]]:
+    """#1383 gap 5: delete every bench cluster past its TTL, each verified. One unfiltered,
+    fail-closed list (list_clusters); expired_clusters selects by exact labels; each delete's
+    exit code is read; then each cluster whose delete GKE accepted is polled by its exact-name
+    describe until NotFound, all within one `budget_s`. (reaped, problems): problems is empty
+    only when every expired cluster answered NotFound (a list that is not known whole, a
+    failed delete or a cluster still there at the deadline is one)."""
+    clusters, why = list_clusters(project)
+    if clusters is None:
+        return [], [f"the project's clusters could not be listed ({why}): whether any bench cluster is past its "
+                    f"TTL is unknown"]
+    expired = expired_clusters(clusters, now=now)
+    if not expired:
+        log("no expired bench clusters")
+        return [], []
+    problems: list[str] = []
+    asked: list[tuple[str, list[str]]] = []
+    for c in expired:
+        # `location` is the cluster's own (a region now; a zone for an older one)
+        loc = c.get("location") or c.get("zone") or region_of(DEFAULT_ZONE)
+        argv = delete_command(c["name"], project=project, location=loc)
+        err: list[str] = []
+        rc, _ = execute(argv, dry_run=not yes, log=log, stderr_out=err)
+        if not yes:
+            continue
+        busy = _INCOMPATIBLE_OP.search(err[-1] if err else "") if rc != 0 else None
+        if busy:
+            # #1387 review: GKE refuses a delete while another operation runs on the cluster: its own
+            # ttl-self-destruct CronJob's delete, or a partner launch's reap, got there first. That is a
+            # delete in progress, not a failed one: the NotFound poll below says whether it ends (an
+            # operation that is not a delete leaves the cluster there, and the poll says so)
+            log(f"{c['name']}: {busy.group(1)} is already running on it (a delete in progress, its own CronJob's "
+                f"or another reap's): waiting for its describe to answer NotFound")
+        elif rc != 0:
+            problems.append(f"{c['name']}: its delete failed (rc={rc}): it is still there, past its TTL")
+            continue
+        asked.append((c["name"], describe_argv(c["name"], project, loc)))
+    deadline = clock() + budget_s
+    reaped = []
+    for name, describe in asked:
+        if _wait_gone(describe, deadline=deadline, clock=clock, sleep=sleep):
+            log(f"reaped: {name} (past its TTL): deleted, its describe answers NotFound")
+            reaped.append(name)
+        else:
+            problems.append(f"{name}: {NOT_CONFIRMED_GONE}: its describe still answered when the {budget_s:g} s "
+                            f"budget ran out; check it with {' '.join(describe)}")
+    return reaped, problems
+
+
 def cmd_gke_reap(a) -> int:
-    rc, out = execute(list_command(a.project), dry_run=False)
-    if rc != 0:
-        return rc
-    cmds = reap_commands(json.loads(out or "[]"), now=time.time(),
-                         project=a.project)
-    if not cmds:
-        print("no expired bench clusters")
-    for argv in cmds:
-        execute(argv, dry_run=not a.yes)
-    return 0
+    _reaped, problems = reap_expired(a.project, yes=a.yes, now=time.time(), budget_s=a.budget_s)
+    for p in problems:
+        sys.stderr.write(f"gke-reap: {p}\n")
+    return 1 if problems else 0
 
 
 def cmd_gke_env(a) -> int:
@@ -2466,6 +2846,8 @@ def add_parsers(sub) -> None:
     up.add_argument("--ttl-hours", type=int, default=DEFAULT_TTL_HOURS)
     up.add_argument("--quota-log", default=None,
                     help="#1173: write every pre-check line here (run606: $OUT/quota-check.log)")
+    up.add_argument("--ttl-proof-out", default=None,
+                    help="#1383: write the TTL backstop's proof record (JSON) here (run606: $OUT/ttl-proof.json)")
     footprint_args(up)
     up.set_defaults(func=cmd_gke_up)
 
@@ -2513,6 +2895,9 @@ def add_parsers(sub) -> None:
                                            "their TTL (dry run unless --yes)")
     reap.add_argument("--project", default=DEFAULT_PROJECT)
     reap.add_argument("--yes", action="store_true")
+    reap.add_argument("--budget-s", type=float, default=DEFAULT_DOWN_BUDGET_S,
+                      help="#1383: how long the reaped clusters may take to answer NotFound (default "
+                           f"{DEFAULT_DOWN_BUDGET_S:g} s)")
     reap.set_defaults(func=cmd_gke_reap)
 
     env = sub.add_parser("gke-env", help="#606: print SNOWPLOW_URL/AUTHN_URL/"

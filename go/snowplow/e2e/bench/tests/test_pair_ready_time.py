@@ -46,6 +46,7 @@ from statistics import NormalDist
 import pytest
 
 from bench import custlat, load606
+from tests import fake_region
 from tests.test_run15_customer_latency import (BENCH, FIX, NA, NB, P14, REPLICA, _iso, _launch,  # noqa: F401
                                                _write_run, pairbed)
 
@@ -80,11 +81,13 @@ def _write15(d: Path, arm: dict) -> list[str]:
     (d / "browser" / "browser-summary.json").write_text(json.dumps({"sessions": arm["browser_sessions"]}))
     files = {"fresh-x.jsonl": arm["churns"], "mem-x.jsonl": arm["mem"], "top.jsonl": arm["tops"],
              "pod-before.jsonl": [p for p in arm["pods"] if p["phase"] == "before"],
-             "pod-after.jsonl": [p for p in arm["pods"] if p["phase"] == "after"]}
+             "pod-after.jsonl": [p for p in arm["pods"] if p["phase"] == "after"],
+             # #1383 gap 7: the cluster's shape with its GKE versions (run 15 predates the record)
+             "cluster-shape.jsonl": [fake_region.cluster_shape()]}
     for name, rows in files.items():
         (d / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return [str(d / n) for n in ("fresh-x.jsonl", "pod-after.jsonl", "pod-before.jsonl", "mem-x.jsonl",
-                                 "top.jsonl")]
+                                 "top.jsonl", "cluster-shape.jsonl")]
 
 
 def _evaluate15(d: Path, arm: dict) -> dict:

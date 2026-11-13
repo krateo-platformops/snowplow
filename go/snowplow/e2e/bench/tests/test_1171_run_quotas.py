@@ -328,19 +328,16 @@ def test_without_the_property_real_gclouds_failed_list_reads_attempt_2s_region_a
     exits 0 with [] (the SDK's MultiScopeLister only warns while
     compute/allow_partial_error is true, its default). Without the property
     on the call, attempt 2's region (3 VMs + 7 forwarding rules, reported 3)
-    with its forwarding-rule list failing reads FIT: run 21 again."""
+    with its forwarding-rule list failing reads FIT: run 21 again. (#1383:
+    the property is the executor's, gke.COMPUTE_LIST_ENV; emptied here.)"""
     for k, v in region_env(vms=3, forwarding_rules=7).items():
         monkeypatch.setenv(k, v)
     monkeypatch.setenv("FAKE_FAIL_READ", "forwarding-rules")
     monkeypatch.delenv(PARTIAL, raising=False)
 
-    def without_the_property(argv, **kw):
-        env = kw.pop("env", None)
-        if env is not None:
-            env = {k: v for k, v in env.items() if k != PARTIAL}
-        return gke.execute(argv, env=env, **kw)
-
-    fits, refusals = gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair(), run=without_the_property)
+    with monkeypatch.context() as m:
+        m.setattr(gke, "COMPUTE_LIST_ENV", {})
+        fits, refusals = gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair())
     assert not refusals, refusals
     assert any(m.startswith("IN_USE_ADDRESSES in europe-west4: 3 of 16 used (listed: 3 VM external IP(s) + 0 "
                             "forwarding-rule use(s)") for m in fits), fits
@@ -350,16 +347,19 @@ def test_without_the_property_real_gclouds_failed_list_reads_attempt_2s_region_a
 
 
 def test_the_pre_checks_lists_and_only_they_carry_the_property(fakes, monkeypatch):  # noqa: F811
-    """The property is passed on each of the three lists' own call (gcloud's
-    environment form of compute/allow_partial_error), never set globally."""
+    """The property is on each of the three lists' own call (gcloud's
+    environment form of compute/allow_partial_error), never set globally:
+    #1383, execute() sets it on every compute list it runs."""
     monkeypatch.delenv(PARTIAL, raising=False)
     seen = []
+    real_run = gke.subprocess.run
 
     def spy(argv, **kw):
         seen.append((argv[1:4], (kw.get("env") or {}).get(PARTIAL)))
-        return gke.execute(argv, **kw)
+        return real_run(argv, **kw)
 
-    gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair(), run=spy)
+    monkeypatch.setattr(gke.subprocess, "run", spy)
+    gke.quota_check(gke.DEFAULT_PROJECT, gke.DEFAULT_ZONE, _fp_pair())
     def is_list(a):
         return a[:1] == ["compute"] and a[2:3] == ["list"]
 

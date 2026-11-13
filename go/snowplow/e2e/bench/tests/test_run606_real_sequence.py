@@ -74,6 +74,8 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         print("fake-access-token"); sys.exit(0)
     if a[:3] == ["container", "clusters", "list"]:
         print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
+    if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)
+        print(json.dumps(server_config())); sys.exit(0)
     # FAKE_CREATE_ERROR: the create refused with this stderr (run 18: the
     # per-location limit); no cluster exists, so its describe answers NotFound
     if a[:3] == ["container", "clusters", "create"] and os.environ.get("FAKE_CREATE_ERROR"):
@@ -108,7 +110,9 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         if os.environ.get("FAKE_DISKS_FAIL") == "1":
             sys.exit(1)
         print(os.environ.get("FAKE_DISKS", "[]")); sys.exit(0)
-    if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")):
+    # #1383: FAKE_NEVER_GONE=1: GKE accepted the delete, and its describe still answers
+    if a[:3] == ["container", "clusters", "describe"] and os.path.exists(os.path.join(STATE, "deleted")) \\
+            and os.environ.get("FAKE_NEVER_GONE") != "1":
         sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
                          "message=Not found: clusters/" + a[3] + ".\\n")
         sys.exit(1)
@@ -129,8 +133,12 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "endpoint": "127.0.0.1",    # the server get-credentials writes below
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
+                          # #1383 gap 7: the versions GKE gave it (FAKE_GKE_VERSION: another patch)
+                          "currentMasterVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,
+                          "currentNodeVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,
                           "nodePools": [{"name": n, "config": {"machineType": m}, "initialNodeCount": c,
-                                         "locations": ["europe-west4-a"]}
+                                         "locations": ["europe-west4-a"],
+                                         "version": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION}
                                         for n, m, c in (("default-pool", "n2-standard-8", 3),
                                                         ("snowplow", "n2-standard-8", 1),
                                                         ("loadgen", "n2-standard-8", 1))],
@@ -262,6 +270,22 @@ FAKE_KUBECTL = _COMMON + _CANON + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+        # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
+        if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
+            sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
+    # #1383 gap 3: gke-up's TTL proof Job (the CronJob's pod spec asking IAM's testIamPermissions as the node SA):
+    # FAKE_TTL_PROOF=granted (default) | denied (IAM answers {})
+    if a[:3] == ["get", "job", "ttl-delete-proof"]:
+        print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
+    if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:       # its pod, on a platform node
+        print(json.dumps({"items": [{"metadata": {"name": "ttl-delete-proof-x"},
+                                     "spec": {"nodeName": "gke-node-proof"}}]})); sys.exit(0)
+    if a[:3] == ["get", "node", "gke-node-proof"]:
+        print(json.dumps({"metadata": {"name": a[2], "labels": {"bench.krateo.io/pool": "platform"}}})); sys.exit(0)
+    if a[:2] == ["logs", "job/ttl-delete-proof"]:
+        granted = os.environ.get("FAKE_TTL_PROOF", "granted") == "granted"
+        print("TTL_PROOF " + json.dumps({"permissions": ["container.clusters.delete"]} if granted else {}))
+        sys.exit(0)
     # #1297: the in-cluster Jobs (bench/incluster.py) RUN here, as their pods would: the container's
     # own command, its /out at STATE/pods/<job>/out, its kubectl this fake (the run's kubeconfig),
     # started when the Job is applied, TERMed (as the kubelet would) when the Job is deleted.
