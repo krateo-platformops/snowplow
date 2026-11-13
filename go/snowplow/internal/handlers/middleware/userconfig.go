@@ -37,7 +37,12 @@
 // (#1029, #1076): every 401 this middleware writes keeps upstream's six Status
 // fields and message and appends `details.causes[0].reason` from a closed set
 // plus a WWW-Authenticate challenge (credential_status.go), so a client can
-// tell a pre-dispatch rejection from a relayed upstream 401. Cache hits bypass the
+// tell a pre-dispatch rejection from a relayed upstream 401. A FOURTH (#1382,
+// authn#140): the Secret is looked up under every name plumbing's
+// endpoints.SessionSecretNames gives, the exact name first, and is used only
+// when endpoints.OwnsSecret proves it the requester's; the apiserver re-read
+// therefore GETs the Secret itself (credhttp.GetSecret) instead of calling
+// endpoints.FromSecret, which returns only the Endpoint. Cache hits bypass the
 // apiserver GET entirely and are byte-equivalent to what
 // `endpoints.FromSecret` would have returned (gated by Ship D.2's
 // TestFromInformerSecret_UpstreamFieldParity).
@@ -122,7 +127,20 @@ import (
 // byte-identical; the diff is dialguard/ (RoundTripper also sets fetch's
 // credentials mode "omit" on js/wasm, still the identity on a server build),
 // helm/, which snowplow does not import, and tests.
-const PinnedPlumbingVersion = "v1.54.0"
+//
+// v1.54.0 → v1.61.0 (#1382, for authn#140; plumbing#152): re-audited by
+// `diff -r` of the module trees (v1.54.0 → v1.58.0 → v1.61.0). server/ and
+// jwtutil/ are byte-identical, so this file's upstream line numbers stand.
+// endpoints/ only adds names.go (UsernameAnnotation, StepUpSuffix,
+// ExactSecretName, SessionSecretNames, OwnsSecret; v1.61.0 makes OwnsSecret
+// also require an annotated Secret's certificate CN, when it holds one, to be
+// the user, and refuses an unparseable one); FromSecret and SecretName are
+// unchanged. The rest is helm/, kubeutil/objectclient and kubeutil/content,
+// which snowplow does not import, usernames/ (new, not imported), signup tests
+// and docs. This file now reads every name SessionSecretNames gives and uses
+// a Secret only when OwnsSecret holds: the step-5 lookup's one intentional
+// change for #1382.
+const PinnedPlumbingVersion = "v1.61.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -279,28 +297,41 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				tokenRejected(wri, err)
 				return
 			}
+			// #1379 re-review — the caller is verified from here on: an
+			// audited route's one record (audit.OpenRecord) names them,
+			// whatever exit the request takes, the credential lookup's below
+			// included.
+			audit.SetCaller(req.Context(), userInfo)
 
 			// Ship D.3 — cache-first lookup. #994 — the Secret is chosen
 			// from the VALIDATED token alone: a token whose groups carry
-			// krateo:loa:2 (a step-up login, authn#49) reads
-			// `<DNS1123(username)>-clientconfig-stepup`; every other token
-			// reads `<DNS1123(username)>-clientconfig`, computed
-			// IDENTICALLY to upstream's `endpoints.SecretName(username)`
-			// at `userconfig.go:67` (credsecret.SessionName). The name is
-			// built from the token's own username, never from a claim or
-			// the request. There is NO fallback between the two: a step-up
-			// Secret that is neither in the informer nor on the apiserver
-			// re-read below is a NotFound, which answers 401 like any
-			// missing credential.
-			secretName := credsecret.For(userInfo.Username, userInfo.Groups)
+			// krateo:loa:2 (a step-up login, authn#49) reads its step-up
+			// Secret; every other token reads its session Secret. The names
+			// are built from the token's own username, never from a claim
+			// or the request. There is NO fallback between the two kinds: a
+			// step-up Secret that is neither in the informer nor on the
+			// apiserver re-read below is a NotFound, which answers 401 like
+			// any missing credential.
+			//
+			// #1382 — the names are plumbing's (credsecret.For): the exact
+			// name (authn#140), then upstream's legacy
+			// `endpoints.SecretName(username)` where it differs. A Secret
+			// found under either is used only when the requester owns it
+			// (endpoints.OwnsSecret): one that is another user's is a miss,
+			// and when no name holds the requester's Secret the answer is
+			// the NotFound 401 of a missing credential, never another
+			// user's credential (api.FromInformerOwnSecret,
+			// api.FromAPIServerOwnSecret).
+			secretNames := credsecret.For(userInfo.Username, userInfo.Groups)
 
-			ep, served, ferr := api.FromInformerSecret(req.Context(), authnNS, secretName)
+			ep, served, ferr := api.FromInformerOwnSecret(req.Context(), authnNS, userInfo.Username, secretNames)
 			if !served {
 				if ferr != nil {
 					// (5.c) — cache HARD ERROR (Ship D.2's verbatim
 					// upstream error string for server-url missing).
 					// Upstream's equivalent branch is the non-NotFound
 					// arm at :73-74 → InternalError.
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, ferr)
 					return
 				}
@@ -328,22 +359,26 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				//       TestUserConfig_ByteEquivalence_CacheMiss.
 				sarc, ierr := credhttp.InClusterConfig()
 				if ierr != nil {
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, fmt.Errorf("unable to create in cluster config: %w", ierr))
 					return
 				}
 
-				// Upstream call (`use.UserConfig` :66-67) with the EXACT
-				// same arguments, through credhttp.FromSecret: plumbing's
-				// endpoints.FromSecret over a hardened copy of sarc (#920:
-				// no client-side limiter; #723: no redirect followed). The
-				// cache-miss fallback's observable behaviour MUST be
-				// byte-identical to upstream — gated by
+				// Upstream call (`use.UserConfig` :66-67), the Secret GET
+				// over a hardened copy of sarc (#920: no client-side
+				// limiter; #723: no redirect followed). #1382 — one GET per
+				// name, in order, until one returns a Secret the requester
+				// owns (api.FromAPIServerOwnSecret, over
+				// credhttp.GetSecret): the Secret itself is read, not only
+				// the Endpoint plumbing's FromSecret extracts, because
+				// ownership is proven from its annotation or certificate.
+				// For a single name and an owned Secret the observable
+				// behaviour stays upstream's — gated by
 				// TestUserConfig_ByteEquivalence_CacheMiss.
 				// #1115 — on the request's ctx: the re-read is a network exchange of
 				// this customer request and runs inside its page budget (a spent
-				// budget is never sent: 504 Timeout). Without a budget the call is
-				// byte-identical to upstream's.
-				ep, ferr = credhttp.FromSecret(req.Context(), sarc, secretName, authnNS)
+				// budget is never sent: 504 Timeout).
+				ep, ferr = api.FromAPIServerOwnSecret(req.Context(), sarc, authnNS, userInfo.Username, secretNames)
 				if ferr != nil {
 					// Upstream :68-75 — NotFound → 401, else → 500.
 					// PM load-bearing pin: the IsNotFound distinction
@@ -359,17 +394,18 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 					// byte-identical to upstream's. Any other re-read error
 					// stays upstream's 500, with no cause.
 					if credhttp.WriteBudgetError(wri, ferr) {
+						audit.FailRoute(req.Context())
 						return
 					}
 					if apierrors.IsNotFound(ferr) {
-						// audit#22 (a) — the caller is verified and snowplow
-						// refuses for its own reason: the request gets the
-						// denied record its route would have given it admitted
-						// (audit.EmitRefused reads the route's descriptor).
-						auditCredentialMissing(req, userInfo)
+						// The verified caller's own credential is missing:
+						// snowplow refuses before anything is sent, and
+						// the audited route's record says why.
+						audit.DenyRoute(req.Context(), credentialMissingReason(userInfo.Groups))
 						credentialMissing(wri, userInfo.Groups, ferr)
 						return
 					}
+					audit.FailRoute(req.Context())
 					response.InternalError(wri, ferr)
 					return
 				}
@@ -383,9 +419,6 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
 			)
-			// An audited route's record (audit.OpenRecord) names this
-			// verified caller, whatever exit the request takes from here.
-			audit.SetCaller(ctx, userInfo)
 
 			authOpen = false
 			auth.End()

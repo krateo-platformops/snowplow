@@ -417,10 +417,16 @@ func main() {
 	// dump. Re-export it as the DEBUG env so those downstream readers observe it,
 	// so LOG_LEVEL=debug now enables the tracing exactly as DEBUG=true always did.
 	debugMode := logLevel == slog.LevelDebug
-	os.Setenv("DEBUG", strconv.FormatBool(debugMode))
-	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
-	os.Setenv("AUTHN_NAMESPACE", *authnNS)
-	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
+	if err := exportEnv([][2]string{
+		{"DEBUG", strconv.FormatBool(debugMode)},
+		{"TRACE", strconv.FormatBool(*blizzardOn)},
+		{"AUTHN_NAMESPACE", *authnNS},
+		{jqsupport.EnvModulesPath, *jqModPath},
+	}); err != nil {
+		// The logger is built from these settings below, so the reason goes to stderr directly.
+		fmt.Fprintf(os.Stderr, "snowplow: %v\n", err)
+		os.Exit(1)
+	}
 
 	// 1.12.4: the handler chain lives in buildLogHandler (log_handler.go)
 	// — base text/JSON handler + the OTel trace-correlation decorator that
@@ -1725,4 +1731,16 @@ func startAuditNamespaceReader(ctx context.Context, log *slog.Logger) {
 		return
 	}
 	audit.SetNamespaceReader(audit.StartNamespaceReader(ctx, mc))
+}
+
+// exportEnv sets each variable for the process, in order, and names the first one it could not
+// set: the downstream readers (plumbing's DEBUG tracing, the authn namespace, the jq module path)
+// would otherwise run with a stale value and nothing would say so.
+func exportEnv(vars [][2]string) error {
+	for _, kv := range vars {
+		if err := os.Setenv(kv[0], kv[1]); err != nil {
+			return fmt.Errorf("cannot set %s for the process: %w", kv[0], err)
+		}
+	}
+	return nil
 }

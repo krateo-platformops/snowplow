@@ -89,6 +89,9 @@ const (
 	DenialSessionCredentialMissing = krateoaudit.DenialReasonSessionCredentialMissing
 	DenialStepUpRequired           = krateoaudit.DenialReasonStepUpRequired
 	DenialInvalidRequest           = krateoaudit.DenialReasonInvalidRequest
+	// DenialRBACNotAllowed: snowplow's own RBAC evaluation refused the
+	// verified caller before its handler ran (audit v0.13.0).
+	DenialRBACNotAllowed = krateoaudit.DenialReasonRbacNotAllowed
 )
 
 // MessageRefused is the body of a denied record: snowplow refused before

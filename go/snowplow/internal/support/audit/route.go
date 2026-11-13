@@ -7,15 +7,28 @@
 //
 //   - the handler emits it, through EmitRoute, with what the authority
 //     answered (a /call write, an export);
-//   - an exit that emitted none (a refusal before or inside the handler: a
-//     body the decoder refuses, a malformed query) is recorded by OpenRecord
-//     when the request ends: what the route's descriptor says the request
-//     asked for (Asked), denied with reason invalid_request when snowplow
-//     answered 4xx, a failure with no status code otherwise;
+//   - the login middleware's own exits after it verified the caller are
+//     described by it: a refusal for its own reason (DenyRoute: the caller's
+//     credential is missing) is denied with that reason, a failure before
+//     anything was sent (FailRoute: the caller's credential could not be
+//     read) is a failure with no status code: no authority the record names
+//     answered;
+//   - a refusal by snowplow before anything was sent (a 4xx exit with no
+//     handler record: a body the decoder refuses, a malformed query) is
+//     recorded by OpenRecord when the request ends: what the request asked
+//     for, denied, reason invalid_request, no status code. What it asked for
+//     is the descriptor the handler stored once it parsed the request
+//     (SetAsked), else the route's descriptor of the request's query alone
+//     (Route.Asked); no body is read a second time;
+//   - any other exit with no handler record (a 2xx, 3xx or 5xx answer, or a
+//     panic) is a DESIGN ERROR of the handler: every such exit must record
+//     its own outcome. It is still recorded, as a failure (the outcome is
+//     required and cannot be marked) with its own fixed body, and counted
+//     (DesignErrorVar); a panic is recovered, recorded as one, and re-raised;
 //   - a request that never got a verified caller (an authentication failure
 //     before verification) gets none: those are counted, never recorded
-//     (coverage.md, Exclusions). The caller is the one the UserConfig
-//     middleware verified (SetCaller).
+//     (coverage.md, Exclusions). The caller is the one the login middleware
+//     verified (SetCaller).
 package audit
 
 import (
@@ -30,11 +43,14 @@ import (
 
 // Route is the audit descriptor of one audited route.
 type Route struct {
-	// Asked is the record of what req asked for, by the route handler's own
-	// rules, before anything happened: the action, the method and verb of
-	// the authority request it would send, and the target when the request
-	// names one the handler would dial (none otherwise: the shared writer
-	// then marks the record target). The emitter adds the outcome.
+	// Asked is the record of what req asked for, from its method, path and
+	// query alone (never its body), by the route handler's own rules: the
+	// action, the method and verb of the authority request it would send,
+	// and the target when the query names one the handler would dial (none
+	// otherwise: the shared writer then marks the record target). The
+	// emitter adds the outcome. It describes an exit before the handler
+	// parsed the request; after that, the handler's own descriptor
+	// (SetAsked) is used.
 	Asked func(req *http.Request) Event
 }
 
@@ -43,9 +59,14 @@ type Route struct {
 // the request.
 const MessageRequestRefused = "refused: snowplow did not accept the request; nothing was sent"
 
-// MessageRequestEnded is the body of a record OpenRecord writes for a request
-// that ended with no record and no refusal (a server error before the send).
-const MessageRequestEnded = "the request ended before anything was sent"
+// MessageUnrecordedAnswer is the body of a record OpenRecord writes for an
+// exit the handler answered without recording its outcome: a design error,
+// never a description of what was or was not sent.
+const MessageUnrecordedAnswer = "the handler answered without recording its outcome"
+
+// MessagePanic is the body of a record OpenRecord writes for a handler that
+// panicked before recording its outcome.
+const MessagePanic = "panic: the handler panicked before recording its outcome"
 
 type slotKey struct{}
 
@@ -58,6 +79,8 @@ type recordSlot struct {
 	mu     sync.Mutex
 	base   context.Context   // the request context as Middleware established it
 	caller *jwtutil.UserInfo // the verified caller (SetCaller)
+	asked  *Event            // the handler's parsed descriptor (SetAsked)
+	end    *routeEnd         // how a middleware said it ended (DenyRoute, FailRoute)
 }
 
 // OpenRecord is the outermost middleware of an audited route (see the file
@@ -70,7 +93,13 @@ func OpenRecord(route Route) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			slot := &recordSlot{route: route, base: req.Context()}
 			sw := &statusWriter{ResponseWriter: w}
-			defer slot.close(req, sw)
+			defer func() {
+				if p := recover(); p != nil {
+					slot.close(req, sw, true)
+					panic(p)
+				}
+				slot.close(req, sw, false)
+			}()
 			next.ServeHTTP(sw, req.WithContext(context.WithValue(req.Context(), slotKey{}, slot)))
 		})
 	}
@@ -85,33 +114,77 @@ func EmitRoute(ctx context.Context, ev Event) {
 	Emit(ctx, ev)
 }
 
-// RefuseRoute writes the audited route's record of req, refused by snowplow
-// for reason (one of the request writer's closed denial reasons) before its
-// handler ran, for the verified caller ui: what the route's descriptor says the
-// request asked for, denied, no status code (audit#22 (a)). On a route that is
-// not audited it writes nothing: such a request, admitted, would have had no
-// record either.
-func RefuseRoute(ctx context.Context, req *http.Request, ui jwtutil.UserInfo, reason string) {
-	s, ok := ctx.Value(slotKey{}).(*recordSlot)
-	if !ok {
-		return
-	}
-	s.mu.Lock()
-	base := s.base
-	s.mu.Unlock()
-	rctx := xcontext.BuildContext(base, xcontext.WithUserInfo(ui))
-	ev := s.route.Asked(req.WithContext(rctx))
-	ev.Outcome, ev.DenialReason, ev.StatusCode, ev.Message = OutcomeDenied, reason, 0, MessageRefused
-	s.emitted.Store(true)
-	Emit(rctx, ev)
-}
-
 // SetCaller records on ctx's audited request that its caller is verified as
 // ui. Called by the middleware that verified it.
 func SetCaller(ctx context.Context, ui jwtutil.UserInfo) {
 	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
 		s.mu.Lock()
 		s.caller = &ui
+		s.mu.Unlock()
+	}
+}
+
+// DenyRoute records on ctx's audited request that snowplow refused the
+// verified caller before anything was sent, for reason (one of the request
+// writer's closed denial reasons): OpenRecord's record of the exit is then
+// denied with that reason, no status code. Called by the middleware that
+// refused (a verified caller whose own credential is missing).
+func DenyRoute(ctx context.Context, reason string) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeDenied, reason: reason, message: MessageRefused}
+		s.mu.Unlock()
+	}
+}
+
+// FailRoute records on ctx's audited request that the caller's credential
+// could not be read, so nothing was sent: OpenRecord's record of the exit is
+// a failure with NO status code and MessageCredentialUnreadable. A legitimate
+// server error, not a design error. No code is written: snowplow's own (500,
+// 504) or its ServiceAccount's read of the credential Secret is never an
+// answer of the authority the record names (schema v1: "the status code the
+// authority answered"; #1298: never a code snowplow made up).
+func FailRoute(ctx context.Context) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeFailure, message: MessageCredentialUnreadable}
+		s.mu.Unlock()
+	}
+}
+
+// FailAuthorizationRoute records on ctx's audited request that snowplow could
+// not evaluate the verified caller's authorization (its own RBAC evaluation
+// was unavailable), so nothing was sent: a failure with NO status code and
+// MessageAuthorizationUnavailable. A legitimate server error, not a design
+// error; no code, as for FailRoute.
+func FailAuthorizationRoute(ctx context.Context) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeFailure, message: MessageAuthorizationUnavailable}
+		s.mu.Unlock()
+	}
+}
+
+// MessageAuthorizationUnavailable is the body of a record of a request whose
+// caller's authorization snowplow could not evaluate (FailAuthorizationRoute).
+const MessageAuthorizationUnavailable = "the caller's authorization could not be evaluated; nothing was sent"
+
+// MessageCredentialUnreadable is the body of a record of a request whose
+// caller's credential could not be read (FailRoute): nothing was sent.
+const MessageCredentialUnreadable = "the caller's credential could not be read; nothing was sent"
+
+// routeEnd is how a middleware said the request ended, for OpenRecord.
+type routeEnd struct {
+	outcome, reason, message string
+}
+
+// SetAsked records on ctx's audited request the handler's own descriptor of
+// what it asked for, once the handler parsed it: OpenRecord describes a later
+// exit with no record by it, never by parsing the request again.
+func SetAsked(ctx context.Context, ev Event) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.asked = &ev
 		s.mu.Unlock()
 	}
 }
@@ -126,29 +199,43 @@ func established(ctx context.Context) {
 	}
 }
 
-func (s *recordSlot) close(req *http.Request, sw *statusWriter) {
+func (s *recordSlot) close(req *http.Request, sw *statusWriter, panicked bool) {
 	if s.emitted.Load() {
 		return
 	}
 	s.mu.Lock()
-	base, caller := s.base, s.caller
+	base, caller, asked, end := s.base, s.caller, s.asked, s.end
 	s.mu.Unlock()
 	if caller == nil {
 		return // never verified: counted, never recorded
 	}
 	ctx := xcontext.BuildContext(base, xcontext.WithUserInfo(*caller))
-	ev := s.route.Asked(req.WithContext(ctx))
+	var ev Event
+	if asked != nil {
+		ev = *asked
+	} else {
+		ev = s.route.Asked(req.WithContext(ctx))
+	}
 	status := sw.status
 	if status == 0 {
-		status = http.StatusOK
+		status = http.StatusOK // net/http's answer to a handler that never set one
 	}
 	switch {
+	case end != nil && !panicked:
+		ev.Outcome, ev.DenialReason, ev.Message = end.outcome, end.reason, end.message
+		ev.StatusCode = 0 // no authority the record names answered
+		Emit(ctx, ev)
+		return
+	case panicked:
+		designErrors.Add("panic", 1)
+		ev.Outcome, ev.DenialReason, ev.Message = OutcomeFailure, "", MessagePanic
 	case status >= 400 && status < 500:
 		ev.Outcome, ev.DenialReason, ev.Message = OutcomeDenied, DenialInvalidRequest, MessageRequestRefused
 	default:
-		ev.Outcome, ev.Message = OutcomeFailure, MessageRequestEnded
+		designErrors.Add("answered", 1)
+		ev.Outcome, ev.DenialReason, ev.Message = OutcomeFailure, "", MessageUnrecordedAnswer
 	}
-	ev.StatusCode = 0 // no authority answered
+	ev.StatusCode = 0 // no authority's answer is known
 	Emit(ctx, ev)
 }
 

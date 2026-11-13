@@ -67,10 +67,17 @@ func i853ServeIdentityPath(t *testing.T, objectName string) (*httptest.ResponseR
 	f := in443Setup(t, ra, bind)
 	// The caller's clientconfig, under the DNS-1123 name authn writes, next to
 	// the harness users' (the stage dials the caller's own apiserver).
+	// #1382: each is annotated with its user's exact username, as authn writes
+	// it (the caller's name is not a valid Secret name, so its Secret has only
+	// the legacy DNS-1123 name).
 	secrets := map[string]*corev1.Secret{}
-	for _, u := range append(append([]string{}, psUsers...), kubeutil.MakeDNS1123Compatible(i853Carol)) {
+	owners := map[string]string{kubeutil.MakeDNS1123Compatible(i853Carol): i853Carol}
+	for _, u := range psUsers {
+		owners[u] = u
+	}
+	for u, owner := range owners {
 		secrets[u+"-clientconfig"] = &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: psAuthnNS, Name: u + "-clientconfig"},
+			ObjectMeta: authnMeta(psAuthnNS, u+"-clientconfig", owner),
 			Data:       map[string][]byte{"server-url": []byte(f.srv.URL), "token": []byte("tok-i853")},
 		}
 	}

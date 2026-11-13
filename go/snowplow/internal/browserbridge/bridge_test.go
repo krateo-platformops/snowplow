@@ -193,6 +193,26 @@ func TestForward_A401IsAnErrorNeverAHead(t *testing.T) {
 	}
 }
 
+// TestRelay_A401ReachesTheCallerAsTheServerGaveIt: a Target (the fake
+// apiserver) answers snowplow's egress, not the page, so its 401 is relayed
+// as a head and body for snowplow to handle as it handles a real server's.
+func TestRelay_A401ReachesTheCallerAsTheServerGaveIt(t *testing.T) {
+	const status = `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}`
+	addr := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, status)
+	}))
+	sink := newSink()
+	Relay(context.Background(), addr, "apiserver", get("/api/v1/namespaces"), sink)
+	if h := sink.next(t); h.kind != "head" || h.status != http.StatusUnauthorized {
+		t.Fatalf("first event %+v, want the 401 head", h)
+	}
+	if got := readBody(t, sink, status); got != status {
+		t.Fatalf("body %q, want %q", got, status)
+	}
+}
+
 // TestForward_TheRequestArrivesAsThePageSentIt: method, path, query, headers,
 // body and the page's host; no header the page did not send.
 func TestForward_TheRequestArrivesAsThePageSentIt(t *testing.T) {

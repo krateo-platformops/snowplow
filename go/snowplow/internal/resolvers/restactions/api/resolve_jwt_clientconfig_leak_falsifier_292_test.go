@@ -115,7 +115,7 @@ func TestFalsifier292_ClientconfigDial_DoesNotLeakUserJWT(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":{"allowed":true}}`))
 	})
-	certPEM, keyPEM := selfSignedClientPair(t)
+	certPEM, keyPEM := selfSignedClientPairFor(t, user292)
 
 	seedCertAuthClientconfig292(t, srv.URL, caPEM, certPEM, keyPEM)
 

@@ -46,6 +46,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // envRefreshSessionCookie names the cookie RefreshAuth reads the JWT from on
@@ -133,6 +134,11 @@ func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 				tokenRejected(wri, err)
 				return
 			}
+			// The caller is verified from here on, as UserConfig names it: an
+			// audited route behind this middleware (POST /debug/shadow-parity)
+			// records them whatever exit the request takes, DebugAuthz's
+			// included.
+			audit.SetCaller(req.Context(), userInfo)
 
 			// IDENTICAL identity placement to UserConfig (userconfig.go:231).
 			// We intentionally do NOT call WithUserConfig / the Secret lookup —

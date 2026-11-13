@@ -190,19 +190,15 @@ func tokenRejected(w http.ResponseWriter, err error) error {
 	return preDispatchUnauthorized(w, CauseTokenInvalid, err)
 }
 
-// auditCredentialMissing records req, refused because the verified caller's
-// own credential Secret is missing (credentialMissing): denied, reason
+// credentialMissingReason is the audit denial reason of credentialMissing's
+// refusal, chosen from the same validated groups that chose the Secret:
 // step_up_required for a krateo:loa:2 token, session_credential_missing
-// otherwise, chosen from the same validated groups. The record names what the
-// request asked for, by its route's descriptor, never the credential Secret
-// (its name embeds the username). A route whose request would produce no record
-// admitted (a read) gets none refused either.
-func auditCredentialMissing(req *http.Request, ui jwtutil.UserInfo) {
-	reason := audit.DenialSessionCredentialMissing
-	if credsecret.IsStepUp(ui.Groups) {
-		reason = audit.DenialStepUpRequired
+// otherwise (audit v0.12.0).
+func credentialMissingReason(groups []string) string {
+	if credsecret.IsStepUp(groups) {
+		return audit.DenialStepUpRequired
 	}
-	audit.RefuseRoute(req.Context(), req, ui, reason)
+	return audit.DenialSessionCredentialMissing
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

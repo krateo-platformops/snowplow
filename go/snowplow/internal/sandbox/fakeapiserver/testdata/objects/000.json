@@ -1,0 +1,516 @@
+{
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Namespace",
+      "metadata": {
+        "name": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000001",
+        "resourceVersion": "1",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      }
+    },
+    {
+      "apiVersion": "observability.krateo.io/v1alpha1",
+      "kind": "Alert",
+      "metadata": {
+        "name": "demo-volume-attach",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000002",
+        "resourceVersion": "2",
+        "generation": 1,
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "spec": {
+        "displayName": "Volume attach failures (demo)"
+      },
+      "status": {
+        "state": "ALERT"
+      }
+    },
+    {
+      "apiVersion": "observability.krateo.io/v1alpha1",
+      "kind": "Incident",
+      "metadata": {
+        "name": "sre-volume-attach-failure-20261012-140005",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000003",
+        "resourceVersion": "3",
+        "generation": 1,
+        "labels": {
+          "observability.krateo.io/alert": "demo-volume-attach",
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "spec": {
+        "alertRef": {
+          "namespace": "krateo-system",
+          "name": "demo-volume-attach"
+        },
+        "applied": false
+      },
+      "status": {
+        "state": "Open",
+        "resolution": {}
+      }
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRole",
+      "metadata": {
+        "name": "sandbox-test-reader",
+        "uid": "00000000-0000-5000-8000-000000000010",
+        "resourceVersion": "10",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "rules": [
+        {
+          "apiGroups": [
+            ""
+          ],
+          "resources": [
+            "namespaces"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "observability.krateo.io"
+          ],
+          "resources": [
+            "incidents",
+            "alerts"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "rbac.authorization.k8s.io"
+          ],
+          "resources": [
+            "clusterroles",
+            "clusterrolebindings",
+            "roles",
+            "rolebindings"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "apiextensions.k8s.io"
+          ],
+          "resources": [
+            "customresourcedefinitions"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            ""
+          ],
+          "resources": [
+            "configmaps",
+            "endpoints"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "apps"
+          ],
+          "resources": [
+            "deployments"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "admissionregistration.k8s.io"
+          ],
+          "resources": [
+            "mutatingwebhookconfigurations",
+            "validatingwebhookconfigurations"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRoleBinding",
+      "metadata": {
+        "name": "sandbox-test-viewers",
+        "uid": "00000000-0000-5000-8000-000000000011",
+        "resourceVersion": "11",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "ClusterRole",
+        "name": "sandbox-test-reader"
+      },
+      "subjects": [
+        {
+          "apiGroup": "rbac.authorization.k8s.io",
+          "kind": "Group",
+          "name": "sandbox-viewers"
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRoleBinding",
+      "metadata": {
+        "name": "sandbox-test-snowplow",
+        "uid": "00000000-0000-5000-8000-000000000012",
+        "resourceVersion": "12",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "ClusterRole",
+        "name": "sandbox-test-reader"
+      },
+      "subjects": [
+        {
+          "kind": "ServiceAccount",
+          "name": "snowplow",
+          "namespace": "krateo-system"
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "Role",
+      "metadata": {
+        "name": "sandbox-visitor-writes",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000013",
+        "resourceVersion": "13",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "rules": [
+        {
+          "apiGroups": [
+            "observability.krateo.io"
+          ],
+          "resources": [
+            "alerts",
+            "incidents"
+          ],
+          "verbs": [
+            "patch"
+          ]
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "RoleBinding",
+      "metadata": {
+        "name": "sandbox-visitor-writes",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000014",
+        "resourceVersion": "14",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": "sandbox-visitor-writes"
+      },
+      "subjects": [
+        {
+          "apiGroup": "rbac.authorization.k8s.io",
+          "kind": "User",
+          "name": "sandbox-visitor"
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "Role",
+      "metadata": {
+        "name": "sandbox-test-snowplow-clientconfig",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000015",
+        "resourceVersion": "15",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "rules": [
+        {
+          "apiGroups": [
+            ""
+          ],
+          "resources": [
+            "secrets"
+          ],
+          "verbs": [
+            "get",
+            "list",
+            "watch"
+          ]
+        },
+        {
+          "apiGroups": [
+            "observability.krateo.io"
+          ],
+          "resources": [
+            "incidents/status",
+            "alerts/status"
+          ],
+          "verbs": [
+            "get",
+            "patch",
+            "update"
+          ]
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "RoleBinding",
+      "metadata": {
+        "name": "sandbox-test-snowplow-clientconfig",
+        "namespace": "krateo-system",
+        "uid": "00000000-0000-5000-8000-000000000016",
+        "resourceVersion": "16",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": "sandbox-test-snowplow-clientconfig"
+      },
+      "subjects": [
+        {
+          "kind": "ServiceAccount",
+          "name": "snowplow",
+          "namespace": "krateo-system"
+        }
+      ]
+    },
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "incidents.observability.krateo.io",
+        "uid": "00000000-0000-5000-8000-000000000020",
+        "resourceVersion": "20",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "spec": {
+        "group": "observability.krateo.io",
+        "scope": "Namespaced",
+        "names": {
+          "plural": "incidents",
+          "singular": "incident",
+          "kind": "Incident",
+          "listKind": "IncidentList"
+        },
+        "versions": [
+          {
+            "name": "v1alpha1",
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            },
+            "schema": {
+              "openAPIV3Schema": {
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "apiextensions.k8s.io/v1",
+      "kind": "CustomResourceDefinition",
+      "metadata": {
+        "name": "alerts.observability.krateo.io",
+        "uid": "00000000-0000-5000-8000-000000000021",
+        "resourceVersion": "20",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "spec": {
+        "group": "observability.krateo.io",
+        "scope": "Namespaced",
+        "names": {
+          "plural": "alerts",
+          "singular": "alert",
+          "kind": "Alert",
+          "listKind": "AlertList"
+        },
+        "versions": [
+          {
+            "name": "v1alpha1",
+            "served": true,
+            "storage": true,
+            "subresources": {
+              "status": {}
+            },
+            "schema": {
+              "openAPIV3Schema": {
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRole",
+      "metadata": {
+        "name": "system:discovery",
+        "uid": "00000000-0000-5000-8000-000000000030",
+        "resourceVersion": "30"
+      },
+      "rules": [
+        {
+          "nonResourceURLs": [
+            "/api",
+            "/api/*",
+            "/apis",
+            "/apis/*",
+            "/healthz",
+            "/livez",
+            "/openapi",
+            "/openapi/*",
+            "/readyz",
+            "/version",
+            "/version/"
+          ],
+          "verbs": [
+            "get"
+          ]
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRoleBinding",
+      "metadata": {
+        "name": "system:discovery",
+        "uid": "00000000-0000-5000-8000-000000000031",
+        "resourceVersion": "31",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "ClusterRole",
+        "name": "system:discovery"
+      },
+      "subjects": [
+        {
+          "apiGroup": "rbac.authorization.k8s.io",
+          "kind": "Group",
+          "name": "system:authenticated"
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRole",
+      "metadata": {
+        "name": "system:basic-user",
+        "uid": "00000000-0000-5000-8000-000000000032",
+        "resourceVersion": "32"
+      },
+      "rules": [
+        {
+          "apiGroups": [
+            "authorization.k8s.io"
+          ],
+          "resources": [
+            "selfsubjectaccessreviews",
+            "selfsubjectrulesreviews"
+          ],
+          "verbs": [
+            "create"
+          ]
+        }
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRoleBinding",
+      "metadata": {
+        "name": "system:basic-user",
+        "uid": "00000000-0000-5000-8000-000000000033",
+        "resourceVersion": "33",
+        "labels": {
+          "sandbox.krateo.io/synthetic": "true"
+        }
+      },
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "ClusterRole",
+        "name": "system:basic-user"
+      },
+      "subjects": [
+        {
+          "apiGroup": "rbac.authorization.k8s.io",
+          "kind": "Group",
+          "name": "system:authenticated"
+        }
+      ]
+    }
+  ]
+}
