@@ -33,6 +33,7 @@
 //     token, no certificate. A site that would dial "the caller's own
 //     clientconfig" has nothing to present and fails before anything is sent;
 //     it can never fall back to snowplow's own credential.
+//
 // No `<user>-clientconfig` Secret is read for the public identity: a real user
 // named `krateo-public` (a valid DNS-1123 name) owns `krateo-public-clientconfig`,
 // which is exactly what credsecret.For("krateo:public") would name.

@@ -147,7 +147,7 @@ func TestIssue1334_BadCredentialNeverFallsBackToPublic(t *testing.T) {
 		return r
 	}
 	cases := []struct {
-		name string
+		name  string
 		authz string
 	}{
 		{"empty Authorization value", ""},

@@ -168,7 +168,9 @@ func TestIssue1334_PublicPassthrough_ImpersonatedAndDecidedByRBAC(t *testing.T) 
 	rec := recorder957(t)
 
 	public := middleware.NewPublicIdentity(
-		func() (*endpoints.Endpoint, error) { return &endpoints.Endpoint{ServerURL: api.URL, Token: i1334CallSAToken}, nil },
+		func() (*endpoints.Endpoint, error) {
+			return &endpoints.Endpoint{ServerURL: api.URL, Token: i1334CallSAToken}, nil
+		},
 		func() (*rest.Config, error) { return &rest.Config{Host: api.URL, BearerToken: i1334CallSAToken}, nil })
 	// The real middleware: any JWT is refused (the key source holds no key), so
 	// only the token-less path can reach Call().

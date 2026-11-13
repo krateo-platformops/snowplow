@@ -72,7 +72,9 @@ func runPublic1334(t *testing.T, pretty bool, granted bool) ([]string, int) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	public := middleware.NewPublicIdentity(
-		func() (*endpoints.Endpoint, error) { return &endpoints.Endpoint{ServerURL: api.URL, Token: "sa-1334"}, nil },
+		func() (*endpoints.Endpoint, error) {
+			return &endpoints.Endpoint{ServerURL: api.URL, Token: "sa-1334"}, nil
+		},
 		func() (*rest.Config, error) { return &rest.Config{Host: api.URL, BearerToken: "sa-1334"}, nil })
 	work := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		l := xcontext.Logger(r.Context())
