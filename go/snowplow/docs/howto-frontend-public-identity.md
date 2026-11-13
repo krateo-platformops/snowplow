@@ -23,6 +23,10 @@ Send the request with **no `Authorization` header at all**.
 | `publicIdentity.enabled: true` | the request is served as the public identity: `200` for what RBAC grants it, `403` for anything else |
 | enabled, but snowplow may not impersonate the identity (the grant is missing, for example mid-roll) | `503`. Retry later; it is not a sign-in problem |
 
+The public identity requires the cache. The chart refuses
+`publicIdentity.enabled: true` unless `env.CACHE_ENABLED` is `"true"`, and a
+binary started with the cache off answers `503`.
+
 Tests: `TestIssue1334_PublicIdentityOff_TokenlessIs401`,
 `TestIssue1334_PublicIdentityUnavailableIs503NeverTheServiceAccount`.
 

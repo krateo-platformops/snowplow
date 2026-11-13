@@ -122,6 +122,10 @@ rbac:
 # A request with any Authorization header (expired, invalid, revoked, ...) is
 # never served as the public identity: it is refused 401 as before. Set this
 # value, never env.PUBLIC_IDENTITY_ENABLED (the chart refuses that key).
+#
+# REQUIRES THE CACHE: snowplow enables the impersonation only with the cache on,
+# so the chart refuses enabled: true unless env.CACHE_ENABLED is "true" (or "1"
+# / "yes"). With the cache off every token-less request would be 503.
 publicIdentity:
   enabled: false
 

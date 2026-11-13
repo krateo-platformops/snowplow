@@ -170,6 +170,30 @@ func TestIssue1334_ChartPublicIdentity_SwitchOnlyThroughTheValue(t *testing.T) {
 	assertSchemaRejectedValue(t, "publicIdentity.other", out)
 }
 
+// The public identity requires the cache (its impersonation is probed only with
+// the cache on): the render refuses publicIdentity.enabled=true with the cache
+// off, so no install ships a silent 503 mode. Every value the binary reads as
+// "on" (cache.Disabled: "true", "1", "yes") is accepted.
+func TestIssue1334_ChartPublicIdentityRequiresTheCache(t *testing.T) {
+	for _, off := range []string{"false", "0", "no", "TRUE", ""} {
+		for _, tmpl := range []string{"templates/configmap.yaml", "templates/clusterrole.yaml"} {
+			out, err := i1334RenderChart(t, tmpl, "--set", "publicIdentity.enabled=true", "--set-string", "env.CACHE_ENABLED="+off)
+			if err == nil || !strings.Contains(out, "publicIdentity.enabled=true requires the cache") {
+				t.Fatalf("publicIdentity on with env.CACHE_ENABLED=%q rendered %s (err=%v); it must be refused\n%s", off, tmpl, err, out)
+			}
+		}
+	}
+	for _, on := range []string{"true", "1", "yes"} {
+		if v, ok := i1334ConfigMapValue(t, "--set", "publicIdentity.enabled=true", "--set-string", "env.CACHE_ENABLED="+on); !ok || v != "true" {
+			t.Fatalf("publicIdentity on with env.CACHE_ENABLED=%q: PUBLIC_IDENTITY_ENABLED=%q (present=%v), want \"true\"", on, v, ok)
+		}
+	}
+	// Off, the cache setting is not the public identity's business.
+	if v, _ := i1334ConfigMapValue(t, "--set-string", "env.CACHE_ENABLED=false"); v != "false" {
+		t.Fatalf("publicIdentity off with the cache off must render; PUBLIC_IDENTITY_ENABLED=%q", v)
+	}
+}
+
 // The refresher allowlist still refuses system:unauthenticated (#631): the
 // public identity's grant does not loosen it.
 func TestIssue1334_ChartImpersonateGroupsStillRefusesUnauthenticated(t *testing.T) {

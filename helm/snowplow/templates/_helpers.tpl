@@ -66,10 +66,21 @@ Create the name of the service account to use
 The ONE reading of publicIdentity.enabled: the ConfigMap's PUBLIC_IDENTITY_ENABLED
 and the ClusterRole's impersonate grant both use it, so they cannot disagree.
 Only a boolean true opts in.
+
+The public identity requires the cache: snowplow probes the impersonation it
+needs only with the cache on, so with env.CACHE_ENABLED anything but what the
+binary reads as on ("true", "1", "yes") every token-less request would be 503.
+The render refuses that combination instead of shipping a silent 503 mode.
 */}}
 {{- define "snowplow.publicIdentityEnabled" -}}
 {{- $p := .Values.publicIdentity | default dict -}}
-{{- if eq (get $p "enabled" | toString) "true" -}}true{{- else -}}false{{- end -}}
+{{- if eq (get $p "enabled" | toString) "true" -}}
+{{- $env := .Values.env | default dict -}}
+{{- if not (has (get $env "CACHE_ENABLED" | toString) (list "true" "1" "yes")) -}}
+{{- fail "publicIdentity.enabled=true requires the cache: set env.CACHE_ENABLED to \"true\" (the public identity is served only by impersonation, which snowplow enables only with the cache on; #1334)" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{/*

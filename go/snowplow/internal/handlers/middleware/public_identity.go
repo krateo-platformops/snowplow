@@ -140,7 +140,7 @@ func (p *PublicIdentity) Context(ctx context.Context) (context.Context, error) {
 	if err != nil || saRC == nil {
 		return nil, errPublicIdentityUnavailable
 	}
-	imp := cache.PermittedImpersonatingRESTConfig(ctx, saRC, PublicUsername, PublicGroups())
+	imp := cache.ImpersonatingRESTConfigNoFallback(ctx, saRC, PublicUsername, PublicGroups())
 	if imp == nil || imp.Impersonate.UserName != PublicUsername ||
 		len(imp.Impersonate.Groups) != 1 || imp.Impersonate.Groups[0] != PublicGroup {
 		return nil, errPublicIdentityUnavailable

@@ -302,9 +302,16 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	rctx := xcontext.BuildContext(ctx, opts...)
 	// #574/#608 — the cohort's impersonating transport, when the apiserver
 	// will accept every principal on it (used below).
+	// An unauthenticated identity has no ServiceAccount fallback (below), so its
+	// refusal is counted as such, never as impersonation_fallback_sa.
+	authenticated := cache.Authenticated(refreshUser, refreshGroups)
 	var imp *rest.Config
 	if saRC != nil {
-		imp = cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups)
+		if authenticated {
+			imp = cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups)
+		} else {
+			imp = cache.ImpersonatingRESTConfigNoFallback(rctx, saRC, refreshUser, refreshGroups)
+		}
 	}
 	// #1334 — an identity the apiserver does not treat as authenticated (the
 	// public identity: system:unauthenticated) has no credential of its own:
@@ -314,7 +321,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// keeps): it is evicted, and the next request resolves it fresh on its own
 	// impersonated path. Decided by the apiserver's own group rule, never by a
 	// name.
-	if imp == nil && !cache.Authenticated(refreshUser, refreshGroups) {
+	if imp == nil && !authenticated {
 		prior, _ := c.GetNoTouch(key)
 		evicted := c.EvictUnrefreshable(key, prior)
 		noteUnauthenticatedRefreshRefused(evicted)

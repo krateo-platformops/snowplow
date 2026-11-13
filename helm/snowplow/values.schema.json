@@ -162,7 +162,7 @@
           "type": "boolean",
           "default": false,
           "title": "Enabled",
-          "description": "When true, snowplow serves token-less requests as the public identity, and the ClusterRole grants impersonate on users [krateo:public] and groups [system:unauthenticated], restricted by resourceNames. When false, neither is rendered. A request that carries any Authorization header, valid or not, is never served as the public identity."
+          "description": "When true, snowplow serves token-less requests as the public identity, and the ClusterRole grants impersonate on users [krateo:public] and groups [system:unauthenticated], restricted by resourceNames. When false, neither is rendered. A request that carries any Authorization header, valid or not, is never served as the public identity. Requires the cache: the chart refuses true unless env.CACHE_ENABLED is \"true\"."
         }
       }
     },

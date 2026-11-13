@@ -121,6 +121,15 @@ func TestIssue1334_Refresher_UnauthenticatedIdentityNeverRefreshedUnderTheServic
 			if UnauthenticatedRefreshRefused("evicted") != before+1 {
 				t.Fatal("the refusal was not counted")
 			}
+			// The split: an eviction is never counted as a ServiceAccount fallback.
+			st := cache.ImpersonationCapabilityStats()
+			if st["impersonation_fallback_sa"] != 0 {
+				t.Fatalf("impersonation_fallback_sa = %d for a cell that was evicted, not refreshed under the ServiceAccount",
+					st["impersonation_fallback_sa"])
+			}
+			if tc.rc != nil && st["impersonation_refused_no_fallback"] != 1 {
+				t.Fatalf("impersonation_refused_no_fallback = %d, want 1 (the refused public impersonation)", st["impersonation_refused_no_fallback"])
+			}
 		})
 	}
 
@@ -153,6 +162,9 @@ func TestIssue1334_Refresher_UnauthenticatedIdentityNeverRefreshedUnderTheServic
 		}
 		if res.calls != 1 || cache.ImpersonatedDialFromContext(res.ctx) {
 			t.Fatalf("an authenticated cohort refused impersonation must still refresh, un-impersonated and re-gated; calls=%d", res.calls)
+		}
+		if st := cache.ImpersonationCapabilityStats(); st["impersonation_fallback_sa"] != 1 || st["impersonation_refused_no_fallback"] != 0 {
+			t.Fatalf("an authenticated cohort's ServiceAccount fallback must count as impersonation_fallback_sa only; got %v", st)
 		}
 	})
 }

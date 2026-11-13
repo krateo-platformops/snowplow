@@ -335,6 +335,10 @@ func TestIssue1334_PublicIdentityUnavailableIs503NeverTheServiceAccount(t *testi
 			if middleware.PublicIdentityOutcome("unavailable") != before+1 {
 				t.Fatal("the refusal was not counted as unavailable")
 			}
+			// A 503 is not a ServiceAccount fallback: it never counts as one.
+			if st := cache.ImpersonationCapabilityStats(); st["impersonation_fallback_sa"] != 0 {
+				t.Fatalf("impersonation_fallback_sa = %d for a public request answered 503", st["impersonation_fallback_sa"])
+			}
 		})
 	}
 }
