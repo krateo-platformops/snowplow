@@ -825,6 +825,13 @@ def ensure_bucket(project: str, run: str, *, dry: bool) -> str:
             f"{EVIDENCE_LIFECYCLE['rule'][0]['condition']['age']} days")
 
 
+def cmd_fetch_evidence(a) -> int:
+    """#1390: a launch's evidence from the bucket, verified, and its statistics re-run from it offline (the
+    launcher's own statistics stage, bench.durable.rejudge): what a lost VM leaves is enough for its verdicts."""
+    dest = a.dest or str(evidence.data_root() / "runs" / "606" / f"durable-{a.launch}")
+    return durable.rejudge(durable.bucket_name(a.project), a.launch, dest, say=_say)
+
+
 def cmd_bucket(a) -> int:
     _say(ensure_bucket(a.project, "_bucket", dry=not a.yes))
     return 0
@@ -1944,6 +1951,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fetch", help="copy the run and evidence directories back, verified")
     common(p, yes=False)
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("fetch-evidence", help="#1390: download a launch's durable copy from the evidence bucket, "
+                                              "verified, and re-run its statistics from it (offline)")
+    p.add_argument("--launch", required=True, help="the launch id (PAIR_RUN_ID, the bucket's runs/<id>/)")
+    p.add_argument("--project", default=DEFAULT_PROJECT)
+    p.add_argument("--dest", default=None, help="default: <data root>/runs/606/durable-<launch>")
+    p.set_defaults(func=cmd_fetch_evidence)
 
     p = sub.add_parser("bucket", help="#1390: ensure the evidence bucket (create when absent) and verify every "
                                       "property it must have (up does it first)")

@@ -208,6 +208,48 @@ def download(bucket: str, launch: str, name: str, dest: str) -> tuple[bool, str]
     return True, f"durable copy downloaded and verified: {out} ({len(files)} files, sha256 each, from gs://{bucket}/{pfx}/)"
 
 
+#: the launch's own record beside its runs (run606_pair.sh uploads $PAIR_OUT/plan/pair.json before any run starts)
+PLAN = "plan"
+BENCH_DIR = Path(__file__).resolve().parent.parent
+
+
+def rejudge(bucket: str, launch: str, dest: str, *, say=print) -> int:
+    """#1390 item 2: a launch's statistics, offline, from its durable copy alone: its record (plan/pair.json) and
+    every run directory downloaded and verified into `dest`, then run606_stats.sh, the very statistics stage the
+    launcher runs, into dest/pair. Returns the statistics' exit (the verdicts ranked), 2 when the record itself
+    cannot be read. A run whose copy does not verify has no statistics (its pairs INVALID, saying so)."""
+    ok, msg = download(bucket, launch, PLAN, dest)
+    say(msg)
+    if not ok:
+        return 2
+    try:
+        pj = json.loads(Path(dest, PLAN, "pair.json").read_text())
+        runs, pairs = pj["runs"], pj["pairs"]
+    except (OSError, ValueError, KeyError) as e:
+        say(f"the launch's record pair.json is not readable ({type(e).__name__}): nothing to re-judge")
+        return 2
+    env = dict(os.environ, PAIR_OUT=str(Path(dest, "pair")), PAIR_RUN_ID=launch, STATS_LABELS=" ".join(runs),
+               PAIRS=" ".join(f"{p['baseline']}:{p['candidate']}" for p in pairs),
+               REPLICA_PAIR=(f"{pj['replica_pair']['first']}:{pj['replica_pair']['second']}"
+                             if pj.get("replica_pair") else ""))
+    if Path(dest, "pair").exists():
+        say(f"{Path(dest, 'pair')} already exists: a re-judge never writes over earlier verdicts")
+        return 2
+    for label, r in runs.items():
+        name = os.path.basename(str(r.get("out") or r["run_name"]).rstrip("/"))
+        ok, msg = download(bucket, launch, name, dest)
+        say(f"run {label}: {msg}")
+        src = str(Path(dest, name)) if ok else ""
+        try:
+            done = ok and "run complete: " in Path(dest, name, "run.log").read_text()
+        except OSError:
+            done = False
+        env.update({f"SRC_{label}": src, f"EXPECTED_IMAGE_DIGEST_{label}": str(r.get("digest") or ""),
+                    f"DONE_{label}": "1" if done else "0"})
+    import subprocess
+    return subprocess.run(["bash", str(BENCH_DIR / "run606_stats.sh")], env=env, cwd=str(BENCH_DIR)).returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.durable")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -220,10 +262,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("download")
     for f in ("--bucket", "--launch", "--name", "--dest"):
         p.add_argument(f, required=True)
+    p = sub.add_parser("rejudge", help="#1390: a launch's statistics, offline, from its durable copy")
+    p.add_argument("--bucket", default=None, help=f"default: the project's ({bucket_name('<project>')})")
+    p.add_argument("--project", default=gke.DEFAULT_PROJECT)
+    p.add_argument("--launch", required=True, help="the launch id (run606_pair.sh's PAIR_RUN_ID)")
+    p.add_argument("--dest", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "bucket":
         print(bucket_name(a.project))
         return 0
+    if a.cmd == "rejudge":
+        return rejudge(a.bucket or bucket_name(a.project), a.launch, a.dest)
     ok, msg = upload(a.bucket, a.launch, a.src) if a.cmd == "upload" else download(a.bucket, a.launch, a.name, a.dest)
     print(msg, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1

@@ -109,6 +109,9 @@ RUN606="$HERE/run606.sh"
 REPLICA="$HERE/customer_latency_replica_runs12_13.json"
 
 refuse() { echo "refusing: $*" >&2; exit 2; }
+# #1390: the statistics stage (and its helpers: is_replica, verdict_file, pair_cmd, replica_cmd, stat_step), one file
+# this launcher and an offline re-run from the durable copy (bench.durable rejudge) both run
+source "$HERE/run606_stats.sh"
 read -r -a LABELS <<< "${RUNS:-A B}"
 read -r -a PAIR_LIST <<< "${PAIRS:-A:B}"
 (( ${#LABELS[@]} >= 2 )) || refuse "RUNS names ${#LABELS[@]} run(s): a comparison needs two or more"
@@ -180,8 +183,6 @@ if [[ -n "$REPLICA_PAIR" ]]; then
   [[ "${!da}" == "${!db}" ]] \
     || refuse "REPLICA_PAIR $REPLICA_PAIR: an A/A replica runs ONE image on both arms; ${da} (${!da}) and ${db} (${!db}) differ"
 fi
-# is_replica <pair>: the pair is the launch's declared A/A replica
-is_replica() { [[ -n "$REPLICA_PAIR" && "$1" == "$REPLICA_PAIR" ]]; }
 for p in "${PAIR_LIST[@]}"; do
   is_replica "$p" && continue
   da="EXPECTED_IMAGE_DIGEST_${p%%:*}" db="EXPECTED_IMAGE_DIGEST_${p##*:}"
@@ -265,47 +266,6 @@ runenv() {
     RUNENV+=(FRONTEND_TAG="${!ft}" EXPECTED_FRONTEND_DIGEST="${!fd}")
   fi
 }
-# verdict_file <pair>: that pair's paired verdict
-verdict_file() { echo "$PAIR_OUT/paired-verdict-${1%%:*}-${1##*:}.json"; }
-# pair_cmd <pair>: PAIR_CMD = its custlat pair, the baseline as A, the candidate as B
-pair_cmd() {
-  local a="${1%%:*}" b="${1##*:}"
-  local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a" db="EXPECTED_IMAGE_DIGEST_$b"
-  PAIR_CMD=(python3 -m bench.custlat pair --a "${!oa}/verdict.json" --b "${!ob}/verdict.json"
-            --a-dir "${!oa}" --b-dir "${!ob}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}"
-            --a-label "$a" --b-label "$b" --launch "$PAIR_RUN_ID")
-}
-# replica_cmd: REPLICA_CMD = the declared A/A pair's in-run replica (custlat replica --in-run),
-# recording this launch's id: a pair says "measured in this launch" only on its own id
-replica_cmd() {
-  local a="${REPLICA_PAIR%%:*}" b="${REPLICA_PAIR##*:}"
-  local oa="OUT_$a" ob="OUT_$b" da="EXPECTED_IMAGE_DIGEST_$a"
-  REPLICA_CMD=(python3 -m bench.custlat replica "${!oa}" "${!ob}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}"
-               --launch "$PAIR_RUN_ID")
-}
-# stat_step <step> <out> <command> <dir 1> <dir 2> -- <cmd...>: #1390, one statistics step. Its start and end
-# lines in the pair log, with the input it reads; the command's own progress lines (custlat.progress, its
-# stderr) between them, each prefixed with the step; its stdout to <out>; its duration and input recorded in
-# $PAIR_OUT/statistics.jsonl (bench/statstime.py: what a later launch's TTL budget is measured from). Returns
-# the command's exit code.
-stat_step() {
-  local step="$1" out="$2" cmd="$3" d1="$4" d2="$5" t0 t1 rc bytes
-  shift 6
-  bytes="$(python3 -m bench.statstime input-bytes "$d1" "$d2" 2>/dev/null)" || bytes="unknown"
-  t0="$(date +%s)"
-  log "statistics: ${step} started (${bytes} bytes of k6 and browser streams)"
-  set +e
-  "$@" 2>&1 >"$out" | while IFS= read -r ln; do log "statistics: ${step}: ${ln}"; done
-  rc="${PIPESTATUS[0]}"
-  set -e
-  t1="$(date +%s)"
-  log "statistics: ${step} ended exit=${rc} after $(( t1 - t0 )) s"
-  python3 -m bench.statstime record --file "$PAIR_OUT/statistics.jsonl" --step "$step" --command "$cmd" \
-      --started "$t0" --ended "$t1" --exit "$rc" "$d1" "$d2" >/dev/null \
-    || log "statistics: ${step}: its duration could not be recorded in $PAIR_OUT/statistics.jsonl"
-  return "$rc"
-}
-
 runs_line=""
 for x in "${LABELS[@]}"; do
   nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x"
@@ -357,6 +317,8 @@ if ! hl_msg="$(python3 -m bench.hostload check --out "$PAIR_OUT/host-load.jsonl"
 fi
 log "host load: ${hl_msg}"
 if [[ "$DRY" == "1" ]]; then
+  # the statistics would read each run's verified durable copy, downloaded to $PAIR_OUT.durable/<its run dir>
+  for x in "${LABELS[@]}"; do out="OUT_$x"; printf -v "SRC_$x" '%s' "${PAIR_OUT}.durable/${!out##*/}"; done
   log "DRY: all ${#LABELS[@]} runs would start now; then, per pair:"
   if [[ -n "$REPLICA_PAIR" ]]; then
     replica_cmd; log "DRY:   ${REPLICA_CMD[*]} --completed <0|1> <0|1> > $REPLICA_FILE (the A/A replica, first)"
@@ -481,75 +443,26 @@ while ! all_exited; do
   all_exited || sleep "${PAIR_POLL_S:-5}"
 done
 trap - INT TERM HUP
-# one paired verdict per pair; the launch's exit ranks them (header): FAIL, INVALID, INCONCLUSIVE, PASS
-rank() { case "$1" in 1) echo 4 ;; 4) echo 2 ;; 0) echo 1 ;; *) echo 3 ;; esac; }
-vrc=0
-required=()
-# the A/A replica first: every other pair is judged against it (REPLICA_PAIR)
-if [[ -n "$REPLICA_PAIR" ]]; then
-  ra="${REPLICA_PAIR%%:*}" rb="${REPLICA_PAIR##*:}"
-  replica_cmd
-  da="DONE_$ra" db="DONE_$rb"
-  oa="OUT_$ra" ob="OUT_$rb"
-  if stat_step "replica ${REPLICA_PAIR}" "$REPLICA_FILE" replica "${!oa}" "${!ob}" -- \
-       "${REPLICA_CMD[@]}" --completed "${!da}" "${!db}"; then
-    required+=(--require "${REPLICA_FILE##*/}")
+# #1390 item 2: the statistics read a fresh, verified download of each run's durable copy, never the run's
+# directory on this machine: $PAIR_OUT.durable/<run dir> (run606_stats.sh's SRC_<L>). A run with no verified copy
+# has no statistics: each pair of it is INVALID, saying so.
+STATS_DIR="${PAIR_OUT}.durable"
+for x in "${LABELS[@]}"; do
+  out="OUT_$x" dur="DURABLE_$x"
+  printf -v "SRC_$x" '%s' ""
+  [[ "${!dur:-0}" == "1" ]] || continue
+  if msg="$(python3 -m bench.durable download --bucket "$EVIDENCE_BUCKET" --launch "$PAIR_RUN_ID" \
+              --name "${!out##*/}" --dest "$STATS_DIR" 2>&1)"; then
+    printf -v "SRC_$x" '%s' "$STATS_DIR/${!out##*/}"
+    log "run $x: ${msg}"
   else
-    # a crash of the replica's own tool: the file is removed, and each pair's `custlat pair
-    # --replica` then cannot read it, so every other pair is INVALID with that reason
-    log "the A/A replica ${REPLICA_PAIR} could not be computed (exit $?): every other pair will be INVALID"
-    rm -f "$REPLICA_FILE"
+    DURABLE_FAILED=1
+    log "EVIDENCE NOT DURABLE (run $x): its durable copy could not be downloaded and verified: ${msg}"
   fi
-  while IFS= read -r r; do
-    [[ -n "$r" ]] && log "replica ${REPLICA_PAIR}: $r"
-  done < <(python3 -c 'import json, sys
-from bench import custlat
-try:
-    ir = json.load(open(sys.argv[1])).get("in_run") or {}
-except (OSError, ValueError):
-    ir = {}
-out = [ir.get("line") or "", *("NOT MEASURED: " + w for w in ir.get("why") or []),
-       *("NOTE: " + n for n in ir.get("notes") or [])]
-for lab, d in ((sys.argv[2], sys.argv[3]), (sys.argv[4], sys.argv[5])):
-    try:
-        rv = json.load(open(d + "/verdict.json"))
-    except (OSError, ValueError):
-        rv = None
-    for sec, missing in custlat.INFO_SECTIONS:
-        out += custlat.arm_info_lines(rv, sec, missing, lab + " (replica arm)")[1]
-print("\n".join(out))' "$REPLICA_FILE" "$ra" "${!oa}" "$rb" "${!ob}" 2>/dev/null || true)
-fi
-for p in "${PAIR_LIST[@]}"; do
-  is_replica "$p" && continue
-  a="${p%%:*}" b="${p##*:}" f="$(verdict_file "$p")"
-  pair_cmd "$p"
-  da="DONE_$a" db="DONE_$b"
-  oa="OUT_$a" ob="OUT_$b"
-  prc=0
-  stat_step "pair ${a}:${b}" "$f" pair "${!oa}" "${!ob}" -- \
-      "${PAIR_CMD[@]}" --completed-a "${!da}" --completed-b "${!db}" || prc=$?
-  required+=(--require "${f##*/}")
-  log "paired verdict ${a} vs ${b} exit=${prc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $f"
-  while IFS= read -r r; do
-    [[ -n "$r" ]] && log "${a} vs ${b}: $r"
-  done < <(python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))
-ex = (v.get("exclusion") or {}).get("items") or []
-print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
-                + ["INVALID: " + r for r in v["invalid_reasons"]]
-                + [((v.get("replica_source") or {}).get("line") or "INFO replica: not said (a verdict before run 24)")]
-                + ([v["frontend"]["line"]] if v.get("frontend") else [])
-                + ["NOTE: " + n for n in v.get("notes") or []]
-                + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),
-                   sum(b - a for a, b in i["b"]), i["why"]) for i in ex]
-                + [c["line"] for c in v["cells"]] + (v.get("a_healthy_lines") or [])
-                + [r["line"] for r in v.get("b_inside_a_outage") or []]
-                + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
-                + [ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
-                                "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only")
-                   for ln in (v.get(k) or {}).get("lines") or []]))' \
-             "$f" 2>/dev/null || true)
-  (( $(rank "$prc") <= $(rank "$vrc") )) || vrc=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
 done
+stats_main
+vrc="$STATS_VRC"
+required=("${STATS_REQUIRED[@]}")
 # #1194: the launch is finished when its evidence is safe, whatever the verdicts
 safe=1
 if msg="$(publish_pair final "${required[@]}" 2>&1)"; then
