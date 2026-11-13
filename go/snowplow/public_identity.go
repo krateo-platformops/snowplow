@@ -19,7 +19,6 @@ func newPublicIdentity(on bool) *middleware.PublicIdentity {
 	if !on {
 		return nil
 	}
-	// log-ctx-waiver: boot: main wires the routes once at start
 	slog.Info("public identity enabled: a request with no Authorization header is served as the public identity, by impersonation",
 		slog.String("identity_class", middleware.PublicIdentityClass),
 		slog.String("needs", "the impersonate grant the chart value publicIdentity.enabled renders"))

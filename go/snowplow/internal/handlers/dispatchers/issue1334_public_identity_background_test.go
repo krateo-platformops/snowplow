@@ -174,7 +174,19 @@ func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
 	cache.ObserveLiveIdentity(i1334Public, unauth, exp)
 	cache.ObserveLiveIdentity(i1334Visitor, unauth, exp)
 	cache.ObserveLiveIdentity(i1334Alice, nil, exp)
+	// CONTROL class: the same user with no group — authenticated, and
+	// authorised for the GVR by the very RoleBinding that authorises the public
+	// identity (it names the USER). It must be emitted as a learned target, so
+	// the public class's absence is the filter's verdict, not the authorisation
+	// check's.
+	cache.ObserveLiveIdentity(i1334Public, nil, exp)
 	gvr := schema.GroupVersionResource{Group: h1RAGVR.Group, Version: h1RAGVR.Version, Resource: h1RAGVR.Resource}
+	cache.ResetBindingsByGVRIndexForTest()
+	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{gvr})
+	if !cache.IdentityAuthorisedForGVR(gvr, i1334Public, unauth) {
+		t.Fatal("precondition: the public identity is authorised for the GVR (its RoleBinding names the user); else the learned filter is never consulted")
+	}
 	prev := enumerateBasePrewarmTargetsFn
 	enumerateBasePrewarmTargetsFn = func(g schema.GroupVersionResource, verb string) []cache.PrewarmTarget {
 		return []cache.PrewarmTarget{
@@ -186,16 +198,19 @@ func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
 	t.Cleanup(func() { enumerateBasePrewarmTargetsFn = prev })
 
 	targets := enumeratePrewarmTargetsWithLearned(gvr, "get")
-	authenticated := 0
+	controlLearned := false
 	for _, tg := range targets {
 		if !cache.Authenticated(tg.Subject.Username, tg.Subject.Groups) {
 			t.Errorf("MUST NEVER: an unauthenticated seed target %q %v (learned=%v): seeds resolve under the ServiceAccount",
 				tg.Subject.Username, tg.Subject.Groups, tg.Learned)
 		}
-		authenticated++
+		if tg.Learned && tg.Subject.Username == i1334Public && len(tg.Subject.Groups) == 0 {
+			controlLearned = true
+		}
 	}
-	if authenticated == 0 {
-		t.Fatal("instrument: the control (alice) produced no seed target, so the filter's verdict is unobserved")
+	if !controlLearned {
+		t.Fatalf("instrument: the authenticated control class (%s, no groups) was not emitted as a learned target, so the "+
+			"public class's absence is not the filter's verdict; targets=%+v", i1334Public, targets)
 	}
 }
 
