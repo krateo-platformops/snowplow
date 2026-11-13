@@ -8,12 +8,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +30,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -149,10 +150,26 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	uri, err := buildURIPath(opts)
+	uri, dialled, asked, err := dialledTarget(opts)
 	if err != nil {
-		response.InternalError(wri, err)
+		// #1257 — a value that is not one path segment is the caller's
+		// error: refused before anything is dialled, as validateRequest's
+		// refusals are.
+		response.BadRequest(wri, err)
 		return
+	}
+	if callAudited(opts.verb) && !asked {
+		// F3 (#1379 review) — the apiserver would act on another object than
+		// the one the request names, so its record could not describe both:
+		// refused before the dial.
+		response.BadRequest(wri, errDialNotAsked)
+		return
+	}
+	if callAudited(opts.verb) {
+		// The handler's one descriptor of what this request asks for: the
+		// route's record of any later exit is built from it (#1379 review
+		// LOW a), never by parsing the request again.
+		audit.SetAsked(req.Context(), callAuditEvent(req, opts, uri, dialled, "", nil))
 	}
 
 	log := xcontext.Logger(req.Context())
@@ -248,7 +265,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// mutations. The request log and trace id once named as their cover do not
 	// cover them (measured on 057: no outcome/resource/session in the gateway
 	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
-	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+	if callAudited(opts.verb) {
 		// #1298 — a failed /call is recorded from what was observed at the
 		// dial (credhttp.Answer.Outcome, the stage records' closed set), never
 		// from rt: rt.Message is the apiserver's Status.message, which names
@@ -263,24 +280,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if rt.Status == response.StatusFailure {
 			outcome, code, msg = answered.Outcome()
 		}
-		// A dry run (#443, /call/dry-run: the apiserver is always sent
-		// dryRun=All, and a plain /call refuses an inbound dryRun) is recorded
-		// as krateo.action=call.dryRun, krateo.audit.dry_run=true and with no
-		// written object (#957). The verb is the apiserver's for the URI that
-		// was dialled (#1291).
-		ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri),
-			auditTarget{gvr: opts.gvr, subresource: opts.subresource, nsn: opts.nsn}, outcome, code)
-		ev.DryRun = opts.dryRun
-		ev.Message = msg
-		// #1333 — the client's provenance (X-Krateo-Provenance), validated
-		// against its closed schema: the asserted krateo.audit.client.* keys,
-		// or krateo.audit.client.rejected alone. It is the client's word and
-		// sets nothing else on the record; the write above ran either way.
-		ev.Client = audit.ProvenanceOf(req.Header)
+		ev := callAuditEvent(req, opts, uri, dialled, outcome, answer)
+		ev.StatusCode, ev.Message = code, msg
 		// #957 — the written object's uid/generation/resourceVersion, from the
 		// apiserver's answer (none on a failure or a dry run).
 		audit.RecordWrittenObject(&ev, answer)
-		audit.Emit(req.Context(), ev)
+		audit.EmitRoute(req.Context(), ev)
 	}
 
 	if rt.Status == response.StatusFailure {
@@ -309,6 +314,23 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
+	if opts, err = r.parseRequest(req); err != nil {
+		return
+	}
+	// #186 — a read-only handler NEVER reads the body into opts.dat, so
+	// callOpts.Payload can never be set (ServeHTTP gates Payload on
+	// opts.dat != nil AND a write verb). On POST /call/read the body has
+	// already been consumed by the BodyExtrasDecode middleware anyway.
+	if req.Body != nil && !r.readOnly {
+		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
+	}
+	return
+}
+
+// parseRequest is validateRequest without the body: the request's method,
+// path and query, checked. The route's audit descriptor (asked) reads it for
+// an exit before the handler ran, so no body is ever read twice.
+func (r *callHandler) parseRequest(req *http.Request) (opts callOptions, err error) {
 	// #443 part 2 — an inline object is resolved only by the RESTAction
 	// handler. BodyExtrasDecode already refuses one for any other GVR; this is
 	// the backstop for one that still reaches the passthrough (e.g. with
@@ -434,17 +456,6 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 
 	if val := req.URL.Query().Get("page"); val != "" {
 		opts.page, err = strconv.Atoi(val)
-		if err != nil {
-			return
-		}
-	}
-
-	// #186 — a read-only handler NEVER reads the body into opts.dat, so
-	// callOpts.Payload can never be set (ServeHTTP gates Payload on
-	// opts.dat != nil AND a write verb). On POST /call/read the body has
-	// already been consumed by the BodyExtrasDecode middleware anyway.
-	if req.Body != nil && !r.readOnly {
-		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
 		if err != nil {
 			return
 		}
@@ -653,37 +664,70 @@ type callOptions struct {
 	raw bool
 }
 
+// buildURIPath is the apiserver path and query /call dials for opts. It is the
+// one place that path is built: /call, /call/dry-run and /call/read dial it,
+// and an export's record reads its verb from it (auditTarget.dialledVerb).
+//
+// #1257 — every value that becomes a path segment (the API group and version,
+// the resource, the namespace, the name and the subresource) is exactly one
+// segment of the path, or the request is refused (errBadPathSegment, a 400)
+// before anything is dialled. A value is a segment only when the apiserver
+// accepts it as one (content.IsPathSegmentName: never "." or "..", never a "/"
+// or a "%", which the apiserver decodes back into a "/"), and it is sent
+// escaped (url.PathEscape), so a "?" or a "#" in a name stays in the name
+// instead of starting a query or a fragment. So the object the apiserver
+// resolves from the dialled path is, by construction, the object opts names,
+// which is the object the audit record names. Before, path.Join turned
+// name=cm-x/status into the status subresource of cm-x, and name=../secrets/s1
+// into another resource, while the record named the query's values.
+//
+// An empty group is the core group (/api), and an empty name a collection, as
+// before; an empty version, resource, or namespace on a namespaced path is
+// refused (path.Join used to drop it, which dials a different path).
 func buildURIPath(opts callOptions) (string, error) {
-	base := path.Join("/apis", opts.gvr.Group, opts.gvr.Version)
+	var parts []string
+	add := func(param, v string) error {
+		if v == "" {
+			return &errBadPathSegment{param: param, reason: "may not be empty"}
+		}
+		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
+			return &errBadPathSegment{param: param, reason: strings.Join(errs, ", ")}
+		}
+		parts = append(parts, url.PathEscape(v))
+		return nil
+	}
+
 	if len(opts.gvr.Group) == 0 {
-		base = path.Join("/api", opts.gvr.Version)
+		parts = append(parts, "api")
+	} else {
+		parts = append(parts, "apis")
+		if err := add("apiVersion", opts.gvr.Group); err != nil {
+			return "", err
+		}
+	}
+	if err := add("apiVersion", opts.gvr.Version); err != nil {
+		return "", err
 	}
 
 	// Issue #156 — the ONLY scope-dependent difference is the
-	// namespaces/<ns> segment. namespaced==true reproduces today's path
-	// byte-for-byte; namespaced==false (a POSITIVE cluster scope resolved
-	// upstream) omits the segment → base/resource. The name-append block
-	// below is scope-independent and unchanged.
-	var uriPath string
-	if opts.namespaced {
-		uriPath = path.Join(base, "namespaces", opts.nsn.Namespace, opts.gvr.Resource)
-	} else {
-		uriPath = path.Join(base, opts.gvr.Resource)
+	// namespaces/<ns> segment: namespaced==true emits it, namespaced==false (a
+	// POSITIVE cluster scope resolved upstream) omits it → base/resource.
+	// namespaces is itself cluster-scoped, so it never takes the segment
+	// (kept explicit for backward compatibility).
+	if opts.namespaced && !strings.EqualFold("namespaces", opts.gvr.Resource) {
+		parts = append(parts, "namespaces")
+		if err := add("namespace", opts.nsn.Namespace); err != nil {
+			return "", err
+		}
 	}
-	if strings.EqualFold("namespaces", opts.gvr.Resource) {
-		// namespaces is itself cluster-scoped; either branch above yields
-		// base/resource for it, but keep this explicit special case for
-		// zero churn / backward-compat (harmless with the new branch).
-		uriPath = path.Join(base, opts.gvr.Resource)
+	if err := add("resource", opts.gvr.Resource); err != nil {
+		return "", err
 	}
 
-	if has([]string{
-		http.MethodDelete,
-		http.MethodGet,
-		http.MethodPut,
-		http.MethodPatch,
-	}, opts.verb) {
-		uriPath = path.Join(uriPath, opts.nsn.Name)
+	if opts.nsn.Name != "" && nameInPath(opts.verb) {
+		if err := add("name", opts.nsn.Name); err != nil {
+			return "", err
+		}
 	}
 
 	// #282 — append the subresource segment (.../{name}/<subresource>, e.g.
@@ -691,8 +735,11 @@ func buildURIPath(opts callOptions) (string, error) {
 	// verb, so the name was just appended above; hang the subresource off it.
 	// Empty subresource → byte-identical to the pre-#282 whole-object path.
 	if opts.subresource != "" {
-		uriPath = path.Join(uriPath, opts.subresource)
+		if err := add("subresource", opts.subresource); err != nil {
+			return "", err
+		}
 	}
+	uriPath := "/" + strings.Join(parts, "/")
 
 	// Aggiunta dei query parametri, se necessario
 	query := url.Values{}
@@ -716,6 +763,87 @@ func buildURIPath(opts callOptions) (string, error) {
 	}
 
 	return uriPath, nil
+}
+
+// errDialNotAsked is the refusal of a /call write whose dial the apiserver
+// would resolve to another object than the one the request names.
+var errDialNotAsked = errors.New("the request names an object the apiserver would not act on: the path it builds resolves to another one")
+
+// callAudited reports whether a /call request with verb is audited: every
+// write. Reads are not (AUDIT-4 covers mutations).
+func callAudited(verb string) bool {
+	return has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, verb)
+}
+
+// callAuditEvent is a /call write's record before what the authority answered
+// is added: the one builder of it, for the handler and for the route's audit
+// descriptor (CallRoute).
+//
+//   - A dry run (#443, /call/dry-run: the apiserver is always sent
+//     dryRun=All, and a plain /call refuses an inbound dryRun) is recorded as
+//     krateo.action=call.dryRun, krateo.audit.dry_run=true and with no written
+//     object (#957). The verb is the apiserver's for the URI that is dialled
+//     (#1291), and the method the one sent, which is that verb's.
+//   - F3 (#1379 review) — the target is the apiserver's classification of the
+//     dial (dialledTarget), so it describes the dial by construction; #1378 —
+//     a create's name is the object the apiserver wrote (dialledObjectName).
+//   - #1333 — the client's provenance (X-Krateo-Provenance), validated
+//     against its closed schema: the asserted krateo.audit.client.* keys, or
+//     krateo.audit.client.rejected alone. It is the client's word and sets
+//     nothing else on the record.
+func callAuditEvent(req *http.Request, opts callOptions, uri string, dialled auditTarget, outcome string, answer []byte) audit.Event {
+	target := dialled
+	target.nsn.Name = dialledObjectName(opts, dialled, outcome, answer)
+	ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, 0)
+	ev.DryRun = opts.dryRun
+	ev.Client = audit.ProvenanceOf(req.Header)
+	return ev
+}
+
+// CallRoute is the audit descriptor of the write /call routes (POST, PUT,
+// PATCH, DELETE /call); CallDryRunRoute of /call/dry-run. Each asks the
+// route's own handler what a request asked for.
+func CallRoute() audit.Route { return audit.Route{Asked: Call().(*callHandler).asked} }
+
+// CallDryRunRoute is the audit descriptor of /call/dry-run (see CallRoute).
+func CallDryRunRoute() audit.Route { return audit.Route{Asked: CallDryRun().(*callHandler).asked} }
+
+// asked is the record of what req asks the handler to write, from its
+// method, path and query alone (parseRequest: the body is never read here),
+// by the rules its dial is built with: the object the apiserver would act on,
+// when the query names one the handler would dial; otherwise the action and
+// the method alone (the method is the one /call sends, the verb that
+// method's lowercase, the apiserver's non-resource rule), and the shared
+// writer marks the target. It describes an exit before the handler parsed
+// the request; after that the handler's own descriptor (audit.SetAsked) is
+// used.
+func (r *callHandler) asked(req *http.Request) audit.Event {
+	unresolved := audit.Event{Action: "call", HTTPMethod: req.Method, Verb: audit.MethodVerb(req.Method), DryRun: r.dryRun}
+	opts, err := r.parseRequest(req)
+	if err != nil {
+		return unresolved
+	}
+	uri, dialled, asked, err := dialledTarget(opts)
+	if err != nil || !asked {
+		return unresolved
+	}
+	return callAuditEvent(req, opts, uri, dialled, "", nil)
+}
+
+// nameInPath reports whether buildURIPath puts the object's name in the path
+// for verb: a by-name verb does; a POST is a create, sent to the collection,
+// and the apiserver takes the new object's name from the body (#1378).
+func nameInPath(verb string) bool {
+	return has([]string{http.MethodDelete, http.MethodGet, http.MethodPut, http.MethodPatch}, verb)
+}
+
+// errBadPathSegment is buildURIPath's refusal of a query value that is not one
+// apiserver path segment (#1257). It names the parameter and the rule, never
+// the value.
+type errBadPathSegment struct{ param, reason string }
+
+func (e *errBadPathSegment) Error() string {
+	return fmt.Sprintf("invalid %q query parameter: %s", e.param, e.reason)
 }
 
 func has(s []string, e string) bool {
