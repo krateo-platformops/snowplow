@@ -533,8 +533,16 @@ def test_up_passes_the_node_sa_check_when_all_is_exactly_as_node_sa_makes_it(fak
     assert rc == 0, err
 
 
+def test_a_binding_held_twice_is_counted_twice():
+    """node_sa_held is a count, never a set: whatever a policy answer holds twice is one more than node-sa makes."""
+    held = vm606.node_sa_held({"bindings": [_DEFAULT_NODE, _REAPER_BOUND, dict(_DEFAULT_NODE)]}, PROJECT)
+    assert held.total() == 3
+    assert list((held - vm606.node_sa_want(PROJECT)).elements()) == [
+        ("roles/container.defaultNodeServiceAccount", None, None, None)]
+
+
 @pytest.mark.parametrize("extra, says", [
-    (_REAPER_OTHER_DESC, f"after node-sa, the node SA holds {REAPER} under snowplow-bench-clusters-only: "),
+    (_REAPER_OTHER_DESC,f"after node-sa, the node SA holds {REAPER} under snowplow-bench-clusters-only: "),
     ({"role": "roles/editor", "members": [f"serviceAccount:{NODE_SA}"]},
      "after node-sa, the node SA holds roles/editor unconditionally, which node-sa does not grant"),
 ])
