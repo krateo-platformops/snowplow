@@ -736,12 +736,19 @@ def bootstrap_done(state: Path, name: str, doc: dict) -> None:
 
 
 def policy(state: Path, key: str) -> dict:
-    """key: project-<id> or sa-<email>."""
+    """key: project-<id>, sa-<email> or bucket-<name> (bucket-gs://<name> too: grant_policies' form)."""
+    key = key.replace("bucket-gs://", "bucket-")
     p = state / "policies" / f"{key}.json"
     return json.loads(p.read_text()) if p.exists() else {"bindings": []}
 
 
 def put_policy(state: Path, key: str, bindings: list) -> None:
+    key = key.replace("bucket-gs://", "bucket-")
+    if key.startswith("bucket-"):                      # a bucket policy lives on a bucket that exists
+        (state / "buckets").mkdir(parents=True, exist_ok=True)
+        bp = state / "buckets" / f"{key[len('bucket-'):]}.json"
+        if not bp.exists():
+            bp.write_text(json.dumps({"kind": "storage#bucket", "name": key[len("bucket-"):]}))
     (state / "policies").mkdir(parents=True, exist_ok=True)
     (state / "policies" / f"{key}.json").write_text(json.dumps({"version": 3, "etag": "BwX=", "bindings": bindings}))
 

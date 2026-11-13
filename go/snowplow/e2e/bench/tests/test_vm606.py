@@ -282,7 +282,8 @@ def test_up_reads_the_grants_back_and_creates_nothing_when_one_is_not_held(fake,
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 2 and "roles/compute.storageAdmin on operations-dev-krateo-io is not held under the condition" in err
     assert f"down --run {RUN} --yes" in err
-    assert not [v for v in _verbs(fake) if v.endswith(" create")]
+    # nothing of the run: the evidence bucket (#1390) is the project's, ensured before any grant can name it
+    assert not [v for v in _verbs(fake) if v.endswith(" create") and v != "storage buckets create"]
 
 
 def test_up_refuses_a_vm_whose_tools_are_not_the_laptops(fake, capsys, monkeypatch):
@@ -622,7 +623,8 @@ def test_launch_refuses_a_vm_that_dies_before_the_run_ends(fake, capsys, tmp_pat
     r = _vm_ready(fake, hours=13.5)                         # 13 h run + 1 h margin does not fit
     pin, pin_sha = _pin(tmp_path)
     rc, _out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
-    assert rc == 2 and "the run's TTL is 13 h" in err and "--ttl-hours >= 14" in err
+    # #1390: the run's 13 h + its measured statistics budget + the margin: 14.05 h
+    assert rc == 2 and "the run's TTL is 13 h, its statistics budget" in err and "--ttl-hours >= 15" in err
     assert not (r / "launch.pid").exists()
 
 
@@ -883,7 +885,7 @@ def test_down_removes_a_binding_with_its_title_but_not_its_form_and_reports_it(f
     assert rc == 0, err
     assert ("WARNING: drifted since up, removed all the same: binding roles/owner on operations-dev-krateo-io under "
             f"snowplow-bench-{RUN}: expression \"true\", not the expiry form vm606 writes") in out
-    assert "8 conditional grant(s)" in out and "1 field(s) had drifted since up" in out
+    assert "10 conditional grant(s)" in out and "1 field(s) had drifted since up" in out
     assert not [b for b in fake_vm606.policy(fake, f"project-{PROJECT}")["bindings"]
                 if (b.get("condition") or {}).get("title") == f"snowplow-bench-{RUN}"]
     assert any("roles/owner" in d for d in _state()["down_drift"])
@@ -1329,11 +1331,12 @@ def test_a_notfound_is_about_the_resource_only_when_it_names_its_own_path():
 def test_grant_policies_are_every_policy_up_writes(fake, capsys, monkeypatch):
     """L11: the run-in-use, unconditional-binding and revoke reads go over grant_policies: exactly the
     policies up's grants are written to."""
-    assert vm606.grant_policies(PROJECT, NUMBER) == [("project", PROJECT), ("sa", NODE_SA)]
+    assert vm606.grant_policies(PROJECT, NUMBER) == [("bucket", BUCKET), ("project", PROJECT), ("sa", NODE_SA)]
     rc, _out, err = _up(capsys, monkeypatch)
     assert rc == 0, err
-    written = {("project" if c["argv"][0] == "projects" else "sa", c["argv"][2 if c["argv"][0] == "projects" else 3])
-               for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:3])}
+    kind = {"projects": ("project", 2), "storage": ("bucket", 3), "iam": ("sa", 3)}
+    written = {(kind[c["argv"][0]][0], c["argv"][kind[c["argv"][0]][1]])
+               for c in fake_vm606.calls(fake) if "add-iam-policy-binding" in " ".join(c["argv"][:4])}
     assert written == set(vm606.grant_policies(PROJECT, NUMBER))
 
 

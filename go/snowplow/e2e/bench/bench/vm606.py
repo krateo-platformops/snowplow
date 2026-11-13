@@ -1214,8 +1214,6 @@ def cmd_up(a) -> int:
     a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
     number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
     _project_ready(a.project)
-    # #1390: the evidence bucket every arm is copied to, ensured and read back before any grant names it
-    _say(ensure_bucket(a.project, run, dry=not a.yes))
     # #1383 gap 6: first the SSH rules of earlier runs whose recorded expiry has passed (a run that ended at its
     # TTL, never `down`), each verified gone; one that cannot be removed refuses this up
     reap_expired_rules(a.project, dry=not a.yes)
@@ -1241,6 +1239,9 @@ def cmd_up(a) -> int:
         _save_state(run, made=as_made(run, a.project, a.zone, a.ttl_hours, terminates_at))
         _save_state(run, vm=name, project=a.project, zone=a.zone, ttl_hours=a.ttl_hours, terminates_at=terminates_at,
                     node_sa=node_sa(number), project_number=number, created_at=time.time())
+    # 0. #1390: the evidence bucket every arm is copied to, created when absent and read back, every property
+    # verified, after every refusal above (nothing is created for a refused up) and before any grant names it
+    _say(ensure_bucket(a.project, run, dry=not a.yes))
     # 1. the grants, expiring with the VM, before the VM exists
     grant(run, a.project, number, roles, terminates_at, dry=not a.yes)
     # 2. SSH through IAP only, before the VM exists
