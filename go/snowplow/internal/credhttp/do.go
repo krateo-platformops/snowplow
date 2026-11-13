@@ -47,11 +47,13 @@ import (
 	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"k8s.io/client-go/rest"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -60,6 +62,40 @@ const maxUnstructuredResponseTextBytes = 2048
 
 // Do is request.Do with a client that never follows a redirect (see do.go).
 func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
+	return do(ctx, opts, func() (*http.Client, error) {
+		// #1112 D4 — plumbing never installs its wire dump (it logs the
+		// Authorization header and the bodies); a Debug endpoint gets WireDump,
+		// which logs metadata only (wiredump.go).
+		cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
+		if err != nil {
+			return nil, err
+		}
+		if opts.Endpoint != nil && opts.Endpoint.Debug {
+			cli.Transport = WireDump(cli.Transport)
+		}
+		return cli, nil
+	})
+}
+
+// DoAs is Do sent with rc's credential instead of opts.Endpoint's (#1334):
+// the request goes to rc.Host, through the client rest.HTTPClientFor builds
+// for rc (its TLS, its credential and its Impersonate-* headers), with Do's
+// redirect refusal, send policy and envelopes. opts.Endpoint is replaced by an
+// endpoint naming only rc.Host, so nothing of the endpoint it carried is sent.
+//
+// It exists for a caller whose only credential is an impersonating config (the
+// public identity): there is no clientconfig endpoint to give Do.
+func DoAs(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *response.Status {
+	if rc == nil || rc.Host == "" {
+		return response.New(http.StatusInternalServerError, fmt.Errorf("unable to create HTTP Client: no rest config"))
+	}
+	opts.Endpoint = &endpoints.Endpoint{ServerURL: rc.Host}
+	return do(ctx, opts, func() (*http.Client, error) {
+		return rest.HTTPClientFor(rc)
+	})
+}
+
+func do(ctx context.Context, opts request.RequestOptions, client func() (*http.Client, error)) *response.Status {
 	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
 		return response.New(http.StatusInternalServerError, err)
@@ -99,16 +135,10 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		call.Header.Set(el[:idx], strings.TrimSpace(el[idx+1:]))
 	}
 
-	// #1112 D4 — plumbing never installs its wire dump (it logs the
-	// Authorization header and the bodies); a Debug endpoint gets WireDump,
-	// which logs metadata only (wiredump.go).
-	cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
+	cli, err := client()
 	if err != nil {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
-	}
-	if opts.Endpoint != nil && opts.Endpoint.Debug {
-		cli.Transport = WireDump(cli.Transport)
 	}
 
 	// #1088 — the endpoint send policy (send.go): a write is sent once, never

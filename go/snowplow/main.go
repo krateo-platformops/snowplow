@@ -382,6 +382,10 @@ func main() {
 	// and needs the seed bearer. PORT-anchored to the listen port.
 	urlSelf := flag.String("url-self", env.String("URL_SELF", "http://snowplow.krateo-system.svc.cluster.local:8081"),
 		"snowplow's own service URL — the self-loopback host for the #57 bearer-append arm (exact scheme+host+port match)")
+	// #1334 — opt-in per install, off by default. The chart sets it from the
+	// same value (publicIdentity.enabled) that ships the impersonate grant.
+	publicIdentityOn := flag.Bool("public-identity", env.Bool(envPublicIdentityEnabled, false),
+		"serve requests that carry no Authorization header as the public identity (user krateo:public, group system:unauthenticated), by impersonation")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -1360,6 +1364,13 @@ func main() {
 	// pattern outside registerDebugRoutes (see debug_routes.go).
 	routes := newRouteTable(mux)
 
+	// #1334 — the caller's identity on every route whose work is authorized by
+	// that identity: UserConfig, plus the public identity for a request with no
+	// Authorization header when the install opted in (nil otherwise: 401 as
+	// before). /rbac keeps the plain UserConfig: its enumeration runs under
+	// snowplow's own ServiceAccount, never under the caller's credential.
+	callerIdentity := middleware.UserConfigOrPublic(jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn))
+
 	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
@@ -1376,7 +1387,7 @@ func main() {
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 
 	routes.Handle("GET /list", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
+		callerIdentity,
 		cache.FallthroughScopeMiddleware(cache.ScopeList)).
 		Then(handlers.List()))
 	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
@@ -1387,7 +1398,7 @@ func main() {
 	// is the F-1 site). The restactions / widgets dispatcher entries
 	// inherit the scope via the same ctx.
 	routes.Handle("GET /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
+		callerIdentity,
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
@@ -1409,7 +1420,7 @@ func main() {
 	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
 	// fails if either half is missing).
 	routes.Handle("POST /call/read", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
+		callerIdentity,
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		middleware.BodyExtrasDecode,
 		handlers.ReadDispatcher(dispatchers.All())).
@@ -1431,7 +1442,7 @@ func main() {
 	// ?extras=); it mirrors POST /call/read exactly. Both export routes are
 	// mounted by mountExportRoutes (so the route table is testable) and are
 	// required scoped routes (requiredScopedRoutes).
-	mountExportRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	mountExportRoutes(routes, chain, callerIdentity)
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
@@ -1471,14 +1482,14 @@ func main() {
 		middleware.UserConfig(jwtKeys, *authnNS)).
 		Then(handlers.RBAC()))
 
-	mountCallWriteRoutes(routes, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	mountCallWriteRoutes(routes, chain, callerIdentity)
 
 	// #443 — GET /capabilities: a static, unauthenticated token list a client
 	// gates on by presence (a 404 means none). No identity, no apiserver call,
 	// so it is outside the read-path-scoped invariant (like /refreshes).
 	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
-	routes.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+	routes.Handle("POST /jq", chain.Append(callerIdentity).Then(handlers.JQ()))
 
 	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
 	// On only under the OTel trace contract with a collector endpoint

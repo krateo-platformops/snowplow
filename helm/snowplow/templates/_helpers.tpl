@@ -62,6 +62,17 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+#1334 — "true" when the install opted in to the public identity, else "false".
+The ONE reading of publicIdentity.enabled: the ConfigMap's PUBLIC_IDENTITY_ENABLED
+and the ClusterRole's impersonate grant both use it, so they cannot disagree.
+Only a boolean true opts in.
+*/}}
+{{- define "snowplow.publicIdentityEnabled" -}}
+{{- $p := .Values.publicIdentity | default dict -}}
+{{- if eq (get $p "enabled" | toString) "true" -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
 Image reference honoring an optional global.imageRegistry override (host-only; repository paths
 preserved). Canonical helper — identical across all Krateo charts.
 */}}

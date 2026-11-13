@@ -106,6 +106,25 @@ rbac:
   # - viewers
   impersonateServiceAccounts: []
 
+# #1334 — the public identity. OFF by default.
+#
+# When enabled, a request that carries NO Authorization header is served as user
+# krateo:public with the single group system:unauthenticated. snowplow has no
+# credential for it and acts for it only by impersonation, so this value also
+# renders the ClusterRole rule that permits exactly that: impersonate on users
+# [krateo:public] and groups [system:unauthenticated], by resourceNames. With
+# system:unauthenticated impersonated the apiserver adds no
+# system:authenticated, so the identity reaches only RoleBindings naming the
+# USER krateo:public plus what any anonymous caller of the apiserver already
+# has. Grant a page by binding a Role (get + resourceNames on its widgets and
+# RESTActions) to that user; never bind a group for it.
+#
+# A request with any Authorization header (expired, invalid, revoked, ...) is
+# never served as the public identity: it is refused 401 as before. Set this
+# value, never env.PUBLIC_IDENTITY_ENABLED (the chart refuses that key).
+publicIdentity:
+  enabled: false
+
 podAnnotations: {}
 podLabels: {}
 

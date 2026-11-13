@@ -99,6 +99,28 @@ func RequesterCredentialFor(ctx context.Context) bool {
 	return !internal
 }
 
+// ImpersonatingConfigFor returns the impersonating *rest.Config ctx dials with,
+// when its transport impersonates the ctx identity (WithImpersonatedDial) and
+// the ctx-carried config does name an identity to impersonate. It is the only
+// credential a caller with no clientconfig of its own has (#1334: the public
+// identity), so a dial site that would otherwise present the clientconfig
+// endpoint presents this instead. ok is false on every other ctx — every live
+// request of an authenticated user — and the caller keeps its own path.
+func ImpersonatingConfigFor(ctx context.Context) (*rest.Config, bool) {
+	if !ImpersonatedDialFromContext(ctx) {
+		return nil, false
+	}
+	rc, ok := internalRESTConfig(ctx)
+	if !ok {
+		return nil, false
+	}
+	imp := rc.Impersonate
+	if imp.UserName == "" && imp.UID == "" && len(imp.Groups) == 0 && len(imp.Extra) == 0 {
+		return nil, false
+	}
+	return rc, true
+}
+
 // internalRESTConfig is the internal-dispatch *rest.Config ctx carries, if any.
 // A context carrying one of the wrong shape, or a nil pointer, falls back to the
 // per-user path rather than fail: the per-user path has no `<sa>-clientconfig`

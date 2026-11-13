@@ -152,6 +152,20 @@
         }
       }
     },
+    "publicIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "title": "Public identity",
+      "description": "#1334 \u2014 serve requests that carry no Authorization header as the public identity: user krateo:public with the single group system:unauthenticated, by impersonation. What it may read is ordinary RBAC: RoleBindings naming the USER krateo:public, plus what system:unauthenticated already has. Off by default: a request with no token is then refused 401.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "title": "Enabled",
+          "description": "When true, snowplow serves token-less requests as the public identity, and the ClusterRole grants impersonate on users [krateo:public] and groups [system:unauthenticated], restricted by resourceNames. When false, neither is rendered. A request that carries any Authorization header, valid or not, is never served as the public identity."
+        }
+      }
+    },
     "podAnnotations": {
       "type": "object",
       "additionalProperties": true,
