@@ -21,7 +21,12 @@ Send the request with **no `Authorization` header at all**.
 |---|---|
 | `publicIdentity.enabled: false` (the default) | `401`, cause `TokenMissing`, exactly as before (`howto-frontend-credential-401-causes.md`) |
 | `publicIdentity.enabled: true` | the request is served as the public identity: `200` for what RBAC grants it, `403` for anything else |
-| enabled, but snowplow may not impersonate the identity (the grant is missing, for example mid-roll) | `503`. Retry later; it is not a sign-in problem |
+| enabled, but snowplow may not impersonate the identity (the grant is missing, for example mid-roll) | `503` |
+
+A `503` on a token-less request means **the page is temporarily unavailable;
+try again**. It is never a sign-in problem: don't send the visitor to log in.
+Show a page-level "temporarily unavailable" state and retry. Snowplow refused
+the request before dispatching anything, so a retry is safe.
 
 The public identity requires the cache. The chart refuses
 `publicIdentity.enabled: true` unless `env.CACHE_ENABLED` is `"true"`, and a
@@ -77,6 +82,11 @@ The identity is user `krateo:public` with the single group
 those read), in the page's namespace (by convention `krateo-public`). Never bind
 the group: `system:unauthenticated` is also what an anonymous caller of the
 apiserver itself is.
+
+The namespace convention is shared with the frontend. Its short URL
+`/public/:slug` resolves the page in the namespace named by a frontend config
+value whose chart default is `krateo-public`. Snowplow itself doesn't read that
+value: whatever the namespace, RBAC decides.
 
 Grants to `system:authenticated` don't reach the public identity.
 
