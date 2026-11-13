@@ -20,6 +20,7 @@ var requestLineKeys = []string{"group", "identity", "items", "name", "namespace"
 var eventLineKeys = map[string][]string{
 	"applyStatus.failed": {"event", "id", "pointer", "reason"},
 	"fake.unimplemented": {"event", "what"},
+	"fake.watchExpired":  {"event", "what"},
 }
 
 func keysOf(l map[string]any) []string {
@@ -102,7 +103,12 @@ func TestRequestLog_EveryLineIsARequestLineOrAListedEvent(t *testing.T) {
 	f.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"applied": true}}})
 	f.advance(2 * time.Second)
 
-	lines := append(h.log(), f.log()...)
+	// a watch from a resourceVersion that left the watch cache's window (fake.watchExpired), on a
+	// harness of its own: h's scripted status writes keep its watch cache's window wide
+	e := newHarness(t, opts{})
+	_, _ = expiredWatch(t, e)
+
+	lines := append(append(h.log(), f.log()...), e.log()...)
 	for _, b := range lineShapeErrors(lines) {
 		t.Error(b)
 	}
@@ -136,6 +142,16 @@ func TestRequestLog_EveryLineIsARequestLineOrAListedEvent(t *testing.T) {
 	if !logged(h, statusWrite) {
 		t.Error("the applied status write has no request line")
 	}
+	// Only the expired watch wrote fake.watchExpired: the watch-list and every other request did not.
+	expiredLines := 0
+	for _, l := range lines {
+		if l["event"] == "fake.watchExpired" {
+			expiredLines++
+		}
+	}
+	if expiredLines != 1 {
+		t.Errorf("%d fake.watchExpired lines in the run, want 1 (the expired watch's)", expiredLines)
+	}
 	// The network seam's egress lines are the bridge's, on their own channel: never the fake's.
 	if logged(h, func(l map[string]any) bool { return l["event"] == "egress" }) {
 		t.Error("an egress line in the fake's request log")
@@ -160,4 +176,48 @@ func TestRequestLog_ShapeCheckRefusesEachDeviation(t *testing.T) {
 	if b := lineShapeErrors([]map[string]any{good, {"event": "fake.unimplemented", "what": "x"}}); len(b) != 0 {
 		t.Errorf("good lines refused: %v", b)
 	}
+}
+
+// expiredWatch watches from a resourceVersion the watch cache has since evicted (TestWatchHistory410's
+// setup: 100 writes, then past eventFreshDuration). It returns that resourceVersion and the log
+// lines the watch wrote.
+func expiredWatch(t *testing.T, h *harness) (string, []map[string]any) {
+	t.Helper()
+	old := incidentRV(h)
+	for i := 0; i < 100; i++ {
+		h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"n": i}}})
+	}
+	h.advance(80 * time.Second) // older than eventFreshDuration (75 s): the cache evicts rather than grows
+	h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"n": "last"}}})
+	before := len(h.log())
+	w := h.watch(inc+"?watch=1&resourceVersion="+old, req{as: "sa"})
+	if e := w.next(); e["type"] != "ERROR" {
+		t.Fatalf("the watch from resourceVersion %s: first event %v, want ERROR (410 Expired)", old, e["type"])
+	}
+	if w.next() != nil {
+		t.Fatal("the stream did not end after the ERROR")
+	}
+	return old, h.log()[before:]
+}
+
+// A watch from an expired resourceVersion writes exactly two lines: its request line, 200 as the
+// apiserver answers it, and one fake.watchExpired naming the watch.
+func TestRequestLog_ExpiredWatchWritesItsRequestLineAndOneWatchExpired(t *testing.T) {
+	h := newHarness(t, opts{})
+	old, lines := expiredWatch(t, h)
+	for _, b := range lineShapeErrors(lines) {
+		t.Error(b)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("the expired watch wrote %d lines, want 2: %v", len(lines), lines)
+	}
+	rl, ev := lines[0], lines[1]
+	eq(t, rl["verb"], "watch", "verb")
+	eq(t, rl["resource"], "incidents", "resource")
+	eq(t, rl["namespace"], "krateo-system", "namespace")
+	eq(t, rl["status"], 200, "status")
+	eq(t, rl["items"], 0, "items")
+	eq(t, rl["query"], "watch=1&resourceVersion="+old, "query")
+	eq(t, ev["event"], "fake.watchExpired", "event")
+	eq(t, ev["what"], "watch of incidents.observability.krateo.io in namespace krateo-system from resourceVersion "+old, "what")
 }
