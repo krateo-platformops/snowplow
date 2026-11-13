@@ -25,11 +25,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,6 +39,7 @@ import (
 
 	krateoaudit "github.com/krateo-platformops/audit"
 	"github.com/krateo-platformops/audit/audittest"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
@@ -75,15 +78,18 @@ func (e2eNamespaces) NamespaceLabels(context.Context, string) (map[string]string
 // recorder.
 func e2eEnv(t *testing.T, extra func(rt *routeTable, chain use.Chain, login func(http.Handler) http.Handler)) (http.Handler, string, *audittest.Recorder) {
 	t.Helper()
-	return e2eEnvWith(t, e2eLogin{groups: []string{"devs"}, seed: []string{credsecret.SessionName(e2eUser)}}, extra)
+	return e2eEnvWith(t, e2eLogin{groups: []string{"devs"}, seed: []string{credsecret.SessionNames(e2eUser)[0]}}, extra)
 }
 
 // e2eLogin is the caller's login state: the token's groups, the credential
 // Secrets the informer holds, and how the apiserver answers a re-read of a
 // Secret the informer does not hold (404 by default).
 type e2eLogin struct {
-	groups       []string
-	seed         []string
+	groups []string
+	seed   []string
+	// owner is the user the seeded Secrets belong to, stamped as authn
+	// writes it (endpoints.UsernameAnnotation, #1382); "" is the caller.
+	owner        string
 	secretStatus int
 	// spentBudget gives the request an already-spent page budget, so the
 	// credential re-read is never sent (504).
@@ -95,13 +101,26 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 	if login.secretStatus == 0 {
 		login.secretStatus = http.StatusNotFound
 	}
+	if login.owner == "" {
+		login.owner = e2eUser
+	}
 	if login.spentBudget {
 		t.Cleanup(middleware.SetPageBudgetArrivalForTest(func() time.Time { return time.Now().Add(-time.Hour) }))
 	}
+	var apiURL string
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Path, "/secrets/") {
+		if i := strings.Index(r.URL.Path, "/secrets/"); i >= 0 {
+			// The apiserver's re-read of a credential Secret: the seeded
+			// one, as the informer holds it, else the configured failure.
+			name := r.URL.Path[i+len("/secrets/"):]
+			if login.secretStatus == http.StatusNotFound && slices.Contains(login.seed, name) {
+				out := e2eSecret(name, apiURL, login.owner)
+				out.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+				_ = json.NewEncoder(w).Encode(out)
+				return
+			}
 			w.WriteHeader(login.secretStatus)
 			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":`+strconv.Itoa(login.secretStatus)+`}`)
 			return
@@ -119,6 +138,7 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 		}
 	}))
 	t.Cleanup(api.Close)
+	apiURL = api.URL
 
 	prevTM := env.TestMode()
 	env.SetTestMode(true)
@@ -131,8 +151,7 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 	t.Cleanup(func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() })
 	cli := fake.NewSimpleClientset()
 	for _, name := range login.seed {
-		sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e2eNS, Name: name},
-			Data: map[string][]byte{"server-url": []byte(api.URL), "token": []byte("tok")}}
+		sec := e2eSecret(name, api.URL, login.owner)
 		if _, err := cli.CoreV1().Secrets(e2eNS).Create(context.Background(), sec, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
@@ -174,6 +193,14 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 		extra(rt, chain, userConfig)
 	}
 	return mux, tok, rec
+}
+
+// e2eSecret is a credential Secret as authn writes it: its owner stamped in
+// endpoints.UsernameAnnotation (#1382), which every reader checks.
+func e2eSecret(name, serverURL, owner string) *corev1.Secret {
+	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: e2eNS, Name: name,
+		Annotations: map[string]string{endpoints.UsernameAnnotation: owner}},
+		Data: map[string][]byte{"server-url": []byte(serverURL), "token": []byte("tok")}}
 }
 
 func e2eDo(h http.Handler, tok, method, target, body string) int {
@@ -329,8 +356,13 @@ func TestAudit_E2E_C_TheLoginsOwnRefusalsAreOneRowEach(t *testing.T) {
 	}{
 		{"no session Secret", e2eLogin{groups: []string{"devs"}},
 			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialSessionCredentialMissing, audit.MessageRefused},
-		{"a krateo:loa:2 token with no step-up Secret", e2eLogin{groups: stepUp, seed: []string{credsecret.SessionName(e2eUser)}},
+		{"a krateo:loa:2 token with no step-up Secret", e2eLogin{groups: stepUp, seed: []string{credsecret.SessionNames(e2eUser)[0]}},
 			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialStepUpRequired, audit.MessageRefused},
+		// #1385: a Secret under the caller's name that belongs to another
+		// user is a miss at every read site, so the caller's credential is
+		// missing.
+		{"the Secret under the caller's name is another user's", e2eLogin{groups: []string{"devs"}, seed: []string{credsecret.SessionNames(e2eUser)[0]}, owner: "e2e-mallory"},
+			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialSessionCredentialMissing, audit.MessageRefused},
 		{"the credential read refused (403)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusForbidden},
 			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", audit.MessageCredentialUnreadable},
 		{"the credential read failed (500)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusInternalServerError},

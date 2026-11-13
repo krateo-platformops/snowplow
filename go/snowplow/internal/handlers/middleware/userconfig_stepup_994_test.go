@@ -61,11 +61,13 @@ func su994Token(t *testing.T, groups ...string) string {
 	return tok
 }
 
+// su994Secret is a credential Secret called name, stamped as the fixture
+// user's it is named for (authnOwned, #1382).
 func su994Secret(name, serverURL string) *corev1.Secret {
-	return &corev1.Secret{
+	return authnOwned(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: su994SecretsNS, Name: name},
 		Data:       map[string][]byte{"server-url": []byte(serverURL), "token": []byte("tok-" + name)},
-	}
+	}, su994User, dlgSubject, dlgActor)
 }
 
 // su994Informer starts the real Secrets informer over exactly secrets.
@@ -199,8 +201,8 @@ func su994Serve(t *testing.T, tok string) su994Result {
 // session Secret — both present in the informer.
 func TestUserConfig994_StepUpGroupSelectsStepUpSecret(t *testing.T) {
 	su994Informer(t,
-		su994Secret(credsecret.SessionName(su994User), su994Session),
-		su994Secret(credsecret.StepUpName(su994User), su994StepUp))
+		su994Secret(credsecret.SessionNames(su994User)[0], su994Session),
+		su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp))
 	asked := su994APIServer(t)
 
 	up := su994Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
@@ -229,7 +231,7 @@ func TestUserConfig994_StepUpGroupSelectsStepUpSecret(t *testing.T) {
 // step-up Secret in the informer AND on the apiserver, it re-reads its session
 // name, gets NotFound and answers 401.
 func TestUserConfig994_NoGroupNeverReadsStepUpSecret(t *testing.T) {
-	stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+	stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 	su994Informer(t, stepUp)
 	asked := su994APIServer(t, stepUp)
 
@@ -239,10 +241,10 @@ func TestUserConfig994_NoGroupNeverReadsStepUpSecret(t *testing.T) {
 			"code=%d reached=%v endpoint=%q", credsecret.StepUpGroup, res.code, res.reached, res.ep.ServerURL)
 	}
 	got := asked()
-	if len(got) != 1 || got[0] != credsecret.SessionName(su994User) {
+	if len(got) != 1 || got[0] != credsecret.SessionNames(su994User)[0] {
 		t.Fatalf("the apiserver re-read must ask for the session Secret only, got %v", got)
 	}
-	if strings.Contains(res.body, credsecret.StepUpSuffix) {
+	if strings.Contains(res.body, endpoints.StepUpSuffix) {
 		t.Fatalf("the 401 names a step-up Secret: %s", res.body)
 	}
 }
@@ -250,7 +252,7 @@ func TestUserConfig994_NoGroupNeverReadsStepUpSecret(t *testing.T) {
 // A missing step-up Secret answers 401: not in the informer, NotFound on the
 // apiserver re-read — and the session Secret, present in both, is never read.
 func TestUserConfig994_MissingStepUpSecretIs401NoFallback(t *testing.T) {
-	session := su994Secret(credsecret.SessionName(su994User), su994Session)
+	session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 	su994Informer(t, session)
 	asked := su994APIServer(t, session)
 
@@ -260,7 +262,7 @@ func TestUserConfig994_MissingStepUpSecretIs401NoFallback(t *testing.T) {
 			"code=%d reached=%v endpoint=%q (session endpoint %q)", res.code, res.reached, res.ep.ServerURL, su994Session)
 	}
 	got := asked()
-	if len(got) != 1 || got[0] != credsecret.StepUpName(su994User) {
+	if len(got) != 1 || got[0] != credsecret.StepUpNames(su994User)[0] {
 		t.Fatalf("the apiserver re-read must ask for the step-up Secret only (no session fallback), got %v", got)
 	}
 }
@@ -271,9 +273,9 @@ func TestUserConfig994_MissingStepUpSecretIs401NoFallback(t *testing.T) {
 func TestUserConfig994_StepUpReReadErrorIsAnErrorNoFallback(t *testing.T) {
 	for _, code := range []int{http.StatusForbidden, http.StatusInternalServerError} {
 		t.Run(http.StatusText(code), func(t *testing.T) {
-			session := su994Secret(credsecret.SessionName(su994User), su994Session)
+			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			su994Informer(t, session)
-			asked := su994APIServerFailing(t, map[string]int{credsecret.StepUpName(su994User): code}, session)
+			asked := su994APIServerFailing(t, map[string]int{credsecret.StepUpNames(su994User)[0]: code}, session)
 
 			res := su994Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
 			if res.reached || res.code != http.StatusInternalServerError {
@@ -285,7 +287,7 @@ func TestUserConfig994_StepUpReReadErrorIsAnErrorNoFallback(t *testing.T) {
 				t.Fatal("PRE: the informer miss must re-read the step-up Secret from the apiserver")
 			}
 			for _, name := range got {
-				if name != credsecret.StepUpName(su994User) {
+				if name != credsecret.StepUpNames(su994User)[0] {
 					t.Fatalf("the apiserver re-read asked for %q; only the step-up Secret may be read (reads=%v)", name, got)
 				}
 			}

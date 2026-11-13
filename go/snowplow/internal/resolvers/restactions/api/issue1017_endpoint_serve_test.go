@@ -98,11 +98,11 @@ func newSrv1017(t *testing.T, cluster string) *srv1017 {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			b, _ := json.Marshal(corev1.Secret{
+			b, _ := json.Marshal(authnOwned(&corev1.Secret{
 				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns1017},
 				Data:       map[string][]byte{"server-url": []byte(url), "token": []byte(name + "-tok")},
-			})
+			}, clusterListBroadUser))
 			_, _ = w.Write(b)
 			return
 		}
@@ -138,7 +138,7 @@ func setup1017(t *testing.T) (ctx context.Context, local, remote *srv1017) {
 	cache.ResetSecretsSnapshotForTest()
 	own := kubeutil.MakeDNS1123Compatible(clusterListBroadUser) + "-clientconfig"
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		own: {ObjectMeta: metav1.ObjectMeta{Namespace: ns1017, Name: own},
+		own: {ObjectMeta: authnMeta(ns1017, own, clusterListBroadUser),
 			Data: map[string][]byte{"server-url": []byte(local.srv.URL), "token": []byte("tok")}},
 		remote1017: {ObjectMeta: metav1.ObjectMeta{Namespace: ns1017, Name: remote1017},
 			Data: map[string][]byte{"server-url": []byte(remote.srv.URL), "token": []byte("remote-tok")}},
