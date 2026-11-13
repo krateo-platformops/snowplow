@@ -18,6 +18,7 @@ judges the VM.
     python3 -m bench.vm606 status --run R [--lines N]        # the launcher's log, its liveness, the VM's time left
     python3 -m bench.vm606 fetch --run R                     # run dirs + evidence back, hashes verified
     python3 -m bench.vm606 down --run R [--yes]              # VM, disk, firewall rules, grants: deleted, verified
+    python3 -m bench.vm606 reap [--yes]                      # earlier runs' expired SSH rules (up does it first)
 
 Every subcommand that changes something in GCP prints its gcloud argv and runs none of them unless
 --yes (as bench.gke). status and fetch create nothing in GCP (an SSH and a copy).
@@ -73,7 +74,10 @@ THE VM (up).
     for that tag before the VM exists: <vm>-deny-ssh (DENY tcp:22 from 0.0.0.0/0, priority 1000, which
     beats default-allow-ssh's 65534) and <vm>-iap-ssh (ALLOW tcp:22 from IAP's 35.235.240.0/20,
     priority 900). Firewall rules carry no labels: their description says owner and run, and `down`
-    deletes only rules with exactly the expected name, target tag and description. OS Login
+    deletes only rules with exactly the expected name, target tag and description. GCE never deletes
+    a rule, so the description also records the run's expiry (expires=<the VM's termination time>,
+    #1383): once it has passed and no instance claims the run, `reap` deletes the rule (exact name
+    and tag, one fail-closed list, each delete read back NotFound), and every `up` reaps first. OS Login
     (enable-oslogin=TRUE, project keys blocked). `up` refuses while iap.googleapis.com is not enabled.
   - A failed `up` says so and names `down`, which removes whatever up made (grants, rules, VM): the
     SSH wait reads every failure (IAP / firewall / OS Login / ssh) and stops at once on one that
@@ -576,7 +580,8 @@ def plan(found: dict) -> dict[str, list[str]]:
 OPERATOR_NEEDS = (
     "resourcemanager.projects.setIamPolicy and iam.serviceAccounts.setIamPolicy (on the node SA): up grants the "
     "run's conditional bindings, down removes them",
-    "compute.securityAdmin: up makes and down deletes the run's two SSH firewall rules (IAP only)",
+    "compute.securityAdmin: up makes and down deletes the run's two SSH firewall rules (IAP only); reap (and up, "
+    "first) deletes earlier runs' expired ones",
     "compute.instanceAdmin.v1: the VM itself",
     "iam.serviceAccountUser on the orchestrator SA: the VM runs as it",
     "iap.tunnelResourceAccessor and compute.osAdminLogin: SSH and scp to the VM through IAP",
@@ -825,9 +830,16 @@ def termination_time(now: float, ttl_hours: int) -> str:
     return gcevm.rfc3339(now + ttl_hours * 3600)
 
 
-def firewall_rules(run: str) -> dict[str, dict]:
-    """The run's two SSH rules, by name (bench.gcevm.ssh_rules): what up makes and the only rules down deletes."""
-    return gcevm.ssh_rules(vm_name(run), f"vm606 owner={OWNER} run={run}")
+def firewall_rules(run: str, expires: str) -> dict[str, dict]:
+    """The run's two SSH rules, by name (bench.gcevm.ssh_rules): what up makes and the only rules down deletes.
+    #1383 gap 6: each description records the run's expiry (`expires`: the VM's own --termination-time), which
+    `reap` (and every up, first) honours once the VM is gone (bench.gcevm.reap_rules)."""
+    return gcevm.ssh_rules(vm_name(run), gcevm.rule_description("vm606", OWNER, run, expires))
+
+
+def rule_names(run: str) -> list[str]:
+    """The run's two SSH rules' exact names (firewall_rules)."""
+    return sorted(firewall_rules(run, ""))
 
 
 def create_command(run: str, project: str, zone: str, ttl_hours: int, startup_file: str,
@@ -899,13 +911,30 @@ def as_made(run: str, project: str, zone: str, ttl_hours, terminates_at) -> dict
     and down must not make the run's own VM read as drifted)."""
     st = {"project": project, "zone": zone, "ttl_hours": ttl_hours, "terminates_at": terminates_at}
     return {"instance": instance_want(run, st),
-            "rules": {fw: firewall_want(fw, rule, project) for fw, rule in firewall_rules(run).items()}}
+            "rules": {fw: firewall_want(fw, rule, project)
+                      for fw, rule in firewall_rules(run, terminates_at).items()}}
+
+
+def reap_expired_rules(project: str, *, dry: bool) -> list[str]:
+    """#1383 gap 6: delete every vm606 SSH rule of `project` whose run's recorded expiry has passed and whose VM is
+    gone (bench.gcevm.reap_rules: exact names and tag, one fail-closed list, each delete's exit code, each read
+    back NotFound). The rules deleted; any rule it could not remove refuses."""
+    deleted, problems = gcevm.reap_rules(project, tool="vm606", owner=OWNER, rules_of=firewall_rules, vm_of=vm_name,
+                                         now=time.time(), dry=dry)
+    if problems:
+        raise Refused("expired SSH rules of earlier runs are left: " + "; ".join(problems))
+    return deleted
+
+
+def cmd_reap(a) -> int:
+    reap_expired_rules(a.project, dry=not a.yes)
+    return 0
 
 
 def _made(st: dict, run: str) -> dict:
     made = st.get("made")
     if not isinstance(made, dict) or not isinstance(made.get("instance"), dict) \
-            or set(made.get("rules") or {}) != set(firewall_rules(run)):
+            or set(made.get("rules") or {}) != set(rule_names(run)):
         raise Refused(f"run {run}'s record holds no as-made of what up created ({state_dir(run) / 'state.json'}): "
                       f"its resources cannot be read back")
     return made
@@ -948,7 +977,7 @@ def vm_footprint(run: str) -> tuple:
     """The VM's own footprint: VM_FOOTPRINT and the project's FIREWALLS its SSH rules take (#1361). The run's
     clusters' rules are its own pre-check's (bench.gke RUN_QUOTAS FIREWALLS, run on this VM, when this VM's rules
     are already in the project's usage)."""
-    return (*VM_FOOTPRINT, gcevm.ssh_rules_footprint(firewall_rules(run)))
+    return (*VM_FOOTPRINT, gcevm.ssh_rules_footprint(rule_names(run)))
 
 
 def vm_quota_check(project: str, zone: str, run: str) -> tuple[list[str], list[str]]:
@@ -989,7 +1018,7 @@ def made_by_up(run: str, st: dict, roles: list[str], number: str) -> list[str]:
     if others:
         off.append(f"{_named(others)} claim(s) run {run} too")
     rules = {r.get("name"): r for r in _rule_docs(run, project)}
-    for fw in firewall_rules(run):
+    for fw in rule_names(run):
         if fw not in rules:
             off.append(f"firewall rule {fw} answers NotFound")
         else:
@@ -1044,6 +1073,9 @@ def cmd_up(a) -> int:
     a.project, a.zone = a.project or DEFAULT_PROJECT, a.zone or DEFAULT_ZONE
     number = _parents(a.project, a.zone)            # an unknown project or zone refuses before anything
     _project_ready(a.project)
+    # #1383 gap 6: first the SSH rules of earlier runs whose recorded expiry has passed (a run that ended at its
+    # TTL, never `down`), each verified gone; one that cannot be removed refuses this up
+    reap_expired_rules(a.project, dry=not a.yes)
     used = run_in_use(run, a.project, number)
     if used:
         raise Refused(f"run {run} is in use: {'; '.join(used)}. `down --run {run}` removes what vm606 made; a new "
@@ -1069,15 +1101,15 @@ def cmd_up(a) -> int:
     # 1. the grants, expiring with the VM, before the VM exists
     grant(run, a.project, number, roles, terminates_at, dry=not a.yes)
     # 2. SSH through IAP only, before the VM exists
-    for fw, rule in firewall_rules(run).items():
+    for fw, rule in firewall_rules(run, terminates_at).items():
         rc, _out, err = gcevm.create(firewall_create_argv(fw, rule, a.project), dry=not a.yes, poll_s=a.poll_s,
                                     what=f"firewall rule {fw}", hint=down_hint(run))
         if rc != 0:
             raise Refused(f"firewall rule {fw} could not be created (rc={rc}; {gcevm.gcloud_cause(err)}); {down_hint(run)}")
     if a.yes:
         made = {r.get("name") for r in _run_rules(run, a.project, _state(run))}   # each as made, or it refuses
-        if made != set(firewall_rules(run)):
-            raise Refused(f"firewall rule(s) {sorted(set(firewall_rules(run)) - made)} answer NotFound after their "
+        if made != set(rule_names(run)):
+            raise Refused(f"firewall rule(s) {sorted(set(rule_names(run)) - made)} answer NotFound after their "
                           f"create; {down_hint(run)}")
     # 3. the VM
     rc, _out, err = gcevm.create(create_command(run, a.project, a.zone, a.ttl_hours, str(sf), terminates_at),
@@ -1577,7 +1609,7 @@ def cmd_fetch(a) -> int:
 
 def _rule_docs(run: str, project: str) -> list[dict]:
     """The run's firewall rules that exist, each read by its exact name (bench.gcevm.rule_docs)."""
-    return gcevm.rule_docs(firewall_rules(run), project)
+    return gcevm.rule_docs(rule_names(run), project)
 
 
 def _owned_rule(run: str, st: dict, r: dict) -> None:
@@ -1780,6 +1812,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fetch", help="copy the run and evidence directories back, verified")
     common(p, yes=False)
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("reap", help="#1383: delete the SSH rules of earlier runs whose recorded expiry has passed "
+                                    "and whose VM is gone (every up does it first), each verified")
+    p.add_argument("--project", default=DEFAULT_PROJECT)
+    p.add_argument("--yes", action="store_true", help="actually do it (default: dry run)")
+    p.set_defaults(func=cmd_reap)
 
     p = sub.add_parser("down", help="delete the VM, its disk, its firewall rules and its grants, verified")
     common(p)

@@ -65,7 +65,8 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_IAM_LOST_WRITE", "FAKE_LIMIT_E2_CPUS", "FAKE_LIMIT_IN_USE_ADDRESSES",
               "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
-              "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL"):
+              "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL",
+              "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     yield st
@@ -1719,7 +1720,7 @@ def _flags(argv: list[str]) -> set[str]:
 def test_the_read_back_covers_every_flag_of_the_create_commands():
     """Each flag up's create commands pass is a field the read-back compares (FIREWALL_FIELDS /
     INSTANCE_FIELDS), and each field compared has a value up made."""
-    fw, rule = next(iter(vm606.firewall_rules(RUN).items()))
+    fw, rule = next(iter(vm606.firewall_rules(RUN, _in(15)).items()))
     assert _flags(vm606.firewall_create_argv(fw, rule, PROJECT)) == \
         {f for fl in vm606.FIREWALL_FIELDS.values() for f in fl if f.startswith("--")}
     assert _flags(vm606.create_command(RUN, PROJECT, ZONE, 15, "startup.sh", _in(15))) == \

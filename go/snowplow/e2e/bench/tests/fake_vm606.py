@@ -26,6 +26,9 @@ outcome:
   - `compute instances list` (unfiltered, every zone): a list whose requests fail (FAKE_LIST_FAILS=1)
     exits 0 with "[]" and a WARNING unless the call's environment sets
     CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, then rc 1 (#1172 B3, tests/fake_region.py);
+  - #1383: `compute firewall-rules list` (unfiltered): every rule this fake holds; FAKE_FW_LIST_FAILS=1 fails it
+    the same way (rc 0 + "[]" + WARNING without the property, rc 1 with it); FAKE_FW_DELETE_FAIL=<name>: that
+    rule's delete is refused (rc 1);
   - `compute instances delete --delete-disks all`: the instance and its disk go (FAKE_KEEP_DISKS=1
     keeps the disk; FAKE_INSTANCE_DELETE_LOST=1: the delete answers rc 0 and nothing goes); `firewall-rules create / delete` (FAKE_FW_DELETE_LOST=1: the delete answers rc 0
     and the rule stays; FAKE_FW_DESCRIBE_503=1: a describe answers 503, not NotFound;
@@ -425,6 +428,16 @@ if a[:3] == ["compute", "firewall-rules", "describe"]:
     if d is None:
         notfound("firewall-rules", "global/firewalls", a[3])
     print(json.dumps(d)); sys.exit(0)
+if a[:3] == ["compute", "firewall-rules", "list"]:
+    # #1383: the project's rules, unfiltered (FAKE_FW_LIST_FAILS=1: its requests fail, as a list fails: rc 0 + []
+    # and a WARNING unless the property is false); FAKE_FW_DELETE_FAIL=<name>: that rule's delete is refused
+    if os.environ.get("FAKE_FW_LIST_FAILS") == "1":
+        os.environ["FAKE_LIST_FAILS"] = "1"
+        failed_list("firewalls")
+    print(json.dumps([json.loads(p.read_text()) for p in sorted((st / "firewalls").glob("*.json"))])); sys.exit(0)
+if a[:3] == ["compute", "firewall-rules", "delete"] and os.environ.get("FAKE_FW_DELETE_FAIL") == a[3]:
+    sys.stderr.write(f"ERROR: (gcloud.compute.firewall-rules.delete) Could not fetch resource:\n - The resource "
+                     f"'projects/{opt('--project')}/global/firewalls/{a[3]}' is not ready\n"); sys.exit(1)
 if a[:3] == ["compute", "firewall-rules", "delete"]:
     if not load("firewalls", a[3]):
         notfound("firewall-rules", "global/firewalls", a[3])
@@ -700,10 +713,11 @@ def put_policy(state: Path, key: str, bindings: list) -> None:
     (state / "policies" / f"{key}.json").write_text(json.dumps({"version": 3, "etag": "BwX=", "bindings": bindings}))
 
 
-def put_rule(state: Path, run: str, fw: str) -> None:
-    """One of the run's SSH rules as up's firewall_create_argv makes it (the fake's `create` builder)."""
+def put_rule(state: Path, run: str, fw: str, expires: str | None = None) -> None:
+    """One of the run's SSH rules as up's firewall_create_argv makes it (the fake's `create` builder). Its
+    recorded expiry (#1383): `expires`, else the run's record's terminates_at, as up writes both."""
     from bench import vm606
-    r = vm606.firewall_rules(run)[fw]
+    r = vm606.firewall_rules(run, expires or vm606._state(run).get("terminates_at"))[fw]
     (state / "firewalls").mkdir(parents=True, exist_ok=True)
     (state / "firewalls" / f"{fw}.json").write_text(json.dumps(firewall_doc(
         fw, PROJECT, vm606.NETWORK, "INGRESS", r["action"], "tcp:22", r["sourceRanges"], r["targetTags"], r["priority"],

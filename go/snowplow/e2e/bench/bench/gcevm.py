@@ -562,6 +562,103 @@ def owned_rule(r: dict, want: dict, tool: str, run: str) -> None:
                       f"was changed")
 
 
+# ─── the SSH rules' recorded expiry, and their reaper (#1383 gap 6) ─────────
+#
+# A firewall rule has no labels and no TTL of its own: GCE never deletes one. A tool's two SSH rules therefore
+# carry their expiry in their description (rule_description: the VM's own --termination-time), and the reaper
+# deletes a rule only when ALL of: its description is exactly that form for the tool and its owner; its name is
+# exactly one of the rules the tool makes for the run the description names (ssh_rules: never a prefix or a
+# pattern); its target tag is that run's; the expiry has passed; and no instance of the project (one unfiltered
+# list, every zone) claims the run (its VM gone: deleting the DENY rule of a live VM would open its port 22 to
+# the project's default-allow-ssh). One unfiltered list of the project's rules, read fail-closed; no --filter.
+# Each delete's exit code is read, and each rule is read back by its exact name until it answers NotFound.
+
+_RULE_EXPIRY = re.compile(r"(?P<tool>[a-z0-9]+) owner=(?P<owner>\S+) run=(?P<run>[a-z][a-z0-9-]*) "
+                          r"expires=(?P<expires>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+
+
+def rule_description(tool: str, owner: str, run: str, expires: str) -> str:
+    """A tool's SSH rule description, carrying the run's expiry (the VM's own termination time, RFC 3339 UTC)."""
+    return f"{tool} owner={owner} run={run} expires={expires}"
+
+
+def expired_rules(rows: list[dict], *, tool: str, owner: str, rules_of, now: float) -> list[tuple[str, dict]]:
+    """(run, rule) of each listed rule the reaper may delete by its description, name and tag (the module note
+    above), whose recorded expiry is before `now`. `rules_of(run, expires)`: the rules the tool makes for that run
+    (ssh_rules), by name."""
+    out = []
+    for r in rows:
+        m = _RULE_EXPIRY.fullmatch(str(r.get("description") or ""))
+        if not m or m["tool"] != tool or m["owner"] != owner:
+            continue
+        want = rules_of(m["run"], m["expires"]).get(r.get("name"))
+        if want is None or sorted(r.get("targetTags") or []) != sorted(want["targetTags"]) \
+                or r.get("description") != want["description"]:
+            continue
+        end = epoch(m["expires"])
+        if end is not None and end < now:
+            out.append((m["run"], r))
+    return sorted(out, key=lambda x: x[1].get("name") or "")
+
+
+# how long a deleted rule may take to answer NotFound, and how often it is read meanwhile
+RULE_GONE_WAIT_S = 120.0
+RULE_GONE_POLL_S = 5.0
+
+
+def reap_rules(project: str, *, tool: str, owner: str, rules_of, vm_of, now: float,
+               dry: bool) -> tuple[list[str], list[str]]:
+    """Delete the project's expired SSH rules of `tool` (expired_rules), each verified. `vm_of(run)`: the run's VM
+    name (an instance named so, or labelled run=<run>, in any zone, keeps its rules). (deleted, problems): problems
+    is empty only when every expired rule answered NotFound after its delete (within RULE_GONE_WAIT_S)."""
+    poll_s, wait_s = RULE_GONE_POLL_S, RULE_GONE_WAIT_S
+    rows = list_json(["compute", "firewall-rules", "list", "--project", project, "--format", "json"],
+                     f"the firewall rules of {project}")
+    expired = expired_rules(rows, tool=tool, owner=owner, rules_of=rules_of, now=now)
+    if not expired:
+        say(f"{tool} reap: no expired SSH rule of {tool} in {project}")
+        return [], []
+    instances = list_json(["compute", "instances", "list", "--project", project, "--format", "json"],
+                          f"the instances of {project}")
+    problems, asked = [], []
+    for run, r in expired:
+        name = r["name"]
+        alive = [i for i in instances if i.get("name") == vm_of(run) or (i.get("labels") or {}).get("run") == run]
+        if alive:
+            problems.append(f"firewall rule {name}: run {run}'s expiry has passed, but {named(alive)} still claim(s) "
+                            f"the run: not deleted")
+            continue
+        rc, _o, err = gcloud(["compute", "firewall-rules", "delete", name, "--project", project, "--quiet"], dry=dry)
+        if dry:
+            continue
+        if rc != 0:
+            problems.append(f"firewall rule {name} (run {run}, expired): its delete failed (rc={rc}; "
+                            f"{gcloud_cause(err)})")
+            continue
+        asked.append(name)
+    deleted = []
+    deadline = time.monotonic() + wait_s
+    for name in asked:
+        path = f"projects/{project}/global/firewalls/{name}"
+        while True:
+            try:
+                gone = get(["compute", "firewall-rules", "describe", name, "--project", project], path,
+                           f"firewall rule {name}") is None
+            except Refused as e:
+                problems.append(f"firewall rule {name}: deleted, then {e}")
+                break
+            if gone:
+                say(f"{tool} reap: firewall rule {name} (expired) deleted; its describe answers NotFound")
+                deleted.append(name)
+                break
+            if time.monotonic() >= deadline:
+                problems.append(f"firewall rule {name}: delete requested, NOT confirmed gone (its describe still "
+                                f"answers after {wait_s:g} s)")
+                break
+            time.sleep(poll_s)
+    return deleted, problems
+
+
 # ─── as made: an instance's describe in the shape of its create flags ───────
 
 def boot_disk_and_image(inst: dict, project: str, zone: str) -> tuple[dict | None, dict | None]:

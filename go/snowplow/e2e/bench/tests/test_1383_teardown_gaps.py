@@ -183,3 +183,110 @@ def test_run606_never_claims_deleted_for_a_cluster_not_confirmed_gone(harness): 
 
 from tests.test_gke_pvc_disks import fakes as pvc_fakes  # noqa: E402,F401
 from tests.test_run606_real_sequence import harness  # noqa: E402,F401
+
+
+# ─── gap 6: the SSH rules carry their expiry, and the reaper honours it ─────
+
+from bench import vm606  # noqa: E402
+from tests import fake_vm606  # noqa: E402
+from tests.test_vm606 import _in, _run  # noqa: E402
+from tests.test_vm606 import fake as vmfake  # noqa: E402,F401
+
+
+def _past(hours: float) -> str:
+    return _in(-hours)
+
+
+def _rule_names(st: Path) -> set[str]:
+    return {p.stem for p in (st / "firewalls").glob("*.json")}
+
+
+def _deletes(st: Path) -> list[str]:
+    return [c["argv"][3] for c in fake_vm606.calls(st) if c["argv"][:3] == ["compute", "firewall-rules", "delete"]]
+
+
+def test_each_ssh_rule_records_the_runs_expiry():
+    t = "2026-11-13T09:00:00Z"
+    rules = vm606.firewall_rules("run25", t)
+    assert set(rules) == {"snowplow-bench-orch-run25-deny-ssh", "snowplow-bench-orch-run25-iap-ssh"}
+    assert {r["description"] for r in rules.values()} == {f"vm606 owner=snowplow-bench run=run25 expires={t}"}
+    made = vm606.as_made("run25", PROJECT, "europe-west3-a", 15, t)
+    assert {r["description"] for r in made["rules"].values()} == {f"vm606 owner=snowplow-bench run=run25 expires={t}"}
+
+
+def _seed(st: Path) -> None:
+    """old1: expired, its VM gone. live: not expired. legacy: a rule made before #1383 (no expiry). Lookalikes: an
+    expired description on a name that is not one of the run's rules, and on a rule whose tag is another's."""
+    for fw in ("deny-ssh", "iap-ssh"):
+        fake_vm606.put_rule(st, "old1", f"snowplow-bench-orch-old1-{fw}", expires=_past(2))
+        fake_vm606.put_rule(st, "live", f"snowplow-bench-orch-live-{fw}", expires=_in(5))
+    legacy = vm606.firewall_rules("legacy", "x")["snowplow-bench-orch-legacy-deny-ssh"]
+    expired_old2 = vm606.firewall_rules("old2", _past(2))["snowplow-bench-orch-old2-iap-ssh"]
+    for name, r, desc, tags in (
+            ("snowplow-bench-orch-legacy-deny-ssh", legacy, "vm606 owner=snowplow-bench run=legacy", None),
+            ("snowplow-bench-orch-old2-iap-ssh-copy", expired_old2, expired_old2["description"], None),
+            ("snowplow-bench-orch-old2-iap-ssh", expired_old2, expired_old2["description"], ["someone-elses-tag"])):
+        (st / "firewalls" / f"{name}.json").write_text(json.dumps(fake_vm606.firewall_doc(
+            name, PROJECT, vm606.NETWORK, "INGRESS", r["action"], "tcp:22", r["sourceRanges"], tags or r["targetTags"],
+            r["priority"], desc)))
+
+
+def test_reap_deletes_only_expired_rules_by_exact_name_each_verified(vmfake, capsys):
+    _seed(vmfake)
+    before = _rule_names(vmfake)
+    rc, out, err = _run(capsys, "reap", "--yes")
+    assert rc == 0, err
+    gone = {"snowplow-bench-orch-old1-deny-ssh", "snowplow-bench-orch-old1-iap-ssh"}
+    assert sorted(_deletes(vmfake)) == sorted(gone)
+    assert _rule_names(vmfake) == before - gone
+    calls = [c["argv"][:4] for c in fake_vm606.calls(vmfake)]
+    for name in gone:                                   # each delete read back by its exact name
+        i = calls.index(["compute", "firewall-rules", "delete", name])
+        assert ["compute", "firewall-rules", "describe", name] in calls[i + 1:]
+        assert f"firewall rule {name} (expired) deleted; its describe answers NotFound" in out
+    lists = [c for c in fake_vm606.calls(vmfake) if c["argv"][:3] == ["compute", "firewall-rules", "list"]]
+    assert lists and all(c["partial_error"] == "false" for c in lists)
+
+
+def test_reap_keeps_an_expired_rule_whose_vm_still_exists(vmfake, capsys):
+    """Deleting the DENY rule of a live VM would open its port 22: an instance claiming the run keeps its rules."""
+    fake_vm606.put_rule(vmfake, "old1", "snowplow-bench-orch-old1-deny-ssh", expires=_past(2))
+    fake_vm606.put_instance(vmfake, "snowplow-bench-orch-old1", {"owner": "snowplow-bench", "run": "old1"}, _past(2))
+    rc, out, err = _run(capsys, "reap", "--yes")
+    assert rc == 2 and "still claim(s) the run: not deleted" in err, err
+    assert _deletes(vmfake) == []
+
+
+def test_reap_fails_closed_on_a_rules_list_that_fails_open(vmfake, capsys, monkeypatch):
+    """The rules list's requests fail: real gcloud answers rc 0 and [] without the property; with it, a refusal."""
+    _seed(vmfake)
+    monkeypatch.setenv("FAKE_FW_LIST_FAILS", "1")
+    rc, out, err = _run(capsys, "reap", "--yes")
+    assert rc == 2 and "could not be listed" in err, err
+    assert _deletes(vmfake) == []
+
+
+@pytest.mark.parametrize("env, says", [
+    ({"FAKE_FW_DELETE_FAIL": "snowplow-bench-orch-old1-iap-ssh"}, "its delete failed (rc=1"),
+    ({"FAKE_FW_DELETE_LOST": "1"}, "delete requested, NOT confirmed gone"),
+])
+def test_reap_reads_each_deletes_rc_and_its_describe(vmfake, capsys, monkeypatch, env, says):
+    _seed(vmfake)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(vm606.gcevm, "RULE_GONE_WAIT_S", 0.2)
+    monkeypatch.setattr(vm606.gcevm, "RULE_GONE_POLL_S", 0.05)
+    rc, out, err = _run(capsys, "reap", "--yes")
+    assert rc == 2 and says in err, err
+
+
+def test_every_up_reaps_first(vmfake, capsys):
+    _seed(vmfake)
+    rc, out, err = _run(capsys, "up", "--run", "run99", "--ttl-hours", "15")    # a dry run: prints, deletes nothing
+    assert rc == 0, err
+    verbs = [" ".join(c["argv"][:3]) for c in fake_vm606.calls(vmfake)]
+    assert "compute firewall-rules list" in verbs
+    assert verbs.index("compute firewall-rules list") < min(
+        (i for i, v in enumerate(verbs) if "iam-policy" in v or v.endswith(" create")), default=len(verbs))
+    assert _deletes(vmfake) == []
+    assert "DRY-RUN: gcloud compute firewall-rules delete snowplow-bench-orch-old1-deny-ssh" in out, out[-3000:]
