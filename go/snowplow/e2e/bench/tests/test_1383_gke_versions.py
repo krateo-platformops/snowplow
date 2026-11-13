@@ -67,3 +67,13 @@ def test_a_pair_whose_versions_are_unrecorded_is_invalid():
     p = custlat.pair(_verdict(DA, DESCRIBE), _verdict(DB, None))
     assert _gv(p)["result"] == "FAIL" and p["verdict"] == "INVALID"
     assert any(r.startswith("customer_latency.pair.gke_versions:") for r in p["invalid_reasons"])
+
+
+def test_a_pair_whose_versions_are_both_unrecorded_is_invalid():
+    """#1387 review (M9): two unknowns are not two equal versions; neither run recorded what GKE gave it."""
+    no_versions = {k: v for k, v in DESCRIBE.items() if k not in ("currentMasterVersion", "currentNodeVersion")}
+    for a, b in ((None, None), (no_versions, no_versions), (None, no_versions)):
+        p = custlat.pair(_verdict(DA, a), _verdict(DB, b))
+        assert _gv(p)["result"] == "FAIL" and _gv(p)["value"] == {"a": None, "b": None}, (a, b)
+        assert p["verdict"] == "INVALID"
+        assert any(r.startswith("customer_latency.pair.gke_versions:") for r in p["invalid_reasons"])
