@@ -85,12 +85,18 @@ type e2eLogin struct {
 	groups       []string
 	seed         []string
 	secretStatus int
+	// spentBudget gives the request an already-spent page budget, so the
+	// credential re-read is never sent (504).
+	spentBudget bool
 }
 
 func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain use.Chain, login func(http.Handler) http.Handler)) (http.Handler, string, *audittest.Recorder) {
 	t.Helper()
 	if login.secretStatus == 0 {
 		login.secretStatus = http.StatusNotFound
+	}
+	if login.spentBudget {
+		t.Cleanup(middleware.SetPageBudgetArrivalForTest(func() time.Time { return time.Now().Add(-time.Hour) }))
 	}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -306,8 +312,11 @@ func TestAudit_E2E_P_APanicAfterTheDialIsOneRowSayingPanic(t *testing.T) {
 // through the real route table and the real UserConfig: a token whose
 // session Secret is missing, and a krateo:loa:2 token whose step-up Secret is
 // missing, are each exactly one denied row with the credential reason, no
-// status code; a credential read the apiserver refuses (403) is one failure
-// row with that code. None moves the design-error counter.
+// status code; a credential read the apiserver refuses (403, 500, 429), or
+// one the page budget never sends (504), is one failure row with NO status
+// code (neither snowplow's own code nor its ServiceAccount's read is an
+// answer of the authority the record names) and the credential body. None
+// moves the design-error counter.
 func TestAudit_E2E_C_TheLoginsOwnRefusalsAreOneRowEach(t *testing.T) {
 	stepUp := []string{"devs", credsecret.StepUpGroup}
 	for _, login := range []struct {
@@ -316,14 +325,20 @@ func TestAudit_E2E_C_TheLoginsOwnRefusalsAreOneRowEach(t *testing.T) {
 		code    int
 		outcome string
 		reason  string
-		status  string
+		body    string
 	}{
 		{"no session Secret", e2eLogin{groups: []string{"devs"}},
-			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialSessionCredentialMissing, ""},
+			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialSessionCredentialMissing, audit.MessageRefused},
 		{"a krateo:loa:2 token with no step-up Secret", e2eLogin{groups: stepUp, seed: []string{credsecret.SessionName(e2eUser)}},
-			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialStepUpRequired, ""},
+			http.StatusUnauthorized, krateoaudit.OutcomeDenied, audit.DenialStepUpRequired, audit.MessageRefused},
 		{"the credential read refused (403)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusForbidden},
-			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", "403"},
+			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", audit.MessageCredentialUnreadable},
+		{"the credential read failed (500)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusInternalServerError},
+			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", audit.MessageCredentialUnreadable},
+		{"the credential read throttled (429)", e2eLogin{groups: []string{"devs"}, secretStatus: http.StatusTooManyRequests},
+			http.StatusInternalServerError, krateoaudit.OutcomeFailure, "", audit.MessageCredentialUnreadable},
+		{"the credential re-read never sent (page budget, 504)", e2eLogin{groups: []string{"devs"}, spentBudget: true},
+			http.StatusGatewayTimeout, krateoaudit.OutcomeFailure, "", audit.MessageCredentialUnreadable},
 	} {
 		for _, route := range []struct {
 			name, method, target, body, action string
@@ -340,12 +355,15 @@ func TestAudit_E2E_C_TheLoginsOwnRefusalsAreOneRowEach(t *testing.T) {
 				if d := audit.DesignErrorCount("answered") - before; d != 0 {
 					t.Errorf("the design-error counter moved by %d on a legitimate refusal or failure", d)
 				}
-				a, _ := e2eRow(t, rec.Records())
+				a, body := e2eRow(t, rec.Records())
 				if a[krateoaudit.KeyOutcome] != login.outcome || a[krateoaudit.KeyDenialReason] != login.reason || a[krateoaudit.KeyAction] != route.action {
 					t.Errorf("action %q outcome %q reason %q, want %s %s %q", a[krateoaudit.KeyAction], a[krateoaudit.KeyOutcome], a[krateoaudit.KeyDenialReason], route.action, login.outcome, login.reason)
 				}
-				if got, ok := a[krateoaudit.KeyHTTPStatusCode]; got != login.status || (login.status == "" && ok) {
-					t.Errorf("http.response.status_code %q (present %t), want %q", got, ok, login.status)
+				if got, ok := a[krateoaudit.KeyHTTPStatusCode]; ok {
+					t.Errorf("http.response.status_code %q: no authority the record names answered", got)
+				}
+				if body != login.body {
+					t.Errorf("body %q, want %q", body, login.body)
 				}
 				if a[krateoaudit.KeyUserName] != e2eUser {
 					t.Errorf("user.name %q: the row does not name the verified caller", a[krateoaudit.KeyUserName])

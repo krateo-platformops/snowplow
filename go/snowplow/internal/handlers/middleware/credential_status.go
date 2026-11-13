@@ -55,7 +55,6 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // The closed set of causes snowplow emits on a pre-dispatch 401 (#1029,
@@ -200,17 +199,6 @@ func credentialMissingReason(groups []string) string {
 		return audit.DenialStepUpRequired
 	}
 	return audit.DenialSessionCredentialMissing
-}
-
-// lookupFailureCode is the status of a credential lookup that failed for any
-// reason but NotFound: the code the apiserver answered the Secret read with,
-// when it answered, else snowplow's own 500.
-func lookupFailureCode(err error) int {
-	var st apierrors.APIStatus
-	if errors.As(err, &st) && st.Status().Code != 0 {
-		return int(st.Status().Code)
-	}
-	return http.StatusInternalServerError
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

@@ -10,8 +10,9 @@
 //   - the login middleware's own exits after it verified the caller are
 //     described by it: a refusal for its own reason (DenyRoute: the caller's
 //     credential is missing) is denied with that reason, a failure before
-//     anything was sent (FailRoute: the credential lookup failed) is a
-//     failure with its code;
+//     anything was sent (FailRoute: the caller's credential could not be
+//     read) is a failure with no status code: no authority the record names
+//     answered;
 //   - a refusal by snowplow before anything was sent (a 4xx exit with no
 //     handler record: a body the decoder refuses, a malformed query) is
 //     recorded by OpenRecord when the request ends: what the request asked
@@ -136,27 +137,28 @@ func DenyRoute(ctx context.Context, reason string) {
 	}
 }
 
-// FailRoute records on ctx's audited request that it failed before anything
-// was sent, with code: the status the authority answered (a Secret read the
-// apiserver refused) or snowplow's own (an error of its own). OpenRecord's
-// record of the exit is then a failure with that code: a legitimate server
-// error, not a design error.
-func FailRoute(ctx context.Context, code int) {
+// FailRoute records on ctx's audited request that the caller's credential
+// could not be read, so nothing was sent: OpenRecord's record of the exit is
+// a failure with NO status code and MessageCredentialUnreadable. A legitimate
+// server error, not a design error. No code is written: snowplow's own (500,
+// 504) or its ServiceAccount's read of the credential Secret is never an
+// answer of the authority the record names (schema v1: "the status code the
+// authority answered"; #1298: never a code snowplow made up).
+func FailRoute(ctx context.Context) {
 	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
 		s.mu.Lock()
-		s.end = &routeEnd{outcome: OutcomeFailure, code: code, message: MessageFailedBeforeSend}
+		s.end = &routeEnd{outcome: OutcomeFailure, message: MessageCredentialUnreadable}
 		s.mu.Unlock()
 	}
 }
 
-// MessageFailedBeforeSend is the body of a record of a request that failed
-// before anything was sent (FailRoute).
-const MessageFailedBeforeSend = "failed before anything was sent"
+// MessageCredentialUnreadable is the body of a record of a request whose
+// caller's credential could not be read (FailRoute): nothing was sent.
+const MessageCredentialUnreadable = "the caller's credential could not be read; nothing was sent"
 
 // routeEnd is how a middleware said the request ended, for OpenRecord.
 type routeEnd struct {
 	outcome, reason, message string
-	code                     int
 }
 
 // SetAsked records on ctx's audited request the handler's own descriptor of
@@ -204,7 +206,7 @@ func (s *recordSlot) close(req *http.Request, sw *statusWriter, panicked bool) {
 	switch {
 	case end != nil && !panicked:
 		ev.Outcome, ev.DenialReason, ev.Message = end.outcome, end.reason, end.message
-		ev.StatusCode = end.code
+		ev.StatusCode = 0 // no authority the record names answered
 		Emit(ctx, ev)
 		return
 	case panicked:
