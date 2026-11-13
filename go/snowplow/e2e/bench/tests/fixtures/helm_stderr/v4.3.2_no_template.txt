@@ -1,0 +1,6 @@
+Error: installer/templates/zz-bench-probe-0123abcd.yaml:6:29
+  executing "installer/templates/zz-bench-probe-0123abcd.yaml" at <include "inst.privateImageComponents" .>:
+    error calling include:
+template: no template "inst.privateImageComponents" associated with template "gotpl"
+
+Use --debug flag to render out invalid YAML

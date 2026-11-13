@@ -119,8 +119,8 @@ def _leaks():
     ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-provider:0.2.53: the installer lists it as a "
                          "private-image component (inst.privateImageComponents) and it cannot be rendered"),
     # #1395: the list is RENDERED from the installer chart; one that cannot be read refuses the run, by name
-    ("private_rule_missing", "the installer's private-image components (inst.privateImageComponents) cannot be "
-                             "read from its rendered chart: helm template failed: Error: template: "),
+    # helm's cause, whatever its version's line layout (#1395 review: helm_reason)
+    ("private_rule_missing", 'no template "inst.privateImageComponents" associated with template "gotpl"'),
     ("private_rule_empty", "the installer's private-image components (inst.privateImageComponents) cannot be "
                            "read from its rendered chart: the define renders no `components` list, or an empty one"),
     ("private_rule_unrendered", "the installer's private-image components (inst.privateImageComponents) cannot be "

@@ -875,8 +875,25 @@ def _in_child(fn_name: str, args: tuple, bound_s: float, late: str):
     return v
 
 
-#: how much of helm's stderr is read: its last line is the reason
+#: how much of helm's stderr is read: its reason is at the end (helm_reason)
 STDERR_TAIL = 4096
+#: how much of that reason a refusal says
+REASON_MAX = 1000
+#: the hint helm appends to a render error, which is not part of the reason
+_DEBUG_HINT = "Use --debug flag"
+
+
+def helm_reason(tail: str, rc: int) -> str:
+    """helm's reason, from the end of its stderr (`tail`), on one line: everything from its FIRST
+    `Error` line to the end, without the `Use --debug flag ...` hint helm appends, each line
+    stripped and joined with a space. No line layout of one helm version is assumed (#1395 review:
+    helm v3.19 says a template error on one line; v4 splits it, location first, cause on later
+    lines, so a pick of one line kept the location and lost the cause). With no `Error` line, all
+    of it. At most REASON_MAX characters."""
+    lines = [x.strip() for x in tail.splitlines()]
+    first = next((i for i, x in enumerate(lines) if x.startswith("Error")), 0)
+    kept = [x for x in lines[first:] if x and not x.startswith(_DEBUG_HINT)]
+    return (" ".join(kept) or f"exit {rc}")[:REASON_MAX]
 
 
 def _tail(fh, n: int = STDERR_TAIL) -> str:
@@ -934,14 +951,11 @@ def render(data: bytes, name: str, values: dict, helm: str = "helm", meta: dict 
                         kill()
                         raise _Refused(f"helm template rendered more than its {RENDER_OUT_MAX} byte cap")
                 rc = pr.wait()
-                # helm's reason is its last `Error:` line: after a template error helm adds a hint
-                # ("Use --debug flag to render out invalid YAML"), which is not one (#1395)
-                said = _tail(ef).strip().splitlines() or [f"exit {rc}"]
-                why = ([x for x in said if x.startswith("Error")] or said)[-1]
+                why = helm_reason(_tail(ef), rc)
                 if meta is not None:
                     meta["render"] = len(out)
         if rc != 0:
-            raise _Refused(f"helm template failed: {why[:300]}")
+            raise _Refused(f"helm template failed: {why}")
         if unread:
             raise _Refused("helm template exited without reading its values")
         return bytes(out)

@@ -171,7 +171,7 @@ def test_the_render_is_the_install_release_namespace_and_cluster_version(tmp_pat
 # ─── a render that cannot answer refuses, with the reason ──────────────────
 
 @pytest.mark.parametrize("body,why", [
-    (None, 'helm template failed: Error: template: '),       # the define gone (renamed)
+    (None, 'helm template failed: Error: '),                  # the define gone (renamed): its cause below
     ("components: [", "the define does not render as YAML: "),
     ("components: []", "the define renders no `components` list, or an empty one"),
     ("other: []", "the define renders no `components` list, or an empty one"),
@@ -456,3 +456,87 @@ def test_the_bench_enable_rule_is_the_installers_for_run_26g(tmp_path, snowplow)
     assert rule == stock
     assert sorted(set(ghcr_pull.private_image_paths(str(pulled), _values(snowplow))) & stock) == [
         "agentgateway-policies", "alert-provider"]
+
+
+# ─── helm's reason, in every line layout (#1395 review) ─────────────────────
+# CI run 43429175943 rendered with the runner image's newer helm: its reason for the missing define
+# was cut to "Error: installer/templates/zz-bench-probe-98ab0cc0.yaml:6:29", the location line of a
+# multi-line error, and the cause was lost. Fixtures:
+#   v3.19.0 (the VM's, vm606.HELM_VERSION): captured from that helm on this probe (v3.22.1 prints
+#     the same bytes);
+#   v4.3.2: the layout helm v4.3.2 writes, from its source (pkg/engine/engine.go
+#     reformatExecErrorMsg / TraceableError.String: location, then the indented executing line and
+#     message, then the chained no-template error; pkg/cmd/template.go appends the --debug hint), its
+#     first line the one CI printed.
+STDERR = FIXTURES / "helm_stderr"
+CAUSE = 'no template "inst.privateImageComponents" associated with template "gotpl"'
+
+
+@pytest.mark.parametrize("layout", ["v3.19.0_no_template.txt", "v4.3.2_no_template.txt"])
+def test_the_reason_keeps_helms_cause_in_every_layout(layout):
+    why = ghcr_pull.helm_reason((STDERR / layout).read_text(), 1)
+    assert why.startswith("Error: ") and why.endswith(CAUSE) and "\n" not in why and "--debug" not in why, why
+    assert "zz-bench-probe-0123abcd.yaml:6:29" in why
+
+
+@pytest.mark.parametrize("tail,want", [
+    ("Error: one line\n", "Error: one line"),
+    ("walk.go:75: found symbolic link in path\nError: the reason\n  and its cause\n\nUse --debug flag to x\n",
+     "Error: the reason and its cause"),
+    ("xxxx partial line of a cut tail\nError: first\nError: second\n", "Error: first Error: second"),
+    ("no error line at all\nsecond line\n", "no error line at all second line"),
+    ("\n\nUse --debug flag to render out invalid YAML\n", "exit 7"),
+    ("", "exit 7"),
+])
+def test_the_reason_is_everything_from_the_first_error_line(tail, want):
+    assert ghcr_pull.helm_reason(tail, 7) == want
+
+
+def test_the_reason_is_capped():
+    assert len(ghcr_pull.helm_reason("Error: " + "y" * 10_000, 1)) == ghcr_pull.REASON_MAX
+
+
+@pytest.mark.parametrize("layout", ["v3.19.0_no_template.txt", "v4.3.2_no_template.txt"])
+def test_a_render_refusal_names_the_cause_whatever_helm_lays_it_out(tmp_path, layout):
+    helm = tmp_path / "helm"
+    helm.write_text(f"#!/bin/sh\ncat > /dev/null\ncat {shlex.quote(str(STDERR / layout))} >&2\nexit 1\n")
+    helm.chmod(0o755)
+    with pytest.raises(ghcr_pull._Refused) as e:
+        ghcr_pull.private_image_paths(str(_pulled(tmp_path, "0.3.616")), _values(), str(helm))
+    assert str(e.value).endswith(CAUSE) and "helm template failed: Error: " in str(e.value), str(e.value)
+
+
+def test_ci_renders_with_the_helm_the_vm_pins():
+    wf = (BENCH_DIR.parent.parent.parent.parent / ".github" / "workflows" / "bench-tests.yaml").read_text()
+    step = wf[wf.index("- name: The helm the VM pins, first on PATH"):wf.index("- name: The suite's helm is the VM's")]
+    assert "from bench import vm606; print(vm606.HELM_VERSION, vm606.HELM_SHA256)" in step
+    assert 'sha256sum -c -' in step and '>> "$GITHUB_PATH"' in step
+    assert wf.index("The helm the VM pins") < wf.index("- name: Bench suite, in parallel")
+
+
+# ─── M9: the laptop renders with each run's own values ─────────────────────
+
+def test_the_laptop_renders_with_each_runs_snowplow_and_frontend_tags(tmp_path, laptop_helm):
+    """A list that is a rule over componentValues shows what the laptop rendered with: each run's
+    SNOWPLOW_TAG_<L> and FRONTEND_TAG_<L> (bench.installer_values), and no frontend override for a
+    run without one. The VM's preflight renders with the same document (run606.sh)."""
+    pulled = _pulled(tmp_path / "v", "0.3.616")
+    t = _helpers(pulled).read_text()
+    d = _define(t)
+    _helpers(pulled).write_text(t.replace(d, d.replace("\n{{- end -}}", (
+        "\n- name: snowplow-{{ .Values.componentValues.snowplow.image.tag }}\n  path: [p]\n"
+        '{{- with dig "frontend" "image" "tag" "" .Values.componentValues }}\n- name: frontend-{{ . }}\n'
+        "  path: [p]\n{{- end }}\n"
+        "{{- end -}}"))))
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        tf.add(pulled / "installer", arcname="installer")
+    (laptop_helm / "installer-9.9.3.tgz").write_bytes(buf.getvalue())
+    env = _env(INSTALLER_VERSION="9.9.3", SNOWPLOW_TAG_N1="1.12.69", SNOWPLOW_TAG_N2="1.12.70",
+               FRONTEND_TAG_N1="1.8.41", FRONTEND_TAG_N2="1.8.41")
+    n1, n2 = REAL_CHART_CHECK(env, ["N1", "N2"])
+    assert "10 entries" in n1 and "snowplow-1.12.69" in n1 and "frontend-1.8.41" in n1, n1
+    assert "snowplow-1.12.70" in n2 and "frontend-1.8.41" in n2 and "snowplow-1.12.69" not in n2, n2
+    env = {k: v for k, v in env.items() if not k.startswith("FRONTEND_TAG_")}
+    n1, _ = REAL_CHART_CHECK(env, ["N1", "N2"])
+    assert "9 entries" in n1 and "frontend-" not in n1, n1
