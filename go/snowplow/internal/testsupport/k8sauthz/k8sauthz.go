@@ -16,23 +16,29 @@
 //
 // Scope: User / Group / ServiceAccount subjects, ClusterRoleBindings,
 // RoleBindings to a Role or a ClusterRole, the "*" wildcards, the implicit
-// system:authenticated group as the apiserver's own group adder decides it
-// (requestGroups), and (#1362) non-resource requests: Attributes with a Path
-// are authorized as upstream RuleAllows authorizes a request whose
+// group (system:authenticated, or system:unauthenticated for system:anonymous)
+// as the apiserver's own impersonation filter decides it (requestGroups), and
+// (#1362) non-resource requests: Attributes
+// with a Path are authorized as upstream RuleAllows authorizes a request whose
 // RequestInfo has IsResourceRequest=false, which means VerbMatches &&
 // NonResourceURLMatches, with ClusterRoleBindings only (the namespace is "").
 // Aggregated ClusterRoles are out of scope (no arm uses them).
 package k8sauthz
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 
+	authnv1 "k8s.io/api/authentication/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/group"
 	kuser "k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/endpoints/filters/impersonation"
+	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 // Attributes are the authorization attributes of one resource request, as the
@@ -102,21 +108,55 @@ func RequestName(verb, name string) string {
 }
 
 // requestGroups is the group set the apiserver's authorizer sees for a request
-// authenticated as (user, groups). It is not modelled: it runs the apiserver's
-// own k8s.io/apiserver/pkg/authentication/group.AuthenticatedGroupAdder, which
-// adds system:authenticated unless the user is system:anonymous or the groups
-// already hold system:authenticated or system:unauthenticated (#1334). Before
-// #1334 this model appended system:authenticated unconditionally — the same
-// mistake as the evaluator it judges, so it could not have caught it.
+// snowplow sends as (user, groups) — Impersonate-User: user plus one
+// Impersonate-Group per group. It is not modelled: the request runs through the
+// apiserver's own k8s.io/apiserver/pkg/endpoints/filters/impersonation filter
+// (v0.36.5 impersonation.go:126-157), and the groups are those of the user the
+// filter hands downstream. That filter adds system:authenticated unless the
+// user is system:anonymous or the groups already hold system:authenticated or
+// system:unauthenticated (126-144), and adds system:unauthenticated to an
+// impersonated system:anonymous that does not already hold it (145-157)
+// (#1334). The authentication path's AuthenticatedGroupAdder applies only the
+// first rule — it adds nothing for system:anonymous, whose real anonymous
+// authenticator already yields [system:unauthenticated] — so it is not the
+// reference for an impersonated system:anonymous with no groups. Before #1334
+// this model appended system:authenticated unconditionally — the same mistake
+// as the evaluator it judges, so it could not have caught it.
+//
+// A request the filter does not turn into (user, ...) — an empty user, which
+// the apiserver never sees — has no answer here: requestGroups panics rather
+// than guess one.
 func requestGroups(user string, groups []string) []string {
-	inner := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
-		return &authenticator.Response{User: &kuser.DefaultInfo{Name: user, Groups: append([]string(nil), groups...)}}, true, nil
-	})
-	resp, ok, err := group.NewAuthenticatedGroupAdder(inner).AuthenticateRequest(&http.Request{})
-	if err != nil || !ok {
-		return append([]string(nil), groups...)
+	var got kuser.Info
+	h := impersonation.WithImpersonation(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got, _ = request.UserFrom(r.Context())
+	}), allowImpersonation{}, nil)
+	req, err := http.NewRequestWithContext(request.WithUser(context.Background(), &kuser.DefaultInfo{
+		Name:   "system:serviceaccount:krateo-system:snowplow",
+		Groups: []string{"system:serviceaccounts", "system:serviceaccounts:krateo-system", kuser.AllAuthenticated},
+	}), http.MethodGet, "/api", nil)
+	if err != nil {
+		panic(fmt.Sprintf("k8sauthz: build impersonation request: %v", err))
 	}
-	return resp.User.GetGroups()
+	req.Header.Set(authnv1.ImpersonateUserHeader, user)
+	for _, g := range groups {
+		req.Header.Add(authnv1.ImpersonateGroupHeader, g)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got == nil || got.GetName() != user {
+		panic(fmt.Sprintf("k8sauthz: the apiserver's impersonation filter does not accept user %q groups %q (%d %s)",
+			user, groups, rec.Code, rec.Body.String()))
+	}
+	return got.GetGroups()
+}
+
+// allowImpersonation authorizes every impersonation: requestGroups needs the
+// filter's group rule, not its impersonate permission check.
+type allowImpersonation struct{}
+
+func (allowImpersonation) Authorize(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+	return authorizer.DecisionAllow, "", nil
 }
 
 // Allowed reports whether Kubernetes RBAC allows attr.

@@ -59,8 +59,9 @@ const (
 // i1334BuildWatcher publishes the 057 shape #1334 found: a ClusterRoleBinding
 // granting `get restactions` to Group system:authenticated ONLY (057's
 // authenticated-get-catalog-index), plus the public page's own Role, bound to
-// the USER krateo:public with resourceNames [public-page].
-func i1334BuildWatcher(t *testing.T) {
+// the USER krateo:public with resourceNames [public-page]. extra objects are
+// published alongside.
+func i1334BuildWatcher(t *testing.T, extra ...runtime.Object) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -104,6 +105,7 @@ func i1334BuildWatcher(t *testing.T) {
 			RoleRef:    rbacv1.RoleRef{APIGroup: g, Kind: "Role", Name: "public-page-1334"},
 		},
 	}
+	seed = append(seed, extra...)
 	wctx, wcancel := context.WithCancel(context.Background())
 	rw, err := cache.NewResourceWatcher(wctx, dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...))
 	if err != nil {
