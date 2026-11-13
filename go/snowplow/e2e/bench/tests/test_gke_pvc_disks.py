@@ -322,7 +322,8 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
                  "spec": {"volumes": [{"name": "c", "configMap": {"name": "x"}}]}}]})); sys.exit(0)
         # #1383: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused) and its proof Job, as the API server and
         # IAM answer: FAKE_TTL_PROOF=granted (default) | denied (testIamPermissions answers {}) | error (an IAM
-        # error naming the account) | silent (the pod printed no answer) | failed (the Job failed) | never
+        # error naming the account) | silent (the pod printed no answer) | failed (the Job failed) | never |
+        # body (run 26g: the JSON file FAKE_TTL_PROOF_BODY names, on one line as the proof script prints it)
         proof = os.environ.get("FAKE_TTL_PROOF", "granted")
         if a[:2] == ["apply", "-f"]:
             text = sys.stdin.read()
@@ -338,6 +339,8 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             ans = {"granted": {"permissions": ["container.clusters.delete"]}, "denied": {},
                    "error": {"error": {"code": 403, "status": "PERMISSION_DENIED",
                                        "message": "denied for someone@example.invalid"}}}.get(proof)
+            if proof == "body":
+                ans = json.load(open(os.environ["FAKE_TTL_PROOF_BODY"]))
             if ans is not None:
                 print("TTL_PROOF " + json.dumps(ans))
             sys.exit(0)

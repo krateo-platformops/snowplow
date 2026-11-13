@@ -261,6 +261,40 @@ os.execv(REAL, [REAL, *a])
 """
 
 
+#: run 26g: the pinned CRD charts, vendored (tests/fixtures/crd_charts). The fake registry serves each one under its
+#: name (bench.crd_schema fetches a ghcr.io CRD chart in-process with the pull token, as the registry step does):
+#: the vendored chart as it is, its Chart.yaml version included (crd_schema refuses a version other than the pin's).
+#: FAKE_CRD_REQUIRE="Kind:field,..." (read from this process's environment when the chart is asked for) serves a CRD
+#: whose spec requires one more field, as the run606 harness's fake helm does for the installer's vendored copy.
+CRD_FIXTURE_CHARTS = Path(__file__).resolve().parent / "fixtures" / "crd_charts"
+
+
+def crd_chart_tgz(chart_dir: Path, require: str = "") -> bytes:
+    """The vendored CRD chart `chart_dir` as a helm archive (its files under one top directory)."""
+    import io
+    import tarfile
+    import yaml
+    req = [x.split(":", 1) for x in require.split(",") if x]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for f in sorted(p for p in chart_dir.rglob("*") if p.is_file()):
+            data = f.read_bytes()
+            rel = f.relative_to(chart_dir)
+            if req and rel.parts[0] == "templates":
+                crd = yaml.safe_load(data)
+                for kind, field in req:
+                    if crd["spec"]["names"]["kind"] == kind:
+                        for v in crd["spec"]["versions"]:
+                            spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+                            spec["required"] = list(spec.get("required") or []) + [field]
+                            spec.setdefault("properties", {})[field] = {"type": "string"}
+                data = yaml.safe_dump(crd).encode()
+            ti = tarfile.TarInfo(f"{chart_dir.name}/{rel.as_posix()}")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def fake_bearer(token: str) -> str:
     import hashlib
     return "fake-bearer-" + hashlib.sha256(token.encode()).hexdigest()[:24]
@@ -290,6 +324,8 @@ def _fake_ghcr():
         import tarfile
         import yaml
         chart = name.rsplit("/", 1)[1]
+        if (CRD_FIXTURE_CHARTS / chart).is_dir():
+            return crd_chart_tgz(CRD_FIXTURE_CHARTS / chart, os.environ.get("FAKE_CRD_REQUIRE", ""))
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             files = [("Chart.yaml", {"apiVersion": "v2", "name": chart, "version": version, "appVersion": version}),

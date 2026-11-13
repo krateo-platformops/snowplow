@@ -72,7 +72,7 @@ def fake(tmp_path, monkeypatch, run_trees):
               "FAKE_FW_DELETE_LOST", "FAKE_FW_DESCRIBE_503", "FAKE_FW_DESCRIBE_NOT_OBJECT", "FAKE_INSTANCE_DESCRIBE_FAIL", "FAKE_INSTANCE_DELETE_LOST",
               "FAKE_PROJECT_NUMBER", "FAKE_PROJECT_STATE", "FAKE_CREATE_FAIL", "FAKE_FW_CREATE_FAIL",
               "FAKE_PROJECT_USAGE_FIREWALLS", "FAKE_PROJECT_INFO_FAIL", "FAKE_NOT_READY", "FAKE_OP_DESCRIBE_FAIL",
-              "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL"):
+              "FAKE_FW_LIST_FAILS", "FAKE_FW_DELETE_FAIL", "FAKE_SERVICES", "FAKE_SERVICES_DISABLED"):
         monkeypatch.delenv(k, raising=False)
     _OUTPUT.clear()
     # #1395: up and launch check the installer chart on the laptop (registry + helm); these tests are

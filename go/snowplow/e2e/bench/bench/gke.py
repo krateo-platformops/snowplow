@@ -800,10 +800,32 @@ spec:
 """
 
 
+_ERROR_REASON = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_ERROR_SERVICE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\.googleapis\.com")
+
+
+def error_reasons(err: dict) -> str:
+    """A Google API error's machine-readable reasons (run 26g): each `error.details[]` ErrorInfo's
+    `reason` (SERVICE_DISABLED, IAM_PERMISSION_DENIED, ...) and, when it names one, the API it is about
+    (`metadata.service`), as "reason: R (service S), ...". The 403 alone said PERMISSION_DENIED for an
+    API that was not enabled. A reason is an upper-case code and a service an API host, each matched
+    whole: nothing of the error's free text (its message, which can name the account) gets through.
+    "" when the error carries none."""
+    out = []
+    details = err.get("details")
+    for d in details if isinstance(details, list) else []:
+        if not isinstance(d, dict) or not isinstance(d.get("reason"), str) or not _ERROR_REASON.fullmatch(d["reason"]):
+            continue
+        svc = (d.get("metadata") or {}).get("service") if isinstance(d.get("metadata"), dict) else None
+        out.append(d["reason"] + (f" (service {svc})" if isinstance(svc, str) and _ERROR_SERVICE.fullmatch(svc)
+                                  else ""))
+    return f"reason: {', '.join(out)}" if out else ""
+
+
 def ttl_proof_answer(logs: str) -> tuple[bool, str]:
     """(proven, why) from the proof pod's log: proven only when IAM's testIamPermissions answer
-    (the TTL_PROOF_MARK line) lists TTL_PERMISSION. An error answer is named by its code and
-    status only (its message can name the account)."""
+    (the TTL_PROOF_MARK line) lists TTL_PERMISSION. An error answer is named by its code, status
+    and machine-readable reasons (error_reasons) only (its message can name the account)."""
     line = next((ln[len(TTL_PROOF_MARK):] for ln in (logs or "").splitlines() if ln.startswith(TTL_PROOF_MARK)),
                 None)
     if line is None:
@@ -815,9 +837,10 @@ def ttl_proof_answer(logs: str) -> tuple[bool, str]:
     if not isinstance(got, dict):
         return False, "IAM's answer is not a JSON object"
     if "error" in got:
-        e = got.get("error") or {}
-        return False, (f"IAM refused the permission test (HTTP {e.get('code')}, {e.get('status')}): whether the "
-                       f"node SA may delete the cluster is unknown")
+        e = got.get("error") if isinstance(got.get("error"), dict) else {}
+        reasons = error_reasons(e)
+        return False, (f"IAM refused the permission test (HTTP {e.get('code')}, {e.get('status')}"
+                       f"{'; ' + reasons if reasons else ''}): whether the node SA may delete the cluster is unknown")
     perms = got.get("permissions") or []
     if TTL_PERMISSION in perms:
         return True, f"IAM answers that the CronJob's identity (the GKE node SA) holds {TTL_PERMISSION}"

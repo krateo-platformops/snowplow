@@ -1089,6 +1089,57 @@ def path_results(docs, paths: list[list[str]], effective: dict) -> list[dict]:
     return out
 
 
+def fetch_chart(host: str, name: str, version: str, user: str, token: str,
+                budget: Budget | None = None) -> tuple[bytes, dict, dict, dict]:
+    """(the chart's helm archive, its Chart.yaml by directory, its values.yaml by directory, what was measured)
+    of oci://<host>/<name>:<version>, fetched in-process with these credentials: the registry's token exchange,
+    the manifest, its one helm chart layer (a blob of its declared size, digest-verified), its files read in a
+    killed child within their bound (read_chart_files). Raises _Refused (a _NoAnswer when it is no answer)."""
+    bearer = _exchange(host, name, user, token, budget)
+    req = urllib.request.Request(f"{API}/v2/{name}/manifests/{version}",
+                                 headers={"Authorization": f"Bearer {bearer}",
+                                          "Accept": "application/vnd.oci.image.manifest.v1+json"})
+    try:
+        manifest = json.loads(_attempt("manifest read", HTTP_BOUND_S,
+                                       lambda: _read(req, MANIFEST_MAX, HTTP_BOUND_S), budget) or b"{}")
+    except ValueError:
+        raise _Refused("its manifest is not JSON") from None
+    layers = [x for x in manifest.get("layers") or [] if x.get("mediaType") == HELM_CHART_LAYER]
+    if len(layers) != 1:
+        raise _Refused(f"{len(layers)} helm chart layers in its manifest")
+    data = _attempt("chart blob read", BLOB_BOUND_S,
+                    lambda: _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer), budget)
+    charts, vals, inflated, largest, parsed, members, deepest = _attempt(
+        "chart files read", PARSE_BOUND_S, lambda: _in_child(
+            "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
+            f"its chart files were not read within their {PARSE_BOUND_S:g} s bound"), budget)
+    if not charts:
+        raise _Refused("no Chart.yaml in its chart layer")
+    return data, charts, vals, {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
+                                "members": members, "deepest": deepest}
+
+
+#: one fetch_chart at its WHOLE bound: the token exchange and the manifest at a registry call's, the blob at a
+#: blob's, the files' read at a parse's
+FETCH_CHART_BOUND_S = 2 * HTTP_BOUND_S + BLOB_BOUND_S + PARSE_BOUND_S
+
+
+def pull_chart(ref: str, version: str, user: str, token: str, budget: Budget | None = None):
+    """A chart on REGISTRY_HOST (ref oci://ghcr.io/<name>) at `version`, fetched in-process with the pull
+    token (fetch_chart, as the preflight reads every chart): (its helm archive, its top directory's
+    Chart.yaml), or why not (a Why: `no_answer` when the registry gave none). For a caller that reads the
+    chart's files itself (run 26g: bench.crd_schema's CRD charts, whose private ones an anonymous helm pull
+    could not read)."""
+    host, _, name = ref[len("oci://"):].partition("/")
+    if host != REGISTRY_HOST or not name:
+        return _why(f"{ref} is not a chart on {REGISTRY_HOST}", False)
+
+    def go():
+        data, charts, _vals, _measured = fetch_chart(host, name, version, user, token, budget)
+        return data, charts[min(charts, key=len)]
+    return _ref_error(f"{ref}:{version}", go)
+
+
 def chart_images(repo: str, chart: str, version: str, user: str, token: str, values: dict | None = None,
                  helm: str = "helm", name: str | None = None, paths: list[list[str]] | None = None,
                  budget: Budget | None = None) -> dict:
@@ -1114,28 +1165,7 @@ def chart_images(repo: str, chart: str, version: str, user: str, token: str, val
            "no_answer": False, "render_no_answer": False}
 
     def fetch():
-        bearer = _exchange(host, name, user, token, budget)
-        req = urllib.request.Request(f"{API}/v2/{name}/manifests/{version}",
-                                     headers={"Authorization": f"Bearer {bearer}",
-                                              "Accept": "application/vnd.oci.image.manifest.v1+json"})
-        try:
-            manifest = json.loads(_attempt("manifest read", HTTP_BOUND_S,
-                                           lambda: _read(req, MANIFEST_MAX, HTTP_BOUND_S), budget) or b"{}")
-        except ValueError:
-            raise _Refused("its manifest is not JSON") from None
-        layers = [x for x in manifest.get("layers") or [] if x.get("mediaType") == HELM_CHART_LAYER]
-        if len(layers) != 1:
-            raise _Refused(f"{len(layers)} helm chart layers in its manifest")
-        data = _attempt("chart blob read", BLOB_BOUND_S,
-                        lambda: _blob(host, name, layers[0]["digest"], layers[0].get("size"), bearer), budget)
-        charts, vals, inflated, largest, parsed, members, deepest = _attempt(
-            "chart files read", PARSE_BOUND_S, lambda: _in_child(
-                "read_chart_files", (data, chart_caps()), PARSE_BOUND_S,
-                f"its chart files were not read within their {PARSE_BOUND_S:g} s bound"), budget)
-        if not charts:
-            raise _Refused("no Chart.yaml in its chart layer")
-        out["measured"] = {"blob": len(data), "largest_file": largest, "inflated": inflated, "parsed": parsed,
-                           "members": members, "deepest": deepest}
+        data, charts, vals, out["measured"] = fetch_chart(host, name, version, user, token, budget)
         return walk(charts, vals, data)
 
     def walk(charts, vals, data):

@@ -772,6 +772,25 @@ on_pair_stop() {
 }
 trap on_pair_stop USR1
 
+# s_apis (run 26g: three arms each created a cluster, then failed ~10 min later in gke-up because the TTL
+# proof's API, cloudresourcemanager, was not enabled in the project): every Google API this run calls, from
+# the laptop, this orchestrator and the GKE node SA, derived from the code (bench/gcp_apis.py), must be
+# enabled in PROJECT, or the run is refused naming each one, before any cluster exists. One read-only
+# `gcloud services list --enabled`; an empty or failed answer refuses too. The dry pass derives the set
+# offline and reads nothing from GCP (as every other GCP read of the dry pass); vm606 `up` checks the same set
+# from the laptop, dry or not, before it creates anything.
+s_apis() {
+  local rc=0 ln why dry=()
+  [[ "$DRY" == "1" ]] && dry=(--dry)
+  python3 -m bench.gcp_apis check --project "$PROJECT" ${dry[@]+"${dry[@]}"} 2>"$KERR" || rc=$?
+  (( rc == 0 )) || why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$KERR"
+  (( rc == 0 )) && return 0
+  : > "$KERR"     # the refusal is the failure's own line, said once
+  record_failure "apis FAILED: ${why:-bench.gcp_apis exited ${rc}}"
+}
 s_source() {
   # Registry preflight, BEFORE any cluster exists (read-only, ghcr only):
   # the chart must resolve at INSTALLER_VERSION and, with VERIFY483=1, its
@@ -820,7 +839,10 @@ s_login_contract() {
 # (kinds, counts, field paths, chart versions: no identity); what it could not
 # validate faithfully it names.
 s_schema() {
+  # run 26g: the CRD charts on ghcr.io are fetched with the ghcr pull token, by path (never read here), as
+  # the registry step reads every chart: an anonymous pull answered kagent-crds 0.1.6 with 401
   local args=(--installer-pulled "$OUT/installer-pulled" --workdir "$OUT/crd-charts"
+              --ghcr-env-file "$GHCR_PULL_ENV_FILE"
               --out "$OUT/crd-check.json" --users "$USERS" --namespaces "$NAMESPACES"
               --fresh-modes $FRESH_MODES --user-prefix "$BENCH_USER_PREFIX")
   [[ "$LOAD_DRIVER" == "k6" ]] && args+=(--fresh-classes --sessions "$BROWSER_SESSIONS"
@@ -2890,6 +2912,7 @@ host_load_preflight
 start_host_load
 log "run budget: ${budget_line}; fits TTL_HOURS=${TTL_HOURS} (${TTL_S} s; ${TTL_HOW}) minus ${TTL_MARGIN_S} s"
 log "k6 customers: K6_SPAN=${K6_SPAN}, DRIVE_S=${DRIVE_S} s, composite burst at ${COMPOSITE_BURST_AT_S} s"
+step apis      s_apis
 step source    s_source
 step login-contract s_login_contract
 step cert-manager-source s_cert_manager_source

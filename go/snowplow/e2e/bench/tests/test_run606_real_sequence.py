@@ -72,6 +72,8 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         return a[a.index(name) + 1] if name in a else None
     if a[:3] == ["auth", "print-access-token"]:                 # #985: the Cloud Quotas read
         print("fake-access-token"); sys.exit(0)
+    if a[:3] == ["services", "list", "--enabled"]:              # run 26g: the apis step (tests/fake_region.py)
+        answer_services()
     if a[:3] == ["container", "clusters", "list"]:
         print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
     if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)
