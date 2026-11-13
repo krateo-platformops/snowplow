@@ -8,6 +8,7 @@ package fakeapiserver
 // own keys. The run below drives every kind of request the fake answers.
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -94,6 +95,20 @@ func TestRequestLog_EveryLineIsARequestLineOrAListedEvent(t *testing.T) {
 	// the scripted status write, applied
 	h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"applied": true}}})
 	h.advance(2 * time.Second)
+	// watches that are not expired: a reflector's resume from its last resourceVersion, in the
+	// window (client-go re-watches from it on every timeout), and a legacy watch from "0"
+	var latest int
+	fmt.Sscan(incidentRV(h), &latest)
+	resume := h.watch(fmt.Sprintf("%s?watch=1&resourceVersion=%d", inc, latest-1), req{as: "sa"})
+	if e := resume.next(); e["type"] != "MODIFIED" {
+		t.Fatalf("the in-window resume's first event is %v, want MODIFIED", e["type"])
+	}
+	resume.cancel()
+	legacy := h.watch(inc+"?watch=1&resourceVersion=0", req{as: "sa"})
+	if e := legacy.next(); e["type"] != "ADDED" {
+		t.Fatalf("the legacy watch's first event is %v, want ADDED", e["type"])
+	}
+	legacy.cancel()
 
 	// the scripted status write, failed (applyStatus.failed)
 	f := newHarness(t, opts{edit: func(s map[string]any) {
