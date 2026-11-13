@@ -291,8 +291,8 @@ BOOT_DISK_TYPE = "pd-balanced"
 IMAGE_FAMILY, IMAGE_PROJECT = "debian-13", "debian-cloud"
 REPO_URL = "https://github.com/krateo-platformops/snowplow.git"
 MAX_TTL_HOURS = 72
-# the VM must outlive the run's own TTL by this much at launch: the launch-to-gke-up time, the pair's
-# verdicts after the last gke-down, and the fetch
+# the VM must outlive the run's own TTL and its measured statistics budget (#1390: statistics_budget) by this much
+# at launch: the launch-to-gke-up time and the fetch
 LAUNCH_MARGIN_S = 3600
 # vm606's own bounds, as they were before #1338 moved gcloud() into bench.gcevm (which has none of its own): any
 # gcloud call that names no timeout, and each SSH attempt of the bootstrap wait
@@ -828,7 +828,7 @@ def ensure_bucket(project: str, run: str, *, dry: bool) -> str:
 def cmd_fetch_evidence(a) -> int:
     """#1390: a launch's evidence from the bucket, verified, and its statistics re-run from it offline (the
     launcher's own statistics stage, bench.durable.rejudge): what a lost VM leaves is enough for its verdicts."""
-    dest = a.dest or str(evidence.data_root() / "runs" / "606" / f"durable-{a.launch}")
+    dest = a.dest or str(evidence.runs_root() / "606" / f"durable-{a.launch}")
     return durable.rejudge(durable.bucket_name(a.project), a.launch, dest, say=_say)
 
 
@@ -1436,6 +1436,8 @@ def _exports(env: dict[str, str]) -> str:
 _HASH_PY = ("python3 -c 'import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],\"rb\"); "
             "[h.update(b) for b in iter(lambda: f.read(1<<20), b\"\")]; print(h.hexdigest())'")
 _TTL_RX = r"bench\.gke gke-up .*--ttl-hours ([0-9]+)"
+# #1390: each run's planned k6 seconds, as its dry pass logs them (run606.sh: "k6 customers: K6_SPAN=..., DRIVE_S=N s")
+_DRIVE_RX = r"k6 customers: K6_SPAN=\S+, DRIVE_S=([0-9]+) s"
 
 
 def _bench_vars(sha: str) -> str:
@@ -1478,6 +1480,10 @@ hours = []
 for f in sorted(glob.glob(sys.argv[1] + "/dry-*/run.log")):
     hours += [int(m.group(1)) for m in re.finditer({_TTL_RX!r}, open(f).read())]
 print("VM606_RUN_TTL_HOURS=" + (str(max(hours)) if hours else ""))
+drive = []
+for f in sorted(glob.glob(sys.argv[1] + "/dry-*/run.log")):
+    drive += [int(m.group(1)) for m in re.finditer({_DRIVE_RX!r}, open(f).read())]
+print("VM606_RUN_K6_SECONDS=" + (str(max(drive)) if drive else ""))
 PY
 echo "VM606_PAIR_OUT=$PO"
 """)
@@ -1518,6 +1524,28 @@ while :; do
 done
 echo "VM606_PID=$pid"
 """)
+
+
+def statistics_records() -> list[str]:
+    """Every statistics.jsonl this laptop holds: each fetched launch's, each offline re-judge's (#1390)."""
+    root = evidence.runs_root() / "606"
+    return sorted(str(p) for p in root.rglob("statistics.jsonl")) if root.exists() else []
+
+
+def statistics_budget(k6_seconds: str | None, pairs: str) -> tuple[float, str]:
+    """#1390 item 3: the launch's statistics budget, measured (bench.statstime.budget over every recorded step and
+    the committed measurement), for its planned k6 seconds per arm (the dry pass) and its steps (each pair of
+    PAIRS: the replica's and every other pair's). Unknown refuses: a VM that cannot be shown to outlive its
+    statistics is not launched."""
+    if not (k6_seconds or "").isdigit():
+        raise Refused("the dry pass logged no planned k6 seconds (run606.sh's `k6 customers: K6_SPAN=..., DRIVE_S=N s`):"
+                      " the statistics budget is unknown")
+    from bench import statstime
+    secs, how = statstime.budget(statstime.load_records([statstime.MEASURED, *statistics_records()]),
+                                 k6_seconds_per_arm=float(k6_seconds), steps=len(pairs.split()))
+    if secs is None:
+        raise Refused(how)
+    return secs, how
 
 
 def cmd_launch(a) -> int:
@@ -1574,14 +1602,16 @@ def cmd_launch(a) -> int:
     if not (ttl or "").isdigit():
         raise Refused("the dry pass handed gke-up no --ttl-hours (no `bench.gke gke-up ... --ttl-hours N` in any "
                       f"dry-*/run.log under {vm_dir(run)}/dry): how long the run lasts is unknown")
+    stats_s, stats_how = statistics_budget(_marker(out, "VM606_RUN_K6_SECONDS"), env["PAIRS"])
     inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
-    need = int(ttl) * 3600 + LAUNCH_MARGIN_S
+    need = int(ttl) * 3600 + stats_s + LAUNCH_MARGIN_S
     if left is None or left < need:
         raise Refused(f"{name} is deleted in {'an unknown time' if left is None else f'{left / 3600:.1f} h'}; the run's "
-                      f"TTL is {ttl} h and the launch needs {need / 3600:.1f} h with the margin: `down` it and `up` "
-                      f"with --ttl-hours >= {-(-need // 3600)}")
-    _say(f"the run's TTL {ttl} h + margin fits the VM's {left / 3600:.1f} h left")
+                      f"TTL is {ttl} h, its {stats_how}, and the launch needs {need / 3600:.1f} h with the "
+                      f"{LAUNCH_MARGIN_S} s margin: `down` it and `up` with --ttl-hours >= {-(-int(need) // 3600)}")
+    _say(f"the run's TTL {ttl} h + its {stats_how} + the {LAUNCH_MARGIN_S} s margin fit the VM's "
+         f"{left / 3600:.1f} h left")
     rc, out, err = ssh(name, project, zone, go, timeout=a.started_timeout_s + 300)
     for ln in _remote_lines(out):
         if ln.startswith("vm606:") or ln.startswith("detached:"):
@@ -1591,7 +1621,8 @@ def cmd_launch(a) -> int:
     started = _marker(out, "VM606_STARTED") or "unknown"
     _save_state(run, launched_at=time.time(), bench_sha=a.bench_sha, bench_zone=a.bench_zone, runs=names, pair=pair,
                 pair_out=pair_out,
-                pin_manifest=pin.name, pin_sha256=got, run_ttl_hours=int(ttl), started=started, fetched=False)
+                pin_manifest=pin.name, pin_sha256=got, run_ttl_hours=int(ttl), started=started, fetched=False,
+                statistics_budget_s=round(stats_s), statistics_budget=stats_how)
     if started != "ok":
         raise Refused(f"the launcher on {name} did not get every run past its paid-only checks ({started}; the lines "
                       f"above say why). Whatever it wrote is on the VM: `fetch` it, or `down --discard-unfetched`")

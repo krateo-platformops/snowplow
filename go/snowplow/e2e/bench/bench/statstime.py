@@ -65,6 +65,50 @@ def record(path: str, *, step: str, command: str, started: float, ended: float, 
     return rec
 
 
+# ─── the statistics budget a launch needs, measured (#1390 item 3) ──────────
+#
+# A launch's VM must outlive its arms AND its statistics. The budget is measured, never a fixed knob: from every
+# recorded statistics step (statistics.jsonl, written by each launch; the measurement committed beside the bench,
+# statistics_measured.jsonl, until a launch on this code has recorded its own):
+#   - the slowest rate seen, seconds per byte of input (a step that read nothing is no rate);
+#   - the input a step reads per k6-second of its two arms, the largest seen;
+# and from the launch's own plan: the k6 seconds of each arm (each run's DRIVE_S, from its dry pass) and its
+# statistics steps (the replica and every pair, each reading its two arms). The budget is
+#   steps x (2 arms x k6 seconds x bytes per k6-second) x seconds per byte.
+
+MEASURED = Path(__file__).resolve().parent.parent / "statistics_measured.jsonl"
+
+
+def load_records(paths) -> list[dict]:
+    out = []
+    for p in paths:
+        try:
+            for line in Path(p).read_text().splitlines():
+                r = json.loads(line)
+                if isinstance(r, dict) and r.get("kind") == "statistics_step" and r.get("exit") == 0:
+                    out.append(r)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def budget(records: list[dict], *, k6_seconds_per_arm: float, steps: int) -> tuple[float | None, str]:
+    """(seconds, how) the launch's statistics are budgeted, or (None, why it is unknown)."""
+    rates = [r["seconds"] / r["input_bytes"] for r in records
+             if isinstance(r.get("input_bytes"), int) and r["input_bytes"] > 0 and r.get("seconds", 0) > 0]
+    density = [r["input_bytes"] / r["k6_seconds"] for r in records
+               if isinstance(r.get("input_bytes"), int) and r["input_bytes"] > 0 and (r.get("k6_seconds") or 0) > 0]
+    if not rates or not density:
+        return None, ("no recorded statistics step measures both a duration and its input (statistics.jsonl): the "
+                      "statistics budget is unknown")
+    rate, dens = max(rates), max(density)
+    per_step = 2 * k6_seconds_per_arm * dens
+    secs = steps * per_step * rate
+    return secs, (f"statistics budget {secs:.0f} s: {steps} step(s) x {per_step / 1e6:.0f} MB of input (2 arms x "
+                  f"{k6_seconds_per_arm:.0f} k6-seconds x {dens / 1e3:.1f} kB per k6-second, the most recorded) x "
+                  f"{rate * 1e9:.1f} s per GB (the slowest of {len(rates)} recorded step(s))")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.statstime")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -77,7 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ended", type=float, required=True)
     p.add_argument("--exit", type=int, required=True, dest="rc")
     p.add_argument("dirs", nargs="+")
+    p = sub.add_parser("budget", help="#1390: the statistics budget of a launch, from every recorded step")
+    p.add_argument("--k6-seconds", type=float, required=True, help="each arm's planned k6 seconds (the most)")
+    p.add_argument("--steps", type=int, required=True, help="the launch's statistics steps (replica + pairs)")
+    p.add_argument("records", nargs="*", help="statistics.jsonl files (the committed measurement always counts)")
     a = ap.parse_args(argv)
+    if a.cmd == "budget":
+        secs, how = budget(load_records([MEASURED, *a.records]), k6_seconds_per_arm=a.k6_seconds, steps=a.steps)
+        print(how, file=sys.stdout if secs is not None else sys.stderr)
+        return 0 if secs is not None else 2
     if a.cmd == "input-bytes":
         print(input_bytes(a.dirs))
         return 0

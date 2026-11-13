@@ -424,6 +424,8 @@ if [ "${BENCH_606_DRY_RUN:-0}" = 1 ]; then
   mkdir -p "$PAIR_OUT/dry-N1" "$PAIR_OUT/dry-N2"
   echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N1 --ttl-hours 13 --yes" > "$PAIR_OUT/dry-N1/run.log"
   echo "[06:52:59] DRY: bounded 1800 python3 -m bench.gke gke-up --name $RUN_NAME_N2 --ttl-hours 12 --yes" > "$PAIR_OUT/dry-N2/run.log"
+  echo "[06:52:59] k6 customers: K6_SPAN=churn, DRIVE_S=${STUB_DRIVE_S:-16170} s, composite burst at 900 s" >> "$PAIR_OUT/dry-N1/run.log"
+  echo "[06:52:59] k6 customers: K6_SPAN=churn, DRIVE_S=${STUB_DRIVE_S2:-14000} s, composite burst at 900 s" >> "$PAIR_OUT/dry-N2/run.log"
   echo "DRY: all 2 runs would start now"
   exit 0
 fi
@@ -533,7 +535,8 @@ def test_launch_starts_the_launcher_detached_and_it_survives_the_session(fake, c
     rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha))
     assert rc == 0, err + out
     assert f"vm606: bench checkout at {sha}" in out and "vm606: dry pass OK" in out   # the dry pass read stdin
-    assert "the run's TTL 13 h + margin fits" in out                       # the larger of the runs' TTLs
+    assert "the run's TTL 13 h + its statistics budget " in out           # the larger of the runs' TTLs
+    assert " + the 3600 s margin fit the VM's" in out
     assert "launched on" in out and "every run passed its paid-only checks" in out
     pid = int((r / "launch.pid").read_text())
     # launch returned while the launcher still waits for its release: it did not wait for it. The session
