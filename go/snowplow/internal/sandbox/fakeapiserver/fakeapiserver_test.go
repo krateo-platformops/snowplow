@@ -501,6 +501,11 @@ func TestStrategicMergePatchIsLoud(t *testing.T) {
 	}
 }
 
+// statusWrite is the request line of the scripted /status write: the ServiceAccount's patch.
+func statusWrite(l map[string]any) bool {
+	return l["verb"] == "patch" && l["resource"] == "incidents/status" && l["identity"] == "sa"
+}
+
 func logged(h *harness, f func(map[string]any) bool) bool {
 	for _, l := range h.log() {
 		if f(l) {
@@ -521,7 +526,7 @@ func TestApplyStatusV1(t *testing.T) {
 	eq(t, w.next()["type"], "MODIFIED", "the visitor's event")
 	gen := get(wr.body, "metadata", "generation")
 	h.advance(1499 * time.Millisecond)
-	if logged(h, func(l map[string]any) bool { return l["applyStatus"] != nil }) {
+	if logged(h, statusWrite) {
 		t.Fatal("applyStatus fired before afterMs")
 	}
 	h.advance(time.Millisecond)
@@ -531,23 +536,23 @@ func TestApplyStatusV1(t *testing.T) {
 	eq(t, get(mod, "object", "metadata", "generation"), gen, "a status write keeps generation")
 	n := 0
 	for _, l := range h.log() {
-		if l["applyStatus"] == "resolve-on-applied" {
+		if statusWrite(l) {
 			n++
 		}
 	}
-	eq(t, n, 1, "one applyStatus line")
+	eq(t, n, 1, "one status write by the ServiceAccount")
 	w.quiet()
 
 	g := newHarness(t, opts{})
 	g.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"other": 1}}})
 	g.advance(5 * time.Second)
-	if logged(g, func(l map[string]any) bool { return l["applyStatus"] != nil }) {
+	if logged(g, statusWrite) {
 		t.Fatal("fired without the match")
 	}
 	r := newHarness(t, opts{})
 	r.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: "application/json", body: map[string]any{"spec": map[string]any{"applied": true}}})
 	r.advance(5 * time.Second)
-	if logged(r, func(l map[string]any) bool { return l["applyStatus"] != nil }) {
+	if logged(r, statusWrite) {
 		t.Fatal("a refused write fired a rule")
 	}
 }
