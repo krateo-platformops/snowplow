@@ -299,6 +299,57 @@ func TestExternalFlight1320_LeaderBudgetDoesNotCutTheCall(t *testing.T) {
 	}
 }
 
+// A read that arrives after EVERY earlier waiter of a call gave up on its
+// budget still joins that call: it runs to its deadline (the ruling), so it is
+// in flight with nobody waiting. The joiner's own budget bounds its own wait
+// exactly: its own 504 at its own deadline, not before (the call's age is not
+// charged to it) and not after; and the call still answers a later reader
+// from the one dial.
+func TestExternalFlight1320_JoinerOfACallEveryWaiterLeftWaitsItsOwnBudget(t *testing.T) {
+	c := testFlightCache(t)
+	o := newHeldOrigin(t, false)
+	opts := o.opts(endpoints.Endpoint{Token: "alice"}, http.MethodGet)
+	lctx := pagebudget.WithCustomer(context.Background(), time.Now().Add(200*time.Millisecond-pagebudget.PageMaxGoal))
+	lr := recv(t, goFetch(c, lctx, opts), "budgeted leader")
+	var be *pagebudget.ExhaustedError
+	if !errors.As(lr.err, &be) {
+		t.Fatalf("budgeted leader err = %v; want its own ExhaustedError", lr.err)
+	}
+	// SETUP: nobody waits any more, and the call is still in flight, joinable.
+	if !eventually(5*time.Second, func() bool { return o.requests.Load() == 1 }) || c.externalFlightsInFlight() != 1 {
+		t.Fatalf("SETUP: origin saw %d dials, %d joinable calls; want 1 and 1", o.requests.Load(), c.externalFlightsInFlight())
+	}
+
+	const left = 400 * time.Millisecond
+	deadline := time.Now().Add(left)
+	jctx := pagebudget.WithCustomer(context.Background(), deadline.Add(-pagebudget.PageMaxGoal))
+	jr := recv(t, goFetch(c, jctx, opts), "late joiner")
+	if joined, dials := c.flightJoined.Load(), o.requests.Load(); joined != 1 || dials != 1 {
+		t.Fatalf("late read: joined=%d dials=%d; want it to join the call already in flight (1, 1)", joined, dials)
+	}
+	be = nil
+	if !errors.As(jr.err, &be) || be.Result != pagebudget.ExhaustedAnswer {
+		t.Fatalf("late joiner err = %v; want its own ExhaustedError (exhausted_answer)", jr.err)
+	}
+	if jr.st == nil || jr.st.Code != http.StatusGatewayTimeout || string(jr.st.Reason) != credhttp.BudgetStatusReason {
+		t.Fatalf("late joiner status = %+v; want 504 Timeout", jr.st)
+	}
+	if jr.at.Before(deadline) {
+		t.Fatalf("late joiner was cut %v BEFORE its own deadline: the call's age was charged to it", deadline.Sub(jr.at))
+	}
+	if late := jr.at.Sub(deadline); late > time.Second {
+		t.Fatalf("late joiner was cut %v after its own deadline", late)
+	}
+
+	later := goFetch(c, context.Background(), opts)
+	eventually(5*time.Second, func() bool { return c.flightJoined.Load() == 2 })
+	o.open()
+	mustOK(t, recv(t, later, "later joiner"), "later joiner")
+	if got := o.requests.Load(); got != 1 {
+		t.Fatalf("origin saw %d dials; want 1", got)
+	}
+}
+
 // A cancelled leader request → joiners unaffected: the call runs on, and every
 // joiner gets the answer from the one dial.
 func TestExternalFlight1320_CancelledLeaderLeavesJoinersUnaffected(t *testing.T) {

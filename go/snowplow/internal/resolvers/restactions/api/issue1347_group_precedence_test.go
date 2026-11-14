@@ -28,6 +28,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -230,7 +231,7 @@ func TestIssue1347_P5_AResolvedStageWithADenialAndACutReadsTheCut(t *testing.T) 
 	})
 	t.Cleanup(func() { close(release) })
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(srv.srv.URL)})
-	for _, tc := range []struct {
+	for i, tc := range []struct {
 		items []any
 		want  string
 	}{
@@ -240,7 +241,14 @@ func TestIssue1347_P5_AResolvedStageWithADenialAndACutReadsTheCut(t *testing.T) 
 		{[]any{"fail", "deny"}, StageReasonError},
 	} {
 		before := len(srv.all())
-		st := x1106Stage("each", http.MethodGet, `${ "/x/" + .p }`)
+		flightBefore := ExternalFetchFlightSnapshot()
+		// Each case reads its own paths (/x<i>/…). An identical read joins a
+		// call still in flight (#1320), and the hung "cut" call of one case
+		// runs on after its page was cut (to the server write deadline): on a
+		// shared path the next case's "cut" would join it instead of being
+		// sent, and this arm is about one resolve's own two answers.
+		prefix := fmt.Sprintf("/x%d/", i)
+		st := x1106Stage("each", http.MethodGet, `${ "`+prefix+`" + .p }`)
 		st.ContinueOnError = ptr.To(true)
 		st.DependsOn = &templates.Dependency{Name: "", Iterator: ptr.To(`[ .ps[] | {p: .} ]`)}
 		ctx := xcontext.BuildContext(context.Background(),
@@ -258,8 +266,8 @@ func TestIssue1347_P5_AResolvedStageWithADenialAndACutReadsTheCut(t *testing.T) 
 			sent[h.Path] = true
 		}
 		for _, p := range tc.items {
-			if !sent["/x/"+p.(string)] {
-				t.Fatalf("SETUP (%v): item %v was not sent: %+v", tc.items, p, srv.all()[before:])
+			if !sent[prefix+p.(string)] {
+				t.Fatalf("SETUP (%v): item %v was not sent: %+v (external read flight before %+v, after %+v)", tc.items, p, srv.all()[before:], flightBefore, ExternalFetchFlightSnapshot())
 			}
 		}
 		// PRE: the errorKey holds both items' answers, the 403 among them.
