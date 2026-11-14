@@ -12,12 +12,13 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// reasonFailedDependency is the Status reason of a 424 answer. Neither
-// plumbing nor apimachinery names one for 424.
-const reasonFailedDependency response.StatusReason = "FailedDependency"
+// reasonFailedDependency is the Status reason of a 424 answer: the read's own
+// (objects.ReasonFailedDependency), so there is one definition.
+const reasonFailedDependency = objects.ReasonFailedDependency
 
 // encodeWidgetResolveError answers a widget /call whose CR was read but whose
 // resolve failed — the apiRef RESTAction, one of its stages, a nested resolve,
@@ -63,7 +64,16 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 		response.Encode(wri, st)
 		return
 	}
-	response.Encode(wri, response.New(code, fmt.Errorf("%s", statusErr.Status().Message)))
+	st := response.New(code, fmt.Errorf("%s", statusErr.Status().Message))
+	if code == http.StatusFailedDependency {
+		// #1414 — a dependency whose TYPE is not installed (objects.Get's 424)
+		// is already the answer this function gives for a dependency that is
+		// not there. It keeps its status, its reason and its message, which
+		// names the type and nothing else.
+		st.Status = response.StatusFailure
+		st.Reason = reasonFailedDependency
+	}
+	response.Encode(wri, st)
 }
 
 // dependencyFailureFallback is the 424 message when the dependency's own

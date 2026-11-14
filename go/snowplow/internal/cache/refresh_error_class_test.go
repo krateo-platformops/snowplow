@@ -10,6 +10,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -54,6 +55,12 @@ func TestIssue608_ClassifyRefreshError(t *testing.T) {
 		{"403 at refetch", fmt.Errorf("resolveAndPopulateL1 widgets/x: %w",
 			WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x", apierrors.NewForbidden(schema.GroupResource{Resource: "flexes"}, "x", errors.New("no")))),
 			RefreshErrForbidden, ResolveStageRefetch, true},
+		// #1414 — a type the apiserver does not serve (objects.Get's 424) is its
+		// own class: never not_found, and it keeps the budget.
+		{"424 type not installed at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
+			&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 424, Reason: "FailedDependency",
+				Message: "The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster."}}),
+			RefreshErrTypeNotInstalled, ResolveStageRefetch, false},
 		{"404 at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
 			apierrors.NewNotFound(schema.GroupResource{Resource: "flexes"}, "x")), RefreshErrNotFound, ResolveStageRefetch, false},
 	} {
