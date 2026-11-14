@@ -21,7 +21,8 @@ const (
 	// forwarded: a krateo.* span carries at most 4 allowlisted attributes
 	// (its row of spanAllowlist: the 3 http.* keys, plus
 	// krateo.interaction.abandoned on an interaction span; the claim family
-	// and outcome on krateo.agentiko.claim.unbacked), and the browser fetch
+	// and outcome on krateo.agentiko.claim.unbacked; the method, status,
+	// route and A2A method on krateo.agentiko.a2a), and the browser fetch
 	// instrumentation adds about ten more, all dropped. 64 leaves room for
 	// both.
 	MaxAttributesPerSpan = 64

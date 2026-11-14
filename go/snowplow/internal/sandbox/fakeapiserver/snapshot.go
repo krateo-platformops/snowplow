@@ -62,10 +62,13 @@ type Rule struct {
 	Stamp   []string        `json:"stamp,omitempty"`
 }
 
-// target is a rule's resolved target; trigger means "the written object".
+// target is a rule's resolved target; trigger means "the written object", which fireRules resolves
+// to that object: its name and its UID, so the write is for the object the rule fired on and not for
+// another one that has taken its name since.
 type target struct {
 	Trigger                          bool
 	Group, Resource, Namespace, Name string
+	UID                              string
 }
 
 func (r Rule) target() (target, error) {

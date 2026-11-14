@@ -11,13 +11,18 @@
 // http.route is a second guard on an already allowlisted value, never the only
 // one.
 //
-// Six span names are forwarded, each with its own attribute set
+// Seven span names are forwarded, each with its own attribute set
 // (spanAllowlist): krateo.widget.fetch and the four page-level spans carry the
 // http.* keys (and the three interaction spans krateo.interaction.abandoned,
 // #1060); krateo.agentiko.claim.unbacked carries ONLY
 // krateo.agentiko.claim.family and krateo.agentiko.claim.outcome, each a
 // lower-case token (^[a-z][a-z0-9_]{0,31}$, claimToken), and no http.*,
-// session, conversation or identity key. An attribute that is not in its
+// session, conversation or identity key; krateo.agentiko.a2a (#1398) carries
+// ONLY http.request.method (exactly POST, postMethod),
+// http.response.status_code (statusCode), http.route (routeTemplate) and
+// krateo.a2a.method (one of message/stream, message/send, tasks/get,
+// tasks/resubscribe, a2aMethod), and no session, conversation or identity
+// key. An attribute that is not in its
 // span's set, or whose value fails the key's check, is dropped and counted;
 // the span is still forwarded.
 //
@@ -54,6 +59,13 @@ const (
 	// that is not backed (contract agreed with the frontend, 2026-11-09). It
 	// carries only AttrClaimFamily and AttrClaimOutcome.
 	SpanAgentikoClaimUnbacked = "krateo.agentiko.claim.unbacked"
+	// SpanAgentikoA2A is the portal's fetch span for one of the agent's
+	// JSON-RPC POSTs under the Agentiko A2A base (contract agreed with the
+	// frontend, #1398, 2026-11-13): the auto fetch span, renamed by the
+	// frontend's span processor, so the gateway's POST /api/a2a/* span is its
+	// child. It carries only AttrMethod (exactly POST), AttrStatus, AttrRoute
+	// (a template) and AttrA2AMethod.
+	SpanAgentikoA2A = "krateo.agentiko.a2a"
 )
 
 // Attribute keys a forwarded span may carry; spanAllowlist says on which span
@@ -77,6 +89,9 @@ const (
 	// (claimToken), never free text, an id or an identity.
 	AttrClaimFamily  = "krateo.agentiko.claim.family"
 	AttrClaimOutcome = "krateo.agentiko.claim.outcome"
+	// AttrA2AMethod is the A2A JSON-RPC method of a krateo.agentiko.a2a span
+	// (#1398): one of a closed set (a2aMethods), never free text.
+	AttrA2AMethod = "krateo.a2a.method"
 )
 
 // valueCheck returns the value to forward for one attribute, rebuilt from the
@@ -91,7 +106,8 @@ type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
 // is dropped and counted (attributes_dropped).
 //
 //   - The http.* keys are allowed on krateo.widget.fetch and the four
-//     page-level spans, never on krateo.agentiko.claim.unbacked. http.route
+//     page-level spans (and, with the checks below, on krateo.agentiko.a2a),
+//     never on krateo.agentiko.claim.unbacked. http.route
 //     has two checks (Diego, 2026-10-30, #1020 F3: "exact where possible,
 //     trust the rest"):
 //     on krateo.widget.fetch it names a snowplow route, so it must be EXACTLY
@@ -105,6 +121,13 @@ type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
 //     allowed only on krateo.agentiko.claim.unbacked, and only as a string
 //     token (claimToken); that span carries no other attribute (frontend
 //     contract, 2026-11-09).
+//   - krateo.agentiko.a2a carries http.request.method, but only as exactly
+//     POST (postMethod: the availability-probe GET is never exported, so any
+//     other method breaks the contract), http.response.status_code
+//     (statusCode; an aborted stream omits it and sends span status ERROR),
+//     http.route as a template (routeTemplate: the A2A route is the
+//     gateway's, not snowplow's, so registeredRoute cannot apply), and
+//     krateo.a2a.method from a closed set (a2aMethod). No other key (#1398).
 var spanAllowlist = map[string]map[string]valueCheck{
 	SpanWidgetFetch: {
 		AttrRoute: registeredRoute, AttrMethod: methodToken, AttrStatus: statusCode,
@@ -126,6 +149,10 @@ var spanAllowlist = map[string]map[string]valueCheck{
 	},
 	SpanAgentikoClaimUnbacked: {
 		AttrClaimFamily: claimToken, AttrClaimOutcome: claimToken,
+	},
+	SpanAgentikoA2A: {
+		AttrMethod: postMethod, AttrStatus: statusCode, AttrRoute: routeTemplate,
+		AttrA2AMethod: a2aMethod,
 	},
 }
 
@@ -149,6 +176,30 @@ func routeTemplate(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
 // methodToken: a string that is an upper-case HTTP method token.
 func methodToken(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
 	if s := v.StringValue; s != nil && methods[*s] {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// postMethod: exactly the string POST (no other member of the value, as
+// claimToken). Any other method, a lower-case "post" included, is dropped.
+func postMethod(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && v.members == 1 && *s == "POST" {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// a2aMethods is the closed set of A2A JSON-RPC methods the portal sends on
+// krateo.agentiko.a2a (frontend contract, #1398).
+var a2aMethods = map[string]bool{
+	"message/stream": true, "message/send": true, "tasks/get": true, "tasks/resubscribe": true,
+}
+
+// a2aMethod: exactly a string (no other member of the value, as claimToken)
+// that is one of a2aMethods. Anything else is dropped, never coerced.
+func a2aMethod(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && v.members == 1 && a2aMethods[*s] {
 		return strValue(*s), true
 	}
 	return nil, false
