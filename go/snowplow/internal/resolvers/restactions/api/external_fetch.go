@@ -361,8 +361,10 @@ func nonOKStatus(code int, dat []byte) *response.Status {
 	if len(bytes.TrimSpace(dat)) == 0 {
 		return failureStatus(code, fmt.Errorf("upstream answered %d %s with an empty body", code, http.StatusText(code)))
 	}
-	res := &response.Status{}
-	if jerr := json.Unmarshal(dat, res); jerr != nil {
+	// #1429 — the upstream's envelope without its "details"
+	// (credhttp.DecodeUpstreamStatus, the one decoder of an upstream body).
+	res := credhttp.DecodeUpstreamStatus(dat)
+	if res == nil {
 		return failureStatus(code, fmt.Errorf("%s", string(dat)))
 	}
 	// #714 — the status line is the truth: a body cannot claim another code,
