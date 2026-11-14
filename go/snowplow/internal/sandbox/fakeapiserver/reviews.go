@@ -187,8 +187,16 @@ func (s *Server) fireRules(c *reqCtx, verb string, stored map[string]any) {
 	}
 }
 
-// applyStatus is a controller's status write: as the ServiceAccount, through the /status path's
-// rules, one MODIFIED event to every matching watch.
+// applyStatus is the simulated controller's status write. On a cluster a controller with its own
+// identity writes the status of the objects it reconciles; here the rule stands for it. The write is
+// not a request and is nobody's credential: it is not authorised as snowplow's ServiceAccount (whose
+// rights are the reference cluster's, read-only) nor as the visitor, and it grants neither anything.
+// It is bound to what the rule declares, structurally: the one target object, and its status
+// subresource only. A target whose kind serves no /status is refused (the 404 a request for that
+// path gets), and restrict keeps every field outside .status as stored, as the /status path does
+// for a request. It goes through the /status path's rules (coerced and validated against the CRD,
+// 400 and 422), and sends one MODIFIED event to every matching watch. Its request line says
+// identity controller, which no request's line can say (authenticate).
 func (s *Server) applyStatus(rule Rule, t target) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,13 +243,13 @@ func (s *Server) applyStatus(rule Rule, t target) {
 		gv = loc.version
 	}
 	c := &reqCtx{group: t.Group, version: loc.version, gv: gv, resource: t.Resource, subresource: "status", ns: t.Namespace, name: t.Name, gr: gr, api: loc.api}
-	// The scripted write's request line is a plain one: the ServiceAccount's patch of /status.
+	// The scripted write's request line: the controller's patch of /status.
 	line := requestLine("")
-	line["verb"], line["group"], line["version"], line["resource"], line["namespace"], line["name"], line["status"], line["identity"] = "patch", t.Group, loc.version, t.Resource+"/status", t.Namespace, t.Name, 200, "sa"
-	if !s.authz.allowed(s.sa, attributes{Verb: "patch", Group: t.Group, Resource: t.Resource, Subresource: "status", Namespace: t.Namespace, Name: t.Name}) {
-		line["status"] = 403
+	line["verb"], line["group"], line["version"], line["resource"], line["namespace"], line["name"], line["status"], line["identity"] = "patch", t.Group, loc.version, t.Resource+"/status", t.Namespace, t.Name, 200, labelController
+	if !s.hasStatus(c) {
+		line["status"] = 404
 		s.o.Log(line)
-		fail("", fmt.Sprintf("the ServiceAccount may not patch %s/status", t.Resource))
+		fail("", fmt.Sprintf("%s has no status subresource: a rule writes its target's status and nothing else", t.Resource))
 		return
 	}
 	coerced, _, err := s.coerceCustomResource(c, next, "Ignore")
