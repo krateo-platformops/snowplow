@@ -853,7 +853,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         sys.exit(0)
     if a[:2] == ["top", "pod"]:
         print("snowplow-abc 120m 650Mi"); sys.exit(0)
-    if a[:1] == ["cp"] and any("mem606" in x for x in a):
+    # the SOURCE pod, never the destination path: a test whose own name holds "mem606" (its tmp dir) had its
+    # driver-results copy answered as this one, a directory where nav-<pod>.jsonl belongs; evaluate died on
+    # it, and nothing noticed until a run without a verdict stopped ending well (#1422)
+    if a[:1] == ["cp"] and any(x.startswith("mem606") and ":" in x for x in a):
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")

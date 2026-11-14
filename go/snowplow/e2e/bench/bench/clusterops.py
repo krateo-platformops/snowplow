@@ -83,7 +83,8 @@ CONTROL_TYPE = "CREATE_CLUSTER"
 CONTROL_SKEW_S = 120.0
 CREATED_KEY = "cluster_created"
 
-_TARGET = re.compile(r"/(?:locations|zones)/([^/]+)/clusters/([^/]+)(?:/nodePools/([^/]+))?$")
+# the one form GKE gave every target of the 225 operations read on 2026-11-14 (a regional listing)
+_TARGET = re.compile(r"/projects/[^/]+/locations/([^/]+)/clusters/([^/]+)(?:/nodePools/([^/]+))?$")
 # gcloud's own log lines on stderr: a listing that exits 0 with one did not answer cleanly (a partial
 # result is announced this way, as `container clusters list` announces its missing zones)
 _GCLOUD_COMPLAINT = re.compile(r"^(ERROR|WARNING):", re.M)
@@ -105,12 +106,30 @@ def list_command(spec: gke.ClusterSpec) -> list[str]:
             "--format", "json"]
 
 
+class Ambiguous(ValueError):
+    """An operation whose target cannot be told to be this cluster's or not."""
+
+
 def target_of(op: dict, spec: gke.ClusterSpec) -> str | None:
     """"cluster" or "nodePool/<pool>" when `op` targets THIS cluster (exact name, in its region) or one
-    of its node pools; None for any other target."""
-    m = _TARGET.search(str(op.get("targetLink") or ""))
-    if m is None or m.group(1) != spec.region or m.group(2) != spec.name:
+    of its node pools; None for another target. Raises Ambiguous for an operation that cannot be placed:
+    no target link, a link that names this cluster in any other form than
+    .../locations/<region>/clusters/<name>[/nodePools/<pool>] (a zonal form, a trailing slash), or this
+    cluster's name in another location (the listing asked for is the region's). Dropping such an
+    operation would read as "it did not happen"."""
+    link = op.get("targetLink")
+    if not isinstance(link, str) or not link:
+        raise Ambiguous("it has no target link")
+    m = _TARGET.search(link)
+    if m is None:
+        if spec.name in link.split("/"):
+            raise Ambiguous(f"its target names {spec.name} in a form that is not "
+                            f".../locations/{spec.region}/clusters/{spec.name}")
         return None
+    if m.group(2) != spec.name:
+        return None
+    if m.group(1) != spec.region:
+        raise Ambiguous(f"its target is {spec.name} in {m.group(1)}, and the listing asked for is {spec.region}'s")
     return f"nodePool/{m.group(3)}" if m.group(3) else "cluster"
 
 
@@ -181,8 +200,19 @@ def read(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "",
         got = None
     if not isinstance(got, list) or not all(isinstance(o, dict) for o in got):
         return _unreadable(spec, now(), f"{' '.join(argv[:4])} exited 0 and answered no JSON list of operations")
-    ops = sorted((operation(o, t) for o in got if (t := target_of(o, spec)) is not None),
-                 key=lambda o: (o["start_t"] is None, o["start_t"] or 0.0, str(o["id"])))
+    ops, unplaced = [], []
+    for o in got:
+        try:
+            t = target_of(o, spec)
+        except Ambiguous as e:
+            unplaced.append(f"{o.get('name')} ({o.get('operationType')}): {e}")
+            continue
+        if t is not None:
+            ops.append(operation(o, t))
+    if unplaced:
+        return _unreadable(spec, now(), f"{len(unplaced)} operation(s) of the listing cannot be told to be "
+                                        f"{spec.name}'s or not: {'; '.join(unplaced[:5])}")
+    ops.sort(key=lambda o: (o["start_t"] is None, o["start_t"] or 0.0, str(o["id"])))
     held = f"the listing holds {len(got)} operation(s), {len(ops)} of them of {spec.name} in {spec.region}"
     if created is None:
         return _unreadable(spec, now(), f"{created_why or 'the creation time of the cluster is not known'}: "
@@ -245,11 +275,12 @@ def load(path: str | None) -> tuple[dict | None, str]:
     return rec, ""
 
 
-def report(path: str | None, phases: list[tuple[str, float | None, float | None]]) -> dict:
+def report(path: str | None, phases: list[tuple[str, float | None, float | None]], blocks=None) -> dict:
     """report["cluster_operations_report_only"] of one run: the record's operations and, per measured
     phase (name, start, end: unix seconds), its outcome. UNKNOWN for every phase when the operations
     could not be read (no record, an UNREADABLE one, an operation with no start time), and for one
-    phase when its own start or end is not recorded."""
+    phase when its own start or end is not recorded. `blocks`: (k6 span, gate windows, block seconds,
+    custlat's split of an interval by phase), for the per-block marks (block_marks)."""
     rec, why = load(path)
     if rec is not None and not rec.get("readable"):
         why = str(rec.get("unreadable") or "the record says neither readable nor why not")
@@ -289,6 +320,62 @@ def report(path: str | None, phases: list[tuple[str, float | None, float | None]
             said = SAID_OVERLAPPED + "; ".join(op_text(o) for o in row["by"]) if row["by"] else SAID_NONE
         out["phases"].append(row)
         out["lines"].append(f"INFO cluster operations, phase {name} [{stamp(t0)}..{stamp(t1)}]: {said}")
+    if blocks is not None:
+        span, wins, block_s, split = blocks
+        out["blocks"] = block_marks(ops if not why else None, why or None, span, wins, block_s, split)
+        out["lines"] += block_lines(out["blocks"], ops if not why else None)
+    return out
+
+
+def block_marks(ops: list[dict] | None, why: str | None, span, wins, block_s: float, seconds_by_phase) -> dict:
+    """The latency blocks the pair statistics use (bench/custlat.py blocks: BLOCK_S blocks on a grid from
+    the customers' first call to their last), each marked NONE / OVERLAPPED / UNKNOWN, counted per gate
+    phase (a block counts in every phase it holds time of, as custlat counts it), and the stretches of
+    consecutive overlapped blocks with the operations over them. `seconds_by_phase(a, b)`: custlat's
+    split of [a, b) by phase. UNKNOWN for every block when the operations could not be read."""
+    if not span:
+        return {"state": "NO_BLOCKS", "why": "the run has no customer calls (no k6 span): no latency block"}
+    t0, t1 = float(span[0]), float(span[1])
+    nb = int((t1 - t0) // block_s) + 1
+    out: dict = {"block_s": block_s, "span": [t0, t1], "blocks": nb, "by_phase": {}, "stretches": []}
+    if why:
+        return dict(out, state=UNKNOWN, why=why, overlapped=None)
+    hit, cur = 0, None
+    for k in range(nb):
+        a = t0 + k * block_s
+        b = min(a + block_s, t1) if k < nb - 1 else max(t1, a)
+        by = [o["id"] for o in ops if o["start_t"] < max(b, a + 1e-9) and (o.get("end_t") is None or o["end_t"] > a)]
+        for p, secs in seconds_by_phase(a, max(b, a + 1e-9)).items():
+            if secs > 0:
+                row = out["by_phase"].setdefault(p, {"blocks": 0, "overlapped": 0})
+                row["blocks"] += 1
+                row["overlapped"] += bool(by)
+        if not by:
+            cur = None
+            continue
+        hit += 1
+        if cur is not None and cur["by"] == by:
+            cur["t1"], cur["blocks"] = b, cur["blocks"] + 1
+        else:
+            cur = {"t0": a, "t1": b, "blocks": 1, "by": by}
+            out["stretches"].append(cur)
+    return dict(out, state="READ", overlapped=hit)
+
+
+def block_lines(marks: dict, ops: list[dict] | None) -> list[str]:
+    head = "INFO cluster operations, latency blocks"
+    if marks.get("state") == "NO_BLOCKS":
+        return [f"{head}: none to mark ({marks['why']})"]
+    if marks.get("state") != "READ":
+        return [f"{head} ({marks['blocks']} of {marks['block_s']:g} s): {SAID_UNKNOWN}{marks.get('why')}"]
+    names = {o["id"]: o for o in ops or []}
+    per = ", ".join(f"{p} {r['overlapped']} of {r['blocks']}" for p, r in marks["by_phase"].items())
+    out = [f"{head}: {marks['overlapped']} of {marks['blocks']} blocks of {marks['block_s']:g} s overlapped by an "
+           f"operation ({per})" if marks["overlapped"] else
+           f"{head}: {SAID_NONE} any of the {marks['blocks']} blocks of {marks['block_s']:g} s ({per})"]
+    for st in marks["stretches"]:
+        out.append(f"{head} [{stamp(st['t0'])}..{stamp(st['t1'])}], {st['blocks']} block(s): {SAID_OVERLAPPED}"
+                   + "; ".join(op_text(names[i]) for i in st["by"]))
     return out
 
 
@@ -297,8 +384,11 @@ def warnings(section: dict) -> list[str]:
     if section.get("state") != "READ":
         return [f"cluster operations: {SAID_UNKNOWN}{section.get('why')}: whether an operation overlapped a "
                 f"measured phase is UNKNOWN"]
+    bl = section.get("blocks") or {}
     return [f"cluster operations: phase {p['phase']} {SAID_OVERLAPPED}{'; '.join(op_text(o) for o in p['by'])}"
-            for p in section.get("phases") or [] if p.get("overlap") == OVERLAPPED]
+            for p in section.get("phases") or [] if p.get("overlap") == OVERLAPPED] + (
+        [f"cluster operations: {bl['overlapped']} of {bl['blocks']} latency blocks overlapped by an operation"]
+        if bl.get("overlapped") else [])
 
 
 # ─── two arms side by side ──────────────────────────────────────────────────
@@ -352,7 +442,35 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
     if not out["phases"]:
         out["lines"].append(f"INFO cluster operations: no phase to compare: {labels[0]}: "
                             f"{wa or 'no measured phase'}; {labels[1]}: {wb or 'no measured phase'}")
+    # the latency blocks the pair's cells are computed from: how many of each arm's overlapped an operation
+    ba, bb = _blocks(va), _blocks(vb)
+    out["blocks"] = {"a": ba, "b": bb}
+    names = [*(ba.get("by_phase") or {}), *(n for n in (bb.get("by_phase") or {}) if n not in (ba.get("by_phase") or {}))]
+    for name in names or [None]:
+        ta, tb = _blocks_said(ba, name), _blocks_said(bb, name)
+        out["lines"].append(f"INFO cluster operations, latency blocks{', phase ' + name if name else ''}: "
+                            f"{labels[0]}: {ta}; {labels[1]}: {tb}")
     return out
+
+
+def _blocks(v: dict | None) -> dict:
+    sec = ((v or {}).get("report") or {}).get(SECTION) if isinstance(v, dict) else None
+    bl = sec.get("blocks") if isinstance(sec, dict) else None
+    if isinstance(bl, dict):
+        return bl
+    return {"state": UNKNOWN, "why": ("the run has no readable verdict.json" if not isinstance(v, dict) else
+                                      f"the run's verdict.json marks no latency block (an evaluate before #1422)")}
+
+
+def _blocks_said(bl: dict, phase: str | None) -> str:
+    if bl.get("state") == "NO_BLOCKS":
+        return "no latency block"
+    if bl.get("state") != "READ":
+        return SAID_UNKNOWN + str(bl.get("why"))
+    row = (bl.get("by_phase") or {}).get(phase) if phase else {"blocks": bl["blocks"], "overlapped": bl["overlapped"]}
+    if row is None:
+        return "no block in this phase"
+    return f"{row['overlapped']} of {row['blocks']} blocks overlapped by an operation"
 
 
 # ─── CLI (run606's collect) ─────────────────────────────────────────────────

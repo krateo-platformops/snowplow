@@ -235,13 +235,16 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     env step's 600 s, #1005, + the 300 s pre-drive PSI Job, #1042, + the
     300 s cert-manager install before the installer's, installer#614); + the
     1,800 s margin = 40,518 s -> 12 h. #1297 adds the in-cluster term, 4,803 s (2 x 300 pod starts +
-    3 last poll + 8 x 300 data606 calls + 1,800 cleanup): the plan reads 44,421 s -> 13 h."""
+    3 last poll + 8 x 300 data606 calls + 1,800 cleanup): the plan reads 44,421 s -> 13 h.
+    #1422: gke-up's bound is the sum of its parts (bench/gke.py UP_BUDGET_PARTS: 1,200 create + 600 + 15
+    TTL proof + 900 maintenance exclusion = 2,715 s, where a fixed 1,800 s had stood): 45,336 s, and with
+    the margin 47,136 s -> 14 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "= 44421 s" in p.stderr and "fits TTL_HOURS=13 (46800 s; derived: the plan's 44421 s" in p.stderr
+    assert "= 45336 s" in p.stderr and "fits TTL_HOURS=14 (50400 s; derived: the plan's 45336 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
-    assert p.returncode == 0 and "fits TTL_HOURS=14 (50400 s; derived" in p.stderr
+    assert p.returncode == 0 and "fits TTL_HOURS=15 (54000 s; derived" in p.stderr
 
 
 @pytest.mark.parametrize("env", [{"TTL_HOURS": "8"}, {"TTL_HOURS": "11"},
@@ -258,11 +261,11 @@ def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path)
     """R11: the margin is part of the bar. THIS plan adds 3,400 s of data
     budget to the default 38,718 s (DATA_TIMEOUT_S=5800): 42,118 s, under a
     hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with (#1297: + 4,803 s
-    in-cluster = 47,821 s, now over the 12 h outright)
+    in-cluster = 47,821 s, now over the 12 h outright; #1422: + 915 s of gke-up = 48,736 s)
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 47821 s" in p.stderr
-    assert "needs TTL_HOURS >= 14" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 48736 s" in p.stderr
+    assert "needs TTL_HOURS >= 15" in p.stderr
 
 
 def test_fresh606_phases_are_bounded_and_truncation_is_recorded():

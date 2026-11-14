@@ -272,7 +272,10 @@ esac
 DRIVER_EST_S=$(( ${DRIVE_S%.*} + DRIVER_LOGIN_BUDGET_S ))
 MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S : DRIVER_EST_S) + 600 ))}"
 # Every other bounded step (seconds). Each one is ENFORCED where it runs.
-UP_BUDGET_S="${UP_BUDGET_S:-1800}"            # reap + gke-up (+ node pools)
+# gke-up: the sum of its parts' own budgets (bench/gke.py UP_BUDGET_PARTS: the create with its node
+# pools, the TTL backstop's proof, the maintenance exclusion and its read-back), never a number of
+# its own: a part added to gke-up is counted here, in RUN_BUDGET_S and so in the TTL
+UP_BUDGET_S="${UP_BUDGET_S:-$(python3 -c 'from bench import gke; print(gke.up_budget_s())')}"
 INSTALL_TIMEOUT_S="${INSTALL_TIMEOUT_S:-900}"  # helm install --wait --timeout
 # installer#614 (s_cert_manager): cert-manager's install and its waits share ONE
 # bound, helm's own default --timeout (5m0s), the one cert-manager's documented
@@ -2674,6 +2677,16 @@ s_evaluate() {
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
       ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${opargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} > "$OUT/verdict.json" || vrc=$?
+  # evaluate's exit is a verdict only when it wrote one: a crash exits 1 too (FAIL's code) and leaves
+  # verdict.json empty. No verdict is a tooling failure: the step fails, and the run never logs
+  # "run complete" over an empty verdict.
+  if ! python3 -c 'import json, sys
+v = json.load(open(sys.argv[1]))
+sys.exit(0 if isinstance(v, dict) and v.get("verdict") in ("PASS", "FAIL", "INVALID", "INCONCLUSIVE") else 1)' \
+       "$OUT/verdict.json" 2>/dev/null; then
+    log "evaluate FAILED (exit ${vrc}): $OUT/verdict.json holds no verdict; this run has none"
+    return 1
+  fi
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   : > "$VERDICT_MARK"        # #1051: the verdict is final; teardown never recomputes it
   # Every INVALID reason in the run log, not only in verdict.json (#817: run

@@ -2688,6 +2688,27 @@ EXCLUSION_BUDGET_S = 900.0
 # gke-up's exit when the cluster does not hold the exclusion as asked (run606's teardown deletes it)
 EXIT_EXCLUSION_MISSING = 7
 
+# gke-up's own bound, the sum of its parts (review of #1425: the exclusion's 900 s were added inside
+# run606's fixed UP_BUDGET_S of 1800 s, beside the proof's 600 s and a create that took about 9.5
+# minutes on run 26i: the worst case no longer fit, and the outer bound would have killed gke-up and
+# torn the arm down). run606's UP_BUDGET_S is up_budget_s(), so a part added here is counted there.
+#   - create: the pre-checks, the cluster, its node pools, the credentials and the CronJob's apply,
+#     together (about 9.5 minutes on run 26i; twice that). Enforced in cmd_gke_up: each call gets what
+#     is left of it, and one that outlasts it is a failed create.
+#   - the TTL proof: its Job's deadline and the poll that sees it end.
+#   - the maintenance exclusion: the update, one wait for an operation in flight, the update again,
+#     the read-back, each call given what is left of it.
+UP_CREATE_BUDGET_S = 1200.0
+UP_BUDGET_PARTS = (("create (pre-checks, cluster, node pools, credentials, TTL CronJob)", "UP_CREATE_BUDGET_S"),
+                   ("TTL backstop proof", "TTL_PROOF_BUDGET_S"), ("the proof's last poll", "_POLL_S"),
+                   ("maintenance exclusion and its read-back", "EXCLUSION_BUDGET_S"))
+
+
+def up_budget_s() -> int:
+    """What gke-up may take at most, in whole seconds: the sum of its parts' own budgets."""
+    return int(-(-sum(float(globals()[name]) for _, name in UP_BUDGET_PARTS) // 1))
+
+
 _RFC3339 = re.compile(r"(\d{4})-(\d\d)-(\d\d)[Tt](\d\d):(\d\d):(\d\d)(\.\d+)?([Zz]|[+-]\d\d:\d\d)")
 
 
@@ -2772,38 +2793,54 @@ def apply_exclusion(spec: ClusterSpec, *, run=None, log: Callable[[str], None] =
            "blocks": "minor and patch upgrades of the control plane and of the nodes that GKE starts in the window",
            "does_not_cover": EXCLUSION_NOT_COVERED, "read_back": None, "cluster_created": None,
            "verified": False, "why": ""}
-    deadline = clock() + budget_s
+    t_start = clock()
+    deadline = t_start + budget_s
 
     def bounded(argv: list[str]) -> tuple[int, str, str]:
         err: list[str] = []
-        limit = max(GCLOUD_CALL_MIN_S, deadline - clock())
+        limit = deadline - clock()           # what is left of the step's budget, never more (up_budget_s)
+        if limit <= 0:
+            return GCLOUD_TIMED_OUT, "", f"not called: the step's {budget_s:g} s were spent"
         try:
             rc, out = run(argv, dry_run=False, log=log, stderr_out=err, timeout=limit)
         except subprocess.TimeoutExpired:
             return GCLOUD_TIMED_OUT, "", f"no answer within {limit:g} s"
         return rc, out, (err[-1] if err else "")
 
+    def done() -> dict:
+        rec["seconds"] = round(clock() - t_start, 1)       # what the step added to gke-up
+        return rec
+
     rc, _, err = bounded(exclusion_command(spec))
     m = _INCOMPATIBLE_OP.search(err) if rc != 0 else None
     if m:
-        log(f"{spec.name} is running {m.group(1)}: waiting for it, then adding the exclusion again")
+        # GKE's own words for the refusal, kept: whether an operation in flight refuses this update, and
+        # how it says so, was not known before the first cluster that showed it
+        rec["refused_once"] = {"operation": m.group(1), "said": gcloud_error_lines(err)}
+        log(f"{spec.name} is running {m.group(1)}: waiting for it, then adding the exclusion again "
+            f"(the update was refused: {rec['refused_once']['said']})")
+        t_wait = clock()
         bounded(operation_wait_command(m.group(1), spec))
+        rec["refused_once"]["waited_s"] = round(clock() - t_wait, 1)
         rc, _, err = bounded(exclusion_command(spec))
     if rc != 0:
-        rec["why"] = f"the update that adds it failed (rc={rc}): {gcloud_error_lines(err)}"
-        return rec
+        # a call the step's own bound ended says so in the bench's words; gcloud's are redacted
+        rec["why"] = (f"the update that adds it failed (rc={rc}): "
+                      f"{err if rc == GCLOUD_TIMED_OUT else gcloud_error_lines(err)}")
+        return done()
     rc, out, err = bounded(describe_command(spec))
     describe = _json(out) if rc == 0 else None
     if not isinstance(describe, dict):
         rec["why"] = ("the cluster could not be read back (describe "
-                      + (f"failed, rc={rc}, {error_summary(err)}" if rc else "answered no JSON object")
+                      + (f"failed, rc={rc}, {err if rc == GCLOUD_TIMED_OUT else error_summary(err)}" if rc
+                         else "answered no JSON object")
                       + "): whether it holds the exclusion is unknown")
-        return rec
+        return done()
     # #1422: when GKE says this cluster was created, from the same read: what the run's operations record is
     # proven against (bench/clusterops.py: the listing must hold the CREATE_CLUSTER that started then)
     rec["cluster_created"] = describe.get("createTime")
     rec["verified"], rec["why"], rec["read_back"] = exclusion_check(describe, spec)
-    return rec
+    return done()
 
 
 # ─── CLI (registered from cli._build_parser) ────────────────────────────────
@@ -2825,6 +2862,7 @@ def cmd_gke_up(a) -> int:
     spec = _spec_from_args(a)
     dry = not a.yes
     env = dict(os.environ, KUBECONFIG=spec.kubeconfig)
+    create_deadline = time.monotonic() + UP_CREATE_BUDGET_S      # up_budget_s()'s first part
     print(f"control plane: regional ({spec.region}); every node in {spec.zone}")
     print(f"cluster={spec.name} context={kube_context(spec)} "
           f"kubeconfig={spec.kubeconfig} ttl-expires={spec.ttl_expires} "
@@ -2864,7 +2902,15 @@ def cmd_gke_up(a) -> int:
         os.makedirs(os.path.dirname(spec.kubeconfig), exist_ok=True)
     for argv in create_commands(spec):
         err: list[str] = []
-        rc, _ = execute(argv, dry_run=dry, env=env, stderr_out=err)
+        left = create_deadline - time.monotonic()
+        try:
+            if left <= 0 and not dry:
+                raise subprocess.TimeoutExpired(argv, 0)
+            rc, _ = execute(argv, dry_run=dry, env=env, stderr_out=err, timeout=max(left, 1))
+        except subprocess.TimeoutExpired:
+            rc = GCLOUD_TIMED_OUT
+            err.append(f"ERROR: the create's {UP_CREATE_BUDGET_S:g} s (UP_CREATE_BUDGET_S, bench/gke.py) ran out at "
+                       f"{' '.join(argv[:4])}")
         if rc != 0:
             # #985: the reason, redacted (gcloud's text can name the operator's account)
             sys.stderr.write(f"create step failed (rc={rc}): {gcloud_error_lines(err[-1] if err else '')}; "
@@ -2933,7 +2979,10 @@ def cmd_gke_up(a) -> int:
                          f"node upgrade on {spec.name} during the run, so the run does not go on; the run's "
                          f"teardown deletes it (by hand: python3 -m bench.gke gke-down --name {spec.name} --yes)\n")
         return EXIT_EXCLUSION_MISSING
-    print(f"maintenance exclusion in place: {excl['why']}; it does not cover {EXCLUSION_NOT_COVERED}")
+    print(f"maintenance exclusion in place: {excl['why']} (the step took {excl['seconds']:g} s"
+          + (f"; the update was refused once while {excl['refused_once']['operation']} ran, "
+             f"{excl['refused_once']['waited_s']:g} s: {excl['refused_once']['said']}" if excl.get("refused_once")
+             else "") + f"); it does not cover {EXCLUSION_NOT_COVERED}")
     return 0
 
 

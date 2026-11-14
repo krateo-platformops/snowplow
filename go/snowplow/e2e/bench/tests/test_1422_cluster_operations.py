@@ -15,8 +15,11 @@ answers in gcloud's own shapes (tests/fake_gke_ops.py says where each comes from
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 
@@ -26,6 +29,7 @@ from bench import clusterops, gke
 from tests import fake_gke_ops
 from tests.fake_gke_ops import operation
 from tests.test_gke_pvc_disks import BENCH, NAME, _calls, fakes  # noqa: F401  (fixture)
+from tests.test_run15_customer_latency import _write_run
 from tests.test_run606_real_sequence import BENCH_DIR, RUN_NAME, harness  # noqa: F401  (fixture)
 
 T = 1794650000.0                 # 2026-11-14T09:53:20Z
@@ -194,6 +198,9 @@ def test_a_listing_not_proven_to_be_this_clusters_is_unreadable_never_none(fakes
     assert rec["unreadable"].startswith("could not be read: ") and rec["unreadable"] in said
     if "creation time" in case and "CREATE_CLUSTER" not in case:
         assert "the cluster's creation time is not recorded" in rec["unreadable"]
+    elif "another region" in case:
+        assert f"cannot be told to be {NAME}'s or not" in rec["unreadable"]
+        assert f"its target is {NAME} in europe-west1, and the listing asked for is europe-west4's" in rec["unreadable"]
     else:
         assert f"the control is missing: no CREATE_CLUSTER of {NAME} in europe-west4 that started within 120 s of " \
                f"the cluster's creation (2026-11-14T08:53:16Z) is in the listing" in rec["unreadable"]
@@ -205,6 +212,45 @@ def test_a_listing_not_proven_to_be_this_clusters_is_unreadable_never_none(fakes
     text = "\n".join(sec["lines"])
     assert "operations could not be read: " in text and "no operation overlapped" not in text
     assert "overlapped by" not in text
+
+
+def _retarget(op, link):
+    op = dict(op)
+    if link is None:
+        del op["targetLink"]
+    else:
+        op["targetLink"] = link(op["targetLink"])
+    return op
+
+
+UNPLACED = {
+    "no target link": (None, "it has no target link"),
+    "the zonal form of the link": (lambda u: u.replace("/locations/europe-west4/", "/zones/europe-west4-a/"),
+                                   "in a form that is not .../locations/europe-west4/clusters/"),
+    "a trailing slash": (lambda u: u + "/", "in a form that is not .../locations/europe-west4/clusters/"),
+    "an empty link": (lambda u: "", "it has no target link"),
+}
+
+
+@pytest.mark.parametrize("case", list(UNPLACED))
+def test_an_operation_that_cannot_be_placed_makes_the_record_unreadable_not_shorter(fakes, case):
+    """The cluster's CREATE_CLUSTER is there (the listing is this cluster's), and one operation on the
+    cluster does not carry the exact target form: dropped, the phase it overlapped would read "none"."""
+    link, why = UNPLACED[case]
+    odd = _retarget(RESIZE, link)
+    path, rec, _ = _record(fakes, [odd])
+    assert rec["readable"] is False and rec["operations"] is None
+    assert f"1 operation(s) of the listing cannot be told to be {NAME}'s or not: {RESIZE['name']} (RESIZE_CLUSTER): " \
+        in rec["unreadable"] and why in rec["unreadable"]
+    _, sec, _ = _evaluate(fakes, path)
+    assert {p["overlap"] for p in sec["phases"]} == {clusterops.UNKNOWN}
+    assert "no operation overlapped" not in "\n".join(sec["lines"])
+
+
+def test_another_clusters_oddly_formed_target_is_not_this_clusters_problem(fakes):
+    other = _retarget(operation("RESIZE_CLUSTER", NAME + "b", start=T + 100, end=T + 200), lambda u: u + "/")
+    _, rec, _ = _record(fakes, [other])
+    assert rec["readable"] is True and [o["type"] for o in rec["operations"]] == ["CREATE_CLUSTER"]
 
 
 def test_a_reused_name_keeps_this_clusters_operations_and_drops_the_earlier_clusters(fakes):
@@ -308,6 +354,91 @@ def test_an_operation_with_no_start_time_leaves_every_phase_unknown(fakes):
     assert all(p["overlap"] == clusterops.UNKNOWN for p in sec["phases"])
 
 
+# ─── the latency blocks: the customers' hours are marked 10 s at a time ──────
+
+@pytest.fixture(scope="module")
+def k6run(tmp_path_factory):
+    """A run directory in run606's layout with run 14's real customer calls (tests/test_run15's fixture)
+    and its span, as evaluate reads it."""
+    d = tmp_path_factory.mktemp("k6run")
+    files = _write_run(d / "src")
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", *files, "--k6-out", str(d / "src" / "k6"),
+                        "--browser-out", str(d / "src" / "browser"), "--browser-sessions", "5", "--no-viewers",
+                        "--expect-digest", DIGEST], cwd=BENCH, capture_output=True, text=True, timeout=600)
+    cl = json.loads(p.stdout)["report"]["customer_latency"]
+    return d / "src", cl["k6_span"]
+
+
+def _blocks_arm(tmp, k6run, label, ops, **env):
+    """One arm: run 14's calls, the cluster's operations `ops` (times relative to the first call)."""
+    src, (s0, _s1) = k6run
+    d = tmp / label
+    shutil.copytree(src, d)
+    made = [operation(k, NAME, start=s0 + a, end=None if b is None else s0 + b) for k, a, b in ops]
+    control = operation("CREATE_CLUSTER", NAME, start=s0 - 3600, end=s0 - 3200)
+    created = gke.rfc3339(s0 - 3604)
+    path, _, _ = _record(d, made, control=control, created=created, **env)
+    files = sorted(str(f) for f in d.glob("*.jsonl"))
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", *files, "--k6-out", str(d / "k6"),
+                        "--browser-out", str(d / "browser"), "--browser-sessions", "5", "--no-viewers",
+                        "--expect-digest", DIGEST, "--cluster-operations", str(path)],
+                       cwd=BENCH, capture_output=True, text=True, timeout=600)
+    (d / "verdict.json").write_text(p.stdout)
+    v = json.loads(p.stdout)
+    return d, v, v["report"]["cluster_operations_report_only"], made
+
+
+def test_each_latency_block_is_marked_and_the_long_span_is_not_one_phase(fakes, k6run):
+    (s0, s1) = k6run[1]
+    # one operation over the blocks that start at 90, 100, 110 and 120 s; one that ENDS exactly where the
+    # block at 300 s starts (over 280 and 290 only); one still running, from 15 s before the last call
+    d, v, sec, made = _blocks_arm(fakes, k6run, "a", [("RESIZE_CLUSTER", 95, 125), ("UPGRADE_MASTER", 285, 300),
+                                                     ("REPAIR_CLUSTER", s1 - s0 - 15, None)])
+    bl = sec["blocks"]
+    nb = int((s1 - s0) // 10) + 1
+    assert bl["state"] == "READ" and bl["block_s"] == 10 and bl["blocks"] == nb
+    last = [st for st in bl["stretches"] if st["by"] == [made[2]["name"]]]
+    assert [(round(st["t0"] - s0), round(st["t1"] - s0), st["blocks"], st["by"]) for st in bl["stretches"][:2]] == [
+        (90, 130, 4, [made[0]["name"]]), (280, 300, 2, [made[1]["name"]])]
+    assert len(last) == 1 and last[0]["blocks"] in (2, 3) and round(last[0]["t1"]) == round(s1)
+    assert bl["overlapped"] == 6 + last[0]["blocks"]
+    # a block counts in each gate phase it holds time of, as the pair statistics count it
+    assert set(bl["by_phase"]) <= {"storm", "burst", "churn", "steady"}
+    assert sum(r["overlapped"] for r in bl["by_phase"].values()) >= bl["overlapped"]
+    assert all(0 <= r["overlapped"] <= r["blocks"] for r in bl["by_phase"].values())
+    text = "\n".join(sec["lines"])
+    assert f"INFO cluster operations, latency blocks: {bl['overlapped']} of {nb} blocks of 10 s overlapped by an " \
+           f"operation (" in text
+    assert "4 block(s): overlapped by: RESIZE_CLUSTER" in text and "2 block(s): overlapped by: UPGRADE_MASTER" in text
+    assert "customer calls, first to last" not in json.dumps(sec)              # hours long: never one phase
+    assert f"cluster operations: {bl['overlapped']} of {nb} latency blocks overlapped by an operation" in \
+        v["report"]["report_warnings"]
+
+
+def test_blocks_say_none_and_unreadable_in_their_own_words_and_the_pair_counts_them_per_arm(fakes, k6run):
+    da, _, sa, _ = _blocks_arm(fakes, k6run, "a", [("RESIZE_CLUSTER", 95, 125)])
+    db, _, sb, _ = _blocks_arm(fakes, k6run, "b", [])
+    dc, _, sc, _ = _blocks_arm(fakes, k6run, "c", [], FAKE_OPERATIONS_RC="1")
+    nb = sb["blocks"]["blocks"]
+    assert sb["blocks"]["overlapped"] == 0 and sb["blocks"]["stretches"] == []
+    assert f"INFO cluster operations, latency blocks: no operation overlapped any of the {nb} blocks of 10 s" in \
+        "\n".join(sb["lines"])
+    assert sc["blocks"]["state"] == clusterops.UNKNOWN and sc["blocks"]["overlapped"] is None
+    (line,) = [ln for ln in sc["lines"] if "latency blocks" in ln]
+    assert "operations could not be read: " in line and "no operation overlapped" not in line
+    # the pair: how many of each arm's blocks, per gate phase
+    pair = _pair_cli(da, db)
+    hit = next(p for p, r in sa["blocks"]["by_phase"].items() if r["overlapped"])
+    ra, rb = sa["blocks"]["by_phase"][hit], sb["blocks"]["by_phase"][hit]
+    assert (f"INFO cluster operations, latency blocks, phase {hit}: N1 (baseline): {ra['overlapped']} of "
+            f"{ra['blocks']} blocks overlapped by an operation; N2 (candidate): 0 of {rb['blocks']} blocks "
+            f"overlapped by an operation") in pair["lines"]
+    assert ra["overlapped"] == 4 and pair["blocks"]["a"]["overlapped"] == 4 and pair["blocks"]["b"]["overlapped"] == 0
+    unk = _pair_cli(da, dc)
+    assert any("latency blocks" in ln and "N2 (candidate): operations could not be read: " in ln for ln in unk["lines"])
+    assert not any("latency blocks" in ln and "N2 (candidate): 0 of" in ln for ln in unk["lines"])
+
+
 def _pair_cli(da, db, a="N1", b="N2"):
     p = subprocess.run([sys.executable, "-m", "bench.custlat", "pair", "--a", str(da / "verdict.json"),
                         "--b", str(db / "verdict.json"), "--a-label", a, "--b-label", b],
@@ -323,7 +454,9 @@ def test_the_pair_names_the_phase_only_one_arm_measured_under_an_operation(fakes
     assert sec["asymmetric"] == [P1[0]] and sec["unknown"] == []
     assert [(p["phase"], p["a"], p["b"], p["asymmetric"]) for p in sec["phases"]] == [
         (P1[0], O, N, True), (P2[0], N, N, False)]
-    one, two = sec["lines"]
+    one, two, blocks = sec["lines"]
+    assert blocks == ("INFO cluster operations, latency blocks: N1 (baseline): no latency block; "
+                      "N2 (candidate): no latency block")          # these arms have no customer calls
     assert one.startswith(f"INFO cluster operations, phase {P1[0]}: ASYMMETRIC, one arm only measured under a "
                           f"cluster operation: N1 (baseline): overlapped by: RESIZE_CLUSTER 2026-11-14T09:55:00Z.."
                           f"2026-11-14T09:56:40Z (DONE, {resize['name']})")
@@ -440,6 +573,7 @@ def test_gke_up_adds_the_exclusion_reads_it_back_and_records_it(fakes, capsys):
     # when GKE says the cluster was created, from the same read-back: what the operations record is proven against
     assert gke.rfc3339_epoch(rec["cluster_created"]) is not None
     assert "maintenance exclusion in place: bench-run-ttl (no_upgrades, " in out.out
+    assert rec["seconds"] > 0 and f"(the step took {rec['seconds']:g} s)" in out.out and "refused_once" not in rec
     assert "it does not cover control-plane resizes and repairs" in out.out
 
 
@@ -492,6 +626,10 @@ def test_the_exclusion_waits_once_for_an_operation_in_flight(fakes, monkeypatch)
     monkeypatch.setenv("FAKE_EXCLUSION_BUSY", "operation-1794648225127-825c8ada-5282-4330-a1a3-8e4c717c325f")
     rc, rec = _up(fakes)
     assert rc == 0 and rec["verified"] is True
+    # GKE's own words for the refusal, and how long the wait took: what a rehearsal needs to show
+    assert rec["refused_once"]["operation"] == "operation-1794648225127-825c8ada-5282-4330-a1a3-8e4c717c325f"
+    assert "Cluster is running incompatible operation operation-1794648225127" in rec["refused_once"]["said"]
+    assert rec["refused_once"]["waited_s"] >= 0 and rec["seconds"] >= rec["refused_once"]["waited_s"]
     seq = [c[1:4] for c in _calls(fakes) if c[:3] in (["gcloud", "container", "clusters"],
                                                        ["gcloud", "container", "operations"]) and c[3] in (
         "update", "wait")]
@@ -532,6 +670,137 @@ def test_the_dry_run_prints_the_update_and_runs_nothing(fakes, capsys):
     assert "--add-maintenance-exclusion-scope no_upgrades" in out
     assert "it does not cover control-plane resizes and repairs" in out
     assert _calls(fakes) == [] and not (fakes / "m.json").exists()
+
+
+# ─── gke-up's bound is the sum of its parts ──────────────────────────────────
+
+def test_gke_ups_outer_bound_is_the_sum_of_the_budgets_its_parts_enforce():
+    parts = {name: float(getattr(gke, name)) for _, name in gke.UP_BUDGET_PARTS}
+    assert parts == {"UP_CREATE_BUDGET_S": 1200.0, "TTL_PROOF_BUDGET_S": 600.0, "_POLL_S": 15.0,
+                     "EXCLUSION_BUDGET_S": 900.0}
+    assert gke.up_budget_s() == sum(parts.values()) == 2715
+    # each constant is the one its step runs under
+    assert inspect.signature(gke.prove_ttl_delete).parameters["budget_s"].default == gke.TTL_PROOF_BUDGET_S
+    assert inspect.signature(gke.apply_exclusion).parameters["budget_s"].default == gke.EXCLUSION_BUDGET_S
+    # and run606 bounds gke-up by exactly that sum: its plan says so, and so its TTL counts it
+    src = (BENCH / "run606.sh").read_text()
+    assert "UP_BUDGET_S=\"${UP_BUDGET_S:-$(python3 -c 'from bench import gke; print(gke.up_budget_s())')}\"" in src
+    assert 'run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up' in src
+
+
+def test_run606s_plan_counts_gke_ups_whole_budget(harness):  # noqa: F811
+    env, _, _, tmp = harness
+    p = _run606(dict(env, BENCH_606_DRY_RUN="1"))
+    m = re.search(r"run budget: up (\d+) \+ .* = (\d+) s; fits TTL_HOURS=(\d+) \((\d+) s", p.stderr)
+    assert m and int(m.group(1)) == gke.up_budget_s(), p.stderr[-1500:]
+    assert int(m.group(2)) + 1800 <= int(m.group(4))                           # the plan, with it, fits the TTL
+
+
+def test_the_exclusion_step_never_outlasts_its_budget():
+    """Every call gets what is left of the step's budget, and none is made once it is spent."""
+    spec = gke.default_spec(NAME, now=T)
+    now, limits = [0.0], []
+
+    def run(argv, **kw):
+        limits.append((argv[3], kw["timeout"]))
+        now[0] += 400                                    # each call takes 400 s
+        if argv[3] == "update" and len(limits) == 1:
+            kw["stderr_out"].append("ERROR: ResponseError: code=400, message=Cluster is running incompatible "
+                                    "operation operation-1-abc.\n")
+            return 1, ""
+        return 0, ""
+    rec = gke.apply_exclusion(spec, run=run, log=lambda _m: None, clock=lambda: now[0])
+    # update (900 left), wait (500 left), update (100 left); the read-back is never called: 0 left
+    assert limits == [("update", 900.0), ("wait", 500.0), ("update", 100.0)]
+    assert rec["verified"] is False and "the step's 900 s were spent" in rec["why"] and rec["seconds"] == 1200.0
+
+
+def test_a_create_that_outlasts_its_budget_is_a_failed_create(fakes, monkeypatch, capsys):
+    monkeypatch.setattr(gke, "UP_CREATE_BUDGET_S", 0.0)
+    rc, rec = _up(fakes)
+    err = capsys.readouterr().err
+    assert rc == gke.GCLOUD_TIMED_OUT and rec is None
+    assert "the create's 0 s (UP_CREATE_BUDGET_S, bench/gke.py) ran out at gcloud container clusters create" in err
+    assert not any(c[:4] == ["gcloud", "container", "clusters", "create"] for c in _calls(fakes))
+
+
+# ─── run606's own shell lines, run as run606 runs them ───────────────────────
+
+def _fn(name):
+    src = (BENCH / "run606.sh").read_text()
+    i = src.index(f"{name}() {{")
+    return src[i:src.index("\n}\n", i) + 3]
+
+
+def _stand_in_python(tmp, module, body):
+    """A python3 first on PATH that answers `-m <module>` with `body` (bash) and is python3 otherwise."""
+    b = tmp / "standin"
+    b.mkdir()
+    (b / "python3").write_text(f'#!/usr/bin/env bash\nif [[ "$1 $2" == "-m {module}" ]]; then\n{body}\nfi\n'
+                               f'exec {shutil.which("python3")} "$@"\n')
+    (b / "python3").chmod(0o755)
+    return f"{b}{os.pathsep}{os.environ['PATH']}"
+
+
+def test_a_record_step_that_fails_leaves_no_half_written_record(tmp_path):
+    """run606's cluster_operations: the record command dies after it began to write (killed at its bound,
+    a full disk). What it left is removed, so evaluate reads "no record", never half of one."""
+    out = tmp_path / "out"
+    out.mkdir()
+    half = 'for ((i = 1; i <= $#; i++)); do [[ "${!i}" == "--out" ]] && { j=$((i + 1)); ' \
+           'printf \'{"kind": "cluster_operations", "readable": true, "operations": [\' > "${!j}"; }; done\n' \
+           'echo "Killed" >&2; exit 137'
+    script = ("set -Eeuo pipefail\nlog() { echo \"$*\" >> \"$OUT/run.log\"; }\n"
+              "bounded() { shift; \"$@\"; }\nkerr_line() { cat \"$KERR\"; }\n"
+              "DRY=0 RUN_NAME=snowplow-bench-x PROJECT=p ZONE=europe-west4-a COLLECT_TIMEOUT_S=5 KERR=\"$OUT/.kerr\"\n"
+              + _fn("cluster_operations") + "\ncluster_operations\necho step-ok\n")
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, OUT=str(out), PATH=_stand_in_python(tmp_path, "bench.clusterops", half)))
+    assert p.returncode == 0 and "step-ok" in p.stdout, p.stderr
+    assert not (out / "cluster-operations.json").exists()
+    log = (out / "run.log").read_text()
+    assert "could not record the cluster's operations: Killed; the verdict will say they could not be read" in log
+    # and that is what evaluate then says
+    v = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(_phases_file(tmp_path)),
+                        "--cluster-operations", str(out / "cluster-operations.json")],
+                       cwd=BENCH, capture_output=True, text=True, timeout=300)
+    sec = json.loads(v.stdout)["report"]["cluster_operations_report_only"]
+    assert sec["state"] == "UNREADABLE" and "the run has no cluster-operations record" in sec["why"]
+
+
+# ─── an input that was never written; an evaluate that wrote no verdict ──────
+
+def test_evaluate_says_a_missing_input_and_still_gives_its_verdict(tmp_path):
+    """run606 names top-boot.jsonl whether or not the boot sampler wrote it: evaluate died on it."""
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(_phases_file(tmp_path)),
+                        str(tmp_path / "top-boot.jsonl")], cwd=BENCH, capture_output=True, text=True, timeout=300)
+    v = json.loads(p.stdout)
+    assert v["verdict"] in ("PASS", "FAIL", "INVALID", "INCONCLUSIVE") and p.returncode in (0, 1, 3, 4)
+    assert v["report"]["missing_inputs"] == ["top-boot.jsonl"]
+    assert "input top-boot.jsonl does not exist: its records are missing from this verdict, not zero" in \
+        v["report"]["report_warnings"]
+    assert "Traceback" not in p.stderr
+
+
+@pytest.mark.parametrize("said, rc", [("", 1), ("Traceback (most recent call last):", 1), ('{"report": {}}', 0)])
+def test_run606_fails_the_evaluate_step_when_there_is_no_verdict(tmp_path, said, rc):
+    """A crashed evaluate exits 1, FAIL's own code, with an empty verdict.json: the step logged
+    "verdict exit=1" and the run "run complete"."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "mem-x.jsonl").write_text("{}\n")
+    script = ("set -Eeuo pipefail\nlog() { echo \"$*\" >> \"$OUT/run.log\"; }\n"
+              "DRY=0 RUN8_REPORT=1 LOAD_DRIVER=k6 VIEWERS=1 BROWSER_SESSIONS=5 EXPECTED_IMAGE_DIGEST=x FRONTEND_TAG=\n"
+              "VERDICT_MARK=\"$OUT/.verdict-final\"\n" + _fn("s_evaluate")
+              + "\nif s_evaluate; then echo step-ok; else echo step-failed; fi\n")
+    body = f'if [[ "$3" == "evaluate" ]]; then echo {json.dumps(said)}; exit {rc}; fi'
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, OUT=str(out), PATH=_stand_in_python(tmp_path, "bench.load606", body)))
+    assert "step-failed" in p.stdout and "step-ok" not in p.stdout, p.stderr
+    assert not (out / ".verdict-final").exists()
+    log = (out / "run.log").read_text()
+    assert f"evaluate FAILED (exit {rc}): {out}/verdict.json holds no verdict; this run has none" in log
+    assert "verdict exit=" not in log
 
 
 def test_the_orchestrators_roles_cover_the_two_new_calls():
