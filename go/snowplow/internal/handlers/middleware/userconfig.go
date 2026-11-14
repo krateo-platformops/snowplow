@@ -150,7 +150,28 @@ import (
 // which snowplow does not import, signup/ (each CSR gets a name of its own;
 // reached only through plumbing/e2e in integration tests), a comment in
 // kubeutil/content, tests and docs.
-const PinnedPlumbingVersion = "v1.68.0"
+//
+// v1.68.0 → v1.74.0 (six releases, bumped on their own): re-audited by
+// `git diff` of the two tags. server/, endpoints/, kubeconfig/, context/,
+// http/ and every other package snowplow imports are byte-identical, so this
+// file's upstream line numbers stand. The one imported package that changed is
+// jwtutil/. v1.69.0: CreateTokenOptions.Audience, an optional "aud" on a token
+// this module does not set; the validators do not check it. v1.70.0 and
+// v1.71.0: NotPublished, NotPublishedSince and JWKSKeySource.NextRefresh are
+// exported; nothing here calls them, and ValidateWithKeySource's own decision
+// is the same code, moved. v1.73.0 and v1.74.0: helm/ only, which snowplow
+// does not import.
+//
+// v1.72.0 IS A BEHAVIOUR CHANGE THIS FILE DEPENDS ON. A key set's time is now
+// when its fetch STARTED, not when it completed. ValidateWithKeySource answers
+// ErrKeyNotPublished (this file's 401, "stop retrying") for a token whose key
+// id is absent from a set fetched after the token was issued, and
+// ErrKeyUnavailable (503, "retry") otherwise. So a token issued while the
+// fetch was on the wire, whose key the issuer published during that round
+// trip, was a 401 and is now a 503 that the next refetch resolves. The window
+// is one JWKS round trip, and the change only turns a wrong permanent refusal
+// into a retry. No code here changes.
+const PinnedPlumbingVersion = "v1.74.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
