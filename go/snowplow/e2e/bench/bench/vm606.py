@@ -456,6 +456,10 @@ CALL_ROLES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("container", "clusters", "describe"): ("roles/container.admin",),
     ("container", "clusters", "list"): ("roles/container.admin",),
     ("container", "operations", "wait"): ("roles/container.admin",),
+    # #1422: gke-up adds the run's maintenance exclusion (container.clusters.update); collect lists the
+    # region's operations for the cluster's own (container.operations.list)
+    ("container", "clusters", "update"): ("roles/container.admin",),
+    ("container", "operations", "list"): ("roles/container.admin",),
     # #1383 gap 8: gke-up's preflight reads which versions the release channel offers in the region
     ("container", "get-server-config"): ("roles/container.admin",),
     ("compute", "regions", "describe"): ("roles/compute.viewer",),
@@ -496,8 +500,8 @@ NODE_SA_REST = gcp_apis.NODE_SA_REST
 
 WHY = {
     "roles/container.admin": (
-        "GKE clusters create / node-pools create / get-credentials / describe / list / delete, operations "
-        "wait, AND every kubectl / helm call against the bench cluster: the installer's helm install writes "
+        "GKE clusters create / node-pools create / get-credentials / describe / list / update (the run's "
+        "maintenance exclusion, #1422) / delete, operations wait / list, AND every kubectl / helm call against the bench cluster: the installer's helm install writes "
         "CRDs, ClusterRoles and ClusterRoleBindings; the run uses Jobs, pods/exec and logs. "
         "container.clusterAdmin has no Kubernetes-API access; container.developer cannot create clusters or "
         "write RBAC: container.admin is the one predefined role that holds both. IT IS PROJECT-WIDE: it "

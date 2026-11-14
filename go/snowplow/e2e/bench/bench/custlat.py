@@ -2042,6 +2042,29 @@ INFO_SECTIONS = (("tracing_report_only", "UNKNOWN"), ("egress_connections_report
                  ("user_buckets_report_only", "ABSENT"), ("resolve_memo_report_only", "ABSENT"))
 
 
+def _verdict_of(d: str) -> dict | None:
+    """A collected run directory's verdict.json; None when it cannot be read."""
+    try:
+        with open(os.path.join(d, "verdict.json")) as fh:
+            v = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def cluster_operations_pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
+    """#1422, INFO only: the two runs' cluster_operations_report_only (bench/clusterops.py) per measured
+    phase, and the phases ONE arm measured under a cluster operation and the other did not. A failure
+    of the comparison reads as unknown, never as symmetric."""
+    from bench import clusterops
+    try:
+        return clusterops.pair(va, vb, labels)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        why = f"the comparison failed: {type(e).__name__}: {e}"
+        return {"result": "INFO", "error": why, "phases": [], "asymmetric": [], "unknown": [],
+                "lines": [f"INFO cluster operations: whether the arms differ is UNKNOWN: {why}"]}
+
+
 def _unmeasured_section() -> dict:
     return {"status": "UNMEASURED",
             "why": "the run's verdict.json has no refresher_tiers_report_only (an evaluate before #1085's report)"}
@@ -2086,6 +2109,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
                                  [_provenance(d) for d in a.dirs])
+        if a.in_run is not None:
+            # #1422: the two arms' cluster operations per phase, side by side: a replica whose one arm
+            # measured a phase under a cluster operation and whose other did not says so
+            out["cluster_operations_report_only"] = cluster_operations_pair(
+                *(_verdict_of(d) for d in a.dirs), tuple(f"{x} (replica arm)" for x in a.in_run.split(":", 1)))
         json.dump(out, sys.stdout, indent=1, sort_keys=True)
         print()
         return 0
@@ -2137,6 +2165,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
             out[section] = {"error": f"{type(e).__name__}: {e}",
                             "lines": [f"INFO {section}: report failed: {type(e).__name__}: {e}"]}
+    # #1422: each arm's cluster operations per measured phase, and the phases only one arm measured under one
+    out["cluster_operations_report_only"] = cluster_operations_pair(
+        va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"))
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

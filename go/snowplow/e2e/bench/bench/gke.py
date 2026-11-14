@@ -47,6 +47,14 @@ This module owns that lifecycle and nothing else:
     region's VMs, forwarding rules and addresses (read-only lists); gke-up
     (and run606_pair.sh for both runs) refuses a run that does not fit,
     naming the quota and both numbers.
+  - Maintenance exclusion (#1422): gke-up adds ONE exclusion to the cluster,
+    scope no_upgrades, over the cluster's TTL window (`exclusion_command`),
+    reads it back (`exclusion_check`) and refuses a cluster that does not hold
+    it as asked (EXIT_EXCLUSION_MISSING), so no control-plane or node upgrade
+    starts during a run. It does NOT stop control-plane resizes and repairs
+    (GKE starts them itself and they ignore maintenance policies): those are
+    recorded per arm and marked on the phases they overlapped
+    (bench/clusterops.py).
 
 Every command is built as an argv list and only EXECUTED by `execute()`,
 which honours dry-run. The unit tests drive the builders and never shell out.
@@ -2637,6 +2645,163 @@ def _wait_gone(describe: list[str], *, deadline: float, clock: Callable[[], floa
         sleep(_POLL_S)
 
 
+# ─── Maintenance exclusion: no upgrade starts during a run (#1422) ──────────
+#
+# Every bench node pool has auto-upgrade and auto-repair on (the release channel sets them), and the
+# control plane upgrades itself: either could start mid-run, on one arm and not the other. gke-up adds
+# ONE maintenance exclusion to each cluster, over the cluster's own TTL window (ClusterSpec.created_at
+# to ttl_expires, the epoch its ttl-expires label carries), reads it back from the cluster, and refuses
+# the run when it is not there as asked.
+#
+# What was chosen, and where it is documented (read 2026-11-14):
+#   - the command: `gcloud container clusters update NAME --add-maintenance-exclusion-name / -start /
+#     -end / -scope`, AFTER the create. `clusters create` has no exclusion flag (SDK 561: `gcloud
+#     container clusters create --help` lists none; the how-to says of a new cluster "This task cannot be
+#     performed in the gcloud CLI"):
+#     https://cloud.google.com/kubernetes-engine/docs/how-to/maintenance-windows-and-exclusions
+#   - the scope: no_upgrades, the one scope that blocks minor AND patch upgrades of the control plane AND
+#     of the nodes (no_minor_upgrades lets patches through; no_minor_or_node_upgrades lets control-plane
+#     patches through). Its length "cannot exceed 90 days" (the page recommends under 30); a bench TTL is
+#     hours, and GKE itself refuses a longer one (the update fails, and so does gke-up):
+#     https://cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions
+#   - the read-back shape: Cluster.maintenancePolicy.window.maintenanceExclusions, a map of the
+#     exclusion's name to a TimeWindow {startTime, endTime, maintenanceExclusionOptions: {scope}}, the
+#     scope one of NO_UPGRADES / NO_MINOR_UPGRADES / NO_MINOR_OR_NODE_UPGRADES, NO_UPGRADES being "the
+#     default exclusion behavior" (so a TimeWindow that carries no scope is a NO_UPGRADES one):
+#     https://cloud.google.com/kubernetes-engine/docs/reference/rest/v1/projects.locations.clusters
+#     A cluster with no policy answers {"resourceVersion": "e3b0c442"} (run 26i's clusters, 2026-11-14).
+#
+# What it does NOT cover (the same concepts page): control-plane REPAIRS and RESIZES ("upscaling the
+# control plane to an appropriate size"; "Most repairs ignore maintenance windows and exclusions", and
+# they cannot be disabled), node auto-repair, the critical security patches and emergency upgrades GKE
+# reserves the right to roll out, and Compute Engine host maintenance. Run 26i's RESIZE_CLUSTER
+# operations are of that kind: this exclusion would not have stopped them. They are recorded and marked
+# on the phases they overlapped instead (bench/clusterops.py).
+EXCLUSION_NAME = "bench-run-ttl"
+EXCLUSION_SCOPE = "no_upgrades"
+EXCLUSION_SCOPE_API = "NO_UPGRADES"
+EXCLUSION_NOT_COVERED = ("control-plane resizes and repairs (GKE starts them itself and they ignore maintenance "
+                         "policies), node auto-repair, emergency or critical-security upgrades, Compute Engine host "
+                         "maintenance")
+# the update is a metadata-only cluster operation (seconds), with one wait for an operation in flight
+EXCLUSION_BUDGET_S = 900.0
+# gke-up's exit when the cluster does not hold the exclusion as asked (run606's teardown deletes it)
+EXIT_EXCLUSION_MISSING = 7
+
+_RFC3339 = re.compile(r"(\d{4})-(\d\d)-(\d\d)[Tt](\d\d):(\d\d):(\d\d)(\.\d+)?([Zz]|[+-]\d\d:\d\d)")
+
+
+def rfc3339(epoch_s: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch_s)))
+
+
+def rfc3339_epoch(ts) -> float | None:
+    """An RFC 3339 time as unix seconds (a Z or an offset: GKE answers either); None for anything else."""
+    import calendar
+    m = _RFC3339.fullmatch(ts.strip()) if isinstance(ts, str) else None
+    if m is None:
+        return None
+    y, mo, d, h, mi, s, frac, tz = m.groups()
+    t = calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(s))) + (float(frac) if frac else 0.0)
+    if tz not in ("Z", "z"):
+        off = int(tz[1:3]) * 3600 + int(tz[4:6]) * 60
+        t -= off if tz[0] == "+" else -off
+    return t
+
+
+def exclusion_window(spec: ClusterSpec) -> tuple[int, int]:
+    """The exclusion's (start, end), unix seconds: exactly the cluster's TTL window, from its creation
+    to the epoch its ttl-expires label carries."""
+    return int(spec.created_at), int(spec.ttl_expires)
+
+
+def exclusion_command(spec: ClusterSpec) -> list[str]:
+    start, end = exclusion_window(spec)
+    return ["gcloud", "container", "clusters", "update", spec.name,
+            "--project", spec.project, "--region", spec.region,
+            "--add-maintenance-exclusion-name", EXCLUSION_NAME,
+            "--add-maintenance-exclusion-start", rfc3339(start),
+            "--add-maintenance-exclusion-end", rfc3339(end),
+            "--add-maintenance-exclusion-scope", EXCLUSION_SCOPE,
+            "--quiet"]
+
+
+def exclusion_check(describe, spec: ClusterSpec) -> tuple[bool, str, dict | None]:
+    """Is the exclusion gke-up asked for on the cluster, as `gcloud container clusters describe`
+    answers it? (ok, why, the exclusion as the cluster holds it). It is there only under its name,
+    with the start and the end asked for (compared as instants) and the NO_UPGRADES scope (a TimeWindow
+    with no scope is one: the API's default); anything else, an unreadable describe included, is not."""
+    start, end = exclusion_window(spec)
+    asked = f"{EXCLUSION_NAME} ({EXCLUSION_SCOPE}, {rfc3339(start)} to {rfc3339(end)})"
+    if not isinstance(describe, dict):
+        return False, f"the cluster could not be read back: whether it holds {asked} is unknown", None
+    policy = describe.get("maintenancePolicy")
+    window = policy.get("window") if isinstance(policy, dict) else None
+    held = window.get("maintenanceExclusions") if isinstance(window, dict) else None
+    held = held if isinstance(held, dict) else {}
+    got = held.get(EXCLUSION_NAME)
+    if not isinstance(got, dict):
+        return False, (f"the cluster holds no maintenance exclusion named {EXCLUSION_NAME} (its exclusions: "
+                       f"{', '.join(sorted(held)) or 'none'})"), None
+    wrong = []
+    for what, want, key in (("start", start, "startTime"), ("end", end, "endTime")):
+        if rfc3339_epoch(got.get(key)) != want:
+            wrong.append(f"its {what} is {got.get(key)!r}, not {rfc3339(want)}")
+    opts = got.get("maintenanceExclusionOptions")
+    opts = opts if isinstance(opts, dict) else {}
+    if opts.get("scope") not in (None, EXCLUSION_SCOPE_API):
+        wrong.append(f"its scope is {opts.get('scope')!r}, not {EXCLUSION_SCOPE_API}")
+    if opts.get("endTimeBehavior") not in (None, "END_TIME_BEHAVIOR_UNSPECIFIED"):
+        wrong.append(f"its end is {opts.get('endTimeBehavior')!r}, not the fixed time asked for")
+    if wrong:
+        return False, f"the cluster's {EXCLUSION_NAME} is not the one asked for ({asked}): {'; '.join(wrong)}", got
+    return True, f"{asked}, read back from the cluster", got
+
+
+def apply_exclusion(spec: ClusterSpec, *, run=None, log: Callable[[str], None] = print,
+                    budget_s: float = EXCLUSION_BUDGET_S, clock: Callable[[], float] = time.monotonic) -> dict:
+    """Add the run's maintenance exclusion to the cluster, then READ IT BACK (a describe) and compare:
+    the record gke-up writes, `verified` True only from the cluster's own answer. An update refused
+    because another operation runs on the cluster waits for THAT operation, once, and retries (as the
+    teardown's delete does); every gcloud call is bounded by what is left of `budget_s`."""
+    run = run or execute
+    start, end = exclusion_window(spec)
+    rec = {"kind": "maintenance_exclusion", "cluster": spec.name, "name": EXCLUSION_NAME,
+           "requested": {"scope": EXCLUSION_SCOPE, "start": rfc3339(start), "end": rfc3339(end),
+                         "start_t": start, "end_t": end, "ttl_expires": int(spec.ttl_expires)},
+           "blocks": "minor and patch upgrades of the control plane and of the nodes that GKE starts in the window",
+           "does_not_cover": EXCLUSION_NOT_COVERED, "read_back": None, "verified": False, "why": ""}
+    deadline = clock() + budget_s
+
+    def bounded(argv: list[str]) -> tuple[int, str, str]:
+        err: list[str] = []
+        limit = max(GCLOUD_CALL_MIN_S, deadline - clock())
+        try:
+            rc, out = run(argv, dry_run=False, log=log, stderr_out=err, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return GCLOUD_TIMED_OUT, "", f"no answer within {limit:g} s"
+        return rc, out, (err[-1] if err else "")
+
+    rc, _, err = bounded(exclusion_command(spec))
+    m = _INCOMPATIBLE_OP.search(err) if rc != 0 else None
+    if m:
+        log(f"{spec.name} is running {m.group(1)}: waiting for it, then adding the exclusion again")
+        bounded(operation_wait_command(m.group(1), spec))
+        rc, _, err = bounded(exclusion_command(spec))
+    if rc != 0:
+        rec["why"] = f"the update that adds it failed (rc={rc}): {gcloud_error_lines(err)}"
+        return rec
+    rc, out, err = bounded(describe_command(spec))
+    describe = _json(out) if rc == 0 else None
+    if not isinstance(describe, dict):
+        rec["why"] = ("the cluster could not be read back (describe "
+                      + (f"failed, rc={rc}, {error_summary(err)}" if rc else "answered no JSON object")
+                      + "): whether it holds the exclusion is unknown")
+        return rec
+    rec["verified"], rec["why"], rec["read_back"] = exclusion_check(describe, spec)
+    return rec
+
+
 # ─── CLI (registered from cli._build_parser) ────────────────────────────────
 
 
@@ -2724,6 +2889,12 @@ def cmd_gke_up(a) -> int:
               f"as the node SA: {' and '.join(TTL_PROBE_METHODS)} on {inside} (must answer 404 NOT_FOUND) and on "
               f"{control} (must answer 403 PERMISSION_DENIED), neither of which exists; then its log is read and "
               f"it is deleted)")
+        # #1422: the run's maintenance exclusion, then the describe that reads it back
+        execute(exclusion_command(spec), dry_run=True)
+        execute(describe_command(spec), dry_run=True)
+        print(f"DRY-RUN: (the cluster must answer its maintenance exclusion {EXCLUSION_NAME}, scope "
+              f"{EXCLUSION_SCOPE_API}, {rfc3339(spec.created_at)} to {rfc3339(spec.ttl_expires)}, its TTL window; "
+              f"it does not cover {EXCLUSION_NOT_COVERED})")
         return 0
     token = new_probe_token()
     ok, why, placement = prove_ttl_delete(spec, token=token)
@@ -2746,6 +2917,19 @@ def cmd_gke_up(a) -> int:
         return EXIT_TTL_BACKSTOP_MISSING
     print(f"TTL backstop proven: {why} in {spec.project} (GKE API calls on two non-existent cluster names from a "
           f"Job of the ttl-self-destruct CronJob's own pod spec)")
+    # #1422: no upgrade may start during the run: the exclusion over the cluster's TTL window, added once the
+    # TTL backstop stands (a cluster this step refuses is one its CronJob can already delete), then READ BACK
+    excl = apply_exclusion(spec)
+    if getattr(a, "maintenance_out", None):
+        with open(a.maintenance_out, "w") as fh:
+            json.dump(excl, fh, indent=1)
+            fh.write("\n")
+    if not excl["verified"]:
+        sys.stderr.write(f"maintenance exclusion NOT in place: {excl['why']}: GKE could start a control-plane or "
+                         f"node upgrade on {spec.name} during the run, so the run does not go on; the run's "
+                         f"teardown deletes it (by hand: python3 -m bench.gke gke-down --name {spec.name} --yes)\n")
+        return EXIT_EXCLUSION_MISSING
+    print(f"maintenance exclusion in place: {excl['why']}; it does not cover {EXCLUSION_NOT_COVERED}")
     return 0
 
 
@@ -3041,6 +3225,9 @@ def add_parsers(sub) -> None:
                     help="#1173: write every pre-check line here (run606: $OUT/quota-check.log)")
     up.add_argument("--ttl-proof-out", default=None,
                     help="#1383: write the TTL backstop's proof record (JSON) here (run606: $OUT/ttl-proof.json)")
+    up.add_argument("--maintenance-out", default=None,
+                    help="#1422: write the maintenance exclusion's record (JSON: what was asked, what the cluster "
+                         "answered) here (run606: $OUT/maintenance-exclusion.json)")
     footprint_args(up)
     up.set_defaults(func=cmd_gke_up)
 
