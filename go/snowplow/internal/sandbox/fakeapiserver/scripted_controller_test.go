@@ -450,19 +450,20 @@ func TestScriptedWrite_TouchesOnlyItsTargetsStatus(t *testing.T) {
 	const incKey = "observability.krateo.io/incidents krateo-system/" + incident
 	const alertKey = "observability.krateo.io/alerts krateo-system/" + alertName
 
-	t.Run("stamps outside .status are not written", func(t *testing.T) {
-		// Each pointer's parent exists, so the stamp itself succeeds: what stops the write
-		// reaching spec and metadata is the status path, not a failed stamp.
-		h := withRule(t, "trigger", map[string]any{"state": "Resolved"}, "/spec/stolen", "/metadata/stolen", "/metadata/name", "/metadata/namespace", "/status/at")
+	t.Run("a stamp under /status is written, and only the status changes", func(t *testing.T) {
+		h := withRule(t, "trigger", map[string]any{"state": "Resolved"}, "/status/at")
 		before := h.do("GET", inc+"/"+incident, req{as: "sa"}).body
+		if get(before, "status", "state") == "Resolved" {
+			t.Fatal("the fixture's incident is already Resolved")
+		}
 		eq(t, h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"poked": true}}}).code, 200, "the visitor's write")
 		poked := h.do("GET", inc+"/"+incident, req{as: "sa"}).body
 		store := storeDigest(h)
 		mark := len(h.log())
 		h.advance(time.Second)
-		lines := h.log()[mark:len(h.log())]
+		lines := h.log()[mark:]
 		if f := failures(lines); len(f) != 0 {
-			t.Fatalf("the write failed, so this arm shows nothing: %v", f)
+			t.Fatalf("the write failed: %v", f)
 		}
 		if c := controllerLines(lines); len(c) != 1 || c[0]["status"] != 200 {
 			t.Fatalf("want the write's one 200 line: %v", lines)
@@ -470,10 +471,7 @@ func TestScriptedWrite_TouchesOnlyItsTargetsStatus(t *testing.T) {
 		eq(t, changed(store, storeDigest(h)), []string{incKey}, "the objects the write changed")
 		after := h.do("GET", inc+"/"+incident, req{as: "sa"}).body
 		eq(t, get(after, "status", "state"), "Resolved", "the status was written")
-		eq(t, get(after, "status", "at"), "2026-11-12T10:00:00Z", "the stamp inside .status was set")
-		if get(before, "status", "state") == "Resolved" {
-			t.Fatal("the fixture's incident is already Resolved")
-		}
+		eq(t, get(after, "status", "at"), "2026-11-12T10:00:00Z", "the stamp under /status was set")
 		// Outside .status and the resourceVersion a write bumps, the object is the one the visitor left.
 		strip := func(o map[string]any) map[string]any {
 			c := deepCopy(o).(map[string]any)
@@ -483,6 +481,59 @@ func TestScriptedWrite_TouchesOnlyItsTargetsStatus(t *testing.T) {
 		}
 		eq(t, strip(after), strip(poked), "everything outside .status")
 	})
+
+	// A stamp that names no field under /status is a defective rule: the write fails, loudly, with
+	// the pointer named, and nothing at all is written: not the rule's status either, no event, no
+	// request line. One rule for every pointer, whatever its parent holds: the incident's spec,
+	// metadata and metadata.annotations all exist, so each of these stamps could otherwise be set.
+	for _, c := range []struct {
+		name    string
+		stamps  []any
+		pointer string
+	}{
+		{"into spec", []any{"/spec/x"}, "/spec/x"},
+		{"into metadata.annotations", []any{"/metadata/annotations/x"}, "/metadata/annotations/x"},
+		{"into metadata", []any{"/metadata/name"}, "/metadata/name"},
+		{"the whole status, not a field of it", []any{"/status"}, "/status"},
+		{"a member that only starts with status", []any{"/statusx/at"}, "/statusx/at"},
+		{"the whole document", []any{""}, ""},
+		{"after a stamp under /status: no partial write", []any{"/status/at", "/spec/x"}, "/spec/x"},
+		{"before a stamp under /status: no partial write", []any{"/metadata/annotations/x", "/status/at"}, "/metadata/annotations/x"},
+	} {
+		t.Run("a stamp outside /status fails the write: "+c.name, func(t *testing.T) {
+			h := newHarness(t, opts{
+				pageEdit: func(objs []map[string]any) {
+					for _, o := range objs {
+						if o["kind"] == "Incident" {
+							meta(o)["annotations"] = map[string]any{"seeded": "yes"}
+						}
+					}
+				},
+				edit: func(s map[string]any) {
+					s["scripted"] = map[string]any{"applyStatus": []any{map[string]any{
+						"id":      "reach",
+						"on":      map[string]any{"verb": "patch", "group": "observability.krateo.io", "resource": "incidents", "namespace": "krateo-system", "name": incident},
+						"afterMs": 100, "target": "trigger", "status": map[string]any{"state": "Resolved"}, "stamp": c.stamps,
+					}}}
+				}})
+			seeded := h.do("GET", inc+"/"+incident, req{as: "sa"}).body
+			eq(t, get(seeded, "metadata", "annotations", "seeded"), "yes", "the incident has annotations, so a stamp into them has a parent")
+			if _, ok := seeded["spec"].(map[string]any); !ok {
+				t.Fatal("the incident has no spec, so a stamp into it has no parent")
+			}
+			w := synced(h, inc)
+			defer w.cancel()
+			eq(t, h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"poked": true}}}).code, 200, "the visitor's write")
+			eq(t, w.next()["type"], "MODIFIED", "the visitor's event")
+			store := storeDigest(h)
+			mark := len(h.log())
+			h.advance(time.Second)
+			lines := h.log()[mark:]
+			eq(t, lines, []map[string]any{{"event": "applyStatus.failed", "id": "reach", "pointer": c.pointer, "reason": "a stamp names a field under /status: a rule writes its target's status and nothing else"}}, "the lines the rule wrote: its one failure, naming the pointer, and no request line")
+			eq(t, changed(store, storeDigest(h)), []string{}, "the objects the write changed")
+			w.quiet() // no event
+		})
+	}
 
 	t.Run("an explicit target is the only object written", func(t *testing.T) {
 		h := withRule(t, map[string]any{"group": "observability.krateo.io", "resource": "alerts", "namespace": "krateo-system", "name": alertName}, map[string]any{"state": "Cleared"})
@@ -513,8 +564,8 @@ func TestScriptedWrite_TouchesOnlyItsTargetsStatus(t *testing.T) {
 		"the visitor's Secret":                       {map[string]any{"group": "", "resource": "secrets", "namespace": "krateo-system", "name": "sandbox-visitor-clientconfig"}, "secrets", visitorSecretPath},
 	} {
 		t.Run("refused: "+name, func(t *testing.T) {
-			// The status and the stamps would land in the object's own fields were the write let through.
-			h := withRule(t, c.target, map[string]any{"phase": "Terminating"}, "/metadata/stolen", "/status/at")
+			// The status and its stamp would land in the object's own fields were the write let through.
+			h := withRule(t, c.target, map[string]any{"phase": "Terminating"}, "/status/at")
 			// The target is stored (a missing one is refused for another reason): the ServiceAccount reads it.
 			eq(t, h.do("GET", c.get, req{as: "sa"}).code, 200, "the target is there")
 			h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"poked": true}}})

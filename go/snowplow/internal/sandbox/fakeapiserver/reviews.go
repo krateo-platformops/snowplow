@@ -192,9 +192,10 @@ func (s *Server) fireRules(c *reqCtx, verb string, stored map[string]any) {
 // not a request and is nobody's credential: it is not authorised as snowplow's ServiceAccount (whose
 // rights are the reference cluster's, read-only) nor as the visitor, and it grants neither anything.
 // It is bound to what the rule declares, structurally: the one target object, and its status
-// subresource only. A target whose kind serves no /status is refused (the 404 a request for that
-// path gets), and restrict keeps every field outside .status as stored, as the /status path does
-// for a request. It goes through the /status path's rules (coerced and validated against the CRD,
+// subresource only. A stamp that names no field under /status fails the write before anything is
+// stored (stampOutsideStatus). A target whose kind serves no /status is refused (the 404 a request
+// for that path gets), and restrict keeps every field outside .status as stored, as the /status
+// path does for a request. It goes through the /status path's rules (coerced and validated against the CRD,
 // 400 and 422), and sends one MODIFIED event to every matching watch. Its request line says
 // identity controller, which no request's line can say (authenticate).
 func (s *Server) applyStatus(rule Rule, t target) {
@@ -230,6 +231,9 @@ func (s *Server) applyStatus(rule Rule, t target) {
 	at := s.now()
 	for _, p := range rule.Stamp {
 		toks, reason := pointerTokens(p)
+		if reason == "" && (len(toks) < 2 || toks[0] != "status") {
+			reason = stampOutsideStatus
+		}
 		if reason == "" {
 			reason = stampAt(next, toks, at)
 		}
@@ -274,6 +278,11 @@ func (s *Server) applyStatus(rule Rule, t target) {
 	}
 	s.o.Log(line)
 }
+
+// stampOutsideStatus is why a stamp that does not name a field under /status is refused. A rule
+// writes its target's status; a stamp anywhere else is a defective rule, and the whole write fails
+// (nothing stored, no event, no request line) rather than the stamp being dropped unseen.
+const stampOutsideStatus = "a stamp names a field under /status: a rule writes its target's status and nothing else"
 
 // stampAt sets the value at an RFC 6901 pointer's location in doc: through objects by key and arrays
 // by index (decimal, no leading zero, in range), the last token naming an object member (set or
