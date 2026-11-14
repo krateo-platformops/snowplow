@@ -67,9 +67,14 @@ const (
 	// v1.68.0 → v1.74.0 (six releases, bumped on their own): `git diff --stat`
 	// of the two tags changes jwtutil/, helm/ and go.mod; crdgen/ and
 	// crdgen/schemas/ have no change at all, so the output above stands.
+	//
+	// v1.74.0 → v1.75.0 (plumbing#173, the release's one commit): `git diff
+	// --stat` of the two tags changes http/request, http/response and
+	// docs/api.md; crdgen/ and crdgen/schemas/ have no change at all, so the
+	// output above stands.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.74.0"
+	crdgenVersion       = "v1.75.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
 	coreProviderCrdgenVersion = "v1.28.1"
 
