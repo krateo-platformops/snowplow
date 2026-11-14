@@ -102,7 +102,7 @@ SITES = {
     "gcevm.failed (a failed remote step's lines)": lambda s: str(gcevm.failed("a step", 1, s, "", prefix="x")),
     # #1422: what gcloud said on stderr beside an operations list it answered with exit 0
     "clusterops.read (a listing's complaint on stderr)": lambda s: clusterops.read(
-        gke.default_spec("snowplow-bench-x"),
+        gke.default_spec("snowplow-bench-x"), created=0.0,
         run=lambda argv, **kw: (kw["stderr_out"].append("WARNING: " + s), (0, "[]"))[1])["unreadable"],
 
     # #1361: a failed gcloud call's cause, in every testvm / vm606 refusal of one

@@ -2770,7 +2770,8 @@ def apply_exclusion(spec: ClusterSpec, *, run=None, log: Callable[[str], None] =
            "requested": {"scope": EXCLUSION_SCOPE, "start": rfc3339(start), "end": rfc3339(end),
                          "start_t": start, "end_t": end, "ttl_expires": int(spec.ttl_expires)},
            "blocks": "minor and patch upgrades of the control plane and of the nodes that GKE starts in the window",
-           "does_not_cover": EXCLUSION_NOT_COVERED, "read_back": None, "verified": False, "why": ""}
+           "does_not_cover": EXCLUSION_NOT_COVERED, "read_back": None, "cluster_created": None,
+           "verified": False, "why": ""}
     deadline = clock() + budget_s
 
     def bounded(argv: list[str]) -> tuple[int, str, str]:
@@ -2798,6 +2799,9 @@ def apply_exclusion(spec: ClusterSpec, *, run=None, log: Callable[[str], None] =
                       + (f"failed, rc={rc}, {error_summary(err)}" if rc else "answered no JSON object")
                       + "): whether it holds the exclusion is unknown")
         return rec
+    # #1422: when GKE says this cluster was created, from the same read: what the run's operations record is
+    # proven against (bench/clusterops.py: the listing must hold the CREATE_CLUSTER that started then)
+    rec["cluster_created"] = describe.get("createTime")
     rec["verified"], rec["why"], rec["read_back"] = exclusion_check(describe, spec)
     return rec
 

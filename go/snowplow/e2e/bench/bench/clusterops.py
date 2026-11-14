@@ -24,6 +24,17 @@ Three parts, one module:
   - `pair()` (bench.custlat pair and replica --in-run): the two arms' outcomes per phase, side by side,
     naming the phases where ONE arm's measurement overlapped an operation and the other's did not.
 
+THE POSITIVE CONTROL. A listing that answers cleanly can still be the wrong one, or a short one: an empty
+list, another region's, one that holds only other clusters' operations, one without this cluster's
+beginning. Each would read "no operation overlapped". So a record is readable only when the listing
+PROVES it is this cluster's: it must hold the operation the bench itself caused, the cluster's own
+CREATE_CLUSTER, by exact target (name and region) AND by its start, within CONTROL_SKEW_S of the
+creation time GKE reported for this cluster when gke-up read it back (Cluster.createTime, kept in
+maintenance-exclusion.json as `cluster_created`). The creation time tells this cluster from an
+earlier one of the same name. The record names the operation that matched (`control`). Without it
+the record is UNREADABLE, saying which control was missing. Operations that started before the
+control's are an earlier cluster's of the same name, and are not this run's: they are left out.
+
 Report only: nothing here changes a verdict. Whether an overlap moves a metric is decided from run
 26i's own evidence (N1 against N1B), before any re-measure rule exists (owner, 2026-11-14).
 
@@ -64,6 +75,13 @@ UNREADABLE_PREFIX = "could not be read: "
 # one listing answers in seconds (225 operations of the region: under 3 s on 2026-11-14); a call past
 # this is no answer, and is recorded as one
 LIST_TIMEOUT_S = 120.0
+CONTROL_TYPE = "CREATE_CLUSTER"
+# how far the cluster's CREATE_CLUSTER may start from the createTime GKE reports for the cluster. Run 26i
+# (2026-11-14): createTime 08:54:10Z, its CREATE_CLUSTER's startTime 08:54:14.07Z, 4 s apart. Two clusters
+# of one name are never this close: the earlier one had to finish being created (about 6 minutes, same run)
+# and be deleted before the name was free.
+CONTROL_SKEW_S = 120.0
+CREATED_KEY = "cluster_created"
 
 _TARGET = re.compile(r"/(?:locations|zones)/([^/]+)/clusters/([^/]+)(?:/nodePools/([^/]+))?$")
 # gcloud's own log lines on stderr: a listing that exits 0 with one did not answer cleanly (a partial
@@ -109,11 +127,40 @@ def _unreadable(spec: gke.ClusterSpec, now: float, why: str) -> dict:
             "source": " ".join(list_command(spec)[:4])}
 
 
-def read(spec: gke.ClusterSpec, *, run=None, now: Callable[[], float] = time.time,
-         timeout: float = LIST_TIMEOUT_S) -> dict:
+def created_from(path: str | None) -> tuple[float | None, str]:
+    """(the cluster's creation time as GKE reported it to gke-up, "") or (None, why it is not known),
+    from the record gke-up wrote when it read the cluster back (maintenance-exclusion.json)."""
+    if not path:
+        return None, "the cluster's creation time was not given (--created-from)"
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except OSError as e:
+        return None, f"the cluster's creation time is not recorded ({path}: {e.strerror})"
+    except ValueError:
+        return None, f"the cluster's creation time is not recorded ({path} is not JSON)"
+    t = epoch(rec.get(CREATED_KEY)) if isinstance(rec, dict) else None
+    if t is None:
+        return None, f"the cluster's creation time is not recorded ({path} holds no readable {CREATED_KEY})"
+    return t, ""
+
+
+def control_of(ops: list[dict], created: float) -> dict | None:
+    """The cluster's own CREATE_CLUSTER among its operations: the one that started within CONTROL_SKEW_S
+    of the creation time GKE reported for the cluster (the nearest, should two qualify)."""
+    near = [o for o in ops if o["type"] == CONTROL_TYPE and o["target"] == "cluster" and o["start_t"] is not None
+            and abs(o["start_t"] - created) <= CONTROL_SKEW_S]
+    return min(near, key=lambda o: abs(o["start_t"] - created)) if near else None
+
+
+def read(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "", run=None,
+         now: Callable[[], float] = time.time, timeout: float = LIST_TIMEOUT_S) -> dict:
     """The cluster's operations record. Fails closed: a listing that exits non-zero, times out, answers
     no JSON list, or exits 0 with a gcloud ERROR / WARNING on its stderr is UNREADABLE, with the reason
-    (the code only for an error: gcloud's text names the operator's account), and `operations` null."""
+    (the code only for an error: gcloud's text names the operator's account), and `operations` null.
+    So is one that does not hold the positive control (module doc): this cluster's own CREATE_CLUSTER,
+    by exact target and by `created`, the creation time GKE reported for it (None: not known, and then
+    no listing can be proven to be this cluster's)."""
     run = run or gke.execute
     argv = list_command(spec)
     err: list[str] = []
@@ -136,8 +183,28 @@ def read(spec: gke.ClusterSpec, *, run=None, now: Callable[[], float] = time.tim
         return _unreadable(spec, now(), f"{' '.join(argv[:4])} exited 0 and answered no JSON list of operations")
     ops = sorted((operation(o, t) for o in got if (t := target_of(o, spec)) is not None),
                  key=lambda o: (o["start_t"] is None, o["start_t"] or 0.0, str(o["id"])))
+    held = f"the listing holds {len(got)} operation(s), {len(ops)} of them of {spec.name} in {spec.region}"
+    if created is None:
+        return _unreadable(spec, now(), f"{created_why or 'the creation time of the cluster is not known'}: "
+                                        f"the listing cannot be proven to be this cluster's ({held})")
+    control = control_of(ops, created)
+    if control is None:
+        others = [stamp(o["start_t"]) for o in ops if o["type"] == CONTROL_TYPE and o["target"] == "cluster"]
+        return _unreadable(
+            spec, now(),
+            f"the control is missing: no {CONTROL_TYPE} of {spec.name} in {spec.region} that started within "
+            f"{CONTROL_SKEW_S:g} s of the cluster's creation ({stamp(created)}) is in the listing, so it is not "
+            f"proven to be this cluster's whole listing ({held}"
+            + (f"; its {CONTROL_TYPE} operation(s) started {', '.join(others)}: another cluster of the same name"
+               if others else "") + ")")
+    # nothing of THIS cluster precedes its own creation: an earlier operation is an earlier cluster's of the name
+    ops = [o for o in ops if o["start_t"] is None or o["start_t"] >= control["start_t"]]
     return {"kind": KIND, "cluster": spec.name, "region": spec.region, "read_at": now(), "readable": True,
             "unreadable": None, "operations": ops, "listed_in_region": len(got),
+            "control": {"operation": control["id"], "type": CONTROL_TYPE, "start": control["start"],
+                        "cluster_created": stamp(created),
+                        "proves": f"the listing holds this cluster's own {CONTROL_TYPE} (exact target, started "
+                                  f"within {CONTROL_SKEW_S:g} s of the creation time GKE reported for it)"},
             "source": f"{' '.join(argv[:4])} --region {spec.region}: the operations whose target is this cluster "
                       f"or one of its node pools"}
 
@@ -291,7 +358,7 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
 # ─── CLI (run606's collect) ─────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
-    """`python3 -m bench.clusterops record --name N --project P --zone Z --out FILE [--yes]`: the
+    """`python3 -m bench.clusterops record --name N --project P --zone Z --created-from F --out FILE [--yes]`: the
     cluster's operations record, written whatever the read answered (UNREADABLE is a record too);
     one line on stdout saying what was recorded. Exit 0: the record is evidence, not a reason to end
     the run. Without --yes nothing is read (a dry run's record says so)."""
@@ -302,6 +369,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--project", default=gke.DEFAULT_PROJECT)
     r.add_argument("--zone", default=gke.DEFAULT_ZONE)
     r.add_argument("--out", required=True)
+    r.add_argument("--created-from", default=None,
+                   help="gke-up's maintenance-exclusion.json: the creation time GKE reported for the cluster "
+                        "(cluster_created), which the listing's CREATE_CLUSTER must match; without it the "
+                        "record is 'could not be read'")
     r.add_argument("--yes", action="store_true", help="actually run gcloud (default: dry run)")
     a = ap.parse_args(argv)
     spec = gke.default_spec(a.name, project=a.project, zone=a.zone)
@@ -309,13 +380,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"DRY-RUN: {' '.join(list_command(spec))}")
         rec = dry_record(spec)
     else:
-        rec = read(spec)
+        created, why = created_from(a.created_from)
+        rec = read(spec, created=created, created_why=why)
     with open(a.out, "w") as fh:
         json.dump(rec, fh, indent=1)
         fh.write("\n")
     if rec["readable"]:
         ops = rec["operations"]
-        print(f"cluster operations of {spec.name}: {len(ops)} recorded"
+        print(f"cluster operations of {spec.name} (its {CONTROL_TYPE} {rec['control']['operation']} is in the "
+              f"listing): {len(ops)} recorded"
               + (": " + "; ".join(op_text(o) for o in ops) if ops else ""))
     else:
         print(f"cluster operations of {spec.name}: {rec['unreadable']}")

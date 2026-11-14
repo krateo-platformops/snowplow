@@ -351,6 +351,7 @@ FAKE = ("#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + 
         print(json.dumps({"name": a[3], "id": os.environ["FAKE_ID"],
                           "endpoint": os.environ.get("FAKE_ENDPOINT", "127.0.0.1"),
                           "maintenancePolicy": maintenance_policy(st, a[3]),     # #1422 (tests/fake_gke_ops.py)
+                          "createTime": create_time(st, a[3]),
                           "resourceLabels": {
             "purpose": "snowplow-bench", "issue": "606", "created-by": "bench-gke", "owner": "t",
             "ttl-expires": "9999999999"}})); sys.exit(0)

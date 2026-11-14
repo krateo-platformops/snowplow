@@ -147,6 +147,7 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + fake_gke_ops.LOADER + textwrap.dede
         print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "endpoint": "127.0.0.1",    # the server get-credentials writes below
                           "maintenancePolicy": maintenance_policy(STATE, a[3]),     # #1422
+                          "createTime": create_time(STATE, a[3]),
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
                           # #1383 gap 7: the versions GKE gave it (FAKE_GKE_VERSION: another patch)
                           "currentMasterVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,

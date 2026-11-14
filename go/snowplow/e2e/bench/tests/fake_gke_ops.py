@@ -36,6 +36,7 @@ Where each shape comes from:
 
 Knobs (environment):
   FAKE_OPERATIONS_EXTRA      a JSON list of Operation objects the region also lists (operation())
+  FAKE_GKE_RESIZES           GKE starts a RESIZE_CLUSTER of a cluster 1 s after its create, still running
   FAKE_OPERATIONS_RC         the listing exits with this code and gcloud's error text
   FAKE_OPERATIONS_KILLED_RC  the listing prints its list and exits with this code, saying nothing (a gcloud
                              that was killed: 143, or timeout(1)'s 124)
@@ -50,7 +51,7 @@ Knobs (environment):
 
 A fake gcloud is its own process, so it loads this file by path: LOADER is the source to put in front
 of its body; it defines ops_note(state, kind, argv), answer_operations(state, argv),
-answer_exclusion_update(state, argv) and maintenance_policy(state, name).
+answer_exclusion_update(state, argv), maintenance_policy(state, name) and create_time(state, name).
 """
 
 from __future__ import annotations
@@ -112,6 +113,9 @@ def ops_note(state: str, kind: str, a: list[str]) -> None:
     now = time.time()
     ops = _load(path, [])
     ops.append(operation(kind, cluster, start=now, end=now + 0.5, pool=pool, region=region))
+    if kind == "CREATE_CLUSTER" and os.environ.get("FAKE_GKE_RESIZES"):
+        # GKE resizes the new cluster's control plane by itself, and has not finished (run 26i, N1)
+        ops.append(operation("RESIZE_CLUSTER", cluster, start=now + 1, region=region))
     path.write_text(json.dumps(ops))
 
 
@@ -204,6 +208,18 @@ def answer_exclusion_update(state: str, a: list[str]) -> None:
     sys.exit(0)
 
 
+def create_time(state: str, name: str) -> str:
+    """Cluster.createTime as `clusters describe` prints it ("2026-11-14T08:54:10+00:00" on run 26i's
+    clusters: whole seconds, a +00:00 offset), 4 s before the cluster's CREATE_CLUSTER started, as there
+    (08:54:10 against 08:54:14.07). FAKE_CREATE_TIME: another instant (an earlier cluster's operation)."""
+    if os.environ.get("FAKE_CREATE_TIME"):
+        return os.environ["FAKE_CREATE_TIME"]
+    starts = [o["startTime"] for o in _load(Path(state) / "operations.json", [])
+              if o["operationType"] == "CREATE_CLUSTER" and o["targetLink"].endswith("/clusters/" + name)]
+    t = _instant(re.sub(r"\.\d+", "", starts[-1])) - 4 if starts else int(time.time())
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(t))
+
+
 def maintenance_policy(state: str, name: str) -> dict:
     """Cluster.maintenancePolicy as `clusters describe` answers it."""
     held = _load(Path(state) / f"maintenance-{name}.json", {})
@@ -219,4 +235,5 @@ LOADER = (
     "answer_operations = _fom.answer_operations\n"
     "answer_exclusion_update = _fom.answer_exclusion_update\n"
     "maintenance_policy = _fom.maintenance_policy\n"
+    "create_time = _fom.create_time\n"
 )

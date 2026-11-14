@@ -32,6 +32,10 @@ T = 1794650000.0                 # 2026-11-14T09:53:20Z
 P1 = ("churn:list_dep@1", T, T + 600)
 P2 = ("churn:list_dep@10", T + 600, T + 1200)
 DIGEST = "sha256:" + "ab" * 32
+# the cluster under test: GKE says it was created an hour before the first phase (Cluster.createTime, as
+# describe prints it), and its CREATE_CLUSTER started 4 s later, as on run 26i's clusters
+CREATED = "2026-11-14T08:53:16+00:00"            # T - 3604
+CREATE = operation("CREATE_CLUSTER", NAME, start=T - 3600, end=T - 3200)
 
 
 def _phases_file(d):
@@ -42,12 +46,18 @@ def _phases_file(d):
     return f
 
 
-def _record(d, ops, name=NAME, **env):
-    """The record run606's collect takes: the CLI, against the fake gcloud on PATH."""
-    out = d / "cluster-operations.json"
-    p = subprocess.run([sys.executable, "-m", "bench.clusterops", "record", "--name", name, "--out", str(out), "--yes"],
+def _record(d, ops, name=NAME, control=CREATE, created=CREATED, **env):
+    """The record run606's collect takes: the CLI, against the fake gcloud on PATH. `control`: the
+    cluster's own CREATE_CLUSTER, which the region lists with `ops` (None: it does not); `created`: the
+    creation time gke-up read back from the cluster, in its maintenance-exclusion.json (None: no file)."""
+    out, excl = d / "cluster-operations.json", d / "maintenance-exclusion.json"
+    if created is not None:
+        excl.write_text(json.dumps({"kind": "maintenance_exclusion", "cluster": name, "cluster_created": created}))
+    listed = ([control] if control is not None else []) + list(ops)
+    p = subprocess.run([sys.executable, "-m", "bench.clusterops", "record", "--name", name, "--created-from",
+                        str(excl), "--out", str(out), "--yes"],
                        cwd=BENCH, capture_output=True, text=True, timeout=120,
-                       env=dict(os.environ, FAKE_OPERATIONS_EXTRA=json.dumps(ops), **env))
+                       env=dict(os.environ, FAKE_OPERATIONS_EXTRA=json.dumps(listed), **env))
     assert p.returncode == 0, p.stderr           # a record is written whatever the read answered
     return out, json.loads(out.read_text()), p.stdout
 
@@ -85,14 +95,17 @@ def test_the_record_holds_this_clusters_operations_only_by_exact_target(fakes):
     path, rec, said = _record(fakes, ops)
     assert rec["readable"] is True and rec["unreadable"] is None
     assert [(o["type"], o["target"], o["status"]) for o in rec["operations"]] == [
-        ("RESIZE_CLUSTER", "cluster", "DONE"), ("UPGRADE_NODES", "nodePool/snowplow", "DONE")]
-    first = rec["operations"][0]
+        ("CREATE_CLUSTER", "cluster", "DONE"), ("RESIZE_CLUSTER", "cluster", "DONE"),
+        ("UPGRADE_NODES", "nodePool/snowplow", "DONE")]
+    # the proof that this is the cluster's own listing: its CREATE_CLUSTER, named
+    assert rec["control"]["operation"] == CREATE["name"] and rec["control"]["cluster_created"] == "2026-11-14T08:53:16Z"
+    first = rec["operations"][1]
     assert set(first) == {"id", "type", "status", "target", "start", "end", "start_t", "end_t"}
     assert first["id"] == ops[0]["name"] and first["start"] == ops[0]["startTime"] and first["end"] == ops[0]["endTime"]
     assert (first["start_t"], first["end_t"]) == (T + 100, T + 200)
     # nothing of the operation but that: no link, so no project number the evidence did not hold
     assert fake_gke_ops.PROJECT_NUMBER not in path.read_text() and "googleapis" not in path.read_text()
-    assert f"cluster operations of {NAME}: 2 recorded" in said
+    assert f"cluster operations of {NAME} (its CREATE_CLUSTER {CREATE['name']} is in the listing): 3 recorded" in said
     listed = [c for c in _calls(fakes) if c[:4] == ["gcloud", "container", "operations", "list"]]
     assert listed == [["gcloud", "container", "operations", "list", "--project", gke.DEFAULT_PROJECT,
                        "--region", "europe-west4", "--format", "json"]]          # no client-side --filter
@@ -100,8 +113,8 @@ def test_the_record_holds_this_clusters_operations_only_by_exact_target(fakes):
 
 def test_a_running_operation_is_recorded_with_no_end(fakes):
     _, rec, said = _record(fakes, [operation("RESIZE_CLUSTER", NAME, start=T + 650)])
-    (op,) = rec["operations"]
-    assert (op["status"], op["end"], op["end_t"]) == ("RUNNING", None, None)
+    op = rec["operations"][-1]
+    assert (op["status"], op["end"], op["end_t"]) == ("RUNNING", None, None) and len(rec["operations"]) == 2
     assert "not ended at the read" in said
 
 
@@ -134,6 +147,8 @@ def test_a_failed_listing_is_recorded_and_reported_as_unreadable_never_as_none(f
                               **FAILED_LISTINGS[case])
     assert rec["readable"] is False and rec["operations"] is None, rec
     assert rec["unreadable"].startswith("could not be read: ")
+    # the reason is the listing's own failure, not what a failed listing read as a list would be missing
+    assert "gcloud container operations list " in rec["unreadable"] and "the control is missing" not in rec["unreadable"]
     assert "PLACEHOLDER-OPERATOR" not in path.read_text()          # gcloud's error text names the account
     assert rec["unreadable"] in said
     v, sec, err = _evaluate(fakes, path)
@@ -146,10 +161,70 @@ def test_a_failed_listing_is_recorded_and_reported_as_unreadable_never_as_none(f
     assert "INFO cluster operations: operations could not be read" in err
 
 
+# The positive control: a listing that answers cleanly and does not hold this cluster's own CREATE_CLUSTER,
+# started when GKE says the cluster was created, proves nothing about the cluster.
+RESIZE = operation("RESIZE_CLUSTER", NAME, start=T + 100, end=T + 200)
+UNPROVEN = {
+    "an empty list": dict(ops=[], control=None),
+    "another region's list, this cluster's name and times in it": dict(ops=[], control=None, FAKE_OPERATIONS_OUT=json.dumps(
+        [operation("CREATE_CLUSTER", NAME, start=T - 3600, end=T - 3200, region="europe-west1"),
+         operation("RESIZE_CLUSTER", NAME, start=T + 100, end=T + 200, region="europe-west1")])),
+    "only another cluster's operations": dict(control=None, ops=[
+        operation("CREATE_CLUSTER", NAME + "b", start=T - 3600, end=T - 3200),
+        operation("RESIZE_CLUSTER", NAME + "b", start=T + 100, end=T + 200)]),
+    "this cluster's later operations, not its CREATE_CLUSTER": dict(control=None, ops=[
+        RESIZE, operation("CREATE_NODE_POOL", NAME, start=T - 3100, end=T - 3000, pool="snowplow")]),
+    "a re-used name: the earlier cluster's CREATE_CLUSTER, not this one's": dict(control=None, ops=[
+        operation("CREATE_CLUSTER", NAME, start=T - 90000, end=T - 89600),
+        operation("DELETE_CLUSTER", NAME, start=T - 80000, end=T - 79700), RESIZE]),
+    "a CREATE_CLUSTER of the name that started 3 minutes off the creation time": dict(control=None, ops=[
+        operation("CREATE_CLUSTER", NAME, start=T - 3604 + 180, end=T - 3200), RESIZE]),
+    "a node pool's operation at the creation time, no CREATE_CLUSTER": dict(control=None, ops=[
+        operation("CREATE_NODE_POOL", NAME, start=T - 3600, end=T - 3200, pool="snowplow"), RESIZE]),
+    "no creation time recorded for the cluster": dict(ops=[RESIZE], created=None),
+    "a creation time that is not a time": dict(ops=[RESIZE], created="soon"),
+}
+
+
+@pytest.mark.parametrize("case", list(UNPROVEN))
+def test_a_listing_not_proven_to_be_this_clusters_is_unreadable_never_none(fakes, case):
+    kw = dict(UNPROVEN[case])
+    path, rec, said = _record(fakes, kw.pop("ops"), **kw)
+    assert rec["readable"] is False and rec["operations"] is None and "control" not in rec, rec
+    assert rec["unreadable"].startswith("could not be read: ") and rec["unreadable"] in said
+    if "creation time" in case and "CREATE_CLUSTER" not in case:
+        assert "the cluster's creation time is not recorded" in rec["unreadable"]
+    else:
+        assert f"the control is missing: no CREATE_CLUSTER of {NAME} in europe-west4 that started within 120 s of " \
+               f"the cluster's creation (2026-11-14T08:53:16Z) is in the listing" in rec["unreadable"]
+    if "re-used" in case:
+        assert "its CREATE_CLUSTER operation(s) started 2026-11-13T08:53:20Z: another cluster of the same name" in \
+            rec["unreadable"]
+    _, sec, _ = _evaluate(fakes, path)
+    assert sec["state"] == "UNREADABLE" and {p["overlap"] for p in sec["phases"]} == {clusterops.UNKNOWN}
+    text = "\n".join(sec["lines"])
+    assert "operations could not be read: " in text and "no operation overlapped" not in text
+    assert "overlapped by" not in text
+
+
+def test_a_reused_name_keeps_this_clusters_operations_and_drops_the_earlier_clusters(fakes):
+    """Both clusters' CREATE_CLUSTER are listed: the creation time picks this one's, and nothing the earlier
+    cluster did is recorded as this run's."""
+    old = [operation("CREATE_CLUSTER", NAME, start=T - 90000, end=T - 89600),
+           operation("RESIZE_CLUSTER", NAME, start=T - 85000, end=T - 84000),
+           operation("DELETE_CLUSTER", NAME, start=T - 80000, end=T - 79700)]
+    path, rec, _ = _record(fakes, old + [RESIZE])
+    assert rec["readable"] is True and rec["control"]["operation"] == CREATE["name"]
+    assert [o["id"] for o in rec["operations"]] == [CREATE["name"], RESIZE["name"]]
+    # read against the earlier cluster's creation time, the same listing is the EARLIER cluster's
+    _, rec, _ = _record(fakes, old + [RESIZE], created="2026-11-13T08:53:18+00:00")
+    assert rec["control"]["operation"] == old[0]["name"]
+
+
 def test_a_listing_that_does_not_answer_in_time_is_unreadable():
     def hung(argv, **kw):
         raise subprocess.TimeoutExpired(argv, kw["timeout"])
-    rec = clusterops.read(gke.default_spec(NAME), run=hung, timeout=7)
+    rec = clusterops.read(gke.default_spec(NAME), created=T - 3604, run=hung, timeout=7)
     assert rec["readable"] is False and rec["operations"] is None
     assert rec["unreadable"] == "could not be read: gcloud container operations list did not answer within 7 s"
 
@@ -227,7 +302,7 @@ def test_an_operation_with_no_start_time_leaves_every_phase_unknown(fakes):
     op = operation("RESIZE_CLUSTER", NAME, start=T + 100, end=T + 200)
     del op["startTime"]
     path, rec, _ = _record(fakes, [op])
-    assert rec["operations"][0]["start_t"] is None
+    assert rec["operations"][-1]["start_t"] is None
     _, sec, _ = _evaluate(fakes, path)
     assert sec["state"] == "UNREADABLE" and "no start time for operation(s)" in sec["why"]
     assert all(p["overlap"] == clusterops.UNKNOWN for p in sec["phases"])
@@ -362,6 +437,8 @@ def test_gke_up_adds_the_exclusion_reads_it_back_and_records_it(fakes, capsys):
     assert rec["read_back"] == {"startTime": rec["requested"]["start"], "endTime": rec["requested"]["end"],
                                 "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}
     assert "control-plane resizes and repairs" in rec["does_not_cover"]
+    # when GKE says the cluster was created, from the same read-back: what the operations record is proven against
+    assert gke.rfc3339_epoch(rec["cluster_created"]) is not None
     assert "maintenance exclusion in place: bench-run-ttl (no_upgrades, " in out.out
     assert "it does not cover control-plane resizes and repairs" in out.out
 
@@ -480,10 +557,8 @@ def _gcloud(state):
 
 def test_run606_records_the_operations_marks_the_phases_and_holds_the_exclusion(harness):  # noqa: F811
     """One whole run: GKE resizes the control plane before the measure and has not finished at collect."""
-    import time
     env, state, _, tmp = harness
-    resize = operation("RESIZE_CLUSTER", RUN_NAME, start=time.time() - 5)
-    p = _run606(env, FAKE_OPERATIONS_EXTRA=json.dumps([resize]))
+    p = _run606(env, FAKE_GKE_RESIZES="1")
     out = tmp / "out"
     log = (out / "run.log").read_text()
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
@@ -500,10 +575,15 @@ def test_run606_records_the_operations_marks_the_phases_and_holds_the_exclusion(
     assert i_list < next(i for i, a in enumerate(gcl) if a[:3] == ["container", "clusters", "delete"])
     rec = json.loads((out / "cluster-operations.json").read_text())
     assert rec["readable"] is True and rec["cluster"] == RUN_NAME
+    # proven to be this cluster's listing: its own CREATE_CLUSTER, started when GKE said the cluster was created
+    made = next(o for o in rec["operations"] if o["type"] == "CREATE_CLUSTER")
+    assert rec["control"]["operation"] == made["id"]
+    assert 0 <= made["start_t"] - gke.rfc3339_epoch(excl["cluster_created"]) <= 5
     kinds = [o["type"] for o in rec["operations"]]
     assert kinds.count("CREATE_CLUSTER") == 1 and kinds.count("CREATE_NODE_POOL") == 2
-    assert "UPDATE_CLUSTER" in kinds and kinds[0] == "RESIZE_CLUSTER"        # the exclusion's own update
-    assert rec["operations"][0]["end"] is None
+    # the exclusion's own update is there; the resize GKE started after the create, not ended at collect
+    assert "UPDATE_CLUSTER" in kinds and kinds[0] == "CREATE_CLUSTER" and kinds.count("RESIZE_CLUSTER") == 1
+    assert next(o for o in rec["operations"] if o["type"] == "RESIZE_CLUSTER")["end"] is None
     # the mark: every measured phase started after the resize, which had not ended at collect
     sec = json.loads((out / "verdict.json").read_text())["report"]["cluster_operations_report_only"]
     assert sec["state"] == "READ" and sec["phases"], sec

@@ -2136,7 +2136,9 @@ node_platforms() {
 # of its node pools), each with its type, status, start and end, into $OUT/cluster-operations.json.
 # Run 26i: GKE resized each arm's control plane by itself, at different times per arm, and nothing of
 # the run said so. evaluate marks every measured phase an operation overlapped. A listing that fails is
-# recorded as could-not-be-read, never as no operation; the read needs no cluster (it works after the
+# recorded as could-not-be-read, never as no operation, and so is one that does not hold this cluster's
+# own CREATE_CLUSTER, started when GKE says the cluster was created (the creation time gke-up read back,
+# in maintenance-exclusion.json): an empty or foreign list proves nothing; the read needs no cluster (it works after the
 # delete too), and is bounded like every other read of collect, inside collect's own cap (a run that
 # never measured has no phase to mark, and takes no record).
 cluster_operations() {
@@ -2146,7 +2148,7 @@ cluster_operations() {
     return 0
   fi
   if line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.clusterops record --name "$RUN_NAME" --project "$PROJECT" \
-               --zone "$ZONE" --out "$CLUSTER_OPS" --yes 2>"$KERR")"; then
+               --zone "$ZONE" --created-from "$OUT/maintenance-exclusion.json" --out "$CLUSTER_OPS" --yes 2>"$KERR")"; then
     log "$line"
   else
     # no record at all: evaluate reads a missing file as could-not-be-read too
