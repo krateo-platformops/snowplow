@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -220,6 +221,20 @@ func (uc *unstructuredClient) resourceInterfaceFor(opts Options) (dynamic.Resour
 	if opts.GVK.Empty() && !opts.GVR.Empty() {
 		gvk, err := uc.mapper.KindFor(opts.GVR)
 		if err != nil {
+			// #1414 — NO MAPPING IS NOT AN ANSWER; THE APISERVER HAS ONE.
+			// The mapper is a copy of discovery, and it has no mapping in three
+			// different situations it cannot tell apart: the resource is not
+			// served (no CRD), its group's discovery failed or is stale (client-go
+			// drops such a group from the mapper without an error), or the copy
+			// predates the CRD. Returning the miss made every one of them a
+			// non-Status error, which the callers answer 500. So a fully named
+			// resource is requested as named, and the apiserver answers for
+			// itself: 404 "the server could not find the requested resource" for
+			// an unserved one, its own 5xx for a failing backend, the object for
+			// one the copy had not caught up with. One rule for every resource.
+			if meta.IsNoMatchError(err) && opts.GVR.Version != "" && opts.GVR.Resource != "" {
+				return uc.resourceInterface(opts.GVR, opts.Namespace), nil
+			}
 			return nil, err
 		}
 		opts.GVK = gvk
@@ -230,14 +245,14 @@ func (uc *unstructuredClient) resourceInterfaceFor(opts Options) (dynamic.Resour
 		return nil, err
 	}
 
-	var ri dynamic.ResourceInterface
-	if len(opts.Namespace) == 0 {
-		ri = uc.dynamicClient.Resource(restMapping.Resource)
-	} else {
-		ri = uc.dynamicClient.Resource(restMapping.Resource).
-			Namespace(opts.Namespace)
+	return uc.resourceInterface(restMapping.Resource, opts.Namespace), nil
+}
+
+func (uc *unstructuredClient) resourceInterface(gvr schema.GroupVersionResource, namespace string) dynamic.ResourceInterface {
+	if len(namespace) == 0 {
+		return uc.dynamicClient.Resource(gvr)
 	}
-	return ri, nil
+	return uc.dynamicClient.Resource(gvr).Namespace(namespace)
 }
 
 func found(el metav1.APIResource, str string) bool {
