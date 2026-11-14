@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"sort"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
@@ -102,13 +103,45 @@ func BehindKeys(ctx context.Context, held map[string]HeldDigests) []string {
 // write for ctx's identity from entry (see the file comment). "" when that
 // hit would not serve the cell (the widgetContent gate fails closed): the tab
 // is behind.
+//
+// #1430: the widgetContent digest is computed once per (answer, identity,
+// published RBAC snapshot) and reused by every caller: the arm (ArmGated),
+// the catch-up check (BehindKeys), a written frame (NoteFrameWritten) and a
+// class move (GatedMoved). The /call hit that stamps the header fills it with
+// the digest of the bytes it wrote (noteServedView); it never reads it.
 func servedDigestNow(ctx context.Context, class string, e *cache.ResolvedEntry) string {
 	if class == cache.CacheEntryClassWidgetContent {
-		gated, served := gateWidgetEnvelope(ctx, e.Raw())
-		if !served {
-			return ""
+		ui, err := xcontext.UserInfo(ctx)
+		if err != nil {
+			return "" // the gate refuses a request with no identity
 		}
-		return cache.AnswerDigest(gated, e.StageOutcomes)
+		// #1430 — one gate per (the cell's answer, this identity, the published
+		// RBAC snapshot): every input the gate reads (cache/served_view_memo.go).
+		return e.ServedViewDigest(cache.ServedViewIdentityOf(ui.Username, ui.Groups), func() (string, bool) {
+			return gatedAnswerDigest(ctx, e)
+		})
 	}
 	return e.ContentDigest()
+}
+
+// gatedAnswerDigest runs the serve-time gate over e for ctx's identity and
+// digests the answer its /call hit would write: the uncached computation
+// servedDigestNow memoises. False when that hit would not serve the cell.
+func gatedAnswerDigest(ctx context.Context, e *cache.ResolvedEntry) (string, bool) {
+	gated, served := gateWidgetEnvelope(ctx, e.Raw())
+	if !served {
+		return "", false
+	}
+	return cache.AnswerDigest(gated, e.StageOutcomes), true
+}
+
+// noteServedView stores the digest a widgetContent /call hit stamped for ctx's
+// identity (#1430), so that identity's next /refreshes arm reuses it. before
+// is cache.ServedViewRBACNow() read BEFORE the hit's gate ran.
+func noteServedView(ctx context.Context, e *cache.ResolvedEntry, before cache.ServedViewRBAC, digest string) {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return
+	}
+	e.NoteServedView(cache.ServedViewIdentityOf(ui.Username, ui.Groups), before, digest)
 }

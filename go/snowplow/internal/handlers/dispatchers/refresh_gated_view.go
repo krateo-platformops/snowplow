@@ -35,6 +35,14 @@
 // a burst of unrelated RBAC events (per-composition RBAC) from re-gating every
 // open tab's shells.
 //
+// THE COST OF THE DIGEST (#1430). The served digest needs the gate (unmarshal
+// the shell, one verdict per action, re-encode, hash). It is computed once per
+// (the shell's answer, this identity, the published RBAC snapshot) and reused
+// by the arm, the catch-up check, a written frame and a class move
+// (servedDigestNow; cache/served_view_memo.go has the key and why the snapshot,
+// not the class, names the RBAC state). The class test above still decides
+// WHETHER a connection re-checks; it never decides which digest is returned.
+//
 // GENERAL. Nothing names a class: a key is tracked when its class is
 // identity-free (one cell narrowed per requester), and the digest is the one
 // the /call hit of that class would write for this identity.

@@ -165,6 +165,7 @@ var storeRegistry = map[string]string{
 	"cache.identityFreeClasses":                       "no-content (the identity-free class list)",
 	"cache.secretsCacheRetainedDataKeys":              "no-content (#510: Secret data-key NAMES only — the AUTHN informer transform's allow-list; no value, no identity)",
 	"rbac.bindingSetShard.m":                          "snapshot-scoped (exact username + groups)",
+	"cache.servedViewMemo.slots":                      "snapshot-scoped (#1430 served digest of a gated cell per exact username + groups, reused only under the RBAC snapshot it was gated against and for the answer it was gated from; a digest, never a body)",
 	"rbac.snapshotAuthzShard.m":                       "snapshot-scoped (username + groups FNV64, same username only)",
 	"rbac.requesterProfileShard.m":                    "snapshot-scoped (username + groups FNV64, same username only)",
 	"schema.crdSchemaMemo":                            "free+regated (CRD schema, identity-free)",
