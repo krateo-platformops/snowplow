@@ -501,9 +501,9 @@ func TestStrategicMergePatchIsLoud(t *testing.T) {
 	}
 }
 
-// statusWrite is the request line of the scripted /status write: the ServiceAccount's patch.
+// statusWrite is the request line of the scripted /status write: the simulated controller's patch.
 func statusWrite(l map[string]any) bool {
-	return l["verb"] == "patch" && l["resource"] == "incidents/status" && l["identity"] == "sa"
+	return l["verb"] == "patch" && l["resource"] == "incidents/status" && l["identity"] == "controller"
 }
 
 func logged(h *harness, f func(map[string]any) bool) bool {
@@ -540,7 +540,7 @@ func TestApplyStatusV1(t *testing.T) {
 			n++
 		}
 	}
-	eq(t, n, 1, "one status write by the ServiceAccount")
+	eq(t, n, 1, "one status write by the controller")
 	w.quiet()
 
 	g := newHarness(t, opts{})
