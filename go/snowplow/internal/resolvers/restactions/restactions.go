@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/itchyny/gojq"
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/ptr"
@@ -117,10 +116,16 @@ func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction
 	var raw []byte
 	if opts.In.Spec.Filter != nil {
 		q := ptr.Deref(opts.In.Spec.Filter, "")
-		// #1054 — the RESTAction filter's JQ, timed on the request (the eval
-		// keeps its context.TODO).
+		// #1054 — the RESTAction filter's JQ, timed on the request. The eval
+		// is not cancellable and never was (it ran on context.TODO(), whose
+		// Done is nil): the filter is in-memory work over stages already
+		// fetched, and its result is the cell every requester of the key
+		// shares. It runs on context.Background() because that is the one
+		// context the gojq fork treats as non-cancellable (execute.go:24): on
+		// any other it polls ctx.Done() before every opcode — ~2.7% of all
+		// CPU on run 23 for a channel that could never close.
 		jq := slowcall.Start(ctx, slowcall.PhaseJQ)
-		vals, s, err := evalFilter(context.TODO(), q, dict)
+		vals, s, err := evalFilter(context.Background(), q, dict)
 		jq.End()
 		if err != nil {
 			// #709 — when a stage without continueOnError failed, the filter
@@ -179,14 +184,17 @@ func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction
 // encoder, with no separator; the identity program yields its input
 // unchanged, so jqutil.Eval(".") of one output is that encoder applied to it,
 // and the concatenation is jqutil.Eval's text for the whole stream.
+//
+// The program comes from jqsupport.Compile (run 23: the per-resolve parse +
+// compile was ≈0.56% of all CPU): the program gojq.Parse + gojq.Compile build,
+// reused while it is alive. A reused program's constants are shared across
+// resolves, so its outputs must stay read-only, and they do: they reach only
+// jqutil's encoder (below) and jqsupport.DecodedObjectOf (ResolveStatusTree),
+// which reads them into a fresh tree.
 func evalFilter(ctx context.Context, query string, data any) ([]any, string, error) {
-	pq, err := gojq.Parse(query)
+	code, err := jqsupport.Compile(query)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid jq query %q: %w", query, err)
-	}
-	code, err := gojq.Compile(pq, gojq.WithModuleLoader(jqsupport.ModuleLoader()))
-	if err != nil {
-		return nil, "", fmt.Errorf("unable to compile jq query %q: %w", query, err)
+		return nil, "", err
 	}
 	var (
 		vals  []any

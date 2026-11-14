@@ -258,7 +258,7 @@ func e767Setup(t *testing.T) *e767Env {
 	cache.ResetSecretsInformerForTest()
 	cache.ResetSecretsSnapshotForTest()
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		n: {ObjectMeta: metav1.ObjectMeta{Namespace: c681AuthnNS, Name: n},
+		n: {ObjectMeta: authnMeta(c681AuthnNS, n, e767User),
 			Data: map[string][]byte{"server-url": []byte(e.srv.URL), "token": []byte("tok-767")}},
 	}})
 	cache.ForceSecretsCacheReadyForTest(c681AuthnNS)

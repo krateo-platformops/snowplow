@@ -130,7 +130,8 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var hitBumpFns []string
-	getNotes := false
+	notes := map[string]bool{}
+	getDelegates := false
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -162,10 +163,17 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 				}
 				return true
 			})
-			if fd.Name.Name == "Get" && fd.Recv != nil {
+			// #1265: Get is GetReportingMiss folded to a bool, so the note may sit
+			// in either, as long as Get reaches it.
+			if (fd.Name.Name == "Get" || fd.Name.Name == "GetReportingMiss") && fd.Recv != nil {
 				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					if id, ok := n.(*ast.Ident); ok && id.Name == "noteServeWhileDirty" {
-						getNotes = true
+					if id, ok := n.(*ast.Ident); ok {
+						switch {
+						case id.Name == "noteServeWhileDirty":
+							notes[fd.Name.Name] = true
+						case fd.Name.Name == "Get" && id.Name == "GetReportingMiss":
+							getDelegates = true
+						}
 					}
 					return true
 				})
@@ -176,7 +184,7 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 		t.Fatalf("SS: hit_total must be bumped ONLY in getCore (the customer Get funnel), found %v — a new customer "+
 			"hit path must go through Get, which notes a stale serve", hitBumpFns)
 	}
-	if !getNotes {
+	if !notes["Get"] && !(getDelegates && notes["GetReportingMiss"]) {
 		t.Fatalf("SS: ResolvedCacheStore.Get must call noteServeWhileDirty — every counted hit is a candidate stale serve")
 	}
 }

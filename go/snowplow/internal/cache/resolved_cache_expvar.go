@@ -115,6 +115,7 @@ func resolvedCacheStatsByStatOf(s ResolvedCacheStats) map[string]int64 {
 		"evict_ttl_total":               int64(s.EvictTTLTotal),
 		"evict_max_age_total":           int64(s.EvictMaxAgeTotal),           // 1.12.6 C5 bounded lifetime
 		"evict_no_representative_total": int64(s.EvictNoRepresentativeTotal), // #444
+		"evict_unstorable_total":        int64(s.EvictUnstorableTotal),       // #1255
 		"evict_delete_total":            int64(s.EvictDeleteTotal),
 		// #345 — #248's resident-suppressed GAUGE (current count, up/down), not a
 		// total. Non-zero DURING the UAF-decline-freeze; distinguishes decline-

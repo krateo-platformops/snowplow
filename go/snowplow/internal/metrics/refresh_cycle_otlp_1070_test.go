@@ -84,8 +84,8 @@ func TestRefreshCycle1070_OTLPAndExpvarAgree(t *testing.T) {
 		ms(x.resolveMS)
 		ctx = cache.WithL1KeyContext(ctx, k)
 		in := x.in
-		if c.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(x.body), Inputs: &in}, c.CaptureGen(k)) {
-			cache.PublishRefreshed(ctx, k)
+		if put := c.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(x.body), Inputs: &in}, c.CaptureGen(k)); put.Stored() {
+			cache.PublishRefreshed(ctx, k, put)
 		}
 		done <- struct{}{}
 		return nil
@@ -114,7 +114,14 @@ func TestRefreshCycle1070_OTLPAndExpvarAgree(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("PRE: the queued refresh never ran")
 	}
-	frame(queued, 1200)
+	// #1321 — the queued refresh's Put is identical: it publishes no frame, so
+	// put_to_frame has no normal-tier sample (publishing is synchronous, so a
+	// frame would already be in the sink).
+	select {
+	case <-st.Keys:
+		t.Fatal("RED (#1321): an identical refresh Put published a frame")
+	default:
+	}
 	if err := cache.RunRefreshNow(context.Background(), direct); err != nil {
 		t.Fatalf("PRE: RunRefreshNow: %v", err)
 	}
@@ -181,7 +188,7 @@ func TestRefreshCycle1070_OTLPAndExpvarAgree(t *testing.T) {
 	want := map[string]map[string]uint64{ // name → tier → the one sample
 		"snowplow_refresh_cycle_wait_ms":               {cache.RefreshTierNormal: 1500},
 		"snowplow_refresh_cycle_duration_ms":           {cache.RefreshTierNormal: 2500, cache.RefreshTierDirect: 700},
-		"snowplow_refresh_broadcaster_put_to_frame_ms": {cache.RefreshTierNormal: 1200, cache.RefreshTierDirect: 4000},
+		"snowplow_refresh_broadcaster_put_to_frame_ms": {cache.RefreshTierDirect: 4000}, // #1321: no frame for the identical Put
 	}
 	for name, sums := range want {
 		var m map[string]evHist

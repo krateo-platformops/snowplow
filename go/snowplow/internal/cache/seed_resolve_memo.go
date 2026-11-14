@@ -166,6 +166,11 @@ type SeedResolveMemo struct {
 	// captured dep moved past the entry's Stamp, so the caller resolved fresh.
 	// Also counted in misses (a stale entry is a miss to the caller).
 	staleMisses uint64
+
+	// shadow is the measurement-only in-flight shadow
+	// (seed_resolve_memo_shadow.go): it counts would-joins and never changes a
+	// Load or a Store.
+	shadow memoShadow
 }
 
 // memoDepIndex is one GVR's slice of the memo's dep index.
@@ -335,8 +340,12 @@ func (mo *SeedResolveMemo) LoadLayeredWithStates(key, consumer string) (map[stri
 	body, err := decodeMemoBody(val.Body)
 	if err != nil {
 		// Unreachable for bytes encoding/json produced; fail toward a fresh
-		// resolve and drop the entry rather than serve something else.
+		// resolve and drop the entry rather than serve something else. The
+		// caller resolves fresh, so the lookup counted as a hit above is a
+		// miss.
 		mo.mu.Lock()
+		mo.hits--
+		mo.misses++
 		if mo.m[key] == val {
 			mo.removeLocked(key, val)
 		}
@@ -700,6 +709,27 @@ func TrackDepMoves(mo *SeedResolveMemo) (untrack func()) {
 	return func() { UntrackDepMoves(mo) }
 }
 
+// dropTrackedResolveMemoEntriesForTest empties every memo TrackDepMoves
+// tracks. ResetDepsForTest calls it: an entry's freshness is judged against
+// the DepTracker's per-coordinate buckets (seedMemoDepsMovedSince), and the
+// reset discards that tracker. An entry produced before it would read
+// "unmoved" against the fresh tracker forever, so a process-global memo (the
+// refresher's, refreshResolveMemo) served one test's RESTAction output to the
+// next test's resolve of a same-named RESTAction (#1347 review F1). Production
+// never resets the tracker: there every delete, recreate or edit of a captured
+// dep bumps its bucket and drops the entry.
+func dropTrackedResolveMemoEntriesForTest() {
+	resolveMemoMoveSubscribers.Range(func(k, _ any) bool {
+		mo := k.(*SeedResolveMemo)
+		mo.mu.Lock()
+		for key, v := range mo.m {
+			mo.removeLocked(key, v)
+		}
+		mo.mu.Unlock()
+		return true
+	})
+}
+
 // UntrackDepMoves stops TrackDepMoves for mo. nil-safe and idempotent.
 func UntrackDepMoves(mo *SeedResolveMemo) {
 	if mo == nil {
@@ -833,6 +863,18 @@ func (mo *SeedResolveMemo) BodyBytes() int64 {
 		return 0
 	}
 	return mo.bodyBytes.Load()
+}
+
+// LookupStats is Stats plus StaleMisses, read together under one lock so
+// stale <= misses in every snapshot (the exported lookup counters).
+// nil-receiver-safe.
+func (mo *SeedResolveMemo) LookupStats() (hits, misses, staleMisses uint64) {
+	if mo == nil {
+		return 0, 0, 0
+	}
+	mo.mu.Lock()
+	defer mo.mu.Unlock()
+	return mo.hits, mo.misses, mo.staleMisses
 }
 
 // StaleMisses returns how many lookups found an entry whose captured deps had

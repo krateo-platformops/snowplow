@@ -1,0 +1,32 @@
+# ── #1362: the grant for snowplow's /debug/* operator surface ────────────────
+# snowplow authorizes every /debug/* request through Kubernetes RBAC as a
+# NON-RESOURCE request. The verb is the lowercase HTTP method and the path is
+# the request path, decided for the caller's JWT username and groups
+# (middleware.DebugAuthz). An authenticated caller without this grant gets 403.
+# The rule below is the whole grant: `get` for every GET route, and `post` for
+# POST /debug/shadow-parity.
+#
+# WHAT THE SURFACE SHOWS. Several routes report metadata about EVERY identity's
+# cache entries, and about objects the holder's own RBAC may forbid:
+# coordinates, item counts, binding UIDs, informer-store resourceVersions. No
+# route returns a resolved body. Grant it to operators only.
+#
+# UNBOUND ON PURPOSE. This chart has no notion of an admin group, so it binds
+# this role to no one. Bind it to your operator group yourself, for example:
+#
+#   kubectl create clusterrolebinding snowplow-debug-operators \
+#     --clusterrole={{ include "snowplow.fullname" . }}-debug-{{ .Release.Namespace }} \
+#     --group=<your-operator-group>
+#
+# An identity bound to the built-in `cluster-admin` ClusterRole already holds
+# it, because cluster-admin carries `nonResourceURLs: ["*"]`. A read-only
+# operator role is the same rule with `verbs: ["get"]`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "snowplow.fullname" . }}-debug-{{ .Release.Namespace }}
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+rules:
+- nonResourceURLs: ["/debug/*"]
+  verbs: ["get", "post"]

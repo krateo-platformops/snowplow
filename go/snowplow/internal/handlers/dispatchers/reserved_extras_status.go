@@ -56,6 +56,13 @@ type reservedExtrasStatus struct {
 	Details    reservedExtrasDetails `json:"details"`
 }
 
+// isReservedExtrasRefusal reports whether err is (or wraps) a #1116 refusal:
+// the resolver refused the request's extras before reading anything.
+func isReservedExtrasRefusal(err error) bool {
+	_, ok := api.AsReservedExtrasError(err)
+	return ok
+}
+
 // WriteReservedExtrasRefusal answers the 400 when err is (or wraps) a #1116
 // refusal and reports whether it did. Any other error is left to the caller.
 func WriteReservedExtrasRefusal(w http.ResponseWriter, err error) bool {

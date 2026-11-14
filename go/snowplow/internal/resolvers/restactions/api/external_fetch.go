@@ -19,6 +19,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -210,10 +211,15 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	// snowplow#229 / audit A1: this was `httpcall.HTTPClientForEndpoint`
 	// verbatim, which DROPS the CA bundle of a TOKEN-AUTH endpoint
 	// (plumbing transport.go:37 returns before the CA install when
-	// !HasCertAuth()). That is snowplow's own SA endpoint — the default
-	// for every api-step with no `endpointRef` — so every non-GET such
-	// step failed TLS with x509-unknown-authority while GETs escaped by
-	// being intercepted upstream. httpClientForEndpoint covers exactly
+	// !HasCertAuth()). That is snowplow's own SA endpoint, which at #229
+	// was the default for every api-step with no `endpointRef`, so every
+	// non-GET such step failed TLS with x509-unknown-authority while GETs
+	// escaped by being intercepted upstream. Since #268/#292 a customer
+	// api-step with no `endpointRef` dials the caller's own clientconfig;
+	// the SA endpoint is dialled by a userAccessFilter stage (GET/HEAD
+	// only: #1281 refuses any other verb) and, through the ctx-carried
+	// internal endpoint, by background resolves (the seed, the refresher,
+	// prewarm). httpClientForEndpoint covers exactly
 	// that shape and DELEGATES to plumbing verbatim for every other one,
 	// so the live cert-auth population is byte-identical. See
 	// endpoints_tls.go for the full trace.
@@ -281,9 +287,10 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 
 	ct := respo.Header.Get("Content-Type")
 	// AUDIT-4 — what the authority answered, for the audit record only
-	// (stage_audit.go). The returned envelope is unchanged.
-	answer := dialAnswerFromContext(ctx)
-	answer.answered(respo.StatusCode)
+	// (stage_audit.go): Send recorded the status line, or why there is none, on
+	// the dial's Answer (credhttp/answer.go); a 2xx body not used is noted
+	// below. The returned envelope is unchanged.
+	answer := credhttp.AnswerFrom(ctx)
 
 	// --- non-2xx shaping (transcribed BYTE-IDENTICALLY from
 	// request.go:98-116) --- (AC5; falsifier (j)).
@@ -305,7 +312,7 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	dat, rerr := io.ReadAll(respo.Body)
 	if rerr != nil {
 		// #523: same transport class as the non-2xx read above.
-		answer.note(dialNoteBodyUnread)
+		answer.Note(audit.NoteBodyUnread)
 		redErr := redact.ErrorURL(rerr)
 		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 	}
@@ -324,7 +331,7 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 		// resolve), NO panic. The envelope message is the conversion
 		// error only; the endpoint auth never appears in it (AC6;
 		// falsifiers (e),(g)).
-		answer.note(dialNoteBodyUnconvertible)
+		answer.Note(audit.NoteBodyUnconvertible)
 		return response.New(http.StatusUnprocessableEntity, cerr), nil, ct, nil
 	}
 

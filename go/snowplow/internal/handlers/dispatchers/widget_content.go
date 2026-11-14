@@ -62,6 +62,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -141,6 +142,11 @@ func withWidgetContentPutSinks(ctx context.Context) context.Context {
 	ctx, _ = cache.WithExternalTouchedSink(ctx)
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	ctx, _ = cache.WithUAFTouchedSink(ctx)
+	// #1319 — not a Put-gate sink: the collector the widget's apiRef
+	// RESTAction reports its stage outcomes into, read back by
+	// populateWidgetContentL1 (api.StageOutcomesFromContext) and kept on the
+	// shell so a content hit answers with them.
+	ctx, _ = api.WithStageOutcomes(ctx)
 	return ctx
 }
 
@@ -318,6 +324,10 @@ func populateWidgetContentL1(
 	// refuse it anyway). recordWidgetDeps is ALSO skipped on a declined path —
 	// there is no entry to dep-track.
 	if !verdict.Store() {
+		// #1255 — a PERMANENT decline evicts an older shell of this key (the
+		// keep-warm walk re-resolves resident shells): no writer can ever replace
+		// it. A transient decline keeps it.
+		evictOnPermanentDecline(ctx, c, verdict, key)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			log.Debug("widget_content.populate.skip_declared_write",
@@ -387,6 +397,8 @@ func populateWidgetContentL1(
 	// gate makes the property hold by OBSERVATION rather than by that argument.
 	if uafSink := cache.UAFTouchedSinkFromContext(ctx); uafSink.Count() > 0 {
 		cache.BumpWidgetsUAFPutDeclined()
+		// #1255 — an older shell of this key can never be replaced: evict it.
+		evictUnstorable(ctx, c, key, cache.UnstorableUAF)
 		log.Debug("widget_content.populate.skip_user_access_filter",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -402,6 +414,8 @@ func populateWidgetContentL1(
 
 	// #398 — the identity-FREE content shell must never hold a Secret body.
 	if cache.DeclineSensitivePut(ctx) {
+		// #1255 — an older shell of this key can never be replaced: evict it.
+		evictUnstorable(ctx, c, key, cache.UnstorableSensitive)
 		log.Debug("widget_content.populate_declined_sensitive",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -420,18 +434,22 @@ func populateWidgetContentL1(
 	// it (the boot-seed exemption). cache.IsPhase1Done() — the same atomic /readyz
 	// consults — is the authoritative pre/post-readyz boundary (the seed-mode
 	// discriminator freshness-audit ruled; seedScopeMode is not threaded into walk()).
-	// stage-outcomes-waiver: a widgetContent cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
+		// #1319 — the outcomes of the resolve that built this shell ("" =
+		// complete), from the collector withWidgetContentPutSinks installed.
+		StageOutcomes: storableStageOutcomes(api.StageOutcomesFromContext(ctx)),
 	}
+	var put cache.PutOutcome
 	if cache.IsPhase1Done() {
 		// Post-readyz (keep-warm / gvr-discovered) re-Put — generation-guarded.
 		// PutIfGen (insert-or-replace): gvr-discovered cells FIRST-fill post-readyz,
 		// so an insert-on-absent (gen 0) must succeed; a mid-resolve DELETE tombstones
 		// the gen → refuse.
-		if !c.PutResolvedIfGen(ctx, verdict, key, entry, capturedGen) {
+		put = c.PutResolvedIfGenOutcome(ctx, verdict, key, entry, capturedGen)
+		if !put.Stored() {
 			log.Debug("widget_content.populate_refused_gen_moved",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
@@ -448,7 +466,8 @@ func populateWidgetContentL1(
 		// before this Put; a dep event in between dirty-marked a key that was not
 		// resident yet. The remark re-marks it once if any of those deps moved since
 		// the resolve began. It never refuses.
-		if !c.PutResolvedThenRemark(ctx, verdict, key, entry) {
+		put = c.PutResolvedThenRemark(ctx, verdict, key, entry)
+		if !put.Stored() {
 			return
 		}
 	}
@@ -462,6 +481,16 @@ func populateWidgetContentL1(
 	// recordWidgetDeps reads (the walker's `in` and `res` are the same CR
 	// shape; recordWidgetDeps is robust to either, but we mirror widgets.go).
 	recordWidgetDeps(ctx, log, key, gvr, res)
+
+	// #1321 B1 — the keep-warm walker re-Puts an ALREADY-RESIDENT shell, and a
+	// /refreshes stream can be armed on it (widgets.go stamps the shell key on a
+	// widgetContent hit). A re-Put that changed the shell's bytes announces the
+	// change itself: otherwise the refresher's later Put of the same bytes is
+	// identical, publishes nothing, and a tab holding the old shell is never
+	// told. The shell key folds no identity, exactly as on the refresher path,
+	// which has always published it: a frame names the key and nothing else, and
+	// each armed tab's refetch is gated for its own user (gateWidgetEnvelope).
+	publishIfSubscribed(key, put)
 }
 
 // isRBACSensitiveApiRefWidget reports whether `obj` (a widget CR's

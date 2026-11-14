@@ -465,7 +465,7 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	var armed atomic.Bool
 	restore := setResolveOnceForTest(func(ctx context.Context, i cache.ResolvedKeyInputs) ([]byte, error) {
 		if armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup([]string{psGroup}))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, []string{psGroup}))
 			i431GrantWide(t, dyn, psCarol)
 			out, err := resolveOnceProd(ctx, i) // reads under the transient grant
 			i431RevokeWide(t, dyn, psCarol)

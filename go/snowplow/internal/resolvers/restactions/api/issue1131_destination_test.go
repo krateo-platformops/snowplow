@@ -203,7 +203,9 @@ func TestIssue1131_F_TheReasonRanksWithSnowplowsOwnRefusals(t *testing.T) {
 	for _, tc := range []struct{ first, second, want string }{
 		{StageReasonError, StageReasonDestinationRefused, StageReasonDestinationRefused},
 		{StageReasonTimeout, StageReasonDestinationRefused, StageReasonDestinationRefused},
-		{StageReasonDestinationRefused, StageReasonForbidden, StageReasonForbidden},
+		// #1347 ruling: a cut / failed code outranks a denial (group first).
+		{StageReasonDestinationRefused, StageReasonForbidden, StageReasonDestinationRefused},
+		{StageReasonForbidden, StageReasonDestinationRefused, StageReasonDestinationRefused},
 		{StageReasonDestinationRefused, StageReasonInvalidPath, StageReasonInvalidPath},
 	} {
 		s := newStageOutcomes()

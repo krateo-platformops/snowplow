@@ -151,8 +151,12 @@ func newB903Env(t *testing.T) *b903Env {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		meta := metav1.ObjectMeta{Name: name, Namespace: b903AuthnNS}
+		if name == kubeutil.MakeDNS1123Compatible(b903User)+"-clientconfig" {
+			meta = authnMeta(b903AuthnNS, name, b903User) // #1382: the caller's own, as authn writes it
+		}
 		b, _ := json.Marshal(corev1.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b903AuthnNS}, Data: data})
+			ObjectMeta: meta, Data: data})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(b)
 	}))

@@ -144,6 +144,16 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 	out := make([]cache.PrewarmTarget, 0, len(base)+len(classes))
 	unmatched := 0
 	for _, t := range base {
+		// #1334 — every seed resolves under snowplow's own ServiceAccount
+		// transport (withCohortSeedContext). An identity the apiserver does not
+		// treat as authenticated holds no credential snowplow could act for it
+		// with, so it is never a seed target: snowplow acts for it only
+		// impersonated, on its own request. The apiserver's group rule decides
+		// (cache.Authenticated), never a name.
+		if !cache.Authenticated(t.Subject.Username, t.Subject.Groups) {
+			unmatched++
+			continue
+		}
 		sig := learnedClassSignature(t.Subject.Username, t.Subject.Groups)
 		pop := known[sig]
 		if pop == 0 {
@@ -158,6 +168,10 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 	for _, sc := range sigs {
 		c, sig := sc.c, sc.sig
 		if _, dup := seen[sig]; dup {
+			continue
+		}
+		// #1334 — as for a representative above.
+		if !cache.Authenticated(c.Username, c.Groups) {
 			continue
 		}
 		if !cache.IdentityAuthorisedForGVR(gvr, c.Username, c.Groups) {
@@ -178,6 +192,32 @@ func enumeratePrewarmTargetsWithLearned(gvr schema.GroupVersionResource, verb st
 
 // learnedKey is a seed target's class key.
 func learnedKey(c seedTarget) string { return cache.LearnedClassKey(c.Username, c.Groups) }
+
+// learnedUnit is one learned unit of a seed pass: the index of the seed (a
+// widget or a RESTAction) it belongs to, and its target.
+type learnedUnit struct {
+	seed int
+	c    seedTarget
+}
+
+// learnedUnitsByClass groups the learned targets of every seed by class key.
+// learned[i] is seed i's learned list. Each class's units keep seed order, then
+// target order: for every k, the result's k entry is exactly the sequence
+//
+//	for i := range learned { for _, c := range learned[i] { if learnedKey(c) == k { visit(i, c) } } }
+//
+// visits, with learnedKey computed once per unit instead of once per (class,
+// unit) pair.
+func learnedUnitsByClass(learned [][]seedTarget) map[string][]learnedUnit {
+	out := map[string][]learnedUnit{}
+	for i, ts := range learned {
+		for _, c := range ts {
+			k := learnedKey(c)
+			out[k] = append(out[k], learnedUnit{seed: i, c: c})
+		}
+	}
+	return out
+}
 
 // ── per-unit cost measurement (the engine bound's t_unit, per kind) ─────────
 //

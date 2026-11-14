@@ -1,0 +1,262 @@
+//go:build js && wasm
+
+package fakeapiserver
+
+// The request log's contract (sandbox SNAPSHOT.md §4, read by capture's §11.2 step 6.1): every line
+// the fake writes is either a request line with exactly the 10 keys verb, group, version, resource,
+// namespace, name, query, status, items and identity, or one of the two event lines with exactly its
+// own keys. The run below drives every kind of request the fake answers.
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+)
+
+var requestLineKeys = []string{"group", "identity", "items", "name", "namespace", "query", "resource", "status", "verb", "version"}
+
+// eventLineKeys are the fake's event lines and the exact keys of each.
+var eventLineKeys = map[string][]string{
+	"applyStatus.failed": {"event", "id", "pointer", "reason"},
+	"fake.unimplemented": {"event", "what"},
+	"fake.watchExpired":  {"event", "what"},
+}
+
+func keysOf(l map[string]any) []string {
+	var ks []string
+	for k := range l {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// lineShapeErrors names every line that is neither shape.
+func lineShapeErrors(lines []map[string]any) []string {
+	var bad []string
+	for _, l := range lines {
+		if ev, ok := l["event"].(string); ok {
+			want, known := eventLineKeys[ev]
+			if !known {
+				bad = append(bad, "an event line of no listed kind: "+strings.Join(keysOf(l), ","))
+			} else if strings.Join(keysOf(l), ",") != strings.Join(want, ",") {
+				bad = append(bad, ev+" with keys "+strings.Join(keysOf(l), ",")+", want "+strings.Join(want, ","))
+			}
+			continue
+		}
+		if strings.Join(keysOf(l), ",") != strings.Join(requestLineKeys, ",") {
+			bad = append(bad, "a request line with keys "+strings.Join(keysOf(l), ","))
+			continue
+		}
+		if _, ok := l["status"].(int); !ok {
+			bad = append(bad, "a request line whose status is not an int")
+		}
+		if _, ok := l["items"].(int); !ok {
+			bad = append(bad, "a request line whose items is not an int")
+		}
+		// identity is a request's (sa, visitor, other, none) or, on a scripted status write's line
+		// and on no other, the controller's.
+		switch id, _ := l["identity"].(string); id {
+		case "sa", "visitor", "other", "none":
+		case "controller":
+			if res, _ := l["resource"].(string); l["verb"] != "patch" || !strings.HasSuffix(res, "/status") {
+				bad = append(bad, fmt.Sprintf("a controller line that is not a patch of a status: %v %v", l["verb"], l["resource"]))
+			}
+		default:
+			bad = append(bad, fmt.Sprintf("a request line with identity %v", l["identity"]))
+		}
+	}
+	return bad
+}
+
+func TestRequestLog_EveryLineIsARequestLineOrAListedEvent(t *testing.T) {
+	h := newHarness(t, opts{extra: append(append([]map[string]any{}, crSAAll...), nsPatchGrant...)})
+	cm := "/api/v1/namespaces/krateo-system/configmaps"
+	// discovery
+	h.do("GET", "/api", req{as: "sa"})
+	h.do("GET", "/apis", req{as: "sa"})
+	h.do("GET", "/apis/observability.krateo.io/v1alpha1", req{as: "sa"})
+	h.do("GET", "/version", req{as: "sa"})
+	// reads
+	h.do("GET", inc+"/"+incident, req{as: "sa"})
+	h.do("GET", inc, req{as: "sa"})
+	w := h.watch(inc+"?watch=1&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true", req{as: "sa"})
+	for w.next()["type"] != "BOOKMARK" {
+	}
+	w.cancel()
+	// writes, a dry run among them
+	h.do("POST", cm, req{as: "sa", ct: "application/json", body: map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "a"}}})
+	h.do("POST", cm+"?dryRun=All", req{as: "sa", ct: "application/json", body: map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "b"}}})
+	cur := h.do("GET", cm+"/a", req{as: "sa"})
+	h.do("PUT", cm+"/a", req{as: "sa", ct: "application/json", body: cur.body})
+	h.do("PATCH", cm+"/a", req{as: "sa", ct: merge, body: map[string]any{"data": map[string]any{"k": "v"}}})
+	h.do("DELETE", cm+"/a", req{as: "sa"})
+	// a review
+	h.do("POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", req{as: "visitor", ct: "application/json", body: map[string]any{"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectAccessReview", "spec": map[string]any{"resourceAttributes": map[string]any{"verb": "get", "resource": "secrets", "namespace": "krateo-system"}}}})
+	// errors: 401 (a bad token), 403, 404, 415, 422, 400, and an unimplemented request (500 and its event line)
+	h.do("GET", inc, req{as: "nope"})
+	h.do("GET", "/api/v1/namespaces/krateo-system/secrets/x", req{as: "visitor"})
+	h.do("GET", inc+"/missing", req{as: "sa"})
+	h.do("POST", cm, req{as: "sa", ct: "text/plain", body: "x"})
+	h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: "application/apply-patch+yaml", body: "{}"})
+	h.do("GET", inc+"?fieldSelector=spec.x%3Dy", req{as: "sa"})
+	h.do("PATCH", "/api/v1/namespaces/krateo-system", req{as: "visitor", ct: "application/strategic-merge-patch+json", body: map[string]any{"metadata": map[string]any{"labels": map[string]any{"a": "b"}}}})
+	// the scripted status write, applied
+	h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"applied": true}}})
+	h.advance(2 * time.Second)
+	// watches that are not expired: a reflector's resume from its last resourceVersion, in the
+	// window (client-go re-watches from it on every timeout), and a legacy watch from "0"
+	var latest int
+	fmt.Sscan(incidentRV(h), &latest)
+	resume := h.watch(fmt.Sprintf("%s?watch=1&resourceVersion=%d", inc, latest-1), req{as: "sa"})
+	if e := resume.next(); e["type"] != "MODIFIED" {
+		t.Fatalf("the in-window resume's first event is %v, want MODIFIED", e["type"])
+	}
+	resume.cancel()
+	legacy := h.watch(inc+"?watch=1&resourceVersion=0", req{as: "sa"})
+	if e := legacy.next(); e["type"] != "ADDED" {
+		t.Fatalf("the legacy watch's first event is %v, want ADDED", e["type"])
+	}
+	legacy.cancel()
+
+	// the scripted status write, failed (applyStatus.failed)
+	f := newHarness(t, opts{edit: func(s map[string]any) {
+		rule := get(s, "scripted").(map[string]any)["applyStatus"].([]any)[0].(map[string]any)
+		rule["stamp"] = []any{"/status/state/at"}
+	}})
+	f.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"applied": true}}})
+	f.advance(2 * time.Second)
+
+	// a watch from a resourceVersion that left the watch cache's window (fake.watchExpired), on a
+	// harness of its own: h's scripted status writes keep its watch cache's window wide
+	e := newHarness(t, opts{})
+	_, _ = expiredWatch(t, e)
+
+	lines := append(append(h.log(), f.log()...), e.log()...)
+	for _, b := range lineShapeErrors(lines) {
+		t.Error(b)
+	}
+	// The run covered what it claims: every verb, the error statuses and both event lines.
+	seenVerb, seenStatus, seenEvent := map[string]bool{}, map[int]bool{}, map[string]bool{}
+	for _, l := range lines {
+		if ev, ok := l["event"].(string); ok {
+			seenEvent[ev] = true
+			continue
+		}
+		seenVerb[l["verb"].(string)] = true
+		if s, ok := l["status"].(int); ok {
+			seenStatus[s] = true
+		}
+	}
+	for _, v := range []string{"get", "list", "watch", "create", "update", "patch", "delete", "review"} {
+		if !seenVerb[v] {
+			t.Errorf("the run made no %s", v)
+		}
+	}
+	for _, s := range []int{200, 201, 400, 401, 403, 404, 415, 422, 500} {
+		if !seenStatus[s] {
+			t.Errorf("the run saw no %d", s)
+		}
+	}
+	for ev := range eventLineKeys {
+		if !seenEvent[ev] {
+			t.Errorf("the run wrote no %s line", ev)
+		}
+	}
+	if !logged(h, statusWrite) {
+		t.Error("the applied status write has no request line")
+	}
+	// Only the expired watch wrote fake.watchExpired: the watch-list and every other request did not.
+	expiredLines := 0
+	for _, l := range lines {
+		if l["event"] == "fake.watchExpired" {
+			expiredLines++
+		}
+	}
+	if expiredLines != 1 {
+		t.Errorf("%d fake.watchExpired lines in the run, want 1 (the expired watch's)", expiredLines)
+	}
+	// The network seam's egress lines are the bridge's, on their own channel: never the fake's.
+	if logged(h, func(l map[string]any) bool { return l["event"] == "egress" }) {
+		t.Error("an egress line in the fake's request log")
+	}
+}
+
+// The check bites: an extra key, a missing items, an unknown event and an event with an extra key
+// are each refused.
+func TestRequestLog_ShapeCheckRefusesEachDeviation(t *testing.T) {
+	good := requestLine("")
+	good["status"] = 200
+	for name, l := range map[string]map[string]any{
+		"an extra key":            func() map[string]any { m := requestLine(""); m["status"] = 200; m["contentType"] = "x"; return m }(),
+		"no items":                func() map[string]any { m := requestLine(""); m["status"] = 200; delete(m, "items"); return m }(),
+		"an unlisted event":       {"event": "applyStatus.applied", "id": "r", "pointer": ""},
+		"an event with extra key": {"event": "fake.unimplemented", "what": "x", "status": 500},
+		"an unlisted identity":    func() map[string]any { m := requestLine(""); m["status"] = 200; m["identity"] = "admin"; return m }(),
+		"a controller's read": func() map[string]any {
+			m := requestLine("")
+			m["status"], m["identity"], m["verb"], m["resource"] = 200, "controller", "get", "incidents/status"
+			return m
+		}(),
+		"a controller's write of a main resource": func() map[string]any {
+			m := requestLine("")
+			m["status"], m["identity"], m["verb"], m["resource"] = 200, "controller", "patch", "incidents"
+			return m
+		}(),
+	} {
+		if len(lineShapeErrors([]map[string]any{l})) == 0 {
+			t.Errorf("%s passed the shape check", name)
+		}
+	}
+	scripted := requestLine("")
+	scripted["status"], scripted["identity"], scripted["verb"], scripted["resource"] = 200, "controller", "patch", "incidents/status"
+	if b := lineShapeErrors([]map[string]any{good, scripted, {"event": "fake.unimplemented", "what": "x"}}); len(b) != 0 {
+		t.Errorf("good lines refused: %v", b)
+	}
+}
+
+// expiredWatch watches from a resourceVersion the watch cache has since evicted (TestWatchHistory410's
+// setup: 100 writes, then past eventFreshDuration). It returns that resourceVersion and the log
+// lines the watch wrote.
+func expiredWatch(t *testing.T, h *harness) (string, []map[string]any) {
+	t.Helper()
+	old := incidentRV(h)
+	for i := 0; i < 100; i++ {
+		h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"n": i}}})
+	}
+	h.advance(80 * time.Second) // older than eventFreshDuration (75 s): the cache evicts rather than grows
+	h.do("PATCH", inc+"/"+incident, req{as: "visitor", ct: merge, body: map[string]any{"spec": map[string]any{"n": "last"}}})
+	before := len(h.log())
+	w := h.watch(inc+"?watch=1&resourceVersion="+old, req{as: "sa"})
+	if e := w.next(); e["type"] != "ERROR" {
+		t.Fatalf("the watch from resourceVersion %s: first event %v, want ERROR (410 Expired)", old, e["type"])
+	}
+	if w.next() != nil {
+		t.Fatal("the stream did not end after the ERROR")
+	}
+	return old, h.log()[before:]
+}
+
+// A watch from an expired resourceVersion writes exactly two lines: its request line, 200 as the
+// apiserver answers it, and one fake.watchExpired naming the watch.
+func TestRequestLog_ExpiredWatchWritesItsRequestLineAndOneWatchExpired(t *testing.T) {
+	h := newHarness(t, opts{})
+	old, lines := expiredWatch(t, h)
+	for _, b := range lineShapeErrors(lines) {
+		t.Error(b)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("the expired watch wrote %d lines, want 2: %v", len(lines), lines)
+	}
+	rl, ev := lines[0], lines[1]
+	eq(t, rl["verb"], "watch", "verb")
+	eq(t, rl["resource"], "incidents", "resource")
+	eq(t, rl["namespace"], "krateo-system", "namespace")
+	eq(t, rl["status"], 200, "status")
+	eq(t, rl["items"], 0, "items")
+	eq(t, rl["query"], "watch=1&resourceVersion="+old, "query")
+	eq(t, ev["event"], "fake.watchExpired", "event")
+	eq(t, ev["what"], "watch of incidents.observability.krateo.io in namespace krateo-system from resourceVersion "+old, "what")
+}

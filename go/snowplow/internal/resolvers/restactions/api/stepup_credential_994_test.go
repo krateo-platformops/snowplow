@@ -92,7 +92,7 @@ func su994Secrets(t *testing.T, apiURL string, byName map[string]string) {
 	cache.ResetSecretsSnapshotForTest()
 	snap := map[string]*corev1.Secret{}
 	for name, tok := range byName {
-		snap[name] = mkSecret(su994NS, name, map[string]string{"server-url": apiURL, "token": tok})
+		snap[name] = authnOwned(mkSecret(su994NS, name, map[string]string{"server-url": apiURL, "token": tok}), su994User, i1025Caller, i1025Victim)
 	}
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: snap})
 	cache.ForceSecretsCacheReadyForTest(su994NS)
@@ -127,8 +127,8 @@ func su994Bearers(dials []su994Dial) map[string]int {
 func TestStepUp994_N_NilRefDialsTheIdentitysOwnCredential(t *testing.T) {
 	api, dials := su994Upstream(t)
 	su994Secrets(t, api.URL, map[string]string{
-		credsecret.SessionName(su994User): su994TokSess,
-		credsecret.StepUpName(su994User):  su994TokUp,
+		credsecret.SessionNames(su994User)[0]: su994TokSess,
+		credsecret.StepUpNames(su994User)[0]:  su994TokUp,
 	})
 
 	su994Resolve(ctxWithUser(su994User, su994Group, credsecret.StepUpGroup), api.URL)
@@ -150,7 +150,7 @@ func TestStepUp994_N_NilRefDialsTheIdentitysOwnCredential(t *testing.T) {
 // right there; it is never dialed in its place.
 func TestStepUp994_N_MissingStepUpSecretFailsNoSessionFallback(t *testing.T) {
 	api, dials := su994Upstream(t)
-	su994Secrets(t, api.URL, map[string]string{credsecret.SessionName(su994User): su994TokSess})
+	su994Secrets(t, api.URL, map[string]string{credsecret.SessionNames(su994User)[0]: su994TokSess})
 
 	su994Resolve(ctxWithUser(su994User, su994Group, credsecret.StepUpGroup), api.URL)
 	got := dials()
@@ -167,7 +167,7 @@ func TestStepUp994_N_MissingStepUpSecretFailsNoSessionFallback(t *testing.T) {
 		t.Fatal("PRE: the informer miss must re-read the Secret from the apiserver")
 	}
 	for _, name := range reread {
-		if name != credsecret.StepUpName(su994User) {
+		if name != credsecret.StepUpNames(su994User)[0] {
 			t.Fatalf("the apiserver re-read asked for %q; only the step-up Secret may be read (reads=%v)", name, reread)
 		}
 	}
@@ -180,7 +180,7 @@ func su994SeedForgeable(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	cache.ResetSecretsInformerForTest()
 	cache.ResetSecretsSnapshotForTest()
-	name := credsecret.StepUpName("victim")
+	name := credsecret.StepUpNames("victim")[0]
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
 		name: mkSecret(su994NS, name, map[string]string{"server-url": su994Forged}),
 	}})
@@ -194,7 +194,7 @@ func TestStepUp994_G_TemplatedStepUpRefRefused(t *testing.T) {
 	su994SeedForgeable(t)
 	r := &resolveRun{dict: map[string]any{"want": "victim"}}
 	ref, templated := r.evalEndpointRef(&templates.Reference{Name: `${ .want + "-clientconfig-stepup" }`, Namespace: su994NS})
-	if !templated || ref == nil || ref.Name != credsecret.StepUpName("victim") {
+	if !templated || ref == nil || ref.Name != credsecret.StepUpNames("victim")[0] {
 		t.Fatalf("the eval site must render the templated name; got ref=%+v templated=%v", ref, templated)
 	}
 	m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker"}
@@ -227,7 +227,7 @@ func TestStepUp994_C_CallerSuppliedLiteralStepUpRefRefused(t *testing.T) {
 		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: "https://caller.su994.example", Token: "caller"}))
 	m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker", provenance: ProvenanceCallerSupplied}
 
-	for _, name := range []string{"x-clientconfig-stepup", credsecret.StepUpName("victim"), "x-clientconfig"} {
+	for _, name := range []string{"x-clientconfig-stepup", credsecret.StepUpNames("victim")[0], "x-clientconfig"} {
 		if err := m.refusePerUserRef(&templates.Reference{Name: name, Namespace: su994NS}); !errors.Is(err, ErrPerUserCredentialRef) {
 			t.Fatalf("#443 VIOLATED: a caller-supplied literal ref %q was not refused; got %v", name, err)
 		}

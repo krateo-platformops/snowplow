@@ -65,8 +65,9 @@
 // TRANSPARENT when GOMEMLIMIT is effectively unlimited (unset → the runtime
 // default math.MaxInt64): headroom is unbounded, admission is always granted,
 // release is a no-op — byte-identical to no bound (project_caching_is_provisional:
-// cleanly removable). A pod SHOULD set GOMEMLIMIT (the chart does, 7GiB); with
-// it unset there is no soft ceiling to protect and the gate correctly no-ops.
+// cleanly removable). A pod runs with a soft limit (internal/memlimit sets 7/8
+// of the container's cgroup memory limit unless GOMEMLIMIT is set); with none
+// there is no soft ceiling to protect and the gate correctly no-ops.
 package api
 
 import (

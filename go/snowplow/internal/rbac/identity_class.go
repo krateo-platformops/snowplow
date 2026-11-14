@@ -28,6 +28,6 @@ import (
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {
 	return cache.IdentityClass{
 		SubjectBindingSet: SubjectBindingSetDigest(ui.Username, ui.Groups),
-		RBACSubGen:        cache.RBACSubGenForSubject(ui.Username, WithAuthenticatedGroup(ui.Groups)),
+		RBACSubGen:        cache.RBACSubGenForSubject(ui.Username, WithAuthenticatedGroup(ui.Username, ui.Groups)),
 	}
 }

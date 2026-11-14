@@ -49,6 +49,7 @@ package evaltest
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -105,8 +106,14 @@ func TestF7_CacheDisabled_BindingUIDAlwaysEmpty(t *testing.T) {
 		Resource:  "configmaps",
 		Namespace: "default",
 	})
-	if err != nil {
-		t.Fatalf("EvaluateRBAC under cache=off: err=%v (want nil)", err)
+	// #1362: with no user endpoint the cache=off review cannot be asked, which
+	// is ErrReviewUnavailable (never an allow). Any other error means the
+	// cache=off path was not the one taken.
+	if err != nil && !errors.Is(err, rbac.ErrReviewUnavailable) {
+		t.Fatalf("EvaluateRBAC under cache=off: err=%v (want nil or ErrReviewUnavailable)", err)
+	}
+	if allowed && err != nil {
+		t.Fatalf("EvaluateRBAC under cache=off allowed on an error")
 	}
 	if uid != "" {
 		t.Fatalf("F7 INVARIANT BROKEN: cache.Disabled()=true MUST yield uid=\"\"; got uid=%q (allowed=%v)", uid, allowed)
@@ -245,7 +252,8 @@ func TestF7_BiconditionalReverse(t *testing.T) {
 		_, uid, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "anyone", Verb: "get", Resource: "configmaps", Namespace: "default",
 		})
-		if err != nil {
+		// #1362: no user endpoint → ErrReviewUnavailable; uid is still "".
+		if err != nil && !errors.Is(err, rbac.ErrReviewUnavailable) {
 			t.Fatalf("EvaluateRBAC cache=off: err=%v", err)
 		}
 		if uid != "" {

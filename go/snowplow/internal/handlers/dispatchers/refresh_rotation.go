@@ -29,8 +29,9 @@
 // GENERAL. The test is "the class this key folds is not the requester's class
 // now" — no resource, class or cause is named. Identity-free classes
 // (cache.IsIdentityFreeClass) fold no class and never rotate, so they are not
-// tracked. A class that is back at the minted one (a binding added then
-// removed between two checks) makes the key live again: no frame.
+// tracked for rotation; #1328 tracks their served VIEW instead
+// (refresh_gated_view.go). A class that is back at the minted one (a binding
+// added then removed between two checks) makes the key live again: no frame.
 //
 // ISOLATION. Only the connection's own keys, derived under its own identity,
 // are ever announced, and only on that connection (RefreshStream.Rotated).
@@ -51,8 +52,16 @@ import (
 // of one /refreshes connection was derived under. Not safe for concurrent use:
 // the connection goroutine owns it.
 type SubscriptionRotationTracker struct {
+	// ctx is the arm ctx (#101 informer-only, carrying the connection's
+	// identity): the identity a gated key's served view is computed for (#1328).
+	ctx  context.Context
 	ui   jwtutil.UserInfo
 	keys map[string]*trackedArm
+	// gated (#1328, refresh_gated_view.go): the armed identity-free keys, each
+	// with the digest of what this connection's tab is served from it, and the
+	// identity class those digests were read under.
+	gated      map[string]*gatedArm
+	gatedClass cache.IdentityClass
 }
 
 type trackedArm struct {
@@ -65,21 +74,27 @@ type trackedArm struct {
 // under).
 func NewSubscriptionRotationTracker(ctx context.Context) *SubscriptionRotationTracker {
 	ui, _ := xcontext.UserInfo(ctx)
-	return &SubscriptionRotationTracker{ui: ui, keys: map[string]*trackedArm{}}
+	return &SubscriptionRotationTracker{ctx: ctx, ui: ui, keys: map[string]*trackedArm{}}
 }
 
 // Derive is DeriveSubscriptionKeyWithReason that also tracks an armed
-// identity-bound key's class.
+// identity-bound key's class, and (#1328) an armed identity-free key's served
+// view.
 func (t *SubscriptionRotationTracker) Derive(ctx context.Context, coords SubscriptionCoordinates) (string, bool, SubscriptionSkipReason) {
 	key, inputs, ok, reason := deriveSubscriptionWithReason(ctx, coords)
-	if ok && inputs != nil && !cache.IsIdentityFreeClass(coords.Class) {
+	switch {
+	case !ok:
+	case cache.IsIdentityFreeClass(coords.Class):
+		t.trackGated(key, coords.Class)
+	case inputs != nil:
 		t.keys[key] = &trackedArm{minted: inputs.Class()}
 	}
 	return key, ok, reason
 }
 
-// Tracking reports whether any armed key can rotate.
-func (t *SubscriptionRotationTracker) Tracking() bool { return len(t.keys) > 0 }
+// Tracking reports whether any armed key can rotate or (#1328) has a served
+// view an RBAC change can move.
+func (t *SubscriptionRotationTracker) Tracking() bool { return len(t.keys) > 0 || len(t.gated) > 0 }
 
 // Rotated returns, sorted, the not-yet-announced armed keys whose class is
 // not the identity's current class, and marks them announced.

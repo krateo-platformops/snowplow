@@ -129,6 +129,10 @@ var nonCacheInitPublishers = map[string][]string{
 	// dial guard refuses is a stage failure on every RESTAction resolve, cache
 	// on or off, so it must stay observable with the cache off.
 	"internal/resolvers/restactions/api/refused_read_metrics.go": {"snowplow_refused_read_total"},
+	// #1281 userAccessFilter-on-a-non-read-verb refusal: same RESOLVER-path
+	// family — every RESTAction resolve, cache on or off, refuses such a stage
+	// before it is sent, so the refusal must stay observable with the cache off.
+	"internal/resolvers/restactions/api/uaf_non_read.go": {"snowplow_uaf_non_read_verb_refused_total"},
 	// #367 shadow-parity toggle STATE: enabled/source is a CONFIG fact (not a cache
 	// measurement) a latency-acceptance window must assert regardless of
 	// CACHE_ENABLED, so its publisher runs ungated. The measurement COUNTERS
@@ -150,18 +154,31 @@ var nonCacheInitPublishers = map[string][]string{
 	// snowplow_work pprof label every CPU profile carries; gating them on
 	// Disabled() would hide the customer count cache-off while the label stays.
 	"internal/workclass/workclass.go": {"snowplow_work_class"},
-	// AUDIT-4 (installer#410) refused-audit-record counter: the audit emitter is
-	// not a cache surface — /call writes and RESTAction write stages emit in
-	// either cache mode, so a record refused for a missing actor/action/method/
-	// target must stay observable with the cache off. Gating it would hide the
-	// refusals in a configuration where writes still happen.
+	// AUDIT-4 (installer#410, #1291) incomplete-audit-record counter, the
+	// /debug/vars mirror of the shared writer's krateo.audit.records.incomplete:
+	// the audit emitter is not a cache surface — /call writes and RESTAction
+	// write stages emit in either cache mode, so a record emitted marked for a
+	// missing actor, class, action, verb, method, preview flag or target must
+	// stay observable with the cache off. Gating it would hide the gaps in a
+	// configuration where writes still happen.
 	"internal/support/audit/incomplete_metrics.go": {"snowplow_audit_incomplete_total"},
+	// #1379 review: the audit trail's design-error counters (an audited exit
+	// with no handler record, a record whose method is not its verb's). The
+	// emitter is not a cache surface and records in either cache mode, so a
+	// design error must stay observable with the cache off.
+	"internal/support/audit/integrity_metrics.go": {"snowplow_audit_dial_method_mismatch_total", "snowplow_audit_unrecorded_exit_total"},
 	// #1054 slow-call record: a measurement of request latency, not a cache
 	// surface. Every API request is recorded in either cache mode (cache-off
 	// serves every /call from the apiserver, where slow calls are likeliest),
 	// so its counters, histogram and rings must stay observable with the
 	// cache off; gating them would blind the instrument exactly there.
 	"internal/slowcall/stats.go": {"snowplow_slow_request_bound_ms", "snowplow_slow_request_phase_ms", "snowplow_slow_request_snapshots_recent", "snowplow_slow_request_snapshots_suppressed_total", "snowplow_slow_request_snapshots_total", "snowplow_slow_requests_recent", "snowplow_slow_requests_total"},
+	// #1265 served-cold counter: what each top-level customer /call was served,
+	// a customer-experience measurement, not a cache surface. With the cache
+	// off every serve is cold{cache_off}, which is the true reading (a
+	// cache-off control arm reads it); gating it would report "no cold serves"
+	// as an absence exactly where every serve is cold.
+	"internal/handlers/dispatchers/customer_serves.go": {"snowplow_customer_serves_cold_total", "snowplow_customer_serves_total"},
 }
 
 // legacyHG321Keys are the five names the shell falsifier asserted since

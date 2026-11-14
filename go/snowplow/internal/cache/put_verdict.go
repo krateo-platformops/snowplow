@@ -116,6 +116,19 @@ func (v PutVerdict) WithExternalTTL(optedIn bool) PutVerdict {
 	return v
 }
 
+// StorableUnderExternalTTL reports a permanent decline whose ONLY permanent cause
+// is a third-party external touch: a genuine external touch, alone or beside a
+// stage error (a failed call of that same endpoint, a 5xx or a timeout). An
+// external-TTL cell's own opt-in stores a clean resolve of these inputs, so for
+// such a cell the decline proves nothing permanent (#1255 F1): the stage error is
+// transient, and the external touch is exactly what the opt-in caches. Every other
+// permanent decline — a declared write, a touch that carried the requester — is
+// refused by the opt-in too.
+func (v PutVerdict) StorableUnderExternalTTL() bool {
+	return v.decision == PutDeclinePermanent && v.thirdPartyOnly &&
+		(v.reason == PutReasonExternal || v.reason == PutReasonStageError)
+}
+
 // PutGateVerdict combines the Put-gate sinks of one resolve. class is the
 // cell's entry class (the #681 DenialOnly rule refuses denial-only bodies for
 // identity-free classes). Precedence, first match wins:
@@ -146,7 +159,10 @@ func PutGateVerdict(g PutGateSinks, class string) PutVerdict {
 		if external > 0 {
 			d = PutDeclinePermanent
 		}
-		return PutVerdict{decision: d, reason: PutReasonStageError}
+		// #1255 F1 — the third-party fact travels with the stage error too: an
+		// external-TTL cell's opt-in stores a clean retry of a third-party touch, so
+		// this decline does not prove THAT cell unstorable (StorableUnderExternalTTL).
+		return PutVerdict{decision: d, reason: PutReasonStageError, thirdPartyOnly: external > 0 && g.External.OnlyThirdParty()}
 	case external > 0:
 		return PutVerdict{decision: PutDeclinePermanent, reason: PutReasonExternal, thirdPartyOnly: g.External.OnlyThirdParty()}
 	}

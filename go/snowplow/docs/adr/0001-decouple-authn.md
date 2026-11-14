@@ -115,6 +115,10 @@ replaced the shared HS256 secret. The contract today:
   empty, or holds no key for the token's `kid`, the result is `jwtutil.ErrKeyUnavailable`,
   which both middlewares answer with `503`. If a refresh fails while the cache still holds
   the `kid`, the cached key keeps serving. Bad signatures and expired tokens get `401`.
+  *(Since plumbing v1.36.0, plumbing#63: a `kid` absent from a set fetched successfully
+  after the token was issued is a retired key, `jwtutil.ErrKeyNotPublished`, answered
+  `401` with the cause `KeyNotPublished`; the `503` remains for every other unresolvable
+  key.)*
 
 **What this changes for the decoupling.** authn's *deployment* is still not needed, but
 authn-free operation now needs **an RSA keypair and an HTTP endpoint serving its JWKS** that

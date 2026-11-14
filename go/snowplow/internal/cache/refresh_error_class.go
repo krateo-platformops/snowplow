@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -68,13 +69,20 @@ const (
 	// RefreshErrDestinationRefused (#1131): the destination policy refused the
 	// address a stage's endpoint resolved to. Nothing was sent.
 	RefreshErrDestinationRefused = "destination_refused"
+	// RefreshErrTypeNotInstalled (#1414): a read's type is not served by the
+	// apiserver (objects.Get's 424). Not a not_found: no object was deleted,
+	// so it never takes the self-gone eviction, which is for a definite 404
+	// alone. It keeps the requeue budget (a CRD re-registration clears inside
+	// it) and at the drop point the cell stays resident and known-stale.
+	RefreshErrTypeNotInstalled = "type_not_installed"
 )
 
 // refreshClasses is the closed class set, in counter-index order.
 var refreshClasses = [...]string{
 	RefreshErrForbidden, RefreshErrUnauthorized, RefreshErrNotFound,
 	RefreshErrTimeout, RefreshErrUnavailable, RefreshErrSchemaInvalid,
-	RefreshErrDiscovery, RefreshErrJQ, RefreshErrDestinationRefused, RefreshErrUnclassified,
+	RefreshErrDiscovery, RefreshErrJQ, RefreshErrDestinationRefused, RefreshErrTypeNotInstalled,
+	RefreshErrUnclassified,
 }
 
 // ResolveStageError carries the failing stage of a resolve and a fixed prefix
@@ -126,6 +134,8 @@ func ClassifyRefreshError(err error) (class, stage string) {
 		return RefreshErrNotFound, stage
 	case destinationRefused(err):
 		return RefreshErrDestinationRefused, stage
+	case typeNotInstalled(err):
+		return RefreshErrTypeNotInstalled, stage
 	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err):
 		return RefreshErrTimeout, stage
 	case apierrors.IsServiceUnavailable(err), apierrors.IsInternalError(err),
@@ -167,6 +177,13 @@ func ClassifyRefreshError(err error) (class, stage string) {
 // mark, which is also what picks up a corrected endpoint.
 func IsNonRetryableRefreshError(err error) bool {
 	return err != nil && (apierrors.IsForbidden(err) || destinationRefused(err))
+}
+
+// typeNotInstalled reports a 424 Failed Dependency Status. On the refresh path
+// only objects.Get answers one: the read's type is not served (#1414).
+func typeNotInstalled(err error) bool {
+	var se *apierrors.StatusError
+	return errors.As(err, &se) && se.ErrStatus.Code == http.StatusFailedDependency
 }
 
 // destinationRefused reports a stage failure whose reason is the destination

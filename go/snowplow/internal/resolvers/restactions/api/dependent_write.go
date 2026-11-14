@@ -31,6 +31,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // dependentWriteBlocked reports whether apiCall is a write stage that must not
@@ -45,8 +46,12 @@ func (r *resolveRun) dependentWriteBlocked(apiCall *templates.API) (string, bool
 }
 
 // skipDependentWrite records the skip of stage id (it depended on dep).
-func (r *resolveRun) skipDependentWrite(id, dep string) {
+func (r *resolveRun) skipDependentWrite(id string, apiCall *templates.API, dep string) {
 	r.outcomes.skip(id, dep)
+	// audit#22 (a) — denied, dependency_failed. Not planned, so nothing of
+	// its target is resolved: marked target.
+	r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
+		outcome: audit.OutcomeDenied, reason: audit.DenialDependencyFailed})
 	r.log.Info("write stage not sent: the stage it depends on did not succeed",
 		slog.String("name", id),
 		slog.String("depends_on", dep),

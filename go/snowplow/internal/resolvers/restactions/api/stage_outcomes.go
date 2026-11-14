@@ -31,7 +31,12 @@ import (
 //     is a write and snowplow refused to send at least one of its items
 //     (InvalidPath, TemplateError, NotSent: undialled_write.go). Reason: a code;
 //   - skipped: a write stage that was not dialed because the stage it depends
-//     on failed or was skipped (reason Skipped).
+//     on failed or was skipped (reason Skipped);
+//   - not executed (#1288): a write stage snowplow deliberately did not send,
+//     because of what the request is, not because anything went wrong: a dry
+//     run (StageNotExecuted, #443 k), or an export or background work
+//     (WriteRefused, #903, #970). It is listed (it did not succeed), and it is
+//     no failure: stageNotExecutedByDesign is the one classifier.
 //
 // The header carries STAGE NAMES AND REASON CODES ONLY, from the closed set
 // below: never an error message, a path, an identity or any response data
@@ -74,26 +79,206 @@ const (
 	// is no Kubernetes StatusReason, so trustedReason drops it from an upstream
 	// answer (#714).
 	StageReasonDestinationRefused = credhttp.DestinationRefusedReason
+	// StageReasonUAFOnNonReadVerb (#1281) — the stage carries userAccessFilter
+	// on a verb other than GET or HEAD, which the CRD rejects (core.go): it
+	// would have been sent as snowplow's ServiceAccount, so nothing was sent
+	// (uaf_non_read.go). Recorded only by snowplow: the reason is no Kubernetes
+	// StatusReason, so trustedReason drops it from an upstream answer (#714).
+	StageReasonUAFOnNonReadVerb = "UserAccessFilterOnNonReadVerb"
+	// StageReasonWriteRefused (#1288) — a write stage, or one item of it, that
+	// snowplow refused to send because the request is not a customer's own
+	// write: an export (#970) or background work (#903). background_write.go
+	// records it, never from an upstream answer. Distinct from
+	// StageNotExecuted, whose #443 contract is "refused by a dry run" (its
+	// message carries the stable "dry-run: " prefix, which this refusal's
+	// message does not).
+	StageReasonWriteRefused = "WriteRefused"
+	// StageReasonNotFoundForRequester (#1319 ruling) — the definite
+	// per-identity NotFound (#1080): a watched named object that does not
+	// exist for THIS requester, the answer #681 stores as a denial. Recorded
+	// only by snowplow, at the two #1080 sites: N2 (recordDefiniteNotFound,
+	// branch C) and N1 (classifyOwnDialNotFound, the requester's own dial).
+	// Never read from an upstream answer (#714); a plain 404 stays NotFound.
+	StageReasonNotFoundForRequester = "NotFoundForRequester"
 )
+
+// stageReasonClass is what a reason code says about its stage (#1288).
+type stageReasonClass uint8
+
+const (
+	// stageReasonFailed — the stage failed: it ran and an item failed, it
+	// could not be built or sent, it was skipped because the stage it depends
+	// on failed (Skipped follows a failure, never a deliberate non-execution:
+	// blocksDependentWrite), it never ran because the resolve stopped early
+	// (NotRun), or the resolve ran no stage (Aborted).
+	stageReasonFailed stageReasonClass = iota + 1
+	// stageReasonNotExecuted — snowplow deliberately did not execute the
+	// stage, by what the request is: a dry run, an export, background work.
+	stageReasonNotExecuted
+)
+
+// stageReasonClasses is the closed set of reason codes, each with its class.
+// A code the header can carry is in it, and only those (stageReasonKnown).
+var stageReasonClasses = map[string]stageReasonClass{
+	StageReasonNotExecuted:  stageReasonNotExecuted,
+	StageReasonWriteRefused: stageReasonNotExecuted,
+	StageReasonForbidden:    stageReasonFailed,
+	StageReasonNotFound:     stageReasonFailed,
+	// A denial, counted like Forbidden on the span (snowplow.stages.failed).
+	StageReasonNotFoundForRequester: stageReasonFailed,
+	StageReasonUnauthorized:         stageReasonFailed,
+	StageReasonNotRun:               stageReasonFailed,
+	StageReasonError:                stageReasonFailed,
+	StageReasonSkipped:              stageReasonFailed,
+	StageReasonAborted:              stageReasonFailed,
+	StageReasonInvalidPath:          stageReasonFailed,
+	StageReasonTemplateError:        stageReasonFailed,
+	StageReasonNotSent:              stageReasonFailed,
+	StageReasonTimeout:              stageReasonFailed,
+	StageReasonDestinationRefused:   stageReasonFailed,
+	// #1281: a misconfigured stage (userAccessFilter on a write) is a real
+	// failure, in every mode, never a deliberate non-execution.
+	StageReasonUAFOnNonReadVerb: stageReasonFailed,
+}
+
+// Stage reason groups (#1319): the client contract for a widget's
+// exception-only notice (owner ruling on #1347: three groups). Every code of
+// the closed set is in exactly one group (TestIssue1319_G1 fails otherwise),
+// and the frontend integration doc lists them as this map says
+// (TestIssue1319_G2). A client reads a code it does not know as
+// StageGroupCutFailed.
+const (
+	// StageGroupCutFailed — the stage's data was cut short or failed: the
+	// portal shows its notice.
+	StageGroupCutFailed = "cut / failed"
+	// StageGroupDenied — a per-user refusal: the requester may not read it.
+	// The portal shows no notice.
+	StageGroupDenied = "denied"
+	// StageGroupByDesign — snowplow deliberately did not execute the stage for
+	// this request (#1288, stageNotExecutedByDesign). Never a notice.
+	StageGroupByDesign = "by design"
+)
+
+// StageReasonGroups places every reason code of the closed set in one group.
+var StageReasonGroups = map[string]string{
+	StageReasonForbidden: StageGroupDenied,
+
+	StageReasonNotExecuted:  StageGroupByDesign, // a dry run's write (#443 k)
+	StageReasonWriteRefused: StageGroupByDesign, // an export's or background work's write (#1288)
+
+	// The definite per-identity NotFound (#1080) has its own code and is a
+	// denial; a plain 404 of a dial stays NotFound, a failure.
+	StageReasonNotFoundForRequester: StageGroupDenied,
+	StageReasonNotFound:             StageGroupCutFailed,
+	// A refused credential is never a #681 per-identity denial.
+	StageReasonUnauthorized:       StageGroupCutFailed,
+	StageReasonTimeout:            StageGroupCutFailed, // the page budget cut it (#1115)
+	StageReasonNotRun:             StageGroupCutFailed,
+	StageReasonError:              StageGroupCutFailed,
+	StageReasonSkipped:            StageGroupCutFailed, // follows a failure only (blocksDependentWrite)
+	StageReasonAborted:            StageGroupCutFailed,
+	StageReasonInvalidPath:        StageGroupCutFailed,
+	StageReasonTemplateError:      StageGroupCutFailed,
+	StageReasonNotSent:            StageGroupCutFailed,
+	StageReasonDestinationRefused: StageGroupCutFailed, // the destination policy, not the requester
+	// #1281: a misconfigured stage (userAccessFilter on a write verb), never a
+	// per-user refusal: it fails for every requester.
+	StageReasonUAFOnNonReadVerb: StageGroupCutFailed,
+}
+
+// StageReasonGroup is reason's group; an unknown code is StageGroupCutFailed.
+func StageReasonGroup(reason string) string {
+	if g, ok := StageReasonGroups[reason]; ok {
+		return g
+	}
+	return StageGroupCutFailed
+}
+
+// stageNotExecutedByDesign reports whether reason says snowplow deliberately
+// did not execute the stage (#1288): the one classifier, read by the span
+// summary (such a stage is not counted as failed) and by the #904 rule (such
+// a stage does not block a dependent write, which the same rule refuses for
+// the same reason).
+func stageNotExecutedByDesign(reason string) bool {
+	return stageReasonClasses[reason] == stageReasonNotExecuted
+}
 
 // StageOutcomesMaxHeaderBytes bounds the header value. Above it the header is
 // {"truncated":true,"failed":N} instead of the per-stage array.
 const StageOutcomesMaxHeaderBytes = 4096
 
-// reasonRank orders reasons when one stage records several (an iterator stage
-// with many failing items): the most specific one wins, deterministically,
-// whatever order concurrent items finish in.
+// stageGroupPrecedence orders the three groups when one stage records reasons
+// of more than one (#1347 ruling): cut / failed outranks denied, which
+// outranks by design. A stage whose data was cut or failed reports a reason of
+// that group whatever else it recorded, so a client that reads the group
+// (StageReasonGroups) shows its notice. A stage with a denied item and an item
+// cut by the page budget reads Timeout, never Forbidden. A higher value wins.
+//
+// The precedence is read from the group of each code (StageReasonGroup), so a
+// new code takes its group's place by being placed in a group: it can never
+// outrank a group above its own. An unknown code reads cut / failed.
+var stageGroupPrecedence = map[string]int{
+	StageGroupCutFailed: 3,
+	StageGroupDenied:    2,
+	StageGroupByDesign:  1,
+}
+
+// reasonOutranks reports whether reason a takes precedence over b when one
+// stage records both: the group first (stageGroupPrecedence), then reasonRank
+// inside the group. Any code outranks "" (a stage that recorded nothing).
+// fail() keeps the reason this order puts first, so a stage reports one
+// reason, deterministically, whatever order its items finish in. It is the
+// one order: the RESTAction header and a widget's header both read the
+// reason fail() kept.
+func reasonOutranks(a, b string) bool {
+	if b == "" {
+		return a != ""
+	}
+	if ga, gb := stageGroupPrecedence[StageReasonGroup(a)], stageGroupPrecedence[StageReasonGroup(b)]; ga != gb {
+		return ga > gb
+	}
+	return reasonRank[a] > reasonRank[b]
+}
+
+// reasonRank orders reasons of the SAME group (stageGroupPrecedence orders the
+// groups) when one stage records several (an iterator stage with many failing
+// items): the most specific one wins. A rank compares only codes of one group;
+// across groups it decides nothing. It is also the set of codes fail() records
+// (any other folds to Error).
 var reasonRank = map[string]int{
-	StageReasonNotExecuted:        10,
-	StageReasonForbidden:          9,
-	StageReasonUnauthorized:       8,
-	StageReasonNotFound:           7,
-	StageReasonInvalidPath:        6,
-	StageReasonDestinationRefused: 5,
-	StageReasonTemplateError:      4,
-	StageReasonTimeout:            3, // #1115: a recorded budget cut, above the NotSent fallback
-	StageReasonNotSent:            2,
-	StageReasonError:              1,
+	// cut / failed.
+	// #1281: recorded once for the whole stage, before anything else can be
+	// (the stage is refused before it is planned); ranked first because the
+	// stage itself is misconfigured.
+	StageReasonUAFOnNonReadVerb:   13,
+	StageReasonUnauthorized:       10,
+	StageReasonNotFound:           9,
+	StageReasonInvalidPath:        7,
+	StageReasonDestinationRefused: 6,
+	StageReasonTemplateError:      5,
+	StageReasonTimeout:            4, // #1115: a recorded budget cut, above the NotSent fallback
+	StageReasonNotSent:            3,
+	StageReasonError:              2,
+
+	// denied.
+	StageReasonForbidden: 11,
+	// #1319: the definite per-identity NotFound (#1080). A stage where one item
+	// is a plain 404 and another this answer reads the plain NotFound: its
+	// group (cut / failed) outranks denied.
+	StageReasonNotFoundForRequester: 8,
+
+	// by design.
+	// The #443 dry-run refusal: a dry run reports StageNotExecuted for its
+	// write stages (#443 k, a stable contract), above WriteRefused.
+	StageReasonNotExecuted: 12,
+	// #1288: an export's or background work's refusal. Items the plan refuses
+	// (InvalidPath, TemplateError: failRefusedItems) are recorded before
+	// dispatch and never reach the refusal, so a write stage with one such
+	// item and one refused item FAILED: it reads that failure (its group
+	// outranks by design), and blocks its dependents. A stage whose every item
+	// was refused reads WriteRefused. The same holds for a dry run's
+	// StageNotExecuted.
+	StageReasonWriteRefused: 1,
 }
 
 type stageOutcome struct {
@@ -110,6 +295,12 @@ type StageOutcomes struct {
 	aborted bool // the resolve stopped before running any stage (F3)
 	order   []string
 	by      map[string]*stageOutcome
+	// replayed (#1319) is set when the body this collector reports on was
+	// served WITHOUT running its resolve (a stored cell, a seed-memo entry):
+	// stored is then the StorableStageOutcomes value the producing resolve
+	// left, and HeaderValue reports it instead of the (empty) stage list.
+	replayed bool
+	stored   string
 }
 
 func newStageOutcomes() *StageOutcomes {
@@ -138,6 +329,58 @@ func claimStageOutcomes(ctx context.Context) *StageOutcomes {
 	}
 	return newStageOutcomes()
 }
+
+// StageOutcomesFromContext returns the collector WithStageOutcomes installed
+// on ctx, nil when none is. A Put site that installed it on a ctx it passed
+// down (the walker's content populate) reads it back here.
+func StageOutcomesFromContext(ctx context.Context) *StageOutcomes {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(stageOutcomesKey{}).(*StageOutcomes)
+	return s
+}
+
+// StorableStageOutcomes (#904, #1319) is the value a Put keeps on the cell it
+// stores: "" when every stage succeeded (HeaderValue's []), so a complete cell
+// costs no memory for it, else the header value. nil (no collector) is "".
+func StorableStageOutcomes(o *StageOutcomes) string {
+	if o == nil {
+		return ""
+	}
+	if v := o.HeaderValue(); v != stageOutcomesAllSucceeded {
+		return v
+	}
+	return ""
+}
+
+// stageOutcomesAllSucceeded is HeaderValue's value for a resolve with no
+// failed, skipped or not-run stage.
+const stageOutcomesAllSucceeded = "[]"
+
+// ReplayStageOutcomes (#1319) reports stored (a StorableStageOutcomes value)
+// as the outcomes of the resolve the collector on ctx waits for, when the
+// body is served without running that resolve: a stored cell (a RESTAction
+// full list), or a seed-memo entry. It claims the collector exactly as that
+// resolve would have (claimStageOutcomes), so a resolve that runs later on
+// ctx keeps its own outcomes privately. No-op when ctx carries no collector
+// or a resolve already claimed it.
+func ReplayStageOutcomes(ctx context.Context, stored string) {
+	s := StageOutcomesFromContext(ctx)
+	if s == nil || !s.claimed.CompareAndSwap(false, true) {
+		return
+	}
+	s.mu.Lock()
+	s.replayed, s.stored = true, stored
+	s.mu.Unlock()
+}
+
+// SealStageOutcomes (#1319) ends the collector's claim window: the resolve it
+// reports on is over (or there was none: a widget with no apiRef), so a
+// resolve that runs later on ctx (a widget's inline child) never reports into
+// it. A collector nothing claimed reads every stage succeeded. No-op when
+// ctx carries no collector or it is already claimed.
+func SealStageOutcomes(ctx context.Context) { ReplayStageOutcomes(ctx, "") }
 
 func (s *StageOutcomes) register(names []string) {
 	if s == nil {
@@ -178,7 +421,7 @@ func (s *StageOutcomes) fail(name, reason string) {
 		return // not a stage of this resolve (cannot happen for a registered run)
 	}
 	o.ran = true
-	if reasonRank[reason] > reasonRank[o.reason] {
+	if reasonOutranks(reason, o.reason) {
 		o.reason = reason
 	}
 }
@@ -195,8 +438,8 @@ func (s *StageOutcomes) failed(name string) bool {
 	return o != nil && o.reason != ""
 }
 
-// reasonOf is the reason stage name's outcome reports (the highest-ranked
-// one it recorded, reasonRank), "" when it recorded none. #1139: a log line
+// reasonOf is the reason stage name's outcome reports (the one it recorded
+// that reasonOutranks puts first), "" when it recorded none. #1139: a log line
 // that names a stage's cause reads it here, so it names the cause the header
 // does.
 func (s *StageOutcomes) reasonOf(name string) string {
@@ -244,11 +487,15 @@ func (s *StageOutcomes) skip(name, dependsOn string) {
 }
 
 // blocksDependentWrite reports whether a write stage that depends on name must
-// not be sent (#904): name failed or was skipped. A dry-run refusal
-// (StageNotExecuted, #443 k) does not block. It is not an outcome of the
-// stage's own call (a real run would have sent it), and the dry run refuses the
-// dependent write for the same reason, so the preview reports what a real run
-// would do. A name that is not a stage of this resolve never blocks.
+// not be sent (#904): name failed or was skipped. A stage snowplow did not
+// execute by design (stageNotExecutedByDesign: a dry-run refusal,
+// StageNotExecuted, #443 k; an export or background refusal, WriteRefused,
+// #1288) does not block. It is not an outcome of the stage's own call (a
+// customer's real run would have sent it), and the same rule refuses the
+// dependent write for the same reason, so the dependent reports that reason
+// (or, when its iterator runs over the refused stage's output, yields zero
+// items and succeeds), never Skipped: Skipped only ever follows a failure. A
+// name that is not a stage of this resolve never blocks.
 func (s *StageOutcomes) blocksDependentWrite(name string) bool {
 	if s == nil {
 		return false
@@ -256,7 +503,7 @@ func (s *StageOutcomes) blocksDependentWrite(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o := s.by[name]
-	return o != nil && o.reason != "" && o.reason != StageReasonNotExecuted
+	return o != nil && o.reason != "" && !stageNotExecutedByDesign(o.reason)
 }
 
 type stageOutcomeJSON struct {
@@ -277,6 +524,14 @@ func (s *StageOutcomes) HeaderValue() string {
 		return ""
 	}
 	s.mu.Lock()
+	if s.replayed {
+		v := s.stored
+		s.mu.Unlock()
+		if v == "" {
+			return stageOutcomesAllSucceeded
+		}
+		return v
+	}
 	out := make([]stageOutcomeJSON, 0, len(s.order)+1)
 	if s.aborted {
 		out = append(out, stageOutcomeJSON{Name: "", Reason: StageReasonAborted})

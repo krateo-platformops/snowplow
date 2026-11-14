@@ -16,28 +16,35 @@
 // that only evaluates (an access review, a render) is recorded like any other
 // POST.
 //
-// A successful write to the apiserver (no endpointRef) also records the written
-// object's uid, generation and resourceVersion, read from the apiserver's
-// answer (#957, audit.Event.RecordWrittenObject): three object identifiers,
-// never the body itself. A write to a named endpoint records none of them. A
-// stage whose apiserver path asks for a dry run (?dryRun=All) is recorded as
-// krateo.action=restaction.dryRun and names no written object: nothing was
-// persisted.
+// A record names exactly one target (schema v1, #1291): the Kubernetes object
+// a stage with no endpointRef wrote (with the apiserver's verb for its path),
+// or else the host the write was sent to (server.address, with the lowercase
+// method as its verb). A successful write to the apiserver also records the
+// written object's uid, generation and resourceVersion, read from the
+// apiserver's answer (#957, audit.RecordWrittenObject): three object
+// identifiers, never the body itself. A write to a named endpoint records none
+// of them. A stage whose apiserver path asks for a dry run (?dryRun=All) is
+// recorded as krateo.action=restaction.dryRun, krateo.audit.dry_run=true, and
+// names no written object: nothing was persisted.
 //
 // WHAT A RECORD NEVER HOLDS. This trail is kept for 365 days, so nothing that
 // can carry a credential goes into it:
 //   - the request PATH: a webhook path (Slack /services/T/B/<secret>, Discord
 //     /api/webhooks/<id>/<token>, Telegram /bot<token>/…) or one built by jq from
 //     an earlier stage's token is a secret in its own right. The RESTAction, its
-//     stage and server.address identify the action and the authority.
+//     stage and its target identify the action and the authority.
 //   - the upstream's response BODY: an error body can echo a token. The outcome
 //     is the real status code plus a short reason class from a closed set
-//     (outcomeMessage), never upstream text.
+//     (audit.FailureMessage, shared with the /call record), never upstream
+//     text.
 //
-// THE OUTCOME is what the authority answered, observed at the dial (dialAnswer):
-// the real status code (201 and 204 are not reported as 200); a 2xx whose body
-// snowplow cannot read or convert is still a SUCCESS — the write was accepted —
-// with a note; a dial that got no response is a failure with no code.
+// THE OUTCOME is what the authority answered, observed at the dial
+// (credhttp.Answer, shared with the /call record): the real status code (201
+// and 204 are not reported as 200); a 2xx whose body snowplow cannot read or
+// convert is still a SUCCESS — the write was accepted — with a note; a dial
+// that got no response is a failure with no code, and so is one snowplow ended
+// itself (its destination policy, the page budget), with that refusal's own
+// message; a 3xx is the redirect snowplow refused to follow.
 //
 
 // WHAT IS NOT RECORDED, ON PURPOSE.
@@ -60,11 +67,11 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -90,57 +97,115 @@ func isSafeMethod(verb string) bool {
 
 // stageAuditEvent builds the record for one write-verb stage dial whose
 // authority answered a, or reports false when the dial is not one the trail
-// records: a safe method, or a resolve that is not a customer request. body is
-// the 2xx response body the dial returned (nil when there is none): a write to
-// the apiserver records the identity of the object it names (#957).
-func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) (audit.Event, bool) {
-	verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
-	if isSafeMethod(verb) {
+// records: a safe method, or a resolve with no requester (stageRecorded). body
+// is the 2xx response body the dial returned (nil when there is none): a write
+// to the apiserver records the identity of the object it names (#957).
+func stageAuditEvent(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *credhttp.Answer, body []byte) (audit.Event, bool) {
+	method := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
+	if !stageRecorded(ctx, method) {
 		return audit.Event{}, false
 	}
-	if cache.RefDenialOrigin(ctx) != cache.RefDenialOriginServe {
-		return audit.Event{}, false
-	}
+	ev := stageEvent(raNamespace, raName, apiCall, method)
+	apiServerObject := stageTarget(ctx, &ev, apiCall, call.Path, call.Endpoint, stageEndpointRef(ctx), true)
 
-	ev := audit.Event{
-		Action:              stageAuditAction,
-		Verb:                verb,
-		RESTActionNamespace: raNamespace,
-		RESTActionName:      raName,
-		Stage:               apiCall.Name,
-	}
-	if call.Endpoint != nil {
-		if u, err := url.Parse(call.Endpoint.ServerURL); err == nil {
-			ev.ServerAddress = u.Host // never userinfo, a path or a query
-		}
-	}
-	// A stage with no endpointRef dials the caller's own clientconfig, which is
-	// the Kubernetes apiserver: its path names the object acted on, and the
-	// object's coordinates are recorded as /call records them. A named endpoint
-	// may be any HTTP API: nothing of its path is recorded.
-	apiServerObject := false
-	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) {
-		path, query, _ := splitPathQuery(call.Path) // as the apiserver receives it (#1073 F1)
-		// #957 — a stage may ask the apiserver for a dry run in its path
-		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
-		// persisted: the record says so and names no written object.
-		ev.DryRun = apiServerDryRun(query)
-		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
-			ev.Group, ev.Version, ev.Resource = gvr.Group, gvr.Version, gvr.Resource
-			ev.Namespace, ev.Name = ns, name
-			ev.Subresource = apiServerSubresource(path)
-			apiServerObject = true
-		}
-	}
-
-	ev.Outcome, ev.Code, ev.Message = outcomeOf(a)
+	// destination_refused (audit v0.12.0) when the destination policy refused
+	// the dial: snowplow's own refusal.
+	ev.Outcome, ev.StatusCode, ev.Message, ev.DenialReason = a.OutcomeWithReason()
 	// #957 — the written object's identity accompanies its coordinates: only a
 	// record that names a Kubernetes object can say which object it was. It is
 	// read from the response, never from the stage's request payload.
 	if apiServerObject {
-		ev.RecordWrittenObject(body)
+		audit.RecordWrittenObject(&ev, body)
 	}
 	return ev, true
+}
+
+// stageRecorded reports whether a stage action with method is one the trail
+// records: a write (not a safe method) on a resolve somebody asked for. Every
+// non-customer origin but an export has no requester (the refresher, the
+// cohort seed, the prewarm drivers, a demand revalidation, a background
+// self-loopback hop): recording one under the identity on the ctx would
+// attribute to a cohort's representative an action that user did not take. An
+// export is the customer's own request (its writes are refused, and that
+// refusal is recorded).
+func stageRecorded(ctx context.Context, method string) bool {
+	if isSafeMethod(method) {
+		return false
+	}
+	requested := true
+	cache.EachNonCustomerOrigin(ctx, func(o string) bool {
+		if o != cache.NonCustomerExport {
+			requested = false
+			return false
+		}
+		return true
+	})
+	return requested
+}
+
+// stageEvent is the part of a stage record every record shares: the action,
+// the method and the RESTAction stage.
+func stageEvent(raNamespace, raName string, apiCall *templates.API, method string) audit.Event {
+	return audit.Event{
+		Action:              stageAuditAction,
+		HTTPMethod:          method,
+		RESTActionNamespace: raNamespace,
+		RESTActionName:      raName,
+		RESTActionStage:     apiCall.Name,
+	}
+}
+
+// stageTarget sets ev's target and verb for a stage action of ev.HTTPMethod to
+// path on ep, and reports whether it named a Kubernetes object.
+//
+//   - A stage with no endpointRef dials the caller's own clientconfig, which is
+//     the Kubernetes apiserver: its path names the object acted on, and the
+//     object's coordinates are recorded as /call records them, with the verb
+//     the apiserver derives for that path.
+//   - A named endpoint may be any HTTP API: nothing of its path is recorded,
+//     and the record names the host it went to (server.address) and the
+//     lowercase method. #1283 — and which endpointRef the stage dialled it
+//     through (krateo.audit.endpoint_ref.*, the reference as resolved: a
+//     templated name rendered), names only: the shared writer never writes a
+//     per-user credential Secret's name.
+//   - #1291 — a record names exactly one target (schema v1). A dial whose
+//     path names no object records the host it went to (the caller's own
+//     apiserver included: that is where the write went). An action that was
+//     not dialled (dialled false) and names no object or no resolved endpoint
+//     names none: the shared writer marks it target.
+func stageTarget(ctx context.Context, ev *audit.Event, apiCall *templates.API, path string, ep *endpoints.Endpoint, ref *templates.Reference, dialled bool) (apiServerObject bool) {
+	method := ev.HTTPMethod
+	if apiCall.EndpointRef == nil && !cache.ServiceAccountDialFromContext(ctx) && path != "" {
+		p, query, hasQuery := splitPathQuery(path) // as the apiserver receives it (#1073 F1)
+		// #957 — a stage may ask the apiserver for a dry run in its path
+		// (".../demo?dryRun=All", e.g. a validation stage). Nothing is
+		// persisted: the record says so and names no written object.
+		ev.DryRun = apiServerDryRun(query)
+		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(p); ok {
+			ev.Group, ev.Version, ev.Resource = gvr.Group, gvr.Version, gvr.Resource
+			ev.Namespace, ev.ObjectName = ns, name
+			ev.Subresource = apiServerSubresource(p)
+			uri := p
+			if hasQuery {
+				uri += "?" + query
+			}
+			ev.Verb = audit.KubernetesVerb(method, uri)
+			return true
+		}
+	}
+	ev.Verb = audit.MethodVerb(method)
+	if !dialled && apiCall.EndpointRef == nil {
+		return false // the caller's apiserver, object unknown: marked target
+	}
+	if ep != nil {
+		if u, err := url.Parse(ep.ServerURL); err == nil {
+			ev.ServerAddress = u.Host // never userinfo, a path or a query
+		}
+	}
+	if ev.ServerAddress != "" && apiCall.EndpointRef != nil && ref != nil {
+		ev.EndpointRefNamespace, ev.EndpointRefName = ref.Namespace, ref.Name
+	}
+	return false
 }
 
 // apiServerDryRun reports whether an apiserver request with this raw query is
@@ -155,78 +220,66 @@ func apiServerDryRun(rawQuery string) bool {
 	return len(q["dryRun"]) > 0
 }
 
-// outcomeOf turns what the authority answered into (outcome, code, message).
-// The message is from a closed set and never carries upstream text.
-func outcomeOf(a *dialAnswer) (outcome string, code int, message string) {
-	if a == nil || a.code == 0 {
-		return "failure", 0, "no response from the endpoint"
-	}
-	if a.code >= 200 && a.code < 300 {
-		return "success", a.code, a.bodyNote
-	}
-	return "failure", a.code, outcomeMessage(a.code)
-}
-
-// outcomeMessage is the reason class of a non-2xx answer: the status text of
-// the code, or the bare code for one with no standard text.
-func outcomeMessage(code int) string {
-	if t := http.StatusText(code); t != "" {
-		return fmt.Sprintf("upstream answered %d %s", code, t)
-	}
-	return fmt.Sprintf("upstream answered %d", code)
-}
-
 // auditStageWrite emits the record for one dialled stage (see stageAuditEvent).
-func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *dialAnswer, body []byte) {
+func auditStageWrite(ctx context.Context, raNamespace, raName string, apiCall *templates.API, call httpcall.RequestOptions, a *credhttp.Answer, body []byte) {
 	if ev, ok := stageAuditEvent(ctx, raNamespace, raName, apiCall, call, a, body); ok {
 		audit.Emit(ctx, ev)
 	}
 }
 
-// dialAnswer is what the authority of one branch-E dial answered, observed by
-// httpFetchConverting for the audit record only: the real status code (the
-// fetch's returned envelope reports every 2xx as 200 and a 2xx it cannot
-// convert as 422) and whether a 2xx body could not be used. Zero code means no
-// response was received. One dial, one goroutine: it is written by the fetch
-// before it returns and read after.
-type dialAnswer struct {
-	code     int
-	bodyNote string
+// stageRefusal is one write stage, or one item of it, that was not sent
+// (audit#22 (a)): what is known of it when it was refused.
+type stageRefusal struct {
+	apiCall *templates.API
+	// method is the item's method; "" takes the stage's verb.
+	method string
+	// path and ep are the item's rendered path and resolved endpoint, when
+	// it got that far ("" and nil otherwise); ref the endpointRef resolved.
+	path string
+	ep   *endpoints.Endpoint
+	ref  *templates.Reference
+	// outcome is denied (snowplow refused, with reason) or failure (the
+	// endpoint snowplow needed to send it could not be read). Neither row
+	// carries a status code: the write was never sent, so no authority
+	// answered it.
+	outcome, reason string
 }
 
-// The closed set of notes on an accepted (2xx) write.
-const (
-	dialNoteBodyUnread        = "accepted; the response body could not be read"
-	dialNoteBodyUnconvertible = "accepted; the response body is not JSON or YAML"
-)
-
-// answered records the final HTTP status code. Nil-safe: a fetch with no
-// observer on its ctx records nothing.
-func (a *dialAnswer) answered(code int) {
-	if a != nil {
-		a.code = code
+// auditStageRefusal emits the record of a write stage snowplow did not send,
+// on a resolve somebody asked for (stageRecorded): denied with its reason, or a
+// failure of what it needed first. A refused READ stage gets none, as a sent
+// read does not. The body is a fixed phrase, never a value of the stage (its
+// path or payload can carry a credential).
+func (r *resolveRun) auditStageRefusal(ctx context.Context, sr stageRefusal) {
+	method := strings.ToUpper(sr.method)
+	if method == "" {
+		method = strings.ToUpper(ptr.Deref(sr.apiCall.Verb, http.MethodGet))
 	}
-}
-
-// note records why an accepted body could not be used. Nil-safe.
-func (a *dialAnswer) note(n string) {
-	if a != nil {
-		a.bodyNote = n
+	if !stageRecorded(ctx, method) {
+		return
 	}
+	ev := stageEvent(r.opts.RESTActionNamespace, r.opts.RESTActionName, sr.apiCall, method)
+	stageTarget(ctx, &ev, sr.apiCall, sr.path, sr.ep, sr.ref, false)
+	ev.Outcome, ev.DenialReason = sr.outcome, sr.reason
+	if sr.outcome == audit.OutcomeDenied {
+		ev.Message = audit.MessageRefused
+	} else {
+		ev.Message = audit.MessageEndpointUnreadable
+	}
+	audit.Emit(ctx, ev)
 }
 
-type dialAnswerCtxKey struct{}
+type stageEndpointRefKey struct{}
 
-// withDialAnswer returns ctx carrying a fresh observer for one dial.
-func withDialAnswer(ctx context.Context) (context.Context, *dialAnswer) {
-	a := &dialAnswer{}
-	return context.WithValue(ctx, dialAnswerCtxKey{}, a), a
+// withStageEndpointRef carries the endpointRef a stage resolved (templated
+// name rendered, #113) to its dial, for the record (#1283). nil: none.
+func withStageEndpointRef(ctx context.Context, ref *templates.Reference) context.Context {
+	return context.WithValue(ctx, stageEndpointRefKey{}, ref)
 }
 
-// dialAnswerFromContext returns the dial's observer, or nil when none.
-func dialAnswerFromContext(ctx context.Context) *dialAnswer {
-	a, _ := ctx.Value(dialAnswerCtxKey{}).(*dialAnswer)
-	return a
+func stageEndpointRef(ctx context.Context) *templates.Reference {
+	ref, _ := ctx.Value(stageEndpointRefKey{}).(*templates.Reference)
+	return ref
 }
 
 // apiServerSubresource returns the subresource an apiserver object path

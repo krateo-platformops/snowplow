@@ -15,6 +15,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
@@ -239,6 +240,33 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 	return cache.ComputeKey(inputs), c, &inputs
 }
 
+// keyMintInputs is the store and identity dispatchCacheLookupKey mints a key
+// under, or why it mints none (bypass != ""): the one place those three
+// early-outs are decided, so the #1265 served-cold counter names the same
+// reason the key mint acted on (coldCauseOfLookup).
+//
+//   - coldCauseDryRun — #443 (f): an inert (dry-run) resolve mints no key and
+//     gets no handle: no L1 lookup, no capture, no Put. This is also a
+//     CORRECTNESS rule: an inline draft named like a stored RESTAction must
+//     never be served the stored cell.
+//   - coldCauseCacheOff — no resolved-output store (the cache or the L1 is off).
+//   - coldCauseIneligibleKey — defence in depth: without an identity we cannot
+//     key safely, so the request skips the cache.
+func keyMintInputs(ctx context.Context) (*cache.ResolvedCacheStore, jwtutil.UserInfo, string) {
+	if cache.Inert(ctx) {
+		return nil, jwtutil.UserInfo{}, coldCauseDryRun
+	}
+	c := cache.ResolvedCache()
+	if c == nil {
+		return nil, jwtutil.UserInfo{}, coldCauseCacheOff
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return nil, jwtutil.UserInfo{}, coldCauseIneligibleKey
+	}
+	return c, ui, ""
+}
+
 // dispatchCacheLookupKey builds the L1 resolved-output cache key and
 // returns the live cache handle, if the L1 layer is enabled. Returns
 // (key, nil, nil) when L1 is disabled — callers MUST treat handle==nil
@@ -271,21 +299,8 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	defer slowcall.Start(ctx, slowcall.PhaseKeyMint).End() // #1054
-	// #443 (f) — an inert (dry-run) resolve mints no key and gets no handle:
-	// no L1 lookup, no capture, no Put. This is also a CORRECTNESS rule: an
-	// inline draft named like a stored RESTAction must never be served the
-	// stored cell.
-	if cache.Inert(ctx) {
-		return "", nil, nil
-	}
-	c := cache.ResolvedCache()
-	if c == nil {
-		return "", nil, nil
-	}
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// Defence in depth — without an identity we cannot key
-		// safely. Skip the cache for this request.
+	c, ui, bypass := keyMintInputs(ctx)
+	if bypass != "" {
 		return "", nil, nil
 	}
 	// Path B direct call — derive BindingUID for the layer's GET-permit.
@@ -695,10 +710,11 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 
 // l1Get is a customer dispatch's L1 read of its response cell, timed as the
 // request's l1_get phase (#1054): the store's single mutex plus a map read,
-// so time here is that lock.
-func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, bool) {
+// so time here is that lock. miss is what the lookup found (cache.LookupHit on
+// a hit), the #1265 served-cold counter's cause for a miss.
+func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, cache.LookupMiss) {
 	defer slowcall.Start(ctx, slowcall.PhaseL1Get).End()
-	return h.Get(key)
+	return h.GetReportingMiss(key)
 }
 
 // cacheHandle is the narrow interface the dispatchers depend on. The
@@ -707,6 +723,9 @@ func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry
 // so it never leaks beyond dispatchers.
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
+	// #1265 P0 — Get plus what the lookup found (cache.LookupMiss): the
+	// customer serve's read (l1Get), so a cold serve names its cause.
+	GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss)
 	// #930 — Now is the store clock: a cell's age (the keep-warm age-skip) is
 	// Now() minus the CreatedAt the store stamped on that clock, never
 	// time.Since, so the decision and the store's own TTL agree on one clock.
@@ -717,25 +736,36 @@ type cacheHandle interface {
 	// they never fake #315/#316 warmth or contaminate the customer hit/miss ratio.
 	GetNoTouch(key string) (*cache.ResolvedEntry, bool)
 	// #189 — generation-guarded write. CaptureGen reads the key's generation
-	// before a resolve; PutResolvedIfGen stores only if it has not moved (a
-	// DELETE-eviction during the resolve would refuse the write rather than
+	// before a resolve; PutResolvedIfGenOutcome stores only if it has not moved
+	// (a DELETE-eviction during the resolve would refuse the write rather than
 	// resurrect the pre-delete body).
 	//
 	// #912 re-review — every write a dispatcher makes takes the resolve's
 	// Put-gate verdict (cache.PutGateVerdict) and stores nothing unless it
 	// allows the Put: there is no ungated write on this interface.
+	//
+	// #1321 — and every write on this interface reports its cache.PutOutcome,
+	// which the writer hands to the publish gate (publishIfSubscribed): a write
+	// that changes a resident cell's bytes is announced by that write. There is
+	// no outcome-discarding write here (the bool PutResolvedIfGen is not on the
+	// interface), and TestIssue1321_C1w_EveryWriteSiteHandsItsOutcomeToThePublishGate
+	// pins that each call site passes the outcome on.
 	CaptureGen(key string) uint64
-	PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome
 	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
 	// carriers. Never refuses a storing verdict; re-marks the key once if a dep
 	// recorded on ctx's dep-gen sink moved since the resolve began.
-	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
+	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #547/#734 — the external-TTL widget's plain Put: exactly Put, plus ending a
 	// KNOWN-STALE state in the write's own critical section (ctx's dep-gen sink).
-	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool
+	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.
+	//
+	// #1255 — a resolve whose decline proves the key unstorable evicts the cell
+	// it could not replace (evict_unstorable.go).
+	unstorableEvicter
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per

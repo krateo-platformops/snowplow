@@ -190,15 +190,19 @@ func wrapEndpointClient(cli *http.Client, ep *endpoints.Endpoint, held, saDial b
 // single caller, httpClientForEndpoint, applies credhttp.Client by provenance
 // (credhttp.EndpointClient otherwise, #1106). Plumbing is always handed a copy
 // of ep without Debug, so it never installs its wire dump (#1112 D4).
+//
+// The plumbing branch is credhttp.PlumbingEndpointClient: only credhttp builds
+// plumbing's clients (#1359), and on js/wasm it sets fetch's credentials mode
+// on them (credhttp/plumbing_clients.go).
 func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpcall.RequestInfo) (*http.Client, bool, error) {
 	if !endpointOwnedShape(ep) {
-		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
+		cli, err := credhttp.PlumbingEndpointClient(ep, ri)
 		return cli, false, err
 	}
 
 	tlsCfg, ok := endpointTLSConfig(ctx, ep)
 	if !ok {
-		cli, err := httpcall.HTTPClientForEndpoint(credhttp.WithoutPlumbingWireDump(ep), ri)
+		cli, err := credhttp.PlumbingEndpointClient(ep, ri)
 		return cli, false, err
 	}
 
@@ -219,6 +223,11 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		// own. It is also where the owned branch gets the destination policy
 		// (#1131); the plumbing branch above gets it from plumbing's transport.
 		DialHolder: credhttp.EndpointDialHolder,
+		// js/wasm only: the browser's fetch below the credential wrappers
+		// replaces the dial, as credhttp.Harden installs it (credhttp's package
+		// doc says what that leaves to the browser). nil on a server build,
+		// which is the field's zero value.
+		WrapTransport: credhttp.BrowserEgress,
 	}
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
 	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by

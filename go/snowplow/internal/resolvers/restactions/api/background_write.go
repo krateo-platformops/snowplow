@@ -31,7 +31,16 @@
 //
 // OBSERVABILITY. A refusal is expected work, not a failure: DEBUG, and one
 // count per refused item in snowplow_background_write_refused_total{origin},
-// every cell of the closed origin set pre-populated (a 0 is a reading).
+// every cell of the closed origin set pre-populated (a 0 is a reading). Its
+// stage outcome reads WriteRefused (#1288; before, the generic Error), a
+// deliberate non-execution: it is listed in X-Snowplow-Stage-Outcomes (the
+// stage did not succeed) and is not counted in the Server span's
+// snowplow.stages.failed. A write that depends on a refused write is not
+// Skipped (blocksDependentWrite): it is planned and refused too, for the same
+// reason, unless its iterator runs over the refused stage's output, which
+// yields zero items: it then has nothing to send and succeeds (not listed).
+// WriteRefused ranks below every failure, so a stage that also has an item
+// the plan refused (InvalidPath, TemplateError) reads that failure.
 package api
 
 import (
@@ -48,6 +57,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 var (
@@ -158,8 +168,17 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 	if !call.ContinueOnError {
 		itemErr = fmt.Errorf("api %s item %d failed: %s", sc.id, i, msg)
 	}
-	r.recordItemError(sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
+	// #1288: the outcome reads WriteRefused, not the generic Error a plain-text
+	// errorKey value would read: a by-design refusal is not a failure. The
+	// errorKey value stays the text it always was.
+	r.recordItemErrorAs(StageReasonWriteRefused, sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
 	recordBackgroundWriteRefused(origin)
+	// audit#22 (a) — denied, write_refused, on a resolve somebody asked for
+	// (an export); background work has no requester and gets no record
+	// (stageRecorded).
+	r.auditStageRefusal(gctx, stageRefusal{apiCall: sc.apiCall, method: verb, path: call.Path,
+		ep: &sc.ep, ref: stageEndpointRef(gctx),
+		outcome: audit.OutcomeDenied, reason: audit.DenialWriteRefused})
 	r.log.Debug("write stage refused",
 		slog.String("name", sc.id),
 		slog.String("verb", verb),

@@ -92,6 +92,12 @@ func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
 	return nil, false // MISS — the declined external cell is never Put/warmed
 }
 
+// GetReportingMiss is Get with the miss reason (#1265 P0): always absent.
+func (h *getRecordingHandle) GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	h.Get(key)
+	return nil, cache.LookupAbsent
+}
+
 // GetNoTouch is the #376 internal no-stamp read the seed-skip decision now uses
 // (seedModeBoot + seedModeKeepwarm). Recorded SEPARATELY from Get so a wiring arm
 // can assert the decision routes through GetNoTouch and NOT Get; getCount/sawGet
@@ -133,20 +139,32 @@ func (h *getRecordingHandle) PutResolved(v cache.PutVerdict, key string, entry *
 func (h *getRecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
 	return v.Store() && h.PutIfGen(ctx, key, entry, capturedGen)
 }
-func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+func (h *getRecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome {
+	if h.PutResolvedIfGen(ctx, v, key, entry, capturedGen) {
+		return cache.PutChanged
+	}
+	return cache.PutRefused
+}
+func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutThenRemark(ctx, key, entry)
-	return true
+	return cache.PutChanged
 }
-func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
 	if !v.Store() {
-		return false
+		return cache.PutRefused
 	}
 	h.PutEndingKnownStale(ctx, key, entry)
-	return true
+	return cache.PutChanged
 }
+
+// #1255 — the unstorable-eviction surface; this handle holds no cell to evict.
+func (h *getRecordingHandle) EvictOnPermanentDecline(context.Context, cache.PutVerdict, string) bool {
+	return false
+}
+func (h *getRecordingHandle) EvictUnstorable(context.Context, string, string) bool { return false }
 
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch

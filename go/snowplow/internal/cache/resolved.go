@@ -285,13 +285,16 @@ type ResolvedEntry struct {
 	// feeds snowplow_prewarm_seed_origin only (seed_origin.go).
 	SeedOrigin string
 
-	// StageOutcomes (#904, restactions class only) is the X-Snowplow-Stage-
-	// Outcomes value of the resolve that produced RawJSON, so an L1 hit answers
-	// with the same header as the cold resolve did. "" means every stage
-	// succeeded (the header is then []), which is the only outcome most stored
-	// cells can have: a cell is stored only when no stage failed, or when every
-	// failure is a per-identity Forbidden (#681 DenialOnly). Stage names and
-	// reason codes only, never identity or data.
+	// StageOutcomes (#904; every resolving class since #1319) is the
+	// X-Snowplow-Stage-Outcomes value of the resolve that produced RawJSON, so
+	// an L1 hit answers with the same header as the cold resolve did: a
+	// RESTAction cell's own stages, a widget cell's apiRef RESTAction's stages,
+	// a RESTAction full list's (replayed to the widget sliced from it). ""
+	// means every stage succeeded (a RESTAction header is then [], a widget
+	// carries none), which is the only outcome most stored cells can have: a
+	// cell is stored only when no stage failed, or when every failure is a
+	// per-identity denial (#681 DenialOnly). Stage names and reason codes
+	// only, never identity or data.
 	StageOutcomes string
 
 	// Inputs is the canonical key-input bundle the entry was resolved
@@ -407,6 +410,13 @@ type ResolvedEntry struct {
 	// Widgets that Go-slice the entry carry it to their Put (ra_full_list_layers.go).
 	// Written only under mu before the entry is readable; never mutated after.
 	contentVersion uint64
+
+	// digest — #1324: the memoised ContentDigest of the entry's body (Raw()),
+	// computed on first use (the first armed response that stamps
+	// X-Snowplow-Refresh-Digest, or the first /refreshes arm that compares
+	// against it) and published once (content_digest.go). A pure function of
+	// the immutable body, so every racer computes the same value.
+	digest atomic.Pointer[string]
 
 	// recentHitters — #444: the last few DISTINCT identities (username + groups,
 	// nothing else) that were served this cell on a customer hit, most recent
@@ -811,6 +821,9 @@ type ResolvedCacheStore struct {
 	// representative could be found to refresh them (a cold, correct refill
 	// instead of a stale cell until the TTL).
 	evictNoRepresentativeTotal atomic.Uint64
+	// #1255: cells evicted because a later resolve of their key proved it can
+	// no longer be stored (EvictOnPermanentDecline / EvictUnstorable).
+	evictUnstorableTotal atomic.Uint64
 
 	// #248 — resident cells carrying a live refreshSuppressed marker, recomputed
 	// on every reaper walk (startResolvedCacheSummary tick). This is a GAUGE, not
@@ -1503,15 +1516,47 @@ func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Durat
 // front and bumps hitTotal — the customer-warmth effects. GetNoTouch is the
 // internal, non-stamping twin.
 func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
-	entry, ok := c.getCore(key, true)
-	if ok {
+	entry, miss := c.GetReportingMiss(key)
+	return entry, miss == LookupHit
+}
+
+// LookupMiss is what one Get found under its key (#1265 P0): a live cell
+// (LookupHit), or why it returned nothing.
+//
+// SCOPE: it is what THIS lookup saw. A cell already gone before it (an LRU or
+// DELETE eviction, a declined Put, a cell never stored, or a TTL / max-age
+// expiry that an earlier read or the reaper already removed) reads
+// LookupAbsent. Only a cell this lookup itself finds past a bound reads
+// LookupExpiredTTL or LookupPastMaxAge.
+type LookupMiss uint8
+
+const (
+	// LookupAbsent — no cell under the key. It is the zero value, so a
+	// LookupMiss nobody set (a default, a stub) never reads as a hit.
+	LookupAbsent LookupMiss = iota
+	// LookupHit — a live cell was found and is returned.
+	LookupHit
+	// LookupExpiredTTL — the cell was past its TTL (its TTLOverride, else the
+	// store TTL) and this lookup evicted it.
+	LookupExpiredTTL
+	// LookupPastMaxAge — the cell was past the max entry age (#378) and this
+	// lookup evicted it.
+	LookupPastMaxAge
+)
+
+// GetReportingMiss is Get plus what the lookup found (LookupMiss). Get is
+// exactly this call with the reason folded to a bool: the same lookup, the same
+// customer-warmth effects and the same miss accounting.
+func (c *ResolvedCacheStore) GetReportingMiss(key string) (*ResolvedEntry, LookupMiss) {
+	entry, miss := c.getCore(key, true)
+	if miss == LookupHit {
 		// #354 P3 (C) — AFTER c.mu is released (getCore's deferred unlock). Get is
 		// the one funnel every hit_total-counted hit goes through
 		// (TestIssue354_P3_StaleServeNoteCoversEveryCountedHit), so a stale serve
 		// is counted on exactly the hit_total population.
 		c.noteServeWhileDirty(key)
 	}
-	return entry, ok
+	return entry, miss
 }
 
 // noteServeWhileDirty counts a customer hit on a cell whose invalidation→fresh
@@ -1539,7 +1584,8 @@ func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
 // it the prompt orphan backstop at maxAge (a customer-cold cell an internal read
 // touches past maxAge is still evicted, not stranded to the reaper tick).
 func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
-	return c.getCore(key, false)
+	entry, miss := c.getCore(key, false)
+	return entry, miss == LookupHit
 }
 
 // getCore is the shared body of Get (touch=true) and GetNoTouch (touch=false). The
@@ -1548,9 +1594,9 @@ func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
 // AND the miss accounting, so a GetNoTouch read is fully metric-neutral — it never
 // inflates hit_total NOR miss_total (freshness-audit: full metric neutrality for
 // internal reads). One implementation so the evict discipline can never drift.
-func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bool) {
+func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, LookupMiss) {
 	if c == nil {
-		return nil, false
+		return nil, LookupAbsent
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1560,7 +1606,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupAbsent
 	}
 	item := el.Value.(*lruItem)
 	// #315/#316 — one time reference for both bound checks AND the lastRead
@@ -1586,7 +1632,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupExpiredTTL
 	}
 	// 1.12.6 C5 (design §7) — bounded LIFETIME, measured from the first Put
 	// under this key (BornAt), which a refresh re-Put does not reset. Past
@@ -1625,7 +1671,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupPastMaxAge
 	}
 	// Customer-warmth effects — ONLY on the touch (customer Get) path (#376). A HIT
 	// here means a customer served this cell, so it is warm as of `now`: move to
@@ -1638,7 +1684,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		c.hitTotal.Add(1)
 		noteSeedOriginHitLocked(item) // #841
 	}
-	return item.entry, true
+	return item.entry, LookupHit
 }
 
 // Has reports whether key is currently resident, WITHOUT any of Get's side
@@ -1667,7 +1713,7 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // replaces the entry and adjusts curBytes accordingly. It reports whether it
 // wrote: the store's admission (admitWrite) can refuse.
 func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
-	return c.putPlain(context.Background(), false, key, entry)
+	return c.putPlain(context.Background(), false, false, key, entry).Stored()
 }
 
 // PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
@@ -1680,20 +1726,26 @@ func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
 // (generation preserved, unknown provenance for the #406 layer index); ctx only
 // ends the known-stale state, inside the same critical section as the write
 // (#734).
-func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) bool {
-	return c.putPlain(ctx, false, key, entry)
+//
+// #1321 — it reports the write's outcome (writeOutcome): the external-TTL
+// widget Put hands it to the publish gate, like every write of a cell a
+// /refreshes stream can be armed on.
+func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
+	return c.putPlain(ctx, false, true, key, entry)
 }
 
-// putPlain is the plain write the methods above share. It reports whether it
-// wrote.
-func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) bool {
+// putPlain is the plain write the methods above share. It reports the write's
+// outcome: PutRefused, or (#1321) PutIdentical / PutChanged against the entry
+// it replaced when outcome is set (writeOutcome). With outcome unset a stored
+// write reports PutChanged without comparing: the caller asks only Stored().
+func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown, outcome bool, key string, entry *ResolvedEntry) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission: an inert resolve, or a write
 	// while the RBAC snapshot is incomplete, stores nothing.
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
@@ -1711,6 +1763,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
 	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
 	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
@@ -1719,7 +1772,7 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	ksEnd.afterUnlock(key)
 	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1741,15 +1794,18 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 // #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
 // the raKey versions the body Go-sliced, so the layer check judges this Put by them.
 // #323's plain no-gen semantics are unchanged.
-func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) bool {
+//
+// #1321 — it reports the write's outcome (writeOutcome) for the publish gate.
+func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
 	// #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh
 	// body). A write the store did not admit (an inert resolve, an incomplete
 	// RBAC snapshot) stored nothing, and there is nothing to remark.
-	if !c.putPlain(ctx, true, key, entry) {
-		return false
+	put := c.putPlain(ctx, true, true, key, entry)
+	if !put.Stored() {
+		return PutRefused
 	}
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
-	return true
+	return put
 }
 
 // #890 / #893 — EDGES OF A CELL THAT IS NOT STORED.
@@ -1817,12 +1873,32 @@ func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key str
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
 func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, false).Stored()
+}
+
+// putIfGenOutcome is putIfGen reporting whether the accepted Put changed the
+// stored bytes (#1321, put_outcome.go): every caller hands the outcome to the
+// publish gate. A fill of an absent key is PutChanged; a #547 demand
+// revalidation or a keep-warm re-Put over a resident cell with the same bytes
+// is PutIdentical. The compare is writeOutcome's: against the entry this write
+// replaced, read in the write's own critical section (no extra c.mu), and run
+// off the lock.
+func (c *ResolvedCacheStore) putIfGenOutcome(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, true)
+}
+
+// putIfGenWrite is the gen-guarded write putIfGen and putIfGenOutcome share.
+// outcome says whether the caller consumes the outcome (writeOutcome). Only
+// then is anything compared beyond #406's own RAFullList compare: putIfGen's
+// callers (the GET-only content cells, the raFullList layer, fixtures) take no
+// frame decision, so they pay no compare (#1321 M1).
+func (c *ResolvedCacheStore) putIfGenWrite(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64, outcome bool) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
@@ -1835,13 +1911,14 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
-		return false
+		return PutRefused
 	}
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
 	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
@@ -1866,7 +1943,7 @@ func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *Re
 	// #406 — a raKey commit with changed content remarks the widgets holding a slice of
 	// the old body; a widget Put of a slice of a since-superseded raKey remarks itself.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // ReplaceIfGen is the #189 generation-guarded REPLACE. It stores entry under key
@@ -1964,15 +2041,20 @@ func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry
 // #375 — like PutIfGen / ReplaceIfGen it takes the resolve ctx and, on ACCEPT,
 // runs remarkIfDepsMoved off-lock: a dep that moved during the re-mint resolve
 // remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
-// birth. #375's arm-9 reflective enumeration covers this method. Returns true
-// iff stored.
-func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// birth. #375's arm-9 reflective enumeration covers this method.
+//
+// #1321 — it returns the Put's outcome: PutRefused, or PutIdentical /
+// PutChanged from the #1070 compare confirmed under c.mu (the `identical`
+// verdict below). The caller publishes a frame only for PutChanged
+// (PublishRefreshed): an identical refresh still runs and still Puts, but it
+// announces nothing the subscriber does not already hold.
+func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
-		return false
+		return PutRefused
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	// #1070 — ONE byte compare of the refresh Put against the resident prior,
@@ -1988,11 +2070,12 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 		c.putRefusedGenerationMovedTotal.Add(1)
 		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
-		return false
+		return PutRefused
 	}
 	// #1070 — identical only if the prior that compared equal is the one replaced
 	// here; any other resident entry (a write landed after the compare) counts the
-	// Put as changed, as #406 voids its compare.
+	// Put as changed, as #406 voids its compare. #1321 — the same verdict decides
+	// the frame (the return value).
 	identical := same != nil && el.Value.(*lruItem).entry == same
 	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
@@ -2027,7 +2110,7 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return putOutcomeOf(identical)
 }
 
 // remintLead is the #378 lead L: how long before the cap the refresher terminal
@@ -2628,7 +2711,9 @@ type ResolvedCacheStats struct {
 	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (Get-lazy + #248 reaper)
 	// #444: evicted by the refresher because no in-class representative was found.
 	EvictNoRepresentativeTotal uint64
-	EvictDeleteTotal           uint64 // 0.30.8: DELETE-event-driven evictions
+	// #1255: evicted because a later resolve proved the key can no longer be stored.
+	EvictUnstorableTotal uint64
+	EvictDeleteTotal     uint64 // 0.30.8: DELETE-event-driven evictions
 
 	// #248 — resident-suppressed gauge (see suppressedResidentGauge). Non-zero
 	// DURING the UAF-decline-freeze; distinguishes decline-frozen from
@@ -2784,6 +2869,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictTTLTotal:                c.evictTTLTotal.Load(),
 		EvictMaxAgeTotal:             c.evictMaxAgeTotal.Load(),
 		EvictNoRepresentativeTotal:   c.evictNoRepresentativeTotal.Load(),
+		EvictUnstorableTotal:         c.evictUnstorableTotal.Load(),
 		EvictDeleteTotal:             c.evictDeleteTotal.Load(),
 		SuppressedResident:           c.suppressedResidentGauge.Load(),
 		WarmPastMaxAge:               c.warmPastMaxAgeGauge.Load(),

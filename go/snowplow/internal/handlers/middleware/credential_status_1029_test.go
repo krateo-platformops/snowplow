@@ -10,16 +10,19 @@
 package middleware_test
 
 import (
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
@@ -96,7 +99,7 @@ func c1029AssertPlumbingCompatible(t *testing.T, rec *httptest.ResponseRecorder,
 // A krateo:loa:2 token whose step-up Secret is missing: 401, cause
 // StepUpRequired, and the bare RFC 9470 challenge.
 func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
-	session := su994Secret(credsecret.SessionName(su994User), su994Session)
+	session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 	su994Informer(t, session)
 	su994APIServer(t, session)
 
@@ -125,7 +128,7 @@ func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
 // invalid_token challenge (#1076), never the step-up one — even with a step-up
 // Secret for the same user sitting in the informer.
 func TestCredentialStatus1029_SessionMissingIsSessionCredentialMissing(t *testing.T) {
-	stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+	stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 	su994Informer(t, stepUp)
 	su994APIServer(t, stepUp)
 
@@ -162,10 +165,10 @@ func TestCredentialStatus1029_ReReadErrorIs500WithNoCause(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			groups := []string{su994Group}
-			want := credsecret.SessionName(su994User)
+			want := credsecret.SessionNames(su994User)[0]
 			if tc.stepUp {
 				groups = append(groups, credsecret.StepUpGroup)
-				want = credsecret.StepUpName(su994User)
+				want = credsecret.StepUpNames(su994User)[0]
 			}
 			su994Informer(t)
 			su994APIServerFailing(t, map[string]int{want: tc.code})
@@ -259,21 +262,51 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			return rec
 		}
 	}
+	// wireSub replaces, in a doc example, the values the wire cannot share
+	// with the doc: KeyNotPublished's message names the JWKS URL, the time
+	// the set was fetched and the token's issue time (plumbing's error text).
+	// Each is checked against what the test set up before it is substituted.
+	var wireSub []string
 	cases := map[string]func(*testing.T) *httptest.ResponseRecorder{
+		"KeyNotPublished": func(t *testing.T) *httptest.ResponseRecorder {
+			t.Setenv("CACHE_ENABLED", "false")
+			authn := &knpJWKS{}
+			authn.publish(map[string]*rsa.PublicKey{"key-2": &knpKey(t).PublicKey})
+			url := authn.serve(t)
+			iat := knpIssuedBefore()
+			before := time.Now().Add(-time.Second)
+			rec, _ := p1076Serve(middleware.UserConfig(jwtutil.NewJWKSKeySource(url), testAuthnNS),
+				bearer("Bearer "+knpMint(t, knpKey(t), "key-1", iat)))
+			after := time.Now().Add(time.Second)
+			m := regexp.MustCompile(`, fetched at (\S+), holds`).FindStringSubmatch(rec.Body.String())
+			if m == nil {
+				t.Fatalf("no fetch time in %s", rec.Body.String())
+			}
+			fetched, err := time.Parse(time.RFC3339, m[1])
+			if err != nil || fetched.Before(before.Truncate(time.Second)) || fetched.After(after) {
+				t.Fatalf("fetch time %q is not this test's fetch [%s, %s]", m[1], before, after)
+			}
+			wireSub = []string{
+				"http://authn.example/.well-known/jwks.json", url,
+				"2026-11-10T09:30:00Z", m[1],
+				"2026-11-10T09:00:00Z", iat.UTC().Format(time.RFC3339),
+			}
+			return rec
+		},
 		"TokenMissing": tokenServe(bearer("")),
 		"TokenInvalid": tokenServe(bearer("Bearer not.a.real.jwt")),
 		"TokenExpired": func(t *testing.T) *httptest.ResponseRecorder {
 			return tokenServe(bearer("Bearer " + helperMakeToken(t, testUsername, -time.Hour)))(t)
 		},
 		"StepUpRequired": func(t *testing.T) *httptest.ResponseRecorder {
-			session := su994Secret(credsecret.SessionName(su994User), su994Session)
+			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			su994Informer(t, session)
 			su994APIServer(t, session)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
 			return rec
 		},
 		"SessionCredentialMissing": func(t *testing.T) *httptest.ResponseRecorder {
-			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			su994Informer(t, stepUp)
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group))
@@ -289,11 +322,21 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			if !ok {
 				t.Fatalf("the doc has no example for %s", reason)
 			}
+			wireSub = nil
 			rec := serve(t)
 			if ex.statusLine != "HTTP/1.1 401 Unauthorized" || rec.Code != http.StatusUnauthorized {
 				t.Fatalf("status: doc %q wire %d", ex.statusLine, rec.Code)
 			}
-			if got, want := rec.Body.String(), sub(ex.body)+"\n"; got != want {
+			body := sub(ex.body)
+			if wireSub != nil {
+				for i := 0; i < len(wireSub); i += 2 {
+					if strings.Count(body, wireSub[i]) != 1 {
+						t.Fatalf("the doc example must name %q exactly once: %s", wireSub[i], body)
+					}
+				}
+				body = strings.NewReplacer(wireSub...).Replace(body)
+			}
+			if got, want := rec.Body.String(), body+"\n"; got != want {
 				t.Fatalf("body differs from doc:\n got  %q\n want %q", got, want)
 			}
 			if len(ex.headers) != len(rec.Result().Header) {
@@ -314,7 +357,7 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 func TestCredentialStatus1029_NearMissGroupIsSessionCause(t *testing.T) {
 	for _, g := range []string{"x-krateo:loa:2", "krateo:loa:2 ", "KRATEO:LOA:2", "krateo:loa:20"} {
 		t.Run(g, func(t *testing.T) {
-			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			su994Informer(t, stepUp)
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, g))
@@ -332,10 +375,10 @@ func TestCredentialStatus1029_CauseMessageCarriesNoIdentity(t *testing.T) {
 	for _, stepup := range []bool{true, false} {
 		t.Run(map[bool]string{true: "stepup", false: "session"}[stepup], func(t *testing.T) {
 			groups := []string{su994Group}
-			have := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			have := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			if stepup {
 				groups = append(groups, credsecret.StepUpGroup)
-				have = su994Secret(credsecret.SessionName(su994User), su994Session)
+				have = su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			}
 			su994Informer(t, have)
 			su994APIServer(t, have)
@@ -357,10 +400,10 @@ func TestCredentialStatus1029_CauseMessageCarriesNoIdentity(t *testing.T) {
 func TestCredentialStatus1029_InformerPathsNeverCarryACause(t *testing.T) {
 	for _, stepup := range []bool{true, false} {
 		groups := []string{su994Group}
-		name := credsecret.SessionName(su994User)
+		name := credsecret.SessionNames(su994User)[0]
 		if stepup {
 			groups = append(groups, credsecret.StepUpGroup)
-			name = credsecret.StepUpName(su994User)
+			name = credsecret.StepUpNames(su994User)[0]
 		}
 		kind := map[bool]string{true: "stepup", false: "session"}[stepup]
 		t.Run(kind+"/hit", func(t *testing.T) {

@@ -38,6 +38,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -238,6 +239,11 @@ func accumulateErrorKey(dict map[string]any, key string, value any) {
 // unchanged -race corpus (TestResolve_ConcurrentRequestsDoNotCrossPollinate,
 // TestShip2a_FullResolve_ManagedFields_Race, etc.).
 type resolveRun struct {
+	// stageRef is the endpointRef the current stage resolved (its templated
+	// name rendered), set by resolveStageEndpoint and carried to the stage's
+	// dials for the record (#1283). Stages run one at a time.
+	stageRef *templates.Reference
+
 	ctx             context.Context
 	log             *slog.Logger
 	opts            ResolveOptions            // verbatim caller opts (RC already non-nil)
@@ -378,12 +384,19 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 // pre-sized slot (no lock needed — same property the inline code relied on).
 // Exercised under -race by TestResolve_IteratorErrorCollection_Race.
 func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
+	r.recordItemErrorAs(stageReasonOf(accumVal), mu, itemErrs, id, i, errKey, accumVal, bumpMsg, itemErr)
+}
+
+// recordItemErrorAs is recordItemError with the stage outcome's reason named by
+// the caller instead of read from accumVal: a refusal snowplow decided whose
+// errorKey value is plain text (background_write.go, #1288 WriteRefused).
+func (r *resolveRun) recordItemErrorAs(reason string, mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
 	mu.Lock()
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
 	r.taintNarrow() // #603 PR-2 — an errored resolve narrows nothing
 	r.stageErrSink.Bump(id, bumpMsg)
-	r.outcomes.fail(id, stageReasonOf(accumVal))
+	r.outcomes.fail(id, reason)
 	if itemErr != nil {
 		// #709 — keep the status this item recorded, so a resolve whose
 		// RESTAction filter cannot produce a value reports it (stage_failure.go).
@@ -420,7 +433,10 @@ func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error
 	if !call.ContinueOnError {
 		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
 	}
-	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
+	// #1319 — its own closed code (NotFoundForRequester, a denial for the
+	// client), not the NotFound a plain 404 reads: the errorKey body is the
+	// same canonical 404 Status.
+	r.recordItemErrorAs(StageReasonNotFoundForRequester, dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
 	notePerIdentityForbidden(r.ctx, false)
 }
 
@@ -481,6 +497,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
 	// stays literal, never templated).
 	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
+	r.stageRef = ref
 	// #1025 — every stage passes here before it branches on userAccessFilter,
 	// so the one rule covers every stage: a named ref to a per-user credential
 	// Secret is refused for every provenance, literal or templated, UAF or
@@ -489,6 +506,11 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	// stageReturn); nothing was read or dialed. The Secret name embeds a
 	// username, so it is not logged, in clear or as a label (#1192).
 	if err := r.mapper.refusePerUserRef(ref); err != nil {
+		// audit#22 (a) — denied, per_user_credential_ref. The record never
+		// carries the reference: its name embeds a username. With no
+		// endpoint resolved, it names no target (marked target).
+		r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
+			outcome: audit.OutcomeDenied, reason: audit.DenialPerUserCredentialRef})
 		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
 			slog.String("name", id),
 			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
@@ -503,6 +525,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		// path the caller cannot list is then the apiserver's 403 stage error.
 		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil)
 		if err != nil {
+			r.auditEndpointUnresolved(apiCall, nil, err)
 			r.log.ErrorContext(r.ctx, "userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
 			return endpoints.Endpoint{}, false, false, stageReturn
@@ -538,6 +561,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	}
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
 	if err != nil {
+		r.auditEndpointUnresolved(apiCall, ref, err)
 		r.log.ErrorContext(r.ctx, "unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
 		// #1115 — the endpointRef Secret read is a network exchange of this
@@ -619,7 +643,7 @@ func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, ap
 	// write item any guard refuses is a stage failure with its reason, never a
 	// silent success (undialled_write.go).
 	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
-	r.failRefusedItems(id, apiCall, skips)
+	r.failRefusedItems(id, apiCall, &ep, skips)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -828,6 +852,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey,
 			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
+		// audit#22 (a) — denied, dry_run_not_executed: what the item would
+		// have written, as far as it was built.
+		r.auditStageRefusal(gctx, stageRefusal{apiCall: sc.apiCall, method: verb, path: call.Path,
+			ep: &sc.ep, ref: stageEndpointRef(gctx),
+			outcome: audit.OutcomeDenied, reason: audit.DenialDryRunNotExecuted})
 		return nil
 	}
 	// #903 — background work never writes: a write stage is sent only on a
@@ -1571,7 +1600,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// (external_fetch_cache.go). The touch above still declines the L1 Put.
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
-	fctx, answer := withDialAnswer(fctx)
+	fctx, answer := credhttp.WithAnswer(fctx)
 	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
 	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
 	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")
@@ -1688,7 +1717,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				itemErr = &causedItemError{text: itemErr.Error(), cause: fetchErr}
 			}
 		}
-		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
+		// #1319 — the definite per-identity NotFound reads its own closed
+		// code; every other answer's reason is read from its code as before.
+		reason := stageReasonOf(accumVal)
+		if isOwnNotFound {
+			reason = StageReasonNotFoundForRequester
+		}
+		r.recordItemErrorAs(reason, dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
 		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}
@@ -1836,6 +1871,8 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// derived from the outer stage's, and a nested named-ref stage must not
 	// read as held because its outer stage was.
 	provCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
+	// #1283 — the stage's dials record which endpointRef they went through.
+	provCtx = withStageEndpointRef(provCtx, r.stageRef)
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active
 	// the SA endpoint carries the SA token (no user-bearer override needed);
@@ -2269,11 +2306,20 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		// #1281 — a stage carrying userAccessFilter on a verb other than
+		// GET/HEAD (the CRD rule's set) would be sent as snowplow's
+		// ServiceAccount: refused here, before the #904 decision below and
+		// before any item is planned, so it is reported whatever the data
+		// (an iterator of zero items, a failed dependency) and nothing is sent
+		// (uaf_non_read.go).
+		if r.refuseUAFOnNonReadVerb(id, apiMap[id]) {
+			continue
+		}
 		// #904 — a write stage whose dependsOn stage did not succeed is not
 		// sent (dependent_write.go). Decided here, between stages, so no item
 		// of it is ever dispatched.
 		if dep, skip := r.dependentWriteBlocked(apiMap[id]); skip {
-			r.skipDependentWrite(id, dep)
+			r.skipDependentWrite(id, apiMap[id], dep)
 			continue
 		}
 		r.outcomes.ran(id)

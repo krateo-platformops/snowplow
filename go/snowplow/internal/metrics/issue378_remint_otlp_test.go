@@ -22,7 +22,7 @@ import (
 )
 
 type r378RefreshPutter interface {
-	ReplaceResolvedIfGenRefresh(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	ReplaceResolvedIfGenRefresh(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome
 }
 
 // r378RemintClasses is the closed class set the live query requires (5 series).
@@ -74,7 +74,7 @@ func TestIssue378_D3_P1SeriesLeaveTheProcessOnOTLP(t *testing.T) {
 		if e, ok := store.GetNoTouch(r[1]); ok {
 			in = *e.Inputs
 		}
-		if !rp.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, r[1], &cache.ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, store.CaptureGen(r[1])) {
+		if !rp.ReplaceResolvedIfGenRefresh(context.Background(), fixtureStoreVerdict, r[1], &cache.ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, store.CaptureGen(r[1])).Stored() {
 			t.Fatalf("SETUP: in-window refresh of %s refused", r[0])
 		}
 	}

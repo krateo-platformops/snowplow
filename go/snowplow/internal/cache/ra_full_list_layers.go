@@ -245,6 +245,25 @@ func (c *ResolvedCacheStore) raLayerForgetLocked(key string) {
 	}
 }
 
+// raLayerConsumersLocked returns the resident widget cells whose recorded body was
+// sliced from raKey. #1255: when raKey is evicted because a later resolve proved it
+// unstorable, its body was stale, so every one of them holds a stale derived body
+// that no raKey commit will ever remark — the caller remarks them
+// (remarkLayerConsumers). A capacity or DELETE removal does not call it (the comment
+// on raLayerForgetLocked holds for those). Callers hold c.mu.
+func (c *ResolvedCacheStore) raLayerConsumersLocked(raKey string) []string {
+	ix := &c.layers
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	var out []string
+	for w := range ix.byRA[raKey] {
+		if _, resident := c.index[w]; resident {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // NoteRAFullListSlice notes, on ctx's dep-gen sink (and its ancestors, whose bodies
 // embed this one), that the resolve served a Go-slice of the raKey entry `entry` (the
 // 4a fast-path hit). The note travels with this resolve to its Put. Called by apiref

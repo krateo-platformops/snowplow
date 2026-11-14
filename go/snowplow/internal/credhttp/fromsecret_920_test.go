@@ -79,3 +79,27 @@ func TestIssue920_FromSecretHasNoClientRateLimit(t *testing.T) {
 		}
 	})
 }
+
+// #1382: credhttp.GetSecret, the Secret read the own-credential readers use in
+// place of FromSecret, has no client-side limiter either, returns the Secret
+// whole (ownership is proven from its annotations or certificate), and leaves
+// the caller's config as it was.
+func TestIssue1382_GetSecretHasNoClientRateLimit(t *testing.T) {
+	srv, hits := secretServer(t)
+	rc, rl := drainedConfig(t, srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	sec, err := GetSecret(ctx, rc, "s", "n")
+	if err != nil {
+		t.Fatalf("RED — credhttp.GetSecret waited on a client-side limiter: %v", err)
+	}
+	if string(sec.Data["server-url"]) != "https://example.invalid" || sec.Name != "s" || hits.Load() != 1 {
+		t.Fatalf("GetSecret read %q (%s) with %d request(s); want the served Secret with 1", sec.Data["server-url"], sec.Name, hits.Load())
+	}
+	if rc.QPS != 1 || rc.Burst != 1 || rc.RateLimiter != rl || rc.WrapTransport != nil {
+		t.Errorf("GetSecret changed the caller's config")
+	}
+	if _, err := GetSecret(ctx, nil, "s", "n"); err == nil {
+		t.Error("GetSecret with no config must fail")
+	}
+}

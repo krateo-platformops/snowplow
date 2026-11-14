@@ -196,7 +196,9 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 	// value spliced into it escaped as one segment (or one query value), and a
 	// value that cannot be one refused (pathtemplate). Payload and headers are
 	// not URIs and keep the plain render below.
-	path, pathErr := pt.Render(context.TODO(), ds)
+	// Not cancellable, as on context.TODO() before; Background is the context
+	// the gojq fork does not poll per opcode (execute.go:24) — run 23.
+	path, pathErr := pt.Render(context.Background(), ds)
 	out.Path = path
 	out.Verb = ptr.To(ptr.Deref(in.Verb, http.MethodGet))
 
@@ -535,7 +537,9 @@ func evalJQE(q string, ds any) (string, error) {
 		return q, nil
 	}
 
-	out, err := jqutil.Eval(context.TODO(),
+	// Not cancellable, as on context.TODO() before; Background is the context
+	// the gojq fork does not poll per opcode (execute.go:24) — run 23.
+	out, err := jqutil.Eval(context.Background(),
 		jqutil.EvalOptions{
 			Query:        q,
 			Unquote:      true,

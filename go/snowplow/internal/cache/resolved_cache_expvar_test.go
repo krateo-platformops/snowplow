@@ -75,6 +75,7 @@ func TestResolvedCacheStatsByStat_ReportsLiveStore(t *testing.T) {
 		"evict_lru_total", "evict_ttl_total", "evict_delete_total",
 		"evict_max_age_total",           // 1.12.6 C5 bounded lifetime
 		"evict_no_representative_total", // #444 refresher eviction: no in-class representative
+		"evict_unstorable_total",        // #1255 a later resolve proved the key unstorable
 		"suppressed_resident",           // #345 — #248's resident-suppressed validation gauge
 		"warm_past_max_age",             // #315 C4 — warm-past-cap at-risk gauge
 		"warm_seeded",                   // #376 — warm working set split by source: boot-prewarmed

@@ -94,6 +94,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// the slow /call class in the 8-cycle parallelism diagnostic.
 	pcs, pcEmit := beginPerCall(req, "restactions")
 	defer pcEmit()
+	// #1265 P0 — one serve outcome per top-level customer call (counter + header).
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerRestactions)
+	defer serveEnd()
 
 	// Ship 1 — customer-priority signal. Mark this /call as in-flight so
 	// the prewarm engine yields its background re-seed work for the
@@ -255,8 +258,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// to the shared empty-identity row → treat as a CACHE MISS, fall through to
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
+	lookupMiss := cache.LookupAbsent
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := l1Get(req.Context(), cacheHandle, cacheKey); ok {
+		var entry *cache.ResolvedEntry
+		if entry, lookupMiss = l1Get(req.Context(), cacheHandle, cacheKey); lookupMiss == cache.LookupHit {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -305,10 +310,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
-			setStoredStageOutcomesHeader(wri, entry) // #904
+			stampRefreshDigest(wri, entry.ContentDigest) // #1324: the cell is served verbatim
+			setStoredStageOutcomesHeader(wri, entry)     // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
 			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
+			serve.servedCell(cacheKey, entry)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -324,6 +331,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
+	serve.servedLive(coldCauseOfLookup(req.Context(), cacheHandle, cacheInputs, lookupMiss))
 
 	// #189 — capture the cache key's generation BEFORE the resolve below. If the
 	// RESTAction CR is DELETE-evicted during the (live-apiserver) resolve, the
@@ -496,14 +504,16 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// #1116 — extras that name a key the resolver writes: a 400 naming
 		// the keys. Nothing was read or dialled, so there is no stale-derived
 		// pass to withdraw.
-		if WriteReservedExtrasRefusal(wri, err) {
+		if isReservedExtrasRefusal(err) {
+			serve.refused() // #1265 — refused before anything was read: not a cold serve
+			WriteReservedExtrasRefusal(wri, err)
 			return
 		}
 		// #905 (c) — an error from a stale-derived pass is withdrawn and the
 		// request re-run with D2 disabled, exactly like a declined body: a write
 		// held in that pass (rule a) makes a filter that needs its output fail,
 		// and the fresh re-run is the one that sends the write.
-		if staleWritePoint(r, wri, req, staleSink, false) {
+		if staleWritePoint(r, wri, req, staleSink, false, nil) {
 			return
 		}
 		log.ErrorContext(ctx, "unable to resolve rest action",
@@ -594,7 +604,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
-		// the body, persist it nowhere.
+		// the body, persist it nowhere. #1255 — and evict an older cell of this key
+		// (a #547 demand revalidation re-enters here over one): no writer can
+		// ever replace it.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "body served (200); not persisted — Secret reads are always live (#398)"),
@@ -608,6 +621,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
 		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
+		// #1255 — the same class-driven gate as the refresher's: an older cell of
+		// this key can never be replaced, so it is evicted.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
 		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
 		// snowplow_restactions_uaf_put_declined_total carries the rate.
@@ -623,6 +639,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// The shared Put-gate verdict (cache.PutGateVerdict): a declared write
 		// (#903 F1), a stage error that is not per-identity forbidden (#681), a
 		// genuine external touch. Each reason keeps its own log and counter.
+		// #1255 — a PERMANENT decline also evicts an older cell of this key (a
+		// #547 demand revalidation re-enters here over a resident known-stale
+		// one): no writer can ever replace it. A transient one keeps it.
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
 		switch verdict.Reason() {
 		case cache.PutReasonDeclaredWrite:
 			// DEBUG: designed, and it fires on every /call of a write RESTAction.
@@ -715,13 +735,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			putStored := cacheHandle.PutResolvedIfGen(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+			put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 				RawJSON:       encoded,
 				Inputs:        cacheInputs,
 				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
 				StaleDerived:  staleSink.StaleDerived(),        // #710 PR-2b
 				StageOutcomes: storableStageOutcomes(outcomes), // #904
 			}, cacheGen0)
+			putStored := put.Stored()
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
 			// during the resolve) stored no cell, so — exactly like the declined
@@ -752,7 +773,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// (it re-armed after a TTL-eviction, and this cold-fill replaces the
 				// evicted entry), announce the fill so the viewer's frame goes fresh
 				// now instead of waiting for the next churn. No-op when unarmed.
-				publishIfSubscribed(cacheKey)
+				// #1321 — and only when the Put changed the stored bytes.
+				publishIfSubscribed(cacheKey, put)
 
 				// #548 — ARM the browser here, and ONLY here, on the cold path.
 				// This block is the one place a cold RESTAction dispatch stores a
@@ -783,10 +805,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a different reason — it mints no key at all (dispatchCacheLookupKey).
 	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
 	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
-	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable, encoded) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, storableStageOutcomes(outcomes)) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

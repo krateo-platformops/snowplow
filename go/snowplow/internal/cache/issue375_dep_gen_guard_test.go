@@ -506,7 +506,10 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 		before := Deps().Stats().UnguardedPutTotal
 		remarksBefore := rl.count(key)
 		out := m.Func.Call(args)
-		if len(out) == 0 || out[0].Kind() != reflect.Bool || !out[0].Bool() {
+		// #1321 — a write that reports its PutOutcome accepts when Stored().
+		accepted := len(out) > 0 && ((out[0].Kind() == reflect.Bool && out[0].Bool()) ||
+			(out[0].Type() == reflect.TypeOf(PutRefused) && out[0].Interface().(PutOutcome).Stored()))
+		if !accepted {
 			t.Errorf("#375 arm-9: %s did not ACCEPT the synthesized live-key Put (out=%v) — cannot prove the "+
 				"accept branch invokes the check; extend the synthesis", m.Name, out)
 			continue

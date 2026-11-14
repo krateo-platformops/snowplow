@@ -16,13 +16,29 @@
 //
 // Scope: User / Group / ServiceAccount subjects, ClusterRoleBindings,
 // RoleBindings to a Role or a ClusterRole, the "*" wildcards, the implicit
-// system:authenticated group. Aggregated ClusterRoles and non-resource URLs
-// are out of scope (no #1046 arm uses them).
+// group (system:authenticated, or system:unauthenticated for system:anonymous)
+// as the apiserver's own impersonation filter decides it (requestGroups), and
+// (#1362) non-resource requests: Attributes
+// with a Path are authorized as upstream RuleAllows authorizes a request whose
+// RequestInfo has IsResourceRequest=false, which means VerbMatches &&
+// NonResourceURLMatches, with ClusterRoleBindings only (the namespace is "").
+// Aggregated ClusterRoles are out of scope (no arm uses them).
 package k8sauthz
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+
+	authnv1 "k8s.io/api/authentication/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/endpoints/filters/impersonation"
+	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 // Attributes are the authorization attributes of one resource request, as the
@@ -35,6 +51,11 @@ type Attributes struct {
 	Resource  string
 	Namespace string
 	Name      string
+	// Path, when non-empty, makes this a NON-RESOURCE request (#1362): the
+	// request path, as RequestInfo.Path carries it. Group, Resource, Namespace
+	// and Name are then ignored, as upstream ignores them, and Verb is the
+	// lowercase HTTP method.
+	Path string
 }
 
 // Authorizer holds a fixed set of RBAC objects.
@@ -86,9 +107,61 @@ func RequestName(verb, name string) string {
 	}
 }
 
+// requestGroups is the group set the apiserver's authorizer sees for a request
+// snowplow sends as (user, groups) — Impersonate-User: user plus one
+// Impersonate-Group per group. It is not modelled: the request runs through the
+// apiserver's own k8s.io/apiserver/pkg/endpoints/filters/impersonation filter
+// (v0.36.5 impersonation.go:126-157), and the groups are those of the user the
+// filter hands downstream. That filter adds system:authenticated unless the
+// user is system:anonymous or the groups already hold system:authenticated or
+// system:unauthenticated (126-144), and adds system:unauthenticated to an
+// impersonated system:anonymous that does not already hold it (145-157)
+// (#1334). The authentication path's AuthenticatedGroupAdder applies only the
+// first rule — it adds nothing for system:anonymous, whose real anonymous
+// authenticator already yields [system:unauthenticated] — so it is not the
+// reference for an impersonated system:anonymous with no groups. Before #1334
+// this model appended system:authenticated unconditionally — the same mistake
+// as the evaluator it judges, so it could not have caught it.
+//
+// A request the filter does not turn into (user, ...) — an empty user, which
+// the apiserver never sees — has no answer here: requestGroups panics rather
+// than guess one.
+func requestGroups(user string, groups []string) []string {
+	var got kuser.Info
+	h := impersonation.WithImpersonation(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got, _ = request.UserFrom(r.Context())
+	}), allowImpersonation{}, nil)
+	req, err := http.NewRequestWithContext(request.WithUser(context.Background(), &kuser.DefaultInfo{
+		Name:   "system:serviceaccount:krateo-system:snowplow",
+		Groups: []string{"system:serviceaccounts", "system:serviceaccounts:krateo-system", kuser.AllAuthenticated},
+	}), http.MethodGet, "/api", nil)
+	if err != nil {
+		panic(fmt.Sprintf("k8sauthz: build impersonation request: %v", err))
+	}
+	req.Header.Set(authnv1.ImpersonateUserHeader, user)
+	for _, g := range groups {
+		req.Header.Add(authnv1.ImpersonateGroupHeader, g)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got == nil || got.GetName() != user {
+		panic(fmt.Sprintf("k8sauthz: the apiserver's impersonation filter does not accept user %q groups %q (%d %s)",
+			user, groups, rec.Code, rec.Body.String()))
+	}
+	return got.GetGroups()
+}
+
+// allowImpersonation authorizes every impersonation: requestGroups needs the
+// filter's group rule, not its impersonate permission check.
+type allowImpersonation struct{}
+
+func (allowImpersonation) Authorize(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+	return authorizer.DecisionAllow, "", nil
+}
+
 // Allowed reports whether Kubernetes RBAC allows attr.
 func (a *Authorizer) Allowed(attr Attributes) bool {
-	groups := append(append([]string(nil), attr.Groups...), "system:authenticated")
+	groups := requestGroups(attr.User, attr.Groups)
 	for _, b := range a.crbs {
 		if !subjectsMatch(b.Subjects, attr.User, groups, "") {
 			continue
@@ -100,7 +173,9 @@ func (a *Authorizer) Allowed(attr Attributes) bool {
 			return true
 		}
 	}
-	if attr.Namespace == "" {
+	// A non-resource request has no namespace, so upstream visits no
+	// RoleBinding for it.
+	if attr.Namespace == "" || attr.Path != "" {
 		return false
 	}
 	for _, b := range a.rbs {
@@ -153,6 +228,12 @@ func subjectsMatch(subjects []rbacv1.Subject, user string, groups []string, bind
 
 func rulesAllow(rules []rbacv1.PolicyRule, attr Attributes) bool {
 	for _, r := range rules {
+		if attr.Path != "" {
+			if has(r.Verbs, attr.Verb) && nonResourceURLMatches(r.NonResourceURLs, attr.Path) {
+				return true
+			}
+			continue
+		}
 		if has(r.Verbs, attr.Verb) && has(r.APIGroups, attr.Group) &&
 			has(r.Resources, attr.Resource) && nameMatches(r.ResourceNames, attr.Name) {
 			return true
@@ -180,6 +261,21 @@ func nameMatches(names []string, name string) bool {
 	}
 	for _, n := range names {
 		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// nonResourceURLMatches is upstream NonResourceURLMatches
+// (pkg/apis/rbac/v1/evaluation_helpers.go): "*", an exact entry, or an entry
+// ending in "*" whose TrimRight("*") is a prefix of the path.
+func nonResourceURLMatches(ruleURLs []string, path string) bool {
+	for _, u := range ruleURLs {
+		if u == rbacv1.NonResourceAll || u == path {
+			return true
+		}
+		if strings.HasSuffix(u, "*") && strings.HasPrefix(path, strings.TrimRight(u, "*")) {
 			return true
 		}
 	}

@@ -15,7 +15,7 @@ import (
 // names come from credsecret, the package that builds them.
 func TestErrorText994_ScrubsTheStepUpSecretName(t *testing.T) {
 	const u = "carla-zq994"
-	for _, name := range []string{credsecret.StepUpName(u), credsecret.SessionName(u)} {
+	for _, name := range []string{credsecret.StepUpNames(u)[0], credsecret.SessionNames(u)[0]} {
 		nf := `secrets "` + name + `" not found`
 		got := redact.Err(errors.New(nf))
 		if strings.Contains(got, u) {

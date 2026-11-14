@@ -17,7 +17,7 @@ is advertised as `call.read.inline`.
 
 ```
 GET /capabilities            (no auth)
-200 {"capabilities":["call.dryRun","call.fieldValidation","call.raw","call.read.inline"]}
+200 {"capabilities":["call.dryRun","call.fieldValidation","call.provenance","call.raw","call.read.inline"]}
 ```
 
 - The list is static and sorted.
@@ -30,6 +30,7 @@ GET /capabilities            (no auth)
 |---|---|
 | `call.dryRun` | `POST\|PUT\|PATCH /call/dry-run` sends the apiserver `dryRun=All` and echoes `X-Snowplow-Dry-Run: All`. |
 | `call.fieldValidation` | `fieldValidation=Ignore\|Strict` is forwarded on write verbs of `/call` and `/call/dry-run`, and echoed in `X-Snowplow-Field-Validation`. |
+| `call.provenance` | `POST\|PUT\|PATCH\|DELETE /call` and `POST\|PUT\|PATCH /call/dry-run` read the `X-Krateo-Provenance` header into the write's audit record (#1333): [howto-frontend-call-provenance.md](howto-frontend-call-provenance.md). |
 | `call.raw` | `raw=true` on `GET /call` and `POST /call/read` returns the stored object for restactions and the widgets group, read as the caller, and echoes `X-Snowplow-Raw: true`. |
 | `call.read.inline` | `POST /call/read` on a RESTAction with body `{"extras":{…},"object":{<RESTAction>}}` resolves the body instead of the stored CR, as the caller, persisting nothing, and echoes `X-Snowplow-Dry-Run: All` and `X-Snowplow-Resolve-Source: request-body`. |
 
@@ -121,7 +122,9 @@ Content-Type: application/json
   `{"reason":"StageNotExecuted","message":"dry-run: stage \"<id>\" verb <V> is not executed"}`.
   Both are a **stable contract**: match on `reason == "StageNotExecuted"`
   (preferred), or on the message prefix `dry-run: stage ` and suffix
-  ` is not executed`.
+  ` is not executed`. One exception: a write stage carrying a
+  `userAccessFilter` reports `UserAccessFilterOnNonReadVerb` instead (#1281,
+  below), as a real run would.
 - **Per-stage outcomes, outside the body.** Every RESTAction reply from the
   resolver carries `X-Snowplow-Stage-Outcomes`, compact JSON in topological
   stage order listing every stage that did **not** succeed:
@@ -129,14 +132,33 @@ Content-Type: application/json
   stage succeeded. Use it when the draft's own `filter` drops the error keys
   from the body.
   - `reason` is a code from a closed set: `StageNotExecuted`, `Forbidden`,
-    `NotFound`, `Unauthorized`, `NotRun` (the resolve stopped before this
+    `NotFound` (a 404), `NotFoundForRequester` (#1319: a watched named
+    object that does not exist for this requester, the definite per-user
+    answer of #1080), `Unauthorized`, `NotRun` (the resolve stopped before this
     stage), `Skipped` (#904: a write stage not sent because the stage it depends
     on failed or was skipped; the row's `dependsOn` names that stage),
     `Aborted` (#904: the resolve-level row, `name` "", of a resolve that ran
     no stage — a `dependsOn` naming no stage, a cycle; every stage is then
     `NotRun`), `InvalidPath`, `TemplateError` and `NotSent` (#1112, a write
     snowplow refused to send, below), `DestinationRefused` (#1131, below),
-    `Error` (anything else).
+    `WriteRefused` (#1288: a write an export or background work does not
+    send; never in a dry run, whose refusal is `StageNotExecuted`),
+    `UserAccessFilterOnNonReadVerb` (#1281, below), `Error` (anything else).
+  - **A `userAccessFilter` on a verb other than `GET`/`HEAD` is refused
+    (#1281).** `userAccessFilter` makes snowplow send the stage with its own
+    ServiceAccount, so it is allowed only on a read. The CRD rejects it on any
+    other verb when a RESTAction is stored; a RESTAction stored before that
+    rule, or a draft carrying one, is refused at resolve time too. Nothing is
+    sent. The row reads `UserAccessFilterOnNonReadVerb`, in a dry run too
+    (where it replaces `StageNotExecuted`). It is decided on the stage, not
+    its data: an iterator stage whose iterator yields no items is listed the
+    same way, and so is a stage whose `dependsOn` failed (instead of
+    `Skipped`). The stage's `errorKey` gets
+    `{"reason":"UserAccessFilterOnNonReadVerb","message":"stage \"<id>\" verb <V> was not sent: userAccessFilter dials snowplow's ServiceAccount and is allowed only on a GET or HEAD stage (#1281)"}`.
+    Without `continueOnError` it is the resolve's failure (`500`). A write
+    that depends on it is `Skipped` (#904). Asking again gives the same
+    answer: the RESTAction has to change (drop the `userAccessFilter`: the
+    write is then sent like any other write).
   - **A write that was not sent is a failure (#1112).** A `POST`/`PUT`/
     `PATCH`/`DELETE` stage that snowplow refuses to send, wholly or for one
     item of its iterator, is listed with one of:
@@ -219,8 +241,13 @@ Content-Type: application/json
     edited).
   - Changed in #904: a succeeded stage is no longer listed (it was
     `{"name":"<stage>","ok":true}`). A reader that only looks at `ok:false`
-    rows is unaffected. In a dry run a write stage depending on another write
-    stage still reports `StageNotExecuted`, never `Skipped`.
+    rows is unaffected. In a dry run, a write stage that depends on another
+    write stage reports `StageNotExecuted`, not `Skipped`, when the stage it
+    depends on only reports `StageNotExecuted`. If the stage it depends on
+    has an item that failed on its own (`InvalidPath`, `TemplateError`),
+    that stage reports the failure (a failure outranks `StageNotExecuted`,
+    #1347). Its dependent writes then report `Skipped`, exactly as in the
+    real run.
 - **Everything runs as the caller.** A named `endpointRef` Secret is read with
   the caller's own credentials (a Secret the caller cannot read is a stage
   error). An endpointRef naming a per-user credential Secret

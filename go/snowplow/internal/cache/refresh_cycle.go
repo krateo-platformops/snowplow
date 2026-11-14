@@ -10,7 +10,8 @@
 //
 //	  - put_total: every accepted refresh terminal Put (ReplaceIfGenRefresh),
 //	    identical or changed bytes, by entry class and tier. A refresh whose
-//	    bytes did not change still costs its whole resolve, its Put and its frame.
+//	    bytes did not change still costs its whole resolve and its Put, but no
+//	    frame (#1321: snowplow_refresh_broadcaster.withheld_identical).
 //	  - wait_ms: from the key's latest insert into the tier it was dequeued from
 //	    until the worker starts the refresh. That is after the customer yield and
 //	    the rate floor, the last points where a dequeue can still not run, so the
@@ -23,7 +24,8 @@
 //	    cell's snapshot) record no sample.
 //	  - put_to_frame_ms: from the refresh Put until the first refresh frame for
 //	    that key written on each open /refreshes stream armed for it (the #870
-//	    Wrote point, after the write and flush succeeded). A coalesced publish
+//	    Wrote point, after the write and flush succeeded). Only a CHANGED Put
+//	    publishes a frame (#1321), so only changed Puts are sampled. A coalesced publish
 //	    keeps the Put time of the earliest refresh it absorbed. A frame on a
 //	    stream that was never offered the Put records nothing, and so does an
 //	    absent stream.
@@ -40,7 +42,6 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"expvar"
 	"strconv"
@@ -269,7 +270,8 @@ func refreshCycleFor(ctx context.Context, key string) *refreshCycle {
 }
 
 // sameBytesPrior is the identical-content test of every refresh Put: key's
-// resident prior if its bytes equal entry's, else nil. It reads the prior
+// resident prior if it answers as entry does (SameAnswer: its bytes, and since
+// #1319 its stored stage outcomes, equal entry's), else nil. It reads the prior
 // under c.mu (a pointer read) and compares outside it, like raLayerEqualPrior
 // (#406), whose compare it replaces on the refresh Put so a body is compared
 // once. The caller confirms under c.mu that the same prior is the one it
@@ -282,7 +284,7 @@ func (c *ResolvedCacheStore) sameBytesPrior(key string, entry *ResolvedEntry) *R
 	c.mu.Lock()
 	prior := c.raLayerResidentEntryLocked(key)
 	c.mu.Unlock()
-	if prior != nil && bytes.Equal(prior.Raw(), entry.Raw()) {
+	if SameAnswer(prior, entry) { // #1319: the body and the stored stage outcomes
 		return prior
 	}
 	return nil
@@ -314,8 +316,11 @@ func noteRefreshPut(ctx context.Context, key, class string, identical bool, now 
 // PublishRefreshed is PublishRefresh for the refresher terminal: it announces
 // key exactly as PublishRefresh does, carrying the time of the refresh Put on
 // ctx so the frame it causes is timed from that Put (put_to_frame).
-func PublishRefreshed(ctx context.Context, key string) {
-	publishRefresh(key, refreshOwedFrom(ctx, key))
+//
+// #1321 — only when put changed the stored bytes (put_outcome.go): an
+// identical refresh Put is counted withheld_identical and publishes nothing.
+func PublishRefreshed(ctx context.Context, key string, put PutOutcome) {
+	publishPut(key, put, refreshOwedFrom(ctx, key))
 }
 
 // refreshOwed is the Put a frame for a key is owed for: when and by which

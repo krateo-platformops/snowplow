@@ -54,6 +54,7 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // The closed set of causes snowplow emits on a pre-dispatch 401 (#1029,
@@ -71,6 +72,13 @@ const (
 	// CauseTokenExpired — the bearer token is correctly signed but expired
 	// (jwtutil.ErrTokenExpired).
 	CauseTokenExpired = "TokenExpired"
+	// CauseKeyNotPublished — the bearer token names a signing key (kid) that
+	// authn's key set, fetched successfully after the token was issued, does
+	// not publish: the key was retired, for example to revoke the tokens it
+	// signed (jwtutil.ErrKeyNotPublished, plumbing v1.36.0). No retry makes
+	// the token verify. Named after its jwtutil error, as TokenInvalid and
+	// TokenExpired are.
+	CauseKeyNotPublished = "KeyNotPublished"
 	// CauseSessionCredentialMissing — a valid token without krateo:loa:2
 	// whose session credential Secret is missing.
 	CauseSessionCredentialMissing = "SessionCredentialMissing"
@@ -106,6 +114,7 @@ var preDispatchCauses = map[string]preDispatchCause{
 	CauseTokenMissing:             {"no bearer token was presented; log in", bareBearerChallenge},
 	CauseTokenInvalid:             {"the bearer token is not valid; log in again", invalidTokenChallenge},
 	CauseTokenExpired:             {"the bearer token has expired; log in again", invalidTokenChallenge},
+	CauseKeyNotPublished:          {"the bearer token's signing key is no longer published; log in again", invalidTokenChallenge},
 	CauseSessionCredentialMissing: {"the session credential is missing; log in again", invalidTokenChallenge},
 	CauseStepUpRequired:           {"the step-up credential is missing or expired; step up again", stepUpChallenge},
 }
@@ -163,14 +172,33 @@ func tokenMissing(w http.ResponseWriter, err error) error {
 }
 
 // tokenRejected answers 401 for a token jwtutil.ValidateWithKeySource refused
-// for the token's own fault. err is that typed error: ErrTokenExpired is
-// TokenExpired, anything else is TokenInvalid. The caller has already answered
-// ErrKeyUnavailable (503, our fault).
+// for the token's own fault. err is that typed error: ErrKeyNotPublished is
+// KeyNotPublished, ErrTokenExpired is TokenExpired, anything else is
+// TokenInvalid. The caller has already answered ErrKeyUnavailable (503, our
+// fault), which ErrKeyNotPublished never matches.
+//
+// ErrKeyNotPublished is checked FIRST: jwtutil reports a retired key as
+// ErrTokenInvalid AND ErrKeyNotPublished, so the generic branch would swallow
+// it.
 func tokenRejected(w http.ResponseWriter, err error) error {
+	if errors.Is(err, jwtutil.ErrKeyNotPublished) {
+		return preDispatchUnauthorized(w, CauseKeyNotPublished, err)
+	}
 	if errors.Is(err, jwtutil.ErrTokenExpired) {
 		return preDispatchUnauthorized(w, CauseTokenExpired, err)
 	}
 	return preDispatchUnauthorized(w, CauseTokenInvalid, err)
+}
+
+// credentialMissingReason is the audit denial reason of credentialMissing's
+// refusal, chosen from the same validated groups that chose the Secret:
+// step_up_required for a krateo:loa:2 token, session_credential_missing
+// otherwise (audit v0.12.0).
+func credentialMissingReason(groups []string) string {
+	if credsecret.IsStepUp(groups) {
+		return audit.DenialStepUpRequired
+	}
+	return audit.DenialSessionCredentialMissing
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not

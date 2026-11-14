@@ -74,11 +74,13 @@ func (c *clusterRecorder970) take() []string {
 	return out
 }
 
+// clientConfigSecret970 is a Secret called name; a credential Secret of a
+// fixture user (userA, victim1025) is stamped as that user's (#1382).
 func clientConfigSecret970(name, serverURL, token string) *corev1.Secret {
-	return &corev1.Secret{
+	return authnOwned(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: extrasNS970},
 		Data:       map[string][]byte{"server-url": []byte(serverURL), "token": []byte(token)},
-	}
+	}, "userA", "victim1025")
 }
 
 // serveAsGroups970 is serveAs970 with the caller's groups, and the caller's

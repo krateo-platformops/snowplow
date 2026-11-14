@@ -395,7 +395,7 @@ func psSeedClientconfigs(t *testing.T, srvURL string) {
 	cache.ResetSecretsSnapshotForTest()
 	mk := func(user string) *corev1.Secret {
 		return &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: psAuthnNS, Name: user + "-clientconfig"},
+			ObjectMeta: authnMeta(psAuthnNS, user+"-clientconfig", user),
 			Data: map[string][]byte{
 				"server-url": []byte(srvURL),
 				"token":      []byte("tok-" + user),

@@ -24,21 +24,81 @@ Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`, `GET
 dependency-tracker section) and `GET /debug/store` (#237 — the per-object informer-store read),
 and two probe endpoints used by the chart.
 
-> **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
-> pprof, vars, servable, apistage, refreshes — is registered by
-> `registerDebugRoutes` (`debug_routes.go`) behind `middleware.RefreshAuth`,
-> the stateless header-or-cookie RS256 gate `/refreshes` uses. Before 1.12.3
-> only `/debug/refreshes` was gated (#69) and the rest were world-readable on
-> the chart's LoadBalancer Service. Pass the token explicitly:
+> **Every `/debug/*` route needs a JWT (since 1.12.3) AND an RBAC grant (since
+> #1362).** The whole surface (pprof, vars, servable, apistage, refreshes,
+> reconcile, harvest, store, shadow-parity, deps) is registered by
+> `registerDebugRoutes` (`debug_routes.go`) behind one chain:
+> `middleware.RefreshAuth`, the stateless header-or-cookie RS256 gate
+> `/refreshes` uses, then `middleware.DebugAuthz`.
+>
+> **A valid JWT alone is not enough.** Several routes report metadata about
+> *every* identity's cache entries and about objects the caller's own RBAC may
+> forbid. `/debug/apistage`, for example, lists each resident entry's
+> coordinates and item count, whoever created it. So `DebugAuthz` authorizes
+> each request through Kubernetes RBAC as a **non-resource request**, exactly as
+> the apiserver would authorize the same request against itself. The verb is
+> the lowercase HTTP method (`get`, or `post` for `POST /debug/shadow-parity`),
+> and the path is the request path, decided for the JWT's username and groups.
+> The decision is the same authorizer every other snowplow RBAC check uses
+> (`rbac.EvaluateRBAC`, the same group-set rules and authz memo). With the cache
+> on it runs in-process against the informer-cached RBAC, so a diagnostic pull
+> still makes zero apiserver calls. With the cache off it is a
+> SelfSubjectAccessReview.
+>
+> The grant is an ordinary ClusterRole rule. The chart ships it as
+> `<fullname>-debug-<namespace>` (`helm/snowplow/templates/clusterrole-debug.yaml`)
+> and **binds it to no one**, because the chart has no notion of an admin
+> group. Bind it to your operator group:
+>
+> ```yaml
+> rules:
+> - nonResourceURLs: ["/debug/*"]
+>   verbs: ["get", "post"]
+> ```
+>
+> ```bash
+> kubectl create clusterrolebinding snowplow-debug-operators \
+>   --clusterrole=snowplow-debug-krateo-system --group=<your-operator-group>
+> ```
+>
+> An identity bound to `cluster-admin` already holds it, because cluster-admin
+> carries `nonResourceURLs: ["*"]`. A RoleBinding cannot grant it: a
+> non-resource request has no namespace. Pass the token explicitly:
 >
 > ```bash
 > curl -H "Authorization: Bearer $TOKEN" http://pod:8081/debug/vars
 > ```
 >
-> No token, an expired token, or a token supplied only in the query string →
-> `401`. A JWKS the pod cannot fetch → `503`. `/health` and `/readyz` stay
-> anonymous — the kubelet presents no credentials. Operator recipes are in
-> [operating.md](../../howto/operating.md).
+> | outcome | status |
+> |---|---|
+> | no token, an expired token, or a token only in the query string | `401` |
+> | a JWKS the pod cannot fetch | `503` |
+> | a valid token whose identity lacks the grant | `403`, a `Status` body: `forbidden: User "<u>" cannot get path "/debug/vars"` |
+> | the authorization cannot be decided | `503`, with the reason in the message `debug authorization unavailable (<reason>)`: `rbac_snapshot_not_built` (the boot window before the RBAC snapshot is published, pprof included: #1368), `rbac_watcher_not_wired`, `review_unavailable` (cache off, see below), `evaluator_error`, `no_identity` |
+>
+> **Known limitation (cache off).** With `CACHE_ENABLED=false` the authorizer is
+> the requester's own SelfSubjectAccessReview, which needs the requester's
+> `<user>-clientconfig` endpoint. `RefreshAuth` deliberately never reads that
+> Secret, so with the cache off **every** `/debug` route answers `503
+> review_unavailable`. It fails closed and never serves unauthorized.
+>
+> `/health` and `/readyz` stay anonymous, because the kubelet presents no
+> credentials. Operator recipes are in [operating.md](../../howto/operating.md).
+>
+> **Which routes expose what** (#1362):
+>
+> | route | output depends on other identities' state? |
+> |---|---|
+> | `GET /debug/pprof/` (`heap`, `goroutine`, `allocs`, …), `/cmdline`, `/profile`, `/symbol`, `/trace` | process-wide: memory, stacks and argv of the process serving every identity. No per-identity records. `/profile` and `/trace` also pin a CPU for their window. |
+> | `GET /debug/vars` | aggregate across all identities. It includes per-cell maps keyed by `path\|gvr\|reason` and learned-identity class counts, a map of the tenant's GVRs. |
+> | `GET /debug/servable` | no: per-GVR informer status (cluster shape), regardless of the caller's RBAC. |
+> | `GET /debug/apistage` | **yes**: every resident L1 entry, whoever created it: coordinates, item count, binding UID, key-attribution fields; `?key_hash` adds a body sha256. Never a body. |
+> | `GET /debug/refreshes` | aggregate: totals and the live subscriber count across all identities, with no per-key breakdown. |
+> | `GET /debug/reconcile` | **yes**: walks every identity's L1 entries, returns the divergent ones' metadata, and evicts them. |
+> | `GET /debug/harvest` | process-wide, not per-identity: counts of what the Phase-1 harvesters hold, and whether a given widget coordinate is held, whatever the caller's RBAC (an existence oracle). |
+> | `GET /debug/store` | **yes**: an object's existence, resourceVersion and uid from the snowplow SA's informer store, whatever the caller's RBAC. |
+> | `GET`/`POST /debug/shadow-parity` | no: one process-local boolean. POST flips it. |
+> | `GET /debug/deps` | **yes**: dependency edges and freshness of every identity's cells, by key hash. |
 
 The probe endpoints:
 
@@ -74,13 +134,25 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   `<METHOD>` for a request no route serves), `http.route` = the templated mux
   pattern (never the raw path; `url.path` is dropped from Server spans at
   export), `http.request.method`, `http.response.status_code`, status `Error`
-  only for 5xx. `/health`, `/readyz`, `/debug/*` and the browser RUM upload
+  only for 5xx. A response that carries `X-Snowplow-Stage-Outcomes` also puts
+  `snowplow.stages.failed` and `snowplow.stages.failure_reasons` on its span
+  (#1264, see [Stage outcomes on the Server span](#stage-outcomes-on-the-server-span-1264)). `/health`, `/readyz`, `/debug/*` and the browser RUM upload
   `POST /telemetry/v1/traces` (#1020 D6: telemetry about the portal, not
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
   see `howto/rum-ingest.md`) get no span. Sampled at
   100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
-  `docs/configuration.md`). The CORS options in `main.go` allow the browser
-  to send `traceparent`/`tracestate`/`baggage`.
+  `docs/configuration.md`). **Sampling trade (installer#402, #1013):** the
+  platform gateway traces 100% and decides nothing (agentgateway-policies
+  ≥ 0.2.19 `tracing.platform.filter: ""`, installer rev 460, 2026-11-09), so
+  every request reaches snowplow with `sampled=1` and gets its Server span; the
+  one sampling decision is the collectors' tail sampler (observability#118:
+  every error, 4xx and JWT trace kept, plus 5% of the rest), and the SLIs stay
+  exact because span metrics are computed before it. Orphaned snowplow spans
+  on 057 went 92% → 0% (snowplow#849). A gateway that samples at its edge, or a
+  snowplow sampler that drops spans itself (`traceidratio`,
+  `parentbased_traceidratio`), makes the SLIs estimates again. The full note is
+  the SAMPLING comment in `internal/tracing/tracing.go`. The CORS options in
+  `main.go` allow the browser to send `traceparent`/`tracestate`/`baggage`.
 - **Metrics** (`internal/metrics/metrics.go` `Setup`): an **OTLP mirror of the
   expvar surface** — observable instruments read the same live counter
   snapshots the expvar closures read (families: fallthrough, dispatch L1,
@@ -94,10 +166,14 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   downstream by the Baggage propagator. It **replaces** the old
   `X-Krateo-Correlation-Id` header entirely; the shortid `X-Krateo-TraceId`
   and the OTel `traceparent` coexist. Which actions emit an AuditEvent, which
-  do not, and why: [audit-coverage.md](audit-coverage.md). A record with no
-  actor is refused at the emitter; one missing its action, method or target is
-  emitted marked `krateo.audit.incomplete`. Both are counted in
-  `snowplow_audit_incomplete_total{actor,action,method,target}`.
+  do not, and why: [audit-coverage.md](audit-coverage.md). The record is
+  written by the shared writer (`github.com/krateo-platformops/audit`, #1291),
+  which never drops one: a record missing a key (its actor included) is
+  emitted marked `krateo.audit.incomplete`, and each marker is counted in
+  `krateo.audit.records.incomplete{marker}` on OTLP, mirrored at `/debug/vars`
+  as `snowplow_audit_incomplete_total{<marker>}`.
+  The Server span of a request that wrote a record carries
+  `krateo.audit.recorded=true` (a boolean, never identity).
 
 ---
 
@@ -120,6 +196,11 @@ a bench probe gets `0` rather than a missing-key error under cache-off:
   `cache.RegisterRBACBindingNoopExpvar()`
 - `snowplow_authz_memo_*` — `rbac.RegisterAuthzMemoExpvar()`
 
+Some non-cache surfaces are published from an ungated `init()` and are present
+under cache-off too (the CFG-1 probe's `nonCacheInitPublishers` list), among them
+`snowplow_customer_serves_total` / `snowplow_customer_serves_cold_total` (#1265):
+with the cache off every serve reads `cold{cause="cache_off"}`.
+
 ---
 
 ## expvars at `/debug/vars`
@@ -140,6 +221,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `snowplow_resolved_cache` (`resolved_cache_expvar.go`, 1.12.4) | L1 store `Stats()` as `map{stat → value}`; per-stat table below. Mirrored to OTLP as `snowplow_resolved_cache{stat}` | previously reachable only through an INFO summary line the chart's `LOG_LEVEL=warn` suppresses |
 | `snowplow_informer_servable` (`servable.go` `ServableCounts`, 1.12.4) | `{registered, synced, servable, watch_broken, confirmed}` | the leading indicator for the `informer-fallthrough-not-synced` cell; `watch_broken > 0` = the stale-delete latch |
 | `snowplow_build_info` (`build_info_expvar.go`, 1.12.4) | `{version}` = `main.build` (the full 40-character git commit the Dockerfile stamps; `unknown` for an unstamped local build) | pins every other metric to a commit. On OTLP the same commit is the resource attribute `vcs.ref.head.revision`; the resource `service.version` is the pod's release label (`app.kubernetes.io/version`, the chart appVersion), the value the collector stamps on its own rows for the pod (#462) |
+| `snowplow_go_runtime` (`internal/memlimit`; OTLP `snowplow_go_gc_percent`, `snowplow_go_memory_limit_bytes{source}`) | `{gogc, memory_limit_bytes, memory_limit_source, cgroup_memory_limit_bytes}`: the runtime's **effective** GOGC (`-1` = off) and soft memory limit (`9223372036854775807` = none), read from `runtime/metrics` at each scrape, and where the limit came from: `env` (the operator set `GOMEMLIMIT`), `cgroup_v2` / `cgroup_v1` (7/8 of `cgroup_memory_limit_bytes`, set at startup), `none` (no cgroup limit), `unreadable` (the cgroup limit could not be read; a WARN at boot says why) | on the chart: `gogc` 100, `memory_limit_source` `cgroup_v2`, `memory_limit_bytes` = 7/8 of the container limit (7 GiB under 8Gi). Read this, not the chart, for what a pod runs with. `unreadable` = no soft limit on this pod. With `env`, `cgroup_memory_limit_bytes` is still the container's limit: `memory_limit_bytes` ≥ it is the OOM-kill misconfiguration (also a boot WARN) |
 | `snowplow_metrics_series_truncated_total` (OTLP only, 1.12.4) | per-family count of `path\|gvr\|reason` series folded into `gvr="__other__"` by the 5000-series OTLP cap | **0**. Non-zero = a cardinality regression (the cap kept it from becoming an incident); `/debug/vars` keeps the uncapped maps |
 | `snowplow_assertion_violations_total` | per-check `map[string]→uint64` of architectural-invariant breaches. Keys: `read_paths_scoped` (a `/call`-class route not wrapped with `FallthroughScopeMiddleware`, asserted at boot by `cache.AssertReadPathsScoped()`), `serve_requires_servable` (an authoritative cache HIT was about to be served from a not-servable informer — asserted per-serve in `internal/cache/serve_assert.go`) | **0** for every key. Non-zero = an invariant is broken in prod (logged ERROR, pod stays up). **`serve_requires_servable` > 0 is P1** — never-serve-from-not-synced is the most load-bearing cache guarantee |
 
@@ -162,6 +244,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `remint_deadline_enqueued_total` | **#506/#538.** proactive refreshes enqueued by the reaper's DEADLINE-keyed trigger that the TTL-keyed one would NOT have produced (`deadlineApproaching && !ttlApproaching`). The threshold is `maxEntryAge − remintLead() + jitter`, where jitter is a deterministic per-key offset in `[0, remintLead()/2)` that disperses a boot-seeded cohort across the lead window instead of enqueuing it all on one pass (the mean added load is ~0.03/s and negligible; the burst shape was the risk). Every enqueue stays strictly inside the re-mint window, so none can fire before `ReplaceIfGenRefresh` would accept it, and each cell keeps at least half the lead for retries. The base is the same instant `ReplaceIfGenRefresh`'s re-mint window opens on, so the pass and the predicate cannot drift. It is the MARGINAL contribution by construction — counting every enqueue in the lead window would mostly re-count TTL-driven work and could not answer whether the trigger does anything | **This is an ENQUEUE (intent); `remint_total` is the EFFECT.** `> 0` with `remint_total` rising = the trigger reaches the terminal; `> 0` with `remint_total` FLAT = enqueues are produced but dropped or declined before the re-mint (the refresher's own counters say which). **A zero is only meaningful above the scope threshold**: on a pod whose `oldest_warm_born_age_seconds` has not yet passed `maxEntryAge − remintLead`, no cell has entered its lead window, so 0 means UNMEASURED, not healthy — the same scope rule the warm-evict detectors carry. Expect it non-zero for dep-quiet keepwarm cells (#538), whose young bodies keep `ttlApproaching` false however close to the cap they get |
 | `warm_in_lead_window` | **#506/#538.** resident WARM cells whose BIRTH age is inside the re-mint lead window `[maxEntryAge - remintLead(), ...)`, recomputed on each reaper walk. A GAUGE - the population, not a rate - and deliberately jitter-free, since the per-key jitter only decides which pass inside the window a cell fires on | **The DENOMINATOR for `remint_deadline_enqueued_total`.** `oldest_warm_born_age_seconds` is a MAX, so it says at least one warm cell is in the band and never how many; without this count a zero on the enqueue counter cannot be told apart from "nothing was eligible". Read as a pair: **`> 0` with `remint_deadline_enqueued_total` at 0 is a DEFECT** (eligible cells are not being enqueued); `== 0` means UNMEASURED, not healthy. On a pod whose warm population is dominated by cold cells (057 at 1.12.38: 98 re-mints against 133,493 cold refusals) expect this near 0, which is why it is the number that says whether #538 is actually fixed |
 | `evict_no_representative_total` | **#444.** identity-bound cells (restactions / widgets / raFullList) the refresher EVICTED because their recorded representative had drifted out of the key's RBAC class and no in-class replacement was found (neither the canonical group representative nor a recent hitter). The cell refills cold and correct on its next request instead of serving stale until the TTL. Replacement outcomes per source are on `snowplow_l1_representative_repick_total` (`group` / `hitter` / `evicted`) | low; tracks personal (User-subject) RBAC changes on representatives of classes no group representative can stand in for |
+| `evict_unstorable_total` | **#1255.** cells EVICTED because a later resolve of their key was declined PERMANENTLY — a permanent Put-gate verdict (declared write, genuine external touch, stage error beside one) or a sensitive read / identity-free UAF body — so no writer could ever replace the old body. Without it the pre-change body was served until the TTL (the 057 PageHeader after its RESTAction gained a named-endpoint stage is the reported case). Only a body resolved before the declining resolve began is evicted (#375 epoch guard), never by a resolve whose identity class moved mid-resolve (#424); an external-TTL cell is kept under its own TTL, including on a transient failure of its own endpoint. Each eviction publishes the refresh frame to armed tabs and logs `cache.unstorable_evicted` at INFO — which does NOT ship at the chart's `LOG_LEVEL=warn`; the per-reason split is `snowplow_l1_evict_unstorable_total{reason}` | low; one per edit that makes a cached RESTAction/widget unstorable. Never moves `evict_delete_total` |
 | `evict_delete_total` | entries evicted by invalidation (the dep tracker's DELETE route) — the store-side twin of `snowplow_deps.evict_delete_total` | tracks object deletions |
 | `suppressed_resident` | **#345 / #248.** a GAUGE (current count, up/down — not a total) of resident cells the refresher has permanently refresh-SUPPRESSED (a UAF decline suppresses on first occurrence). #248's own validation signal: the reaper reads it every summary tick and evicts the past-`maxEntryAge` members; the number was previously computed and discarded into the `LOG_LEVEL=warn`-suppressed INFO line. Distinguishes decline-FROZEN cells from never-yet-refreshed ones | **0** in steady state; a persistent non-zero plateau = cells frozen by UAF-decline that only the reaper (past maxEntryAge) or a keying fix will clear — read next to `evict_max_age_total` (the reaper draining them) |
 | `warm_past_max_age` | **#315 C4.** a GAUGE of resident WARM cells (read within TTL or `SeededAtBoot`) that are ALSO past `maxEntryAge`. The read-independent pass deliberately does NOT cold-evict these (evicting a warm cell manufactures a cold nav — C3); it keeps them body-fresh via `proactive_refresh_total` and (#378) re-mints their key when a refresh lands inside the lead window, so a cell is counted here only if no refresh was accepted in its window. The AT-RISK population (structural proxy, not a leak count) | **0** on a fast-roll pod (nothing outlives a day); a non-zero plateau on a long-lived pod = warm cells past the cap that no in-window refresh re-minted — read next to `evict_max_age_total` (the cold ones being reaped) |
@@ -215,6 +298,61 @@ Defined in `internal/handlers/dispatchers/l1_lookup_metrics.go`.
 | `snowplow_internal_dispatch_informer_serve_miss_total{reason}` / `snowplow_internal_dispatch_informer_sync_wait_ms_total` (expvar + OTLP, #796) | Internal-dispatch LISTs not served from their informer, by reason (`unregistered`, `list_refused`, `sync_timeout`, `watch_broken`, `type_unconfirmed`, `not_servable`), and the total ms spent in the bounded sync-wait | `list_refused` names informers whose LIST is refused (404/403): the wait now ends at once. Rising `sync_timeout` with `wait_ms` ≈ 5 s per miss is the latency the rule does not cover |
 | `snowplow_widget_skipped_undeclared_extras_put_total` | Puts quarantined by the F6 undeclared-request-extras allowlist | non-zero means a client sends extras the widget author has not declared in `spec.keyExtras` |
 | `snowplow_widget_undeclared_extras_exempt_total` (expvar + OTLP) | Requests carrying undeclared, non-identity extras that were Put anyway because the widget has no extras-reading spec surface (no apiRef / widgetDataTemplate / resourcesRefsTemplate; #777 b′) | informational: its share next to the skipped counter is the fraction of would-be F6 declines the exemption cached |
+
+### Customer serves — zero cold navigation (#1265)
+Defined in `internal/handlers/dispatchers/customer_serves.go`; on OTLP in `internal/metrics/customer_serves_metrics.go`.
+
+**The definition (Diego, 2026-11-08).** A navigation is cold when at least one widget had nothing cached to show, fresh or stale, so the user waited on live computation. Stale-then-replace (#710) is warm. A widget-cell miss served from a stale apistage input (D2) is cold, cause `no_cell` (ruling Q6). This counter is the authority; Chrome timings are the user-side confirmation.
+
+**What is counted.** Exactly one outcome per **top-level customer** `/call` to the restactions or widgets handler, decided where snowplow answers it:
+
+| `outcome` | when |
+|---|---|
+| `fresh` | the body is a resident cell (the per-identity L1 cell, or the identity-free widgetContent shell) with no stale mark |
+| `stale` | the body is a resident cell whose inputs moved since its Put (an open invalidation window or known-stale) or that was stored from a stale input (`StaleDerived`): the #1062 stale ledger's predicate |
+| `cold` | the body comes from a live resolve run for this request; a resolve that then fails is still cold |
+| `refused` | the request was refused before anything was served or read: a bad request (including an inline object at the widgets handler), an unreadable CR, an RBAC denial, or the #1116 reserved-extras 400 |
+
+**What is not counted.** Refresher, seed, prewarm and every other background driver resolve in process and never reach the handler; their self-loopbacks carry the background marker and work class. A #547 demand revalidation, a #710 withdrawn stale serve's re-run (the same request's second pass), an export's per-page re-dispatch and a customer resolve's own nested self-loopback (`X-Snowplow-Nested-Depth` on a trusted hop) are not counted either. Every loopback marker a caller can send (`X-Snowplow-Nested-Depth`, `X-Snowplow-Background`, `X-Snowplow-Work-Class`) excludes a request only when it arrives on a trusted self-loopback: snowplow's own address as the egress itself defines it when it marks a self-call (`api.SameSelfAddress`, one predicate for both sides). That is any of its own Service DNS forms (`name.namespace`, `name.namespace.svc`, `name.namespace.svc.cluster.local` of `URL_SELF`'s Service) on `URL_SELF`'s port, and nothing broader. A request whose Host is anything else (another Service or namespace, another port, a subdomain, an external host) is the caller's own and is counted, so no caller can hide its calls by sending a marker. Every exclusion signal is weighed on its own, so an untrusted background marker cannot hide an export page either. So the population is customer traffic by construction: unlike `resolved_cache.hit_total`/`miss_total` (#376) and `stale_served_total` (#552), no internal read can move it.
+
+| series (expvar and OTLP) | labels | meaning | healthy range |
+|---|---|---|---|
+| `snowplow_customer_serves_total` | `handler` {restactions, widgets}, `outcome` (above), `class_warm` | one per top-level customer call; expvar `map[handler][outcome][class_warm]` | zero cold navigation reads `cold == 0`. `class_warm` is the requester's sign-in warm state; it reads only `none` until #1265 P3 (the `complete` / `warming` series are absent, not zero, until then) |
+| `snowplow_customer_serves_cold_total` | `handler`, `cause` | the cold serves by cause; expvar `map[handler][cause]` | `no_cell`: the lookup found no cell (never stored, Put declined, evicted, or a D2 stale-input resolve). `expired_ttl` / `evicted_maxage`: **this** lookup found the cell past its TTL / the max entry age (#378). `ineligible_key`: no servable key (a `""` first-match BindingUID, #95, or no identity). `dry_run`: an inert request (#443). `cache_off`: no resolved-output store |
+
+Every cell is pre-populated: a `0` is a reading. Scope of the expiry causes: a cell that left the store before the lookup (LRU, DELETE eviction, or an expiry an internal read or the reaper already applied) reads `no_cell`, so `expired_ttl` is a lower bound on TTL-caused cold serves.
+
+**The response header and the span.** A counted response that reached the serve decision carries `X-Snowplow-Serve-Outcome: fresh|stale|cold`, set before the first byte (exposed through CORS like `X-Snowplow-Refresh-Key`; the SPA ignores it; the bench reads it per navigation). Its server span carries `snowplow.serve.outcome` and, on a cold serve, `snowplow.serve.cold_cause` (distinct from #1264's `snowplow.stages.*`). Neither carries identity, a key, a resource name or a body. A refused response and an uncounted one carry neither, so the header and the counter describe the same population.
+
+### Stage outcomes on the Server span (#1264)
+Defined in `internal/handlers/dispatchers/stage_outcomes_span.go` (the wrapper `main.go` `newServerHandler` puts around the route table) and `internal/resolvers/restactions/api/stage_outcomes_summary.go` (the parser).
+
+A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure is in the body (under each stage's `errorKey`) and in `X-Snowplow-Stage-Outcomes`. Its Server span keeps status **Unset** (semconv: a 200 is not an error), and usually has no failing child span, so a tail sampler that keeps error traces would miss it. The span therefore carries what the header says:
+
+| attribute | type | value |
+|---|---|---|
+| `snowplow.stages.failed` | int | the number of entries the header lists that **failed** (#1288): a stage that failed, one `Skipped` after a failure, one `NotRun`, plus the resolve-level `Aborted` row. A stage snowplow deliberately did not execute is **not** counted (`not_executed` below). **`0`** when no listed stage failed: set, not omitted, so a 0 reads "no stage failed" and absence reads "this response had no stage outcomes". For the truncated summary `{"truncated":true,"failed":N}` it is N, which counts every listed stage: the summary no longer says which were deliberate, so it errs on keeping the trace. Observability's sampler keeps a trace on `snowplow.stages.failed > 0` |
+| `snowplow.stages.not_executed` | int | (#1288) the number of entries the header lists that snowplow **deliberately did not execute**, by what the request is: a dry run's refused write (`StageNotExecuted`, #443) and an export's or background work's refused write (`WriteRefused`, #903/#970). Set whenever `failed` is, `0` included; not set for the truncated summary, which cannot tell |
+| `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of the **failed** entries, sorted (byte order), from the header's closed set of failure codes: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `TemplateError`, `Timeout`, `Unauthorized`, `UserAccessFilterOnNonReadVerb` (#1281, a misconfigured stage). `StageNotExecuted` and `WriteRefused` never appear (they are not failures). Any other value is folded to **`other`** (and counted as failed), never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
+
+**Failed versus not executed (#1288).** The header lists every stage that did not succeed (its #904 meaning, which callers rely on), and it is unchanged. The span splits that list by the class of each row's reason, decided by one classifier (`stageNotExecutedByDesign`, `internal/resolvers/restactions/api/stage_outcomes.go`): a property of the reason code, never of the route, the RESTAction or the widget. Two codes are deliberate non-executions, `StageNotExecuted` and `WriteRefused`; every other code is a failure. `Skipped` is counted as failed on purpose: a write is skipped only when the stage it depends on failed (the #904 rule never blocks on a deliberate non-execution: the dependent write is then refused for the same reason and reports that reason, or, when it iterates the refused stage's output, yields zero items and succeeds), so a skip is a consequence of a real failure that the same trace already carries. Both deliberate codes rank below every failure code (#1347: a stage's reason is chosen by group first, cut / failed > denied > by design), so a write stage with one item the plan refused (`InvalidPath`, `TemplateError`) and other items an export or a dry run refused reads that failure and counts in `failed`; its dependent writes read `Skipped`. Before #1288 every dry-run preview with a write stage and every export of a RESTAction with a write stage read `failed > 0`, and the export refusal read the generic `Error`.
+
+**Which responses.** Exactly those whose header carries the outcomes: a RESTAction `/call` (GET, `POST /call/read`, an inline draft), cold or an L1 hit, and an `/export` (the outcomes its pages merged into its own header). The values are read from the response's final header when the handler returns, so they always match what the client was sent; a withdrawn stale pass (#710) reports its re-run's. A response without the header gets neither attribute: a widgets `/call`, every other route, a request refused before its resolve. An export's per-page re-dispatch and a #547 demand revalidation write into their own recorders, never through the wrapper, so they cannot overwrite the span.
+
+**Cache hits.** A hit answers with the header the resolve that stored the cell produced, which every restactions-class Put keeps on the entry (`cache.ResolvedEntry.StageOutcomes`, #904), so the span of a hit carries those stored outcomes. Nothing is invented for a hit: a cell stored all-success reads `0`.
+
+**Not covered: widgets.** A widget's `apiRef` resolve runs in process; the widget response carries no `X-Snowplow-Stage-Outcomes`, and a widget cell stores none, so a widgets span carries neither attribute.
+
+**No identity.** The parser drops the header's stage names: no stage, RESTAction or target name, user, message or body reaches the span. Distinct from #1265's `snowplow.serve.*`.
+
+### Self-loopback recursion guard — cycle and depth stops (#1274)
+Defined in `internal/cache/nested_loopback_guard_metrics.go`; on OTLP in `internal/metrics/nested_loopback_guard_metrics.go`.
+
+A RESTAction stage that calls snowplow's own `/call` (a trusted self-loopback, by any of snowplow's own Service DNS forms on `URL_SELF`'s port) carries its descent path and depth. The HTTP edge of the next hop stops a recursion before it resolves. Since #1274 the ingest trusts the short Service-name forms the portal's `snowplow-endpoint` uses, so these stops now also fire for chains through that endpoint.
+
+| series (expvar and OTLP) | labels | meaning | healthy range |
+|---|---|---|---|
+| `snowplow_nested_loopback_guard_stops_total` | `kind` {cycle, depth}; expvar `map[kind]` | `cycle`: the hop's own node was already on its descent path, so the raw CR was served instead of recursing. This is the designed stop for a self-referential RESTAction; it is logged at INFO, `http-edge nested resolve cycle-stop`, metadata only. `depth`: the depth-8 backstop answered 508 for a non-cyclic chain that went too deep; it is logged at WARN | `cycle` tracks the self-referential RESTActions being resolved and is not an alert. `depth` should stay **0**; a non-zero value is a chain the ancestor set could not see, and needs investigating. Both cells are present at 0 from process start; with the cache off the key is absent (CFG-1) |
 
 ### RAFullList serve path — the cheap Go-slice serve for big LISTs
 Defined in `internal/cache/bindings_by_gvr_metrics.go`.
@@ -283,12 +421,14 @@ Substrate fills (a nested resolve that re-scopes the L1 key, such as the RAFullL
 | `snowplow_apistage_stale_debt_retries_total` | failed refill attempts. Since #740 a failed refill joins the content cell's viewer-gated retry chain (`snowplow_stale_retry_*`, source `debt`): a refused fill is retried at once, any other failure at 1 s doubling to 60 s, **only while a dependent's tab is armed** | low |
 | `snowplow_apistage_stale_overdue_total` | debts open past 10 s, and dependent replaces still failing past 10 s from the serve, counted **once** each, with one WARN `apistage.stale_debt_overdue` / `apistage.stale_replace_overdue` (metadata only). Both keep retrying while viewed (#740); there is no breaker | **0**. Alert on rate > 0 |
 | `snowplow_apistage_stale_replace_retries_total` | failed dependent re-resolves (the cell is kept); retried on the dependent cell's viewer-gated chain (#740) | low |
+| `snowplow_apistage_stale_replace_identical_total` | **#1321.** done dependent replaces whose cell then held exactly the body the stale-derived response was written with: the client already has those bytes, so no frame was published (the ledger closed the serve `close="identical"`) | informational |
 | `snowplow_apistage_stale_serve_withdrawn_total` | map `reason` (`unarmable`) → stale serves withdrawn at the write point because the Put was declined; the response re-ran fresh | low; each costs one extra resolve |
 | `snowplow_apistage_stale_push_total` | replacement publishes that found an armed tab | ≈ committed stale-served dependents |
 | `snowplow_apistage_stale_push_unarmed_total` | replacement publishes that found no armed tab yet; the owed mark announces the key when a tab arms | informational, **not** a guarantee failure (a tab that never arms has nobody looking at stale data) |
 | `snowplow_apistage_stale_owed_open` | gauge: keys written stale whose fresh value has not yet reached an armed tab | small; drains as tabs arm |
 | `snowplow_apistage_stale_owed_arm_emits_total` | refresh events emitted at `/refreshes` arm time for a key whose replacement was published before the tab armed | tracks `stale_push_unarmed_total` |
 | `snowplow_apistage_stale_owed_dropped_total` | owed marks dropped by the L1-capacity bound before reaching a tab: **a guarantee failure** | **0**. A bench gate |
+| `snowplow_apistage_stale_owed_settled_total` | **#1321.** owed marks cleared because the replacement's bytes equal every stale-derived body written under the mark: no push is owed. A mark two different bodies were written under is never settled (it still owes a frame) | informational |
 | `snowplow_apistage_stale_dependent_unresolved_total` | debt-lane re-resolves that completed but whose Put was declined; the stale-derived cell is evicted and the push still goes out | low |
 
 ### Stale serve → push, for every layer (#1062)
@@ -299,6 +439,7 @@ Defined in `internal/cache/stale_push.go`. The #710 goal times **every** stale p
   An unarmed response (external-TTL widget) is not counted: nothing can push to it. A nested cell read inside a resolve is not a response. `resolved_cache.stale_served_total` therefore counts more: every Get hit on a dirty cell.
 - **Replaced**: the key's cell stops holding the stale bytes. Either an accepted Put of a non-stale-derived body whose resolve began at or after the serve's latest dirty mark (a Put that began earlier carries the pre-change state), or the key leaves the store.
 - **Pushed**: the `/refreshes` handler **wrote** a frame for the key (a write, not an offer) after the replacement, or wrote a resync frame to a stream armed for it. The sample is `stale_to_push_ms{layer}` = push − serve.
+- **Identical (#1321)**: a frame is published only for a Put that changed the stored bytes. A replacing Put whose bytes **equal the bytes the client was served** corrects nothing on the client and no frame follows it, so it closes the serve itself at the Put (`close="identical"`; the sample is Put − serve, and past 10 s it counts unreplaced like a late push). Per client, like a frame: when the replacing bytes equal the user's **newest** serve of the key, every replaced serve of that user closes. A Put that began before the serve's mark proves nothing, even with equal bytes.
 - **The client is the requester, not the key.** An L1 key is shared by a whole RBAC class, and a widgetContent key by every user. So each serve carries its requester's subject digest (`cache.StaleSubject`: the process-keyed digest of the username, in memory only, never logged), and each `/refreshes` stream carries its authenticated user's. A frame written on a stream closes only that user's serves of the key. One user's frame never closes another user's stale serve, so a stranded client (#1081) shows as unreplaced. The grain is the user, not the tab: two tabs of one user are one client, so a strand on the second tab is hidden while the first is pushed (the server cannot tell tabs apart without client coordination). The unit is a serve, not a viewing episode: a tab that refetches stale twice before the replacement yields two samples.
 - **A client without a stream** cannot be pushed. Its serve is **not** counted unreplaced while no stream **of its user** is armed for its key (nobody is viewing a live page, #740). It stays open: a stream that arms later and is written a frame records the full delay (#710 F2). Serves never pushed leave only through the L1-capacity bound (`close="dropped"`). `stale_serves_open` shows them.
 - **#740 resume**: a parked D2 debt that resumes restarts its dependents' apistage clocks at the resume.
@@ -308,7 +449,7 @@ Defined in `internal/cache/stale_push.go`. The #710 goal times **every** stale p
 | `snowplow_stale_to_push_ms` | histogram per layer (cumulative `le_*`, buckets at exactly **1000 / 3000 / 10000**, plus `count`, `sum_ms`, `max_ms`): stale serve → the replacing frame written | **p95 ≤ 3000, max ≤ 10000**, target 1000 |
 | `snowplow_stale_unreplaced_total` | stale serves not replaced within the 10 s max, counted **once** each: pushed after > 10 s, or still unpushed 10 s after the serve while a stream of the serve's user is armed for the key (one WARN `cache.stale_push_unreplaced` per layer per scan, metadata only) | **0**. Alert on rate > 0 |
 | `snowplow_stale_serves_total` | stale serves timed | the stale share of armed responses |
-| `snowplow_stale_serve_closes_total` | map `layer` → `close` (`pushed`, `dropped`) | `dropped` is serves no stream ever pushed |
+| `snowplow_stale_serve_closes_total` | map `layer` → `close` (`pushed`, `dropped`, `identical`) | `dropped` is serves no stream ever pushed; `identical` (#1321) is serves whose replacing bytes equalled the served ones (no frame needed) |
 | `snowplow_stale_serves_open` | gauge: serves waiting for their replacing frame, including those no stream has armed | small; drains as frames are written |
 
 On OTLP the same five series carry the attribute `layer` (and `close`), read from the same snapshot.
@@ -407,8 +548,9 @@ guard. So it stays expvar-only; see its row below.
 | `snowplow_refresher_residency_cheapen` (map, expvar only; diagnostics, not a C7-tagged family) | two residency counters. `pickup_noop_no_park` (**#374 Part B**): dequeues where the worker found the key not resident and skipped the customer-priority yield park, since processing it is a no-op. `enqueue_dropped_non_resident` (**#383**): dirty-marks whose queue slot and trigger GVRs were DROPPED at the refresher hook because the key was not resident in L1 at the mark. `SubmitSliceabilityInvalidate` still fired for each of them (#91 Lever C), and #375/#408 remark the key once its in-flight Put lands. Before #383 those marks were enqueued and later counted in `snowplow_refresher_skipped_no_entry_total` | both are load-dependent. `enqueue_dropped_non_resident` per mark is the non-resident share of churn, which swings roughly 39–97% across load (#386-M2), so always quote it with the load. Zero `enqueue_dropped_non_resident` under churn with non-zero `skipped_no_entry_total` means the drop gate is not running |
 | `snowplow_resolve_latency_p95_ms` (**#386 M1** — standalone scalar OUTSIDE the `snowplow_refresher_` C7 family) | p95 of the REAL resolve latency (the handler re-resolve+Put in `processOne`), a P² streaming estimate sampled ONLY on the ok=true path AFTER `yieldToCustomer` returns — so it EXCLUDES the dequeue, the customer-priority park, the `skipped_no_entry`/`skipped_no_handler` skips and the rate-floor defer | a DIAGNOSTIC sizing input for #384/#365 (≈≲31ms observed). **expvar-only by design** — a sizing input read on demand, not an alert (the backlog `queue_depth`/`completed` is the alert), so deliberately NOT OTLP-mirrored and kept out of the auto-mirrored C7 family |
 | `snowplow_refresh_rebuild` (**#604 instrument** — a MAP, kept OUTSIDE the `snowplow_refresher_` C7 family for the same reason as the row above) | `identical_total` / `changed_total` / `no_prior_total` / `identical_share`. On every refresher re-resolve, the freshly rebuilt bytes are compared to the entry they are about to replace (`GetNoTouch`, so it cannot stamp `lastRead` or contaminate `warm_lastread`). `no_prior_total` is its own bucket so `identical_share` has a denominator of comparisons ACTUALLY MADE, and so a zero in the other two cannot read as health | the number **#604** turns on: a HIGH identical share is sound evidence that list_dep invalidation is over-broad (#603) and that precision — not refreshing less — is the fix; a LOW share is **AMBIGUOUS**, meaning either genuine churn OR residual non-determinism in some rebuild. The comparison is over BYTES, so **identical is a LOWER BOUND**. #579 (`8073e959`) removed the one known non-determinism source (Go map iteration in the indexer read); others may exist and must be ruled out before reading a low share as churn. **Observes only** — no Put is skipped, pinned by an arm so that stays true |
-| `snowplow_refresh_cycle_put_total` (**#1070**; expvar map `class\|tier\|content`, OTLP counter `{class, tier, content}`) | every ACCEPTED refresh terminal Put (`ReplaceIfGenRefresh`), `identical` or `changed`, by entry class (`restactions`, `widgets`, `apistage`, `widgetContent`, `raFullList`, `other`) and tier (`viewed`, `normal`, `cluster_list`, `direct` = the D2 `RunRefreshNow` refill). One `bytes.Equal` against the resident prior, off the store lock, which is also #406's compare for an RA full-list body. `identical` only if that prior is still the one replaced under the lock; otherwise it counts as `changed`. Unlike `snowplow_refresh_rebuild` it counts accepted Puts only, split by class and tier, on OTLP too | the identical share per class is how much refresh work changed nothing (same lower-bound caveat as the row above). An identical Put still costs its resolve, its Put and its frame |
-| `snowplow_refresh_cycle_wait_ms`, `snowplow_refresh_cycle_duration_ms`, `snowplow_refresh_broadcaster_put_to_frame_ms` (**#1070**; expvar map tier → cumulative `le_*` buckets + `count`, `sum_ms`, `max_ms`; OTLP histograms `{tier}`, bounds 10/25/50/100/250/500/1000/2000/3000/5000/10000/30000/60000 ms) | the refresh cycle in stages, on the dirty-window clock. **wait**: the key's latest insert into the tier it was dequeued from until the worker starts the refresh (after the customer yield, the suppression check and the rate floor, so a yield park counts as waiting; a rate-floor deferral does not, since the key re-enters its tier at expiry; a key re-added while processing is timed from the re-add). Queued tiers only. **duration**: the worker's start until the accepted refresh Put (no sample without a Put). **put_to_frame**: the refresh Put until the first refresh frame for that key WRITTEN (the #870 `Wrote` point) on each open stream it was offered to. A coalesced publish keeps the earliest Put it absorbed; a resync frame and an absent stream record nothing | the viewer's change→frame time is roughly wait + duration + put_to_frame, plus whatever came before the insert (the dirty-mark fan-out). Read p95 against the 1 s / 3 s / 10 s marks per tier. `viewed` wait growing means the viewed reservation is starved |
+| `snowplow_refresh_cycle_put_total` (**#1070**; expvar map `class\|tier\|content`, OTLP counter `{class, tier, content}`) | every ACCEPTED refresh terminal Put (`ReplaceIfGenRefresh`), `identical` or `changed`, by entry class (`restactions`, `widgets`, `apistage`, `widgetContent`, `raFullList`, `other`) and tier (`viewed`, `normal`, `cluster_list`, `direct` = the D2 `RunRefreshNow` refill). One `bytes.Equal` against the resident prior, off the store lock, which is also #406's compare for an RA full-list body. `identical` only if that prior is still the one replaced under the lock; otherwise it counts as `changed`. Unlike `snowplow_refresh_rebuild` it counts accepted Puts only, split by class and tier, on OTLP too | the identical share per class is how much refresh work changed nothing (same lower-bound caveat as the row above). An identical Put still costs its resolve and its Put, but since #1321 no frame (`snowplow_refresh_broadcaster.withheld_identical`) |
+| `snowplow_refresh_cycle_wait_ms`, `snowplow_refresh_cycle_duration_ms`, `snowplow_refresh_broadcaster_put_to_frame_ms` (**#1070**; expvar map tier → cumulative `le_*` buckets + `count`, `sum_ms`, `max_ms`; OTLP histograms `{tier}`, bounds 10/25/50/100/250/500/1000/2000/3000/5000/10000/30000/60000 ms) | the refresh cycle in stages, on the dirty-window clock. **wait**: the key's latest insert into the tier it was dequeued from until the worker starts the refresh (after the customer yield, the suppression check and the rate floor, so a yield park counts as waiting; a rate-floor deferral does not, since the key re-enters its tier at expiry; a key re-added while processing is timed from the re-add). Queued tiers only. **duration**: the worker's start until the accepted refresh Put (no sample without a Put). **put_to_frame**: the refresh Put until the first refresh frame for that key WRITTEN (the #870 `Wrote` point) on each open stream it was offered to. Only a Put that changed the bytes publishes a frame (#1321), so only changed Puts are sampled. A coalesced publish keeps the earliest Put it absorbed; a resync frame and an absent stream record nothing | the viewer's change→frame time is roughly wait + duration + put_to_frame, plus whatever came before the insert (the dirty-mark fan-out). Read p95 against the 1 s / 3 s / 10 s marks per tier. `viewed` wait growing means the viewed reservation is starved |
+| `snowplow_resolve_memo` lookups and would-join (expvar map keys `hits_total`, `misses_total` (stale included), `stale_misses_total`, `would_join_total`; OTLP `snowplow_resolve_memo_lookups_total{outcome}` {hit, miss, stale_miss}, disjoint, and `snowplow_resolve_memo_would_join_total`, no attributes) | the refresher's resolve memo (#598): its Loads, hit or miss (a #411 stale miss counts as both a miss and a stale miss in expvar; on OTLP the outcomes are disjoint), and, **measurement only**, the misses an in-flight join on the memo key would have saved: a produce that starts while a produce of the SAME memo key (its leader) is in flight counts only when that leader hands over a body the memo would serve it — the leader reached the memo Store and its body passes the memo's #411 freshness rule when the leader ends, so a dependency that moved after the leader started refuses it, exactly as the memo does. Nothing joins. The memo key folds the identity, so a would-join is always same-identity work. All present at 0 from process start; with the cache off the key is absent (CFG-1) | hit share = hits / (hits + misses). `would_join_total` / `misses_total` is the share of produces an in-flight join would remove (always ≤ 1: a lookup whose stored body cannot be decoded counts as a miss); read it against the refresher's CPU, not as a health signal |
 | `snowplow_deps_dirty_mark_by_entry_class_total{class}` (OTLP; `/debug/vars` `snowplow_deps_dirty_mark_attribution.by_entry_class`) | **#479 1b / #603 PR-0.** The same dirty-marks as `dirty_mark_total`, split by the **entry class of the marked key**: `restactions` / `widgets` / `widgetContent` / `apistage` / `raFullList`, plus `unknown` and `unregistered`. Closed, pre-registered label set; recordDirtyMarks is the single writer, so the classes sum to `dirty_mark_total`. The class is read off the dep edge (no store read on the mark path). **`unknown` is NOT a class**: it means the class had not been learned yet when the key was marked (its edges were created after its last store and the create-time try-lock peek found the store busy, or the cell was never stored / already gone) | **read the `unknown` share FIRST** — the split is only as good as `1 - unknown/total`. `unregistered` is a **GUARD: alert on > 0** (a CacheEntryClass outside RemintClasses). The consumer share (widgets + widgetContent vs restactions/raFullList/apistage) is the #479 Q2 input |
 | `snowplow_refresher_dirty_to_fresh_samples_total` | **#354 P3.** invalidation→fresh windows CLOSED FRESH: a resident cell's first dirty-mark (an informer event fanned out to the key, or a #375 remark) to the refresher's accepted, un-remarked re-Put. Each sample is also one observation of the OTLP histogram `snowplow_refresher_dirty_to_fresh_ms` (synchronous `Int64Histogram`, no attributes, bounds 50/100/250/500/750/1000/2000/5000/10000/30000/60000 ms — bracketing the 1 s north-star and the 10 s AC-98.12 SLA). A retried error and a rate-floor deferral stay inside the window | must be > 0 on a stage with churn, or the stage is invalid (no window measured) |
 | `snowplow_refresher_dirty_to_fresh_ms_p95`, `snowplow_refresher_dirty_to_fresh_ms_max` | **#354 P3.** GAUGES — p95 (P²) and max of the window (ms) over roughly the last OTLP export interval (two estimators staggered by half an interval, the older read). For `/debug/vars` parity and alerting without a histogram query; the distribution is the histogram | p95 under 1 s (fresh north-star); max under 10 s (AC-98.12) |
@@ -500,7 +642,8 @@ tags (1.12.6 C7). The OTLP mirror publishes each stat as
 
 | stat | meaning | healthy range |
 |---|---|---|
-| `published` | live-refresh signals published by the resolver / refresher on an L1 commit | tracks L1 commits under churn |
+| `published` | live-refresh signals published by the resolver / refresher on an L1 commit that **changed the stored bytes** (#1321) | tracks changed L1 commits under churn; ≈ `snowplow_refresh_cycle_put_total{content="changed"}` plus the cold fills and D2 replaces that changed bytes, minus `coalesced` |
+| `withheld_identical` | **#1321.** accepted Puts whose bytes equal the prior they replaced, so **no** signal was published: the refresh and its Put still ran, the subscriber already holds those bytes. Every write of a cell a stream can be armed on goes through this gate (#1321 review B1): the refresher terminal, the cold-dispatch fills, the seed terminal Put (keep-warm / gvr-discovered / rbac-shift / boot), the walker's widgetContent shell Put, the external-TTL widget Put and the raFullList serve-path Put, so a change is always announced by the write that made it. The refresh Put compares against the resident prior off the store lock and confirms under it that the same prior was replaced (a write in between voids the compare and the Put publishes); the other writes compare against the entry they replaced, read in their own critical section. Counted only for an armed key on the non-refresher writes (they consult the gate only when a stream is armed) | for the refresher it equals `snowplow_refresh_cycle_put_total{content="identical"}`; `withheld_identical / (withheld_identical + published)` is the share of frames #1321 removed (~84% on an idle 057 at 1.12.67) |
 | `delivered` | signals delivered into a subscriber's sink | tracks published × armed subscribers |
 | `dropped` | signals dropped on a full subscriber sink. **Structurally 0 since #484**: a full sink defers the key (`deferred`) instead; nothing increments it | **0**; any value is a regression of the never-drop invariant |
 | `deferred` | **#484.** refresher-path signals a full subscriber sink deferred into that subscriber's refresh pending set (dedup'd, ⊆ the armed set, un-paced); delivered as soon as the sink has room | > 0 only while a consumer is behind; sustained growth with `pending_overflow_resync` = wedged consumers |
@@ -514,6 +657,10 @@ tags (1.12.6 C7). The OTLP mirror publishes each stat as
 | `evict_published` | **1.12.6 C10.** DELETE-semantics evictions (informer DELETE, confirmed self-404) that reached ≥1 armed subscriber as a `refresh` frame. TTL, LRU, max-age and non-404 drop-point evictions stay silent by design | moves with deletions on watched pages |
 | `evict_deferred` | **1.12.6 C10.** eviction frames the per-subscriber token bucket (`REFRESH_EVICTION_PUBLISH_RATE_PER_SECOND` 5, `_BURST` 10 — provisional) deferred into the pending set; never dropped, drained at the pace | > 0 only during a bulk delete — the proof the bound engaged |
 | `rotation_announced` | **#819.** refresh frames sent on an armed key whose identity class moved (an RBAC change touching the user, its groups or `system:authenticated`): the tab refetches and re-arms under its new key. Once per armed key per connection, sent at once (NOT paced: the SPA reconnects ~200 ms after the first frame, and a frame still queued then is lost with the old connection) | > 0 only after an RBAC change that moves an armed user's class; flat across many RBAC publishes = no armed class moved |
+| `arm_held` | **#1324.** armed keys whose `/refreshes` arm carried a `held` digest (the `X-Snowplow-Refresh-Digest` of the tab's `/call` answer; docs/howto-frontend-refresh-digest-catch-up.md) | the denominator of `arm_catch_up`; 0 means no tab sends `held` yet (an SPA without the contract) |
+| `arm_catch_up` | **#1324.** refresh frames sent at once on arm because the tab was behind: the digest of what its `/call` would answer NOW for that user differs from its `held`, or the cell is gone. Recovers frames lost between a `/call` and its arm, and while the SPA re-opens its stream on a widget mount/unmount (`/refreshes` keeps no replay) | a small share of `arm_held`; tracks real changes that landed while a tab was not armed |
+| `arm_duplicate_absorbed` | **#1325 review m1.** arm-time refresh offers (the #710 owed-push emit, the #870 store-swap ledger arm, the #1324 catch-up) not sent because the same arm had already offered that key, from any source (a publish since subscribe included): one arm writes at most one frame per key. The catch-up is the arm's last step and closes it; later publishes are never absorbed | each one is a refetch of the same bytes the tab no longer makes; non-zero where a stale serve's owed push and a stale `held` meet (a D2 serve replaced while the SPA re-opened its stream). A frame absorbed here was already offered, so this never hides a change |
+| `gated_view_moved` | **#1328.** refresh frames for an RBAC change that moved what a tab is SERVED from a gated key (an identity-free widgetContent shell, narrowed per requester at serve time) while the stored bytes did not move, so no write announced it. Checked on a connection only when its identity's RBAC class moved (`rbac.IdentityClassOf`), per armed gated key, against the #1324 served digest its tab holds | each is a tab whose actions' `allowed` flags changed with a grant or revoke; 0 while RBAC is quiet. A non-zero rate with no RBAC change would be a defect |
 | `stream_seconds_total` | **1.12.6 C12.** accumulated `/refreshes` stream lifetime (seconds) | ÷ `streams_closed_total` = mean stream lifetime (live: ≈3,336 s; a collapse means something upstream is cutting streams, see the delivery-failure matrix row G1) |
 | `streams_closed_total` | **1.12.6 C12.** streams that ended (client close, hub reset, pod restart) | tracks reconnects |
 
@@ -577,6 +724,7 @@ Rules the mirror follows:
 |---|---|---|---|
 | `snowplow_l1_identity_class_drift_declined_total{site,reason}` | counter (sum) | L1 Puts / re-Puts the #424 guard declined because the writer's identity no longer belongs to the RBAC class the key was minted for | low, non-zero rate on a cluster with RBAC churn (a grant/revoke landing mid-resolve). `no_identity` should stay 0 |
 | `snowplow_l1_representative_repick_total{outcome}` | counter (sum) | #444 refresher outcomes when a cell's recorded representative drifted out of its RBAC class: `group` (re-picked the canonical group representative), `hitter` (re-picked a recent hitter), `evicted` (no in-class representative; the cell was evicted). The evictions are also `snowplow_resolved_cache{stat=evict_no_representative_total}` (a gauge row, already on OTLP through the `snowplow_resolved_cache` mirror) | low; follows personal (User-subject) RBAC changes on representatives. `evicted` should stay well below `group` + `hitter` |
+| `snowplow_l1_evict_unstorable_total{reason}` | counter (sum) | #1255 L1 cells evicted because a later resolve of their key was declined PERMANENTLY, so no writer could ever replace the old body: `declared_write`, `external_touched`, `stage_error` (beside a genuine external touch), `sensitive_resource`, `uaf`, `other`. The closed set is emitted in full, zeros included; the sum is `snowplow_resolved_cache{stat=evict_unstorable_total}`. The eviction's `cache.unstorable_evicted` line is INFO (designed work, not a failure) and does not ship at `LOG_LEVEL=warn`, so this counter is the signal that leaves the pod | low; one per edit that makes a cached RESTAction/widget unstorable (a transient endpoint failure never counts here) |
 | `snowplow_resolved_cache_remint_total{class}` | counter (sum) | **#378.** refresher-terminal re-mints (BornAt resets under the same key, inside the lead window `[maxAge − L, …)`), by `class` ∈ {restactions, widgets, widgetContent, apistage, raFullList} — the full closed set is emitted (zeros included). Their sum is `snowplow_resolved_cache{stat=remint_total}` | > 0 per class with a **customer-warm** working set once a pod is older than `maxAge − L`; since #496 a zero per class is correct when nothing of that class is warm, so read it with `snowplow_resolved_cache{stat=remint_refused_cold_total}` before calling it inert; `evict_max_age_warm_customer_total` stays 0 apart from the #496 late-first-read residual (see its row above) — a sustained rise is still P5 |
 | `snowplow_binding_set_memo_hits` / `_misses` / `_refused` | counter (sum) | subject binding-set digest memo (#424). The memo shard swaps on every RBAC snapshot publish | hit ratio `hits/(hits+misses)` high once warm. `refused` = 0 (cap 4096 per shard) |
 | `snowplow_binding_set_memo_entries` | gauge | live entries in the current memo shard | ≈ active identities |
@@ -913,7 +1061,7 @@ tighter bound costs `DEPS_RECONCILE_SAMPLE` (O(sample) under the store mutex per
 4096 / 30 s the 99 % figure is ≈ 56 min at 100K. Go's map iteration samples a random *window*
 rather than 512 independent draws, so these figures are slightly optimistic.
 
-`GET /debug/reconcile` (JWT-gated like its siblings) runs ONE full walk on demand and returns
+`GET /debug/reconcile` (JWT-gated and RBAC-authorized like its siblings) runs ONE full walk on demand and returns
 the divergent set as metadata only (key hash / class / gvr / namespace / name — never a body).
 It is a reconcile, not a dry run: the entries it lists are evicted by the worker right after.
 The full walk is **chunked** (`RangeMetadataBatched`): the store mutex is held once for a key
@@ -975,7 +1123,7 @@ its `indexerCount`, `gvrLastSyncResourceVersion` and `gvrLastEventAgeSeconds`. C
 and the divergence IS the staleness — no inference.
 
 **It does NOT read the apiserver, and that is deliberate.** Serving the comparison here would
-read as the snowplow ServiceAccount, telling any valid-JWT holder the existence and
+read as the snowplow ServiceAccount, telling any holder of the /debug grant the existence and
 `resourceVersion` of objects their own RBAC forbids. The operator runs that half themselves, under
 their own identity.
 
@@ -1047,7 +1195,7 @@ The OTLP mirror is **aggregate, not per-GVR** — a production cluster carries ~
 informers, so three per-GVR gauges would add ~500 series per collection interval, the same
 cardinality class 1.12.4 had to cap. Stats: `indexer_objects`, `gvrs_never_event`,
 `max_event_age_seconds`, `gvrs_stale_over_hour`. The dashboard says *something* is stale; the
-JWT-gated `/debug/servable` route says which.
+JWT-gated, RBAC-authorized `/debug/servable` route says which.
 
 ### Upstream controller health — "is snowplow broken, or is an upstream controller crash-looping?"
 Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`.

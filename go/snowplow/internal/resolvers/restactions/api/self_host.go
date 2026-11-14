@@ -148,7 +148,25 @@ func parsedHostEqualsSelf(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	return u.Scheme == sh.scheme && u.Port() == sh.port && hostsMatch(u.Hostname(), sh.host)
+	return u.Scheme == sh.scheme && SameSelfAddress(sh.host, sh.port, u.Hostname(), u.Port())
+}
+
+// SameSelfAddress is THE "this is snowplow's own address" predicate, shared by
+// both sides of a self-loopback (#1265 / #1274 review): the egress here
+// (parsedHostEqualsSelf: which stages get the bearer and the loopback markers)
+// and the ingest (dispatchers.requestArrivedOnSelfHost: which hops have their
+// markers trusted). One predicate, so a hop the egress marks as a self-call is
+// exactly a hop the ingest trusts as one.
+//
+// selfHost/selfPort are URL_SELF's hostname and explicit port; host/port are
+// the candidate's. True iff the ports are equal (both "" when neither names
+// one) and the hosts are the same string or the same in-cluster Service's own
+// DNS forms (hostsMatch: name.namespace, name.namespace.svc,
+// name.namespace.svc.cluster.local of the SAME name and namespace). Nothing
+// broader: another Service, another port, a subdomain or a look-alike host is
+// not self.
+func SameSelfAddress(selfHost, selfPort, host, port string) bool {
+	return port == selfPort && hostsMatch(host, selfHost)
 }
 
 // selfLoopbackWorkClassHeader is the #871 work-class header a self-loopback

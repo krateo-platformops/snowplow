@@ -532,7 +532,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// impersonation_fallback_sa is non-zero while a cohort's group is NOT
 	// allowlisted — it reads the defect's condition, not a health zero.
 	impersonation, err := m.Int64ObservableCounter("snowplow_impersonation",
-		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_capability_check_error, reviews, memo_*."))
+		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_refused_no_fallback (#1334), impersonation_capability_check_error, reviews, memo_*."))
 	if err != nil {
 		return err
 	}
@@ -1253,6 +1253,16 @@ func registerInstruments(m metric.Meter, build string) error {
 	if err := registerSlowCallInstruments(m); err != nil {
 		return err
 	}
+	// #1265: customer serve outcomes, likewise whatever the cache mode (with
+	// the cache off every serve is cold{cache_off}).
+	if err := registerCustomerServeInstruments(m); err != nil {
+		return err
+	}
+	// The effective GOGC and soft memory limit, whatever the cache mode (the
+	// snowplow_go_runtime expvar key is published unconditionally).
+	if err := registerGoRuntimeInstruments(m); err != nil {
+		return err
+	}
 	// #448: the security/verification counters. CFG-1: every one of them is a
 	// cache surface whose expvar key is published only from a Disabled()-gated
 	// init, so under cache-off its OTLP series is absent too (not present-zero).
@@ -1308,6 +1318,12 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 	if err := registerRefreshCycleInstruments(m); err != nil { // #1070
+		return err
+	}
+	if err := registerNestedLoopbackGuardInstruments(m); err != nil { // #1274
+		return err
+	}
+	if err := registerResolveMemoInstruments(m); err != nil {
 		return err
 	}
 	return registerSecurityInstruments(m)
@@ -2185,6 +2201,16 @@ func registerStaleServeInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	replaceIdentical, err := m.Int64ObservableCounter("snowplow_apistage_stale_replace_identical_total",
+		metric.WithDescription("Done replaces of a stale-served customer cell whose cell then held exactly the body the response was written with: the client already has those bytes, so no /refreshes frame was published. #1321."))
+	if err != nil {
+		return err
+	}
+	owedSettled, err := m.Int64ObservableCounter("snowplow_apistage_stale_owed_settled_total",
+		metric.WithDescription("Owed-push marks cleared because the replacement's bytes equal every stale-derived body written under them: no push owed. #1321."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		s := restactionsapi.StaleServeStatsSnapshot()
 		o.ObserveInt64(serveTotal, int64(s.ServeTotal), metric.WithAttributes(attribute.String("reason", "known_stale")))
@@ -2201,8 +2227,11 @@ func registerStaleServeInstruments(m metric.Meter) error {
 		o.ObserveInt64(owedDropped, int64(s.Owed.Dropped))
 		o.ObserveInt64(owedArm, int64(s.Owed.ArmEmits))
 		o.ObserveInt64(replaceRetries, int64(s.ReplaceRetries))
+		o.ObserveInt64(replaceIdentical, int64(s.ReplaceIdentical))
+		o.ObserveInt64(owedSettled, int64(s.Owed.Settled))
 		return nil
-	}, serveTotal, debtOpen, debtParked, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries)
+	}, serveTotal, debtOpen, debtParked, oldest, retries, overdue, pushes, unarmed, unresolved, withdrawn, owedOpen, owedDropped, owedArm, replaceRetries,
+		replaceIdentical, owedSettled)
 	return err
 }
 
@@ -2252,6 +2281,19 @@ func registerSecurityInstruments(m metric.Meter) error {
 	repick, err := m.Int64ObservableCounter(
 		"snowplow_l1_representative_repick_total",
 		metric.WithDescription("Refresher outcomes when an identity-bound cell's recorded representative drifted out of the key's RBAC class (#444), by outcome {group, hitter, evicted}: re-picked the canonical group representative, re-picked a recent hitter, or evicted the cell (no in-class representative). The evictions also count on snowplow_resolved_cache{stat=evict_no_representative_total}."))
+	if err != nil {
+		return err
+	}
+
+	// --- #1255: cells evicted because a later resolve proved their key
+	// unstorable, per reason. The closed reason set (cache.EvictUnstorableReasons)
+	// is emitted in full, zeros included; the sum is
+	// snowplow_resolved_cache{stat=evict_unstorable_total}. The eviction's own log
+	// line is INFO (designed work, not a failure) and does not ship at the chart's
+	// LOG_LEVEL=warn, so this is the signal that leaves the pod. ---
+	evictUnstorable, err := m.Int64ObservableCounter(
+		"snowplow_l1_evict_unstorable_total",
+		metric.WithDescription("L1 cells evicted because a later resolve of their key was declined PERMANENTLY, so no writer could ever replace the old body (#1255), by reason {declared_write, external_touched, stage_error, sensitive_resource, uaf, other}. Each is one edit that made a cached RESTAction/widget unstorable; the next request resolves live instead of serving the pre-change body until its TTL."))
 	if err != nil {
 		return err
 	}
@@ -2374,6 +2416,9 @@ func registerSecurityInstruments(m metric.Meter) error {
 		for _, c := range cache.ResolvedCacheRemintByClass() {
 			o.ObserveInt64(remint, int64(c.Count), metric.WithAttributes(attribute.String("class", c.Class)))
 		}
+		for _, c := range cache.EvictUnstorableByReason() {
+			o.ObserveInt64(evictUnstorable, int64(c.Count), metric.WithAttributes(attribute.String("reason", c.Reason)))
+		}
 		byReason := cache.KnownStaleServedByReason()
 		for _, reason := range cache.KnownStaleReasons {
 			o.ObserveInt64(knownStaleServed, int64(byReason[reason]), metric.WithAttributes(attribute.String("reason", reason)))
@@ -2414,7 +2459,7 @@ func registerSecurityInstruments(m metric.Meter) error {
 			}
 		}
 		return nil
-	}, driftDeclined, repick, remint, knownStaleServed, knownStaleRerun, bsHits, bsMisses, bsRefused, bsEntries,
+	}, driftDeclined, repick, remint, evictUnstorable, knownStaleServed, knownStaleRerun, bsHits, bsMisses, bsRefused, bsEntries,
 		lRegistered, lSeeded, lUnseeded, lNavOnly, lFromSecrets, lUnparseable, lClientconfig,
 		lCapacity, lBound)
 	return err

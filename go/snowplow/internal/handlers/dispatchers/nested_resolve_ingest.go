@@ -59,17 +59,20 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
-// selfLoopbackHost is the URL_SELF host (Hostname, no port/scheme) parsed once at
-// startup by SetSelfLoopbackHost (main.go). Empty when URL_SELF is unset — then
-// the belt-and-suspenders host check is skipped and the token match alone gates
+// selfAddr is URL_SELF's hostname and explicit port ("" when it names none).
+type selfAddr struct{ host, port string }
+
+// selfLoopbackHost is URL_SELF's address, parsed once at startup by
+// SetSelfLoopbackHost (main.go). nil when URL_SELF is unset — then the
+// belt-and-suspenders host check is skipped and the token match alone gates
 // (the token match is the primary and sufficient guard; the host check only ever
 // tightens, never loosens). atomic so the startup Store and per-request Load are
 // race-free without a mutex, mirroring api.selfHost.
-var selfLoopbackHost atomic.Pointer[string]
+var selfLoopbackHost atomic.Pointer[selfAddr]
 
-// SetSelfLoopbackHost parses rawURL (URL_SELF) and installs its host for the
-// ingest belt-and-suspenders check. An empty/unparseable rawURL clears it (host
-// check disabled). Wired once at startup from main.go alongside
+// SetSelfLoopbackHost parses rawURL (URL_SELF) and installs its host and port
+// for the ingest belt-and-suspenders check. An empty/unparseable rawURL clears
+// it (host check disabled). Wired once at startup from main.go alongside
 // api.SetSelfHost(URL_SELF), so both the emit-side and ingest-side self-host
 // derive from the SAME URL_SELF value.
 func SetSelfLoopbackHost(rawURL string) {
@@ -82,25 +85,30 @@ func SetSelfLoopbackHost(rawURL string) {
 		selfLoopbackHost.Store(nil)
 		return
 	}
-	h := u.Hostname()
-	selfLoopbackHost.Store(&h)
+	selfLoopbackHost.Store(&selfAddr{host: u.Hostname(), port: u.Port()})
 }
 
 // requestArrivedOnSelfHost reports whether req arrived on the configured
 // self-host. Belt-and-suspenders ONLY (C1: the token match is primary). Returns
 // true when no self-host is configured — it must never TIGHTEN beyond the token
-// gate when unconfigured (the token match still stands as the sole gate). req.Host
-// may carry a port; we compare the hostname component only.
+// gate when unconfigured (the token match still stands as the sole gate).
+//
+// #1274 review — it decides with api.SameSelfAddress, the SAME predicate the
+// egress marks a self-call with (parsedHostEqualsSelf): any of snowplow's own
+// Service DNS forms (name.namespace, .svc, .svc.cluster.local) on URL_SELF's
+// port, nothing broader. Before, an exact hostname compare refused the short
+// forms the egress treats as self (#57 fix B), so a self-hop by the short name
+// carried every loopback marker and had them all ignored here.
 func requestArrivedOnSelfHost(req *http.Request) bool {
 	sh := selfLoopbackHost.Load()
 	if sh == nil {
 		return true // unconfigured — defer entirely to the token match
 	}
-	host := req.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h // req.Host carried a port — compare the hostname component
+	host, port := req.Host, ""
+	if h, p, err := net.SplitHostPort(req.Host); err == nil {
+		host, port = h, p
 	}
-	return host == *sh
+	return api.SameSelfAddress(sh.host, sh.port, host, port)
 }
 
 // isTrustedSelfLoopback is the C1 forge-guard. TRUE iff the request carries a
@@ -195,12 +203,18 @@ func reseedInertFromHeaders(req *http.Request) *http.Request {
 // cache.BackgroundHeader: 1, and this hop then refuses write stages too (its
 // ctx carries no background marker of its own).
 //
-// Trust rule (the reseedInertFromHeaders precedent): honoured on ANY request
-// with a snowplow-validated identity, because the hop marker only RESTRICTS —
-// it refuses that one request's write stages and changes nothing else (not the
-// origin, the memory gates, the cache key or a log level). A user forging it
-// stops only their own request's writes. Any value but "1" is ignored. Runs
-// first in ServeHTTP, with the inert ingest.
+// Trust rule (the reseedInertFromHeaders precedent): honoured as a write
+// refusal on ANY request with a snowplow-validated identity, because for that
+// purpose the hop marker only RESTRICTS: it refuses that one request's write
+// stages and changes nothing that decides a serve (not the origin, the memory
+// gates, the cache key or a log level). A user forging it stops only their own
+// request's writes. Any value but "1" is ignored. Runs first in ServeHTTP, with
+// the inert ingest.
+//
+// The marker also takes a request out of the #1265 served-cold counter, and
+// that use is NOT a restriction: honoured from any host, it would let a caller
+// hide its own calls from the counter. So the counter reads it only on a
+// trusted self-loopback, like the nested-depth marker (isTopLevelCustomerCall).
 func reseedBackgroundFromHeaders(req *http.Request) *http.Request {
 	if req == nil || req.Header.Get(cache.BackgroundHeader) != "1" || cache.BackgroundHop(req.Context()) {
 		return req
@@ -256,7 +270,14 @@ func httpEdgeGuardStop(ctx context.Context, log *slog.Logger, resource, namespac
 	node := nestedResolveNodeKey(resource, namespace, name)
 	if cache.NestedResolveAncestorPresent(ctx, node) {
 		cache.BumpHTTPEdgeCycleStop()
-		log.Debug("http-edge nested resolve cycle-stop: node already an ancestor — returning raw CR",
+		// INFO (#1274 review): a cycle-stop is the designed outcome for a
+		// self-referential RESTAction, not a failure, so not WARN (the production
+		// floor is LOG_LEVEL=warn; snowplow_nested_loopback_guard_stops_total is
+		// the production signal). It is one line per stopped hop, and that hop
+		// is itself a /call that already logs dispatcher.call.complete at INFO,
+		// so it at most doubles a line that is already there. Metadata only: the
+		// CR coordinate and the depth, no identity.
+		log.InfoContext(ctx, "http-edge nested resolve cycle-stop: node already an ancestor — returning raw CR",
 			slog.String("node", node),
 			slog.Int("depth", cache.NestedCallDepthFromContext(ctx)),
 		)

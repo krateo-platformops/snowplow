@@ -277,10 +277,13 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		// directly — no jqutil encode-to-string + json.Unmarshal-back
 		// round-trip (design §3.4.2). Behaviour byte-identical per the
 		// §3.4.2 truth table.
-		// #1054 — the stage filter's JQ, timed on the request (the eval keeps
-		// its context.TODO: timing it changes nothing it does).
+		// #1054 — the stage filter's JQ, timed on the request (timing it
+		// changes nothing it does). The eval is not cancellable and never was
+		// (it ran on context.TODO(), whose Done is nil). It runs on
+		// context.Background(), the one context the gojq fork does not poll
+		// before every opcode (execute.go:24) — run 23.
 		jq := slowcall.Start(ctx, slowcall.PhaseJQ)
-		v, ok, err := EvalValue(context.TODO(), q, pig, jqsupport.ModuleLoader())
+		v, ok, err := EvalValue(context.Background(), q, pig, jqsupport.ModuleLoader())
 		jq.End()
 		switch {
 		case errors.Is(err, ErrMultiYield):

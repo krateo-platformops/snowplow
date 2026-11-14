@@ -88,17 +88,31 @@ const (
 // to -29, from the unsampled http.server.request.duration counter; the query
 // is in the PR that fixes #1013), about 68 compressed bytes per span.
 //
-// WHAT HAPPENS WHEN THE GATEWAY SAMPLES AT ITS EDGE (installer#402). The
-// parent-based sampler then follows the gateway's keep/drop flag: a request
-// the gateway drops arrives with sampled=0 and snowplow records no Server
-// span for it, so the SLIs silently become estimates. Which of the three
-// remedies applies is Diego's decision when #402 lands (the #1013 PR describes
-// each): (a) the gateway keeps propagating sampled=1 for every request it
-// forwards to snowplow and applies its ratio at EXPORT (its policy `filter`)
-// rather than at the sampling decision; (b) snowplow installs a sampler that
-// always samples SpanKind=Server spans and is parent-based otherwise,
-// accepting traces whose gateway parent was not exported; (c) the SLI moves
-// to spans the gateway always keeps.
+// THE CHOSEN TRADE (installer#402, landed on 057 2026-11-09). The
+// platform gateway traces 100% and decides nothing: agentgateway-policies
+// >= 0.2.19 exposes `tracing.platform.filter`, and the installer sets it to
+// "" (installer rev 460, applied 2026-11-09 06:27:08Z), so the gateway
+// propagates sampled=1 for every request it forwards here and exports every
+// span. That is the shape of remedy (a) in the #1013 PR (sampled=1 for every
+// request, the ratio applied after the sampling decision), with the ratio
+// taken off the gateway altogether: sampling happens once, at the
+// collectors' tail sampler (observability#118, Diego's choice), which keeps
+// every trace with an error, a 4xx or a JWT, plus 5% of the rest. snowplow
+// stays parentbased_always_on (#1013), so every request still gets its
+// Server span, and the SLIs stay exact because the collectors compute span
+// metrics BEFORE tail sampling. Not taken: (b) a snowplow sampler that
+// always samples Server spans whatever the parent says, and (c) moving the
+// SLIs to spans the gateway always keeps. Measured on 057 over
+// 9-minute windows of the same browsing, snowplow spans whose gateway parent
+// is not stored went 94/102 (92%) -> 0/104 (0%) (snowplow#849, closed).
+//
+// WHAT WOULD BREAK IT. A gateway that starts sampling at its edge: a
+// request it drops arrives with sampled=0, the parent-based sampler records
+// no Server span for it, and the SLIs silently become estimates. Or a snowplow
+// sampler that drops spans on its own (traceidratio, as 1.12.4 shipped, or
+// parentbased_traceidratio, which applies its ratio to every root span): the
+// same result from this side. Keep the sampling decision in the tail sampler,
+// after the span metrics, and change neither half alone.
 const (
 	// serviceName is the span-scope name NewServerHandler passes to
 	// otelhttp. The resource service.name lives in internal/otelresource
