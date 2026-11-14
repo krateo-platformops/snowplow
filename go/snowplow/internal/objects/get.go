@@ -218,7 +218,7 @@ func checkReference(ref templatesv1.ObjectReference) *response.Status {
 	if err != nil {
 		return nil
 	}
-	if err := apipath.CheckGVR(gv.WithResource(ref.Resource)); err != nil {
+	if err := apipath.CheckGVR(gv.WithResource(ref.Resource), apipath.Reference); err != nil {
 		return response.New(http.StatusBadRequest, err)
 	}
 	return nil

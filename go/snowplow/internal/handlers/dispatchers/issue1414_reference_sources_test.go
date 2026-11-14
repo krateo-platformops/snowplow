@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -80,6 +81,17 @@ func TestIssue1414_ANonPathReferenceIsRefusedFromEverySourceUnderTheServiceAccou
 				nothingSent(t, a)
 				if got.Err == nil || got.Err.Code != http.StatusBadRequest || got.Unstructured != nil {
 					t.Fatalf("want a 400 and no object, got err=%+v object=%v", got.Err, got.Unstructured != nil)
+				}
+				// This reference did not come from a query: the refusal names the reference's
+				// field, and neither the value nor the object.
+				m := got.Err.Message
+				if !strings.HasPrefix(m, `invalid reference field "resource": `) && !strings.HasPrefix(m, `invalid reference field "apiVersion": `) {
+					t.Errorf("the 400 must name the reference's field, got %q", m)
+				}
+				for _, part := range []string{"query", "configmaps", "other", "metrics", "svc", "pods", "buttons", ref.Name + `"`} {
+					if strings.Contains(m, part) {
+						t.Errorf("the 400 carries %q: %q", part, m)
+					}
 				}
 				// And the walk does not take the refusal for a deleted child.
 				w, _ := f6cWalker(t)

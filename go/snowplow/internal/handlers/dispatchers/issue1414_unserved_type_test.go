@@ -222,7 +222,10 @@ func TestIssue1414_AQueryThatIsNotOnePathIsA400AndNothingIsSent(t *testing.T) {
 					t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
 				}
 				st := i1414Status(t, rec)
-				// The refusal names the parameter and the rule, never the value.
+				// The refusal names the query parameter and the rule, never the value.
+				if !strings.HasPrefix(st.Message, `invalid "resource" query parameter: `) && !strings.HasPrefix(st.Message, `invalid "apiVersion" query parameter: `) {
+					t.Errorf("the 400 must name the query parameter, got %q", st.Message)
+				}
 				for _, part := range []string{"configmaps", "other", "metrics", "svc", "pods", "buttons"} {
 					if strings.Contains(st.Message, part) {
 						t.Errorf("the 400 echoes the value (%q): %q", part, st.Message)

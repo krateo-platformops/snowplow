@@ -689,7 +689,7 @@ type callOptions struct {
 func buildURIPath(opts callOptions) (string, error) {
 	var parts []string
 	add := func(param, v string) error {
-		if err := apipath.Segment(param, v); err != nil {
+		if err := apipath.Segment(apipath.Query(param), v); err != nil {
 			return err
 		}
 		parts = append(parts, url.PathEscape(v))

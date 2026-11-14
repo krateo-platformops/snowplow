@@ -31,7 +31,7 @@ func ParseGVR(req *http.Request) (gvr schema.GroupVersionResource, err error) {
 	// segment of an apiserver path, on every route that reads this query. A
 	// value that is not one segment is refused here, before any discovery or
 	// dial (apipath.Segment is the one rule).
-	if err := apipath.CheckGVR(gvr); err != nil {
+	if err := apipath.CheckGVR(gvr, apipath.Query); err != nil {
 		return schema.GroupVersionResource{}, err
 	}
 	return

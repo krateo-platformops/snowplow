@@ -285,13 +285,13 @@ func (uc *unstructuredClient) resourceInterface(gvr schema.GroupVersionResource,
 func checkPathSegments(opts Options) error {
 	// Each part the caller named. A part left empty never becomes a path as
 	// given: the mapper resolves it, or the read refuses it.
-	for _, part := range []struct{ param, v string }{
-		{"apiVersion", opts.GVR.Group}, {"apiVersion", opts.GVR.Version}, {"resource", opts.GVR.Resource},
+	for _, part := range []struct{ field, v string }{
+		{"group", opts.GVR.Group}, {"version", opts.GVR.Version}, {"resource", opts.GVR.Resource},
 	} {
 		if part.v == "" {
 			continue
 		}
-		if err := apipath.Segment(part.param, part.v); err != nil {
+		if err := apipath.Segment(apipath.ClientOption(part.field), part.v); err != nil {
 			return err
 		}
 	}
