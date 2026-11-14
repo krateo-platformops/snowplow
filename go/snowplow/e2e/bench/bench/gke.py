@@ -20,7 +20,10 @@ This module owns that lifecycle and nothing else:
     the body's exit path ALWAYS reaches teardown;
   - `self_destruct_manifest()` — an in-cluster CronJob that deletes the
     cluster once its TTL passes, the only layer that survives the operator's
-    laptop dying mid-run;
+    laptop dying mid-run. It runs as the bench's own node SA
+    (`node_sa_email()`, every node pool's --service-account), which may get
+    and delete snowplow-bench-* clusters only (`node_sa_bindings()`); gke-up
+    proves both halves on every run from the cluster (`ttl_proof_manifest()`);
   - `resolve_endpoints()` — SNOWPLOW_URL / AUTHN_URL / FRONTEND_URL read from
     the new cluster's Services (LB IPs are new every run, and the harness's
     baked defaults point at a cluster deleted 2026-06-14);
@@ -55,6 +58,7 @@ import dataclasses
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -112,6 +116,73 @@ DEFAULT_ZONE = "europe-west4-a"
 # patch because GKE retires patches on its own schedule.
 DEFAULT_CLUSTER_VERSION = "1.36"
 DEFAULT_TTL_HOURS = 8
+
+
+# ─── The bench clusters' node service account (Diego, 2026-11-13) ───────────
+#
+# Run 26h: every arm died in gke-up, "TTL backstop NOT proven: IAM answers that the CronJob's identity (the GKE
+# node SA) does NOT hold container.clusters.delete". The clusters ran as the project's default Compute Engine SA,
+# which may not delete clusters, so the ttl-self-destruct CronJob never could have; earlier runs only ever went
+# through teardown. Every bench cluster and node pool now runs as ONE dedicated SA, declared here with its exact
+# grants, and nowhere else: gke-up creates with it (create_commands: --service-account), vm606 node-sa creates it
+# and its grants and reads them back, vm606 plan-iam prints them, and vm606 up grants the orchestrator actAs on it.
+#
+#   - NODE_SA_ROLES, on the project, unconditional: roles/container.defaultNodeServiceAccount, the one role GKE's
+#     docs name as a custom node SA's minimum ("Kubernetes Engine Default Node Service Account": metric and log
+#     writes, autoscaling metrics). No Artifact Registry reader: no bench image is in the project's registries
+#     (the CronJob's TTL_IMAGE is gcr.io/google.com/cloudsdktool, public; the platform's are ghcr.io, with the pull
+#     secret, and public registries).
+#   - REAPER_PERMISSIONS, a custom role of the project holding only the two calls the CronJob makes (its describe
+#     re-checks the labels; its delete), bound under reaper_condition(): clusters whose NAME starts with
+#     BENCH_NAME_PREFIX only, so the SA can never delete krateo-057 or any other cluster of the project.
+#
+# GKE evaluates resource.name / resource.type in IAM conditions for clusters (IAM's resource-attribute table:
+# container.googleapis.com/Cluster), named projects/<p>/zones/<zone>/clusters/<c> for a zonal cluster and
+# projects/<p>/locations/<location>/clusters/<c> for a regional one; bench clusters are regional, in whatever
+# region the run picks (runs 24 and 25: europe-west4 and europe-west1), so the condition matches both forms in any
+# location. IAM conditions have no regular expressions or wildcards: extract("<prefix>{x}<suffix>") answers the
+# text between the prefix and the suffix, "" when either is missing; a cluster name or a location holds no "/", so
+# "/clusters/" + BENCH_NAME_PREFIX can only be found where the cluster's name begins. The project is not in the
+# expression: the binding lives on this project's policy, which only ever applies to its own clusters, and leaving
+# it out does not depend on whether GKE writes the project's id or its number there. What the grant allows is PROVEN
+# on every run, from the cluster, as this SA (ttl_proof_manifest), never assumed from this text.
+NODE_SA_NAME = "snowplow-bench-node"
+NODE_SA_DISPLAY_NAME = "snowplow bench GKE nodes"
+NODE_SA_DESCRIPTION = ("Node SA of the temporary bench GKE clusters (bench/gke.py); deletes snowplow-bench-* "
+                       "clusters only (its TTL CronJob)")
+NODE_SA_ROLES = ("roles/container.defaultNodeServiceAccount",)
+REAPER_ROLE_ID = "snowplowBenchClusterReaper"
+REAPER_ROLE_TITLE = "snowplow bench cluster reaper"
+REAPER_ROLE_DESCRIPTION = ("container.clusters.get and delete, for the bench TTL CronJob; bound to the bench node "
+                           "SA under a condition naming snowplow-bench-* clusters only (bench/gke.py)")
+REAPER_PERMISSIONS = ("container.clusters.delete", "container.clusters.get")
+CLUSTER_RESOURCE_TYPE = "container.googleapis.com/Cluster"
+#: (the collection, the extract identifier) of each name GKE gives a cluster in an IAM condition
+CLUSTER_NAME_FORMS = (("locations", "location"), ("zones", "zone"))
+REAPER_CONDITION_TITLE = "snowplow-bench-clusters-only"
+
+
+def node_sa_email(project: str) -> str:
+    """The node SA every bench cluster and node pool runs as (create_commands: --service-account)."""
+    return f"{NODE_SA_NAME}@{project}.iam.gserviceaccount.com"
+
+
+def reaper_role(project: str) -> str:
+    return f"projects/{project}/roles/{REAPER_ROLE_ID}"
+
+
+def reaper_condition() -> dict:
+    """The condition of the reaper role's binding: a cluster, named BENCH_NAME_PREFIX..., in any location."""
+    names = " || ".join(f'resource.name.extract("/{coll}/{{{ident}}}/clusters/{BENCH_NAME_PREFIX}") != ""'
+                        for coll, ident in CLUSTER_NAME_FORMS)
+    return {"title": REAPER_CONDITION_TITLE,
+            "expression": f'resource.type == "{CLUSTER_RESOURCE_TYPE}" && ({names})',
+            "description": f"bench node SA: delete only clusters named {BENCH_NAME_PREFIX}* (bench/gke.py)"}
+
+
+def node_sa_bindings(project: str) -> list[tuple[str, dict | None]]:
+    """(role, condition or None) of every binding the node SA holds on the project: exactly these, nothing else."""
+    return [*((r, None) for r in NODE_SA_ROLES), (reaper_role(project), reaper_condition())]
 
 
 class ClusterNotFound(RuntimeError):
@@ -424,7 +495,9 @@ def create_commands(spec: ClusterSpec) -> list[list[str]]:
     # REGIONAL control plane, every node in ONE zone: --num-nodes is per node
     # location, so with the one zone each pool keeps its count (no extra nodes)
     loc = ["--project", spec.project, "--region", spec.region]
-    nodes = ["--node-locations", ",".join(node_locations(spec))]
+    # every node, of every pool, runs as the bench's own node SA (NODE_SA_NAME), never the project's default
+    # Compute Engine SA: the TTL CronJob deletes the cluster as it (run 26h)
+    nodes = ["--node-locations", ",".join(node_locations(spec)), "--service-account", node_sa_email(spec.project)]
     cmds = [[
         "gcloud", "container", "clusters", "create", spec.name, *loc, *nodes,
         "--cluster-version", spec.cluster_version,
@@ -674,13 +747,18 @@ def lb_progress(svc_list: dict, events: list[dict] | None = None) -> tuple[dict,
 
 TTL_NAMESPACE = "bench-self-destruct"
 TTL_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli:slim"
-TTL_PERMISSION = "container.clusters.delete"
 TTL_PROOF_JOB = "ttl-delete-proof"
 TTL_PROOF_MARK = "TTL_PROOF "
-# the permission test runs IN the cluster, as the CronJob's own identity (the GKE node SA);
-# vm606's plan-iam lists this host as the node SA's, not the orchestrator's (NODE_SA_REST)
-TTL_PROOF_API = "https://cloudresourcemanager.googleapis.com/v1"
-# how long the proof Job may take: the image pull on a new node, gcloud's token, one request
+# the effective-permission test runs IN the cluster, as the CronJob's own identity (the node SA, NODE_SA_NAME), on
+# the GKE API the CronJob's gcloud calls; vm606's plan-iam lists this host as the node SA's, not the orchestrator's
+# (NODE_SA_REST)
+TTL_PROOF_API = "https://container.googleapis.com/v1"
+# the HTTP method of each permission the CronJob uses (REAPER_PERMISSIONS) on a cluster's own URL: its `gcloud
+# container clusters describe` and `delete --region` call projects.locations.clusters get and delete
+TTL_PROBE_METHODS = {"container.clusters.get": "GET", "container.clusters.delete": "DELETE"}
+# the probe names' fixed part (ttl_probe_names): no bench cluster is named so, and the random rest is new each run
+TTL_PROBE_WORD = "ttlprobe-"
+# how long the proof Job may take: the image pull on a new node, gcloud's token, four requests
 TTL_PROOF_BUDGET_S = 600.0
 # gke-up's exit when the cluster exists but its TTL backstop is not applied or not proven
 EXIT_TTL_BACKSTOP_MISSING = 3
@@ -720,12 +798,13 @@ def self_destruct_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
     """A CronJob that deletes THIS cluster once its TTL has passed.
 
     The only teardown layer that survives the operator's machine dying. It
-    runs with the node service account (the cluster is created with the
-    cloud-platform scope), so it works only if that account may call
-    container.clusters.delete: gke-up PROVES that on every run, right after
-    applying it, as that very identity (prove_ttl_delete; #1383 gap 3), and
-    a run whose proof fails does not go on. It re-checks the labels itself,
-    so a copy applied to the wrong cluster deletes nothing.
+    runs as the node service account (NODE_SA_NAME; the platform pool has the
+    cloud-platform scope), so it works only if that account may get and delete
+    THIS cluster (REAPER_PERMISSIONS, granted for snowplow-bench-* clusters
+    only): gke-up PROVES that on every run, right after applying it, as that
+    very identity (prove_ttl_delete; #1383 gap 3), and a run whose proof fails
+    does not go on. It re-checks the labels itself, so a copy applied to the
+    wrong cluster deletes nothing.
     """
     _check_name(spec.name)
     exp = spec.ttl_expires
@@ -767,21 +846,49 @@ spec:
 """
 
 
-def ttl_proof_manifest(spec: ClusterSpec, image: str = TTL_IMAGE) -> str:
-    """#1383 gap 3: a Job of the CronJob's own pod spec (_ttl_pod_spec) that asks IAM, as the
-    identity the CronJob runs as, whether it holds TTL_PERMISSION on the project
-    (projects.testIamPermissions: IAM answers for the CALLER, with every inherited and
-    conditional grant applied; GKE has no per-cluster IAM, so the project's answer is the
-    cluster's). It prints IAM's answer on one TTL_PROOF_MARK line; the token never leaves the
-    pod. Deletes nothing."""
+def new_probe_token() -> str:
+    """The random part of one run's probe names (ttl_probe_names): 40 bits, new on every proof."""
+    return secrets.token_hex(5)
+
+
+def ttl_probe_names(token: str) -> tuple[str, str]:
+    """(inside, control): two cluster names that do not exist, one starting with BENCH_NAME_PREFIX and one not,
+    both valid GKE names (_check_name's rule: lowercase, digits, hyphens, at most 40) so GKE answers about the
+    permission, never about the name's form."""
+    return f"{BENCH_NAME_PREFIX}{TTL_PROBE_WORD}{token}", f"{TTL_PROBE_WORD}{token}"
+
+
+def ttl_proof_manifest(spec: ClusterSpec, image: str = TTL_IMAGE, token: str | None = None) -> str:
+    """#1383 gap 3 / run 26h: a Job of the CronJob's own pod spec (_ttl_pod_spec) that tests, as the identity
+    the CronJob runs as, what the GKE API EFFECTIVELY lets it do, name-limited grant included: IAM's
+    projects.testIamPermissions cannot (it answers for the project, and a grant conditioned on the cluster's
+    name holds for no project). For each permission the CronJob uses (TTL_PROBE_METHODS) it calls the cluster's
+    own URL, in this cluster's region, for two names that do not exist (ttl_probe_names):
+      - BENCH_NAME_PREFIX + "ttlprobe-<random>": 404 NOT_FOUND says the permission is granted for bench names
+        (the service looked the cluster up, so the caller was allowed to ask);
+      - "ttlprobe-<random>": 403 PERMISSION_DENIED says the grant stops at the name prefix.
+    Neither cluster exists, so nothing can be deleted. Each answer is one TTL_PROOF_MARK line: the permission,
+    the name, the HTTP code and GKE's answer body (ttl_proof_answer reads it); the token never leaves the pod.
+    UNVERIFIED until the first real run: that GKE checks the permission on the requested name before it looks
+    the cluster up. Google's API guidance (AIP-211) says to check authorization before anything else, and, for a
+    resource that does not exist, that a service "should" check the parent's read-children permission instead;
+    GKE's own docs do not say which it does. Either way nothing reads as proven by mistake: a 403 for the bench
+    name (what a parent check would answer the SA, which may not list clusters) refuses as "not granted"."""
     _check_name(spec.name)
-    body = json.dumps({"permissions": [TTL_PERMISSION]})
+    inside, control = ttl_probe_names(token or new_probe_token())
+    base = f"{TTL_PROOF_API}/projects/{spec.project}/locations/{spec.region}/clusters"
     script = (
         "set -eu\n"
         "tok=$(gcloud auth print-access-token)\n"
-        "resp=$(curl -sS -X POST -H \"Authorization: Bearer $tok\" -H 'Content-Type: application/json' "
-        f"--data '{body}' '{TTL_PROOF_API}/projects/{spec.project}:testIamPermissions')\n"
-        f"echo \"{TTL_PROOF_MARK}$(printf '%s' \"$resp\" | tr -d '\\n')\"\n"
+        "ans=\"${TMPDIR:-/tmp}/probe.json\"\n"
+        "probe() {\n"
+        "  rm -f \"$ans\"\n"
+        "  code=$(curl -sS -o \"$ans\" -w '%{http_code}' -X \"$2\" -H \"Authorization: Bearer $tok\" "
+        "\"$3/$4\") || code=000\n"
+        f"  echo \"{TTL_PROOF_MARK}$1 $4 $code $(tr -d '\\n' < \"$ans\" 2>/dev/null || true)\"\n"
+        "}\n"
+        + "".join(f"probe {perm} {method} '{base}' {name}\n"
+                  for perm, method in TTL_PROBE_METHODS.items() for name in (inside, control))
     )
     return f"""\
 apiVersion: batch/v1
@@ -822,29 +929,85 @@ def error_reasons(err: dict) -> str:
     return f"reason: {', '.join(out)}" if out else ""
 
 
-def ttl_proof_answer(logs: str) -> tuple[bool, str]:
-    """(proven, why) from the proof pod's log: proven only when IAM's testIamPermissions answer
-    (the TTL_PROOF_MARK line) lists TTL_PERMISSION. An error answer is named by its code, status
-    and machine-readable reasons (error_reasons) only (its message can name the account)."""
-    line = next((ln[len(TTL_PROOF_MARK):] for ln in (logs or "").splitlines() if ln.startswith(TTL_PROOF_MARK)),
-                None)
-    if line is None:
-        return False, "the proof pod printed no answer (its gcloud token or its request failed before IAM answered)"
+def probe_answer(code: str, body: str) -> tuple[str, str]:
+    """(verdict, description) of one probe's answer. "404": GKE's NOT_FOUND, "403": its PERMISSION_DENIED, each
+    only when the HTTP code AND the Google API error body both say so (a 404 page of a wrong URL is not GKE's
+    lookup); "other" for anything else, a success among them. The description names the HTTP code, the error's
+    code, status and machine-readable reasons (error_reasons), never its message (it can name the account)."""
     try:
-        got = json.loads(line)
+        got = json.loads(body) if body.strip() else None
     except ValueError:
-        return False, "IAM's answer is not JSON"
-    if not isinstance(got, dict):
-        return False, "IAM's answer is not a JSON object"
-    if "error" in got:
-        e = got.get("error") if isinstance(got.get("error"), dict) else {}
-        reasons = error_reasons(e)
-        return False, (f"IAM refused the permission test (HTTP {e.get('code')}, {e.get('status')}"
-                       f"{'; ' + reasons if reasons else ''}): whether the node SA may delete the cluster is unknown")
-    perms = got.get("permissions") or []
-    if TTL_PERMISSION in perms:
-        return True, f"IAM answers that the CronJob's identity (the GKE node SA) holds {TTL_PERMISSION}"
-    return False, f"IAM answers that the CronJob's identity (the GKE node SA) does NOT hold {TTL_PERMISSION}"
+        got = None
+    e = got.get("error") if isinstance(got, dict) else None
+    if not isinstance(e, dict):
+        if code == "000":
+            return "other", "no HTTP answer (the request failed)"
+        what = ("a success (a cluster of that name exists)" if code.startswith("2") else
+                "no Google API error" if isinstance(got, dict) else
+                "no answer body" if not body.strip() else "an answer that is not a JSON object")
+        return "other", f"HTTP {code}, {what}"
+    ecode = e.get("code") if isinstance(e.get("code"), int) else None
+    status = e.get("status") if isinstance(e.get("status"), str) and _ERROR_REASON.fullmatch(e["status"]) else None
+    reasons = error_reasons(e)
+    desc = f"HTTP {code} ({ecode} {status}{'; ' + reasons if reasons else ''})"
+    if code == "404" and ecode == 404 and status == "NOT_FOUND":
+        return "404", desc
+    if code == "403" and ecode == 403 and status == "PERMISSION_DENIED":
+        return "403", desc
+    return "other", desc
+
+
+def ttl_proof_answer(logs: str) -> tuple[bool, str]:
+    """(proven, why) from the proof pod's log (ttl_proof_manifest's TTL_PROOF_MARK lines). For EACH permission the
+    CronJob uses (TTL_PROBE_METHODS), both of:
+      - the name starting with BENCH_NAME_PREFIX answered 404 NOT_FOUND (granted for bench clusters);
+      - the name that does not answered 403 PERMISSION_DENIED (the grant stops at the prefix).
+    Proven only then. 403 for both: not granted. 404 for both: the name limit does not hold (the SA could act on
+    any cluster of the project, krateo-057 included): refused all the same. Anything else, a missing answer
+    among them, refuses, naming the HTTP code, the error's status and reasons (probe_answer)."""
+    rows: dict[tuple[str, bool], tuple[str, str, str]] = {}
+    bad: list[str] = []
+    for ln in (logs or "").splitlines():
+        if not ln.startswith(TTL_PROOF_MARK):
+            continue
+        parts = ln[len(TTL_PROOF_MARK):].split(" ", 3)
+        perm, name, code = (parts + ["", "", ""])[:3]
+        if perm not in TTL_PROBE_METHODS or TTL_PROBE_WORD not in name or not re.fullmatch(r"\d{3}", code):
+            bad.append("the proof pod printed a line that is not one of its probes")
+            continue
+        key = (perm, name.startswith(BENCH_NAME_PREFIX))
+        if key in rows:
+            bad.append(f"{perm}: the proof pod answered twice for a {'bench' if key[1] else 'control'} name")
+            continue
+        rows[key] = (name, *probe_answer(code, parts[3] if len(parts) > 3 else ""))
+    if not rows:
+        return False, ("the proof pod printed no answer (its gcloud token or its requests failed before GKE "
+                       "answered)")
+    good = []
+    for perm in TTL_PROBE_METHODS:
+        verb = perm.rsplit(".", 1)[1]
+        inside, control = rows.get((perm, True)), rows.get((perm, False))
+        if inside is None or control is None:
+            bad.append(f"{perm}: the proof pod printed no answer for its "
+                       f"{BENCH_NAME_PREFIX + ' name' if inside is None else 'control name'}")
+            continue
+        (ni, vi, di), (nc, vc, dc) = inside, control
+        if vi == "404" and vc == "403":
+            good.append(f"{perm}: {ni} answered {di}, {nc} answered {dc}")
+        elif vi == "403" and vc == "403":
+            bad.append(f"{perm} is not granted to the node SA, not even on {BENCH_NAME_PREFIX}* clusters ({ni} "
+                       f"answered {di}; {nc} answered {dc})")
+        elif vi == "404" and vc == "404":
+            bad.append(f"{perm}: the name limit does not hold: {nc}, which does not start with {BENCH_NAME_PREFIX}, "
+                       f"answered {dc} too, so the node SA may {verb} ANY cluster of the project, krateo-057 "
+                       f"included")
+        else:
+            bad.append(f"{perm}: {ni} answered {di} and {nc} answered {dc}, not 404 NOT_FOUND and 403 "
+                       f"PERMISSION_DENIED")
+    if bad:
+        return False, "; ".join(bad)
+    return True, (f"GKE lets the CronJob's identity (the node SA) get and delete {BENCH_NAME_PREFIX}* clusters, and "
+                  f"no other ({'; '.join(good)})")
 
 
 def proof_placement(spec: ClusterSpec, *, run=None) -> dict:
@@ -866,17 +1029,17 @@ def proof_placement(spec: ClusterSpec, *, run=None) -> dict:
 
 def prove_ttl_delete(spec: ClusterSpec, *, run=None, clock: Callable[[], float] = time.monotonic,
                      sleep: Callable[[float], None] = time.sleep,
-                     budget_s: float = TTL_PROOF_BUDGET_S) -> tuple[bool, str, dict]:
-    """#1383 gap 3: PROVE the TTL CronJob can delete the cluster, on this run: apply the proof
-    Job (ttl_proof_manifest: the CronJob's pod spec), wait for it to end within `budget_s`, read
-    where its pod ran (placement: its node and that node's pool, which must be ttl_pool's) and its
-    answer (ttl_proof_answer), delete it. (proven, the line saying so, the placement). Anything not
-    read is "not proven", never proven."""
+                     budget_s: float = TTL_PROOF_BUDGET_S, token: str | None = None) -> tuple[bool, str, dict]:
+    """#1383 gap 3: PROVE the TTL CronJob can delete the cluster, and no cluster but a bench one, on this
+    run: apply the proof Job (ttl_proof_manifest: the CronJob's pod spec, probing ttl_probe_names(token)),
+    wait for it to end within `budget_s`, read where its pod ran (placement: its node and that node's pool,
+    which must be ttl_pool's) and its answer (ttl_proof_answer), delete it. (proven, the line saying so, the
+    placement). Anything not read is "not proven", never proven."""
     run = run or execute
     k = _kubectl(spec)
     quiet = lambda _m: None  # noqa: E731
     placement: dict = {"node": None, "pool": None}
-    rc, _ = run(k + ["apply", "-f", "-"], dry_run=False, input_data=ttl_proof_manifest(spec), log=quiet)
+    rc, _ = run(k + ["apply", "-f", "-"], dry_run=False, input_data=ttl_proof_manifest(spec, token=token), log=quiet)
     if rc != 0:
         return False, f"the proof Job could not be applied (rc={rc})", placement
     try:
@@ -2556,15 +2719,22 @@ def cmd_gke_up(a) -> int:
     # #1383 gap 3: and the backstop is PROVEN able to delete the cluster, on this run, as its own identity
     if dry:
         execute(_kubectl(spec) + ["apply", "-f", "-"], dry_run=True)
-        print(f"DRY-RUN: (stdin: Job {TTL_NAMESPACE}/{TTL_PROOF_JOB}, the CronJob's pod spec, asking IAM's "
-              f"testIamPermissions for {TTL_PERMISSION} as the node SA; then its log is read and it is deleted)")
+        inside, control = ttl_probe_names("<random>")
+        print(f"DRY-RUN: (stdin: Job {TTL_NAMESPACE}/{TTL_PROOF_JOB}, the CronJob's pod spec, calling the GKE API "
+              f"as the node SA: {' and '.join(TTL_PROBE_METHODS)} on {inside} (must answer 404 NOT_FOUND) and on "
+              f"{control} (must answer 403 PERMISSION_DENIED), neither of which exists; then its log is read and "
+              f"it is deleted)")
         return 0
-    ok, why, placement = prove_ttl_delete(spec)
+    token = new_probe_token()
+    ok, why, placement = prove_ttl_delete(spec, token=token)
     proof = {"kind": "ttl_backstop_proof", "cluster": spec.name, "project": spec.project,
-             "permission": TTL_PERMISSION, "proven": ok, "why": why,
+             "node_sa": node_sa_email(spec.project), "permissions": list(TTL_PROBE_METHODS),
+             "probe_names": list(ttl_probe_names(token)), "proven": ok, "why": why,
              "node": placement["node"], "pool": placement["pool"],
              "pool_required": "=".join(ttl_pool(spec)),
-             "method": "projects.testIamPermissions, from a Job of the ttl-self-destruct CronJob's pod spec"}
+             "method": ("GKE API get and delete of a non-existent snowplow-bench- name (404 NOT_FOUND: granted) "
+                        "and of a non-existent name outside it (403 PERMISSION_DENIED: the name limit holds), from "
+                        "a Job of the ttl-self-destruct CronJob's pod spec")}
     if getattr(a, "ttl_proof_out", None):
         with open(a.ttl_proof_out, "w") as fh:
             json.dump(proof, fh)
@@ -2574,8 +2744,8 @@ def cmd_gke_up(a) -> int:
                          f"{spec.name} at its TTL, so the run does not go on; the run's teardown deletes it (by "
                          f"hand: python3 -m bench.gke gke-down --name {spec.name} --yes)\n")
         return EXIT_TTL_BACKSTOP_MISSING
-    print(f"TTL backstop proven: {why} in {spec.project} (projects.testIamPermissions from a Job of the "
-          f"ttl-self-destruct CronJob's own pod spec)")
+    print(f"TTL backstop proven: {why} in {spec.project} (GKE API calls on two non-existent cluster names from a "
+          f"Job of the ttl-self-destruct CronJob's own pod spec)")
     return 0
 
 

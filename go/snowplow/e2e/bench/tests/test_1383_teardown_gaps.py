@@ -287,6 +287,7 @@ def test_every_up_reaps_first(vmfake, capsys):
     verbs = [" ".join(c["argv"][:3]) for c in fake_vm606.calls(vmfake)]
     assert "compute firewall-rules list" in verbs
     assert verbs.index("compute firewall-rules list") < min(
-        (i for i, v in enumerate(verbs) if "iam-policy" in v or v.endswith(" create")), default=len(verbs))
+        (i for i, v in enumerate(verbs) if "add-iam-policy" in v or "remove-iam-policy" in v or v.endswith(" create")),
+        default=len(verbs))     # (run 26h: up reads the node SA's policy first: a read, before the reap)
     assert _deletes(vmfake) == []
     assert "DRY-RUN: gcloud compute firewall-rules delete snowplow-bench-orch-old1-deny-ssh" in out, out[-3000:]

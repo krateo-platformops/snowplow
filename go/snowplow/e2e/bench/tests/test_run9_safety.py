@@ -10,6 +10,7 @@ R6: the fresh CLI wires "status" to the status writer.
 
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 import time
@@ -195,21 +196,31 @@ def test_partial_collect_has_one_wall_clock_cap(harness):
     assert gcl[-3:] == TEARDOWN_TAIL
 
 
-@pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 35` on the wall clock
+#: the hung read's hang: far past its 1 s bound, so a read cut by the bound and one that ran its hang out never look
+#: alike, whatever the runner's speed
+HUNG_READ_S = 60
+
+
 def test_every_collect_read_is_bounded_twice(harness):
+    """Each collect read is bounded twice (s_collect's KR): kubectl's --request-timeout AND an outer wall-clock bound
+    (`bounded COLLECT_TIMEOUT_S`), because --request-timeout does not bound an open exec stream (`kubectl cp`).
+    Both asserted directly, never through the run's total wall clock (#1406: that sat on the CI runner's variance):
+      - the first bound: every bench-loadgen collect read in the call log carries --request-timeout=COLLECT_TIMEOUT_S;
+      - the second: a cp that hangs (and ignores --request-timeout, as an exec stream does) is TERMinated, by the
+        outer bound, long before its hang ends; the whole collect's cap (COLLECT_CAP_S) is not what stops it."""
     env, state, ambient, tmp = harness
-    # one hung read, bounded per read at 1 s (the total cap is not what stops it)
-    env = _measure_fails(env, FAKE_SLOW_LOGS="40", COLLECT_TIMEOUT_S="1")
-    t0 = time.time()
+    env = _measure_fails(env, FAKE_SLOW_LOGS=str(HUNG_READ_S), COLLECT_TIMEOUT_S="1")
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
-                       capture_output=True, text=True, timeout=120)
-    assert time.time() - t0 < 35
-    assert "could not copy the driver's results (/out/nav.jsonl)" in p.stderr
-    assert "stopped after" not in p.stderr          # the per-read bound, not the total cap
+                       capture_output=True, text=True, timeout=10 * HUNG_READ_S)
     reads = [c["argv"] for c in _calls(state) if c["tool"] == "kubectl"
              and ("cp" in c["argv"] or any(x.startswith("pod/") for x in c["argv"]))
              and any("bench-loadgen" == x for x in c["argv"])]
-    assert reads and all(any(x.startswith("--request-timeout=") for x in r) for r in reads)
+    assert reads and all("--request-timeout=1s" in r for r in reads), reads
+    hung = [json.loads(ln) for ln in (state / "slow-reads.jsonl").read_text().splitlines()]
+    assert hung and all(h["how"] == "cut" and h["after_s"] < HUNG_READ_S / 2 for h in hung), hung
+    assert all("cp" in h["argv"] and "--request-timeout=1s" in h["argv"] for h in hung), hung
+    assert "could not copy the driver's results (/out/nav.jsonl)" in p.stderr
+    assert "stopped after" not in p.stderr          # the per-read bound, not the total cap
     assert (tmp / "out" / "fresh-fresh606-0.jsonl").exists()       # the others still came
 
 

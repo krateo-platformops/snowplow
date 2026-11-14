@@ -9,8 +9,9 @@
 # Teardown layers (any one deletes the cluster):
 #   1. `trap teardown EXIT` below (+ INT/TERM/HUP → exit → EXIT trap);
 #   2. the in-cluster ttl-self-destruct CronJob applied by `gke-up`, which proves
-#      on every run that the CronJob's identity may delete the cluster (IAM
-#      testIamPermissions from a Job of its own pod spec, $OUT/ttl-proof.json):
+#      on every run that the CronJob's identity (the bench node SA) may delete
+#      snowplow-bench-* clusters and no other (GKE API calls on two non-existent
+#      names from a Job of its own pod spec, $OUT/ttl-proof.json; run 26h):
 #      a run whose CronJob is not applied or not proven stops (#1383);
 #   3. `python -m bench.gke gke-reap --yes` (first step of every run; also by hand;
 #      each delete verified by its describe's NotFound);

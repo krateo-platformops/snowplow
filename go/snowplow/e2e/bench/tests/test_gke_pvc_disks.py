@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 
 from bench import gke
-from tests import fake_region
+from tests import fake_gke_api, fake_region
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
@@ -226,7 +226,7 @@ def test_the_backstop_without_this_clusters_id_takes_only_recorded_unlabelled_di
 
 # ─── 1+2. teardown, end to end against fakes ───────────────────────────────
 
-FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + textwrap.dedent("""\
+FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + fake_gke_api.LOADER + textwrap.dedent("""\
     st = os.environ["FAKE_STATE"]
     tool = os.path.basename(sys.argv[0])
     a = [x for x in sys.argv[1:] if not x.startswith(("--kubeconfig=", "--context=", "--request-timeout="))]
@@ -321,9 +321,10 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
                 {"metadata": {"name": "web-0", "namespace": "krateo-system"},
                  "spec": {"volumes": [{"name": "c", "configMap": {"name": "x"}}]}}]})); sys.exit(0)
         # #1383: gke-up's TTL CronJob apply (FAKE_TTL_APPLY_RC: refused) and its proof Job, as the API server and
-        # IAM answer: FAKE_TTL_PROOF=granted (default) | denied (testIamPermissions answers {}) | error (an IAM
-        # error naming the account) | silent (the pod printed no answer) | failed (the Job failed) | never |
-        # body (run 26g: the JSON file FAKE_TTL_PROOF_BODY names, on one line as the proof script prints it)
+        # GKE answer (run 26h, tests/fake_gke_api.py): FAKE_TTL_PROOF=granted (default: node-sa's grant) | denied
+        # (no grant) | unlimited (the role with no condition) | disabled (the GKE API off; its 403 names the
+        # caller) | silent (the pod printed no answer) | failed (the Job failed, its log empty) | never |
+        # body (run 26g: every probe answers the Google API error in the JSON file FAKE_TTL_PROOF_BODY names)
         proof = os.environ.get("FAKE_TTL_PROOF", "granted")
         if a[:2] == ["apply", "-f"]:
             text = sys.stdin.read()
@@ -336,13 +337,9 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + t
             st_ = {"failed": {"failed": 1}, "never": {"active": 1}}.get(proof, {"succeeded": 1})
             print(json.dumps({"kind": "Job", "status": st_})); sys.exit(0)
         if a[:2] == ["logs", "job/ttl-delete-proof"]:
-            ans = {"granted": {"permissions": ["container.clusters.delete"]}, "denied": {},
-                   "error": {"error": {"code": 403, "status": "PERMISSION_DENIED",
-                                       "message": "denied for someone@example.invalid"}}}.get(proof)
-            if proof == "body":
-                ans = json.load(open(os.environ["FAKE_TTL_PROOF_BODY"]))
-            if ans is not None:
-                print("TTL_PROOF " + json.dumps(ans))
+            applied = os.path.join(st, "applied.txt")
+            if proof != "failed":
+                sys.stdout.write(ttl_proof_logs(open(applied).read() if os.path.exists(applied) else "", proof))
             sys.exit(0)
         sys.exit(0)
     if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)

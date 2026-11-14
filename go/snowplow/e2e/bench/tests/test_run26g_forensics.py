@@ -1,13 +1,14 @@
 """Run 26g's forensics: three bench defects, each fixed and armed here.
 
-1. Every arm created its GKE cluster, then failed ~10 min later in gke-up: the TTL proof asks
-   cloudresourcemanager.googleapis.com as the GKE node SA, and that API was not enabled in the project. Now
+1. Every arm created its GKE cluster, then failed ~10 min later in gke-up: the TTL proof asked
+   cloudresourcemanager.googleapis.com as the GKE node SA, and that API was not enabled in the project (since run
+   26h the proof calls the GKE API instead, and only the laptop's `gcloud projects` calls still need it). Now
    every Google API the run calls (laptop, orchestrator, node SA), DERIVED from the code (bench/gcp_apis.py), is
    checked enabled before anything is created: in vm606 `up` (dry or not) and in run606's first step. An empty or
    failed services answer refuses (gcloud lists can exit 0 with nothing).
 2. The proof's refusal said only "HTTP 403, PERMISSION_DENIED": the real reason, SERVICE_DISABLED, was in
-   error.details[]. bench.gke.ttl_proof_answer now names each details[] reason (and the API it is about), never the
-   free-text message.
+   error.details[]. bench.gke.ttl_proof_answer (run 26h: the GKE-API proof, each probe's answer read by
+   probe_answer) now names each details[] reason (and the API it is about), never the free-text message.
 3. The schema step's CRD check pulled ghcr.io charts anonymously ("kagent-crds 0.1.6 not read: helm pull failed:
    ... 401"). A ghcr.io CRD chart is now fetched in-process with the ghcr pull token, by path, as the registry step
    reads every chart. (Whether an unreadable chart refuses the run: the existing contract names it and fails only
@@ -36,6 +37,13 @@ from tests.test_vm606 import RUN, _run, _up_env, _verbs, fake  # noqa: F401  (fi
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 SERVICE_DISABLED = FIXTURES / "crm_service_disabled_403.json"
 CRM = "cloudresourcemanager.googleapis.com"
+INSIDE, CONTROL = gke.ttl_probe_names("abcdef0123")
+
+
+def _proof_logs(code: int, body: dict) -> str:
+    """The proof pod's log when every one of its probes (both permissions, both names) answered `body` at `code`."""
+    return "".join(f"{gke.TTL_PROOF_MARK}{perm} {name} {code} {json.dumps(body)}\n"
+                   for perm in gke.TTL_PROBE_METHODS for name in (INSIDE, CONTROL))
 
 
 def _services(env: dict):
@@ -60,8 +68,12 @@ def test_the_apis_are_derived_from_every_caller():
     assert need["unmapped"] == []
     apis = need["apis"]
     assert {f"{h}.googleapis.com" for _f, h in gcp_apis.NODE_SA_REST.values()} <= set(apis)
-    assert any(u.startswith("GKE node SA: REST cloudresourcemanager.googleapis.com (the TTL proof Job")
-               for u in apis[CRM]), apis[CRM]
+    # run 26h: the TTL proof calls the GKE API as the node SA; cloudresourcemanager only for the operator's
+    # `gcloud projects` calls (the project, its IAM policy), never for the node SA any more
+    assert gcp_apis.NODE_SA_REST == {"TTL_PROOF_API": ("gke.py", "container")}
+    assert any(u.startswith("GKE node SA: REST container.googleapis.com (the TTL proof Job")
+               for u in apis["container.googleapis.com"]), apis["container.googleapis.com"]
+    assert apis[CRM] and all(u.startswith("laptop (operator): gcloud projects (bench/") for u in apis[CRM]), apis[CRM]
     assert any(u.startswith("GKE node SA: gcloud container (the ttl-self-destruct CronJob")
                for u in apis["container.googleapis.com"])
     assert any(u.startswith("laptop (operator): --tunnel-through-iap (bench/gcevm.py:")
@@ -107,14 +119,25 @@ def test_the_clusters_logging_and_monitoring_apis_are_read_from_its_create_argv(
     apis = gcp_apis.required()["apis"]
     for flag, api in (("--logging", "logging.googleapis.com"), ("--monitoring", "monitoring.googleapis.com")):
         assert apis[api] == [f"GKE node SA: container clusters create {flag} SYSTEM (bench.gke.create_commands)"]
-    # read from the argv, never a list: a flag set to NONE (either spelling) or left out requires nothing
+    # read from the argv, never a list: only a flag set to NONE (either spelling) requires nothing
     got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--logging=NONE",
                                       "--monitoring", "SYSTEM,API_SERVER"]])["apis"]
     assert "logging.googleapis.com" not in got
     assert got["monitoring.googleapis.com"] == [
         "GKE node SA: container clusters create --monitoring SYSTEM,API_SERVER (bench.gke.create_commands)"]
-    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--monitoring", "NONE"]])
-    assert not {"logging.googleapis.com", "monitoring.googleapis.com"} & set(got["apis"])
+    # fail closed (#1404 review): a flag left out is GKE's default, system logging and monitoring ON, so the API is
+    # required; a node pool's create takes neither flag and requires neither
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--monitoring", "NONE"],
+                                     ["gcloud", "container", "node-pools", "create", "p", "--cluster", "c"]])["apis"]
+    assert "monitoring.googleapis.com" not in got
+    assert got["logging.googleapis.com"] == [
+        "GKE node SA: container clusters create without --logging (GKE's default: SYSTEM logging and monitoring on; "
+        "bench.gke.create_commands)"]
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c"]])["apis"]
+    assert {"logging.googleapis.com", "monitoring.googleapis.com"} <= set(got)
+    got = gcp_apis.required(creates=[["gcloud", "container", "clusters", "create", "c", "--logging", "none",
+                                      "--monitoring=NONE"]])["apis"]
+    assert not {"logging.googleapis.com", "monitoring.googleapis.com"} & set(got)
 
 
 def test_a_disabled_logging_api_refuses_naming_the_node_sa():
@@ -127,13 +150,14 @@ def test_a_disabled_logging_api_refuses_naming_the_node_sa():
 
 def test_with_the_projects_services_of_run_26g_the_check_refuses_naming_cloudresourcemanager():
     """The project's listing on 2026-11-13 (tests/fixtures/services_enabled_20261113.json): every API the run calls
-    is enabled but the TTL proof's, and the refusal names it, who calls it and how to enable it."""
+    is enabled but cloudresourcemanager (then the TTL proof's; since run 26h the operator's `gcloud projects`
+    calls'), and the refusal names it, who calls it and how to enable it."""
     with pytest.raises(gcp_apis.Refused) as e:
         gcp_apis.check("operations-dev-krateo-io", run=_services({"FAKE_SERVICES": "captured"}))
     msg = str(e.value)
     n = len(gcp_apis.required()["apis"])
     assert msg.startswith(f"1 of the {n} Google APIs the run calls is not enabled in operations-dev-krateo-io")
-    assert f"{CRM} is not enabled (called by GKE node SA: " in msg
+    assert f"{CRM} is not enabled (called by laptop (operator): gcloud projects (bench/" in msg
     assert f"gcloud services enable {CRM} --project operations-dev-krateo-io" in msg
     assert msg.count("is not enabled (called by") == 1
 
@@ -199,7 +223,7 @@ def test_vm606_up_refuses_before_anything_while_an_api_is_disabled(fake, capsys,
     monkeypatch.setenv("FAKE_SERVICES", "captured")
     rc, _out, err = _up_bounded(capsys, "--env-file", _up_env(), "--run", RUN, "--ttl-hours", "15",
                                 *(["--yes"] if yes else []))
-    assert rc == 2 and f"{CRM} is not enabled (called by GKE node SA" in err, err
+    assert rc == 2 and f"{CRM} is not enabled (called by laptop (operator)" in err, err
     assert not [v for v in _verbs(fake) if "add-iam-policy-binding" in v or "create" in v or "delete" in v]
 
 
@@ -240,27 +264,31 @@ def test_run606s_dry_pass_derives_the_apis_and_reads_nothing_from_gcp(tmp_path):
 # ─── 2. the TTL proof's refusal names Google's reason ───────────────────────
 
 def test_a_service_disabled_answer_is_named_by_its_reason():
+    """Run 26g's own answer (Google's SERVICE_DISABLED 403, as captured), given to every probe of the GKE-API proof
+    (run 26h): refused, named by its code, status and reason, never by its free text."""
     body = json.loads(SERVICE_DISABLED.read_text())
-    ok, why = gke.ttl_proof_answer("TTL_PROOF " + json.dumps(body))
+    ok, why = gke.ttl_proof_answer(_proof_logs(403, body))
     assert not ok
-    assert ("IAM refused the permission test (HTTP 403, PERMISSION_DENIED; reason: SERVICE_DISABLED (service "
-            "cloudresourcemanager.googleapis.com)): whether the node SA may delete the cluster is unknown") == why
+    desc = "HTTP 403 (403 PERMISSION_DENIED; reason: SERVICE_DISABLED (service cloudresourcemanager.googleapis.com))"
+    for perm in gke.TTL_PROBE_METHODS:
+        assert (f"{perm} is not granted to the node SA, not even on snowplow-bench-* clusters ({INSIDE} answered "
+                f"{desc}; {CONTROL} answered {desc})") in why, why
     assert "357378285144" not in why and "has not been used" not in why     # the free text never
 
 
 @pytest.mark.parametrize("details, says", [
     ([{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "IAM_PERMISSION_DENIED",
        "domain": "iam.googleapis.com", "metadata": {"permission": "resourcemanager.projects.testIamPermissions"}}],
-     "(HTTP 403, PERMISSION_DENIED; reason: IAM_PERMISSION_DENIED)"),
+     "HTTP 403 (403 PERMISSION_DENIED; reason: IAM_PERMISSION_DENIED)"),
     ([{"reason": "denied for x@example.invalid"}, {"reason": "SERVICE_DISABLED",
                                                     "metadata": {"service": "x@example.invalid"}}],
-     "(HTTP 403, PERMISSION_DENIED; reason: SERVICE_DISABLED)"),
-    ("not a list", "(HTTP 403, PERMISSION_DENIED)"),
-    ([], "(HTTP 403, PERMISSION_DENIED)"),
+     "HTTP 403 (403 PERMISSION_DENIED; reason: SERVICE_DISABLED)"),
+    ("not a list", "HTTP 403 (403 PERMISSION_DENIED)"),
+    ([], "HTTP 403 (403 PERMISSION_DENIED)"),
 ])
 def test_only_a_reasons_code_and_an_api_host_get_through(details, says):
-    ok, why = gke.ttl_proof_answer("TTL_PROOF " + json.dumps(
-        {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "for x@example.invalid", "details": details}}))
+    ok, why = gke.ttl_proof_answer(_proof_logs(403, {"error": {
+        "code": 403, "status": "PERMISSION_DENIED", "message": "for x@example.invalid", "details": details}}))
     assert not ok and says in why and "@" not in why, why
 
 

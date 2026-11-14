@@ -2,10 +2,11 @@
 before anything is created (run 26g).
 
 Run 26g: all three arms created their GKE clusters, then failed in gke-up after about 10 minutes each: "TTL
-backstop NOT proven: IAM refused the permission test (HTTP 403, PERMISSION_DENIED)". The TTL proof Job asks
+backstop NOT proven: IAM refused the permission test (HTTP 403, PERMISSION_DENIED)". The TTL proof Job then asked
 cloudresourcemanager.googleapis.com as the GKE node SA, and that API was not enabled in the project (the error's
 reason, SERVICE_DISABLED, was not printed then: bench.gke.error_reasons prints it now). Nothing had checked, before
-the clusters existed, that the APIs the run calls are enabled.
+the clusters existed, that the APIs the run calls are enabled. (Since run 26h the proof calls the GKE API instead,
+as the bench's own node SA: NODE_SA_REST.)
 
 WHO CALLS WHAT, read from the code (`required`), never from a list kept by hand:
   - the laptop (the operator: OPERATOR_SIDE, bench.vm606 and the modules it shares) and the orchestrator (every
@@ -18,7 +19,8 @@ WHO CALLS WHAT, read from the code (`required`), never from a list kept by hand:
     them (the ttl-self-destruct CronJob, the TTL proof Job): their gcloud calls and REST URLs; and every REST
     constant NODE_SA_REST names (the one source of which URLs only the node SA requests; bench.vm606's plan-iam
     reads it too); and what the cluster create argv bench.gke builds makes the nodes send as the node SA
-    (CLUSTER_FLAG_API: --logging SYSTEM, --monitoring SYSTEM: GKE's system logging and monitoring agents).
+    (CLUSTER_FLAG_API: --logging SYSTEM, --monitoring SYSTEM: GKE's system logging and monitoring agents; a flag
+    left out is GKE's default, both on, so it requires the API too: only an explicit NONE requires nothing).
 A gcloud command group no entry of GCLOUD_API maps (a call the derivation cannot place) refuses the check by name:
 the set is never silently short.
 
@@ -67,16 +69,18 @@ GCLOUD_API: dict[str, str | None] = {
 #: through an IAP tunnel, and OS Login's key import on an instance with enable-oslogin
 FLAG_API = {"--tunnel-through-iap": "iap.googleapis.com", "enable-oslogin": "oslogin.googleapis.com"}
 #: a flag of the cluster create argv bench.gke builds -> the API the cluster's nodes then write to as the GKE node SA
-#: (GKE's system logging and monitoring agents), unless its value is NONE (the cluster then sends nothing there)
+#: (GKE's system logging and monitoring agents), unless its value is NONE (the cluster then sends nothing there). A
+#: cluster create WITHOUT the flag requires the API too: GKE then turns system logging and monitoring on (fail closed)
 CLUSTER_FLAG_API = {"--logging": "logging.googleapis.com", "--monitoring": "monitoring.googleapis.com"}
 #: a URL on the www host of googleapis.com names its API by its first path segment (www.googleapis.com/compute/v1:
 #: compute.googleapis.com), except an OAuth scope (www.googleapis.com/auth/...)
 WWW_NOT_API = frozenset({"auth"})
 #: A REST API the orchestrator never calls itself: a module constant (by name, in its file, on its host) whose URL
-#: only a pod in the bench cluster requests, as the GKE node SA. #1383 gap 3: gke-up's TTL proof Job asks IAM's
-#: projects.testIamPermissions AS the identity the ttl-self-destruct CronJob runs as. bench.vm606's plan-iam
-#: skips it (no orchestrator role); `required` counts it as the node SA's.
-NODE_SA_REST = {"TTL_PROOF_API": ("gke.py", "cloudresourcemanager")}
+#: only a pod in the bench cluster requests, as the GKE node SA. #1383 gap 3 / run 26h: gke-up's TTL proof Job calls
+#: the GKE API (clusters get and delete, on two cluster names that do not exist) AS the identity the
+#: ttl-self-destruct CronJob runs as. bench.vm606's plan-iam skips it (no orchestrator role); `required` counts it
+#: as the node SA's.
+NODE_SA_REST = {"TTL_PROOF_API": ("gke.py", "container")}
 #: the operator's modules: their calls run on the laptop as the operator, never as the orchestrator SA
 OPERATOR_SIDE = ("vm606.py", "gcevm.py", "testvm.py")
 #: the one read: how long it may take (a services list answers in seconds; a call past this is no answer)
@@ -165,13 +169,21 @@ def required(bench_dir: Path = BENCH_DIR, manifests=None, creates=None) -> dict:
         for m in _REST.finditer(text):
             add(_rest_api(m.group(1), m.group(2)), NODE_SA, f"REST {m.group(1)}.googleapis.com ({what})")
     for argv in (cluster_creates() if creates is None else creates):
+        seen = set()
         for i, a in enumerate(argv):
             flag, eq, val = a.partition("=")
             if flag in CLUSTER_FLAG_API:
+                seen.add(flag)
                 val = val if eq else (argv[i + 1] if i + 1 < len(argv) else "")
                 if val.upper() != "NONE":
                     add(CLUSTER_FLAG_API[flag], NODE_SA,
                         f"{' '.join(argv[1:4])} {flag} {val} (bench.gke.create_commands)")
+        # fail closed: a cluster created without the flag gets GKE's default, system logging and monitoring ON, so
+        # the API is required; only an explicit NONE requires nothing (a node pool takes neither flag)
+        if argv[2:4] == ["clusters", "create"]:
+            for flag in sorted(set(CLUSTER_FLAG_API) - seen):
+                add(CLUSTER_FLAG_API[flag], NODE_SA, f"{' '.join(argv[1:4])} without {flag} (GKE's default: SYSTEM "
+                                                     f"logging and monitoring on; bench.gke.create_commands)")
     return {"apis": {a: sorted(w) for a, w in sorted(apis.items())}, "unmapped": sorted(set(unmapped))}
 
 
