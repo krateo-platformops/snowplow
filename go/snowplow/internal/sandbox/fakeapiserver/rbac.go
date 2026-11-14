@@ -30,8 +30,20 @@ const saPrefix = "system:serviceaccount:"
 type identity struct {
 	User   string
 	Groups []string
-	Label  string // the request log's identity: sa | visitor | other | none
+	Label  string // the request log's identity: labelSA, labelVisitor, labelOther or labelNone
 }
+
+// The request log's identity values (sandbox SNAPSHOT.md §4). A request's line carries one of the
+// first four, from authentication and impersonation. labelController is no request's: it is the
+// line of a scripted status write (applyStatus), the simulated controller's own, and nothing that
+// reads a request sets it.
+const (
+	labelSA         = "sa"
+	labelVisitor    = "visitor"
+	labelOther      = "other"
+	labelNone       = "none"
+	labelController = "controller"
+)
 
 // serviceAccountIdentity is the user and groups the apiserver gives a ServiceAccount token.
 func serviceAccountIdentity(namespace, name string) identity {

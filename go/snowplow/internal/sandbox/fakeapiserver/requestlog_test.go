@@ -56,6 +56,17 @@ func lineShapeErrors(lines []map[string]any) []string {
 		if _, ok := l["items"].(int); !ok {
 			bad = append(bad, "a request line whose items is not an int")
 		}
+		// identity is a request's (sa, visitor, other, none) or, on a scripted status write's line
+		// and on no other, the controller's.
+		switch id, _ := l["identity"].(string); id {
+		case "sa", "visitor", "other", "none":
+		case "controller":
+			if res, _ := l["resource"].(string); l["verb"] != "patch" || !strings.HasSuffix(res, "/status") {
+				bad = append(bad, fmt.Sprintf("a controller line that is not a patch of a status: %v %v", l["verb"], l["resource"]))
+			}
+		default:
+			bad = append(bad, fmt.Sprintf("a request line with identity %v", l["identity"]))
+		}
 	}
 	return bad
 }
@@ -183,12 +194,25 @@ func TestRequestLog_ShapeCheckRefusesEachDeviation(t *testing.T) {
 		"no items":                func() map[string]any { m := requestLine(""); m["status"] = 200; delete(m, "items"); return m }(),
 		"an unlisted event":       {"event": "applyStatus.applied", "id": "r", "pointer": ""},
 		"an event with extra key": {"event": "fake.unimplemented", "what": "x", "status": 500},
+		"an unlisted identity":    func() map[string]any { m := requestLine(""); m["status"] = 200; m["identity"] = "admin"; return m }(),
+		"a controller's read": func() map[string]any {
+			m := requestLine("")
+			m["status"], m["identity"], m["verb"], m["resource"] = 200, "controller", "get", "incidents/status"
+			return m
+		}(),
+		"a controller's write of a main resource": func() map[string]any {
+			m := requestLine("")
+			m["status"], m["identity"], m["verb"], m["resource"] = 200, "controller", "patch", "incidents"
+			return m
+		}(),
 	} {
 		if len(lineShapeErrors([]map[string]any{l})) == 0 {
 			t.Errorf("%s passed the shape check", name)
 		}
 	}
-	if b := lineShapeErrors([]map[string]any{good, {"event": "fake.unimplemented", "what": "x"}}); len(b) != 0 {
+	scripted := requestLine("")
+	scripted["status"], scripted["identity"], scripted["verb"], scripted["resource"] = 200, "controller", "patch", "incidents/status"
+	if b := lineShapeErrors([]map[string]any{good, scripted, {"event": "fake.unimplemented", "what": "x"}}); len(b) != 0 {
 		t.Errorf("good lines refused: %v", b)
 	}
 }

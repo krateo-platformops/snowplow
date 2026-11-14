@@ -294,20 +294,6 @@
             "list",
             "watch"
           ]
-        },
-        {
-          "apiGroups": [
-            "observability.krateo.io"
-          ],
-          "resources": [
-            "incidents/status",
-            "alerts/status"
-          ],
-          "verbs": [
-            "get",
-            "patch",
-            "update"
-          ]
         }
       ]
     },
