@@ -55,7 +55,7 @@ new OTLPTraceExporter({
 Everything not listed here is dropped. Nothing is forwarded as sent: the payload is rebuilt from the fields below.
 
 - **Resource:** `service.name` must be exactly `krateo-frontend`. Any other value drops the whole resource's spans. No other resource attribute is forwarded: the forwarded resource carries `service.name=krateo-frontend` only. Scope is set by snowplow to `snowplow/rum-ingest`.
-- **Span names:** `krateo.page.load`, `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish`, `krateo.widget.fetch`, `krateo.agentiko.claim.unbacked`. A name matches exactly (case, whitespace and suffixes included). Any other name is dropped.
+- **Span names:** `krateo.page.load`, `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish`, `krateo.widget.fetch`, `krateo.agentiko.claim.unbacked`, `krateo.agentiko.a2a`. A name matches exactly (case, whitespace and suffixes included). Any other name is dropped.
 - **Span fields kept:**
   - `traceId`, `spanId`, `parentSpanId`, as hex, the OTLP/JSON encoding;
   - `kind`;
@@ -67,12 +67,13 @@ Everything not listed here is dropped. Nothing is forwarded as sent: the payload
 
 | key | on spans | allowed values |
 |---|---|---|
-| `http.route` | the first five (not `krateo.agentiko.claim.unbacked`) | on `krateo.widget.fetch`: exactly one of snowplow's registered routes. On the page-level spans: a route **template** (`/compositions/{namespace}/{name}`) that starts with `/`, uses only `A-Z a-z 0-9 / _ . : { } -`, is at most 256 characters, and has no segment of 24 characters or more and no JWT-shaped segment; a query string, fragment or `%`-escape fails the character check. See the contract below. |
-| `http.request.method` | the first five | `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` (upper case) |
-| `http.response.status_code` | the first five | an integer from 100 to 599 (`intValue`) |
+| `http.route` | the first five and `krateo.agentiko.a2a` (not `krateo.agentiko.claim.unbacked`) | on `krateo.widget.fetch`: exactly one of snowplow's registered routes. On the page-level spans and `krateo.agentiko.a2a`: a route **template** (`/compositions/{namespace}/{name}`) that starts with `/`, uses only `A-Z a-z 0-9 / _ . : { } -`, is at most 256 characters, and has no segment of 24 characters or more and no JWT-shaped segment; a query string, fragment or `%`-escape fails the character check. See the contract below. |
+| `http.request.method` | the first five and `krateo.agentiko.a2a` | on the first five: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` (upper case). On `krateo.agentiko.a2a`: exactly `POST` (`stringValue`). |
+| `http.response.status_code` | the first five and `krateo.agentiko.a2a` | an integer from 100 to 599 (`intValue`) |
 | `krateo.interaction.abandoned` | `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish` only | exactly `true` (`boolValue`). See below. |
 | `krateo.agentiko.claim.family` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
 | `krateo.agentiko.claim.outcome` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
+| `krateo.a2a.method` | `krateo.agentiko.a2a` only | exactly one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe` (`stringValue`). See below. |
 
 Every other attribute is dropped and counted, as is an allowlisted key on a span that does not list it, or whose value fails its check. That includes `enduser.id`, `url.full` and any header.
 
@@ -111,6 +112,29 @@ What snowplow does with each of the two attributes:
 | upper case anywhere, a leading digit or `_`, empty, longer than 32, any other character (`-`, `.`, space, a non-ASCII letter) | that attribute is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
 | not a string (`intValue`, `boolValue`, `doubleValue`, `arrayValue`, …), or a matching string with any other member beside it | dropped and counted; the span is still forwarded |
 | on any other span | dropped and counted; the span is still forwarded |
+
+### `krateo.agentiko.a2a`: the frontend contract
+
+Agreed with the frontend on 2026-11-13 (#1398; frontend 1.8.43). The portal emits it for each of the agent's JSON-RPC `POST`s under the Agentiko A2A base. It is the browser's fetch span, renamed by the portal, so its context is the request's `traceparent` and the gateway's `POST /api/a2a/*` span is its child.
+
+- **Attributes:** `http.request.method`, `http.response.status_code`, `http.route` and `krateo.a2a.method`, and **nothing else**. No user, token, session, conversation or message content: snowplow drops and counts any other key on this span.
+- **Values:**
+  - `http.request.method`: exactly `POST`. The availability-probe `GET` is never exported, so any other method breaks the contract.
+  - `http.response.status_code`: an integer from 100 to 599. When no complete response was read (a stream that fails or is aborted after the `200`), the portal omits it and sets span status `ERROR` instead. snowplow forwards the status code, never its message. It does not accept `0`.
+  - `http.route`: the template `/api/a2a/{namespace}/{agent}`, never the concrete path. The A2A route is the gateway's, not snowplow's, so it passes the page-span template check, not the registered-route check. That check cannot tell a short concrete path (`/api/a2a/ns1/agent1`) from a template (see the `http.route` contract below). Sending the template is the frontend's guarantee.
+  - `krateo.a2a.method`: one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe`.
+- **Duration:** to the end of the response body. For `message/stream` that is the whole streamed turn, up to the last SSE byte. A stream that errors or aborts ends the span there. A tab closed mid-stream never ends it, so nothing is exported.
+
+What snowplow does with each attribute:
+
+| sent | result |
+|---|---|
+| the values above | forwarded as sent |
+| `http.request.method` other than `POST` (`GET`, `post`, …); a `krateo.a2a.method` outside the four; a concrete path with a query string, escape or token-shaped segment in `http.route`; a status outside 100–599 | that attribute is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| no `http.response.status_code`, with span status `ERROR` | forwarded with status `ERROR` and nothing dropped |
+| any other key, including `enduser.id`, on this span; `krateo.a2a.method` on any other span | dropped and counted; the span is still forwarded |
+
+`krateo.widget.fetch` is unchanged: an `http.route` under `/api/a2a/` is not a snowplow route, so it is dropped and counted there.
 
 ### `http.route`: the frontend contract
 
