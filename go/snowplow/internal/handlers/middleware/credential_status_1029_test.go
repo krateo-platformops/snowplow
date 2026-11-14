@@ -91,6 +91,15 @@ func c1029AssertPlumbingCompatible(t *testing.T, rec *httptest.ResponseRecorder,
 	if err := json.Unmarshal(rec.Body.Bytes(), &asPlumbing); err != nil {
 		t.Fatalf("a plumbing response.Status reader cannot decode the body: %v", err)
 	}
+	// plumbing v1.75.0 — response.Status has Details, so a plumbing reader now
+	// also decodes this body's details.causes. The body is the same bytes as
+	// before (asserted above); what changed is what the reader's struct holds.
+	// The six fields are compared as before, and the cause the reader now sees
+	// is the body's one cause.
+	if d := asPlumbing.Details; d == nil || len(d.Causes) != 1 || d.Causes[0].Type == "" {
+		t.Fatalf("a plumbing response.Status reader must see the body's one cause, got %+v", d)
+	}
+	asPlumbing.Details = nil
 	if asPlumbing != *response.New(http.StatusUnauthorized, errors.New(b.Message)) {
 		t.Fatalf("a plumbing response.Status reader sees %+v, want %+v", asPlumbing, *response.New(http.StatusUnauthorized, errors.New(b.Message)))
 	}
