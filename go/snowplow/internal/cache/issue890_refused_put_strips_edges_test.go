@@ -26,7 +26,7 @@ var refusals890 = []refusal890{
 		return c.replaceIfGen(context.Background(), k, e, g)
 	}},
 	{"ReplaceIfGenRefresh", func(c *ResolvedCacheStore, k string, e *ResolvedEntry, g uint64) bool {
-		return c.replaceIfGenRefresh(context.Background(), k, e, g)
+		return c.replaceIfGenRefresh(context.Background(), k, e, g).Stored()
 	}},
 }
 

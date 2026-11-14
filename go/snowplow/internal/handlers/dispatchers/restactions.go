@@ -310,7 +310,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
-			setStoredStageOutcomesHeader(wri, entry) // #904
+			stampRefreshDigest(wri, entry.ContentDigest) // #1324: the cell is served verbatim
+			setStoredStageOutcomesHeader(wri, entry)     // #904
 			// #710 PR-2b; #1062 — armed (the header above), for this requester.
 			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
@@ -512,7 +513,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// request re-run with D2 disabled, exactly like a declined body: a write
 		// held in that pass (rule a) makes a filter that needs its output fail,
 		// and the fresh re-run is the one that sends the write.
-		if staleWritePoint(r, wri, req, staleSink, false) {
+		if staleWritePoint(r, wri, req, staleSink, false, nil) {
 			return
 		}
 		log.ErrorContext(ctx, "unable to resolve rest action",
@@ -734,13 +735,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			putStored := cacheHandle.PutResolvedIfGen(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+			put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
 				RawJSON:       encoded,
 				Inputs:        cacheInputs,
 				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
 				StaleDerived:  staleSink.StaleDerived(),        // #710 PR-2b
 				StageOutcomes: storableStageOutcomes(outcomes), // #904
 			}, cacheGen0)
+			putStored := put.Stored()
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
 			// during the resolve) stored no cell, so — exactly like the declined
@@ -771,7 +773,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// (it re-armed after a TTL-eviction, and this cold-fill replaces the
 				// evicted entry), announce the fill so the viewer's frame goes fresh
 				// now instead of waiting for the next churn. No-op when unarmed.
-				publishIfSubscribed(cacheKey)
+				// #1321 — and only when the Put changed the stored bytes.
+				publishIfSubscribed(cacheKey, put)
 
 				// #548 — ARM the browser here, and ONLY here, on the cold path.
 				// This block is the one place a cold RESTAction dispatch stores a
@@ -802,10 +805,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a different reason — it mints no key at all (dispatchCacheLookupKey).
 	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
 	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
-	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable, encoded) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, storableStageOutcomes(outcomes)) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

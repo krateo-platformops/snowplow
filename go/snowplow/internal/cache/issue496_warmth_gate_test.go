@@ -150,7 +150,7 @@ func TestIssue496_ColdCellInTheWindowIsNotReMinted(t *testing.T) {
 	}
 	refusedBefore := c.Stats().RemintRefusedColdTotal
 
-	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"fresh"}]}`), Inputs: &in}, c.CaptureGen(key)) {
+	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"fresh"}]}`), Inputs: &in}, c.CaptureGen(key)).Stored() {
 		t.Fatal("SETUP: ReplaceIfGenRefresh refused a live in-window cell; the write must be ACCEPTED (only the re-mint is gated)")
 	}
 
@@ -223,7 +223,7 @@ func TestIssue496_WarmCellInTheWindowIsStillReMinted(t *testing.T) {
 	}
 	refusedBefore := c.Stats().RemintRefusedColdTotal
 
-	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"fresh"}]}`), Inputs: &in}, c.CaptureGen(key)) {
+	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"fresh"}]}`), Inputs: &in}, c.CaptureGen(key)).Stored() {
 		t.Fatal("SETUP: ReplaceIfGenRefresh refused a live in-window cell")
 	}
 	e1, _ := c.GetNoTouch(key)
@@ -263,7 +263,7 @@ func TestIssue496_SeededCellLosesSeedWarmthAtItsFirstRefresh(t *testing.T) {
 
 	// First in-window refresh: re-minted (seed warmth), and the entry it writes
 	// carries SeededAtBoot=false.
-	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"r1"}]}`), Inputs: &in}, c.CaptureGen(key)) {
+	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"r1"}]}`), Inputs: &in}, c.CaptureGen(key)).Stored() {
 		t.Fatal("SETUP: first refresh refused")
 	}
 	e1, _ := c.GetNoTouch(key)
@@ -279,7 +279,7 @@ func TestIssue496_SeededCellLosesSeedWarmthAtItsFirstRefresh(t *testing.T) {
 	// Age it back into the window from its NEW birth; now the gate must refuse.
 	i496WaitForWindow(t, c, key, e1.BornAt)
 	refusedBefore := c.Stats().RemintRefusedColdTotal
-	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"r2"}]}`), Inputs: &in}, c.CaptureGen(key)) {
+	if !c.replaceIfGenRefresh(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"r2"}]}`), Inputs: &in}, c.CaptureGen(key)).Stored() {
 		t.Fatal("SETUP: second refresh refused")
 	}
 	e2, _ := c.GetNoTouch(key)

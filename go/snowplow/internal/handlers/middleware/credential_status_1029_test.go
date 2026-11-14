@@ -99,7 +99,7 @@ func c1029AssertPlumbingCompatible(t *testing.T, rec *httptest.ResponseRecorder,
 // A krateo:loa:2 token whose step-up Secret is missing: 401, cause
 // StepUpRequired, and the bare RFC 9470 challenge.
 func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
-	session := su994Secret(credsecret.SessionName(su994User), su994Session)
+	session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 	su994Informer(t, session)
 	su994APIServer(t, session)
 
@@ -128,7 +128,7 @@ func TestCredentialStatus1029_StepUpMissingIsStepUpRequired(t *testing.T) {
 // invalid_token challenge (#1076), never the step-up one — even with a step-up
 // Secret for the same user sitting in the informer.
 func TestCredentialStatus1029_SessionMissingIsSessionCredentialMissing(t *testing.T) {
-	stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+	stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 	su994Informer(t, stepUp)
 	su994APIServer(t, stepUp)
 
@@ -165,10 +165,10 @@ func TestCredentialStatus1029_ReReadErrorIs500WithNoCause(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			groups := []string{su994Group}
-			want := credsecret.SessionName(su994User)
+			want := credsecret.SessionNames(su994User)[0]
 			if tc.stepUp {
 				groups = append(groups, credsecret.StepUpGroup)
-				want = credsecret.StepUpName(su994User)
+				want = credsecret.StepUpNames(su994User)[0]
 			}
 			su994Informer(t)
 			su994APIServerFailing(t, map[string]int{want: tc.code})
@@ -299,14 +299,14 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			return tokenServe(bearer("Bearer " + helperMakeToken(t, testUsername, -time.Hour)))(t)
 		},
 		"StepUpRequired": func(t *testing.T) *httptest.ResponseRecorder {
-			session := su994Secret(credsecret.SessionName(su994User), su994Session)
+			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			su994Informer(t, session)
 			su994APIServer(t, session)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, credsecret.StepUpGroup))
 			return rec
 		},
 		"SessionCredentialMissing": func(t *testing.T) *httptest.ResponseRecorder {
-			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			su994Informer(t, stepUp)
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group))
@@ -357,7 +357,7 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 func TestCredentialStatus1029_NearMissGroupIsSessionCause(t *testing.T) {
 	for _, g := range []string{"x-krateo:loa:2", "krateo:loa:2 ", "KRATEO:LOA:2", "krateo:loa:20"} {
 		t.Run(g, func(t *testing.T) {
-			stepUp := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			stepUp := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			su994Informer(t, stepUp)
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group, g))
@@ -375,10 +375,10 @@ func TestCredentialStatus1029_CauseMessageCarriesNoIdentity(t *testing.T) {
 	for _, stepup := range []bool{true, false} {
 		t.Run(map[bool]string{true: "stepup", false: "session"}[stepup], func(t *testing.T) {
 			groups := []string{su994Group}
-			have := su994Secret(credsecret.StepUpName(su994User), su994StepUp)
+			have := su994Secret(credsecret.StepUpNames(su994User)[0], su994StepUp)
 			if stepup {
 				groups = append(groups, credsecret.StepUpGroup)
-				have = su994Secret(credsecret.SessionName(su994User), su994Session)
+				have = su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			}
 			su994Informer(t, have)
 			su994APIServer(t, have)
@@ -400,10 +400,10 @@ func TestCredentialStatus1029_CauseMessageCarriesNoIdentity(t *testing.T) {
 func TestCredentialStatus1029_InformerPathsNeverCarryACause(t *testing.T) {
 	for _, stepup := range []bool{true, false} {
 		groups := []string{su994Group}
-		name := credsecret.SessionName(su994User)
+		name := credsecret.SessionNames(su994User)[0]
 		if stepup {
 			groups = append(groups, credsecret.StepUpGroup)
-			name = credsecret.StepUpName(su994User)
+			name = credsecret.StepUpNames(su994User)[0]
 		}
 		kind := map[bool]string{true: "stepup", false: "session"}[stepup]
 		t.Run(kind+"/hit", func(t *testing.T) {

@@ -121,7 +121,8 @@ item of an iterator stage, and whatever the stage's `continueOnError`:
   `iterator` runs over the refused stage's output: that yields zero items,
   so it has nothing to send and is not listed. A write stage with an item
   that failed on its own (`InvalidPath`, `TemplateError`) reads that
-  failure, not `WriteRefused`. The merged value keeps the header's 4 KiB bound: above
+  failure, not `WriteRefused` (#1347: a failure outranks a by-design
+  code), and its dependent writes read `Skipped`, as in the real run. The merged value keeps the header's 4 KiB bound: above
   it, or when a page already sent the summary, it is
   `{"truncated":true,"failed":N}`, with `N` the number of distinct
   outcomes the pages listed (or a summarised page's own `N`, when larger);

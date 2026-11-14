@@ -43,6 +43,14 @@ type PutGateEffects struct {
 	// snapshot was incomplete, so its body was filtered by it. A hit marks the
 	// hitter so, and the store admits no write of it.
 	StartedIncomplete bool
+	// StageOutcomes (#1319) is the producing resolve's stored
+	// X-Snowplow-Stage-Outcomes value ("" = every stage succeeded). It is no
+	// Put-gate sink and Replay does not touch it: the memo's caller
+	// (apiref.Resolve) records it on a producing resolve and replays it into
+	// the hitter's stage-outcome collector (api.ReplayStageOutcomes), which
+	// this package cannot import. Carried here so a memo hit is
+	// indistinguishable from the resolve it replaces in what the cell stores.
+	StageOutcomes string
 }
 
 // PutGateCapture holds the child sinks a producing resolve runs under.

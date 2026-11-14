@@ -85,11 +85,11 @@ func i1025Setup(t *testing.T) (string, func() []su994Dial) {
 	t.Helper()
 	api, dials := su994Upstream(t)
 	su994Secrets(t, api.URL, map[string]string{
-		credsecret.SessionName(i1025Caller): i1025TokCaller,
-		credsecret.StepUpName(i1025Caller):  i1025TokCallerUp,
-		credsecret.SessionName(i1025Victim): i1025TokVictim,
-		credsecret.StepUpName(i1025Victim):  i1025TokVictimUp,
-		i1025Endpoint:                       i1025TokEndpoint,
+		credsecret.SessionNames(i1025Caller)[0]: i1025TokCaller,
+		credsecret.StepUpNames(i1025Caller)[0]:  i1025TokCallerUp,
+		credsecret.SessionNames(i1025Victim)[0]: i1025TokVictim,
+		credsecret.StepUpNames(i1025Victim)[0]:  i1025TokVictimUp,
+		i1025Endpoint:                           i1025TokEndpoint,
 	})
 	return api.URL, dials
 }
@@ -150,7 +150,7 @@ func i1025AssertRefused(t *testing.T, dials []su994Dial, header, logs, secretNam
 	if strings.Contains(logs, `"secret_name"`) || strings.Contains(logs, redact.Prefixed("secret", secretName)) {
 		t.Fatalf("#1192: the refusal log line carries the Secret name's label; logs=%s", logs)
 	}
-	if wantT :=`"templated":` + map[bool]string{true: "true", false: "false"}[templated]; !strings.Contains(logs, wantT) {
+	if wantT := `"templated":` + map[bool]string{true: "true", false: "false"}[templated]; !strings.Contains(logs, wantT) {
 		t.Fatalf("#1025: the refusal log line lacks %s; logs=%s", wantT, logs)
 	}
 	// Never the Secret name nor the victim's username in clear.
@@ -173,7 +173,7 @@ func i1025AssertRefused(t *testing.T, dials []su994Dial, header, logs, secretNam
 // A1, A2 — a stored RESTAction's LITERAL ref to another user's session or
 // step-up credential is refused.
 func TestIssue1025_A1A2_StoredLiteralPerUserRefRefused(t *testing.T) {
-	for _, name := range []string{credsecret.SessionName(i1025Victim), credsecret.StepUpName(i1025Victim)} {
+	for _, name := range []string{credsecret.SessionNames(i1025Victim)[0], credsecret.StepUpNames(i1025Victim)[0]} {
 		t.Run(name[len(i1025Victim):], func(t *testing.T) {
 			apiURL, dials := i1025Setup(t)
 			before := PerUserRefRefusedSnapshot()
@@ -189,9 +189,9 @@ func TestIssue1025_A1A2_StoredLiteralPerUserRefRefused(t *testing.T) {
 // name that is looked up, never the rendered text.
 func TestIssue1025_A3_StoredTemplatedPerUserRefRefused(t *testing.T) {
 	for _, tc := range []struct{ tmpl, resolved string }{
-		{`${ .want + "-clientconfig" }`, credsecret.SessionName(i1025Victim)},
-		{`${ .want + "-clientconfig-stepup" }`, credsecret.StepUpName(i1025Victim)},
-		{`${ .want + "-ClientConfig-StepUp" }`, credsecret.StepUpName(i1025Victim)},
+		{`${ .want + "-clientconfig" }`, credsecret.SessionNames(i1025Victim)[0]},
+		{`${ .want + "-clientconfig-stepup" }`, credsecret.StepUpNames(i1025Victim)[0]},
+		{`${ .want + "-ClientConfig-StepUp" }`, credsecret.StepUpNames(i1025Victim)[0]},
 	} {
 		t.Run(tc.tmpl, func(t *testing.T) {
 			apiURL, dials := i1025Setup(t)
@@ -206,7 +206,7 @@ func TestIssue1025_A3_StoredTemplatedPerUserRefRefused(t *testing.T) {
 // A4 — an inline (caller-supplied) draft's literal session or step-up ref is
 // refused by the same rule, before the Secret is read as the caller.
 func TestIssue1025_A4_CallerSuppliedPerUserRefRefused(t *testing.T) {
-	for _, name := range []string{credsecret.SessionName(i1025Victim), credsecret.StepUpName(i1025Victim)} {
+	for _, name := range []string{credsecret.SessionNames(i1025Victim)[0], credsecret.StepUpNames(i1025Victim)[0]} {
 		t.Run(name[len(i1025Victim):], func(t *testing.T) {
 			apiURL, dials := i1025Setup(t)
 			var read []string
@@ -309,7 +309,7 @@ func TestIssue1025_A8_UAFStagePerUserRefRefused(t *testing.T) {
 			}
 			t.Cleanup(func() { serviceAccountEndpointFn = prev })
 
-			name := credsecret.StepUpName(i1025Victim)
+			name := credsecret.StepUpNames(i1025Victim)[0]
 			stage := i1025Stage(&templates.Reference{Name: name, Namespace: su994NS})
 			stage.UserAccessFilter = &templates.UserAccessFilterSpec{Verb: "get", Group: "composition.krateo.io", Resource: "fireworksapps"}
 			before := PerUserRefRefusedSnapshot()
@@ -325,7 +325,7 @@ func TestIssue1025_A8_UAFStagePerUserRefRefused(t *testing.T) {
 func TestIssue1025_RuleRefusesEveryProvenance(t *testing.T) {
 	for _, prov := range []Provenance{ProvenanceStored, ProvenanceCallerSupplied} {
 		m := &endpointReferenceMapper{authnNS: su994NS, username: "attacker", provenance: prov}
-		for _, name := range []string{credsecret.SessionName("victim"), credsecret.StepUpName("victim")} {
+		for _, name := range []string{credsecret.SessionNames("victim")[0], credsecret.StepUpNames("victim")[0]} {
 			before := PerUserRefRefusedSnapshot()
 			err := m.refusePerUserRef(&templates.Reference{Name: name, Namespace: su994NS})
 			if !errors.Is(err, ErrPerUserCredentialRef) {

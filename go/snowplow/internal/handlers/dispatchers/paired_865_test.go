@@ -339,7 +339,7 @@ func TestPaired865Customer(t *testing.T) {
 	cache.ResetSecretsInformerForTest()
 	cache.ResetSecretsSnapshotForTest()
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		p865User + "-clientconfig": {ObjectMeta: metav1.ObjectMeta{Namespace: p865AuthnNS, Name: p865User + "-clientconfig"},
+		p865User + "-clientconfig": {ObjectMeta: authnMeta(p865AuthnNS, p865User+"-clientconfig", p865User),
 			Data: map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok-" + p865User)}},
 	}})
 	cache.ForceSecretsCacheReadyForTest(p865AuthnNS)

@@ -31,14 +31,17 @@
 // evaluator's own unexported functions — selectCRBCandidates /
 // selectRBCandidatesAllNS (index pre-filters) gated by anySubjectMatches (the
 // correctness barrier), with effectiveGroups' ServiceAccount synthetic groups —
-// exactly as BuildRequesterProfile does. The one deliberate difference:
-// system:authenticated is ALWAYS added. Every real /call carries a non-empty
-// username (it is JWT-authenticated), so for customers this is identical to the
+// exactly as BuildRequesterProfile does. The one deliberate difference: the
+// apiserver's implicit group (cache.ImplicitGroup) is folded in as a PRESENTED
+// group even for an empty username, via WithAuthenticatedGroup. Every real
+// /call carries a non-empty username, so for customers this is identical to the
 // evaluator. It matters for the prewarm seed, whose group representative is
 // {Username:"", Groups:[g]} (pickRepresentativeFromSubjects): without it the
 // seed would omit the system:authenticated bindings every real member holds and
-// mint a key no customer derives. Treating the representative as
-// authenticated makes seed and customer keys agree (key parity).
+// mint a key no customer derives. Treating the representative as the apiserver
+// treats a member makes seed and customer keys agree (key parity). An identity
+// presenting system:unauthenticated gets no system:authenticated here, in the
+// evaluator, or at the apiserver (#1334).
 //
 // IDENTITY IN THE KEY IS BINDING IDs, NEVER NAMES. The ids are the SOT
 // cache.BindingUIDFromCRB / BindingUIDFromRB forms ("C:<uid>",
@@ -68,10 +71,6 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
-
-// systemAuthenticatedGroup is the implicit group of every authenticated
-// request (Kubernetes auth chain; mirrors anySubjectMatches).
-const systemAuthenticatedGroup = "system:authenticated"
 
 // SubjectBindingSetDigest returns the digest of every binding in the published
 // RBAC snapshot whose subjects match (username, groups), or "" when no snapshot
@@ -130,7 +129,7 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 	if snap == nil {
 		return nil
 	}
-	id := EvaluateOptions{Username: username, Groups: WithAuthenticatedGroup(groups)}
+	id := EvaluateOptions{Username: username, Groups: WithAuthenticatedGroup(username, groups)}
 
 	seen := map[string]struct{}{}
 	var ids []string
@@ -169,10 +168,11 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// WithAuthenticatedGroup returns groups plus system:authenticated (once,
-// de-duplicated, order otherwise preserved). Every real request is
-// authenticated, so this is the requester's EFFECTIVE group set. #424 uses it
-// at three sites that must agree for one identity class: the binding-set digest
+// WithAuthenticatedGroup returns the kube-apiserver's EFFECTIVE group set for
+// (username, groups): groups plus the implicit group the apiserver adds, if any
+// (cache.ImplicitGroup — system:authenticated for every authenticated identity,
+// nothing for one presenting system:unauthenticated, #1334). #424 uses it at
+// three sites that must agree for one identity class: the binding-set digest
 // (above), the RBACSubGen fold (dispatchCacheLookupKey) and the prewarm seed's
 // resolve identity (withCohortSeedContext) — a seed representative with
 // Username=="" would otherwise not match system:authenticated subjects in
@@ -181,8 +181,8 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 //
 // #436: the implementation is cache.WithAuthenticatedGroup, so the reseed
 // reachability predicate (cache.RotatedSubjectSet.Rotated) folds the same set.
-func WithAuthenticatedGroup(groups []string) []string {
-	return cache.WithAuthenticatedGroup(groups)
+func WithAuthenticatedGroup(username string, groups []string) []string {
+	return cache.WithAuthenticatedGroup(username, groups)
 }
 
 // canonicalGroupsKey is an EXACT (collision-free) order-independent encoding of

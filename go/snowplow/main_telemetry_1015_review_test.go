@@ -401,7 +401,7 @@ func TestS1015_DefaultOffContract(t *testing.T) {
 			if (ingest != nil) != tc.wantOn {
 				t.Fatalf("newRUMIngest on=%v, want %v", ingest != nil, tc.wantOn)
 			}
-			mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, ingest)
+			mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, ingest)
 			t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 			want := http.StatusNotFound
 			if tc.wantOn {
@@ -429,7 +429,7 @@ func TestS1015_RouteIsRegisteredScoped(t *testing.T) {
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 
 	missingBefore := cache.AssertReadPathsScoped()
-	mountTelemetryRoute(http.NewServeMux(), use.NewChain(), debugAuthTestKeys, http.NotFoundHandler())
+	mountTelemetryRoute(newRouteTable(http.NewServeMux()), use.NewChain(), debugAuthTestKeys, http.NotFoundHandler())
 	missingAfter := cache.AssertReadPathsScoped()
 	if missingBefore-missingAfter != 1 {
 		t.Fatalf("required scoped routes missing: %d before mounting, %d after; mounting the ingest must register exactly %s",

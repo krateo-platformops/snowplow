@@ -434,7 +434,7 @@ func TestReplay765b_P9_TheAuditCoversAReceiverWidget(t *testing.T) {
 			enc = []byte(`{"forced":"difference"}`)
 		}
 		prior, had := e.store.GetNoTouch(key)
-		stored := e.store.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: enc, Inputs: &in}, gen0)
+		stored := e.store.ReplaceResolvedIfGenRefresh(ctx, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: enc, Inputs: &in}, gen0).Stored()
 		cache.NoteRefreshWrite(ctx, key, stored)
 		cache.NoteNarrowAuditWrite(ctx, key, prior, had, enc, stored)
 		return nil

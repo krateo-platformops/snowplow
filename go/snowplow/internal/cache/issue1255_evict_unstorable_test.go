@@ -386,7 +386,7 @@ func TestIssue1255_U5_TheEvictionReplacesAndPushesAnOpenStaleServe(t *testing.T)
 
 	u1255Put(t, c, u1255Resolve("k"), "k", `{"pre":"edit"}`)
 	// An armed tab was served the cell stale.
-	s := noteStaleServe("k", "subj", layerL1, StalePushNow(), nil)
+	s := noteStaleServe("k", "subj", layerL1, StalePushNow(), nil, nil)
 	if s == nil {
 		t.Fatal("PRECONDITION: the stale serve must open")
 	}

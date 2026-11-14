@@ -181,6 +181,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 
 	apirefStart := time.Now()
 	ds, err := resolveApiRefFn(ctx, opts)
+	// #1319 — the widget's stage outcomes are its apiRef RESTAction's, and that
+	// resolve is over: seal the caller's collector so a resolve that runs later
+	// on this ctx (an inline child's) keeps its own. A widget with no apiRef
+	// has no RESTAction stages and reads complete.
+	api.SealStageOutcomes(ctx)
 	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
 		// #1116 — a reserved-extras refusal is the caller's error, logged once

@@ -193,7 +193,7 @@ func (f *d2Fixture) storeAndCommit(l1Key string) {
 	f.sinksMu.Lock()
 	sink := f.sinks[l1Key]
 	f.sinksMu.Unlock()
-	CommitStaleServe(sink)
+	CommitStaleServe(sink, nil)
 }
 
 func d2WaitDebtsClosed(t *testing.T) {

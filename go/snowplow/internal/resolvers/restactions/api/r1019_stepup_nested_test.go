@@ -41,14 +41,14 @@ func TestR1019_S1_StepUpThroughANestedResolveDialsEachStagesOwnCredential(t *tes
 	}))
 	t.Cleanup(remote.Close)
 	su994Secrets(t, api.URL, map[string]string{
-		credsecret.SessionName(su994User): su994TokSess,
-		credsecret.StepUpName(su994User):  su994TokUp,
+		credsecret.SessionNames(su994User)[0]: su994TokSess,
+		credsecret.StepUpNames(su994User)[0]:  su994TokUp,
 	})
 	// re-publish the snapshot with the named remote endpoint Secret added
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		credsecret.SessionName(su994User): mkSecret(su994NS, credsecret.SessionName(su994User), map[string]string{"server-url": api.URL, "token": su994TokSess}),
-		credsecret.StepUpName(su994User):  mkSecret(su994NS, credsecret.StepUpName(su994User), map[string]string{"server-url": api.URL, "token": su994TokUp}),
-		"remote-994":                      mkSecret(su994NS, "remote-994", map[string]string{"server-url": remote.URL, "token": "TOK-REMOTE-994"}),
+		credsecret.SessionNames(su994User)[0]: authnOwned(mkSecret(su994NS, credsecret.SessionNames(su994User)[0], map[string]string{"server-url": api.URL, "token": su994TokSess}), su994User),
+		credsecret.StepUpNames(su994User)[0]:  authnOwned(mkSecret(su994NS, credsecret.StepUpNames(su994User)[0], map[string]string{"server-url": api.URL, "token": su994TokUp}), su994User),
+		"remote-994":                          mkSecret(su994NS, "remote-994", map[string]string{"server-url": remote.URL, "token": "TOK-REMOTE-994"}),
 	}})
 	cache.ForceSecretsCacheReadyForTest(su994NS)
 

@@ -68,7 +68,7 @@ func cycleEnv(t *testing.T) *ResolvedCacheStore {
 
 // cycleRefreshPut is the refresher terminal write of key with body, on ctx.
 func cycleRefreshPut(c *ResolvedCacheStore, ctx context.Context, key string, in ResolvedKeyInputs, body string) bool {
-	return c.replaceIfGenRefresh(WithL1KeyContext(ctx, key), key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key))
+	return c.replaceIfGenRefresh(WithL1KeyContext(ctx, key), key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)).Stored()
 }
 
 func TestRefreshCycle1070_C1_EveryRefreshPutCountsIdenticalOrChangedPerClass(t *testing.T) {
@@ -303,10 +303,10 @@ func TestRefreshCycle1070_C4_PutToFrameIsRecordedForAnOpenStreamOnly(t *testing.
 	}{{open, openIn}, {absent, absentIn}, {closed, closedIn}} {
 		ctx := WithL1KeyContext(withRefreshCycle(context.Background(), k.key, RefreshTierViewed, windowNow()), k.key)
 		clk.advance(200 * time.Millisecond)
-		if !c.replaceIfGenRefresh(ctx, k.key, &ResolvedEntry{RawJSON: []byte(`{"v":"new"}`), Inputs: &k.in}, c.CaptureGen(k.key)) {
+		if !c.replaceIfGenRefresh(ctx, k.key, &ResolvedEntry{RawJSON: []byte(`{"v":"new"}`), Inputs: &k.in}, c.CaptureGen(k.key)).Stored() {
 			t.Fatal("PRE: refresh Put refused")
 		}
-		PublishRefreshed(ctx, k.key)
+		PublishRefreshed(ctx, k.key, PutChanged)
 	}
 	if got := cycleRecv(t, st); got != open {
 		t.Fatalf("PRE: the open stream was offered another key")
@@ -347,10 +347,10 @@ func TestRefreshCycle1070_C5_ACoalescedPublishKeepsTheEarliestPut(t *testing.T) 
 	t.Cleanup(st.Unsub)
 	put := func(body string) {
 		ctx := WithL1KeyContext(withRefreshCycle(context.Background(), key, RefreshTierNormal, windowNow()), key)
-		if !c.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)) {
+		if !c.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)).Stored() {
 			t.Fatal("PRE: refresh Put refused")
 		}
-		PublishRefreshed(ctx, key)
+		PublishRefreshed(ctx, key, PutChanged)
 	}
 	put(`{"v":1}`) // opens the window, offered at once
 	cycleRecv(t, st)
@@ -466,10 +466,10 @@ func runRefreshCycle(name string, tier refreshTier, identical bool, wait, durati
 	if identical {
 		body = `{"v":"old"}`
 	}
-	if !c.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)) {
+	if !c.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, c.CaptureGen(key)).Stored() {
 		return false
 	}
-	PublishRefreshed(ctx, key)
+	PublishRefreshed(ctx, key, PutChanged)
 	select {
 	case k := <-st.Keys:
 		clock.Add(int64(toFrame))

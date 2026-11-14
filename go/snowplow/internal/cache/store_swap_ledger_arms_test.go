@@ -73,7 +73,7 @@ func newLedgerRig(t *testing.T, n int) *ledgerRig {
 		obj, _ := f.storeObj(in.Namespace + "/" + in.Name)
 		Deps().Record(rctx, key, f.gvr, in.Namespace, in.Name)
 		e := &ResolvedEntry{RawJSON: cellBody(obj), Inputs: &in}
-		stored := r.store.replaceIfGenRefresh(rctx, key, e, gen0)
+		stored := r.store.replaceIfGenRefresh(rctx, key, e, gen0).Stored()
 		NoteRefreshWrite(rctx, key, stored)
 		if stored {
 			PublishRefresh(key) // what resolveAndPopulateL1 does after an accepted re-Put

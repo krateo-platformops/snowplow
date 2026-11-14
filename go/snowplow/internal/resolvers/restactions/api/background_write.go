@@ -57,6 +57,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 var (
@@ -172,6 +173,12 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 	// errorKey value stays the text it always was.
 	r.recordItemErrorAs(StageReasonWriteRefused, sc.dictMu, sc.itemErrs, sc.id, i, call.ErrorKey, msg, msg, itemErr)
 	recordBackgroundWriteRefused(origin)
+	// audit#22 (a) — denied, write_refused, on a resolve somebody asked for
+	// (an export); background work has no requester and gets no record
+	// (stageRecorded).
+	r.auditStageRefusal(gctx, stageRefusal{apiCall: sc.apiCall, method: verb, path: call.Path,
+		ep: &sc.ep, ref: stageEndpointRef(gctx),
+		outcome: audit.OutcomeDenied, reason: audit.DenialWriteRefused})
 	r.log.Debug("write stage refused",
 		slog.String("name", sc.id),
 		slog.String("verb", verb),

@@ -637,11 +637,13 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		// non-empty username; without the explicit group the seeded body would
 		// lack every grant a real member gets through system:authenticated —
 		// a NARROWER body under the very key that member derives (the binding-set
-		// digest always counts system:authenticated). Every real /call is
-		// authenticated, so this is the member's effective group set.
+		// digest counts the apiserver's implicit group). WithAuthenticatedGroup
+		// is the apiserver's rule (#1334), so this is the member's effective
+		// group set — system:authenticated for an authenticated cohort, none for
+		// a cohort presenting system:unauthenticated.
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: cohort.Username,
-			Groups:   rbac.WithAuthenticatedGroup(cohort.Groups),
+			Groups:   rbac.WithAuthenticatedGroup(cohort.Username, cohort.Groups),
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
@@ -1604,6 +1606,10 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	//     POINTER the gate below holds — bump it there, watch the Put decline.
 	//
 	// Behaviour is unchanged: the seam's production value IS widgets.Resolve.
+	// #1319 — the seed's stage outcomes (its widget's apiRef RESTAction's),
+	// kept on the entry so an L1 hit of the seeded cell answers with the header
+	// a cold resolve would have.
+	resCtx, stageOutcomes := restactionsapi.WithStageOutcomes(resCtx)
 	res, err := widgetsResolveFn(resCtx, widgets.ResolveOptions{
 		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
@@ -1668,7 +1674,6 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// seed Put above — HasUAF was stamped from the sink before the Put, so
 	// uafTTLOverrideForEntry yields the short UAF_RESOLVED_TTL_SECONDS for a
 	// narrowed cell and 0 (unchanged, full store TTL) for every other widget.
-	// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
@@ -1682,6 +1687,8 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
 		// keeps a resident cell's own origin on a replace).
 		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #1319 — the widget's apiRef RESTAction's outcomes ("" = complete).
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the

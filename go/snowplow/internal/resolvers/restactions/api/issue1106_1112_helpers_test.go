@@ -135,7 +135,7 @@ func x1106Env(t *testing.T, own string, secrets map[string]map[string]string) {
 		for k, v := range data {
 			d[k] = []byte(v)
 		}
-		by[name] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: x1106NS, Name: name}, Data: d}
+		by[name] = authnOwned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: x1106NS, Name: name}, Data: d}, x1106User)
 	}
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: by})
 	cache.ForceSecretsCacheReadyForTest(x1106NS)

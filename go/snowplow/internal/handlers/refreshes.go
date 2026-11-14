@@ -36,6 +36,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -110,6 +111,12 @@ type subRequest struct {
 	PerPage   int            `json:"perPage"`
 	Page      int            `json:"page"`
 	Extras    map[string]any `json:"extras"`
+	// Held (#1324, optional) is the X-Snowplow-Refresh-Digest the tab's /call
+	// for this widget answered with: what the tab HOLDS. On subscribe a key
+	// whose current served digest differs (or whose cell is gone) gets one
+	// catch-up frame. Absent or "" means no catch-up (today's behaviour). It
+	// is never part of the key derivation.
+	Held string `json:"held,omitempty"`
 }
 
 // Refreshes returns the GET /refreshes SSE handler. It takes no verification
@@ -155,7 +162,7 @@ func Refreshes() http.HandlerFunc {
 		// #819: take the class signal BEFORE deriving, so a class move during
 		// the derivation is re-checked at the first loop turn.
 		classMoved := cache.IdentityClassesMayHaveMoved()
-		armed, rotation, derr := validateSubscription(req)
+		armed, rotation, held, derr := validateSubscription(req)
 		if derr != nil {
 			// #560 — an arrival snowplow refused ITSELF. On the measured
 			// deployment this stays 0 while the ingress cliff (~22 widgets) sits
@@ -272,8 +279,37 @@ func Refreshes() http.HandlerFunc {
 			slog.Int("armed_keys", len(armed)),
 		)
 
-		// #819: only a connection with an identity-bound key can rotate; a
-		// nil channel never fires.
+		// #1324 — the arm catch-up: /refreshes keeps no replay, so a frame
+		// published while this tab's key was not armed (between its /call and
+		// this arm, or while the SPA re-opened its stream on a mount/unmount)
+		// reached nobody. Every key whose `held` digest is not the digest of
+		// what its /call would answer NOW for this identity, or whose cell is
+		// gone, gets exactly one frame, at once. Checked AFTER subscribing, so
+		// a change landing during the check is either seen here or published
+		// to this stream.
+		//
+		// #1325 m1 — CatchUp is the arm's last step and runs on EVERY arm (an
+		// empty behind list included): a key this arm already offered (the #710
+		// owed emit, the #870 ledger arm, a publish since subscribe) is not
+		// offered again, and CatchUp then closes the arm. One arm, at most one
+		// frame per key.
+		//
+		// #1325 m3 — BehindKeys reads on the #101 arm ctx (informer-only), the
+		// same derivation validateSubscription's arm reads use: the invariant
+		// holds by construction if the gate it runs ever grows an objects.Get.
+		cache.NoteRefreshArmHeld(len(held))
+		// #1328 — seed what this tab is served from each gated key (read the
+		// class first: an RBAC change after it moves the class again, and the
+		// classMoved turn below re-checks).
+		rotation.ArmGated()
+		behind := dispatchers.BehindKeys(refreshArmCtx(req), held)
+		if stream.CatchUp != nil {
+			stream.CatchUp(behind)
+		}
+
+		// #819: only a connection with an identity-bound key can rotate, or
+		// (#1328) with a gated key whose served view an RBAC change can move;
+		// a nil channel never fires.
 		if !rotation.Tracking() {
 			classMoved = nil
 		}
@@ -304,6 +340,8 @@ func Refreshes() http.HandlerFunc {
 				if !writeRefreshFrame(writeFrame, stream, k) {
 					return // client write failed or exceeded the deadline — disconnect
 				}
+				// #1328 — the tab's refetch reads at least the view served now.
+				rotation.NoteFrameWritten(k)
 			case <-classMoved:
 				// #819: an RBAC publish or the #682 epoch may have moved this
 				// identity's class. Re-acquire first (coalesced: notes during the
@@ -313,6 +351,12 @@ func Refreshes() http.HandlerFunc {
 				classMoved = cache.IdentityClassesMayHaveMoved()
 				if rotated := rotation.Rotated(); len(rotated) > 0 {
 					stream.Rotated(rotated)
+				}
+				// #1328 — a gated key folds no class and never rotates, but what
+				// THIS identity is served from it can move with the class: one
+				// frame per gated key whose served view is not the tab's.
+				if moved := rotation.GatedMoved(); len(moved) > 0 && stream.GatedMoved != nil {
+					stream.GatedMoved(moved)
 				}
 			case <-heartbeat.C:
 				if !writeFrame(": keepalive\n\n") {
@@ -466,21 +510,30 @@ func readSubscriptionPayload(req *http.Request) ([]byte, error) {
 // validateSubscription (see the comment above readSubscriptionPayload) also
 // returns, since #819, the rotation tracker holding the class each
 // identity-bound armed key was derived under.
-func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, error) {
+// refreshArmCtx is the ctx of every /refreshes arm-time read (#101): the
+// request's, marked informer-only, so no arm read can reach the apiserver
+// fall-through (the route carries UserInfo but no UserConfig). The key
+// derivation (validateSubscription) and the #1324 catch-up check
+// (BehindKeys) both read on it (#1325 m3).
+func refreshArmCtx(req *http.Request) context.Context {
+	return cache.WithInformerOnlyReads(req.Context())
+}
+
+func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.SubscriptionRotationTracker, map[string]dispatchers.HeldDigests, error) {
 	decoded, err := readSubscriptionPayload(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var reqs []subRequest
 	if err := json.Unmarshal(decoded, &reqs); err != nil {
-		return nil, nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
+		return nil, nil, nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
 	}
 	if len(reqs) == 0 {
-		return nil, nil, fmt.Errorf("'sub' payload is an empty array")
+		return nil, nil, nil, fmt.Errorf("'sub' payload is an empty array")
 	}
 	if len(reqs) > refreshSubMaxEntries {
-		return nil, nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
+		return nil, nil, nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
 	}
 
 	// #101: the /refreshes arming reads MUST be informer-only. The route is
@@ -488,10 +541,12 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 	// so subscriptionKeyExtras's per-coord objects.Get cannot reach the apiserver
 	// fall-through without dying at the endpoint read (378-error storm). The
 	// marker makes an informer GET-miss a quiet NotFound-shaped skip instead.
-	armCtx := cache.WithInformerOnlyReads(req.Context())
+	armCtx := refreshArmCtx(req)
 
 	rotation := dispatchers.NewSubscriptionRotationTracker(armCtx)
 	armed := make(map[string]struct{}, len(reqs))
+	// #1324 — the digests the tab holds, per armed key (only non-empty ones).
+	held := map[string]dispatchers.HeldDigests{}
 	var skippedInformerMiss, skippedOther int
 	for _, s := range reqs {
 		key, ok, reason := rotation.Derive(armCtx, dispatchers.SubscriptionCoordinates{
@@ -516,6 +571,12 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 			continue
 		}
 		armed[key] = struct{}{}
+		if s.Held != "" { // absent or "" — no catch-up for this coordinate
+			h := held[key]
+			h.Class = s.Class
+			h.Digests = append(h.Digests, s.Held)
+			held[key] = h
+		}
 	}
 
 	// #101 ARM condition: per-subscription INFO summary REPLACING the per-coord
@@ -531,7 +592,7 @@ func validateSubscription(req *http.Request) (map[string]struct{}, *dispatchers.
 		slog.Int("skipped_informer_miss", skippedInformerMiss),
 		slog.Int("skipped_other", skippedOther),
 	)
-	return armed, rotation, nil
+	return armed, rotation, held, nil
 }
 
 // writeRefreshFrame writes k's refresh frame and, only when the write

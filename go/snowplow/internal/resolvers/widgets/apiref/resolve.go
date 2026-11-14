@@ -17,6 +17,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/client-go/rest"
 )
 
@@ -350,6 +351,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	var memoEffects *cache.PutGateCapture
 	// memoProduce is the miss's measurement-only in-flight record.
 	var memoProduce *cache.MemoProduce
+	// #1319 — the producing resolve's own stage outcomes (a child collector),
+	// stored with the memo entry; outcomesCtx is the caller's ctx, whose
+	// collector a hit (or the producer, when it returns) reports into.
+	var memoOutcomes *api.StageOutcomes
+	outcomesCtx := ctx
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
@@ -366,6 +372,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// write mark, UAF refilters) onto THIS caller's sinks, so every Put rule
 			// judges the memo-served body exactly as it judged the producer's.
 			effects.Replay(ctx)
+			// #1319 — and report the producer's stage outcomes as this
+			// resolve's, so the widget cell the hitter stores (and its /call
+			// header) reads exactly what the producer's did.
+			api.ReplayStageOutcomes(ctx, effects.StageOutcomes)
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
@@ -413,6 +423,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// out of the per-pass memo itself); every sibling re-resolves live.
 		ctx, memoSensitive = cache.WithSensitiveTouchedSink(ctx)
 		ctx, memoEffects = cache.WithPutGateEffectsCapture(ctx)
+		// #1319 — the producer reports into a child collector so the memo can
+		// store its outcomes; when this resolve returns, error or not, they are
+		// handed to the caller's collector exactly as a direct resolve would
+		// have reported them.
+		ctx, memoOutcomes = api.WithStageOutcomes(ctx)
+		defer func() { api.ReplayStageOutcomes(outcomesCtx, api.StorableStageOutcomes(memoOutcomes)) }()
 	}
 
 	// storeMemo stores the resolved body ENCODED (#883 F4), closes the edge-3
@@ -458,8 +474,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			encoded = b
 		}
 		memoProduce.Produced(deps, memoStamp) // measurement only: what a joiner would have taken
+		effects := memoEffects.Effects()
+		effects.StageOutcomes = api.StorableStageOutcomes(memoOutcomes) // #1319
 		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark),
-			memoEffects.Effects())
+			effects)
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef

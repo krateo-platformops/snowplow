@@ -110,6 +110,19 @@ type EvaluateOptions struct {
 	// not carry would match a rule the apiserver never matches.
 	Name string
 
+	// NonResourcePath (#1362), when non-empty, makes this a NON-RESOURCE check:
+	// the request path the apiserver authorizes a request outside /api and
+	// /apis with (RequestInfo.Path, IsResourceRequest=false). Group, Resource,
+	// Namespace and Name must then be empty (EvaluateRBAC refuses a check that
+	// carries any: ErrMalformedNonResourceCheck), and Verb is the lowercase
+	// HTTP method.
+	// A rule permits it as upstream RuleAllows does for a non-resource request:
+	// the verb matches and one of the rule's nonResourceURLs matches the path
+	// (NonResourceURLMatches: "*", exact, or a trailing-"*" prefix). Only
+	// ClusterRoleBindings can grant it: with Namespace "" no RoleBinding is
+	// visited, as upstream. Build it with NonResourceCheck, never by hand.
+	NonResourcePath string
+
 	// SkipBindingUID, when true, lets the evaluator SKIP the
 	// (Name, UID) stable-sort of the CRB/RB candidate sets
 	// (sortCRBsStable / sortRBsStable). That sort exists ONLY to make
@@ -240,6 +253,17 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		(*h)(ctx, snap, opts, allowed)
 	}()
 
+	// #1362: a non-resource request has no namespace and no resource
+	// attributes, so upstream visits ClusterRoleBindings only. A check that
+	// carries both is malformed. It is refused here, in both modes, and not
+	// left to the field's doc comment: with a Namespace the walk below would
+	// also visit that namespace's RoleBindings, which the apiserver never
+	// does for a non-resource request.
+	if opts.NonResourcePath != "" &&
+		(opts.Namespace != "" || opts.Group != "" || opts.Resource != "" || opts.Name != "") {
+		return false, "", ErrMalformedNonResourceCheck
+	}
+
 	if cache.Disabled() {
 		// Cache=off correctness baseline: a SelfSubjectAccessReview with
 		// the user's endpoint from ctx. No BindingUID is available (no
@@ -249,7 +273,12 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		// path honours is denied here; #1049 — it carries a list's
 		// field-selector Name, which re-deriving it from the verb would
 		// drop.
-		return selfSubjectAccessReview(ctx, opts), "", nil
+		//
+		// #1362: a review that could not be answered is returned as an
+		// error, not as a deny. Every caller fails closed on an error, and the
+		// /debug gate turns it into a 503.
+		ok, sarErr := selfSubjectAccessReview(ctx, opts)
+		return ok, "", sarErr
 	}
 
 	rw := cache.Global()
@@ -264,7 +293,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, "", fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
+		return false, "", ErrWatcherNotWired
 	}
 
 	// Ship B (0.30.138, AC-B.3) — SINGLE rbacSnap.Load() at the top of
@@ -281,7 +310,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, "", fmt.Errorf("rbac: snapshot not yet built")
+		return false, "", ErrSnapshotNotBuilt
 	}
 
 	// Ship L2 (0.30.253) — snapshot-generation authz memo. Sits AFTER the
@@ -305,7 +334,10 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (allowed bool, matc
 		Resource:   opts.Resource,
 		Namespace:  opts.Namespace,
 		Name:       opts.Name,
-		SkipUID:    opts.SkipBindingUID,
+		// #1362: a non-resource verdict is about one path. Without it here, a
+		// permit for /debug/vars would be served for /debug/apistage.
+		NonResourcePath: opts.NonResourcePath,
+		SkipUID:         opts.SkipBindingUID,
 	}
 	if v, ok := authzMemoLookup(snap.PublishSeq, memoKey); ok {
 		// #261 case-2 — a memo HIT is the HOT at-risk serve path; surface the
@@ -500,6 +532,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 // the first matching subject wins).
 func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) WinningSubjectClass {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	implicit := implicitGroup(opts)
 	for _, s := range subjects {
 		switch s.Kind {
 		case rbacv1.UserKind:
@@ -520,9 +553,9 @@ func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) Win
 			if isSA && (s.Name == allServiceAccountsGroup || s.Name == serviceAccountsNamespacePfx+saNS) {
 				return SubjectClassImplicitGroup
 			}
-			// system:authenticated is an IMPLICIT group for every authenticated
-			// request (mirrors anySubjectMatches' username-gated branch).
-			if s.Name == "system:authenticated" && opts.Username != "" {
+			// The apiserver's implicit group (implicitGroup — mirrors
+			// anySubjectMatches' branch) is an IMPLICIT match.
+			if implicit != "" && s.Name == implicit {
 				return SubjectClassImplicitGroup
 			}
 		case rbacv1.ServiceAccountKind:
@@ -578,10 +611,10 @@ func sortRBsStable(rbs []*rbacv1.RoleBinding) {
 //     effectiveGroups adds the synthetic system:serviceaccounts groups
 //     for SA identities, evaluate.go:451-462 — REUSED here so the index
 //     and the matcher agree on group expansion)
-//  3. CRBsByGroup["system:authenticated"]                (implicit group;
-//     mirrors anySubjectMatches' s.Name == "system:authenticated" branch.
-//     The matcher requires opts.Username != "", so we only include this
-//     index landing when the request is authenticated.)
+//  3. CRBsByGroup[implicitGroup(opts)]                   (the apiserver's
+//     implicit group — system:authenticated for an authenticated request;
+//     none for an empty username or one presenting system:unauthenticated,
+//     #1334. Same predicate as anySubjectMatches' implicit branch.)
 //  4. CRBsByServiceAccount["<ns>/<name>"]                (SA subjects;
 //     only when opts.Username is a canonical SA)
 //  5. CRBsCatchAll                                        (unrecognised
@@ -628,12 +661,12 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 	for _, g := range groups {
 		add(snap.CRBsByGroup[g])
 	}
-	// system:authenticated is implicit for every authenticated request.
-	// anySubjectMatches gates this on opts.Username != "" — mirror that
-	// here so we don't include the implicit-group landing for an empty
-	// (unauthenticated) identity.
-	if opts.Username != "" {
-		add(snap.CRBsByGroup["system:authenticated"])
+	// The apiserver's implicit group (implicitGroup: system:authenticated
+	// for an authenticated request, none for an empty username or one
+	// presenting system:unauthenticated, #1334) — the SAME predicate
+	// anySubjectMatches uses, so the index landing and the matcher agree.
+	if ig := implicitGroup(opts); ig != "" {
+		add(snap.CRBsByGroup[ig])
 	}
 	if isSA {
 		add(snap.CRBsByServiceAccount[saNS+"/"+saName])
@@ -697,10 +730,10 @@ func routeRBSubjects(
 	for _, g := range groups {
 		add(byGroup[g])
 	}
-	// system:authenticated is implicit for every authenticated request;
-	// mirror anySubjectMatches by gating it on a non-empty username.
-	if opts.Username != "" {
-		add(byGroup["system:authenticated"])
+	// The apiserver's implicit group — the same implicitGroup predicate
+	// anySubjectMatches uses (#1334).
+	if ig := implicitGroup(opts); ig != "" {
+		add(byGroup[ig])
 	}
 	if isSA {
 		add(byServiceAccount[saNS+"/"+saName])
@@ -866,9 +899,23 @@ func roleRefPermits(ctx context.Context, snap *cache.RBACSnapshot, namespace str
 // the Kubernetes `ResourceNameMatches` semantics — see its doc comment.
 // Before 0.30.109 this check was absent: a resourceNames-scoped rule
 // over-exposed every object (cross-user leak in filterListByRBAC).
+//
+// #1362 — a non-resource check (opts.NonResourcePath != "") is upstream
+// RuleAllows' other branch: VerbMatches && NonResourceURLMatches, and nothing
+// else. The resource fields are NOT consulted for it. Otherwise the empty
+// Group/Resource of a non-resource check would match a rule's "*" apiGroups
+// and resources, and `resources: ["*"]` (the snowplow SA's own read rule, or
+// any wildcard reader) would grant every /debug path, which the apiserver
+// never allows.
 func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	for _, rule := range rules {
 		if !stringSliceMatches(rule.Verbs, opts.Verb) {
+			continue
+		}
+		if opts.NonResourcePath != "" {
+			if nonResourceURLMatches(rule.NonResourceURLs, opts.NonResourcePath) {
+				return true
+			}
 			continue
 		}
 		if !stringSliceMatches(rule.APIGroups, opts.Group) {
@@ -938,6 +985,24 @@ func resourceNameMatches(rule rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	return false
 }
 
+// nonResourceURLMatches is Kubernetes' NonResourceURLMatches for one
+// PolicyRule's nonResourceURLs (pkg/apis/rbac/v1 evaluation_helpers.go),
+// exactly: "*" matches every path, an exact entry matches itself, and an entry
+// ending in "*" matches every path that starts with what precedes the "*"
+// (strings.TrimRight, so "/debug/**" is the same as "/debug/*"). "/debug/*"
+// therefore matches "/debug/vars" and "/debug/pprof/heap", but not "/debug".
+func nonResourceURLMatches(ruleURLs []string, path string) bool {
+	for _, u := range ruleURLs {
+		if u == rbacv1.NonResourceAll || u == path {
+			return true
+		}
+		if strings.HasSuffix(u, "*") && strings.HasPrefix(path, strings.TrimRight(u, "*")) {
+			return true
+		}
+	}
+	return false
+}
+
 // stringSliceMatches implements the RBAC wildcard rule: "*" matches
 // every value; otherwise an exact match is required.
 func stringSliceMatches(allowed []string, want string) bool {
@@ -967,6 +1032,7 @@ func stringSliceMatches(allowed []string, want string) bool {
 func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
 	groups := effectiveGroups(opts, isSA, saNS)
+	implicit := implicitGroup(opts)
 
 	for _, s := range subjects {
 		switch s.Kind {
@@ -980,10 +1046,11 @@ func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 					return true
 				}
 			}
-			// Every authenticated request gains the
-			// system:authenticated group implicitly (Kubernetes
-			// auth chain).
-			if s.Name == "system:authenticated" && opts.Username != "" {
+			// The apiserver's implicit group (system:authenticated
+			// for an authenticated request, none for one presenting
+			// system:unauthenticated, #1334). Username=="" is "no
+			// requester": no implicit group.
+			if implicit != "" && s.Name == implicit {
 				return true
 			}
 		case rbacv1.ServiceAccountKind:
@@ -1001,6 +1068,23 @@ const (
 	allServiceAccountsGroup     = "system:serviceaccounts"
 	serviceAccountsNamespacePfx = "system:serviceaccounts:"
 )
+
+// implicitGroup is the group the kube-apiserver adds to opts' requester
+// (cache.ImplicitGroup: system:authenticated unless the user is
+// system:anonymous or the groups already name system:authenticated or
+// system:unauthenticated; system:unauthenticated for system:anonymous), or ""
+// for none. Username=="" is "no requester" and gets none — the prewarm group
+// representative carries system:authenticated as a presented group instead
+// (WithAuthenticatedGroup). The ONE place the evaluator decides that a
+// requester is authenticated (#1334): anySubjectMatches, firstMatchSubjectClass
+// and both candidate selectors read it, so the index route and the matcher
+// cannot disagree.
+func implicitGroup(opts EvaluateOptions) string {
+	if opts.Username == "" {
+		return ""
+	}
+	return cache.ImplicitGroup(opts.Username, opts.Groups)
+}
 
 // effectiveGroups returns the group set used for Group-subject matching.
 // It is opts.Groups plus, when the request identity is a canonical

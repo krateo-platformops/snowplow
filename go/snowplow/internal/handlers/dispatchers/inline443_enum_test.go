@@ -69,15 +69,19 @@ var cacheAllow443 = map[string]cacheClass443{
 	"DepTracker.RecordList": gatedInCache443,
 	// #603 PR-2 SHADOW: RecordListNarrowable checks Inert itself; the commit
 	// and the widen are ctx-less and run only from commitNarrow, which checks it.
-	"DepTracker.RecordListNarrowable":        gatedInCache443,
-	"DepTracker.CommitListInterest":          gatedAtCaller443,
-	"DepTracker.WidenListInterest":           gatedAtCaller443,
-	"ListNarrowShadowOn":                     readOnly443,
-	"CommitWhyOfAnalysis":                    readOnly443,
-	"DepTracker.ReplayEdgesWithStates":       gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
-	"DepTracker.ReleaseUnstored":             gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
-	"ResolvedCacheStore.PutContentIfGen":     gatedInCache443,
-	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
+	"DepTracker.RecordListNarrowable":              gatedInCache443,
+	"DepTracker.CommitListInterest":                gatedAtCaller443,
+	"DepTracker.WidenListInterest":                 gatedAtCaller443,
+	"ListNarrowShadowOn":                           readOnly443,
+	"CommitWhyOfAnalysis":                          readOnly443,
+	"DepTracker.ReplayEdgesWithStates":             gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
+	"DepTracker.ReleaseUnstored":                   gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
+	"ResolvedCacheStore.PutContentIfGen":           gatedInCache443,
+	"ResolvedCacheStore.PutRAFullListIfGenOutcome": gatedInCache443, // #1321: PutRAFullListIfGen reporting its outcome; same Inert check (putRAFullListIfGen)
+	"PutOutcome.Stored":                            readOnly443,
+	// #1321 — publishes only a STORED outcome, and an inert resolve stores nothing
+	// (#443 (a)): under the flag it is always handed PutRefused and returns.
+	"PublishPutIfSubscribed":                 unreachableInert443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
 	// #1255 — an unstorable decline evicts the older cell; both refuse an inert ctx.
 	"ResolvedCacheStore.EvictOnPermanentDecline": gatedInCache443,
@@ -216,6 +220,13 @@ var cacheAllow443 = map[string]cacheClass443{
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
+	// #1321 — the D2 replace's publish gate: the served body (a sink read), the
+	// cell's bytes (a stored entry's body, never mutated), whether the key is
+	// still owed a push (a map read). SettleStaleOwed clears an owed mark: only
+	// finishStaleReplace reaches it, on a debt serveStaleWithDebt's cache.Inert
+	// check let open (like PublishRefresh).
+	"StaleServeSink.ServedBody": readOnly443, "ResolvedEntry.Raw": readOnly443, "StaleOwed": readOnly443,
+	"SettleStaleOwed": unreachableInert443,
 	// #930 — reads the dirty-window clock (an atomic pointer load, time.Now by
 	// default) to age a known-stale mark; no state is written.
 	"DirtyWindowNow": readOnly443,
@@ -260,6 +271,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	"FallthroughReasonOf": readOnly443, "WithFallthroughReason": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
+	// #1334 — the apiserver's group rule over (username, groups): a pure function.
+	"Authenticated": readOnly443,
 	// #561 removed "WithInformerOnlyReads" from this table when it deleted
 	// #403's informer-only UAF pre-check read. #594 PUTS IT BACK, for a
 	// different read on the same path: apiref.DeclaresExternalEndpoint, the
@@ -305,6 +318,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
 	// demand revalidation, the background hop). Pure ctx reads.
 	"NonCustomerWriteOrigin": readOnly443,
+	// AUDIT-4 (audit#22) — "does this resolve have a requester?" for a stage's
+	// audit record (stage_audit.go stageRecorded): every non-customer origin
+	// NonCustomerWriteOrigin reads, walked in its order. Pure ctx reads.
+	"EachNonCustomerOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.

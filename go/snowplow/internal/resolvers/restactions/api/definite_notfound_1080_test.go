@@ -37,7 +37,6 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -151,7 +150,7 @@ func resolveAsUser1080(t *testing.T, url string, stages ...*templates.API) (map[
 	cache.ResetSecretsSnapshotForTest()
 	secret := kubeutil.MakeDNS1123Compatible(snt681User) + "-clientconfig"
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		secret: {ObjectMeta: metav1.ObjectMeta{Namespace: "krateo-system", Name: secret},
+		secret: {ObjectMeta: authnMeta("krateo-system", secret, snt681User),
 			Data: map[string][]byte{"server-url": []byte(url), "token": []byte("tok")}},
 	}})
 	cache.ForceSecretsCacheReadyForTest("krateo-system")

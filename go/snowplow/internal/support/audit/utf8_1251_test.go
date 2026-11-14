@@ -92,7 +92,7 @@ func (c *collector1251) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func userCtx1251(name string) context.Context {
 	return xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: name, Groups: []string{"devs"}}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: name, Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}))
 }
 
 // edgeCtx1251 is ctx as audit.Middleware leaves it for req.
@@ -117,7 +117,7 @@ func TestUTF8_1251_X_OneBadRecordDoesNotLoseTheBatch(t *testing.T) {
 	good := func(user string) {
 		req := httptest.NewRequest(http.MethodPost, "/call/dry-run?name=cm-ok", nil)
 		req.Header.Set("User-Agent", "portal/1.0")
-		e.Emit(edgeCtx1251(userCtx1251(user), req), Event{Action: "call", Verb: http.MethodPost, Resource: "configmaps", Name: "cm-ok", Outcome: "success"})
+		e.Emit(edgeCtx1251(userCtx1251(user), req), Event{Action: "call", HTTPMethod: http.MethodPost, Verb: "create", Resource: "configmaps", ObjectName: "cm-ok", Outcome: "success"})
 	}
 	// The bad record: every way a request can carry bytes that are not UTF-8.
 	bad := httptest.NewRequest(http.MethodPost, "/call/dry-run?name=x", nil)
@@ -127,10 +127,10 @@ func TestUTF8_1251_X_OneBadRecordDoesNotLoseTheBatch(t *testing.T) {
 
 	good("alice-1251")
 	e.Emit(edgeCtx1251(userCtx1251("bob-1251"), bad), Event{
-		Action: "call", Verb: http.MethodPost, Resource: "configmaps",
-		Name:    "cm-\xff",                // name=cm-%FF, decoded (already possible on main)
-		Message: "upstream said \xfe\xff", // the record body
-		Outcome: "failure", Code: http.StatusNotFound,
+		Action: "call", HTTPMethod: http.MethodPost, Verb: "create", Resource: "configmaps",
+		ObjectName: "cm-\xff",                // name=cm-%FF, decoded (already possible on main)
+		Message:    "upstream said \xfe\xff", // the record body
+		Outcome:    "failure", StatusCode: http.StatusNotFound,
 	})
 	good("carol-1251")
 
@@ -181,12 +181,15 @@ func TestUTF8_1251_C_UserAgentCutOnACharacterBoundary(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Fatalf("the cut split a character: %q", got[len(got)-20:])
 	}
-	if want := strings.Repeat("a", 1023) + userAgentTruncateSuffix; got != want {
-		t.Fatalf("user_agent.original ends %q, want 1023 a's then %q", got[len(got)-20:], userAgentTruncateSuffix)
+	const suffix = "...TRUNCATED" // the apiserver's userAgentTruncateSuffix
+	if want := strings.Repeat("a", 1023) + suffix; got != want {
+		t.Fatalf("user_agent.original ends %q, want 1023 a's then %q", got[len(got)-20:], suffix)
 	}
 	// A run of invalid bytes past the bound: replaced, then cut, still bounded.
-	got = truncateUserAgent(strings.Repeat("\xff", 2000))
-	if !utf8.ValidString(got) || len(got) > maxUserAgentLength+len(userAgentTruncateSuffix) {
+	req = httptest.NewRequest(http.MethodGet, "/export?name=x", nil)
+	req.Header.Set("User-Agent", strings.Repeat("\xff", 2000))
+	got = serveAndEmit(t, req, nil)[AttrUserAgent].AsString()
+	if !utf8.ValidString(got) || len(got) > 1024+len(suffix) {
 		t.Fatalf("invalid bytes past the bound: %d bytes, valid %t", len(got), utf8.ValidString(got))
 	}
 }
@@ -195,8 +198,8 @@ func TestUTF8_1251_R_RawBytesOverTCPReachTheRecordAsReplacement(t *testing.T) {
 	rec := logtest.NewRecorder()
 	e := New(rec.Logger("test-1251"))
 	srv := httptest.NewServer(Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := xcontext.BuildContext(r.Context(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice"}))
-		e.Emit(ctx, Event{Action: "export", Verb: r.Method, Resource: "restactions", Name: r.URL.Query().Get("name"), Outcome: "success"})
+		ctx := xcontext.BuildContext(r.Context(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman}))
+		e.Emit(ctx, Event{Action: "export", HTTPMethod: r.Method, Verb: "get", Resource: "restactions", ObjectName: r.URL.Query().Get("name"), Outcome: "success"})
 		w.WriteHeader(http.StatusOK)
 	})))
 	t.Cleanup(srv.Close)

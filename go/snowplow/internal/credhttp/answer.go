@@ -127,21 +127,46 @@ func sendRefusal(err error) string {
 //
 //   - a 2xx is a success with its real code: the write was accepted, even when
 //     snowplow did not use the body (the note says so);
-//   - a dial snowplow ended itself (the destination policy, the page budget) is
-//     a failure with no code and the refusal's own message;
+//   - a dial snowplow's destination policy refused was never sent: snowplow
+//     itself refused, which is what the schema's denied means (#1291), so it is
+//     denied, with no code (no authority answered; audit#13) and the refusal's
+//     own message, and its reason is destination_refused (OutcomeWithReason,
+//     audit v0.12.0);
+//   - a dial the page budget ended is a failure with no code and the budget's
+//     own message: it ran out of time, nothing refused it;
 //   - anything else is a failure with audit.FailureMessage of the observed code
-//     (0 = no response; a 3xx = the redirect snowplow refused).
+//     (0 = no response; a 3xx = the redirect snowplow refused, which an
+//     authority did answer, so it keeps its code).
 //
 // A nil Answer (no observer) reads as no response.
 func (a *Answer) Outcome() (outcome string, code int, message string) {
+	outcome, code, message, _ = a.OutcomeWithReason()
+	return outcome, code, message
+}
+
+// OutcomeWithReason is Outcome plus, on a denied outcome, why snowplow refused
+// (krateo.audit.denial_reason, audit v0.12.0): the destination policy's
+// refusal is destination_refused. "" on any other outcome.
+func (a *Answer) OutcomeWithReason() (outcome string, code int, message, reason string) {
+	outcome, code, message = a.outcome()
+	if outcome == audit.OutcomeDenied {
+		reason = audit.DenialDestinationRefused
+	}
+	return outcome, code, message, reason
+}
+
+func (a *Answer) outcome() (outcome string, code int, message string) {
 	if a == nil {
-		return "failure", 0, audit.FailureMessage(0)
+		return audit.OutcomeFailure, 0, audit.FailureMessage(0)
 	}
 	if a.code >= 200 && a.code < 300 {
-		return "success", a.code, a.bodyNote
+		return audit.OutcomeSuccess, a.code, a.bodyNote
+	}
+	if a.code == 0 && a.refusal == audit.MessageDestinationRefused {
+		return audit.OutcomeDenied, 0, a.refusal
 	}
 	if a.code == 0 && a.refusal != "" {
-		return "failure", 0, a.refusal
+		return audit.OutcomeFailure, 0, a.refusal
 	}
-	return "failure", a.code, audit.FailureMessage(a.code)
+	return audit.OutcomeFailure, a.code, audit.FailureMessage(a.code)
 }

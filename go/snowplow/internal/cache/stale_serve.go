@@ -30,6 +30,7 @@
 package cache
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
@@ -55,6 +56,8 @@ type StaleServeSink struct {
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
+	// servedBody (#1321) is the stale-derived body the committed response wrote.
+	servedBody []byte
 	// wrote (#905): a write stage of this resolve was sent. From then on no read
 	// of it is served stale (NoteIfNoWrite refuses, under the lock BeginWrite
 	// takes), so it can never be withdrawn and re-run, which would send the
@@ -304,11 +307,25 @@ func (s *StaleServeSink) ServedAt() time.Time {
 	return s.servedAt
 }
 
+// ServedBody is the stale-derived body the committed response wrote (nil
+// before Commit). Nil-safe. #1321: the dependent's replace publishes no frame
+// when the cell then holds exactly these bytes.
+func (s *StaleServeSink) ServedBody() []byte {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.servedBody
+}
+
 // Commit is the dispatcher's accepted-Put outcome for a stale-derived
 // response: it sets the key's owed-push mark and reports whether a content
 // debt already cleared (the caller then replaces the cell now). False after a
-// withdrawal or a previous commit.
-func (s *StaleServeSink) Commit() (replaceNow bool) {
+// withdrawal or a previous commit. body is the stale-derived body the response
+// writes (the bytes its accepted Put stored): #1321 — a replacement with the
+// same bytes owes this client no frame (ServedBody, the ledger, the owed mark).
+func (s *StaleServeSink) Commit(body []byte) (replaceNow bool) {
 	if s == nil {
 		return false
 	}
@@ -317,6 +334,7 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 		s.mu.Unlock()
 		return false
 	}
+	s.servedBody = body
 	// #1062 — the stale-derived body is about to be written under its armed
 	// key: one apistage stale serve, timed from the D2 serve until the frame
 	// that follows its replacement is written to a stream (stale_push.go).
@@ -330,7 +348,7 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 	// staleDebtsMu → s.mu (serveStaleWithDebt). It cannot invert: the ledger's lock
 	// is a leaf (stale_push.go), and noteStaleServeNow takes no other lock, so
 	// nothing under s.mu ever waits on staleDebtsMu.
-	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, s.servedAt)
+	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, s.servedAt, body)
 	s.state = staleSinkCommitted
 	replaceNow = s.replaceOnCommit
 	served := append([]staleServedRef(nil), s.served...)
@@ -338,7 +356,7 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 	if fn := staleCommitVisibleHookForTest.Load(); fn != nil {
 		(*fn)()
 	}
-	MarkStaleOwed(s.l1Key)
+	MarkStaleOwed(s.l1Key, body)
 	// The stale bodies are now written: count their reads as this request's
 	// hits, exactly once (a withdrawn pass never reaches here), through the one
 	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547
@@ -416,16 +434,24 @@ var (
 	staleOwedDropped   atomic.Uint64
 	staleOwedArmEmits  atomic.Uint64
 	staleOwedDelivered atomic.Uint64
+	staleOwedSettled   atomic.Uint64 // #1321
 )
 
 // staleOwedMark is one owed push. Its timing lives in the stale-push ledger
 // (stale_push.go, #1062): the mark only carries the push to a late arm.
+//
+// #1321 — body is the stale-derived body every response under the mark was
+// written with; mixed is set once two different (or unknown) bodies were. A
+// replacement with exactly body owes nobody a frame (SettleStaleOwed).
 type staleOwedMark struct {
-	key string
+	key   string
+	body  []byte
+	mixed bool
 }
 
-// MarkStaleOwed sets key's owed-push mark.
-func MarkStaleOwed(key string) {
+// MarkStaleOwed sets key's owed-push mark for a stale-derived response written
+// with body (nil: unknown).
+func MarkStaleOwed(key string, body []byte) {
 	if key == "" {
 		return
 	}
@@ -437,9 +463,12 @@ func MarkStaleOwed(key string) {
 	defer staleOwedMu.Unlock()
 	if e, ok := staleOwed[key]; ok {
 		staleOwedOrder.MoveToBack(e)
+		if m := e.Value.(*staleOwedMark); body == nil || !bytes.Equal(m.body, body) {
+			m.mixed, m.body = true, nil
+		}
 		return
 	}
-	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key})
+	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key, body: body, mixed: body == nil})
 	for staleOwedOrder.Len() > limit {
 		front := staleOwedOrder.Front()
 		staleOwedOrder.Remove(front)
@@ -485,6 +514,33 @@ func clearStaleOwed(key string) bool {
 	return true
 }
 
+// SettleStaleOwed clears key's owed-push mark when every response under it was
+// written with exactly cur — the bytes the cell now holds, no longer
+// stale-derived — and reports whether it did (#1321). Those clients hold the
+// current bytes, so no push is owed and none is published (finishStaleReplace);
+// without this the mark would wait for an arm or the capacity bound, and a
+// capacity drop reads as a guarantee failure (staleOwedDropped). A mark whose
+// bodies differ (mixed) or whose body differs from cur stays.
+func SettleStaleOwed(key string, cur []byte) bool {
+	if key == "" || cur == nil {
+		return false
+	}
+	staleOwedMu.Lock()
+	defer staleOwedMu.Unlock()
+	e, ok := staleOwed[key]
+	if !ok {
+		return false
+	}
+	m := e.Value.(*staleOwedMark)
+	if m.mixed || !bytes.Equal(m.body, cur) {
+		return false
+	}
+	staleOwedOrder.Remove(e)
+	delete(staleOwed, key)
+	staleOwedSettled.Add(1)
+	return true
+}
+
 // noteStaleOwedArmEmit is the arm-time delivery of an owed push: it clears
 // the mark and counts the emit. Its stale_to_push (now − the serve: the tab
 // showed the stale body all that time, #710 F2) is recorded when the handler
@@ -509,9 +565,10 @@ func noteRefreshFanout(key string, offered int) {
 
 // StaleOwedStats is the owed-mark family: open marks, marks dropped by the
 // capacity bound (a guarantee failure), pushes emitted at arm time, and marks
-// cleared by a delivered publish.
+// cleared by a delivered publish, and (#1321) marks settled because the
+// replacement's bytes equal every body written under them (no push owed).
 type StaleOwedStats struct {
-	Open, Dropped, ArmEmits, Delivered uint64
+	Open, Dropped, ArmEmits, Delivered, Settled uint64
 }
 
 // StaleOwedStatsSnapshot reads the owed-mark family.
@@ -520,7 +577,8 @@ func StaleOwedStatsSnapshot() StaleOwedStats {
 	open := uint64(len(staleOwed))
 	staleOwedMu.Unlock()
 	return StaleOwedStats{Open: open, Dropped: staleOwedDropped.Load(),
-		ArmEmits: staleOwedArmEmits.Load(), Delivered: staleOwedDelivered.Load()}
+		ArmEmits: staleOwedArmEmits.Load(), Delivered: staleOwedDelivered.Load(),
+		Settled: staleOwedSettled.Load()}
 }
 
 // ResetStaleOwedForTest drops every mark and zeroes the family. Production
@@ -533,6 +591,7 @@ func ResetStaleOwedForTest() {
 	staleOwedDropped.Store(0)
 	staleOwedArmEmits.Store(0)
 	staleOwedDelivered.Store(0)
+	staleOwedSettled.Store(0)
 }
 
 // KnownStaleMark returns key's known-stale window: the dep-event seq of its

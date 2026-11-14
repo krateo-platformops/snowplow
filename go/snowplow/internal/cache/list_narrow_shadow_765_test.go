@@ -535,7 +535,7 @@ func newAuditHarness(t *testing.T) *auditHarness {
 		gen0 := h.store.CaptureGen(key)
 		encoded := h.body(t)
 		prior, had := h.store.GetNoTouch(key)
-		stored := h.store.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: encoded, Inputs: &in}, gen0)
+		stored := h.store.replaceIfGenRefresh(ctx, key, &ResolvedEntry{RawJSON: encoded, Inputs: &in}, gen0).Stored()
 		NoteRefreshWrite(ctx, key, stored)
 		NoteNarrowAuditWrite(ctx, key, prior, had, encoded, stored)
 		return nil

@@ -3,6 +3,8 @@ package audit
 import (
 	"fmt"
 	"net/http"
+
+	krateoaudit "github.com/krateo-platformops/audit"
 )
 
 // outcome.go — the closed set of a record's body for an action that dialled an
@@ -69,6 +71,38 @@ func FailureMessage(code int) string {
 	}
 	return "upstream answered " + codeText(code)
 }
+
+// Why snowplow itself refused (krateo.audit.denial_reason, on a denied record
+// only; audit v0.12.0, audit#22 (a)): the request writer's closed set, each one
+// of snowplow's own refusal causes. A denied record carries no status code.
+const (
+	DenialDestinationRefused       = krateoaudit.DenialReasonDestinationRefused
+	DenialPerUserCredentialRef     = krateoaudit.DenialReasonPerUserCredentialRef
+	DenialEndpointRefMalformed     = krateoaudit.DenialReasonEndpointRefMalformed
+	DenialInternalIdentityContext  = krateoaudit.DenialReasonInternalIdentityContext
+	DenialWriteRefused             = krateoaudit.DenialReasonWriteRefused
+	DenialDryRunNotExecuted        = krateoaudit.DenialReasonDryRunNotExecuted
+	DenialDependencyFailed         = krateoaudit.DenialReasonDependencyFailed
+	DenialUAFOnWriteVerb           = krateoaudit.DenialReasonUafOnWriteVerb
+	DenialInvalidPath              = krateoaudit.DenialReasonInvalidPath
+	DenialTemplateError            = krateoaudit.DenialReasonTemplateError
+	DenialSessionCredentialMissing = krateoaudit.DenialReasonSessionCredentialMissing
+	DenialStepUpRequired           = krateoaudit.DenialReasonStepUpRequired
+	DenialInvalidRequest           = krateoaudit.DenialReasonInvalidRequest
+	// DenialRBACNotAllowed: snowplow's own RBAC evaluation refused the
+	// verified caller before its handler ran (audit v0.13.0).
+	DenialRBACNotAllowed = krateoaudit.DenialReasonRbacNotAllowed
+)
+
+// MessageRefused is the body of a denied record: snowplow refused before
+// sending anything. The reason is krateo.audit.denial_reason, never the body.
+const MessageRefused = "not sent: snowplow refused the request"
+
+// MessageEndpointUnreadable is the body of the failure record of a write stage
+// whose endpoint could not be read: nothing was sent, so the record carries no
+// status code (the read's answer is the apiserver's to snowplow, not the
+// write's).
+const MessageEndpointUnreadable = "the stage's endpoint could not be read; nothing was sent"
 
 // codeText is "<code> <status text>", or the bare code when it has no
 // standard text.

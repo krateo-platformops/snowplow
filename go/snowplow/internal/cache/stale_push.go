@@ -71,6 +71,25 @@
 // the replacement closes nothing: the refetch it triggers reads the same stale
 // cell.
 //
+// # WHEN THE CLIENT ALREADY HOLDS THE REPLACING BYTES (#1321)
+//
+// A frame is published only for a Put that changed the stored bytes
+// (put_outcome.go). A replacing Put whose bytes EQUAL the bytes the client was
+// served corrects nothing on the client — it holds them already — and no frame
+// follows it. So such a Put closes the serve itself, at the Put:
+// stale_to_push_ms records putTime − servedAt (the time the client showed bytes
+// not yet confirmed current), past 10 s it counts unreplaced like a late push,
+// and stale_serve_closes_total{close="identical"} counts it. The rule is per
+// CLIENT, like a frame: when a replacing Put's bytes equal the bytes of the
+// subject's NEWEST serve of the key (its latest stale read), every replaced
+// serve of that (key, subject) closes, exactly the set a frame written to that
+// subject's stream at that instant would close. An older serve whose bytes
+// differ was already followed by a frame (the Put that changed them published
+// one) and the client's later read is the newest serve. A Put that does not
+// replace the serve (it began before the serve's mark) proves nothing, even
+// with equal bytes. The served bytes are held only while they can still
+// decide this: the newest serve of a (key, subject), not yet replaced.
+//
 // # UNREPLACED (the 10 s goal max)
 //
 // stale_unreplaced_total{layer} counts, ONCE per serve, a serve whose
@@ -120,6 +139,7 @@
 package cache
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"expvar"
@@ -146,10 +166,13 @@ var StaleLayers = []string{StaleLayerAPIStage, StaleLayerL1}
 const (
 	stalePushClosePushed  = "pushed"
 	stalePushCloseDropped = "dropped"
+	// #1321 — closed at a replacing Put whose bytes equal the bytes the client
+	// was served: no frame follows (the client holds them already).
+	stalePushCloseIdentical = "identical"
 )
 
 // StalePushCloses is the `close` label set, in export order.
-var StalePushCloses = []string{stalePushClosePushed, stalePushCloseDropped}
+var StalePushCloses = []string{stalePushClosePushed, stalePushCloseDropped, stalePushCloseIdentical}
 
 // StaleToPushMaxMS is the goal's maximum from a stale serve to its push (owner
 // bar: max ≤ 10 s). A design constant, never an env knob.
@@ -174,6 +197,7 @@ const (
 const (
 	closePushedIdx = iota
 	closeDroppedIdx
+	closeIdenticalIdx
 	stalePushCloseCount
 )
 
@@ -229,6 +253,11 @@ type staleServe struct {
 	needSeq  bool
 	seq      uint64
 	replaced bool
+	// served (#1321) is the cell bytes this serve answered with (nil: unknown).
+	// A replacing Put with equal bytes closes the client's serves at the Put
+	// (the file comment). Held only while it can decide that: cleared once a
+	// newer serve of the same (key, subject) opens or the serve is replaced.
+	served []byte
 	// overdue: counted on stale_unreplaced_total (once).
 	overdue bool
 	el      *list.Element
@@ -317,10 +346,20 @@ func NoteStaleHit(ctx context.Context, key string, entry *ResolvedEntry, subject
 	st, dirty := dirtyStampFor(key)
 	switch {
 	case entry.StaleDerived:
-		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerAPIStage, StalePushNow(), st))
+		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerAPIStage, StalePushNow(), st, servedBytesOf(entry)))
 	case dirty:
-		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerL1, StalePushNow(), st))
+		settleLateOpen(key, noteStaleServe(key, subjectOf(ctx), layerL1, StalePushNow(), st, servedBytesOf(entry)))
 	}
+}
+
+// servedBytesOf is the cell bytes a hit on e answered with, as the ledger keeps
+// them (#1321): the stored body, never a copy. nil (unknown) for an incremental
+// list cell, whose body is built on demand and is never a customer hit's cell.
+func servedBytesOf(e *ResolvedEntry) []byte {
+	if e == nil || e.listCell != nil {
+		return nil
+	}
+	return e.Raw() // the plain branch: the stored body itself
 }
 
 // settleLateOpen catches the Put that landed between a hit's read and its
@@ -334,6 +373,10 @@ func NoteStaleHit(ctx context.Context, key string, entry *ResolvedEntry, subject
 // its store is visible here. Both sides ask the same question (replaces).
 //
 // Only a stale hit reaches this: a fresh hit returns from NoteStaleHit first.
+//
+// #1321 — a Put caught here whose bytes equal the served ones is followed by no
+// frame, so it closes the client's serves now (identicalCloseLocked), as it
+// would have at its own mark.
 func settleLateOpen(key string, s *staleServe) {
 	if s == nil {
 		return
@@ -343,10 +386,24 @@ func settleLateOpen(key string, s *staleServe) {
 	if ok && !cur.replaces(s) {
 		return
 	}
+	var curRaw []byte
+	if ok {
+		curRaw = servedBytesOf(cur)
+	}
+	var samples []stalePushSample
 	l := stalePush
+	now := StalePushNow()
 	l.mu.Lock()
-	s.replaced = true
+	if !s.replaced { // a replaced serve was settled by its Put's own mark
+		s.replaced = true
+		if curRaw != nil && s.served != nil && bytes.Equal(s.served, curRaw) {
+			samples = l.identicalCloseLocked(key, s.subject, now, samples)
+		} else {
+			s.served = nil
+		}
+	}
 	l.mu.Unlock()
+	recordStalePushSamples(samples)
 }
 
 // replaces reports whether the body in e replaces serve s: not stale-derived and,
@@ -358,23 +415,24 @@ func (e *ResolvedEntry) replaces(s *staleServe) bool {
 }
 
 // noteStaleServeNow is a serve whose dirty stamp has not been read yet (the D2
-// commit): it reads it once, here.
-func noteStaleServeNow(key, subject string, layer int, servedAt time.Time) {
+// commit): it reads it once, here. served is the body the response wrote.
+func noteStaleServeNow(key, subject string, layer int, servedAt time.Time, served []byte) {
 	st, _ := dirtyStampFor(key)
-	noteStaleServe(key, subject, layer, servedAt, st)
+	noteStaleServe(key, subject, layer, servedAt, st, served)
 }
 
 // noteStaleServe opens one serve of key for subject at servedAt. st is key's
 // dirty stamp as the serve read it (nil: none) — the mark a replacing Put must
-// have read past — read ONCE by the caller, before the leaf lock.
-func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirtyStamp) *staleServe {
+// have read past — read ONCE by the caller, before the leaf lock. served is the
+// bytes it answered with (nil: unknown; #1321).
+func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirtyStamp, served []byte) *staleServe {
 	if key == "" {
 		return nil
 	}
 	if servedAt.IsZero() {
 		servedAt = StalePushNow()
 	}
-	s := &staleServe{key: key, subject: subject, layer: layer, servedAt: servedAt}
+	s := &staleServe{key: key, subject: subject, layer: layer, servedAt: servedAt, served: served}
 	if st != nil {
 		s.needSeq, s.seq = true, st.seq
 	}
@@ -387,6 +445,11 @@ func noteStaleServe(key, subject string, layer int, servedAt time.Time, st *dirt
 	if subs == nil {
 		subs = map[string][]*staleServe{}
 		l.byKey[key] = subs
+	}
+	// #1321 — only the client's newest serve decides an identical close: an
+	// older one no longer holds its bytes.
+	for _, o := range subs[subject] {
+		o.served = nil
 	}
 	subs[subject] = append(subs[subject], s)
 	stalePushStats.open[layer].Add(1)
@@ -462,20 +525,45 @@ func RestartStaleServeClock(key, layer string, at time.Time) {
 // noteStalePushPut is every ACCEPTED store Put of key (the four Put methods,
 // after c.mu is released, before the caller publishes): it replaces key's open
 // serves the Put corrects, for every subject (see the file comment).
+//
+// #1321 — and for each subject whose NEWEST serve it replaces with the very
+// bytes that serve answered with, it closes that client's replaced serves now
+// ("identical"): the Put publishes no frame for bytes the client holds.
 func noteStalePushPut(key string, entry *ResolvedEntry) {
 	if stalePushOpenTotal.Load() == 0 || entry == nil || entry.StaleDerived {
 		return
 	}
+	var samples []stalePushSample
+	raw := servedBytesOf(entry) // the Put's bytes as a hit would serve them (nil: never identical)
 	l := stalePush
+	now := StalePushNow()
 	l.mu.Lock()
-	for _, serves := range l.byKey[key] {
+	for subject, serves := range l.byKey[key] {
+		newest := serves[len(serves)-1]
+		identical := raw != nil && newest.served != nil && entry.replaces(newest) && bytes.Equal(newest.served, raw)
 		for _, s := range serves {
 			if entry.replaces(s) {
 				s.replaced = true
+				if !identical {
+					s.served = nil // a frame closes it now (the Put changed its bytes)
+				}
 			}
+		}
+		if identical {
+			samples = l.identicalCloseLocked(key, subject, now, samples)
 		}
 	}
 	l.mu.Unlock()
+	recordStalePushSamples(samples)
+}
+
+// identicalCloseLocked closes (key, subject)'s replaced serves at now as
+// "identical" (#1321): the replacing bytes equal the client's newest serve, so
+// the client holds them and no frame will follow. The same set and the same
+// sample a frame written to that subject's stream now would close and record.
+// Caller holds mu.
+func (l *stalePushLedger) identicalCloseLocked(key, subject string, now time.Time, out []stalePushSample) []stalePushSample {
+	return l.closeReplacedLocked(key, subject, now, closeIdenticalIdx, out)
 }
 
 // noteStalePushEvicted: key left the store (evictDirtyWindow, under c.mu: the
@@ -489,6 +577,7 @@ func noteStalePushEvicted(key string) {
 	for _, serves := range l.byKey[key] {
 		for _, s := range serves {
 			s.replaced = true
+			s.served = nil
 		}
 	}
 	l.mu.Unlock()
@@ -537,6 +626,13 @@ func stalePushResyncWritten(keys map[string]struct{}, subject string) {
 // pushLocked closes (key, subject)'s replaced serves at now in one pass.
 // Caller holds mu.
 func (l *stalePushLedger) pushLocked(key, subject string, now time.Time, out []stalePushSample) []stalePushSample {
+	return l.closeReplacedLocked(key, subject, now, closePushedIdx, out)
+}
+
+// closeReplacedLocked closes (key, subject)'s replaced serves at now, counted
+// under closeIdx (pushed: a frame was written; identical: the replacing bytes
+// equal the client's, #1321). Caller holds mu.
+func (l *stalePushLedger) closeReplacedLocked(key, subject string, now time.Time, closeIdx int, out []stalePushSample) []stalePushSample {
 	serves := l.byKey[key][subject]
 	if len(serves) == 0 {
 		return out
@@ -552,7 +648,7 @@ func (l *stalePushLedger) pushLocked(key, subject string, now time.Time, out []s
 			s.overdue = true
 			stalePushStats.unreplaced[s.layer].Add(1)
 		}
-		l.countCloseLocked(s, closePushedIdx)
+		l.countCloseLocked(s, closeIdx)
 		out = append(out, stalePushSample{layer: s.layer, ms: ms})
 	}
 	for i := len(keep); i < len(serves); i++ {

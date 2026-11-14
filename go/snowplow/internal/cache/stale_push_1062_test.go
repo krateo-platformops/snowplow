@@ -79,11 +79,18 @@ func noFrameWithin(t *testing.T, st RefreshStream, d time.Duration) bool {
 	}
 }
 
-// put is an accepted gen-guarded Put of a fresh body under rctx.
+// put is an accepted gen-guarded Put of a fresh body under rctx. A
+// stale-derived body differs from the fresh one, so the fresh Put that replaces
+// it changes the client's bytes and closes at its frame (#1321: a replacement
+// with the served bytes closes at the Put instead — issue1321_*_test.go).
 func (e *k1062Env) put(t *testing.T, rctx context.Context, staleDerived bool) {
 	t.Helper()
 	in := *mustInputs(t, e.c, e.key)
-	if !e.c.putIfGen(rctx, e.key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in, StaleDerived: staleDerived}, e.c.CaptureGen(e.key)) {
+	body := `{"body":"new"}`
+	if staleDerived {
+		body = `{"body":"stale-derived"}`
+	}
+	if !e.c.putIfGen(rctx, e.key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in, StaleDerived: staleDerived}, e.c.CaptureGen(e.key)) {
 		t.Fatalf("PRECONDITION: the Put was refused")
 	}
 }
@@ -287,7 +294,7 @@ func TestIssue1062_RST_TheResumeMovesTheApistageClockForwardOnly(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	e := newK1062(t)
 	t0 := StalePushNow()
-	noteStaleServeNow(e.key, "", layerAPIStage, t0)
+	noteStaleServeNow(e.key, "", layerAPIStage, t0, nil)
 	RestartStaleServeClock(e.key, StaleLayerAPIStage, t0.Add(3*time.Second)) // the resume
 	RestartStaleServeClock(e.key, StaleLayerAPIStage, t0.Add(time.Second))   // an older resume: never backwards
 	RestartStaleServeClock(e.key, StaleLayerL1, t0.Add(5*time.Second))       // another layer: untouched
@@ -520,7 +527,7 @@ func TestIssue1062_N3_TheCapacityBoundDropsTheOldestServe(t *testing.T) {
 	}
 	subjects := []string{"user:n3-0", "user:n3-1", "user:n3-2"}
 	for _, s := range subjects {
-		noteStaleServeNow(e.key, s, layerAPIStage, StalePushNow())
+		noteStaleServeNow(e.key, s, layerAPIStage, StalePushNow(), nil)
 		e.advance(time.Second)
 	}
 	s := k1062Layer(t, StaleLayerAPIStage)
