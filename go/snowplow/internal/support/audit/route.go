@@ -152,6 +152,23 @@ func FailRoute(ctx context.Context) {
 	}
 }
 
+// FailAuthorizationRoute records on ctx's audited request that snowplow could
+// not evaluate the verified caller's authorization (its own RBAC evaluation
+// was unavailable), so nothing was sent: a failure with NO status code and
+// MessageAuthorizationUnavailable. A legitimate server error, not a design
+// error; no code, as for FailRoute.
+func FailAuthorizationRoute(ctx context.Context) {
+	if s, ok := ctx.Value(slotKey{}).(*recordSlot); ok {
+		s.mu.Lock()
+		s.end = &routeEnd{outcome: OutcomeFailure, message: MessageAuthorizationUnavailable}
+		s.mu.Unlock()
+	}
+}
+
+// MessageAuthorizationUnavailable is the body of a record of a request whose
+// caller's authorization snowplow could not evaluate (FailAuthorizationRoute).
+const MessageAuthorizationUnavailable = "the caller's authorization could not be evaluated; nothing was sent"
+
 // MessageCredentialUnreadable is the body of a record of a request whose
 // caller's credential could not be read (FailRoute): nothing was sent.
 const MessageCredentialUnreadable = "the caller's credential could not be read; nothing was sent"

@@ -271,6 +271,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	"FallthroughReasonOf": readOnly443, "WithFallthroughReason": readOnly443,
 	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
+	// #1334 — the apiserver's group rule over (username, groups): a pure function.
+	"Authenticated": readOnly443,
 	// #561 removed "WithInformerOnlyReads" from this table when it deleted
 	// #403's informer-only UAF pre-check read. #594 PUTS IT BACK, for a
 	// different read on the same path: apiref.DeclaresExternalEndpoint, the
@@ -316,6 +318,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
 	// demand revalidation, the background hop). Pure ctx reads.
 	"NonCustomerWriteOrigin": readOnly443,
+	// AUDIT-4 (audit#22) — "does this resolve have a requester?" for a stage's
+	// audit record (stage_audit.go stageRecorded): every non-customer origin
+	// NonCustomerWriteOrigin reads, walked in its order. Pure ctx reads.
+	"EachNonCustomerOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.

@@ -288,8 +288,9 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // re-audited the same way (snowplow#1359): http/util/ is byte-identical.
 // v1.52.0 → v1.54.0 re-audited the same way (plumbing#141): http/util/ is
 // byte-identical. v1.54.0 → v1.61.0 re-audited the same way (snowplow#1382):
-// http/util/ is byte-identical.
-const retryPolicyTranscribedFrom = "v1.61.0"
+// http/util/ is byte-identical. v1.61.0 → v1.68.0 re-audited the same way
+// (plumbing#159): http/util/ is byte-identical.
+const retryPolicyTranscribedFrom = "v1.68.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,

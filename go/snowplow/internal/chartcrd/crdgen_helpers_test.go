@@ -58,9 +58,14 @@ const (
 	// kubeutil/objectclient, kubeutil/content, usernames/, signup tests and
 	// docs; crdgen/ and crdgen/schemas/ are byte-identical, so the output above
 	// stands.
+	//
+	// v1.61.0 → v1.68.0 (plumbing#159, kubeconfig's bearer token): `diff -r` of
+	// the module trees changes kubeconfig/, helm/, signup/, kubeutil/content
+	// (a comment), tests and docs; crdgen/ and crdgen/schemas/ are
+	// byte-identical, so the output above stands.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.61.0"
+	crdgenVersion       = "v1.68.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
 	coreProviderCrdgenVersion = "v1.28.1"
 

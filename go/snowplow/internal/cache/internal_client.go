@@ -14,7 +14,10 @@
 //   kubeconfig.NewClientConfig marshals the endpoint into a kubeconfig
 //   document and hands it to client-go's clientcmd loader. That path is:
 //     - CERT-AUTH-ONLY — the kubeconfig user block has no token field, so
-//       a token-bearing endpoint loses its only credential; and
+//       a token-bearing endpoint loses its only credential (true up to
+//       plumbing v1.67.0; v1.68.0, plumbing#159, writes the token, so a
+//       token-only per-user endpoint such as the sandbox visitor's now
+//       authenticates); and
 //     - base64-AWARE — clientcmd base64-decodes certificate-authority-data.
 //
 //   The per-user `<user>-clientconfig` Secret works there because the
@@ -69,15 +72,16 @@ import (
 //     by WithInternalRESTConfig — Phase 1's SA walk, or the background refresher /
 //     prewarm re-resolve, on their OWN ctx), that pre-built config is returned
 //     verbatim. This is the load-bearing fix path: it bypasses
-//     kubeconfig.NewClientConfig, which cannot carry the SA's raw-PEM CA or bearer
-//     token. Post-#268/#269 Part 1 a LIVE per-user request never carries it (the
+//     kubeconfig.NewClientConfig, which cannot carry the SA's raw-PEM CA (it
+//     base64-decodes the CA field). Post-#268/#269 Part 1 a LIVE per-user request never carries it (the
 //     dispatcher attach was removed); Part 2 re-gates the background re-resolve at
 //     getFromAPIServer via rbac.MustRegateSADial so a denied read is not served
 //     under the SA identity.
 //   - Otherwise (every LIVE per-user request) it delegates to
 //     plumbing's kubeconfig.NewClientConfig(ctx, ep), unchanged — the
-//     per-user `<user>-clientconfig` endpoint is cert-based and
-//     base64-encoded, exactly what that path expects.
+//     per-user `<user>-clientconfig` endpoint carries a client certificate or
+//     a bearer token (plumbing >= v1.68.0) and a base64-encoded CA, exactly
+//     what that path expects.
 //
 // The internal *rest.Config is shared, read-only — callers MUST NOT mutate
 // the returned pointer's fields. plumbing's kubeconfig.NewClientConfig
@@ -97,6 +101,28 @@ func ClientConfigFor(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, 
 func RequesterCredentialFor(ctx context.Context) bool {
 	_, internal := internalRESTConfig(ctx)
 	return !internal
+}
+
+// ImpersonatingConfigFor returns the impersonating *rest.Config ctx dials with,
+// when its transport impersonates the ctx identity (WithImpersonatedDial) and
+// the ctx-carried config does name an identity to impersonate. It is the only
+// credential a caller with no clientconfig of its own has (#1334: the public
+// identity), so a dial site that would otherwise present the clientconfig
+// endpoint presents this instead. ok is false on every other ctx — every live
+// request of an authenticated user — and the caller keeps its own path.
+func ImpersonatingConfigFor(ctx context.Context) (*rest.Config, bool) {
+	if !ImpersonatedDialFromContext(ctx) {
+		return nil, false
+	}
+	rc, ok := internalRESTConfig(ctx)
+	if !ok {
+		return nil, false
+	}
+	imp := rc.Impersonate
+	if imp.UserName == "" && imp.UID == "" && len(imp.Groups) == 0 && len(imp.Extra) == 0 {
+		return nil, false
+	}
+	return rc, true
 }
 
 // internalRESTConfig is the internal-dispatch *rest.Config ctx carries, if any.

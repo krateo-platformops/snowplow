@@ -140,7 +140,17 @@ import (
 // and docs. This file now reads every name SessionSecretNames gives and uses
 // a Secret only when OwnsSecret holds: the step-5 lookup's one intentional
 // change for #1382.
-const PinnedPlumbingVersion = "v1.61.0"
+//
+// v1.61.0 → v1.68.0 (plumbing#159, the token-only endpoint's bearer token):
+// re-audited by `diff -r` of the two module trees. server/, jwtutil/ and
+// endpoints/ are byte-identical, so this file's upstream line numbers stand.
+// The diff is kubeconfig/ (Marshal writes the endpoint's token and proxy URL
+// into the kubeconfig it builds, so NewClientConfig carries a token-only
+// endpoint's credential; its DEBUG round tripper logs metadata only), helm/,
+// which snowplow does not import, signup/ (each CSR gets a name of its own;
+// reached only through plumbing/e2e in integration tests), a comment in
+// kubeutil/content, tests and docs.
+const PinnedPlumbingVersion = "v1.68.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -219,6 +229,19 @@ const PinnedPlumbingVersion = "v1.61.0"
 // ±10% of the pre-D.3 baseline. The flag is verified-removable
 // (`project_caching_is_provisional`).
 func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
+	return userConfig(keys, authnNS, nil)
+}
+
+// UserConfigOrPublic is UserConfig with the #1334 public identity: a request
+// carrying NO Authorization header field is served as the public identity
+// (public_identity.go) instead of 401 TokenMissing. A nil public is exactly
+// UserConfig. Every request that carries an Authorization header — valid or
+// not — takes UserConfig's path unchanged.
+func UserConfigOrPublic(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) func(http.Handler) http.Handler {
+	return userConfig(keys, authnNS, public)
+}
+
+func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
 			// #1115 — a customer request's network exchanges share the page's
@@ -242,6 +265,18 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 			// request as an InternalError, before the auth-header check.
 			if keys == nil {
 				response.InternalError(wri, fmt.Errorf("no JWT key source configured"))
+				return
+			}
+
+			// #1334 — no Authorization header field at all, and the install
+			// opted in: the public identity. Decided on the header's PRESENCE
+			// only, before anything is read from it, so a request that sent a
+			// header of any shape keeps the 401s below.
+			if public != nil && tokenless(req) {
+				public.serve(wri, req, next, func() {
+					authOpen = false
+					auth.End()
+				})
 				return
 			}
 
