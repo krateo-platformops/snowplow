@@ -109,7 +109,29 @@ func zrRule(incidentUID string) map[string]any {
 	}
 }
 
-func zrHarness(t *testing.T) (*harness, string) {
+// zrGrant is a Role and its RoleBinding to the visitor: verbs on zendeskrequests in a namespace.
+func zrGrant(name, ns string, verbs ...any) []map[string]any {
+	return []map[string]any{
+		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": map[string]any{"name": name, "namespace": ns, "resourceVersion": "49"}, "rules": []any{
+			map[string]any{"apiGroups": []any{zrGroup}, "resources": []any{"zendeskrequests"}, "verbs": verbs}}},
+		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": map[string]any{"name": name, "namespace": ns, "resourceVersion": "50"},
+			"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name},
+			"subjects": []any{map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "sandbox-visitor"}}},
+	}
+}
+
+// zrStatusWrites counts the request lines of writes to zendeskrequests/status, by object name.
+func zrStatusWrites(h *harness) map[string]int {
+	w := map[string]int{}
+	for _, l := range h.log() {
+		if l["resource"] == "zendeskrequests/status" {
+			w[fmt.Sprint(l["name"])]++
+		}
+	}
+	return w
+}
+
+func zrHarness(t *testing.T, more ...map[string]any) (*harness, string) {
 	t.Helper()
 	// The incident's uid, from the fixture.
 	var pg struct {
@@ -129,6 +151,7 @@ func zrHarness(t *testing.T) (*harness, string) {
 	}
 	extra := append([]map[string]any{zrCRD(t, "zendeskrequests"), zrCRD(t, "zendeskrequestconfigurations")}, zrRBAC()...)
 	extra = append(extra, zrSeeds(uid)...)
+	extra = append(extra, more...)
 	h := newHarness(t, opts{extra: extra, edit: func(s map[string]any) {
 		d := s["discovery"].(map[string]any)
 		groups := d["apis"].(map[string]any)
@@ -284,21 +307,17 @@ func TestZendesk_RaiseIsFilingThenFiledInOrder(t *testing.T) {
 // The rule fires once per created object that carries the incident's uid, and never for another.
 func TestZendesk_FiledOncePerCreatedObjectWithTheIncidentLabel(t *testing.T) {
 	h, uid := zrHarness(t)
-	a, b, other := "zr-sandbox-visitor-1794600001", "zr-sandbox-visitor-1794600002", "zr-sandbox-visitor-1794600003"
+	a, b, other, wrong := "zr-sandbox-visitor-1794600001", "zr-sandbox-visitor-1794600002", "zr-sandbox-visitor-1794600003", "zr-sandbox-visitor-1794600008"
 	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(a, uid)}).code, 201, "create a")
 	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(b, uid)}).code, 201, "create b")
 	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(other, "")}).code, 201, "create a request with no incident label")
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(wrong, "another-incidents-uid")}).code, 201, "create a request with another incident's uid")
 	h.advance(zrFileWait + time.Minute)
-	writes := map[string]int{}
-	for _, l := range h.log() {
-		if l["resource"] == "zendeskrequests/status" {
-			writes[fmt.Sprint(l["name"])]++
-		}
-	}
-	eq(t, writes, map[string]int{a: 1, b: 1}, "one filing per created object with the label, none for the other")
+	eq(t, zrStatusWrites(h), map[string]int{a: 1, b: 1}, "one filing per created object with the label, none for the others")
 	eq(t, cardState(h.do("GET", zrPath+"/"+a, req{as: "sa"}).body), "filed", "a")
 	eq(t, cardState(h.do("GET", zrPath+"/"+b, req{as: "sa"}).body), "filed", "b")
 	eq(t, cardState(h.do("GET", zrPath+"/"+other, req{as: "sa"}).body), "filing", "the request with no incident label")
+	eq(t, cardState(h.do("GET", zrPath+"/"+wrong, req{as: "sa"}).body), "filing", "the request with another incident's uid")
 	if l := h.log(); logged(h, func(l map[string]any) bool { return l["event"] == "applyStatus.failed" }) {
 		t.Fatalf("an applyStatus.failed line: %v", l)
 	}
@@ -345,6 +364,94 @@ func TestZendesk_CreateIsValidatedAgainstTheCRD(t *testing.T) {
 	badKind := raiseBody("zr-sandbox-visitor-1794600007", uid)
 	badKind["spec"].(map[string]any)["kind"] = "Question"
 	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: badKind}).code, 422, "kind outside Bug|FeatureRequest")
+	badPriority := raiseBody("zr-sandbox-visitor-1794600009", uid)
+	badPriority["spec"].(map[string]any)["priority"] = "critical"
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: badPriority}).code, 422, "priority outside low|normal|high|urgent")
 	dup := raiseBody("zr-demo-user-1794500000", uid)
 	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: dup}).code, 409, "AlreadyExists: two tabs in the same second")
+	// A refused create is not filed, and the request whose name the 409 named is not filed again.
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{}, "no filing for a refused create")
+}
+
+// The rule is a create rule: an update of a filed request does not file it again.
+func TestZendesk_AnUpdateDoesNotFileAgain(t *testing.T) {
+	h, uid := zrHarness(t, zrGrant("test-visitor-patch", "krateo-system", "patch")...)
+	name := "zr-sandbox-visitor-1794600010"
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, uid)}).code, 201, "create")
+	h.advance(zrFileWait)
+	eq(t, zrStatusWrites(h), map[string]int{name: 1}, "filed")
+	patched := h.do("PATCH", zrPath+"/"+name, req{as: "visitor", ct: merge, body: map[string]any{"metadata": map[string]any{"annotations": map[string]any{"test/touched": "1"}}}})
+	eq(t, patched.code, 200, "the patch")
+	eq(t, get(patched.body, "metadata", "labels", "krateo.io/incident-uid"), uid, "the patched object still carries the incident's uid")
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{name: 1}, "an update does not file again")
+}
+
+// The rule is its namespace's: a request with the incident's uid created in another namespace is
+// not filed.
+func TestZendesk_ACreateInAnotherNamespaceIsNotFiled(t *testing.T) {
+	ns := map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{"name": "default", "uid": "ns-default", "resourceVersion": "51"}}
+	h, uid := zrHarness(t, append(zrGrant("test-visitor-raise-elsewhere", "default", "create", "get"), ns)...)
+	name := "zr-sandbox-visitor-1794600011"
+	body := raiseBody(name, uid)
+	body["metadata"].(map[string]any)["namespace"] = "default"
+	elsewhere := "/apis/zendesk.ogen.krateo.io/v2/namespaces/default/zendeskrequests"
+	eq(t, h.do("POST", elsewhere, req{as: "visitor", ct: "application/json", body: body}).code, 201, "create in another namespace")
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{}, "no filing outside the rule's namespace")
+	eq(t, cardState(h.do("GET", elsewhere+"/"+name, req{as: "sa"}).body), "filing", "the request in the other namespace")
+	if logged(h, func(l map[string]any) bool { return l["event"] == "applyStatus.failed" }) {
+		t.Fatalf("an applyStatus.failed line: %v", h.log())
+	}
+}
+
+// A filing is for the object that was created, not for its name: a request deleted inside the delay
+// is not filed, and neither is an unlabelled request re-created under its name.
+func TestZendesk_ADeletedRequestsNameIsNotFiled(t *testing.T) {
+	h, uid := zrHarness(t, zrGrant("test-visitor-delete", "krateo-system", "delete")...)
+	name := "zr-sandbox-visitor-1794600012"
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, uid)}).code, 201, "create with the label")
+	h.advance(time.Second)
+	eq(t, h.do("DELETE", zrPath+"/"+name, req{as: "visitor"}).code, 200, "delete inside the delay")
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, "")}).code, 201, "re-create without the label")
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{}, "the unlabelled re-created request is never filed")
+	eq(t, cardState(h.do("GET", zrPath+"/"+name, req{as: "sa"}).body), "filing", "the re-created request")
+
+	// Deleted and not re-created: nothing is written, and nothing failed.
+	gone := "zr-sandbox-visitor-1794600013"
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(gone, uid)}).code, 201, "create with the label")
+	eq(t, h.do("DELETE", zrPath+"/"+gone, req{as: "visitor"}).code, 200, "delete inside the delay")
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{}, "a deleted request is not filed")
+	if logged(h, func(l map[string]any) bool { return l["event"] == "applyStatus.failed" }) {
+		t.Fatalf("an applyStatus.failed line: %v", h.log())
+	}
+}
+
+// A labelled request re-created under a deleted one's name inside the delay is filed once, at its
+// own delay: the deleted object's filing does not land on it.
+func TestZendesk_ARecreatedRequestIsFiledOnceAtItsOwnDelay(t *testing.T) {
+	h, uid := zrHarness(t, zrGrant("test-visitor-delete", "krateo-system", "delete")...)
+	name := "zr-sandbox-visitor-1794600014"
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, uid)}).code, 201, "create with the label")
+	h.advance(time.Second)
+	eq(t, h.do("DELETE", zrPath+"/"+name, req{as: "visitor"}).code, 200, "delete inside the delay")
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, uid)}).code, 201, "re-create with the label")
+	// The first object's delay runs out one second before the second's.
+	h.advance(zrFileWait - time.Second)
+	eq(t, zrStatusWrites(h), map[string]int{}, "the deleted object's filing does not land on the re-created one")
+	eq(t, cardState(h.do("GET", zrPath+"/"+name, req{as: "sa"}).body), "filing", "the re-created request before its own delay")
+	h.advance(time.Second)
+	eq(t, zrStatusWrites(h), map[string]int{name: 1}, "the re-created request is filed at its own delay")
+	h.advance(time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{name: 1}, "one filing for the re-created request")
+	eq(t, cardState(h.do("GET", zrPath+"/"+name, req{as: "sa"}).body), "filed", "the re-created request")
+
+	// Deleted and re-created after the filing: the new object is filed, once.
+	eq(t, h.do("DELETE", zrPath+"/"+name, req{as: "visitor"}).code, 200, "delete after the filing")
+	eq(t, h.do("POST", zrPath, req{as: "visitor", ct: "application/json", body: raiseBody(name, uid)}).code, 201, "re-create after the filing")
+	h.advance(zrFileWait + time.Minute)
+	eq(t, zrStatusWrites(h), map[string]int{name: 2}, "one filing per created object")
 }

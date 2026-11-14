@@ -179,7 +179,8 @@ func (s *Server) fireRules(c *reqCtx, verb string, stored map[string]any) {
 			continue
 		}
 		if t.Trigger {
-			t = target{Group: c.group, Resource: c.resource, Namespace: c.ns, Name: name}
+			uid, _ := meta(stored)["uid"].(string)
+			t = target{Group: c.group, Resource: c.resource, Namespace: c.ns, Name: name, UID: uid}
 		}
 		rule := rule
 		s.o.AfterFunc(time.Duration(rule.AfterMs)*time.Millisecond, func() { s.applyStatus(rule, t) })
@@ -196,6 +197,11 @@ func (s *Server) applyStatus(rule Rule, t target) {
 	}
 	gr := t.Group + "/" + t.Resource
 	prev := s.bucket(gr)[t.Namespace+"/"+t.Name]
+	if t.UID != "" && (prev == nil || meta(prev)["uid"] != t.UID) {
+		// The object the rule fired on was deleted before the delay ran out (and its name may be
+		// another object's now). A controller does not write the status of an object that is gone.
+		return
+	}
 	if prev == nil {
 		fail("", fmt.Sprintf("target %s %s/%s does not exist", t.Resource, t.Namespace, t.Name))
 		return
