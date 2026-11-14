@@ -24,10 +24,10 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -179,11 +179,17 @@ func IsNonRetryableRefreshError(err error) bool {
 	return err != nil && (apierrors.IsForbidden(err) || destinationRefused(err))
 }
 
-// typeNotInstalled reports a 424 Failed Dependency Status. On the refresh path
-// only objects.Get answers one: the read's type is not served (#1414).
+// typeNotInstalled reports a Status that carries snowplow's own cause for a
+// type that is not installed (objects.Get's 424, #1414). It is read from the
+// cause (#1426 F2), never from the code: a RESTAction stage whose upstream
+// answers 424 is not this, and cannot carry the cause.
 func typeNotInstalled(err error) bool {
 	var se *apierrors.StatusError
-	return errors.As(err, &se) && se.ErrStatus.Code == http.StatusFailedDependency
+	if !errors.As(err, &se) {
+		return false
+	}
+	_, ok := statusdetails.MissingTypeMeta(se.ErrStatus)
+	return ok
 }
 
 // destinationRefused reports a stage failure whose reason is the destination

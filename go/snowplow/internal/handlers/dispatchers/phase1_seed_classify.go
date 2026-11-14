@@ -42,6 +42,7 @@ package dispatchers
 import (
 	"context"
 	"errors"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -131,12 +132,16 @@ func statusErrFromResponse(s *response.Status) error {
 	if s == nil {
 		return nil
 	}
-	return &apierrors.StatusError{
-		ErrStatus: metav1.Status{
-			Status:  metav1.StatusFailure,
-			Code:    int32(s.Code),
-			Reason:  metav1.StatusReason(s.Reason),
-			Message: s.Message,
-		},
+	st := metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    int32(s.Code),
+		Reason:  metav1.StatusReason(s.Reason),
+		Message: s.Message,
 	}
+	// #1429 — a read that found its TYPE not installed says which type in its
+	// details; that, and only that, travels with the error (statusdetails).
+	if gvr, ok := statusdetails.MissingType(s); ok {
+		st.Details = statusdetails.TypeNotInstalledMeta(gvr)
+	}
+	return &apierrors.StatusError{ErrStatus: st}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,8 +60,14 @@ func TestIssue608_ClassifyRefreshError(t *testing.T) {
 		// own class: never not_found, and it keeps the budget.
 		{"424 type not installed at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
 			&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 424, Reason: "FailedDependency",
-				Message: "The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster."}}),
+				Message: "The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster.",
+				Details: statusdetails.TypeNotInstalledMeta(schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"})}}),
 			RefreshErrTypeNotInstalled, ResolveStageRefetch, false},
+		// #1426 F2 — the class is read from the cause, never from the code: a
+		// RESTAction stage whose upstream answers HTTP 424 is not it.
+		{"an upstream's 424 at apiref is not type_not_installed", wrap(ResolveStageApiRef,
+			&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 424, Reason: "FailedDependency", Message: "upstream"}}),
+			RefreshErrUnclassified, ResolveStageApiRef, false},
 		{"404 at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
 			apierrors.NewNotFound(schema.GroupResource{Resource: "flexes"}, "x")), RefreshErrNotFound, ResolveStageRefetch, false},
 	} {

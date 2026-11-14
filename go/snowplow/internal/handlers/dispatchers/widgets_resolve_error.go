@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
@@ -65,13 +66,21 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 		return
 	}
 	st := response.New(code, fmt.Errorf("%s", statusErr.Status().Message))
-	if code == http.StatusFailedDependency {
-		// #1414 — a dependency whose TYPE is not installed (objects.Get's 424)
-		// is already the answer this function gives for a dependency that is
-		// not there. It keeps its status, its reason and its message, which
-		// names the type and nothing else.
+	if gvr, ok := statusdetails.MissingTypeMeta(statusErr.Status()); ok && code == http.StatusFailedDependency {
+		// #1414, #1429 — a dependency whose TYPE is not installed (objects.Get's
+		// 424, recognised by its cause and never by its code or text) is
+		// already the answer this function gives for a dependency that is not
+		// there. It keeps its status, its reason and its message, and says
+		// which type in its details: the DEPENDENCY's type, rebuilt from the
+		// cause, so nothing else the error carried can ride along.
+		//
+		// Any other 424 is an upstream's own (a RESTAction stage whose endpoint
+		// answered 424) and is passed through like every other code. It cannot
+		// carry the cause: an upstream's details never reach a snowplow error
+		// (credhttp.DecodeUpstreamStatus).
 		st.Status = response.StatusFailure
 		st.Reason = reasonFailedDependency
+		st.Details = statusdetails.TypeNotInstalled(gvr)
 	}
 	response.Encode(wri, st)
 }

@@ -50,3 +50,23 @@ func TestNonOKStatus_AnUpstreamsDetailsNeverReachTheStageFailure(t *testing.T) {
 		})
 	}
 }
+
+// An upstream that answers 424 with snowplow's own cause in its body: the stage failure is a
+// plain 424 with the upstream's message, and no details. (Its claimed reason does not survive
+// either: #714 keeps a reason only when it is the one the code implies.)
+func TestNonOKStatus_AnUpstream424CannotPresentTheTypeNotInstalledCause(t *testing.T) {
+	body := `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"an upstream's own 424","reason":"FailedDependency",` +
+		`"details":{"group":"g.example.org","kind":"things","causes":[{"reason":"TypeNotInstalled","message":"g.example.org/v1","field":"apiVersion"}]},"code":424}`
+	st := nonOKStatus(424, []byte(body))
+	got, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("stage failure: %s", got)
+	if st.Details != nil || strings.Contains(string(got), "details") || strings.Contains(string(got), "TypeNotInstalled") {
+		t.Fatalf("an upstream's cause reached the stage failure: %s", got)
+	}
+	if st.Code != 424 || st.Message != "an upstream's own 424" {
+		t.Fatalf("want a plain 424 with the upstream's message, got %s", got)
+	}
+}

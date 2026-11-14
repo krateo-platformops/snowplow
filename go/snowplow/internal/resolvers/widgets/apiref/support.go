@@ -2,6 +2,7 @@ package apiref
 
 import (
 	"encoding/json"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -53,16 +54,23 @@ func statusErrorFromResponse(st *response.Status, ref templatesv1.ObjectReferenc
 		code = http.StatusInternalServerError
 	}
 	reason := metav1.StatusReason(st.Reason)
+	details := &metav1.StatusDetails{
+		Name: ref.Name,
+		Kind: ref.Resource,
+	}
+	// #1429 — a read that found its TYPE not installed says which type in its
+	// details; those replace the reference's (statusdetails), so the error
+	// names the missing type and no object.
+	if gvr, ok := statusdetails.MissingType(st); ok {
+		details = statusdetails.TypeNotInstalledMeta(gvr)
+	}
 	return &apierrors.StatusError{
 		ErrStatus: metav1.Status{
 			Status:  st.Status,
 			Message: st.Message,
 			Reason:  reason,
 			Code:    code,
-			Details: &metav1.StatusDetails{
-				Name: ref.Name,
-				Kind: ref.Resource,
-			},
+			Details: details,
 		},
 	}
 }

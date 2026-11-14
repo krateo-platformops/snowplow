@@ -279,3 +279,59 @@ describe('snowplow #853: 424 Failed Dependency', () => {
   })
 })
 ```
+
+## 6. Two kinds of 424, and how a program tells them apart (#1414, #1429)
+
+snowplow answers `424 Failed Dependency` with `reason: "FailedDependency"` in two
+situations. The `message` is for people; a program must not parse it. The
+difference is in the body's `details`.
+
+| situation | `details` |
+|---|---|
+| A **type** is not installed on the cluster: the object asked for, or a dependency of it, is of a type the apiserver does not serve | present, with exactly one cause whose `reason` is `TypeNotInstalled` |
+| An **object** a widget reads is missing (the dependency answered 404 or 410; sections 1 to 5) | absent |
+
+The type-not-installed body, for a type in a named group:
+
+```json
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster.","reason":"FailedDependency","details":{"group":"widgets.templates.krateo.io","kind":"flexes","causes":[{"reason":"TypeNotInstalled","message":"widgets.templates.krateo.io/v1beta1","field":"apiVersion"}]},"code":424}
+```
+
+and for a type in the core group:
+
+```json
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"The type things (v1) is not installed on this cluster.","reason":"FailedDependency","details":{"kind":"things","causes":[{"reason":"TypeNotInstalled","message":"v1","field":"apiVersion"}]},"code":424}
+```
+
+Field by field:
+
+- `details.group`: the missing type's API group. It is **left out** for the
+  core group; read an absent `group` as `""`.
+- `details.kind`: the missing type's **resource** (the plural, such as
+  `flexes`), as it was asked for. It is the resource, not the Kind, as in the
+  apiserver's own NotFound details.
+- `details.causes`: **exactly one** cause.
+  - `reason`: `TypeNotInstalled`.
+  - `field`: `apiVersion`.
+  - `message`: the missing type's apiVersion, `<group>/<version>`, or the
+    version alone (`v1`) for the core group. For this reason the cause's
+    `message` is a **value with that grammar, not prose**.
+- There is no object name, namespace, uid or identity in `details`.
+
+When the missing type is a **dependency's**, the request names the widget and
+`details` names the dependency's type. A widget
+`buttons.widgets.templates.krateo.io` whose `apiRef` is a RESTAction, on a
+cluster without the RESTAction CRD, answers:
+
+```json
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"The type restactions (templates.krateo.io/v1) is not installed on this cluster.","reason":"FailedDependency","details":{"group":"templates.krateo.io","kind":"restactions","causes":[{"reason":"TypeNotInstalled","message":"templates.krateo.io/v1","field":"apiVersion"}]},"code":424}
+```
+
+Only snowplow produces this cause. An upstream's own `details` (an apiserver's,
+or an external endpoint's behind a RESTAction stage) never reach a snowplow
+answer, so a body that carries the cause carries it because snowplow found the
+type missing. An upstream that itself answers HTTP 424 is passed through with
+its code and message and no `details`.
+
+The top-level `reason`, `code` and `message` are unchanged by #1429, so the
+frontend's 424 state renders as before.

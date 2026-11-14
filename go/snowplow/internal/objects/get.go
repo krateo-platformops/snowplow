@@ -20,6 +20,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -397,6 +398,9 @@ func typeNotInstalled(gvr schema.GroupVersionResource) *response.Status {
 	st.Message = fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion())
 	st.Status = response.StatusFailure
 	st.Reason = ReasonFailedDependency
+	// #1429 — which type, for a reader that must not parse the message
+	// (statusdetails): group, resource and apiVersion, as they were asked for.
+	st.Details = statusdetails.TypeNotInstalled(gvr)
 	return st
 }
 

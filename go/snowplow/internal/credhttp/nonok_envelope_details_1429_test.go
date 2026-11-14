@@ -54,3 +54,18 @@ func TestNonOKEnvelope_AnUpstreamsDetailsNeverReachTheEnvelope(t *testing.T) {
 		})
 	}
 }
+
+// An upstream that answers 424 with snowplow's own cause in its body: the envelope is a plain
+// 424 with the upstream's message and reason, and no details. The cause is snowplow's to give.
+func TestNonOKEnvelope_AnUpstream424CannotPresentTheTypeNotInstalledCause(t *testing.T) {
+	body := `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"an upstream's own 424","reason":"FailedDependency",` +
+		`"details":{"group":"g.example.org","kind":"things","causes":[{"reason":"TypeNotInstalled","message":"g.example.org/v1","field":"apiVersion"}]},"code":424}`
+	got, err := json.Marshal(nonOKEnvelope(424, []byte(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"an upstream's own 424","reason":"FailedDependency","code":424}`
+	if string(got) != want {
+		t.Fatalf("nonOKEnvelope returned\n got: %s\nwant: %s", got, want)
+	}
+}
