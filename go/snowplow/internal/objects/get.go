@@ -15,6 +15,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/apipath"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
@@ -40,6 +41,20 @@ type Result struct {
 }
 
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
+	// #1257 / #1414 — THE REFERENCE IS AN APISERVER PATH OR IT IS REFUSED.
+	// A reference reaches this read from a request's query, a nested call's
+	// path, a cache entry's inputs or CR content (an apiRef, a walked child),
+	// and under the requester's credential or snowplow's own. Whatever its
+	// source and credential, its group, version and resource each become one
+	// segment of the apiserver path (apipath.CheckGVR, the one rule), or the
+	// read is refused here with a 400: before the informer, before any
+	// discovery, before any dial.
+	if st := checkReference(ref); st != nil {
+		xcontext.Logger(ctx).ErrorContext(ctx, "reference is not an apiserver path", slog.String("err", st.Message))
+		res.Err = st
+		return res
+	}
+
 	// R5 (0.30.110): resolver-side dep recording. When this Get runs
 	// under a cache.WithL1KeyContext ctx, the fetched object becomes a
 	// dependency of the L1 entry being populated — record the edge so a
@@ -195,6 +210,20 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	return getFromAPIServer(ctx, ref)
 }
 
+// checkReference is nil for a reference whose group, version and resource are
+// each one apiserver path segment, else the 400 that refuses it. A group/version
+// that does not parse is left to the read, which answers its own 400 for it.
+func checkReference(ref templatesv1.ObjectReference) *response.Status {
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil
+	}
+	if err := apipath.CheckGVR(gv.WithResource(ref.Resource), apipath.Reference); err != nil {
+		return response.New(http.StatusBadRequest, err)
+	}
+	return nil
+}
+
 // informerOnlyMiss returns the NotFound-shaped Result an informer-only ctx
 // (#101, cache.WithInformerOnlyReads) yields on a routed-branch fallthrough,
 // WITHOUT touching the apiserver. It fills res.GVR (best-effort parse) so the
@@ -226,7 +255,6 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		return
 	}
 	res.GVR = gv.WithResource(ref.Resource)
-
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
@@ -299,6 +327,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = st // #1115 — 504 Timeout
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
+		} else if dynamic.IsNotServed(err) {
+			res.Err = typeNotInstalled(res.GVR) // #1414 — 424, before the object's 404
 		} else if apierrors.IsNotFound(err) {
 			res.Err = response.New(http.StatusNotFound, err)
 		}
@@ -347,6 +377,27 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	res.Unstructured = uns
 	res.Err = nil
 	return
+}
+
+// ReasonFailedDependency is the Status reason of a 424 answer. Neither plumbing
+// nor apimachinery names one for 424.
+const ReasonFailedDependency response.StatusReason = "FailedDependency"
+
+// typeNotInstalled is the answer to a read whose type the apiserver does not
+// serve (#1414): 424 Failed Dependency, not 404. A 404 says an OBJECT is not
+// there: a reader retries it as a cold start and takes it, on a refetch, as a
+// confirmed delete. Here nothing was deleted and no retry can help: something
+// the read needs is not installed on this cluster.
+//
+// The message is shown to users as it is, so it is built from the type's
+// coordinates alone: no object name or namespace, no identity, none of the
+// apiserver's text. One rule for every type.
+func typeNotInstalled(gvr schema.GroupVersionResource) *response.Status {
+	st := response.New(http.StatusFailedDependency, nil)
+	st.Message = fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion())
+	st.Status = response.StatusFailure
+	st.Reason = ReasonFailedDependency
+	return st
 }
 
 // recordGetDep registers an exact-object dependency edge for a
