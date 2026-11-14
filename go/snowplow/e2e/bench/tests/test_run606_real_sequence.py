@@ -220,6 +220,24 @@ _CANON = textwrap.dedent("""\
     """)
 
 FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
+    def slow_read(secs):
+        # a read that hangs `secs` (it ignores --request-timeout, as an open exec stream does), and says in
+        # slow-reads.jsonl how it ended: "cut" by a TERM (after how long), or "completed" (it ran its whole hang)
+        if secs <= 0:
+            return
+        import signal
+        t0 = time.monotonic()
+        def note(how):
+            with open(os.path.join(STATE, "slow-reads.jsonl"), "a") as fh:
+                fh.write(json.dumps({"argv": sys.argv[1:], "how": how,
+                                     "after_s": round(time.monotonic() - t0, 3)}) + "\\n")
+        def cut(*_):
+            note("cut")
+            os._exit(143)
+        signal.signal(signal.SIGTERM, cut)
+        time.sleep(secs)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        note("completed")
     raw = sys.argv[1:]
     kc = os.environ.get("KUBECONFIG"); ctx = None; a = []; ns = None; imp = []
     it = iter(raw)
@@ -931,7 +949,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     if a[:1] == ["cp"] and any(x.startswith("load606") for x in a):
         # The driver's /out/nav.jsonl (#817). FAKE_DRIVE_STREAM: whole (a framed
         # stream) | headcut (run 9: only the tail after log rotation) | nofile.
-        time.sleep(float(os.environ.get("FAKE_SLOW_LOGS", "0")))   # a slow / hung read
+        slow_read(float(os.environ.get("FAKE_SLOW_LOGS", "0")))     # a slow / hung read
         mode = os.environ.get("FAKE_DRIVE_STREAM", "whole")
         if mode == "nofile":
             print("tar: /out/nav.jsonl: Cannot stat", file=sys.stderr); sys.exit(1)
