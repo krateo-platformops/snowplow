@@ -6,7 +6,8 @@ package fakeapiserver
 // /call, and a scripted create-rule (§6) files it as the Zendesk provider would, after a delay. The
 // CRDs are 057's own (testdata/zendesk, read-only from 057 on 2026-11-13); the POST body and the
 // "filed" status are the shapes portal #424 sends and renders; the ServiceAccount's grant is 057's
-// (get/list/watch on */*, create on self/subjectaccessreviews, impersonate users).
+// (get/list/watch on */*, create on self/subjectaccessreviews, impersonate users) and nothing more:
+// the filing is the simulated controller's write, which needs no grant of the ServiceAccount's.
 
 import (
 	"encoding/json"
@@ -50,20 +51,13 @@ func zrRBAC() []map[string]any {
 		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": map[string]any{"name": "snowplow-krateo-system", "resourceVersion": "42"},
 			"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "snowplow-krateo-system"},
 			"subjects": []any{map[string]any{"kind": "ServiceAccount", "name": "snowplow", "namespace": "krateo-system"}}},
-		// §6: the scripted status write, as the ServiceAccount.
-		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": map[string]any{"name": "sandbox-zendesk-filed", "namespace": "krateo-system", "resourceVersion": "43"}, "rules": []any{
-			rule([]any{zrGroup}, []any{"zendeskrequests/status"}, []any{"get", "patch", "update"}),
-		}},
-		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": map[string]any{"name": "sandbox-zendesk-filed", "namespace": "krateo-system", "resourceVersion": "44"},
-			"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "sandbox-zendesk-filed"},
-			"subjects": []any{map[string]any{"kind": "ServiceAccount", "name": "snowplow", "namespace": "krateo-system"}}},
 		// The visitor's Raise, in the configuration's namespace only: create, get and list
 		// requests; list configurations.
-		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": map[string]any{"name": "sandbox-visitor-raise", "namespace": "krateo-system", "resourceVersion": "45"}, "rules": []any{
+		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": map[string]any{"name": "sandbox-visitor-raise", "namespace": "krateo-system", "resourceVersion": "43"}, "rules": []any{
 			rule([]any{zrGroup}, []any{"zendeskrequests"}, []any{"create", "get", "list"}),
 			rule([]any{zrGroup}, []any{"zendeskrequestconfigurations"}, []any{"list"}),
 		}},
-		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": map[string]any{"name": "sandbox-visitor-raise", "namespace": "krateo-system", "resourceVersion": "46"},
+		{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": map[string]any{"name": "sandbox-visitor-raise", "namespace": "krateo-system", "resourceVersion": "44"},
 			"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "sandbox-visitor-raise"},
 			"subjects": []any{map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "sandbox-visitor"}}},
 	}
@@ -214,7 +208,7 @@ func cardState(o map[string]any) string {
 }
 
 // (c) and (a): the visitor's create is a 201 with RV+1, one ADDED event and its 10-key request
-// line; the card shows "filing"; after the delay the rule files it, as the ServiceAccount, with one
+// line; the card shows "filing"; after the delay the rule files it, as the controller, with one
 // MODIFIED event, the seeded request's status fields and the times stamped; the card shows "filed".
 // Both states, in order, on one watch, without a reload.
 func TestZendesk_RaiseIsFilingThenFiledInOrder(t *testing.T) {
@@ -296,7 +290,7 @@ func TestZendesk_RaiseIsFilingThenFiledInOrder(t *testing.T) {
 	if len(filing) != 1 {
 		t.Fatalf("the filing wrote %d lines, want its one request line: %v", len(filing), filing)
 	}
-	eq(t, filing[0], map[string]any{"verb": "patch", "group": zrGroup, "version": "v2", "resource": "zendeskrequests/status", "namespace": "krateo-system", "name": name, "query": "", "status": 200, "items": 0, "identity": "sa"}, "the filing's request line")
+	eq(t, filing[0], map[string]any{"verb": "patch", "group": zrGroup, "version": "v2", "resource": "zendeskrequests/status", "namespace": "krateo-system", "name": name, "query": "", "status": 200, "items": 0, "identity": "controller"}, "the filing's request line")
 
 	// Once: nothing more for this object.
 	h.advance(time.Minute)
