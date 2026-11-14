@@ -173,19 +173,61 @@ func subGenCounterFor(subj subjectKey) *atomic.Uint64 {
 	return v.(*atomic.Uint64)
 }
 
-// BumpSubjectSubGens increments the sub-generation of each subject whose
-// effective bindings just changed. Called from the RBAC informer hooks
-// (onBindingAdd/Update/Delete) with the binding's subjects already in hand
-// (subjectsFromRBAC(o.Subjects)) — so NO new informer and NO binding-set walk.
-// An Update deletes-old-then-adds-new; the hook calls this for BOTH the old
-// subject set (on the delete leg) and the new (on the add leg), so a
-// subject-list edit that drops user U and adds user V bumps both U (its grant
-// changed: removed) and V (added). Idempotent-safe: every call is a monotonic
-// +1, and the key only needs to CHANGE on any relevant RBAC event, not carry a
-// meaningful absolute value.
+// rbacStateClock (#1439) numbers the RBAC states that rotate a key. It ticks
+// once per flush that bumps at least one subject (BumpSubjectSubGens) and once
+// for the #682 boot-window epoch (rotateIfRBACEventSeenPreBuild), and the tick's
+// value is written into every counter that event moves. A counter therefore
+// holds the NUMBER OF THE LAST STATE CHANGE THAT TOUCHED ITS SUBJECT, and one
+// value is written by one event only.
+//
+// WHY A CLOCK AND NOT A COUNT. Before #1439 each bump added 1 and an identity's
+// sub-generation was the SUM of its counters. A sum says how many times
+// something changed, not which state the identity is in, so two identities with
+// one binding set and different histories reached the same value at different
+// times: one whose own counter stood at 2 (a binding granted then revoked) held
+// (digest, 2) before two rules edits of a shared role; one whose own counter was
+// 0 held (digest, 2) after them. The second derived the first's pre-edit key and
+// was served its pre-edit body (TestIssue1439_ClassValueNamesOneRBACState).
+var rbacStateClock atomic.Uint64
+
+// nextRBACState ticks the state clock and returns the new state's number.
+func nextRBACState() uint64 { return rbacStateClock.Add(1) }
+
+// raiseSubGenTo moves c up to state. It never lowers c: the clock only rises,
+// so a concurrent writer that already stored a later state keeps it.
+func raiseSubGenTo(c *atomic.Uint64, state uint64) {
+	for {
+		cur := c.Load()
+		if cur >= state || c.CompareAndSwap(cur, state) {
+			return
+		}
+	}
+}
+
+// foldSubGen folds one more counter into an identity's sub-generation: the
+// LATER of the two states. See RBACSubGenForSubject for why it is not a sum.
+func foldSubGen(acc, counter uint64) uint64 {
+	return max(acc, counter)
+}
+
+// BumpSubjectSubGens moves the sub-generation of each subject whose effective
+// RBAC just changed to ONE new state of the state clock. Its production caller
+// is the flush at the snapshot publish (bumpTakenSubGens, rbac_subgen_pending.go),
+// which hands it every subject the publish's RBAC events touched: both sides of
+// a binding subject edit, every subject of every binding that references an
+// edited role. All of them get the same number — they changed together, in the
+// state that publish made live.
+//
+// The new state is above every value any counter holds, so every bumped
+// subject's counter changes, and with it the key of every identity that folds
+// it. An empty set ticks nothing.
 func BumpSubjectSubGens(subjects []subjectKey) {
+	if len(subjects) == 0 {
+		return
+	}
+	state := nextRBACState()
 	for _, s := range subjects {
-		subGenCounterFor(s).Add(1)
+		raiseSubGenTo(subGenCounterFor(s), state)
 	}
 	// One atomic add for the whole batch, not one per element — the counter is
 	// a cumulative total, so len(subjects) is the exact delta. Sequenced AFTER
@@ -194,15 +236,32 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 }
 
 // RBACSubGenForSubject returns the requesting identity's EFFECTIVE RBAC
-// sub-generation: the sum over the identity's own subject counter(s) — the User
-// counter, every presented Group's counter, and (when the username is a
-// ServiceAccount) the SA counter. A sum means ANY relevant subject's bump
-// changes the total, so the folded key rotates on a grant/revoke via the user
-// OR any of its groups OR (for an SA) the SA identity — the C-118-2 group-grant
-// crux. Lock-free (a handful of atomic Loads). O(len(groups)) map reads on the
-// hot path; a user has O(10) groups (design INFERRED bound, pinned by the herd
-// arm). Returns 0 for an identity none of whose subjects has ever been touched
-// (correct: nothing changed → no key rotation).
+// sub-generation: the number of the last RBAC state change that touched the
+// identity — the LATEST state over its own subject counter(s) (the User
+// counter, every presented Group's counter, and, when the username is a
+// ServiceAccount, the SA counter) and the #682 boot-window epoch. Any relevant
+// subject's bump writes a state above all of them, so the folded key rotates on
+// a grant/revoke via the user OR any of its groups OR (for an SA) the SA
+// identity — the C-118-2 group-grant crux. Lock-free (a handful of atomic
+// Loads). O(len(groups)) map reads on the hot path; a user has O(10) groups
+// (design INFERRED bound, pinned by the herd arm). Returns 0 for an identity
+// none of whose subjects has ever been touched (correct: nothing changed → no
+// key rotation).
+//
+// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE. Take two identities that
+// hold one binding set and read the same value v, at any two times. Neither has
+// had a subject bumped after state v. Every change that can move a verdict of
+// theirs without moving the binding set bumps one of their subjects: a rules
+// change, create or delete of a role one of their bindings references bumps
+// every subject of that binding, and a binding re-pointed at one of their
+// subjects, or to another role, bumps both sides. So for both, the roles behind
+// the binding set are exactly those of state v: the same verdicts. With the sum
+// this fold used before, equal values meant only an equal NUMBER of changes.
+// Both halves are needed: a sum of clock values collides (states 3 and 4 add up
+// to state 7), and the latest of per-subject counts collides (2 and 2).
+//
+// A read that races a flush sees, per counter, either the old value or the new
+// state; the fold is then the old value or the new state, never a third one.
 //
 // The subjectKey mapping mirrors subjectsFromRBAC exactly: a User is
 // {Kind:"User",Name:username}; a Group is {Kind:"Group",Name:g}; a
@@ -210,27 +269,27 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 // subject {Kind:"ServiceAccount",Name:<name>,Namespace:<ns>} so a binding whose
 // subject is that SA (which onBinding* recorded as an SA subjectKey) bumps it.
 func RBACSubGenForSubject(username string, groups []string) uint64 {
-	// #682 — the process-wide boot-window epoch is one more monotone term of
-	// the sum (rbac_subgen_epoch.go explains why that cannot collide).
-	sum := rbacSubGenEpoch.Load()
+	// #682 — the process-wide boot-window epoch is one more state of the same
+	// clock (rbac_subgen_epoch.go).
+	gen := rbacSubGenEpochState.Load()
 	if username != "" {
 		if ns, name, ok := parseServiceAccountUsername(username); ok {
 			// The identity is a ServiceAccount: fold the SA subject counter (the
 			// shape onBinding* recorded), NOT a User counter — a binding granting
 			// this SA is indexed under the SA subjectKey.
-			sum += subGenValue(subjectKey{Kind: subjectKindServiceAccount, Name: name, Namespace: ns})
+			gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindServiceAccount, Name: name, Namespace: ns}))
 		} else {
 			// A human/user identity: fold the User subject counter.
-			sum += subGenValue(subjectKey{Kind: subjectKindUser, Name: username})
+			gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindUser, Name: username}))
 		}
 	}
 	for _, g := range groups {
 		if g == "" {
 			continue
 		}
-		sum += subGenValue(subjectKey{Kind: subjectKindGroup, Name: g})
+		gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindGroup, Name: g}))
 	}
-	return sum
+	return gen
 }
 
 // subGenValue reads a subject's counter WITHOUT creating it — an untouched
@@ -286,5 +345,6 @@ func ResetRBACSubGenForTest() {
 	})
 	rbacSubGenBumps.Store(0)
 	rbacSubGenSubjects.Store(0)
+	rbacStateClock.Store(0)
 	resetRBACSubGenEpochForTest()
 }

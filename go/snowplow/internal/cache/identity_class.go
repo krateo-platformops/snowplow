@@ -36,9 +36,13 @@ import (
 )
 
 // IdentityClass is the requester's RBAC class as the identity-bound keys fold
-// it. Two identities with equal classes get the same verdict for every RBAC
-// check (the binding-set digest), and an RBAC change that moves any of a
-// subject's verdicts moves the class (the sub-generation, monotone per subject).
+// it. A class value names ONE RBAC state: two identities that read equal
+// classes — at one instant or at two different times (#1439) — get the same
+// verdict for every RBAC check. The binding-set digest says which bindings
+// apply; the sub-generation is the number of the last RBAC state change that
+// touched the identity (RBACSubGenForSubject), so it says which contents of the
+// roles behind those bindings. An RBAC change that moves any of a subject's
+// verdicts moves the class.
 type IdentityClass struct {
 	SubjectBindingSet string
 	RBACSubGen        uint64
