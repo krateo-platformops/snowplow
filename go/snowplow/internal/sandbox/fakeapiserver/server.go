@@ -156,8 +156,8 @@ func New(o Options) (*Server, error) {
 	}
 	id := s.snap.Identity
 	s.sa = serviceAccountIdentity(id.ServiceAccount.Namespace, id.ServiceAccount.Name)
-	s.sa.Label = "sa"
-	s.visitor = identity{User: id.Visitor.Username, Groups: append(append([]string{}, id.Visitor.Groups...), "system:authenticated"), Label: "visitor"}
+	s.sa.Label = labelSA
+	s.visitor = identity{User: id.Visitor.Username, Groups: append(append([]string{}, id.Visitor.Groups...), "system:authenticated"), Label: labelVisitor}
 	// §8: the one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
 	// under the visitor's exact name (credsecret.For's first, preferred name: the session name, or
 	// the step-up one for a step-up identity), owned through the username annotation
@@ -274,10 +274,15 @@ func (s *Server) unimplemented(what string) error {
 
 // ------------------------------------------------------------------ authentication
 
+// authenticate is the only way a request gets an identity: no Authorization header is anonymous,
+// the ServiceAccount's token and the visitor's are theirs, anything else is 401. With impersonate
+// below, a request's log line says sa, visitor, other or none. It never says controller: that
+// line is the scripted status write's (applyStatus), which is no request, and no token or header
+// names it.
 func (s *Server) authenticate(r *http.Request) (identity, error) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
-		return identity{User: "system:anonymous", Groups: []string{"system:unauthenticated"}, Label: "none"}, nil
+		return identity{User: "system:anonymous", Groups: []string{"system:unauthenticated"}, Label: labelNone}, nil
 	}
 	tok, ok := strings.CutPrefix(auth, "Bearer ")
 	tok = strings.TrimSpace(tok)
@@ -361,12 +366,12 @@ func (s *Server) impersonate(r *http.Request, id identity) (identity, error) {
 	} else if !hasString(out.Groups, "system:unauthenticated") {
 		out.Groups = append(out.Groups, "system:unauthenticated")
 	}
-	out.Label = "other"
+	out.Label = labelOther
 	switch user {
 	case s.visitor.User:
-		out.Label = "visitor"
+		out.Label = labelVisitor
 	case s.sa.User:
-		out.Label = "sa"
+		out.Label = labelSA
 	}
 	return out, nil
 }
@@ -384,10 +389,12 @@ func hasString(list []string, v string) bool {
 
 // requestLine is a request-log line (sandbox SNAPSHOT.md §4): exactly the 10 keys verb, group,
 // version, resource, namespace, name, query, status, items and identity. items is 0 for a verb that
-// returns no items (writes, reviews, discovery, errors); a get, list or watch sets it. The fake's
-// only other lines are its two event lines, applyStatus.failed and fake.unimplemented.
+// returns no items (writes, reviews, discovery, errors); a get, list or watch sets it. identity is
+// the request's (sa, visitor, other or none), or controller on the line of a scripted status write
+// (applyStatus), which no request made. The fake's only other lines are its event lines:
+// applyStatus.failed, fake.unimplemented and fake.watchExpired.
 func requestLine(query string) map[string]any {
-	return map[string]any{"verb": "", "group": "", "version": "", "resource": "", "namespace": "", "name": "", "query": query, "status": 0, "items": 0, "identity": "none"}
+	return map[string]any{"verb": "", "group": "", "version": "", "resource": "", "namespace": "", "name": "", "query": query, "status": 0, "items": 0, "identity": labelNone}
 }
 
 // ServeHTTP serves one request and logs it.
