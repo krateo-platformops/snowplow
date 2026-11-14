@@ -24,13 +24,13 @@ import (
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/apipath"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
-	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -672,9 +672,9 @@ type callOptions struct {
 //
 // #1257 — every value that becomes a path segment (the API group and version,
 // the resource, the namespace, the name and the subresource) is exactly one
-// segment of the path, or the request is refused (errBadPathSegment, a 400)
+// segment of the path, or the request is refused (apipath.BadSegmentError, a 400)
 // before anything is dialled. A value is a segment only when the apiserver
-// accepts it as one (content.IsPathSegmentName: never "." or "..", never a "/"
+// accepts it as one (apipath.Segment: never "." or "..", never a "/"
 // or a "%", which the apiserver decodes back into a "/"), and it is sent
 // escaped (url.PathEscape), so a "?" or a "#" in a name stays in the name
 // instead of starting a query or a fragment. So the object the apiserver
@@ -689,11 +689,8 @@ type callOptions struct {
 func buildURIPath(opts callOptions) (string, error) {
 	var parts []string
 	add := func(param, v string) error {
-		if v == "" {
-			return &errBadPathSegment{param: param, reason: "may not be empty"}
-		}
-		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
-			return &errBadPathSegment{param: param, reason: strings.Join(errs, ", ")}
+		if err := apipath.Segment(apipath.Query(param), v); err != nil {
+			return err
 		}
 		parts = append(parts, url.PathEscape(v))
 		return nil
@@ -837,15 +834,6 @@ func (r *callHandler) asked(req *http.Request) audit.Event {
 // and the apiserver takes the new object's name from the body (#1378).
 func nameInPath(verb string) bool {
 	return has([]string{http.MethodDelete, http.MethodGet, http.MethodPut, http.MethodPatch}, verb)
-}
-
-// errBadPathSegment is buildURIPath's refusal of a query value that is not one
-// apiserver path segment (#1257). It names the parameter and the rule, never
-// the value.
-type errBadPathSegment struct{ param, reason string }
-
-func (e *errBadPathSegment) Error() string {
-	return fmt.Sprintf("invalid %q query parameter: %s", e.param, e.reason)
 }
 
 func has(s []string, e string) bool {

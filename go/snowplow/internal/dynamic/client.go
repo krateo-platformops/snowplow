@@ -2,9 +2,14 @@ package dynamic
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
+	"github.com/krateo-platformops/snowplow/internal/apipath"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -83,7 +88,7 @@ func (uc *unstructuredClient) Create(ctx context.Context, obj *unstructured.Unst
 }
 
 func (uc *unstructuredClient) Get(ctx context.Context, name string, opts Options) (*unstructured.Unstructured, error) {
-	ri, err := uc.resourceInterfaceFor(opts)
+	ri, err := uc.readInterfaceFor(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +97,7 @@ func (uc *unstructuredClient) Get(ctx context.Context, name string, opts Options
 }
 
 func (uc *unstructuredClient) List(ctx context.Context, opts Options) (*unstructured.UnstructuredList, error) {
-	ri, err := uc.resourceInterfaceFor(opts)
+	ri, err := uc.readInterfaceFor(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +221,15 @@ func (uc *unstructuredClient) Discover(ctx context.Context, category string) ([]
 	return all, nil
 }
 
+// resourceInterfaceFor returns the interface for opts' resource, as the mapper
+// resolves it. A resource the mapper has no mapping for is the mapper's error:
+// this is the route of the writes (Create, Delete), which never act on a
+// resource the client's copy of discovery does not know. The reads go through
+// readInterfaceFor.
 func (uc *unstructuredClient) resourceInterfaceFor(opts Options) (dynamic.ResourceInterface, error) {
+	if err := checkPathSegments(opts); err != nil {
+		return nil, err
+	}
 	if opts.GVK.Empty() && !opts.GVR.Empty() {
 		gvk, err := uc.mapper.KindFor(opts.GVR)
 		if err != nil {
@@ -230,14 +243,113 @@ func (uc *unstructuredClient) resourceInterfaceFor(opts Options) (dynamic.Resour
 		return nil, err
 	}
 
-	var ri dynamic.ResourceInterface
-	if len(opts.Namespace) == 0 {
-		ri = uc.dynamicClient.Resource(restMapping.Resource)
-	} else {
-		ri = uc.dynamicClient.Resource(restMapping.Resource).
-			Namespace(opts.Namespace)
+	return uc.resourceInterface(restMapping.Resource, opts.Namespace), nil
+}
+
+// readInterfaceFor is resourceInterfaceFor for a read (Get, List), with one
+// difference (#1414): when the mapper has no mapping for a fully named
+// resource, the apiserver is asked instead of failing on the miss.
+//
+// NO MAPPING IS NOT AN ANSWER. The mapper is a copy of discovery, and it has
+// no mapping in three situations it cannot tell apart: the resource is not
+// served (no CRD), its group's discovery failed or is stale (client-go drops
+// such a group from the mapper without an error), or the copy predates the
+// CRD. Returning the miss made every one of them a non-Status error, which
+// the callers answer 500. servedResource reads the one document that says
+// which it is. One rule for every resource.
+func (uc *unstructuredClient) readInterfaceFor(opts Options) (dynamic.ResourceInterface, error) {
+	ri, err := uc.resourceInterfaceFor(opts)
+	if err == nil || !meta.IsNoMatchError(err) || !opts.GVK.Empty() ||
+		opts.GVR.Version == "" || opts.GVR.Resource == "" {
+		return ri, err
 	}
-	return ri, nil
+	gvr, err := uc.servedResource(opts.GVR)
+	if err != nil {
+		return nil, err
+	}
+	return uc.resourceInterface(gvr, opts.Namespace), nil
+}
+
+func (uc *unstructuredClient) resourceInterface(gvr schema.GroupVersionResource, namespace string) dynamic.ResourceInterface {
+	if len(namespace) == 0 {
+		return uc.dynamicClient.Resource(gvr)
+	}
+	return uc.dynamicClient.Resource(gvr).Namespace(namespace)
+}
+
+// checkPathSegments refuses options whose group, version or resource is not
+// one apiserver path segment (#1257, apipath.Segment). The client is the last
+// place before the wire: client-go joins these values into the request path as
+// they are, so a "/" would add segments and a ".." would leave the resource.
+// Nothing is discovered or dialled for such a value.
+func checkPathSegments(opts Options) error {
+	// Each part the caller named. A part left empty never becomes a path as
+	// given: the mapper resolves it, or the read refuses it.
+	for _, part := range []struct{ field, v string }{
+		{"group", opts.GVR.Group}, {"version", opts.GVR.Version}, {"resource", opts.GVR.Resource},
+	} {
+		if part.v == "" {
+			continue
+		}
+		if err := apipath.Segment(apipath.ClientOption(part.field), part.v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// NotServedError says the apiserver does not serve a resource: its type is not
+// installed. It is never inferred from an error's text or media type; see
+// servedResource for the evidence it stands on.
+type NotServedError struct {
+	GVR schema.GroupVersionResource
+}
+
+func (e *NotServedError) Error() string {
+	return fmt.Sprintf("the apiserver does not serve %s in %s", e.GVR.Resource, e.GVR.GroupVersion())
+}
+
+// IsNotServed reports whether err says the requested resource's type is not
+// served by the apiserver, as opposed to an object of a served type missing.
+func IsNotServed(err error) bool {
+	var nse *NotServedError
+	return errors.As(err, &nse)
+}
+
+// servedResource answers, for a resource the mapper has no mapping for,
+// whether the apiserver serves it, from the one place that says so: the
+// discovery document of the resource's own group/version, read now from the
+// apiserver and not from the mapper's copy.
+//
+//   - the document is a 404 (the group/version is not served) or lists no such
+//     resource: *NotServedError. Nothing else is dialled;
+//   - the document lists it: the resource as the document names it. The name
+//     is matched as the mapper matches one (lower-cased, plural or singular),
+//     so a read resolves to the same resource whether the mapper or this
+//     document resolved it, and the path is built from the apiserver's own
+//     name, never from the caller's;
+//   - the document cannot be read (the group's backend is down, the apiserver
+//     is unreachable): that error. An unknown is never "not served".
+func (uc *unstructuredClient) servedResource(gvr schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	list, err := uc.discoveryClient.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
+	if apierrors.IsNotFound(err) {
+		return schema.GroupVersionResource{}, &NotServedError{GVR: gvr}
+	}
+	if err != nil {
+		return schema.GroupVersionResource{}, err
+	}
+	want := strings.ToLower(gvr.Resource)
+	if list != nil {
+		for _, r := range list.APIResources {
+			if strings.Contains(r.Name, "/") {
+				continue // a subresource is not a resource
+			}
+			if r.Name == want || (r.SingularName != "" && r.SingularName == want) {
+				return gvr.GroupVersion().WithResource(r.Name), nil
+			}
+		}
+	}
+	return schema.GroupVersionResource{}, &NotServedError{GVR: gvr}
 }
 
 func found(el metav1.APIResource, str string) bool {
