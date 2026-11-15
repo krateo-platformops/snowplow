@@ -103,7 +103,7 @@ const maxUnstructuredResponseTextBytes = 2048
 // (ProxyURL, not ServerURL) leaking by a different mechanism; it is the #453 /
 // #500 error-prose class and is tracked as #536.
 func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
-	return httpFetchConverting(ctx, opts, toJSONBytes)
+	return httpFetchConverting(ctx, opts, toJSONBytes, nil)
 }
 
 // httpFetchConverting is httpFetchAllowingNonJSON with the 2xx body conversion
@@ -111,7 +111,13 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 // (external_fetch_cache.go), which returns exactly what toJSONBytes returns for
 // the same bytes. The request, the response handling and every error path are
 // the same for both.
-func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error) {
+//
+// share, when set, wraps the finished transport chain (#1320,
+// external_fetch_flight.go): it is the outermost layer on the client, directly
+// under credhttp.Send, so the send policy above it is this caller's own and
+// everything below it — the credential, the Impersonate-* headers, the host
+// pin, the tracing headers — is on the one request that reaches the wire.
+func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error), share func(http.RoundTripper, *http.Request) http.RoundTripper) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
 	// #1137 — the URL is built by the one builder the plan's check reads
 	// (credhttp.RequestURL), so the path checked is the path sent.
@@ -257,6 +263,9 @@ func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, conv
 	// Impersonate-* header is added.
 	if saDial {
 		cli.Transport = pinSADialHost(u, cli.Transport)
+	}
+	if share != nil {
+		cli.Transport = share(cli.Transport, call)
 	}
 
 	// #1088 — the endpoint send policy: a write (any method but GET, HEAD,

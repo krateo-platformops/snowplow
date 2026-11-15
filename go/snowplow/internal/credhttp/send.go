@@ -381,7 +381,9 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	tr := &attemptTrace{}
 	start := time.Now()
-	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), tr.hooks())))
+	// tr.shared: an attempt answered by a request already on the wire (#1320)
+	// is classified through it, never measured (shared_attempt.go).
+	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(withSharedAttemptSink(req.Context(), tr.shared), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
 	// #1131 — RetryClient has no way to be told an error is final, and it reads

@@ -1596,8 +1596,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if branchE == branchEImpersonate {
 		fctx = withEndpointImpersonation(fctx, branchEImp)
 	}
-	// Always a live fetch; the CONVERSION is memoised by the response's bytes
-	// (external_fetch_cache.go). The touch above still declines the L1 Put.
+	// Always a live fetch of this caller's own: its send policy, page budget,
+	// audit record, item error and stage outcome are its own. Only a request
+	// on the wire may be shared with an identical read waiting at the same
+	// time (#1320: same request, credentials and every header included; never
+	// after it completes), and the CONVERSION is memoised by the response's
+	// bytes (external_fetch_cache.go, external_fetch_flight.go). The touch
+	// above still declines the L1 Put.
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := credhttp.WithAnswer(fctx)
@@ -2088,7 +2093,16 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		thirdPartyDial: !heldCred && !requesterBearer,
 	}
 
+	requestGone := false
 	for i := range tmp {
+		// #1320 review B1 — the request is gone (its client left, its scope
+		// was cut): no further item is dispatched. With a bounded fan-out the
+		// loop reaches item N only after earlier items finished, so without
+		// this a request that ended during item 1 still walked every item.
+		if r.ctx.Err() != nil {
+			requestGone = true
+			break
+		}
 		call := tmp[i]
 
 		// Edge type 3 dep recording — see 0.30.94 ship for full
@@ -2146,6 +2160,20 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if err := g.Wait(); err != nil {
 		r.log.Debug("api stage short-circuited on hard error",
 			slog.String("name", id), slog.Any("err", err))
+		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+		recordStageTiming()
+		return true
+	}
+	if requestGone {
+		// The stage did not run every item: a truncating exit, like the
+		// hard-error one above, and a stage error for the Put gates, so the
+		// partial result of a request nobody waits for is never stored. Not a
+		// stage failure for the caller (ResolveWithFailure: a caller
+		// cancellation is not one).
+		r.taintNarrow() // #603 PR-2: an errored resolve never narrows its list edges
+		r.stageErrSink.Bump(id, "the request ended before every item was dispatched")
+		r.log.Debug("api stage stopped: the request ended before every item was dispatched",
+			slog.String("name", id), slog.Int("items", len(tmp)))
 		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
 		recordStageTiming()
 		return true
