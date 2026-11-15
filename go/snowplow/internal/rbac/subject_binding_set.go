@@ -21,11 +21,16 @@
 //
 // ROLE CONTENTS ARE NOT FOLDED. A role edit changes the permissions of every
 // holder of the referencing bindings identically, so it cannot make two
-// same-set requesters diverge; it is a staleness event, not an isolation
-// event, and it is already handled by the per-subject RBACSubGen the key also
-// folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of every
-// referencing binding). TestSubjectBindingSet_RoleEditRotatesKey proves the
-// rotation end to end.
+// same-set requesters diverge AT ONE INSTANT. It does make the same set mean
+// different verdicts BEFORE and AFTER the edit, so the digest alone names a
+// binding set, not an RBAC state: the state is named by the RBACSubGen the key
+// also folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of
+// every referencing binding), which since #1439 is the number of the last RBAC
+// state change that touched the requester (cache.RBACSubGenForSubject). A cell
+// minted by one same-set requester before the edit is therefore never the cell
+// another derives after it. TestSubjectBindingSet_RoleEditRotatesKey proves the
+// rotation end to end; TestIssue1439_ClassValueNamesOneRBACState the
+// before/after separation across two requesters.
 //
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the
 // evaluator's own unexported functions — selectCRBCandidates /

@@ -17,12 +17,14 @@ import (
 // IdentityClassOf returns ui's current RBAC class:
 //
 //   - SubjectBindingSet (#423): the digest of every binding whose subjects match
-//     the requester. Equal digests ⇒ equal verdicts for every RBAC check, so
-//     sharing a cell between them is sound.
-//   - RBACSubGen (#118 (c)): the per-subject sub-generation over the EFFECTIVE
-//     groups (system:authenticated included, #424). It moves on any grant,
-//     revoke or rules edit touching the subject — including a grant-then-revoke
-//     or a Role edit that leaves the binding set unchanged (#435).
+//     the requester. Equal digests ⇒ equal verdicts for every RBAC check at
+//     one instant, so sharing a cell between them is sound.
+//   - RBACSubGen (#118 (c)): the sub-generation over the EFFECTIVE groups
+//     (system:authenticated included, #424): the number of the last RBAC state
+//     change that touched the requester (#1439). It moves on any grant, revoke
+//     or rules edit touching the subject — including a grant-then-revoke or a
+//     Role edit that leaves the binding set unchanged (#435) — and one value is
+//     one state, so equal classes at two different times are equal verdicts too.
 //
 // Both read the published snapshot / counters; neither is ever logged.
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {
