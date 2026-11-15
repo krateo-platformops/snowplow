@@ -1,7 +1,8 @@
 // l1_perstep_rbac_cross_user_falsifier_test.go — #423 acceptance falsifier.
 //
 // QUESTION: on origin/main c20cc763 the restactions-class L1 key folds only the RESTAction's own
-// first-match dispatch BindingUID + the requester's RBACSubGen sum
+// first-match dispatch BindingUID + the requester's RBACSubGen (a sum then;
+// the latest RBAC state since #1439)
 // (helpers.go dispatchCacheLookupKey, resolved.go ComputeKey). A NON-UAF stage
 // inside the RESTAction is narrowed PER REQUESTER by the apiserver (the
 // requester's own <user>-clientconfig) or by the informer pivot's
@@ -157,7 +158,7 @@ func psSubjects(a psArm) []rbacv1.Subject {
 
 // psBuildWatcher publishes: one CRB (the shared RESTAction grant); alice's RB in
 // ns x granting get on the target resource; bob's SYMMETRIC but unrelated RB in
-// ns z (get pods) so the per-subject RBACSubGen sums come out equal (asserted,
+// ns z (get pods) so the two RBACSubGen values come out equal (asserted,
 // not assumed). The target object (Secret or ConfigMap x/y) carries the
 // sentinel and is also present in the fake dynamic client so the lazily
 // registered informer can serve it.

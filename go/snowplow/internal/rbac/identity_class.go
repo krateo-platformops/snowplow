@@ -24,7 +24,13 @@ import (
 //     change that touched the requester (#1439). It moves on any grant, revoke
 //     or rules edit touching the subject — including a grant-then-revoke or a
 //     Role edit that leaves the binding set unchanged (#435) — and one value is
-//     one state, so equal classes at two different times are equal verdicts too.
+//     one state, so equal classes at two different times are equal verdicts
+//     too, PROVIDED every subject through which a binding matches the requester
+//     is one the sub-generation folds and the binding is in the role index.
+//     Known exceptions (cache.RBACSubGenForSubject lists them): a
+//     ServiceAccount matched through its implicit groups or through a User-kind
+//     subject (#1443), and a binding whose role was absent when the index was
+//     built (#1449).
 //
 // Both read the published snapshot / counters; neither is ever logged.
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {

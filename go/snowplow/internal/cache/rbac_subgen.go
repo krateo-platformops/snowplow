@@ -248,17 +248,38 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 // none of whose subjects has ever been touched (correct: nothing changed → no
 // key rotation).
 //
-// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE. Take two identities that
-// hold one binding set and read the same value v, at any two times. Neither has
-// had a subject bumped after state v. Every change that can move a verdict of
-// theirs without moving the binding set bumps one of their subjects: a rules
-// change, create or delete of a role one of their bindings references bumps
-// every subject of that binding, and a binding re-pointed at one of their
-// subjects, or to another role, bumps both sides. So for both, the roles behind
-// the binding set are exactly those of state v: the same verdicts. With the sum
-// this fold used before, equal values meant only an equal NUMBER of changes.
-// Both halves are needed: a sum of clock values collides (states 3 and 4 add up
-// to state 7), and the latest of per-subject counts collides (2 and 2).
+// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE, AND UNDER WHICH CONDITION.
+// Take two identities that hold one binding set and read the same value v, at
+// any two times. Neither has had a FOLDED subject bumped after state v. A rules
+// change, create or delete of a role bumps every subject of every binding the
+// role index (bindingsByGVRIndex.byRole) lists under that role, and a binding
+// re-pointed at other subjects, or to another role, bumps both sides. So the
+// roles behind the binding set are exactly those of state v for both — the
+// same verdicts — PROVIDED THAT, for every binding in the set:
+//
+//	(a) every subject through which the binding matches the identity is one
+//	    this function folds, and
+//	(b) the binding is in the role index under the role it references.
+//
+// Where (a) or (b) fails, a verdict can move with no bump of a folded subject,
+// and the class does not move: the identity's own key is stale (as it was
+// before #1439; the cross-identity aliasing #1439 removed does not come back).
+// The known exceptions:
+//
+//   - (a), #1443: a ServiceAccount matched through the evaluator's implicit
+//     groups (system:serviceaccounts, system:serviceaccounts:<ns>), which are
+//     folded only if the requester presents them;
+//   - (a), #1443: a ServiceAccount matched through a User-kind subject naming
+//     its username — the bump lands on the User counter, the fold reads the
+//     ServiceAccount counter;
+//   - (b), #1449: a binding whose role was absent when the index was built
+//     (#261 case 3) is not listed under it, so the role's later create or edit
+//     bumps nobody.
+//
+// With the sum this fold used before, equal values meant only an equal NUMBER
+// of changes. Both halves are needed: a sum of clock values collides (states 3
+// and 4 add up to state 7), and the latest of per-subject counts collides (2
+// and 2).
 //
 // A read that races a flush sees, per counter, either the old value or the new
 // state; the fold is then the old value or the new state, never a third one.

@@ -6,7 +6,7 @@
 // can rotate with NO sub-gen bump. Case-2 carrier: the serve-time
 // first-permitting binding's WINNING subject matched only through an IMPLICIT
 // group (system:authenticated, or a synthetic system:serviceaccounts[:ns]
-// group). RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
+// group). RBACSubGenForSubject folds only the requester's PRESENTED groups, so a
 // grant/revoke through such a binding rotates the serve-time first-match
 // BindingUID with NO sub-gen bump. The counter measures the AT-RISK SERVE
 // POPULATION (a structural proxy); off-zero => reassess, NOT a confirmed-leak

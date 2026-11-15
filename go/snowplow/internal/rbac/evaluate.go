@@ -54,7 +54,7 @@ func ResetEvaluateRBACCallCount() {
 // the #261 case-2 serve-time-detector substrate: a binding that permits a
 // request ONLY through an IMPLICIT group (system:authenticated, or a synthetic
 // system:serviceaccounts[:ns] group) rotates no per-subject RBAC sub-gen when
-// its grant changes (RBACSubGenForSubject sums only the presented ui.Groups,
+// its grant changes (RBACSubGenForSubject folds only the presented ui.Groups,
 // not the implicit ones), so a grant/revoke through it can shift the serve-time
 // first-match BindingUID with NO sub-gen bump — the bounded self-stale-leak
 // carrier. Surfaced via EvaluateOptions.WinningSubjectClassOut (below) WITHOUT

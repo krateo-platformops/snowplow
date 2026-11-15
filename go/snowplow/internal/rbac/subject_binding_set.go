@@ -3,7 +3,7 @@
 //
 // THE DEFECT (#423): the restactions / widgets / raFullList cells were keyed by
 // the FIRST binding granting `get` on the dispatched CR (BindingUID) plus the
-// RBACSubGen sum. Two users co-bound by that one binding derived the same key
+// RBACSubGen (then a sum of counters). Two users co-bound by that one binding derived the same key
 // even when one of them held an EXTRA binding that changed what the
 // RESTAction's own steps could read — and the hit path serves entry.RawJSON
 // verbatim. A co-bound user lacking the per-step grant was served the other
@@ -28,7 +28,11 @@
 // every referencing binding), which since #1439 is the number of the last RBAC
 // state change that touched the requester (cache.RBACSubGenForSubject). A cell
 // minted by one same-set requester before the edit is therefore never the cell
-// another derives after it. TestSubjectBindingSet_RoleEditRotatesKey proves the
+// another derives after it — where the edit bumps a subject the requester's
+// sub-generation folds. It does not when the binding matches a ServiceAccount
+// through its implicit groups or a User-kind subject (#1443), or when the role
+// was absent at the role-index build (#1449): there the requester's key does
+// not rotate at all. TestSubjectBindingSet_RoleEditRotatesKey proves the
 // rotation end to end; TestIssue1439_ClassValueNamesOneRBACState the
 // before/after separation across two requesters.
 //

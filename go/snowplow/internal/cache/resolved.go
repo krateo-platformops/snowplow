@@ -646,8 +646,9 @@ type ResolvedKeyInputs struct {
 	// their new sub-gen. UNLIKE HasUAF this IS folded into ComputeKey →
 	// resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
 	//
-	// #682 — RBACSubGenForSubject also adds the process-wide boot-window epoch
-	// (rbac_subgen_epoch.go). That is a term of THIS existing dimension, not a
+	// #682 — RBACSubGenForSubject also folds the process-wide boot-window epoch
+	// (rbac_subgen_epoch.go; since #1439 the fold is the latest state of the
+	// RBAC state clock, not a sum). That is a term of THIS existing dimension, not a
 	// new identity input: no key-format change, no resolvedKeyVersion bump, and
 	// identity-free classes (which do not fold RBACSubGen) never rotate on it.
 	RBACSubGen uint64
@@ -984,7 +985,7 @@ type ResolvedCacheStore struct {
 	// whose serve-time first-permitting binding's WINNING subject matched only
 	// through an IMPLICIT group — system:authenticated, or a synthetic
 	// system:serviceaccounts[:ns] group (#261 case-2, the RBAC-fact carrier).
-	// RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
+	// RBACSubGenForSubject folds only the requester's PRESENTED groups, so a
 	// grant/revoke through such a binding rotates the serve-time first-match
 	// BindingUID with NO sub-gen bump — the bounded self-stale-leak carrier.
 	// Bumped HIT-GATED ONLY from the restactions serve hit-site, off a MARK the
