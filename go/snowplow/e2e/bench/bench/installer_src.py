@@ -63,7 +63,7 @@ def check_pins(pins: dict, requirements) -> list[str]:
     for comp, field, op, value in requirements:
         c = comps.get(comp)
         if c is None:
-            fails.append(f"{comp}: not in component-pins.yaml")
+            fails.append(f"{comp}: not in the installer's component pins")
             continue
         got = c.get(field)
         if op == "==" and got != value:
@@ -75,7 +75,7 @@ def check_pins(pins: dict, requirements) -> list[str]:
 
 def preflight(chart_dir: str, requirements=PR483_REQUIREMENTS) -> dict:
     chart_yaml = os.path.join(chart_dir, "Chart.yaml")
-    pins_yaml = os.path.join(chart_dir, "files", "component-pins.yaml")
+    from bench import installer_pins
     fails: list[str] = []
     meta: dict = {}
     if not os.path.isfile(chart_yaml):
@@ -90,11 +90,16 @@ def preflight(chart_dir: str, requirements=PR483_REQUIREMENTS) -> dict:
         for d in deps:
             if not any(v.startswith(d) for v in vendored):
                 fails.append(f"dependency {d} not vendored (run helm dependency update)")
-    if not os.path.isfile(pins_yaml):
-        fails.append(f"{pins_yaml} missing")
-    else:
-        fails += check_pins(yaml.safe_load(open(pins_yaml)), requirements)
-    return {"chart_dir": chart_dir, "version": meta.get("version"),
+    # the pins file the chart itself loads (bench/installer_pins.py: component-pins.yaml up to
+    # installer 0.3.639, component-pins.min.yaml from 0.3.640), never a name fixed here
+    pins_file = None
+    if os.path.isfile(chart_yaml):
+        try:
+            pins, pins_file = installer_pins.load(chart_dir)
+            fails += check_pins(pins, requirements)
+        except installer_pins.Refused as e:
+            fails.append(str(e))
+    return {"chart_dir": chart_dir, "version": meta.get("version"), "pins_file": pins_file,
             "requirements": [list(r) for r in requirements],
             "ok": not fails, "failures": fails}
 

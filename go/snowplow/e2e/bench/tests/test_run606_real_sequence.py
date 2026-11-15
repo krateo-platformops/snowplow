@@ -1536,14 +1536,20 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         open(os.path.join(d, "templates", "self-bootstrap.yaml"), "w").write(chr(10).join([
             "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-bootstrap", "data:",
             '  components-patch.json: {{ dict "spec" (dict "componentValues" ' + cv + ') | toJson | quote }}', ""]))
+        # the pins file, as the published chart ships and loads it: component-pins.yaml up to installer
+        # 0.3.639; FAKE_INSTALLER_PINS=min: 0.3.640's form, only the generated component-pins.min.yaml,
+        # which its inst.componentsYaml loads
+        pins_name = "component-pins.min.yaml" if os.environ.get("FAKE_INSTALLER_PINS") == "min" else \
+            "component-pins.yaml"
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
-            '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10))
+            '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10)
+            + '{{- define "inst.componentsYaml" -}}{{ .Files.Get "files/' + pins_name + '" }}{{- end -}}' + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
             "dependencies": [{"name": "core-provider", "version": "2.13.24"},
                              {"name": "core-provider-crds", "version": "2.13.40"}]}))
         good = os.environ.get("FAKE_PINS", "good") == "good"
-        open(os.path.join(d, "files", "component-pins.yaml"), "w").write(json.dumps({
+        open(os.path.join(d, "files", pins_name), "w").write(json.dumps({
             "components": [
                 {"name": "authn-crd", "kind": "AuthnCrds", "chart": "authn-crds", "version": "0.27.3"},
                 {"name": "snowplow-crd", "kind": "SnowplowCrds", "chart": "snowplow-crds", "version": "1.12.56"},

@@ -98,7 +98,8 @@ def crd_sources(installer_dir: str) -> list[dict]:
     """The installer's vendored dependencies and its pinned CRD components."""
     meta = _load(os.path.join(installer_dir, "Chart.yaml"))
     values = _load(os.path.join(installer_dir, "values.yaml"))
-    pins = _load(os.path.join(installer_dir, "files", "component-pins.yaml")).get("components") or []
+    from bench import installer_pins
+    pins = installer_pins.components(installer_dir)      # the file the chart itself loads
     charts_dir = os.path.join(installer_dir, "charts")
     vendored = sorted(os.listdir(charts_dir)) if os.path.isdir(charts_dir) else []
     out = []

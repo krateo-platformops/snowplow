@@ -115,6 +115,9 @@ source "$HERE/run606_stats.sh"
 read -r -a LABELS <<< "${RUNS:-A B}"
 read -r -a PAIR_LIST <<< "${PAIRS:-A:B}"
 (( ${#LABELS[@]} >= 2 )) || refuse "RUNS names ${#LABELS[@]} run(s): a comparison needs two or more"
+# a launch measures: the one-cluster rehearsal mode (run606.sh BENCH_606_REHEARSAL: no load, no verdict)
+# would turn every run of it into a rehearsal that still creates its cluster
+[[ -z "${BENCH_606_REHEARSAL:-}" ]] || refuse "BENCH_606_REHEARSAL is set (${BENCH_606_REHEARSAL}): a launch never carries it (the rehearsal is one run606.sh run, with no load): unset it"
 (( ${#PAIR_LIST[@]} >= 1 )) || refuse "PAIRS names no comparison"
 is_label() { local x; for x in "${LABELS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
 seen=" "
