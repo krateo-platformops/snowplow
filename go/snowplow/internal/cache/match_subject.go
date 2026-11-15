@@ -101,6 +101,190 @@ func Authenticated(username string, groups []string) bool {
 	return false
 }
 
+// The two groups the kube-apiserver places every ServiceAccount in
+// (k8s.io/apiserver pkg/authentication/serviceaccount: AllServiceAccountsGroup
+// and MakeNamespaceGroupName).
+const (
+	allServiceAccountsGroup       = "system:serviceaccounts"
+	serviceAccountsNamespaceGroup = "system:serviceaccounts:"
+)
+
+// ServiceAccountGroups returns the two groups every ServiceAccount of namespace
+// is a member of: all ServiceAccounts, and the ServiceAccounts of namespace.
+func ServiceAccountGroups(namespace string) (all, ofNamespace string) {
+	return allServiceAccountsGroup, serviceAccountsNamespaceGroup + namespace
+}
+
+// MatchedSubject is one binding subject a requester matches bindings through:
+// the rbac/v1 subject Kind, its Name and, for a ServiceAccount, its Namespace.
+// Implicit is true when the requester holds the subject without presenting it
+// (the apiserver's implicit group, the two ServiceAccount groups).
+type MatchedSubject struct {
+	Kind      string
+	Name      string
+	Namespace string
+	Implicit  bool
+}
+
+func (m MatchedSubject) key() subjectKey {
+	return subjectKey{Kind: m.Kind, Name: m.Name, Namespace: m.Namespace}
+}
+
+// SubjectMatcher holds one requester (username, groups) and answers the ONE
+// question every RBAC consumer asks of it: through which binding subjects does
+// this requester match a binding (#1443).
+//
+// THE RULE. A requester matches a binding iff one of the binding's subjects is
+// in the requester's matched-subject set. That set is enumerated by Visit and
+// by nothing else:
+//
+//   - the evaluator matches with it (rbac.anySubjectMatches → Match) and routes
+//     its candidate indexes with it (selectCRBCandidates, routeRBSubjects);
+//   - the identity class folds the sub-generation counter of exactly it
+//     (RBACSubGenForSubject, foldSubjects), as do the reseed predicates built on
+//     foldSubjects (RotatedSubjectSet.Rotated, IdentityAuthorisedForGVR);
+//   - a binding event bumps the binding's subjects in the same (Kind, Name,
+//     Namespace) form (subjectsFromRBAC).
+//
+// So "a change to this binding can move this requester's verdict" implies "the
+// change bumps a counter this requester folds": the class rotates whenever the
+// verdict can. Before #1443 the evaluator and the fold each kept their own
+// list, and the fold's lacked the ServiceAccount groups and the User form of a
+// ServiceAccount username; a rules edit behind such a binding moved the verdict
+// and rotated nothing.
+//
+// The zero value matches nothing.
+type SubjectMatcher struct {
+	username string
+	groups   []string
+	implicit string
+	saNS     string
+	saName   string
+	isSA     bool
+	// The two ServiceAccount groups of saNS, built once (the namespace one is
+	// the only string this type allocates).
+	saAll, saOfNS string
+}
+
+// NewSubjectMatcher returns the matcher for a request by (username, groups).
+// It keeps groups by reference and allocates nothing, except one string (the
+// namespace group's name) for a ServiceAccount username.
+func NewSubjectMatcher(username string, groups []string) SubjectMatcher {
+	m := SubjectMatcher{username: username, groups: groups}
+	if username == "" {
+		// "No requester": the evaluator gives it no implicit group. The prewarm
+		// group representative ({"", [g]}) carries system:authenticated as a
+		// PRESENTED group instead (WithAuthenticatedGroup).
+		return m
+	}
+	m.implicit = ImplicitGroup(username, groups)
+	if m.saNS, m.saName, m.isSA = ParseServiceAccountUsername(username); m.isSA {
+		m.saAll, m.saOfNS = ServiceAccountGroups(m.saNS)
+	}
+	return m
+}
+
+// Visit calls visit for every subject the requester matches bindings through,
+// until visit returns false. It is the single enumeration of the set:
+//
+//  1. User <username>, for a non-empty username — a ServiceAccount's username
+//     (system:serviceaccount:<ns>:<name>) included: a User-kind subject naming
+//     it matches like any other user name;
+//  2. Group <g> for every presented group;
+//  3. for a ServiceAccount username, Group system:serviceaccounts and Group
+//     system:serviceaccounts:<ns>, presented or not;
+//  4. the apiserver's implicit group (ImplicitGroup), if it adds one;
+//  5. for a ServiceAccount username, ServiceAccount <ns>/<name>.
+//
+// A subject may be visited twice (a presented group that is also an implicit
+// one); the presented visit comes first.
+func (m SubjectMatcher) Visit(visit func(MatchedSubject) bool) {
+	if m.username != "" && !visit(MatchedSubject{Kind: subjectKindUser, Name: m.username}) {
+		return
+	}
+	for _, g := range m.groups {
+		if !visit(MatchedSubject{Kind: subjectKindGroup, Name: g}) {
+			return
+		}
+	}
+	if m.isSA {
+		if !visit(MatchedSubject{Kind: subjectKindGroup, Name: m.saAll, Implicit: true}) ||
+			!visit(MatchedSubject{Kind: subjectKindGroup, Name: m.saOfNS, Implicit: true}) {
+			return
+		}
+	}
+	if m.implicit != "" && !visit(MatchedSubject{Kind: subjectKindGroup, Name: m.implicit, Implicit: true}) {
+		return
+	}
+	if m.isSA {
+		visit(MatchedSubject{Kind: subjectKindServiceAccount, Name: m.saName, Namespace: m.saNS})
+	}
+}
+
+// Match reports whether binding subject s is in the requester's matched-subject
+// set, and whether the requester holds it implicitly (see MatchedSubject). A
+// subject of any other kind than User, Group or ServiceAccount matches no one.
+// A ServiceAccount subject is compared by its namespace as written.
+//
+// Match is the evaluator's inner loop (once per subject of every candidate
+// binding), so it decides by the subject's kind against the matcher's fields
+// instead of walking Visit: one comparison for a User or ServiceAccount
+// subject, one scan of the presented groups for a Group subject. It is the
+// membership test of the set Visit enumerates and of nothing else:
+// TestIssue1443_MatchIsMembershipOfTheVisitedSet holds Match(s) equal to "s is
+// among the subjects Visit yields, with the first such entry's Implicit" over
+// generated requesters and subjects, so the two cannot drift.
+func (m SubjectMatcher) Match(s rbacv1.Subject) (matched, implicit bool) {
+	return m.match(&s)
+}
+
+// MatchAny reports whether the requester matches one of a binding's subjects:
+// Match over each of them, without copying a subject or the matcher per test.
+func (m *SubjectMatcher) MatchAny(subjects []rbacv1.Subject) bool {
+	for i := range subjects {
+		if matched, _ := m.match(&subjects[i]); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// match is Match's body, on pointers: the evaluator's inner loop.
+func (m *SubjectMatcher) match(s *rbacv1.Subject) (matched, implicit bool) {
+	switch s.Kind {
+	case rbacv1.UserKind:
+		return m.username != "" && s.Name == m.username, false
+	case rbacv1.GroupKind:
+		for _, g := range m.groups {
+			if g == s.Name {
+				return true, false
+			}
+		}
+		if m.isSA && (s.Name == m.saAll || s.Name == m.saOfNS) {
+			return true, true
+		}
+		if m.implicit != "" && s.Name == m.implicit {
+			return true, true
+		}
+	case rbacv1.ServiceAccountKind:
+		return m.isSA && s.Name == m.saName && s.Namespace == m.saNS, false
+	}
+	return false, false
+}
+
+// bindingSubjectKey is the (Kind, Name, Namespace) form of one binding subject:
+// the form a binding event bumps (subjectsFromRBAC) and the form Match compares.
+// ok is false for a kind RBAC does not define.
+func bindingSubjectKey(s rbacv1.Subject) (subjectKey, bool) {
+	switch s.Kind {
+	case rbacv1.UserKind, rbacv1.GroupKind:
+		return subjectKey{Kind: s.Kind, Name: s.Name}, true
+	case rbacv1.ServiceAccountKind:
+		return subjectKey{Kind: s.Kind, Name: s.Name, Namespace: s.Namespace}, true
+	}
+	return subjectKey{}, false
+}
+
 // SubjectIdentity is the minimal subject shape consumed by the RBAC
 // evaluator. Equivalent in surface to k8s authn/v1.UserInfo's required
 // fields (Username + Groups). The cache-package mirror exists because

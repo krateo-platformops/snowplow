@@ -35,7 +35,7 @@
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the
 // evaluator's own unexported functions — selectCRBCandidates /
 // selectRBCandidatesAllNS (index pre-filters) gated by anySubjectMatches (the
-// correctness barrier), with effectiveGroups' ServiceAccount synthetic groups —
+// correctness barrier), with the shared matcher's ServiceAccount groups —
 // exactly as BuildRequesterProfile does. The one deliberate difference: the
 // apiserver's implicit group (cache.ImplicitGroup) is folded in as a PRESENTED
 // group even for an empty username, via WithAuthenticatedGroup. Every real
@@ -148,13 +148,14 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 		seen[s] = struct{}{}
 		ids = append(ids, s)
 	}
+	who := subjectMatcher(id)
 	for _, crb := range selectCRBCandidates(snap, id) {
-		if anySubjectMatches(crb.Subjects, id) {
+		if anySubjectMatches(&who, crb.Subjects) {
 			add(cache.BindingUIDFromCRB(crb))
 		}
 	}
 	for _, rb := range selectRBCandidatesAllNS(snap, id) {
-		if anySubjectMatches(rb.Subjects, id) {
+		if anySubjectMatches(&who, rb.Subjects) {
 			add(cache.BindingUIDFromRB(rb))
 		}
 	}

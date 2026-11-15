@@ -185,8 +185,8 @@ func TestKey423_SubjectBindingSet_MatchesEvaluatorSubjectSemantics(t *testing.T)
 		want := map[string]bool{}
 		matches := func(subs []rbacv1.Subject) bool {
 			groups := append(append([]string{}, id.g...), "system:authenticated")
-			if ns, _, isSA := rbac.ParseServiceAccountUsernameForTest(id.u); isSA {
-				groups = rbac.EffectiveGroupsForTest(groups, true, ns)
+			if ns, _, isSA := cache.ParseServiceAccountUsername(id.u); isSA {
+				groups = append(groups, "system:serviceaccounts", "system:serviceaccounts:"+ns)
 			}
 			for _, s := range subs {
 				switch s.Kind {
@@ -201,7 +201,7 @@ func TestKey423_SubjectBindingSet_MatchesEvaluatorSubjectSemantics(t *testing.T)
 						}
 					}
 				case "ServiceAccount":
-					if ns, n, ok := rbac.ParseServiceAccountUsernameForTest(id.u); ok && s.Namespace == ns && s.Name == n {
+					if ns, n, ok := cache.ParseServiceAccountUsername(id.u); ok && s.Namespace == ns && s.Name == n {
 						return true
 					}
 				}
