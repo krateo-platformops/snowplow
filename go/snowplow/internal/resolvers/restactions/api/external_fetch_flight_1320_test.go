@@ -708,7 +708,12 @@ func TestExternalFlight1320_BackgroundJoinsBackgroundWhileItsStarterWaits(t *tes
 	}
 	scancel()
 	recvWire(t, starter, "starter")
-	late := wireShared(c, context.Background(), opts)
+	var late wireResult
+	select {
+	case late = <-goShared(c, context.Background(), opts):
+	case <-time.After(5 * time.Second):
+		t.Fatal("a background read arriving after the starter left is waiting on the starter's request (it joined it)")
+	}
 	if late.outcome() != "ok" {
 		t.Fatalf("a background read arriving after the starter left: %s; want its own answer", late.outcome())
 	}
@@ -1361,7 +1366,12 @@ func TestExternalFlight1320_NoJoinFromTheFirstResponseByteOn(t *testing.T) {
 	t1 := goTrip(w1, r1)
 	<-firstByte
 	w2, r2 := newReaderWire(t, c, next, context.Background())
-	second := <-goTrip(w2, r2)
+	var second tripResult
+	select {
+	case second = <-goTrip(w2, r2):
+	case <-time.After(5 * time.Second):
+		t.Fatal("a read arriving after the first response byte is waiting on that request (it joined it)")
+	}
 	if second.err != nil {
 		t.Fatal(second.err)
 	}
@@ -1498,10 +1508,16 @@ func TestExternalFlight1320_ARetryNeverRejoinsTheAttemptItGaveUpOn(t *testing.T)
 	if r := <-t1; r.err == nil {
 		t.Fatal("SETUP: attempt 1 was answered")
 	}
-	retry, err := w.RoundTrip(req.Clone(page))
-	if err != nil {
-		t.Fatalf("the retry: %v", err)
+	var rt tripResult
+	select {
+	case rt = <-goTrip(w, req.Clone(page)):
+	case <-time.After(5 * time.Second):
+		t.Fatal("the retry is waiting on the attempt its fetch gave up on (it re-joined it)")
 	}
+	if rt.err != nil {
+		t.Fatalf("the retry: %v", rt.err)
+	}
+	retry := rt.resp
 	body, _ := io.ReadAll(retry.Body)
 	retry.Body.Close()
 	if string(body) != `{"n":2}` || next.calls.Load() != 2 {
