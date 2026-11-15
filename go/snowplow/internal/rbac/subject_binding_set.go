@@ -30,11 +30,12 @@
 // state change that touched the requester (cache.RBACSubGenForSubject). A cell
 // minted by one same-set requester before the edit is therefore never the cell
 // another derives after it — where the edit bumps a subject the requester's
-// sub-generation folds. Since #1443 the fold reads every subject the evaluator
-// matches the requester by, so the one case where it does not is, until #1458
-// lands, a binding that a rebuild of the role index dropped (it read a
-// snapshot older than the binding's already-applied event): there the
-// requester's key does not rotate at all.
+// sub-generation folds. Both halves of that hold: since #1443 the fold reads
+// every subject the evaluator matches the requester by (one shared matcher,
+// cache.SubjectMatcher, pinned by its parity arms), and since #1458 every
+// binding the informers have delivered is in the role index the edit is routed
+// through (the index is a fold of the RBAC events with atomic updates; nothing
+// rebuilds it from the snapshot).
 // TestSubjectBindingSet_RoleEditRotatesKey proves the rotation end to end;
 // TestIssue1439_ClassValueNamesOneRBACState the before/after separation across
 // two requesters.

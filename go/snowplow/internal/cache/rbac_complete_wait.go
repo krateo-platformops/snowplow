@@ -13,7 +13,7 @@ package cache
 //
 // The wait is #1231's: readiness waits for the same thing (rbac_readiness.go).
 // waitAndPublishInitialRBACSnapshot closes rbacInitialPublishDone once it has
-// published the complete snapshot and run the bindings-index build. No timer
+// published the complete snapshot and marked the bindings index ready. No timer
 // decides it; the caller's ctx bounds the wait.
 
 import "context"

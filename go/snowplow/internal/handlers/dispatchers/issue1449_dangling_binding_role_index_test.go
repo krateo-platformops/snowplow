@@ -173,7 +173,7 @@ func i1449Setup(t *testing.T, arm i1449Arm) *i1449Env {
 	dyn := psBuildWatcher(t, a, world...)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetPendingSubGenBumpsForTest)
@@ -312,7 +312,7 @@ func TestIssue1449_BindingToAbsentRoleFollowsThatRole(t *testing.T) {
 				e.createBinding()
 			}
 			if arm.when == i1449AfterBuildThenRebuild {
-				cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+				cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 			}
 			if e.canList() {
 				t.Fatalf("PRE: with the role absent the user must be DENIED `list %s` in %s", a.target.Resource, psTargetNS)
@@ -443,7 +443,7 @@ func TestIssue1449_RoleDeletedThenRecreated(t *testing.T) {
 				{"the role is deleted", func() {
 					e.deleteRole()
 					// A rebuild with the role absent must keep the binding.
-					cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, e.a.target})
+					cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, e.a.target})
 				}, false},
 				{"the role is created again with the grant", e.grant, true},
 			} {

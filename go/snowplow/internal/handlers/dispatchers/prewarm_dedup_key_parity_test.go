@@ -106,7 +106,7 @@ func buildDedupParityWatcher(t *testing.T, k int) {
 	_, _ = rw.EnsureResourceType(dedupWidgetGVR)
 	_ = rw.WaitForCacheSync(ctx, 5*time.Second)
 	cache.RebuildRBACSnapshotForTest(rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{dedupWidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{dedupWidgetGVR})
 	prev := cache.Global()
 	cache.SetGlobal(rw)
 	t.Cleanup(func() {

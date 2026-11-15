@@ -1,18 +1,25 @@
 package cache
 
 // rbac_subgen_epoch_819_test.go — #819 part 1: the #682 boot epoch settles
-// before Ready, on every readiness path, because the readiness flip itself
-// (MarkPhase1Done) runs the first bindings-index build when nothing has yet.
+// before Ready, on every readiness path.
 //
-//   R1  window edit, index unbuilt, Ready flips → the index is built and the
-//       epoch is 1 when MarkPhase1Done returns. RED on main: the flip did not
-//       build, so the bump waited for the engine's boot pass (bench run 10:
-//       6.5 min after Ready).
-//   R2  control: no edit in the window → built, epoch stays 0 (the settle
+// Until #1458 the readiness flip itself (MarkPhase1Done) ran the first
+// bindings-index BUILD, and with it the bump. There is no build any more: the
+// index is marked READY by the initial-publish goroutine, once the RBAC
+// handlers have been delivered their initial lists (markBindingsIndexReady),
+// and readiness waits for that goroutine to return (#1231;
+// TestIssue1458_ReadinessWaitsForTheIndexToBeReady drives that end to end).
+// The flip only gives the index its navigated set.
+//
+//   R1  window edit, index not ready → the ready transition bumps the epoch to
+//       1 and rotates the identity-bound key; the readiness flip alone does
+//       neither, and is counted.
+//   R2  control: no edit in the window → ready, epoch stays 0 (the transition
 //       never invents a rotation).
-//   R3  a later readiness call and a later rebuild never bump again.
-//   R4  no complete snapshot at the flip → the build is requested, not run
-//       over nothing; the first complete publish runs it.
+//   R3  a later readiness call, a later pass and a repeated ready never bump
+//       again.
+//   R4  the flip before ready does not make the index ready, and the navigated
+//       set it gave is in force when ready comes.
 //   S1  the epoch bump and an RBAC publish each close the identity-class
 //       signal armed /refreshes connections wait on (part 2's trigger).
 
@@ -35,7 +42,7 @@ func global819(t *testing.T, rw *ResourceWatcher) {
 	})
 }
 
-func TestIssue819_R1_ReadinessFlipSettlesTheEpochBeforeReady(t *testing.T) {
+func TestIssue819_R1_ReadySettlesTheEpoch_TheFlipAloneDoesNot(t *testing.T) {
 	rw := newSnapshotTestWatcher(t)
 	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
 		t.Fatal(err)
@@ -46,33 +53,39 @@ func TestIssue819_R1_ReadinessFlipSettlesTheEpochBeforeReady(t *testing.T) {
 
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682)) // an edit in the window
 	before := identityKeys682()
-	builtBefore := ReadySettleStatsSnapshot().BuiltAtFlip
+	setBefore := ReadySettleStatsSnapshot().NavigatedSetAtFlip
 	if BindingsByGVRIndexBuilt() || RBACSubGenEpoch() != 0 {
-		t.Fatal("precondition: the index must be unbuilt and the epoch 0 before the flip")
+		t.Fatal("precondition: the index must not be ready and the epoch 0 before the flip")
 	}
 
 	MarkPhase1Done()
 
-	if !BindingsByGVRIndexBuilt() {
-		t.Fatal("R1 RED: Ready flipped with the bindings index unbuilt — the #682 bump is still owed and will " +
-			"rotate every user's keys under tabs armed after Ready (#819)")
-	}
-	if got := RBACSubGenEpoch(); got != 1 {
-		t.Fatalf("R1 RED: epoch=%d when Ready flipped, want 1 — the window edit's rotation must land before Ready", got)
-	}
 	if !IsPhase1Done() {
 		t.Fatal("R1: MarkPhase1Done did not flip readiness")
 	}
-	if got := ReadySettleStatsSnapshot().BuiltAtFlip - builtBefore; got != 1 {
-		t.Fatalf("R1: built_at_flip moved by %d, want 1 — the settle that built before Ready must be counted", got)
+	if got := ReadySettleStatsSnapshot().NavigatedSetAtFlip - setBefore; got != 1 {
+		t.Fatalf("R1: navigated_set_at_flip moved by %d, want 1", got)
+	}
+	if BindingsByGVRIndexBuilt() || RBACSubGenEpoch() != 0 {
+		t.Fatalf("R1: the readiness flip made the index ready (%v) or rotated the epoch (%d): only the delivery of the "+
+			"RBAC handlers' initial lists may (#1458)", BindingsByGVRIndexBuilt(), RBACSubGenEpoch())
+	}
+
+	markBindingsIndexReady() // what the initial-publish goroutine runs before readiness is released
+
+	if !BindingsByGVRIndexBuilt() {
+		t.Fatal("R1: markBindingsIndexReady did not make the index ready")
+	}
+	if got := RBACSubGenEpoch(); got != 1 {
+		t.Fatalf("R1 RED: epoch=%d at ready, want 1 — the window edit's rotation must land there, before Ready", got)
 	}
 	after := identityKeys682()
 	if before["restactions"] == after["restactions"] {
-		t.Fatal("R1: the identity-bound key did not rotate at the settle — #682's guarantee was weakened")
+		t.Fatal("R1: the identity-bound key did not rotate at ready — #682's guarantee was weakened")
 	}
 }
 
-func TestIssue819_R2_NoWindowEdit_SettleBuildsWithoutRotating(t *testing.T) {
+func TestIssue819_R2_NoWindowEdit_ReadyWithoutRotating(t *testing.T) {
 	rw := newSnapshotTestWatcher(t)
 	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
 		t.Fatal(err)
@@ -82,16 +95,17 @@ func TestIssue819_R2_NoWindowEdit_SettleBuildsWithoutRotating(t *testing.T) {
 	BumpRBACGenForTest()
 
 	MarkPhase1Done()
+	markBindingsIndexReady()
 
 	if !BindingsByGVRIndexBuilt() {
-		t.Fatal("R2: the readiness flip did not build the index")
+		t.Fatal("R2: the index is not ready")
 	}
 	if got := RBACSubGenEpoch(); got != 0 {
-		t.Fatalf("R2: epoch=%d with no edit in the window — the settle rotated every key for nothing", got)
+		t.Fatalf("R2: epoch=%d with no edit in the window — ready rotated every key for nothing", got)
 	}
 }
 
-func TestIssue819_R3_LaterFlipsAndRebuildsNeverBump(t *testing.T) {
+func TestIssue819_R3_LaterFlipsPassesAndReadiesNeverBump(t *testing.T) {
 	rw := newSnapshotTestWatcher(t)
 	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
 		t.Fatal(err)
@@ -102,17 +116,20 @@ func TestIssue819_R3_LaterFlipsAndRebuildsNeverBump(t *testing.T) {
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682))
 
 	MarkPhase1Done()
-	// An edit after the settle rotates through the per-subject path, never the
-	// epoch; nor do a second flip or the boot pass's own rebuild.
+	markBindingsIndexReady()
+	// An edit after ready rotates through the per-subject path, never the
+	// epoch; nor do a second flip, a prewarm pass's index step or a repeated
+	// ready.
 	roleHandler682.OnUpdate(role682(cmRule682), role682(noRule682))
 	MarkPhase1Done()
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{{Version: "v1", Resource: "configmaps"}})
+	SetNavigatedGVRs([]schema.GroupVersionResource{{Version: "v1", Resource: "configmaps"}})
+	markBindingsIndexReady()
 	if got := RBACSubGenEpoch(); got != 1 {
-		t.Fatalf("R3: epoch=%d, want exactly 1 — a later flip or rebuild bumped again", got)
+		t.Fatalf("R3: epoch=%d, want exactly 1 — a later flip, pass or ready bumped again", got)
 	}
 }
 
-func TestIssue819_R4_NoCompleteSnapshot_BuildIsRequestedNotRunOverNothing(t *testing.T) {
+func TestIssue819_R4_FlipBeforeReady_NavigatedSetIsInForceAtReady(t *testing.T) {
 	rw := newSnapshotTestWatcher(t)
 	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
 		t.Fatal(err)
@@ -124,19 +141,25 @@ func TestIssue819_R4_NoCompleteSnapshot_BuildIsRequestedNotRunOverNothing(t *tes
 	MarkPhase1Done()
 
 	if BindingsByGVRIndexBuilt() {
-		t.Fatal("R4: the index claims to be built over no snapshot (#686)")
+		t.Fatal("R4: the readiness flip made the index ready over no snapshot (#686)")
 	}
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
-	pending := idx.pendingNavigated
+	navigated := len(idx.navigated)
 	idx.mu.RUnlock()
-	if pending == nil {
-		t.Fatal("R4: the flip neither built nor requested the build — the first publish would not run it")
+	if want := len(rw.RegisteredGVRs()); navigated != want || want == 0 {
+		t.Fatalf("R4: the flip gave the index %d navigated GVRs, the watcher has %d registered", navigated, want)
 	}
 	rbacSnap.Store(&RBACSnapshot{})
-	buildPendingBindingsIndex() // what the first complete publish runs
+	markBindingsIndexReady()
 	if !BindingsByGVRIndexBuilt() {
-		t.Fatal("R4: the requested build did not run at the first complete publish")
+		t.Fatal("R4: the index is not ready after markBindingsIndexReady")
+	}
+	idx.mu.RLock()
+	after := len(idx.navigated)
+	idx.mu.RUnlock()
+	if after != navigated {
+		t.Fatalf("R4: ready changed the navigated set from %d to %d GVRs", navigated, after)
 	}
 }
 
@@ -150,7 +173,7 @@ func TestIssue819_S1_EpochBumpAndPublishSignalIdentityClassMove(t *testing.T) {
 
 	ch := IdentityClassesMayHaveMoved()
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682))
-	BuildBindingsByGVRIndex(nil) // the epoch bump
+	markBindingsIndexReady() // the epoch bump
 	select {
 	case <-ch:
 	default:

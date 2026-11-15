@@ -45,7 +45,7 @@ the current tree (docs-standard, 2026-08-06); anchors are file + function names.
  │ Step 7.6 ENGINE BOOT SEED — SYNCHRONOUS, before readiness:                    │
  │           StartPrewarmEngine → scopeKindBoot → rePrewarmBoot                  │
  │             ① RE-WALK both roots, FRESH visited map, AFTER the sync barrier   │
- │             ② settleRegisteredSet  ③ BuildBindingsByGVRIndex                  │
+ │             ② settleRegisteredSet  ③ index navigated set (SetNavigatedGVRs)   │
  │             ④ seedScopeYielding: rank-major, class-interleaved per-binding    │
  │                seed from the live index, yielding to customer /call           │
  │           /readyz unblocks on the FIRST of:                                   │
@@ -226,8 +226,12 @@ The engine worker (`prewarm_engine.go`) yields to any in-flight customer
    resume re-walk, and Lever A marks declined-external targets so a resume does
    not re-resolve external whales in a loop.)
 2. `settleRegisteredSet` once.
-3. `cache.BuildBindingsByGVRIndex(rw.RegisteredGVRs())` — the cohort-scoping
-   substrate, built over the *navigated* GVRs.
+3. `prewarmPassIndexStep` → `cache.SetNavigatedGVRs(rw.RegisteredGVRs())` — gives
+   the cohort-scoping index its *navigated* GVRs and re-derives its per-GVR
+   buckets. It does not touch the index's membership (which binding names which
+   role, with which subjects): the RBAC event hooks alone write that, from the
+   informers' first event on, and nothing refills it from the RBAC snapshot
+   (#1458).
 4. `seedScopeYielding` drains the harvested widgets + restactions and seeds the
    per-binding top-level L1 cells, in a **rank-major, class-interleaved**
    order: identities are ranked widget-capable-first (deterministic rank
@@ -387,8 +391,8 @@ lazy resolve-on-navigation at `/call`.
   literal that omitted `rc` (the SA `*rest.Config`) fail-closed at
   `discoverPluralInfo`. *Fix:* `newPhase1Walker` makes `rc` a required
   positional parameter (`phase1_walker_new.go`).
-- **Empty per-GVR index → skipped seed.** If `BuildBindingsByGVRIndex` runs
-  before the RBAC snapshot is ready, or a navigated GVR has no authorising
+- **Empty per-GVR index → skipped seed.** If the index is not ready yet (the
+  RBAC handlers have not been delivered their initial lists), or a navigated GVR has no authorising
   binding, `EnumeratePrewarmTargetsForGVR` returns nil and the seed skips that
   GVR by design. Those targets fall back to cold-then-warm at first `/call` —
   never to a global-cohort universe (that fallback was an RBAC-leak risk and

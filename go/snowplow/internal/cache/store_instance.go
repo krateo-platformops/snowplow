@@ -109,6 +109,10 @@ type storeInstance struct {
 	mu       sync.Mutex
 	adapters []*handlerAdapter
 	depAdpt  *handlerAdapter // the dep handler's adapter: the comparator record
+	// extRegs is each extension handler's registration on this instance's
+	// informer, by extension name (#1458: its HasSynced says the handler has
+	// been delivered the initial list).
+	extRegs map[string]clientcache.ResourceEventHandlerRegistration
 
 	// Candidate-only watch state, guarded by rw.mu: the latest reflector error
 	// the instance-aware watch-error handler saw while this instance was not
@@ -294,6 +298,27 @@ func (a *adaptingAttacher) AddEventHandler(h clientcache.ResourceEventHandler) (
 	a.next++
 	name := extensionHandlerName(a.next)
 	return a.inf.AddEventHandler(a.in.adapt(name, h, a.record(name)))
+}
+
+// keepRegistration records an extension handler's registration on the instance.
+func (a *adaptingAttacher) keepRegistration(extension string, reg clientcache.ResourceEventHandlerRegistration) {
+	if reg == nil {
+		return
+	}
+	a.in.mu.Lock()
+	if a.in.extRegs == nil {
+		a.in.extRegs = map[string]clientcache.ResourceEventHandlerRegistration{}
+	}
+	a.in.extRegs[extension] = reg
+	a.in.mu.Unlock()
+}
+
+// extensionRegistration returns the registration of the named extension's
+// handler on this instance, or nil.
+func (in *storeInstance) extensionRegistration(extension string) clientcache.ResourceEventHandlerRegistration {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.extRegs[extension]
 }
 
 // depHandlerName is the dep handler's record name. Extension handlers are

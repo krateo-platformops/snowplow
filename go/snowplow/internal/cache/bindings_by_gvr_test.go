@@ -90,7 +90,7 @@ func TestBindingsByGVRIndex_WildcardMatchesEveryGVR(t *testing.T) {
 		gr("composition.krateo.io", "compositions"),
 		gr("widgets.templates.krateo.io", "panels"),
 	}
-	if n := BuildBindingsByGVRIndex(navigated); n != 1 {
+	if n := SeedBindingsIndexFromSnapshotForTest(navigated); n != 1 {
 		t.Fatalf("expected 1 binding enrolled, got %d", n)
 	}
 
@@ -123,7 +123,7 @@ func TestBindingsByGVRIndex_ExactMatchScopesToGVR(t *testing.T) {
 
 	compGVR := gr("composition.krateo.io", "compositions")
 	panelGVR := gr("widgets.templates.krateo.io", "panels")
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR, panelGVR})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{compGVR, panelGVR})
 
 	// devs matches compositions (group-only representative: empty Username + [devs] Groups).
 	comp := EnumeratePrewarmTargetsForGVR(compGVR, "list")
@@ -155,7 +155,7 @@ func TestBindingsByGVRIndex_DeltaAddRemove(t *testing.T) {
 		[]*rbacv1.ClusterRole{adminCR, devsCR})
 	PublishRBACSnapshotForTest(snap)
 
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{compGVR})
 	if got := targetRepresentativeLabels(EnumeratePrewarmTargetsForGVR(compGVR, "list")); !equalSorted(got, []string{"admin", "group:devs"}) {
 		t.Fatalf("after build: want [admin group:devs], got %v", got)
 	}
@@ -198,7 +198,7 @@ func TestBindingsByGVRIndex_DeltaNonTypedBumpsCanary(t *testing.T) {
 	ResetBindingsByGVRIndexForTest()
 	// Build (empty navigated) so deltaActive() is true.
 	PublishRBACSnapshotForTest(buildSnap(nil, nil))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{gr("composition.krateo.io", "compositions")})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{gr("composition.krateo.io", "compositions")})
 
 	before := BindingsIndexDeltaSkippedNonTyped()
 	// A garbage object — not typed, not a bytesObject/Unstructured.
@@ -972,7 +972,7 @@ func TestBindingsByGVRIndex_ConcurrentRace(t *testing.T) {
 	}
 	snap := buildSnap(append([]*rbacv1.ClusterRoleBinding{adminCRB}, pool...), crs)
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex(navigated)
+	SeedBindingsIndexFromSnapshotForTest(navigated)
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -1032,7 +1032,7 @@ func TestBindingsByGVRIndex_ConcurrentRace(t *testing.T) {
 				return
 			default:
 			}
-			BuildBindingsByGVRIndex(navigated)
+			SeedBindingsIndexFromSnapshotForTest(navigated)
 		}
 	}()
 

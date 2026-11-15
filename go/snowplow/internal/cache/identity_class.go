@@ -40,10 +40,11 @@ import (
 // classes — at one instant or at two different times (#1439) — get the same
 // verdict for every RBAC check, ON ONE CONDITION: every subject through which
 // a binding matches the identity is one the sub-generation folds, and the
-// binding is in the role index. RBACSubGenForSubject states the condition. Its
-// first half holds by construction since #1443 (the fold reads the subjects
-// the evaluator matches with); the second has one known exception, until #1458
-// lands. The binding-set digest says which bindings apply; the sub-generation
+// binding is in the role index. RBACSubGenForSubject states the condition and
+// how each half holds: the first since #1443, by the shared subject matcher
+// and its parity arms; the second since #1458, the role index being a fold of
+// the RBAC events with atomic updates that nothing rebuilds from the snapshot.
+// The binding-set digest says which bindings apply; the sub-generation
 // is the number of the last RBAC state change that touched the identity's
 // folded subjects, so it says which contents of the roles behind those
 // bindings. Under the same condition, an RBAC change that moves any of a
