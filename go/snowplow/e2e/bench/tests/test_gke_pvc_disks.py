@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 
 from bench import gke
-from tests import fake_gke_api, fake_region
+from tests import fake_gke_api, fake_gke_ops, fake_region
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
@@ -226,7 +226,8 @@ def test_the_backstop_without_this_clusters_id_takes_only_recorded_unlabelled_di
 
 # ─── 1+2. teardown, end to end against fakes ───────────────────────────────
 
-FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + fake_gke_api.LOADER + textwrap.dedent("""\
+FAKE = ("#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + fake_gke_api.LOADER
+        + fake_gke_ops.LOADER + textwrap.dedent("""\
     st = os.environ["FAKE_STATE"]
     tool = os.path.basename(sys.argv[0])
     a = [x for x in sys.argv[1:] if not x.startswith(("--kubeconfig=", "--context=", "--request-timeout="))]
@@ -348,9 +349,22 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + f
         if has("deleted") and not os.environ.get("FAKE_NEVER_GONE"):
             sys.stderr.write("ERROR: ResponseError: code=404, message=Not found: clusters/x.\\n"); sys.exit(1)
         print(json.dumps({"name": a[3], "id": os.environ["FAKE_ID"],
-                          "endpoint": os.environ.get("FAKE_ENDPOINT", "127.0.0.1"), "resourceLabels": {
+                          "endpoint": os.environ.get("FAKE_ENDPOINT", "127.0.0.1"),
+                          "maintenancePolicy": maintenance_policy(st, a[3]),     # #1422 (tests/fake_gke_ops.py)
+                          "createTime": create_time(st, a[3]),
+                          "resourceLabels": {
             "purpose": "snowplow-bench", "issue": "606", "created-by": "bench-gke", "owner": "t",
             "ttl-expires": "9999999999"}})); sys.exit(0)
+    # #1422 (tests/fake_gke_ops.py): the region's operations, GKE's own record of each call that is one, and
+    # the maintenance exclusion gke-up adds and reads back
+    if a[:3] == ["container", "operations", "list"]:
+        answer_operations(st, a)
+    if a[:3] == ["container", "clusters", "update"]:
+        answer_exclusion_update(st, a)
+    if a[:3] == ["container", "clusters", "create"]:
+        ops_note(st, "CREATE_CLUSTER", a)
+    if a[:3] == ["container", "node-pools", "create"]:
+        ops_note(st, "CREATE_NODE_POOL", a)
     if a[:3] == ["container", "clusters", "delete"]:
         with open(os.path.join(st, "cluster_deletes"), "a") as fh:
             fh.write(a[3] + "\\n")
@@ -470,7 +484,7 @@ FAKE = "#!/usr/bin/env python3\nimport json, os, sys\n" + fake_region.LOADER + f
                              + ". List results may be incomplete.\\n")
         sys.exit(0)
     sys.exit(0)
-    """)
+    """))
 
 
 def _pv(name, handle, reclaim, *, dynamic=True, size="10Gi"):

@@ -17,6 +17,14 @@
 #      each delete verified by its describe's NotFound);
 #   4. the ttl-expires label, which 2 and 3 read.
 #
+# What GKE does to the cluster during the run (#1422): gke-up adds a maintenance
+# exclusion over the cluster's TTL window (scope no_upgrades), reads it back and
+# stops the run when the cluster does not hold it ($OUT/maintenance-exclusion.json),
+# so no control-plane or node upgrade starts mid-run. Control-plane resizes and
+# repairs ignore maintenance policies (run 26i: RESIZE_CLUSTER, at different times
+# per arm): collect records the cluster's operations ($OUT/cluster-operations.json)
+# and evaluate marks every measured phase one overlapped (report only).
+#
 # A paid run is not finished until its evidence is safe (#1194, bench/evidence.py):
 # OUT defaults to the durable run directory, and before gke-down the teardown
 # publishes the whole of OUT to its own evidence directory and verifies it, then
@@ -264,7 +272,10 @@ esac
 DRIVER_EST_S=$(( ${DRIVE_S%.*} + DRIVER_LOGIN_BUDGET_S ))
 MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S : DRIVER_EST_S) + 600 ))}"
 # Every other bounded step (seconds). Each one is ENFORCED where it runs.
-UP_BUDGET_S="${UP_BUDGET_S:-1800}"            # reap + gke-up (+ node pools)
+# gke-up: the sum of its parts' own budgets (bench/gke.py UP_BUDGET_PARTS: the create with its node
+# pools, the TTL backstop's proof, the maintenance exclusion and its read-back), never a number of
+# its own: a part added to gke-up is counted here, in RUN_BUDGET_S and so in the TTL
+UP_BUDGET_S="${UP_BUDGET_S:-$(python3 -c 'from bench import gke; print(gke.up_budget_s())')}"
 INSTALL_TIMEOUT_S="${INSTALL_TIMEOUT_S:-900}"  # helm install --wait --timeout
 # installer#614 (s_cert_manager): cert-manager's install and its waits share ONE
 # bound, helm's own default --timeout (5m0s), the one cert-manager's documented
@@ -927,12 +938,16 @@ s_up() {
   # #985: gke-up's stderr (its refusals and a failed create's reason, redacted
   # by gke-up) goes through record_failure like every other step's; its
   # progress is on stdout. Run 18 lost both arms with only the RUN line logged.
+  # #1422: gke-up adds a maintenance exclusion over the cluster's TTL window (no control-plane or node
+  # upgrade starts during the run), reads it back and fails when the cluster does not hold it
+  # ($OUT/maintenance-exclusion.json: what was asked, what the cluster answered). It does not cover
+  # control-plane resizes and repairs: those are recorded at collect (cluster_operations).
   local up_rc=0
-  rm -f "$OUT/quota-check.log"
+  rm -f "$OUT/quota-check.log" "$OUT/maintenance-exclusion.json"
   run bounded "$UP_BUDGET_S" python3 -m bench.gke gke-up --name "$RUN_NAME" --project "$PROJECT" \
       --zone "$ZONE" --ttl-hours "$TTL_HOURS" --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
       --address-need "$LB_NEED" --quota-log "$OUT/quota-check.log" --ttl-proof-out "$OUT/ttl-proof.json" \
-      $YES 2>"$KERR" || up_rc=$?
+      --maintenance-out "$OUT/maintenance-exclusion.json" $YES 2>"$KERR" || up_rc=$?
   # #1173: every pre-check line in the run's log, IN_USE_ADDRESSES's with the number counted
   # from the region's address holders beside the one GCE reports (each launch is the falsifier)
   if [[ -s "$OUT/quota-check.log" ]]; then
@@ -2119,6 +2134,31 @@ node_platforms() {
     log "could not record the node CPU platforms ($phase): $(kerr_line); the verdict will say they are UNKNOWN"
   fi
 }
+# cluster_operations (#1422): the GKE operations of this run's own cluster (bench/clusterops.py:
+# gcloud container operations list for its region, kept to the ones whose target is this cluster or one
+# of its node pools), each with its type, status, start and end, into $OUT/cluster-operations.json.
+# Run 26i: GKE resized each arm's control plane by itself, at different times per arm, and nothing of
+# the run said so. evaluate marks every measured phase an operation overlapped. A listing that fails is
+# recorded as could-not-be-read, never as no operation, and so is one that does not hold this cluster's
+# own CREATE_CLUSTER, started when GKE says the cluster was created (the creation time gke-up read back,
+# in maintenance-exclusion.json): an empty or foreign list proves nothing; the read needs no cluster (it works after the
+# delete too), and is bounded like every other read of collect, inside collect's own cap (a run that
+# never measured has no phase to mark, and takes no record).
+cluster_operations() {
+  local line CLUSTER_OPS="$OUT/cluster-operations.json"
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.clusterops record --name $RUN_NAME --project $PROJECT --zone $ZONE --out $CLUSTER_OPS (gcloud container operations list --region $REGION)"
+    return 0
+  fi
+  if line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.clusterops record --name "$RUN_NAME" --project "$PROJECT" \
+               --zone "$ZONE" --created-from "$OUT/maintenance-exclusion.json" --out "$CLUSTER_OPS" --yes 2>"$KERR")"; then
+    log "$line"
+  else
+    # no record at all: evaluate reads a missing file as could-not-be-read too
+    rm -f "$CLUSTER_OPS"
+    log "could not record the cluster's operations: $(kerr_line); the verdict will say they could not be read"
+  fi
+}
 # ─── #1297: the run's own work, IN-CLUSTER on the loadgen node (bench/incluster.py) ──────────────
 # Paid run 24 failed its data step on every arm because THIS machine was loaded (~90 on 8 CPUs): data606
 # and every timed sampler ran here. Now they run as Jobs on the run's loadgen node, each under a
@@ -2446,6 +2486,7 @@ s_collect() {
   local p
   if [[ "$DRY" == "1" ]]; then
     log "DRY: kubectl cp <each load606 pod>:/out/nav.jsonl $OUT/nav-<pod>.jsonl"
+    cluster_operations     # #1422: its own DRY line
     return 0
   fi
   # Every piece is best effort and bounded: this also runs from the teardown
@@ -2487,6 +2528,8 @@ s_collect() {
   snowplow_pod_record after
   tracing_reading after
   node_platforms collect
+  # #1422: what GKE did to this cluster while the run measured
+  cluster_operations
   # #1089: the netns606 samples (the TCP path under snowplow), report only;
   # flushed per line, so a copy at any moment holds whole samples
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=netns606 -o name); do
@@ -2603,6 +2646,9 @@ s_evaluate() {
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
   # run 23: the tracing readings (tracing_reading), INFO lines; a missing file reads UNKNOWN
   local trargs=(--tracing "$OUT/tracing.json")
+  # #1422: the cluster's operations (cluster_operations), marked on every measured phase; a missing or
+  # unreadable record reads "operations could not be read", never "none"
+  local opargs=(--cluster-operations "$OUT/cluster-operations.json")
   # run 26: the frontend override and its digest, judged like snowplow's (none without FRONTEND_TAG)
   local feargs=()
   if [[ -n "$FRONTEND_TAG" ]]; then
@@ -2614,7 +2660,7 @@ s_evaluate() {
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${apfargs[*]}${feargs[*]+ ${feargs[*]}}"; return 0
+    log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${opargs[*]} ${apfargs[*]}${feargs[*]+ ${feargs[*]}}"; return 0
   fi
   if [[ ${#files[@]} -eq 0 ]]; then log "no result files to evaluate"; return 1; fi
   # The verdict is a RESULT, not a tooling failure: record it, do not abort.
@@ -2630,7 +2676,17 @@ s_evaluate() {
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
-      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} > "$OUT/verdict.json" || vrc=$?
+      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${opargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} > "$OUT/verdict.json" || vrc=$?
+  # evaluate's exit is a verdict only when it wrote one: a crash exits 1 too (FAIL's code) and leaves
+  # verdict.json empty. No verdict is a tooling failure: the step fails, and the run never logs
+  # "run complete" over an empty verdict.
+  if ! python3 -c 'import json, sys
+v = json.load(open(sys.argv[1]))
+sys.exit(0 if isinstance(v, dict) and v.get("verdict") in ("PASS", "FAIL", "INVALID", "INCONCLUSIVE") else 1)' \
+       "$OUT/verdict.json" 2>/dev/null; then
+    log "evaluate FAILED (exit ${vrc}): $OUT/verdict.json holds no verdict; this run has none"
+    return 1
+  fi
   log "verdict exit=${vrc} (0 PASS, 1 FAIL, 3 INVALID, 4 INCONCLUSIVE) -> $OUT/verdict.json"
   : > "$VERDICT_MARK"        # #1051: the verdict is final; teardown never recomputes it
   # Every INVALID reason in the run log, not only in verdict.json (#817: run
@@ -2651,7 +2707,7 @@ s_evaluate() {
   done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
 print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
                              "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only",
-                             "host_load_report_only", "incluster_report_only")
+                             "host_load_report_only", "incluster_report_only", "cluster_operations_report_only")
                  for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever

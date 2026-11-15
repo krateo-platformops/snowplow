@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from bench import diag606, gcevm, gke, identity, load606, logscrub, sampler, testvm, vm606
+from bench import clusterops, diag606, gcevm, gke, identity, load606, logscrub, sampler, testvm, vm606
 from tests.test_run606_real_sequence import BENCH_DIR
 
 D256 = "sha256:" + "0123456789abcdef" * 4
@@ -100,6 +100,11 @@ SITES = {
     # #1338: bench/gcevm.py, shared by vm606 and testvm: a VM's output, a failed remote step, a drifted field
     "gcevm.remote_lines (a VM's output)": lambda s: "\n".join(gcevm.remote_lines(s)),
     "gcevm.failed (a failed remote step's lines)": lambda s: str(gcevm.failed("a step", 1, s, "", prefix="x")),
+    # #1422: what gcloud said on stderr beside an operations list it answered with exit 0
+    "clusterops.read (a listing's complaint on stderr)": lambda s: clusterops.read(
+        gke.default_spec("snowplow-bench-x"), created=0.0,
+        run=lambda argv, **kw: (kw["stderr_out"].append("WARNING: " + s), (0, "[]"))[1])["unreadable"],
+
     # #1361: a failed gcloud call's cause, in every testvm / vm606 refusal of one
     "gcevm.gcloud_cause (a refused gcloud call's cause)": lambda s: gcevm.gcloud_cause("ERROR: " + s),
 
@@ -134,7 +139,7 @@ def test_the_call_sites_are_the_ones_swept():
     """A new place that redacts is added to SITES, not left out of the sweep."""
     src = {p.name: p.read_text() for p in (BENCH_DIR / "bench").glob("*.py")}
     users = sorted(n for n, t in src.items() if "redact_identity" in t and n != "identity.py")
-    assert users == ["diag606.py", "gcevm.py", "gke.py", "load606.py", "logscrub.py", "sampler.py", "testvm.py",
+    assert users == ["clusterops.py", "diag606.py", "gcevm.py", "gke.py", "load606.py", "logscrub.py", "sampler.py", "testvm.py",
                      "vm606.py"]
     assert "bench/identity.py" in (BENCH_DIR / "run606.sh").read_text()
 

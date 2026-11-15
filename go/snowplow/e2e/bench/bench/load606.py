@@ -5941,11 +5941,64 @@ def _cluster_sample_reports(report: dict, recs: list[dict], apf_path: str | None
                                                                    browser)
 
 
+def measured_phases(recs: list[dict], report: dict) -> list[tuple[str, float | None, float | None]]:
+    """#1422: every measured phase the report knows the start and end of, as (name, start, end): boot
+    (figures.boot_window: the restart to the new pod's Ready), the storm and the burst
+    (cpu_profile_windows: the storm from its own anchor, never run_phases' open -inf), each churn step
+    (churn_windows). The customers' calls, hours long, are not one phase: they are marked per latency
+    block (measured_blocks)."""
+    from bench import figures
+    mem = [r for r in recs if r.get("kind") in ("mem_start", "mem", "heap_profile", "cpu_profile", "mem_end")]
+    out: list[tuple[str, float | None, float | None]] = []
+    boot, _ = figures.boot_window(recs)
+    if boot is not None:
+        out.append(("boot", boot[0], boot[1]))
+    win = cpu_profile_windows(mem)
+    for name in ("storm", "burst"):
+        if win is not None and win.get(name):
+            out.append((name, win[name]["t0"], win[name]["t1"]))
+    out += [(f"churn:{label}", t0, t1) for label, t0, t1, _ in churn_windows(
+        [r for r in recs if r.get("kind") in ("fresh", "churn")])]
+    return out
+
+
+def measured_blocks(report: dict):
+    """#1422: what marks the latency blocks the pair statistics use (clusterops.block_marks): the
+    customers' span, the gate's windows (custlat.pooled: storm / burst / churn / steady), custlat's
+    BLOCK_S and its split of an interval by phase."""
+    from bench import custlat
+    cl = report.get("customer_latency") or {}
+    wins = custlat.pooled([(n, float(a), float(b)) for n, a, b in cl.get("windows") or []])
+    return cl.get("k6_span"), wins, custlat.BLOCK_S, lambda a, b: custlat._seconds(a, b, wins)
+
+
+def cluster_operations_report(path: str | None, recs: list[dict], report: dict) -> dict:
+    """report["cluster_operations_report_only"] (bench/clusterops.py), and its warnings added to
+    report_warnings. A report that fails reads "operations could not be read", like a record that
+    is not there: never as no operation."""
+    from bench import clusterops
+    try:
+        sec = clusterops.report(path, measured_phases(recs, report), measured_blocks(report))
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes, nor stops, the verdict
+        why = f"the report failed: {type(e).__name__}: {e}"
+        sec = {"state": "UNREADABLE", "why": why, "operations": None, "phases": [],
+               "lines": [f"INFO cluster operations: {clusterops.SAID_UNKNOWN}{why}"]}
+    if path is not None:      # asked for (run606 always does): an unreadable record, and each overlap, is a warning
+        report.setdefault("report_warnings", []).extend(clusterops.warnings(sec))
+    return sec
+
+
 def _cmd_evaluate(a) -> int:
     recs = []
     streams = []
     mem_streams = []
+    missing_inputs = []
     for p in a.inputs:
+        # an input run606 names and collect never wrote (top-boot.jsonl when the boot outran its sampler):
+        # its records are MISSING, said in the report; evaluate crashed on it and left verdict.json empty
+        if not os.path.exists(p):
+            missing_inputs.append(os.path.basename(p))
+            continue
         rs = _read_jsonl(p)
         recs.extend(rs)
         s = driver_stream(p, rs)
@@ -6000,6 +6053,10 @@ def _cmd_evaluate(a) -> int:
                       churns=[r for r in recs if r.get("kind") == "churn"],
                       api_outages=[r for r in recs if r.get("kind") == "api_unreachable"],
                       profile_dir=a.profile_dir)
+    result["report"]["missing_inputs"] = missing_inputs
+    for name in missing_inputs:
+        result["report"].setdefault("report_warnings", []).append(
+            f"input {name} does not exist: its records are missing from this verdict, not zero")
     # the cluster's shape (gke-shape): "control_plane": "regional" from run 17;
     # runs 14-16 have no record (their control plane was zonal)
     result["report"]["cluster_shape"] = next((r for r in recs if r.get("kind") == "cluster_shape"), None)
@@ -6062,6 +6119,13 @@ def _cmd_evaluate(a) -> int:
     from bench import custlat
     _cluster_sample_reports(result["report"], recs, a.apf, custlat.calls((k6 or {}).get("k6")),
                             (k6 or {}).get("browser"))
+    # #1422 (INFO, never judged): the GKE operations of the run's own cluster (bench/clusterops.py,
+    # cluster-operations.json) against every measured phase: no operation overlapped, overlapped by
+    # which, or the operations could not be read (never "none")
+    result["report"]["cluster_operations_report_only"] = ops = cluster_operations_report(
+        a.cluster_operations, recs, result["report"])
+    for ln in ops.get("lines") or []:
+        print(ln, file=sys.stderr, flush=True)
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
@@ -6261,6 +6325,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--tracing", default=None,
                    help="run 23: run606's tracing.json (bench/tracing.py), shown as INFO lines, never "
                         "judged; a missing file reads UNKNOWN")
+    e.add_argument("--cluster-operations", default=None,
+                   help="#1422: run606's cluster-operations.json (bench/clusterops.py): each measured phase is "
+                        "marked with the GKE operations that overlapped it, INFO, never judged; a missing or "
+                        "unreadable record reads 'operations could not be read', never 'none'")
     e.add_argument("--no-viewers", action="store_true",
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",

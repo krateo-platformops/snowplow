@@ -38,7 +38,7 @@ import pytest
 
 from bench import gke
 from bench.load606 import SCALEUSER_PASSWORD
-from tests import _planted, fake_gke_api, fake_region
+from tests import _planted, fake_gke_api, fake_gke_ops, fake_region
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 RUN_NAME = "snowplow-bench-1014-1300"
@@ -65,7 +65,7 @@ _COMMON = textwrap.dedent("""\
                                  "context": context}) + "\\n")
     """)
 
-FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
+FAKE_GCLOUD = _COMMON + fake_region.LOADER + fake_gke_ops.LOADER + textwrap.dedent("""\
     a = sys.argv[1:]
     record("gcloud", os.environ.get("KUBECONFIG"))
     def opt(name):
@@ -78,6 +78,11 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         print(os.environ.get("FAKE_CLUSTERS", "[]")); sys.exit(0)
     if a[:2] == ["container", "get-server-config"]:             # #1383 gap 8 (tests/fake_region.py)
         print(json.dumps(server_config())); sys.exit(0)
+    # #1422 (tests/fake_gke_ops.py): the region's operations, and the maintenance exclusion gke-up adds
+    if a[:3] == ["container", "operations", "list"]:
+        answer_operations(STATE, a)
+    if a[:3] == ["container", "clusters", "update"]:
+        answer_exclusion_update(STATE, a)
     # FAKE_CREATE_ERROR: the create refused with this stderr (run 18: the
     # per-location limit); no cluster exists, so its describe answers NotFound
     if a[:3] == ["container", "clusters", "create"] and os.environ.get("FAKE_CREATE_ERROR"):
@@ -122,7 +127,14 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         # FAKE_REGIONAL_NOTFOUND=1: the region answers NotFound (gcloud's real
         # text, the account a placeholder); a same-named zonal bench cluster
         # answers in the zone (#900 review: run606's teardown must not go there)
-        if os.environ.get("FAKE_REGIONAL_NOTFOUND") == "1" and "--region" in a:
+        # #1422: the cluster was there while gke-up read its maintenance exclusion back (the first describe
+        # after the update); it is gone from then on
+        vanished = os.path.join(STATE, "vanished")
+        still_there = os.path.exists(os.path.join(STATE, "maintenance-" + a[3] + ".json")) \
+            and not os.path.exists(vanished)
+        if os.environ.get("FAKE_REGIONAL_NOTFOUND") == "1" and still_there:
+            open(vanished, "w").write("1")
+        elif os.environ.get("FAKE_REGIONAL_NOTFOUND") == "1" and "--region" in a:
             sys.stderr.write("ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not "
                              f"found: projects/{opt('--project')}/locations/{opt('--region')}/clusters/{a[3]}. "
                              "This command is authenticated as PLACEHOLDER-OPERATOR@example.invalid which is the "
@@ -134,6 +146,8 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
         # what GKE reports for the regional cluster gke-up made (#899 F1 records it)
         print(json.dumps({"name": a[3], "id": "d8cac43bc0ac45d28fe8bdd1ccbe101a68fc42887613486d883c5066a9fc7796", "location": opt("--region") or opt("--zone"),
                           "endpoint": "127.0.0.1",    # the server get-credentials writes below
+                          "maintenancePolicy": maintenance_policy(STATE, a[3]),     # #1422
+                          "createTime": create_time(STATE, a[3]),
                           "locations": ["europe-west4-a"], "currentNodeCount": 5,
                           # #1383 gap 7: the versions GKE gave it (FAKE_GKE_VERSION: another patch)
                           "currentMasterVersion": os.environ.get("FAKE_GKE_VERSION") or GKE_VERSION,
@@ -171,12 +185,16 @@ FAKE_GCLOUD = _COMMON + fake_region.LOADER + textwrap.dedent("""\
                     break
                 time.sleep(0.1)
         open(os.path.join(STATE, "deleted"), "w").write("1")
+        ops_note(STATE, "DELETE_CLUSTER", a)                     # #1422: GKE's own record of it
         sys.exit(0)
     if a[:3] == ["container", "clusters", "create"]:
         if os.environ.get("FAKE_AT_CREATE"):                     # #1194: the disk changes mid-run
             import subprocess
             subprocess.run(["bash", "-c", os.environ["FAKE_AT_CREATE"]], check=True)
         time.sleep(float(os.environ.get("FAKE_SLOW_UP", "0")))   # a hung create
+        ops_note(STATE, "CREATE_CLUSTER", a)
+    if a[:3] == ["container", "node-pools", "create"]:
+        ops_note(STATE, "CREATE_NODE_POOL", a)
     sys.exit(0)   # create / node-pools create / delete
     """)
 
@@ -835,7 +853,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         sys.exit(0)
     if a[:2] == ["top", "pod"]:
         print("snowplow-abc 120m 650Mi"); sys.exit(0)
-    if a[:1] == ["cp"] and any("mem606" in x for x in a):
+    # the SOURCE pod, never the destination path: a test whose own name holds "mem606" (its tmp dir) had its
+    # driver-results copy answered as this one, a directory where nav-<pod>.jsonl belongs; evaluate died on
+    # it, and nothing noticed until a run without a verdict stopped ending well (#1422)
+    if a[:1] == ["cp"] and any(x.startswith("mem606") and ":" in x for x in a):
         dest = a[-1]
         os.makedirs(dest, exist_ok=True)
         open(os.path.join(dest, "heap-01-150000-ready.pb.gz"), "wb").write(b"\\x1f\\x8bfake")
