@@ -149,7 +149,6 @@ var storeRegistry = map[string]string{
 	"cache.bindingsByGVRIndex.wildcard":               "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.byRole":                 "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.entries":                "no-content (identity-free binding index)",
-	"cache.bindingsByGVRIndex.roleRefUnresolved":      "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.navigated":              "no-content (identity-free binding index)",
 	"cache.keySet.keys":                               "no-content (dep edges; value = the key's reverse *depSet, which holds only its CacheEntryClass index — #603 PR-0)",
 	"cache.depSet.deps":                               "no-content (dep edges)",
