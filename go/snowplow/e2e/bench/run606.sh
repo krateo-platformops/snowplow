@@ -1038,6 +1038,22 @@ snowplow_env_render() {
     return 1
   fi
 }
+# s_portal_routes: the portal's route table, from the installer chart this run installs
+# (bench/installer_routes.py: the path each component is served at on the ONE portal origin, and the
+# frontend config key that must carry it; rendered offline by the chart's own rules). Before anything
+# is created, in the dry pass too: the portal-origin gate holds the live frontend config against THIS
+# table, never against paths fixed in the bench (installer 0.3.639 moved authn from /auth to /authn,
+# and the first paid rehearsal on 0.3.641 found out 26 minutes into a cluster).
+s_portal_routes() {
+  local line
+  if line="$(python3 -m bench.installer_routes table --installer-pulled "$OUT/installer-pulled" \
+               --values "$OUT/installer-values.yaml" --out "$OUT/portal-routes.json" 2>"$KERR")"; then
+    log "$line"
+  else
+    record_failure "portal-routes FAILED: the installer chart's portal route table could not be derived"
+    return 1
+  fi
+}
 # snowplow_env_gate: before any load, the running snowplow container must have every declared key as
 # declared (the reading tracing_reading just took: the container's env and the ConfigMaps it reads,
 # never the rendered values), and, in a launch of several runs, the keys no run declared must read
@@ -1290,9 +1306,12 @@ PORTAL_GATEWAY_SVC="krateo-agent-gateway-platform"   # internalDataPlane: <gatew
 wait_portal_origin() {
   local why="" t0 now t_addr="" end resync_s resync_src refuse v rc_d rc_c rc_g rc_f g="$OUT/.gate"
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: read the installer cdc's resync interval; read $FRONTEND_CONFIGMAP config.json until load606 portal-origin passes (gateway $PORTAL_GATEWAY_SVC address, then 2 x resync) -> $OUT/portal-origin.env"
-    printf 'export PORTAL_ORIGIN=http://dry-run-gateway PORTAL_SNOWPLOW_URL=http://dry-run-gateway/content\n' \
-        > "$OUT/portal-origin.env"
+    log "DRY: read the installer cdc's resync interval; read $FRONTEND_CONFIGMAP config.json until load606 portal-origin --routes $OUT/portal-routes.json passes (gateway $PORTAL_GATEWAY_SVC address, then 2 x resync) -> $OUT/portal-origin.env"
+    # the dry origin, with snowplow at the path the chart's table gives it
+    python3 -c 'import json, sys
+t = json.load(open(sys.argv[1]))
+print("export PORTAL_ORIGIN=http://dry-run-gateway PORTAL_SNOWPLOW_URL=http://dry-run-gateway" + t["paths"][t["snowplow_key"]])' \
+        "$OUT/portal-routes.json" > "$OUT/portal-origin.env"
     # shellcheck disable=SC1091
     source "$OUT/portal-origin.env"
     return 0
@@ -1328,7 +1347,7 @@ wait_portal_origin() {
   while :; do
     "${K[@]}" -n krateo-system get configmap "$FRONTEND_CONFIGMAP" \
         -o 'jsonpath={.data.config\.json}' > "$OUT/frontend-config.json" 2>"$KERR" || true
-    if python3 -m bench.load606 portal-origin < "$OUT/frontend-config.json" \
+    if python3 -m bench.load606 portal-origin --routes "$OUT/portal-routes.json" < "$OUT/frontend-config.json" \
         > "$OUT/portal-origin.env" 2>"$OUT/.portal-origin.err"; then
       # shellcheck disable=SC1091
       source "$OUT/portal-origin.env"
@@ -1347,7 +1366,16 @@ wait_portal_origin() {
     now="$(python3 -m bench.origin_gate now --state "$g/clock")"
     python3 -m bench.origin_gate reading --t "$now" --gateway-json "$g/svc.json" --gateway-rc "$rc_g" \
         --gateway-err "$g/svc.err" --frontends-json "$g/fe.json" --frontends-rc "$rc_f" --frontends-err "$g/fe.err" \
-        --deployments-json "$g/deploy.json" --installers-json "$g/installers.json" >> "$OUT/portal-origin-wait.jsonl"
+        --deployments-json "$g/deploy.json" --installers-json "$g/installers.json" \
+        --routes "$OUT/portal-routes.json" >> "$OUT/portal-origin-wait.jsonl"
+    # the installer rendered every URL on one origin, and a path that is not its own chart's route: no
+    # wait resolves that, so the gate stops here (its verdict says which two things disagree)
+    if python3 -c 'import json, sys
+rows = [json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+sys.exit(0 if rows and rows[-1].get("rendered") == "wrong_paths" else 1)' "$OUT/portal-origin-wait.jsonl"; then
+      log "portal not same-origin, and waiting cannot fix it: $why"
+      break
+    fi
     # the window counts from when the current address was first read: a reading of NO address
     # restarts it; one that could not be taken (a transient API error) does not (#1006 R2-1)
     t_addr="$(python3 -m bench.origin_gate address-since --readings "$OUT/portal-origin-wait.jsonl")"
@@ -1358,7 +1386,8 @@ wait_portal_origin() {
     sleep "$PLATFORM_POLL_S"
   done
   v="$(python3 -m bench.origin_gate verdict --readings "$OUT/portal-origin-wait.jsonl" \
-      --resync "$OUT/portal-origin-resync.json" --why "${why:-config.json unreadable}")"
+      --resync "$OUT/portal-origin-resync.json" --why "${why:-config.json unreadable}" \
+      --routes "$OUT/portal-routes.json")"
   rm -rf "$g"
   record_failure "portal origin FAILED: $(python3 -c 'import json, sys; v = json.loads(sys.argv[1]); print(v["kind"] + ": " + v["message"])' "$v")" || true
   return 1
@@ -3078,6 +3107,7 @@ step cert-manager-source s_cert_manager_source
 step schema    s_schema
 step registry  s_registry
 step snowplow-env snowplow_env_render
+step portal-routes s_portal_routes
 step reap      s_reap
 step up        s_up
 step psi       s_psi

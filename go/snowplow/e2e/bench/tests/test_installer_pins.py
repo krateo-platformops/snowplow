@@ -227,8 +227,8 @@ def test_run606s_dry_pass_goes_through_every_step_on_either_form_of_the_chart(ha
     assert pulled_files == (["component-pins.min.yaml"] if form == "min" else ["component-pins.yaml"])
     assert "installer registry preflight REFUSED" not in log and "(registry preflight OK" in log
     steps = re.findall(r"=== step (\S+) ===", log)
-    assert steps[:9] == ["apis", "source", "login-contract", "cert-manager-source", "schema", "registry",
-                         "snowplow-env", "reap", "up"] and steps[-1] == "evaluate"
+    assert steps[:10] == ["apis", "source", "login-contract", "cert-manager-source", "schema", "registry",
+                          "snowplow-env", "portal-routes", "reap", "up"] and steps[-1] == "evaluate"
 
 
 # ─── from the review of the per-arm env change ──────────────────────────────

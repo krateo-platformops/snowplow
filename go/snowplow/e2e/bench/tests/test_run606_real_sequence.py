@@ -1052,7 +1052,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             if mode == "unread":
                 print("Error from server (Forbidden): frontends is forbidden", file=sys.stderr); sys.exit(1)
             host = "http://10.0.0.9" if mode == "same" else "http://localhost:808"
-            cfg = ({"SNOWPLOW_API_BASE_URL": host + "/content", "AUTHN_API_BASE_URL": host + "/auth",
+            authn_path = os.environ.get("FAKE_LIVE_AUTHN_PATH") or os.environ.get("FAKE_AUTHN_PATH", "/auth")
+            cfg = ({"SNOWPLOW_API_BASE_URL": host + "/content", "AUTHN_API_BASE_URL": host + authn_path,
                     "EVENTS_API_BASE_URL": host + "/events", "EVENTS_PUSH_API_BASE_URL": host + "/events"}
                    if mode == "same" else
                    {"SNOWPLOW_API_BASE_URL": "http://localhost:8081", "AUTHN_API_BASE_URL": "http://localhost:8082",
@@ -1310,7 +1311,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"}
             else:
                 urls = {"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/content",
-                        "AUTHN_API_BASE_URL": "http://10.0.0.9/auth",
+                        "AUTHN_API_BASE_URL": "http://10.0.0.9" + (
+                            os.environ.get("FAKE_LIVE_AUTHN_PATH") or os.environ.get("FAKE_AUTHN_PATH", "/auth")),
                         "EVENTS_API_BASE_URL": "http://10.0.0.9/events",
                         "EVENTS_PUSH_API_BASE_URL": "http://10.0.0.9/events"}
             print(json.dumps({"api": {"INIT": init, "BUILDERS_NAMESPACE": "krateo-system", **urls},
@@ -1543,7 +1545,11 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             "component-pins.yaml"
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
             '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10)
-            + '{{- define "inst.componentsYaml" -}}{{ .Files.Get "files/' + pins_name + '" }}{{- end -}}' + chr(10))
+            + '{{- define "inst.componentsYaml" -}}{{ .Files.Get "files/' + pins_name + '" }}{{- end -}}' + chr(10)
+            # which components are on: the installer's own rule (a pin's feature, in the values)
+            + '{{- define "inst.compEnabled" -}}{{- $top := index . 0 -}}{{- $c := index . 1 -}}'
+            + '{{- if or (not $c.feature) (index $top.Values.features $c.feature) -}}true{{- end -}}{{- end -}}'
+            + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
             "dependencies": [{"name": "core-provider", "version": "2.13.24"},
@@ -1577,8 +1583,20 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                 # FAKE_FRONTEND_PIN (0.3.545's own is 1.8.34); by default one that carries the login
                 # form contract (bench/login_contract.py, run 26d); "none": no frontend pin
                 + ([{"name": "frontend", "kind": "Frontend", "chart": "frontend",
-                     "version": os.environ.get("FAKE_FRONTEND_PIN", "1.8.40"), "feature": "portal"}]
-                   if os.environ.get("FAKE_FRONTEND_PIN") != "none" else [])}))
+                     "version": os.environ.get("FAKE_FRONTEND_PIN", "1.8.40"), "feature": "portal",
+                     "svcMatch": "frontend", "exposePort": 8080, "gatewayPath": "/", "gatewayRewrite": False}]
+                   if os.environ.get("FAKE_FRONTEND_PIN") != "none" else [])
+                # the portal's path-mode routes, as the published pins declare them (0.3.616: authn at
+                # /auth; 0.3.639 on: /authn. FAKE_AUTHN_PATH: the path this chart pins)
+                + [{"name": "authn", "version": "0.47.0", "feature": "portal", "svcMatch": "authn",
+                    "exposePort": 8082, "gatewayPath": os.environ.get("FAKE_AUTHN_PATH", "/auth"),
+                    "gatewayRewrite": True, "configKeys": ["AUTHN_API_BASE_URL"]},
+                   {"name": "snowplow", "version": "1.12.70", "feature": "portal", "svcMatch": "snowplow",
+                    "exposePort": 8081, "gatewayPath": "/content", "gatewayRewrite": True,
+                    "configKeys": ["SNOWPLOW_API_BASE_URL"]},
+                   {"name": "krateo-sse-proxy", "version": "1.2.0", "feature": "portal", "svcMatch": "sse-proxy",
+                    "exposePort": 8080, "gatewayPath": "/events", "gatewayRewrite": True,
+                    "configKeys": ["EVENTS_API_BASE_URL", "EVENTS_PUSH_API_BASE_URL"]}]}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")

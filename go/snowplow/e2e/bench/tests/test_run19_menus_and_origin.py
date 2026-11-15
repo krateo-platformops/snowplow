@@ -229,12 +229,26 @@ SAME = {"api": {"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/content", "AUTHN_API_B
                 "EVENTS_API_BASE_URL": "http://10.0.0.9/events", "EVENTS_PUSH_API_BASE_URL": "http://10.0.0.9/events/"}}
 
 
+
+#: the portal route table of an installer that routes authn at /auth (0.3.616's), as
+#: bench.installer_routes derives it: what these tests hold a config against
+ROUTES = {"kind": "portal_routes", "snowplow_key": "SNOWPLOW_API_BASE_URL", "source": "test",
+          "paths": {"SNOWPLOW_API_BASE_URL": "/content", "AUTHN_API_BASE_URL": "/auth",
+                    "EVENTS_API_BASE_URL": "/events", "EVENTS_PUSH_API_BASE_URL": "/events"}}
+
+
 def _origin(api):
-    return load606.portal_origin(json.dumps({"api": api}))
+    return load606.portal_origin(json.dumps({"api": api}), ROUTES)
+
+
+def _routes_file(tmp_path):
+    f = tmp_path / "portal-routes.json"
+    f.write_text(json.dumps(ROUTES))
+    return str(f)
 
 
 def test_one_origin_at_057s_paths_passes():
-    r = load606.portal_origin(json.dumps(SAME))
+    r = load606.portal_origin(json.dumps(SAME), ROUTES)
     assert r["origin"] == "http://10.0.0.9" and r["snowplow_url"] == "http://10.0.0.9/content"
     tls = {k: v.replace("http://10.0.0.9", "https://portal.krateo.dev") for k, v in SAME["api"].items()}
     assert _origin(tls)["origin"] == "https://portal.krateo.dev"            # 057's own config
@@ -244,7 +258,7 @@ def test_one_origin_at_057s_paths_passes():
     ({"EVENTS_PUSH_API_BASE_URL": "http://10.0.0.10/events"}, "2 origins"),
     ({"EVENTS_PUSH_API_BASE_URL": "http://10.0.0.9:8083/events"}, "2 origins"),      # a port is an origin
     ({"AUTHN_API_BASE_URL": "https://10.0.0.9/auth"}, "2 origins"),                   # so is a scheme
-    ({"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/snowplow"}, "not '/content'"),
+    ({"SNOWPLOW_API_BASE_URL": "http://10.0.0.9/snowplow"}, "the installer chart routes it at '/content'"),
     ({"EVENTS_API_BASE_URL": "/events"}, "not an absolute URL"),
     ({"AUTHN_API_BASE_URL": ""}, "not an absolute URL"),
 ])
@@ -254,13 +268,14 @@ def test_anything_but_one_origin_at_057s_paths_is_refused(change, why):
 
 
 def test_the_cli_exports_the_origin_or_says_why_not(tmp_path):
-    ok = subprocess.run([sys.executable, "-m", "bench.load606", "portal-origin"], input=json.dumps(SAME),
+    rf = _routes_file(tmp_path)
+    ok = subprocess.run([sys.executable, "-m", "bench.load606", "portal-origin", "--routes", rf], input=json.dumps(SAME),
                         capture_output=True, text=True, cwd=BENCH_DIR, timeout=60)
     assert ok.returncode == 0 and "export PORTAL_ORIGIN=http://10.0.0.9" in ok.stdout
     run17 = {"api": {"SNOWPLOW_API_BASE_URL": "http://localhost:8081", "AUTHN_API_BASE_URL": "http://localhost:8082",
                      "EVENTS_API_BASE_URL": "http://localhost:8083",
                      "EVENTS_PUSH_API_BASE_URL": "http://localhost:8083"}}
-    bad = subprocess.run([sys.executable, "-m", "bench.load606", "portal-origin"], input=json.dumps(run17),
+    bad = subprocess.run([sys.executable, "-m", "bench.load606", "portal-origin", "--routes", rf], input=json.dumps(run17),
                          capture_output=True, text=True, cwd=BENCH_DIR, timeout=60)
     assert bad.returncode == 1 and "3 origins" in bad.stderr and bad.stdout == ""
 

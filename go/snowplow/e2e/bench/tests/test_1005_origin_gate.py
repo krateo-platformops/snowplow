@@ -321,12 +321,15 @@ def test_a_reading_is_built_from_what_kubectl_answered(tmp_path):
     d = _deploy(_c())
     d["items"][1]["status"] = {"conditions": [{"type": "Available", "status": "True"}]}
     dep.write_text(json.dumps(d))
-    r = origin_gate.reading(5, str(svc), 0, str(fe), 0, str(dep))
+    from tests.test_run19_menus_and_origin import ROUTES
+    r = origin_gate.reading(5, str(svc), 0, str(fe), 0, str(dep), routes=ROUTES)
     assert (r["gateway"], r["rendered"], r["cdc_available"]) == ("address", "same_origin", True)
     r = origin_gate.reading(5, str(svc), 1, str(fe), 1, str(tmp_path / "none"),
-                            {"gateway": 'Error from server (NotFound): services "x" not found', "frontends": "denied"})
+                            {"gateway": 'Error from server (NotFound): services "x" not found', "frontends": "denied"},
+                            routes=ROUTES)
     assert (r["gateway"], r["rendered"], r["cdc_available"]) == ("absent", "unread", None)
-    assert origin_gate.reading(5, str(svc), 1, str(fe), 0, str(dep), {"gateway": "timeout"})["gateway"] == "unread"
+    assert origin_gate.reading(5, str(svc), 1, str(fe), 0, str(dep), {"gateway": "timeout"},
+                               routes=ROUTES)["gateway"] == "unread"
 
 
 # ─── the gate in run606's real sequence ─────────────────────────────────────
