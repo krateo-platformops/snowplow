@@ -1784,7 +1784,7 @@ func registerExternalFetchCacheInstruments(m metric.Meter) error {
 		return err
 	}
 	flight, err := m.Int64ObservableCounter("snowplow_external_fetch_flight_total",
-		metric.WithDescription("External api-step fetches by whether they shared a call (#1320), by outcome: led (a read that started a call identical reads may join), joined (a read that shared an identical call already in flight: no call sent), not_shared (a write, or an endpoint the key cannot fold exactly: never shared). Identical means the whole outbound request, credentials and every header included, so identities never share; a call admits joiners only until its first response byte, never after it completes. Calls sent = led + not_shared."))
+		metric.WithDescription("External api-step read attempts by whether they shared a request on the wire (#1320), by outcome: led (an attempt that started a request identical reads may join), joined (an attempt answered by an identical request already on the wire: nothing sent), not_shared (an attempt its own reader sent: a write, an endpoint the key cannot fold exactly, a redirect hop, a retry past the attempt its fetch gave up on). Counted per attempt, not per fetch. Identical means the whole outbound request, credentials and every header included, so identities never share; a request admits joiners only until its first response byte and, when a customer started it, only until that customer's page-budget deadline; it is cancelled when its last waiter leaves and never reused after it completes. Requests sent = led + not_shared; collapse = joined / (led + joined)."))
 	if err != nil {
 		return err
 	}

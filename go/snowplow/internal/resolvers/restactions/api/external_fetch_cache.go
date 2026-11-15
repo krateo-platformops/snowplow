@@ -1,5 +1,6 @@
 // external_fetch_cache.go — the external api-step fetch: identical concurrent
-// reads share one in-flight call, and the CONVERSION is memoised by content.
+// reads share one request on the wire, and the CONVERSION is memoised by
+// content.
 //
 // WHY. External results never reach L1 (the external-touched sink declines the
 // Put: they have no dependency edge to invalidate them), so every visit
@@ -7,34 +8,33 @@
 // 15–19% of steady-state CPU in httpFetchAllowingNonJSON → toJSONBytes →
 // yaml.YAMLToJSON, and one external-backed widget ran 870 times in the storm,
 // once per user. On 057 (#1320) every page load opened its own identical call,
-// up to 48 at once, each cut at its page budget while the upstream ran it on.
+// up to 48 at once.
 //
-// WHAT IS SHARED: an identical READ while it is in flight, and nothing else
-// (#1320, owner ruling 2026-11-10; external_fetch_flight.go). Snowplow has no
-// event source for an external endpoint. A read (GET, HEAD, OPTIONS, TRACE)
-// arriving while an identical one is in flight joins it; identical is the
-// whole outbound request — endpoint with every credential field, method,
-// resolved URL, every header (an exported JWT included), payload and dial
-// provenance — so identities never share. THE FRESHNESS CONTRACT: a joiner may
-// get an answer from a call that started up to one call-duration before it
-// arrived. It never gets bytes received before it arrived: a call stops
-// admitting joiners at its first response byte. Nothing is reused after
+// WHAT IS SHARED: one identical READ on the wire, among readers waiting at the
+// same time, and nothing else (#1320; external_fetch_flight.go has the rules).
+// Snowplow has no event source for an external endpoint. A read (GET, HEAD,
+// OPTIONS, TRACE) whose attempt reaches the wire while an identical request is
+// already there waits on that one; identical is the whole outbound request —
+// endpoint with every credential field, method, resolved URL, every header (an
+// exported JWT included), payload and dial provenance — so identities never
+// share. Everything above the wire is each reader's own: its retries, backoff,
+// page budget, audit record and conversion run exactly as without sharing.
+//
+// THE FRESHNESS CONTRACT. A reader may get an answer from a request that was
+// sent before it arrived — by at most the page budget of the customer that
+// sent it. It never gets bytes received before it arrived: a wire request
+// stops admitting readers at its first response byte. Nothing is reused after
 // completion — no TTL, no Cache-Control/Expires window, no conditional request
 // (a 304 on If-Modified-Since is second-granular and answers "not modified"
 // for a file rolled back to an older mtime, #845 review) — so a read arriving
-// after a call completed makes a full, unconditional call of its own, and a
-// change upstream is in the next call. A write is never shared. The shared
-// call runs detached from every page, under the server write deadline; each
-// caller's page budget and context bound only its own wait, and each caller
-// records its own stage and audit outcome.
+// after a request completed sends a full, unconditional request of its own,
+// and a change upstream is in the next one. A write is never shared.
 //
-// IT RUNS TO ITS DEADLINE EVEN AFTER ITS LAST WAITER LEAVES — by design, the
-// ruling's purpose. Under load every page is cut at its 10 s budget; cancelling
-// the call when its last waiter left would recreate the 057 storm (each cut
-// abandons the call and the next page starts over from zero). Kept running, the
-// next page joins a call already most of the way done. Its only bound is the
-// server write deadline (cache.DemandRevalidationDeadline). A client disconnect
-// therefore ends that caller's wait, never the call (inline443 h_ClientCancel).
+// NOTHING OUTLIVES ITS READERS (owner ruling 2026-11-15). A wire request is
+// cancelled when the last reader waiting on it leaves (its page budget ran
+// out, its client disconnected), and its key is freed. A client disconnect
+// therefore ends the upstream request when nobody else waits on it, as it did
+// before sharing (inline443 h_ClientCancel).
 //
 // WHAT IS MEMOISED: the conversion of the bytes just received. key =
 // sha256(conversion mode ‖ raw bytes) → toJSONBytes' output for them. The
@@ -52,7 +52,7 @@
 // it, so it shrinks as the heap fills even when every read is a hit. Evictions
 // are counted.
 //
-// With the cache off the memo and the shared call both step aside (cache-off
+// With the cache off the memo and the sharing both step aside (cache-off
 // byte-identical: every read is its caller's own fetch).
 
 package api
@@ -63,6 +63,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"expvar"
+	"net/http"
 	"sync"
 	"sync/atomic"
 
@@ -91,22 +92,30 @@ type externalFetchCache struct {
 	bytes       int64
 	converting  singleflight.Group
 
-	// flights (#1320) is each outbound read's joinable in-flight call, keyed by
-	// the whole request (externalReadKeyOf): held only from the call's start to
-	// its first response byte, never after it completes.
+	// flights (#1320) is each outbound read's joinable request on the wire,
+	// keyed by the whole request (externalReadKeyOf): held from the request's
+	// start until it stops admitting readers (its first response byte, its
+	// completion, its last waiter leaving, or a newer request replacing one
+	// that is past its join bound), never after it completes.
 	flightsMu sync.Mutex
 	flights   map[externalFlightKey]*externalFlight
 
 	// fetch, toJSON and budget are seams for the tests.
-	fetch  func(context.Context, httpcall.RequestOptions, func(string, []byte) ([]byte, error)) (*response.Status, []byte, string, error)
+	fetch  func(context.Context, httpcall.RequestOptions, func(string, []byte) ([]byte, error), func(http.RoundTripper, *http.Request) http.RoundTripper) (*response.Status, []byte, string, error)
 	toJSON func(string, []byte) ([]byte, error)
 	budget func(held int64) int64
 
 	convertHits, convertMisses, evictions atomic.Uint64
-	// #1320 — reads that started a shared call, reads that joined one, and
-	// fetches that are never shared (a write, or an endpoint the key cannot
-	// fold exactly). Calls sent = led + not_shared.
+	// #1320 — by ATTEMPT (one try of one fetch that reached the sharing):
+	// attempts that started a wire request others may join, attempts answered
+	// by a wire request already there (nothing sent), and attempts sent by
+	// their own reader outside the sharing (a write, a key that cannot fold
+	// exactly, a redirect hop, a retry past the attempt its fetch gave up on).
+	// Requests sent = led + not_shared.
 	flightLed, flightJoined, flightNotShared atomic.Uint64
+	// A shared request that panicked after its last waiter left (nobody to
+	// raise it in). Logged where counted.
+	flightPanicsUnwaited atomic.Uint64
 }
 
 func newExternalFetchCache() *externalFetchCache {
@@ -123,17 +132,18 @@ func newExternalFetchCache() *externalFetchCache {
 var externalFetches = newExternalFetchCache()
 
 // sharedExternalFetch is the external dispatch's fetch (resolve.go). Same
-// return contract as httpFetchAllowingNonJSON; a read may share an identical
-// in-flight call (external_fetch_flight.go), never a completed one.
+// return contract as httpFetchAllowingNonJSON; a read's attempt may share an
+// identical request already on the wire (external_fetch_flight.go), never a
+// completed one.
 func sharedExternalFetch(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
 	return externalFetches.do(ctx, opts)
 }
 
 func (c *externalFetchCache) do(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
 	if cache.Disabled() {
-		return c.fetch(ctx, opts, toJSONBytes)
+		return c.fetch(ctx, opts, toJSONBytes, nil)
 	}
-	return c.fetchShared(ctx, opts)
+	return c.fetch(ctx, opts, c.convert, c.share(ctx, opts))
 }
 
 // convert is toJSONBytes memoised by content: the body's bytes are looked up by
@@ -269,12 +279,17 @@ func ExternalFetchCacheSnapshot() []ExternalFetchCacheCount {
 
 // ExternalFetchFlightSnapshot returns snowplow_external_fetch_flight_total by
 // outcome (closed set, zeros included; #1320):
-//   - led: a read that started a call identical reads may join;
-//   - joined: a read that shared an identical call already in flight;
-//   - not_shared: a fetch that is never shared (a write, or an endpoint the key
-//     cannot fold exactly).
+//   - led: an attempt that started a request on the wire identical reads may
+//     join;
+//   - joined: an attempt answered by an identical request already on the wire
+//     (nothing sent);
+//   - not_shared: an attempt its own reader sent outside the sharing (a write,
+//     an endpoint the key cannot fold exactly, a redirect hop, a retry past the
+//     attempt its fetch gave up on).
 //
-// Calls sent = led + not_shared; joined is the calls not sent.
+// Counted per attempt, not per fetch (a fetch that retries counts each try).
+// Requests sent = led + not_shared; joined is the requests not sent, so the
+// collapse is joined / (led + joined).
 func ExternalFetchFlightSnapshot() []ExternalFetchCacheCount {
 	c := externalFetches
 	return []ExternalFetchCacheCount{
@@ -283,6 +298,10 @@ func ExternalFetchFlightSnapshot() []ExternalFetchCacheCount {
 		{Outcome: "not_shared", Count: c.flightNotShared.Load()},
 	}
 }
+
+// ExternalFetchFlightUnwaitedPanics returns how many shared requests panicked
+// after their last waiter left (each also logged at ERROR).
+func ExternalFetchFlightUnwaitedPanics() uint64 { return externalFetches.flightPanicsUnwaited.Load() }
 
 // ExternalFetchCacheHeld returns the memo's current entries and bytes.
 func ExternalFetchCacheHeld() (entries int, bytes int64) { return externalFetches.held() }
@@ -321,6 +340,9 @@ func init() {
 		}))
 		expvar.Publish("snowplow_external_fetch_conversion_evictions_total", expvar.Func(func() any {
 			return ExternalFetchCacheEvictions()
+		}))
+		expvar.Publish("snowplow_external_fetch_flight_unwaited_panics_total", expvar.Func(func() any {
+			return ExternalFetchFlightUnwaitedPanics()
 		}))
 		expvar.Publish("snowplow_external_fetch_flight_total", expvar.Func(func() any {
 			m := map[string]uint64{}
