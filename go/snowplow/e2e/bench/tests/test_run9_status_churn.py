@@ -33,6 +33,7 @@ FIX = Path(__file__).parent / "fixtures"
 GVR = ("composition.krateo.io", "v1-2-2", "githubscaffoldingwithcompositionpages")
 RENDER_KW = dict(snowplow_url="http://snowplow.krateo-system.svc:8081",
                  authn_url="http://authn.krateo-system.svc:8082", user="scaleuser-0001",
+                 debug_user="scaleuser-debug-reader",
                  password="PW", rates=["1", "10", "50"], samples=60, gap_s=5.0,
                  probe_name="bench-app-01-01", namespaces=50, comp_group=GVR[0],
                  comp_version=GVR[1], comp_plural=GVR[2], delay_s=60)
@@ -42,9 +43,11 @@ RENDER_KW = dict(snowplow_url="http://snowplow.krateo-system.svc:8081",
 
 
 def test_annotation_only_fresh606_manifest_is_byte_identical_to_71f25c6f():
+    # byte-identical but for ONE argument (#1471): the start gate reads /debug/vars as the debug reader
     golden = (FIX / "fresh606_annotation_71f25c6f.yaml").read_text()
-    assert load606_job.render_fresh(**RENDER_KW) == golden
-    assert load606_job.render_fresh(modes=("annotation",), **RENDER_KW) == golden
+    debug = ' --debug-user "scaleuser-debug-reader"'
+    for got in (load606_job.render_fresh(**RENDER_KW), load606_job.render_fresh(modes=("annotation",), **RENDER_KW)):
+        assert got.count(debug) == 1 and got.replace(debug, "", 1) == golden
 
 
 def test_annotation_probe_restaction_is_byte_identical_to_71f25c6f():

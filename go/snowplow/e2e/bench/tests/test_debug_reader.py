@@ -80,6 +80,85 @@ RUN606_DEBUG_READERS = ("bench/load606.py", "bench/full_widen.py", "k6/browser.j
 _REQ = re.compile(r"""(?:\bget\(\s*f?["']|\$\{[^}]+\})(/debug/[A-Za-z0-9_/]+)""")
 
 
+# ─── every function that reaches a /debug request, found by the call graph, not by a literal ─
+
+def _debug_readers(src: str) -> list[str]:
+    """Every function (or method) of a module that reaches a /debug request: those whose own calls carry a
+    "/debug/..." path argument, then, to a fixpoint, every function calling one of them, by name or method
+    name. A helper that hides the literal (read_vars, mem_sample) is found through its callers."""
+    import ast
+    tree = ast.parse(src)
+    fns = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fns[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            fns.update({f"{node.name}.{m.name}": m for m in node.body
+                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))})
+
+    def lit(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            return n.value.startswith("/debug/")
+        return (isinstance(n, ast.JoinedStr) and bool(n.values) and isinstance(n.values[0], ast.Constant)
+                and str(n.values[0].value).startswith("/debug/"))
+    hit = {q for q, f in fns.items() if any(isinstance(c, ast.Call) and any(lit(x) for x in c.args)
+                                           for c in ast.walk(f))}
+    while True:
+        short = {q.rsplit(".", 1)[-1] for q in hit}
+        more = {q for q, f in fns.items() if q not in hit and any(
+            isinstance(c, ast.Call) and ((isinstance(c.func, ast.Name) and c.func.id in short)
+                                         or (isinstance(c.func, ast.Attribute) and c.func.attr in short))
+            for c in ast.walk(f))}
+        if not more:
+            return sorted(hit)
+        hit |= more
+
+
+#: every function of the run606 path that reaches /debug, and, for each ENTRY (where the token is chosen), the
+#: test that proves it is the debug reader's. A new reader (a new call of read_vars, mem_sample, a helper that
+#: builds a /debug URL) is not in this table, and turns the guard RED until it is given its own proof
+DEBUG_READERS = {
+    "bench/load606.py": {
+        "_cmd_drive": "test_the_drive_samples_debug_vars_as_the_debug_reader",
+        "_drive": "test_the_drive_samples_debug_vars_as_the_debug_reader",
+        "read_vars": "(helper: reached through _drive)",
+        "_cmd_fresh": "test_fresh_gates_its_start_as_the_debug_reader_and_probes_as_its_own_user",
+        "wait_for_customer_load": "(helper: reached through _cmd_fresh; tests/test_measure_validity.py)",
+        "_cmd_go_runtime": "test_the_go_runtime_job_reads_as_the_debug_reader (its only identity is --user)",
+        "_cmd_memwatch": "test_mem606_and_the_drivers_sampler_read_as_the_debug_reader_and_the_drive_as_scale_users",
+        "memwatch": "(helper: reached through _cmd_memwatch)",
+        "mem_sample": "(helper: reached through memwatch)",
+        "cpu_profiler": "(helper: reached through memwatch)",
+    },
+    "bench/full_widen.py": {
+        "main": "test_the_full_widen_cli_wires_debug_to_the_debug_reader_and_the_probe_to_its_user",
+        "_cmd_watch": "test_the_full_widen_cli_wires_debug_to_the_debug_reader_and_the_probe_to_its_user",
+        "Watch.run": "(method: reached through _cmd_watch)",
+        "Watch.tick": "test_the_full_widen_job_reads_debug_as_the_debug_reader_and_the_probe_as_its_own_identity",
+        "Watch._vars": "test_the_full_widen_job_reads_debug_as_the_debug_reader_and_the_probe_as_its_own_identity",
+    },
+}
+
+
+def test_every_function_that_reads_debug_is_one_whose_identity_is_proven():
+    for rel, want in DEBUG_READERS.items():
+        assert _debug_readers((BENCH / rel).read_text()) == sorted(want), rel
+    # each named proof exists in this file
+    here = (BENCH / "tests" / "test_debug_reader.py").read_text()
+    for want in DEBUG_READERS.values():
+        for proof in want.values():
+            name = proof.split(" ")[0]
+            assert name.startswith("(") or f"def {name}(" in here, proof
+    # the k6 scripts: one function reads /debug, the browser's learned-class counters
+    for f in (BENCH / "k6").glob("*.js"):
+        # each top-level function's text runs to the next top-level `function` / `async function`
+        code = re.sub(r"(?m)^\s*//.*$", "", f.read_text())          # code, not its comments
+        chunks = re.split(r"(?m)^(?=(?:export )?(?:default )?(?:async )?function\b)", code)
+        fns = [re.match(r"(?:export )?(?:default )?(?:async )?function\s*(\w*)", c).group(1) or "<default>"
+               for c in chunks if re.match(r"(?:export )?(?:default )?(?:async )?function\b", c) and "/debug/" in c]
+        assert fns == (["learnedCounts"] if f.name == "browser.js" else []), (f.name, fns)
+
+
 def test_the_role_grants_exactly_the_debug_paths_the_run_requests():
     used = {}
     for rel in RUN606_DEBUG_READERS:
@@ -154,6 +233,59 @@ def test_the_full_widen_job_reads_debug_as_the_debug_reader_and_the_probe_as_its
     assert ("/debug/vars", "dbg") in seen and ("/call", "own") in seen
     assert all(t == "dbg" for p, t in seen if p.startswith("/debug/")) and \
         all(t == "own" for p, t in seen if not p.startswith("/debug/"))
+
+
+def test_the_full_widen_cli_wires_debug_to_the_debug_reader_and_the_probe_to_its_user(monkeypatch, tmp_path):
+    # #1471 review J08: the watch's own tests build its callables; THIS drives main(), as the Job runs it
+    got = {}
+
+    class Watch:
+        def __init__(self, **kw):
+            got.update(kw)
+
+        def run(self):
+            return 0
+    monkeypatch.setattr(full_widen, "Watch", Watch)
+    monkeypatch.setattr(full_widen, "STREAM", str(tmp_path / "widen.jsonl"))
+    monkeypatch.setattr(load606, "login", lambda url, user, pw: f"tok:{user}")
+    rc = full_widen.main(["watch", "--snowplow-url", "http://s", "--authn-url", "http://a",
+                          "--user", "scaleuser-fullwiden", "--debug-user", READER, "--password", "pw",
+                          "--bounds", "{}", "--widen-wait-s", "1"])
+    assert rc == 0
+    assert got["debug_login"]() == f"tok:{READER}" and got["login"]() == "tok:scaleuser-fullwiden"
+
+
+def test_fresh_gates_its_start_as_the_debug_reader_and_probes_as_its_own_user(monkeypatch, tmp_path):
+    # #1471 review: fresh606's start gate read /debug/vars as scaleuser-0001; on 1.12.71 that is a 403, and the
+    # gate waited out 1800 s. It reads as the debug reader, and a refusal stops the probe at once
+    seen = {}
+
+    def gate(client, token, **kw):
+        seen["gate"] = token
+        return {"started": False, "waited_s": 0.0, "delta": None, "refused": 403,
+                "why": "/debug/vars answered 403: the start gate cannot read snowplow's counters"}
+    monkeypatch.setattr(load606, "login", lambda url, user, pw: f"tok:{user}")
+    monkeypatch.setattr(load606, "wait_for_customer_load", gate)
+    out = tmp_path / "fresh.jsonl"
+    argv = ["fresh", "--mutator", "incluster", "--snowplow-url", "http://s", "--authn-url", "http://a",
+            "--user", "scaleuser-0001", "--password", "pw", "--group", "g", "--version", "v", "--plural", "p",
+            "--probe-name", "bench-app-01-01", "--rates", "10", "--samples", "1", "--gap-s", "0",
+            "--churn-namespaces", "1", "--wait-for-load", "--no-viewer", "--out", str(out)]
+    assert load606.main(argv + ["--debug-user", READER]) == 2
+    assert seen["gate"] == f"tok:{READER}"
+    rec = [json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+    assert rec[-1]["kind"] == "fresh_start_gate" and rec[-1]["refused"] == 403
+    # no debug reader: the probe refuses by name, it never gates as its own user
+    seen.clear()
+    assert load606.main(argv) == 2 and "gate" not in seen
+
+
+def test_the_fresh_job_names_the_debug_reader():
+    [job] = [j for j in _job_docs(*COMMON, "--users", "4", "--shards", "1", "--init",
+                                  "/call?resource=layouts&name=app-shell", "--fresh-rates", "10")
+             if j["metadata"]["name"] == "fresh606"]
+    s = _script(job)
+    assert f'--user "scaleuser-0001" --debug-user "{READER}"' in s and "--wait-for-load" in s
 
 
 def test_the_drive_samples_debug_vars_as_the_debug_reader(monkeypatch, tmp_path):

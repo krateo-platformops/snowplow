@@ -1303,10 +1303,25 @@ def wait_for_customer_load(client: HttpClient, token: str, *, min_delta: int = 1
     `min_delta` from this probe's first reading. It is only a START gate (the
     refresher also adds lookups, #552, so it is never used as a measurement).
     Returns {started, waited_s, delta}; started=False after max_wait_s.
+
+    `token` is the bench's debug reader's (bench/rbac_model.py THE DEBUG READER): snowplow #1365 authorizes
+    /debug by RBAC. An HTTP answer that is not 200 (401, 403, 5xx) is a REFUSAL, returned at once with
+    `refused` (its status) and `why`: it is not "the load has not started yet", and waiting it out would
+    cost the whole max_wait_s for nothing (review of #1471). No HTTP answer at all (status 0) is waited
+    out as before: snowplow may be restarting.
     """
+    refused: list = []
+
     def total():
-        v = read_vars(client, token)
-        if not v:
+        r = client.get("/debug/vars", token)
+        if r.status == 0:
+            return None
+        if r.status != 200:
+            refused.append(r.status)
+            return None
+        try:
+            v = json.loads(r.body)
+        except ValueError:
             return None
         s = summarize_vars(v)
         if s["l1_hit"] is None:
@@ -1316,6 +1331,9 @@ def wait_for_customer_load(client: HttpClient, token: str, *, min_delta: int = 1
     base = None
     while clock() - t0 < max_wait_s:
         cur = total()
+        if refused:
+            return {"started": False, "waited_s": round(clock() - t0, 1), "delta": None, "refused": refused[0],
+                    "why": f"/debug/vars answered {refused[0]}: the start gate cannot read snowplow's counters"}
         if cur is not None:
             if base is None:
                 base = cur
@@ -5366,9 +5384,23 @@ def _cmd_fresh(a) -> int:
     # Start only once the driver's navigations reach snowplow (run 7's first
     # samples ran during the login phase, with no read load at all).
     if a.wait_for_load:
-        gate = wait_for_customer_load(client, token, min_delta=a.load_min_delta,
+        # the gate reads /debug/vars, as the bench's debug reader (snowplow #1365); the probe's own reads stay
+        # this user's
+        if not a.debug_user:
+            print("fresh: the start gate (--wait-for-load) reads /debug/vars and needs the debug reader "
+                  "(--debug-user)", file=sys.stderr)
+            return 2
+        try:
+            debug_token = login(a.authn_url, a.debug_user, a.password)
+        except Exception as e:  # noqa: BLE001
+            print(f"fresh: the debug reader's login failed: {type(e).__name__}", file=sys.stderr)
+            return 2
+        gate = wait_for_customer_load(client, debug_token, min_delta=a.load_min_delta,
                                       max_wait_s=a.load_max_wait_s)
         sink({"kind": "fresh_start_gate", **gate})
+        if gate.get("refused"):
+            print(f"fresh: REFUSED: {gate['why']}", file=sys.stderr)
+            return 2
     rates = a.rates if a.rates else [a.churn_rate]
     fresh_phases(client, token, sink, modes=modes, rates=rates, mutators=mutators,
                  paths=paths, targets=targets, probe=(a.namespace, a.probe_name),
@@ -6304,6 +6336,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="start only after the driver's navigations reach snowplow")
     f.add_argument("--load-min-delta", type=int, default=100)
     f.add_argument("--load-max-wait-s", type=float, default=1800.0)
+    f.add_argument("--debug-user", default=None,
+                   help="the identity the start gate reads /debug/vars as (bench/rbac_model.py DEBUG_READER); "
+                        "required with --wait-for-load")
     f.add_argument("--churn-rate", type=float, default=0.0)
     f.add_argument("--churn-namespaces", type=int, default=50)
     f.add_argument("--churn-per-ns", type=int, default=20)

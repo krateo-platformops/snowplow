@@ -59,7 +59,7 @@ def test_lb_progress_pending_fatal_found():
 def test_fresh_job_runs_incluster_with_least_privilege():
     m = load606_job.render_fresh(
         snowplow_url="http://snowplow.krateo-system.svc:8081",
-        authn_url="http://authn.krateo-system.svc:8082", user="scaleuser-0001",
+        authn_url="http://authn.krateo-system.svc:8082", user="scaleuser-0001", debug_user="d",
         password="pw", rates=["1", "10", "50"], samples=60, gap_s=5,
         probe_name="bench-app-01-01", namespaces=50,
         comp_group="composition.krateo.io", comp_version="v1-2-2",

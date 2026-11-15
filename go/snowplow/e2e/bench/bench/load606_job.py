@@ -351,7 +351,7 @@ spec:
 """
 
 
-def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
+def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str, debug_user: str,
                  rates: list[str], samples: int, gap_s: float, probe_name: str,
                  namespaces: int, comp_group: str, comp_version: str,
                  comp_plural: str, poll_ms: int = 100,
@@ -382,7 +382,7 @@ def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
 sleep {delay_s:g}
 exec python3 -u /opt/load606/load606.py fresh --mutator incluster \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
-  --user {json.dumps(user)} --password {json.dumps(password)} \\
+  --user {json.dumps(user)} --debug-user {json.dumps(debug_user)} --password {json.dumps(password)} \\
   --group {comp_group} --version {comp_version} --plural {comp_plural} \\
   --probe-name {probe_name} --rates {rate_args} --samples {samples} \\
   --gap-s {gap_s} --poll-ms {poll_ms} --churn-namespaces {namespaces} \\
@@ -684,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-            user=a.fresh_user, password=a.password, rates=a.fresh_rates,
+            user=a.fresh_user, password=a.password, debug_user=a.debug_user, rates=a.fresh_rates,
             samples=a.fresh_samples, gap_s=a.fresh_gap_s,
             probe_name=a.probe_name, namespaces=a.namespaces,
             comp_group=a.comp_group, comp_version=a.comp_version,
