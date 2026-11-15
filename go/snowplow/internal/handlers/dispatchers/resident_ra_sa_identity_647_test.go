@@ -97,7 +97,7 @@ func s647Env(t *testing.T, o l262Opts) *l262Env {
 		t.Fatalf("WaitForCacheSync(restactions): %v", err)
 	}
 	cache.RebuildRBACSnapshotForTest(env.rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR, l262TargetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR, l262TargetGVR})
 
 	env.deps.saEP = endpoints.Endpoint{ServerURL: s647SAServer, Token: phase1RealSAToken}
 	if len(env.ras) != s647RAs {

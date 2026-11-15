@@ -3,16 +3,17 @@
 // THE GAP. A Role / ClusterRole RULE edit rotates a per-identity key only
 // through the per-subject sub-generation bump onRoleRulesChanged records
 // (bindings_by_gvr_delta.go, #257): the SubjectBindingSet digest covers binding
-// ids, not role contents. Every sub-gen hook returns early while the
-// bindings-by-GVR delta index is not built (deltaActive), and the index is built
-// once, by the prewarm engine boot (prewarm_engine_boot.go, step 3). An RBAC
-// edit that landed between the first RBAC snapshot publish and that build
-// rotated no key, so a per-identity cell minted in that window could keep being
-// served under the pre-edit grant.
+// ids, not role contents. No hook records a bump while the bindings index is
+// not READY (isReady): until the RBAC handlers have been delivered their
+// informers' initial lists the index does not hold every binding, so a role
+// edit could not be routed to every subject it concerns. An RBAC edit that
+// landed between the first RBAC snapshot publish and ready rotated no key, so
+// a per-identity cell minted in that window could keep being served under the
+// pre-edit grant.
 //
 // THE FIX. The RBAC informer handler (newRBACSnapshotHandler) notes, under the
 // index's read lock, that an RBAC change the key can ONLY see through the
-// sub-gen arrived while the index was not built:
+// sub-gen arrived while the index was not ready:
 //
 //   - a Role / ClusterRole ADD that is NOT part of the informer's initial list
 //     (isInInitialList), a Role / ClusterRole DELETE, or a Role / ClusterRole
@@ -29,12 +30,11 @@
 // informer handlers run asynchronously to HasSynced, so initial-list ADDs can
 // still be delivered after the first publish.
 //
-// The FIRST false→true transition of the index's built flag
-// (BuildBindingsByGVRIndex, under the index's write lock) reads-and-clears that
-// note and, if it was set, bumps ONE process-wide epoch that
-// RBACSubGenForSubject folds into every identity's sub-generation. Later
-// rebuilds never bump: built never returns to false in production, so the note
-// can only be taken before the first build.
+// The index's ONE false→true transition of ready (markBindingsIndexReady, under
+// the index's write lock) reads-and-clears that note and, if it was set, bumps
+// ONE process-wide epoch that RBACSubGenForSubject folds into every identity's
+// sub-generation. ready never returns to false in production, so the note can
+// only be taken before it.
 //
 // WHY A GLOBAL TERM IS SOUND. An identity's sub-generation is the LATEST state
 // of the RBAC state clock over its subject counters and this epoch
@@ -51,24 +51,21 @@
 // the same binding set and a different history, reaches that earlier sum later.)
 //
 // COST. At most ONE global rotation per process, and only when an RBAC edit
-// really landed between the first publish and the first index build. The
-// cells that exist in that window are mostly the boot seed's; on rotation they
-// miss on their next read, and the refresher's identity-class drift guard
-// re-picks or evicts them (#424/#444).
+// really landed between the first publish and ready. The cells that exist in
+// that window are mostly the boot seed's; on rotation they miss on their next
+// read, and the refresher's identity-class drift guard re-picks or evicts them
+// (#424/#444).
 //
-// #819 — THE BUMP LANDS BEFORE READY. The engine's boot pass builds the index
-// only after its navigation re-walk, and readiness does not wait for that pass:
-// a boot pass that errors before the build, or the seed deadline, releases
-// Ready with the index unbuilt, and the requeued pass (which also yields to
-// the customer traffic Ready lets in) built it minutes later. The epoch then
-// rotated every user's keys under tabs already armed on them (bench run 10:
-// 6.5 min after Ready). So the first readiness flip settles the build itself
-// (settleBindingsIndexBeforeReady, from MarkPhase1Done): the bump, if owed,
-// happens before /readyz is 200 on every readiness path, and every later RBAC
-// edit rotates through the per-subject sub-gen, the index being built. The one
-// exception is a flip before the first COMPLETE RBAC snapshot: the build is
-// then deferred to that publish (#686) and counted
-// (snowplow_bindings_index_ready_settle.deferred_at_flip).
+// #819 / #1458 — THE BUMP LANDS BEFORE READY. The index is marked ready by the
+// initial-publish goroutine (waitAndPublishInitialRBACSnapshot), right after
+// its complete publish and once the RBAC handlers have been delivered their
+// initial lists, and readiness waits for that goroutine to return (#1231). So
+// the bump, if owed, happens before /readyz is 200 on every readiness path,
+// and every later RBAC edit rotates through the per-subject sub-gen. (Until
+// #1458 the index was BUILT from the published snapshot, first by the engine's
+// boot pass and, since #819, by the first readiness flip, with a deferral when
+// no complete snapshot existed yet. There is no build any more: the first
+// readiness flip only sets the navigated set, settleBindingsIndexBeforeReady.)
 
 package cache
 
@@ -83,8 +80,8 @@ import (
 )
 
 var (
-	// rbacSubGenEpoch COUNTS the boot-window rotations: 0, or 1 once the first
-	// index build found an RBAC event noted before it. It is what
+	// rbacSubGenEpoch COUNTS the boot-window rotations: 0, or 1 once the index
+	// became ready with an RBAC event noted before it. It is what
 	// RBACSubGenEpoch, the snowplow_rbac_subgen_epoch expvar and its OTLP mirror
 	// report, unchanged by #1439. It is NOT folded into any key.
 	rbacSubGenEpoch atomic.Uint64
@@ -92,13 +89,13 @@ var (
 	// RBACSubGen: the RBAC state clock's value at that rotation (0 before it).
 	// Folded by RBACSubGenForSubject; not published.
 	rbacSubGenEpochState atomic.Uint64
-	// rbacEventSeenPreBuild is set by deltaActive when an RBAC event arrived
-	// after the first publish while the delta index was not built.
+	// rbacEventSeenPreBuild is set by the RBAC handler when an RBAC event
+	// arrived after the first publish while the index was not ready.
 	rbacEventSeenPreBuild atomic.Bool
 )
 
-// notePreBuildRBACEvent is called by deltaActive under the index's read lock
-// when the index is not built.
+// notePreBuildRBACEvent is called under the index's read lock when the index
+// is not ready (notePreBuildIfNotBuilt).
 func notePreBuildRBACEvent() {
 	if RBACGen() > 0 {
 		rbacEventSeenPreBuild.Store(true)
@@ -177,8 +174,8 @@ func preBuildUpdateRotates(isBinding bool, oldObj, newObj interface{}) bool {
 	return !policyRulesEqual(o.rules, n.rules)
 }
 
-// rotateIfRBACEventSeenPreBuild is called by BuildBindingsByGVRIndex under the
-// index's write lock at the FIRST false→true transition of built. It reads and
+// rotateIfRBACEventSeenPreBuild is called by markBindingsIndexReady under the
+// index's write lock at the false→true transition of ready. It reads and
 // clears the note and bumps the epoch once if it was set.
 func rotateIfRBACEventSeenPreBuild() bool {
 	if !rbacEventSeenPreBuild.Swap(false) {
@@ -193,33 +190,25 @@ func rotateIfRBACEventSeenPreBuild() bool {
 	return true
 }
 
-// settleBindingsIndexBeforeReady (#819) runs the first bindings-index build,
-// and so the #682 bump it owes, before the first readiness flip. Called by
-// MarkPhase1Done. A no-op when the cache is off, there is no watcher, or the
-// index is already built (the boot pass's step 3 got there first).
+// settleBindingsIndexBeforeReady (#819, #1458) gives the bindings index its
+// navigated set, the GVRs registered so far, at the first readiness flip, so
+// the per-GVR buckets the enumerators read exist when the pod becomes Ready.
+// Called by MarkPhase1Done. A no-op when the cache is off or there is no
+// watcher. Every prewarm pass sets the navigated set again over what is
+// registered then, and AddNavigatedGVR widens it meanwhile.
 //
-// Over the GVRs registered so far: the boot pass's own build later is a
-// rebuild over the full navigated set (never a bump), and AddNavigatedGVR
-// widens it meanwhile.
+// It writes buckets only. The index's membership is the event hooks' alone and
+// its ready signal is the initial-publish goroutine's (markBindingsIndexReady),
+// which readiness waits for (#1231): the #682 bump lands there, before Ready.
 //
-// THE ONE EXCEPTION: no complete RBAC snapshot yet. Building over a partial
-// one would skip a binding whose role is not listed yet, for good (#686), so
-// the flip only REQUESTS the build and the first complete publish runs it.
-// Since #1231 that is still before Ready: readiness waits for the initial
-// publish to return, the build included (rbac_readiness.go). Until that publish, EvaluateRBAC has no complete snapshot to
-// grant from (no snapshot: deny; a partial event-driven one: the pre-existing
-// #686 window), so few or no identity-bound keys exist to rotate. The case is
-// counted (snowplow_bindings_index_ready_settle.deferred_at_flip) and logged,
-// never silent.
-//
-// A panic in the build is recovered and counted: it must never skip the flip
-// and pin /readyz at 503.
+// A panic is recovered and counted: it must never skip the flip and pin
+// /readyz at 503.
 func settleBindingsIndexBeforeReady() {
 	if Disabled() {
 		return
 	}
 	rw := Global()
-	if rw == nil || rw.mode == modePassthrough || BindingsByGVRIndexBuilt() {
+	if rw == nil || rw.mode == modePassthrough {
 		return
 	}
 	start := time.Now()
@@ -231,59 +220,40 @@ func settleBindingsIndexBeforeReady() {
 			slog.Error("cache.bindings_by_gvr.ready_settle_panic",
 				slog.String("subsystem", "cache"),
 				slog.String("panic_type", fmt.Sprintf("%T", r)), // metadata only, never the value
-				slog.String("effect", "readiness flips anyway; the boot pass's own build settles the #682 epoch later"))
+				slog.String("effect", "readiness flips anyway; the next prewarm pass sets the navigated set"))
 		}
 	}()
-	navigated := rw.RegisteredGVRs()
-	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
-		BuildBindingsByGVRIndex(navigated)
-		readySettleBuilt.Add(1)
-		return
-	}
-	requestBindingsIndexBuild(navigated)
-	if hook := readySettleAfterRequestHookForTest.Load(); hook != nil {
+	if hook := readySettleHookForTest.Load(); hook != nil {
 		(*hook)()
 	}
-	// A publish that completed between the check above and the request did
-	// not see it: run it now.
-	if rbacSnap.Load() != nil && rbacInitialPublishReturned(rw) {
-		buildPendingBindingsIndex()
-		readySettleBuilt.Add(1)
-		return
-	}
-	readySettleDeferred.Add(1)
-	// log-ctx-waiver: boot: phase 1 settles the index before the pod is ready
-	slog.Warn("cache.bindings_by_gvr.ready_settle_deferred",
-		slog.String("subsystem", "cache"),
-		slog.String("effect", "Phase 1 finished before the first complete RBAC snapshot: the bindings-index build "+
-			"(and a #682 epoch bump, if owed) runs at that publish, before Ready, which waits for it (#819, #686, #1231)"))
+	SetNavigatedGVRs(rw.RegisteredGVRs())
+	readySettleSet.Add(1)
 }
 
 var (
-	readySettleBuilt     atomic.Uint64
-	readySettleDeferred  atomic.Uint64
+	readySettleSet       atomic.Uint64
 	readySettlePanics    atomic.Uint64
 	readySettleLastNanos atomic.Int64
-	// readySettleAfterRequestHookForTest runs between the deferred request
-	// and the re-check. TEST-ONLY: nil in production.
-	readySettleAfterRequestHookForTest atomic.Pointer[func()]
+	// readySettleHookForTest runs inside the settle, before it sets the
+	// navigated set. TEST-ONLY: nil in production.
+	readySettleHookForTest atomic.Pointer[func()]
 )
 
 // ReadySettleStats is the #819 readiness-settle readout.
 type ReadySettleStats struct {
-	BuiltAtFlip    uint64
-	DeferredAtFlip uint64
-	Panics         uint64
-	LastMS         float64
+	// NavigatedSetAtFlip counts the readiness flips that gave the bindings
+	// index its navigated set.
+	NavigatedSetAtFlip uint64
+	Panics             uint64
+	LastMS             float64
 }
 
 // ReadySettleStatsSnapshot reads the settle counters.
 func ReadySettleStatsSnapshot() ReadySettleStats {
 	return ReadySettleStats{
-		BuiltAtFlip:    readySettleBuilt.Load(),
-		DeferredAtFlip: readySettleDeferred.Load(),
-		Panics:         readySettlePanics.Load(),
-		LastMS:         float64(readySettleLastNanos.Load()) / float64(time.Millisecond),
+		NavigatedSetAtFlip: readySettleSet.Load(),
+		Panics:             readySettlePanics.Load(),
+		LastMS:             float64(readySettleLastNanos.Load()) / float64(time.Millisecond),
 	}
 }
 
@@ -308,17 +278,15 @@ func init() {
 	expvar.Publish("snowplow_rbac_subgen_epoch", expvar.Func(func() any {
 		return RBACSubGenEpoch()
 	}))
-	// #819: the readiness flip's bindings-index settle — how often it built
-	// (bump before Ready) or deferred to the first complete publish (bump
-	// after Ready), recovered panics, and the last settle's duration (the
-	// delay it added to Ready).
+	// #819 / #1458: the readiness flip's bindings-index settle — how often it
+	// gave the index its navigated set, recovered panics, and the last
+	// settle's duration (the delay it added to Ready).
 	expvar.Publish("snowplow_bindings_index_ready_settle", expvar.Func(func() any {
 		st := ReadySettleStatsSnapshot()
 		return map[string]any{
-			"built_at_flip":    st.BuiltAtFlip,
-			"deferred_at_flip": st.DeferredAtFlip,
-			"panics":           st.Panics,
-			"last_ms":          st.LastMS,
+			"navigated_set_at_flip": st.NavigatedSetAtFlip,
+			"panics":                st.Panics,
+			"last_ms":               st.LastMS,
 		}
 	}))
 }

@@ -128,7 +128,7 @@ func i1439Setup(t *testing.T, earlierGroups []string) *i1439Env {
 	// every counter start at zero.
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetPendingSubGenBumpsForTest)

@@ -153,7 +153,7 @@ func i426BuildWatcher(t *testing.T) *dynamicfake.FakeDynamicClient {
 	// Activate the binding deltas that bump the per-subject sub-gens.
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{i426RAGVR()})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{i426RAGVR()})
 
 	if added, syncCh := rw.EnsureResourceType(i426RAGVR()); added {
 		select {

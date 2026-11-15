@@ -186,7 +186,7 @@ func TestP0_RestActionTargetGVR_RequiresSACredentialedCtx(t *testing.T) {
 	panelGVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Resource: "panels"}
 
 	// Build the index over the navigated GVRs (compositions + panels).
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR, panelGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{compGVR, panelGVR})
 
 	// (a) BARE ctx — the P0 regression: objects.Get fail-closes on missing
 	// identity → restActionTargetGVR returns (zero,false).

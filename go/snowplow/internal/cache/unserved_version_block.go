@@ -157,6 +157,11 @@ func (rw *ResourceWatcher) retireUnservedVersion(gvr schema.GroupVersionResource
 	if rw == nil || rw.mode == modePassthrough {
 		return false
 	}
+	// #1458 — an RBAC informer is never torn down, so it is never blocked
+	// from registering either.
+	if refuseRBACInformerTeardown(gvr, reason) {
+		return false
+	}
 	rw.mu.Lock()
 	if rw.unservedVersions == nil {
 		rw.unservedVersions = map[schema.GroupVersionResource]struct{}{}

@@ -205,7 +205,7 @@ func c681Setup(t *testing.T) *c681Env {
 	cache.RebuildRBACSnapshotForTest(rw)
 	// The prewarm engine builds the delta index once; the #257 role-edit
 	// rotation runs only on a built index.
-	cache.BuildBindingsByGVRIndex(rw.RegisteredGVRs())
+	cache.SeedBindingsIndexFromSnapshotForTest(rw.RegisteredGVRs())
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetRBACSubGenForTest)

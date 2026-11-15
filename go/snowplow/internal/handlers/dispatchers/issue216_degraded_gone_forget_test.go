@@ -76,7 +76,7 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 	// type-exists conjunct, so a 404 is a deletion not a CRD-absent transient) +
 	// RESOLVED_CACHE_ENABLED + published global.
 	buildFixCWatcher(t)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{fixCWidgetGVR})
 	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()
@@ -208,7 +208,7 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 	srv := newI187APIServer(t, http.StatusInternalServerError) // 500 — NOT a confirmed deletion
 
 	buildFixCWatcher(t)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{fixCWidgetGVR})
 	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()

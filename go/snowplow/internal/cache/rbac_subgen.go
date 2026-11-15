@@ -274,19 +274,28 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 // under that class before the change. The guarantee above does not hold for it
 // in either direction.
 //
-// (a) holds by construction since #1443: the fold below reads the counters of
-// SubjectMatcher.Visit, the one enumeration the evaluator matches bindings
-// with (see "THE FOLDED SUBJECTS ARE THE MATCHED SUBJECTS" below). Before it, a
+// (a) holds since #1443, by the shared matcher and its parity arms: the fold
+// below reads the counters of SubjectMatcher.Visit, the one enumeration the
+// evaluator matches bindings with (see "THE FOLDED SUBJECTS ARE THE MATCHED
+// SUBJECTS" below), and TestIssue1443_FoldRotatedAndMatchAgree /
+// TestIssue1443_MatchIsMembershipOfTheVisitedSet pin that the two agree for
+// every requester shape. Before it, a
 // ServiceAccount matched through its two ServiceAccount groups, or through a
 // User-kind subject naming its username, was matched by a subject the fold did
 // not read.
 //
-// (b) has one known exception, until #1458 lands: a rebuild of the index reads
-// the published snapshot; a binding whose ADD event was already applied but
-// whose snapshot is not published yet is not in it, so the rebuild drops the
-// binding, and the role's later edits bump nobody until the next rebuild or
-// the next event on the binding. (A binding whose role is absent is listed
-// under the role it names since #1449.)
+// (b) holds since #1458, for every binding the RBAC informers have delivered:
+// the index's membership is a fold of their events, written by the binding
+// event hooks alone from the informers' first event on (the initial list
+// included), and a binding's update replaces its old side by its new one in ONE
+// critical section, so no role hook ever finds the binding absent. Nothing
+// rebuilds the index from the published snapshot (until #1458 every prewarm
+// pass did, and dropped a binding whose event was applied but whose snapshot
+// was not published yet). A binding whose role is absent is listed under the
+// role it names since #1449. Pinned by
+// TestIssue1458_GeneratedHistory_IndexIsTheFoldOfTheLiveObjects,
+// TestIssue1458_BindingUpdateIsOneCriticalSection and the source guard
+// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot.
 //
 // With the sum this fold used before, equal values meant only an equal NUMBER
 // of changes. Both halves are needed: a sum of clock values collides (states 3

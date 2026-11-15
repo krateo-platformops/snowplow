@@ -495,6 +495,14 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	// silently.
 	AssertRBACTypedOverridesRegistered()
 
+	// #1458 — the bindings index is a fold of THIS watcher's RBAC informer
+	// events, from their first one: it starts empty and not ready here, before
+	// the informers run. (Production builds one watcher per process, so this is
+	// the index's initial state; it matters where a process builds a second
+	// one, as the test suites do: what an earlier watcher's events left in the
+	// index is not this watcher's world.)
+	beginBindingsIndexForWatcher()
+
 	// #1016 — factory.Start is where the watcher escapes to other goroutines:
 	// its informers' handlers run from here on and can bind it to the
 	// dep-watch bridge through a submit. So the constructor's last write to
@@ -1877,6 +1885,41 @@ func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
 	rw.removeResourceTypeWithReason(gvr, confirmRetractUnspecified)
 }
 
+// rbacInformerTeardownRefused counts teardowns of an RBAC informer that were
+// refused (refuseRBACInformerTeardown).
+var rbacInformerTeardownRefused atomic.Uint64
+
+// RBACInformerTeardownRefusedTotal returns how many teardowns of an RBAC
+// informer were refused.
+func RBACInformerTeardownRefusedTotal() uint64 { return rbacInformerTeardownRefused.Load() }
+
+// refuseRBACInformerTeardown reports whether gvr is one of the typed RBAC
+// informers, which are NEVER torn down (#1458), and counts and logs the
+// refusal. They are registered once, at the watcher's construction, and they
+// are the one source of two things that cannot be rebuilt from anything else:
+// the RBAC snapshot the in-process evaluator authorises from, and the event
+// stream the bindings index is a fold of. A teardown would empty the first
+// (every request denied) and, were the informer registered again, give the
+// second an initial list with no delete for what vanished in between (bindings
+// that no longer exist would stay in the index). No CRD describes these kinds,
+// so no CRD event has a reason to remove them; the CRD-driven teardown paths
+// are keyed by a CRD object's group and plural alone, which a CRD object named
+// after an RBAC kind would satisfy.
+func refuseRBACInformerTeardown(gvr schema.GroupVersionResource, reason string) bool {
+	if !isTypedRBACGVR(gvr) {
+		return false
+	}
+	rbacInformerTeardownRefused.Add(1)
+	// log-ctx-waiver: worker: a teardown asked for by the CRD worker or a watch error, never a request
+	slog.Warn("cache.rbac.informer_teardown_refused",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("reason", reason),
+		slog.String("hint", "an RBAC informer is never torn down: it is the evaluator's RBAC snapshot source and "+
+			"the bindings index's event stream (#1458)"))
+	return true
+}
+
 // removeResourceTypeWithReason is RemoveResourceType plus the 1.12.7
 // attribution of WHY the teardown happened, for the confirmation-retraction
 // counter. Unexported and additive: the exported entry point keeps its
@@ -1884,6 +1927,9 @@ func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
 // package changes and the three production teardowns name themselves.
 func (rw *ResourceWatcher) removeResourceTypeWithReason(gvr schema.GroupVersionResource, reason string) {
 	if rw == nil || rw.mode == modePassthrough {
+		return
+	}
+	if refuseRBACInformerTeardown(gvr, reason) {
 		return
 	}
 	rw.mu.Lock()

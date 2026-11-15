@@ -123,6 +123,7 @@ var identityBoundReuseKeys = []struct{ method, recvFrom string }{
 var storeRegistry = map[string]string{
 	"cache.ResolvedCacheStore.index":                  "class-keyed (identity-free classes re-gated: widgetContent→gateWidgetEnvelope, apistage→gateContentEnvelope)",
 	"cache.ResolvedCacheStore.tombstones":             "no-content",
+	"cache.storeInstance.extRegs":                     "no-content (#1458 each extension handler's informer registration, by extension name: its HasSynced, never a body, never an identity)",
 	"cache.listCellSet.delivered":                     "no-content (#854 per-key identity of the last informer delivery: object keys and slice identities, never a body)",
 	"cache.storeSwapsByGVR":                           "no-content (#870 / #928 per-GVR build outcome counters keyed by GroupVersionResource.String(); never a body, never an identity)",
 	"cache.listCellSet.cells":                         "free+regated (#854 incremental apistage LIST cells: the identity-free content substrate of the apistage entries they back, re-gated per requester at serve exactly as those entries are)",
@@ -147,8 +148,8 @@ var storeRegistry = map[string]string{
 	"dispatchers.passDoneSet.m":                       "class-keyed (#643 PR-C resume record per full dispatchCacheLookupKey; the value holds the pointer of the entry this pass Put under that SAME key, compared by identity only and never served)",
 	"cache.bindingsByGVRIndex.byGVR":                  "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.wildcard":               "no-content (identity-free binding index)",
-	"cache.bindingsByGVRIndex.byRole":                 "no-content (identity-free binding index)",
-	"cache.bindingsByGVRIndex.entries":                "no-content (identity-free binding index)",
+	"cache.bindingsByGVRIndex.membersByRole":          "no-content (identity-free binding index)",
+	"cache.bindingsByGVRIndex.members":                "no-content (identity-free binding index)",
 	"cache.bindingsByGVRIndex.navigated":              "no-content (identity-free binding index)",
 	"cache.keySet.keys":                               "no-content (dep edges; value = the key's reverse *depSet, which holds only its CacheEntryClass index — #603 PR-0)",
 	"cache.depSet.deps":                               "no-content (dep edges)",
