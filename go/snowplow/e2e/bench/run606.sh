@@ -852,6 +852,35 @@ s_source() {
     *) record_failure "source FAILED: the installer chart does not resolve or verify ($OUT/installer-preflight.json)"; return 1 ;;
   esac
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
+  portal_readers
+}
+# portal_readers (run 26j: three paid clusters, every bench user's boot call 403): the bench's base
+# group must be granted the portal's shell, and the pages its users are driven through must still
+# grant it, read from the charts this install pins (bench/portal_readers.py), BEFORE any cluster
+# exists, in the dry pass, the rehearsal and every run of a launch: the run's values declare the
+# group in the portal's reader groups (bench/installer_values.py), the installer's schema must take
+# that key, and the pinned portal chart and each pinned page chart are rendered with the values the
+# installer gives them. $OUT/portal-readers.json: what the shell needs (the chart's own reader rules),
+# which pages grant the group and which do not. Its registry reads spend the run's one bound.
+portal_readers() {
+  write_installer_values
+  local rc=0 ln why
+  python3 -m bench.portal_readers check --installer-pulled "$OUT/installer-pulled" \
+      --values "$OUT/installer-values.yaml" --ghcr-env-file "$GHCR_PULL_ENV_FILE" \
+      --budget-file "$REGISTRY_BUDGET" --out "$OUT/portal-readers.json" >"$OUT/.portal-readers.out" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$OUT/.portal-readers.out"
+  rm -f "$OUT/.portal-readers.out"
+  (( rc == 0 )) && return 0
+  why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  : > "$KERR"     # the refusal is the failure's own line, said once
+  if (( rc == 4 )); then
+    record_failure "source FAILED: the registry gave NO ANSWER for the portal's charts within the registry reads' bound (${why:-no reason given}): whether the bench's base group may read the portal is unknown"
+  else
+    record_failure "source FAILED: portal readers: ${why:-bench.portal_readers exited ${rc} ($OUT/portal-readers.json)}"
+  fi
+  return 1
 }
 # s_login_contract (run 26d: 0 of 5 browser sessions signed in, frontend 1.8.40 renamed the login
 # form): the frontend this install runs (the installer's pin, or FRONTEND_TAG through
@@ -1127,13 +1156,22 @@ snowplow_env_gate() {
   log "snowplow env: ${line}"
 }
 # s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the pod's reading and the
-# gate, the operations record, and ONE block with everything the rehearsal exists to show.
+# gate, the image the snowplow pod runs (#1468: digest_gate, the measuring run's own check, against
+# EXPECTED_IMAGE_DIGEST; no restart came before it here, so no leftover pod is expected), the
+# preflight (run 26j: the preflight user's boot call and the menu's routes, by s_preflight, the
+# measuring run's own step: the boot root must answer 200, the menu must list routes, and with
+# COMPOSITE_BURST_USERS > 0 one of them must be a composite page), the operations record, and ONE
+# block with everything the rehearsal exists to show. Each check runs whatever the one before it
+# said: the report shows them all, and the rehearsal fails when any of them did.
 s_rehearsal() {
   local gate=0
   # the user the runtime reading logs in as: the bench's own preflight user, as the preflight step makes it
-  run python3 -m bench data606-preflight-user >&2 || return 1
+  preflight_user || return 1
   tracing_reading before
   snowplow_env_gate || gate=$?
+  digest_gate snowplow "$SNOWPLOW_POD_SELECTOR" "$EXPECTED_IMAGE_DIGEST" image_digest "$OUT/image-digest.jsonl" \
+    "$(( $(date +%s) + DIGEST_SETTLE_S ))" || gate=1
+  s_preflight || gate=1
   cluster_operations
   if [[ "$DRY" == "1" ]]; then
     log "DRY: python3 -m bench.snowplow_env rehearsal-report --out-dir $OUT"
@@ -1564,7 +1602,7 @@ run_preflight_job() {
     log "PREFLIGHT did not finish within ${PREFLIGHT_TIMEOUT_S}s (${what}): $(job_pod_why "$job")"
     return 1
   fi
-  log "preflight OK (${what}; product errors, if any, are recorded, not fatal)"
+  log "preflight OK (${what}: the boot root answered 200; a product error of any other call, if any, is recorded, not fatal)"
 }
 # s_psi (#1042): right after the loadgen node exists, before any install or
 # drive time: the browser's starvation evidence needs what the gate reads. A
@@ -1608,6 +1646,14 @@ s_psi() {
   fi
   log "psi: readable on the loadgen node (${why})"
 }
+# preflight_user: the bench's own preflight user, made once a run (the rehearsal's runtime reading
+# logs in as it before the preflight step does)
+PREFLIGHT_USER_MADE=""
+preflight_user() {
+  [[ -z "$PREFLIGHT_USER_MADE" ]] || return 0
+  run python3 -m bench data606-preflight-user >&2 || return 1
+  PREFLIGHT_USER_MADE=1
+}
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
   # (run 6 discovered stale page roots 54 minutes in). The boot root is the
@@ -1624,7 +1670,7 @@ s_preflight() {
   # shellcheck disable=SC1091
   source "$OUT/portal.env"
   log "portal boot root (config.json INIT): $PORTAL_INIT"
-  run python3 -m bench data606-preflight-user >&2
+  preflight_user
   python3 -m bench.load606_job --preflight-only --snowplow-url "$SNOWPLOW_URL" \
       --authn-url "$AUTHN_URL" --password "$PW" --init "$PORTAL_INIT" \
       --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \
@@ -1742,6 +1788,10 @@ s_classes() {
   if [[ "$DRY" != "1" ]]; then
     kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \
       || { record_failure "menu classes FAILED: applying their identities"; return 1; }
+  else
+    # nothing sends the manifest to a cluster in a dry pass, so nothing redacted it: the run
+    # directory keeps no password (#939), dry or not
+    redact_pw "$OUT/menu-classes.yaml"
   fi
   while IFS=$'\t' read -r label user; do
     [[ -n "$label" ]] || continue

@@ -12,6 +12,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import subprocess
+import sys
 import threading
 import time
 
@@ -217,6 +218,44 @@ def test_preflight_refuses_stale_init_in_one_request():
     res = load606.preflight(c, "t", load606.Portal(init=stale))
     assert res["ok"] is False and res["refused"][0]["path"] == stale
     assert c.calls == [stale]
+
+
+class _Boot:
+    """A portal whose every call answers `status` with `body`, as sent."""
+
+    def __init__(self, status, body):
+        self.status, self.body, self.calls = status, body, []
+
+    def get(self, path, token):
+        self.calls.append(path)
+        return load606.Response(self.status, self.body.encode(), 1.0)
+
+
+@pytest.mark.parametrize("status, body, why", [
+    # run 26j: 403 with an empty body, for a user nothing grants the portal's shell
+    (403, "", "its groups are not granted the portal's shell; an empty body"),
+    (500, '{"message":"resolve apiRef: unexpected end of JSON input"}',
+     "snowplow or the API server failed the call; body: {"),
+    (503, "", "snowplow or the API server failed the call; an empty body"),
+])
+def test_preflight_refuses_a_boot_root_that_is_not_200_whatever_it_answers(status, body, why):
+    c = _Boot(status, body)
+    res = load606.preflight(c, "t", PORTAL)
+    assert res["ok"] is False and res["init_status"] == status and c.calls == [INIT]
+    [x] = res["refused"]
+    assert x["path"] == INIT and x["status"] == status and x["boot_root"] is True
+    assert x["body"].startswith(f"the portal's boot root did not answer 200 for this login ({why}")
+    # never recorded as a product error that the run walks past
+    assert res["product_errors"] == [] and res["routes"] == []
+
+
+def test_the_preflight_summary_names_the_boot_roots_status_and_path():
+    rec = json.dumps(load606.preflight(_Boot(403, ""), "t", PORTAL))
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "preflight-summary"], input=rec, cwd=str(BENCH_DIR),
+                       capture_output=True, text=True, timeout=120)
+    assert p.returncode == 2
+    assert (f"[preflight] REFUSED {INIT} -> 403: the portal's boot root did not answer 200 for this login (its groups "
+            "are not granted the portal's shell; an empty body)") in p.stdout
 
 
 def test_preflight_records_product_5xx_and_does_not_refuse():

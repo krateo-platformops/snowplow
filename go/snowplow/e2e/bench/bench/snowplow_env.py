@@ -106,10 +106,10 @@ def declared_text(declared: dict[str, str]) -> str:
 PATCH_KEY = "components-patch.json"
 
 
-def rendered_env(docs: list) -> dict:
-    """spec.componentValues.snowplow.env of the Installer CR the chart applies, from its rendered
-    documents: the one ConfigMap that carries components-patch.json (the merge patch its bootstrap
-    Job applies to the CR). Raises Refused when the render holds none, or more than one."""
+def rendered_component_values(docs: list) -> dict:
+    """spec.componentValues of the Installer CR the chart applies, from its rendered documents: the
+    one ConfigMap that carries components-patch.json (the merge patch its bootstrap Job applies to
+    the CR). Raises Refused when the render holds none, or more than one."""
     found = [d["data"][PATCH_KEY] for d in docs if isinstance(d, dict) and d.get("kind") == "ConfigMap"
              and isinstance(d.get("data"), dict) and PATCH_KEY in d["data"]]
     if len(found) != 1:
@@ -120,7 +120,12 @@ def rendered_env(docs: list) -> dict:
         cv = patch["spec"]["componentValues"]
     except (ValueError, KeyError, TypeError) as e:
         raise Refused(f"{PATCH_KEY} is not a JSON patch with spec.componentValues ({type(e).__name__})") from None
-    env = (cv.get("snowplow") or {}).get("env") if isinstance(cv, dict) else None
+    return cv if isinstance(cv, dict) else {}
+
+
+def rendered_env(docs: list) -> dict:
+    """spec.componentValues.snowplow.env of the Installer CR the chart applies (rendered_component_values)."""
+    env = (rendered_component_values(docs).get("snowplow") or {}).get("env")
     return dict(env) if isinstance(env, dict) else {}
 
 
@@ -462,12 +467,75 @@ def _json_file(path: str):
         return None
 
 
+def _last_json_line(path: str, kind: str):
+    """The last record of `kind` in a JSON-lines file (a Job's log holds other lines too); None when
+    the file is not there or holds none."""
+    rec = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.lstrip().startswith("{"):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict) and r.get("kind") == kind:
+                        rec = r
+    except OSError:
+        return None
+    return rec
+
+
+def image_lines(rec: dict | None) -> list[str]:
+    """The snowplow pod's image, as the kubelet resolved it, against the expected digest: the record
+    of the run's one digest check (bench.load606 image_digest_gate), for a report."""
+    if not isinstance(rec, dict):
+        return ["the snowplow pod's image: NO RECORD (image-digest.jsonl): the digest check did not run"]
+    out = [f"the snowplow pod's image against the expected digest {rec.get('expected')}: {rec.get('result')}"
+           + (f" ({rec.get('why')})" if rec.get("why") else "")]
+    out += [f"  {p.get('container')}: image {p.get('image')!r}, imageID {p.get('image_id')!r}, digest "
+            f"{p.get('digest') or 'none'}" + (" (a pod on its way out, not judged)" if p.get("terminating") else "")
+            for p in rec.get("pods") or []]
+    return out
+
+
+def readers_lines(rec: dict | None) -> list[str]:
+    """Who the pinned charts grant the portal to (bench/portal_readers.py's record), for a report."""
+    if not isinstance(rec, dict):
+        return ["portal readers, from the charts: NO RECORD (portal-readers.json)"]
+    if not rec.get("ok"):
+        return [f"portal readers, from the charts: REFUSED: {rec.get('why')}"]
+    from bench import portal_readers
+    return [ln.replace("portal readers:", "portal readers, from the charts:", 1) for ln in portal_readers.said(rec)]
+
+
+def preflight_lines(rec: dict | None) -> list[str]:
+    """The preflight user's boot call, the menu's routes and its composite pages (bench.load606's
+    preflight record, already through the bench's identity redaction), for a report."""
+    if not isinstance(rec, dict):
+        return ["preflight (as the bench's preflight user): NO RECORD (preflight.jsonl): the preflight Job gave "
+                "no result"]
+    routes = rec.get("routes") or []
+    out = [f"preflight (as the bench's preflight user): {'OK' if rec.get('ok') else 'REFUSED'}; boot root "
+           f"{rec.get('init')} answered {rec.get('init_status')}; {len(routes)} route(s) in the menu; composite "
+           f"page(s): {', '.join(rec.get('composite_routes') or []) or 'NONE'}"]
+    out += [f"  {r.get('path')}: {r.get('status')}, {r.get('tree_calls')} call(s), depth {r.get('tree_depth')}, "
+            f"{r.get('tree_errors')} error(s)" for r in routes]
+    out += [f"  REFUSED {x.get('path')} -> {x.get('status')}: {str(x.get('body') or '')[:300]}"
+            for x in rec.get("refused") or []]
+    out += [f"  product error (recorded, not fatal) {x.get('path')} -> {x.get('status')}"
+            for x in rec.get("product_errors") or []]
+    return out
+
+
 def rehearsal_lines(out_dir: str) -> list[str]:
     """Everything a rehearsal run (run606.sh BENCH_606_REHEARSAL=env) exists to show, from the files
     it wrote, in one block: the maintenance exclusion as GKE printed it back, the seconds its step
     took and GKE's refusal text if it was refused once (#1422), the cluster's operations record and
     its control, the declared snowplow env as the chart rendered it, the pod's Go runtime reading and
-    the comparison's verdict. A file that is not there is said, never skipped."""
+    the comparison's verdict, the image the snowplow pod runs against the expected digest (#1468),
+    who the charts grant the portal to, and the preflight user's boot call, routes and composite
+    pages (run 26j). A file that is not there is said, never skipped."""
     from bench import clusterops
     j = lambda name: _json_file(os.path.join(out_dir, name))  # noqa: E731
     lines = ["=== rehearsal report ==="]
@@ -510,6 +578,9 @@ def rehearsal_lines(out_dir: str) -> list[str]:
         "NO RECORD (snowplow-env.json)" if rec is None else
         f"{'VERIFIED' if rec.get('verified') else 'NOT AS DECLARED'}: declared {declared_text(rec.get('declared') or {})}; "
         f"{rec.get('why')}"))
+    lines += image_lines(_last_json_line(os.path.join(out_dir, "image-digest.jsonl"), "image_digest"))
+    lines += readers_lines(j("portal-readers.json"))
+    lines += preflight_lines(_last_json_line(os.path.join(out_dir, "preflight.jsonl"), "preflight"))
     lines.append("=== end of rehearsal report ===")
     return lines
 

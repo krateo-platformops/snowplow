@@ -271,7 +271,7 @@ def test_unset_the_installer_values_are_byte_identical_and_nothing_is_added(tmp_
     with_fe = (b / "out" / "installer-values.yaml").read_text()
     # the override is the frontend block under componentValues, and nothing else
     assert with_fe.count(BLOCK) == 1 and with_fe.replace(BLOCK, "", 1) == unset
-    assert sorted(yaml.safe_load(unset)["componentValues"]) == ["snowplow"]
+    assert sorted(yaml.safe_load(unset)["componentValues"]) == ["portal", "snowplow"]
     vals = yaml.safe_load(with_fe)
     assert vals["componentValues"]["frontend"] == {"image": {"tag": FTAG}}
     assert vals["componentValues"]["snowplow"] == yaml.safe_load(unset)["componentValues"]["snowplow"]

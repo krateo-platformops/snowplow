@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import ghcr_pull, gke, installer_values, vm606
+from bench import ghcr_pull, gke, installer_values, rbac_model, vm606
 from tests import fake_vm606
 from tests.test_gke_pvc_disks import fakes as pvc_fakes  # noqa: F401
 from tests.test_run606_real_sequence import harness  # noqa: F401
@@ -256,12 +256,17 @@ def test_the_preflight_renders_with_the_username_and_never_says_it(tmp_path, cap
     ("1.12.69", "", "installer_values_heredoc_1.12.69.yaml"),
     ("1.12.70", "1.8.41", "installer_values_heredoc_1.12.70_frontend_1.8.41.yaml")])
 def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend, golden):
-    """The goldens are what run606.sh's heredoc wrote (before #1395) for these tags."""
+    """The goldens are what run606.sh's heredoc wrote (before #1395) for these tags; the document is
+    that, plus ONE block since run 26j: the portal's reader group, the last entry of componentValues."""
     want = (FIXTURES / golden).read_text()
-    assert installer_values.document(snowplow, frontend) == want
+    got = installer_values.document(snowplow, frontend)
+    i, j = got.index("  # The bench's base group reads the portal's shell"), got.index("registryAuth:")
+    assert got[:i] + got[j:] == want
+    block = [ln for ln in got[i:j].splitlines() if not ln.lstrip().startswith("#")]
+    assert block == ["  portal:", "    readerGroups:", "    - " + rbac_model.BASE_GROUP]
     out = tmp_path / "v.yaml"
     assert installer_values.main(["--snowplow-tag", snowplow, "--frontend-tag", frontend, "--out", str(out)]) == 0
-    assert out.read_text() == want
+    assert out.read_text() == got
 
 
 def test_run606_writes_its_values_through_the_one_source():

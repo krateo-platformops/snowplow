@@ -1387,8 +1387,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 print(f'Error from server (NotFound): jobs.batch "{job}" not found', file=sys.stderr)
                 sys.exit(1)
             # FAKE_PREFLIGHT=refused: the run's preflight refuses; FAKE_PREFLIGHT_REFUSE_JOB: that Job alone
-            refused = (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
-                       or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
+            # FAKE_PREFLIGHT=forbidden: the boot root answers 403 for the preflight user (run 26j);
+            # noroutes: the shell renders no sidebar Menu with routes. Both refuse, as bench.load606 does
+            refused = (os.environ.get("FAKE_PREFLIGHT", "ok") in ("refused", "forbidden", "noroutes")
+                       and job == "preflight606" or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job)
             # FAKE_PREFLIGHT=pending: the run's preflight Job never finishes (its pod is never scheduled)
             if os.environ.get("FAKE_PREFLIGHT") == "pending" and job == "preflight606":
                 print(""); sys.exit(0)
@@ -1412,7 +1414,23 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         job = next(x for x in a if "preflight606" in x).split("/", 1)[-1]
         # each Job its OWN table: a class's Job adds a route only it has (#999 review B2)
         own = [] if job == "preflight606" else ["/only-" + job.rsplit("-", 1)[1]]
-        if (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
+        init = "/call?resource=layouts&apiVersion=widgets.templates.krateo.io/v1beta1&name=app-shell&namespace=krateo-system"
+        if os.environ.get("FAKE_PREFLIGHT") == "forbidden" and job == "preflight606":
+            # the record bench.load606's preflight prints for a boot root that answers 403 with an empty
+            # body (tests/test_portal_readers.py holds the real function to this shape)
+            print(json.dumps({"kind": "preflight", "init": init, "ok": False, "init_status": 403, "routes": [],
+                              "refused": [{"path": init, "status": 403, "boot_root": True, "body":
+                                           "the portal's boot root did not answer 200 for this login (its groups are "
+                                           "not granted the portal's shell; an empty body)"}],
+                              "product_errors": [], "forbidden": [], "login_ms": 332.2}))
+            print("preflight REFUSED: " + init + " -> 403", file=sys.stderr)
+        elif os.environ.get("FAKE_PREFLIGHT") == "noroutes" and job == "preflight606":
+            print(json.dumps({"kind": "preflight", "init": init, "ok": False, "init_status": 200, "routes": [],
+                              "refused": [{"path": "(sidebar menu)", "status": None,
+                                           "body": "the shell rendered no sidebar Menu with routes"}],
+                              "product_errors": [], "forbidden": [], "composite_routes": []}))
+            print("preflight REFUSED: (sidebar menu) -> None", file=sys.stderr)
+        elif (os.environ.get("FAKE_PREFLIGHT", "ok") == "refused" and job == "preflight606"
                 or os.environ.get("FAKE_PREFLIGHT_REFUSE_JOB") == job):
             print(json.dumps({"kind": "preflight", "ok": False, "init_status": 200,
                               "routes": [], "refused": [{"path": "/dashboard", "status": 500,
@@ -1420,7 +1438,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                               "product_errors": []}))
             print("preflight REFUSED: /dashboard -> 500", file=sys.stderr)
         else:
-            print(json.dumps({"kind": "preflight", "ok": True, "init_status": 200,
+            print(json.dumps({"kind": "preflight", "init": init, "ok": True, "init_status": 200,
                               "routes": [{"path": p, "status": 200, "endpoint":
                                           "/call?resource=flexes&name=page" + p.replace("/", "-")}
                                          for p in ("/dashboard", "/observability", "/compositions", *own)],
@@ -1634,7 +1652,29 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                     "configKeys": ["SNOWPLOW_API_BASE_URL"]},
                    {"name": "krateo-sse-proxy", "version": "1.2.0", "feature": "portal", "svcMatch": "sse-proxy",
                     "exposePort": 8080, "gatewayPath": "/events", "gatewayRewrite": True,
-                    "configKeys": ["EVENTS_API_BASE_URL", "EVENTS_PUSH_API_BASE_URL"]}]}))
+                    "configKeys": ["EVENTS_API_BASE_URL", "EVENTS_PUSH_API_BASE_URL"]}]
+                # the portal and two of its page charts, as 0.3.641 pins them (the pages depend on the
+                # portal; no repo of their own). FAKE_PORTAL_PIN=none: an installer that pins no portal
+                + ([{"name": "portal", "kind": "Portal", "chart": "portal", "version": "1.8.118",
+                     "feature": "portal", "deps": ["frontend", "git-provider"]},
+                    {"name": "dashboard-page", "kind": "DashboardPage", "version": "1.8.118",
+                     "feature": "portal", "deps": ["portal"]},
+                    {"name": "settings-page", "kind": "SettingsPage", "version": "1.8.118",
+                     "feature": "portal", "deps": ["portal"]}]
+                   if os.environ.get("FAKE_PORTAL_PIN") != "none" else [])}))
+        # the installer's values schema, as far as the portal's values go (0.3.641: componentValues.portal
+        # takes no undeclared key, and declares readerGroups). FAKE_INSTALLER_SCHEMA=no-reader-groups:
+        # 0.3.422's form, the same closed map without readerGroups (helm would reject the key);
+        # none: a chart with no schema
+        schema = os.environ.get("FAKE_INSTALLER_SCHEMA", "")
+        if schema != "none":
+            props = {"agents": {"type": "object"}, "enableCyberjokerUser": {"type": "boolean"}}
+            if schema != "no-reader-groups":
+                props["readerGroups"] = {"type": "array", "items": {"type": "string"}}
+            open(os.path.join(d, "values.schema.json"), "w").write(json.dumps({
+                "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                "properties": {"componentValues": {"type": "object", "properties": {
+                    "portal": {"type": "object", "additionalProperties": False, "properties": props}}}}}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")

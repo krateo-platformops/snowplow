@@ -2105,7 +2105,7 @@ def test_run606_k6_a_refused_menu_class_preflight_stops_the_run(harness):
     p, calls, out = _run606_k6(harness, FAKE_PREFLIGHT_REFUSE_JOB="preflight606-c1")
     log = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "preflight OK (the run;" in log
+    assert "preflight OK (the run:" in log
     assert "PREFLIGHT REFUSED: /dashboard -> 500" in log and "(menu class bench-platform-admins+devs)" in log
     assert "=== step reboot ===" not in log and "=== step measure ===" not in log
 

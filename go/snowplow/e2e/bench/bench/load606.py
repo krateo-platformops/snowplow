@@ -4879,14 +4879,26 @@ def _redact_strings(obj, redact):
     return obj
 
 
+#: what a boot root that is not 200 means, by its class (classify)
+BOOT_ROOT_WHY = {"forbidden": "its groups are not granted the portal's shell",
+                 "config": "the portal has no such object, or its type is not served",
+                 "product": "snowplow or the API server failed the call"}
+
+
 def _preflight(client: HttpClient, token: str, portal: "Portal", *,
                full_walk: bool = False, per_user_parallel: int = 6) -> dict:
     """Seconds-scale check BEFORE stamping data or mass logins.
 
-    Refuses (ok=False) on a CONFIG error: INIT or a menu route's content page
-    is 404 or an unserved type. A product 5xx / 403 is RECORDED and does not
-    refuse. Also records the navigation shape (first-load calls, routes) and,
-    with full_walk, the closure-walk size as a separately labelled metric.
+    Refuses (ok=False) when the BOOT ROOT (INIT) does not answer 200 for this
+    user, whatever it answers: every call of a navigation hangs off it, so a
+    user that cannot read it has no portal (run 26j: 403 for every bench user,
+    recorded as a product error, "preflight OK" logged, and the run stopped
+    one step later on a message about composite pages). Refuses too on a
+    CONFIG error of a menu route's content page (404 or an unserved type).
+    THE LINE: a product 5xx / 403 of any call that is NOT the boot root (a
+    route's page, a widget of its tree) is RECORDED and does not refuse. Also
+    records the navigation shape (first-load calls, routes) and, with
+    full_walk, the closure-walk size as a separately labelled metric.
     """
     out: dict = {"kind": "preflight", "init": portal.init, "refused": [],
                  "product_errors": [], "forbidden": [], "routes": []}
@@ -4896,9 +4908,10 @@ def _preflight(client: HttpClient, token: str, portal: "Portal", *,
         out["init_status"] = r.status
         if cls != "ok":
             body = (r.body or b"")[:400].decode("utf-8", "replace")
-            (out["refused"] if cls == "config" else out["product_errors"]).append(
-                {"path": portal.init, "status": r.status, "body": body})
-            out["ok"] = not out["refused"]
+            out["refused"].append({"path": portal.init, "status": r.status, "boot_root": True, "body": (
+                f"the portal's boot root did not answer 200 for this login ({BOOT_ROOT_WHY.get(cls, cls)}; "
+                + (f"body: {body}" if body.strip() else "an empty body") + ")")})
+            out["ok"] = False
             return out
         shell, routes, content = first_load(client, token, portal, pool=pool,
                                             per_user_parallel=per_user_parallel)
