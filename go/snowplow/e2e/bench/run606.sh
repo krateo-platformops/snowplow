@@ -1070,10 +1070,8 @@ go_runtime_reading() {
     log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the preflight user reads /debug/vars snowplow_go_runtime) -> $out"
     return 0
   fi
-  rm -f "$out"
   python3 -m bench.load606_job --go-runtime-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
       --password "$PW" > "$OUT/go-runtime-job.yaml"
-  "${K[@]}" --request-timeout=60s -n bench-loadgen delete job "$job" --ignore-not-found --wait=true >/dev/null 2>"$KERR" || true
   kapply "$OUT/go-runtime-job.yaml" >/dev/null || { log "the ${job} Job was not created: $(kerr_line)"; return 0; }
   deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do

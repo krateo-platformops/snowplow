@@ -310,6 +310,9 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+                    if d.get("kind") == "User":       # authn's users: only one that exists can log in
+                        with open(os.path.join(STATE, "users"), "a") as uf:
+                            uf.write((d.get("metadata") or {}).get("name", "") + "\\n")
         # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
         if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
             sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
@@ -323,6 +326,11 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # of fields the process has instead; FAKE_GO_RUNTIME_FAIL: login | vars401 | nokey | pending
     if "runtime606" in a or "job/runtime606" in a:
         fail = os.environ.get("FAKE_GO_RUNTIME_FAIL", "")
+        # authn answers a login only for a user that exists: the Job logs in as the bench's preflight user
+        # (scaleuser-0000), which the run must have created first
+        uf = os.path.join(STATE, "users")
+        if "scaleuser-0000" not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
+            fail = "login"
         if "get" in a:
             done = fail != "pending"
             bad = fail in ("login", "vars401", "nokey")

@@ -301,6 +301,13 @@ def test_the_runtime_job_reads_what_snowplow_publishes():
                            (200, json.dumps({"snowplow_go_runtime": {"gogc": 100}}), "lacks memory_limit_bytes")):
         r = load606.go_runtime_record(status, b)
         assert r["ok"] is False and r["effective"] is None and why in r["why"]
+    full = json.loads(body)["snowplow_go_runtime"]
+    for field in load606.GO_RUNTIME_FIELDS:           # a reading without any one of the four is no reading
+        less = {k: v for k, v in full.items() if k != field}
+        r = load606.go_runtime_record(200, json.dumps({"snowplow_go_runtime": less}))
+        assert r["ok"] is False and r["effective"] is None and r["why"] == f"snowplow_go_runtime lacks {field}"
+    assert load606.GO_RUNTIME_FIELDS == ("gogc", "memory_limit_bytes", "memory_limit_source",
+                                         "cgroup_memory_limit_bytes")
     from bench import load606_job
     job = load606_job.render_go_runtime(snowplow_url="http://s", authn_url="http://a", user="u", password="pw")
     assert "name: runtime606" in job and "load606.py go-runtime" in job and "bench.krateo.io/pool: loadgen" in job
@@ -639,6 +646,9 @@ def test_the_rehearsal_installs_reads_the_pod_prints_one_block_and_tears_down_wi
                  "comparison with the declaration: VERIFIED: declared GOGC=100 (the Go default, set explicitly)"):
         assert said in block, (said, block)
     # no data, no drivers, no verdict; the cluster is deleted
+    # the reading's user is the bench's own preflight user, created by the rehearsal before the Job logs in
+    users = (state / "users").read_text().split()
+    assert users == ["scaleuser-0000"]
     for step in ("=== step data ===", "=== step measure ===", "=== step evaluate ===", "run complete"):
         assert step not in log
     assert not (out / "verdict.json").exists()
@@ -711,7 +721,16 @@ def test_run606_reads_the_process_before_load_and_keeps_the_password_out(harness
     assert v["report"]["snowplow_env"]["lines"][0].startswith(
         "INFO snowplow Go runtime, effective (read from the running process before the measure): GOGC 100, memory "
         "limit 7.00 GiB (7516192768 bytes)")
-    assert " + go runtime 300 + measure " in log                               # the Job's wait is a term of the plan
+    # the Job's wait is a term of the plan: named in the line, counted in the total, and the total with
+    # its margin fits the cluster's TTL
+    import re
+    m = re.search(r"run budget: (.*) = (\d+) s; fits TTL_HOURS=\d+ \((\d+) s; .* minus (\d+) s", log)
+    line, total, ttl_s, margin = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    assert " + go runtime 300 + measure " in line
+    flat = " ".join(re.sub(r"\([^()]*\)", "", line).split())
+    terms = [int(n) * int(k) if n else int(k) for n, k in re.findall(r"(?:(\d+)x)?(\d+)(?= \+|$)", flat)]
+    assert len(terms) == flat.count(" + ") + 1 and sum(terms) == total, (flat, total)
+    assert total + margin <= ttl_s
 
 
 @needs_helm
