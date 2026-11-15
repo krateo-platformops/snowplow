@@ -231,7 +231,7 @@ func e767Setup(t *testing.T) *e767Env {
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
 	cache.RebuildRBACSnapshotForTest(rw)
-	cache.BuildBindingsByGVRIndex(rw.RegisteredGVRs())
+	cache.SeedBindingsIndexFromSnapshotForTest(rw.RegisteredGVRs())
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetRBACSubGenForTest)

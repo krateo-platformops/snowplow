@@ -265,7 +265,7 @@ func TestIssue1334_Prewarm_NoUnauthenticatedSeedTarget(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: h1RAGVR.Group, Version: h1RAGVR.Version, Resource: h1RAGVR.Resource}
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{gvr})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{gvr})
 	if !cache.IdentityAuthorisedForGVR(gvr, i1334Public, unauth) {
 		t.Fatal("precondition: the public identity is authorised for the GVR (its RoleBinding names the user); else the learned filter is never consulted")
 	}

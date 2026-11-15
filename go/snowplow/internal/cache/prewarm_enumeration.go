@@ -141,7 +141,7 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 	gr := grFromGVR(gvr)
 
 	idx.mu.RLock()
-	if !idx.built {
+	if !idx.ready {
 		idx.mu.RUnlock()
 		return nil
 	}
@@ -349,7 +349,7 @@ func IdentityAuthorisedForGVR(gvr schema.GroupVersionResource, username string, 
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	if !idx.built {
+	if !idx.ready {
 		return false
 	}
 	match := func(set map[bindingID]struct{}) bool {

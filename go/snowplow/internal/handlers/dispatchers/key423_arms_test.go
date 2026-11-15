@@ -315,7 +315,7 @@ func TestKey423_SeedKeyParity(t *testing.T) {
 
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 	var rep *cache.PrewarmTarget
 	for _, tg := range cache.EnumeratePrewarmTargetsForGVR(h1RAGVR, "list") {
 		tg := tg
@@ -360,7 +360,7 @@ func TestKey423_RoleEditRotatesKey(t *testing.T) {
 	dyn := psBuildWatcher(t, a) // target-reader is referenced ONLY by alice's RoleBinding
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 
 	aliceCtx := psUserCtx(a, psAlice)
 	// Bob is bound only to pod-reader in ns z — the edited role does not touch him.

@@ -117,8 +117,10 @@ var phase1Done atomic.Bool
 // safety-net) funnels through here, so the expvar boundary is observed
 // on all of them. See prewarm_complete_metric.go.
 //
-// #819: the FIRST flip settles the #682 boot epoch before /readyz can turn
-// 200 (settleBindingsIndexBeforeReady), on every readiness path.
+// #819 / #1458: the FIRST flip gives the bindings index its navigated set
+// (settleBindingsIndexBeforeReady), on every readiness path. The #682 boot
+// epoch settles when the index becomes ready, which readiness waits for
+// (#1231).
 func MarkPhase1Done() {
 	if !phase1Done.Load() {
 		settleBindingsIndexBeforeReady()

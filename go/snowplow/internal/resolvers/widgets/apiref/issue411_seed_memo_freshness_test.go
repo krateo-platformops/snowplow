@@ -557,7 +557,7 @@ func TestIssue411_MemoDoesNotCrossRBACSubGenClass(t *testing.T) {
 	i411CrossClassArm(t, "i411-xclass-subgen-ra", func(f *i411Fixture) {
 		// Activate the sub-gen deltas (production builds this index at boot over
 		// the navigated GVRs), then edit the role's rules.
-		cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{f.gRA})
+		cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{f.gRA})
 		role := &rbacv1.ClusterRole{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
 			ObjectMeta: metav1.ObjectMeta{Name: "widgets-reader"},

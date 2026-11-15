@@ -67,7 +67,7 @@ func TestDiscoveryHook_AddNavigatedGVRFlow_NarrowCohortEnumeratedPostWiden(t *te
 
 	// EMPTY navigated set — composition.krateo.io is NOT in
 	// RegisteredGVRs() at boot (the empirical scenario).
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{})
 
 	compGVR := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
@@ -135,7 +135,7 @@ func TestDiscoveryHook_AddNavigatedGVRIdempotent(t *testing.T) {
 		[]*rbacv1.ClusterRole{devsCR},
 	)
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{})
 
 	compGVR := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
@@ -183,7 +183,7 @@ func TestDiscoveryHook_NotifyOrderingIsLoadBearing(t *testing.T) {
 		[]*rbacv1.ClusterRole{adminCR, devsCR},
 	)
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{})
 
 	compGVR := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",

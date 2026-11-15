@@ -85,7 +85,7 @@ func i1458Setup(t *testing.T, arm i1449Arm) *i1449Env {
 	dyn := psBuildWatcher(t, a, arm.role(i1449GrantRules(a)))
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetPendingSubGenBumpsForTest)
@@ -171,7 +171,7 @@ func TestIssue1458_RebuildBetweenABindingEventAndItsPublish(t *testing.T) {
 
 			// --- the rebuild, as a prewarm pass does.
 			if arm.rebuild == i1458RebuildInWindow {
-				cache.BuildBindingsByGVRIndex(navigated)
+				cache.SeedBindingsIndexFromSnapshotForTest(navigated)
 				t.Logf("index rebuilt in the window: the binding is in the index=%v", indexed())
 			}
 
@@ -179,7 +179,7 @@ func TestIssue1458_RebuildBetweenABindingEventAndItsPublish(t *testing.T) {
 			free()
 			e.settle("the publish of the binding", e.canList)
 			if arm.rebuild == i1458RebuildAfterPublish {
-				cache.BuildBindingsByGVRIndex(navigated)
+				cache.SeedBindingsIndexFromSnapshotForTest(navigated)
 			}
 			c1 := e.class()
 			k1, _ := k423RAKey(t, e.ctx)

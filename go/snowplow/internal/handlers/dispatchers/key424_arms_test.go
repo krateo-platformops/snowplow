@@ -449,7 +449,7 @@ func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *test
 	dyn := psBuildWatcher(t, a)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
 	carolCtx, daveCtx := psUserCtx(a, psCarol), psUserCtx(a, psDave)
 	cKey, cIn := k423RAKey(t, carolCtx)
 	if dKey, _ := k423RAKey(t, daveCtx); cKey != dKey {
@@ -513,7 +513,7 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	dyn := psBuildWatcher(t, a, k423PortalReaders(a)...) // Group:portal → target-reader in ns x
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	carolCtx := psUserCtx(a, psCarol)
 	key, in := k423RAKey(t, carolCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)

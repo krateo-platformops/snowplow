@@ -707,17 +707,6 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		noteDanglingRoleRefs(snap, dangling)
 	}
 
-	// #686 — a bindings-index build requested before the first publish was
-	// deferred, not marked built over nothing. Run it over a COMPLETE
-	// snapshot only: an event-driven rebuild during the initial LIST can
-	// publish a partial one (a RoleBinding before its Role), and building
-	// over it would skip that binding for good. So: once this watcher's
-	// initial publish has returned, or from the initial publish itself
-	// (waitAndPublishInitialRBACSnapshot).
-	if rbacInitialPublishReturned(rw) {
-		buildPendingBindingsIndex()
-	}
-
 	// #118 (c)-v2 GAP-2 — flush the deferred per-subject sub-gen bumps at the
 	// publish barrier, sequenced AFTER rbacSnap.Store. Any request that
 	// observes a bumped sub-gen (new resolved key) is thereby guaranteed to
@@ -1176,9 +1165,9 @@ func isTypedRBACGVR(gvr schema.GroupVersionResource) bool {
 //
 // gvr discriminates a binding event (CRB/RB → onBinding{Add,Update,Delete})
 // from a role-rule event (ClusterRole/Role → onRoleRulesChanged). The
-// index hooks no-op until the index is built (deltaActive gate) so a
-// pre-build replay event is free; the wholesale rebuild scheduling is
-// unchanged. The handler bodies stay non-blocking: scheduleRBACRebuild is
+// binding hooks record membership from the first event on (#1458); what waits
+// for the index to be ready is the sub-generation bump and the role hooks'
+// bucket re-routing (isReady). The wholesale rebuild scheduling is unchanged. The handler bodies stay non-blocking: scheduleRBACRebuild is
 // a few atomics, and the index delta is O(navigatedGVRs) map ops under the
 // index lock (Gate-2: ~5.8 µs/event).
 func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
@@ -1214,6 +1203,30 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 	}
 }
 
+// rbacSnapshotHandlerExtension names the handler extension that carries the
+// RBAC snapshot handler and, through it, the bindings-index hooks.
+const rbacSnapshotHandlerExtension = "rbac.snapshot_writer"
+
+// rbacHandlerRegistrations returns the registrations of the RBAC snapshot
+// handler on rw's RBAC informers (#1458). Each one's HasSynced means that
+// handler, and so the bindings-index hooks, has been delivered the informer's
+// whole initial list.
+func (rw *ResourceWatcher) rbacHandlerRegistrations() []clientcache.ResourceEventHandlerRegistration {
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	var out []clientcache.ResourceEventHandlerRegistration
+	for _, gvr := range rbacTypedGVRs {
+		in := rw.instances[gvr]
+		if in == nil {
+			continue
+		}
+		if reg := in.extensionRegistration(rbacSnapshotHandlerExtension); reg != nil {
+			out = append(out, reg)
+		}
+	}
+	return out
+}
+
 // init registers the typed-RBAC-snapshot handler-extension with the
 // cache-package declarative registry (Ship 0 / 0.30.222). Before Ship 0
 // the watcher's addResourceTypeLocked / addResourceTypeMetadataOnlyLocked
@@ -1228,7 +1241,7 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 // indirection changes.
 func init() {
 	RegisterHandlerExtension(HandlerExtension{
-		Name:      "rbac.snapshot_writer",
+		Name:      rbacSnapshotHandlerExtension,
 		Predicate: isTypedRBACGVR,
 		Handlers: func(rw *ResourceWatcher, gvr schema.GroupVersionResource) clientcache.ResourceEventHandler {
 			// #682 — wrapped so the pre-build note sees isInInitialList and
@@ -1413,7 +1426,8 @@ func rbacInitialPublishReturned(rw *ResourceWatcher) bool {
 }
 
 // initialPublishBeforeIndexHookForTest runs between the initial complete
-// publish and the deferred bindings-index build. TEST-ONLY: nil in production.
+// publish and the bindings index being marked ready. TEST-ONLY: nil in
+// production.
 var initialPublishBeforeIndexHookForTest atomic.Pointer[func()]
 
 // SetInitialPublishBeforeIndexHookForTest installs h and returns the restore.
@@ -1490,10 +1504,27 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	if h := initialPublishBeforeIndexHookForTest.Load(); h != nil {
 		(*h)() // #1231 arm: between the complete publish and the deferred build
 	}
-	// #686 — the first COMPLETE snapshot: run a bindings-index build that
-	// was requested before any snapshot existed. #1231: readiness waits for
-	// this function to return, so the build is done before Ready.
-	buildPendingBindingsIndex()
+	// #1458 — the bindings index is READY once the RBAC handlers have been
+	// delivered their informers' initial lists: its membership, which the
+	// event hooks alone write, then holds every binding. An informer's
+	// HasSynced (the channels above) says the STORE holds the initial list;
+	// the handler is delivered it on its own goroutine, and its registration's
+	// HasSynced says when that is done. No timer and no cap: readiness waits
+	// for this function to return (#1231), so a pod is never Ready on an
+	// index that is still filling, and the #682 rotation, if owed, lands
+	// before Ready (#819).
+	for _, reg := range rw.rbacHandlerRegistrations() {
+		select {
+		case <-reg.HasSyncedChecker().Done():
+		case <-rw.stopCh:
+			slog.Info("cache.rbac.snapshot.initial_publish_aborted",
+				slog.String("subsystem", "cache"),
+				slog.String("hint", "stopCh closed before the RBAC handlers were delivered their initial lists — process shutdown"),
+			)
+			return
+		}
+	}
+	markBindingsIndexReady()
 	slog.Info("cache.rbac.snapshot.initial_publish_done",
 		slog.String("subsystem", "cache"),
 		slog.String("hint", "first typed-RBAC snapshot is live; "+

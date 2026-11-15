@@ -89,7 +89,7 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 
 	// Index must be built over a navigated set INCLUDING restActionGVR so
 	// the get-restactions binding is enrolled.
-	if n := BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR}); n != 1 {
+	if n := SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR}); n != 1 {
 		t.Fatalf("expected 1 binding enrolled, got %d", n)
 	}
 	// Precondition: the gate the enumerator reads is non-empty.
@@ -139,7 +139,7 @@ func TestProactiveRASeed_F6_transparent_no_binding(t *testing.T) {
 		getListRules("composition.krateo.io", "compositions"))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR, gr("composition.krateo.io", "compositions")})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR, gr("composition.krateo.io", "compositions")})
 
 	if got := EnumeratePrewarmTargetsForGVR(restActionGVR, "get"); len(got) != 0 {
 		t.Fatalf("precondition: expected 0 get-restactions targets, got %d", len(got))
@@ -167,7 +167,7 @@ func TestProactiveRASeed_F6_transparent_empty_informer(t *testing.T) {
 		getListRules(restActionGVR.Group, restActionGVR.Resource))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR})
 
 	rw := newSyntheticRemoveWatcher(t, restActionGVR)
 	t.Cleanup(func() { rw.Stop() })

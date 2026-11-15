@@ -2,15 +2,16 @@ package cache
 
 // ready_settle_819_test.go — #819 / #828 review: the readiness settle's edges.
 //
+// Since #1458 the settle only gives the bindings index its navigated set: the
+// index is never built from a snapshot, so there is no build to run or defer
+// at the flip (the old P2, a publish between the deferral's request and its
+// re-check, has nothing left to test).
+//
 //   P1  a NON-NIL but INCOMPLETE snapshot at the flip (the initial publish has
 //       not returned: an event-driven publish during the initial LIST can hold
-//       a RoleBinding before its Role) → the settle must NOT build (the
-//       binding would be skipped for good, #686); it requests the build,
-//       counts the deferral, and the first complete publish builds it with the
-//       binding enrolled.
-//   P2  the initial publish completes between the request and the re-check →
-//       the re-check builds (the publisher's buildPendingBindingsIndex ran
-//       before the request existed, so nothing else would).
+//       a RoleBinding before its Role) → the flip must NOT make the index
+//       ready; when the binding's event and the complete publish have come and
+//       the index is marked ready, the binding is under its role.
 //   P3  a panic inside the settle is recovered and counted; Ready still flips.
 //   O1  RefreshStream.Rotated offers only keys THIS connection armed.
 
@@ -39,7 +40,7 @@ func pendingInitialPublishWatcher(t *testing.T) *ResourceWatcher {
 		ResetPhase1DoneForTest()
 		ResetBindingsByGVRIndexForTest()
 		ResetRBACSubGenForTest()
-		readySettleAfterRequestHookForTest.Store(nil)
+		readySettleHookForTest.Store(nil)
 	}
 	reset()
 	t.Cleanup(func() {
@@ -79,10 +80,9 @@ func byRoleLen() int {
 	return len(idx.byRole)
 }
 
-func TestIssue819_P1_IncompleteSnapshotAtFlip_DefersInsteadOfBuilding(t *testing.T) {
+func TestIssue819_P1_IncompleteSnapshotAtFlip_IndexIsNotReady(t *testing.T) {
 	rw := pendingInitialPublishWatcher(t)
 	rbacSnap.Store(partial819())
-	before := ReadySettleStatsSnapshot()
 
 	MarkPhase1Done()
 
@@ -90,43 +90,18 @@ func TestIssue819_P1_IncompleteSnapshotAtFlip_DefersInsteadOfBuilding(t *testing
 		t.Fatal("P1: readiness did not flip")
 	}
 	if BindingsByGVRIndexBuilt() {
-		t.Fatal("P1 RED: the settle built the index over an INCOMPLETE snapshot — the RoleBinding whose Role is " +
-			"not listed yet is skipped for good, and its role edits will bump no subject (#686)")
+		t.Fatal("P1 RED: the readiness flip made the index ready over an INCOMPLETE snapshot, before the RBAC " +
+			"handlers were delivered their initial lists (#686, #1458)")
 	}
-	if got := ReadySettleStatsSnapshot().DeferredAtFlip - before.DeferredAtFlip; got != 1 {
-		t.Fatalf("P1: deferred_at_flip moved by %d, want 1 — the after-Ready build must be reported", got)
-	}
-	// The first complete publish runs the requested build.
+	// The binding's event, the complete publish, then ready: what the informer
+	// and the initial-publish goroutine do.
+	onBindingAdd(rb819())
 	rbacSnap.Store(complete819())
 	close(rw.rbacInitialPublishDone)
-	buildPendingBindingsIndex()
-	if !BindingsByGVRIndexBuilt() || byRoleLen() == 0 {
-		t.Fatalf("P1: the complete publish did not build with the binding enrolled (built=%v byRole=%d)",
+	markBindingsIndexReady()
+	if !BindingsByGVRIndexBuilt() || byRoleLen() != 1 {
+		t.Fatalf("P1: ready with the binding delivered before it: ready=%v byRole=%d, want true / 1",
 			BindingsByGVRIndexBuilt(), byRoleLen())
-	}
-}
-
-func TestIssue819_P2_PublishBetweenRequestAndRecheck_RecheckBuilds(t *testing.T) {
-	rw := pendingInitialPublishWatcher(t)
-	rbacSnap.Store(partial819())
-	// The initial publish completes after the settle's first check and
-	// before its request: its buildPendingBindingsIndex found nothing pending.
-	hook := func() {
-		rbacSnap.Store(complete819())
-		close(rw.rbacInitialPublishDone)
-	}
-	readySettleAfterRequestHookForTest.Store(&hook)
-	before := ReadySettleStatsSnapshot()
-
-	MarkPhase1Done()
-
-	if !BindingsByGVRIndexBuilt() || byRoleLen() == 0 {
-		t.Fatal("P2 RED: a publish that completed between the request and the re-check left the build " +
-			"pending with nobody to run it — the bump is owed after Ready until the boot pass builds")
-	}
-	if got := ReadySettleStatsSnapshot(); got.BuiltAtFlip-before.BuiltAtFlip != 1 || got.DeferredAtFlip != before.DeferredAtFlip {
-		t.Fatalf("P2: built_at_flip +%d deferred_at_flip +%d, want +1 / +0",
-			got.BuiltAtFlip-before.BuiltAtFlip, got.DeferredAtFlip-before.DeferredAtFlip)
 	}
 }
 
@@ -135,7 +110,7 @@ func TestIssue819_P3_PanicInSettleIsRecovered_ReadyStillFlips(t *testing.T) {
 	rbacSnap.Store(partial819())
 	const panicValue = "P3-settle-panic-value"
 	hook := func() { panic(panicValue) }
-	readySettleAfterRequestHookForTest.Store(&hook)
+	readySettleHookForTest.Store(&hook)
 	before := ReadySettleStatsSnapshot().Panics
 	logs := &lockedBuffer819{}
 	prevLogger := slog.Default()

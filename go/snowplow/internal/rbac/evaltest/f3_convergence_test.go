@@ -268,7 +268,7 @@ func f3InitWatcher(t *testing.T, idents []f3Identity) {
 	// the seed enumerator reads. Production wires this via the Phase 1
 	// walker; for the synthetic harness we call it directly.
 	cache.ResetBindingsByGVRIndexForTest()
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{
 		{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets"},
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
 	})
@@ -734,7 +734,7 @@ func TestF3_MidTestMutation_NewBindingInNewNamespace(t *testing.T) {
 	// ALSO add ns-C to the BindingsByGVR index — the seed enumerator
 	// needs the GVR×ns enrolment to include the new binding.
 	cache.ResetBindingsByGVRIndexForTest()
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{
 		{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets"},
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
 	})
@@ -893,14 +893,14 @@ func TestF3_SAExemption_DoesNotMaskUserGroupSeedMiss(t *testing.T) {
 	// deliberately UNENROLLED so a widgets-class seed lookup is empty. The
 	// dispatcher is unaffected (it reads the RBAC snapshot, not this index).
 	cache.ResetBindingsByGVRIndexForTest()
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
 	})
 	// Restore the standard 2-GVR index so no sibling test inherits the
 	// restactions-only index (process-global).
 	defer func() {
 		cache.ResetBindingsByGVRIndexForTest()
-		cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+		cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{
 			{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets"},
 			{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
 		})

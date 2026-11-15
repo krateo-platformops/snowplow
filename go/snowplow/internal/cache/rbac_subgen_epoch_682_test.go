@@ -105,7 +105,7 @@ func TestIssue682_E1_PreBuildRoleEdit_RotatesEveryIdentityBoundKeyAtFirstBuild(t
 	if RBACSubGenEpoch() != 0 {
 		t.Fatal("the epoch moved before the build")
 	}
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	if RBACSubGenEpoch() != 1 {
 		t.Fatalf("E1 RED: epoch=%d after the first build following a pre-build edit, want 1 — a cell minted in the window keeps the pre-edit grant", RBACSubGenEpoch())
 	}
@@ -127,7 +127,7 @@ func TestIssue682_E2_EditBeforeFirstPublish_DoesNotRotate(t *testing.T) {
 	reset682(t)
 	// RBACGen()==0: before the first publish.
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682))
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	if RBACSubGenEpoch() != 0 {
 		t.Fatalf("E2: epoch=%d — an event before the first publish (initial sync) rotated every key", RBACSubGenEpoch())
 	}
@@ -137,7 +137,7 @@ func TestIssue682_E3_LaterRebuildsNeverBump(t *testing.T) {
 	reset682(t)
 	BumpRBACGenForTest()
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682))
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	if RBACSubGenEpoch() != 1 {
 		t.Fatalf("precondition: epoch=%d after the first build", RBACSubGenEpoch())
 	}
@@ -145,7 +145,7 @@ func TestIssue682_E3_LaterRebuildsNeverBump(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); roleHandler682.OnUpdate(role682(cmRule682), role682(noRule682)) }()
-		go func() { defer wg.Done(); BuildBindingsByGVRIndex(nil) }()
+		go func() { defer wg.Done(); SeedBindingsIndexFromSnapshotForTest(nil) }()
 		wg.Wait()
 	}
 	if RBACSubGenEpoch() != 1 {
@@ -169,7 +169,7 @@ func TestIssue682_E4_PostBuildEdit_RotatesThroughSubjectSubGen_NotEpoch(t *testi
 	}
 	rbacSnap.Store(snap)
 	t.Cleanup(func() { rbacSnap.Store(nil) })
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	sub0 := RBACSubGenForSubject(identUser, identGroup)
 
 	roleHandler682.OnUpdate(role682(noRule682), role682(cmRule682))
@@ -187,7 +187,7 @@ func TestIssue682_E1b_PreBuildRoleAddAndRoleRefChange_Rotate(t *testing.T) {
 		reset682(t)
 		BumpRBACGenForTest()
 		roleHandler682.OnAdd(role682(cmRule682), false)
-		BuildBindingsByGVRIndex(nil)
+		SeedBindingsIndexFromSnapshotForTest(nil)
 		if RBACSubGenEpoch() != 1 {
 			t.Fatalf("E1b RED: a pre-build Role create (a dangling roleRef now grants) did not rotate (epoch=%d)", RBACSubGenEpoch())
 		}
@@ -196,7 +196,7 @@ func TestIssue682_E1b_PreBuildRoleAddAndRoleRefChange_Rotate(t *testing.T) {
 		reset682(t)
 		BumpRBACGenForTest()
 		bindingHandler682.OnUpdate(rb682("old-role", "team682"), rb682("cm", "team682"))
-		BuildBindingsByGVRIndex(nil)
+		SeedBindingsIndexFromSnapshotForTest(nil)
 		if RBACSubGenEpoch() != 1 {
 			t.Fatalf("E1b RED: a pre-build binding roleRef change (digest-invisible) did not rotate (epoch=%d)", RBACSubGenEpoch())
 		}
@@ -207,7 +207,7 @@ func TestIssue682_E2b_LateInitialListAdd_DoesNotRotate(t *testing.T) {
 	reset682(t)
 	BumpRBACGenForTest()                           // the first publish already happened...
 	roleHandler682.OnAdd(role682(cmRule682), true) // ...and an initial-list ADD is delivered late
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	if RBACSubGenEpoch() != 0 {
 		t.Fatalf("E2b RED: a late initial-list ADD rotated every key at the first build (epoch=%d)", RBACSubGenEpoch())
 	}
@@ -219,7 +219,7 @@ func TestIssue682_E2c_BindingDigestPaths_DoNotRotate(t *testing.T) {
 	bindingHandler682.OnAdd(rb682("cm", "team682"), false)
 	bindingHandler682.OnUpdate(rb682("cm", "team682"), rb682("cm", "team682", "other682"))
 	bindingHandler682.OnDelete(rb682("cm", "team682"))
-	BuildBindingsByGVRIndex(nil)
+	SeedBindingsIndexFromSnapshotForTest(nil)
 	if RBACSubGenEpoch() != 0 {
 		t.Fatalf("E2c: binding add / subject edit / delete rotated globally (epoch=%d) — the SubjectBindingSet digest already covers them", RBACSubGenEpoch())
 	}

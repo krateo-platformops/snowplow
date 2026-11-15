@@ -129,7 +129,7 @@ func newSubgenHarness(t *testing.T, navigated []schema.GroupVersionResource, see
 	// delta hooks to be active (deltaActive) AND for onRoleRulesChanged to find
 	// the referencing bindings in byRole.
 	cache.ResetBindingsByGVRIndexForTest()
-	cache.BuildBindingsByGVRIndex(navigated)
+	cache.SeedBindingsIndexFromSnapshotForTest(navigated)
 
 	return &subgenHarness{dyn: dyn}
 }

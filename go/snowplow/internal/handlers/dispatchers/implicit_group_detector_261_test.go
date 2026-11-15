@@ -161,7 +161,7 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	// Build the index against the LIVE (full) snapshot — the c2-reader ClusterRole
 	// IS present, so the binding resolves normally: any bump here comes from the
 	// RBAC winning-subject fact.
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User) // alice, Groups=["devs"]
 	key, handle, inputs := dispatchCacheLookupKey(reqCtx, "restactions",
@@ -226,7 +226,7 @@ func TestC2_RegularSubject_ControlDoesNotBump(t *testing.T) {
 	h1BuildWatcher(t) // h1-bind CRB subject is User=alice — a REGULAR match.
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User)
 	key, handle, inputs := dispatchCacheLookupKey(reqCtx, "restactions",
