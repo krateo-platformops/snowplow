@@ -369,11 +369,15 @@ func (idx *bindingsByGVRIndex) enrolLocked(entry bindingEntry, rules []rbacv1.Po
 // recordBindingLocked is the ONE way a binding enters the index (#1449): the
 // build and the binding ADD / UPDATE delta hooks both call it. The binding is
 // recorded under the role it names (entries + byRole) whether or not that role
-// is in snap. A role that is absent has no rules, so the binding enters no GVR
-// or wildcard bucket (it grants nothing, and the evaluator, which reads the
-// snapshot and never this index, denies it); it stays reachable through byRole,
-// so the role's create, every rules edit and its delete reach the binding's
-// subjects (onRoleRulesChanged). Caller holds idx.mu (write).
+// is in snap. A role that is absent has no rules, so THIS function puts the
+// binding in no GVR or wildcard bucket (it grants nothing, and the evaluator,
+// which reads the snapshot and never this index, denies it); it stays reachable
+// through byRole, so the role's create, every rules edit and its delete reach
+// the binding's subjects (onRoleRulesChanged). That holds for the record path
+// only: when a role is DELETED, onRoleRulesChanged re-buckets its bindings
+// under the role's last-known rules, where they stay until the next event on
+// the role or the binding, or the next build (#1457; prewarm targeting only,
+// never keys or authorization). Caller holds idx.mu (write).
 func (idx *bindingsByGVRIndex) recordBindingLocked(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
 	rules, _ := rulesForRoleRef(snap, namespace, ref)
 	idx.enrolLocked(bindingEntry{id: id, subjects: subjects}, rules, roleRefKey(namespace, ref))

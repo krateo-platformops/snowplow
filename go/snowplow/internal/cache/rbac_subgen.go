@@ -252,17 +252,46 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 // none of whose subjects has ever been touched (correct: nothing changed → no
 // key rotation).
 //
-// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE. Take two identities that
-// hold one binding set and read the same value v, at any two times. Neither has
-// had a subject bumped after state v. Every change that can move a verdict of
-// theirs without moving the binding set bumps one of their subjects: a rules
-// change, create or delete of a role one of their bindings references bumps
-// every subject of that binding, and a binding re-pointed at one of their
-// subjects, or to another role, bumps both sides. So for both, the roles behind
-// the binding set are exactly those of state v: the same verdicts. With the sum
-// this fold used before, equal values meant only an equal NUMBER of changes.
-// Both halves are needed: a sum of clock values collides (states 3 and 4 add up
-// to state 7), and the latest of per-subject counts collides (2 and 2).
+// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE, AND UNDER WHICH CONDITION.
+// Take two identities that hold one binding set and read the same value v, at
+// any two times outside the publish window (a snapshot is live and the bumps
+// its changes owe are not written yet: at most one rebuild late, see
+// rbac_subgen_pending.go). Neither has had a FOLDED subject bumped after state
+// v. A rules change, create or delete of a role bumps every subject of every
+// binding the role index (bindingsByGVRIndex.byRole) lists under that role,
+// and a binding
+// re-pointed at other subjects, or to another role, bumps both sides. So the
+// roles behind the binding set are exactly those of state v for both — the
+// same verdicts — PROVIDED THAT, for every binding in the set:
+//
+//	(a) every subject through which the binding matches the identity is one
+//	    this function folds, and
+//	(b) the binding is in the role index under the role it references.
+//
+// Where (a) or (b) fails, a verdict can move with no bump of a folded subject,
+// and the identity keeps its old class. It can then be served a pre-change
+// cell: its own, or one that ANOTHER identity with the same binding set stored
+// under that class before the change. The guarantee above does not hold for it
+// in either direction.
+//
+// (a) holds by construction since #1443: the fold below reads the counters of
+// SubjectMatcher.Visit, the one enumeration the evaluator matches bindings
+// with (see "THE FOLDED SUBJECTS ARE THE MATCHED SUBJECTS" below). Before it, a
+// ServiceAccount matched through its two ServiceAccount groups, or through a
+// User-kind subject naming its username, was matched by a subject the fold did
+// not read.
+//
+// (b) has one known exception, until #1458 lands: a rebuild of the index reads
+// the published snapshot; a binding whose ADD event was already applied but
+// whose snapshot is not published yet is not in it, so the rebuild drops the
+// binding, and the role's later edits bump nobody until the next rebuild or
+// the next event on the binding. (A binding whose role is absent is listed
+// under the role it names since #1449.)
+//
+// With the sum this fold used before, equal values meant only an equal NUMBER
+// of changes. Both halves are needed: a sum of clock values collides (states 3
+// and 4 add up to state 7), and the latest of per-subject counts collides (2
+// and 2).
 //
 // A read that races a flush sees, per counter, either the old value or the new
 // state; the fold is then the old value or the new state, never a third one.

@@ -1,7 +1,8 @@
 // rbac_subgen_counters_test.go — #247 key-rotation vantage arms.
 //
-// WHAT THESE PIN. The L1 key folds RBACSubGenForSubject, which sums the
-// requesting identity's PER-SUBJECT counters. Before #247 the only published
+// WHAT THESE PIN. The L1 key folds RBACSubGenForSubject, which reads the latest
+// state over the requesting identity's PER-SUBJECT counters (#1439; a sum
+// before it). Before #247 the only published
 // RBAC counter was snowplow_rbac_publish_seq — GLOBAL, one bump per snapshot
 // publish — one link too early on the chain publish -> per-subject bump -> key
 // minted -> resident excess, so it cannot say whether any key rotated. Two

@@ -3,8 +3,9 @@
 //
 // THE DEFECT (#423): the restactions / widgets / raFullList cells were keyed by
 // the FIRST binding granting `get` on the dispatched CR (BindingUID) plus the
-// RBACSubGen sum. Two users co-bound by that one binding derived the same key
-// even when one of them held an EXTRA binding that changed what the
+// RBACSubGen (then a sum of counters). Two users co-bound by that one binding
+// derived the same key even when one of them held an EXTRA binding that
+// changed what the
 // RESTAction's own steps could read — and the hit path serves entry.RawJSON
 // verbatim. A co-bound user lacking the per-step grant was served the other
 // user's resolved data (TestFalsifier_L1PerStepRBAC_CrossUser).
@@ -28,9 +29,15 @@
 // every referencing binding), which since #1439 is the number of the last RBAC
 // state change that touched the requester (cache.RBACSubGenForSubject). A cell
 // minted by one same-set requester before the edit is therefore never the cell
-// another derives after it. TestSubjectBindingSet_RoleEditRotatesKey proves the
-// rotation end to end; TestIssue1439_ClassValueNamesOneRBACState the
-// before/after separation across two requesters.
+// another derives after it — where the edit bumps a subject the requester's
+// sub-generation folds. Since #1443 the fold reads every subject the evaluator
+// matches the requester by, so the one case where it does not is, until #1458
+// lands, a binding that a rebuild of the role index dropped (it read a
+// snapshot older than the binding's already-applied event): there the
+// requester's key does not rotate at all.
+// TestSubjectBindingSet_RoleEditRotatesKey proves the rotation end to end;
+// TestIssue1439_ClassValueNamesOneRBACState the before/after separation across
+// two requesters.
 //
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the
 // evaluator's own unexported functions — selectCRBCandidates /
