@@ -257,7 +257,7 @@ def test_drive_refusing_at_login_still_frames_its_stream(portal, tmp_path, capsy
 def test_driver_job_writes_to_out_turns_ready_when_done_and_lingers():
     m = load606_job.render(users=4, shards=1, think_s=1, duration_s=1,
                            snowplow_url="http://s", authn_url="http://a", password="pw",
-                           init=INIT, src="#", linger_s=7200)
+                           debug_user="d", init=INIT, src="#", linger_s=7200)
     job = list(yaml.safe_load_all(m))[2]
     c = job["spec"]["template"]["spec"]["containers"][0]
     script = c["args"][0]
@@ -281,7 +281,7 @@ def test_drive_exit_line_is_json_the_evaluator_reads(tmp_path):
     """The wrapper's printf must produce a line _read_jsonl accepts."""
     m =load606_job.render(users=1, shards=1, think_s=1, duration_s=1,
                            snowplow_url="http://s", authn_url="http://a", password="pw",
-                           init=INIT, src="#")
+                           debug_user="d", init=INIT, src="#")
     script = list(yaml.safe_load_all(m))[2]["spec"]["template"]["spec"]["containers"][0]["args"][0]
     line = next(l for l in script.splitlines() if "drive_exit" in l)
     out = tmp_path / "nav.jsonl"

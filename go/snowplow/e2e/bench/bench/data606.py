@@ -33,7 +33,7 @@ import functools
 import json
 import time
 
-from bench import cluster, lifecycle, rbac_model
+from bench import cluster, data_manifests, lifecycle, rbac_model
 from bench.load606 import list_dep_fixture_yaml, list_dep_status_fixture_yaml
 
 __all__ = ["hold_composition_controller", "assert_no_external_children",
@@ -193,3 +193,20 @@ def add_parsers(sub) -> None:
         return 0
 
     q.set_defaults(func=_one)
+
+    r = sub.add_parser("data606-debug-reader", help="#606: register the ONE identity the bench reads "
+                                                    "snowplow's /debug with, and its ClusterRole (bench/"
+                                                    "rbac_model.py THE DEBUG READER), no login")
+
+    def _debug(a):
+        import json as _json
+        from bench.cli import _gke_context_guard
+        _gke_context_guard()
+        docs = [rbac_model.debug_reader_rbac_yaml()] + [
+            _json.dumps(d) + "\n" for d in data_manifests.debug_reader_docs(lifecycle._scaleuser_password())]
+        ok, err = lifecycle.apply_with_retry("---\n".join(docs), "the debug reader", timeout_secs=60)
+        if not ok:
+            raise RuntimeError(f"the debug reader was not registered: {err[:300]}")
+        return 0
+
+    r.set_defaults(func=_debug)

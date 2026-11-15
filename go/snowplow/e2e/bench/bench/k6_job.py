@@ -222,11 +222,12 @@ def k6_config(*, snowplow_url: str, init: str, frontend_ns: str, builders_ns: st
 def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
                    page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
-                   frontend_url: str, snowplow_url: str,
+                   frontend_url: str, snowplow_url: str, authn_url: str, debug_user: str,
                    fresh: dict | None = None) -> dict:
     """`fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
     in order; `frontend_url`: the portal's origin; `snowplow_url`: snowplow as the browser reaches it (config
-    SNOWPLOW_API_BASE_URL), where a session reads the learned-class counters."""
+    SNOWPLOW_API_BASE_URL), where a session reads the learned-class counters, as `debug_user` (bench/rbac_model.py
+    THE DEBUG READER, logged in at `authn_url`), never as the session's own user."""
     by_session = {x["session"]: [f["user"] for f in x["fresh"]] for x in (fresh or {}).get("sessions", [])}
     return {"sessions": [dict({k: s[k] for k in ("name", "user", "offset")}, fresh=by_session.get(s["name"], []))
                          for s in sessions],
@@ -234,6 +235,7 @@ def browser_config(*, sessions: list[dict], routes: list[str], password: str,
             "durationS": int(duration_s), "quietMs": quiet_ms,
             "pageTimeoutMs": page_timeout_ms, "signinTimeoutMs": signin_timeout_ms,
             "frontendUrl": frontend_url, "snowplowUrl": snowplow_url,
+            "authnUrl": authn_url.rstrip("/"), "debugUser": debug_user,
             "firstVisit": first_visit_label(sessions)}
 
 

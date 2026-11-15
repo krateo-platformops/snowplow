@@ -1607,7 +1607,8 @@ def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_trie
     cfg = k6_job.browser_config(sessions=[dict(s, cold=True) for s in sessions],
                                 routes=["/dashboard", "/compositions"], password="x",
                                 think_s=0.3, duration_s=6, page_timeout_ms=5000,
-                                frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080")
+                                frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080",
+                                authn_url=f"http://{spa}:8080", debug_user="fixture-debug")
     cfg.update(loginTries=login_tries, loginRetryMs=2000, signinTimeoutMs=10000)
     (k6dir / "browser-config.json").write_text(json.dumps(cfg))
     yaml_text = k6_job.render_browser(config=cfg, linger_s=0, origin_wait_s=origin_wait_s)

@@ -126,6 +126,17 @@ def synthetic_user_docs(i, groups, password):
                             groups=list(groups), avatar=authn_user.avatar_url(i), labels=labels)]
 
 
+def debug_reader_docs(password):
+    """The debug reader's password Secret and authn User (bench/rbac_model.py THE DEBUG READER): in
+    the debug group ALONE, so it reads the portal and the bench namespaces as nobody, and /debug as its
+    ClusterRole allows."""
+    labels = {"app": "scaletest"}
+    name = rbac_model.DEBUG_READER
+    return [authn_user.password_secret(name, AUTHN_NS, password, labels),
+            authn_user.user(name, AUTHN_NS, display_name="Bench debug reader", groups=[rbac_model.DEBUG_GROUP],
+                            avatar=authn_user.avatar_url(0), labels=labels)]
+
+
 def documents(*, namespaces: int = 50, users: int = 1000,
               fresh_modes: tuple = ("annotation",)) -> list[tuple[str, dict]]:
     """Every object of a NON-built-in kind the data step applies (data606's
@@ -150,6 +161,8 @@ def documents(*, namespaces: int = 50, users: int = 1000,
     model = rbac_model.bench_model(users, namespaces)
     for d in synthetic_user_docs(0, ["devs", rbac_model.team_group(1)], SCALEUSER_PASSWORD):
         out.append(("the preflight identity", d))
+    for d in debug_reader_docs(SCALEUSER_PASSWORD):
+        out.append(("the debug reader", d))
     for i in range(1, users + 1):
         for d in synthetic_user_docs(i, rbac_model.user_groups(i, m=model), SCALEUSER_PASSWORD):
             out.append(("the data step's users", d))

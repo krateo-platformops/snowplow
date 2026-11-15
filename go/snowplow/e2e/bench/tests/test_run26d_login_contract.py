@@ -355,7 +355,7 @@ def _browser(tmp_path, *, dom, signin_ms=300, sessions=2, duration_s=12, k6dir=N
         sessions=[{"name": f"s{i}", "user": f"fixture-{i}", "offset": i, "cold": True} for i in range(1, sessions + 1)],
         routes=["/dashboard", "/compositions"], password="x", think_s=0.3, duration_s=duration_s,
         page_timeout_ms=3000, signin_timeout_ms=2000, frontend_url=f"http://{spa}:8080",
-        snowplow_url=f"http://{spa}:8080")
+        snowplow_url=f"http://{spa}:8080", authn_url=f"http://{spa}:8080", debug_user="fixture-debug")
     cfg.update(loginTries=1)
     (tmp_path / "cfg.json").write_text(json.dumps(cfg))
     subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)

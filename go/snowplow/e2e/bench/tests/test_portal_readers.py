@@ -422,7 +422,7 @@ def test_the_rehearsal_checks_the_image_and_runs_the_preflight_and_reports_both(
     # the go runtime read comes first, then the image, then the preflight; and still no load
     assert log.index("snowplow env verified from the running process") < log.index("image digest MATCH") < log.index("portal boot root")
     assert "=== step data ===" not in log and "=== step measure ===" not in log
-    assert (state / "users").read_text().split() == ["scaleuser-0000"]
+    assert (state / "users").read_text().split() == ["scaleuser-debug-reader", "scaleuser-0000"]
 
 
 @needs_helm

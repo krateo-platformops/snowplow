@@ -1085,18 +1085,18 @@ s_portal_routes() {
     return 1
   fi
 }
-# go_runtime_reading: the GC settings the snowplow PROCESS runs with, before any load: the bench's own
-# preflight user logs in from a short Job on the loadgen node (runtime606, like the preflight Job) and
+# go_runtime_reading: the GC settings the snowplow PROCESS runs with, before any load: the bench's debug
+# reader (debug_reader) logs in from a short Job on the loadgen node (runtime606, like the preflight Job) and
 # reads /debug/vars' snowplow_go_runtime (its effective GOGC, its memory limit and where that came
 # from, the container's cgroup limit) -> $OUT/go-runtime.jsonl. The pod's env is not that: chart
 # 1.12.70 sets no GOMEMLIMIT and the process derives one from its cgroup. No credential from outside
-# the cluster: the user is the bench's synthetic one (data606-preflight-user), with the bench's fixed
+# the cluster: the user is the bench's synthetic one (data606-debug-reader), with the bench's fixed
 # test password, which is redacted from the manifest once applied and from every log line. A reading
 # that fails leaves a file that says so, or none: the gate then fails the arm.
 go_runtime_reading() {
   local out="$OUT/go-runtime.jsonl" job=runtime606 deadline ok="" failed=""
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the preflight user reads /debug/vars snowplow_go_runtime) -> $out"
+    log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the debug reader reads /debug/vars snowplow_go_runtime) -> $out"
     return 0
   fi
   python3 -m bench.load606_job --go-runtime-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
@@ -1165,8 +1165,8 @@ snowplow_env_gate() {
 # said: the report shows them all, and the rehearsal fails when any of them did.
 s_rehearsal() {
   local gate=0
-  # the user the runtime reading logs in as: the bench's own preflight user, as the preflight step makes it
-  preflight_user || return 1
+  # the identity the runtime reading logs in as: the bench's debug reader, as the preflight step makes it
+  debug_reader || return 1
   tracing_reading before
   snowplow_env_gate || gate=$?
   digest_gate snowplow "$SNOWPLOW_POD_SELECTOR" "$EXPECTED_IMAGE_DIGEST" image_digest "$OUT/image-digest.jsonl" \
@@ -1646,13 +1646,24 @@ s_psi() {
   fi
   log "psi: readable on the loadgen node (${why})"
 }
-# preflight_user: the bench's own preflight user, made once a run (the rehearsal's runtime reading
-# logs in as it before the preflight step does)
+# preflight_user: the bench's own preflight user, made once a run (the rehearsal's preflight runs in
+# its own step)
 PREFLIGHT_USER_MADE=""
 preflight_user() {
   [[ -z "$PREFLIGHT_USER_MADE" ]] || return 0
   run python3 -m bench data606-preflight-user >&2 || return 1
   PREFLIGHT_USER_MADE=1
+}
+# debug_reader (snowplow #1365: /debug is authorized by RBAC as a non-resource request, in every image
+# after 1.12.70): the ONE identity every /debug read of the run is done as (the Go runtime read, mem606,
+# the driver's sampler, the browser's learned-class counters, the full-widen watch), with its
+# ClusterRole (get on exactly the bench's /debug paths) bound to its own group: bench/rbac_model.py THE
+# DEBUG READER. No measured user holds a /debug grant. Made once a run, before the first /debug read.
+DEBUG_READER_MADE=""
+debug_reader() {
+  [[ -z "$DEBUG_READER_MADE" ]] || return 0
+  run python3 -m bench data606-debug-reader >&2 || return 1
+  DEBUG_READER_MADE=1
 }
 s_preflight() {
   # SECONDS-scale, right after env and BEFORE stamping or any login burst
@@ -1671,6 +1682,7 @@ s_preflight() {
   source "$OUT/portal.env"
   log "portal boot root (config.json INIT): $PORTAL_INIT"
   preflight_user
+  debug_reader
   python3 -m bench.load606_job --preflight-only --snowplow-url "$SNOWPLOW_URL" \
       --authn-url "$AUTHN_URL" --password "$PW" --init "$PORTAL_INIT" \
       --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \

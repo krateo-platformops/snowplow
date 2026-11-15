@@ -568,7 +568,7 @@ def rehearsal_lines(out_dir: str) -> list[str]:
     g, why = reading_of(os.path.join(out_dir, "tracing.json"))
     eff, eff_why = effective_of(os.path.join(out_dir, "go-runtime.jsonl"))
     lines.append("the snowplow process's effective GC settings, read before any load (/debug/vars "
-                 "snowplow_go_runtime, as the bench's preflight user): "
+                 "snowplow_go_runtime, as the bench's debug reader): "
                  + (f"{effective_text(eff)}; raw: {json.dumps(eff, sort_keys=True)}" if eff is not None
                     else f"NOT READ ({eff_why})"))
     lines.append("the pod's Go runtime env, read before any load: "

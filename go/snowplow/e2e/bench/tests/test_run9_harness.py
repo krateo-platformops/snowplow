@@ -313,7 +313,7 @@ def test_probe_without_refresh_headers_records_that_nothing_was_armed():
 
 def test_job_renders_viewers_on_by_default_and_off_on_request():
     kw = dict(users=4, shards=1, think_s=1, duration_s=1, snowplow_url="http://s",
-              authn_url="http://a", password="pw", init=INIT, src="#")
+              authn_url="http://a", password="pw", debug_user="d", init=INIT, src="#")
     assert "--no-viewers" not in load606_job.render(**kw)
     assert "--no-viewers" in load606_job.render(viewers=False, **kw)
     fk = dict(snowplow_url="http://s", authn_url="http://a", user="u", password="pw",

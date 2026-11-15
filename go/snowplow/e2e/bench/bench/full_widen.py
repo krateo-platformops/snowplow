@@ -264,12 +264,13 @@ def identity_docs(user: str, password: str) -> list[dict]:
 
 
 def job_yaml(*, snowplow_url: str, authn_url: str, user: str, password: str, bounds: dict,
-             linger_s: float, widen_wait_s: float, sample_s: float = SAMPLE_S) -> str:
+             linger_s: float, widen_wait_s: float, sample_s: float = SAMPLE_S, debug_user: str | None = None) -> str:
     """The fullwiden606 Job and its ConfigMap (this file, load606.py and
     store_rebuild.py under bench/, so `python3 -m bench.full_widen` imports
     them as on the host). Framed like mem606: the wrapper appends its exit
     record, writes /out/exited and lingers until the collect copies /out."""
     from pathlib import Path
+    from bench import rbac_model
     from bench.load606_job import IMAGE, _indent
     here = Path(__file__).parent
     files = {"full_widen.py": Path(__file__), "load606.py": here / "load606.py",
@@ -281,7 +282,8 @@ rc=0
 cd {SRC_DIR}
 python3 -u -m bench.full_widen watch \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
-  --user {json.dumps(user)} --password {json.dumps(password)} \\
+  --user {json.dumps(user)} --debug-user {json.dumps(debug_user or rbac_model.DEBUG_READER)} \\
+  --password {json.dumps(password)} \\
   --bounds {json.dumps(json.dumps(bounds, sort_keys=True))} --sample-s {sample_s:g} \\
   --widen-wait-s {widen_wait_s:g} || rc=$?
 printf '{{"kind": "exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {STREAM}
@@ -639,25 +641,36 @@ class Watch:
     "build_and_swap": {"s", "source"}}; `widen_wait_s`: how long armed may wait
     for the operator's widen."""
 
-    def __init__(self, *, get: Callable, login: Callable, emit: Callable, arm: Callable, widened: Callable,
-                 bounds: dict, widen_wait_s: float, sample_s: float = SAMPLE_S, clock: Callable = time.time,
-                 sleep: Callable = time.sleep, mechanism: Callable | None = None):
-        self.get, self.login, self.emit, self.arm, self.widened = get, login, emit, arm, widened
+    def __init__(self, *, get: Callable, login: Callable, debug_login: Callable, emit: Callable, arm: Callable,
+                 widened: Callable, bounds: dict, widen_wait_s: float, sample_s: float = SAMPLE_S,
+                 clock: Callable = time.time, sleep: Callable = time.sleep, mechanism: Callable | None = None):
+        # `login`: the stage's own identity, for the probe read; `debug_login`: the bench's debug reader
+        # (bench/rbac_model.py THE DEBUG READER), for /debug/vars alone (snowplow #1365)
+        self.get, self.login, self.debug_login, self.emit = get, login, debug_login, emit
+        self.arm, self.widened = arm, widened
         self.bounds, self.widen_wait_s, self.sample_s = bounds, widen_wait_s, sample_s
         self.clock, self.sleep, self.mechanism = clock, sleep, mechanism
-        self.token, self.seq, self.prev_gc = None, 0, None
+        self.token, self.debug_token, self.seq, self.prev_gc = None, None, 0, None
+
+    def _token(self, which: str):
+        """The probe read's token ("read") or the debug reader's ("debug"), logged in when there is none;
+        None (a login_failed record) when the login fails."""
+        attr, fn = ("token", self.login) if which == "read" else ("debug_token", self.debug_login)
+        if getattr(self, attr) is None:
+            try:
+                setattr(self, attr, fn())
+            except Exception as e:      # noqa: BLE001 — a failed login is a sample, retried
+                self.emit({"kind": "login_failed", "t": self.clock(), "error": type(e).__name__,
+                           "identity": which})
+        return getattr(self, attr)
 
     def _vars(self) -> dict | None:
         for _ in range(2):
-            if self.token is None:
-                try:
-                    self.token = self.login()
-                except Exception as e:      # noqa: BLE001 — a failed login is a sample, retried
-                    self.emit({"kind": "login_failed", "t": self.clock(), "error": type(e).__name__})
-                    return None
-            st, body = self.get("/debug/vars", self.token)
+            if self._token("debug") is None:
+                return None
+            st, body = self.get("/debug/vars", self.debug_token)
             if st == 401:
-                self.token = None
+                self.debug_token = None
                 continue
             if st != 200:
                 return None
@@ -671,7 +684,7 @@ class Watch:
         """One read with a /debug/vars read either side: the sample record."""
         before = self._vars()
         self.seq += 1
-        st, _ = self.get(read_path(self.seq), self.token) if self.token else (0, b"")
+        st, _ = self.get(read_path(self.seq), self.token) if self._token("read") else (0, b"")
         after = self._vars()
         if before is None or after is None:
             self.emit({"kind": "sample_failed", "t": self.clock(), "phase": phase, "read": st})
@@ -761,7 +774,8 @@ def _cmd_watch(a) -> int:
     def arm():
         with open(ARMED, "w") as f:
             f.write(str(time.time()))
-    return Watch(get=get, login=lambda: load606.login(a.authn_url, a.user, a.password), emit=emit, arm=arm,
+    return Watch(get=get, login=lambda: load606.login(a.authn_url, a.user, a.password),
+                 debug_login=lambda: load606.login(a.authn_url, a.debug_user, a.password), emit=emit, arm=arm,
                  widened=lambda: os.path.exists(WIDENED), bounds=json.loads(a.bounds),
                  widen_wait_s=a.widen_wait_s, sample_s=a.sample_s).run()
 
@@ -1013,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
     for f in ("--stream", "--plan", "--pods-before", "--pods-after", "--out", "--crds-before", "--crds-after"):
         ev.add_argument(f, required=True)
     w = sub.add_parser("watch", help="in-cluster: the register, armed and settle phases")
-    for f in ("--snowplow-url", "--authn-url", "--user", "--password", "--bounds"):
+    for f in ("--snowplow-url", "--authn-url", "--user", "--debug-user", "--password", "--bounds"):
         w.add_argument(f, required=True)
     w.add_argument("--sample-s", type=float, default=SAMPLE_S)
     w.add_argument("--widen-wait-s", type=float, required=True)

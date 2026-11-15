@@ -5200,12 +5200,22 @@ def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
           "curve": curve})
     if failed:
         return 2, f"only {len(tokens)}/{len(users)} users logged in; refusing a partial population"
-    probe_user = users[0]
+    # snowplow #1365: /debug is authorized by RBAC as a non-resource request. The sampler reads as the
+    # bench's debug reader (bench/rbac_model.py THE DEBUG READER), never as a measured user: no measured
+    # user holds a /debug grant, so the measurement keeps the customer's RBAC shape
+    debug_token = None
+    if a.vars_interval > 0:
+        if not a.debug_user:
+            return 2, "the /debug/vars sampler (--vars-interval > 0) needs the debug reader (--debug-user)"
+        try:
+            debug_token = login(a.authn_url, a.debug_user, a.password)
+        except Exception as e:  # noqa: BLE001
+            return 2, f"the debug reader's login failed: {type(e).__name__}"
     stop = threading.Event()
 
     def _sampler():
         while not stop.is_set():
-            v = read_vars(client, tokens[probe_user])
+            v = read_vars(client, debug_token)
             sink({"kind": "vars", "t": time.time(),
                   **(summarize_vars(v) if v else {"unreadable": True})})
             stop.wait(a.vars_interval)
@@ -6251,6 +6261,9 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--nav-workers", type=int, default=128)
     d.add_argument("--call-workers", type=int, default=512)
     d.add_argument("--vars-interval", type=float, default=15.0)
+    d.add_argument("--debug-user", default=None,
+                   help="the identity the /debug/vars sampler reads as (bench/rbac_model.py DEBUG_READER); "
+                        "required when --vars-interval > 0")
     d.add_argument("--no-viewers", action="store_true",
                    help="do NOT open /refreshes viewers (#764: then #710/#740 cannot run)")
     d.add_argument("--out", required=True)

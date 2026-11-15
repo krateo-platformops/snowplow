@@ -542,7 +542,7 @@ def test_loadgen_job_renders_pinned_to_loadgen_pool_with_source():
     src = load606_job.LOAD606_SRC.read_text()
     m = load606_job.render(users=1000, shards=2, think_s=60, duration_s=1800,
                            snowplow_url="http://s:8081", authn_url="http://a:8082",
-                           password="pw",
+                           password="pw", debug_user="scaleuser-debug-reader",
                            init="/call?resource=layouts&name=app-shell&x=1")
     ns, cm, job = list(yaml.safe_load_all(m))
     assert cm["data"]["load606.py"].rstrip("\n") == src.rstrip("\n")

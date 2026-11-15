@@ -310,9 +310,17 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+                        # the Job as applied (the runtime606 fake reads which user its command logs in as)
+                        open(os.path.join(STATE, "job-" + (d.get("metadata") or {}).get("name", "")), "w").write(
+                            json.dumps(d))
                     if d.get("kind") == "User":       # authn's users: only one that exists can log in
                         with open(os.path.join(STATE, "users"), "a") as uf:
                             uf.write((d.get("metadata") or {}).get("name", "") + "\\n")
+                    # who may read /debug; FAKE_DROP_KIND: the API server keeps no object of that kind
+                    if d.get("kind") in ("User", "ClusterRole", "ClusterRoleBinding") and \\
+                            d.get("kind") != os.environ.get("FAKE_DROP_KIND"):
+                        with open(os.path.join(STATE, "rbac.jsonl"), "a") as rf:
+                            rf.write(json.dumps(d) + "\\n")
         # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
         if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
             sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
@@ -326,14 +334,44 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # of fields the process has instead; FAKE_GO_RUNTIME_FAIL: login | vars401 | nokey | pending
     if "runtime606" in a or "job/runtime606" in a:
         fail = os.environ.get("FAKE_GO_RUNTIME_FAIL", "")
-        # authn answers a login only for a user that exists: the Job logs in as the bench's preflight user
-        # (scaleuser-0000), which the run must have created first
+        # authn answers a login only for a user that exists: the Job logs in as the user its command names,
+        # which the run must have created first
+        import re
+        jf = os.path.join(STATE, "job-runtime606")
+        cmd = ""
+        if os.path.exists(jf):
+            cmd = " ".join(json.load(open(jf))["spec"]["template"]["spec"]["containers"][0].get("args") or [])
+        m = re.search(r'--user "([^"]+)"', cmd)
+        who = m.group(1) if m else ""
         uf = os.path.join(STATE, "users")
-        if "scaleuser-0000" not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
+        if who not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
             fail = "login"
+        # snowplow #1365 (every image after 1.12.70): /debug/vars is a NON-RESOURCE request, allowed only
+        # by a ClusterRoleBinding of the user (or one of its groups) to a ClusterRole whose rule has
+        # nonResourceURLs matching the path and verb get, as upstream RuleAllows decides (exact, "*", or a
+        # trailing-"*" prefix); a resource rule never opens it. FAKE_SNOWPLOW_DEBUG_AUTHZ=jwt: 1.12.70, where
+        # any valid JWT reads /debug
+        if not fail and os.environ.get("FAKE_SNOWPLOW_DEBUG_AUTHZ", "rbac") == "rbac":
+            rf = os.path.join(STATE, "rbac.jsonl")
+            docs = [json.loads(x) for x in open(rf).read().splitlines()] if os.path.exists(rf) else []
+            groups = {g for d in docs if d.get("kind") == "User" and d["metadata"]["name"] == who
+                      for g in (d.get("spec") or {}).get("groups") or []}
+            roles = {d["metadata"]["name"]: d.get("rules") or [] for d in docs if d.get("kind") == "ClusterRole"}
+
+            def url_ok(u):
+                return u == "*" or u == "/debug/vars" or (u.endswith("*") and "/debug/vars".startswith(u[:-1]))
+            allowed = any(
+                any(s.get("kind") == "User" and s.get("name") == who or s.get("kind") == "Group" and s.get("name") in groups
+                    for s in d.get("subjects") or [])
+                and any(any(url_ok(u) for u in r.get("nonResourceURLs") or [])
+                        and any(v in ("get", "*") for v in r.get("verbs") or [])
+                        for r in roles.get((d.get("roleRef") or {}).get("name"), []))
+                for d in docs if d.get("kind") == "ClusterRoleBinding")
+            if not allowed:
+                fail = "vars403"
         if "get" in a:
             done = fail != "pending"
-            bad = fail in ("login", "vars401", "nokey")
+            bad = fail in ("login", "vars401", "vars403", "nokey")
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("1" if done and not bad else "")
             elif any(x.endswith("{.status.failed}") for x in a):
@@ -347,6 +385,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                    "memory_limit_source": "cgroup_v2", "cgroup_memory_limit_bytes": 8589934592}
             eff.update(json.loads(os.environ.get("FAKE_GO_RUNTIME") or "{}"))
             why = {"login": "the login failed (HTTPError)", "vars401": "/debug/vars answered 401",
+                   "vars403": "/debug/vars answered 403",
                    "nokey": "/debug/vars holds no snowplow_go_runtime: this snowplow image does not publish "
                             "the settings its Go runtime runs with"}.get(fail)
             if fail != "pending":
