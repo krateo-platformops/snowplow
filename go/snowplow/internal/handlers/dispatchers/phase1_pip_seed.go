@@ -969,7 +969,7 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
 		// is visible in logs while errors.As/Is still thread through to the
 		// embedded StatusError.
-		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
+		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
 	}
 	if got.Unstructured == nil {
 		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
