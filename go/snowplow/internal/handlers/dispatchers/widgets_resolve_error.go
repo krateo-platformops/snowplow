@@ -12,13 +12,13 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
-	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// reasonFailedDependency is the Status reason of a 424 answer: the read's own
-// (objects.ReasonFailedDependency), so there is one definition.
-const reasonFailedDependency = objects.ReasonFailedDependency
+// reasonFailedDependency is the Status reason of a 424 answer
+// (statusdetails.ReasonFailedDependency, the one definition).
+const reasonFailedDependency = statusdetails.ReasonFailedDependency
 
 // encodeWidgetResolveError answers a widget /call whose CR was read but whose
 // resolve failed — the apiRef RESTAction, one of its stages, a nested resolve,
@@ -50,6 +50,18 @@ const reasonFailedDependency = objects.ReasonFailedDependency
 // One rule for every widget kind and every dependency; it changes the answer
 // only. Nothing on this path is cached: the handler returns before any Put.
 func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err error) {
+	// #1414, #1429 — a dependency whose TYPE is not installed is already the
+	// answer this function gives for a dependency that is not there: 424, the
+	// reason, the message naming the DEPENDENCY's type, and that type in the
+	// details. It is recognised by the Go type objects.Get alone creates, never
+	// by a status's code, text or details: a status that only looks like it
+	// (client-go builds one from whatever an upstream's body says) is passed
+	// through below like any other, with no reason and no details.
+	var notInstalled *statusdetails.TypeNotInstalledError
+	if errors.As(err, &notInstalled) {
+		response.Encode(wri, notInstalled.Status())
+		return
+	}
 	var statusErr *apierrors.StatusError
 	if !errors.As(err, &statusErr) {
 		response.InternalError(wri, err)
@@ -64,16 +76,7 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 		response.Encode(wri, st)
 		return
 	}
-	st := response.New(code, fmt.Errorf("%s", statusErr.Status().Message))
-	if code == http.StatusFailedDependency {
-		// #1414 — a dependency whose TYPE is not installed (objects.Get's 424)
-		// is already the answer this function gives for a dependency that is
-		// not there. It keeps its status, its reason and its message, which
-		// names the type and nothing else.
-		st.Status = response.StatusFailure
-		st.Reason = reasonFailedDependency
-	}
-	response.Encode(wri, st)
+	response.Encode(wri, response.New(code, fmt.Errorf("%s", statusErr.Status().Message)))
 }
 
 // dependencyFailureFallback is the 424 message when the dependency's own

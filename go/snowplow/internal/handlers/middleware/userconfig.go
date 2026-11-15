@@ -171,7 +171,14 @@ import (
 // trip, was a 401 and is now a 503 that the next refetch resolves. The window
 // is one JWKS round trip, and the change only turns a wrong permanent refusal
 // into a retry. No code here changes.
-const PinnedPlumbingVersion = "v1.74.0"
+//
+// v1.74.0 → v1.75.0 (plumbing#173, the release's one commit): re-audited by
+// `git diff` of the two tags. server/, jwtutil/, endpoints/ and kubeconfig/
+// are byte-identical, so this file's upstream line numbers stand. The release
+// adds response.Status.Details (omitted from a body when nil; no constructor
+// sets it, so every body this file writes through plumbing's response is the
+// same bytes) and makes http/request.Do drop an upstream's "details".
+const PinnedPlumbingVersion = "v1.75.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,

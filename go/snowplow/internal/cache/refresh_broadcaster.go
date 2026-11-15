@@ -1393,6 +1393,10 @@ type RefreshBroadcasterStats struct {
 	ArmCatchUp            uint64  `stat:"arm_catch_up" desc:"Refresh frames sent at once on arm because the tab was behind: its held digest is not the digest of what its /call would answer now, or the cell is gone (#1324)."`
 	ArmDuplicateAbsorbed  uint64  `stat:"arm_duplicate_absorbed" desc:"Arm-time refresh offers (owed-push emit, store-swap ledger arm, catch-up) absorbed because the same arm had already offered that key: one arm writes at most one frame per key (#1325 m1)."`
 	GatedViewMoved        uint64  `stat:"gated_view_moved" desc:"Refresh frames for an RBAC change that moved what a tab is served from a gated (identity-free, serve-time-gated) key while its stored bytes did not: no write announces it (#1328)."`
+	GatedViewGateRuns     uint64  `stat:"gated_view_gate_runs" desc:"Serve-time gate runs asked for by a /refreshes connection to digest what its tab is served from a gated key (arm, catch-up check, frame written, class move) (#1430)."`
+	GatedViewReused       uint64  `stat:"gated_view_reused" desc:"Served digests of a gated key answered from the digest already computed for the same answer, identity and RBAC snapshot, with no gate run (#1430)."`
+	GatedViewCallFills    uint64  `stat:"gated_view_call_fills" desc:"Served digests stored by a /call hit on a gated key: the digest of the bytes it wrote (#1430)."`
+	GatedViewRBACMoved    uint64  `stat:"gated_view_snapshot_moved" desc:"Stored served digests discarded because the RBAC snapshot they were gated under is no longer the published one (#1430)."`
 	StreamSecondsTotal    float64 `stat:"stream_seconds_total" desc:"Accumulated /refreshes stream lifetime in seconds (divide by streams_closed_total for the mean)."`
 	StreamsClosedTotal    uint64  `stat:"streams_closed_total" desc:"/refreshes streams that ended."`
 }
@@ -1431,6 +1435,10 @@ func RefreshBroadcasterStatsSnapshot() RefreshBroadcasterStats {
 		ArmCatchUp:            refreshArmCatchUpTotal.Load(),
 		ArmDuplicateAbsorbed:  refreshArmDuplicateAbsorbedTotal.Load(),
 		GatedViewMoved:        refreshGatedViewMovedTotal.Load(),
+		GatedViewGateRuns:     servedViewGateRunsTotal.Load(),
+		GatedViewReused:       servedViewReusedTotal.Load(),
+		GatedViewCallFills:    servedViewCallFillsTotal.Load(),
+		GatedViewRBACMoved:    servedViewSnapshotMovedTotal.Load(),
 		StreamSecondsTotal:    float64(refreshStreamNanosTotal.Load()) / float64(time.Second),
 		StreamsClosedTotal:    refreshStreamsClosedTotal.Load(),
 	}
@@ -1548,6 +1556,10 @@ func resetRefreshBroadcasterForTest() {
 	refreshArmCatchUpTotal.Store(0)
 	refreshArmDuplicateAbsorbedTotal.Store(0)
 	refreshGatedViewMovedTotal.Store(0)
+	servedViewGateRunsTotal.Store(0)
+	servedViewReusedTotal.Store(0)
+	servedViewCallFillsTotal.Store(0)
+	servedViewSnapshotMovedTotal.Store(0)
 	refreshArmHeldTotal.Store(0)
 	refreshEvictDeferredTotal.Store(0)
 	refreshStreamNanosTotal.Store(0)

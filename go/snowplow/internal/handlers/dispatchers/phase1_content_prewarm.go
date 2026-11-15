@@ -397,7 +397,7 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	got := objects.Get(rctx, ref)
 	if got.Err != nil {
 		// #630 — keep the apiserver status typed; the text is unchanged.
-		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
+		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
 	}
 	if got.Unstructured == nil {
 		return 0, fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)

@@ -32,17 +32,23 @@
 // The FIRST false→true transition of the index's built flag
 // (BuildBindingsByGVRIndex, under the index's write lock) reads-and-clears that
 // note and, if it was set, bumps ONE process-wide epoch that
-// RBACSubGenForSubject adds to every identity's sum. Later rebuilds never bump:
-// built never returns to false in production, so the note can only be taken
-// before the first build.
+// RBACSubGenForSubject folds into every identity's sub-generation. Later
+// rebuilds never bump: built never returns to false in production, so the note
+// can only be taken before the first build.
 //
-// WHY A GLOBAL TERM IN THE SUM IS SOUND. RBACSubGenForSubject is a sum of
-// counters that are each monotone non-decreasing (per-subject counters only ever
-// Add(1); the epoch only ever Add(1)). Any change to any term therefore
-// strictly increases the sum: a later state can never produce an earlier sum,
-// so a rotated key can never collide with a key minted before the rotation. The
-// epoch is part of the existing RBACSubGen key dimension — not a new identity
-// input — and identity-free classes (which do not fold RBACSubGen) do not rotate.
+// WHY A GLOBAL TERM IS SOUND. An identity's sub-generation is the LATEST state
+// of the RBAC state clock over its subject counters and this epoch
+// (rbac_subgen.go, #1439). The epoch bump takes the clock's next state, which is
+// above every value any counter holds, so every identity's sub-generation moves
+// to it and no key minted before the bump can be derived after it. Every later
+// per-subject bump takes a later state still. The epoch is part of the existing
+// RBACSubGen key dimension — not a new identity input — and identity-free
+// classes (which do not fold RBACSubGen) do not rotate.
+//
+// (Until #1439 this paragraph argued from a SUM of counters that only ever
+// Add(1): "a later state can never produce an earlier sum". That holds for ONE
+// identity over time and is false ACROSS identities — another identity, with
+// the same binding set and a different history, reaches that earlier sum later.)
 //
 // COST. At most ONE global rotation per process, and only when an RBAC edit
 // really landed between the first publish and the first index build. The
@@ -77,8 +83,15 @@ import (
 )
 
 var (
-	// rbacSubGenEpoch is the process-wide term of every identity's RBACSubGen.
+	// rbacSubGenEpoch COUNTS the boot-window rotations: 0, or 1 once the first
+	// index build found an RBAC event noted before it. It is what
+	// RBACSubGenEpoch, the snowplow_rbac_subgen_epoch expvar and its OTLP mirror
+	// report, unchanged by #1439. It is NOT folded into any key.
 	rbacSubGenEpoch atomic.Uint64
+	// rbacSubGenEpochState is the process-wide term of every identity's
+	// RBACSubGen: the RBAC state clock's value at that rotation (0 before it).
+	// Folded by RBACSubGenForSubject; not published.
+	rbacSubGenEpochState atomic.Uint64
 	// rbacEventSeenPreBuild is set by deltaActive when an RBAC event arrived
 	// after the first publish while the delta index was not built.
 	rbacEventSeenPreBuild atomic.Bool
@@ -171,6 +184,10 @@ func rotateIfRBACEventSeenPreBuild() bool {
 	if !rbacEventSeenPreBuild.Swap(false) {
 		return false
 	}
+	// #1439 — the rotation is one state of the RBAC state clock, the same clock
+	// the per-subject bumps take theirs from, so it is above every sub-generation
+	// minted before it and below every one minted by a later bump.
+	raiseSubGenTo(&rbacSubGenEpochState, nextRBACState())
 	rbacSubGenEpoch.Add(1)
 	noteIdentityClassesMayHaveMoved() // #819: tell armed tabs their keys rotated
 	return true
@@ -270,13 +287,16 @@ func ReadySettleStatsSnapshot() ReadySettleStats {
 	}
 }
 
-// RBACSubGenEpoch returns the current epoch.
+// RBACSubGenEpoch returns how many boot-window rotations this process made: 0
+// or 1 (the value snowplow_rbac_subgen_epoch publishes). The term the keys fold
+// is rbacSubGenEpochState.
 func RBACSubGenEpoch() uint64 { return rbacSubGenEpoch.Load() }
 
 // resetRBACSubGenEpochForTest zeroes the epoch and the note (composed into
 // ResetRBACSubGenForTest).
 func resetRBACSubGenEpochForTest() {
 	rbacSubGenEpoch.Store(0)
+	rbacSubGenEpochState.Store(0)
 	rbacEventSeenPreBuild.Store(false)
 }
 

@@ -3,8 +3,9 @@
 //
 // THE DEFECT (#423): the restactions / widgets / raFullList cells were keyed by
 // the FIRST binding granting `get` on the dispatched CR (BindingUID) plus the
-// RBACSubGen sum. Two users co-bound by that one binding derived the same key
-// even when one of them held an EXTRA binding that changed what the
+// RBACSubGen (then a sum of counters). Two users co-bound by that one binding
+// derived the same key even when one of them held an EXTRA binding that
+// changed what the
 // RESTAction's own steps could read — and the hit path serves entry.RawJSON
 // verbatim. A co-bound user lacking the per-step grant was served the other
 // user's resolved data (TestFalsifier_L1PerStepRBAC_CrossUser).
@@ -21,16 +22,27 @@
 //
 // ROLE CONTENTS ARE NOT FOLDED. A role edit changes the permissions of every
 // holder of the referencing bindings identically, so it cannot make two
-// same-set requesters diverge; it is a staleness event, not an isolation
-// event, and it is already handled by the per-subject RBACSubGen the key also
-// folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of every
-// referencing binding). TestSubjectBindingSet_RoleEditRotatesKey proves the
-// rotation end to end.
+// same-set requesters diverge AT ONE INSTANT. It does make the same set mean
+// different verdicts BEFORE and AFTER the edit, so the digest alone names a
+// binding set, not an RBAC state: the state is named by the RBACSubGen the key
+// also folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of
+// every referencing binding), which since #1439 is the number of the last RBAC
+// state change that touched the requester (cache.RBACSubGenForSubject). A cell
+// minted by one same-set requester before the edit is therefore never the cell
+// another derives after it — where the edit bumps a subject the requester's
+// sub-generation folds. Since #1443 the fold reads every subject the evaluator
+// matches the requester by, so the one case where it does not is, until #1458
+// lands, a binding that a rebuild of the role index dropped (it read a
+// snapshot older than the binding's already-applied event): there the
+// requester's key does not rotate at all.
+// TestSubjectBindingSet_RoleEditRotatesKey proves the rotation end to end;
+// TestIssue1439_ClassValueNamesOneRBACState the before/after separation across
+// two requesters.
 //
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the
 // evaluator's own unexported functions — selectCRBCandidates /
 // selectRBCandidatesAllNS (index pre-filters) gated by anySubjectMatches (the
-// correctness barrier), with effectiveGroups' ServiceAccount synthetic groups —
+// correctness barrier), with the shared matcher's ServiceAccount groups —
 // exactly as BuildRequesterProfile does. The one deliberate difference: the
 // apiserver's implicit group (cache.ImplicitGroup) is folded in as a PRESENTED
 // group even for an empty username, via WithAuthenticatedGroup. Every real
@@ -143,13 +155,14 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 		seen[s] = struct{}{}
 		ids = append(ids, s)
 	}
+	who := subjectMatcher(id)
 	for _, crb := range selectCRBCandidates(snap, id) {
-		if anySubjectMatches(crb.Subjects, id) {
+		if anySubjectMatches(&who, crb.Subjects) {
 			add(cache.BindingUIDFromCRB(crb))
 		}
 	}
 	for _, rb := range selectRBCandidatesAllNS(snap, id) {
-		if anySubjectMatches(rb.Subjects, id) {
+		if anySubjectMatches(&who, rb.Subjects) {
 			add(cache.BindingUIDFromRB(rb))
 		}
 	}

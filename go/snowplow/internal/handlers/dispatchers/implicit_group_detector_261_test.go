@@ -1,16 +1,26 @@
-// implicit_group_detector_261_test.go — #261 case-2 serve-time detector
-// falsifier (implicit-group first-match missed-rotation carrier).
+// implicit_group_detector_261_test.go — #261 case-2 serve-time counter: L1
+// hits of a cell whose request was permitted only through an implicit group.
 //
-// #261 is a SERVE-TIME DETECTOR (observability only; the keying FIX is
-// v7-deferred). The bounded self-stale-leak class: a BindingUID identity key
-// can rotate with NO sub-gen bump. Case-2 carrier: the serve-time
-// first-permitting binding's WINNING subject matched only through an IMPLICIT
-// group (system:authenticated, or a synthetic system:serviceaccounts[:ns]
-// group). RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
-// grant/revoke through such a binding rotates the serve-time first-match
-// BindingUID with NO sub-gen bump. The counter measures the AT-RISK SERVE
-// POPULATION (a structural proxy); off-zero => reassess, NOT a confirmed-leak
-// count.
+// WHAT IT WAS WRITTEN FOR. #261 was a serve-time DETECTOR (observability only)
+// for a class in which a grant or revoke could change what an identity may
+// read with NO sub-generation bump, so its key did not rotate. Case-2 carrier:
+// the serve-time first-permitting binding's WINNING subject matched only
+// through an IMPLICIT group (system:authenticated, or a synthetic
+// system:serviceaccounts[:ns] group). When the detector was written
+// RBACSubGenForSubject read only the requester's PRESENTED groups, so a change
+// through such a binding bumped nothing the requester's key folds, and the
+// counter measured the AT-RISK SERVE POPULATION (a structural proxy, never a
+// confirmed-leak count).
+//
+// WHAT HOLDS NOW. Since #424 (system:authenticated) and #1443 (the
+// ServiceAccount groups) the fold reads every subject the evaluator matches
+// with (cache.SubjectMatcher), so a change through such a binding bumps and
+// the key rotates: no cell counted here is at risk for that reason any more.
+// The counter still counts exactly what these arms pin — L1 hits of a cell
+// whose first-permitting binding's winning subject matched only through an
+// implicit group — and that says HOW the served request was permitted, not
+// that a rotation was missed. Its name (serve_missed_rotation_atrisk_…) and
+// the "at-risk" wording in the assertions below date from the detector.
 //
 // WHY THIS ARM DRIVES THE REAL BOUNDARY
 // (feedback_falsifier_must_drive_real_boundary_not_install_crossed_state):
@@ -159,9 +169,8 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 
 	// Build the index against the LIVE (full) snapshot — the c2-reader ClusterRole
-	// IS present, so the binding resolves normally and is NOT in the case-3
-	// roleref-unresolved skip-set. This isolates the case-2 (implicit-group)
-	// class: any bump here comes from the RBAC winning-subject fact, not case-3.
+	// IS present, so the binding resolves normally: any bump here comes from the
+	// RBAC winning-subject fact.
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User) // alice, Groups=["devs"]
@@ -173,17 +182,12 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	}
 	// PRECONDITION: the MARK-AT-MINT classified this cell as case-2 implicit_group
 	// — produced by the REAL evaluator's winning-subject determination, not
-	// asserted into existence. (It must NOT be the case-3 class: the role is
-	// present, so IsRoleRefUnresolvedAtBuild is false.)
+	// asserted into existence.
 	if inputs.AtRiskClass != cache.AtRiskImplicitGroup {
 		t.Fatalf("PRECONDITION FAILED: the mint-time at-risk class for the serve-time first-match "+
 			"BindingUID %q must be AtRiskImplicitGroup (the winning subject matched via "+
 			"system:authenticated); got %v. Without it the arm cannot exercise the case-2 detector.",
 			inputs.BindingUID, inputs.AtRiskClass)
-	}
-	if cache.IsRoleRefUnresolvedAtBuild(inputs.BindingUID) {
-		t.Fatalf("PRECONDITION: the case-2 binding %q must NOT also read case-3 at-risk (role is present "+
-			"at build) — else the arm would not isolate the implicit-group class", inputs.BindingUID)
 	}
 	if _, ok := handle.Get(key); ok {
 		t.Fatalf("PRECONDITION: the derived key must be cold before the miss-populate")
@@ -221,12 +225,6 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	// the load-bearing assertion).
 	if raw := cache.ResolvedCache().Stats().ServeMissedRotationAtriskImplicitGroup; raw != 1 {
 		t.Fatalf("the raw store field must also read 1; got %d", raw)
-	}
-	// Cross-class isolation: the case-3 counter must NOT have moved (this cell is
-	// NOT roleref-unresolved).
-	if raw := cache.ResolvedCache().Stats().ServeMissedRotationAtriskRolerefUnresolved; raw != 0 {
-		t.Fatalf("cross-class leak: the case-3 roleref_unresolved counter moved to %d on a case-2 "+
-			"implicit-group serve; the two classes must be independent", raw)
 	}
 }
 
