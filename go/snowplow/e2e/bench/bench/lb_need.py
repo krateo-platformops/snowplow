@@ -86,7 +86,8 @@ def planned(installer_pulled: str, values_file: str) -> list[dict]:
     from bench import diag606
     root = os.path.join(installer_pulled, "installer")
     core = set(diag606.core_features(installer_pulled))
-    pins = _load(os.path.join(root, "files", "component-pins.yaml")).get("components") or []
+    from bench import installer_pins
+    pins = installer_pins.components(root)               # the file the chart itself loads
     try:
         chart_values = _load(os.path.join(root, "values.yaml"))
     except OSError:

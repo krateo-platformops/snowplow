@@ -314,8 +314,11 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
     from bench import diag606
     root = os.path.join(installer_pulled, "installer")
     core = set(diag606.core_features(installer_pulled))
-    with open(os.path.join(root, "files", "component-pins.yaml"), "rb") as fh:
-        pins = _load_yaml(fh.read(), "the installer's files/component-pins.yaml: ") or {}
+    from bench import installer_pins
+    try:      # the file the chart itself loads, read by this module's bounded YAML reader
+        pins, _ = installer_pins.load(root, parse=_load_yaml)
+    except installer_pins.Refused as e:
+        raise _Refused(str(e)) from None
     try:
         with open(os.path.join(root, "values.yaml"), "rb") as fh:
             inst_values = _load_yaml(fh.read(), "the installer's values.yaml: ") or {}

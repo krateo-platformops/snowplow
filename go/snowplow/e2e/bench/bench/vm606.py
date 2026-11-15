@@ -1637,7 +1637,7 @@ echo "VM606_DIR_MODE=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os
 LAPTOP_ONLY = re.compile(r"^(OUT_[A-Z][A-Z0-9]*|PAIR_OUT|BENCH_RUNS_DIR|BENCH_EVIDENCE_DIR|XDG_DATA_HOME|HOME|PATH|"
                          r"KUBECONFIG|GHCR_PULL_ENV_FILE|PYTHONPATH|BENCH_GKE_CONTEXT)$")
 SECRET_KEYS = re.compile(r"^GHCR_PULL_[A-Z0-9_]*$")
-TEST_HOOKS = re.compile(r"^(BENCH_606_DRY_RUN|BENCH_606_FAIL_AT|BENCH_606_HOST_LOAD|BENCH_ALLOW_[A-Z_]+|"
+TEST_HOOKS = re.compile(r"^(BENCH_606_DRY_RUN|BENCH_606_FAIL_AT|BENCH_606_HOST_LOAD|BENCH_606_REHEARSAL|BENCH_ALLOW_[A-Z_]+|"
                         r"CLOUDSDK_[A-Z_]+)$")
 _ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
