@@ -93,12 +93,17 @@ func TestRefreshes1325_A2_TwoWidgetsOnOneKeyCatchUpWhenAnyHoldsOldBytes(t *testi
 	}
 }
 
+// A3 — the arm catch-up check reads on the #101 arm ctx. Since #1430 the check
+// is the rotation tracker's (Behind), which reads on the ctx it was built
+// with: so every tracker in this package is built on refreshArmCtx(req)
+// (directly, or through a variable assigned from it), the check is called on
+// a tracker, and no call of the ctx-taking BehindKeys bypasses it.
 func TestRefreshes1325_A3_BehindKeysReadsOnTheArmCtx(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := 0
+	trackers, checks := 0, 0
 	for _, p := range files {
 		if strings.HasSuffix(p, "_test.go") {
 			continue
@@ -108,28 +113,66 @@ func TestRefreshes1325_A3_BehindKeysReadsOnTheArmCtx(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Variables assigned exactly refreshArmCtx(...).
+		isArmCtxCall := func(e ast.Expr) bool {
+			c, ok := e.(*ast.CallExpr)
+			if !ok {
+				return false
+			}
+			fn, _ := c.Fun.(*ast.Ident)
+			return fn != nil && fn.Name == "refreshArmCtx"
+		}
+		armVars, otherAssigned := map[string]bool{}, map[string]bool{}
+		ast.Inspect(f, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok || len(as.Lhs) != len(as.Rhs) {
+				return true
+			}
+			for i, l := range as.Lhs {
+				if id, ok := l.(*ast.Ident); ok {
+					if isArmCtxCall(as.Rhs[i]) {
+						armVars[id.Name] = true
+					} else {
+						otherAssigned[id.Name] = true
+					}
+				}
+			}
+			return true
+		})
+		onArmCtx := func(e ast.Expr) bool {
+			if isArmCtxCall(e) {
+				return true
+			}
+			id, ok := e.(*ast.Ident)
+			return ok && armVars[id.Name] && !otherAssigned[id.Name]
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "BehindKeys" || len(call.Args) == 0 {
+			if !ok {
 				return true
 			}
-			calls++
-			var fn *ast.Ident
-			if arg, isCall := call.Args[0].(*ast.CallExpr); isCall {
-				fn, _ = arg.Fun.(*ast.Ident)
-			}
-			if fn == nil || fn.Name != "refreshArmCtx" {
-				t.Fatalf("A3 RED: BehindKeys at %s does not read on refreshArmCtx(req) — #101: every /refreshes arm-time "+
-					"read is informer-only (#1325 review m3)", fset.Position(call.Pos()))
+			switch sel.Sel.Name {
+			case "NewSubscriptionRotationTracker", "BehindKeys":
+				if sel.Sel.Name == "NewSubscriptionRotationTracker" {
+					trackers++
+				} else {
+					checks++
+				}
+				if len(call.Args) == 0 || !onArmCtx(call.Args[0]) {
+					t.Fatalf("A3 RED: %s at %s does not read on refreshArmCtx(req) — #101: every /refreshes arm-time "+
+						"read is informer-only (#1325 review m3)", sel.Sel.Name, fset.Position(call.Pos()))
+				}
+			case "Behind":
+				checks++
 			}
 			return true
 		})
 	}
-	if calls == 0 {
-		t.Fatal("A3: no BehindKeys call found — the scan is not looking at the handler")
+	if trackers == 0 || checks == 0 {
+		t.Fatalf("A3: %d tracker constructions and %d catch-up checks found — the scan is not looking at the handler", trackers, checks)
 	}
 }

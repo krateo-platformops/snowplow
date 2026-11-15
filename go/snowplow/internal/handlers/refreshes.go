@@ -294,15 +294,17 @@ func Refreshes() http.HandlerFunc {
 		// offered again, and CatchUp then closes the arm. One arm, at most one
 		// frame per key.
 		//
-		// #1325 m3 — BehindKeys reads on the #101 arm ctx (informer-only), the
+		// #1325 m3 — the check reads on the #101 arm ctx (informer-only), the
 		// same derivation validateSubscription's arm reads use: the invariant
 		// holds by construction if the gate it runs ever grows an objects.Get.
+		// #1430 — it is the tracker's: built on that arm ctx, with the identity
+		// digested once for the connection.
 		cache.NoteRefreshArmHeld(len(held))
 		// #1328 — seed what this tab is served from each gated key (read the
 		// class first: an RBAC change after it moves the class again, and the
 		// classMoved turn below re-checks).
 		rotation.ArmGated()
-		behind := dispatchers.BehindKeys(refreshArmCtx(req), held)
+		behind := rotation.Behind(held)
 		if stream.CatchUp != nil {
 			stream.CatchUp(behind)
 		}
