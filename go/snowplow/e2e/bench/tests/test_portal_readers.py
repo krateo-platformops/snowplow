@@ -188,6 +188,10 @@ def test_a_role_without_restactions_does_not_grant_the_shell():
     part = _role("widgets-only", NS, [WIDGETS]) + _binding("widgets-only", NS)
     g = _grant({**SHELL, "part.yaml": part}, {"readerGroups": ["admins"]})
     assert not g["granted"] and g["missing"] == {NS: ["get restactions.templates.krateo.io"]}
+    # a Role in the right API group, on another resource of it, does not cover RESTActions
+    other = _role("forms", NS, [WIDGETS, dict(RESTACTIONS, resources=["customforms"])]) + _binding("forms", NS)
+    g = _grant({**SHELL, "forms.yaml": other}, {"readerGroups": ["admins"]})
+    assert not g["granted"] and g["missing"] == {NS: ["get restactions.templates.krateo.io"]}
     # a Role narrowed to named objects does not cover a reader's rule either
     named = _role("named", NS, [WIDGETS, dict(RESTACTIONS, resourceNames=["sidebar-nav"])]) + _binding("named", NS)
     g = _grant({**SHELL, "named.yaml": named}, {"readerGroups": ["admins"]})
