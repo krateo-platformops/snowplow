@@ -229,17 +229,16 @@ func rbBindingID(p *rbacv1.RoleBinding) bindingID {
 // Only User / Group / ServiceAccount kinds are projected (the cohort
 // machinery consumes User+Groups; SA subjects are carried so a future SA
 // cohort path can use them — collectCohortBindingIDs already ignores SA).
+// Each subject's key is bindingSubjectKey's (match_subject.go): the one form
+// a binding event bumps and the evaluator's subject matcher compares (#1443).
 func subjectsFromRBAC(subjects []rbacv1.Subject) []subjectKey {
 	if len(subjects) == 0 {
 		return nil
 	}
 	out := make([]subjectKey, 0, len(subjects))
 	for _, s := range subjects {
-		switch s.Kind {
-		case rbacv1.UserKind, rbacv1.GroupKind:
-			out = append(out, subjectKey{Kind: s.Kind, Name: s.Name})
-		case rbacv1.ServiceAccountKind:
-			out = append(out, subjectKey{Kind: s.Kind, Name: s.Name, Namespace: s.Namespace})
+		if k, ok := bindingSubjectKey(s); ok {
+			out = append(out, k)
 		}
 	}
 	return out

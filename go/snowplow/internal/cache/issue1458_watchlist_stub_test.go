@@ -72,6 +72,11 @@ func (s *c1458Stub) emitLocked(res, typ string, obj map[string]any) {
 func (s *c1458Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	const prefix = "/apis/rbac.authorization.k8s.io/v1/"
+	if r.URL.Path == "/version" {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"major":"0","minor":"0","gitVersion":"watch-list-stub (the test's own server)","platform":"httptest"}`))
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, prefix) {
 		s.serveOther(w, r)
 		return

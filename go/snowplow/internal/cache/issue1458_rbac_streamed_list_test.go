@@ -50,6 +50,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
@@ -66,6 +67,7 @@ type k1458Req struct {
 	sendInitialEvents bool
 	status            int
 	synthetic         bool
+	query             string
 }
 
 func (r k1458Req) String() string {
@@ -76,7 +78,7 @@ func (r k1458Req) String() string {
 			kind = "WATCH+sendInitialEvents"
 		}
 	}
-	s := fmt.Sprintf("%s %s -> %d", kind, r.resource, r.status)
+	s := fmt.Sprintf("%s %s?%s -> %d", kind, r.resource, r.query, r.status)
 	if r.synthetic {
 		s += " (injected by the test)"
 	}
@@ -122,7 +124,7 @@ func (t *k1458Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	q := req.URL.Query()
 	rec := k1458Req{resource: res, watch: q.Get("watch") == "true" || q.Get("watch") == "1",
-		sendInitialEvents: q.Get("sendInitialEvents") == "true"}
+		sendInitialEvents: q.Get("sendInitialEvents") == "true", query: req.URL.RawQuery}
 	if rec.watch {
 		t.mu.Lock()
 		inject := t.expire[res] > 0
@@ -254,7 +256,8 @@ func k1458AssertStreamed(t *testing.T, phase string, reqs []k1458Req) {
 				streamed++
 			}
 		}
-		t.Logf("%s: %s requests of the watcher's client: %v", phase, gvr.Resource, seen)
+		t.Logf("%s: %s: requests of the watcher's client: %v", phase, gvr.Resource, seen)
+		t.Logf("%s: %s: streamed lists (WATCH with sendInitialEvents=true answered 200)=%d, plain collection LISTs=%d", phase, gvr.Resource, streamed, plain)
 		if streamed == 0 {
 			t.Errorf("%s: NO STREAMED LIST for %s: no WATCH with sendInitialEvents=true was answered 200 (requests: %v)", phase, gvr.Resource, seen)
 		}
@@ -384,9 +387,12 @@ func c1458StreamedListArm(t *testing.T, restCfg *rest.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := plain.Resource(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}).List(ctx, metav1.ListOptions{}); err == nil && len(v.Items) > 0 {
-		kv, _, _ := unstructured.NestedString(v.Items[0].Object, "status", "nodeInfo", "kubeletVersion")
-		t.Logf("cluster: kubelet %s", kv)
+	if dc, derr := discovery.NewDiscoveryClientForConfig(plainCfg); derr == nil {
+		if v, verr := dc.ServerVersion(); verr == nil {
+			t.Logf("server /version: gitVersion=%q major=%q minor=%q platform=%q", v.GitVersion, v.Major, v.Minor, v.Platform)
+		} else {
+			t.Logf("server /version: %v", verr)
+		}
 	}
 
 	// --- the world before the watcher starts.
