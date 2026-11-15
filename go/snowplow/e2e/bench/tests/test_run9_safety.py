@@ -241,7 +241,8 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     the margin 47,136 s -> 14 h."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "= 45336 s" in p.stderr and "fits TTL_HOURS=14 (50400 s; derived: the plan's 45336 s" in p.stderr
+    # + the 300 s wait of the runtime606 Job (the process's effective GC settings, before the measure)
+    assert "= 45636 s" in p.stderr and "fits TTL_HOURS=14 (50400 s; derived: the plan's 45636 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
     assert p.returncode == 0 and "fits TTL_HOURS=15 (54000 s; derived" in p.stderr
@@ -264,7 +265,7 @@ def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path)
     in-cluster = 47,821 s, now over the 12 h outright; #1422: + 915 s of gke-up = 48,736 s)
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 48736 s" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 49036 s" in p.stderr
     assert "needs TTL_HOURS >= 15" in p.stderr
 
 

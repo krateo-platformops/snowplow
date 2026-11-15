@@ -361,12 +361,12 @@ def test_the_gate_reads_and_records_the_cdcs_resync_from_each_source(harness, cd
 # the slack is its round-up remainder: both sides of the property are pinned here
 # by hand, never derived from the code under test, so a budget change shows which
 # side moved. A resync's excess = 2 x (resync - the 180 s budget term).
-HARNESS_TTL_SLACK_S = 1222      # 2137 before #1422 counted gke-up's whole budget (1800 -> 2715 s)
+HARNESS_TTL_SLACK_S = 922       # 2137 before #1422 counted gke-up's whole budget; 1222 before the runtime606 wait
 
 
 def test_a_resync_past_the_budget_term_warns_within_the_ttl_slack(harness):  # noqa: F811
     """#1006 F5 (M22) / F8: 8m reads past the budget's 180s term; its excess,
-    2 x (480 - 180) = 600 s, is under the harness plan's slack (1222 s): said, and
+    2 x (480 - 180) = 600 s, is under the harness plan's slack (922 s): said, and
     the run goes on."""
     p, out, d = _run(harness, FAKE_CDC_RESYNC="args:8m")
     assert p.returncode == 0, out[-3000:]
@@ -376,7 +376,7 @@ def test_a_resync_past_the_budget_term_warns_within_the_ttl_slack(harness):  # n
 
 def test_a_resync_whose_excess_is_past_the_slack_is_refused(harness):  # noqa: F811
     """The twin: 31m's excess, 2 x (1860 - 180) = 3360 s, is past the harness
-    plan's slack (1222 s): refused at the gate, before data. (The slack follows
+    plan's slack (922 s): refused at the gate, before data. (The slack follows
     the whole-hour TTL's rounding: #1194's evidence term moved it from 640 s.)"""
     p, out, d = _run(harness, FAKE_CDC_RESYNC="args:31m")
     assert p.returncode != 0

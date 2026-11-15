@@ -399,11 +399,13 @@ FW_JOB_S=$(( PREFLIGHT_TIMEOUT_S + FW_BOUND_S + FW_WIDEN_WAIT_S + FW_BOUND_S ))
 # reads, its /out copy, its init log (or, for a pod that never started, job_pod_why's read in its place),
 # /out/collected, 3 deletes), and the teardown's in-cluster collect + deletes
 INC_FINISH_CALLS=8
+# the runtime606 Job's wait (go_runtime_reading, before the measure): the preflight Job's own bound
+GO_RUNTIME_S="$PREFLIGHT_TIMEOUT_S"
 INC_POLL_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1])))' "$PREFLIGHT_POLL_S")"   # data606_wait's poll, rounded up
 INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + INC_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
 RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
-                 + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + ENV_AGREE_WAIT_S + MEASURE_WAIT_S
+                 + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + GO_RUNTIME_S + ENV_AGREE_WAIT_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
 TTL_NEEDED_H=$(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 ))
 if [[ -z "$TTL_HOURS" ]]; then
@@ -418,7 +420,7 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
-AGREE_LINE=""; if (( ENV_AGREE_WAIT_S > 0 )); then AGREE_LINE=" + env agreement ${ENV_AGREE_WAIT_S}"; fi
+AGREE_LINE=" + go runtime ${GO_RUNTIME_S}"; if (( ENV_AGREE_WAIT_S > 0 )); then AGREE_LINE="${AGREE_LINE} + env agreement ${ENV_AGREE_WAIT_S}"; fi
 budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
@@ -1054,6 +1056,36 @@ s_portal_routes() {
     return 1
   fi
 }
+# go_runtime_reading: the GC settings the snowplow PROCESS runs with, before any load: the bench's own
+# preflight user logs in from a short Job on the loadgen node (runtime606, like the preflight Job) and
+# reads /debug/vars' snowplow_go_runtime (its effective GOGC, its memory limit and where that came
+# from, the container's cgroup limit) -> $OUT/go-runtime.jsonl. The pod's env is not that: chart
+# 1.12.70 sets no GOMEMLIMIT and the process derives one from its cgroup. No credential from outside
+# the cluster: the user is the bench's synthetic one (data606-preflight-user), with the bench's fixed
+# test password, which is redacted from the manifest once applied and from every log line. A reading
+# that fails leaves a file that says so, or none: the gate then fails the arm.
+go_runtime_reading() {
+  local out="$OUT/go-runtime.jsonl" job=runtime606 deadline ok="" failed=""
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the preflight user reads /debug/vars snowplow_go_runtime) -> $out"
+    return 0
+  fi
+  python3 -m bench.load606_job --go-runtime-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
+      --password "$PW" > "$OUT/go-runtime-job.yaml"
+  kapply "$OUT/go-runtime-job.yaml" >/dev/null || { log "the ${job} Job was not created: $(kerr_line)"; return 0; }
+  deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S ))
+  while (( $(date +%s) < deadline )); do
+    ok="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
+    failed="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
+    [[ -n "$ok" && "$ok" != "0" ]] && break
+    [[ -n "$failed" && "$failed" != "0" ]] && break
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  "${K[@]}" --request-timeout=60s -n bench-loadgen logs "job/$job" > "$out" 2>/dev/null || true
+  if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
+    log "the ${job} Job did not finish within ${PREFLIGHT_TIMEOUT_S}s: $(job_pod_why "$job")"
+  fi
+}
 # snowplow_env_gate: before any load, the running snowplow container must have every declared key as
 # declared (the reading tracing_reading just took: the container's env and the ConfigMaps it reads,
 # never the rendered values), and, in a launch of several runs, the keys no run declared must read
@@ -1062,14 +1094,16 @@ s_portal_routes() {
 snowplow_env_gate() {
   local line rc=0
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.snowplow_env check --declared '$SNOWPLOW_ENV' --tracing $OUT/tracing.json --out $OUT/snowplow-env.json (the running pod must have every declared key as declared)"
+    go_runtime_reading
+    log "DRY: python3 -m bench.snowplow_env check --declared '$SNOWPLOW_ENV' --tracing $OUT/tracing.json --effective $OUT/go-runtime.jsonl --out $OUT/snowplow-env.json (the running process must run with every declared setting)"
     if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then
       log "DRY: python3 -m bench.snowplow_env agree --dir $SNOWPLOW_ENV_DIR --arm $BENCH_ARM --arms $SNOWPLOW_ENV_ARMS --wait-s $ENV_AGREE_WAIT_S"
     fi
     return 0
   fi
+  go_runtime_reading
   line="$(python3 -m bench.snowplow_env check --declared "$SNOWPLOW_ENV" --tracing "$OUT/tracing.json" \
-            --arm "$BENCH_ARM" --out "$OUT/snowplow-env.json" 2>"$KERR")" || rc=$?
+            --effective "$OUT/go-runtime.jsonl" --arm "$BENCH_ARM" --out "$OUT/snowplow-env.json" 2>"$KERR")" || rc=$?
   if (( rc != 0 )); then
     # the other runs of the launch are not kept waiting for a reading that will not come
     if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then mkdir -p "$SNOWPLOW_ENV_DIR"; : > "$SNOWPLOW_ENV_DIR/${BENCH_ARM}.gone"; fi
@@ -1096,6 +1130,8 @@ snowplow_env_gate() {
 # gate, the operations record, and ONE block with everything the rehearsal exists to show.
 s_rehearsal() {
   local gate=0
+  # the user the runtime reading logs in as: the bench's own preflight user, as the preflight step makes it
+  run python3 -m bench data606-preflight-user >&2 || return 1
   tracing_reading before
   snowplow_env_gate || gate=$?
   cluster_operations
