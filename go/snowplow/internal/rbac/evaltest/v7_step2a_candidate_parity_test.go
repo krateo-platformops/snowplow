@@ -156,8 +156,11 @@ func referenceSelectRBCandidatesOriginal(snap *cache.RBACSnapshot, ns string, us
 	if snap == nil || ns == "" {
 		return nil
 	}
-	saNS, saName, isSA := rbac.ParseServiceAccountUsernameForTest(username)
-	effGroups := rbac.EffectiveGroupsForTest(groups, isSA, saNS)
+	saNS, saName, isSA := cache.ParseServiceAccountUsername(username)
+	effGroups := groups
+	if isSA {
+		effGroups = append(append([]string{}, groups...), "system:serviceaccounts", "system:serviceaccounts:"+saNS)
+	}
 
 	seen := make(map[*rbacv1.RoleBinding]struct{})
 	var out []*rbacv1.RoleBinding

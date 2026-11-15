@@ -47,25 +47,15 @@ type RotatedSubjectSet struct {
 	set map[subjectKey]struct{}
 }
 
-// foldSubjects returns the subjectKeys an identity (username + presented groups)
-// folds into its effective RBAC sub-gen — mirroring RBACSubGenForSubject EXACTLY
-// (a ServiceAccount username folds the SA subject, a human username the User
-// subject, every non-empty group its Group subject).
+// foldSubjects returns the subjectKeys an identity (username + groups) folds
+// into its effective RBAC sub-gen: its matched-subject set (SubjectMatcher.Visit,
+// #1443), the same set the evaluator matches bindings with.
 func foldSubjects(username string, groups []string) []subjectKey {
-	out := make([]subjectKey, 0, 1+len(groups))
-	if username != "" {
-		if ns, name, ok := parseServiceAccountUsername(username); ok {
-			out = append(out, subjectKey{Kind: subjectKindServiceAccount, Name: name, Namespace: ns})
-		} else {
-			out = append(out, subjectKey{Kind: subjectKindUser, Name: username})
-		}
-	}
-	for _, g := range groups {
-		if g == "" {
-			continue
-		}
-		out = append(out, subjectKey{Kind: subjectKindGroup, Name: g})
-	}
+	out := make([]subjectKey, 0, 2+len(groups))
+	NewSubjectMatcher(username, groups).Visit(func(ms MatchedSubject) bool {
+		out = append(out, ms.key())
+		return true
+	})
 	return out
 }
 
