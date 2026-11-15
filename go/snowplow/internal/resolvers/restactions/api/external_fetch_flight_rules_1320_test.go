@@ -619,6 +619,61 @@ func TestExternalFlight1320_TheJoinerCountIsOnlyOnTheSpanThatWentOnTheWire(t *te
 	}
 }
 
+// The joiner count is exact: who an outcome goes to is fixed when it is
+// published. A joiner whose own context ends in that same instant (after the
+// publish, before the status line reaches it) was counted, so it is answered,
+// not sent away.
+func TestExternalFlight1320_AReaderCountedAtPublishIsAnswered(t *testing.T) {
+	c := wireCache(t)
+	next := &scriptedWire{fn: func(_ int64, req *http.Request) (*http.Response, error) { return scriptedOK(req, `{}`), nil }}
+	starter, sreq := newReaderWire(t, c, next, context.Background())
+	f, role := starter.joinOrLead(sreq.Context())
+	if role != flightLead {
+		t.Fatalf("role = %v; want lead", role)
+	}
+	jctx, leave := context.WithCancel(context.Background())
+	joiner, jreq := newReaderWire(t, c, next, jctx)
+	if jf, jrole := joiner.joinOrLead(jreq.Context()); jrole != flightJoin || jf != f {
+		t.Fatalf("SETUP: the second reader's role = %v; want join", jrole)
+	}
+	// The outcome is published: the joiner is one of the readers it goes to.
+	if joiners := f.publish(); joiners != 1 {
+		t.Fatalf("publish counted %d joiners; want 1", joiners)
+	}
+	leave() // ... and only now does the joiner's context end
+	answered := make(chan tripResult, 1)
+	go func() {
+		resp, err := f.await(jreq, false)
+		answered <- tripResult{resp: resp, err: err}
+	}()
+	select {
+	case r := <-answered:
+		t.Fatalf("the joiner returned before the status line was there: resp=%v err=%v (it was counted as answered, then sent away)", r.resp != nil, r.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	view := *scriptedOK(sreq, `{}`)
+	f.resp = &view
+	close(f.headers)
+	r := <-answered
+	if r.err != nil || r.resp == nil || r.resp.StatusCode != http.StatusOK {
+		t.Fatalf("the joiner counted at publish got resp=%v err=%v; want the answer", r.resp != nil, r.err)
+	}
+	// A reader that leaves BEFORE the publish is not counted and not answered.
+	c2 := wireCache(t)
+	s2, s2req := newReaderWire(t, c2, next, context.Background())
+	f2, _ := s2.joinOrLead(s2req.Context())
+	gone, cancel := context.WithCancel(context.Background())
+	j2, j2req := newReaderWire(t, c2, next, gone)
+	j2.joinOrLead(j2req.Context())
+	cancel()
+	if _, err := f2.await(j2req, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a joiner that left before the publish got %v; want its own cancellation", err)
+	}
+	if joiners := f2.publish(); joiners != 0 {
+		t.Fatalf("publish counted %d joiners after the only one left; want 0", joiners)
+	}
+}
+
 // The record of which request answered a fetch follows the fetch's LAST
 // attempt: a reader whose shared attempt was answered (here: 503) and that
 // then sends its own request is no longer "answered by another reader's
