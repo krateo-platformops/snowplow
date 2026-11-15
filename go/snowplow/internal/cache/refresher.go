@@ -288,9 +288,13 @@ type refresher struct {
 	// ones a wake key can reach.
 	normalGetBlocked int
 	reserveWaiting   int
-	reserveCond      sync.Cond
-	inFlightMu       sync.Mutex
-	inFlightKeys     map[string]bool
+	// reserveStopped: the pool is shutting down. Set by wakeReservedOnShutdown in
+	// the same priorityGetMu section as its Broadcast, and read by the park's
+	// check under that lock, so a worker can never park past a shutdown.
+	reserveStopped bool
+	reserveCond    sync.Cond
+	inFlightMu     sync.Mutex
+	inFlightKeys   map[string]bool
 
 	// work (#930) counts the keys queued or in a worker's hands across every
 	// tier (refresher_quiescence.go).

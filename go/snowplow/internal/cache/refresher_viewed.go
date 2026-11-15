@@ -332,7 +332,10 @@ func (r *refresher) nextDequeue() (key string, tier refreshTier, pick dequeuePic
 			r.normalGetBlocked++ // ended by leftNormalGet
 			return "", tierNormal, pickNormal
 		}
-		if r.queue.ShuttingDown() {
+		// The stop flag, not the queue's own state: it is written under this
+		// lock together with the Broadcast (wakeReservedOnShutdown), so this
+		// check and the Wait below cannot fall between the two.
+		if r.reserveStopped {
 			return "", tierNormal, pickShutdown
 		}
 		r.viewed.reserveParks.Add(1)
@@ -447,10 +450,17 @@ func (r *refresher) endUnviewed() {
 
 // wakeReservedOnShutdown releases every parked reserved worker when the normal
 // tier shuts down: a worker blocked in a queue's Get learns that from the Get, a
-// parked one only from this. Called AFTER the queue's ShutDown, so a woken worker
-// (and one that takes priorityGetMu later) reads ShuttingDown and leaves.
+// parked one only from this.
+//
+// CORRECT BY CONSTRUCTION: the stop flag and the Broadcast are one priorityGetMu
+// section, and a worker checks the flag and parks in one section of the same
+// lock (nextDequeue; Wait releases the lock only once the worker is waiting). So
+// a worker either sees the flag and leaves, or is already waiting when the
+// Broadcast comes, and a woken worker re-checks a flag that is already set.
+// Nothing depends on whether the queue's own ShutDown ran before or after this.
 func (r *refresher) wakeReservedOnShutdown() {
 	r.priorityGetMu.Lock()
+	r.reserveStopped = true
 	r.reserveWaiting = 0
 	r.reserveCond.Broadcast()
 	r.priorityGetMu.Unlock()
@@ -458,7 +468,8 @@ func (r *refresher) wakeReservedOnShutdown() {
 
 // shutdownNotifyingQueue is the normal tier's underlying queue: its ShutDown —
 // direct, or the delaying queue's, which shuts down through it — also releases
-// the parked reserved workers (#1069), whoever shuts the queue down. The
+// the parked reserved workers (#1069), whoever shuts the queue down. The order
+// of the two steps in ShutDown does not matter (wakeReservedOnShutdown). The
 // refresher's tiers are only ever stopped with ShutDown (StartRefresher's ctx
 // goroutine, StopRefresher).
 type shutdownNotifyingQueue struct {

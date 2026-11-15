@@ -22,7 +22,11 @@
 //   - R6 the customer yield (#854) still parks both tiers, the reserved
 //     worker's viewed job included, and releases them together.
 //   - R7 the new stats count exactly (per-tier completions, the dequeue age).
-//   - R8 a shutdown releases the parked reserved worker.
+//   - R8 a shutdown releases the parked reserved worker. R8b/R8c/R8d
+//     (deterministic, white-box): a worker that reaches the park after the stop
+//     leaves instead of parking; the stop alone releases a parked worker, with
+//     the queue's own shutdown not yet done (so the order of the two steps of
+//     the queue's ShutDown cannot matter); the queue's ShutDown releases it.
 package cache
 
 import (
@@ -569,6 +573,117 @@ func TestReserve1069_R8_ShutdownReleasesTheReservedWorker(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("R8 RED (#1069): after the refresher's ctx ended a worker did not exit within 3s — the parked reserved worker never learns of the shutdown")
+	}
+}
+
+// reserve1069FillUnviewed takes every unviewed slot of r's p workers (each a
+// worker blocked in the normal Get), so the next nextDequeue has no slot on
+// either side: it parks, or leaves on a shutdown.
+func reserve1069FillUnviewed(t *testing.T, r *refresher, p int) {
+	t.Helper()
+	for i := 0; i < p-1; i++ {
+		if k, tier, pick := r.nextDequeue(); pick != pickNormal {
+			t.Fatalf("PRECONDITION: worker %d of %d dequeued (%q, %d, %d), want an unviewed slot", i, p, k, tier, pick)
+		}
+	}
+}
+
+// reserve1069LastWorker runs the last worker's nextDequeue and returns the
+// channel its pick arrives on.
+func reserve1069LastWorker(r *refresher) chan dequeuePick {
+	got := make(chan dequeuePick, 1)
+	go func() {
+		_, _, pick := r.nextDequeue()
+		got <- pick
+	}()
+	return got
+}
+
+func reserve1069Parked(r *refresher) int {
+	r.priorityGetMu.Lock()
+	defer r.priorityGetMu.Unlock()
+	return r.reserveWaiting
+}
+
+// TestReserve1069_R8b_AWorkerThatArrivesAfterTheStopDoesNotPark is R8b: the
+// check before the park. The stop comes while nobody is parked (its Broadcast
+// reaches no one); the last worker then reaches the park and must leave. Without
+// the check it parks, and nothing will ever wake it.
+func TestReserve1069_R8b_AWorkerThatArrivesAfterTheStopDoesNotPark(t *testing.T) {
+	for _, p := range []int{2, 4} {
+		t.Run(fmt.Sprintf("p%d", p), func(t *testing.T) {
+			t.Cleanup(withCleanRefresher(t, p, 0))
+			r := refresherSingleton() // no StartRefresher: no worker but this test
+			reserve1069FillUnviewed(t, r, p)
+
+			r.wakeReservedOnShutdown()
+			got := reserve1069LastWorker(r)
+			// Two exclusive outcomes of that one call: it leaves or it parks.
+			waitFor(t, 30*time.Second, "the last worker leaves or parks", func() bool {
+				return len(got) == 1 || reserve1069Parked(r) == 1
+			})
+			if len(got) == 0 {
+				t.Fatalf("R8b RED (#1069): a worker that reached the park after the shutdown parked — nothing wakes it again, so it never exits")
+			}
+			if pick := <-got; pick != pickShutdown {
+				t.Fatalf("R8b: the last worker got pick %d, want pickShutdown", pick)
+			}
+		})
+	}
+}
+
+// TestReserve1069_R8c_TheStopAloneReleasesAParkedWorker is R8c: a parked worker
+// leaves on wakeReservedOnShutdown ALONE, with the queue's own shutdown not done
+// yet. That is the state a woken worker sees if the wake runs before the inner
+// ShutDown, so the order of the two steps of shutdownNotifyingQueue.ShutDown
+// cannot matter: a worker that re-checked the queue's state here would park
+// again, for good.
+func TestReserve1069_R8c_TheStopAloneReleasesAParkedWorker(t *testing.T) {
+	for _, p := range []int{2, 4} {
+		t.Run(fmt.Sprintf("p%d", p), func(t *testing.T) {
+			t.Cleanup(withCleanRefresher(t, p, 0))
+			r := refresherSingleton()
+			reserve1069FillUnviewed(t, r, p)
+			got := reserve1069LastWorker(r)
+			waitFor(t, 30*time.Second, "the last worker parks", func() bool { return reserve1069Parked(r) == 1 })
+
+			r.wakeReservedOnShutdown() // the queue itself is NOT shut down
+			if r.queue.ShuttingDown() {
+				t.Fatalf("PRECONDITION: the normal tier is shutting down; this arm needs the stop without it")
+			}
+			// Two exclusive outcomes: the woken worker leaves, or re-parks (a
+			// second park; the first was taken off reserveWaiting by the stop).
+			waitFor(t, 30*time.Second, "the woken worker leaves or parks again", func() bool {
+				return len(got) == 1 || r.viewed.reserveParks.Load() == 2
+			})
+			if len(got) == 0 {
+				t.Fatalf("R8c RED (#1069): the worker woken by the shutdown parked again — the stop must be visible to it whatever the queue's own state")
+			}
+			if pick := <-got; pick != pickShutdown {
+				t.Fatalf("R8c: the woken worker got pick %d, want pickShutdown", pick)
+			}
+		})
+	}
+}
+
+// TestReserve1069_R8d_TheQueuesShutDownReleasesAParkedWorker is R8d: the wiring.
+// The normal tier's ShutDown (whoever calls it) releases a parked worker.
+func TestReserve1069_R8d_TheQueuesShutDownReleasesAParkedWorker(t *testing.T) {
+	const p = 4
+	t.Cleanup(withCleanRefresher(t, p, 0))
+	r := refresherSingleton()
+	reserve1069FillUnviewed(t, r, p)
+	got := reserve1069LastWorker(r)
+	waitFor(t, 30*time.Second, "the last worker parks", func() bool { return reserve1069Parked(r) == 1 })
+
+	r.queue.ShutDown()
+	select {
+	case pick := <-got:
+		if pick != pickShutdown {
+			t.Fatalf("R8d: the parked worker got pick %d, want pickShutdown", pick)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("R8d RED (#1069): the normal tier's ShutDown did not release the parked reserved worker")
 	}
 }
 
