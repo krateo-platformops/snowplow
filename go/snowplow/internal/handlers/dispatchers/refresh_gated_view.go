@@ -83,7 +83,14 @@ func (t *SubscriptionRotationTracker) servedNow(key, class string) string {
 	if !ok || e == nil {
 		return ""
 	}
-	return servedDigestNow(t.ctx, class, e)
+	return servedDigestNow(t.viewer, class, e)
+}
+
+// Behind is BehindKeys for this connection's identity (#1324): the keys in
+// held the tab is behind on. It reads on the tracker's arm ctx and reuses the
+// identity digested once for the connection (#1430).
+func (t *SubscriptionRotationTracker) Behind(held map[string]HeldDigests) []string {
+	return behindKeys(t.viewer, held)
 }
 
 // ArmGated seeds every armed gated key with what its tab is served now, after

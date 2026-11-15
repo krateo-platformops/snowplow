@@ -78,6 +78,15 @@ func BehindKeys(ctx context.Context, held map[string]HeldDigests) []string {
 	if len(held) == 0 {
 		return nil
 	}
+	return behindKeys(servedViewerOf(ctx), held)
+}
+
+// behindKeys is BehindKeys for a viewer already built (#1430: the identity is
+// digested once per arm, not once per key).
+func behindKeys(v servedViewer, held map[string]HeldDigests) []string {
+	if len(held) == 0 {
+		return nil
+	}
 	store := cache.ResolvedCache()
 	var behind []string
 	for key, h := range held {
@@ -85,7 +94,7 @@ func BehindKeys(ctx context.Context, held map[string]HeldDigests) []string {
 		if store != nil {
 			//serve-probe: #1324 arm catch-up — digests what /call would serve now, serves no body
 			if e, ok := store.GetNoTouch(key); ok && e != nil {
-				cur = servedDigestNow(ctx, h.Class, e)
+				cur = servedDigestNow(v, h.Class, e)
 			}
 		}
 		for _, d := range h.Digests {
@@ -99,8 +108,28 @@ func BehindKeys(ctx context.Context, held map[string]HeldDigests) []string {
 	return behind
 }
 
+// servedViewer is who a served digest is computed for: the ctx the gate reads
+// the requester from, and (#1430) that requester's identity as the served-view
+// memo keys it. Built once per /refreshes connection or /call request and
+// passed down: digesting the identity sorts and hashes every group.
+type servedViewer struct {
+	ctx context.Context
+	id  cache.ServedViewIdentity
+	// known is false when ctx carries no identity: the gate refuses it.
+	known bool
+}
+
+// servedViewerOf builds the viewer of ctx's identity.
+func servedViewerOf(ctx context.Context) servedViewer {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return servedViewer{ctx: ctx}
+	}
+	return servedViewer{ctx: ctx, id: cache.ServedViewIdentityOf(ui.Username, ui.Groups), known: true}
+}
+
 // servedDigestNow is the digest of the bytes the /call hit of class would
-// write for ctx's identity from entry (see the file comment). "" when that
+// write for v's identity from entry (see the file comment). "" when that
 // hit would not serve the cell (the widgetContent gate fails closed): the tab
 // is behind.
 //
@@ -108,18 +137,15 @@ func BehindKeys(ctx context.Context, held map[string]HeldDigests) []string {
 // published RBAC snapshot) and reused by every caller: the arm (ArmGated),
 // the catch-up check (BehindKeys), a written frame (NoteFrameWritten) and a
 // class move (GatedMoved). The /call hit that stamps the header fills it with
-// the digest of the bytes it wrote (noteServedView); it never reads it.
-func servedDigestNow(ctx context.Context, class string, e *cache.ResolvedEntry) string {
+// the digest of the bytes it wrote (gateNotingServedView); it never reads it.
+func servedDigestNow(v servedViewer, class string, e *cache.ResolvedEntry) string {
 	if class == cache.CacheEntryClassWidgetContent {
-		ui, err := xcontext.UserInfo(ctx)
-		if err != nil {
+		if !v.known {
 			return "" // the gate refuses a request with no identity
 		}
 		// #1430 — one gate per (the cell's answer, this identity, the published
 		// RBAC snapshot): every input the gate reads (cache/served_view_memo.go).
-		return e.ServedViewDigest(cache.ServedViewIdentityOf(ui.Username, ui.Groups), func() (string, bool) {
-			return gatedAnswerDigest(ctx, e)
-		})
+		return e.ServedViewDigest(v.id, func() (string, bool) { return gatedAnswerDigest(v.ctx, e) })
 	}
 	return e.ContentDigest()
 }
@@ -135,13 +161,18 @@ func gatedAnswerDigest(ctx context.Context, e *cache.ResolvedEntry) (string, boo
 	return cache.AnswerDigest(gated, e.StageOutcomes), true
 }
 
-// noteServedView stores the digest a widgetContent /call hit stamped for ctx's
-// identity (#1430), so that identity's next /refreshes arm reuses it. before
-// is cache.ServedViewRBACNow() read BEFORE the hit's gate ran.
-func noteServedView(ctx context.Context, e *cache.ResolvedEntry, before cache.ServedViewRBAC, digest string) {
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		return
+// gateNotingServedView runs gate, the serve-time gate of a /call hit on e, and
+// returns its result with fill: called with the digest of the bytes the hit
+// wrote, it stores that digest for ctx's identity (#1430), so the identity's
+// next /refreshes arm reuses it. The RBAC state is read here, BEFORE the gate,
+// so a digest gated across a snapshot or mode change is never stored. The hit
+// never reads the memo: its header is the digest of what it wrote.
+func gateNotingServedView(ctx context.Context, e *cache.ResolvedEntry, gate func() ([]byte, bool)) (gated []byte, served bool, fill func(digest string)) {
+	before := cache.ServedViewRBACNow()
+	gated, served = gate()
+	return gated, served, func(digest string) {
+		if v := servedViewerOf(ctx); v.known {
+			e.NoteServedView(v.id, before, digest)
+		}
 	}
-	e.NoteServedView(cache.ServedViewIdentityOf(ui.Username, ui.Groups), before, digest)
 }

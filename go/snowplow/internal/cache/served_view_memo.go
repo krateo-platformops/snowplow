@@ -8,21 +8,34 @@
 // every armed gated key, also when nothing it reads had changed (bench run
 // 26i: 55 cpu-s per 1,533 profiled seconds, +4.8% customer-path CPU).
 //
-// THE KEY IS EVERY INPUT OF THE GATE. The served digest is a function of
-// exactly three things, and the memo names each one exactly:
+// THE KEY IS EVERY INPUT OF THE GATE. The served digest is a function of three
+// things, which the memo names, and of the mode the RBAC evaluator runs in,
+// which it does not name: outside the one mode in which the evaluator reads
+// the published snapshot, nothing is stored or reused (THE MODE, below).
 //
 //   - the cell's answer (its body and its stored stage outcomes): the entry's
 //     ContentDigest. The memo belongs to the answer, not to the entry object:
 //     a re-Put carries it to the new entry (putCoreLocked), and it is dropped
 //     whole the first time it is read for an entry whose answer differs. An
 //     identical re-Put (most refresh Puts) therefore keeps it;
-//   - the requester: the exact username and group set (ServedViewIdentity).
-//     Every verdict is about this requester; the snapshot does not name it;
+//   - the requester: the username and the group set, as one fixed-size
+//     digest of their length-prefixed encoding (ServedViewIdentity). Every
+//     verdict is about this requester; the snapshot does not name it;
 //   - the RBAC state every verdict is read from: the published RBAC snapshot,
 //     named by its PublishSeq (ServedViewRBAC). A result is stored only when
 //     that snapshot is complete (Synced) and is still the published one after
 //     the gate ran, so a stored digest was computed against one snapshot, and
 //     it is reused only while that snapshot is the published one.
+//
+// THE MODE. Before it reads the snapshot the evaluator branches twice
+// (rbac.EvaluateRBAC): with the cache disabled it asks the apiserver with the
+// requester's credential, and with no watcher wired it denies everything. In
+// both, the verdicts are not a function of the published snapshot, so a
+// digest gated there must not be stored under its sequence, and a stored one
+// must not be reused. ServedViewRBACNow therefore reads the mode at the same
+// point as the snapshot and is storable only when the cache is enabled, the
+// watcher is wired and the snapshot is complete; the before/after compare
+// around the gate covers a mode that changes while the gate runs.
 //
 // The identity CLASS is deliberately not the key. It moves after the snapshot
 // it reflects (the sub-generation bumps are flushed after the Store), a
@@ -40,56 +53,77 @@
 // (answer, identity, snapshot) wait for the one gate and share its digest;
 // callers for another identity are never blocked by it.
 //
-// NO BODY. A slot holds a digest string and a sequence number. The gated bytes
-// are discarded by the caller exactly as before. Identities are held in memory
-// only, like recentHitters: no String method, never logged, never exported on
-// /debug, never copied into ResolvedEntryMeta.
+// NO BODY, NO NAME. A slot holds a digest string and a sequence number, under
+// a 32-byte identity digest: neither a served byte nor a username or group
+// name is kept, and a slot's size does not depend on how many groups the
+// requester carries (an external identity provider may send hundreds). The
+// gated bytes are discarded by the caller exactly as before. Nothing of it is
+// logged, exported on /debug or copied into ResolvedEntryMeta.
 package cache
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-// ServedViewIdentity is the exact requester a served digest was gated for: the
-// username and the canonical (sorted, 0x00-joined) group set. Exact, not
-// hashed: two different identities never share a slot.
-type ServedViewIdentity struct {
-	username string
-	groups   string
-}
+// ServedViewIdentity names the requester a served digest was gated for: the
+// SHA-256 of the username and of every group, each prefixed by its length, the
+// groups in sorted order. The length prefixes make the encoding injective (no
+// two (username, group multiset) pairs encode alike, whatever bytes a name
+// carries), so two identities share a slot only on a SHA-256 collision. Fixed
+// size: a slot costs the same for one group or for hundreds.
+type ServedViewIdentity [sha256.Size]byte
 
 // ServedViewIdentityOf builds the identity of (username, groups). The group
-// order does not matter (no RBAC verdict depends on it).
+// order does not matter (no RBAC verdict depends on it); duplicates are kept.
+// It sorts and hashes the groups: build it ONCE per connection or request and
+// pass it down, never once per key.
 func ServedViewIdentityOf(username string, groups []string) ServedViewIdentity {
-	id := ServedViewIdentity{username: username}
-	switch len(groups) {
-	case 0:
-	case 1:
-		id.groups = groups[0]
-	default:
-		sorted := make([]string, len(groups))
+	sorted := groups
+	if !sort.StringsAreSorted(groups) {
+		sorted = make([]string, len(groups))
 		copy(sorted, groups)
 		sort.Strings(sorted)
-		id.groups = strings.Join(sorted, "\x00")
 	}
-	return id
+	size := 8 + len(username) + 8
+	for _, g := range sorted {
+		size += 8 + len(g)
+	}
+	enc := make([]byte, 0, size)
+	enc = binary.LittleEndian.AppendUint64(enc, uint64(len(username)))
+	enc = append(enc, username...)
+	enc = binary.LittleEndian.AppendUint64(enc, uint64(len(sorted)))
+	for _, g := range sorted {
+		enc = binary.LittleEndian.AppendUint64(enc, uint64(len(g)))
+		enc = append(enc, g...)
+	}
+	return sha256.Sum256(enc)
 }
 
 // ServedViewRBAC names the RBAC state a gate reads: the published snapshot's
-// PublishSeq, and whether a result gated against it may be stored.
+// PublishSeq, and whether a result gated against it may be stored (the
+// evaluator is in the mode that reads that snapshot, and it is complete).
 type ServedViewRBAC struct {
 	seq      uint64
 	complete bool
 }
 
-// ServedViewRBACNow reads the published RBAC snapshot's name. Read it BEFORE
-// the gate runs. Not storable when there is no snapshot, when it carries no
-// sequence, or when it was built before every RBAC informer had synced (a role
-// not yet listed denies, and its later arrival is not always a new class).
+// ServedViewRBACNow reads the evaluator's mode and the published RBAC
+// snapshot's name, at one point. Read it BEFORE the gate runs. Not storable:
+//
+//   - when the cache is disabled (the evaluator asks the apiserver) or no
+//     watcher is wired (it denies everything): the verdicts are then not read
+//     from the snapshot at all;
+//   - when there is no snapshot, when it carries no sequence, or when it was
+//     built before every RBAC informer had synced (a role not yet listed
+//     denies, and its later arrival is not always a new class).
 func ServedViewRBACNow() ServedViewRBAC {
+	if Disabled() || Global() == nil {
+		return ServedViewRBAC{}
+	}
 	snap := rbacSnap.Load()
 	if snap == nil {
 		return ServedViewRBAC{}
@@ -215,8 +249,9 @@ func (e *ResolvedEntry) ServedViewDigest(id ServedViewIdentity, gate func() (str
 		m.drop(id, s)
 		return mine
 	}
-	// The slot's own gate stored nothing (a refusal, or the snapshot moved
-	// while it ran): answer live, as before #1430.
+	// A caller that found the slot's gate already run, with nothing stored (a
+	// refusal, a snapshot or a mode that moved while it ran, a gate that
+	// panicked): the slot has no answer for it. Answer live, as before #1430.
 	m.drop(id, s)
 	servedViewGateRunsTotal.Add(1)
 	d, _ := gate()

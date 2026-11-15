@@ -16,7 +16,14 @@ package dispatchers
 //	P4  parity: over shells × identities × a sequence of RBAC states, cold,
 //	    warm and in shuffled order, the memoised digest equals the uncached one.
 //	P5  the widgetContent /call hit stores the digest it stamped: the same
-//	    identity's arm runs no gate and holds exactly that digest.
+//	    identity's arm runs no gate and holds exactly that digest. A hit on a
+//	    WARM memo still stamps the digest of the bytes it wrote: it reads
+//	    nothing from the memo, and replaces what the memo held.
+//	P6  the /call fill reads the RBAC state before its gate: a publish that
+//	    lands while the gate runs leaves nothing stored.
+//	P7  the evaluator's mode: a digest gated with no watcher wired, or with the
+//	    cache disabled, is never the answer once the evaluator reads the
+//	    snapshot again.
 
 import (
 	"context"
@@ -47,6 +54,7 @@ func p1430Setup(t *testing.T) dynamic.Interface {
 	reset()
 	t.Cleanup(reset)
 	dyn := h1BuildWatcherWithRA(t)
+	p1430Quiet(t)
 	if !cache.ServedViewRBACNow().Storable() {
 		t.Fatal("PRE: the harness published no complete RBAC snapshot; nothing would be stored and every arm below would pass vacuously")
 	}
@@ -101,18 +109,51 @@ func p1430Binding(name, role, subjectKind, subject string) *unstructured.Unstruc
 		"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": role}}}
 }
 
+// p1430Quiet waits until no RBAC snapshot rebuild is in flight.
+func p1430Quiet(t *testing.T) {
+	t.Helper()
+	if err := cache.Global().WaitRBACQuiescentForTest(10 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // p1430Await waits until ctx's identity may (or may not) do verb on the panel
-// the shells name, then lets the #703 follow-up publish land.
+// the shells name, and until the RBAC writer is quiet with that still true
+// (the #703 follow-up publish runs in the same writer slot).
 func p1430Await(t *testing.T, ctx context.Context, verb string, want bool) {
 	t.Helper()
+	can := func() bool {
+		return rbac.UserCan(ctx, rbac.UserCanOptions{Verb: verb, GroupResource: h1WidgetGVR.GroupResource(), Namespace: h1NS, Name: "target"})
+	}
 	deadline := time.Now().Add(10 * time.Second)
-	for rbac.UserCan(ctx, rbac.UserCanOptions{Verb: verb, GroupResource: h1WidgetGVR.GroupResource(), Namespace: h1NS, Name: "target"}) != want {
+	for {
+		if can() == want {
+			p1430Quiet(t)
+			if can() == want {
+				return
+			}
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("PRE: the RBAC change never made %s=%v", verb, want)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(100 * time.Millisecond)
+}
+
+// p1430UnderOneSnapshot runs measure until the published RBAC snapshot is the
+// same before and after it, so a count taken inside it is of one snapshot: a
+// publish that lands during a pass voids that pass, it does not fail it.
+func p1430UnderOneSnapshot(t *testing.T, measure func()) {
+	t.Helper()
+	for pass := 0; pass < 50; pass++ {
+		p1430Quiet(t)
+		before := cache.ServedViewRBACNow()
+		measure()
+		if cache.ServedViewRBACNow() == before {
+			return
+		}
+	}
+	t.Fatal("PRE: the RBAC snapshot never held still for one measured pass")
 }
 
 func p1430Arm(ctx context.Context, key string) *SubscriptionRotationTracker {
@@ -192,16 +233,27 @@ func TestIssue1430_P2_APublishBetweenTwoArmsIsGatedAgain(t *testing.T) {
 	mk(p1430RBACGVR("clusterrolebindings"), p1430Binding("alice-deletes-1430", "panel-deleter-1430", "User", "alice-1430"))
 	p1430Await(t, alice, "delete", true)
 
-	before := cache.RefreshBroadcasterStatsSnapshot()
-	a1 := p1430Arm(alice, key).gated[key].served
+	// Alice's stored digest is of the snapshot before the grant, whatever
+	// number of publishes followed: the first arm after them gates once and
+	// discards one slot.
+	var a1 string
+	var runs, moved uint64
+	first := true
+	p1430UnderOneSnapshot(t, func() {
+		before := cache.RefreshBroadcasterStatsSnapshot()
+		a1 = p1430Arm(alice, key).gated[key].served
+		after := cache.RefreshBroadcasterStatsSnapshot()
+		if first {
+			runs, moved = after.GatedViewGateRuns-before.GatedViewGateRuns, after.GatedViewRBACMoved-before.GatedViewRBACMoved
+			first = false
+		}
+	})
 	if a1 == a0 || a1 != p1430Live(alice, e) {
 		t.Fatalf("P2 RED: after a grant that changes what alice is served her arm holds %q (before: %q, uncached now: %q) — "+
 			"a stored digest outlived the RBAC snapshot it was gated under", a1, a0, p1430Live(alice, e))
 	}
-	after := cache.RefreshBroadcasterStatsSnapshot()
-	if after.GatedViewGateRuns-before.GatedViewGateRuns != 1 || after.GatedViewRBACMoved-before.GatedViewRBACMoved != 1 {
-		t.Fatalf("P2 RED: gate_runs Δ=%d snapshot_moved Δ=%d, want 1 and 1",
-			after.GatedViewGateRuns-before.GatedViewGateRuns, after.GatedViewRBACMoved-before.GatedViewRBACMoved)
+	if runs != 1 || moved != 1 {
+		t.Fatalf("P2 RED: gate_runs Δ=%d snapshot_moved Δ=%d on the first arm after the grant, want 1 and 1", runs, moved)
 	}
 	// The live connection's own check (#1328) reads the same digest.
 	if got := ta.GatedMoved(); len(got) != 1 || got[0] != key {
@@ -228,7 +280,7 @@ func TestIssue1430_P3_TheDigestFollowsTheAnswerNotTheEntry(t *testing.T) {
 				"&namespace=" + h1NS + "&name=target"}})
 	}
 	e0 := p1430Put(t, key, item("one"), "")
-	d0 := servedDigestNow(alice, p1430Class, e0)
+	d0 := servedDigestNow(servedViewerOf(alice), p1430Class, e0)
 	if d0 == "" || d0 != p1430Live(alice, e0) {
 		t.Fatalf("PRE: %q", d0)
 	}
@@ -239,7 +291,7 @@ func TestIssue1430_P3_TheDigestFollowsTheAnswerNotTheEntry(t *testing.T) {
 		t.Fatal("PRE: the re-Put did not store a new entry")
 	}
 	before := cache.RefreshBroadcasterStatsSnapshot()
-	if d := servedDigestNow(alice, p1430Class, e1); d != d0 {
+	if d := servedDigestNow(servedViewerOf(alice), p1430Class, e1); d != d0 {
 		t.Fatalf("P3 RED: identical re-Put: %q, want %q", d, d0)
 	}
 	if runs := cache.RefreshBroadcasterStatsSnapshot().GatedViewGateRuns - before.GatedViewGateRuns; runs != 0 {
@@ -249,7 +301,7 @@ func TestIssue1430_P3_TheDigestFollowsTheAnswerNotTheEntry(t *testing.T) {
 
 	// Another body under the same key.
 	e2 := p1430Put(t, key, item("two"), "")
-	d2 := servedDigestNow(alice, p1430Class, e2)
+	d2 := servedDigestNow(servedViewerOf(alice), p1430Class, e2)
 	if d2 == d0 || d2 != p1430Live(alice, e2) {
 		t.Fatalf("P3 RED: after the shell's body changed the memo answered %q (before %q, uncached %q) — a stored digest "+
 			"survived a change of the bytes it was gated from", d2, d0, p1430Live(alice, e2))
@@ -260,7 +312,7 @@ func TestIssue1430_P3_TheDigestFollowsTheAnswerNotTheEntry(t *testing.T) {
 
 	// The same body, other stage outcomes: another answer (#1319).
 	e3 := p1430Put(t, key, item("two"), `[{"stage":"s","reason":"denied"}]`)
-	d3 := servedDigestNow(alice, p1430Class, e3)
+	d3 := servedDigestNow(servedViewerOf(alice), p1430Class, e3)
 	if d3 == d2 || d3 != p1430Live(alice, e3) {
 		t.Fatalf("P3 RED: same body, other stage outcomes: %q (before %q, uncached %q)", d3, d2, p1430Live(alice, e3))
 	}
@@ -337,7 +389,7 @@ func TestIssue1430_P4_Parity_TheMemoisedDigestIsTheUncachedOne(t *testing.T) {
 			for _, c := range cells {
 				id, e := identities[c.i], entries[c.s]
 				live := p1430Live(id.ctx, e)
-				if got := servedDigestNow(id.ctx, p1430Class, e); got != live {
+				if got := servedDigestNow(servedViewerOf(id.ctx), p1430Class, e); got != live {
 					t.Fatalf("P4 RED [%s, pass %d]: shell %s for %s: memoised %q, uncached %q", state, pass, shells[c.s].cell,
 						id.name, got, live)
 				}
@@ -346,7 +398,7 @@ func TestIssue1430_P4_Parity_TheMemoisedDigestIsTheUncachedOne(t *testing.T) {
 		}
 		// Group order is not part of the identity.
 		for s := range shells {
-			if a, b := servedDigestNow(identities[3].ctx, p1430Class, entries[s]), servedDigestNow(identities[4].ctx, p1430Class, entries[s]); a != b {
+			if a, b := servedDigestNow(servedViewerOf(identities[3].ctx), p1430Class, entries[s]), servedDigestNow(servedViewerOf(identities[4].ctx), p1430Class, entries[s]); a != b {
 				t.Fatalf("P4 RED [%s]: the same groups in another order gave %q and %q", state, a, b)
 			}
 		}
@@ -437,8 +489,128 @@ func TestIssue1430_P5_TheCallHitFillsWhatItsIdentityArmsOn(t *testing.T) {
 	if runs := after.GatedViewGateRuns - mid.GatedViewGateRuns; runs != 0 {
 		t.Fatalf("P5 RED: the arm that follows its identity's /call hit ran the gate %d times, want 0", runs)
 	}
-	if got := BehindKeys(cache.WithInformerOnlyReads(ctx), map[string]HeldDigests{contentKey: {Class: p1430Class, Digests: []string{stamped}}}); len(got) != 0 {
+	if got := tr.Behind(map[string]HeldDigests{contentKey: {Class: p1430Class, Digests: []string{stamped}}}); len(got) != 0 {
 		t.Fatalf("P5 RED: a tab holding the digest its /call stamped is behind (%v)", got)
+	}
+
+	// A hit on a WARM memo. The memo is made to hold a digest that is NOT the
+	// one of the bytes the hit writes: if the hit read the memo, it would stamp
+	// it. It must stamp what it wrote, run no arm-side gate, reuse nothing, and
+	// leave the memo holding the digest it stamped.
+	entry, ok := handle.Get(contentKey)
+	if !ok {
+		t.Fatal("PRE: the shell is gone")
+	}
+	viewer := servedViewerOf(ctx)
+	const planted = "v1.ffffffffffffffffffffffffffffffff"
+	entry.NoteServedView(viewer.id, cache.ServedViewRBACNow(), planted)
+	if d := servedDigestNow(viewer, p1430Class, entry); d != planted {
+		t.Fatalf("PRE: the memo is not warm with the planted digest (%q)", d)
+	}
+	warm := cache.RefreshBroadcasterStatsSnapshot()
+	rec2 := k1134Get(h, Widgets(), widgetGV, k547WidgetGVR.Resource, k547WName, 0, k547Changed)
+	hit := cache.RefreshBroadcasterStatsSnapshot()
+	if got := rec2.Header().Get(RefreshDigestHeader); got != stamped || got != cache.ContentDigest(rec2.Body.Bytes()) {
+		t.Fatalf("P5 RED: a /call hit on a warm memo stamped %q; the bytes it wrote digest to %q (the memo held %q) — "+
+			"the hit must digest what it wrote and never read the memo", got, cache.ContentDigest(rec2.Body.Bytes()), planted)
+	}
+	if hit.GatedViewReused != warm.GatedViewReused || hit.GatedViewGateRuns != warm.GatedViewGateRuns ||
+		hit.GatedViewCallFills-warm.GatedViewCallFills != 1 {
+		t.Fatalf("P5 RED: across a /call hit on a warm memo: reused Δ=%d gate_runs Δ=%d call_fills Δ=%d, want 0, 0, 1",
+			hit.GatedViewReused-warm.GatedViewReused, hit.GatedViewGateRuns-warm.GatedViewGateRuns, hit.GatedViewCallFills-warm.GatedViewCallFills)
+	}
+	if d := servedDigestNow(viewer, p1430Class, entry); d != stamped {
+		t.Fatalf("P5 RED: after the hit the memo holds %q, want the digest the hit stamped %q", d, stamped)
+	}
+}
+
+func TestIssue1430_P6_TheCallFillReadsTheRBACStateBeforeItsGate(t *testing.T) {
+	p1430Setup(t)
+	alice := p1430Ctx("alice-1430", "team-1430")
+	e := p1430Put(t, "wc-1430-p6", d1324Shell(true), "")
+
+	// The control: with no publish during the gate, the fill stores.
+	gated, served, fill := gateNotingServedView(alice, e, func() ([]byte, bool) { return gateWidgetEnvelope(alice, e.Raw()) })
+	if !served {
+		t.Fatal("PRE: the gate refused")
+	}
+	fill(cache.AnswerDigest(gated, e.StageOutcomes))
+	if n := e.ServedViewSlotsForTest(); n != 1 {
+		t.Fatalf("PRE: the fill stored %d slots with no publish in flight, want 1", n)
+	}
+
+	// A publish lands while the gate runs: the verdicts may be of either
+	// snapshot, so the digest names neither.
+	f := p1430Put(t, "wc-1430-p6-mid", d1324Shell(true), "")
+	gated, _, fill = gateNotingServedView(alice, f, func() ([]byte, bool) {
+		g, s := gateWidgetEnvelope(alice, f.Raw())
+		cache.RebuildRBACSnapshotForTest(cache.Global()) // a new sequence, mid-gate
+		return g, s
+	})
+	fill(cache.AnswerDigest(gated, f.StageOutcomes))
+	if n := f.ServedViewSlotsForTest(); n != 0 {
+		t.Fatalf("P6 RED: a /call fill whose gate ran across an RBAC publish stored %d slot(s) — the fill site read the "+
+			"RBAC state after its gate, not before", n)
+	}
+	// A ctx with no identity fills nothing.
+	_, _, fill = gateNotingServedView(context.Background(), f, func() ([]byte, bool) { return nil, false })
+	fill("v1.00000000000000000000000000000000")
+	if n := f.ServedViewSlotsForTest(); n != 0 {
+		t.Fatalf("P6 RED: a fill with no identity stored %d slot(s)", n)
+	}
+}
+
+func TestIssue1430_P7_ADigestGatedInAnotherEvaluatorModeIsNeverTheAnswer(t *testing.T) {
+	modes := map[string]func(t *testing.T) (leave func()){
+		"watcher_not_wired": func(t *testing.T) func() {
+			w := cache.Global()
+			cache.SetGlobal(nil)
+			return func() { cache.SetGlobal(w) }
+		},
+		"cache_disabled": func(t *testing.T) func() {
+			t.Setenv("CACHE_ENABLED", "false")
+			return func() { t.Setenv("CACHE_ENABLED", "true") }
+		},
+	}
+	for name, enter := range modes {
+		t.Run(name, func(t *testing.T) {
+			p1430Setup(t)
+			// The harness lets h1User get panels; the shell asks exactly that, so
+			// the real view differs from the one a deny-everything mode gives.
+			reader := p1430Ctx(h1User)
+			viewer := servedViewerOf(reader)
+			shell := fakeEnvelope([]map[string]any{{"id": "get", "verb": "GET", "allowed": false,
+				"path": "/call?resource=" + h1WidgetGVR.Resource + "&apiVersion=" + h1WidgetGVR.Group + "/" + h1WidgetGVR.Version +
+					"&namespace=" + h1NS + "&name=target"}})
+			e := p1430Put(t, "wc-1430-p7-"+name, shell, "")
+			real := p1430Live(reader, e)
+
+			seq := cache.ServedViewRBACNow()
+			leave := enter(t)
+			other := servedDigestNow(viewer, p1430Class, e)
+			if other == real || other != p1430Live(reader, e) {
+				t.Fatalf("PRE: in mode %s the gate gives %q (uncached %q, real view %q); the arm needs a mode whose view differs",
+					name, other, p1430Live(reader, e), real)
+			}
+			gated, _, fill := gateNotingServedView(reader, e, func() ([]byte, bool) { return gateWidgetEnvelope(reader, e.Raw()) })
+			fill(cache.AnswerDigest(gated, e.StageOutcomes))
+			leave()
+			if cache.ServedViewRBACNow() != seq {
+				t.Fatal("PRE: the RBAC snapshot moved; the arm must change the mode under ONE snapshot")
+			}
+			if got := servedDigestNow(viewer, p1430Class, e); got != real {
+				t.Fatalf("P7 RED: back in the snapshot-reading mode, under the same snapshot, the memo answered %q; the uncached "+
+					"gate gives %q — a digest gated in mode %s was stored", got, real, name)
+			}
+
+			// And the reverse: a digest stored while the evaluator reads the
+			// snapshot is not the answer in the other mode.
+			enter(t)
+			if got, live := servedDigestNow(viewer, p1430Class, e), p1430Live(reader, e); got != live {
+				t.Fatalf("P7 RED: in mode %s the memo answered the stored %q, the uncached gate gives %q", name, got, live)
+			}
+			leave()
+		})
 	}
 }
 
@@ -453,6 +625,12 @@ func BenchmarkIssue1430_ArmGated(b *testing.B) {
 	prev := cache.LiveRBACSnapshot()
 	cache.PublishRBACSnapshotForTest(&cache.RBACSnapshot{Synced: true, PublishSeq: 1430})
 	b.Cleanup(func() { cache.PublishRBACSnapshotForTest(prev) })
+	prevW := cache.Global()
+	cache.SetGlobal(&cache.ResourceWatcher{}) // the evaluator reads the snapshot only with a watcher wired
+	b.Cleanup(func() { cache.SetGlobal(prevW) })
+	if !cache.ServedViewRBACNow().Storable() {
+		b.Fatal("PRE: nothing would be stored; the memoised arm would measure the uncached gate")
+	}
 	items := make([]map[string]any, 40)
 	for i := range items {
 		items[i] = map[string]any{"id": i, "verb": "DELETE", "allowed": true,
