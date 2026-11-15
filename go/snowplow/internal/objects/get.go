@@ -20,6 +20,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -33,6 +34,12 @@ type Result struct {
 	GVR          schema.GroupVersionResource
 	Unstructured *unstructured.Unstructured
 	Err          *response.Status
+	// TypeNotInstalled is set, with Err, when this read decided that its type
+	// is not installed on the cluster (#1414). It is the only place that
+	// decision is made and the only place the error is created; a caller that
+	// turns Err into an error passes THIS on, so the answer is recognised by
+	// its Go type and never by what a Status looks like (#1429).
+	TypeNotInstalled *statusdetails.TypeNotInstalledError
 	// RequesterDialled: the read left snowplow under the requester's own
 	// credential (getFromAPIServer). It also marked the ExternalTouchedSink on
 	// ctx; a caller that installs its sinks only after the read (the dispatcher's
@@ -328,7 +335,9 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
 		} else if dynamic.IsNotServed(err) {
-			res.Err = typeNotInstalled(res.GVR) // #1414 — 424, before the object's 404
+			// #1414 — 424, before the object's 404.
+			res.TypeNotInstalled = typeNotInstalled(res.GVR)
+			res.Err = res.TypeNotInstalled.Status()
 		} else if apierrors.IsNotFound(err) {
 			res.Err = response.New(http.StatusNotFound, err)
 		}
@@ -379,9 +388,9 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	return
 }
 
-// ReasonFailedDependency is the Status reason of a 424 answer. Neither plumbing
-// nor apimachinery names one for 424.
-const ReasonFailedDependency response.StatusReason = "FailedDependency"
+// ReasonFailedDependency is the Status reason of a 424 answer
+// (statusdetails.ReasonFailedDependency, the one definition).
+const ReasonFailedDependency = statusdetails.ReasonFailedDependency
 
 // typeNotInstalled is the answer to a read whose type the apiserver does not
 // serve (#1414): 424 Failed Dependency, not 404. A 404 says an OBJECT is not
@@ -391,13 +400,16 @@ const ReasonFailedDependency response.StatusReason = "FailedDependency"
 //
 // The message is shown to users as it is, so it is built from the type's
 // coordinates alone: no object name or namespace, no identity, none of the
-// apiserver's text. One rule for every type.
-func typeNotInstalled(gvr schema.GroupVersionResource) *response.Status {
-	st := response.New(http.StatusFailedDependency, nil)
-	st.Message = fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion())
-	st.Status = response.StatusFailure
-	st.Reason = ReasonFailedDependency
-	return st
+// apiserver's text. One rule for every type. The body, with the type in its
+// details (#1429), is the error's Status().
+//
+// This is the ONLY constructor of the error in the module
+// (statusdetails/typenotinstalled_fence_test.go).
+func typeNotInstalled(gvr schema.GroupVersionResource) *statusdetails.TypeNotInstalledError {
+	return &statusdetails.TypeNotInstalledError{
+		GVR:     gvr,
+		Message: fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion()),
+	}
 }
 
 // recordGetDep registers an exact-object dependency edge for a
