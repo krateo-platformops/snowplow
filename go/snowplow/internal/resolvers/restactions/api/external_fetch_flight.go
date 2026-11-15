@@ -444,11 +444,14 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 			// The value is not ours to predict (a transport's panic can carry a
 			// URL or a header): its type, and its text only when it is an
 			// error, with any URL in it redacted.
-			attrs := []any{slog.String("flight", hex.EncodeToString(f.key[:8])), slog.String("panic_type", fmt.Sprintf("%T", p))}
+			panicText := ""
 			if perr, ok := p.(error); ok {
-				attrs = append(attrs, slog.String("panic", redact.ErrorURL(perr).Error()))
+				panicText = redact.ErrorURL(perr).Error()
 			}
-			slog.Default().ErrorContext(f.ctx, "external read: the shared request panicked after its last waiter left", attrs...)
+			slog.Default().ErrorContext(f.ctx, "external read: the shared request panicked after its last waiter left",
+				slog.String("flight", hex.EncodeToString(f.key[:8])),
+				slog.String("panic_type", fmt.Sprintf("%T", p)),
+				slog.String("panic", panicText))
 		}
 		// Raised again in every waiter, where a panic in the transport
 		// surfaces without sharing: in the reader's own goroutine.
