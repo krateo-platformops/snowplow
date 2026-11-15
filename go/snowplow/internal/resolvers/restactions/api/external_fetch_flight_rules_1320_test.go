@@ -577,6 +577,48 @@ func TestExternalFlight1320_AnUnsharedRequestsSpanSaysNothingOfJoiners(t *testin
 	}
 }
 
+// The joiner count goes on the wire request's CLIENT span and no other: the
+// span whose id went on the wire. Here the span found on the sent request's
+// context is the starter's own request span (the scripted transport opens no
+// client span), and it must not be marked.
+func TestExternalFlight1320_TheJoinerCountIsOnlyOnTheSpanThatWentOnTheWire(t *testing.T) {
+	c := wireCache(t)
+	tp, exp := spansOf(t)
+	release := make(chan struct{})
+	next := &scriptedWire{fn: func(_ int64, req *http.Request) (*http.Response, error) {
+		httptrace.ContextClientTrace(req.Context()).WroteHeaderField("Traceparent", []string{"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"})
+		<-release
+		return scriptedOK(req, `{}`), nil
+	}}
+	sctx, sspan := tp.Tracer("test").Start(context.Background(), "request starter")
+	starter, sreq := newReaderWire(t, c, next, sctx)
+	t1 := goTrip(starter, sreq)
+	eventually(2*time.Second, func() bool { return next.calls.Load() == 1 })
+	joiner, jreq := newReaderWire(t, c, next, context.Background())
+	t2 := goTrip(joiner, jreq)
+	if !eventually(2*time.Second, func() bool { return c.flightJoined.Load() == 1 }) {
+		t.Fatal("SETUP: the second reader did not join")
+	}
+	close(release)
+	for _, ch := range []<-chan tripResult{t1, t2} {
+		r := <-ch
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		r.resp.Body.Close()
+	}
+	sspan.End()
+	spans := exp.GetSpans().Snapshots()
+	if len(spans) != 1 {
+		t.Fatalf("SETUP: %d spans; want the starter's request span alone", len(spans))
+	}
+	for _, a := range spans[0].Attributes() {
+		if string(a.Key) == "snowplow.upstream.joiners" {
+			t.Fatalf("%s, which did not go on the wire, carries snowplow.upstream.joiners=%s", spans[0].Name(), a.Value.Emit())
+		}
+	}
+}
+
 // The record of which request answered a fetch follows the fetch's LAST
 // attempt: a reader whose shared attempt was answered (here: 503) and that
 // then sends its own request is no longer "answered by another reader's
