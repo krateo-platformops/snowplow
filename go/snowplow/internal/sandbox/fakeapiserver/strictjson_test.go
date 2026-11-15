@@ -9,7 +9,9 @@ package fakeapiserver
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -175,4 +177,266 @@ func TestStrictJSON_NewReadsEveryKeyExactly(t *testing.T) {
 	eq(t, page(`"items"`, `"Items"`), `object page 0: the top level holds the key "Items", which is "items" only by ignoring case`, "a page's Items")
 	eq(t, page(`"items"`, `"items":[],"items"`), `object page 0: the top level holds the key "items" twice`, "a page's items twice")
 	eq(t, page(`"kind"`, `"kind":"Secret","kind"`), `object page 0: items[0] holds the key "kind" twice`, "a key twice in an object")
+}
+
+// The fold is encoding/json's own: simple case folding, one code point for one. A key it folds to
+// a field is refused; one it does not is a key the loader does not know, and is left alone.
+// agentiko-sandbox keeps the same sixteen rows.
+func TestStrictJSON_FoldsAsEncodingJSONDoes(t *testing.T) {
+	type fields struct {
+		Kind      string `json:"kind"`
+		Resources string `json:"resources"`
+		Class     string `json:"class"`
+		ID        string `json:"id"`
+		Fi        string `json:"fi"`
+		Ring      string `json:"å"`
+		Sigma     string `json:"σ"`
+	}
+	for _, c := range []struct {
+		key, field, what string
+		folds            bool
+	}{
+		{"KIND", "kind", "ASCII upper case", true},
+		{"ID", "id", "ASCII upper case", true},
+		{"Kind", "kind", "the Kelvin sign U+212A for k", true},
+		{"reſources", "resources", "the long s U+017F for s", true},
+		{"Å", "å", "the Angstrom sign U+212B", true},
+		{"Å", "å", "capital A with ring U+00C5", true},
+		{"Σ", "σ", "capital sigma U+03A3", true},
+		{"ς", "σ", "final sigma U+03C2", true},
+		{"claß", "class", "sharp s U+00DF for ss: full folding", false},
+		{"ﬁ", "fi", "the ligature U+FB01 for fi: full folding", false},
+		{"İd", "id", "dotted capital I U+0130: Turkish", false},
+		{"ıd", "id", "dotless i U+0131: Turkish", false},
+		{"kınd", "kind", "dotless i inside", false},
+		{"ｋｉｎｄ", "kind", "fullwidth letters", false},
+		{"Å", "å", "A and a combining ring: a combining sequence", false},
+		{"å", "å", "a and a combining ring: not normalised", false},
+	} {
+		key, _ := json.Marshal(c.key)
+		_, err := strictJSON([]byte(`{`+string(key)+`:"v"}`), reflect.TypeOf(fields{}))
+		want := ""
+		if c.folds {
+			want = `the top level holds the key ` + strconv.Quote(c.key) + `, which is ` + strconv.Quote(c.field) + ` only by ignoring case`
+		}
+		got := ""
+		if err != nil {
+			got = err.Error()
+		}
+		eq(t, got, want, fmt.Sprintf("%s (%U)", c.what, []rune(c.key)))
+		// And encoding/json itself: it takes the key for the field exactly when strictJSON refuses it.
+		var f fields
+		if err := json.Unmarshal([]byte(`{`+string(key)+`:"v"}`), &f); err != nil {
+			t.Fatal(err)
+		}
+		eq(t, f != fields{}, c.folds, fmt.Sprintf("encoding/json on %s (%U)", c.what, []rune(c.key)))
+	}
+}
+
+func nestedJSON(open, close string, n int, inner string) string {
+	return strings.Repeat(open, n) + inner + strings.Repeat(close, n)
+}
+
+const tooDeep = "the JSON is nested deeper than 1000 containers"
+
+// maxDepth: containers from the file's top level, objects and arrays alike, the top-level one at
+// depth 1. 1000 is read, 1001 is refused, by name.
+func TestStrictJSON_NestingBound(t *testing.T) {
+	eq(t, maxDepth, 1000, "maxDepth, as agentiko-sandbox's parsers hold it")
+	bare := func(text string) string {
+		if _, err := strictJSON([]byte(text), nil); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	for what, mk := range map[string]func(n int) string{
+		"arrays":            func(n int) string { return nestedJSON("[", "]", n, "") },
+		"objects":           func(n int) string { return nestedJSON(`{"a":`, "}", n-1, "{}") },
+		"arrays in objects": func(n int) string { return nestedJSON(`{"a":[`, "]}", n/2, "") + strings.Repeat(" ", n%2) },
+	} {
+		eq(t, bare(mk(1000)), "", what+": 1000 deep")
+		eq(t, bare(mk(1002)), tooDeep, what+": 1002 deep")
+	}
+	eq(t, bare(nestedJSON("[", "]", 999, "")), "", "arrays: 999 deep")
+	eq(t, bare(nestedJSON("[", "]", 1001, "")), tooDeep, "arrays: 1001 deep")
+	eq(t, bare(nestedJSON(`{"a":`, "}", 1000, "{}")), tooDeep, "objects: 1001 deep")
+	eq(t, bare(nestedJSON("[", "]", 1000, `{}`)), tooDeep, "an object under 1000 arrays")
+	eq(t, bare(nestedJSON("[", "]", 1000, `1`)), "", "a number under 1000 arrays is no container")
+	eq(t, bare(`[`+nestedJSON("[", "]", 999, "")+`,`+nestedJSON("[", "]", 999, "")+`]`), "", "two siblings, each 1000 deep in all")
+
+	// Through New: the enclosing containers count. own is the value's own depth.
+	snap := func(where string, own int) string {
+		v := nestedJSON("[", "]", own, "")
+		_, err := loadHarness(t, opts{edit: func(s map[string]any) {
+			s["scripted"].(map[string]any)["applyStatus"].([]any)[0].(map[string]any)["target"] = map[string]any{"group": "g", "resource": "r", "namespace": "n", "name": "x"}
+		}, rawSnap: func(s string) string {
+			old := map[string]string{"top": `{`, "status": `"status":{`, "target": `"target":{`}[where]
+			if !strings.Contains(s, old) {
+				t.Fatalf("no %s in the snapshot", old)
+			}
+			return strings.Replace(s, old, old+`"zz":`+v+`,`, 1)
+		}})
+		if err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	page := func(inItem bool, own int) string {
+		v := nestedJSON(`{"a":`, "}", own-1, "{}")
+		_, err := loadHarness(t, opts{rawPage: func(s string) string {
+			i := strings.Index(s, "{")
+			if inItem {
+				i = strings.Index(s, "[")
+				i += strings.Index(s[i:], "{")
+			}
+			return s[:i+1] + `"zz":` + v + `,` + s[i+1:]
+		}})
+		if err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	eq(t, snap("top", 999), "", "snapshot.json, a top-level key: 999 under 1")
+	eq(t, snap("top", 1000), "snapshot.json: "+tooDeep, "snapshot.json, a top-level key: 1000 under 1")
+	eq(t, snap("status", 995), "", "snapshot.json, a rule's status: 995 under 5")
+	eq(t, snap("status", 996), "snapshot.json: "+tooDeep, "snapshot.json, a rule's status: 996 under 5")
+	eq(t, snap("target", 995), "", "snapshot.json, a rule's target: 995 under 5")
+	eq(t, snap("target", 996), "snapshot.json: "+tooDeep, "snapshot.json, a rule's target: 996 under 5")
+	eq(t, page(false, 999), "", "an object page, a top-level key: 999 under 1")
+	eq(t, page(false, 1000), "object page 0: "+tooDeep, "an object page, a top-level key: 1000 under 1")
+	eq(t, page(true, 997), "", "an object page, inside items[0]: 997 under 3")
+	eq(t, page(true, 998), "object page 0: "+tooDeep, "an object page, inside items[0]: 998 under 3")
+	// A rule's target read on its own (its second reading, after snapshot.json's).
+	target := func(own int) string {
+		if _, err := strictJSON([]byte(nestedJSON(`{"zz":`, "}", own-1, "{}")), reflect.TypeOf(ruleTarget{})); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	eq(t, target(1000), "", "a target alone: 1000 deep")
+	eq(t, target(1001), tooDeep, "a target alone: 1001 deep")
+}
+
+// maxSafeInteger and the forms of a number: an integer (no fraction, no exponent) is read up to
+// 2^53 in magnitude; any other literal is a float and only has to be finite as a double.
+func TestStrictJSON_NumberBounds(t *testing.T) {
+	eq(t, uint64(maxSafeInteger), uint64(9007199254740992), "maxSafeInteger, 2^53, as agentiko-sandbox's parsers hold it")
+	beyond := func(at, lit string) string {
+		return at + " is the integer " + lit + ", beyond 9007199254740992 in magnitude"
+	}
+	infinite := func(at, lit string) string { return at + " is the number " + lit + ", which is not finite as a double" }
+	rows := []struct{ lit, want string }{
+		{"0", ""}, {"-0", ""}, {"1", ""}, {"-1", ""},
+		{"9007199254740991", ""}, {"9007199254740992", ""}, {"-9007199254740992", ""},
+		{"9007199254740993", "beyond"}, {"-9007199254740993", "beyond"},
+		{"9223372036854775807", "beyond"}, {"9223372036854775808", "beyond"}, {"18446744073709551616", "beyond"},
+		{"123456789012345678901234567890123456789012345678901234567890", "beyond"},
+		// A fraction or an exponent makes a float, whatever its value.
+		{"9007199254740993.0", ""}, {"9007199254740993e0", ""}, {"1e20", ""}, {"1E20", ""}, {"1e+20", ""}, {"1.5e300", ""}, {"-1.5e300", ""},
+		{"1.7976931348623157e308", ""}, {"0.1", ""}, {"-0.0", ""}, {"0e0", ""}, {"1e-400", ""}, {"5e-324", ""},
+		{"1e400", "infinite"}, {"-1e400", "infinite"}, {"1.8e308", "infinite"}, {"-1.8e308", "infinite"},
+		{"123456789012345678901234567890123456789012345678901234567890.0e300", "infinite"},
+	}
+	for _, c := range rows {
+		want := map[string]func(at string) string{
+			"":         func(string) string { return "" },
+			"beyond":   func(at string) string { return beyond(at, c.lit) },
+			"infinite": func(at string) string { return infinite(at, c.lit) },
+		}[c.want]
+		strict := func(text string, typ reflect.Type) string {
+			if _, err := strictJSON([]byte(text), typ); err != nil {
+				return err.Error()
+			}
+			return ""
+		}
+		eq(t, strict(c.lit, nil), want("the top level"), c.lit+" alone")
+		eq(t, strict(`{"a":[1,{"b":`+c.lit+`}]}`, nil), want("a[1].b"), c.lit+" in free-form JSON")
+		eq(t, strict(`{"group":"g","zz":`+c.lit+`}`, reflect.TypeOf(ruleTarget{})), want("zz"), c.lit+" in a rule's target")
+
+		// Through New: a rule's status and its target in snapshot.json, and a field of an object.
+		prefix := func(file, at string) string {
+			if w := want(at); w != "" {
+				return file + ": " + w
+			}
+			return ""
+		}
+		_, err := loadHarness(t, opts{edit: func(s map[string]any) {
+			s["scripted"].(map[string]any)["applyStatus"].([]any)[0].(map[string]any)["target"] = map[string]any{"group": "g", "resource": "r", "namespace": "n", "name": "x"}
+		}, rawSnap: func(s string) string {
+			s = strings.Replace(s, `"status":{`, `"status":{"zz":`+c.lit+`,`, 1)
+			return strings.Replace(s, `"target":{`, `"target":{"zy":`+c.lit+`,`, 1)
+		}})
+		got := ""
+		if err != nil {
+			got = err.Error()
+		}
+		// target sorts before status in the marshalled rule? Neither: the first of the two in the text is said.
+		if got != prefix("snapshot.json", "scripted.applyStatus[0].status.zz") && got != prefix("snapshot.json", "scripted.applyStatus[0].target.zy") {
+			t.Errorf("%s in snapshot.json: got %q", c.lit, got)
+		}
+		_, err = loadHarness(t, opts{rawPage: func(s string) string {
+			i := strings.Index(s, "[")
+			i += strings.Index(s[i:], "{")
+			return s[:i+1] + `"zz":` + c.lit + `,` + s[i+1:]
+		}})
+		got = ""
+		if err != nil {
+			got = err.Error()
+		}
+		eq(t, got, prefix("object page 0", "items[0].zz"), c.lit+" in an object page")
+	}
+
+	// A number as read is the number written: nothing is rounded.
+	h, err := loadHarness(t, opts{edit: func(map[string]any) {}, rawSnap: func(s string) string {
+		return strings.Replace(s, `"status":{`, `"status":{"zz":9007199254740992,`, 1)
+	}, rawPage: func(s string) string {
+		i := strings.Index(s, "[")
+		i += strings.Index(s[i:], "{")
+		return s[:i+1] + `"zz":-9007199254740992,` + s[i+1:]
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, _ := json.Marshal(h.s.rules[0].Status["zz"])
+	eq(t, string(held), "9007199254740992", "2^53 in a rule's status is held exactly")
+	for _, bucket := range h.s.store {
+		for _, obj := range bucket {
+			if v, ok := obj["zz"]; ok {
+				held, _ = json.Marshal(v)
+			}
+		}
+	}
+	eq(t, string(held), "-9007199254740992", "-2^53 in an object is held exactly")
+
+	// Where the loader reads a Go integer, a float is refused by name, before the decoder.
+	typed := func(old, lit string) string {
+		_, err := loadHarness(t, opts{edit: func(map[string]any) {}, rawSnap: func(s string) string {
+			i := strings.Index(s, old)
+			if i < 0 {
+				t.Fatalf("no %s in the snapshot", old)
+			}
+			j := i + len(old) + strings.IndexAny(s[i+len(old):], ",}")
+			return s[:i] + old + lit + s[j:]
+		}})
+		if err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	eq(t, typed(`"afterMs":`, "1500"), "", "afterMs 1500")
+	eq(t, typed(`"afterMs":`, "9007199254740992"), "", "afterMs 2^53")
+	eq(t, typed(`"afterMs":`, "9007199254740993"), "snapshot.json: "+beyond("scripted.applyStatus[0].afterMs", "9007199254740993"), "afterMs beyond 2^53")
+	eq(t, typed(`"afterMs":`, "1.5"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1.5, where an integer is read", "afterMs 1.5")
+	eq(t, typed(`"afterMs":`, "1e3"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1e3, where an integer is read", "afterMs 1e3")
+	eq(t, typed(`"afterMs":`, "1500.0"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1500.0, where an integer is read", "afterMs 1500.0")
+	eq(t, typed(`"afterMs":`, "1e400"), "snapshot.json: "+infinite("scripted.applyStatus[0].afterMs", "1e400"), "afterMs 1e400")
+	eq(t, typed(`"schema":`, "1.0"), "snapshot.json: schema is the number 1.0, where an integer is read", "schema 1.0")
+	eq(t, typed(`"schema":`, "9007199254740993"), "snapshot.json: "+beyond("schema", "9007199254740993"), "schema beyond 2^53")
+
+	// Forms JSON forbids are the tokenizer's to refuse, as before.
+	for _, lit := range []string{"01", "-01", "+1", ".5", "1.", "1e", "1e+", "--1", "0x10", "NaN", "Infinity", "-Infinity", "1_000", "١"} {
+		if _, err := strictJSON([]byte(`{"a":`+lit+`}`), nil); err == nil {
+			t.Errorf("%s was read", lit)
+		}
+	}
 }

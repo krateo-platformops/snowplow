@@ -3,7 +3,6 @@
 package fakeapiserver
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -94,53 +93,76 @@ func listedResources(snapshot any) (listed map[string][]string, problems []strin
 // exactly. The rule and the loader's registration of CRD schemas both ask it, so no object is a CRD
 // to one and not to the other.
 func isCRD(obj map[string]any) bool {
-	return obj["kind"] == "CustomResourceDefinition" && obj["apiVersion"] == "apiextensions.k8s.io/v1"
+	return obj["kind"] == "CustomResourceDefinition" && obj["apiVersion"] == crdGroup+"/v1"
 }
+
+const crdGroup = "apiextensions.k8s.io"
 
 // snapshotCRDs is the CRDs among the snapshot's objects, in their order and by metadata.name. Each
 // of these is a problem, whether or not discovery lists the CRD's type:
 //
-//   - a CRD whose metadata.name is not exactly <spec.names.plural>.<spec.group>, or with one of the
-//     three absent or not a string: the fake keys a CRD's schema by spec.group and
-//     spec.names.plural, so such a CRD would give its schema to a type that is not the one it is
-//     named for;
+//   - an object of the group apiextensions.k8s.io that is not a CRD (isCRD): one of another
+//     version (apiextensions.k8s.io/v1beta1, or the group's name alone as its apiVersion), or of
+//     another kind, whatever discovery lists. The group holds what custom types are, and the fake
+//     reads that from a v1 CustomResourceDefinition alone;
+//   - a CRD whose metadata.name, spec.group or spec.names.plural is not a non-empty string, or
+//     whose metadata.name is not exactly <spec.names.plural>.<spec.group>: the fake keys a CRD's
+//     schema by spec.group and spec.names.plural, so such a CRD would give its schema to a type
+//     that is not the one it is named for;
+//   - a CRD whose spec.versions is not a list (absent, null, a string, an object), or holds an
+//     entry whose name is not a non-empty string (a null entry, one that is not an object, a name
+//     that is absent, not a string or ""), beside good entries or not: a real apiserver rejects
+//     both;
 //   - two CRDs with one name;
 //   - a metadata.name, spec.group, spec.names.plural or spec.versions[].name that is not
 //     well-formed Unicode.
 //
-// Only CRDs with none of these reach the loader's registration.
+// Only CRDs with none of these reach the loader's registration and crdlessTypes.
 func snapshotCRDs(objects []map[string]any) (crds []map[string]any, byName map[string]map[string]any, problems []string) {
 	byName = map[string]map[string]any{}
+	nonEmpty := func(v any) (string, bool) {
+		s, ok := v.(string)
+		return s, ok && s != ""
+	}
 	for _, obj := range objects {
 		if !isCRD(obj) {
+			if av, _ := obj["apiVersion"].(string); av == crdGroup || strings.HasPrefix(av, crdGroup+"/") {
+				md, _ := obj["metadata"].(map[string]any)
+				problems = append(problems, fmt.Sprintf("object %s %v %s: in the group %s only a CustomResourceDefinition of %s/v1 is read", av, obj["kind"], strconv.Quote(fmt.Sprint(md["name"])), crdGroup, crdGroup))
+			}
 			continue
 		}
 		md, _ := obj["metadata"].(map[string]any)
 		spec, _ := obj["spec"].(map[string]any)
 		names, _ := spec["names"].(map[string]any)
-		name, okName := md["name"].(string)
-		group, okGroup := spec["group"].(string)
-		plural, okPlural := names["plural"].(string)
+		name, okName := nonEmpty(md["name"])
+		group, okGroup := nonEmpty(spec["group"])
+		plural, okPlural := nonEmpty(names["plural"])
 		who := "CustomResourceDefinition " + strconv.Quote(name)
 		var wrong []string
-		switch {
-		case !okName:
+		if !okName {
 			who = "a CustomResourceDefinition"
-			wrong = append(wrong, "metadata.name is not a string")
-		case !okGroup || !okPlural:
-			for field, ok := range map[string]bool{"spec.group": okGroup, "spec.names.plural": okPlural} {
-				if !ok {
-					wrong = append(wrong, field+" is not a string")
-				}
-			}
-		case name != plural+"."+group:
+			wrong = append(wrong, "metadata.name is not a non-empty string")
+		}
+		if !okGroup {
+			wrong = append(wrong, "spec.group is not a non-empty string")
+		}
+		if !okPlural {
+			wrong = append(wrong, "spec.names.plural is not a non-empty string")
+		}
+		if okName && okGroup && okPlural && name != plural+"."+group {
 			wrong = append(wrong, "metadata.name is not <spec.names.plural>.<spec.group>, "+strconv.Quote(plural+"."+group))
 		}
 		ill := !wellFormed(name) || !wellFormed(group) || !wellFormed(plural)
-		versions, _ := spec["versions"].([]any)
-		for _, v := range versions {
+		versions, isList := spec["versions"].([]any)
+		if !isList {
+			wrong = append(wrong, "spec.versions is not a list")
+		}
+		for i, v := range versions {
 			vm, _ := v.(map[string]any)
-			if n, ok := vm["name"].(string); ok && !wellFormed(n) {
+			if n, ok := nonEmpty(vm["name"]); !ok {
+				wrong = append(wrong, fmt.Sprintf("spec.versions[%d]: name is not a non-empty string", i))
+			} else if !wellFormed(n) {
 				ill = true
 			}
 		}
@@ -177,8 +199,7 @@ func snapshotCRDs(objects []map[string]any) (crds []map[string]any, byName map[s
 // A CRD that names a version in more than one spec.versions entry is malformed (a real apiserver
 // rejects it: spec.versions[i].name: Duplicate value) and no entry is chosen: that alone is said,
 // `spec.versions names <the name> more than once`, for any name two entries share, the listed
-// version's or not, a string or not; entries with no name share none. Only the CRD a listed custom
-// type needs is asked this.
+// version's or not. Only the CRD a listed custom type needs is asked this.
 //
 // Otherwise the reasons are everything else that is wrong with it:
 //
@@ -187,9 +208,8 @@ func snapshotCRDs(objects []map[string]any) (crds []map[string]any, byName map[s
 //	does not serve <version>
 //
 // The version is served by a spec.versions entry with that name, exactly, and served the boolean
-// true: a spec.versions that is missing, empty or not a list serves nothing, and so do an entry
-// that is not an object or has no name, and a served that is absent or anything but true ("true",
-// 1). (snapshotCRDs has already refused a CRD whose name is not its spec's; the spec is still
+// true: an empty spec.versions serves nothing, and so does a served that is absent or anything but
+// true ("true", 1). (snapshotCRDs has already refused a CRD whose name is not its spec's; the spec is still
 // compared here because one name can be cut into a plural and a group in more than one place.)
 func crdlessTypes(listed map[string][]string, crds map[string]map[string]any) []string {
 	disagrees := func(field string, found any, want string) string {
@@ -250,39 +270,21 @@ func crdlessTypes(listed map[string][]string, crds map[string]map[string]any) []
 	return out
 }
 
-// sharedVersionName is the first spec.versions name two entries share, as JSON. Names are compared
-// as JavaScript's === compares them, which is how agentiko-sandbox's validator finds one: two
-// strings, two numbers of one value (1 and 1.0), two booleans or two nulls are the same name; an
-// entry that is not an object or has no name has none; a name that is an object or a list equals
-// no other.
+// sharedVersionName is the first spec.versions name two entries share, quoted. snapshotCRDs has
+// already refused a CRD with an entry whose name is not a non-empty string, so every name here is
+// one.
 func sharedVersionName(versions []any) (string, bool) {
 	seen := map[string]bool{}
 	for _, v := range versions {
 		vm, _ := v.(map[string]any)
-		name, has := vm["name"]
-		if !has {
+		name, ok := vm["name"].(string)
+		if !ok {
 			continue
 		}
-		var key string
-		switch n := name.(type) {
-		case string:
-			key = strconv.Quote(n)
-		case json.Number:
-			f, _ := n.Float64()                         // out of range is an infinity, as in JavaScript
-			key = strconv.FormatFloat(f+0, 'g', -1, 64) // +0: -0 and 0 are one number
-		case float64:
-			key = strconv.FormatFloat(n+0, 'g', -1, 64)
-		case bool:
-			key = strconv.FormatBool(n)
-		case nil:
-			key = "null"
-		default:
-			continue
+		if seen[name] {
+			return strconv.Quote(name), true
 		}
-		if seen[key] {
-			return key, true
-		}
-		seen[key] = true
+		seen[name] = true
 	}
 	return "", false
 }

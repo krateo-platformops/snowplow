@@ -7,10 +7,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+)
+
+// The two bounds of a snapshot file, held here and nowhere else. agentiko-sandbox's two parsers
+// hold the same numbers.
+const (
+	// maxDepth is the deepest nesting read: containers (objects and arrays alike) counted from the
+	// file's top level, the top-level one at depth 1. A file nested to maxDepth is read; one level
+	// more is refused.
+	maxDepth = 1000
+	// maxSafeInteger is the largest magnitude of an integer read, 2^53: up to it every integer is
+	// exact as an IEEE double, which is how JavaScript, and encoding/json into an untyped value,
+	// hold a number; beyond it they round, silently.
+	maxSafeInteger = 1 << 53
 )
 
 // strictJSON is the one reading of a snapshot file. It parses data once and returns it as plain
@@ -21,7 +35,11 @@ import (
 //     last, a reader that stops at the first does not;
 //   - a key that encoding/json would take for a field of t only by ignoring case ("Resources", or
 //     "reſources" with a long s, for `resources`): JSON.parse, and agentiko-sandbox's validator
-//     with it, read keys exactly.
+//     with it, read keys exactly. The fold is encoding/json's own: simple, one code point for one;
+//   - nesting deeper than maxDepth;
+//   - a number that would not be read as written (checkNumber): an integer beyond maxSafeInteger in
+//     magnitude, a number that is not finite as a double, and a fraction or an exponent where t
+//     holds an integer.
 //
 // t is the Go type the caller then decodes the same bytes into with encoding/json; after strictJSON
 // that decode matches every key exactly and has no duplicate to choose from, so the values returned
@@ -36,7 +54,7 @@ import (
 func strictJSON(data []byte, t reflect.Type) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	v, err := strictValue(dec, t, "")
+	v, err := strictValue(dec, t, "", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +64,35 @@ func strictJSON(data []byte, t reflect.Type) (any, error) {
 	return v, nil
 }
 
-func strictValue(dec *json.Decoder, t reflect.Type, path string) (any, error) {
+// checkNumber refuses a number token that would not be read as written. What a number is, is
+// decided by the form of its literal, as agentiko-sandbox's parsers decide it:
+//
+//   - an integer has no fraction and no exponent (an optional minus and digits): it is refused
+//     beyond maxSafeInteger in magnitude (9007199254740992 is read, 9007199254740993 is not);
+//   - any other literal is a float, and only has to be finite as an IEEE double: 1e20,
+//     9007199254740993.0 and 1.5e300 are read, 1e400 is not;
+//   - where t is a Go integer, a float is refused here, by name, and not by the decoder after.
+func checkNumber(n json.Number, t reflect.Type, at string) error {
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	lit := n.String()
+	if strings.ContainsAny(lit, ".eE") {
+		if f, _ := strconv.ParseFloat(lit, 64); math.IsInf(f, 0) {
+			return fmt.Errorf("%s is the number %s, which is not finite as a double", at, lit)
+		}
+		if t != nil && t.Kind() >= reflect.Int && t.Kind() <= reflect.Uintptr {
+			return fmt.Errorf("%s is the number %s, where an integer is read", at, lit)
+		}
+		return nil
+	}
+	if m, err := strconv.ParseUint(strings.TrimPrefix(lit, "-"), 10, 64); err != nil || m > maxSafeInteger {
+		return fmt.Errorf("%s is the integer %s, beyond %d in magnitude", at, lit, uint64(maxSafeInteger))
+	}
+	return nil
+}
+
+func strictValue(dec *json.Decoder, t reflect.Type, path string, depth int) (any, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, err
@@ -56,6 +102,16 @@ func strictValue(dec *json.Decoder, t reflect.Type, path string) (any, error) {
 			return "the top level"
 		}
 		return strings.TrimPrefix(path, ".")
+	}
+	if d, ok := tok.(json.Delim); ok && (d == '{' || d == '[') {
+		if depth++; depth > maxDepth {
+			return nil, fmt.Errorf("the JSON is nested deeper than %d containers", maxDepth)
+		}
+	}
+	if n, ok := tok.(json.Number); ok {
+		if err := checkNumber(n, t, at()); err != nil {
+			return nil, err
+		}
 	}
 	switch tok {
 	case json.Delim('{'):
@@ -79,7 +135,7 @@ func strictValue(dec *json.Decoder, t reflect.Type, path string) (any, error) {
 					}
 				}
 			}
-			if m[key], err = strictValue(dec, child, path+"."+key); err != nil {
+			if m[key], err = strictValue(dec, child, path+"."+key, depth); err != nil {
 				return nil, err
 			}
 		}
@@ -89,7 +145,7 @@ func strictValue(dec *json.Decoder, t reflect.Type, path string) (any, error) {
 		_, elem := jsonFields(t)
 		a := []any{}
 		for i := 0; dec.More(); i++ {
-			v, err := strictValue(dec, elem, path+"["+strconv.Itoa(i)+"]")
+			v, err := strictValue(dec, elem, path+"["+strconv.Itoa(i)+"]", depth)
 			if err != nil {
 				return nil, err
 			}
