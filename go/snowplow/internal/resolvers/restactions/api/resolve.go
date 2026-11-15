@@ -1606,6 +1606,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := credhttp.WithAnswer(fctx)
+	// #1320 — which request on the wire answered this read, when another
+	// reader's did: the session id that request carried, so this caller's own
+	// record can name the one upstream record. Nothing reads it yet: a read
+	// stage writes no audit record today, and the field that will carry it is
+	// being agreed with the audit schema's readers.
+	fctx, answeredByWire := withExternalAnsweredBy(fctx)
+	_ = answeredByWire
 	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
 	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
 	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")

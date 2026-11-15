@@ -28,6 +28,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/client-go/rest"
 )
 
@@ -340,18 +341,19 @@ func TestExternalFlight1320_KeyHasNoSeparatorOrSentinelAmbiguity(t *testing.T) {
 		return mustKey(t, ctx, o)
 	}
 	for name, pair := range map[string][2]req{
-		"no payload / the text none":        {{path: "/e"}, {path: "/e", payload: ptr.To("none")}},
-		"no payload / an empty payload":     {{path: "/e"}, {path: "/e", payload: ptr.To("")}},
-		"payload a / payload b":             {{path: "/e", payload: ptr.To("a")}, {path: "/e", payload: ptr.To("b")}},
-		"one header / split in two":         {{path: "/e", headers: []string{"X-A: 1X-B: 2"}}, {path: "/e", headers: []string{"X-A: 1", "X-B: 2"}}},
-		"header text moved into the path":   {{path: "/eX-A: 1"}, {path: "/e", headers: []string{"X-A: 1"}}},
-		"payload text moved into a header":  {{path: "/e", headers: []string{"X"}, payload: ptr.To("Y")}, {path: "/e", headers: []string{"XY"}, payload: ptr.To("")}},
-		"no impersonation / an empty one":   {{path: "/e"}, {path: "/e", imp: &rest.ImpersonationConfig{}}},
-		"user a+uid b / user ab":            {{path: "/e", imp: &rest.ImpersonationConfig{UserName: "a", UID: "b"}}, {path: "/e", imp: &rest.ImpersonationConfig{UserName: "ab"}}},
-		"groups [ab] / groups [a b]":        {{path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"ab"}}}, {path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"a", "b"}}}},
-		"uid g / group g":                   {{path: "/e", imp: &rest.ImpersonationConfig{UID: "g"}}, {path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"g"}}}},
-		"extra k=[v w] / extra k=[v], w=[]": {{path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"k": {"v", "w"}}}}, {path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"k": {"v"}, "w": {}}}}},
-		"group g / extra g":                 {{path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"g"}}}, {path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"g": {}}}}},
+		"no payload / the text none":            {{path: "/e"}, {path: "/e", payload: ptr.To("none")}},
+		"no payload / an empty payload":         {{path: "/e"}, {path: "/e", payload: ptr.To("")}},
+		"payload a / payload b":                 {{path: "/e", payload: ptr.To("a")}, {path: "/e", payload: ptr.To("b")}},
+		"one header / split in two":             {{path: "/e", headers: []string{"X-A: 1X-B: 2"}}, {path: "/e", headers: []string{"X-A: 1", "X-B: 2"}}},
+		"header text moved into the path":       {{path: "/eX-A: 1"}, {path: "/e", headers: []string{"X-A: 1"}}},
+		"payload text moved into a header":      {{path: "/e", headers: []string{"X"}, payload: ptr.To("Y")}, {path: "/e", headers: []string{"XY"}, payload: ptr.To("")}},
+		"no impersonation / an empty one":       {{path: "/e"}, {path: "/e", imp: &rest.ImpersonationConfig{}}},
+		"user a+uid b / user ab":                {{path: "/e", imp: &rest.ImpersonationConfig{UserName: "a", UID: "b"}}, {path: "/e", imp: &rest.ImpersonationConfig{UserName: "ab"}}},
+		"groups [ab] / groups [a b]":            {{path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"ab"}}}, {path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"a", "b"}}}},
+		"uid g / group g":                       {{path: "/e", imp: &rest.ImpersonationConfig{UID: "g"}}, {path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"g"}}}},
+		"extra k=[v w] / extra k=[v], w=[]":     {{path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"k": {"v", "w"}}}}, {path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"k": {"v"}, "w": {}}}}},
+		"extras {a:[b c] d:[]} / {a:[b] c:[d]}": {{path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"a": {"b", "c"}, "d": {}}}}, {path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"a": {"b"}, "c": {"d"}}}}},
+		"group g / extra g":                     {{path: "/e", imp: &rest.ImpersonationConfig{Groups: []string{"g"}}}, {path: "/e", imp: &rest.ImpersonationConfig{Extra: map[string][]string{"g": {}}}}},
 	} {
 		if key(pair[0]) == key(pair[1]) {
 			t.Errorf("%s: two different requests share one key", name)
@@ -368,6 +370,61 @@ func TestExternalFlight1320_KeyFoldsTheServiceAccountDialMark(t *testing.T) {
 	sa := mustKey(t, cache.WithServiceAccountDial(context.Background()), keyBase())
 	if plain == sa {
 		t.Fatal("a ServiceAccount dial and a plain dial share one key")
+	}
+}
+
+// ------------------------------------------------------------- the session
+
+// The session id is not a key component: readers of different sessions share
+// one request, which carries its starter's session id. Each joiner is handed
+// that id, so its own record can name the one upstream record; the starter's
+// own record needs none (the request is its own).
+func TestExternalFlight1320_AJoinerLearnsTheSessionOfTheRequestThatAnsweredIt(t *testing.T) {
+	c := wireCache(t)
+	o := newWireOrigin(t, heldOriginHandler)
+	opts := o.read("clickhouse", "/events")
+	read := func(session string) (context.Context, *externalAnsweredBy) {
+		ctx := customerCtx(pagebudget.PageMaxGoal)
+		if session != "" {
+			ctx = audit.WithSessionID(ctx, session)
+		}
+		return withExternalAnsweredBy(ctx)
+	}
+	sctx, starterBy := read("session-starter")
+	starter := goShared(c, sctx, opts)
+	if !eventually(5*time.Second, func() bool { return o.requests.Load() == 1 }) {
+		t.Fatal("the starter's request never reached the origin")
+	}
+	var joinerBy []*externalAnsweredBy
+	var joiners []<-chan wireResult
+	for _, session := range []string{"session-other", "", "session-starter"} {
+		jctx, by := read(session)
+		joinerBy = append(joinerBy, by)
+		joiners = append(joiners, goShared(c, jctx, opts))
+	}
+	if !eventually(3*time.Second, func() bool { return c.flightJoined.Load() == 3 }) {
+		t.Fatalf("readers of other sessions did not share: joined=%d requests=%d; want 3 and 1 (the session id is not in the key)",
+			c.flightJoined.Load(), o.requests.Load())
+	}
+	o.open1()
+	mustWireOK(t, recvWire(t, starter, "starter"), "starter")
+	for _, ch := range joiners {
+		mustWireOK(t, recvWire(t, ch, "joiner"), "joiner")
+	}
+	if got := o.requests.Load(); got != 1 {
+		t.Fatalf("origin saw %d requests; want 1", got)
+	}
+	if session, joined := starterBy.WireSession(); joined || session != "" {
+		t.Errorf("the starter's record says joined=%v session=%q; want false (its answer came from its own request)", joined, session)
+	}
+	for i, by := range joinerBy {
+		if session, joined := by.WireSession(); !joined || session != "session-starter" {
+			t.Errorf("joiner %d's record says joined=%v session=%q; want true and the starter's session id", i, joined, session)
+		}
+	}
+	// A fetch with no record on its context is unaffected, and a nil record reads as not joined.
+	if session, joined := (*externalAnsweredBy)(nil).WireSession(); joined || session != "" {
+		t.Errorf("a nil record reads joined=%v session=%q", joined, session)
 	}
 }
 

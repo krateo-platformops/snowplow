@@ -43,7 +43,11 @@
 // is decided): a request on the wire is joinable if and only if the reader
 // that started it is still waiting on it AND it is younger than the page
 // budget; a customer never joins a request background work started; a write
-// is never shared; the key is every input that reaches the wire.
+// is never shared; the key is every input of the request the stage asks for
+// (credentials, URL, headers, payload, provenance). The session id is NOT a
+// key component (owner ruling 2026-11-15): it is correlation, like the trace
+// id, so readers of different sessions share, and the request on the wire
+// carries its starter's.
 //   - "Younger than the page budget": until the page-budget deadline of the
 //     customer that started it, or, for a request background work started (no
 //     page budget), until pagebudget.PageMaxGoal after it started. So one
@@ -88,6 +92,12 @@
 // the key's digest). The correlation headers are not part of what the stage
 // asks for and are not in the key.
 //
+// FROM A JOINER TO THE UPSTREAM'S RECORD. The upstream sees one request, under
+// its starter's session id (W3C baggage, session.id). That id is held on the
+// wire request and handed to each joiner it answers (externalAnsweredBy on the
+// joiner's context), so a joiner's own record can name the one upstream
+// record. It is correlation data and is never logged or put on a span here.
+//
 // Nothing here logs a key, URL or header: the key is a sha256 digest.
 package api
 
@@ -114,6 +124,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/client-go/rest"
 )
 
@@ -135,6 +146,9 @@ type externalFlight struct {
 	joinUntil time.Time
 	// customerStarted: a reader with a page budget started it.
 	customerStarted bool
+	// session is the session id the wire request carries: its starter's
+	// (audit.SessionID of the starter's context). "" when it has none.
+	session string
 
 	// Under c.flightsMu.
 	waiters     int
@@ -258,6 +272,7 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 	if customer {
 		f.joinUntil = b.Deadline()
 	}
+	f.session = audit.SessionID(ctx)
 	f.ctx, f.cancel = context.WithCancel(pagebudget.Detach(ctx))
 	// A wire request that admits no more joiners is replaced in the slot; it
 	// goes on for the readers it has.
@@ -427,6 +442,9 @@ func (f *externalFlight) await(req *http.Request, led bool) (*http.Response, err
 			return nil, f.err
 		}
 		span.End()
+		if !led {
+			answeredBy(ctx).set(f.session)
+		}
 		// The reader's own copy of the status line, headers and trailers.
 		resp := *f.resp
 		resp.Header = f.resp.Header.Clone()
@@ -483,6 +501,50 @@ func (b *externalFlightBody) Read(p []byte) (int, error) {
 func (b *externalFlightBody) Close() error {
 	b.once.Do(func() { b.f.leave(b.starter) })
 	return nil
+}
+
+// externalAnsweredBy says which request on the wire answered a read that sent
+// none of its own: the session id that request carried (its starter's). Put
+// on a fetch's context with withExternalAnsweredBy; filled when an attempt of
+// the fetch is answered by a request another reader started.
+type externalAnsweredBy struct {
+	mu      sync.Mutex
+	joined  bool
+	session string
+}
+
+type externalAnsweredByKey struct{}
+
+// withExternalAnsweredBy returns ctx carrying a fresh record for one fetch.
+func withExternalAnsweredBy(ctx context.Context) (context.Context, *externalAnsweredBy) {
+	a := &externalAnsweredBy{}
+	return context.WithValue(ctx, externalAnsweredByKey{}, a), a
+}
+
+func answeredBy(ctx context.Context) *externalAnsweredBy {
+	a, _ := ctx.Value(externalAnsweredByKey{}).(*externalAnsweredBy)
+	return a
+}
+
+func (a *externalAnsweredBy) set(session string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.joined, a.session = true, session
+	a.mu.Unlock()
+}
+
+// WireSession is the session id of the request that answered this fetch, and
+// whether another reader's request did (false: the fetch's answer came from a
+// request it sent itself, under its own session id). Nil-safe.
+func (a *externalAnsweredBy) WireSession() (session string, joined bool) {
+	if a == nil {
+		return "", false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.session, a.joined
 }
 
 // flightEvent is one connection-phase event of the wire request, as a joined
