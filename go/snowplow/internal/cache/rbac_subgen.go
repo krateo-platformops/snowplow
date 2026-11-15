@@ -276,9 +276,12 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 //   - (a), #1443: a ServiceAccount matched through a User-kind subject naming
 //     its username — the bump lands on the User counter, the fold reads the
 //     ServiceAccount counter;
-//   - (b), #1449: a binding whose role was absent when the index was built
-//     (#261 case 3) is not listed under it, so the role's later create or edit
-//     bumps nobody.
+//   - (b), until #1458 lands: a rebuild of the index reads the published
+//     snapshot; a binding whose ADD event was already applied but whose
+//     snapshot is not published yet is not in it, so the rebuild drops the
+//     binding, and the role's later edits bump nobody until the next rebuild
+//     or the next event on the binding. (A binding whose role is absent is
+//     listed under the role it names since #1449.)
 //
 // With the sum this fold used before, equal values meant only an equal NUMBER
 // of changes. Both halves are needed: a sum of clock values collides (states 3

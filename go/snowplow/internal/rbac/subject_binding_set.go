@@ -30,10 +30,11 @@
 // minted by one same-set requester before the edit is therefore never the cell
 // another derives after it — where the edit bumps a subject the requester's
 // sub-generation folds. It does not when the binding matches a ServiceAccount
-// through its implicit groups or a User-kind subject (#1443), or when the role
-// was absent at the role-index build (#1449): there the requester's key does
-// not rotate at all. TestSubjectBindingSet_RoleEditRotatesKey proves the
-// rotation end to end; TestIssue1439_ClassValueNamesOneRBACState the
+// through its implicit groups or a User-kind subject (#1443), or, until #1458
+// lands, when a rebuild of the role index dropped the binding (it read a
+// snapshot older than the binding's already-applied event): there the
+// requester's key does not rotate at all.
+// TestSubjectBindingSet_RoleEditRotatesKey proves the rotation end to end; TestIssue1439_ClassValueNamesOneRBACState the
 // before/after separation across two requesters.
 //
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the

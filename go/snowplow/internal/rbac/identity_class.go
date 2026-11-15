@@ -29,8 +29,9 @@ import (
 //     is one the sub-generation folds and the binding is in the role index.
 //     Known exceptions (cache.RBACSubGenForSubject lists them): a
 //     ServiceAccount matched through its implicit groups or through a User-kind
-//     subject (#1443), and a binding whose role was absent when the index was
-//     built (#1449).
+//     subject (#1443), and, until #1458 lands, a binding that an index
+//     rebuild dropped because the snapshot it read was older than the
+//     binding's already-applied event.
 //
 // Both read the published snapshot / counters; neither is ever logged.
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {

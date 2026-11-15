@@ -41,8 +41,8 @@ import (
 // verdict for every RBAC check, ON ONE CONDITION: every subject through which
 // a binding matches the identity is one the sub-generation folds, and the
 // binding is in the role index. RBACSubGenForSubject states the condition and
-// its three known exceptions (#1443 twice, #1449). The binding-set digest says
-// which bindings apply; the sub-generation is the number of the last RBAC state
+// its three known exceptions (#1443 twice, and #1458 until it lands). The
+// binding-set digest says which bindings apply; the sub-generation is the number of the last RBAC state
 // change that touched the identity's folded subjects, so it says which contents
 // of the roles behind those bindings. Under the same condition, an RBAC change
 // that moves any of a subject's verdicts moves the class.
