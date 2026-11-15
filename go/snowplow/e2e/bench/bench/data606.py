@@ -187,7 +187,7 @@ def add_parsers(sub) -> None:
         from bench.cli import _gke_context_guard
         _gke_context_guard()
         n, _ = lifecycle.create_synthetic_users(
-            0, 0, groups_for=lambda i: ["devs", rbac_model.team_group(1)], login=False)
+            0, 0, groups_for=lambda i: rbac_model.preflight_groups(), login=False)
         if n != 1:
             raise RuntimeError("preflight user not registered")
         return 0

@@ -240,6 +240,12 @@ subjects:
 """
 
 
+def preflight_groups() -> list[str]:
+    """The preflight user's groups (scaleuser-0000): the portal's base group and the first team, as a data
+    user of that team has (ONE definition: data606-preflight-user creates it, the schema step validates it)."""
+    return [BASE_GROUP, team_group(1)]
+
+
 def debug_reader_rbac_yaml() -> str:
     """ClusterRole + ClusterRoleBinding: `get` on the bench's /debug paths, for the debug reader's
     group alone (module doc: THE DEBUG READER). Non-resource rules only: no API group, no resource."""

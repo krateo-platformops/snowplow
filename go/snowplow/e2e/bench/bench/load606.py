@@ -4593,12 +4593,21 @@ def driver_stream_checks(streams: list[dict]) -> list[dict]:
     return framed_stream_checks(DRIVER_FRAMING, streams, required=True)
 
 
+_TIMED_OUT = re.compile(r"(?i)\b(timed out|timeout)\b|TimeoutError")
+
+
 def classify(resp: "Response") -> str:
     """ok | config (a request the cluster cannot serve: 404, or snowplow's
     'no matches for <GVR>' for an unserved type — run 6) | forbidden |
-    product (any other non-2xx: a FINDING, recorded, never a tooling stop)."""
+    timeout / unreachable (no HTTP answer: the client's bound passed, or no
+    server was reached) | product (any other non-2xx: a FINDING, recorded,
+    never a tooling stop)."""
     if 200 <= resp.status < 300:
         return "ok"
+    if resp.status == 0:
+        # no HTTP answer at all (HttpClient: status 0 with the exception in `error`): a timeout, or a server
+        # that could not be reached; never a status snowplow answered
+        return "timeout" if _TIMED_OUT.search(resp.error or "") else "unreachable"
     body = (resp.body or b"")[:2000].decode("utf-8", "replace")
     if resp.status == 404 or "no matches for" in body:
         return "config"
@@ -4882,7 +4891,9 @@ def _redact_strings(obj, redact):
 #: what a boot root that is not 200 means, by its class (classify)
 BOOT_ROOT_WHY = {"forbidden": "its groups are not granted the portal's shell",
                  "config": "the portal has no such object, or its type is not served",
-                 "product": "snowplow or the API server failed the call"}
+                 "product": "snowplow or the API server failed the call",
+                 "timeout": "the call timed out: no answer within the client's bound",
+                 "unreachable": "the call reached no server"}
 
 
 def _preflight(client: HttpClient, token: str, portal: "Portal", *,
@@ -4908,9 +4919,10 @@ def _preflight(client: HttpClient, token: str, portal: "Portal", *,
         out["init_status"] = r.status
         if cls != "ok":
             body = (r.body or b"")[:400].decode("utf-8", "replace")
-            out["refused"].append({"path": portal.init, "status": r.status, "boot_root": True, "body": (
-                f"the portal's boot root did not answer 200 for this login ({BOOT_ROOT_WHY.get(cls, cls)}; "
-                + (f"body: {body}" if body.strip() else "an empty body") + ")")})
+            said = (f"after {r.ms:.0f} ms, {r.error}" if cls in ("timeout", "unreachable") else
+                    f"body: {body}" if body.strip() else "an empty body")
+            out["refused"].append({"path": portal.init, "status": r.status, "class": cls, "boot_root": True, "body": (
+                f"the portal's boot root did not answer 200 for this login ({BOOT_ROOT_WHY.get(cls, cls)}; {said})")})
             out["ok"] = False
             return out
         shell, routes, content = first_load(client, token, portal, pool=pool,
@@ -4933,8 +4945,9 @@ def _preflight(client: HttpClient, token: str, portal: "Portal", *,
             out["routes"].append(row)
             if c == "config":
                 out["refused"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
-            elif c == "product":
-                out["product_errors"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
+            elif c in ("product", "timeout", "unreachable"):
+                out["product_errors"].append({**row, "class": c, "body": (
+                    (rr.body or b"")[:400].decode("utf-8", "replace") if c == "product" else rr.error)})
             elif c == "forbidden":
                 out["forbidden"].append(row)
         again = menu_reread(client, token, out["menu"], routes, portal.frontend_ns)

@@ -393,6 +393,47 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                                   "why": why}))
             sys.exit(0)
         sys.exit(0)
+    # #1471 review (g): the live chain of the portal's grant, as the installer leaves it: the Installer CR (with
+    # its registryAuth username, which the bench must never write anywhere), the Portal CR the installer merges
+    # componentValues.portal into, and the Role and RoleBinding the portal's shell-readers template renders in
+    # krateo-system for each reader group. FAKE_LIVE_READERS: installer-drops (the Installer CR lacks the key:
+    # installer #173/#174's schema expansion) | portal-drops (the Portal CR lacks it) | no-binding (no
+    # RoleBinding rendered) | norestactions (the Role lacks the RESTActions rule)
+    if "get" in a and any(x.startswith("installers.composition.krateo.io,") for x in a):
+        mode = os.environ.get("FAKE_LIVE_READERS", "ok")
+        cf = os.path.join(STATE, "installer-cv.json")
+        cv = json.load(open(cf)) if os.path.exists(cf) else {}
+        groups = list(((cv.get("portal") or {}).get("readerGroups")) or [])
+        inst_cv = json.loads(json.dumps(cv))
+        if mode == "installer-drops":
+            (inst_cv.get("portal") or {}).pop("readerGroups", None)
+            groups = []
+        portal_groups = [] if mode == "portal-drops" else groups
+        items = [{"apiVersion": "composition.krateo.io/v0-3-641", "kind": "Installer",
+                  "metadata": {"name": "installer", "namespace": "krateo-system"},
+                  "spec": {"componentValues": inst_cv, "registryAuth": {"username": "fake-registry-user-7f3a"}}},
+                 {"apiVersion": "composition.krateo.io/v1-8-118", "kind": "Portal",
+                  "metadata": {"name": "portal", "namespace": "krateo-system"},
+                  "spec": dict({"enableAdminUser": True}, **({"readerGroups": portal_groups} if portal_groups else {}))}]
+        for g in portal_groups:
+            rules = [{"apiGroups": ["widgets.templates.krateo.io"], "resources": ["*"], "verbs": ["get", "list"]}]
+            if mode != "norestactions":
+                rules.append({"apiGroups": ["templates.krateo.io"], "resources": ["restactions"], "verbs": ["get"]})
+            name = g + "-read-portal-shell"
+            items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                          "metadata": {"name": name, "namespace": "krateo-system"}, "rules": rules})
+            if mode != "no-binding":
+                items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                              "metadata": {"name": name, "namespace": "krateo-system"},
+                              "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name},
+                              "subjects": [{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": g}]})
+        # a binding of an admin USER the record must not keep
+        items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                      "metadata": {"name": "admin-reads", "namespace": "krateo-system"},
+                      "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "admin-reads"},
+                      "subjects": [{"kind": "User", "name": "fake-admin-person-9c1d"}]})
+        print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+        sys.exit(0)
     if a[:3] == ["get", "job", "ttl-delete-proof"]:
         print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
     if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:       # its pod, on a platform node
@@ -1588,6 +1629,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         vals = yaml.safe_load(open(vf)) if vf else {}
         env = (((vals or {}).get("componentValues") or {}).get("snowplow") or {}).get("env") or {}
         json.dump(env, open(os.path.join(STATE, "snowplow-declared-env.json"), "w"))
+        # the componentValues the Installer CR is created with (the live readers listing answers from it)
+        json.dump((vals or {}).get("componentValues") or {}, open(os.path.join(STATE, "installer-cv.json"), "w"))
     if a[:1] == ["pull"]:
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)

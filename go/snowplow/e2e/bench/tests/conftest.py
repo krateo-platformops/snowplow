@@ -460,10 +460,14 @@ def _fake_ghcr():
                       else "a: " + "{a: " * 1000 + "1" + "}" * 1000 + "\n")]
             tpls = dict(FAKE_CHART_TEMPLATES.get(chart) or {})
             # FAKE_PORTAL_CHART (read from this process's environment when the chart is asked for):
-            # no-readers = a portal chart from before its reader groups (no shell-readers template)
+            # no-readers = a portal chart from before its reader groups (no shell-readers template);
             mode = os.environ.get("FAKE_PORTAL_CHART", "") if chart == "portal" else ""
             if mode == "no-readers":
                 tpls.pop("templates/rbac.shell-readers.yaml")
+            # other-namespace: one whose reader template binds its readers outside its release namespace
+            if mode == "other-namespace":
+                tpls["templates/rbac.shell-readers.yaml"] = tpls["templates/rbac.shell-readers.yaml"].replace(
+                    "namespace: {{ $.Release.Namespace }}", "namespace: krateo-elsewhere")
             # FAKE_PAGE_READERS_ONLY=<group>: every page chart's own values grant that group alone
             only = os.environ.get("FAKE_PAGE_READERS_ONLY", "")
             if only and isinstance(files[1][1], dict) and "readerGroups" in files[1][1] and chart != "portal":

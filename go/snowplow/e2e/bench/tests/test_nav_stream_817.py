@@ -196,7 +196,7 @@ def _drive(url, out, *, duration_s, think_s, users=3):
         "drive", "--snowplow-url", url, "--authn-url", url, "--password", "pw",
         "--user-start", "1", "--user-end", str(users), "--init", INIT,
         "--think-s", str(think_s), "--duration-s", str(duration_s),
-        "--vars-interval", "0.5", "--nav-workers", "8", "--call-workers", "32",
+        "--vars-interval", "0.5", "--debug-user", "scaleuser-debug-reader", "--nav-workers", "8", "--call-workers", "32",
         "--out", str(out)])
 
 

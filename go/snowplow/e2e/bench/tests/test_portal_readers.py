@@ -27,7 +27,7 @@ import tarfile
 import pytest
 import yaml
 
-from bench import accept1126, ghcr_pull, installer_routes, installer_values, portal_readers, rbac_model, snowplow_env
+from bench import accept1126, data_manifests, ghcr_pull, installer_routes, installer_values, portal_readers, rbac_model, snowplow_env
 from tests.conftest import FAKE_PAGE_READERS, FAKE_PORTAL_DEMO, FAKE_PORTAL_SHELL_READERS
 from tests.test_installer_routes import CHARTS, SHA256
 from tests.test_run606_real_sequence import BENCH_DIR, SCALEUSER_PASSWORD, harness  # noqa: F401  (fixture)
@@ -527,3 +527,128 @@ def test_the_acceptance_run_refuses_without_a_route_table_and_holds_no_path_of_i
     # the CLI takes no run without the table, and the module fixes no prefix
     src = (BENCH / "bench" / "accept1126.py").read_text()
     assert not re.search(r'"/(auth|authn|content)"', src) and 'p.add_argument("--routes", required=True' in src
+
+
+
+# ─── #1471 review: the release-namespace guard ──────────────────────────────
+
+@needs_helm
+def test_a_portal_chart_that_binds_its_readers_outside_its_release_namespace_is_refused(pulled, tmp_path,
+                                                                                         monkeypatch):
+    # the shell's objects are read in the release namespace: a grant anywhere else opens nothing
+    monkeypatch.setenv("FAKE_PORTAL_CHART", "other-namespace")
+    with pytest.raises(portal_readers.Refused, match=r"binds a reader group in \['krateo-elsewhere'\], not in its "
+                                                     r"release namespace krateo-system"):
+        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+
+
+# ─── #1471 review (g): the LIVE grant, before any load ──────────────────────
+
+SHELL_NEED = [WIDGETS, RESTACTIONS]
+
+
+def _record():
+    return {"kind": "portal_readers", "ok": True, "group": GROUP,
+            "shell": {"release_namespace": NS, "need": {NS: SHELL_NEED}}}
+
+
+def _live(groups_inst=(GROUP,), groups_portal=(GROUP,), role_rules=SHELL_NEED, bind=True, ns=NS):
+    items = [{"kind": "Installer", "metadata": {"name": "installer"},
+              "spec": {"componentValues": {"portal": {"agents": {"enabled": True},
+                                                      **({"readerGroups": list(groups_inst)} if groups_inst is not None
+                                                         else {})}},
+                       "registryAuth": {"username": "someone-7f3a"}}},
+             {"kind": "Portal", "metadata": {"name": "portal"},
+              "spec": {**({"readerGroups": list(groups_portal)} if groups_portal is not None else {})}},
+             {"kind": "Role", "metadata": {"name": "r", "namespace": ns}, "rules": list(role_rules)},
+             {"kind": "RoleBinding", "metadata": {"name": "admin-reads", "namespace": NS},
+              "roleRef": {"kind": "Role", "name": "r"}, "subjects": [{"kind": "User", "name": "person-9c1d"}]}]
+    if bind:
+        items.append({"kind": "RoleBinding", "metadata": {"name": "devs-read-portal-shell", "namespace": ns},
+                      "roleRef": {"kind": "Role", "name": "r"},
+                      "subjects": [{"kind": "Group", "name": GROUP, "apiGroup": "rbac.authorization.k8s.io"}]})
+    return portal_readers.live(_record(), items, GROUP, "portal")
+
+
+def test_the_live_chain_passes_when_all_three_links_carry_the_grant():
+    rec = _live()
+    assert rec["ok"] and rec["missing"] == [] and rec["bindings"] == ["devs-read-portal-shell"]
+    assert rec["installer_reader_groups"] == [GROUP] and rec["portal_reader_groups"] == [GROUP]
+    # the record keeps the reader groups and the group's bindings, never the registry user or another subject
+    text = json.dumps(rec)
+    assert "someone-7f3a" not in text and "person-9c1d" not in text and "admin-reads" not in text
+
+
+@pytest.mark.parametrize("kw, said", [
+    ({"groups_inst": None}, "the Installer CR's spec.componentValues.portal.readerGroups does not carry `devs` "
+                            "(it holds null)"),
+    ({"groups_portal": None}, "the Portal CR `portal`'s spec.readerGroups does not carry `devs` (it holds null)"),
+    ({"groups_portal": ("admins",)}, "the Portal CR `portal`'s spec.readerGroups does not carry `devs` (it holds "
+                                     "[\"admins\"])"),
+    ({"bind": False}, "in krateo-system, no RoleBinding binds `devs` to a Role that allows get "
+                      "*.widgets.templates.krateo.io, get restactions.templates.krateo.io, list "
+                      "*.widgets.templates.krateo.io (bindings of `devs` there: none)"),
+    ({"role_rules": [WIDGETS]}, "in krateo-system, no RoleBinding binds `devs` to a Role that allows get "
+                                "restactions.templates.krateo.io (bindings of `devs` there: devs-read-portal-shell)"),
+    ({"ns": "krateo-elsewhere"}, "in krateo-system, no RoleBinding binds `devs` to a Role that allows get "
+                                 "*.widgets.templates.krateo.io"),
+])
+def test_a_live_link_that_is_missing_refuses_the_arm_naming_it(kw, said):
+    rec = _live(**kw)
+    assert not rec["ok"] and said in rec["why"], rec["why"]
+
+
+def test_every_missing_link_is_named_and_no_record_is_not_a_pass():
+    rec = _live(groups_inst=None, groups_portal=None, bind=False)
+    assert len(rec["missing"]) == 3 and not rec["ok"]
+    assert portal_readers.live(None, [], GROUP, "portal")["why"].startswith("the free check's record")
+    assert portal_readers.live(dict(_record(), ok=False), [], GROUP, "portal")["ok"] is False
+    rec = portal_readers.live(_record(), [], GROUP, "portal")
+    assert "the Installer CR: 0 found in krateo-system, not one" in rec["why"]
+
+
+@needs_helm
+def test_the_rehearsal_reads_and_reports_the_live_grant_and_writes_no_identity(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, SNOWPLOW_ENV="GOGC=100", BENCH_606_REHEARSAL="env")
+    out = tmp / "out"
+    log = (out / "run.log").read_text()
+    assert p.returncode == 0 and "rehearsal complete" in log, log[-3000:]
+    block = log[log.index("=== rehearsal report ==="):log.index("=== end of rehearsal report ===")]
+    assert (f"portal readers, LIVE: OK: the Installer CR and the Portal CR carry `{GROUP}`, and in {NS} it is bound "
+            "to what the shell needs") in block
+    rec = json.loads((out / "portal-readers-live.json").read_text())
+    assert rec["ok"] and rec["bindings"] == [f"{GROUP}-read-portal-shell"]
+    for f in out.rglob("*"):
+        if f.is_file():
+            body = f.read_text(errors="replace")
+            assert "fake-registry-user-7f3a" not in body and "fake-admin-person-9c1d" not in body, f
+
+
+@needs_helm
+@pytest.mark.parametrize("mode, said", [
+    ("installer-drops", "the Installer CR's spec.componentValues.portal.readerGroups does not carry `devs`"),
+    ("portal-drops", "the Portal CR `portal`'s spec.readerGroups does not carry `devs`"),
+    ("no-binding", "no RoleBinding binds `devs` to a Role that allows"),
+    ("norestactions", "no RoleBinding binds `devs` to a Role that allows get restactions.templates.krateo.io"),
+])
+def test_a_measuring_run_whose_live_grant_is_missing_stops_before_any_load(harness, mode, said):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, FAKE_LIVE_READERS=mode)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0 and said in log, log[-3000:]
+    assert "preflight FAILED before any load: the portal's shell is not granted to the bench's base group on the " \
+           "live cluster" in log
+    assert "=== step data ===" not in log and "=== step measure ===" not in log
+    # the preflight Job never ran: the cause is named, not a 403 one step later
+    assert "preflight606" not in (state / "applied-jobs").read_text()
+
+
+# ─── #1471 review: the preflight user's groups are the model's ──────────────
+
+def test_the_preflight_user_is_in_the_models_base_group_never_a_literal():
+    assert rbac_model.preflight_groups() == [rbac_model.BASE_GROUP, rbac_model.team_group(1)]
+    docs = [d for w, d in data_manifests.documents(namespaces=2, users=2) if w == "the preflight identity"]
+    assert [d["spec"]["groups"] for d in docs if d["kind"] == "User"] == [rbac_model.preflight_groups()]
+    for rel in ("bench/data_manifests.py", "bench/data606.py"):
+        assert not re.search(r'["\']devs["\']', (BENCH / rel).read_text()), rel

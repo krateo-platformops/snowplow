@@ -1646,6 +1646,23 @@ s_psi() {
   fi
   log "psi: readable on the loadgen node (${why})"
 }
+# portal_readers_live (run 26j, review of #1471): the grant the source stage held against the CHARTS, read
+# from the LIVE cluster before any load, in the rehearsal and in every measuring run: the Installer CR
+# carries the reader group, the Portal CR carries it (an installer that drops a nested componentValues key
+# without a default never passes it on: installer #173/#174), and in krateo-system a RoleBinding binds the
+# group to what the chart's reader template grants. The listing goes through a pipe, never a file (the
+# Installer CR carries the registry username); $OUT/portal-readers-live.json keeps the reader groups and the
+# group's bindings only. Any link missing refuses the arm, naming which.
+portal_readers_live() {
+  local line rc=0
+  line="$(bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get \
+            installers.composition.krateo.io,portals.composition.krateo.io,roles,rolebindings -o json 2>"$KERR" \
+          | python3 -m bench.portal_readers live --record "$OUT/portal-readers.json" \
+              --out "$OUT/portal-readers-live.json")" || rc=$?
+  log "$line"
+  (( rc == 0 )) && return 0
+  record_failure "preflight FAILED before any load: the portal's shell is not granted to the bench's base group on the live cluster ($OUT/portal-readers-live.json)"
+}
 # preflight_user: the bench's own preflight user, made once a run (the rehearsal's preflight runs in
 # its own step)
 PREFLIGHT_USER_MADE=""
@@ -1670,6 +1687,7 @@ s_preflight() {
   # (run 6 discovered stale page roots 54 minutes in). The boot root is the
   # frontend's own config.json INIT — never a hard-coded page name.
   if [[ "$DRY" == "1" ]]; then
+    log "DRY: kubectl -n krateo-system get installers.composition.krateo.io,portals.composition.krateo.io,roles,rolebindings -o json | python3 -m bench.portal_readers live --record $OUT/portal-readers.json --out $OUT/portal-readers-live.json (the arm is refused unless all three links carry the grant)"
     log "DRY: read frontend-config-vars config.json -> PORTAL_INIT; preflight606 Job"
     # the identities this step makes, said in the dry pass too (each prints its command)
     preflight_user
@@ -1678,6 +1696,7 @@ s_preflight() {
     export PORTAL_FRONTEND_NS=krateo-system PORTAL_BUILDERS_NS=krateo-system
     return 0
   fi
+  portal_readers_live || return 1
   "${K[@]}" -n krateo-system get configmap "$FRONTEND_CONFIGMAP" \
       -o 'jsonpath={.data.config\.json}' > "$OUT/frontend-config.json"
   python3 -m bench.load606 portal-config < "$OUT/frontend-config.json" > "$OUT/portal.env"

@@ -159,7 +159,7 @@ def documents(*, namespaces: int = 50, users: int = 1000,
     for n in range(1, namespaces + 1):
         add("the compositions", composition_yaml(f"bench-ns-{n:02d}", f"bench-app-{n:02d}-01"))
     model = rbac_model.bench_model(users, namespaces)
-    for d in synthetic_user_docs(0, ["devs", rbac_model.team_group(1)], SCALEUSER_PASSWORD):
+    for d in synthetic_user_docs(0, rbac_model.preflight_groups(), SCALEUSER_PASSWORD):
         out.append(("the preflight identity", d))
     for d in debug_reader_docs(SCALEUSER_PASSWORD):
         out.append(("the debug reader", d))

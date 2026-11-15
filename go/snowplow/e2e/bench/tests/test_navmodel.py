@@ -387,3 +387,37 @@ def test_preflight_ok_path_records_product_errors_and_reads_init_from_config(har
     assert "name=app-shell" in job and "dashboard-page" not in job
     verdict = json.loads((tmp / "out" / "verdict.json").read_text())
     assert verdict["report"]["preflight"]["product_errors"][0]["path"] == "/agents/new"
+
+
+
+# ─── #1471 review: a call with no answer is named, never "status 0, product" ─
+
+@pytest.mark.parametrize("error, cls", [
+    ("TimeoutError: timed out", "timeout"),
+    ("URLError: <urlopen error timed out>", "timeout"),
+    ("URLError: <urlopen error [Errno 61] Connection refused>", "unreachable"),
+    ("RemoteDisconnected: Remote end closed connection without response", "unreachable"),
+])
+def test_no_http_answer_is_a_timeout_or_unreachable_not_a_product_error(error, cls):
+    assert load606.classify(load606.Response(0, b"", 30000.0, error)) == cls
+
+
+class _Silent:
+    """A portal whose every call gets no answer within the client's bound."""
+
+    def __init__(self, error="TimeoutError: timed out"):
+        self.error, self.calls = error, []
+
+    def get(self, path, token):
+        self.calls.append(path)
+        return load606.Response(0, b"", 30001.0, self.error)
+
+
+def test_a_boot_root_that_times_out_is_refused_as_a_timeout():
+    res = load606.preflight(_Silent(), "t", PORTAL)
+    [x] = res["refused"]
+    assert res["ok"] is False and x["status"] == 0 and x["class"] == "timeout" and x["boot_root"] is True
+    assert x["body"] == ("the portal's boot root did not answer 200 for this login (the call timed out: no answer "
+                         "within the client's bound; after 30001 ms, TimeoutError: timed out)")
+    res = load606.preflight(_Silent("URLError: <urlopen error [Errno 61] Connection refused>"), "t", PORTAL)
+    assert res["refused"][0]["class"] == "unreachable" and "the call reached no server" in res["refused"][0]["body"]

@@ -353,9 +353,76 @@ def said(rec: dict) -> list[str]:
     return lines
 
 
+# ─── the LIVE grant, before any load ────────────────────────────────────────
+#
+# What `check` cannot show (no cluster): that the installer passes the declared value on. Its chart merges
+# componentValues.<portal> into the Portal CR's spec (templates/compositions.yaml), and its own schema warns
+# that a nested componentValues key with no default can be dropped from the schema expansion and never reach
+# the component's release (installer #173/#174); readerGroups has no default. So before any load the run
+# reads the three live links of the chain, and refuses the arm naming each one that is missing:
+#   1. the Installer CR's spec.componentValues.<portal>.readerGroups carries the group;
+#   2. the Portal CR's spec.readerGroups carries it;
+#   3. in the release namespace a RoleBinding binds the group to a Role that allows what the chart's reader
+#      template grants (the rules `check` derived from the pinned chart: the same predicate, run against
+#      the LIVE objects).
+# The input is ONE `kubectl get installers,portals,roles,rolebindings -o json` list, on stdin: the Installer
+# CR carries the registry username (registryAuth), so it is never written anywhere; the record keeps only
+# the reader groups and the bindings of the group (no other subject, no user).
+
+LIVE_KIND = "portal_readers_live"
+INSTALLER_KIND, PORTAL_KIND = "Installer", "Portal"
+
+
+def live(record: dict | None, items: list, group: str, portal: str) -> dict:
+    """The live record (above). `record`: `check`'s (the need); `items`: the listed objects."""
+    rec = {"kind": LIVE_KIND, "group": group, "ok": False, "missing": []}
+    if not isinstance(record, dict) or not record.get("ok") or not (record.get("shell") or {}).get("need"):
+        rec["why"] = ("the free check's record (portal-readers.json) is missing or refused: what the shell needs "
+                      "is not known")
+        return rec
+    ns = record["shell"]["release_namespace"]
+    need = record["shell"]["need"].get(ns) or []
+    of = lambda kind: [d for d in items if isinstance(d, dict) and d.get("kind") == kind]  # noqa: E731
+    inst, port = of(INSTALLER_KIND), [d for d in of(PORTAL_KIND) if (d.get("metadata") or {}).get("name") == portal]
+    rec["installer_reader_groups"] = (None if len(inst) != 1 else
+                                      ((((inst[0].get("spec") or {}).get("componentValues") or {}).get(portal) or {})
+                                       .get(READERS_KEY)))
+    rec["portal_reader_groups"] = None if len(port) != 1 else ((port[0].get("spec") or {}).get(READERS_KEY))
+    for what, n, got in (("the Installer CR", len(inst), rec["installer_reader_groups"]),
+                         (f"the Portal CR `{portal}`", len(port), rec["portal_reader_groups"])):
+        key = (f"spec.componentValues.{portal}.{READERS_KEY}" if what == "the Installer CR" else f"spec.{READERS_KEY}")
+        if n != 1:
+            rec["missing"].append(f"{what}: {n} found in {ns}, not one")
+        elif not isinstance(got, list) or group not in got:
+            rec["missing"].append(f"{what}'s {key} does not carry `{group}` (it holds {json.dumps(got)})")
+    rbac = [d for d in items if isinstance(d, dict) and d.get("kind") in ("Role", "RoleBinding")]
+    have = bound(rbac, group, ns)
+    gaps = missing(need, have.get(ns, []))
+    rec["bindings"] = sorted((d.get("metadata") or {}).get("name") for d in rbac if d.get("kind") == "RoleBinding"
+                             and any(s.get("kind") == "Group" and s.get("name") == group for s in d.get("subjects") or []))
+    rec["need"] = need_text({ns: need})
+    if gaps:
+        rec["missing"].append(f"in {ns}, no RoleBinding binds `{group}` to a Role that allows {', '.join(gaps)} "
+                              f"(bindings of `{group}` there: {', '.join(rec['bindings']) or 'none'})")
+    rec["ok"] = not rec["missing"]
+    rec["why"] = ("; ".join(rec["missing"]) if rec["missing"] else
+                  f"the Installer CR and the Portal CR carry `{group}`, and in {ns} it is bound to what the shell "
+                  f"needs ({rec['need']}) by {', '.join(rec['bindings'])}")
+    return rec
+
+
+def live_said(rec: dict) -> str:
+    return ("portal readers, LIVE: " + ("OK: " if rec.get("ok") else "MISSING: ") + str(rec.get("why"))
+            + (f" [Installer CR readerGroups {json.dumps(rec.get('installer_reader_groups'))}, Portal CR readerGroups "
+               f"{json.dumps(rec.get('portal_reader_groups'))}]" if "installer_reader_groups" in rec else ""))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python3 -m bench.portal_readers")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    lv = sub.add_parser("live", help="the live objects (one kubectl list on stdin) against the free check's record")
+    lv.add_argument("--record", required=True, help="portal-readers.json, the free check's record")
+    lv.add_argument("--out", required=True)
     c = sub.add_parser("check")
     c.add_argument("--installer-pulled", required=True)
     c.add_argument("--values", required=True)
@@ -364,6 +431,30 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads")
     c.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    if a.cmd == "live":
+        from bench import installer_values
+        try:
+            with open(a.record) as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            record = None
+        raw = sys.stdin.read()
+        try:
+            listed = json.loads(raw) if raw.strip() else None
+        except ValueError:
+            listed = None
+        if not isinstance(listed, dict) or not isinstance(listed.get("items"), list):
+            rec = {"kind": LIVE_KIND, "ok": False, "missing": [], "group": installer_values.READER_GROUP,
+                   "why": "the live Installer CR, Portal CR, Roles and RoleBindings could not be read (no listing)"}
+        else:
+            rec = live(record, listed["items"], installer_values.READER_GROUP, installer_values.PORTAL_COMPONENT)
+        tmp = a.out + ".part"
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh, indent=1)
+            fh.write("\n")
+        os.replace(tmp, a.out)
+        print(live_said(rec))
+        return 0 if rec["ok"] else 1
     from bench import ghcr_pull, noanswer
     why = ghcr_pull.check(a.ghcr_env_file)
     if why:

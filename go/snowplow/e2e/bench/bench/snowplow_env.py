@@ -580,6 +580,10 @@ def rehearsal_lines(out_dir: str) -> list[str]:
         f"{rec.get('why')}"))
     lines += image_lines(_last_json_line(os.path.join(out_dir, "image-digest.jsonl"), "image_digest"))
     lines += readers_lines(j("portal-readers.json"))
+    lv = j("portal-readers-live.json")
+    from bench import portal_readers
+    lines.append(portal_readers.live_said(lv) if isinstance(lv, dict) else
+                 "portal readers, LIVE: NO RECORD (portal-readers-live.json): the live grant was not read")
     lines += preflight_lines(_last_json_line(os.path.join(out_dir, "preflight.jsonl"), "preflight"))
     lines.append("=== end of rehearsal report ===")
     return lines
