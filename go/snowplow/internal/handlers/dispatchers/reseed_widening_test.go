@@ -176,7 +176,7 @@ func s258BuildWatcher(t *testing.T, extraUsers ...string) (dynamic.Interface, *c
 	cache.SetGlobal(rw)
 	// The live binding index (what EnumeratePrewarmTargetsForGVR reads, and what
 	// gates the informer delta → pending sub-gen bump). Phase 1 builds it in prod.
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
 	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	t.Cleanup(func() {

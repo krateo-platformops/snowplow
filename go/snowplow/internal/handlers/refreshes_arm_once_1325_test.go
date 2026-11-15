@@ -22,6 +22,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,43 +94,159 @@ func TestRefreshes1325_A2_TwoWidgetsOnOneKeyCatchUpWhenAnyHoldsOldBytes(t *testi
 	}
 }
 
+// A3 — the arm catch-up check reads on the #101 arm ctx. Since #1430 the check
+// is the rotation tracker's (Behind), which reads on the ctx it was built
+// with. So: every construction of a tracker, and every call of the ctx-taking
+// BehindKeys, receives a context that IS refreshArmCtx(...) — written in
+// place, or a local variable of the same function that is defined from
+// refreshArmCtx(...) and never assigned anything else. The variable is
+// resolved by scope (the parser's object resolution), never by its name: a
+// parameter, a package variable or a variable of another function that
+// merely carries the same name does not pass.
+func a3ArmCtxViolations(t *testing.T, filename, src string) (violations []string, trackers, checks int) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, 0) // object resolution ON
+	if err != nil {
+		t.Fatal(err)
+	}
+	isArmCtxCall := func(e ast.Expr) bool {
+		c, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		fn, _ := c.Fun.(*ast.Ident)
+		return fn != nil && fn.Name == "refreshArmCtx"
+	}
+	// Every assignment to each resolved variable: its definition and any later
+	// write, keyed by the variable's object (its scope), not its name.
+	armDefined := map[*ast.Object]bool{}
+	otherWrite := map[*ast.Object]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch st := n.(type) {
+		case *ast.AssignStmt:
+			for i, l := range st.Lhs {
+				id, ok := l.(*ast.Ident)
+				if !ok || id.Obj == nil {
+					continue
+				}
+				if len(st.Lhs) == len(st.Rhs) && isArmCtxCall(st.Rhs[i]) {
+					armDefined[id.Obj] = true
+				} else {
+					otherWrite[id.Obj] = true
+				}
+			}
+		case *ast.ValueSpec:
+			for i, id := range st.Names {
+				if id.Obj == nil {
+					continue
+				}
+				if len(st.Names) == len(st.Values) && isArmCtxCall(st.Values[i]) {
+					armDefined[id.Obj] = true
+				} else {
+					otherWrite[id.Obj] = true
+				}
+			}
+		case *ast.UnaryExpr:
+			if id, ok := st.X.(*ast.Ident); ok && st.Op == token.AND && id.Obj != nil {
+				otherWrite[id.Obj] = true // its address escapes: it may be written anywhere
+			}
+		}
+		return true
+	})
+	onArmCtx := func(e ast.Expr) bool {
+		if isArmCtxCall(e) {
+			return true
+		}
+		id, ok := e.(*ast.Ident)
+		if !ok || id.Obj == nil || id.Obj.Kind != ast.Var {
+			return false
+		}
+		if _, isParam := id.Obj.Decl.(*ast.Field); isParam {
+			return false
+		}
+		return armDefined[id.Obj] && !otherWrite[id.Obj]
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "NewSubscriptionRotationTracker", "BehindKeys":
+			if sel.Sel.Name == "NewSubscriptionRotationTracker" {
+				trackers++
+			} else {
+				checks++
+			}
+			if len(call.Args) == 0 || !onArmCtx(call.Args[0]) {
+				violations = append(violations, sel.Sel.Name+" at "+fset.Position(call.Pos()).String())
+			}
+		case "Behind":
+			checks++
+		}
+		return true
+	})
+	return violations, trackers, checks
+}
+
 func TestRefreshes1325_A3_BehindKeysReadsOnTheArmCtx(t *testing.T) {
+	// The guard itself, on sources it must accept and sources it must refuse.
+	const head = "package handlers\nfunc refreshArmCtx(r any) any { return r }\nvar pkgCtx = any(nil)\n"
+	for name, c := range map[string]struct {
+		body string
+		bad  bool
+	}{
+		"in place":          {body: "func h(req any) { t := dispatchers.NewSubscriptionRotationTracker(refreshArmCtx(req)); t.Behind(nil) }"},
+		"local var":         {body: "func h(req any) { armCtx := refreshArmCtx(req); t := dispatchers.NewSubscriptionRotationTracker(armCtx); t.Behind(nil) }"},
+		"var decl":          {body: "func h(req any) { var armCtx = refreshArmCtx(req); dispatchers.NewSubscriptionRotationTracker(armCtx) }"},
+		"ctx-taking":        {body: "func h(req any) { dispatchers.BehindKeys(refreshArmCtx(req), nil) }"},
+		"the request's ctx": {bad: true, body: "func h(req any) { dispatchers.NewSubscriptionRotationTracker(req) }"},
+		"a parameter named like the arm variable": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); _ = armCtx; mk(req) }\nfunc mk(armCtx any) { dispatchers.NewSubscriptionRotationTracker(armCtx) }"},
+		"a same-named variable of another function": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); _ = armCtx }\nfunc g(req any) { armCtx := req; dispatchers.NewSubscriptionRotationTracker(armCtx) }"},
+		"a shadowing variable in an inner scope": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); { armCtx := req; dispatchers.NewSubscriptionRotationTracker(armCtx) }; _ = armCtx }"},
+		"reassigned": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); armCtx = req; dispatchers.NewSubscriptionRotationTracker(armCtx) }"},
+		"address taken": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); set(&armCtx); dispatchers.NewSubscriptionRotationTracker(armCtx) }"},
+		"a package variable": {bad: true, body: "func h(req any) { dispatchers.NewSubscriptionRotationTracker(pkgCtx) }"},
+		"the ctx-taking check on another ctx": {bad: true,
+			body: "func h(req any) { armCtx := refreshArmCtx(req); _ = armCtx; dispatchers.BehindKeys(req, nil) }"},
+	} {
+		v, _, _ := a3ArmCtxViolations(t, name+".go", head+c.body)
+		if (len(v) > 0) != c.bad {
+			t.Fatalf("A3 guard RED: %q: violations %v, want a violation: %v", name, v, c.bad)
+		}
+	}
+
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := 0
+	trackers, checks := 0, 0
 	for _, p := range files {
 		if strings.HasSuffix(p, "_test.go") {
 			continue
 		}
-		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+		src, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "BehindKeys" || len(call.Args) == 0 {
-				return true
-			}
-			calls++
-			var fn *ast.Ident
-			if arg, isCall := call.Args[0].(*ast.CallExpr); isCall {
-				fn, _ = arg.Fun.(*ast.Ident)
-			}
-			if fn == nil || fn.Name != "refreshArmCtx" {
-				t.Fatalf("A3 RED: BehindKeys at %s does not read on refreshArmCtx(req) — #101: every /refreshes arm-time "+
-					"read is informer-only (#1325 review m3)", fset.Position(call.Pos()))
-			}
-			return true
-		})
+		v, tr, ch := a3ArmCtxViolations(t, p, string(src))
+		if len(v) > 0 {
+			t.Fatalf("A3 RED: %v does not read on refreshArmCtx(req) — #101: every /refreshes arm-time read is "+
+				"informer-only (#1325 review m3)", v)
+		}
+		trackers, checks = trackers+tr, checks+ch
 	}
-	if calls == 0 {
-		t.Fatal("A3: no BehindKeys call found — the scan is not looking at the handler")
+	if trackers == 0 || checks == 0 {
+		t.Fatalf("A3: %d tracker constructions and %d catch-up checks found — the scan is not looking at the handler", trackers, checks)
 	}
 }

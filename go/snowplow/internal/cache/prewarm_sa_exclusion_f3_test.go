@@ -100,7 +100,7 @@ func TestF3SAExclusion_MixedSubjects(t *testing.T) {
 	add(crbRuleUID("masters", "uid-masters", rbacv1.Subject{Kind: "Group", Name: "system:masters"}, rules))
 
 	PublishRBACSnapshotForTest(buildSnap(crbs, crs))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
 	got := subjectSetOf(targets)
@@ -157,7 +157,7 @@ func TestF3SAExclusion_AllServiceAccount_FullyExcluded(t *testing.T) {
 		crs = append(crs, cr)
 	}
 	PublishRBACSnapshotForTest(buildSnap(crbs, crs))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
 	if len(targets) != 0 {

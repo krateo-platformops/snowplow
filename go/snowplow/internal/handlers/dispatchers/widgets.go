@@ -225,7 +225,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			perPage, page, keyExtras)
 		if contentHandle != nil {
 			if entry, ok := contentHandle.Get(contentKey); ok {
-				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
+				gated, served, fillServedView := gateNotingServedView(req.Context(), entry, func() ([]byte, bool) {
+					return gateWidgetEnvelope(req.Context(), entry.RawJSON)
+				})
+				if served {
 					cache.RecordApiserverFallthrough(req.Context(),
 						cache.ReasonWidgetContentHit, got.GVR.String())
 					emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
@@ -233,7 +236,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					// #1324 — the GATED bytes this requester is served, not the shared shell.
-					stampRefreshDigest(wri, func() string { return cache.AnswerDigest(gated, entry.StageOutcomes) })
+					// #1430 — and that digest is what this identity's next arm compares.
+					stampRefreshDigest(wri, func() string {
+						d := cache.AnswerDigest(gated, entry.StageOutcomes)
+						fillServedView(d)
+						return d
+					})
 					// #1319 — the outcomes the walker's resolve stored with the shell.
 					setWidgetStageOutcomesHeader(wri, entry.StageOutcomes)
 					// #1062 — an armed hit on a dirty shared shell is an l1 stale

@@ -423,7 +423,7 @@ func TestSubGenSkip_IndexDeltaStillRunsOnASkippedEvent(t *testing.T) {
 	roleNoGrant.Name = crb.RoleRef.Name
 	PublishRBACSnapshotForTest(buildSnap(
 		[]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{roleNoGrant}))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{compGVR})
 
 	if got := targetRepresentativeLabels(EnumeratePrewarmTargetsForGVR(compGVR, "list")); len(got) != 0 {
 		t.Fatalf("setup: want no prewarm targets before the role grants anything, got %v", got)

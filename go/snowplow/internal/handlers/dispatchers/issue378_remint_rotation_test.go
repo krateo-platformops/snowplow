@@ -121,7 +121,7 @@ func TestIssue378_F3_ReMintAcrossRotation_KeyAndOutput(t *testing.T) {
 	// in, and its key move came in one step or in two (below).
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
 	// Then settle RBAC: no rebuild in flight (an earlier arm's included), and
 	// every sub-gen bump already recorded flushed by one synchronous rebuild. From
 	// here carol's key inputs move only on this arm's own binding ADD.
@@ -295,7 +295,7 @@ func TestIssue378_F3b_RoleRulesRotation_SubGenOnly_NoFreshMint(t *testing.T) {
 	// Activate the binding/role deltas that bump per-subject sub-generations.
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, psConfigmapsGVR})
 	carol, dave := psUserCtx(e.a, psCarol), psUserCtx(e.a, psDave)
 	c := cache.ResolvedCache()
 	serve := func(ctx context.Context) string {

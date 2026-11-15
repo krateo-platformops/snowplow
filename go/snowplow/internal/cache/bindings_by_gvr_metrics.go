@@ -14,8 +14,9 @@
 //
 //   - snowplow_bindings_by_gvr_delta_skipped_non_typed — the S1 index
 //     drift canary: a non-zero value means a delta event object was
-//     neither typed nor convertible and was DROPPED (the index will drift
-//     until the next boot rebuild). Surfacing it makes the drift
+//     neither typed nor convertible and was DROPPED (the RBAC snapshot
+//     leaves the same object out, until an event delivers it convertible;
+//     nothing rebuilds the index, #1458). Surfacing it makes the drop
 //     observable instead of silent.
 //
 // All values are expvar.Func — evaluated lazily at scrape time, zero

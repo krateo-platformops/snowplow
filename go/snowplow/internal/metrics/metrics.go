@@ -1484,7 +1484,7 @@ func registerDenialOnlyInstruments(m metric.Meter) error {
 		return err
 	}
 	epoch, err := m.Int64ObservableGauge("snowplow_rbac_subgen_epoch",
-		metric.WithDescription("The process-wide RBAC sub-generation epoch (#682). 0 or 1: it is bumped at most once, at the first bindings-by-GVR index build, iff an RBAC event landed after the first RBAC publish and before that build; the bump rotates every per-identity L1 key."))
+		metric.WithDescription("The process-wide RBAC sub-generation epoch (#682). 0 or 1: it is bumped at most once, when the bindings-by-GVR index becomes ready (the RBAC handlers have been delivered their initial lists), iff an RBAC event landed after the first RBAC publish and before that; the bump rotates every per-identity L1 key."))
 	if err != nil {
 		return err
 	}

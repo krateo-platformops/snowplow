@@ -81,7 +81,7 @@ func r435Base(t *testing.T) *dynamicfake.FakeDynamicClient {
 	dyn := k424Watcher(t, seed...)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{gvr(), {Version: "v1", Resource: "configmaps"}})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{gvr(), {Version: "v1", Resource: "configmaps"}})
 	return dyn
 }
 

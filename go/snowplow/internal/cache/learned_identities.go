@@ -367,7 +367,7 @@ func syncLearnedFromSecrets(items []*corev1.Secret) {
 			// #130 F3: a ServiceAccount never renders the frontend; it is not a
 			// seed class (mirrors the SA-only binding exclusion). It is not
 			// "unparseable" either.
-			_, _, isSA = parseServiceAccountUsername(user)
+			_, _, isSA = ParseServiceAccountUsername(user)
 		}
 		// #1382 — the Secret is learned under its certificate's CN, and only
 		// when it is that user's (endpoints.OwnsSecret): a Secret whose
@@ -435,7 +435,7 @@ func ObserveLiveIdentity(username string, groups []string, exp time.Time) {
 	if Disabled() || username == "" {
 		return
 	}
-	if _, _, isSA := parseServiceAccountUsername(username); isSA {
+	if _, _, isSA := ParseServiceAccountUsername(username); isSA {
 		return
 	}
 	key := LearnedClassKey(username, groups)

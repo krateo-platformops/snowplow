@@ -85,17 +85,6 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 		rbacv1.Subject{Kind: "User", Name: "alice"},
 		getListRules(restActionGVR.Group, restActionGVR.Resource))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
-	PublishRBACSnapshotForTest(snap)
-
-	// Index must be built over a navigated set INCLUDING restActionGVR so
-	// the get-restactions binding is enrolled.
-	if n := BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR}); n != 1 {
-		t.Fatalf("expected 1 binding enrolled, got %d", n)
-	}
-	// Precondition: the gate the enumerator reads is non-empty.
-	if got := EnumeratePrewarmTargetsForGVR(restActionGVR, "get"); len(got) != 1 {
-		t.Fatalf("precondition: expected 1 get-restactions target, got %d", len(got))
-	}
 
 	rw := newSyntheticRemoveWatcher(t, restActionGVR)
 	t.Cleanup(func() { rw.Stop() })
@@ -104,6 +93,27 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 	// seeding, or the async Replace races the manual Adds below and wipes
 	// them — the CI-order flake this test tripped.
 	waitInformerSynced(t, rw, restActionGVR)
+
+	// The hand-made snapshot and the index stood up from it come AFTER the
+	// watcher: a watcher starts the index empty (#1458) and publishes its own
+	// (empty) RBAC world.
+	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := WaitRBACRebuildQuiesceForTest(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	PublishRBACSnapshotForTest(snap)
+
+	// Index must be built over a navigated set INCLUDING restActionGVR so
+	// the get-restactions binding is enrolled.
+	if n := SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR}); n != 1 {
+		t.Fatalf("expected 1 binding enrolled, got %d", n)
+	}
+	// Precondition: the gate the enumerator reads is non-empty.
+	if got := EnumeratePrewarmTargetsForGVR(restActionGVR, "get"); len(got) != 1 {
+		t.Fatalf("precondition: expected 1 get-restactions target, got %d", len(got))
+	}
 
 	// Seed three composition-detail-style RESTActions (the per-composition
 	// RAs the nav walk never reaches). One duplicate add to prove dedup.
@@ -139,7 +149,7 @@ func TestProactiveRASeed_F6_transparent_no_binding(t *testing.T) {
 		getListRules("composition.krateo.io", "compositions"))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR, gr("composition.krateo.io", "compositions")})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR, gr("composition.krateo.io", "compositions")})
 
 	if got := EnumeratePrewarmTargetsForGVR(restActionGVR, "get"); len(got) != 0 {
 		t.Fatalf("precondition: expected 0 get-restactions targets, got %d", len(got))
@@ -167,7 +177,7 @@ func TestProactiveRASeed_F6_transparent_empty_informer(t *testing.T) {
 		getListRules(restActionGVR.Group, restActionGVR.Resource))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{restActionGVR})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{restActionGVR})
 
 	rw := newSyntheticRemoveWatcher(t, restActionGVR)
 	t.Cleanup(func() { rw.Stop() })

@@ -280,6 +280,20 @@ func rePrewarmGVRDiscoveredSeed(ctx context.Context, deps rePrewarmDeps) error {
 	return rePrewarmBootScoped(ctx, deps, seedModeGVRDiscovered)
 }
 
+// prewarmPassIndexStep is what a prewarm pass (boot, keep-warm sweep, GVR
+// discovery) does to the BindingsByGVR index: it sets the navigated set to the
+// GVRs registered now, and the index re-derives its per-GVR buckets (prewarm
+// targeting) from the bindings it holds. It does NOT touch the index's
+// membership, which the RBAC event hooks alone write: a pass can neither drop a
+// binding the event path recorded nor bring back one it removed (#1458; until
+// then every pass emptied the index and refilled it from the published RBAC
+// snapshot, which is published later than the events are handled). Returns the
+// navigated GVR count and the number of bindings the index holds.
+func prewarmPassIndexStep(rw *cache.ResourceWatcher) (navigated, bindings int) {
+	gvrs := rw.RegisteredGVRs()
+	return len(gvrs), cache.SetNavigatedGVRs(gvrs)
+}
+
 // bootShouldWalk is the #135 F4b Lever B reuse predicate — the SINGLE source of
 // the walk-vs-reuse decision (rePrewarmBootScoped calls this; the falsifier calls
 // the SAME function, never a copy, so the test can't drift from prod — the #64/#66
@@ -507,16 +521,13 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// seed reads RegisteredGVRs().
 	settleRegisteredSet(ctx, deps.rw)
 
-	// ── (3) BUILD the BindingsByGVR index over the navigated GVRs. Ship 1
-	// builds it here on the engine path, AFTER the re-walk discovered the
-	// navigated GVRs. The build is ONCE (Gate-2); steady-state maintenance
-	// is the delta hooks (bindings_by_gvr_delta.go).
-	navigated := deps.rw.RegisteredGVRs()
-	enrolled := cache.BuildBindingsByGVRIndex(navigated)
+	// ── (3) Give the BindingsByGVR index its navigated set: the GVRs registered
+	// now, after the re-walk discovered them (prewarmPassIndexStep).
+	navigated, bindings := prewarmPassIndexStep(deps.rw)
 	log.Info("prewarm.engine.boot.index_built",
 		slog.String("subsystem", "cache"),
-		slog.Int("navigated_gvrs", len(navigated)),
-		slog.Int("bindings_enrolled", enrolled),
+		slog.Int("navigated_gvrs", navigated),
+		slog.Int("bindings_enrolled", bindings),
 	)
 
 	// ── (4) SEED per cohort with PER-TARGET-GVR scoping.
