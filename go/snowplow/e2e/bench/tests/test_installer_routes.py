@@ -122,13 +122,68 @@ def test_a_table_the_chart_does_not_give_is_refused(pulled, tmp_path):
     assert "not path mode (exposure.type='LoadBalancer'" in _refused(pulled["0.3.641"], _values(tmp_path, type="LoadBalancer"))
     vals = _values(tmp_path)
     # a chart that cannot say which components are on
-    assert "has no inst.compEnabled define" in _refused(pulled["0.3.545"], vals)
+    bare = _copy(pulled, tmp_path)
+    helpers = bare / "installer" / "templates" / "_helpers.tpl"
+    helpers.write_text(helpers.read_text().replace('define "inst.compEnabled"', 'define "inst.compOn"')
+                       .replace('define "inst.featureEnabled"', 'define "inst.featureOn"'))
+    assert "has neither an inst.compEnabled nor an inst.featureEnabled define" in _refused(bare, vals)
     assert "no pulled installer chart at" in _refused(tmp_path / "nowhere", vals)
     # the portal's feature off: no route to hold a config against
     off = yaml.safe_load(installer_values.document("1.12.70"))
     off.setdefault("features", {})["portal"] = False
     (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
     assert "renders no portal route with a frontend key" in _refused(pulled["0.3.641"], str(tmp_path / "off.yaml"))
+
+
+def test_a_chart_from_before_comp_enabled_is_asked_by_its_own_feature_rule(pulled, tmp_path):
+    """0.3.545 (like 0.3.422, which several dry-pass tests pull from the real registry) has no
+    inst.compEnabled: its route table gates on inst.featureEnabled of the pin's feature."""
+    t = installer_routes.table(str(pulled["0.3.545"]), _values(tmp_path))
+    assert t["paths"]["AUTHN_API_BASE_URL"] == "/auth" and "its own inst.featureEnabled" in t["source"]
+    assert [r["component"] for r in t["routes"]] == ["authn", "snowplow", "frontend", "krateo-sse-proxy"]
+    off = yaml.safe_load(installer_values.document("1.12.70"))
+    off.setdefault("features", {})["portal"] = False
+    (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
+    assert "renders no portal route with a frontend key" in _refused(pulled["0.3.545"], str(tmp_path / "off.yaml"))
+
+
+def test_a_chart_with_comp_enabled_is_asked_by_it_not_by_the_feature_alone(pulled, tmp_path):
+    """inst.compEnabled also turns a component on through its `alsoFeatures`; the older rule
+    (inst.featureEnabled of the pin's one feature) would call this authn off and drop its route."""
+    chart = _copy(pulled, tmp_path)
+    f = chart / "installer" / "files" / "component-pins.min.yaml"
+    doc = yaml.safe_load(f.read_text())
+    authn = next(c for c in doc["components"] if c["name"] == "authn")
+    authn["feature"], authn["alsoFeatures"] = "specialistAgents", ["portal"]      # off, and on through portal
+    f.write_text(yaml.safe_dump(doc))
+    t = installer_routes.table(str(chart), _values(tmp_path))
+    assert t["paths"]["AUTHN_API_BASE_URL"] == "/authn" and "its own inst.compEnabled" in t["source"]
+
+
+def _pins_of(chart):
+    f = chart / "installer" / "files" / "component-pins.min.yaml"
+    return f, yaml.safe_load(f.read_text())
+
+
+def test_a_frontend_key_given_two_paths_by_the_pins_is_refused(pulled, tmp_path):
+    chart = _copy(pulled, tmp_path)
+    f, doc = _pins_of(chart)
+    next(c for c in doc["components"] if c["name"] == "krateo-sse-proxy")["configKeys"] = [
+        "EVENTS_API_BASE_URL", "AUTHN_API_BASE_URL"]
+    f.write_text(yaml.safe_dump(doc))
+    assert "give the frontend key AUTHN_API_BASE_URL two paths (/authn and /events)" in _refused(chart, _values(tmp_path))
+
+
+@pytest.mark.parametrize("change", ["no key", "no path"])
+def test_a_table_with_no_snowplow_route_is_refused(pulled, tmp_path, change):
+    """The browser and the probes reach the portal's API through snowplow's URL: a chart that routes no
+    snowplow with a frontend key gives them nothing to call."""
+    chart = _copy(pulled, tmp_path)
+    f, doc = _pins_of(chart)
+    snow = next(c for c in doc["components"] if c["name"] == "snowplow")
+    snow.pop("configKeys" if change == "no key" else "gatewayPath")
+    f.write_text(yaml.safe_dump(doc))
+    assert "routes no snowplow component with a frontend key" in _refused(chart, _values(tmp_path))
 
 
 def test_a_chart_whose_own_route_table_and_pins_disagree_is_refused_naming_both(pulled, tmp_path):

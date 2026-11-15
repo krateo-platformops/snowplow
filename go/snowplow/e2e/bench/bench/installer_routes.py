@@ -13,8 +13,9 @@ The table is the chart's, never the bench's:
     browser URL). The installer's templates build BOTH things from them: the routes
     (agentgateway-policies' spec.platformRoutes: pathPrefix = gatewayPath) and the frontend's URL
     keys (compositions.yaml: origin + gatewayPath, one per configKey);
-  - which components are on is the chart's own rule too: its `inst.compEnabled` define, rendered with
-    the run's values by `helm template` (a probe template added to an in-memory copy of the pulled
+  - which components are on is the chart's own rule too: its `inst.compEnabled` define (a chart from
+    before it, 0.3.422 or 0.3.545, is asked by the rule its route table applied inline:
+    `inst.featureEnabled` of the pin's feature), rendered with the run's values by `helm template` (a probe template added to an in-memory copy of the pulled
     chart, as bench.ghcr_pull reads the private-image list). No cluster: the table is known in the
     dry pass, before anything is created;
   - a chart that carries the `inst.platformRoutes` define (0.3.639 on: "so it can be TESTED") has it
@@ -25,8 +26,8 @@ The table is the chart's, never the bench's:
 Read from the published charts (2026-11-15): authn is /auth up to 0.3.636 and /authn from 0.3.639;
 snowplow /content, sse-proxy /events and the frontend / are the same in 0.3.616 and 0.3.641.
 
-Refused (fail closed), with the reason: a chart that cannot be rendered; one with no
-`inst.compEnabled` define (0.3.545: which components are on cannot be asked of it); values that are
+Refused (fail closed), with the reason: a chart that cannot be rendered; one with neither enable
+define (which components are on cannot be asked of it); values that are
 not path mode (exposure.type Gateway, gatewayMode path: the bench's portal is one origin); a table
 with no route or no frontend key.
 """
@@ -42,6 +43,9 @@ import sys
 KIND = "portal_routes"
 PROBE_KEY = "table"
 ENABLED_DEFINE = "inst.compEnabled"
+#: the rule of a chart from before inst.compEnabled (0.3.422, 0.3.545: its route table gates each
+#: component on `inst.featureEnabled (list $top $d.feature)`, inline in compositions.yaml)
+FEATURE_DEFINE = "inst.featureEnabled"
 ROUTES_DEFINE = "inst.platformRoutes"
 #: the component whose browser URL the bench's browser and probes call the portal's API through
 SNOWPLOW_COMPONENT = "snowplow"
@@ -62,7 +66,7 @@ def _has_define(root: str, name: str) -> bool:
     return False
 
 
-def _probe(name: str, with_routes: bool) -> str:
+def _probe(name: str, with_routes: bool, enabled: str = ENABLED_DEFINE) -> str:
     """One ConfigMap whose value is JSON: the pinned components that have a gatewayPath and that the
     chart's own inst.compEnabled says are on, and (when the chart has the define) its own
     inst.platformRoutes for them, at the values' platform port."""
@@ -72,8 +76,9 @@ def _probe(name: str, with_routes: bool) -> str:
     return ('{{- $all := (include "inst.componentsYaml" $ | fromYaml).components -}}\n'
             '{{- $on := list -}}\n{{- $rendered := list -}}\n'
             '{{- range $c := $all -}}\n'
-            '{{- if and $c.gatewayPath (not $c.registerOnly) (eq (include "' + ENABLED_DEFINE
-            + '" (list $ $c)) "true") -}}\n{{- $on = append $on $c -}}\n{{- end -}}\n{{- end -}}\n'
+            '{{- if and $c.gatewayPath (not $c.registerOnly) (eq (include "' + enabled
+            + '" (list $ ' + ("$c" if enabled == ENABLED_DEFINE else "$c.feature")
+            + ')) "true") -}}\n{{- $on = append $on $c -}}\n{{- end -}}\n{{- end -}}\n'
             + routes +
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + name + "\ndata:\n  " + PROBE_KEY
             + ': {{ dict "components" $on "platformRoutes" $rendered | toJson | quote }}\n')
@@ -104,9 +109,10 @@ def table(installer_pulled: str, values_file: str, helm: str = "helm") -> dict:
         raise Refused(f"the run's values are not path mode (exposure.type={exposure.get('type')!r}, gatewayMode="
                       f"{exposure.get('gatewayMode')!r}): the bench's portal is ONE origin with a path per "
                       f"component (exposure.type Gateway, gatewayMode path)")
-    if not _has_define(root, ENABLED_DEFINE):
-        raise Refused(f"the installer chart has no {ENABLED_DEFINE} define: which of its components are on cannot "
-                      f"be asked of it")
+    enabled = next((d for d in (ENABLED_DEFINE, FEATURE_DEFINE) if _has_define(root, d)), None)
+    if enabled is None:
+        raise Refused(f"the installer chart has neither an {ENABLED_DEFINE} nor an {FEATURE_DEFINE} define: which "
+                      f"of its components are on cannot be asked of it")
     try:
         _, pins_file = installer_pins.load(root)
     except installer_pins.Refused as e:
@@ -114,7 +120,7 @@ def table(installer_pulled: str, values_file: str, helm: str = "helm") -> dict:
     with_routes = _has_define(root, ROUTES_DEFINE)
     probe = f"templates/zz-bench-routes-{secrets.token_hex(4)}.yaml"
     try:
-        docs = ghcr_pull.render(ghcr_pull._chart_with(root, {probe: _probe("bench-portal-routes", with_routes)}),
+        docs = ghcr_pull.render(ghcr_pull._chart_with(root, {probe: _probe("bench-portal-routes", with_routes, enabled)}),
                                 ghcr_pull.INSTALLER_RELEASE, values, helm,
                                 args=("--kube-version", ghcr_pull.KUBE_VERSION, "--show-only", probe))
         raw = docs[0]["data"][PROBE_KEY] if len(docs) == 1 else None
@@ -168,7 +174,7 @@ def table(installer_pulled: str, values_file: str, helm: str = "helm") -> dict:
                       f"portal's API has no browser URL")
     return {"kind": KIND, "paths": paths, "routes": routes, "snowplow_key": snow["keys"][0],
             "source": f"the pulled installer chart's {pins_file} (gatewayPath, configKeys), its components on by its "
-                      f"own {ENABLED_DEFINE} for the run's values"
+                      f"own {enabled} for the run's values"
                       + (f", and equal to its own {ROUTES_DEFINE}" if with_routes else
                          f" (the chart has no {ROUTES_DEFINE} define: its routes are built inline from the same "
                          f"pins)")}
