@@ -92,17 +92,31 @@
 // the key's digest). The correlation headers are not part of what the stage
 // asks for and are not in the key.
 //
-// FROM A JOINER TO THE UPSTREAM'S RECORD. The upstream sees one request, under
-// its starter's trace context and session id. What identifies that one
-// request is its W3C traceparent as written on the wire: the trace id and the
-// id of the client span the tracing transport opened for it (the parent of
-// whatever span the upstream records). A session id alone does not: a caller
-// can send the same one on many requests. So the wire request holds its
-// traceparent's trace id and span id (read from the header as it is written,
-// httptrace.WroteHeaderField; absent when tracing is off) and its starter's
-// session id, and hands them to each joiner it answers (externalAnsweredBy on
-// the joiner's context), so a joiner's own record can name exactly that
-// request. They are correlation data, never logged or put on a span here.
+// WHAT A SHARED READ CHANGES FOR AN UPSTREAM'S RECORDS, AND THE LINK BACK. The
+// upstream sees one request, under its starter's trace context and session
+// id; a joiner's read leaves no record of its own there. So that a joiner's
+// trace still leads to that one request, the span active on the joiner's
+// fetch gets a SPAN LINK to the wire request's client span (owner ruling
+// 2026-11-15): the span context of the W3C traceparent written on the wire,
+// which is unique to that one request (a session id is not: a caller can send
+// the same one on many requests). The link carries the two ids and nothing
+// else: no attribute, no user, no session id, no URL. It is added when the
+// fetch ends, and only when the answer the fetch returned came from another
+// reader's request: a reader that sent its own request, or that re-sent after
+// a shared attempt failed, links to nothing. With tracing off no traceparent
+// is written, so there is no link and nothing is done. Snowplow's audit
+// trail is unchanged: it records writes, and a shared request is a read.
+//
+// The other end: the wire request's client span carries
+// snowplow.upstream.joiners, the number of OTHER readers its answer went to,
+// so a trace store that samples each trace on its own can keep the trace a
+// joiner's link points at. Only when it is above zero: an unshared request's
+// span has no such attribute. A count, no identity. It is final when it is
+// set: the readers an answer goes to are fixed, under the lock, at the moment
+// the status line is published (nobody joins after it, and a reader that has
+// not left by then is answered), and the client span is still open then (it
+// ends when the body is read to its end or closed, which the wire request
+// does afterwards).
 //
 // Nothing here logs a key, URL or header: the key is a sha256 digest.
 package api
@@ -131,7 +145,9 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
-	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/client-go/rest"
 )
 
@@ -153,16 +169,19 @@ type externalFlight struct {
 	joinUntil time.Time
 	// customerStarted: a reader with a page budget started it.
 	customerStarted bool
-	// ref is what identifies the wire request to its upstream: its starter's
-	// session id (audit.SessionID of the starter's context; set at start) and
-	// the trace id and span id of the traceparent written on the wire (set
-	// under traceMu when the header is written; empty when tracing is off).
+	// ref is what identifies the wire request to its upstream: the W3C trace
+	// context written on the wire (set under traceMu as the headers are
+	// written; empty when tracing is off).
 	ref externalWireRef
 
 	// Under c.flightsMu.
 	waiters     int
 	starterGone bool // the reader that started it stopped waiting
 	closed      bool // admits no more joiners
+	// published: the wire request's outcome (status line, error or panic) is
+	// decided; every reader still waiting at that moment gets it, even one
+	// whose own context ends in the same instant.
+	published bool
 
 	// headers is closed once the wire request has a status line, an error or a
 	// panic; resp, err, panicked and panicVal are written before that and read
@@ -221,6 +240,7 @@ func (w *externalWire) RoundTrip(req *http.Request) (*http.Response, error) {
 	// write, an inexact key, a redirect hop (net/http sets Response on one).
 	if !w.shareable || req.Response != nil || req.Method != w.method || req.URL.String() != w.url {
 		w.c.flightNotShared.Add(1)
+		answeredBy(req.Context()).clear()
 		return w.next.RoundTrip(req)
 	}
 	// A reader that is already gone starts nothing and joins nothing: the
@@ -229,6 +249,9 @@ func (w *externalWire) RoundTrip(req *http.Request) (*http.Response, error) {
 		return w.next.RoundTrip(req)
 	}
 	f, role := w.joinOrLead(req.Context())
+	// Whatever an earlier attempt of this fetch was answered by, this one's
+	// answer is its own unless it joins and is answered (await).
+	answeredBy(req.Context()).clear()
 	switch role {
 	case flightOwn:
 		w.c.flightNotShared.Add(1)
@@ -281,7 +304,6 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 	if customer {
 		f.joinUntil = b.Deadline()
 	}
-	f.ref.Session = audit.SessionID(ctx)
 	f.ctx, f.cancel = context.WithCancel(pagebudget.Detach(ctx))
 	// A wire request that admits no more joiners is replaced in the slot; it
 	// goes on for the readers it has.
@@ -336,6 +358,78 @@ func (f *externalFlight) leave(starter bool) {
 	}
 }
 
+// leaveIfUnpublished is leave for a reader whose context ended while it waited
+// for the outcome, in one critical section with publish. false: the outcome
+// was published first, so the reader is one of those it goes to and has not
+// left.
+func (f *externalFlight) leaveIfUnpublished(starter bool) bool {
+	c := f.c
+	c.flightsMu.Lock()
+	if f.published {
+		c.flightsMu.Unlock()
+		return false
+	}
+	f.waiters--
+	if starter {
+		f.starterGone = true
+	}
+	last := f.waiters == 0
+	if last {
+		f.closed = true
+		if c.flights[f.key] == f {
+			delete(c.flights, f.key)
+		}
+	}
+	c.flightsMu.Unlock()
+	if last {
+		f.cancel()
+	}
+	return true
+}
+
+// publish fixes who the wire request's outcome goes to: every reader still
+// waiting. It returns how many of them are joiners (readers other than the
+// one that started it). It retires the request: nobody joins from here on,
+// and its key is free.
+func (f *externalFlight) publish() (joiners int) {
+	c := f.c
+	c.flightsMu.Lock()
+	f.published, f.closed = true, true
+	if c.flights[f.key] == f {
+		delete(c.flights, f.key)
+	}
+	joiners = f.waiters
+	if !f.starterGone {
+		joiners--
+	}
+	c.flightsMu.Unlock()
+	return joiners
+}
+
+// spanAttrUpstreamJoiners is on the client span of a request on the wire whose
+// answer went to other readers too: how many (file comment).
+const spanAttrUpstreamJoiners = "snowplow.upstream.joiners"
+
+// markShared sets spanAttrUpstreamJoiners on the wire request's client span:
+// the span whose id went on the wire in the traceparent, found on the context
+// of the request the transport sent. Nothing is done without joiners or
+// without a trace context (tracing off).
+func (f *externalFlight) markShared(resp *http.Response, joiners int) {
+	if joiners <= 0 || resp == nil || resp.Request == nil {
+		return
+	}
+	f.traceMu.Lock()
+	ref := f.ref
+	f.traceMu.Unlock()
+	if ref.traceparent == "" {
+		return
+	}
+	wire := ref.SpanContext()
+	if span := trace.SpanFromContext(resp.Request.Context()); wire.IsValid() && span.SpanContext().SpanID() == wire.SpanID() {
+		span.SetAttributes(attribute.Int(spanAttrUpstreamJoiners, joiners))
+	}
+}
+
 // start sends f's wire request: req, on f's own context, in a goroutine of its
 // own, so no single reader's cancellation ends it while another still waits.
 func (w *externalWire) start(f *externalFlight, req *http.Request) {
@@ -377,6 +471,7 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 		f.panicVal = p
 		if !published {
 			f.panicked = true
+			f.publish()
 			close(f.headers)
 			return
 		}
@@ -387,12 +482,12 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 		f.mu.Unlock()
 	}()
 	resp, err := next.RoundTrip(req)
-	// Whatever it returned, it is over as something to join: nothing is
-	// reused after completion.
-	f.c.closeJoins(f)
+	// Whatever it returned, publishing it retires the request: it is over as
+	// something to join, and nothing is reused after completion.
 	if err != nil {
 		f.err = err
 		published = true
+		f.publish()
 		close(f.headers)
 		return
 	}
@@ -401,6 +496,8 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 	view.Body = http.NoBody
 	f.resp = &view
 	published = true
+	// Before the body is read: the client span is still open.
+	f.markShared(resp, f.publish())
 	close(f.headers)
 
 	defer body.Close()
@@ -440,35 +537,39 @@ func (f *externalFlight) await(req *http.Request, led bool) (*http.Response, err
 	}
 	select {
 	case <-f.headers:
-		if f.panicked {
-			span.EndRelease(slowcall.ReleaseLeaderFailed)
-			f.leave(led)
-			panic(f.panicVal)
-		}
-		if f.err != nil {
-			span.EndRelease(slowcall.ReleaseLeaderFailed)
-			f.leave(led)
-			return nil, f.err
-		}
-		span.End()
-		if !led {
-			f.traceMu.Lock()
-			ref := f.ref
-			f.traceMu.Unlock()
-			answeredBy(ctx).set(ref)
-		}
-		// The reader's own copy of the status line, headers and trailers.
-		resp := *f.resp
-		resp.Header = f.resp.Header.Clone()
-		resp.Trailer = f.resp.Trailer.Clone()
-		resp.Request = req
-		resp.Body = &externalFlightBody{f: f, ctx: ctx, starter: led}
-		return &resp, nil
 	case <-ctx.Done():
-		span.EndRelease(slowcall.CauseOf(ctx.Err()))
-		f.leave(led)
-		return nil, context.Cause(ctx)
+		if f.leaveIfUnpublished(led) {
+			span.EndRelease(slowcall.CauseOf(ctx.Err()))
+			return nil, context.Cause(ctx)
+		}
+		// The outcome was published before this reader left: it is one of the
+		// readers it goes to (and was counted as one). It is here in a moment.
+		<-f.headers
 	}
+	if f.panicked {
+		span.EndRelease(slowcall.ReleaseLeaderFailed)
+		f.leave(led)
+		panic(f.panicVal)
+	}
+	if f.err != nil {
+		span.EndRelease(slowcall.ReleaseLeaderFailed)
+		f.leave(led)
+		return nil, f.err
+	}
+	span.End()
+	if !led {
+		f.traceMu.Lock()
+		ref := f.ref
+		f.traceMu.Unlock()
+		answeredBy(ctx).set(ref)
+	}
+	// The reader's own copy of the status line, headers and trailers.
+	resp := *f.resp
+	resp.Header = f.resp.Header.Clone()
+	resp.Trailer = f.resp.Trailer.Clone()
+	resp.Request = req
+	resp.Body = &externalFlightBody{f: f, ctx: ctx, starter: led}
+	return &resp, nil
 }
 
 // externalFlightBody is one waiter's read of f's body, under that waiter's own
@@ -515,37 +616,43 @@ func (b *externalFlightBody) Close() error {
 	return nil
 }
 
-// externalWireRef identifies one request on the wire to whoever received it.
+// externalWireRef identifies one request on the wire to whoever received it:
+// the W3C trace context it carried, as written (the traceparent and tracestate
+// header values). Empty when none was sent (tracing off).
 type externalWireRef struct {
-	// Session is the session id the request carried in W3C baggage: its
-	// starter's. "" when the starter had none.
-	Session string
-	// TraceID and SpanID are those of the traceparent written on the wire:
-	// the trace the request belongs to, and the client span opened for this
-	// one request (the parent of the upstream's own span). Both "" when no
-	// traceparent was sent (tracing off).
-	TraceID, SpanID string
+	traceparent, tracestate string
 }
 
-// traceparentIDs reads the trace id and parent (span) id of a W3C traceparent
-// header value, "version-traceid-parentid-flags". ok=false for anything else.
-func traceparentIDs(v string) (traceID, spanID string, ok bool) {
-	parts := strings.Split(strings.TrimSpace(v), "-")
-	if len(parts) < 4 || len(parts[0]) != 2 || len(parts[1]) != 32 || len(parts[2]) != 16 {
-		return "", "", false
+// wireHeaders reads a ref's trace context the way a receiver does.
+type wireHeaders externalWireRef
+
+func (h wireHeaders) Get(key string) string {
+	switch key {
+	case "traceparent":
+		return h.traceparent
+	case "tracestate":
+		return h.tracestate
 	}
-	for _, p := range parts[1:3] {
-		if _, err := hex.DecodeString(p); err != nil {
-			return "", "", false
-		}
+	return ""
+}
+func (h wireHeaders) Set(string, string) {}
+func (h wireHeaders) Keys() []string     { return []string{"traceparent", "tracestate"} }
+
+// SpanContext is the span context of the wire request's client span: what its
+// upstream received as the parent of its own span. Invalid (the zero value)
+// when no well-formed traceparent was written.
+func (r externalWireRef) SpanContext() trace.SpanContext {
+	if r.traceparent == "" {
+		return trace.SpanContext{}
 	}
-	return parts[1], parts[2], true
+	return trace.SpanContextFromContext(propagation.TraceContext{}.Extract(context.Background(), wireHeaders(r)))
 }
 
-// externalAnsweredBy says which request on the wire answered a read that sent
-// none of its own. Put on a fetch's context with withExternalAnsweredBy;
-// filled when an attempt of the fetch is answered by a request another reader
-// started.
+// externalAnsweredBy says which request on the wire answered a fetch whose
+// answer came from a request it did not send. Put on the fetch's context by
+// externalFetchCache.do; set when an attempt joins and is answered, cleared by
+// every attempt that sends its own, so at the fetch's end it describes the
+// attempt whose answer the fetch returned.
 type externalAnsweredBy struct {
 	mu     sync.Mutex
 	joined bool
@@ -574,9 +681,18 @@ func (a *externalAnsweredBy) set(ref externalWireRef) {
 	a.mu.Unlock()
 }
 
+func (a *externalAnsweredBy) clear() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.joined, a.ref = false, externalWireRef{}
+	a.mu.Unlock()
+}
+
 // Wire is the request that answered this fetch, and whether another reader's
-// request did (false: the fetch's answer came from a request it sent itself,
-// under its own trace and session). Nil-safe.
+// request did (false: the answer came from a request the fetch sent itself).
+// Nil-safe.
 func (a *externalAnsweredBy) Wire() (ref externalWireRef, joined bool) {
 	if a == nil {
 		return externalWireRef{}, false
@@ -584,6 +700,21 @@ func (a *externalAnsweredBy) Wire() (ref externalWireRef, joined bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.ref, a.joined
+}
+
+// linkAnsweringRequest gives the span active on ctx a link to the wire request
+// that answered the fetch, when another reader's request did and it carried a
+// trace context (see the file comment). Two ids on the link, no attribute.
+// Nothing is done, and nothing allocated, otherwise: tracing off, or a fetch
+// answered by its own request.
+func linkAnsweringRequest(ctx context.Context, by *externalAnsweredBy) {
+	ref, joined := by.Wire()
+	if !joined || ref.traceparent == "" {
+		return
+	}
+	if sc := ref.SpanContext(); sc.IsValid() {
+		trace.SpanFromContext(ctx).AddLink(trace.Link{SpanContext: sc})
+	}
 }
 
 // flightEvent is one connection-phase event of the wire request, as a joined
@@ -608,16 +739,21 @@ func (f *externalFlight) trace() *httptrace.ClientTrace {
 		f.traceMu.Unlock()
 	}
 	return &httptrace.ClientTrace{
-		// The traceparent as it goes on the wire is what identifies this
+		// The trace context as it goes on the wire is what identifies this
 		// request to its upstream (externalWireRef). No other header is read,
 		// and none is handed to a joiner.
 		WroteHeaderField: func(key string, value []string) {
-			if !strings.EqualFold(key, "traceparent") || len(value) == 0 {
+			if len(value) == 0 {
 				return
 			}
-			if traceID, spanID, ok := traceparentIDs(value[len(value)-1]); ok {
+			switch {
+			case strings.EqualFold(key, "traceparent"):
 				f.traceMu.Lock()
-				f.ref.TraceID, f.ref.SpanID = traceID, spanID
+				f.ref.traceparent = value[len(value)-1]
+				f.traceMu.Unlock()
+			case strings.EqualFold(key, "tracestate"):
+				f.traceMu.Lock()
+				f.ref.tracestate = strings.Join(value, ",")
 				f.traceMu.Unlock()
 			}
 		},

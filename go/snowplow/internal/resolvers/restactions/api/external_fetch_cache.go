@@ -143,7 +143,12 @@ func (c *externalFetchCache) do(ctx context.Context, opts httpcall.RequestOption
 	if cache.Disabled() {
 		return c.fetch(ctx, opts, toJSONBytes, nil)
 	}
-	return c.fetch(ctx, opts, c.convert, c.share(ctx, opts))
+	// Which request on the wire answered this fetch, when another reader's
+	// did: the fetch's span is linked to it (external_fetch_flight.go).
+	ctx, by := withExternalAnsweredBy(ctx)
+	st, body, ct, err := c.fetch(ctx, opts, c.convert, c.share(ctx, opts))
+	linkAnsweringRequest(ctx, by)
+	return st, body, ct, err
 }
 
 // convert is toJSONBytes memoised by content: the body's bytes are looked up by
