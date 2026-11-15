@@ -2,7 +2,7 @@
 
 run606's wait_portal_origin waits for the frontend's config.json
 (frontend-config-vars) to name ONE origin for snowplow, authn and sse-proxy,
-at 057's paths (load606 portal-origin). The URLs take two hops:
+each at the path the installer chart routes it at (load606 portal-origin). The URLs take two hops:
   1. the installer's composition-dynamic-controller (cdc) renders the
      Frontend composition's spec.config from a Helm `lookup` of the platform
      gateway's LoadBalancer address, on every resync (its Observe renders the
@@ -36,7 +36,10 @@ all read-only:
   - gateway: the platform gateway Service's address
     (address | no_address | absent | unread);
   - rendered: what the installer RENDERED, the Frontend composition's
-    spec.config URL keys (same_origin | not_same_origin | absent | unread);
+    spec.config URL keys, held against the installer chart's own route table (the run's
+    portal-routes.json, bench/installer_routes.py): same_origin | not_same_origin | wrong_paths (one
+    origin, and a key's path is not the one the chart routes: the installer's two renderings
+    disagree, and the gate stops there) | absent | unread;
   - cdc: the installer cdc Deployment's Available condition, which holds
     while its Observe runs every resync (True | False | None = unread).
 A helm revision says nothing here: the cdc writes one only when a reconcile
@@ -286,8 +289,10 @@ def installer_conditions(installers_json: str) -> list[dict] | None:
 
 
 def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, frontends_rc: int,
-            deployments_json: str, err: dict | None = None, installers_json: str = "") -> dict:
-    """One poll's readings, each one READ or saying it was not (#1006 F3)."""
+            deployments_json: str, err: dict | None = None, installers_json: str = "",
+            routes: dict | None = None) -> dict:
+    """One poll's readings, each one READ or saying it was not (#1006 F3). `routes`: the run's portal
+    route table (bench.installer_routes), which the rendered config is held against."""
     from bench import load606
     err = err or {}
     g = _json(gateway_json) if gateway_rc == 0 else None
@@ -299,14 +304,18 @@ def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, f
         ing = ((g.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
         gw = "address" if any(i.get("ip") or i.get("hostname") for i in ing) else "no_address"
     f = _json(frontends_json) if frontends_rc == 0 else None
+    rendered_why = None
     if not isinstance(f, dict):
         rendered = "unread"
     elif not f.get("items"):
         rendered = "absent"
     else:
         cfg = (f["items"][0].get("spec") or {}).get("config") or {}
-        ok = load606.portal_origin(json.dumps({"api": cfg}))["origin"] is not None
-        rendered = "same_origin" if ok else "not_same_origin"
+        po = load606.portal_origin(json.dumps({"api": cfg}), routes)
+        # wrong_paths: one origin, every key rendered, and a path that is not the chart's own route
+        rendered = "same_origin" if po["origin"] is not None else (
+            "wrong_paths" if po.get("wrong") == "paths" else "not_same_origin")
+        rendered_why = po.get("why")
     d = _json(deployments_json)
     cdc = None
     if isinstance(d, dict):
@@ -315,13 +324,16 @@ def reading(t: float, gateway_json: str, gateway_rc: int, frontends_json: str, f
         if len(cdcs) == 1:
             conds = (cdcs[0].get("status") or {}).get("conditions") or []
             cdc = any(c.get("type") == "Available" and c.get("status") == "True" for c in conds)
-    return {"t": t, "gateway": gw, "rendered": rendered, "cdc_available": cdc,
+    return {"t": t, "gateway": gw, "rendered": rendered, "rendered_why": rendered_why, "cdc_available": cdc,
             "installer": installer_conditions(installers_json),
             "errors": {k: v[:300] for k, v in err.items() if v}}
 
 
-def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
-    """(kind, message) for a gate that ran out, from its LAST poll."""
+def verdict(readings: list[dict], resync: dict, why: str, routes: dict | None = None) -> tuple[str, str]:
+    """(kind, message) for a gate that ran out, from its LAST poll. `routes`: the run's portal route
+    table, named in the messages (the paths are the installer chart's, never fixed here)."""
+    from bench import installer_routes
+    want = installer_routes.paths_text((routes or {}).get("paths") or {}) or "no route table was given"
     tail = f"config.json: {why}; installer cdc resync {resync.get('seconds')}s ({resync.get('source')})"
     if not readings:
         return "no_reading", f"the gate took no reading; {tail}"
@@ -342,6 +354,12 @@ def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
     if r == "unread":
         return "rendered_unread", (f"the gateway has an address; the Frontend composition could not be read "
                                    f"({errs or 'no answer'}); {tail}")
+    if r == "wrong_paths":
+        # the installer's two renderings disagree: its route table and the frontend config it writes
+        return "installer_defect", (
+            f"INSTALLER DEFECT: the Frontend composition the installer renders and the installer chart's own "
+            f"route table disagree: {last.get('rendered_why')}. The gateway routes {want} "
+            f"({(routes or {}).get('source')}), so the frontend is told a path the gateway does not route; {tail}")
     if r == "same_origin":
         return "frontend_not_propagated", (f"the installer RENDERED the one origin into the Frontend composition, "
                                            f"but frontend-config-vars does not carry it after {since:.0f}s with the "
@@ -360,7 +378,7 @@ def verdict(readings: list[dict], resync: dict, why: str) -> tuple[str, str]:
     says = (" | ".join(word(i) for i in insts) if insts else "its conditions could not be read")
     return "installer_defect", (f"INSTALLER DEFECT: the installer cdc is Available and the gateway has had its "
                                 f"address for {since:.0f}s (2 x its resync), yet the Frontend composition it "
-                                f"renders is {r} (not one origin at /content, /auth, /events); the Installer "
+                                f"renders is {r} (not one origin with {want}: {last.get('rendered_why') or 'not said'}); the Installer "
                                 f"composition{'s say' if insts and len(insts) > 1 else ' says'}: {says}; {tail}")
 
 
@@ -386,12 +404,14 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--gateway-err", default="")
     rd.add_argument("--frontends-err", default="")
     rd.add_argument("--installers-json", default="", help="kubectl get installers -o json (krateo-system)")
+    rd.add_argument("--routes", required=True, help="the run's portal route table ($OUT/portal-routes.json)")
     ad = sub.add_parser("address-since", help="when the gateway's current address was first read (empty: none)")
     ad.add_argument("--readings", required=True)
     v = sub.add_parser("verdict")
     v.add_argument("--readings", required=True)
     v.add_argument("--resync", required=True)
     v.add_argument("--why", required=True)
+    v.add_argument("--routes", required=True, help="the run's portal route table ($OUT/portal-routes.json)")
     nw = sub.add_parser("now", help="the gate's clock: wall time, or BENCH_GATE_CLOCK_STEP_S per call (tests)")
     nw.add_argument("--state", required=True)
     a = ap.parse_args(argv)
@@ -417,10 +437,18 @@ def main(argv: list[str] | None = None) -> int:
         t_addr = float(a.t_addr) if a.t_addr else None
         print(f"{deadline(a.t0, t_addr, a.resync, a.poll, a.lb_wait):.3f}")
         return 0
+    if a.cmd in ("reading", "verdict"):
+        from bench import installer_routes
+        try:
+            routes = installer_routes.load(a.routes)
+        except installer_routes.Refused as e:
+            print(f"origin gate: {e}", file=sys.stderr)
+            return 2
     if a.cmd == "reading":
         print(json.dumps(reading(a.t, a.gateway_json, a.gateway_rc, a.frontends_json, a.frontends_rc,
                                  a.deployments_json, {"gateway": text(a.gateway_err),
-                                                      "frontends": text(a.frontends_err)}, a.installers_json)))
+                                                      "frontends": text(a.frontends_err)}, a.installers_json,
+                                 routes)))
         return 0
     if a.cmd == "address-since":
         rows = [json.loads(x) for x in text(a.readings).splitlines() if x.strip()]
@@ -439,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
             readings = [json.loads(ln) for ln in fh if ln.strip()]
     except OSError:
         pass
-    kind, msg = verdict(readings, _json(a.resync) or {"seconds": None, "source": "unknown"}, a.why)
+    kind, msg = verdict(readings, _json(a.resync) or {"seconds": None, "source": "unknown"}, a.why, routes)
     print(json.dumps({"kind": kind, "message": msg}))
     return 0
 

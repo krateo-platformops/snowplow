@@ -4710,45 +4710,56 @@ def portal_from_config_json(text: str) -> dict:
             "builders_ns": api.get("BUILDERS_NAMESPACE") or ""}
 
 
-# The portal stack behind ONE origin, as krateo-057 serves it (read-only,
-# 2026-10-29): Gateway krateo-agent-gateway-platform, one listener; HTTPRoutes
-# / -> frontend, /auth -> authn, /content -> snowplow, /events -> sse-proxy
-# (each prefix rewritten to /); frontend-config-vars config.json names them
-# https://portal.krateo.dev{/auth,/content,/events}. The installer writes the
-# same table for exposure.type=Gateway, gatewayMode=path (component-pins
-# gatewayPath). config.json key -> the path it must carry on that origin.
-PORTAL_PATHS = {"SNOWPLOW_API_BASE_URL": "/content", "AUTHN_API_BASE_URL": "/auth",
-                "EVENTS_API_BASE_URL": "/events", "EVENTS_PUSH_API_BASE_URL": "/events"}
+# The portal stack behind ONE origin (exposure.type=Gateway, gatewayMode=path): one Gateway listener,
+# a path per component (/ the frontend, a prefix each for authn, snowplow and sse-proxy, rewritten to
+# /), and the frontend's config.json naming each peer at <origin><its prefix>. WHICH prefix, and which
+# config.json key carries it, is the installer chart's (its pins' gatewayPath and configKeys): the run
+# derives the table from the chart it installs (bench/installer_routes.py, $OUT/portal-routes.json),
+# and nothing here holds a path. (Until installer 0.3.636 authn's was /auth; from 0.3.639 it is
+# /authn. A table fixed here read the second as the installer's defect.)
 
 
-def portal_origin(text: str) -> dict:
-    """The frontend's config.json → {origin, snowplow_url, urls}, or
-    {origin: None, why}: the SPA's peers (snowplow, authn, sse-proxy) must
-    share ONE origin at 057's paths. Four origins make every Bearer-header
-    fetch cross-origin, and its preflight is the server's to answer (run 17
-    attempt 5: sse-proxy 401s it, so /notifications never opened)."""
+def portal_origin(text: str, routes: dict) -> dict:
+    """The frontend's config.json → {origin, snowplow_url, urls}, or {origin: None, why, ...}: the
+    SPA's peers (snowplow, authn, sse-proxy) must share ONE origin, each at the path the installer
+    chart routes it at (`routes`: bench.installer_routes' table: paths = config.json key -> path).
+    Four origins make every Bearer-header fetch cross-origin, and its preflight is the server's to
+    answer (run 17 attempt 5: sse-proxy 401s it, so /notifications never opened).
+
+    A config that does not pass says which way (`wrong`): "incomplete" (a key is not an absolute URL
+    yet: the installer has not rendered it), "origins" (more than one origin), or "paths" (one
+    origin, every key present, and a key's path is not the chart's: the frontend is told a path the
+    gateway does not route, which no wait resolves)."""
     from urllib.parse import urlsplit
+    paths = routes["paths"]
     api = (json.loads(text).get("api") or {})
-    urls = {k: api.get(k) or "" for k in PORTAL_PATHS}
-    origins, wrong = set(), []
-    for k, path in PORTAL_PATHS.items():
+    urls = {k: api.get(k) or "" for k in paths}
+    origins, missing, off = set(), [], []
+    for k, path in paths.items():
         u = urlsplit(urls[k])
         if not (u.scheme and u.netloc):
-            wrong.append(f"{k}={urls[k]!r} is not an absolute URL")
+            missing.append(f"{k}={urls[k]!r} is not an absolute URL")
             continue
         origins.add(f"{u.scheme}://{u.netloc}")
-        if u.path.rstrip("/") != path:
-            wrong.append(f"{k}={urls[k]!r}: path {u.path or '/'!r}, not {path!r}")
-    if len(origins) > 1:
-        wrong.append(f"{len(origins)} origins: {sorted(origins)}")
+        if u.path.rstrip("/") != path.rstrip("/"):
+            off.append(f"{k}={urls[k]!r}: path {u.path or '/'!r}, and the installer chart routes it at "
+                       f"{path or '/'!r}")
+    wrong = missing + off + ([f"{len(origins)} origins: {sorted(origins)}"] if len(origins) > 1 else [])
     if wrong:
-        return {"origin": None, "urls": urls, "why": "; ".join(wrong)}
+        kind = "incomplete" if missing else "origins" if len(origins) > 1 else "paths"
+        return {"origin": None, "urls": urls, "wrong": kind, "why": "; ".join(wrong)}
     origin = origins.pop()
-    return {"origin": origin, "urls": urls, "snowplow_url": urls["SNOWPLOW_API_BASE_URL"].rstrip("/")}
+    return {"origin": origin, "urls": urls, "snowplow_url": urls[routes["snowplow_key"]].rstrip("/")}
 
 
 def _cmd_portal_origin(a) -> int:
-    r = portal_origin(sys.stdin.read())
+    from bench import installer_routes
+    try:
+        routes = installer_routes.load(a.routes)
+    except installer_routes.Refused as e:
+        print(f"portal not same-origin: {e}", file=sys.stderr)
+        return 1
+    r = portal_origin(sys.stdin.read(), routes)
     if r["origin"] is None:
         print(f"portal not same-origin: {r['why']}", file=sys.stderr)
         return 1
@@ -6229,7 +6240,9 @@ def main(argv: list[str] | None = None) -> int:
     po = sub.add_parser("portal-origin",
                         help="config.json on stdin -> PORTAL_ORIGIN / PORTAL_SNOWPLOW_URL exports; "
                              "exit 1 (the reason on stderr) unless snowplow, authn and sse-proxy share "
-                             "one origin at 057's paths")
+                             "one origin, each at the path the installer chart routes it at")
+    po.add_argument("--routes", required=True,
+                    help="the run's portal route table (bench.installer_routes: $OUT/portal-routes.json)")
     po.set_defaults(func=_cmd_portal_origin)
     ps = sub.add_parser("preflight-summary", help="preflight JSONL on stdin -> summary")
     ps.set_defaults(func=_cmd_preflight_summary)
