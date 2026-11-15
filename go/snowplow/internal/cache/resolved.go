@@ -644,8 +644,8 @@ type ResolvedKeyInputs struct {
 	//
 	// #682 — RBACSubGenForSubject also folds the process-wide boot-window epoch
 	// (rbac_subgen_epoch.go; since #1439 the fold is the latest state of the
-	// RBAC state clock, not a sum). That is a term of THIS existing dimension, not a
-	// new identity input: no key-format change, no resolvedKeyVersion bump, and
+	// RBAC state clock, not a sum). That is a term of THIS existing dimension,
+	// not a new identity input: no key-format change, no resolvedKeyVersion bump, and
 	// identity-free classes (which do not fold RBACSubGen) never rotate on it.
 	RBACSubGen uint64
 
@@ -959,15 +959,17 @@ type ResolvedCacheStore struct {
 	// whose serve-time first-permitting binding's WINNING subject matched only
 	// through an IMPLICIT group — system:authenticated, or a synthetic
 	// system:serviceaccounts[:ns] group (#261 case-2, the RBAC-fact carrier).
-	// RBACSubGenForSubject folds only the requester's PRESENTED groups, so a
-	// grant/revoke through such a binding rotates the serve-time first-match
-	// BindingUID with NO sub-gen bump — the bounded self-stale-leak carrier.
+	// When the detector was written the key fold read only the requester's
+	// PRESENTED groups, so a grant/revoke through such a binding rotated no key.
+	// Since #424 (system:authenticated) and #1443 (the ServiceAccount groups) the
+	// fold reads every subject the evaluator matches with (SubjectMatcher), so
+	// such a change now rotates the key: the counter no longer marks a rotation
+	// gap, it says how the served request was permitted.
 	// Bumped HIT-GATED ONLY from the restactions serve hit-site, off a MARK the
-	// key-mint stamped (never re-evaluated at hit). T1/T3 SEMANTICS: this is
-	// the AT-RISK SERVE POPULATION (a structural proxy), NOT a confirmed-stale-leak count —
-	// off-zero means an at-risk-keyed cell was served → REASSESS (the keying fix
-	// is v7-deferred), never "N leaks"; zero means no at-risk cell served
-	// (matches the 057 baseline). Atomic; safe to read without mu.
+	// key-mint stamped (never re-evaluated at hit). It was never a
+	// confirmed-stale-leak count: off-zero means a cell permitted through an
+	// implicit group was served, never "N leaks"; zero means none was (matches
+	// the 057 baseline). Atomic; safe to read without mu.
 	serveMissedRotationAtriskImplicitGroup atomic.Uint64
 
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
@@ -2822,9 +2824,9 @@ type ResolvedCacheStats struct {
 
 	// #261 case-2 — serve-time L1 HITs of a cell whose first-permitting
 	// binding's winning subject matched only through an IMPLICIT group
-	// (system:authenticated / synthetic system:serviceaccounts[:ns]). AT-RISK
-	// SERVE POPULATION proxy (see the store field's T1/T3 note), NOT a
-	// confirmed-leak count: off-zero => reassess, never N leaks.
+	// (system:authenticated / synthetic system:serviceaccounts[:ns]). Not a
+	// leak count, and since #1443 not a rotation-gap signal (see the store
+	// field's note).
 	ServeMissedRotationAtriskImplicitGroup uint64
 }
 

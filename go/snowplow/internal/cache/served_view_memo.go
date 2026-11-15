@@ -38,9 +38,9 @@
 // around the gate covers a mode that changes while the gate runs.
 //
 // The identity CLASS is deliberately not the key. It moves after the snapshot
-// it reflects (the sub-generation bumps are flushed after the Store), and a
-// ServiceAccount's synthetic groups never move it (#261). The snapshot is what
-// the evaluator reads, so it is the name that cannot miss a change.
+// it reflects (the sub-generation bumps are flushed after the Store). The
+// snapshot is what the evaluator reads, so it is the name that cannot miss a
+// change.
 //
 // LIFETIME. Nothing here has a size cap or a TTL. The memo is reachable only
 // from its entry: it goes when the answer changes, and with the entry when the

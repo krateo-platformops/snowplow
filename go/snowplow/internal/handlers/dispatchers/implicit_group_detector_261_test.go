@@ -6,9 +6,12 @@
 // can rotate with NO sub-gen bump. Case-2 carrier: the serve-time
 // first-permitting binding's WINNING subject matched only through an IMPLICIT
 // group (system:authenticated, or a synthetic system:serviceaccounts[:ns]
-// group). RBACSubGenForSubject folds only the requester's PRESENTED groups, so a
-// grant/revoke through such a binding rotates the serve-time first-match
-// BindingUID with NO sub-gen bump. The counter measures the AT-RISK SERVE
+// group). When the detector was written RBACSubGenForSubject read only the
+// requester's PRESENTED groups, so a grant/revoke through such a binding
+// rotated the serve-time first-match BindingUID with NO sub-gen bump. Since
+// #424 and #1443 the fold reads every subject the evaluator matches with
+// (cache.SubjectMatcher), so such a change now bumps: the counter says how the
+// served request was permitted. It was written to measure the AT-RISK SERVE
 // POPULATION (a structural proxy); off-zero => reassess, NOT a confirmed-leak
 // count.
 //

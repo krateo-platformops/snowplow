@@ -23,15 +23,15 @@
 // covered by a dedicated collision test (groups_hash_test in evaltest).
 //
 // GROUP-EQUIVALENCE PARITY WITH THE EVALUATOR (B3): the verdict that the
-// memo caches is produced by anySubjectMatches / effectiveGroups
-// (evaluate.go), which match Group subjects against opts.Groups plus —
+// memo caches is produced by anySubjectMatches over cache.SubjectMatcher
+// (evaluate.go), which matches Group subjects against opts.Groups plus —
 // for a ServiceAccount identity — the two synthetic SA groups
 // (system:serviceaccounts, system:serviceaccounts:<ns>) and, for any
 // authenticated identity, system:authenticated. Those synthetic/implicit
 // groups are derived deterministically FROM (Username, opts.Groups) by
 // the evaluator itself; they are NOT free inputs. Therefore hashing the
 // caller-supplied opts.Groups (this function's input) together with
-// Username already in the memo key uniquely determines effectiveGroups,
+// Username already in the memo key uniquely determines the matched groups,
 // so two requests with the same (Username, GroupsHash) are guaranteed to
 // expand to the same effective group set and thus the same verdict. We
 // deliberately hash the RAW opts.Groups (not the expanded set) so the
