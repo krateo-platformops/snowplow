@@ -338,34 +338,18 @@ func (c *externalFetchCache) closeJoins(f *externalFlight) {
 
 // leave records that one waiter stopped waiting on f. The last one out ends
 // the wire request and frees the key.
-func (f *externalFlight) leave(starter bool) {
-	c := f.c
-	c.flightsMu.Lock()
-	f.waiters--
-	if starter {
-		f.starterGone = true
-	}
-	last := f.waiters == 0
-	if last {
-		f.closed = true
-		if c.flights[f.key] == f {
-			delete(c.flights, f.key)
-		}
-	}
-	c.flightsMu.Unlock()
-	if last {
-		f.cancel()
-	}
-}
+func (f *externalFlight) leave(starter bool) { f.leaveUnless(starter, false) }
 
 // leaveIfUnpublished is leave for a reader whose context ended while it waited
 // for the outcome, in one critical section with publish. false: the outcome
 // was published first, so the reader is one of those it goes to and has not
 // left.
-func (f *externalFlight) leaveIfUnpublished(starter bool) bool {
+func (f *externalFlight) leaveIfUnpublished(starter bool) bool { return f.leaveUnless(starter, true) }
+
+func (f *externalFlight) leaveUnless(starter, unlessPublished bool) bool {
 	c := f.c
 	c.flightsMu.Lock()
-	if f.published {
+	if unlessPublished && f.published {
 		c.flightsMu.Unlock()
 		return false
 	}
