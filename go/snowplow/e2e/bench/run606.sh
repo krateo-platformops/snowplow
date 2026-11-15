@@ -1671,6 +1671,9 @@ s_preflight() {
   # frontend's own config.json INIT — never a hard-coded page name.
   if [[ "$DRY" == "1" ]]; then
     log "DRY: read frontend-config-vars config.json -> PORTAL_INIT; preflight606 Job"
+    # the identities this step makes, said in the dry pass too (each prints its command)
+    preflight_user
+    debug_reader
     export PORTAL_INIT="/call?resource=layouts&apiVersion=widgets.templates.krateo.io/v1beta1&name=app-shell&namespace=krateo-system"
     export PORTAL_FRONTEND_NS=krateo-system PORTAL_BUILDERS_NS=krateo-system
     return 0

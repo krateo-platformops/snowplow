@@ -226,3 +226,12 @@ def test_a_run_whose_debug_reader_is_missing_fails_before_load_by_the_403(harnes
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0 and "rehearsal complete" not in log
     assert "the settings the process runs with could not be read: /debug/vars answered 403" in log, log[-3000:]
+
+
+def test_a_dry_pass_says_it_makes_the_debug_reader_at_the_preflight(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, BENCH_606_DRY_RUN="1")
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode == 0, log[-3000:]
+    pre = log[log.index("=== step preflight ==="):log.index("=== step data ===")]
+    assert "DRY: python3 -m bench data606-debug-reader" in pre and "DRY: python3 -m bench data606-preflight-user" in pre
