@@ -31,6 +31,20 @@ can READ BACK from the pod; a key it could not verify is refused, not trusted).
     launch that reached its reading; one that differs fails the arm before load. The launcher
     refuses, before anything is created, a launch whose arms do not declare the same set of keys.
 
+THE EFFECTIVE SETTINGS. What a pod's env says is not what its process runs with: snowplow chart 1.12.70
+sets no GOMEMLIMIT, the pod's env reads "unset (the runtime's default, no limit)", and the process
+runs with a soft memory limit all the same (snowplow derives it in-process, 7/8 of the container's
+cgroup limit). So the record's facts are the PROCESS's: snowplow publishes what its Go runtime has
+on /debug/vars (snowplow_go_runtime: gogc, memory_limit_bytes, memory_limit_source,
+cgroup_memory_limit_bytes), read before any load by the bench's own preflight user from a short Job
+on the loadgen node (run606 go_runtime_reading; no credential from outside the cluster). The record
+holds both the declared env and the effective values, and:
+  - the effective GOGC must equal the declared one (a declared GOMEMLIMIT its effective bytes), or
+    the arm fails before load; so does an arm whose effective settings could not be read;
+  - between the arms of a launch, the effective memory limit and its source must be equal (unless
+    the arms declare GOMEMLIMIT themselves), and the effective GOGC when no arm declares it;
+  - every line that states a setting states the effective value.
+
 Report only beyond that: evaluate shows the record (report["snowplow_env"]), and the pair says in
 one line whether its arms differ in image, in environment, or in both.
 """
@@ -168,16 +182,90 @@ def key_text(k: str, r: dict) -> str:
     return f"{k} unset" if r.get("state") == "unset" else f"{k} UNKNOWN ({r.get('why')})"
 
 
-def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=time.time) -> dict:
-    """The run's record: what was declared, what the running container has, and whether every
-    declared key is SET there to the declared value. Fails closed: no reading, an UNKNOWN key."""
+GOGC_OFF = -1                      # the runtime's GOGC when GC is off (GOGC=off)
+NO_LIMIT = 2 ** 63 - 1             # the runtime's memory limit when there is none (math.MaxInt64)
+_SIZE = re.compile(r"^(\d+)(B|KiB|MiB|GiB|TiB)?$")
+_UNIT = {None: 1, "B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40}
+
+
+def gogc_value(text: str) -> int | None:
+    """A GOGC value as the runtime holds it: "off" is -1, else the integer; None when it is neither."""
+    if text == "off":
+        return GOGC_OFF
+    return int(text) if re.fullmatch(r"\d+", text) else None
+
+
+def memlimit_bytes(text: str) -> int | None:
+    """A GOMEMLIMIT value in bytes, as Go parses it (an integer with an optional B, KiB, MiB, GiB or
+    TiB; "off" is no limit); None when it is none of those."""
+    if text == "off":
+        return NO_LIMIT
+    m = _SIZE.match(text)
+    return int(m.group(1)) * _UNIT[m.group(2)] if m else None
+
+
+def size_text(n) -> str:
+    """Bytes as a message says them: no limit, or binary units with the exact byte count."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        return f"{n!r}"
+    if n >= NO_LIMIT:
+        return "no limit"
+    return f"{n / 2 ** 30:.2f} GiB ({n} bytes)" if n >= 2 ** 20 else f"{n} bytes"
+
+
+def effective_of(path: str | None) -> tuple[dict | None, str]:
+    """(the settings the snowplow process runs with, "") from the runtime606 Job's output (its one
+    go_runtime line, load606 go-runtime), or (None, why they are not known)."""
+    if not path:
+        return None, "no reading of the process's settings was taken"
+    try:
+        with open(path) as fh:
+            rows = [json.loads(ln) for ln in fh if ln.lstrip().startswith("{")]
+    except OSError as e:
+        return None, f"the reading of the process's settings is not there ({path}: {e.strerror})"
+    except ValueError:
+        return None, f"the reading of the process's settings is not JSON ({path})"
+    rec = next((r for r in rows if isinstance(r, dict) and r.get("kind") == "go_runtime"), None)
+    if rec is None:
+        return None, "the Job that reads the process's settings printed no reading"
+    if not rec.get("ok") or not isinstance(rec.get("effective"), dict):
+        return None, str(rec.get("why") or "the reading says neither ok nor why not")
+    return rec["effective"], ""
+
+
+def effective_text(e: dict | None) -> str:
+    if not isinstance(e, dict):
+        return "the process's effective settings: NOT READ"
+    gogc = "off" if e.get("gogc") == GOGC_OFF else e.get("gogc")
+    return (f"GOGC {gogc}, memory limit {size_text(e.get('memory_limit_bytes'))} (source "
+            f"{e.get('memory_limit_source')}; the container's limit {size_text(e.get('cgroup_memory_limit_bytes'))})")
+
+
+def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=time.time,
+          effective_path: str | None = None) -> dict:
+    """The run's record: what was declared, what the running container's env has, what the PROCESS
+    runs with (`effective_path`: the runtime606 Job's output), and whether every declared key is SET
+    in the env to the declared value and is the effective one. Fails closed: no reading of the pod,
+    an UNKNOWN key, no reading of the process."""
     rec: dict = {"kind": KIND, "arm": arm, "t": now(), "declared": declared, "observed": None, "verified": False,
-                 "mismatches": [], "undeclared": {},
+                 "mismatches": [], "undeclared": {}, "effective": None,
                  "source": "the live snowplow container's env and the ConfigMaps it reads (the run's Go runtime "
                            "reading before the measure), never the rendered values"}
+    eff, eff_why = effective_of(effective_path)
+    rec["effective"] = eff
+    if eff is None:
+        rec["mismatches"].append(f"the settings the process runs with could not be read: {eff_why}")
+    else:
+        if "GOGC" in declared and gogc_value(declared["GOGC"]) != eff.get("gogc"):
+            rec["mismatches"].append(f"declared GOGC={declared['GOGC']}, the process runs with GOGC "
+                                     f"{'off' if eff.get('gogc') == GOGC_OFF else eff.get('gogc')}")
+        if "GOMEMLIMIT" in declared and memlimit_bytes(declared["GOMEMLIMIT"]) != eff.get("memory_limit_bytes"):
+            rec["mismatches"].append(f"declared GOMEMLIMIT={declared['GOMEMLIMIT']}, the process runs with a memory "
+                                     f"limit of {size_text(eff.get('memory_limit_bytes'))}")
     g, why = reading_of(tracing_path)
     if g is None:
-        rec["why"] = why
+        rec["mismatches"].append(why)
+        rec["why"] = "; ".join(rec["mismatches"])
         return rec
     obs = rec["observed"] = observed(g)
     if g.get("secret_source"):
@@ -192,7 +280,8 @@ def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=tim
         rec["mismatches"].append(f"undeclared key(s) the pod's reading cannot decide: {', '.join(unknown)}")
     rec["verified"] = not rec["mismatches"]
     rec["why"] = ("; ".join(rec["mismatches"]) if rec["mismatches"] else
-                  f"the pod has every declared key as declared ({declared_text(declared)}); undeclared: "
+                  f"the process runs with {effective_text(eff)}; the pod's env has every declared key as declared "
+                  f"({declared_text(declared)}); undeclared in the env: "
                   + (", ".join(key_text(k, r) for k, r in rec["undeclared"].items()) or "none"))
     return rec
 
@@ -223,6 +312,26 @@ def undeclared_differences(recs: dict[str, dict]) -> list[str]:
     return out
 
 
+def effective_differences(recs: dict[str, dict]) -> list[str]:
+    """What the processes of the launch's arms run with that must be the same and is not: the memory
+    limit and its source (unless the arms declare GOMEMLIMIT themselves: then each arm's own check
+    holds it), and the GOGC when no arm declares it."""
+    out = []
+    eff = {arm: r.get("effective") for arm, r in sorted(recs.items()) if isinstance(r.get("effective"), dict)}
+    declared = {k for r in recs.values() for k in (r.get("declared") or {})}
+    fields = ([] if "GOMEMLIMIT" in declared else ["memory_limit_bytes", "memory_limit_source"]) + (
+        [] if "GOGC" in declared else ["gogc"])
+    for f in fields:
+        seen = {arm: e.get(f) for arm, e in eff.items()}
+        if len({json.dumps(v) for v in seen.values()}) > 1:
+            said = {"memory_limit_bytes": "the memory limit the process runs with",
+                    "memory_limit_source": "where the process's memory limit comes from",
+                    "gogc": "the GOGC the process runs with (declared on no run)"}[f]
+            out.append(f"{said} differs between the runs: " + ", ".join(
+                f"{arm}: {size_text(v) if f == 'memory_limit_bytes' else v}" for arm, v in seen.items()))
+    return out
+
+
 def agree(shared_dir: str, arm: str, arms: list[str], wait_s: float, *, clock=time.monotonic, sleep=time.sleep,
           poll_s: float = 5.0) -> dict:
     """Before `arm` starts its load: wait (at most `wait_s`) for the reading of every other arm of the
@@ -247,11 +356,13 @@ def agree(shared_dir: str, arm: str, arms: list[str], wait_s: float, *, clock=ti
         if not pending or clock() >= deadline:
             break
         sleep(min(poll_s, max(deadline - clock(), 0.01)))
-    diffs = undeclared_differences(recs) if arm in recs else [f"{arm}'s own reading is not in {shared_dir}"]
+    diffs = (effective_differences(recs) + undeclared_differences(recs)) if arm in recs else [
+        f"{arm}'s own reading is not in {shared_dir}"]
     compared = sorted(x for x in recs if x != arm)
     absent = sorted(x for x in arms if x not in recs and x != arm)
     return {"ok": not diffs, "why": "; ".join(diffs), "compared": compared, "not_compared": absent,
-            "line": (f"undeclared Go runtime keys: {'DIFFER: ' + '; '.join(diffs) if diffs else 'the same'} on "
+            "line": (f"the processes' memory limit and undeclared Go runtime keys: "
+                     f"{'DIFFER: ' + '; '.join(diffs) if diffs else 'the same'} on "
                      f"{arm} and {', '.join(compared) or 'no other run'}"
                      + (f"; NOT compared with {', '.join(absent)} (no reading within {wait_s:g} s, or the run "
                         f"ended without one)" if absent else ""))}
@@ -277,9 +388,11 @@ def report(path: str | None) -> dict:
     state = "VERIFIED" if rec.get("verified") else "NOT_VERIFIED"
     und = ", ".join(key_text(k, r) for k, r in (rec.get("undeclared") or {}).items()) or "none"
     return dict(rec, state=state, lines=[
+        f"INFO snowplow Go runtime, effective (read from the running process before the measure): "
+        f"{effective_text(rec.get('effective'))}",
         f"INFO snowplow env declared: {declared_text(rec.get('declared') or {})}; "
-        + (f"read from the running pod before the measure: as declared; undeclared Go runtime keys: {und}"
-           if rec.get("verified") else f"NOT verified from the pod: {rec.get('why')}")])
+        + (f"the process and the pod's env have it as declared; undeclared Go runtime keys in the env: {und}"
+           if rec.get("verified") else f"NOT verified: {rec.get('why')}")])
 
 
 def _arm(v: dict | None) -> dict | None:
@@ -292,34 +405,48 @@ def _digest(v: dict | None):
 
 
 def pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparable: str = "") -> dict:
-    """The pair's one statement of what its arms differ in: the image (each verdict's expected digest),
-    the declared snowplow env (each arm's record, verified from its pod), both, or neither; and the
-    undeclared keys that differ. An arm without a verified record: UNKNOWN, never "the same"."""
+    """The pair's one statement of what its arms differ in: the image (each verdict's expected digest)
+    and the GC settings their PROCESSES ran with (each arm's record: the effective values, read from
+    the running process before the measure), with what each arm declared beside them. An arm
+    without a verified record: UNKNOWN, never "the same"."""
     da, db = _digest(va), _digest(vb)
     image = ("the image is UNKNOWN on an arm" if not da or not db else
              f"the same image ({da})" if da == db else f"different images ({labels[0]}: {da}; {labels[1]}: {db})")
     ra, rb = _arm(va), _arm(vb)
     out: dict = {"result": "INFO", "same_image": (da == db) if da and db else None, "env_differs": None,
-                 "undeclared_differ": None, "a": ra, "b": rb}
+                 "effective_differs": None, "undeclared_differ": None, "a": ra, "b": rb}
     if ra is None or rb is None:
         who = ", ".join(lab for lab, r in zip(labels, (ra, rb), strict=True) if r is None)
-        out["lines"] = [f"INFO arms: {image}; snowplow env UNKNOWN: no record verified from the pod for {who}"]
+        out["lines"] = [f"INFO arms: {image}; snowplow's GC settings UNKNOWN: no record verified from the running "
+                        f"process for {who}"]
     else:
         ea, eb = ra.get("declared") or {}, rb.get("declared") or {}
-        keys = sorted(set(ea) | set(eb))
-        diff = [k for k in keys if ea.get(k) != eb.get(k)]
+        fa, fb = ra.get("effective") or {}, rb.get("effective") or {}
+        diff = [k for k in sorted(set(ea) | set(eb)) if ea.get(k) != eb.get(k)]
+        eff = [f for f in ("gogc", "memory_limit_bytes", "memory_limit_source") if fa.get(f) != fb.get(f)]
         und = undeclared_differences({labels[0]: ra, labels[1]: rb})
-        out.update(env_differs=bool(diff), undeclared_differ=und)
+        out.update(env_differs=bool(diff), effective_differs=eff, undeclared_differ=und)
 
-        def one(e, k):
-            return said(k, e[k]) if k in e else f"{k} not declared"
-        env = ("the same declared snowplow env (" + (declared_text(ea) if ea else "nothing declared") + ")"
-               if not diff else "they differ in snowplow env: "
-               + "; ".join(f"{one(ea, k)} on {labels[0]}, {one(eb, k)} on {labels[1]}" for k in diff))
-        only = (" (in env only, not in image)" if diff and da and da == db else
-                " (in image only)" if not diff and da and db and da != db else "")
-        out["lines"] = [f"INFO arms: {image}; {env}{only}; each read from the running pod before the measure"
-                        + ("; UNDECLARED keys differ: " + "; ".join(und) if und else "")]
+        def gogc(e):
+            return "off" if e.get("gogc") == GOGC_OFF else e.get("gogc")
+
+        def limit(e):
+            return f"{size_text(e.get('memory_limit_bytes'))} from {e.get('memory_limit_source')}"
+
+        def declared(e):
+            return declared_text(e) if e else "nothing declared"
+        gc = (f"GOGC {gogc(fa)} on both" if "gogc" not in eff else
+              f"GOGC {gogc(fa)} on {labels[0]}, GOGC {gogc(fb)} on {labels[1]}")
+        mem = (f"memory limit {limit(fa)} on both" if not {"memory_limit_bytes", "memory_limit_source"} & set(eff) else
+               f"memory limit {limit(fa)} on {labels[0]}, {limit(fb)} on {labels[1]}")
+        what = ("their processes ran with the same GC settings" if not eff else
+                "their processes ran with different GC settings")
+        only = (" (they differ in GC settings only, not in image)" if eff and da and da == db else
+                " (they differ in image only)" if not eff and da and db and da != db else "")
+        out["lines"] = [
+            f"INFO arms: {image}; {what}: {gc}; {mem}{only}; each read from the running process before the measure "
+            f"(declared: {labels[0]} {declared(ea)}; {labels[1]} {declared(eb)})"
+            + ("; UNDECLARED env keys differ: " + "; ".join(und) if und else "")]
     if not_comparable:
         out["lines"].append(f"INFO not comparable with {not_comparable}")
     return out
@@ -371,6 +498,11 @@ def rehearsal_lines(out_dir: str) -> list[str]:
         f"{'as declared' if rn.get('ok') else 'NOT as declared'}: {rn.get('why')}" if isinstance(rn, dict)
         else "no render record (nothing was declared)"))
     g, why = reading_of(os.path.join(out_dir, "tracing.json"))
+    eff, eff_why = effective_of(os.path.join(out_dir, "go-runtime.jsonl"))
+    lines.append("the snowplow process's effective GC settings, read before any load (/debug/vars "
+                 "snowplow_go_runtime, as the bench's preflight user): "
+                 + (f"{effective_text(eff)}; raw: {json.dumps(eff, sort_keys=True)}" if eff is not None
+                    else f"NOT READ ({eff_why})"))
     lines.append("the pod's Go runtime env, read before any load: "
                  + (goruntime.reading_text(g) if g is not None else f"NOT READ ({why})"))
     rec = load(os.path.join(out_dir, "snowplow-env.json"))
@@ -407,6 +539,9 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("check", help="exit 1 unless the running pod has every declared key as declared")
     c.add_argument("--declared", default="")
     c.add_argument("--tracing", required=True)
+    c.add_argument("--effective", default=None,
+                   help="the runtime606 Job's output (run606: $OUT/go-runtime.jsonl): the settings the snowplow "
+                        "process runs with; without it the check fails")
     c.add_argument("--arm", default="")
     c.add_argument("--out", required=True)
     g = sub.add_parser("agree", help="exit 1 when a key no run declared differs between the launch's runs")
@@ -447,9 +582,9 @@ def main(argv: list[str] | None = None) -> int:
         print(("rendered: " if rec["ok"] else "NOT rendered as declared: ") + rec["why"])
         return 0 if rec["ok"] else 1
     if a.cmd == "check":
-        rec = check(declared, a.tracing, arm=a.arm)
+        rec = check(declared, a.tracing, arm=a.arm, effective_path=a.effective)
         _write(a.out, rec)
-        print(("verified from the pod: " if rec["verified"] else "NOT as declared: ") + rec["why"])
+        print(("verified from the running process: " if rec["verified"] else "NOT as declared: ") + rec["why"])
         return 0 if rec["verified"] else 1
     res = agree(a.dir, a.arm, a.arms, a.wait_s)
     _write(a.out, res)

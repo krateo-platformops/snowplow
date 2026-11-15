@@ -185,7 +185,6 @@ def render_preflight(*, snowplow_url: str, authn_url: str, user: str,
     between two reads); product 5xx are recorded in its JSON line, never a
     refusal. The ConfigMap ships bench/identity.py beside load606.py, mounted
     as bench/identity.py: the record is redacted with it."""
-    src = LOAD606_SRC.read_text() if src is None else src
     script = f"""set -eu
 exec python3 -u /opt/load606/load606.py preflight \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
@@ -193,6 +192,29 @@ exec python3 -u /opt/load606/load606.py preflight \\
   --init {json.dumps(init)} --frontend-ns {json.dumps(frontend_ns)} \\
   --builders-ns {json.dumps(builders_ns)} --full-walk
 """
+    return _one_shot_job(job_name, script, src)
+
+
+GO_RUNTIME_JOB = "runtime606"
+
+
+def render_go_runtime(*, snowplow_url: str, authn_url: str, user: str, password: str,
+                      src: str | None = None, job_name: str = GO_RUNTIME_JOB) -> str:
+    """Namespace + ConfigMap + the runtime606 Job: the bench's preflight user logs in and reads
+    /debug/vars' snowplow_go_runtime (`load606 go-runtime`): the GC settings the snowplow process
+    runs with, as one JSON line. Seconds-scale, on the loadgen pool like the preflight."""
+    script = f"""set -eu
+exec python3 -u /opt/load606/load606.py go-runtime \\
+  --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
+  --user {json.dumps(user)} --password {json.dumps(password)}
+"""
+    return _one_shot_job(job_name, script, src)
+
+
+def _one_shot_job(job_name: str, script: str, src: str | None = None) -> str:
+    """Namespace + ConfigMap (load606.py, identity.py) + one Job of one container that runs `script`
+    on the loadgen pool, once."""
+    src = LOAD606_SRC.read_text() if src is None else src
     return f"""\
 apiVersion: v1
 kind: Namespace
@@ -564,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--snowplow-url", required=True)
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
-    p.add_argument("--init", required=True)
+    p.add_argument("--init", default=None, help="the portal's boot root (required, except with --go-runtime-only)")
     p.add_argument("--composite-route", action="append", default=None)
     p.add_argument("--burst-users", type=int, default=0)
     p.add_argument("--burst-at-s", type=float, default=600.0)
@@ -573,6 +595,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--preflight-only", action="store_true",
                    help="render ONLY the preflight Job (+ namespace/configmap)")
     p.add_argument("--preflight-user", default="scaleuser-0000")
+    p.add_argument("--go-runtime-only", action="store_true",
+                   help="render only the runtime606 Job: the preflight user reads the GC settings the snowplow "
+                        "process runs with (/debug/vars snowplow_go_runtime)")
     p.add_argument("--preflight-job-name", default="preflight606",
                    help="--preflight-only: the Job's name (a menu class's preflight, run606 s_classes)")
     p.add_argument("--menu-classes", action="store_true",
@@ -616,9 +641,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--browser-snowplow-url", default=None,
                    help="k6: snowplow as the browser reaches it (config SNOWPLOW_API_BASE_URL)")
     a = p.parse_args(argv)
+    if a.init is None and not a.go_runtime_only:
+        p.error("the following arguments are required: --init")
     if a.menu_classes:
         for label in menu_classes_driven(a.users, a.namespaces, a.browser_sessions, a.burst_users, a.dry_run):
             print(label)
+        return 0
+    if a.go_runtime_only:
+        sys.stdout.write(render_go_runtime(snowplow_url=a.snowplow_url, authn_url=a.authn_url,
+                                           user=a.preflight_user, password=a.password))
         return 0
     if a.preflight_only:
         sys.stdout.write(render_preflight(

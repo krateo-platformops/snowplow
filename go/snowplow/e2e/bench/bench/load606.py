@@ -4963,6 +4963,58 @@ def _cmd_preflight(a) -> int:
     return 0
 
 
+#: snowplow's own account of the GC settings its process runs with, on /debug/vars
+#: (go/snowplow/internal/memlimit/expvar.go, in 1.12.69 and 1.12.70): read from runtime/metrics at each
+#: read, so it is what the runtime HAS, whatever set it (the env, or snowplow deriving its memory limit
+#: from the container's cgroup limit: chart 1.12.70 sets no GOMEMLIMIT, and the process still runs
+#: with one)
+GO_RUNTIME_VAR = "snowplow_go_runtime"
+GO_RUNTIME_FIELDS = ("gogc", "memory_limit_bytes", "memory_limit_source", "cgroup_memory_limit_bytes")
+
+
+def go_runtime_record(status: int | None, body, why: str | None = None) -> dict:
+    """The record of one read of /debug/vars' snowplow_go_runtime: {"kind": "go_runtime", "ok",
+    "effective": {gogc, memory_limit_bytes, memory_limit_source, cgroup_memory_limit_bytes}} or
+    ok False with why (the login, the status, a body that is not JSON, an image that does not
+    publish the key, a field that is missing). Never a default in place of a value."""
+    rec: dict = {"kind": "go_runtime", "ok": False, "effective": None, "why": why}
+    if why:
+        return rec
+    if status != 200:
+        rec["why"] = f"/debug/vars answered {status}"
+        return rec
+    try:
+        doc = json.loads(body)
+    except (TypeError, ValueError):
+        rec["why"] = "/debug/vars answered no JSON"
+        return rec
+    g = doc.get(GO_RUNTIME_VAR) if isinstance(doc, dict) else None
+    if not isinstance(g, dict):
+        rec["why"] = (f"/debug/vars holds no {GO_RUNTIME_VAR}: this snowplow image does not publish the settings "
+                      f"its Go runtime runs with")
+        return rec
+    missing = [f for f in GO_RUNTIME_FIELDS if f not in g]
+    if missing:
+        rec["why"] = f"{GO_RUNTIME_VAR} lacks {', '.join(missing)}"
+        return rec
+    rec.update(ok=True, effective={f: g[f] for f in GO_RUNTIME_FIELDS})
+    return rec
+
+
+def _cmd_go_runtime(a) -> int:
+    """One line: the go_runtime record (the in-cluster runtime606 Job's whole output). Exit 2 when the
+    settings could not be read; the record says why."""
+    try:
+        tok = login(a.authn_url, a.user, a.password)
+    except Exception as e:  # noqa: BLE001
+        rec = go_runtime_record(None, None, f"the login failed ({type(e).__name__})")
+    else:
+        r = HttpClient(a.snowplow_url).get("/debug/vars", tok)
+        rec = go_runtime_record(r.status, r.body)
+    print(json.dumps(rec), flush=True)
+    return 0 if rec["ok"] else 2
+
+
 def _cmd_login_tokens(a) -> int:
     """#830: sign users start..end in through authn (the adaptive ramp, capped
     at --max-concurrency) and write their bearer tokens, in user order, to
@@ -6234,6 +6286,11 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--full-walk", action="store_true",
                     help="also record the closure walk (report-only metric)")
     pf.set_defaults(func=_cmd_preflight)
+    gr = sub.add_parser("go-runtime", help="the GC settings the snowplow process runs with "
+                                           "(/debug/vars snowplow_go_runtime), as one JSON line")
+    for flag in ("--snowplow-url", "--authn-url", "--user", "--password"):
+        gr.add_argument(flag, required=True)
+    gr.set_defaults(func=_cmd_go_runtime)
     pc = sub.add_parser("portal-config",
                         help="config.json on stdin -> PORTAL_* shell exports")
     pc.set_defaults(func=_cmd_portal_config)

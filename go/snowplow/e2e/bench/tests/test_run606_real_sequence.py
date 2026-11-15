@@ -316,6 +316,36 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # #1383 gap 3 / run 26h: gke-up's TTL proof Job (the CronJob's pod spec calling the GKE API as the node SA on two
     # names that do not exist), GKE answering per tests/fake_gke_api.py: FAKE_TTL_PROOF=granted (default: node-sa's
     # grant) | denied (no grant: 403 for both)
+    # the runtime606 Job (run606 go_runtime_reading): the preflight user reads /debug/vars'
+    # snowplow_go_runtime. Its answer is what snowplow publishes (internal/memlimit/expvar.go): the
+    # effective GOGC (the env the install declared, else the runtime's 100), and a memory limit DERIVED
+    # from the container's 8Gi cgroup limit (7/8), as chart 1.12.70 runs. FAKE_GO_RUNTIME: a JSON object
+    # of fields the process has instead; FAKE_GO_RUNTIME_FAIL: login | vars401 | nokey | pending
+    if "runtime606" in a or "job/runtime606" in a:
+        fail = os.environ.get("FAKE_GO_RUNTIME_FAIL", "")
+        if "get" in a:
+            done = fail != "pending"
+            bad = fail in ("login", "vars401", "nokey")
+            if any(x.endswith("{.status.succeeded}") for x in a):
+                print("1" if done and not bad else "")
+            elif any(x.endswith("{.status.failed}") for x in a):
+                print("1" if done and bad else "")
+            sys.exit(0)
+        if "logs" in a:
+            dp = os.path.join(STATE, "snowplow-declared-env.json")
+            env = json.loads(os.environ["FAKE_SNOWPLOW_GO_ENV"]) if os.environ.get("FAKE_SNOWPLOW_GO_ENV") else (
+                json.load(open(dp)) if os.path.exists(dp) else {})
+            eff = {"gogc": int(env.get("GOGC", 100)), "memory_limit_bytes": 7516192768,
+                   "memory_limit_source": "cgroup_v2", "cgroup_memory_limit_bytes": 8589934592}
+            eff.update(json.loads(os.environ.get("FAKE_GO_RUNTIME") or "{}"))
+            why = {"login": "the login failed (HTTPError)", "vars401": "/debug/vars answered 401",
+                   "nokey": "/debug/vars holds no snowplow_go_runtime: this snowplow image does not publish "
+                            "the settings its Go runtime runs with"}.get(fail)
+            if fail != "pending":
+                print(json.dumps({"kind": "go_runtime", "ok": why is None, "effective": None if why else eff,
+                                  "why": why}))
+            sys.exit(0)
+        sys.exit(0)
     if a[:3] == ["get", "job", "ttl-delete-proof"]:
         print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
     if a[:2] == ["get", "pods"] and "job-name=ttl-delete-proof" in a:       # its pod, on a platform node
