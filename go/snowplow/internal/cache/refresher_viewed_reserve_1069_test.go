@@ -27,15 +27,24 @@
 //     leaves instead of parking; the stop alone releases a parked worker, with
 //     the queue's own shutdown not yet done (so the order of the two steps of
 //     the queue's ShutDown cannot matter); the queue's ShutDown releases it.
+//   - R9 a FAILED refresh releases its unviewed slot, at the drop point (a
+//     non-retryable 403 or refused destination) and on a retry
+//     (type_not_installed): afterwards N−1 unviewed jobs run at once again and a
+//     viewed key still starts beside them.
 package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func maxInto(m *atomic.Int32, n int32) {
@@ -729,5 +738,131 @@ func TestReserve1069_R7_StatsCountExactly(t *testing.T) {
 		if got := st[stat]; got != want {
 			t.Errorf("R7: %s = %d, want %d", stat, got, want)
 		}
+	}
+}
+
+// TestReserve1069_R9_AFailedRefreshReleasesItsSlot is R9: an unviewed slot is
+// released when its refresh FAILS, whichever way the failure is handled: the
+// drop point on the first attempt (a non-retryable 403 or refused destination,
+// #608/#1131) or a retry inside the budget (type_not_installed, which #1429
+// recognises by snowplow's own error type and which keeps the budget). A slot
+// held past a failure would shrink the unviewed side for good, one failure at a
+// time, and with N−1 such failures leave no worker for unviewed work at all.
+//
+// Each case: N−1 unviewed keys fail while all hold a slot at once; then N−1 new
+// unviewed keys must all run at once again (every slot came back), and a viewed
+// key must still start beside them (the reserved worker is still free).
+func TestReserve1069_R9_AFailedRefreshReleasesItsSlot(t *testing.T) {
+	const p = 4
+	for _, tc := range []struct {
+		name         string
+		err          error
+		wantClass    string
+		nonRetryable bool
+	}{
+		{"forbidden", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
+			apierrors.NewForbidden(schema.GroupResource{Resource: "flexes"}, "x", errors.New("no"))),
+			RefreshErrForbidden, true},
+		{"destination_refused", WrapResolveStage(ResolveStageApiRef, "apiref", x1131Refused()),
+			RefreshErrDestinationRefused, true},
+		{"type_not_installed", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
+			&statusdetails.TypeNotInstalledError{
+				GVR:     schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"},
+				Message: "The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster."}),
+			RefreshErrTypeNotInstalled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The premise: the error is handled the way this case names.
+			if c, _ := ClassifyRefreshError(tc.err); c != tc.wantClass {
+				t.Fatalf("PRECONDITION: class %q, want %q", c, tc.wantClass)
+			}
+			if got := IsNonRetryableRefreshError(tc.err); got != tc.nonRetryable {
+				t.Fatalf("PRECONDITION: non-retryable %v, want %v", got, tc.nonRetryable)
+			}
+			terminalEnv(t)
+			t.Cleanup(withCleanRefresher(t, p, 0))
+			CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
+			_, keys := terminalFixtureNoReset(t, 2*(p-1)+1)
+			failing, second, v := keys[:p-1], keys[p-1:2*(p-1)], keys[2*(p-1)]
+			isFailing := map[string]bool{}
+			for _, k := range failing {
+				isFailing[k] = true
+			}
+			failGate, secondGate := make(chan struct{}), make(chan struct{})
+			var failOnce, secondOnce sync.Once
+			releaseFail := func() { failOnce.Do(func() { close(failGate) }) }
+			releaseSecond := func() { secondOnce.Do(func() { close(secondGate) }) }
+			t.Cleanup(releaseFail)
+			t.Cleanup(releaseSecond)
+			var attemptsMu sync.Mutex
+			attempts := map[string]int{}
+			var inFailing, failingDone, inSecond, maxSecond atomic.Int32
+			viewedStarted := make(chan struct{}, 1)
+			RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
+				switch {
+				case k == v:
+					select {
+					case viewedStarted <- struct{}{}:
+					default:
+					}
+					return nil
+				case isFailing[k]:
+					attemptsMu.Lock()
+					attempts[k]++
+					n := attempts[k]
+					attemptsMu.Unlock()
+					if n > 1 { // a retry (type_not_installed only) succeeds
+						failingDone.Add(1)
+						return nil
+					}
+					inFailing.Add(1)
+					<-failGate // every failing key holds its slot at once
+					if tc.nonRetryable {
+						failingDone.Add(1) // the drop point: no further attempt
+					}
+					return tc.err
+				default:
+					maxInto(&maxSecond, inSecond.Add(1))
+					<-secondGate
+					inSecond.Add(-1)
+					return nil
+				}
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			StartRefresher(ctx)
+			viewed765Arm(t, v)
+
+			terminalMark(failing)
+			waitFor(t, 5*time.Second, "N−1 failing refreshes in flight at once", func() bool { return inFailing.Load() == p-1 })
+			releaseFail()
+			waitFor(t, 10*time.Second, "every failing key handled to its end (R9 RED on type_not_installed if never: its retry finds no unviewed slot, the failed attempts kept theirs)", func() bool { return failingDone.Load() == p-1 })
+			st := RefresherStatsByStat()
+			if st["failed"] != p-1 {
+				t.Fatalf("PRECONDITION: failed=%d, want %d (one failed attempt per key)", st["failed"], p-1)
+			}
+			if tc.nonRetryable && (st["dropped"] != p-1 || st["retried"] != 0) {
+				t.Fatalf("PRECONDITION: dropped=%d retried=%d, want %d and 0 (the drop point on the first attempt)", st["dropped"], st["retried"], p-1)
+			}
+			if !tc.nonRetryable && (st["retried"] != p-1 || st["dropped"] != 0) {
+				t.Fatalf("PRECONDITION: retried=%d dropped=%d, want %d and 0 (one retry inside the budget)", st["retried"], st["dropped"], p-1)
+			}
+
+			terminalMark(second)
+			waitFor(t, 5*time.Second, "N−1 new unviewed refreshes in flight at once after the failures (R9 RED if never: a failed refresh kept its unviewed slot)", func() bool {
+				return inSecond.Load() == p-1
+			})
+			time.Sleep(150 * time.Millisecond) // a 4th worker, if it may, takes a 4th job now
+			if got := maxSecond.Load(); got > p-1 {
+				t.Fatalf("R9 RED (#1069): %d unviewed jobs ran at once with %d workers after the failures, want ≤ %d", got, p, p-1)
+			}
+			terminalMark([]string{v})
+			select {
+			case <-viewedStarted:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("R9 RED (#1069): after %d failed refreshes (%s), a viewed key did not start within 3s beside %d unviewed jobs", p-1, tc.name, inSecond.Load())
+			}
+			releaseSecond()
+		})
 	}
 }
