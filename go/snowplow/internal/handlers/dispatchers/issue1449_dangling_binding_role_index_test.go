@@ -38,6 +38,14 @@
 // path) and the real evaluator. The only seam is the read of the RESTAction CR.
 //
 // ASSERTED at each step on the user's class and key, and ON THE BYTES SERVED.
+//
+// TestIssue1449_RoleDeletedThenRecreated: the role is then DELETED and created
+// again with the grant; the class moves at each step and the bytes follow.
+//
+// RED on main bb715986 (PR #1455, commit 562362e0): the at-build arms and the
+// rebuild arm, sub-generation 0 → 0 → 0, the stored row served after the rule
+// was removed. Mutations, each RED here: the build skipping a binding to an
+// absent role; the role ADD, UPDATE or DELETE event not bumping.
 package dispatchers
 
 import (
@@ -299,7 +307,6 @@ func TestIssue1449_BindingToAbsentRoleFollowsThatRole(t *testing.T) {
 			e := i1449Setup(t, arm)
 			a := e.a
 			bystander := i1439Class(psDave, []string{psGroup}) // no binding names this identity's subjects but the group's
-			detector := cache.ResolvedCache().Stats().ServeMissedRotationAtriskRolerefUnresolved
 
 			if arm.when != i1449AtBuild {
 				e.createBinding()
@@ -378,7 +385,6 @@ func TestIssue1449_BindingToAbsentRoleFollowsThatRole(t *testing.T) {
 					"body carrying row %s/%s (apiserver dials=%d, L1 hits=%d)",
 					a.target.Resource, psTargetNS, psTargetNS, psTargetObj, after.dials, after.hits)
 			}
-			t.Logf("#261 case-3 detector (%s) moved by %d over the arm", c3RolerefUnresolvedStat, cache.ResolvedCache().Stats().ServeMissedRotationAtriskRolerefUnresolved-detector)
 
 			if got := i1439Class(psDave, []string{psGroup}); got != bystander {
 				t.Errorf("BLAST RADIUS: the class of an identity that is no subject of the binding moved")
@@ -389,6 +395,75 @@ func TestIssue1449_BindingToAbsentRoleFollowsThatRole(t *testing.T) {
 			cache.ResetDepsForTest()
 			if ctl := e.read(); ctl.row {
 				t.Fatalf("CONTROL FAILED: the user's own post-removal resolve carries the row — the revoke is not real; body=%s", ctl.body)
+			}
+		})
+	}
+}
+
+// deleteRole deletes the role through the fake apiserver.
+func (e *i1449Env) deleteRole() {
+	e.t.Helper()
+	var err error
+	if e.arm.roleKind == "ClusterRole" {
+		err = e.dyn.Resource(i1449CRGVR).Delete(context.Background(), i1449RoleName, metav1.DeleteOptions{})
+	} else {
+		err = e.dyn.Resource(icsRoleGVR).Namespace(psTargetNS).Delete(context.Background(), i1449RoleName, metav1.DeleteOptions{})
+	}
+	if err != nil {
+		e.t.Fatalf("delete role: %v", err)
+	}
+	e.settle("the role delete", func() bool { return !e.canList() })
+}
+
+// TestIssue1449_RoleDeletedThenRecreated — the role a binding names is created
+// (granting), DELETED, and created again. Each of the three is a change of what
+// the binding's subject may do, so the class moves at each and the bytes follow:
+// the row after the first create, no row after the delete, the row again after
+// the re-create. The binding is in the snapshot at index build, and the index is
+// rebuilt while the role is absent, the state in which the build used to drop
+// the binding.
+func TestIssue1449_RoleDeletedThenRecreated(t *testing.T) {
+	for _, arm := range []i1449Arm{
+		{name: "rolebinding-to-role", bindingKind: "RoleBinding", roleKind: "Role", when: i1449AtBuild},
+		{name: "clusterrolebinding-to-clusterrole", bindingKind: "ClusterRoleBinding", roleKind: "ClusterRole", when: i1449AtBuild},
+	} {
+		arm := arm
+		t.Run(arm.name, func(t *testing.T) {
+			e := i1449Setup(t, arm)
+			type step struct {
+				what    string
+				do      func()
+				wantRow bool
+			}
+			prev := e.class()
+			prevKey, _ := k423RAKey(t, e.ctx)
+			t.Logf("start (binding, no role): sub-gen=%d key=%.12s… may list=%v", prev.RBACSubGen, prevKey, e.canList())
+			for _, st := range []step{
+				{"the role is created with the grant", e.grant, true},
+				{"the role is deleted", func() {
+					e.deleteRole()
+					// A rebuild with the role absent must keep the binding.
+					cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, e.a.target})
+				}, false},
+				{"the role is created again with the grant", e.grant, true},
+			} {
+				st.do()
+				c := e.class()
+				k, _ := k423RAKey(t, e.ctx)
+				if e.canList() != st.wantRow {
+					t.Fatalf("PRE: after %s the evaluator's `list` verdict must be %v", st.what, st.wantRow)
+				}
+				r := e.read()
+				t.Logf("%s: sub-gen=%d key=%.12s… may list=%v; read carries row=%v (apiserver dials=%d, L1 hits=%d)",
+					st.what, c.RBACSubGen, k, st.wantRow, r.row, r.dials, r.hits)
+				if c.RBACSubGen <= prev.RBACSubGen || k == prevKey {
+					t.Errorf("DID NOT ROTATE: %s, and the user's sub-generation went %d → %d (key moved=%v)",
+						st.what, prev.RBACSubGen, c.RBACSubGen, k != prevKey)
+				}
+				if r.row != st.wantRow {
+					t.Errorf("STALE VIEW SERVED: after %s the user's read carries row=%v, want %v; body=%s", st.what, r.row, st.wantRow, r.body)
+				}
+				prev, prevKey = c, k
 			}
 		})
 	}

@@ -409,32 +409,13 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 	}
 }
 
-// applyBindingAdd resolves the binding's roleRef rules against the
-// published snapshot then enrols the binding under the write lock.
+// applyBindingAdd records the binding against the published snapshot, under
+// the write lock, through the same function the build uses (#1449).
 func (idx *bindingsByGVRIndex) applyBindingAdd(namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
 	snap := rbacSnap.Load()
-	rules, ok := rulesForRoleRef(snap, namespace, ref)
-	rk := roleRefKey(namespace, ref)
-
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if !ok {
-		// roleRef unresolvable (role not yet in snapshot) — record the
-		// entry + byRole membership so a later onRoleRulesChanged for that
-		// role can route it once the role appears. No GVR/wildcard
-		// enrolment yet.
-		idx.entries[id] = bindingEntry{id: id, subjects: subjects}
-		if rk != "" {
-			set := idx.byRole[rk]
-			if set == nil {
-				set = map[bindingID]struct{}{}
-				idx.byRole[rk] = set
-			}
-			set[id] = struct{}{}
-		}
-		return
-	}
-	idx.enrolLocked(bindingEntry{id: id, subjects: subjects}, rules, rk)
+	idx.recordBindingLocked(snap, namespace, ref, id, subjects)
 }
 
 // applyBindingDelete unrols the binding under the write lock.

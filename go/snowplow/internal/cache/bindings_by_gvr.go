@@ -147,29 +147,6 @@ type bindingsByGVRIndex struct {
 	byRole   map[string]map[bindingID]struct{}
 	entries  map[bindingID]bindingEntry
 
-	// roleRefUnresolved is the PER-BUILD set of binding UIDs SKIPPED at the two
-	// rulesForRoleRef !ok sites in BuildBindingsByGVRIndex (the binding's
-	// Role/ClusterRole was absent from the snapshot at build time, so the
-	// binding is not in byRole/byGVR and its grant is not reflected in the
-	// index keying). #261 case-3 serve-time-detector substrate: a later create
-	// or edit of that role shifts the binding's grant — and thus the
-	// serve-time first-match BindingUID — with NO sub-gen bump, the bounded
-	// "roleRef unresolved at build" missed-rotation carrier.
-	//
-	// Keyed by the SAME UID string form the serve path folds into the L1 cell
-	// key (BindingUIDFromCRB "C:<uid>" / BindingUIDFromRB "R:<ns>/<uid>", via
-	// crbBindingID / rbBindingID), so IsRoleRefUnresolvedAtBuild queries it
-	// directly with the dispatcher's matchedBindingUID — no UID→bindingID
-	// conversion.
-	//
-	// LIFECYCLE (arch caveat, critical): CLEARED at the START of every build
-	// and repopulated during THAT build only — NEVER accumulated across builds.
-	// A binding unresolved in a PAST build but re-enrolled now must NOT read
-	// at-risk, so the set reflects the LAST build's skip decisions alone. The
-	// steady-state delta hooks (enrol/unrol) deliberately do NOT touch it: it is
-	// a per-build snapshot of skip decisions, corrected on the next rebuild.
-	roleRefUnresolved map[bindingID]struct{}
-
 	// navigated is the set of GVRs the index buckets are maintained for.
 	// Set at BuildBindingsByGVRIndex time; the delta hooks enrol only into
 	// these buckets. A GVR discovered later (post-build CRD) widens this
@@ -195,12 +172,11 @@ var (
 func bindingsByGVRSingleton() *bindingsByGVRIndex {
 	bindingsIndexOnce.Do(func() {
 		bindingsIndexInstance = &bindingsByGVRIndex{
-			byGVR:             map[groupResource]map[bindingID]struct{}{},
-			wildcard:          map[bindingID]struct{}{},
-			byRole:            map[string]map[bindingID]struct{}{},
-			entries:           map[bindingID]bindingEntry{},
-			navigated:         map[groupResource]struct{}{},
-			roleRefUnresolved: map[bindingID]struct{}{},
+			byGVR:     map[groupResource]map[bindingID]struct{}{},
+			wildcard:  map[bindingID]struct{}{},
+			byRole:    map[string]map[bindingID]struct{}{},
+			entries:   map[bindingID]bindingEntry{},
+			navigated: map[groupResource]struct{}{},
 		}
 	})
 	return bindingsIndexInstance
@@ -390,6 +366,19 @@ func (idx *bindingsByGVRIndex) enrolLocked(entry bindingEntry, rules []rbacv1.Po
 	}
 }
 
+// recordBindingLocked is the ONE way a binding enters the index (#1449): the
+// build and the binding ADD / UPDATE delta hooks both call it. The binding is
+// recorded under the role it names (entries + byRole) whether or not that role
+// is in snap. A role that is absent has no rules, so the binding enters no GVR
+// or wildcard bucket (it grants nothing, and the evaluator, which reads the
+// snapshot and never this index, denies it); it stays reachable through byRole,
+// so the role's create, every rules edit and its delete reach the binding's
+// subjects (onRoleRulesChanged). Caller holds idx.mu (write).
+func (idx *bindingsByGVRIndex) recordBindingLocked(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
+	rules, _ := rulesForRoleRef(snap, namespace, ref)
+	idx.enrolLocked(bindingEntry{id: id, subjects: subjects}, rules, roleRefKey(namespace, ref))
+}
+
 // unrolLocked removes a binding id from every bucket it could be in. Caller
 // holds idx.mu (write). With set-backed buckets each delete is O(1); we
 // touch at most |navigated| buckets + wildcard + byRole. rk is the
@@ -419,7 +408,8 @@ func (idx *bindingsByGVRIndex) unrolLocked(id bindingID, rk string) {
 // BuildBindingsByGVRIndex builds the index ONCE over navigatedGVRs against
 // the current published RBAC snapshot. Safe to call with a nil/empty
 // navigated set (the index stays empty until AddNavigatedGVR widens it).
-// Returns the number of bindings enrolled (CRB + RB resolved).
+// Returns the number of bindings recorded (every CRB and RB in the snapshot,
+// #1449).
 func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	idx := bindingsByGVRSingleton()
 
@@ -449,9 +439,6 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 	idx.byRole = map[string]map[bindingID]struct{}{}
 	idx.entries = map[bindingID]bindingEntry{}
 	idx.navigated = map[groupResource]struct{}{}
-	// #261 case-3 — CLEAR the per-build skipped-set at build start; it is
-	// repopulated below during THIS build only (never accumulated).
-	idx.roleRefUnresolved = map[bindingID]struct{}{}
 	for _, gvr := range navigatedGVRs {
 		idx.navigated[grFromGVR(gvr)] = struct{}{}
 	}
@@ -477,44 +464,30 @@ func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
 		defer rotateIfRBACEventSeenPreBuild() // runs before the Unlock (LIFO)
 	}
 
-	enrolled := 0
+	// #1449 — EVERY binding is recorded, under the role it names, whether or
+	// not that role is in the snapshot (recordBindingLocked: the one function
+	// the delta hooks use too). A build that skipped a binding to an absent
+	// role left it out of byRole, so that role's later create and every later
+	// rules edit bumped no subject.
+	recorded := 0
 	for _, crb := range snap.ClusterRoleBindings {
 		if crb == nil {
 			continue
 		}
-		rules, ok := rulesForRoleRef(snap, "", crb.RoleRef)
-		if !ok {
-			// #261 case-3 — roleRef unresolvable at THIS build (its ClusterRole
-			// is absent from the snapshot). Record the skipped binding's UID (the
-			// same string the serve path folds) so a later serve HIT on its
-			// at-risk-keyed cell is detectable. Per-build; cleared at build start.
-			idx.roleRefUnresolved[crbBindingID(crb)] = struct{}{}
-			continue
-		}
-		entry := bindingEntry{id: crbBindingID(crb), subjects: subjectsFromRBAC(crb.Subjects)}
-		idx.enrolLocked(entry, rules, roleRefKey("", crb.RoleRef))
-		enrolled++
+		idx.recordBindingLocked(snap, "", crb.RoleRef, crbBindingID(crb), subjectsFromRBAC(crb.Subjects))
+		recorded++
 	}
 	for ns, rbs := range snap.RoleBindingsByNS {
 		for _, rb := range rbs {
 			if rb == nil {
 				continue
 			}
-			rules, ok := rulesForRoleRef(snap, ns, rb.RoleRef)
-			if !ok {
-				// #261 case-3 — roleRef unresolvable at THIS build (its Role is
-				// absent from the snapshot). Record the skipped binding's UID
-				// (R:<ns>/<uid> form) for the serve-time detector. Per-build.
-				idx.roleRefUnresolved[rbBindingID(rb)] = struct{}{}
-				continue
-			}
-			entry := bindingEntry{id: rbBindingID(rb), subjects: subjectsFromRBAC(rb.Subjects)}
-			idx.enrolLocked(entry, rules, roleRefKey(ns, rb.RoleRef))
-			enrolled++
+			idx.recordBindingLocked(snap, ns, rb.RoleRef, rbBindingID(rb), subjectsFromRBAC(rb.Subjects))
+			recorded++
 		}
 	}
 	idx.built = true
-	return enrolled
+	return recorded
 }
 
 // BindingsByGVRIndexBuilt reports whether the index has been built at
@@ -525,37 +498,6 @@ func BindingsByGVRIndexBuilt() bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.built
-}
-
-// IsRoleRefUnresolvedAtBuild (method) reports whether the binding identified
-// by bindingUID — the SAME "C:<uid>" / "R:<ns>/<uid>" string the serve path
-// folds as ResolvedKeyInputs.BindingUID — was SKIPPED at the LAST index build
-// because its roleRef's Role/ClusterRole was absent from the snapshot then.
-// #261 case-3 serve-time detector: true means the binding's grant was NOT
-// reflected in the index keying at build, so a role create/edit since then
-// could have shifted its serve-time first-match grant with NO sub-gen bump —
-// the AT-RISK missed-rotation carrier. Empty UID is a no-op (false).
-//
-// Concurrency mirrors the other index reads: RLock over idx.mu (the build /
-// delta hooks write under idx.mu.Lock()).
-func (idx *bindingsByGVRIndex) IsRoleRefUnresolvedAtBuild(bindingUID string) bool {
-	if bindingUID == "" {
-		return false
-	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	_, ok := idx.roleRefUnresolved[bindingID(bindingUID)]
-	return ok
-}
-
-// IsRoleRefUnresolvedAtBuild is the package-level query the serve hit-site
-// (dispatchers) consults on an L1 HIT with matchedBindingUID in hand — it
-// delegates to the process-wide index singleton. Structural proxy only; the
-// counter it gates (resolved.go) measures the AT-RISK SERVE POPULATION, not a
-// confirmed-leak count (see #261 T1/T3 semantics). Cache-off / pre-build the
-// singleton's set is empty → false (no false at-risk reads).
-func IsRoleRefUnresolvedAtBuild(bindingUID string) bool {
-	return bindingsByGVRSingleton().IsRoleRefUnresolvedAtBuild(bindingUID)
 }
 
 // AddNavigatedGVR widens the index's navigated set by one GVR and enrols
@@ -674,7 +616,6 @@ func ResetBindingsByGVRIndexForTest() {
 	idx.byRole = map[string]map[bindingID]struct{}{}
 	idx.entries = map[bindingID]bindingEntry{}
 	idx.navigated = map[groupResource]struct{}{}
-	idx.roleRefUnresolved = map[bindingID]struct{}{}
 	idx.built = false
 	idx.pendingNavigated = nil
 }
