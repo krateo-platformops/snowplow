@@ -25,7 +25,10 @@ FIX = BENCH_DIR / "tests" / "fixtures"
 
 def _wait_fn() -> str:
     """The rendered browser container's wait for the portal's origin."""
-    y = k6_job.render_browser(config={"sessions": [], "frontendUrl": "http://127.0.0.1:8080"}, linger_s=0)
+    cfg = k6_job.browser_config(sessions=[], routes=[], password="x", think_s=1, duration_s=1,
+                                frontend_url="http://127.0.0.1:8080", snowplow_url="http://127.0.0.1:8080",
+                                authn_url="http://127.0.0.1:8080", debug_user="d")
+    y = k6_job.render_browser(config=cfg, linger_s=0)
     job = next(d for d in yaml.safe_load_all(y) if d and d["kind"] == "Job")
     args = job["spec"]["template"]["spec"]["containers"][0]["args"][0]
     return args[args.index("wait_origin() {"):args.index("wait_origin && ")]

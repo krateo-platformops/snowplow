@@ -371,3 +371,12 @@ def test_a_dry_pass_says_it_makes_the_debug_reader_at_the_preflight(harness):  #
     assert p.returncode == 0, log[-3000:]
     pre = log[log.index("=== step preflight ==="):log.index("=== step data ===")]
     assert "DRY: python3 -m bench data606-debug-reader" in pre and "DRY: python3 -m bench data606-preflight-user" in pre
+
+
+
+def test_no_test_writes_a_browser_config_by_hand():
+    # #1471: a hand-written config lacked authnUrl / debugUser, so the browser never read the counters and the
+    # Chrome test saw empty values. Every browser config a test runs comes from k6_job.browser_config
+    for f in sorted((BENCH / "tests").glob("test_*.py")):
+        src = f.read_text()
+        assert not re.search(r'["\']frontendUrl["\']\s*:', src), f.name

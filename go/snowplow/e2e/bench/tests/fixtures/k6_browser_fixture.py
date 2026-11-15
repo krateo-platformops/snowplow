@@ -24,8 +24,16 @@ in real Chrome under test (tests/test_k6_830.py, #831 gate):
   /call        one GET /call that answers, one to a refused port (#919)
   sign-in      stores K_user {accessToken} in localStorage, as the SPA's Login
                does (utils/getAccessToken.ts reads it back)
-  /debug/vars  (#935) Bearer-only (401 without): snowplow's two learned-class
-               counters; a class is "learned" the first time its token reads
+  /debug/vars  (#935) snowplow's two learned-class counters, authorized as
+               snowplow #1365 does (1.12.71 on): 401 without a token, 403 for
+               any token but the debug reader's (no session holds a /debug
+               grant), 200 for the debug reader's
+  /basic/login authn, for the bench's debug reader alone (DEBUG_USER, Basic
+               auth): its token; 401 for anyone else (a session signs in on
+               the page)
+  learning     a class is "learned" the first time its token reaches /call
+               (the SPA's calls carry it, as the real SPA's do): snowplow
+               learns a class from that class's own resolves
 
 Usage: k6_browser_fixture.py PORT SIGNIN_MS SKELETON_DELAY_MS PAGE_MS [1.8.40|1.8.36|two-submits|old]"""
 import http.server
@@ -35,6 +43,8 @@ import threading
 import time
 
 PORT, SIGNIN_MS, SKEL_MS, PAGE_MS = (int(x) for x in sys.argv[1:5])
+#: the bench's debug reader, as the tests' browser config names it (debugUser), and the token authn gives it
+DEBUG_USER, DEBUG_TOKEN = "fixture-debug", "fixture-debug-token"
 DOM = sys.argv[5] if len(sys.argv) > 5 else "1.8.40"
 if DOM not in ("1.8.40", "1.8.36", "two-submits", "old"):
     sys.exit(f"DOM must be 1.8.40, 1.8.36, two-submits or old, got {DOM!r}")
@@ -114,7 +124,9 @@ function live () {
   // #919: a /call that answers, and one refused at network level (nothing
   // listens on port 8099 in the browser's container; not one of Chrome's
   // blocked 'unsafe' ports, which fail before connecting), with user extras
-  fetch('/call?resource=tables&name=t1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
+  const tok = (JSON.parse(localStorage.getItem('K_user') || '{}').accessToken) || '';
+  fetch('/call?resource=tables&name=t1&namespace=ns1&extras=FIXTURE-SECRET',
+        { headers: tok ? { Authorization: 'Bearer ' + tok } : {} }).catch(() => {});
   fetch('http://127.0.0.1:8099/call?resource=boom&name=b1&namespace=ns1&extras=FIXTURE-SECRET').catch(() => {});
 }
 window.addEventListener('popstate', () => render(location.pathname));
@@ -154,15 +166,18 @@ class H(http.server.BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _status(self, code):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _vars(self):
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer ") or len(auth) <= len("Bearer "):
-            self.send_response(401)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+            return self._status(401)
+        if auth != "Bearer " + DEBUG_TOKEN:
+            return self._status(403)
         with LEARNED_LOCK:
-            LEARNED.add(auth)
             n = len(LEARNED)
         body = json.dumps({"snowplow_learned_classes_registered": n, "snowplow_learned_classes_seeded": n}).encode()
         self._send(body, "application/json")
@@ -175,6 +190,20 @@ class H(http.server.BaseHTTPRequestHandler):
             SEEN.append(self.path)
         if self.path.startswith("/debug/vars"):
             return self._vars()
+        if self.path.startswith("/basic/login"):
+            import base64
+            try:
+                who = base64.b64decode((self.headers.get("Authorization") or "").split()[1]).decode().split(":")[0]
+            except (IndexError, ValueError):
+                who = ""
+            if who != DEBUG_USER:
+                return self._status(401)
+            return self._send(json.dumps({"accessToken": DEBUG_TOKEN}).encode(), "application/json")
+        if self.path.startswith("/call"):
+            auth = self.headers.get("Authorization") or ""
+            if auth.startswith("Bearer ") and auth != "Bearer " + DEBUG_TOKEN:
+                with LEARNED_LOCK:
+                    LEARNED.add(auth)
         if self.path.startswith("/notifications"):
             return self._stream()
         return self._send(PAGE.encode(), "text/html")

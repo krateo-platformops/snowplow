@@ -1517,12 +1517,15 @@ def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page
     out = tmp_path / "out"
     out.mkdir(mode=0o777)
     out.chmod(0o777)
-    (tmp_path / "cfg.json").write_text(json.dumps({
-        "sessions": [{"name": "s1", "user": "fixture-user", "offset": 0, "fresh": list(fresh)}],
-        "routes": ["/dashboard", "/compositions", "/never", "/err"], "password": "x",
-        "thinkS": 0.3, "durationS": duration_s, "quietMs": 1000, "pageTimeoutMs": 3000,
-        "signinTimeoutMs": 10000, "frontendUrl": f"http://{spa}:8080", "snowplowUrl": f"http://{spa}:8080",
-        "firstVisit": "test"}))
+    # the config the run renders (k6_job.browser_config, the ONE way to make one): the fixture is snowplow,
+    # authn (for the debug reader, `fixture-debug`) and the portal at once
+    cfg = k6_job.browser_config(
+        sessions=[{"name": "s1", "user": "fixture-user", "offset": 0, "cold": True}],
+        routes=["/dashboard", "/compositions", "/never", "/err"], password="x", think_s=0.3,
+        duration_s=duration_s, quiet_ms=1000, page_timeout_ms=3000, signin_timeout_ms=10000,
+        frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080", authn_url=f"http://{spa}:8080",
+        debug_user="fixture-debug", fresh={"sessions": [{"session": "s1", "fresh": [{"user": u} for u in fresh]}]})
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg))
     subprocess.run(["docker", "network", "create", net], capture_output=True, check=True)
     try:
         subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
@@ -1762,9 +1765,10 @@ def test_in_chrome_each_session_switches_to_its_fresh_identity_classes(tmp_path)
     (first, then warm), then signs in as its next fresh class in a new browser
     context and visits every route for the first time again. The real read
     path end to end (#939 review LOW): the previous class's K_user token,
-    the Bearer header, the two expvar names — the fixture's /debug/vars
-    (401 without a token) learns a class the first time its token reads,
-    so every fresh class is proven cold."""
+    the Bearer header, the two expvar names — the fixture learns a class the
+    first time its token reaches /call, and its /debug/vars answers the debug
+    reader alone (snowplow #1365: 403 for a session's token), so every fresh
+    class is proven cold, and only through the debug reader."""
     o = _run_browser_fixture(tmp_path, signin_ms=300, fresh=["fixture-fresh-1", "fixture-fresh-2"],
                              duration_s=40)
     loads = [(t["class"], t["identity"], t["route"], t["visit"]) for _, t in o["points"]["browser_page_load_ms"]]
