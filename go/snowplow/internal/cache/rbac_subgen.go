@@ -250,7 +250,9 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 //
 // #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE, AND UNDER WHICH CONDITION.
 // Take two identities that hold one binding set and read the same value v, at
-// any two times. Neither has had a FOLDED subject bumped after state v. A rules
+// any two times outside the publish window (a snapshot is live and the bumps
+// its changes owe are not written yet: at most one rebuild late, see
+// rbac_subgen_pending.go). Neither has had a FOLDED subject bumped after state v. A rules
 // change, create or delete of a role bumps every subject of every binding the
 // role index (bindingsByGVRIndex.byRole) lists under that role, and a binding
 // re-pointed at other subjects, or to another role, bumps both sides. So the
@@ -262,9 +264,11 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 //	(b) the binding is in the role index under the role it references.
 //
 // Where (a) or (b) fails, a verdict can move with no bump of a folded subject,
-// and the class does not move: the identity's own key is stale (as it was
-// before #1439; the cross-identity aliasing #1439 removed does not come back).
-// The known exceptions:
+// and the identity keeps its old class. It can then be served a pre-change
+// cell: its own, or one that ANOTHER identity with the same binding set stored
+// under that class before the change (a human user's cell re-read by a
+// ServiceAccount, for one). The guarantee above does not hold for it in either
+// direction. The known exceptions:
 //
 //   - (a), #1443: a ServiceAccount matched through the evaluator's implicit
 //     groups (system:serviceaccounts, system:serviceaccounts:<ns>), which are

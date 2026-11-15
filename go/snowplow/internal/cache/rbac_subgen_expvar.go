@@ -11,7 +11,8 @@
 // internal/metrics/metrics.go owns the OTLP mirror.
 //
 // WHAT THEY MEASURE (#247): the L1 cache key folds RBACSubGenForSubject
-// (rbac_subgen.go), which sums the requesting identity's PER-SUBJECT counters.
+// (rbac_subgen.go), which reads the latest RBAC state over the requesting
+// identity's PER-SUBJECT counters (#1439; a sum before it).
 // The only published RBAC counter before this file, snowplow_rbac_publish_seq,
 // is GLOBAL — one bump per snapshot publish. It sits one link too early on the
 // chain rbac_subgen.go documents:
