@@ -270,14 +270,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			pcs.l1Hit = "hit"
 			// #261 serve-time detector (observability only; the keying FIX is
 			// v7-deferred — this changes NO serving behaviour, RawJSON below is
-			// untouched). Both at-risk carriers of the bounded self-stale-leak
+			// untouched). The at-risk carrier of the bounded self-stale-leak
 			// class — case-2 (winning subject is an implicit group; an RBAC fact)
-			// and case-3 (first-permitting binding's roleRef was unresolved at the
-			// last bindings_by_gvr index build; an index fact) — were computed at
-			// KEY-MINT (dispatchCacheLookupKey) and carried on cacheInputs.
-			// AtRiskClass. Here we merely READ that MARK and bump the matching
-			// counter — never re-evaluating RBAC or the index at the hit (pm
-			// load-bearing #4). Through such a binding a grant/revoke can shift the
+			// — was computed at KEY-MINT (dispatchCacheLookupKey) and carried on
+			// cacheInputs.AtRiskClass. Here we merely READ that MARK and bump the
+			// counter — never re-evaluating RBAC at the hit (pm load-bearing #4).
+			// (Case-3, a binding skipped at the index build, was retired with
+			// that skip: #1449.) Through such a binding a grant/revoke can shift the
 			// serve-time first-match BindingUID with NO sub-gen bump, so a HIT of
 			// the at-risk-keyed cell can serve potentially-stale bytes.
 			// HIT-GATED ONLY: a MISS re-resolves under fresh perms (no stale), so
@@ -295,9 +294,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				case cache.AtRiskImplicitGroup:
 					cache.ResolvedCache().BumpServeMissedRotationAtriskImplicitGroup()
 					class = "implicit_group"
-				case cache.AtRiskRolerefUnresolved:
-					cache.ResolvedCache().BumpServeMissedRotationAtriskRolerefUnresolved()
-					class = "roleref_unresolved"
 				}
 				if class != "" {
 					log.Debug("l1.serve_missed_rotation_atrisk",
