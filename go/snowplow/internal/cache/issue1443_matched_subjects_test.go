@@ -176,6 +176,13 @@ func TestIssue1443_MatchIsMembershipOfTheVisitedSet(t *testing.T) {
 			visited = append(visited, ms)
 			return true
 		})
+		// Every entry Visit yields is itself matched, whatever its name: an
+		// entry the enumeration gained cannot hide outside the subject universe.
+		for _, ms := range visited {
+			if ok, _ := m.Match(rbacv1.Subject{Kind: ms.Kind, Name: ms.Name, Namespace: ms.Namespace}); !ok {
+				t.Fatalf("requester (%q, %q): Visit yields %+v, which Match does not match", username, groups, ms)
+			}
+		}
 		for _, s := range subjects {
 			wantMatched, wantImplicit := false, false
 			if k, ok := bindingSubjectKey(s); ok {
