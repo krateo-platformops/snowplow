@@ -16,9 +16,10 @@
 //
 // Snowplow is read through its PRODUCTION derivations only:
 //
-//   - key/digest group set: effectiveGroups over cache.WithAuthenticatedGroup
-//     (what SubjectBindingIDs evaluates — the SA synthetic groups come from
-//     effectiveGroups, the apiserver's implicit group from WithAuthenticatedGroup);
+//   - key/digest group set: the Group subjects of cache.SubjectMatcher over
+//     cache.WithAuthenticatedGroup (what the key fold and SubjectBindingIDs
+//     evaluate — the ServiceAccount groups come from the matcher, the
+//     apiserver's implicit group from WithAuthenticatedGroup);
 //   - the binding-set digest's ids (rbac.SubjectBindingIDs) over a published
 //     snapshot holding one binding per candidate group;
 //   - the live path: rbac.EvaluateRBAC for the RAW (username, groups) against
@@ -225,10 +226,18 @@ func TestIssue1334_EffectiveGroups_ParityWithAPIServer(t *testing.T) {
 			}
 
 			// (1) The key/digest group set.
-			saNS, _, isSA := rbac.ParseServiceAccountUsernameForTest(r.username)
-			keyGroups := rbac.EffectiveGroupsForTest(cache.WithAuthenticatedGroup(r.username, r.groups), isSA, saNS)
+			// Read from production: the Group subjects of the shared matcher
+			// (cache.SubjectMatcher, #1443) over the effective group set, which
+			// is what the key fold and the digest both evaluate.
+			var keyGroups []string
+			cache.NewSubjectMatcher(r.username, cache.WithAuthenticatedGroup(r.username, r.groups)).Visit(func(ms cache.MatchedSubject) bool {
+				if ms.Kind == "Group" {
+					keyGroups = append(keyGroups, ms.Name)
+				}
+				return true
+			})
 			if !equal1334(keyGroups, want) {
-				t.Errorf("key/digest group set (WithAuthenticatedGroup + effectiveGroups) = %q, apiserver = %q",
+				t.Errorf("key/digest group set (the shared matcher over WithAuthenticatedGroup) = %q, apiserver = %q",
 					set1334(keyGroups), want)
 			}
 

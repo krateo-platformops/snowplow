@@ -309,10 +309,12 @@ const (
 // as its username on the request (system:serviceaccount:<ns>:<name>).
 const serviceAccountUsernamePrefix = "system:serviceaccount:"
 
-// parseServiceAccountUsername splits a canonical SA username into (namespace,
-// name). Returns ok=false for a non-SA username (a human user), which the caller
-// then folds as a User subject. Mirrors f3SubjectFor / the k8s canonical form.
-func parseServiceAccountUsername(username string) (namespace, name string, ok bool) {
+// ParseServiceAccountUsername splits a canonical ServiceAccount username
+// (system:serviceaccount:<ns>:<name>) into (namespace, name); ok=false for any
+// other username. The ONE parser of that form: the shared matcher
+// (SubjectMatcher) and rbac.IsServiceAccountUsername both read it, so "is this
+// requester a ServiceAccount" has one answer (#1443).
+func ParseServiceAccountUsername(username string) (namespace, name string, ok bool) {
 	rest, found := strings.CutPrefix(username, serviceAccountUsernamePrefix)
 	if !found {
 		return "", "", false

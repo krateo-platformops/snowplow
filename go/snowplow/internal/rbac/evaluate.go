@@ -1018,30 +1018,15 @@ func subjectMatcher(opts EvaluateOptions) cache.SubjectMatcher {
 	return cache.NewSubjectMatcher(opts.Username, opts.Groups)
 }
 
-// parseServiceAccountUsername decodes the
-// "system:serviceaccount:<ns>:<name>" form. Returns (ns, name, true) on
-// success; ("", "", false) for non-ServiceAccount usernames.
-func parseServiceAccountUsername(u string) (string, string, bool) {
-	const prefix = "system:serviceaccount:"
-	if !strings.HasPrefix(u, prefix) {
-		return "", "", false
-	}
-	rest := u[len(prefix):]
-	parts := strings.SplitN(rest, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
-}
-
 // IsServiceAccountUsername reports whether u is a canonical Kubernetes
 // ServiceAccount username of the form "system:serviceaccount:<ns>:<name>".
-// It is the boolean projection of parseServiceAccountUsername — the single
-// source of truth for the SA-identity prefix test — so callers outside this
-// package (e.g. the internal-REST-config dispatcher's serve-un-narrowed
-// predicate) never hand-roll the "system:serviceaccount:" prefix check.
+// It is the boolean projection of cache.ParseServiceAccountUsername — the
+// single parser of that form, which the shared matcher also reads — so callers
+// outside this package (e.g. the internal-REST-config dispatcher's
+// serve-un-narrowed predicate) never hand-roll the "system:serviceaccount:"
+// prefix check.
 func IsServiceAccountUsername(u string) bool {
-	_, _, ok := parseServiceAccountUsername(u)
+	_, _, ok := cache.ParseServiceAccountUsername(u)
 	return ok
 }
 

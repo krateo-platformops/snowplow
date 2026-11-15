@@ -178,7 +178,7 @@ func NewSubjectMatcher(username string, groups []string) SubjectMatcher {
 		return m
 	}
 	m.implicit = ImplicitGroup(username, groups)
-	if m.saNS, m.saName, m.isSA = parseServiceAccountUsername(username); m.isSA {
+	if m.saNS, m.saName, m.isSA = ParseServiceAccountUsername(username); m.isSA {
 		m.saAll, m.saOfNS = ServiceAccountGroups(m.saNS)
 	}
 	return m
@@ -225,19 +225,35 @@ func (m SubjectMatcher) Visit(visit func(MatchedSubject) bool) {
 // set, and whether the requester holds it implicitly (see MatchedSubject). A
 // subject of any other kind than User, Group or ServiceAccount matches no one.
 // A ServiceAccount subject is compared by its namespace as written.
+//
+// Match is the evaluator's inner loop (once per subject of every candidate
+// binding), so it decides by the subject's kind against the matcher's fields
+// instead of walking Visit: one comparison for a User or ServiceAccount
+// subject, one scan of the presented groups for a Group subject. It is the
+// membership test of the set Visit enumerates and of nothing else:
+// TestIssue1443_MatchIsMembershipOfTheVisitedSet holds Match(s) equal to "s is
+// among the subjects Visit yields, with the first such entry's Implicit" over
+// generated requesters and subjects, so the two cannot drift.
 func (m SubjectMatcher) Match(s rbacv1.Subject) (matched, implicit bool) {
-	want, ok := bindingSubjectKey(s)
-	if !ok {
-		return false, false
-	}
-	m.Visit(func(ms MatchedSubject) bool {
-		if ms.key() == want {
-			matched, implicit = true, ms.Implicit
-			return false
+	switch s.Kind {
+	case rbacv1.UserKind:
+		return m.username != "" && s.Name == m.username, false
+	case rbacv1.GroupKind:
+		for _, g := range m.groups {
+			if g == s.Name {
+				return true, false
+			}
 		}
-		return true
-	})
-	return matched, implicit
+		if m.isSA && (s.Name == m.saAll || s.Name == m.saOfNS) {
+			return true, true
+		}
+		if m.implicit != "" && s.Name == m.implicit {
+			return true, true
+		}
+	case rbacv1.ServiceAccountKind:
+		return m.isSA && s.Name == m.saName && s.Namespace == m.saNS, false
+	}
+	return false, false
 }
 
 // bindingSubjectKey is the (Kind, Name, Namespace) form of one binding subject:

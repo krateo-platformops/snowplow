@@ -15,6 +15,7 @@
 package cache
 
 import (
+	"math/rand"
 	"reflect"
 	"testing"
 
@@ -142,6 +143,78 @@ func TestIssue1443_FoldRotatedAndMatchAgree(t *testing.T) {
 	ResetRBACSubGenForTest()
 	if matchedPairs < 25 {
 		t.Fatalf("VACUOUS: only %d (requester, subject) pairs matched", matchedPairs)
+	}
+}
+
+// Match decides by the subject's kind against the matcher's fields; Visit
+// enumerates the set. Match must be exactly the membership test of what Visit
+// yields — the first entry equal to the subject, with its Implicit — for every
+// requester and every subject, well-formed or not.
+func TestIssue1443_MatchIsMembershipOfTheVisitedSet(t *testing.T) {
+	names := []string{
+		"", "alice", "bob", "devs", "ops", "reader", "apps", "other",
+		"system:anonymous", "krateo:public", "system:authenticated", "system:unauthenticated",
+		"system:serviceaccounts", "system:serviceaccounts:apps", "system:serviceaccounts:other", "system:serviceaccounts:",
+		"system:serviceaccount:apps:reader", "system:serviceaccount:other:reader", "system:serviceaccount:apps:writer",
+		"system:serviceaccount:apps", "system:serviceaccount::reader", "system:serviceaccount:apps:", "system:serviceaccount:a:b:c",
+	}
+	var subjects []rbacv1.Subject
+	for _, kind := range []string{"User", "Group", "ServiceAccount", "Robot", ""} {
+		for _, n := range names {
+			for _, ns := range []string{"", "apps", "other", "a"} {
+				subjects = append(subjects, rbacv1.Subject{Kind: kind, Name: n, Namespace: ns})
+			}
+		}
+	}
+	r := rand.New(rand.NewSource(1443))
+	requesters, matchedPairs, implicitPairs := 0, 0, 0
+	check := func(username string, groups []string) {
+		requesters++
+		m := NewSubjectMatcher(username, groups)
+		var visited []MatchedSubject
+		m.Visit(func(ms MatchedSubject) bool {
+			visited = append(visited, ms)
+			return true
+		})
+		for _, s := range subjects {
+			wantMatched, wantImplicit := false, false
+			if k, ok := bindingSubjectKey(s); ok {
+				for _, ms := range visited {
+					if ms.key() == k {
+						wantMatched, wantImplicit = true, ms.Implicit
+						break
+					}
+				}
+			}
+			gotMatched, gotImplicit := m.Match(s)
+			if gotMatched != wantMatched || gotImplicit != wantImplicit {
+				t.Fatalf("requester (%q, %q), subject %+v: Match=(%v, implicit %v); membership of the visited set=(%v, implicit %v)",
+					username, groups, s, gotMatched, gotImplicit, wantMatched, wantImplicit)
+			}
+			if gotMatched {
+				matchedPairs++
+				if gotImplicit {
+					implicitPairs++
+				}
+			}
+		}
+	}
+	for _, u := range names {
+		check(u, nil)
+		for _, g := range names {
+			check(u, []string{g})
+		}
+		for i := 0; i < 40; i++ {
+			gs := make([]string, r.Intn(6))
+			for j := range gs {
+				gs[j] = names[r.Intn(len(names))]
+			}
+			check(u, gs)
+		}
+	}
+	t.Logf("requesters=%d subjects=%d matched pairs=%d of which implicit=%d", requesters, len(subjects), matchedPairs, implicitPairs)
+	if matchedPairs < 1000 || implicitPairs < 100 {
+		t.Fatalf("VACUOUS: %d matched pairs, %d implicit", matchedPairs, implicitPairs)
 	}
 }
 
