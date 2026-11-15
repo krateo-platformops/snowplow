@@ -266,6 +266,10 @@ def test_fresh_gates_its_start_as_the_debug_reader_and_probes_as_its_own_user(mo
                 "why": "/debug/vars answered 403: the start gate cannot read snowplow's counters"}
     monkeypatch.setattr(load606, "login", lambda url, user, pw: f"tok:{user}")
     monkeypatch.setattr(load606, "wait_for_customer_load", gate)
+
+    def past_the_gate(*a, **kw):
+        raise AssertionError("the probe ran its phases past a refused start gate")
+    monkeypatch.setattr(load606, "fresh_phases", past_the_gate)
     out = tmp_path / "fresh.jsonl"
     argv = ["fresh", "--mutator", "incluster", "--snowplow-url", "http://s", "--authn-url", "http://a",
             "--user", "scaleuser-0001", "--password", "pw", "--group", "g", "--version", "v", "--plural", "p",
