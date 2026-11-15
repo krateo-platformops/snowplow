@@ -18,6 +18,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -523,6 +524,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// #709 — a stage that failed without continueOnError is reported with
 		// its upstream status (restactions.Resolve returns it typed), as the
 		// widget handler already does for an apiRef error: a 404 stays a 404.
+		//
+		// #1429 — a `resolve: true` stage whose target's TYPE is not installed
+		// is snowplow's own type-not-installed answer, as on every other route:
+		// recognised by objects.Get's Go type, never by a status's shape.
+		var notInstalled *statusdetails.TypeNotInstalledError
+		if errors.As(err, &notInstalled) {
+			response.Encode(wri, notInstalled.Status())
+			return
+		}
 		var statusErr *apierrors.StatusError
 		if errors.As(err, &statusErr) {
 			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))

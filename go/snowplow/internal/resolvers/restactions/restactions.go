@@ -134,7 +134,7 @@ func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction
 			if failure != nil {
 				log.Debug("restaction filter failed after a stage failure",
 					slog.String("stage", failure.Stage), slog.Any("err", jqsupport.SanitizeError(err)))
-				return opts.In, nil, false, failure.StatusError(opts.In.GetNamespace(), opts.In.GetName())
+				return opts.In, nil, false, failure.Err(opts.In.GetNamespace(), opts.In.GetName())
 			}
 			return opts.In, nil, false, fmt.Errorf("unable to resolve filter: %w", jqsupport.SanitizeError(err))
 		}
@@ -148,7 +148,7 @@ func resolve(ctx context.Context, opts ResolveOptions) (ra *templates.RESTAction
 			//   - otherwise no value is a legitimate result: the status is
 			//     JSON null.
 			if failure != nil {
-				return opts.In, nil, false, failure.StatusError(opts.In.GetNamespace(), opts.In.GetName())
+				return opts.In, nil, false, failure.Err(opts.In.GetNamespace(), opts.In.GetName())
 			}
 			s = "null"
 		}

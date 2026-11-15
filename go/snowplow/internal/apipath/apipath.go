@@ -36,6 +36,10 @@ func Reference(field string) string { return fmt.Sprintf("reference field %q", f
 // `client resource "version"`.
 func ClientOption(field string) string { return fmt.Sprintf("client resource %q", field) }
 
+// DiscoveryName is a name the apiserver's own discovery document gives for a
+// resource: `discovery document resource "name"`.
+func DiscoveryName(field string) string { return fmt.Sprintf("discovery document resource %q", field) }
+
 // BadSegmentError is the refusal of a value that is not one apiserver path
 // segment. It names what the value is (What, built by a Source) and the rule,
 // never the value.
