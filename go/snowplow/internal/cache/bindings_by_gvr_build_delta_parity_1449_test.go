@@ -64,12 +64,12 @@ func i1449View() i1449IndexView {
 			v.ByGVR[gr] = i1449SortedIDs(set)
 		}
 	}
-	for rk, set := range idx.byRole {
+	for rk, set := range idx.membersByRole {
 		if len(set) > 0 {
 			v.ByRole[rk] = i1449SortedIDs(set)
 		}
 	}
-	for id, e := range idx.entries {
+	for id, e := range idx.members {
 		v.Entries[string(id)] = append([]subjectKey(nil), e.subjects...)
 	}
 	return v

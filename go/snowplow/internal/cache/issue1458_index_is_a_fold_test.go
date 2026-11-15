@@ -783,105 +783,267 @@ func TestIssue1458_AWatcherStartsTheIndexEmpty(t *testing.T) {
 
 // ── the source guard ─────────────────────────────────────────────────────────
 
-// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot — the index's
-// membership maps (entries, byRole) are written by enrolLocked and unrolLocked
-// alone (and emptied by resetLocked); those are reached only from the binding
-// event hooks' two functions (applyBindingAdd, applyBindingDelete), the test
-// seed and the test reset. A build, a pass or a publish that wrote membership
-// would have to call one of them, or write the maps itself: both fail here.
-func TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot(t *testing.T) {
-	fset := token.NewFileSet()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
+// m1458Fields are the bindings index's membership fields. Their names are
+// unique in the package (checked below), so a reference to them is found by
+// FIELD NAME, whatever the variable holding the index is called.
+var m1458Fields = map[string]bool{"members": true, "membersByRole": true}
+
+// m1458Scan is what the guard reads off the package's production files.
+type m1458Scan struct {
+	files      int
+	declaredIn map[string][]string        // field name -> struct types declaring a field of that name
+	writers    map[string]bool            // functions that write a membership map
+	readers    map[string]bool            // functions that only read them
+	builders   map[string]bool            // functions that build the index struct with those fields
+	escapes    map[string]bool            // functions that hand a membership map to another function
+	callers    map[string]map[string]bool // callee -> callers
+}
+
+// m1458Root strips index expressions and parentheses: idx.membersByRole[rk][id]
+// -> idx.membersByRole.
+func m1458Root(x ast.Expr) ast.Expr {
+	for {
+		switch e := x.(type) {
+		case *ast.IndexExpr:
+			x = e.X
+		case *ast.ParenExpr:
+			x = e.X
+		default:
+			return x
+		}
 	}
-	callers := map[string]map[string]bool{} // callee -> callers
-	writers := map[string]bool{}            // functions that write entries / byRole
-	files := 0
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-			continue
+}
+
+// m1458IsField reports whether x is <anything>.members or <anything>.membersByRole.
+func m1458IsField(x ast.Expr) bool {
+	sel, ok := x.(*ast.SelectorExpr)
+	return ok && m1458Fields[sel.Sel.Name]
+}
+
+// m1458Mentions reports whether x contains a membership field selector.
+func m1458Mentions(x ast.Node) bool {
+	found := false
+	ast.Inspect(x, func(n ast.Node) bool {
+		if e, ok := n.(ast.Expr); ok && m1458IsField(e) {
+			found = true
 		}
-		f, err := parser.ParseFile(fset, e.Name(), nil, 0)
+		return !found
+	})
+	return found
+}
+
+// m1458ScanSource parses Go source (name -> text) as the guard parses the
+// package: every function that mentions a membership field is classified.
+func m1458ScanSource(t *testing.T, sources map[string]string) *m1458Scan {
+	t.Helper()
+	sc := &m1458Scan{declaredIn: map[string][]string{}, writers: map[string]bool{}, readers: map[string]bool{},
+		builders: map[string]bool{}, escapes: map[string]bool{}, callers: map[string]map[string]bool{}}
+	fset := token.NewFileSet()
+	for name, src := range sources {
+		f, err := parser.ParseFile(fset, name, src, 0)
 		if err != nil {
-			t.Fatalf("parse %s: %v", e.Name(), err)
+			t.Fatalf("parse %s: %v", name, err)
 		}
-		files++
+		sc.files++
 		for _, d := range f.Decls {
+			if gd, ok := d.(*ast.GenDecl); ok {
+				for _, spec := range gd.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					st, ok := ts.Type.(*ast.StructType)
+					if !ok {
+						continue
+					}
+					for _, fld := range st.Fields.List {
+						for _, n := range fld.Names {
+							if m1458Fields[n.Name] {
+								sc.declaredIn[n.Name] = append(sc.declaredIn[n.Name], ts.Name.Name)
+							}
+						}
+					}
+				}
+				continue
+			}
 			fn, ok := d.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				continue
 			}
-			isMembership := func(x ast.Expr) bool {
-				// <anything>.entries[...] or <anything>.byRole[...], or the maps themselves
-				if ix, ok := x.(*ast.IndexExpr); ok {
-					x = ix.X
+			fname := fn.Name.Name
+			mentions, writes, builds, escapes := false, false, false, false
+			// aliases: local variables assigned from an expression that
+			// mentions a membership field (set := idx.membersByRole[rk]).
+			aliases := map[string]bool{}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
 				}
-				sel, ok := x.(*ast.SelectorExpr)
-				if !ok || (sel.Sel.Name != "entries" && sel.Sel.Name != "byRole") {
-					return false
+				for i, rhs := range as.Rhs {
+					if !m1458Mentions(rhs) {
+						continue
+					}
+					if len(as.Lhs) == len(as.Rhs) {
+						if id, ok := as.Lhs[i].(*ast.Ident); ok {
+							aliases[id.Name] = true
+						}
+					} else if id, ok := as.Lhs[0].(*ast.Ident); ok {
+						aliases[id.Name] = true // v, ok := idx.members[id]
+					}
 				}
-				recv, ok := sel.X.(*ast.Ident)
-				return ok && recv.Name == "idx"
+				return true
+			})
+			isTarget := func(x ast.Expr) bool {
+				root := m1458Root(x)
+				if m1458IsField(root) {
+					return true
+				}
+				// an alias written THROUGH (alias[k] = v), not re-assigned
+				id, ok := root.(*ast.Ident)
+				return ok && aliases[id.Name] && root != x
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				switch n := n.(type) {
-				case *ast.CallExpr:
-					name := ""
-					switch fun := n.Fun.(type) {
-					case *ast.Ident:
-						name = fun.Name
-					case *ast.SelectorExpr:
-						name = fun.Sel.Name
-					}
-					if name == "delete" && len(n.Args) > 0 && isMembership(n.Args[0]) {
-						writers[fn.Name.Name] = true
-					}
-					if name != "" {
-						if callers[name] == nil {
-							callers[name] = map[string]bool{}
-						}
-						callers[name][fn.Name.Name] = true
+				case *ast.SelectorExpr:
+					if m1458Fields[n.Sel.Name] {
+						mentions = true
 					}
 				case *ast.AssignStmt:
 					for _, lhs := range n.Lhs {
-						if isMembership(lhs) {
-							writers[fn.Name.Name] = true
+						if isTarget(lhs) {
+							writes = true
+						}
+					}
+				case *ast.IncDecStmt:
+					if isTarget(n.X) {
+						writes = true
+					}
+				case *ast.CompositeLit:
+					for _, el := range n.Elts {
+						if kv, ok := el.(*ast.KeyValueExpr); ok {
+							if id, ok := kv.Key.(*ast.Ident); ok && m1458Fields[id.Name] {
+								builds = true
+							}
+						}
+					}
+				case *ast.CallExpr:
+					callee := ""
+					switch fun := n.Fun.(type) {
+					case *ast.Ident:
+						callee = fun.Name
+					case *ast.SelectorExpr:
+						callee = fun.Sel.Name
+					}
+					if callee != "" {
+						if sc.callers[callee] == nil {
+							sc.callers[callee] = map[string]bool{}
+						}
+						sc.callers[callee][fname] = true
+					}
+					for i, arg := range n.Args {
+						root := m1458Root(arg)
+						id, isIdent := root.(*ast.Ident)
+						aliasWhole := isIdent && aliases[id.Name] && root == arg
+						if !m1458IsField(root) && !aliasWhole {
+							continue
+						}
+						switch {
+						case (callee == "delete" && i == 0) || callee == "clear":
+							writes = true
+						case callee == "len":
+						default:
+							// A membership map (or a part of one) handed to
+							// another function: it could write it.
+							escapes = true
 						}
 					}
 				}
 				return true
 			})
+			switch {
+			case writes:
+				sc.writers[fname] = true
+			case escapes:
+				sc.escapes[fname] = true
+			case builds:
+				sc.builders[fname] = true
+			case mentions:
+				sc.readers[fname] = true
+			}
 		}
 	}
-	if files < 50 {
-		t.Fatalf("the guard parsed %d files: it is not looking at the package", files)
+	return sc
+}
+
+func m1458Set(m map[string]bool) string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
 	}
-	set := func(m map[string]bool) string {
-		var out []string
-		for k := range m {
-			out = append(out, k)
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot — the index's
+// membership maps (members, membersByRole) are written by enrolLocked and
+// unrolLocked alone (and emptied by resetLocked); those are reached only from
+// the binding event hooks' functions (applyBindingAdd, applyBindingUpdate,
+// applyBindingDelete), the test seed and the resets. A build, a pass or a
+// publish that wrote membership would have to call one of them, or write the
+// maps itself, through whatever variable: both fail here. Every function that
+// so much as READS the maps is listed, so a new one is looked at.
+func TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
 		}
-		sort.Strings(out)
-		return strings.Join(out, ",")
+		b, err := os.ReadFile(e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[e.Name()] = string(b)
+	}
+	sc := m1458ScanSource(t, sources)
+	if sc.files < 50 {
+		t.Fatalf("the guard parsed %d files: it is not looking at the package", sc.files)
+	}
+	for name := range m1458Fields {
+		if got := sc.declaredIn[name]; len(got) != 1 || got[0] != "bindingsByGVRIndex" {
+			t.Fatalf("a field named %q is declared by %v, want by bindingsByGVRIndex alone: the guard finds the membership "+
+				"maps by field name, so the name must be unique in the package", name, got)
+		}
 	}
 	check := func(what string, got map[string]bool, want ...string) {
 		t.Helper()
 		sort.Strings(want)
-		if set(got) != strings.Join(want, ",") {
-			t.Errorf("%s: [%s], want [%s] — the bindings index's membership has a writer the event hooks do not own (#1458)",
-				what, set(got), strings.Join(want, ","))
+		if m1458Set(got) != strings.Join(want, ",") {
+			t.Errorf("%s: [%s], want [%s] — the bindings index's membership has a writer the event hooks do not own, "+
+				"or a function this guard has not been told about (#1458)", what, m1458Set(got), strings.Join(want, ","))
 		}
 	}
-	check("functions that write the membership maps", writers, "enrolLocked", "resetLocked", "unrolLocked")
-	check("callers of enrolLocked", callers["enrolLocked"], "recordBindingLocked")
-	check("callers of recordBindingLocked", callers["recordBindingLocked"], "SeedBindingsIndexFromSnapshotForTest", "applyBindingAdd")
-	check("callers of unrolLocked", callers["unrolLocked"], "applyBindingDelete")
-	check("callers of applyBindingAdd", callers["applyBindingAdd"], "onBindingAdd", "onBindingUpdate")
-	check("callers of applyBindingDelete", callers["applyBindingDelete"], "onBindingDelete", "onBindingUpdate")
-	check("callers of resetLocked", callers["resetLocked"], "ResetBindingsByGVRIndexForTest", "SeedBindingsIndexFromSnapshotForTest", "beginBindingsIndexForWatcher")
-	check("callers of SeedBindingsIndexFromSnapshotForTest", callers["SeedBindingsIndexFromSnapshotForTest"])
-	check("callers of the hooks' onBindingAdd", callers["onBindingAdd"], "rbacSnapshotEventHandlers")
+	check("functions that WRITE the membership maps", sc.writers, "enrolLocked", "resetLocked", "unrolLocked")
+	check("functions that hand a membership map to another function", sc.escapes)
+	check("functions that build the index", sc.builders, "bindingsByGVRSingleton")
+	check("functions that only READ the membership maps", sc.readers,
+		"AddNavigatedGVR", "BindingsIndexNamesSubjectForTest", "EnumeratePrewarmTargetsForGVR", "IdentityAuthorisedForGVR",
+		"SetNavigatedGVRs", "onRoleRulesChanged", "rebucketLocked", "recordBindingLocked")
+	check("callers of enrolLocked", sc.callers["enrolLocked"], "recordBindingLocked")
+	check("callers of recordBindingLocked", sc.callers["recordBindingLocked"], "SeedBindingsIndexFromSnapshotForTest", "applyBindingAdd", "applyBindingUpdate")
+	check("callers of unrolLocked", sc.callers["unrolLocked"], "applyBindingDelete", "applyBindingUpdate", "recordBindingLocked")
+	check("callers of applyBindingAdd", sc.callers["applyBindingAdd"], "onBindingAdd")
+	check("callers of applyBindingUpdate", sc.callers["applyBindingUpdate"], "onBindingUpdate")
+	check("callers of applyBindingDelete", sc.callers["applyBindingDelete"], "onBindingDelete")
+	check("callers of resetLocked", sc.callers["resetLocked"], "ResetBindingsByGVRIndexForTest", "SeedBindingsIndexFromSnapshotForTest", "beginBindingsIndexForWatcher")
+	check("callers of SeedBindingsIndexFromSnapshotForTest", sc.callers["SeedBindingsIndexFromSnapshotForTest"])
+	check("callers of the hooks' onBindingAdd", sc.callers["onBindingAdd"], "rbacSnapshotEventHandlers")
+	check("callers of the hooks' onBindingUpdate", sc.callers["onBindingUpdate"], "rbacSnapshotEventHandlers")
+	check("callers of the hooks' onBindingDelete", sc.callers["onBindingDelete"], "rbacSnapshotEventHandlers")
 
 	// And no other package's production code stands an index up from the snapshot.
 	var users []string
@@ -903,5 +1065,42 @@ func TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot(t *testing.T
 	}
 	if len(users) != 1 || !strings.HasSuffix(users[0], "internal/cache/bindings_by_gvr.go") {
 		t.Errorf("production files that name SeedBindingsIndexFromSnapshotForTest: %v, want only its definition", users)
+	}
+}
+
+// TestIssue1458_SourceGuardSeesAWriterThroughAnyVariable — the guard's own
+// falsifier: a membership write through a variable that is not called idx, an
+// alias, a delete, a clear and a map handed to another function are each seen.
+func TestIssue1458_SourceGuardSeesAWriterThroughAnyVariable(t *testing.T) {
+	const head = "package cache\n"
+	for _, c := range []struct {
+		name, body string
+		want       string // writer | escape | reader
+	}{
+		{"assign through another variable name", "func f(index *bindingsByGVRIndex, e bindingEntry) { index.members[e.id] = e }", "writer"},
+		{"assign through a field of another struct", "func f(h *holder, e bindingEntry) { h.ix.members[e.id] = e }", "writer"},
+		{"replace the whole map", "func f(x *bindingsByGVRIndex) { x.membersByRole = nil }", "writer"},
+		{"write through an alias", "func f(x *bindingsByGVRIndex, rk string, id bindingID) { set := x.membersByRole[rk]; set[id] = struct{}{} }", "writer"},
+		{"delete", "func f(x *bindingsByGVRIndex, id bindingID) { delete(x.members, id) }", "writer"},
+		{"delete through an alias", "func f(x *bindingsByGVRIndex, rk string, id bindingID) { set := x.membersByRole[rk]; delete(set, id) }", "writer"},
+		{"clear", "func f(x *bindingsByGVRIndex) { clear(x.members) }", "writer"},
+		{"hand the map to another function", "func f(x *bindingsByGVRIndex) { fill(x.members) }", "escape"},
+		{"hand an inner set to another function", "func f(x *bindingsByGVRIndex, rk string) { fill(x.membersByRole[rk]) }", "escape"},
+		{"control: a read", "func f(x *bindingsByGVRIndex, id bindingID) bool { _, ok := x.members[id]; return ok && len(x.membersByRole) > 0 }", "reader"},
+		{"control: a range over an alias", "func f(x *bindingsByGVRIndex, rk string) (n int) { set := x.membersByRole[rk]; for range set { n++ }; return n }", "reader"},
+	} {
+		sc := m1458ScanSource(t, map[string]string{"x.go": head + c.body})
+		got := "nothing"
+		switch {
+		case sc.writers["f"]:
+			got = "writer"
+		case sc.escapes["f"]:
+			got = "escape"
+		case sc.readers["f"]:
+			got = "reader"
+		}
+		if got != c.want {
+			t.Errorf("%s: the guard classifies it as %s, want %s", c.name, got, c.want)
+		}
 	}
 }

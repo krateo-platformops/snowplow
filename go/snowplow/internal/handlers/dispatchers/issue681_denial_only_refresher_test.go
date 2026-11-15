@@ -358,8 +358,8 @@ func TestIssue681_R2_GrantRotates_RefreshDropsThePreGrantCell(t *testing.T) {
 	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
 	denied := e.body(t)
-	if !strings.Contains(denied, "Forbidden") && denied == `{"prior":true}` {
-		t.Fatalf("PRE: the cell must hold the denial-only body: %s", denied)
+	if denied == `{"prior":true}` || !strings.Contains(denied, "forbidden") && !strings.Contains(denied, "Forbidden") {
+		t.Fatalf("PRE: the first refresh must have Put the denial-only body (the denied stage's 403), the cell holds: %s", denied)
 	}
 	sg0 := cache.RBACSubGenForSubject(i677Rep, nil)
 	e.grant(t)

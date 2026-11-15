@@ -32,7 +32,7 @@
 // A FOLD OF EVENTS, NEVER REBUILT (#1458). The index holds two things:
 //
 //   - MEMBERSHIP: which binding names which role, with which subjects
-//     (entries, byRole). It is what a role's rules edit reaches an identity's
+//     (members, membersByRole). It is what a role's rules edit reaches an identity's
 //     cache keys through (onRoleRulesChanged → the sub-generation of the
 //     subjects of the bindings that name the role). It is written by the RBAC
 //     informer event hooks ALONE (bindings_by_gvr_delta.go), from the
@@ -88,6 +88,7 @@ package cache
 
 import (
 	"sync"
+	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -153,7 +154,7 @@ type bindingEntry struct {
 //   - wildcard  = set of bindingEntries whose roleRef carries a `*/*`
 //     get/list rule (cluster-admin). NOT expanded across every GVR — the
 //     per-GVR cohort = byGVR[gr] ∪ wildcard.
-//   - byRole[roleKey] = set of bindingIDs referencing that role — used by
+//   - membersByRole[roleKey] = set of bindingIDs referencing that role — used by
 //     the role-rule-change re-route path to find every binding to
 //     re-resolve when a ClusterRole/Role's rules change.
 //   - entries[id] = the bindingEntry for an id — lets the delta hooks
@@ -163,8 +164,12 @@ type bindingsByGVRIndex struct {
 	mu       sync.RWMutex
 	byGVR    map[groupResource]map[bindingID]struct{}
 	wildcard map[bindingID]struct{}
-	byRole   map[string]map[bindingID]struct{}
-	entries  map[bindingID]bindingEntry
+	// membersByRole and members are the index's MEMBERSHIP (#1458). Their
+	// names are unique in the package on purpose: the source guard
+	// (TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot) finds
+	// every reference to them by field name, whatever the variable is called.
+	membersByRole map[string]map[bindingID]struct{}
+	members       map[bindingID]bindingEntry
 
 	// navigated is the set of GVRs the index buckets are maintained for.
 	// Set by SetNavigatedGVRs; the delta hooks enrol only into these
@@ -187,11 +192,11 @@ var (
 func bindingsByGVRSingleton() *bindingsByGVRIndex {
 	bindingsIndexOnce.Do(func() {
 		bindingsIndexInstance = &bindingsByGVRIndex{
-			byGVR:     map[groupResource]map[bindingID]struct{}{},
-			wildcard:  map[bindingID]struct{}{},
-			byRole:    map[string]map[bindingID]struct{}{},
-			entries:   map[bindingID]bindingEntry{},
-			navigated: map[groupResource]struct{}{},
+			byGVR:         map[groupResource]map[bindingID]struct{}{},
+			wildcard:      map[bindingID]struct{}{},
+			membersByRole: map[string]map[bindingID]struct{}{},
+			members:       map[bindingID]bindingEntry{},
+			navigated:     map[groupResource]struct{}{},
 		}
 	})
 	return bindingsIndexInstance
@@ -357,12 +362,12 @@ func rulesForRoleRef(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef) (
 // unresolvable).
 func (idx *bindingsByGVRIndex) enrolLocked(entry bindingEntry, rules []rbacv1.PolicyRule, rk string) {
 	entry.role = rk
-	idx.entries[entry.id] = entry
+	idx.members[entry.id] = entry
 	if rk != "" {
-		set := idx.byRole[rk]
+		set := idx.membersByRole[rk]
 		if set == nil {
 			set = map[bindingID]struct{}{}
-			idx.byRole[rk] = set
+			idx.membersByRole[rk] = set
 		}
 		set[entry.id] = struct{}{}
 	}
@@ -390,8 +395,12 @@ func (idx *bindingsByGVRIndex) bucketLocked(id bindingID, rules []rbacv1.PolicyR
 }
 
 // recordBindingLocked is the ONE way a binding enters the index (#1449,
-// #1458): the binding ADD / UPDATE event hooks call it. The binding is
-// recorded under the role it names (entries + byRole) whether or not that role
+// #1458): the binding ADD / UPDATE event hooks call it. It is an UPSERT: a
+// binding the index already holds under this id is first removed from where it
+// was filed (its old role, its old buckets), in the same critical section, so
+// the index never files one binding twice and no reader sees it absent. The
+// binding is
+// recorded under the role it names (members + membersByRole) whether or not that role
 // is in snap. A role that is absent has no rules, so THIS function puts the
 // binding in no GVR or wildcard bucket (it grants nothing, and the evaluator,
 // which reads the snapshot and never this index, denies it); it stays reachable
@@ -399,9 +408,13 @@ func (idx *bindingsByGVRIndex) bucketLocked(id bindingID, rules []rbacv1.PolicyR
 // the binding's subjects (onRoleRulesChanged). That holds for the record path
 // only: when a role is DELETED, onRoleRulesChanged re-buckets its bindings
 // under the role's last-known rules, where they stay until the next event on
-// the role or the binding, or the next build (#1457; prewarm targeting only,
-// never keys or authorization). Caller holds idx.mu (write).
+// the role or the binding, or the next prewarm pass's index step, which
+// re-derives the buckets (#1457 item 2; prewarm targeting only, never keys or
+// authorization). Caller holds idx.mu (write).
 func (idx *bindingsByGVRIndex) recordBindingLocked(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
+	if prev, held := idx.members[id]; held {
+		idx.unrolLocked(id, prev.role)
+	}
 	rules, _ := rulesForRoleRef(snap, namespace, ref)
 	idx.enrolLocked(bindingEntry{id: id, subjects: subjects}, rules, roleRefKey(namespace, ref))
 }
@@ -417,11 +430,11 @@ func (idx *bindingsByGVRIndex) unrolLocked(id bindingID, rk string) {
 		delete(set, id)
 	}
 	if rk != "" {
-		if set := idx.byRole[rk]; set != nil {
+		if set := idx.membersByRole[rk]; set != nil {
 			delete(set, id)
 		}
 	}
-	delete(idx.entries, id)
+	delete(idx.members, id)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -445,7 +458,7 @@ func SetNavigatedGVRs(navigatedGVRs []schema.GroupVersionResource) int {
 		idx.navigated[grFromGVR(gvr)] = struct{}{}
 	}
 	idx.rebucketLocked(rbacSnap.Load())
-	return len(idx.entries)
+	return len(idx.members)
 }
 
 // rebucketLocked empties the buckets and enrols every binding the index holds
@@ -454,7 +467,7 @@ func SetNavigatedGVRs(navigatedGVRs []schema.GroupVersionResource) int {
 func (idx *bindingsByGVRIndex) rebucketLocked(snap *RBACSnapshot) {
 	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
 	idx.wildcard = map[bindingID]struct{}{}
-	for id, entry := range idx.entries {
+	for id, entry := range idx.members {
 		rules, _ := rulesForRoleKey(snap, entry.role)
 		idx.bucketLocked(id, rules)
 	}
@@ -491,7 +504,7 @@ func BindingsByGVRIndexBuilt() bool {
 
 // AddNavigatedGVR widens the index's navigated set by one GVR and enrols
 // every already-known binding that grants get/list on it (a CRD discovery
-// widens the navigated surface). Cheap: walks idx.entries once, resolving each
+// widens the navigated surface). Cheap: walks idx.members once, resolving each
 // binding's rules against the snapshot. Buckets only, never membership.
 // Idempotent — a GVR already in navigated is a no-op.
 func AddNavigatedGVR(gvr schema.GroupVersionResource) {
@@ -512,7 +525,7 @@ func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 	// Enrol every known non-wildcard binding that grants this GVR. Wildcard
 	// bindings already cover every GVR (the per-GVR cohort unions wildcard),
 	// so they need no per-GVR enrolment.
-	for id, entry := range idx.entries {
+	for id, entry := range idx.members {
 		if _, isWild := idx.wildcard[id]; isWild {
 			continue
 		}
@@ -603,8 +616,8 @@ func beginBindingsIndexForWatcher() {
 func (idx *bindingsByGVRIndex) resetLocked() {
 	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
 	idx.wildcard = map[bindingID]struct{}{}
-	idx.byRole = map[string]map[bindingID]struct{}{}
-	idx.entries = map[bindingID]bindingEntry{}
+	idx.membersByRole = map[string]map[bindingID]struct{}{}
+	idx.members = map[bindingID]bindingEntry{}
 	idx.navigated = map[groupResource]struct{}{}
 	idx.ready = false
 }
@@ -616,12 +629,20 @@ func (idx *bindingsByGVRIndex) resetLocked() {
 // ready (settling the #682 note, as the first ready does). Returns the number
 // of bindings recorded.
 //
-// Production MUST NOT call this, and no production path does anything like it:
-// membership is written by the event hooks alone (#1458; the source guard
-// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot pins it). A
+// Production CANNOT call this: it panics outside a test binary
+// (testing.Testing), and the source guard
+// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot fails on any
+// production file that names it. It lives in a non-test file only because the
+// tests of three other packages (handlers, handlers/dispatchers, rbac/evaltest)
+// use it and Go has no cross-package test-only export; a build-tagged file
+// would break those packages' untagged test builds. A
 // test that drives a live watcher and seeds from the snapshot must first let
 // the snapshot catch up with the events, or it reproduces #1458 on itself.
 func SeedBindingsIndexFromSnapshotForTest(navigatedGVRs []schema.GroupVersionResource) int {
+	if !testing.Testing() {
+		panic("cache.SeedBindingsIndexFromSnapshotForTest called outside a test binary: the bindings index's " +
+			"membership is written by the RBAC event hooks alone (#1458)")
+	}
 	idx := bindingsByGVRSingleton()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -665,7 +686,7 @@ func BindingsIndexNamesSubjectForTest(kind, namespace, name string) bool {
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	for _, e := range idx.entries {
+	for _, e := range idx.members {
 		for _, s := range e.subjects {
 			if s == want {
 				return true

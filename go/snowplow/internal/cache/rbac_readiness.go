@@ -154,7 +154,17 @@ func rbacSnapshotCompleteExpvar() any {
 		"elapsed_ms":              rbacCompleteElapsedMs(),
 		"unsynced_informers":      unsynced,
 		"initial_publish_pending": st.PublishPending,
+		// #1458: RBAC kinds whose event handler registration was not found;
+		// non-empty keeps the bindings index not ready and the pod NotReady.
+		"missing_handler_registrations": missingHandlersOrEmpty(),
 	}
+}
+
+func missingHandlersOrEmpty() []string {
+	if m := RBACHandlersMissing(); m != nil {
+		return m
+	}
+	return []string{}
 }
 
 // ResetRBACCompleteForTest clears the first-complete instant. Tests only.

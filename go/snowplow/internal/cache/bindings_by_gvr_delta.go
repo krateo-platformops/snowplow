@@ -215,34 +215,41 @@ func onBindingAdd(obj interface{}) {
 // #1458 — the index delta runs on EVERY update, ready or not (membership is
 // written from the first event on); the bumps and both no-op counters wait for
 // ready, as they always did.
+//
+// ONE CRITICAL SECTION (#1458). The old side's removal and the new side's
+// record are applied under a single hold of the index lock
+// (applyBindingUpdate). They used to be two: in between, the binding was in
+// the index under neither side, and a rules edit of its role handled in that
+// gap (the role hooks run on another informer's goroutine) found no binding and
+// bumped no subject. Every update opened the gap, the unchanged re-deliveries a
+// relist sends for every binding included.
 func onBindingUpdate(oldObj, newObj interface{}) {
 	idx := bindingsByGVRSingleton()
 	var oldSide, newSide bindingUpdateSide
-	ready := false
+	var oldRec, newRec bindingRecord
 	if o, ok := asCRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
+		oldRec = bindingRecord{held: true, ref: o.RoleRef, id: crbBindingID(o)}
 		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
+		oldRec = bindingRecord{held: true, namespace: o.Namespace, ref: o.RoleRef, id: rbBindingID(o)}
 		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
 	if o, ok := asCRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		ready = idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
+		newRec = bindingRecord{held: true, ref: o.RoleRef, id: crbBindingID(o), subjects: subj}
 		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		ready = idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
+		newRec = bindingRecord{held: true, namespace: o.Namespace, ref: o.RoleRef, id: rbBindingID(o), subjects: subj}
 		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
-		ready = idx.isReady()
 	}
-	if !ready {
+	if !idx.applyBindingUpdate(oldRec, newRec) {
 		return
 	}
 	if !bindingUpdateSemanticallyUnchanged(oldSide, newSide) {
@@ -363,11 +370,11 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	set := idx.byRole[rk]
+	set := idx.membersByRole[rk]
 	if len(set) == 0 {
 		return
 	}
-	// Snapshot the ids — re-enrol mutates idx.byRole[rk] in place.
+	// Snapshot the ids — re-enrol mutates idx.membersByRole[rk] in place.
 	ids := make([]bindingID, 0, len(set))
 	for id := range set {
 		ids = append(ids, id)
@@ -381,7 +388,7 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 	// dedups a subject bound via multiple referencing bindings.
 	changed := make(map[subjectKey]struct{})
 	for _, id := range ids {
-		entry, present := idx.entries[id]
+		entry, present := idx.members[id]
 		if !present {
 			continue
 		}
@@ -424,6 +431,42 @@ func (idx *bindingsByGVRIndex) applyBindingAdd(namespace string, ref rbacv1.Role
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.recordBindingLocked(snap, namespace, ref, id, subjects)
+	return idx.ready
+}
+
+// bindingRecord is one side of a binding update as the index files it. held is
+// false for a side the hook could not normalise.
+type bindingRecord struct {
+	held      bool
+	namespace string
+	ref       rbacv1.RoleRef
+	id        bindingID
+	subjects  []subjectKey
+}
+
+// bindingUpdateMidHookForTest, when non-nil, runs inside applyBindingUpdate
+// between the removal of the old side and the record of the new one — under
+// the index lock. TEST-ONLY: one atomic load per binding update in production.
+// The #1458 arm uses it to run a role's rules edit exactly there.
+var bindingUpdateMidHookForTest atomic.Pointer[func()]
+
+// applyBindingUpdate replaces a binding's old side by its new side under ONE
+// hold of the write lock: no reader of the index, and no role hook, ever sees
+// the binding absent during an update (#1458). Reports whether the index is
+// ready.
+func (idx *bindingsByGVRIndex) applyBindingUpdate(oldRec, newRec bindingRecord) (ready bool) {
+	snap := rbacSnap.Load()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if oldRec.held {
+		idx.unrolLocked(oldRec.id, roleRefKey(oldRec.namespace, oldRec.ref))
+	}
+	if h := bindingUpdateMidHookForTest.Load(); h != nil {
+		(*h)()
+	}
+	if newRec.held {
+		idx.recordBindingLocked(snap, newRec.namespace, newRec.ref, newRec.id, newRec.subjects)
+	}
 	return idx.ready
 }
 

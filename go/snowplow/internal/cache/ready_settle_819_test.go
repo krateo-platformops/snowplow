@@ -77,7 +77,7 @@ func byRoleLen() int {
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return len(idx.byRole)
+	return len(idx.membersByRole)
 }
 
 func TestIssue819_P1_IncompleteSnapshotAtFlip_IndexIsNotReady(t *testing.T) {

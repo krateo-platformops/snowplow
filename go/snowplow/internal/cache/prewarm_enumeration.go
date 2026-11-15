@@ -173,7 +173,7 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 	// insertion; the boot.go seam signature is unchanged.
 	byIdentity := make(map[string]PrewarmTarget, len(ids))
 	for id := range ids {
-		entry, ok := idx.entries[id]
+		entry, ok := idx.members[id]
 		if !ok {
 			continue
 		}
@@ -354,7 +354,7 @@ func IdentityAuthorisedForGVR(gvr schema.GroupVersionResource, username string, 
 	}
 	match := func(set map[bindingID]struct{}) bool {
 		for id := range set {
-			entry, ok := idx.entries[id]
+			entry, ok := idx.members[id]
 			if !ok {
 				continue
 			}

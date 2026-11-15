@@ -7,6 +7,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // #686 asked that the bindings index never claim to be live over nothing: an
@@ -82,15 +83,11 @@ func TestIssue686_IndexIsNotReadyBeforeTheHandlersAreDelivered(t *testing.T) {
 	}
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
-	byRole := len(idx.byRole["R/tenant-a/reader"])
-	bucket := len(idx.byGVR[grFromGVR(navigated[0])])
+	byRole := len(idx.membersByRole["R/tenant-a/reader"])
 	idx.mu.RUnlock()
 	if byRole != 1 {
 		t.Fatalf("#686: the index is ready and holds %d bindings under the role, want the 1 the informer delivered: "+
 			"the role edit would bump no one", byRole)
-	}
-	if bucket != 1 {
-		t.Fatalf("the navigated set given before ready was lost: byGVR[configmaps]=%d, want 1", bucket)
 	}
 }
 
@@ -125,9 +122,14 @@ func TestIssue686_ReadyRotatesTheEpochExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestIssue686_GVRDiscoveredBeforeReadyIsNotLost — a GVR discovered
-// (AddNavigatedGVR) before the index is ready must have its bindings enrolled
-// once it is. RED when the ready transition does not derive the buckets.
+// TestIssue686_GVRDiscoveredBeforeReadyIsNotLost — a navigated set given
+// (SetNavigatedGVRs) and a GVR discovered (AddNavigatedGVR) before the index is
+// ready must have their bindings enrolled once it is. The hooks are driven
+// directly, in the one order that leaves the READY TRANSITION as the only thing
+// that can enrol them: the bindings are delivered while no snapshot holds their
+// roles (so their ADD buckets nothing), the roles are published, and no role
+// event is handled (the role hooks do nothing before ready). RED when the ready
+// transition does not derive the buckets.
 func TestIssue686_GVRDiscoveredBeforeReadyIsNotLost(t *testing.T) {
 	wait686NoRebuild(t)
 	prev := rbacSnap.Load()
@@ -136,34 +138,62 @@ func TestIssue686_GVRDiscoveredBeforeReadyIsNotLost(t *testing.T) {
 	ResetBindingsByGVRIndexForTest()
 	t.Cleanup(ResetBindingsByGVRIndexForTest)
 
-	SetNavigatedGVRs([]schema.GroupVersionResource{{Group: "", Version: "v1", Resource: "configmaps"}})
+	configmaps := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 	panels := schema.GroupVersionResource{Group: "widgets.example.io", Version: "v1", Resource: "panels"}
-	AddNavigatedGVR(panels) // discovered before ready, with no snapshot
+	SetNavigatedGVRs([]schema.GroupVersionResource{configmaps}) // before ready, with no snapshot
+	AddNavigatedGVR(panels)                                     // discovered before ready, with no snapshot
 
-	role := &rbacv1.Role{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "panel-reader"},
-		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{"widgets.example.io"}, Resources: []string{"panels"}, Verbs: []string{"get", "list"}}},
+	role := func(name, group, resource string) *rbacv1.Role {
+		return &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: name},
+			Rules:      []rbacv1.PolicyRule{{APIGroups: []string{group}, Resources: []string{resource}, Verbs: []string{"get", "list"}}},
+		}
 	}
-	rb := &rbacv1.RoleBinding{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "panel-reader-bind", UID: "rb-686-panels"},
-		Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: "u-686"}},
-		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "panel-reader"},
+	binding := func(name, roleName string) *rbacv1.RoleBinding {
+		return &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: name, UID: types.UID("uid-686-" + name)},
+			Subjects:   []rbacv1.Subject{{Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: "u-686"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: roleName},
+		}
 	}
-	rw := newSnapshotTestWatcher(t, role, rb)
-	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
-		t.Fatal(err)
+	cmBinding, panelBinding := binding("cm-bind", "cm-reader"), binding("panel-bind", "panel-reader")
+	// The bindings are delivered first: no snapshot, so no rules, so no bucket.
+	onBindingAdd(cmBinding)
+	onBindingAdd(panelBinding)
+	bucketed := func(gvr schema.GroupVersionResource) int {
+		idx := bindingsByGVRSingleton()
+		idx.mu.RLock()
+		defer idx.mu.RUnlock()
+		return len(idx.byGVR[grFromGVR(gvr)])
 	}
+	if bucketed(configmaps) != 0 || bucketed(panels) != 0 {
+		t.Fatalf("SETUP: a binding delivered with no snapshot is already in a bucket")
+	}
+	// The complete snapshot is published; the roles' own events are not handled
+	// before ready.
+	rbacSnap.Store(&RBACSnapshot{
+		Synced:           true,
+		RoleBindingsByNS: map[string][]*rbacv1.RoleBinding{"tenant-a": {cmBinding, panelBinding}},
+		RolesByNSName: map[string]*rbacv1.Role{
+			"tenant-a/cm-reader":    role("cm-reader", "", "configmaps"),
+			"tenant-a/panel-reader": role("panel-reader", "widgets.example.io", "panels"),
+		},
+	})
+	onRoleObjectChanged(bumpSrcRoleAdd, role("cm-reader", "", "configmaps"))
+	onRoleObjectChanged(bumpSrcRoleAdd, role("panel-reader", "widgets.example.io", "panels"))
+	if bucketed(configmaps) != 0 || bucketed(panels) != 0 {
+		t.Fatalf("SETUP: a role event handled before ready bucketed a binding")
+	}
+
+	markBindingsIndexReady()
+
 	if !BindingsByGVRIndexBuilt() {
-		t.Fatal("the watcher's initial publish returned and the index is not ready")
+		t.Fatal("markBindingsIndexReady did not make the index ready")
 	}
-	idx := bindingsByGVRSingleton()
-	idx.mu.RLock()
-	_, navigated := idx.navigated[grFromGVR(panels)]
-	enrolled := len(idx.byGVR[grFromGVR(panels)])
-	idx.mu.RUnlock()
-	if !navigated || enrolled == 0 {
-		t.Fatalf("#686: the GVR discovered before ready was lost: navigated=%v byGVR[panels]=%d", navigated, enrolled)
+	if got := bucketed(configmaps); got != 1 {
+		t.Fatalf("#686: the navigated set given before ready was lost: byGVR[configmaps]=%d, want 1", got)
+	}
+	if got := bucketed(panels); got != 1 {
+		t.Fatalf("#686: the GVR discovered before ready was lost: byGVR[panels]=%d, want 1", got)
 	}
 }

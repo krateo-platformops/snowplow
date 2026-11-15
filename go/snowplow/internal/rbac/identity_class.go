@@ -27,11 +27,13 @@ import (
 //     one state, so equal classes at two different times are equal verdicts
 //     too, PROVIDED every subject through which a binding matches the requester
 //     is one the sub-generation folds and the binding is in the role index.
-//     The first holds by construction since #1443 (the fold reads the subjects
-//     the evaluator matches with, cache.SubjectMatcher). The one known
-//     exception to the second (cache.RBACSubGenForSubject states it): until
-//     #1458 lands, a binding that an index rebuild dropped because the
-//     snapshot it read was older than the binding's already-applied event.
+//     Both hold (cache.RBACSubGenForSubject states how). The first since
+//     #1443: the fold and the evaluator read the subjects from one shared
+//     matcher, cache.SubjectMatcher, and parity arms pin that they agree. The
+//     second since #1458: the role index is a fold of the RBAC informers'
+//     events, written by the event hooks alone from the first event on, each
+//     binding update in one critical section; nothing rebuilds it from the
+//     snapshot.
 //
 // Both read the published snapshot / counters; neither is ever logged.
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {

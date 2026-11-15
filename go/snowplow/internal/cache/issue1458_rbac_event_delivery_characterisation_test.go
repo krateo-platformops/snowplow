@@ -426,13 +426,13 @@ func c1458IndexMembership() map[string]string {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	rolesOf := map[bindingID][]string{}
-	for rk, set := range idx.byRole {
+	for rk, set := range idx.membersByRole {
 		for id := range set {
 			rolesOf[id] = append(rolesOf[id], rk)
 		}
 	}
 	out := map[string]string{}
-	for id, e := range idx.entries {
+	for id, e := range idx.members {
 		var subj []string
 		for _, s := range e.subjects {
 			subj = append(subj, s.Kind+":"+s.Namespace+"/"+s.Name)

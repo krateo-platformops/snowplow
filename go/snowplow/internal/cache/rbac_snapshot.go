@@ -1208,23 +1208,39 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 const rbacSnapshotHandlerExtension = "rbac.snapshot_writer"
 
 // rbacHandlerRegistrations returns the registrations of the RBAC snapshot
-// handler on rw's RBAC informers (#1458). Each one's HasSynced means that
-// handler, and so the bindings-index hooks, has been delivered the informer's
-// whole initial list.
-func (rw *ResourceWatcher) rbacHandlerRegistrations() []clientcache.ResourceEventHandlerRegistration {
+// handler on rw's four RBAC informers (#1458), and names every RBAC kind that
+// has none. Each registration's HasSynced means that handler, and so the
+// bindings-index hooks, has been delivered the informer's whole initial list.
+// The index may be marked ready only when missing is empty: a kind with no
+// registration is a kind whose events the index never receives.
+func (rw *ResourceWatcher) rbacHandlerRegistrations() (regs []clientcache.ResourceEventHandlerRegistration, missing []string) {
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
-	var out []clientcache.ResourceEventHandlerRegistration
 	for _, gvr := range rbacTypedGVRs {
-		in := rw.instances[gvr]
-		if in == nil {
+		var reg clientcache.ResourceEventHandlerRegistration
+		if in := rw.instances[gvr]; in != nil {
+			reg = in.extensionRegistration(rbacSnapshotHandlerExtension)
+		}
+		if reg == nil {
+			missing = append(missing, gvr.Resource)
 			continue
 		}
-		if reg := in.extensionRegistration(rbacSnapshotHandlerExtension); reg != nil {
-			out = append(out, reg)
-		}
+		regs = append(regs, reg)
 	}
-	return out
+	return regs, missing
+}
+
+// rbacHandlersMissing names the RBAC kinds whose handler registration was not
+// found when the index was to be marked ready; nil when all four were.
+var rbacHandlersMissing atomic.Pointer[[]string]
+
+// RBACHandlersMissing names the RBAC kinds with no handler registration at the
+// ready mark (the index is then never marked ready, and the pod never Ready).
+func RBACHandlersMissing() []string {
+	if p := rbacHandlersMissing.Load(); p != nil {
+		return append([]string(nil), (*p)...)
+	}
+	return nil
 }
 
 // init registers the typed-RBAC-snapshot handler-extension with the
@@ -1513,7 +1529,25 @@ func waitAndPublishInitialRBACSnapshot(rw *ResourceWatcher) {
 	// for this function to return (#1231), so a pod is never Ready on an
 	// index that is still filling, and the #682 rotation, if owed, lands
 	// before Ready (#819).
-	for _, reg := range rw.rbacHandlerRegistrations() {
+	regs, missing := rw.rbacHandlerRegistrations()
+	if len(missing) > 0 {
+		// FAIL CLOSED. Without all four registrations the index would be
+		// marked ready while a kind's events never reach it: its bindings (or
+		// its roles' edits) would rotate nobody. The index is not marked ready
+		// and this function does not return, so readiness keeps waiting
+		// (rbac_initial_publish_pending) and says which kinds are missing.
+		rbacHandlersMissing.Store(&missing)
+		// log-ctx-waiver: boot: the first RBAC snapshot, published before the pod is ready
+		slog.Error("cache.rbac.handler_registrations_missing",
+			slog.String("subsystem", "cache"),
+			slog.Any("kinds", missing),
+			slog.String("effect", "the bindings index is NOT marked ready and the pod stays NotReady: the RBAC "+
+				"event handler is not registered on every RBAC informer, so the index cannot hold every binding (#1458)"))
+		<-rw.stopCh
+		return
+	}
+	rbacHandlersMissing.Store(nil)
+	for _, reg := range regs {
 		select {
 		case <-reg.HasSyncedChecker().Done():
 		case <-rw.stopCh:
