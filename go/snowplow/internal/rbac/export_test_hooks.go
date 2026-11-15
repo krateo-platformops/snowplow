@@ -27,12 +27,16 @@ func ParseServiceAccountUsernameForTest(u string) (string, string, bool) {
 	return parseServiceAccountUsername(u)
 }
 
-// EffectiveGroupsForTest exposes effectiveGroups, adapted to a (groups,
-// isSA, saNS) signature so the parity test can compare it directly against
-// cache.CohortEffectiveGroupsForTest. It constructs the EvaluateOptions the
-// original reads (only Groups is consulted by effectiveGroups).
+// EffectiveGroupsForTest returns groups plus, for a ServiceAccount of saNS, the
+// two groups Kubernetes places it in (cache.ServiceAccountGroups — the names
+// the shared matcher adds, #1443): the group set the evaluator matches Group
+// subjects with, the apiserver's implicit group aside.
 func EffectiveGroupsForTest(groups []string, isSA bool, saNS string) []string {
-	return effectiveGroups(EvaluateOptions{Groups: groups}, isSA, saNS)
+	if !isSA {
+		return groups
+	}
+	all, ofNS := cache.ServiceAccountGroups(saNS)
+	return append(append(make([]string, 0, len(groups)+2), groups...), all, ofNS)
 }
 
 // CanonicalGroupsHashForTest exposes canonicalGroupsHash (groups_hash.go)

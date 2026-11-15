@@ -4,19 +4,20 @@
 // The class is (binding-set digest, sub-generation). A rules edit leaves the
 // digest alone and is carried only by the sub-generation: the edit bumps the
 // SUBJECTS of every binding that references the role, and a requester's
-// sub-generation moves only if it folds one of those subjects. The evaluator
-// matches a ServiceAccount requester through subjects the fold does not read:
+// sub-generation moves only if it folds one of those subjects. Before the fix the evaluator
+// matched a ServiceAccount requester through subjects the fold did not read:
 //
 //   - Group system:serviceaccounts and Group system:serviceaccounts:<ns>, which
 //     the evaluator adds to every ServiceAccount requester whether or not the
-//     request presents them (rbac/evaluate.go effectiveGroups); the fold reads
+//     request presents them; the fold read
 //     only the presented groups plus the apiserver's implicit group;
 //   - a User-kind subject naming the ServiceAccount's username
 //     (system:serviceaccount:<ns>:<name>), which the evaluator matches like any
-//     other user name (anySubjectMatches); the fold reads the ServiceAccount
+//     other user name (anySubjectMatches); the fold read the ServiceAccount
 //     counter for such a username and never the User one.
 //
-// So a rules edit behind such a binding changes the verdict and rotates nothing.
+// So a rules edit behind such a binding changed the verdict and rotated nothing.
+// Since the fix both read one enumeration (cache.SubjectMatcher).
 //
 // THE ARMS (TestIssue1443_RulesEditBehindEveryMatchedSubjectRotatesTheKey). Two
 // identities hold one binding set, matched through the arm's subject(s). The
