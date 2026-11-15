@@ -77,8 +77,8 @@ const (
 
 // New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first. The one
 // rule it keeps itself is SNAPSHOT.md §3's (isBuiltinGroup): a custom type in discovery has its CRD
-// among the objects, serving the listed version, since everything the fake knows of a custom type it
-// reads from that CRD.
+// among the objects, of that group and plural and serving the listed version, since everything the
+// fake knows of a custom type it reads from that CRD.
 func New(o Options) (*Server, error) {
 	if o.Clock == nil {
 		o.Clock = time.Now
@@ -94,6 +94,10 @@ func New(o Options) (*Server, error) {
 	}
 	s := &Server{o: o, gvs: map[string]map[string]metav1.APIResource{}, custom: map[string]bool{}, store: map[string]map[string]map[string]any{},
 		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}, selectable: map[string][]string{}, crds: map[string]*crdInfo{}}
+	listed, err := listedResources(o.Snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot.json: %w", err)
+	}
 	if err := json.Unmarshal(o.Snapshot, &s.snap); err != nil {
 		return nil, fmt.Errorf("snapshot.json: %w", err)
 	}
@@ -150,8 +154,8 @@ func New(o Options) (*Server, error) {
 			}
 		}
 	}
-	if missing := crdlessTypes(s.snap.Discovery.Resources, objects); len(missing) > 0 {
-		return nil, fmt.Errorf("snapshot.json discovery.resources: custom types (their group is not built in) with no CRD among the objects that serves the listed version: %s", strings.Join(missing, "; "))
+	if missing := crdlessTypes(listed, objects); len(missing) > 0 {
+		return nil, fmt.Errorf("snapshot.json discovery.resources: custom types (their group is not built in) without their CRD among the objects: %s", strings.Join(missing, "; "))
 	}
 	for _, obj := range objects {
 		loc, ok := s.locate(obj)
