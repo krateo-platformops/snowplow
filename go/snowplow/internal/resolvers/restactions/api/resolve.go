@@ -2170,6 +2170,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		// partial result of a request nobody waits for is never stored. Not a
 		// stage failure for the caller (ResolveWithFailure: a caller
 		// cancellation is not one).
+		r.taintNarrow() // #603 PR-2: an errored resolve never narrows its list edges
 		r.stageErrSink.Bump(id, "the request ended before every item was dispatched")
 		r.log.Debug("api stage stopped: the request ended before every item was dispatched",
 			slog.String("name", id), slog.Int("items", len(tmp)))
