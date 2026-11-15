@@ -1722,7 +1722,12 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
                           f"{' (NO ANSWER from the registry)' if res.get('no_answer') else ''}: "
                           + "; ".join(res.get("failures") or ["no reason given"]))
         for x in labels:
-            doc = installer_values.document(env[f"SNOWPLOW_TAG_{x}"], env.get(f"FRONTEND_TAG_{x}", ""))
+            from bench import snowplow_env
+            try:
+                declared = snowplow_env.parse(env.get(f"SNOWPLOW_ENV_{x}", ""))
+            except snowplow_env.Refused as e:
+                raise Refused(f"run {x}: {e}") from None
+            doc = installer_values.document(env[f"SNOWPLOW_TAG_{x}"], env.get(f"FRONTEND_TAG_{x}", ""), declared)
             try:
                 values = ghcr_pull._load_yaml(doc, f"run {x}'s installer values: ") or {}
                 paths = ghcr_pull.private_image_paths(pulled, values, helm)
