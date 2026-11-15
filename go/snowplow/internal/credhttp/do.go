@@ -246,6 +246,32 @@ func WriteBudgetError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
+// DecodeUpstreamStatus reads an UPSTREAM's error body as a Status envelope: its
+// kind, apiVersion, status, message, reason and code, and nothing else. It is
+// nil when the body is not JSON of that shape.
+//
+// #1429 — plumbing's Status carries Details (plumbing#173), which snowplow
+// sets on its OWN answers (a type that is not installed). An upstream's
+// "details" is not part of what snowplow answers: an apiserver's carries the
+// object's name and uid, an external endpoint's can carry anything, and an
+// upstream must never present a cause snowplow did not produce. So the member
+// is taken by a field that shadows Status.Details, accepts any JSON value and
+// is dropped. Without it a body with details would pass them through, and a
+// body whose "details" is not an object would stop decoding as a Status.
+//
+// The one decoder for every place that reads an upstream body into a Status
+// (nonOKEnvelope here, nonOKStatus in the RESTAction stages).
+func DecodeUpstreamStatus(dat []byte) *response.Status {
+	var envelope struct {
+		response.Status
+		Details json.RawMessage `json:"details,omitempty"`
+	}
+	if err := json.Unmarshal(dat, &envelope); err != nil {
+		return nil
+	}
+	return &envelope.Status
+}
+
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
 // answer is ALWAYS a Failure carrying the status line's code (#1088). Before
 // #1088 two shapes read as a success: a JSON body that is not a Status (an
@@ -256,8 +282,8 @@ func WriteBudgetError(w http.ResponseWriter, err error) bool {
 // audited write that the apiserver refused must never be recorded as a success.
 // A Status body keeps its message and reason, as before.
 func nonOKEnvelope(code int, dat []byte) *response.Status {
-	res := &response.Status{}
-	if err := json.Unmarshal(dat, res); err != nil {
+	res := DecodeUpstreamStatus(dat)
+	if res == nil {
 		res = response.New(code, fmt.Errorf("%s", string(dat)))
 	}
 	res.Code = code

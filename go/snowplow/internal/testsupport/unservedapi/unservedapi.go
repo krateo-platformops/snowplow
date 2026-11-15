@@ -20,8 +20,9 @@
 //     anonymous is refused (403 Forbidden Status) on every path.
 //
 // It serves core/v1 configmaps (ns/x, other/x) and pods, and
-// widgets.templates.krateo.io/v1beta1 buttons (ns/x). Nothing else: flexes has
-// no CRD. It also answers /metrics and the pod log and service proxy
+// widgets.templates.krateo.io/v1beta1 buttons (ns/x, plus two widgets with a
+// dependency: needs-uninstalled-type and needs-missing-object). Nothing else:
+// flexes has no CRD, and neither has templates.krateo.io's restactions. It also answers /metrics and the pod log and service proxy
 // subresources, so a request that escaped its resource would SUCCEED here and
 // be seen.
 //
@@ -238,6 +239,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == configmaps+"x" || path == "/api/v1/namespaces/other/configmaps/x":
 		ns := strings.Split(path, "/")[4]
 		json(http.StatusOK, "application/json", `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"`+ns+`"}}`)
+	case path == buttons+"needs-uninstalled-type":
+		// A served widget whose dependency (spec.apiRef, a RESTAction by default) is of a type
+		// this apiserver does not serve.
+		json(http.StatusOK, "application/json", `{"apiVersion":"`+GV+`","kind":"Button","metadata":{"name":"needs-uninstalled-type","namespace":"ns"},`+
+			`"spec":{"apiRef":{"name":"the-dependency","namespace":"ns"}}}`)
+	case path == buttons+"needs-missing-object":
+		// A served widget whose dependency is an object of a SERVED type that does not exist.
+		json(http.StatusOK, "application/json", `{"apiVersion":"`+GV+`","kind":"Button","metadata":{"name":"needs-missing-object","namespace":"ns"},`+
+			`"spec":{"apiRef":{"name":"gone","namespace":"ns","resource":"configmaps","apiVersion":"v1"}}}`)
 	case path == buttons+"x":
 		json(http.StatusOK, "application/json", `{"apiVersion":"`+GV+`","kind":"Button","metadata":{"name":"x","namespace":"ns"}}`)
 	case path == "/apis/"+GV+"/namespaces/ns/buttons":
@@ -247,6 +257,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json(http.StatusNotFound, "application/json", notFoundStatus("buttons", Group, strings.TrimPrefix(path, buttons)))
 	case strings.HasPrefix(path, configmaps) && !strings.Contains(strings.TrimPrefix(path, configmaps), "/"):
 		json(http.StatusNotFound, "application/json", notFoundStatus("configmaps", "", strings.TrimPrefix(path, configmaps)))
+
+	// An access review, as the apiserver answers one: created, allowed.
+	case r.Method == http.MethodPost && path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews":
+		json(http.StatusCreated, "application/json", `{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","metadata":{},"spec":{},"status":{"allowed":true}}`)
 
 	// What a request that escaped its resource would reach.
 	case path == "/metrics":

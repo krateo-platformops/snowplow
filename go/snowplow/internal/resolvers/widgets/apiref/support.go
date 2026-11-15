@@ -2,6 +2,7 @@ package apiref
 
 import (
 	"encoding/json"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -65,6 +66,16 @@ func statusErrorFromResponse(st *response.Status, ref templatesv1.ObjectReferenc
 			},
 		},
 	}
+}
+
+// errorFromResult is the error of a failed objects.Get of the apiRef: the
+// read's own *statusdetails.TypeNotInstalledError when the read decided its
+// type is not installed (#1429), else statusErrorFromResponse of its status.
+func errorFromResult(res objects.Result, ref templatesv1.ObjectReference) error {
+	if res.TypeNotInstalled != nil {
+		return res.TypeNotInstalled
+	}
+	return statusErrorFromResponse(res.Err, ref)
 }
 
 func rawExtensionToMap(raw *runtime.RawExtension) (map[string]any, error) {

@@ -43,9 +43,11 @@ import (
 	jwtutil "github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/unservedapi"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 const i1414Token = "i1414-requester-token"
@@ -381,9 +383,9 @@ func TestIssue1414_WalkTypeNotInstalledKeepsTheHarvestedChild(t *testing.T) {
 // its message as a JSON Status.
 func TestIssue1414_ResolveErrorKeepsADependencysTypeNotInstalled(t *testing.T) {
 	const msg = "The type restactions (templates.krateo.io/v1) is not installed on this cluster."
-	dep := &apierrors.StatusError{ErrStatus: metav1.Status{
-		Status: metav1.StatusFailure, Code: http.StatusFailedDependency, Reason: "FailedDependency", Message: msg,
-	}}
+	depType := schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
+	// objects.Get's own error: its Go type is what makes it this answer (#1429).
+	dep := &statusdetails.TypeNotInstalledError{GVR: depType, Message: msg}
 	rec := httptest.NewRecorder()
 	encodeWidgetResolveError(h1ReqCtx(h1User), rec, fmt.Errorf("apiref resolve templates.krateo.io/restactions/x: %w", dep))
 	if rec.Code != http.StatusFailedDependency {
@@ -393,4 +395,5 @@ func TestIssue1414_ResolveErrorKeepsADependencysTypeNotInstalled(t *testing.T) {
 	if st.Status != metav1.StatusFailure || st.Reason != "FailedDependency" || st.Message != msg {
 		t.Errorf("want Failure/FailedDependency/%q, got %q/%q/%q", msg, st.Status, st.Reason, st.Message)
 	}
+	i1429Details(t, rec, depType.Group, depType.GroupVersion().String(), depType.Resource)
 }

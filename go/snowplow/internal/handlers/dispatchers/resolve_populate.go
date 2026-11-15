@@ -903,7 +903,7 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		// so on. The message text is unchanged ("re-fetch <res>/<name>: <msg>").
 		refetchErr := cache.WrapResolveStage(cache.ResolveStageRefetch,
 			fmt.Sprintf("re-fetch %s/%s", inputs.Resource, inputs.Name),
-			statusErrFromResponse(got.Err))
+			statusErrFromResult(got))
 		//
 		// WHAT EACH CLASS DOES WITH IT (the refresher decides, not this site):
 		//

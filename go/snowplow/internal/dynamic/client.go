@@ -324,12 +324,21 @@ func IsNotServed(err error) bool {
 //   - the document is a 404 (the group/version is not served) or lists no such
 //     resource: *NotServedError. Nothing else is dialled;
 //   - the document lists it: the resource as the document names it. The name
-//     is matched as the mapper matches one (lower-cased, plural or singular),
-//     so a read resolves to the same resource whether the mapper or this
+//     is matched as the mapper matches one: without regard to case, and a
+//     plural before a singular, over the WHOLE document, so an entry whose
+//     singular is the request never wins over another entry whose plural is.
+//     A read thus resolves to the same resource whether the mapper or this
 //     document resolved it, and the path is built from the apiserver's own
 //     name, never from the caller's;
 //   - the document cannot be read (the group's backend is down, the apiserver
 //     is unreachable): that error. An unknown is never "not served".
+//
+// #1426 — THE DOCUMENT'S NAME BECOMES A PATH SEGMENT TOO, so it is held to the
+// same rule as a caller's (apipath.Segment). A CRD's or a built-in's name
+// always passes; only an aggregated API can publish one that does not (a "..",
+// a name with a "/"). Such a document is not usable: the read is refused with
+// that error and nothing is dialled. It is not "not served" either, since the
+// document does list the resource.
 func (uc *unstructuredClient) servedResource(gvr schema.GroupVersionResource) (schema.GroupVersionResource, error) {
 	list, err := uc.discoveryClient.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
 	if apierrors.IsNotFound(err) {
@@ -338,18 +347,31 @@ func (uc *unstructuredClient) servedResource(gvr schema.GroupVersionResource) (s
 	if err != nil {
 		return schema.GroupVersionResource{}, err
 	}
-	want := strings.ToLower(gvr.Resource)
-	if list != nil {
-		for _, r := range list.APIResources {
-			if strings.Contains(r.Name, "/") {
-				continue // a subresource is not a resource
-			}
-			if r.Name == want || (r.SingularName != "" && r.SingularName == want) {
-				return gvr.GroupVersion().WithResource(r.Name), nil
+	if list == nil {
+		return schema.GroupVersionResource{}, &NotServedError{GVR: gvr}
+	}
+	name, listed := "", false
+	for _, r := range list.APIResources { // the plural, over the whole document
+		if strings.EqualFold(r.Name, gvr.Resource) {
+			name, listed = r.Name, true
+			break
+		}
+	}
+	if !listed {
+		for _, r := range list.APIResources { // then the singular
+			if r.SingularName != "" && strings.EqualFold(r.SingularName, gvr.Resource) {
+				name, listed = r.Name, true
+				break
 			}
 		}
 	}
-	return schema.GroupVersionResource{}, &NotServedError{GVR: gvr}
+	if !listed {
+		return schema.GroupVersionResource{}, &NotServedError{GVR: gvr}
+	}
+	if err := apipath.Segment(apipath.DiscoveryName("name"), name); err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("the discovery document of %s is not usable: %w", gvr.GroupVersion(), err)
+	}
+	return gvr.GroupVersion().WithResource(name), nil
 }
 
 func found(el metav1.APIResource, str string) bool {

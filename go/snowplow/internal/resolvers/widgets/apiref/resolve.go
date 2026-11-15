@@ -193,7 +193,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// errors.As. The wrapped chain also preserves the upstream
 		// message + adds a `apiref resolve <group>/<resource>/<name>`
 		// context prefix for log-side observability.
-		statusErr := statusErrorFromResponse(res.Err, opts.ApiRef)
+		statusErr := errorFromResult(res, opts.ApiRef)
 		wrapped := fmt.Errorf("apiref resolve %s/%s/%s: %w",
 			res.GVR.Group, res.GVR.Resource, opts.ApiRef.Name, statusErr)
 		// Falsifier slog WARN: the runtime artifact tester / observer

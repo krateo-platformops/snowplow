@@ -42,6 +42,7 @@ package dispatchers
 import (
 	"context"
 	"errors"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -139,4 +140,16 @@ func statusErrFromResponse(s *response.Status) error {
 			Message: s.Message,
 		},
 	}
+}
+
+// statusErrFromResult is the error of a failed objects.Get: the read's own
+// *statusdetails.TypeNotInstalledError when the read decided its type is not
+// installed (#1429), else statusErrFromResponse of its status. The type is
+// what the widget encoder and the refresher's classifier recognise; a status
+// never stands in for it.
+func statusErrFromResult(got objects.Result) error {
+	if got.TypeNotInstalled != nil {
+		return got.TypeNotInstalled
+	}
+	return statusErrFromResponse(got.Err)
 }
