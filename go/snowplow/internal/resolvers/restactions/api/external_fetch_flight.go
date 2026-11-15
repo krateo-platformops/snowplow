@@ -20,9 +20,9 @@
 // backoff, connect cut, budget notes, audit observation (credhttp.Answer),
 // retry counters, body handling and conversion. Only when one of ITS attempts
 // reaches the wire does it either start a wire request or wait on an identical
-// one already there. So a wire request has no policy of its own: a customer
-// that shares an attempt background work started gets that attempt's answer
-// and applies the customer rule to it; backoff is always the reader's own.
+// one already there. So a wire request has no policy of its own: background
+// work that shares an attempt a customer started gets that attempt's answer
+// and applies its own retry rule to it; backoff is always the reader's own.
 //
 // THE KEY is the whole outbound request (externalReadKeyOf): the endpoint with
 // every field (server URL, CA, client certificate and key, token, username,
@@ -39,24 +39,26 @@
 // credhttp.SafeMethod, the module's one write classifier) is sent by its own
 // caller: never joined, never joining.
 //
-// WHO MAY JOIN, AND UNTIL WHEN.
-//   - A reader whose context is already done neither starts nor joins: its
-//     attempt goes to the transport below, which sends nothing for a done
-//     context, as without sharing.
-//   - A wire request a CUSTOMER started admits joiners only until that
-//     customer's page-budget deadline (owner ruling 2026-11-15, "join only
-//     young calls"): one request that never answers can cost at most the
-//     readers that arrive within one page budget of it. After that a reader
-//     starts its own, which is what it would have done without sharing. A
-//     slow upstream is therefore NOT converged on by late readers.
-//   - A wire request BACKGROUND work started (no page budget) is never joined
-//     by a customer: it has no page budget to bound the join by, and the
-//     customer's own call is the outcome the rule promises it. Other
-//     background readers join it while the reader that started it still waits.
-//   - Nobody joins after the first response byte (the freshness contract,
-//     external_fetch_cache.go), and nothing is reused after completion.
-//   - A reader's own RETRY never re-joins the attempt it gave up on (a
-//     connect cut): it is sent on its own, as its fresh connection would be.
+// THE JOIN RULE (owner rulings 2026-11-15; joinableLocked is the one place it
+// is decided): a request on the wire is joinable if and only if the reader
+// that started it is still waiting on it AND it is younger than the page
+// budget; a customer never joins a request background work started; a write
+// is never shared; the key is every input that reaches the wire.
+//   - "Younger than the page budget": until the page-budget deadline of the
+//     customer that started it, or, for a request background work started (no
+//     page budget), until pagebudget.PageMaxGoal after it started. So one
+//     request that never answers can cost at most the readers that arrive
+//     within one page budget of it; a slow upstream is NOT converged on by
+//     late readers, who start their own, as without sharing.
+//   - "Still waiting": once its starter has left (its budget ran out, its
+//     client disconnected, its connect was cut), nobody new joins. Readers
+//     already waiting on it stay, unaffected.
+//   - Besides the rule: a reader whose context is already done neither starts
+//     nor joins (the transport below sends nothing for a done context, as
+//     without sharing); nobody joins after the first response byte (the
+//     freshness contract, external_fetch_cache.go) and nothing is reused after
+//     completion; a reader's own RETRY never re-joins the attempt it gave up
+//     on: it is sent on its own, as its fresh connection would be.
 //
 // ITS LIFETIME IS ITS WAITERS'. A reader waits on the wire request under its
 // own attempt's context (its page budget, its client's connection). When the
@@ -64,14 +66,18 @@
 // cancelled and the key freed (owner ruling 2026-11-15, reversing 2026-11-10's
 // "runs to its deadline"): nothing outlives the readers it was sent for.
 //
-// WHAT EACH WAITER GETS. The response's status line and headers (its own
-// copy), and a body that reads the bytes as the wire request receives them,
-// under the waiter's own context. Of a non-2xx answer only the first
-// maxUnstructuredResponseTextBytes are held: all the fetch reads of one. The
-// connection-phase trace events of the wire request (net/http/httptrace: DNS,
-// connect, TLS, got-connection, first byte) are replayed to each joiner's own
-// trace hooks, so the send policy classifies a joiner's attempt (connected or
-// not, the retry cause) from what the shared attempt did.
+// WHAT EACH WAITER GETS. The response's status line, headers and trailers (its
+// own copy), and a body that reads the bytes as the wire request receives
+// them, under the waiter's own context. Of a non-2xx answer only the first
+// maxUnstructuredResponseTextBytes are held: all the fetch reads of one.
+//
+// ONE REQUEST FEEDS EACH INSTRUMENT ONCE. The connection counters and the
+// retry reserve (credhttp connections.go, send.go) listen on the httptrace
+// hooks of the reader that started the request: they count its one connection
+// and time its one answer. A joiner's attempt is only CLASSIFIED by the wire
+// request's connection events (connected or not, the phase it failed in),
+// which reach it through credhttp.ObserveSharedAttempt and never through
+// httptrace: a joiner counts no connection and takes no reserve sample.
 //
 // WHOSE REQUEST IS ON THE WIRE. The reader's that started it, byte for byte
 // what it would have sent alone: its X-Krateo-TraceId, and the W3C traceparent
@@ -91,6 +97,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -105,6 +112,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/rest"
 )
@@ -121,9 +129,12 @@ type externalFlight struct {
 	// none of its cancellation or page budget. cancel ends the wire request.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// joinUntil is the page-budget deadline of the customer that started it;
-	// zero when background work did.
+	// joinUntil is when it stops being "younger than the page budget": the
+	// page-budget deadline of the customer that started it, or
+	// pagebudget.PageMaxGoal after its start when background work did.
 	joinUntil time.Time
+	// customerStarted: a reader with a page budget started it.
+	customerStarted bool
 
 	// Under c.flightsMu.
 	waiters     int
@@ -147,12 +158,12 @@ type externalFlight struct {
 	bodyPanic bool
 	more      chan struct{}
 
-	// The wire request's trace events so far and the joiners' hooks they are
-	// replayed to, under traceMu (held across the hook calls, so a joiner sees
-	// every event once, in order).
+	// The wire request's connection events so far and the joiners' attempt
+	// contexts they are told to, under traceMu (held across the calls, so a
+	// joiner hears every event once, in order).
 	traceMu sync.Mutex
-	events  []func(*httptrace.ClientTrace)
-	traces  []*httptrace.ClientTrace
+	events  []flightEvent
+	joiners []context.Context
 }
 
 // externalWire is one fetch's sharing transport: its attempts start or wait on
@@ -233,7 +244,8 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 	defer w.mu.Unlock()
 	c.flightsMu.Lock()
 	defer c.flightsMu.Unlock()
-	if f := c.flights[w.key]; f != nil && f.joinableLocked(time.Now(), customer) {
+	now := time.Now()
+	if f := c.flights[w.key]; f != nil && f.joinableLocked(now, customer) {
 		if _, again := w.waited[f]; again {
 			return nil, flightOwn
 		}
@@ -241,7 +253,8 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 		w.waited[f] = struct{}{}
 		return f, flightJoin
 	}
-	f := &externalFlight{c: c, key: w.key, waiters: 1, headers: make(chan struct{}), more: make(chan struct{})}
+	f := &externalFlight{c: c, key: w.key, waiters: 1, headers: make(chan struct{}), more: make(chan struct{}),
+		customerStarted: customer, joinUntil: now.Add(pagebudget.PageMaxGoal)}
 	if customer {
 		f.joinUntil = b.Deadline()
 	}
@@ -253,16 +266,17 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 	return f, flightLead
 }
 
-// joinableLocked reports whether a reader arriving now may wait on f (see the
-// file comment, "WHO MAY JOIN"). customer: the reader has a page budget.
+// joinableLocked is THE JOIN RULE (file comment): a reader arriving now may
+// wait on f if and only if f's starter is still waiting on it and f is younger
+// than the page budget, and a customer never joins a request background work
+// started. closed covers what ends joining for good: the first response byte,
+// completion, the last waiter leaving. customer: the arriving reader has a
+// page budget.
 func (f *externalFlight) joinableLocked(now time.Time, customer bool) bool {
-	if f.closed {
-		return false
-	}
-	if !f.joinUntil.IsZero() {
-		return now.Before(f.joinUntil)
-	}
-	return !customer && !f.starterGone
+	return !f.closed &&
+		!f.starterGone &&
+		now.Before(f.joinUntil) &&
+		(f.customerStarted || !customer)
 }
 
 // closeJoins takes f out of its key's slot: no read joins it from here on.
@@ -302,6 +316,10 @@ func (f *externalFlight) leave(starter bool) {
 // own, so no single reader's cancellation ends it while another still waits.
 func (w *externalWire) start(f *externalFlight, req *http.Request) {
 	wreq := req.Clone(httptrace.WithClientTrace(f.ctx, f.trace()))
+	// The request is cancelled by f.ctx alone: a deprecated Cancel channel on
+	// the starter's request (http.Client.Timeout sets one) would end it under
+	// its joiners.
+	wreq.Cancel = nil
 	go f.fly(w.next, wreq)
 }
 
@@ -321,8 +339,14 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 		if unwaited {
 			// Nobody is left to raise it in: counted and logged, never lost.
 			f.c.flightPanicsUnwaited.Add(1)
-			slog.Default().ErrorContext(f.ctx, "external read: the shared request panicked after its last waiter left",
-				slog.String("flight", hex.EncodeToString(f.key[:8])), slog.Any("panic", p))
+			// The value is not ours to predict (a transport's panic can carry a
+			// URL or a header): its type, and its text only when it is an
+			// error, with any URL in it redacted.
+			attrs := []any{slog.String("flight", hex.EncodeToString(f.key[:8])), slog.String("panic_type", fmt.Sprintf("%T", p))}
+			if perr, ok := p.(error); ok {
+				attrs = append(attrs, slog.String("panic", redact.ErrorURL(perr).Error()))
+			}
+			slog.Default().ErrorContext(f.ctx, "external read: the shared request panicked after its last waiter left", attrs...)
 		}
 		// Raised again in every waiter, where a panic in the transport
 		// surfaces without sharing: in the reader's own goroutine.
@@ -382,13 +406,13 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 
 // await waits for f's status line under the reader's own attempt context.
 // led: this reader started f (its own dial span already covers the wait); a
-// joiner records a flight wait and has f's trace events replayed to it.
+// joiner records a flight wait and is told f's connection events (tell).
 func (f *externalFlight) await(req *http.Request, led bool) (*http.Response, error) {
 	ctx := req.Context()
 	var span slowcall.Span
 	if !led {
 		span = slowcall.StartWait(ctx, slowcall.PhaseFlightWait, "external_flight", hex.EncodeToString(f.key[:]), "")
-		f.replayTo(httptrace.ContextClientTrace(ctx))
+		f.tell(ctx)
 	}
 	select {
 	case <-f.headers:
@@ -403,9 +427,10 @@ func (f *externalFlight) await(req *http.Request, led bool) (*http.Response, err
 			return nil, f.err
 		}
 		span.End()
-		// The reader's own copy of the status line and headers.
+		// The reader's own copy of the status line, headers and trailers.
 		resp := *f.resp
 		resp.Header = f.resp.Header.Clone()
+		resp.Trailer = f.resp.Trailer.Clone()
 		resp.Request = req
 		resp.Body = &externalFlightBody{f: f, ctx: ctx, starter: led}
 		return &resp, nil
@@ -460,115 +485,52 @@ func (b *externalFlightBody) Close() error {
 	return nil
 }
 
+// flightEvent is one connection-phase event of the wire request, as a joined
+// attempt is classified by it.
+type flightEvent struct {
+	ev     credhttp.SharedAttemptEvent
+	failed bool
+}
+
 // trace is the wire request's own hooks: the freshness contract's first-byte
-// close, and every connection-phase event recorded for the joiners. The hooks
-// of the reader that started it are already on f.ctx and run natively.
-// WroteHeaderField is not forwarded: a joiner is never handed another
-// request's header values.
+// close, and the connection-phase events its joiners' attempts are classified
+// by. The hooks of the reader that started it are already on f.ctx and run
+// natively: that is where the connection is counted and the answer timed,
+// once.
 func (f *externalFlight) trace() *httptrace.ClientTrace {
-	emit := func(ev func(*httptrace.ClientTrace)) {
+	emit := func(ev credhttp.SharedAttemptEvent, failed bool) {
 		f.traceMu.Lock()
-		f.events = append(f.events, ev)
-		for _, t := range f.traces {
-			ev(t)
+		f.events = append(f.events, flightEvent{ev, failed})
+		for _, ctx := range f.joiners {
+			credhttp.ObserveSharedAttempt(ctx, ev, failed)
 		}
 		f.traceMu.Unlock()
 	}
 	return &httptrace.ClientTrace{
-		GetConn: func(hostPort string) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.GetConn != nil {
-					t.GetConn(hostPort)
-				}
-			})
-		},
-		GotConn: func(info httptrace.GotConnInfo) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.GotConn != nil {
-					t.GotConn(info)
-				}
-			})
-		},
 		GotFirstResponseByte: func() {
 			// The freshness contract: once response bytes arrive, a read
 			// arriving later would be handed bytes received before it arrived.
 			f.c.closeJoins(f)
-			emit(func(t *httptrace.ClientTrace) {
-				if t.GotFirstResponseByte != nil {
-					t.GotFirstResponseByte()
-				}
-			})
 		},
-		DNSStart: func(info httptrace.DNSStartInfo) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.DNSStart != nil {
-					t.DNSStart(info)
-				}
-			})
-		},
-		DNSDone: func(info httptrace.DNSDoneInfo) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.DNSDone != nil {
-					t.DNSDone(info)
-				}
-			})
-		},
-		ConnectStart: func(network, addr string) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.ConnectStart != nil {
-					t.ConnectStart(network, addr)
-				}
-			})
-		},
-		ConnectDone: func(network, addr string, err error) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.ConnectDone != nil {
-					t.ConnectDone(network, addr, err)
-				}
-			})
-		},
-		TLSHandshakeStart: func() {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.TLSHandshakeStart != nil {
-					t.TLSHandshakeStart()
-				}
-			})
-		},
-		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.TLSHandshakeDone != nil {
-					t.TLSHandshakeDone(state, err)
-				}
-			})
-		},
-		WroteHeaders: func() {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.WroteHeaders != nil {
-					t.WroteHeaders()
-				}
-			})
-		},
-		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			emit(func(t *httptrace.ClientTrace) {
-				if t.WroteRequest != nil {
-					t.WroteRequest(info)
-				}
-			})
-		},
+		DNSStart:          func(httptrace.DNSStartInfo) { emit(credhttp.SharedDNSStart, false) },
+		DNSDone:           func(i httptrace.DNSDoneInfo) { emit(credhttp.SharedDNSDone, i.Err != nil) },
+		ConnectStart:      func(_, _ string) { emit(credhttp.SharedConnectStart, false) },
+		ConnectDone:       func(_, _ string, err error) { emit(credhttp.SharedConnectDone, err != nil) },
+		TLSHandshakeStart: func() { emit(credhttp.SharedTLSStart, false) },
+		TLSHandshakeDone:  func(_ tls.ConnectionState, err error) { emit(credhttp.SharedTLSDone, err != nil) },
+		GotConn:           func(httptrace.GotConnInfo) { emit(credhttp.SharedGotConn, false) },
+		WroteHeaders:      func() { emit(credhttp.SharedWroteHeaders, false) },
 	}
 }
 
-// replayTo hands a joiner's hooks every event f's wire request has had, then
-// keeps them for the events to come.
-func (f *externalFlight) replayTo(t *httptrace.ClientTrace) {
-	if t == nil {
-		return
-	}
+// tell gives a joiner's attempt (on ctx) every connection event f's wire
+// request has had, then keeps it for the events to come.
+func (f *externalFlight) tell(ctx context.Context) {
 	f.traceMu.Lock()
-	for _, ev := range f.events {
-		ev(t)
+	for _, e := range f.events {
+		credhttp.ObserveSharedAttempt(ctx, e.ev, e.failed)
 	}
-	f.traces = append(f.traces, t)
+	f.joiners = append(f.joiners, ctx)
 	f.traceMu.Unlock()
 }
 
@@ -580,6 +542,13 @@ var exactEndpointKeyOf = credhttp.ExactEndpointKeyOf
 // httpFetchConverting sends besides the per-request correlation headers (see
 // the file comment). ok=false for a write, and for a request whose endpoint the
 // key cannot fold exactly: neither is shared.
+//
+// NO TWO REQUESTS CAN FOLD TO THE SAME BYTES, BY CONSTRUCTION. The components
+// are written in one fixed order. A string is written as its length then its
+// bytes; a list as its count then its elements; something that may be absent
+// as a presence byte then, when present, its value. So no value can be read
+// as another component, as a separator, or as "absent": there is no sentinel
+// text anywhere.
 func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (externalFlightKey, bool) {
 	var k externalFlightKey
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
@@ -587,18 +556,20 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 		return k, false
 	}
 	// The provenance httpClientForEndpoint and httpFetchConverting read from
-	// ctx: each changes the chain built or the headers sent.
+	// ctx: each changes the chain built or the headers sent. Always the same
+	// four inputs, each its own length-prefixed element of the endpoint key
+	// (credhttp.EndpointKeyOf): the held mark, the #443 inert flag (an inert
+	// read already differs by its cache.InertHeader; the flag is folded too,
+	// so the wire request's ctx, its starter's, is never inert for a joiner
+	// that is not), the ServiceAccount-dial mark, and the token file such a
+	// dial reads (empty otherwise).
 	held, saDial := credhttp.HeldCredential(ctx), cache.ServiceAccountDialFromContext(ctx)
-	// #443 — an inert (dry-run) read already differs by its cache.InertHeader;
-	// the flag is folded too, so the wire request's ctx (its starter's) is
-	// never inert for a joiner that is not, or the reverse.
-	prov := []string{"held=" + boolString(held), "inert=" + boolString(cache.Inert(ctx))}
+	saTokenFile := ""
 	if saDial {
-		// Present exactly on a ServiceAccount dial, so it folds the dial's
-		// mark and the token file it reads in one input.
-		prov = append(prov, "sa-token-file:"+dynamic.ServiceAccountTokenFile())
+		saTokenFile = dynamic.ServiceAccountTokenFile()
 	}
-	epKey, exact := exactEndpointKeyOf(opts.Endpoint, prov...)
+	epKey, exact := exactEndpointKeyOf(opts.Endpoint,
+		"held="+boolString(held), "inert="+boolString(cache.Inert(ctx)), "sa-dial="+boolString(saDial), "sa-token-file="+saTokenFile)
 	if !exact {
 		return k, false
 	}
@@ -609,39 +580,45 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 
 	h := sha256.New()
 	var n [8]byte
-	put := func(s string) {
-		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
-		h.Write(n[:])
-		h.Write([]byte(s))
-	}
 	putCount := func(c int) {
 		binary.BigEndian.PutUint64(n[:], uint64(c))
 		h.Write(n[:])
 	}
-	put("external-read/v3")
-	h.Write(epKey[:])
-	put(verb)
-	put(credhttp.RequestURL(serverURL, opts.Path))
+	putString := func(s string) {
+		putCount(len(s))
+		h.Write([]byte(s))
+	}
+	putPresent := func(present bool) {
+		if present {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+	}
+	putStrings := func(ss []string) {
+		putCount(len(ss))
+		for _, s := range ss {
+			putString(s)
+		}
+	}
+	putString("external-read/v4") // the layout's version
+	h.Write(epKey[:])             // fixed length
+	putString(verb)
+	putString(credhttp.RequestURL(serverURL, opts.Path))
 	// Every header, in order: a later duplicate overrides an earlier one on
 	// the wire, so the order is part of the request.
-	putCount(len(opts.Headers))
-	for _, hd := range opts.Headers {
-		put(hd)
-	}
-	if opts.Payload == nil {
-		put("payload:none")
-	} else {
-		put("payload:" + *opts.Payload)
+	putStrings(opts.Headers)
+	putPresent(opts.Payload != nil)
+	if opts.Payload != nil {
+		putString(*opts.Payload)
 	}
 	// #615 — the impersonation a branch-E dial is sent as.
-	if imp, ok := ctx.Value(endpointImpersonationKey{}).(rest.ImpersonationConfig); ok {
-		put("impersonate")
-		put(imp.UserName)
-		put(imp.UID)
-		putCount(len(imp.Groups))
-		for _, g := range imp.Groups {
-			put(g)
-		}
+	imp, impersonated := ctx.Value(endpointImpersonationKey{}).(rest.ImpersonationConfig)
+	putPresent(impersonated)
+	if impersonated {
+		putString(imp.UserName)
+		putString(imp.UID)
+		putStrings(imp.Groups)
 		keys := make([]string, 0, len(imp.Extra))
 		for ek := range imp.Extra {
 			keys = append(keys, ek)
@@ -649,14 +626,9 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 		slices.Sort(keys)
 		putCount(len(keys))
 		for _, ek := range keys {
-			put(ek)
-			putCount(len(imp.Extra[ek]))
-			for _, v := range imp.Extra[ek] {
-				put(v)
-			}
+			putString(ek)
+			putStrings(imp.Extra[ek])
 		}
-	} else {
-		put("no-impersonation")
 	}
 	h.Sum(k[:0])
 	return k, true

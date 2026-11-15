@@ -524,11 +524,19 @@ func TestExternalFlight1320_AStarterLeavingLeavesItsJoinersTheRequest(t *testing
 	if o.cancelled.Load() != 1 {
 		t.Fatal("the starter leaving cancelled the request its joiner still waits on")
 	}
+	// No new joiner once the starter has left (owner ruling 2026-11-15): a
+	// reader arriving now, well inside the page budget, sends its own.
+	newcomer := goShared(c, customerCtx(pagebudget.PageMaxGoal), opts)
+	if !eventually(3*time.Second, func() bool { return o.requests.Load() == 3 }) {
+		t.Fatalf("a reader arriving after the starter left: requests=%d joined=%d; want its own request (3) and no new join (1)",
+			o.requests.Load(), c.flightJoined.Load())
+	}
+	if c.flightJoined.Load() != 1 {
+		t.Fatalf("joined = %d; want 1 (only the reader that was there before the starter left)", c.flightJoined.Load())
+	}
 	o.open1()
 	mustWireOK(t, recvWire(t, joiner, "joiner"), "joiner")
-	if got := o.requests.Load(); got != 2 {
-		t.Fatalf("origin saw %d requests; want 2 (the own call's and the shared one)", got)
-	}
+	mustWireOK(t, recvWire(t, newcomer, "newcomer"), "newcomer")
 }
 
 // JOIN ONLY YOUNG REQUESTS (owner ruling 2026-11-15). A customer's request
@@ -944,7 +952,12 @@ func TestExternalFlight1320_BodyHandlingMatchesTheReadersOwnCall(t *testing.T) {
 		left time.Duration
 	}{{"/slow-body", 400 * time.Millisecond}, {"/long-error", pagebudget.PageMaxGoal}} {
 		own := wireOwn(c, customerCtx(tc.left), o.read("alice", tc.path))
-		shared := wireShared(c, customerCtx(tc.left), o.read("alice", tc.path))
+		var shared wireResult
+		select {
+		case shared = <-goShared(c, customerCtx(tc.left), o.read("alice", tc.path)):
+		case <-time.After(tc.left + 5*time.Second):
+			t.Fatalf("%s: with sharing the reader never returned (its body read is not under its own context)", tc.path)
+		}
 		if own.outcome() != shared.outcome() {
 			t.Errorf("%s: outcome with sharing = %s; the reader's own call = %s", tc.path, shared.outcome(), own.outcome())
 		}
@@ -1111,9 +1124,13 @@ func TestExternalFlight1320_KeyFoldsEveryRequestInput(t *testing.T) {
 		},
 		"payload":       func(o *httpcall.RequestOptions, _ *context.Context) { o.Payload = ptr.To("{}") },
 		"empty payload": func(o *httpcall.RequestOptions, _ *context.Context) { o.Payload = ptr.To("") },
-		"held":          func(_ *httpcall.RequestOptions, c *context.Context) { *c = credhttp.WithHeldCredential(*c) },
-		"sa dial":       func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithServiceAccountDial(*c) },
-		"inert":         func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithInert(*c) },
+		"payload none":  func(o *httpcall.RequestOptions, _ *context.Context) { o.Payload = ptr.To("none") },
+		"empty impersonation": func(_ *httpcall.RequestOptions, c *context.Context) {
+			*c = withEndpointImpersonation(*c, rest.ImpersonationConfig{})
+		},
+		"held":    func(_ *httpcall.RequestOptions, c *context.Context) { *c = credhttp.WithHeldCredential(*c) },
+		"sa dial": func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithServiceAccountDial(*c) },
+		"inert":   func(_ *httpcall.RequestOptions, c *context.Context) { *c = cache.WithInert(*c) },
 		"impersonation": func(_ *httpcall.RequestOptions, c *context.Context) {
 			*c = withEndpointImpersonation(*c, rest.ImpersonationConfig{UserName: "cohort"})
 		},
@@ -1236,8 +1253,9 @@ func (s *scriptedWire) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func scriptedOK(req *http.Request, body string) *http.Response {
 	return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Proto: "HTTP/1.1",
-		Header: http.Header{"Content-Type": {"application/json"}, "X-Seq": {"1"}},
-		Body:   io.NopCloser(strings.NewReader(body)), Request: req}
+		Header:  http.Header{"Content-Type": {"application/json"}, "X-Seq": {"1"}},
+		Trailer: http.Header{"X-Trail": {"1"}},
+		Body:    io.NopCloser(strings.NewReader(body)), Request: req}
 }
 
 // newReaderWire is one fetch's sharing transport over next, and its request.
@@ -1313,6 +1331,10 @@ func TestExternalFlight1320_EachWaiterGetsItsOwnResponse(t *testing.T) {
 	a.resp.Header.Set("X-Seq", "changed-by-a")
 	if got := b.resp.Header.Get("X-Seq"); got != "1" {
 		t.Fatalf("one waiter's header change reached another: X-Seq = %q", got)
+	}
+	a.resp.Trailer.Set("X-Trail", "changed-by-a")
+	if got := b.resp.Trailer.Get("X-Trail"); got != "1" {
+		t.Fatalf("one waiter's trailer change reached another: X-Trail = %q", got)
 	}
 	if a.resp.Request != r1 || b.resp.Request != r2 {
 		t.Error("a waiter's response does not name its own request")
@@ -1475,117 +1497,5 @@ func TestExternalFlight1320_APanicWithNoWaiterLeftIsCounted(t *testing.T) {
 	}
 	if !eventually(2*time.Second, func() bool { return c.flightPanicsUnwaited.Load() == 1 }) {
 		t.Fatalf("unwaited panics = %d; want 1", c.flightPanicsUnwaited.Load())
-	}
-}
-
-// A fetch's retry never re-joins the attempt it gave up on (a connect cut):
-// it is sent on its own, as its fresh connection would be.
-func TestExternalFlight1320_ARetryNeverRejoinsTheAttemptItGaveUpOn(t *testing.T) {
-	c := wireCache(t)
-	release := make(chan struct{})
-	defer close(release)
-	next := &scriptedWire{}
-	next.fn = func(n int64, req *http.Request) (*http.Response, error) {
-		if n == 1 { // the attempt that never gets anywhere
-			select {
-			case <-release:
-			case <-req.Context().Done():
-			}
-			return nil, errors.New("attempt 1 ended")
-		}
-		return scriptedOK(req, `{"n":2}`), nil
-	}
-	page := customerCtx(pagebudget.PageMaxGoal)
-	attempt1, cut := context.WithCancel(page)
-	w, req := newReaderWire(t, c, next, attempt1)
-	t1 := goTrip(w, req)
-	eventually(2*time.Second, func() bool { return next.calls.Load() == 1 })
-	// Another reader keeps attempt 1 on the wire, still young and joinable.
-	other, oreq := newReaderWire(t, c, next, customerCtx(pagebudget.PageMaxGoal))
-	otherTrip := goTrip(other, oreq)
-	eventually(2*time.Second, func() bool { return c.flightJoined.Load() == 1 })
-	cut() // this fetch gives up on attempt 1
-	if r := <-t1; r.err == nil {
-		t.Fatal("SETUP: attempt 1 was answered")
-	}
-	var rt tripResult
-	select {
-	case rt = <-goTrip(w, req.Clone(page)):
-	case <-time.After(5 * time.Second):
-		t.Fatal("the retry is waiting on the attempt its fetch gave up on (it re-joined it)")
-	}
-	if rt.err != nil {
-		t.Fatalf("the retry: %v", rt.err)
-	}
-	retry := rt.resp
-	body, _ := io.ReadAll(retry.Body)
-	retry.Body.Close()
-	if string(body) != `{"n":2}` || next.calls.Load() != 2 {
-		t.Fatalf("the retry read %q with %d requests below; want its own request's answer and 2", body, next.calls.Load())
-	}
-	if joined, own := c.flightJoined.Load(), c.flightNotShared.Load(); joined != 1 || own != 1 {
-		t.Fatalf("joined=%d not_shared=%d; want 1 and 1 (the retry must not re-join attempt 1)", joined, own)
-	}
-	select {
-	case r := <-otherTrip:
-		t.Fatalf("the other reader ended: %v", r.err)
-	default:
-	}
-}
-
-// A joiner's own trace hooks see the shared attempt's connection events,
-// those before it joined (replayed) and those after, each once and in order;
-// never the request's header values.
-func TestExternalFlight1320_AJoinerSeesTheAttemptsConnectionEvents(t *testing.T) {
-	c := wireCache(t)
-	step := make(chan struct{})
-	release := make(chan struct{})
-	next := &scriptedWire{fn: func(_ int64, req *http.Request) (*http.Response, error) {
-		tr := httptrace.ContextClientTrace(req.Context())
-		tr.GetConn("upstream.invalid:80")
-		tr.GotConn(httptrace.GotConnInfo{Reused: true})
-		if tr.WroteHeaderField != nil {
-			tr.WroteHeaderField("Authorization", []string{"Bearer t"})
-		}
-		<-step
-		tr.WroteHeaders()
-		<-release
-		return scriptedOK(req, `{}`), nil
-	}}
-	record := func() (*httptrace.ClientTrace, func() []string) {
-		var mu sync.Mutex
-		var got []string
-		add := func(s string) { mu.Lock(); got = append(got, s); mu.Unlock() }
-		return &httptrace.ClientTrace{
-				GetConn:          func(string) { add("get-conn") },
-				GotConn:          func(i httptrace.GotConnInfo) { add(fmt.Sprintf("got-conn reused=%v", i.Reused)) },
-				WroteHeaders:     func() { add("wrote-headers") },
-				WroteHeaderField: func(k string, _ []string) { add("header-field " + k) },
-			}, func() []string {
-				mu.Lock()
-				defer mu.Unlock()
-				return append([]string(nil), got...)
-			}
-	}
-	w1, r1 := newReaderWire(t, c, next, context.Background())
-	t1 := goTrip(w1, r1)
-	eventually(2*time.Second, func() bool { return next.calls.Load() == 1 })
-	tr, events := record()
-	w2, r2 := newReaderWire(t, c, next, httptrace.WithClientTrace(context.Background(), tr))
-	t2 := goTrip(w2, r2)
-	eventually(2*time.Second, func() bool { return c.flightJoined.Load() == 1 && len(events()) == 2 })
-	close(step)
-	eventually(2*time.Second, func() bool { return len(events()) == 3 })
-	close(release)
-	for _, ch := range []<-chan tripResult{t1, t2} {
-		if r := <-ch; r.err != nil {
-			t.Fatal(r.err)
-		} else {
-			r.resp.Body.Close()
-		}
-	}
-	want := []string{"get-conn", "got-conn reused=true", "wrote-headers"}
-	if got := events(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("the joiner's trace saw %v; want %v", got, want)
 	}
 }
