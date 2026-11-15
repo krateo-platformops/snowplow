@@ -235,6 +235,22 @@ func (m SubjectMatcher) Visit(visit func(MatchedSubject) bool) {
 // among the subjects Visit yields, with the first such entry's Implicit" over
 // generated requesters and subjects, so the two cannot drift.
 func (m SubjectMatcher) Match(s rbacv1.Subject) (matched, implicit bool) {
+	return m.match(&s)
+}
+
+// MatchAny reports whether the requester matches one of a binding's subjects:
+// Match over each of them, without copying a subject or the matcher per test.
+func (m *SubjectMatcher) MatchAny(subjects []rbacv1.Subject) bool {
+	for i := range subjects {
+		if matched, _ := m.match(&subjects[i]); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// match is Match's body, on pointers: the evaluator's inner loop.
+func (m *SubjectMatcher) match(s *rbacv1.Subject) (matched, implicit bool) {
 	switch s.Kind {
 	case rbacv1.UserKind:
 		return m.username != "" && s.Name == m.username, false

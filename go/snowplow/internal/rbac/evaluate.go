@@ -467,6 +467,9 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
 	//    permits override namespace scope. Sort in stable order
 	//    (design §6) so the first-match BindingUID is deterministic.
+	// The requester's matcher is built ONCE per evaluation and tested against
+	// every candidate binding (#1443).
+	who := subjectMatcher(opts)
 	crbCandidates := selectCRBCandidates(snap, opts)
 	// The stable sort exists ONLY to make the returned matchedBindingUID
 	// deterministic; the verdict is order-independent (first match wins,
@@ -479,7 +482,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 		// walk when no subject matches. The index already narrowed
 		// the candidate set; this matcher is the post-lookup
 		// correctness gate.
-		if !anySubjectMatches(crb.Subjects, opts) {
+		if !anySubjectMatches(&who, crb.Subjects) {
 			continue
 		}
 		permits, err := roleRefPermits(ctx, snap, "", crb.RoleRef, opts, log)
@@ -501,7 +504,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 			sortRBsStable(rbCandidates)
 		}
 		for _, rb := range rbCandidates {
-			if !anySubjectMatches(rb.Subjects, opts) {
+			if !anySubjectMatches(&who, rb.Subjects) {
 				continue
 			}
 			permits, err := roleRefPermits(ctx, snap, opts.Namespace, rb.RoleRef, opts, log)
@@ -997,14 +1000,11 @@ func stringSliceMatches(allowed []string, want string) bool {
 // The identity class folds the sub-generation of exactly the same set
 // (cache.RBACSubGenForSubject), so a binding that can move a verdict here
 // always rotates the requester's key.
-func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
-	m := subjectMatcher(opts)
-	for _, s := range subjects {
-		if matched, _ := m.Match(s); matched {
-			return true
-		}
-	}
-	return false
+//
+// who is the requester's matcher (subjectMatcher), built once by the caller for
+// all the bindings it tests.
+func anySubjectMatches(who *cache.SubjectMatcher, subjects []rbacv1.Subject) bool {
+	return who.MatchAny(subjects)
 }
 
 // subjectMatcher is opts' requester as the shared matcher. The ONE place the
