@@ -62,6 +62,9 @@ type SubscriptionRotationTracker struct {
 	// identity class those digests were read under.
 	gated      map[string]*gatedArm
 	gatedClass cache.IdentityClass
+	// viewer (#1430) is ctx's identity as the served-view memo keys it, digested
+	// once for the connection: every gated key and every catch-up check uses it.
+	viewer servedViewer
 }
 
 type trackedArm struct {
@@ -74,7 +77,7 @@ type trackedArm struct {
 // under).
 func NewSubscriptionRotationTracker(ctx context.Context) *SubscriptionRotationTracker {
 	ui, _ := xcontext.UserInfo(ctx)
-	return &SubscriptionRotationTracker{ctx: ctx, ui: ui, keys: map[string]*trackedArm{}}
+	return &SubscriptionRotationTracker{ctx: ctx, ui: ui, keys: map[string]*trackedArm{}, viewer: servedViewerOf(ctx)}
 }
 
 // Derive is DeriveSubscriptionKeyWithReason that also tracks an armed

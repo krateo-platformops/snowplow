@@ -429,6 +429,14 @@ type ResolvedEntry struct {
 	// store lock; putCoreLocked carries it across a replace-in-place.
 	recentHitters atomic.Pointer[[]HitterIdentity]
 
+	// servedViews — #1430: the digests of what each identity is served from
+	// this cell when it is gated per requester, keyed by every input of the
+	// gate (served_view_memo.go). It belongs to the cell's ANSWER: putCoreLocked
+	// carries it across a replace-in-place and the first read for an entry with
+	// another answer drops it. Digests only, never a body; in-memory only,
+	// never logged, exported or copied into ResolvedEntryMeta.
+	servedViews atomic.Pointer[servedViewMemo]
+
 	// TTLOverride — R1 Layer 2 (#36) bounded-staleness backstop. When > 0,
 	// THIS entry expires after TTLOverride instead of the store's standard
 	// ttl. Set to the short CATALOG_UNSERVABLE_TTL_SECONDS when an apistage
@@ -2478,6 +2486,12 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		}
 		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
 			entry.recentHitters.Store(old.entry.recentHitters.Load())
+		}
+		// #1430 — the served-view digests belong to the ANSWER: a re-Put of the
+		// same answer keeps them, and servedViewMemoOf drops them on first use
+		// when the answer differs (no compare under c.mu).
+		if old.entry != nil && old.entry != entry && entry.servedViews.Load() == nil {
+			entry.servedViews.Store(old.entry.servedViews.Load())
 		}
 		// #841 — the seed origin belongs to the KEY too, and only an insert sets
 		// it: a refresh re-Put of a seeded cell keeps counting the hits the seed
