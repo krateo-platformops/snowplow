@@ -46,6 +46,7 @@ func TestReserve1069_R1_ViewedStartsWhileUnviewedSlotsAreBusy(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 9)
 	normal, v := keys[:8], keys[8]
 	gate := make(chan struct{})
@@ -115,6 +116,7 @@ func TestReserve1069_R2_UnviewedNeverHoldsTheLastWorker(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 24)
 	clKeys, normal := keys[:12], keys[12:]
 	var in, maxIn, done atomic.Int32
@@ -215,6 +217,7 @@ func TestReserve1069_R3_ViewedStillCappedAtNMinus1(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 9)
 	viewed, n := keys[:8], keys[8]
 	isViewed := map[string]bool{}
@@ -262,6 +265,7 @@ func TestReserve1069_R4_ReservedWorkerDoesNotSpin(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, p-1+40)
 	long, short := keys[:p-1], keys[p-1:]
 	isLong := map[string]bool{}
@@ -328,6 +332,7 @@ func TestReserve1069_R4b_NoWakeKeyWhenNoWorkerWaitsInTheNormalGet(t *testing.T) 
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 10)
 	short, long, v1, v2 := keys[:5], keys[5:8], keys[8], keys[9]
 	isLong := map[string]bool{}
@@ -387,6 +392,7 @@ func TestReserve1069_R5_SingleWorkerAlternatesStrictly(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 6)
 	n0, v1, v2, n1, n2, n3 := keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]
 	name := map[string]string{n0: "n0", v1: "v1", v2: "v2", n1: "n1", n2: "n2", n3: "n3"}
@@ -444,6 +450,7 @@ func TestReserve1069_R5b_WakeKeyIsNotATurn(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 3)
 	v0, v1, n1 := keys[0], keys[1], keys[2]
 	name := map[string]string{v0: "v0", v1: "v1", n1: "n1"}
@@ -499,6 +506,7 @@ func TestReserve1069_R6_CustomerYieldParksBothTiers(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, p)
 	normal, v := keys[:p-1], keys[p-1]
 	var inflight atomic.Bool
@@ -575,6 +583,7 @@ func TestReserve1069_R7_StatsCountExactly(t *testing.T) {
 	restore := SetDirtyWindowClockForTest(func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now })
 	t.Cleanup(restore)
 	advance := func(d time.Duration) { nowMu.Lock(); now = now.Add(d); nowMu.Unlock() }
+	CompleteRBACSnapshotForTest(t) // the fixture writes the store (#1233)
 	_, keys := terminalFixtureNoReset(t, 5)
 	normal, viewed := keys[:3], keys[3:]
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error { return nil })

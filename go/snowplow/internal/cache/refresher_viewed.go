@@ -303,7 +303,7 @@ const (
 //
 // A worker that may take neither parks on reserveCond: it is the RESERVED worker.
 // It wakes when wakeViewed announces a viewed key (every viewed add, delayed adds
-// included, and a viewed slot release) and on shutdown. It never polls: a park
+// included) and on shutdown. It never polls: a park
 // is one Wait. A worker parks only while the unviewed side is full, which leaves
 // no viewed worker beside it, so every viewed arrival finds it; if a worker
 // leaving an unviewed job takes that key first, the woken one finds the slot
@@ -332,7 +332,7 @@ func (r *refresher) nextDequeue() (key string, tier refreshTier, pick dequeuePic
 			r.normalGetBlocked++ // ended by leftNormalGet
 			return "", tierNormal, pickNormal
 		}
-		if r.reserveStopped || r.queue.ShuttingDown() {
+		if r.queue.ShuttingDown() {
 			return "", tierNormal, pickShutdown
 		}
 		r.viewed.reserveParks.Add(1)
@@ -395,7 +395,8 @@ func (r *refresher) signalReserveLocked() {
 // blocked in its Get. With every viewed slot full it does nothing: a wake would
 // only bring a worker back to a refused viewed probe, the normal Get would hand
 // it the next wake, and so on — a busy spin (architect-623, RUN: ~85% of a core
-// idle). A full reservation is re-woken by the slot release instead.
+// idle). The worker that frees a viewed slot re-probes the viewed tier itself
+// (processNext), so a full reservation needs no wake either.
 //
 // #1069 — no wake key when no worker is blocked in the normal Get: every other
 // worker is in a job or about to probe, and re-probes the viewed tier itself. A
@@ -446,10 +447,10 @@ func (r *refresher) endUnviewed() {
 
 // wakeReservedOnShutdown releases every parked reserved worker when the normal
 // tier shuts down: a worker blocked in a queue's Get learns that from the Get, a
-// parked one only from this.
+// parked one only from this. Called AFTER the queue's ShutDown, so a woken worker
+// (and one that takes priorityGetMu later) reads ShuttingDown and leaves.
 func (r *refresher) wakeReservedOnShutdown() {
 	r.priorityGetMu.Lock()
-	r.reserveStopped = true
 	r.reserveWaiting = 0
 	r.reserveCond.Broadcast()
 	r.priorityGetMu.Unlock()
@@ -457,7 +458,9 @@ func (r *refresher) wakeReservedOnShutdown() {
 
 // shutdownNotifyingQueue is the normal tier's underlying queue: its ShutDown —
 // direct, or the delaying queue's, which shuts down through it — also releases
-// the parked reserved workers (#1069), whoever shuts the queue down.
+// the parked reserved workers (#1069), whoever shuts the queue down. The
+// refresher's tiers are only ever stopped with ShutDown (StartRefresher's ctx
+// goroutine, StopRefresher).
 type shutdownNotifyingQueue struct {
 	workqueue.TypedInterface[string]
 	onShutDown func()
@@ -466,11 +469,6 @@ type shutdownNotifyingQueue struct {
 func (q *shutdownNotifyingQueue) ShutDown() {
 	q.TypedInterface.ShutDown()
 	q.onShutDown()
-}
-
-func (q *shutdownNotifyingQueue) ShutDownWithDrain() {
-	q.onShutDown()
-	q.TypedInterface.ShutDownWithDrain()
 }
 
 // claimInFlight marks key as being re-resolved by this worker (#799 B2). false:

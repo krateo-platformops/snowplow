@@ -288,7 +288,6 @@ type refresher struct {
 	// ones a wake key can reach.
 	normalGetBlocked int
 	reserveWaiting   int
-	reserveStopped   bool
 	reserveCond      sync.Cond
 	inFlightMu       sync.Mutex
 	inFlightKeys     map[string]bool
@@ -983,8 +982,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// #765 idle wake: back to the viewed probe; wake the next idle worker
 			// while more viewed keys wait — but only when the reservation has a
 			// slot for it (#799 B3: re-adding with every slot full made the
-			// reserved worker busy-spin on the wake key). A slot release wakes
-			// again (endViewed). #1069 — the wake key is not a turn: lastViewed
+			// reserved worker busy-spin on the wake key). The worker that frees a
+			// slot re-probes the viewed tier itself. #1069 — the wake key is not a turn: lastViewed
 			// stays as it was, so p=1 alternation counts only real dequeues.
 			r.leftNormalGet(true)
 			r.normalStamps.take(key) // #1070: the wake key is no refresh; drop its stamp
@@ -1003,16 +1002,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	switch tier {
 	case tierViewed:
 		defer func() {
+			// No wake here. The slot just freed, and a mark that landed while this
+			// key was processing is re-queued by Done itself, not through Add; but
+			// this worker goes straight back to nextDequeue, which probes the
+			// viewed tier first with the slot it just released, so whatever waits
+			// is taken by it (at p=1 after one other-tier turn, as alternation
+			// rules). Waking another worker could only move that key to it.
 			r.endViewed()
 			r.viewedQueue.Done(key)
-			// The slot just freed, and a mark that landed while this key was
-			// processing is re-queued by Done itself, not through Add: wake an
-			// idle worker for whatever waits (#799 B3: wake on slot release).
-			// DEFENSIVE: this worker re-probes the viewed tier itself on its next
-			// loop, so no test arm can tell this wake apart (mutation Z2 survives).
-			if r.viewedQueue.Len() > 0 {
-				r.wakeViewed()
-			}
 		}()
 		r.viewed.dequeued.Add(1)
 	case tierClusterList:
