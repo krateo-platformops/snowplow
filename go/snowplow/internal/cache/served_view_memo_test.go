@@ -417,7 +417,10 @@ func TestIssue1430_M10_TheIdentityIsInjectiveAndOrderFree(t *testing.T) {
 		"user/group boundary":         {{"ua", []string{"b"}}, {"u", []string{"ab"}}},
 		"a group that is the user":    {{"u", []string{"g"}}, {"g", []string{"u"}}},
 		"a duplicate group":           {{"u", []string{"a"}}, {"u", []string{"a", "a"}}},
-		"a length-prefix look-alike":  {{"u", []string{"a", "b"}}, {"u", []string{"a\x01\x00\x00\x00\x00\x00\x00\x00b"}}},
+		// Same group count, same bytes once joined by a 0x00: only the
+		// per-group length prefix tells them apart.
+		"a 0x00 moved between two groups": {{"u", []string{"a\x00b", "c"}}, {"u", []string{"a", "b\x00c"}}},
+		"a length-prefix look-alike":      {{"u", []string{"a", "b"}}, {"u", []string{"a\x01\x00\x00\x00\x00\x00\x00\x00b"}}},
 	}
 	for name, pair := range distinct {
 		if ServedViewIdentityOf(pair[0].user, pair[0].groups) == ServedViewIdentityOf(pair[1].user, pair[1].groups) {
