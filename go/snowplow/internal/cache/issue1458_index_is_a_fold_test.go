@@ -672,6 +672,7 @@ func TestIssue1458_ReadinessWaitsForTheIndexToBeReady(t *testing.T) {
 			t.Fatalf("after the LIST returned: index ready=%v readiness complete=%v, want both", BindingsByGVRIndexBuilt(), RBACReadiness().Complete)
 		}
 		c1458DiffMembership(t, "at ready", c1458IndexMembership(), c1458LiveMembership(t, dyn))
+		r1458NoBumpBeforeReady(t)
 		if got := len(EnumeratePrewarmTargetsForGVR(c1458CMGVR, "list")); got == 0 {
 			t.Fatalf("at ready the enumerator answers no prewarm target for a navigated GVR every binding grants")
 		}
@@ -722,7 +723,57 @@ func TestIssue1458_ReadinessWaitsForTheIndexToBeReady(t *testing.T) {
 		}
 		// READY MEANS COMPLETE: read at the moment the initial publish returned.
 		c1458DiffMembership(t, "at ready", c1458IndexMembership(), c1458LiveMembership(t, dyn))
+		r1458NoBumpBeforeReady(t)
 	})
+}
+
+// r1458NoBumpBeforeReady: the bindings delivered before the index was ready
+// recorded no sub-generation bump (bumps stay off until ready, as before
+// #1458), and nothing in an initial list owes the #682 rotation.
+func r1458NoBumpBeforeReady(t *testing.T) {
+	t.Helper()
+	if err := WaitRBACRebuildQuiesceForTest(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := RBACSubGenForSubject("nobody-1458", []string{"g-o-0"}); got != 0 {
+		t.Errorf("the sub-generation of a subject bound only by initial-list bindings is %d at ready, want 0: "+
+			"a binding delivered before ready recorded a bump, or the epoch rotated", got)
+	}
+	if got := RBACSubGenEpoch(); got != 0 {
+		t.Errorf("the #682 epoch is %d after a boot with no RBAC edit, want 0", got)
+	}
+}
+
+// TestIssue1458_AWatcherStartsTheIndexEmpty — the index is a fold of ONE
+// watcher's events: what an earlier watcher's events left in it is not the
+// next watcher's world (production builds one watcher; the test suites build
+// many in one process).
+func TestIssue1458_AWatcherStartsTheIndexEmpty(t *testing.T) {
+	func() {
+		t.Setenv("CACHE_ENABLED", "true")
+		dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			c1458CRBGVR: "ClusterRoleBindingList", c1458CRGVR: "ClusterRoleList", c1458RBGVR: "RoleBindingList",
+			c1458RoleGVR: "RoleList", c1458CMGVR: "ConfigMapList",
+		}, c1458U(t, c1458CR("cr-first", c1458Rules("configmaps"))), c1458U(t, c1458CRB("crb-first", "cr-first", "g-first")))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		first, err := NewResourceWatcher(ctx, dyn)
+		if err != nil {
+			t.Fatalf("NewResourceWatcher: %v", err)
+		}
+		defer first.Stop()
+		if err := first.WaitInitialRBACPublishForTest(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if !BindingsIndexNamesSubjectForTest("Group", "", "g-first") {
+			t.Fatalf("SETUP: the first watcher's binding is not in the index")
+		}
+	}()
+	_, dyn, _ := c1458Watcher(t, false, c1458CR("cr-second", c1458Rules("configmaps")), c1458CRB("crb-second", "cr-second", "g-second"))
+	if BindingsIndexNamesSubjectForTest("Group", "", "g-first") {
+		t.Errorf("the index still holds the binding an EARLIER watcher's events recorded: it is not this watcher's world")
+	}
+	c1458DiffMembership(t, "the second watcher", c1458IndexMembership(), c1458LiveMembership(t, dyn))
 }
 
 // ── the source guard ─────────────────────────────────────────────────────────

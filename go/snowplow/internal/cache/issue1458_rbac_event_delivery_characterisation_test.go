@@ -418,15 +418,17 @@ func c1458Wait(d time.Duration, cond func() bool) bool {
 }
 
 // c1458IndexMembership renders what the index holds: binding → role key and
-// subjects.
+// subjects. Every role the binding is filed under is rendered (exactly one,
+// when the index is right: a binding left under a role it no longer names
+// shows as two), and a binding filed under a role with no entry shows too.
 func c1458IndexMembership() map[string]string {
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	roleOf := map[bindingID]string{}
+	rolesOf := map[bindingID][]string{}
 	for rk, set := range idx.byRole {
 		for id := range set {
-			roleOf[id] = rk
+			rolesOf[id] = append(rolesOf[id], rk)
 		}
 	}
 	out := map[string]string{}
@@ -436,7 +438,17 @@ func c1458IndexMembership() map[string]string {
 			subj = append(subj, s.Kind+":"+s.Namespace+"/"+s.Name)
 		}
 		sort.Strings(subj)
-		out[string(id)] = roleOf[id] + " <- " + strings.Join(subj, ",")
+		roles := rolesOf[id]
+		sort.Strings(roles)
+		out[string(id)] = strings.Join(roles, "+") + " <- " + strings.Join(subj, ",")
+		if e.role != strings.Join(roles, "+") {
+			out[string(id)] += " (entry names role " + e.role + ")"
+		}
+		delete(rolesOf, id)
+	}
+	for id, roles := range rolesOf {
+		sort.Strings(roles)
+		out[string(id)] = strings.Join(roles, "+") + " <- (NO ENTRY)"
 	}
 	return out
 }
