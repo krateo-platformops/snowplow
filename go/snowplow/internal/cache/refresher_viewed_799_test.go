@@ -6,7 +6,8 @@
 //     normal tier, never park in the viewed tier's blocking Get. The seam
 //     (tierProbeHook) holds the first prober between its Len()>0 probe and its
 //     Get until a second prober arrives (or 500ms), so the race is exact, not
-//     timing. Then two normal keys must run CONCURRENTLY on both workers.
+//     timing. Then normal keys must run CONCURRENTLY on every unviewed slot
+//     (p−1 since #1069) while the last worker still starts a viewed key.
 //     Uses the #799 seam, so it does not compile on 546c2b5b; there,
 //     architect-623's timing probe stranded a worker in 9 of 120 rounds.
 //   - B2 ONE RE-RESOLVE PER KEY ACROSS TIERS: K runs on the normal tier; a tab
@@ -23,27 +24,38 @@ import (
 )
 
 // TestViewed799_B1_RacingProbesNeverStrandAWorker is B1.
+//
+// #1069 — re-shaped for the viewed reservation: at p=2 only ONE worker may hold
+// unviewed work now, so "two normal keys on both workers" no longer describes a
+// healthy pool. At p=3 the arm keeps its point: all three workers return together
+// and probe a viewed tier holding ONE key; afterwards both unviewed slots (p−1)
+// run normal work at once AND the third worker still starts a viewed key — no
+// worker is parked in a priority tier's Get.
 func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
 	CompleteRBACSnapshotForTest(t)
+	const p = 3
 	terminalEnv(t)
-	cleanup := withCleanRefresher(t, 2, 0)
+	cleanup := withCleanRefresher(t, p, 0)
 	t.Cleanup(cleanup)
-	_, keys := terminalFixtureNoReset(t, 5)
-	n1, n2, v, f1, f2 := keys[0], keys[1], keys[2], keys[3], keys[4]
+	_, keys := terminalFixtureNoReset(t, 7)
+	n1, n2, v0, v, f1, f2, v3 := keys[0], keys[1], keys[2], keys[3], keys[4], keys[5], keys[6]
 
 	busy := make(chan struct{})
 	var inBusy atomic.Int32
 	finalGate := make(chan struct{})
 	var inFinal, maxFinal atomic.Int32
 	var vRuns atomic.Int32
+	v3Ran := make(chan struct{})
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
 		switch k {
-		case n1, n2:
+		case n1, n2, v0:
 			inBusy.Add(1)
 			<-busy
 		case v:
 			vRuns.Add(1)
+		case v3:
+			close(v3Ran)
 		case f1, f2:
 			n := inFinal.Add(1)
 			for m := maxFinal.Load(); n > m && !maxFinal.CompareAndSwap(m, n); m = maxFinal.Load() {
@@ -56,6 +68,15 @@ func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
 		}
 		return nil
 	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	StartRefresher(ctx)
+	viewed765Arm(t, v0, v, v3)
+
+	terminalMark([]string{n1, n2, v0})
+	waitFor(t, 10*time.Second, "all three workers busy", func() bool { return inBusy.Load() == 3 })
+
 	// The seam: the first viewed-tier prober waits (holding whatever the probe
 	// holds) until a second prober reaches the same point, or 500ms.
 	var probers atomic.Int32
@@ -77,30 +98,32 @@ func TestViewed799_B1_RacingProbesNeverStrandAWorker(t *testing.T) {
 	tierProbeHook.Store(&hook)
 	t.Cleanup(func() { tierProbeHook.Store(nil) })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	StartRefresher(ctx)
-	viewed765Arm(t, v)
-
-	terminalMark([]string{n1, n2})
-	waitFor(t, 10*time.Second, "both workers busy", func() bool { return inBusy.Load() == 2 })
-	terminalMark([]string{v}) // ONE viewed key while both workers are busy
-	close(busy)               // both return together and probe the viewed tier
+	terminalMark([]string{v}) // ONE viewed key while every worker is busy
+	close(busy)               // all three return together and probe the viewed tier
 	waitFor(t, 10*time.Second, "the viewed key re-resolved", func() bool { return vRuns.Load() == 1 })
 	time.Sleep(100 * time.Millisecond)
 
-	// No more viewed work: two normal keys must run on BOTH workers at once.
+	// No more viewed work: two normal keys must run on both unviewed slots at once.
 	terminalMark([]string{f1, f2})
 	deadline := time.Now().Add(3 * time.Second)
-	for maxFinal.Load() < 2 && time.Now().Before(deadline) {
+	for maxFinal.Load() < p-1 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	got := maxFinal.Load()
-	close(finalGate)
-	if got < 2 {
-		t.Fatalf("B1 RED (#799): only %d of 2 workers ran normal-tier work after the viewed tier emptied — "+
-			"a worker that lost the probe race is parked in the viewed tier's blocking Get", got)
+	if got < p-1 {
+		close(finalGate)
+		t.Fatalf("B1 RED (#799): only %d of %d unviewed slots ran normal-tier work after the viewed tier emptied — "+
+			"a worker that lost the probe race is parked in the viewed tier's blocking Get", got, p-1)
 	}
+	// And the third worker is live: a viewed key starts while both normal jobs run.
+	terminalMark([]string{v3})
+	select {
+	case <-v3Ran:
+	case <-time.After(3 * time.Second):
+		close(finalGate)
+		t.Fatalf("B1 RED (#799): with %d normal jobs in flight a viewed key did not start within 3s — the third worker is stranded", inFinal.Load())
+	}
+	close(finalGate)
 }
 
 // TestViewed799_B2_OneReResolvePerKeyAcrossTiers is B2.
