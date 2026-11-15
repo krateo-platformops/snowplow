@@ -71,6 +71,14 @@ type target struct {
 	UID                              string
 }
 
+// ruleTarget is a rule's target as an object (§6).
+type ruleTarget struct {
+	Group     string `json:"group"`
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
 func (r Rule) target() (target, error) {
 	var s string
 	if err := json.Unmarshal(r.Target, &s); err == nil {
@@ -79,7 +87,7 @@ func (r Rule) target() (target, error) {
 		}
 		return target{Trigger: true}, nil
 	}
-	var t struct{ Group, Resource, Namespace, Name string }
+	var t ruleTarget
 	if err := json.Unmarshal(r.Target, &t); err != nil {
 		return target{}, fmt.Errorf("rule %s: target: %v", r.ID, err)
 	}
