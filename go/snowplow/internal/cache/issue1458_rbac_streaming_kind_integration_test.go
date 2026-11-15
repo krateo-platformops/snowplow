@@ -50,4 +50,8 @@ func TestIssue1458_Kind_StreamedListAndRelistReachTheRBACHandlers(t *testing.T) 
 		t.Fatal(err)
 	}
 	c1458StreamedListArm(t, cfg)
+	// EVIDENCE BRANCH ONLY (evidence/1458-f2-log, never merged): CI runs the
+	// suite without -v, so a passing test prints nothing. This forced failure
+	// makes the job log carry everything the arm recorded above.
+	t.Fatalf("EVIDENCE RUN (#1458 (f)2): forced failure so the log above is printed; arm assertions failed before this line: %v", t.Failed())
 }
