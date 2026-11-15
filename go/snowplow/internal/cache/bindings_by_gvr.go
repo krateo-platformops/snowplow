@@ -584,6 +584,19 @@ func ResetBindingsByGVRIndexForTest() {
 	idx.resetLocked()
 }
 
+// beginBindingsIndexForWatcher empties the index's membership and buckets and
+// clears ready, keeping the navigated set: a watcher is about to start the RBAC
+// informers whose events the index folds. Called by NewResourceWatcher before
+// its informers run.
+func beginBindingsIndexForWatcher() {
+	idx := bindingsByGVRSingleton()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	navigated := idx.navigated
+	idx.resetLocked()
+	idx.navigated = navigated
+}
+
 func (idx *bindingsByGVRIndex) resetLocked() {
 	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
 	idx.wildcard = map[bindingID]struct{}{}
@@ -639,4 +652,22 @@ func SeedBindingsIndexFromSnapshotForTest(navigatedGVRs []schema.GroupVersionRes
 		rotateIfRBACEventSeenPreBuild()
 	}
 	return recorded
+}
+
+// BindingsIndexNamesSubjectForTest reports whether a binding the index holds
+// names the subject: the index's MEMBERSHIP, read whether the index is ready
+// or not (the enumerators answer nothing before ready). TEST-ONLY.
+func BindingsIndexNamesSubjectForTest(kind, namespace, name string) bool {
+	want := subjectKey{Kind: kind, Name: name, Namespace: namespace}
+	idx := bindingsByGVRSingleton()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for _, e := range idx.entries {
+		for _, s := range e.subjects {
+			if s == want {
+				return true
+			}
+		}
+	}
+	return false
 }

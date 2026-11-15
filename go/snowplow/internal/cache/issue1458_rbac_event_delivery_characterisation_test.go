@@ -526,9 +526,10 @@ func TestIssue1458Char_RelistAfterAGap(t *testing.T) {
 		c1458CRB("crb-on-edit-role", "cr-edit", "g-roleedit"),
 	}
 	_, dyn, gate := c1458Watcher(t, true, seed...)
-	ResetBindingsByGVRIndexForTest()
-	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{c1458CMGVR})
-	c1458DiffMembership(t, "after the build", c1458IndexMembership(), c1458LiveMembership(t, dyn))
+	// The index is the one this watcher's own events fed (no seed); a pass's
+	// index step gives it its navigated set.
+	SetNavigatedGVRs([]schema.GroupVersionResource{c1458CMGVR})
+	c1458DiffMembership(t, "at ready", c1458IndexMembership(), c1458LiveMembership(t, dyn))
 	ResetPendingSubGenBumpsForTest()
 	ResetRBACSubGenForTest()
 	c1458Stable(rec, 200*time.Millisecond, 10*time.Second)
@@ -830,8 +831,9 @@ func TestIssue1458Char_UnconvertibleObject(t *testing.T) {
 	rec := c1458InstallRecorder(t)
 	_, dyn, _ := c1458Watcher(t, false,
 		c1458Role("a", "r", c1458Rules("configmaps")), c1458RB("a", "rb-good", "r", "g-good"))
-	ResetBindingsByGVRIndexForTest()
-	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{c1458CMGVR})
+	// The index is the one this watcher's own events fed (no seed); a pass's
+	// index step gives it its navigated set.
+	SetNavigatedGVRs([]schema.GroupVersionResource{c1458CMGVR})
 	c1458Stable(rec, 200*time.Millisecond, 10*time.Second)
 	mark := rec.len()
 	dropped := BindingsIndexDeltaSkippedNonTyped()

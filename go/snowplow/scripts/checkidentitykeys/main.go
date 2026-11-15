@@ -123,6 +123,7 @@ var identityBoundReuseKeys = []struct{ method, recvFrom string }{
 var storeRegistry = map[string]string{
 	"cache.ResolvedCacheStore.index":                  "class-keyed (identity-free classes re-gated: widgetContent→gateWidgetEnvelope, apistage→gateContentEnvelope)",
 	"cache.ResolvedCacheStore.tombstones":             "no-content",
+	"cache.storeInstance.extRegs":                     "no-content (#1458 each extension handler's informer registration, by extension name: its HasSynced, never a body, never an identity)",
 	"cache.listCellSet.delivered":                     "no-content (#854 per-key identity of the last informer delivery: object keys and slice identities, never a body)",
 	"cache.storeSwapsByGVR":                           "no-content (#870 / #928 per-GVR build outcome counters keyed by GroupVersionResource.String(); never a body, never an identity)",
 	"cache.listCellSet.cells":                         "free+regated (#854 incremental apistage LIST cells: the identity-free content substrate of the apistage entries they back, re-gated per requester at serve exactly as those entries are)",

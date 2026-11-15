@@ -85,6 +85,24 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 		rbacv1.Subject{Kind: "User", Name: "alice"},
 		getListRules(restActionGVR.Group, restActionGVR.Resource))
 	snap := buildSnap([]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
+
+	rw := newSyntheticRemoveWatcher(t, restActionGVR)
+	t.Cleanup(func() { rw.Stop() })
+	rw.EnsureResourceType(restActionGVR)
+	// Wait for the informer's initial (empty) LIST+Replace to land BEFORE
+	// seeding, or the async Replace races the manual Adds below and wipes
+	// them — the CI-order flake this test tripped.
+	waitInformerSynced(t, rw, restActionGVR)
+
+	// The hand-made snapshot and the index stood up from it come AFTER the
+	// watcher: a watcher starts the index empty (#1458) and publishes its own
+	// (empty) RBAC world.
+	if err := rw.WaitInitialRBACPublishForTest(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := WaitRBACRebuildQuiesceForTest(time.Minute); err != nil {
+		t.Fatal(err)
+	}
 	PublishRBACSnapshotForTest(snap)
 
 	// Index must be built over a navigated set INCLUDING restActionGVR so
@@ -96,14 +114,6 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 	if got := EnumeratePrewarmTargetsForGVR(restActionGVR, "get"); len(got) != 1 {
 		t.Fatalf("precondition: expected 1 get-restactions target, got %d", len(got))
 	}
-
-	rw := newSyntheticRemoveWatcher(t, restActionGVR)
-	t.Cleanup(func() { rw.Stop() })
-	rw.EnsureResourceType(restActionGVR)
-	// Wait for the informer's initial (empty) LIST+Replace to land BEFORE
-	// seeding, or the async Replace races the manual Adds below and wipes
-	// them — the CI-order flake this test tripped.
-	waitInformerSynced(t, rw, restActionGVR)
 
 	// Seed three composition-detail-style RESTActions (the per-composition
 	// RAs the nav walk never reaches). One duplicate add to prove dedup.

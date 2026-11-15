@@ -148,6 +148,13 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 	cache.ResetDepsForTest()
 	cache.ResetRefresherForTest()
 	cache.ResetDenialOnlyPutForTest()
+	// The cell below is stored under a hand-built key (sub-generation 0). The
+	// sub-generation counters are process-global: another arm's RBAC edit must
+	// not move this arm's representative off that key.
+	cache.ResetPendingSubGenBumpsForTest()
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetPendingSubGenBumpsForTest)
+	t.Cleanup(cache.ResetRBACSubGenForTest)
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 	t.Cleanup(cache.ResetDepsForTest)
 	t.Cleanup(cache.ResetRefresherForTest)
@@ -336,16 +343,32 @@ func TestIssue681_R1_DenialOnlyRefresh_IsPut_WindowClosesFresh(t *testing.T) {
 	}
 }
 
-func TestIssue681_R2_GrantRotates_NextRefreshPutsFuller(t *testing.T) {
+// R2 — a grant by a Role rules edit ROTATES the representative's key (the
+// role's rules edit bumps the sub-generation of the subjects bound to it), so
+// the cell stored under the pre-grant class is no longer anybody's: the next
+// refresh must not keep its denied body alive. The refresher finds the
+// representative has left the cell's RBAC class, with no in-class replacement,
+// and evicts it; the next request resolves fresh, under the post-grant key.
+//
+// (Until #1458 this arm ran with the bindings index never built, a state
+// production does not have: no rules edit bumped any subject, the key stayed,
+// and the arm asserted a fuller re-Put under the same key. With a live watcher
+// the index is now always fed by its events, as in production.)
+func TestIssue681_R2_GrantRotates_RefreshDropsThePreGrantCell(t *testing.T) {
 	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
 	denied := e.body(t)
+	if !strings.Contains(denied, "Forbidden") && denied == `{"prior":true}` {
+		t.Fatalf("PRE: the cell must hold the denial-only body: %s", denied)
+	}
+	sg0 := cache.RBACSubGenForSubject(i677Rep, nil)
 	e.grant(t)
-	d0 := e.pathDials(i677Denied)
+	i1126WaitFor(t, 10*time.Second, "the grant's sub-generation bump", func() bool {
+		return cache.RBACSubGenForSubject(i677Rep, nil) > sg0
+	})
 	e.cycle(t)
-	if e.pathDials(i677Denied)-d0 != 1 || e.body(t) == denied {
-		t.Fatalf("R2 RED: after the grant the next refresh did not read the ConfigMap and re-Put the fuller body (dials %d)",
-			e.pathDials(i677Denied)-d0)
+	if got, ok := e.store.GetNoTouch(e.key); ok {
+		t.Fatalf("R2 RED: after the grant rotated the representative's key, the refresh kept the pre-grant cell alive: %s", got.RawJSON)
 	}
 }
 
