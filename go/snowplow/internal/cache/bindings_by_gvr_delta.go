@@ -62,9 +62,11 @@ import (
 // NEITHER the expected typed *rbacv1.* pointer NOR convertible via the
 // defensive convertUnstructured* fallback. A non-zero value means the
 // typed transform missed (the logged-WARN regression case, rbac_snapshot.go:383)
-// AND the conversion fallback also failed — the index dropped that event
-// and will DRIFT until the next boot rebuild. S1: surfaced via expvar
-// (bindings_by_gvr_metrics.go) so the drift is observable, not silent.
+// AND the conversion fallback also failed — the index dropped that event.
+// The RBAC snapshot leaves the same object out (its rebuild converts the same
+// way), so the index and the evaluator agree; the object enters both when an
+// event delivers it convertible. S1: surfaced via expvar
+// (bindings_by_gvr_metrics.go) so the drop is observable, not silent.
 var bindingsIndexDeltaSkippedNonTyped atomic.Uint64
 
 // BindingsIndexDeltaSkippedNonTyped returns the cumulative count of delta
@@ -140,7 +142,7 @@ func deltaDropNonTyped(kind string) {
 		slog.String("subsystem", "cache"),
 		slog.String("kind", kind),
 		slog.String("effect", "delta event object neither typed nor convertible — "+
-			"index drops this event and will drift until next boot rebuild; "+
+			"the index drops this event, as the RBAC snapshot leaves the object out, until an event delivers it convertible; "+
 			"see snowplow_bindings_by_gvr_delta_skipped_non_typed at /debug/vars"),
 	)
 }

@@ -611,7 +611,7 @@ func r1458World(n int) []runtime.Object {
 	for i := 0; i < n; i++ {
 		nm := fmt.Sprintf("o-%d", i)
 		seed = append(seed, c1458Role("a", nm, c1458Rules("configmaps")), c1458CR(nm, c1458Rules("configmaps")),
-			c1458RB("a", nm, nm, "g-"+nm), c1458CRB(nm, nm, "g-"+nm))
+			c1458RB("a", nm, nm, "gr-"+nm), c1458CRB(nm, nm, "gc-"+nm))
 	}
 	return seed
 }
@@ -628,7 +628,7 @@ func r1458NotReady(t *testing.T, rw *ResourceWatcher, why string) {
 	if n := len(EnumeratePrewarmTargetsForGVR(c1458CMGVR, "list")); n != 0 {
 		t.Fatalf("%s: the enumerator answers %d prewarm targets from an index that is not ready", why, n)
 	}
-	if IdentityAuthorisedForGVR(c1458CMGVR, "nobody", []string{"g-o-0"}) {
+	if IdentityAuthorisedForGVR(c1458CMGVR, "nobody", []string{"gr-o-0"}) || IdentityAuthorisedForGVR(c1458CMGVR, "nobody", []string{"gc-o-0"}) {
 		t.Fatalf("%s: the index authorises a prewarm identity before it is ready", why)
 	}
 	if st := RBACReadiness(); st.Complete {
@@ -675,6 +675,11 @@ func TestIssue1458_ReadinessWaitsForTheIndexToBeReady(t *testing.T) {
 		r1458NoBumpBeforeReady(t)
 		if got := len(EnumeratePrewarmTargetsForGVR(c1458CMGVR, "list")); got == 0 {
 			t.Fatalf("at ready the enumerator answers no prewarm target for a navigated GVR every binding grants")
+		}
+		// The RoleBindings were delivered while no Role was: only the ready
+		// transition's own derivation can have put them in the buckets.
+		if !IdentityAuthorisedForGVR(c1458CMGVR, "nobody", []string{"gr-o-0"}) {
+			t.Fatalf("at ready a binding delivered before its role is not a prewarm target: the ready transition did not derive the buckets")
 		}
 	})
 
@@ -735,7 +740,7 @@ func r1458NoBumpBeforeReady(t *testing.T) {
 	if err := WaitRBACRebuildQuiesceForTest(30 * time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if got := RBACSubGenForSubject("nobody-1458", []string{"g-o-0"}); got != 0 {
+	if got := RBACSubGenForSubject("nobody-1458", []string{"gr-o-0", "gc-o-0"}); got != 0 {
 		t.Errorf("the sub-generation of a subject bound only by initial-list bindings is %d at ready, want 0: "+
 			"a binding delivered before ready recorded a bump, or the epoch rotated", got)
 	}

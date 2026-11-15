@@ -45,6 +45,12 @@ func TestIssue819_SeedDeadlineRelease_EpochSettledBeforeReady(t *testing.T) {
 	})
 	cache.ResetPhase1DoneForTest()
 	cache.ResetRBACSubGenForTest()
+	// The RBAC snapshot is process-global: an earlier arm's snapshot must not
+	// pass for this watcher's first publish, nor its rebuild still be running.
+	if err := cache.WaitRBACRebuildQuiesceForTest(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	seq0 := cache.RBACGen()
 
 	// Hold the watcher's initial publish between its complete publish and the
 	// ready mark.
@@ -83,7 +89,10 @@ func TestIssue819_SeedDeadlineRelease_EpochSettledBeforeReady(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	wait("the first complete RBAC publish", func() bool { s := cache.RBACSnapshotForTest(); return s != nil && s.Synced })
+	wait("this watcher's first complete RBAC publish", func() bool {
+		s := cache.RBACSnapshotForTest()
+		return s != nil && s.Synced && s.PublishSeq > seq0
+	})
 
 	// The window edit: a ClusterRole ADD that is not part of the initial list.
 	cr := &unstructured.Unstructured{Object: map[string]any{

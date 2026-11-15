@@ -13,8 +13,9 @@ package cache
 // THE RULE. Readiness requires the initial RBAC publish to be done: the live
 // snapshot is Synced (built after all four RBAC informers had finished their
 // initial LIST) AND waitAndPublishInitialRBACSnapshot has returned, so the
-// bindings-index build #819 owes before Ready, deferred to that publish when
-// Phase 1 flipped first, has run too. Nothing else decides it. No timer
+// bindings index is ready (the RBAC handlers have been delivered their initial
+// lists, #1458) and the #682 rotation it may owe has landed (#819). Nothing
+// else decides it. No timer
 // and no cap: a sync that never completes keeps the pod NotReady, and says which
 // informer it waits on (the readiness body, the expvar and gauge below, and the
 // boot WARN in main.go). Liveness (/health) does not read this, so a slow sync
