@@ -321,7 +321,7 @@ func (f *externalFlight) fly(next http.RoundTripper, req *http.Request) {
 		if unwaited {
 			// Nobody is left to raise it in: counted and logged, never lost.
 			f.c.flightPanicsUnwaited.Add(1)
-			slog.Default().Error("external read: the shared request panicked after its last waiter left",
+			slog.Default().ErrorContext(f.ctx, "external read: the shared request panicked after its last waiter left",
 				slog.String("flight", hex.EncodeToString(f.key[:8])), slog.Any("panic", p))
 		}
 		// Raised again in every waiter, where a panic in the transport
@@ -592,8 +592,10 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 	// #443 — an inert (dry-run) read already differs by its cache.InertHeader;
 	// the flag is folded too, so the wire request's ctx (its starter's) is
 	// never inert for a joiner that is not, or the reverse.
-	prov := []string{"held=" + boolString(held), "sa-dial=" + boolString(saDial), "inert=" + boolString(cache.Inert(ctx))}
+	prov := []string{"held=" + boolString(held), "inert=" + boolString(cache.Inert(ctx))}
 	if saDial {
+		// Present exactly on a ServiceAccount dial, so it folds the dial's
+		// mark and the token file it reads in one input.
 		prov = append(prov, "sa-token-file:"+dynamic.ServiceAccountTokenFile())
 	}
 	epKey, exact := exactEndpointKeyOf(opts.Endpoint, prov...)
@@ -616,7 +618,7 @@ func externalReadKeyOf(ctx context.Context, opts httpcall.RequestOptions) (exter
 		binary.BigEndian.PutUint64(n[:], uint64(c))
 		h.Write(n[:])
 	}
-	put("external-read/v2")
+	put("external-read/v3")
 	h.Write(epKey[:])
 	put(verb)
 	put(credhttp.RequestURL(serverURL, opts.Path))

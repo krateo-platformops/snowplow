@@ -314,7 +314,7 @@ func ExternalFetchCacheEvictions() uint64 { return externalFetches.evictions.Loa
 // MUST NOT use it.
 func RecordExternalFetchCacheForTest() {
 	c := externalFetches
-	for _, ctr := range []*atomic.Uint64{&c.convertHits, &c.convertMisses, &c.evictions, &c.flightLed, &c.flightJoined, &c.flightNotShared} {
+	for _, ctr := range []*atomic.Uint64{&c.convertHits, &c.convertMisses, &c.evictions, &c.flightLed, &c.flightJoined, &c.flightNotShared, &c.flightPanicsUnwaited} {
 		ctr.Add(1)
 	}
 }

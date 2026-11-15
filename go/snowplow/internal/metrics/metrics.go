@@ -1788,6 +1788,11 @@ func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	flightPanics, err := m.Int64ObservableCounter("snowplow_external_fetch_flight_unwaited_panics_total",
+		metric.WithDescription("Shared external read requests that panicked after their last waiter had left (#1320): nobody was left to raise the panic in, so it is counted here and logged at ERROR. A panic with a waiter is raised in that waiter and is not counted. Expected 0."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		for _, c := range restactionsapi.ExternalFetchCacheSnapshot() {
 			o.ObserveInt64(total, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
@@ -1799,8 +1804,9 @@ func registerExternalFetchCacheInstruments(m metric.Meter) error {
 		o.ObserveInt64(entries, int64(n))
 		o.ObserveInt64(bytes, b)
 		o.ObserveInt64(evictions, int64(restactionsapi.ExternalFetchCacheEvictions()))
+		o.ObserveInt64(flightPanics, int64(restactionsapi.ExternalFetchFlightUnwaitedPanics()))
 		return nil
-	}, total, bytes, entries, evictions, flight)
+	}, total, bytes, entries, evictions, flight, flightPanics)
 	return err
 }
 

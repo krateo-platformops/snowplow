@@ -1342,6 +1342,80 @@ func TestExternalFlight1320_ACompletedRequestIsNeverJoined(t *testing.T) {
 	}
 }
 
+// The freshness contract on its own: from the request's first response byte
+// on — before its status line is even back — no read joins it.
+func TestExternalFlight1320_NoJoinFromTheFirstResponseByteOn(t *testing.T) {
+	c := wireCache(t)
+	firstByte := make(chan struct{})
+	release := make(chan struct{})
+	next := &scriptedWire{}
+	next.fn = func(n int64, req *http.Request) (*http.Response, error) {
+		if n == 1 {
+			httptrace.ContextClientTrace(req.Context()).GotFirstResponseByte()
+			close(firstByte)
+			<-release // the first byte is in; the status line is not back yet
+		}
+		return scriptedOK(req, fmt.Sprintf(`{"n":%d}`, n)), nil
+	}
+	w1, r1 := newReaderWire(t, c, next, context.Background())
+	t1 := goTrip(w1, r1)
+	<-firstByte
+	w2, r2 := newReaderWire(t, c, next, context.Background())
+	second := <-goTrip(w2, r2)
+	if second.err != nil {
+		t.Fatal(second.err)
+	}
+	body, _ := io.ReadAll(second.resp.Body)
+	second.resp.Body.Close()
+	if string(body) != `{"n":2}` || c.flightJoined.Load() != 0 || next.calls.Load() != 2 {
+		t.Fatalf("a read arriving after the first response byte read %q, joined=%d, %d requests below; want its own request's answer, 0, 2",
+			body, c.flightJoined.Load(), next.calls.Load())
+	}
+	close(release)
+	if r := <-t1; r.err != nil {
+		t.Fatal(r.err)
+	} else {
+		r.resp.Body.Close()
+	}
+}
+
+// Of a non-2xx answer only what the fetch reads is held (the first
+// maxUnstructuredResponseTextBytes), however long the upstream's body: a
+// shared request must not hold in memory what the reader's own call never
+// reads. A 2xx body is held whole.
+func TestExternalFlight1320_ANon2xxBodyIsHeldOnlyAsFarAsTheFetchReadsIt(t *testing.T) {
+	c := wireCache(t)
+	long := strings.Repeat("x", 20*maxUnstructuredResponseTextBytes)
+	for _, tc := range []struct {
+		code int
+		want int
+	}{{http.StatusNotFound, maxUnstructuredResponseTextBytes}, {http.StatusInternalServerError, maxUnstructuredResponseTextBytes}, {http.StatusOK, len(long)}} {
+		next := &scriptedWire{fn: func(_ int64, req *http.Request) (*http.Response, error) {
+			resp := scriptedOK(req, long)
+			resp.StatusCode = tc.code
+			return resp, nil
+		}}
+		w, req := newReaderWire(t, c, next, context.Background())
+		f, role := w.joinOrLead(req.Context())
+		if role != flightLead {
+			t.Fatalf("role = %v; want lead", role)
+		}
+		w.start(f, req)
+		resp, err := f.await(req, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		f.mu.Lock()
+		held := len(f.buf)
+		f.mu.Unlock()
+		if held != tc.want || len(got) != tc.want {
+			t.Errorf("status %d: %d bytes held, %d read; want %d", tc.code, held, len(got), tc.want)
+		}
+	}
+}
+
 // A panic in the transport is raised again in every waiter, in its own
 // goroutine, as without sharing.
 func TestExternalFlight1320_APanicIsRaisedInEveryWaiter(t *testing.T) {

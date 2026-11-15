@@ -32,6 +32,7 @@ func TestExternalFetchCacheCountersReachOTLP(t *testing.T) {
 		flightPrior[o] = read(before, "snowplow_external_fetch_flight_total", map[string]string{"outcome": o})
 	}
 	evBefore := read(before, "snowplow_external_fetch_conversion_evictions_total", map[string]string{})
+	panicsBefore := read(before, "snowplow_external_fetch_flight_unwaited_panics_total", map[string]string{})
 	read(before, "snowplow_external_fetch_conversion_bytes", map[string]string{})
 	read(before, "snowplow_external_fetch_conversion_entries", map[string]string{})
 
@@ -47,6 +48,9 @@ func TestExternalFetchCacheCountersReachOTLP(t *testing.T) {
 		if got := read(all, "snowplow_external_fetch_flight_total", map[string]string{"outcome": o}) - flightPrior[o]; got != 1 {
 			t.Errorf("external_fetch_flight_total{outcome=%s} delta = %d; want 1", o, got)
 		}
+	}
+	if got := read(all, "snowplow_external_fetch_flight_unwaited_panics_total", map[string]string{}) - panicsBefore; got != 1 {
+		t.Errorf("external_fetch_flight_unwaited_panics_total delta = %d; want 1", got)
 	}
 	if got := read(all, "snowplow_external_fetch_conversion_evictions_total", map[string]string{}) - evBefore; got != 1 {
 		t.Errorf("external_fetch_conversion_evictions_total delta = %d; want 1", got)
