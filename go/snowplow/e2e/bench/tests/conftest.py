@@ -130,9 +130,133 @@ FAKE_CHART_VALUES = {
     "frontend": {"global": {"imageRegistry": ""},
                  "image": {"registry": "ghcr.io", "repository": "krateo-platformops/frontend",
                            "pullPolicy": "IfNotPresent", "tag": ""}},
+    # the portal, in the REAL 1.8.118 shape (helm show values): no reader group and no demo user by
+    # default; the installer's componentValues, or the bench's, name the groups that read the shell
+    "portal": {"enableCyberjokerUser": False, "readerGroups": []},
+    # two page charts, as the real ones declare their readers (1.8.118 values.yaml): the dashboard is
+    # for admins and devs, the settings for admins alone; each in its own namespace
+    "dashboard-page": {"namespace": "krateo-dashboard", "readerGroups": ["admins", "devs"]},
+    "settings-page": {"namespace": "krateo-settings", "readerGroups": ["admins"]},
 }
+#: the reader template of a page chart, as the real page charts have it: a Role and a RoleBinding per
+#: reader group, in the page's own namespace
+FAKE_PAGE_READERS = """{{- range $g := .Values.readerGroups }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $g }}-read-{{ $.Chart.Name }}
+  namespace: {{ $.Values.namespace }}
+rules:
+- apiGroups: [widgets.templates.krateo.io]
+  resources: ['*']
+  verbs: [get, list]
+- apiGroups: [templates.krateo.io]
+  resources: [restactions]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $g }}-read-{{ $.Chart.Name }}
+  namespace: {{ $.Values.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $g }}-read-{{ $.Chart.Name }}
+subjects:
+- kind: Group
+  name: {{ $g }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+"""
+#: portal 1.8.118's templates/rbac.shell-readers.yaml (its rules and bindings, without its comment):
+#: who reads the shell in the release namespace
+FAKE_PORTAL_SHELL_READERS = """{{- range $g := .Values.readerGroups }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $g }}-read-portal-shell
+  namespace: {{ $.Release.Namespace }}
+rules:
+- apiGroups:
+  - widgets.templates.krateo.io
+  resources:
+  - '*'
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - templates.krateo.io
+  resources:
+  - restactions
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $g }}-read-portal-shell
+  namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $g }}-read-portal-shell
+subjects:
+- kind: Group
+  name: {{ $g }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+"""
+#: the demo grants of portal 1.8.118's templates/rbac.cyberjoker-rbac.yaml, as far as the shell goes:
+#: `devs` reads widgets and RESTActions in the release namespace only while the demo user is on
+FAKE_PORTAL_DEMO = """{{- if .Values.enableCyberjokerUser }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-list-any-template-in-krateo-namespace
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups: [widgets.templates.krateo.io]
+  resources: ['*']
+  verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-list-any-template-in-krateo-namespace
+  namespace: {{ .Release.Namespace }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: devs-get-list-any-template-in-krateo-namespace}
+subjects:
+- {kind: Group, name: devs, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devs-get-any-restaction-in-krateo-namespace
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups: [templates.krateo.io]
+  resources: [restactions]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devs-get-any-restaction-in-krateo-namespace
+  namespace: {{ .Release.Namespace }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: devs-get-any-restaction-in-krateo-namespace}
+subjects:
+- {kind: Group, name: devs, apiGroup: rbac.authorization.k8s.io}
+{{- end }}
+"""
 #: each chart's templates, real Helm templates (rendered by the real helm)
 FAKE_CHART_TEMPLATES = {
+    "portal": {"templates/rbac.shell-readers.yaml": FAKE_PORTAL_SHELL_READERS,
+               "templates/rbac.cyberjoker-rbac.yaml": FAKE_PORTAL_DEMO},
+    "dashboard-page": {"templates/rbac.readers.yaml": FAKE_PAGE_READERS},
+    "settings-page": {"templates/rbac.readers.yaml": FAKE_PAGE_READERS},
     "agentgateway-policies": {
         "templates/cert-replay-hop.yaml": "{{- if .Values.certReplayHop.enabled }}\n" + """apiVersion: apps/v1
 kind: Deployment
@@ -335,6 +459,15 @@ def _fake_ghcr():
                      ("values.yaml", FAKE_CHART_VALUES.get(chart, {}) if version != FAKE_CHART_DEEP
                       else "a: " + "{a: " * 1000 + "1" + "}" * 1000 + "\n")]
             tpls = dict(FAKE_CHART_TEMPLATES.get(chart) or {})
+            # FAKE_PORTAL_CHART (read from this process's environment when the chart is asked for):
+            # no-readers = a portal chart from before its reader groups (no shell-readers template)
+            mode = os.environ.get("FAKE_PORTAL_CHART", "") if chart == "portal" else ""
+            if mode == "no-readers":
+                tpls.pop("templates/rbac.shell-readers.yaml")
+            # FAKE_PAGE_READERS_ONLY=<group>: every page chart's own values grant that group alone
+            only = os.environ.get("FAKE_PAGE_READERS_ONLY", "")
+            if only and isinstance(files[1][1], dict) and "readerGroups" in files[1][1] and chart != "portal":
+                files[1] = ("values.yaml", dict(files[1][1], readerGroups=[only]))
             if chart == "agentgateway-policies" and version == FAKE_CHART_HOP_UNRENDERED:
                 tpls["templates/ui-token-hop.yaml"] = tpls["templates/ui-token-hop.yaml"].replace(
                     ".Values.uiTokenHop.enabled }}", ".Values.uiTokenHop.neverOn }}", 1)

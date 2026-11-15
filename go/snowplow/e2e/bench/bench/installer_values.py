@@ -10,7 +10,9 @@ comments say why each value is what it is.
 
     python3 -m bench.installer_values --snowplow-tag T [--frontend-tag F] --out installer-values.yaml
 
-`--snowplow-env` (SNOWPLOW_ENV) adds the run's declared snowplow environment under
+Every run's document grants the bench's base group the portal's shell
+(componentValues.portal.readerGroups: the group is bench/rbac_model.py's BASE_GROUP, never a second
+literal). `--snowplow-env` (SNOWPLOW_ENV) adds the run's declared snowplow environment under
 componentValues.snowplow.env. `--frontend-tag` (run 26: FRONTEND_TAG) appends the frontend's image override to componentValues;
 empty or absent, the document is the one without it. The tags are written as the heredoc wrote
 them, inside double quotes, unescaped.
@@ -21,6 +23,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+from bench import rbac_model
+
+#: the installer's component whose chart ships the portal's shell: the key of its componentValues
+PORTAL_COMPONENT = "portal"
+#: the group granted the shell: the one every bench user is in (ONE definition, bench/rbac_model.py)
+READER_GROUP = rbac_model.BASE_GROUP
 
 TEMPLATE = """\
 bootstrap:
@@ -70,6 +79,16 @@ componentValues:
       operator: Equal
       value: snowplow
       effect: NoSchedule{snowplow_env}{frontend}
+  # The bench's base group reads the portal's shell (the layout, the theme, the header, the sidebar
+  # Menu and the shared RESTActions) through the portal chart's own value for it: every bench user is
+  # in that group (bench/rbac_model.py BASE_GROUP) and nothing else grants it the shell. Up to
+  # installer 0.3.625 the grant came with the portal's demo user, on by a default of the installer's
+  # values schema; from 0.3.630 that default is gone, and run 26j's three clusters answered 403 on
+  # the boot root for every bench user. No demo user is installed. bench/portal_readers.py holds the
+  # grant against the pinned charts before any cluster exists.
+  {portal}:
+    readerGroups:
+    - {reader_group}
 registryAuth:
   enabled: true
   # username: set at install from the pull-token file, piped into helm's -f - (not kept)
@@ -91,7 +110,8 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
     document is the one without it, and the installer's own values apply)."""
     frontend = f'\n  frontend:\n    image:\n      tag: "{frontend_tag}"' if frontend_tag else ""
     env = ("\n    env:" + "".join(f'\n      {k}: "{v}"' for k, v in sorted(snowplow_env.items()))) if snowplow_env else ""
-    return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend, snowplow_env=env)
+    return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend, snowplow_env=env,
+                           portal=PORTAL_COMPONENT, reader_group=READER_GROUP)
 
 
 def main(argv: list[str] | None = None) -> int:

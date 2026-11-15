@@ -521,8 +521,10 @@ def test_run606_reads_core_features_from_the_pulled_chart(harness):
 def test_run606_refuses_a_core_feature_rule_it_cannot_read(harness):
     p, out = _run(harness, FAKE_CORE_FEATURES="dynamic")
     assert p.returncode != 0
-    assert "refusing:" in out and "inst.coreFeatures is not a static list" in out
-    assert "=== step preflight ===" not in p.stderr
+    # the first step that asks which components are on (the source stage's portal readers) refuses it
+    assert "source FAILED: portal readers: the installer's pins could not be read for the run's values" in out
+    assert "inst.coreFeatures is not a static list" in out
+    assert "=== step preflight ===" not in p.stderr and "=== step up ===" not in p.stderr
 
 
 def test_preflight_reads_the_0_3_459_menu_once_the_pages_exist():

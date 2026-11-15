@@ -154,11 +154,18 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True,
                        timeout=300)
     out = p.stdout + p.stderr
-    # run 26g: the schema step reads the ghcr.io CRD charts with the token first, so a token (or a registry API)
-    # that reads no chart at all is refused there, by the same cause; any other case reaches the registry step
+    # run 26j: the source stage reads the portal's charts with the token first (bench/portal_readers.py), so a
+    # token (or a registry API) that reads no chart at all is refused there, by the same cause (until then the
+    # schema step's CRD charts were the first read, run 26g); so is an installer chart that does not render.
+    # Any other case reaches the registry step
     if case in ("bad_token", "network", "http", "redirect"):
-        assert p.returncode != 0 and "schema FAILED" in out and why in out, out[-2000:]
-        assert "=== step registry ===" not in out and "=== step up ===" not in out
+        assert p.returncode != 0 and "source FAILED: portal readers: the pinned chart could not be fetched" in out \
+            and why in out, out[-2000:]
+        assert "=== step schema ===" not in out and "=== step up ===" not in out
+    elif case == "private_rule_unrendered":
+        assert p.returncode != 0 and ("source FAILED: portal readers: the installer chart could not be rendered with "
+                                      "this run's values: helm template failed: Error: execution error") in out
+        assert "=== step schema ===" not in out and "=== step up ===" not in out
     else:
         assert p.returncode != 0 and ("registry FAILED" in out or "refusing: " in out) and why in out, out[-2000:]
         assert "=== step registry ===" in out and "=== step up ===" not in out

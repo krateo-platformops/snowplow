@@ -41,7 +41,7 @@ THE FIVE THINGS THAT MAKE THIS HARNESS CORRECT RATHER THAN GREEN
 
 CREDENTIALS
 
-`HARNESS_USER` / `HARNESS_PASSWORD` env only → `GET /auth/basic/login` (the login
+`HARNESS_USER` / `HARNESS_PASSWORD` env only → `GET <authn's prefix>/basic/login` (the login
 is a GET with a Basic header — `feedback_basic_login_is_get`). The password is
 read once, used once, and never written to the run dir, a proof, a log line or a
 report. `_redact()` guards the one place a token could leak into a proof.
@@ -51,8 +51,8 @@ The harness user is a DEDICATED least-privilege account (see
 
 MEASUREMENT VANTAGE (`feedback_northstar_measurement_vantage`)
 
-Every counter read is an HTTP GET to `/content/debug/vars` **through the platform
-gateway**, the same path the browser uses — never a port-forward, never a
+Every counter read is an HTTP GET to `<snowplow's prefix>/debug/vars` **through the platform
+gateway** (the prefixes are the installer chart's: `--routes`, see `route_prefix`), the same path the browser uses — never a port-forward, never a
 kubectl exec. kubectl is used ONLY for read-only preflight facts (deployed image
 digests) and for the gated CRD stage's own objects. This module produces NO
 latency numbers, so `feedback_no_kubectl_in_measurement` is satisfied by
@@ -67,6 +67,7 @@ import datetime
 import json
 import os
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -74,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from bench import cluster, store_rebuild
+from bench import cluster, installer_routes, store_rebuild
 from bench.phases import StageProof, _now_iso, load_state, save_state
 
 
@@ -89,9 +90,33 @@ EXPECTED_CONTEXT = "gke_operations-dev-krateo-io_europe-west3-a_krateo-057"
 #: Portal ingress. All HTTP goes here — gateway path only.
 DEFAULT_PORTAL_BASE = "https://portal.krateo.dev"
 
-#: Route prefixes on the platform gateway (facts doc §1.1).
-SNOWPLOW_PREFIX = "/content"     # → snowplow:8081, URLRewrite to /
-AUTHN_PREFIX = "/auth"           # → authn:8082, URLRewrite to /
+#: Route prefixes on the platform gateway: the INSTALLER CHART's, never fixed here. Until installer
+#: 0.3.636 authn was routed at /auth; from 0.3.639 it is /authn, and a prefix held in this file logged
+#: in at a path the gateway no longer routed. The run is given the portal's route table
+#: (`--routes`: the file `python3 -m bench.installer_routes table` writes from the installer chart the
+#: portal was installed with and its values; run606 keeps it as portal-routes.json) and every URL
+#: below takes its prefix from it. No table, or a table that routes the component nowhere: refused.
+_ROUTES: dict | None = None
+
+
+def use_routes(table: dict | None) -> None:
+    """The portal route table this run's URLs are built from (bench.installer_routes' table)."""
+    global _ROUTES
+    _ROUTES = table
+
+
+def route_prefix(component: str) -> str:
+    """The path prefix the gateway routes `component` at, from the run's route table."""
+    from bench import installer_routes
+    if _ROUTES is None:
+        raise PreflightFailed(
+            "no portal route table: pass --routes <portal-routes.json> (python3 -m bench.installer_routes "
+            "table --installer-pulled D --values F --out portal-routes.json, from the installer chart this "
+            "portal was installed with): the gateway's prefixes are the installer's, not this file's")
+    try:
+        return installer_routes.prefix_of(_ROUTES, component)
+    except installer_routes.Refused as e:
+        raise PreflightFailed(str(e)) from None
 
 NS = "krateo-system"
 
@@ -328,14 +353,14 @@ def _http_get(url: str, token: str | None, reqlog: _RequestLog,
 
 
 def login(portal_base: str, reqlog: _RequestLog) -> str:
-    """GET /auth/basic/login with a Basic header → accessToken.
+    """GET <authn's prefix>/basic/login with a Basic header → accessToken.
 
     The login is a GET, not a POST (`feedback_basic_login_is_get`). The
     credential never leaves this function and the token is never persisted.
     """
     user, pw = _creds()
     creds = base64.b64encode(f"{user}:{pw}".encode()).decode()
-    url = f"{portal_base}{AUTHN_PREFIX}/basic/login"
+    url = f"{portal_base}{route_prefix(installer_routes.AUTHN_COMPONENT)}/basic/login"
     req = urllib.request.Request(
         url, headers={"Authorization": "Basic " + creds}, method="GET")
     try:
@@ -360,7 +385,7 @@ def login(portal_base: str, reqlog: _RequestLog) -> str:
 
 def read_debug_vars(portal_base: str, token: str,
                     reqlog: _RequestLog) -> dict:
-    """GET /content/debug/vars through the gateway.
+    """GET <snowplow's prefix>/debug/vars through the gateway.
 
     Distinguishes the three outcomes the facts doc §1.2 calls out, because they
     mean different things and a harness that conflates them misreports:
@@ -370,7 +395,7 @@ def read_debug_vars(portal_base: str, token: str,
             must never be reported as one (there is no break-glass; the whole
             debug surface answers 503 while authn is down).
     """
-    url = f"{portal_base}{SNOWPLOW_PREFIX}/debug/vars"
+    url = f"{portal_base}{route_prefix(installer_routes.SNOWPLOW_COMPONENT)}/debug/vars"
     status, body = _http_get(url, token, reqlog)
     if status == 503:
         raise PreflightFailed(
@@ -392,7 +417,7 @@ def read_apistage_key(portal_base: str, token: str, key: str,
                       reqlog: _RequestLog) -> dict:
     """Ask the L1 store whether ONE key is resident right now.
 
-    `GET /content/debug/apistage?key_hash=<key>` → `MetadataForKey(key)`, JWT-gated by
+    `GET <snowplow's prefix>/debug/apistage?key_hash=<key>` → `MetadataForKey(key)`, JWT-gated by
     RefreshAuth like the rest of /debug. The value the SPA arms on — the
     `X-Snowplow-Refresh-Key` header — IS the store key, so the key the browser reports is
     the key this looks up. Verified live on 057: a bogus key answers 200 with
@@ -410,7 +435,7 @@ def read_apistage_key(portal_base: str, token: str, key: str,
     Returns {"count": int, "meta": dict|None}. Never raises on a missing entry: absent IS
     the answer at the delete step.
     """
-    url = f"{portal_base}{SNOWPLOW_PREFIX}/debug/apistage?key_hash={key}"
+    url = f"{portal_base}{route_prefix(installer_routes.SNOWPLOW_COMPONENT)}/debug/apistage?key_hash={key}"
     status, body = _http_get(url, token, reqlog)
     if status == 503:
         raise PreflightFailed(
@@ -1325,7 +1350,7 @@ def stage_preflight(ctx: dict) -> dict:
     # fails here rather than half-way through a run that has already created CRs.
     grants = {}
     for resource in ("flexes", "paragraphs"):
-        probe = (f"{portal}{SNOWPLOW_PREFIX}/call?resource={resource}"
+        probe = (f"{portal}{route_prefix(installer_routes.SNOWPLOW_COMPONENT)}/call?resource={resource}"
                  f"&apiVersion=widgets.templates.krateo.io/v1beta1"
                  f"&name=s6-grant-probe-does-not-exist&namespace={NS}")
         status, _ = _http_get(probe, ctx["token"], reqlog)
@@ -1989,9 +2014,16 @@ def stage_list(*, enable_crd_relist: bool = False, enable_crd_full_widen: bool =
 def run(run_dir: Path, portal_base: str, *, enable_crd_relist: bool = False,
         crd_name: str | None = None, from_stage: str | None = None,
         expect_bundle: str | None = None, enable_crd_full_widen: bool = False,
-        full_widen_crs: int | None = None) -> int:
-    """One invocation, every stage, per-stage proofs + state.json."""
+        full_widen_crs: int | None = None, routes: str | None = None) -> int:
+    """One invocation, every stage, per-stage proofs + state.json. `routes`: the portal's route
+    table file (`--routes`); without one the first URL built refuses the run (route_prefix)."""
     run_dir = Path(run_dir)
+    if routes:
+        try:
+            use_routes(installer_routes.load(routes))
+        except installer_routes.Refused as e:
+            print(f"[accept1126] refusing: {e}", file=sys.stderr)
+            return 2
     (run_dir / "proofs").mkdir(parents=True, exist_ok=True)
     (run_dir / "hooks").mkdir(parents=True, exist_ok=True)
     (run_dir / "announce").mkdir(parents=True, exist_ok=True)
@@ -2137,6 +2169,10 @@ def add_parsers(sub: argparse._SubParsersAction) -> None:
         help="S6 live acceptance for 1.12.6 item 7 — counter half.")
     p.add_argument("--run-dir", required=True)
     p.add_argument("--portal-base", default=DEFAULT_PORTAL_BASE)
+    p.add_argument("--routes", required=True,
+                   help="the portal's route table (python3 -m bench.installer_routes table ... --out FILE, from "
+                        "the installer chart the portal was installed with): which path the gateway routes "
+                        "authn and snowplow at. Never assumed: installer 0.3.639 moved authn from /auth to /authn.")
     p.add_argument("--from-stage", default=None)
     p.add_argument(
         "--expect-bundle", default=None,
@@ -2176,7 +2212,7 @@ def cmd_accept1126(args) -> int:
                crd_name=args.crd_name, from_stage=args.from_stage,
                expect_bundle=args.expect_bundle,
                enable_crd_full_widen=args.enable_crd_full_widen,
-               full_widen_crs=args.full_widen_crs)
+               full_widen_crs=args.full_widen_crs, routes=args.routes)
 
 
 def cmd_accept1126_hook(args) -> int:

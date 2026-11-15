@@ -49,6 +49,8 @@ FEATURE_DEFINE = "inst.featureEnabled"
 ROUTES_DEFINE = "inst.platformRoutes"
 #: the component whose browser URL the bench's browser and probes call the portal's API through
 SNOWPLOW_COMPONENT = "snowplow"
+#: the component a user logs in at
+AUTHN_COMPONENT = "authn"
 
 
 class Refused(ValueError):
@@ -178,6 +180,16 @@ def table(installer_pulled: str, values_file: str, helm: str = "helm") -> dict:
                       + (f", and equal to its own {ROUTES_DEFINE}" if with_routes else
                          f" (the chart has no {ROUTES_DEFINE} define: its routes are built inline from the same "
                          f"pins)")}
+
+
+def prefix_of(t: dict, component: str) -> str:
+    """The path prefix the table routes `component` at, as a URL is built from it ("" for "/").
+    Raises Refused when the table routes it nowhere."""
+    for r in t.get("routes") or []:
+        if isinstance(r, dict) and r.get("component") == component:
+            return _norm(r.get("path"))
+    raise Refused(f"the portal route table routes no `{component}` component (it routes: "
+                  f"{', '.join(str(r.get('component')) for r in t.get('routes') or []) or 'nothing'})")
 
 
 def said(t: dict) -> str:
