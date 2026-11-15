@@ -88,6 +88,12 @@ func TestIssue1429_OwnTypeNotInstalledNamesTheTypeInDetails(t *testing.T) {
 			"The type things (v1) is not installed on this cluster."},
 		{"group_not_served", "absent.example.org/v1", "things", "absent.example.org",
 			"The type things (absent.example.org/v1) is not installed on this cluster."},
+		// The resource as the reference gave it: a singular, mixed-case name of a
+		// type that is not installed is echoed as it came (no type answers to it,
+		// so there is no canonical plural to give). A reader treats a details.kind
+		// that is not a lower-case DNS label as malformed.
+		{"singular_mixed_case", unservedapi.GV, "Flex", unservedapi.Group,
+			"The type Flex (widgets.templates.krateo.io/v1beta1) is not installed on this cluster."},
 		// A subresource is not a type: pods/log is in the core document, "log" is not served.
 		{"subresource_name", "v1", "log", "",
 			"The type log (v1) is not installed on this cluster."},
@@ -176,12 +182,11 @@ func TestIssue1429_ADependencysMissingObjectCarriesNoCause(t *testing.T) {
 	i1429NoCause(t, rec)
 }
 
-// A 424 that is not snowplow's own (a RESTAction stage whose upstream answered
-// HTTP 424) is passed through like every other code: its code and message, no
-// reason stamped by snowplow, no details. It cannot carry the cause, because
-// an upstream's details never reach a snowplow error; the last row shows what
-// happens if one somehow did: the cause is recognised only in its exact shape.
-func TestIssue1429_AnUpstreams424IsAPlainPassthrough(t *testing.T) {
+// A status that is not snowplow's own decision is passed through like every
+// other: its code and message, no reason stamped by snowplow, no details.
+// Whatever it looks like: the first row carries EXACTLY the details snowplow
+// writes, on a 424 with the reason. Only objects.Get's Go type is the answer.
+func TestIssue1429_AStatusThatLooksLikeTheAnswerIsAPlainPassthrough(t *testing.T) {
 	plain := &apierrors.StatusError{ErrStatus: metav1.Status{
 		Status: metav1.StatusFailure, Code: http.StatusFailedDependency, Reason: "FailedDependency", Message: "the upstream says a dependency failed",
 	}}
@@ -192,6 +197,7 @@ func TestIssue1429_AnUpstreams424IsAPlainPassthrough(t *testing.T) {
 	}
 	cause := metav1.StatusCause{Type: "TypeNotInstalled", Field: "apiVersion", Message: "g.example.org/v1"}
 	for name, serr := range map[string]*apierrors.StatusError{
+		"exactly_snowplows_details":   wrongShape(&metav1.StatusDetails{Group: "g.example.org", Kind: "things", Causes: []metav1.StatusCause{cause}}),
 		"no_details":                  plain,
 		"another_cause":               wrongShape(&metav1.StatusDetails{Group: "g.example.org", Kind: "things", Causes: []metav1.StatusCause{{Type: "FieldValueInvalid", Field: "apiVersion", Message: "g.example.org/v1"}}}),
 		"two_causes":                  wrongShape(&metav1.StatusDetails{Group: "g.example.org", Kind: "things", Causes: []metav1.StatusCause{cause, cause}}),

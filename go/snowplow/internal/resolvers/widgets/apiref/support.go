@@ -2,7 +2,7 @@ package apiref
 
 import (
 	"encoding/json"
-	"github.com/krateo-platformops/snowplow/internal/statusdetails"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -54,25 +54,28 @@ func statusErrorFromResponse(st *response.Status, ref templatesv1.ObjectReferenc
 		code = http.StatusInternalServerError
 	}
 	reason := metav1.StatusReason(st.Reason)
-	details := &metav1.StatusDetails{
-		Name: ref.Name,
-		Kind: ref.Resource,
-	}
-	// #1429 — a read that found its TYPE not installed says which type in its
-	// details; those replace the reference's (statusdetails), so the error
-	// names the missing type and no object.
-	if gvr, ok := statusdetails.MissingType(st); ok {
-		details = statusdetails.TypeNotInstalledMeta(gvr)
-	}
 	return &apierrors.StatusError{
 		ErrStatus: metav1.Status{
 			Status:  st.Status,
 			Message: st.Message,
 			Reason:  reason,
 			Code:    code,
-			Details: details,
+			Details: &metav1.StatusDetails{
+				Name: ref.Name,
+				Kind: ref.Resource,
+			},
 		},
 	}
+}
+
+// errorFromResult is the error of a failed objects.Get of the apiRef: the
+// read's own *statusdetails.TypeNotInstalledError when the read decided its
+// type is not installed (#1429), else statusErrorFromResponse of its status.
+func errorFromResult(res objects.Result, ref templatesv1.ObjectReference) error {
+	if res.TypeNotInstalled != nil {
+		return res.TypeNotInstalled
+	}
+	return statusErrorFromResponse(res.Err, ref)
 }
 
 func rawExtensionToMap(raw *runtime.RawExtension) (map[string]any, error) {

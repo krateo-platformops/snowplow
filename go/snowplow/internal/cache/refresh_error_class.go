@@ -179,17 +179,13 @@ func IsNonRetryableRefreshError(err error) bool {
 	return err != nil && (apierrors.IsForbidden(err) || destinationRefused(err))
 }
 
-// typeNotInstalled reports a Status that carries snowplow's own cause for a
-// type that is not installed (objects.Get's 424, #1414). It is read from the
-// cause (#1426 F2), never from the code: a RESTAction stage whose upstream
-// answers 424 is not this, and cannot carry the cause.
+// typeNotInstalled reports snowplow's own decision that a read's type is not
+// installed (#1414): the Go type objects.Get alone creates. Never a status's
+// code (#1426 F2) and never its details (#1429): a status an upstream's body
+// shaped to look like it is not this.
 func typeNotInstalled(err error) bool {
-	var se *apierrors.StatusError
-	if !errors.As(err, &se) {
-		return false
-	}
-	_, ok := statusdetails.MissingTypeMeta(se.ErrStatus)
-	return ok
+	var tni *statusdetails.TypeNotInstalledError
+	return errors.As(err, &tni)
 }
 
 // destinationRefused reports a stage failure whose reason is the destination

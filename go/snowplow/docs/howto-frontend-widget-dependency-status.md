@@ -307,9 +307,14 @@ Field by field:
 
 - `details.group`: the missing type's API group. It is **left out** for the
   core group; read an absent `group` as `""`.
-- `details.kind`: the missing type's **resource** (the plural, such as
-  `flexes`), as it was asked for. It is the resource, not the Kind, as in the
-  apiserver's own NotFound details.
+- `details.kind`: the missing type's **resource, exactly as the reference
+  gave it** (normally the plural, such as `flexes`). It is the resource, not
+  the Kind, as in the apiserver's own NotFound details. snowplow does not
+  normalise it: no installed type answers to the name, so there is no canonical
+  plural to give, and a reference that says `Flex` is answered with `Flex`. A
+  resource name is a lower-case DNS label; **a reader treats a `details.kind`
+  that is not one as malformed** (a mistyped reference), not as a type to act
+  on.
 - `details.causes`: **exactly one** cause.
   - `reason`: `TypeNotInstalled`.
   - `field`: `apiVersion`.
@@ -327,11 +332,30 @@ cluster without the RESTAction CRD, answers:
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"The type restactions (templates.krateo.io/v1) is not installed on this cluster.","reason":"FailedDependency","details":{"group":"templates.krateo.io","kind":"restactions","causes":[{"reason":"TypeNotInstalled","message":"templates.krateo.io/v1","field":"apiVersion"}]},"code":424}
 ```
 
-Only snowplow produces this cause. An upstream's own `details` (an apiserver's,
-or an external endpoint's behind a RESTAction stage) never reach a snowplow
-answer, so a body that carries the cause carries it because snowplow found the
-type missing. An upstream that itself answers HTTP 424 is passed through with
-its code and message and no `details`.
+Only snowplow's own decision produces this cause. The answer is written from a
+Go error type that only the read (`objects.Get`) creates, when the apiserver's
+discovery says the type is not served; it is never recognised from what a
+status looks like. So a backend cannot make snowplow say it: an upstream that
+itself answers HTTP 424, even with this very `details` block in its body, is
+passed through with its code and its message text and **no `reason` and no
+`details`**, exactly as a relayed status of any other code is.
+
+What a reader does with that:
+
+- **Key on the cause**, never on the code alone and never on the text. A 424
+  is the type-not-installed answer only when `details.causes` holds the one
+  `TypeNotInstalled` cause. A 424 with `reason: "FailedDependency"` and no
+  `details` is a dependency's missing object (sections 1 to 5). A 424 with no
+  `reason` and no `details` is an upstream's own, relayed; its `message` is
+  the upstream's words.
+- A relayed 424's `status` field reads `"Success"` today. That is plumbing's
+  `response.New` defaulting a code it does not list; it is fixed in plumbing
+  v1.76.0 and tracked in snowplow #1437, not here. Read the HTTP status and
+  `code`, not `status`.
+
+The same answer is given wherever the missing type is met: the object asked
+for, a widget's `apiRef`, and the target of a RESTAction stage with
+`resolve: true`.
 
 The top-level `reason`, `code` and `message` are unchanged by #1429, so the
 frontend's 424 state renders as before.

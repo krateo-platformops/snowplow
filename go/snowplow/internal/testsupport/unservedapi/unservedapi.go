@@ -258,6 +258,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, configmaps) && !strings.Contains(strings.TrimPrefix(path, configmaps), "/"):
 		json(http.StatusNotFound, "application/json", notFoundStatus("configmaps", "", strings.TrimPrefix(path, configmaps)))
 
+	// An access review, as the apiserver answers one: created, allowed.
+	case r.Method == http.MethodPost && path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews":
+		json(http.StatusCreated, "application/json", `{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","metadata":{},"spec":{},"status":{"allowed":true}}`)
+
 	// What a request that escaped its resource would reach.
 	case path == "/metrics":
 		plain(http.StatusOK, "# HELP apiserver_request_total\n")

@@ -384,10 +384,8 @@ func TestIssue1414_WalkTypeNotInstalledKeepsTheHarvestedChild(t *testing.T) {
 func TestIssue1414_ResolveErrorKeepsADependencysTypeNotInstalled(t *testing.T) {
 	const msg = "The type restactions (templates.krateo.io/v1) is not installed on this cluster."
 	depType := schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
-	dep := &apierrors.StatusError{ErrStatus: metav1.Status{
-		Status: metav1.StatusFailure, Code: http.StatusFailedDependency, Reason: "FailedDependency", Message: msg,
-		Details: statusdetails.TypeNotInstalledMeta(depType), // #1429: the cause is what makes it this answer
-	}}
+	// objects.Get's own error: its Go type is what makes it this answer (#1429).
+	dep := &statusdetails.TypeNotInstalledError{GVR: depType, Message: msg}
 	rec := httptest.NewRecorder()
 	encodeWidgetResolveError(h1ReqCtx(h1User), rec, fmt.Errorf("apiref resolve templates.krateo.io/restactions/x: %w", dep))
 	if rec.Code != http.StatusFailedDependency {
@@ -397,7 +395,5 @@ func TestIssue1414_ResolveErrorKeepsADependencysTypeNotInstalled(t *testing.T) {
 	if st.Status != metav1.StatusFailure || st.Reason != "FailedDependency" || st.Message != msg {
 		t.Errorf("want Failure/FailedDependency/%q, got %q/%q/%q", msg, st.Status, st.Reason, st.Message)
 	}
-	if got, ok := statusdetails.MissingTypeMeta(st); !ok || got != depType {
-		t.Errorf("the details must name the dependency's type %s, got %v (ok=%v); body: %s", depType, got, ok, rec.Body.String())
-	}
+	i1429Details(t, rec, depType.Group, depType.GroupVersion().String(), depType.Resource)
 }

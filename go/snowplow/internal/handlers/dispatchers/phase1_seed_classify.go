@@ -42,7 +42,7 @@ package dispatchers
 import (
 	"context"
 	"errors"
-	"github.com/krateo-platformops/snowplow/internal/statusdetails"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -132,16 +132,24 @@ func statusErrFromResponse(s *response.Status) error {
 	if s == nil {
 		return nil
 	}
-	st := metav1.Status{
-		Status:  metav1.StatusFailure,
-		Code:    int32(s.Code),
-		Reason:  metav1.StatusReason(s.Reason),
-		Message: s.Message,
+	return &apierrors.StatusError{
+		ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    int32(s.Code),
+			Reason:  metav1.StatusReason(s.Reason),
+			Message: s.Message,
+		},
 	}
-	// #1429 — a read that found its TYPE not installed says which type in its
-	// details; that, and only that, travels with the error (statusdetails).
-	if gvr, ok := statusdetails.MissingType(s); ok {
-		st.Details = statusdetails.TypeNotInstalledMeta(gvr)
+}
+
+// statusErrFromResult is the error of a failed objects.Get: the read's own
+// *statusdetails.TypeNotInstalledError when the read decided its type is not
+// installed (#1429), else statusErrFromResponse of its status. The type is
+// what the widget encoder and the refresher's classifier recognise; a status
+// never stands in for it.
+func statusErrFromResult(got objects.Result) error {
+	if got.TypeNotInstalled != nil {
+		return got.TypeNotInstalled
 	}
-	return &apierrors.StatusError{ErrStatus: st}
+	return statusErrFromResponse(got.Err)
 }

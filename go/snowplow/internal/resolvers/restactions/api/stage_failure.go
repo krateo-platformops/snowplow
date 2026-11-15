@@ -64,6 +64,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -85,6 +86,24 @@ type StageFailure struct {
 	// refusal (#1131) is the destination policy's own text: nothing was sent,
 	// so nothing answered. It holds the address and its range, never the URL.
 	refusal string
+	// notInstalled (#1429) is snowplow's own decision that the type of the
+	// object a `resolve: true` stage resolves in-process is not installed
+	// (objects.Get's error, from the nested call). No upstream answered: the
+	// failure is reported as that decision (Err), never rebuilt from its code.
+	notInstalled *statusdetails.TypeNotInstalledError
+}
+
+// Err is the failure as the error a caller reports: snowplow's own
+// type-not-installed decision when that is what failed the stage (#1429), so
+// the answer names the missing type; else StatusError.
+func (f *StageFailure) Err(raNamespace, raName string) error {
+	if f == nil {
+		return nil
+	}
+	if f.notInstalled != nil {
+		return fmt.Errorf("restaction %s/%s stage %q failed: %w", raNamespace, raName, f.Stage, f.notInstalled)
+	}
+	return f.StatusError(raNamespace, raName)
 }
 
 // StatusError renders the failure as a typed apiserver status, so every
@@ -169,6 +188,9 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 			f.Reason = credhttp.BudgetStatusReason
 		}
 	}
+	// #1429 — the in-process resolve's target is of a type that is not
+	// installed: the error chain carries objects.Get's own error.
+	errors.As(itemErr, &f.notInstalled)
 	// #1131 — the destination policy refused the dial: the error chain, never a
 	// recorded value, says so.
 	if st, ok := credhttp.DestinationStatus(itemErr); ok {
@@ -279,6 +301,9 @@ func firstStageFailure(itemErrs []error, calls []httpcall.RequestOptions) *Stage
 				call = calls[i]
 			}
 			switch {
+			case f.notInstalled != nil:
+				// #1429 — snowplow's own sentence: the type, and nothing else.
+				f.Message = f.notInstalled.Message
 			case f.budget != nil:
 				// #1115 — the ExhaustedError's text is identity-free by
 				// construction (phase, cause, attempts; no host).

@@ -124,7 +124,7 @@ func ResolveNestedCall(
 		// #630 — keep the apiserver status typed (403 stays IsForbidden), the
 		// same repair as the refresher's re-fetch; the text is unchanged.
 		return nil, fmt.Errorf("nested resolve: fetch %s/%s: %w",
-			ref.Resource, ref.Name, statusErrFromResponse(got.Err))
+			ref.Resource, ref.Name, statusErrFromResult(got))
 	}
 	if got.Unstructured == nil {
 		return nil, fmt.Errorf("nested resolve: fetch %s/%s: nil object",
