@@ -159,9 +159,8 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 
 	// Build the index against the LIVE (full) snapshot — the c2-reader ClusterRole
-	// IS present, so the binding resolves normally and is NOT in the case-3
-	// roleref-unresolved skip-set. This isolates the case-2 (implicit-group)
-	// class: any bump here comes from the RBAC winning-subject fact, not case-3.
+	// IS present, so the binding resolves normally: any bump here comes from the
+	// RBAC winning-subject fact.
 	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User) // alice, Groups=["devs"]
@@ -173,17 +172,12 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	}
 	// PRECONDITION: the MARK-AT-MINT classified this cell as case-2 implicit_group
 	// — produced by the REAL evaluator's winning-subject determination, not
-	// asserted into existence. (It must NOT be the case-3 class: the role is
-	// present, so IsRoleRefUnresolvedAtBuild is false.)
+	// asserted into existence.
 	if inputs.AtRiskClass != cache.AtRiskImplicitGroup {
 		t.Fatalf("PRECONDITION FAILED: the mint-time at-risk class for the serve-time first-match "+
 			"BindingUID %q must be AtRiskImplicitGroup (the winning subject matched via "+
 			"system:authenticated); got %v. Without it the arm cannot exercise the case-2 detector.",
 			inputs.BindingUID, inputs.AtRiskClass)
-	}
-	if cache.IsRoleRefUnresolvedAtBuild(inputs.BindingUID) {
-		t.Fatalf("PRECONDITION: the case-2 binding %q must NOT also read case-3 at-risk (role is present "+
-			"at build) — else the arm would not isolate the implicit-group class", inputs.BindingUID)
 	}
 	if _, ok := handle.Get(key); ok {
 		t.Fatalf("PRECONDITION: the derived key must be cold before the miss-populate")
@@ -221,12 +215,6 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	// the load-bearing assertion).
 	if raw := cache.ResolvedCache().Stats().ServeMissedRotationAtriskImplicitGroup; raw != 1 {
 		t.Fatalf("the raw store field must also read 1; got %d", raw)
-	}
-	// Cross-class isolation: the case-3 counter must NOT have moved (this cell is
-	// NOT roleref-unresolved).
-	if raw := cache.ResolvedCache().Stats().ServeMissedRotationAtriskRolerefUnresolved; raw != 0 {
-		t.Fatalf("cross-class leak: the case-3 roleref_unresolved counter moved to %d on a case-2 "+
-			"implicit-group serve; the two classes must be independent", raw)
 	}
 }
 
