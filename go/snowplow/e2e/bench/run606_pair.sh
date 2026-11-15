@@ -143,7 +143,7 @@ for x in "${LABELS[@]}"; do
     w="${v}_$x"; [[ -n "${!w:-}" ]] || refuse "$w is required (one per run)"
   done
 done
-for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT FRONTEND_TAG EXPECTED_FRONTEND_DIGEST; do
+for v in RUN_NAME SNOWPLOW_TAG EXPECTED_IMAGE_DIGEST BENCH_606_GO BENCH_1004_GO OUT FRONTEND_TAG EXPECTED_FRONTEND_DIGEST SNOWPLOW_ENV; do
   [[ -z "${!v:-}" ]] || refuse "$v is per run (set ${v}_<run>, one per run of ${LABELS[*]}): unset it"
 done
 # Run 26: the frontend image, per run like snowplow's (FRONTEND_TAG_<L> and
@@ -163,6 +163,18 @@ for x in "${LABELS[@]}"; do
   [[ "${!fd:-}" == "${!fdx:-}" ]] \
     || refuse "$fd (${!fd:-unset}) and $fdx (${!fdx:-unset}) differ: a pair compares snowplow only, every run runs one frontend"
 done
+# Each run's DECLARED snowplow environment (SNOWPLOW_ENV_<L>, bench/snowplow_env.py: Go runtime keys,
+# explicit values, applied through the installer's values and read back from the pod before load).
+# Every run declares the SAME KEYS, or none does: a run that left a key out would take the
+# installer's default for it by silence. The values may differ: that is what such a launch compares.
+env_args=()
+for x in "${LABELS[@]}"; do se="SNOWPLOW_ENV_$x"; env_args+=("${x}=${!se:-}"); done
+env_msg="$(python3 -m bench.snowplow_env same-keys "${env_args[@]}" 2>&1)" || refuse "${env_msg#refusing: }"
+# same_env <a> <b>: the two runs declare the same snowplow env (key by key)
+same_env() {
+  local ea="SNOWPLOW_ENV_$1" eb="SNOWPLOW_ENV_$2"
+  [[ "$(printf '%s\n' ${!ea:-} | sort)" == "$(printf '%s\n' ${!eb:-} | sort)" ]]
+}
 [[ -z "${DRIVE_S:-}" ]] || refuse "DRIVE_S is derived by K6_SPAN=churn: unset it"
 [[ "${K6_SPAN:-churn}" == "churn" ]] || refuse "a pair runs K6_SPAN=churn (customers on through every churn step)"
 [[ "${LOAD_DRIVER:-k6}" == "k6" ]] || refuse "a pair compares k6's customers: LOAD_DRIVER=k6"
@@ -182,11 +194,16 @@ if [[ -n "$REPLICA_PAIR" ]]; then
   da="EXPECTED_IMAGE_DIGEST_${REPLICA_PAIR%%:*}" db="EXPECTED_IMAGE_DIGEST_${REPLICA_PAIR##*:}"
   [[ "${!da}" == "${!db}" ]] \
     || refuse "REPLICA_PAIR $REPLICA_PAIR: an A/A replica runs ONE image on both arms; ${da} (${!da}) and ${db} (${!db}) differ"
+  same_env "${REPLICA_PAIR%%:*}" "${REPLICA_PAIR##*:}" \
+    || refuse "REPLICA_PAIR $REPLICA_PAIR: an A/A replica runs ONE snowplow env on both arms; SNOWPLOW_ENV_${REPLICA_PAIR%%:*} and SNOWPLOW_ENV_${REPLICA_PAIR##*:} differ"
 fi
 for p in "${PAIR_LIST[@]}"; do
   is_replica "$p" && continue
   da="EXPECTED_IMAGE_DIGEST_${p%%:*}" db="EXPECTED_IMAGE_DIGEST_${p##*:}"
-  [[ "${!da}" != "${!db}" ]] || refuse "pair $p: the two digests are the same image: nothing to compare (an A/A replica is declared by REPLICA_PAIR)"
+  # a pair compares two images, or ONE image under two declared snowplow envs
+  if [[ "${!da}" == "${!db}" ]] && same_env "${p%%:*}" "${p##*:}"; then
+    refuse "pair $p: the two digests are the same image and the two runs declare the same snowplow env: nothing to compare (an A/A replica is declared by REPLICA_PAIR)"
+  fi
 done
 # #1004: the full-widen stage runs on every run or on none
 fw=0; for x in "${LABELS[@]}"; do v="BENCH_1004_GO_$x"; [[ -n "${!v:-}" ]] && fw=$(( fw + 1 )); done
@@ -260,6 +277,11 @@ runenv() {
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
           BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}"
           FRONTEND_TAG_VAR="FRONTEND_TAG_$1")   # run 26d: its login-contract refusal names this run's variable
+  # the run's declared snowplow env, its label, and where the launch's runs share their pod readings
+  # (run606.sh snowplow_env_gate: a Go runtime key no run declared must read the same on all of them)
+  local se="SNOWPLOW_ENV_$1"
+  RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1" SNOWPLOW_ENV_DIR="$PAIR_OUT/snowplow-env"
+           SNOWPLOW_ENV_ARMS="${LABELS[*]}")
   # run 26: the run's frontend override, only when it has one
   local ft="FRONTEND_TAG_$1" fd="EXPECTED_FRONTEND_DIGEST_$1"
   if [[ -n "${!ft:-}" ]]; then
@@ -268,11 +290,12 @@ runenv() {
 }
 runs_line=""
 for x in "${LABELS[@]}"; do
-  nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x"
+  nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x" se="SNOWPLOW_ENV_$x"
+  envs="${!se:+, snowplow env ${!se}}"
   if [[ -n "${!ft:-}" ]]; then
-    runs_line="${runs_line} ${x}=${!nm} (${!tg}, frontend ${!ft} ${!fd})"
+    runs_line="${runs_line} ${x}=${!nm} (${!tg}${envs}, frontend ${!ft} ${!fd})"
   else
-    runs_line="${runs_line} ${x}=${!nm} (${!tg})"
+    runs_line="${runs_line} ${x}=${!nm} (${!tg}${envs})"
   fi
 done
 log "runs:${runs_line}; pairs (baseline:candidate) ${PAIR_LIST[*]}; bench ${BENCH_SHA}, ${BASH} ${BASH_VERSION}"
@@ -421,6 +444,9 @@ while ! all_exited; do
     pid="PID_$x" rc="RC_$x"
     if [[ -z "${!rc}" ]] && ! kill -0 "${!pid}" 2>/dev/null; then
       set +e; wait "${!pid}"; printf -v "$rc" '%s' "$?"; set -e
+      # a run that ended without its pod reading: the others do not wait for it (snowplow_env agree)
+      mkdir -p "$PAIR_OUT/snowplow-env"
+      [[ -f "$PAIR_OUT/snowplow-env/$x.json" ]] || : > "$PAIR_OUT/snowplow-env/$x.gone"
       if completed "$x"; then printf -v "DONE_$x" '%s' 1; fi
       done_x="DONE_$x"
       log "run $x exited ${!rc} ($([[ "${!done_x}" == "1" ]] && echo 'its evaluate step ran' || echo 'it did not complete'))"

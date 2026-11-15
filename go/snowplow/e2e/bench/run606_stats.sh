@@ -31,7 +31,7 @@ pair_cmd() {
   local sa="SRC_$a" sb="SRC_$b" da="EXPECTED_IMAGE_DIGEST_$a" db="EXPECTED_IMAGE_DIGEST_$b"
   PAIR_CMD=(python3 -m bench.custlat pair --a "${!sa}/verdict.json" --b "${!sb}/verdict.json"
             --a-dir "${!sa}" --b-dir "${!sb}" --replica "$REPLICA" --expect-a "${!da}" --expect-b "${!db}"
-            --a-label "$a" --b-label "$b" --launch "$PAIR_RUN_ID")
+            --a-label "$a" --b-label "$b" --launch "$PAIR_RUN_ID" --not-comparable "${NOT_COMPARABLE_WITH:-}")
 }
 # replica_cmd: REPLICA_CMD = the declared A/A pair's in-run replica (custlat replica --in-run), from the durable
 # copies, recording this launch's id: a pair says "measured in this launch" only on its own id
@@ -39,7 +39,7 @@ replica_cmd() {
   local a="${REPLICA_PAIR%%:*}" b="${REPLICA_PAIR##*:}"
   local sa="SRC_$a" sb="SRC_$b" da="EXPECTED_IMAGE_DIGEST_$a"
   REPLICA_CMD=(python3 -m bench.custlat replica "${!sa}" "${!sb}" --in-run "$REPLICA_PAIR" --expect-digest "${!da}"
-               --launch "$PAIR_RUN_ID")
+               --launch "$PAIR_RUN_ID" --not-comparable "${NOT_COMPARABLE_WITH:-}")
 }
 # stat_step <step> <out> <command> <dir 1> <dir 2> -- <cmd...>: one statistics step. Its start and end lines in
 # the pair log, with the input it reads; the command's own progress lines (custlat.progress, its stderr) between
@@ -114,8 +114,10 @@ for lab, d in ((sys.argv[2], sys.argv[3]), (sys.argv[4], sys.argv[5])):
         rv = None
     for sec, missing in custlat.INFO_SECTIONS:
         out += custlat.arm_info_lines(rv, sec, missing, lab + " (replica arm)")[1]
-try:      # 1422: the two arms cluster operations per phase, as custlat replica --in-run wrote them
-    out += (json.load(open(sys.argv[1])).get("cluster_operations_report_only") or {}).get("lines") or []
+try:      # what the arms differ in; 1422: their cluster operations per phase (custlat replica --in-run)
+    rj = json.load(open(sys.argv[1]))
+    out += (rj.get("arms") or {}).get("lines") or []
+    out += (rj.get("cluster_operations_report_only") or {}).get("lines") or []
 except (OSError, ValueError):
     pass
 print("\n".join(out))' "$REPLICA_FILE" "$ra" "${!sa:-/nonexistent}" "$rb" "${!sb:-/nonexistent}" 2>/dev/null || true)
@@ -146,6 +148,7 @@ ex = (v.get("exclusion") or {}).get("items") or []
 print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidate_" in r]
                 + ["INVALID: " + r for r in v["invalid_reasons"]]
                 + [((v.get("replica_source") or {}).get("line") or "INFO replica: not said (a verdict before run 24)")]
+                + ((v.get("arms") or {}).get("lines") or [])
                 + ([v["frontend"]["line"]] if v.get("frontend") else [])
                 + ["NOTE: " + n for n in v.get("notes") or []]
                 + ["EXCLUDED from both runs: %s (A %.0f s, B %.0f s): %s" % (i["what"], sum(b - a for a, b in i["a"]),

@@ -6126,6 +6126,12 @@ def _cmd_evaluate(a) -> int:
         a.cluster_operations, recs, result["report"])
     for ln in ops.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
+    # the run's declared snowplow env and what its pod had before the measure (bench/snowplow_env.py,
+    # snowplow-env.json): INFO; the pair states from it what its arms differ in
+    from bench import snowplow_env
+    result["report"]["snowplow_env"] = env = _report_only(snowplow_env.report, a.snowplow_env)
+    for ln in env.get("lines") or []:
+        print(ln, file=sys.stderr, flush=True)
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
@@ -6325,6 +6331,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--tracing", default=None,
                    help="run 23: run606's tracing.json (bench/tracing.py), shown as INFO lines, never "
                         "judged; a missing file reads UNKNOWN")
+    e.add_argument("--snowplow-env", default=None,
+                   help="run606's snowplow-env.json (bench/snowplow_env.py): the declared snowplow env and the "
+                        "pod's reading before the measure, INFO")
     e.add_argument("--cluster-operations", default=None,
                    help="#1422: run606's cluster-operations.json (bench/clusterops.py): each measured phase is "
                         "marked with the GKE operations that overlapped it, INFO, never judged; a missing or "

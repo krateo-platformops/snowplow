@@ -2052,6 +2052,17 @@ def _verdict_of(d: str) -> dict | None:
     return v if isinstance(v, dict) else None
 
 
+def arms_pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparable: str = "") -> dict:
+    """INFO only: what the two runs differ in (bench/snowplow_env.py pair): image, declared snowplow
+    env, both, neither. A failure of the comparison reads as unknown."""
+    from bench import snowplow_env
+    try:
+        return snowplow_env.pair(va, vb, labels, not_comparable or "")
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        return {"result": "INFO", "error": f"{type(e).__name__}: {e}",
+                "lines": [f"INFO arms: what they differ in is UNKNOWN: the comparison failed: {type(e).__name__}: {e}"]}
+
+
 def cluster_operations_pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
     """#1422, INFO only: the two runs' cluster_operations_report_only (bench/clusterops.py) per measured
     phase, and the phases ONE arm measured under a cluster operation and the other did not. A failure
@@ -2091,6 +2102,10 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"{x.upper()}'s collected run dir (its k6/ stream: read when not-Ready time "
                              f"is excluded); default: the directory of --{x}")
     rp = sub.add_parser("replica", help="the replica ratios of two collected run dirs")
+    for sp in (pr, rp):
+        sp.add_argument("--not-comparable", default="",
+                        help="the launch's own statement of what its results are not comparable with, and why "
+                             "(run606_pair.sh's NOT_COMPARABLE_WITH); said in the report as given")
     rp.add_argument("dirs", nargs=2)
     rp.add_argument("--in-run", default=None, metavar="L1:L2",
                     help="run 24: the two dirs are an A/A pair of this launch (labels L1:L2), checked "
@@ -2110,6 +2125,8 @@ def main(argv: list[str] | None = None) -> int:
             out = replica_ratios(report_from_dir(a.dirs[0]), report_from_dir(a.dirs[1]),
                                  [_provenance(d) for d in a.dirs])
         if a.in_run is not None:
+            out["arms"] = arms_pair(*(_verdict_of(d) for d in a.dirs),
+                                    tuple(f"{x} (replica arm)" for x in a.in_run.split(":", 1)), a.not_comparable)
             # #1422: the two arms' cluster operations per phase, side by side: a replica whose one arm
             # measured a phase under a cluster operation and whose other did not says so
             out["cluster_operations_report_only"] = cluster_operations_pair(
@@ -2165,6 +2182,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
             out[section] = {"error": f"{type(e).__name__}: {e}",
                             "lines": [f"INFO {section}: report failed: {type(e).__name__}: {e}"]}
+    # what the arms differ in: the image, the declared snowplow env (verified from each pod), both or neither
+    out["arms"] = arms_pair(va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"), a.not_comparable)
     # #1422: each arm's cluster operations per measured phase, and the phases only one arm measured under one
     out["cluster_operations_report_only"] = cluster_operations_pair(
         va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"))

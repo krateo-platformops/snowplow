@@ -1253,6 +1253,13 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             # written long before the snowplow container started
             otel = json.loads(os.environ.get("FAKE_SNOWPLOW_OTEL", '{"OTEL_ENABLED": "true", '
                                              '"OTEL_TRACES_SAMPLER": "parentbased_always_on"}'))
+            # the Go runtime env the install's values declared (the fake helm's install wrote it);
+            # FAKE_SNOWPLOW_GO_ENV: what the platform's ConfigMap holds instead (a declaration that
+            # did not arrive, a key no run declared)
+            dp = os.path.join(STATE, "snowplow-declared-env.json")
+            go = json.loads(os.environ["FAKE_SNOWPLOW_GO_ENV"]) if os.environ.get("FAKE_SNOWPLOW_GO_ENV") else (
+                json.load(open(dp)) if os.path.exists(dp) else {})
+            otel = {**otel, **go}
             print(json.dumps({"items": [{"metadata": {"name": "installers-v0-3-422-configmap"}, "data": data},
                                         {"metadata": {"name": "snowplow", "creationTimestamp": "2026-01-01T00:00:00Z",
                                                       "managedFields": [{"manager": "helm",
@@ -1476,6 +1483,14 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         sys.exit(0)
     if a[:1] == ["template"]:
         os.execv(sys.executable, [sys.executable, os.environ["FAKE_HELM_TEMPLATE_BIN"], *a])
+    if "install" in a and a[a.index("install") + 1:a.index("install") + 2] == ["installer"]:
+        # the platform this install makes: snowplow's ConfigMap carries the env its values declare
+        # (componentValues.snowplow.env), which the fake kubectl then lists
+        import yaml
+        vf = next((a[i + 1] for i, x in enumerate(a) if x == "-f" and a[i + 1] != "-"), None)
+        vals = yaml.safe_load(open(vf)) if vf else {}
+        env = (((vals or {}).get("componentValues") or {}).get("snowplow") or {}).get("env") or {}
+        json.dump(env, open(os.path.join(STATE, "snowplow-declared-env.json"), "w"))
     if a[:1] == ["pull"]:
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
@@ -1512,6 +1527,15 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         priv = {"none": "", "empty": '{{- define "inst.privateImageComponents" -}}components: []{{- end -}}'
                 }.get(mode, chr(10).join(['{{- define "inst.privateImageComponents" -}}', "components:", *entries,
                                           *last, "{{- end -}}"]))
+        # the merge patch the installer's bootstrap applies to its CR (bench/snowplow_env.py reads
+        # componentValues.snowplow.env from it). FAKE_INSTALLER_HOLDS_GOGC: an installer whose own default
+        # wins over the values (the declaration never reaches the CR)
+        held = os.environ.get("FAKE_INSTALLER_HOLDS_GOGC")
+        cv = ('(merge (dict "snowplow" (dict "env" (dict "GOGC" "%s"))) .Values.componentValues)' % held if held
+              else ".Values.componentValues")
+        open(os.path.join(d, "templates", "self-bootstrap.yaml"), "w").write(chr(10).join([
+            "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-bootstrap", "data:",
+            '  components-patch.json: {{ dict "spec" (dict "componentValues" ' + cv + ') | toJson | quote }}', ""]))
         open(os.path.join(d, "templates", "_helpers.tpl"), "w").write(
             '{{- define "inst.coreFeatures" -}}' + core + '{{- end -}}' + chr(10) + priv + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({

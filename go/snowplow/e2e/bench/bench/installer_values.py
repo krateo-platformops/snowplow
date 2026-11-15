@@ -10,7 +10,8 @@ comments say why each value is what it is.
 
     python3 -m bench.installer_values --snowplow-tag T [--frontend-tag F] --out installer-values.yaml
 
-`--frontend-tag` (run 26: FRONTEND_TAG) appends the frontend's image override to componentValues;
+`--snowplow-env` (SNOWPLOW_ENV) adds the run's declared snowplow environment under
+componentValues.snowplow.env. `--frontend-tag` (run 26: FRONTEND_TAG) appends the frontend's image override to componentValues;
 empty or absent, the document is the one without it. The tags are written as the heredoc wrote
 them, inside double quotes, unescaped.
 """
@@ -68,7 +69,7 @@ componentValues:
     - key: dedicated
       operator: Equal
       value: snowplow
-      effect: NoSchedule{frontend}
+      effect: NoSchedule{snowplow_env}{frontend}
 registryAuth:
   enabled: true
   # username: set at install from the pull-token file, piped into helm's -f - (not kept)
@@ -82,25 +83,37 @@ registryAuth:
 """
 
 
-def document(snowplow_tag: str, frontend_tag: str = "") -> str:
-    """The values document of a run whose snowplow image tag is `snowplow_tag` (SNOWPLOW_TAG) and
-    whose frontend image tag override is `frontend_tag` (FRONTEND_TAG; empty: none)."""
+def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, str] | None = None) -> str:
+    """The values document of a run whose snowplow image tag is `snowplow_tag` (SNOWPLOW_TAG), whose
+    frontend image tag override is `frontend_tag` (FRONTEND_TAG; empty: none) and whose declared
+    snowplow environment is `snowplow_env` (SNOWPLOW_ENV, bench/snowplow_env.py: Go runtime keys,
+    each an explicit value, written as strings under componentValues.snowplow.env; none: the
+    document is the one without it, and the installer's own values apply)."""
     frontend = f'\n  frontend:\n    image:\n      tag: "{frontend_tag}"' if frontend_tag else ""
-    return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend)
+    env = ("\n    env:" + "".join(f'\n      {k}: "{v}"' for k, v in sorted(snowplow_env.items()))) if snowplow_env else ""
+    return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend, snowplow_env=env)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.installer_values")
     ap.add_argument("--snowplow-tag", required=True)
     ap.add_argument("--frontend-tag", default="")
+    ap.add_argument("--snowplow-env", default="",
+                    help="SNOWPLOW_ENV: the run's declared snowplow environment (bench/snowplow_env.py)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     if not a.snowplow_tag:
         print("refusing: --snowplow-tag is empty", file=sys.stderr)
         return 2
+    from bench import snowplow_env
+    try:
+        env = snowplow_env.parse(a.snowplow_env)
+    except snowplow_env.Refused as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return 2
     tmp = a.out + ".part"
     with open(tmp, "w") as fh:
-        fh.write(document(a.snowplow_tag, a.frontend_tag))
+        fh.write(document(a.snowplow_tag, a.frontend_tag, env))
     os.replace(tmp, a.out)
     return 0
 

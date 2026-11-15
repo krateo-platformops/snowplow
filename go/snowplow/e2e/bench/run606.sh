@@ -110,6 +110,32 @@ fi
 # step refuses an older one by name, before any cluster (bench/login_contract.py).
 FRONTEND_TAG="${FRONTEND_TAG:-}"
 EXPECTED_FRONTEND_DIGEST="${EXPECTED_FRONTEND_DIGEST:-}"
+# The run's DECLARED snowplow environment (bench/snowplow_env.py), optional: space-separated
+# KEY=VALUE, Go runtime keys only, each an explicit value (SNOWPLOW_ENV="GOGC=100": the Go default
+# is declared by its value; there is no "unset", a fresh install takes the installer's own default
+# for a key the values leave out). It is applied ONLY through the installer's values
+# (componentValues.snowplow.env), rendered by the pulled chart before anything is created (the
+# snowplow-env step, in the dry pass too), and read back from the running pod before any load (the
+# measure step): a pod that does not have every declared key as declared fails the run there.
+# Unset: the installer's own values apply, and nothing here changes.
+SNOWPLOW_ENV="${SNOWPLOW_ENV:-}"
+python3 -m bench.snowplow_env parse --declared "$SNOWPLOW_ENV" >/dev/null || exit 2
+# In a launch of several runs (run606_pair.sh sets these): this run's label, the directory the runs
+# share their pod readings in, and the labels of every run. Before its load each run waits, at most
+# ENV_AGREE_WAIT_S, for the others' readings: a Go runtime key NO run declared (GOMEMLIMIT,
+# GOMAXPROCS, ...) that differs between them fails the run before load.
+BENCH_ARM="${BENCH_ARM:-}"
+SNOWPLOW_ENV_DIR="${SNOWPLOW_ENV_DIR:-}"
+SNOWPLOW_ENV_ARMS="${SNOWPLOW_ENV_ARMS:-}"
+ENV_AGREE_WAIT_S=0
+if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then ENV_AGREE_WAIT_S="${ENV_AGREE_WAIT_S_SET:-600}"; fi
+# BENCH_606_REHEARSAL=env: a ONE-CLUSTER rehearsal of what touches GCP and the installer, no load:
+# gke-up (the maintenance exclusion, read back), the install with SNOWPLOW_ENV, the pod's Go runtime
+# reading and its comparison with the declaration, the cluster's operations record, one final block
+# that prints all of it, then the teardown. No data, no drivers, no verdict. It creates a cluster,
+# so it needs BENCH_606_GO like any run.
+REHEARSAL="${BENCH_606_REHEARSAL:-}"
+case "$REHEARSAL" in ""|env) ;; *) echo "refusing: BENCH_606_REHEARSAL must be 'env' or unset, got '${REHEARSAL}'" >&2; exit 2 ;; esac
 if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
   if [[ -z "$FRONTEND_TAG" || -z "$EXPECTED_FRONTEND_DIGEST" ]]; then
     echo "refusing: FRONTEND_TAG and EXPECTED_FRONTEND_DIGEST are set together or not at all (FRONTEND_TAG='${FRONTEND_TAG}', EXPECTED_FRONTEND_DIGEST='${EXPECTED_FRONTEND_DIGEST}')" >&2
@@ -377,7 +403,7 @@ INC_POLL_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1])))
 INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + INC_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
 RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
-                 + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + MEASURE_WAIT_S
+                 + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + ENV_AGREE_WAIT_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
 TTL_NEEDED_H=$(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 ))
 if [[ -z "$TTL_HOURS" ]]; then
@@ -392,7 +418,8 @@ TTL_S=$(( ${TTL_HOURS%.*} * 3600 ))
 TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+AGREE_LINE=""; if (( ENV_AGREE_WAIT_S > 0 )); then AGREE_LINE=" + env agreement ${ENV_AGREE_WAIT_S}"; fi
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -990,7 +1017,78 @@ write_installer_values() {
   # chart check (which renders the installer's private-image components with these same values
   # before any paid step); run 26: FRONTEND_TAG appends the frontend's image override
   python3 -m bench.installer_values --snowplow-tag "$SNOWPLOW_TAG" --frontend-tag "$FRONTEND_TAG" \
-      --out "$OUT/installer-values.yaml"
+      --snowplow-env "$SNOWPLOW_ENV" --out "$OUT/installer-values.yaml"
+}
+# snowplow_env_render: the declared snowplow env, as the pulled installer chart renders it with this
+# run's values (helm template, offline): every declared key must be in the Installer CR the chart
+# would apply (componentValues.snowplow.env), with its value. Before anything is created, in the dry
+# pass too: an installer that does not carry the declaration is found here, not on a paid cluster.
+snowplow_env_render() {
+  local line
+  if [[ -z "$SNOWPLOW_ENV" ]]; then
+    log "snowplow env: nothing declared (SNOWPLOW_ENV unset): the installer's own values are used"
+    return 0
+  fi
+  if line="$(python3 -m bench.snowplow_env render-check --installer-pulled "$OUT/installer-pulled" \
+               --values "$OUT/installer-values.yaml" --declared "$SNOWPLOW_ENV" \
+               --out "$OUT/snowplow-env-render.json" 2>"$KERR")"; then
+    log "snowplow env declared: $(python3 -m bench.snowplow_env parse --declared "$SNOWPLOW_ENV"); ${line}"
+  else
+    record_failure "snowplow-env FAILED: the installer does not render the declared snowplow env (${SNOWPLOW_ENV}): ${line}"
+    return 1
+  fi
+}
+# snowplow_env_gate: before any load, the running snowplow container must have every declared key as
+# declared (the reading tracing_reading just took: the container's env and the ConfigMaps it reads,
+# never the rendered values), and, in a launch of several runs, the keys no run declared must read
+# the same on every run. $OUT/snowplow-env.json: declared, observed, verified. A run with nothing
+# declared records its reading too (the undeclared keys are compared all the same).
+snowplow_env_gate() {
+  local line rc=0
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.snowplow_env check --declared '$SNOWPLOW_ENV' --tracing $OUT/tracing.json --out $OUT/snowplow-env.json (the running pod must have every declared key as declared)"
+    if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then
+      log "DRY: python3 -m bench.snowplow_env agree --dir $SNOWPLOW_ENV_DIR --arm $BENCH_ARM --arms $SNOWPLOW_ENV_ARMS --wait-s $ENV_AGREE_WAIT_S"
+    fi
+    return 0
+  fi
+  line="$(python3 -m bench.snowplow_env check --declared "$SNOWPLOW_ENV" --tracing "$OUT/tracing.json" \
+            --arm "$BENCH_ARM" --out "$OUT/snowplow-env.json" 2>"$KERR")" || rc=$?
+  if (( rc != 0 )); then
+    # the other runs of the launch are not kept waiting for a reading that will not come
+    if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then mkdir -p "$SNOWPLOW_ENV_DIR"; : > "$SNOWPLOW_ENV_DIR/${BENCH_ARM}.gone"; fi
+    record_failure "measure FAILED before any load: snowplow env ${line:-$(kerr_line)}"
+    return 1
+  fi
+  log "snowplow env ${line}"
+  [[ -n "$SNOWPLOW_ENV_DIR" ]] || return 0
+  mkdir -p "$SNOWPLOW_ENV_DIR"
+  cp "$OUT/snowplow-env.json" "$SNOWPLOW_ENV_DIR/.${BENCH_ARM}.part" && mv "$SNOWPLOW_ENV_DIR/.${BENCH_ARM}.part" "$SNOWPLOW_ENV_DIR/${BENCH_ARM}.json"
+  rc=0
+  # shellcheck disable=SC2086
+  local bound=$(( ENV_AGREE_WAIT_S + 60 ))      # the wait, and the comparison's own minute
+  line="$(bounded "$bound" python3 -m bench.snowplow_env agree --dir "$SNOWPLOW_ENV_DIR" \
+            --arm "$BENCH_ARM" --arms $SNOWPLOW_ENV_ARMS --wait-s "$ENV_AGREE_WAIT_S" \
+            --out "$OUT/snowplow-env-agree.json" 2>"$KERR")" || rc=$?
+  if (( rc != 0 )); then
+    record_failure "measure FAILED before any load: ${line:-the readings of the runs could not be compared: $(kerr_line)}"
+    return 1
+  fi
+  log "snowplow env: ${line}"
+}
+# s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the pod's reading and the
+# gate, the operations record, and ONE block with everything the rehearsal exists to show.
+s_rehearsal() {
+  local gate=0
+  tracing_reading before
+  snowplow_env_gate || gate=$?
+  cluster_operations
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.snowplow_env rehearsal-report --out-dir $OUT"
+    return 0
+  fi
+  python3 -m bench.snowplow_env rehearsal-report --out-dir "$OUT" 2>&1 | while IFS= read -r ln; do log "$ln"; done
+  return "$gate"
 }
 # s_registry: BEFORE any cluster exists, the pull token must resolve every
 # repo-override chart the installer turns on, and every private-image
@@ -1723,6 +1821,9 @@ s_measure() {
   # any restart or OOM during measure makes the run INVALID, with its reason).
   snowplow_pod_record before
   tracing_reading before
+  # the declared snowplow env, proven from the running pod (and agreed between the launch's runs)
+  # before anything loads it
+  snowplow_env_gate || return 1
   # Standard memory capture (#710): kubectl top every TOP_POLL_S from here
   # (each sample bounded by it, #919), plus the in-cluster mem606 Job
   # (memstats + heap profiles, metadata only). The boot's own samples end here:
@@ -2648,7 +2749,7 @@ s_evaluate() {
   local trargs=(--tracing "$OUT/tracing.json")
   # #1422: the cluster's operations (cluster_operations), marked on every measured phase; a missing or
   # unreadable record reads "operations could not be read", never "none"
-  local opargs=(--cluster-operations "$OUT/cluster-operations.json")
+  local opargs=(--cluster-operations "$OUT/cluster-operations.json" --snowplow-env "$OUT/snowplow-env.json")
   # run 26: the frontend override and its digest, judged like snowplow's (none without FRONTEND_TAG)
   local feargs=()
   if [[ -n "$FRONTEND_TAG" ]]; then
@@ -2707,7 +2808,8 @@ sys.exit(0 if isinstance(v, dict) and v.get("verdict") in ("PASS", "FAIL", "INVA
   done < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])).get("report") or {}
 print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
                              "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only",
-                             "host_load_report_only", "incluster_report_only", "cluster_operations_report_only")
+                             "host_load_report_only", "incluster_report_only", "cluster_operations_report_only",
+                             "snowplow_env")
                  for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever
@@ -2975,6 +3077,7 @@ step login-contract s_login_contract
 step cert-manager-source s_cert_manager_source
 step schema    s_schema
 step registry  s_registry
+step snowplow-env snowplow_env_render
 step reap      s_reap
 step up        s_up
 step psi       s_psi
@@ -2983,6 +3086,11 @@ step install   s_install
 step platform  s_wait_platform
 if [[ "$VERIFY483" == "1" ]]; then step verify483 s_verify483; fi
 step env       s_env
+if [[ "$REHEARSAL" == "env" ]]; then
+  step rehearsal s_rehearsal
+  log "rehearsal complete: $OUT (no load ran; the teardown deletes the cluster)"
+  exit 0
+fi
 step preflight s_preflight
 step data      s_data
 if [[ "$LOAD_DRIVER" == "k6" ]]; then step classes s_classes; fi
