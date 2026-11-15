@@ -22,10 +22,11 @@ func isBuiltinGroup(group string) bool {
 }
 
 // listedResources is the snapshot's discovery.resources as the rule reads it: each group version's
-// resource names, in the list's order. An entry that is null or not an object, and one whose name
-// is absent or not a string, names nothing and is skipped; a group version whose list is null or
-// has no resources lists nothing. A `resources` that is not a list is refused, naming the group
-// version.
+// resource names, in the list's order. A group version whose list is null or has no resources lists
+// nothing. A `resources` that is not a list is refused, naming the group version, and so is an entry
+// whose name is not a non-empty string (a null entry, one that is not an object, a name that is
+// absent, null, not a string or ""), naming the group version and the entry's index; both for every
+// group version, the built-in ones too.
 func listedResources(snapshot []byte) (map[string][]string, error) {
 	var snap struct {
 		Discovery struct {
@@ -45,11 +46,11 @@ func listedResources(snapshot []byte) (map[string][]string, error) {
 		if err := json.Unmarshal(list["resources"], &entries); err != nil {
 			return nil, fmt.Errorf("discovery.resources[%q]: resources is not a list", gv)
 		}
-		for _, e := range entries {
+		for i, e := range entries {
 			var entry map[string]json.RawMessage
 			var name string
-			if json.Unmarshal(e, &entry) != nil || entry["name"] == nil || string(entry["name"]) == "null" || json.Unmarshal(entry["name"], &name) != nil {
-				continue
+			if json.Unmarshal(e, &entry) != nil || entry["name"] == nil || json.Unmarshal(entry["name"], &name) != nil || name == "" {
+				return nil, fmt.Errorf("discovery.resources[%q]: resources[%d]: name is not a non-empty string", gv, i)
 			}
 			out[gv] = append(out[gv], name)
 		}
@@ -60,22 +61,29 @@ func listedResources(snapshot []byte) (map[string][]string, error) {
 // crdlessTypes is the rule applied to a snapshot: the resources its discovery lists (listedResources)
 // in a group that is not built in, whose CRD is not among its objects as the rule asks. A
 // subresource entry counts as its resource: the name up to its first "/". The CRD is the
-// CustomResourceDefinition of apiextensions.k8s.io (any version of that group) whose metadata.name
-// is exactly <plural>.<group>; of two with one name, the last among the objects. Each offender is
-// named once, as one of
+// CustomResourceDefinition of apiextensions.k8s.io/v1, exactly, whose metadata.name is exactly
+// <plural>.<group>; of two with one name, the last among the objects. Each offender is named once,
+// sorted, as
 //
 //	<group/version> <plural> (no CustomResourceDefinition <plural>.<group>)
-//	<group/version> <plural> (CustomResourceDefinition <plural>.<group>: spec.group is "x", expected "<group>")
-//	<group/version> <plural> (CustomResourceDefinition <plural>.<group>: spec.names.plural is "x", expected "<plural>")
-//	<group/version> <plural> (CustomResourceDefinition <plural>.<group> does not serve <version>)
 //
-// sorted; a CRD whose spec.group and spec.names.plural both disagree says both, joined by " and ",
-// and a field that is absent or not a string "is not a string".
+// or, for a CRD that is there, with everything that is wrong with it, joined by " and ":
+//
+//	<group/version> <plural> (CustomResourceDefinition <plural>.<group>: <reason> and <reason>)
+//	    spec.group is "x", expected "<group>"
+//	    spec.names.plural is "x", expected "<plural>"
+//	    spec.versions names "<a version>" more than once
+//	    does not serve <version>
+//
+// A spec.group or spec.names.plural that is absent or not a string "is not a string".
 //
 // The version is the group version after its first "/". It is served by a spec.versions entry with
-// that name, exactly, and served the boolean true, any such entry if several have the name: a
-// spec.versions that is missing, empty or not a list serves nothing, and so do an entry that is not
-// an object or has no name, and a served that is absent or anything but true ("true", 1).
+// that name, exactly, and served the boolean true: a spec.versions that is missing, empty or not a
+// list serves nothing, and so do an entry that is not an object or has no name, and a served that
+// is absent or anything but true ("true", 1). A CRD that names any version in more than one entry
+// is malformed (a real apiserver rejects it: spec.versions[i].name: Duplicate value) and no entry is
+// chosen: the type that needs it is refused. Only a CRD a listed custom type needs is read, so a
+// malformed CRD no listed type needs is not this rule's to refuse.
 //
 // A real apiserver derives a custom type's discovery entry from its CRD (spec.group,
 // spec.names.plural and each served version), so it never lists one without the other; the fake
@@ -86,11 +94,12 @@ func crdlessTypes(listed map[string][]string, objects []map[string]any) []string
 	type crdSpec struct {
 		group, plural any
 		served        map[string]bool
+		twice         []string // the version names more than one spec.versions entry has, sorted
 	}
 	crds := map[string]crdSpec{} // by metadata.name
 	for _, obj := range objects {
 		av, _ := obj["apiVersion"].(string)
-		if g, _ := splitGV(av); obj["kind"] != "CustomResourceDefinition" || g != "apiextensions.k8s.io" {
+		if obj["kind"] != "CustomResourceDefinition" || av != "apiextensions.k8s.io/v1" {
 			continue
 		}
 		md, _ := obj["metadata"].(map[string]any)
@@ -102,12 +111,21 @@ func crdlessTypes(listed map[string][]string, objects []map[string]any) []string
 		names, _ := spec["names"].(map[string]any)
 		crd := crdSpec{group: spec["group"], plural: names["plural"], served: map[string]bool{}}
 		versions, _ := spec["versions"].([]any)
+		entries := map[string]int{}
 		for _, v := range versions {
 			vm, _ := v.(map[string]any)
-			if n, ok := vm["name"].(string); ok && vm["served"] == true {
+			n, ok := vm["name"].(string)
+			if !ok {
+				continue
+			}
+			if entries[n]++; entries[n] == 2 {
+				crd.twice = append(crd.twice, n)
+			}
+			if vm["served"] == true {
 				crd.served[n] = true
 			}
 		}
+		sort.Strings(crd.twice)
 		crds[name] = crd
 	}
 	disagrees := func(field string, found any, want string) string {
@@ -144,11 +162,14 @@ func crdlessTypes(listed map[string][]string, objects []map[string]any) []string
 					wrong = append(wrong, d)
 				}
 			}
-			switch {
-			case len(wrong) > 0:
+			for _, v := range crd.twice {
+				wrong = append(wrong, "spec.versions names "+strconv.Quote(v)+" more than once")
+			}
+			if !crd.served[version] {
+				wrong = append(wrong, "does not serve "+version)
+			}
+			if len(wrong) > 0 {
 				out = append(out, fmt.Sprintf("%s %s (CustomResourceDefinition %s: %s)", gv, plural, crdName, strings.Join(wrong, " and ")))
-			case !crd.served[version]:
-				out = append(out, fmt.Sprintf("%s %s (CustomResourceDefinition %s does not serve %s)", gv, plural, crdName, version))
 			}
 		}
 	}

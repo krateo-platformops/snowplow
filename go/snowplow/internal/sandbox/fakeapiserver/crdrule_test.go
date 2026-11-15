@@ -12,6 +12,7 @@ package fakeapiserver
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -76,7 +77,9 @@ func refusal(t *testing.T, edit func(map[string]any), extra ...map[string]any) s
 	return ""
 }
 
-// noCRD, unserved and wrongSpec are the three refusals of one listed type.
+// noCRD is the refusal of a listed type with no CRD; wrongSpec, of one whose CRD is there and
+// wrong, with what is wrong with it; unserved is wrongSpec for a CRD that only does not serve the
+// version.
 func noCRD(gv, plural string) string {
 	g, _ := splitGV(gv)
 	return gv + " " + plural + " (no CustomResourceDefinition " + plural + "." + g + ")"
@@ -84,7 +87,7 @@ func noCRD(gv, plural string) string {
 
 func unserved(gv, plural string) string {
 	g, v := splitGV(gv)
-	return gv + " " + plural + " (CustomResourceDefinition " + plural + "." + g + " does not serve " + v + ")"
+	return gv + " " + plural + " (CustomResourceDefinition " + plural + "." + g + ": does not serve " + v + ")"
 }
 
 func wrongSpec(gv, plural, what string) string {
@@ -220,6 +223,8 @@ func TestCRDRule_OnlyAnApiextensionsCustomResourceDefinitionCounts(t *testing.T)
 		"a CustomResourceDefinition of another group": func(o map[string]any) { o["apiVersion"] = "example.io/v1" },
 		"a group that only ends like it":              func(o map[string]any) { o["apiVersion"] = "x.apiextensions.k8s.io/v1" },
 		"an apiVersion with no group":                 func(o map[string]any) { o["apiVersion"] = "v1" },
+		"another version of apiextensions.k8s.io":     func(o map[string]any) { o["apiVersion"] = "apiextensions.k8s.io/v1beta1" },
+		"the bare group":                              func(o map[string]any) { o["apiVersion"] = "apiextensions.k8s.io" },
 		"another kind of apiextensions.k8s.io":        func(o map[string]any) { o["kind"] = "CustomResourceDefinitionList" },
 	} {
 		crd := namedCRD(t, "panels."+widgetsGroup)
@@ -310,7 +315,11 @@ func TestCRDRule_TheCRDsSpecMustBeThatGroupAndPlural(t *testing.T) {
 		{"spec.names.plural wrong", specJ(eG, "panelsets", served), plural(`"panelsets"`)},
 		{"spec.names.plural the singular", specJ(eG, "panel", served), plural(`"panel"`)},
 		{"both wrong", specJ("x.example.io", "boards", served), group(`"x.example.io"`) + " and " + plural(`"boards"`)},
-		{"both wrong and the version unserved: the spec is what is said", specJ("x.example.io", "boards", `[]`), group(`"x.example.io"`) + " and " + plural(`"boards"`)},
+		{"both wrong and the version unserved: all three are said", specJ("x.example.io", "boards", `[]`), group(`"x.example.io"`) + " and " + plural(`"boards"`) + " and does not serve v1"},
+		{"spec.group wrong and the version unserved", specJ("x.example.io", "panels", `[{"name":"v1","served":false}]`), group(`"x.example.io"`) + " and does not serve v1"},
+		{"spec.names.plural wrong and another version served", specJ(eG, "boards", `[{"name":"v2","served":true}]`), plural(`"boards"`) + " and does not serve v1"},
+		{"spec.group wrong, a version named twice and the listed one unserved", specJ("x.example.io", "panels", `[{"name":"v2","served":true},{"name":"v2","served":true}]`),
+			group(`"x.example.io"`) + ` and spec.versions names "v2" more than once and does not serve v1`},
 		{"spec.names missing", `{"group":"` + eG + `","versions":` + served + `}`, plural("not a string")},
 		{"spec.names null", `{"group":"` + eG + `","names":null,"versions":` + served + `}`, plural("not a string")},
 		{"spec.names a string", `{"group":"` + eG + `","names":"panels","versions":` + served + `}`, plural("not a string")},
@@ -322,8 +331,8 @@ func TestCRDRule_TheCRDsSpecMustBeThatGroupAndPlural(t *testing.T) {
 		{"spec.group null", `{"group":null,"names":{"plural":"panels"},"versions":` + served + `}`, group("not a string")},
 		{"spec.group not a string", `{"group":1,"names":{"plural":"panels"},"versions":` + served + `}`, group("not a string")},
 		{"spec.group empty", specJ("", "panels", served), group(`""`)},
-		{"no spec", `null`, group("not a string") + " and " + plural("not a string")},
-		{"a spec that is a string", `"panels"`, group("not a string") + " and " + plural("not a string")},
+		{"no spec", `null`, group("not a string") + " and " + plural("not a string") + " and does not serve v1"},
+		{"a spec that is a string", `"panels"`, group("not a string") + " and " + plural("not a string") + " and does not serve v1"},
 	} {
 		want := c.want
 		if want != "" {
@@ -337,7 +346,7 @@ func TestCRDRule_TheCRDsSpecMustBeThatGroupAndPlural(t *testing.T) {
 	eq(t, crdRule(t, list, `[`+bad+`,`+good+`]`), "", "an inconsistent CRD shadowed by a later consistent one")
 	// Each group version that lists the type is refused, the same way.
 	eq(t, crdRule(t, `{"`+eGV+`":{"resources":[{"name":"panels"}]},"`+eG+`/v2":{"resources":[{"name":"panels/status"}]}}`, `[`+bad+`]`),
-		wrongSpec(eGV, "panels", group(`"x.example.io"`))+"; "+wrongSpec(eG+"/v2", "panels", group(`"x.example.io"`)), "every group version's listing")
+		wrongSpec(eGV, "panels", group(`"x.example.io"`))+"; "+wrongSpec(eG+"/v2", "panels", group(`"x.example.io"`)+" and does not serve v2"), "every group version's listing")
 }
 
 // The same clause through New, on a real CRD.
@@ -395,6 +404,12 @@ func TestCRDRule_SpecConversionIsNotRead(t *testing.T) {
 func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 	panels := namesJ(eGV, "panels")
 	refusedNoCRD, refusedUnserved := noCRD(eGV, "panels"), unserved(eGV, "panels")
+	twice := func(version string, more ...string) string {
+		return wrongSpec(eGV, "panels", strings.Join(append([]string{"spec.versions names " + version + " more than once"}, more...), " and "))
+	}
+	noName := func(gv string, i int) string {
+		return `error: discovery.resources["` + gv + `"]: resources[` + strconv.Itoa(i) + `]: name is not a non-empty string`
+	}
 	for _, c := range []struct{ what, resources, objects, want string }{
 		// spec.versions empty, null, a string or an object: not served, refused.
 		{"spec.versions empty", panels, `[` + panelsJ(`[]`) + `]`, refusedUnserved},
@@ -430,10 +445,18 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"a key with two slashes, v1 served", namesJ(eG+"/v1/x", "panels"), `[` + panelsJ(served) + `]`, unserved(eG+"/v1/x", "panels")},
 		{"a key with two slashes, x served", namesJ(eG+"/v1/x", "panels"), `[` + panelsJ(`[{"name":"x","served":true}]`) + `]`, unserved(eG+"/v1/x", "panels")},
 
-		// Duplicate version names with different served values: accepted if ANY entry has served true.
-		{"the version twice, served then not", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v1","served":false}]`) + `]`, ""},
-		{"the version twice, not served then served", panels, `[` + panelsJ(`[{"name":"v1","served":false},{"name":"v1","served":true}]`) + `]`, ""},
-		{"the version twice, never served", panels, `[` + panelsJ(`[{"name":"v1","served":false},{"name":"v1"}]`) + `]`, refusedUnserved},
+		// Duplicate spec.versions[].name: the CRD is malformed and the type that needs it is refused,
+		// whatever the entries' served say and in either order.
+		{"the version twice, served then not", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v1","served":false}]`) + `]`, twice(`"v1"`)},
+		{"the version twice, not served then served", panels, `[` + panelsJ(`[{"name":"v1","served":false},{"name":"v1","served":true}]`) + `]`, twice(`"v1"`)},
+		{"the version twice, served twice", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v1","served":true}]`) + `]`, twice(`"v1"`)},
+		{"the version three times", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v1","served":true},{"name":"v1","served":true}]`) + `]`, twice(`"v1"`)},
+		{"the version twice, never served: both are said", panels, `[` + panelsJ(`[{"name":"v1","served":false},{"name":"v1"}]`) + `]`, twice(`"v1"`, "does not serve v1")},
+		{"another version twice, the listed one served", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v2","served":true},{"name":"v2","served":false}]`) + `]`, twice(`"v2"`)},
+		{"two versions twice: each is named, sorted", panels, `[` + panelsJ(`[{"name":"v2"},{"name":"v1","served":true},{"name":"v2"},{"name":"v1"}]`) + `]`,
+			wrongSpec(eGV, "panels", `spec.versions names "v1" more than once and spec.versions names "v2" more than once`)},
+		{"a malformed CRD no listed type needs", panels, `[` + panelsJ(served) + `,` + crdJ("boards."+eG, specJ(eG, "boards", `[{"name":"v1","served":true},{"name":"v1","served":true}]`)) + `]`, ""},
+		{"a malformed CRD of a built-in group's type", namesJ("apps/v1", "boards"), `[` + crdJ("boards.apps", specJ("apps", "boards", `[{"name":"v1"},{"name":"v1"}]`)) + `]`, ""},
 
 		// Two CRDs with the same name: the LAST one in the object list decides.
 		{"two CRDs of the name, the last serves", panels, `[` + panelsJ(`[]`) + `,` + panelsJ(served) + `]`, ""},
@@ -445,15 +468,19 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"panels//status is panels'", namesJ(eGV, "panels//status"), `[` + panelsJ(served) + `]`, ""},
 		{"panels//status, no CRD", namesJ(eGV, "panels//status"), `[]`, refusedNoCRD},
 		{"/status, no CRD matches", namesJ(eGV, "/status"), `[` + panelsJ(served) + `]`, noCRD(eGV, "")},
-		{"an empty name, no CRD matches", namesJ(eGV, ""), `[` + panelsJ(served) + `]`, noCRD(eGV, "")},
 
 		// A subresource whose CRD is present but whose parent entry is absent from the list: accepted.
 		{"a subresource alone, its CRD present", namesJ(eGV, "panels/status"), `[` + panelsJ(served) + `]`, ""},
 		{"a subresource alone, no CRD", namesJ(eGV, "panels/status"), `[]`, refusedNoCRD},
 
-		// A CRD counts only if kind is CustomResourceDefinition and its apiVersion's GROUP is
-		// apiextensions.k8s.io (any version of that group); found by exact metadata.name.
-		{"apiextensions.k8s.io/v1beta1", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/v1beta1","kind":"CustomResourceDefinition"`) + `]`, ""},
+		// A CRD counts only if kind is CustomResourceDefinition and its apiVersion is exactly
+		// apiextensions.k8s.io/v1; found by exact metadata.name.
+		{"apiextensions.k8s.io/v1", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition"`) + `]`, ""},
+		{"apiextensions.k8s.io/v1beta1", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/v1beta1","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
+		{"the bare group apiextensions.k8s.io", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
+		{"apiextensions.k8s.io/v1/x", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/v1/x","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
+		{"apiextensions.k8s.io/V1", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/V1","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
+		{"no apiVersion", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
 		{"another group's CustomResourceDefinition", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"example.io/v1","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
 		{"a group that ends like it", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"x.apiextensions.k8s.io/v1","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
 		{"another kind", panels, `[` + crdJ("panels."+eG, specJ(eG, "panels", served), `"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinitionList"`) + `]`, refusedNoCRD},
@@ -464,12 +491,20 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"a CRD whose name is not a string", panels, `[{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":1},"spec":` + specJ(eG, "panels", served) + `}]`, refusedNoCRD},
 		{"a CRD with no metadata", panels, `[{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","spec":` + specJ(eG, "panels", served) + `}]`, refusedNoCRD},
 
-		// A resource entry whose name is not a string, or a null entry: skipped.
-		{"an entry whose name is a number", listJ(eGV, `{"name":1}`), `[]`, ""},
-		{"an entry whose name is null", listJ(eGV, `{"name":null}`), `[]`, ""},
-		{"an entry with no name", listJ(eGV, `{"kind":"Panel"}`), `[]`, ""},
-		{"a null entry", listJ(eGV, `null`), `[]`, ""},
-		{"skipped entries beside a listed one", listJ(eGV, `null`, `{"name":1}`, `{"name":"panels"}`, `{"name":["panels"]}`), `[]`, refusedNoCRD},
+		// A resource entry whose name is not a non-empty string refuses the snapshot, naming the
+		// group version and the entry, in every group version, the built-in ones too.
+		{"an entry whose name is a number", listJ(eGV, `{"name":1}`), `[]`, noName(eGV, 0)},
+		{"an entry whose name is null", listJ(eGV, `{"name":null}`), `[]`, noName(eGV, 0)},
+		{"an entry whose name is a list", listJ(eGV, `{"name":["panels"]}`), `[]`, noName(eGV, 0)},
+		{"an entry whose name is empty", listJ(eGV, `{"name":""}`), `[]`, noName(eGV, 0)},
+		{"an entry with no name", listJ(eGV, `{"kind":"Panel"}`), `[]`, noName(eGV, 0)},
+		{"a null entry", listJ(eGV, `null`), `[]`, noName(eGV, 0)},
+		{"an entry that is a string", listJ(eGV, `"panels"`), `[]`, noName(eGV, 0)},
+		{"an entry that is a list", listJ(eGV, `["panels"]`), `[]`, noName(eGV, 0)},
+		{"a null entry after two listed ones, their CRD present", listJ(eGV, `{"name":"panels"}`, `{"name":"panels/status"}`, `null`), `[` + panelsJ(served) + `]`, noName(eGV, 2)},
+		{"an empty name in the core group", listJ("v1", `{"name":"pods"}`, `{"name":""}`), `[]`, noName("v1", 1)},
+		{"a null entry in a built-in group", listJ("apps/v1", `null`), `[]`, noName("apps/v1", 0)},
+		{"a name that is only a slash is a string", namesJ("apps/v1", "/"), `[]`, ""},
 		{"a group version whose list is null", `{"` + eGV + `":null}`, `[]`, ""},
 		{"a list with no resources", `{"` + eGV + `":{}}`, `[]`, ""},
 		{"a list whose resources is null", `{"` + eGV + `":{"resources":null}}`, `[]`, ""},
@@ -481,12 +516,15 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"resources a string", `{"` + eGV + `":{"resources":"panels"}}`, `[]`, `error: discovery.resources["` + eGV + `"]: resources is not a list`},
 		{"resources a number", `{"` + eGV + `":{"resources":1}}`, `[]`, `error: discovery.resources["` + eGV + `"]: resources is not a list`},
 		{"resources true", `{"` + eGV + `":{"resources":true}}`, `[]`, `error: discovery.resources["` + eGV + `"]: resources is not a list`},
+		{"resources an object, in the core group", `{"v1":{"resources":{"name":"pods"}}}`, `[]`, `error: discovery.resources["v1"]: resources is not a list`},
+		{"resources a string, in a built-in group", `{"apps/v1":{"resources":"deployments"}}`, `[]`, `error: discovery.resources["apps/v1"]: resources is not a list`},
 	} {
 		eq(t, crdRule(t, c.resources, c.objects), c.want, c.what)
 	}
 }
 
-// The edges that reach New: a list that is not one is refused by name, and a null entry is skipped.
+// The edges that reach New: a list that is not one, and an entry with no name, are refused by name,
+// in a built-in group version too.
 func TestCRDRule_TheEdgesAtLoad(t *testing.T) {
 	resources := func(gv string, v any) func(map[string]any) {
 		return func(s map[string]any) {
@@ -497,9 +535,24 @@ func TestCRDRule_TheEdgesAtLoad(t *testing.T) {
 		eq(t, refusal(t, resources(widgetsGV, v)), `snapshot.json: discovery.resources["`+widgetsGV+`"]: resources is not a list`, "resources "+what)
 	}
 	eq(t, refusal(t, resources(widgetsGV, nil)), "", "resources null")
-	eq(t, refusal(t, resources(widgetsGV, []any{nil})), "", "a null entry is skipped")
-	eq(t, refusal(t, resources(widgetsGV, []any{nil, apires("panels", "Panel", true)})), crdRulePrefix+noCRD(widgetsGV, "panels"), "a null entry beside a listed type")
-	eq(t, refusal(t, resources(widgetsGV, []any{apires("", "Panel", true)})), crdRulePrefix+noCRD(widgetsGV, ""), "an empty name")
+	eq(t, refusal(t, resources("apps/v1", map[string]any{"name": "deployments"})), `snapshot.json: discovery.resources["apps/v1"]: resources is not a list`, "resources an object, in a built-in group")
+	noName := func(gv string, i int) string {
+		return `snapshot.json: discovery.resources["` + gv + `"]: resources[` + strconv.Itoa(i) + `]: name is not a non-empty string`
+	}
+	eq(t, refusal(t, resources(widgetsGV, []any{nil})), noName(widgetsGV, 0), "a null entry")
+	eq(t, refusal(t, resources(widgetsGV, []any{apires("panels", "Panel", true), nil}), namedCRD(t, "panels."+widgetsGroup)), noName(widgetsGV, 1), "a null entry after a listed type")
+	eq(t, refusal(t, resources(widgetsGV, []any{apires("", "Panel", true)})), noName(widgetsGV, 0), "an empty name")
+	eq(t, refusal(t, resources(widgetsGV, []any{map[string]any{"name": 1, "kind": "Panel"}})), noName(widgetsGV, 0), "a name that is a number: this refusal, not the decoder's")
+	eq(t, refusal(t, resources(widgetsGV, []any{map[string]any{"kind": "Panel"}})), noName(widgetsGV, 0), "no name")
+	eq(t, refusal(t, withResources("apps/v1", apires("", "Deployment", true))), noName("apps/v1", 1), "an empty name in a built-in group")
+
+	// A CRD that names a version twice, through New: the refusal is this rule's.
+	crd := versionedCRD(t, "panels."+widgetsGroup, sv{"v1beta1", true}, sv{"v1beta1", false})
+	eq(t, refusal(t, listing(widgetsGV, "panels", "panels/status"), crd), crdRulePrefix+wrongSpec(widgetsGV, "panels", `spec.versions names "v1beta1" more than once`), "the listed version named twice")
+	// And a CRD wrong in its spec and in its versions: both are said.
+	crd = versionedCRD(t, "panels."+widgetsGroup, sv{"v1", true})
+	crd["spec"].(map[string]any)["group"] = zrGroup
+	eq(t, refusal(t, listing(widgetsGV, "panels"), crd), crdRulePrefix+wrongSpec(widgetsGV, "panels", `spec.group is "`+zrGroup+`", expected "`+widgetsGroup+`" and does not serve v1beta1`), "spec.group wrong and the version unserved")
 }
 
 func TestCRDRule_NothingListedAsksNothing(t *testing.T) {
