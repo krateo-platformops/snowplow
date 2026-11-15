@@ -376,13 +376,18 @@ func TestExternalFlight1320_KeyFoldsTheServiceAccountDialMark(t *testing.T) {
 // ------------------------------------------------------------- the session
 
 // The session id is not a key component: readers of different sessions share
-// one request, which carries its starter's session id. Each joiner is handed
-// that id, so its own record can name the one upstream record; the starter's
-// own record needs none (the request is its own).
-func TestExternalFlight1320_AJoinerLearnsTheSessionOfTheRequestThatAnsweredIt(t *testing.T) {
+// one request, which carries its starter's trace context and session id.
+// Each joiner is handed what identifies that one request to the upstream (the
+// trace id and span id of the traceparent written on the wire, and the
+// session id), so its own record can name it exactly; the starter's own record
+// needs none (the request is its own).
+func TestExternalFlight1320_AJoinerLearnsWhichRequestAnsweredIt(t *testing.T) {
 	c := wireCache(t)
 	o := newWireOrigin(t, heldOriginHandler)
-	opts := o.read("clickhouse", "/events")
+	const traceID, spanID = "0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331"
+	// The tracing transport injects the traceparent below the sharing; here the
+	// stage sends one itself, which reaches the wire the same way.
+	opts := o.read("clickhouse", "/events", "traceparent: 00-"+traceID+"-"+spanID+"-01")
 	read := func(session string) (context.Context, *externalAnsweredBy) {
 		ctx := customerCtx(pagebudget.PageMaxGoal)
 		if session != "" {
@@ -414,17 +419,32 @@ func TestExternalFlight1320_AJoinerLearnsTheSessionOfTheRequestThatAnsweredIt(t 
 	if got := o.requests.Load(); got != 1 {
 		t.Fatalf("origin saw %d requests; want 1", got)
 	}
-	if session, joined := starterBy.WireSession(); joined || session != "" {
-		t.Errorf("the starter's record says joined=%v session=%q; want false (its answer came from its own request)", joined, session)
+	if ref, joined := starterBy.Wire(); joined || ref != (externalWireRef{}) {
+		t.Errorf("the starter's record says joined=%v ref=%+v; want false and nothing (its answer came from its own request)", joined, ref)
 	}
+	want := externalWireRef{Session: "session-starter", TraceID: traceID, SpanID: spanID}
 	for i, by := range joinerBy {
-		if session, joined := by.WireSession(); !joined || session != "session-starter" {
-			t.Errorf("joiner %d's record says joined=%v session=%q; want true and the starter's session id", i, joined, session)
+		if ref, joined := by.Wire(); !joined || ref != want {
+			t.Errorf("joiner %d's record says joined=%v ref=%+v; want true and %+v", i, joined, ref, want)
 		}
 	}
-	// A fetch with no record on its context is unaffected, and a nil record reads as not joined.
-	if session, joined := (*externalAnsweredBy)(nil).WireSession(); joined || session != "" {
-		t.Errorf("a nil record reads joined=%v session=%q", joined, session)
+	// A nil record (a fetch with none on its context) reads as not joined.
+	if ref, joined := (*externalAnsweredBy)(nil).Wire(); joined || ref != (externalWireRef{}) {
+		t.Errorf("a nil record reads joined=%v ref=%+v", joined, ref)
+	}
+}
+
+// Only a well-formed traceparent yields ids; anything else yields none.
+func TestExternalFlight1320_TraceparentIDs(t *testing.T) {
+	const traceID, spanID = "0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331"
+	if tr, sp, ok := traceparentIDs("00-" + traceID + "-" + spanID + "-01"); !ok || tr != traceID || sp != spanID {
+		t.Errorf("a well-formed traceparent read as %q, %q, %v", tr, sp, ok)
+	}
+	for _, bad := range []string{"", "00", "00-" + traceID + "-" + spanID, "00-" + traceID[:31] + "-" + spanID + "-01",
+		"00-" + traceID + "-" + spanID[:15] + "-01", "00-" + strings.Repeat("z", 32) + "-" + spanID + "-01", "0-" + traceID + "-" + spanID + "-01"} {
+		if tr, sp, ok := traceparentIDs(bad); ok || tr != "" || sp != "" {
+			t.Errorf("traceparentIDs(%q) = %q, %q, %v; want nothing", bad, tr, sp, ok)
+		}
 	}
 }
 

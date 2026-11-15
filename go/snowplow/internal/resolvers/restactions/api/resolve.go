@@ -1607,8 +1607,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// body that could not be used) for the audit record below.
 	fctx, answer := credhttp.WithAnswer(fctx)
 	// #1320 — which request on the wire answered this read, when another
-	// reader's did: the session id that request carried, so this caller's own
-	// record can name the one upstream record. Nothing reads it yet: a read
+	// reader's did: that request's trace id, span id and session id, so this
+	// caller's own record can name it exactly. Nothing reads it yet: a read
 	// stage writes no audit record today, and the field that will carry it is
 	// being agreed with the audit schema's readers.
 	fctx, answeredByWire := withExternalAnsweredBy(fctx)

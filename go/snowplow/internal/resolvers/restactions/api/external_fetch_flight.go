@@ -93,10 +93,16 @@
 // asks for and are not in the key.
 //
 // FROM A JOINER TO THE UPSTREAM'S RECORD. The upstream sees one request, under
-// its starter's session id (W3C baggage, session.id). That id is held on the
-// wire request and handed to each joiner it answers (externalAnsweredBy on the
-// joiner's context), so a joiner's own record can name the one upstream
-// record. It is correlation data and is never logged or put on a span here.
+// its starter's trace context and session id. What identifies that one
+// request is its W3C traceparent as written on the wire: the trace id and the
+// id of the client span the tracing transport opened for it (the parent of
+// whatever span the upstream records). A session id alone does not: a caller
+// can send the same one on many requests. So the wire request holds its
+// traceparent's trace id and span id (read from the header as it is written,
+// httptrace.WroteHeaderField; absent when tracing is off) and its starter's
+// session id, and hands them to each joiner it answers (externalAnsweredBy on
+// the joiner's context), so a joiner's own record can name exactly that
+// request. They are correlation data, never logged or put on a span here.
 //
 // Nothing here logs a key, URL or header: the key is a sha256 digest.
 package api
@@ -113,6 +119,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -146,9 +153,11 @@ type externalFlight struct {
 	joinUntil time.Time
 	// customerStarted: a reader with a page budget started it.
 	customerStarted bool
-	// session is the session id the wire request carries: its starter's
-	// (audit.SessionID of the starter's context). "" when it has none.
-	session string
+	// ref is what identifies the wire request to its upstream: its starter's
+	// session id (audit.SessionID of the starter's context; set at start) and
+	// the trace id and span id of the traceparent written on the wire (set
+	// under traceMu when the header is written; empty when tracing is off).
+	ref externalWireRef
 
 	// Under c.flightsMu.
 	waiters     int
@@ -272,7 +281,7 @@ func (w *externalWire) joinOrLead(ctx context.Context) (*externalFlight, flightR
 	if customer {
 		f.joinUntil = b.Deadline()
 	}
-	f.session = audit.SessionID(ctx)
+	f.ref.Session = audit.SessionID(ctx)
 	f.ctx, f.cancel = context.WithCancel(pagebudget.Detach(ctx))
 	// A wire request that admits no more joiners is replaced in the slot; it
 	// goes on for the readers it has.
@@ -443,7 +452,10 @@ func (f *externalFlight) await(req *http.Request, led bool) (*http.Response, err
 		}
 		span.End()
 		if !led {
-			answeredBy(ctx).set(f.session)
+			f.traceMu.Lock()
+			ref := f.ref
+			f.traceMu.Unlock()
+			answeredBy(ctx).set(ref)
 		}
 		// The reader's own copy of the status line, headers and trailers.
 		resp := *f.resp
@@ -503,14 +515,41 @@ func (b *externalFlightBody) Close() error {
 	return nil
 }
 
+// externalWireRef identifies one request on the wire to whoever received it.
+type externalWireRef struct {
+	// Session is the session id the request carried in W3C baggage: its
+	// starter's. "" when the starter had none.
+	Session string
+	// TraceID and SpanID are those of the traceparent written on the wire:
+	// the trace the request belongs to, and the client span opened for this
+	// one request (the parent of the upstream's own span). Both "" when no
+	// traceparent was sent (tracing off).
+	TraceID, SpanID string
+}
+
+// traceparentIDs reads the trace id and parent (span) id of a W3C traceparent
+// header value, "version-traceid-parentid-flags". ok=false for anything else.
+func traceparentIDs(v string) (traceID, spanID string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(v), "-")
+	if len(parts) < 4 || len(parts[0]) != 2 || len(parts[1]) != 32 || len(parts[2]) != 16 {
+		return "", "", false
+	}
+	for _, p := range parts[1:3] {
+		if _, err := hex.DecodeString(p); err != nil {
+			return "", "", false
+		}
+	}
+	return parts[1], parts[2], true
+}
+
 // externalAnsweredBy says which request on the wire answered a read that sent
-// none of its own: the session id that request carried (its starter's). Put
-// on a fetch's context with withExternalAnsweredBy; filled when an attempt of
-// the fetch is answered by a request another reader started.
+// none of its own. Put on a fetch's context with withExternalAnsweredBy;
+// filled when an attempt of the fetch is answered by a request another reader
+// started.
 type externalAnsweredBy struct {
-	mu      sync.Mutex
-	joined  bool
-	session string
+	mu     sync.Mutex
+	joined bool
+	ref    externalWireRef
 }
 
 type externalAnsweredByKey struct{}
@@ -526,25 +565,25 @@ func answeredBy(ctx context.Context) *externalAnsweredBy {
 	return a
 }
 
-func (a *externalAnsweredBy) set(session string) {
+func (a *externalAnsweredBy) set(ref externalWireRef) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
-	a.joined, a.session = true, session
+	a.joined, a.ref = true, ref
 	a.mu.Unlock()
 }
 
-// WireSession is the session id of the request that answered this fetch, and
-// whether another reader's request did (false: the fetch's answer came from a
-// request it sent itself, under its own session id). Nil-safe.
-func (a *externalAnsweredBy) WireSession() (session string, joined bool) {
+// Wire is the request that answered this fetch, and whether another reader's
+// request did (false: the fetch's answer came from a request it sent itself,
+// under its own trace and session). Nil-safe.
+func (a *externalAnsweredBy) Wire() (ref externalWireRef, joined bool) {
 	if a == nil {
-		return "", false
+		return externalWireRef{}, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.session, a.joined
+	return a.ref, a.joined
 }
 
 // flightEvent is one connection-phase event of the wire request, as a joined
@@ -569,6 +608,19 @@ func (f *externalFlight) trace() *httptrace.ClientTrace {
 		f.traceMu.Unlock()
 	}
 	return &httptrace.ClientTrace{
+		// The traceparent as it goes on the wire is what identifies this
+		// request to its upstream (externalWireRef). No other header is read,
+		// and none is handed to a joiner.
+		WroteHeaderField: func(key string, value []string) {
+			if !strings.EqualFold(key, "traceparent") || len(value) == 0 {
+				return
+			}
+			if traceID, spanID, ok := traceparentIDs(value[len(value)-1]); ok {
+				f.traceMu.Lock()
+				f.ref.TraceID, f.ref.SpanID = traceID, spanID
+				f.traceMu.Unlock()
+			}
+		},
 		GotFirstResponseByte: func() {
 			// The freshness contract: once response bytes arrive, a read
 			// arriving later would be handed bytes received before it arrived.
