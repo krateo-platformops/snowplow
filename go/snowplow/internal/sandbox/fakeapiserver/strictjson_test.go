@@ -10,9 +10,13 @@ package fakeapiserver
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
+	"math/rand/v2"
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall/js"
 	"testing"
 )
 
@@ -317,20 +321,42 @@ func TestStrictJSON_NestingBound(t *testing.T) {
 	eq(t, target(1001), tooDeep, "a target alone: 1001 deep")
 }
 
-// maxSafeInteger and the forms of a number: an integer (no fraction, no exponent) is read up to
-// 2^53 in magnitude; any other literal is a float and only has to be finite as a double.
+// The forms of a number: an integer (no fraction, no exponent) is read when a double holds it
+// exactly; any other literal is a float and only has to be finite as a double. The integer rows are
+// the table agentiko-sandbox keeps too.
 func TestStrictJSON_NumberBounds(t *testing.T) {
-	eq(t, uint64(maxSafeInteger), uint64(9007199254740992), "maxSafeInteger, 2^53, as agentiko-sandbox's parsers hold it")
-	beyond := func(at, lit string) string {
-		return at + " is the integer " + lit + ", beyond 9007199254740992 in magnitude"
+	inexact := func(at, lit string) string {
+		return at + " is the integer " + lit + ", which names no double: it is neither one exactly nor one's shortest spelling"
 	}
 	infinite := func(at, lit string) string { return at + " is the number " + lit + ", which is not finite as a double" }
+	pow := func(n int64) string { return new(big.Int).Exp(big.NewInt(2), big.NewInt(n), nil).String() }
 	rows := []struct{ lit, want string }{
+		// The shared table: integers that name a double, exactly or as its shortest spelling.
 		{"0", ""}, {"-0", ""}, {"1", ""}, {"-1", ""},
-		{"9007199254740991", ""}, {"9007199254740992", ""}, {"-9007199254740992", ""},
-		{"9007199254740993", "beyond"}, {"-9007199254740993", "beyond"},
-		{"9223372036854775807", "beyond"}, {"9223372036854775808", "beyond"}, {"18446744073709551616", "beyond"},
-		{"123456789012345678901234567890123456789012345678901234567890", "beyond"},
+		{"9007199254740991", ""}, {"9007199254740992", ""}, {"-9007199254740992", ""}, {"9007199254740994", ""}, {"-9007199254740994", ""},
+		{"9223372036854775808", ""}, {"-9223372036854775808", ""}, // ±2^63, exactly
+		{"9223372036854776000", ""}, {"-9223372036854776000", ""}, // ±2^63, as String writes them (kube-apiserver's int64 maximum)
+		{"18446744073709551616", ""}, {"18446744073709552000", ""}, {"36028797018963968", ""}, // 2^64 both ways, 2^55
+		{"999999999999999868928", ""}, {"999999999999999900000", ""}, // the largest double below 1e21, both ways
+		{"92233720368547760000", ""},                  // 10 × 2^63's shortest digits: the shortest spelling of the double 9.223372036854776e19
+		{"1000000000000000000000", ""}, {pow(70), ""}, // 1e21 and 2^70: exactly only, String writes them with an exponent
+		{pow(1000), ""}, {"-" + pow(1000), ""}, {pow(1023), ""},
+		{"179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368", ""}, // the largest double
+		// Integers that name no double: neither one exactly nor one's shortest spelling.
+		{"9007199254740993", "inexact"}, {"-9007199254740993", "inexact"}, {"9007199254740995", "inexact"},
+		{"9223372036854775807", "inexact"}, {"-9223372036854775807", "inexact"}, {"9223372036854775809", "inexact"},
+		{"9223372036854776001", "inexact"}, {"9223372036854775999", "inexact"}, {"92233720368547760001", "inexact"},
+		{"18446744073709551615", "inexact"}, {"18446744073709552001", "inexact"},
+		{"999999999999999999999", "inexact"},  // its double is 1e21, which String writes 1e+21
+		{"1000000000000000000001", "inexact"}, // 1e21+1
+		{"99999999999999999999", "inexact"},   // its double is 1e20, which String writes 100000000000000000000
+		{"100000000000000000000", ""},
+		{new(big.Int).Add(new(big.Int).Exp(big.NewInt(2), big.NewInt(70), nil), big.NewInt(1)).String(), "inexact"}, // 2^70+1
+		{"1180591620717411300000", "inexact"}, // 2^70's shortest digits, written out: String writes 1.1805916207174113e+21
+		{"123456789012345678901234567890123456789012345678901234567890", "inexact"},
+		{pow(1000) + "1", "inexact"}, // 2^1000 with a digit more: ten times it, and one
+		// Integers beyond the largest double: the nearest is an infinity.
+		{strings.Repeat("9", 400), "inexact"}, {"1" + strings.Repeat("0", 399), "inexact"}, {"-" + strings.Repeat("9", 400), "inexact"}, {pow(1024), "inexact"},
 		// A fraction or an exponent makes a float, whatever its value.
 		{"9007199254740993.0", ""}, {"9007199254740993e0", ""}, {"1e20", ""}, {"1E20", ""}, {"1e+20", ""}, {"1.5e300", ""}, {"-1.5e300", ""},
 		{"1.7976931348623157e308", ""}, {"0.1", ""}, {"-0.0", ""}, {"0e0", ""}, {"1e-400", ""}, {"5e-324", ""},
@@ -340,7 +366,7 @@ func TestStrictJSON_NumberBounds(t *testing.T) {
 	for _, c := range rows {
 		want := map[string]func(at string) string{
 			"":         func(string) string { return "" },
-			"beyond":   func(at string) string { return beyond(at, c.lit) },
+			"inexact":  func(at string) string { return inexact(at, c.lit) },
 			"infinite": func(at string) string { return infinite(at, c.lit) },
 		}[c.want]
 		strict := func(text string, typ reflect.Type) string {
@@ -392,7 +418,7 @@ func TestStrictJSON_NumberBounds(t *testing.T) {
 	}, rawPage: func(s string) string {
 		i := strings.Index(s, "[")
 		i += strings.Index(s[i:], "{")
-		return s[:i+1] + `"zz":-9007199254740992,` + s[i+1:]
+		return s[:i+1] + `"zz":-9007199254740992,"zy":9223372036854776000,` + s[i+1:]
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -407,6 +433,14 @@ func TestStrictJSON_NumberBounds(t *testing.T) {
 		}
 	}
 	eq(t, string(held), "-9007199254740992", "-2^53 in an object is held exactly")
+	for _, bucket := range h.s.store {
+		for _, obj := range bucket {
+			if v, ok := obj["zy"]; ok {
+				held, _ = json.Marshal(v)
+			}
+		}
+	}
+	eq(t, string(held), "9223372036854776000", "an int64 maximum as kube-apiserver writes it is held as the double it names, and written back the same")
 
 	// Where the loader reads a Go integer, a float is refused by name, before the decoder.
 	typed := func(old, lit string) string {
@@ -425,13 +459,21 @@ func TestStrictJSON_NumberBounds(t *testing.T) {
 	}
 	eq(t, typed(`"afterMs":`, "1500"), "", "afterMs 1500")
 	eq(t, typed(`"afterMs":`, "9007199254740992"), "", "afterMs 2^53")
-	eq(t, typed(`"afterMs":`, "9007199254740993"), "snapshot.json: "+beyond("scripted.applyStatus[0].afterMs", "9007199254740993"), "afterMs beyond 2^53")
+	eq(t, typed(`"afterMs":`, "9007199254740993"), "snapshot.json: "+inexact("scripted.applyStatus[0].afterMs", "9007199254740993"), "afterMs 2^53+1")
+	eq(t, typed(`"afterMs":`, "9223372036854775807"), "snapshot.json: "+inexact("scripted.applyStatus[0].afterMs", "9223372036854775807"), "afterMs the int64 maximum: a double would round it")
+	eq(t, typed(`"afterMs":`, "-9223372036854776000"), "snapshot.json: scripted.applyStatus[0].afterMs is the integer -9223372036854776000, which does not fit the int64 read there", "afterMs -2^63 as String writes it: the integer written does not fit")
+	eq(t, typed(`"afterMs":`, "-9223372036854775808"), "", "afterMs the int64 minimum: exact, and it fits")
+	// Exact as a double, and too large for the int64 the loader reads: this refusal, not the decoder's.
+	eq(t, typed(`"afterMs":`, "9223372036854776000"), "snapshot.json: scripted.applyStatus[0].afterMs is the integer 9223372036854776000, which does not fit the int64 read there", "afterMs 9223372036854776000")
+	eq(t, typed(`"afterMs":`, "9223372036854775808"), "snapshot.json: scripted.applyStatus[0].afterMs is the integer 9223372036854775808, which does not fit the int64 read there", "afterMs 2^63")
+	eq(t, typed(`"afterMs":`, "-18446744073709551616"), "snapshot.json: scripted.applyStatus[0].afterMs is the integer -18446744073709551616, which does not fit the int64 read there", "afterMs -2^64")
+	eq(t, typed(`"schema":`, "9223372036854776000"), "snapshot.json: schema is the integer 9223372036854776000, which does not fit the int read there", "schema 9223372036854776000")
 	eq(t, typed(`"afterMs":`, "1.5"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1.5, where an integer is read", "afterMs 1.5")
 	eq(t, typed(`"afterMs":`, "1e3"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1e3, where an integer is read", "afterMs 1e3")
 	eq(t, typed(`"afterMs":`, "1500.0"), "snapshot.json: scripted.applyStatus[0].afterMs is the number 1500.0, where an integer is read", "afterMs 1500.0")
 	eq(t, typed(`"afterMs":`, "1e400"), "snapshot.json: "+infinite("scripted.applyStatus[0].afterMs", "1e400"), "afterMs 1e400")
 	eq(t, typed(`"schema":`, "1.0"), "snapshot.json: schema is the number 1.0, where an integer is read", "schema 1.0")
-	eq(t, typed(`"schema":`, "9007199254740993"), "snapshot.json: "+beyond("schema", "9007199254740993"), "schema beyond 2^53")
+	eq(t, typed(`"schema":`, "9007199254740993"), "snapshot.json: "+inexact("schema", "9007199254740993"), "schema 2^53+1")
 
 	// Forms JSON forbids are the tokenizer's to refuse, as before.
 	for _, lit := range []string{"01", "-01", "+1", ".5", "1.", "1e", "1e+", "--1", "0x10", "NaN", "Infinity", "-Infinity", "1_000", "١"} {
@@ -439,4 +481,200 @@ func TestStrictJSON_NumberBounds(t *testing.T) {
 			t.Errorf("%s was read", lit)
 		}
 	}
+}
+
+// closureSeeds are the doubles agentiko-sandbox's closure test seeds, the same here: random bit
+// patterns, integers from 2^49 to 2^65, and the neighbours of 2^53, 2^63, 2^64, 1e20, 1e21 and 2^70
+// (the four doubles on each side, and the value ±1 and ±3), each also negated.
+func closureSeeds(n int) []float64 {
+	r := rand.New(rand.NewPCG(1464, 81))
+	var out []float64
+	add := func(f float64) {
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			out = append(out, f, -f)
+		}
+	}
+	for _, x := range []float64{1 << 53, 1 << 63, 1 << 64, 1e20, 1e21, 1 << 70} {
+		add(x)
+		for _, d := range []float64{1, -1, 3, -3} {
+			add(x + d)
+		}
+		up, down := x, x
+		for k := 0; k < 4; k++ {
+			up, down = math.Nextafter(up, math.Inf(1)), math.Nextafter(down, 0)
+			add(up)
+			add(down)
+		}
+	}
+	for len(out) < n {
+		switch len(out) % 3 {
+		case 0:
+			add(math.Float64frombits(r.Uint64())) // any double
+		case 1:
+			e := 49 + r.IntN(65-49+1) // an integer in [2^e, 2^(e+1))
+			add(math.Ldexp(float64(r.Uint64N(1<<52)|1<<52), e-52))
+		default:
+			e := r.IntN(70) // an integer-valued double below 2^70, every binade alike
+			add(math.Trunc(math.Ldexp(float64(r.Uint64N(1<<52)|1<<52), e-52)))
+		}
+	}
+	return out
+}
+
+// Below 1e21, ECMAScript's String(f) of an integer-valued double is strconv.FormatFloat(f, 'f', -1,
+// 64): checked against Node's own String, in which this test runs.
+func TestStrictJSON_ShortestSpellingIsECMAScripts(t *testing.T) {
+	esString := js.Global().Get("String")
+	checked := 0
+	for _, f := range closureSeeds(1_000_000) {
+		if f != math.Trunc(f) || math.Abs(f) >= 1e21 {
+			continue
+		}
+		checked++
+		if got, want := strconv.FormatFloat(f, 'f', -1, 64), esString.Invoke(f).String(); got != want && !(f == 0 && want == "0") {
+			t.Fatalf("FormatFloat(%v) is %s, String is %s", f, got, want)
+		}
+	}
+	if checked < 600_000 {
+		t.Fatalf("only %d integer-valued doubles below 1e21 were checked", checked)
+	}
+	t.Logf("%d integer-valued doubles below 1e21: FormatFloat equals Node's String for each", checked)
+}
+
+// The rule is closed under the writer: every double, written as ECMAScript's String(f) writes it
+// (the sandbox's canonical writer), is read, and read back as the same double.
+func TestStrictJSON_TheNumberRuleIsClosedUnderTheWriter(t *testing.T) {
+	esString := js.Global().Get("String")
+	for _, f := range closureSeeds(1_000_000) {
+		lit := esString.Invoke(f).String()
+		v, err := strictJSON([]byte(lit), nil)
+		if err != nil {
+			t.Fatalf("%v written %s is refused: %v", f, lit, err)
+		}
+		back, err := v.(json.Number).Float64()
+		if err != nil || back != f && !(f == 0 && back == 0) {
+			t.Fatalf("%v written %s is read back as %v (%v)", f, lit, back, err)
+		}
+	}
+}
+
+// Every integer literal the rule reads names one double, and is held as that double: its
+// spelling as String writes it, or its exact value.
+func TestStrictJSON_AnIntegerReadNamesOneDouble(t *testing.T) {
+	for _, f := range closureSeeds(200_000) {
+		if f != math.Trunc(f) {
+			continue
+		}
+		exact, _ := new(big.Float).SetFloat64(f).Int(nil)
+		for _, lit := range []string{exact.String(), strconv.FormatFloat(f, 'f', -1, 64)} {
+			i, _ := new(big.Int).SetString(lit, 10)
+			ok := integerLiteralOk(lit, i)
+			nearest, _ := new(big.Float).SetInt(i).Float64()
+			switch {
+			case lit == exact.String() && !ok:
+				t.Fatalf("%s, exactly %v, is refused", lit, f)
+			case ok && nearest != f:
+				t.Fatalf("%s is read, and names %v, not %v", lit, nearest, f)
+			case lit != exact.String() && ok != (math.Abs(f) < 1e21):
+				t.Fatalf("%s, the shortest spelling of %v: read %v", lit, f, ok)
+			}
+		}
+	}
+}
+
+// kube-apiserver renders an int64 bound in a CRD schema as String writes its double: the maximum
+// as 9223372036854776000, the minimum as -9223372036854776000. Such a CRD is read.
+func TestStrictJSON_ACRDWithInt64BoundsAsTheApiserverWritesThem(t *testing.T) {
+	load := func(min, max string) string {
+		crd := namedCRD(t, "panels."+widgetsGroup)
+		schema := crd["spec"].(map[string]any)["versions"].([]any)[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)
+		props, _ := schema["properties"].(map[string]any)
+		if props == nil {
+			props = map[string]any{}
+			schema["properties"] = props
+		}
+		props["count"] = map[string]any{"type": "integer", "format": "int64", "minimum": "MIN-BOUND", "maximum": "MAX-BOUND"}
+		_, err := loadHarness(t, opts{edit: listing(widgetsGV, "panels"), extra: []map[string]any{crd}, rawExtra: func(text string) string {
+			if strings.Count(text, `"MIN-BOUND"`) != 1 || strings.Count(text, `"MAX-BOUND"`) != 1 {
+				t.Fatal("the bounds are not in the CRD's text once each")
+			}
+			return strings.Replace(strings.Replace(text, `"MIN-BOUND"`, min, 1), `"MAX-BOUND"`, max, 1)
+		}})
+		if err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	at := "object page 1: items[0].spec.versions[0].schema.openAPIV3Schema.properties.count."
+	eq(t, load("-9223372036854776000", "9223372036854776000"), "", "int64 bounds as kube-apiserver writes them")
+	eq(t, load("-9223372036854775808", "9223372036854775808"), "", "±2^63 written exactly")
+	eq(t, load("-9223372036854775808", "9223372036854775807"), at+"maximum is the integer 9223372036854775807, which names no double: it is neither one exactly nor one's shortest spelling", "the int64 maximum written exactly names no double")
+	eq(t, load("-9223372036854775807", "9223372036854776000"), at+"minimum is the integer -9223372036854775807, which names no double: it is neither one exactly nor one's shortest spelling", "-(2^63-1) names no double")
+}
+
+// An unpaired surrogate escape is refused anywhere, key or value; a byte that is not UTF-8 is read
+// as U+FFFD (like the sandbox's decoder), refused only in a name the rule matches; a byte order
+// mark and content after the value are refused.
+func TestStrictJSON_UnpairedSurrogates(t *testing.T) {
+	read := func(text string) string {
+		if _, err := strictJSON([]byte(text), reflect.TypeOf(Snapshot{})); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	at := func(esc string, i int) string {
+		return "the JSON holds an unpaired surrogate, " + esc + ", at byte " + strconv.Itoa(i)
+	}
+	for _, c := range []struct{ what, text, want string }{
+		{"a high surrogate alone, in a value", `{"a":"x\ud800y"}`, at(`\ud800`, 7)},
+		{"a low surrogate alone, in a value", `{"a":"x\udc00"}`, at(`\udc00`, 7)},
+		{"a high surrogate at the end of a string", `{"a":"\udbff"}`, at(`\udbff`, 6)},
+		{"a high surrogate in a key", `{"k\ud800":1}`, at(`\ud800`, 3)},
+		{"a low surrogate in a key the loader reads", `{"discovery":{"resources":{"apps/v1\udc00":{"resources":[]}}}}`, at(`\udc00`, 35)},
+		{"two high surrogates", `["\ud800\ud800"]`, at(`\ud800`, 2)},
+		{"a low then a high", `["\udc00\ud800"]`, at(`\udc00`, 2)},
+		{"a high then a non-surrogate escape", `["\ud800\u0041"]`, at(`\ud800`, 2)},
+		{"a high then a raw character", `["\ud800A"]`, at(`\ud800`, 2)},
+		{"upper-case hex", `["\uD800"]`, at(`\uD800`, 2)},
+		{"a pair, then a low alone", `["\ud83d\ude00\ude00"]`, at(`\ude00`, 14)},
+		{"a pair", `["\ud83d\ude00"]`, ""},
+		{"a pair in upper case", `["\uD83D\uDE00"]`, ""},
+		{"the last pair", `["\udbff\udfff"]`, ""},
+		{"an escaped backslash, then text like an escape", `["\\ud800"]`, ""},
+		{"an escaped quote before it", `["\"","\ud800"]`, at(`\ud800`, 7)},
+		{"outside a string it is the tokenizer's", `[1]`, ""},
+		{"a non-surrogate escape", `["\u00e9\u20ac"]`, ""},
+		{"U+FFFD written as an escape", `["\ufffd"]`, ""},
+	} {
+		eq(t, read(c.text), c.want, c.what)
+	}
+	// Bytes that are not UTF-8: read as U+FFFD, here as in the sandbox.
+	v, err := strictJSON([]byte("[\"a\xffb\",\"\xed\xa0\x80\"]"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, v.([]any)[0], "a�b", "a byte that is not UTF-8 is read as U+FFFD")
+	eq(t, strings.Count(v.([]any)[1].(string), "�") > 0, true, "a surrogate's raw bytes are not UTF-8, and read as U+FFFD")
+	// Through New: in a resource name it is refused; in data it is read.
+	_, err = loadHarness(t, opts{edit: listing("apps/v1", "pods"), rawSnap: func(s string) string {
+		return strings.Replace(s, `"name":"pods"`, "\"name\":\"po\xffds\"", 1)
+	}})
+	eq(t, err != nil && strings.Contains(err.Error(), `name "po`+"�"+`ds" is not well-formed Unicode`), true, "a byte that is not UTF-8 in a resource name")
+	_, err = loadHarness(t, opts{rawPage: func(s string) string {
+		i := strings.Index(s, "[")
+		i += strings.Index(s[i:], "{")
+		return s[:i+1] + "\"zz\":\"da\xfft\xe9a\"," + s[i+1:]
+	}})
+	eq(t, err, error(nil), "bytes that are not UTF-8 in data")
+	_, err = loadHarness(t, opts{rawPage: func(s string) string { return strings.Replace(s, `"items"`, `"it\ud800ems"`, 1) }})
+	eq(t, err != nil && strings.HasPrefix(err.Error(), `object page 0: the JSON holds an unpaired surrogate, \ud800, at byte`), true, "an unpaired surrogate in a page")
+	_, err = loadHarness(t, opts{edit: func(map[string]any) {}, rawSnap: func(s string) string {
+		return strings.Replace(s, `"resourceVersion"`, `"x\udfff":1,"resourceVersion"`, 1)
+	}})
+	eq(t, err != nil && strings.HasPrefix(err.Error(), `snapshot.json: the JSON holds an unpaired surrogate, \udfff, at byte`), true, "an unpaired surrogate in snapshot.json")
+
+	// A byte order mark, and content after the value, are refused.
+	eq(t, read("\xef\xbb\xbf{}") != "", true, "a byte order mark")
+	eq(t, read(`{} x`) != "", true, "content after the value")
+	eq(t, read(`{"a":1,"\u0061":2}`), `the top level holds the key "a" twice`, "a key twice after its escapes are read")
 }

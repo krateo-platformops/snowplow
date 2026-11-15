@@ -33,10 +33,11 @@ func isBuiltinGroup(group string) bool {
 // would serve such a type as an empty list it knows nothing about (no schema, no selectable
 // fields), and nothing would say so (#1464).
 
-// wellFormed says a name read from JSON is the name that was written. encoding/json decodes an
-// unpaired surrogate escape ("\ud800") and a byte that is not UTF-8 as U+FFFD, where JavaScript
-// keeps the surrogate, so two different names would compare equal here and differ there; a name
-// that holds U+FFFD after decoding, written so or not, is refused.
+// wellFormed says a name holds no U+FFFD. strictJSON has refused every unpaired surrogate escape;
+// a byte that is not UTF-8 is read as U+FFFD, here and by the sandbox's decoder. A name the rule
+// matches (a resource name, a CRD's metadata.name, spec.group, spec.names.plural and
+// spec.versions[].name) is refused with U+FFFD in it, written so or decoded so; elsewhere (a
+// group-version key, a kind, any data) U+FFFD is a character like another.
 func wellFormed(name string) bool { return !strings.ContainsRune(name, '\uFFFD') }
 
 // listedResources is what the snapshot's discovery lists: each group version's resource names, in
@@ -47,7 +48,7 @@ func wellFormed(name string) bool { return !strings.ContainsRune(name, '\uFFFD')
 //     object without resources or with resources null or anything but an array);
 //   - an entry whose name is not a non-empty string (a null entry, one that is not an object, a
 //     name that is absent, null, not a string or "");
-//   - a group version or a resource name that is not well-formed Unicode.
+//   - a resource name that holds U+FFFD (wellFormed).
 //
 // A snapshot with no discovery.resources (absent or null) lists nothing.
 func listedResources(snapshot any) (listed map[string][]string, problems []string) {
@@ -62,10 +63,6 @@ func listedResources(snapshot any) (listed map[string][]string, problems []strin
 	}
 	listed = map[string][]string{}
 	for gv, v := range resources {
-		if !wellFormed(gv) {
-			problems = append(problems, fmt.Sprintf("discovery.resources[%s] is not well-formed Unicode", strconv.Quote(gv)))
-			continue
-		}
 		list, _ := v.(map[string]any)
 		entries, ok := list["resources"].([]any)
 		if !ok {

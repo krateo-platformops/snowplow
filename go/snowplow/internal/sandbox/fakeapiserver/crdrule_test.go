@@ -739,18 +739,31 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"discovery.resources 0", `0`, `[]`, "discovery.resources is not an object"},
 		{"discovery.resources an empty string", `""`, `[]`, "discovery.resources is not an object"},
 
-		// A name that is not well-formed Unicode: an unpaired surrogate, which Go reads as U+FFFD and
-		// JavaScript keeps, so two names could be one here and two there.
-		{"a group version with an unpaired surrogate", namesJ(eG+`/v1\ud800`, "panels"), `[]`, `discovery.resources["` + eG + `/v1` + "\uFFFD" + `"] is not well-formed Unicode`},
-		{"a resource name with an unpaired surrogate", namesJ(eGV, `panels\udc00`), `[` + goodJ(`panels\udc00.`+eG, served) + `]`, `discovery.resources["` + eGV + `"]: resources[0]: name "panels` + "\uFFFD" + `" is not well-formed Unicode`},
-		{"a resource name with U+FFFD itself", namesJ(eGV, "panels\uFFFD"), `[]`, `discovery.resources["` + eGV + `"]: resources[0]: name "panels` + "\uFFFD" + `" is not well-formed Unicode`},
-		{"a resource name with an unpaired surrogate, in a built-in group", namesJ("apps/v1", `pods\ud800`), `[]`, `discovery.resources["apps/v1"]: resources[0]: name "pods` + "\uFFFD" + `" is not well-formed Unicode`},
-		{"a surrogate pair is a character", namesJ("apps/v1", `pods😀`), `[]`, ""},
-		{"a CRD name with an unpaired surrogate", `{}`, `[` + goodJ(`boards\ud800.`+eG, served) + `]`, `objects: CustomResourceDefinition "boards` + "\uFFFD" + `.` + eG + `": a name in it is not well-formed Unicode`},
-		{"a CRD's spec.group with an unpaired surrogate", `{}`, `[` + crdJ("boards."+eG, specJ(eG+`\ud800`, "boards", served)) + `]`,
+		// U+FFFD in a name the rule matches is refused: a resource name, a CRD's metadata.name,
+		// spec.group, spec.names.plural, spec.versions[].name, decoded from bytes that are not UTF-8 or
+		// written so. In a group-version key, a kind or any data it is a character like another.
+		// (An unpaired surrogate escape is refused before, anywhere: TestStrictJSON_UnpairedSurrogates.)
+		{"a resource name with U+FFFD", namesJ(eGV, "panels\uFFFD"), `[]`, `discovery.resources["` + eGV + `"]: resources[0]: name "panels` + "\uFFFD" + `" is not well-formed Unicode`},
+		{"a resource name with U+FFFD, in a built-in group", namesJ("apps/v1", "pods\uFFFD"), `[]`, `discovery.resources["apps/v1"]: resources[0]: name "pods` + "\uFFFD" + `" is not well-formed Unicode`},
+		{"a group-version key with U+FFFD", namesJ("apps/v1\uFFFD", "deployments"), `[]`, ""},
+		{"a group-version key with U+FFFD, in a group with it", namesJ("apps\uFFFD/v1", "deployments"), `[]`, ""},
+		{"a kind with U+FFFD", listJ("apps/v1", `{"name":"deployments","kind":"Deploy\uFFFDment"}`), `[]`, ""},
+		{"a surrogate pair is a character", namesJ("apps/v1", `pods\ud83d\ude00`), `[]`, ""},
+		{"a CRD name with U+FFFD", `{}`, `[` + goodJ("boards\uFFFD."+eG, served) + `]`, `objects: CustomResourceDefinition "boards` + "\uFFFD" + `.` + eG + `": a name in it is not well-formed Unicode`},
+		{"a CRD's spec.group with U+FFFD", `{}`, `[` + crdJ("boards."+eG, specJ(eG+"\uFFFD", "boards", served)) + `]`,
 			`objects: CustomResourceDefinition "boards.` + eG + `": a name in it is not well-formed Unicode and metadata.name is not <spec.names.plural>.<spec.group>, "boards.` + eG + "\uFFFD" + `"`},
-		{"a CRD's version name with an unpaired surrogate", `{}`, `[` + goodJ("boards."+eG, `[{"name":"v1\udfff","served":true}]`) + `]`, `objects: CustomResourceDefinition "boards.` + eG + `": a name in it is not well-formed Unicode`},
-		{"two version names that differ only in their unpaired surrogates", panels, `[` + panelsJ(`[{"name":"v1","served":true},{"name":"v\ud800"},{"name":"v\udc00"}]`) + `]`, `objects: CustomResourceDefinition "panels.` + eG + `": a name in it is not well-formed Unicode`},
+		{"a CRD's spec.names.plural with U+FFFD", `{}`, `[` + crdJ("boards."+eG, specJ(eG, "boards\uFFFD", served)) + `]`,
+			`objects: CustomResourceDefinition "boards.` + eG + `": a name in it is not well-formed Unicode and metadata.name is not <spec.names.plural>.<spec.group>, "boards` + "\uFFFD" + `.` + eG + `"`},
+		{"a CRD's version name with U+FFFD", `{}`, `[` + goodJ("boards."+eG, `[{"name":"v1\uFFFD","served":true}]`) + `]`, `objects: CustomResourceDefinition "boards.` + eG + `": a name in it is not well-formed Unicode`},
+		{"U+FFFD in a CRD's data", `{}`, `[` + crdJ("boards."+eG, `{"group":"`+eG+`","names":{"plural":"boards","kind":"Bo\uFFFDard"},"versions":[{"name":"v1","served":true}]}`) + `]`, ""},
+		// The CRD of another group with a capitalised name is not the group's, and not a CRD.
+		{"a CustomResourceDefinition of Apiextensions.k8s.io/v1", panels, `[` + goodJ("panels."+eG, served, `"apiVersion":"Apiextensions.k8s.io/v1","kind":"CustomResourceDefinition"`) + `]`, refusedNoCRD},
+		// Object-typed positions: a CRD's metadata, spec, spec.names and each spec.versions entry.
+		{"a CRD's metadata a list", `{}`, `[{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":["boards.` + eG + `"],"spec":` + specJ(eG, "boards", served) + `}]`, "objects: a CustomResourceDefinition: metadata.name is not a non-empty string"},
+		{"a CRD's spec a list", `{}`, `[` + crdJ("boards."+eG, `[]`) + `]`, `objects: CustomResourceDefinition "boards.` + eG + `": spec.group is not a non-empty string and spec.names.plural is not a non-empty string and spec.versions is not a list`},
+		{"a CRD's spec.names null", `{}`, `[` + crdJ("boards."+eG, `{"group":"`+eG+`","names":null,"versions":[]}`) + `]`, `objects: CustomResourceDefinition "boards.` + eG + `": spec.names.plural is not a non-empty string`},
+		{"a spec.versions entry that is a list", `{}`, `[` + goodJ("boards."+eG, `[["v1"]]`) + `]`, `objects: CustomResourceDefinition "boards.` + eG + `": spec.versions[0]: name is not a non-empty string`},
+		{"an integer literal 99999999999999999999 in discovery", listJ("apps/v1", `{"name":"deployments","x":99999999999999999999}`), `[]`, "strict: discovery.resources.apps/v1.resources[0].x is the integer 99999999999999999999, which names no double: it is neither one exactly nor one's shortest spelling"},
 	} {
 		eq(t, crdRule(t, c.resources, c.objects), c.want, c.what)
 	}

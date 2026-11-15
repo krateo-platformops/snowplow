@@ -59,6 +59,8 @@ type opts struct {
 	// rawSnap and rawPage rewrite snapshot.json's and page 0's text, after edit and pageEdit: for
 	// what a Go map cannot hold (a key twice).
 	rawSnap, rawPage func(string) string
+	// rawExtra rewrites the extra objects' page text.
+	rawExtra func(string) string
 }
 
 func readFixture(t *testing.T, rel string) []byte {
@@ -112,6 +114,9 @@ func loadHarness(t *testing.T, o opts) (*harness, error) {
 	pages := [][]byte{page0}
 	if len(o.extra) > 0 {
 		b, _ := json.Marshal(map[string]any{"items": o.extra})
+		if o.rawExtra != nil {
+			b = []byte(o.rawExtra(string(b)))
+		}
 		pages = append(pages, b)
 	}
 	n := 0
