@@ -69,6 +69,16 @@ func readFixture(t *testing.T, rel string) []byte {
 
 func newHarness(t *testing.T, o opts) *harness {
 	t.Helper()
+	h, err := loadHarness(t, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// loadHarness is newHarness with New's refusal returned, for the tests of what New refuses.
+func loadHarness(t *testing.T, o opts) (*harness, error) {
+	t.Helper()
 	h := &harness{t: t, now: time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)}
 	snap := readFixture(t, "snapshot.json")
 	if o.edit != nil {
@@ -110,10 +120,10 @@ func newHarness(t *testing.T, o opts) *harness {
 		NewUID: func() string { n++; return fmt.Sprintf("uid-%05d", n) },
 	})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	h.s = s
-	return h
+	return h, nil
 }
 
 // advance moves the clock, running due timers in order (outside the harness lock).

@@ -75,7 +75,9 @@ const (
 	maxJSONPatchOps = 10000           // apiserver patch.go maxJSONPatchOperations
 )
 
-// New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first.
+// New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first. The one
+// rule it keeps itself is SNAPSHOT.md §3's (isBuiltinGroup): a custom type in discovery has its CRD
+// among the objects, since everything the fake knows of a custom type it reads from that CRD.
 func New(o Options) (*Server, error) {
 	if o.Clock == nil {
 		o.Clock = time.Now
@@ -146,6 +148,9 @@ func New(o Options) (*Server, error) {
 				}
 			}
 		}
+	}
+	if missing := crdlessTypes(s.snap.Discovery.Resources, objects); len(missing) > 0 {
+		return nil, fmt.Errorf("snapshot.json discovery.resources: custom types (their group is not built in) with no CRD among the objects: %s", strings.Join(missing, "; "))
 	}
 	for _, obj := range objects {
 		loc, ok := s.locate(obj)
