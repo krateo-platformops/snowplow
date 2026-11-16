@@ -433,7 +433,9 @@ def report(path: str | None) -> dict:
         f"INFO snowplow env declared: {declared_text(rec.get('declared') or {})}; "
         + (f"the process and the pod's env have it as declared; undeclared Go runtime keys in the env: {und}"
            if rec.get("verified") else f"NOT verified: {rec.get('why')}"),
-        f"INFO {READ_FINDING}: {read_text(read)}"] + load_start_lines(rec.get("load_start"))
+        f"INFO {READ_FINDING}: {read_text(read)}" + (
+            f"; {STALL_SHARED_NODE}" if (read or {}).get("stall") and isinstance(rec.get("load_start"), dict) else "")]
+        + load_start_lines(rec.get("load_start"))
         + boot_window_lines(rec.get("boot_window")))
 
 
@@ -459,12 +461,39 @@ def load_start_lines(ls: dict | None) -> list[str]:
     if not isinstance(ls, dict):
         return ["INFO load start: NO RECORD (load-start.json: no load was applied, or a run that predates it)"]
     ans = ls.get("read_answered_from_ready_s")
-    return [f"INFO load start: Ready at {_utc(ls['ready_at'])}; the drivers applied at {_utc(ls['applied_at'])} = "
-            f"Ready + {ls['offset_s']} s; the Go runtime read answered at "
-            + (f"Ready + {ans} s" if ans is not None else "NO TIME (it never answered)"),
-            f"INFO load start: load starts at Ready + {ls['offset_s']} s in this arm, and in every arm right after "
-            f"{ls.get('after') or 'the reboot, the digest gate and the pod record'}: the Go runtime read runs alongside "
-            f"the load and never delays it"]
+    out = [f"INFO load start: Ready at {_utc(ls['ready_at'])}; the drivers applied at {_utc(ls['applied_at'])} = "
+           f"Ready + {ls['offset_s']} s; the Go runtime read answered at "
+           + (f"Ready + {ans} s" if ans is not None else "NO TIME (it never answered)"),
+           f"INFO load start: load starts at Ready + {ls['offset_s']} s in this arm, and in every arm right after "
+           f"{ls.get('after') or 'the reboot, the digest gate and the pod record'}: the Go runtime read runs alongside "
+           f"the load and never delays it"]
+    # #1494 (5): the drivers' first request reaching snowplow (their own records), after their pods' start and
+    # login ramp; (6): what the measure did right after the apply, from the load start
+    if "first_request_at" in ls:
+        fr = ls.get("first_request_from_ready_s")
+        out.append("INFO load start: the drivers' first request " + (
+            f"at {_utc(ls['first_request_at'])} = Ready + {fr} s = load start + "
+            f"{round(ls['first_request_at'] - ls['applied_at'], 1)} s ({ls.get('first_request_source')})"
+            if fr is not None else f"NOT RECORDED ({ls.get('first_request_source')})"))
+    steps = [(name, ls.get(k)) for name, k in (("the observer's top switch", "top_switch_at"),
+                                               ("the tracing read", "tracing_read_at"))]
+    if any(isinstance(t, (int, float)) for _, t in steps):
+        out.append("INFO load start: after the apply, " + ", ".join(
+            f"{name} at load start + {round(t - ls['applied_at'], 1)} s" if isinstance(t, (int, float))
+            else f"{name} NOT RECORDED" for name, t in steps))
+    return out
+
+
+def with_first_request(env: dict | None, t: float | None, source: str) -> None:
+    """#1494 (5): evaluate's: the drivers' first request into the report's load start, and its line."""
+    ls = (env or {}).get("load_start") if isinstance(env, dict) else None
+    if not isinstance(ls, dict) or not isinstance(ls.get("ready_at"), (int, float)):
+        return
+    ls["first_request_at"] = t
+    ls["first_request_source"] = source
+    ls["first_request_from_ready_s"] = round(t - ls["ready_at"], 1) if isinstance(t, (int, float)) else None
+    env["lines"] = [ln for ln in env.get("lines") or [] if not ln.startswith("INFO load start:")] + [
+        ln for ln in load_start_lines(ls)]
 
 
 def _utc(t) -> str:
@@ -501,6 +530,10 @@ def boot_window_lines(bw: dict | None) -> list[str]:
         return ["INFO boot window: NO RECORD (boot-window.json: no Go runtime read, or one that predates it)"]
     return [ln for ln in bw.get("lines") or [] if isinstance(ln, str)]
 
+
+#: #1494 (4): where a stall is reported in a measuring run (the read runs alongside the load)
+STALL_SHARED_NODE = ("runtime606 runs on the loadgen node beside the drivers (the load starts right after Ready): "
+                     "a stall it saw is not only snowplow's")
 
 #: the stall's own finding, named so in the record, the report and the run log
 READ_FINDING = "the measure's first snowplow read (runtime606, /debug/vars as the debug reader)"
@@ -567,7 +600,8 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparab
             f"Ready + {ob if ob is not None else 'UNKNOWN'} s"
             + (f": a difference of {round(abs(oa - ob), 1)} s (the bench holds no tolerance for it: reported, not "
                f"judged)" if oa is not None and ob is not None else ": the difference is UNKNOWN")
-            + "; in every arm the load starts right after the reboot, the digest gate and the pod record")
+            + "; in every arm the load starts right after the reboot, the digest gate and the pod record"
+            + _first_requests_said(sa, sb, labels))
     out["disagree"] = agreement(_sec(va), _sec(vb), labels)
     if out["disagree"]:
         out["lines"].append("INVALID arms: snowplow env, compared after the measure from each arm's reading: "
@@ -575,6 +609,17 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparab
     if not_comparable:
         out["lines"].append(f"INFO not comparable with {not_comparable}")
     return out
+
+
+def _first_requests_said(sa: dict | None, sb: dict | None, labels: tuple[str, str]) -> str:
+    """#1494 (5): the pair's Ready -> first request, both arms, when either records it."""
+    fa, fb = ((s_ or {}).get("first_request_from_ready_s") for s_ in (sa, sb))
+    if fa is None and fb is None:
+        return ""
+    return (f"; the drivers' first request: {labels[0]} at Ready + {fa if fa is not None else 'UNKNOWN'} s, "
+            f"{labels[1]} at Ready + {fb if fb is not None else 'UNKNOWN'} s"
+            + (f" (a difference of {round(abs(fa - fb), 1)} s, reported, not judged)" if fa is not None and fb is not None
+               else ""))
 
 
 def _sec(v: dict | None) -> dict | None:

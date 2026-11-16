@@ -2031,7 +2031,20 @@ s_measure() {
   # (memstats + heap profiles, metadata only). The boot's own samples end here:
   # the observer switches top_boot to top at once (#1297).
   observer_signal top
+  local top_at
+  top_at="$(python3 -c 'import time; print(round(time.time(), 3))')"
   tracing_reading before
+  # #1494 (6): the top switch and the tracing read, as times, into the load start's record (offsets from it in
+  # the report)
+  if [[ "$DRY" != "1" ]]; then
+    python3 -c 'import json, sys, time
+p, top = sys.argv[1], float(sys.argv[2])
+r = json.load(open(p))
+r.update(top_switch_at=top, tracing_read_at=round(time.time(), 3))
+open(p + ".part", "w").write(json.dumps(r))' "$OUT/load-start.json" "$top_at" \
+      && mv "$OUT/load-start.json.part" "$OUT/load-start.json" \
+      || log "WARNING: the top switch and the tracing read could not be added to $OUT/load-start.json"
+  fi
   go_runtime_finish
   if snowplow_env_check; then
     [[ "$DRY" == "1" ]] || log "snowplow env ${SNOWPLOW_ENV_LINE}"
@@ -2977,6 +2990,12 @@ s_evaluate() {
     # a bounded call like any other, so a stop mid-hold leaves no sleep behind (#1170)
     bounded 60 sleep 60 || true
   fi
+  # #1494: the exact evaluate argv, its run dir as {OUT}, kept with the evidence: `python3 -m bench.load606
+  # reevaluate <run dir>` re-runs it on a fetched copy with any later bench
+  python3 -c 'import json, sys; o = sys.argv[1]; print(json.dumps([x.replace(o, "{OUT}") for x in sys.argv[2:]]))' "$OUT" \
+      "${files[@]}" ${r8[@]+"${r8[@]}"} --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
+      ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${opargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} \
+      > "$OUT/evaluate-argv.json" || log "WARNING: the evaluate argv could not be recorded ($OUT/evaluate-argv.json)"
   # #871: --profile-dir attributes mem606's CPU profiles by the snowplow_work label
   python3 -m bench.load606 evaluate "${files[@]}" ${r8[@]+"${r8[@]}"} \
       --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
@@ -3012,7 +3031,7 @@ sys.exit(0 if isinstance(v, dict) and v.get("verdict") in ("PASS", "FAIL", "INVA
 print("\n".join(ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
                              "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only",
                              "host_load_report_only", "incluster_report_only", "cluster_operations_report_only",
-                             "snowplow_env")
+                             "snowplow_env", "boot_window_overlap_report_only")
                  for ln in (r.get(k) or {}).get("lines") or []))' \
              "$OUT/verdict.json" 2>/dev/null || true)
   # A verdict is a result, not a tooling failure: the step succeeds whatever

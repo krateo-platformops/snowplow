@@ -1929,7 +1929,12 @@ def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
     # another before its load: the owner's ruling, 2026-11-16): a key no run declared that differs disqualifies
     from bench import snowplow_env
     labs = tuple(label.split(":", 1)) if label and ":" in label else ("1st", "2nd")
-    for d_ in snowplow_env.agreement(*(snowplow_env._sec(v) for v in verdicts), labs):
+    try:
+        diffs = snowplow_env.agreement(*(snowplow_env._sec(v) for v in verdicts), labs)
+    except Exception as e:  # noqa: BLE001 — #1494 (1): a comparison that raised fails closed: no calibration
+        diffs = [f"they could not be compared ({type(e).__name__}: {e}): whether a key no run declared differs "
+                 f"is UNKNOWN"]
+    for d_ in diffs:
         why.append(f"the two runs' snowplow env, compared after the measure: {d_}")
     if provs[0].get("image_digest") != provs[1].get("image_digest"):
         why.append(f"the two runs ran different images ({provs[0].get('image_digest')} vs "
@@ -2071,6 +2076,17 @@ def arms_pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_com
                 "lines": [f"INFO arms: what they differ in is UNKNOWN: the comparison failed: {type(e).__name__}: {e}"]}
 
 
+def boot_window_pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
+    """#1494 (4), INFO only: each arm's boot-window overlap per phase (bench/bootwindow.py pair_overlap). A failure
+    of the comparison reads as unknown, never as "not overlapped"."""
+    from bench import bootwindow
+    try:
+        return bootwindow.pair_overlap(va, vb, labels)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes the verdict
+        return {"result": "INFO", "error": f"{type(e).__name__}: {e}", "gate_marked": {},
+                "lines": [f"INFO boot window overlap: UNKNOWN: the comparison failed: {type(e).__name__}: {e}"]}
+
+
 def cluster_operations_pair(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
     """#1422, INFO only: the two runs' cluster_operations_report_only (bench/clusterops.py) per measured
     phase, and the phases ONE arm measured under a cluster operation and the other did not. A failure
@@ -2139,6 +2155,8 @@ def main(argv: list[str] | None = None) -> int:
             # measured a phase under a cluster operation and whose other did not says so
             out["cluster_operations_report_only"] = cluster_operations_pair(
                 *(_verdict_of(d) for d in a.dirs), tuple(f"{x} (replica arm)" for x in a.in_run.split(":", 1)))
+            out["boot_window_overlap_report_only"] = boot_window_pair(
+                *(_verdict_of(d) for d in a.dirs), tuple(f"{x} (replica arm)" for x in a.in_run.split(":", 1)))
         json.dump(out, sys.stdout, indent=1, sort_keys=True)
         print()
         return 0
@@ -2194,13 +2212,32 @@ def main(argv: list[str] | None = None) -> int:
     out["arms"] = arms_pair(va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"), a.not_comparable)
     # ... and, AFTER the measure, whether a key no arm declared reads the same on both (the owner's ruling,
     # 2026-11-16: no arm waits for another before its load): one that differs makes the pair INVALID, named
-    if out["arms"].get("disagree"):
+    # #1494 (1): the comparison fails CLOSED: one that raised (arms_pair caught it, report-only) is INVALID too,
+    # named, never "they agree"
+    disagree = ([f"the arms' snowplow env could not be compared ({out['arms']['error']}): whether a key no arm "
+                 f"declared differs is UNKNOWN"] if out["arms"].get("error") else out["arms"].get("disagree") or [])
+    if disagree:
+        # #1494 (2): PRECEDENCE: INVALID over FAIL (a candidate restart, or a cell past its bar) and over PASS: a
+        # pair whose arms did not run the same undeclared environment compares more than the two images, so its
+        # FAIL does not stand as the image's FAIL any more than its PASS would. The FAIL's own reasons are kept.
+        was = out.get("verdict")
         out["verdict"] = "INVALID"
         out.setdefault("invalid_reasons", []).extend(
-            f"customer_latency.pair.snowplow_env_agreement: {d}" for d in out["arms"]["disagree"])
+            f"customer_latency.pair.snowplow_env_agreement: {d}" for d in disagree)
+        out.setdefault("notes", []).append(
+            f"PRECEDENCE: INVALID (the arms' snowplow env, compared after the measure) over {was}: a pair whose arms "
+            f"did not run the same undeclared environment compares more than the two images, so neither its FAIL nor "
+            f"its PASS stands"
+            + ("; the FAIL's own reasons are kept (fail_reasons)" if was == "FAIL" and out.get("fail_reasons") else ""))
     # #1422: each arm's cluster operations per measured phase, and the phases only one arm measured under one
     out["cluster_operations_report_only"] = cluster_operations_pair(
         va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"))
+    # #1494 (4): the phases either arm's boot-window probes or goroutine dump overlapped, and the cells over them
+    out["boot_window_overlap_report_only"] = bw = boot_window_pair(
+        va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"))
+    if bw.get("gate_marked") and isinstance(out.get("cells"), list):
+        from bench import bootwindow
+        out["cells"] = [bootwindow.cell_mark(c, bw["gate_marked"]) if isinstance(c, dict) else c for c in out["cells"]]
     try:
         text = json.dumps(out, indent=1, default=str)
     except Exception as e:  # noqa: BLE001 — the paired verdict file is never left empty

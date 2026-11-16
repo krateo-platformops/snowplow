@@ -1152,7 +1152,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         mode = os.environ.get("FAKE_DRIVE_STREAM", "whole")
         if mode == "nofile":
             print("tar: /out/nav.jsonl: Cannot stat", file=sys.stderr); sys.exit(1)
-        navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v,
+        # a navigation's record carries its start (NavResult.start, epoch s), as the driver writes it
+        navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v, "start": round(time.time() - 3 + v, 3),
                  "wall_ms": 50, "calls": 3, "errors": 0, "sched_lag_ms": 1} for v in (1, 2)]
         recs = ([{"kind": "drive_start", "t": 1.0}] + navs
                 + [{"kind": "drive_end", "t": 2.0, "ok": True, "rc": 0, "reason": None,
