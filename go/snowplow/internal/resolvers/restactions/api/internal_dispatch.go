@@ -127,6 +127,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -546,7 +547,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
-			slog.String("resolved_path", call.Path),
+			redact.PathAttr("resolved_path", call.Path),
 			slog.String("note", "Task #118 — a jq-templated name/namespace segment folded to empty (string+null); the intended by-name GET became a cluster-wide LIST"),
 		)
 	}

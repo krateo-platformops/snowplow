@@ -12,6 +12,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -76,7 +77,10 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 		response.Encode(wri, st)
 		return
 	}
-	response.Encode(wri, response.New(code, fmt.Errorf("%s", statusErr.Status().Message)))
+	// #1481 — the reason derived from the code that agrees with it
+	// (credhttp.ReasonForCode): a 502 answers no reason, never plumbing's
+	// InternalError (a 500's), as the stage failure itself records it.
+	response.Encode(wri, credhttp.FailureStatus(code, fmt.Errorf("%s", statusErr.Status().Message)))
 }
 
 // dependencyFailureFallback is the 424 message when the dependency's own

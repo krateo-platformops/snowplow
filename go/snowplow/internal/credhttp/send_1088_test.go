@@ -409,9 +409,11 @@ func TestDo1088_NonOKAnswerIsAlwaysAFailure(t *testing.T) {
 		if tc.code == http.StatusForbidden && (st.Message != "forbidden: cm x" || st.Reason != "Forbidden") {
 			t.Fatalf("a Status body lost its message or reason: %+v", st)
 		}
-		// A body that names no reason gets plumbing's reason for the code; a
-		// code plumbing does not map keeps none (never an invented one).
-		wantReason := map[int]string{http.StatusInternalServerError: "InternalError", http.StatusBadGateway: "", http.StatusGatewayTimeout: "", http.StatusForbidden: "Forbidden"}[tc.code]
+		// A body that names no reason gets the reason derived from the code
+		// when it agrees with the code (#1481, ReasonForCode): 504 is Timeout
+		// since plumbing v1.84.0; a 502 keeps none (plumbing's InternalError
+		// is 500's reason).
+		wantReason := map[int]string{http.StatusInternalServerError: "InternalError", http.StatusBadGateway: "", http.StatusGatewayTimeout: "Timeout", http.StatusForbidden: "Forbidden"}[tc.code]
 		if string(st.Reason) != wantReason {
 			t.Fatalf("%d: reason %q, want %q (derived from the code)", tc.code, st.Reason, wantReason)
 		}

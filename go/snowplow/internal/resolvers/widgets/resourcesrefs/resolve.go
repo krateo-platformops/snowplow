@@ -16,6 +16,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -183,7 +184,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			slog.String("name", in.Name),
 			slog.String("namespace", in.Namespace),
 			slog.String("verb", verb),
-			slog.String("path", el.Path),
+			redact.PathAttr("path", el.Path),
 			slog.Bool("allowed", el.Allowed),
 		)
 	}
