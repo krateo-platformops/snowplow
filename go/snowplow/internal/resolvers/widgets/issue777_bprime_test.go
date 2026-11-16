@@ -300,6 +300,10 @@ var b777Consumers = map[string]string{
 	// #874 — reads the apiRef RA's own output slice (continue/cursor) to emit
 	// status.resourcesRefs.slice; only reached with a resourcesRefs fan-out.
 	"cache.SourcePagination": "spec.apiRef (reads the apiRef RA output's slice; an absent apiRef yields an empty dict, declaring nothing)",
+	// #1476 — reads only the apiRef error's TYPE and the CR's apiRef
+	// coordinates to choose the failure line's level; it puts nothing in the
+	// body.
+	"apiRefFailureLevel": "spec.apiRef (classifies the apiRef error for its log level; extras-free, writes no body)",
 }
 
 // TestB777_ExtrasConsumersAreEnumerated — B10, the Go-side structural guard. It
@@ -438,7 +442,7 @@ var b777Walked = map[string]bool{"Resolve": true, "resolveApiRef": true}
 var b777Benign = map[string]bool{
 	"len": true, "make": true, "append": true,
 	"log.Error": true, "log.Warn": true, "log.Debug": true, "log.Info": true,
-	"log.ErrorContext": true, "log.WarnContext": true,
+	"log.ErrorContext": true, "log.WarnContext": true, "log.Log": true,
 	"slog.Any": true, "slog.String": true, "slog.Int64": true, "slog.Int": true,
 	"loggerAttr": true, "stageObject": true, "time.Since": true,
 	"maps.SetNestedField": true, "maps.StructSliceToMapSlice": true,
