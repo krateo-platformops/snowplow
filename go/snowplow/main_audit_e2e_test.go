@@ -226,8 +226,17 @@ func e2eRow(t *testing.T, recs []sdklog.Record) (map[string]string, string) {
 		t.Fatalf("%d rows, want exactly 1", len(recs))
 	}
 	a := map[string]string{}
+	versions := 0
 	for _, kv := range audittest.Attributes(recs[0]) {
 		a[string(kv.Key)] = kv.Value.Emit()
+		if string(kv.Key) == krateoaudit.KeySchemaVersion {
+			versions++
+		}
+	}
+	// Every row the real route table writes carries the schema version the
+	// shared writer stamps, as the literal "1".
+	if versions != 1 || a[krateoaudit.KeySchemaVersion] != "1" {
+		t.Errorf("krateo.audit.schema_version = %q (%d times), want exactly \"1\"", a[krateoaudit.KeySchemaVersion], versions)
 	}
 	return a, recs[0].Body().AsString()
 }
