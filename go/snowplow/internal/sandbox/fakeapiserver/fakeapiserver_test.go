@@ -56,6 +56,11 @@ type opts struct {
 	edit     func(snap map[string]any)
 	pageEdit func(objects []map[string]any)
 	extra    []map[string]any
+	// rawSnap and rawPage rewrite snapshot.json's and page 0's text, after edit and pageEdit: for
+	// what a Go map cannot hold (a key twice).
+	rawSnap, rawPage func(string) string
+	// rawExtra rewrites the extra objects' page text.
+	rawExtra func(string) string
 }
 
 func readFixture(t *testing.T, rel string) []byte {
@@ -69,6 +74,16 @@ func readFixture(t *testing.T, rel string) []byte {
 
 func newHarness(t *testing.T, o opts) *harness {
 	t.Helper()
+	h, err := loadHarness(t, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// loadHarness is newHarness with New's refusal returned, for the tests of what New refuses.
+func loadHarness(t *testing.T, o opts) (*harness, error) {
+	t.Helper()
 	h := &harness{t: t, now: time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)}
 	snap := readFixture(t, "snapshot.json")
 	if o.edit != nil {
@@ -78,6 +93,9 @@ func newHarness(t *testing.T, o opts) *harness {
 		}
 		o.edit(m)
 		snap, _ = json.Marshal(m)
+	}
+	if o.rawSnap != nil {
+		snap = []byte(o.rawSnap(string(snap)))
 	}
 	page0 := readFixture(t, "objects/000.json")
 	if o.pageEdit != nil {
@@ -90,9 +108,15 @@ func newHarness(t *testing.T, o opts) *harness {
 		o.pageEdit(pg.Items)
 		page0, _ = json.Marshal(pg)
 	}
+	if o.rawPage != nil {
+		page0 = []byte(o.rawPage(string(page0)))
+	}
 	pages := [][]byte{page0}
 	if len(o.extra) > 0 {
 		b, _ := json.Marshal(map[string]any{"items": o.extra})
+		if o.rawExtra != nil {
+			b = []byte(o.rawExtra(string(b)))
+		}
 		pages = append(pages, b)
 	}
 	n := 0
@@ -110,10 +134,10 @@ func newHarness(t *testing.T, o opts) *harness {
 		NewUID: func() string { n++; return fmt.Sprintf("uid-%05d", n) },
 	})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	h.s = s
-	return h
+	return h, nil
 }
 
 // advance moves the clock, running due timers in order (outside the harness lock).
