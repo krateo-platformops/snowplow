@@ -83,27 +83,30 @@ func createRequestOptionsChecked(ctx context.Context, log *slog.Logger, in *temp
 // iterErr (#638) is the iterator's compile/eval error: nil for a non-iterator
 // stage and for a benign nil-upstream iteration (IsBenignNilIteration).
 func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any, apiserver bool) (all []httpcall.RequestOptions, skips []skippedOption, iterErr error) {
+	elems, iterErr := stagePlanElements(ctx, log, in, dict)
+	all, skips = renderRequestOptions(log, in, elems, apiserver)
+	return all, skips, iterErr
+}
+
+// stagePlanElements is the first half of a stage's plan (#1477): the per-call
+// data each of its requests renders from, one element per request. A stage
+// without an iterator plans exactly one request, rendered from dict itself. An
+// iterator stage plans one per element of its iterator. It reads nothing but
+// the stage and dict, so the stage loop runs it BEFORE resolving the stage's
+// endpoint and resolves the endpoint only when there is an element: a stage
+// whose iterator yields nothing reads no endpointRef Secret.
+//
+// iterErr (#638) is the iterator's compile/eval error, with no elements: nil
+// for a non-iterator stage and for a benign nil-upstream iteration
+// (IsBenignNilIteration), which, like a null or no value, plans nothing.
+func stagePlanElements(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (elems []any, iterErr error) {
 	it := ""
 	if in.DependsOn != nil {
 		it = ptr.Deref(in.DependsOn.Iterator, "")
 	}
-
-	// #1123 — the path is compiled once per stage and rendered per call.
-	pt := pathtemplate.Compile(in.Path)
-
 	if len(it) == 0 {
-		all = make([]httpcall.RequestOptions, 0, 1)
-		el, ok, sr := createRequestOptionWith(in, pt, dict, apiserver)
-		if ok {
-			all = append(all, el)
-		} else {
-			recordMalformedDialSkip(log, in.Name, el.Path, sr)
-			skips = append(skips, skippedOption{path: el.Path, reason: sr})
-		}
-		return
+		return []any{dict}, nil
 	}
-
-	all = []httpcall.RequestOptions{}
 
 	// #638 — the iterator is evaluated by jqsupport.IterateValues: EXACTLY the
 	// pre-#638 jqutil.ForEach element semantics (one array → its elements; a
@@ -130,11 +133,25 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 			log.ErrorContext(ctx, "unable to execute iterator", slog.String("query", it), slog.Any("err", err))
 			iterErr = fmt.Errorf("iterator %q failed: %w", it, err)
 		}
-		return all, skips, iterErr
+		return nil, iterErr
 	}
+	return elems, nil
+}
 
-	for _, sa := range elems {
-		el, ok, sr := createRequestOptionWith(in, pt, sa, apiserver)
+// renderRequestOptions is the second half of a stage's plan: one request
+// option per element (stagePlanElements), the valid ones in all and the
+// refused ones in skips (each counted and logged once by
+// recordMalformedDialSkip). apiserver is as createRequestOptionsWithSkips
+// documents. all is never nil.
+func renderRequestOptions(log *slog.Logger, in *templates.API, elems []any, apiserver bool) (all []httpcall.RequestOptions, skips []skippedOption) {
+	all = make([]httpcall.RequestOptions, 0, len(elems))
+	if len(elems) == 0 {
+		return all, nil
+	}
+	// #1123 — the path is compiled once per stage and rendered per call.
+	pt := pathtemplate.Compile(in.Path)
+	for _, ds := range elems {
+		el, ok, sr := createRequestOptionWith(in, pt, ds, apiserver)
 		if !ok {
 			recordMalformedDialSkip(log, in.Name, el.Path, sr)
 			skips = append(skips, skippedOption{path: el.Path, reason: sr})
@@ -142,8 +159,7 @@ func createRequestOptionsWithSkips(ctx context.Context, log *slog.Logger, in *te
 		}
 		all = append(all, el)
 	}
-
-	return all, skips, iterErr
+	return all, skips
 }
 
 // recordMalformedDialSkip is the SINGLE shared skip path for the #288 guard,
