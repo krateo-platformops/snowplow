@@ -225,7 +225,19 @@ func i187Watcher(t *testing.T, registerSelfGVR bool) *cache.ResourceWatcher {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		i187GVR(): "FlexList",
 	}
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	// #1483 — the cell's representative may `get` its own object, as every
+	// identity-bound cell's did when its key was minted: its BindingUID is this
+	// binding's (uid-187). Without it the representative is denied before the
+	// re-fetch dials (objects.getFromAPIServer authorizes first), and none of
+	// these arms would reach the apiserver whose answer they test.
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds,
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "i187-reader"}, Rules: []rbacv1.PolicyRule{
+			{Verbs: []string{"get", "list"}, APIGroups: []string{i187Group}, Resources: []string{i187Resource}}}},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "i187-reader", UID: "uid-187"},
+			Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: "admin"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "i187-reader"},
+		})
 
 	// #1233 — the store admits no write until the RBAC snapshot is complete, and
 	// this watcher's RBAC informers publish a partial one first. Clear what an
