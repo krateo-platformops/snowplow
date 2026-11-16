@@ -404,6 +404,7 @@ const (
 	sw1476Reset              // the connection is reset: a transport fault
 	sw1476BadBody            // a 200 whose body does not decode
 	sw1476NotFound           // a 404 Status
+	sw1476Conflict           // a 409 Status (not retried) whose message changes on every answer
 )
 
 // switchAPI1476 is the requester's own apiserver; "sw" answers per *mode.
@@ -429,6 +430,9 @@ func switchAPI1476(t *testing.T, mode *atomic.Int32) *httptest.Server {
 		case sw1476NotFound:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
+		case sw1476Conflict:
+			w.WriteHeader(http.StatusConflict)
+			_, _ = fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","code":409,"message":"conflict %d"}`, n.Add(1))
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -449,19 +453,25 @@ func failureLevels1476(rec *rec711) []slog.Level {
 }
 
 // N4 — the class is the status line's code, never the message: an upstream
-// 500 whose message changes on every refresh is the same failure.
+// answer whose message changes on every refresh is the same failure, for a
+// code the retry client hands back as is (409) and one it turns into its own
+// error (500).
 func TestIssue1476_SameCodeDifferentMessage_IsTheSameFailure(t *testing.T) {
-	setup1476E(t)
-	var mode atomic.Int32
-	mode.Store(sw1476Upstream500)
-	srv := switchAPI1476(t, &mode)
-	rec := &rec711{}
-	for i := 0; i < 3; i++ {
-		resolveAsUser1476(t, srv.URL, "cell-1476-m", rec, stage1476("sw", "/api/v1/namespaces/team-a/configmaps/sw", false))
-	}
-	got := failureLevels1476(rec)
-	if len(got) != 3 || got[0] != slog.LevelError || got[1] != slog.LevelDebug || got[2] != slog.LevelDebug {
-		t.Fatalf("an upstream 500 with a changing message: want ERROR, DEBUG, DEBUG, got %v", got)
+	for _, m := range []int32{sw1476Conflict, sw1476Upstream500} {
+		t.Run(fmt.Sprintf("mode%d", m), func(t *testing.T) {
+			setup1476E(t)
+			var mode atomic.Int32
+			mode.Store(m)
+			srv := switchAPI1476(t, &mode)
+			rec := &rec711{}
+			for i := 0; i < 3; i++ {
+				resolveAsUser1476(t, srv.URL, "cell-1476-m", rec, stage1476("sw", "/api/v1/namespaces/team-a/configmaps/sw", false))
+			}
+			got := failureLevels1476(rec)
+			if len(got) != 3 || got[0] != slog.LevelError || got[1] != slog.LevelDebug || got[2] != slog.LevelDebug {
+				t.Fatalf("an upstream answer with a changing message: want ERROR, DEBUG, DEBUG, got %v", got)
+			}
+		})
 	}
 }
 
