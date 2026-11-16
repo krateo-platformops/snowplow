@@ -145,18 +145,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// extras through filterDeclaredKeyExtras, which keeps ONLY
 	// spec.keyExtras-declared names, and every key stripped here is by
 	// construction outside that set.
-	opts.Extras = sanitizeUndeclaredIdentityExtras(opts.In.Object, opts.Extras)
-
-	if inj := DeclaredIdentity(ctx, opts.In.Object); len(inj) > 0 {
-		merged := make(map[string]any, len(opts.Extras)+len(inj))
-		for k, v := range opts.Extras {
-			merged[k] = v
-		}
-		for k, v := range inj { // injection wins on collision (quarantine)
-			merged[k] = v
-		}
-		opts.Extras = merged
-	}
+	opts.Extras = resolveInputExtras(ctx, opts.In.Object, opts.Extras)
 
 	// Ship 0.30.193 Checkpoint 1 — widget-resolve phase wall-clocks.
 	// Captured per-phase so seedOneWidget's deferred log can attribute
@@ -398,6 +387,36 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
 
 	return apiref.Resolve(ctx, apirefOptionsFor(opts, apiRef, apiRefEff))
+}
+
+// resolveInputExtras is the request extras as Resolve hands them on: the
+// identity keys the widget has not declared stripped (A-3,
+// sanitizeUndeclaredIdentityExtras), then its declared identity injected,
+// injection winning on collision (A2, DeclaredIdentity). Resolve calls it once;
+// ApiRefExtras derives from it, so the two cannot drift.
+func resolveInputExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	extras := sanitizeUndeclaredIdentityExtras(obj, requestExtras)
+	if inj := DeclaredIdentity(ctx, obj); len(inj) > 0 {
+		merged := make(map[string]any, len(extras)+len(inj))
+		for k, v := range extras {
+			merged[k] = v
+		}
+		for k, v := range inj { // injection wins on collision (quarantine)
+			merged[k] = v
+		}
+		extras = merged
+	}
+	return extras
+}
+
+// ApiRefExtras returns the extras a Resolve of the widget obj, given
+// requestExtras, threads into its apiRef RESTAction: spec.apiRef.extras under
+// the request extras as Resolve hands them on (resolveInputExtras), exactly
+// what resolveApiRef passes to apiref.Resolve. #1477: a background resolve
+// (requestExtras nil) asks it which keys the apiRef RESTAction's dict will
+// carry, to skip a resolve that needs keys it does not.
+func ApiRefExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	return mergeRequestWins(GetApiRefExtras(obj), resolveInputExtras(ctx, obj, requestExtras))
 }
 
 // apirefOptionsFor builds the apiref.Resolve options for resolveApiRef: the
