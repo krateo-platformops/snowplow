@@ -186,11 +186,15 @@ def test_a_hung_gke_up_is_bounded_and_torn_down(harness):
 @pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 35` on the wall clock
 def test_partial_collect_has_one_wall_clock_cap(harness):
     env, state, ambient, tmp = harness
-    env = _measure_fails(env, FAKE_SLOW_LOGS="40", COLLECT_CAP_S="2")
+    # the hung read's hang: twice the whole run's bound, so a run the cap did not stop can never pass, whatever
+    # the runner's speed (#1422's settle step made the whole run a few seconds longer: 37 s seen against a 40 s
+    # hang and a 35 s bound under -n 8)
+    hang_s = 120
+    env = _measure_fails(env, FAKE_SLOW_LOGS=str(hang_s), COLLECT_CAP_S="2")
     t0 = time.time()
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
-                       capture_output=True, text=True, timeout=120)
-    assert time.time() - t0 < 35
+                       capture_output=True, text=True, timeout=2 * hang_s)
+    assert time.time() - t0 < hang_s / 2
     assert "partial collect: stopped after 2s (cap 2s reached)" in p.stderr
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
     assert gcl[-3:] == TEARDOWN_TAIL
