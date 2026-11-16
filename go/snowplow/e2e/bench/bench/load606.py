@@ -3931,8 +3931,8 @@ def _check(name, value, op, bar, checks):
 NAV_CHECKS = ("warm_nav_p95_ms", "cold_nav_p95_ms", "zero_cold_navs.first_nav_p95_ms",
               "zero_cold_navs.navs_over_cold_bar")
 #: every wall-time outcome a stall can decide (Diego's ruling, applied without special cases, #1043
-#: review): the four bars, a page that timed out, a widget that timed out
-WALL_TIME_CHECKS = NAV_CHECKS + ("browser.page_timeouts", "browser.widget_errors")
+#: review): the four bars, a page that timed out, a sign-in that did (#1508), a widget that timed out
+WALL_TIME_CHECKS = NAV_CHECKS + ("browser.page_timeouts", "browser.signin_failures", "browser.widget_errors")
 
 
 def nav_checks(navs: list[dict], th: dict) -> list[dict]:
@@ -3963,8 +3963,10 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     the page loads with their possible delay removed are the fastest the
     browser can have seen snowplow. Every WALL_TIME_CHECKS outcome is
     re-judged on them, against the verdict's OWN bars: the four page-load
-    bars on the loads' times; browser.page_timeouts without the timeouts a
-    stall overlapped (such a load may have finished in time); and
+    bars on the loads' times; browser.page_timeouts and browser.signin_failures
+    with the same subtraction (#1508): a load past its bound whose real time
+    less its stall is within the bound (a load that never completed, or whose
+    time was censored at the bound, is never flipped); and
     browser.widget_errors without the widget-timeout states of loads a stall
     overlapped. An outcome that differs (a FAIL the stall alone can explain)
     means the load generator, not snowplow, may have decided it: INVALID. No
@@ -4013,9 +4015,17 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
                   "slack_s": st.get("slack_s")})
     as_seen = {c["check"]: c["result"] for c in nav_checks(navs, th)}
     without = {c["check"]: c["result"] for c in nav_checks(fastest, th)}
-    # a page that timed out: without the stall it may have finished in time
-    as_seen["browser.page_timeouts"] = "FAIL" if any(n.get("timeout") for n in navs) else "PASS"
-    without["browser.page_timeouts"] = "FAIL" if any(n.get("timeout") and not d for n, d in zip(navs, delays)) else "PASS"
+    # a load past its bound (a page timeout, a sign-in failure): the same subtraction as the four bars (#1508).
+    # Without the stall it was within its bound only when how long it really took is KNOWN (it completed) and
+    # that time less the stall is within the bound; one that never completed, or one a browser.js before #1508
+    # stopped watching at its bound (its time censored there), cannot be flipped
+    def flips(n: dict, d: float) -> bool:
+        return n.get("completed") is True and n.get("bound_ms") is not None and n["wall_ms"] - d <= n["bound_ms"]
+
+    for chk, signin in (("browser.page_timeouts", False), ("browser.signin_failures", True)):
+        late = [(n, d) for n, d in zip(navs, delays) if n.get("timeout") and (n.get("nav") == "login") == signin]
+        as_seen[chk] = "FAIL" if late else "PASS"
+        without[chk] = "FAIL" if any(not flips(n, d) for n, d in late) else "PASS"
     # a widget that timed out, in a load a stall overlapped: the same
     if browser is not None:
         wc = k6eval.widget_error_check(browser, k6th)
@@ -4083,6 +4093,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     th = dict(THRESHOLDS, **(thresholds or {}))
     checks: list[dict] = []
     validity: list[dict] = []
+    signin_failed: list[dict] = []
+    after_failed: list[dict] = []
+    if k6 is not None:
+        # #1508: a class whose sign-in never completed signed nobody in: its later navigations are no page loads
+        navs, signin_failed, after_failed = k6eval.split_after_failed_signin(navs)
 
     first = [n["wall_ms"] for n in navs if n.get("visit") == 1]
     warm = [n["wall_ms"] for n in navs if (n.get("visit") or 0) > 1]
@@ -4153,13 +4168,26 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         if k6.get("viewers", True):
             validity.extend(k6eval.viewer_checks(k6.get("viewer"), k6.get("k6"),
                                                  k6.get("thresholds")))
-        timeouts = (k6eval.browser_report(k6.get("browser")) or {}).get("timeouts")
-        checks.append({"check": "browser.page_timeouts", "value": timeouts, "bar": "== 0",
-                       "result": "PASS" if timeouts == 0 else "FAIL",
-                       **({} if timeouts == 0 else
-                          {"why": "a real-browser page did not finish loading within its "
-                                  "timeout: the worst page load there is"})})
+        # #1508: a page load past its bound, counted from the loads themselves: never a class's sign-in (that is
+        # browser.signin_failures, once) nor a navigation of a context that never signed in; each says how long
+        # it really took, or that it never completed
+        late = [n for n in navs if n.get("timeout") and n.get("nav") != k6eval.SIGNIN_METHOD]
+        from collections import Counter
+        said = Counter(k6eval.outcome_kind(n) for n in late)
+        checks.append({"check": "browser.page_timeouts", "value": len(late), "bar": "== 0",
+                       "result": "PASS" if not late else "FAIL",
+                       **({} if not late else
+                          {"loads": [{"session": n.get("session"), "class": n.get("class"), "page": n.get("page"),
+                                      "outcome": k6eval.load_outcome(n)} for n in late],
+                           "why": f"{len(late)} real-browser page load(s) did not finish within their bound ("
+                                  + ", ".join(f"{k} {v}" for k, v in sorted(said.items()))
+                                  + "): the worst page load there is"})})
+        checks.append(k6eval.signin_failure_check(signin_failed, after_failed))
         checks.append(k6eval.widget_error_check(k6.get("browser"), k6.get("thresholds")))
+        # #1508: a session that ended before the drive's end drove fewer loads than declared: INVALID by environment
+        validity.append(k6eval.sessions_check(
+            k6eval.session_ends(k6.get("browser"), k6.get("sessions"), k6.get("logs")),
+            len(navs) + len(after_failed)))
     else:
         _check("driver.sched_lag_p95_ms",
                pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
@@ -6501,13 +6529,34 @@ def boot_window_overlap(env: dict, recs: list[dict], report: dict) -> dict:
                 "lines": [f"INFO boot window overlap: UNKNOWN ({why})"]}
 
 
-def cluster_operations_report(path: str | None, recs: list[dict], report: dict) -> dict:
+MEASURE_PHASE = "measure"
+
+
+def measure_span(recs: list[dict], report: dict, browser: dict | None = None,
+                 phases: list | None = None) -> tuple[str, float | None, float | None]:
+    """#1422 (2026-11-16): the whole measure, (MEASURE_PHASE, start, end): from the measured reboot (the boot
+    window's restart) to the drivers' last record (the latest end of a measured phase, of k6's customer calls,
+    and of a real-browser page load). No boot record: its start is not recorded (an overlap is undecided)."""
+    from bench import k6eval
+    boot = next((float(r["t_restart"]) for r in recs if r.get("kind") == "boot"
+                 and isinstance(r.get("t_restart"), (int, float))), None)
+    ends = [t1 for _, _, t1 in (phases if phases is not None else measured_phases(recs, report)) if t1 is not None]
+    span = (report.get("customer_latency") or {}).get("k6_span")
+    if span:
+        ends.append(float(span[1]))
+    ends += [n["start"] + n["wall_ms"] / 1000 for n in k6eval.browser_navs(browser)
+             if isinstance(n.get("start"), (int, float))]
+    return MEASURE_PHASE, boot, (max(ends) if ends else None)
+
+
+def cluster_operations_report(path: str | None, recs: list[dict], report: dict, browser: dict | None = None) -> dict:
     """report["cluster_operations_report_only"] (bench/clusterops.py), and its warnings added to
     report_warnings. A report that fails reads "operations could not be read", like a record that
-    is not there: never as no operation."""
+    is not there: never as no operation. Its first phase is the whole measure (measure_span)."""
     from bench import clusterops
     try:
-        sec = clusterops.report(path, measured_phases(recs, report), measured_blocks(report))
+        phases = measured_phases(recs, report)
+        sec = clusterops.report(path, [measure_span(recs, report, browser, phases), *phases], measured_blocks(report))
     except Exception as e:  # noqa: BLE001 — a report-only section never changes, nor stops, the verdict
         why = f"the report failed: {type(e).__name__}: {e}"
         sec = {"state": "UNREADABLE", "why": why, "operations": None, "phases": [],
@@ -6545,7 +6594,8 @@ def _cmd_evaluate(a) -> int:
               "browser": k6eval.read_k6_out(a.browser_out, "browser") if a.browser_out else None,
               "viewer": k6eval.read_viewer_out(a.k6_out) if a.k6_out else None,
               "viewers": not a.no_viewers,
-              "sessions": a.browser_sessions}
+              "sessions": a.browser_sessions,
+              "logs": a.browser_log}
         navs = k6eval.browser_navs(k6["browser"])
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -6652,9 +6702,20 @@ def _cmd_evaluate(a) -> int:
     # cluster-operations.json) against every measured phase: no operation overlapped, overlapped by
     # which, or the operations could not be read (never "none")
     result["report"]["cluster_operations_report_only"] = ops = cluster_operations_report(
-        a.cluster_operations, recs, result["report"])
+        a.cluster_operations, recs, result["report"], (k6 or {}).get("browser"))
     for ln in ops.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
+    # #1422, the owner's ruling (2026-11-16): an operation of the cluster overlapping the measure, or an overlap
+    # that cannot be decided, makes the run INVALID by environment; so does a control plane not settled before
+    # the measured reboot. INVALID wins over FAIL (#1495)
+    from bench import clusterops
+    env_checks = ([clusterops.overlap_check(ops)] if a.cluster_operations is not None else []) + (
+        [clusterops.settle_check(a.settle)] if a.settle is not None else [])
+    for chk in env_checks:
+        result.setdefault("validity", []).append(chk)
+        if chk["result"] == "FAIL":
+            result["verdict"] = "INVALID"
+            result.setdefault("invalid_reasons", []).append(f"{chk['check']}: {chk['why']}")
     # the run's declared snowplow env and what its pod had before the measure (bench/snowplow_env.py,
     # snowplow-env.json): INFO; the pair states from it what its arms differ in
     from bench import snowplow_env
@@ -6904,9 +6965,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="run606's snowplow-env.json (bench/snowplow_env.py): the declared snowplow env and the "
                         "pod's reading before the measure, INFO")
     e.add_argument("--cluster-operations", default=None,
-                   help="#1422: run606's cluster-operations.json (bench/clusterops.py): each measured phase is "
-                        "marked with the GKE operations that overlapped it, INFO, never judged; a missing or "
-                        "unreadable record reads 'operations could not be read', never 'none'")
+                   help="#1422: run606's cluster-operations.json (bench/clusterops.py): the measure and each "
+                        "measured phase are marked with the GKE operations that overlapped them; one that overlapped "
+                        "makes the run INVALID by environment (the owner's ruling, 2026-11-16), and so does a "
+                        "missing or unreadable record (undecided), never 'none'")
+    e.add_argument("--settle", default=None,
+                   help="#1422: run606's settle.json (bench/clusterops.py settle): a missing record, or one that "
+                        "does not say SETTLED, makes the run INVALID by environment")
+    e.add_argument("--browser-log", action="append", default=None,
+                   help="#1508: the browser driver's log (driver-k6browser-*.log, repeatable): which session's "
+                        "iteration threw, for a browser.js that recorded no session end (before #1508)")
     e.add_argument("--no-viewers", action="store_true",
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
     e.add_argument("--run8", action="store_true",

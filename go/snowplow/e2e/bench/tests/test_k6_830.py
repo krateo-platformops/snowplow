@@ -766,6 +766,9 @@ def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
     pts += [_point("browser_widget_states", 1, session=sessions[0], route="/r1", state="error")
             ] * error_states
     pts += [_point("browser_widget_states", 2, session=sessions[0], route="/r1", state="forbidden")]
+    # #1508: browser.js ends each session with its browser_session_end point (ran to the drive's end)
+    pts += [_point("browser_session_end", 1, session=s, early="no", cause="the drive is over", **{"class": "0"})
+            for s in sessions]
     return pts
 
 

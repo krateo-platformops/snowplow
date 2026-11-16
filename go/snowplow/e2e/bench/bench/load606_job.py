@@ -81,7 +81,7 @@ def render(*, users: int, shards: int, think_s: float, duration_s: float,
            builders_ns: str = "krateo-system", src: str | None = None,
            composite_routes: list[str] | tuple = (), burst_users: int = 0,
            burst_at_s: float = 600.0, viewers: bool = True,
-           linger_s: float = 3600.0) -> str:
+           linger_s: float = 3600.0, name: str = "load606") -> str:
     if not init.startswith("/call"):
         raise ValueError("init must be the frontend config.json api.INIT /call path")
     src = LOAD606_SRC.read_text() if src is None else src
@@ -126,7 +126,7 @@ exit "$rc"
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: load606
+  name: {name}
   namespace: bench-loadgen
 spec:
   completionMode: Indexed
@@ -136,7 +136,7 @@ spec:
   template:
     metadata:
       labels:
-        app: load606
+        app: {name}
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -536,8 +536,20 @@ def class_tables(specs: list[str]) -> dict[str, list[dict]]:
     return out
 
 
+#: #1422 (the owner's ruling of 2026-11-16): the warm-up Job, run606's settle step. It drives the measure's
+#: customer load (the same users, routes, think time, viewers and burst; k6, or the load606 driver) on the
+#: loaded cluster until GKE's control plane has settled, and is deleted before the measured reboot. NOT in
+#: it: the real-Chrome sessions (their fresh identity classes must reach the measure never signed in,
+#: #935), fresh606 (its probe's churn is what the measure's freshness phases time) and mem606 (a reading
+#: of the measure). WARMUP_CONTAINER: the container whose run IS the load (bench.clusterops settle waits
+#: on it, and counts the load from its start).
+WARMUP_JOB = "warmup606"
+WARMUP_CONTAINER = {"k6": "k6", "load606": "driver"}
+
+
 def render_k6_driver(a) -> str:
-    """#830: the k6 load Job and the real-Chrome Job, from the CLI args."""
+    """#830: the k6 load Job and the real-Chrome Job, from the CLI args (--warmup: the k6 load Job only,
+    as WARMUP_JOB)."""
     import os
 
     from bench import k6_job
@@ -567,6 +579,9 @@ def render_k6_driver(a) -> str:
                                [routes[0]["path"]] if a.dry_run else []),
                            menu_classes=menu_classes, class_of=class_of,
                            browser_users=[s["index"] for s in sessions], viewers=viewers)
+    if a.warmup:
+        return k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password, linger_s=a.linger_s,
+                                name=WARMUP_JOB, configmap=WARMUP_JOB)
     fresh = None
     if a.fresh_classes:
         import json
@@ -651,6 +666,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="#935: bench/fresh_classes plan JSON (each browser session's fresh identity classes)")
     p.add_argument("--browser-origin", default=None,
                    help="k6: the portal's origin as the frontend config names it (load606 portal-origin)")
+    p.add_argument("--warmup", action="store_true",
+                   help="#1422: render only the warm-up Job (WARMUP_JOB): the driver's customer load; no browser, "
+                        "no fresh606, no mem606")
     p.add_argument("--browser-snowplow-url", default=None,
                    help="k6: snowplow as the browser reaches it (config SNOWPLOW_API_BASE_URL)")
     a = p.parse_args(argv)
@@ -686,7 +704,10 @@ def main(argv: list[str] | None = None) -> int:
                             builders_ns=a.builders_ns,
                             composite_routes=a.composite_route or [],
                             burst_users=a.burst_users, burst_at_s=a.burst_at_s,
-                            viewers=not a.no_viewers, linger_s=a.linger_s))
+                            viewers=not a.no_viewers, linger_s=a.linger_s,
+                            name=WARMUP_JOB if a.warmup else "load606"))
+    if a.warmup:
+        return 0
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,

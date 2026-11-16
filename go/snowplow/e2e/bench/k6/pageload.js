@@ -371,13 +371,32 @@ function loadOf (b, here, testids) {
 // Every point of a load carries its start, t0 (epoch ms, integer): the page's
 // own (loadOf), or for a load that never settled, `actionAt`, the driver's
 // clock just before the action (the same system clock) (#1043 review B1).
-export function recordOps (r, tags, timeoutMs, actionAt) {
+// #1508: `watch` = { ms, cause } (browser.js settled): the load was watched past its bound `timeoutMs`, until
+// it settled or the drive ended, so a load past the bound is no longer censored there. `ms` is how long it
+// took from the action to the moment it settled (or to the end of the watch), on the clock the bound is
+// judged on. Past the bound (watch.ms > timeoutMs, or no load at all): a timeout, tagged with its bound and
+// `completed` yes (its value is its real time, it loaded: its widget states count) or no (its value is how
+// long it was watched; `cause` says why the watch ended). Without `watch` (a caller before #1508): r null is
+// a timeout censored at the bound, as before.
+export function recordOps (r, tags, timeoutMs, actionAt, watch) {
   const t0 = loadStart(r, actionAt)
   const at = Number.isFinite(t0) ? { t0: String(Math.round(t0)) } : {}
+  const past = watch ? watch.ms > timeoutMs : r === null
   if (r === null) {
-    const t = Object.assign({}, tags, at, { skeleton: 'timeout', timeout: 'yes' })
-    return [['browser_page_timeouts', 1, Object.assign({}, tags, at)], ['browser_page_load_ms', timeoutMs, t],
-      ['browser_page_loads', 1, t]]
+    const t = Object.assign({}, tags, at, { skeleton: 'timeout', timeout: 'yes' },
+      watch ? { bound: String(timeoutMs), completed: 'no', cause: String(watch.cause || 'not said') } : {})
+    return [['browser_page_timeouts', 1, Object.assign({}, tags, at, watch ? { bound: String(timeoutMs) } : {})],
+      ['browser_page_load_ms', watch ? Math.round(watch.ms) : timeoutMs, t], ['browser_page_loads', 1, t]]
+  }
+  if (past) {
+    const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'yes', bound: String(timeoutMs),
+      completed: 'yes' })
+    const ops = [['browser_page_timeouts', 1, Object.assign({}, tags, at, { bound: String(timeoutMs) })],
+      ['browser_page_load_ms', Math.round(watch.ms), t], ['browser_page_loads', 1, t]]
+    for (const k of Object.keys(r.states || {})) {
+      if (r.states[k]) ops.push(['browser_widget_states', r.states[k], Object.assign({}, t, { state: k })])
+    }
+    return ops
   }
   const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' })
   const ops = [['browser_page_load_ms', r.ms, t], ['browser_page_loads', 1, t]]
@@ -385,6 +404,31 @@ export function recordOps (r, tags, timeoutMs, actionAt) {
     if (r.states[k]) ops.push(['browser_widget_states', r.states[k], Object.assign({}, t, { state: k })])
   }
   return ops
+}
+
+// #1508: why the watch of a load ended without it settling: one line, at most 200 characters, never an
+// identity (`secrets`: the session's users and the password, each replaced). A waitForFunction that ran
+// out its timeout ran to the drive's end; anything else ended the watch early (the page's context went).
+export function watchCause (e, watchedMs, secrets) {
+  const line = redactAll(String(e).split('\n')[0], secrets)
+  if (/timed out/i.test(line)) return `not settled by the drive's end (watched ${Math.round(watchedMs)} ms)`
+  return `the watch ended: ${line}`.slice(0, 200)
+}
+
+export function redactAll (text, secrets) {
+  let t = String(text)
+  for (const x of secrets || []) {
+    if (x) t = t.split(x).join('<redacted>')
+  }
+  return t
+}
+
+// #1508: the browser_session_end point's tags, one per session when its iteration ends: `early` yes when it
+// ended before the drive's end (an error, or no identity class left to drive), with its `cause` (one line, at
+// most 200 characters, never an identity).
+export function sessionEndTags (session, k, early, cause, secrets) {
+  return { session, class: String(k), early: early ? 'yes' : 'no',
+    cause: redactAll(String(cause).split('\n')[0], secrets).slice(0, 200) }
 }
 
 // Run 26d (frontend 1.8.40: 0 of 5 sessions signed in): the login form contract, frontend#659
