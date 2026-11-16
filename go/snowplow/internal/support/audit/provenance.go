@@ -144,18 +144,21 @@ var (
 //
 //	source          string, required, "portal"
 //	agentSessionId  string, optional, 1-128 of [A-Za-z0-9_-]
-//	confirmationId  string, optional, lowercase UUID
-//	confirmedSet    object, with op: {count int >= 1, irreversible bool,
-//	                sha256 64 lowercase hex}, all three required, no other key
-//	op              int, with confirmedSet: >= 0 and < confirmedSet.count
+//	confirmationId  string, with confirmedSet and op: lowercase UUID
+//	confirmedSet    object, with confirmationId and op: {count int >= 1,
+//	                irreversible bool, sha256 64 lowercase hex}, all three
+//	                required, no other key
+//	op              int, with confirmationId and confirmedSet: >= 0 and
+//	                < confirmedSet.count
 //	requestedAt     string, optional, RFC 3339 with milliseconds, in range
 //	                (requestedAt)
 //
 // The top level is an object; a key not listed, a key given twice, a value of
 // another JSON type (null included) or a value outside its rule fails it.
-// source is required because the library writes no asserted key without it,
-// and confirmedSet and op come together because the library writes the four
-// confirmed_set keys together.
+// source is required because the library writes no asserted key without it.
+// confirmationId, confirmedSet and op come all three together or not at all
+// (#1333 ruling): a write no confirm gate ran for asserts none of them, and
+// the library writes the four confirmed_set keys together.
 func provenanceSchema(raw []byte) (ClientProvenance, bool) {
 	fields, ok := jsonObject(raw)
 	if !ok {
@@ -206,6 +209,13 @@ func provenanceSchema(raw []byte) (ClientProvenance, bool) {
 		}
 	}
 	if c.Source == "" || (set != nil) != hasOp {
+		return ClientProvenance{}, false
+	}
+	// A confirmation is all of it or none of it: confirmationId, confirmedSet
+	// and op together (one press of the gate, the set it confirmed, this
+	// write's place in it), or none of them for a write no gate ran for. Half
+	// a confirmation is never a truthful record.
+	if (c.ConfirmationID != "") != (set != nil) {
 		return ClientProvenance{}, false
 	}
 	if set != nil {

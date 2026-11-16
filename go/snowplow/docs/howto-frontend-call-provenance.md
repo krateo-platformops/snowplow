@@ -11,7 +11,7 @@ Everything below comes from the code: the decoder
 `internal/support/audit/provenance.go`, the emit site in
 `internal/handlers/call.go`, the CORS options and the route table in
 `main.go`, and the shared audit library
-`github.com/krateo-platformops/audit` v0.12.0 (`docs/schema.md`, "Client-asserted
+`github.com/krateo-platformops/audit` v0.13.0 (`docs/schema.md`, "Client-asserted
 provenance"). The tests named in each section are the proof.
 
 ## 1. Gate on the capability
@@ -73,12 +73,12 @@ X-Krateo-Provenance: v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJhZ2VudFNlc3Npb25JZCI6InNlc18w
 |---|---|---|---|---|
 | `source` | string | **yes** | `"portal"` | `krateo.audit.client.source` |
 | `agentSessionId` | string | no: agent-initiated writes only | 1 to 128 of `[A-Za-z0-9_-]` | `krateo.audit.client.agent_session_id` |
-| `confirmationId` | string | no | a UUID, canonical and **lower-case** (`crypto.randomUUID()`) | `krateo.audit.client.confirmation_id` |
-| `confirmedSet` | object | with `op` | exactly `{count, irreversible, sha256}`, all three | see below |
+| `confirmationId` | string | with `confirmedSet` and `op` | a UUID, canonical and **lower-case** (`crypto.randomUUID()`) | `krateo.audit.client.confirmation_id` |
+| `confirmedSet` | object | with `confirmationId` and `op` | exactly `{count, irreversible, sha256}`, all three | see below |
 | `confirmedSet.count` | integer | yes | at least 1 | `krateo.audit.client.confirmed_set.count` |
 | `confirmedSet.irreversible` | boolean | yes | `true` when any op of the set is irreversible | `krateo.audit.client.confirmed_set.irreversible` |
 | `confirmedSet.sha256` | string | yes | 64 lower-case hex digits: section 7 | `krateo.audit.client.confirmed_set.sha256` |
-| `op` | integer | with `confirmedSet` | at least 0 and less than `confirmedSet.count`: this `/call`'s index in the set | `krateo.audit.client.confirmed_set.op` |
+| `op` | integer | with `confirmationId` and `confirmedSet` | at least 0 and less than `confirmedSet.count`: this `/call`'s index in the set | `krateo.audit.client.confirmed_set.op` |
 | `requestedAt` | string | no | RFC 3339 with exactly 3 fractional digits, `Z` or `±hh:mm` with hour 00-23 and minute 00-59, a real date and time, and an instant whose UTC form is in the years 0000-9999 (`new Date().toISOString()` of a present-day date always is) | `krateo.audit.client.requested_at`, rewritten in UTC (`...Z`) |
 
 **A write no confirm gate ran for** (a sandbox-confined preview the portal
@@ -97,7 +97,7 @@ Any other key is a rejection, and so is:
 - a key that differs only in case (`Source`), or a key given twice;
 - a value of another JSON type, `null` included (`"op":"1"`, `"irreversible":"true"`);
 - an integer written with a fraction or an exponent (`1.0`, `1e1`), or past 64 bits;
-- `confirmedSet` without `op`, or `op` without `confirmedSet`;
+- half a confirmation: `confirmationId`, `confirmedSet` and `op` come all three together (a write the confirm gate confirmed) or not at all (a write no gate ran for), so a `confirmationId` alone, a `confirmedSet` and `op` without a `confirmationId`, or a `confirmedSet` without `op` is refused;
 - a top level that is not an object, or an empty object (no `source`).
 
 **Never taken from the header**, and no key exists for any of them: the user's
