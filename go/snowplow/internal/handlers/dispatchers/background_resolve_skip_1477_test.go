@@ -67,15 +67,30 @@ func widget1477(inline map[string]any) *unstructured.Unstructured {
 }
 
 // serveRA1477 makes backgroundRESTActionGetFn return the RESTAction for ra1477.
-func serveRA1477(t *testing.T, endpointName string) {
+// The returned func reports, per read so far, whether it was informer-only.
+func serveRA1477(t *testing.T, endpointName string) (informerOnly func() []bool) {
 	t.Helper()
 	orig := backgroundRESTActionGetFn
 	t.Cleanup(func() { backgroundRESTActionGetFn = orig })
-	backgroundRESTActionGetFn = func(_ context.Context, ref templatesv1.ObjectReference) objects.Result {
+	var reads []bool
+	backgroundRESTActionGetFn = func(ctx context.Context, ref templatesv1.ObjectReference) objects.Result {
+		reads = append(reads, cache.InformerOnlyReadsFromContext(ctx))
 		if ref.Name != ra1477 || ref.Namespace != h1NS {
 			return objects.Result{}
 		}
 		return objects.Result{GVR: restActionGVR, Unstructured: spokeRA1477(endpointName)}
+	}
+	return func() []bool { return append([]bool(nil), reads...) }
+}
+
+// The walk's and the widget seed's read of the apiRef RESTAction is
+// informer-only: the predicate never costs an apiserver round trip.
+func TestIssue1477_WidgetPredicateReadsInformerOnly(t *testing.T) {
+	reads := serveRA1477(t, templatedEndpoint1477)
+	walk1477(t, widget1477(nil))
+	got := reads()
+	if len(got) != 1 || !got[0] {
+		t.Fatalf("#1477 RED: the walk's predicate read must be one informer-only read; got %v", got)
 	}
 }
 

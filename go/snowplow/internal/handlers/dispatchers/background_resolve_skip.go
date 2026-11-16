@@ -151,8 +151,11 @@ func restactionNeedsRequestExtras(cr *templatesv1.RESTAction, carried map[string
 // with the extras widgets.Resolve threads into that RESTAction
 // (widgets.ApiRefExtras). A widget with no apiRef, or whose RESTAction cannot
 // be read or decoded, is not skipped: its resolve reports what it reports
-// today. The RESTAction is read through backgroundRESTActionGetFn (objects.Get,
-// the read the resolve itself makes), under ctx.
+// today. The RESTAction is read through backgroundRESTActionGetFn (objects.Get)
+// from the informer only (cache.WithInformerOnlyReads, as
+// apiref.DeclaresExternalEndpoint reads it): the predicate never costs an
+// apiserver round trip, and a RESTAction the informer does not hold is
+// resolved as before.
 func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured) bool {
 	if w == nil {
 		return false
@@ -161,7 +164,7 @@ func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured)
 	if err != nil || ref.Name == "" || ref.Namespace == "" {
 		return false
 	}
-	got := backgroundRESTActionGetFn(ctx, ref)
+	got := backgroundRESTActionGetFn(cache.WithInformerOnlyReads(ctx), ref)
 	if got.Err != nil || got.Unstructured == nil {
 		return false
 	}
