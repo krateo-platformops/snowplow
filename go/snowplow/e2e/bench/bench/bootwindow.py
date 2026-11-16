@@ -11,8 +11,10 @@ the reboot's start (boot.jsonl) and the observer's `kubectl top` of the pod thro
 (top-boot.jsonl), into <out>/bootwindow.json and ONE block of lines.
 
 Per route, in the window [Ready, Ready + window]: how many probes, their answers, how many STALLED
-(past the stall bound with no byte, or no answer at all), the longest time without a byte, and when
-the stalls began and ended relative to Ready. The reading key (the owner's, 2026-11-16):
+(past the stall bound with no byte: a late first byte, or no answer that took longer than the bound),
+how many FAILED FAST (no answer within the bound: refused, reset, a name that does not resolve), the
+longest time without a byte, and when the stalls began and ended relative to Ready. A route with
+either is NOT SERVED, which is what the reading key reads (the owner's, 2026-11-16):
   every route stalls                       network or endpoint churn (the Service's endpoints, kube-proxy)
   /readyz fast, the gated routes stall     the auth/refresh gate (every authenticated request waits on it)
   only /debug/vars stalls                  the expvar render (snowplow's /debug/vars handler itself)
@@ -56,17 +58,25 @@ def no_byte_s(p: dict) -> float:
 
 
 def stalled(p: dict, stall_s: float) -> bool:
-    return p.get("first_byte_ms") is None or p["first_byte_ms"] > stall_s * 1000.0
+    """Past the stall bound with no byte: a late first byte, or no answer that took longer than the bound."""
+    fb = p.get("first_byte_ms")
+    return fb > stall_s * 1000.0 if fb is not None else (p.get("elapsed_ms") or 0.0) > stall_s * 1000.0
+
+
+def failed(p: dict, stall_s: float) -> bool:
+    """No HTTP answer, and quickly (refused, reset, a name that does not resolve): not served, not a stall."""
+    return p.get("first_byte_ms") is None and not p.get("status") and not stalled(p, stall_s)
 
 
 def route_summary(probes: list[dict], ready: float, stall_s: float) -> dict:
-    """One route's probes started in the window: answers by status, stalls, the longest wait for a
-    byte, and the stalls' span relative to Ready (s)."""
-    st = [p for p in probes if stalled(p, stall_s)]
+    """One route's probes started in the window: answers by status, stalls, fast failures, the longest
+    wait for a byte, and the stalls' (and failures') span relative to Ready (s)."""
+    st = [p for p in probes if stalled(p, stall_s) or failed(p, stall_s)]
     statuses: dict = {}
     for p in probes:
         statuses[str(p.get("status"))] = statuses.get(str(p.get("status")), 0) + 1
-    out = {"probes": len(probes), "statuses": statuses, "stalled": len(st),
+    out = {"probes": len(probes), "statuses": statuses, "stalled": sum(1 for p in probes if stalled(p, stall_s)),
+           "failed_fast": sum(1 for p in probes if failed(p, stall_s)), "not_served": len(st),
            "max_no_byte_s": max((no_byte_s(p) for p in probes), default=None),
            "error_classes": sorted({p["error_class"] for p in probes if p.get("error_class")})}
     if st:
@@ -77,8 +87,8 @@ def route_summary(probes: list[dict], ready: float, stall_s: float) -> dict:
 
 
 def reading(routes: dict) -> str:
-    """The owner's key, over which routes stalled in the window."""
-    s = {r for r, v in routes.items() if v.get("stalled")}
+    """The owner's key, over which routes were not served in the window (a stall, or no answer at all)."""
+    s = {r for r, v in routes.items() if v.get("not_served")}
     if not all(routes.get(r, {}).get("probes") for r in ROUTES):
         return "NO READING: a route has no probe in the window"
     if not s:
@@ -160,15 +170,17 @@ def report(out_dir: str, declared: str = "", window_s: float | None = None) -> t
     rec["routes"] = routes
     for r in ROUTES:
         v = routes[r]
-        said = (f"STALLED: {v['stalled']} of {v['probes']} probes, from Ready+{v['stall_from_ready_s']} s to "
-                f"Ready+{v['stall_until_ready_s']} s, the longest {v['max_no_byte_s']} s without a byte "
-                f"({', '.join(v['stalled_at'])}{'; ' + ', '.join(v['error_classes']) if v['error_classes'] else ''})"
-                if v["stalled"] else
+        said = (f"{'STALLED' if v['stalled'] else 'NOT SERVED'}: {v['stalled']} of {v['probes']} probes stalled "
+                f"(past {stall_s:g} s without a byte), {v['failed_fast']} failed fast with no answer; from "
+                f"Ready+{v['stall_from_ready_s']} s to Ready+{v['stall_until_ready_s']} s, the longest "
+                f"{v['max_no_byte_s']} s without a byte ({', '.join(v['stalled_at'])}"
+                f"{'; ' + ', '.join(v['error_classes']) if v['error_classes'] else ''})"
+                if v["not_served"] else
                 f"no stall: {v['probes']} probes, the longest {v['max_no_byte_s']} s to a first byte")
         lines.append(f"  {SAID[r]}: {said}; answers {json.dumps(v['statuses'], sort_keys=True)}")
     pre = [p for p in probes if p["t"] < ready]
-    pre_st = {r: sum(1 for p in pre if p.get("route") == r and stalled(p, stall_s)) for r in ROUTES}
-    lines.append(f"before Ready (the old pod, then the rollout): {len(pre)} probes, stalled per route "
+    pre_st = {r: sum(1 for p in pre if p.get("route") == r and (stalled(p, stall_s) or failed(p, stall_s))) for r in ROUTES}
+    lines.append(f"before Ready (the old pod, then the rollout): {len(pre)} probes, not served per route "
                  f"{json.dumps(pre_st)}")
     rec["reading"] = reading(routes)
     lines.append(f"READING: {rec['reading']}")

@@ -513,6 +513,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             out = os.path.join(inc_dir(job), "out")
             src = os.path.join(os.environ["PYTHONPATH"].split(os.pathsep)[0], "bench", "load606.py")
             argv = [out if x == "/out" else src if x == "/opt/load606/load606.py" else x for x in c["command"]]
+            # the Service DNS names a pod resolves are the harness's fake server here
+            for flag in ("--snowplow-url", "--authn-url"):
+                if flag in argv:
+                    argv[argv.index(flag) + 1] = f"http://127.0.0.1:{port}"
             argv[argv.index("--linger-s") + 1] = "60"
             env = dict(os.environ, HOME=os.path.join(inc_dir(job)))
             for e in c.get("env", []):

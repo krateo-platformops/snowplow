@@ -384,6 +384,15 @@ def test_a_late_first_byte_is_a_stall_too():
     assert s["stalled"] == 1 and s["max_no_byte_s"] == 12.0 and s["stall_from_ready_s"] == 6.0
 
 
+def test_a_fast_failure_is_not_served_but_no_stall():
+    refused = {"kind": "probe", "route": "vars", "t": 106.0, "status": 0, "elapsed_ms": 2.0, "connect_ms": None,
+               "first_byte_ms": None, "error_class": "ConnectionRefusedError", "stalled_at": "connect"}
+    s = bootwindow.route_summary([refused], 100.0, 5.0)
+    assert (s["stalled"], s["failed_fast"], s["not_served"]) == (0, 1, 1)
+    routes = {r: bootwindow.route_summary([dict(refused, route=r)], 100.0, 5.0) for r in bootwindow.ROUTES}
+    assert bootwindow.reading(routes) == "every route stalls: network or endpoint churn"
+
+
 def test_the_report_from_a_run_dir(tmp_path):
     ready = 1794812705.0
     bw = tmp_path / "bootwindow"
@@ -414,7 +423,8 @@ def test_the_report_from_a_run_dir(tmp_path):
     assert p.returncode == 0, p.stdout + p.stderr
     said = p.stdout
     assert "READING: /readyz fast, the gated routes stall: the auth/refresh gate" in said
-    assert "/debug/vars (debug reader): STALLED: 2 of 37 probes, from Ready+5.0 s to Ready+40.0 s" in said
+    assert ("/debug/vars (debug reader): STALLED: 2 of 37 probes stalled (past 5 s without a byte), 0 failed fast "
+            "with no answer; from Ready+5.0 s to Ready+40.0 s") in said
     assert "effective GOGC [50]" in said and "NumGC +36 (from 10)" in said and "GC pauses +36.0 ms" in said
     assert "max 1358m" in said and "#1 at Ready+11.0 s: NOT saved (0: TimeoutError)" in said
     rec = json.loads(out.read_text())
