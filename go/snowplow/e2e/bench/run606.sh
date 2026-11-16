@@ -145,8 +145,13 @@ if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then ENV_AGREE_WAIT_S="${ENV_AGREE_WAIT_S_SET:-
 # probe's start, window and copy many times over).
 REHEARSAL="${BENCH_606_REHEARSAL:-}"
 case "$REHEARSAL" in ""|env|bootwindow) ;; *) echo "refusing: BENCH_606_REHEARSAL must be 'env', 'bootwindow' or unset, got '${REHEARSAL}'" >&2; exit 2 ;; esac
-read -r BOOT_EVERY_S BOOT_WINDOW_S BOOT_STALL_S HTTP_TIMEOUT_S < <(python3 -c 'from bench import load606 as l
+# (the probe's period, its window past Ready and its stall bound default to load606's BOOT_*; each may be set,
+# like every bounded step here)
+read -r boot_every boot_window boot_stall HTTP_TIMEOUT_S < <(python3 -c 'from bench import load606 as l
 print(f"{l.BOOT_EVERY_S:g} {l.BOOT_WINDOW_S:g} {l.BOOT_STALL_S:g} {l.HTTP_TIMEOUT_S:g}")')
+BOOT_EVERY_S="${BOOT_EVERY_S:-$boot_every}"
+BOOT_WINDOW_S="${BOOT_WINDOW_S:-$boot_window}"
+BOOT_STALL_S="${BOOT_STALL_S:-$boot_stall}"
 if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
   if [[ -z "$FRONTEND_TAG" || -z "$EXPECTED_FRONTEND_DIGEST" ]]; then
     echo "refusing: FRONTEND_TAG and EXPECTED_FRONTEND_DIGEST are set together or not at all (FRONTEND_TAG='${FRONTEND_TAG}', EXPECTED_FRONTEND_DIGEST='${EXPECTED_FRONTEND_DIGEST}')" >&2
@@ -1217,6 +1222,7 @@ s_bootwindow_start() {
   fi
   python3 -m bench.load606_job --boot-probe-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
       --password "$PW" --init "$PORTAL_INIT" --boot-bound-s "$BOOT_BOUND_S" --linger-s "$COLLECT_CAP_S" \
+      --boot-every-s "$BOOT_EVERY_S" --boot-window-s "$BOOT_WINDOW_S" --boot-stall-s "$BOOT_STALL_S" \
       > "$OUT/boot-probe-job.yaml"
   kapply "$OUT/boot-probe-job.yaml" >/dev/null || { record_failure "bootwindow FAILED: the boot606 Job was not created" || true; return 1; }
   : > "$OUT/.boot-started"

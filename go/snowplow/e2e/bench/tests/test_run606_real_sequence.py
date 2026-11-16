@@ -488,7 +488,9 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # FAKE_INC_POOL=<pool>: the pods land on a node of that pool; FAKE_INC_LEFT=1: data606's pod is
     # still listed when the drivers are applied; FAKE_INC_PENDING=<job>: that Job's pod is never
     # scheduled (Pending, its PodScheduled condition carrying run 24b's FailedScheduling message).
-    INC = ("data606", "observe606")
+    # boot606 (BENCH_606_REHEARSAL=bootwindow): load606.py boot-probe, run from the bench's own copy, against
+    # the harness's fake server, as its pod would
+    INC = ("data606", "observe606", "boot606")
     def inc_dir(job):
         return os.path.join(STATE, "pods", job)
     def inc_alive(job):
@@ -509,7 +511,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 continue
             c = d["spec"]["template"]["spec"]["containers"][0]
             out = os.path.join(inc_dir(job), "out")
-            argv = [out if x == "/out" else x for x in c["command"]]
+            src = os.path.join(os.environ["PYTHONPATH"].split(os.pathsep)[0], "bench", "load606.py")
+            argv = [out if x == "/out" else src if x == "/opt/load606/load606.py" else x for x in c["command"]]
             argv[argv.index("--linger-s") + 1] = "60"
             env = dict(os.environ, HOME=os.path.join(inc_dir(job)))
             for e in c.get("env", []):
@@ -1843,6 +1846,9 @@ def _fake_server(state: Path):
             q = urllib.parse.parse_qs(u.query)
             if u.path == "/basic/login":
                 return self._send({"accessToken": "fake-jwt"})
+            # bootwindow: STATE/vars-stall holds how long /debug/vars waits before its first byte
+            if u.path == "/debug/vars" and (state / "vars-stall").exists():
+                time.sleep(float((state / "vars-stall").read_text()))
             if u.path == "/call" and q.get("name") == ["bench-fresh-listdep"]:
                 m = state / "marker"
                 marker = m.read_text() if m.exists() else ""

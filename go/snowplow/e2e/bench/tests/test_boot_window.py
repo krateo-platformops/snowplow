@@ -271,8 +271,9 @@ class ProbeClient:
     """Answers per path: `stall` paths take `stall_s` with no byte (status 0) while ticking a real
     sleep (the probe's watch thread sees them in flight); everything else answers at once."""
 
-    def __init__(self, stall_paths=(), stall_s=0.0, timeout=30.0):
+    def __init__(self, stall_paths=(), stall_s=0.0, timeout=30.0, slow_body_paths=()):
         self.stall_paths, self.stall_s, self.timeout = stall_paths, stall_s, timeout
+        self.slow_body_paths = slow_body_paths
         self.calls, self.lock = [], threading.Lock()
 
     def get(self, path, token, timing=None):
@@ -285,6 +286,8 @@ class ProbeClient:
             return load606.Response(0, b"", self.stall_s * 1000, "TimeoutError: timed out", connect_ms=0.5,
                                     error_class="TimeoutError")
         tm["first_byte_ms"] = 1.0
+        if any(path.startswith(p) for p in self.slow_body_paths):
+            time.sleep(self.stall_s)              # answered at once, its body slow: not a stall
         body = (json.dumps(GR).encode() if path == "/debug/vars" else
                 b"goroutine 1 [chan receive, 3 minutes]:\nmain.main()\n" if path.endswith("debug=2") else b"{}")
         return load606.Response(200, body, 1.5, connect_ms=0.5, first_byte_ms=1.0)
@@ -329,6 +332,11 @@ def test_a_probe_past_the_stall_bound_saves_a_dump_that_names_it(tmp_path):
     assert all(r["dump"] for r in stalled) and all(r["stalled_at"] == "first_byte" for r in stalled)
     # the routes that answered never triggered one
     assert all(r["dump"] is None for r in recs if r["kind"] == "probe" and r["route"] != "vars")
+
+
+def test_a_slow_body_after_its_first_byte_is_no_stall_and_takes_no_dump(tmp_path):
+    recs, end = _probe(tmp_path, ProbeClient(slow_body_paths=("/debug/vars",), stall_s=0.5))
+    assert end["dumps"] == 0 and not [r for r in recs if r["kind"] == "dump"]
 
 
 def test_no_stall_no_dump_and_the_gc_fields_are_kept(tmp_path):
@@ -421,18 +429,47 @@ def test_a_report_without_the_window_is_incomplete(tmp_path):
                                            "=== end of bootwindow report ==="]
 
 
-def test_the_bootwindow_dry_pass_says_each_step(tmp_path):
-    from tests.test_run606_real_sequence import fake_registry
-    env = dict(os.environ, **fake_registry(tmp_path), BENCH_606_DRY_RUN="1", BENCH_606_REHEARSAL="bootwindow",
-               SNOWPLOW_ENV="GOGC=50", RUN_NAME="snowplow-bench-bw50-test", OUT=str(tmp_path / "out"),
-               PYTHONPATH=str(BENCH_DIR), HOME=str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env, capture_output=True, text=True, timeout=600,
-                       cwd=BENCH_DIR)
-    log = (tmp_path / "out" / "run.log").read_text()
+def _steps(log):
+    return [ln.split("=== step ", 1)[1].split(" ===")[0] for ln in log.splitlines() if "=== step " in ln]
+
+
+def test_the_bootwindow_dry_pass_says_each_step(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, BENCH_606_DRY_RUN="1", BENCH_606_REHEARSAL="bootwindow", SNOWPLOW_ENV="GOGC=50")
+    log = (tmp / "out" / "run.log").read_text()
     assert p.returncode == 0, log[-3000:]
-    steps = [ln.split("=== step ", 1)[1].split(" ===")[0] for ln in log.splitlines() if "=== step " in ln]
-    assert steps[-6:] == ["preflight", "data", "bootwindow-start", "reboot", "bootwindow", "digest"]
-    assert "measure" not in steps and "classes" not in steps
+    steps = _steps(log)
+    assert steps[steps.index("preflight"):] == ["preflight", "data", "bootwindow-start", "reboot", "bootwindow",
+                                                "digest"]
     assert "load606_job --boot-probe-only" in log and "python3 -m bench.bootwindow report" in log
     assert "rehearsal complete" in log
+
+
+def test_the_bootwindow_rehearsal_probes_the_reboot_and_reports_it(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    (state / "vars-stall").write_text("0.8")          # /debug/vars: 0.8 s to its first byte, every read
+    p = _run606(env, BENCH_606_REHEARSAL="bootwindow", SNOWPLOW_ENV="GOGC=50", BOOT_WINDOW_S="3",
+                BOOT_EVERY_S="0.5", BOOT_STALL_S="0.3")
+    out = tmp / "out"
+    log = (out / "run.log").read_text()
+    assert p.returncode == 0 and "rehearsal complete" in log, log[-4000:]
+    steps = _steps(log)
+    assert steps[steps.index("preflight"):] == ["preflight", "data", "bootwindow-start", "reboot", "bootwindow",
+                                                "digest"]
+    # the probe ran before the reboot and through the window, its files came in, its Job is gone
+    rows = [json.loads(x) for x in (out / "bootwindow" / "probes.jsonl").read_text().splitlines()]
+    boot = json.loads((out / "boot.jsonl").read_text())["t_restart"]
+    assert any(r["kind"] == "probe" and r["t"] < boot for r in rows)
+    assert next(r for r in rows if r["kind"] == "boot_probe_end")["reason"] == "window"
+    rec = json.loads((out / "bootwindow.json").read_text())
+    assert rec["ok"] and rec["reading"] == "only /debug/vars stalls: the expvar render"
+    assert rec["dumps"] and all(d["file"] for d in rec["dumps"])
+    assert all((out / "bootwindow" / d["file"]).exists() for d in rec["dumps"])
+    assert "=== bootwindow report ===" in log and "READING: only /debug/vars stalls: the expvar render" in log
+    deleted = (state / "deleted.jsonl").read_text()
+    assert "job/boot606" in deleted
+    # the bench user's password is in no file of the run (the Job's manifest is redacted once applied)
+    from bench.load606 import SCALEUSER_PASSWORD
+    for f in out.rglob("*"):
+        if f.is_file() and not f.name.endswith(".gz"):
+            assert SCALEUSER_PASSWORD not in f.read_text(errors="replace"), f
