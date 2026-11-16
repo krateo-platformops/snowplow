@@ -2013,8 +2013,8 @@ s_measure() {
   MEASURE_STARTED=1
   kapply "$OUT/loadgen-job.yaml"
   local applied
-  applied="$(date +%s)"
-  local deadline=$(( applied + MEASURE_WAIT_S ))
+  applied="$(python3 -c 'import time; print(round(time.time(), 3))')"     # to the ms, like Ready's own record
+  local deadline=$(( ${applied%.*} + MEASURE_WAIT_S ))
   if [[ "$DRY" == "1" ]]; then
     log "DRY: load start: the drivers applied right after the pod record -> $OUT/load-start.json (Ready + <offset> s, the same point in every arm)"
   else

@@ -1012,10 +1012,11 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                      "env": [{"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}},
                              {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://$(HOST_IP):4318"}]}]},
                  "status": {"hostIP": "10.0.0.5", "containerStatuses": [cs],
-                            # FAKE_NO_READY_TIME=1: its Ready condition carries no lastTransitionTime
+                            # FAKE_NO_READY_TIME=1: its Ready condition carries no lastTransitionTime;
+                            # FAKE_READY_AGO_S: it turned Ready that long before this read
                             "conditions": [{"type": "Ready", "status": "True", **({} if os.environ.get(
-                                "FAKE_NO_READY_TIME") == "1" else {"lastTransitionTime":
-                                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))})}]}}]
+                                "FAKE_NO_READY_TIME") == "1" else {"lastTransitionTime": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - float(os.environ.get("FAKE_READY_AGO_S", "0"))))})}]}}]
         # FAKE_TERMINATING_READS=N: the first N reads also list the old
         # ReplicaSet's Terminating pod (old digest) FIRST; -1 = it never goes.
         tr = int(os.environ.get("FAKE_TERMINATING_READS", "0"))

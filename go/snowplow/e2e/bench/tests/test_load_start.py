@@ -35,7 +35,7 @@ def _job_args(state):
 
 def test_the_load_starts_right_after_ready_and_the_read_runs_alongside_it(harness):  # noqa: F811
     env, state, _, tmp = harness
-    p = _run606(env, SNOWPLOW_ENV="GOGC=100")
+    p = _run606(env, SNOWPLOW_ENV="GOGC=100", FAKE_READY_AGO_S="7")      # the pod turned Ready 7 s before its record
     out = tmp / "out"
     log = (out / "run.log").read_text()
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
@@ -47,7 +47,7 @@ def test_the_load_starts_right_after_ready_and_the_read_runs_alongside_it(harnes
     # the anchor is the pod's Ready, not when the read (or anything else) returned
     ready = json.loads((out / "pod-before.jsonl").read_text().splitlines()[0])["ready_at"]
     ls = json.loads((out / "load-start.json").read_text())
-    assert ls["ready_at"] == ready and ls["offset_s"] == round(ls["applied_at"] - ready, 1)
+    assert ls["ready_at"] == ready and ls["offset_s"] == round(ls["applied_at"] - ready, 1) and ls["offset_s"] >= 7
     assert f"--deadline {int(ready) + 300}" in _job_args(state)          # Ready + GO_RUNTIME_S (300 by default)
     # the record, the run report and the validity check
     rec = json.loads((out / "snowplow-env.json").read_text())
