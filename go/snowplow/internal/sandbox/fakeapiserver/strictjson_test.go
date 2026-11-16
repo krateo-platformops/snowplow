@@ -613,7 +613,8 @@ func TestStrictJSON_ACRDWithInt64BoundsAsTheApiserverWritesThem(t *testing.T) {
 }
 
 // An unpaired surrogate escape is refused anywhere, key or value; a byte that is not UTF-8 is read
-// as U+FFFD (like the sandbox's decoder), refused only in a name the rule matches; a byte order
+// as U+FFFD, refused only in a name the rule matches (the sandbox's readers now refuse such a file
+// outright, SNAPSHOT.md V25; matching it is #1496); a byte order
 // mark and content after the value are refused.
 func TestStrictJSON_UnpairedSurrogates(t *testing.T) {
 	read := func(text string) string {
@@ -650,7 +651,7 @@ func TestStrictJSON_UnpairedSurrogates(t *testing.T) {
 	} {
 		eq(t, read(c.text), c.want, c.what)
 	}
-	// Bytes that are not UTF-8: read as U+FFFD, here as in the sandbox.
+	// Bytes that are not UTF-8: read as U+FFFD here (the sandbox refuses the file, V25: #1496).
 	v, err := strictJSON([]byte("[\"a\xffb\",\"\xed\xa0\x80\"]"), nil)
 	if err != nil {
 		t.Fatal(err)

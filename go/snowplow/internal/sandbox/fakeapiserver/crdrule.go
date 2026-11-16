@@ -34,7 +34,7 @@ func isBuiltinGroup(group string) bool {
 // fields), and nothing would say so (#1464).
 
 // wellFormed says a name holds no U+FFFD. strictJSON has refused every unpaired surrogate escape;
-// a byte that is not UTF-8 is read as U+FFFD, here and by the sandbox's decoder. A name the rule
+// a byte that is not UTF-8 is read as U+FFFD here (the sandbox's readers refuse the file: #1496). A name the rule
 // matches (a resource name, a CRD's metadata.name, spec.group, spec.names.plural and
 // spec.versions[].name) is refused with U+FFFD in it, written so or decoded so; elsewhere (a
 // group-version key, a kind, any data) U+FFFD is a character like another.
@@ -50,14 +50,24 @@ func wellFormed(name string) bool { return !strings.ContainsRune(name, '\uFFFD')
 //     name that is absent, null, not a string or "");
 //   - a resource name that holds U+FFFD (wellFormed).
 //
-// A snapshot with no discovery.resources (absent or null) lists nothing.
+// discovery and discovery.resources, when present, are each a non-null, non-array object: null,
+// false, 0, "" and [] are never read as absent (SNAPSHOT.md §3, the sandbox's V23 and V24). A
+// snapshot with no discovery, or a discovery with no resources member, lists nothing.
 func listedResources(snapshot any) (listed map[string][]string, problems []string) {
 	snap, _ := snapshot.(map[string]any)
-	discovery, _ := snap["discovery"].(map[string]any)
-	if discovery["resources"] == nil {
+	dv, present := snap["discovery"]
+	if !present {
 		return nil, nil
 	}
-	resources, ok := discovery["resources"].(map[string]any)
+	discovery, ok := dv.(map[string]any)
+	if !ok {
+		return nil, []string{"discovery is not an object"}
+	}
+	rv, present := discovery["resources"]
+	if !present {
+		return nil, nil
+	}
+	resources, ok := rv.(map[string]any)
 	if !ok {
 		return nil, []string{"discovery.resources is not an object"}
 	}

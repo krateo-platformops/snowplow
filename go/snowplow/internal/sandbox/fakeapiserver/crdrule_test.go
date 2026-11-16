@@ -731,7 +731,7 @@ func TestCRDRule_TheSandboxsEdges(t *testing.T) {
 		{"an empty list", listJ(eGV), `[]`, ""},
 		{"an empty list in a built-in group", listJ("apps/v1"), `[]`, ""},
 		{"no group version at all", `{}`, `[` + panelsJ(served) + `]`, ""},
-		{"discovery.resources null", `null`, `[` + panelsJ(served) + `]`, ""},
+		{"discovery.resources null", `null`, `[` + panelsJ(served) + `]`, "discovery.resources is not an object"},
 		{"discovery.resources a list", `[]`, `[]`, "discovery.resources is not an object"},
 		{"discovery.resources a string", `"v1"`, `[]`, "discovery.resources is not an object"},
 		{"discovery.resources true", `true`, `[]`, "discovery.resources is not an object"},
@@ -810,6 +810,21 @@ func TestCRDRule_TheEdgesAtLoad(t *testing.T) {
 	eq(t, refusal(t, listing(widgetsGV, "panels", "panels/status"), crd), crdRulePrefix+wrongCRD(widgetsGV, "panels", `spec.versions names "v1beta1" more than once`), "the listed version named twice")
 	// And nothing lists its type: the CRD is not read for this, and loads.
 	eq(t, refusal(t, nil, versionedCRD(t, "panels."+widgetsGroup, sv{"v1beta1", true}, sv{"v1beta1", false})), "", "a version named twice in a CRD no listed type needs")
+	// discovery and discovery.resources, when present, are objects: null, false, 0, "" and [] are
+	// never read as absent (SNAPSHOT.md §3, the sandbox's V23 and V24).
+	for what, v := range map[string]any{"null": nil, "false": false, "0": 0, "an empty string": "", "a list": []any{}, "a string": "x"} {
+		v := v
+		eq(t, refusal(t, func(s map[string]any) { s["discovery"] = v }), "snapshot.json: discovery is not an object", "discovery "+what)
+		eq(t, refusal(t, func(s map[string]any) { s["discovery"].(map[string]any)["resources"] = v }), "snapshot.json: discovery.resources is not an object", "discovery.resources "+what)
+	}
+	// Absent, they list nothing and refuse nothing.
+	for what, snap := range map[string]any{
+		"no discovery":                  map[string]any{"schema": 1},
+		"a discovery with no resources": map[string]any{"discovery": map[string]any{"api": map[string]any{}}},
+	} {
+		listed, problems := listedResources(snap)
+		eq(t, len(listed)+len(problems), 0, what+" lists nothing and is not refused")
+	}
 	// The snapshot is not a JSON object.
 	for _, text := range []string{`[]`, `"snapshot"`, `null`, `1`} {
 		_, err := loadHarness(t, opts{rawSnap: func(string) string { return text }})
