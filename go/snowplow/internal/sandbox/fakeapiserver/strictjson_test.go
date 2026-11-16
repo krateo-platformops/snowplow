@@ -636,6 +636,8 @@ func TestStrictJSON_UnpairedSurrogates(t *testing.T) {
 		{"a high then a non-surrogate escape", `["\ud800\u0041"]`, at(`\ud800`, 2)},
 		{"a high then a raw character", `["\ud800A"]`, at(`\ud800`, 2)},
 		{"upper-case hex", `["\uD800"]`, at(`\uD800`, 2)},
+		{"mixed-case hex", `["\uDbFf"]`, at(`\uDbFf`, 2)},
+		{"mixed-case hex, a pair", `["􏿿"]`, ""},
 		{"a pair, then a low alone", `["\ud83d\ude00\ude00"]`, at(`\ude00`, 14)},
 		{"a pair", `["\ud83d\ude00"]`, ""},
 		{"a pair in upper case", `["\uD83D\uDE00"]`, ""},

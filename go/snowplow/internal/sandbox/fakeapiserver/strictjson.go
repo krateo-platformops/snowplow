@@ -202,12 +202,22 @@ func strictValue(dec *json.Decoder, t reflect.Type, path string, depth int) (any
 // one not preceded by a high one. Escapes are read in order, so "\\ud800" (an escaped backslash,
 // then text) is none. A malformed escape is the tokenizer's to refuse.
 func unpairedSurrogate(data []byte) (at int, esc string, found bool) {
+	// The four hex digits are read one by one into a rune: four digits hold at most 0xFFFF, so
+	// nothing is ever narrowed (a ParseUint result converted to rune is a uint64 -> int32
+	// conversion, gosec G115, whatever the digits say).
 	hex4 := func(i int) (rune, bool) {
 		if i+6 > len(data) || data[i] != '\\' || data[i+1] != 'u' {
 			return 0, false
 		}
-		v, err := strconv.ParseUint(string(data[i+2:i+6]), 16, 32)
-		return rune(v), err == nil
+		var r rune
+		for _, c := range data[i+2 : i+6] {
+			d, ok := hexDigit(c)
+			if !ok {
+				return 0, false
+			}
+			r = r<<4 | d
+		}
+		return r, true
 	}
 	inString := false
 	for i := 0; i < len(data); i++ {
@@ -235,6 +245,19 @@ func unpairedSurrogate(data []byte) (at int, esc string, found bool) {
 		}
 	}
 	return 0, "", false
+}
+
+// hexDigit is the value of one hexadecimal digit, either case, as a JSON \u escape spells it.
+func hexDigit(c byte) (rune, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return rune(c - '0'), true
+	case 'a' <= c && c <= 'f':
+		return rune(c-'a') + 10, true
+	case 'A' <= c && c <= 'F':
+		return rune(c-'A') + 10, true
+	}
+	return 0, false
 }
 
 var jsonUnmarshaler = reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
