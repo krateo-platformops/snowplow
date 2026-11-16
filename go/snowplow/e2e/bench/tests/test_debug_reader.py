@@ -127,7 +127,7 @@ DEBUG_READERS = {
         "_cmd_go_runtime": "test_the_go_runtime_job_reads_as_the_debug_reader (its only identity is --user)",
         "go_runtime_read": "(helper: reached through _cmd_go_runtime; its token is the caller's)",
         "BootProbe._get": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
-        "BootProbe._probe": "(method: reached through BootProbe.run, as a thread's target)",
+        "BootProbe._probe": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
         "BootProbe._dump": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
         "_cmd_memwatch": "test_mem606_and_the_drivers_sampler_read_as_the_debug_reader_and_the_drive_as_scale_users",
         "memwatch": "(helper: reached through _cmd_memwatch)",

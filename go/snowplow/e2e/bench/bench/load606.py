@@ -5336,7 +5336,8 @@ class BootProbe:
             return self.client.get("/debug/vars", token, timing=timing)
         return self.client.get(self.init, token, timing=timing)
 
-    def _probe(self, route: str, who: str, tick: int, token) -> None:
+    def _probe(self, route: str, who: str, tick: int) -> None:
+        token = self._token(who)          # a login (a 401 asks for one) here, never on the tick's own thread
         timing: dict = {}
         t = self.clock()
         with self._lock:
@@ -5406,7 +5407,7 @@ class BootProbe:
                 break
             if now >= t0 + tick * self.every_s:
                 for route, who in self.routes:
-                    th = threading.Thread(target=self._probe, args=(route, who, tick, self._token(who)),
+                    th = threading.Thread(target=self._probe, args=(route, who, tick),
                                           daemon=True)
                     th.start()
                     self.threads.append(th)

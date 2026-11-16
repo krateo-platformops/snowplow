@@ -334,6 +334,28 @@ def test_a_probe_past_the_stall_bound_saves_a_dump_that_names_it(tmp_path):
     assert all(r["dump"] is None for r in recs if r["kind"] == "probe" and r["route"] != "vars")
 
 
+def test_a_401_logs_the_role_in_again_on_its_next_probe(tmp_path):
+    class Expiring(ProbeClient):
+        def get(self, path, token, timing=None):
+            if path == "/debug/vars" and token == "DBG":
+                with self.lock:
+                    self.calls.append((path, token))
+                return load606.Response(401, b"", 1.0, "http 401", connect_ms=0.5, first_byte_ms=0.9)
+            return super().get(path, token, timing)
+    c, recs, logins = Expiring(), [], []
+
+    def fresh():
+        logins.append(1)
+        return "DBG2"
+    pr = load606.BootProbe(c, "/call?x", {"debug_reader": "DBG", "preflight_user": "PFU"},
+                           {"debug_reader": fresh}, out_dir=str(tmp_path), sink=recs.append, every_s=0.2,
+                           window_s=0.6, stall_s=5, bound_s=30.0, tick_s=0.02)
+    (tmp_path / "ready").write_text(str(time.time()))
+    pr.run()
+    assert logins and ("/debug/vars", "DBG2") in c.calls
+    assert "DBG2" not in json.dumps(recs)
+
+
 def test_a_slow_body_after_its_first_byte_is_no_stall_and_takes_no_dump(tmp_path):
     recs, end = _probe(tmp_path, ProbeClient(slow_body_paths=("/debug/vars",), stall_s=0.5))
     assert end["dumps"] == 0 and not [r for r in recs if r["kind"] == "dump"]
