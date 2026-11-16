@@ -3,8 +3,9 @@
 //
 // THE DEFECT (#423): the restactions / widgets / raFullList cells were keyed by
 // the FIRST binding granting `get` on the dispatched CR (BindingUID) plus the
-// RBACSubGen sum. Two users co-bound by that one binding derived the same key
-// even when one of them held an EXTRA binding that changed what the
+// RBACSubGen (then a sum of counters). Two users co-bound by that one binding
+// derived the same key even when one of them held an EXTRA binding that
+// changed what the
 // RESTAction's own steps could read — and the hit path serves entry.RawJSON
 // verbatim. A co-bound user lacking the per-step grant was served the other
 // user's resolved data (TestFalsifier_L1PerStepRBAC_CrossUser).
@@ -21,24 +22,39 @@
 //
 // ROLE CONTENTS ARE NOT FOLDED. A role edit changes the permissions of every
 // holder of the referencing bindings identically, so it cannot make two
-// same-set requesters diverge; it is a staleness event, not an isolation
-// event, and it is already handled by the per-subject RBACSubGen the key also
-// folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of every
-// referencing binding). TestSubjectBindingSet_RoleEditRotatesKey proves the
-// rotation end to end.
+// same-set requesters diverge AT ONE INSTANT. It does make the same set mean
+// different verdicts BEFORE and AFTER the edit, so the digest alone names a
+// binding set, not an RBAC state: the state is named by the RBACSubGen the key
+// also folds (#257 onRoleUpdated → onRoleRulesChanged bumps every subject of
+// every referencing binding), which since #1439 is the number of the last RBAC
+// state change that touched the requester (cache.RBACSubGenForSubject). A cell
+// minted by one same-set requester before the edit is therefore never the cell
+// another derives after it — where the edit bumps a subject the requester's
+// sub-generation folds. Both halves of that hold: since #1443 the fold reads
+// every subject the evaluator matches the requester by (one shared matcher,
+// cache.SubjectMatcher, pinned by its parity arms), and since #1458 every
+// binding the informers have delivered is in the role index the edit is routed
+// through (the index is a fold of the RBAC events with atomic updates; nothing
+// rebuilds it from the snapshot).
+// TestSubjectBindingSet_RoleEditRotatesKey proves the rotation end to end;
+// TestIssue1439_ClassValueNamesOneRBACState the before/after separation across
+// two requesters.
 //
 // SAME SUBJECT SEMANTICS AS THE EVALUATOR. The set is built only from the
 // evaluator's own unexported functions — selectCRBCandidates /
 // selectRBCandidatesAllNS (index pre-filters) gated by anySubjectMatches (the
-// correctness barrier), with effectiveGroups' ServiceAccount synthetic groups —
-// exactly as BuildRequesterProfile does. The one deliberate difference:
-// system:authenticated is ALWAYS added. Every real /call carries a non-empty
-// username (it is JWT-authenticated), so for customers this is identical to the
+// correctness barrier), with the shared matcher's ServiceAccount groups —
+// exactly as BuildRequesterProfile does. The one deliberate difference: the
+// apiserver's implicit group (cache.ImplicitGroup) is folded in as a PRESENTED
+// group even for an empty username, via WithAuthenticatedGroup. Every real
+// /call carries a non-empty username, so for customers this is identical to the
 // evaluator. It matters for the prewarm seed, whose group representative is
 // {Username:"", Groups:[g]} (pickRepresentativeFromSubjects): without it the
 // seed would omit the system:authenticated bindings every real member holds and
-// mint a key no customer derives. Treating the representative as
-// authenticated makes seed and customer keys agree (key parity).
+// mint a key no customer derives. Treating the representative as the apiserver
+// treats a member makes seed and customer keys agree (key parity). An identity
+// presenting system:unauthenticated gets no system:authenticated here, in the
+// evaluator, or at the apiserver (#1334).
 //
 // IDENTITY IN THE KEY IS BINDING IDs, NEVER NAMES. The ids are the SOT
 // cache.BindingUIDFromCRB / BindingUIDFromRB forms ("C:<uid>",
@@ -68,10 +84,6 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
-
-// systemAuthenticatedGroup is the implicit group of every authenticated
-// request (Kubernetes auth chain; mirrors anySubjectMatches).
-const systemAuthenticatedGroup = "system:authenticated"
 
 // SubjectBindingSetDigest returns the digest of every binding in the published
 // RBAC snapshot whose subjects match (username, groups), or "" when no snapshot
@@ -130,7 +142,7 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 	if snap == nil {
 		return nil
 	}
-	id := EvaluateOptions{Username: username, Groups: WithAuthenticatedGroup(groups)}
+	id := EvaluateOptions{Username: username, Groups: WithAuthenticatedGroup(username, groups)}
 
 	seen := map[string]struct{}{}
 	var ids []string
@@ -144,13 +156,14 @@ func SubjectBindingIDs(snap *cache.RBACSnapshot, username string, groups []strin
 		seen[s] = struct{}{}
 		ids = append(ids, s)
 	}
+	who := subjectMatcher(id)
 	for _, crb := range selectCRBCandidates(snap, id) {
-		if anySubjectMatches(crb.Subjects, id) {
+		if anySubjectMatches(&who, crb.Subjects) {
 			add(cache.BindingUIDFromCRB(crb))
 		}
 	}
 	for _, rb := range selectRBCandidatesAllNS(snap, id) {
-		if anySubjectMatches(rb.Subjects, id) {
+		if anySubjectMatches(&who, rb.Subjects) {
 			add(cache.BindingUIDFromRB(rb))
 		}
 	}
@@ -169,10 +182,11 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// WithAuthenticatedGroup returns groups plus system:authenticated (once,
-// de-duplicated, order otherwise preserved). Every real request is
-// authenticated, so this is the requester's EFFECTIVE group set. #424 uses it
-// at three sites that must agree for one identity class: the binding-set digest
+// WithAuthenticatedGroup returns the kube-apiserver's EFFECTIVE group set for
+// (username, groups): groups plus the implicit group the apiserver adds, if any
+// (cache.ImplicitGroup — system:authenticated for every authenticated identity,
+// nothing for one presenting system:unauthenticated, #1334). #424 uses it at
+// three sites that must agree for one identity class: the binding-set digest
 // (above), the RBACSubGen fold (dispatchCacheLookupKey) and the prewarm seed's
 // resolve identity (withCohortSeedContext) — a seed representative with
 // Username=="" would otherwise not match system:authenticated subjects in
@@ -181,8 +195,8 @@ func buildSubjectBindingSetDigest(snap *cache.RBACSnapshot, username string, gro
 //
 // #436: the implementation is cache.WithAuthenticatedGroup, so the reseed
 // reachability predicate (cache.RotatedSubjectSet.Rotated) folds the same set.
-func WithAuthenticatedGroup(groups []string) []string {
-	return cache.WithAuthenticatedGroup(groups)
+func WithAuthenticatedGroup(username string, groups []string) []string {
+	return cache.WithAuthenticatedGroup(username, groups)
 }
 
 // canonicalGroupsKey is an EXACT (collision-free) order-independent encoding of

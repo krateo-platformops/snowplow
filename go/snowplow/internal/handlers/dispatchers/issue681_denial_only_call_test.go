@@ -205,7 +205,7 @@ func c681Setup(t *testing.T) *c681Env {
 	cache.RebuildRBACSnapshotForTest(rw)
 	// The prewarm engine builds the delta index once; the #257 role-edit
 	// rotation runs only on a built index.
-	cache.BuildBindingsByGVRIndex(rw.RegisteredGVRs())
+	cache.SeedBindingsIndexFromSnapshotForTest(rw.RegisteredGVRs())
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	t.Cleanup(cache.ResetRBACSubGenForTest)
@@ -270,7 +270,7 @@ func c681Setup(t *testing.T) *c681Env {
 	secrets := map[string]*corev1.Secret{}
 	for _, i := range []ident681{c681A, c681B, c681C} {
 		n := kubeutil.MakeDNS1123Compatible(i.user) + "-clientconfig"
-		secrets[n] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c681AuthnNS, Name: n},
+		secrets[n] = &corev1.Secret{ObjectMeta: authnMeta(c681AuthnNS, n, i.user),
 			Data: map[string][]byte{"server-url": []byte(e.user.URL), "token": []byte(i.token())}}
 	}
 	cache.ResetSecretsInformerForTest()

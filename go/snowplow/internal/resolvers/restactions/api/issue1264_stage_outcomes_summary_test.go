@@ -59,9 +59,10 @@ func TestIssue1264_S1_FailedStagesCountAndSortedDistinctReasons(t *testing.T) {
 	o := newStageOutcomes()
 	o.register([]string{"ok", "forbidden", "notfound-a", "notfound-b", "skipped", "never"})
 	o.ran("ok")
-	// Two items of one stage fail with different reasons: the ranked one is
-	// the stage's outcome, and the stage counts once.
-	o.fail("forbidden", StageReasonNotFound)
+	// Two items of one stage fail with different reasons of one group
+	// (denied): the ranked one is the stage's outcome, and the stage counts
+	// once. (#1347: across groups the group decides, issue1347_*.)
+	o.fail("forbidden", StageReasonNotFoundForRequester)
 	o.fail("forbidden", StageReasonForbidden)
 	o.fail("notfound-a", StageReasonNotFound)
 	o.fail("notfound-b", StageReasonNotFound)
@@ -175,21 +176,23 @@ type s1264Reason struct {
 func s1264ReasonTable(t *testing.T) map[string]s1264Reason {
 	t.Helper()
 	table := map[string]s1264Reason{
-		"StageReasonNotExecuted":        {StageReasonNotExecuted, true},
-		"StageReasonWriteRefused":       {StageReasonWriteRefused, true},
-		"StageReasonForbidden":          {StageReasonForbidden, false},
-		"StageReasonNotFound":           {StageReasonNotFound, false},
-		"StageReasonUnauthorized":       {StageReasonUnauthorized, false},
-		"StageReasonNotRun":             {StageReasonNotRun, false},
-		"StageReasonError":              {StageReasonError, false},
-		"StageReasonSkipped":            {StageReasonSkipped, false},
-		"StageReasonAborted":            {StageReasonAborted, false},
-		"StageReasonInvalidPath":        {StageReasonInvalidPath, false},
-		"StageReasonTemplateError":      {StageReasonTemplateError, false},
-		"StageReasonNotSent":            {StageReasonNotSent, false},
-		"StageReasonTimeout":            {StageReasonTimeout, false},
-		"StageReasonDestinationRefused": {StageReasonDestinationRefused, false},
-		"StageReasonUAFOnNonReadVerb":   {StageReasonUAFOnNonReadVerb, false}, // #1281: a misconfigured stage
+		"StageReasonNotExecuted":  {StageReasonNotExecuted, true},
+		"StageReasonWriteRefused": {StageReasonWriteRefused, true},
+		"StageReasonForbidden":    {StageReasonForbidden, false},
+		"StageReasonNotFound":     {StageReasonNotFound, false},
+		// #1319: the definite per-identity NotFound, a denial (counted failed, like Forbidden).
+		"StageReasonNotFoundForRequester": {StageReasonNotFoundForRequester, false},
+		"StageReasonUnauthorized":         {StageReasonUnauthorized, false},
+		"StageReasonNotRun":               {StageReasonNotRun, false},
+		"StageReasonError":                {StageReasonError, false},
+		"StageReasonSkipped":              {StageReasonSkipped, false},
+		"StageReasonAborted":              {StageReasonAborted, false},
+		"StageReasonInvalidPath":          {StageReasonInvalidPath, false},
+		"StageReasonTemplateError":        {StageReasonTemplateError, false},
+		"StageReasonNotSent":              {StageReasonNotSent, false},
+		"StageReasonTimeout":              {StageReasonTimeout, false},
+		"StageReasonDestinationRefused":   {StageReasonDestinationRefused, false},
+		"StageReasonUAFOnNonReadVerb":     {StageReasonUAFOnNonReadVerb, false}, // #1281: a misconfigured stage
 	}
 	declared := s1264DeclaredReasonConsts(t)
 	var tableNames []string

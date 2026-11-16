@@ -51,7 +51,6 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
 	"k8s.io/client-go/kubernetes/fake"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -440,10 +439,7 @@ func TestUserConfig_CacheHit_BypassesApiserver(t *testing.T) {
 	// computation is `kubeutil.MakeDNS1123Compatible(username)+"-clientconfig"`.
 	// For "alice" the DNS1123 form is "alice" verbatim.
 	seedSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: testAuthnNS,
-			Name:      testUsername + "-clientconfig",
-		},
+		ObjectMeta: authnMeta(testAuthnNS, testUsername+"-clientconfig", testUsername),
 		Data: map[string][]byte{
 			"server-url": []byte("https://alice.example/k8s"),
 			"token":      []byte("alice-bearer-token-from-cache"),

@@ -137,10 +137,28 @@ The index lives on the snapshot (`cache/rbac_snapshot.go`) and is built once per
 `selectCRBCandidates` unions the routes that apply to the request identity, deduplicating by
 pointer (a multi-subject binding appears once):
 
-1. `CRBsByUser[Username]` when `Username != ""`
-2. `CRBsByGroup[g]` for every `g` in `effectiveGroups(opts)`
-3. `CRBsByGroup["system:authenticated"]`, gated on `Username != ""` so an unauthenticated
-   identity never lands the implicit group
+The routes are the requester's **matched-subject set**, enumerated by one function,
+`cache.SubjectMatcher.Visit` (#1443), in its order:
+
+1. `CRBsByUser[Username]` when `Username != ""` (a ServiceAccount's username included)
+2. `CRBsByGroup[g]` for every presented group, then, for a ServiceAccount identity,
+   `system:serviceaccounts` and `system:serviceaccounts:<ns>`
+3. `CRBsByGroup[<implicit group>]` — the one group the kube-apiserver adds to the requester,
+   decided only by `cache.ImplicitGroup` (#1334), when it adds one:
+   - `system:anonymous` gets `system:unauthenticated` (unless its groups already hold it);
+   - any other user gets `system:authenticated`, unless its groups already hold
+     `system:authenticated` or `system:unauthenticated` — then nothing is added, so an identity
+     presenting `system:unauthenticated` is never authenticated;
+   - `system:anonymous` is never given `system:authenticated`.
+
+   This is the apiserver's own rule in k8s.io/apiserver v0.36.5 (the module's pin):
+   `pkg/endpoints/filters/impersonation/impersonation.go:126-144` (non-anonymous:
+   `system:authenticated` unless either implicit group is present) and `:145-157`
+   (`system:anonymous`: `system:unauthenticated` unless present), and
+   `pkg/authentication/group/authenticated_group_adder.go:45-56` on the authentication path (adds
+   nothing for `system:anonymous`, whose anonymous authenticator already yields
+   `[system:unauthenticated]`; otherwise the same `system:authenticated` rule). An empty
+   `Username` is "no requester" and lands no implicit group.
 4. `CRBsByServiceAccount["<ns>/<name>"]` when the username is a canonical SA
 5. `CRBsCatchAll` — always
 
@@ -156,20 +174,26 @@ namespace-scoped analogue; a missing namespace yields an empty candidate set wit
 The load-bearing symmetry rule is that **every place the verdict depends on a subject kind, both
 the index route and the matcher route handle User, Group, and ServiceAccount the same way.** If
 the index routes a User but the matcher only checks Groups (or vice-versa), the answer is wrong.
-The matcher `anySubjectMatches` is the canonical statement of the predicate:
+The matcher `anySubjectMatches` asks `cache.SubjectMatcher.Match` whether a binding subject is
+in the requester's matched-subject set:
 
-- `UserKind` → exact `s.Name == opts.Username`
-- `GroupKind` → membership test against `effectiveGroups`, **plus** the implicit
-  `system:authenticated` for any authenticated identity
-- `ServiceAccountKind` → `(Namespace, Name)` match on a parsed canonical SA username
-- any other kind → no case → no match
+- `UserKind` → exact `s.Name == Username` (a non-empty username; a ServiceAccount's username
+  matches a User-kind subject naming it)
+- `GroupKind` → a presented group, **or** for a ServiceAccount identity one of the two groups
+  Kubernetes places it in (`system:serviceaccounts`, `system:serviceaccounts:<ns>`), **or** the
+  apiserver's implicit group (route 3 above: `system:authenticated` for an authenticated
+  identity, `system:unauthenticated` for `system:anonymous`, none for an identity presenting
+  `system:unauthenticated`)
+- `ServiceAccountKind` → `(Namespace, Name)` match on a parsed canonical SA username, the
+  subject's namespace compared as written
+- any other kind → no match
 
-`effectiveGroups` is the single source of group expansion: for a ServiceAccount identity it
-appends the two Kubernetes synthetic groups `system:serviceaccounts` and
-`system:serviceaccounts:<ns>`; for a non-SA identity it returns `opts.Groups` unchanged with no
-allocation. Crucially **`selectCRBCandidates` reuses the same `effectiveGroups`** so the index
-and the matcher agree on group expansion — the symmetry is enforced by shared code, not by two
-parallel implementations.
+`cache.SubjectMatcher` is the single statement of that set (#1443). **The candidate selectors
+route with its enumeration (`Visit`), the matcher tests membership of it (`Match`), and the
+identity class folds the sub-generation counter of exactly it (`cache.RBACSubGenForSubject`).**
+So the index and the matcher agree by shared code, and a binding that can decide a requester's
+verdict always rotates that requester's cache key when it, or the role behind it, changes. A
+property test holds `Match` equal to membership of what `Visit` enumerates.
 
 `rulesPermit` walks the resolved role's `PolicyRule`s with Kubernetes wildcard semantics
 (`stringSliceMatches`: `"*"` matches everything) over Verbs, APIGroups, Resources, and honours
@@ -205,7 +229,7 @@ Properties that keep it correct:
 Groups fold into the key via `canonicalGroupsHash` (`groups_hash.go`): order-independent
 (sort-first) FNV-1a with a per-element **length prefix** so distinct set partitions like
 `["a","bc"]` vs `["ab","c"]` cannot alias. Hashing the *raw* `opts.Groups` is sufficient because
-`effectiveGroups` is a pure function of `(Username, Groups)`. Counters are exposed read-only over
+the matched-subject set is a pure function of `(Username, Groups)`. Counters are exposed read-only over
 `/debug/vars` via `RegisterAuthzMemoExpvar`.
 
 ### 2.6 BindingUID derivation — `cache/match_subject.go`
@@ -371,7 +395,8 @@ are the ones that leave `SkipBindingUID` false and keep the deterministic UID.
 5. **Memo caches PERMITS only.** A deny can be transiently wrong under churn and must self-heal
    by re-walking every call. Caching a deny is the #301 incident.
 6. **Predicate symmetry across subject kinds.** The subject index and `anySubjectMatches` route
-   User, Group, and ServiceAccount identically, sharing `effectiveGroups` for group expansion.
+   User, Group, and ServiceAccount identically, sharing `cache.SubjectMatcher`; the cache key's
+   sub-generation folds the same set (#1443).
 7. **The subject index may over-include but never under-include.** `anySubjectMatches` is the
    post-lookup equality barrier; `CRBsCatchAll` guards unrecognised kinds.
 8. **`BindingUID == ""` ⟺ (cache off) ∨ (deny / no snapshot)** — both directions
@@ -394,7 +419,7 @@ are the ones that leave `SkipBindingUID` false and keep the deterministic UID.
 | Admin list stuck empty under load; refresher starved | A transiently-wrong deny got cached (regression of the PERMITS-only rule). | `evaluate.go` memo-store site; `snowplow_authz_memo_deny_uncached_total` should be > 0 and rising. |
 | Everything denied right after pod start | Snapshot not yet published — degrade-to-deny pre-readiness gate firing as designed; self-heals once the first rebuild publishes. | `evaluate.go`; `cluster_list.go`. |
 | Permits silently lost for one subject kind | Subject index under-includes (index/matcher predicate drift); or a future `Subject.Kind` not routed to `CRBsCatchAll`. | `selectCRBCandidates`; `anySubjectMatches`; `rebuildSubjectIndexes` (`cache/rbac_snapshot.go`). |
-| Wrong verdict for a ServiceAccount caller | Synthetic SA groups not expanded, or index/matcher disagree on expansion. | `effectiveGroups`; `parseServiceAccountUsername` (`evaluate.go`). |
+| Wrong verdict for a ServiceAccount caller | Synthetic SA groups not expanded, or index/matcher disagree on expansion. | `cache.SubjectMatcher`, `cache.ParseServiceAccountUsername` (`internal/cache/match_subject.go`, `rbac_subgen.go`). |
 | `resourceNames`-scoped rule over-exposes a list, or its named objects vanish from a UAF list | `resourceNameMatches` regressed; or `NameFrom` mis-derives the per-object name. | `evaluate.go` `resourceNameMatches`; `refilter.go` `compileNameFrom`/`evalSingle`. |
 | Stale verdict served across a binding change | Memo generation-binding broke (gen not in key, or shard not swapped on `PublishSeq` change). | `snapshot_authz_memo.go`. |
 | Group-set hash collision (two different group sets share an entry) | A second, non-length-prefixed groups hasher was introduced (the 0.30.239 two-hasher drift). | `canonicalGroupsHash` (`groups_hash.go`); do not inline a second hasher. |

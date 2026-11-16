@@ -6,6 +6,7 @@ package evaltest
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -401,10 +402,15 @@ func TestEvaluateRBAC_NamespaceScopeNotEscalated(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────
 
 // TestEvaluateRBAC_CacheOffFallsThroughToSAR — exercised indirectly:
-// when CACHE_ENABLED is off, EvaluateRBAC calls UserCan which calls
-// SelfSubjectAccessReview against ctx.UserConfig. Without a UserConfig
-// in ctx, UserCan logs an error and returns false. This test asserts
-// that path is reachable (proves we did NOT bypass the off-path).
+// when CACHE_ENABLED is off, EvaluateRBAC calls SelfSubjectAccessReview
+// against ctx.UserConfig. Without a UserConfig in ctx the review cannot be
+// asked. This test asserts that path is reachable (proves we did NOT bypass
+// the off-path).
+//
+// #1362: that is ErrReviewUnavailable, not a bare deny. Before #1362 the
+// cache-off path collapsed "could not ask" into (false, nil), which a
+// caller that answers "unavailable" (the /debug gate's 503) cannot tell
+// from the apiserver's deny. It still never allows.
 func TestEvaluateRBAC_CacheOffFallsThroughToSAR(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "false")
 
@@ -412,12 +418,12 @@ func TestEvaluateRBAC_CacheOffFallsThroughToSAR(t *testing.T) {
 		t.Fatalf("Disabled() should be true with CACHE_ENABLED=false")
 	}
 
-	// No UserConfig in ctx — UserCan will log error and return false.
+	// No UserConfig in ctx: the review cannot be asked.
 	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "configmaps", Namespace: "default",
 	})
-	if err != nil {
-		t.Fatalf("EvaluateRBAC: %v", err)
+	if !errors.Is(err, rbac.ErrReviewUnavailable) {
+		t.Fatalf("EvaluateRBAC: err=%v, want ErrReviewUnavailable (the cache=off path was not reached)", err)
 	}
 	if ok {
 		t.Fatalf("cache=off + no user config → must deny; got allow")

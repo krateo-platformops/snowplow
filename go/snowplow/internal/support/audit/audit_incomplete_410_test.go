@@ -84,7 +84,7 @@ func TestAudit410_RecordlessActorShape_IsEmittedMarked(t *testing.T) {
 // absence is a gap like any other, not a reason to drop the record.
 func TestAudit410_NoActor_EmitsAnOtherwiseCompleteRecordMarkedActor(t *testing.T) {
 	before := IncompleteCount(IncompleteActor)
-	got := emit410(t, context.Background(), complete410())
+	got := emit410(t, WithSessionID(context.Background(), "s-test"), complete410())
 	if len(got) != 1 {
 		t.Fatalf("a complete record with no actor emitted %d records, want 1", len(got))
 	}

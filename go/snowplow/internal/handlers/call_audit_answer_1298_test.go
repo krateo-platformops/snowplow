@@ -9,7 +9,9 @@ package handlers
 //      destination, the page budget (not sent; sent and possibly applied). The
 //      record carries NO http.response.status_code ("when the authority
 //      answered", audit-coverage.md) and a closed-set body saying what snowplow
-//      did, never "upstream answered".
+//      did, never "upstream answered". The refused destination is denied with
+//      krateo.audit.denial_reason=destination_refused (audit v0.12.0); no
+//      other arm carries a denial reason.
 //   X  the upstream answered a 3xx and snowplow refused to follow it: the
 //      record carries the 3xx, and says snowplow refused it.
 //   J  the upstream answered 2xx with a non-JSON body: the write was accepted,
@@ -69,6 +71,7 @@ func TestCall1298_RecordIsWhatWasObservedAtTheDial(t *testing.T) {
 		wantOutcome string
 		wantCode    int // 0 = no http.response.status_code attribute
 		wantBody    string
+		wantReason  string // krateo.audit.denial_reason; "" = none
 	}{
 		{
 			name: "R connection refused",
@@ -92,7 +95,7 @@ func TestCall1298_RecordIsWhatWasObservedAtTheDial(t *testing.T) {
 			// #1291 — snowplow itself refused: denied (schema v1), and a
 			// denied record never carries a status code (audit#13).
 			wantCaller: http.StatusBadGateway, wantOutcome: "denied", wantCode: 0,
-			wantBody: audit.MessageDestinationRefused,
+			wantBody: audit.MessageDestinationRefused, wantReason: audit.DenialDestinationRefused,
 		},
 		{
 			name: "R page budget spent before the send",
@@ -208,6 +211,9 @@ func TestCall1298_RecordIsWhatWasObservedAtTheDial(t *testing.T) {
 			}
 			if got.body != c.wantBody {
 				t.Errorf("RED #1298: record body = %q, want %q", got.body, c.wantBody)
+			}
+			if r := got.attrs["krateo.audit.denial_reason"]; r != c.wantReason {
+				t.Errorf("krateo.audit.denial_reason = %q, want %q", r, c.wantReason)
 			}
 			// What snowplow did itself never reads as an upstream answer
 			// (the #1131 rule, issue1131_destination_test.go).

@@ -74,6 +74,13 @@ var (
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	// #1476 — this resolve is one failure-log round of the widget's cell; its
+	// apiRef RESTAction, resolved under the same cell key, joins it. A failure
+	// unchanged since the cell's previous round logs at DEBUG
+	// (api/failure_log.go).
+	ctx, endFailureRound := api.BeginFailureRound(ctx)
+	defer endFailureRound()
+
 	// A2 contract: server-trusted identity injection into the RESOLVE INPUT
 	// (definitive-cache-identity-architecture §1.3 + §2.4). For a widget whose CR
 	// declares spec.identityContext, fold the declared subset of the
@@ -138,18 +145,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// extras through filterDeclaredKeyExtras, which keeps ONLY
 	// spec.keyExtras-declared names, and every key stripped here is by
 	// construction outside that set.
-	opts.Extras = sanitizeUndeclaredIdentityExtras(opts.In.Object, opts.Extras)
-
-	if inj := DeclaredIdentity(ctx, opts.In.Object); len(inj) > 0 {
-		merged := make(map[string]any, len(opts.Extras)+len(inj))
-		for k, v := range opts.Extras {
-			merged[k] = v
-		}
-		for k, v := range inj { // injection wins on collision (quarantine)
-			merged[k] = v
-		}
-		opts.Extras = merged
-	}
+	opts.Extras = resolveInputExtras(ctx, opts.In.Object, opts.Extras)
 
 	// Ship 0.30.193 Checkpoint 1 — widget-resolve phase wall-clocks.
 	// Captured per-phase so seedOneWidget's deferred log can attribute
@@ -181,13 +177,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 
 	apirefStart := time.Now()
 	ds, err := resolveApiRefFn(ctx, opts)
+	// #1319 — the widget's stage outcomes are its apiRef RESTAction's, and that
+	// resolve is over: seal the caller's collector so a resolve that runs later
+	// on this ctx (an inline child's) keeps its own. A widget with no apiRef
+	// has no RESTAction stages and reads complete.
+	api.SealStageOutcomes(ctx)
 	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
 		// #1116 — a reserved-extras refusal is the caller's error, logged once
 		// at WARN where it was decided (api.RefuseReservedExtras); any caller
 		// can send one, so it must not also write an ERROR line.
 		if _, refused := api.AsReservedExtrasError(err); !refused {
-			log.ErrorContext(ctx, "unable to resolve api reference", slog.Any("err", err))
+			log.Log(ctx, apiRefFailureLevel(ctx, opts.In, err), "unable to resolve api reference", slog.Any("err", err))
 		}
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageApiRef, "resolve apiRef "+stageObject(opts.In), err)
@@ -345,6 +346,24 @@ func stageObject(w *Widget) string {
 	return w.GroupVersionKind().String() + " " + w.GetNamespace() + "/" + w.GetName()
 }
 
+// apiRefFailureLevel is the level of the "unable to resolve api reference"
+// line of widget w (#1476, api/failure_log.go): an expected per-identity deny
+// — the apiRef read, or a stage of its RESTAction, denied for the caller's
+// identity — logs at WARN, any other failure at ERROR, and an unchanged repeat
+// in the widget cell's generation at DEBUG. Classified by the error's type
+// only; the target is the apiRef the widget names.
+func apiRefFailureLevel(ctx context.Context, w *Widget, err error) slog.Level {
+	own := slog.LevelError
+	if api.IsPerIdentityDenied(err) {
+		own = slog.LevelWarn
+	}
+	target := "widget.apiRef"
+	if ref, rerr := GetApiRef(w.Object); rerr == nil {
+		target += "\x00" + ref.Namespace + "/" + ref.Name
+	}
+	return api.FailureLogLevel(ctx, own, target, api.FailureClassOf(err))
+}
+
 func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	apiRef, err := GetApiRef(opts.In.Object)
 	if err != nil {
@@ -368,6 +387,36 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
 
 	return apiref.Resolve(ctx, apirefOptionsFor(opts, apiRef, apiRefEff))
+}
+
+// resolveInputExtras is the request extras as Resolve hands them on: the
+// identity keys the widget has not declared stripped (A-3,
+// sanitizeUndeclaredIdentityExtras), then its declared identity injected,
+// injection winning on collision (A2, DeclaredIdentity). Resolve calls it once;
+// ApiRefExtras derives from it, so the two cannot drift.
+func resolveInputExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	extras := sanitizeUndeclaredIdentityExtras(obj, requestExtras)
+	if inj := DeclaredIdentity(ctx, obj); len(inj) > 0 {
+		merged := make(map[string]any, len(extras)+len(inj))
+		for k, v := range extras {
+			merged[k] = v
+		}
+		for k, v := range inj { // injection wins on collision (quarantine)
+			merged[k] = v
+		}
+		extras = merged
+	}
+	return extras
+}
+
+// ApiRefExtras returns the extras a Resolve of the widget obj, given
+// requestExtras, threads into its apiRef RESTAction: spec.apiRef.extras under
+// the request extras as Resolve hands them on (resolveInputExtras), exactly
+// what resolveApiRef passes to apiref.Resolve. #1477: a background resolve
+// (requestExtras nil) asks it which keys the apiRef RESTAction's dict will
+// carry, to skip a resolve that needs keys it does not.
+func ApiRefExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	return mergeRequestWins(GetApiRefExtras(obj), resolveInputExtras(ctx, obj, requestExtras))
 }
 
 // apirefOptionsFor builds the apiref.Resolve options for resolveApiRef: the

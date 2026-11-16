@@ -171,7 +171,9 @@ func beginBudgetedAttempt(ctx context.Context, b *pagebudget.Budget) (*budgetedA
 	dctx, cancelD := context.WithDeadlineCause(ctx, b.Deadline(), pagebudget.ErrExhausted)
 	cctx, cancelCut := context.WithCancelCause(dctx)
 	x.cancelD, x.cancelCut = cancelD, cancelCut
-	x.ctx = httptrace.WithClientTrace(context.WithValue(cctx, budgetedExchangeKey{}, true), &httptrace.ClientTrace{
+	// x.shared: the same two facts for an attempt answered by a request
+	// already on the wire (#1320, shared_attempt.go).
+	x.ctx = httptrace.WithClientTrace(withSharedAttemptSink(context.WithValue(cctx, budgetedExchangeKey{}, true), x.shared), &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) {
 			x.mu.Lock()
 			x.gotConn = true
@@ -365,6 +367,11 @@ func (r *reserveRing) resetForTest() {
 	r.n, r.next = 0, 0
 	r.mu.Unlock()
 }
+
+// ResetRetryReserveForTest forgets the reserve's samples, for a cross-package
+// test that measures one (#1320: one shared request feeds it once). Production
+// MUST NOT use it.
+func ResetRetryReserveForTest() { freshAnswers.resetForTest() }
 
 // RetryReserve is the current retry reserve and whether it is measured (expvar).
 func RetryReserve() (time.Duration, bool) { return freshAnswers.reserve() }

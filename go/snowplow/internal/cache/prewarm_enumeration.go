@@ -141,7 +141,7 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 	gr := grFromGVR(gvr)
 
 	idx.mu.RLock()
-	if !idx.built {
+	if !idx.ready {
 		idx.mu.RUnlock()
 		return nil
 	}
@@ -173,7 +173,7 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 	// insertion; the boot.go seam signature is unchanged.
 	byIdentity := make(map[string]PrewarmTarget, len(ids))
 	for id := range ids {
-		entry, ok := idx.entries[id]
+		entry, ok := idx.members[id]
 		if !ok {
 			continue
 		}
@@ -336,25 +336,25 @@ func allSubjectsAreServiceAccountKind(subjects []subjectKey) bool {
 // IdentityAuthorisedForGVR reports whether ANY binding in the (gvr) bucket ∪
 // the wildcard bucket names one of the identity's folded subjects — the User
 // (or ServiceAccount) for username, and a Group for every EFFECTIVE group
-// (WithAuthenticatedGroup: a real requester is always authenticated). #262: the
+// (WithAuthenticatedGroup: the apiserver's group set, #1334). #262: the
 // AUTHORISED half of the learned-identity emission rule — a learned class is a
 // seed target for a GVR only if a matching binding sits in that GVR's bucket.
 // Read live from the published index on every call (never memoised); false
 // before the index is built.
 func IdentityAuthorisedForGVR(gvr schema.GroupVersionResource, username string, groups []string) bool {
 	want := make(map[subjectKey]struct{}, 2+len(groups))
-	for _, s := range foldSubjects(username, WithAuthenticatedGroup(groups)) {
+	for _, s := range foldSubjects(username, WithAuthenticatedGroup(username, groups)) {
 		want[s] = struct{}{}
 	}
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	if !idx.built {
+	if !idx.ready {
 		return false
 	}
 	match := func(set map[bindingID]struct{}) bool {
 		for id := range set {
-			entry, ok := idx.entries[id]
+			entry, ok := idx.members[id]
 			if !ok {
 				continue
 			}

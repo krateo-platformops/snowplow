@@ -22,7 +22,8 @@ package credhttp
 //     request.Do's RetryClient re-sent a PUT or a DELETE.
 //
 //  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
-//     never plumbing's, which logs the Authorization header and the bodies.
+//     never plumbing's debug round tripper, which sits under the credential
+//     round trippers (wiredump.go, #1481).
 //
 //  5. (#1131) a refused destination is reported as itself: DestinationStatus.
 //
@@ -47,11 +48,14 @@ import (
 	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	"k8s.io/client-go/rest"
 )
 
 // maxUnstructuredResponseTextBytes mirrors request.Do's bound on a non-2xx
@@ -60,9 +64,32 @@ const maxUnstructuredResponseTextBytes = 2048
 
 // Do is request.Do with a client that never follows a redirect (see do.go).
 func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
+	return do(ctx, opts, nil)
+}
+
+// DoAs is Do sent with rc's credential instead of opts.Endpoint's (#1334):
+// the request goes to rc.Host, through the client rest.HTTPClientFor builds
+// for rc (its TLS, its credential and its Impersonate-* headers), with Do's
+// redirect refusal, send policy and envelopes. opts.Endpoint is replaced by an
+// endpoint naming only rc.Host, so nothing of the endpoint it carried is sent.
+//
+// It exists for a caller whose only credential is an impersonating config (the
+// public identity): there is no clientconfig endpoint to give Do.
+func DoAs(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *response.Status {
+	if rc == nil || rc.Host == "" {
+		return response.New(http.StatusInternalServerError, fmt.Errorf("unable to create HTTP Client: no rest config"))
+	}
+	opts.Endpoint = &endpoints.Endpoint{ServerURL: rc.Host}
+	return do(ctx, opts, rc)
+}
+
+// do is Do's body. With rc nil the client is the endpoint client plumbing builds
+// for opts.Endpoint; with rc set it is rc's (DoAs). Both are sent through Send,
+// in this function, so the #1106 guard sees the obtain and the send together.
+func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *response.Status {
 	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err)
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
@@ -74,7 +101,7 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 
 	call, err := http.NewRequestWithContext(ctx, verb, u.String(), body)
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err)
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 	// Additional headers for AWS Signature 4 algorithm.
 	if opts.Endpoint.HasAwsAuth() {
@@ -99,16 +126,21 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		call.Header.Set(el[:idx], strings.TrimSpace(el[idx+1:]))
 	}
 
-	// #1112 D4 — plumbing never installs its wire dump (it logs the
-	// Authorization header and the bodies); a Debug endpoint gets WireDump,
-	// which logs metadata only (wiredump.go).
-	cli, err := request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
+	var cli *http.Client
+	if rc != nil {
+		cli, err = rest.HTTPClientFor(rc)
+	} else {
+		// #1112 D4 — plumbing never installs its debug round tripper (it sees
+		// the Authorization header; wiredump.go, #1481); a Debug endpoint gets
+		// WireDump, which logs metadata only.
+		cli, err = request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
+		if err == nil && opts.Endpoint != nil && opts.Endpoint.Debug {
+			cli.Transport = WireDump(cli.Transport)
+		}
+	}
 	if err != nil {
 		return response.New(http.StatusInternalServerError,
 			fmt.Errorf("unable to create HTTP Client for endpoint: %w", err))
-	}
-	if opts.Endpoint != nil && opts.Endpoint.Debug {
-		cli.Transport = WireDump(cli.Transport)
 	}
 
 	// #1088 — the endpoint send policy (send.go): a write is sent once, never
@@ -123,24 +155,30 @@ func Do(ctx context.Context, opts request.RequestOptions) *response.Status {
 		if st, ok := DestinationStatus(err); ok {
 			return st // #1131 — 502 DestinationRefused
 		}
-		return response.New(http.StatusInternalServerError, err)
+		// #1481 — a transport error's text quotes the request's URL (a
+		// *url.Error), and the /call handler logs the envelope's message: the
+		// URL is rendered without its query values or userinfo (#523).
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 	defer respo.Body.Close()
 
 	// #726 — the refused redirect itself. As #729 ruled for the resolver path,
 	// a 3xx is not an answer a client can act on (and carries no Location
 	// here): report a Failure with 502 Bad Gateway; the fixed message names the
-	// redirect's own code and never its target.
+	// redirect's own code and never its target. #1481: its reason is
+	// snowplow's own RedirectRefused, never plumbing's InternalError (a 500's,
+	// which a classifier reads as a transient server failure): the refusal
+	// is deterministic.
 	if respo.StatusCode >= 300 && respo.StatusCode < 400 {
-		st := response.New(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
-		st.Status = response.StatusFailure
+		st := FailureStatus(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
+		st.Reason = response.StatusReason(RedirectRefusedReason)
 		return st
 	}
 
 	if respo.StatusCode < 200 || respo.StatusCode >= 300 {
 		dat, err := io.ReadAll(io.LimitReader(respo.Body, maxUnstructuredResponseTextBytes))
 		if err != nil {
-			return response.New(http.StatusInternalServerError, err)
+			return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 		}
 		return nonOKEnvelope(respo.StatusCode, dat)
 	}
@@ -191,8 +229,9 @@ const BudgetStatusReason = "Timeout"
 // BudgetStatus shapes an exchange its page budget ended (#1115) into the
 // envelope a stage or a /call passthrough reports: 504 Gateway Timeout, a
 // Failure, reason Timeout, the identity-free ExhaustedError text. ok=false for
-// any other error. (plumbing's response.New(504, …) would read as a Success:
-// 504 is not in its list.)
+// any other error. Its reason is snowplow's own decision, set here: it does
+// not depend on what plumbing's response.New derives for 504 (Timeout since
+// plumbing v1.84.0, none before).
 func BudgetStatus(err error) (*response.Status, bool) {
 	var e *pagebudget.ExhaustedError
 	if !errors.As(err, &e) {
@@ -216,6 +255,32 @@ func WriteBudgetError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
+// DecodeUpstreamStatus reads an UPSTREAM's error body as a Status envelope: its
+// kind, apiVersion, status, message, reason and code, and nothing else. It is
+// nil when the body is not JSON of that shape.
+//
+// #1429 — plumbing's Status carries Details (plumbing#173), which snowplow
+// sets on its OWN answers (a type that is not installed). An upstream's
+// "details" is not part of what snowplow answers: an apiserver's carries the
+// object's name and uid, an external endpoint's can carry anything, and an
+// upstream must never present a cause snowplow did not produce. So the member
+// is taken by a field that shadows Status.Details, accepts any JSON value and
+// is dropped. Without it a body with details would pass them through, and a
+// body whose "details" is not an object would stop decoding as a Status.
+//
+// The one decoder for every place that reads an upstream body into a Status
+// (nonOKEnvelope here, nonOKStatus in the RESTAction stages).
+func DecodeUpstreamStatus(dat []byte) *response.Status {
+	var envelope struct {
+		response.Status
+		Details json.RawMessage `json:"details,omitempty"`
+	}
+	if err := json.Unmarshal(dat, &envelope); err != nil {
+		return nil
+	}
+	return &envelope.Status
+}
+
 // nonOKEnvelope shapes a non-2xx answer into the envelope Do returns. A non-2xx
 // answer is ALWAYS a Failure carrying the status line's code (#1088). Before
 // #1088 two shapes read as a success: a JSON body that is not a Status (an
@@ -226,20 +291,22 @@ func WriteBudgetError(w http.ResponseWriter, err error) bool {
 // audited write that the apiserver refused must never be recorded as a success.
 // A Status body keeps its message and reason, as before.
 func nonOKEnvelope(code int, dat []byte) *response.Status {
-	res := &response.Status{}
-	if err := json.Unmarshal(dat, res); err != nil {
-		res = response.New(code, fmt.Errorf("%s", string(dat)))
+	res := DecodeUpstreamStatus(dat)
+	if res == nil {
+		res = FailureStatus(code, fmt.Errorf("%s", string(dat)))
 	}
 	res.Code = code
 	res.Status = response.StatusFailure
-	// A body that names no reason gets the one plumbing derives from the code
-	// (response.New), as every other non-2xx envelope here does: an object-
-	// bodied 500 reads InternalError. A code plumbing does not map (502, 504,
-	// 429) keeps no reason: before #1088 those read InternalError only because
-	// the RetryClient's give-up error was re-wrapped as a 500, which also hid
-	// the real code. Inventing one would claim what the upstream never said.
+	// A body that names no reason gets the one derived from the code that
+	// agrees with it (ReasonForCode, #1481), as every other non-2xx envelope
+	// here does: an object-bodied 500 reads InternalError, a 504 Timeout, a
+	// 429 TooManyRequests. A 502 keeps no reason: plumbing (v1.84.0) derives
+	// InternalError for it, the reason of a 500, which would claim a failure
+	// the upstream never named. (Before #1088 a 502 read InternalError only
+	// because the RetryClient's give-up error was re-wrapped as a 500, which
+	// also hid the real code.)
 	if res.Reason == "" {
-		res.Reason = response.New(code, nil).Reason
+		res.Reason = ReasonForCode(code)
 	}
 	if res.Kind == "" {
 		res.Kind, res.APIVersion = "Status", "v1"

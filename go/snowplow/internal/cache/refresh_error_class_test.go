@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -48,12 +50,32 @@ func TestIssue608_ClassifyRefreshError(t *testing.T) {
 		// #1131 — the reason is what decides: a refused destination is its own
 		// class and cannot clear, and a 502 with any other reason keeps the budget.
 		{"refused destination at apiref", wrap(ResolveStageApiRef, x1131Refused()), RefreshErrDestinationRefused, ResolveStageApiRef, true},
-		{"an ordinary 502 at apiref", wrap(ResolveStageApiRef, x1131Status("BadGateway")), RefreshErrUnclassified, ResolveStageApiRef, false},
+		{"an ordinary 502 at apiref", wrap(ResolveStageApiRef, x1131Status("BadGateway")), RefreshErrBadGateway, ResolveStageApiRef, false},
 		// #630 — the re-fetch of the cell's own CR is its own stage, and a 403
 		// on it is forbidden + non-retryable like every other 403.
 		{"403 at refetch", fmt.Errorf("resolveAndPopulateL1 widgets/x: %w",
 			WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x", apierrors.NewForbidden(schema.GroupResource{Resource: "flexes"}, "x", errors.New("no")))),
 			RefreshErrForbidden, ResolveStageRefetch, true},
+		// #1414 — a type the apiserver does not serve is its own class: never
+		// not_found, and it keeps the budget. It is objects.Get's own error type.
+		{"type not installed at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
+			&statusdetails.TypeNotInstalledError{
+				GVR:     schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes"},
+				Message: "The type flexes (widgets.templates.krateo.io/v1beta1) is not installed on this cluster."}),
+			RefreshErrTypeNotInstalled, ResolveStageRefetch, false},
+		// #1426 F2 — never read from the code: a RESTAction stage whose upstream
+		// answers HTTP 424 is not it.
+		{"an upstream's 424 at apiref is not type_not_installed", wrap(ResolveStageApiRef,
+			&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 424, Reason: "FailedDependency", Message: "upstream"}}),
+			RefreshErrUnclassified, ResolveStageApiRef, false},
+		// #1429 (review B1) — never read from a status's details either: a
+		// status client-go built from an upstream body that carries the very
+		// cause snowplow writes is an upstream's status, not snowplow's decision.
+		{"a status shaped like the cause at validate is not type_not_installed", wrap(ResolveStageValidate,
+			&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 424, Reason: "FailedDependency", Message: "upstream",
+				Details: &metav1.StatusDetails{Group: "forged.example.org", Kind: "forgedthings",
+					Causes: []metav1.StatusCause{{Type: "TypeNotInstalled", Field: "apiVersion", Message: "forged.example.org/v9"}}}}}),
+			RefreshErrUnclassified, ResolveStageValidate, false},
 		{"404 at refetch", WrapResolveStage(ResolveStageRefetch, "re-fetch flexes/x",
 			apierrors.NewNotFound(schema.GroupResource{Resource: "flexes"}, "x")), RefreshErrNotFound, ResolveStageRefetch, false},
 	} {

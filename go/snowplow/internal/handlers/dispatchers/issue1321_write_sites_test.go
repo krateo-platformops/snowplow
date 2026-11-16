@@ -156,7 +156,11 @@ func TestIssue1321_B1w_TheWalkerShellRePutThatChangesAnArmedShellAnnouncesIt(t *
 	}
 }
 
-func TestIssue1321_M2_StageOutcomesAreNotPartOfIdentical(t *testing.T) {
+// M2 (#1319 revision) — the stage outcomes are part of "identical": the SPA
+// renders a widget's X-Snowplow-Stage-Outcomes, so a Put that moves only them
+// changes what an armed tab renders. It must publish (so the tab refetches and
+// its notice clears) and move the #1324 digest (so a re-arm catches up).
+func TestIssue1321_M2_StageOutcomesArePartOfIdentical(t *testing.T) {
 	e := newR1321(t, "m2-1321", `{"v":"same"}`)
 	ctx := context.Background()
 	put := func(body, outcomes string) cache.PutOutcome {
@@ -166,33 +170,47 @@ func TestIssue1321_M2_StageOutcomesAreNotPartOfIdentical(t *testing.T) {
 	}
 	before, _ := e.c.GetNoTouch(e.key)
 	digest0 := before.ContentDigest()
+	if digest0 != cache.ContentDigest([]byte(`{"v":"same"}`)) {
+		t.Fatal("M2 RED: a complete cell's digest is no longer the #1324 body digest")
+	}
 
-	failed := `[{"name":"list","reason":"Forbidden"}]`
+	failed := `[{"name":"list","ok":false,"reason":"Forbidden"}]`
 	got := put(`{"v":"same"}`, failed)
 	publishIfSubscribed(e.key, got)
-	if got != cache.PutIdentical {
-		t.Fatalf("M2 RED: the same body with other stage outcomes reported %v, want identical — 'identical' is the body "+
-			"an armed client renders (cache/put_outcome.go)", got)
+	if got != cache.PutChanged {
+		t.Fatalf("M2 RED: the same body with other stage outcomes reported %v, want changed — the tab renders them (#1319)", got)
 	}
-	if n := e.frames(); n != 0 {
-		t.Fatalf("M2 RED: a stage-outcome-only change published %d frame(s), want 0", n)
+	if n := e.frames(); n != 1 {
+		t.Fatalf("M2 RED: a stage-outcome-only change published %d frame(s), want 1", n)
 	}
 	after, _ := e.c.GetNoTouch(e.key)
 	if after.StageOutcomes != failed {
-		t.Fatal("PRE: the Put did not store the new stage outcomes (the cell must still carry them for the hit header)")
+		t.Fatal("PRE: the Put did not store the new stage outcomes")
 	}
-	if after.ContentDigest() != digest0 {
-		t.Fatal("M2 RED: the #1324 digest moved on a stage-outcome-only change — the frame rule and the catch-up rule " +
+	if after.ContentDigest() == digest0 {
+		t.Fatal("M2 RED: the #1324 digest did not move on a stage-outcome-only change — the frame rule and the catch-up rule " +
 			"must agree on what 'the client holds' means")
 	}
-	// Scope: the same stream does see a body change, with stage outcomes unchanged.
-	if got := put(`{"v":"other"}`, failed); got != cache.PutChanged {
-		t.Fatalf("M2 RED: a changed body reported %v, want changed", got)
+	// The same answer again is identical: no frame.
+	if got := put(`{"v":"same"}`, failed); got != cache.PutIdentical {
+		t.Fatalf("M2 RED: the same body and outcomes reported %v, want identical", got)
+	} else {
+		publishIfSubscribed(e.key, got)
+	}
+	if n := e.frames(); n != 0 {
+		t.Fatalf("M2 RED: an identical answer published %d frame(s), want 0", n)
+	}
+	// Back to complete: a frame, and the body-only digest again.
+	if got := put(`{"v":"same"}`, ""); got != cache.PutChanged {
+		t.Fatalf("M2 RED: clearing the outcomes reported %v, want changed", got)
 	} else {
 		publishIfSubscribed(e.key, got)
 	}
 	if n := e.frames(); n != 1 {
-		t.Fatalf("M2 RED: a changed body published %d frame(s), want 1", n)
+		t.Fatalf("M2 RED: clearing the outcomes published %d frame(s), want 1 (the notice must clear)", n)
+	}
+	if cleared, _ := e.c.GetNoTouch(e.key); cleared.ContentDigest() != digest0 {
+		t.Fatal("M2 RED: a complete answer's digest differs from the body digest")
 	}
 }
 

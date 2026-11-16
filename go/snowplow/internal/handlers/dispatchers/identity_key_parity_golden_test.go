@@ -162,7 +162,7 @@ func TestIdentityKeyParityGolden_MintSites(t *testing.T) {
 		// "<digest>/<sub-gen>" formula captured in the want values.
 		got[u.name+"/memoClass"] = rbac.IdentityClassOf(jwtutil.UserInfo{Username: u.user, Groups: u.groups}).String()
 		if legacy := rbac.SubjectBindingSetDigest(u.user, u.groups) + "/" +
-			strconv.FormatUint(cache.RBACSubGenForSubject(u.user, rbac.WithAuthenticatedGroup(u.groups)), 10); legacy != got[u.name+"/memoClass"] {
+			strconv.FormatUint(cache.RBACSubGenForSubject(u.user, rbac.WithAuthenticatedGroup(u.user, u.groups)), 10); legacy != got[u.name+"/memoClass"] {
 			t.Errorf("%s: IdentityClassOf().String() = %q, pre-#449 memo class = %q", u.name, got[u.name+"/memoClass"], legacy)
 		}
 	}

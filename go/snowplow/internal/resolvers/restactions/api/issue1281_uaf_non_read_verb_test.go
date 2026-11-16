@@ -106,7 +106,7 @@ type u81Server struct {
 }
 
 func (s *u81Server) clientconfigPath() string {
-	return "/api/v1/namespaces/" + u81AuthnNS + "/secrets/" + credsecret.For(u81User, []string{"devs"})
+	return "/api/v1/namespaces/" + u81AuthnNS + "/secrets/" + credsecret.For(u81User, []string{"devs"})[0]
 }
 
 // all returns every request received, the clientconfig Secret read excluded
@@ -137,7 +137,7 @@ func newU81Server(t *testing.T) *u81Server {
 		case r.Method == http.MethodGet && r.URL.Path == s.clientconfigPath():
 			b, _ := json.Marshal(corev1.Secret{
 				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-				ObjectMeta: metav1.ObjectMeta{Name: credsecret.For(u81User, []string{"devs"}), Namespace: u81AuthnNS},
+				ObjectMeta: authnMeta(u81AuthnNS, credsecret.For(u81User, []string{"devs"})[0], u81User),
 				Data:       map[string][]byte{"server-url": []byte(s.srv.URL), "token": []byte(u81UserToken)},
 			})
 			_, _ = w.Write(b)

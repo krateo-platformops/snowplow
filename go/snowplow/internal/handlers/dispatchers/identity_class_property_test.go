@@ -178,7 +178,7 @@ func icsPublish(t *testing.T, objs []runtime.Object) *dynamicfake.FakeDynamicCli
 	for _, res := range icsResources {
 		navigated = append(navigated, schema.GroupVersionResource{Version: "v1", Resource: res})
 	}
-	cache.BuildBindingsByGVRIndex(append(navigated, icsRAGVR))
+	cache.SeedBindingsIndexFromSnapshotForTest(append(navigated, icsRAGVR))
 	cache.ResetPendingSubGenBumpsForTest()
 	cache.ResetRBACSubGenForTest()
 	prev := cache.Global()

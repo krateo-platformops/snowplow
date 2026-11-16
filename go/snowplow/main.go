@@ -4,10 +4,18 @@
 // /readyz, /debug/vars, pprof and swagger), the per-GVR dispatchers, the
 // informer/L1 caches and prewarm engine, RBAC, and the in-cluster
 // Kubernetes clients, then runs the server until signalled to shut down.
+//
+// The same program also builds for js/wasm, to run in a browser worker for
+// the Agentiko sandbox. That build adds only files constrained to js && wasm:
+// bridge_js.go serves the page's requests from this server
+// (internal/browserbridge, whose package doc says what does not apply in a
+// browser), egress leaves through the browser's fetch (internal/credhttp's
+// package doc), and no shutdown signal ever arrives.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +26,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	krateoaudit "github.com/krateo-platformops/audit"
@@ -227,7 +234,7 @@ func newRequestChain(log *slog.Logger) use.Chain {
 //
 // It is a function so the route the pod serves is the one the tests drive
 // (main_telemetry_1015_test.go).
-func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
+func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
 	var h http.Handler = http.NotFoundHandler()
 	if ingest != nil {
 		h = rum.CountAuthFailures(chain.Append(
@@ -235,7 +242,7 @@ func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySo
 			cache.FallthroughScopeMiddleware(cache.ScopeTelemetry)).
 			Then(ingest))
 	}
-	mux.Handle(rum.Pattern, h)
+	mux.HandleUnaudited(rum.Pattern, "browser spans forwarded to the trace plane: no platform state changes (#1015)", h)
 	cache.RegisterScopedRoute(rum.Pattern, cache.ScopeTelemetry)
 }
 
@@ -258,7 +265,7 @@ func mountTelemetryRoute(mux *http.ServeMux, chain use.Chain, keys jwtutil.KeySo
 //
 // It is a function (not inline in main) so the route table is testable with a
 // test identity middleware in place of the JWT + clientconfig lookup.
-func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+func mountCallWriteRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
 	writes := []struct {
 		method string
 		scope  string
@@ -270,7 +277,7 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 	}
 	for _, w := range writes {
 		pattern := w.method + " /call"
-		mux.Handle(pattern, chain.Append(
+		mux.HandleAudited(pattern, handlers.CallRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.Call()))
@@ -282,7 +289,7 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 			continue
 		}
 		dryPattern := w.method + " /call/dry-run"
-		mux.Handle(dryPattern, chain.Append(
+		mux.HandleAudited(dryPattern, handlers.CallDryRunRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.CallDryRun()))
@@ -303,7 +310,7 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 //
 // It is a function (not inline in main) so the route table is testable with a
 // test identity middleware, as mountCallWriteRoutes is.
-func mountExportRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+func mountExportRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
 	for _, r := range []struct {
 		pattern string
 		handler http.Handler
@@ -311,7 +318,7 @@ func mountExportRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http
 		{"GET /export", handlers.ExportGET()},
 		{"POST /export", handlers.ExportPOST()},
 	} {
-		mux.Handle(r.pattern, chain.Append(
+		mux.HandleAudited(r.pattern, handlers.ExportRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
 			Then(r.handler))
@@ -375,6 +382,10 @@ func main() {
 	// and needs the seed bearer. PORT-anchored to the listen port.
 	urlSelf := flag.String("url-self", env.String("URL_SELF", "http://snowplow.krateo-system.svc.cluster.local:8081"),
 		"snowplow's own service URL — the self-loopback host for the #57 bearer-append arm (exact scheme+host+port match)")
+	// #1334 — opt-in per install, off by default. The chart sets it from the
+	// same value (publicIdentity.enabled) that ships the impersonate grant.
+	publicIdentityOn := flag.Bool("public-identity", env.Bool(envPublicIdentityEnabled, false),
+		"serve requests that carry no Authorization header as the public identity (user krateo:public, group system:unauthenticated), by impersonation")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -410,10 +421,16 @@ func main() {
 	// dump. Re-export it as the DEBUG env so those downstream readers observe it,
 	// so LOG_LEVEL=debug now enables the tracing exactly as DEBUG=true always did.
 	debugMode := logLevel == slog.LevelDebug
-	os.Setenv("DEBUG", strconv.FormatBool(debugMode))
-	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
-	os.Setenv("AUTHN_NAMESPACE", *authnNS)
-	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
+	if err := exportEnv([][2]string{
+		{"DEBUG", strconv.FormatBool(debugMode)},
+		{"TRACE", strconv.FormatBool(*blizzardOn)},
+		{"AUTHN_NAMESPACE", *authnNS},
+		{jqsupport.EnvModulesPath, *jqModPath},
+	}); err != nil {
+		// The logger is built from these settings below, so the reason goes to stderr directly.
+		fmt.Fprintf(os.Stderr, "snowplow: %v\n", err)
+		os.Exit(1)
+	}
 
 	// 1.12.4: the handler chain lives in buildLogHandler (log_handler.go)
 	// — base text/JSON handler + the OTel trace-correlation decorator that
@@ -477,6 +494,11 @@ func main() {
 	//   - authn stays off the hot path of every token validation.
 	// Absent an explicit --jwks-url, derive it from the authn base URL already
 	// configured for the #57 token exchange — one URL to get wrong, not two.
+	if err := checkJWKSRequestTimeout(*jwksTimeout); err != nil {
+		// log-ctx-waiver: boot: process start, before a context exists
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
 	if resolvedJWKSURL == "" {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
@@ -486,10 +508,14 @@ func main() {
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
-	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
+	// credhttp builds the key source's client: the one plumbing builds by
+	// default (dialguard.Client) at the request timeout, positive by
+	// checkJWKSRequestTimeout above. On js/wasm plumbing sets fetch's
+	// credentials mode on it, so the browser attaches none of the frame's
+	// cookies to the JWKS fetch (credhttp/plumbing_clients.go).
+	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
-		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh),
-		jwtutil.WithJWKSRequestTimeout(*jwksTimeout))
+		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
 	log.Info("JWT verification keys sourced from authn JWKS",
 		slog.String("jwks_url", resolvedJWKSURL),
 		slog.Duration("cache_ttl", *jwksCacheTTL),
@@ -1340,79 +1366,29 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// #1362: every route goes through routeTable, which refuses a /debug
+	// pattern outside registerDebugRoutes (see debug_routes.go).
+	routes := newRouteTable(mux)
 
-	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
+	// #1334 — every route whose work is authorized by the caller's identity:
+	// mountCallerIdentityRoutes (public_identity.go), so the route table that
+	// decides which routes accept the public identity is testable.
+	mountCallerIdentityRoutes(routes, chain, jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn))
+
+	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
-	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
-	mux.Handle("GET /readyz", handlers.ReadyCheck())
+	routes.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	routes.Handle("GET /readyz", handlers.ReadyCheck())
 	// Ship D (0.30.141, architectural-consistency invariant) —
 	// /api-info/names is `/call`-class read; scope as `plurals` so the
 	// invariant counter classifies any apiserver fall-through from this
 	// route. cache.FallthroughScopeMiddleware is a no-op when
 	// CACHE_ENABLED=false (project_caching_is_provisional).
-	mux.Handle("GET /api-info/names", chain.Append(
+	routes.Handle("GET /api-info/names", chain.Append(
 		cache.FallthroughScopeMiddleware(cache.ScopePlurals)).
 		Then(handlers.Plurals()))
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
-
-	mux.Handle("GET /list", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeList)).
-		Then(handlers.List()))
-	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
-
-	// Ship D — GET /call is the canonical `/call` read path. Dispatcher
-	// routes into the per-group restactions / widgets handlers; for the
-	// scope label we use call-generic (the dispatcher's fallthrough lane
-	// is the F-1 site). The restactions / widgets dispatcher entries
-	// inherit the scope via the same ctx.
-	mux.Handle("GET /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		handlers.Dispatcher(dispatchers.All())).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
-
-	// #186 — POST /call/read is the body-carrying READ path. It exists so a
-	// large `extras` input rides the request BODY instead of the URL query,
-	// where over HTTP/2 it is charged against the gateway's ~16 KiB header
-	// budget and 431s before Snowplow is invoked. It shares the GET /call
-	// chain EXACTLY — UserConfig, the call-generic read scope, and crucially
-	// the dispatcher into the restactions / widgets resolve handlers — with
-	// two additions: BodyExtrasDecode (decodes {"extras":{...}} → context, so
-	// the context-first util.ParseExtras returns it) runs BEFORE the
-	// dispatcher, and the dispatcher is the POST variant (ReadDispatcher —
-	// the plain Dispatcher is GET-only by design). The terminal fallthrough
-	// is handlers.CallRead(), the READ-ONLY /call (verb forced GET, no
-	// Payload): a POST /call/read to an unhandled GVR is a read passthrough,
-	// never a create. Same read-path invariant as GET /call, so it is
-	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
-	// fails if either half is missing).
-	mux.Handle("POST /call/read", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		middleware.BodyExtrasDecode,
-		handlers.ReadDispatcher(dispatchers.All())).
-		Then(handlers.CallRead()))
-	cache.RegisterScopedRoute("POST /call/read", cache.ScopeCallGeneric)
-
-	// GET /export — GENERIC export: any /call-resolvable list
-	// (RESTAction or list/table Widget) serialized as a CSV/JSON/PDF
-	// attachment. The handler re-dispatches IN-PROCESS through the same
-	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
-	// and serve-time user-aware filtering — export can never see more
-	// than the caller's own /call), then serializes the extracted rows.
-	// The route shares the /call middleware chain, so the scope
-	// classification and the read-path invariant hold; a scheduled
-	// export is just a CronJob curling this route (see howto/export.md).
-	//
-	// POST /export (#970) is the same export with the extras in the request
-	// BODY, for a filter too large for the URL (the gateway 431s a long
-	// ?extras=); it mirrors POST /call/read exactly. Both export routes are
-	// mounted by mountExportRoutes (so the route table is testable) and are
-	// required scoped routes (requiredScopedRoutes).
-	mountExportRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
@@ -1428,7 +1404,7 @@ func main() {
 	refreshesHandler := chain.Append(
 		middleware.RefreshAuth(jwtKeys)).
 		Then(handlers.Refreshes())
-	mux.Handle("GET /refreshes", refreshesHandler)
+	routes.Handle("GET /refreshes", refreshesHandler)
 	// #560 — the SAME handler on POST. The GET form carries the subscription set
 	// in `?sub=`, which grows ~361 bytes per widget: a 50-widget page sends an
 	// 18 KB URL and the ingress returns 431 before snowplow sees it, so live
@@ -1436,30 +1412,12 @@ func main() {
 	// coordinate array in the body, which has no request-line limit. Same path,
 	// same auth, same semantics, still zero apiserver reads — and GET stays
 	// byte-identical so the server can land ahead of the client.
-	mux.Handle("POST /refreshes", refreshesHandler)
-
-	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
-	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
-	// resolves a referenced RESTAction's api[] stages to the (group, version,
-	// resource, verb) tuples a /call WOULD read, WITHOUT dispatching.
-	// Authenticated with the SAME JWT+clientconfig as /call (middleware.UserConfig):
-	// the JWT authenticates the caller, but the enumeration uses NONE of the
-	// caller's RBAC perms (it runs under the SA), so the read-set is computable
-	// before any binding exists. DELIBERATELY NOT cache.RegisterScopedRoute'd:
-	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
-	// outside the read-path-scoped invariant (fallthrough_assert.go).
-	mux.Handle("GET /rbac", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS)).
-		Then(handlers.RBAC()))
-
-	mountCallWriteRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: its coordinates ride the body; no state changes (#560)", refreshesHandler)
 
 	// #443 — GET /capabilities: a static, unauthenticated token list a client
 	// gates on by presence (a 404 means none). No identity, no apiserver call,
 	// so it is outside the read-path-scoped invariant (like /refreshes).
-	mux.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
-
-	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
 	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
 	// On only under the OTel trace contract with a collector endpoint
@@ -1467,7 +1425,7 @@ func main() {
 	// runs until main returns.
 	rumCtx, rumStop := context.WithCancel(context.Background())
 	defer rumStop()
-	mountTelemetryRoute(mux, chain, jwtKeys, newRUMIngest(rumCtx, mux))
+	mountTelemetryRoute(routes, chain, jwtKeys, newRUMIngest(rumCtx, mux))
 	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register
@@ -1536,19 +1494,16 @@ func main() {
 	// Extracted into a named registrar (debug_routes.go) so the gating is
 	// testable against production wiring — the same shape snowplowCORSOptions
 	// uses for the CORS contract. /health + /readyz above stay ANONYMOUS (the
-	// kubelet presents no JWT); /swagger/ is unchanged.
+	// kubelet presents no JWT); /swagger/ is unchanged. #1362: every route is
+	// also authorized (middleware.DebugAuthz): RBAC `nonResourceURLs` for the
+	// JWT's identity, so an authenticated caller without the grant gets 403.
 	//
 	// MUST come after the expvar publishers registered just above.
-	registerDebugRoutes(mux, chain, jwtKeys)
+	registerDebugRoutes(routes, chain, jwtKeys)
 
-	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGKILL,
-		syscall.SIGHUP,
-		syscall.SIGQUIT,
-	}...)
+	// The signals that start a graceful shutdown: shutdown_signals.go on a
+	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
 
 	server := &http.Server{
@@ -1641,6 +1596,22 @@ func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
 }
 
+// errJWKSRequestTimeoutNotPositive refuses a non-positive
+// --jwks-request-timeout / JWT_JWKS_REQUEST_TIMEOUT at startup. The timeout
+// bounds every JWKS fetch, and a token validation waits on one, so without a
+// bound an authn that accepts the connection and never answers hangs every
+// authentication. The default is 5 s.
+var errJWKSRequestTimeoutNotPositive = errors.New("--jwks-request-timeout/JWT_JWKS_REQUEST_TIMEOUT must be positive: it bounds every JWKS fetch, and an unbounded one can hang every authentication")
+
+// checkJWKSRequestTimeout is errJWKSRequestTimeoutNotPositive, with the value
+// given, when d is not positive.
+func checkJWKSRequestTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w (got %s)", errJWKSRequestTimeoutNotPositive, d)
+	}
+	return nil
+}
+
 // parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
 // handler's minimum floor (issue #163). Case- and whitespace-insensitive. Any
 // unrecognised value — including the empty string and the default "info" —
@@ -1693,4 +1664,16 @@ func startAuditNamespaceReader(ctx context.Context, log *slog.Logger) {
 		return
 	}
 	audit.SetNamespaceReader(audit.StartNamespaceReader(ctx, mc))
+}
+
+// exportEnv sets each variable for the process, in order, and names the first one it could not
+// set: the downstream readers (plumbing's DEBUG tracing, the authn namespace, the jq module path)
+// would otherwise run with a stale value and nothing would say so.
+func exportEnv(vars [][2]string) error {
+	for _, kv := range vars {
+		if err := os.Setenv(kv[0], kv[1]); err != nil {
+			return fmt.Errorf("cannot set %s for the process: %w", kv[0], err)
+		}
+	}
+	return nil
 }

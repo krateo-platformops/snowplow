@@ -50,8 +50,8 @@ const (
 func helperRecord(t *testing.T, ev audit.Event) map[string]string {
 	t.Helper()
 	rec := logtest.NewRecorder()
-	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}))
+	ctx := audit.WithSessionID(xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})), "s-443")
 	audit.New(rec.Logger("helper-1055")).Emit(ctx, ev)
 	got := records957(rec)
 	if len(got) != 1 {
@@ -85,8 +85,10 @@ func TestExport1055_M_T_MethodIsTheRequestsAndTheTargetHasGroupAndVersion(t *tes
 			}
 			got := one957(t, rec)
 			want := map[string]string{
-				"krateo.action":         "export",
-				"http.request.method":   c.method,
+				"krateo.action": "export",
+				// F1 (#1379 review): the method of the request the export
+				// SENT, GET for a GET and a POST /export alike (schema v1).
+				"http.request.method":   http.MethodGet,
 				"k8s.resource.group":    group1055,
 				"k8s.resource.version":  version1055,
 				"k8s.resource.resource": "fireworksapps",
@@ -224,9 +226,9 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				rec := recorder957(t)
 				req := httptest.NewRequest(method, fullTarget+e.query, nil)
-				req = req.WithContext(xcontext.BuildContext(req.Context(),
+				req = req.WithContext(audit.WithSessionID(xcontext.BuildContext(req.Context(),
 					xcontext.WithLogger(slog.New(slog.DiscardHandler)),
-					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman})))
+					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman})), "s-1055"))
 				Export(e.inner(t)).ServeHTTP(e.writer(), req)
 
 				got := records957(rec)
@@ -235,7 +237,7 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				r := got[0]
 				for k, v := range map[string]string{
-					"http.request.method":       method,
+					"http.request.method":       http.MethodGet, // F1: the method sent
 					"k8s.resource.group":        group1055,
 					"k8s.resource.version":      version1055,
 					"k8s.resource.resource":     "fireworksapps",

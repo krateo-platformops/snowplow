@@ -15,7 +15,17 @@
 //     never cluster scope);
 //   - a grant in another namespace only;
 //   - one Role holding the SAME verb twice, name-scoped first and unscoped
-//     second (a name mismatch on the first rule must not end the walk).
+//     second (a name mismatch on the first rule must not end the walk);
+//   - (#1334) grants to the implicit groups system:authenticated and
+//     system:unauthenticated, requested by an identity presenting
+//     system:unauthenticated and by an impersonated system:anonymous with NO
+//     groups. The apiserver (impersonation.go:126-157, k8s.io/apiserver
+//     v0.36.5) gives the first no system:authenticated, and the second exactly
+//     [system:unauthenticated]; an authenticated control holds only
+//     system:authenticated. These rows are the only ones whose verdict
+//     depends on the implicit group, so they are what judges the model's
+//     requestGroups: a model that always adds system:authenticated, or one
+//     that adds nothing for system:anonymous, disagrees with the hand table.
 //
 // TWO ORACLES. Every case carries a hand-written expectation derived from the
 // upstream authorizer (RuleAllows + the RequestInfo name of a plain item or
@@ -52,7 +62,14 @@ var i1046AdvGroups = map[string][]string{
 	"r-cr-via-rb":    nil,
 	"r-other-ns":     nil,
 	"r-dup":          nil,
+	// #1334
+	i1046AdvPublic: {"system:unauthenticated"},
+	i1046AdvAnon:   nil,
 }
+
+// #1334 identities: a user presenting system:unauthenticated, and
+// system:anonymous with no groups.
+const i1046AdvPublic, i1046AdvAnon = "r-public", "system:anonymous"
 
 func i1046AdvSeed() []runtime.Object {
 	g, r := []string{i1046GVR.Group}, []string{i1046GVR.Resource}
@@ -82,6 +99,11 @@ func i1046AdvSeed() []runtime.Object {
 		// SAME verb: name-scoped rule first, unscoped rule second, one Role
 		role(i1046AdvNS, "rv-dup", ruleNamed(g, r, []string{"get"}, []string{"x"}), rule(g, r, []string{"get"})),
 		roleBinding(i1046AdvNS, "rv-d", "Role", "rv-dup", userSubject("r-dup")),
+		// #1334: one object per implicit group
+		role(i1046AdvNS, "rv-get-authonly", ruleNamed(g, r, []string{"get"}, []string{"auth-only"})),
+		roleBinding(i1046AdvNS, "rv-authn", "Role", "rv-get-authonly", groupSubject("system:authenticated")),
+		role(i1046AdvNS, "rv-get-unauthonly", ruleNamed(g, r, []string{"get"}, []string{"unauth-only"})),
+		roleBinding(i1046AdvNS, "rv-unauthn", "Role", "rv-get-unauthonly", groupSubject("system:unauthenticated")),
 	}
 }
 
@@ -131,6 +153,17 @@ var i1046AdvCases = []i1046AdvCase{
 	{"r-dup", "get", i1046AdvNS, "x", true},
 	{"r-dup", "get", i1046AdvNS, "y", true},
 	{"r-dup", "list", i1046AdvNS, "y", false},
+	// #1334: system:unauthenticated presented — no system:authenticated
+	{i1046AdvPublic, "get", i1046AdvNS, "auth-only", false},
+	{i1046AdvPublic, "get", i1046AdvNS, "unauth-only", true},
+	// #1334: impersonated system:anonymous, no groups — gets
+	// system:unauthenticated (impersonation.go:145-157), never
+	// system:authenticated (126)
+	{i1046AdvAnon, "get", i1046AdvNS, "auth-only", false},
+	{i1046AdvAnon, "get", i1046AdvNS, "unauth-only", true},
+	// control: an authenticated user holds system:authenticated only
+	{"r-starname", "get", i1046AdvNS, "auth-only", true},
+	{"r-starname", "get", i1046AdvNS, "unauth-only", false},
 }
 
 func TestIssue1046_ObjectCheck_AdversarialShapes(t *testing.T) {

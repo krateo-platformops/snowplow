@@ -28,9 +28,12 @@ func flattenRecords(rec logtest.Recording) []logtest.Record {
 
 // actorCtx is a request context carrying an authenticated actor, the way every
 // audited route's UserConfig middleware leaves it.
+// actorCtx is a request context as the pod has it: a verified caller, and the
+// session id audit.Middleware establishes on every request (the request writer
+// must write one, audit v0.12.0).
 func actorCtx() context.Context {
-	return xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman}))
+	return WithSessionID(xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})), "s-test")
 }
 
 func TestSanitizeID(t *testing.T) {

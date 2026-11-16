@@ -197,8 +197,11 @@ func TestExport1251_GETAndPOSTCarryTheRequestFacts(t *testing.T) {
 			if a := got["krateo.action"].AsString(); a != "export" {
 				t.Fatalf("precondition: krateo.action = %q", a)
 			}
-			if m := got["http.request.method"].AsString(); m != c.method {
-				t.Fatalf("precondition: http.request.method = %q, want %q", m, c.method)
+			// F1 (#1379 review): the method the export SENT, GET, whatever
+			// method it was served with; krateo.request.uri says what it
+			// received.
+			if m := got["http.request.method"].AsString(); m != http.MethodGet {
+				t.Fatalf("precondition: http.request.method = %q, want GET", m)
 			}
 			wantFacts1251(t, got, []string{browser1251, gatewayPeer1251}, target)
 			if v, has := got["k8s.object.uid"]; has {
@@ -245,8 +248,11 @@ func wantFacts1251(t *testing.T, got map[string]attribute.Value, ips []string, u
 }
 
 // The exits before the dial — a request that does not validate (400) and one
-// with no user endpoint (401) — emit no record: nothing was sent. The control
-// in the same arm is a write that reaches the dial.
+// with no user endpoint (401) — emit no record from the HANDLER: nothing was
+// sent. Each is its route's record from audit.OpenRecord, with the reason the
+// login middleware or the refusal gives it (TestAudit_OpenRecord_*,
+// TestAudit_E2E_*); this arm drives the handler alone. The control in the
+// same arm is a write that reaches the dial.
 func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 	api, ep := newFakeAPI443(t)
 	api.respond(http.StatusNotFound, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}`)
@@ -275,12 +281,13 @@ func TestCall1251_ExitsBeforeTheDialEmitNothing(t *testing.T) {
 		t.Fatalf("no user endpoint: code %d, want 401", w.Code)
 	}
 	if n := len(records957(rec)); n != 0 {
-		t.Fatalf("the exits before the dial emitted %d records, want 0", n)
+		t.Fatalf("the exits before the dial emitted %d records from the handler, want 0", n)
 	}
 	if n := len(api.requests()); n != 0 {
 		t.Fatalf("precondition: %d requests reached the apiserver before a 400/401", n)
 	}
 	// Control: the same handler, a request that reaches the dial.
+	rec.Reset()
 	if w := serve1251(CallDryRun(), ep, http.MethodPatch, "/call/dry-run?"+cmQuery443, cmRequest957, gatewayPeer1251, browser1251); w.Code != http.StatusNotFound {
 		t.Fatalf("control: code %d, want the dial's 404", w.Code)
 	}

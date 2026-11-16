@@ -47,25 +47,15 @@ type RotatedSubjectSet struct {
 	set map[subjectKey]struct{}
 }
 
-// foldSubjects returns the subjectKeys an identity (username + presented groups)
-// folds into its effective RBAC sub-gen — mirroring RBACSubGenForSubject EXACTLY
-// (a ServiceAccount username folds the SA subject, a human username the User
-// subject, every non-empty group its Group subject).
+// foldSubjects returns the subjectKeys an identity (username + groups) folds
+// into its effective RBAC sub-gen: its matched-subject set (SubjectMatcher.Visit,
+// #1443), the same set the evaluator matches bindings with.
 func foldSubjects(username string, groups []string) []subjectKey {
-	out := make([]subjectKey, 0, 1+len(groups))
-	if username != "" {
-		if ns, name, ok := parseServiceAccountUsername(username); ok {
-			out = append(out, subjectKey{Kind: subjectKindServiceAccount, Name: name, Namespace: ns})
-		} else {
-			out = append(out, subjectKey{Kind: subjectKindUser, Name: username})
-		}
-	}
-	for _, g := range groups {
-		if g == "" {
-			continue
-		}
-		out = append(out, subjectKey{Kind: subjectKindGroup, Name: g})
-	}
+	out := make([]subjectKey, 0, 2+len(groups))
+	NewSubjectMatcher(username, groups).Visit(func(ms MatchedSubject) bool {
+		out = append(out, ms.key())
+		return true
+	})
 	return out
 }
 
@@ -86,7 +76,7 @@ func (r RotatedSubjectSet) Rotated(username string, groups []string) bool {
 	if len(r.set) == 0 {
 		return false
 	}
-	for _, s := range foldSubjects(username, WithAuthenticatedGroup(groups)) {
+	for _, s := range foldSubjects(username, WithAuthenticatedGroup(username, groups)) {
 		if _, hit := r.set[s]; hit {
 			return true
 		}
@@ -173,20 +163,29 @@ func NotifyRBACShiftForTest(rotated []RotatedSubject) {
 	fireRBACShift(RotatedSubjectSet{set: set})
 }
 
-// WithAuthenticatedGroup returns groups plus system:authenticated (once,
-// de-duplicated, order otherwise preserved): the requester's EFFECTIVE group
-// set. The single source for every site that must agree on one identity class —
+// WithAuthenticatedGroup returns the kube-apiserver's EFFECTIVE group set for a
+// request by (username, groups): groups plus ImplicitGroup(username, groups)
+// when the apiserver adds one, order otherwise preserved; groups itself when it
+// adds none.
+//
+// For every authenticated identity — any user but system:anonymous whose groups
+// name neither system:authenticated nor system:unauthenticated — that is groups
+// plus system:authenticated, byte-identical to the pre-#1334 result, so no key
+// or digest moves on rollout. An identity presenting system:unauthenticated
+// keeps its groups unchanged, as the apiserver does; before #1334 it was
+// evaluated, keyed and served as if it were authenticated.
+//
+// The single source for every site that must agree on one identity class —
 // the RBACSubGen key fold, the binding-set digest, the seed resolve identity
-// (rbac.WithAuthenticatedGroup delegates here) and the reseed reachability
-// predicate (Rotated, #436). It lives in this package so Rotated can use it
-// without an import cycle.
-func WithAuthenticatedGroup(groups []string) []string {
-	for _, g := range groups {
-		if g == systemAuthenticatedGroup {
-			return groups
-		}
+// (rbac.WithAuthenticatedGroup delegates here), the learned class key and the
+// reseed reachability predicates (Rotated #436, IdentityAuthorisedForGVR). It
+// lives in this package so Rotated can use it without an import cycle.
+func WithAuthenticatedGroup(username string, groups []string) []string {
+	ig := ImplicitGroup(username, groups)
+	if ig == "" {
+		return groups
 	}
 	out := make([]string, 0, len(groups)+1)
 	out = append(out, groups...)
-	return append(out, systemAuthenticatedGroup)
+	return append(out, ig)
 }

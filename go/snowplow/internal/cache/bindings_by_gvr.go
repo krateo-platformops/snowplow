@@ -29,18 +29,36 @@
 // List over-inclusion = wasted seed (benign); under-inclusion = per-user
 // fallback resolve (benign). Eventual consistency is fine.
 //
-// INCREMENTAL MAINTENANCE (Gate-2, gate2bench). The wholesale rebuild of
-// this index per ~4.6/s snapshot republish was measured at ~265 ms/build
-// → ~122% CPU and is REJECTED. The index is therefore:
-//   - built ONCE after WaitAllInformersSynced over RegisteredGVRs()
-//     (BuildBindingsByGVRIndex);
-//   - maintained INCREMENTALLY via delta hooks on the SAME RBAC informer
-//     events that drive scheduleRBACRebuild (OnBindingAdd / OnBindingUpdate
-//     (old,new) / OnBindingDelete) — each event resolves ONE binding's
-//     roleRef rules + (un)enrols its subjectKeys into the per-GVR buckets.
-//   The Gate-2 incremental bench measured the per-binding-event delta at
-//   ~5.8 µs → 0.0027% CPU at 4.6/s (set-backed buckets make the DELETE
-//   side O(navigatedGVRs), not O(bucket-size)).
+// A FOLD OF EVENTS, NEVER REBUILT (#1458). The index holds two things:
+//
+//   - MEMBERSHIP: which binding names which role, with which subjects
+//     (members, membersByRole). It is what a role's rules edit reaches an identity's
+//     cache keys through (onRoleRulesChanged → the sub-generation of the
+//     subjects of the bindings that name the role). It is written by the RBAC
+//     informer event hooks ALONE (bindings_by_gvr_delta.go), from the
+//     informers' first event on, the initial list included. NOTHING refills it
+//     from the published RBAC snapshot: a refill reads a snapshot that is
+//     published later than the events are handled, so it drops (or resurrects)
+//     what the event path already applied (#1458).
+//   - BUCKETS: which bindings grant get/list on which navigated resource
+//     (byGVR, wildcard), over the navigated set. Derived from membership, the
+//     role rules and the navigated set; they decide prewarm targeting only.
+//     SetNavigatedGVRs (the readiness settle and every prewarm pass) and
+//     AddNavigatedGVR (CRD discovery) re-derive them; they never touch
+//     membership.
+//
+// READY. The index is ready once the four RBAC handlers have been delivered
+// their informers' initial lists (their registrations' HasSynced): membership
+// then holds every binding. The initial-publish goroutine, which readiness
+// waits for (#1231), sets it once (markBindingsIndexReady). Until then the
+// enumerators answer nothing and the hooks record no sub-generation bump (the
+// #682 note covers that window with one rotation at ready).
+//
+// The wholesale rebuild of this index per ~4.6/s snapshot republish was
+// measured at ~265 ms/build → ~122% CPU and is REJECTED (Gate-2). The
+// per-binding-event delta was measured at ~5.8 µs → 0.0027% CPU at 4.6/s
+// (set-backed buckets make the DELETE side O(navigatedGVRs), not
+// O(bucket-size)).
 //
 // SET-BACKED BUCKETS (Gate-2 lesson). Buckets are map[subjectKey]struct{}
 // — NOT slices. A slice bucket made an admin-wildcard binding delete an
@@ -69,9 +87,8 @@
 package cache
 
 import (
-	"log/slog"
 	"sync"
-	"sync/atomic"
+	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -125,6 +142,9 @@ type bindingID string
 type bindingEntry struct {
 	id       bindingID
 	subjects []subjectKey
+	// role is the byRole key of the role the binding names (roleRefKey), ""
+	// for a roleRef of an unknown kind.
+	role string
 }
 
 // bindingsByGVRIndex is the incremental reverse index.
@@ -134,7 +154,7 @@ type bindingEntry struct {
 //   - wildcard  = set of bindingEntries whose roleRef carries a `*/*`
 //     get/list rule (cluster-admin). NOT expanded across every GVR — the
 //     per-GVR cohort = byGVR[gr] ∪ wildcard.
-//   - byRole[roleKey] = set of bindingIDs referencing that role — used by
+//   - membersByRole[roleKey] = set of bindingIDs referencing that role — used by
 //     the role-rule-change re-route path to find every binding to
 //     re-resolve when a ClusterRole/Role's rules change.
 //   - entries[id] = the bindingEntry for an id — lets the delta hooks
@@ -144,46 +164,23 @@ type bindingsByGVRIndex struct {
 	mu       sync.RWMutex
 	byGVR    map[groupResource]map[bindingID]struct{}
 	wildcard map[bindingID]struct{}
-	byRole   map[string]map[bindingID]struct{}
-	entries  map[bindingID]bindingEntry
-
-	// roleRefUnresolved is the PER-BUILD set of binding UIDs SKIPPED at the two
-	// rulesForRoleRef !ok sites in BuildBindingsByGVRIndex (the binding's
-	// Role/ClusterRole was absent from the snapshot at build time, so the
-	// binding is not in byRole/byGVR and its grant is not reflected in the
-	// index keying). #261 case-3 serve-time-detector substrate: a later create
-	// or edit of that role shifts the binding's grant — and thus the
-	// serve-time first-match BindingUID — with NO sub-gen bump, the bounded
-	// "roleRef unresolved at build" missed-rotation carrier.
-	//
-	// Keyed by the SAME UID string form the serve path folds into the L1 cell
-	// key (BindingUIDFromCRB "C:<uid>" / BindingUIDFromRB "R:<ns>/<uid>", via
-	// crbBindingID / rbBindingID), so IsRoleRefUnresolvedAtBuild queries it
-	// directly with the dispatcher's matchedBindingUID — no UID→bindingID
-	// conversion.
-	//
-	// LIFECYCLE (arch caveat, critical): CLEARED at the START of every build
-	// and repopulated during THAT build only — NEVER accumulated across builds.
-	// A binding unresolved in a PAST build but re-enrolled now must NOT read
-	// at-risk, so the set reflects the LAST build's skip decisions alone. The
-	// steady-state delta hooks (enrol/unrol) deliberately do NOT touch it: it is
-	// a per-build snapshot of skip decisions, corrected on the next rebuild.
-	roleRefUnresolved map[bindingID]struct{}
+	// membersByRole and members are the index's MEMBERSHIP (#1458). Their
+	// names are unique in the package on purpose: the source guard
+	// (TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot) finds
+	// every reference to them by field name, whatever the variable is called.
+	membersByRole map[string]map[bindingID]struct{}
+	members       map[bindingID]bindingEntry
 
 	// navigated is the set of GVRs the index buckets are maintained for.
-	// Set at BuildBindingsByGVRIndex time; the delta hooks enrol only into
-	// these buckets. A GVR discovered later (post-build CRD) widens this
-	// via AddNavigatedGVR.
+	// Set by SetNavigatedGVRs; the delta hooks enrol only into these
+	// buckets. A GVR discovered later (a CRD) widens this via
+	// AddNavigatedGVR.
 	navigated map[groupResource]struct{}
 
-	built bool
-
-	// pendingNavigated (#686): a build requested while no RBAC snapshot was
-	// published yet. The index stays UNBUILT (built=false) rather than
-	// claiming to be built over nothing: a "built" empty byRole makes every
-	// later role edit bump no subject. The first snapshot publish runs the
-	// build (buildPendingBindingsIndex). nil when no build is pending.
-	pendingNavigated []schema.GroupVersionResource
+	// ready: the four RBAC handlers have been delivered their initial lists,
+	// so membership holds every binding (#1458). Set once
+	// (markBindingsIndexReady); never returns to false in production.
+	ready bool
 }
 
 // bindingsIndexSingleton is the process-wide index. Lazily constructed.
@@ -195,12 +192,11 @@ var (
 func bindingsByGVRSingleton() *bindingsByGVRIndex {
 	bindingsIndexOnce.Do(func() {
 		bindingsIndexInstance = &bindingsByGVRIndex{
-			byGVR:             map[groupResource]map[bindingID]struct{}{},
-			wildcard:          map[bindingID]struct{}{},
-			byRole:            map[string]map[bindingID]struct{}{},
-			entries:           map[bindingID]bindingEntry{},
-			navigated:         map[groupResource]struct{}{},
-			roleRefUnresolved: map[bindingID]struct{}{},
+			byGVR:         map[groupResource]map[bindingID]struct{}{},
+			wildcard:      map[bindingID]struct{}{},
+			membersByRole: map[string]map[bindingID]struct{}{},
+			members:       map[bindingID]bindingEntry{},
+			navigated:     map[groupResource]struct{}{},
 		}
 	})
 	return bindingsIndexInstance
@@ -238,17 +234,16 @@ func rbBindingID(p *rbacv1.RoleBinding) bindingID {
 // Only User / Group / ServiceAccount kinds are projected (the cohort
 // machinery consumes User+Groups; SA subjects are carried so a future SA
 // cohort path can use them — collectCohortBindingIDs already ignores SA).
+// Each subject's key is bindingSubjectKey's (match_subject.go): the one form
+// a binding event bumps and the evaluator's subject matcher compares (#1443).
 func subjectsFromRBAC(subjects []rbacv1.Subject) []subjectKey {
 	if len(subjects) == 0 {
 		return nil
 	}
 	out := make([]subjectKey, 0, len(subjects))
 	for _, s := range subjects {
-		switch s.Kind {
-		case rbacv1.UserKind, rbacv1.GroupKind:
-			out = append(out, subjectKey{Kind: s.Kind, Name: s.Name})
-		case rbacv1.ServiceAccountKind:
-			out = append(out, subjectKey{Kind: s.Kind, Name: s.Name, Namespace: s.Namespace})
+		if k, ok := bindingSubjectKey(s); ok {
+			out = append(out, k)
 		}
 	}
 	return out
@@ -361,21 +356,30 @@ func rulesForRoleRef(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef) (
 // bindingEntry + rules so the hooks resolve the snapshot ONCE per event.
 // ─────────────────────────────────────────────────────────────────────
 
-// enrolLocked enrols a binding into the per-GVR buckets / wildcard bucket
-// + the byRole map. Caller holds idx.mu (write). rules is the binding's
-// resolved roleRef rules; rk is its roleRefKey ("" if unresolvable).
+// enrolLocked records a binding's membership (entries + byRole) and enrols it
+// into the per-GVR buckets / wildcard bucket. Caller holds idx.mu (write).
+// rules is the binding's resolved roleRef rules; rk is its roleRefKey ("" if
+// unresolvable).
 func (idx *bindingsByGVRIndex) enrolLocked(entry bindingEntry, rules []rbacv1.PolicyRule, rk string) {
-	idx.entries[entry.id] = entry
+	entry.role = rk
+	idx.members[entry.id] = entry
 	if rk != "" {
-		set := idx.byRole[rk]
+		set := idx.membersByRole[rk]
 		if set == nil {
 			set = map[bindingID]struct{}{}
-			idx.byRole[rk] = set
+			idx.membersByRole[rk] = set
 		}
 		set[entry.id] = struct{}{}
 	}
+	idx.bucketLocked(entry.id, rules)
+}
+
+// bucketLocked enrols a binding id into the wildcard bucket or the per-GVR
+// buckets its rules grant. It writes buckets only, never membership. Caller
+// holds idx.mu (write).
+func (idx *bindingsByGVRIndex) bucketLocked(id bindingID, rules []rbacv1.PolicyRule) {
 	if rulesGrantWildcard(rules) {
-		idx.wildcard[entry.id] = struct{}{}
+		idx.wildcard[id] = struct{}{}
 		return
 	}
 	for gr := range idx.navigated {
@@ -385,9 +389,34 @@ func (idx *bindingsByGVRIndex) enrolLocked(entry bindingEntry, rules []rbacv1.Po
 				set = map[bindingID]struct{}{}
 				idx.byGVR[gr] = set
 			}
-			set[entry.id] = struct{}{}
+			set[id] = struct{}{}
 		}
 	}
+}
+
+// recordBindingLocked is the ONE way a binding enters the index (#1449,
+// #1458): the binding ADD / UPDATE event hooks call it. It is an UPSERT: a
+// binding the index already holds under this id is first removed from where it
+// was filed (its old role, its old buckets), in the same critical section, so
+// the index never files one binding twice and no reader sees it absent. The
+// binding is
+// recorded under the role it names (members + membersByRole) whether or not that role
+// is in snap. A role that is absent has no rules, so THIS function puts the
+// binding in no GVR or wildcard bucket (it grants nothing, and the evaluator,
+// which reads the snapshot and never this index, denies it); it stays reachable
+// through byRole, so the role's create, every rules edit and its delete reach
+// the binding's subjects (onRoleRulesChanged). That holds for the record path
+// only: when a role is DELETED, onRoleRulesChanged re-buckets its bindings
+// under the role's last-known rules, where they stay until the next event on
+// the role or the binding, or the next prewarm pass's index step, which
+// re-derives the buckets (#1457 item 2; prewarm targeting only, never keys or
+// authorization). Caller holds idx.mu (write).
+func (idx *bindingsByGVRIndex) recordBindingLocked(snap *RBACSnapshot, namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
+	if prev, held := idx.members[id]; held {
+		idx.unrolLocked(id, prev.role)
+	}
+	rules, _ := rulesForRoleRef(snap, namespace, ref)
+	idx.enrolLocked(bindingEntry{id: id, subjects: subjects}, rules, roleRefKey(namespace, ref))
 }
 
 // unrolLocked removes a binding id from every bucket it could be in. Caller
@@ -401,168 +430,83 @@ func (idx *bindingsByGVRIndex) unrolLocked(id bindingID, rk string) {
 		delete(set, id)
 	}
 	if rk != "" {
-		if set := idx.byRole[rk]; set != nil {
+		if set := idx.membersByRole[rk]; set != nil {
 			delete(set, id)
 		}
 	}
-	delete(idx.entries, id)
+	delete(idx.members, id)
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Build (ONCE). BuildBindingsByGVRIndex builds the full index from the
-// published snapshot over the given navigated GVR set. Called after
-// WaitAllInformersSynced over RegisteredGVRs(). Idempotent: a rebuild
-// resets and re-enrols (used only at boot / explicit re-build; the
-// steady-state path is the delta hooks).
+// The navigated set and the ready signal. Neither writes membership.
 // ─────────────────────────────────────────────────────────────────────
 
-// BuildBindingsByGVRIndex builds the index ONCE over navigatedGVRs against
-// the current published RBAC snapshot. Safe to call with a nil/empty
-// navigated set (the index stays empty until AddNavigatedGVR widens it).
-// Returns the number of bindings enrolled (CRB + RB resolved).
-func BuildBindingsByGVRIndex(navigatedGVRs []schema.GroupVersionResource) int {
+// SetNavigatedGVRs sets the navigated set and re-derives the per-GVR and
+// wildcard buckets from the membership the index holds and the published
+// snapshot's role rules. Called by the readiness settle and by every prewarm
+// pass, over the registered GVRs. It NEVER writes membership (entries, byRole):
+// it can neither drop a binding the event path recorded nor bring back one it
+// removed (#1458). Safe with a nil or empty set (no bucket until
+// AddNavigatedGVR or a later call widens it). Returns the number of bindings
+// the index holds.
+func SetNavigatedGVRs(navigatedGVRs []schema.GroupVersionResource) int {
 	idx := bindingsByGVRSingleton()
-
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	// #686 (reviewer-small's #689 gate): load the snapshot UNDER idx.mu. A
-	// publish landing between an unlocked Load (nil) and this Lock would run
-	// buildPendingBindingsIndex while pendingNavigated is still unset, and
-	// the deferral recorded below would then wait for the NEXT publish. Under
-	// the lock, the publisher's buildPendingBindingsIndex blocks on its RLock
-	// until the deferral is recorded, then runs it.
-	snap := rbacSnap.Load()
-
-	// #682: the FIRST false→true transition of built rotates every
-	// per-identity key once, if an RBAC event landed between the first
-	// publish and this build (rbac_subgen_epoch.go). Registered below, on the
-	// REAL build path only. A build DEFERRED over a nil snapshot (#686) is
-	// not a transition: built stays false, and the note must survive until
-	// the real first build (buildPendingBindingsIndex) consumes it. Rotating
-	// at each deferral was a per-pass global rotation (reviewer-small, #689
-	// gate on main 57e48a5e: #685's E3 RED 20/20).
-	wasBuilt := idx.built
-
-	// Reset to a clean state (idempotent rebuild).
-	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
-	idx.wildcard = map[bindingID]struct{}{}
-	idx.byRole = map[string]map[bindingID]struct{}{}
-	idx.entries = map[bindingID]bindingEntry{}
-	idx.navigated = map[groupResource]struct{}{}
-	// #261 case-3 — CLEAR the per-build skipped-set at build start; it is
-	// repopulated below during THIS build only (never accumulated).
-	idx.roleRefUnresolved = map[bindingID]struct{}{}
+	idx.navigated = make(map[groupResource]struct{}, len(navigatedGVRs))
 	for _, gvr := range navigatedGVRs {
 		idx.navigated[grFromGVR(gvr)] = struct{}{}
 	}
-
-	if snap == nil {
-		// #686 — refuse to call an index BUILT over no snapshot: byRole
-		// would stay empty and every later role-rule edit would bump no
-		// subject (onRoleRulesChanged finds no referencing binding). Stay
-		// unbuilt (callers keep the pre-build fallbacks) and let the first
-		// publish build it.
-		idx.built = false
-		idx.pendingNavigated = append([]schema.GroupVersionResource(nil), navigatedGVRs...)
-		bindingsIndexDeferredTotal.Add(1)
-		// log-ctx-waiver: worker: the debounced index build; a pod-wide index, built for no request
-		slog.Warn("cache.bindings_by_gvr.build_deferred_no_snapshot",
-			slog.String("subsystem", "cache"),
-			slog.Int("navigated", len(navigatedGVRs)),
-			slog.String("effect", "index left unbuilt; the first RBAC snapshot publish builds it (#686)"))
-		return 0
-	}
-	idx.pendingNavigated = nil
-	if !wasBuilt {
-		defer rotateIfRBACEventSeenPreBuild() // runs before the Unlock (LIFO)
-	}
-
-	enrolled := 0
-	for _, crb := range snap.ClusterRoleBindings {
-		if crb == nil {
-			continue
-		}
-		rules, ok := rulesForRoleRef(snap, "", crb.RoleRef)
-		if !ok {
-			// #261 case-3 — roleRef unresolvable at THIS build (its ClusterRole
-			// is absent from the snapshot). Record the skipped binding's UID (the
-			// same string the serve path folds) so a later serve HIT on its
-			// at-risk-keyed cell is detectable. Per-build; cleared at build start.
-			idx.roleRefUnresolved[crbBindingID(crb)] = struct{}{}
-			continue
-		}
-		entry := bindingEntry{id: crbBindingID(crb), subjects: subjectsFromRBAC(crb.Subjects)}
-		idx.enrolLocked(entry, rules, roleRefKey("", crb.RoleRef))
-		enrolled++
-	}
-	for ns, rbs := range snap.RoleBindingsByNS {
-		for _, rb := range rbs {
-			if rb == nil {
-				continue
-			}
-			rules, ok := rulesForRoleRef(snap, ns, rb.RoleRef)
-			if !ok {
-				// #261 case-3 — roleRef unresolvable at THIS build (its Role is
-				// absent from the snapshot). Record the skipped binding's UID
-				// (R:<ns>/<uid> form) for the serve-time detector. Per-build.
-				idx.roleRefUnresolved[rbBindingID(rb)] = struct{}{}
-				continue
-			}
-			entry := bindingEntry{id: rbBindingID(rb), subjects: subjectsFromRBAC(rb.Subjects)}
-			idx.enrolLocked(entry, rules, roleRefKey(ns, rb.RoleRef))
-			enrolled++
-		}
-	}
-	idx.built = true
-	return enrolled
+	idx.rebucketLocked(rbacSnap.Load())
+	return len(idx.members)
 }
 
-// BindingsByGVRIndexBuilt reports whether the index has been built at
-// least once. The engine's cohort source falls back to the global
-// enumeration when this is false (pre-build / cache-off).
+// rebucketLocked empties the buckets and enrols every binding the index holds
+// under the rules snap gives the role it names. Buckets only. Caller holds
+// idx.mu (write).
+func (idx *bindingsByGVRIndex) rebucketLocked(snap *RBACSnapshot) {
+	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
+	idx.wildcard = map[bindingID]struct{}{}
+	for id, entry := range idx.members {
+		rules, _ := rulesForRoleKey(snap, entry.role)
+		idx.bucketLocked(id, rules)
+	}
+}
+
+// markBindingsIndexReady marks the index ready: the four RBAC handlers have
+// been delivered their informers' initial lists, so membership holds every
+// binding. Called once per watcher by the initial-publish goroutine, after its
+// complete publish (waitAndPublishInitialRBACSnapshot); idempotent. The first
+// call derives the buckets from that snapshot and settles the #682 note: one
+// rotation of every per-identity key if an RBAC event the keys can only see
+// through the sub-generation arrived before ready (rbac_subgen_epoch.go).
+func markBindingsIndexReady() {
+	idx := bindingsByGVRSingleton()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.ready {
+		return
+	}
+	idx.rebucketLocked(rbacSnap.Load())
+	idx.ready = true
+	rotateIfRBACEventSeenPreBuild()
+}
+
+// BindingsByGVRIndexBuilt reports whether the index is ready: the RBAC
+// handlers have been delivered their initial lists (markBindingsIndexReady).
+// The enumerators answer nothing before it.
 func BindingsByGVRIndexBuilt() bool {
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.built
-}
-
-// IsRoleRefUnresolvedAtBuild (method) reports whether the binding identified
-// by bindingUID — the SAME "C:<uid>" / "R:<ns>/<uid>" string the serve path
-// folds as ResolvedKeyInputs.BindingUID — was SKIPPED at the LAST index build
-// because its roleRef's Role/ClusterRole was absent from the snapshot then.
-// #261 case-3 serve-time detector: true means the binding's grant was NOT
-// reflected in the index keying at build, so a role create/edit since then
-// could have shifted its serve-time first-match grant with NO sub-gen bump —
-// the AT-RISK missed-rotation carrier. Empty UID is a no-op (false).
-//
-// Concurrency mirrors the other index reads: RLock over idx.mu (the build /
-// delta hooks write under idx.mu.Lock()).
-func (idx *bindingsByGVRIndex) IsRoleRefUnresolvedAtBuild(bindingUID string) bool {
-	if bindingUID == "" {
-		return false
-	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	_, ok := idx.roleRefUnresolved[bindingID(bindingUID)]
-	return ok
-}
-
-// IsRoleRefUnresolvedAtBuild is the package-level query the serve hit-site
-// (dispatchers) consults on an L1 HIT with matchedBindingUID in hand — it
-// delegates to the process-wide index singleton. Structural proxy only; the
-// counter it gates (resolved.go) measures the AT-RISK SERVE POPULATION, not a
-// confirmed-leak count (see #261 T1/T3 semantics). Cache-off / pre-build the
-// singleton's set is empty → false (no false at-risk reads).
-func IsRoleRefUnresolvedAtBuild(bindingUID string) bool {
-	return bindingsByGVRSingleton().IsRoleRefUnresolvedAtBuild(bindingUID)
+	return idx.ready
 }
 
 // AddNavigatedGVR widens the index's navigated set by one GVR and enrols
-// every already-known binding that grants get/list on it (a post-build
-// CRD discovery widens the navigated surface). Cheap: walks idx.entries
-// once, resolving each binding's rules against the snapshot. Idempotent —
-// a GVR already in navigated is a no-op.
+// every already-known binding that grants get/list on it (a CRD discovery
+// widens the navigated surface). Cheap: walks idx.members once, resolving each
+// binding's rules against the snapshot. Buckets only, never membership.
+// Idempotent — a GVR already in navigated is a no-op.
 func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 	idx := bindingsByGVRSingleton()
 	gr := grFromGVR(gvr)
@@ -573,14 +517,6 @@ func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 		return
 	}
 	idx.navigated[gr] = struct{}{}
-	// #686 (reviewer-small's #689 gate): while a build is DEFERRED (no
-	// snapshot yet), the deferred build will RESET navigated to its own set.
-	// Carry the discovered GVR into that set, or it is lost for good: no
-	// binding would ever be enrolled under it, and its narrow cohorts would
-	// be skipped forever.
-	if !idx.built && idx.pendingNavigated != nil {
-		idx.pendingNavigated = append(idx.pendingNavigated, gvr)
-	}
 
 	snap := rbacSnap.Load()
 	if snap == nil {
@@ -589,14 +525,11 @@ func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 	// Enrol every known non-wildcard binding that grants this GVR. Wildcard
 	// bindings already cover every GVR (the per-GVR cohort unions wildcard),
 	// so they need no per-GVR enrolment.
-	for id, entry := range idx.entries {
+	for id, entry := range idx.members {
 		if _, isWild := idx.wildcard[id]; isWild {
 			continue
 		}
-		// Re-resolve the binding's rules. We need the binding's roleRef;
-		// it is not stored on the entry, so we re-derive via the byRole
-		// reverse map — find the role this id is under and resolve it.
-		rules, ok := idx.rulesForEntryLocked(snap, id)
+		rules, ok := rulesForRoleKey(snap, entry.role)
 		if !ok {
 			continue
 		}
@@ -611,24 +544,19 @@ func AddNavigatedGVR(gvr schema.GroupVersionResource) {
 	}
 }
 
-// rulesForEntryLocked resolves the rules for a binding id by finding which
-// role it is enrolled under in byRole and resolving that role against the
-// snapshot. Caller holds idx.mu. Returns (nil,false) if the id is not in
-// any byRole bucket (a binding whose roleRef was unresolvable at enrol).
-func (idx *bindingsByGVRIndex) rulesForEntryLocked(snap *RBACSnapshot, id bindingID) ([]rbacv1.PolicyRule, bool) {
-	for rk, set := range idx.byRole {
-		if _, ok := set[id]; !ok {
-			continue
-		}
-		ns, ref := parseRoleRefKey(rk)
-		return rulesForRoleRef(snap, ns, ref)
+// rulesForRoleKey resolves a byRole key (roleRefKey) to the role's rules in
+// snap. (nil,false) for "" (a roleRef of an unknown kind) or an absent role.
+func rulesForRoleKey(snap *RBACSnapshot, rk string) ([]rbacv1.PolicyRule, bool) {
+	if rk == "" {
+		return nil, false
 	}
-	return nil, false
+	ns, ref := parseRoleRefKey(rk)
+	return rulesForRoleRef(snap, ns, ref)
 }
 
 // parseRoleRefKey is the inverse of roleRefKey: "C/<name>" → (ns="",
 // ClusterRole ref); "R/<ns>/<name>" → (ns, Role ref). Used by
-// rulesForEntryLocked to re-resolve a known binding's rules.
+// rulesForRoleKey to re-resolve a known binding's rules.
 func parseRoleRefKey(rk string) (string, rbacv1.RoleRef) {
 	if len(rk) > 2 && rk[:2] == "C/" {
 		return "", rbacv1.RoleRef{Kind: "ClusterRole", Name: rk[2:]}
@@ -664,53 +592,106 @@ func parseRoleRefKey(rk string) (string, rbacv1.RoleRef) {
 
 // ResetBindingsByGVRIndexForTest clears the singleton's state. Production
 // MUST NOT call this. Tests (including cross-package dispatcher tests) use
-// it to observe a clean build.
+// it to observe a clean index.
 func ResetBindingsByGVRIndexForTest() {
 	idx := bindingsByGVRSingleton()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
-	idx.wildcard = map[bindingID]struct{}{}
-	idx.byRole = map[string]map[bindingID]struct{}{}
-	idx.entries = map[bindingID]bindingEntry{}
-	idx.navigated = map[groupResource]struct{}{}
-	idx.roleRefUnresolved = map[bindingID]struct{}{}
-	idx.built = false
-	idx.pendingNavigated = nil
+	idx.resetLocked()
 }
 
-// bindingsIndexDeferredTotal counts builds deferred because no RBAC snapshot
-// was published yet (#686).
-var bindingsIndexDeferredTotal atomic.Uint64
-
-// BindingsIndexDeferredTotalForTest reads bindingsIndexDeferredTotal.
-func BindingsIndexDeferredTotalForTest() uint64 { return bindingsIndexDeferredTotal.Load() }
-
-// requestBindingsIndexBuild records a build for the first complete snapshot
-// publish to run (buildPendingBindingsIndex), unless the index is built or a
-// build is already pending (#819: the readiness flip found no complete
-// snapshot yet).
-func requestBindingsIndexBuild(navigatedGVRs []schema.GroupVersionResource) {
+// beginBindingsIndexForWatcher empties the index's membership and buckets and
+// clears ready, keeping the navigated set: a watcher is about to start the RBAC
+// informers whose events the index folds. Called by NewResourceWatcher before
+// its informers run.
+func beginBindingsIndexForWatcher() {
 	idx := bindingsByGVRSingleton()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if idx.built || idx.pendingNavigated != nil {
-		return
-	}
-	idx.pendingNavigated = append([]schema.GroupVersionResource{}, navigatedGVRs...)
-	bindingsIndexDeferredTotal.Add(1)
+	navigated := idx.navigated
+	idx.resetLocked()
+	idx.navigated = navigated
 }
 
-// buildPendingBindingsIndex runs a build deferred by BuildBindingsByGVRIndex
-// on a nil snapshot (#686). Called right after a snapshot is published.
-func buildPendingBindingsIndex() {
+func (idx *bindingsByGVRIndex) resetLocked() {
+	idx.byGVR = map[groupResource]map[bindingID]struct{}{}
+	idx.wildcard = map[bindingID]struct{}{}
+	idx.membersByRole = map[string]map[bindingID]struct{}{}
+	idx.members = map[bindingID]bindingEntry{}
+	idx.navigated = map[groupResource]struct{}{}
+	idx.ready = false
+}
+
+// SeedBindingsIndexFromSnapshotForTest is the TEST-ONLY way to stand an index
+// up without an informer's event stream: it empties the index, records every
+// binding of the PUBLISHED snapshot as its ADD event would (recordBindingLocked,
+// the function the hooks use), sets the navigated set and marks the index
+// ready (settling the #682 note, as the first ready does). Returns the number
+// of bindings recorded.
+//
+// Production CANNOT call this: it panics outside a test binary
+// (testing.Testing), and the source guard
+// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot fails on any
+// production file that names it. It lives in a non-test file only because the
+// tests of three other packages (handlers, handlers/dispatchers, rbac/evaltest)
+// use it and Go has no cross-package test-only export; a build-tagged file
+// would break those packages' untagged test builds. A
+// test that drives a live watcher and seeds from the snapshot must first let
+// the snapshot catch up with the events, or it reproduces #1458 on itself.
+func SeedBindingsIndexFromSnapshotForTest(navigatedGVRs []schema.GroupVersionResource) int {
+	if !testing.Testing() {
+		panic("cache.SeedBindingsIndexFromSnapshotForTest called outside a test binary: the bindings index's " +
+			"membership is written by the RBAC event hooks alone (#1458)")
+	}
+	idx := bindingsByGVRSingleton()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	wasReady := idx.ready
+	idx.resetLocked()
+	for _, gvr := range navigatedGVRs {
+		idx.navigated[grFromGVR(gvr)] = struct{}{}
+	}
+	snap := rbacSnap.Load()
+	recorded := 0
+	if snap != nil {
+		for _, crb := range snap.ClusterRoleBindings {
+			if crb == nil {
+				continue
+			}
+			idx.recordBindingLocked(snap, "", crb.RoleRef, crbBindingID(crb), subjectsFromRBAC(crb.Subjects))
+			recorded++
+		}
+		for ns, rbs := range snap.RoleBindingsByNS {
+			for _, rb := range rbs {
+				if rb == nil {
+					continue
+				}
+				idx.recordBindingLocked(snap, ns, rb.RoleRef, rbBindingID(rb), subjectsFromRBAC(rb.Subjects))
+				recorded++
+			}
+		}
+	}
+	idx.ready = true
+	if !wasReady {
+		rotateIfRBACEventSeenPreBuild()
+	}
+	return recorded
+}
+
+// BindingsIndexNamesSubjectForTest reports whether a binding the index holds
+// names the subject: the index's MEMBERSHIP, read whether the index is ready
+// or not (the enumerators answer nothing before ready). TEST-ONLY.
+func BindingsIndexNamesSubjectForTest(kind, namespace, name string) bool {
+	want := subjectKey{Kind: kind, Name: name, Namespace: namespace}
 	idx := bindingsByGVRSingleton()
 	idx.mu.RLock()
-	pending := idx.pendingNavigated
-	built := idx.built
-	idx.mu.RUnlock()
-	if pending == nil || built {
-		return
+	defer idx.mu.RUnlock()
+	for _, e := range idx.members {
+		for _, s := range e.subjects {
+			if s == want {
+				return true
+			}
+		}
 	}
-	BuildBindingsByGVRIndex(pending)
+	return false
 }

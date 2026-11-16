@@ -73,7 +73,7 @@ func cr1328(name, group, resource, verb string) map[string]any {
 func TestRefreshes1328_G1_AGrantThatChangesTheGatedViewIsOneFrame_G2G3_NothingElse(t *testing.T) {
 	const name = "g1328"
 	dyn := setup819(t, name)
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	var keys []string
 	store := evictionWiring(t, &keys)
 	k := expectedKey(t, name) // widgetContent: identity-free, gated per requester
@@ -137,7 +137,7 @@ func TestRefreshes1328_G1_AGrantThatChangesTheGatedViewIsOneFrame_G2G3_NothingEl
 func TestRefreshes1328_G4_AWrittenFrameUpdatesWhatTheTabHolds(t *testing.T) {
 	const name = "g1328-fill"
 	dyn := setup819(t, name)
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	var keys []string
 	store := evictionWiring(t, &keys)
 	k := expectedKey(t, name)

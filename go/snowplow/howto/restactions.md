@@ -277,12 +277,15 @@ Each stage ends in exactly one outcome:
 - **not executed**: a write stage snowplow did not send on purpose, because
   of what the request is: a dry run (`StageNotExecuted`), an export or
   background work (`WriteRefused`). It does not block its dependent writes:
-  they are not sent for the same reason and report the same reason, never
+  they are not sent for the same reason and report the same reason, not
   `Skipped`, unless the dependent's `iterator` runs over the refused stage's
   output, which then yields zero items: it has nothing to send and succeeds
   (not listed). So `Skipped` always follows a real failure. A write stage
   with an item that failed on its own (`InvalidPath`, `TemplateError`) as
-  well as refused items reads that failure, not `WriteRefused`.
+  well as refused items reads that failure, not `WriteRefused` or
+  `StageNotExecuted` (#1347). It failed, so its dependent writes read
+  `Skipped`, in a dry run, an export or background work exactly as in the
+  real run.
 
 Example: a delete lifecycle where `delete.dependsOn` is `detachVolumes`
 (an iterator over the server's data volumes), and `delete` has no
@@ -312,7 +315,9 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
  {"name":"delete","ok":false,"reason":"Skipped","dependsOn":"detachVolumes"}]
 ```
 
-- `reason` is a code: `Forbidden`, `NotFound`, `Unauthorized`, `Error`,
+- `reason` is a code: `Forbidden`, `NotFound`, `NotFoundForRequester` (#1319:
+  a watched named object that does not exist for this requester, #1080),
+  `Unauthorized`, `Error`,
   `Skipped`, `NotRun` (the resolve stopped before this stage),
   `StageNotExecuted` (a dry run), `WriteRefused` (a write stage an export or
   background work does not send, #903/#970; before #1288 it read `Error`),
@@ -321,6 +326,19 @@ that is neither, a missing header — as **not** succeeded, never as `[]`.
   that is not sent fails" below), and `DestinationRefused` for an endpoint
   address snowplow refuses to dial (see "Which addresses an endpoint can
   dial" below). `dependsOn` is set on a `Skipped` row.
+- One row has one `reason`, even when the stage's items failed with
+  different codes (an `iterator`). The codes are in three groups: **cut /
+  failed** (every code not listed below), **denied** (`Forbidden`,
+  `NotFoundForRequester`) and **by design** (`StageNotExecuted`,
+  `WriteRefused`). The row reads a code of the highest group any item
+  recorded: cut / failed, then denied, then by design (#1347). Inside one
+  group the most specific code wins, by a fixed order. So a stage with a
+  `403` item and an item cut by the page budget reads `Timeout`, not
+  `Forbidden`. A stage with a refused item and an item that failed on its own
+  (`InvalidPath`, `TemplateError`) reads that failure, not `WriteRefused` or
+  `StageNotExecuted`, and it blocks its dependent writes. A widget `/call`
+  header uses the same rule
+  ([docs/howto-frontend-widget-stage-outcomes.md](../docs/howto-frontend-widget-stage-outcomes.md)).
 - A resolve that runs no stage at all (its `dependsOn` graph names a stage
   that does not exist or has a cycle) answers a resolve-level row
   `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as

@@ -42,7 +42,7 @@ func TestS1251_RequestFactsReachTheAuditRecordAndNoLogLine(t *testing.T) {
 			slog.SetDefault(log)
 			t.Cleanup(func() { slog.SetDefault(prev) })
 			mux := http.NewServeMux()
-			mountCallWriteRoutes(mux, newRequestChain(log), testUserConfig443(ep))
+			mountCallWriteRoutes(newRouteTable(mux), newRequestChain(log), testUserConfig443(ep))
 			srv := newServerHandler(mux)
 
 			target := "/call/dry-run" + cmQ443 + "&owner=" + url.QueryEscape(sentinel1251)

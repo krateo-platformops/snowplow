@@ -20,6 +20,8 @@ package slowcall
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -47,9 +49,52 @@ type cpuSample struct {
 	procOK  bool
 }
 
-// cgroupStatPaths are cpu.stat's places: cgroup v2 (one unified file), then
-// v1's cpu controller.
-var cgroupStatPaths = []string{"/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu,cpuacct/cpu.stat", "/sys/fs/cgroup/cpu/cpu.stat"}
+// cgroupDir is the cgroup filesystem's mount point.
+const cgroupDir = "/sys/fs/cgroup"
+
+// cgroupStatPaths are cpu.stat's places under cgroupDir: cgroup v2 (one
+// unified file), then v1's cpu controller.
+var cgroupStatPaths = []string{"cpu.stat", "cpu,cpuacct/cpu.stat", "cpu/cpu.stat"}
+
+// cgroupRoot is cgroupDir opened as an os.Root, so a cgroupStatPaths entry is
+// read beneath it and cannot reach any other file, whatever the entry holds.
+var cgroupRoot = &rootCache{dir: cgroupDir, open: os.OpenRoot}
+
+// rootCache opens dir as an os.Root once it can and keeps it for the process:
+// one descriptor, shared by the sampler's goroutine and the requests' emit
+// reads (os.Root's methods are safe for concurrent use). Two failures are
+// permanent and settled too, as nil: a directory that does not exist
+// (fs.ErrNotExist: no cgroup filesystem, as on macOS or under Node's real
+// filesystem) and a platform with no file access at all (errors.ErrUnsupported:
+// in a browser page wasm_exec.js answers every filesystem call with ENOSYS,
+// which syscall reports as ErrUnsupported). A sample then carries no cgroup
+// fields, as it does when no cpu.stat is found. Any other failure (a transient
+// one such as EMFILE) is not kept: that sample carries no cgroup fields and the
+// next one opens again.
+type rootCache struct {
+	dir  string
+	open func(string) (*os.Root, error)
+
+	mu      sync.Mutex
+	settled bool
+	root    *os.Root
+}
+
+func (c *rootCache) get() *os.Root {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.settled {
+		return c.root
+	}
+	r, err := c.open(c.dir)
+	switch {
+	case err == nil:
+		c.root, c.settled = r, true
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, errors.ErrUnsupported):
+		c.settled = true
+	}
+	return c.root
+}
 
 type cpuSampler struct {
 	read func() cpuSample
@@ -139,19 +184,24 @@ func (c *cpuSampler) windowAttrs(start time.Time) []slog.Attr {
 	return out
 }
 
-func readCPU() cpuSample {
+func readCPU() cpuSample { return readCPUFrom(cgroupRoot.get()) }
+
+// readCPUFrom is one sample, its cpu.stat read beneath cg (none when cg is nil).
+func readCPUFrom(cg *os.Root) cpuSample {
 	t0 := time.Now() // the sample's own instant
 	s := cpuSample{at: t0}
 	s.procNS, s.procOK = processCPU()
+	if cg == nil {
+		return s
+	}
 	for _, p := range cgroupStatPaths {
-		if b, err := os.ReadFile(p); err == nil {
+		if b, err := cg.ReadFile(p); err == nil {
 			s.usageNS, s.periods, s.thrPer, s.thrNS, s.cgOK = parseCPUStat(b)
 			if s.cgOK {
 				break
 			}
 		}
 	}
-
 	return s
 }
 

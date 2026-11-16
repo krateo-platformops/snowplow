@@ -76,8 +76,8 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.Handle("GET /call", stub)
 	mux.Handle("GET /swagger/", stub) // main registers this subtree pattern too
-	mountCallWriteRoutes(mux, use.NewChain(), func(http.Handler) http.Handler { return stub })
-	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
+	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(), func(http.Handler) http.Handler { return stub })
+	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	return mux
 }
@@ -482,7 +482,7 @@ func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
 // authenticated or not.
 func TestS1015_DisabledRouteIs404(t *testing.T) {
 	mux := http.NewServeMux()
-	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, nil)
+	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, nil)
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	for _, tok := range []string{"", mintRUMToken(t, "off-user")} {
 		if rec := postRUM(t, mux, tok, otlpBody(t, rum.ServiceName, nil, widgetFetch())); rec.Code != http.StatusNotFound {

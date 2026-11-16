@@ -53,6 +53,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -421,14 +422,14 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 		if _, ok := cache.ParseAPIServerDiscoveryPath(path); ok {
 			if co := cache.ReadSetSkeleton(stage.Path); co.ResourceTemplated {
 				return nil, fmt.Errorf("path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
-					"the read coordinate is undetermined (#504)", path)
+					"the read coordinate is undetermined (#504)", redact.Path(path))
 			}
 			continue
 		}
 
 		// Anything else: residual ${...}, upstream-dependent, or non-kube →
 		// the whole stage is UNRESOLVABLE.
-		return nil, fmt.Errorf("path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", path)
+		return nil, fmt.Errorf("path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", redact.Path(path))
 	}
 
 	return rows, nil

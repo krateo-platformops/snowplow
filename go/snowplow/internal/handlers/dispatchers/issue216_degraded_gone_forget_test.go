@@ -76,7 +76,7 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 	// type-exists conjunct, so a 404 is a deletion not a CRD-absent transient) +
 	// RESOLVED_CACHE_ENABLED + published global.
 	buildFixCWatcher(t)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{fixCWidgetGVR})
 	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()
@@ -102,12 +102,12 @@ func TestIssue216_DegradedConfirmed404_ForgetsHarvestAndStopsSeedReplay(t *testi
 		Namespace:              i187NS,
 		Name:                   i187Name,
 		BindingUID:             "uid-216",
-		RepresentativeUsername: "admin",
-		RepresentativeGroups:   []string{"admins"},
+		RepresentativeUsername: "userGranted", // #1483: buildFixCWatcher grants it get on its own object
+		RepresentativeGroups:   nil,
 		// #424: a real identity-bound cell always carries the binding-set digest
 		// it was minted with (dispatchCacheLookupKey); the refresher's drift
 		// guard compares the representative's current set against it.
-		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
+		SubjectBindingSet: rbac.SubjectBindingSetDigest("userGranted", nil),
 	}
 	delKey := cache.ComputeKey(del)
 	store.PutResolved(fixtureStoreVerdict, delKey, &cache.ResolvedEntry{
@@ -208,7 +208,7 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 	srv := newI187APIServer(t, http.StatusInternalServerError) // 500 — NOT a confirmed deletion
 
 	buildFixCWatcher(t)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{fixCWidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{fixCWidgetGVR})
 	knowEveryRepresentative(t, fixCWidgetGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	cache.ResetGoneForgetHooksForTest()
@@ -232,12 +232,12 @@ func TestIssue216_DropPointNon404_DoesNotForgetHarvest(t *testing.T) {
 		Namespace:              i187NS,
 		Name:                   i187Name,
 		BindingUID:             "uid-216-neg",
-		RepresentativeUsername: "admin",
-		RepresentativeGroups:   []string{"admins"},
+		RepresentativeUsername: "userGranted", // #1483: buildFixCWatcher grants it get on its own object
+		RepresentativeGroups:   nil,
 		// #424: a real identity-bound cell always carries the binding-set digest
 		// it was minted with (dispatchCacheLookupKey); the refresher's drift
 		// guard compares the representative's current set against it.
-		SubjectBindingSet: rbac.SubjectBindingSetDigest("admin", []string{"admins"}),
+		SubjectBindingSet: rbac.SubjectBindingSetDigest("userGranted", nil),
 	}
 	key := cache.ComputeKey(in)
 	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"outage-not-deletion"}`), Inputs: &in})

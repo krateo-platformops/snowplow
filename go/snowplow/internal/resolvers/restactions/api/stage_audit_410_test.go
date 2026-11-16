@@ -152,7 +152,7 @@ func env410(t *testing.T, apiURL, extURL string) {
 	cache.ResetSecretsSnapshotForTest()
 	own := kubeutil.MakeDNS1123Compatible(user410) + "-clientconfig"
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
-		own: {ObjectMeta: metav1.ObjectMeta{Namespace: raNS410, Name: own},
+		own: {ObjectMeta: authnMeta(raNS410, own, user410),
 			Data: map[string][]byte{"server-url": []byte(apiURL), "token": []byte("tok")}},
 		extRef410: {ObjectMeta: metav1.ObjectMeta{Namespace: raNS410, Name: extRef410},
 			Data: map[string][]byte{"server-url": []byte(extURL), "token": []byte("ext-tok")}},

@@ -308,7 +308,7 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	// #261 MARK-AT-MINT (pm load-bearing #4): the serve-time at-risk class is
 	// computed HERE, as a byproduct of the key-derivation EvaluateRBAC call, and
 	// carried on inputs.AtRiskClass so the L1 hit-site merely READS it — never
-	// re-evaluating RBAC or the bindings_by_gvr index at hit. winClass captures
+	// re-evaluating RBAC at hit. winClass captures
 	// the case-2 RBAC fact (implicit-group winning subject) via the OPTIONAL
 	// out-param; EvaluateRBAC's public (bool,string,error) signature is
 	// unchanged. On deny/err the out-param is left at its default (regular).
@@ -319,17 +319,10 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, keyCheck)
 	// Assemble the mint-time at-risk MARK. Only meaningful for a real permit (a
 	// non-empty first-match BindingUID); a "" BindingUID serves as a MISS
-	// (serveFromCacheEligible) so it can never reach the hit-site bump. Case-2
-	// (implicit-group, the RBAC fact) takes precedence over case-3
-	// (roleref-unresolved, the index fact) in the rare overlap — see AtRiskClass.
+	// (serveFromCacheEligible) so it can never reach the hit-site bump.
 	atRiskClass := cache.AtRiskNone
-	if bindingUID != "" {
-		switch {
-		case winClass == rbac.SubjectClassImplicitGroup:
-			atRiskClass = cache.AtRiskImplicitGroup
-		case cache.IsRoleRefUnresolvedAtBuild(bindingUID):
-			atRiskClass = cache.AtRiskRolerefUnresolved
-		}
+	if bindingUID != "" && winClass == rbac.SubjectClassImplicitGroup {
+		atRiskClass = cache.AtRiskImplicitGroup
 	}
 	inputs := cache.ResolvedKeyInputs{
 		CacheEntryClass: handlerKind,

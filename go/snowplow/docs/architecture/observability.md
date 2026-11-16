@@ -24,21 +24,81 @@ Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`, `GET
 dependency-tracker section) and `GET /debug/store` (#237 — the per-object informer-store read),
 and two probe endpoints used by the chart.
 
-> **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
-> pprof, vars, servable, apistage, refreshes — is registered by
-> `registerDebugRoutes` (`debug_routes.go`) behind `middleware.RefreshAuth`,
-> the stateless header-or-cookie RS256 gate `/refreshes` uses. Before 1.12.3
-> only `/debug/refreshes` was gated (#69) and the rest were world-readable on
-> the chart's LoadBalancer Service. Pass the token explicitly:
+> **Every `/debug/*` route needs a JWT (since 1.12.3) AND an RBAC grant (since
+> #1362).** The whole surface (pprof, vars, servable, apistage, refreshes,
+> reconcile, harvest, store, shadow-parity, deps) is registered by
+> `registerDebugRoutes` (`debug_routes.go`) behind one chain:
+> `middleware.RefreshAuth`, the stateless header-or-cookie RS256 gate
+> `/refreshes` uses, then `middleware.DebugAuthz`.
+>
+> **A valid JWT alone is not enough.** Several routes report metadata about
+> *every* identity's cache entries and about objects the caller's own RBAC may
+> forbid. `/debug/apistage`, for example, lists each resident entry's
+> coordinates and item count, whoever created it. So `DebugAuthz` authorizes
+> each request through Kubernetes RBAC as a **non-resource request**, exactly as
+> the apiserver would authorize the same request against itself. The verb is
+> the lowercase HTTP method (`get`, or `post` for `POST /debug/shadow-parity`),
+> and the path is the request path, decided for the JWT's username and groups.
+> The decision is the same authorizer every other snowplow RBAC check uses
+> (`rbac.EvaluateRBAC`, the same group-set rules and authz memo). With the cache
+> on it runs in-process against the informer-cached RBAC, so a diagnostic pull
+> still makes zero apiserver calls. With the cache off it is a
+> SelfSubjectAccessReview.
+>
+> The grant is an ordinary ClusterRole rule. The chart ships it as
+> `<fullname>-debug-<namespace>` (`helm/snowplow/templates/clusterrole-debug.yaml`)
+> and **binds it to no one**, because the chart has no notion of an admin
+> group. Bind it to your operator group:
+>
+> ```yaml
+> rules:
+> - nonResourceURLs: ["/debug/*"]
+>   verbs: ["get", "post"]
+> ```
+>
+> ```bash
+> kubectl create clusterrolebinding snowplow-debug-operators \
+>   --clusterrole=snowplow-debug-krateo-system --group=<your-operator-group>
+> ```
+>
+> An identity bound to `cluster-admin` already holds it, because cluster-admin
+> carries `nonResourceURLs: ["*"]`. A RoleBinding cannot grant it: a
+> non-resource request has no namespace. Pass the token explicitly:
 >
 > ```bash
 > curl -H "Authorization: Bearer $TOKEN" http://pod:8081/debug/vars
 > ```
 >
-> No token, an expired token, or a token supplied only in the query string →
-> `401`. A JWKS the pod cannot fetch → `503`. `/health` and `/readyz` stay
-> anonymous — the kubelet presents no credentials. Operator recipes are in
-> [operating.md](../../howto/operating.md).
+> | outcome | status |
+> |---|---|
+> | no token, an expired token, or a token only in the query string | `401` |
+> | a JWKS the pod cannot fetch | `503` |
+> | a valid token whose identity lacks the grant | `403`, a `Status` body: `forbidden: User "<u>" cannot get path "/debug/vars"` |
+> | the authorization cannot be decided | `503`, with the reason in the message `debug authorization unavailable (<reason>)`: `rbac_snapshot_not_built` (the boot window before the RBAC snapshot is published, pprof included: #1368), `rbac_watcher_not_wired`, `review_unavailable` (cache off, see below), `evaluator_error`, `no_identity` |
+>
+> **Known limitation (cache off).** With `CACHE_ENABLED=false` the authorizer is
+> the requester's own SelfSubjectAccessReview, which needs the requester's
+> `<user>-clientconfig` endpoint. `RefreshAuth` deliberately never reads that
+> Secret, so with the cache off **every** `/debug` route answers `503
+> review_unavailable`. It fails closed and never serves unauthorized.
+>
+> `/health` and `/readyz` stay anonymous, because the kubelet presents no
+> credentials. Operator recipes are in [operating.md](../../howto/operating.md).
+>
+> **Which routes expose what** (#1362):
+>
+> | route | output depends on other identities' state? |
+> |---|---|
+> | `GET /debug/pprof/` (`heap`, `goroutine`, `allocs`, …), `/cmdline`, `/profile`, `/symbol`, `/trace` | process-wide: memory, stacks and argv of the process serving every identity. No per-identity records. `/profile` and `/trace` also pin a CPU for their window. |
+> | `GET /debug/vars` | aggregate across all identities. It includes per-cell maps keyed by `path\|gvr\|reason` and learned-identity class counts, a map of the tenant's GVRs. |
+> | `GET /debug/servable` | no: per-GVR informer status (cluster shape), regardless of the caller's RBAC. |
+> | `GET /debug/apistage` | **yes**: every resident L1 entry, whoever created it: coordinates, item count, binding UID, key-attribution fields; `?key_hash` adds a body sha256. Never a body. |
+> | `GET /debug/refreshes` | aggregate: totals and the live subscriber count across all identities, with no per-key breakdown. |
+> | `GET /debug/reconcile` | **yes**: walks every identity's L1 entries, returns the divergent ones' metadata, and evicts them. |
+> | `GET /debug/harvest` | process-wide, not per-identity: counts of what the Phase-1 harvesters hold, and whether a given widget coordinate is held, whatever the caller's RBAC (an existence oracle). |
+> | `GET /debug/store` | **yes**: an object's existence, resourceVersion and uid from the snowplow SA's informer store, whatever the caller's RBAC. |
+> | `GET`/`POST /debug/shadow-parity` | no: one process-local boolean. POST flips it. |
+> | `GET /debug/deps` | **yes**: dependency edges and freshness of every identity's cells, by key hash. |
 
 The probe endpoints:
 
@@ -210,8 +270,7 @@ Defined in `internal/cache/fallthrough_meter_expvar.go`.
 | `widget_content_store_total`, `widget_content_evict_total` | per-class store / evict for `widgetContent` cells | evicts ≪ stores |
 | `ra_full_list_store_total`, `ra_full_list_evict_total` | per-class store / evict for `RAFullList` cells | evicts ≪ stores |
 | `put_refused_generation_moved_total` | **#189.** request-path `PutIfGen` writes REFUSED because the key's generation moved between the dispatcher's pre-resolve capture and the tail write — i.e. a DELETE-eviction (or any removal) landed during the in-flight resolve, so the pre-delete body was NOT resurrected. Reads non-zero exactly when the write-side resurrection race is being closed | **0** in steady state; a low rate around object churn is healthy (the guard doing its job). A sustained climb = many resolves are racing evictions — read next to `snowplow_deps.evict_delete_total` |
-| `serve_missed_rotation_atrisk_roleref_unresolved` | **#261 case-3 serve-time detector.** restactions serve HITs (hit-gated) of a cell whose serve-time first-permitting `BindingUID` was roleRef-UNRESOLVED at the last `bindings_by_gvr` index build — so its grant is not reflected in the L1 keying and a later role create/edit could have shifted the grant with no sub-gen bump (the bounded self-stale-leak carrier). Measures the **AT-RISK SERVE POPULATION** (structural proxy), NOT a confirmed-leak count | **0** in steady state (matches the 057 0/2517 baseline). Off-zero => an at-risk-keyed cell was served → REASSESS (the keying fix is v7-deferred); NEVER read as "N leaks" |
-| `serve_missed_rotation_atrisk_implicit_group` | **#261 case-2 serve-time detector.** restactions serve HITs (hit-gated) of a cell whose serve-time first-permitting binding's WINNING subject matched only through an IMPLICIT group (`system:authenticated`, or a synthetic `system:serviceaccounts[:ns]` group) — `RBACSubGenForSubject` sums only the requester's PRESENTED groups, so a grant/revoke through such a binding shifts the serve-time first-match `BindingUID` with no sub-gen bump (the bounded self-stale-leak carrier). The class is computed at KEY-MINT (the evaluator's winning-subject fact, surfaced via `WinningSubjectClassOut`) and merely READ at the hit. Measures the **AT-RISK SERVE POPULATION** (structural proxy), NOT a confirmed-leak count | **0** in steady state (none of the 4 implicit-group CRBs on 057 grants `get`). Off-zero => an at-risk-keyed cell was served → REASSESS (the keying fix is v7-deferred); NEVER read as "N leaks" |
+| `serve_missed_rotation_atrisk_implicit_group` | **#261 case-2 serve-time detector.** restactions serve HITs (hit-gated) of a cell whose serve-time first-permitting binding's WINNING subject matched only through an IMPLICIT group (`system:authenticated`, or a synthetic `system:serviceaccounts[:ns]` group). When the detector was written the key fold read only the requester's PRESENTED groups, so a change through such a binding rotated no key; since #424 (`system:authenticated`) and #1443 (the ServiceAccount groups) the fold reads every subject the evaluator matches with, so such a change now rotates the key and the counter no longer marks a rotation gap: it says how the request was permitted. The class is computed at KEY-MINT (the evaluator's winning-subject fact, surfaced via `WinningSubjectClassOut`) and merely READ at the hit. Measures the **AT-RISK SERVE POPULATION** (structural proxy), NOT a confirmed-leak count | **0** in steady state (none of the 4 implicit-group CRBs on 057 grants `get`). Off-zero => a cell permitted through an implicit group was served; not a leak count, and since #1443 not a rotation-gap signal either |
 
 
 ### RA resolve guard — malformed single-object dials skipped (#288 / #293 / #302)
@@ -275,7 +334,7 @@ A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure i
 | `snowplow.stages.not_executed` | int | (#1288) the number of entries the header lists that snowplow **deliberately did not execute**, by what the request is: a dry run's refused write (`StageNotExecuted`, #443) and an export's or background work's refused write (`WriteRefused`, #903/#970). Set whenever `failed` is, `0` included; not set for the truncated summary, which cannot tell |
 | `snowplow.stages.failure_reasons` | string[] | the distinct reason codes of the **failed** entries, sorted (byte order), from the header's closed set of failure codes: `Aborted`, `DestinationRefused`, `Error`, `Forbidden`, `InvalidPath`, `NotFound`, `NotRun`, `NotSent`, `Skipped`, `TemplateError`, `Timeout`, `Unauthorized`, `UserAccessFilterOnNonReadVerb` (#1281, a misconfigured stage). `StageNotExecuted` and `WriteRefused` never appear (they are not failures). Any other value is folded to **`other`** (and counted as failed), never passed on raw. Not set when `failed` is 0, nor for the truncated summary, which no longer names its reasons |
 
-**Failed versus not executed (#1288).** The header lists every stage that did not succeed (its #904 meaning, which callers rely on), and it is unchanged. The span splits that list by the class of each row's reason, decided by one classifier (`stageNotExecutedByDesign`, `internal/resolvers/restactions/api/stage_outcomes.go`): a property of the reason code, never of the route, the RESTAction or the widget. Two codes are deliberate non-executions, `StageNotExecuted` and `WriteRefused`; every other code is a failure. `Skipped` is counted as failed on purpose: a write is skipped only when the stage it depends on failed (the #904 rule never blocks on a deliberate non-execution: the dependent write is then refused for the same reason and reports that reason, or, when it iterates the refused stage's output, yields zero items and succeeds), so a skip is a consequence of a real failure that the same trace already carries. `WriteRefused` ranks below every failure code, so a write stage with one item the plan refused (`InvalidPath`, `TemplateError`) and other items an export refused reads that failure and counts in `failed`. Before #1288 every dry-run preview with a write stage and every export of a RESTAction with a write stage read `failed > 0`, and the export refusal read the generic `Error`.
+**Failed versus not executed (#1288).** The header lists every stage that did not succeed (its #904 meaning, which callers rely on), and it is unchanged. The span splits that list by the class of each row's reason, decided by one classifier (`stageNotExecutedByDesign`, `internal/resolvers/restactions/api/stage_outcomes.go`): a property of the reason code, never of the route, the RESTAction or the widget. Two codes are deliberate non-executions, `StageNotExecuted` and `WriteRefused`; every other code is a failure. `Skipped` is counted as failed on purpose: a write is skipped only when the stage it depends on failed (the #904 rule never blocks on a deliberate non-execution: the dependent write is then refused for the same reason and reports that reason, or, when it iterates the refused stage's output, yields zero items and succeeds), so a skip is a consequence of a real failure that the same trace already carries. Both deliberate codes rank below every failure code (#1347: a stage's reason is chosen by group first, cut / failed > denied > by design), so a write stage with one item the plan refused (`InvalidPath`, `TemplateError`) and other items an export or a dry run refused reads that failure and counts in `failed`; its dependent writes read `Skipped`. Before #1288 every dry-run preview with a write stage and every export of a RESTAction with a write stage read `failed > 0`, and the export refusal read the generic `Error`.
 
 **Which responses.** Exactly those whose header carries the outcomes: a RESTAction `/call` (GET, `POST /call/read`, an inline draft), cold or an L1 hit, and an `/export` (the outcomes its pages merged into its own header). The values are read from the response's final header when the handler returns, so they always match what the client was sent; a withdrawn stale pass (#710) reports its re-run's. A response without the header gets neither attribute: a widgets `/call`, every other route, a request refused before its resolve. An export's per-page re-dispatch and a #547 demand revalidation write into their own recorders, never through the wrapper, so they cannot overwrite the span.
 
@@ -302,7 +361,7 @@ Defined in `internal/cache/bindings_by_gvr_metrics.go`.
 | `snowplow_ra_full_list_serve` | `map{hit, repopulate, verified_slice, fallback}` serve-outcome counters for the RAFullList cell | admin's first compositions `/call` should drive `hit`+1 over a warm prewarm-pinned cell; rising `fallback` = the cheap path is not engaging |
 | `snowplow_ra_full_list_memo` | per-(RA × sliceShape) sliceability verdict snapshot | diagnostic for the RAFullList failure modes |
 | `snowplow_sliceability_reverify` | async sliceability-reverify worker counters | evidence the stuck-false reverify path is firing (informer event → re-verify) |
-| `snowplow_bindings_by_gvr_delta_skipped_non_typed` | `uint64` — delta-event objects neither typed nor convertible, and DROPPED | **0**. Non-zero = the bindings-by-GVR index is drifting until the next boot rebuild (a silent-data-staleness canary) |
+| `snowplow_bindings_by_gvr_delta_skipped_non_typed` | `uint64` — delta-event objects neither typed nor convertible, and DROPPED | **0**. Non-zero = an RBAC object the typed conversion refuses: the bindings-by-GVR index drops its events and the RBAC snapshot leaves it out, until an event delivers it convertible (nothing rebuilds the index, #1458) |
 | `snowplow_informer_unrenderable_store_items_total` / `_cells` (**#624**; OTLP twin `snowplow_informer_unrenderable_store_items_total{site,gvr}`, hand-wired) | `uint64` total, plus a `"site\|gvr"` map, with `site` = `list_decoded` / `list_raw` / `get`. Counts informer serve reads that were failed **CLOSED** (served=false, so the read fell through to the apiserver) because a store slot could not be rendered by the shared converter (`store_item.go`) | **0**. Non-zero = a store holds a shape that the serve paths cannot render, for example a new typed transform or a metadata-only slot. The reads stay correct, because they go to the apiserver, but the cache is bypassed for that GVR. Before #624 these slots were silently DROPPED, which is how every RBAC LIST served `items: []`. Zero is health only alongside a non-zero served-LIST count for the same GVR |
 | `snowplow_prewarm_resident_units_dropped_total` (**#647**; OTLP twin `snowplow_prewarm_resident_units_dropped_total{reason}`, hand-wired) | map `reason` → `uint64`, closed set `get_failed` / `decode_failed` / `no_static_target`, all emitted. Counts RESTAction units that the resident enumeration (RBAC-shift reseed, learned-class seed, #258 rotated filter) DROPPED because it could not derive the RESTAction's target GVR. A dropped unit is reseeded for nobody, so its cells for the rotated or newly learned identities stay cold until a customer read refills them | `get_failed` and `decode_failed` are **0**. `get_failed` is the #647 signature: one per RESTAction per run while the lookup ran with no identity (98/run on 057). `no_static_target` is non-zero and stable per cluster (a RESTAction with no static userAccessFilter target; the boot seed seeds it for nobody either) |
 
@@ -430,6 +489,7 @@ Defined in `internal/handlers/dispatchers/prewarm_engine_metrics.go`.
 | `snowplow_prewarm_engine_requeued_total` | `uint64` — engine-owned boot-scope requeues (the F.4 deadline-cut resume) | small; unbounded climb = the resume bound regressed |
 | `snowplow_prewarm_engine_yield_total` | `uint64` — worker parked because a customer `/call` was in flight (customer-priority yield) | >0 under customer load = the yield hook is working |
 | `snowplow_prewarm_engine_pending_depth` | live queue depth | **0** once the worker drains; sustained non-zero across many scrapes = worker dead |
+| `snowplow_prewarm_resolve_skipped_total` (**#1477**, `internal/handlers/dispatchers/background_resolve_skip.go`; OTLP twin `snowplow_prewarm_resolve_skipped_total{site,reason}`, hand-wired) | map `site` → `reason` → `uint64`: background resolves skipped BEFORE they ran. `site` is the closed set `restaction_seed` / `widget_seed` / `walk` / `content_prewarm`; `reason` the closed set `needs_request_extras`: a templated api-step `endpointRef.name` reads a dict key the background resolve does not carry (no request extras; a widget's apiRef RESTAction carries the widget's `spec.apiRef.extras` and declared identity) and the resolver does not write itself (a stage name, an errorKey, `slice`), or reads its input in a way the analysis cannot follow. Rendered with the key missing, the name selects a Secret no customer's request would, the stage misses its endpoint, and no customer key can match the cell (customer keys fold the extras the request carries). The one predicate is `restactionsapi.NeedsRequestExtras` (the generalisation of #113, whose RESTAction-seed skip is the `restaction_seed` cell). Every cell is published, so `0` is a reading. A skipped walk widget is not descended: its subtree is reached by the navigation that carries the extras | on a cluster whose RESTActions select their endpoint from a request extra (hub-spoke): grows by about the same amount every pass (one count per such unit per pass), while the background `unable to resolve api endpoint reference` ERROR lines for those units stay at 0; `0` on a cluster without such RESTActions |
 
 ### Phase-1 seed — per-target seed outcomes
 Defined in `internal/handlers/dispatchers/phase1_pip_metrics.go` (+ siblings).
@@ -479,6 +539,7 @@ guard. So it stays expvar-only; see its row below.
 | `snowplow_refresher_viewed_enqueue_total`, `snowplow_refresher_viewed_promoted_total`, `snowplow_refresher_viewed_dequeued_total`, `snowplow_refresher_viewed_queue_depth` (gauge) | **#765 viewed tier.** A dirty-marked key with an armed `/refreshes` subscription (a cell open on a page) is queued on a third tier drained before the cluster_list and normal tiers. `viewed_enqueue` counts keys routed there at the mark or promoted; `viewed_promoted` the keys a tab armed while they already waited dirty in another tier; `viewed_dequeued` the viewed-tier dequeues; `viewed_queue_depth` the live tier depth. The rate floor and the customer yield apply to it unchanged | depth bounded by the cells on open pages, near 0 at rest; `viewed_enqueue` > 0 whenever a viewed cell's data changes |
 | `snowplow_refresher_deferred_in_flight_total` | **#799 B2.** dequeues NOT run because a worker on another tier was re-resolving the same key at that moment (one re-resolve per key at a time, across tiers). The dequeue keeps its trigger set and the finishing worker re-adds the key (viewed tier if still armed) | low; it moves only when a key sits in two tiers (a promoted key, or a mark that routed viewed while the key ran on another tier) |
 | `snowplow_refresher_normal_completed_total`, `snowplow_refresher_viewed_completed_total` | successful dequeues of the normal tier and of the viewed tier: with the cluster_list tier's (not published) they split `completed_total` by tier. Counting only | under churn, `normal_completed` moves in every 60 s interval; a paired run compares it between arms |
+| `snowplow_refresher_viewed_reserve_parks_total` | **#1069.** parks of the RESERVED worker: a worker that may take neither a viewed slot (none queued, or the viewed cap is full) nor an unviewed one (normal + cluster_list already hold `parallelism − 1`) waits on a condition until viewed work is announced, an unviewed slot is left for it, or shutdown. A park is one wait, never a poll | its rate is bounded by the work (about one park per viewed job, plus role hand-overs), never by elapsed time: a rate far above `viewed_completed` + `normal_completed` means a spin. 0 at `parallelism = 1` (nothing is reserved; the tiers alternate) |
 | `snowplow_refresher_viewed_dirty_age_ms_p95`, `snowplow_refresher_viewed_dirty_age_ms_max`, `snowplow_refresher_unviewed_dirty_age_ms_p95`, `snowplow_refresher_unviewed_dirty_age_ms_max` (gauges) | the age of the change a dequeue is about to refresh: its dirty window's first mark to the dequeue that runs it, split by side (viewed tier; normal + cluster_list), p95 (P²) and max over roughly the last OTLP export interval. Read at EVERY dequeue that runs inside a window, whatever its outcome, so a window that a remark or a retry keeps open is measured at each attempt (unlike `dirty_to_fresh`, which samples only windows that close fresh). It excludes the re-resolve itself and includes the rate floor and any customer-yield park | `viewed_*` is the server-side view of a viewer's wait for a worker (it includes the rate floor when one applies); `unviewed_*` is the unviewed age a paired run compares between arms (a ratio of the same instrument, not an absolute bar). A key evicted before its dequeue is not in either: read with `dirty_ended_unfresh_evicted` |
 | `snowplow_refresher_viewed_customer_triggered_total`, `snowplow_refresher_viewed_unsubscribed_total`, `snowplow_refresher_viewed_skipped_consumed_total` | **#765.** At the viewed-tier dequeue the subscription is re-checked: `customer_triggered` = still viewed, re-resolved with the admission-cap bypass (like K5 / #740); `unsubscribed` = the tab closed meanwhile, re-resolved as background. `skipped_consumed` = a dequeue skipped because another tier's dequeue of the same (promoted) key already consumed its trigger set (the exactly-once rule) | `customer_triggered` + `unsubscribed` ≤ `dequeued` (a viewed dequeue that is skipped, rate-floor deferred, or already a K5 revalidation is in neither); `skipped_consumed` > `promoted` would mean a skip of a key that was never in two tiers — investigate |
 | `snowplow_refresher_suppressed_set_total` | **1.12.6 C4 / #191, #547.** keys marked refresh-by-traffic-only by a STRUCTURALLY PERMANENT decline (external endpoint, UAF cell, sensitive resource, unsupported kind — first occurrence). A stage-error / empty-full decline never suppresses since #547 (it leaves the cell known-stale) | low |
@@ -600,6 +661,10 @@ tags (1.12.6 C7). The OTLP mirror publishes each stat as
 | `arm_catch_up` | **#1324.** refresh frames sent at once on arm because the tab was behind: the digest of what its `/call` would answer NOW for that user differs from its `held`, or the cell is gone. Recovers frames lost between a `/call` and its arm, and while the SPA re-opens its stream on a widget mount/unmount (`/refreshes` keeps no replay) | a small share of `arm_held`; tracks real changes that landed while a tab was not armed |
 | `arm_duplicate_absorbed` | **#1325 review m1.** arm-time refresh offers (the #710 owed-push emit, the #870 store-swap ledger arm, the #1324 catch-up) not sent because the same arm had already offered that key, from any source (a publish since subscribe included): one arm writes at most one frame per key. The catch-up is the arm's last step and closes it; later publishes are never absorbed | each one is a refetch of the same bytes the tab no longer makes; non-zero where a stale serve's owed push and a stale `held` meet (a D2 serve replaced while the SPA re-opened its stream). A frame absorbed here was already offered, so this never hides a change |
 | `gated_view_moved` | **#1328.** refresh frames for an RBAC change that moved what a tab is SERVED from a gated key (an identity-free widgetContent shell, narrowed per requester at serve time) while the stored bytes did not move, so no write announced it. Checked on a connection only when its identity's RBAC class moved (`rbac.IdentityClassOf`), per armed gated key, against the #1324 served digest its tab holds | each is a tab whose actions' `allowed` flags changed with a grant or revoke; 0 while RBAC is quiet. A non-zero rate with no RBAC change would be a defect |
+| `gated_view_gate_runs` | **#1430.** runs of the serve-time gate asked for by a `/refreshes` connection to digest what its tab is served from a gated key (arm, catch-up check, a written frame, a class move). Since #1430 the digest is computed once per (the shell's answer, the identity, the published RBAC snapshot) and reused; nothing is stored or reused while the cache is disabled, no watcher is wired or the snapshot is incomplete | far below the number of arms; rising in step with arms means nothing is reused (read `gated_view_snapshot_moved`) |
+| `gated_view_reused` | **#1430.** served digests answered from the one already computed for the same answer, identity and RBAC snapshot: no gate run | `gated_view_reused / (gated_view_reused + gated_view_gate_runs)` is the share of arm-side digests that cost nothing; near 1 while RBAC is quiet |
+| `gated_view_call_fills` | **#1430.** served digests stored by a `/call` hit on a gated key: the digest of the bytes it wrote, so the same identity's next arm runs no gate. The `/call` path never reads a stored digest | tracks armed widgetContent hits |
+| `gated_view_snapshot_moved` | **#1430.** stored served digests discarded because the RBAC snapshot they were gated under is no longer the published one (counted when the identity next asks, aggregate only) | 0 while RBAC is quiet; a rate close to `gated_view_gate_runs` means RBAC publishes are frequent enough to cancel the saving (every digest is then recomputed, as before #1430) |
 | `stream_seconds_total` | **1.12.6 C12.** accumulated `/refreshes` stream lifetime (seconds) | ÷ `streams_closed_total` = mean stream lifetime (live: ≈3,336 s; a collapse means something upstream is cutting streams, see the delivery-failure matrix row G1) |
 | `streams_closed_total` | **1.12.6 C12.** streams that ended (client close, hub reset, pod restart) | tracks reconnects |
 
@@ -615,7 +680,7 @@ change. No arm pins it (see the matrix); alert on the rule.
 | `snowplow_rbac_publish_seq` (`internal/cache/rbac_snapshot_expvar.go`) | `uint64` — incremented once per successful RBAC-snapshot publish (also the point per-subject sub-generation bumps land) | bumps within ~30s of a RoleBinding ADD/DELETE; `0` = no snapshot published (cache-off or pre-readiness) |
 | `snowplow_rbac_subgen_bumps_total` (`internal/cache/rbac_subgen_expvar.go`) | `uint64` — cumulative PER-SUBJECT sub-generation bumps (one per subject per bump, so a publish flushing 40 subjects adds 40). This, not `publish_seq`, is the rate at which identity-bound L1 keys rotate | rises with RBAC churn; `0` = no identity-bound key has ever rotated for an RBAC reason. The key is always present, so `0` never means "not instrumented" |
 | `snowplow_rbac_subgen_subjects_tracked` (`internal/cache/rbac_subgen_expvar.go`) | `uint64` — distinct subjects that have a sub-generation counter; the blast-radius denominator for `bumps_total`. **HIGH-WATER MARK, NOT A RATE** — entries are never removed, so it ratchets up then saturates | read the RATIO, never a delta: `bumps_total` high with `subjects_tracked` low = churn concentrated on a few subjects (one tenant); both high = fleet-wide rotation. A **flat line means saturation, not quiet** — it reads the same healthy and broken |
-| `snowplow_bindings_index_ready_settle` (`internal/cache/rbac_subgen_epoch.go`) | map — **#819.** the readiness flip runs the first bindings-index build (so a #682 epoch bump lands before `/readyz` is 200): `built_at_flip` (built before Ready), `deferred_at_flip` (no complete RBAC snapshot yet at the flip: the build, and any owed bump, runs at that first publish, AFTER Ready, #686), `panics` (a recovered build panic; Ready still flipped), `last_ms` (the settle's duration, the delay it added to Ready) | `deferred_at_flip` > 0 means this boot's epoch could move after Ready; read `snowplow_rbac_subgen_epoch` against it. `last_ms` is one in-memory build: milliseconds, not seconds |
+| `snowplow_bindings_index_ready_settle` (`internal/cache/rbac_subgen_epoch.go`) | map — **#819, #1458.** the readiness flip gives the bindings index its navigated set (the GVRs registered so far), so its per-GVR buckets exist when the pod becomes Ready: `navigated_set_at_flip` (flips that did), `panics` (a recovered panic; Ready still flipped), `last_ms` (the settle's duration, the delay it added to Ready). The index is never built from the RBAC snapshot (#1458): its membership is the RBAC event hooks' alone, and it becomes ready, with the #682 epoch bump if one is owed, when the RBAC handlers have been delivered their initial lists, which readiness waits for (#1231). Until #1458 this map carried `built_at_flip` and `deferred_at_flip` | `last_ms` is one in-memory pass over the bindings: milliseconds, not seconds |
 | `snowplow_rbac_binding_noop_updates_total` (`internal/cache/rbac_binding_noop_counters.go`) | `uint64` — (Cluster)RoleBinding UPDATE events redelivering the SAME per-object `resourceVersion`. A watch re-establishment dispatches a Sync delta as `OnUpdate(old,new)` with old == new, so this isolates RELIST FAN-OUT. Since #253 such an event records **no** sub-generation bump (it is a semantic no-op, below) — this counter still counts it | rising in steps of roughly the binding count = watch churn. **A zero means "no relists", NOT "no label/annotation churn"** — a label/annotation write changes the RV and is counted only by the semantic key below. Both no-op counters are **UPDATE-only and structurally blind to creates/deletes** (`onBindingAdd`/`onBindingDelete` bump unconditionally; an ADD has no old side), so on a cluster whose binding count never grows they say nothing about a create-dominated production workload |
 | `snowplow_rbac_binding_semantic_noop_updates_total` (`internal/cache/rbac_binding_noop_counters.go`) | `uint64` — UPDATE events whose subject set (order-insensitive multiset of Kind/Name/Namespace) and roleRef (+ binding namespace) were both unchanged, at the same `metadata.uid`, at any `resourceVersion`. A SUPERSET of the key above (a uid-changed UPDATE is counted by `snowplow_rbac_binding_uid_changed_updates_total` instead, #260). **Since #253 this is exactly the set of binding UPDATEs that record NO sub-generation bump** — the skip and this counter share one predicate (`bindingUpdateSemanticallyUnchanged`) | climbing on label/annotation churn and relists is healthy: each increment is a key rotation #253 avoided. To confirm the skip in production, read it against the `binding_update` bucket of `snowplow_rbac_subgen_bumps_by_source_total` (which must not move for these events), **never** against `snowplow_rbac_subgen_bumps_total`, which also moves on binding ADD/DELETE, the role path (#257) and ServiceAccount churn |
 | `snowplow_authz_memo_hits` / `_misses` / `_swaps` / `_refused` / `_entries` (`internal/rbac/snapshot_authz_memo.go` via `RegisterAuthzMemoExpvar`) | memo hit/miss, generation shard swaps, cap-breach refusals, live entry count | hit rate ≥0.85 warm; swaps bump on snapshot generation change; refused low |
@@ -686,7 +751,7 @@ match what the producers write.
 | `snowplow_crd_discovery` (`internal/cache/crd_discovery_expvar.go`) | `map{stat → value}` derived from the `CRDDiscoveryStats` tags (1.12.6 C7); mirrored to OTLP as `snowplow_crd_discovery{stat}`. Per-stat table below | `events_dropped`/`*_skipped_ng`/`panics_recovered` should be **0** |
 | `snowplow_crd_schema_memo_hits_total` / `_misses_total` / `_stale_dropped_total` / `_invalidations_total` (`internal/resolvers/crds/schema/schema_cache_metrics.go`) | compiled-CRD-schema memo counters | high hit ratio warm; stale-drops expected under concurrent CRD install |
 | `snowplow_sa_discovery_builds_total` / `_invalidations_total` / `_fallbacks_total` / `_impersonated_rejected_total` (`internal/dynamic/cached_client_metrics.go`) | SA-discovery client lifecycle; `impersonated_rejected` = an impersonating config refused by the SA singleton (#608) | fallbacks low; climb = discovery degrading; builds ~1 per process and `impersonated_rejected` 0 — non-zero is the #608 signature |
-| `snowplow_refresh_failed_by_class` (expvar map `<err_class>/<stage>`, `internal/cache/refresher_metrics.go`) / OTLP `snowplow_refresh_failed{err_class,stage}` | refresh failures by closed-set class (`forbidden`, `unauthorized`, `not_found`, `timeout`, `unavailable`, `schema_invalid`, `discovery`, `jq`, `destination_refused`, `unclassified`) and resolve stage (`apiref`, `widget_data`, `resources_refs`, `validate`, `refetch` (the refresher's re-fetch of the cell's own CR, #630), `none`) (#608) | alert on `unclassified` > 0 and on `forbidden`/`validate` > 0 |
+| `snowplow_refresh_failed_by_class` (expvar map `<err_class>/<stage>`, `internal/cache/refresher_metrics.go`) / OTLP `snowplow_refresh_failed{err_class,stage}` | refresh failures by closed-set class (`forbidden`, `unauthorized`, `not_found`, `timeout`, `unavailable`, `schema_invalid`, `discovery`, `jq`, `destination_refused` (#1131), `type_not_installed` (#1414), `redirect_refused` (snowplow refused a redirect the upstream answered, #729), `bad_gateway` (any other 502), `server_error` (a 5xx other than 500, 502, 503 and 504), `unclassified`). A 5xx is classed by its code, never by an InternalError a 502 or another 5xx was given: client-go and plumbing (v1.84.0) give it one, but InternalError is a 500's reason (#1481). Only `forbidden` and `destination_refused` skip the requeue budget. Resolve stage (`apiref`, `widget_data`, `resources_refs`, `validate`, `refetch` (the refresher's re-fetch of the cell's own CR, #630), `none`) (#608) | alert on `unclassified` > 0 and on `forbidden`/`validate` > 0 |
 | `snowplow_discovery` (`internal/dynamic/partial_discovery.go`, #517) | `{total, partial_total, fatal_total, failed_groups:[…]}` for `Client.Discover` (the `GET /list` discovery). `partial_total` counts PARTIAL discoveries honoured as degraded (one or more API group/versions failed, the healthy groups were still served); `fatal_total` counts the calls `/list` answers 500 for; `failed_groups` names the group/versions of the most recent degradation. NOT gated on `CACHE_ENABLED` — `/list` performs discovery either way | `partial_total`/`fatal_total` **0** while `total > 0` = healthy. `total == 0` means no `/list` traffic, NOT health — always read the pair. A climbing `partial_total` with a group named in `failed_groups` = a stale aggregated APIService: `/list` is serving a SHORTER list than the cluster has |
 
 #### `snowplow_informer_watch` stats
@@ -1000,7 +1065,7 @@ tighter bound costs `DEPS_RECONCILE_SAMPLE` (O(sample) under the store mutex per
 4096 / 30 s the 99 % figure is ≈ 56 min at 100K. Go's map iteration samples a random *window*
 rather than 512 independent draws, so these figures are slightly optimistic.
 
-`GET /debug/reconcile` (JWT-gated like its siblings) runs ONE full walk on demand and returns
+`GET /debug/reconcile` (JWT-gated and RBAC-authorized like its siblings) runs ONE full walk on demand and returns
 the divergent set as metadata only (key hash / class / gvr / namespace / name — never a body).
 It is a reconcile, not a dry run: the entries it lists are evicted by the worker right after.
 The full walk is **chunked** (`RangeMetadataBatched`): the store mutex is held once for a key
@@ -1062,7 +1127,7 @@ its `indexerCount`, `gvrLastSyncResourceVersion` and `gvrLastEventAgeSeconds`. C
 and the divergence IS the staleness — no inference.
 
 **It does NOT read the apiserver, and that is deliberate.** Serving the comparison here would
-read as the snowplow ServiceAccount, telling any valid-JWT holder the existence and
+read as the snowplow ServiceAccount, telling any holder of the /debug grant the existence and
 `resourceVersion` of objects their own RBAC forbids. The operator runs that half themselves, under
 their own identity.
 
@@ -1134,7 +1199,7 @@ The OTLP mirror is **aggregate, not per-GVR** — a production cluster carries ~
 informers, so three per-GVR gauges would add ~500 series per collection interval, the same
 cardinality class 1.12.4 had to cap. Stats: `indexer_objects`, `gvrs_never_event`,
 `max_event_age_seconds`, `gvrs_stale_over_hour`. The dashboard says *something* is stale; the
-JWT-gated `/debug/servable` route says which.
+JWT-gated, RBAC-authorized `/debug/servable` route says which.
 
 ### Upstream controller health — "is snowplow broken, or is an upstream controller crash-looping?"
 Defined in `internal/cache/controller_health_expvar.go` / `controller_health.go`.
@@ -1581,6 +1646,95 @@ The operator-notable events:
 | `config.retired_flag_ignored` | Warn/Info | `internal/cache/retired_flags.go` | a retired prewarm/pivot env var is still set; Warn when the value is `false` (a silent behavior change the operator did not consent to — the flag is implicit-on-cache now) |
 | `dispatcher.call.complete` | Info | `dispatchers/per_call_log.go` | per-dispatch structured timing (the per-call diagnostic) |
 | `cache.secrets.informer.assertion_violation` | Error | `internal/cache/secrets_informer.go` | secrets-informer invariant breach |
+
+### Failure lines: logged again only when they change (#711, #1476)
+
+A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
+that failed fails the same way each time. So a failure line logs at its own level only when
+the failure is **new since the cell's previous resolve**, and at **Debug** while it repeats
+unchanged. The lines are:
+
+- `api call response failure` (each dispatch branch of a stage);
+- `unable to resolve api endpoint reference` (a stage's `endpointRef`);
+- the widget's `unable to resolve api reference` (its `apiRef`).
+
+The rules are in `internal/resolvers/restactions/api/failure_log.go`:
+
+- **A resolve is a round.** Each resolve of a cell (its L1 key) is one round. A
+  RESTAction's stages, and a widget with its apiRef RESTAction resolved under the same key,
+  are one round. At the end of a round, its failures replace the cell's previous ones.
+- **What counts as the same failure.** The same target and the same class.
+  - The target is what failed: the stage and the path it read, the stage's `endpointRef`, or
+    the widget's `apiRef`.
+  - The class is a closed label decided by the error's type: `per_identity_denied`, the status
+    code (`404`, `500`, ...), or `error` for a fault with no answer (a reset or refused
+    connection).
+  - At the external fetch, the code is the status line of the dial's last attempt. So an
+    upstream 500, a reset and a 200 whose body could not be used are three different
+    failures, even though the fetch reports all three as a 500.
+  - The class never comes from the error's message, which can name the requester. Two
+    failures with the same code and different text are the same failure.
+- **When a line logs at its own level again:**
+  - when the target succeeds, or does not fail, in a resolve and then fails again;
+  - on a different class for the same target;
+  - on a new target;
+  - on a new generation. A generation is one residency of the cell's key in the resolved
+    cache: a round whose first failure finds the key not resident starts afresh. An eviction
+    ends a generation, and so does an RBAC change, because the key folds the identity's RBAC
+    class.
+
+  With no L1 key on the context (or the cache off), every line logs at its own level.
+- **Overlapping resolves of one cell** (a refresh and a `/call`, or two prewarm passes):
+  - Each resolve reads the notes at its first failure, and writes them at its end in one
+    compare-and-swap.
+  - If the notes moved in between (another resolve of the cell ended), the late resolve does
+    not write the failures it logged at Debug, so the next resolve logs them at their own
+    level.
+  - So a recurrence that a concurrent recovery hides stays hidden for that one overlapping
+    resolve only.
+  - Two overlapping failing resolves can cost one extra line at the failure's own level, never
+    a hidden one.
+- **Its own level.** Decided before the line is written, from the class:
+  - **Warn**: an expected per-identity deny. That is either a re-gate deny for the ctx identity
+    (#711), or the caller's own Forbidden:
+    - the apiserver's 403 on the requester's own dial (#681 F2);
+    - an `apiRef` read refused by the apiserver for the requester's credential or for the
+      identity being impersonated. The 403's typed details must name the object that was
+      read (group, resource and name);
+    - the ServiceAccount read re-gated and denied for the ctx identity.
+
+    The ServiceAccount's own 403 is not one, and neither is the apiserver refusing the
+    impersonation itself. That refusal's details name the impersonated user, group or
+    ServiceAccount, not the object read. Both stay Error. The one refusal this cannot tell
+    apart is a read of the very ServiceAccount being impersonated: it is marked as the
+    identity's deny.
+  - **Debug, every time**: an authorized definite NotFound (#1080 N1/N2). That classification
+    already requires `continueOnError`, so the stage declared the outcome. Every failure is
+    recorded under the stage's `errorKey` (it defaults to `error`), so that adds no condition.
+    The following keep Error:
+    - a NotFound on a stage without `continueOnError`;
+    - a NotFound the watcher does not confirm absent;
+    - a NotFound on a ServiceAccount dial whose pre-dial authorization did not run;
+    - any other failure under `continueOnError`.
+  - **Error**: everything else.
+- **Dry runs.** An inert (#443) resolve opens no round and never touches the notes. Its
+  expected deny logs at Debug, and its other failures at their own level.
+- **Counters are unchanged.** Every occurrence is still counted where it is recorded: the
+  stage-error and per-identity sinks, and `snowplow_internal_dispatch_predial_total{outcome=denied}`.
+  Read the counters for how often a failure happens; the lines say which failures exist.
+- **What is held.** For each cell whose last resolve failed: that resolve's failures, each
+  one a SHA-256 digest of the target plus the class label. No path, name or identity is held
+  in clear.
+  - Per cell, this is bounded by the cell's current failures.
+  - A resolve without a failure deletes the cell's notes.
+  - Keys that are no longer resident are swept. The sweep runs once as many keys have been
+    inserted as were held after the last sweep, so its residency probes average out to at most
+    two per inserted key.
+  - There is no cap and no timer.
+- **Not reduced.** A cell whose failing resolve is never stored is never resident, so each of
+  its resolves logs at its own level. The dedupe follows residency on purpose.
+
+To see every repeat, raise `LOG_LEVEL=debug`.
 
 There are many more dotted events in the `phase1.*`, `prewarm.engine.*`,
 `cache.crd_discovery.*`, `cache.rbac.snapshot.*`, and `cache.discovery.*`

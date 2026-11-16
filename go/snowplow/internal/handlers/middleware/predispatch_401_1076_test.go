@@ -98,6 +98,15 @@ func p1076AssertCause(t *testing.T, rec *httptest.ResponseRecorder, reached bool
 		t.Fatalf("a plumbing Status reader cannot decode the body: %v", err)
 	}
 	_ = json.Unmarshal([]byte(plumbingBody), &plumbing)
+	// plumbing v1.75.0 — response.Status has Details, so a plumbing reader now
+	// also decodes this body's details.causes. The body is the same bytes as
+	// before (asserted above); what changed is what the reader's struct holds.
+	// The six fields are compared as before, and the cause the reader now sees
+	// is the body's one cause.
+	if d := asPlumbing.Details; d == nil || len(d.Causes) != 1 || string(d.Causes[0].Type) != reason || d.Causes[0].Message != p1076Sentence[reason] {
+		t.Fatalf("a plumbing Status reader must see the one cause %q, got %+v", reason, d)
+	}
+	asPlumbing.Details = nil
 	if asPlumbing != plumbing {
 		t.Fatalf("a plumbing Status reader sees %+v, want %+v", asPlumbing, plumbing)
 	}

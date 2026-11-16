@@ -157,6 +157,12 @@ func TestIssue723_724_EveryConstructorRefusesRedirects(t *testing.T) {
 			_, err := FromSecret(ctx, rc, "x", "n")
 			return err
 		},
+		// #1382: GetSecret reads the requester's credential Secret whole, over
+		// the same hardened client.
+		"GetSecret": func(rc *rest.Config) error {
+			_, err := GetSecret(ctx, rc, "x", "n")
+			return err
+		},
 		"HTTPClientFor": func(rc *rest.Config) error {
 			c, err := HTTPClientFor(rc)
 			if err != nil {

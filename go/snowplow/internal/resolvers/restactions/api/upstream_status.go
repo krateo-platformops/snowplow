@@ -27,40 +27,19 @@
 package api
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
-// reasonCodes is each Kubernetes StatusReason's documented HTTP code
-// (k8s.io/apimachinery/pkg/apis/meta/v1/types.go).
-var reasonCodes = map[metav1.StatusReason]int{
-	metav1.StatusReasonUnauthorized:          401,
-	metav1.StatusReasonForbidden:             403,
-	metav1.StatusReasonNotFound:              404,
-	metav1.StatusReasonAlreadyExists:         409,
-	metav1.StatusReasonConflict:              409,
-	metav1.StatusReasonGone:                  410,
-	metav1.StatusReasonExpired:               410,
-	metav1.StatusReasonInvalid:               422,
-	metav1.StatusReasonServerTimeout:         500,
-	metav1.StatusReasonStoreReadError:        500,
-	metav1.StatusReasonInternalError:         500,
-	metav1.StatusReasonTimeout:               504,
-	metav1.StatusReasonTooManyRequests:       429,
-	metav1.StatusReasonBadRequest:            400,
-	metav1.StatusReasonMethodNotAllowed:      405,
-	metav1.StatusReasonNotAcceptable:         406,
-	metav1.StatusReasonRequestEntityTooLarge: 413,
-	metav1.StatusReasonUnsupportedMediaType:  415,
-	metav1.StatusReasonServiceUnavailable:    503,
-}
-
 // trustedReason returns the upstream-claimed reason if it agrees with the HTTP
-// code, else "" (the reader falls back to the code).
+// code, else "" (the reader falls back to the code). Each Kubernetes
+// StatusReason's documented code is credhttp.DocumentedCode (#1481 moved the
+// table there, beside the rule for a reason derived from a code,
+// credhttp.ReasonForCode); a reason that is not a Kubernetes one is dropped.
 func trustedReason(claimed string, code int) string {
 	if claimed == "" {
 		return ""
 	}
-	if c, ok := reasonCodes[metav1.StatusReason(claimed)]; ok && c == code {
+	if c, ok := credhttp.DocumentedCode(claimed); ok && c == code {
 		return claimed
 	}
 	return ""

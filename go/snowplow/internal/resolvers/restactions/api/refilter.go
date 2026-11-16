@@ -499,7 +499,10 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 // discarded at return — so there is no cross-invocation staleness. Evaluator
 // ERRORS are NOT memoized (mirroring filterListByRBAC AC-6): a transient error
 // on one (resource,namespace,name) must not poison a later same-tuple item;
-// the next item retries. The filtering RESULT is byte-identical either way —
+// the next item retries. The one exception is rbac.ErrReviewUnavailable (a
+// cache=off SelfSubjectAccessReview that could not be asked or answered). It
+// is recorded as a deny for this invocation, so an apiserver in distress
+// receives one review per tuple and not one per item, as before #1362. The filtering RESULT is byte-identical either way —
 // the memo only removes redundant EvaluateRBAC calls.
 func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *uafExpr, nameExpr string, nameCode *uafExpr, memo map[uafRBACMemoKey]bool) bool {
 	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
@@ -603,9 +606,22 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 				slog.String("name", name),
 				slog.Any("err", err),
 			)
+			// #1362: a cache=off SelfSubjectAccessReview that could not be
+			// asked or answered is recorded as a deny FOR THIS INVOCATION.
+			// Before #1362 the cache=off path returned that outcome as a
+			// plain (false, nil), and it was memoized like any deny. So a
+			// 50-item list cost one review per (resource, namespace, name)
+			// while the apiserver was in distress, not 50. Keeping the error
+			// un-memoized would multiply the load on an apiserver that is
+			// already failing. The verdict is unchanged (deny), and the memo
+			// dies with this call, so the next request asks again.
+			if memo != nil && errors.Is(err, rbac.ErrReviewUnavailable) {
+				memo[key] = false
+			}
 			continue // a transient evaluator error on one resource must
 			// not mask a genuine grant on another — but it also must not
-			// permit: try the rest, default-deny if none grant. The error is
+			// permit: try the rest, default-deny if none grant. Any OTHER
+			// error (the cache=on snapshot momentarily unavailable) is
 			// deliberately NOT memoized (AC-6): a later same-tuple item retries.
 		}
 		// Record the verdict for reuse by a later same-tuple item.

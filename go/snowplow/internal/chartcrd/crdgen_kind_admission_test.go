@@ -210,6 +210,22 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 			}
 		})
 	}
+
+	// #1334 — the public identity's value, its rendered grant (server-side
+	// dry-run) and what the apiserver does with the impersonation it permits,
+	// on this same cluster (issue1334_public_identity_kind_test.go).
+	t.Run("issue1334", func(t *testing.T) {
+		issue1334KindArms(t, ctx, cfg, func(spec map[string]any) error {
+			u := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": crd.Spec.Group + "/" + served,
+				"kind":       crd.Spec.Names.Kind,
+				"metadata":   map[string]any{"name": "issue1334", "namespace": "default"},
+				"spec":       spec,
+			}}
+			_, err := dyn.Resource(gvr).Namespace("default").Create(ctx, u, dryRun)
+			return err
+		})
+	})
 }
 
 func waitEstablished(t *testing.T, ctx context.Context, ext *apiextclient.Clientset, name string) {
