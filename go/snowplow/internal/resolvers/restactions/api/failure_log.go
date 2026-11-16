@@ -47,10 +47,18 @@
 // joins the open round, so the cell's failures are one set. A nested resolve
 // under another key (the RAFullList cell) is that key's own round. A failure
 // logged with no round for its ctx's key (no L1 key, the cache off) logs at its
-// own level. Two concurrent rounds of one key (a refresh and a /call) each
-// read the notes when they first fail and write them when they end: the last
-// to end wins, which can cost one extra line, never hide a new failure for
-// longer than one round.
+// own level.
+//
+// OVERLAPPING ROUNDS. Two rounds of one key can run at once (a refresh and a
+// /call; a keepwarm and a gvr-discovered pass on one cohort cell). Each reads
+// the notes at its first failure and writes them at its end, as one
+// compare-and-swap. A round whose read is stale by its end (another round of
+// the key ended in between) does not write the targets it logged at DEBUG,
+// so the next round logs them at their own level. So a failure is logged at
+// DEBUG by a round only if that round read it as failing unchanged, and a
+// recurrence that a concurrent recovery hides is hidden for that one
+// overlapping round only. Two overlapping rounds that both fail can cost an
+// extra line at the failure's own level, never a hidden one.
 //
 // BOUNDED BY CONSTRUCTION, NO KNOB.
 //   - Per cell: the notes ARE the previous round's failures, so they are
@@ -111,9 +119,14 @@ type failureTarget [sha256.Size]byte
 // failureNotes is one cell's previous-round failures: target -> class.
 type failureNotes map[failureTarget]string
 
+// noteEntry is one write of a key's notes. Every write stores a new entry, so
+// its pointer is the key's version: a round that loaded entry e knows the
+// notes moved under it when the key holds anything but e at its end.
+type noteEntry struct{ notes failureNotes }
+
 var (
 	// failureNoted maps an L1 key to the failures of its last round.
-	failureNoted sync.Map // string -> failureNotes
+	failureNoted sync.Map // string -> *noteEntry
 	// failureNotedKeys is the number of keys held; failureInsertsSinceSweep
 	// the number inserted since the last sweep, and failureSweepAfter the
 	// number held when it ended: the next sweep runs once that many have been
@@ -140,10 +153,14 @@ type failureRound struct {
 	key  string
 	once sync.Once
 	// off: no resolved cache to follow residency in; no dedupe.
-	off  bool
-	prev failureNotes
-	mu   sync.Mutex
-	cur  failureNotes
+	off bool
+	// loaded is the entry the round read (nil: none), prev its notes.
+	loaded *noteEntry
+	prev   failureNotes
+	mu     sync.Mutex
+	cur    failureNotes
+	// debugged are the targets this round logged at DEBUG, on prev's word.
+	debugged map[failureTarget]struct{}
 }
 
 type failureRoundCtxKey struct{}
@@ -184,7 +201,8 @@ func (r *failureRound) load() {
 		return
 	}
 	if v, ok := failureNoted.Load(r.key); ok {
-		r.prev = v.(failureNotes)
+		r.loaded = v.(*noteEntry)
+		r.prev = r.loaded.notes
 	}
 }
 
@@ -195,13 +213,21 @@ func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 		return own
 	}
 	t := failureTarget(sha256.Sum256([]byte(target)))
+	prev, seen := r.prev[t]
+	debug := seen && prev == class
 	r.mu.Lock()
 	if r.cur == nil {
 		r.cur = failureNotes{}
 	}
 	r.cur[t] = class
+	if debug {
+		if r.debugged == nil {
+			r.debugged = map[failureTarget]struct{}{}
+		}
+		r.debugged[t] = struct{}{}
+	}
 	r.mu.Unlock()
-	if prev, seen := r.prev[t]; seen && prev == class {
+	if debug {
 		return slog.LevelDebug
 	}
 	return own
@@ -209,20 +235,60 @@ func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 
 // end replaces the cell's notes with this round's failures: none (a round
 // without a failure, or one with no store to follow) deletes them.
+//
+// If the notes moved since this round read them (another round of the key
+// ended in between: a success that deleted them, a failure that rewrote
+// them), the targets this round logged at DEBUG on the old notes' word are
+// not written: the next round logs them at their own level. So a failure is
+// logged at DEBUG only by rounds whose own read of the notes shows it failing
+// unchanged, and a round that overlapped a change can hide it for that one
+// round only. The check and the write are one compare-and-swap on the key's
+// entry, so no other round's end can slip between them.
 func (r *failureRound) end() {
 	r.mu.Lock()
-	cur := r.cur
+	cur, debugged := r.cur, r.debugged
 	r.mu.Unlock()
-	if r.off || len(cur) == 0 {
-		if _, ok := failureNoted.LoadAndDelete(r.key); ok {
-			failureNotedKeys.Add(-1)
-		}
-		return
+	if r.off {
+		cur = nil
 	}
-	if _, loaded := failureNoted.Swap(r.key, cur); !loaded {
-		failureNotedKeys.Add(1)
-		failureInsertsSinceSweep.Add(1)
-		sweepFailureNoted(r.key)
+	for {
+		v, present := failureNoted.Load(r.key)
+		var now *noteEntry
+		if present {
+			now = v.(*noteEntry)
+		}
+		next := cur
+		if now != r.loaded && len(debugged) > 0 {
+			next = make(failureNotes, len(cur))
+			for t, c := range cur {
+				if _, d := debugged[t]; !d {
+					next[t] = c
+				}
+			}
+		}
+		if len(next) == 0 {
+			if !present {
+				return
+			}
+			if failureNoted.CompareAndDelete(r.key, v) {
+				failureNotedKeys.Add(-1)
+				return
+			}
+			continue
+		}
+		e := &noteEntry{notes: next}
+		if !present {
+			if _, raced := failureNoted.LoadOrStore(r.key, e); raced {
+				continue
+			}
+			failureNotedKeys.Add(1)
+			failureInsertsSinceSweep.Add(1)
+			sweepFailureNoted(r.key)
+			return
+		}
+		if failureNoted.CompareAndSwap(r.key, v, e) {
+			return
+		}
 	}
 }
 
@@ -400,7 +466,7 @@ func resetFailureNotedForTest() {
 // key holds. Tests only.
 func failureNotedForTest(key string) (keys int64, notes int) {
 	if v, ok := failureNoted.Load(key); ok {
-		notes = len(v.(failureNotes))
+		notes = len(v.(*noteEntry).notes)
 	}
 	return failureNotedKeys.Load(), notes
 }

@@ -104,3 +104,54 @@ func TestIssue1476_ForbiddenIsPerIdentityOnlyForTheCtxIdentitysCredential(t *tes
 		})
 	}
 }
+
+// The refresher impersonates a tenant ServiceAccount cohort and reads a
+// serviceaccounts object. When the apiserver refuses impersonating that
+// ServiceAccount, the details carry the same group and resource as the read
+// (serviceaccounts) but the IMPERSONATED account's name: the ServiceAccount's
+// own fault, not marked. When the impersonated read itself is refused, the
+// details name the object read: the identity's deny. Not covered (by
+// construction, see forbidsRequested): reading the very ServiceAccount being
+// impersonated.
+func TestIssue1476_ImpersonatedServiceAccountCohort_ReadingServiceAccounts(t *testing.T) {
+	prev := env.TestMode()
+	env.SetTestMode(true)
+	t.Cleanup(func() { env.SetTestMode(prev) })
+	for _, c := range []struct {
+		name, details string
+		want          bool
+	}{
+		{"impersonating_the_account_refused", `{"name":"sa1476","kind":"serviceaccounts"}`, false},
+		{"the_impersonated_read_refused", `{"name":"other","kind":"serviceaccounts"}`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api":
+					_, _ = w.Write([]byte(`{"kind":"APIVersions","versions":["v1"]}`))
+				case "/apis":
+					_, _ = w.Write([]byte(`{"kind":"APIGroupList","apiVersion":"v1","groups":[]}`))
+				case "/api/v1":
+					_, _ = w.Write([]byte(`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[` +
+						`{"name":"serviceaccounts","singularName":"serviceaccount","namespaced":true,"kind":"ServiceAccount","verbs":["get","list"]}]}`))
+				default:
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,"details":` + c.details + `}`))
+				}
+			}))
+			t.Cleanup(srv.Close)
+			ctx := cache.WithInternalRESTConfig(context.Background(),
+				&rest.Config{Host: srv.URL, Impersonate: rest.ImpersonationConfig{UserName: "system:serviceaccount:tenant:sa1476"}})
+			ctx = xcontext.BuildContext(ctx, xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: srv.URL, Token: "t"}))
+			res := getFromAPIServer(ctx, templatesv1.ObjectReference{
+				Reference: templatesv1.Reference{Name: "other", Namespace: "tenant"}, APIVersion: "v1", Resource: "serviceaccounts"})
+			if res.Err == nil || res.Err.Code != http.StatusForbidden {
+				t.Fatalf("PRECONDITION: the read must be refused with 403 (err=%v)", res.Err)
+			}
+			if res.PerIdentityDenied != c.want {
+				t.Fatalf("PerIdentityDenied=%v, want %v", res.PerIdentityDenied, c.want)
+			}
+		})
+	}
+}

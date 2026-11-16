@@ -158,6 +158,123 @@ func TestIssue1476_EvictedThenRePutBySuccess_FirstFailureLogs(t *testing.T) {
 	}
 }
 
+// C1 — two rounds of one cell overlap while the upstream changes: P fails; S
+// starts (the upstream recovered: it succeeds) and, before S ends, F starts on
+// the same key and meets the fault again. F read P's notes, so its line is
+// DEBUG: that one overlapping round is the most a recurrence can be hidden.
+// The notes moved under F (S ended and deleted them), so F must not write the
+// target it logged at DEBUG: the next round logs the fault at its own level.
+// Both orders of the two ends.
+func TestIssue1476_OverlappingRecoveryAndRecurrence_HiddenForOneRoundAtMost(t *testing.T) {
+	for _, sEndsFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("s_ends_first=%v", sEndsFirst), func(t *testing.T) {
+			setup711(t, func(string) bool { return true })
+			base := cache.WithL1KeyContext(context.Background(), "cell-1476-c1")
+			lv := func(ctx context.Context) slog.Level { return FailureLogLevel(ctx, slog.LevelError, "t", "500") }
+			if got := round1476(base, "t", "500"); got != slog.LevelError {
+				t.Fatalf("P: %v, want ERROR", got)
+			}
+			_, sEnd := BeginFailureRound(base)
+			fctx, fEnd := BeginFailureRound(base)
+			if got := lv(fctx); got != slog.LevelDebug {
+				t.Fatalf("PRECONDITION: F read P's notes, so its line is DEBUG, got %v", got)
+			}
+			if sEndsFirst {
+				sEnd()
+				fEnd()
+			} else {
+				fEnd()
+				sEnd()
+			}
+			want := []slog.Level{slog.LevelError, slog.LevelDebug, slog.LevelDebug}
+			var later []slog.Level
+			for range want {
+				later = append(later, round1476(base, "t", "500"))
+			}
+			if fmt.Sprint(later) != fmt.Sprint(want) {
+				t.Fatalf("after the overlap the recurring fault must log at its level once: want %v, got %v", want, later)
+			}
+		})
+	}
+}
+
+// Two overlapping rounds that both fail the same way: the one whose read went
+// stale by its end does not write what it logged at DEBUG, which can cost an
+// extra line at the failure's own level, never a hidden one.
+func TestIssue1476_OverlappingFailingRounds_NeverHide(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	base := cache.WithL1KeyContext(context.Background(), "cell-1476-c1b")
+	round1476(base, "t", "500") // ERROR
+	actx, aEnd := BeginFailureRound(base)
+	bctx, bEnd := BeginFailureRound(base)
+	FailureLogLevel(actx, slog.LevelError, "t", "500")
+	FailureLogLevel(bctx, slog.LevelError, "t", "500")
+	aEnd()
+	bEnd()
+	if got := round1476(base, "t", "500"); got != slog.LevelError {
+		t.Fatalf("after two overlapping failing rounds, the next line is %v: the stale round must not keep the DEBUG", got)
+	}
+}
+
+// Rounds of one key in many goroutines, each with concurrent failures, some
+// succeeding: no race (-race), and the key count matches what is held.
+func TestIssue1476_ConcurrentRounds_KeepTheCountTrue(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				base := cache.WithL1KeyContext(context.Background(), fmt.Sprintf("cell-1476-cc-%d", i%3))
+				ctx, end := BeginFailureRound(base)
+				if (g+i)%3 != 0 {
+					var iw sync.WaitGroup
+					for s := 0; s < 4; s++ {
+						iw.Add(1)
+						go func(s int) {
+							defer iw.Done()
+							FailureLogLevel(ctx, slog.LevelError, fmt.Sprintf("t%d", s), "500")
+						}(s)
+					}
+					iw.Wait()
+				}
+				end()
+			}
+		}(g)
+	}
+	wg.Wait()
+	held := int64(0)
+	failureNoted.Range(func(_, _ any) bool { held++; return true })
+	if keys, _ := failureNotedForTest(""); keys != held {
+		t.Fatalf("the key count reads %d, %d keys are held", keys, held)
+	}
+}
+
+// A resolve nested under ANOTHER cell key (the RAFullList cell under a
+// widget's) is that key's own round: its failures are noted under its key,
+// not joined into the enclosing cell's round.
+func TestIssue1476_NestedResolveUnderAnotherKey_IsItsOwnRound(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	outer := cache.WithL1KeyContext(context.Background(), "cell-1476-outer")
+	nested := func() slog.Level {
+		octx, oEnd := BeginFailureRound(outer)
+		defer oEnd()
+		ictx, iEnd := BeginFailureRound(cache.WithL1KeyContext(octx, "cell-1476-inner"))
+		defer iEnd()
+		return FailureLogLevel(ictx, slog.LevelError, "t", "500")
+	}
+	if got := nested(); got != slog.LevelError {
+		t.Fatalf("first: %v, want ERROR", got)
+	}
+	if got := nested(); got != slog.LevelDebug {
+		t.Fatalf("the nested cell's unchanged failure logged at %v: its round must be its own", got)
+	}
+	if _, notes := failureNotedForTest("cell-1476-inner"); notes != 1 {
+		t.Fatalf("the nested cell holds %d notes, want 1", notes)
+	}
+}
+
 // B3 — the notes are the cell's current failures: an iterator whose failing
 // item changes on every refresh holds one note, not one per name it ever
 // failed on.

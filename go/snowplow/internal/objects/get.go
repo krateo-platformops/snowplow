@@ -344,7 +344,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = st // #1115 — 504 Timeout
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
-			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc) && forbidsRequested(err, res.GVR)
+			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc) && forbidsRequested(err, res.GVR, ref.Name)
 		} else if dynamic.IsNotServed(err) {
 			// #1414 — 424, before the object's 404.
 			res.TypeNotInstalled = typeNotInstalled(res.GVR)
@@ -417,18 +417,23 @@ func dialsAsCtxIdentity(ctx context.Context, rc *rest.Config) bool {
 }
 
 // forbidsRequested reports whether a Forbidden's typed Status details name the
-// resource the read asked for (#1476): the apiserver's authorization of THIS
-// read refused it. A Forbidden that names another resource is not an answer
-// about the read: the apiserver refusing the impersonation itself names
-// users, groups or serviceaccounts (the ServiceAccount's own fault, #608). By
-// type only, never the message.
-func forbidsRequested(err error, gvr schema.GroupVersionResource) bool {
+// object the read asked for (#1476): its group, resource AND name, so the
+// apiserver's authorization of THIS read refused it. A Forbidden that names
+// anything else is not an answer about the read: the apiserver refusing the
+// impersonation itself names the impersonated user, group or ServiceAccount
+// (the ServiceAccount's own fault, #608), including when the read is of a
+// serviceaccounts object. By type only, never the message.
+//
+// The one case it cannot tell apart: the read of the very ServiceAccount
+// being impersonated, refused at impersonation, names the same group,
+// resource and name as the read; it is marked as the identity's deny.
+func forbidsRequested(err error, gvr schema.GroupVersionResource, name string) bool {
 	var status apierrors.APIStatus
 	if !errors.As(err, &status) {
 		return false
 	}
 	d := status.Status().Details
-	return d != nil && d.Group == gvr.Group && d.Kind == gvr.Resource
+	return d != nil && d.Group == gvr.Group && d.Kind == gvr.Resource && d.Name == name
 }
 
 // ReasonFailedDependency is the Status reason of a 424 answer
