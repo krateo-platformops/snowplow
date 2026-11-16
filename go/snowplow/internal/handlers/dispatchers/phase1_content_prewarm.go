@@ -52,6 +52,7 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -64,7 +65,6 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -311,7 +311,9 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 	// (oversize ones are still warm — see the oversize branch). oversize
 	// counts how many of those tripped the observability WARN. failed
 	// counts resolve failures (those alone leave a content entry cold).
-	var warmed, oversize, failed int
+	// skipped (#1477) counts data sources not resolved because they need
+	// request extras this resolve does not carry.
+	var warmed, oversize, failed, skipped int
 	log.Info("content.prewarm.started",
 		slog.String("subsystem", "cache"),
 		slog.Int("data_sources", len(refs)),
@@ -325,11 +327,15 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 			log.WarnContext(ctx, "content.prewarm.ctx_cancelled",
 				slog.String("subsystem", "cache"),
 				slog.Int("warmed", warmed),
-				slog.Int("remaining", len(refs)-warmed-failed),
+				slog.Int("remaining", len(refs)-warmed-failed-skipped),
 			)
 			break
 		}
 		envelopeBytes, err := prewarmOneRESTAction(rctx, ref, authnNS)
+		if errors.Is(err, errContentPrewarmNeedsRequestExtras) {
+			skipped++
+			continue
+		}
 		if err != nil {
 			failed++
 			log.WarnContext(ctx, "content.prewarm.resolve_failed",
@@ -370,9 +376,14 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 		slog.Int("warmed", warmed),
 		slog.Int("oversize_warned", oversize),
 		slog.Int("failed", failed),
+		slog.Int("skipped_needs_request_extras", skipped),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 }
+
+// errContentPrewarmNeedsRequestExtras is prewarmOneRESTAction's skip (#1477):
+// the RESTAction needs request extras this resolve does not carry.
+var errContentPrewarmNeedsRequestExtras = errors.New("content prewarm: the RESTAction needs request extras this resolve does not carry")
 
 // prewarmOneRESTAction resolves ONE data-source RESTAction under the
 // content-prewarm SA context. The resolve's side effect — F1's
@@ -393,8 +404,13 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 // fewer entries and re-introduce cold misses. (The discovery walk is the
 // opposite case — it must honour the declared per-widget slice; see
 // phase1_walk.go.)
+//
+// #1477 — a RESTAction this no-extras resolve cannot render (its templated
+// endpointRef reads a request extra) is not resolved: the return is
+// errContentPrewarmNeedsRequestExtras, which the pass counts as skipped, not
+// failed.
 func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference, authnNS string) (int, error) {
-	got := objects.Get(rctx, ref)
+	got := backgroundRESTActionGetFn(rctx, ref)
 	if got.Err != nil {
 		// #630 — keep the apiserver status typed; the text is unchanged.
 		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
@@ -411,6 +427,16 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(
 		got.Unstructured.Object, &cr); err != nil {
 		return 0, fmt.Errorf("unstructured -> RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	// #1477 — the #113 rule: this resolve carries NO extras (the harvest keeps
+	// the RESTAction ref, not the widgets' inline extras, and the resolve below
+	// passes none), so a templated endpointRef that reads a request extra
+	// renders a Secret no customer's request selects: the stage misses its
+	// endpoint and warms nothing a customer's resolve could hit. Not resolved.
+	if restactionNeedsRequestExtras(&cr, nil) {
+		logBackgroundResolveSkip(bgSkipSiteContentPrewarm, "restaction", ref.Namespace+"/"+ref.Name)
+		return 0, errContentPrewarmNeedsRequestExtras
 	}
 
 	// #250 — resolve under the BARE rctx: do NOT thread a restactions-class
@@ -437,7 +463,7 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	// fail-fresh remark every warmed cell + bump unguarded_put_total on each boot /
 	// keepwarm cycle). No L1 key is set, so no phantom restactions edge is recorded.
 	rctx = cache.WithDepGenSink(rctx)
-	res, err := restactions.Resolve(rctx, restactions.ResolveOptions{
+	res, err := restactionsResolveFn(rctx, restactions.ResolveOptions{
 		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the
 		// content prewarm runs under withContentPrewarmSAContext which
