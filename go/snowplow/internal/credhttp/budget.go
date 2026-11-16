@@ -154,6 +154,17 @@ type budgetedAttempt struct {
 	wrote     bool
 	cut       bool
 	timer     *time.Timer
+	// conn is the connection httptrace reported (GotConnInfo.Conn); nil for an
+	// attempt answered by a request already on the wire (#1320). #1509 reads
+	// whether it closes (leaving_1509.go).
+	conn net.Conn
+}
+
+// connection is the attempt's connection, if httptrace reported one.
+func (x *budgetedAttempt) connection() net.Conn {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.conn
 }
 
 // errConnectCut is the cause of an attempt Send stopped waiting on because it
@@ -174,9 +185,10 @@ func beginBudgetedAttempt(ctx context.Context, b *pagebudget.Budget) (*budgetedA
 	// x.shared: the same two facts for an attempt answered by a request
 	// already on the wire (#1320, shared_attempt.go).
 	x.ctx = httptrace.WithClientTrace(withSharedAttemptSink(context.WithValue(cctx, budgetedExchangeKey{}, true), x.shared), &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
+		GotConn: func(i httptrace.GotConnInfo) {
 			x.mu.Lock()
 			x.gotConn = true
+			x.conn = i.Conn
 			x.mu.Unlock()
 		},
 		WroteHeaders: func() {
@@ -286,7 +298,8 @@ var EndpointDialHolder = &transport.DialHolder{Dial: endpointDial}
 // address, immediately before the connect.
 var endpointDialer = &net.Dialer{KeepAlive: 30 * time.Second, Control: dialguard.Control}
 
-// endpointDialFn is the dial the bound wraps (seamed in tests).
+// endpointDialFn is the dial the bound wraps (seamed in tests). #1509: one
+// call per racing attempt (race_1509.go).
 var endpointDialFn = endpointDialer.DialContext
 
 // dialNow is the dial clock (seamed in tests).
@@ -301,7 +314,15 @@ var dialNow = time.Now
 func endpointDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	dctx, cancel := context.WithDeadline(ctx, dialNow().Add(pagebudget.PageMaxGoal))
 	defer cancel()
-	return endpointDialFn(dctx, network, addr)
+	// #1509 (b) — a late connect is raced by another socket (race_1509.go),
+	// every attempt under this same bound and through the same guarded dialer.
+	c, err := raceDial(dctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	// #1509 — wrapped so an attempt can tell when its connection closes
+	// (leaving_1509.go).
+	return newEndpointConn(c), nil
 }
 
 // --- the retry reserve -----------------------------------------------------------

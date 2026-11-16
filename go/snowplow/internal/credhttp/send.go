@@ -178,6 +178,11 @@ func sendOnceBudgeted(cli *http.Client, req *http.Request, b *pagebudget.Budget)
 //     an established connection, after Retry-After after a 429;
 //   - otherwise the last answer, or a *pagebudget.ExhaustedError when the
 //     budget ended it.
+//
+// #1509 (a): a first attempt's 429 from a server that is leaving (its
+// connection is closing, leaving_1509.go) is not counted as an answer: the
+// attempt is made again at once on a fresh connection, once, and the rules
+// above apply to that one.
 func sendBudgeted(site string, cli *http.Client, req *http.Request, b *pagebudget.Budget) (*http.Response, error) {
 	if !budgetNow().Before(b.Deadline()) {
 		b.Note(pagebudget.NotSent)
@@ -186,38 +191,72 @@ func sendBudgeted(site string, cli *http.Client, req *http.Request, b *pagebudge
 	obs := &attemptObserver{next: cli.Transport, site: site}
 	observed := *cli
 	observed.Transport = obs
-	reserve, _ := freshAnswers.reserve()
 	policy := util.NewRetryClient(&observed)
 
-	resp, err, x := budgetedTry(&observed, req, b, b.Deadline().Add(-reserve))
-	wait, retry := budgetedRetryWait(req, resp, err, x, policy)
-	// A connect cut lands exactly at deadline − reserve: what it left IS the
-	// reserve, so a cut attempt always has room for its retry.
-	fits := x.wasCut() || b.Deadline().Sub(budgetNow()) >= reserve+wait
-	switch {
-	case retry && fits:
-		if resp != nil {
-			_ = resp.Body.Close()
+	// #1509 (a) — redone at most once: a first attempt whose 429 came from a
+	// server that is leaving (leaving_1509.go) is made again, at once, on a
+	// fresh connection, and is then treated as the first attempt.
+	redone := false
+	for {
+		reserve, _ := freshAnswers.reserve()
+		resp, err, x := budgetedTry(&observed, req, b, b.Deadline().Add(-reserve))
+		wait, retry := budgetedRetryWait(req, resp, err, x, policy)
+		var leaving <-chan struct{}
+		if retry && !redone && err == nil {
+			closesNow, closed := leavingSignal(resp, x.connection())
+			switch {
+			case closesNow:
+				wait, leaving = 0, closedChan
+			case closed != nil:
+				leaving = closed
+			}
 		}
-		x.end()
-		if !sleepBudget(req.Context(), b, wait) {
-			b.Note(pagebudget.ExhaustedConnect)
-			return nil, &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect, Cause: obs.prevCause, Attempts: obs.attempts}
-		}
-		resp, err, x = budgetedTry(&observed, req, b, time.Time{})
-		if err == nil {
-			b.Note(pagebudget.Retried)
+		// A connect cut lands exactly at deadline − reserve: what it left IS the
+		// reserve, so a cut attempt always has room for its retry. A leaving
+		// server's 429 waits Retry-After only if its connection stays open, so
+		// it is admitted by the same arithmetic as any other 429.
+		fits := x.wasCut() || b.Deadline().Sub(budgetNow()) >= reserve+wait
+		switch {
+		case retry && fits:
+			if resp != nil {
+				// Closed before the wait: an HTTP/2 connection the server sent
+				// GOAWAY on closes once it carries no stream (#1509).
+				_ = resp.Body.Close()
+			}
+			x.end()
+			left, ok := sleepBudgetOrLeaving(req.Context(), b, wait, leaving)
+			if !ok {
+				b.Note(pagebudget.ExhaustedConnect)
+				return nil, &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect, Cause: obs.prevCause, Attempts: obs.attempts}
+			}
+			if left {
+				redone = true
+				continue
+			}
+			resp, err, x = budgetedTry(&observed, req, b, time.Time{})
+			if err == nil {
+				b.Note(pagebudget.Retried)
+				resp.Body = x.bodyEnding(resp.Body)
+				return resp, nil
+			}
+		case err == nil:
+			if redone {
+				b.Note(pagebudget.Retried)
+			} else {
+				b.Note(pagebudget.Within)
+			}
 			resp.Body = x.bodyEnding(resp.Body)
 			return resp, nil
 		}
-	case err == nil:
-		b.Note(pagebudget.Within)
-		resp.Body = x.bodyEnding(resp.Body)
-		return resp, nil
+		return sendBudgetedFailed(err, x, obs, b, req.Method)
 	}
+}
+
+// sendBudgetedFailed is the end of a send whose last attempt failed.
+func sendBudgetedFailed(err error, x *budgetedAttempt, obs *attemptObserver, b *pagebudget.Budget, method string) (*http.Response, error) {
 	// The send failed. A connect cut whose retry did not fit is the budget's
 	// doing too: its connection phase is what ran out.
-	e := x.exhausted(err, obs.attempts, obs.prevCause, req.Method)
+	e := x.exhausted(err, obs.attempts, obs.prevCause, method)
 	if e == nil && x.wasCut() {
 		e = &pagebudget.ExhaustedError{Result: pagebudget.ExhaustedConnect, Cause: obs.prevCause, Attempts: obs.attempts}
 	}
