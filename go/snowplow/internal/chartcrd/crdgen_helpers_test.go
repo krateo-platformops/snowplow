@@ -90,6 +90,38 @@ const (
 	// only dialguard/ and the Makefile; crdgen/ and crdgen/schemas/ are
 	// byte-identical, so v1.85.0's crdgen is still v1.82.0's.
 	//
+	// v1.85.0 → v1.88.0 (snowplow#<this PR>): crdgen/ CHANGES; crdgen/schemas/
+	// has no change at all (`git diff --stat v1.82.0 v1.88.0 -- crdgen
+	// crdgen/schemas` and the same from v1.85.0 list the same eight files, none
+	// under schemas/, because crdgen/ is identical between v1.82.0 and v1.85.0).
+	// Three commits touch it (`git log v1.82.0..v1.88.0 -- crdgen`):
+	//   - plumbing#199 (f5c3288, v1.86.0): copyScalarValidation emits
+	//     exclusiveMinimum/exclusiveMaximum through the new numericBound and
+	//     returns what it cannot express; junctorMemberSchema passes that on and
+	//     the transpiler warns (warnDropped). Neither chart schema has an
+	//     exclusiveMinimum or exclusiveMaximum.
+	//   - plumbing#200 (7bfae18): tests only.
+	//   - plumbing#203 (f12ee75, v1.88.0): emitNot carries a `not` over
+	//     allOf/anyOf/oneOf of value validations natively (isScalarJunction,
+	//     notValueSchema), and drops, with a warning, a `not` it cannot carry
+	//     whole, such as one whose member names a type other than the field's.
+	// Measured at the bump with generate()'s options: helm/snowplow-crds' CRD is
+	// byte-identical; helm/snowplow's differs in ONE place, spec.rbac.
+	// impersonateGroups.items, which gains the chart's `not: {anyOf: [{enum:
+	// [system:masters, '*']}, {pattern: '^system:'}]}` that v1.85.0 dropped with
+	// a warning. impersonateServiceAccounts' `not: {enum: ['*']}` is emitted
+	// as before. With both item constraints native, the CEL rule that stood in
+	// for the dropped `not` duplicated it, so the chart no longer carries it
+	// (see constrainedItemFields). core-provider 2.13.107 requires plumbing
+	// v1.88.0 (its go/core-provider/go.mod, read at tag 2.13.107), so
+	// coreProviderCrdgenVersion moves with crdgenVersion and the invariant holds
+	// by code. Elsewhere in the tag range snowplow imports nothing that changed:
+	// the rest is chartinspector/ and compositionrbac/ (new), helm/ and go.mod.
+	// THIS HOLDS ONLY ONCE THE INSTALLER DEPLOYS core-provider 2.13.107: a
+	// core-provider at or below 2.13.106 compiles the chart with a crdgen that
+	// drops impersonateGroups' `not`, and the chart now has no rule to fall
+	// back on.
+	//
 	// THE TWO CORE-PROVIDER VERSIONS ARE DIFFERENT THINGS. coreProviderVersion
 	// names the status schema in testdata (statusSchemaPath), which the guard
 	// compiles beside the chart because it counts toward the CRD's CEL cost;
@@ -100,10 +132,10 @@ const (
 	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.85.0"
+	crdgenVersion       = "v1.88.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
-	// (core-provider 2.13.105's go/core-provider/go.mod).
-	coreProviderCrdgenVersion = "v1.82.0"
+	// (core-provider 2.13.107's go/core-provider/go.mod).
+	coreProviderCrdgenVersion = "v1.88.0"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
@@ -115,24 +147,21 @@ const (
 	costOverBudget = "estimated rule cost exceeds budget"
 )
 
-// The two allowlists whose items carry a constraint. #657: each stays bounded.
-var constrainedItemFields = []string{ruleOnlyField, nativeNotField}
+// constrainedItemFields are the two allowlists whose items carry a
+// constraint, each a JSON-Schema `not` that helm enforces and crdgen emits as
+// the CRD item's native `not`, with no CEL cost: impersonateServiceAccounts'
+// `not: {enum}` since plumbing#81 (v1.28.0), impersonateGroups' `not: {anyOf:
+// [enum, pattern]}` since plumbing#203 (v1.88.0). Until v1.88.0 crdgen dropped
+// the latter, and the chart carried a CEL rule that restated it; the `not` is
+// now the one statement of the constraint, for helm and the CRD alike. #657:
+// each stays bounded.
+var constrainedItemFields = []string{"impersonateGroups", "impersonateServiceAccounts"}
 
-const (
-	// ruleOnlyField is the item node whose constraint exists ONLY as a CEL
-	// rule: crdgen drops this schema's `not`, so the rule is the enforcement,
-	// and the bounds are what keep its cost under the budget.
-	ruleOnlyField = "impersonateGroups"
-
-	// nativeNotField is the item node whose `not: {enum}` crdgen emits as a
-	// native `not` since plumbing#81 (v1.28.0). It has no CEL cost. Before, crdgen
-	// emitted costlyItemRule for it.
-	nativeNotField = "impersonateServiceAccounts"
-
-	// costlyItemRule broke the cost budget unbounded (1.363149x), which is why
-	// the negative controls put it back: they prove the cost check still runs.
-	costlyItemRule = `!(self in ["*"])`
-)
+// costlyItemRule is the rule crdgen emitted for impersonateServiceAccounts'
+// items before plumbing#81. It breaks the cost budget unbounded (1.363149x),
+// which is why the negative controls put it back on every constrained item:
+// they prove the cost check still runs.
+const costlyItemRule = `!(self in ["*"])`
 
 // requirePinnedCrdgen reads go.mod, because a `go test` binary carries no
 // module dependency list in its build info. The module has no replace
@@ -282,32 +311,38 @@ func stripBounds(t *testing.T, schema []byte) []byte {
 	return out
 }
 
-// withCostlyItemRule returns a copy of the schema whose nativeNotField items
-// carry costlyItemRule, the rule crdgen emitted for them before plumbing#81.
+// withCostlyItemRule returns a copy of the schema whose constrainedItemFields
+// items each carry costlyItemRule.
 func withCostlyItemRule(t *testing.T, schema []byte) []byte {
 	t.Helper()
 	var root map[string]any
 	if err := json.Unmarshal(schema, &root); err != nil {
 		t.Fatal(err)
 	}
-	var cur any = root
-	for _, k := range []string{"properties", "rbac", "properties", nativeNotField, "items"} {
-		m, ok := cur.(map[string]any)
+	for _, f := range constrainedItemFields {
+		items, ok := schemaNode(root, "properties", "rbac", "properties", f, "items").(map[string]any)
 		if !ok {
-			t.Fatalf("schema has no %s on the way to %s.items", k, nativeNotField)
+			t.Fatalf("schema has no rbac.%s.items", f)
 		}
-		cur = m[k]
+		items["x-kubernetes-validations"] = []any{map[string]any{"rule": costlyItemRule, "message": "must not be one of the forbidden values"}}
 	}
-	items, ok := cur.(map[string]any)
-	if !ok {
-		t.Fatalf("schema has no %s.items", nativeNotField)
-	}
-	items["x-kubernetes-validations"] = []any{map[string]any{"rule": costlyItemRule, "message": "must not be one of the forbidden values"}}
 	out, err := json.Marshal(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// schemaNode walks a decoded JSON schema by key; nil when a key is missing.
+func schemaNode(n any, keys ...string) any {
+	for _, k := range keys {
+		m, ok := n.(map[string]any)
+		if !ok {
+			return nil
+		}
+		n = m[k]
+	}
+	return n
 }
 
 // rbacField returns spec.rbac.<field> from the generated CRD's served version.

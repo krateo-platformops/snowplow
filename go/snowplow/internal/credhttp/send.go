@@ -303,7 +303,11 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 //
 // v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
 // and the Makefile; http/ is byte-identical.
-const retryPolicyTranscribedFrom = "v1.85.0"
+//
+// v1.85.0 → v1.88.0 (the crdgen bump, for core-provider 2.13.107): `git diff
+// --stat` changes chartinspector/, compositionrbac/, crdgen/, helm/ and go.mod;
+// http/ has no change at all.
+const retryPolicyTranscribedFrom = "v1.88.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
