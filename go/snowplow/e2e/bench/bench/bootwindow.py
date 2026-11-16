@@ -189,6 +189,9 @@ def summarize(effective: str, pod: str | None, dump_path: str, load_start: str |
                 f"served: {v['requests']} request(s), the longest {v['max_no_byte_s']} s to a first byte")
         lines.append(f"INFO boot window: {SAID[r]}: {said}; answers {json.dumps(v['statuses'], sort_keys=True)}")
     lines.append(f"INFO boot window: READING: {rec['reading']}")
+    if applied is not None and any(v.get("not_served") for v in routes.values()):
+        from bench.snowplow_env import STALL_SHARED_NODE       # #1494 (4): where the stall is reported
+        lines.append(f"INFO boot window: {STALL_SHARED_NODE}")
     if isinstance(gc, dict):
         lines.append(f"INFO boot window: /debug/vars, once answered: GOGC {gc.get('gogc')}, NumGC {gc.get('num_gc')}, "
                      f"PauseTotalNs {gc.get('pause_total_ns')}, GCCPUFraction {gc.get('gc_cpu_fraction')}, "
@@ -210,6 +213,122 @@ def summarize(effective: str, pod: str | None, dump_path: str, load_start: str |
                      f"for {dump.get('elapsed_ms')} ms")
     rec["lines"] = lines
     return rec
+
+
+# ─── what the boot window overlapped (#1494 item 4): the measured phases and the gate's ─────
+#
+# The load starts right after Ready (the owner's ruling, 2026-11-16), so in a stalled arm the boot window's
+# probes run into the load (up to the read's deadline, Ready + its budget) and the goroutine dump (debug=2:
+# it stops the world while it walks every goroutine, ~7.7k of them at 50K) can land inside a measured phase.
+# Marked here, per phase, from the arm's own record (snowplow-env.json's boot_window: its probes' span and
+# its dump's start and duration): evaluate's measured phases (boot, storm, burst, each churn step) and the
+# gate's phases (custlat.pooled of the customers' windows: what the pair's cells are computed over). An
+# overlap is the same test as a cluster operation's (bench/clusterops.py overlaps). Report-only.
+
+def spans_of(bw: dict | None) -> tuple[dict | None, dict | None, str]:
+    """(the probes' span {start_t, end_t}, the dump's {start_t, end_t} or None, why neither is known)."""
+    if not isinstance(bw, dict) or bw.get("kind") != KIND:
+        return None, None, "the run has no boot-window record (no Go runtime read, or one that predates it)"
+    w = bw.get("window") or {}
+    if not isinstance(w.get("start"), (int, float)) or not isinstance(w.get("end"), (int, float)):
+        return None, None, "the boot-window record holds no probe span (a record that predates #1494's)"
+    probes = {"id": "the boot-window probes", "start_t": float(w["start"]), "end_t": float(w["end"])}
+    d = bw.get("dump") if isinstance(bw.get("dump"), dict) else None
+    dump = None
+    if d and isinstance(d.get("t"), (int, float)) and not d.get("skipped"):
+        dump = {"id": "the goroutine dump", "start_t": float(d["t"]),
+                "end_t": float(d["t"]) + float(d.get("elapsed_ms") or 0) / 1000.0}
+    return probes, dump, ""
+
+
+def overlap_report(bw: dict | None, phases: list, gate: list) -> dict:
+    """report["boot_window_overlap_report_only"] of one run: per measured phase (name, start, end) and per gate
+    phase (its windows, pooled by name), whether the probes and the dump overlapped it."""
+    from bench import clusterops
+    from bench.snowplow_env import STALL_SHARED_NODE
+    probes, dump, why = spans_of(bw)
+    out: dict = {"state": "UNKNOWN" if why else "READ", "why": why or None, "probes": probes, "dump": dump,
+                 "phases": [], "gate": {}, "lines": []}
+    if why:
+        out["lines"].append(f"INFO boot window overlap: UNKNOWN ({why})")
+        return out
+    stalled = any((r or {}).get("not_served") for r in (bw.get("routes") or {}).values())
+
+    def marks(t0, t1) -> dict:
+        if t0 is None or t1 is None:
+            return {"probes": None, "dump": None}
+        return {"probes": clusterops.overlaps(probes, t0, t1), "dump": bool(dump) and clusterops.overlaps(dump, t0, t1)}
+    for name, t0, t1 in phases:
+        out["phases"].append(dict(phase=name, t0=t0, t1=t1, **marks(t0, t1)))
+    for name, t0, t1 in gate:
+        m = marks(t0, t1)
+        g = out["gate"].setdefault(name, {"probes": False, "dump": False})
+        for k in ("probes", "dump"):
+            g[k] = g[k] or bool(m[k])
+    hit = [p for p in out["phases"] if p["probes"] or p["dump"]]
+    ghit = [n for n, g in out["gate"].items() if g["probes"] or g["dump"]]
+    out["lines"].append(
+        f"INFO boot window overlap: the probes {clusterops.stamp(probes['start_t'])}..{clusterops.stamp(probes['end_t'])}"
+        + (f", the goroutine dump {clusterops.stamp(dump['start_t'])} for {round(dump['end_t'] - dump['start_t'], 3)} s"
+           if dump else ", no goroutine dump")
+        + (f"; overlapped measured phase(s) {', '.join(p['phase'] for p in hit)}" if hit else
+           "; no measured phase overlapped")
+        + (f"; gate phase(s) {', '.join(ghit)}" if ghit else "; no gate phase overlapped"))
+    for p in hit:
+        what = " and ".join(x for x, on in (("the probes", p["probes"]), ("the goroutine dump", p["dump"])) if on)
+        out["lines"].append(f"INFO boot window overlap, phase {p['phase']} [{clusterops.stamp(p['t0'])}.."
+                            f"{clusterops.stamp(p['t1'])}]: OVERLAPPED by {what}")
+    if stalled:
+        out["lines"].append(f"INFO boot window overlap: a route was not served; {STALL_SHARED_NODE}")
+    return out
+
+
+def _arm_overlap(v: dict | None) -> dict:
+    sec = ((v or {}).get("report") or {}).get("boot_window_overlap_report_only") if isinstance(v, dict) else None
+    return sec if isinstance(sec, dict) else {"state": "UNKNOWN", "why": "the run's verdict.json has no boot-window "
+                                              "overlap section (an evaluate before #1494)", "phases": [], "gate": {}}
+
+
+def _said(sec: dict, row: dict | None) -> str:
+    if sec.get("state") != "READ":
+        return f"UNKNOWN ({sec.get('why')})"
+    if row is None:
+        return "phase not measured"
+    on = [x for x, k in (("probes", "probes"), ("dump", "dump")) if row.get(k)]
+    return ("OVERLAPPED by the " + " and the ".join(on)) if on else "not overlapped"
+
+
+def pair_overlap(va: dict | None, vb: dict | None, labels: tuple[str, str]) -> dict:
+    """The pair report's boot-window marks: per measured and gate phase, each arm's, and the gate phases where
+    either arm's probes or dump overlapped (the pair's cells over those phases are marked by cell_mark)."""
+    sa, sb = _arm_overlap(va), _arm_overlap(vb)
+    out: dict = {"result": "INFO", "a": sa.get("state"), "b": sb.get("state"), "gate_marked": {}, "lines": []}
+    pa = {p["phase"]: p for p in sa.get("phases") or []}
+    pb = {p["phase"]: p for p in sb.get("phases") or []}
+    for name in [*pa, *(n for n in pb if n not in pa)]:
+        ta, tb = _said(sa, pa.get(name)), _said(sb, pb.get(name))
+        if "OVERLAPPED" in ta + tb or "UNKNOWN" in ta + tb:
+            out["lines"].append(f"INFO boot window overlap, phase {name}: {labels[0]}: {ta}; {labels[1]}: {tb}")
+    for name in [*(sa.get("gate") or {}), *(n for n in (sb.get("gate") or {}) if n not in (sa.get("gate") or {}))]:
+        ga, gb = (sa.get("gate") or {}).get(name), (sb.get("gate") or {}).get(name)
+        ta, tb = _said(sa, ga), _said(sb, gb)
+        if "OVERLAPPED" in ta + tb:
+            out["gate_marked"][name] = f"{labels[0]}: {ta}; {labels[1]}: {tb}"
+            out["lines"].append(f"INFO boot window overlap, gate phase {name}: {labels[0]}: {ta}; {labels[1]}: {tb}")
+    if not out["lines"]:
+        out["lines"].append("INFO boot window overlap: " + (
+            "no phase of either arm overlapped a probe window or the goroutine dump"
+            if sa.get("state") == "READ" and sb.get("state") == "READ" else
+            f"UNKNOWN: {labels[0]}: {sa.get('why') or 'read'}; {labels[1]}: {sb.get('why') or 'read'}"))
+    return out
+
+
+def cell_mark(cell: dict, marked: dict) -> dict:
+    """A pair cell whose gate phase either arm's probes or dump overlapped: marked in its record and its line."""
+    m = marked.get(cell.get("phase"))
+    if m and isinstance(cell.get("line"), str):
+        cell = dict(cell, boot_window=m, line=f"{cell['line']} [boot window overlapped this phase: {m}]")
+    return cell
 
 
 def main(argv: list[str] | None = None) -> int:

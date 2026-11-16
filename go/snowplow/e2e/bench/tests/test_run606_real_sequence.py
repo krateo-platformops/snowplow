@@ -1091,10 +1091,11 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         {"kind": "viewer_end", "t": 4, "rc": 3 if cut else 0,
                          "ended_by": "k6 exited without feed_end: the feed is cut" if cut
                          else "feed_end", "navs": 7}])
-            with open(os.path.join(dest, "viewer.jsonl"), "w") as fh:
-                fh.write("".join(json.dumps(r) + "\\n" for r in vrecs))
-            with open(os.path.join(dest, "viewer-exit.json"), "w") as fh:
-                json.dump({"kind": "viewer_exit", "rc": 3 if cut else 0}, fh)
+            if os.environ.get("VIEWERS", "1") != "0":      # VIEWERS=0: no viewer sidecar, no viewer output
+                with open(os.path.join(dest, "viewer.jsonl"), "w") as fh:
+                    fh.write("".join(json.dumps(r) + "\\n" for r in vrecs))
+                with open(os.path.join(dest, "viewer-exit.json"), "w") as fh:
+                    json.dump({"kind": "viewer_exit", "rc": 3 if cut else 0}, fh)
             m = {"page_loads": {"count": 7}, "http_req_failed": {"rate": 0},
                  "route_table_mismatch": {"count": 0}}
             for sc, n in (("navigate", 3), ("composite_burst", 1)):
@@ -1152,7 +1153,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         mode = os.environ.get("FAKE_DRIVE_STREAM", "whole")
         if mode == "nofile":
             print("tar: /out/nav.jsonl: Cannot stat", file=sys.stderr); sys.exit(1)
-        navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v,
+        # a navigation's record carries its start (NavResult.start, epoch s), as the driver writes it
+        navs = [{"kind": "nav", "user": "scaleuser-0001", "page": "p", "visit": v, "start": round(time.time() - 3 + v, 3),
                  "wall_ms": 50, "calls": 3, "errors": 0, "sched_lag_ms": 1} for v in (1, 2)]
         recs = ([{"kind": "drive_start", "t": 1.0}] + navs
                 + [{"kind": "drive_end", "t": 2.0, "ok": True, "rc": 0, "reason": None,

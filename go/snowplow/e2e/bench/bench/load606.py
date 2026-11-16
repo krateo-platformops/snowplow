@@ -6473,6 +6473,34 @@ def measured_blocks(report: dict):
     return cl.get("k6_span"), wins, custlat.BLOCK_S, lambda a, b: custlat._seconds(a, b, wins)
 
 
+def first_request(report: dict, recs: list[dict]) -> tuple[float | None, str]:
+    """#1494 (5): (the drivers' first request's START, where it was read): k6's earliest customer call start
+    (custlat's k6_first_start: a point's time is the request's end, minus its duration), else the load606
+    driver's first navigation start; (None, why) when neither is recorded."""
+    t = (report.get("customer_latency") or {}).get("k6_first_start")
+    if isinstance(t, (int, float)):
+        return float(t), "k6's first customer call, its start: the point's time (the request's end) minus its duration"
+    starts = [r["start"] for r in recs if r.get("kind") == "nav" and isinstance(r.get("start"), (int, float))]
+    if starts:
+        return float(min(starts)), "the load606 driver's first navigation, its start"
+    return None, "no driver record holds a request (no k6 call, no navigation)"
+
+
+def boot_window_overlap(env: dict, recs: list[dict], report: dict) -> dict:
+    """#1494 (4): report["boot_window_overlap_report_only"] (bench/bootwindow.py overlap_report) over the
+    measured phases (measured_phases) and the gate's (custlat.pooled of the customers' windows). Report-only:
+    a failure reads UNKNOWN, never "not overlapped"."""
+    from bench import bootwindow, custlat
+    try:
+        wins = (report.get("customer_latency") or {}).get("windows") or []
+        gate = custlat.pooled([(n, float(a), float(b)) for n, a, b in wins])
+        return bootwindow.overlap_report((env or {}).get("boot_window"), measured_phases(recs, report), gate)
+    except Exception as e:  # noqa: BLE001 — a report-only section never changes, nor stops, the verdict
+        why = f"the report failed: {type(e).__name__}: {e}"
+        return {"state": "UNKNOWN", "why": why, "phases": [], "gate": {},
+                "lines": [f"INFO boot window overlap: UNKNOWN ({why})"]}
+
+
 def cluster_operations_report(path: str | None, recs: list[dict], report: dict) -> dict:
     """report["cluster_operations_report_only"] (bench/clusterops.py), and its warnings added to
     report_warnings. A report that fails reads "operations could not be read", like a record that
@@ -6631,6 +6659,8 @@ def _cmd_evaluate(a) -> int:
     # snowplow-env.json): INFO; the pair states from it what its arms differ in
     from bench import snowplow_env
     result["report"]["snowplow_env"] = env = _report_only(snowplow_env.report, a.snowplow_env)
+    # #1494 (5): the drivers' first request reaching snowplow, from their own records, into the load start
+    snowplow_env.with_first_request(env, *first_request(result["report"], recs))
     for ln in env.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
     if a.snowplow_env is not None:
@@ -6642,9 +6672,19 @@ def _cmd_evaluate(a) -> int:
             result["verdict"] = "INVALID"
             result.setdefault("invalid_reasons", []).append(f"{chk['check']}: {chk['why']}")
     if env.get("runtime_read_stall"):
-        # the boot-window stall is a finding of its own, whatever the read ended with (runs 26j/27)
+        # the boot-window stall is a finding of its own, whatever the read ended with (runs 26j/27); #1494 (4):
+        # the read now runs beside the drivers on the loadgen node
         result["report"].setdefault("report_warnings", []).append(
-            f"{snowplow_env.READ_FINDING}: {snowplow_env.read_text(env.get('runtime_read'))}")
+            f"{snowplow_env.READ_FINDING}: {snowplow_env.read_text(env.get('runtime_read'))}"
+            + (f"; {snowplow_env.STALL_SHARED_NODE}" if isinstance(env.get("load_start"), dict) else ""))
+    # #1494 (4): the measured and gate phases the boot window's probes or its goroutine dump overlapped
+    result["report"]["boot_window_overlap_report_only"] = ov = boot_window_overlap(env, recs, result["report"])
+    for ln in ov.get("lines") or []:
+        print(ln, file=sys.stderr, flush=True)
+    if ov.get("dump") and any(p.get("dump") for p in ov.get("phases") or []):
+        result["report"].setdefault("report_warnings", []).append(
+            "boot window: the goroutine dump (debug=2, it stops the world) ran inside measured phase(s) "
+            + ", ".join(p["phase"] for p in ov["phases"] if p.get("dump")))
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))

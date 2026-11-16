@@ -118,6 +118,7 @@ try:      # what the arms differ in; 1422: their cluster operations per phase (c
     rj = json.load(open(sys.argv[1]))
     out += (rj.get("arms") or {}).get("lines") or []
     out += (rj.get("cluster_operations_report_only") or {}).get("lines") or []
+    out += (rj.get("boot_window_overlap_report_only") or {}).get("lines") or []
 except (OSError, ValueError):
     pass
 print("\n".join(out))' "$REPLICA_FILE" "$ra" "${!sa:-/nonexistent}" "$rb" "${!sb:-/nonexistent}" 2>/dev/null || true)
@@ -158,7 +159,7 @@ print("\n".join(["FAIL: " + r for r in v.get("fail_reasons") or [] if ".candidat
                 + ((v.get("refresher_tiers_report_only") or {}).get("lines") or [])
                 + [ln for k in ("tracing_report_only", "egress_connections_report_only", "nodes_report_only",
                                 "go_runtime_report_only", "user_buckets_report_only", "resolve_memo_report_only",
-                                "cluster_operations_report_only")
+                                "cluster_operations_report_only", "boot_window_overlap_report_only")
                    for ln in (v.get(k) or {}).get("lines") or []]))' \
                "$f" 2>/dev/null || true)
     (( $(rank "$prc") <= $(rank "$STATS_VRC") )) || STATS_VRC=$(( prc == 1 || prc == 4 || prc == 0 ? prc : 3 ))
