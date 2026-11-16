@@ -1666,11 +1666,11 @@ The rules are in `internal/resolvers/restactions/api/failure_log.go`:
   - The target is what failed: the stage and the path it read, the stage's `endpointRef`, or
     the widget's `apiRef`.
   - The class is a closed label decided by the error's type: `per_identity_denied`, the status
-    code (`404`, `500`, ...), `error` for a fault with no answer (a reset or refused
-    connection), or `decode` for a body that arrived and could not be used.
-  - At the external fetch, the code is the status line of the dial's last attempt, so an
-    upstream 500 and a reset are different failures, even though the fetch reports both as a
-    500.
+    code (`404`, `500`, ...), or `error` for a fault with no answer (a reset or refused
+    connection).
+  - At the external fetch, the code is the status line of the dial's last attempt. So an
+    upstream 500, a reset and a 200 whose body could not be used are three different
+    failures, even though the fetch reports all three as a 500.
   - The class never comes from the error's message, which can name the requester. Two
     failures with the same code and different text are the same failure.
 - **When a line logs at its own level again:**

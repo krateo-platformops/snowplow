@@ -1673,11 +1673,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// envelope and route it through the identical recordItemError handling —
 	// byte-identical to the pre-ship ResponseHandler-error path. (Falsifier
 	// TestFalsifierB_SuccessBranchDecodeFailure_NoTruncate.)
-	decodeFailed := false // #1476 — its own failure class, not the upstream's 500
 	if res.Status != response.StatusFailure {
 		if err := feedBytes(jsonBytes); err != nil {
 			res = response.New(http.StatusInternalServerError, err)
-			decodeFailed = true
 		}
 	}
 
@@ -1709,7 +1707,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			failLevel = slog.LevelDebug
 		default:
 			failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path),
-				externalFailureClass(res, fetchErr, decodeFailed, answer.LastStatus()))
+				externalFailureClass(res, fetchErr, answer.LastStatus()))
 		}
 		r.log.Log(fctx, failLevel, "api call response failure", slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),

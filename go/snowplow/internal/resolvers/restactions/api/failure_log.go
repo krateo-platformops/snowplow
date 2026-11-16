@@ -31,8 +31,7 @@
 //     status code — never its message, which can name the requester (#681 S1).
 //     FailureClassOf / failureClassOfCode build it; classPerIdentityDenied is
 //     the expected per-identity deny (#711: a re-gate deny, #1476: the
-//     caller's own Forbidden), classUncoded a transport fault with no code,
-//     classDecode a body that could not be used.
+//     caller's own Forbidden), classUncoded a transport fault with no code.
 //   - its own level: decided by the site from the class, BEFORE the line: WARN
 //     for an expected per-identity deny, DEBUG for an authorized definite
 //     NotFound under continueOnError (which does not go through the notes at
@@ -104,9 +103,6 @@ const (
 	// classUncoded is a failure that carries no status code (a transport
 	// fault: a reset, a refused connection, a TLS error).
 	classUncoded = "error"
-	// classDecode is an answer that arrived but could not be used (a body
-	// that does not decode, a filter that fails on it).
-	classDecode = "decode"
 )
 
 // failureTarget is the digest a failure's target is noted under.
@@ -302,16 +298,14 @@ func FailureClassOf(err error) string {
 
 // externalFailureClass is the class of an external fetch's failure. The fetch
 // shapes every fault into one 500 envelope (an upstream 5xx after the retry
-// client gave up, a reset connection, a refused dial), so the class reads what
-// the dial itself observed: answered is the status line of its last attempt
-// (credhttp.Answer.LastStatus), 0 when no attempt got one. A body that arrived
-// and could not be used is classDecode; with an answer, its code; with none,
-// the fault's own class (the page budget's 504, the destination refusal, else
-// classUncoded).
-func externalFailureClass(res *response.Status, fetchErr error, decodeFailed bool, answered int) string {
+// client gave up, a reset connection, a refused dial, a 2xx body that could
+// not be used), so the class reads what the dial itself observed: answered is
+// the status line of its last attempt (credhttp.Answer.LastStatus), 0 when no
+// attempt got one. With an answer, its code (a body that arrived and could not
+// be used is its 2xx); with none, the fault's own class (the page budget's
+// 504, the destination refusal, else classUncoded).
+func externalFailureClass(res *response.Status, fetchErr error, answered int) string {
 	switch {
-	case decodeFailed:
-		return classDecode
 	case answered != 0:
 		return failureClassOfCode(answered)
 	case fetchErr != nil:
