@@ -393,6 +393,13 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(withSharedAttemptSink(req.Context(), tr.shared), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
+	// #1476 — the status line this attempt got, or none: the dial's answer
+	// keeps the last one (answer.go).
+	if resp != nil {
+		AnswerFrom(req.Context()).attempted(resp.StatusCode)
+	} else {
+		AnswerFrom(req.Context()).attempted(0)
+	}
 	// #1131 — RetryClient has no way to be told an error is final, and it reads
 	// MaxRetries after each attempt, sequentially, so this ends its loop with
 	// this error. TestIssue1131_RefusalIsSentOnce pins that.

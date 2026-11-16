@@ -91,6 +91,11 @@ type StageFailure struct {
 	// (objects.Get's error, from the nested call). No upstream answered: the
 	// failure is reported as that decision (Err), never rebuilt from its code.
 	notInstalled *statusdetails.TypeNotInstalledError
+	// perIdentity (#1476) is set when the stage's item failed with an expected
+	// per-identity deny (IsPerIdentityDenied: a re-gate deny, the caller's own
+	// Forbidden). Err marks its error as one, so the site that reports the
+	// failed resolve (a widget's apiRef) classifies it by type.
+	perIdentity bool
 }
 
 // Err is the failure as the error a caller reports: snowplow's own
@@ -102,6 +107,9 @@ func (f *StageFailure) Err(raNamespace, raName string) error {
 	}
 	if f.notInstalled != nil {
 		return fmt.Errorf("restaction %s/%s stage %q failed: %w", raNamespace, raName, f.Stage, f.notInstalled)
+	}
+	if f.perIdentity {
+		return MarkPerIdentityDenied(f.StatusError(raNamespace, raName))
 	}
 	return f.StatusError(raNamespace, raName)
 }
@@ -191,6 +199,8 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 	// #1429 — the in-process resolve's target is of a type that is not
 	// installed: the error chain carries objects.Get's own error.
 	errors.As(itemErr, &f.notInstalled)
+	// #1476 — an expected per-identity deny, by type.
+	f.perIdentity = IsPerIdentityDenied(itemErr)
 	// #1131 — the destination policy refused the dial: the error chain, never a
 	// recorded value, says so.
 	if st, ok := credhttp.DestinationStatus(itemErr); ok {

@@ -194,6 +194,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// message + adds a `apiref resolve <group>/<resource>/<name>`
 		// context prefix for log-side observability.
 		statusErr := errorFromResult(res, opts.ApiRef)
+		// #1476 — a Forbidden for the ctx identity (objects.Get decided it)
+		// stays an expected per-identity deny on its way to the widget's log
+		// site. The mark unwraps, so the StatusError chain is unchanged.
+		if res.PerIdentityDenied {
+			statusErr = api.MarkPerIdentityDenied(statusErr)
+		}
 		wrapped := fmt.Errorf("apiref resolve %s/%s/%s: %w",
 			res.GVR.Group, res.GVR.Resource, opts.ApiRef.Name, statusErr)
 		// Falsifier slog WARN: the runtime artifact tester / observer

@@ -74,6 +74,13 @@ var (
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	// #1476 — this resolve is one failure-log round of the widget's cell; its
+	// apiRef RESTAction, resolved under the same cell key, joins it. A failure
+	// unchanged since the cell's previous round logs at DEBUG
+	// (api/failure_log.go).
+	ctx, endFailureRound := api.BeginFailureRound(ctx)
+	defer endFailureRound()
+
 	// A2 contract: server-trusted identity injection into the RESOLVE INPUT
 	// (definitive-cache-identity-architecture §1.3 + §2.4). For a widget whose CR
 	// declares spec.identityContext, fold the declared subset of the
@@ -192,7 +199,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		// at WARN where it was decided (api.RefuseReservedExtras); any caller
 		// can send one, so it must not also write an ERROR line.
 		if _, refused := api.AsReservedExtrasError(err); !refused {
-			log.ErrorContext(ctx, "unable to resolve api reference", slog.Any("err", err))
+			log.Log(ctx, apiRefFailureLevel(ctx, opts.In, err), "unable to resolve api reference", slog.Any("err", err))
 		}
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageApiRef, "resolve apiRef "+stageObject(opts.In), err)
@@ -348,6 +355,24 @@ func stageObject(w *Widget) string {
 		return "<nil>"
 	}
 	return w.GroupVersionKind().String() + " " + w.GetNamespace() + "/" + w.GetName()
+}
+
+// apiRefFailureLevel is the level of the "unable to resolve api reference"
+// line of widget w (#1476, api/failure_log.go): an expected per-identity deny
+// — the apiRef read, or a stage of its RESTAction, denied for the caller's
+// identity — logs at WARN, any other failure at ERROR, and an unchanged repeat
+// in the widget cell's generation at DEBUG. Classified by the error's type
+// only; the target is the apiRef the widget names.
+func apiRefFailureLevel(ctx context.Context, w *Widget, err error) slog.Level {
+	own := slog.LevelError
+	if api.IsPerIdentityDenied(err) {
+		own = slog.LevelWarn
+	}
+	target := "widget.apiRef"
+	if ref, rerr := GetApiRef(w.Object); rerr == nil {
+		target += "\x00" + ref.Namespace + "/" + ref.Name
+	}
+	return api.FailureLogLevel(ctx, own, target, api.FailureClassOf(err))
 }
 
 func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
