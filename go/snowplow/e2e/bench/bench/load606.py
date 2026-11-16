@@ -6473,53 +6473,6 @@ def measured_blocks(report: dict):
     return cl.get("k6_span"), wins, custlat.BLOCK_S, lambda a, b: custlat._seconds(a, b, wins)
 
 
-#: run606 s_evaluate's inputs (its nullglob globs, in its order), for a run dir with no evaluate-argv.json
-EVALUATE_GLOBS = ("nav-*.jsonl", "fresh-*.jsonl", "preflight.jsonl", "pod-*.jsonl", "mem-*.jsonl", "top.jsonl",
-                  "top-boot.jsonl", "boot.jsonl", "flowcontrol-config.jsonl", "image-digest.jsonl", "job-pods.jsonl",
-                  "cluster-shape*.jsonl", "api-outages*.jsonl", "platform-definitions.jsonl", "command-failures.jsonl",
-                  "cert-manager*.jsonl", "host-load.jsonl", "incluster-placement.jsonl", "observer-pod.jsonl",
-                  "netns*.jsonl", "frontend-digest*.jsonl")
-
-
-def reevaluate_argv(run_dir: str, a) -> list[str]:
-    """The evaluate argv of a run directory: its own evaluate-argv.json ({OUT} = the dir), or, for a run before
-    #1494, run606 s_evaluate's argv rebuilt from the dir's files and the run's settings (`a`)."""
-    import glob
-    d = os.path.abspath(run_dir)
-    rec = os.path.join(d, "evaluate-argv.json")
-    if os.path.exists(rec):
-        with open(rec) as fh:
-            return ["evaluate", *(x.replace("{OUT}", d) for x in json.load(fh))]
-    files = [f for g in EVALUATE_GLOBS for f in sorted(glob.glob(os.path.join(d, g)))]
-    digest = a.expect_digest
-    if digest is None:
-        dg = next((r for r in reversed(_read_jsonl(os.path.join(d, "image-digest.jsonl")))
-                   if r.get("kind") == "image_digest"), {}) if os.path.exists(os.path.join(d, "image-digest.jsonl")) else {}
-        digest = dg.get("expected")
-    argv = ["evaluate", *files, *([] if a.no_run8 else ["--run8"])]
-    argv += ["--expect-digest", digest or "", "--profile-dir", os.path.join(d, "heap")]
-    if os.path.isdir(os.path.join(d, "k6")):
-        argv += ["--k6-out", os.path.join(d, "k6"), "--browser-out", os.path.join(d, "browser"),
-                 "--browser-sessions", str(a.browser_sessions), *(["--no-viewers"] if a.no_viewers else [])]
-    argv += ["--tracing", os.path.join(d, "tracing.json"), "--cluster-operations",
-             os.path.join(d, "cluster-operations.json"), "--snowplow-env", os.path.join(d, "snowplow-env.json"),
-             "--apf", os.path.join(d, "apf.jsonl.gz")]
-    if a.frontend_tag:
-        argv += ["--frontend-tag", a.frontend_tag, "--expect-frontend-digest", a.expect_frontend_digest or ""]
-    return argv
-
-
-def _cmd_reevaluate(a) -> int:
-    if os.path.abspath(a.out) == os.path.abspath(os.path.join(a.run_dir, "verdict.json")):
-        print("reevaluate: --out must not be the run's own verdict.json", file=sys.stderr)
-        return 2
-    argv = reevaluate_argv(a.run_dir, a)
-    print("reevaluate: python3 -m bench.load606 " + " ".join(argv), file=sys.stderr, flush=True)
-    import contextlib
-    with open(a.out, "w") as fh, contextlib.redirect_stdout(fh):
-        return main(argv)
-
-
 def first_request(report: dict, recs: list[dict]) -> tuple[float | None, str]:
     """#1494 (5): (the drivers' first request's time, where it was read): k6's first customer call (custlat's
     k6_span), else the load606 driver's first navigation; (None, why) when neither is recorded."""
@@ -6961,20 +6914,6 @@ def main(argv: list[str] | None = None) -> int:
                    help="#871: where mem606's CPU profiles were copied (the run's heap/ dir); "
                         "attributes their CPU by the snowplow_work label")
     e.set_defaults(func=_cmd_evaluate)
-    re_ = sub.add_parser("reevaluate", help="#1494: evaluate again a run directory (a fetched durable copy) with this "
-                                             "bench: its own evaluate-argv.json when it has one, else rebuilt")
-    re_.add_argument("run_dir")
-    re_.add_argument("--out", required=True, help="where the new verdict goes (never over the run's verdict.json)")
-    re_.add_argument("--expect-digest", default=None,
-                     help="without evaluate-argv.json (a run before #1494): the run's EXPECTED_IMAGE_DIGEST "
-                          "(default: image-digest.jsonl's expected)")
-    re_.add_argument("--browser-sessions", type=int, default=5,
-                     help="without evaluate-argv.json: the run's BROWSER_SESSIONS (run606's default 5)")
-    re_.add_argument("--no-viewers", action="store_true", help="without evaluate-argv.json: the run had VIEWERS=0")
-    re_.add_argument("--no-run8", action="store_true", help="without evaluate-argv.json: the run had RUN8_REPORT=0")
-    re_.add_argument("--frontend-tag", default=None)
-    re_.add_argument("--expect-frontend-digest", default=None)
-    re_.set_defaults(func=_cmd_reevaluate)
     wcp = sub.add_parser("work-class",
                          help="#871: CPU per snowplow_work class over the given CPU profiles")
     wcp.add_argument("profiles", nargs="+")

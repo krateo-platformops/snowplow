@@ -201,33 +201,97 @@ def test_a_run_reports_ready_to_first_request_the_top_switch_the_tracing_read_an
     assert "INFO boot window overlap: the probes " in log
 
 
-# ─── a fetched run, evaluated again with this bench ─────────────────────────
+# ─── a fetched run, evaluated again with this bench (bench/reevaluate.py) ───
+
+def _judged(v: dict, d) -> dict:
+    """What the verdict judged, with the run dir as {OUT}: the verdict, every invalid and fail reason, and every
+    validity check's result."""
+    s = json.dumps({"verdict": v.get("verdict"), "invalid": sorted(v.get("invalid_reasons") or []),
+                    "fail": sorted(v.get("fail_reasons") or []),
+                    "validity": sorted((c.get("check"), c.get("result")) for c in v.get("validity") or [])})
+    return json.loads(s.replace(str(d), "{OUT}"))
+
+
+def _reevaluate(copy, out, *args):
+    return subprocess.run(["python3", "-m", "bench.reevaluate", str(copy), "--out", str(out), *args], cwd=BENCH_DIR,
+                          capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(BENCH_DIR)))
+
+
+def _as_before_1494(copy):
+    """The run dir as a run from before #1494 left it: no evaluate-argv.json, a load start without the top / tracing
+    times."""
+    (copy / "evaluate-argv.json").unlink()
+    ls = json.loads((copy / "load-start.json").read_text())
+    (copy / "load-start.json").write_text(json.dumps({k: ls[k] for k in ("kind", "ready_at", "applied_at", "offset_s")}))
+
+
+def _check_reevaluation(out, tmp_path, *, expect: dict):
+    first = _judged(json.loads((out / "verdict.json").read_text()), out)
+    recorded = json.loads((out / "evaluate-argv.json").read_text())
+    assert recorded[0].startswith("{OUT}/")
+    copy = tmp_path / "fetched"
+    shutil.copytree(out, copy)
+    # with its own evaluate-argv.json
+    r = _reevaluate(copy, tmp_path / "v1.json")
+    assert r.returncode in (0, 1, 3, 4), r.stderr[-2000:]
+    assert _judged(json.loads((tmp_path / "v1.json").read_text()), copy) == first, r.stderr[-2000:]
+    # as a run from before #1494: every setting derived from the evidence, none from a default
+    _as_before_1494(copy)
+    r = _reevaluate(copy, tmp_path / "v2.json")
+    assert (tmp_path / "v2.json").exists(), r.stderr[-3000:]
+    v2 = json.loads((tmp_path / "v2.json").read_text())
+    assert _judged(v2, copy) == first, r.stderr[-2000:]
+    got = {k: s["value"] for k, s in v2["reevaluated"]["settings"].items()}
+    assert got == expect, got
+    # the rebuilt argv is the one run606 ran, to the flag
+    assert v2["reevaluated"]["argv"] == ["evaluate", *(x.replace("{OUT}", str(copy)) for x in recorded)]
+    return copy
+
 
 def test_a_run_directory_is_evaluated_again_its_evidence_as_it_is(harness, tmp_path):  # noqa: F811
     env, state, _, tmp = harness
     p = _run606(env, SNOWPLOW_ENV="GOGC=100")
     out = tmp / "out"
     assert p.returncode == 0, (out / "run.log").read_text()[-3000:]
-    assert json.loads((out / "evaluate-argv.json").read_text())[0].startswith("{OUT}/")
-    first = json.loads((out / "verdict.json").read_text())
-    # a copy of it elsewhere (a fetched durable copy), with its own evaluate-argv.json ...
-    copy = tmp_path / "fetched"
-    shutil.copytree(out, copy)
-    r = subprocess.run(["python3", "-m", "bench.load606", "reevaluate", str(copy), "--out", str(tmp_path / "v1.json")],
-                       cwd=BENCH_DIR, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(BENCH_DIR)))
-    v1 = json.loads((tmp_path / "v1.json").read_text())
-    assert v1["verdict"] == first["verdict"] and "boot_window_overlap_report_only" in v1["report"], r.stderr[-2000:]
-    # ... and one from before #1494 (no evaluate-argv.json, a load-start.json without the top / tracing times)
-    (copy / "evaluate-argv.json").unlink()
-    ls = json.loads((copy / "load-start.json").read_text())
-    (copy / "load-start.json").write_text(json.dumps({k: ls[k] for k in ("kind", "ready_at", "applied_at", "offset_s")}))
-    r = subprocess.run(["python3", "-m", "bench.load606", "reevaluate", str(copy), "--out", str(tmp_path / "v2.json"),
-                        "--browser-sessions", "5"],
-                       cwd=BENCH_DIR, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(BENCH_DIR)))
-    v2 = json.loads((tmp_path / "v2.json").read_text())
-    assert v2["verdict"] == first["verdict"], r.stderr[-2000:]
-    assert "reevaluate: python3 -m bench.load606 evaluate " in r.stderr
+    from tests.test_run606_real_sequence import FAKE_DIGEST
+    copy = _check_reevaluation(out, tmp_path, expect={"driver": "load606", "expect_digest": FAKE_DIGEST,
+                                                      "frontend": "none", "run8": True})
     # never over the run's own verdict
-    r = subprocess.run(["python3", "-m", "bench.load606", "reevaluate", str(copy), "--out", str(copy / "verdict.json")],
-                       cwd=BENCH_DIR, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(BENCH_DIR)))
+    assert _reevaluate(copy, copy / "verdict.json").returncode == 2
+    # what the evidence cannot decide is refused, named, unless stated; a statement it contradicts too
+    (copy / "image-digest.jsonl").unlink()
+    r = _reevaluate(copy, tmp_path / "v3.json")
+    assert r.returncode == 2 and "REFUSED: expect_digest: not decided by the run's evidence" in r.stderr
+    assert _reevaluate(copy, tmp_path / "v3.json", "--expect-digest", FAKE_DIGEST).returncode != 2
+    (copy / "verdict.json").unlink()
+    r = _reevaluate(copy, tmp_path / "v4.json", "--expect-digest", FAKE_DIGEST)
+    assert r.returncode == 2 and "run8: not decided by the run's evidence (no readable verdict.json of the run)" in r.stderr
+    r = _reevaluate(copy, tmp_path / "v4.json", "--expect-digest", FAKE_DIGEST, "--run8", "on", "--driver", "k6")
+    assert r.returncode == 2 and "driver: stated 'k6', the run's evidence says 'load606'" in r.stderr
+
+
+def test_a_k6_run_with_a_frontend_override_three_sessions_no_viewers_no_run8_is_evaluated_again_as_it_ran(harness, tmp_path):  # noqa: F811
+    from tests.test_run26_frontend_override import FD, FTAG, _fenv
+    env, state, _, tmp = harness
+    e = dict(_fenv(env), FAKE_FRONTEND_DIGEST=FD, LOAD_DRIVER="k6", USERS="20", THINK_S="1", COMPOSITE_BURST_USERS="5",
+             BROWSER_SESSIONS="3", VIEWERS="0", RUN8_REPORT="0", PREFLIGHT_TIMEOUT_S="10", PREFLIGHT_POLL_S="0.5", SNOWPLOW_ENV="GOGC=100")
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=e, capture_output=True, text=True, timeout=600)
+    out = tmp / "out"
+    assert p.returncode == 0, (out / "run.log").read_text()[-3000:]
+    from tests.test_run606_real_sequence import FAKE_DIGEST
+    v = json.loads((out / "verdict.json").read_text())
+    assert any(c["check"] == "frontend.image_digest" for c in v["validity"])          # the override was judged
+    assert "run8" not in v["report"]
+    copy = _check_reevaluation(out, tmp_path, expect={
+        "driver": "k6", "expect_digest": FAKE_DIGEST, "frontend": [FTAG, FD], "run8": False,
+        "browser_sessions": 3, "viewers": False})
+    # a statement the evidence contradicts is refused, naming the setting
+    r = _reevaluate(copy, tmp_path / "v5.json", "--browser-sessions", "5", "--viewers", "on", "--no-frontend",
+                    "--run8", "on")
     assert r.returncode == 2
+    for k in ("browser_sessions: stated 5", "viewers: stated True", "frontend: stated 'none'", "run8: stated True"):
+        assert k in r.stderr, r.stderr
+    # viewer output beside a manifest with no viewer sidecar: the evidence contradicts itself, refused
+    (copy / "k6" / "viewer-exit.json").write_text('{"kind": "viewer_exit", "rc": 0}')
+    r = _reevaluate(copy, tmp_path / "v6.json")
+    assert r.returncode == 2 and "viewers: not decided by the run's evidence (the viewer left output" in r.stderr

@@ -1091,10 +1091,11 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         {"kind": "viewer_end", "t": 4, "rc": 3 if cut else 0,
                          "ended_by": "k6 exited without feed_end: the feed is cut" if cut
                          else "feed_end", "navs": 7}])
-            with open(os.path.join(dest, "viewer.jsonl"), "w") as fh:
-                fh.write("".join(json.dumps(r) + "\\n" for r in vrecs))
-            with open(os.path.join(dest, "viewer-exit.json"), "w") as fh:
-                json.dump({"kind": "viewer_exit", "rc": 3 if cut else 0}, fh)
+            if os.environ.get("VIEWERS", "1") != "0":      # VIEWERS=0: no viewer sidecar, no viewer output
+                with open(os.path.join(dest, "viewer.jsonl"), "w") as fh:
+                    fh.write("".join(json.dumps(r) + "\\n" for r in vrecs))
+                with open(os.path.join(dest, "viewer-exit.json"), "w") as fh:
+                    json.dump({"kind": "viewer_exit", "rc": 3 if cut else 0}, fh)
             m = {"page_loads": {"count": 7}, "http_req_failed": {"rate": 0},
                  "route_table_mismatch": {"count": 0}}
             for sc, n in (("navigate", 3), ("composite_burst", 1)):

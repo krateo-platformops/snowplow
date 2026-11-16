@@ -2990,8 +2990,8 @@ s_evaluate() {
     # a bounded call like any other, so a stop mid-hold leaves no sleep behind (#1170)
     bounded 60 sleep 60 || true
   fi
-  # #1494: the exact evaluate argv, its run dir as {OUT}, kept with the evidence: `python3 -m bench.load606
-  # reevaluate <run dir>` re-runs it on a fetched copy with any later bench
+  # #1494: the exact evaluate argv, its run dir as {OUT}, kept with the evidence: `python3 -m bench.reevaluate
+  # <run dir> --out F` re-runs it on a fetched copy with any later bench
   python3 -c 'import json, sys; o = sys.argv[1]; print(json.dumps([x.replace(o, "{OUT}") for x in sys.argv[2:]]))' "$OUT" \
       "${files[@]}" ${r8[@]+"${r8[@]}"} --expect-digest "$EXPECTED_IMAGE_DIGEST" --profile-dir "$OUT/heap" \
       ${k6args[@]+"${k6args[@]}"} "${trargs[@]}" "${opargs[@]}" "${apfargs[@]}" ${feargs[@]+"${feargs[@]}"} \
