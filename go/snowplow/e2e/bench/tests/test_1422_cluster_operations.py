@@ -483,7 +483,7 @@ def test_the_pair_is_not_asymmetric_when_both_or_neither_overlapped_and_unknown_
     # a verdict from before #1422 has no section: unknown, never symmetric
     (dc / "verdict.json").write_text(json.dumps({"verdict": "PASS", "report": {}}))
     old = _pair_cli(da, dc)
-    assert old["unknown"] == [P1[0], P2[0]] and "has no cluster_operations_report_only" in old["lines"][0]
+    assert old["unknown"] == ["measure", P1[0], P2[0]] and "has no cluster_operations_report_only" in old["lines"][0]
 
 
 def test_the_in_run_replica_says_it_too(fakes):
