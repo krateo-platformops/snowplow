@@ -145,7 +145,11 @@ func configSources(t *testing.T) map[string]*rest.Config {
 	// copy of a config that carries a limiter must not carry it either.
 	bound := BindRequestBudget(pagebudget.WithCustomer(context.Background(), time.Now()),
 		&rest.Config{Host: testHost, QPS: 5, Burst: 10, RateLimiter: flowcontrol.NewTokenBucketRateLimiter(5, 10)})
-	return map[string]*rest.Config{"InClusterConfig": ic, "NewClientConfig": cc, "Harden": hd, "BindRequestBudget": bound}
+	// #1318 — BindContext copies a config for one unit of work; the same.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // the copy is only read, never sent on
+	boundCtx := BindContext(ctx, &rest.Config{Host: testHost, QPS: 5, Burst: 10, RateLimiter: flowcontrol.NewTokenBucketRateLimiter(5, 10)})
+	return map[string]*rest.Config{"InClusterConfig": ic, "NewClientConfig": cc, "Harden": hd, "BindRequestBudget": bound, "BindContext": boundCtx}
 }
 
 // Control: the instrument sees the default limiter when it is there. Built
