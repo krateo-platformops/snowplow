@@ -25,6 +25,7 @@ import pytest
 
 from bench import bootwindow, custlat, load606, snowplow_env
 from tests.test_load_start import _rec, _verdict
+from tests.test_pair_ready_time import _pair_cli as _pair15, run15  # noqa: F401  (fixture)
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
 
@@ -89,6 +90,35 @@ def test_a_disagreement_turns_a_candidate_restart_fail_into_invalid_and_keeps_it
     assert ("PRECEDENCE: INVALID (the arms' snowplow env, compared after the measure) over FAIL: a pair whose arms did "
             "not run the same undeclared environment compares more than the two images, so neither its FAIL nor its "
             "PASS stands; the FAIL's own reasons are kept (fail_reasons)") in out["notes"]
+
+
+def test_the_pair_tags_its_cells_over_a_gate_phase_a_boot_window_overlapped(run15, tmp_path):  # noqa: F811
+    """custlat main's wiring: the pair (as run606_pair.sh runs it) tags exactly the cells of the gate phase either
+    arm's boot window overlapped, in their record and their line."""
+    d, va, vb, _, p0 = run15
+    assert p0["cells"] and not any("boot_window" in c for c in p0["cells"])      # no section: no tag
+    phases = {c["phase"] for c in p0["cells"]}
+    for arm, v, inside in (("a", va, True), ("b", vb, False)):
+        gate = custlat.pooled([(n, float(x), float(y)) for n, x, y in v["report"]["customer_latency"]["windows"]])
+        # the last churn step: past storm (open from -inf) and burst, so churn alone holds it
+        name, g0, _ = [w for w in gate if w[0] == "churn"][-1]
+        assert name in phases and all(y < g0 for n, _, y in gate if n != "churn")
+        end = max(y for _, _, y in gate)
+        bw = _bw(g0 + 5.0, g0 + 30.0) if inside else _bw(end + 1000.0, end + 1001.0, stalled=False)
+        vv = dict(v, report=dict(v["report"], boot_window_overlap_report_only=bootwindow.overlap_report(bw, [], gate)))
+        shutil.copytree(d / arm, tmp_path / arm)
+        (tmp_path / arm / "verdict.json").write_text(json.dumps(vv))
+    _, p = _pair15(tmp_path / "a", tmp_path / "b")
+    mark = p["boot_window_overlap_report_only"]["gate_marked"]["churn"]
+    assert mark.endswith(": OVERLAPPED by the probes; B (candidate): not overlapped"), mark
+    churn = [c for c in p["cells"] if c["phase"] == "churn"]
+    assert churn and all(c["boot_window"] == mark and c["line"].endswith(
+        f" [boot window overlapped this phase: {mark}]") for c in churn)
+    other = [(c["phase"], c.get("boot_window"), c["line"][-160:]) for c in p["cells"] if c["phase"] != "churn"
+             and ("boot_window" in c or "boot window overlapped" in c["line"])]
+    assert not other, (other, p["boot_window_overlap_report_only"]["gate_marked"])
+    # the cells are the same cells, only tagged
+    assert [(c["phase"], c["metric"]) for c in p["cells"]] == [(c["phase"], c["metric"]) for c in p0["cells"]]
 
 
 # ─── (3) the dump's exact time ──────────────────────────────────────────────
@@ -163,10 +193,17 @@ def test_the_pair_report_and_its_cells_mark_the_phases_either_arm_overlapped():
 # ─── (5) first request, (6) top / tracing; and the stall note, from a real run ───
 
 def test_the_first_request_comes_from_the_drivers_own_records():
-    assert load606.first_request({"customer_latency": {"k6_span": [1005.5, 2000.0]}}, []) == \
-        (1005.5, "k6's first customer call")
+    # k6 stamps each http_req_duration point at the request's END: a call started at time - duration. The call
+    # that ended first (1000.0, 50 ms) is not the one that started first (1000.3, 1 s: started at 999.3)
+    o = {"points": {"http_req_duration": [(50.0, {}), (1000.0, {}), (5.0, {})]},
+         "times": {"http_req_duration": [1000.0, 1000.3, 1001.0]}}
+    cl = custlat.report(o, None, [], [], [], [])
+    assert cl["k6_span"] == [1000.0, 1001.0] and cl["k6_first_start"] == 999.3
+    assert load606.first_request({"customer_latency": cl}, [{"kind": "nav", "start": 5.0}]) == (
+        999.3, "k6's first customer call, its start: the point's time (the request's end) minus its duration")
+    assert custlat.first_start([(1000.0, 250.0)]) == 999.75 and custlat.first_start([]) is None
     navs = [{"kind": "nav", "start": 1010.0}, {"kind": "nav", "start": 1003.0}, {"kind": "mem", "start": 1.0}]
-    assert load606.first_request({}, navs) == (1003.0, "the load606 driver's first navigation")
+    assert load606.first_request({}, navs) == (1003.0, "the load606 driver's first navigation, its start")
     assert load606.first_request({}, [])[0] is None
 
 
@@ -187,7 +224,7 @@ def test_a_run_reports_ready_to_first_request_the_top_switch_the_tracing_read_an
     said = "\n".join(env_["lines"])
     assert (f"INFO load start: the drivers' first request at " in said
             and f"= Ready + {env_['load_start']['first_request_from_ready_s']} s" in said
-            and "(the load606 driver's first navigation)" in said)
+            and "(the load606 driver's first navigation, its start)" in said)
     assert (f"INFO load start: after the apply, the observer's top switch at load start + "
             f"{round(ls['top_switch_at'] - ls['applied_at'], 1)} s, the tracing read at load start + "
             f"{round(ls['tracing_read_at'] - ls['applied_at'], 1)} s") in said
@@ -295,3 +332,71 @@ def test_a_k6_run_with_a_frontend_override_three_sessions_no_viewers_no_run8_is_
     (copy / "k6" / "viewer-exit.json").write_text('{"kind": "viewer_exit", "rc": 0}')
     r = _reevaluate(copy, tmp_path / "v6.json")
     assert r.returncode == 2 and "viewers: not decided by the run's evidence (the viewer left output" in r.stderr
+
+
+def _k6_run_dir(d, *, browser_config=True, frontend_digest=False, frontend_tag=None):
+    """A minimal k6 run dir as run606 leaves it: the manifest, the digest gate's record, the verdict, the
+    installer values; optionally the frontend's digest record and tag."""
+    import yaml
+    docs = [{"kind": "ConfigMap", "metadata": {"name": "k6"}, "data": {"config.json": json.dumps({"viewers": True})}},
+            {"kind": "Job", "metadata": {"name": "k6load"},
+             "spec": {"template": {"spec": {"containers": [{"name": "k6"}, {"name": "viewer"}]}}}},
+            {"kind": "Job", "metadata": {"name": "k6browser"}, "spec": {"template": {"spec": {"containers": []}}}}]
+    if browser_config:
+        docs.insert(0, {"kind": "ConfigMap", "metadata": {"name": "k6browser"},
+                        "data": {"browser-config.json": json.dumps({"sessions": [{"name": f"s{i}"} for i in range(4)]})}})
+    (d / "loadgen-job.yaml").write_text(yaml.safe_dump_all(docs))
+    (d / "image-digest.jsonl").write_text(json.dumps({"kind": "image_digest", "expected": "sha256:" + "ab" * 32}) + "\n")
+    (d / "verdict.json").write_text(json.dumps({"verdict": "PASS", "report": {"run8": {}}}))
+    vals = {"componentValues": {"snowplow": {"image": {"tag": "1.12.70"}}}}
+    if frontend_tag:
+        vals["componentValues"]["frontend"] = {"image": {"tag": frontend_tag}}
+    (d / "installer-values.yaml").write_text(yaml.safe_dump(vals))
+    if frontend_digest:
+        (d / "frontend-digest.jsonl").write_text(json.dumps({"kind": "frontend_image_digest",
+                                                             "expected": "sha256:" + "1a" * 32}) + "\n")
+    return d
+
+
+def test_reevaluate_derives_a_k6_run_dirs_settings(tmp_path):
+    from bench import reevaluate
+    s = reevaluate.settings(str(_k6_run_dir(tmp_path)), {})
+    assert {k: v for k, (v, _) in s.items()} == {"driver": "k6", "expect_digest": "sha256:" + "ab" * 32,
+                                                 "frontend": "none", "run8": True, "browser_sessions": 4,
+                                                 "viewers": True}
+    (tmp_path / "f").mkdir()
+    s = reevaluate.settings(str(_k6_run_dir(tmp_path / "f", frontend_digest=True, frontend_tag="1.8.44")), {})
+    assert s["frontend"][0] == ("1.8.44", "sha256:" + "1a" * 32)
+
+
+def test_reevaluate_refuses_a_frontend_whose_evidence_is_present_but_undecided(tmp_path):
+    """V02: frontend-digest.jsonl says an override ran, installer-values.yaml holds no frontend tag: refused,
+    named, never read as "none"; stated, it is taken."""
+    from bench import reevaluate
+    d = str(_k6_run_dir(tmp_path, frontend_digest=True))
+    with pytest.raises(reevaluate.Refused, match=r"^frontend: not decided by the run's evidence \(frontend-digest.jsonl "
+                                                 r"present with its expected, installer-values.yaml tag None"):
+        reevaluate.settings(d, {})
+    s = reevaluate.settings(d, {"frontend": ("1.8.44", "sha256:" + "1a" * 32)})
+    assert s["frontend"][0] == ("1.8.44", "sha256:" + "1a" * 32) and s["frontend"][1].startswith("stated")
+    # the tag without the digest record: undecided too
+    with pytest.raises(reevaluate.Refused, match=r"^frontend: not decided"):
+        (tmp_path / "t").mkdir()
+        reevaluate.settings(str(_k6_run_dir(tmp_path / "t", frontend_tag="1.8.44")), {})
+
+
+def test_reevaluate_refuses_a_k6_run_with_no_browser_config(tmp_path):
+    """V03: no browser-config.json in the manifest: the session count is refused, named, never 5 by default."""
+    from bench import reevaluate
+    d = str(_k6_run_dir(tmp_path, browser_config=False))
+    with pytest.raises(reevaluate.Refused, match=r"^browser_sessions: not decided by the run's evidence "
+                                                 r"\(loadgen-job.yaml holds no browser-config.json with its sessions\)"):
+        reevaluate.settings(d, {})
+    assert reevaluate.settings(d, {"browser_sessions": 5})["browser_sessions"][0] == 5
+    # the browser's own summary disagreeing with the manifest: undecided as well
+    (tmp_path / "x").mkdir()
+    d2 = _k6_run_dir(tmp_path / "x")
+    (d2 / "browser").mkdir()
+    (d2 / "browser" / "browser-summary.json").write_text(json.dumps({"kind": "browser_summary", "sessions": ["a", "b"]}))
+    with pytest.raises(reevaluate.Refused, match=r"^browser_sessions: not decided .* 4 sessions, the browser's summary 2"):
+        reevaluate.settings(str(d2), {})

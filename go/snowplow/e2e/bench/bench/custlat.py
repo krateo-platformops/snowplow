@@ -233,6 +233,12 @@ def calls(o: dict | None) -> list[tuple[float, float]]:
             if i < len(ts) and ts[i] is not None and v is not None]
 
 
+def first_start(cs: list[tuple[float, float]]) -> float | None:
+    """The earliest START of k6's calls (`calls`): k6 stamps each http_req_duration point at the request's
+    end, so a call started at its time minus its duration (ms)."""
+    return round(min(t - ms / 1000.0 for t, ms in cs), 3) if cs else None
+
+
 def _union(ivs) -> list[tuple[float, float]]:
     """Intervals merged, sorted, non-empty."""
     out: list[list[float]] = []
@@ -918,6 +924,8 @@ def report(k6o: dict | None, browser: dict | None, mem: list[dict], fresh: list[
     cs = calls(k6o)
     span = [min(t for t, _ in cs), max(t for t, _ in cs)] if cs else None
     return {"block_s": BLOCK_S, "calls": len(cs), "k6_span": span,
+            # #1494 (5): k6 stamps a point's time at the request's END: a call started at time - duration
+            "k6_first_start": first_start(cs),
             "windows": [[n, w0, w1] for n, w0, w1 in wins],
             "phases": phase_stats(cs, wins),
             # the gate's phases: every churn step pooled while customers are on

@@ -6474,14 +6474,15 @@ def measured_blocks(report: dict):
 
 
 def first_request(report: dict, recs: list[dict]) -> tuple[float | None, str]:
-    """#1494 (5): (the drivers' first request's time, where it was read): k6's first customer call (custlat's
-    k6_span), else the load606 driver's first navigation; (None, why) when neither is recorded."""
-    span = (report.get("customer_latency") or {}).get("k6_span")
-    if isinstance(span, (list, tuple)) and span and isinstance(span[0], (int, float)):
-        return float(span[0]), "k6's first customer call"
+    """#1494 (5): (the drivers' first request's START, where it was read): k6's earliest customer call start
+    (custlat's k6_first_start: a point's time is the request's end, minus its duration), else the load606
+    driver's first navigation start; (None, why) when neither is recorded."""
+    t = (report.get("customer_latency") or {}).get("k6_first_start")
+    if isinstance(t, (int, float)):
+        return float(t), "k6's first customer call, its start: the point's time (the request's end) minus its duration"
     starts = [r["start"] for r in recs if r.get("kind") == "nav" and isinstance(r.get("start"), (int, float))]
     if starts:
-        return float(min(starts)), "the load606 driver's first navigation"
+        return float(min(starts)), "the load606 driver's first navigation, its start"
     return None, "no driver record holds a request (no k6 call, no navigation)"
 
 
